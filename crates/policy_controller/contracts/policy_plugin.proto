@@ -276,8 +276,12 @@ message RequestFacts {
   bool streaming = 5;
   uint32 max_output_tokens = 6;
   uint32 prompt_tokens = 7;  // the host's count or estimate
-  // Prefix block hashes, capped by `view.max_block_hashes`: a controller
-  // reads the first that many of a longer list and refuses none.
+  // Prefix block hashes, capped by `view.max_block_hashes` (1 to 8,190): a
+  // controller reads the first of a longer list, as many as the stages of
+  // its generation read and that many at most, and refuses no list for its
+  // length under the frame's bound. A DecideRequest over that bound, 64 KiB
+  // as encoded, is refused whole: a sender cuts its list at the tail until
+  // the frame fits, and counts the cut on its own side.
   repeated fixed64 block_hashes = 8 [packed = true];
   HashKind hash_kind = 9;
   // The routing key as the host derives it; its `hash` form is the
@@ -298,7 +302,9 @@ message RequestFacts {
   // controller hashes it into `block_hashes` before any stage sees the view,
   // bounded by `view.max_prompt_text_bytes`, a field of the spec still to
   // come with the step that hashes text: a text over the cap is read to the
-  // cap and its tail is not read, and a cap of 0 takes no text. A
+  // cap and its tail is not read, and a cap of 0 takes no text. The
+  // frame's bound comes first: a text that carries its DecideRequest over
+  // 64 KiB is refused with the frame. A
   // controller that does not hash it yet keeps none of it: it answers the
   // request `Busy` with no reason and never decides it as a request with no
   // prefix.
@@ -406,11 +412,13 @@ message Lease {
   // the request's session key carries in its hash form (see Identity); 0
   // when none.
   fixed64 session_key = 6;
-  // Token-work booked on the target.
+  // The prompt size the request stated, in tokens; 0 where it stated none.
   uint32 tokens = 7;
   // The leader's term that minted the lease.
   uint64 term = 8;
   // Bounds decision to Dispatched; then Completed or the stream rule ends it.
+  // A controller's lease tells what is left of the span as its answer is
+  // sent; the span counts from the request's take.
   uint32 dispatch_ttl_ms = 9;
   LeaseOrigin origin = 10;
 }
@@ -418,8 +426,9 @@ message Lease {
 // Serves the routing trace header and Explain; positions into the generation's
 // spec. The record carries the first five fields (its `top` at most three
 // entries, each only `worker_id` and `score`) and reads `drew_first` from
-// its count, which a decision that drew first does not hold; the
-// observability contract fills the rest, unset until then.
+// its count, which a decision that drew first does not hold, and `lifted`
+// from the all-vetoed rule's pick; the observability contract fills the
+// rest, unset until then.
 message Trace {
   // Zero-based position in the spec's profile names in ascending UTF-8 order.
   uint32 profile = 1;  // u16
@@ -450,6 +459,23 @@ message Trace {
   // `survivors` is unset and `drops` is empty, neither one a count, and
   // `top` is of the rows drawn.
   bool drew_first = 12;
+  // The soft veto lifted to make this pick; none unless that veto left the
+  // pool nobody, or left a session key handed on at its sessions rule's
+  // in-flight cap nobody under the cap. The all-vetoed rule's pick sets it,
+  // and so does the pick of a session key kept on its worker. A host counts
+  // both from this field.
+  LiftedVeto lifted = 13;
+}
+
+// The soft vetoes the all-vetoed rule lifts, in the order it lifts them. The
+// zero value is none, with no presence bit: a pick made with no veto lifted
+// reads it truly, and a reader makes one comparison. A zero with a meaning
+// departs on purpose from this file's rule, an UNSPECIFIED zero: an enum
+// with no such reason keeps the rule.
+enum LiftedVeto {
+  LIFTED_VETO_NONE = 0;
+  // Every usable worker was over its overload thresholds.
+  LIFTED_VETO_OVERLOAD = 1;
 }
 
 message FilterDrop {
@@ -483,8 +509,9 @@ message Busy {
 }
 
 // The leases it books, one outcome, the trace. The record is the outcome
-// enum with the trace inside each variant and no leases (the host mints the
-// lease at commit); the wire hoists the trace and carries the leases.
+// enum with the trace inside each variant and no leases (its door files the
+// lease at the issue and hands it beside the record); the wire hoists the
+// trace and carries the leases.
 message Decision {
   repeated Lease leases = 1;
   oneof outcome {
@@ -541,9 +568,12 @@ message Released {
   }
   enum Reason {
     REASON_UNSPECIFIED = 0;
-    // The host gave up before dispatch.
+    // The lease ended before a dispatch: its host gave up, no dispatch was
+    // named by its deadline, or its answer was stopped for the fence (its
+    // controller no longer led the term that minted it).
     REASON_ABANDONED = 1;
-    // A late decision arrived after a fallback dispatch.
+    // A late decision: it arrived after a fallback dispatch, or was cut
+    // before it left, for its request's budget or its dispatch span.
     REASON_LATE_DECISION = 2;
     // The client went away.
     REASON_CLIENT_GONE = 3;
@@ -571,12 +601,27 @@ message MembershipChange {
     KIND_RESIZED = 5;
     // After a resync, `ids` lists every worker of every pool, never one pool.
     KIND_SNAPSHOT = 6;
+    // Since protocol 2; a stream on protocol 1 is not sent it. The worker
+    // stands in no pool of `models` any more: its role moved, or it serves
+    // them no longer. A registration that keeps its id sends it ahead of
+    // its KIND_RELABELLED or KIND_RESIZED. A new incarnation sends its
+    // KIND_REPLACED first and this behind it, for the new id. A plugin that
+    // lists workers by model unlists the worker under these names and keeps
+    // what it holds by id. A model joined has no kind, a role move names
+    // every model of the old list, and a write that moves neither sends
+    // none. A snapshot names ids and no pool: a plugin that lists workers by
+    // model then drops the ids the snapshot leaves out and holds the rest as
+    // it knew them, and a decision's candidates say who stands in the pool
+    // it decides over.
+    KIND_LEFT = 7;
   }
   Kind kind = 1;
   fixed64 worker_id = 2;
   // The retiring id of a replacement.
   fixed64 old_worker_id = 3;
   repeated fixed64 ids = 4 [packed = true];
+  // KIND_LEFT: the models whose pools the worker left.
+  repeated string models = 5;
 }
 
 message Signal {
@@ -601,14 +646,19 @@ message Signal {
 // the controller's (bit 63 clear): a gateway-minted fallback id is re-minted
 // when the controller first learns the lease, its origin kept LOCAL.
 message LifecycleEvent {
-  // Monotonic for the plugin's life, across every Observe stream the host
-  // opens to it. The host numbers what it owed: the events it sent and the
-  // events it refused at a full queue. A gap is events the plugin never
-  // received (refused at a full queue, or in flight on a stream that
-  // ended), and a plugin that keeps a ledger of leases treats it as a loss.
-  // A gap sits where the loss fell: every event raised before it arrives
-  // ahead of the gap. A loss after the last event raised shows at the next
-  // event.
+  // Monotonic for one load of the plugin by one controller, across every
+  // Observe stream of that load; a new load starts again at one. The host
+  // numbers what it owed: the events it sent and the events it refused at a
+  // full queue. A gap is events the plugin never received (refused at a
+  // full queue, or in flight on a stream that ended), and a plugin that
+  // keeps a ledger of leases treats it as a loss. A gap sits at the loss.
+  // For a refusal, every event that entered the host's queue before it
+  // arrives ahead of the gap; an event whose thread stood between its read
+  // of the count and its entry when the refusal fell can arrive on either
+  // side; a refusal after the last event raised shows at the next event.
+  // For a stream that ended, the gap is the events in flight on it: it sits
+  // before the first event of the next stream, and events that waited in
+  // the host's queue behind them arrive after it.
   uint64 seq = 1;
   oneof event {
     Issued issued = 2;
@@ -639,7 +689,17 @@ message LifecycleEvent {
 // names the plugin's version, protocol_min = protocol_max. A plugin that
 // does not speak the one version offered ends the stream, as the server,
 // with FAILED_PRECONDITION, its message naming the offered and the spoken
-// versions.
+// versions. No Observe hello is sent before a Decide stream has settled:
+// the events wait, so a plugin may be asked a decision before it heard the
+// pool. An Observe stream names the version last fixed and lives under it:
+// one that ends is opened again under that version, and once the plugin's
+// Decide streams settle on another, the controller ends it and the next
+// names that one. Version 2 adds MembershipChange.KIND_LEFT. Where the
+// version last fixed is 1 and no Decide stream is open, a KIND_LEFT event
+// waits for the next one to settle: the controller ends the Observe stream
+// and holds the events behind that one. The next Observe stream opens at
+// the settle: on version 2 the event is sent first, on version 1 it is not
+// sent.
 message PluginHello {
   uint32 protocol_min = 1;
   uint32 protocol_max = 2;
@@ -682,7 +742,11 @@ message PluginHelloAck {
 
 // `scores_in` carries the native scorers' combined scores when the plugin is
 // asked for the pick alone; a row the filters dropped scores below zero. The
-// candidate list is bounded by `plugins[].max_candidates`.
+// candidate list is bounded by `plugins[].max_candidates`. The request's
+// `block_hashes` are filled only for a plugin whose row declares a request's
+// hashes (token hashes or text hashes among its needs), with the first 8,190
+// of a longer list; a plugin that declares neither receives none, whatever
+// the other stages of its generation read.
 message PluginDecide {
   fixed64 decision_id = 1;
   RequestFacts request = 2;
@@ -779,7 +843,9 @@ service PolicyPlugin {
   // One bidirectional stream per controller shard, pipelined, ordered per
   // decision id: view and stage set in; mask, scores and pick out.
   rpc Decide(stream PluginRequest) returns (stream PluginResponse);
-  // A client stream answered once: the LifecycleEvent states, opened for a
-  // plugin once one of its Decide streams settled and for no other.
+  // A client stream answered once: the LifecycleEvent states of the kinds
+  // the plugin's row lists (`plugins[].observes`, none by default), opened
+  // once one of the plugin's Decide streams settled, for a plugin whose row
+  // lists a kind and for no other.
   rpc Observe(stream ObserveRequest) returns (Ack);
 }

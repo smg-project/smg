@@ -2009,10 +2009,10 @@ mod tests {
             SlurmDiscoveryConfig, UnhealthyRemovalScope, DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS,
         },
         server::posture::SecretSource,
-        service_discovery::RuntimeDiscoveryConfig,
-        worker::{ConnectionMode, RuntimeType},
     };
     use smg_auth::Role;
+    use smg_service_discovery::RuntimeDiscoveryConfig;
+    use smg_worker::identity::basic::{ConnectionMode, RuntimeType};
 
     use super::*;
 

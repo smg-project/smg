@@ -14,24 +14,37 @@ use smg_data_connector::{
 };
 use smg_external_router::realtime::webrtc::default_bind_addr;
 use smg_mcp::McpOrchestrator;
+use smg_worker::{
+    connection::http_client::{
+        build_client, connect_timeout_secs_below, WorkerHttpClientCache,
+        DEFAULT_CONNECT_TIMEOUT_SECS,
+    },
+    health::liveness,
+    workflow::WorkflowHost,
+};
 use tokio::sync::broadcast::error::RecvError;
 use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::{debug, info};
 
 use crate::{
+    admin::worker_service::WorkerService,
     config::{ParserChoice, RouterConfig},
     middleware::{AuthConfig, TokenBucket},
     observability::inflight_tracker::InFlightRequestTracker,
-    policies::PolicyRegistry,
+    policies::{kv_index::event_monitor::KvEventMonitor, PolicyRegistry},
     rate_limit::RateLimitManager,
     rl_adapter,
     routers::{
         common::{
-            openai_bridge::FormatRegistry, overload, pd_admission,
-            prefill_admission::PrefillAdmission, realtime::RealtimeRegistry,
+            openai_bridge::FormatRegistry,
+            overload, pd_admission,
+            prefill_admission::PrefillAdmission,
+            realtime::RealtimeRegistry,
+            snapshot::{ModelWorkerSnapshot, WorkerMonitor, WorkerRegistry},
         },
         gateway::Gateway,
         grpc::{
+            backend_client::BackendConnector,
             multimodal::MultimodalConfigRegistry,
             regular::symphony::{check_names, named_table},
             utils::{Names, ALIASES},
@@ -39,13 +52,6 @@ use crate::{
     },
     server::http_client_builder,
     wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
-    worker::{
-        connection::http_client::{
-            build_client, connect_timeout_secs_below, DEFAULT_CONNECT_TIMEOUT_SECS,
-        },
-        health::liveness,
-        KvEventMonitor, WorkerHttpClientCache, WorkerMonitor, WorkerRegistry, WorkerService,
-    },
     workflow::{JobQueue, TokenizerLoadFailures, WorkflowEngines},
 };
 
@@ -212,6 +218,16 @@ pub struct AppContextBuilder {
     kv_event_monitor: Option<Arc<KvEventMonitor>>,
     webrtc_bind_addr: Option<std::net::IpAddr>,
     webrtc_stun_server: Option<String>,
+}
+
+/// The context hosts the worker crate's workflow steps: they read the
+/// registry through this and nothing else of the gateway.
+impl WorkflowHost for AppContext {
+    type Generation = ModelWorkerSnapshot;
+
+    fn worker_registry(&self) -> &Arc<WorkerRegistry> {
+        &self.worker_registry
+    }
 }
 
 impl AppContext {
@@ -444,7 +460,7 @@ impl AppContextBuilder {
             .router_config
             .ok_or(AppContextBuildError::MissingField("router_config"))?;
         // The configuration's liveness budgets (the stall, wedge and stale
-        // thresholds and the warm-up slice, see `worker::health::liveness`) take
+        // thresholds and the warm-up slice, see `smg_worker::health::liveness`) take
         // effect for every context built from it, the server's and a test's
         // alike. They are process-wide and the first call wins, so a
         // constructor that builds the policy registry itself configures them
@@ -538,6 +554,12 @@ impl AppContextBuilder {
             .filter(|_| router_config.effective_prefill_queue_size() > 0)
         {
             start_prefill_admission_notifier(&worker_registry, admission)?;
+        }
+        // The hash rings are filled where a membership change is heard, off
+        // the request path. Where no runtime is entered nothing warms them,
+        // and the first reader of a generation fills its ring.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            policy_registry.keep_rings_warm(&worker_registry, &runtime);
         }
 
         // Create WorkerService from the already-built components
@@ -712,7 +734,7 @@ impl AppContextBuilder {
                 .pool_max_idle_per_host(500)
                 .timeout(Duration::from_secs(timeout_secs))
                 // Below the request timeout, as the worker clients keep it
-                // (`worker::connection::http_client::connect_timeout_secs_below`): a dark
+                // (`smg_worker::connection::http_client::connect_timeout_secs_below`): a dark
                 // external host fails as a connect timeout, not as the
                 // request's own (except under a 1 s request timeout, where the
                 // two timers race).
@@ -808,7 +830,9 @@ impl AppContextBuilder {
 
     /// Create worker registry
     fn with_worker_registry(mut self) -> Self {
-        self.worker_registry = Some(Arc::new(WorkerRegistry::new()));
+        self.worker_registry = Some(Arc::new(
+            WorkerRegistry::new().with_engine_connector(BackendConnector::shared()),
+        ));
         self
     }
 
@@ -1012,16 +1036,24 @@ fn mcp_bootstrap_config(file: Option<&smg_mcp::McpConfig>) -> smg_mcp::McpConfig
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
+    use openai_protocol::worker::{HealthCheckConfig, WorkerSpec, WorkerStatus};
+    use smg_worker::{
+        connection::engine::NO_ENGINE_CONNECTOR,
+        identity::basic::{ConnectionMode, Worker, WorkerType},
+        kv_events::SubscriptionKind,
+        test_support::RefusedAddress,
+    };
     use tracing_test::traced_test;
 
     use super::*;
     use crate::{
         config::types::PolicyConfig,
-        routers::common::prefill_admission::PrefillAdmissionAttempt,
-        worker::{
-            test_support::{select_worker, worker_of},
-            BasicWorkerBuilder, ConnectionMode, SubscriptionKind, Worker, WorkerType,
+        routers::{
+            common::{
+                prefill_admission::{test_support::select_worker, PrefillAdmissionAttempt},
+                snapshot::test_support::worker_of,
+            },
+            grpc::backend_client::BasicWorkerBuilder,
         },
     };
 
@@ -1044,11 +1076,11 @@ mod tests {
     }
 
     /// Child-process body of the root-store test below (see
-    /// `worker::connection::http_client::no_root_store`); a no-op unless the case
+    /// `smg_worker::connection::http_client::no_root_store`); a no-op unless the case
     /// variable is set.
     #[test]
     fn child_with_client_without_native_roots() {
-        use crate::worker::connection::http_client::no_root_store;
+        use smg_worker::connection::http_client::no_root_store;
 
         if std::env::var(no_root_store::CASE).is_err() {
             return;
@@ -1064,7 +1096,7 @@ mod tests {
         ignore = "the native verifier does not use SSL_CERT_FILE/SSL_CERT_DIR"
     )]
     fn the_gateway_client_builds_without_a_native_root_store() {
-        use crate::worker::connection::http_client::no_root_store;
+        use smg_worker::connection::http_client::no_root_store;
 
         no_root_store::run(
             &no_root_store::test_name(module_path!(), "child_with_client_without_native_roots"),
@@ -1315,6 +1347,45 @@ mod tests {
         );
     }
 
+    /// A context built on a runtime starts the task that fills the hash
+    /// rings: the ring of a generation is filled with no request to read it.
+    #[tokio::test]
+    async fn a_context_built_on_a_runtime_fills_the_hash_rings_itself() {
+        use openai_protocol::UNKNOWN_MODEL_ID;
+
+        use crate::routers::common::snapshot::WorkerRegistryExt as _;
+
+        let mut config = RouterConfig::builder()
+            .round_robin_policy()
+            .build_unchecked();
+        config.health_check.disable_health_check = true;
+        let context = AppContext::from_config(config, 30, None, None)
+            .await
+            .expect("a context");
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://ring:8080")
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        context.worker_registry.register(worker).expect("a worker");
+
+        let bound = std::time::Instant::now() + Duration::from_secs(30);
+        while !context
+            .worker_registry
+            .get_routing_snapshot(UNKNOWN_MODEL_ID)
+            .hash_ring_is_filled()
+        {
+            assert!(
+                std::time::Instant::now() < bound,
+                "no task filled the ring of the generation"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
     #[test]
     fn maybe_rate_limit_manager_disabled_is_ok_none() {
         let config = RouterConfig::default();
@@ -1404,6 +1475,38 @@ policy:
                 .and_then(|proxy| proxy.https.as_deref()),
             Some("http://env-proxy.example:3128")
         );
+    }
+
+    /// The registry the gateway builds connects its mesh imports through
+    /// the gateway's connector: an imported gRPC worker's connect reaches
+    /// for its engine, it is not refused for want of a connector.
+    #[tokio::test]
+    async fn the_gateways_registry_connects_its_mesh_imports() {
+        let refused = RefusedAddress::reserve();
+        let registry = AppContextBuilder::new()
+            .with_worker_registry()
+            .worker_registry
+            .expect("the registry");
+        let mut spec = WorkerSpec::new(format!("grpc://{}", refused.addr()));
+        spec.connection_mode = ConnectionMode::Grpc;
+        registry.on_remote_worker_state(&smg_worker::registry::RemoteWorkerState {
+            worker_id: "peer-w1".to_string(),
+            model_id: "m".to_string(),
+            url: spec.url.clone(),
+            health: true,
+            version: 1,
+            spec: serde_json::to_vec(&spec).expect("a spec encodes"),
+        });
+        let import = registry.get_all().pop().expect("the import");
+        assert_eq!(*import.connection_mode(), ConnectionMode::Grpc);
+
+        match import.engine_connection().await {
+            Ok(connection) => assert!(connection.is_some()),
+            Err(refusal) => assert!(
+                !refusal.to_string().contains(NO_ENGINE_CONNECTOR),
+                "{refusal}"
+            ),
+        }
     }
 
     #[tokio::test]
@@ -1546,24 +1649,26 @@ mod effective_max_concurrent_requests_tests {
     }
 }
 
-/// The test fixture shared by the modules that drive a workflow step or a
-/// discovery pass against an `AppContext` built by hand.
+/// The test fixture shared by the modules whose cases need an `AppContext`
+/// built by hand.
 #[cfg(test)]
 pub(crate) mod testing {
     use std::sync::Arc;
 
+    use smg_worker::connection::http_client::WorkerHttpClientCache;
+
     use super::{AppContext, ToolParserFactory};
     use crate::{
+        admin::worker_service::WorkerService,
         config::RouterConfig,
         middleware::{AuthConfig, TokenBucket},
         observability::inflight_tracker::InFlightRequestTracker,
         policies::PolicyRegistry,
         routers::{
-            common::{openai_bridge, realtime::RealtimeRegistry},
+            common::{openai_bridge, realtime::RealtimeRegistry, snapshot::WorkerRegistry},
             grpc::multimodal::MultimodalConfigRegistry,
         },
         server::http_client,
-        worker::{WorkerHttpClientCache, WorkerRegistry, WorkerService},
     };
 
     /// An `AppContext` over `router_config` and `worker_registry`: in-memory
@@ -1631,5 +1736,79 @@ pub(crate) mod testing {
             webrtc_bind_addr: None,
             webrtc_stun_server: None,
         })
+    }
+
+    /// An `AppContext` with an uninitialized worker job queue: submitted jobs are
+    /// accepted and queued but never processed, so a test observes what is
+    /// *submitted* without spawning workflow background tasks.
+    /// [`live_app_context`] is the one whose jobs run.
+    pub(crate) fn create_test_app_context() -> Arc<AppContext> {
+        let router_config = RouterConfig::builder()
+            .worker_startup_timeout_secs(1)
+            .build_unchecked();
+
+        // Note: Using uninitialized queue for tests to avoid spawning background workers
+        // Jobs submitted during tests will queue but not be processed
+        app_context_for_tests(router_config, Arc::new(WorkerRegistry::new()), None)
+    }
+
+    /// An `AppContext` whose jobs run: a live job queue and workflow engines, so
+    /// a test observes what the registry *ends up with* once its jobs run.
+    /// Regular routing with round-robin, a five-second startup window for an
+    /// engine slow to answer its probes, and no drain wait on removal.
+    /// [`create_test_app_context`] is the one whose jobs never run.
+    pub(crate) fn live_app_context() -> Arc<AppContext> {
+        use std::sync::OnceLock;
+
+        use llm_tokenizer::registry::TokenizerRegistry;
+        use smg_data_connector::{
+            MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
+        };
+
+        use crate::{
+            config::{HealthCheckConfig, PolicyConfig, RoutingMode},
+            workflow::{JobQueue, JobQueueConfig, WorkflowEngines},
+        };
+
+        let config = RouterConfig::builder()
+            .mode(RoutingMode::Regular {
+                worker_urls: vec![],
+            })
+            .policy(PolicyConfig::RoundRobin)
+            .worker_startup_timeout_secs(5)
+            .worker_startup_check_interval_secs(1)
+            .health_check_config(HealthCheckConfig {
+                drain_settle_secs: 0,
+                ..HealthCheckConfig::default()
+            })
+            .build_unchecked();
+        let context = Arc::new(
+            AppContext::builder()
+                .router_config(config.clone())
+                .client(http_client())
+                .tokenizer_registry(Arc::new(TokenizerRegistry::new()))
+                .worker_registry(Arc::new(WorkerRegistry::new()))
+                .policy_registry(Arc::new(PolicyRegistry::new(config.policy.clone())))
+                .response_storage(Arc::new(MemoryResponseStorage::new()))
+                .conversation_storage(Arc::new(MemoryConversationStorage::new()))
+                .conversation_item_storage(Arc::new(MemoryConversationItemStorage::new()))
+                .worker_job_queue(Arc::new(OnceLock::new()))
+                .workflow_engines(Arc::new(OnceLock::new()))
+                .mcp_orchestrator(Arc::new(OnceLock::new()))
+                .build()
+                .unwrap(),
+        );
+        context
+            .worker_job_queue
+            .set(JobQueue::new(
+                JobQueueConfig::default(),
+                Arc::downgrade(&context),
+            ))
+            .ok();
+        context
+            .workflow_engines
+            .set(WorkflowEngines::new(&context.router_config))
+            .ok();
+        context
     }
 }

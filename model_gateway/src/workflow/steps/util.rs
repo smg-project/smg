@@ -1,21 +1,21 @@
 //! Shared URL normalization and network probe utilities for worker steps.
 
-use std::{future::Future, time::Duration};
+use std::{future::Future, sync::Arc, time::Duration};
 
 use futures::stream::{FuturesUnordered, StreamExt};
 use reqwest::Client;
-use smg_grpc_client::connect_channel_with_timeout;
-
-use crate::{
-    routers::grpc::client::{GrpcClient, HealthCheckResponse},
-    worker::identity::endpoint::Endpoint,
+// The gRPC base URL stands beside the address type, where the worker module
+// reads it too; its path here is kept for the steps.
+pub(crate) use smg_worker::identity::endpoint::grpc_base_url;
+use smg_worker::{
+    connection::engine::{EngineConnection, HealthAnswer},
+    identity::{
+        basic::RuntimeType,
+        endpoint::{strip_protocol, strip_scheme, Endpoint},
+    },
 };
 
-fn strip_scheme<'a>(url: &'a str, scheme: &str) -> Option<&'a str> {
-    url.get(..scheme.len())
-        .filter(|prefix| prefix.eq_ignore_ascii_case(scheme))
-        .map(|_| &url[scheme.len()..])
-}
+use crate::routers::grpc::backend_client::BackendConnector;
 
 /// The scheme `url` starts with, lowercased: a word of scheme characters
 /// (RFC 3986's, a digit or a sign first too, and the empty word) before a
@@ -30,31 +30,12 @@ fn url_scheme(url: &str) -> Option<String> {
         .then(|| word.to_ascii_lowercase())
 }
 
-/// Strip protocol prefix (http://, https://, grpc://, grpcs://) from URL.
-pub(crate) fn strip_protocol(url: &str) -> String {
-    for scheme in ["http://", "https://", "grpc://", "grpcs://"] {
-        if let Some(rest) = strip_scheme(url, scheme) {
-            return rest.to_string();
-        }
-    }
-    url.to_string()
-}
-
 /// Ensure URL has an HTTP(S) scheme — handles bare `host:port` and gRPC inputs.
 pub(crate) fn http_base_url(url: &str) -> String {
     if strip_scheme(url, "http://").is_some() || strip_scheme(url, "https://").is_some() {
         url.trim_end_matches('/').to_string()
     } else {
         format!("http://{}", strip_protocol(url).trim_end_matches('/'))
-    }
-}
-
-/// Ensure URL has a gRPC scheme — handles bare `host:port` and HTTP(S) inputs.
-pub(crate) fn grpc_base_url(url: &str) -> String {
-    if strip_scheme(url, "grpc://").is_some() || strip_scheme(url, "grpcs://").is_some() {
-        url.trim_end_matches('/').to_string()
-    } else {
-        format!("grpc://{}", strip_protocol(url).trim_end_matches('/'))
     }
 }
 
@@ -111,6 +92,20 @@ pub(crate) async fn try_http_reachable(
     Ok(())
 }
 
+/// A connection to the engine at `grpc_url`, spoken to as `runtime_type`,
+/// made by the gateway's connector. The detection reads an engine through
+/// the worker crate's port, as the worker runtime does.
+pub(crate) async fn connect_grpc_as(
+    grpc_url: &str,
+    runtime_type: &str,
+) -> Result<Arc<dyn EngineConnection>, String> {
+    let runtime: RuntimeType = runtime_type
+        .parse()
+        .map_err(|_| format!("Unknown runtime type: {runtime_type}"))?;
+    let connector = BackendConnector::shared();
+    connector.connect_grpc(grpc_url, runtime).await
+}
+
 /// One gRPC health RPC to the engine at `grpc_url`, spoken to as
 /// `runtime_type`: its answer, healthy or not, or why there was none (the
 /// endpoint unreachable, the RPC failed or timed out, another runtime's
@@ -120,14 +115,14 @@ pub(crate) async fn grpc_health_answer(
     grpc_url: &str,
     timeout_secs: u64,
     runtime_type: &str,
-) -> Result<HealthCheckResponse, String> {
-    let connect_future = GrpcClient::connect(grpc_url, runtime_type);
-    let client = tokio::time::timeout(Duration::from_secs(timeout_secs), connect_future)
+) -> Result<HealthAnswer, String> {
+    let connect_future = connect_grpc_as(grpc_url, runtime_type);
+    let connection = tokio::time::timeout(Duration::from_secs(timeout_secs), connect_future)
         .await
         .map_err(|_| "gRPC connection timeout".to_string())?
         .map_err(|e| format!("gRPC connection failed: {e}"))?;
 
-    let health_future = client.health_check();
+    let health_future = connection.health_answer();
     tokio::time::timeout(Duration::from_secs(timeout_secs), health_future)
         .await
         .map_err(|_| "gRPC health check timeout".to_string())?
@@ -176,10 +171,11 @@ fn not_healthy_error(message: &str) -> String {
 /// five in-flight sockets per attempt instead of one.
 async fn grpc_transport_reachable(grpc_url: &str, timeout_secs: u64) -> Result<(), String> {
     let timeout = Duration::from_secs(timeout_secs);
-    let connect_future = connect_channel_with_timeout(grpc_url, timeout);
+    let connector = BackendConnector::shared();
+    let connect_future = connector.dial_grpc(grpc_url, timeout);
 
-    // tonic's connect timeout is applied to the connector. Keep an outer
-    // deadline as a safety net for the remaining Channel::connect setup.
+    // The dial bounds its own connect with the timeout. Keep an outer
+    // deadline as a safety net for the rest of the channel's setup.
     tokio::time::timeout(timeout, connect_future)
         .await
         .map_err(|_| "gRPC connection timeout".to_string())?
@@ -264,10 +260,7 @@ pub(crate) async fn try_grpc_reachable(url: &str, timeout_secs: u64) -> Result<(
 /// answering its health check as its overrides say (healthy until told
 /// otherwise): its `grpc://` URL and those overrides.
 #[cfg(test)]
-pub(crate) async fn mock_grpc_engine() -> (
-    String,
-    std::sync::Arc<mock_worker::overrides::WorkerOverrides>,
-) {
+pub(crate) async fn mock_grpc_engine() -> (String, Arc<mock_worker::overrides::WorkerOverrides>) {
     mock_grpc_engine_on(mock_worker::config::SchedulerWire::TokenSpeed).await
 }
 
@@ -281,10 +274,7 @@ pub(crate) async fn mock_grpc_engine() -> (
 )]
 pub(crate) async fn mock_grpc_engine_on(
     wire: mock_worker::config::SchedulerWire,
-) -> (
-    String,
-    std::sync::Arc<mock_worker::overrides::WorkerOverrides>,
-) {
+) -> (String, Arc<mock_worker::overrides::WorkerOverrides>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind the mock engine");
@@ -292,7 +282,7 @@ pub(crate) async fn mock_grpc_engine_on(
         .local_addr()
         .expect("the mock engine's address")
         .port();
-    let config = std::sync::Arc::new(mock_worker::config::Config {
+    let config = Arc::new(mock_worker::config::Config {
         http_count: 0,
         grpc_base_port: port,
         grpc_count: 1,
@@ -318,8 +308,10 @@ mod tests {
         },
     };
 
+    use smg_worker::test_support::RefusedAddress;
+
     use super::*;
-    use crate::{server::http_client, worker::test_support::RefusedAddress};
+    use crate::server::http_client;
 
     struct DropFlag(Arc<AtomicBool>);
 

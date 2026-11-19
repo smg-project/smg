@@ -13,7 +13,7 @@ rewrites it; the test fails on any other difference).
 |---|---|---|
 | `policy_plugin.proto` | package `smg.policy.v1`: the view (`RequestFacts`, `Candidate`, `LoadRow`, `Constraints`, `PoolFacts`, `Identity`), the decision (`Decision`, `Pick`, `Target`, `Pair`, `Shed`, `Queue`, `Trace`, `Lease`, `Busy`), the lifecycle (`LifecycleEvent`) and the `PolicyPlugin` service a user policy serves over gRPC | 4.1, 4.2, 4.3, 4.5, appendix A |
 | `policy_controller.proto` | the same package: the `PolicyController` service of the standalone controller in its four scopes (gateway, ingestion, control, replication), its frames, credits, worker events, snapshots, spec operations, leadership and the replication log; imports the file above and the engine wire's `common.proto` for the relayed load record and event batch | 5.1 to 5.5, 8, appendix A |
-| `smg-policy.wit` | package `smg:policy@1.0.0`: the `types` and `host` interfaces and the two worlds a WebAssembly policy targets, `policy` (the view as records) and `policy-packed` (the view as bytes) | 4.5, appendix B |
+| `smg-policy.wit` | package `smg:policy@1.1.0`: the `types` and `host` interfaces and the two worlds a WebAssembly policy targets, `policy` (the view as records) and `policy-packed` (the view as bytes) | 4.5, appendix B |
 
 Section numbers are the policy controller design's. The in-process form of
 every view, decision and lifecycle message is the crate's own type in
@@ -32,16 +32,22 @@ clock, a lease's issue instant), and each file's comments name them.
   decline. An empty filter mask is a present, empty `survivors` message and
   sheds the request; it is never a decline. `Hello` carries the protocol
   range and `Welcome` the chosen version; the controller speaks N and N-1 and
-  upgrades first. No absolute instant crosses the decide, session, plugin and
+  upgrades first. A plugin speaks one version on all its streams, fixed by
+  its first `Decide` stream to settle; plugin protocol 2 adds
+  `MembershipChange.KIND_LEFT`, which a stream on 1 is not sent. No
+  absolute instant crosses the decide, session, plugin and
   lifecycle wires (budgets, ages and vetoes are durations relative to receipt);
   the control scope's audit records carry wall-clock instants on purpose.
 - The WIT package carries the world version. The engine accepts
-  `smg:policy@1.x` within a stated range and the spec may pin `abi: 1.0`. The
+  `smg:policy@1.x` within a stated range and the spec may pin `abi: 1.1`. The
   component model types a record, variant, flags or function by its exact
   shape, so within `1.x` no type or signature changes: a `1.y` release adds
   host functions, interfaces or worlds a module may leave unused, a module's
   extra exports are ignored, and a changed shape is a new type or the next
-  major. The loader's error names the module's version and the accepted
+  major. The world is pre-release until a shipped release carries it: until
+  then a shape changes in place under the next minor and the range's floor
+  rises with it (1.1 added `left` to `membership`, and a 1.0 module is
+  refused). The loader's error names the module's version and the accepted
   range.
 - Both are pre-release until the first shipped release that carries them; the
   rules above bind from then on.
@@ -54,7 +60,7 @@ clock, a lease's issue instant), and each file's comments name them.
 
 - A gRPC plugin or a client of the controller compiles the two proto files
   with `protoc` and the generator of its language; the include path holds
-  this directory and the engine wire's directory (`crates/grpc_client/proto`
+  this directory and the engine wire's directory (`crates/worker/proto`
   in this repository) for `common.proto`. In Rust the generated types come
   from `tonic-prost-build` as the repository's own gRPC clients do.
 - A WebAssembly plugin targets one world of `smg-policy.wit` with
@@ -63,11 +69,15 @@ clock, a lease's issue instant), and each file's comments name them.
   guest builds without `std` and exports its own `cabi_realloc`. The host
   imports are `log`, `now-micros`, `counter` and `random-u64`; the exports are
   `init`, the `decision` resource (constructor, `filter`, `score`, `pick`) and
-  `observe`. A `policy-packed` guest reads its three blocks in place: the
+  `observe`, which the host calls with the kinds of lifecycle event the
+  plugin's row lists, none by default (a gRPC plugin's `Observe` stream
+  carries those). A `policy-packed` guest reads its three blocks in place: the
   offsets are in the WIT comments, the model name is padded so the u64
   sections stay 8-byte aligned for any name length, and the guest's
   `cabi_realloc` returns 8-aligned memory for the blocks (or it reads with
-  unaligned loads).
+  unaligned loads). Either world's view carries the request's block hashes
+  only where the plugin's row declares them among its needs, 8,190 at most,
+  as a gRPC plugin's frame does.
 - The validity rules a plugin must keep are in the files: surviving positions
   unique and in range, one finite score per candidate clamped to `0..1`, a
   pick inside the surviving set; a violation is a trap (the instance is
@@ -98,7 +108,9 @@ about 170 bytes out (a pair with two decode alternates 260); a candidate row
 with its load row is about 90 bytes (up to 6 more with the index's block count
 set), so a gRPC plugin's record view is about 42 KB at 512 candidates, hence
 `plugins[].max_candidates`
-(default 128); a credit grant (a delta: each decide request spends one, no
+(default 128), and its frame carries the request's block hashes only where
+the plugin's row declares them, 8,190 at most (64 KB);
+a credit grant (a delta: each decide request spends one, no
 answer returns one, a new stream starts at the welcome's window) is 6 bytes
 in its envelope (20 on the wire); a
 `HelloPage` of 100 leases and 50 pins is about 9.3 KB, so a 64 KB page holds

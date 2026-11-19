@@ -5,11 +5,11 @@
 //! policy controller crate replays the rows through its own decision
 //! (`crates/policy_controller/tests/classic/manual.rs`).
 //!
-//! This file is not part of the gateway. It is kept beside the recorded rows
-//! with the commit it records from, and run in a checkout of that commit:
-//! copy it to `model_gateway/src/policies/classic_manual_rows.rs`, add
-//! `#[cfg(test)] mod classic_manual_rows;` to
-//! `model_gateway/src/policies/mod.rs`, then
+//! This file is an ignored test of the gateway crate, kept beside the code
+//! it runs. It records from the checkout it is built in and writes the sheet
+//! under `CLASSIC_ROWS_OUT`, naming `CLASSIC_ROWS_COMMIT` as the commit it
+//! recorded from. The sheets the policy controller crate replays are in
+//! `crates/policy_controller/tests/classic/sheets`; to record this one again:
 //!
 //! ```text
 //! CLASSIC_ROWS_OUT=<dir> CLASSIC_ROWS_COMMIT=<commit> \
@@ -25,9 +25,10 @@ use std::{fs, path::PathBuf, sync::Arc};
 
 use openai_protocol::worker::WorkerStatus;
 use serde::Serialize;
+use smg_worker::identity::basic::Worker;
 
 use super::{LoadBalancingPolicy, ManualConfig, ManualPolicy, SelectWorkerInfo, WorkerRole};
-use crate::{config::ManualAssignmentMode, policies::test_support::make_worker, worker::Worker};
+use crate::{config::ManualAssignmentMode, policies::test_support::make_worker};
 
 /// One worker of a row: the requests the router holds on it and the routing
 /// keys that have a request in flight on it.

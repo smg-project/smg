@@ -5,13 +5,18 @@
 
 use std::fmt;
 
-pub use crate::plugins::config::{BreakerSpec, Exposure, Failure, FrameBudget, HeaderSet, Reveal};
+pub use crate::plugins::config::{
+    BreakerSpec, EventKind, EventSet, Exposure, Failure, FrameBudget, HeaderSet, Reveal,
+};
 use crate::spec::Needs;
 
-/// The `smg:policy` package versions the host accepts: one major, every
-/// minor up to [`Abi::SUPPORTED_MINOR`]. A 1.y release adds host functions,
-/// interfaces or worlds a module may leave unused; a changed shape is the
-/// next major.
+/// The `smg:policy` package versions the host accepts: one major, the
+/// minors from [`Abi::FLOOR_MINOR`] to [`Abi::SUPPORTED_MINOR`]. A 1.y
+/// release adds host functions, interfaces or worlds a module may leave
+/// unused; a changed shape is the next major. Until a shipped release
+/// carries the world a shape changes in place under the next minor, and the
+/// floor rises with it: a module built against the older shape is another
+/// type to the host, so it is refused by its version.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Abi {
     pub major: u32,
@@ -21,16 +26,29 @@ pub struct Abi {
 impl Abi {
     /// The major the host speaks.
     pub const MAJOR: u32 = 1;
+    /// The oldest minor the host speaks.
+    pub const FLOOR_MINOR: u32 = 1;
     /// The newest minor the host speaks.
-    pub const SUPPORTED_MINOR: u32 = 0;
+    pub const SUPPORTED_MINOR: u32 = 1;
 
     /// The one committed version today.
-    pub const V1_0: Self = Self { major: 1, minor: 0 };
+    pub const V1_1: Self = Self { major: 1, minor: 1 };
 
     /// Whether a module of this version runs on this host: the major must
     /// match and the minor lie within the supported range.
     pub fn accepted(self) -> bool {
-        self.major == Self::MAJOR && (..=Self::SUPPORTED_MINOR).contains(&self.minor)
+        self.major == Self::MAJOR
+            && (Self::FLOOR_MINOR..=Self::SUPPORTED_MINOR).contains(&self.minor)
+    }
+
+    /// The accepted versions, as the loader's refusal names them.
+    pub(crate) fn accepted_range() -> String {
+        let (major, floor, newest) = (Self::MAJOR, Self::FLOOR_MINOR, Self::SUPPORTED_MINOR);
+        if floor == newest {
+            format!("{major}.{newest}")
+        } else {
+            format!("{major}.{floor} to {major}.{newest}")
+        }
     }
 
     /// `major.minor` of a `major.minor.patch` suffix; the patch is dropped.
@@ -91,10 +109,21 @@ pub struct PluginSpec {
     /// What the host must feed for the plugin's stages to mean anything
     /// (hashes, loads, headers, media, the affinity column behind a
     /// candidate's five affinity facts); the plugin declares it, the host
-    /// cannot read it off a module.
+    /// cannot read it off a module. The view carries the request's block
+    /// hashes where these declare them, in the token form or the text form:
+    /// the first [`MAX_BLOCK_HASHES`](crate::spec::MAX_BLOCK_HASHES) of
+    /// a longer list. Where they declare neither it carries none, whatever
+    /// the other stages of the profile read.
     pub needs: Needs,
     /// The counters the plugin may add to, by id; a name per id.
     pub metrics: Vec<String>,
+    /// The kinds of lifecycle event the module's `observe` is called with,
+    /// none by default: a row that lists none is never told. A row that
+    /// lists any has the plugin's scorer and picker say they need the
+    /// lifecycle's calls ([`crate::Lifecycle::needs_lifecycle`]). Bound as
+    /// a filter alone a plugin hears nothing, whatever this lists: the
+    /// engine forwards the lifecycle to scorers and pickers.
+    pub observes: EventSet,
     pub failure: Failure,
     pub log: LogLimit,
     pub breaker: BreakerSpec,
@@ -124,6 +153,7 @@ impl PluginSpec {
             view: Exposure::default(),
             needs: Needs::default(),
             metrics: Vec::new(),
+            observes: EventSet::default(),
             failure: Failure::default(),
             log: LogLimit::default(),
             breaker: BreakerSpec::default(),
@@ -158,18 +188,21 @@ mod tests {
     use super::{Abi, PluginSpec};
 
     #[test]
-    fn the_abi_range_is_one_major_up_to_the_supported_minor() {
-        assert!(Abi::V1_0.accepted());
-        assert!(!Abi { major: 2, minor: 0 }.accepted());
+    fn the_abi_range_is_one_major_from_the_floor_to_the_supported_minor() {
+        assert!(Abi::V1_1.accepted());
+        assert!(!Abi { major: 2, minor: 1 }.accepted());
+        // Under the floor: the minor a shape was changed in place after.
+        assert!(!Abi { major: 1, minor: 0 }.accepted());
+        assert_eq!(Abi::accepted_range(), "1.1");
         assert!(!Abi {
             major: 1,
             minor: Abi::SUPPORTED_MINOR + 1
         }
         .accepted());
-        assert_eq!(Abi::parse("1.0.0"), Some(Abi::V1_0));
+        assert_eq!(Abi::parse("1.1.0"), Some(Abi::V1_1));
         assert_eq!(Abi::parse("1.2"), Some(Abi { major: 1, minor: 2 }));
         assert_eq!(Abi::parse("one"), None);
-        assert_eq!(Abi::V1_0.to_string(), "1.0");
+        assert_eq!(Abi::V1_1.to_string(), "1.1");
     }
 
     #[test]

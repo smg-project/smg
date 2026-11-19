@@ -9,7 +9,10 @@
 //!
 //! with whatever classes stand in those places, the clitic group in both
 //! letter alternatives or in neither (the Mistral tekken template has none
-//! and takes one digit at a time), and whatever bound the digit rule has.
+//! and takes one digit at a time), whatever bound the digit rule has, and
+//! in front of the seven, or not, an alternative that is a run of one class
+//! (the Kimi template opens with its ideographs, `[\p{Han}]+`, and takes
+//! them out of both letter classes).
 //! Run as the backtracking program the template costs 750 instructions a
 //! piece (the optional lead-in and the two overlapping runs are entered and
 //! given back at most positions); decided alternative by alternative it
@@ -39,7 +42,22 @@
 //! Each is what the engine's backtracking arrives at: a greedy optional
 //! lead-in is kept only when the rest matches after it, a greedy run before a
 //! required class gives back characters until the class follows, and the
-//! first alternative to reach the end of the pattern wins. The classes are
+//! first alternative to reach the end of the pattern wins.
+//!
+//! The opening run, in a template that has one, is the first alternative: a
+//! piece that starts at a character of its class is that run, whatever else
+//! the character is (a Han radical is punctuation and a Han numeral a digit
+//! inside a piece that began before it, and a run of their own where one
+//! begins). Such a template is the scanner's when no character of the run's
+//! class is one a letter body can begin with (the upper and the lower class
+//! of the first letter alternative, the upper class of the second). A
+//! character of the run then reaches a letter alternative as its lead-in
+//! alone, a role it never plays, since the run is tried first: the role
+//! table holds no lead-in bit for it, and the scanner reads the run in the
+//! digit test, one mask for both. The letter, punctuation and whitespace
+//! pieces of a template with no opening run take the tests they took, and a
+//! digit piece one more. A template whose run shares a character with those
+//! letter classes keeps the program. The classes are
 //! the parser's ([`Roles`] reads them), so the scanner and the program cannot
 //! read a category differently, and the program stays as the matcher the
 //! tests hold the scanner against.
@@ -87,10 +105,13 @@ pub(super) enum Role {
     NotTrail,
     /// A whitespace run (`\s+`).
     Space,
+    /// The run a template opens with (`[\p{Han}]+`): the last role, which a
+    /// template without the run has no class for.
+    Run,
 }
 
 /// The roles, in the order of their bits.
-const ROLES: [Role; 15] = [
+const ROLES: [Role; 16] = [
     Role::Lead1,
     Role::Upper1,
     Role::Lower1,
@@ -106,6 +127,7 @@ const ROLES: [Role; 15] = [
     Role::TrailSpace,
     Role::NotTrail,
     Role::Space,
+    Role::Run,
 ];
 
 impl Role {
@@ -186,7 +208,12 @@ impl Scanner {
         let Node::Alt { alternatives, .. } = root else {
             return None;
         };
-        let [first, second, digits, punct, breaks, trail, space] = alternatives.as_slice() else {
+        // An eighth alternative in front is the opening run.
+        let (run, alternatives) = match alternatives.as_slice() {
+            [run, seven @ ..] if seven.len() == 7 => (Some(repeat(run, 1, u32::MAX)?), seven),
+            alternatives => (None, alternatives),
+        };
+        let [first, second, digits, punct, breaks, trail, space] = alternatives else {
             return None;
         };
         let (lead1, upper1, lower1, clitics1) = letters(first, 0, 1)?;
@@ -233,12 +260,25 @@ impl Scanner {
                 Role::TrailSpace => repeat(trail_space, 1, u32::MAX)?,
                 Role::NotTrail => *not_trail,
                 Role::Space => repeat(space, 1, u32::MAX)?,
+                Role::Run => run?,
             })
         };
-        let role_classes = ROLES
+        // The run's role is the last: a template without the run has the
+        // tables it had, and no character holds the role's bit.
+        let role_classes = ROLES[..ROLES.len() - usize::from(run.is_none())]
             .iter()
             .map(|&role| of(role).map(|class| &classes[class]))
             .collect::<Option<Vec<&Class>>>()?;
+        let mut roles = Roles::build(&role_classes);
+        if run.is_some() {
+            // See the module documentation: no character of the run may
+            // begin a letter body, and none is a lead-in.
+            let bodies = Role::Upper1.bit() | Role::Lower1.bit() | Role::Upper2.bit();
+            if roles.some_char_holds_both(Role::Run.bit(), bodies) {
+                return None;
+            }
+            roles.clear_where(Role::Run.bit(), Role::Lead1.bit() | Role::Lead2.bit());
+        }
         let mut clitic_start = [false; 128];
         let mut clitic_beyond_ascii = false;
         for alternative in clitics1.iter().chain(&clitics2) {
@@ -249,7 +289,7 @@ impl Scanner {
             clitic_beyond_ascii |= class.may_hold_beyond_ascii();
         }
         Some(Self {
-            roles: Roles::build(&role_classes),
+            roles,
             clitics1,
             clitics2,
             clitic_start,
@@ -354,7 +394,8 @@ impl Scanner {
     }
 
     /// The end of the piece that starts at `pos`, if one does: the first of
-    /// the seven alternatives that matches there, as the engine picks it.
+    /// the template's alternatives that matches there, as the engine picks
+    /// it.
     /// Compiled into its callers' loops: out of line it was a call per
     /// piece, and every value the loop keeps across a call is a spill.
     #[inline(always)]
@@ -414,8 +455,15 @@ impl Scanner {
                 &self.clitics2,
             );
         }
-        // 3. Up to the bound of digits.
-        if c & Role::Digit.bit() != 0 {
+        // 3. Up to the bound of digits; and, behind the same test, the
+        //    opening run of a template that has one: no letter alternative
+        //    takes a character of it (see the module documentation), so the
+        //    first alternative is read here and the pieces of every other
+        //    kind pay no test for it.
+        if c & (Role::Digit.bit() | Role::Run.bit()) != 0 {
+            if c & Role::Run.bit() != 0 {
+                return Some(self.roles.run_end(text, after, Role::Run.bit()));
+            }
             let mut end = after;
             let mut count = 1;
             while count < self.digit_cap {

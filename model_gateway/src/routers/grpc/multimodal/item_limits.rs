@@ -14,9 +14,10 @@
 use std::collections::HashMap;
 
 use llm_multimodal::Modality;
+use smg_worker::identity::basic::{RuntimeType, Worker};
 
 use super::plan::MediaPlan;
-use crate::worker::{RuntimeType, Worker, WorkerRegistry};
+use crate::routers::common::snapshot::WorkerRegistry;
 
 /// Worker label carrying the engine's per-request media limits as
 /// `<modality>=<count>` pairs (`image=8,video=2`): vLLM's
@@ -202,7 +203,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::{super::plan::tests::image_urls, *};
-    use crate::worker::test_support::{grpc_worker, registry_with};
+    use crate::routers::common::snapshot::test_support::{grpc_worker, registry_with};
 
     const MODEL: &str = "vision-model";
 

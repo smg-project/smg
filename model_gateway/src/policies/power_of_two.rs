@@ -3,15 +3,13 @@
 use std::{cmp::Ordering, sync::Arc};
 
 use rand::RngExt;
+use smg_worker::{identity::basic::Worker, load::state::LoadReceiver};
 
 use super::{
     draw_eligible, get_healthy_worker_indices, LeastLoadPolicy, LoadBalancingPolicy,
     SelectWorkerInfo,
 };
-use crate::{
-    config::PowerOfTwoLoadMetric,
-    worker::{load::state::LoadReceiver, Worker},
-};
+use crate::config::PowerOfTwoLoadMetric;
 
 /// Power-of-two choices policy: sample two distinct healthy workers uniformly
 /// and route to the one with the lower expected wait, scored exactly like
@@ -171,12 +169,10 @@ mod tests {
     use std::collections::HashMap;
 
     use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
+    use smg_worker::load::state::{one_rank_load, one_rank_load_reqs_only, TestFeed};
 
     use super::*;
-    use crate::{
-        policies::test_support::{fed_pair, make_worker},
-        worker::load::state::{one_rank_load, one_rank_load_reqs_only, TestFeed},
-    };
+    use crate::policies::test_support::{fed_pair, make_worker};
 
     #[test]
     fn single_worker_always_selected() {

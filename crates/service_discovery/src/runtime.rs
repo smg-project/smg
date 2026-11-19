@@ -1,0 +1,242 @@
+//! Worker discovery as a running host uses it, and the one conversion
+//! that produces it from configuration.
+
+use std::{error::Error, sync::Arc, time::Duration};
+
+use tokio::task;
+
+use super::{
+    config::{
+        DiscoveryConfig, DiscoveryConfigError, DiscoveryConfigResult, KubernetesDiscoveryConfig,
+    },
+    consul::{self, ConsulProviderConfig},
+    file::{self, FileProviderConfig},
+    host::DiscoveryHost,
+    kubernetes::{self, ModelIdSource, ServiceDiscoveryConfig},
+    provider::Roles,
+    slurm::{self, SlurmProviderConfig},
+};
+
+/// The selected worker-discovery provider, resolved for the running host.
+///
+/// `Option<RuntimeDiscoveryConfig>` is on versus off; a variant carries no
+/// `enabled` flag of its own.
+#[derive(Debug, Clone)]
+pub enum RuntimeDiscoveryConfig {
+    Kubernetes(ServiceDiscoveryConfig),
+    File(FileProviderConfig),
+    Slurm(SlurmProviderConfig),
+    Consul(ConsulProviderConfig),
+}
+
+impl RuntimeDiscoveryConfig {
+    /// Resolve configuration into its runtime form.
+    ///
+    /// Every input surface of a host (a command line, a language binding)
+    /// converts through here, so a setting cannot reach the runtime through one
+    /// surface and be dropped by another. Values arrive as the surface built
+    /// them, defaults included: a command line's port 80 and
+    /// `KubernetesDiscoveryConfig`'s port 8000 are each kept, not reconciled.
+    pub fn from_config(
+        discovery: &DiscoveryConfig,
+        roles: Option<Roles>,
+    ) -> DiscoveryConfigResult<Self> {
+        match discovery {
+            DiscoveryConfig::Kubernetes(kubernetes) => {
+                Ok(Self::Kubernetes(kubernetes_runtime(kubernetes, roles)?))
+            }
+            DiscoveryConfig::File(file) => Ok(Self::File(FileProviderConfig::new(
+                file.path.clone(),
+                Duration::from_secs(file.check_interval_secs),
+                roles,
+            )?)),
+            DiscoveryConfig::Slurm(slurm) => {
+                Ok(Self::Slurm(SlurmProviderConfig::new(slurm, roles)?))
+            }
+            DiscoveryConfig::Consul(consul) => {
+                Ok(Self::Consul(ConsulProviderConfig::new(consul, roles)?))
+            }
+        }
+    }
+}
+
+fn kubernetes_runtime(
+    config: &KubernetesDiscoveryConfig,
+    roles: Option<Roles>,
+) -> DiscoveryConfigResult<ServiceDiscoveryConfig> {
+    let model_id_source = config
+        .model_id_source
+        .as_deref()
+        .map(|source| {
+            ModelIdSource::parse(source).map_err(|reason| DiscoveryConfigError::InvalidValue {
+                field: "discovery.model_id_source".to_string(),
+                value: source.to_string(),
+                reason,
+            })
+        })
+        .transpose()?;
+
+    Ok(ServiceDiscoveryConfig {
+        selector: config.selector.clone(),
+        check_interval: Duration::from_secs(config.check_interval_secs),
+        port: config.port,
+        namespace: config.namespace.clone(),
+        disaggregated_mode: matches!(
+            roles,
+            Some(Roles::PrefillDecode | Roles::EncodePrefillDecode)
+        ),
+        encode_selector: config.encode_selector.clone(),
+        prefill_selector: config.prefill_selector.clone(),
+        decode_selector: config.decode_selector.clone(),
+        bootstrap_port_annotation: config.bootstrap_port_annotation.clone(),
+        worker_ports_annotation: config.worker_ports_annotation.clone(),
+        kv_connector_annotation: config.kv_connector_annotation.clone(),
+        kv_engine_id_annotation: config.kv_engine_id_annotation.clone(),
+        model_id_source,
+    })
+}
+
+/// Start the selected provider's discovery task.
+pub async fn start_service_discovery(
+    config: RuntimeDiscoveryConfig,
+    host: Arc<dyn DiscoveryHost>,
+) -> Result<task::JoinHandle<()>, Box<dyn Error + Send + Sync>> {
+    match config {
+        RuntimeDiscoveryConfig::Kubernetes(config) => {
+            Ok(kubernetes::start_kubernetes_discovery(config, host).await?)
+        }
+        RuntimeDiscoveryConfig::File(config) => Ok(file::start_file_discovery(config, host)),
+        RuntimeDiscoveryConfig::Slurm(config) => Ok(slurm::start_slurm_discovery(config, host)?),
+        RuntimeDiscoveryConfig::Consul(config) => Ok(consul::start_consul_discovery(config, host)?),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{ConsulDiscoveryConfig, FileDiscoveryConfig, SlurmDiscoveryConfig};
+
+    fn kubernetes(config: &DiscoveryConfig, roles: Option<Roles>) -> ServiceDiscoveryConfig {
+        let Ok(RuntimeDiscoveryConfig::Kubernetes(runtime)) =
+            RuntimeDiscoveryConfig::from_config(config, roles)
+        else {
+            panic!("expected Kubernetes runtime discovery");
+        };
+        runtime
+    }
+
+    /// Every Kubernetes setting reaches the runtime, the KV annotation names
+    /// included: those once flowed through only one of two hand-written
+    /// conversions.
+    #[test]
+    fn kubernetes_settings_reach_the_runtime() {
+        let config = DiscoveryConfig::Kubernetes(KubernetesDiscoveryConfig {
+            namespace: Some("prod".to_string()),
+            port: 9000,
+            check_interval_secs: 45,
+            selector: [("app".to_string(), "worker".to_string())].into(),
+            bootstrap_port_annotation: "example.com/bootstrap".to_string(),
+            worker_ports_annotation: "example.com/ports".to_string(),
+            kv_connector_annotation: "example.com/connector".to_string(),
+            kv_engine_id_annotation: "example.com/engine-id".to_string(),
+            model_id_source: Some("namespace".to_string()),
+            ..Default::default()
+        });
+
+        let runtime = kubernetes(&config, Some(Roles::Regular));
+
+        assert_eq!(runtime.namespace.as_deref(), Some("prod"));
+        assert_eq!(runtime.port, 9000);
+        assert_eq!(runtime.check_interval, Duration::from_secs(45));
+        assert_eq!(
+            runtime.selector.get("app").map(String::as_str),
+            Some("worker")
+        );
+        assert_eq!(runtime.bootstrap_port_annotation, "example.com/bootstrap");
+        assert_eq!(runtime.worker_ports_annotation, "example.com/ports");
+        assert_eq!(runtime.kv_connector_annotation, "example.com/connector");
+        assert_eq!(runtime.kv_engine_id_annotation, "example.com/engine-id");
+        assert!(matches!(
+            runtime.model_id_source,
+            Some(ModelIdSource::Namespace)
+        ));
+        assert!(!runtime.disaggregated_mode);
+    }
+
+    #[test]
+    fn disaggregated_modes_select_role_selectors() {
+        let config = DiscoveryConfig::Kubernetes(KubernetesDiscoveryConfig::default());
+        for roles in [Roles::PrefillDecode, Roles::EncodePrefillDecode] {
+            assert!(
+                kubernetes(&config, Some(roles)).disaggregated_mode,
+                "{roles:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn file_settings_reach_the_runtime() {
+        let config = DiscoveryConfig::File(FileDiscoveryConfig {
+            path: "/run/smg/workers.json".into(),
+            check_interval_secs: 15,
+        });
+        let Ok(RuntimeDiscoveryConfig::File(runtime)) =
+            RuntimeDiscoveryConfig::from_config(&config, Some(Roles::Regular))
+        else {
+            panic!("expected file runtime discovery");
+        };
+        assert_eq!(runtime.path, std::path::Path::new("/run/smg/workers.json"));
+        assert_eq!(runtime.check_interval, Duration::from_secs(15));
+    }
+
+    #[test]
+    fn slurm_settings_reach_the_runtime() {
+        let config = DiscoveryConfig::Slurm(SlurmDiscoveryConfig {
+            job_names: vec!["smg-worker".to_string()],
+            encode_job_names: vec![],
+            prefill_job_names: vec![],
+            decode_job_names: vec![],
+            port: 8000,
+            bootstrap_port: None,
+            user: None,
+            account: None,
+            partition: None,
+            check_interval_secs: 10,
+        });
+        let Ok(RuntimeDiscoveryConfig::Slurm(runtime)) =
+            RuntimeDiscoveryConfig::from_config(&config, Some(Roles::Regular))
+        else {
+            panic!("expected Slurm runtime discovery");
+        };
+        assert_eq!(runtime.check_interval, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn consul_settings_reach_the_runtime() {
+        let config = DiscoveryConfig::Consul(ConsulDiscoveryConfig {
+            service: "smg-worker".to_string(),
+            address: Some("http://consul.internal:8500".to_string()),
+            datacenter: Some("dc2".to_string()),
+            check_interval_secs: 10,
+        });
+        let Ok(RuntimeDiscoveryConfig::Consul(runtime)) =
+            RuntimeDiscoveryConfig::from_config(&config, Some(Roles::Regular))
+        else {
+            panic!("expected Consul runtime discovery");
+        };
+        assert_eq!(runtime.check_interval, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn invalid_model_id_source_is_a_config_error() {
+        let config = DiscoveryConfig::Kubernetes(KubernetesDiscoveryConfig {
+            model_id_source: Some("pod-name".to_string()),
+            ..Default::default()
+        });
+        let err = RuntimeDiscoveryConfig::from_config(&config, Some(Roles::Regular)).unwrap_err();
+        assert!(
+            matches!(err, DiscoveryConfigError::InvalidValue { ref field, .. } if field == "discovery.model_id_source"),
+            "{err}"
+        );
+    }
+}

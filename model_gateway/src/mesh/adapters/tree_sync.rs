@@ -30,13 +30,11 @@ use kv_index::TenantId;
 use rand::seq::IndexedRandom;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use smg_mesh::{DrainHandle, StreamNamespace, MAX_STREAM_CHUNK_BYTES};
+use smg_worker::identity::endpoint::Endpoint;
 use tracing::{debug, error, trace, warn};
 use uuid::Uuid;
 
-use crate::{
-    policies::{TreeHandle, TreeKind},
-    worker::identity::endpoint::Endpoint,
-};
+use crate::policies::{TreeHandle, TreeKind};
 
 const PREFIX: &str = "td:";
 pub(crate) const REPAIR_REQUEST_PREFIX: &str = "tree:req:";

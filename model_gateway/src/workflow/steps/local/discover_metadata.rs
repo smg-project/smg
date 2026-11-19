@@ -3,23 +3,25 @@
 use std::{collections::HashMap, time::Duration};
 
 use async_trait::async_trait;
+use openai_protocol::UNKNOWN_MODEL_ID;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use smg_worker::identity::{
+    basic::ConnectionMode,
+    endpoint::Endpoint,
+    sampling_defaults::{SamplingDefaults, DEFAULT_SAMPLING_PARAMS_LABEL},
+};
 use tool_parser::GrammarStart;
 use tracing::{debug, warn};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use crate::{
-    routers::grpc::client::{flat_labels, GrpcClient},
-    worker::{
-        identity::{endpoint::Endpoint, sampling_defaults::SamplingDefaults},
-        ConnectionMode, DEFAULT_SAMPLING_PARAMS_LABEL, UNKNOWN_MODEL_ID,
-    },
+    routers::grpc::client::flat_labels,
     workflow::{
         data::{WorkerKind, WorkerWorkflowData},
         steps::{
             local::create_worker::resolve_model_id,
-            util::{grpc_base_url, http_base_url},
+            util::{connect_grpc_as, grpc_base_url, http_base_url},
         },
     },
 };
@@ -354,30 +356,6 @@ async fn fetch_vllm_http_metadata_checked(
     Ok(labels)
 }
 
-/// Re-read the KV transfer engine id a gRPC engine reports, for a PD worker
-/// that came back on the same address (#2491): a restarted engine process
-/// carries a new id, and a handoff minted for the old one strands the decode.
-///
-/// Unlike registration discovery, a server-info failure is an error here
-/// rather than a tolerated gap: the caller must tell a read that did not
-/// complete (retry later) from an engine that reports no id (nothing to
-/// retry).
-pub(crate) async fn discover_grpc_kv_engine_id(
-    url: &str,
-    runtime_type: &str,
-) -> Result<Option<String>, String> {
-    let client = GrpcClient::connect(&grpc_base_url(url), runtime_type)
-        .await
-        .map_err(|e| format!("Failed to connect to gRPC: {e}"))?;
-    let mut labels = client
-        .get_server_info()
-        .await
-        .map_err(|e| format!("Failed to fetch gRPC server info: {e}"))?
-        .to_labels();
-    normalize_grpc_keys(&mut labels);
-    Ok(labels.remove("kv_engine_id").filter(|id| !id.is_empty()))
-}
-
 /// The gRPC model and server info as labels. Registration tolerates a
 /// server-info failure (`strict == false`: the model info alone is kept); a
 /// refresh must not mistake it for an engine that reports less, so with
@@ -389,18 +367,17 @@ async fn fetch_grpc_metadata(
 ) -> Result<(HashMap<String, String>, String), String> {
     let grpc_url = grpc_base_url(url);
 
-    let client = GrpcClient::connect(&grpc_url, runtime_type)
+    let connection = connect_grpc_as(&grpc_url, runtime_type)
         .await
         .map_err(|e| format!("Failed to connect to gRPC: {e}"))?;
 
-    let mut labels = client
-        .get_model_info()
+    let mut labels = connection
+        .model_labels()
         .await
-        .map_err(|e| format!("Failed to fetch gRPC model info: {e}"))?
-        .to_labels();
+        .map_err(|e| format!("Failed to fetch gRPC model info: {e}"))?;
 
-    match client.get_server_info().await {
-        Ok(info) => labels.extend(info.to_labels()),
+    match connection.server_labels().await {
+        Ok(server) => labels.extend(server),
         // An engine that does not implement the call offers nothing to read;
         // any other failure fails a strict read.
         Err(e) if strict && e.code() != tonic::Code::Unimplemented => {
@@ -977,7 +954,7 @@ mod tests {
     #[tokio::test]
     async fn an_engine_that_refuses_the_connection_leaves_registration_empty_and_fails_a_strict_read(
     ) {
-        use crate::worker::test_support::RefusedAddress;
+        use smg_worker::test_support::RefusedAddress;
 
         let refused = RefusedAddress::reserve();
         let base = refused.http_url();
@@ -1172,7 +1149,7 @@ mod tests {
     /// named, strict or not.
     #[tokio::test]
     async fn an_engine_that_refuses_the_connection_fails_the_grpc_read_at_the_dial() {
-        use crate::worker::test_support::RefusedAddress;
+        use smg_worker::test_support::RefusedAddress;
 
         let refused = RefusedAddress::reserve();
         let url = format!("grpc://{}", refused.addr());
@@ -1355,7 +1332,7 @@ mod tests {
     /// ends with the request URL, the query kept.
     #[tokio::test]
     async fn a_refused_connection_goes_without_the_clients_url() {
-        use crate::worker::test_support::RefusedAddress;
+        use smg_worker::test_support::RefusedAddress;
 
         let refused = RefusedAddress::reserve();
         let url = format!("{}?token=s3cret", refused.http_url());

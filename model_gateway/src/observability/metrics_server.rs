@@ -5,6 +5,7 @@ use std::{net::SocketAddr, time::Duration};
 
 use axum::{extract::State, response::IntoResponse, routing::get, Router};
 use metrics_exporter_prometheus::PrometheusHandle;
+use smg_worker::metrics::series as worker_series;
 use tokio::task::JoinHandle;
 use tracing::{error, info};
 
@@ -21,7 +22,7 @@ async fn prometheus_handler(State(state): State<MetricsState>) -> impl IntoRespo
     super::metrics::record_detokenize_activity();
     super::metrics::record_tokenizer_encode_activity();
     let mut body = state.handle.render();
-    super::worker_metrics::render_into(&mut body);
+    worker_series::render_into(&mut body);
     (
         [(
             http::header::CONTENT_TYPE,
@@ -67,7 +68,7 @@ pub async fn start_metrics_server(
         loop {
             tokio::time::sleep(Duration::from_secs(UPKEEP_INTERVAL_SECS)).await;
             upkeep_handle.run_upkeep();
-            super::worker_metrics::run_upkeep();
+            worker_series::run_upkeep();
         }
     });
 

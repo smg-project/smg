@@ -12,6 +12,7 @@ use openai_protocol::{
     worker::ConstrainedDecoding,
 };
 use serde_json::{json, Value};
+use smg_worker::identity::basic::{Worker, WorkerType};
 use symphony::{
     grammar::{GrammarStart, Options},
     Format, Grammar, GrammarBackend, OutputAnswer, OutputChoice, Spelling, Turn, Unspelled,
@@ -32,7 +33,6 @@ use crate::{
         spec::{scans_for_tool_calls_for, ChatResponseSpec},
         utils::{ModelNames, Names, TagVocabulary, WorkerDecoding},
     },
-    worker::{Worker, WorkerType},
 };
 
 /// The schema a JSON `response_format` asks the answer to follow, borrowed from the request (owned
@@ -126,7 +126,11 @@ pub(super) fn tagged(
 /// The tag of a forced call to one of `tools`, at most one when `one_call`, with
 /// `reasoning_open` when the prompt leaves the model inside its thought and `thought_closed` when
 /// it closed the thought itself and wrote the template's text after it, in the `vocabulary` the
-/// worker's grammar compiler takes ([`tagged`]).
+/// worker's grammar compiler takes ([`tagged`]). A registry table's tag that opens with free
+/// text, the prefix an open thought takes on workers that name no one start for the grammar
+/// ([`opens_with_free_text`]), comes marked ([`Prepared::OpensWithFreeText`]): text that owes
+/// nothing at its end does not hold the model to the call, so preparation gives the older
+/// registry's schema in the tag's place where that schema can be built ([`Prepared::held_by`]).
 #[expect(
     clippy::too_many_arguments,
     reason = "the table, the request's ask, where the prompt and the engine leave the model, \
@@ -143,7 +147,7 @@ fn calls_tag(
     start: GrammarStart,
     vocabulary: TagVocabulary,
     continues: bool,
-) -> Result<Option<ToolConstraint>, SymphonyError> {
+) -> PreparedConstraint {
     let grammar = format.grammar_for(
         tools,
         Options {
@@ -154,14 +158,115 @@ fn calls_tag(
             start,
         },
     );
-    tagged(
+    // The response template's table keeps its tag unmarked: it has no other syntax the older
+    // registry could constrain and the table still read ([`tagged`]).
+    let free = !compiled && grammar.as_ref().is_some_and(opens_with_free_text);
+    let first_token = start == GrammarStart::FirstToken;
+    let tag = tagged(
         grammar,
         vocabulary,
         compiled,
         model,
         "a forced tool choice",
         continues,
-    )
+    )?;
+    Ok(match tag {
+        Some(constraint) if free => Prepared::OpensWithFreeText {
+            constraint,
+            first_token,
+        },
+        Some(constraint) => Prepared::Constraint {
+            constraint,
+            first_token,
+            table: true,
+        },
+        None => Prepared::None,
+    })
+}
+
+/// Whether `grammar` opens with free text, which owes nothing at its end: a tag that begins so
+/// does not hold the model to what follows it.
+fn opens_with_free_text(grammar: &Grammar) -> bool {
+    match grammar {
+        Grammar::AnyText { .. } => true,
+        Grammar::Sequence(elements) => elements.first().is_some_and(opens_with_free_text),
+        _ => false,
+    }
+}
+
+/// Whether `schema`, the older registry's JSON schema for a forced call to `tools`, keeps what
+/// every reference in the tools' parameters points at: each is a local one (`#` and a JSON
+/// pointer) whose target in `schema` is its target in the tool's own parameters. The registry
+/// writes a named function's parameters as they are, and for a list of tools one schema that
+/// nests each tool's parameters and lifts their `$defs` to its root, where a reference to
+/// anything else (an entry of `definitions`, the tool's own root) points nowhere or at another
+/// value. A schema that loses a target is not sent in a tag's place ([`Prepared::held_by`]).
+/// A constraint of another kind, which the registry does not give with no parser named, is
+/// taken as it is.
+pub(crate) fn keeps_references(schema: &ToolConstraint, tools: &[Tool]) -> bool {
+    let ToolConstraint::JsonSchema(schema) = schema else {
+        return true;
+    };
+    let mut references = tools
+        .iter()
+        .map(|tool| tool.function.parameters_schema())
+        .flat_map(|parameters| {
+            references_in(parameters)
+                .into_iter()
+                .map(move |reference| (parameters, reference))
+        })
+        .peekable();
+    if references.peek().is_none() {
+        return true;
+    }
+    let Ok(schema) = serde_json::from_str::<Value>(schema) else {
+        return false;
+    };
+    references.all(|(parameters, reference)| {
+        reference.strip_prefix('#').is_some_and(|pointer| {
+            parameters
+                .pointer(pointer)
+                .is_some_and(|target| schema.pointer(pointer) == Some(target))
+        })
+    })
+}
+
+/// The text of every reference written in `schema`: each `$ref`, `$dynamicRef` and
+/// `$recursiveRef` that stands where a schema does. The values of `const`, `enum`, `default`
+/// and `examples` are data, and a member named like a reference there is none. The members of
+/// `properties`, `patternProperties`, `$defs`, `definitions`, `dependentSchemas` and
+/// `dependencies` are schemas under names of their own, so a property named `default` is read.
+/// Any other keyword is followed, so one this does not know cannot hide a reference.
+fn references_in(schema: &Value) -> Vec<&str> {
+    let mut found = Vec::new();
+    // Each value still to read, with whether its members are schemas under names of their own.
+    let mut pending = vec![(schema, false)];
+    while let Some((value, named)) = pending.pop() {
+        match value {
+            Value::Object(members) if named => {
+                pending.extend(members.values().map(|member| (member, false)));
+            }
+            Value::Object(members) => {
+                for (key, member) in members {
+                    match (key.as_str(), member) {
+                        ("$ref" | "$dynamicRef" | "$recursiveRef", Value::String(reference)) => {
+                            found.push(reference.as_str());
+                        }
+                        ("const" | "enum" | "default" | "examples", _) => {}
+                        (
+                            "properties" | "patternProperties" | "$defs" | "definitions"
+                            | "dependentSchemas" | "dependencies",
+                            _,
+                        ) => pending.push((member, true)),
+                        _ => pending.push((member, false)),
+                    }
+                }
+            }
+            Value::Array(items) => pending.extend(items.iter().map(|item| (item, false))),
+            _ => {}
+        }
+    }
+    found
 }
 
 /// The tag of a JSON answer following `schema`, with `reasoning_open` when the prompt leaves the
@@ -216,14 +321,15 @@ pub(crate) fn grammar_start_from(start: WorkerGrammarStart) -> GrammarStart {
 
 /// Where the model's `workers` start a grammar, before one is selected: the start every one of
 /// them names in its `constrained_decoding_start` label (parsed once at its construction,
-/// [`WorkerMetadata::decoding`](crate::worker::identity::metadata::WorkerMetadata::decoding): this walk runs on every
+/// [`WorkerMetadata::decoding`](smg_worker::identity::metadata::WorkerMetadata::decoding): this walk runs on every
 /// request and looks nothing up), a prefill or encode worker left out
 /// since it generates no token a grammar constrains (the roles that do are allow-listed, so a
 /// role added later is left out until it is named); `Either` when one that starts at the first
 /// token stands beside one that does not, since no one tag fits both (the answer keeps the
 /// prefix a forced call takes: [`Format::answer_grammar_for`]); unknown when none says, and
 /// when workers that start after their reasoning parser stand beside ones that do not say,
-/// since the unknown start's tags fit both (a forced call's prefix, an answer's schema alone).
+/// since the unknown start's tags fit both (a forced call's tag, or the older registry's schema
+/// where the table's tag would open with free text; an answer's schema alone).
 pub(crate) fn grammar_start_of(workers: &[Arc<dyn Worker>]) -> GrammarStart {
     let mut starts = workers
         .iter()
@@ -605,7 +711,8 @@ pub(crate) fn constraint(
 /// worker's own start and vocabulary ([`Prepared::Answer`], [`AnswerTag`]), since a pool whose
 /// workers start the grammar at different places has no one answer tag that fits them all.
 /// [`Prepared::None`] when no table reads the response ([`reads`]), the request asks neither, or
-/// the table has no tag for the call; the older registry then decides as before. An error refuses
+/// the table has no tag for the call; the older registry then decides as before. A call's tag
+/// that opens with free text comes marked ([`Prepared::OpensWithFreeText`]). An error refuses
 /// the request: the response template's table cannot constrain the call it is asked (the answer's
 /// refusal comes with the derivation), or a chat request's `regex` or `ebnf` constraint would
 /// apply outside its format. `thought_closed` says the prompt closed the thought itself and wrote
@@ -644,15 +751,7 @@ pub(crate) fn constraint_for(
             start,
             vocabulary,
             continues,
-        )
-        .map(|tag| match tag {
-            Some(constraint) => Prepared::Constraint {
-                constraint,
-                first_token: start == GrammarStart::FirstToken,
-                table: true,
-            },
-            None => Prepared::None,
-        });
+        );
     }
     Ok(match asks.answer_schema() {
         Some(schema) => Prepared::Answer(Arc::new(AnswerTag {
@@ -760,6 +859,15 @@ pub(crate) enum Prepared {
         /// request's own schema where no table reads ([`WorkerConstraint::table`]).
         table: bool,
     },
+    /// A forced call's tag a registry table built that opens with free text ([`calls_tag`]),
+    /// which does not hold the model to the call. Preparation gives the older registry's schema
+    /// in its place, or keeps the tag as the table's own where that schema cannot be built
+    /// ([`Self::held_by`]).
+    OpensWithFreeText {
+        constraint: ToolConstraint,
+        /// As [`Self::Constraint`]'s.
+        first_token: bool,
+    },
     /// A JSON answer's tag, which derives for the selected worker's own start as the `auto` tag
     /// does ([`AnswerTag`]): the schema alone behind a reasoning parser's gate or where the engine
     /// does not say, the closed thought then the schema from the first token. A pool whose
@@ -770,10 +878,32 @@ pub(crate) enum Prepared {
 }
 
 impl Prepared {
+    /// What holds a forced call where the table's tag opens with free text
+    /// ([`Self::OpensWithFreeText`]): the constraint `schema` gives, the older registry's JSON
+    /// schema, which holds the model to the call wherever the engine starts the grammar; or the
+    /// table's own tag where `schema` gives none, so that a request that schema cannot spell is
+    /// served, not refused. Anything else stays as found, and `schema` is not asked.
+    pub(crate) fn held_by(self, schema: impl FnOnce() -> Option<ToolConstraint>) -> Self {
+        match self {
+            Self::OpensWithFreeText {
+                constraint,
+                first_token,
+            } => match schema() {
+                Some(schema) => Self::from(Some(schema)),
+                None => Self::Constraint {
+                    constraint,
+                    first_token,
+                    table: true,
+                },
+            },
+            found => found,
+        }
+    }
+
     /// The constraint a worker whose engine starts the grammar at `start` and whose compiler
     /// takes `vocabulary` takes: a JSON answer's tag derived for it, what was found as it is
-    /// otherwise. The tests read what preparation found through it; the decision
-    /// ([`worker_constraint`]) reads each variant itself.
+    /// otherwise, a marked tag too. The tests read what preparation found through it; the
+    /// decision ([`worker_constraint`]) reads each variant itself.
     #[cfg(test)]
     pub(crate) fn for_start(
         self,
@@ -782,7 +912,9 @@ impl Prepared {
     ) -> Result<Option<ToolConstraint>, SymphonyError> {
         match self {
             Self::None => Ok(None),
-            Self::Constraint { constraint, .. } => Ok(Some(constraint)),
+            Self::Constraint { constraint, .. } | Self::OpensWithFreeText { constraint, .. } => {
+                Ok(Some(constraint))
+            }
             Self::Answer(answer) => answer.for_start(start, vocabulary),
         }
     }
@@ -1112,6 +1244,12 @@ pub(crate) fn worker_constraint(
             first_token,
             table,
         } => (Some(constraint), false, None, first_token, table),
+        // Preparation resolves a marked tag ([`Prepared::held_by`]); one nothing resolved is
+        // the table's tag as it was built.
+        Prepared::OpensWithFreeText {
+            constraint,
+            first_token,
+        } => (Some(constraint), false, None, first_token, true),
         Prepared::None => (None, false, None, false, false),
     };
     Ok(WorkerConstraint {
@@ -1347,9 +1485,10 @@ mod tests {
     /// calls when the prompt leaves the thought open: nothing after the reasoning parser's gate
     /// (a JSON answer then needs no tag; the request's own schema goes to the engine as it is),
     /// the thought closed first from the first token, the schema alone (the request's own, no
-    /// tag) when the worker does not say, and for the calls the free-text prefix when the
-    /// model's workers name different starts. The answer's tag derives for the selected worker,
-    /// whatever start the pool names.
+    /// tag) when the worker does not say, and for the calls the free-text prefix, marked as
+    /// such, when the model's workers name different starts or none: free text owes the call
+    /// nothing, so preparation gives the older registry's schema in the tag's place. The
+    /// answer's tag derives for the selected worker, whatever start the pool names.
     #[test]
     fn the_workers_grammar_start_shapes_what_precedes_a_tables_answer_and_calls() {
         let deepseek = names(Some("deepseek_v4"), Some("deepseek_v4"));
@@ -1431,10 +1570,34 @@ mod tests {
             );
             serde_json::from_str::<Value>(&tag).expect("JSON")
         };
-        assert_eq!(
-            call_of(symphony::GrammarStart::Unknown)["format"]["elements"][0]["type"],
-            "any_text"
-        );
+        for start in [
+            symphony::GrammarStart::Unknown,
+            symphony::GrammarStart::Either,
+        ] {
+            let Ok(Prepared::OpensWithFreeText {
+                constraint: ToolConstraint::StructuralTag(tag),
+                first_token,
+            }) = super::constraint(
+                ParserChoice::Symphony,
+                &deepseek,
+                Asks::Chat(&forced),
+                &tools(),
+                true,
+                false,
+                start,
+                TagVocabulary::Current,
+                &templates(),
+            )
+            else {
+                panic!("{start:?}: a tag marked as opening with free text");
+            };
+            let tag: Value = serde_json::from_str(&tag).expect("JSON");
+            assert_eq!(
+                tag["format"]["elements"][0]["type"], "any_text",
+                "{start:?}: {tag}"
+            );
+            assert!(!first_token, "{start:?}: not built for the first token");
+        }
         let bare = call_of(symphony::GrammarStart::AfterReasoning);
         assert_eq!(
             bare["format"]["elements"][0]["type"], "const_string",
@@ -1443,6 +1606,208 @@ mod tests {
         let first = call_of(symphony::GrammarStart::FirstToken);
         assert_eq!(first["format"]["elements"][0]["end"], "</think>");
         assert_eq!(first["format"]["elements"][1], bare["format"]);
+    }
+
+    /// No tag of a registry table that opens with free text goes unmarked. Over every table,
+    /// wherever the workers start a grammar, the thought never opened, closed by the prompt or
+    /// open, one call and many: the table's tag opens with free text only from an open thought
+    /// on workers that name no one start, the tag is marked exactly there, and every other tag
+    /// stands unmarked.
+    #[test]
+    fn a_forced_calls_tag_is_marked_only_where_it_opens_with_free_text() {
+        let tools = tools();
+        let mut marked = 0;
+        for table in symphony::formats::Table::ALL {
+            let format = table.format();
+            for (reasoning_open, thought_closed) in [(false, false), (false, true), (true, false)] {
+                for start in [
+                    symphony::GrammarStart::Unknown,
+                    symphony::GrammarStart::Either,
+                    symphony::GrammarStart::AfterReasoning,
+                    symphony::GrammarStart::FirstToken,
+                ] {
+                    for one_call in [true, false] {
+                        let cell = format!(
+                            "{}, open {reasoning_open}, closed {thought_closed}, {start:?}, one \
+                             call {one_call}",
+                            table.name()
+                        );
+                        let built = format.grammar_for(
+                            &tools,
+                            Options {
+                                at_least_one: true,
+                                reasoning_open,
+                                thought_closed,
+                                one_call,
+                                start,
+                            },
+                        );
+                        let free = built.as_ref().is_some_and(opens_with_free_text);
+                        let found = calls_tag(
+                            &format,
+                            false,
+                            "m",
+                            &tools,
+                            one_call,
+                            reasoning_open,
+                            thought_closed,
+                            start,
+                            TagVocabulary::Current,
+                            false,
+                        )
+                        .expect("a registry table refuses nothing");
+                        if free {
+                            assert!(
+                                reasoning_open
+                                    && matches!(
+                                        start,
+                                        symphony::GrammarStart::Unknown
+                                            | symphony::GrammarStart::Either
+                                    ),
+                                "{cell}: free text only from an open thought on workers that \
+                                 name no one start"
+                            );
+                            assert!(
+                                matches!(found, Prepared::OpensWithFreeText { .. }),
+                                "{cell}: the tag is marked, not {found:?}"
+                            );
+                            marked += 1;
+                        } else {
+                            let stands = match &found {
+                                Prepared::Constraint { table: true, .. } => true,
+                                Prepared::None => false,
+                                other => panic!("{cell}: {other:?}"),
+                            };
+                            assert_eq!(stands, built.is_some(), "{cell}: every other tag stands");
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            marked > 0,
+            "the sweep meets tables whose tag opens with free text"
+        );
+    }
+
+    /// The older registry's schema keeps a reference when its target there is its target in the
+    /// tool's own parameters: any local reference of a named function, whose parameters are the
+    /// schema; a `$defs` entry under the one schema for a list of tools, which lifts those and
+    /// nothing else. A reference to an entry of `definitions` or to the tool's own root under
+    /// that list, one that resolves nowhere, one that is no local pointer, and one whose target
+    /// the schema carries with another value are not kept.
+    /// A member named like a reference inside data (`const`, `enum`, `default`, `examples`) is
+    /// none; a property named like one of those keywords is still read.
+    #[test]
+    fn a_schema_keeps_a_reference_whose_target_it_carries() {
+        let tool = |parameters: &Value| -> Tool {
+            serde_json::from_value(json!({
+                "type": "function",
+                "function": {"name": "lookup", "parameters": parameters},
+            }))
+            .expect("a tool")
+        };
+        let referring = |reference: &str| {
+            json!({
+                "type": "object",
+                "properties": {"place": {"$ref": reference}},
+                "$defs": {"place": {"type": "string"}},
+                "definitions": {"place": {"type": "string"}},
+            })
+        };
+        // A named function's parameters are the schema as they are.
+        let own = |parameters: &Value| ToolConstraint::JsonSchema(parameters.to_string());
+        // A list's one schema nests the parameters and carries `defs` at its root.
+        let listed = |parameters: &Value, defs: Value| {
+            ToolConstraint::JsonSchema(
+                json!({
+                    "type": "array",
+                    "items": {"anyOf": [{"properties": {"parameters": parameters}}]},
+                    "$defs": defs,
+                })
+                .to_string(),
+            )
+        };
+        let place = || json!({"place": {"type": "string"}});
+        for (reference, named, list) in [
+            ("#/$defs/place", true, true),
+            ("#/definitions/place", true, false),
+            ("#", true, false),
+            ("#/$defs/missing", false, false),
+            ("https://example.com/place.json", false, false),
+        ] {
+            let parameters = referring(reference);
+            let tools = [tool(&parameters)];
+            assert_eq!(
+                keeps_references(&own(&parameters), &tools),
+                named,
+                "{reference}: a named function"
+            );
+            assert_eq!(
+                keeps_references(&listed(&parameters, place()), &tools),
+                list,
+                "{reference}: a list of tools"
+            );
+        }
+        let parameters = referring("#/$defs/place");
+        let other = json!({"place": {"type": "integer"}});
+        assert!(
+            !keeps_references(&listed(&parameters, other), &[tool(&parameters)]),
+            "another value under the name"
+        );
+        for (parameters, list) in [
+            (
+                json!({"type": "object", "examples": [{"$ref": "literal"}]}),
+                true,
+            ),
+            (
+                json!({"type": "object", "default": {"$ref": "literal"}}),
+                true,
+            ),
+            (
+                json!({"type": "object", "properties": {"kind": {"const": {"$ref": "literal"}}}}),
+                true,
+            ),
+            (
+                json!({"type": "object", "properties": {"kind": {"enum": [{"$ref": "literal"}]}}}),
+                true,
+            ),
+            (
+                json!({
+                    "type": "object",
+                    "properties": {"default": {"$ref": "#/definitions/place"}},
+                    "definitions": {"place": {"type": "string"}},
+                }),
+                false,
+            ),
+            (
+                json!({
+                    "type": "object",
+                    "properties": {"examples": {"$ref": "#/definitions/place"}},
+                    "definitions": {"place": {"type": "string"}},
+                }),
+                false,
+            ),
+        ] {
+            let tools = [tool(&parameters)];
+            assert!(
+                keeps_references(&own(&parameters), &tools),
+                "{parameters}: a named function"
+            );
+            assert_eq!(
+                keeps_references(&listed(&parameters, json!({})), &tools),
+                list,
+                "{parameters}: a list of tools"
+            );
+        }
+        let plain = json!({"type": "object"});
+        assert!(
+            keeps_references(
+                &ToolConstraint::JsonSchema("not JSON".to_string()),
+                &[tool(&plain)]
+            ),
+            "no reference: nothing to keep"
+        );
     }
 
     /// A forced or required call on a table whose calls are given as data with JSON arguments
@@ -2822,12 +3187,12 @@ mod tests {
             Some(text.as_str())
         );
         assert_eq!(stamp.schema(), Some(&schema));
-        // The forced call's tag keeps the pool's start: the prefix that fits either kind.
+        // The forced call's tag keeps the pool's start: the prefix that fits either kind, which
+        // is free text, so the tag comes marked.
         let forced = request(json!({"tool_choice": "required"}));
-        let Ok(Prepared::Constraint {
+        let Ok(Prepared::OpensWithFreeText {
             constraint: ToolConstraint::StructuralTag(call),
             first_token,
-            ..
         }) = super::constraint(
             ParserChoice::Symphony,
             &deepseek,
@@ -2840,7 +3205,7 @@ mod tests {
             &templates(),
         )
         else {
-            panic!("a forced tag");
+            panic!("a forced tag, marked");
         };
         let call: Value = serde_json::from_str(&call).expect("JSON");
         assert_eq!(call["format"]["elements"][0]["type"], "any_text", "{call}");

@@ -29,7 +29,11 @@ from smg_grpc_servicer.rust_lifecycle import (
 from smg_grpc_servicer.tokenspeed import engine_watchdog
 from smg_grpc_servicer.tokenspeed.engine_watchdog import EngineProcessWatch
 from smg_grpc_servicer.tokenspeed.health_servicer import TokenSpeedHealthServicer
-from smg_grpc_servicer.tokenspeed.rust import KV_EVENTS_ENV, default_kv_events_config
+from smg_grpc_servicer.tokenspeed.rust import (
+    KV_EVENTS_ENV,
+    default_kv_events_config,
+    read_remainders_setting,
+)
 from smg_grpc_servicer.tokenspeed.scheduler_launcher import launch_engine
 from smg_grpc_servicer.tokenspeed.servicer import TokenSpeedSchedulerServicer
 from smg_grpc_servicer.tokenspeed.warmup import (
@@ -159,9 +163,12 @@ async def serve_grpc(server_args: ServerArgs) -> None:
     # a host with no free block of ports is refused as on the Rust path: one
     # named ERROR line and exit code 2, not a traceback. An encode worker runs
     # the vision tower only, with no KV cache to publish from: its server args
-    # are left as given.
+    # are left as given. The chunk-remainders knob is read here too, as the
+    # Rust launcher reads it with its knobs: a value it does not take is the
+    # same named exit before the engine launches.
     encode_worker = server_args.disaggregation_mode == "encode"
     try:
+        remainders = read_remainders_setting()
         if not encode_worker and default_kv_events_config(server_args) is not None:
             announce_kv_events_default("TokenSpeed", KV_EVENTS_ENV, logger)
     except ServicerConfigError as error:
@@ -298,7 +305,7 @@ async def serve_grpc(server_args: ServerArgs) -> None:
     # Warmup on a background thread so the async server can handle the probe.
     warmup_thread = threading.Thread(
         target=_wait_and_warmup,
-        args=(server_args, health_servicer),
+        args=(server_args, health_servicer, remainders),
         daemon=True,
     )
     warmup_thread.start()
@@ -343,11 +350,14 @@ async def serve_grpc(server_args: ServerArgs) -> None:
 def _wait_and_warmup(
     server_args: ServerArgs,
     health_servicer: TokenSpeedHealthServicer,
+    remainders: str,
 ) -> None:
     """Probe the gRPC server until it can generate one token, then set SERVING.
 
     Hits the external port so the warmup exercises transport, proto codec,
-    and scheduler IPC end-to-end.
+    and scheduler IPC end-to-end. ``remainders`` is the chunk-remainders
+    knob's setting, read before the engine launched
+    (:func:`read_remainders_setting`).
     """
     if os.getenv("TOKENSPEED_SKIP_GRPC_WARMUP", "0").lower() in ("1", "true", "yes"):
         logger.info("TOKENSPEED_SKIP_GRPC_WARMUP=1 — skipping warmup")
@@ -430,7 +440,7 @@ def _wait_and_warmup(
         # configuration admits, :mod:`smg_grpc_servicer.warmup`) runs over
         # the same channel before the health flips, under its budget.
         if warmup_ok:
-            planned_warmup(server_args, model_info, channel)
+            planned_warmup(server_args, model_info, channel, remainders)
     finally:
         channel.close()
 
@@ -442,10 +452,11 @@ def _wait_and_warmup(
         logger.error("TokenSpeed gRPC warmup did not produce a complete frame")
 
 
-def planned_warmup(server_args: Any, model_info: Any, channel: Any) -> Any:
+def planned_warmup(server_args: Any, model_info: Any, channel: Any, remainders: str) -> Any:
     """The planned warm-up over ``channel`` (the servicer's own port):
-    the plan from the server arguments and the advertised model facts, the
-    level and budget from :data:`WARMUP_ENV`. The pass is an optimisation: a
+    the plan from the server arguments, the advertised model facts and the
+    chunk-remainders setting (``remainders``, read at start), the level and
+    budget from :data:`WARMUP_ENV`. The pass is an optimisation: a
     failed request is a logged line, and a failure of the pass itself (a
     thread the host refuses, an argument an engine release lacks) is one
     ERROR line, never a reason to stay NOT_SERVING (the one-token request
@@ -453,13 +464,13 @@ def planned_warmup(server_args: Any, model_info: Any, channel: Any) -> Any:
     flips the health). Returns the report, or ``None`` when nothing ran or
     the pass failed."""
     try:
-        return _planned_warmup(server_args, model_info, channel)
+        return _planned_warmup(server_args, model_info, channel, remainders)
     except Exception:  # noqa: BLE001 -- the pass is an optimisation; the server serves without it
         logger.exception("The planned warm-up failed; the server serves without it")
         return None
 
 
-def _planned_warmup(server_args: Any, model_info: Any, channel: Any) -> Any:
+def _planned_warmup(server_args: Any, model_info: Any, channel: Any, remainders: str) -> Any:
     try:
         setting = parse_setting(
             os.environ.get(WARMUP_ENV), name=WARMUP_ENV, default_budget_secs=DEFAULT_BUDGET_SECS
@@ -471,7 +482,11 @@ def _planned_warmup(server_args: Any, model_info: Any, channel: Any) -> Any:
         "max_context_length": getattr(model_info, "max_context_length", 0),
         "vocab_size": getattr(model_info, "vocab_size", 0),
     }
-    plan = plan_for(setting, warmup_inputs(server_args, facts), knob=WARMUP_ENV)
+    # The inputs only when the knob is on, as on the Rust path: plan_for logs
+    # the off reason and reads none, so a start that plans nothing logs no
+    # chunk-remainders WARNING either.
+    inputs = warmup_inputs(server_args, facts, remainders=remainders) if setting.enabled else None
+    plan = plan_for(setting, inputs, knob=WARMUP_ENV)
     if plan is None:
         return None
     return run_warmup(plan, warmup_wire("", channel=channel), budget_secs=setting.budget_secs)

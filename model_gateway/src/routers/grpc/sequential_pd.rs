@@ -14,6 +14,9 @@ use std::{
 
 use axum::response::Response;
 use smg_grpc_client::vllm_proto as vllm;
+use smg_worker::{
+    health::liveness, identity::basic::Worker, metrics::writers::Metrics as WorkerMetrics,
+};
 use tracing::{debug, error, warn};
 
 use crate::{
@@ -50,7 +53,6 @@ use crate::{
             },
         },
     },
-    worker::{health::liveness, Worker},
 };
 
 /// The message a sequential decode side's silence verdict starts with (see
@@ -710,7 +712,7 @@ async fn sequential_prefill_side(
     let bound = prefill_worker
         .and_then(|worker| PrefillBound::at(worker, sides.prompt_tokens, prefill_start));
     if let Some(prefill) = prefill_worker {
-        Metrics::record_worker_request(prefill.url(), prefill.model_id());
+        WorkerMetrics::record_worker_request(prefill.url(), prefill.model_id());
     }
     // Booked before the call is polled, for the servicers that send their
     // headers with the first message (see `PrefillTicket::book`); the bound
@@ -946,7 +948,7 @@ async fn sequential_decode_side(
     let workers = sides.workers;
     // Send request to decode
     if let Some(decode) = workers.decode_worker() {
-        Metrics::record_worker_request(decode.url(), decode.model_id());
+        WorkerMetrics::record_worker_request(decode.url(), decode.model_id());
     }
     // The relay phase ends at the decode dispatch. Everything after this
     // instant, including the engines' KV transfer and the decode scheduling,
@@ -1043,22 +1045,23 @@ async fn sequential_decode_side(
 mod tests {
     use std::fmt::Write as _;
 
+    use smg_worker::identity::basic::{
+        ConnectionMode, RuntimeType, Worker, WorkerType, MOONCAKE_CONNECTOR, NIXL_CONNECTOR,
+    };
+
     use super::*;
     use crate::{
         middleware::test_support::text_of,
         routers::{
             common::{attempt_ledger::FailedSide, retry::is_retryable_response},
             grpc::{
+                backend_client::BasicWorkerBuilder,
                 common::stages::request_execution::tests::{
                     answers_after, fails_now, failure, media_refs_request, never_answers,
                     tokenspeed_pair, vllm_pd_mm_request,
                 },
                 proto_wrapper::FanoutStream,
             },
-        },
-        worker::{
-            BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerType,
-            MOONCAKE_CONNECTOR, NIXL_CONNECTOR,
         },
     };
 

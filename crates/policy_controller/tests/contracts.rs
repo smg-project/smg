@@ -1,6 +1,6 @@
 //! The policy controller's two wire contracts, compiled and parsed at test
 //! time (`contracts/README.md`): the gRPC protocol in package `smg.policy.v1`
-//! and the WebAssembly world `smg:policy@1.0.0`. Nothing at run time reads
+//! and the WebAssembly world `smg:policy@1.1.0`. Nothing at run time reads
 //! the files; the world's `types` interface is rendered from the crate's
 //! types by the `wit` module and held to the committed file by `tests/wit.rs`.
 //! The tests here hold four things: the
@@ -26,9 +26,9 @@ use prost_types::{
 };
 use smg_policy_controller::{
     fingerprint, spec::DENIED_HEADERS, AffinityFacts, Candidate, Constraints, HashKind, Health,
-    Identity, Lease, LeaseKind, LoadRow, MediaCounts, Membership, Outcome, OverloadRegime, Pair,
-    Phase, PoolFacts, Queue, ReleaseReason, RequestFacts, Role, Shed, ShedReason, Side, Signal,
-    SignalSource, Target, Trace, TransportClass, ZoneCapacity,
+    Identity, Lease, LeaseKind, Lifted, LoadRow, MediaCounts, Membership, Outcome, OverloadRegime,
+    Pair, Phase, PoolFacts, Queue, ReleaseReason, RequestFacts, Role, Shed, ShedReason, Side,
+    Signal, SignalSource, Target, Trace, TransportClass, ZoneCapacity,
 };
 use wit_parser::{InterfaceId, PackageId, Resolve, TypeDefKind, WorldId, WorldItem, WorldKey};
 
@@ -39,7 +39,7 @@ const WORLD_WIT: &str = "smg-policy.wit";
 const PACKAGE: &str = "smg.policy.v1";
 const WIT_NAMESPACE: &str = "smg";
 const WIT_PACKAGE: &str = "policy";
-const WIT_VERSION: &str = "1.0.0";
+const WIT_VERSION: &str = "1.1.0";
 
 /// The header deny-list of design section 4.6: the names no view may read
 /// and no routing-key override may key on, lowercase, in this order, each
@@ -164,6 +164,9 @@ fn request_record() -> &'static [&'static str] {
             seed,
             block_size,
             now_micros,
+            pinned_at,
+            lent_in_flight,
+            session_counted,
             affinity,
             named,
             model_fingerprint,
@@ -197,7 +200,9 @@ fn constraints_record() -> &'static [&'static str] {
             excluded,
             wire_modes,
             overload_lifted,
-            subset_hint
+            subset_hint,
+            stalled,
+            pins
         }
     )
 }
@@ -213,6 +218,8 @@ fn pool_record() -> &'static [&'static str] {
             generation,
             zones,
             reach,
+            reported,
+            engines,
         }
     )
 }
@@ -309,7 +316,8 @@ fn trace_record() -> &'static [&'static str] {
             top,
             top_len,
             seed,
-            generation
+            generation,
+            lifted
         }
     )
 }
@@ -325,6 +333,7 @@ fn lease_record() -> &'static [&'static str] {
             kind,
             side,
             target_index,
+            booked,
             generation,
             session as "session_key",
             session_verdict,
@@ -493,6 +502,7 @@ fn enum_mirrors() -> Vec<(
                     Relabelled,
                     Resized,
                     Snapshot,
+                    Left,
                 }
             ),
         ),
@@ -629,7 +639,15 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
             record: request_record(),
             // The affinity column rides the request in the crate; the wire
             // carries each entry in its candidate.
-            host_only: &["now_micros", "affinity", "named", "model_fingerprint"],
+            host_only: &[
+                "now_micros",
+                "pinned_at",
+                "lent_in_flight",
+                "session_counted",
+                "affinity",
+                "named",
+                "model_fingerprint",
+            ],
             wire_only: &["prompt_text"],
             wire: &[
                 ("model", Type::String),
@@ -658,7 +676,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "Constraints",
             record: constraints_record(),
-            host_only: &[],
+            host_only: &["stalled", "pins"],
             wire_only: &[],
             wire: &[
                 ("excluded", Type::Fixed64),
@@ -672,7 +690,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "PoolFacts",
             record: pool_record(),
-            host_only: &["reach"],
+            host_only: &["reach", "reported", "engines"],
             wire_only: &[],
             wire: &[
                 ("pool_size", Type::Uint32),
@@ -773,6 +791,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 ("fallback", Type::Bool),
                 ("affinity_source", Type::Enum),
                 ("drew_first", Type::Bool),
+                ("lifted", Type::Enum),
             ],
             repeated: &["top", "drops"],
             optional: &["survivors"],
@@ -780,7 +799,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "Lease",
             record: lease_record(),
-            host_only: &["session_verdict", "issued_micros"],
+            host_only: &["booked", "session_verdict", "issued_micros"],
             wire_only: &["term", "dispatch_ttl_ms", "origin"],
             wire: &[
                 ("id", Type::Fixed64),
@@ -858,7 +877,15 @@ fn wit_mirrors() -> Vec<WitMirror> {
         WitMirror {
             record: "request",
             crate_record: request_record(),
-            host_only: &["now_micros", "affinity", "named", "model_fingerprint"],
+            host_only: &[
+                "now_micros",
+                "pinned_at",
+                "lent_in_flight",
+                "session_counted",
+                "affinity",
+                "named",
+                "model_fingerprint",
+            ],
             before: &[],
             beside: &[],
         },
@@ -872,14 +899,14 @@ fn wit_mirrors() -> Vec<WitMirror> {
         WitMirror {
             record: "pool",
             crate_record: pool_record(),
-            host_only: &["reach"],
+            host_only: &["reach", "reported", "engines"],
             before: &[],
             beside: &[],
         },
         WitMirror {
             record: "lease",
             crate_record: lease_record(),
-            host_only: &["session_verdict", "issued_micros"],
+            host_only: &["booked", "session_verdict", "issued_micros"],
             before: &[],
             beside: &[],
         },
@@ -1087,6 +1114,7 @@ const ONEOFS: &[(&str, &str, &str, &[&str])] = &[
             "generation",
             "ids",
             "lease_end",
+            "term_start",
         ],
     ),
     (
@@ -1128,7 +1156,7 @@ fn contracts_dir() -> PathBuf {
 /// The engine wire's protos (`smg.grpc.common`): the controller protocol
 /// imports the load record and the event batch a relay forwards unchanged.
 fn engine_wire_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../grpc_client/proto")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../worker/proto")
 }
 
 fn compile_protocol() -> io::Result<FileDescriptorSet> {
@@ -1442,6 +1470,21 @@ fn the_protocol_compiles_and_mirrors_the_engine_record() {
     }
     let found = enum_values(plugin, "ShedReason").expect("ShedReason is an enum");
     assert_eq!(found, proto_enum("SHED_REASON", shed_reasons()));
+    // The lifted veto: the mark's variants in order, numbered from zero.
+    // Its zero is none, a case, on purpose: the enum's comment says why.
+    let found = enum_values(plugin, "LiftedVeto").expect("LiftedVeto is an enum");
+    let expected: Vec<(String, i32)> = cases!(Lifted, Lifted { None, Overload })
+        .iter()
+        .enumerate()
+        .map(|(i, case)| {
+            let number = i32::try_from(i).unwrap_or(i32::MAX);
+            (format!("LIFTED_VETO_{}", screaming_case(case)), number)
+        })
+        .collect();
+    assert_eq!(
+        found, expected,
+        "the lifted vetoes are the mark's, from none"
+    );
     // The health bits: the record's flags in order, one bit each.
     let found = enum_values(plugin, "HealthFlag").expect("HealthFlag is an enum");
     let mut expected = vec![("HEALTH_FLAG_UNSPECIFIED".to_owned(), 0)];
@@ -1744,10 +1787,56 @@ const MEMBERSHIP_FIELDS: &[(&str, &[ResumeField])] = &[
             ("dp_rank", 23, Type::Uint32),
             ("engine", 24, Type::String),
             ("health_policy", 25, Type::Message),
+            ("maker", 27, Type::Message),
         ],
+    ),
+    (
+        "Maker",
+        &[("provider", 1, Type::String), ("key", 2, Type::String)],
     ),
     ("WorkerSpec", &[("health_policy", 14, Type::Message)]),
 ];
+
+/// A membership change on the plugin wire, by name and number: a plugin
+/// built against protocol 1 reads the first four fields and the kinds to
+/// `KIND_SNAPSHOT` as it did, and protocol 2 added the kind a worker left
+/// with its field `models`.
+#[test]
+fn the_plugin_wires_membership_change_is_pinned() {
+    let set = compile_protocol().expect("protoc compiles the two protocol files");
+    let plugin = file(&set, PLUGIN_PROTO).expect("the plugin file is in the descriptor set");
+    let compiled = message(plugin, "MembershipChange")
+        .unwrap_or_else(|| panic!("MembershipChange is missing from {PLUGIN_PROTO}"));
+    let found: Vec<(String, i32, Type, bool)> = fields(compiled)
+        .into_iter()
+        .map(|(name, number, kind, repeated, _)| (name, number, kind, repeated))
+        .collect();
+    let expected = [
+        ("kind", 1, Type::Enum, false),
+        ("worker_id", 2, Type::Fixed64, false),
+        ("old_worker_id", 3, Type::Fixed64, false),
+        ("ids", 4, Type::Fixed64, true),
+        ("models", 5, Type::String, true),
+    ]
+    .map(|(name, number, kind, repeated)| (name.to_owned(), number, kind, repeated));
+    assert_eq!(found, expected, "a field of the membership change moved");
+    let kinds = enum_values(plugin, "MembershipChange.Kind").expect("the kinds are an enum");
+    let pinned = [
+        "KIND_UNSPECIFIED",
+        "KIND_ADDED",
+        "KIND_REMOVED",
+        "KIND_REPLACED",
+        "KIND_RELABELLED",
+        "KIND_RESIZED",
+        "KIND_SNAPSHOT",
+        "KIND_LEFT",
+    ];
+    let pinned: Vec<(String, i32)> = (0..)
+        .zip(pinned)
+        .map(|(number, name)| (name.to_owned(), number))
+        .collect();
+    assert_eq!(kinds, pinned, "a kind of the membership change moved");
+}
 
 #[test]
 fn the_membership_fields_are_pinned() {

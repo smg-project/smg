@@ -24,15 +24,13 @@ use smg_mesh::{
     gossip::{NodeState, NodeStatus},
     member_transition_line, status_of, ClusterState,
 };
+use smg_service_discovery::{
+    build_watcher_config, matches_selector, pod_ip, pod_is_ready, selector_string,
+};
 use tokio::task;
 use tracing::{debug, error, info, warn};
 
-use crate::{
-    config::DiscoveryConfig,
-    service_discovery::{
-        build_watcher_config, matches_selector, pod_ip, pod_is_ready, selector_string,
-    },
-};
+use crate::config::DiscoveryConfig;
 
 /// Configuration for Kubernetes router-peer discovery.
 #[derive(Debug, Clone)]
@@ -345,10 +343,10 @@ mod tests {
     use std::sync::Arc;
 
     use k8s_openapi::{api::core::v1::PodCondition, apimachinery::pkg::apis::meta::v1::Time};
+    use smg_service_discovery::testing::make_labeled_pod;
     use tracing_test::traced_test;
 
     use super::*;
-    use crate::service_discovery::testing::make_labeled_pod;
 
     fn router_config_and_pod() -> (MeshDiscoveryConfig, Pod) {
         let mut router_selector = HashMap::new();

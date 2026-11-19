@@ -6,17 +6,24 @@ use std::{
 };
 
 use async_trait::async_trait;
+use smg_worker::{
+    health::bootstrap_probe,
+    identity::basic::Worker,
+    registry::{worker_model_ids, WorkerId},
+    workflow::{pool_group, refresh_worker_pool_sizes, PoolGroups},
+};
 use tracing::debug;
 use wfaas::{
     StepExecutor, StepId, StepResult, StepStatus, WorkflowContext, WorkflowData, WorkflowError,
     WorkflowResult, WorkflowState,
 };
 
-use super::{pool_group, refresh_worker_pool_sizes, PoolGroups};
 use crate::{
-    routers::{common::pd_admission, grpc::regular::symphony::telemetry},
-    worker::{health::bootstrap_probe, registry::WorkerId, Worker, WorkerRegistry},
-    workflow::data::{WorkerRegistrationData, WorkerRegistrationMode},
+    routers::{
+        common::{pd_admission, snapshot::WorkerRegistry},
+        grpc::regular::symphony::telemetry,
+    },
+    workflow::data::{require_app_context, WorkerRegistrationData, WorkerRegistrationMode},
 };
 
 /// Unified step to register workers in the registry.
@@ -217,11 +224,7 @@ pub(crate) mod registration_hold {
 #[async_trait]
 impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorkersStep {
     async fn execute(&self, context: &mut WorkflowContext<D>) -> WorkflowResult<StepResult> {
-        let app_context = context
-            .data
-            .get_app_context()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?
-            .clone();
+        let app_context = require_app_context(context.data.get_app_context())?.clone();
 
         let workers = context
             .data
@@ -299,7 +302,7 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorke
             if has_retry_overrides {
                 let resolved = worker.resilience();
                 let retry_config = resolved.retry.clone();
-                for model_id in WorkerRegistry::worker_model_ids(worker) {
+                for model_id in worker_model_ids(worker) {
                     app_context.worker_registry.set_model_retry_config(
                         &model_id,
                         retry_config.clone(),
@@ -323,7 +326,7 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorke
         }
 
         // WorkerMonitor subscribes to registry events directly (see
-        // `worker::load::monitor::WorkerMonitor::start_event_loop`), so this
+        // `smg_worker::load::monitor::WorkerMonitor::start_event_loop`), so this
         // step no longer has to push group-add notifications. The
         // monitor's event loop reconciles the impacted groups as soon as the
         // registry emits `WorkerEvent::Registered` or `WorkerEvent::Replaced`.
@@ -349,7 +352,7 @@ mod tests {
     use openai_protocol::model_card::ModelCard;
 
     use super::*;
-    use crate::worker::BasicWorkerBuilder;
+    use crate::routers::grpc::backend_client::BasicWorkerBuilder;
 
     fn worker_at(url: &str, model_id: &str) -> Arc<dyn Worker> {
         Arc::new(
@@ -373,7 +376,8 @@ mod tests {
 
         use crate::{
             app_context::testing::app_context_for_tests, config::RouterConfig,
-            worker::WorkerRegistry, workflow::steps::create_worker_workflow_data,
+            routers::common::snapshot::WorkerRegistry,
+            workflow::steps::create_worker_workflow_data,
         };
         let url = "http://worker:8080";
         let registry = Arc::new(WorkerRegistry::new());
@@ -417,7 +421,8 @@ mod tests {
 
         use crate::{
             app_context::testing::app_context_for_tests, config::RouterConfig,
-            worker::WorkerRegistry, workflow::steps::create_worker_workflow_data,
+            routers::common::snapshot::WorkerRegistry,
+            workflow::steps::create_worker_workflow_data,
         };
         let data = create_worker_workflow_data(
             WorkerSpec::new("http://worker:8080"),

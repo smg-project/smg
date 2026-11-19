@@ -15,6 +15,11 @@ use futures::{
 use smg_grpc_client::{
     is_transport_failure, media_identity::sglang as media_contract, RequestDeadline,
 };
+use smg_worker::{
+    health::{liveness, liveness::SideReprieve},
+    identity::basic::{ConnectionModeExt, Worker, WorkerTypeExt},
+    metrics::writers::Metrics as WorkerMetrics,
+};
 use tokio::sync::{oneshot, watch};
 use tracing::{debug, error, info_span, warn, Instrument};
 
@@ -60,11 +65,6 @@ use crate::{
             },
         },
     },
-    worker::{
-        health::liveness::{self, SideReprieve},
-        identity::basic::WorkerTypeExt,
-        ConnectionModeExt, Worker,
-    },
 };
 
 pub(crate) type StreamResult = Result<ProtoStream, tonic::Status>;
@@ -75,10 +75,6 @@ pub(crate) type StreamResult = Result<ProtoStream, tonic::Status>;
 pub(crate) type SideDispatch = Pin<Box<dyn Future<Output = StreamResult> + Send>>;
 
 /// How the two parallel sides resolved.
-#[expect(
-    clippy::large_enum_variant,
-    reason = "consumed by its caller on the next line; boxing would add an allocation to the success path to save one stack move"
-)]
 enum PdDispatchOutcome {
     /// Both sides answered; either or both may carry an error.
     Both(StreamResult, StreamResult),
@@ -1169,7 +1165,7 @@ async fn execute_single(
     let streaming = proto_request.stream();
     let worker = workers.single();
     if let Some(worker) = worker {
-        Metrics::record_worker_request(worker.url(), worker.model_id());
+        WorkerMetrics::record_worker_request(worker.url(), worker.model_id());
     }
     // The call's future is boxed, as the disaggregated sides' are: it is the
     // large part of the dispatch, and inlined in the pipeline's future it
@@ -1271,7 +1267,10 @@ pub(crate) fn start_failure_response(
     } else {
         error!(function = function, error = %e, "{}", description);
     }
-    let mut response = e.to_http_error(code, format!("{description}: {}", e.message()));
+    // The status of a dial that failed names the worker's address, for the
+    // line above; the client's answer is the same failure without it.
+    let detail = e.client_message();
+    let mut response = e.to_http_error(code, format!("{description}: {detail}"));
     // INTERNAL is the servicers' code for a request the engine took and failed
     // on: the worker's own answer for this payload, which the retry layer does
     // not replay on it (see `routers::common::attempt_ledger`). tonic gives
@@ -1351,7 +1350,7 @@ async fn execute_embed(
     let worker = workers.single();
     let calls = requests.into_iter().map(|request| {
         if let Some(worker) = worker {
-            Metrics::record_worker_request(worker.url(), worker.model_id());
+            WorkerMetrics::record_worker_request(worker.url(), worker.model_id());
         }
         client.embed(request)
     });
@@ -1516,7 +1515,7 @@ async fn execute_parallel_pd(
         .into_iter()
         .flatten()
     {
-        Metrics::record_worker_request(worker.url(), worker.model_id());
+        WorkerMetrics::record_worker_request(worker.url(), worker.model_id());
     }
     // The side is booked on its worker here, before its call is polled: a
     // servicer that sends its headers with the first message answers the
@@ -2783,14 +2782,16 @@ pub(crate) mod tests {
     use std::{collections::HashSet, sync::Arc, time::Duration};
 
     use smg_grpc_client::{sglang_proto as sglang, tokenspeed_proto as ts, vllm_proto as vllm};
+    use smg_worker::{
+        health::{circuit_breaker::CircuitBreakerConfig, resilience::ResolvedResilience},
+        identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType},
+        test_support::no_health_check,
+    };
 
     use super::*;
-    use crate::{
-        routers::common::{attempt_ledger::FailedSide, retry::is_retryable_response},
-        worker::{
-            test_support::no_health_check, BasicWorkerBuilder, CircuitBreakerConfig,
-            ConnectionMode, ResolvedResilience, RuntimeType, Worker, WorkerType,
-        },
+    use crate::routers::{
+        common::{attempt_ledger::FailedSide, retry::is_retryable_response},
+        grpc::backend_client::BasicWorkerBuilder,
     };
 
     /// A boxed encode send, as the supervisor's tests build them.
@@ -2839,7 +2840,7 @@ pub(crate) mod tests {
     /// the next one opens a breaker set to two.
     #[tokio::test]
     async fn the_late_stream_of_a_side_retired_for_its_partners_failure_earns_no_breaker_success() {
-        use crate::worker::health::circuit_breaker::CircuitState;
+        use smg_worker::health::circuit_breaker::CircuitState;
         let decode: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("grpc://decode:30002")
                 .worker_type(WorkerType::Decode)
@@ -4856,7 +4857,7 @@ pub(crate) mod tests {
     #[test]
     fn a_decode_verdict_on_the_prefills_dispatch_is_charged_to_the_decode_when_both_sides_answered()
     {
-        use crate::worker::health::circuit_breaker::CircuitState;
+        use smg_worker::health::circuit_breaker::CircuitState;
         let pair = || {
             let worker = |url: &str, worker_type: WorkerType| -> Arc<dyn Worker> {
                 Arc::new(
@@ -5987,3 +5988,7 @@ pub(crate) mod tests {
         assert_eq!(batch_breaker_status(&answers, &capacity_503), Some(500));
     }
 }
+
+#[cfg(test)]
+#[expect(clippy::print_stdout, reason = "a recorder says where its sheet went")]
+mod classic_sticky_rank_rows;

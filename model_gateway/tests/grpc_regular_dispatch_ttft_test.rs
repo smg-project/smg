@@ -29,14 +29,11 @@ use llm_tokenizer::{
 };
 use openai_protocol::transcription::{AudioFile, TranscriptionRequest};
 use smg::{
-    config::RetryConfig,
-    middleware::TenantRequestMeta,
-    routers::RouterTrait,
-    tenant::TenantKey,
-    worker::{RuntimeType, WorkerType},
+    config::RetryConfig, middleware::TenantRequestMeta, routers::RouterTrait, tenant::TenantKey,
 };
 use smg_grpc_client::vllm_proto as proto;
 use smg_test_harness as common;
+use smg_worker::identity::basic::{RuntimeType, WorkerType};
 use tonic::{Request, Response, Status};
 
 const MODEL: &str = "regular-dispatch-ttft-test-model";
@@ -229,7 +226,9 @@ async fn request(router: &dyn RouterTrait, route: Route, streaming: bool) -> Opt
                 "stream": streaming,
             }))
             .expect("Messages request");
-            router.route_messages(None, &tenant, request, model).await
+            router
+                .route_messages(None, &tenant, Arc::new(request), model)
+                .await
         }
         Route::Generate => {
             let request = serde_json::from_value(serde_json::json!({

@@ -27,12 +27,15 @@ use smg::{
         posture::{SecretSource, SecretSources},
         ServerConfig,
     },
-    service_discovery::RuntimeDiscoveryConfig,
     version,
-    worker::{identity::endpoint::Endpoint, ConnectionMode, RuntimeType},
 };
 use smg_auth::{ApiKeyEntry, ControlPlaneAuthConfig, JwtConfig, Role};
 use smg_mesh::{MTLSConfig, MeshServerConfig};
+use smg_service_discovery::RuntimeDiscoveryConfig;
+use smg_worker::identity::{
+    basic::{ConnectionMode, RuntimeType},
+    endpoint::Endpoint,
+};
 
 use super::{
     secrets::{
@@ -1355,7 +1358,9 @@ impl CliArgs {
         let service_discovery_config = router_config
             .discovery
             .as_ref()
-            .map(|discovery| RuntimeDiscoveryConfig::from_config(discovery, &router_config.mode))
+            .map(|discovery| {
+                RuntimeDiscoveryConfig::from_config(discovery, router_config.mode.discovery_roles())
+            })
             .transpose()?;
         let mesh_discovery_config = router_config
             .discovery

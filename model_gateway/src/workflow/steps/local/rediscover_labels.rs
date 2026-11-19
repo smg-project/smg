@@ -11,13 +11,16 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
+use smg_worker::identity::basic::ConnectionMode;
 use tracing::debug;
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use super::discover_metadata::discover_engine_labels;
 use crate::{
-    routers::grpc::{backend_client::BackendClient, zmq_client},
-    worker::ConnectionMode,
+    routers::grpc::{
+        backend_client::{backend_client_if_initialized, BackendClient},
+        zmq_client,
+    },
     workflow::data::WorkerUpdateWorkflowData,
 };
 
@@ -49,7 +52,13 @@ impl StepExecutor<WorkerUpdateWorkflowData> for RediscoverLabelsStep {
             // what registration read from the model's files; a link not up
             // yet leaves the labels as they are, and the next transition
             // into service refreshes again.
-            let Some(link) = worker.backend_client_if_initialized() else {
+            let link = backend_client_if_initialized(worker.as_ref()).map_err(|e| {
+                WorkflowError::StepFailed {
+                    step_id: StepId::new("rediscover_labels"),
+                    message: format!("could not read the link of {}: {e}", worker.redacted_url()),
+                }
+            })?;
+            let Some(link) = link else {
                 debug!(worker_url = %worker.redacted_url(), "The ZMQ link is not up; nothing to refresh");
                 return Ok(StepResult::Skip);
             };
@@ -110,10 +119,6 @@ impl StepExecutor<WorkerUpdateWorkflowData> for RediscoverLabelsStep {
         context.data.fresh_engine_labels = Some(fresh);
         Ok(StepResult::Success)
     }
-
-    fn is_retryable(&self, _error: &WorkflowError) -> bool {
-        true
-    }
 }
 
 #[cfg(test)]
@@ -121,12 +126,13 @@ mod tests {
     use std::sync::Arc;
 
     use openai_protocol::worker::{WorkerStatus, WorkerUpdateRequest};
+    use smg_worker::identity::basic::Worker;
     use wfaas::WorkflowInstanceId;
 
     use super::*;
     use crate::{
-        service_discovery::testing::create_test_app_context,
-        worker::{BasicWorkerBuilder, Worker},
+        app_context::testing::create_test_app_context,
+        routers::grpc::backend_client::BasicWorkerBuilder,
     };
 
     fn context(
@@ -210,7 +216,7 @@ mod tests {
             BasicWorkerBuilder::new(ep("worker.ipc"))
                 .connection_mode(ConnectionMode::Zmq)
                 .runtime_type(RuntimeType::Vllm)
-                .backend_client(BackendClient::Zmq(client.expect("adapter connect")))
+                .engine_connection(BackendClient::Zmq(client.expect("adapter connect")))
                 .discovered_labels(HashMap::from([(
                     "constrained_decoding_start".to_string(),
                     "first_token".to_string(),

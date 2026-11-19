@@ -40,7 +40,7 @@ HELPERS = CHART / "templates" / "_helpers.tpl"
 SCHEMA = CHART / "values.schema.json"
 ROUTER_TEMPLATE = CHART / "templates" / "deployment-router.yaml"
 # The gateway's Consul provider, which reads Consul's own variables.
-CONSUL_PROVIDER = REPO / "model_gateway" / "src" / "service_discovery" / "consul.rs"
+CONSUL_PROVIDER = REPO / "crates" / "service_discovery" / "src" / "consul.rs"
 # The chart needs Kubernetes >= 1.26 and `helm template` checks it against
 # its default version, which older helm releases put below that.
 KUBE_VERSION = "1.30.0"
@@ -893,14 +893,15 @@ def test_a_prefill_only_policy_is_refused_by_the_schema():
 
 
 # Tags of digits alone, two workers whose tags are filled in as written, and
-# the policy controller's switch.
+# the policy controller's switch with the spec document the chart refuses it
+# without.
 DIGIT_TAGS = ("1.16", "1.10", "20261115")
 WORKERS = (
     "workers:\n"
     "  - name: one\n    engine: vllm\n    model: m\n    image:\n      tag: {}\n"
     "  - name: two\n    engine: vllm\n    model: m\n    image:\n      tag: {}\n"
 )
-CONTROLLER_ON = ("policyController.enabled=true",)
+CONTROLLER_ON = ("policyController.enabled=true", "policyController.spec.apiVersion=smg.policy/v1")
 
 
 def images(documents: list[dict]) -> set[str]:

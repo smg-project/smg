@@ -12,16 +12,14 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use reqwest::Client;
+use smg_worker::identity::{basic::ConnectionMode, endpoint::Endpoint};
 use tracing::{debug, warn};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use super::discover_metadata::ModelsResponse;
-use crate::{
-    worker::{identity::endpoint::Endpoint, ConnectionMode},
-    workflow::{
-        data::{WorkerKind, WorkerWorkflowData},
-        steps::util::{grpc_base_url, grpc_health_answer, http_base_url},
-    },
+use crate::workflow::{
+    data::{require_app_context, WorkerKind, WorkerWorkflowData},
+    steps::util::{grpc_base_url, grpc_health_answer, http_base_url},
 };
 
 // ─── gRPC backend detection ────────────────────────────────────────────────
@@ -134,17 +132,19 @@ async fn probe_models_endpoint(
     }
 }
 
-/// Probe vLLM's `/version` endpoint.
-async fn try_vllm_version(
+/// Probe one path of the backend: `Ok` when it is reached and answers with
+/// a success status.
+async fn probe_path(
     url: &str,
+    path: &str,
     timeout_secs: u64,
     client: &Client,
     api_key: Option<&str>,
 ) -> Result<(), String> {
-    let version_url = format!("{}/version", http_base_url(url));
+    let probe_url = format!("{}{path}", http_base_url(url));
 
     let mut req = client
-        .get(&version_url)
+        .get(&probe_url)
         .timeout(Duration::from_secs(timeout_secs));
     if let Some(key) = api_key {
         req = req.bearer_auth(key);
@@ -153,44 +153,13 @@ async fn try_vllm_version(
     let response = req.send().await.map_err(|e| {
         format!(
             "Failed to reach {}: {}",
-            Endpoint::redacted_str(&version_url),
+            Endpoint::redacted_str(&probe_url),
             e.without_url()
         )
     })?;
 
     if !response.status().is_success() {
-        return Err(format!("/version returned {}", response.status()));
-    }
-
-    Ok(())
-}
-
-/// Probe SGLang's `/server_info` endpoint.
-async fn try_sglang_server_info(
-    url: &str,
-    timeout_secs: u64,
-    client: &Client,
-    api_key: Option<&str>,
-) -> Result<(), String> {
-    let info_url = format!("{}/server_info", http_base_url(url));
-
-    let mut req = client
-        .get(&info_url)
-        .timeout(Duration::from_secs(timeout_secs));
-    if let Some(key) = api_key {
-        req = req.bearer_auth(key);
-    }
-
-    let response = req.send().await.map_err(|e| {
-        format!(
-            "Failed to reach {}: {}",
-            Endpoint::redacted_str(&info_url),
-            e.without_url()
-        )
-    })?;
-
-    if !response.status().is_success() {
-        return Err(format!("/server_info returned {}", response.status()));
+        return Err(format!("{path} returned {}", response.status()));
     }
 
     Ok(())
@@ -236,8 +205,8 @@ async fn detect_http_backend(
     // regardless of whether /server_info also succeeds. We only conclude SGLang if
     // /server_info succeeds and /version does not.
     let (vllm_result, sglang_result) = tokio::join!(
-        try_vllm_version(url, timeout_secs, client, api_key),
-        try_sglang_server_info(url, timeout_secs, client, api_key),
+        probe_path(url, "/version", timeout_secs, client, api_key),
+        probe_path(url, "/server_info", timeout_secs, client, api_key),
     );
 
     let vllm_failure = match vllm_result {
@@ -312,11 +281,7 @@ impl StepExecutor<WorkerWorkflowData> for DetectBackendStep {
             context.data.connection_mode.as_ref().ok_or_else(|| {
                 WorkflowError::ContextValueNotFound("connection_mode".to_string())
             })?;
-        let app_context = context
-            .data
-            .app_context
-            .as_ref()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
+        let app_context = require_app_context(context.data.app_context.as_ref())?;
 
         let timeout = config
             .health
@@ -392,10 +357,6 @@ impl StepExecutor<WorkerWorkflowData> for DetectBackendStep {
         context.data.detected_runtime_type = Some(detected);
         Ok(StepResult::Success)
     }
-
-    fn is_retryable(&self, _error: &WorkflowError) -> bool {
-        true
-    }
 }
 
 #[cfg(test)]
@@ -406,13 +367,11 @@ mod tests {
         Json, Router,
     };
     use serde_json::json;
+    use smg_worker::test_support::RefusedAddress;
     use tokio::net::TcpListener;
 
     use super::{detect_grpc_backend, detect_http_backend};
-    use crate::{
-        server::http_client, worker::test_support::RefusedAddress,
-        workflow::steps::util::mock_grpc_engine,
-    };
+    use crate::{server::http_client, workflow::steps::util::mock_grpc_engine};
 
     /// A runtime that answers its health RPC with `healthy: false` (its
     /// engine still loading) is identified all the same, with and without

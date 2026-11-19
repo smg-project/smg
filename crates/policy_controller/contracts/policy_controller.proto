@@ -19,7 +19,7 @@
 // PushLoad and PushKvEvents; the relay's subject is the RELAY origin.
 // Control: `user` reads (GetSnapshot, Explain, GetPolicySpec, Leader,
 // WatchRegime), `admin` writes the rest; every call writes an audit event.
-// Replication: Replicate, and GetSnapshot as the re-sync base;
+// Replication: Replicate, whose stream carries a re-sync's snapshot in parts;
 // ReplicaHello.replica_id must equal the subject. Leader is served to every
 // scope; a standby serves Leader, WatchWorkers, GetSnapshot and GetPolicySpec
 // and answers Session and Decide with NotLeader / Busy { NOT_LEADER }.
@@ -34,17 +34,27 @@
 // Fencing: design 5.3. Every ControllerFrame and DecideAnswer carries the
 // leader's term, every GatewayFrame the gateway's term floor. A gateway
 // raises its floor from Leader and rejects frames below it; the controller
-// refuses a floor above its own term with FAILED_PRECONDITION; a leader past
-// its renew deadline sends NotLeader with an empty address and releases
-// nothing.
+// refuses a floor above its own term with FAILED_PRECONDITION, and its
+// leader gives the lease up so that the next take is above the floor (a
+// floor more than 65,536 above the term, or one that leaves no term to
+// take, is not believed: INVALID_ARGUMENT by the field's name, and the
+// lease stands; one controller process moves the lease 1,048,576 terms on
+// such floors at most and no floor moves it past term 8,388,608, and past
+// either a floor above the term is refused the same and moves nothing); a
+// leader past its renew deadline sends NotLeader with an empty address and
+// releases nothing.
 // Flow: design 5.2. Budgets are relative to receipt, never absolute; credits
 // ride the Decide stream as deltas (Credit) and are never taken back; with
 // no credit the gateway decides locally, and a DecideRequest sent with none
 // is answered Busy { NO_CREDIT } and spends none; a Decide whose budget is
 // gone on arrival, or ends while it is decided, is answered
-// Busy { BUDGET_GONE_ON_ARRIVAL } without a lease, and the controller counts
-// the second apart; a Decision that arrives after a fallback is answered
-// with Released.
+// Busy { BUDGET_GONE_ON_ARRIVAL } without a lease, and so is a pick whose
+// lease has under a millisecond of its dispatch span left once it is
+// decided, or once it is sent to a gateway that read nothing meanwhile:
+// the span counts from the request's take, and a lease tells what is left
+// of it as it is sent. The controller counts the two that end while they
+// are decided apart from the rest; a Decision that arrives after a
+// fallback is answered with Released.
 // A DecideRequest the controller has no decision for is answered Busy with
 // no reason, and the gateway decides it locally.
 // Where the controller leads, a Decide stream is a present gateway's: one
@@ -54,45 +64,64 @@
 // the first request under each term the replica leads.
 // Errors (gRPC status): UNAUTHENTICATED no principal, or Hello's id is not
 // the subject (the stream closes); PERMISSION_DENIED the scope or
-// role does not cover the RPC; FAILED_PRECONDITION not the leader (a
-// NotLeader in the status details, which are a google.rpc.Status that
-// holds it as an Any, its address the leader's gateway listener as Leader
-// tells it; on Session, the NotLeader frame ahead
-// of the status), a first frame that is not Hello or a second Hello, no
+// role does not cover the RPC, or a membership write names a row its
+// caller did not make (WorkerRow.maker); FAILED_PRECONDITION a write or a
+// Session off the leader (a NotLeader in the status details, which are a
+// google.rpc.Status that holds it as an Any, its address the leader's
+// gateway listener as Leader tells it; on Session, the NotLeader frame
+// ahead of the status), a first frame that is not Hello or a second
+// Hello, no
 // protocol version in common, a floor above the term, a revision or
-// digest guard, a Decide stream of a gateway that is not present where
-// the controller leads (at its open, at its first request under a term,
-// and an open one when the presence ends), or a rejoin position not
-// held under its term (a resync_required batch precedes it; the rejoin
-// opens a new Replicate stream); INVALID_ARGUMENT a spec, registration
-// or patch rejected (the field path in ApplyResult.issues, and at the
-// head of a refused registration's or patch's status message), a
+// digest guard, a Decide stream of a gateway that is not present where the
+// controller leads (at its open, at its first request under a term, and an
+// open one when the presence ends), or a replication call on a controller
+// whose lease lives in its own process (it has no standby); INVALID_ARGUMENT
+// a spec,
+// registration or patch rejected (the field path in ApplyResult.issues, and
+// at the head of a refused registration's or patch's status message), a
 // Dispatched, Completed or Released whose side, class, reason or number
 // reads wrong, a Released that names neither a lease nor a ticket (the
-// field's name in the message), or a DecideRequest field out of its range
-// in this protocol version (the status message names the field, and the
-// stream closes); RESOURCE_EXHAUSTED a relay over its per-subscriber
-// budget or a standby over its backlog (a resync_required batch precedes
-// it), a Hello past the controller's ceiling of present gateways, a
+// field's name in the message), a term floor that is not believed (the
+// same), a veto of no kind, a Hello whose veto_count is not its list's
+// length, or a DecideRequest field out of its range in this protocol version
+// (the status message names the field, and the stream closes);
+// RESOURCE_EXHAUSTED a relay over its per-subscriber budget, a WatchWorkers
+// past its principal's ceiling of 4 open watches or past the replica's
+// ceiling of watching principals, a
 // Decide stream past its gateway's Welcome.max_decide_streams, a Session
-// frame over the transport's limit of 4 MiB a message, or a Decide frame
-// over 64 KiB as encoded; ALREADY_EXISTS a Hello whose id collides with
-// another present gateway's, refused while that one stands, or an add of
-// a registered URL; NOT_FOUND a replace of an absent URL, or no worker
-// under the id; DEADLINE_EXCEEDED a Session stream that said no Hello
-// within 5 s of its open; UNAVAILABLE a standby not yet synced, or a
+// frame over the transport's limit of 4 MiB a message, a Decide frame over
+// 64 KiB as encoded, or a ceiling of the controller's: a Hello past 4,096
+// present gateways, a Hello that lists more than 4,096 vetoes or more than
+// eight kinds for one worker, a ninth kind of veto on one worker, a veto
+// past the 4,096 one gateway holds; ALREADY_EXISTS a Hello whose id collides
+// with another present gateway's, refused while that one stands, or an add
+// of a registered URL; NOT_FOUND a replace of an absent URL, or no worker
+// under the id; DEADLINE_EXCEEDED a Session stream that said no Hello within
+// 5 s of its open, or a Replicate stream whose standby took no part of its
+// snapshot for 60 s; UNAVAILABLE a standby not yet synced, a read a standby
+// cannot serve yet (WatchWorkers until its replica follows the leader's log,
+// a NotLeader in the status details), a leader whose store does not lead its
+// term, on a membership write, a spec write, its dry run and a rollback,
+// Replicate and the open of a WatchWorkers (the moment after
+// its take, until its store is told the term, and a call admitted under a
+// take its store has since passed: retry; or its whole lead, until a later
+// take, where its log followed a term at or above the one it took), or a
 // Decide stream open when the controller closes its listeners at its
 // shutdown (its gateway opens the next one on the leader);
 // ABORTED fenced mid-stream, reconnect through Leader, a Hello read
 // under a term the election left before its seat was taken, or a session
 // a newer one of its gateway replaced, or a worker row that moved under a
-// membership call (a second writer: read the row again); OUT_OF_RANGE and
+// membership call (a second writer: read the row again); UNIMPLEMENTED a
+// call, a frame kind or a mode this build does not serve, or a spec call
+// of a controller given no spec source, by its name;
+// OUT_OF_RANGE and
 // DATA_LOSS raised by no handler, forwarded as RelayResync. The
 // transport answers OUT_OF_RANGE itself to a request over its limit of
 // 4 MiB on a call of one request message; on a Session or Decide stream
 // the reader answers that finding RESOURCE_EXHAUSTED. Any other read of
 // a Session or Decide frame that the transport fails ends the stream
-// under the transport's own status. In-band within a stream:
+// under the transport's own status. A dry run past the 32 that may wait
+// their turn is answered RESOURCE_EXHAUSTED. In-band within a stream:
 // Busy, NotLeader, SpecAck { accepted: false }, Decline.
 
 syntax = "proto3";
@@ -108,12 +137,21 @@ service PolicyController {
   // Gateway scope, one bidirectional stream per gateway runtime thread.
   rpc Decide(stream DecideRequest) returns (stream DecideAnswer);
   // Gateway scope, server stream: a snapshot then the tail, resumable by seq
-  // and term.
+  // and term. The stream ends ABORTED when its replica stops leading, and
+  // with no error when its watcher takes nothing for 30 s: the watcher
+  // resumes after the last event it took. A principal holds at most 4
+  // watches open at a replica: one more is refused RESOURCE_EXHAUSTED.
   rpc WatchWorkers(WatchWorkersRequest) returns (stream WorkerEvent);
   // Ingestion scope (relays only), client streams answered once at the end.
   rpc PushLoad(stream LoadReport) returns (Ack);
   rpc PushKvEvents(stream RelayKvFrame) returns (Ack);
-  // Control scope, unary.
+  // Control scope, unary. An answer says the row as written. A registration,
+  // its refresh and a patch owe a build of the pools: it starts within one
+  // publication window (20 ms) of their answer, and they are in force for
+  // decisions when it ends. A deregistration and a new incarnation's
+  // replacing of the old are in force at their answer: no decision made
+  // after it names the worker that left. So is a refresh that takes its
+  // worker off a model, for the pools it leaves.
   rpc RegisterWorker(RegisterWorkerRequest) returns (WorkerEvent);
   rpc PatchWorker(PatchWorkerRequest) returns (WorkerEvent);
   rpc DeregisterWorker(DeregisterWorkerRequest) returns (WorkerEvent);
@@ -130,7 +168,10 @@ service PolicyController {
   // Control scope, server stream.
   rpc WatchRegime(RegimeRequest) returns (stream Regime);
   // Replication scope, one bidirectional stream per standby: the leader's
-  // ordered log, acknowledged per batch, cut past a bounded backlog.
+  // ordered log, acknowledged per batch, cut past a bounded backlog. A
+  // leader sends 4 snapshots at once: a standby past them is told to
+  // re-sync, and told again each second, until one of them ends and its
+  // own snapshot's first part follows.
   rpc Replicate(stream ReplicaFrame) returns (stream ReplicationBatch);
   // Liveness and readiness are grpc.health.v1, not here.
 }
@@ -151,8 +192,9 @@ message GatewayFrame {
   }
 }
 
-// What the gateway holds; the leases, pins and vetoes follow in HelloPage
-// frames, the counts here size the restore.
+// What the gateway holds. Its standing vetoes ride this frame. No HelloPage
+// is sent (design 5.2): the page's case stays unsent in the oneof, and the
+// lease and pin counts size no restore.
 message Hello {
   // Must equal the principal's subject.
   string gateway_id = 1;
@@ -165,12 +207,22 @@ message Hello {
   uint64 generation = 7;
   uint32 lease_count = 8;
   uint32 pin_count = 9;
+  // The length of `vetoes`: a Hello that counts otherwise is refused.
   uint32 veto_count = 10;
   // A reconnect inside the grace period: restore exactly what the pages list
-  // and release at once what they omit (the inverse rule, design 4.3).
+  // and release at once what they omit (the inverse rule, design 4.3). The
+  // vetoes are no page's: `vetoes` below lists them whole.
   bool resume = 11;
   // The gateway's release string, for the audit log.
   string version = 16;
+  // The gateway's standing vetoes, whole, held before the Welcome leaves: a
+  // veto the list omits is lifted, whether or not the Hello says `resume`.
+  // An entry with nothing remaining is no veto; of two entries of one
+  // worker and kind the later end stands. A list holds at most 4,096
+  // vetoes and, of those with time remaining, at most eight kinds for one
+  // worker: a Hello past either is refused RESOURCE_EXHAUSTED and makes no
+  // session.
+  repeated VetoAssertion vetoes = 17;
   // Never assigned; kept out of use so a later field takes a fresh number.
   reserved 12 to 15;
 }
@@ -181,7 +233,9 @@ message Locality {
   repeated string topology = 2;
 }
 
-// At most 64 KB a page (about 900 leases); the counts in Hello size the whole.
+// At most 64 KB a page (about 900 leases); the lease and pin counts in Hello
+// size the whole. Vetoes ride Hello.vetoes and never a page: no build reads
+// `vetoes` here.
 message HelloPage {
   repeated LeaseAssertion leases = 1;
   repeated Pin pins = 2;
@@ -218,15 +272,28 @@ message VetoAssertion {
   uint32 remaining_micros = 3;
 }
 
+// A gateway's veto on a worker, by kind: each kind stands and clears apart,
+// and the worker is vetoed for the gateway while one kind stands. A veto on
+// a worker the controller holds no row for is not kept: a veto leaves with
+// its worker's row, and the gateway states it again when it sees the worker.
 message GatewayVeto {
   fixed64 worker_id = 1;
+  // A veto is kept by its kind's number: a number this build has no name
+  // for stands and clears like the named ones. KIND_UNSPECIFIED is no kind:
+  // the session ends with INVALID_ARGUMENT, and a Hello that lists it is
+  // refused the same way. A worker holds at most eight kinds for one
+  // gateway, and a gateway at most 4,096 vetoes, what its Hello lists
+  // whole: a frame that would set a ninth kind, or one veto more, ends the
+  // session with RESOURCE_EXHAUSTED, and what stands stays. A clear, and a
+  // frame of a kind that stands, are always taken.
   enum Kind {
     KIND_UNSPECIFIED = 0;
     KIND_BREAKER = 1;
     KIND_LIVENESS = 2;
   }
   Kind kind = 2;
-  // How long the veto stands; 0 with `clear` lifts it.
+  // How long the veto stands from the frame's arrival. `clear`, or a
+  // duration of 0, lifts this kind's veto.
   uint32 for_micros = 3;
   bool clear = 4;
 }
@@ -273,6 +340,10 @@ message Welcome {
   uint32 leader_poll_ms = 11;
   uint32 leases_restored = 12;
   uint32 pins_restored = 13;
+  // How many of the Hello's vetoes the controller holds: fewer than listed
+  // when an entry had nothing remaining, repeated another, or named a worker
+  // the controller holds no row for.
+  uint32 vetoes_restored = 14;
 }
 
 // What the transport verified, or what the caller stated on a listener that
@@ -301,6 +372,11 @@ message Principal {
 }
 
 // What the host must feed per model and role, from the spec's validation.
+// A row is an obligation: a host feeds, for a model and a role, the union
+// of the rows whose model matches, and a model and role with no row need
+// nothing. A row's model is a binding's pattern as the spec writes it:
+// `*`, `prefix*`, `*suffix` or a model's id. The rows keep the bindings'
+// order, and two bindings of one pattern write one row a role.
 message NeedsSummary {
   repeated ModelNeeds models = 1;
 }
@@ -352,7 +428,9 @@ message SpecPush {
 
 // Idempotent on (verified gateway id, request_id) for the lease's lifetime: a
 // repeated Decide after a stream reset returns the standing decision. A
-// frame is at most 64 KiB as encoded.
+// frame is at most 64 KiB as encoded, and one over it is refused whole: a
+// sender cuts its block hashes at the tail until its frame fits, and
+// counts the cut on its own side.
 message DecideRequest {
   // 1 to 256 bytes: the gateway's own key of one request among those it has
   // standing, carried back on every answer. A longer id is sent as a digest
@@ -385,7 +463,12 @@ message Credit {
 // --- WatchWorkers: membership, health, the id-to-URL map, the needs ---------
 
 message WatchWorkersRequest {
-  // Empty for every model.
+  // Empty for every model. Otherwise the snapshot holds the rows that serve
+  // one of these, and the tail tells an event when a row it names does: a
+  // replacement that takes a worker out of them names both rows. No more
+  // names than a row may serve models (a limit of this build), each a model
+  // id as a registration states one: INVALID_ARGUMENT by this field's name
+  // otherwise.
   repeated string models = 1;
   // 0: a snapshot first, then the tail; otherwise the tail after this seq,
   // exclusive: every membership or health event, and with `with_needs` every
@@ -395,12 +478,20 @@ message WatchWorkersRequest {
   // answers one SnapshotRequired and ends the stream, never a silent skip or
   // replay (replicas match by position and term: the replication contract's
   // rejoin check); a synced standby behind it holds the stream and delivers
-  // as it applies.
+  // as it applies. Each run of a controller starts its log at a place drawn
+  // below 2^48. A later run can take a term again, at each start where the
+  // lease is not shared and where a shared lease's record was lost, and the
+  // draw keeps a position of another run outside the positions this run
+  // holds, under its first or ahead of its head, but for a chance of 4,097
+  // in 2^48 a resume, or of 69,634 where the lease is shared and the log
+  // holds the load rows' positions too.
   // membership_epoch moves only on a membership change and is no resume point.
   uint64 resume_seq = 2;
+  // INVALID_ARGUMENT, by this field's name, where the controller tells no
+  // generation's needs.
   bool with_needs = 3;
   // The term `resume_seq` was written under, WorkerEvent.term as delivered; 0
-  // with resume_seq 0.
+  // with resume_seq 0 (INVALID_ARGUMENT, by this field's name, otherwise).
   uint64 resume_term = 4;
 }
 
@@ -408,8 +499,13 @@ message WorkerEvent {
   // The replication log position of the event: the leader assigns it, the
   // batch carries it and a standby adopts it, so every replica numbers the
   // event alike. Every page of one snapshot carries the position the snapshot
-  // is consistent with, filtered by `models` or not (the position GetSnapshot's
-  // replication_seq names on a complete one); the tail starts after it.
+  // is consistent with, filtered by `models` or not: the last position of the
+  // kinds a watcher can ask for when the rows were read (a standby's
+  // snapshot stands at the log's head, at or after it; the rows are the
+  // same at both); the tail starts after it. A registration call's answer
+  // carries the position of the call's write, and where the call wrote
+  // nothing the last position of those kinds: a watcher that has passed it
+  // holds the row as answered or a later one.
   uint64 seq = 1;
   uint64 membership_epoch = 2;
   oneof event {
@@ -421,24 +517,27 @@ message WorkerEvent {
     WorkerRow relabelled = 8;
     NeedsSummary needs = 9;
     // The tail cannot resume after the requested seq (the position gone, or
-    // held under another term): the stream ends and the watcher reconnects
-    // with resume_seq 0.
+    // held under another term), or the watcher fell behind what the log
+    // retains: the stream ends and the watcher reconnects with resume_seq 0.
+    // The event carries no position of its own: seq and term are 0.
     SnapshotRequired snapshot_required = 10;
   }
   // The term `seq` was written under; a watcher hands both back on resume.
   uint64 term = 11;
 }
 
-// Paged at 128 rows, every page at the snapshot's seq; a watcher switches to
-// the tail at `last` and, cut before it, reconnects with resume_seq 0. A row
-// is at most 16,384 bytes at its registration (WorkerSpec), so a page of 128
-// rows is about half of a 4 MiB frame.
+// Paged at 128 rows or at 2 MiB of rows, whichever comes first, every page at
+// the snapshot's seq; a watcher switches to the tail at `last` and, cut
+// before it, reconnects with resume_seq 0. A page takes its first row
+// whatever it weighs. A row is at most 16,384 bytes at its registration
+// (WorkerSpec), so a page stays within half of a 4 MiB frame.
 message WorkerSnapshot {
   repeated WorkerRow workers = 1;
   bool last = 2;
 }
 
 message SnapshotRequired {
+  // The position of the oldest event the log retains.
   uint64 oldest_seq = 1;
 }
 
@@ -517,6 +616,30 @@ message WorkerRow {
   // engine, the registration key for a single rank.
   string engine = 24;
   HealthPolicy health_policy = 25;
+  // How long ago the row was admitted, at the send. Set in a snapshot's
+  // rows, where a standby restores the instant from it; 0 in an event's
+  // row. A row an event adds, a new worker's or a replacement's, is
+  // admitted where it is applied; a row an event changes keeps the
+  // admission its standby holds.
+  uint64 admitted_age_ms = 26;
+  // Who made the row. Absent: a control call. The caller that made a row
+  // alone changes it: an UPSERT or a REPLACE over it, a patch, a drain and
+  // a removal from any other are refused PERMISSION_DENIED, ahead of the
+  // revision's test, and the words name the maker. An ADD over it is
+  // ALREADY_EXISTS whoever made it. A reader that knows no such field
+  // reads every row as a control call's.
+  Maker maker = 27;
+}
+
+// A provider that finds workers by itself, as a row's maker. Neither
+// field is empty: a reader refuses a row whose maker lacks one, by that
+// field.
+message Maker {
+  // The provider's name: one token of visible ASCII (0x21 to 0x7E) with no
+  // comma, at most 128 bytes, the form of a principal's stated name.
+  string provider = 1;
+  // The provider's own key for the worker, at most 2048 bytes.
+  string key = 2;
 }
 
 // A host-local wire is reachable from one gateway only.
@@ -546,6 +669,24 @@ message PairingDescriptor {
   bool ec_producer = 9;
   bool ec_consumer = 10;
   bool vision = 11;
+  // The worker's end of the encode handoff, with its two EC roles: the form
+  // its registration states and, under a push, the connector the role is
+  // stated on. Unspecified is no end, as a registration that names no form
+  // reads; the connector above is the pair's. The store derives from them
+  // which encoders hand an item to which prefills.
+  EncodeHandoff encode_handoff = 12;
+  string ec_connector = 13;
+  // The worker, an encoder, processes an item's references itself.
+  bool encode_references = 14;
+}
+
+// How an encoder hands an encoded item to a prefill.
+enum EncodeHandoff {
+  ENCODE_HANDOFF_UNSPECIFIED = 0;
+  // The encoder pushes the item to the prefill over an EC connector.
+  ENCODE_HANDOFF_PUSH = 1;
+  // The encoder and the prefill meet at a rendezvous.
+  ENCODE_HANDOFF_RENDEZVOUS = 2;
 }
 
 // Per-worker overrides over the spec's defaults; unset means the spec's value.
@@ -648,15 +789,20 @@ message RegisterWorkerRequest {
   enum Mode {
     // Reads as MODE_ADD.
     MODE_UNSPECIFIED = 0;
-    // The URL must be absent: ALREADY_EXISTS otherwise.
+    // The URL must be absent: ALREADY_EXISTS otherwise, whoever made the
+    // standing row.
     MODE_ADD = 1;
-    // The URL must stand: its next incarnation, NOT_FOUND otherwise.
+    // The URL must stand: its next incarnation, NOT_FOUND otherwise, whatever
+    // the registration leaves unset. A field past its own rule or bound is
+    // INVALID_ARGUMENT first, whether the URL stands or not. A caller that
+    // did not make the standing row is PERMISSION_DENIED (WorkerRow.maker).
     MODE_REPLACE = 2;
     // Registers an absent URL. Over a standing row: equal facts write nothing
     // and answer the row unmoved, a change of role, wire or models is a new
     // incarnation, any other change is made in place. The models change
     // when their set does: the same ids in another order are written in
-    // place, and the row tells the stated order.
+    // place, and the row tells the stated order. A caller that did not make
+    // the standing row is PERMISSION_DENIED, whatever the facts.
     MODE_UPSERT = 3;
   }
   Mode mode = 2;
@@ -675,8 +821,8 @@ message RegisterWorkerRequest {
 // whole; any other field left unset or empty keeps the row's value, and an
 // overload or a signals block that is present replaces the row's. A URL's
 // first registration names its wire and its role: INVALID_ARGUMENT by the
-// field it leaves unset, and by the field that states a number this
-// contract does not name.
+// field it leaves unset. A wire or a role that states a number this
+// contract does not name is INVALID_ARGUMENT at every registration.
 //
 // Bounds, each INVALID_ARGUMENT by its field: a URL at most 2,048 bytes; a
 // runtime, a zone and a model id at most 256 bytes each; at most 128 labels,
@@ -733,6 +879,8 @@ message PatchWorkerRequest {
   repeated string remove_labels = 3;
   OverloadThresholds overload = 4;
   // The row's revision the caller read; FAILED_PRECONDITION when it moved.
+  // A caller that did not make the row is PERMISSION_DENIED first, whatever
+  // revision it read (WorkerRow.maker).
   uint64 revision = 5;
 }
 
@@ -751,8 +899,8 @@ message DeregisterWorkerRequest {
 // --- Control scope: the store -----------------------------------------------
 
 // Redacted by default: URLs lose credentials, session keys and header values
-// are fingerprinted, plugin state dumps hash identifiers. The replication
-// scope's call is served complete and unredacted: a standby's re-sync base.
+// are fingerprinted, plugin state dumps hash identifiers. A standby is
+// restored on its Replicate stream (ReplicationSnapshot), never by this call.
 message SnapshotRequest {
   enum Slice {
     SLICE_UNSPECIFIED = 0;
@@ -772,7 +920,9 @@ message SnapshotRequest {
   repeated string models = 2;
   // Admin only in the control scope: identifiers in clear.
   bool plain_identifiers = 3;
-  // Rows per slice at most; `truncated` says when it bit.
+  // Rows per slice at most; 0 sets no limit. A slice's rows are bounded by
+  // the bytes of a page as well, whatever is asked. `truncated` says when
+  // either bound left a row out.
   uint32 limit = 4;
 }
 
@@ -793,10 +943,8 @@ message Snapshot {
   KvIndexSummary kv_index = 12;
   repeated GatewayRow gateways = 13;
   bool truncated = 14;
-  // The log position the snapshot is consistent with (a standby rejoins with
-  // `last_applied_seq` here and `last_applied_term` = `replication_term`);
-  // non-zero only on a complete, unredacted snapshot of the replication scope,
-  // zero on a partial or redacted one.
+  // The log position the snapshot is consistent with; non-zero only on a
+  // complete, unredacted snapshot, zero on a partial or redacted one.
   uint64 replication_seq = 15;
   // The interned-id table at that position.
   IdAssignment ids = 16;
@@ -808,6 +956,8 @@ message Snapshot {
   // The term the event at `replication_seq` was written under; present with
   // it, zero with it.
   uint64 replication_term = 18;
+  // The membership epoch at `replication_seq`; present with it.
+  uint64 membership_epoch = 19;
 }
 
 // The health precedence's inputs.
@@ -826,6 +976,9 @@ message LoadSample {
   fixed64 worker_id = 1;
   uint32 dp_rank = 2;
   LoadRow load = 3;
+  // Whether the report counts resident tokens: the row's 0 is both "none"
+  // and "not counted". The host's own reading, in no plugin's view.
+  bool resident_counted = 4;
 }
 
 message SessionRow {
@@ -950,13 +1103,20 @@ message ApplyRequest {
   bytes document = 1;
   // `yaml` or `json`.
   string format = 2;
+  // A write states its mode: none, or a number that is no mode, is
+  // INVALID_ARGUMENT by the field's name.
   ApplyMode mode = 3;
   // The digest of the generation the caller edited; FAILED_PRECONDITION when
   // another apply landed first.
   string expected_digest = 4;
 }
 
-// Persisted first, then applied; under `source: file` the answer is read_only.
+// Persisted first, then applied; under `source: file` every answer is
+// read_only: an enforce and a rollback carry the standing number and digest
+// and take nothing. A dry run answers OK whatever its verdict: accepted,
+// with the number the document would run under, which is not reserved, and
+// its digest; or not accepted, with the standing number and digest and one
+// issue. `needs` is the feed before and after a document that would run.
 message ApplyResult {
   bool accepted = 1;
   uint64 generation = 2;
@@ -1018,7 +1178,10 @@ message LeaderInfo {
   string address = 2;
   uint64 term = 3;
   bool is_leader = 4;
-  // Synced on replication lag, live ranks and generation (design 5.4).
+  // On a follower: its replication lag is under one load poll interval,
+  // or two of the leader's heartbeats where that is longer. The live
+  // ranks and the generation narrow this bit with their steps (design
+  // 5.4). A leader follows nobody: false.
   bool synced = 5;
   SyncState sync = 6;
   repeated GroupLeader groups = 7;
@@ -1027,6 +1190,8 @@ message LeaderInfo {
 }
 
 message SyncState {
+  // The age of the last frame that left a follower at the head its leader
+  // stated (ReplicationBatch.head_seq).
   uint32 replication_lag_ms = 1;
   uint32 ranks_live = 2;
   uint32 ranks_total = 3;
@@ -1083,16 +1248,24 @@ message ReplicaHello {
   uint64 last_applied_seq = 2;
   // The highest term seen: the fencing floor, not the term of any position.
   uint64 term_seen = 3;
-  // Events the standby can hold unacknowledged; the leader cuts a slower one.
+  // Events the standby can hold unacknowledged. The leader sends it no
+  // further, and tells a standby that leaves the bound full for a second
+  // to resync. Zero asks for the leader's own bound, and a bound above
+  // the leader's is cut to it.
   uint32 max_backlog = 4;
   // The term the event at `last_applied_seq` was written under. A leader
   // continues a standby only when its log holds `last_applied_seq` under
   // `last_applied_term`; on another term, a position past its head, or one
   // older than it retains, it answers a resync_required batch, never a
   // continuation: two replicas that agree on a position and its term share
-  // the prefix before it. A standby seeds both from a snapshot's
-  // `replication_seq` and `replication_term`; a non-zero `last_applied_seq`
-  // with a zero term is answered resync_required as well.
+  // the prefix before it. A standby restored from a snapshot stands at the
+  // snapshot's place under its term. A non-zero `last_applied_seq` with a
+  // zero term is answered resync_required as well: a standby on which its
+  // leader's event did not land states its head's number under no term, and
+  // is restored whole. A standby that
+  // applied nothing states zero for both: it is continued from the leader's
+  // first write, at the position after the place the leader's run drew,
+  // while the leader's log retains every write since.
   uint64 last_applied_term = 5;
 }
 
@@ -1106,13 +1279,59 @@ message ReplicationBatch {
   // current term: a catch-up batch splits at a term boundary, so a standby
   // records each position under its write term.
   uint64 term = 2;
+  // No events and no part of a snapshot: the leader's heartbeat, one a
+  // second on an idle stream. `first_seq` is then the position after the
+  // leader's head and `term` the head's: a standby that applied
+  // `first_seq - 1` stands at the head.
   repeated ReplicationEvent events = 3;
   // The standby's backlog was cut, or its `last_applied_seq` is not held
-  // under `last_applied_term`: re-sync from GetSnapshot (its `replication_seq`
-  // and `replication_term` seed the next hello), then rejoin on a new
-  // Replicate stream. A standby that re-syncs ends its open WatchWorkers
-  // tails with SnapshotRequired: their positions came from the log it dropped.
+  // under `last_applied_term`: the leader's snapshot follows on this stream
+  // in parts (`snapshot`), then the log from the snapshot's place. A standby
+  // that re-syncs ends its open WatchWorkers tails with SnapshotRequired:
+  // their positions came from the log it dropped.
   bool resync_required = 4;
+  // One part of the leader's snapshot; the batch carries no event.
+  // `first_seq` is then the position after the snapshot's place and `term`
+  // the place's, the same on every part: a standby restored from the
+  // snapshot stands at `first_seq - 1`, and the next batch of events starts
+  // at `first_seq`.
+  ReplicationSnapshot snapshot = 5;
+  // The leader's head as the frame was made: the last position its log
+  // holds. A standby that applied through it stood at the head then, and
+  // its lag's instant moves at such a frame alone: inside a replay, or in
+  // the tail a restore leaves, it reads not synced however fast the frames
+  // come. 0 states no head (a leader of a build before the field): the
+  // frame moves the instant, as every applied frame did.
+  uint64 head_seq = 6;
+}
+
+// One part of a snapshot a standby is restored from: the leader's rows and
+// load rows as one write of its log left them, cut once and sent in parts on
+// the stream that then carries the log from that place, so no gap stands
+// between a snapshot and what follows it. Rows are paged as a watch's
+// snapshot is (WorkerSnapshot: 128 rows or 2 MiB of rows, a first row
+// whatever it weighs), the load rows within the same bytes, the rows' parts
+// first. A standby stages the parts and restores at the last one, whole or
+// not at all: a stream that ends inside a snapshot leaves its store as it
+// was. An empty store is one empty part.
+message ReplicationSnapshot {
+  // The part's number in its snapshot: zero, then one more each part.
+  uint32 part = 1;
+  // The snapshot's last part.
+  bool last = 2;
+  // The membership epoch at the snapshot's place, on every part. A standby
+  // restored from the snapshot numbers its next membership change after it,
+  // as the leader does.
+  uint64 membership_epoch = 3;
+  // Each row's `admitted_age_ms` is its age at the part's send.
+  repeated WorkerRow workers = 4;
+  repeated LoadSample loads = 5;
+  // The generation that stands at the leader when the part is sent, with its
+  // document, on the snapshot's first part: at the snapshot's place or
+  // after it, never before. Unset where the leader holds no document. A
+  // standby restored from the snapshot runs the document under this number;
+  // the event of the same generation, where it follows, changes nothing.
+  GenerationEvent generation = 6;
 }
 
 message ReplicationEvent {
@@ -1125,12 +1344,26 @@ message ReplicationEvent {
     GenerationEvent generation = 6;
     IdAssignment ids = 7;
     LeaseEnd lease_end = 8;
+    // The first position of a term: the leader's take, journaled before its
+    // first write under the term. It changes no row; a standby journals the
+    // position. An event with no case set is one the reader's build does not
+    // know: a standby never skips it, it leaves the synced state at that
+    // position.
+    TermStart term_start = 9;
   }
 }
+
+// The start of the term its batch is written under.
+message TermStart {}
 
 // A generation as the leader applied it (the status, the document the
 // gateways receive), so a standby serves GetPolicySpec and RollbackPolicySpec
 // and runs it after promotion; a rollback replicates the restored one alike.
+// A leader's log keeps the generation's number alone, and the document is
+// joined at the send: an event with no document states a generation that
+// stood no longer by then. A standby applies nothing for it and journals the
+// position; a later event carries what replaced it. A leader states the
+// generation that stands again behind the start of each term it takes.
 message GenerationEvent {
   SpecStatus status = 1;
   SpecPush document = 2;

@@ -18,6 +18,8 @@ use openai_protocol::{
     model_card::ModelCard, worker::WorkerUpdateRequest as ProtocolWorkerUpdateRequest,
 };
 use serde::{Deserialize, Serialize};
+pub use smg_worker::jobs::WorkerRegistrationMode;
+use smg_worker::workflow::{self as worker_workflow, WorkerList};
 use wfaas::{StepId, WorkflowData, WorkflowError, WorkflowResult};
 
 // ============================================================================
@@ -33,16 +35,25 @@ pub enum WorkerKind {
     External,
 }
 
+use smg_worker::{
+    identity::basic::{ConnectionMode, Worker},
+    registry::WorkerId,
+};
+
 use super::{
-    mcp_registration::McpServerConfigRequest, steps::local::WorkerRemovalRequest,
-    tokenizer_registration::TokenizerConfigRequest,
+    mcp_registration::McpServerConfigRequest, tokenizer_registration::TokenizerConfigRequest,
     wasm_module_registration::WasmModuleConfigRequest,
     wasm_module_removal::WasmModuleRemovalRequest,
 };
-use crate::{
-    app_context::AppContext,
-    worker::{registry::WorkerId, ConnectionMode, Worker},
-};
+use crate::app_context::AppContext;
+
+/// The application context a workflow's data was given, or the workflow's
+/// error for a run that was started without one.
+pub(crate) fn require_app_context(
+    app_context: Option<&Arc<AppContext>>,
+) -> WorkflowResult<&Arc<AppContext>> {
+    app_context.ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))
+}
 
 // ============================================================================
 // Shared trait for worker registration workflows
@@ -74,50 +85,6 @@ pub trait WorkerRegistrationData: WorkflowData {
     /// existed.
     fn registration_mode(&self) -> WorkerRegistrationMode {
         WorkerRegistrationMode::Upsert
-    }
-}
-
-/// Semantics of the final worker registry write.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum WorkerRegistrationMode {
-    /// `POST /workers`: fail when the URL is already registered.
-    CreateOnly,
-    /// Startup and service discovery: register the URL, replacing whatever
-    /// holds it. Both reconcile declared state against the registry.
-    #[default]
-    Upsert,
-    /// `PUT /workers/{id}`: replace the worker only while `worker_id` still
-    /// holds the URL at `expected_revision`.
-    ///
-    /// `PUT` answers 202 and registers later, so other writes for the same URL
-    /// can land in between. Binding the write to what the request validated
-    /// makes the late write fail instead of resurrecting a worker a `DELETE`
-    /// removed, overwriting one a `POST` created, or restoring the older
-    /// specification over a second `PUT` that finished first.
-    ReplaceById {
-        worker_id: String,
-        expected_revision: u64,
-    },
-}
-
-/// Wrapper for worker list that can be serialized
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct WorkerList {
-    /// Worker URLs (we can't serialize `Arc<dyn Worker>`, so we store URLs)
-    pub worker_urls: Vec<String>,
-}
-
-impl WorkerList {
-    pub fn new() -> Self {
-        Self {
-            worker_urls: Vec::new(),
-        }
-    }
-
-    pub fn from_workers(workers: &[Arc<dyn Worker>]) -> Self {
-        Self {
-            worker_urls: workers.iter().map(|w| w.url().to_string()).collect(),
-        }
     }
 }
 
@@ -184,10 +151,7 @@ impl WorkerWorkflowData {
         if let Some(client) = &self.http_client_handle {
             return Ok(Arc::clone(client));
         }
-        let app_context = self
-            .app_context
-            .as_ref()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
+        let app_context = require_app_context(self.app_context.as_ref())?;
         app_context
             .worker_client_cache
             .get(&self.config.http_pool, self.http2.unwrap_or(false))
@@ -240,50 +204,9 @@ impl WorkflowData for TokenizerWorkflowData {
     }
 }
 
-/// Data for worker removal workflow
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkerRemovalWorkflowData {
-    pub config: WorkerRemovalRequest,
-    pub workers_to_remove: Option<WorkerList>,
-    /// URLs of workers being removed
-    pub worker_urls: Vec<String>,
-    /// Model IDs affected by the removal
-    pub affected_models: std::collections::HashSet<String>,
-    /// Application context (transient, must be re-initialized after deserialization)
-    #[serde(skip, default)]
-    pub app_context: Option<Arc<AppContext>>,
-    /// Actual worker objects to remove (transient, not serialized)
-    #[serde(skip, default)]
-    pub actual_workers_to_remove: Option<Vec<Arc<dyn Worker>>>,
-    /// The workers the registry step removed at those URLs, a same-URL
-    /// replacement that landed during the drain rather than the worker found
-    /// (transient, not serialized)
-    #[serde(skip, default)]
-    pub removed_workers: Vec<Arc<dyn Worker>>,
-}
-
-impl WorkerRemovalWorkflowData {
-    /// Narrows the job to `kept`, the workers it still holds: the selection's
-    /// result, or what a step left after it found some of them standing on
-    /// their own (a pin that moved, a registration under the URL since the
-    /// selection). The worker list, the URLs and the affected models move
-    /// together, so the steps after it touch nothing of the others.
-    pub fn keep_only(&mut self, kept: Vec<Arc<dyn Worker>>) {
-        self.worker_urls = kept.iter().map(|worker| worker.url().to_string()).collect();
-        self.affected_models = kept
-            .iter()
-            .map(|worker| worker.model_id().to_string())
-            .collect();
-        self.workers_to_remove = Some(WorkerList::from_workers(&kept));
-        self.actual_workers_to_remove = Some(kept);
-    }
-}
-
-impl WorkflowData for WorkerRemovalWorkflowData {
-    fn workflow_type() -> &'static str {
-        "worker_removal"
-    }
-}
+/// Data for worker removal workflow: the worker crate's, with this gateway's
+/// context as the host its steps read.
+pub type WorkerRemovalWorkflowData = worker_workflow::WorkerRemovalWorkflowData<AppContext>;
 
 /// Data for worker update workflow
 #[derive(Debug, Clone, Serialize, Deserialize)]

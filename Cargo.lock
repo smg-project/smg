@@ -5796,9 +5796,13 @@ dependencies = [
 name = "policy-controller-example"
 version = "0.1.0"
 dependencies = [
+ "mock-worker",
  "serde_yaml",
+ "smg-grpc-client",
  "smg-policy-controller",
+ "tikv-jemallocator",
  "tokio",
+ "tonic",
 ]
 
 [[package]]
@@ -7814,7 +7818,6 @@ dependencies = [
  "openai-harmony",
  "openai-protocol",
  "openapi-gen",
- "openmetrics-parser",
  "openssl",
  "opentelemetry 0.32.0",
  "opentelemetry-otlp",
@@ -7825,7 +7828,6 @@ dependencies = [
  "portpicker",
  "prost",
  "prost-types",
- "quanta",
  "rand 0.10.2",
  "rayon",
  "reasoning-parser",
@@ -7851,9 +7853,11 @@ dependencies = [
  "smg-mm-rdma",
  "smg-response-template",
  "smg-rl",
+ "smg-service-discovery",
  "smg-symphony",
  "smg-test-harness",
  "smg-wasm",
+ "smg-worker",
  "tempfile",
  "thiserror 2.0.21",
  "tikv-jemalloc-ctl",
@@ -7956,6 +7960,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smg-mcp",
+ "smg-worker",
  "str0m",
  "thiserror 2.0.21",
  "tokio",
@@ -7985,6 +7990,7 @@ dependencies = [
  "smg",
  "smg-grpc-client",
  "smg-symphony",
+ "smg-worker",
  "tikv-jemalloc-ctl",
  "tikv-jemallocator",
  "tokio",
@@ -8007,6 +8013,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "smg-worker",
  "tempfile",
  "tokio",
  "tokio-stream",
@@ -8094,6 +8101,7 @@ dependencies = [
  "axum",
  "clap",
  "criterion",
+ "crossbeam-queue",
  "http",
  "hyper-util",
  "k8s-openapi",
@@ -8119,6 +8127,7 @@ dependencies = [
  "serde_yaml",
  "sha2 0.11.0",
  "smg-grpc-client",
+ "smg-policy-controller",
  "tempfile",
  "thiserror 2.0.21",
  "thread_local",
@@ -8162,6 +8171,7 @@ dependencies = [
  "smg-grpc-client",
  "smg-mesh",
  "smg-rl",
+ "smg-service-discovery",
  "smg-symphony",
  "tempfile",
  "tikv-jemallocator",
@@ -8215,6 +8225,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "smg-service-discovery"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "blake3",
+ "futures",
+ "http",
+ "k8s-openapi",
+ "kube",
+ "metrics",
+ "notify",
+ "openai-protocol",
+ "openssl",
+ "parking_lot 0.13.0",
+ "reqwest 0.13.4",
+ "rustls",
+ "serde",
+ "serde_json",
+ "smg-worker",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "tracing-test",
+ "url",
+]
+
+[[package]]
 name = "smg-symphony"
 version = "0.3.0"
 dependencies = [
@@ -8258,6 +8297,7 @@ dependencies = [
  "smg-auth",
  "smg-grpc-client",
  "smg-mcp",
+ "smg-worker",
  "tempfile",
  "tokio",
  "tokio-stream",
@@ -8291,13 +8331,42 @@ dependencies = [
 name = "smg-worker"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "arc-swap",
+ "async-trait",
  "axum",
+ "base64 0.23.1",
  "bitflags 2.13.2",
+ "chrono",
+ "dashmap",
+ "futures",
+ "http",
+ "metrics",
+ "metrics-exporter-prometheus",
+ "metrics-util",
+ "once_cell",
+ "openmetrics-parser",
+ "openssl",
+ "parking_lot 0.13.0",
+ "prost",
+ "prost-build",
+ "quanta",
+ "reqwest 0.13.4",
+ "rustc-hash 2.1.3",
+ "rustls",
  "schemars 1.2.2",
  "serde",
  "serde_json",
  "serde_with",
+ "thiserror 2.0.21",
+ "tokio",
+ "tonic",
+ "tonic-prost",
+ "tracing",
+ "tracing-test",
  "url",
+ "uuid",
+ "wfaas",
 ]
 
 [[package]]

@@ -14,6 +14,12 @@ use openai_protocol::{
         WorkerUpdateRequest,
     },
 };
+use smg_worker::{
+    connection::engine::EngineConnection,
+    health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
+    identity::basic::{BasicWorker, ConnectionMode, RuntimeType},
+    registry::WorkerId,
+};
 use tracing_test::traced_test;
 use wfaas::WorkflowInstanceId;
 
@@ -28,11 +34,6 @@ use crate::{
         },
     },
     server::http_client,
-    worker::{
-        health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
-        registry::WorkerId,
-        BasicWorker, ConnectionMode, RuntimeType,
-    },
     workflow::steps::local::test_support::labels_of,
 };
 
@@ -47,7 +48,8 @@ fn make_app_context_with(
     tool_parser_factory: Option<tool_parser::ParserFactory>,
 ) -> Arc<AppContext> {
     use crate::{
-        app_context::testing::app_context_for_tests, config::RouterConfig, worker::WorkerRegistry,
+        app_context::testing::app_context_for_tests, config::RouterConfig,
+        routers::common::snapshot::WorkerRegistry,
     };
 
     let router_config = RouterConfig::builder()
@@ -1009,7 +1011,8 @@ async fn zmq_update_preserves_transport_state_and_the_live_client() {
         ),
     );
     let _engine = engine.expect("mock engine");
-    let client = Arc::new(BackendClient::Zmq(client.expect("adapter connect")));
+    let client: Arc<dyn EngineConnection> =
+        Arc::new(BackendClient::Zmq(client.expect("adapter connect")));
 
     let worker: Arc<dyn Worker> = Arc::new(
         BasicWorkerBuilder::new(ep("ts0.ipc"))
@@ -1030,7 +1033,7 @@ async fn zmq_update_preserves_transport_state_and_the_live_client() {
         .as_any()
         .downcast_ref::<BasicWorker>()
         .expect("BasicWorker");
-    old.backend_client
+    old.engine_connection
         .load_full()
         .set(Arc::clone(&client))
         .ok()
@@ -1078,7 +1081,7 @@ async fn zmq_update_preserves_transport_state_and_the_live_client() {
     );
 
     let adopted = new
-        .backend_client
+        .engine_connection
         .load_full()
         .get()
         .cloned()
@@ -1102,7 +1105,7 @@ async fn zmq_worker_with_its_link(
     by_hand: HashMap<String, String>,
 ) -> (
     Arc<dyn Worker>,
-    Arc<BackendClient>,
+    Arc<dyn EngineConnection>,
     MockEngine,
     tempfile::TempDir,
 ) {
@@ -1129,7 +1132,8 @@ async fn zmq_worker_with_its_link(
         connect_to_frontend(&handshake, EngineId::from_engine_index(0), ready),
     );
     let engine = engine.expect("mock engine");
-    let client = Arc::new(BackendClient::Zmq(client.expect("adapter connect")));
+    let client: Arc<dyn EngineConnection> =
+        Arc::new(BackendClient::Zmq(client.expect("adapter connect")));
     let mut labels = recorded.clone();
     labels.extend(by_hand);
     let worker: Arc<dyn Worker> = Arc::new(
@@ -1147,7 +1151,7 @@ async fn zmq_worker_with_its_link(
         .as_any()
         .downcast_ref::<BasicWorker>()
         .expect("BasicWorker")
-        .backend_client
+        .engine_connection
         .load_full()
         .set(Arc::clone(&client))
         .ok()
@@ -1204,7 +1208,7 @@ async fn a_zmq_refresh_gives_the_card_the_handshake_window() {
         .downcast_ref::<BasicWorker>()
         .expect("BasicWorker");
     let adopted = new
-        .backend_client
+        .engine_connection
         .load_full()
         .get()
         .cloned()
@@ -1617,6 +1621,39 @@ async fn a_refreshed_parser_name_with_a_control_character_is_refused() {
             .expect("the worker stays registered");
         assert!(Arc::ptr_eq(&kept, &worker), "the worker was left as it was");
     }
+}
+
+/// A `constrained_decoding` value the engine reports at a refresh with a
+/// control character in it is refused: the job fails in a sentence that
+/// names the label and does not repeat the value, and the worker is left
+/// as it was.
+#[tokio::test]
+async fn a_refreshed_decoding_policy_with_a_control_character_is_refused() {
+    let worker = discovered(
+        WorkerSpec::new("http://w:8000"),
+        labels_of(&[("served_model_name", "m")]),
+    );
+    let app_ctx = make_app_context(std::slice::from_ref(&worker));
+    let fresh = labels_of(&[
+        ("served_model_name", "m"),
+        ("constrained_decoding", "sometimes\nINJECTED"),
+    ]);
+    let mut refresh = make_refresh_context(Arc::clone(&app_ctx), Arc::clone(&worker), fresh);
+
+    let err = UpdateWorkerPropertiesStep
+        .execute(&mut refresh)
+        .await
+        .expect_err("the reported value is refused");
+    assert_eq!(
+        err.to_string(),
+        "Step failed: update_worker_properties - Worker http://w:8000: \
+         constrained_decoding must not contain control characters"
+    );
+    let kept = app_ctx
+        .worker_registry
+        .get_by_url("http://w:8000")
+        .expect("the worker stays registered");
+    assert!(Arc::ptr_eq(&kept, &worker), "the worker was left as it was");
 }
 
 /// An external worker's cards come from the provider's model list, not

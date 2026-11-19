@@ -12,7 +12,11 @@
 //! keeps in flight; the plugin's ack fixes the protocol version and the
 //! stages it implements, and an ack that says `init` failed fails the apply.
 //! A stage a profile binds and the ack leaves out takes its fallback on
-//! every decision, and one warning a bound set says so.
+//! every decision, and one warning a bound set says so. A plugin speaks
+//! one version on all its streams: the first `Decide` stream to settle
+//! fixes it, a stream opened while one stands is offered it alone, an ack
+//! that settles second and names another ends its stream with both named,
+//! and the end of the last stream frees it.
 //!
 //! How a decision runs: one `Decide` stream per deciding thread, opened at
 //! the apply ([`Plugin::warm`] on every shard thread) and kept. No decision
@@ -22,7 +26,11 @@
 //! (a pair's two sides are in flight together). The frame carries the view
 //! (the request under the plugin's exposure, every candidate, the pool) and
 //! the stage bits the profile binds; the answer carries the survivors, one
-//! score per candidate and the pick, each stage's field its own. A plugin
+//! score per candidate and the pick, each stage's field its own. The
+//! request's block hashes ride the frame only where the plugin's row
+//! declares them (`needs`, either form), the first
+//! [`MAX_BLOCK_HASHES`](crate::spec::MAX_BLOCK_HASHES) of a longer list,
+//! so a prompt's length sizes no frame of a plugin that reads none. A plugin
 //! bound as a filter or a scorer is asked at the decision's open, so the
 //! native stages run while it computes; a plugin bound as the picker alone
 //! is asked at the pick, with the combined native scores. The deciding
@@ -72,24 +80,46 @@
 //! rule and the cool-down. Without a fallback stage, `failure: open` steps
 //! aside and `failure: closed` sheds, as for every kind.
 //!
-//! The lifecycle: one `Observe` stream per plugin, opened once a `Decide`
-//! stream has settled, carries the events the engine forwards (issued,
+//! The lifecycle: a plugin hears the kinds of event its row lists
+//! ([`GrpcPluginSpec::observes`]), none by default. A row that lists none is
+//! told nothing and has no `Observe` stream. A row that lists any has its
+//! plugin's scorer and picker say they need the lifecycle's calls
+//! ([`crate::Lifecycle::needs_lifecycle`]), so a host that makes none
+//! refuses them. One `Observe` stream per such plugin, opened once a
+//! `Decide` stream has settled, carries the events it hears (among issued,
 //! dispatched, completed, released, membership, signals) in order, each
 //! numbered by the I/O thread where it enters the stream, so the numbers
 //! never go down whichever threads raise the events; an event the queue
 //! cannot take at once is dropped and counted,
 //! never a wait on a deciding thread. A number counts the events sent and
-//! the events refused, for the plugin's life and across its streams, so a
-//! gap tells the plugin what it lost: events refused at a full queue, or in
-//! flight on a stream that ended. A gap sits where the loss fell: an event
-//! carries the refusals its thread had seen as it entered the queue, so
-//! every event raised before a loss arrives ahead of its gap, and a loss
-//! after the last event raised shows at the next. The stream's task is
-//! started again a pause after one that panicked, the queue and the numbers
-//! kept. Each profile
+//! the events refused, for one load of the plugin and across that load's
+//! streams, so a gap tells the plugin what it lost: events refused at a full
+//! queue, or in flight on a stream that ended. A gap sits at the loss. For
+//! a refusal, an event carries the refusals its thread had seen as it
+//! entered the queue, so every event that entered the queue before the
+//! refusal arrives ahead of the gap, an event whose thread stood between its
+//! read of the count and its entry when the refusal fell arrives on either
+//! side, and a refusal after the last event raised shows at the next. For a
+//! stream that ended, the gap is the events in flight on it: it sits before
+//! the first event of the next stream, and the events that waited in the
+//! queue behind them arrive after it. A stream that fails says one warning
+//! an outage. The stream's task is started again a pause after a turn that
+//! panicked, the queue and the numbers kept, and says one error a streak of
+//! such turns. One edge starts an outage and a streak anew: the end of a
+//! call that stood a minute, which only the plugin makes. An event sent
+//! does not, and two outages with less than a minute of standing between
+//! them are one line. So a plugin whose calls all end inside a minute is
+//! one outage for its life, and a server that ends every call by age past
+//! a minute says one line an age. The process's panic hook writes its own
+//! line to stderr at every panicked turn. Each profile
 //! that binds the plugin holds one [`Bound`] set, taken from its engine
 //! build's [`Binder`]: one adapter of a build forwards, so an event reaches
-//! the plugin once per engine.
+//! the plugin once per engine. An `Observe` stream's hello names the
+//! version the plugin's `Decide` streams last fixed: none opens before one
+//! has settled (the events wait in the queue), a call that ends is opened
+//! again under that version, and once a settle fixes another the call is
+//! ended for the next to name that one. A word the stream's version has no
+//! kind for is not written and takes no number.
 //!
 //! The runtime: one I/O thread per process ([`Runtime`]) owns every stream;
 //! a deciding thread hands it a frame and waits on that frame's place in
@@ -122,7 +152,8 @@ mod unit;
 mod view;
 
 pub use config::{
-    BreakerSpec, Exposure, Failure, GrpcPluginSpec, HeaderSet, Reveal, Tls, Transport,
+    BreakerSpec, EventKind, EventSet, Exposure, Failure, GrpcPluginSpec, HeaderSet, Reveal, Tls,
+    Transport,
 };
 pub use plugin::{Binder, Bound, LoadError, Plugin, Stats};
 pub use runtime::Runtime;
@@ -137,5 +168,11 @@ pub type GrpcScorer = crate::plugins::PluginScorer<Bound>;
 /// See [`GrpcFilter`].
 pub type GrpcPicker = crate::plugins::PluginPicker<Bound>;
 
-/// The protocol version this host speaks: the one committed major.
-pub const PROTOCOL: u32 = 1;
+/// The newest protocol version this host speaks. Version 2 added the
+/// membership kind for the models a worker left; a stream that settled on
+/// version 1 is not sent it.
+pub const PROTOCOL: u32 = 2;
+/// The oldest protocol version this host speaks. A `Decide` hello offers
+/// from this one to [`PROTOCOL`] until the plugin's first settled stream
+/// fixes the version it speaks.
+pub const PROTOCOL_MIN: u32 = 1;

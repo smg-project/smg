@@ -702,7 +702,8 @@ struct Place {
 
 /// The answer under construction: the `message_start` message, its content
 /// blocks by index, each tool call's input JSON as it streams, and the bytes
-/// of text, thinking, signature and input retained so far.
+/// retained so far: each block's start event, and the text, thinking,
+/// signature and input its deltas add.
 struct Assembled {
     message: Message,
     blocks: Vec<ContentBlock>,
@@ -710,7 +711,8 @@ struct Assembled {
     retained: usize,
 }
 
-/// More content blocks than this in one answer are not followed.
+/// An answer may hold this many content blocks. One with a block past them
+/// is not stored: the record is the answer the client read, or nothing.
 const MAX_BLOCKS: usize = 1024;
 
 /// More bytes than this without an event's end, before the first event or
@@ -846,7 +848,7 @@ impl StreamedTurn {
             let parsed = parse_event(&self.carry[..end]);
             self.carry.drain(..end);
             match parsed {
-                Ok(Some(event)) => self.apply(event),
+                Ok(Some(event)) => self.apply(event, end),
                 Ok(None) => {}
                 Err(Unreadable) => self.decline("data this gateway cannot read"),
             }
@@ -863,7 +865,8 @@ impl StreamedTurn {
         }
     }
 
-    fn apply(&mut self, event: MessageStreamEvent) {
+    /// `event` folded into the answer; `size` is the bytes it arrived in.
+    fn apply(&mut self, event: MessageStreamEvent, size: usize) {
         let Some(answer) = &mut self.answer else {
             return;
         };
@@ -871,7 +874,11 @@ impl StreamedTurn {
             MessageStreamEvent::ContentBlockStart {
                 index,
                 content_block,
-            } => answer.start_block(index, content_block),
+            } => {
+                if answer.start_block(index, content_block, size).is_err() {
+                    self.decline("a content block past the bound on blocks");
+                }
+            }
             MessageStreamEvent::ContentBlockDelta { index, delta } => answer.delta(index, delta),
             MessageStreamEvent::ContentBlockStop { index } => {
                 if answer.stop_block(index).is_err() {
@@ -1013,10 +1020,22 @@ impl HttpBody for StreamedTurn {
 }
 
 impl Assembled {
-    fn start_block(&mut self, index: u32, block: ContentBlock) {
+    /// The block at `index`, as its start event of `size` bytes gave it. A
+    /// block may arrive whole in that event (a server tool's result, a block
+    /// this gateway does not read), so the event counts toward the bytes
+    /// retained, as a delta does; one that replaces a block counts too. A
+    /// block past `MAX_BLOCKS` has no place in the record, which would then
+    /// not be the answer the client read.
+    fn start_block(
+        &mut self,
+        index: u32,
+        block: ContentBlock,
+        size: usize,
+    ) -> Result<(), Unreadable> {
         let Some(index) = slot(index) else {
-            return;
+            return Err(Unreadable);
         };
+        self.retained += size;
         while self.blocks.len() < index {
             self.blocks.push(ContentBlock::Text {
                 text: String::new(),
@@ -1031,6 +1050,7 @@ impl Assembled {
             self.blocks[index] = block;
             self.partial_json[index].clear();
         }
+        Ok(())
     }
 
     fn delta(&mut self, index: u32, delta: ContentBlockDelta) {
@@ -2196,40 +2216,135 @@ mod tests {
         }
     }
 
-    /// A stream with data this gateway cannot read (a content block of a
-    /// kind it does not know, a tool call whose input deltas are no JSON
-    /// document) reaches the client as it came and leaves no turn: the
-    /// record is the answer the client read or nothing, so the continue
-    /// from its id is the 404.
+    /// A streamed answer with a block of a kind this gateway does not read
+    /// reaches the client as it came and is stored with the block as the
+    /// upstream sent it, beside the text it reads. A continue from it reads
+    /// the stored blocks as the request's input, which has no form for a kind
+    /// no API has, so it is the 404.
     #[tokio::test]
-    async fn an_unreadable_stream_leaves_no_turn() {
+    async fn a_streamed_block_this_gateway_does_not_read_is_stored_as_sent() {
         let threads = MessageThreads::new();
-        let mut unknown_block = text_events("msg_unknown", "known");
-        unknown_block.splice(
+        let block =
+            json!({"type": "a_block_kind_of_no_api", "tool_use_id": "srvtoolu_1", "detail": "x"});
+        let mut events = text_events("msg_unknown", "known");
+        events.splice(
             4..4,
             [
                 (
                     "content_block_start",
-                    json!({"type": "content_block_start", "index": 1, "content_block": {"type": "bash_code_execution_tool_result", "tool_use_id": "srvtoolu_1", "content": []}}),
+                    json!({"type": "content_block_start", "index": 1, "content_block": block.clone()}),
                 ),
                 (
                     "content_block_stop",
                     json!({"type": "content_block_stop", "index": 1}),
                 ),
+            ],
+        );
+        let bytes = sse(&events);
+        let (_, turn) = accepted(threads.resolve(create("hi", true), None).await);
+        let answered = threads
+            .stored(turn.expect("a turn"), streamed(&bytes, &[]))
+            .await;
+        let read = to_bytes(answered.into_body(), usize::MAX)
+            .await
+            .expect("the stream");
+        assert_eq!(read.as_ref(), bytes.as_slice());
+        let (_, turns) = threads
+            .turns("msg_unknown", None)
+            .await
+            .ok()
+            .expect("the thread");
+        let stored = &turns[0].raw_response;
+        assert_eq!(stored["content"][0]["text"], "known");
+        assert_eq!(stored["content"][1], block);
+        let refused = refusal(
+            threads
+                .resolve(continue_from("msg_unknown", "again"), None)
+                .await,
+        );
+        assert_eq!(
+            refused.status(),
+            StatusCode::NOT_FOUND,
+            "the request does not read the block"
+        );
+    }
+
+    /// A block that arrives whole in its start event counts toward the limit
+    /// as deltas do: an answer whose blocks pass the bound with no delta at
+    /// all is not stored, and the same answer under a wider bound is.
+    #[tokio::test]
+    async fn a_block_started_whole_counts_toward_the_limit() {
+        let block = json!({"type": "a_block_kind_of_no_api", "detail": "x".repeat(2048)});
+        let mut events = text_events("msg_whole", "known");
+        events.splice(
+            4..4,
+            [
                 (
                     "content_block_start",
-                    json!({"type": "content_block_start", "index": 2, "content_block": {"type": "text", "text": ""}}),
-                ),
-                (
-                    "content_block_delta",
-                    json!({"type": "content_block_delta", "index": 2, "delta": {"type": "text_delta", "text": "after"}}),
+                    json!({"type": "content_block_start", "index": 1, "content_block": block}),
                 ),
                 (
                     "content_block_stop",
-                    json!({"type": "content_block_stop", "index": 2}),
+                    json!({"type": "content_block_stop", "index": 1}),
                 ),
             ],
         );
+        let bytes = sse(&events);
+        for (limit, kept) in [(1 << 20, true), (1024, false)] {
+            let threads = MessageThreads::new().limited(limit);
+            let (_, turn) = accepted(threads.resolve(create("hi", true), None).await);
+            let answered = threads
+                .stored(turn.expect("a turn"), streamed(&bytes, &[]))
+                .await;
+            let read = to_bytes(answered.into_body(), usize::MAX)
+                .await
+                .expect("the stream");
+            assert_eq!(read.as_ref(), bytes.as_slice());
+            let stored = threads.turns("msg_whole", None).await.is_ok();
+            assert_eq!(stored, kept, "a limit of {limit} bytes");
+        }
+    }
+
+    /// An answer with a block past the bound on blocks is not stored, as
+    /// the record would lack that block: the client reads the stream as it
+    /// came, and the continue from its id is the 404.
+    #[tokio::test]
+    async fn a_block_past_the_block_bound_leaves_no_turn() {
+        let threads = MessageThreads::new();
+        let mut events = text_events("msg_many", "known");
+        events.splice(
+            4..4,
+            [
+                (
+                    "content_block_start",
+                    json!({"type": "content_block_start", "index": MAX_BLOCKS, "content_block": {"type": "text", "text": "past the bound"}}),
+                ),
+                (
+                    "content_block_stop",
+                    json!({"type": "content_block_stop", "index": MAX_BLOCKS}),
+                ),
+            ],
+        );
+        let bytes = sse(&events);
+        let (_, turn) = accepted(threads.resolve(create("hi", true), None).await);
+        let answered = threads
+            .stored(turn.expect("a turn"), streamed(&bytes, &[]))
+            .await;
+        let read = to_bytes(answered.into_body(), usize::MAX)
+            .await
+            .expect("the stream");
+        assert_eq!(read.as_ref(), bytes.as_slice());
+        let stored = threads.turns("msg_many", None).await.is_ok();
+        assert!(!stored, "a turn that lacks a block the client read");
+    }
+
+    /// A stream with data this gateway cannot read (a tool call whose input
+    /// deltas are no JSON document) reaches the client as it came and leaves
+    /// no turn: the record is the answer the client read or nothing, so the
+    /// continue from its id is the 404.
+    #[tokio::test]
+    async fn an_unreadable_stream_leaves_no_turn() {
+        let threads = MessageThreads::new();
         let no_json = vec![
             message_start("msg_nojson"),
             (
@@ -2250,25 +2365,27 @@ mod tests {
             ),
             ("message_stop", json!({"type": "message_stop"})),
         ];
-        for (id, events) in [("msg_unknown", unknown_block), ("msg_nojson", no_json)] {
-            let bytes = sse(&events);
-            let (_, turn) = accepted(threads.resolve(create("hi", true), None).await);
-            let answered = threads
-                .stored(turn.expect("a turn"), streamed(&bytes, &[]))
-                .await;
-            let read = to_bytes(answered.into_body(), usize::MAX)
-                .await
-                .expect("the stream");
-            assert_eq!(read.as_ref(), bytes.as_slice(), "{id}");
-            let kept = threads
-                .store
-                .get_response(&ResponseId::from(id))
-                .await
-                .expect("the store");
-            assert!(kept.is_none(), "{id}: the place is given back");
-            let refused = refusal(threads.resolve(continue_from(id, "again"), None).await);
-            assert_eq!(refused.status(), StatusCode::NOT_FOUND, "{id}");
-        }
+        let bytes = sse(&no_json);
+        let (_, turn) = accepted(threads.resolve(create("hi", true), None).await);
+        let answered = threads
+            .stored(turn.expect("a turn"), streamed(&bytes, &[]))
+            .await;
+        let read = to_bytes(answered.into_body(), usize::MAX)
+            .await
+            .expect("the stream");
+        assert_eq!(read.as_ref(), bytes.as_slice());
+        let kept = threads
+            .store
+            .get_response(&ResponseId::from("msg_nojson"))
+            .await
+            .expect("the store");
+        assert!(kept.is_none(), "the place is given back");
+        let refused = refusal(
+            threads
+                .resolve(continue_from("msg_nojson", "again"), None)
+                .await,
+        );
+        assert_eq!(refused.status(), StatusCode::NOT_FOUND);
     }
 
     /// A stream framed with CRLF blank lines (one of the relay's three

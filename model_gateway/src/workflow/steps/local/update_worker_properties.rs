@@ -4,6 +4,8 @@ use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
 use openai_protocol::worker::{WorkerModels, WorkerSpec, WorkerStatus};
+use smg_service_discovery::DISCOVERY_PROVIDER_LABEL;
+use smg_worker::identity::basic::{merge_labels, BasicWorker, RuntimeType, Worker};
 use tracing::{debug, info};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
@@ -14,12 +16,9 @@ use super::create_worker::{
     warn_on_conflicting_parser_overrides, DP_WIDTH_LABELS,
 };
 use crate::{
-    service_discovery::DISCOVERY_PROVIDER_LABEL,
-    worker::{
-        identity::basic::merge_labels, registry::service::MAX_WORKER_LABELS, BasicWorker,
-        BasicWorkerBuilder, RuntimeType, Worker,
-    },
-    workflow::data::WorkerUpdateWorkflowData,
+    admin::worker_service::MAX_WORKER_LABELS,
+    routers::grpc::backend_client::BasicWorkerBuilder,
+    workflow::data::{require_app_context, WorkerUpdateWorkflowData},
 };
 
 /// Step to update worker properties.
@@ -59,12 +58,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
             context.data.updated_workers = Some(Vec::new());
             return Ok(StepResult::Skip);
         }
-        let app_context = context
-            .data
-            .app_context
-            .as_ref()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?
-            .clone();
+        let app_context = require_app_context(context.data.app_context.as_ref())?.clone();
         let workers_to_update = context
             .data
             .workers_to_update

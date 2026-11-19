@@ -13,6 +13,7 @@ import grpc
 import pytest
 from smg_grpc_proto.generated import common_pb2
 from smg_grpc_servicer import tokenizer_bundle as bundle_module
+from smg_grpc_servicer.sglang.model_artifacts import tokenizer_dir_for
 from smg_grpc_servicer.tokenizer_bundle import (
     CHUNK_SIZE,
     TokenizerBundle,
@@ -349,6 +350,8 @@ def _get_tokenizer(engine, bundle):
         "get_exception_traceback": lambda: "",
         "tokenizer_bundle": bundle,
         "tokenizer_chunks": tokenizer_chunks,
+        "asyncio": asyncio,
+        "tokenizer_dir_for": tokenizer_dir_for,
     }
     exec(compile(ast.Module(body=[method], type_ignores=[]), str(source), "exec"), namespace)
     return namespace["GetTokenizer"]

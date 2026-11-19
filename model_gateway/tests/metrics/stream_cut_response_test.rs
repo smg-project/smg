@@ -20,16 +20,15 @@ use llm_tokenizer::traits::Tokenizer;
 use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
 use serde_json::{json, Value};
 use smg::{
-    health::ProbeState,
     middleware::AuthConfig,
     routers::RouterFactory,
-    server::{build_app, AppState},
-    worker::{RuntimeType, Worker, WorkerType},
+    server::{build_app, health::ProbeState, AppState},
 };
 use smg_test_harness::{
     grpc_harness::{grpc_router_config, grpc_test_context_with_tokenizer, grpc_worker},
     scripted_tokenizer::ScriptedTokenizer,
 };
+use smg_worker::identity::basic::{RuntimeType, Worker, WorkerType};
 use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
 use tower::ServiceExt;
 

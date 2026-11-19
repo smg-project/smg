@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::collections::HashMap;
 
 use clap::ValueEnum;
 pub use llm_multimodal::jpeg_turbo::TurboJpegPolicy;
@@ -9,16 +9,27 @@ use serde::{de, Deserialize, Deserializer, Serialize};
 pub use smg_data_connector::{
     HistoryBackend, MemoryConfig, OracleConfig, PostgresConfig, RedisConfig, SchemaConfig,
 };
+use smg_service_discovery::Roles;
+pub use smg_service_discovery::{
+    deserialize_discovery, ConsulDiscoveryConfig, DiscoveryConfig, FileDiscoveryConfig,
+    KubernetesDiscoveryConfig, SlurmDiscoveryConfig, DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS,
+};
+// The worker's settings vocabulary lives in the worker crate.
+pub use smg_worker::settings::{
+    PdPairingMode, RetryConfig, UnhealthyRemovalScope, DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS,
+};
+use smg_worker::{
+    health::overload::{DEFAULT_TOKEN_USAGE_CEILING, DEFAULT_WAITING_REQUESTS},
+    identity::{
+        basic::{ConnectionMode, RuntimeType},
+        endpoint::Endpoint,
+    },
+};
 
 use super::{validation::ConfigValidator, ConfigResult};
 use crate::{
     routers::common::pd_admission::DEFAULT_PD_ADMISSION_WAIT_SECS,
     tenant::DEFAULT_TENANT_HEADER_NAME,
-    worker::{
-        health::overload::{DEFAULT_TOKEN_USAGE_CEILING, DEFAULT_WAITING_REQUESTS},
-        identity::endpoint::Endpoint,
-        ConnectionMode, RuntimeType,
-    },
 };
 
 /// The parser name that reads a model with the table its tokenizer's `response_template`
@@ -872,10 +883,6 @@ fn default_worker_stall_secs() -> u64 {
     2
 }
 
-/// The default per-stage silence bound of a ZMQ engine's startup handshake:
-/// an hour, since it alone covers the engine's init between HELLO and READY.
-pub const DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS: u64 = 3600;
-
 fn default_zmq_startup_timeout_secs() -> u64 {
     DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS
 }
@@ -1027,6 +1034,19 @@ pub enum RoutingMode {
 }
 
 impl RoutingMode {
+    /// The worker roles a discovery provider fills under this mode. `None`
+    /// for a mode with no worker pools to fill.
+    pub fn discovery_roles(&self) -> Option<Roles> {
+        match self {
+            RoutingMode::Regular { .. } => Some(Roles::Regular),
+            RoutingMode::PrefillDecode { .. } => Some(Roles::PrefillDecode),
+            RoutingMode::EncodePrefillDecode { .. } => Some(Roles::EncodePrefillDecode),
+            RoutingMode::OpenAI { .. }
+            | RoutingMode::Anthropic { .. }
+            | RoutingMode::Gemini { .. } => None,
+        }
+    }
+
     /// This mode with every worker URL masked like [`Endpoint::redacted`]:
     /// what the start-up lines and the configuration view show.
     pub fn redacted(&self) -> Self {
@@ -1215,58 +1235,6 @@ pub enum ManualAssignmentMode {
     /// policy, then pin. With `--policy manual` (no underlying policy to
     /// delegate to) this falls back to min-load.
     Delegate,
-}
-
-/// How strictly PD placement pairs a prefill with a decode on their KV
-/// transfer protocol (#2483). A descriptor component an engine does not report
-/// is "unknown".
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum PdPairingMode {
-    /// Compare nothing of the KV handoff: placement behaves as if no
-    /// descriptor existed. The gRPC wire still keeps two known runtimes
-    /// apart, since its requests are in the runtime's own message type.
-    Off,
-    /// A known difference in runtime, transport or KV layout refuses the
-    /// pair; unknown components and engine versions pair with anything.
-    #[default]
-    Lenient,
-    /// Runtime, transport and KV layout must be known on both sides and
-    /// agree, and reported engine versions must match.
-    Strict,
-}
-
-impl PdPairingMode {
-    /// Number of modes, for per-mode caches.
-    pub const COUNT: usize = 3;
-
-    /// A dense index for per-mode caches.
-    pub const fn index(self) -> usize {
-        match self {
-            Self::Off => 0,
-            Self::Lenient => 1,
-            Self::Strict => 2,
-        }
-    }
-
-    /// Parse the CLI spelling (`off` / `lenient` / `strict`).
-    pub fn parse(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "off" => Some(Self::Off),
-            "lenient" => Some(Self::Lenient),
-            "strict" => Some(Self::Strict),
-            _ => None,
-        }
-    }
-
-    /// The CLI spelling.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Off => "off",
-            Self::Lenient => "lenient",
-            Self::Strict => "strict",
-        }
-    }
 }
 
 /// Per-request sticky-routing override: when a sticky key is present, any
@@ -1815,256 +1783,6 @@ impl PolicyConfig {
     }
 }
 
-/// Worker discovery: the one provider that finds this router's workers, and
-/// that provider's settings. Presence means discovery is on; there is no
-/// `enabled` flag.
-///
-/// Serialized as a `provider` tag beside the provider's own flat fields:
-///
-/// ```yaml
-/// discovery:
-///   provider: kubernetes
-///   selector: { app: sglang }
-///   port: 8000
-/// ```
-///
-/// [`RouterConfig::discovery`] also reads the flat Kubernetes object that
-/// predates the tag; see [`deserialize_discovery`].
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "provider", rename_all = "snake_case")]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "one per router, built at startup; boxing the Kubernetes variant would complicate every construction and match to save a few hundred bytes"
-)]
-pub enum DiscoveryConfig {
-    Kubernetes(KubernetesDiscoveryConfig),
-    File(FileDiscoveryConfig),
-    Slurm(SlurmDiscoveryConfig),
-    Consul(ConsulDiscoveryConfig),
-}
-
-impl From<KubernetesDiscoveryConfig> for DiscoveryConfig {
-    fn from(config: KubernetesDiscoveryConfig) -> Self {
-        Self::Kubernetes(config)
-    }
-}
-
-impl From<FileDiscoveryConfig> for DiscoveryConfig {
-    fn from(config: FileDiscoveryConfig) -> Self {
-        Self::File(config)
-    }
-}
-
-impl From<SlurmDiscoveryConfig> for DiscoveryConfig {
-    fn from(config: SlurmDiscoveryConfig) -> Self {
-        Self::Slurm(config)
-    }
-}
-
-impl From<ConsulDiscoveryConfig> for DiscoveryConfig {
-    fn from(config: ConsulDiscoveryConfig) -> Self {
-        Self::Consul(config)
-    }
-}
-
-/// Deserialize [`RouterConfig::discovery`] from either shape it has had.
-///
-/// The flat Kubernetes object that predates the `provider` tag has no tag and
-/// carries an `enabled` flag. A missing tag means Kubernetes, the only
-/// provider that object could describe. `enabled: false` becomes `None` here,
-/// at deserialization, because canonical output has no `enabled` to carry the
-/// `false`: a disabled config that is read and written back must stay
-/// disabled.
-///
-/// Fields are read only after the object is buffered to find its tag, so a
-/// YAML scalar keeps the type YAML gave it: a label value that looks like a
-/// number or boolean must be quoted (`version: "1"`), as in a Kubernetes
-/// manifest. The flat struct once read such values as strings.
-///
-/// Public so every input surface — the Python binding's `discovery` mapping
-/// included — reads discovery by the same rules.
-pub fn deserialize_discovery<'de, D>(deserializer: D) -> Result<Option<DiscoveryConfig>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let Some(mut value) = Option::<serde_json::Value>::deserialize(deserializer)? else {
-        return Ok(None);
-    };
-    if let Some(fields) = value.as_object_mut() {
-        match fields.remove("enabled") {
-            None | Some(serde_json::Value::Bool(true)) => {}
-            Some(serde_json::Value::Bool(false)) => return Ok(None),
-            Some(other) => {
-                return Err(de::Error::custom(format!(
-                    "discovery.enabled must be a boolean, got {other}"
-                )));
-            }
-        }
-        fields
-            .entry("provider")
-            .or_insert_with(|| serde_json::Value::from("kubernetes"));
-    }
-    DiscoveryConfig::deserialize(value)
-        .map(Some)
-        .map_err(de::Error::custom)
-}
-
-/// Kubernetes worker discovery: Pods matching a selector become workers.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct KubernetesDiscoveryConfig {
-    /// None = all namespaces
-    pub namespace: Option<String>,
-    pub port: u16,
-    pub check_interval_secs: u64,
-    /// Regular mode
-    pub selector: HashMap<String, String>,
-    /// EPD mode encode
-    #[serde(default)]
-    pub encode_selector: HashMap<String, String>,
-    /// PD mode prefill
-    pub prefill_selector: HashMap<String, String>,
-    /// PD mode decode
-    pub decode_selector: HashMap<String, String>,
-    pub bootstrap_port_annotation: String,
-    /// Annotation listing a pod's worker data ports (comma-separated).
-    /// Absent on a pod = single worker at `port`.
-    #[serde(default = "default_worker_ports_annotation")]
-    pub worker_ports_annotation: String,
-    #[serde(default = "default_kv_connector_annotation")]
-    pub kv_connector_annotation: String,
-    #[serde(default = "default_kv_engine_id_annotation")]
-    pub kv_engine_id_annotation: String,
-    /// Router node discovery for HA (Kubernetes label selector)
-    #[serde(default)]
-    pub router_selector: HashMap<String, String>,
-    /// Annotation key to read mesh port from Router Pods
-    #[serde(default = "default_router_mesh_port_annotation")]
-    pub router_mesh_port_annotation: String,
-    /// Source for per-worker model_id override: `namespace`, `label:<key>`, or `annotation:<key>`
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model_id_source: Option<String>,
-}
-
-fn default_router_mesh_port_annotation() -> String {
-    "sglang.ai/mesh-port".to_string()
-}
-
-fn default_worker_ports_annotation() -> String {
-    "smg.ai/worker-ports".to_string()
-}
-
-fn default_kv_connector_annotation() -> String {
-    "smg.ai/kv-connector".to_string()
-}
-
-fn default_kv_engine_id_annotation() -> String {
-    "smg.ai/kv-engine-id".to_string()
-}
-
-impl Default for KubernetesDiscoveryConfig {
-    fn default() -> Self {
-        Self {
-            namespace: None,
-            port: 8000,
-            check_interval_secs: 120,
-            selector: HashMap::new(),
-            encode_selector: HashMap::new(),
-            prefill_selector: HashMap::new(),
-            decode_selector: HashMap::new(),
-            bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
-            worker_ports_annotation: default_worker_ports_annotation(),
-            kv_connector_annotation: default_kv_connector_annotation(),
-            kv_engine_id_annotation: default_kv_engine_id_annotation(),
-            router_selector: HashMap::new(),
-            router_mesh_port_annotation: default_router_mesh_port_annotation(),
-            model_id_source: None,
-        }
-    }
-}
-
-/// The interval of a discovery provider's periodic pass when none is given,
-/// the same for every provider. Kubernetes, file and Consul discovery apply a
-/// change as it happens and use the pass to retry what earlier ones left
-/// undone; Slurm discovery polls on it. ([`KubernetesDiscoveryConfig`] keeps its own
-/// default, 120, for programmatic and serialized configuration.)
-pub const DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS: u64 = 30;
-
-fn default_discovery_check_interval_secs() -> u64 {
-    DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS
-}
-
-/// File worker discovery: the workers listed in a JSON manifest on disk.
-///
-/// The manifest is reread in full whenever it changes, and every
-/// `check_interval_secs` in case a change went unreported. It may be absent at
-/// startup: discovery reads it once a writer creates it.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct FileDiscoveryConfig {
-    pub path: PathBuf,
-    #[serde(default = "default_discovery_check_interval_secs")]
-    pub check_interval_secs: u64,
-}
-
-/// Slurm worker discovery: one worker on every node of each running job whose
-/// name maps to a worker type.
-///
-/// Every `check_interval_secs`, `squeue` lists the running jobs with a mapped
-/// name, scoped to `user` (by default, the user the gateway runs as) and, when
-/// given, to `account` and `partition`. `scontrol` resolves each job's nodes,
-/// and every node serves one inference server on `port`.
-///
-/// Names map to worker types by the field that lists them: `job_names` are
-/// regular workers, the others the pools of disaggregated routing. A name maps
-/// to one type only.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SlurmDiscoveryConfig {
-    #[serde(default)]
-    pub job_names: Vec<String>,
-    #[serde(default)]
-    pub encode_job_names: Vec<String>,
-    #[serde(default)]
-    pub prefill_job_names: Vec<String>,
-    #[serde(default)]
-    pub decode_job_names: Vec<String>,
-    /// The port of every discovered server.
-    pub port: u16,
-    /// The bootstrap port of the encode and prefill workers.
-    #[serde(default)]
-    pub bootstrap_port: Option<u16>,
-    /// The user whose jobs are discovered; by default, the user `squeue`
-    /// runs as.
-    #[serde(default)]
-    pub user: Option<String>,
-    #[serde(default)]
-    pub account: Option<String>,
-    #[serde(default)]
-    pub partition: Option<String>,
-    #[serde(default = "default_discovery_check_interval_secs")]
-    pub check_interval_secs: u64,
-}
-
-/// Consul worker discovery: the instances of one Consul service whose health
-/// checks all pass, each configured by its `smg_*` service metadata.
-///
-/// Consul is read with blocking queries, so a change applies as soon as
-/// Consul reports it; every `check_interval_secs` the last good list is
-/// reconciled again. `address` is Consul's HTTP API, by default
-/// `CONSUL_HTTP_ADDR` or `127.0.0.1:8500`; `datacenter` is by default
-/// the agent's own. The ACL token and the TLS settings come from Consul's own
-/// environment variables, never from this configuration.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ConsulDiscoveryConfig {
-    pub service: String,
-    #[serde(default)]
-    pub address: Option<String>,
-    #[serde(default)]
-    pub datacenter: Option<String>,
-    #[serde(default = "default_discovery_check_interval_secs")]
-    pub check_interval_secs: u64,
-}
-
-pub use smg_external_router::RetryConfig;
-
 /// Health check configuration for worker monitoring. The four counts and
 /// periods are at least 1 (checked at configuration validation): none of
 /// them has a meaning at 0, and a zero interval would make the checker a
@@ -2099,21 +1817,6 @@ pub struct HealthCheckConfig {
 
 fn default_drain_settle_secs() -> u64 {
     5
-}
-
-/// Which Failed workers the health checker removes. Mesh-imported workers
-/// are never removed under any scope: their owner manages them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UnhealthyRemovalScope {
-    /// None: a Failed worker stays registered and probed, and rejoins in
-    /// place when its engine answers again.
-    Disabled,
-    /// The workers a discovery provider registered, which it registers again
-    /// once their engine returns. Static and API-added workers stay.
-    DiscoveryOwned,
-    /// Every local worker, static and API-added ones included, though
-    /// nothing re-adds those.
-    AllLocal,
 }
 
 /// Resolve `--worker-auto-recovery` into the removal scope. An explicit
@@ -2499,6 +2202,41 @@ mod tests {
             "{shown}"
         );
         assert!(!shown.contains("secret"), "{shown}");
+    }
+
+    /// A mode with worker pools names the roles a discovery provider fills.
+    /// A mode with none names no roles, and a provider refuses it.
+    #[test]
+    fn a_routing_mode_names_the_roles_discovery_fills() {
+        use crate::config::test_support::{
+            epd_routing_mode, pd_routing_mode, regular_routing_mode,
+        };
+
+        assert_eq!(
+            regular_routing_mode().discovery_roles(),
+            Some(Roles::Regular)
+        );
+        assert_eq!(
+            pd_routing_mode().discovery_roles(),
+            Some(Roles::PrefillDecode)
+        );
+        assert_eq!(
+            epd_routing_mode().discovery_roles(),
+            Some(Roles::EncodePrefillDecode)
+        );
+        for mode in [
+            RoutingMode::OpenAI {
+                worker_urls: vec![],
+            },
+            RoutingMode::Anthropic {
+                worker_urls: vec![],
+            },
+            RoutingMode::Gemini {
+                worker_urls: vec![],
+            },
+        ] {
+            assert_eq!(mode.discovery_roles(), None, "{mode:?}");
+        }
     }
 
     #[test]

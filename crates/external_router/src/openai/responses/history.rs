@@ -3,7 +3,7 @@
 //! Loads conversation history and/or previous response chains into the request
 //! input before forwarding to the upstream provider.
 
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, fmt::Display, sync::Arc};
 
 use axum::response::Response;
 use openai_protocol::{
@@ -17,7 +17,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use smg_data_connector::{
     is_unstored, visible_chain, ConversationId, ConversationItem, ListParams, ResponseId,
-    ResponseStorageError, SortOrder, StoredResponse,
+    ResponseStorageError, SortOrder, StorageFailure, StoredResponse,
 };
 use tracing::warn;
 
@@ -94,6 +94,24 @@ pub(crate) async fn load_input_history(
     })
 }
 
+/// A storage failure while the history is loaded: logged in the context's
+/// words, recorded as an internal error on `model`, answered as a storage
+/// failure under `code`.
+fn storage_failed(
+    model: &str,
+    code: &str,
+    context: impl Display,
+    err: &(impl StorageFailure + Display),
+) -> Response {
+    warn!("{context}: {err}");
+    super::record_error(
+        model,
+        metrics_labels::ERROR_INTERNAL,
+        metrics_labels::REASON_INTERNAL,
+    );
+    error::storage_failure(code, context, err)
+}
+
 /// The previous-response chain as the caller may see it: the records up to the
 /// first of another tenant (the chain ends there, as it would at a missing
 /// one); a chain ending in a record its client asked not to store (a
@@ -132,22 +150,12 @@ async fn visible_previous_chain(
                 format!("Previous response with id '{prev_id_str}' not found."),
             ))
         }
-        Err(e) => {
-            warn!(
-                "Failed to load previous response chain for {}: {}",
-                prev_id_str, e
-            );
-            super::record_error(
-                model,
-                metrics_labels::ERROR_INTERNAL,
-                metrics_labels::REASON_INTERNAL,
-            );
-            Err(error::storage_failure(
-                "load_previous_response_chain_failed",
-                format!("Failed to load previous response chain for {prev_id_str}"),
-                &e,
-            ))
-        }
+        Err(e) => Err(storage_failed(
+            model,
+            "load_previous_response_chain_failed",
+            format!("Failed to load previous response chain for {prev_id_str}"),
+            &e,
+        )),
     }
 }
 
@@ -192,19 +200,12 @@ async fn check_conversation_visible(
                 format!("No conversation found with id '{}'", conv_id.0),
             ))
         }
-        Err(e) => {
-            warn!("Failed to check conversation {}: {}", conv_id.0, e);
-            super::record_error(
-                model,
-                metrics_labels::ERROR_INTERNAL,
-                metrics_labels::REASON_INTERNAL,
-            );
-            Err(error::storage_failure(
-                "check_conversation_failed",
-                format!("Failed to check conversation {}", conv_id.0),
-                &e,
-            ))
-        }
+        Err(e) => Err(storage_failed(
+            model,
+            "check_conversation_failed",
+            format!("Failed to check conversation {}", conv_id.0),
+            &e,
+        )),
     }
 }
 
@@ -232,13 +233,8 @@ async fn conversation_window_items(
     {
         Ok(stored_items) => stored_items,
         Err(e) => {
-            warn!("Failed to load conversation history: {}", e);
-            super::record_error(
+            return Err(storage_failed(
                 model,
-                metrics_labels::ERROR_INTERNAL,
-                metrics_labels::REASON_INTERNAL,
-            );
-            return Err(error::storage_failure(
                 "load_conversation_history_failed",
                 "Failed to load conversation history",
                 &e,

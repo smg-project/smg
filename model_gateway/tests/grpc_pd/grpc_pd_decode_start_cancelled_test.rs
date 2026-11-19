@@ -24,13 +24,9 @@ use common::{
     grpc_harness::{build_grpc_router, grpc_router_config, grpc_workers, serve_engine},
     metrics_capture::render_after,
 };
-use smg::{
-    middleware::TenantRequestMeta,
-    routers::RouterTrait,
-    tenant::TenantKey,
-    worker::{RuntimeType, WorkerType},
-};
+use smg::{middleware::TenantRequestMeta, routers::RouterTrait, tenant::TenantKey};
 use smg_grpc_client::vllm_proto as proto;
+use smg_worker::identity::basic::{RuntimeType, WorkerType};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};

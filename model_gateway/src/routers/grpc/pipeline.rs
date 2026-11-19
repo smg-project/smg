@@ -84,14 +84,14 @@ use crate::{
     rate_limit::{RateLimitManager, UsageSettlement},
     routers::{
         common::{
-            json_response,
-            placement::{self, Candidates, WireConstraint},
+            json_response, placement,
+            placement::{Candidates, WireConstraint},
             prefill_admission::PrefillAdmission,
             retry::{is_retryable_response, BackoffCalculator},
+            snapshot::{RoutingPool, WorkerRegistry},
         },
         error,
     },
-    worker::{RoutingPool, WorkerRegistry},
 };
 
 /// Which endpoint a pipeline serves. Selects the endpoint-specific stage set
@@ -329,8 +329,8 @@ enum RunOutcome {
     Final(Box<DispatchContext>, Instant),
 }
 
-/// One full pipeline run: the one box of a run, allocated where the request
-/// context moves in (see [`RequestPipeline::run`]).
+/// One full pipeline run, boxed once in [`RequestPipeline::run`]; the request
+/// context reaches it in a box of its own.
 type RunFuture<'a> = Pin<Box<dyn Future<Output = Result<RunOutcome, Response>> + Send + 'a>>;
 
 impl RequestPipeline {
@@ -683,14 +683,13 @@ impl RequestPipeline {
     /// iteration, so the pipeline is not where that turn is counted);
     /// `retry_config` enables the dispatch-phase retry loop.
     ///
-    /// The run is boxed once, here, and the context moves straight into that
-    /// box: it holds ingress + per-attempt state across awaits, and an
-    /// `async fn` hop in between would keep its own copy of the 2.6 KiB
-    /// context in every caller's state machine (an argument lives in the
-    /// future as the upvar and as the rebound local).
+    /// The run is boxed once, here: it holds ingress + per-attempt state
+    /// across awaits. The 2.5 KiB context comes in a box of its own, so every
+    /// hop from the entry point into this future moves a pointer; by value,
+    /// each hop copied the context whole.
     fn run<'a>(
         &'a self,
-        ctx: RequestContext,
+        ctx: Box<RequestContext>,
         metrics_endpoint: Option<&'static str>,
         retry_config: Option<&'a RetryConfig>,
     ) -> RunFuture<'a> {
@@ -710,15 +709,15 @@ impl RequestPipeline {
     }
 
     /// The run itself, as the future [`Self::run`] boxes: an `async move`
-    /// block over the context it was handed, so the context has one place in
-    /// that future (an `async fn` would rebind the argument into a second).
+    /// block over the arguments it was handed, so each has one place in that
+    /// future (an `async fn` would rebind every argument into a second).
     #[expect(
         clippy::manual_async_fn,
-        reason = "an async fn keeps a by-value argument twice in its state machine (the captured argument and the rebound local); the async move block holds the 2.6 KiB context once"
+        reason = "an async fn keeps a by-value argument twice in its state machine (the captured argument and the rebound local); the async move block holds each once"
     )]
     fn run_inner<'a>(
         &'a self,
-        mut ctx: RequestContext,
+        mut ctx: Box<RequestContext>,
         metrics_endpoint: Option<&'static str>,
         retry_config: Option<&'a RetryConfig>,
     ) -> impl Future<Output = Result<RunOutcome, Response>> + Send + 'a {
@@ -742,7 +741,7 @@ impl RequestPipeline {
             // plan's wire size stands in for the released buffers.
             let model_id = ctx.input.model_id.clone();
             let mut dctx = match ctx.into_dispatch() {
-                Ok(dctx) => Box::new(dctx),
+                Ok(dctx) => dctx,
                 Err(response) => {
                     self.record_error(metrics_endpoint, &model_id, &response);
                     return Err(response);
@@ -1113,7 +1112,7 @@ impl RequestPipeline {
     /// Responses stream never forwards.
     fn run_signalling<'a>(
         &'a self,
-        ctx: RequestContext,
+        ctx: Box<RequestContext>,
         metrics_endpoint: Option<&'static str>,
         retry_config: Option<&'a RetryConfig>,
         stream_start: Option<StreamStartupSender>,
@@ -1168,7 +1167,9 @@ impl RequestPipeline {
     ) -> Response {
         const ENDPOINT: &str = metrics_labels::ENDPOINT_CHAT;
         let run = {
-            let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
+            let mut ctx = Box::new(RequestContext::for_chat(
+                request, headers, model_id, components,
+            ));
             ctx.input.tenant_request_meta = tenant_request_meta;
             ctx.input.rate_limit_cell = rate_limit_cell;
             self.run_signalling(ctx, Some(ENDPOINT), retry_config, stream_start)
@@ -1230,7 +1231,9 @@ impl RequestPipeline {
             .unwrap_or(1);
         const ENDPOINT: &str = metrics_labels::ENDPOINT_GENERATE;
         let run = {
-            let mut ctx = RequestContext::for_generate(request, headers, model_id, components);
+            let mut ctx = Box::new(RequestContext::for_generate(
+                request, headers, model_id, components,
+            ));
             ctx.input.tenant_request_meta = tenant_request_meta;
             ctx.input.rate_limit_cell = rate_limit_cell;
             self.run(ctx, Some(ENDPOINT), retry_config)
@@ -1275,7 +1278,9 @@ impl RequestPipeline {
     ) -> Response {
         const ENDPOINT: &str = metrics_labels::ENDPOINT_COMPLETIONS;
         let run = {
-            let mut ctx = RequestContext::for_completion(request, headers, model_id, components);
+            let mut ctx = Box::new(RequestContext::for_completion(
+                request, headers, model_id, components,
+            ));
             ctx.input.tenant_request_meta = tenant_request_meta;
             ctx.input.rate_limit_cell = rate_limit_cell;
             self.run(ctx, Some(ENDPOINT), retry_config)
@@ -1320,8 +1325,9 @@ impl RequestPipeline {
     ) -> Response {
         const ENDPOINT: &str = metrics_labels::ENDPOINT_MESSAGES;
         let run = {
-            let mut ctx =
-                RequestContext::for_messages(request, tools, headers, model_id, components);
+            let mut ctx = Box::new(RequestContext::for_messages(
+                request, tools, headers, model_id, components,
+            ));
             ctx.input.tenant_request_meta = tenant_request_meta;
             ctx.input.rate_limit_cell = rate_limit_cell;
             self.run(ctx, Some(ENDPOINT), retry_config)
@@ -1371,7 +1377,9 @@ impl RequestPipeline {
     ) -> Response {
         const ENDPOINT: &str = metrics_labels::ENDPOINT_DECISIONS;
         let run = {
-            let mut ctx = RequestContext::for_decisions(request, headers, model_id, components);
+            let mut ctx = Box::new(RequestContext::for_decisions(
+                request, headers, model_id, components,
+            ));
             ctx.input.tenant_request_meta = tenant_request_meta;
             ctx.input.rate_limit_cell = rate_limit_cell;
             self.run(ctx, Some(ENDPOINT), retry_config)
@@ -1413,7 +1421,9 @@ impl RequestPipeline {
     ) -> Response {
         const ENDPOINT: &str = metrics_labels::ENDPOINT_EMBEDDINGS;
         let run = {
-            let mut ctx = RequestContext::for_embedding(request, headers, model_id, components);
+            let mut ctx = Box::new(RequestContext::for_embedding(
+                request, headers, model_id, components,
+            ));
             ctx.input.tenant_request_meta = tenant_request_meta;
             ctx.input.rate_limit_cell = rate_limit_cell;
             self.run(ctx, Some(ENDPOINT), None)
@@ -1464,8 +1474,9 @@ impl RequestPipeline {
         // the endpoint's metrics don't split across backends.
         const ENDPOINT: &str = metrics_labels::ENDPOINT_AUDIO_TRANSCRIPTIONS;
         let run = {
-            let mut ctx =
-                RequestContext::for_transcription(request, audio, headers, model_id, components);
+            let mut ctx = Box::new(RequestContext::for_transcription(
+                request, audio, headers, model_id, components,
+            ));
             ctx.input.tenant_request_meta = tenant_request_meta;
             ctx.input.rate_limit_cell = rate_limit_cell;
             self.run(ctx, Some(ENDPOINT), None)
@@ -1514,7 +1525,9 @@ impl RequestPipeline {
     ) -> Response {
         const ENDPOINT: &str = metrics_labels::ENDPOINT_CLASSIFY;
         let run = {
-            let mut ctx = RequestContext::for_classify(request, headers, model_id, components);
+            let mut ctx = Box::new(RequestContext::for_classify(
+                request, headers, model_id, components,
+            ));
             ctx.input.tenant_request_meta = tenant_request_meta;
             ctx.input.rate_limit_cell = rate_limit_cell;
             self.run(ctx, Some(ENDPOINT), None)
@@ -1567,7 +1580,9 @@ impl RequestPipeline {
     ) -> Result<(ChatCompletionResponse, Option<ParserChoice>), Response> {
         let rate_limit_cell = Arc::new(RateLimitCell::new());
         let run = {
-            let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
+            let mut ctx = Box::new(RequestContext::for_chat(
+                request, headers, model_id, components,
+            ));
             ctx.input.tenant_request_meta = tenant_request_meta.as_ref().map(iteration_charge);
             ctx.input.rate_limit_cell = Some(rate_limit_cell.clone());
             self.run(ctx, None, None)
@@ -1641,12 +1656,12 @@ impl RequestPipeline {
     ) -> Result<harmony::ResponsesIterationResult, Response> {
         let rate_limit_cell = Arc::new(RateLimitCell::new());
         let run = {
-            let mut ctx = RequestContext::for_responses(
+            let mut ctx = Box::new(RequestContext::for_responses(
                 Arc::clone(request),
                 None,                  // No headers needed for internal pipeline execution
                 request.model.clone(), // Model ID from request
                 harmony_ctx.components.clone(),
-            );
+            ));
             ctx.input.tenant_request_meta = tenant_request_meta.as_ref().map(iteration_charge);
             ctx.input.rate_limit_cell = Some(rate_limit_cell.clone());
             self.run(ctx, None, None)
@@ -1718,12 +1733,12 @@ impl RequestPipeline {
     > {
         let rate_limit_cell = Arc::new(RateLimitCell::new());
         let run = {
-            let mut ctx = RequestContext::for_responses(
+            let mut ctx = Box::new(RequestContext::for_responses(
                 Arc::clone(request),
                 None,
                 request.model.clone(),
                 harmony_ctx.components.clone(),
-            );
+            ));
             ctx.input.tenant_request_meta = tenant_request_meta.as_ref().map(iteration_charge);
             ctx.input.rate_limit_cell = Some(rate_limit_cell.clone());
             self.run_signalling(ctx, None, None, stream_start)

@@ -15,6 +15,7 @@ use llm_multimodal::{
 };
 use openai_protocol::worker::MmProcessingMode;
 use smg_grpc_client::{common_proto as common, vllm_proto as vllm};
+use smg_worker::identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType};
 
 use super::{
     capability::{runtime_supports_modality, SUPPORTS_VISION_LABEL},
@@ -24,14 +25,16 @@ use super::{
 use crate::{
     observability::metrics::Metrics,
     routers::{
-        common::placement::{self, PipelinePin, NO_MEDIA_REF_CAPABLE_WORKER_CODE},
+        common::{
+            placement::{self, PipelinePin, NO_MEDIA_REF_CAPABLE_WORKER_CODE},
+            snapshot::WorkerRegistry,
+        },
         error,
         grpc::{
             common::stages::pd_protocol::{EncodeHandoff, PdProtocol},
             context::WorkerSelection,
         },
     },
-    worker::{ConnectionMode, RuntimeType, Worker, WorkerRegistry, WorkerType},
 };
 
 /// Worker label carrying the advertised backend (`GetServerInfo.mm_processor`).
@@ -963,6 +966,9 @@ pub(crate) fn assemble_media_refs(plan: &MediaPlan) -> Result<vllm::MediaRefs, M
 mod tests {
     use std::sync::Arc;
 
+    use openai_protocol::model_card::ModelCard;
+    use smg_worker::{identity::basic::WorkerType, test_support::no_health_check};
+
     use super::*;
     #[cfg(all(
         feature = "jemalloc-stats",
@@ -970,13 +976,11 @@ mod tests {
         not(target_env = "musl")
     ))]
     use crate::routers::grpc::testing::bytes_allocated_during;
-    use crate::{
-        routers::grpc::multimodal::{
-            config::MultimodalConfigRegistry, settings::MultimodalSettings,
-        },
-        worker::{
-            test_support::{no_health_check, registry_with},
-            BasicWorkerBuilder, ModelCard, WorkerType,
+    use crate::routers::{
+        common::snapshot::test_support::registry_with,
+        grpc::{
+            backend_client::BasicWorkerBuilder,
+            multimodal::{config::MultimodalConfigRegistry, settings::MultimodalSettings},
         },
     };
 
@@ -1861,10 +1865,9 @@ mod tests {
             "{err}"
         );
 
-        // Audio is the worker's alone on this runtime: a hinted request that
-        // also carries it keeps the cheap refusal instead of a fetch and a
-        // decode that worker selection would refuse, while the same audio
-        // without a hint still forwards.
+        // vLLM also accepts the router's audio tensors. A hinted request
+        // carrying audio is processed locally so its image hint takes effect;
+        // the same audio without a hint still forwards.
         let audio = MediaContentPart::AudioUrl {
             url: "https://a/x.wav".to_string().into(),
             uuid: None,
@@ -1872,15 +1875,17 @@ mod tests {
         let mut with_audio = expandable_placeholders();
         with_audio.insert(Modality::Audio, "<|audio_pad|>".to_string());
         with_audio.set_worker_expandable(Modality::Audio, true);
-        let err = resolve_mm_processing(
-            &components,
-            &registry,
-            MODEL,
-            &plan(vec![hinted_image("https://a/1.png", 504), audio.clone()]),
-            &with_audio,
-        )
-        .expect_err("the router cannot serve audio to this worker");
-        assert_eq!(err.code(), "multimodal_hint_unsupported_in_worker_mode");
+        assert_eq!(
+            resolve_mm_processing(
+                &components,
+                &registry,
+                MODEL,
+                &plan(vec![hinted_image("https://a/1.png", 504), audio.clone()]),
+                &with_audio,
+            )
+            .expect("the router can apply the hint and serve audio"),
+            MmProcessing::Router
+        );
         assert_eq!(
             resolve_mm_processing(
                 &components,

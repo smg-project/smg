@@ -1,0 +1,101 @@
+# Regression gate for `cargo bench -p smg-policy-controller --bench bucket`, the fifth row of the matrix
+# in .github/workflows/benchmark-policy-engine.yml, run on pull requests through scripts/bench_gate.py. The
+# first row gates the `decision` binary with policy-engine.toml, which records the placement every row is
+# built with (every function on a 64-byte boundary) and why.
+#
+# The gate runs the whole file: the `bucket` preset's rows (`policy_engine/decide/<path>/<n>`), which the
+# `decision` binary leaves out because it runs at its own gate's bound. They are the preset's decision for a
+# request that is no prefill placement at 8, 64 and 512 candidates (`bucket`), a prefill placement with its
+# booking at the same sizes (`bucket_prefill`), the same where 64 models take turns over 8 workers of their
+# own and over the same 8 (`bucket_prefill_64_models`, `bucket_prefill_64_models_shared`), where a worker
+# joined mid-view (`bucket_prefill_joined/512`), at two rows a worker (`bucket_prefill_two_rows/256`) and
+# over a view older than a worker's leave at the three sizes (`bucket_prefill_stale`).
+# 13 single-threaded rows, a fresh seed per iteration, about 127 s a run, so three interleaved runs a side
+# take about 13 minutes.
+#
+# Threshold (the method is described in tokenizer.toml). The identical-build spread, (max - min) / median of
+# the per-run criterion medians of one build, was read twice on the build host. The hosted runner first ran
+# this binary under the gate on the pull request that brought this file and passed its 10 rows. Its spreads
+# are not read into the thresholds yet.
+#
+#   row                                          first reading   second reading   threshold
+#   bucket/8 (230 ns)                            3.7 %           1.9 %            10 %
+#   bucket/64 (549 ns)                           6.0 %           5.6 %            15 %
+#   bucket/512 (3.11 us)                         2.4 %           1.9 %            10 %
+#   bucket_prefill/8 (302 ns)                    2.8 %           5.7 %            10 %
+#   bucket_prefill/64 (794 ns)                   6.4 %           3.7 %            10 %
+#   bucket_prefill/512 (4.32 us)                 4.8 %           8.2 %            10 %
+#   bucket_prefill_64_models/8 (333 ns)          12.7 %          2.5 %            10 %
+#   bucket_prefill_64_models_shared/8 (1.63 us)  8.7 %           11.6 %           20 %
+#   bucket_prefill_joined/512 (5.14 us)          3.8 %           2.4 %            10 %
+#   bucket_prefill_two_rows/256 (5.70 us)        2.7 %           4.1 %            10 %
+#   bucket_prefill_stale/8 (401 ns)              8.7 %           6.3 %            15 %
+#   bucket_prefill_stale/64 (1.02 us)            6.1 %           6.6 %            15 %
+#   bucket_prefill_stale/512 (5.73 us)           9.2 %           7.6 %            20 %
+#
+# Each reading: six pinned runs of one build, read through the gate script itself: one build as both sides
+# (the second side the same binary with one byte appended past its image), three interleaved runs a side,
+# each from a fresh copy of the binary with a fresh criterion home, on a reserved core of a shared many-core
+# build host. The two readings ran side by side on two cores. The host was loaded and no run was held for a
+# quiet one: its one-minute loads before the runs were 71 to 91 and 69 to 89. The three `bucket_prefill_stale`
+# rows were read the same way with the change that brings them, on its own build, at loads of 61 to 116 and
+# 43 to 76.
+#
+# The threshold is the smallest multiple of 5 % that is at least twice the identical-build spread, never
+# under 10 %. Where a row's two readings differ on that host the lower stands, as in policy-engine.toml.
+# Eight rows read 4.8 % or less in their lower reading and take 10 %. `bucket/64` reads 5.6 % and takes 15
+# %. `bucket_prefill_64_models_shared/8` reads 8.7 % and takes 20 %. Of the three stale rows, two read 6.3
+# and 6.1 % and take 15 %, and the widest reads 7.6 % and takes 20 %. The wide rows are read again on the
+# hosted runner's results. The gate fails an id only when every pull-request run is slower than every
+# base run, so one slow run cannot fail the job. Read as three base and three head runs at 10 % a row, both
+# null cases of the first ten rows passed: 0 failed, 0 suspect of 10 ids. Both null cases of the thirteen
+# passed the same way.
+#
+# A pull request that moves no file of this binary builds two binaries of the same bytes, which the gate
+# passes without a run. Every job that runs both sides uploads bench-gate/results.json with the raw per-run
+# medians; they give the hosted runner's reading, and a row whose spread there reads above 5 % takes its
+# threshold by the rule above.
+
+# Count: `count = true`, as policy-engine.toml records it. No row carries `whole_pass`, as in the
+# power-of-two file: the mark follows a row that read slower on a count a few instructions apart, and no
+# row of this binary has. No id of this binary has failed by time yet, so the count has not run on it.
+repeats = 3
+count = true
+# The count ends 2,280 s into the run: this binary's runs and its report end long before the gate
+# step's bound. No count starts in the budget's last 30 s.
+run_budget = 2280
+filter = "^policy_engine/decide/bucket"
+
+# The files that feed this binary beyond the measured crate: the base side is built with them as the pull
+# request has them (bench_gate.py build --sources-from), so the two binaries differ in the measured code alone.
+sources = [
+    "crates/policy_controller/benches/bucket.rs",
+    "crates/policy_controller/benches/common/mod.rs",
+    "crates/policy_controller/benches/common/preset.rs",
+]
+
+# The first gate whose pattern matches an id decides its threshold.
+[[gate]]
+pattern = "^policy_engine/decide/bucket/64$"
+threshold = 0.15
+note = "identical build 6.0 and 5.6 % on the loaded build host"
+
+[[gate]]
+pattern = "^policy_engine/decide/bucket_prefill_64_models_shared/8$"
+threshold = 0.20
+note = "identical build 8.7 and 11.6 % on the loaded build host"
+
+[[gate]]
+pattern = "^policy_engine/decide/bucket_prefill_stale/512$"
+threshold = 0.20
+note = "identical build 9.2 and 7.6 % on the loaded build host"
+
+[[gate]]
+pattern = "^policy_engine/decide/bucket_prefill_stale/(8|64)$"
+threshold = 0.15
+note = "identical build 8.7 and 6.3 % at 8, 6.1 and 6.6 % at 64, on the loaded build host"
+
+[[gate]]
+pattern = "^policy_engine/decide/bucket"
+threshold = 0.10
+note = "identical build 1.9 - 4.8 % in the lower of two readings on the build host; the hosted spreads are not read in yet"

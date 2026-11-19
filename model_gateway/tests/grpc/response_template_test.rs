@@ -27,11 +27,11 @@ use smg::{
     config::{AccessLogField, ParserChoice, RouterConfig, RoutingMode},
     middleware::TenantRequestMeta,
     observability::log_format::{JsonLine, SpanFields},
-    routers::{RouterFactory, RouterTrait},
+    routers::{grpc::backend_client::BasicWorkerBuilder, RouterFactory, RouterTrait},
     tenant::TenantKey,
-    worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType},
 };
 use smg_grpc_client::tokenspeed_scheduler::tokenspeed_proto as ts;
+use smg_worker::identity::basic::{ConnectionMode, RuntimeType, WorkerType};
 use tokio::{net::TcpListener, task::JoinHandle, time::timeout};
 use tower::ServiceExt;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
@@ -462,7 +462,7 @@ async fn messages(gateway: &Gateway, stream: bool) -> (Vec<Value>, Value) {
     let body = read(
         gateway
             .router
-            .route_messages(None, &tenant(), request, MODEL),
+            .route_messages(None, &tenant(), Arc::new(request), MODEL),
     )
     .await;
     assert!(!body.contains("<tool_call>"), "no framing in {body}");

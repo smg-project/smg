@@ -51,6 +51,7 @@ use openai_protocol::{
     embedding::EmbeddingRequest,
     generate::GenerateRequest,
     messages::{CountMessageTokensRequest, CreateMessageRequest},
+    model_card::ModelCard,
     rerank::RerankRequest,
     responses::ResponsesRequest,
     worker::HealthCheckConfig,
@@ -64,9 +65,10 @@ use smg::{
     rate_limit::{
         RateLimitBackend, RateLimitManager, ReserveOutcome, ReserveRequest, UsageSettlement,
     },
-    routers::{http::router::Router as HttpRouter, RouterTrait},
+    routers::{
+        grpc::backend_client::BasicWorkerBuilder, http::router::Router as HttpRouter, RouterTrait,
+    },
     tenant::TenantKey,
-    worker::{BasicWorkerBuilder, ModelCard},
 };
 use tokio::{net::TcpListener, task::JoinHandle};
 use tower::ServiceExt;
@@ -448,7 +450,9 @@ impl Endpoint {
                     "max_tokens": 32,
                     "stream": stream,
                 }));
-                router.route_messages(None, &tenant, body, MODEL).await
+                router
+                    .route_messages(None, &tenant, Arc::new(body), MODEL)
+                    .await
             }
             Self::Embeddings => {
                 let body = request::<EmbeddingRequest>(json!({
@@ -636,7 +640,7 @@ async fn every_input_the_request_carries_is_reserved() {
         ]}],
     }));
     router
-        .route_messages(None, &tenant, tool_result, MODEL)
+        .route_messages(None, &tenant, Arc::new(tool_result), MODEL)
         .await;
 
     // Ten words of instructions and two of input: ceil(12 * 1.3). Two words

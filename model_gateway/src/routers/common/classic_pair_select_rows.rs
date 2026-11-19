@@ -5,7 +5,7 @@
 //! each worker names, the policy each pool runs under, whether shedding is
 //! on, and what the gateway's pair placement answered at each request. The
 //! policy controller crate replays the rows through its own pair decision
-//! (`crates/policy_controller/tests/classic/pair_select.rs`).
+//! (`crates/policy_controller/tests/classic_rows.rs`).
 //!
 //! A request's answer is the pair it was placed on, each worker by its place
 //! in its pool's list, or no pair with the role the placement named and why.
@@ -21,11 +21,11 @@
 //! `random` stands on the side where a row must show whether the policy was
 //! asked: where it was not, one pair takes every draw.
 //!
-//! This file is not part of the gateway. It is kept beside the recorded rows
-//! with the commit it records from, and run in a checkout of that commit:
-//! copy it to `model_gateway/src/routers/common/classic_pair_select_rows.rs`,
-//! add `#[cfg(test)] mod classic_pair_select_rows;` to
-//! `model_gateway/src/routers/common/mod.rs`, then
+//! This file is an ignored test of the gateway crate, kept beside the code
+//! it runs. It records from the checkout it is built in and writes the sheet
+//! under `CLASSIC_ROWS_OUT`, naming `CLASSIC_ROWS_COMMIT` as the commit it
+//! recorded from. The sheets the policy controller crate replays are in
+//! `crates/policy_controller/tests/classic/sheets`; to record this one again:
 //!
 //! ```text
 //! CLASSIC_ROWS_OUT=<dir> CLASSIC_ROWS_COMMIT=<commit> \
@@ -39,8 +39,17 @@
 
 use std::{collections::HashMap, fs, path::PathBuf, sync::Arc, time::Duration};
 
-use openai_protocol::worker::{WorkerSpec, WorkerStatus};
+use openai_protocol::{
+    model_card::ModelCard,
+    worker::{WorkerSpec, WorkerStatus},
+};
 use serde::Serialize;
+use smg_worker::{
+    identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType},
+    pd::pairing::PdPairingMode,
+    runtime::StallReason,
+    test_support::no_health_check,
+};
 
 use super::{
     placement::{select_pair, Pair, PairFailure, PlacementFailure, PlacementInputs},
@@ -49,15 +58,12 @@ use super::{
 use crate::{
     config::types::PolicyConfig,
     policies::{PolicyFactory, PolicyRegistry},
-    worker::{
-        pd::{
+    routers::{
+        common::{
             pair_index::{PdPairIndex, PdWire},
-            pairing::PdPairingMode,
+            snapshot::WorkerRegistry,
         },
-        runtime::StallReason,
-        test_support::no_health_check,
-        BasicWorkerBuilder, ConnectionMode, ModelCard, RuntimeType, Worker, WorkerRegistry,
-        WorkerType,
+        grpc::backend_client::BasicWorkerBuilder,
     },
 };
 

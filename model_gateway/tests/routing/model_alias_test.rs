@@ -16,7 +16,7 @@ use axum::{
 };
 use openai_protocol::model_card::ModelCard;
 use serde_json::json;
-use smg::worker::BasicWorkerBuilder;
+use smg::routers::grpc::backend_client::BasicWorkerBuilder;
 use tower::ServiceExt;
 
 use crate::common::{

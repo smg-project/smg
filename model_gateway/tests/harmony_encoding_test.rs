@@ -7,13 +7,15 @@
 
 use std::sync::Arc;
 
+use openai_protocol::model_card::ModelCard;
 use smg::{
-    worker::{BasicWorkerBuilder, ConnectionMode, ModelCard, Worker, WorkerType},
+    routers::grpc::backend_client::BasicWorkerBuilder,
     workflow::{
         data::{WorkerKind, WorkerRegistrationMode, WorkerWorkflowData},
         steps::local::EnsureHarmonyEncodingStep,
     },
 };
+use smg_worker::identity::basic::{ConnectionMode, Worker, WorkerType};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowInstanceId};
 
 fn force_offline_vocab() {

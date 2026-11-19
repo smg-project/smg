@@ -7,6 +7,7 @@ use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
     fs, io, iter,
+    ops::Range,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex, OnceLock, PoisonError,
@@ -20,13 +21,17 @@ use chrono::{
 };
 use minijinja::{
     machinery::{
-        ast::{BinOpKind, Call, CallArg, Expr, ForLoop, IfCond, Macro, Set, Stmt, UnaryOpKind},
+        ast::{
+            BinOpKind, Call, CallArg, CallType, Expr, ForLoop, IfCond, Macro, Set, Stmt,
+            UnaryOpKind,
+        },
         parse, tokenize, Token, WhitespaceConfig,
     },
     syntax::SyntaxConfig,
     value::{DynObject, Enumerator, Kwargs, Object, ObjectRepr, ValueKind},
     Environment, Error as MinijinjaError, ErrorKind, Output, State, Value,
 };
+use rustc_hash::FxHashSet;
 use serde::Serialize;
 use serde_json::{self, ser::Formatter, Value as JsonValue};
 
@@ -875,14 +880,23 @@ struct Detected {
     /// Every name the template reads (see [`ChatTemplateState::reads`]);
     /// `None` where the template did not parse, the names being unknown.
     names_read: Option<HashSet<String>>,
+    /// Whether the root `set` statements build values and the template only
+    /// writes them ([`built_values_read_plainly`]).
+    writes_built_constants: bool,
 }
 
-/// Single-pass detection of content format, think-in-prefill, thinking toggle
-/// and the names read.
+/// Single-pass detection of content format, think-in-prefill, thinking toggle,
+/// the names read and whether the template only writes the values its root
+/// statements build.
 fn detect_all(template: &str) -> Detected {
     let (thinking_toggle, thinking_key_name) = detect_thinking_toggle(template);
-    let (content_format, think_in_prefill, prefill_opens_think_block, names_read) =
-        detect_all_with_ast(template);
+    let (
+        content_format,
+        think_in_prefill,
+        prefill_opens_think_block,
+        names_read,
+        writes_built_constants,
+    ) = detect_all_with_ast(template);
     Detected {
         content_format,
         think_in_prefill,
@@ -890,12 +904,14 @@ fn detect_all(template: &str) -> Detected {
         thinking_key_name,
         prefill_opens_think_block,
         names_read,
+        writes_built_constants,
     }
 }
 
 /// AST detection of content format, think-in-prefill, whether the generation
-/// prompt leaves a think block open, and the names the template reads
-/// (`None` where it did not parse).
+/// prompt leaves a think block open, the names the template reads (`None`
+/// where it did not parse), and whether the root `set` statements build
+/// values that the template only writes ([`built_values_read_plainly`]).
 fn detect_all_with_ast(
     template: &str,
 ) -> (
@@ -903,6 +919,7 @@ fn detect_all_with_ast(
     bool,
     bool,
     Option<HashSet<String>>,
+    bool,
 ) {
     let template = plain_generation_blocks(template);
     let ast = match parse(
@@ -912,7 +929,7 @@ fn detect_all_with_ast(
         WhitespaceConfig::default(),
     ) {
         Ok(ast) => ast,
-        Err(_) => return (ChatTemplateContentFormat::String, false, false, None),
+        Err(_) => return (ChatTemplateContentFormat::String, false, false, None, false),
     };
 
     let nodes = Nodes::of(&ast);
@@ -922,11 +939,17 @@ fn detect_all_with_ast(
     };
     let names_read = Some(nodes.names.iter().map(|name| (*name).to_string()).collect());
     let (think_in_prefill, prefill_opens_think_block) = ThinkDetector::run(&ast);
+    let mut sets = Vec::new();
+    root_set_statement(&ast, &template, false, &mut sets);
+    let namespaces = namespaces(&sets);
+    let writes_built_constants =
+        built_values_read_plainly(&ast, &computed_statements(sets).0, &namespaces);
     (
         content_format,
         think_in_prefill,
         prefill_opens_think_block,
         names_read,
+        writes_built_constants,
     )
 }
 
@@ -1799,6 +1822,1032 @@ fn dict_function(
         pairs.push((Value::from(name), kwargs.peek::<Value>(name)?));
     }
     Ok(Value::from_iter(pairs))
+}
+
+/// A root `set` statement of a chat template: one that binds a name at the
+/// top level, or in a statement that shares the top level's names (a
+/// top-level `if`, `filter`, `autoescape` or block `set`, the `else` of a
+/// top-level `for`), where a template binds the names its whole render
+/// reads.
+struct RootSet<'a> {
+    name: &'a str,
+    /// The expression the name is bound to. `None` when nothing says what
+    /// the value reads: the statement binds the name another way (a block's
+    /// output, one of several names at once, a macro, an import), or its
+    /// expression calls what the load cannot follow ([`names_read`]).
+    expression: Option<Expression<'a>>,
+    /// Whether the statement stands under a top-level `if` or in the `else`
+    /// of a top-level `for`: it may not run.
+    conditional: bool,
+    /// Whether the expression is a call of `namespace`: the name is a
+    /// namespace, whose attributes other statements bind.
+    namespace: bool,
+}
+
+/// The expression of a root `set` statement.
+struct Expression<'a> {
+    /// Its byte span in the source.
+    span: (usize, usize),
+    /// The names it reads.
+    names: Vec<&'a str>,
+    /// A filter or a test takes part in it: its value may be another at the
+    /// next render (`random`).
+    draws: bool,
+    /// The source spells its value already: it is a literal the source
+    /// holds as it stands, or another name alone.
+    spelled: bool,
+}
+
+/// The root `set` statements of `source`, a chat template, in the template's
+/// order. Empty when the template does not parse.
+fn root_sets(source: &str) -> Vec<RootSet<'_>> {
+    let mut sets = Vec::new();
+    if let Ok(ast) = parse(source, "chat", SyntaxConfig {}, WhitespaceConfig::default()) {
+        root_set_statement(&ast, source, false, &mut sets);
+    }
+    sets
+}
+
+/// [`root_sets`] of `statements`, under a top-level `if` or not
+/// (`conditional`).
+fn root_sets_under<'a>(
+    statements: &[Stmt<'a>],
+    source: &'a str,
+    conditional: bool,
+    sets: &mut Vec<RootSet<'a>>,
+) {
+    for stmt in statements {
+        root_set_statement(stmt, source, conditional, sets);
+    }
+}
+
+/// [`root_sets`] of `stmt` and of the statements under it.
+fn root_set_statement<'a>(
+    stmt: &Stmt<'a>,
+    source: &'a str,
+    conditional: bool,
+    sets: &mut Vec<RootSet<'a>>,
+) {
+    match stmt {
+        Stmt::Template(template) => {
+            root_sets_under(&template.children, source, conditional, sets);
+        }
+        // The walk follows the engine's scopes. It enters every list of
+        // statements that runs among the names it stands in, where a `set`
+        // binds a top-level name: the bodies of an `if`, a `filter`, an
+        // `autoescape` and a block `set`, and the `else` of a `for`, which
+        // runs once the loop's own names are gone. It enters none that runs
+        // among names of its own, which end with it: the body of a `for`, a
+        // `with`, a macro, a `call`, a `block`.
+        Stmt::IfCond(cond) => {
+            root_sets_under(&cond.true_body, source, true, sets);
+            root_sets_under(&cond.false_body, source, true, sets);
+        }
+        Stmt::ForLoop(for_loop) => root_sets_under(&for_loop.else_body, source, true, sets),
+        Stmt::FilterBlock(block) => root_sets_under(&block.body, source, conditional, sets),
+        Stmt::AutoEscape(block) => root_sets_under(&block.body, source, conditional, sets),
+        Stmt::SetBlock(block) => {
+            root_sets_under(&block.body, source, conditional, sets);
+            unread_bindings(&block.target, conditional, sets);
+        }
+        Stmt::Set(set) => {
+            let Expr::Var(target) = &set.target else {
+                unread_bindings(&set.target, conditional, sets);
+                return;
+            };
+            // The statement's span runs from `set` to the end of its
+            // expression, which starts after the `=` that follows the name.
+            let (name_end, end) = (
+                target.span().end_offset as usize,
+                set.span().end_offset as usize,
+            );
+            let span = source.get(name_end..end).and_then(|rest| {
+                // Found by its byte: a search by a `char` pattern here makes
+                // the optimiser build the mark scans of `encoders::marks`
+                // differently (33 instructions more on each natively marked
+                // request).
+                let assign = rest.bytes().position(|byte| byte == b'=')?;
+                Some((end - rest[assign + 1..].trim_start().len(), end))
+            });
+            let spelled = match &set.expr {
+                Expr::Const(literal) => literal
+                    .value
+                    .as_str()
+                    .is_none_or(|text| source.contains(text)),
+                Expr::Var(_) => true,
+                _ => false,
+            };
+            let (mut names, mut draws) = (Vec::new(), false);
+            let expression = span
+                .filter(|_| names_read(&set.expr, &mut names, &mut draws))
+                .map(|span| Expression {
+                    span,
+                    names,
+                    draws,
+                    spelled,
+                });
+            let namespace = calls_namespace(&set.expr);
+            sets.push(RootSet {
+                name: target.id,
+                expression,
+                conditional,
+                namespace,
+            });
+        }
+        Stmt::Macro(declared) => sets.push(RootSet {
+            name: declared.name,
+            expression: None,
+            conditional,
+            namespace: false,
+        }),
+        Stmt::Import(import) => unread_bindings(&import.name, conditional, sets),
+        Stmt::FromImport(import) => {
+            for (name, alias) in &import.names {
+                unread_bindings(alias.as_ref().unwrap_or(name), conditional, sets);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whether the load can compute `expr` from literals and names: by what the
+/// syntax itself does (operators, subscripts, the methods of such values,
+/// `'<{}>'.format(suffix)`), by filters and by tests. The names it reads go
+/// to `names`. `draws` is set where a filter or a test takes part: one may
+/// answer anew at each render (`random`), so such a value is computed and
+/// never kept. Any other call is beyond the load: a function, a macro or a
+/// block reads what it likes.
+fn names_read<'a>(expr: &Expr<'a>, names: &mut Vec<&'a str>, draws: &mut bool) -> bool {
+    match expr {
+        Expr::Var(var) => {
+            names.push(var.id);
+            true
+        }
+        Expr::Const(_) => true,
+        Expr::UnaryOp(op) => names_read(&op.expr, names, draws),
+        Expr::BinOp(op) => {
+            names_read(&op.left, names, draws) && names_read(&op.right, names, draws)
+        }
+        Expr::Compare(compare) => {
+            names_read(&compare.expr, names, draws)
+                && compare
+                    .ops
+                    .iter()
+                    .all(|op| names_read(&op.expr, names, draws))
+        }
+        Expr::IfExpr(cond) => {
+            names_read(&cond.test_expr, names, draws)
+                && names_read(&cond.true_expr, names, draws)
+                && cond
+                    .false_expr
+                    .as_ref()
+                    .is_none_or(|expr| names_read(expr, names, draws))
+        }
+        Expr::GetAttr(attr) => names_read(&attr.expr, names, draws),
+        Expr::GetItem(item) => {
+            names_read(&item.expr, names, draws) && names_read(&item.subscript_expr, names, draws)
+        }
+        Expr::Slice(slice) => {
+            names_read(&slice.expr, names, draws)
+                && [&slice.start, &slice.stop, &slice.step]
+                    .into_iter()
+                    .flatten()
+                    .all(|bound| names_read(bound, names, draws))
+        }
+        Expr::List(list) => list.items.iter().all(|item| names_read(item, names, draws)),
+        Expr::Map(map) => map
+            .keys
+            .iter()
+            .chain(&map.values)
+            .all(|expr| names_read(expr, names, draws)),
+        // A method of a value, as the engine itself reads the call: a call
+        // through `self` runs a block of the template.
+        Expr::Call(call) => {
+            matches!(call.identify_call(), CallType::Method(..))
+                && names_read(&call.expr, names, draws)
+                && arguments_read(&call.args, names, draws)
+        }
+        Expr::Filter(filter) => {
+            *draws = true;
+            filter
+                .expr
+                .as_ref()
+                .is_none_or(|expr| names_read(expr, names, draws))
+                && arguments_read(&filter.args, names, draws)
+        }
+        Expr::Test(test) => {
+            *draws = true;
+            names_read(&test.expr, names, draws) && arguments_read(&test.args, names, draws)
+        }
+    }
+}
+
+/// [`names_read`] of `args`, the arguments of a call, a filter or a test.
+fn arguments_read<'a>(args: &[CallArg<'a>], names: &mut Vec<&'a str>, draws: &mut bool) -> bool {
+    args.iter().all(|arg| match arg {
+        CallArg::Pos(expr)
+        | CallArg::Kwarg(_, expr)
+        | CallArg::PosSplat(expr)
+        | CallArg::KwargSplat(expr) => names_read(expr, names, draws),
+    })
+}
+
+/// The names `target` binds, in a block `set` or a `set` of several names at
+/// once, as root sets whose value nothing reads ([`RootSet::expression`]).
+fn unread_bindings<'a>(target: &Expr<'a>, conditional: bool, sets: &mut Vec<RootSet<'a>>) {
+    match target {
+        Expr::Var(var) => sets.push(RootSet {
+            name: var.id,
+            expression: None,
+            conditional,
+            namespace: false,
+        }),
+        Expr::List(list) => {
+            for item in &list.items {
+                unread_bindings(item, conditional, sets);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Stands before each value the load reads back from a render of a
+/// template's own statements (see [`ChatTemplateState::control_bindings`]):
+/// the unit separator, an ASCII control character no template writes.
+const VALUE_SEPARATOR: u8 = 0x1f;
+
+/// Stands in that render for a value that is no string: the record
+/// separator, one byte that is no control spelling and is not empty.
+const NOT_A_STRING: u8 = 0x1e;
+
+/// A root `set` statement that binds control spellings for every render:
+/// the byte span of its expression, its value, and where the control
+/// spellings stand in the value. One spelling is the whole value, or the
+/// value begins with one and ends with one ([`several_controls`]).
+struct ControlBinding {
+    span: (usize, usize),
+    value: String,
+    controls: Vec<Range<usize>>,
+}
+
+impl ControlBinding {
+    /// The control spellings of the value, in its order.
+    fn spellings(&self) -> impl Iterator<Item = &str> {
+        self.controls
+            .iter()
+            .map(|control| &self.value[control.clone()])
+    }
+}
+
+/// A root `set` statement whose value the load computes
+/// ([`computed_statements`]).
+struct Computed<'a> {
+    name: &'a str,
+    /// The byte span of its expression.
+    span: (usize, usize),
+    /// Its value is the same at every render: it may stand as a literal.
+    fixed: bool,
+    /// Its expression builds the value: the source does not spell it
+    /// already ([`Expression::spelled`]).
+    builds: bool,
+    /// The names its expression reads.
+    names: Vec<&'a str>,
+}
+
+/// The root `set` statements among `sets` ([`root_sets`]) whose value the
+/// load computes, in the template's order; and the names that some
+/// statement binds to no one value.
+///
+/// The load computes a statement whose expression reads nothing of a
+/// request ([`names_read`]): literals, and names that such statements bound
+/// before it. The value is the same at every render, `fixed`, when also no
+/// filter or test takes part in it and each name it reads was bound at the
+/// top level by a statement of that kind: a name bound under an `if`, by a
+/// statement that draws, or in a way nothing reads has no one value from
+/// there on. A value that a request argument may carry is never computed
+/// (`{% set close = custom if custom is defined else '</s>' %}`), and its
+/// name is the request's to set, whatever else binds it
+/// (`{% if custom is defined %}{% set close = custom %}{% endif %}` after
+/// `{% set close = '</s>' %}`).
+fn computed_statements<'a>(sets: Vec<RootSet<'a>>) -> (Vec<Computed<'a>>, Vec<&'a str>) {
+    // The names the load has a value for; `true` where every render sees
+    // that value from here on.
+    let mut known: HashMap<&str, bool> = HashMap::new();
+    let mut unsettled = Vec::new();
+    let mut computed = Vec::new();
+    for set in sets {
+        let expression = set
+            .expression
+            .filter(|expression| expression.names.iter().all(|name| known.contains_key(name)));
+        let fixed = expression.as_ref().is_some_and(|expression| {
+            !expression.draws
+                && expression
+                    .names
+                    .iter()
+                    .all(|name| known.get(name) == Some(&true))
+        });
+        match expression {
+            Some(expression) => {
+                known.insert(set.name, fixed && !set.conditional);
+                computed.push(Computed {
+                    name: set.name,
+                    span: expression.span,
+                    fixed,
+                    builds: !expression.spelled,
+                    names: expression.names,
+                });
+            }
+            None => {
+                known.remove(set.name);
+            }
+        }
+        if !fixed {
+            unsettled.push(set.name);
+        }
+    }
+    (computed, unsettled)
+}
+
+/// Whether `expr` is a call of `namespace`.
+fn calls_namespace(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Call(call) if matches!(&call.expr, Expr::Var(callee) if callee.id == "namespace")
+    )
+}
+
+/// The names among `sets` ([`root_sets`]) that the top level binds by a call
+/// of `namespace`, once, where it always runs, and in no other way.
+fn namespaces<'a>(sets: &[RootSet<'a>]) -> Vec<&'a str> {
+    sets.iter()
+        .filter(|set| set.namespace && !set.conditional)
+        .filter(|set| sets.iter().filter(|other| other.name == set.name).count() == 1)
+        .map(|set| set.name)
+        .collect()
+}
+
+/// How [`built_values_read_plainly`] watches a name.
+#[derive(Clone, Copy, PartialEq)]
+enum Watched {
+    /// Its value may hold a control spelling between marks: a value a
+    /// top-level statement builds, a special token, a name bound from a join
+    /// that holds one of these, a macro that writes one.
+    Carrier,
+    /// A built value is made from it.
+    Part,
+    /// A namespace the top level binds once and nothing else binds
+    /// ([`namespaces`]): read as a template likes, until a top-level
+    /// statement binds one of its attributes from a carrier.
+    Namespace,
+    /// Such a namespace from then on: each of its attributes stands where
+    /// a carrier may stand (`ns.attr`), the name by itself only under a
+    /// truth test.
+    Holder,
+}
+
+/// The names watched where the walk of [`built_values_read_plainly`] stands.
+type Names<'a> = HashMap<&'a str, Watched>;
+
+/// Whether the syntax of a template shows that a copy with its control
+/// spellings between marks would write what the template writes, at every
+/// render: `ast` is the template, `computed` its top-level statements the
+/// load computes ([`computed_statements`]).
+///
+/// One of those statements that builds its value may bind a control
+/// spelling, which the marked copy holds between marks, and a render gives
+/// each of the four special tokens between marks too. Such a name is a
+/// carrier; so is a name a plain `set` binds from a join that holds one, and
+/// a macro that writes one. Whether a built value is a control spelling is
+/// read later, with the vocabulary: one that is not empty and does not
+/// begin and end with a control spelling leaves the template unmarked
+/// there ([`ChatTemplateState::control_bindings`]). A carrier may stand in
+/// three places:
+///
+/// - as a written value, alone or as a whole operand of a join: `~`, or
+///   `+`, which joins two strings and fails on anything else, with the marks
+///   as without them;
+/// - the same way as the value of a plain `set` of one name;
+/// - alone, or under `not`, `and` and `or`, in the condition of an `if`,
+///   which asks only whether it is empty: the marks stand around a control
+///   spelling, so a value is empty with them exactly when it is without.
+///
+/// A `set` of a namespace's attribute is no plain `set`: a statement
+/// elsewhere reads what it bound. Where the top level binds a name once by
+/// a call of `namespace` and a top-level statement binds one of its
+/// attributes from a join that holds a carrier, the namespace is a holder:
+/// each attribute stands in the three places, as the value of such a `set`
+/// too, and in such a condition against the empty string, the same
+/// question. An attribute bound from a carrier only inside a loop, a macro
+/// or a block makes no holder, and fails as any other read; so does the
+/// holder's name bound again to anything but a new namespace.
+///
+/// A name a built value is made from, a part, may stand in the statements
+/// that build and in such a condition. Any other statement that reads it
+/// could put together a control the load never computed.
+///
+/// Every other read fails, wherever it stands and whatever a render would
+/// pass: a filter, a test, a comparison, a subscript, an argument, a list,
+/// a loop's sequence, a block that keeps or changes what is written inside
+/// it. So does a statement that builds a value the load cannot know as one
+/// value ([`Computed::fixed`]). The names are the engine's: the body of a
+/// loop, of a macro and of a `block` has names of its own. A loop's target
+/// and a macro's parameter take the place of a watched name there; a `set`
+/// inside takes it only from where it runs, so the name stays watched.
+fn built_values_read_plainly<'a>(
+    ast: &'a Stmt<'a>,
+    computed: &[Computed<'a>],
+    namespaces: &[&'a str],
+) -> bool {
+    let Stmt::Template(template) = ast else {
+        return false;
+    };
+    let mut names = Names::new();
+    let mut built = HashSet::new();
+    for statement in computed.iter().filter(|statement| statement.builds) {
+        if !statement.fixed {
+            return false;
+        }
+        names.insert(statement.name, Watched::Carrier);
+        built.insert(statement.span.1);
+    }
+    if built.is_empty() {
+        return false;
+    }
+    for name in SPECIAL_TOKEN_NAMES {
+        names.insert(name, Watched::Carrier);
+    }
+    // What a built value is made from, through every statement between.
+    for statement in computed.iter().rev() {
+        if statement.builds || names.get(statement.name) == Some(&Watched::Part) {
+            for name in &statement.names {
+                names.entry(name).or_insert(Watched::Part);
+            }
+        }
+    }
+    for name in namespaces {
+        names.entry(name).or_insert(Watched::Namespace);
+    }
+    scope_reads_plainly(&template.children, names, &built)
+}
+
+/// [`built_values_read_plainly`] of `body`, the statements of one scope,
+/// among `names`; `built` holds the end of each statement that builds.
+fn scope_reads_plainly<'a>(
+    body: &'a [Stmt<'a>],
+    mut names: Names<'a>,
+    built: &HashSet<usize>,
+) -> bool {
+    // A carrier may be bound from another, and by a statement that stands
+    // behind the read: a loop's body runs again.
+    // A namespace that becomes a holder keeps its entry: the watched names
+    // are counted, not the entries.
+    let watched = |names: &Names| {
+        names
+            .values()
+            .filter(|kind| **kind != Watched::Namespace)
+            .count()
+    };
+    loop {
+        let known = watched(&names);
+        bind_carriers(body, &mut names);
+        if watched(&names) == known {
+            break;
+        }
+    }
+    statements_read_plainly(body, &names, built)
+}
+
+/// Adds to `names` the carriers the statements of one scope bind: the name
+/// of a plain `set` whose value reads a carrier, and a macro whose body
+/// reads one. A namespace becomes a holder where a `set` binds one of its
+/// attributes from a value that reads a carrier.
+fn bind_carriers<'a>(body: &'a [Stmt<'a>], names: &mut Names<'a>) {
+    for stmt in body {
+        match stmt {
+            Stmt::Set(set) => match &set.target {
+                Expr::Var(target) if expression_reads(&set.expr, names, false) => {
+                    names.entry(target.id).or_insert(Watched::Carrier);
+                }
+                // A namespace's attribute bound from a carrier: it holds one.
+                target => {
+                    if let Some(namespace) = attribute_of(target, names, Watched::Namespace)
+                        .filter(|_| expression_reads(&set.expr, names, false))
+                    {
+                        names.insert(namespace, Watched::Holder);
+                    }
+                }
+            },
+            Stmt::Macro(declared)
+                if statements_read(&declared.body, &without(names, &declared.args), false) =>
+            {
+                names.entry(declared.name).or_insert(Watched::Carrier);
+            }
+            // The statements that run among this scope's names.
+            Stmt::IfCond(cond) => {
+                bind_carriers(&cond.true_body, names);
+                bind_carriers(&cond.false_body, names);
+            }
+            Stmt::ForLoop(for_loop) => bind_carriers(&for_loop.else_body, names),
+            _ => {}
+        }
+    }
+}
+
+/// Whether the statements of one scope read `names` plainly
+/// ([`built_values_read_plainly`]).
+fn statements_read_plainly<'a>(
+    body: &'a [Stmt<'a>],
+    names: &Names<'a>,
+    built: &HashSet<usize>,
+) -> bool {
+    body.iter().all(|stmt| match stmt {
+        Stmt::EmitRaw(_) => true,
+        Stmt::EmitExpr(emit) => joins(&emit.expr, names, false),
+        Stmt::Set(set) if rebinds_holder(set, names) => false,
+        // A statement that builds reads its parts as it likes.
+        Stmt::Set(set) if matches!(set.target, Expr::Var(_)) => joins(
+            &set.expr,
+            names,
+            built.contains(&(set.span().end_offset as usize)),
+        ),
+        // A holder's attribute is bound as a name is.
+        Stmt::Set(set) if attribute_of(&set.target, names, Watched::Holder).is_some() => {
+            joins(&set.expr, names, false)
+        }
+        Stmt::IfCond(cond) => {
+            asks_whether_empty(&cond.expr, names)
+                && statements_read_plainly(&cond.true_body, names, built)
+                && statements_read_plainly(&cond.false_body, names, built)
+        }
+        Stmt::ForLoop(for_loop) => {
+            !expression_reads(&for_loop.iter, names, true)
+                && for_loop
+                    .filter_expr
+                    .as_ref()
+                    .is_none_or(|filter| !expression_reads(filter, names, true))
+                && scope_reads_plainly(
+                    &for_loop.body,
+                    without(names, std::slice::from_ref(&for_loop.target)),
+                    built,
+                )
+                && statements_read_plainly(&for_loop.else_body, names, built)
+        }
+        Stmt::Macro(declared) => {
+            declared
+                .defaults
+                .iter()
+                .all(|default| !expression_reads(default, names, true))
+                && scope_reads_plainly(&declared.body, without(names, &declared.args), built)
+        }
+        Stmt::Block(block) => scope_reads_plainly(&block.body, without(names, &[]), built),
+        _ => !statements_read(std::slice::from_ref(stmt), names, true),
+    })
+}
+
+/// Whether `set` binds a holder's name to anything but a new namespace: the
+/// name would then name a namespace that another name reads.
+fn rebinds_holder(set: &Set, names: &Names) -> bool {
+    matches!(&set.target, Expr::Var(target) if names.get(target.id) == Some(&Watched::Holder))
+        && !calls_namespace(&set.expr)
+}
+
+/// The namespace whose attribute `expr` reads or binds (`ns.attr`), where
+/// `names` watch it as `kind`.
+fn attribute_of<'a>(expr: &Expr<'a>, names: &Names<'a>, kind: Watched) -> Option<&'a str> {
+    match expr {
+        Expr::GetAttr(attr) => match &attr.expr {
+            Expr::Var(var) if names.get(var.id) == Some(&kind) => Some(var.id),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Whether `expr`, a written value, the value of a plain `set` or the value
+/// a `set` binds to a holder's attribute, reads `names` plainly: a carrier
+/// or a holder's attribute alone or as a whole operand of `~` or `+`, or a
+/// carrier called (a macro's text) with arguments that read none; a part
+/// only in a statement that `builds`. A holder is read by its attributes,
+/// never by its name alone.
+fn joins<'a>(expr: &'a Expr<'a>, names: &Names<'a>, builds: bool) -> bool {
+    match expr {
+        Expr::Var(var) => match names.get(var.id) {
+            Some(Watched::Part) => builds,
+            // A holder is read by its attributes.
+            Some(Watched::Holder) => false,
+            _ => true,
+        },
+        Expr::GetAttr(_) if attribute_of(expr, names, Watched::Holder).is_some() => true,
+        Expr::BinOp(op) if matches!(op.op, BinOpKind::Concat | BinOpKind::Add) => {
+            joins(&op.left, names, builds) && joins(&op.right, names, builds)
+        }
+        Expr::Call(call) if matches!(&call.expr, Expr::Var(var) if names.get(var.id) == Some(&Watched::Carrier)) =>
+        {
+            let mut read = Nodes::default();
+            read.args(&call.args);
+            !any_watched(&read.names, names, true)
+        }
+        _ => !expression_reads(expr, names, !builds),
+    }
+}
+
+/// Whether `expr`, the condition of an `if`, reads `names` only to ask
+/// whether one is empty: a name or a holder's attribute alone, such an
+/// attribute against the empty string (`ns.attr == ''` or `!= ''`), or
+/// under `not`, `and` and `or`.
+fn asks_whether_empty<'a>(expr: &'a Expr<'a>, names: &Names<'a>) -> bool {
+    match expr {
+        Expr::Var(_) => true,
+        Expr::GetAttr(_) if attribute_of(expr, names, Watched::Holder).is_some() => true,
+        // A holder's attribute against the empty string: the same question.
+        Expr::BinOp(op)
+            if matches!(op.op, BinOpKind::Eq | BinOpKind::Ne)
+                && attribute_of(&op.left, names, Watched::Holder).is_some()
+                && matches!(&op.right, Expr::Const(empty) if empty.value.as_str() == Some("")) =>
+        {
+            true
+        }
+        Expr::UnaryOp(op) if matches!(op.op, UnaryOpKind::Not) => {
+            asks_whether_empty(&op.expr, names)
+        }
+        Expr::BinOp(op) if matches!(op.op, BinOpKind::ScAnd | BinOpKind::ScOr) => {
+            asks_whether_empty(&op.left, names) && asks_whether_empty(&op.right, names)
+        }
+        _ => !expression_reads(expr, names, true),
+    }
+}
+
+/// Whether `expr` reads one of `names` anywhere ([`any_watched`]).
+fn expression_reads<'a>(expr: &'a Expr<'a>, names: &Names<'a>, parts: bool) -> bool {
+    let mut read = Nodes::default();
+    read.expr(expr);
+    any_watched(&read.names, names, parts)
+}
+
+/// Whether `stmts` read one of `names` anywhere ([`any_watched`]); a name
+/// they bind counts as read.
+fn statements_read<'a>(stmts: &'a [Stmt<'a>], names: &Names<'a>, parts: bool) -> bool {
+    let mut read = Nodes::default();
+    read.stmts(stmts, &mut Vec::new());
+    any_watched(&read.names, names, parts)
+}
+
+/// Whether one of `read`, the names a piece of a template reads, is watched
+/// among `names`: as a carrier or a holder or, where `parts` count, as a
+/// part.
+fn any_watched(read: &HashSet<&str>, names: &Names, parts: bool) -> bool {
+    read.iter().any(|name| match names.get(name) {
+        Some(Watched::Carrier | Watched::Holder) => true,
+        Some(Watched::Part) => parts,
+        Some(Watched::Namespace) | None => false,
+    })
+}
+
+/// `names` without those that `targets` name: a loop's targets and a macro's
+/// parameters are the body's own names from its first statement.
+fn without<'a>(names: &Names<'a>, targets: &'a [Expr<'a>]) -> Names<'a> {
+    let mut bound = Nodes::default();
+    for target in targets {
+        bound.expr(target);
+    }
+    let mut inner = names.clone();
+    // A namespace becomes a holder at the top level alone: inside, a `set` of
+    // its attribute from a carrier fails as before.
+    inner.retain(|name, kind| !bound.names.contains(name) && *kind != Watched::Namespace);
+    inner
+}
+
+/// The quote of a plain string literal of a template's source that holds
+/// `value`. `None` for a value none holds (a backslash, a control
+/// character, both kinds of quote).
+fn literal_quote(value: &str) -> Option<char> {
+    let holds = |quote: u8| {
+        !value
+            .bytes()
+            .any(|byte| byte == quote || byte == b'\\' || byte < b' ')
+    };
+    if holds(b'\'') {
+        Some('\'')
+    } else if holds(b'"') {
+        Some('"')
+    } else {
+        None
+    }
+}
+
+/// The value of `binding` as a string literal of a template's source, each
+/// of its control spellings between the marks of `encoders::marks`. `None`
+/// for a value no plain literal holds ([`literal_quote`]).
+fn marked_literal(binding: &ControlBinding) -> Option<String> {
+    let value = binding.value.as_str();
+    let quote = literal_quote(value)?;
+    let mut literal = String::from(quote);
+    let mut cursor = 0;
+    for control in &binding.controls {
+        literal.push_str(&value[cursor..control.start]);
+        literal.push_str(&marks::mark(&value[control.clone()]));
+        cursor = control.end;
+    }
+    literal.push_str(&value[cursor..]);
+    literal.push(quote);
+    Some(literal)
+}
+
+/// Where the control spellings stand in `value`, a string a statement
+/// builds that is no control spelling whole: the added tokens `added` finds
+/// in it, each as it stands, leftmost and the longest at one place. `None`
+/// unless the value begins with one and ends with one. Text at an edge may
+/// be a piece of a control: the template would complete that control where
+/// it writes the value, and no mark would stand around it. Text between two
+/// controls is closed in by them. A token whose entry carries a flag is
+/// found as its spelling, and the read of the vocabulary refuses it
+/// ([`contested`]).
+fn several_controls(value: &str, added: &AddedTokens) -> Option<Vec<Range<usize>>> {
+    let controls: Vec<_> = added.ranges(value).collect();
+    let at_both_edges = controls.first()?.start == 0 && controls.last()?.end == value.len();
+    at_both_edges.then_some(controls)
+}
+
+/// `source`, a chat template, with the expression of each of `bindings`
+/// ([`ChatTemplateState::control_bindings`], in the template's order) replaced by its
+/// value, the control spellings between marks ([`marked_literal`]). `None`
+/// when a value has no literal.
+fn with_marked_literals(source: &str, bindings: &[ControlBinding]) -> Option<String> {
+    let mut marked = String::with_capacity(source.len());
+    let mut cursor = 0;
+    for binding in bindings {
+        let (start, end) = binding.span;
+        marked.push_str(&source[cursor..start]);
+        marked.push_str(&marked_literal(binding)?);
+        cursor = end;
+    }
+    marked.push_str(&source[cursor..]);
+    Some(marked)
+}
+
+/// Whether the flat encode may read one of `spellings`, where a text holds
+/// it, otherwise than alone and as it stands. `added` is every added token
+/// of the vocabulary, each with a flag: whether the caller's flat encode
+/// reads that token otherwise by itself. Its entry says so (the token takes
+/// the whitespace beside it, it matches only as a whole word, or it is
+/// matched after normalization), or the caller's encoder does not take the
+/// longer of two added tokens that begin at one place and the token begins
+/// with another one.
+///
+/// Between marks a spelling is read as its own token. The flat encode takes
+/// the added tokens leftmost, each under its flags: first the ones matched
+/// as they stand, then, in what is left between them, the ones matched
+/// after normalization. So a flagged spelling is more than its characters
+/// there, or none of them, or it is read only in the second pass, behind
+/// every token of the first and wherever the text normalizes to it, or it
+/// is read as the token it begins with; and a token that holds a spelling,
+/// or that ends inside one, takes the spelling's place where the text
+/// beside it completes that token. A token that stands inside a spelling
+/// without a flag, or that begins inside one, never does: the spelling
+/// starts first, or is the longer and is taken.
+fn contested<'a>(spellings: &[&str], mut added: impl Iterator<Item = (&'a str, bool)>) -> bool {
+    // The bytes a spelling begins with: a token meets a spelling only there.
+    let mut begins = [false; 256];
+    for spelling in spellings {
+        if let Some(&first) = spelling.as_bytes().first() {
+            begins[usize::from(first)] = true;
+        }
+    }
+    added.any(|(token, flagged)| {
+        if flagged && spellings.contains(&token) {
+            return true;
+        }
+        let token = token.as_bytes();
+        token.iter().enumerate().any(|(at, &byte)| {
+            begins[usize::from(byte)]
+                && spellings.iter().any(|spelling| {
+                    let (spelling, rest) = (spelling.as_bytes(), &token[at..]);
+                    if at == 0 {
+                        // The token begins with the spelling and goes on.
+                        rest.len() > spelling.len() && rest.starts_with(spelling)
+                    } else {
+                        // The token holds the spelling further in, or ends
+                        // inside it.
+                        rest.starts_with(spelling) || spelling.starts_with(rest)
+                    }
+                })
+        })
+    })
+}
+
+/// What `source`, a chat template, writes by itself: its raw text and its
+/// string literals, each piece a text of its own, then each run of two or
+/// more pieces that stand side by side, joined, and last every piece in
+/// the order of the source, glued with nothing between. Between two pieces
+/// of a run nothing lies but a comment, the marks of an expression or a
+/// join, so a render that writes one writes the next right after it, and
+/// a token the pieces spell together is written whole. Between two pieces
+/// that follow each other in the source a render may write nothing (a
+/// parenthesis, a block tag, an expression that comes out empty): the
+/// glued text holds a token such pieces spell together, and in it a piece
+/// stands between the pieces before and after it in the source. Each text
+/// is asked by itself: a token that matches only as a whole word is
+/// found in the piece that holds it. The glued
+/// text is left out where it would repeat a text: after one piece alone,
+/// or one run of every piece. The lexer reads under the whitespace rules
+/// of the render ([`build_environment`]).
+/// A comment is not in the texts, and neither is a literal that `built`
+/// names by its byte offset: one inside an expression the template builds a
+/// value from, the pattern of that value, which it writes only as the
+/// value. A template the lexer refuses is read whole.
+fn written_text(source: &str, built: impl Fn(usize) -> bool) -> Vec<String> {
+    let mut written = Vec::new();
+    // The runs of pieces that stand side by side, and how many pieces the
+    // open run holds so far.
+    let mut runs: Vec<String> = Vec::new();
+    let mut pieces = 0_usize;
+    // Every piece in the order of the source, with nothing between.
+    let mut glued = String::with_capacity(source.len());
+    // A newline after a block or a comment that ends a line is not written,
+    // nor the blanks before a block that begins one.
+    let whitespace = WhitespaceConfig {
+        trim_blocks: true,
+        lstrip_blocks: true,
+        ..WhitespaceConfig::default()
+    };
+    for item in tokenize(source, false, SyntaxConfig, whitespace) {
+        let Ok((token, span)) = item else {
+            return vec![source.to_owned()];
+        };
+        let text = match &token {
+            Token::TemplateData(text) | Token::Str(text) => Some(*text),
+            Token::String(text) => Some(&**text),
+            Token::VariableStart | Token::VariableEnd | Token::Tilde | Token::Plus => continue,
+            _ => None,
+        };
+        let Some(text) = text.filter(|_| !built(span.start_offset as usize)) else {
+            // The run ends here; one piece alone is no run.
+            if pieces == 1 {
+                runs.pop();
+            }
+            pieces = 0;
+            continue;
+        };
+        written.push(text.to_owned());
+        glued.push_str(text);
+        if pieces == 0 {
+            runs.push(String::new());
+        }
+        if let Some(run) = runs.last_mut() {
+            run.push_str(text);
+        }
+        pieces += 1;
+    }
+    if pieces == 1 {
+        runs.pop();
+    }
+    // One piece alone is the glued text, and so is a run of every piece.
+    let repeats = written.len() < 2 || runs.iter().any(|run| run.len() == glued.len());
+    written.extend(runs);
+    if !repeats {
+        written.push(glued);
+    }
+    written
+}
+
+/// Whether the texts of [`written_text`] spell one of `added`, the added
+/// tokens, between them: the token begins with the end of one text, goes on
+/// over whole texts, any number of them, and ends with the start of another.
+/// A render writes the pieces in an order of its own: it leaves one out (a
+/// branch), writes one again or never (a loop), or writes one that stands
+/// elsewhere in the source (a macro, a block bound to a name). So any piece
+/// may come right after any other, itself among them, and a token they
+/// spell together there is written whole. The joined texts are pieces in
+/// one such order. Each token is read as it is spelled.
+fn spelled_across(written: &[String], added: &[(&str, bool)]) -> bool {
+    let longest = added
+        .iter()
+        .map(|(token, _)| token.len())
+        .max()
+        .unwrap_or(0);
+    // The ends of the texts a token may begin with: each is shorter than
+    // the longest token.
+    let ends: FxHashSet<&[u8]> = written
+        .iter()
+        .map(String::as_bytes)
+        .flat_map(|text| {
+            let from = text.len().saturating_sub(longest.saturating_sub(1));
+            (from..text.len()).map(move |at| &text[at..])
+        })
+        .collect();
+    added.iter().any(|(token, _)| {
+        let token = token.as_bytes();
+        // Where the token may go on: behind the end of a text, and behind
+        // each whole text that follows one.
+        let mut begun = vec![false; token.len()];
+        for at in 1..token.len() {
+            let (head, rest) = token.split_at(at);
+            if !begun[at] && !ends.contains(head) {
+                continue;
+            }
+            for text in written.iter().map(String::as_bytes) {
+                if text.starts_with(rest) {
+                    return true;
+                }
+                if !text.is_empty() && rest.starts_with(text) {
+                    begun[at + text.len()] = true;
+                }
+            }
+        }
+        false
+    })
+}
+
+/// The names a render gives the four special tokens a template reads
+/// ([`RENDER_CONTEXT_NAMES`]). No template reads any other special token of
+/// the vocabulary.
+const SPECIAL_TOKEN_NAMES: [&str; 4] = ["bos_token", "eos_token", "unk_token", "pad_token"];
+
+/// A conversation a template that builds its control spellings is checked on
+/// before its marks are put in force (see
+/// [`ChatTemplateState::mark_built_controls`]).
+struct Probe {
+    messages: Vec<JsonValue>,
+    tools: Option<Vec<JsonValue>>,
+    documents: Option<Vec<JsonValue>>,
+}
+
+impl Probe {
+    /// The parameters the probe renders under at the instant `now` (a
+    /// template may write the time): with the generation prompt or without,
+    /// the thinking switch as the gateway passes it or leaves it.
+    fn params<'a>(
+        &'a self,
+        special_tokens: &'a SpecialTokens,
+        now: DateTime<FixedOffset>,
+        (add_generation_prompt, thinking): (bool, Option<bool>),
+    ) -> ChatTemplateParams<'a> {
+        ChatTemplateParams {
+            add_generation_prompt,
+            tools: self.tools.as_deref(),
+            documents: self.documents.as_deref(),
+            special_tokens: Some(special_tokens),
+            thinking,
+            now: Some(now),
+            ..Default::default()
+        }
+    }
+}
+
+/// The probe conversations, the bare turn first: a system message and a
+/// second turn, a history message with reasoning, a tool round with its
+/// tools (the call's arguments as the template takes them), a document.
+fn probes(raw_tool_call_arguments: bool) -> [Probe; 5] {
+    let text = "probe";
+    let message = |role: &str| serde_json::json!({"role": role, "content": text});
+    let conversation = |messages: Vec<JsonValue>| Probe {
+        messages,
+        tools: None,
+        documents: None,
+    };
+    let arguments = serde_json::json!({"probe": text});
+    let arguments = if raw_tool_call_arguments {
+        JsonValue::String(arguments.to_string())
+    } else {
+        arguments
+    };
+    [
+        conversation(vec![message("user")]),
+        conversation(vec![
+            message("system"),
+            message("user"),
+            message("assistant"),
+            message("user"),
+        ]),
+        conversation(vec![
+            message("user"),
+            serde_json::json!({
+                "role": "assistant", "content": text, "reasoning_content": text,
+            }),
+            message("user"),
+        ]),
+        Probe {
+            tools: Some(vec![serde_json::json!({"type": "function", "function": {
+                "name": "probe",
+                "description": text,
+                "parameters": {"type": "object", "properties": {"probe": {"type": "string"}}},
+            }})]),
+            ..conversation(vec![
+                message("user"),
+                serde_json::json!({"role": "assistant", "content": "", "tool_calls": [{
+                    "id": "call_0",
+                    "type": "function",
+                    "function": {"name": "probe", "arguments": arguments},
+                }]}),
+                serde_json::json!({"role": "tool", "tool_call_id": "call_0", "content": text}),
+                message("user"),
+            ])
+        },
+        Probe {
+            documents: Some(vec![serde_json::json!({"title": text, "text": text})]),
+            ..conversation(vec![message("user")])
+        },
+    ]
 }
 
 /// Build a pre-configured `Environment<'static>` with the given template string,
@@ -3128,6 +4177,12 @@ pub struct ChatTemplateState {
     /// Every name the default template reads (see [`Self::reads`]); `None`
     /// where the template did not parse, the names being unknown.
     names_read: Option<HashSet<String>>,
+    /// Whether the root `set` statements of the default template build
+    /// values and the template only writes them
+    /// ([`built_values_read_plainly`]): only such a template may have its
+    /// control spellings marked, and the load reads no other for one (see
+    /// [`Self::control_bindings`]).
+    writes_built_constants: bool,
 }
 
 impl std::fmt::Debug for ChatTemplateState {
@@ -3152,6 +4207,7 @@ impl ChatTemplateState {
             thinking_key_name,
             prefill_opens_think_block,
             names_read,
+            writes_built_constants,
         } = template.as_ref().map(|t| detect_all(t)).unwrap_or_default();
         let developer_role_supported = template
             .as_deref()
@@ -3173,6 +4229,7 @@ impl ChatTemplateState {
             processor: None,
             marked: false,
             names_read,
+            writes_built_constants,
         };
         state.settle_by_behaviour();
         Ok(state)
@@ -3310,6 +4367,7 @@ impl ChatTemplateState {
             processor: None,
             marked: false,
             names_read: None,
+            writes_built_constants: false,
         }
     }
 
@@ -3368,12 +4426,13 @@ impl ChatTemplateState {
         messages: &[serde_json::Value],
         params: ChatTemplateParams,
     ) -> Result<(String, bool)> {
+        // A render call carries no template of its own, so the words name
+        // what holds for every caller: the model has none, and only its
+        // configuration can bring one.
         let env = self.env.as_ref().ok_or_else(|| {
             anyhow!(
-                "Cannot use chat template functions because tokenizer.chat_template is not set \
-                 and no template argument was passed! For information about writing templates and \
-                 setting the tokenizer.chat_template attribute, please see the documentation at \
-                 https://huggingface.co/docs/transformers/main/en/chat_templating",
+                "The model has no chat template. One must be configured for the model; \
+                 a request cannot supply it.",
             )
         })?;
 
@@ -3482,6 +4541,491 @@ impl ChatTemplateState {
         self.marked
     }
 
+    /// Marks the control spellings the templates build. A template may never
+    /// spell a control token whole: it binds each to a name once, out of a
+    /// constant of its own (`'<open{}>'.format(suffix)`), and writes the
+    /// names. [`Self::mark_controls`] finds no spelling in such a source, so
+    /// the load reads the bindings instead ([`Self::control_bindings`]): a
+    /// root `set` statement whose value is the same at every render and is
+    /// one added token (`is_control`) binds a control spelling, and a copy
+    /// of the source takes that spelling, between the marks of
+    /// `encoders::marks`, as a literal in the statement's place. A value
+    /// such a statement builds that begins with an added token and ends
+    /// with one holds several, and takes the marks around each
+    /// ([`several_controls`]). A statement beside them that spells one
+    /// control whole in a literal of its own binds it the same way, where
+    /// its name is read as theirs. Compiled
+    /// so, the template writes control tokens where it writes the names,
+    /// alone or inside a longer value, and the same spellings in request
+    /// text stay text, as under [`Self::mark_controls`]; a render builds no
+    /// spelling again.
+    ///
+    /// The templates (this one, the `tool_use` one, the processor's) are
+    /// marked together or not at all, and only where the syntax shows that
+    /// the marks change nothing a render reads
+    /// ([`built_values_read_plainly`]): each value the top-level statements
+    /// build is only written, joined or asked whether it is empty, and what
+    /// it is built from is read by nothing else. A template that reads one
+    /// any other way (a filter, a comparison, a search, a slice), binds one
+    /// from a request argument, builds a value that is not empty and does
+    /// not begin and end with a control spelling, or writes an added token
+    /// whole by itself (in its text or in a string literal, not in a
+    /// comment; in one piece, or in pieces a render may write one right
+    /// after another, see [`spelled_across`]) stays as it is, its prompts
+    /// encoded from their text as before. So does one that writes a control
+    /// outside its constants on a probe conversation
+    /// ([`Self::marks_every_control`]). Every reading is
+    /// made through copies of the templates ([`Self::twin`]), so the render
+    /// of a request carries nothing for it. `controls`, the matcher over the
+    /// added tokens, is asked for only once a template binds a control
+    /// spelling it does not write whole by itself, or builds a value a
+    /// plain literal holds that is neither a control spelling nor empty,
+    /// so a checkpoint without either never builds it. `as_spelled` says
+    /// whether the flat encode matches every added token as it is spelled.
+    /// It is asked at such a built value, which is bound only then: the
+    /// text between two controls of a bound value is read by its
+    /// characters, and the flat encode reads it so only then. It is asked
+    /// again once a template binds a control spelling: under a pipeline
+    /// that matches an added token after normalization the flat encode
+    /// reads as that token a text the normalizer turns into its spelling,
+    /// and the templates stay as they are.
+    ///
+    /// Before that the vocabulary is read once: `added` is every added
+    /// token, with whether its entry carries a flag. Where the flat encode
+    /// may read a spelling that would stand between marks otherwise than
+    /// alone and as it stands ([`contested`]), the templates stay as they
+    /// are: a prompt with the marks would read that spelling as its own
+    /// token everywhere.
+    /// Returns the spellings the templates now hold between marks, the
+    /// special tokens a render gives by name among them, so that the caller
+    /// can tell which added tokens a request may still type as tokens;
+    /// `None` when the templates stay as they are.
+    pub(crate) fn mark_built_controls<'a, 'b, I>(
+        &mut self,
+        is_control: &dyn Fn(&str) -> bool,
+        added: impl FnOnce() -> I,
+        controls: impl Fn() -> Option<&'a AddedTokens>,
+        as_spelled: &dyn Fn() -> bool,
+        special_tokens: &SpecialTokens,
+    ) -> Option<Vec<String>>
+    where
+        I: Iterator<Item = (&'b str, bool)>,
+    {
+        // A built value of several controls is read with the matcher only
+        // where the flat encode matches every added token as it is spelled.
+        let several = || as_spelled().then(&controls).flatten();
+        let own = self.control_bindings(is_control, &several, special_tokens);
+        if own.is_empty() {
+            return None;
+        }
+        if !as_spelled() {
+            tracing::debug!(
+                "the chat template binds control spellings and stays unmarked: the flat encode \
+                 matches an added token after normalization"
+            );
+            return None;
+        }
+        let nested: Vec<_> = [&self.tool_use, &self.processor]
+            .into_iter()
+            .flatten()
+            .map(|state| state.control_bindings(is_control, &several, special_tokens))
+            .collect();
+        // Every spelling that would stand between marks: what the templates
+        // bind, and the special tokens a render gives by name.
+        let named = [
+            &special_tokens.bos_token,
+            &special_tokens.eos_token,
+            &special_tokens.unk_token,
+            &special_tokens.pad_token,
+        ];
+        let spellings: Vec<&str> = own
+            .iter()
+            .chain(nested.iter().flatten())
+            .flat_map(ControlBinding::spellings)
+            .chain(named.into_iter().flatten().map(String::as_str))
+            .filter(|spelling| !spelling.is_empty())
+            .collect();
+        let added: Vec<_> = added().collect();
+        if contested(&spellings, added.iter().copied()) {
+            tracing::debug!(
+                "the chat template binds control spellings and stays unmarked: the flat encode \
+                 may read one of them otherwise than alone"
+            );
+            return None;
+        }
+        let controls = controls()?;
+        let own = self.built_controls_marked(&own, controls, &added, special_tokens)?;
+        let mut envs = Vec::new();
+        for (state, bindings) in [&self.tool_use, &self.processor]
+            .into_iter()
+            .flatten()
+            .zip(&nested)
+        {
+            envs.push(state.built_controls_marked(bindings, controls, &added, special_tokens)?);
+        }
+        self.env = Some(own);
+        self.marked = true;
+        for (state, env) in [&mut self.tool_use, &mut self.processor]
+            .into_iter()
+            .flatten()
+            .zip(envs)
+        {
+            state.env = Some(env);
+            state.marked = true;
+        }
+        tracing::info!(
+            "the chat template builds its control spellings: the control tokens it writes are \
+             marked, and the same spellings in a request are encoded as text"
+        );
+        Some(spellings.into_iter().map(str::to_owned).collect())
+    }
+
+    /// This template's state around `env`, without nested templates: a
+    /// render through it takes `env` whatever the request declares, and
+    /// prepares the request as this template's own renders do (the content
+    /// shape, the roles, the thinking key, the form of a tool call's
+    /// arguments).
+    fn twin(&self, env: Environment<'static>) -> Self {
+        Self {
+            env: Some(env),
+            content_format: self.content_format,
+            thinking_toggle: self.thinking_toggle,
+            thinking_key_name: self.thinking_key_name,
+            think_in_prefill: self.think_in_prefill,
+            prefill_opens_think_block: self.prefill_opens_think_block,
+            developer_role_supported: self.developer_role_supported,
+            root_role_supported: self.root_role_supported,
+            raw_tool_call_arguments: self.raw_tool_call_arguments,
+            tool_use: None,
+            output_len: RenderedLength::default(),
+            processor: None,
+            marked: false,
+            names_read: None,
+            writes_built_constants: false,
+        }
+    }
+
+    /// The root `set` statements of this template that bind control
+    /// spellings for every render: those whose value is the same at every
+    /// render ([`computed_statements`]) and is one control spelling
+    /// (`is_control`), or a string the statement builds that begins with a
+    /// control spelling and ends with one ([`several_controls`]), under a
+    /// name no statement binds another way. The template engine says the
+    /// values: the statements the load computes, alone, each followed by
+    /// its value behind a separator ([`VALUE_SEPARATOR`]), are rendered
+    /// once, the way a request's template is.
+    ///
+    /// None when one of those values holds a control spelling the load
+    /// cannot write as a literal: its statement reads a name that has no
+    /// one value, or another statement binds its name another way. The
+    /// template would write that control without marks wherever no probe
+    /// conversation goes, so it stays as it is. None when a statement
+    /// builds any other value that is not empty, whether a string or not
+    /// ([`NOT_A_STRING`]): it may be a piece of a control, which takes no
+    /// marks, and the template would complete that control where it writes
+    /// the piece. None as well when the template writes one of the
+    /// spellings whole by itself, in its text or in a string literal
+    /// ([`written_text`]): that template is of the other kind, and it says
+    /// so here. A comment that names a spelling is nothing the template
+    /// writes, and neither is the pattern a value is built from, nor the
+    /// literal of a statement that spells one control whole. Such a
+    /// statement binds its control like the ones that build theirs, where
+    /// the syntax, read again with it counted among them, shows its name
+    /// read as theirs ([`built_values_read_plainly`]); None where it does
+    /// not. The first read of the syntax stands before that one and counts
+    /// only the statements that build: a spelled control that a built value
+    /// is made from is a part of that value there ([`Watched::Part`]), and a
+    /// template that also writes it by its name stays as it is.
+    ///
+    /// `matcher`, the matcher over the added tokens, is asked for only at a
+    /// value a statement builds that is neither a control spelling nor
+    /// empty and that a plain literal holds ([`literal_quote`]): it says
+    /// where the control spellings stand in that value. A default prompt
+    /// with a line break in it, which the load takes for built, never asks.
+    fn control_bindings<'a>(
+        &self,
+        is_control: &dyn Fn(&str) -> bool,
+        matcher: &dyn Fn() -> Option<&'a AddedTokens>,
+        special_tokens: &SpecialTokens,
+    ) -> Vec<ControlBinding> {
+        // Only a template that writes the values its root statements build
+        // may be marked: nothing is read again for any other.
+        let Some(plain) = self.env.as_ref().filter(|_| self.writes_built_constants) else {
+            return Vec::new();
+        };
+        let Ok(template) = plain.get_template("chat") else {
+            return Vec::new();
+        };
+        let source = template.source();
+        let sets = root_sets(source);
+        let namespaces = namespaces(&sets);
+        let (mut computed, unsettled) = computed_statements(sets);
+        let mut statements = String::new();
+        for statement in &computed {
+            let (start, end) = statement.span;
+            statements.push_str("{% set ");
+            statements.push_str(statement.name);
+            statements.push_str(" = ");
+            statements.push_str(&source[start..end]);
+            statements.push_str(" %}");
+            // A spelling is a string; a value of any other type is written
+            // as the byte that stands for one.
+            statements.push(char::from(VALUE_SEPARATOR));
+            statements.push_str("{{ ");
+            statements.push_str(statement.name);
+            statements.push_str(" if ");
+            statements.push_str(statement.name);
+            statements.push_str(" is string else '");
+            statements.push(char::from(NOT_A_STRING));
+            statements.push_str("' }}");
+        }
+        // The statements stand in a copy of this template's environment, in
+        // the template's place.
+        let mut alone = plain.clone();
+        if alone
+            .add_template_owned("chat".to_owned(), statements)
+            .is_err()
+        {
+            return Vec::new();
+        }
+        let messages = [serde_json::json!({"role": "user", "content": "probe"})];
+        let params = ChatTemplateParams {
+            add_generation_prompt: true,
+            special_tokens: Some(special_tokens),
+            now: Some(render_instant()),
+            ..Default::default()
+        };
+        let Ok((rendered, _)) = self.twin(alone).apply_with_continuation(&messages, params) else {
+            return Vec::new();
+        };
+        // One value behind each separator, in the statements' order; before
+        // the first the statements write nothing. A cut at an ASCII byte
+        // leaves each piece the text it was.
+        let values: Vec<&str> = rendered
+            .split(char::from(VALUE_SEPARATOR))
+            .skip(1)
+            .collect();
+        if values.len() != computed.len() {
+            return Vec::new();
+        }
+        // What the template writes by itself, read once the source holds a
+        // control spelling somewhere. The expression of a statement that
+        // builds its value, or that spells one control whole, is no part of
+        // it: the template writes that literal only as the value.
+        let written_by_itself = || {
+            let bound: Vec<_> = computed
+                .iter()
+                .zip(&values)
+                .filter(|(statement, value)| statement.builds || is_control(value))
+                .map(|(statement, _)| statement.span.0..statement.span.1)
+                .collect();
+            written_text(source, |at| bound.iter().any(|span| span.contains(&at)))
+        };
+        let mut written = None;
+        let mut bindings = Vec::new();
+        // The statements that spell one control whole in a literal of their
+        // own.
+        let mut spelled = Vec::new();
+        for (index, (statement, &value)) in computed.iter().zip(&values).enumerate() {
+            let whole = is_control(value);
+            if !whole && (!statement.builds || value.is_empty()) {
+                continue;
+            }
+            if !statement.fixed || unsettled.contains(&statement.name) {
+                return Vec::new();
+            }
+            let controls = if whole {
+                Some(iter::once(0..value.len()).collect())
+            } else if literal_quote(value).is_none() {
+                // No plain literal holds the value (one that is no string
+                // among them): it could take no marks, and the matcher is
+                // not asked.
+                None
+            } else {
+                matcher().and_then(|added| several_controls(value, added))
+            };
+            // A built value that does not begin and end with a control may
+            // be a piece of one: the template would complete that control
+            // where it writes the piece, and no mark would stand around it.
+            let Some(controls) = controls else {
+                return Vec::new();
+            };
+            for control in &controls {
+                // The source holds the spelling: the template may write it
+                // whole by itself, in its text or in a string literal. In a
+                // comment, or in the pattern a value is built from, it
+                // writes nothing.
+                let spelling = &value[control.clone()];
+                if source.contains(spelling)
+                    && written
+                        .get_or_insert_with(written_by_itself)
+                        .iter()
+                        .any(|text| text.contains(spelling))
+                {
+                    return Vec::new();
+                }
+            }
+            if !statement.builds {
+                spelled.push(index);
+            }
+            bindings.push(ControlBinding {
+                span: statement.span,
+                value: value.to_owned(),
+                controls,
+            });
+        }
+        // A statement that spells one control whole binds it like the ones
+        // that build theirs only where the template reads its name as it may
+        // read theirs: the syntax is read again, with that statement counted
+        // among the ones that build.
+        if !spelled.is_empty() {
+            for index in spelled {
+                computed[index].builds = true;
+            }
+            let read_plainly = parse(source, "chat", SyntaxConfig {}, WhitespaceConfig::default())
+                .is_ok_and(|ast| built_values_read_plainly(&ast, &computed, &namespaces));
+            if !read_plainly {
+                return Vec::new();
+            }
+        }
+        bindings
+    }
+
+    /// This template compiled with the control spellings of `bindings`
+    /// between marks, when the marks are complete (see
+    /// [`Self::mark_built_controls`]).
+    fn built_controls_marked(
+        &self,
+        bindings: &[ControlBinding],
+        controls: &AddedTokens,
+        added: &[(&str, bool)],
+        special_tokens: &SpecialTokens,
+    ) -> Option<Environment<'static>> {
+        let plain = self.env.as_ref()?;
+        let template = plain.get_template("chat").ok()?;
+        let source = template.source();
+        if bindings.is_empty() {
+            return None;
+        }
+        let declined = |guard: &str| -> Option<Environment<'static>> {
+            tracing::debug!(
+                guard,
+                "the chat template binds control spellings and stays unmarked"
+            );
+            None
+        };
+        // A template that writes an added token whole by itself is of the
+        // other kind: its spellings would want the scan of `mark_controls`,
+        // which is not made here. What the template writes is asked, not
+        // its source: in a comment, or in the pattern a bound spelling is
+        // built from, the template writes none, and pieces that stand side
+        // by side write one whole, so they are asked joined and each by
+        // itself, and every piece once more glued in the order of the
+        // source: a render may write nothing between two that follow each
+        // other. A render may also write one piece right after any other,
+        // wherever the two stand in the source, so a token the pieces
+        // spell between them in any order counts as written whole.
+        let bound = |at| {
+            bindings
+                .iter()
+                .any(|binding| (binding.span.0..binding.span.1).contains(&at))
+        };
+        let written = written_text(source, bound);
+        if written
+            .iter()
+            .any(|text| controls.ranges(text).next().is_some())
+            || spelled_across(&written, added)
+        {
+            return declined("it writes an added token whole by itself");
+        }
+        let Some(literals) = with_marked_literals(source, bindings) else {
+            return declined("no string literal holds one of the spellings");
+        };
+        let Ok(marked) = build_environment(literals) else {
+            return declined("the template does not compile with the spellings as literals");
+        };
+        let marked = self.twin(marked);
+        if !self
+            .twin(plain.clone())
+            .marks_every_control(&marked, controls, special_tokens)
+        {
+            return declined(
+                "the marked template does not stand for it on the probe conversations",
+            );
+        }
+        marked.env
+    }
+
+    /// Whether `marked`, this template compiled with its control spellings
+    /// between marks, stands for this one on the probe conversations; both
+    /// are templates alone ([`Self::twin`]).
+    ///
+    /// The syntax already shows that `marked` writes this template's text at
+    /// every render ([`built_values_read_plainly`]). What no syntax shows is
+    /// a control the template puts together outside its constants, out of
+    /// pieces of text side by side: on each conversation, with the
+    /// generation prompt and without, under each value of the thinking
+    /// switch the gateway passes by itself, `marked` must write the text
+    /// this template writes, every added token in it between marks. Then no
+    /// control the template writes there would be encoded as text, and a
+    /// request that types no spelling is encoded as it was. The bare turn
+    /// must render, and a control must be written.
+    ///
+    /// A conversation this template refuses is not judged; `marked` must
+    /// refuse it as well.
+    fn marks_every_control(
+        &self,
+        marked: &Self,
+        controls: &AddedTokens,
+        special_tokens: &SpecialTokens,
+    ) -> bool {
+        let marked_tokens = marks::marked_special_tokens(special_tokens);
+        let now = render_instant();
+        let with_prompt = (true, None);
+        let switch: &[Option<bool>] = if self.thinking_key_name.is_some() {
+            &[None, Some(true), Some(false)]
+        } else {
+            &[None]
+        };
+        let mut writes_a_control = false;
+        for (index, probe) in probes(self.raw_tool_call_arguments).iter().enumerate() {
+            for prompt in [true, false] {
+                for thinking in switch {
+                    let mode = (prompt, *thinking);
+                    let Ok((expected, _)) = self.apply_with_continuation(
+                        &probe.messages,
+                        probe.params(special_tokens, now, mode),
+                    ) else {
+                        let refused = marked
+                            .apply_with_continuation(
+                                &probe.messages,
+                                probe.params(&marked_tokens, now, mode),
+                            )
+                            .is_err();
+                        if (index == 0 && mode == with_prompt) || !refused {
+                            return false;
+                        }
+                        continue;
+                    };
+                    let Ok((rendered, _)) = marked.apply_with_continuation(
+                        &probe.messages,
+                        probe.params(&marked_tokens, now, mode),
+                    ) else {
+                        return false;
+                    };
+                    let Ok((text, written)) = marks::flatten(&rendered) else {
+                        return false;
+                    };
+                    if text != expected || !controls.ranges(&text).eq(written.iter().cloned()) {
+                        return false;
+                    }
+                    writes_a_control |= !written.is_empty();
+                }
+            }
+        }
+        writes_a_control
+    }
+
     /// [`Self::set`] and [`Self::mark_controls`] as one step: the template
     /// is replaced only when it both builds and marks, so a template that
     /// fails to mark leaves the previous one in force, marks included (set
@@ -3510,6 +5054,7 @@ impl ChatTemplateState {
             thinking_key_name,
             prefill_opens_think_block,
             names_read,
+            writes_built_constants,
         } = detect_all(&template);
         let developer_role_supported = detect_developer_role_support(&template);
         let root_role_supported = detect_root_role_support(&template);
@@ -3522,6 +5067,7 @@ impl ChatTemplateState {
         self.think_in_prefill = think_in_prefill;
         self.prefill_opens_think_block = prefill_opens_think_block;
         self.names_read = names_read;
+        self.writes_built_constants = writes_built_constants;
         self.env = Some(env);
         // A replacement template stands alone, as a template file does.
         self.tool_use = None;

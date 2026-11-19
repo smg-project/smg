@@ -1,14 +1,20 @@
 //! The view and the lifecycle as the protocol carries them, and the answer
 //! as the host reads it back. The exposure decides what of the identities
-//! and headers crosses, as it does for the WebAssembly worlds. A frame is a
-//! fresh message (the stream takes it whole); the messages rendered from the
-//! engine's types as the WIT is are a later step.
+//! and headers crosses, as it does for the WebAssembly worlds, and the
+//! plugin's declared needs whether the request's block hashes do. A frame is
+//! a fresh message (the stream takes it whole); the messages rendered from
+//! the engine's types as the WIT is are a later step.
 
 use crate::{
+    counts::with_counts,
     decision::{Decision, Target, Trace},
     lease::{Lease, LeaseKind, Membership, Outcome, ReleaseReason, Side, Signal, TransportClass},
-    plugins::config::{Exposure, Reveal},
+    plugins::{
+        config::{Exposure, Reveal},
+        shown_hashes,
+    },
     proto,
+    spec::Needs,
     view::{
         AffinityFacts, Candidate, HashKind, Health, Identity, LoadRow, OverloadRegime, Phase,
         PoolFacts, RequestFacts, Role, SignalSource, WireModes, ZoneCapacity,
@@ -120,8 +126,9 @@ fn load(row: &LoadRow) -> proto::LoadRow {
 
 /// One candidate as the frame carries it: the row, and the affinity facts the
 /// host holds for it beside the row (`held`), which the record carries as
-/// five of its own fields.
-fn candidate(c: &Candidate, held: AffinityFacts) -> proto::Candidate {
+/// five of its own fields. Its requests in flight are what the request's
+/// facts read for it (`in_flight`).
+fn candidate(c: &Candidate, held: AffinityFacts, in_flight: u32) -> proto::Candidate {
     proto::Candidate {
         id: c.id.0,
         role: role(c.role),
@@ -131,7 +138,7 @@ fn candidate(c: &Candidate, held: AffinityFacts) -> proto::Candidate {
         wire_modes: wire_bits(c.wire_modes),
         engine_kind: u32::from(c.engine_kind),
         connector: u32::from(c.connector),
-        in_flight: c.in_flight,
+        in_flight,
         load: c.load.as_ref().map(load),
         overlap_blocks: held.overlap_blocks,
         predicted_blocks: held.predicted_blocks,
@@ -205,9 +212,10 @@ pub(crate) fn exposure(e: &Exposure) -> proto::Exposure {
     }
 }
 
-/// The request under the plugin's exposure. The budget is written when the
-/// frame is sent: what the decision has left at that instant.
-fn request(facts: &RequestFacts<'_>, exposure: &Exposure) -> proto::RequestFacts {
+/// The request under the plugin's exposure and its declared needs. The
+/// budget is written when the frame is sent: what the decision has left at
+/// that instant.
+fn request(facts: &RequestFacts<'_>, exposure: &Exposure, needs: Needs) -> proto::RequestFacts {
     proto::RequestFacts {
         model: facts.model.to_owned(),
         namespace_seed: facts.namespace_seed,
@@ -216,7 +224,7 @@ fn request(facts: &RequestFacts<'_>, exposure: &Exposure) -> proto::RequestFacts
         streaming: facts.streaming,
         max_output_tokens: facts.max_output_tokens,
         prompt_tokens: facts.prompt_tokens,
-        block_hashes: facts.block_hashes.to_vec(),
+        block_hashes: shown_hashes(facts, needs).to_vec(),
         hash_kind: hash_kind(facts.hash_kind),
         session_key: session_identity(facts, exposure.session_key),
         phase: phase(facts.phase),
@@ -263,25 +271,26 @@ fn pool(p: &PoolFacts<'_>) -> proto::PoolFacts {
     }
 }
 
-/// One decision's frame: the view under the plugin's exposure. The stages
-/// asked, the two budgets and a pick-only ask's combined scores are written
-/// when the frame is sent ([`stamp`]).
+/// One decision's frame: the view under the plugin's exposure and its
+/// declared needs. The stages asked, the two budgets and a pick-only ask's
+/// combined scores are written when the frame is sent ([`stamp`]).
 pub(crate) fn decide(
     decision_id: u64,
     facts: &RequestFacts<'_>,
     candidates: &[Candidate],
     pool_facts: &PoolFacts<'_>,
     exposure: &Exposure,
+    needs: Needs,
 ) -> proto::PluginDecide {
     proto::PluginDecide {
         decision_id,
-        request: Some(request(facts, exposure)),
+        request: Some(request(facts, exposure, needs)),
         // A candidate's affinity facts ride the request's column, by its
         // index: the same index reads the row and its entry.
-        candidates: (0u32..)
+        candidates: with_counts!(facts, |counts| (0u32..)
             .zip(candidates)
-            .map(|(index, c)| candidate(c, facts.affinity_at(index)))
-            .collect(),
+            .map(|(index, c)| candidate(c, facts.affinity_at(index), counts(c)))
+            .collect()),
         pool: Some(pool(pool_facts)),
         stages: 0,
         scores_in: Vec::new(),
@@ -366,6 +375,7 @@ fn trace(t: &Trace) -> proto::Trace {
         fallback: false,
         affinity_source: 0,
         drew_first: t.drew_first(),
+        lifted: proto::LiftedVeto::from(t.lifted) as i32,
     }
 }
 
@@ -470,9 +480,16 @@ pub(crate) fn released(l: &Lease, r: ReleaseReason) -> proto::lifecycle_event::E
     })
 }
 
+/// A membership word as the plugin contract carries it. A stream whose
+/// protocol version has no kind for a word is not sent it ([`since`]).
 pub(crate) fn membership(m: &Membership<'_>) -> proto::lifecycle_event::Event {
     use proto::membership_change::Kind;
+    let mut models = Vec::new();
     let (kind, worker_id, old_worker_id, ids) = match m {
+        Membership::Left { id, models: left } => {
+            models.extend_from_slice(left);
+            (Kind::Left, id.0, 0, Vec::new())
+        }
         Membership::Added(w) => (Kind::Added, w.0, 0, Vec::new()),
         Membership::Removed(w) => (Kind::Removed, w.0, 0, Vec::new()),
         Membership::Replaced { old, new } => (Kind::Replaced, new.0, old.0, Vec::new()),
@@ -487,7 +504,19 @@ pub(crate) fn membership(m: &Membership<'_>) -> proto::lifecycle_event::Event {
         worker_id,
         old_worker_id,
         ids,
+        models,
     })
+}
+
+/// The first protocol version whose streams carry `event`. A stream on an
+/// older one is not sent it, and hears what it heard before the word came.
+#[inline]
+pub(crate) fn since(event: &proto::lifecycle_event::Event) -> u32 {
+    use proto::{lifecycle_event::Event, membership_change::Kind};
+    match event {
+        Event::Membership(change) if change.kind == Kind::Left as i32 => 2,
+        _ => 1,
+    }
 }
 
 /// A signal; a veto's instant on the host's clock becomes the microseconds
@@ -668,7 +697,8 @@ pub(crate) fn read(
 
 #[cfg(test)]
 mod tests {
-    use super::{proto, Answer, Invalid, FILTER, PICK, SCORE};
+    use super::{membership, proto, since, Answer, Invalid, FILTER, PICK, SCORE};
+    use crate::{lease::Membership, view::WorkerId};
 
     /// The stages' rules, under a plugin that declared no counter.
     fn read(d: proto::PluginDecision, asked: u32, count: u32) -> Result<Answer, Invalid> {
@@ -858,6 +888,110 @@ mod tests {
         assert_eq!(a.pick, Some(2));
     }
 
+    /// A frame carries the request's block hashes for a row that declares
+    /// them in either form, the first of a list past the contract's range,
+    /// and none for a row that declares neither, whatever else it declares.
+    #[test]
+    fn a_frame_carries_the_block_hashes_its_row_declares() {
+        use crate::{
+            plugins::config::Exposure,
+            spec::{Needs, MAX_BLOCK_HASHES},
+            view::{PoolFacts, RequestFacts},
+        };
+
+        let most = usize::try_from(MAX_BLOCK_HASHES).expect("the range fits a length");
+        let held: Vec<u64> = (1..).take(most + 2).collect();
+        let sent = |list: &[u64], needs: Needs| {
+            let facts = RequestFacts {
+                model: "m",
+                block_hashes: list,
+                ..RequestFacts::default()
+            };
+            super::decide(
+                1,
+                &facts,
+                &[],
+                &PoolFacts::default(),
+                &Exposure::default(),
+                needs,
+            )
+            .request
+            .expect("a frame carries its request")
+            .block_hashes
+        };
+        let tokens = Needs {
+            token_hashes: true,
+            ..Needs::default()
+        };
+        let text = Needs {
+            text_hashes: true,
+            ..Needs::default()
+        };
+        // Every other need, and neither form of the hashes.
+        let neither = Needs {
+            text: true,
+            token_hashes: false,
+            text_hashes: false,
+            loads: true,
+            events: true,
+            ring: true,
+            headers: true,
+            media: true,
+            active_sessions: true,
+            session_in_flight: true,
+            affinity: true,
+            sample: 8,
+        };
+        assert_eq!(sent(&held[..3], tokens), [1, 2, 3]);
+        assert_eq!(sent(&held[..3], text), [1, 2, 3]);
+        assert!(sent(&held[..3], Needs::default()).is_empty());
+        assert!(sent(&held, neither).is_empty());
+        assert_eq!(
+            sent(&held[..most], tokens),
+            held[..most],
+            "a list at the range, whole"
+        );
+        assert_eq!(
+            sent(&held, tokens),
+            held[..most],
+            "the first of a longer list"
+        );
+    }
+
+    /// The frame carries each candidate's requests in flight as the
+    /// request's facts read them: the lent count where the host lends a
+    /// table, the rows themselves reading zero.
+    #[test]
+    fn the_frame_gives_a_row_the_count_its_request_reads() {
+        use crate::{
+            counts::tests::Lent,
+            plugins::config::Exposure,
+            spec::Needs,
+            view::{Candidate, PoolFacts, RequestFacts},
+        };
+
+        let mut rows: Vec<Candidate> = (0..)
+            .zip([4, 0, 9])
+            .map(|(position, in_flight)| Candidate {
+                position,
+                in_flight,
+                ..Candidate::default()
+            })
+            .collect();
+        let lent = Lent::take(&mut rows);
+        let facts = lent.beside(&RequestFacts::default());
+        let frame = super::decide(
+            1,
+            &facts,
+            &rows,
+            &PoolFacts::default(),
+            &Exposure::default(),
+            Needs::default(),
+        );
+        let read: Vec<u32> = frame.candidates.iter().map(|c| c.in_flight).collect();
+        assert_eq!(read, [4, 0, 9]);
+    }
+
     /// The view's trace is the contract's pair. A counted trace leaves with
     /// its count and no word of a draw; a drawn one leaves with the count
     /// unset, which is no zero, and `drew_first` set.
@@ -882,11 +1016,32 @@ mod tests {
         assert_eq!((wire.survivors, wire.drew_first), (None, true));
     }
 
+    /// The trace a plugin is shown carries the veto the all-vetoed rule
+    /// lifted, and none for a pick no rule made.
+    #[test]
+    fn the_views_trace_carries_the_lifted_veto() {
+        use crate::decision::{Lifted, Trace};
+        let steered = Trace {
+            lifted: Lifted::Overload,
+            ..Trace::default()
+        };
+        assert_eq!(
+            super::trace(&steered).lifted,
+            proto::LiftedVeto::Overload as i32
+        );
+        assert_eq!(
+            super::trace(&Trace::default()).lifted,
+            proto::LiftedVeto::None as i32
+        );
+    }
+
     /// A measurement for the Numbers table, not a check: run in release
     /// with `--ignored measure --nocapture`. What one frame costs before
     /// the stream takes it, with a load row on every candidate: the message
     /// built from the view (the deciding thread's share), its encoding (the
-    /// I/O thread's) and its size on the wire.
+    /// I/O thread's) and its size on the wire. The row declares the
+    /// request's hashes, and the last two frames carry a prompt's: the
+    /// view's default of 256 and the contract's most.
     #[test]
     #[ignore = "a measurement for the Numbers table; run in release with --nocapture"]
     #[expect(
@@ -900,6 +1055,7 @@ mod tests {
 
         use crate::{
             plugins::config::Exposure,
+            spec::{Needs, MAX_BLOCK_HASHES},
             view::{Candidate, LoadRow, PoolFacts, RequestFacts, WorkerId},
         };
 
@@ -911,7 +1067,24 @@ mod tests {
             ..RequestFacts::default()
         };
         let exposure = Exposure::default();
-        for n in [8u32, 64, 128, 512] {
+        let needs = Needs {
+            token_hashes: true,
+            ..Needs::default()
+        };
+        let prompt: Vec<u64> = (1..=u64::from(MAX_BLOCK_HASHES)).collect();
+        let frames = [
+            (8u32, 0),
+            (64, 0),
+            (128, 0),
+            (512, 0),
+            (64, 256),
+            (64, prompt.len()),
+        ];
+        for (n, hashes) in frames {
+            let facts = RequestFacts {
+                block_hashes: &prompt[..hashes],
+                ..facts
+            };
             let candidates: Vec<Candidate> = (0..n)
                 .map(|i| Candidate {
                     position: i,
@@ -939,6 +1112,7 @@ mod tests {
                     black_box(&candidates),
                     &pool,
                     &exposure,
+                    needs,
                 ));
             }
             let build = started.elapsed().as_nanos() / u128::from(rounds);
@@ -949,6 +1123,7 @@ mod tests {
                     &candidates,
                     &pool,
                     &exposure,
+                    needs,
                 ))),
             };
             let mut wire = Vec::with_capacity(request.encoded_len());
@@ -961,9 +1136,30 @@ mod tests {
             }
             let encode = started.elapsed().as_nanos() / u128::from(rounds);
             println!(
-                "a frame of {n} candidates: built in {build} ns, encoded in {encode} ns, {} bytes",
+                "a frame of {n} candidates and {hashes} block hashes: built in {build} ns, encoded in {encode} ns, {} bytes",
                 wire.len()
             );
         }
+    }
+
+    /// The contract carries the models a worker left as a kind of protocol
+    /// 2: the mapper hands a plugin the word with its models, and the
+    /// write's own word as a kind every version carries.
+    #[test]
+    fn a_plugin_is_told_the_models_a_worker_left_as_a_kind_of_protocol_2() {
+        let (id, models) = (WorkerId(7), ["m".to_string()]);
+        let left = Membership::Left {
+            id,
+            models: &models,
+        };
+        let word = membership(&left);
+        assert_eq!(since(&word), 2);
+        let proto::lifecycle_event::Event::Membership(change) = word else {
+            panic!("a membership word");
+        };
+        let kind = proto::membership_change::Kind::Left as i32;
+        assert_eq!((change.kind, change.worker_id), (kind, 7));
+        assert_eq!(change.models, models);
+        assert_eq!(since(&membership(&Membership::Relabelled(id))), 1);
     }
 }

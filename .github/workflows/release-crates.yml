@@ -13,7 +13,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Tier 0: The crate the protocol crate of tier 1 depends on
+  # Tier 0: The workflow engine, which the worker crate of tier 1 names as an optional dependency. cargo wants
+  # every dependency of a crate it publishes on the registry first, an optional one too.
   tier0:
     # A candidate never reaches crates.io: its dispatch is a no-op (every tier needs this one), and the first step says
     # why when the job is reached anyway.
@@ -23,8 +24,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - crate: smg-worker
-            path: crates/worker
+          - crate: wfaas
+            path: crates/workflow
     steps:
       - name: Refuse a release candidate
         shell: bash
@@ -44,9 +45,21 @@ jobs:
           path: ${{ matrix.path }}
           token: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
-  # Tier 1: Crates with no internal dependencies but tier 0
+  # Tier 1: The worker crate, which the protocol crate of tier 2 depends on
   tier1:
     needs: tier0
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/publish-crate
+        with:
+          crate: smg-worker
+          path: crates/worker
+          token: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  # Tier 2: Crates with no internal dependencies but the two tiers above
+  tier2:
+    needs: tier1
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -60,8 +73,6 @@ jobs:
             path: crates/kv_index
           - crate: data-connector
             path: crates/data_connector
-          - crate: wfaas
-            path: crates/workflow
           - crate: smg-auth
             path: crates/auth
           - crate: smg-mcp
@@ -80,9 +91,9 @@ jobs:
           path: ${{ matrix.path }}
           token: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
-  # Tier 2: Crates depending on tier 1
-  tier2:
-    needs: tier1
+  # Tier 3: Crates depending on tier 2
+  tier3:
+    needs: tier2
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -104,6 +115,8 @@ jobs:
             path: crates/rl
           - crate: smg-external-router
             path: crates/external_router
+          - crate: smg-service-discovery
+            path: crates/service_discovery
           - crate: smg-symphony
             path: crates/symphony
     steps:
@@ -114,9 +127,9 @@ jobs:
           path: ${{ matrix.path }}
           token: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
-  # Tier 3: Crates depending on tier 2
-  tier3:
-    needs: tier2
+  # Tier 4: Crates depending on tier 3
+  tier4:
+    needs: tier3
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -136,9 +149,9 @@ jobs:
           path: ${{ matrix.path }}
           token: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
-  # Tier 4: Crates depending on tier 3
-  tier4:
-    needs: tier3
+  # Tier 5: Crates depending on tier 4
+  tier5:
+    needs: tier4
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -148,9 +161,9 @@ jobs:
           path: crates/engine_servicer
           token: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
-  # Tier 5: Main crate depending on all others
-  tier5:
-    needs: tier4
+  # Tier 6: Main crate depending on all others
+  tier6:
+    needs: tier5
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

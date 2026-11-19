@@ -19,10 +19,10 @@ use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
 use serde_json::{json, Value};
 use smg::{
     config::{RouterConfig, RoutingMode},
-    routers::RouterFactory,
-    worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType},
+    routers::{grpc::backend_client::BasicWorkerBuilder, RouterFactory},
 };
 use smg_data_connector::{create_storage, HistoryBackend, RedisConfig, StorageFactoryConfig};
+use smg_worker::identity::basic::{ConnectionMode, RuntimeType, WorkerType};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,

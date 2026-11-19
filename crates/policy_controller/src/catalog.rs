@@ -89,6 +89,13 @@ pub struct Catalog {
     filters: Vec<(&'static str, Factory<dyn Filter>)>,
     scorers: Vec<(&'static str, Build<dyn Scorer>)>,
     pickers: Vec<(&'static str, Build<dyn Picker>)>,
+    /// Whether the host makes the lifecycle's calls: a stage that needs
+    /// them ([`crate::Lifecycle::needs_lifecycle`]) is in no other build.
+    lifecycle: bool,
+    /// Whether the host records the prefixes it sent each worker: a
+    /// prefix-affinity source that reads them, alone or merged with the
+    /// index, is in no other build.
+    sent_prefixes: bool,
 }
 
 /// The factory of a built-in that takes no parameter.
@@ -131,7 +138,37 @@ impl Catalog {
                 ("manual", of(|| Box::new(Manual))),
                 ("best-with-temperature", Build::Typed),
             ],
+            lifecycle: true,
+            sent_prefixes: true,
         }
+    }
+
+    /// The catalog of a host that makes some lifecycle calls only: the
+    /// validator refuses a stage that needs them, by name, as not in this
+    /// build.
+    #[cfg(any(test, feature = "controller"))]
+    pub(crate) fn without_lifecycle(mut self) -> Self {
+        self.lifecycle = false;
+        self
+    }
+
+    /// Whether the host makes the lifecycle's calls.
+    pub(crate) fn makes_lifecycle_calls(&self) -> bool {
+        self.lifecycle
+    }
+
+    /// The catalog of a host that records no prefix it sent: the validator
+    /// refuses a prefix-affinity source that reads them, by its field, as
+    /// not in this build.
+    #[cfg(any(test, feature = "controller"))]
+    pub(crate) fn without_sent_prefixes(mut self) -> Self {
+        self.sent_prefixes = false;
+        self
+    }
+
+    /// Whether the host records the prefixes it sent each worker.
+    pub(crate) fn records_sent_prefixes(&self) -> bool {
+        self.sent_prefixes
     }
 
     /// Adds a filter under `name`: a document names it as it names a
@@ -249,13 +286,17 @@ fn find<T: ?Sized>(held: &[(&'static str, Build<T>)], name: &str) -> Option<Foun
         })
 }
 
-/// The names by kind; a factory has nothing to print.
+/// The names by kind and the host's two facts: whether it makes the
+/// lifecycle's calls and whether it records the prefixes sent; a factory
+/// has nothing to print.
 impl fmt::Debug for Catalog {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Catalog")
             .field("filters", &self.filters().collect::<Vec<_>>())
             .field("scorers", &self.scorers().collect::<Vec<_>>())
             .field("pickers", &self.pickers().collect::<Vec<_>>())
+            .field("lifecycle", &self.lifecycle)
+            .field("sent_prefixes", &self.sent_prefixes)
             .finish()
     }
 }
@@ -394,6 +435,79 @@ mod tests {
         catalog
     }
 
+    /// The highest id is the best, by state the lifecycle's calls keep.
+    #[derive(Debug)]
+    struct Kept;
+
+    impl Lifecycle for Kept {
+        fn needs_lifecycle(&self) -> bool {
+            true
+        }
+    }
+
+    impl Scorer for Kept {
+        fn name(&self) -> &'static str {
+            "kept"
+        }
+
+        fn score(
+            &self,
+            _: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            out: &mut [f32],
+        ) -> TieBand {
+            id_shares(candidates, kept, out);
+            TieBand::NORMALIZED
+        }
+    }
+
+    /// Picks as [`Worst`] does, by state the lifecycle's calls keep.
+    #[derive(Debug)]
+    struct KeptPick;
+
+    impl Lifecycle for KeptPick {
+        fn needs_lifecycle(&self) -> bool {
+            true
+        }
+    }
+
+    impl Picker for KeptPick {
+        fn name(&self) -> &'static str {
+            "kept-pick"
+        }
+
+        fn pick(
+            &self,
+            facts: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            scores: &[f32],
+            band: TieBand,
+            out: &mut Targets,
+        ) {
+            Worst.pick(facts, candidates, kept, scores, band, out);
+        }
+    }
+
+    /// The module's stages and the two that need the lifecycle's calls.
+    fn kept_catalog() -> Catalog {
+        let mut catalog = catalog();
+        catalog
+            .scorer("kept", || Box::new(Kept))
+            .and_then(|catalog| catalog.picker("kept-pick", || Box::new(KeptPick)))
+            .expect("two free names");
+        catalog
+    }
+
+    /// The refusal of a stage that needs the lifecycle's calls, by its field.
+    fn lacks_lifecycle(path: &str) -> SpecError {
+        SpecError::NotInBuild {
+            path: path.to_string(),
+            what: "the lifecycle this stage needs",
+        }
+    }
+
     /// A document of one profile, `p`, written as JSON.
     fn spec(profile: &str) -> PolicySpec {
         serde_json::from_str(&format!(
@@ -441,6 +555,61 @@ mod tests {
             .validate_in(&catalog(), &[])
             .expect("the document names stages the catalog holds");
         pick(&engine)
+    }
+
+    #[test]
+    fn a_stage_that_needs_the_lifecycle_is_refused_where_the_host_makes_no_call() {
+        let unserved = kept_catalog().without_lifecycle();
+        for (profile, path) in [
+            (
+                r#"{"score":["kept"],"pick":"best"}"#,
+                "profiles.p.score[0].kept",
+            ),
+            (
+                r#"{"score":["high-id",{"kept":{"weight":2}}],"pick":"best"}"#,
+                "profiles.p.score[1].kept",
+            ),
+            (
+                r#"{"score":["high-id"],"pick":"kept-pick"}"#,
+                "profiles.p.pick",
+            ),
+        ] {
+            let refused = spec(profile).validate_in(&unserved, &[]).err();
+            assert_eq!(refused, Some(lacks_lifecycle(path)), "{profile}");
+        }
+        // A shape error the walk meets later outranks it, as it outranks
+        // any thing a build lacks.
+        let shape = spec(r#"{"score":["kept"],"pick":"manual"}"#)
+            .validate_in(&unserved, &[])
+            .err();
+        assert!(
+            matches!(&shape, Some(SpecError::PickerRunsNoScorer { .. })),
+            "{shape:?}"
+        );
+        // The host's word refuses no other stage, its own or a built-in.
+        let engine =
+            spec(r#"{"filter":["odd-ids"],"score":["high-id","least-requests"],"pick":"worst"}"#)
+                .validate_in(&unserved, &[])
+                .expect("no stage of the document needs the calls");
+        assert!(!engine.needs_lifecycle());
+    }
+
+    #[test]
+    fn a_host_that_makes_the_calls_runs_a_stage_that_needs_them() {
+        let served = kept_catalog();
+        for profile in [
+            r#"{"score":["kept"],"pick":"best"}"#,
+            r#"{"score":["high-id"],"pick":"kept-pick"}"#,
+        ] {
+            let engine = spec(profile)
+                .validate_in(&served, &[])
+                .expect("the host makes the calls");
+            assert!(engine.needs_lifecycle(), "{profile}");
+        }
+        let plain = spec(r#"{"score":["high-id"],"pick":"worst"}"#)
+            .validate_in(&served, &[])
+            .expect("stages the catalog holds");
+        assert!(!plain.needs_lifecycle());
     }
 
     #[test]

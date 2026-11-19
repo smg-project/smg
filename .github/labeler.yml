@@ -32,6 +32,7 @@ grpc:
   - changed-files:
       - any-glob-to-any-file:
           - 'crates/grpc_client/**/*'
+          - 'crates/worker/proto/**/*'
           - 'grpc_servicer/**/*'
           - 'model_gateway/src/routers/grpc/**/*'
 
@@ -97,7 +98,9 @@ mesh:
 
 model-gateway:
   - changed-files:
-      - any-glob-to-any-file: 'model_gateway/**/*'
+      - any-glob-to-any-file:
+          - 'model_gateway/**/*'
+          - 'crates/service_discovery/**/*'
 
 openai:
   - changed-files:
