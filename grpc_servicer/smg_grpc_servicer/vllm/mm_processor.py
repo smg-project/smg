@@ -490,7 +490,7 @@ class InProcessMediaProcessor:
         `media_fetch_failed`, and one over the download size cap
         `media_too_large`; a named host the policy refuses, and anything
         raised before the download (a URL, a domain or a data URL refused as
-        sent) or while decoding the bytes it delivered (an image that does
+        sent, a named URL aiohttp will not send) or while decoding the bytes it delivered (an image that does
         not decode, bad base64), is `invalid_multimodal_request`. vLLM wraps
         a download's error before it gets here, so the whole chain is read."""
         chain = list(_raised_from(exc))

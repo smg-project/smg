@@ -555,6 +555,78 @@ def test_the_connections_download_marks_what_it_raises(stub_vllm_connections, mo
     assert not guard.raised_by_fetch(ValueError("Failed to load image"))
 
 
+async def _download(self, url, **kwargs):
+    """vLLM's HTTPConnection.async_get_bytes, as far as these tests need."""
+    client = await self.get_async_client()
+    async with client.get(url) as response:
+        response.raise_for_status()
+        return await response.read()
+
+
+def test_a_named_url_aiohttp_will_not_send_is_refused_as_sent(stub_vllm_connections, monkeypatch):
+    # No host, or one that does not parse: aiohttp refuses the URL the request
+    # named before any hop is sent (some before the request even starts), the
+    # request's reference as sent. Its refusal of a redirect target is the
+    # fetch's, and does not leak into the next download in the same task.
+    connections = sys.modules["vllm.connections"]
+    monkeypatch.setattr(connections.HTTPConnection, "async_get_bytes", _download, raising=False)
+
+    async def run():
+        state = {"hits": 0}
+        runner, port = await _serve(_routes(state))
+        connection = guard.media_connector_kwargs(None, allow_private_hosts=True)["connection"]
+        try:
+            for redirect_first in (False, True):
+                if redirect_first:
+                    with pytest.raises(aiohttp.NonHttpUrlClientError) as raised:
+                        await connection.async_get_bytes(
+                            f"http://127.0.0.1:{port}/bounce?to=ftp://media.example/a.png"
+                        )
+                    assert guard.raised_by_fetch(raised.value)
+                for url in ("http://", "http://[::1"):
+                    with pytest.raises(aiohttp.InvalidURL) as raised:
+                        await connection.async_get_bytes(url)
+                    assert not guard.raised_by_fetch(raised.value), url
+            assert state["hits"] == 0
+        finally:
+            await connection._guarded.close()  # noqa: SLF001
+            await runner.cleanup()
+
+    asyncio.run(run())
+
+
+def test_concurrent_downloads_on_one_session_keep_their_own_hop(stub_vllm_connections, monkeypatch):
+    # One guarded session, many downloads at once: a redirect target refused
+    # in one never makes another's refusal of its named URL a redirect's, and
+    # the other way round.
+    connections = sys.modules["vllm.connections"]
+    monkeypatch.setattr(connections.HTTPConnection, "async_get_bytes", _download, raising=False)
+
+    async def run():
+        state = {"hits": 0}
+        runner, port = await _serve(_routes(state))
+        connection = guard.media_connector_kwargs(["localhost"], allow_private_hosts=True)[
+            "connection"
+        ]
+        target = f"http://127.0.0.1:{port}/media"
+        redirected = f"http://localhost:{port}/bounce?to={target}"
+        try:
+            urls = [redirected, target] * 16
+            results = await asyncio.gather(
+                *(connection.async_get_bytes(url) for url in urls), return_exceptions=True
+            )
+            for url, result in zip(urls, results, strict=True):
+                assert isinstance(result, MediaHostRefused), (url, result)
+                expected = guard.MediaRedirectRefused if url == redirected else MediaHostRefused
+                assert type(result) is expected, (url, result)
+            assert state["hits"] == 0
+        finally:
+            await connection._guarded.close()  # noqa: SLF001
+            await runner.cleanup()
+
+    asyncio.run(run())
+
+
 def test_the_connection_hands_vllm_the_guarded_session(stub_vllm_connections):
     async def run():
         kwargs = guard.media_connector_kwargs(None, allow_private_hosts=False)
@@ -669,6 +741,40 @@ def test_vllms_connector_wraps_a_named_host_and_a_redirect_refusal_apart(monkeyp
             assert await code_of(connector, target) == "invalid_multimodal_request"
             bounce = f"http://localhost:{port}/bounce?to={target}"
             assert await code_of(connector, bounce) == "media_fetch_failed"
+            assert state["hits"] == 0
+        finally:
+            session = connector.connection._guarded  # noqa: SLF001
+            if session is not None:
+                await session.close()
+            await runner.cleanup()
+
+    asyncio.run(run())
+
+
+def test_vllms_connector_refuses_a_url_with_no_host_as_sent():
+    # A named URL aiohttp will not send at all is the request's reference as
+    # sent, as the router answers it; the same refusal of a redirect target
+    # (a scheme it does not fetch) is a fetch that failed.
+    connector_module = pytest.importorskip("vllm.multimodal.media.connector")
+    from smg_grpc_servicer.vllm import mm_processor
+
+    processor = mm_processor.InProcessMediaProcessor.__new__(mm_processor.InProcessMediaProcessor)
+
+    async def code_of(connector, url):
+        with pytest.raises(Exception) as raised:  # noqa: B017 - vLLM's own wrapping
+            await connector.load_from_url_async(url, _RawBytes())
+        return processor._client_media_code(raised.value)  # noqa: SLF001
+
+    async def run():
+        state = {"hits": 0}
+        runner, port = await _serve(_routes(state))
+        connector = connector_module.MediaConnector(
+            **guard.media_connector_kwargs(None, allow_private_hosts=True)
+        )
+        try:
+            bounce = f"http://127.0.0.1:{port}/bounce?to=ftp://media.example/a.png"
+            assert await code_of(connector, bounce) == "media_fetch_failed"
+            assert await code_of(connector, "http://") == "invalid_multimodal_request"
             assert state["hits"] == 0
         finally:
             session = connector.connection._guarded  # noqa: SLF001

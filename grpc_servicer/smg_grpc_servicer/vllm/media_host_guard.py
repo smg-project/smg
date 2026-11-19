@@ -414,11 +414,21 @@ def guarded_connection(policy: MediaHostPolicy):
 
         async def async_get_bytes(self, *args: Any, **kwargs: Any) -> bytes:
             # The one network step of vLLM's loader: what fails here is the
-            # fetch, never the decode of the bytes it delivered.
+            # fetch, never the decode of the bytes it delivered. Except a URL
+            # the request named that aiohttp will not send at all (no host, a
+            # scheme it does not fetch): refused as the request sent it, so
+            # left unmarked; the same refusal of a redirect target is the
+            # fetch's. aiohttp may refuse the named URL before the request's
+            # start resets the hop, so the download resets it here first.
+            from aiohttp import InvalidURL, NonHttpUrlClientError
+
+            _HOP_IS_REDIRECT.set(False)
             try:
                 return await super().async_get_bytes(*args, **kwargs)
             except Exception as e:
-                mark_raised_by_fetch(e)
+                unsendable = isinstance(e, (InvalidURL, NonHttpUrlClientError))
+                if not unsendable or _HOP_IS_REDIRECT.get():
+                    mark_raised_by_fetch(e)
                 raise
 
     return GuardedHTTPConnection()
