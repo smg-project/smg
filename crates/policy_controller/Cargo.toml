@@ -433,5 +433,9 @@ harness = false
 name = "predictor"
 harness = false
 
+[[bench]]
+name = "sent"
+harness = false
+
 [lints]
 workspace = true
