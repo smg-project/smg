@@ -56,9 +56,10 @@
 //! its giving up, never across a decision. A worker's count is one atomic
 //! a row, whichever file books it. What a gateway's frame says of a lease
 //! is handed by its session to the file the lease's id names and applied
-//! by that file's decider at work: as it takes up its work, before a
-//! decision reads its rows' counts, at its issue, and once more before
-//! the decider waits on an empty queue. So a decision reads its own file
+//! by that file's decider at work: as it takes up its work, by each
+//! request it takes whatever its answer, ahead of the rows' counts a
+//! decision reads, at its issue, and once more before the decider
+//! waits on an empty queue. So a decision reads its own file
 //! behind everything handed to it, and a row another file books lags by
 //! that file's next take. Where a file's decider waits for a job the
 //! session applies what it hands. A lease leaves its file where its
@@ -542,7 +543,7 @@ impl Deciding {
     /// Decides until the last handle of the queue is dropped. With a job
     /// at hand the decider is at work at its own file of leases: what the
     /// sessions hand to that file is left to it, applied as it takes up
-    /// its work, before each decision reads its rows' counts, where the
+    /// its work, by each request it takes, refused or decided, where the
     /// file's turn is free, and at each issue. It leaves that work before
     /// it waits on an empty queue: what is handed meanwhile is applied by
     /// the session that hands it.
@@ -727,6 +728,28 @@ impl Deciding {
         answer
     }
 
+    /// What a request is refused for before anything is built, or the term
+    /// the fence shows at `now` with the request as taken then. The fence
+    /// is read first: a replica that does not lead builds nothing, and
+    /// says so before any other reason. A text is said next, ahead of the
+    /// budget, so its count holds every text a leader took.
+    fn judged<'a>(
+        &self,
+        request: &'a Checked,
+        gateway: GatewayId,
+        received: Instant,
+        now: Instant,
+    ) -> Result<(u64, Taken<'a>), Reason> {
+        let Reads { fence, counts, .. } = &self.reads;
+        let term = fence.leader_term(now).ok_or(Reason::NotLeader)?;
+        if request.has_text() {
+            counts.texts.fetch_add(1, Ordering::Relaxed);
+            return Err(Reason::Unspecified);
+        }
+        let taken = Taken::at(request, gateway, received, now);
+        Ok((term, taken.ok_or(Reason::BudgetGoneOnArrival)?))
+    }
+
     /// One request's decision with the term both reads of the fence showed
     /// and, where it is a pick, the lease issued for it with what is left
     /// of its dispatch span, or the reason its answer is `Busy`.
@@ -744,26 +767,21 @@ impl Deciding {
             ..
         } = &self.reads;
         let now = clock();
-        // The fence, read first: a replica that does not lead builds
-        // nothing, and says so before any other reason.
-        let term = fence.leader_term(now).ok_or(Reason::NotLeader)?;
-        if request.has_text() {
-            counts.texts.fetch_add(1, Ordering::Relaxed);
-            return Err(Reason::Unspecified);
+        let judged = self.judged(request, gateway, received, now);
+        // What the sessions handed is applied where the turn is free,
+        // whatever was judged: before the rows' counts are read, and by a
+        // request refused above too, so a hand at a full ring waits for
+        // one request of this decider at most.
+        if let Some(at_work) = &self.working {
+            at_work.apply();
         }
+        let (term, taken) = judged?;
         // The store's pins, lent to the decision: its engine asks them for
         // a key its own table holds no pin of, as after an apply of a new
         // generation.
         let pins = StorePins { store, now };
-        let taken = Taken::at(request, gateway, received, now)
-            .ok_or(Reason::BudgetGoneOnArrival)?
-            .lent(&pins);
+        let taken = taken.lent(&pins);
         let (buffers, own) = (&mut self.buffers, counts.part(self.index));
-        // What the sessions handed is applied before the rows' counts are
-        // read, where the turn is free.
-        if let Some(at_work) = &self.working {
-            at_work.apply();
-        }
         // One load of the world for the decision and for its lease: the
         // lease books the count that load laid beside its target's row,
         // and the engine told of it is the one that decided.
@@ -2702,6 +2720,65 @@ pub(crate) mod tests {
         decider.unsent(GATEWAY, answer);
         assert_eq!(live(), 0, "the release waited for the decider's next take");
         assert_eq!(bed.counts.faults.load(Ordering::Relaxed), 0);
+    }
+
+    /// A request refused before anything is built applies what is handed
+    /// too, so a hand at a full ring waits for one request of the file's
+    /// decider, whatever its answer. The decider here is a former leader
+    /// behind its closed fence whose gateway still asks it: it refuses each
+    /// request and never rests, and the hand is through all the same.
+    #[tokio::test]
+    async fn a_refused_request_applies_what_a_full_ring_holds() {
+        let mut bed = bed(Some(preset("random", 1)), true, (1, 8), []);
+        bed.ask(frame(1, 1)).await;
+        let hold = || {
+            let (reached, held) = std_mpsc::sync_channel(1);
+            let (go, word) = std_mpsc::sync_channel(1);
+            (Step::Hold { reached, go: word }, held, go)
+        };
+        // The second request is held at its read of the clock: its decider
+        // is at work, and what is handed is left to it.
+        let (first, held, go) = hold();
+        bed.script.steps.lock().push_back(first);
+        assert_eq!(bed.submit(frame(2, 1)), None);
+        held.recv_timeout(PATIENCE)
+            .expect("the decider reads the clock");
+        // The ring fills, and one hand more waits at it.
+        let gone = || Said::Released(None, ReleaseReason::ClientGone);
+        let hand = lifecycle::open(&bed.store, GATEWAY);
+        for _ in 0..MemoryStore::HANDOVER {
+            bed.store.hand(&hand, LeaseId(0), gone());
+        }
+        let (through, handed) = std_mpsc::channel();
+        let store = Arc::clone(&bed.store);
+        let waiting = thread::spawn(move || {
+            store.hand(&lifecycle::open(&store, GATEWAY), LeaseId(0), gone());
+            through.send(()).expect("the case waits for the hand");
+        });
+        // The lead is an hour gone at every read from here on. Two more
+        // requests wait behind the held one, and the last is held at its
+        // read of the clock: by then the decider has refused two requests
+        // and has not rested.
+        let hour = Duration::from_secs(3600);
+        let (last, held, last_go) = hold();
+        *bed.script.shown.lock() = hour;
+        bed.script.steps.lock().extend([Step::At(hour), last]);
+        assert_eq!(bed.submit(frame(3, 1)), None);
+        assert_eq!(bed.submit(frame(4, 1)), None);
+        go.send(()).expect("the decider holds the other end");
+        held.recv_timeout(PATIENCE)
+            .expect("the decider reads the clock for the last request");
+        let handed = handed.recv_timeout(PATIENCE);
+        last_go.send(()).expect("the decider holds the other end");
+        handed.expect("a refused request applies what the ring holds");
+        waiting.join().expect("the hand's thread");
+        for id in 2..=4 {
+            let answer = bed.answer().await;
+            assert_eq!(
+                (busy(&answer), answer.request_id.as_slice()),
+                (Reason::NotLeader, &[id][..])
+            );
+        }
     }
 
     /// A lease's dispatch span counts from its decision's first read, and

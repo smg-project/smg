@@ -559,10 +559,11 @@ impl MemoryStore {
     /// or this caller where none is. A full ring stops its caller until a
     /// holder applied, so no frame is dropped: the caller applies where
     /// no thread is at work, and waits for the one that is, which looks
-    /// at its ring ahead of each decision. The caller's thread is held
-    /// for that wait, one decision of the file's decider at most: it
-    /// yields 64 times, then sleeps 50 microseconds between its looks, so
-    /// a slow decision costs its waiting hands no core.
+    /// at its ring at each request it takes, whatever its answer. The
+    /// caller's thread is held for that wait, one request of the file's
+    /// decider at most: it yields `FULL_RING_YIELDS` times, then sleeps
+    /// `FULL_RING_SLEEP` between its looks, so a slow decision costs its
+    /// waiting hands no core.
     pub fn hand(&self, hand: &Hand, lease: LeaseId, said: Said) {
         let at = self.file_of(lease);
         let file = &self.files[at];
