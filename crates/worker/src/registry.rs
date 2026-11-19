@@ -184,8 +184,8 @@ pub struct WorkerRegistry<G> {
     /// once, with the registry.
     empty_generation: Arc<G>,
 
-    /// Monotonic membership generation; bumped on every register / replace /
-    /// remove.
+    /// Membership generation; bumped on every register / replace / remove.
+    /// `usize::MAX` is reserved for the stale snapshot marker.
     global_epoch: AtomicUsize,
 
     /// Orders membership writes against rebuild scans. Mutators hold the
@@ -2129,7 +2129,15 @@ impl<G: Generation> WorkerRegistry<G> {
     /// worker-map mutation and this bump, so the rebuild scan cannot observe
     /// a half-applied write.
     fn bump_global_routing_epoch(&self) {
-        self.global_epoch.fetch_add(1, Ordering::Release);
+        self.global_epoch
+            .update(Ordering::Release, Ordering::Relaxed, |epoch| {
+                let next = epoch.wrapping_add(1);
+                if next == usize::MAX {
+                    0
+                } else {
+                    next
+                }
+            });
         let previous = self
             .global_routing_snapshot
             .swap(Arc::new(GlobalRoutingSnapshot {
