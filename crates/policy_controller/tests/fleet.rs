@@ -240,6 +240,7 @@ fn ask(id: &[u8]) -> DecideRequest {
             ..RequestFacts::default()
         }),
         constraints: None,
+        again: false,
     }
 }
 

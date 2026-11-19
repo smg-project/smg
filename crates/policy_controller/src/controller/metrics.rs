@@ -88,6 +88,11 @@ pub const DECIDE_HASHES_CUT_TOTAL: &str = "smg_policy_controller_decide_hashes_c
 /// that had ended, `queue_full` for one whose queue had no place, which a
 /// stream's window rules out.
 pub const DECIDE_ANSWERS_DROPPED_TOTAL: &str = "smg_policy_controller_decide_answers_dropped_total";
+/// Decide requests their gateway said it asked again, holding no answer to
+/// the first ask, by what became of the lease that ask was issued
+/// (`earlier_lease`): `ended` where it still waited for a dispatch, `none`
+/// where no lease of the request waited.
+pub const DECIDE_ASKED_AGAIN_TOTAL: &str = "smg_policy_controller_decide_asked_again_total";
 /// Candidates a gateway's wires took from its decisions: members that
 /// share no wire with the gateway that asked.
 pub const DECIDE_CANDIDATES_UNDIALED_TOTAL: &str =
@@ -170,6 +175,8 @@ struct DecideCounters {
     hashes_cut: Counter,
     /// `queue_full`, `stream_gone`.
     dropped: [Counter; 2],
+    /// `none`, `ended`: in the order of [`Counts::again`].
+    again: [Counter; 2],
     undialed: Counter,
     outlasted: Counter,
 }
@@ -255,6 +262,11 @@ impl Metrics {
             "Answers no decide stream took, by cause".into(),
         );
         recorder.describe_counter(
+            KeyName::from_const_str(DECIDE_ASKED_AGAIN_TOTAL),
+            None,
+            "Decide requests asked again, by what became of the earlier lease".into(),
+        );
+        recorder.describe_counter(
             KeyName::from_const_str(DECIDE_CANDIDATES_UNDIALED_TOTAL),
             None,
             "Candidates a gateway's wires took from its decisions".into(),
@@ -324,6 +336,8 @@ impl Metrics {
                 .register_counter(&Key::from_name(DECIDE_HASHES_CUT_TOTAL), &metadata),
             dropped: ["queue_full", "stream_gone"]
                 .map(|cause| counter(DECIDE_ANSWERS_DROPPED_TOTAL, "cause", cause)),
+            again: ["none", "ended"]
+                .map(|lease| counter(DECIDE_ASKED_AGAIN_TOTAL, "earlier_lease", lease)),
             undialed: recorder
                 .register_counter(&Key::from_name(DECIDE_CANDIDATES_UNDIALED_TOTAL), &metadata),
             outlasted: recorder
@@ -452,6 +466,9 @@ impl Metrics {
         self.decides.hashes_cut.absolute(counts.hashes_cut());
         let dropped = [&counts.dropped_full, &counts.dropped_gone];
         for (counter, count) in self.decides.dropped.iter().zip(dropped) {
+            counter.absolute(read(count));
+        }
+        for (counter, count) in self.decides.again.iter().zip(&counts.again) {
             counter.absolute(read(count));
         }
         self.decides.undialed.absolute(counts.undialed());
@@ -734,6 +751,10 @@ mod tests {
                 "decide_answers_dropped_total",
                 &["queue_full", "stream_gone"].map(|cause| format!("{{cause=\"{cause}\"}}"))[..],
             ),
+            (
+                "decide_asked_again_total",
+                &["none", "ended"].map(|lease| format!("{{earlier_lease=\"{lease}\"}}"))[..],
+            ),
             ("decide_candidates_undialed_total", &[String::new()][..]),
             ("decide_budget_outlasted_total", &[String::new()][..]),
         ] {
@@ -754,6 +775,8 @@ mod tests {
             &counts.outlasted,
             &counts.unleased,
             &counts.awaited,
+            &counts.again[0],
+            &counts.again[1],
         ]);
         for (count, value) in all.zip(1..) {
             count.store(value, Ordering::Relaxed);
@@ -786,6 +809,8 @@ mod tests {
             "decide_budget_outlasted_total 12",
             "decide_no_decision_total{cause=\"lease_ids_spent\"} 13",
             "decide_no_decision_total{cause=\"document_awaited\"} 14",
+            "decide_asked_again_total{earlier_lease=\"none\"} 15",
+            "decide_asked_again_total{earlier_lease=\"ended\"} 16",
             "decide_candidates_undialed_total 31",
             "decide_hashes_cut_total 42",
         ] {

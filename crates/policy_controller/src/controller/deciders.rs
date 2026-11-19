@@ -78,8 +78,9 @@
 //! waits for a job. Their engine is told under the turn where its
 //! generation still stands. So a lease whose answer never reached its
 //! gateway (an answer in the queue of a stream that then ended, a
-//! decision that panicked past its issue) stands until its deadline and
-//! then the next issue of its file or the sweep's next tick. A decision
+//! decision that panicked past its issue) stands until its gateway asks
+//! the request again, or else until its deadline and then the next issue
+//! of its file or the sweep's next tick. A decision
 //! its stream stops at the send is none of them: the stream hands its
 //! lease's release there, as a session hands a frame's
 //! ([`super::decide`]). Nor is an answer its stream's queue does not
@@ -95,13 +96,29 @@
 //! its own worker's count and living by its own frames. Both leases are
 //! credits: nothing reserves a decode room yet.
 //!
-//! What a lease does not do yet. A request sent twice under one id is
-//! issued two leases. A stage hears a lease's issue here, its release
-//! where its decider's last read or its stream's send stops its answer or
-//! its stream's queue refuses it, its dispatch, completion and release at
-//! its gateway's word and its end at the dispatch deadline, and not the
-//! end of a lease whose gateway was let go: a document that names a stage
-//! in need of the calls stays refused.
+//! One lease stands for a request its gateway asks again. A gateway whose
+//! stream ended with a request unanswered sends it again and says so
+//! (`DecideRequest.again`). The request's decider then ends the lease the
+//! earlier ask was issued, where it still waits for a dispatch, as the
+//! dispatch deadline would end it ([`MemoryStore::asked_again`]), and
+//! decides the request as any other. The earlier lease is on that
+//! decider's file: a model's requests go to one decider for the process's
+//! life ([`Deciders::of`]). A request sent twice under one id without the
+//! word is two requests and is issued two leases: a lease is keyed by its
+//! gateway and the id the store mints, and no two asks are joined by the
+//! id their asker states. A repeat its stream answers `Busy` before a
+//! decider takes it (no credit, a full queue, a budget of 0) ends
+//! nothing: the earlier lease waits out its deadline. The word is for a
+//! stream that ended: an answer that waits in an open stream's queue is
+//! not held back, and it leaves with the lease the word ended.
+//!
+//! What a lease does not do yet. A stage hears a lease's issue here, its
+//! release where its decider's last read or its stream's send stops its
+//! answer or its stream's queue refuses it, its dispatch, completion and
+//! release at its gateway's word and its end at the dispatch deadline or
+//! where its request is asked again, and not the end of a lease whose
+//! gateway was let go: a document that names a stage in need of the calls
+//! stays refused.
 //!
 //! A term mints 2^32 - 1 ids, and under every term but the last a leader
 //! leaves before they end. The first answer a term hands over with an id at
@@ -231,6 +248,10 @@ pub(crate) struct Counts {
     /// replica under a shared lease waited for its first lead. Each leaves
     /// as `Busy` with no reason: no decision is made under no document.
     pub(crate) awaited: AtomicU64,
+    /// Requests their gateway said it asked again, holding no answer to
+    /// the first ask: at 0 those that found no lease of the request
+    /// waiting for a dispatch, at 1 those whose earlier lease was ended.
+    pub(crate) again: [AtomicU64; 2],
 }
 
 /// The parts a made decision's counts are kept in. A decider adds to the
@@ -840,7 +861,10 @@ impl Deciding {
     /// the fence shows at `now` with the request as taken then. The fence
     /// is read first: a replica that does not lead builds nothing, and
     /// says so before any other reason. A text is said next, ahead of the
-    /// budget, so its count holds every text a leader took.
+    /// budget, so its count holds every text a leader took. A request
+    /// asked again ends its earlier lease there too, whatever becomes of
+    /// its own decision. The two are words few requests say, behind one
+    /// test.
     fn judged<'a>(
         &self,
         request: &'a Checked,
@@ -850,12 +874,31 @@ impl Deciding {
     ) -> Result<(u64, Taken<'a, Checked>), Reason> {
         let Reads { fence, counts, .. } = &self.reads;
         let term = fence.leader_term(now).ok_or(Reason::NotLeader)?;
-        if request.has_text() {
-            counts.texts.fetch_add(1, Ordering::Relaxed);
-            return Err(Reason::Unspecified);
+        if request.says_more() {
+            if request.has_text() {
+                counts.texts.fetch_add(1, Ordering::Relaxed);
+                return Err(Reason::Unspecified);
+            }
+            if request.again() {
+                self.asked_again(request, gateway);
+            }
         }
         let taken = Taken::at(request, gateway, received, now);
         Ok((term, taken.ok_or(Reason::BudgetGoneOnArrival)?))
+    }
+
+    /// A request its gateway asks again, holding no answer to the first
+    /// ask: the lease that ask was issued ends here, where it still waits
+    /// for a dispatch, as its dispatch deadline would end it
+    /// ([`MemoryStore::asked_again`]). It ends ahead of the request's own
+    /// decision and whatever that decision's answer, a `Busy` for a spent
+    /// budget included: no dispatch will name it. Counted by whether a
+    /// lease was ended.
+    #[cold]
+    fn asked_again(&self, request: &Checked, gateway: GatewayId) {
+        let Reads { store, counts, .. } = &self.reads;
+        let ended = store.asked_again(gateway, fingerprint(request.id()));
+        counts.again[usize::from(ended)].fetch_add(1, Ordering::Relaxed);
     }
 
     /// One request's decision with the term both reads of the fence showed
@@ -1437,6 +1480,7 @@ pub(crate) mod tests {
                 ..proto::RequestFacts::default()
             }),
             constraints: None,
+            again: false,
         }
     }
 
@@ -2675,6 +2719,151 @@ pub(crate) mod tests {
         let store: &dyn LeasesStore = bed.store.as_ref();
         assert_eq!(store.get(GATEWAY, LeaseId(id(1))), None);
         assert_eq!(store.live(GATEWAY), 2);
+    }
+
+    /// `frame` as its gateway sends it again, holding no answer to the
+    /// first ask.
+    fn again(mut frame: proto::DecideRequest) -> proto::DecideRequest {
+        frame.again = true;
+        frame
+    }
+
+    /// The requests the bed's deciders counted as asked again: those that
+    /// found no lease waiting, and those whose earlier lease was ended.
+    fn asked_again(bed: &Bed) -> [u64; 2] {
+        let again = bed.counts.again.each_ref();
+        again.map(|count| count.load(Ordering::Relaxed))
+    }
+
+    /// One lease stands for a request its gateway asks again. The lease
+    /// the first ask was issued ends as abandoned where it waits, and the
+    /// engine that issued it is told, ahead of the repeat's own lease. A
+    /// lease of another request stands.
+    #[tokio::test]
+    async fn a_request_asked_again_ends_the_lease_its_first_ask_was_issued() {
+        let told = Arc::new(Mutex::new(Vec::new()));
+        let mut bed = bed(Some(hearing(&told, 1)), true, (2, 8), []);
+        let id = |count: u64| 1 << 32 | count;
+        for request in 1..=2 {
+            bed.ask(frame(request, 1)).await;
+        }
+        // The answer to the first never arrived: its gateway asks again.
+        let answer = bed.ask(again(frame(1, 1))).await;
+        assert_eq!(lease_of(&answer).id, id(3));
+        let abandoned = (id(1), Some(ReleaseReason::Abandoned));
+        assert_eq!(
+            *told.lock(),
+            [(id(1), None), (id(2), None), abandoned, (id(3), None)]
+        );
+        let store: &dyn LeasesStore = bed.store.as_ref();
+        assert_eq!(store.get(GATEWAY, LeaseId(id(1))), None);
+        assert_eq!(store.live(GATEWAY), 2, "another request's and the repeat's");
+        assert_eq!(asked_again(&bed), [0, 1]);
+    }
+
+    /// A request sent twice under one id without the word is two requests:
+    /// each is issued a lease and neither ends the other's.
+    #[tokio::test]
+    async fn a_request_sent_twice_without_the_word_is_issued_two_leases() {
+        let told = Arc::new(Mutex::new(Vec::new()));
+        let mut bed = bed(Some(hearing(&told, 1)), true, (2, 8), []);
+        let id = |count: u64| 1 << 32 | count;
+        for _ in 0..2 {
+            bed.ask(frame(1, 1)).await;
+        }
+        assert_eq!(*told.lock(), [(id(1), None), (id(2), None)]);
+        assert_eq!(bed.store.live(GATEWAY), 2);
+        assert_eq!(asked_again(&bed), [0, 0]);
+    }
+
+    /// A repeat ends a lease that waits and no other: a lease its gateway
+    /// named a dispatch for stands, and a request no decider took has
+    /// none. Each such repeat is decided as a first ask.
+    #[tokio::test]
+    async fn a_request_asked_again_ends_no_lease_that_was_dispatched() {
+        let told = Arc::new(Mutex::new(Vec::new()));
+        let mut bed = bed(Some(hearing(&told, 1)), true, (2, 8), []);
+        let id = |count: u64| 1 << 32 | count;
+        bed.ask(frame(1, 1)).await;
+        let store: &dyn LeasesStore = bed.store.as_ref();
+        let first = LeaseId(id(1));
+        assert!(store.dispatched(GATEWAY, first, Dispatch::default(), bed.script.taken));
+        // The gateway holds the first answer and asks again all the same,
+        // and it asks again for a request no decider ever took.
+        for request in [1, 9] {
+            bed.ask(again(frame(request, 1))).await;
+        }
+        assert_eq!(*told.lock(), [(id(1), None), (id(2), None), (id(3), None)]);
+        assert_eq!(bed.store.live(GATEWAY), 3);
+        assert_eq!(asked_again(&bed), [2, 0]);
+    }
+
+    /// The word reaches the asking gateway's own leases alone: a lease
+    /// another gateway holds under the same id stands.
+    #[tokio::test]
+    async fn a_request_asked_again_ends_no_lease_of_another_gateway() {
+        let told = Arc::new(Mutex::new(Vec::new()));
+        let mut bed = bed(Some(hearing(&told, 1)), true, (2, 8), []);
+        let id = |count: u64| 1 << 32 | count;
+        bed.ask(frame(1, 1)).await;
+        let repeat = again(frame(1, 1));
+        assert_eq!(bed.submit_at(repeat, OTHER, Duration::ZERO), None);
+        bed.answer().await;
+        assert_eq!(*told.lock(), [(id(1), None), (id(2), None)]);
+        assert_eq!((bed.store.live(GATEWAY), bed.store.live(OTHER)), (1, 1));
+        assert_eq!(asked_again(&bed), [1, 0]);
+    }
+
+    /// A repeat ends its earlier lease whatever becomes of its own
+    /// decision: one answered `Busy` for a budget that is gone leaves no
+    /// lease of its request on file.
+    #[tokio::test]
+    async fn a_request_asked_again_past_its_budget_ends_its_earlier_lease_all_the_same() {
+        let told = Arc::new(Mutex::new(Vec::new()));
+        let mut bed = bed(Some(hearing(&told, 1)), true, (2, 8), []);
+        let id = |count: u64| 1 << 32 | count;
+        bed.ask(frame(1, 1)).await;
+        // The repeat's budget is gone at its decider's read of the clock,
+        // well inside the first lease's dispatch span.
+        let (budget, read) = (Duration::from_millis(1), Duration::from_millis(2));
+        bed.script.steps.lock().push_back(Step::At(read));
+        let answer = bed.ask(budgeted(again(frame(1, 1)), budget)).await;
+        assert_eq!(busy(&answer), Reason::BudgetGoneOnArrival);
+        let abandoned = (id(1), Some(ReleaseReason::Abandoned));
+        assert_eq!(*told.lock(), [(id(1), None), abandoned]);
+        assert_eq!(bed.store.live(GATEWAY), 0);
+        assert_eq!(asked_again(&bed), [0, 1]);
+    }
+
+    /// A dispatch handed ahead of the repeat stands: what was handed to
+    /// the file is applied before the repeat looks for a lease that waits.
+    #[tokio::test]
+    async fn a_dispatch_handed_ahead_of_a_request_asked_again_is_applied_first() {
+        let told = Arc::new(Mutex::new(Vec::new()));
+        let mut bed = bed(Some(hearing(&told, 1)), true, (1, 8), []);
+        let id = |count: u64| 1 << 32 | count;
+        bed.ask(frame(1, 1)).await;
+        // The repeat's decider is held at its first read of the clock: it
+        // has the job at hand, so a frame handed now is left to it.
+        let (reached, held) = std_mpsc::sync_channel(1);
+        let (go, word) = std_mpsc::sync_channel(1);
+        let hold = Step::Hold { reached, go: word };
+        bed.script.steps.lock().push_back(hold);
+        assert_eq!(bed.submit(again(frame(1, 1))), None);
+        held.recv_timeout(PATIENCE)
+            .expect("the decider reads the clock");
+        let hand = lifecycle::open(&bed.store, GATEWAY);
+        let dispatched = Said::Dispatched(Dispatch::default(), bed.script.taken);
+        bed.store.hand(&hand, LeaseId(id(1)), dispatched);
+        go.send(()).expect("the decider holds the other end");
+        bed.answer().await;
+        assert_eq!(*told.lock(), [(id(1), None), (id(2), None)]);
+        assert_eq!(
+            bed.store.live(GATEWAY),
+            2,
+            "the dispatched lease and the repeat's"
+        );
+        assert_eq!(asked_again(&bed), [1, 0]);
     }
 
     /// A decider with a job at hand is at work at the leases' file: what a
@@ -5221,7 +5410,26 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_pairs_answer_that_does_not_leave_gives_both_sides_up() {
         let told = Arc::new(Mutex::new(Vec::new()));
-        let kept = Arc::clone(&told);
+        // The decision's last read of the clock shows its budget gone.
+        let steps = [Step::At(Duration::ZERO), Step::At(BUDGET)];
+        let mut bed = bed(Some(hearing_pairs(&told)), true, (1, 8), steps);
+        let answer = bed.ask(phased(frame(1, 77), proto::Phase::Prefill)).await;
+        assert_eq!(busy(&answer), Reason::BudgetGoneOnArrival);
+        assert_eq!(bed.counts.outlasted.load(Ordering::Relaxed), 1);
+        assert_eq!(bed.store.live(GATEWAY), 0);
+        // One id, and each call once a side.
+        let (id, late) = (1 << 32 | 1, Some(ReleaseReason::LateDecision));
+        assert_eq!(
+            *told.lock(),
+            [(id, None), (id, None), (id, late), (id, late)]
+        );
+    }
+
+    /// A pair plan for the prefill and decode phases, picking through
+    /// [`Told`]: what its engine tells its stage of leases is kept in
+    /// `told`.
+    fn hearing_pairs(told: &Arc<Mutex<Calls>>) -> AppliedSpec {
+        let kept = Arc::clone(told);
         let mut catalog = Catalog::builtin();
         catalog
             .picker("told", move || Box::new(Told(Arc::clone(&kept))))
@@ -5240,21 +5448,32 @@ pub(crate) mod tests {
         )
         .expect("a document of this build");
         let digest = document.digest().expect("the document digests");
-        let spec = AppliedSpec::validate_digested(&document, digest, &catalog)
-            .expect("the catalog holds the stage");
-        // The decision's last read of the clock shows its budget gone.
-        let steps = [Step::At(Duration::ZERO), Step::At(BUDGET)];
-        let mut bed = bed(Some(spec), true, (1, 8), steps);
-        let answer = bed.ask(phased(frame(1, 77), proto::Phase::Prefill)).await;
-        assert_eq!(busy(&answer), Reason::BudgetGoneOnArrival);
-        assert_eq!(bed.counts.outlasted.load(Ordering::Relaxed), 1);
-        assert_eq!(bed.store.live(GATEWAY), 0);
-        // One id, and each call once a side.
-        let (id, late) = (1 << 32 | 1, Some(ReleaseReason::LateDecision));
-        assert_eq!(
-            *told.lock(),
-            [(id, None), (id, None), (id, late), (id, late)]
-        );
+        AppliedSpec::validate_digested(&document, digest, &catalog)
+            .expect("the catalog holds the stage")
+    }
+
+    /// A pair asked again ends each side of its lease that waits: one id,
+    /// and the engine that heard each side's issue hears each side's end,
+    /// ahead of the two sides the repeat is issued.
+    #[tokio::test]
+    async fn a_pair_asked_again_ends_each_side_that_waits() {
+        let told = Arc::new(Mutex::new(Vec::new()));
+        let mut bed = bed(Some(hearing_pairs(&told)), true, (1, 8), []);
+        let pair = || phased(frame(1, 77), proto::Phase::Prefill);
+        bed.ask(pair()).await;
+        bed.ask(again(pair())).await;
+        let (first, second) = (1 << 32 | 1, 1 << 32 | 2);
+        let abandoned = Some(ReleaseReason::Abandoned);
+        let sides = |id, word| [(id, word), (id, word)];
+        let heard = [
+            sides(first, None),
+            sides(first, abandoned),
+            sides(second, None),
+        ];
+        assert_eq!(*told.lock(), heard.concat());
+        let store: &dyn LeasesStore = bed.store.as_ref();
+        assert_eq!(store.get(GATEWAY, LeaseId(first)), None);
+        assert_eq!(asked_again(&bed), [0, 1]);
     }
 
     /// The encode side rides the plan that names it. The engine's entry
