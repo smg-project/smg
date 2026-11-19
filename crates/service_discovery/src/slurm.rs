@@ -98,8 +98,10 @@ pub struct SlurmProviderConfig {
 
 impl SlurmProviderConfig {
     /// Resolve Slurm settings that have passed [`crate::DiscoveryConfig::validate`].
-    /// `routing` supplies the required worker roles the host accepts.
-    pub fn new(
+    /// `routing` supplies the required worker roles the host accepts. The
+    /// crate alone calls it: [`crate::RuntimeDiscoveryConfig::from_config`]
+    /// is the one way to these settings, and it checks them first.
+    pub(crate) fn new(
         config: &SlurmDiscoveryConfig,
         routing: Option<Roles>,
     ) -> DiscoveryConfigResult<Self> {

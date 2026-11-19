@@ -155,7 +155,12 @@ fn a_setting_the_gateway_refuses_is_refused_here_by_its_flag() -> Result<(), Box
         (
             &["--discovery-provider", "kubernetes"][..],
             "--discovery-provider",
-            "Validation failed: Regular mode with service discovery requires a non-empty selector",
+            "Validation failed: Regular mode with service discovery requires a non-empty selector; the roles follow the prefill, decode and encode selectors and job names given",
+        ),
+        (
+            &["--discovery-provider", "slurm", "--slurm-job-name", "w", "--slurm-port", "8000", "--prefill-selector", "role=p"],
+            "--discovery-provider",
+            "Validation failed: PD mode with Slurm discovery requires a prefill or decode job name; the roles follow the prefill, decode and encode selectors and job names given",
         ),
         (
             &["--service-discovery", "--selector", "app=worker", "--service-discovery-port", "0"],
@@ -175,7 +180,7 @@ fn a_setting_the_gateway_refuses_is_refused_here_by_its_flag() -> Result<(), Box
         (
             &["--discovery-provider", "slurm", "--slurm-prefill-job-name", "shared", "--slurm-decode-job-name", "shared", "--slurm-port", "8000"],
             "--discovery-provider",
-            "Validation failed: Slurm job name 'shared' maps to both prefill and decode workers",
+            "Validation failed: Slurm job name 'shared' maps to both prefill and decode workers; the roles follow the prefill, decode and encode selectors and job names given",
         ),
         (
             &["--discovery-provider", "consul", "--consul-service", "workers", "--consul-address", ""],
@@ -311,10 +316,19 @@ fn a_refused_field_uses_the_flag_that_sets_it_for_the_selected_provider(
             };
             let displayed = error.to_string();
             assert_eq!(
-                refuse_settings(&config, error).to_string(),
+                refuse_settings(&config, Roles::Regular, error).to_string(),
                 format!("{flag}: {displayed}")
             );
         }
+        // A provider that fails to build names no field either, and its
+        // refusal is none of the roles: it stands in its own words.
+        let error = DiscoveryConfigError::ValidationFailed {
+            reason: "the provider did not build".to_owned(),
+        };
+        assert_eq!(
+            refuse_settings(&config, Roles::Regular, error).to_string(),
+            "--discovery-provider: Validation failed: the provider did not build"
+        );
     }
     Ok(())
 }

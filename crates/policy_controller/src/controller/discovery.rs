@@ -46,7 +46,7 @@ impl DiscoverySettings {
         // Providers that need roles take regular workers by default.
         let roles = roles.unwrap_or(Roles::Regular);
         let runtime = RuntimeDiscoveryConfig::from_config(&config, Some(roles))
-            .map_err(|error| refuse_settings(&config, error))?;
+            .map_err(|error| refuse_settings(&config, roles, error))?;
         Ok(Self(Box::new(Settings {
             config,
             roles,
