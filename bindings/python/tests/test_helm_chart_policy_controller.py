@@ -343,7 +343,7 @@ def test_a_router_on_its_slurm_variant_takes_the_releases_controller():
 
 
 @needs_helm
-def test_a_router_on_its_ol9_variant_takes_the_releases_controller():
+def test_ol9_tag_suffix_is_removed_only_for_the_controller_image():
     """The Oracle Linux 9 variant is the router's alone too. Its suffix is cut
     as the Slurm variant's is: where it ends a tag, and nowhere else."""
     documents = render(*ON, "global.image.tag=1.16.0-ol9")
