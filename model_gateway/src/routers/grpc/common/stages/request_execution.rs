@@ -3105,7 +3105,7 @@ pub(crate) mod tests {
 
         use crate::{
             middleware::messages_errors::into_messages_envelope,
-            routers::common::retry::is_retryable_response,
+            routers::common::retry::NonRetryable,
         };
 
         let why = "The structural tag constraint cannot be enforced: xgrammar drops \
@@ -3137,7 +3137,10 @@ pub(crate) mod tests {
                 "unsupported_constraint",
                 "{code}"
             );
-            assert!(!is_retryable_response(&response), "{code}");
+            assert!(
+                response.extensions().get::<NonRetryable>().is_some(),
+                "{code}"
+            );
             let body = axum::body::to_bytes(response.into_body(), 1 << 16)
                 .await
                 .expect("body");
@@ -3186,6 +3189,10 @@ pub(crate) mod tests {
         let messages: serde_json::Value = serde_json::from_slice(&messages).expect("json");
         assert_eq!(messages["error"]["type"], "invalid_request_error");
         assert_eq!(messages["error"]["message"], why);
+        assert!(
+            messages["error"].get("code").is_none(),
+            "the messages envelope carries no code: {messages}"
+        );
     }
 
     /// A side's start the worker cancelled (its connection closed under

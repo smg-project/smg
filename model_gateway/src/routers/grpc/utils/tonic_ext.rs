@@ -409,7 +409,7 @@ mod tests {
     fn a_constraint_refusal_is_a_terminal_400_the_breaker_does_not_sample() {
         use smg_grpc_client::constraint_refused_status;
 
-        use crate::routers::{common::retry::is_retryable_response, error};
+        use crate::routers::{common::retry::NonRetryable, error};
 
         let status = constraint_refused_status("The JSON schema constraint cannot be enforced");
         assert_eq!(status.http_status(), StatusCode::BAD_REQUEST);
@@ -423,7 +423,9 @@ mod tests {
             error::extract_error_code_from_response(&response),
             UNSUPPORTED_CONSTRAINT_CODE
         );
-        assert!(!is_retryable_response(&response));
+        // A 400 is not replayed by status alone; the refusal is marked
+        // terminal whatever statuses the operator makes retryable.
+        assert!(response.extensions().get::<NonRetryable>().is_some());
         let plain =
             tonic::Status::invalid_argument("The JSON schema constraint cannot be enforced");
         assert!(plain.constraint_refusal_response().is_none());
