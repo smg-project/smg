@@ -14,6 +14,9 @@ This page explains the document.
 6. [Loading and changing a document](#loading-and-changing-a-document)
 7. [A stage of your own](#a-stage-of-your-own)
 8. [When a gateway loses its stream](#when-a-gateway-loses-its-stream)
+
+7. [Gateway routing metrics](#gateway-routing-metrics)
+8. [A stage of your own](#a-stage-of-your-own)
 9. [What is not built yet](#what-is-not-built-yet)
 
 ## The smallest document
@@ -612,6 +615,54 @@ Use `Explain` on the control listener with `gateway_id` and `request_id`. Use th
 - Plugin projections are unset.
 - The lifecycle outcome is unset.
 - The control call keeps the record's original binding position and trace. `binding` is 0 when no binding matched or when the first binding matched. The name fields are empty for unmatched decisions and records from older generations.
+
+## Gateway routing metrics
+
+The embedded host counts each ask and times its call to the controller. Each ask counts as
+`pick`, `shed`, `queue`, or `refused`. The `mode` is `embedded`. The `model` is the
+resolved model, and `profile` is empty on a refusal or when the host needs a name after that
+generation has been replaced. When a commit finds no sendable target, each subsequent ask
+counts on its own.
+
+The embedded column gives the gateway family to query. `Same` carries the classic names over.
+The contract column also records families whose embedded writers are pending. The shipped
+dashboard uses the classic names. Decision series appear after their first observation.
+The standalone controller keeps the `smg_policy_controller_` prefix for its process metrics,
+including role, replication, election, and load polling.
+
+| Classic gateway | Embedded gateway | Class and contract |
+| --- | --- | --- |
+| `smg_worker_selection_total{policy}` | `smg_worker_selection_total{profile}` | Kept. The embedded profile label comes with the router's send path. |
+| `smg_worker_overload_shed_total`, `smg_worker_overload_fallback_total`, `smg_worker_liveness_fallback_total` | Same | Kept. The embedded writers will use the decision's outcome and lifted veto. |
+| `smg_pd_admission_waits_total`, `smg_pd_admission_sheds_total`, `smg_pd_admission_window`, `smg_pd_prefill_admission_inflight`, `smg_pd_prefill_admission_queued`, `smg_pd_prefill_admission_rejections_total`, `smg_pd_prefill_admission_wait_seconds` | Same | Kept. The gateway owns admission. |
+| `smg_routing_key_source_total{source}` | Same | Kept. The gateway reads `header` or `rid` as the source. |
+| `smg_cache_aware_policy_branch_total`, `smg_manual_policy_branch_total{branch}`, `smg_consistent_hashing_policy_branch_total`, `smg_prefix_hash_policy_branch_total` | `smg_policy_decisions_total{model,profile,outcome,mode}` | Renamed. The contract groups by outcome. The standalone controller's `smg_policy_controller_decide_no_decision_total` corresponds to `outcome="refused"`. |
+| `smg_policy_inflight_reconciled_total{policy}` | — | Renamed to `smg_policy_lease_expired_total{kind}` in the controller contract. |
+| `smg_cache_aware_match_ratio`, `smg_kv_index_lookup_seconds`, `smg_cache_placement_entries` | Same | Moved to the process that holds the index. Match ratio is observed only when the scorer reports the chosen worker's overlap. Embedded observations from the index are pending. |
+| `smg_cache_tree_chars`, `smg_cache_tree_tokens`, `smg_cache_tree_tenants`, `smg_manual_policy_cache_entries` | — | Ends with the classic trees and manual cache. |
+| `smg_cache_aware_prefix_margin_held_total` | — | Open. An embedded successor requires the scorer to report whether the margin held without an extra read. Otherwise the counter ends with classic routing. |
+| — | `smg_policy_decision_seconds{mode,outcome}` | Added. One observation per ask. |
+| — | — | Added by the contract. Embedded writers are pending for `smg_policy_leases{kind,state}`, `smg_policy_spec_generation`, and `smg_policy_spec_apply_total{result}`. The standalone controller already publishes the two spec families when it has a spec source. |
+| — | — | The contract renames the standalone controller's `smg_policy_controller_decide_busy_total` to `smg_policy_fallback_total{reason}` for fallback and its `smg_policy_controller_decide_budget_outlasted_total` to `smg_policy_deadline_misses_total` for decision deadlines. Both contract writers are pending. |
+| `smg_router_requests_total`, `smg_router_request_errors_total`, `smg_router_request_duration_seconds`, `smg_router_tokens_total`, `smg_router_ttft_seconds`, `smg_router_tpot_seconds`, `smg_http_responses_total`, `smg_http_request_duration_seconds`, `smg_http_inflight_request_age_count`, `smg_http_connections_active` | Same | Kept. Request and connection metrics. |
+| `smg_admission_inflight`, `smg_admission_queue_depth`, `smg_admission_queue_rejected_total`, `smg_scheduler_admit_total`, `smg_scheduler_inflight`, `smg_scheduler_queue_depth` | Same | Kept. Admission and scheduling. |
+| `smg_engine_running_requests`, `smg_engine_waiting_requests`, `smg_engine_token_usage`, `smg_engine_cache_hit_rate`, `smg_worker_health`, `smg_worker_cb_state`, `smg_worker_health_checks_total`, `smg_worker_retries_total`, `smg_worker_retries_exhausted_total` | Same | Kept. Worker reports and resilience. |
+| `smg_kv_event_lag_seconds`, `smg_kv_event_gaps_total`, `smg_kv_event_resyncs_total`, `smg_kv_event_missed_batches_total`, `smg_kv_event_stream_errors_total`, `smg_kv_event_degraded_ranks`, `smg_kv_index_entries` | Same | Kept. Gateway cache event and index metrics. |
+| `smg_symphony_outputs_total`, `smg_symphony_malformed_total`, `smg_symphony_fallback_total`, `smg_symphony_refused_total`, `smg_symphony_calls_suppressed_total`, `smg_tokenizer_cache_lookups_total` | Same | Kept. Output parsing and tokenization. |
+| `smg_tokio_worker_busy_ratio`, `smg_tokio_event_loop_stalls_total`, `smg_tokio_event_loop_delay_seconds`, `smg_tokio_alive_tasks`, `smg_tokio_global_queue_depth`, `smg_log_dropped_lines` | Same | Kept. Runtime and logging. |
+| `smg_allocator_resident_bytes`, `smg_allocator_allocated_bytes` | Same | Kept. Available when the gateway runs with jemalloc statistics. |
+| `smg_pd_prefill_duration_seconds`, `smg_pd_kv_transfer_duration_seconds`, `smg_pd_decode_ttft_seconds`, `smg_pd_ttft_seconds`, `smg_pd_rendezvous_failures_total`, `smg_pd_bootstrap_failures_total`, `smg_pd_kv_transfer_failures_total`, `smg_pd_kv_connector_mode_total` | Same | Kept. Prefill and decode dispatch. |
+
+The manual policy branches `occupied_hit`, `occupied_miss`, `vacant`, and
+`no_routing_id` correspond to `pick`. `no_healthy_workers` corresponds to `shed`.
+`cap_respill` corresponds to `pick` when the policy returns a worker and `shed` when it
+returns none. The outcome count groups these branches together.
+
+An embedded selection uses the existing opt-in routing capture. Its `x-smg-cache-trace`
+selection row names the profile in `policy`, uses origin `policy_controller`, and carries
+a `decision` with up to three scored worker addresses. The gateway uses redacted addresses
+for the selected worker and the top candidates. The same row appears in the dispatch log
+when tracing is configured to log.
 
 ## A stage of your own
 

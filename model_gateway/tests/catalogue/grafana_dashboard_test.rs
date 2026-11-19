@@ -11,6 +11,8 @@
 //! (`telemetry::OUTPUTS`) whose name has one value across the sources. A
 //! panel written against a name the code never had is empty on a real
 //! scrape, and nothing else notices.
+//! The policy metrics table maps those families to the gateway's embedded
+//! metrics and names the families that apply in either routing mode.
 
 #![expect(clippy::expect_used, reason = "test failures should panic")]
 
@@ -19,13 +21,17 @@ use std::{
     fs,
 };
 
+use metrics::{Counter, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit};
+use parking_lot::Mutex;
 use regex::Regex;
 use serde_json::Value;
+use smg::observability::metrics::{start_prometheus, PrometheusConfig};
 
 use super::{repo_root, rust_files};
 
 const DASHBOARD: &str = "deploy/helm/smg/templates/grafana-dashboard.yaml";
 const SOURCE_ROOTS: &[&str] = &["model_gateway/src", "crates"];
+const POLICY_METRICS: &str = "crates/policy_controller/README.md";
 
 /// The dashboard JSON as the chart renders it: the ConfigMap's
 /// `smg-dashboard.json` block, de-indented, with the brace escapes resolved
@@ -211,4 +217,100 @@ fn every_family_a_panel_queries_is_described() {
         unknown.len(),
         unknown.join("\n")
     );
+}
+
+/// The descriptions registered when the gateway starts its recorder.
+#[derive(Default)]
+struct GatewayDescriptions(Mutex<BTreeSet<String>>);
+
+impl Recorder for GatewayDescriptions {
+    fn describe_counter(&self, key: KeyName, _: Option<Unit>, _: SharedString) {
+        self.0.lock().insert(key.as_str().to_owned());
+    }
+
+    fn describe_gauge(&self, key: KeyName, unit: Option<Unit>, description: SharedString) {
+        self.describe_counter(key, unit, description);
+    }
+
+    fn describe_histogram(&self, key: KeyName, unit: Option<Unit>, description: SharedString) {
+        self.describe_counter(key, unit, description);
+    }
+
+    fn register_counter(&self, _: &Key, _: &Metadata<'_>) -> Counter {
+        Counter::noop()
+    }
+
+    fn register_gauge(&self, _: &Key, _: &Metadata<'_>) -> Gauge {
+        Gauge::noop()
+    }
+
+    fn register_histogram(&self, _: &Key, _: &Metadata<'_>) -> Histogram {
+        Histogram::noop()
+    }
+}
+
+fn table_families(cell: &str) -> impl Iterator<Item = &str> {
+    cell.split('`')
+        .skip(1)
+        .step_by(2)
+        .map(|entry| entry.split_once('{').map_or(entry, |(name, _)| name))
+}
+
+#[test]
+fn every_dashboard_family_has_a_policy_metrics_mapping() {
+    let dashboard: Value =
+        serde_json::from_str(&rendered_dashboard()).expect("the rendered dashboard is JSON");
+    let catalogue = Catalogue::from_sources();
+    let series = Regex::new(r"smg_[a-z0-9_]+").expect("valid regex");
+    let readme = fs::read_to_string(repo_root().join(POLICY_METRICS)).expect("the policy README");
+    let table = readme
+        .split_once("## Gateway routing metrics\n")
+        .expect("the policy README has the gateway metrics table")
+        .1
+        .split("\n## ")
+        .next()
+        .expect("the gateway metrics section");
+
+    let descriptions = GatewayDescriptions::default();
+    metrics::with_local_recorder(&descriptions, || {
+        start_prometheus(PrometheusConfig::default())
+    });
+    let gateway = descriptions.0.into_inner();
+    let mut mapped = BTreeSet::new();
+    for row in table.lines().filter(|line| line.starts_with('|')) {
+        let mut columns = row.split('|').skip(1);
+        let left = columns.next().expect("classic gateway column");
+        let right = columns.next().expect("embedded gateway column");
+        let same = right.trim() == "Same";
+        let embedded = if same { left } else { right };
+        let mut names = table_families(embedded).peekable();
+        if names.peek().is_some() {
+            mapped.extend(table_families(left));
+        }
+        for family in names {
+            // The binary describes allocator statistics when it runs with jemalloc.
+            let described = gateway.contains(family)
+                || (same
+                    && family.starts_with("smg_allocator_")
+                    && catalogue.families.contains(family));
+            assert!(
+                described,
+                "embedded gateway family {family} has no description"
+            );
+        }
+    }
+    for panel in panels(&dashboard) {
+        for expr in queries(panel) {
+            for name in series.find_iter(expr) {
+                let family = catalogue
+                    .family_of(name.as_str())
+                    .expect("described family");
+                assert!(
+                    mapped.contains(family),
+                    "panel `{}` has no policy metrics row for {family}",
+                    title(panel)
+                );
+            }
+        }
+    }
 }
