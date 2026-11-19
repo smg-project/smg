@@ -53,9 +53,11 @@
 //! the ring under the turn ([`MemoryStore::settle`]). Two pairs of a
 //! write and a read cross. The ring's pair is the queue's tail: a push
 //! has moved the tail by an atomic exchange before it returns, and a
-//! take reports an empty ring only by a read of the tail. The other pair
-//! is the mark of who is at work: the leaver stores it and the hand
-//! loads it.
+//! take reports an empty ring only by a read of the tail. Both are facts
+//! of the queue crate's code as read at 0.3.14, not of its written
+//! contract: a version that moves reads its push and its pop again. The
+//! other pair is the mark of who is at work: the leaver stores it and
+//! the hand loads it.
 //!
 //! Atomics follow the C++20 model, which keeps one total order of every
 //! sequentially consistent operation and fence. Where a read takes a
@@ -69,8 +71,11 @@
 //! write. A take that reads a moved tail waits for the slot's stamp and
 //! takes the frame. A hand that reads nobody at work takes the turn and
 //! applies what waits; where a thread began work since, the frame is
-//! left to that thread's takes. None of it leans on the orderings the
-//! queue gives its own reads and writes.
+//! left to that thread's takes. That thread wrote its mark, passed a
+//! fence of its own and took the turn ([`MemoryStore::begin`]): its
+//! first take finds the frame of a hand that missed the mark, and a
+//! later one the frame of a hand that read it. None of it leans on the
+//! orderings the queue gives its own reads and writes.
 //!
 //! A decision reads its own file behind everything handed to it. A row
 //! that another file's leases book lags by that file's next take: a
@@ -107,7 +112,6 @@ use std::{
 };
 
 use arc_swap::Guard;
-use crossbeam_queue::ArrayQueue;
 use parking_lot::{Mutex, MutexGuard};
 
 use super::{Key, Leases, MemoryStore};
@@ -144,34 +148,47 @@ impl Told {
 /// What a frame said of a gateway's lease, as it waits in the ring.
 type Handed = (GatewayId, LeaseId, Said);
 
-/// A file's ring by its two ends: [`MemoryStore::HANDOVER`] frames
-/// written in place and taken in the order they were handed. The ends
-/// are two types: a hand writes a frame and can take none.
-fn ring() -> (Hands, Ring) {
-    let frames = Arc::new(ArrayQueue::new(MemoryStore::HANDOVER));
-    (Hands(Arc::clone(&frames)), Ring(frames))
-}
+/// A file's ring by its two ends. They stand in a module of their own
+/// and the queue is private to it: the turn module writes a frame through
+/// the writing end, takes one through the reading end it holds
+/// exclusively, and reaches the queue no other way.
+mod ring {
+    use std::sync::Arc;
 
-/// The ring's writing end, every hand's.
-struct Hands(Arc<ArrayQueue<Handed>>);
+    use crossbeam_queue::ArrayQueue;
 
-impl Hands {
-    /// Writes `frame` behind what waits, or gives it back where the ring
-    /// is full. It wakes no thread: none sleeps at a ring, and a frame is
-    /// applied by a thread that looks ([`MemoryStore::hand`]).
-    fn write(&self, frame: Handed) -> Result<(), Handed> {
-        self.0.push(frame)
+    use super::{Handed, MemoryStore};
+
+    /// A file's ring by its two ends: [`MemoryStore::HANDOVER`] frames
+    /// written in place and taken in the order they were handed. The
+    /// ends are two types: a hand writes a frame and can take none.
+    pub(super) fn ends() -> (Hands, Taker) {
+        let frames = Arc::new(ArrayQueue::new(MemoryStore::HANDOVER));
+        (Hands(Arc::clone(&frames)), Taker(frames))
     }
-}
 
-/// The ring's reading end. It stands behind the file's turn, so the
-/// turn's holder alone takes a frame.
-struct Ring(Arc<ArrayQueue<Handed>>);
+    /// The ring's writing end, every hand's.
+    pub(super) struct Hands(Arc<ArrayQueue<Handed>>);
 
-impl Ring {
-    /// The frame handed first of those that wait.
-    fn take(&mut self) -> Option<Handed> {
-        self.0.pop()
+    impl Hands {
+        /// Writes `frame` behind what waits, or gives it back where the
+        /// ring is full. It wakes no thread: none sleeps at a ring, and
+        /// a frame is applied by a thread that looks
+        /// ([`MemoryStore::hand`]).
+        pub(super) fn write(&self, frame: Handed) -> Result<(), Handed> {
+            self.0.push(frame)
+        }
+    }
+
+    /// The ring's reading end. It stands behind the file's turn, so the
+    /// turn's holder alone takes a frame.
+    pub(super) struct Taker(Arc<ArrayQueue<Handed>>);
+
+    impl Taker {
+        /// The frame handed first of those that wait.
+        pub(super) fn take(&mut self) -> Option<Handed> {
+            self.0.pop()
+        }
     }
 }
 
@@ -185,14 +202,14 @@ struct Shown {
     /// it leaves.
     at_work: AtomicUsize,
     /// The ring's writing end, every hand's.
-    hands: Hands,
+    hands: ring::Hands,
 }
 
 /// What stands behind the turn: the file, and the reading end of its
 /// ring.
 pub(super) struct Behind {
     leases: Leases,
-    ring: Ring,
+    ring: ring::Taker,
 }
 
 /// One decider's file of leases behind its turn, with the ring of what is
@@ -212,7 +229,7 @@ pub(super) struct File {
 
 impl File {
     fn new(leases: Leases, name: Option<Decider>) -> Self {
-        let (hands, ring) = ring();
+        let (hands, ring) = ring::ends();
         Self {
             turn: Mutex::new(Behind { leases, ring }),
             shown: Shown {
