@@ -292,6 +292,10 @@ Corpus: 33 texts per size class of about 256, 2,000, 32,000, 128,000, 500,000 an
 DeepSeek V4.1 vocabulary; a 1M text is two 500k texts joined), assembled from public text: XL-Sum news articles in Arabic, Chinese, English, Hindi, Japanese,
 Korean, Russian and Thai, and open-source code and configuration (Rust, Python, Go, shell, C, Jinja templates, TOML and YAML,
 protobuf, JSON) with generated tool-call payloads; 17 to 39 % of the bytes of a size class are outside ASCII.
+A warm cell encodes one text, the first of its size class, again and again, and is therefore a ceiling of what
+repeated text gives, not the speed of mixed traffic. Those six texts are 1,548 bytes (256), 8,873 (2k), 151,173 (32k),
+599,401 (128k), 2,289,914 (500k) and 4,613,798 (1M), with 90, 41, 50, 42, 39 and 41 % of their bytes outside ASCII,
+each above the share of its class.
 
 Families: the tokenizer files of sixteen public checkpoints. Ten byte-level BPE vocabularies (DeepSeek V4.1 Flash,
 DeepSeek V3.2, Llama 3.2, Llama 4 Scout, gpt-oss, Qwen3.6, GLM-5.3 Flash, MiniMax M3, MiMo V2.6, and Ministral 3 through

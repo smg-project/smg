@@ -70,7 +70,11 @@ from code placement alone, so a margin inside that band is not a difference betw
 - **`enc`** (encode): one process per column, family, size class and mode, pinned to one core; 3 warm-ups
   and 30 timed encodes (10 for the `tokenizers` column at the two largest classes); the p50 of nanoseconds
   per token. *Cold* takes a different text for every encode (the class's 33 texts in order), *warm* the
-  same text every time. A round is one pass over the families, the columns interleaved inside each cell
+  same text every time. The warm text is the first of its class, encoded again and again, so a warm
+  figure is a ceiling of what repeated text gives, not the speed of mixed traffic. The six warm texts hold
+  1,548, 8,873, 151,173, 599,401, 2,289,914 and 4,613,798 bytes (the 256 class to the 1M class), and 90, 41,
+  50, 42, 39 and 41 % of those bytes are outside ASCII, where a class as a whole holds 17 to 39 %
+  (`corpus.json`). A round is one pass over the families, the columns interleaved inside each cell
   in an order that rotates from cell to cell; a cell's figure is the median of its rounds.
 - **`dec`** (decode): the first 2,048 ids of a 32k-token text. A full decode (30 repetitions, ns per
   token); the same ids stepped through one stream (ns per token, and the time of a step); the first
