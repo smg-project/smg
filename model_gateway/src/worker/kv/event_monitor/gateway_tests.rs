@@ -464,7 +464,8 @@ async fn the_subscription_asks_for_load_records_before_the_first_batch() {
 /// leaves one WARN line, which names the model, carries the servicer's
 /// own reason and says that the model reaches the approximate tree only
 /// when no worker of it publishes; the worker carries a gauge from the
-/// answer until it leaves.
+/// answer until it leaves. Its removal finds the task ended and frees the
+/// slot itself, with the index of the model's last events subscription.
 #[traced_test]
 #[test]
 fn a_backend_without_kv_events_is_a_gauge_until_the_worker_leaves() {
@@ -541,11 +542,27 @@ fn a_backend_without_kv_events_is_a_gauge_until_the_worker_leaves() {
                 Ok(())
             });
 
+            assert!(
+                monitor.get_indexer("hybrid-m").is_some(),
+                "the add made the model's index"
+            );
             monitor.on_worker_removed(worker.url()).await;
             assert_eq!(
                 gauge(&handle, worker.url()),
                 Some(0.0),
                 "the worker's removal lowers it"
+            );
+            // The task had ended at the engine's answer, before the removal
+            // began: the removal itself frees the slot and drops the index
+            // of the model's last events subscription.
+            assert_eq!(
+                monitor.slot_ids(worker.url()).await,
+                (None, None),
+                "the removal leaves no reservation"
+            );
+            assert!(
+                monitor.get_indexer("hybrid-m").is_none(),
+                "the model's last events subscription takes its index"
             );
             server.abort();
         });

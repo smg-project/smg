@@ -467,7 +467,8 @@ pub fn describe_series() {
     describe_counter!(
         "smg_kv_event_batches_total",
         "KV event batches by worker and disposition (applied, stale, snapshot, load_only, \
-         other_rank, not_indexed: a batch of events on a stream opened for load records alone)"
+         other_rank, not_indexed: a batch of events on a stream opened for load records alone, \
+         or one whose rank fits no rank)"
     );
     describe_counter!(
         "smg_engine_load_polls_total",
