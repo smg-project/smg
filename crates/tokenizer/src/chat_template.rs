@@ -940,7 +940,9 @@ fn detect_all_with_ast(
     let (think_in_prefill, prefill_opens_think_block) = ThinkDetector::run(&ast);
     let mut sets = Vec::new();
     root_set_statement(&ast, &template, false, &mut sets);
-    let writes_built_constants = built_values_read_plainly(&ast, &computed_statements(sets).0);
+    let namespaces = namespaces(&sets);
+    let writes_built_constants =
+        built_values_read_plainly(&ast, &computed_statements(sets).0, &namespaces);
     (
         content_format,
         think_in_prefill,
@@ -1836,6 +1838,9 @@ struct RootSet<'a> {
     /// Whether the statement stands under a top-level `if` or in the `else`
     /// of a top-level `for`: it may not run.
     conditional: bool,
+    /// Whether the expression is a call of `namespace`: the name is a
+    /// namespace, whose attributes other statements bind.
+    namespace: bool,
 }
 
 /// The expression of a root `set` statement.
@@ -1940,16 +1945,19 @@ fn root_set_statement<'a>(
                     draws,
                     spelled,
                 });
+            let namespace = calls_namespace(&set.expr);
             sets.push(RootSet {
                 name: target.id,
                 expression,
                 conditional,
+                namespace,
             });
         }
         Stmt::Macro(declared) => sets.push(RootSet {
             name: declared.name,
             expression: None,
             conditional,
+            namespace: false,
         }),
         Stmt::Import(import) => unread_bindings(&import.name, conditional, sets),
         Stmt::FromImport(import) => {
@@ -2051,6 +2059,7 @@ fn unread_bindings<'a>(target: &Expr<'a>, conditional: bool, sets: &mut Vec<Root
             name: var.id,
             expression: None,
             conditional,
+            namespace: false,
         }),
         Expr::List(list) => {
             for item in &list.items {
@@ -2158,6 +2167,24 @@ fn computed_statements<'a>(sets: Vec<RootSet<'a>>) -> (Vec<Computed<'a>>, Vec<&'
     (computed, unsettled)
 }
 
+/// Whether `expr` is a call of `namespace`.
+fn calls_namespace(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Call(call) if matches!(&call.expr, Expr::Var(callee) if callee.id == "namespace")
+    )
+}
+
+/// The names among `sets` ([`root_sets`]) that the top level binds by a call
+/// of `namespace`, once, where it always runs, and in no other way.
+fn namespaces<'a>(sets: &[RootSet<'a>]) -> Vec<&'a str> {
+    sets.iter()
+        .filter(|set| set.namespace && !set.conditional)
+        .filter(|set| sets.iter().filter(|other| other.name == set.name).count() == 1)
+        .map(|set| set.name)
+        .collect()
+}
+
 /// How [`built_values_read_plainly`] watches a name.
 #[derive(Clone, Copy, PartialEq)]
 enum Watched {
@@ -2167,6 +2194,14 @@ enum Watched {
     Carrier,
     /// A built value is made from it.
     Part,
+    /// A namespace the top level binds once and nothing else binds
+    /// ([`namespaces`]): read as a template likes, until a top-level
+    /// statement binds one of its attributes from a carrier.
+    Namespace,
+    /// Such a namespace from then on: each of its attributes stands where
+    /// a carrier may stand (`ns.attr`), the name by itself only under a
+    /// truth test.
+    Holder,
 }
 
 /// The names watched where the walk of [`built_values_read_plainly`] stands.
@@ -2195,6 +2230,16 @@ type Names<'a> = HashMap<&'a str, Watched>;
 ///   which asks only whether it is empty: the marks stand around a control
 ///   spelling, so a value is empty with them exactly when it is without.
 ///
+/// A `set` of a namespace's attribute is no plain `set`: a statement
+/// elsewhere reads what it bound. Where the top level binds a name once by
+/// a call of `namespace` and a top-level statement binds one of its
+/// attributes from a join that holds a carrier, the namespace is a holder:
+/// each attribute stands in the three places, as the value of such a `set`
+/// too, and in such a condition against the empty string, the same
+/// question. An attribute bound from a carrier only inside a loop, a macro
+/// or a block makes no holder, and fails as any other read; so does the
+/// holder's name bound again to anything but a new namespace.
+///
 /// A name a built value is made from, a part, may stand in the statements
 /// that build and in such a condition. Any other statement that reads it
 /// could put together a control the load never computed.
@@ -2207,7 +2252,11 @@ type Names<'a> = HashMap<&'a str, Watched>;
 /// loop, of a macro and of a `block` has names of its own. A loop's target
 /// and a macro's parameter take the place of a watched name there; a `set`
 /// inside takes it only from where it runs, so the name stays watched.
-fn built_values_read_plainly<'a>(ast: &'a Stmt<'a>, computed: &[Computed<'a>]) -> bool {
+fn built_values_read_plainly<'a>(
+    ast: &'a Stmt<'a>,
+    computed: &[Computed<'a>],
+    namespaces: &[&'a str],
+) -> bool {
     let Stmt::Template(template) = ast else {
         return false;
     };
@@ -2234,6 +2283,9 @@ fn built_values_read_plainly<'a>(ast: &'a Stmt<'a>, computed: &[Computed<'a>]) -
             }
         }
     }
+    for name in namespaces {
+        names.entry(name).or_insert(Watched::Namespace);
+    }
     scope_reads_plainly(&template.children, names, &built)
 }
 
@@ -2246,10 +2298,18 @@ fn scope_reads_plainly<'a>(
 ) -> bool {
     // A carrier may be bound from another, and by a statement that stands
     // behind the read: a loop's body runs again.
+    // A namespace that becomes a holder keeps its entry: the watched names
+    // are counted, not the entries.
+    let watched = |names: &Names| {
+        names
+            .values()
+            .filter(|kind| **kind != Watched::Namespace)
+            .count()
+    };
     loop {
-        let known = names.len();
+        let known = watched(&names);
         bind_carriers(body, &mut names);
-        if names.len() == known {
+        if watched(&names) == known {
             break;
         }
     }
@@ -2258,7 +2318,8 @@ fn scope_reads_plainly<'a>(
 
 /// Adds to `names` the carriers the statements of one scope bind: the name
 /// of a plain `set` whose value reads a carrier, and a macro whose body
-/// reads one.
+/// reads one. A namespace becomes a holder where a `set` binds one of its
+/// attributes from a value that reads a carrier.
 fn bind_carriers<'a>(body: &'a [Stmt<'a>], names: &mut Names<'a>) {
     for stmt in body {
         match stmt {
@@ -2266,7 +2327,14 @@ fn bind_carriers<'a>(body: &'a [Stmt<'a>], names: &mut Names<'a>) {
                 Expr::Var(target) if expression_reads(&set.expr, names, false) => {
                     names.entry(target.id).or_insert(Watched::Carrier);
                 }
-                _ => {}
+                // A namespace's attribute bound from a carrier: it holds one.
+                target => {
+                    if let Some(namespace) = attribute_of(target, names, Watched::Namespace)
+                        .filter(|_| expression_reads(&set.expr, names, false))
+                    {
+                        names.insert(namespace, Watched::Holder);
+                    }
+                }
             },
             Stmt::Macro(declared)
                 if statements_read(&declared.body, &without(names, &declared.args), false) =>
@@ -2294,12 +2362,17 @@ fn statements_read_plainly<'a>(
     body.iter().all(|stmt| match stmt {
         Stmt::EmitRaw(_) => true,
         Stmt::EmitExpr(emit) => joins(&emit.expr, names, false),
+        Stmt::Set(set) if rebinds_holder(set, names) => false,
         // A statement that builds reads its parts as it likes.
         Stmt::Set(set) if matches!(set.target, Expr::Var(_)) => joins(
             &set.expr,
             names,
             built.contains(&(set.span().end_offset as usize)),
         ),
+        // A holder's attribute is bound as a name is.
+        Stmt::Set(set) if attribute_of(&set.target, names, Watched::Holder).is_some() => {
+            joins(&set.expr, names, false)
+        }
         Stmt::IfCond(cond) => {
             asks_whether_empty(&cond.expr, names)
                 && statements_read_plainly(&cond.true_body, names, built)
@@ -2325,18 +2398,45 @@ fn statements_read_plainly<'a>(
                 .all(|default| !expression_reads(default, names, true))
                 && scope_reads_plainly(&declared.body, without(names, &declared.args), built)
         }
-        Stmt::Block(block) => scope_reads_plainly(&block.body, names.clone(), built),
+        Stmt::Block(block) => scope_reads_plainly(&block.body, without(names, &[]), built),
         _ => !statements_read(std::slice::from_ref(stmt), names, true),
     })
 }
 
-/// Whether `expr`, a written value or the value of a plain `set`, reads
-/// `names` plainly: a carrier alone, as a whole operand of `~` or `+`, or called (a
-/// macro's text) with arguments that read none; a part only in a statement
-/// that `builds`.
+/// Whether `set` binds a holder's name to anything but a new namespace: the
+/// name would then name a namespace that another name reads.
+fn rebinds_holder(set: &Set, names: &Names) -> bool {
+    matches!(&set.target, Expr::Var(target) if names.get(target.id) == Some(&Watched::Holder))
+        && !calls_namespace(&set.expr)
+}
+
+/// The namespace whose attribute `expr` reads or binds (`ns.attr`), where
+/// `names` watch it as `kind`.
+fn attribute_of<'a>(expr: &Expr<'a>, names: &Names<'a>, kind: Watched) -> Option<&'a str> {
+    match expr {
+        Expr::GetAttr(attr) => match &attr.expr {
+            Expr::Var(var) if names.get(var.id) == Some(&kind) => Some(var.id),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Whether `expr`, a written value, the value of a plain `set` or the value
+/// a `set` binds to a holder's attribute, reads `names` plainly: a carrier
+/// or a holder's attribute alone or as a whole operand of `~` or `+`, or a
+/// carrier called (a macro's text) with arguments that read none; a part
+/// only in a statement that `builds`. A holder is read by its attributes,
+/// never by its name alone.
 fn joins<'a>(expr: &'a Expr<'a>, names: &Names<'a>, builds: bool) -> bool {
     match expr {
-        Expr::Var(var) => builds || names.get(var.id) != Some(&Watched::Part),
+        Expr::Var(var) => match names.get(var.id) {
+            Some(Watched::Part) => builds,
+            // A holder is read by its attributes.
+            Some(Watched::Holder) => false,
+            _ => true,
+        },
+        Expr::GetAttr(_) if attribute_of(expr, names, Watched::Holder).is_some() => true,
         Expr::BinOp(op) if matches!(op.op, BinOpKind::Concat | BinOpKind::Add) => {
             joins(&op.left, names, builds) && joins(&op.right, names, builds)
         }
@@ -2351,10 +2451,21 @@ fn joins<'a>(expr: &'a Expr<'a>, names: &Names<'a>, builds: bool) -> bool {
 }
 
 /// Whether `expr`, the condition of an `if`, reads `names` only to ask
-/// whether one is empty: a name alone, or under `not`, `and` and `or`.
+/// whether one is empty: a name or a holder's attribute alone, such an
+/// attribute against the empty string (`ns.attr == ''` or `!= ''`), or
+/// under `not`, `and` and `or`.
 fn asks_whether_empty<'a>(expr: &'a Expr<'a>, names: &Names<'a>) -> bool {
     match expr {
         Expr::Var(_) => true,
+        Expr::GetAttr(_) if attribute_of(expr, names, Watched::Holder).is_some() => true,
+        // A holder's attribute against the empty string: the same question.
+        Expr::BinOp(op)
+            if matches!(op.op, BinOpKind::Eq | BinOpKind::Ne)
+                && attribute_of(&op.left, names, Watched::Holder).is_some()
+                && matches!(&op.right, Expr::Const(empty) if empty.value.as_str() == Some("")) =>
+        {
+            true
+        }
         Expr::UnaryOp(op) if matches!(op.op, UnaryOpKind::Not) => {
             asks_whether_empty(&op.expr, names)
         }
@@ -2381,12 +2492,13 @@ fn statements_read<'a>(stmts: &'a [Stmt<'a>], names: &Names<'a>, parts: bool) ->
 }
 
 /// Whether one of `read`, the names a piece of a template reads, is watched
-/// among `names`: as a carrier or, where `parts` count, as a part.
+/// among `names`: as a carrier or a holder or, where `parts` count, as a
+/// part.
 fn any_watched(read: &HashSet<&str>, names: &Names, parts: bool) -> bool {
     read.iter().any(|name| match names.get(name) {
-        Some(Watched::Carrier) => true,
+        Some(Watched::Carrier | Watched::Holder) => true,
         Some(Watched::Part) => parts,
-        None => false,
+        Some(Watched::Namespace) | None => false,
     })
 }
 
@@ -2398,7 +2510,9 @@ fn without<'a>(names: &Names<'a>, targets: &'a [Expr<'a>]) -> Names<'a> {
         bound.expr(target);
     }
     let mut inner = names.clone();
-    inner.retain(|name, _| !bound.names.contains(name));
+    // A namespace becomes a holder at the top level alone: inside, a `set` of
+    // its attribute from a carrier fails as before.
+    inner.retain(|name, kind| !bound.names.contains(name) && *kind != Watched::Namespace);
     inner
 }
 
@@ -4591,7 +4705,9 @@ impl ChatTemplateState {
             return Vec::new();
         };
         let source = template.source();
-        let (mut computed, unsettled) = computed_statements(root_sets(source));
+        let sets = root_sets(source);
+        let namespaces = namespaces(&sets);
+        let (mut computed, unsettled) = computed_statements(sets);
         let mut statements = String::new();
         for statement in &computed {
             let (start, end) = statement.span;
@@ -4715,7 +4831,7 @@ impl ChatTemplateState {
                 computed[index].builds = true;
             }
             let read_plainly = parse(source, "chat", SyntaxConfig {}, WhitespaceConfig::default())
-                .is_ok_and(|ast| built_values_read_plainly(&ast, &computed));
+                .is_ok_and(|ast| built_values_read_plainly(&ast, &computed, &namespaces));
             if !read_plainly {
                 return Vec::new();
             }

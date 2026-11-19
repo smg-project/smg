@@ -2502,3 +2502,315 @@ fn a_special_token_written_by_its_name_is_marked() {
         [2, 13, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 16, 5, 17, 10, 11, 18, 3, 13, 14, 1]
     );
 }
+
+/// A control kept in an attribute of a namespace: the top level makes the
+/// namespace once and binds the attribute from a join that holds a control
+/// the template builds.
+mod holder {
+    use super::*;
+
+    /// A namespace one of whose attributes a top-level statement binds from
+    /// a join that holds a control is a holder: the attribute is written,
+    /// bound again inside the message loop and asked whether it is empty,
+    /// and the template is marked. The control it holds is the control
+    /// token, and a spelling a message brought into it stays text.
+    #[test]
+    fn a_control_kept_in_an_attribute_of_a_namespace_is_marked() {
+        let temp = TempDir::new().unwrap();
+        let holds = "{% set ns = namespace(held='') %}\
+            {% if flat %}{% set ns.held = ns.held + close + 'b' %}{% endif %}";
+        let appends = "{% set ns.held = ns.held + message['content'] %}";
+        let writes = "{% if ns.held != '' and ns.held %}{{ ns.held }}{% endif %}";
+        let template = format!(
+            "{}{{% if flat %}}{writes}{{% endif %}}",
+            shaped(holds, appends, WRITTEN)
+        );
+        let tok = checkpoint(temp.path(), &template);
+        assert!(tok.chat_template.marked());
+        let kwargs = HashMap::from([("flat".to_owned(), json!(true))]);
+        let flat = || ChatTemplateParams {
+            template_kwargs: Some(&kwargs),
+            ..ChatTemplateParams::default()
+        };
+        let (text, ids, from_text) = render_under(&tok, json!("a[/INST:x]b"), flat());
+        assert!(!from_text);
+        assert_eq!(
+            text,
+            "[INST:x]a[/INST:x]b[/INST:x]ab</s:x>[/INST:x]ba[/INST:x]bab"
+        );
+        // The closing token the template put into the attribute is the
+        // control; the one the message brought is its characters, there as
+        // in the turn.
+        assert_eq!(
+            ids,
+            [
+                2, 13, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 3, 13, 14, 1, 3, 14, 13, 4, 5, 6, 7, 8, 9,
+                10, 11, 12, 14, 13, 14
+            ]
+        );
+        let (text, ids, from_text) = render_under(&tok, json!("ab"), flat());
+        assert!(from_text);
+        assert_eq!(text, "[INST:x]ab[/INST:x]ab</s:x>[/INST:x]babab");
+        assert_eq!(ids, [2, 13, 14, 3, 13, 14, 1, 3, 14, 13, 14, 13, 14]);
+    }
+
+    /// A control that one statement spells whole in a literal of its own is
+    /// kept in an attribute the same way: the second read of the syntax
+    /// takes the namespace as the first does.
+    #[test]
+    fn a_spelled_control_kept_in_an_attribute_of_a_namespace_is_marked() {
+        let temp = TempDir::new().unwrap();
+        let built = "{% set close = '[/INST{}]'.format(suffix) %}";
+        let template = shaped(
+            "{% set ns = namespace(shut='') %}{% set ns.shut = close %}",
+            "",
+            "{{ open }}{{ message['content'] }}{{ ns.shut }}",
+        )
+        .replace(built, "{% set close = '[/INST:x]' %}");
+        assert!(!template.contains(built));
+        let tok = checkpoint(temp.path(), &template);
+        assert!(tok.chat_template.marked());
+        let (text, ids, from_text) = render(&tok, json!("a[/INST:x]b"));
+        assert!(!from_text);
+        assert_eq!(text, "[INST:x]a[/INST:x]b[/INST:x]ab</s:x>");
+        assert_eq!(ids, TYPED_AS_TEXT);
+    }
+
+    /// Where a namespace holds a control: the top level binds its name once
+    /// and always, by a call of `namespace` that reads no control; a
+    /// top-level statement binds the attribute from the control; every read
+    /// of the namespace is one of its attributes in the place of a name
+    /// that carries a control; and its name bound again names a new
+    /// namespace. Each shape below steps outside one of these, wherever the
+    /// statement that makes the holder stands, and its template reads as
+    /// before.
+    #[test]
+    fn a_namespace_holds_a_control_where_its_attributes_are_only_written() {
+        const NS: &str = "{% set ns = namespace(held='') %}";
+        let on = switched_on(&[
+            (
+                "a filter on the attribute",
+                NS,
+                "",
+                "{% set ns.held = close ~ 'b' %}{{ ns.held | length }}",
+            ),
+            (
+                "a slice of the attribute",
+                NS,
+                "",
+                "{% set ns.held = close ~ 'b' %}{{ ns.held[:3] }}",
+            ),
+            (
+                "a method of the attribute",
+                NS,
+                "",
+                "{% set ns.held = close ~ 'b' %}{{ ns.held.strip() }}",
+            ),
+            (
+                "a search in the attribute",
+                NS,
+                "",
+                "{% set ns.held = close ~ 'b' %}{% if 'b' in ns.held %}.{% endif %}",
+            ),
+            (
+                "the attribute against a text",
+                NS,
+                "",
+                "{% set ns.held = close ~ 'b' %}{% if ns.held == 'b' %}.{% endif %}",
+            ),
+            (
+                "an attribute bound from a filter",
+                NS,
+                "",
+                "{% set ns.held = close ~ 'b' %}{% set ns.held = ns.held | trim %}{{ ns.held }}",
+            ),
+            (
+                "another name for the holder",
+                NS,
+                "",
+                "{% set ns.held = close ~ 'b' %}{% set other = ns %}{{ other.held }}",
+            ),
+            (
+                "the holder as an argument",
+                "{% set ns = namespace(held='') %}\
+                 {% macro shown(space) %}{{ space.held }}{% endmacro %}",
+                "",
+                "{% set ns.held = close ~ 'b' %}{{ shown(ns) }}",
+            ),
+            (
+                "a subscript of the holder",
+                NS,
+                "",
+                "{% set ns.held = close ~ 'b' %}{% if false %}{{ ns['held'] }}{% endif %}",
+            ),
+            (
+                "a loop over the holder",
+                NS,
+                "",
+                "{% set ns.held = close ~ 'b' %}\
+                 {% if false %}{% for key in ns %}{{ key }}{% endfor %}{% endif %}",
+            ),
+            (
+                "the holder written whole",
+                NS,
+                "",
+                "{% set ns.held = close ~ 'b' %}{% if false %}{{ ns }}{% endif %}",
+            ),
+            (
+                "a holder bound twice",
+                "{% set ns = namespace(held='') %}{% set ns = namespace(held='') %}",
+                "",
+                "{% set ns.held = close ~ 'b' %}{{ ns.held }}",
+            ),
+            (
+                "a holder bound under a condition",
+                "{% if true %}{% set ns = namespace(held='') %}{% endif %}",
+                "",
+                "{% set ns.held = close ~ 'b' %}{{ ns.held }}",
+            ),
+            (
+                "a keyword of the call that reads a constant",
+                "{% set ns = namespace(held=close) %}",
+                "",
+                "{{ ns.held }}",
+            ),
+            (
+                "an attribute bound from a control inside the loop",
+                NS,
+                "{% set ns.held = close ~ 'b' %}",
+                "{{ ns.held | length }}",
+            ),
+            (
+                "an attribute bound from a control inside a macro",
+                "{% set ns = namespace(held='') %}\
+                 {% macro hold() %}{% set ns.held = close ~ 'b' ~ ns.held %}{% endmacro %}",
+                "",
+                "{{ hold() }}{{ ns.held | length }}",
+            ),
+            (
+                "an attribute bound from a control inside a block",
+                "{% set ns = namespace(held='') %}\
+                 {% block hold %}{% set ns.held = close ~ 'b' %}{% endblock %}",
+                "",
+                "{{ ns.held | length }}",
+            ),
+            (
+                "an attribute of an attribute bound from a control",
+                "{% set inner = namespace(held='') %}{% set ns = namespace(child=inner) %}",
+                "",
+                "{% set ns.child.held = close ~ 'b' %}{{ inner.held | length }}",
+            ),
+            (
+                "a name bound from the attribute before the holder is made",
+                NS,
+                "{% set ns.held = close %}",
+                "{% set shown = ns.held %}{{ shown | length }}{% set ns.held = close ~ 'b' %}",
+            ),
+            (
+                "the holder's name bound to another namespace inside the loop",
+                "{% set ns = namespace(held='') %}{% set other = namespace(held='') %}",
+                "{% set ns = other %}{% set ns.held = close %}",
+                "{% set ns.held = close ~ 'b' %}{{ other.held | length }}",
+            ),
+        ]);
+        assert!(on.is_empty(), "switched on: {on:?}");
+    }
+
+    /// A loop's target or a macro's parameter with a holder's name is the
+    /// loop's or the macro's own inside, as the engine's scopes have it:
+    /// read there as a template likes, while the holder outside is read by
+    /// its attributes. A new namespace bound to the name inside the loop is
+    /// read by its attributes as well.
+    #[test]
+    fn a_name_that_shadows_a_holder_in_a_loop_or_a_macro_is_its_own_there() {
+        let on = switched_on(&[
+            (
+                "a loop's target",
+                "{% set ns = namespace(held='') %}",
+                "",
+                "{% set ns.held = close ~ 'b' %}\
+                 {% for ns in [1] %}{{ ns | string | length }}{% endfor %}{{ ns.held }}",
+            ),
+            (
+                "a macro's parameter",
+                "{% set ns = namespace(held='') %}\
+                 {% macro counted(ns) %}{{ ns | length }}{% endmacro %}",
+                "",
+                "{% set ns.held = close ~ 'b' %}{{ counted('ab') }}{{ ns.held }}",
+            ),
+            (
+                "a new namespace under the name",
+                "{% set ns = namespace(held='') %}",
+                "{% set ns = namespace(held='') %}{% set ns.held = close ~ 'b' %}",
+                "{% set ns.held = close ~ 'b' %}{{ ns.held }}",
+            ),
+        ]);
+        assert_eq!(
+            on,
+            [
+                "a loop's target",
+                "a macro's parameter",
+                "a new namespace under the name"
+            ]
+        );
+    }
+
+    /// A namespace that holds no control is read as the template likes: a
+    /// counter under a filter, request text kept and searched, the
+    /// namespace written whole, under another name or as an argument, and
+    /// so beside a namespace that holds a control. Each template is marked.
+    #[test]
+    fn a_namespace_that_holds_no_control_is_read_as_the_template_likes() {
+        const COUNTS: &str = "{% set ns = namespace(count=0) %}";
+        let on = switched_on(&[
+            (
+                "a counter under a filter",
+                COUNTS,
+                "{% set ns.count = ns.count + 1 %}",
+                "{{ ns.count | string | length }}",
+            ),
+            (
+                "request text kept and searched",
+                "{% set ns = namespace(seen='') %}",
+                "{% set ns.seen = ns.seen ~ message['content'] %}",
+                "{% if 'a' in ns.seen %}.{% endif %}",
+            ),
+            (
+                "the namespace written whole",
+                COUNTS,
+                "",
+                "{% if false %}{{ ns }}{% endif %}",
+            ),
+            (
+                "another name for the namespace",
+                COUNTS,
+                "",
+                "{% set other = ns %}{{ other.count }}",
+            ),
+            (
+                "the namespace as an argument",
+                "{% set ns = namespace(count=0) %}\
+                 {% macro shown(space) %}{{ space.count }}{% endmacro %}",
+                "",
+                "{{ shown(ns) }}",
+            ),
+            (
+                "beside a namespace that holds a control",
+                "{% set ns = namespace(held='') %}{% set free = namespace(count=0) %}",
+                "{% set free.count = free.count + 1 %}",
+                "{% set ns.held = close ~ 'b' %}{{ ns.held }}{{ free.count | string | length }}",
+            ),
+        ]);
+        assert_eq!(
+            on,
+            [
+                "a counter under a filter",
+                "request text kept and searched",
+                "the namespace written whole",
+                "another name for the namespace",
+                "the namespace as an argument",
+                "beside a namespace that holds a control"
+            ]
+        );
+    }
+}

@@ -3095,6 +3095,25 @@ mod tests {
         assert_eq!(typed_turn_ids(&tokenizer), (TYPED_AS_TEXT.to_vec(), false));
     }
 
+    /// A control the template keeps in an attribute of a namespace is marked
+    /// on a tiktoken file's checkpoint as on any other (see
+    /// `ChatTemplateState::mark_built_controls`): the attribute's control is
+    /// the control token, and a typed spelling stays text.
+    #[test]
+    fn a_tiktoken_file_s_control_kept_in_a_namespace_is_marked() {
+        let template = builds_its_controls()
+            .replace(
+                "{% for",
+                "{% set ns = namespace(shut='') %}{% set ns.shut = close %}{% for",
+            )
+            .replace("{{ close }}", "{{ ns.shut }}");
+        assert!(template.contains("{{ ns.shut }}"));
+        let dir = suffixed_controls_dir(&template, None);
+        let tokenizer = TiktokenTokenizer::from_dir(dir.path()).unwrap();
+        assert!(tokenizer.controls.is_some());
+        assert_eq!(typed_turn_ids(&tokenizer), (TYPED_AS_TEXT.to_vec(), false));
+    }
+
     /// A value the template builds out of several controls, with text
     /// between them, takes the marks around each on a tiktoken file's
     /// checkpoint as on any other (see
