@@ -108,9 +108,11 @@ pub struct GroupTick<'a> {
 /// The lock: the collector calls [`Self::record`], [`Self::report`] and
 /// [`Self::report_empty`] while it holds the lock of its own reports, and
 /// lays what the sink answers under the same hold, so a record that lands
-/// between a sink's answer and the collector's lay is not undone. A sink
-/// called there neither calls the collector nor waits. The other calls are
-/// made with no lock of the collector's held.
+/// between a sink's answer and the collector's lay is not undone. It calls
+/// [`Self::forget`] there too, so a record lands ahead of a report's
+/// removal or behind the sink's word of it. A sink called there neither
+/// calls the collector nor waits. The other calls are made with no lock of
+/// the collector's held.
 ///
 /// A poll's unit is one engine: its polled members cross together, so a
 /// sink that judges an engine reads the answer whole.
@@ -154,9 +156,11 @@ pub trait LoadSink: Send + Sync {
     fn fetch_failed(&self, members: &[Arc<dyn Worker>]);
 
     /// The worker's loads are forgotten: it left the registry, was
-    /// replaced, or its status left `Ready`. It is also said, under the
-    /// lock of the reports, for a worker whose pushed report a record of
-    /// the registry's worker at the URL replaced.
+    /// replaced, or its status left `Ready`. It is also said for a worker
+    /// whose pushed report a record of the registry's worker at the URL
+    /// replaced. It is not said at the eviction of a worker whose URL holds
+    /// another worker's report: what the sink holds at the URL is that
+    /// worker's since its first record.
     fn forget(&self, worker: &Arc<dyn Worker>);
 
     /// The collector reset itself: it stopped its groups and dropped every

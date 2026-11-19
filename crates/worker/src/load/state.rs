@@ -236,6 +236,10 @@ impl<G: Generation> LoadState<G> {
     /// published stay the eviction path's responsibility, which always runs
     /// after the registry mutation and therefore after this fence would have
     /// started failing.
+    ///
+    /// A report that is admitted voids the eviction queued for its worker:
+    /// an eviction is for what the worker published before it was queued,
+    /// and a worker that left `Ready` and came back publishes ahead of it.
     pub(crate) fn publish_group(
         &self,
         group_urls: &[String],
@@ -260,6 +264,15 @@ impl<G: Generation> LoadState<G> {
             for url in group_urls {
                 changed |= entries.remove(url.as_str()).is_some();
             }
+            if !admitted.is_empty() {
+                // Under the publishers' lock, as the batch that applies the
+                // queue takes it: the two do not cross.
+                self.pending_evictions.lock().retain(|queued| {
+                    !admitted.iter().any(|(_, entry)| {
+                        std::ptr::addr_eq(entry.source.as_ptr(), Arc::as_ptr(queued))
+                    })
+                });
+            }
             for (url, entry) in admitted {
                 entries.insert(url, entry);
                 changed = true;
@@ -269,8 +282,8 @@ impl<G: Generation> LoadState<G> {
     }
 
     /// Whether `worker` is the `Ready` worker the registry holds at its URL
-    /// now, by pointer. One test at three places: the publish fence, the
-    /// start of a pushed report, and the pushers a reset keeps.
+    /// now, by pointer. One test at two places: the publish fence and the
+    /// pushers a reset keeps.
     pub(crate) fn is_current_incarnation(&self, worker: &Arc<dyn Worker>) -> bool {
         self.registry
             .get_by_url(worker.url())
@@ -295,15 +308,19 @@ impl<G: Generation> LoadState<G> {
     /// Apply every queued eviction in one rebuild. Returns the workers whose
     /// own entry was actually removed (the metrics sentinel set): a same-URL
     /// replacement that already republished keeps its fresh entry, and its
-    /// series simply continues under the same URL.
+    /// series simply continues under the same URL. So does a worker that
+    /// published again after its eviction was queued: that publish took the
+    /// eviction out of the queue ([`Self::publish_group`]).
     pub(crate) fn apply_pending_evictions(&self) -> Vec<Arc<dyn Worker>> {
-        let pending: Vec<Arc<dyn Worker>> = std::mem::take(&mut *self.pending_evictions.lock());
-        if pending.is_empty() {
+        if self.pending_evictions.lock().is_empty() {
             return Vec::new();
         }
 
         let mut removed: Vec<Arc<dyn Worker>> = Vec::new();
         self.rebuild(|entries| {
+            // The queue is taken under the publishers' lock, so a publish
+            // that voids an eviction and this batch do not cross.
+            let pending: Vec<Arc<dyn Worker>> = std::mem::take(&mut *self.pending_evictions.lock());
             let mut changed = false;
             for worker in &pending {
                 let evict = entries.get(worker.url()).is_some_and(|entry| {
@@ -586,5 +603,23 @@ mod tests {
 
         assert!(state.snapshot().is_empty());
         assert!(state.apply_pending_evictions().is_empty());
+    }
+
+    /// An eviction is for what its worker published before it was queued:
+    /// a publish of the same worker since then voids it, and the fresh
+    /// entry stays.
+    #[test]
+    fn a_publish_voids_the_eviction_queued_before_it() {
+        let (registry, state) = setup();
+        let worker = ready_worker("http://w1:8080", "m");
+        registry.register(Arc::clone(&worker)).unwrap();
+        state.publish_group(&[], vec![(Arc::clone(&worker), load(1))]);
+        state.enqueue_eviction(Arc::clone(&worker));
+
+        state.publish_group(&[], vec![(Arc::clone(&worker), load(2))]);
+        let removed = state.apply_pending_evictions();
+
+        assert!(removed.is_empty(), "the eviction is older than the entry");
+        assert_eq!(waiting_of(&state.snapshot(), "http://w1:8080"), Some(2));
     }
 }

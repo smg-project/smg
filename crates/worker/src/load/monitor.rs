@@ -346,9 +346,9 @@ pub trait LoadConsumer: Send + Sync {
 /// started it. A reset holds the report to that worker: one that left, was
 /// replaced or left `Ready` while registry events were lost is evicted
 /// there ([`WorkerMonitor::evict_lost_pushers`]). The pusher was the
-/// registry's `Ready` worker at the URL when its record started the
-/// report, and the report holds that worker's records alone: a record of
-/// any other worker starts it again or is dropped.
+/// registry's worker at the URL when its record started the report,
+/// `Ready` or not, and the report holds that worker's records alone: a
+/// record of any other worker starts it again or is dropped.
 struct PushedFile {
     report: WorkerLoadResponse,
     pusher: Arc<dyn Worker>,
@@ -582,7 +582,9 @@ impl<G: Generation> WorkerMonitor<G> {
     /// are ignored before updating freshness, liveness, metrics or routing
     /// state, and before any reader of the record is called. A record that
     /// finds no report, or the report of another worker, starts one for the
-    /// registry's `Ready` worker at the URL alone. Any other is dropped
+    /// registry's worker at the URL alone, whatever its status: the sink
+    /// and the wedged rule hear a registered worker that is not `Ready`,
+    /// and the publish fence holds its rows back. Any other is dropped
     /// ahead of the report, the sink, the series and the publish. Its
     /// worker is still marked as one whose stream pushes, as for any record.
     pub fn apply_pushed_load<R: LoadRecord>(
@@ -619,14 +621,16 @@ impl<G: Generation> WorkerMonitor<G> {
             .get(url)
             .is_some_and(|file| Arc::ptr_eq(&file.pusher, worker))
         {
-            // A report is on file for the registry's `Ready` worker at its
-            // URL alone, by the publish fence's test, and holds that
-            // worker's records alone. A host ends a worker's stream after
-            // the registry let the worker go, and starts its successor's
-            // with no word to the monitor. So a record can land behind its
+            // A report is on file for the registry's worker at its URL
+            // alone, by identity, and holds that worker's records alone.
+            // Its status is not read: a worker that is not `Ready` still
+            // feeds the sink and the wedged rule, and the publish fence
+            // holds its rows back. A host ends a worker's stream after the
+            // registry let the worker go, and starts its successor's with
+            // no word to the monitor. So a record can land behind its
             // worker's eviction or ahead of its predecessor's: it starts a
             // report for the registry's worker and is dropped for any other.
-            if !self.load_state.is_current_incarnation(worker) {
+            if !self.worker_registry.is_current_handle(worker) {
                 return;
             }
             let started = PushedFile::started_by(worker);
@@ -1258,11 +1262,12 @@ impl<G: Generation> WorkerMonitor<G> {
     /// Evict the loads of every pusher that is no longer the `Ready` worker
     /// the registry holds at its URL: it left, was replaced or left `Ready`
     /// while registry events were lost, so no event evicted it. The test is
-    /// the publish fence's ([`LoadState::is_current_incarnation`]): a report
-    /// the fence refuses is not kept on file. A pusher that stays keeps its
-    /// report, and the sink its receipts: its stream is not the monitor's
-    /// to stop. A worker registered at the URL later starts a report of its
-    /// own.
+    /// the publish fence's ([`LoadState::is_current_incarnation`]): the
+    /// eviction a lost event owed is made here. A pusher that stays keeps
+    /// its report, and the sink its receipts: its stream is not the
+    /// monitor's to stop. A worker that is still registered starts its
+    /// report again at its next record, and one registered at the URL
+    /// later starts a report of its own.
     fn evict_lost_pushers(&self) {
         let lost: Vec<Arc<dyn Worker>> = self
             .pushed_reports
@@ -1284,16 +1289,27 @@ impl<G: Generation> WorkerMonitor<G> {
     /// worker (its overload flag, its receipts, its cached rank loads) are
     /// cleared synchronously; the shared snapshot removal is queued so a
     /// removal wave costs one batched rebuild instead of one per worker (see
-    /// [`Self::flush_pending_evictions`]).
+    /// [`Self::flush_pending_evictions`]). The report and the sink's part
+    /// go when the report at the URL is the worker's own, or none is there.
+    /// A report another worker started ahead of this eviction stays, with
+    /// what the sink holds at the URL: both are that worker's.
     fn evict_worker_loads(&self, worker: &Arc<dyn Worker>) {
         let url = worker.url();
         self.native_loads_memo.remove(url);
-        // The pushed report goes with the worker, by its URL: a replacement
-        // is polled until its own stream pushes. A report the replacement
-        // started ahead of this eviction goes too, and its next record
-        // starts it again.
-        self.pushed_reports.lock().remove(url);
-        self.sink.forget(worker);
+        {
+            let mut reports = self.pushed_reports.lock();
+            if reports
+                .get(url)
+                .is_none_or(|file| Arc::ptr_eq(&file.pusher, worker))
+            {
+                // The pushed report goes with the worker that pushed it: a
+                // replacement is polled until its own stream pushes. The
+                // sink forgets under this hold, so a record of the next
+                // worker at the URL lands behind it and keeps its receipt.
+                reports.remove(url);
+                self.sink.forget(worker);
+            }
+        }
         self.load_state.enqueue_eviction(Arc::clone(worker));
     }
 
@@ -1304,7 +1320,8 @@ impl<G: Generation> WorkerMonitor<G> {
     /// would otherwise read its last load as live. For a removed worker it is
     /// a no-op: the worker series store dropped the series with the
     /// registration. A same-URL replacement that already republished keeps
-    /// its entry, and its series continues uninterrupted.
+    /// its entry, and its series continues uninterrupted. So does a worker
+    /// that left `Ready`, came back and published again ahead of the flush.
     pub(crate) fn flush_pending_evictions(&self) {
         for worker in self.load_state.apply_pending_evictions() {
             // A worker can serve multiple models (one load group per model),

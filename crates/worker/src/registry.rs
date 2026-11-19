@@ -638,7 +638,7 @@ impl<G: Generation> WorkerRegistry<G> {
     /// and the shared runtime but installs a new worker object with a possibly
     /// different model card, and the replaced handle must not be allowed to
     /// attribute a counter move to the model set it used to carry.
-    fn is_current_handle(&self, worker: &Arc<dyn Worker>) -> bool {
+    pub(crate) fn is_current_handle(&self, worker: &Arc<dyn Worker>) -> bool {
         let Some(worker_id) = self.url_to_id.get(worker.url()).map(|id| id.clone()) else {
             return false;
         };
