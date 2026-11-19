@@ -1358,7 +1358,9 @@ impl CliArgs {
         let service_discovery_config = router_config
             .discovery
             .as_ref()
-            .map(|discovery| RuntimeDiscoveryConfig::from_config(discovery, &router_config.mode))
+            .map(|discovery| {
+                RuntimeDiscoveryConfig::from_config(discovery, router_config.mode.discovery_roles())
+            })
             .transpose()?;
         let mesh_discovery_config = router_config
             .discovery

@@ -10,7 +10,7 @@ use std::{collections::BTreeMap, net::Ipv6Addr};
 use openai_protocol::worker::WorkerType;
 use smg_worker::identity::endpoint::{Endpoint, EndpointError};
 
-use crate::{config::RoutingMode, observability::metrics::metrics_labels};
+use super::series;
 
 /// Which provider produced a snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -40,10 +40,10 @@ impl DiscoveryKind {
     /// The `discovery` value on discovery metrics.
     pub(super) fn metric_label(self) -> &'static str {
         match self {
-            DiscoveryKind::Kubernetes => metrics_labels::DISCOVERY_KUBERNETES,
-            DiscoveryKind::File => metrics_labels::DISCOVERY_FILE,
-            DiscoveryKind::Slurm => metrics_labels::DISCOVERY_SLURM,
-            DiscoveryKind::Consul => metrics_labels::DISCOVERY_CONSUL,
+            DiscoveryKind::Kubernetes => series::DISCOVERY_KUBERNETES,
+            DiscoveryKind::File => series::DISCOVERY_FILE,
+            DiscoveryKind::Slurm => series::DISCOVERY_SLURM,
+            DiscoveryKind::Consul => series::DISCOVERY_CONSUL,
         }
     }
 }
@@ -51,25 +51,16 @@ impl DiscoveryKind {
 /// The worker types a routing mode accepts, for a provider whose records name
 /// their own type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Roles {
+pub enum Roles {
+    /// Regular workers alone.
     Regular,
+    /// Prefill and decode workers.
     PrefillDecode,
+    /// Encode, prefill and decode workers.
     EncodePrefillDecode,
 }
 
 impl Roles {
-    /// `None` for a mode with no worker pools to fill.
-    pub(super) fn of(mode: &RoutingMode) -> Option<Self> {
-        match mode {
-            RoutingMode::Regular { .. } => Some(Self::Regular),
-            RoutingMode::PrefillDecode { .. } => Some(Self::PrefillDecode),
-            RoutingMode::EncodePrefillDecode { .. } => Some(Self::EncodePrefillDecode),
-            RoutingMode::OpenAI { .. }
-            | RoutingMode::Anthropic { .. }
-            | RoutingMode::Gemini { .. } => None,
-        }
-    }
-
     pub(super) fn allows(self, worker_type: WorkerType) -> bool {
         matches!(
             (self, worker_type),

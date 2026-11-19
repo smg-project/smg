@@ -857,30 +857,7 @@ pub(crate) fn init_metrics() {
     );
 
     // Layer 4: Discovery metrics
-    describe_counter!(
-        "smg_discovery_registrations_total",
-        "Worker registration attempts by source and result"
-    );
-    describe_counter!(
-        "smg_discovery_deregistrations_total",
-        "Worker deregistration events by source and reason"
-    );
-    describe_histogram!(
-        "smg_discovery_sync_duration_seconds",
-        "Discovery sync duration by source"
-    );
-    describe_gauge!(
-        "smg_discovery_workers_discovered",
-        "Workers known via discovery by source"
-    );
-    describe_counter!(
-        "smg_discovery_snapshot_errors_total",
-        "Discovery source observations rejected, by source and reason"
-    );
-    describe_counter!(
-        "smg_discovery_skipped_total",
-        "Discovered workers left out of an otherwise good snapshot, by source and reason"
-    );
+    crate::service_discovery::describe_series();
 
     // Layer 5: MCP metrics
     describe_counter!(
@@ -2419,70 +2396,6 @@ impl Metrics {
     // ========================================================================
     // Layer 3: Worker resilience metrics (retry)
     // ========================================================================
-
-    // ========================================================================
-    // Layer 4: Discovery metrics
-    // ========================================================================
-
-    /// Record worker registration attempt
-    pub fn record_discovery_registration(source: &'static str, result: &'static str) {
-        counter!(
-            "smg_discovery_registrations_total",
-            "source" => source,
-            "result" => result
-        )
-        .increment(1);
-    }
-
-    /// Record worker deregistration
-    pub fn record_discovery_deregistration(source: &'static str, reason: &'static str) {
-        counter!(
-            "smg_discovery_deregistrations_total",
-            "source" => source,
-            "reason" => reason
-        )
-        .increment(1);
-    }
-
-    /// Record discovery sync duration
-    pub fn record_discovery_sync_duration(source: &'static str, duration: Duration) {
-        histogram!(
-            "smg_discovery_sync_duration_seconds",
-            "source" => source
-        )
-        .record(duration.as_secs_f64());
-    }
-
-    /// Set workers discovered count
-    pub fn set_discovery_workers_discovered(source: &'static str, count: usize) {
-        gauge!(
-            "smg_discovery_workers_discovered",
-            "source" => source
-        )
-        .set(count as f64);
-    }
-
-    /// Record a discovered worker a provider left out of a snapshot it
-    /// otherwise applied
-    pub fn record_discovery_skip(source: &'static str, reason: &'static str) {
-        counter!(
-            "smg_discovery_skipped_total",
-            "source" => source,
-            "reason" => reason
-        )
-        .increment(1);
-    }
-
-    /// Record a discovery source observation that was rejected; the provider
-    /// keeps reconciling its last good snapshot meanwhile
-    pub fn record_discovery_snapshot_error(source: &'static str, reason: &'static str) {
-        counter!(
-            "smg_discovery_snapshot_errors_total",
-            "source" => source,
-            "reason" => reason
-        )
-        .increment(1);
-    }
 
     // ========================================================================
     // Layer 5: MCP metrics

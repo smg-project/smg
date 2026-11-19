@@ -291,7 +291,7 @@ A port is a trait this crate calls and a host implements.
 | `EngineConnector` | `connection::engine` | How to connect a gRPC or ZMQ worker to its engine, and how to dial a gRPC address once. | Its gRPC and ZMQ connector. |
 | `EngineConnection` | `connection::engine` | The calls the runtime makes on a connected engine: liveness, the health and load reads, the labels the engine reports of its model and of itself, the admin calls and the two pushed streams. | Its client of an engine. |
 | `ConnectorDefault` | `connection::engine` | The connector a builder uses when it is handed none. | The same connector. |
-| `WorkerJobs` | `health::manager` | How to remove a failed worker, and how to read a worker's labels again. | Its job queue. |
+| `WorkerJobs` | `jobs` | How to remove workers at an address, how to read a worker's labels again, how to register a worker, and whether a job of an address is in flight. | Its job queue. |
 | `LoadConsumer` | `load::monitor` | Whether a reader wants loads, and how to trim what readers booked on a worker. | Its policy registry. |
 | `RequestCompletionSink` | `identity::basic` | What to do when a request on a worker ends. | The sink its policy registry installs. |
 | `KvEventSink` | `kv_events::port` | What to do with the KV cache events a worker's stream brings: keep each rank's cursor, apply what it admits, and drop a worker's blocks when it leaves. | The sink over its KV indexes. |
@@ -337,7 +337,7 @@ is always there.
 | Module | Feature | What it holds |
 |---|---|---|
 | `health` | | The overload thresholds. With `runtime`: the health manager, liveness, the circuit breaker, the resilience settings and the probe of a bootstrap port. |
-| `identity` | | A worker's address, parsed once and keyed, and the sampling defaults a worker reports. With `runtime`: the `Worker` trait, `BasicWorker`, its builder, its metadata and the worker errors. |
+| `identity` | | A worker's address, parsed once and keyed, and the sampling defaults a worker reports. With `runtime`: the `Worker` trait, `BasicWorker`, its builder, its metadata, the worker errors and the door a worker's address passes. |
 | `kv_events` | | The port between the collector of the KV cache events an engine pushes and a host's sink. With `runtime`: the collector, which keeps one task a worker, and the port of its host. |
 | `labels` | | The labels of a worker's spec that the worker's own code reads. |
 | `metrics_labels` | | The metric label values the worker's writers share with a host's. |
@@ -349,6 +349,7 @@ is always there.
 | `metrics` | `metrics` | The label mechanism shared with a host's writers. With `runtime`: the worker's metric writers and their series store. |
 | `common_proto` | `proto` | The Rust types of `proto/common.proto`. |
 | `connection` | `runtime` | The engine handle a host implements, the HTTP client factory and the cache of worker-directed clients. |
+| `jobs` | `runtime` | The port to a host's job queue, and how a registration writes its address. |
 | `load` | `runtime` | A worker's requests in flight, the load monitor, the snapshots it publishes, the fleet's capacity and the merge of scraped metrics. |
 | `pd` | `runtime` | What a prefill or decode worker says of its side of a pair. |
 | `periodic_task` | `runtime` | A task on a thread of its own. |

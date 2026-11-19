@@ -19,6 +19,8 @@ pub use validation::{
     RUNTIME_WORKER_THREADS_PER_CPU,
 };
 
+use crate::service_discovery::DiscoveryConfigError;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("Validation failed: {reason}")]
@@ -49,6 +51,23 @@ impl ConfigError {
             field: field.into(),
             value: value.to_string(),
             reason: reason.into(),
+        }
+    }
+}
+
+impl From<DiscoveryConfigError> for ConfigError {
+    fn from(error: DiscoveryConfigError) -> Self {
+        match error {
+            DiscoveryConfigError::ValidationFailed { reason } => Self::ValidationFailed { reason },
+            DiscoveryConfigError::InvalidValue {
+                field,
+                value,
+                reason,
+            } => Self::InvalidValue {
+                field,
+                value,
+                reason,
+            },
         }
     }
 }

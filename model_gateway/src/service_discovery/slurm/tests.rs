@@ -1,7 +1,6 @@
 use std::sync::Mutex;
 
 use super::*;
-use crate::config::test_support::{epd_routing_mode, regular_routing_mode};
 
 const SQUEUE_23_11: &str = include_str!("../testdata/slurm/squeue-23.11.json");
 const SQUEUE_24_11: &str = include_str!("../testdata/slurm/squeue-24.11.json");
@@ -25,7 +24,7 @@ fn discovery_config(job_names: &[&str]) -> SlurmDiscoveryConfig {
 }
 
 fn config(job_names: &[&str]) -> SlurmProviderConfig {
-    SlurmProviderConfig::new(&discovery_config(job_names), &regular_routing_mode()).unwrap()
+    SlurmProviderConfig::new(&discovery_config(job_names), Some(Roles::Regular)).unwrap()
 }
 
 fn job(jobs: &Jobs, id: u64) -> &Job {
@@ -288,7 +287,7 @@ async fn only_a_placed_job_needs_a_start_time() {
     assert_eq!(
         outcome.skipped,
         [Skip {
-            reason: metrics_labels::DISCOVERY_SKIP_INVALID,
+            reason: series::DISCOVERY_SKIP_INVALID,
             message: "job 1 (smg-worker): running with no start time".to_string(),
         }]
     );
@@ -325,7 +324,7 @@ async fn job_names_map_to_worker_types() {
             bootstrap_port: Some(8998),
             ..discovery_config(&[])
         },
-        &epd_routing_mode(),
+        Some(Roles::EncodePrefillDecode),
     )
     .unwrap();
     let mut workers: Vec<(String, WorkerType, Option<u16>)> = poll(&slurm, &config)
@@ -443,7 +442,7 @@ async fn a_job_on_a_node_scontrol_does_not_know_is_left_out() {
     assert_eq!(
         outcome.skipped,
         [Skip {
-            reason: metrics_labels::DISCOVERY_SKIP_INVALID,
+            reason: series::DISCOVERY_SKIP_INVALID,
             message: "job 2 (smg-worker): node n2 is missing from scontrol's answer".to_string(),
         }]
     );
@@ -476,7 +475,7 @@ async fn two_jobs_on_one_node_leave_it_to_the_first_started() {
     let conflict = |outcome: &PollOutcome| {
         assert_eq!(outcome.skipped.len(), 1, "{:?}", outcome.skipped);
         let skip = outcome.skipped[0].clone();
-        assert_eq!(skip.reason, metrics_labels::DISCOVERY_SKIP_CONFLICT);
+        assert_eq!(skip.reason, series::DISCOVERY_SKIP_CONFLICT);
         skip.message
     };
 
@@ -621,10 +620,7 @@ fn squeue_is_asked_for_the_mapped_names_in_one_scope() {
 
 #[test]
 fn modes_without_worker_pools_cannot_use_slurm_discovery() {
-    let openai = RoutingMode::OpenAI {
-        worker_urls: vec![],
-    };
-    assert!(SlurmProviderConfig::new(&discovery_config(&["w"]), &openai).is_err());
+    assert!(SlurmProviderConfig::new(&discovery_config(&["w"]), None).is_err());
 }
 
 // ---- The commands, against scripts standing in for them. ----
@@ -746,10 +742,7 @@ async fn a_command_that_fails_says_how() {
             .contains("Unable to contact slurm controller"),
         "{error}"
     );
-    assert_eq!(
-        error.metric_reason(),
-        metrics_labels::SNAPSHOT_ERROR_UNREADABLE
-    );
+    assert_eq!(error.metric_reason(), series::SNAPSHOT_ERROR_UNREADABLE);
 
     let slurm = SlurmCli {
         timeout: Duration::from_millis(200),
@@ -787,8 +780,5 @@ async fn an_unusable_answer_is_invalid() {
         .unwrap_err();
     assert!(matches!(error, SlurmError::Invalid { .. }), "{error}");
     assert!(error.to_string().contains("Invalid hostlist"), "{error}");
-    assert_eq!(
-        error.metric_reason(),
-        metrics_labels::SNAPSHOT_ERROR_INVALID
-    );
+    assert_eq!(error.metric_reason(), series::SNAPSHOT_ERROR_INVALID);
 }

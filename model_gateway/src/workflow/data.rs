@@ -18,6 +18,7 @@ use openai_protocol::{
     model_card::ModelCard, worker::WorkerUpdateRequest as ProtocolWorkerUpdateRequest,
 };
 use serde::{Deserialize, Serialize};
+pub use smg_worker::jobs::WorkerRegistrationMode;
 use smg_worker::workflow::{self as worker_workflow, WorkerList};
 use wfaas::{StepId, WorkflowData, WorkflowError, WorkflowResult};
 
@@ -85,29 +86,6 @@ pub trait WorkerRegistrationData: WorkflowData {
     fn registration_mode(&self) -> WorkerRegistrationMode {
         WorkerRegistrationMode::Upsert
     }
-}
-
-/// Semantics of the final worker registry write.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum WorkerRegistrationMode {
-    /// `POST /workers`: fail when the URL is already registered.
-    CreateOnly,
-    /// Startup and service discovery: register the URL, replacing whatever
-    /// holds it. Both reconcile declared state against the registry.
-    #[default]
-    Upsert,
-    /// `PUT /workers/{id}`: replace the worker only while `worker_id` still
-    /// holds the URL at `expected_revision`.
-    ///
-    /// `PUT` answers 202 and registers later, so other writes for the same URL
-    /// can land in between. Binding the write to what the request validated
-    /// makes the late write fail instead of resurrecting a worker a `DELETE`
-    /// removed, overwriting one a `POST` created, or restoring the older
-    /// specification over a second `PUT` that finished first.
-    ReplaceById {
-        worker_id: String,
-        expected_revision: u64,
-    },
 }
 
 // ============================================================================

@@ -1,8 +1,13 @@
+use std::sync::Arc;
+
 use openai_protocol::worker::WorkerType;
 use smg_worker::identity::endpoint::endpoint_key;
 
 use super::*;
-use crate::{server::http_client, service_discovery::testing::create_test_app_context};
+use crate::{
+    app_context::AppContext, config::RouterConfig, server::http_client,
+    service_discovery::testing::create_test_app_context,
+};
 
 fn key(url: &str) -> EndpointKey {
     endpoint_key(url).expect(url)
@@ -260,7 +265,7 @@ fn owned_workers_are_scoped_by_provider_label_and_origin() {
     );
     register_with_labels(&app_context, "http://10.0.0.3:8080", &[]);
 
-    let owned = owned_workers(&app_context, DiscoveryKind::Kubernetes);
+    let owned = owned_workers(&*app_context, DiscoveryKind::Kubernetes);
     assert_eq!(owned.len(), 1);
     assert_eq!(owned[0].endpoint.key().as_str(), "10.0.0.1:8080");
     assert_eq!(owned[0].discovery_id.as_deref(), Some("uid-1:8080"));
@@ -281,7 +286,7 @@ fn owned_workers_read_back_the_spec_hash() {
             (DISCOVERY_SPEC_HASH_LABEL, &worker.fingerprint()),
         ],
     );
-    let owned = owned_workers(&app_context, DiscoveryKind::Kubernetes);
+    let owned = owned_workers(&*app_context, DiscoveryKind::Kubernetes);
     assert_eq!(owned[0].spec_hash, Some(worker.fingerprint()));
 
     let actions = compute_actions(&desired_state_of(&[worker]), &owned);
@@ -302,7 +307,7 @@ fn an_owned_worker_without_a_spec_hash_is_updated_in_place() {
             (DISCOVERY_ID_LABEL, "uid-1:8080"),
         ],
     );
-    let owned = owned_workers(&app_context, DiscoveryKind::Kubernetes);
+    let owned = owned_workers(&*app_context, DiscoveryKind::Kubernetes);
     assert_eq!(owned[0].spec_hash, None);
 
     let desired = desired_state_of(&[published("10.0.0.1:8080", "uid-1:8080")]);
@@ -321,7 +326,7 @@ fn an_owned_worker_without_an_id_is_replaced() {
         "http://10.0.0.1:8080",
         &[(DISCOVERY_PROVIDER_LABEL, "kubernetes")],
     );
-    let owned = owned_workers(&app_context, DiscoveryKind::Kubernetes);
+    let owned = owned_workers(&*app_context, DiscoveryKind::Kubernetes);
     assert_eq!(owned[0].discovery_id, None);
 
     let desired = desired_state_of(&[published("10.0.0.1:8080", "uid-1:8080")]);
@@ -343,7 +348,7 @@ fn an_empty_published_id_does_not_match_a_missing_label() {
         "http://10.0.0.1:8080",
         &[(DISCOVERY_PROVIDER_LABEL, "kubernetes")],
     );
-    let owned = owned_workers(&app_context, DiscoveryKind::Kubernetes);
+    let owned = owned_workers(&*app_context, DiscoveryKind::Kubernetes);
 
     let desired = desired_state_of(&[published("10.0.0.1:8080", "")]);
     let actions = compute_actions(&desired, &owned);
@@ -377,7 +382,7 @@ fn owned_workers_exclude_mesh_imported_workers() {
         .get_by_url("http://10.0.0.3:8080")
         .is_some());
 
-    assert!(owned_workers(&app_context, DiscoveryKind::Kubernetes).is_empty());
+    assert!(owned_workers(&*app_context, DiscoveryKind::Kubernetes).is_empty());
 }
 
 #[test]
@@ -392,7 +397,7 @@ fn build_worker_spec_carries_the_record_and_stamps_provenance() {
         kv_engine_id: Some("engine-1".to_string()),
         ..published("10.0.0.1:8081", "uid-1:8081")
     };
-    let spec = build_worker_spec(&worker, DiscoveryKind::Kubernetes, &app_context);
+    let spec = build_worker_spec(&worker, DiscoveryKind::Kubernetes, &*app_context);
 
     assert_eq!(spec.url, "10.0.0.1:8081");
     assert_eq!(spec.worker_type, WorkerType::Prefill);
@@ -448,7 +453,7 @@ fn compat_labels_are_written_verbatim_but_cannot_claim_provenance() {
         ]),
         ..published("10.0.0.1:8080", "rec-7")
     };
-    let spec = build_worker_spec(&worker, DiscoveryKind::Kubernetes, &app_context);
+    let spec = build_worker_spec(&worker, DiscoveryKind::Kubernetes, &*app_context);
 
     assert_eq!(
         spec.labels
@@ -481,7 +486,7 @@ fn debug_output_masks_a_provider_published_credential() {
 
 #[test]
 fn test_deregistration_reconciled_metric_label() {
-    assert_eq!(metrics_labels::DEREGISTRATION_RECONCILED, "reconciled");
+    assert_eq!(series::DEREGISTRATION_RECONCILED, "reconciled");
 }
 
 #[tokio::test]
@@ -491,7 +496,7 @@ async fn test_reconcile_without_job_queue_is_safe() {
     reconcile(
         &desired,
         DiscoveryKind::Kubernetes,
-        &app_context,
+        &*app_context,
         time::Instant::now(),
     )
     .await;
@@ -504,7 +509,7 @@ async fn test_reconcile_without_job_queue_is_safe() {
 /// pass then queued a second registration of the URL beside it.
 #[tokio::test]
 async fn an_addition_waiting_for_a_queue_slot_holds_its_urls_claim() {
-    use crate::workflow::{JobQueue, JobQueueConfig};
+    use crate::workflow::{Job, JobQueue, JobQueueConfig};
 
     let app_context = create_test_app_context();
     // One slot and no runner: the dispatcher takes one job out and waits for
@@ -539,7 +544,7 @@ async fn an_addition_waiting_for_a_queue_slot_holds_its_urls_claim() {
     let mut pass = std::pin::pin!(reconcile(
         &desired,
         DiscoveryKind::Kubernetes,
-        &app_context,
+        &*app_context,
         time::Instant::now(),
     ));
     assert!(
@@ -592,7 +597,7 @@ async fn a_discovered_prefill_worker_without_a_bootstrap_annotation_is_probed_on
         kv_engine_id: Some("engine-1".to_string()),
         ..published("127.0.0.1:18081", "uid-1:18081")
     };
-    let mut spec = build_worker_spec(&worker, DiscoveryKind::Kubernetes, &app_context);
+    let mut spec = build_worker_spec(&worker, DiscoveryKind::Kubernetes, &*app_context);
     assert_eq!(spec.bootstrap_port, None, "no annotation, no port");
     // The runtime the worker's engine reports when the registration detects it.
     spec.runtime_type = RuntimeType::Vllm;

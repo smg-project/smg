@@ -26,6 +26,7 @@
 pub mod admin;
 pub mod app_context;
 pub mod config;
+mod discovery_host;
 pub mod endpoints;
 pub(crate) mod fs_watch;
 pub mod mesh;
