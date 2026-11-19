@@ -85,7 +85,7 @@ impl Bed {
         let store = Arc::new(MemoryStore::new());
         let workers = WorkerObjects::new(Arc::clone(&store), ObjectsWake::default());
         let host = Arc::new(Host::new(
-            Arc::clone(workers.registry()),
+            Arc::clone(workers.objects().registry()),
             Some(Credential::for_test(KEY)),
         ));
         let jobs = Arc::new(RecordedJobs::default());
@@ -372,6 +372,7 @@ async fn a_row_the_provider_registered_is_not_asked_again_and_one_it_no_longer_l
         .expect("followed object");
     let revision = bed
         .workers
+        .objects()
         .registry()
         .get_all_with_ids()
         .into_iter()

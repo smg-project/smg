@@ -43,12 +43,6 @@ impl WorkerObjects {
         Arc::clone(&self.objects)
     }
 
-    /// The registry the replica's worker objects stand in.
-    #[cfg(feature = "discovery")]
-    pub(crate) fn registry(&self) -> &Arc<WorkerRegistry<Members>> {
-        self.objects.registry()
-    }
-
     /// The holder, for a case that reads what stands.
     #[cfg(test)]
     pub(crate) fn objects(&self) -> &Objects<Members> {

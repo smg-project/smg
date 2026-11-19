@@ -481,7 +481,7 @@ impl Controller {
         #[cfg(feature = "discovery")]
         let discovery = config.discovery.as_ref().map(|settings| {
             let host = Arc::new(discovery::Host::new(
-                Arc::clone(workers.registry()),
+                Arc::clone(workers.holder().registry()),
                 settings.credential().cloned(),
             ));
             Box::new(discovery::Discovery::new(
