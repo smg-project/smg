@@ -113,6 +113,7 @@ CRATES = (
     crate("smg-rl", "crates/rl", "smg-rl"),
     crate("engine-zmq-adapter", "crates/engine_zmq_adapter", "engine-zmq-adapter"),
     crate("engine-servicer", "crates/engine_servicer", "engine-servicer"),
+    crate("smg-policy-controller", "crates/policy_controller", "smg-policy-controller"),
     crate("smg-client", "clients/rust"),
     crate("openapi-gen", "clients/openapi-gen"),
     crate(GATEWAY, "model_gateway"),
