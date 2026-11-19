@@ -3188,6 +3188,8 @@ fn a_frame_handed_as_a_thread_leaves_its_work_is_applied_by_one_of_the_two() {
         HEARD.fetch_add(1, SeqCst);
     }
     const ROUNDS: usize = 100_000;
+    /// How long the rounds run at most: past it the case asks no more.
+    const RUN: Duration = Duration::from_secs(20);
     const BOUND: Duration = Duration::from_secs(60);
     /// Tells the case's two threads to end, where the case unwinds too.
     struct Ends<'a>(&'a AtomicUsize);
@@ -3254,7 +3256,7 @@ fn a_frame_handed_as_a_thread_leaves_its_work_is_applied_by_one_of_the_two() {
             }
         };
         for asked in 1..=ROUNDS {
-            if now.elapsed() > PATIENCE {
+            if now.elapsed() > RUN {
                 break;
             }
             let record = booking(gateway, 0, a, now);
