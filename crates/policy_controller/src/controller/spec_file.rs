@@ -418,11 +418,12 @@ pub(crate) mod tests {
     use crate::{
         controller::generations::{
             tests::{
-                bound_to, election, faulting, long_text_under_aliases, padded, with_line,
-                LEAST_LOAD, RANDOM,
+                bound_to, election, election_under, faulting, long_text_under_aliases, padded,
+                with_line, LEAST_LOAD, RANDOM,
             },
             Validate,
         },
+        elector::Tick,
         spec::{AppliedSpec, SpecError},
         store::MemoryStore,
     };
@@ -1534,8 +1535,8 @@ pub(crate) mod tests {
 
     /// A look in flight when the replica stops leading applies nothing:
     /// the door holds who writes, whatever the watch asked ahead of the
-    /// look. The state stays unread, so the looks behind the replica's next
-    /// take read it.
+    /// look. The state stays unread, so the looks of the replica's next
+    /// lead read it, behind a take or behind none.
     #[test]
     fn a_look_in_flight_when_the_replica_stops_leading_applies_nothing() {
         let bed = bed(LEAST_LOAD.as_bytes());
@@ -1564,5 +1565,36 @@ pub(crate) mod tests {
         assert!(bed.generations.source_writes(), "it leads again");
         assert_eq!(settle(&mut file), Ok(Applied::Generation(3)));
         assert_eq!(bed.answered().2, bound_to(1).as_bytes());
+
+        // A lead comes back with no take as well: a fence closes by itself
+        // at the renew deadline, and the holder's next renewal opens it
+        // again under the same term. A look refused in between is read
+        // behind that renewal.
+        let deadline = Duration::from_secs(1);
+        let bed = self::bed(LEAST_LOAD.as_bytes());
+        let mut elector = election_under(deadline);
+        bed.generations.under(elector.fence());
+        let mut file = SpecFile::start_deferred(bed.path.clone(), Arc::clone(&bed.generations))
+            .expect("a file that runs");
+        let door = Arc::clone(&bed.generations);
+        elector.at_take(move || door.at_take());
+        // The take's write lands two deadlines late: its fence is closed.
+        let late = Instant::now()
+            .checked_sub(2 * deadline)
+            .expect("a host that is up for two seconds");
+        elector.tick(late).expect("a take");
+        assert_eq!(bed.generation(), 1, "the start's document, at the take");
+        assert!(!bed.generations.source_writes(), "past its deadline");
+        replace(&bed.path, bound_to(1).as_bytes());
+        assert_eq!(settle(&mut file), Ok(Applied::Waits(1)));
+        // A round whose window closed again ahead of its read waits as the
+        // first look did.
+        let read = (0..8).find_map(|_| {
+            let renewed = elector.tick(Instant::now());
+            assert!(matches!(renewed, Ok(Tick::Renewed { .. })), "a renewal");
+            Some(settle(&mut file)).filter(|read| !matches!(read, Ok(Applied::Waits(_))))
+        });
+        assert_eq!(read, Some(Ok(Applied::Generation(2))));
+        assert_eq!(bed.generations.takes(), 1, "no take since the first");
     }
 }

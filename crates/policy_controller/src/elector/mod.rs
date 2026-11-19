@@ -549,6 +549,8 @@ impl Elector {
     /// inside [`Elector::tick`], on its caller's thread, and its time is
     /// the take's: the window stamped behind it counts from the tick's
     /// instant, and a step that outlasts it leads from the next renewal.
+    /// Built with the controller, its one caller.
+    #[cfg(any(test, feature = "controller"))]
     pub(crate) fn at_take(&mut self, step: impl Fn() + Send + 'static) {
         self.at_take = Some(Box::new(step));
     }

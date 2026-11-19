@@ -2157,11 +2157,17 @@ pub(crate) mod tests {
     /// lease, with an hour's renew deadline. Its fence shows a term from
     /// its first step to its release.
     pub(crate) fn election() -> Elector {
-        let hour = Duration::from_secs(3_600);
+        election_under(Duration::from_secs(3_600))
+    }
+
+    /// A replica's candidate alone over its lease, with `deadline` as its
+    /// renew deadline. Under a short one a case closes the fence by the
+    /// clock, between two renewals of one term.
+    pub(crate) fn election_under(deadline: Duration) -> Elector {
         let settings = ElectionSettings {
-            duration: 2 * hour,
-            renew_period: Duration::from_secs(1),
-            renew_deadline: hour,
+            duration: 2 * deadline,
+            renew_period: Duration::from_secs(1).min(deadline / 4),
+            renew_deadline: deadline,
         };
         Elector::alone("controller-0@127.0.0.1:1", settings).expect("the settings are in order")
     }
