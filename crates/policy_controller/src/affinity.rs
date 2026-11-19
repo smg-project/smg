@@ -63,6 +63,31 @@ const CHARS_PER_TOKEN: u32 = 4;
 /// of the common engines.
 const DEFAULT_BLOCK_SIZE: u32 = 16;
 
+/// The matched share under which a request is balanced instead of pinned,
+/// when the document names no threshold. The warm-up slice counts a hit as
+/// a miss at or under the same share when it names none.
+pub const DEFAULT_THRESHOLD: f32 = 0.3;
+
+/// How long after admission a worker counts as warming, in seconds, when
+/// the document names no time.
+pub const DEFAULT_WARMUP_SECS: u64 = 60;
+
+/// The share of misses offered to warming workers when the document names
+/// none.
+pub const DEFAULT_WARMUP_SHARE: f32 = 0.25;
+
+/// The index growth after which a worker is warm, in blocks, when the
+/// document names none.
+pub const DEFAULT_WARMUP_BLOCKS: u64 = 1024;
+
+/// The share of the fleet's median index under which a worker is thin, when
+/// the document names none.
+pub const DEFAULT_WARMUP_THIN_RATIO: f32 = 0.5;
+
+/// One hit in this many is diverted to a thin worker when the document
+/// names no count.
+pub const DEFAULT_WARMUP_DIVERT_EVERY: u64 = 8;
+
 /// The gates the affinity stages of one profile share: the spill gate of
 /// `prefix-affinity`, the fleet KV gate of `kv-pressure`, and the block size
 /// a held prefix is priced by.
@@ -371,7 +396,7 @@ impl PrefixAffinity {
     /// The stage from its parameters and its profile's gates.
     pub fn new(params: &PrefixAffinityParams, gates: Gates) -> Self {
         Self {
-            threshold: params.threshold.unwrap_or(0.3),
+            threshold: params.threshold.unwrap_or(DEFAULT_THRESHOLD),
             source: params.source.unwrap_or_default(),
             gates,
         }
@@ -831,12 +856,16 @@ impl WarmupSlice {
     /// The stage from its parameters and its profile's gates.
     pub fn new(params: &WarmupSliceParams, gates: Gates) -> Self {
         Self {
-            secs_micros: params.secs.unwrap_or(60).saturating_mul(1_000_000),
-            share: params.share.unwrap_or(0.25),
-            blocks: u32::try_from(params.blocks.unwrap_or(1024)).unwrap_or(u32::MAX),
-            thin_ratio: params.thin_ratio.unwrap_or(0.5),
-            divert_every: params.divert_every.unwrap_or(8),
-            miss_share: params.miss_share.unwrap_or(0.3),
+            secs_micros: params
+                .secs
+                .unwrap_or(DEFAULT_WARMUP_SECS)
+                .saturating_mul(1_000_000),
+            share: params.share.unwrap_or(DEFAULT_WARMUP_SHARE),
+            blocks: u32::try_from(params.blocks.unwrap_or(DEFAULT_WARMUP_BLOCKS))
+                .unwrap_or(u32::MAX),
+            thin_ratio: params.thin_ratio.unwrap_or(DEFAULT_WARMUP_THIN_RATIO),
+            divert_every: params.divert_every.unwrap_or(DEFAULT_WARMUP_DIVERT_EVERY),
+            miss_share: params.miss_share.unwrap_or(DEFAULT_THRESHOLD),
             gates,
             misses: AtomicU64::new(0),
             hits: AtomicU64::new(0),

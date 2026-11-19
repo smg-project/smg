@@ -93,6 +93,17 @@ const NONE: u32 = u32::MAX;
 /// oldest leaves as if its interval had passed.
 const WINDOW_CAP: usize = 1 << 20;
 
+/// The absolute part of the balance rule, in booked tokens, when the
+/// document names none.
+pub const DEFAULT_ABS_THRESHOLD: u32 = 64;
+
+/// The relative part of the balance rule when the document names none.
+pub const DEFAULT_REL_THRESHOLD: f32 = 1.5;
+
+/// The bookings' window and the cut's cadence, in seconds, when the document
+/// names none.
+pub const DEFAULT_ADJUST_INTERVAL_S: u32 = 5;
+
 /// The bucket scorer: the owner of the request's size first and every other
 /// survivor at zero, or the least booked survivor first when the balance
 /// rule spills. See the module's notes for the partition and its window.
@@ -207,9 +218,13 @@ struct Loads {
 impl Bucket {
     pub fn new(params: &BucketParams) -> Self {
         Self {
-            abs_threshold: u64::from(params.abs_threshold.unwrap_or(64)),
-            rel_threshold: params.rel_threshold.unwrap_or(1.5),
-            interval_micros: u64::from(params.adjust_interval_s.unwrap_or(5)) * 1_000_000,
+            abs_threshold: u64::from(params.abs_threshold.unwrap_or(DEFAULT_ABS_THRESHOLD)),
+            rel_threshold: params.rel_threshold.unwrap_or(DEFAULT_REL_THRESHOLD),
+            interval_micros: u64::from(
+                params
+                    .adjust_interval_s
+                    .unwrap_or(DEFAULT_ADJUST_INTERVAL_S),
+            ) * 1_000_000,
             partitions: ArcSwap::from_pointee(FxHashMap::default()),
             listed: ArcSwap::from_pointee(FxHashMap::default()),
             relisting: Mutex::new(()),

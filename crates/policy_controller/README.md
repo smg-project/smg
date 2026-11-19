@@ -469,6 +469,7 @@ One more rule for the hash ring. Under `consistent_hashing`, a key stays on its 
 The stock controller takes its document from one of two sources. A start names exactly one.
 
 The binary needs the crate's `controller` feature. Without it the binary is not built.
+The feature builds from a checkout of this repository. Its build script reads the worker crate's proto directory, which a copy from the registry does not hold.
 
 ```sh
 cargo build --release -p smg-policy-controller --features controller

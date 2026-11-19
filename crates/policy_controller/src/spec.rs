@@ -36,7 +36,7 @@ use crate::{
     bucket::Bucket,
     builtins::{
         FewestSessions, LeastLoad, LeastRequests, ResidentWork, SampledBest, SessionAffinity,
-        DEFAULT_MEAN_PREFILL_TOKENS,
+        DEFAULT_KV_PRESSURE_WEIGHT, DEFAULT_MEAN_PREFILL_TOKENS, DEFAULT_THROUGHPUT,
     },
     catalog::{Catalog, Found},
     framework::{Binding, Engine, OverloadThresholds, Picker, Plan, Profile, Scorer, Weighted},
@@ -2231,9 +2231,9 @@ fn gates_of(p: &ProfileSpec, view: &ViewSpec) -> Gates {
 fn scorer_of(stage: &ScoreStage, gates: Gates, boundaries: &[u32]) -> Resolved<Box<dyn Scorer>> {
     match stage {
         ScoreStage::LeastLoad(p) => built_scorer(LeastLoad::new(
-            p.kv_pressure_weight.unwrap_or(0.15),
+            p.kv_pressure_weight.unwrap_or(DEFAULT_KV_PRESSURE_WEIGHT),
             p.mean_prefill_tokens.unwrap_or(DEFAULT_MEAN_PREFILL_TOKENS),
-            p.default_throughput.unwrap_or(2000.0),
+            p.default_throughput.unwrap_or(DEFAULT_THROUGHPUT),
         )),
         ScoreStage::LeastRequests(_) => built_scorer(LeastRequests),
         ScoreStage::FewestSessions(_) => built_scorer(FewestSessions),

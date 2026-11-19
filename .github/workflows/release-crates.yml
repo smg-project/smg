@@ -141,6 +141,8 @@ jobs:
             path: crates/engine_zmq_adapter
           - crate: smg-response-template
             path: crates/response_template
+          - crate: smg-policy-controller
+            path: crates/policy_controller
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/publish-crate

@@ -26,13 +26,14 @@ profiles:
   cache_aware:
     filter: [healthy, not-overloaded, not-tried]
     score:
+      - warmup-slice: { weight: 8, secs: 0 }
       - prefix-affinity:
+          weight: 4
           decay: 0.5
           accounting_ttl_ms: 200
           spill: { prefix_margin_tokens: 1024, uncached_credit: true }
       - kv-pressure: { spread: 0.3, ceiling: 0.9 }
       - least-load
-      - warmup-slice: { secs: 0 }
     pick: { best-with-temperature: { temperature: 0.05 } }
 bindings:
   - match: { model: "*" }

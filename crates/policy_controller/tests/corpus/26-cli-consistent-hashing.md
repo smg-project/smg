@@ -13,8 +13,6 @@ smg launch --worker-urls http://worker-a:8000 http://worker-b:8000 http://worker
 ```yaml
 apiVersion: smg.policy/v1
 generation: 1
-view:
-  headers: [x-smg-routing-key, x-smg-target-worker]
 profiles:
   consistent_hashing:
     filter: [healthy, not-overloaded, not-tried]
