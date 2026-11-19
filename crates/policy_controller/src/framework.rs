@@ -4196,10 +4196,11 @@ impl Engine {
     /// The table's half of a dispatch ([`Lifecycle::on_dispatched`]): the
     /// session pin follows the dispatched worker of the side, the decode
     /// of a pair target on the decode side and the target itself
-    /// otherwise. A host that keeps its own record of the pin reads the
-    /// table behind this half, and tells the stages last
-    /// ([`dispatched_stages`](Self::dispatched_stages)).
-    pub fn dispatched_key(&self, lease: &Lease, target: &Target, side: Side) {
+    /// otherwise. The controller keeps its own record of the pin: it reads
+    /// the table behind this half, and tells the stages last
+    /// ([`dispatched_stages`](Self::dispatched_stages)). The two halves
+    /// are the crate's own: a host tells a dispatch whole, by the trait.
+    pub(crate) fn dispatched_table(&self, lease: &Lease, target: &Target, side: Side) {
         let dispatched = match (side, target.pair) {
             (Side::Decode, Some(pair)) => pair.decode_id,
             _ => target.id,
@@ -4212,7 +4213,7 @@ impl Engine {
 
     /// The stages' half of a dispatch: each profile's scorers and its
     /// picker hear it.
-    pub fn dispatched_stages(
+    pub(crate) fn dispatched_stages(
         &self,
         lease: &Lease,
         target: &Target,
@@ -4248,7 +4249,7 @@ impl Lifecycle for Engine {
         side: Side,
         since_decision_micros: u32,
     ) {
-        self.dispatched_key(lease, target, side);
+        self.dispatched_table(lease, target, side);
         self.dispatched_stages(lease, target, side, since_decision_micros);
     }
 
@@ -8133,6 +8134,31 @@ mod tests {
         );
         pool[0].health.healthy = true;
         assert_eq!(place_keyed(&engine, &pool, 7, 30).position, 0);
+    }
+
+    /// A pair's dispatch moves its key's pin to the worker of the side it
+    /// names: the pair's decode worker on the decode side, the target
+    /// itself on the prefill side.
+    #[test]
+    fn a_pairs_dispatch_pins_the_worker_of_its_side() {
+        let engine = session_engine(SESSIONS);
+        let target = Target {
+            id: WorkerId(3),
+            pair: Some(Pair {
+                decode_id: WorkerId(5),
+                ..Pair::default()
+            }),
+            ..Target::default()
+        };
+        let lease = |key| Lease {
+            session: session(key),
+            session_verdict: SessionVerdict::Pinned,
+            ..Lease::default()
+        };
+        engine.on_dispatched(&lease(7), &target, Side::Decode, 0);
+        engine.on_dispatched(&lease(8), &target, Side::Prefill, 0);
+        let pin = |key| engine.sessions.pins(session(key)).map(|pins| pins[0]);
+        assert_eq!((pin(7), pin(8)), (Some(WorkerId(5)), Some(WorkerId(3))));
     }
 
     /// Two bindings' rules share the engine's table, which sweeps at the
