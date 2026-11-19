@@ -14,6 +14,7 @@ use super::{
     StaleGeneration, ViewBuffers, World, Writer, PUBLISH_WINDOW, WALKED_RUNS,
 };
 use crate::{
+    counts::Slot,
     spec::{BindingSpec, Match, OverloadSpec, Pairing},
     store::{
         loads::LoadSample, pairing::Refusal, GatewayId, HealthSink, LeasesStore, LoadSink,
@@ -41,6 +42,21 @@ mod written;
 
 const MODEL: &str = "m";
 const ASKER: GatewayId = GatewayId(1);
+
+/// A store's write gives each member its slot. The cases here hand a writer
+/// rows no store filed and read no count of theirs, so a row is given the
+/// next slot of the writer's counts where it is handed.
+trait Filed {
+    fn filed(&self, writer: &Writer) -> std::vec::IntoIter<(&WorkerRow, Slot)>;
+}
+
+impl Filed for [WorkerRow] {
+    fn filed(&self, writer: &Writer) -> std::vec::IntoIter<(&WorkerRow, Slot)> {
+        let counts = writer.counts();
+        let filed: Vec<_> = self.iter().map(|row| (row, counts.claim())).collect();
+        filed.into_iter()
+    }
+}
 
 fn facts(key: &str, role: Role, models: &[&str]) -> WorkerFacts {
     WorkerFacts {
@@ -1831,7 +1847,7 @@ fn a_publication_before_a_departing_workers_row_leaves_still_shows_its_veto() {
     };
     let leaving = WorkerId(1);
     let mut writer = Writer::new(PUBLISH_WINDOW, origin);
-    writer.rebuild(1, members.iter(), |_, _| None, Classes::Derive);
+    writer.rebuild(1, members.filed(&writer), |_, _| None, Classes::Derive);
     let vetoed = writer
         .veto(ASKER, leaving, Some(t0 + Duration::from_secs(60)))
         .expect("a new veto");
@@ -1841,11 +1857,11 @@ fn a_publication_before_a_departing_workers_row_leaves_still_shows_its_veto() {
     let between = writer.publish_window(t0);
     assert_eq!(masked(&between), [leaving]);
     // The membership write takes the row and its vetoes out together,
-    let after = writer.rebuild(2, members[1..].iter(), |_, _| None, Classes::Derive);
+    let after = writer.rebuild(2, members[1..].filed(&writer), |_, _| None, Classes::Derive);
     assert_eq!(after.members(MODEL, Role::Single), Some(1));
     assert_eq!(masked(&after), []);
     // and the same id registered again starts without them.
-    let again = writer.rebuild(3, members.iter(), |_, _| None, Classes::Derive);
+    let again = writer.rebuild(3, members.filed(&writer), |_, _| None, Classes::Derive);
     assert_eq!(again.members(MODEL, Role::Single), Some(2));
     assert_eq!(masked(&again), []);
 }
@@ -2083,7 +2099,7 @@ fn a_spare_of_another_length_is_left_and_the_publication_allocates() {
         row_serving(2, &[MODEL], origin),
     ];
     let mut writer = Writer::new(PUBLISH_WINDOW, origin);
-    writer.rebuild(1, members.iter(), |_, _| None, Classes::Derive);
+    writer.rebuild(1, members.filed(&writer), |_, _| None, Classes::Derive);
     // No write leaves a pool a spare of another length: one is planted,
     // the rows of a pool of one, held by the pool alone.
     writer.spares[0] = Some(Arc::from(&writer.working[0].rows[..1]));
@@ -2110,7 +2126,7 @@ fn a_membership_write_leaves_the_writers_lists_at_one_slot_a_pool() {
     ];
     let mut writer = Writer::new(PUBLISH_WINDOW, origin);
     for epoch in 1..=4 {
-        writer.rebuild(epoch, members.iter(), |_, _| None, Classes::Derive);
+        writer.rebuild(epoch, members.filed(&writer), |_, _| None, Classes::Derive);
         // Two models, a pool each: one slot a pool in each list, however
         // many membership writes came before.
         assert_eq!(
@@ -2146,7 +2162,7 @@ fn a_vetos_write_builds_its_own_gateways_run_and_shares_every_other() {
         })
         .collect();
     let mut writer = Writer::new(PUBLISH_WINDOW, origin);
-    writer.rebuild(1, members.iter(), |_, _| None, Classes::Derive);
+    writer.rebuild(1, members.filed(&writer), |_, _| None, Classes::Derive);
     let (writing, other) = (GatewayId(3), GatewayId(7));
     for (gateway, id) in [(other, 2), (other, 6), (writing, 3)] {
         writer
@@ -2223,7 +2239,8 @@ fn the_runs_each_write_leaves_are_the_runs_a_derive_builds_again() {
         .collect();
     let mut present = [true; 12];
     let mut writer = Writer::new(PUBLISH_WINDOW, origin);
-    writer.rebuild(1, all.iter(), |_, _| None, Classes::Derive);
+    writer.rebuild(1, all.filed(&writer), |_, _| None, Classes::Derive);
+    let counts = writer.counts();
     // A fixed sequence: the case makes the same writes at every run.
     let mut state = 0x9E37_79B9_7F4A_7C15_u64;
     let mut next = |bound: u64| {
@@ -2244,7 +2261,7 @@ fn the_runs_each_write_leaves_are_the_runs_a_derive_builds_again() {
                 let members = all
                     .iter()
                     .zip(present)
-                    .filter_map(|(row, here)| here.then_some(row));
+                    .filter_map(|(row, here)| here.then_some((row, counts.claim())));
                 writer.rebuild(step + 2, members, |_, _| None, Classes::Derive);
             }
             // A window's publication, which drops what its instant ended.
@@ -3489,7 +3506,7 @@ fn the_pass_over_every_engine_says_whether_it_moved_a_verdict() {
         })
     };
     let mut writer = Writer::new(PUBLISH_WINDOW, origin);
-    writer.rebuild(1, [member].iter(), sample, Classes::Derive);
+    writer.rebuild(1, [member].filed(&writer), sample, Classes::Derive);
     let verdict = |writer: &Writer| writer.working[0].rows[0].health.overloaded;
     // The build judged every engine: the row carries its verdict, and a
     // pass finds it as that write left it.
@@ -5184,44 +5201,44 @@ fn a_member_whose_rows_revision_stands_is_carried_and_one_whose_revision_moved_i
         .apply(lists, 0, std::iter::empty(), |_, _| None)
         .expect("applied");
     let members = [row(3, "east", 1), row(7, "west", 1)];
-    let first = writer.rebuild(1, members.iter(), |_, _| None, Classes::Derive);
+    let first = writer.rebuild(1, members.filed(&writer), |_, _| None, Classes::Derive);
     assert_eq!(zones(&first), (1, 2));
     // The revision is what says a row's facts moved. At a standing revision
     // a member's fields are the last read's, whatever the row states: a
     // store hands no such row, and the case does, to tell a carry from a
     // read.
     let members = [row(3, "west", 1), row(7, "east", 1)];
-    let carried = writer.rebuild(2, members.iter(), |_, _| None, Classes::Derive);
+    let carried = writer.rebuild(2, members.filed(&writer), |_, _| None, Classes::Derive);
     assert_eq!(zones(&carried), (1, 2));
     // At another revision a member is read, and the other is carried.
     let members = [row(3, "west", 1), row(7, "east", 2)];
-    let read = writer.rebuild(3, members.iter(), |_, _| None, Classes::Derive);
+    let read = writer.rebuild(3, members.filed(&writer), |_, _| None, Classes::Derive);
     assert_eq!(zones(&read), (1, 1));
     // An apply whose lists differ reads every member, at any revision and
     // in whatever order the store's table hands them,
     let other = Arc::new(generation_listing(2, &[], &["west", "east"], &[]));
     let members = [row(7, "east", 2), row(3, "east", 1)];
     let (relisted, _) = writer
-        .apply(other, 3, members.iter(), |_, _| None)
+        .apply(other, 3, members.filed(&writer), |_, _| None)
         .expect("applied");
     assert_eq!(zones(&relisted), (2, 2));
     // and the write after it carries that reading.
     let members = [row(3, "west", 1), row(7, "west", 2)];
-    let after = writer.rebuild(4, members.iter(), |_, _| None, Classes::Derive);
+    let after = writer.rebuild(4, members.filed(&writer), |_, _| None, Classes::Derive);
     assert_eq!(zones(&after), (2, 2));
     // A member that leaves takes its entry with it, on either side of a
     // member that stays. One that joins again at the id and the revision
     // it left at is read: no field of its last life is carried.
     let members = [row(7, "west", 2)];
-    let left = writer.rebuild(5, members.iter(), |_, _| None, Classes::Derive);
+    let left = writer.rebuild(5, members.filed(&writer), |_, _| None, Classes::Derive);
     assert_eq!(listed(&left, WorkerId(7)).1, 2);
     let members = [row(3, "west", 1), row(7, "west", 2)];
-    let back = writer.rebuild(6, members.iter(), |_, _| None, Classes::Derive);
+    let back = writer.rebuild(6, members.filed(&writer), |_, _| None, Classes::Derive);
     assert_eq!(zones(&back), (1, 2));
     let members = [row(3, "west", 1)];
-    let left = writer.rebuild(7, members.iter(), |_, _| None, Classes::Derive);
+    let left = writer.rebuild(7, members.filed(&writer), |_, _| None, Classes::Derive);
     assert_eq!(listed(&left, WorkerId(3)).1, 1);
     let members = [row(3, "west", 1), row(7, "west", 2)];
-    let back = writer.rebuild(8, members.iter(), |_, _| None, Classes::Derive);
+    let back = writer.rebuild(8, members.filed(&writer), |_, _| None, Classes::Derive);
     assert_eq!(zones(&back), (1, 1));
 }

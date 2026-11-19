@@ -1872,12 +1872,12 @@ fn in_flight_for(store: &MemoryStore, gateway: GatewayId) -> Vec<(WorkerId, u32)
 }
 
 /// [`in_flight_for`] the gateway the cases issue their leases to.
-fn in_flight(store: &MemoryStore) -> Vec<(WorkerId, u32)> {
+pub(super) fn in_flight(store: &MemoryStore) -> Vec<(WorkerId, u32)> {
     in_flight_for(store, GatewayId(1))
 }
 
 /// A lease of `gateway` on `target`, issued at `now` under term 1.
-fn booking(gateway: GatewayId, id: u64, target: WorkerId, now: Instant) -> LeaseRecord {
+pub(super) fn booking(gateway: GatewayId, id: u64, target: WorkerId, now: Instant) -> LeaseRecord {
     LeaseRecord {
         target,
         ..lease(gateway, id, 1, now)
@@ -2272,8 +2272,8 @@ fn a_member_keeps_its_slot_and_a_leavers_slot_is_given_to_no_one() {
 
 /// Two leases filed through `file`, one on a member that is built and one
 /// on a member whose first build is owed to the window. Each books its
-/// worker's count: the row the build lists reads its lease, and each lease
-/// ends on the count it booked.
+/// worker's count and asks for no build: the row the window's build lists
+/// reads its lease, and each lease ends on the count it booked.
 fn filed_ahead_of_a_first_build(file: fn(&dyn LeasesStore, GatewayId, &[LeaseRecord; 2])) {
     let store = MemoryStore::new();
     let built = ready(&store, "http://a:1");
@@ -2292,7 +2292,13 @@ fn filed_ahead_of_a_first_build(file: fn(&dyn LeasesStore, GatewayId, &[LeaseRec
         booking(gateway, 1, built, now),
         booking(gateway, 2, owed, now),
     ];
+    let builds = store.membership_builds();
     file(leases, gateway, &records);
+    assert_eq!(
+        (store.membership_builds(), store.publish_due().is_some()),
+        (builds, true),
+        "a lease asked for the build"
+    );
     store.publish_now();
     let of = |count| {
         let mut rows = [(built, count), (owed, count)];
@@ -2306,8 +2312,8 @@ fn filed_ahead_of_a_first_build(file: fn(&dyn LeasesStore, GatewayId, &[LeaseRec
     assert_eq!(in_flight(&store), of(0));
 }
 
-/// The issue door asks for the build a lease's worker is owed before it
-/// reads the standing world.
+/// The issue door books the slot a member's write gave it, inside the
+/// member's registration window too.
 #[test]
 fn a_lease_issued_ahead_of_its_workers_first_build_books_its_count() {
     filed_ahead_of_a_first_build(|leases, _, records| {
@@ -2317,8 +2323,8 @@ fn a_lease_issued_ahead_of_its_workers_first_build_books_its_count() {
     });
 }
 
-/// The restore door asks for it too: a gateway's pages may list a lease on
-/// a member inside its registration window.
+/// The restore door reads the same slot: a gateway's pages may list a
+/// lease on a member inside its registration window.
 #[test]
 fn a_lease_restored_ahead_of_its_workers_first_build_books_its_count() {
     filed_ahead_of_a_first_build(|leases, gateway, records| {
@@ -2326,11 +2332,11 @@ fn a_lease_restored_ahead_of_its_workers_first_build_books_its_count() {
     });
 }
 
-/// The issue door asks for no build where the standing world lists the
-/// lease's worker: a build owed to a registration beside it stays with its
-/// window. A lease on the worker inside that window asks for it, once.
+/// No lease asks for a build: one on a worker the standing world lists
+/// and one on a worker inside its registration window both leave the owed
+/// build to its window.
 #[test]
-fn a_lease_issued_on_a_listed_worker_leaves_an_owed_build_to_its_window() {
+fn a_lease_issued_leaves_an_owed_build_to_its_window() {
     let store = MemoryStore::new();
     let built = ready(&store, "http://a:1");
     let owed = store.upsert(facts("http://b:1", 1)).id();
@@ -2348,12 +2354,198 @@ fn a_lease_issued_on_a_listed_worker_leaves_an_owed_build_to_its_window() {
     assert_eq!(leases.issue(booking(gateway, 2, owed, now)), Ok(()));
     assert_eq!(
         (store.membership_builds(), store.publish_due().is_some()),
-        (builds + 1, false),
-        "a lease on a worker inside its window asks once"
+        (builds, true),
+        "a lease on a worker inside its window asked for the build"
     );
     for id in [1, 2] {
         assert!(leases.released(gateway, LeaseId(id), None, ReleaseReason::ClientGone));
     }
+}
+
+/// A first dispatch that moves a lease onto a worker inside its
+/// registration window books that worker's count and asks for no build:
+/// the row the window's build lists reads the lease, and the lease ends on
+/// the count it booked.
+#[test]
+fn a_lease_dispatched_onto_a_worker_inside_its_window_books_its_count() {
+    let store = MemoryStore::new();
+    let built = ready(&store, "http://a:1");
+    let owed = store.upsert(facts("http://b:1", 1)).id();
+    let revision = WorkersStore::get(&store, owed).expect("the row").revision;
+    store
+        .set_status(owed, WorkerStatus::Ready, revision)
+        .expect("ready");
+    let builds = store.membership_builds();
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    leases.set_term(1);
+    let mut targets = Targets::new();
+    for id in [built, owed] {
+        targets.push(Target {
+            id,
+            ..Target::default()
+        });
+    }
+    let record = LeaseRecord {
+        picked: Picked::of(&targets),
+        ..booking(gateway, 1, built, now)
+    };
+    assert_eq!(leases.issue(record), Ok(()));
+    let on = Dispatch {
+        target_index: 1,
+        ..Dispatch::default()
+    };
+    assert!(leases.dispatched(gateway, LeaseId(1), on, now));
+    assert_eq!(
+        (store.membership_builds(), store.publish_due().is_some()),
+        (builds, true),
+        "the dispatch asked for the build"
+    );
+    store.publish_now();
+    let of = |count| {
+        let mut rows = [(built, 0), (owed, count)];
+        rows.sort_unstable();
+        rows
+    };
+    assert_eq!(in_flight(&store), of(1));
+    assert!(leases.released(gateway, LeaseId(1), None, ReleaseReason::ClientGone));
+    assert_eq!(in_flight(&store), of(0));
+}
+
+/// A member that leaves inside its registration window takes its slot
+/// with it: the lease filed on it ends on the count it booked, and the
+/// member that joins next is given another.
+#[test]
+fn a_member_that_leaves_inside_its_window_takes_its_slot_with_it() {
+    let store = MemoryStore::new();
+    let built = ready(&store, "http://a:1");
+    let left = store.upsert(facts("http://b:1", 1)).id();
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    leases.set_term(1);
+    assert_eq!(leases.issue(booking(gateway, 1, left, now)), Ok(()));
+    let revision = WorkersStore::get(&store, left).expect("the row").revision;
+    assert!(store.remove(left, revision).is_some());
+    let joined = ready(&store, "http://c:1");
+    let mut rows = [(built, 0), (joined, 0)];
+    rows.sort_unstable();
+    assert_eq!(in_flight(&store), rows, "the lease of the one that left");
+    assert!(leases.released(gateway, LeaseId(1), None, ReleaseReason::WorkerRemoved));
+    assert_eq!(in_flight(&store), rows);
+}
+
+/// The table holds a member from the write that files it to the build
+/// that lists it: behind a membership build it holds none, however many
+/// joined inside the window.
+#[test]
+fn a_membership_build_leaves_no_member_in_the_table() {
+    let store = MemoryStore::new();
+    let first = ready(&store, "http://a:1");
+    assert_eq!(store.filed_members(), 0, "the first build listed it");
+    let second = store.upsert(facts("http://b:1", 1)).id();
+    let third = store.upsert(facts("http://c:1", 1)).id();
+    assert!(first != second && second != third);
+    assert_eq!(store.filed_members(), 2, "two joined inside the window");
+    store.publish_now();
+    assert_eq!(store.filed_members(), 0, "the build listed both");
+}
+
+/// A generation of the standing pairing mode builds no membership: the
+/// table stands behind its publication, and a lease on a member inside
+/// its window books its count.
+#[cfg(feature = "controller")]
+#[test]
+fn a_generation_that_builds_no_membership_leaves_a_joiners_slot_on_file() {
+    let store = MemoryStore::new();
+    store.apply(manual_ruled(1, 60, 30)).expect("generation 1");
+    let built = ready(&store, "http://a:1");
+    let owed = store.upsert(facts("http://b:1", 1)).id();
+    let revision = WorkersStore::get(&store, owed).expect("the row").revision;
+    store
+        .set_status(owed, WorkerStatus::Ready, revision)
+        .expect("ready");
+    store.apply(manual_ruled(2, 60, 30)).expect("generation 2");
+    assert_eq!(
+        (store.publish_due().is_some(), store.filed_members()),
+        (true, 1),
+        "the generation built no membership"
+    );
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    leases.set_term(1);
+    assert_eq!(leases.issue(booking(gateway, 1, owed, now)), Ok(()));
+    store.publish_now();
+    let mut rows = [(built, 0), (owed, 1)];
+    rows.sort_unstable();
+    assert_eq!(in_flight(&store), rows);
+}
+
+/// A member filed with no model stands in no pool, and the build behind
+/// its write lists it nowhere. The refresh that gives it a model files
+/// its slot again: a lease on it inside that window books its count.
+#[test]
+fn a_member_given_its_first_model_books_a_lease_inside_that_window() {
+    let store = MemoryStore::new();
+    let built = ready(&store, "http://a:1");
+    let bare = WorkerFacts {
+        models: Vec::new(),
+        ..facts("http://b:1", 1)
+    };
+    let owed = store.upsert(bare).id();
+    store.publish_now();
+    assert_eq!(store.filed_members(), 0, "the build listed it in no pool");
+    // The same incarnation with a model: the row and its slot stay.
+    assert_eq!(store.upsert(facts("http://b:1", 1)).id(), owed);
+    let revision = WorkersStore::get(&store, owed).expect("the row").revision;
+    store
+        .set_status(owed, WorkerStatus::Ready, revision)
+        .expect("ready");
+    assert!(store.publish_due().is_some(), "the refresh owes its build");
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    leases.set_term(1);
+    assert_eq!(leases.issue(booking(gateway, 1, owed, now)), Ok(()));
+    store.publish_now();
+    let mut rows = [(built, 0), (owed, 1)];
+    rows.sort_unstable();
+    assert_eq!(in_flight(&store), rows);
+}
+
+/// A standby follows the refresh as its leader wrote it: the member given
+/// its first model is filed again there too, and a lease on it before the
+/// standby's build books its count.
+#[test]
+fn a_followed_refresh_files_the_slot_of_a_member_given_its_first_model() {
+    let leader = MemoryStore::new();
+    let bare = WorkerFacts {
+        models: Vec::new(),
+        ..facts("http://b:1", 1)
+    };
+    let owed = leader.upsert(bare).id();
+    let revision = WorkersStore::get(&leader, owed).expect("the row").revision;
+    leader
+        .set_status(owed, WorkerStatus::Ready, revision)
+        .expect("ready");
+    leader.publish_now();
+    let standby = MemoryStore::new();
+    assert!(standby.restore_from(leader.cut(Kinds::All)));
+    assert_eq!(standby.filed_members(), 0, "the restore built its world");
+    // The leader gives the member its first model and the standby follows.
+    let unjournaled = Position::default();
+    let refresh = leader.upsert(facts("http://b:1", 1));
+    let row = WorkersStore::get(&leader, owed);
+    standby.follow(unjournaled, WorkersStore::epoch(&leader), refresh, row);
+    assert_eq!(
+        (standby.publish_due().is_some(), standby.filed_members()),
+        (true, 1),
+        "the followed refresh owes its build"
+    );
+    let leases: &dyn LeasesStore = &standby;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    leases.set_term(1);
+    assert_eq!(leases.issue(booking(gateway, 1, owed, now)), Ok(()));
+    standby.publish_now();
+    assert_eq!(in_flight(&standby), [(owed, 1)]);
 }
 
 /// A member back under its key and incarnation is one that joined: it is
