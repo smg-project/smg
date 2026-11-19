@@ -169,7 +169,9 @@ pub trait LoadProbe: Send + Sync + 'static {
         deadline: Duration,
     ) -> impl Future<Output = Result<WorkerLoadResponse, ReadError>> + Send;
 
-    /// The text of the engine's metrics endpoint, within `timeout`.
+    /// The text of the engine's metrics endpoint, within `timeout`. A probe
+    /// whose client's build outlasts `timeout` answers that scrape at the
+    /// build's end.
     fn scrape(
         &self,
         url: &str,

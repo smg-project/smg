@@ -14,13 +14,15 @@ use smg_grpc_client::{
     engine_load::LOAD_SECTIONS, is_transport_failure, SglangSchedulerClient,
     TokenSpeedSchedulerClient, TrtllmServiceClient, VllmEngineClient,
 };
-use tokio::{sync::OnceCell, time::timeout};
+use tokio::{
+    sync::OnceCell,
+    time::{timeout, Instant},
+};
 use tonic::Code;
 
 use super::loads::{LoadProbe, ReadError, Target};
 
 /// The engines' probe.
-#[derive(Default)]
 pub struct EngineProbe {
     clients: Mutex<HashMap<String, Family>>,
     /// The scrape's HTTP client, built by the first scrape and kept. Its
@@ -28,6 +30,14 @@ pub struct EngineProbe {
     /// does not pay for them, and a controller that scrapes no engine
     /// never does.
     http: OnceCell<reqwest::Client>,
+    /// What builds that client: the crate's factory.
+    build: fn() -> Result<reqwest::Client, reqwest::Error>,
+}
+
+impl Default for EngineProbe {
+    fn default() -> Self {
+        Self::building(http_client)
+    }
 }
 
 /// One connected client, by family.
@@ -144,14 +154,23 @@ impl EngineProbe {
         Self::default()
     }
 
+    /// A probe whose HTTP client `build` makes.
+    pub(crate) fn building(build: fn() -> Result<reqwest::Client, reqwest::Error>) -> Self {
+        Self {
+            clients: Mutex::default(),
+            http: OnceCell::new(),
+            build,
+        }
+    }
+
     /// The scrape's HTTP client, built at the first call and kept. The
-    /// build reads files, so it runs off the runtime's workers, and the
-    /// first scrape's timeout starts behind it. One that fails is the
+    /// build reads files, so it runs off the runtime's workers, and its
+    /// time is the first scrape's own. One that fails is the
     /// transport's failure of that scrape, and the next scrape builds
     /// again.
     async fn http(&self) -> Result<&reqwest::Client, ReadError> {
         let built = || async {
-            match tokio::task::spawn_blocking(http_client).await {
+            match tokio::task::spawn_blocking(self.build).await {
                 Ok(Ok(client)) => Ok(client),
                 Ok(Err(error)) => Err(ReadError::Transport(format!("{error:?}"))),
                 Err(join) => Err(ReadError::Transport(join.to_string())),
@@ -228,11 +247,18 @@ impl LoadProbe for EngineProbe {
     }
 
     async fn scrape(&self, url: &str, timeout: Duration) -> Result<String, ReadError> {
-        let response = self
-            .http()
-            .await?
+        // The client's build is the first scrape's own time: the request
+        // has what the build left of the timeout, so the scrape ends by
+        // its deadline. A build that outlasted the timeout sends nothing.
+        let asked = Instant::now();
+        let http = self.http().await?;
+        let left = timeout.saturating_sub(asked.elapsed());
+        if left.is_zero() {
+            return Err(ReadError::Deadline(timeout));
+        }
+        let response = http
             .get(format!("{}/metrics", url.trim_end_matches('/')))
-            .timeout(timeout)
+            .timeout(left)
             .send()
             .await
             .map_err(|error| failed(error, timeout))?;
@@ -253,7 +279,7 @@ impl LoadProbe for EngineProbe {
 
 #[cfg(test)]
 mod tests {
-    use std::io::ErrorKind;
+    use std::{io::ErrorKind, net, thread};
 
     use tokio::{net::TcpListener, task::JoinSet};
 
@@ -328,5 +354,39 @@ mod tests {
 
         assert!(matches!(read, Err(ReadError::Deadline(_))), "{read:?}");
         assert!(probe.http_built(), "the first scrape builds it");
+    }
+
+    /// The build's time is the first scrape's own: a build that outlasts
+    /// the timeout fails that scrape by its deadline with nothing sent,
+    /// and the client is kept for the next.
+    #[tokio::test]
+    async fn a_build_that_outlasts_the_timeout_fails_its_scrape_unsent() {
+        fn slow() -> Result<reqwest::Client, reqwest::Error> {
+            thread::sleep(Duration::from_millis(60));
+            http_client()
+        }
+        let listener = net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        listener
+            .set_nonblocking(true)
+            .expect("a listener that does not wait");
+        let url = format!(
+            "http://{}",
+            listener.local_addr().expect("the bound address")
+        );
+        let probe = EngineProbe::building(slow);
+        let timeout = Duration::from_millis(20);
+
+        let read = probe.scrape(&url, timeout).await;
+
+        assert!(
+            matches!(read, Err(ReadError::Deadline(bound)) if bound == timeout),
+            "{read:?}"
+        );
+        assert!(probe.http_built(), "the build is kept");
+        let came = listener.accept();
+        assert!(
+            matches!(&came, Err(error) if error.kind() == ErrorKind::WouldBlock),
+            "the scrape sent nothing: {came:?}"
+        );
     }
 }
