@@ -3124,10 +3124,16 @@ impl NativeEncoder {
                 // blocks where its pattern gives that reader. The all-ASCII
                 // unit does not: its lean scan reads long words in fewer
                 // instructions than the block pass (measured: the pass costs
-                // a sixth more on a text of 18-byte words).
+                // a sixth more on a text of 18-byte words). The cased-letter
+                // template has no lean scan: its unit goes by blocks either
+                // way, the all-ASCII one from `encode_single_stage`.
                 let encoded = if cache.unit_ascii {
                     self.encode_single_stage::<true>(model, stage, text, words, mapped, ids, cache)
                 } else if let Some(blocks) = stage.pattern.by_blocks(text) {
+                    self.encode_single_stage_by_blocks(
+                        model, blocks, text, words, mapped, ids, cache,
+                    )
+                } else if let Some(blocks) = stage.pattern.by_cased_blocks(text) {
                     self.encode_single_stage_by_blocks(
                         model, blocks, text, words, mapped, ids, cache,
                     )
@@ -3489,8 +3495,10 @@ impl NativeEncoder {
     /// compiled in here, the lean loop moved the code of the other loops,
     /// and the byte loops and the cased scanner cost 1 to 2 % more
     /// operations per token on text the lean scan never reads (counted). A
-    /// pattern with no lean scan goes on to the other copy, which is the
-    /// function as it was.
+    /// pattern with no lean scan leaves this copy at once: through
+    /// [`Self::encode_single_stage_by_blocks`] when it gives a reader of the
+    /// text by blocks (the cased-letter template, `Pattern::by_cased_blocks`),
+    /// else on to the other copy, which is the function as it was.
     #[inline(never)]
     #[expect(clippy::too_many_arguments)]
     fn encode_single_stage<const ASCII: bool>(
@@ -3504,6 +3512,12 @@ impl NativeEncoder {
         cache: &mut PieceCache,
     ) -> Result<(), Fallback> {
         if ASCII && !stage.pattern.has_lean_scan() {
+            // No lean scan: the block pass where the pattern gives that
+            // reader (the cased-letter template), else the walk as it was.
+            if let Some(blocks) = stage.pattern.by_cased_blocks(text) {
+                return self
+                    .encode_single_stage_by_blocks(model, blocks, text, words, mapped, ids, cache);
+            }
             return self
                 .encode_single_stage::<false>(model, stage, text, words, mapped, ids, cache);
         }
@@ -3552,13 +3566,15 @@ impl NativeEncoder {
     /// [`Self::encode_single_stage`] keeps its text and its loops as they
     /// are. A pattern that gives a reader by blocks leaves no gap in any
     /// text (`Pattern::by_blocks`), so there is none to tokenize here and
-    /// no cursor to keep.
+    /// no cursor to keep. Compiled once a template (`CASED`, the reader's
+    /// type): with the loops of both in one copy, the loop of the GPT-4
+    /// family's template cost one instruction a token more (counted).
     #[inline(never)]
     #[expect(clippy::too_many_arguments)]
-    fn encode_single_stage_by_blocks(
+    fn encode_single_stage_by_blocks<const CASED: bool>(
         &self,
         model: Option<&ModelWrapper>,
-        blocks: pattern::ByBlocks<'_>,
+        blocks: pattern::ByBlocks<'_, CASED>,
         text: &str,
         words: bool,
         mapped: &mut String,

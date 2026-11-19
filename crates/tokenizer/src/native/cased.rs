@@ -63,8 +63,10 @@
 //! tests hold the scanner against.
 
 use super::{
+    block,
     pattern::{
-        clitic_match, concat, each_match, plain_class, previous_boundary, repeat, Class, Node,
+        clitic_match, concat, each_match, each_match_by_blocks, plain_class, previous_boundary,
+        repeat, Class, Node,
     },
     scan::{Bits, Roles, WordScan},
 };
@@ -152,6 +154,12 @@ pub(super) struct Scanner {
     clitic_beyond_ascii: bool,
     /// The most digits the digit alternative takes at once.
     digit_cap: u32,
+    /// Whether [`block`]'s pass cuts ASCII text as this scanner does
+    /// ([`Self::reads_ascii_as_blocks`]) and the alternatives leave no gap.
+    blocks: bool,
+    /// Whether the run behind punctuation takes the slash (`[\r\n/]*`; the
+    /// Kimi template's takes the line breaks alone).
+    take_slash: bool,
 }
 
 /// The lead-in, upper and lower classes of a letter alternative with runs
@@ -288,14 +296,150 @@ impl Scanner {
             }
             clitic_beyond_ascii |= class.may_hold_beyond_ascii();
         }
-        Some(Self {
+        let mut scanner = Self {
             roles,
             clitics1,
             clitics2,
             clitic_start,
             clitic_beyond_ascii,
             digit_cap,
-        })
+            blocks: false,
+            take_slash: false,
+        };
+        scanner.take_slash = (scanner.roles.ascii_members(Role::PunctBreak.bit()) >> b'/') & 1 != 0;
+        scanner.blocks = scanner.tiles() && scanner.reads_ascii_as_blocks(classes);
+        Some(scanner)
+    }
+
+    /// Whether the encoder may read a text of this template by blocks.
+    pub(super) fn blocks(&self) -> bool {
+        self.blocks
+    }
+
+    /// Whether the alternatives leave no gap in any text: every character
+    /// holds a role that starts a piece of one character at least (the
+    /// encoder's block routine keeps no cursor to find a gap by).
+    fn tiles(&self) -> bool {
+        self.roles.every_char_holds(
+            Role::Lower1.bit()
+                | Role::Upper2.bit()
+                | Role::Digit.bit()
+                | Role::Punct.bit()
+                | Role::Space.bit()
+                | Role::Run.bit(),
+        )
+    }
+
+    /// Whether [`block`]'s pass cuts ASCII text as this scanner does. The
+    /// pass computes the starts from the plain ASCII sets, so every role
+    /// must hold exactly its set of them (the opening run none); the two
+    /// letter alternatives must carry one clitic group, whose clitics begin
+    /// with the apostrophe alone and go on in letters; and the digit rule's
+    /// bound must fit a block's shifts.
+    fn reads_ascii_as_blocks(&self, classes: &[Class]) -> bool {
+        let ascii = |test: &dyn Fn(u8) -> bool| {
+            (0..128u8)
+                .filter(|&code| test(code))
+                .fold(0u128, |set, code| set | (1 << code))
+        };
+        let capitals = ascii(&|code| code.is_ascii_uppercase());
+        let smalls = ascii(&|code| code.is_ascii_lowercase());
+        let letters = capitals | smalls;
+        let digits = ascii(&block::is_digit);
+        let spaces = ascii(&block::is_space);
+        let breaks = ascii(&block::is_break);
+        let lead = !(letters | digits | breaks);
+        let roles = [
+            (Role::Lead1, lead),
+            (Role::Upper1, capitals),
+            (Role::Lower1, smalls),
+            (Role::Lead2, lead),
+            (Role::Upper2, capitals),
+            (Role::Lower2, smalls),
+            (Role::Digit, digits),
+            (Role::PunctPrefix, 1 << b' '),
+            (Role::Punct, !(letters | digits | spaces)),
+            (
+                Role::PunctBreak,
+                breaks | (u128::from(self.take_slash) << b'/'),
+            ),
+            (Role::BreakSpace, spaces),
+            (Role::Break, breaks),
+            (Role::TrailSpace, spaces),
+            (Role::NotTrail, !spaces),
+            (Role::Space, spaces),
+            (Role::Run, 0),
+        ];
+        let clitics_go_on_in_letters = self.clitics1.iter().all(|clitic| {
+            (2..=block::BLOCK).contains(&clitic.len())
+                && clitic[1..].iter().all(|&class| {
+                    ascii(&|code| classes[class].contains(char::from(code))) & !letters == 0
+                })
+        });
+        // The two groups are two sets of classes to the parser: the same
+        // group when they hold the same ASCII, place by place.
+        let members = |class: usize| ascii(&|code| classes[class].contains(char::from(code)));
+        let same_clitics = self.clitics1.len() == self.clitics2.len()
+            && self
+                .clitics1
+                .iter()
+                .zip(&self.clitics2)
+                .all(|(one, other)| {
+                    one.len() == other.len()
+                        && one
+                            .iter()
+                            .zip(other)
+                            .all(|(&a, &b)| members(a) == members(b))
+                });
+        let quote = !self.clitics1.is_empty();
+        roles
+            .into_iter()
+            .all(|(role, set)| self.roles.ascii_members(role.bit()) == set)
+            && same_clitics
+            && (0..128).all(|code| self.clitic_start[code] == (quote && code == usize::from(b'\'')))
+            && clitics_go_on_in_letters
+            && (self.digit_cap < u64::BITS || self.digit_cap == u32::MAX)
+    }
+
+    /// [`block::cased_pieces`] from `from`, a piece's start, with this
+    /// scanner's digit bound and clitics.
+    #[inline(always)]
+    pub(super) fn block_pass<F: FnMut(usize, usize)>(
+        &self,
+        classes: &[Class],
+        text: &str,
+        from: usize,
+        f: &mut F,
+    ) -> usize {
+        block::cased_pieces(
+            text.as_bytes(),
+            from,
+            self.digit_cap,
+            self.take_slash,
+            |at| clitic_match(classes, text, at, &self.clitics1),
+            f,
+        )
+    }
+
+    /// [`Self::for_each_match`] through [`block`]'s pass, for a text
+    /// `Pattern::by_cased_blocks` gives a reader of: the templates' one walk
+    /// (`pattern::each_match_by_blocks`) with this template's pass
+    /// ([`Self::block_pass`]) and its `match_at`.
+    #[inline(always)]
+    pub(super) fn for_each_match_by_blocks<const WORDS: bool, F: FnMut(usize, usize)>(
+        &self,
+        classes: &[Class],
+        text: &str,
+        f: &mut F,
+    ) {
+        each_match_by_blocks(
+            text,
+            #[inline(always)]
+            |from, f| self.block_pass(classes, text, from, f),
+            #[inline(always)]
+            |pos| self.match_at::<WORDS>(classes, text, pos),
+            f,
+        );
     }
 
     /// The most digits the digit alternative takes at once.
