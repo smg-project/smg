@@ -2105,8 +2105,7 @@ impl Ranks {
 enum Brought {
     /// No row for a rank of it.
     Nothing,
-    /// A row for a rank that pushed since the poll began: the row is passed
-    /// over, and the engine is named.
+    /// A row that was passed over. The answer still names its engine.
     Named,
     /// A row that was written.
     Heard,
@@ -2229,6 +2228,8 @@ impl MemoryStore {
         let mut first: Option<(u32, Brought)> = None;
         let mut others: Vec<(u32, Brought)> = Vec::new();
         let mut omits = false;
+        // Whether a row was passed over for its stamp.
+        let mut stale = false;
         // The door's answer: the positions of the rows it passes over.
         let mut passed: Vec<usize> = Vec::new();
         for (position, &(id, rank, row)) in answer.iter().enumerate() {
@@ -2249,6 +2250,17 @@ impl MemoryStore {
             }
             let (engine, brought) = match row {
                 Some(row) => {
+                    // A stamped row can't replace a newer sample on file.
+                    if sampled_at.is_some_and(|at| {
+                        ranks
+                            .samples
+                            .get(&rank)
+                            .is_some_and(|sample| sample.sampled_at > at)
+                    }) {
+                        passed.push(position);
+                        stale = true;
+                        continue;
+                    }
                     let sample = LoadSample {
                         row,
                         received_at: polled_at,
@@ -2282,10 +2294,14 @@ impl MemoryStore {
         }
         // A row passed over names its engine as a written row does: the
         // naming is the answer's, whichever sample stands. It moves a mark
-        // only beside a rank the answer left out, so the passed-over rows
-        // are read for their engines there and nowhere else: by the list,
-        // which holds exactly them, in the answer's order.
-        if omits {
+        // beside a rank the answer left out, and where a row passed over
+        // for its stamp names a rank that stands marked: no record named
+        // that rank again, as one did a rank that pushed since the poll
+        // began. So the passed-over rows are read for their engines there
+        // and nowhere else: by the list, which holds exactly them, in the
+        // answer's order.
+        let marked = writer.any_unnamed();
+        if omits || (stale && marked) {
             for &position in &passed {
                 let id = answer[position].0;
                 if let Some(engine) = writer.engine_of(id) {
@@ -2302,7 +2318,6 @@ impl MemoryStore {
         // with no row for an engine is the word that none came, which
         // moves no mark, and a rank that pushed since the poll began
         // named itself.
-        let marked = writer.any_unnamed();
         if omits || marked {
             for &(id, rank, row) in answer {
                 let pushed = table
@@ -2335,10 +2350,8 @@ impl MemoryStore {
                     writer.judged(engine, true);
                     true
                 }
-                // No row was written, and the answer named a rank that
-                // pushed since the poll began beside a rank it left out:
-                // no word that none came. The mark the answer moved is
-                // judged and shown with it.
+                // The answer passed over a row and left a rank out.
+                // Judge the marks the answer moved.
                 Brought::Named => writer.judged(engine, false),
                 // No row came for the engine: the word that none came,
                 // unless a rank of it pushed since the poll began. The

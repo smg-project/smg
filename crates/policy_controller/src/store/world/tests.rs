@@ -14,7 +14,9 @@ use super::{
     PoolVetoes, StaleGeneration, VetoEnds, ViewBuffers, World, Writer, PUBLISH_WINDOW, WALKED_RUNS,
 };
 use crate::{
+    builtins::ResidentWork,
     counts::Slot,
+    lease::{Lease, Lifecycle, Side},
     spec::{BindingSpec, Match, OverloadSpec, Pairing},
     store::{
         loads::LoadSample, pairing::Refusal, GatewayId, HealthSink, LeasesStore, LoadSink,
@@ -25,7 +27,7 @@ use crate::{
         fingerprint, AffinityFacts, Candidate, Constraints, LoadRow, Phase, RequestFacts, Role,
         WireModes, WorkerId,
     },
-    AppliedSpec, PairPools, PairTable, PolicySpec, Scratch,
+    AppliedSpec, PairPools, PairTable, PolicySpec, Scorer, Scratch, Target,
 };
 
 mod encode_classes;
@@ -1196,6 +1198,88 @@ fn the_age_is_the_decisions_own_and_saturates() {
     // Seven weeks on, the age stands at its ceiling.
     let (rows, _, _) = view(&store, &ask(t0 + Duration::from_secs(50 * 86_400)));
     assert_eq!(rows[0].load.map(|load| load.report_age_ms), Some(u32::MAX));
+}
+
+#[test]
+fn an_older_stamped_poll_keeps_the_report_that_released_dispatch_credit() {
+    let store = MemoryStore::new();
+    let id = member(&store, "worker-a");
+    let pushed_at = Instant::now() + Duration::from_millis(67);
+    let dispatch_at = pushed_at - Duration::from_millis(13);
+    let polled_at = pushed_at + PUBLISH_WINDOW * 2;
+    let pushed = load(7, 0);
+    let scorer = ResidentWork::new(3);
+    scorer.on_dispatched(
+        &Lease {
+            issued_micros: store.micros(dispatch_at),
+            tokens: 43,
+            ..Lease::default()
+        },
+        &Target {
+            id,
+            ..Target::default()
+        },
+        Side::Single,
+        0,
+    );
+    assert_eq!(scorer.held_at(id, 0), 1);
+    store.record(id, 0, pushed, pushed_at, LoadSource::Stream);
+    store.publish(pushed_at + PUBLISH_WINDOW);
+
+    let score = |at| {
+        let (rows, _, built) = view(&store, &ask(at));
+        assert_eq!(rows[0].load.map(|load| load.running), Some(pushed.running));
+        assert_eq!(rows[0].load_sampled_at_micros, store.micros(pushed_at));
+        let facts = RequestFacts {
+            now_micros: built.now_micros,
+            ..RequestFacts::default()
+        };
+        scorer.score(&facts, &rows, &[0], &mut [0.0]);
+        assert_eq!(scorer.held_at(id, 0), 0);
+    };
+    score(pushed_at);
+
+    let saved = store.load(id, 0);
+    let passed = store.report_sampled(
+        &[(id, 0, Some(load(19, 0)))],
+        polled_at,
+        dispatch_at - Duration::from_millis(2),
+        LoadSource::Poll,
+    );
+    assert_eq!(store.load(id, 0), saved);
+    assert_eq!(passed, [0]);
+    store.publish(polled_at + PUBLISH_WINDOW);
+    score(polled_at);
+}
+
+#[test]
+fn a_stamped_poll_replaces_an_older_or_equal_sample() {
+    let store = MemoryStore::new();
+    let id = member(&store, "worker-a");
+    let pushed_at = Instant::now();
+    store.record(id, 0, load(7, 0), pushed_at, LoadSource::Stream);
+    let sampled_at = pushed_at + Duration::from_millis(13);
+    for (offset, running) in [(31, 6), (43, 8)] {
+        let polled_at = pushed_at + Duration::from_millis(offset);
+        let row = load(running, 0);
+        assert!(store
+            .report_sampled(
+                &[(id, 0, Some(row))],
+                polled_at,
+                sampled_at,
+                LoadSource::Poll
+            )
+            .is_empty());
+        assert_eq!(
+            store.load(id, 0),
+            Some(LoadSample {
+                row,
+                received_at: polled_at,
+                sampled_at,
+                source: LoadSource::Poll
+            })
+        );
+    }
 }
 
 #[test]

@@ -46,7 +46,7 @@ A few more rules:
 
 - `filter` and `score` may be left out. `pick` is required.
 - With one profile, `bindings` may be left out. The profile then serves every request. With two profiles or more, the bindings are required.
-- `view.max_report_age_ms` is optional and takes a whole number from 1 to 3,599,999. At decision time, built-in load scorers treat a report older than the limit like a missing report. A report exactly at the limit still counts. Omit the limit to use reports of any age.
+- With `view.max_report_age_ms` set (a whole number from 1 to 3,599,999), `least-load`, `resident-work`, `least-cost` and the KV-pressure gates of `prefix-affinity` and `warmup-slice` treat older reports as missing. Age is read at the decision's instant, and a report exactly at the limit still counts. Overload verdicts can still reflect older reports, plugins interpret report age themselves, and host-registered stages keep their own rules. With the limit unset, reports of any age count.
 - A field the format does not know is refused by name. Nothing is ignored. The one exception is the parameters of a scorer you register: its own type reads them, and must deny unknown fields to refuse one.
 - The document has no `kind` line. A document that writes one is refused.
 

@@ -295,9 +295,12 @@ pub struct ViewSpec {
     /// at most: one frame of the Decide call carries no more.
     #[schemars(range(min = 1, max = 8190))]
     pub max_block_hashes: u32,
-    /// Maximum load report age in milliseconds. Built-in scorers use their
-    /// unreported path for a sample older than this at the decision's instant.
-    /// Omit to use reports of any age.
+    /// With this limit in milliseconds set, `least-load`, `resident-work`,
+    /// `least-cost` and the KV-pressure gates of `prefix-affinity` and
+    /// `warmup-slice` treat older reports as missing. A report exactly at
+    /// the limit still counts. Overload verdicts can still reflect older
+    /// reports, plugins interpret report age themselves, and host-registered
+    /// stages keep their own rules. Omit it to use reports of any age.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1, max = MAX_REPORT_AGE_MS))]
     pub max_report_age_ms: Option<u64>,
