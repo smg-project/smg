@@ -691,9 +691,13 @@ impl<G: Generation> WorkerMonitor<G> {
                 // receipts are this worker's alone. Its series go with it,
                 // every rank it held: this record writes its own rank
                 // below, and the others read the sentinel until this
-                // worker reports them.
+                // worker reports them. Where a poll of this worker has
+                // published its row, the poll wrote every rank's series
+                // and none is cleared.
                 self.sink.forget(&left.pusher);
-                write_sentinel(&left.pusher, Some(&left));
+                if !self.load_state.row_is_another_live_workers(&left.pusher) {
+                    write_sentinel(&left.pusher, Some(&left));
+                }
             }
         }
         // On file: made just above when it was not.
@@ -1440,16 +1444,18 @@ impl<G: Generation> WorkerMonitor<G> {
     }
 
     /// Set a worker's `smg_engine_*` series to the sentinel, unless they
-    /// have a live owner: the worker itself where it is the registry's
-    /// `Ready` worker again, or another worker whose report stands at the
-    /// URL with no record held. A report with a held record is no live
+    /// have a live owner. That is the worker itself where it is the
+    /// registry's `Ready` worker again, another worker whose report
+    /// stands at the URL with no record held, or another `Ready` worker
+    /// whose row stands at the URL: a poll writes a worker's series with
+    /// the row it publishes. A report with a held record is no live
     /// owner: its worker was not `Ready` at that record, and the flush
     /// that finds it `Ready` writes its series. `reports` is the locked
     /// map of the pushed reports. A record writes its series under the
-    /// same lock, so a sentinel and a live write do not cross. `file` is
-    /// the report the eviction removed, where it removed one: the sentinel
-    /// covers the worker's own width and each rank the report held past
-    /// it.
+    /// same lock, so a sentinel and a pushed write do not cross. `file`
+    /// is the report the eviction removed, where it removed one: the
+    /// sentinel covers the worker's own width and each rank the report
+    /// held past it.
     fn clear_series(
         &self,
         reports: &FxHashMap<String, PushedFile>,
@@ -1461,6 +1467,7 @@ impl<G: Generation> WorkerMonitor<G> {
             || reports
                 .get(url)
                 .is_some_and(|other| !Arc::ptr_eq(&other.pusher, worker) && !other.series_held)
+            || self.load_state.row_is_another_live_workers(worker)
         {
             return;
         }

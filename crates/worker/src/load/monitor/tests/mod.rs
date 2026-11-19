@@ -2797,6 +2797,85 @@ async fn a_successors_first_record_clears_the_ranks_its_predecessor_reported() {
     );
 }
 
+/// A tick's poll of the worker at `http://w:1`, by what it leaves: the
+/// file's lay, the answer's series and the published row.
+fn polled(monitor: &WorkerMonitor, worker: &Arc<dyn Worker>, answer: WorkerLoadResponse) {
+    let _ = monitor.apply_polled_load("http://w:1", &answer, Instant::now());
+    Metrics::record_engine_load("http://w:1", "m", &answer);
+    monitor.load_state.publish_group(
+        &["http://w:1".to_string()],
+        vec![(Arc::clone(worker), Arc::new(answer))],
+    );
+}
+
+/// A successor can be polled ahead of its predecessor's eviction: the
+/// tick wrote its series and published its row. The predecessor's
+/// eviction writes no sentinel over them.
+#[tokio::test]
+async fn an_eviction_leaves_the_series_a_polled_successor_wrote() {
+    let rendered = render_with_recorder(|| {
+        let (registry, monitor) = build_monitor();
+        let first = ready_worker("http://w:1", "m");
+        let id = registry.register(Arc::clone(&first)).unwrap();
+        monitor.apply_pushed_load(&first, 0, &pushed(7), Instant::now());
+        monitor.flush_pushed();
+        let next = ready_worker("http://w:1", "m");
+        assert!(registry.replace(&id, Arc::clone(&next)));
+        polled(&monitor, &next, answer_of(0, 9));
+
+        monitor.evict_worker_loads(&first);
+        monitor.flush_pending_evictions();
+
+        assert_eq!(published_rows(&monitor), vec![(0, 9)], "its row");
+    });
+    assert!(running_series(&rendered).ends_with(" 9"), "{rendered}");
+}
+
+/// The same where the successor's stream then pushes. Its first record
+/// takes its predecessor's report off the file and clears no series: the
+/// tick wrote every rank's.
+#[tokio::test]
+async fn a_polled_successors_first_record_leaves_the_series_its_poll_wrote() {
+    let rendered = render_with_recorder(|| {
+        let (monitor, _replaced, next) = a_replaced_pusher_ahead_of_its_event();
+        let mut answer = answer_of(0, 9);
+        answer.loads.push(SchedulerLoadSnapshot {
+            dp_rank: 1,
+            num_running_reqs: 8,
+            ..Default::default()
+        });
+        polled(&monitor, &next, answer);
+
+        monitor.apply_pushed_load(&next, 0, &pushed(5), Instant::now());
+    });
+    assert!(running_series(&rendered).ends_with(" 5"), "{rendered}");
+    assert!(
+        running_series_of(&rendered, 1).ends_with(" 8"),
+        "{rendered}"
+    );
+}
+
+/// A polled worker has no report for its successor's record to replace,
+/// so nothing clears its series there. Its successor's held report is no
+/// live owner: the batch that removes the polled row writes the sentinel.
+#[tokio::test]
+async fn a_held_successor_does_not_keep_a_polled_predecessors_sentinel_away() {
+    let rendered = render_with_recorder(|| {
+        let (registry, monitor) = build_monitor();
+        let first = ready_worker("http://w:1", "m");
+        let id = registry.register(Arc::clone(&first)).unwrap();
+        polled(&monitor, &first, answer_of(0, 7));
+        registry.transition_status(&id, WorkerStatus::NotReady);
+        let next = ready_worker("http://w:1", "m");
+        assert!(registry.replace(&id, Arc::clone(&next)));
+        monitor.apply_pushed_load(&next, 0, &pushed(9), Instant::now());
+
+        monitor.evict_worker_loads(&first);
+        monitor.flush_pending_evictions();
+    });
+    assert!(running_series(&rendered).ends_with(" -1"), "{rendered}");
+}
+
 /// A report can hold a rank far past its worker's width. The eviction's
 /// sentinel covers that rank by itself: no series is made for a rank
 /// between, and the cost does not grow with the rank.

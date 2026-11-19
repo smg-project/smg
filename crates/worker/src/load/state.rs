@@ -280,6 +280,22 @@ impl<G: Generation> LoadState<G> {
             })
     }
 
+    /// Whether the row at `worker`'s URL came from another worker that is
+    /// the registry's `Ready` worker now. Such a worker is a live writer
+    /// of the URL's engine series: a poll writes them with the row it
+    /// publishes, and a pushed record ahead of its row.
+    pub(crate) fn row_is_another_live_workers(&self, worker: &Arc<dyn Worker>) -> bool {
+        let source = self
+            .tx
+            .borrow()
+            .entries
+            .get(worker.url())
+            .and_then(|entry| entry.source.upgrade());
+        source.is_some_and(|source| {
+            !Arc::ptr_eq(&source, worker) && self.is_current_incarnation(&source)
+        })
+    }
+
     /// Queue a worker's eviction and wake the flusher. The snapshot changes
     /// on the next [`Self::apply_pending_evictions`] batch.
     pub(crate) fn enqueue_eviction(&self, worker: Arc<dyn Worker>) {
