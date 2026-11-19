@@ -1237,9 +1237,11 @@ fn hand<R>(
     let (needs, shown) = engine.reads_for(model, phase);
     // A profile whose own stages read the column is handed the rows the
     // store names in the column's place, and no column: a stage that
-    // reads holders is fed them, whatever the picker's sample. The sample
-    // caps the rows named, and a profile that takes none is named every
-    // one. The deciding profile answers for itself: the needs are merged
+    // reads holders is fed them. The sample caps the rows named, and a
+    // profile that takes none is named every one. A profile that shows
+    // its rows to a plugin, or whose warm-up stages rule by two rulings,
+    // is named no row and keeps its column. The deciding profile answers
+    // for itself: the needs are merged
     // over a pair's two phases and a sessions rule, so they say only
     // where to ask, and no other decision pays the second walk.
     let cap = if needs.affinity {
@@ -4290,11 +4292,11 @@ pub(crate) mod tests {
 
     /// A decode decision of a model that also pairs is decided by its own
     /// profile, and the hand reads that profile's sample: it caps the rows
-    /// it names by it, and a profile that takes none is named every row.
-    /// One whose own stages read no column keeps its column, and so does
-    /// one whose warm-up stages rule by different numbers. The needs of its workers' stream
-    /// carry the pair's decode side, which reads the column and samples
-    /// sixteen here.
+    /// it names by it, and a profile that takes none is named every holder
+    /// and every warming row. One whose own stages read no column keeps
+    /// its column, and so does one whose warm-up stages rule by different
+    /// numbers. The needs of its workers' stream carry the pair's decode
+    /// side, which reads the column and samples sixteen here.
     #[test]
     fn the_hand_caps_the_rows_it_names_by_the_profile_that_decides() {
         use crate::Phase;
