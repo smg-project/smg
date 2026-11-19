@@ -22,7 +22,7 @@ use tokenizers::{
         PreTokenizerWrapper,
     },
     processors::template::TemplateProcessing,
-    tokenizer::{OffsetReferential, OffsetType, SplitDelimiterBehavior, Tokenizer as HfTokenizer},
+    tokenizer::{SplitDelimiterBehavior, Tokenizer as HfTokenizer},
     AddedToken, AddedVocabulary, Model,
 };
 use tracing::{debug, info, warn};
@@ -510,9 +510,8 @@ impl EncoderCore {
     /// into its spelling, which the matcher of [`Self::added`], a reader of
     /// the raw text, passes. A prompt rendered by segments is encoded by
     /// segments under such a pipeline: there the text is its characters.
-    /// A built value of several controls stays unbound under it, so that
-    /// the text between them is read as the flat encode reads it (see
-    /// `ChatTemplateState::mark_built_controls`).
+    /// A template that builds its control spellings stays as it is under
+    /// it (see `ChatTemplateState::mark_built_controls`).
     fn matches_after_normalization(&self) -> bool {
         *self.matches_after_normalization.get_or_init(|| {
             let normalizes = match self.tokenizer.get_normalizer() {
@@ -528,21 +527,6 @@ impl EncoderCore {
                     .values()
                     .any(|token| token.normalized)
         })
-    }
-
-    /// The added tokens the flat encode cuts out of `text`, in order, as the
-    /// reference pipeline finds them: the entries matched as spelled, then,
-    /// in what is left, the ones matched after normalization. Only the load
-    /// of a template asks, where [`Self::matches_after_normalization`].
-    fn cut_out(&self, text: &str) -> Vec<Range<usize>> {
-        self.tokenizer
-            .get_added_vocabulary()
-            .extract_and_normalize(self.tokenizer.get_normalizer(), text)
-            .get_splits(OffsetReferential::Original, OffsetType::Byte)
-            .into_iter()
-            .filter(|(_, _, tokens)| tokens.is_some())
-            .map(|(_, (start, end), _)| start..end)
-            .collect()
     }
 
     /// Whether the flat encode of `text` cuts out exactly the added tokens at
@@ -1134,7 +1118,6 @@ impl HuggingFaceTokenizer {
                     || core.added_entries(),
                     || core.added(),
                     &|| !core.matches_after_normalization(),
-                    &|text: &str| core.cut_out(text),
                     &special_tokens,
                 )
                 .map(|written| {
@@ -2893,7 +2876,6 @@ impl TokenizerTrait for HuggingFaceTokenizer {
                 || core.added_entries(),
                 || core.added(),
                 &|| !core.matches_after_normalization(),
-                &|text: &str| core.cut_out(text),
                 &self.special_tokens,
             );
             self.kept = written.as_deref().and_then(|written| core.kept(written));
