@@ -79,3 +79,13 @@ def test_every_path_filter_entry_has_a_root_on_the_tree(workflow):
 def test_discovery_runs_when_the_command_line_changes():
     workflow = ROOT / ".github" / "workflows" / "e2e-discovery.yml"
     assert ("pull_request", "paths", "model_gateway/src/cli/mod.rs") in filter_entries(workflow)
+
+
+def test_discovery_runs_when_the_workflow_crate_changes():
+    workflow = ROOT / ".github" / "workflows" / "e2e-discovery.yml"
+    assert ("pull_request", "paths", "crates/workflow/**") in filter_entries(workflow)
+
+
+def test_discovery_runs_when_the_worker_workflow_steps_change():
+    workflow = ROOT / ".github" / "workflows" / "e2e-discovery.yml"
+    assert ("pull_request", "paths", "crates/worker/src/workflow/**") in filter_entries(workflow)
