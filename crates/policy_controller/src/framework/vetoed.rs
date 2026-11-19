@@ -293,17 +293,19 @@ fn veto_ran(profile: &Profile, veto: &str, emptied_by: &str) -> bool {
 /// The overload veto is lifted under [`AllVetoed::Steer`], where it stood
 /// in the emptied pass and a row reads as over its thresholds. Under a veto
 /// its host lifted none does, and that tier ends there. The liveness veto
-/// is lifted next, under either word of the binding, where a row is doubted
-/// and the health stage stood in the pass that ended empty. That pass reads
-/// the rows with no doubt ([`undoubted`]) and is otherwise as the pass
-/// before it: a steering binding has the overload veto lifted there too, a
-/// binding that sheds keeps it. So under a binding that sheds a doubted
-/// worker under its thresholds takes the request, and a pool over on every
-/// ready worker is shed as saturated. Nothing harder is lifted: a worker
-/// that is not ready, behind an open breaker or draining stays refused.
-/// So does a row a hold of the host stands on, whichever way the host says
-/// it: by the breaker bit on a row it wrote, or among its held rows beside
-/// lent ones ([`Constraints::held`]), which the lifted pass keeps masked.
+/// is lifted next, under either word of the binding, where the doubt alone
+/// refuses a row ([`doubted_alone`], [`mask_doubts`]) and the health stage
+/// stood in the pass that ended empty. That pass reads the rows with no
+/// doubt ([`undoubted`]) and is otherwise as the pass before it: a steering
+/// binding has the overload veto lifted there too, a binding that sheds
+/// keeps it. So under a binding that sheds a doubted worker under its
+/// thresholds takes the request, and a pool over on every ready worker is
+/// shed as saturated. Nothing harder is lifted: a worker that is not ready,
+/// behind an open breaker or draining stays refused, and a doubt on such a
+/// worker opens no pass. So does a row a hold of the host stands on,
+/// whichever way the host says it: by the breaker bit on a row it wrote, or
+/// among its held rows beside lent ones ([`Constraints::held`]), which the
+/// lifted pass keeps masked.
 ///
 /// A set put to no rule is shed where it emptied ([`AllVetoed::Unasked`]):
 /// each side of a pair, and the rule's own passes, so the rule is asked
@@ -353,10 +355,11 @@ pub(super) fn emptied(
             Some(stage) => ended = stage,
         }
     }
-    // A doubt is a row's own bit or the host's mask beside the rows. A row
-    // a hold of the host stands on is not doubted: it stays masked, and a
-    // mask of held rows alone gains nobody when it is lifted.
-    let own = candidates.iter().any(|row| row.health.stalled);
+    // A doubt is a row's own bit or the host's mask beside the rows, and
+    // the tier opens for a row the doubt alone refuses. A doubt on a row a
+    // harder veto refuses too gains nobody when it is lifted. Nor does a
+    // row a hold of the host stands on: it stays masked.
+    let own = candidates.iter().any(|row| doubted_alone(row.health));
     // The two lengths answer for the rows only where every held row is a
     // row of the mask: the store's view keeps that, and a host that fills
     // the constraints by hand owes it.
@@ -364,7 +367,7 @@ pub(super) fn emptied(
         cx.held.iter().all(|held| cx.stalled.contains(held)),
         "a held row is no row of the mask"
     );
-    let masked = cx.stalled.len() > cx.held.len();
+    let masked = cx.stalled.len() > cx.held.len() && mask_doubts(candidates, cx);
     if (own || masked) && veto_ran(profile, Healthy.name(), ended) {
         return doubted(emptied_by, own, profile, facts, cx, buf, set);
     }
@@ -476,6 +479,32 @@ fn undoubted(candidates: &[Candidate], rows: &mut Vec<Candidate>) {
         },
         ..*row
     }));
+}
+
+/// Whether the liveness veto alone refuses a row of these bits: the row
+/// carries the doubt and stands once it is lifted. The health stage's own
+/// test of the row with no doubt on it
+/// ([`Health::routable_ignoring_overload`]), so the two cannot part.
+const fn doubted_alone(health: Health) -> bool {
+    health.stalled
+        && Health {
+            stalled: false,
+            ..health
+        }
+        .routable_ignoring_overload()
+}
+
+/// Whether the host's mask alone refuses a row: a row of the mask no hold
+/// stands on whose own bits refuse nothing. Both lists are in order, so a
+/// held row is found by a search. Asked only of a pool the rule was put
+/// to, and only where the mask is longer than the held list.
+fn mask_doubts(candidates: &[Candidate], cx: &Constraints<'_>) -> bool {
+    cx.stalled.iter().any(|&at| {
+        cx.held.binary_search(&at).is_err()
+            && candidates
+                .get(at as usize)
+                .is_some_and(|row| row.health.routable_ignoring_overload())
+    })
 }
 
 /// The rule's pick among the rows its lifted pass kept (`buf.kept`): the
@@ -3506,6 +3535,65 @@ mod tests {
         assert_eq!(passes, pool.len());
         let (one, passes) = ask(&[0, 1, 3]);
         assert_eq!(order(&one), vec![2]);
+        assert_eq!(passes, 2 * pool.len());
+    }
+
+    /// A doubt on a row a harder veto refuses too opens no tier: lifting it
+    /// gains nobody. A pool with no ready worker but the doubted one, which
+    /// is not ready, draining or behind an open breaker, costs the one pass
+    /// it costs with no doubt in it, by the host's mask and by the row's own
+    /// bit alike. A doubt alone on a ready row costs the tier's pass, and
+    /// that row takes the request.
+    #[test]
+    fn a_doubt_on_a_row_a_harder_veto_refuses_costs_no_further_pass() {
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counts: Box<dyn Filter> = Box::new(Counts(Arc::clone(&asked)));
+        let (engine, _) = counted_among(|_| vec![counts, Box::new(Healthy)]);
+        let ask = |pool: &[Candidate], stalled: &[u32]| {
+            let masked = Constraints {
+                stalled,
+                ..Constraints::default()
+            };
+            let mut scratch = Scratch::new();
+            let decision = engine.decide(
+                &facts(1),
+                &PoolFacts::default(),
+                pool,
+                &masked,
+                &mut scratch,
+            );
+            (decision, asked.swap(0, Ordering::Relaxed))
+        };
+        // No row is ready but the second, which each case refuses its way.
+        let pool_of = |refuse: fn(&mut Health)| {
+            let mut pool = [free(0, 0), free(1, 0), free(2, 0)];
+            pool[0].health.healthy = false;
+            pool[2].health.healthy = false;
+            refuse(&mut pool[1].health);
+            pool
+        };
+        let harder: [fn(&mut Health); 3] = [
+            |health| health.healthy = false,
+            |health| health.draining = true,
+            |health| health.breaker_open = true,
+        ];
+        for refuse in harder {
+            let mut pool = pool_of(refuse);
+            let (masked, passes) = ask(&pool, &[1]);
+            assert_eq!(shed_of(&masked), (ShedReason::NoEndpoints, "healthy"));
+            assert_eq!(passes, pool.len());
+            pool[1].health.stalled = true;
+            let (own, passes) = ask(&pool, &[]);
+            assert_eq!(shed_of(&own), (ShedReason::NoEndpoints, "healthy"));
+            assert_eq!(passes, pool.len());
+        }
+        let mut pool = pool_of(|_| {});
+        let (masked, passes) = ask(&pool, &[1]);
+        assert_eq!(order(&masked), vec![1]);
+        assert_eq!(passes, 2 * pool.len());
+        pool[1].health.stalled = true;
+        let (own, passes) = ask(&pool, &[]);
+        assert_eq!(order(&own), vec![1]);
         assert_eq!(passes, 2 * pool.len());
     }
 
