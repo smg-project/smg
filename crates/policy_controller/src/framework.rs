@@ -849,6 +849,13 @@ struct Buffers {
     scores: Vec<f32>,
     stage: Vec<f32>,
     before_soft: Vec<u32>,
+    /// The rows as they read with no doubt, for the all-vetoed rule's pass
+    /// that lifts the liveness veto ([`vetoed::emptied`]). The first such
+    /// pass sizes it, and no other decision touches it.
+    undoubted: Vec<Candidate>,
+    /// The veto the rule lifted for the rows it kept ([`vetoed::emptied`]):
+    /// the mark of its pick's trace ([`vetoed::steered`]).
+    lifted: Lifted,
     /// The pool size every buffer holds room for ([`Buffers::reserve`]).
     room: usize,
 }
@@ -1844,16 +1851,17 @@ struct Set<'a> {
     partnered: Option<&'a [u32]>,
     /// The profile's filters as one test of a row, where the pass's caller
     /// holds the engine's fold of them: a whole pass hands it to its stages
-    /// ([`run_whole`]), and the all-vetoed rule's second pass asks it about
-    /// a set that is the whole pool ([`vetoed::emptied`]). `None` from every
-    /// other caller: the rule's second pass is staged.
+    /// ([`run_whole`]), and the all-vetoed rule's pass with the overload
+    /// veto lifted asks it about a set that is the whole pool
+    /// ([`vetoed::emptied`]). `None` from every other caller: that pass of
+    /// the rule is staged.
     fold: Option<RowTests>,
     /// The `epd` plan's filters apply: the pool is the encode pool and the
     /// rows' compatibility and vision bits are read.
     encode: bool,
-    /// What the binding says of a pool the overload veto empties
-    /// ([`AllVetoed`]): the filter half puts such a pool to the rule by this
-    /// word ([`vetoed::emptied`]).
+    /// What the binding says of a pool a soft veto empties ([`AllVetoed`]):
+    /// the filter half puts such a pool to the rule by this word
+    /// ([`vetoed::emptied`]).
     vetoed: AllVetoed,
 }
 
@@ -1867,9 +1875,9 @@ impl<'a> Set<'a> {
     }
 
     /// One side of a pair: `candidates` narrowed by the classes a chosen
-    /// prefill pairs with or by the partnered list. A side sheds a pool the
-    /// overload veto empties: the pair plan does not enter the all-vetoed
-    /// rule.
+    /// prefill pairs with or by the partnered list. A side is put to no rule
+    /// ([`AllVetoed::Unasked`]): the pair plan does not enter the all-vetoed
+    /// rule, and a pool a veto empties there is shed.
     const fn side(
         candidates: &'a [Candidate],
         class: Option<&'a [u32]>,
@@ -1881,17 +1889,18 @@ impl<'a> Set<'a> {
             partnered,
             fold: None,
             encode: false,
-            vetoed: AllVetoed::Shed,
+            vetoed: AllVetoed::Unasked,
         }
     }
 
-    /// The same rows put to no rule: a pass over them sheds a pool the
-    /// overload veto empties, whatever the binding says. The rule's own
-    /// second pass runs over such a set, and a kept key is decided over one
-    /// ([`Engine::keep`]): its lifted run stands in for the rule.
+    /// The same rows put to no rule ([`AllVetoed::Unasked`]): a pass over
+    /// them sheds a pool a veto empties, whatever the binding says. The
+    /// rule's own passes run over such a set, and so does each pass of a
+    /// kept key that reads the overload veto as it stands
+    /// ([`Engine::keep`]).
     const fn shedding(self) -> Self {
         Self {
-            vetoed: AllVetoed::Shed,
+            vetoed: AllVetoed::Unasked,
             ..self
         }
     }
@@ -1994,7 +2003,7 @@ fn run_single(
 /// ([`leads`]): a pool whose every row is refused is put to the stages at
 /// once, which alone say what refused it. The stages take the fold with
 /// their set: where the overload veto empties the pool, the all-vetoed
-/// rule's second pass asks it ([`vetoed::emptied`]).
+/// rule's pass with that veto lifted asks it ([`vetoed::emptied`]).
 ///
 /// Out of line: the decision's entry holds nothing of the pass. By count,
 /// inlined there the pass read 27 instructions fewer over 8 rows, and a
@@ -3751,9 +3760,9 @@ impl Engine {
                 .then(|| profile.open(facts, candidates, pool));
             if vetoed::keeps_its_key(binding, *placing, *vetoed, facts) {
                 let rule = binding.sessions.as_ref();
-                // The lifted run stands in for the all-vetoed rule: no pass
-                // of a kept key is put to it.
-                let set = set.shedding();
+                // The lifted run stands in for the rule's overload tier. A
+                // pool it leaves nobody is put to the liveness tier, by the
+                // binding's own set.
                 return self.keep(profile, index, rule, facts, pool, set, cx, scratch);
             }
             opened
@@ -3882,9 +3891,8 @@ impl Engine {
         let mut all_vetoed = false;
         if KEPT {
             // A pass that keeps nobody leaves no pin standing, and the
-            // lifted pass answers below. A kept key's set sheds, so this
-            // pass is put to no rule.
-            all_vetoed = filter(profile, facts, cx, buf, set).is_some();
+            // lifted pass answers below: this pass is put to no rule.
+            all_vetoed = filter(profile, facts, cx, buf, set.shedding()).is_some();
         } else if let Some(answer) = single_survivors(profile, index, facts, pool, set, cx, buf) {
             return answer;
         }
@@ -4194,8 +4202,9 @@ impl Engine {
                 profile, index, rule, placing, facts, pool, candidates, buf, pin,
             );
         }
-        // The veto as it stands: that pass's survivors decide.
-        if !all_vetoed && filter(profile, facts, cx, buf, set).is_none() {
+        // The veto as it stands: that pass's survivors decide. The pass is
+        // put to no rule.
+        if !all_vetoed && filter(profile, facts, cx, buf, set.shedding()).is_none() {
             if let Some(respilled) = self.respill(
                 profile, index, rule, placing, facts, pool, candidates, buf, pin,
             ) {

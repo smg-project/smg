@@ -1321,7 +1321,10 @@ pub struct OverloadSpec {
     /// which the controller's own service does not yet. A rule with
     /// `inflight_cap: 65535` has no cap. Set, the key moves to the ring's
     /// next worker; unset, the key stays on its worker over the veto.
-    /// Everywhere else a keyed request keeps the veto.
+    /// Everywhere else a keyed request keeps the veto. The word is the
+    /// overload veto's alone: a worker the liveness check doubts still
+    /// takes a request no other worker can, unless it is over its
+    /// thresholds too.
     pub shed_when_all_vetoed: bool,
 }
 

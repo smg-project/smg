@@ -476,6 +476,10 @@ enum LiftedVeto {
   LIFTED_VETO_NONE = 0;
   // Every usable worker was over its overload thresholds.
   LIFTED_VETO_OVERLOAD = 1;
+  // No worker stood until the liveness veto was lifted: the pick is of the
+  // workers the liveness check doubts. A reader built before this value
+  // reads a number it does not name.
+  LIFTED_VETO_LIVENESS = 2;
 }
 
 message FilterDrop {
