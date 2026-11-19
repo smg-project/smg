@@ -30,6 +30,7 @@ on:
       # registers it.
       - crates/worker/src/identity/endpoint.rs
       - model_gateway/src/workflow/**
+      - crates/workflow/**
       - crates/worker/src/worker.rs
       - crates/mock_worker/**
       - model_gateway/tests/discovery/k8s_discovery_test.rs

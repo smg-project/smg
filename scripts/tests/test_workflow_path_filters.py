@@ -21,6 +21,7 @@ WORKFLOWS = sorted(
     for suffix in ("yml", "yaml")
     for path in (ROOT / ".github" / "workflows").glob(f"*.{suffix}")
 )
+DISCOVERY_WORKFLOW = ROOT / ".github" / "workflows" / "e2e-discovery.yml"
 GLOB = re.compile(r"[*?\[]")
 
 
@@ -79,3 +80,8 @@ def test_every_path_filter_entry_has_a_root_on_the_tree(workflow):
 def test_discovery_runs_when_the_command_line_changes():
     workflow = ROOT / ".github" / "workflows" / "e2e-discovery.yml"
     assert ("pull_request", "paths", "model_gateway/src/cli/mod.rs") in filter_entries(workflow)
+
+
+def test_discovery_runs_when_the_workflow_crate_changes():
+    entries = set(filter_entries(DISCOVERY_WORKFLOW))
+    assert ("pull_request", "paths", "crates/workflow/**") in entries
