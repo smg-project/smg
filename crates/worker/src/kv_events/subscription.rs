@@ -7,6 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use futures::FutureExt as _;
 use tokio::sync::{oneshot, Semaphore};
 use tracing::{error, info, warn};
 
@@ -366,12 +367,10 @@ impl Rounds {
     /// With a `feed` (an events subscription: the sink and its id for the
     /// worker) it says to the sink what the stream brings and, on exit, that
     /// the worker left; without one it streams the worker's load records
-    /// alone. Exits when `shutdown_rx`
-    /// fires or the backend returns `Unimplemented`. Each round
-    /// (`subscription_round`) gets the engine connection, subscribes
-    /// under the deadline and drains one stream, then says what comes next;
-    /// this loop is the one place that sleeps the reconnect backoff and the
-    /// one place that ends the task.
+    /// alone. Exits when `shutdown_rx` fires or the backend returns
+    /// `Unimplemented`. A panic inside a round is an exit too: the sink
+    /// hears that the worker left, then the panic goes on to the task that
+    /// runs the loop. This is the one place that ends the task.
     pub(super) async fn subscription_loop<S>(
         worker: Arc<dyn Worker>,
         worker_url: String,
@@ -401,30 +400,53 @@ impl Rounds {
             load_sink: load_sink.as_ref(),
             wake: wake.as_ref(),
         };
-        let mut backoff = Backoff::new();
 
-        let unsupported = loop {
-            match Self::subscription_round(&subscription, &mut backoff, &mut shutdown_rx).await {
-                Round::Again => {}
-                Round::Backoff => {
-                    if sleep_or_shutdown(backoff.delay(), wake.as_ref(), &mut shutdown_rx).await {
-                        break false;
-                    }
-                    backoff.grow();
-                }
-                Round::Shutdown => break false,
-                Round::Unsupported => break true,
-            }
-        };
+        // A panic inside a round is held until the sink has heard that the
+        // worker left: its blocks do not stay in the sink behind a task that
+        // feeds it no more.
+        let ended =
+            std::panic::AssertUnwindSafe(Self::rounds_to_end(&subscription, &mut shutdown_rx))
+                .catch_unwind()
+                .await;
         let events = feed.is_some();
         if let Some((sink, id)) = feed {
             Self::remove_from_sink(sink, id, &worker_url).await;
         }
+        let unsupported = match ended {
+            Ok(unsupported) => unsupported,
+            // On to the task that runs the loop, which reports it.
+            Err(panic) => std::panic::resume_unwind(panic),
+        };
         // The gauge is the events subscription's: a loads-only one a backend
         // refuses leaves the worker on the poll, which is the designed
         // fallback.
         if unsupported && events {
             Metrics::set_kv_events_unavailable(&worker_url, true);
+        }
+    }
+
+    /// Round after round until the task is to end: `true` when the backend
+    /// serves no KV events, `false` when the worker left. Each round
+    /// (`subscription_round`) gets the engine connection, subscribes under
+    /// the deadline and drains one stream, then says what comes next; this
+    /// is the one place that sleeps the reconnect backoff.
+    async fn rounds_to_end<S: KvEventSink<Batch = KvEventBatch>>(
+        sub: &WorkerSubscription<'_, S>,
+        shutdown_rx: &mut oneshot::Receiver<()>,
+    ) -> bool {
+        let mut backoff = Backoff::new();
+        loop {
+            match Self::subscription_round(sub, &mut backoff, shutdown_rx).await {
+                Round::Again => {}
+                Round::Backoff => {
+                    if sleep_or_shutdown(backoff.delay(), sub.wake, shutdown_rx).await {
+                        return false;
+                    }
+                    backoff.grow();
+                }
+                Round::Shutdown => return false,
+                Round::Unsupported => return true,
+            }
         }
     }
 
@@ -437,7 +459,15 @@ impl Rounds {
         shutdown_rx: &mut oneshot::Receiver<()>,
     ) -> Round {
         let worker_url = sub.worker_url;
-        let backend_client = match sub.worker.engine_connection().await {
+        // The connect takes as long as the worker's transport lets it. The
+        // worker's removal ends the wait at once, as it ends the subscribe
+        // call and the backoff; the connect dropped here is made again for
+        // the worker's next caller.
+        let connected = tokio::select! {
+            connected = sub.worker.engine_connection() => connected,
+            _ = &mut *shutdown_rx => return Round::Shutdown,
+        };
+        let backend_client = match connected {
             Ok(Some(client)) => client,
             Ok(None) => {
                 // HTTP workers are filtered in on_worker_added, so this should
@@ -840,10 +870,13 @@ mod tests {
     use super::{super::port::KvCursor, *};
     use crate::{
         common_proto as common,
-        identity::basic::StallReason,
+        connection::engine::{EngineConnector, ZmqLink},
+        identity::basic::{ConnectionMode, StallReason},
         test_support::{
-            BasicWorkerBuilder, LoadReaders, Script, ScriptedEngine, WorkerMonitor, WorkerRegistry,
+            no_health_check, BasicWorkerBuilder, LoadReaders, Script, ScriptedEngine,
+            WorkerMonitor, WorkerRegistry,
         },
+        worker::{RuntimeType, WorkerType},
     };
 
     /// Where the cases' workers stand, by name alone: nothing dials it.
@@ -890,6 +923,8 @@ mod tests {
     struct Said {
         calls: Mutex<Vec<String>>,
         applied: u64,
+        /// Panics inside `admit`, once the call is noted.
+        admit_panics: bool,
     }
 
     impl Said {
@@ -916,6 +951,7 @@ mod tests {
                 "admit {id} rank {rank} seq {}{chunk}",
                 facts.sequence
             ));
+            assert!(!self.admit_panics, "the sink panics inside admit");
             BatchOutcome::Applied
         }
 
@@ -1542,6 +1578,102 @@ mod tests {
         assert!(matches!(round, Round::Shutdown | Round::Backoff));
         assert_eq!(request.start_sequence_number, 41);
         assert_eq!(sink.calls(), ["cursor 7 rank 0"]);
+    }
+
+    /// A panic inside a round is an exit of the loop like any other: the
+    /// sink hears that the worker left before the panic goes on to the task
+    /// that runs the loop. Without that the worker's blocks stay in the sink
+    /// behind a task that feeds it no more.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_round_that_panics_still_says_to_the_sink_that_the_worker_left() {
+        let (worker, _engine) = connected(Script::Stream(vec![Ok(stored_batch(&[(1, 16)]))]));
+        let sink = Arc::new(Said {
+            admit_panics: true,
+            ..Said::default()
+        });
+        let (_leave, leaving) = oneshot::channel();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the case awaits the task to its end"
+        )]
+        let task = tokio::spawn(Rounds::subscription_loop(
+            Arc::clone(&worker),
+            worker.url().to_string(),
+            Some((Arc::clone(&sink), 7)),
+            "m".to_string(),
+            leaving,
+            None,
+        ));
+
+        let ended = task.await.expect_err("the panic goes on to the task");
+        assert!(ended.is_panic());
+        let said: Vec<String> = sink
+            .calls()
+            .into_iter()
+            .filter(|call| !call.starts_with("cursor"))
+            .collect();
+        assert_eq!(said, ["reconnected 7", "admit 7 rank 0 seq 1", "removed 7"]);
+    }
+
+    /// A connector whose connect never answers, as a dial does to an address
+    /// that neither takes the connection nor refuses it.
+    #[derive(Debug)]
+    struct NeverConnects;
+
+    #[async_trait::async_trait]
+    impl EngineConnector for NeverConnects {
+        async fn connect_grpc(
+            &self,
+            _base_url: &str,
+            _runtime: RuntimeType,
+        ) -> Result<Arc<dyn EngineConnection>, String> {
+            std::future::pending().await
+        }
+
+        async fn connect_zmq(&self, _link: ZmqLink) -> Result<Arc<dyn EngineConnection>, String> {
+            std::future::pending().await
+        }
+
+        async fn dial_grpc(&self, _base_url: &str, _timeout: Duration) -> Result<(), String> {
+            std::future::pending().await
+        }
+    }
+
+    /// The worker's removal ends a round that still waits on the engine's
+    /// connection: that wait is as long as the transport's, and a removal
+    /// must not be. The clock is paused, so the bound costs no wall time: a
+    /// round still waiting when it is reached has outlived the removal.
+    #[tokio::test(start_paused = true)]
+    async fn a_removal_ends_a_round_that_waits_on_the_connect() {
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(URL)
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Grpc)
+                .health_config(no_health_check())
+                .engine_connector(Arc::new(NeverConnects))
+                .build(),
+        );
+        let sink = Said::default();
+        let sub = said_subscription(&worker, &sink);
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+        let mut backoff = Backoff::new();
+        let removal = async {
+            // The round is inside the connect by now: it was polled first.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            shutdown_tx.send(()).unwrap();
+        };
+
+        let (round, ()) = tokio::join!(
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                Rounds::subscription_round(&sub, &mut backoff, &mut shutdown_rx),
+            ),
+            removal,
+        );
+
+        let round = round.expect("the round outlived the worker's removal");
+        assert!(matches!(round, Round::Shutdown));
+        assert!(sink.calls().is_empty(), "nothing is said to the sink");
     }
 
     /// What crosses the port from the collector's side, call by call, held
