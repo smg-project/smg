@@ -122,7 +122,7 @@ mod tests {
     use super::*;
     use crate::{
         store::{
-            membership::life, HealthPolicy, LeasesStore, MemoryStore, WorkerFacts, WorkerPatch,
+            membership::life, HealthPolicy, MemoryStore, WorkerFacts, WorkerPatch,
             WorkerStatus as RowStatus, WorkersStore,
         },
         worker_host::{object, Members, SoleLead},
@@ -455,7 +455,6 @@ mod tests {
     #[test]
     fn an_adapter_of_an_earlier_term_writes_nothing() {
         let replica = Replica::new(1, true).expect("a laid worker");
-        replica.store.set_term(1);
         let lead = Arc::new(TestLead(Mutex::new(Some(1))));
         let adapter = HealthAdapter::new(
             Arc::clone(&replica.objects),
@@ -463,7 +462,6 @@ mod tests {
             lead.clone(),
             1,
         );
-        replica.store.set_term(2);
         *lead.0.lock() = Some(2);
         assert_eq!(
             adapter.probe_outcome(&replica.id, true, replica.revision, ObjectStatus::Pending),

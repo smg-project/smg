@@ -8,6 +8,9 @@
 /// A gateway with its own store can use [`SoleLead`].
 pub trait Lead: Send + Sync + 'static {
     /// The term this replica leads under, or `None` while it follows.
+    ///
+    /// Called under a worker object's mutation lock: it must not block, and
+    /// must take no lock that is held while the registry is written.
     fn term(&self) -> Option<u64>;
 }
 
