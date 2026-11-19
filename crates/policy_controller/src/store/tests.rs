@@ -77,8 +77,7 @@ fn lease(gateway: GatewayId, id: u64, term: u64, now: Instant) -> LeaseRecord {
         term,
         issued_at: now,
         dispatch_deadline: now + Duration::from_secs(1),
-        state: LeaseState::Issued,
-        session_ttl_micros: None,
+        state: LeaseState::ISSUED,
     }
 }
 
@@ -1801,7 +1800,7 @@ fn a_pairs_sides_are_dispatched_and_ended_each_by_its_own_frame() {
     let at = now + Duration::from_millis(3);
     let dispatched = LeaseState::Dispatched { at };
     assert!(leases.dispatched(gateway, key, on(Side::Decode, 0), at));
-    assert_eq!(sides(&store, 1), Some((LeaseState::Issued, dispatched)));
+    assert_eq!(sides(&store, 1), Some((LeaseState::ISSUED, dispatched)));
     assert!(leases.dispatched(gateway, key, on(Side::Prefill, 0), at));
     assert_eq!(sides(&store, 1), Some((dispatched, dispatched)));
     // A frame on a side the pair does not hold changes nothing.
@@ -1867,7 +1866,7 @@ fn a_release_ends_the_side_it_names_and_with_no_side_every_side() {
     assert!(leases.released(gateway, LeaseId(1), Some(Side::Decode), gone));
     assert_eq!(booked(&store, &[p, d]), [1, 0]);
     let released = LeaseState::Released(gone);
-    assert_eq!(sides(&store, 1), Some((LeaseState::Issued, released)));
+    assert_eq!(sides(&store, 1), Some((LeaseState::ISSUED, released)));
     // The last side's release takes the record off the file.
     assert!(leases.released(gateway, LeaseId(1), Some(Side::Prefill), gone));
     assert_eq!(leases.get(gateway, LeaseId(1)), None);
@@ -2176,7 +2175,7 @@ fn decode_side(target: WorkerId) -> DecodeSide {
         target,
         picked: Picked::default(),
         session: Session::NONE,
-        state: LeaseState::Issued,
+        state: LeaseState::ISSUED,
         tokens: 0,
         target_index: 0,
     }
@@ -2274,7 +2273,7 @@ fn a_restore_empties_the_lease_file_and_a_hello_books_what_it_lists_once() {
         .into_iter()
         .map(|(record, said)| {
             assert_eq!(said, removed);
-            assert_eq!(record.state, LeaseState::Issued);
+            assert_eq!(record.state, LeaseState::ISSUED);
             record.lease.id.0
         })
         .collect();
@@ -3138,7 +3137,7 @@ fn the_store_mints_a_decisions_lease_under_its_own_term_alone() {
     let filed = leases.get(gateway, second).expect("under its minted id");
     assert_eq!(
         (filed.lease.id, filed.term, filed.target, filed.state),
-        (second, 3, a, LeaseState::Issued)
+        (second, 3, a, LeaseState::ISSUED)
     );
     // A term's counter starts at 1, and an id a restored lease holds is
     // passed over: the store's `Duplicate` is no decision's answer.
@@ -3248,9 +3247,20 @@ fn told() -> Vec<(LeaseRecord, Said)> {
 /// counter of its id, and the counters of the leases it ended, as the
 /// store told their end.
 fn issued_at(store: &MemoryStore, target: WorkerId, at: Instant) -> (u64, Vec<u64>) {
+    issued_in(store, target, at, LeaseState::ISSUED)
+}
+
+/// [`issued_at`] for a lease in `state`.
+fn issued_in(
+    store: &MemoryStore,
+    target: WorkerId,
+    at: Instant,
+    state: LeaseState,
+) -> (u64, Vec<u64>) {
     let counter = |id: LeaseId| id.0 & 0xffff_ffff;
     let record = LeaseRecord {
         dispatch_deadline: at + Duration::from_secs(5),
+        state,
         ..booking(GatewayId(1), 0, target, at)
     };
     let world = store.world();
@@ -3304,6 +3314,34 @@ fn an_issue_ends_two_leases_past_their_dispatch_deadline_at_most() {
     // the three late ones, each on its worker's count.
     assert_eq!(leases.live(gateway), 5);
     assert_eq!(in_flight(&store), [(a, 5)]);
+}
+
+#[test]
+fn a_lease_issued_under_a_rule_with_a_ttl_stands_and_ends_as_any_issued_lease() {
+    let store = MemoryStore::new();
+    let a = ready(&store, "http://a:1");
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, t0) = (GatewayId(1), Instant::now());
+    leases.set_term(1);
+    let id = |counter: u64| LeaseId(1 << 32 | counter);
+    let state = |id| leases.get(gateway, id).map(|record| record.state);
+    // Two leases under a sessions rule with a TTL: each is live and on
+    // its worker's count, as a lease under no rule is.
+    let under = LeaseState::issued(Some(60_000_000));
+    assert_eq!(issued_in(&store, a, t0, under), (1, vec![]));
+    assert_eq!(issued_in(&store, a, t0, under), (2, vec![]));
+    assert_eq!(state(id(2)), Some(under));
+    assert_eq!(leases.live(gateway), 2);
+    assert_eq!(in_flight(&store), [(a, 2)]);
+    // A dispatch moves the first.
+    assert!(leases.dispatched(gateway, id(1), Dispatch::default(), t0));
+    assert_eq!(state(id(1)), Some(LeaseState::Dispatched { at: t0 }));
+    // An issue past the deadline ends the second as abandoned, and the
+    // dispatched one stands.
+    let late = t0 + Duration::from_secs(6);
+    assert_eq!(issued_at(&store, a, late).1, [2]);
+    assert_eq!(state(id(2)), None);
+    assert_eq!(leases.live(gateway), 2);
 }
 
 #[test]
@@ -3472,7 +3510,7 @@ fn a_frame_handed_where_nobody_is_at_work_is_applied_by_its_hand() {
     assert_eq!(kept.len(), 1);
     assert_eq!(
         (kept[0].0.lease.id, kept[0].0.state, kept[0].1),
-        (ids[0], LeaseState::Issued, dispatch)
+        (ids[0], LeaseState::ISSUED, dispatch)
     );
     // A second dispatch, a second release and a lease not on file tell
     // nothing.

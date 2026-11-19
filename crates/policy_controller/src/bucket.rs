@@ -2125,7 +2125,7 @@ mod tests {
             target: pool[1].id,
             picked,
             session: crate::view::Session::NONE,
-            state: crate::store::LeaseState::Issued,
+            state: crate::store::LeaseState::ISSUED,
             tokens: 300,
             target_index: 0,
         };

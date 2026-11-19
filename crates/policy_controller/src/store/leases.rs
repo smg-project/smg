@@ -22,8 +22,17 @@ pub(crate) const DISPATCH_TTL: std::time::Duration = std::time::Duration::from_s
 /// its own frames.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LeaseState {
-    /// Decided, not yet dispatched; the dispatch deadline bounds this.
-    Issued,
+    /// Decided, not yet dispatched; the dispatch deadline bounds this. It
+    /// holds the TTL of the sessions rule the lease's decision was made
+    /// under, in microseconds, for the commit that ends the key's pin of
+    /// record by it: `u64::MAX` under a rule with no TTL and under no
+    /// rule, the session table's own form. The state has the room, so
+    /// no record grows for it. It dies at the dispatch, and no replica
+    /// is sent a lease's record: a log row of a lease's issue, when one
+    /// comes, carries it.
+    Issued {
+        session_ttl_micros: u64,
+    },
     /// Dispatched to its target at `at`.
     Dispatched {
         at: Instant,
@@ -36,7 +45,40 @@ impl LeaseState {
     /// Whether a frame still moves a lease that stands so: issued or
     /// dispatched.
     pub const fn is_live(self) -> bool {
-        matches!(self, Self::Issued | Self::Dispatched { .. })
+        matches!(self, Self::Issued { .. } | Self::Dispatched { .. })
+    }
+
+    /// Issued under no sessions rule, or under a rule with no TTL.
+    pub const ISSUED: Self = Self::Issued {
+        session_ttl_micros: u64::MAX,
+    };
+
+    /// Issued under a sessions rule of this TTL; `None`: a rule with no
+    /// TTL, or no rule.
+    pub fn issued(session_ttl_micros: Option<u64>) -> Self {
+        Self::Issued {
+            session_ttl_micros: session_ttl_micros.unwrap_or(u64::MAX),
+        }
+    }
+
+    /// Whether the lease still waits for its dispatch.
+    pub fn is_issued(self) -> bool {
+        matches!(self, Self::Issued { .. })
+    }
+
+    /// The TTL an issued lease's rule ends its key's pin by; `None` under
+    /// a rule with no TTL, under no rule, and once the lease left the
+    /// issued state. The pin's writer takes `None` as no end at all, so
+    /// it asks [`Self::is_issued`] first: the door tells a dispatch once,
+    /// with the record as it stood before its dispatch was written, and
+    /// a record past that state pins nothing by its lease's rule.
+    pub fn session_ttl_micros(self) -> Option<u64> {
+        match self {
+            Self::Issued { session_ttl_micros } if session_ttl_micros != u64::MAX => {
+                Some(session_ttl_micros)
+            }
+            _ => None,
+        }
     }
 }
 
@@ -156,11 +198,6 @@ pub struct LeaseRecord {
     /// part a side, where the prefill side is the record's own lease,
     /// target and state. `None` for a single's lease.
     pub decode: Option<DecodeSide>,
-    /// The TTL of the sessions rule the lease's decision was made under,
-    /// copied from its decision's scratch (`None`: a rule with no TTL, or
-    /// no rule): a commit whose engine's table holds no such key ends the
-    /// key's pin of record by it, no earlier than that pin's end stood.
-    pub session_ttl_micros: Option<u64>,
     /// The term of the leader that issued the lease.
     pub term: u64,
     pub issued_at: Instant,
@@ -229,10 +266,7 @@ impl LeaseRecord {
 
     /// Whether a side of the lease waits for its dispatch.
     pub fn waits(&self) -> bool {
-        self.state == LeaseState::Issued
-            || self
-                .decode
-                .is_some_and(|decode| decode.state == LeaseState::Issued)
+        self.state.is_issued() || self.decode.is_some_and(|decode| decode.state.is_issued())
     }
 }
 
