@@ -17,7 +17,7 @@ use crate::{
     spec::Needs,
     view::{
         mean_in_flight, AffinityFacts, Candidate, Constraints, NamedAffinity, Phase, PoolFacts,
-        RequestFacts, WorkerId,
+        ReportCutoff, RequestFacts, WorkerId,
     },
     Draw,
 };
@@ -2401,6 +2401,7 @@ pub struct Engine {
     /// seat without sampling.
     seat_flags: u8,
     explain_sample: u32,
+    max_report_age_ms: Option<u64>,
 }
 
 /// A stage keeps state a decider, so each model decides at its own seat.
@@ -3269,7 +3270,12 @@ impl Engine {
             orders,
             seat_flags: u8::from(keeping) * KEEPS_DECIDERS,
             explain_sample: 0,
+            max_report_age_ms: None,
         }
+    }
+
+    pub(crate) fn limit_report_age(&mut self, max_age_ms: Option<u64>) {
+        self.max_report_age_ms = max_age_ms;
     }
 
     pub fn generation(&self) -> u64 {
@@ -3738,8 +3744,14 @@ impl Engine {
                 // load stage costs a row without one from its reporting peers,
                 // so of one in front it would say that it must be asked whole,
                 // after the ranks were read: a pool not said to hold none is
-                // asked whole at once.
-                if marks.ranked() && pool.reported {
+                // asked whole at once. A configured age limit can make a
+                // reported row use that same path.
+                if marks.ranked()
+                    && pool.reported
+                    && self.max_report_age_ms.is_none_or(|max_age| {
+                        all_reports_current(candidates, facts.now_micros, max_age)
+                    })
+                {
                     return run_ranked(self, index, facts, pool, set, cx, buf);
                 }
             }
@@ -4408,6 +4420,12 @@ impl Engine {
             None => shed(ShedReason::NoEndpoints, "partners", prefill_pick.trace),
         }
     }
+}
+
+#[inline(never)]
+fn all_reports_current(candidates: &[Candidate], now_micros: u64, max_age_ms: u64) -> bool {
+    let cutoff = ReportCutoff::new(now_micros, max_age_ms);
+    candidates.iter().all(|row| cutoff.load(row).is_some())
 }
 
 impl Engine {

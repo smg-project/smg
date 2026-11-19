@@ -42,7 +42,7 @@ use crate::{
         },
         GatewayId,
     },
-    view::{LoadRow, Role, WorkerId},
+    view::{LoadRow, Role, WorkerId, REPORT_CLOCK_HISTORY_MS},
 };
 
 mod blocks;
@@ -202,7 +202,8 @@ impl MemoryStore {
         // An hour before the store was made, where the host's clock reaches
         // that far: a sample older than the store keeps an instant of its
         // own.
-        let origin = now.checked_sub(Duration::from_secs(3_600)).unwrap_or(now);
+        let history = Duration::from_millis(u64::from(REPORT_CLOCK_HISTORY_MS));
+        let origin = now.checked_sub(history).unwrap_or(now);
         let kv = Arc::new(KvTables::default());
         let writer = Writer::new(window, origin).over(Arc::clone(&kv));
         let world = ArcSwap::new(writer.world());
