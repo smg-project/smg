@@ -594,13 +594,13 @@ impl Controller {
     ///
     /// Refused here, before anything serves ([`StoreRefused`]): a path that
     /// leads to no directory, a directory another controller still holds at
-    /// the end of that wait, a lock the system does not give, a directory
-    /// with no lock file where the controller may make none, a
-    /// directory that is not read, two files under one number, a newest
-    /// generation that does not run, a spec source taken before this one,
-    /// and a lease another replica can take ([`LeasePlace`]). A standby does
-    /// not follow an applied generation in this build, so a promoted one
-    /// would run without it.
+    /// the end of that wait, one renamed under that wait, a lock the system
+    /// does not give, a directory with no lock file where the controller
+    /// may make none, a directory that is not read, two files under one
+    /// number, a newest generation that does not run, a spec source taken
+    /// before this one, and a lease another replica can take
+    /// ([`LeasePlace`]). A standby does not follow an applied generation in
+    /// this build, so a promoted one would run without it.
     pub async fn spec_store(&mut self, dir: impl Into<PathBuf>) -> Result<(), Error> {
         let path = dir.into();
         let refused = |source| Error::SpecStore {

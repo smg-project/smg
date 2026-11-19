@@ -4937,6 +4937,30 @@ pub(crate) mod tests {
         assert_eq!(again.read(2).await.expect("on file"), stands);
     }
 
+    /// The read call reads a generation on file through the directory the
+    /// store opened. Where the path leads to another directory before the
+    /// door takes the store, the answer is still the held file's bytes,
+    /// not the other's under that name.
+    #[tokio::test]
+    async fn the_read_call_reads_the_directory_held_where_the_path_leads_elsewhere() {
+        let base = tempfile::tempdir().expect("a temp dir");
+        let (dir, moved) = (base.path().join("store"), base.path().join("moved"));
+        std::fs::create_dir(&dir).expect("the directory");
+        std::fs::write(dir.join(name_of(1, "yaml")), LEAST_LOAD).expect("the first");
+        std::fs::write(dir.join(name_of(2, "yaml")), RANDOM).expect("the second");
+        let opened = SpecStore::open(dir.clone()).expect("the directory opens");
+        std::fs::rename(&dir, &moved).expect("the directory moves");
+        std::fs::create_dir(&dir).expect("another stands at its path");
+        std::fs::write(dir.join(name_of(1, "yaml")), "other").expect("the other's own");
+        let (_store, generations) = generations();
+        generations.bind_store(opened).expect("the store binds");
+        let old = generations.read(1).await.expect("on file");
+        assert_eq!(
+            (old.generation, old.document.as_slice()),
+            (1, LEAST_LOAD.as_bytes())
+        );
+    }
+
     /// An older file that is no document of this build stays on file and is
     /// listed nowhere: the start runs the newest, the read call does not
     /// answer the older one, and a rollback to it is refused by name.
