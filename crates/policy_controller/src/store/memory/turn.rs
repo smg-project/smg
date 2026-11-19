@@ -325,12 +325,12 @@ impl DerefMut for Turn<'_> {
     }
 }
 
-/// A decider's seat at its file ([`MemoryStore::at_work`]). While its
+/// A decider's place at its file ([`MemoryStore::at_work`]). While its
 /// thread works the hands leave what they hand to that file to it: it
 /// applies where it finds its turn free at each request it takes
 /// ([`AtWork::apply`]), at each issue, and behind the give-up of an
 /// answer its stream refused. A thread that rests ([`AtWork::rest`]) or
-/// drops its seat takes the turn once more: what was handed behind its
+/// drops its place takes the turn once more: what was handed behind its
 /// last take is applied before the thread waits.
 pub struct AtWork {
     store: Arc<MemoryStore>,
@@ -552,20 +552,20 @@ impl MemoryStore {
         }
     }
 
-    /// The calling thread's seat at its file, at work: a decider's, from
+    /// The calling thread's place at its file, at work: a decider's, from
     /// a job at hand to an empty queue. The file is the one of the
     /// decider the thread acts as ([`Decider::acting`]), and one thread
     /// at a time works at a file.
     pub fn at_work(self: &Arc<Self>) -> AtWork {
-        // The seat stands before its thread's mark does: a first take
-        // that unwinds drops the seat, which clears the mark.
-        let mut seat = AtWork {
+        // The place stands before its thread's mark does: a first take
+        // that unwinds drops the place, which clears the mark.
+        let mut place = AtWork {
             store: Arc::clone(self),
             file: self.acting(),
             working: false,
         };
-        seat.work();
-        seat
+        place.work();
+        place
     }
 
     /// The calling thread says it works at the file at `at`, then takes

@@ -1208,7 +1208,9 @@ pub enum Refused {
 /// decides at its model's seat, by the rule the served controller keeps
 /// ([`Engine::keeps_deciders`]). Every profile's stages hear every lease,
 /// so the stage's state has one writer a model and hears a model's
-/// leases whole, and a model's requests decide one at a time.
+/// leases whole, and a model's requests decide one at a time. The files
+/// a host lays past those its models name gain such a generation
+/// nothing.
 ///
 /// At its seat a caller acts as that seat's decider ([`Decider::enter`])
 /// and works at its file for the one decision, so the lease is filed
@@ -2900,25 +2902,35 @@ pub(crate) mod tests {
 
     /// A stage is asked what it needs at each decision, and that call can
     /// panic as any other. The seat's question calls no stage, so the
-    /// panic is the decision's own: the request is refused as faulted,
-    /// nothing unwinds into the host, and no thread is left at work at
-    /// the seat's file.
+    /// panic is the decision's own, at the first request under the
+    /// stage's generation and at a later one: each is refused as faulted,
+    /// nothing unwinds into the host, and the seat the caller left is at
+    /// rest.
     #[test]
     fn a_stage_that_panics_at_its_needs_costs_its_request_alone() {
-        let store = fleet(1);
+        // The model's seat is not the first, where the calling thread
+        // sits.
+        let files = (2..=8).find(|&files| decider_of(MODEL, files) != 0);
+        let files = files.expect("the model names a later file under some count");
+        let store = fleet(files);
         let door = Door::new(Arc::clone(&store));
-        let (before, _) = leased(&door, b"r-0", 7);
+        seated(0);
+        let (own, _) = leased(&door, b"r-0", 7);
         let armed = Arc::new(AtomicBool::new(false));
         let stage = Arc::clone(&armed);
         picking(&store, 2, "needy", move || {
             Box::new(Needy(Arc::clone(&stage)))
         });
-        // The door has read the generation's word by this decision.
-        let _ = leased(&door, b"r-1", 7);
         armed.store(true, Ordering::Relaxed);
-        let refused = door.decide(GATEWAY, &request(b"r-2", 7), Instant::now());
-        assert_eq!(refused.err(), Some(Refused::Faulted));
-        assert_eq!(door.faults(), 1);
-        assert_eq!(report(&door, before, gone()), 1, "no thread is at work");
+        // The first request under the generation leaves the caller's own
+        // seat for the model's. The next reads the door's word.
+        for id in [b"r-1", b"r-2"] {
+            let refused = door.decide(GATEWAY, &request(id, 7), Instant::now());
+            assert_eq!(refused.err(), Some(Refused::Faulted));
+        }
+        assert_eq!(door.faults(), 2);
+        // What is said of the lease on file at the caller's own seat is
+        // applied at once: no thread is left at work there.
+        assert_eq!(report(&door, own, gone()), 0, "applied at once");
     }
 }
