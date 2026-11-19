@@ -38,7 +38,9 @@
 //!
 //! Of the row's own columns, the status is the object's first status and is
 //! not followed after: the store's status is the truth, and what drives it
-//! writes the store. The id and the revision stand beside the object in the
+//! writes the store. An object built in the place of a standing one takes
+//! that one's running state, its status with it, and not its row's status.
+//! The id and the revision stand beside the object in the
 //! holder ([`Standing`]). No credential and no connector is a row's fact: the
 //! host that brings one hands it to the holder.
 //!
