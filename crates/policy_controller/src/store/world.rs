@@ -481,6 +481,10 @@ struct Derived {
     /// status (a status change is a health signal and moves no position).
     by_model: FxHashMap<Box<str>, [Option<u32>; ROLES]>,
     pools: Box<[PoolShape]>,
+    /// The members in no pool, by id, each with its slot in the counts:
+    /// a member that offers no model. With the pools' rows they are every
+    /// member the build read ([`World::unpooled_of`]).
+    unpooled: Box<[(WorkerId, Slot)]>,
     /// The store's counts of the leases on file, which the pools' slots
     /// name: the one table of the store's life, lent with its shapes.
     counts: Arc<Counts>,
@@ -961,14 +965,26 @@ impl World {
     }
 
     /// The slot of worker `id`'s count wherever this world lists it: a
-    /// member's rows name one. `None` for a worker in no pool. It searches
-    /// every pool, for a lease written outside a decision.
+    /// member's rows name one. `None` for a worker in no pool: a member
+    /// there is read apart ([`World::unpooled_of`]). It searches every
+    /// pool, for a lease written outside a decision.
     pub(crate) fn booked_of(&self, id: WorkerId) -> Option<Slot> {
         let mut pools = self.rows.iter().zip(self.derived.pools.iter());
         pools.find_map(|(rows, shape)| {
             let row = rows.binary_search_by_key(&id, |row| row.id).ok()?;
             shape.booked.get(row).copied()
         })
+    }
+
+    /// The slot of worker `id`'s count where the worker is a member in no
+    /// pool of this world: one that offers no model. `None` for a member
+    /// a pool lists, and for a worker that was no member when this
+    /// world's membership was built. A lease's door reads it behind the
+    /// pools and the table, off the path of a listed target.
+    pub(crate) fn unpooled_of(&self, id: WorkerId) -> Option<Slot> {
+        let unpooled = &self.derived.unpooled;
+        let at = unpooled.binary_search_by_key(&id, |&(of, _)| of).ok()?;
+        unpooled.get(at).map(|&(_, slot)| slot)
     }
 
     /// Writes over `rows`, the candidates `built` left for `ask` before
@@ -2921,6 +2937,10 @@ impl Writer {
         // Each model's members a side, by their place in `entries`: a
         // member's entry is written once, whatever it offers.
         let mut groups: FxHashMap<Box<str>, [Vec<u32>; ROLES]> = FxHashMap::default();
+        // The members that offer no model, by their place in `members`: in
+        // no pool, and named by the world all the same. None in most
+        // fleets.
+        let mut bare: Vec<u32> = Vec::new();
         // The members' ids are read by the vetoes alone: a membership build
         // with no veto standing does not collect them.
         let standing = !self.vetoes.by_gateway.is_empty();
@@ -3025,6 +3045,11 @@ impl Writer {
             };
             let at = entries.len() as u32;
             entries.push(entry);
+            if facts.models.is_empty() {
+                // In no pool, and done: the loop below starts on a model.
+                bare.push(at);
+                continue;
+            }
             let side = role_slot(facts.role);
             for model in &facts.models {
                 match groups.get_mut(model.as_str()) {
@@ -3335,11 +3360,21 @@ impl Writer {
         self.engines = engines;
         self.silenced = silenced;
         self.epoch = epoch;
+        // In id order, as the walk above pushed them.
+        // A place names its member's id and slot: the list stands by id, as
+        // the walk read the members.
+        let unpooled: Box<[(WorkerId, Slot)]> = bare
+            .iter()
+            .filter_map(|&at| members.get(at as usize))
+            .map(|&(id, _, slot)| (id, slot))
+            .collect();
+        debug_assert!(unpooled.is_sorted_by(|a, b| a.0 < b.0));
         let before = mem::replace(
             &mut self.derived,
             Arc::new(Derived {
                 by_model,
                 pools: pools.into_boxed_slice(),
+                unpooled,
                 counts: Arc::clone(&self.counts),
             }),
         );

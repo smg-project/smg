@@ -2873,9 +2873,10 @@ fn a_generation_that_builds_no_membership_leaves_a_joiners_slot_on_file() {
     assert_eq!(in_flight(&store), rows);
 }
 
-/// A member filed with no model stands in no pool, and the build behind
-/// its write lists it nowhere. The refresh that gives it a model files
-/// its slot again: a lease on it inside that window books its count.
+/// A member filed with no model stands in no pool, and the world of the
+/// build behind its write names its slot all the same: a lease on it
+/// inside the window of the refresh that gives it a model books its
+/// count.
 #[test]
 fn a_member_given_its_first_model_books_a_lease_inside_that_window() {
     let store = MemoryStore::new();
@@ -2886,7 +2887,7 @@ fn a_member_given_its_first_model_books_a_lease_inside_that_window() {
     };
     let owed = store.upsert(bare).id();
     store.publish_now();
-    assert_eq!(store.filed_members(), 0, "the build listed it in no pool");
+    assert_eq!(store.filed_members(), 0, "the build named it, in no pool");
     // The same incarnation with a model: the row and its slot stay.
     assert_eq!(store.upsert(facts("http://b:1", 1)).id(), owed);
     let revision = WorkersStore::get(&store, owed).expect("the row").revision;
@@ -2904,11 +2905,97 @@ fn a_member_given_its_first_model_books_a_lease_inside_that_window() {
     assert_eq!(in_flight(&store), rows);
 }
 
-/// A standby follows the refresh as its leader wrote it: the member given
-/// its first model is filed again there too, and a lease on it before the
+/// A lease on a member that offers no model books its count all the same:
+/// the world behind the member's first build names its slot, and the row
+/// reads the count at the build that first lists the member in a pool.
+#[test]
+fn a_lease_on_a_member_in_no_pool_is_counted_once_a_build_lists_it() {
+    let store = MemoryStore::new();
+    let built = ready(&store, "http://a:1");
+    let bare = WorkerFacts {
+        models: Vec::new(),
+        ..facts("http://b:1", 1)
+    };
+    let owed = store.upsert(bare).id();
+    store.publish_now();
+    assert_eq!(store.filed_members(), 0, "the build named it, in no pool");
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    leases.set_term(1);
+    assert_eq!(leases.issue(booking(gateway, 1, owed, now)), Ok(()));
+    assert_eq!(in_flight(&store), [(built, 0)], "it stands in no pool");
+    assert_eq!(store.upsert(facts("http://b:1", 1)).id(), owed);
+    let revision = WorkersStore::get(&store, owed).expect("the row").revision;
+    store
+        .set_status(owed, WorkerStatus::Ready, revision)
+        .expect("ready");
+    store.publish_now();
+    let mut rows = [(built, 0), (owed, 1)];
+    rows.sort_unstable();
+    assert_eq!(in_flight(&store), rows);
+}
+
+/// A world names the slot of a member in no pool from the build behind
+/// its write to the build behind its leave, and of no worker beside the
+/// members its build read.
+#[test]
+fn a_world_names_a_member_in_no_pool_until_it_leaves() {
+    let store = MemoryStore::new();
+    let pooled = ready(&store, "http://a:1");
+    let bare = WorkerFacts {
+        models: Vec::new(),
+        ..facts("http://b:1", 1)
+    };
+    let owed = store.upsert(bare).id();
+    assert!(store.world().booked_of(pooled).is_some());
+    assert!(
+        store.world().unpooled_of(owed).is_none(),
+        "inside its window"
+    );
+    store.publish_now();
+    assert!(
+        store.world().unpooled_of(owed).is_some(),
+        "named, in no pool"
+    );
+    assert!(store.world().booked_of(owed).is_none(), "no pool lists it");
+    assert!(
+        store.world().unpooled_of(pooled).is_none(),
+        "a pool lists it"
+    );
+    let revision = WorkersStore::get(&store, owed).expect("the row").revision;
+    assert!(store.remove(owed, revision).is_some());
+    assert!(store.world().unpooled_of(owed).is_none(), "it left");
+    assert!(store.world().booked_of(pooled).is_some());
+}
+
+/// A generation of the standing pairing mode builds no membership: the
+/// world it publishes still names the slot of a member in no pool.
+#[cfg(feature = "controller")]
+#[test]
+fn a_generation_that_builds_no_membership_still_names_a_member_in_no_pool() {
+    let store = MemoryStore::new();
+    store.apply(manual_ruled(1, 60, 30)).expect("generation 1");
+    ready(&store, "http://a:1");
+    let bare = WorkerFacts {
+        models: Vec::new(),
+        ..facts("http://b:1", 1)
+    };
+    let owed = store.upsert(bare).id();
+    store.publish_now();
+    assert!(store.world().unpooled_of(owed).is_some());
+    store.apply(manual_ruled(2, 60, 30)).expect("generation 2");
+    assert!(
+        store.world().unpooled_of(owed).is_some(),
+        "the generation built no membership"
+    );
+}
+
+/// A standby follows the refresh as its leader wrote it: its restored
+/// world names the slot of the member given its first model, the
+/// followed refresh files nothing, and a lease on the member before the
 /// standby's build books its count.
 #[test]
-fn a_followed_refresh_files_the_slot_of_a_member_given_its_first_model() {
+fn a_lease_books_on_a_standby_behind_a_followed_refresh() {
     let leader = MemoryStore::new();
     let bare = WorkerFacts {
         models: Vec::new(),
@@ -2930,8 +3017,8 @@ fn a_followed_refresh_files_the_slot_of_a_member_given_its_first_model() {
     standby.follow(unjournaled, WorkersStore::epoch(&leader), refresh, row);
     assert_eq!(
         (standby.publish_due().is_some(), standby.filed_members()),
-        (true, 1),
-        "the followed refresh owes its build"
+        (true, 0),
+        "the followed refresh owes its build and files nothing"
     );
     let leases: &dyn LeasesStore = &standby;
     let (gateway, now) = (GatewayId(1), Instant::now());
