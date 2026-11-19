@@ -887,15 +887,17 @@ pub struct Plugin {
     /// time, and the adopter keeps it warm. What the thread is to the plugin
     /// stands in the same place: an adopter reads a state the dead thread
     /// left lent there, and gives it back before it acts under another name
-    /// or under none. Under that decider's own name it holds the state as
-    /// its own, in the decision the dead thread left open.
+    /// or under none. Under that decider's own name it checks the hold at
+    /// its first act: the state is the decider's where the rest still names
+    /// this place, and gives way to the state at rest where it does not.
     places: ThreadLocal<Working>,
     /// Where a named decider's kept state rests between its decisions, one
     /// place a name ([`Decider`]), made at the first named use. A place's
     /// lock is taken where a decision brings the state and where it gives it
     /// back, and by no stage call. It is free unless a host lets two threads
     /// act as one decider at once: the second then finds no instance, makes
-    /// one, and the later of the two to give back drops the other's.
+    /// one, and the state of the later bring is the one kept, whichever of
+    /// the two gives back last.
     rests: OnceLock<Box<[Resting]>>,
     /// Per thread: the thread's own instance (it also decides under no
     /// name) while a named decider's stands in its working slot.
@@ -1285,8 +1287,10 @@ impl Plugin {
     /// What the place never gave back (a close that did not return, on this
     /// thread or on one that exited and left it the place) goes back first,
     /// under another name or under none: a thread decides on no instance
-    /// but the one of the decider it acts as.
-    fn lend(&self, working: &Working) -> bool {
+    /// but the one of the decider it acts as. `start` says the call begins
+    /// a span of its own, a decision's first open or a call outside a
+    /// decision: a hold of the same decider found there is checked.
+    fn lend(&self, working: &Working, start: bool) -> bool {
         let mut now = working.standing.get();
         let Some(decider) = Decider::acting() else {
             // Under no name the thread acts as itself. The mark is read in
@@ -1298,7 +1302,18 @@ impl Plugin {
             return false;
         };
         match now.lent {
-            Some(held) if held == decider => return false,
+            // The state is here: an earlier open of the decision brought it,
+            // or a decision open around a told event did. At a start that
+            // holds only where the rest still names this place. A close that
+            // did not return can have left the hold, and the decider can
+            // have been brought elsewhere since: such a hold is stale, its
+            // instance is dropped, and the state at rest comes.
+            Some(held) if held == decider => {
+                if !start || self.brought_here(working, decider) {
+                    return false;
+                }
+                *working.slot.borrow_mut() = None;
+            }
             Some(held) => self.give_back(working, held),
             None => {}
         }
@@ -1316,6 +1331,15 @@ impl Plugin {
         now.lent = Some(decider);
         working.standing.set(now);
         true
+    }
+
+    /// Whether `decider`'s rest names `working` as the place of its last
+    /// bring: the state in the place is the one that bring left there.
+    fn brought_here(&self, working: &Working, decider: Decider) -> bool {
+        self.rest_of(decider)
+            .lock()
+            .as_ref()
+            .is_some_and(|rest| rest.at == std::ptr::from_ref(working).addr())
     }
 
     /// Gives the working place back to the named decider whose kept state
@@ -1370,7 +1394,7 @@ impl Plugin {
         Lent {
             plugin: self,
             working,
-            brought: self.lend(working),
+            brought: self.lend(working, true),
         }
     }
 
@@ -1744,19 +1768,17 @@ impl Plugin {
     }
 
     /// One of this plugin's opens of decision `decision` on this thread;
-    /// says whether the plugin already failed that decision (the one read
-    /// of the cell an open makes).
-    fn note_open(&self, decision: u64) -> bool {
+    /// says whether the plugin already failed that decision, and whether
+    /// this open is its first of it (the one read of the cell an open
+    /// makes).
+    fn note_open(&self, decision: u64) -> (bool, bool) {
         let opens = self.decision_opens.get_or_default();
         let (mut part, init) = opens.get();
-        let init = if part.is_of(decision) {
-            init
-        } else {
-            OwnTime::default()
-        };
+        let first = !part.is_of(decision);
+        let init = if first { OwnTime::default() } else { init };
         let failed = part.open(decision);
         opens.set((part, init));
-        failed
+        (failed, first)
     }
 
     /// The time of a lazy `init` decision `decision` paid on this thread:
@@ -2279,7 +2301,8 @@ impl Bound {
         let mut budget = plugin.runtime.decisions.on_this_thread();
         let decision = budget.open(facts.budget_micros);
         open.decision = decision;
-        if plugin.note_open(decision) {
+        let (failed, first) = plugin.note_open(decision);
+        if failed {
             // The plugin already failed this decision (the other side of a
             // pair, another binding): its part in the decision is over, with
             // no call, no `init` and no second count.
@@ -2310,7 +2333,7 @@ impl Bound {
         // A named decider's kept state comes to this thread for the
         // decision; the plugin's last close of it gives it back.
         let working = plugin.working();
-        plugin.lend(working);
+        plugin.lend(working, first);
         let mut guard = working.slot.borrow_mut();
         if guard.is_none() {
             if plugin.emptied.get_or_default().get() {

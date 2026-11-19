@@ -3860,13 +3860,38 @@ impl LeftLent {
 
     /// Whether a new thread stood in the first thread's place, and what
     /// `act` said there.
-    fn taken<T: Send>(&self, act: impl FnOnce(&Plugin) -> T + Send) -> (bool, T) {
+    fn taken<T: Send>(&self, act: impl FnOnce(&Self) -> T + Send) -> (bool, T) {
         std::thread::scope(|scope| {
             scope
-                .spawn(|| (self.place.get_or_default().get(), act(&self.plugin)))
+                .spawn(|| (self.place.get_or_default().get(), act(self)))
                 .join()
                 .expect("the second thread")
         })
+    }
+
+    /// Decider 1's decision on the calling thread, and the `observe` calls
+    /// its catch-up made.
+    fn heard_as_decider_1(&self) -> u64 {
+        let before = self.plugin.stats().observed;
+        let _turn = Decider::new(1).enter();
+        assert!(
+            matches!(decide(&self.engine, &self.candidates, 1), Decision::Pick(_)),
+            "decider 1 decides"
+        );
+        self.plugin.stats().observed - before
+    }
+
+    /// Decider 1's two turns on the calling thread, with what each heard:
+    /// the first makes an instance, and the second hears the list, one
+    /// member told between them. Two more members are told behind them.
+    fn two_turns_then_two_members(&self) -> [u64; 2] {
+        use smg_policy_controller::Membership;
+        let anew = self.heard_as_decider_1();
+        self.engine.on_membership(&Membership::Added(WorkerId(102)));
+        let listed = self.heard_as_decider_1();
+        self.engine.on_membership(&Membership::Added(WorkerId(103)));
+        self.engine.on_membership(&Membership::Added(WorkerId(104)));
+        [anew, listed]
     }
 }
 
@@ -3880,10 +3905,10 @@ fn a_thread_under_no_name_gives_back_the_state_its_place_was_left_with() {
     // One pair: whether the second thread stood in the first's place, and
     // whether it was warm there under no name, then as decider 1.
     let pair = || {
-        LeftLent::by_a_thread_that_exited("left-lent").taken(|plugin| {
-            let own = plugin.is_warm();
+        LeftLent::by_a_thread_that_exited("left-lent").taken(|left| {
+            let own = left.plugin.is_warm();
             let _turn = Decider::new(1).enter();
-            (own, plugin.is_warm())
+            (own, left.plugin.is_warm())
         })
     };
     let shared = (0..PLACES).map(|_| pair()).find(|(shared, _)| *shared);
@@ -3911,24 +3936,15 @@ fn a_state_given_back_late_does_not_replace_the_one_at_rest() {
     // decisions on this thread, and the instances made.
     let pair = || {
         let left = LeftLent::by_a_thread_that_exited("came-late");
-        let heard = || {
-            let before = left.plugin.stats().observed;
-            let _turn = Decider::new(1).enter();
-            assert!(
-                matches!(decide(&left.engine, &left.candidates, 1), Decision::Pick(_)),
-                "decider 1 decides on this thread"
-            );
-            left.plugin.stats().observed - before
-        };
-        let anew = heard();
+        let anew = left.heard_as_decider_1();
         left.engine
             .on_membership(&smg_policy_controller::Membership::Added(WorkerId(102)));
-        let behind = heard();
-        let (shared, own) = left.taken(Plugin::is_warm);
+        let behind = left.heard_as_decider_1();
+        let (shared, own) = left.taken(|left| left.plugin.is_warm());
         (
             shared,
             own,
-            [anew, behind, heard()],
+            [anew, behind, left.heard_as_decider_1()],
             left.plugin.stats().instantiations,
         )
     };
@@ -3937,6 +3953,81 @@ fn a_state_given_back_late_does_not_replace_the_one_at_rest() {
         shared,
         Some((true, false, [0, 1, 0], 2)),
         "decider 1's later instance heard the list once and nothing behind the late give-back: it rests"
+    );
+}
+
+/// A turn under the decider's own name in a place left lent runs on the
+/// state at rest. The first thread exits with decider 1's instance in its
+/// place ([`LeftLent`]). Decider 1 takes two turns on the case's own
+/// thread, and two more members are told. The thread that takes the first
+/// thread's place then acts as decider 1 itself. The hold
+/// it finds there is stale, since the rest names the other place: it drops
+/// it and decides on the state at rest, which hears the two changes. That
+/// state rests behind the turn: decider 1's next decision on the case's
+/// thread hears nothing. On the instance the first thread left, the turn
+/// would hear the list as one snapshot and its close would come late: the
+/// next decision would hear the two changes again.
+#[test]
+fn a_turn_under_the_same_name_in_a_place_left_lent_runs_on_the_state_at_rest() {
+    // One pair: whether the second thread stood in the first's place, the
+    // `observe` calls of decider 1's decisions (two on this thread, the
+    // second thread's, one more on this thread), and the instances made.
+    let pair = || {
+        let left = LeftLent::by_a_thread_that_exited("same-name");
+        let before = left.two_turns_then_two_members();
+        // Behind its turn the second thread reads, under no name, whether
+        // an instance is its own: the stale one is dropped, not set aside.
+        let (shared, turn) = left.taken(|left| (left.heard_as_decider_1(), left.plugin.is_warm()));
+        (
+            shared,
+            before,
+            turn,
+            left.heard_as_decider_1(),
+            left.plugin.stats().instantiations,
+        )
+    };
+    let shared = (0..PLACES).map(|_| pair()).find(|(shared, ..)| *shared);
+    assert_eq!(
+        shared,
+        Some((true, [0, 1], (2, false), 0, 2)),
+        "the second thread's turn as decider 1 heard the two changes on the state at rest, kept no instance of the stale hold, and left that state at rest"
+    );
+}
+
+/// An event told under the decider's own name in a place left lent reaches
+/// the state at rest: the start of a told event checks the hold as a
+/// decision's first open does. The staging is the case's above. The thread
+/// that takes the first thread's place tells one dispatch as decider 1: the
+/// state at rest comes, hears the two changes and then the event, and rests
+/// behind it, so decider 1's next decision hears nothing. On the instance
+/// the first thread left, the event would be heard behind one snapshot and
+/// stay in the place: the next decision would hear the two changes.
+#[test]
+fn an_event_told_under_the_same_name_in_a_place_left_lent_reaches_the_state_at_rest() {
+    // One pair, as above: the second thread's `observe` calls are its told
+    // event's.
+    let pair = || {
+        let left = LeftLent::by_a_thread_that_exited("same-name-told");
+        let before = left.two_turns_then_two_members();
+        let (shared, told) = left.taken(|left| {
+            let before = left.plugin.stats().observed;
+            let _turn = Decider::new(1).enter();
+            left.engine
+                .on_dispatched(&Lease::default(), &Target::default(), Side::Single, 3);
+            left.plugin.stats().observed - before
+        });
+        (
+            shared,
+            before,
+            [told, left.heard_as_decider_1()],
+            left.plugin.stats().instantiations,
+        )
+    };
+    let shared = (0..PLACES).map(|_| pair()).find(|(shared, ..)| *shared);
+    assert_eq!(
+        shared,
+        Some((true, [0, 1], [3, 0], 2)),
+        "the second thread's event as decider 1 was heard behind the two changes on the state at rest, and that state rests behind it"
     );
 }
 
