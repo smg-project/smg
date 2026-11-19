@@ -1241,7 +1241,7 @@ where
     // asked for again a pause later. No decision asks for this stream, as
     // one does for a `Decide` stream.
     let mut said = Said::default();
-    // The word a call took and could not carry, kept for the next call.
+    // The event a call took and could not write, kept for the next call.
     let mut kept = None;
     while let Err(panicked) = Caught(Box::pin(observe_streams(
         lane, &mut queue, &mut kept, &mut sent, &mut lost, &mut said, &mut open,
@@ -1425,9 +1425,11 @@ struct Requests<'a> {
     kept: &'a mut Option<Kept>,
 }
 
-/// A word an events call took and could not carry, kept for the call that
-/// opens next, with the settles its plugin had seen as it was kept: a later
-/// count says a stream settled since, though none may stand.
+/// An event an events call took and could not write, kept for the call that
+/// opens next: a word its version has no kind for, or any event that found
+/// the call's window full or its receiver gone. It holds the settles its
+/// plugin had seen as it was kept: a later count says a stream settled
+/// since, though none may stand.
 struct Kept {
     word: proto::ObserveRequest,
     settles: u64,
@@ -1459,7 +1461,8 @@ struct Ended {
 
 /// What one turn of a call's select found.
 enum Found {
-    /// An event was written, or let go: the next turn takes the next.
+    /// An event was written or let go, or the call found room for the one
+    /// it kept: the next turn takes the next.
     Next,
     /// The call yields to the next one: a settle fixed another version, or
     /// the word taken is kept for a call that carries it.
@@ -1504,21 +1507,16 @@ where
     tokio::pin!(moved);
     let opened = tokio::time::Instant::now();
     let (outcome, at) = loop {
-        // One event: the word kept first, then the queue's next. The
-        // stream's room comes first: an event is taken only once the call
-        // can be written it, so a turn cut short, by a move or by the
-        // call's end, holds no event. The wait for room is cut each frame,
-        // as the wait for a settle is: a plugin dropped while its call's
-        // window is full is read at the cut, and its task ends with it.
+        // One event: the word kept first, then the queue's next. It is
+        // judged as it is taken, room or none: a word the call's version
+        // has no kind for does not wait behind a full window. Any other
+        // event needs the stream's room. With room at hand it is written
+        // at once. With none it rests in the task's keep, unnumbered, so a
+        // turn cut short there, by a move or by the call's end, leaves it
+        // for the next call. The wait for room is cut each frame, as the
+        // wait for a settle is: a plugin dropped while its call's window
+        // is full is read at the cut, and its task ends with it.
         let send = async {
-            let room = loop {
-                match tokio::time::timeout(frame, tx.reserve()).await {
-                    Ok(Ok(room)) => break room,
-                    Ok(Err(_)) => return Found::Gone,
-                    Err(_) if queue.is_closed() => return Found::Closed,
-                    Err(_) => {}
-                }
-            };
             let (mut event, under) = match kept.take() {
                 Some(kept) => (kept.word, Some(kept.settles)),
                 None => match queue.recv().await {
@@ -1526,13 +1524,7 @@ where
                     None => return Found::Closed,
                 },
             };
-            // The call's receiver went while the turn waited for an event:
-            // a word the version has no kind for is judged all the same,
-            // and any other event is kept for the next call, unnumbered.
-            let gone = tx.is_closed();
-            // Numbered here, where it enters the stream: one task numbers
-            // every event, in the order it sends.
-            if let Some(proto::observe_request::Request::Event(numbered)) = event.request.as_mut() {
+            if let Some(proto::observe_request::Request::Event(numbered)) = event.request.as_ref() {
                 let newer = numbered
                     .event
                     .as_ref()
@@ -1552,25 +1544,42 @@ where
                     let settled = under.is_some_and(|under| stand.settles != under);
                     if fixed && (stand.standing != 0 || settled) {
                         *lost = (*lost).max(numbered.seq);
-                        return if gone { Found::Gone } else { Found::Next };
+                        return Found::Next;
                     }
                     *kept = Some(Kept {
                         word: event,
                         settles: stand.settles,
                     });
-                    return if gone { Found::Gone } else { Found::Yields };
-                }
-                if !gone {
-                    numbered.seq = number(sent, lost, numbered.seq);
+                    return Found::Yields;
                 }
             }
-            if gone {
-                let settles = under.unwrap_or_else(|| spoken.stand().settles);
-                *kept = Some(Kept {
-                    word: event,
-                    settles,
-                });
-                return Found::Gone;
+            let room = match tx.try_reserve() {
+                Ok(room) => room,
+                Err(refused) => {
+                    let settles = under.unwrap_or_else(|| spoken.stand().settles);
+                    *kept = Some(Kept {
+                        word: event,
+                        settles,
+                    });
+                    if matches!(refused, mpsc::error::TrySendError::Closed(())) {
+                        return Found::Gone;
+                    }
+                    // The room this wait finds is given back: the turn that
+                    // follows takes the kept event and asks again.
+                    loop {
+                        match tokio::time::timeout(frame, tx.reserve()).await {
+                            Ok(Ok(_)) => return Found::Next,
+                            Ok(Err(_)) => return Found::Gone,
+                            Err(_) if queue.is_closed() => return Found::Closed,
+                            Err(_) => {}
+                        }
+                    }
+                }
+            };
+            // Numbered here, where it enters the stream: one task numbers
+            // every event, in the order it sends.
+            if let Some(proto::observe_request::Request::Event(numbered)) = event.request.as_mut() {
+                numbered.seq = number(sent, lost, numbered.seq);
             }
             room.send(event);
             Found::Next
@@ -2623,13 +2632,13 @@ mod tests {
         assert_eq!((sent, lost), (1, 0));
     }
 
-    /// An event is taken only once its call's stream has room for it. Here
-    /// the call that named 1 is written a full window and reads none of it,
-    /// two more events are raised, and a settle moves the version to 2. The
-    /// call that names 2 writes both, numbered behind the window: no event
-    /// was in flight when the first call was ended.
+    /// An event that finds its call's window full is written by the next
+    /// call. Here the call that named 1 is written a full window and reads
+    /// none of it, two more events are raised, and a settle moves the
+    /// version to 2. The call that names 2 writes both, numbered behind the
+    /// window: the one the first call held took no number there.
     #[tokio::test(start_paused = true)]
-    async fn an_event_is_not_taken_before_its_call_has_room_for_it() {
+    async fn an_event_that_finds_its_call_full_is_written_by_the_next_call() {
         use crate::{lease::Membership, view::WorkerId};
         let (events, lane, raise) = unsettled();
         let heard = Rc::new(RefCell::new(Vec::new()));
@@ -2779,9 +2788,9 @@ mod tests {
     /// outcome, ends the call as that outcome does. Here the call takes one
     /// event and lets its receiver go, a second event is raised, and the
     /// outcome comes a moment later: the turn waits for it, and the end says
-    /// the outcome, dated where the turn saw it. The second event is not
-    /// taken: it waits in the queue for the next call. An event carried is
-    /// no stand.
+    /// the outcome, dated where the turn saw it. The second event takes no
+    /// number: it rests in the task's keep for the next call. An event
+    /// carried is no stand.
     #[tokio::test(start_paused = true)]
     async fn a_send_that_sees_a_calls_end_first_says_the_calls_outcome() {
         let (raise, mut queue) = mpsc::channel(4);
@@ -2803,13 +2812,13 @@ mod tests {
         assert_eq!(ended.at, before, "the end is dated where the turn saw it");
         assert!(!ended.stood, "an event carried is no stand");
         assert_eq!(sent, 1, "the second event took no number");
-        assert!(queue.try_recv().is_ok(), "and waits in the queue");
+        assert!(queue.try_recv().is_err(), "and left the queue for the keep");
     }
 
     /// An event taken as the call's receiver goes is kept for the next call
-    /// and takes no number. Here a turn holds the stream's room and waits
-    /// for an event. The receiver goes, an event is raised, and the call
-    /// says its outcome a moment later: the event is kept, unnumbered.
+    /// and takes no number. Here a turn waits for an event. The receiver
+    /// goes, an event is raised, and the call says its outcome a moment
+    /// later: the event is kept, unnumbered.
     #[tokio::test(start_paused = true)]
     async fn an_event_taken_as_the_calls_receiver_goes_is_kept_for_the_next_call() {
         let (raise, mut queue) = mpsc::channel(4);
@@ -2844,11 +2853,11 @@ mod tests {
     }
 
     /// A word the call's version has no kind for is judged though the
-    /// call's receiver has gone. Here a call that named 1 holds the stream's
-    /// room and waits for an event, and a stream stands on 1. The receiver
-    /// goes and a left word is raised: no stream of the plugin hears the
-    /// word, so it is let go, as it is under a call that stands. Kept, it
-    /// would wait for the next settle with the events behind it.
+    /// call's receiver has gone. Here a call that named 1 waits for an
+    /// event, and a stream stands on 1. The receiver goes and a left word
+    /// is raised: no stream of the plugin hears the word, so it is let go,
+    /// as it is under a call that stands. Kept, it would wait for the next
+    /// settle with the events behind it.
     #[tokio::test(start_paused = true)]
     async fn a_left_word_taken_as_the_calls_receiver_goes_is_let_go_under_a_stream_on_1() {
         use crate::{lease::Membership, view::WorkerId};
@@ -2889,14 +2898,14 @@ mod tests {
     }
 
     /// A dropped plugin's call ends though its window is full. Here the
-    /// call's peer reads nothing: the window fills, the queue is empty and
-    /// the turn waits for the stream's room. The plugin is then dropped. The
-    /// wait for room is cut each frame and reads the drop there, so the
-    /// task does not outlive its plugin.
+    /// call's peer reads nothing: the window fills and one more event waits
+    /// for the stream's room. The plugin is then dropped. The wait for room
+    /// is cut each frame and reads the drop there, so the task does not
+    /// outlive its plugin.
     #[tokio::test(start_paused = true)]
     async fn a_dropped_plugins_call_ends_though_its_window_is_full() {
-        let (raise, mut queue) = mpsc::channel(OBSERVE_WINDOW);
-        for _ in 0..OBSERVE_WINDOW {
+        let (raise, mut queue) = mpsc::channel(OBSERVE_WINDOW + 1);
+        for _ in 0..=OBSERVE_WINDOW {
             raise.try_send(raised()).expect("the queue takes an event");
         }
         let (tx, rx) = mpsc::channel(OBSERVE_WINDOW);
@@ -2925,6 +2934,90 @@ mod tests {
             u64::try_from(OBSERVE_WINDOW).ok(),
             Some(sent),
             "the window's events were written"
+        );
+    }
+
+    /// A word the call's version has no kind for is judged though the
+    /// call's window is full. Here the call that named 1 is written a full
+    /// window and reads none of it, no stream stands, and a left word is
+    /// raised behind the window: the word is kept and the call yields to
+    /// the next one. Behind a wait for room the word would stay unread, and
+    /// the events behind it with it.
+    #[tokio::test(start_paused = true)]
+    async fn a_left_word_is_judged_though_its_calls_window_is_full() {
+        use crate::{lease::Membership, view::WorkerId};
+        let models = ["m".to_owned()];
+        let left = Membership::Left {
+            id: WorkerId(7),
+            models: &models,
+        };
+        let (raise, mut queue) = mpsc::channel(OBSERVE_WINDOW + 1);
+        for _ in 0..OBSERVE_WINDOW {
+            raise.try_send(raised()).expect("the queue takes an event");
+        }
+        raise
+            .try_send(word(&left))
+            .expect("the queue takes the word");
+        let (tx, rx) = mpsc::channel(OBSERVE_WINDOW);
+        // The call's peer holds its receiver and reads nothing.
+        let call = async move {
+            let _held = rx;
+            std::future::pending::<Result<(), tonic::Status>>().await
+        };
+        // A stream settled on 1 and ended: the version holds, none stands.
+        let spoken = Spoken::default();
+        drop(spoken.settle(1).expect("the settle"));
+        let (mut kept, mut sent, mut lost) = (None, 0, 0);
+        let requests = Requests {
+            tx,
+            version: 1,
+            spoken: &spoken,
+            kept: &mut kept,
+        };
+        let (queue, frame, never) = (&mut queue, RECONNECT_PAUSE, std::future::pending());
+        let turn = super::forward(call, requests, queue, &mut sent, &mut lost, frame, never);
+        let turn = tokio::time::timeout(Duration::from_secs(60), turn).await;
+        assert!(
+            matches!(turn, Ok(Turn::Moved { .. })),
+            "the call yields within the minute"
+        );
+        assert!(kept.is_some(), "the word is kept for the next call");
+        assert_eq!(
+            u64::try_from(OBSERVE_WINDOW).ok(),
+            Some(sent),
+            "the events ahead of the word were written"
+        );
+    }
+
+    /// An event that waited for its call's room is written in that call
+    /// once the peer reads. Here the window fills, one more event waits, and
+    /// the peer then reads every event and ends the call: the event that
+    /// waited took the next number.
+    #[tokio::test(start_paused = true)]
+    async fn an_event_that_waited_for_room_is_written_once_its_call_reads() {
+        let (raise, mut queue) = mpsc::channel(OBSERVE_WINDOW + 1);
+        for _ in 0..=OBSERVE_WINDOW {
+            raise.try_send(raised()).expect("the queue takes an event");
+        }
+        let (tx, mut rx) = mpsc::channel(OBSERVE_WINDOW);
+        // The call's peer reads nothing for a second, then every event.
+        let call = async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            for _ in 0..=OBSERVE_WINDOW {
+                if rx.recv().await.is_none() {
+                    return Err(tonic::Status::aborted("the stream ended early"));
+                }
+            }
+            Ok(())
+        };
+        let (mut sent, mut lost) = (0, 0);
+        let turn = forward(call, tx, &mut queue, &mut sent, &mut lost, RECONNECT_PAUSE);
+        let ended = tokio::time::timeout(Duration::from_secs(60), turn).await;
+        assert!(matches!(ended, Ok(Some(_))), "the call read and ended");
+        assert_eq!(
+            u64::try_from(OBSERVE_WINDOW + 1).ok(),
+            Some(sent),
+            "the event that waited was written, numbered"
         );
     }
 
