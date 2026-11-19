@@ -273,9 +273,6 @@ pub enum Error {
     /// The admin listener could not be bound or failed while serving.
     #[error("admin listener: {0}")]
     Admin(#[source] io::Error),
-    /// The engines' HTTP client could not be built.
-    #[error("the engines' probe: {0}")]
-    Probe(#[source] reqwest::Error),
     /// The spec file could not be read, or its document does not run.
     #[error("the spec file {}: {source}", .path.display())]
     SpecFile {
@@ -451,7 +448,7 @@ impl Controller {
         let (phase, readiness) =
             readiness::channel(elector.fence(), steps, Arc::clone(&shared.lag));
         let shared = Arc::new(shared);
-        let probe = Arc::new(EngineProbe::new().map_err(Error::Probe)?);
+        let probe = Arc::new(EngineProbe::new());
         Ok(Self {
             config,
             catalog,
@@ -1234,6 +1231,14 @@ mod tests {
         fn place(&self) -> String {
             self.lease.place()
         }
+    }
+
+    /// A controller with no engine to scrape builds no HTTP client: its
+    /// start reads no root certificate of the platform.
+    #[tokio::test]
+    async fn a_start_with_no_engine_to_scrape_builds_no_http_client() {
+        let controller = Controller::bind(valid()).await.expect("the listeners bind");
+        assert!(!controller.probe.http_built());
     }
 
     /// Every socket the controller accepts sends at once, read from the
