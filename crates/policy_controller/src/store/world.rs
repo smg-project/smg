@@ -2238,10 +2238,15 @@ impl Writer {
     /// rows start with no bit, and an applied generation may hand any pool
     /// another pair or none: an engine that had a threshold is judged once
     /// more under what it has now, so a bit no threshold holds is cleared.
-    /// Whether a verdict moved.
-    fn judge_every(&mut self) -> bool {
+    ///
+    /// A door comes here too where its write ended the last mark, behind
+    /// its own judgment of the write ([`Self::judged`]). That judgment
+    /// read the written engine as the whole write left it, the mark gone,
+    /// and counted the write, so the write is counted once. This pass
+    /// finds every verdict as its last write left it and moves none: from
+    /// it an engine with no threshold is judged at no write.
+    pub(super) fn judge_every(&mut self) {
         self.judging = false;
-        let mut moved = false;
         for index in 0..self.engines.len() {
             // A rank stands unnamed only while the writer judges: a record
             // reads a mark behind that one test.
@@ -2252,22 +2257,12 @@ impl Writer {
             };
             let had = mem::replace(&mut engine.judged, true);
             if had || has {
-                moved |= self.judge(index as u32);
+                self.judge(index as u32);
             }
             if let Some(engine) = self.engines.get_mut(index) {
                 engine.judged = has;
             }
         }
-        moved
-    }
-
-    /// The last mark went: every engine is judged once more, and one with
-    /// no threshold is judged at no write after it. The write that ended
-    /// the mark is counted here where that judgment moves a verdict: its
-    /// door's own judgment comes after and finds the bit cleared.
-    fn judge_unmarked(&mut self) {
-        let moved = self.judge_every();
-        self.flips += u64::from(moved);
     }
 
     /// Judge one engine over what is on file for its ranks and write the
@@ -2429,18 +2424,25 @@ impl Writer {
 
     /// A record received at `at` changed what is on file for the member
     /// whose first place stands at `place`: its engine is heard, and
-    /// judged once ([`Self::judged`]). The record names its rank, so a
-    /// mark an answer left on it ends ([`Self::named_again`]). While no engine
-    /// has a threshold, none is silent and no rank stands unnamed there
-    /// is no word to end and no verdict to move, and the write reads no
-    /// engine and no mark.
+    /// judged once ([`Self::judge_heard`]). The record names its rank, so
+    /// a mark an answer left on it ends ([`Self::recorded_marked`]). While
+    /// no engine has a threshold, none is silent and no rank stands
+    /// unnamed there is no word to end and no verdict to move, and the
+    /// write reads no engine and no mark.
     pub(super) fn recorded(&mut self, place: u32, id: WorkerId, rank: u16, at: Instant) -> bool {
         if !self.judging && self.silenced == 0 {
             return false;
         }
         if !self.unnamed.is_empty() {
-            self.named_again(id, rank);
+            return self.recorded_marked(place, id, rank, at);
         }
+        self.judge_heard(place, at)
+    }
+
+    /// The member whose first place stands at `place` was heard at `at`:
+    /// its rank takes the receipt, and its engine is judged once with its
+    /// word that no report came ended ([`Self::judged`]).
+    fn judge_heard(&mut self, place: u32, at: Instant) -> bool {
         let Some(engine) = self.engine_at(place) else {
             return false;
         };
@@ -2448,15 +2450,23 @@ impl Writer {
         self.judged(engine, true)
     }
 
-    /// A record names its rank again, which ends the mark an answer left
-    /// on the rank ([`Self::name`]). Cold and out of line: the record door
-    /// runs at every pushed record and comes here only while a mark
-    /// stands, and with this step inlined a record paid for it in a store
-    /// that holds no mark.
+    /// The record door in a store that holds a mark. The record names its
+    /// rank again, which ends the mark an answer left on the rank
+    /// ([`Self::name`]), and its engine is heard and judged as at any
+    /// record. Where the last mark went with it, every engine is judged
+    /// once more behind that judgment ([`Self::judge_every`]). Cold and
+    /// out of line: the record door runs at every pushed record and comes
+    /// here only while a mark stands, and with this step inlined a record
+    /// paid for it in a store that holds no mark.
     #[cold]
     #[inline(never)]
-    fn named_again(&mut self, id: WorkerId, rank: u16) {
+    fn recorded_marked(&mut self, place: u32, id: WorkerId, rank: u16, at: Instant) -> bool {
         self.name(id, rank, false);
+        let moved = self.judge_heard(place, at);
+        if self.unnamed.is_empty() {
+            self.judge_every();
+        }
+        moved
     }
 
     /// The member whose first place stands at `place` was heard at `at`:
@@ -2556,8 +2566,10 @@ impl Writer {
     /// The engine's last answer named another of its ranks and not `rank`
     /// of the member `id` (`unnamed`), or an answer or a record names the
     /// rank again. The caller judges the engine once its write is whole
-    /// ([`Self::judged`]). From the mark on the engine is judged at each
-    /// write, threshold or none, until a membership write or a generation
+    /// ([`Self::judged`]), and every engine once more behind that where
+    /// the write ended the last mark ([`Self::judge_every`]). From the
+    /// mark on the engine is judged at each write, threshold or none,
+    /// until the last mark's end, a membership write or a generation
     /// finds it with no mark and no threshold. Whether the mark moved.
     pub(super) fn name(&mut self, id: WorkerId, rank: u16, unnamed: bool) -> bool {
         match (self.unnamed.binary_search(&(id, rank)), unnamed) {
@@ -2574,9 +2586,6 @@ impl Writer {
             }
             (Ok(at), false) => {
                 self.unnamed.remove(at);
-                if self.unnamed.is_empty() {
-                    self.judge_unmarked();
-                }
                 true
             }
             _ => false,
@@ -2590,16 +2599,13 @@ impl Writer {
     }
 
     /// The member's rows went with an eviction: its ranks' marks go with
-    /// them, and a rank with nothing on file is a rank again. Whether a
-    /// mark went.
+    /// them, and a rank with nothing on file is a rank again. The caller
+    /// judges the engine, and every engine once more behind it where the
+    /// last mark went ([`Self::judge_every`]). Whether a mark went.
     pub(super) fn forget(&mut self, id: WorkerId) -> bool {
         let before = self.unnamed.len();
         self.unnamed.retain(|&(member, _)| member != id);
-        let went = self.unnamed.len() != before;
-        if went && self.unnamed.is_empty() {
-            self.judge_unmarked();
-        }
-        went
+        self.unnamed.len() != before
     }
 
     /// The marks of the members a membership write removed go with them,

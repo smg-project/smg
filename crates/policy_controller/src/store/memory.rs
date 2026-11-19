@@ -2023,7 +2023,8 @@ impl LoadSink for MemoryStore {
         // with no row for an engine is the word that none came, which
         // moves no mark, and a rank that pushed since the poll began
         // named itself.
-        if omits || writer.any_unnamed() {
+        let marked = writer.any_unnamed();
+        if omits || marked {
             for &(id, rank, row) in answer {
                 let pushed = table
                     .get(&id)
@@ -2076,6 +2077,14 @@ impl LoadSink for MemoryStore {
                     !pushed && writer.silence(engine, polled_at)
                 }
             };
+        }
+        // The last mark went with this answer: every engine is judged once
+        // more, behind the answer's own judgments, which read each of its
+        // engines as the whole answer left it. A verdict that moves with
+        // the mark's end is counted once, with whatever else of its engine
+        // the answer moved.
+        if marked && !writer.any_unnamed() {
+            writer.judge_every();
         }
         if changed {
             let world = writer.folded_at(polled_at);
@@ -2160,6 +2169,11 @@ impl LoadSink for MemoryStore {
             if folded.is_some() || forgot {
                 if let Some(engine) = engine {
                     writer.judged(engine, false);
+                }
+                // The last mark went with the member: every engine is
+                // judged once more, behind the eviction's own judgment.
+                if forgot && !writer.any_unnamed() {
+                    writer.judge_every();
                 }
                 let world = writer.folded();
                 self.show(writer, world);
