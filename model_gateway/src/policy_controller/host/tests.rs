@@ -18,11 +18,12 @@ use smg_policy_controller::{
     decision::ShedReason,
     door::Refused,
     lease::{ReleaseReason, TransportClass},
-    store::{LeasesStore, MemoryStore, WorkersStore},
+    store::{LeasesStore, MemoryStore, WorkerFacts, WorkerStatus as RowStatus, WorkersStore},
 };
 use smg_worker::identity::basic::WorkerLoadGuard;
 
 use super::{
+    left_no_worker,
     testing::{bed, MODEL},
     Ask, End, Held, Unplaced, GATEWAY,
 };
@@ -191,9 +192,10 @@ async fn a_held_request_dropped_after_its_send_ends_its_lease_and_its_load() {
     let (host, store, workers) = bed(&["http://w0:8000"]);
     let now = Instant::now();
     let placed = host.place(&first(b"r1"), now).await.expect("a worker");
-    let guard = WorkerLoadGuard::with_key(Arc::clone(placed.worker()), None);
-    let mut held = Held { placed, guard };
-    held.placed.dispatched(now);
+    let mut held = Held::new(placed, |worker| {
+        WorkerLoadGuard::with_key(Arc::clone(worker), None)
+    });
+    held.placed().dispatched(now);
     assert_eq!((live(&store, 1), workers[0].load()), (1, 1));
     // A response dropped with no end said: the lease completes as cancelled
     // and the worker's load is given back.
@@ -240,7 +242,7 @@ async fn each_reason_an_attempt_has_no_worker_reads_its_own_answer() {
             shed(ShedReason::Deadline),
             unavailable,
             "admission_queue_timeout",
-            None,
+            Some("2"),
         ),
         (
             shed(ShedReason::PolicyDeclined),
@@ -275,10 +277,44 @@ async fn each_reason_an_attempt_has_no_worker_reads_its_own_answer() {
 #[tokio::test]
 async fn a_placement_names_the_rank_its_decision_named() {
     let (host, store, _workers) = bed(&["http://w0:8000"]);
+    // The bed's row is rank 0 of 1, which a constant would answer too: the
+    // row is written again as rank 1 of 2.
+    let unranked = host
+        .place(&first(b"r0"), Instant::now())
+        .await
+        .expect("a worker");
+    let row = WorkersStore::get(&*store, unranked.id()).expect("the bed's row");
+    drop(unranked);
+    let id = store
+        .upsert(WorkerFacts {
+            dp_rank: 1,
+            dp_size: 2,
+            ..row.facts
+        })
+        .id();
+    store.publish_now();
+    let row = WorkersStore::get(&*store, id).expect("the ranked row");
+    if row.status != RowStatus::Ready {
+        store
+            .set_status(id, RowStatus::Ready, row.revision)
+            .expect("the row stands");
+        store.publish_now();
+    }
     let placed = host
         .place(&first(b"r1"), Instant::now())
         .await
         .expect("a worker");
-    let row = WorkersStore::get(&*store, placed.id()).expect("the target's row");
-    assert_eq!(placed.rank(), row.facts.dp_rank);
+    assert_eq!((placed.id(), placed.rank()), (id, 1));
+}
+
+#[test]
+fn a_pool_no_stage_emptied_reads_its_own_reason() {
+    assert_eq!(
+        left_no_worker("none"),
+        "the policy controller holds no candidate for the model"
+    );
+    assert_eq!(
+        left_no_worker("healthy"),
+        "the policy controller's healthy stage left no worker"
+    );
 }
