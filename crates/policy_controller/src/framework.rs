@@ -333,8 +333,10 @@ pub trait Scorer: Lifecycle + Debug {
     }
 
     /// What `row` holds of the request ([`Overlap`]), asked behind the
-    /// decision that picked the row, on the thread that made it. The
-    /// default says nothing.
+    /// decision that picked the row, on the thread that made it, and once
+    /// a decision: a stage may spend what its pass judged by on the first
+    /// call, so a second row asked of the same decision may read no margin
+    /// held. The default says nothing.
     fn said(&self, _facts: &RequestFacts<'_>, _candidates: &[Candidate], _row: u32) -> Overlap {
         Overlap::default()
     }
@@ -2485,10 +2487,11 @@ pub struct Engine {
     /// build, so a publication asks no stage whether it keeps them.
     keepers: Vec<Keeper>,
     /// Per profile, the place among its scorers of the first that states a
-    /// pick's overlap ([`Scorer::states_overlap`]), [`UNSTATED`] where the
+    /// pick's overlap ([`Scorer::states_overlap`]), `None` where the
     /// profile holds none. A decision reads it where its host asks the
-    /// overlap stated ([`Engine::decide_stated`]), and no other does.
-    stating: Vec<u8>,
+    /// overlap stated ([`Engine::decide_stated`]), and no other does. The
+    /// place is kept whole: a profile is as long as its document makes it.
+    stating: Vec<Option<usize>>,
 }
 
 /// A stage that keeps a number of the reports, by its place in the engine.
@@ -2527,10 +2530,6 @@ pub(crate) const KEEPS_DECIDERS: u8 = 1;
 pub(crate) const SAMPLES_DECISIONS: u8 = 2;
 /// A binding of the generation names a shadow.
 pub(crate) const SHADOWS: u8 = 4;
-
-/// No scorer of a profile states a pick's overlap: a place no profile's
-/// list of scorers is read at.
-const UNSTATED: u8 = u8::MAX;
 
 /// Which of a profile's leading stages are ranks, read once when the engine
 /// is built: a stage that writes levels ([`Spread::Levels`]) and whose
@@ -3386,8 +3385,7 @@ impl Engine {
             .iter()
             .map(|profile| {
                 let stated = |weighted: &Weighted| weighted.scorer.states_overlap();
-                let at = profile.scorers.iter().position(stated);
-                at.and_then(|at| u8::try_from(at).ok()).unwrap_or(UNSTATED)
+                profile.scorers.iter().position(stated)
             })
             .collect();
         let row_tests = profiles
@@ -4015,11 +4013,8 @@ impl Engine {
         pick: &Pick,
     ) -> Overlap {
         let profile = usize::from(pick.trace.profile);
-        let stage = self.stating.get(profile).copied().unwrap_or(UNSTATED);
-        let stage = self
-            .profiles
-            .get(profile)
-            .and_then(|profile| profile.scorers.get(usize::from(stage)));
+        let stage = self.stating.get(profile).copied().flatten();
+        let stage = stage.and_then(|at| self.profiles.get(profile)?.scorers.get(at));
         match (stage, pick.targets.first()) {
             (Some(stage), Some(target)) => stage.scorer.said(facts, candidates, target.position),
             _ => Overlap::default(),
@@ -5696,6 +5691,82 @@ mod tests {
         let pick = decision.pick().expect("a pick");
         assert_eq!(pick.targets.first().map(|target| target.position), Some(0));
         assert!(pick.overlap().margin_held);
+    }
+
+    /// The first stating scorer is asked wherever it stands in its profile:
+    /// at the front, and behind more scorers than a byte counts. Every row
+    /// holds eight of the request's sixteen blocks, so the pick's overlap
+    /// reads the same whichever row the other scorers leave in front.
+    #[test]
+    fn a_profile_states_its_overlap_by_a_scorer_at_any_place() {
+        let params = PrefixAffinityParams::default();
+        for ahead in [0usize, 1, 255, 256, 300] {
+            let mut scorers: Vec<Weighted> = (0..ahead)
+                .map(|_| Weighted {
+                    scorer: Box::new(LeastRequests),
+                    weight: 1.0,
+                })
+                .collect();
+            scorers.push(Weighted {
+                scorer: Box::new(PrefixAffinity::new(
+                    &params,
+                    Gates::of(Some(&params), None, Some(16)),
+                )),
+                weight: 1.0,
+            });
+            let engine = Engine::new(
+                vec![Profile {
+                    name: "cache".into(),
+                    filters: vec![Box::new(Healthy)],
+                    scorers,
+                    picker: Box::new(Best),
+                }],
+                vec![Binding {
+                    model: "*".into(),
+                    phases: vec![],
+                    plan: Plan::Single,
+                    profile: 0,
+                    decode_profile: None,
+                    sessions: None,
+                    overload: None,
+                }],
+                1,
+                Needs::default(),
+            );
+            let column = [AffinityFacts {
+                overlap_blocks: 8,
+                admitted_age_ms: u32::MAX,
+                ..AffinityFacts::default()
+            }; 4];
+            let hashes = [0u64; 16];
+            let facts = RequestFacts {
+                model: "m",
+                block_hashes: &hashes,
+                prompt_tokens: 256,
+                seed: 7,
+                affinity: &column,
+                ..RequestFacts::default()
+            };
+            let rows = [
+                candidate(0, 0),
+                candidate(1, 0),
+                candidate(2, 0),
+                candidate(3, 0),
+            ];
+            let decision = engine.decide_stated(
+                &facts,
+                &PoolFacts::default(),
+                &rows,
+                &Constraints::default(),
+                &mut Scratch::new(),
+            );
+            let overlap = decision.pick().expect("a pick").overlap();
+            assert_eq!(
+                (overlap.blocks, overlap.of),
+                (8, 16),
+                "{ahead} scorers stand ahead of the stating one"
+            );
+        }
     }
 
     /// A stated decision begins with no word of an earlier pass. The plain

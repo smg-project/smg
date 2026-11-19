@@ -2834,6 +2834,64 @@ mod tests {
         assert!(!held());
     }
 
+    /// The front pass takes the word back as the whole pass does: under the
+    /// fleet's KV gate it says every row alike, and the price an earlier
+    /// pass judged by is not said.
+    #[test]
+    fn a_front_pass_under_the_kv_gate_takes_the_stages_word_back() {
+        let kv = KvPressureParams {
+            ceiling: Some(0.9),
+            ..KvPressureParams::default()
+        };
+        let params = PrefixAffinityParams {
+            spill: Some(SpillParams {
+                rel: Some(1.1),
+                prefix_margin_tokens: Some(8),
+                ..SpillParams::default()
+            }),
+            ..PrefixAffinityParams::default()
+        };
+        let stage = PrefixAffinity::new(&params, Gates::of(Some(&params), Some(&kv), Some(16)));
+        let pool = |usage| {
+            [
+                reporting(0, 10, 8, usage),
+                reporting(1, 0, 0, 500),
+                reporting(2, 0, 0, 500),
+                reporting(3, 0, 0, 500),
+            ]
+        };
+        let (calm, hot) = (pool(500), pool(950));
+        // The front pass over a pool, lent its rows' counts as the whole
+        // pass's helper lends them: the scores and what the pass said.
+        let front = |pool: &[Held]| {
+            let column = column(pool);
+            let mut lent_rows = rows(pool);
+            let lent = Lent::take(&mut lent_rows);
+            let facts = lent.beside(&RequestFacts {
+                affinity: &column,
+                ..facts(16)
+            });
+            let kept = kept(lent_rows.len() as u32);
+            let mut out = vec![0.0; lent_rows.len()];
+            let (_, said) = stage.score_front(&facts, &lent_rows, &kept, &kept, &mut out);
+            (out, matches!(said, Front::Alike))
+        };
+        let held = || {
+            let column = column(&calm);
+            let facts = RequestFacts {
+                affinity: &column,
+                ..facts(16)
+            };
+            stage.said(&facts, &rows(&calm), 0).margin_held
+        };
+        forget_judged();
+        assert!(!front(&calm).1);
+        assert!(held());
+        assert!(!front(&calm).1);
+        assert_eq!(front(&hot), (vec![1.0; 4], true));
+        assert!(!held());
+    }
+
     /// The margin's bit is the difference of two scores: the stage that
     /// prices the held prefix puts the row in front, and the same gate
     /// with no price puts it behind. Over pools, holders, loads and
