@@ -20,12 +20,12 @@ use rustc_hash::{FxHashMap, FxHasher};
 use crate::{
     affinity::WarmRule,
     counts::{with_counts, LentCounts, Pieces, Slot},
-    decision::{Overlap, Target, Targets, MAX_TARGETS},
+    decision::{Decision, Overlap, Target, Targets, MAX_TARGETS},
     framework::{
-        top_drawn, top_pass, Filter, Front, Narrowed, Picker, Scorer, Spread, TieBand, Unit,
-        DRAW_BOUND,
+        top_drawn, top_pass, DecisionScope, Filter, Front, Narrowed, Picker, Scorer, Spread,
+        TieBand, Unit, DRAW_BOUND,
     },
-    lease::{Lease, Lifecycle, Membership, Side, Signal},
+    lease::{Lease, Lifecycle, Membership, Outcome, ReleaseReason, Side, Signal},
     spec::{CostMargin, Needs, Unreported},
     terms::{Term, TermValues},
     view::{
@@ -347,6 +347,10 @@ pub(crate) fn with_report_age(
 }
 
 impl<S: ReadsLoad> Lifecycle for ReportAge<S> {
+    fn on_decision_issued(&self, lease: &Lease, decision: &Decision) {
+        self.stage.on_decision_issued(lease, decision);
+    }
+
     fn on_dispatched(
         &self,
         lease: &Lease,
@@ -356,6 +360,14 @@ impl<S: ReadsLoad> Lifecycle for ReportAge<S> {
     ) {
         self.stage
             .on_dispatched(lease, target, side, since_decision_micros);
+    }
+
+    fn on_completed(&self, lease: &Lease, outcome: &Outcome) {
+        self.stage.on_completed(lease, outcome);
+    }
+
+    fn on_released(&self, lease: &Lease, reason: ReleaseReason) {
+        self.stage.on_released(lease, reason);
     }
 
     fn on_membership(&self, change: &Membership<'_>) {
@@ -368,6 +380,10 @@ impl<S: ReadsLoad> Lifecycle for ReportAge<S> {
 
     fn keeps_loads(&self) -> bool {
         self.stage.keeps_loads()
+    }
+
+    fn needs_lifecycle(&self) -> bool {
+        self.stage.needs_lifecycle()
     }
 }
 
@@ -409,12 +425,38 @@ impl<S: ReadsLoad> Scorer for ReportAge<S> {
         self.stage.front_wise()
     }
 
+    fn owns(&self) -> bool {
+        self.stage.owns()
+    }
+
+    // The rows reach the stage as they stand, not through the cutoff: a
+    // stage that owns its pool by a row's load would read past the limit.
+    // No wrapped stage owns a pool today.
+    fn own(
+        &self,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        candidates: &[Candidate],
+        keep: &mut dyn FnMut(&Candidate) -> bool,
+        kept: &mut Vec<u32>,
+    ) -> bool {
+        self.stage.own(facts, pool, candidates, keep, kept)
+    }
+
     fn spread(&self) -> Spread {
         self.stage.spread()
     }
 
     fn needs(&self) -> Needs {
         self.stage.needs()
+    }
+
+    fn scope(&self) -> Option<&dyn DecisionScope> {
+        self.stage.scope()
+    }
+
+    fn refuses_by_reports(&self) -> bool {
+        self.stage.refuses_by_reports()
     }
 
     fn warm_rule(&self) -> Option<WarmRule> {
@@ -3798,8 +3840,11 @@ mod tests {
 
     use super::*;
     use crate::{
+        affinity::{Gates, WarmupSlice},
         counts::tests::Lent,
-        decision::Pair,
+        decision::{Pair, Pick},
+        lease::{EventKind, TransportClass},
+        spec::WarmupSliceParams,
         view::{Health, LoadRow},
     };
 
@@ -3818,6 +3863,237 @@ mod tests {
 
     fn kept(n: u32) -> Vec<u32> {
         (0..n).collect()
+    }
+
+    #[test]
+    fn a_report_age_limit_preserves_the_stages_methods() {
+        #[derive(Debug, Default)]
+        struct ProbeState {
+            events: Mutex<Vec<EventKind>>,
+        }
+
+        impl DecisionScope for ProbeState {
+            fn open(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &PoolFacts<'_>) {}
+            fn close(&self) {}
+        }
+
+        #[derive(Clone, Debug, Default)]
+        struct Probe(Arc<ProbeState>);
+
+        impl Lifecycle for Probe {
+            fn on_decision_issued(&self, _: &Lease, _: &Decision) {
+                self.0.events.lock().push(EventKind::Issued);
+            }
+            fn on_dispatched(&self, _: &Lease, _: &Target, _: Side, _: u32) {
+                self.0.events.lock().push(EventKind::Dispatched);
+            }
+            fn on_completed(&self, _: &Lease, _: &Outcome) {
+                self.0.events.lock().push(EventKind::Completed);
+            }
+            fn on_released(&self, _: &Lease, _: ReleaseReason) {
+                self.0.events.lock().push(EventKind::Released);
+            }
+            fn on_membership(&self, _: &Membership<'_>) {
+                self.0.events.lock().push(EventKind::Membership);
+            }
+            fn on_signal(&self, _: &Signal) {
+                self.0.events.lock().push(EventKind::Signal);
+            }
+            fn keeps_loads(&self) -> bool {
+                true
+            }
+            fn needs_lifecycle(&self) -> bool {
+                true
+            }
+        }
+
+        impl Scorer for Probe {
+            fn name(&self) -> &'static str {
+                "probe"
+            }
+            fn score(
+                &self,
+                facts: &RequestFacts<'_>,
+                candidates: &[Candidate],
+                kept: &[u32],
+                out: &mut [f32],
+            ) -> TieBand {
+                self.score_with(facts, candidates, kept, out, |row| row.load)
+            }
+            fn score_front(
+                &self,
+                facts: &RequestFacts<'_>,
+                candidates: &[Candidate],
+                kept: &[u32],
+                asked: &[u32],
+                out: &mut [f32],
+            ) -> (TieBand, Front) {
+                self.score_front_with(facts, candidates, kept, asked, out, |row| row.load)
+            }
+            fn row_wise(&self) -> bool {
+                true
+            }
+            fn front_wise(&self) -> bool {
+                true
+            }
+            fn owns(&self) -> bool {
+                true
+            }
+            fn own(
+                &self,
+                _: &RequestFacts<'_>,
+                _: &PoolFacts<'_>,
+                candidates: &[Candidate],
+                keep: &mut dyn FnMut(&Candidate) -> bool,
+                kept: &mut Vec<u32>,
+            ) -> bool {
+                kept.extend(
+                    candidates
+                        .iter()
+                        .filter(|row| keep(row))
+                        .map(|row| row.position),
+                );
+                !kept.is_empty()
+            }
+            fn spread(&self) -> Spread {
+                Spread::Levels(1.0)
+            }
+            fn needs(&self) -> Needs {
+                Needs {
+                    loads: true,
+                    ..Needs::default()
+                }
+            }
+            fn scope(&self) -> Option<&dyn DecisionScope> {
+                Some(self.0.as_ref())
+            }
+            fn refuses_by_reports(&self) -> bool {
+                false
+            }
+            fn warm_rule(&self) -> Option<WarmRule> {
+                WarmupSlice::new(&WarmupSliceParams::default(), Gates::default()).warm_rule()
+            }
+            fn states_overlap(&self) -> bool {
+                true
+            }
+            fn said(&self, _: &RequestFacts<'_>, _: &[Candidate], row: u32) -> Overlap {
+                Overlap {
+                    blocks: 3,
+                    of: 5 + row as u16,
+                    ..Overlap::default()
+                }
+            }
+        }
+
+        impl ReadsLoad for Probe {
+            fn score_with(
+                &self,
+                _: &RequestFacts<'_>,
+                candidates: &[Candidate],
+                kept: &[u32],
+                out: &mut [f32],
+                load: impl Fn(&Candidate) -> Option<LoadRow> + Copy,
+            ) -> TieBand {
+                for (slot, &index) in out.iter_mut().zip(kept) {
+                    *slot = if load(&candidates[index as usize]).is_some() {
+                        1.0
+                    } else {
+                        0.0
+                    };
+                }
+                TieBand(0.0625)
+            }
+            fn score_front_with(
+                &self,
+                facts: &RequestFacts<'_>,
+                candidates: &[Candidate],
+                _: &[u32],
+                asked: &[u32],
+                out: &mut [f32],
+                load: impl Fn(&Candidate) -> Option<LoadRow> + Copy,
+            ) -> (TieBand, Front) {
+                let band = self.score_with(facts, candidates, asked, out, load);
+                (band, Front::of(self.spread(), out))
+            }
+        }
+
+        let bare = Probe::default();
+        let wrapped = with_report_age(bare.clone(), Some(37));
+        let facts = RequestFacts {
+            now_micros: 71_337,
+            ..RequestFacts::default()
+        };
+        let mut rows = [candidate(0, 0), candidate(1, 0)];
+        rows[1].load = Some(LoadRow::default());
+        rows[1].load_sampled_at_micros = facts.now_micros;
+        let score = |stage: &dyn Scorer| {
+            let mut out = [0.0; 2];
+            let band = stage.score(&facts, &rows, &[0, 1], &mut out);
+            (band, out)
+        };
+        let score_front = |stage: &dyn Scorer| {
+            let mut out = [0.0];
+            let front = stage.score_front(&facts, &rows, &[0, 1], &[1], &mut out);
+            (front, out)
+        };
+        let own = |stage: &dyn Scorer| {
+            let mut kept = Vec::new();
+            let owns = stage.own(
+                &facts,
+                &PoolFacts::default(),
+                &rows,
+                &mut |row| row.load.is_some(),
+                &mut kept,
+            );
+            (owns, kept)
+        };
+        assert_eq!(wrapped.name(), bare.name());
+        assert_eq!(score(wrapped.as_ref()), score(&bare));
+        assert_eq!(score_front(wrapped.as_ref()), score_front(&bare));
+        assert_eq!(wrapped.row_wise(), bare.row_wise());
+        assert_eq!(wrapped.front_wise(), bare.front_wise());
+        assert_eq!(wrapped.owns(), bare.owns());
+        assert_eq!(own(wrapped.as_ref()), own(&bare));
+        assert_eq!(wrapped.spread(), bare.spread());
+        assert_eq!(wrapped.needs(), bare.needs());
+        assert!(std::ptr::addr_eq(
+            wrapped.scope().expect("the scope"),
+            bare.scope().expect("the scope")
+        ));
+        assert_eq!(wrapped.refuses_by_reports(), bare.refuses_by_reports());
+        assert_eq!(wrapped.warm_rule(), bare.warm_rule());
+        assert_eq!(wrapped.states_overlap(), bare.states_overlap());
+        assert_eq!(wrapped.said(&facts, &rows, 1), bare.said(&facts, &rows, 1));
+        assert_eq!(wrapped.keeps_loads(), bare.keeps_loads());
+        assert_eq!(wrapped.needs_lifecycle(), bare.needs_lifecycle());
+
+        let tell = |stage: &dyn Scorer| {
+            let lease = Lease::default();
+            let target = target_of(&rows[1]);
+            stage.on_decision_issued(&lease, &Decision::Pick(Pick::default()));
+            stage.on_dispatched(&lease, &target, Side::Single, 23);
+            stage.on_completed(
+                &lease,
+                &Outcome {
+                    side: Side::Single,
+                    served: target.id,
+                    status: 200,
+                    class: TransportClass::Ok,
+                    ttft_micros: 0,
+                    tokens_in: 0,
+                    tokens_out: 0,
+                    duration_micros: 0,
+                },
+            );
+            stage.on_released(&lease, ReleaseReason::Abandoned);
+            stage.on_membership(&Membership::Added(target.id));
+            stage.on_signal(&Signal::Health {
+                worker: target.id,
+                health: Health::default(),
+            });
+            std::mem::take(&mut *bare.0.events.lock())
+        };
+        assert_eq!(tell(wrapped.as_ref()), tell(&bare));
     }
 
     /// The costs find the same ends by either way: a few rows are compared
