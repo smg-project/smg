@@ -22,6 +22,7 @@ use smg_worker::{
     identity::endpoint::Endpoint,
     jobs::{WorkerJobAsker, WorkerJobs},
     registry::WorkerId,
+    workflow::SETTLE_STEP_TIMEOUT,
 };
 use tokio::sync::{mpsc, oneshot, Semaphore};
 use tracing::{debug, error, field, info, warn};
@@ -1372,20 +1373,12 @@ impl JobQueue {
                     instance_id
                 );
 
-                // Caller wait must cover the worst-case `DrainWorkersStep`
-                // sleep, which is `max(per-worker drain_settle_secs)`. We
-                // can't see per-worker overrides from here without scanning
-                // the registry, so use a generous floor: at least
-                // `MAX_DRAIN_WAIT_SECS` (large enough for realistic
-                // overrides), and at least the global default if it's
-                // higher. 30s on top covers the other removal steps.
-                const MAX_DRAIN_WAIT_SECS: u64 = 600;
-                let drain_wait_secs = context
-                    .router_config
-                    .health_check
-                    .drain_settle_secs
-                    .max(MAX_DRAIN_WAIT_SECS);
-                let timeout_duration = Duration::from_secs(30 + drain_wait_secs);
+                // The job waits as long as its run can last. The drain step
+                // waits each worker's own window under `SETTLE_STEP_TIMEOUT`.
+                // A job that gave up earlier would report a failure and free
+                // the URL while its run went on to remove the worker. 30s on
+                // top covers the other removal steps.
+                let timeout_duration = SETTLE_STEP_TIMEOUT + Duration::from_secs(30);
 
                 // Completion releases the claim after the worker leaves.
                 // Another kept job can take the URL as soon as it is released.
@@ -4462,5 +4455,59 @@ mod tests {
                 "named at revision {revision}"
             );
         }
+    }
+
+    /// A removal job lasts as long as its run. A worker's own drain window
+    /// past the old wait of 630 seconds ends in the removal, and the job
+    /// holds the URL until then: it reports no failure while its run still
+    /// means to remove the worker.
+    #[tokio::test(start_paused = true)]
+    async fn a_removal_job_holds_its_url_through_a_long_drain_window() {
+        use openai_protocol::worker::HealthCheckConfig;
+        use smg_worker::identity::basic::Worker;
+
+        use crate::{
+            app_context::testing::live_app_context,
+            routers::grpc::backend_client::BasicWorkerBuilder,
+        };
+
+        let context = live_app_context();
+        let registry = &context.worker_registry;
+        let queue = context.worker_job_queue.get().expect("the live queue");
+        let url = "http://w:8000";
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(url)
+                .health_config(HealthCheckConfig {
+                    drain_settle_secs: 900,
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        registry
+            .register(Arc::clone(&worker))
+            .expect("the worker registers");
+        queue
+            .submit(removal(url, None))
+            .await
+            .expect("the removal is queued");
+
+        tokio::time::sleep(Duration::from_secs(700)).await;
+        let status = queue.get_status(url).expect("the job holds the URL");
+        assert_eq!(status.status, "processing");
+        assert!(
+            registry.get_by_url(url).is_some(),
+            "the worker drains through its window"
+        );
+
+        tokio::time::sleep(Duration::from_secs(300)).await;
+        assert!(
+            queue.get_status(url).is_none(),
+            "the job ended without a failure"
+        );
+        assert!(
+            registry.get_by_url(url).is_none(),
+            "the removal took the worker"
+        );
     }
 }
