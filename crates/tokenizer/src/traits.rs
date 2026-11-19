@@ -607,6 +607,19 @@ pub trait Tokenizer: Encoder + Decoder {
         ))
     }
 
+    /// The largest id the tokenizer knows, added tokens included, as vLLM's
+    /// `tokenizer.max_token_id` reads it: a multimodal placeholder token can
+    /// lie past the model's vocabulary, so the ids an engine's frontend admits
+    /// are bounded by the larger of the two. The default reads it off
+    /// [`Self::vocab_size`], which suits a vocabulary that counts every id;
+    /// one whose size leaves its added tokens out overrides it. `None` for an
+    /// empty vocabulary.
+    fn max_token_id(&self) -> Option<TokenIdType> {
+        self.vocab_size()
+            .checked_sub(1)
+            .map(|id| TokenIdType::try_from(id).unwrap_or(TokenIdType::MAX))
+    }
+
     /// EOS token IDs for stop detection.
     ///
     /// Merged from `config.json` and `generation_config.json` (eos_token_id, int or list).

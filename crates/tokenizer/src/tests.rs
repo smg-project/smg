@@ -1538,3 +1538,43 @@ fn generic_stream_end_releases_a_held_replacement_character() {
         );
     }
 }
+
+/// `max_token_id` counts the added tokens `vocab_size` leaves out: two
+/// placeholders added past the model's last id, the larger is the largest;
+/// without them the model's last id is, and the default reads it off
+/// `vocab_size`.
+#[test]
+fn max_token_id_counts_the_added_tokens() {
+    let with_added = |added_tokens: serde_json::Value| {
+        let definition = serde_json::json!({
+            "version": "1.0", "added_tokens": added_tokens,
+            "model": {"type": "WordLevel", "unk_token": "[UNK]", "vocab": {
+                "[UNK]": 0, "a": 1, "b": 2, "c": 3
+            }}
+        });
+        let native =
+            tokenizers::Tokenizer::from_bytes(serde_json::to_vec(&definition).unwrap()).unwrap();
+        crate::HuggingFaceTokenizer::from_tokenizer(native)
+    };
+    let added = |id: u32, content: &str| {
+        serde_json::json!({
+            "id": id, "content": content, "special": true, "single_word": false,
+            "lstrip": false, "rstrip": false, "normalized": false
+        })
+    };
+    let placeholders = with_added(serde_json::json!([
+        added(4, "<image>"),
+        added(5, "<video>")
+    ]));
+    assert_eq!(crate::TokenizerTrait::vocab_size(&placeholders), 4);
+    assert_eq!(crate::TokenizerTrait::max_token_id(&placeholders), Some(5));
+    let plain = with_added(serde_json::json!([]));
+    assert_eq!(crate::TokenizerTrait::max_token_id(&plain), Some(3));
+
+    let mock = mock::MockTokenizer::new();
+    let size = crate::TokenizerTrait::vocab_size(&mock);
+    assert_eq!(
+        crate::TokenizerTrait::max_token_id(&mock),
+        Some(size as u32 - 1)
+    );
+}

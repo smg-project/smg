@@ -2648,6 +2648,24 @@ impl TokenizerTrait for HuggingFaceTokenizer {
         self.token_text(id)
     }
 
+    /// The model's last id or the largest added token's, whichever is
+    /// larger: [`Self::vocab_size`] leaves the added tokens out, and a
+    /// multimodal placeholder is often one of them.
+    fn max_token_id(&self) -> Option<TokenIdType> {
+        let tokenizer = &self.core.tokenizer;
+        let model = tokenizer
+            .get_vocab_size(false)
+            .checked_sub(1)
+            .map(|id| TokenIdType::try_from(id).unwrap_or(TokenIdType::MAX));
+        let added = tokenizer
+            .get_added_vocabulary()
+            .get_added_tokens_decoder()
+            .keys()
+            .copied()
+            .max();
+        model.max(added)
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
