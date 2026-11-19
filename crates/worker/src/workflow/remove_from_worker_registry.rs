@@ -3,14 +3,17 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use openai_protocol::worker::WorkerStatus;
-use smg_worker::identity::{basic::Worker, endpoint::Endpoint};
 use tracing::{debug, warn};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
-use crate::workflow::{
+use super::{
     data::WorkerRemovalWorkflowData,
-    steps::shared::{pool_group, refresh_worker_pool_sizes, PoolGroups},
+    host::{require_host, WorkflowHost},
+    pool::{pool_group, refresh_worker_pool_sizes, PoolGroups},
+};
+use crate::{
+    identity::{basic::Worker, endpoint::Endpoint},
+    worker::WorkerStatus,
 };
 
 /// Step to remove workers from the worker registry.
@@ -28,18 +31,13 @@ use crate::workflow::{
 pub struct RemoveFromWorkerRegistryStep;
 
 #[async_trait]
-impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromWorkerRegistryStep {
+impl<H: WorkflowHost> StepExecutor<WorkerRemovalWorkflowData<H>> for RemoveFromWorkerRegistryStep {
     async fn execute(
         &self,
-        context: &mut WorkflowContext<WorkerRemovalWorkflowData>,
+        context: &mut WorkflowContext<WorkerRemovalWorkflowData<H>>,
     ) -> WorkflowResult<StepResult> {
-        let app_context =
-            Arc::clone(
-                context.data.app_context.as_ref().ok_or_else(|| {
-                    WorkflowError::ContextValueNotFound("app_context".to_string())
-                })?,
-            );
-        let registry = &app_context.worker_registry;
+        let host = Arc::clone(require_host(context.data.host.as_ref())?);
+        let registry = host.worker_registry();
         let worker_urls = context.data.worker_urls.clone();
         let pins = context.data.config.expected_revisions.clone();
 
@@ -181,17 +179,17 @@ impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromWorkerRegistryStep {
 mod tests {
     use std::{collections::HashMap, sync::Arc};
 
-    use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
-    use smg_worker::identity::basic::{Worker, WorkerType};
     use wfaas::WorkflowInstanceId;
 
     use super::*;
     use crate::{
-        app_context::{testing::app_context_for_tests, AppContext},
-        config::RouterConfig,
-        routers::{common::snapshot::WorkerRegistry, grpc::backend_client::BasicWorkerBuilder},
-        workflow::{data::WorkerList, steps::local::WorkerRemovalRequest},
+        model_card::ModelCard,
+        test_support::{BasicWorkerBuilder, WorkerRegistry},
+        worker::WorkerType,
+        workflow::{data::WorkerList, host::testing::RegistryHost, WorkerRemovalRequest},
     };
+
+    type WorkerRemovalWorkflowData = super::WorkerRemovalWorkflowData<RegistryHost>;
 
     fn build_worker(url: &str) -> Arc<dyn Worker> {
         Arc::new(
@@ -202,17 +200,16 @@ mod tests {
         )
     }
 
-    fn make_app_context(registry: Arc<WorkerRegistry>) -> Arc<AppContext> {
-        let router_config = RouterConfig::builder()
-            .worker_startup_timeout_secs(1)
-            .build_unchecked();
-        app_context_for_tests(router_config, registry, None)
+    fn make_host(registry: Arc<WorkerRegistry>) -> Arc<RegistryHost> {
+        Arc::new(RegistryHost {
+            worker_registry: registry,
+        })
     }
 
     /// The data the selection leaves for the step: the workers found under
     /// `url`, and the request's pins, if any.
     fn make_context(
-        app_context: Arc<AppContext>,
+        host: Arc<RegistryHost>,
         url: &str,
         workers: Vec<Arc<dyn Worker>>,
         expected_revisions: Option<HashMap<String, Option<u64>>>,
@@ -225,7 +222,7 @@ mod tests {
             workers_to_remove: Some(WorkerList::from_workers(&workers)),
             worker_urls: workers.iter().map(|w| w.url().to_string()).collect(),
             affected_models: workers.iter().map(|w| w.model_id().to_string()).collect(),
-            app_context: Some(app_context),
+            host: Some(host),
             actual_workers_to_remove: Some(workers),
             removed_workers: Vec::new(),
         };
@@ -246,7 +243,7 @@ mod tests {
             .expect("the worker registers");
         let pins = HashMap::from([(found_id.as_str().to_string(), Some(found.revision()))]);
         let mut ctx = make_context(
-            make_app_context(Arc::clone(&registry)),
+            make_host(Arc::clone(&registry)),
             url,
             vec![Arc::clone(&found)],
             Some(pins),
@@ -314,7 +311,7 @@ mod tests {
             .expect("the worker registers");
         let pinned = found.revision();
         let mut ctx = make_context(
-            make_app_context(Arc::clone(&registry)),
+            make_host(Arc::clone(&registry)),
             url,
             vec![Arc::clone(&found)],
             Some(HashMap::from([(
@@ -378,7 +375,7 @@ mod tests {
                 .expect("the worker registers");
             let pinned = found.revision();
             let mut ctx = make_context(
-                make_app_context(Arc::clone(&registry)),
+                make_host(Arc::clone(&registry)),
                 url,
                 vec![Arc::clone(&found)],
                 Some(HashMap::from([(
@@ -445,7 +442,7 @@ mod tests {
                 .expect("the worker registers");
             let pinned = found.revision();
             let mut ctx = make_context(
-                make_app_context(Arc::clone(&registry)),
+                make_host(Arc::clone(&registry)),
                 url,
                 vec![Arc::clone(&found)],
                 Some(HashMap::from([(found_id.as_str().to_string(), None)])),
@@ -488,7 +485,7 @@ mod tests {
             .register(Arc::clone(&found))
             .expect("the worker registers");
         let mut ctx = make_context(
-            make_app_context(Arc::clone(&registry)),
+            make_host(Arc::clone(&registry)),
             url,
             vec![Arc::clone(&found)],
             None,

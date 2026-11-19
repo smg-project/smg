@@ -3,12 +3,16 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use smg_worker::identity::endpoint::Endpoint;
 use tracing::debug;
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
-use super::find_workers_by_url;
-use crate::workflow::data::{require_app_context, WorkerRemovalWorkflowData};
+use super::{
+    data::WorkerRemovalWorkflowData,
+    host::{require_host, WorkflowHost},
+    removal::FIND_WORKERS_TO_REMOVE_STEP,
+    select::find_workers_by_url,
+};
+use crate::identity::endpoint::Endpoint;
 
 /// Request structure for worker removal.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -18,7 +22,7 @@ pub struct WorkerRemovalRequest {
     /// removal was decided.
     ///
     /// A DP-aware URL expands into one worker per rank, each with its own
-    /// independent revision, and `super::find_workers_by_url` returns the
+    /// independent revision, and `find_workers_by_url` returns the
     /// whole group for a base URL. A single revision therefore cannot guard
     /// the group: it would retain only the ranks that happen to share it and
     /// silently leave the rest registered against a Pod that is already gone.
@@ -34,20 +38,20 @@ pub struct WorkerRemovalRequest {
 
 /// Step to find workers to remove based on URL.
 ///
-/// Uses registered URLs and DP base URLs, independent of the gateway's
+/// Uses registered URLs and DP base URLs, independent of the host's
 /// current DP setting. Backends need not be reachable during removal.
 pub struct FindWorkersToRemoveStep;
 
 #[async_trait]
-impl StepExecutor<WorkerRemovalWorkflowData> for FindWorkersToRemoveStep {
+impl<H: WorkflowHost> StepExecutor<WorkerRemovalWorkflowData<H>> for FindWorkersToRemoveStep {
     async fn execute(
         &self,
-        context: &mut WorkflowContext<WorkerRemovalWorkflowData>,
+        context: &mut WorkflowContext<WorkerRemovalWorkflowData<H>>,
     ) -> WorkflowResult<StepResult> {
         let request = &context.data.config;
-        let app_context = require_app_context(context.data.app_context.as_ref())?;
+        let registry = require_host(context.data.host.as_ref())?.worker_registry();
 
-        let mut workers_to_remove = find_workers_by_url(&app_context.worker_registry, &request.url);
+        let mut workers_to_remove = find_workers_by_url(registry, &request.url);
 
         if let Some(expected_revisions) = &request.expected_revisions {
             // Pin each worker to its own revision. An id absent from the map
@@ -56,8 +60,7 @@ impl StepExecutor<WorkerRemovalWorkflowData> for FindWorkersToRemoveStep {
             // reconcile pass re-evaluates it, while its siblings still drain.
             // An id pinned at no revision is removed as it stands.
             workers_to_remove.retain(|worker| {
-                app_context
-                    .worker_registry
+                registry
                     .get_id_by_url(worker.url())
                     .and_then(|id| expected_revisions.get(id.as_str()).copied())
                     .is_some_and(|expected| {
@@ -75,7 +78,7 @@ impl StepExecutor<WorkerRemovalWorkflowData> for FindWorkersToRemoveStep {
             }
         } else if workers_to_remove.is_empty() {
             return Err(WorkflowError::StepFailed {
-                step_id: StepId::new("find_workers_to_remove"),
+                step_id: StepId::new(FIND_WORKERS_TO_REMOVE_STEP),
                 message: format!("Worker {} not found", Endpoint::redacted_str(&request.url)),
             });
         }

@@ -173,7 +173,7 @@ commands_of() {
             # Opt-in (#[ignore]) cases against the database the workflow creates for the job.
             echo "-p data-connector --test postgres_integration --test conformance :: --ignored --test-threads=1" ;;
         protocols)
-            echo "-p openai-protocol -p smg-worker -p smg-external-router -p smg-auth -p smg-rl -p smg-client -p openapi-gen --features openai-protocol/axum,smg-worker/runtime,smg-external-router/openai,smg-external-router/anthropic,smg-external-router/gemini" ;;
+            echo "-p openai-protocol -p smg-worker -p smg-external-router -p smg-auth -p smg-rl -p smg-client -p openapi-gen --features openai-protocol/axum,smg-worker/runtime,smg-worker/workflow,smg-external-router/openai,smg-external-router/anthropic,smg-external-router/gemini" ;;
         engine)
             echo "-p smg-grpc-client -p engine-zmq-client -p engine-zmq-adapter -p engine-servicer -p mock-worker -p gateway-perf --features engine-zmq-client/mock-engine" ;;
         kv)

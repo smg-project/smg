@@ -42,7 +42,7 @@ impl StepExecutor<WorkerRemovalWorkflowData> for ReleaseTokenizerStep {
         &self,
         context: &mut WorkflowContext<WorkerRemovalWorkflowData>,
     ) -> WorkflowResult<StepResult> {
-        let app_context = require_app_context(context.data.app_context.as_ref())?;
+        let app_context = require_app_context(context.data.host.as_ref())?;
         // The gateway manages no tokenizer when autoload is off: every entry
         // is the operator's, as the registration step leaves them.
         if app_context.router_config.disable_tokenizer_autoload {
@@ -222,7 +222,10 @@ mod tests {
     use llm_multimodal::PreProcessorConfig;
     use llm_tokenizer::{mock::MockTokenizer, traits::Tokenizer, LoadOutcome, TokenizerRegistry};
     use openai_protocol::model_card::ModelCard;
-    use smg_worker::identity::basic::{ConnectionMode, Worker};
+    use smg_worker::{
+        identity::basic::{ConnectionMode, Worker},
+        workflow::RemoveFromWorkerRegistryStep,
+    };
     use tokio::sync::Notify;
     use wfaas::{StepExecutor, WorkflowContext, WorkflowInstanceId};
 
@@ -236,10 +239,7 @@ mod tests {
         },
         workflow::{
             data::WorkerRemovalWorkflowData,
-            steps::local::{
-                create_worker_removal_workflow_data, RemoveFromPolicyRegistryStep,
-                RemoveFromWorkerRegistryStep,
-            },
+            steps::local::{create_worker_removal_workflow_data, RemoveFromPolicyRegistryStep},
         },
     };
 

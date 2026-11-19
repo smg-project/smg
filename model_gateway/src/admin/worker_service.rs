@@ -24,6 +24,7 @@ use smg_worker::{
         endpoint::Endpoint,
     },
     registry::WorkerId,
+    workflow::find_workers_by_url,
 };
 use tracing::warn;
 
@@ -32,7 +33,7 @@ use crate::{
     observability::log_format::has_control_character,
     routers::{common::snapshot::WorkerRegistry, provider_support},
     service_discovery::{DISCOVERY_LABEL_PREFIX, DISCOVERY_PROVIDER_LABEL},
-    workflow::{steps::local::find_workers_by_url, Job, JobQueue, WorkerRegistrationMode},
+    workflow::{Job, JobQueue, WorkerRegistrationMode},
 };
 
 /// Validate the URL of an incoming worker-management request, translating a
@@ -1383,7 +1384,7 @@ mod tests {
     /// refused the group's PATCH on every try.
     #[tokio::test]
     async fn a_patch_of_a_completed_data_parallel_group_by_its_post_id_reaches_every_rank() {
-        use crate::workflow::{steps::local::find_workers_by_url, WorkflowEngines};
+        use crate::workflow::WorkflowEngines;
 
         let registry = Arc::new(WorkerRegistry::new());
         let url = "http://10.0.0.6:8000";

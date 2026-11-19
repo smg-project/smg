@@ -8334,6 +8334,7 @@ dependencies = [
  "tracing-test",
  "url",
  "uuid",
+ "wfaas",
 ]
 
 [[package]]
