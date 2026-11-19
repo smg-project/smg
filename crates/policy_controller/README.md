@@ -82,6 +82,7 @@ profiles:
 - A profile has exactly one picker.
 - Workers whose scores are equal, within a small band, tie. `best` draws among them at random.
 - A decision that ends with no worker is a **shed**. It names the stage that left it empty.
+- A pick can state what its first worker holds of the request's prefix (`Pick::overlap`): the leading blocks held, the request's blocks, where the match came from, and whether the prefix margin kept that worker in front. The profile's first `prefix-affinity` scorer says it. A host that calls the library asks through `Engine::decide_stated`. The controller's `Decide` answer does not carry it yet.
 
 ### Filters
 
@@ -585,6 +586,7 @@ A stage is a Rust type that implements `Filter`, `Scorer` or `Picker`. You add i
 
 - The code above is from [`examples/policy-controller`](../../examples/policy-controller), the guide with the scorer, its tests and its document. That page also lists the data the stock controller feeds a stage today.
 - [`policyspec.schema.json`](policyspec.schema.json) is the JSON schema of the document, generated from the crate's types. It lists every field with its description.
+- A scorer of your own can state a pick's overlap too: implement `Scorer::states_overlap` and `Scorer::said`. Both have a default that says nothing. `said` is asked once a decision, of the first target alone.
 - [`contracts`](contracts) holds the wire contracts: the controller's calls and the plugin interfaces.
 
 ## What is not built yet

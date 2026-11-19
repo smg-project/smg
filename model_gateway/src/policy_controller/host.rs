@@ -37,7 +37,7 @@ use smg_policy_controller::{
     handle::Handle,
     lease::{Outcome, ReleaseReason, Side, TransportClass},
     store::{GatewayId, MemoryStore, WorkersStore},
-    view::{Constraints, RequestFacts, WorkerId},
+    view::{Constraints, HashKind, RequestFacts, WorkerId},
 };
 use smg_worker::identity::basic::{Worker, WorkerLoadGuard};
 
@@ -52,6 +52,15 @@ use crate::{
         error,
     },
 };
+
+mod hashes;
+
+pub(crate) use hashes::Hashes;
+#[cfg_attr(
+    not(test),
+    expect(unused_imports, reason = "the prompt is part of the host's interface")
+)]
+pub(crate) use hashes::Prompt;
 
 /// The gateway of this process, as the controller's store names it: the
 /// crate's own name for the one gateway that decides in its own process.
@@ -76,27 +85,39 @@ pub(crate) struct Ask<'a> {
     pub streaming: bool,
     /// The rows of the workers the request's failed attempts were sent to.
     pub tried: &'a [WorkerId],
+    /// The attempt's prompt hashes, where it has them. The stage that holds
+    /// the tokens fills this once per attempt, before its first ask.
+    pub hashes: Option<&'a Hashes>,
 }
 
 impl<'a> Ask<'a> {
     /// The request as the controller reads it, with the targets the gateway
     /// `missed` at this attempt's earlier commits. The one place a fact of
-    /// a request is stated: a later step adds its fact here.
+    /// a request is stated: a later step adds its fact here. Each ask
+    /// borrows the attempt's hashes.
     ///
     /// Each call draws the decision's seed anew. The seed is the one
     /// randomness a stage gets: under a constant seed a policy that draws
     /// picks the same worker of an unchanged pool every time.
     fn request(&self, missed: &'a [WorkerId]) -> Request<'a> {
+        let mut facts = RequestFacts {
+            model: self.model,
+            streaming: self.streaming,
+            attempt: u8::try_from(self.tried.len()).unwrap_or(u8::MAX),
+            tried: self.tried,
+            seed: rand::rng().random(),
+            ..RequestFacts::default()
+        };
+        if let Some(hashes) = self.hashes {
+            facts.block_hashes = &hashes.blocks;
+            facts.hash_kind = HashKind::Token;
+            facts.block_size = hashes.block_size;
+            facts.namespace_seed = hashes.namespace_seed;
+            facts.prompt_tokens = hashes.prompt_tokens;
+        }
         Request {
             id: self.id,
-            facts: RequestFacts {
-                model: self.model,
-                streaming: self.streaming,
-                attempt: u8::try_from(self.tried.len()).unwrap_or(u8::MAX),
-                tried: self.tried,
-                seed: rand::rng().random(),
-                ..RequestFacts::default()
-            },
+            facts,
             constraints: Constraints {
                 excluded: missed,
                 ..Constraints::default()

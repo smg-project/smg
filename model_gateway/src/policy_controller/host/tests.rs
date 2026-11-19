@@ -12,29 +12,35 @@ use axum::{
     body::to_bytes,
     http::{header::RETRY_AFTER, StatusCode},
 };
+use kv_index::compute_request_content_hashes;
 use openai_protocol::worker::WorkerStatus;
 use serde_json::Value;
 use smg_policy_controller::{
     decision::ShedReason,
     door::Refused,
     lease::{ReleaseReason, TransportClass},
-    store::{LeasesStore, MemoryStore, WorkerFacts, WorkerStatus as RowStatus, WorkersStore},
+    store::{
+        BatchOutcome, KvEventSink, LeasesStore, LoadSink, LoadSource, MemoryStore, WorkerFacts,
+        WorkerStatus as RowStatus, WorkersStore, PUBLISH_WINDOW,
+    },
+    view::LoadRow,
 };
 use smg_worker::identity::basic::WorkerLoadGuard;
 
 use super::{
     left_no_worker,
-    testing::{bed, MODEL},
-    Ask, End, Held, Unplaced, GATEWAY,
+    testing::{bed, cache_bed, store_blocks, MODEL},
+    Ask, End, Hashes, Held, Prompt, Unplaced, GATEWAY,
 };
 
 /// A first attempt's ask of the request `id`.
-fn first(id: &[u8]) -> Ask<'_> {
+pub(super) fn first(id: &[u8]) -> Ask<'_> {
     Ask {
         id,
         model: MODEL,
         streaming: false,
         tried: &[],
+        hashes: None,
     }
 }
 
@@ -88,6 +94,63 @@ async fn a_drawn_pick_is_not_the_same_worker_for_every_request() {
     // Each ask draws its own seed. Under one seed the default profile's
     // draw lands every request on the same worker of an unchanged pool.
     assert_eq!(picked.len(), 2, "64 requests landed on {picked:?}");
+}
+
+#[tokio::test]
+async fn a_returning_prefix_lands_on_the_worker_that_holds_it() {
+    let tokens: Vec<u32> = (1..=64).collect();
+    for block_size in [32, 16] {
+        let (host, store, holder) = cache_bed();
+        store.set_block_size(MODEL, block_size);
+        let blocks = compute_request_content_hashes(&tokens, block_size as usize);
+        assert_eq!(store_blocks(&store, holder, &blocks), BatchOutcome::Applied);
+        let hashes = Hashes::of(
+            &store,
+            MODEL,
+            &Prompt {
+                tokens: Some(&tokens),
+                namespace: None,
+            },
+        );
+        let now = Instant::now();
+        // Give plain asks a lower-load choice while affinity can still win.
+        for row in store.snapshot().1 {
+            store.record(
+                row.id,
+                0,
+                LoadRow {
+                    running: u32::from(row.id == holder),
+                    ..LoadRow::default()
+                },
+                now,
+                LoadSource::Stream,
+            );
+        }
+        let now = now + PUBLISH_WINDOW;
+        store.publish(now);
+        let mut plain_matches = 0;
+        for turn in 0..32u8 {
+            let id = [turn];
+            let plain = first(&id);
+            let returning = Ask {
+                hashes: Some(&hashes),
+                ..plain
+            };
+            assert_eq!(
+                host.place(&returning, now).await.expect("a worker").id(),
+                holder,
+                "block size {block_size}, request {turn}"
+            );
+            let placed = host.place(&plain, now).await.expect("a worker");
+            plain_matches += usize::from(placed.id() == holder);
+        }
+        assert!(plain_matches < 32, "block size {block_size}");
+        let returning = Ask {
+            hashes: Some(&hashes),
+            ..first(b"returning")
+        };
+        assert_eq!(returning.request(&[]).facts.block_size, block_size);
+    }
 }
 
 #[tokio::test]
