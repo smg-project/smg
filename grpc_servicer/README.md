@@ -723,15 +723,25 @@ grammar compile instead of falling back. Pin `guidance` (or `xgrammar`)
 explicitly when that matters; the engine keeps the backend of its first
 structured request either way, as it does behind vLLM's own frontend.
 
-A constraint the engine's backend cannot enforce is refused before the engine
-with INVALID_ARGUMENT (a 400 at a router), the same way on every Rust servicer:
-a JSON-schema feature xgrammar drops (`multipleOf`, `uniqueItems`, a string
-`format` it lacks, ...) wherever xgrammar is the backend, whether the schema is
-a `response_format`'s or inside a forced tool call's structural tag; every kind
-of constraint on an engine with no grammar backend; a kind the backend does not
-compile. The vLLM servicer reads the backend off `--structured-outputs-config`,
-the SGLang and TokenSpeed servicers off their engine's `--grammar-backend` (see
-their sections); a backend the servicer does not know is left to the engine.
+A constraint the engine's backend cannot enforce is refused before the engine,
+the same way on every Rust servicer: a JSON-schema feature xgrammar drops
+(`multipleOf`, `uniqueItems`, a string `format` it lacks, ...) wherever
+xgrammar is the backend, whether the schema is a `response_format`'s or inside
+a forced tool call's structural tag; every kind of constraint on an engine with
+no grammar backend; a kind the backend does not compile. The vLLM servicer
+reads the backend off `--structured-outputs-config`, the SGLang and TokenSpeed
+servicers off their engine's `--grammar-backend` (see their sections); a
+backend the servicer does not know is left to the engine. The refusal is
+`INVALID_ARGUMENT` with the trailer `smg-constraint-refused: worker`, the
+message naming the constraint, the keyword and where it stands. Behind the
+servicers a router answers the client a 400 under the code
+`unsupported_constraint` with the servicer's message alone (not
+`start_generation_failed`, nor on a disaggregated pair the side's
+`prefill_worker_failed_to_start`), replays nothing (every worker of the kind
+refuses it alike) and samples no circuit breaker against the worker. On
+`/v1/messages` the answer is the request's `invalid_request_error`, whose
+envelope carries no code (it rides in `X-SMG-Error-Code`). A router that
+predates the trailer answers a 400 under the code of whatever failed to start.
 
 A constraint the engine admitted and then could not continue the request under
 (a sampled token the grammar rejects, as speculative decoding can produce) is

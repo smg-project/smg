@@ -30,7 +30,9 @@ use engine_zmq_client::{
 use futures::StreamExt;
 use llm_tokenizer::traits::Tokenizer;
 use openai_protocol::worker::{RuntimeType, SchedulerLoadSnapshot, WorkerLoadResponse, WorkerType};
-use smg_grpc_client::{sglang_proto, tokenspeed_proto, trtllm_proto, vllm_proto as vllm};
+use smg_grpc_client::{
+    constraint_refused_status, sglang_proto, tokenspeed_proto, trtllm_proto, vllm_proto as vllm,
+};
 use tokio::time::Instant;
 
 #[cfg(unix)]
@@ -60,9 +62,10 @@ use crate::{
         TrtllmGenerateStream,
     },
     vllm::{
-        fan_out_requests, has_media, kv_transfer_params, now_secs, ranked_candidate_count,
-        refuse_greedy_choices, translate_media, translate_request_with_media,
-        translated_from_processed, ProcessedMedia, TranslatedMedia, VllmGenerateStream,
+        constraint_ref as vllm_constraint_ref, fan_out_requests, has_media, kv_transfer_params,
+        now_secs, ranked_candidate_count, refuse_greedy_choices, translate_media,
+        translate_request_with_media, translated_from_processed, ProcessedMedia, TranslatedMedia,
+        VllmGenerateStream,
     },
 };
 
@@ -849,6 +852,11 @@ impl ZmqEngineClient {
         // On the request's own `n`: every sub below carries `n = 1`.
         if let Some(sp) = req.sampling_params.as_ref() {
             refuse_greedy_choices(sp).map_err(tonic::Status::invalid_argument)?;
+            // A constraint the engine's grammar backend cannot enforce is
+            // refused here, before anything reaches the engine, as on every
+            // wire.
+            refuse_unenforceable_constraint(vllm_constraint_ref(sp), support)
+                .map_err(constraint_refused_status)?;
         }
         let subs = fan_out_requests(req);
         let last = subs.len().saturating_sub(1);
@@ -1027,7 +1035,7 @@ impl ZmqEngineClient {
                 tokenspeed_constraint_ref(sp),
                 self.structured_outputs_support(),
             )
-            .map_err(tonic::Status::invalid_argument)?;
+            .map_err(constraint_refused_status)?;
         }
         let max_model_len = self.prompt_bound()?;
         // The ranks as the engine numbers them: a disaggregated request is
@@ -1198,7 +1206,7 @@ impl ZmqEngineClient {
                 sglang_constraint_ref(sp),
                 self.structured_outputs_support(),
             )
-            .map_err(tonic::Status::invalid_argument)?;
+            .map_err(constraint_refused_status)?;
         }
         let max_model_len = self.prompt_bound()?;
         // The connected scheduler ranks: a request is placed among them as
@@ -1376,7 +1384,7 @@ impl ZmqEngineClient {
             trtllm_constraint_ref(&req),
             self.structured_outputs_support(),
         )
-        .map_err(tonic::Status::invalid_argument)?;
+        .map_err(constraint_refused_status)?;
         let max_model_len = self.prompt_bound()?;
         let mut streams = Vec::new();
         for (index, sub) in fan_out_trtllm_requests(req).into_iter().enumerate() {
