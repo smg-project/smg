@@ -1986,6 +1986,55 @@ mod tests {
         out
     }
 
+    /// Under no cap the two feeds are still one reading: a profile that
+    /// takes no sample is named every holder and every warming row. Over a
+    /// pool where thirty-three of forty rows hold the request, more than
+    /// any sample names, and two rows are thin, each stage scores the rows
+    /// named as the column they were derived from, turn by turn.
+    #[test]
+    fn every_holder_named_scores_as_the_column_past_any_cap() {
+        // Rows 0 to 23 hold the deepest match and rows 24 to 31 a shallower
+        // one; rows 38 and 39 are thin, and row 38 holds the deepest too.
+        let pool: Vec<Held> = (0..40u32)
+            .map(|row| match row {
+                0..=23 => sized(row, row % 3, 12, 64),
+                24..=31 => sized(row, row % 3, 4, 64),
+                38 => sized(row, 1, 12, 12),
+                39 => sized(row, 0, 0, 12),
+                _ => sized(row, row % 3, 0, 64),
+            })
+            .collect();
+        let each: Vec<NamedHolder> = pool
+            .iter()
+            .filter(|(_, held)| held.overlap_blocks > 0)
+            .map(|(row, held)| holder(row.position, held.overlap_blocks))
+            .collect();
+        assert_eq!(each.len(), 33);
+        let stage = affinity(None);
+        assert_eq!(
+            scores_named(
+                &stage,
+                &facts(16),
+                &rows(&pool),
+                named(&each, &[38, 39], true)
+            ),
+            scores(&stage, &facts(16), &pool)
+        );
+        let (by_column, by_named) = (warmup(0.25, 1), warmup(0.25, 1));
+        for turn in 0..8 {
+            assert_eq!(
+                scores_named(
+                    &by_named,
+                    &facts(16),
+                    &rows(&pool),
+                    named(&each, &[38, 39], true)
+                ),
+                scores(&by_column, &facts(16), &pool),
+                "turn {turn}"
+            );
+        }
+    }
+
     /// The two feeds are one reading: over one pool, the rows a host named
     /// (each holder with what it holds, the warming rows) score as the
     /// column they were derived from, turn by turn and whichever rows a

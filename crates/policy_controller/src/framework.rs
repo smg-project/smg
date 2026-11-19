@@ -621,6 +621,26 @@ impl Profile {
         stages.filter_map(|stage| stage.scorer.warm_rule())
     }
 
+    /// The cap of each list of rows a host names in the affinity column's
+    /// place for a decision of this profile ([`Engine::named_for`]): its
+    /// sample, [`u32::MAX`] where it takes none, and `0` where it is named
+    /// no row.
+    fn named_cap(&self) -> u32 {
+        let needs = self.needs();
+        let mut rules = self.warm_rules();
+        let first = rules.next();
+        let one = first.is_none_or(|first| rules.all(|rule| rule == first));
+        if !(needs.affinity && one) {
+            return 0;
+        }
+        match needs.sample {
+            // A profile that shows its rows to a plugin takes no sample.
+            0 if self.scoped() => 0,
+            0 => u32::MAX,
+            sample => sample,
+        }
+    }
+
     /// Whether any stage holds a [`DecisionScope`].
     pub fn scoped(&self) -> bool {
         self.scopes().next().is_some()
@@ -2203,6 +2223,9 @@ pub struct Engine {
     /// Per profile, what its stages ask of a decision beyond the profile's
     /// own run ([`Marks`]).
     marks: Vec<Marks>,
+    /// Per profile, the cap of the rows a host names for its decisions
+    /// ([`Self::named_for`]), said once at the build.
+    named: Vec<u32>,
     /// Per profile, its filters as one test of a row, where the engine
     /// holds every one itself ([`RowTests::of`]). A decision that draws
     /// first asks it about a row in place of a call a filter, and no other
@@ -3034,6 +3057,7 @@ impl Engine {
             .zip(&orders)
             .map(|(profile, &order)| Marks::of(profile, order))
             .collect();
+        let named: Vec<u32> = profiles.iter().map(Profile::named_cap).collect();
         let row_tests = profiles
             .iter()
             .map(|profile| RowTests::of(&profile.filters))
@@ -3068,6 +3092,7 @@ impl Engine {
             sessions,
             assignment: AssignmentStages::default(),
             marks,
+            named,
             row_tests,
             orders,
         }
@@ -3148,7 +3173,8 @@ impl Engine {
     /// `model` ([`Needs::sample`]), `0` where that profile never draws and
     /// where no binding matches. A host that names a decision's rows takes
     /// its cap from [`Self::named_for`], not from here: a profile that
-    /// keeps its column has a sample too. [`Self::needs_for`] answers for a
+    /// keeps its column has a sample too, and one that takes none is
+    /// named without a cap. [`Self::needs_for`] answers for a
     /// worker's stream, where the larger of two needs is the safe one: for a
     /// decode decision of a model that also pairs it carries the pair's
     /// decode side, whose sample may be the larger. A cap's safe side is
@@ -3298,27 +3324,22 @@ impl Engine {
     }
 
     /// The cap of each list of rows a host names in the affinity column's
-    /// place for a decision of `phase` for `model`: the sample of the
-    /// profile that decision resolves to ([`Self::sample_for`]) where that
-    /// profile's own stages read the column and its warm-up stages rule by
-    /// one ruling. `0` otherwise, and where no binding matches: such a
-    /// decision is handed the column where its needs declare it. The
-    /// profile answers for itself here: [`Self::needs_for`] is merged over
-    /// a pair's two phases and a binding's sessions rule, and says where to
-    /// ask.
+    /// place for a decision of `phase` for `model`, where the profile that
+    /// decision resolves to reads the column by its own stages and its
+    /// warm-up stages rule by one ruling: that profile's sample
+    /// ([`Self::sample_for`]), and [`u32::MAX`] where it takes none. A
+    /// sample caps how many rows are named and decides nothing else: a
+    /// profile that takes none reads every row, so it is named every
+    /// holder and every warming row. `0` otherwise, where the profile
+    /// shows its rows to a plugin, whose stage reads the column whole, and
+    /// where no binding matches: such a decision is named no row and
+    /// handed the column where its needs declare it. The profile answers
+    /// for itself here: [`Self::needs_for`] is merged over a pair's two
+    /// phases and a binding's sessions rule, and says where to ask. The cap
+    /// is the profile's own, said once at the build: a decision reads it.
     pub fn named_for(&self, model: &str, phase: Phase) -> u32 {
-        let Some((_, _, profile)) = self.resolve(model, phase) else {
-            return 0;
-        };
-        let needs = profile.needs();
-        let mut rules = profile.warm_rules();
-        let first = rules.next();
-        let one = first.is_none_or(|first| rules.all(|rule| rule == first));
-        if needs.affinity && one {
-            needs.sample
-        } else {
-            0
-        }
+        self.resolve(model, phase)
+            .map_or(0, |(_, index, _)| self.named[usize::from(index)])
     }
 
     /// The binding a request resolves to, with its profile for the phase: one
