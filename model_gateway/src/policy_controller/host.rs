@@ -27,17 +27,18 @@
 use std::{fmt, sync::Arc, time::Instant};
 
 use axum::{
-    http::{header::RETRY_AFTER, HeaderValue},
+    http::{header::RETRY_AFTER, HeaderMap, HeaderValue},
     response::Response,
 };
 use rand::RngExt;
 use smg_policy_controller::{
     decision::{Decision, Lifted, ShedReason, Target, Targets, Trace},
-    door::{Door, Refused, Request},
+    door::{Door, Maker, Refused, Request},
     handle::Handle,
     lease::{Outcome, ReleaseReason, Side, TransportClass},
-    store::{GatewayId, MemoryStore, WorkersStore},
-    view::{Constraints, HashKind, RequestFacts, WorkerId},
+    store::{GatewayId, MemoryStore, WorkersStore, World},
+    view::{Constraints, HashKind, Identity, Phase, RequestFacts, WorkerId},
+    AppliedSpec,
 };
 use smg_worker::identity::basic::{Worker, WorkerLoadGuard};
 
@@ -128,6 +129,12 @@ pub(crate) struct Ask<'a> {
     pub model: &'a str,
     /// Whether the answer is streamed.
     pub streaming: bool,
+    /// The request's headers. The sources of its routing key are read from
+    /// them, where its binding names a header.
+    pub headers: Option<&'a HeaderMap>,
+    /// The request's own id, the `rid` of its body: a source of its routing
+    /// key, where its binding names it.
+    pub rid: Option<&'a str>,
     /// The rows of the workers the request's failed attempts were sent to.
     pub tried: &'a [WorkerId],
     /// The attempt's prompt hashes, where it has them. The stage that holds
@@ -136,18 +143,45 @@ pub(crate) struct Ask<'a> {
 }
 
 impl<'a> Ask<'a> {
-    /// The request as the controller reads it, with the targets the gateway
-    /// `missed` at this attempt's earlier commits. The one place a fact of
-    /// a request is stated: a later step adds its fact here. Each ask
-    /// borrows the attempt's hashes.
+    /// The request's routing key by the sources its binding names in `spec`:
+    /// the first that holds a value
+    /// ([`KeySources::derive`](smg_policy_controller::KeySources::derive)).
+    /// [`Identity::NONE`] where the binding names no source, or none of them
+    /// holds a value.
+    ///
+    /// The key borrows the document. The door hands the ask the world it
+    /// decides under, and the key is derived there
+    /// ([`Handle::decide_under`]).
+    fn key<'s>(&self, spec: &'s AppliedSpec) -> Identity<'s>
+    where
+        'a: 's,
+    {
+        let Some(sources) = spec.key_sources_for(self.model, Phase::Single) else {
+            return Identity::NONE;
+        };
+        let headers = self.headers;
+        let header = |name: &str| headers?.get(name).map(HeaderValue::as_bytes);
+        sources
+            .derive(header, self.rid)
+            .map_or(Identity::NONE, |derived| derived.key)
+    }
+
+    /// The request as the controller reads it, with its routing `key` and
+    /// the targets the gateway `missed` at this attempt's earlier commits.
+    /// The one place a fact of a request is stated: a later step adds its
+    /// fact here. Each ask borrows the attempt's hashes.
     ///
     /// Each call draws the decision's seed anew. The seed is the one
     /// randomness a stage gets: under a constant seed a policy that draws
     /// picks the same worker of an unchanged pool every time.
-    fn request(&self, missed: &'a [WorkerId]) -> Request<'a> {
+    fn request<'s>(&self, key: Identity<'s>, missed: &'s [WorkerId]) -> Request<'s>
+    where
+        'a: 's,
+    {
         let mut facts = RequestFacts {
             model: self.model,
             streaming: self.streaming,
+            session_key: key,
             attempt: u8::try_from(self.tried.len()).unwrap_or(u8::MAX),
             tried: self.tried,
             seed: rand::rng().random(),
@@ -168,6 +202,25 @@ impl<'a> Ask<'a> {
                 ..Constraints::default()
             },
         }
+    }
+}
+
+/// One ask of an attempt, as the door takes it up: its request is made from
+/// the world the decision is made under, so its key is derived by the
+/// sources of the document that decides.
+struct Made<'r, 'a> {
+    ask: &'r Ask<'a>,
+    missed: &'r [WorkerId],
+}
+
+impl Maker for Made<'_, '_> {
+    fn model(&self) -> &str {
+        self.ask.model
+    }
+
+    fn make<'w>(&'w self, world: &'w World) -> Request<'w> {
+        let key = self.ask.key(world.spec());
+        self.ask.request(key, self.missed)
     }
 }
 
@@ -406,9 +459,9 @@ impl Host {
         missed: &[WorkerId],
         now: Instant,
     ) -> Result<Asked, Unplaced> {
-        let request = ask.request(missed);
+        let made = Made { ask, missed };
         let started = Instant::now();
-        let decided = Handle::decide(Arc::clone(&self.door), GATEWAY, &request, now);
+        let decided = Handle::decide_under(Arc::clone(&self.door), GATEWAY, &made, now);
         let seconds = started.elapsed().as_secs_f64();
         let decision = decided.as_ref().ok().map(Handle::decision);
         let trace = decision.map(Decision::trace);

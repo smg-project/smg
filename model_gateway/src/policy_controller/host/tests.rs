@@ -10,7 +10,7 @@ use std::{
 
 use axum::{
     body::to_bytes,
-    http::{header::RETRY_AFTER, StatusCode},
+    http::{header::RETRY_AFTER, HeaderMap, HeaderValue, StatusCode},
 };
 use futures::FutureExt;
 use kv_index::compute_request_content_hashes;
@@ -20,21 +20,84 @@ use smg_policy_controller::{
     decision::{Decision, Shed, ShedReason, Trace},
     door::Refused,
     lease::{ReleaseReason, TransportClass},
+    spec::{KeySourceSpec, RoutingKeySpec},
     store::{
-        BatchOutcome, KvEventSink, LeasesStore, LoadSink, LoadSource, MemoryStore, WorkerFacts,
-        WorkerStatus as RowStatus, WorkersStore, PUBLISH_WINDOW,
+        BatchOutcome, KvEventSink, LeasesStore, LoadSink, LoadSource, MemoryStore, SessionsStore,
+        WorkerFacts, WorkerStatus as RowStatus, WorkersStore, PUBLISH_WINDOW,
     },
-    view::LoadRow,
+    view::{fingerprint, Identity, LoadRow},
     AppliedSpec, PolicySpec,
 };
 use smg_worker::identity::basic::WorkerLoadGuard;
 
 use super::{
     left_no_worker, profile_of,
-    testing::{bed, cache_bed, store_blocks, MODEL},
+    testing::{bed, bed_under, cache_bed, store_blocks, MODEL},
     Ask, End, Hashes, Held, Prompt, Unplaced, GATEWAY,
 };
-use crate::observability::{cache_trace, metrics::test_support::render_with_recorder};
+use crate::{
+    config::{ManualAssignmentMode, PolicyConfig, RouterConfig},
+    observability::{cache_trace, metrics::test_support::render_with_recorder},
+};
+
+/// The workers of a keyed case.
+const URLS: [&str; 4] = [
+    "http://w0:8000",
+    "http://w1:8000",
+    "http://w2:8000",
+    "http://w3:8000",
+];
+
+/// The header a `manual` rule reads its key from, as the gateway's
+/// configuration names it where it names none.
+const KEY_HEADER: &str = "x-smg-routing-key";
+
+/// A request's headers with `key` under `name`.
+fn keyed(name: &'static str, key: &str) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    let key = HeaderValue::from_str(key).expect("a header's value");
+    headers.insert(name, key);
+    headers
+}
+
+/// A key's two parts, owned: a derived key borrows its document.
+fn owned(key: Identity<'_>) -> (u64, Option<String>) {
+    (key.hash, key.plain.map(str::to_owned))
+}
+
+/// A source that is the request header `name`.
+fn header(name: &str) -> KeySourceSpec {
+    KeySourceSpec {
+        header: Some(name.to_owned()),
+        ..KeySourceSpec::default()
+    }
+}
+
+/// Hands `store` the document of `policy` again, a generation later, with
+/// `block` as the sources of its binding's key: an operator's apply.
+fn name_sources(store: &MemoryStore, policy: PolicyConfig, block: RoutingKeySpec) {
+    let config = RouterConfig {
+        policy_controller: true,
+        policy,
+        ..RouterConfig::default()
+    };
+    let mut document = config.policy_document().expect("the routing's document");
+    document.generation += 1;
+    document.bindings[0].routing_key = Some(block);
+    let generation = config
+        .hosted_policy(&document)
+        .expect("a document the gateway hosts");
+    store.apply(generation).expect("a later generation");
+}
+
+/// The manual policy, its first worker drawn.
+fn manual() -> PolicyConfig {
+    PolicyConfig::Manual {
+        eviction_interval_secs: 60,
+        max_idle_secs: 14_400,
+        assignment_mode: ManualAssignmentMode::Random,
+    }
+}
 
 /// A first attempt's ask of the request `id`.
 pub(super) fn first(id: &[u8]) -> Ask<'_> {
@@ -42,6 +105,8 @@ pub(super) fn first(id: &[u8]) -> Ask<'_> {
         id,
         model: MODEL,
         streaming: false,
+        headers: None,
+        rid: None,
         tried: &[],
         hashes: None,
     }
@@ -408,7 +473,10 @@ async fn a_returning_prefix_lands_on_the_worker_that_holds_it() {
             hashes: Some(&hashes),
             ..first(b"returning")
         };
-        assert_eq!(returning.request(&[]).facts.block_size, block_size);
+        assert_eq!(
+            returning.request(Identity::NONE, &[]).facts.block_size,
+            block_size
+        );
     }
 }
 
@@ -639,4 +707,190 @@ fn a_pool_no_stage_emptied_reads_its_own_reason() {
         left_no_worker("healthy"),
         "the policy controller's healthy stage left no worker"
     );
+}
+
+#[tokio::test]
+async fn an_ask_states_the_key_its_bindings_sources_hold() {
+    let headers = keyed(KEY_HEADER, "conv-1");
+    let ask = Ask {
+        headers: Some(&headers),
+        ..first(b"request")
+    };
+    let (_, store, _) = bed_under(manual(), &URLS[..1]);
+    store.deciding(|world| {
+        let key = ask.key(world.spec());
+        assert_eq!(key, Identity::plain("conv-1"));
+        assert_eq!(ask.request(key, &[]).facts.session_key, key);
+        let bare = first(b"request");
+        assert_eq!(bare.key(world.spec()), Identity::NONE, "no header");
+    });
+    // A binding that names no source gives its requests no key.
+    let (_, store, _) = bed(&URLS[..1]);
+    store.deciding(|world| assert_eq!(ask.key(world.spec()), Identity::NONE));
+}
+
+#[tokio::test]
+async fn a_key_is_read_by_the_documents_sources_in_their_order() {
+    let (_, store, _) = bed_under(PolicyConfig::ConsistentHashing, &URLS[..1]);
+    let block = RoutingKeySpec {
+        sources: vec![
+            header("x-conversation"),
+            header(KEY_HEADER),
+            KeySourceSpec {
+                rid: true,
+                ..KeySourceSpec::default()
+            },
+        ],
+        strip_lineage: true,
+    };
+    name_sources(&store, PolicyConfig::ConsistentHashing, block);
+    // A header the view does not list leaves as its fingerprint alone.
+    let hashed = |key: &str| Identity::hashed(fingerprint(key.as_bytes()));
+    let key_of = |headers: Option<&HeaderMap>, rid: Option<&str>| {
+        let ask = Ask {
+            headers,
+            rid,
+            ..first(b"request")
+        };
+        store.deciding(|world| owned(ask.key(world.spec())))
+    };
+
+    let mut headers = keyed("x-conversation", "conv_t2_r1");
+    headers.insert(KEY_HEADER, HeaderValue::from_static("hint_t2"));
+    let rid = Some("rid-key_r1");
+    assert_eq!(key_of(Some(&headers), rid), owned(hashed("conv")));
+    headers.remove("x-conversation");
+    assert_eq!(key_of(Some(&headers), rid), owned(hashed("hint")));
+    assert_eq!(key_of(None, rid), owned(Identity::plain("rid-key")));
+    assert_eq!(key_of(Some(&HeaderMap::new()), None), owned(Identity::NONE));
+}
+
+#[tokio::test]
+async fn a_key_keeps_its_worker_across_requests_under_the_manual_policy() {
+    let (host, store, _) = bed_under(manual(), &URLS);
+    let now = Instant::now();
+    let headers = keyed(KEY_HEADER, "conv-1");
+    let ask = Ask {
+        headers: Some(&headers),
+        ..first(b"first")
+    };
+    let mut placed = host.place(&ask, now).await.expect("a worker");
+    placed.dispatched(now);
+    placed.completed(ok(), now);
+
+    for turn in 0..8u8 {
+        let mut next = host
+            .place(&Ask { id: &[turn], ..ask }, now)
+            .await
+            .expect("the pinned worker");
+        assert!(Arc::ptr_eq(placed.worker(), next.worker()));
+        assert_eq!(placed.id(), next.id());
+        next.dispatched(now);
+        next.completed(ok(), now);
+    }
+    assert_eq!(SessionsStore::len(&*store), 1);
+}
+
+#[tokio::test]
+async fn a_key_keeps_its_worker_under_consistent_hashing() {
+    let ring = PolicyConfig::ConsistentHashing;
+    let (host, store, _) = bed_under(ring.clone(), &URLS);
+    // The converter names no source for the ring yet: the document names
+    // the header here, as an operator's would.
+    let block = RoutingKeySpec {
+        sources: vec![header(KEY_HEADER)],
+        strip_lineage: false,
+    };
+    name_sources(&store, ring, block);
+    let now = Instant::now();
+    let headers = keyed(KEY_HEADER, "conv-1");
+    let ask = Ask {
+        headers: Some(&headers),
+        ..first(b"first")
+    };
+    let mut placed = host.place(&ask, now).await.expect("a worker");
+    placed.released(ReleaseReason::ClientGone, now);
+    for turn in 0..8u8 {
+        let mut next = host
+            .place(&Ask { id: &[turn], ..ask }, now)
+            .await
+            .expect("the ring's owner");
+        assert_eq!(placed.id(), next.id());
+        next.released(ReleaseReason::ClientGone, now);
+    }
+
+    let mut owners = BTreeSet::new();
+    for turn in 8..28u8 {
+        let (id, headers) = ([turn], keyed(KEY_HEADER, &format!("conv-{turn}")));
+        let ask = Ask {
+            headers: Some(&headers),
+            ..first(&id)
+        };
+        let mut placed = host.place(&ask, now).await.expect("a worker");
+        owners.insert(placed.id());
+        placed.released(ReleaseReason::ClientGone, now);
+    }
+    assert!(owners.len() >= 2, "ring owners: {owners:?}");
+    assert!(SessionsStore::is_empty(&*store));
+}
+
+#[tokio::test]
+async fn a_retry_of_a_key_steps_off_the_worker_it_tried() {
+    let headers = keyed(KEY_HEADER, "conv-1");
+    for urls in [&URLS[..2], &URLS[..1]] {
+        let (host, _, _) = bed_under(manual(), urls);
+        let ask = Ask {
+            headers: Some(&headers),
+            ..first(b"request")
+        };
+        let now = Instant::now();
+        let mut placed = host.place(&ask, now).await.expect("a worker");
+        placed.dispatched(now);
+        placed.completed(
+            End {
+                status: 503,
+                class: TransportClass::ServerError,
+                ..ok()
+            },
+            now,
+        );
+
+        let tried = [placed.id()];
+        let now = Instant::now();
+        let mut retry = host
+            .place(
+                &Ask {
+                    tried: &tried,
+                    ..ask
+                },
+                now,
+            )
+            .await
+            .expect("a worker for the retry");
+        assert_eq!(retry.id() == placed.id(), urls.len() == 1);
+        retry.dispatched(now);
+        retry.completed(ok(), now);
+    }
+}
+
+#[tokio::test]
+async fn a_key_whose_client_left_before_the_send_keeps_no_pin() {
+    let (host, store, _) = bed_under(manual(), &URLS);
+    let now = Instant::now();
+    let headers = keyed(KEY_HEADER, "conv-1");
+    let ask = Ask {
+        headers: Some(&headers),
+        ..first(b"left")
+    };
+    let mut placed = host.place(&ask, now).await.expect("a worker");
+    placed.released(ReleaseReason::ClientGone, now);
+    assert!(SessionsStore::is_empty(&*store));
+
+    let mut sent = host
+        .place(&Ask { id: b"sent", ..ask }, now)
+        .await
+        .expect("a worker");
+    sent.dispatched(now);
+    assert_eq!(SessionsStore::len(&*store), 1);
+    sent.completed(ok(), now);
 }

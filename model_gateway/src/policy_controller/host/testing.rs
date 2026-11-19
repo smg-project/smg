@@ -18,7 +18,7 @@ use smg_worker::identity::basic::Worker;
 
 use super::Host;
 use crate::{
-    config::RouterConfig,
+    config::{PolicyConfig, RouterConfig},
     policy_controller::start,
     routers::{common::snapshot::WorkerRegistry, grpc::backend_client::BasicWorkerBuilder},
 };
@@ -32,12 +32,18 @@ type Bed = (Host, Arc<MemoryStore>, Vec<Arc<dyn Worker>>);
 /// The store a start makes under the controller with one ready row a URL,
 /// a registry with one worker a URL, and the host over the two.
 pub(crate) fn bed(urls: &[&str]) -> Bed {
+    bed_under(RouterConfig::default().policy, urls)
+}
+
+/// [`bed`] where the gateway routes by `policy`.
+pub(crate) fn bed_under(policy: PolicyConfig, urls: &[&str]) -> Bed {
     let config = RouterConfig {
         policy_controller: true,
+        policy,
         ..RouterConfig::default()
     };
     let store = start(&config)
-        .expect("the start takes the default routing")
+        .expect("the start takes the routing")
         .expect("the controller was picked");
     bed_with(store, urls)
 }
