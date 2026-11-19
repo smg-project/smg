@@ -272,7 +272,7 @@ impl Door {
                 let laid = if mode == Mode::Replace {
                     Laid::Another
                 } else {
-                    facts.laid_over(&row.facts)
+                    row.laid(&facts)
                 };
                 match laid {
                     Laid::Unmoved => {
@@ -2212,15 +2212,37 @@ pub(crate) mod tests {
         };
         door.deregister(&operator(), under(TERM), &drain)
             .expect("draining");
-        // An upsert in place is the same registration: draining still.
-        let labelled = proto::WorkerSpec {
+        // A patch is the same registration: draining still.
+        let patch = proto::PatchWorkerRequest {
+            worker_id: row.id,
             labels: [("tier".to_owned(), "gold".to_owned())].into(),
-            ..unchecked(URL)
+            remove_labels: Vec::new(),
+            overload: None,
+            revision: row.revision,
         };
         let told = door
-            .register(&operator(), under(TERM), &ask(labelled, Mode::Upsert))
-            .expect("in place");
+            .relabel(&operator(), &Maker::Control, &patch)
+            .expect("patched");
         assert_eq!(row_of(&told).status, proto::WorkerStatus::Draining as i32);
+        // A registration over a draining row is the URL's next incarnation,
+        // by an upsert as by a replacement: the drain is not handed on, and
+        // an unchecked worker is ready from its own.
+        let told = door
+            .register(&operator(), under(TERM), &ask(unchecked(URL), Mode::Upsert))
+            .expect("registered anew");
+        let Some(Event::Replaced(replaced)) = told.event else {
+            panic!("a replacement: {told:?}");
+        };
+        assert!(!replaced.state_carried);
+        let anew = store.by_key(URL).expect("the new row");
+        assert_eq!(anew.status, WorkerStatus::Ready);
+        let drain = proto::DeregisterWorkerRequest {
+            worker_id: anew.id.0,
+            revision: anew.revision,
+            drain: true,
+        };
+        door.deregister(&operator(), under(TERM), &drain)
+            .expect("draining again");
         // The URL's next incarnation is another registration: the drain is
         // not handed on, and an unchecked worker is ready from its own.
         let told = door

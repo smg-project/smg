@@ -112,7 +112,9 @@ pub fn registration_at_door<H: WorkflowHost>(
 
 /// Build a removal that selects workers, marks their rows draining, waits
 /// for them to settle and removes their rows. The holder drops the objects
-/// when it follows the store.
+/// when it follows the store. The drain marks the row: routing reads the
+/// row's status, and the holder mirrors it onto the held object where it
+/// follows the store.
 pub fn removal_at_door<H: WorkflowHost>(
     door: Arc<dyn Membership>,
     objects: Arc<Objects<H::Generation>>,
@@ -209,16 +211,11 @@ impl<H: WorkflowHost> StepExecutor<WorkerRegistrationWorkflowData<H>> for WriteW
         Ok(StepResult::Success)
     }
 
+    /// A step's error carries text: the two fixed messages name the refusals
+    /// worth a second attempt.
     fn is_retryable(&self, error: &WorkflowError) -> bool {
-        no_leader(error)
-            || matches!(error, WorkflowError::StepFailed { message, .. } if message == MOVED)
+        matches!(error, WorkflowError::StepFailed { message, .. } if message == NOT_LEADING || message == MOVED)
     }
-}
-
-// Step errors carry text. Use a fixed message to recognize the refusal
-// without carrying the door's detail into the run.
-fn no_leader(error: &WorkflowError) -> bool {
-    matches!(error, WorkflowError::StepFailed { message, .. } if message == NOT_LEADING)
 }
 
 fn skipped(url: &str, why: &str) {
@@ -309,8 +306,10 @@ impl<H: WorkflowHost> StepExecutor<WorkerRemovalWorkflowData<H>>
         Ok(StepResult::Success)
     }
 
-    fn is_retryable(&self, error: &WorkflowError) -> bool {
-        no_leader(error)
+    /// One attempt a removal write, as the registry's: no refusal is tried
+    /// again here.
+    fn is_retryable(&self, _: &WorkflowError) -> bool {
+        false
     }
 }
 
@@ -362,8 +361,10 @@ impl<H: WorkflowHost> StepExecutor<WorkerRemovalWorkflowData<H>>
         Ok(StepResult::Success)
     }
 
-    fn is_retryable(&self, error: &WorkflowError) -> bool {
-        no_leader(error)
+    /// One attempt a removal write, as the registry's: no refusal is tried
+    /// again here.
+    fn is_retryable(&self, _: &WorkflowError) -> bool {
+        false
     }
 }
 
@@ -654,11 +655,7 @@ mod tests {
         let worker = worker(URL, "model");
         f.seed(&Maker::Control, worker.as_ref())
             .expect("registered");
-        let live = f.host.registry.get_by_url(URL).expect("the held worker");
-        let mut removal = f.removal(WorkerJobAsker::Api, vec![Arc::clone(&live)]);
-        f.drain().execute(&mut removal).await.expect("first drain");
-        let draining = f.store.by_key(URL).expect("the draining row");
-        assert_eq!(draining.status, WorkerStatus::Draining);
+        let standing = f.store.by_key(URL);
         let epoch = f.store.epoch();
 
         let mut cx = f.registration(WorkerJobAsker::Startup, vec![worker]);
@@ -666,12 +663,24 @@ mod tests {
             f.write().execute(&mut cx).await.expect("unchanged"),
             StepResult::Success
         );
-        assert_eq!(f.store.by_key(URL), Some(draining));
+        assert_eq!(f.store.by_key(URL), standing);
         assert_eq!(f.store.epoch(), epoch);
         assert_eq!(
             cx.data.workers.expect("the written URLs").worker_urls,
             [URL]
         );
+    }
+
+    #[tokio::test]
+    async fn a_row_already_draining_counts_as_drained_once_and_is_taken() {
+        let f = Fixture::new();
+        let worker = worker(URL, "model");
+        f.seed(&Maker::Control, worker.as_ref())
+            .expect("registered");
+        let live = f.host.registry.get_by_url(URL).expect("the held worker");
+        let mut removal = f.removal(WorkerJobAsker::Api, vec![Arc::clone(&live)]);
+        f.drain().execute(&mut removal).await.expect("first drain");
+        let epoch = f.store.epoch();
 
         f.drain()
             .execute(&mut removal)
@@ -682,6 +691,40 @@ mod tests {
         assert_eq!(f.store.epoch(), epoch);
         f.remove().execute(&mut removal).await.expect("removed");
         assert!(f.store.by_key(URL).is_none());
+    }
+
+    /// A source that says gone and then found inside the settle window: the
+    /// registration is another one, and the removal leaves its row.
+    #[tokio::test]
+    async fn a_worker_found_again_while_its_removal_settles_is_registered_anew_and_stays() {
+        let f = Fixture::new();
+        let worker = worker(URL, "model");
+        f.seed(&Maker::Control, worker.as_ref())
+            .expect("registered");
+        let live = f.host.registry.get_by_url(URL).expect("the held worker");
+        let mut removal = f.removal(WorkerJobAsker::Api, vec![live]);
+        f.drain().execute(&mut removal).await.expect("drained");
+        let draining = f.store.by_key(URL).expect("the draining row");
+        assert_eq!(draining.status, WorkerStatus::Draining);
+
+        // Equal facts, found again: the URL's next life, out of the drain.
+        let mut cx = f.registration(WorkerJobAsker::Startup, vec![worker]);
+        assert_eq!(
+            f.write().execute(&mut cx).await.expect("registered anew"),
+            StepResult::Success
+        );
+        let anew = f.store.by_key(URL).expect("the new row");
+        assert_ne!(anew.id, draining.id);
+        assert_ne!(anew.status, WorkerStatus::Draining);
+        assert_eq!(
+            cx.data.workers.expect("the written URLs").worker_urls,
+            [URL]
+        );
+
+        // The removal's guard names the row that left: the new one stays.
+        f.remove().execute(&mut removal).await.expect("skipped");
+        assert!(removal.data.removed_workers.is_empty());
+        assert_eq!(f.store.by_key(URL), Some(anew));
     }
 
     #[tokio::test]
@@ -747,42 +790,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_door_that_does_not_lead_fails_a_step_for_a_retry() {
+    async fn a_door_that_does_not_lead_fails_a_removal_step_with_no_second_attempt() {
         let f = Fixture::new();
         let built = worker(URL, "model");
         f.seed(&Maker::Control, built.as_ref()).expect("registered");
         let live = f.host.registry.get_by_url(URL).expect("the held worker");
-        let mut registration = f.registration(WorkerJobAsker::Api, vec![built]);
         let mut removal = f.removal(WorkerJobAsker::Api, vec![Arc::clone(&live)]);
 
         let door: Arc<dyn Membership> = Arc::new(Shut(Refused::NotLeading("follower".to_owned())));
-        let write = WriteWorkersAtDoor {
-            door: Arc::clone(&door),
-        };
-        let error = write
-            .execute(&mut registration)
-            .await
-            .expect_err("a follower");
-        assert!(StepExecutor::<Registration>::is_retryable(&write, &error));
-
         let drain = DrainWorkersAtDoor {
             door: Arc::clone(&door),
             ..f.drain()
         };
         let error = drain.execute(&mut removal).await.expect_err("a follower");
-        assert!(StepExecutor::<Removal>::is_retryable(&drain, &error));
+        assert!(!StepExecutor::<Removal>::is_retryable(&drain, &error));
         assert!(removal.data.drained_workers.is_empty());
 
         removal.data.drained_workers.push(live);
         let remove = RemoveWorkersAtDoor { door, ..f.remove() };
         let error = remove.execute(&mut removal).await.expect_err("a follower");
-        assert!(StepExecutor::<Removal>::is_retryable(&remove, &error));
+        assert!(!StepExecutor::<Removal>::is_retryable(&remove, &error));
         assert!(removal.data.removed_workers.is_empty());
     }
 
     #[tokio::test]
     async fn a_registration_retries_only_when_the_door_or_row_moved() {
         for (refusal, retryable) in [
+            (Refused::NotLeading("follower".to_owned()), true),
             (Refused::Moved, true),
             (Refused::Absent, false),
             (Refused::OutOfScope, false),
@@ -934,35 +968,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_row_that_moved_under_its_object_is_left() {
-        let f = Fixture::new();
-        let built = worker(URL, "model");
-        f.seed(&Maker::Control, built.as_ref()).expect("registered");
-        let live = f.host.registry.get_by_url(URL).expect("the held worker");
-        f.door
-            .found(&Maker::Control, URL, &|old| WorkerFacts {
-                priority: 5,
-                ..facts(built.as_ref(), old)
-            })
-            .expect("the row moved in place");
-
-        let row = f.store.by_key(URL);
-        let mut removal = f.removal(WorkerJobAsker::Api, vec![Arc::clone(&live)]);
-        assert_eq!(
-            f.drain().execute(&mut removal).await.expect("skipped"),
-            StepResult::Success
-        );
-        assert!(removal.data.drained_workers.is_empty());
-        removal.data.drained_workers.push(live);
-        assert_eq!(
-            f.remove().execute(&mut removal).await.expect("skipped"),
-            StepResult::Success
-        );
-        assert!(removal.data.removed_workers.is_empty());
-        assert_eq!(f.store.by_key(URL), row);
-    }
-
-    #[tokio::test]
     async fn a_removal_leaves_workers_without_a_row() {
         let f = Fixture::new();
         let live = worker(URL, "model");
@@ -1046,27 +1051,47 @@ mod tests {
         }
     }
 
+    /// A removal leaves a row its guard does not name: one that moved under
+    /// the held object, and another maker's.
     #[tokio::test]
-    async fn a_control_call_takes_no_providers_row() {
-        let f = Fixture::new();
-        let maker = Maker::provider("discovery", URL).expect("a provider's maker");
-        f.seed(&maker, worker(URL, "model").as_ref())
-            .expect("registered");
-        let live = f.host.registry.get_by_url(URL).expect("the held worker");
-        let row = f.store.by_key(URL);
-        let mut removal = f.removal(WorkerJobAsker::Api, vec![Arc::clone(&live)]);
-        assert_eq!(
-            f.drain().execute(&mut removal).await.expect("skipped"),
-            StepResult::Success
-        );
-        assert!(removal.data.drained_workers.is_empty());
-        removal.data.drained_workers.push(live);
-        assert_eq!(
-            f.remove().execute(&mut removal).await.expect("skipped"),
-            StepResult::Success
-        );
-        assert!(removal.data.removed_workers.is_empty());
-        assert_eq!(f.store.by_key(URL), row);
+    async fn a_removal_leaves_a_row_its_guard_does_not_name() {
+        type Setup = fn(&Fixture) -> Arc<dyn Worker>;
+        let moved: Setup = |f| {
+            let built = worker(URL, "model");
+            f.seed(&Maker::Control, built.as_ref()).expect("registered");
+            let live = f.host.registry.get_by_url(URL).expect("the held worker");
+            f.door
+                .found(&Maker::Control, URL, &|old| WorkerFacts {
+                    priority: 5,
+                    ..facts(built.as_ref(), old)
+                })
+                .expect("the row moved in place");
+            live
+        };
+        let anothers: Setup = |f| {
+            let maker = Maker::provider("discovery", URL).expect("a provider's maker");
+            f.seed(&maker, worker(URL, "model").as_ref())
+                .expect("registered");
+            f.host.registry.get_by_url(URL).expect("the held worker")
+        };
+        for setup in [moved, anothers] {
+            let f = Fixture::new();
+            let live = setup(&f);
+            let row = f.store.by_key(URL);
+            let mut removal = f.removal(WorkerJobAsker::Api, vec![Arc::clone(&live)]);
+            assert_eq!(
+                f.drain().execute(&mut removal).await.expect("skipped"),
+                StepResult::Success
+            );
+            assert!(removal.data.drained_workers.is_empty());
+            removal.data.drained_workers.push(live);
+            assert_eq!(
+                f.remove().execute(&mut removal).await.expect("skipped"),
+                StepResult::Success
+            );
+            assert!(removal.data.removed_workers.is_empty());
+            assert_eq!(f.store.by_key(URL), row);
+        }
     }
 
     #[tokio::test]
@@ -1074,8 +1099,7 @@ mod tests {
         let f = Fixture::new();
         let built = worker(URL, "model");
         f.seed(&Maker::Control, built.as_ref()).expect("registered");
-        let id = f.host.registry.get_id_by_url(URL).expect("the object id");
-        let live = f.host.registry.get(&id).expect("the held worker");
+        let live = f.host.registry.get_by_url(URL).expect("the held worker");
         let mut removal = f.removal(WorkerJobAsker::Api, vec![live]);
         f.drain().execute(&mut removal).await.expect("drained");
         assert_eq!(removal.data.drained_workers.len(), 1);
@@ -1090,8 +1114,8 @@ mod tests {
         let replacement = f
             .host
             .registry
-            .get(&id)
-            .expect("the replacement under the same id");
+            .get_by_url(URL)
+            .expect("the replacement at the URL");
         assert!(!Arc::ptr_eq(&replacement, &removal.data.drained_workers[0]));
         let row = f.store.by_key(URL);
         assert_eq!(
@@ -1100,6 +1124,9 @@ mod tests {
         );
         assert!(removal.data.removed_workers.is_empty());
         assert_eq!(f.store.by_key(URL), row);
+        // Other facts, found again: the row is out of the drain as well.
+        let status = row.map(|row| row.status);
+        assert_ne!(status, Some(WorkerStatus::Draining));
     }
 
     #[test]
@@ -1193,18 +1220,15 @@ mod tests {
                 dependency.map(StepId::new).into_iter().collect::<Vec<_>>()
             );
             assert!(step.depends_on_any.is_empty());
-            assert!(matches!(step.on_failure, FailureAction::FailWorkflow));
-            assert_eq!(
-                step.timeout,
-                if id == "settle_drained_workers" {
-                    None
-                } else {
-                    Some(Duration::from_secs(10))
-                }
-            );
-            let retry = step.retry_policy.as_ref().expect("one attempt");
-            assert_eq!(retry.max_attempts, 1);
-            assert!(matches!(retry.backoff, BackoffStrategy::Fixed(value) if value.is_zero()));
+            // The two writes at the door are this module's: ten seconds and
+            // one attempt each. The other two steps are the worker crate's.
+            if id.ends_with("_at_door") {
+                assert!(matches!(step.on_failure, FailureAction::FailWorkflow));
+                assert_eq!(step.timeout, Some(Duration::from_secs(10)));
+                let retry = step.retry_policy.as_ref().expect("one attempt");
+                assert_eq!(retry.max_attempts, 1);
+                assert!(matches!(retry.backoff, BackoffStrategy::Fixed(value) if value.is_zero()));
+            }
         }
     }
 }

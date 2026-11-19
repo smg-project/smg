@@ -127,7 +127,7 @@ pub(crate) fn lay(
 
     match &standing {
         None => facts.incarnation = turn.life()?,
-        Some(row) => match facts.laid_over(&row.facts) {
+        Some(row) => match row.laid(&facts) {
             Laid::Unmoved => return Ok(Wrote::Unmoved(row.id)),
             Laid::InPlace => {}
             Laid::Another => facts.incarnation = turn.life()?,
