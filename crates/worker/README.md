@@ -52,13 +52,15 @@ On this page:
 smg-worker = { workspace = true, features = ["runtime"] }
 ```
 
-That line is a host's: it asks for the runtime. Without `features`, a crate
-gets the default layer, the first row below. The default feature set is
-empty, so every other layer is asked for by name.
+That line is a host's, in a crate of this workspace. It asks for the runtime,
+and `workspace = true` takes the version from the workspace's root manifest. A
+crate outside the workspace names a version instead. The features are the
+same. Without `features`, a crate gets the default layer, the first row below.
+The default feature set is empty, so every other layer is asked for by name.
 
 | Feature | What it adds | Turns on | Pulls in | Who needs it |
 |---|---|---|---|---|
-| none | The wire types, the settings and label vocabulary, a worker's address and the overload thresholds. | | `bitflags`, `schemars`, `serde`, `serde_json`, `serde_with`, `url` | A crate that only reads or writes the types. `openai-protocol` re-exports them. |
+| none | The wire types, the settings and label vocabulary, a worker's address, the overload thresholds and the port between the KV event collector and a host's sink. | | `bitflags`, `schemars`, `serde`, `serde_json`, `serde_with`, `url` | A crate that only reads or writes the types. `openai-protocol` re-exports them. |
 | `axum` | The HTTP responses of the admin types. | | `axum` | A crate that answers the admin API. |
 | `metrics` | What the worker's metric writers share with a host's: the bounded label set, the one set of model labels and the handles a record keeps. | | `dashmap`, `rustc-hash` | A crate with metric writers of its own. `smg-external-router` is one. |
 | `proto` | `common_proto`: the Rust types of `proto/common.proto`. The build then runs `protoc`. | | `prost`, `prost-build` | A crate that speaks gRPC to an engine. `smg-grpc-client` is one. |
@@ -286,7 +288,7 @@ A port is a trait this crate calls and a host implements.
 |---|---|---|---|
 | `Generation` | `registry` | What it keeps of one membership generation. | The snapshot its routing reads. |
 | `EngineConnector` | `connection::engine` | How to connect a gRPC or ZMQ worker to its engine. | Its gRPC and ZMQ connector. |
-| `EngineConnection` | `connection::engine` | The calls the runtime makes on a connected engine: liveness, the health and load reads, the admin calls and the two pushed streams. | Its client of an engine. |
+| `EngineConnection` | `connection::engine` | The calls the runtime makes on a connected engine: liveness, the health and load reads, the admin calls, the read of the engine's KV transfer id and the two pushed streams. | Its client of an engine. |
 | `ConnectorDefault` | `connection::engine` | The connector a builder uses when it is handed none. | The same connector. |
 | `WorkerJobs` | `health::manager` | How to remove a failed worker, and how to read a worker's labels again. | Its job queue. |
 | `LoadConsumer` | `load::monitor` | Whether a reader wants loads, and how to trim what readers booked on a worker. | Its policy registry. |
@@ -353,5 +355,7 @@ is always there.
   module map with `src/lib.rs`, both ways. It fails on a feature or a module
   that one side holds and the other does not, and on a row whose features
   differ.
+- No test holds the ports table. A change that adds or removes a port edits
+  its row by hand.
 
 When either fails, change this page in the same pull request.
