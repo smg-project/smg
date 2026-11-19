@@ -62,7 +62,8 @@ use crate::{
     vllm::{
         fan_out_requests, has_media, kv_transfer_params, now_secs, ranked_candidate_count,
         refuse_greedy_choices, translate_media, translate_request_with_media,
-        translated_from_processed, ProcessedMedia, TranslatedMedia, VllmGenerateStream,
+        translated_from_processed, validate_token_ids, ProcessedMedia, TranslatedMedia,
+        VllmGenerateStream,
     },
 };
 
@@ -175,6 +176,9 @@ pub(crate) struct ZmqConnectionMeta {
     /// is the engine's `auto`, every kind taken
     /// ([`StructuredOutputsSupport::default`]).
     structured_outputs: OnceLock<StructuredOutputsSupport>,
+    /// The model's vocabulary size, set once by the caller that knows it (the
+    /// servicer); unset skips the out-of-vocab token-id checks.
+    vocab_size: OnceLock<u32>,
     /// The engine's supported tasks (`get_supported_tasks`), fetched on first
     /// use and kept for the connection, as vLLM's frontend keeps them.
     supported_tasks: tokio::sync::OnceCell<Arc<[String]>>,
@@ -434,6 +438,7 @@ impl ZmqEngineClient {
                 eos,
                 tokenizer_eos: OnceLock::new(),
                 structured_outputs: OnceLock::new(),
+                vocab_size: OnceLock::new(),
                 supported_tasks: tokio::sync::OnceCell::new(),
                 engine_truncates_long_prompts: OnceLock::new(),
                 engine_places_by_rendezvous_room: OnceLock::new(),
@@ -569,6 +574,21 @@ impl ZmqEngineClient {
             .request_timeout
             .get()
             .map(|timeout| RequestDeadline::after(*timeout))
+    }
+
+    /// Bound client-supplied token ids (prompt, `stop_token_ids`,
+    /// `logit_bias`) by the model's vocabulary, as vLLM's frontend does: an
+    /// out-of-range id reaching the engine faults the GPU. Zero leaves the
+    /// checks off.
+    pub fn set_vocab_size(&self, vocab_size: u32) {
+        if vocab_size > 0 {
+            let _ = self.meta.vocab_size.set(vocab_size);
+        }
+    }
+
+    /// The model's vocabulary size, once [`Self::set_vocab_size`] set it.
+    pub(crate) fn vocab_size(&self) -> Option<u32> {
+        self.meta.vocab_size.get().copied()
     }
 
     /// The tasks the engine's model runner serves (vLLM's
@@ -849,6 +869,11 @@ impl ZmqEngineClient {
         // On the request's own `n`: every sub below carries `n = 1`.
         if let Some(sp) = req.sampling_params.as_ref() {
             refuse_greedy_choices(sp).map_err(tonic::Status::invalid_argument)?;
+        }
+        // After the media translation, not before: an SHM payload must be read
+        // (and so unlinked) even when the request is then refused.
+        if let Some(vocab_size) = self.vocab_size() {
+            validate_token_ids(&req, vocab_size).map_err(tonic::Status::invalid_argument)?;
         }
         let subs = fan_out_requests(req);
         let last = subs.len().saturating_sub(1);
@@ -3164,6 +3189,59 @@ mod tests {
             None,
             "a request without a grammar carries nothing"
         );
+    }
+
+    /// Once the vocabulary is known, an out-of-vocab id is refused as
+    /// INVALID_ARGUMENT before any frame reaches the engine (where it would
+    /// fault the GPU); unset, the request goes through as before.
+    #[tokio::test]
+    async fn out_of_vocab_ids_never_reach_the_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let (client, mut engines) = connected_ranks(dir.path(), 1).await;
+        let request = || vllm::GenerateRequest {
+            request_id: "oov".to_string(),
+            input: Some(vllm::generate_request::Input::Tokenized(
+                vllm::TokenizedInput {
+                    original_text: String::new(),
+                    input_ids: vec![1, 2, 3],
+                },
+            )),
+            sampling_params: Some(vllm::SamplingParams {
+                max_tokens: Some(4),
+                logit_bias: [(999_999_999, 5.0)].into_iter().collect(),
+                ..Default::default()
+            }),
+            stream: true,
+            ..Default::default()
+        };
+
+        client.set_vocab_size(1000);
+        let Err(status) = client.generate_vllm_streams(request()).await else {
+            panic!("an out-of-vocab logit_bias key was accepted");
+        };
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert!(status.message().contains("[999999999] in logit_bias"));
+        let quiet = tokio::time::timeout(Duration::from_millis(200), engines[0].recv()).await;
+        assert!(
+            quiet.is_err(),
+            "a refused request reached the engine: {quiet:?}"
+        );
+
+        // The size is set once: a later zero (an unknown size) cannot clear it.
+        client.set_vocab_size(0);
+        assert!(client.generate_vllm_streams(request()).await.is_err());
+
+        let dir = tempfile::tempdir().unwrap();
+        let (unsized_client, mut engines) = connected_ranks(dir.path(), 1).await;
+        unsized_client.set_vocab_size(0);
+        let _streams = unsized_client
+            .generate_vllm_streams(request())
+            .await
+            .expect("an unknown vocabulary skips the check");
+        assert!(matches!(
+            engines[0].recv().await.expect("inbound"),
+            EngineInbound::Add(_)
+        ));
     }
 
     /// Answer each rank's next utility call with its entry in `answers`,

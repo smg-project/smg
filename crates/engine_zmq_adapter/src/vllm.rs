@@ -988,6 +988,75 @@ pub(crate) fn validate_sampling(sp: &vllm::SamplingParams, max_tokens: u32) -> R
     Ok(())
 }
 
+/// Refuse client-supplied token ids outside the model's vocabulary, as vLLM's
+/// frontend does in `InputProcessor` (prompt ids) and `SamplingParams.verify`
+/// (`stop_token_ids`, `logit_bias`) — checks the ZMQ path otherwise bypasses.
+/// They are not cosmetic: the engine uses these ids as indices into the
+/// embedding table and the logits tensor, so one out-of-range id is a CUDA
+/// illegal-address fault that takes down every DP rank of the engine.
+///
+/// Checked before translation folds the engine's EOS ids into the stop set
+/// (those are the server's, not the caller's). A caller that derives stop ids
+/// of its own before this (the servicer's single-token string stops and EOS
+/// backstop) drops any the model cannot sample, so a refusal names the
+/// caller's ids.
+///
+/// Stricter than vLLM in one case: vLLM bounds prompt ids by the larger of the
+/// model's and the tokenizer's vocabulary, because some multimodal models'
+/// placeholder tokens lie past the model's vocabulary (only those positions
+/// are masked out of the embedding lookup). This client knows only the
+/// model's size, so such a model's multimodal prompts are refused here rather
+/// than risk an unmasked text position past the table.
+pub(crate) fn validate_token_ids(
+    req: &vllm::GenerateRequest,
+    vocab_size: u32,
+) -> Result<(), String> {
+    if let Some(vllm::generate_request::Input::Tokenized(tokenized)) = &req.input {
+        validate_prompt_ids(&tokenized.input_ids, vocab_size)?;
+    }
+    let Some(sp) = req.sampling_params.as_ref() else {
+        return Ok(());
+    };
+    let bad = out_of_vocab(
+        sp.stop_token_ids.iter().map(|&id| i64::from(id)),
+        vocab_size,
+    );
+    if !bad.is_empty() {
+        return Err(format!(
+            "token_id(s) {bad:?} in stop_token_ids contain out-of-vocab token ids. \
+             Vocabulary size: {vocab_size}"
+        ));
+    }
+    let bad = out_of_vocab(sp.logit_bias.keys().map(|&id| i64::from(id)), vocab_size);
+    if !bad.is_empty() {
+        return Err(format!(
+            "token_id(s) {bad:?} in logit_bias contain out-of-vocab token ids. \
+             Vocabulary size: {vocab_size}"
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse a prompt id past the model's vocabulary, with vLLM's message
+/// (`InputProcessor`; see [`validate_token_ids`]). Prompt ids are unsigned, so
+/// only the upper bound applies.
+pub(crate) fn validate_prompt_ids(input_ids: &[u32], vocab_size: u32) -> Result<(), String> {
+    match input_ids.iter().copied().max() {
+        Some(max) if max >= vocab_size => Err(format!("Token id {max} is out of vocabulary")),
+        _ => Ok(()),
+    }
+}
+
+/// The ids outside `[0, vocab_size)`, sorted and deduplicated so the message
+/// is stable (`logit_bias` is a hash map).
+fn out_of_vocab(ids: impl Iterator<Item = i64>, vocab_size: u32) -> Vec<i64> {
+    let vocab = i64::from(vocab_size);
+    let mut bad: Vec<i64> = ids.filter(|&id| id < 0 || id >= vocab).collect();
+    bad.sort_unstable();
+    bad.dedup();
+    bad
+}
+
 /// The request's constraint as the shared refusal reads it
 /// ([`refuse_unenforceable_constraint`]): the proto `constraint` one-of by
 /// kind, with its text. `json_object = false` is an opt-out, no constraint.

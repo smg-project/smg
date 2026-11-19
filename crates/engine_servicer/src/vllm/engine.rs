@@ -34,6 +34,7 @@ pub(super) async fn connect_engine(state: Arc<State>, inputs: ConnectInputs) {
                 structured_outputs_backend_from_config(&state.model.structured_outputs_backend)
                     .into(),
             );
+            client.set_vocab_size(state.model.vocab_size);
             // Known at start: the wire reports every scheduler step while the
             // engine's statistics are on, before its first batch shows it.
             if state.model.log_stats == Some(true) {

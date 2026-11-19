@@ -553,6 +553,55 @@ fn kv_transfer_params_prefer_json_then_the_legacy_pair() {
         .contains("remote_host"));
 }
 
+/// Out-of-vocab ids fault the GPU (a `logit_bias` key of 999999999 indexes
+/// past the logits tensor and raises a CUDA illegal-address error on the
+/// rank), so they are refused with vLLM's own messages; in-vocab ids pass.
+#[test]
+fn out_of_vocab_token_ids_are_refused() {
+    const VOCAB: u32 = 1000;
+    let ok = tokenized_req(vllm::SamplingParams {
+        stop_token_ids: vec![0, 999],
+        logit_bias: [(0, 1.0), (999, -5.0)].into_iter().collect(),
+        ..Default::default()
+    });
+    assert_eq!(validate_token_ids(&ok, VOCAB), Ok(()));
+
+    let bias = tokenized_req(vllm::SamplingParams {
+        logit_bias: [(5, 1.0), (999_999_999, 5.0)].into_iter().collect(),
+        ..Default::default()
+    });
+    let error = validate_token_ids(&bias, VOCAB).unwrap_err();
+    assert!(error.contains("[999999999] in logit_bias"), "{error}");
+    assert!(error.contains("Vocabulary size: 1000"), "{error}");
+
+    let negative = tokenized_req(vllm::SamplingParams {
+        logit_bias: [(-1, 1.0)].into_iter().collect(),
+        ..Default::default()
+    });
+    assert!(validate_token_ids(&negative, VOCAB)
+        .unwrap_err()
+        .contains("[-1] in logit_bias"));
+
+    let stop = tokenized_req(vllm::SamplingParams {
+        stop_token_ids: vec![1000, 7, 1000],
+        ..Default::default()
+    });
+    assert!(validate_token_ids(&stop, VOCAB)
+        .unwrap_err()
+        .contains("[1000] in stop_token_ids"));
+
+    let mut prompt = tokenized_req(vllm::SamplingParams::default());
+    if let Some(vllm::generate_request::Input::Tokenized(t)) = prompt.input.as_mut() {
+        t.input_ids = vec![1, 4000, 2];
+    }
+    assert_eq!(
+        validate_token_ids(&prompt, VOCAB).unwrap_err(),
+        "Token id 4000 is out of vocabulary"
+    );
+    assert_eq!(validate_prompt_ids(&[0, 999], VOCAB), Ok(()));
+    assert_eq!(validate_prompt_ids(&[], VOCAB), Ok(()));
+}
+
 #[test]
 fn kv_transfer_params_ride_the_sampling_extra_args() {
     let mut req = tokenized_req(vllm::SamplingParams::default());
