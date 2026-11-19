@@ -3575,6 +3575,12 @@ impl Writer {
         self.owed.is_some() && self.due().is_some_and(|due| now >= due)
     }
 
+    /// Whether a membership write left a build owed that none has paid:
+    /// the standing pools then list no member written since their build.
+    pub(super) fn owes(&self) -> bool {
+        self.owed.is_some()
+    }
+
     /// Whether the member `id` waits at `rank` for a build: a membership
     /// write left one owed and no row of the member stands at the rank, by
     /// the walk a load write folds a rank's record with ([`rows_at`]). A
