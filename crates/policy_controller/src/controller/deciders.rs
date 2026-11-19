@@ -4330,6 +4330,9 @@ pub(crate) mod tests {
                 assert_eq!(engine.needs_for(MODEL, Phase::Decode).sample, 16);
                 assert_eq!(engine.sample_for(MODEL, Phase::Decode), own);
                 assert_eq!(engine.named_for(MODEL, Phase::Decode), named);
+                // No binding of this document covers an encode item: no row
+                // is named for one, whatever its profiles cap.
+                assert_eq!(engine.named_for(MODEL, Phase::Encode), 0);
                 let rule = engine.warm_rule_for(MODEL, Phase::Decode);
                 assert_eq!(rule.is_some(), ruled);
             });
