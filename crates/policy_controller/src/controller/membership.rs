@@ -40,6 +40,12 @@
 //! whoever made the row. The control scope's three calls are a control
 //! call's; a provider's step writes through the same turn.
 //!
+//! **A provider takes a worker away by its URL.** It holds the URL and no id
+//! or revision of an earlier answer. The door reads the standing row in its
+//! turn, tests the maker whole and removes the row. Only the row of exactly
+//! that maker goes: a late or a repeated removal never takes a later worker
+//! at the URL.
+//!
 //! **Every life of a URL has a number of its own:** the leader's term above the
 //! store's epoch when the door numbered it, counted from a base the door
 //! draws once a run. The store's id is a function of the URL and that
@@ -100,16 +106,24 @@ fn moved() -> Status {
 }
 
 /// A write of a row by a caller that did not make it. The words name the
-/// row's maker, never its URL.
+/// row's maker by its provider, never by its key, and never the URL. A
+/// caller of that provider under another key is told so: where a new worker
+/// took an address, its provider takes the old one away by the old key.
 fn made_by(row: &WorkerRow, caller: &Maker) -> Result<(), Status> {
     if row.maker == *caller {
         return Ok(());
     }
-    Err(Status::permission_denied(match &row.maker {
-        Maker::Control => {
+    Err(Status::permission_denied(match (&row.maker, caller) {
+        (Maker::Control, _) => {
             "the row was made by a control call: its maker alone changes it".to_owned()
         }
-        Maker::Provider(found) => {
+        (Maker::Provider(found), Maker::Provider(own)) if found.provider() == own.provider() => {
+            let provider = found.provider();
+            format!(
+                "the row is provider {provider}'s under another key: that key's caller changes it"
+            )
+        }
+        (Maker::Provider(found), _) => {
             let provider = found.provider();
             format!(
                 "the row is provider {provider}'s: its worker is changed at the provider's source"
@@ -123,6 +137,9 @@ fn made_by(row: &WorkerRow, caller: &Maker) -> Result<(), Status> {
 const REGISTER: &str = "RegisterWorker";
 const PATCH: &str = "PatchWorker";
 const DEREGISTER: &str = "DeregisterWorker";
+/// A provider's removal by URL, as an audit line says it: no call of the
+/// contract has the name.
+const TAKEN_AWAY: &str = "a provider's removal";
 
 /// The low bits of a life's number hold the store's epoch, counted from the
 /// door's base; the leader's term stands above them.
@@ -438,6 +455,41 @@ impl Door {
         };
         let epoch = self.store.epoch();
         Ok(told(DEREGISTER, by, event, wrote, epoch, self.place()))
+    }
+
+    /// A provider's removal of a worker it finds no more, by the row's URL,
+    /// from `by` under the term `leading` reads. A provider holds the URL
+    /// and no id or revision of an earlier answer.
+    ///
+    /// The standing row is read by its URL in the door's turn, its maker is
+    /// tested whole and the row is removed. So the call takes away only the
+    /// row of exactly `maker`: a late or a repeated removal never takes a
+    /// later worker at the URL, which another key made. No row under the
+    /// URL is `NOT_FOUND`, and the caller reads that as done.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the registration workflow's removal step is its caller"
+        )
+    )]
+    pub(crate) fn remove_found(
+        &self,
+        by: &Principal,
+        maker: &Maker,
+        leading: impl FnOnce() -> Result<u64, Status>,
+        url: &str,
+    ) -> Result<proto::WorkerEvent, Status> {
+        self.call(TAKEN_AWAY, by, leading, |_| {
+            let standing = self.store.by_key(url).ok_or_else(absent)?;
+            made_by(&standing, maker)?;
+            self.store
+                .remove(standing.id, standing.revision)
+                .ok_or_else(moved)?;
+            let epoch = self.store.epoch();
+            let event = worker_wire::removed(&standing);
+            Ok(told(TAKEN_AWAY, by, event, true, epoch, self.place()))
+        })
     }
 
     /// The row under `id` when `maker` made it and `revision` is the one it
@@ -1292,6 +1344,76 @@ pub(crate) mod tests {
             .expect_err("past the bound");
         assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
         assert!(status.message().starts_with("labels:"), "{status:?}");
+    }
+
+    #[test]
+    fn a_provider_takes_away_by_url_only_the_row_it_made() {
+        let (store, door) = door();
+        let maker = found("pods/a");
+        let made = row_of(
+            &door
+                .upsert(&operator(), &maker, TERM, &ask(spec(URL), Mode::Upsert))
+                .expect("found"),
+        );
+        let other = "grpc://10.0.0.6:8000";
+        door.register(&operator(), under(TERM), &ask(spec(other), Mode::Add))
+            .expect("registered");
+        let epoch = store.epoch();
+        let denied = |answer: Result<proto::WorkerEvent, Status>, whose: &str| {
+            let status = answer.expect_err("refused");
+            assert_eq!(status.code(), Code::PermissionDenied, "{status:?}");
+            assert!(status.message().contains(whose), "{status:?}");
+            assert!(!status.message().contains("10.0.0"), "no URL: {status:?}");
+            assert!(!status.message().contains("pods/"), "no key: {status:?}");
+        };
+        // Another maker's row stays: a control call's, and this provider's
+        // own under another key, which is told so.
+        denied(
+            door.remove_found(&operator(), &maker, under(TERM), other),
+            "a control call",
+        );
+        denied(
+            door.remove_found(&operator(), &found("pods/b"), under(TERM), URL),
+            "provider cluster's under another key",
+        );
+        // No row under the URL is not found, and a replica that does not
+        // lead refuses by name. None of the four wrote.
+        let none = door
+            .remove_found(&operator(), &maker, under(TERM), "grpc://10.0.0.9:8000")
+            .expect_err("no row");
+        assert_eq!(none.code(), Code::NotFound, "{none:?}");
+        let follower = || -> Result<u64, Status> {
+            Err(Status::failed_precondition("this replica does not lead"))
+        };
+        let refused = door
+            .remove_found(&operator(), &maker, follower, URL)
+            .expect_err("a follower");
+        assert_eq!(refused.code(), Code::FailedPrecondition, "{refused:?}");
+        assert_eq!(store.epoch(), epoch);
+        // The maker's own call takes the row away and answers it removed.
+        let told = door
+            .remove_found(&operator(), &maker, under(TERM), URL)
+            .expect("taken away");
+        assert!(matches!(told.event, Some(Event::Removed(_))));
+        assert!(store.get(WorkerId(made.id)).is_none());
+        assert_eq!(store.epoch(), epoch + 1);
+        // A new worker takes the address under another key: the old key's
+        // late or repeated removal leaves it.
+        let again = row_of(
+            &door
+                .upsert(
+                    &operator(),
+                    &found("pods/c"),
+                    TERM,
+                    &ask(spec(URL), Mode::Upsert),
+                )
+                .expect("found again"),
+        );
+        denied(
+            door.remove_found(&operator(), &maker, under(TERM), URL),
+            "provider cluster's under another key",
+        );
+        assert!(store.get(WorkerId(again.id)).is_some());
     }
 
     #[test]
