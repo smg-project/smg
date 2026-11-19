@@ -11,13 +11,14 @@
 //! one, so the most files a host names, 256, take a sixteenth of the
 //! counter at their first ids and leave the term its span.
 //!
-//! A claim is one atomic step of the term's block count, made under the
-//! claiming file's turn, and the block's byte is written before the
-//! block's first id leaves that turn. The blocks are claimed in their
-//! order: one file mints the counter from 1 on, as it did before the
-//! blocks, and three quarters of the counter, the term's mark, is the
-//! claim of block 3,072. The claim past the last block fails: the term is
-//! spent.
+//! A claim is made under the claiming file's turn, one claim at a time:
+//! the block's byte is written, then the term's block count steps past
+//! it. So a count that covers a block finds its byte written, and what
+//! asks whether an id's file is settled reads the count first
+//! ([`Blocks::settled`]). The blocks are claimed in their order: one file
+//! mints the counter from 1 on, as it did before the blocks, and three
+//! quarters of the counter, the term's mark, is the claim of block 3,072.
+//! The claim past the last block fails: the term is spent.
 //!
 //! An id's file never changes while its lease can be on file. A rise of
 //! the term starts the blocks again under the new term and keeps the table
@@ -27,6 +28,13 @@
 //! id names its file by one rule ([`Blocks::file_of`]): an id of the
 //! leading term by the leading table, an id of a kept term by that term's
 //! table, any other id by its block modulo the files.
+//!
+//! A term past 31 bits leads no table ([`Blocks::rise`]): the mint serves
+//! no id under it, and the blocks stay as the last term below it left
+//! them. So a gateway's own id, whose upper half reads as such a term,
+//! names its block's file whatever term the store reaches. From then on
+//! no block is claimed and no term leads the blocks anew: every id names
+//! for good the file it reads.
 //!
 //! The law covers the ids this replica mints and the ids of terms that
 //! led. An id of the leading term that some other door filed stands in a
@@ -39,12 +47,13 @@
 use std::{
     cmp,
     sync::{
-        atomic::{AtomicU64, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
         Arc,
     },
 };
 
 use arc_swap::ArcSwap;
+use parking_lot::Mutex;
 
 use crate::lease::LeaseId;
 
@@ -69,14 +78,22 @@ const KEPT: u64 = 1 << (u32::BITS - 1);
 #[derive(Debug)]
 pub(super) struct Blocks {
     /// The leading term over the blocks claimed under it, [`KEPT`] between
-    /// the two. One word: a claim is one atomic step, and counts under no
-    /// term but the leading.
+    /// the two. One word, written under the claims' lock: a claim counts
+    /// under no term but the leading.
     claimed: AtomicU64,
     /// Each block's file under the leading term, written by the block's
     /// claim and cleared by a rise, in place.
     files: [AtomicU8; BLOCKS as usize],
     /// The tables kept, the newest first: replaced whole by a rise.
     kept: ArcSwap<Vec<Kept>>,
+    /// Held by a claim from its block's byte to the count's step, and by a
+    /// rise: one claim at a time, and none beside a rise.
+    claims: Mutex<()>,
+    /// Whether the store's term is past 31 bits: set by a rise, under the
+    /// claims' lock, and never cleared. From then on no block is claimed
+    /// and no term leads the blocks anew, so every id names for good the
+    /// file it reads.
+    past: AtomicBool,
 }
 
 /// The table a term left at the rise past it, kept while a lease of the
@@ -93,14 +110,16 @@ impl Default for Blocks {
             claimed: AtomicU64::new(0),
             files: [const { AtomicU8::new(0) }; BLOCKS as usize],
             kept: ArcSwap::from_pointee(Vec::new()),
+            claims: Mutex::new(()),
+            past: AtomicBool::new(false),
         }
     }
 }
 
 impl Blocks {
     /// The word of `term` with no block claimed and no table kept. A term
-    /// past 32 bits takes the greatest word: the mint refuses a term past
-    /// 31 bits, so no claim is made under it.
+    /// past 32 bits takes the greatest word: no table leads a term past 31
+    /// bits, so no claim is made under it.
     fn word(term: u64) -> u64 {
         u64::from(u32::try_from(term).unwrap_or(u32::MAX)) << u32::BITS
     }
@@ -123,22 +142,25 @@ impl Blocks {
     }
 
     /// Claims the next block of `term`'s counter for `file`, under that
-    /// file's turn: the block's number, its byte written. `None` where
-    /// `term` does not lead the blocks or its last block is claimed: the
-    /// file mints no further id under it.
+    /// file's turn: the block's number. The block's byte is written and
+    /// then the count steps past it, one claim at a time, so a count that
+    /// covers a block finds its byte written ([`Self::settled`]). `None`
+    /// where `term` does not lead the blocks, its last block is claimed or
+    /// the store's term is past 31 bits: the file mints no further id
+    /// under it.
     #[cfg(any(test, feature = "controller"))]
     pub(super) fn claim(&self, term: u64, file: u8) -> Option<u16> {
-        let leading = Self::word(term);
-        let next = |word: u64| {
-            let claimed = (word & !KEPT).checked_sub(leading)?;
-            (claimed < u64::from(BLOCKS)).then_some(word + 1)
-        };
-        let claimed = &self.claimed;
-        let word = claimed.try_update(Ordering::Relaxed, Ordering::Relaxed, next);
+        let _one = self.claims.lock();
+        if self.past.load(Ordering::Acquire) {
+            return None;
+        }
+        let word = self.claimed.load(Ordering::Acquire);
         // The blocks claimed before this one are its number.
-        let block = u16::try_from((word.ok()? & !KEPT) - leading).ok()?;
+        let claimed = (word & !KEPT).checked_sub(Self::word(term))?;
+        let block = u16::try_from(claimed).ok()?;
         let named = self.files.get(usize::from(block))?;
         named.store(file, Ordering::Release);
+        self.claimed.store(word + 1, Ordering::Release);
         Some(block)
     }
 
@@ -149,7 +171,18 @@ impl Blocks {
     /// kept tables are told first, then the word, and the bytes are
     /// cleared last: a read that meets the rise finds the leaving term's
     /// table among the kept ([`Self::file_of`]).
+    ///
+    /// A term past 31 bits leads no table, and the blocks stay as they
+    /// stand for good: the mint serves no id under it, and an id whose
+    /// upper half reads as that term, a gateway's own, goes on naming its
+    /// block's file. No block is claimed from then on and no term leads
+    /// the blocks anew, so every id's file is settled ([`Self::settled`]).
     pub(super) fn rise(&self, term: u64, on_file: impl Iterator<Item = LeaseId>) {
+        let _one = self.claims.lock();
+        if term >= 1 << 31 {
+            self.past.store(true, Ordering::Release);
+            return;
+        }
         let leaving = self.claimed.load(Ordering::Acquire) >> u32::BITS;
         let before = self.kept.load();
         // The terms a table can be kept for, and whether a lease on file
@@ -225,29 +258,46 @@ impl Blocks {
         Self::among(named.map_or(block, |named| u16::from(*named)), files)
     }
 
-    /// Whether the file `lease` names among `files` of them is settled:
-    /// the one it names for as long as a lease can be on file under it. An
-    /// id of the leading term is settled from a block a file claimed, and
-    /// an id of a term below it wherever it reads its file: no claim and
-    /// no rise writes either anew while its lease is on file. An id of the
-    /// leading term from a block no file claimed is not, since the block's
-    /// claim names its file anew, and neither is an id of a term that can
-    /// still lead. No block is claimed under a term past 31 bits, and with
-    /// one file every id names it: both are settled. Asked under the turn
-    /// of the file the id names, which no rise passes.
-    pub(super) fn settled(&self, lease: LeaseId, files: usize) -> bool {
-        let term = Self::term_of(lease);
-        if files <= 1 || term >= 1 << 31 {
-            return true;
+    /// The file `lease` names for good among `files` of them: the one it
+    /// names for as long as a lease can be on file under it. `None` where
+    /// its file is not settled. An id of the leading term is settled from
+    /// a block a file claimed: the count is read first and the block's
+    /// byte behind it, the other way round from a claim's writes, so a
+    /// block the count covers reads its own file's byte. An id of a term
+    /// below the leading one is settled wherever it reads its file: no
+    /// claim and no rise writes either anew while its lease is on file.
+    /// An id of the leading term from a block no file claimed is not,
+    /// since the block's claim names its file anew, and neither is an id
+    /// of a term that can still lead: until the store's term is past 31
+    /// bits, when no claim and no rise follows and both are settled where
+    /// they read their file. An id of a term past 31 bits names its
+    /// block's file, as no table leads such a term, and with one file
+    /// every id names it: both are settled. Asked under a file's turn,
+    /// which no rise passes.
+    pub(super) fn settled(&self, lease: LeaseId, files: usize) -> Option<usize> {
+        let (term, block) = (Self::term_of(lease), Self::block_of(lease));
+        if files <= 1 {
+            return Some(0);
+        }
+        if term >= 1 << 31 {
+            return Some(Self::among(block, files));
         }
         let word = self.claimed.load(Ordering::Acquire);
-        match term.cmp(&(word >> u32::BITS)) {
-            cmp::Ordering::Less => true,
-            // The blocks claimed under the leading term: the word below
-            // the kept bit.
-            cmp::Ordering::Equal => u64::from(Self::block_of(lease)) < word & (KEPT - 1),
-            cmp::Ordering::Greater => false,
-        }
+        let settled = match term.cmp(&(word >> u32::BITS)) {
+            cmp::Ordering::Less => Some(self.file_of(lease, files)),
+            cmp::Ordering::Equal => {
+                // The blocks claimed under the leading term: the word
+                // below the kept bit.
+                let claimed = u64::from(block) < word & (KEPT - 1);
+                let named = self.files.get(usize::from(block)).filter(|_| claimed);
+                named.map(|named| Self::among(named.load(Ordering::Acquire).into(), files))
+            }
+            cmp::Ordering::Greater => None,
+        };
+        // Past 31 bits no claim and no rise follows: the file an id reads
+        // is its file for good.
+        let past = || self.past.load(Ordering::Acquire);
+        settled.or_else(|| past().then(|| self.file_of(lease, files)))
     }
 
     /// The terms whose tables are kept, the newest first.
@@ -554,20 +604,26 @@ mod tests {
         assert_eq!(file.mint(&blocks, 9, 3), Some(1));
         let own = LeaseId(1 << 63 | u64::from(6 * BLOCK));
         for settled in [id(9, 1), id(9, BLOCK - 1), id(3, 5 * BLOCK), own] {
-            assert!(blocks.settled(settled, 4), "{settled:?}");
+            let named = Some(blocks.file_of(settled, 4));
+            assert_eq!(blocks.settled(settled, 4), named, "{settled:?}");
         }
         for open in [id(9, BLOCK), id(9, 5 * BLOCK + 17), id(10, 1)] {
-            assert!(!blocks.settled(open, 4), "{open:?}");
-            assert!(blocks.settled(open, 1), "one file: {open:?}");
+            assert_eq!(blocks.settled(open, 4), None, "{open:?}");
+            assert_eq!(blocks.settled(open, 1), Some(0), "one file: {open:?}");
         }
         // The claim of the second block settles its ids, and a rise leaves
         // the term below the leading one.
         let mut other = Minted::default();
         assert_eq!(other.mint(&blocks, 9, 2), Some(BLOCK));
-        assert!(blocks.settled(id(9, BLOCK), 4));
+        assert_eq!(blocks.settled(id(9, BLOCK), 4), Some(2));
         blocks.rise(10, std::iter::empty());
-        assert!(blocks.settled(id(9, 5 * BLOCK + 17), 4));
-        assert!(!blocks.settled(id(10, 1), 4));
+        assert_eq!(blocks.settled(id(9, 5 * BLOCK + 17), 4), Some(1));
+        assert_eq!(blocks.settled(id(10, 1), 4), None);
+        // A table kept is no block claimed: the next term's first block
+        // is no file's.
+        blocks.rise(11, [id(10, 1)].into_iter());
+        assert_eq!(blocks.kept_terms(), [10]);
+        assert_eq!(blocks.settled(id(11, 1), 4), None);
     }
 
     /// A block's number is past a byte. A block behind the first 256 names
@@ -591,11 +647,11 @@ mod tests {
         assert_eq!(blocks.file_of(lease, 3), 1, "its number, 301, among 3");
     }
 
-    /// A claim is one atomic step of the block count: two files that claim
-    /// at once take the blocks of a term between them, each block
-    /// once, whichever of them takes it. Every wait ends at the case's
-    /// bound and a file claims no more than two terms' blocks: a claim
-    /// that never fails, or a claimer that leaves, fails the case.
+    /// One claim is made at a time: two files that claim at once take the
+    /// blocks of a term between them, each block once, whichever of them
+    /// takes it. Every wait ends at the case's bound and a file claims no
+    /// more than two terms' blocks: a claim that never fails, or a claimer
+    /// that leaves, fails the case.
     #[test]
     fn two_files_that_claim_at_once_take_each_block_once() {
         const TERMS: u64 = 200;
@@ -686,5 +742,118 @@ mod tests {
             reader.join().expect("the reader ends")
         });
         assert_eq!(wrong, 0, "an id read by a table that is not its term's");
+    }
+
+    /// A count that covers a block finds its byte written: a claim writes
+    /// the byte and then steps the count, and what asks whether an id's
+    /// file is settled reads the count first. Beside a file that claims a
+    /// term's blocks a reader asks of the block the count covered last and
+    /// of the next one: the first is the claiming file's, the next is not
+    /// settled or is the claiming file's, and neither is the one a cleared
+    /// byte names. On one core a reader seldom lands inside a claim, and
+    /// the case never fails a right read.
+    #[test]
+    fn a_block_under_claim_is_not_settled_before_its_byte_is_written() {
+        const ROUNDS: usize = 32;
+        let round = || {
+            let blocks = Blocks::default();
+            let (reads, done) = (AtomicBool::new(false), AtomicBool::new(false));
+            thread::scope(|scope| {
+                let reader = scope.spawn(|| {
+                    let mut wrong = 0_u64;
+                    let file = |block: u32| blocks.settled(id(0, block << BLOCK_BITS | 1), 4);
+                    while !done.load(Ordering::Acquire) {
+                        let next = blocks.claimed.load(Ordering::Acquire) as u32;
+                        if let Some(last) = next.checked_sub(1) {
+                            wrong += u64::from(file(last) != Some(3));
+                        }
+                        if next < BLOCKS {
+                            wrong += u64::from(!matches!(file(next), None | Some(3)));
+                        }
+                        reads.store(true, Ordering::Release);
+                    }
+                    wrong
+                });
+                while !reads.load(Ordering::Acquire) {
+                    thread::yield_now();
+                }
+                // A term's blocks and no more: a claim that never fails
+                // ends at twice as many.
+                let claims = std::iter::from_fn(|| blocks.claim(0, 3));
+                let claims = claims.take(2 * BLOCKS as usize).count();
+                done.store(true, Ordering::Release);
+                let wrong = reader.join().expect("the reader ends");
+                assert_eq!(claims, BLOCKS as usize, "a term's blocks, each once");
+                wrong
+            })
+        };
+        let wrong: u64 = (0..ROUNDS).map(|_| round()).sum();
+        assert_eq!(wrong, 0, "a block read as settled under a cleared byte");
+    }
+
+    /// A term past 31 bits leads no table, the least such term as any
+    /// above it: the mint serves no id under it and no block is claimed.
+    /// A gateway's own id, whose upper half reads as such a term, names
+    /// its block's file before the store reaches that term, under it and
+    /// behind it, and an id of the last term below it goes on reading
+    /// that term's table. From then on every id is settled where it reads
+    /// its file: no block is claimed and no term leads anew.
+    #[test]
+    fn a_term_past_31_bits_leads_no_table() {
+        for past in [1 << 31, 1 << 31 | 5] {
+            let blocks = Blocks::default();
+            blocks.rise(4, std::iter::empty());
+            assert_eq!(Minted::default().mint(&blocks, 4, 2), Some(1));
+            let (own, held) = (id(past, 7 * BLOCK + 9), id(4, 1));
+            let files = || (blocks.file_of(own, 3), blocks.file_of(held, 3));
+            assert_eq!(files(), (1, 2), "ahead of {past:#x}");
+            // Not settled ahead of it: a block of the leading term that no
+            // file claimed, and a term that can still lead.
+            let open = [id(4, 5 * BLOCK + 3), id(9, 5 * BLOCK + 3)];
+            let settled = || open.map(|open| blocks.settled(open, 3));
+            assert_eq!(settled(), [None, None]);
+            blocks.rise(past, [own, held].into_iter());
+            assert_eq!(files(), (1, 2), "under {past:#x}");
+            assert_eq!((blocks.claim(past, 0), blocks.claim(4, 0)), (None, None));
+            let named = (blocks.settled(own, 3), blocks.settled(held, 3));
+            assert_eq!(named, (Some(1), Some(2)));
+            // No claim and no rise follows: each is settled where it reads
+            // its file, the cleared byte and the block's number among 3.
+            assert_eq!(settled(), [Some(0), Some(2)]);
+            assert!(blocks.kept_terms().is_empty());
+            blocks.rise(past + 1, [own, held].into_iter());
+            assert_eq!(files(), (1, 2), "behind {past:#x}");
+            assert_eq!(settled(), [Some(0), Some(2)]);
+        }
+    }
+
+    /// A claim and a rise never write the word beside each other: a claim
+    /// that read the word ahead of a rise would write the leaving term
+    /// back over the risen one. A file claims under whatever term leads
+    /// while the term rises: each rise finds the term the rise before it
+    /// wrote, and the last one stands. On one core a claim seldom meets a
+    /// rise, and the case never fails a right write.
+    #[test]
+    fn a_claim_beside_a_rise_leaves_the_risen_term() {
+        const TERMS: u64 = 500;
+        let blocks = Blocks::default();
+        let leading = || blocks.claimed.load(Ordering::Acquire) >> u32::BITS;
+        let done = AtomicBool::new(false);
+        let back = thread::scope(|scope| {
+            scope.spawn(|| {
+                while !done.load(Ordering::Acquire) {
+                    blocks.claim(leading(), 1);
+                }
+            });
+            let back = (1..=TERMS).filter(|&term| {
+                let back = leading() != term - 1;
+                blocks.rise(term, std::iter::empty());
+                back
+            });
+            let back = back.count();
+            done.store(true, Ordering::Release);
+            back
+        });
+        assert_eq!((back, leading()), (0, TERMS), "a term written back");
     }
 }

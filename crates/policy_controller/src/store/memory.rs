@@ -2979,15 +2979,21 @@ impl LeasesStore for MemoryStore {
         // The slot of the record's target's count: read before the turn is
         // taken.
         let booked = self.slot_ahead(record.target);
-        // The file the id names, read again under that file's turn: a rise
-        // of the term holds every turn, so the name stands while this one
-        // is held.
+        // The file the id names for good, asked under a file's turn: a
+        // rise of the term holds every turn, so the answer stands while
+        // one is held. The first turn is the file's that the id reads with
+        // no turn, and an answer that names another file is asked again
+        // under that file's turn: the lease is filed under the turn of the
+        // file its id names. An id whose file is not settled is filed in
+        // none.
         let id = record.lease.id;
-        let mut leases = loop {
-            let at = self.file_of(id);
+        let files = self.files.len();
+        let mut at = self.file_of(id);
+        let (mut leases, settled) = loop {
             let leases = self.turn_of(at);
-            if self.file_of(id) == at {
-                break leases;
+            match self.blocks.settled(id, files) {
+                Some(named) if named != at => at = named,
+                settled => break (leases, settled),
             }
         };
         if record.term > leases.term {
@@ -2996,7 +3002,7 @@ impl LeasesStore for MemoryStore {
                 store: leases.term,
             });
         }
-        if !self.blocks.settled(id, self.files.len()) {
+        if settled.is_none() {
             return Err(LeaseRefused::Unclaimed);
         }
         let key = (record.gateway, record.lease.id);
@@ -3092,7 +3098,7 @@ impl LeasesStore for MemoryStore {
             }
             for record in records {
                 let id = record.lease.id;
-                let here = self.file_of(id) == at && self.blocks.settled(id, files);
+                let here = self.blocks.settled(id, files) == Some(at);
                 if record.gateway != gateway || record.term > term || !here {
                     continue;
                 }

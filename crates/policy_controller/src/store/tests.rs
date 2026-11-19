@@ -4021,6 +4021,77 @@ fn a_door_files_no_id_whose_file_a_claim_would_name_anew() {
     assert_eq!(LeasesStore::restore(&one, gateway, &[by_hand(4, 9)]), 1);
 }
 
+/// A door asks the file an id names once more under the turn it took. A
+/// door that waited for the first file's turn while a decider claimed the
+/// id's block files the lease in that decider's file, where its frames
+/// look for it. No hook says the door reached its wait, so the case gives
+/// it time: a door that came late reads the claimed byte and passes too.
+#[test]
+fn a_door_that_waited_behind_a_claim_files_its_id_where_the_claim_named_it() {
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    let store = MemoryStore::new().with_deciders(2);
+    let a = ready(&store, "http://a:1");
+    LeasesStore::set_term(&store, 3);
+    let (store, booked) = (&store, store.world().booked_of(a));
+    let record = LeaseRecord {
+        target: a,
+        ..lease(gateway, 0, 3, now)
+    };
+    // An id of the term's second block, which no decider claimed yet: it
+    // reads the first file.
+    let by_hand = lease(gateway, 3 << 32 | 1 << 20 | 9, 3, now);
+    let (reached, parked) = mpsc::sync_channel(1);
+    let (go, word) = mpsc::sync_channel::<()>(1);
+    let filed = std::thread::scope(|scope| {
+        // The first decider claims the first block and is parked under its
+        // turn, in its issue's tell.
+        scope.spawn(move || {
+            let _acting = Decider::new(0).enter();
+            let issued = store.issue_decided(record, booked, |_| {
+                reached.send(()).expect("the case hears the tell");
+                word.recv().expect("the case lets the issuer go");
+            });
+            issued.expect("minted under the store's term");
+        });
+        parked.recv().expect("the issue tells");
+        // The door reads the first file and waits for its turn.
+        let door = scope.spawn(move || LeasesStore::issue(store, by_hand));
+        std::thread::sleep(Duration::from_millis(200));
+        // The second decider claims the second block, the id's.
+        let _acting = Decider::new(1).enter();
+        let second = store.issue_decided(record, booked, |_| ());
+        go.send(()).expect("the issuer holds the other end");
+        let filed = door.join().expect("the door returns");
+        (second.map(|lease| lease.id), filed)
+    });
+    assert_eq!(filed, (Ok(LeaseId(3 << 32 | 1 << 20)), Ok(())));
+    assert!(LeasesStore::get(store, gateway, by_hand.lease.id).is_some());
+}
+
+/// Once the store's term is past 31 bits no decider mints and no term
+/// leads the blocks anew, so the doors file every id where it reads its
+/// file: an id of the last term from a block no decider claimed, and an
+/// id of a term that never led here. A restore keeps both.
+#[test]
+fn the_doors_file_every_id_once_the_term_is_past_31_bits() {
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    let by_hand = |term: u64, counter: u64| lease(gateway, term << 32 | counter, term, now);
+    let store = MemoryStore::new().with_deciders(2);
+    LeasesStore::set_term(&store, 4);
+    let doors: &dyn LeasesStore = &store;
+    let (unclaimed, never) = (by_hand(4, 9), by_hand(10, 5 << 20 | 1));
+    assert_eq!(doors.issue(unclaimed), Err(LeaseRefused::Unclaimed));
+    LeasesStore::set_term(&store, 1 << 31);
+    assert_eq!(
+        (doors.issue(unclaimed), doors.issue(never)),
+        (Ok(()), Ok(()))
+    );
+    let on_file = |record: LeaseRecord| doors.get(gateway, record.lease.id).is_some();
+    assert!(on_file(unclaimed) && on_file(never));
+    assert_eq!(doors.restore(gateway, &[unclaimed, never]), 2);
+    assert!(on_file(unclaimed) && on_file(never));
+}
+
 /// The most deciders a host names each issue a first lease: every id is
 /// far below its term's mark, three quarters of the counter, so no count
 /// of deciders hands a term over at its first leases.
