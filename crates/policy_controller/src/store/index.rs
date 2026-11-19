@@ -1229,6 +1229,11 @@ impl KvTables {
         }
     }
 
+    /// Drop the size of record so a returning model can set it anew.
+    pub(super) fn forget_block_size(&self, model: &str) {
+        self.table.lock().block_sizes.remove(model);
+    }
+
     fn note(&self, reason: ResyncReason) {
         self.resyncs[slot(reason)].fetch_add(1, Ordering::Relaxed);
     }

@@ -2555,6 +2555,10 @@ impl KvEventSink for MemoryStore {
     fn set_block_size(&self, model: &str, size: u32) {
         self.kv.set_block_size(model, size);
     }
+
+    fn forget_block_size(&self, model: &str) {
+        self.kv.forget_block_size(model);
+    }
 }
 
 // ----------------------------------------------------------- reservations

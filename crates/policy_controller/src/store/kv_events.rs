@@ -170,6 +170,9 @@ pub trait KvEventSink: Send + Sync {
     /// Name a model's block size: provisional until a stored block confirms
     /// it, and only ever raised.
     fn set_block_size(&self, model: &str, size: u32);
+
+    /// Drop the model's block size of record when its last events subscription leaves.
+    fn forget_block_size(&self, model: &str);
 }
 
 /// A sequence this far below the cursor is a restarted publisher, not a late
@@ -309,5 +312,33 @@ impl RankCursor {
             replay_pending: self.replay.is_some(),
             degraded: self.degraded,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::KvEventSink;
+    use crate::store::{MemoryStore, Signals, WorkerFacts, WorkersStore};
+
+    #[test]
+    fn a_forgotten_block_size_is_gone_and_a_new_one_stands() {
+        let store = MemoryStore::new();
+        let model = "m";
+        store.upsert(WorkerFacts {
+            key: "http://a:8000".into(),
+            models: vec![model.into()],
+            signals: Signals {
+                events: true,
+                ..Signals::default()
+            },
+            ..WorkerFacts::default()
+        });
+        store.set_block_size(model, 32);
+        store.set_block_size("other", 64);
+        store.forget_block_size(model);
+        assert_eq!(store.block_size(model), None);
+        assert_eq!(store.block_size("other"), Some(64));
+        store.set_block_size(model, 16);
+        assert_eq!(store.block_size(model), Some(16));
     }
 }

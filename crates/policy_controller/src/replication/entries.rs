@@ -86,6 +86,11 @@ pub const ENTRIES: &[(&str, &str, Fate)] = &[
     ("KvEventSink", "removed", Fate::Rebuilt(SUBSCRIPTION)),
     ("KvEventSink", "block_size", Fate::Read),
     ("KvEventSink", "set_block_size", Fate::Rebuilt(SUBSCRIPTION)),
+    (
+        "KvEventSink",
+        "forget_block_size",
+        Fate::Rebuilt(SUBSCRIPTION),
+    ),
     ("ReservationStore", "window", Fate::Read),
     ("ReservationStore", "try_reserve", Fate::NotYet(PINS)),
     ("ReservationStore", "release", Fate::NotYet(PINS)),
