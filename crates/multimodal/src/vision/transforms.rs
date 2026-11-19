@@ -395,11 +395,56 @@ fn build_planar_tensor_by_table(
 /// the canvas is cropped at its right and bottom edges.
 pub fn paint_rgb_onto_planes(
     rgb: &[u8],
-    (image_w, image_h): (usize, usize),
-    (canvas_w, canvas_h): (usize, usize),
+    image_size: (usize, usize),
+    canvas_size: (usize, usize),
     scale: [f32; 3],
     bias: [f32; 3],
     planes: &mut [f32],
+) {
+    paint_onto_planes(
+        rgb,
+        image_size,
+        canvas_size,
+        bias,
+        planes,
+        |row, r, g, b| {
+            deinterleave_rgb_to_planes(row, r, g, b, scale, bias);
+        },
+    );
+}
+
+/// [`paint_rgb_onto_planes`] through a per-channel table instead of a scale
+/// and a bias: every painted byte maps to `table[c][byte]`, and the margin
+/// holds the mapped black, `table[c][0]`.
+pub fn paint_rgb_onto_planes_by_table(
+    rgb: &[u8],
+    image_size: (usize, usize),
+    canvas_size: (usize, usize),
+    table: &[[f32; 256]; 3],
+    planes: &mut [f32],
+) {
+    let black = std::array::from_fn(|c| table[c][0]);
+    paint_onto_planes(
+        rgb,
+        image_size,
+        canvas_size,
+        black,
+        planes,
+        |row, r, g, b| {
+            deinterleave_rgb_to_planes_by_table(row, r, g, b, table);
+        },
+    );
+}
+
+/// The canvas of [`paint_rgb_onto_planes`]: `planes` filled with `black` per
+/// channel, then each painted row of `rgb` written by `deinterleave`.
+fn paint_onto_planes(
+    rgb: &[u8],
+    (image_w, image_h): (usize, usize),
+    (canvas_w, canvas_h): (usize, usize),
+    black: [f32; 3],
+    planes: &mut [f32],
+    deinterleave: impl Fn(&[u8], &mut [f32], &mut [f32], &mut [f32]),
 ) {
     let canvas_pixels = canvas_w * canvas_h;
     debug_assert_eq!(planes.len(), 3 * canvas_pixels);
@@ -407,22 +452,20 @@ pub fn paint_rgb_onto_planes(
     let (r_plane, rest) = planes.split_at_mut(canvas_pixels);
     let (g_plane, b_plane) = rest.split_at_mut(canvas_pixels);
 
-    r_plane.fill(bias[0]);
-    g_plane.fill(bias[1]);
-    b_plane.fill(bias[2]);
+    r_plane.fill(black[0]);
+    g_plane.fill(black[1]);
+    b_plane.fill(black[2]);
 
     let painted_w = image_w.min(canvas_w);
     let painted_h = image_h.min(canvas_h);
     for y in 0..painted_h {
         let src_row = &rgb[y * image_w * 3..(y * image_w + painted_w) * 3];
         let dst = y * canvas_w;
-        deinterleave_rgb_to_planes(
+        deinterleave(
             src_row,
             &mut r_plane[dst..dst + painted_w],
             &mut g_plane[dst..dst + painted_w],
             &mut b_plane[dst..dst + painted_w],
-            scale,
-            bias,
         );
     }
 }
@@ -487,20 +530,30 @@ pub fn normalize(tensor: &mut Array3<f32>, mean: &[f64; 3], std: &[f64; 3]) {
     }
 }
 
-/// Convert image to tensor and normalize in a single pass.
+/// Convert image to tensor and normalize in a single pass, in the fused
+/// arithmetic of the reference image processors (`BaseImageProcessorFast`
+/// with `do_rescale` and `do_normalize`): the mean and std scaled into byte
+/// units, then one subtraction and one division in `f32`, as [`PixelNorm`]
+/// does. A multiply-add by `1 / (255 * std)` differs in the last bit, which
+/// can move the value across a rounding tie when the engine casts to bf16.
 ///
-/// Fuses `to_tensor` (u8→f32 with /255) and `normalize` ((x-mean)/std)
-/// into one loop to avoid an extra pass over the data.
+/// [`PixelNorm`]: crate::encoder_inputs::PixelNorm
 pub fn to_tensor_and_normalize(
     image: &DynamicImage,
     mean: &[f64; 3],
     std: &[f64; 3],
 ) -> Array3<f32> {
     let (w, h, raw) = rgb_bytes(image);
-    // Fused: (pixel/255 - mean) / std = pixel * (1/(255*std)) - mean/std
-    let scale: [f32; 3] = std::array::from_fn(|c| 1.0 / (255.0 * std[c] as f32));
-    let bias: [f32; 3] = std::array::from_fn(|c| -(mean[c] as f32) / (std[c] as f32));
-    build_planar_tensor(&raw, w, h, scale, bias)
+    build_planar_tensor_by_table(&raw, w, h, &to_tensor_and_normalize_table(mean, std))
+}
+
+/// The per-channel table of [`to_tensor_and_normalize`]:
+/// `(byte - 255 * mean[c]) / (255 * std[c])` in `f32` for every byte.
+pub(crate) fn to_tensor_and_normalize_table(mean: &[f64; 3], std: &[f64; 3]) -> [[f32; 256]; 3] {
+    std::array::from_fn(|c| {
+        let (offset, divisor) = (mean[c] as f32 * 255.0, std[c] as f32 * 255.0);
+        std::array::from_fn(|byte| (byte as f32 - offset) / divisor)
+    })
 }
 
 /// Convert image to tensor and normalize in the steps of torchvision's
@@ -4040,6 +4093,33 @@ mod tests {
         }
     }
 
+    /// Golden bits from HF's fused rescale-and-normalize (transformers 5.10.1,
+    /// torch 2.12). With mean = std = 0.5, byte 127 sits next to a bf16
+    /// rounding tie, so any other f32 formula can cast to a different bf16.
+    #[test]
+    fn to_tensor_and_normalize_is_bit_exact_with_hf() {
+        let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(3, 2, Rgb([127, 128, 1])));
+        let clip_mean = [0.48145466, 0.4578275, 0.40821073];
+        let clip_std = [0.26862954, 0.26130258, 0.27577711];
+        for (mean, std, golden) in [
+            (
+                [0.5; 3],
+                [0.5; 3],
+                [0xbb80_8081_u32, 0x3b80_8081, 0xbf7d_fdfe],
+            ),
+            (clip_mean, clip_std, [0x3d7c_e08c, 0x3e2c_f360, 0xbfbb_a5e2]),
+        ] {
+            let tensor = to_tensor_and_normalize(&image, &mean, &std);
+            for (c, bits) in golden.into_iter().enumerate() {
+                assert_eq!(
+                    tensor[[c, 1, 2]].to_bits(),
+                    bits,
+                    "mean {mean:?}, channel {c}"
+                );
+            }
+        }
+    }
+
     /// Every byte through `to_tensor_then_normalize` is the value of
     /// torchvision's `ToTensor` then `Normalize` (the three roundings), the
     /// bits of six bytes per channel pinned from torchvision; the fused form
@@ -5753,6 +5833,30 @@ mod tests {
                     assert_eq!(
                         planes[c * 6 + y * 3 + x].to_bits(),
                         expected.to_bits(),
+                        "channel {c} at ({x}, {y})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn paint_rgb_onto_planes_by_table_matches_to_tensor_and_normalize() {
+        // A 2x2 image on a 3x2 canvas: the right column is normalized black.
+        let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(2, 2, Rgb([127, 128, 1])));
+        let (mean, std) = ([0.5; 3], [0.5; 3]);
+        let expected = to_tensor_and_normalize(&image, &mean, &std);
+        let (w, h, raw) = rgb_bytes(&image);
+        let mut planes = vec![f32::NAN; 3 * 3 * 2];
+        let table = to_tensor_and_normalize_table(&mean, &std);
+        paint_rgb_onto_planes_by_table(&raw, (w, h), (3, 2), &table, &mut planes);
+        for c in 0..3 {
+            for y in 0..2 {
+                for x in 0..3 {
+                    let value = if x < 2 { expected[[c, y, x]] } else { -1.0 };
+                    assert_eq!(
+                        planes[c * 6 + y * 3 + x].to_bits(),
+                        value.to_bits(),
                         "channel {c} at ({x}, {y})"
                     );
                 }

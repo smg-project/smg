@@ -29,11 +29,20 @@
 //! An overload row picks nothing: it holds whether the gateway read one
 //! worker as overloaded after each write of its loads, and must replay
 //! verdict for verdict.
+//! A minimum-tokens row holds the rank each request took on one worker, and
+//! must replay rank for rank. A sticky rank row holds the rank each request
+//! of one grouped worker was pinned to by its key. Two hashes place no key
+//! alike, so it must replay with the requests of one key on one rank, and
+//! a counted row count for count or share for share.
 //! No row is decided differently but where its module names it. The store
 //! judges an engine by rules of its own, and the overload module holds a
 //! recorded row they decide apart from the gateway to the verdicts its
 //! entry gives. The prefix hash module holds a recorded row that a key of
 //! whole blocks cannot decide as recorded to the outcome its entry gives.
+//! The store decides a rank by rules of its own too: the minimum-tokens
+//! module holds a recorded row they decide apart to the ranks its entry
+//! gives, and the sticky rank module holds a row on which the gateway sets
+//! no rank to a rank of the worker for every request.
 //! A row whose form this crate does not build yet is owed: [`OWED`] names
 //! it with the validator's words and the
 //! change that builds it, and the replay fails once the row is no longer
@@ -55,10 +64,12 @@ mod classic {
     pub mod bucket;
     pub mod encode_pair;
     pub mod manual;
+    pub mod minimum_tokens;
     pub mod overload;
     pub mod pair_index;
     pub mod power_of_two;
     pub mod prefix_hash;
+    pub mod sticky_rank;
 }
 
 /// What a row recorded, and what its replay gives in the same shape: the
@@ -89,37 +100,12 @@ struct Owed {
 }
 
 /// The owed rows. The classic manual policy keeps a key's pins apart under
-/// each role of a pair; here a sessions rule runs under the single plan. A
-/// request placed by its routing key on the hash ring keeps its worker over
-/// the thresholds there; its rows are refused by their module until a key
-/// keeps its ring worker here ([`ring`]). Those entries do not expire by
-/// themselves, since the module refuses a ring row before it builds an
-/// engine: the change that keeps a key on its ring worker deletes them
-/// together with that guard.
-const OWED: &[Owed] = &[
-    Owed {
-        row: "manual-one-key-pins-apart-under-the-prefill-and-the-decode-role",
-        refused: "sessions run under the single plan",
-        by: "sessions on the sides of a pair, which read the pair's partner lists",
-    },
-    ring("consistent-hashing-a-key-keeps-its-worker-over-its-thresholds-beside-free-workers"),
-    ring("consistent-hashing-a-key-keeps-its-worker-with-every-worker-over"),
-    ring("consistent-hashing-a-key-leaves-its-worker-over-its-thresholds-under-shedding"),
-    ring("consistent-hashing-a-key-is-shed-with-every-worker-over-under-shedding"),
-    ring("consistent-hashing-a-key-passes-to-the-next-member-when-its-worker-is-down"),
-    ring("consistent-hashing-a-retry-that-tried-the-keys-worker-passes-the-key-on"),
-    ring("consistent-hashing-a-key-keeps-its-worker-when-the-next-member-is-over-too"),
-    ring("consistent-hashing-a-key-passes-to-a-next-member-over-its-thresholds-when-its-worker-is-down"),
-];
-
-/// A ring row of the all-vetoed sheet, owed in its module's words.
-const fn ring(row: &'static str) -> Owed {
-    Owed {
-        row,
-        refused: classic::all_vetoed::RING_ROW,
-        by: "the change that keeps a session key on its ring worker",
-    }
-}
+/// each role of a pair; here a sessions rule runs under the single plan.
+const OWED: &[Owed] = &[Owed {
+    row: "manual-one-key-pins-apart-under-the-prefill-and-the-decode-role",
+    refused: "sessions run under the single plan",
+    by: "sessions on the sides of a pair, which read the pair's partner lists",
+}];
 
 /// A sheet of the directory whose module has not landed here: `policy`
 /// is its head's, and `by` names the change that brings the module. The
@@ -281,11 +267,13 @@ const fn module<R: Recorded>(inline: &'static str) -> Module {
 /// rows and the pair index's rows pick nothing, so each of the two modules
 /// brings its own replay and its own rule for a copied row. The prefix
 /// hash module brings its own replay too, which holds the rows it names
-/// apart to its entries.
+/// apart to its entries. A rank row names a rank or none, so the
+/// minimum-tokens module and the sticky rank module bring their own replays
+/// as well, and hold a copied row whole, as the overload module does.
 /// An encode-pair row is replayed in its store part by its own module;
 /// its copied rows name no runtime either, and the pair index's rule
 /// holds them.
-const MODULES: [Module; 8] = [
+const MODULES: [Module; 10] = [
     module::<classic::all_vetoed::Row>(classic::all_vetoed::INLINE),
     module::<classic::bucket::Row>(classic::bucket::INLINE),
     Module {
@@ -295,6 +283,12 @@ const MODULES: [Module; 8] = [
         copied: classic::pair_index::copied_row_defects,
     },
     module::<classic::manual::Row>(classic::manual::INLINE),
+    Module {
+        policy: classic::minimum_tokens::POLICY,
+        inline: classic::minimum_tokens::INLINE,
+        replay: classic::minimum_tokens::replay_rows,
+        copied: classic::overload::copied_row_defects,
+    },
     Module {
         policy: classic::overload::POLICY,
         inline: classic::overload::INLINE,
@@ -313,6 +307,12 @@ const MODULES: [Module; 8] = [
         inline: classic::prefix_hash::INLINE,
         replay: classic::prefix_hash::replay_rows,
         copied: copied_row_defects,
+    },
+    Module {
+        policy: classic::sticky_rank::POLICY,
+        inline: classic::sticky_rank::INLINE,
+        replay: classic::sticky_rank::replay_rows,
+        copied: classic::overload::copied_row_defects,
     },
 ];
 
@@ -584,6 +584,13 @@ fn the_classic_manual_rows_replay_pick_for_pick_and_share_for_share() {
 }
 
 #[test]
+fn the_classic_minimum_tokens_rows_replay_rank_for_rank() {
+    let (rows, defects) = replay_sheet(classic::minimum_tokens::INLINE, "the inline rows");
+    assert!(rows >= 8, "{rows} inline rows");
+    assert!(defects.is_empty(), "{defects:#?}");
+}
+
+#[test]
 fn the_classic_overload_rows_replay_verdict_for_verdict() {
     let (rows, defects) = replay_sheet(classic::overload::INLINE, "the inline rows");
     assert!(rows >= 8, "{rows} inline rows");
@@ -593,6 +600,13 @@ fn the_classic_overload_rows_replay_verdict_for_verdict() {
 #[test]
 fn the_classic_prefix_hash_rows_replay_pick_for_pick_and_share_for_share() {
     let (rows, defects) = replay_sheet(classic::prefix_hash::INLINE, "the inline rows");
+    assert!(rows >= 8, "{rows} inline rows");
+    assert!(defects.is_empty(), "{defects:#?}");
+}
+
+#[test]
+fn the_classic_sticky_rank_rows_replay_rank_for_rank_and_count_for_count() {
+    let (rows, defects) = replay_sheet(classic::sticky_rank::INLINE, "the inline rows");
     assert!(rows >= 8, "{rows} inline rows");
     assert!(defects.is_empty(), "{defects:#?}");
 }
@@ -976,7 +990,7 @@ fn an_encode_pair_row_is_held_to_the_stores_lists_and_the_decision() {
     assert!(
         matches!(served.as_slice(), [store, decision]
             if store.contains("yet the class of prefill 0 holds encoder 0")
-                && decision.contains("refused as ec_incompatible, replayed")),
+                && decision.contains("refused as ec_incompatible, replayed Pick(")),
         "{served:#?}"
     );
     let bare = "an-encoder-whose-runtime-states-no-handoff-serves-no-item";
@@ -1061,10 +1075,12 @@ fn every_json_file_of_the_directory_is_a_sheet_to_answer_for() {
             "bucket.json",
             "encode_pair.json",
             "manual.json",
+            "minimum_tokens.json",
             "overload.json",
             "pair-index.json",
             "power_of_two.json",
             "prefix_hash.json",
+            "sticky_rank.json",
             "stray.json",
         ]
     );

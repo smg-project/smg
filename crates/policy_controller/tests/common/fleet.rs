@@ -32,7 +32,8 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    net::SocketAddr,
+    io::ErrorKind,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::Path,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -64,12 +65,12 @@ use smg_policy_controller::{
         Side, Welcome,
     },
     store::{
-        Ask, BatchFacts, BatchOutcome, GatewayId, HealthPolicy, HealthSink, KvCursor, KvEvent,
-        KvEventSink, LaneCounts, LeaseState, MemoryStore, SequenceHash, Signals, StoredBlock,
-        ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
+        Ask, BatchFacts, BatchOutcome, GatewayId, HealthPolicy, HealthSink, Kinds, KvCursor,
+        KvEvent, KvEventSink, LaneCounts, LeaseState, MemoryStore, SequenceHash, Signals,
+        StoredBlock, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
     },
     view::{fingerprint, LoadRow, Role, WireModes, WorkerId},
-    AppliedSpec, LeaseId, PolicySpec,
+    AppliedSpec, Catalog, LeaseId, PolicySpec,
 };
 use tokio::{
     io::{copy, sink},
@@ -85,7 +86,15 @@ use tonic::{
 use crate::{
     engines::{engine_config, eventually},
     net::loopback,
+    pair,
 };
+
+/// The leader's address and the standby's of a pair: one host, two
+/// addresses, so both listen on one replication port as replicas
+/// configured alike do. Linux routes the second with no alias; another
+/// host refuses its bind, and a case that binds it is ignored there.
+const LEADER: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+const STANDBY: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
 
 /// How often the stand-in prober asks every engine: the check interval of
 /// every registration.
@@ -136,6 +145,9 @@ pub struct Seen {
     pub engine: usize,
     pub rank: u16,
     pub healthy: bool,
+    /// Whether the row reads overloaded: its engine's reports against the
+    /// thresholds that stand for it.
+    pub overloaded: bool,
     pub load: Option<LoadRow>,
 }
 
@@ -296,6 +308,7 @@ struct Probed {
 pub struct Replica {
     gateway: SocketAddr,
     control: SocketAddr,
+    replication: SocketAddr,
     store: Arc<MemoryStore>,
     readiness: Readiness,
     stop: Option<oneshot::Sender<()>>,
@@ -624,7 +637,7 @@ async fn probe(
                 // A verdict is pushed under the lock its write was made
                 // under: a reader that saw the write reads the verdict.
                 let mut verdicts = turns.verdicts.lock();
-                if let Some((from, to)) = store.probe_outcome(id, healthy, row.revision) {
+                if let Some((from, to)) = store.probe_outcome(id, healthy, row.revision).moved() {
                     verdicts.push(Verdict {
                         engine,
                         from,
@@ -796,20 +809,67 @@ impl Replica {
     /// Binds and serves a controller named `id`. Replicas given one `lease`
     /// file elect over it; with none the controller leads itself.
     pub async fn start(id: &str, lease: Option<&Path>) -> Result<Self, String> {
-        let listener = |name: &str, scopes: &[Scope]| Listener {
+        Self::start_over(id, lease, Catalog::builtin(), None).await
+    }
+
+    /// As [`Replica::start`], over the stages `catalog` holds, a host's own
+    /// among them. With `spec` the controller takes its policy document
+    /// from that file and applies it itself, as a host's own build does: a
+    /// document names a host's stage where the controller bound over that
+    /// catalog validates it, and nowhere else.
+    pub async fn start_over(
+        id: &str,
+        lease: Option<&Path>,
+        catalog: Catalog,
+        spec: Option<&Path>,
+    ) -> Result<Self, String> {
+        Self::serve(id, lease, loopback().ip(), 0, false, (Some(catalog), spec)).await
+    }
+
+    /// As [`Replica::start`], with every listener on `ip` and the
+    /// replication listener at `port`. Replicas of one lease listen on one
+    /// replication port, each at an address of its own, as replicas
+    /// configured alike do: the one that follows finds its leader's stream
+    /// there, and the leader takes its name as told. `0` takes a number of
+    /// the pairs' own ([`pair::ports`]), the next one free on `ip` and, at
+    /// the leader's address, on the standby's too ([`pair::free`]): a bind
+    /// of port `0` is handed none of them, so the number stays free on the
+    /// address a standby binds it at.
+    pub async fn start_at(
+        id: &str,
+        lease: Option<&Path>,
+        ip: IpAddr,
+        port: u16,
+    ) -> Result<Self, String> {
+        Self::serve(id, lease, ip, port, true, (None, None)).await
+    }
+
+    /// Binds and serves the controller over the stages `catalog` holds,
+    /// the stock build's where it names none, and on the `spec` file where
+    /// one is given; with `standbys` its replication listener takes a
+    /// standby's name as told.
+    async fn serve(
+        id: &str,
+        lease: Option<&Path>,
+        ip: IpAddr,
+        port: u16,
+        standbys: bool,
+        (catalog, spec): (Option<Catalog>, Option<&Path>),
+    ) -> Result<Self, String> {
+        let listener = |name: &str, scopes: &[Scope], port: u16| Listener {
             name: name.to_owned(),
-            addr: loopback(),
+            addr: SocketAddr::new(ip, port),
             scopes: scopes.to_vec(),
             tls: None,
         };
-        let config = Config {
+        let config = |port: u16| Config {
             controller_id: id.to_owned(),
             listeners: vec![
-                listener("gateway", &[Scope::Gateway, Scope::Ingestion]),
-                listener("control", &[Scope::Control]),
-                listener("replication", &[Scope::Replication]),
+                listener("gateway", &[Scope::Gateway, Scope::Ingestion], 0),
+                listener("control", &[Scope::Control], 0),
+                listener("replication", &[Scope::Replication], port),
             ],
-            admin: loopback(),
+            admin: SocketAddr::new(ip, 0),
             decide_shards: Config::default_decide_shards(),
             shutdown_settle: Duration::ZERO,
             shutdown_grace: Duration::from_secs(5),
@@ -821,13 +881,42 @@ impl Replica {
                 ..Election::default()
             },
         };
-        let mut controller = bounded(
-            "the controller binds its listeners",
-            ROOM,
-            Controller::bind(config),
-        )
-        .await?
-        .map_err(|error| error.to_string())?;
+        // A pair's first replica draws its replication port from the pairs'
+        // own numbers and takes the next one free on its address. A bind
+        // takes its catalog: the stock build's is made again for each
+        // number, and a host's own is bound once, at the port its start
+        // names.
+        let drawn = standbys && port == 0 && catalog.is_none();
+        let mut numbers = pair::ports(ip);
+        let mut host = catalog;
+        let mut controller = loop {
+            let port = if drawn {
+                numbers
+                    .next()
+                    .ok_or("no port among the pairs' own is free")?
+            } else {
+                port
+            };
+            let catalog = host.take().unwrap_or_else(Catalog::builtin);
+            let bound = bounded(
+                "the controller binds its listeners",
+                ROOM,
+                Controller::bind_with(config(port), catalog),
+            )
+            .await?;
+            match bound {
+                // In use on this address: the next number.
+                Err(Error::Bind { source, .. })
+                    if drawn && source.kind() == ErrorKind::AddrInUse => {}
+                // Held on the standby's address by a standby that outlived
+                // its leader: the next number, and this bind is let go.
+                Ok(_)
+                    if drawn
+                        && ip == LEADER
+                        && !pair::free(STANDBY, port).map_err(|error| error.to_string())? => {}
+                bound => break bound.map_err(|error| error.to_string())?,
+            }
+        };
         controller
             .identity_as_told("gateway")
             .map_err(|error| error.to_string())?;
@@ -835,6 +924,21 @@ impl Replica {
         controller
             .identity_as_told("control")
             .map_err(|error| error.to_string())?;
+        // A standby states its name on its stream, as a gateway does.
+        if standbys {
+            controller
+                .identity_as_told("replication")
+                .map_err(|error| error.to_string())?;
+        }
+        if let Some(spec) = spec {
+            bounded(
+                "the controller takes its spec file",
+                ROOM,
+                controller.spec_file(spec),
+            )
+            .await?
+            .map_err(|error| error.to_string())?;
+        }
         let addresses = controller.addresses();
         let gateway = addresses
             .of(Scope::Gateway)
@@ -842,6 +946,9 @@ impl Replica {
         let control = addresses
             .of(Scope::Control)
             .ok_or("the controller has no control listener")?;
+        let replication = addresses
+            .of(Scope::Replication)
+            .ok_or("the controller has no replication listener")?;
         let store = controller.store();
         let readiness = controller.readiness();
         let (stop, stopped) = oneshot::channel::<()>();
@@ -856,6 +963,7 @@ impl Replica {
         Ok(Self {
             gateway,
             control,
+            replication,
             store,
             readiness,
             stop: Some(stop),
@@ -919,23 +1027,25 @@ impl Harness {
     /// reference client to its gateway listener and the generated client to
     /// its control listener, which takes the name its caller states.
     pub async fn start() -> Result<Self, String> {
-        let mut replica = Replica::start("fleet-controller", None).await?;
+        let replica = Replica::start("fleet-controller", None).await?;
+        Self::around(replica).await
+    }
+
+    /// Starts a lone controller of a host's own build: over the stages
+    /// `catalog` holds and on the policy document at `spec`, which the
+    /// controller reads and applies itself. The case applies no generation
+    /// in its own process beside it.
+    pub async fn start_hosting(catalog: Catalog, spec: &Path) -> Result<Self, String> {
+        let replica = Replica::start_over("fleet-controller", None, catalog, Some(spec)).await?;
+        Self::around(replica).await
+    }
+
+    /// The harness around a controller once it leads: the reference client
+    /// at its gateway listener and the generated client at its control
+    /// listener.
+    async fn around(mut replica: Replica) -> Result<Self, String> {
         replica.reaches(State::Leader).await?;
-        let gateway = replica.gateway();
-        let client = bounded(
-            "the client connects to the gateway listener",
-            ROOM,
-            Client::connect(&format!("http://{gateway}"), GATEWAY),
-        )
-        .await?
-        .map_err(|error| error.to_string())?;
-        let operator = bounded(
-            "the operator connects to the control listener",
-            ROOM,
-            PolicyControllerClient::connect(format!("http://{}", replica.control)),
-        )
-        .await?
-        .map_err(|error| error.to_string())?;
+        let (client, operator) = Self::clients(&replica).await?;
         let (stop_feeds, _) = watch::channel(false);
         Ok(Self {
             store: Arc::clone(&replica.store),
@@ -955,6 +1065,81 @@ impl Harness {
             stop_feeds,
             feeds: JoinSet::new(),
         })
+    }
+
+    /// Starts two controllers over the lease file `lease`, each at an
+    /// address of its own on one replication port, waits until the first
+    /// leads and the second follows, and returns the harness around the
+    /// leader with its standby.
+    pub async fn start_pair(lease: &Path) -> Result<(Self, Replica), String> {
+        let mut leader = Replica::start_at("fleet-leader", Some(lease), LEADER, 0).await?;
+        leader.reaches(State::Leader).await?;
+        let port = leader.replication.port();
+        let mut standby = Replica::start_at("fleet-standby", Some(lease), STANDBY, port).await?;
+        standby.reaches(State::Follower).await?;
+        Ok((Self::around(leader).await?, standby))
+    }
+
+    /// The reference client at `replica`'s gateway listener and the
+    /// generated client at its control listener.
+    async fn clients(
+        replica: &Replica,
+    ) -> Result<(Client, PolicyControllerClient<Channel>), String> {
+        let gateway = replica.gateway();
+        let client = bounded(
+            "the client connects to the gateway listener",
+            ROOM,
+            Client::connect(&format!("http://{gateway}"), GATEWAY),
+        )
+        .await?
+        .map_err(|error| error.to_string())?;
+        let operator = bounded(
+            "the operator connects to the control listener",
+            ROOM,
+            PolicyControllerClient::connect(format!("http://{}", replica.control)),
+        )
+        .await?
+        .map_err(|error| error.to_string())?;
+        Ok((client, operator))
+    }
+
+    /// How many of the fleet's ranks `standby`'s own store holds ready
+    /// with a load row beside them: what a controller that follows has of
+    /// its leader's log. A row no registration made is an error.
+    pub fn followed(&self, standby: &Replica) -> Result<usize, String> {
+        let cut = standby.store.cut(Kinds::All);
+        let mut held = 0;
+        for row in &cut.rows {
+            if !self.members.contains_key(&row.id) {
+                return Err(format!(
+                    "the standby holds a row no registration made: {:?}",
+                    row.id
+                ));
+            }
+            let loaded = cut.loads.iter().any(|(id, _, _)| *id == row.id);
+            if row.status == WorkerStatus::Ready && loaded {
+                held += 1;
+            }
+        }
+        Ok(held)
+    }
+
+    /// Stops the controller the harness asks, the planned stop that
+    /// releases the lease, and turns the harness to `standby` once it
+    /// leads: the two clients connect to its listeners and the store read
+    /// from here on is its own. The registrations stand, since a standby
+    /// holds its leader's rows under their ids. The stand-in prober goes
+    /// on writing to the stopped controller's store: the promoted one's
+    /// rows keep the status its leader's log told.
+    pub async fn hand_over(&mut self, standby: Replica) -> Result<(), String> {
+        let stopped = std::mem::replace(&mut self.replica, standby);
+        stopped.stop().await?;
+        self.replica.reaches(State::Leader).await?;
+        let (client, operator) = Self::clients(&self.replica).await?;
+        self.store = Arc::clone(&self.replica.store);
+        self.client = client;
+        self.operator = operator;
+        Ok(())
     }
 
     /// Ask: who leads, as the reference client hears it on the gateway
@@ -1018,6 +1203,9 @@ impl Harness {
             let mut ids = Vec::with_capacity(usize::from(shape.ranks));
             for rank in 0..shape.ranks {
                 let id = self.member(&endpoint, shape, rank).await?;
+                // The build this registration owes, asked: the cases read
+                // the row at once.
+                self.store.publish_now();
                 self.members.insert(id, (engine, rank));
                 ids.push(id);
             }
@@ -1206,6 +1394,55 @@ impl Harness {
         self.events.snapshots.load(Ordering::SeqCst)
     }
 
+    /// Patches the overload thresholds of every rank of the engine at
+    /// `engine` on the control listener, each under the revision its row
+    /// stands at: an operator's patch. The engine's next overload verdict
+    /// reads the thresholds it left.
+    pub async fn patch_overload(
+        &mut self,
+        engine: usize,
+        overload: proto::OverloadThresholds,
+    ) -> Result<(), String> {
+        let ids: Vec<WorkerId> = self
+            .members
+            .iter()
+            .filter(|(_, (of, _))| *of == engine)
+            .map(|(id, _)| *id)
+            .collect();
+        if ids.is_empty() {
+            return Err(format!("engine {engine} holds no rank to patch"));
+        }
+        for id in ids {
+            let row = self
+                .store
+                .get(id)
+                .ok_or("a rank of the engine holds no row")?;
+            let mut request = Request::new(proto::PatchWorkerRequest {
+                worker_id: id.0,
+                overload: Some(overload),
+                revision: row.revision,
+                ..proto::PatchWorkerRequest::default()
+            });
+            request
+                .metadata_mut()
+                .insert(PRINCIPAL, AsciiMetadataValue::from_static(OPERATOR));
+            bounded(
+                "the patch call answers",
+                ROOM,
+                self.operator.patch_worker(request),
+            )
+            .await?
+            .map_err(|status| {
+                format!(
+                    "the patch was refused: {:?}: {}",
+                    status.code(),
+                    status.message()
+                )
+            })?;
+        }
+        Ok(())
+    }
+
     /// The pool serving `model` in `role` as a decision's view reads it at
     /// this instant, each row named by its engine. Until the service
     /// answers decisions this is what a case reads back.
@@ -1234,6 +1471,7 @@ impl Harness {
                     engine,
                     rank,
                     healthy: row.health.healthy,
+                    overloaded: row.health.overloaded,
                     load: row.load,
                 })
             })

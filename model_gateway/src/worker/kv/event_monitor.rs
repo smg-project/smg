@@ -11,13 +11,18 @@
 //! - `on_worker_removed` — signals graceful shutdown, task cleans up indexer
 //! - `stop` — signals shutdown to all tasks, clears state
 //!
-//! The work of a subscription is split by stage: `subscription.rs` runs the
-//! task per worker (connecting, reconnecting, the stream read loop, the
-//! pushed load records, the worker's departure); `admission.rs` keeps one
-//! stream's state (per-rank cursors, gap recovery, relay snapshots, and the
-//! metrics around an applied batch); `apply.rs` takes one event into the
-//! index (tiers, cache groups, namespaces, and the physical copies of a
-//! block, counted per worker).
+//! The work of a subscription is split by stage: the worker crate's KV event
+//! collector runs the task per worker (connecting, reconnecting, the stream
+//! read loop, the pushed load records, the worker's departure);
+//! `admission.rs` keeps one stream's state (per-rank cursors, gap recovery,
+//! relay snapshots, and the metrics around an applied batch); `apply.rs`
+//! takes one event into the index (tiers, cache groups, namespaces, and the
+//! physical copies of a block, counted per worker).
+//!
+//! The task and the index meet at the worker crate's port: the task says
+//! what its stream brought, and `index_sink.rs`, the sink over the models'
+//! indexes, keeps each worker's stream state and applies what its cursor
+//! admits.
 
 use std::{
     collections::HashMap,
@@ -26,12 +31,10 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, OnceLock, Weak,
     },
-    time::Instant,
 };
 
 use dashmap::{mapref::entry::Entry, DashMap};
 use futures::FutureExt as _;
-use smg_grpc_client::common_proto::EngineLoad;
 use tokio::{
     sync::{oneshot, watch, Mutex},
     task::JoinHandle,
@@ -42,7 +45,7 @@ use super::index_backend::KvIndex;
 use crate::worker::{
     identity::endpoint::Endpoint,
     load::monitor::WorkerMonitor,
-    metrics::Metrics,
+    metrics::{KvIndexChainStats, Metrics},
     periodic_task::PeriodicTask,
     registry::{Generation, WorkerRegistry},
     ConnectionMode, Worker, UNKNOWN_MODEL_ID,
@@ -50,12 +53,18 @@ use crate::worker::{
 
 mod admission;
 mod apply;
+#[cfg(test)]
+mod gateway_tests;
+mod index_sink;
 mod recovery;
-mod subscription;
 
 #[cfg(any(test, feature = "test-util"))]
 pub(crate) use apply::WorkerIndexState;
-pub(crate) use subscription::EngineStreams;
+use index_sink::{IndexSink, OpenRow};
+// The worker crate's port, at the path it had here.
+use smg_worker::kv_events::port;
+pub use smg_worker::kv_events::SubscriptionKind;
+use smg_worker::kv_events::{port::KvEventSink, KvEventCollector, PushedLoadSink};
 
 /// Interval between publications of each model's index size and, for the chain
 /// index, its shape and memory (`smg_kv_index_*` gauges by model).
@@ -79,19 +88,6 @@ pub(crate) struct KvBlockSize {
     pub(crate) from_events: bool,
 }
 
-/// What a worker's stream is for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SubscriptionKind {
-    /// The worker's KV events into its model's index, with the load records
-    /// that ride them: a worker under a cache-aware policy.
-    Events,
-    /// The worker's load records alone (`SubscribeKvEventsRequest.
-    /// loads_only`): a worker priced by its load with no KV index. A
-    /// servicer that predates the field streams its events too; they are
-    /// dropped.
-    Loads,
-}
-
 pub struct KvEventMonitor {
     /// Per-model KV indexes: model_id → shared indexer.
     /// Arc-wrapped so the stats task can share the map WITHOUT holding (even
@@ -103,6 +99,9 @@ pub struct KvEventMonitor {
     /// Used by CacheAwarePolicy to chunk request tokens at query time.
     /// Arc-wrapped so subscription tasks can update it from events.
     block_sizes: Arc<DashMap<String, KvBlockSize>>,
+    /// Where the events subscriptions' batches go: the sink over the models'
+    /// indexes, which keeps each worker's stream state by its row.
+    sink: Arc<IndexSink>,
     /// Per-worker subscription slots: worker_url → the live subscription, or
     /// the reservation a removal leaves until the old task has cleaned up.
     /// Mutex matches LoadMonitor pattern for atomic abort + remove; Arc so a
@@ -123,36 +122,9 @@ pub struct KvEventMonitor {
     worker_registry: OnceLock<Weak<dyn WorkerLookup>>,
 }
 
-/// Where a load record pushed on a worker's event stream goes: the load
-/// monitor, as this monitor's streams hold it. Held by this name,
-/// the sink brings nothing of the registry the load monitor is built over.
-pub(crate) trait PushedLoadSink: Send + Sync {
-    /// Take the record of `dp_rank` received at `received_at`
-    /// ([`WorkerMonitor::apply_pushed_load`]).
-    fn push_load(
-        self: Arc<Self>,
-        worker: &Arc<dyn Worker>,
-        dp_rank: i32,
-        record: &EngineLoad,
-        received_at: Instant,
-    );
-}
-
-impl<G: Generation> PushedLoadSink for WorkerMonitor<G> {
-    fn push_load(
-        self: Arc<Self>,
-        worker: &Arc<dyn Worker>,
-        dp_rank: i32,
-        record: &EngineLoad,
-        received_at: Instant,
-    ) {
-        self.apply_pushed_load(worker, dp_rank, record, received_at);
-    }
-}
-
-/// The registry as a peer that asks one thing of it holds it: the worker
-/// registered under a URL. Such a holder reads no generation, so it names
-/// no value of the registry's host.
+/// The registry as this monitor holds it: it asks one thing of it, the
+/// worker registered under a URL. Such a holder reads no generation, so it
+/// names no value of the registry's host.
 pub(crate) trait WorkerLookup: Send + Sync {
     /// The worker registered under `url`, as [`WorkerRegistry::get_by_url`]
     /// reads it.
@@ -184,12 +156,19 @@ enum Slot {
 /// it depends on the `on_worker_removed` future living on: the registry's
 /// removal step runs it under a timeout, and a cleanup waiting on the
 /// removal permits can outlast that; a reservation only the remover could
-/// lift would then hold every later add of the URL for good.
+/// lift would then hold every later add of the URL for good. A task that
+/// had ended before its removal began runs no such path: the remover lifts
+/// the reservation after its wait, and the URL's next add lifts one whose
+/// remover went first ([`KvEventMonitor::lift_reservation`]).
 struct Reservation {
     /// The subscription the reservation belongs to; a task lifts only its own.
     id: u64,
     /// Closes when the task has ended.
     done: watch::Receiver<()>,
+    /// The subscription's model and kind: whoever lifts the reservation
+    /// drops the model's index with the model's last events subscription.
+    model_id: String,
+    kind: SubscriptionKind,
 }
 
 /// Tracks a single worker's subscription state.
@@ -203,8 +182,9 @@ struct WorkerSubscription {
     /// the object under the URL, and the records on the stream reach the
     /// one the task holds, so an add with another object restarts it.
     started_for: Weak<dyn Worker>,
-    /// Signals the subscription task to shut down gracefully. The task owns
-    /// the worker's index state and takes its blocks out of the index on exit.
+    /// Signals the subscription task to shut down gracefully. On exit the
+    /// task tells the sink the worker left, and the sink takes the worker's
+    /// blocks out of the index.
     shutdown_tx: oneshot::Sender<()>,
     /// Closes when the task has ended; a removal moves it into the
     /// reservation it leaves in the slot.
@@ -225,9 +205,11 @@ static NEXT_SUBSCRIPTION_ID: AtomicU64 = AtomicU64::new(1);
 impl KvEventMonitor {
     /// A monitor whose models get chain indexes.
     pub fn new() -> Self {
+        let block_sizes = Arc::new(DashMap::new());
         Self {
             indexers: Arc::new(DashMap::new()),
-            block_sizes: Arc::new(DashMap::new()),
+            sink: Arc::new(IndexSink::new(Arc::clone(&block_sizes))),
+            block_sizes,
             worker_handles: Arc::new(Mutex::new(HashMap::new())),
             stats_task: parking_lot::Mutex::new(None),
             load_sink: OnceLock::new(),
@@ -283,6 +265,22 @@ impl KvEventMonitor {
         }
     }
 
+    /// The chain index's counters its gauges publish, as the worker's
+    /// writers take them.
+    fn chain_counters(stats: &kv_index::ChainIndexStats) -> KvIndexChainStats {
+        KvIndexChainStats {
+            runs_live: stats.runs_live,
+            blocks_live: stats.blocks_live,
+            arena_bytes: stats.arena_bytes,
+            arena_free_bytes: stats.arena_free_bytes,
+            arena_chunk_bytes: stats.arena_chunk_bytes,
+            slab_bytes: stats.slab_bytes,
+            moved_hashes: stats.moved_hashes,
+            engine_conflicts: stats.engine_conflicts,
+            cap_refusals: stats.cap_refusals,
+        }
+    }
+
     /// One model's index size and chain shape as gauges: the periodic
     /// publication's unit, and what a new index publishes at once, so the
     /// model's series exist (at zero) from its first worker rather than
@@ -290,7 +288,7 @@ impl KvEventMonitor {
     fn publish_index(model_id: &str, index: &KvIndex) {
         Metrics::set_kv_index_size(model_id, index.current_size(), index.entry_count());
         if let Some(stats) = index.chain_stats() {
-            Metrics::set_kv_index_chain_stats(model_id, &stats);
+            Metrics::set_kv_index_chain_stats(model_id, &Self::chain_counters(&stats));
         }
     }
 
@@ -302,7 +300,7 @@ impl KvEventMonitor {
     /// to zero).
     fn publish_dropped_index(model_id: &str) {
         Metrics::set_kv_index_size(model_id, 0, 0);
-        Metrics::set_kv_index_chain_stats(model_id, &kv_index::ChainIndexStats::default());
+        Metrics::set_kv_index_chain_stats(model_id, &KvIndexChainStats::default());
         // The size went with the model's last subscription: 0, a size no
         // block has, says none is known.
         Metrics::set_kv_block_size(model_id, 0);
@@ -385,25 +383,31 @@ impl KvEventMonitor {
                 }
                 continue;
             }
-            let mut done = match handles.get(&url) {
+            let (reserved, mut done) = match handles.get(&url) {
                 Some(Slot::Active(_)) => {
                     debug!(worker_url = %Endpoint::redacted_str(&url), "KV event subscription already active, skipping");
                     return;
                 }
-                Some(Slot::Removing(reservation)) => reservation.done.clone(),
+                Some(Slot::Removing(reservation)) => (reservation.id, reservation.done.clone()),
                 None => break handles,
             };
             // The previous subscription for this URL is still being taken
             // out of the index: intern it again only once its task has ended.
             if done.has_changed().is_err() {
-                // The task is gone without lifting its reservation (it ended
-                // before the removal began, was aborted, or panicked past its
-                // guard): nothing is left to wait for. Whatever it raised on
-                // the gauge is lowered before its successor starts, whose
-                // answer owns the gauge from here (the removal's own reset
-                // skips a slot that is no longer its reservation).
-                handles.remove(&url);
-                Metrics::set_kv_events_unavailable(&url, false);
+                // The task is gone without lifting its reservation (it was
+                // aborted, panicked past its guard, or had ended before a
+                // removal whose caller went first): nothing is left to wait
+                // for. The reservation is lifted here as its task would have
+                // lifted it, the gauge lowered and the model's last index
+                // dropped, before its successor starts, whose answer owns
+                // the gauge from here.
+                Self::lift_reservation(
+                    &mut handles,
+                    &self.indexers,
+                    &self.block_sizes,
+                    &url,
+                    reserved,
+                );
                 break handles;
             }
             drop(handles);
@@ -441,17 +445,8 @@ impl KvEventMonitor {
             .filter(|_| kind == SubscriptionKind::Events)
         {
             if bs > 0 {
-                let known = self
-                    .block_sizes
-                    .entry(model_id.clone())
-                    .or_insert(KvBlockSize {
-                        tokens: bs,
-                        from_events: false,
-                    });
-                // Under the entry's lock, as the learn site writes it, so a
-                // size a stream learns meanwhile is not overwritten on the
-                // gauge by the seed.
-                Metrics::set_kv_block_size(&model_id, known.tokens);
+                self.sink
+                    .set_block_size(&model_id, u32::try_from(bs).unwrap_or(u32::MAX));
             } else {
                 warn!(worker_url = %Endpoint::redacted_str(&url), "Worker reports kv_block_size=0, ignoring");
             }
@@ -460,7 +455,7 @@ impl KvEventMonitor {
         let started_for = Arc::downgrade(worker);
         let worker = Arc::clone(worker);
         let worker_url = url.clone();
-        let block_sizes = Arc::clone(&self.block_sizes);
+        let sink = Arc::clone(&self.sink);
 
         info!(
             worker_url = %Endpoint::redacted_str(&url),
@@ -474,7 +469,6 @@ impl KvEventMonitor {
         let id = NEXT_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed);
         let load_sink = self.load_sink.get().cloned();
         let loop_model_id = model_id.clone();
-        let task_model_id = model_id.clone();
         let slots = Arc::clone(&self.worker_handles);
         let indexers = Arc::clone(&self.indexers);
         let model_block_sizes = Arc::clone(&self.block_sizes);
@@ -495,15 +489,41 @@ impl KvEventMonitor {
             // Catch panics here so they surface when they happen — a bare
             // JoinError would only be observed at worker removal, leaving the
             // index silently frozen for this worker until then.
-            let result = std::panic::AssertUnwindSafe(Self::subscription_loop(
-                worker,
-                worker_url,
-                indexer,
-                block_sizes,
-                loop_model_id,
-                shutdown_rx,
-                load_sink,
-            ))
+            let result = std::panic::AssertUnwindSafe(async move {
+                // An events subscription opens its row in the sink first. The
+                // row is the collector's from here on: it goes with the loop,
+                // or with the job that says the worker left.
+                let row = match indexer {
+                    Some(index) => {
+                        match sink.open(index, &loop_model_id, &worker_url, worker.dp_rank()) {
+                            Ok(row) => Some(row),
+                            Err(e) => {
+                                error!(
+                                    worker_url = %Endpoint::redacted_str(&worker_url),
+                                    error = %e,
+                                    "Failed to intern worker; KV events from this worker will \
+                                     not feed cache-aware routing"
+                                );
+                                Metrics::record_kv_event_subscription_failure(
+                                    &worker_url,
+                                    "intern_failed",
+                                );
+                                return;
+                            }
+                        }
+                    }
+                    None => None,
+                };
+                KvEventCollector::subscription_loop(
+                    worker,
+                    worker_url,
+                    row.map(OpenRow::into_feed),
+                    loop_model_id,
+                    shutdown_rx,
+                    load_sink,
+                )
+                .await;
+            })
             .catch_unwind()
             .await;
             if let Err(payload) = result {
@@ -522,16 +542,7 @@ impl KvEventMonitor {
                 );
                 Metrics::record_kv_event_subscription_failure(writer.url(), "panic");
             }
-            Self::complete_removal(
-                &slots,
-                &indexers,
-                &model_block_sizes,
-                &writer,
-                id,
-                &task_model_id,
-                kind,
-            )
-            .await;
+            Self::complete_removal(&slots, &indexers, &model_block_sizes, &writer, id).await;
             // The task's last write is made: the worker may go.
             drop(writer);
             // Closes `done` last: an add waiting on it finds the slot free.
@@ -569,44 +580,62 @@ impl KvEventMonitor {
         block_sizes: &DashMap<String, KvBlockSize>,
         worker: &Arc<dyn Worker>,
         id: u64,
-        model_id: &str,
-        kind: SubscriptionKind,
     ) {
-        let worker_url = worker.url();
         let mut handles = slots.lock().await;
+        Self::lift_reservation(&mut handles, indexers, block_sizes, worker.url(), id);
+    }
+
+    /// Lift the reservation `id` under `worker_url`, if it still stands
+    /// there: lower the worker's gauge, free the slot, and drop the model's
+    /// index with the model's last events subscription, zeroing the gauges
+    /// that index fed. The caller holds the slot lock. Whoever finds the
+    /// subscription's task ended calls it: the task at its own end, the
+    /// remover after its wait (a task that had ended before the removal
+    /// began lifted nothing), and an add that finds the reservation's task
+    /// gone.
+    fn lift_reservation(
+        handles: &mut HashMap<String, Slot>,
+        indexers: &DashMap<String, Arc<KvIndex>>,
+        block_sizes: &DashMap<String, KvBlockSize>,
+        worker_url: &str,
+        id: u64,
+    ) {
         if !matches!(handles.get(worker_url), Some(Slot::Removing(held)) if held.id == id) {
             return;
         }
         // A backend without KV events is no longer a blind spot once its
-        // worker has left: lowered here, by the task that owned the
-        // subscription and under the slot lock, so a re-add of the URL that
-        // follows the removal cannot see its fresh gauge reset by a stale
-        // caller, and a caller that dropped `on_worker_removed` early does
-        // not leave it raised.
+        // worker has left: lowered here, under the slot lock and only while
+        // the reservation is this subscription's, so a re-add of the URL
+        // that follows the removal cannot see its fresh gauge reset by a
+        // stale caller, and a caller that dropped `on_worker_removed` early
+        // does not leave it raised.
         Metrics::set_kv_events_unavailable(worker_url, false);
-        handles.remove(worker_url);
+        let Some(Slot::Removing(held)) = handles.remove(worker_url) else {
+            return;
+        };
         // Under the slot lock, which `on_worker_added` holds from its lookup
         // of the model's index to its insert: an add of the model racing
         // with this either keeps the index (its slot is already in) or
         // creates the next one.
-        if kind != SubscriptionKind::Events {
+        if held.kind != SubscriptionKind::Events {
             return;
         }
         let last_of_model = !handles.values().any(|slot| {
             matches!(slot, Slot::Active(other)
-                if other.kind == SubscriptionKind::Events && other.model_id == model_id)
+                if other.kind == SubscriptionKind::Events && other.model_id == held.model_id)
         });
         if last_of_model {
-            indexers.remove(model_id);
-            block_sizes.remove(model_id);
-            Self::publish_dropped_index(model_id);
+            indexers.remove(&held.model_id);
+            block_sizes.remove(&held.model_id);
+            Self::publish_dropped_index(&held.model_id);
         }
     }
 
     /// Stop the KV event subscription for a worker.
     ///
-    /// Sends a graceful shutdown signal. The subscription task takes the
-    /// worker's blocks out of the index from its own per-worker map; that
+    /// Sends a graceful shutdown signal. The subscription task tells the
+    /// sink the worker left, and the sink takes the worker's blocks out of
+    /// the index from the row it keeps for the worker; that
     /// CPU-bound cleanup runs on the bounded blocking pool rather than a Tokio
     /// runtime worker. A write made here once the task is gone (the join
     /// error, the gauge of a task that ended before the removal) is made
@@ -683,6 +712,8 @@ impl KvEventMonitor {
                     Slot::Removing(Reservation {
                         id: sub.id,
                         done: sub.done.clone(),
+                        model_id: sub.model_id.clone(),
+                        kind: sub.kind,
                     }),
                 );
                 Some(sub)
@@ -717,17 +748,22 @@ impl KvEventMonitor {
             );
             Metrics::record_kv_event_subscription_failure(worker_url, "join_error");
         }
-        // A task that ends on the shutdown signal lowers the gauge in its own
-        // cleanup (`complete_removal`). One that had ended before this removal
-        // began (the answer that raises the gauge ends the subscription), or
-        // that did not reach its cleanup, left the reservation in place and
-        // the gauge with it: lowered here, under the slot lock and only while
-        // the reservation is still this subscription's. A successor under the
+        // A task that ends on the shutdown signal lifts its reservation in
+        // its own cleanup (`complete_removal`). One that had ended before
+        // this removal began (the answer that raises the gauge ends the
+        // subscription), or that did not reach its cleanup, left the
+        // reservation in place, and the gauge and the model's index with
+        // it: lifted here, under the slot lock and only while the
+        // reservation is still this subscription's. A successor under the
         // URL owns the gauge from its add on.
-        let handles = self.worker_handles.lock().await;
-        if matches!(handles.get(worker_url), Some(Slot::Removing(held)) if held.id == id) {
-            Metrics::set_kv_events_unavailable(worker_url, false);
-        }
+        let mut handles = self.worker_handles.lock().await;
+        Self::lift_reservation(
+            &mut handles,
+            &self.indexers,
+            &self.block_sizes,
+            worker_url,
+            id,
+        );
     }
 
     /// Stop all subscriptions and clean up.
@@ -906,12 +942,10 @@ mod tests {
 
     use kv_index::{ContentHash, SequenceHash, StoredBlock};
     use openai_protocol::worker::{ConnectionMode, HealthCheckConfig, RuntimeType, WorkerType};
+    use smg_worker::kv_events::{INDEX_REMOVAL_PERMITS, MAX_CONCURRENT_INDEX_REMOVALS};
     use tracing_test::traced_test;
 
-    use super::{
-        subscription::{INDEX_REMOVAL_PERMITS, MAX_CONCURRENT_INDEX_REMOVALS},
-        *,
-    };
+    use super::*;
     use crate::worker::{kv::index_backend::WorkerBlocks, BasicWorkerBuilder, WorkerRegistry};
 
     async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
@@ -1016,6 +1050,8 @@ mod tests {
                     Slot::Removing(Reservation {
                         id: sub.id,
                         done: sub.done.clone(),
+                        model_id: sub.model_id.clone(),
+                        kind: sub.kind,
                     }),
                 );
                 let _ = sub.shutdown_tx.send(());

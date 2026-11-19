@@ -224,9 +224,16 @@ impl Row {
         let mut held = 0;
         let mut next_end = None;
         self.vetoes.retain(|_, ends| {
-            ends.retain(|&(_, end)| end > now);
+            // One pass over a worker's ends drops the ends past and keeps
+            // the earliest end left: one more compare an end kept.
+            ends.retain(|&(_, end)| {
+                let stands = end > now;
+                if stands && next_end.is_none_or(|next: Instant| end < next) {
+                    next_end = Some(end);
+                }
+                stands
+            });
             held += ends.len();
-            next_end = ends.iter().map(|&(_, end)| end).chain(next_end).min();
             !ends.is_empty()
         });
         self.held = held;
@@ -475,7 +482,9 @@ impl Gateways {
     }
 
     /// The sweep's task: a pass every tenth of the grace period until
-    /// `stop`, on no stream's path.
+    /// `stop`, on no stream's path. The leases' due ends ride it too
+    /// ([`LeasesStore::expire`]): a file of leases whose decider waits for
+    /// a job issues nothing, so nothing else would end its due leases.
     pub(crate) async fn run(&self, mut stop: watch::Receiver<bool>) {
         let mut tick = tokio::time::interval((self.grace / 10).max(Duration::from_millis(1)));
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -487,6 +496,10 @@ impl Gateways {
                     // The pins of record ride this clock: a pass of theirs
                     // is due far less often than a tick.
                     self.store.sweep_pins(now);
+                    // So do the leases past their dispatch deadline in
+                    // a file whose decider waits for a job: one at work
+                    // ends its own file's at its issues.
+                    drop(LeasesStore::expire(&*self.store, now));
                 }
                 _ = stop.wait_for(|stop| *stop) => break,
             }
@@ -756,9 +769,10 @@ pub(crate) mod tests {
         },
         elector::{ElectionSettings, Elector, Tick},
         lease::{Lease, LeaseId},
+        spec::{AppliedSpec, PolicySpec},
         store::{
             GatewayId, HealthSink, LeaseRecord, LeaseState, LeasesStore, MemoryStore, Picked,
-            WorkersStore,
+            SessionsStore, WorkersStore,
         },
         view::WorkerId,
     };
@@ -836,6 +850,7 @@ pub(crate) mod tests {
             issued_at: now,
             dispatch_deadline: now + Duration::from_secs(5),
             state: LeaseState::Issued,
+            session_ttl_micros: None,
         }
     }
 
@@ -914,8 +929,13 @@ pub(crate) mod tests {
         let gone = welcomed(&gateways, A, "gateway-a", TERM, t0);
         let _stands = welcomed(&gateways, B, "gateway-b", TERM, t0);
         for gateway in [A, B] {
-            lifecycle::completed(&store, gateway, &a_completed(1, served), t0)
-                .expect("the frame reads");
+            lifecycle::completed(
+                &store,
+                &lifecycle::open(&store, gateway),
+                &a_completed(1, served),
+                t0,
+            )
+            .expect("the frame reads");
         }
         gone.end(t0);
 
@@ -943,7 +963,13 @@ pub(crate) mod tests {
         let (_elector, store, gateways, t0) = leading(GRACE);
         let served = worker(&store, "http://a:8000");
         let gone = welcomed(&gateways, A, "gateway-a", TERM, t0);
-        lifecycle::completed(&store, A, &a_completed(1, served), t0).expect("the frame reads");
+        lifecycle::completed(
+            &store,
+            &lifecycle::open(&store, A),
+            &a_completed(1, served),
+            t0,
+        )
+        .expect("the frame reads");
         gone.end(t0);
 
         let _anew = welcomed(&gateways, A, "gateway-a", TERM, t0 + GRACE);
@@ -973,8 +999,13 @@ pub(crate) mod tests {
         drop(second);
         assert_eq!(gateways.sweep(t0 + GRACE), 0, "a replaced session runs");
         // Its late frame, then its end.
-        lifecycle::completed(&store, A, &a_completed(1, served), t0 + GRACE)
-            .expect("the frame reads");
+        lifecycle::completed(
+            &store,
+            &lifecycle::open(&store, A),
+            &a_completed(1, served),
+            t0 + GRACE,
+        )
+        .expect("the frame reads");
         drop(first);
         assert_eq!(gateways.sweep(t0 + GRACE), 1);
         assert!(
@@ -1042,8 +1073,13 @@ pub(crate) mod tests {
                 let gateway = GatewayId(100 + wave * 8 + n);
                 let subject = format!("gateway-{wave}-{n}");
                 let seat = welcomed(&gateways, gateway, &subject, TERM, now);
-                lifecycle::completed(&store, gateway, &a_completed(1, served), now)
-                    .expect("the frame reads");
+                lifecycle::completed(
+                    &store,
+                    &lifecycle::open(&store, gateway),
+                    &a_completed(1, served),
+                    now,
+                )
+                .expect("the frame reads");
                 seat.end(now);
             }
             assert_eq!(store.health_entries(), 8, "a completion a gateway");
@@ -1378,6 +1414,77 @@ pub(crate) mod tests {
             ended.elapsed()
         );
 
+        stop.send_replace(true);
+        timeout(Duration::from_secs(20), task.join_next())
+            .await
+            .expect("the task ends within 20 s of its stop")
+            .expect("one task")
+            .expect("it ended by itself");
+    }
+
+    /// The leases' due ends ride the sweeps' task: a lease past its
+    /// dispatch deadline leaves by the task's own tick where no decider
+    /// issues, its gateway's session standing, and a lease inside its
+    /// deadline stays.
+    #[tokio::test]
+    async fn the_sweeps_task_ends_a_lease_past_its_dispatch_deadline() {
+        let (_elector, store, gateways, t0) = leading(Duration::from_millis(60));
+        let due = LeaseRecord {
+            dispatch_deadline: t0,
+            ..lease(A, 1, t0)
+        };
+        store.issue(due).expect("a lease");
+        store.issue(lease(A, 2, t0)).expect("a lease");
+        let _stands = welcomed(&gateways, A, "gateway-a", TERM, t0);
+        let (stop, stopped) = watch::channel(false);
+        let mut task = JoinSet::new();
+        let sweeper = Arc::clone(&gateways);
+        task.spawn(async move { sweeper.run(stopped).await });
+
+        let started = Instant::now();
+        while store.live(A) > 1 {
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "the sweep ended no due lease in 20 s"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(LeasesStore::get(&*store, A, LeaseId(1)).is_none());
+        assert!(LeasesStore::get(&*store, A, LeaseId(2)).is_some());
+
+        stop.send_replace(true);
+        timeout(Duration::from_secs(20), task.join_next())
+            .await
+            .expect("the task ends within 20 s of its stop")
+            .expect("one task")
+            .expect("it ended by itself");
+    }
+
+    /// The pins of record ride the sweeps' task: a pin past its end leaves
+    /// by the task's own tick, which no other caller of the pins' sweep
+    /// stands in for.
+    #[tokio::test]
+    async fn the_sweeps_task_drops_a_pin_of_record_past_its_end() {
+        let (_elector, store, gateways, t0) = leading(Duration::from_millis(60));
+        // A standing sessions rule: without one no pass of the pins runs.
+        let mut document = PolicySpec::preset("manual").expect("a preset of this build");
+        document.generation = 1;
+        let spec = AppliedSpec::validate(&document).expect("the document validates");
+        store.apply(spec).expect("a first generation");
+        SessionsStore::pin(&*store, 7, WorkerId(1), t0, Some(store.micros(t0)));
+        assert_eq!(SessionsStore::len(&*store), 1);
+        let (stop, stopped) = watch::channel(false);
+        let mut task = JoinSet::new();
+        let sweeper = Arc::clone(&gateways);
+        task.spawn(async move { sweeper.run(stopped).await });
+        let started = Instant::now();
+        while SessionsStore::len(&*store) > 0 {
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "the task swept no pin in 20 s"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
         stop.send_replace(true);
         timeout(Duration::from_secs(20), task.join_next())
             .await

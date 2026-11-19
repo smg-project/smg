@@ -54,7 +54,7 @@ clock, a lease's issue instant), and each file's comments name them.
 
 - A gRPC plugin or a client of the controller compiles the two proto files
   with `protoc` and the generator of its language; the include path holds
-  this directory and the engine wire's directory (`crates/grpc_client/proto`
+  this directory and the engine wire's directory (`crates/worker/proto`
   in this repository) for `common.proto`. In Rust the generated types come
   from `tonic-prost-build` as the repository's own gRPC clients do.
 - A WebAssembly plugin targets one world of `smg-policy.wit` with

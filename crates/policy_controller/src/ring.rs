@@ -39,6 +39,7 @@
 
 use std::{
     cell::RefCell,
+    cmp::Ordering,
     collections::VecDeque,
     mem,
     time::{Duration, Instant},
@@ -51,10 +52,10 @@ use crate::{
     affinity::Gates,
     counts::with_counts,
     decision::MAX_TARGETS,
-    framework::{Scorer, TieBand},
+    framework::{Scorer, TieBand, DRAW_BOUND},
     lease::{Lifecycle, Membership},
     spec::{BoundedLoadParams, Needs},
-    view::{Candidate, RequestFacts, WorkerId},
+    view::{Candidate, PoolFacts, RequestFacts, WorkerId},
     Draw,
 };
 
@@ -90,6 +91,75 @@ pub enum Probe<T> {
     Stop,
 }
 
+/// The ids a lifecycle pruned within [`FENCE`], fenced against relearning
+/// from a view older than the pruning. A stage that learns its members from
+/// a decision's view holds one. It keeps pruned workers out of a listing
+/// and is no kin of [`crate::elector::Fence`], which holds the term a
+/// process leads under.
+#[derive(Debug, Default)]
+pub(crate) struct Fence {
+    /// The retirements within [`FENCE`], oldest first. Those of an id the
+    /// feed named since stay until they lapse and lift nothing.
+    retired: VecDeque<(WorkerId, Instant)>,
+    /// Each fenced id with its last retirement, the one whose lapse lifts
+    /// the fence.
+    fenced: FxHashMap<WorkerId, Instant>,
+}
+
+impl Fence {
+    /// Whether no id holds a fence.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.fenced.is_empty()
+    }
+
+    /// Whether `id` holds a fence the last [`Fence::expire`] left standing.
+    pub(crate) fn holds(&self, id: WorkerId) -> bool {
+        self.fenced.contains_key(&id)
+    }
+
+    /// Whether `id` was pruned within [`FENCE`] of `now` and is fenced
+    /// against relearning.
+    pub(crate) fn is_retired(&self, id: WorkerId, now: Instant) -> bool {
+        self.fenced
+            .get(&id)
+            .is_some_and(|&at| now.saturating_duration_since(at) < FENCE)
+    }
+
+    /// Lift the fence on `id`: the feed named it as a member again.
+    pub(crate) fn admit(&mut self, id: WorkerId) {
+        // Its retirements stay in the list: none is its last any more, so
+        // their lapses lift nothing.
+        self.fenced.remove(&id);
+    }
+
+    /// Forget the retirements older than [`FENCE`] at `now`.
+    pub(crate) fn expire(&mut self, now: Instant) {
+        while let Some(&(old, at)) = self.retired.front() {
+            if now.saturating_duration_since(at) < FENCE {
+                break;
+            }
+            self.retired.pop_front();
+            // The fence lifts with the id's last retirement. The map says
+            // whether this entry is it: no pass over the list for a lapse.
+            if self.fenced.get(&old) == Some(&at) {
+                self.fenced.remove(&old);
+            }
+        }
+    }
+
+    /// Fence `id` for [`FENCE`] from `now`: a lifecycle pruned it.
+    pub(crate) fn retire(&mut self, id: WorkerId, now: Instant) {
+        self.expire(now);
+        let last = self.fenced.entry(id).or_insert(now);
+        *last = (*last).max(now);
+        // Two callers can read their clocks in one order and get here in
+        // the other. The list stays oldest first all the same, so a
+        // retirement that lapsed never waits behind a later one.
+        let behind = self.retired.partition_point(|&(_, at)| at <= now);
+        self.retired.insert(behind, (id, now));
+    }
+}
+
 /// The ring: its members, each at [`VIRTUAL_NODES`] sorted positions hashed
 /// from the member's stable key and indexed by the handle id; the ids pruned
 /// within [`FENCE`], fenced against relearning from a stale view.
@@ -100,13 +170,30 @@ pub struct Ring {
     index: FxHashMap<WorkerId, u32>,
     /// `(position, member index)`, sorted by position.
     entries: Vec<(u64, u32)>,
-    /// The retirements within [`FENCE`], oldest first. Those of an id the
-    /// feed named since stay until they lapse and lift nothing.
-    retired: VecDeque<(WorkerId, Instant)>,
-    /// Each fenced id with its last retirement, the one whose lapse lifts
-    /// the fence.
-    fenced: FxHashMap<WorkerId, Instant>,
+    /// The ids pruned within [`FENCE`].
+    fence: Fence,
+    /// The pools shown whole ([`Ring::show`]) under `shown_epoch`, by their
+    /// host's number in rising order, each with whether it may be walked:
+    /// its rows stood in the order of their ids, and each was a member
+    /// behind the showing.
+    shown: Vec<(u32, bool)>,
+    /// The newest membership epoch a pool was shown under.
+    shown_epoch: u64,
+    /// For a member, by its index: the pool that showed it as a row a walk
+    /// may take, by the pool's number, [`MANY_POOLS`] where several did
+    /// and [`NO_POOL`] where none did. A member whose mark is another
+    /// pool's is no row of the pool a walk is taken for. Dropped with the
+    /// notes, and never longer than the members.
+    shown_by: Vec<u32>,
+    /// Whether a member carries the mark of several pools.
+    shown_many: bool,
 }
+
+/// The mark of a member no pool showed since the notes were last dropped.
+const NO_POOL: u32 = u32::MAX;
+
+/// The mark of a member several pools showed: a row of each.
+const MANY_POOLS: u32 = u32::MAX - 1;
 
 impl Ring {
     pub fn new() -> Self {
@@ -189,56 +276,123 @@ impl Ring {
         members: impl IntoIterator<Item = (WorkerId, u32)>,
         now: Instant,
     ) -> usize {
-        self.expire(now);
-        let fenced = &self.fenced;
+        self.fence.expire(now);
+        let fence = &self.fence;
         let fresh: Vec<(WorkerId, u32)> = members
             .into_iter()
-            .filter(|(id, _)| !fenced.contains_key(id))
+            .filter(|&(id, _)| !fence.holds(id))
             .collect();
         self.add_many(fresh)
+    }
+
+    /// [`Ring::learn`] for every row of the pool its host numbers `pool`
+    /// under the membership epoch `epoch`, and the note that the pool was
+    /// shown, with whether a walk may find its rows: they stood in the
+    /// order of their ids (`ordered`) and each is a member now. A row the
+    /// fence left out is the whole pass's to place, so its pool is not
+    /// walked until it is shown again: at the next epoch, or after the
+    /// feed names an id ([`Ring::admit`], [`Ring::remove`],
+    /// [`Ring::retain_only`]), which drops every note. The pools of an
+    /// earlier epoch are dropped at the first of a later one, and a pool
+    /// of an epoch behind the one held is not noted. Each row of a pool a
+    /// walk may take is marked with the pool's number, or with the mark of
+    /// several pools where another showed it too: the marks stand and
+    /// fall with the notes.
+    pub fn show(
+        &mut self,
+        epoch: u64,
+        pool: u32,
+        ordered: bool,
+        members: impl Iterator<Item = (WorkerId, u32)> + Clone,
+        now: Instant,
+    ) {
+        self.learn(members.clone(), now);
+        let rows = members.clone();
+        let mut members = members;
+        let ordered = ordered && members.all(|(id, _)| self.contains(id));
+        if epoch < self.shown_epoch {
+            return;
+        }
+        if epoch > self.shown_epoch {
+            self.forget_shown();
+            self.shown_epoch = epoch;
+        }
+        match self
+            .shown
+            .binary_search_by_key(&pool, |&(number, _)| number)
+        {
+            Ok(at) => self.shown[at].1 = ordered,
+            Err(at) => self.shown.insert(at, (pool, ordered)),
+        }
+        if !ordered {
+            return;
+        }
+        // Each row of a pool a walk may take is marked with the pool, so
+        // the walk of another pool passes it by one read.
+        self.shown_by.resize(self.members.len(), NO_POOL);
+        let mark = pool.min(MANY_POOLS);
+        for (id, _) in rows {
+            if let Some(member) = self.member_index(id) {
+                let by = &mut self.shown_by[member as usize];
+                *by = if *by == NO_POOL || *by == mark {
+                    mark
+                } else {
+                    MANY_POOLS
+                };
+                self.shown_many |= *by == MANY_POOLS;
+            }
+        }
+    }
+
+    /// Drops what the ring was shown: every pool's note and every
+    /// member's mark.
+    fn forget_shown(&mut self) {
+        self.shown.clear();
+        self.shown_by.clear();
+        self.shown_many = false;
+    }
+
+    /// The members' marks by member index, no longer than the members,
+    /// and whether one of them is the mark of several pools: where none
+    /// is, a member is a pool's by that pool's number alone.
+    fn marks(&self) -> (&[u32], bool) {
+        (&self.shown_by, self.shown_many)
+    }
+
+    /// What [`Ring::show`] noted of the pool numbered `pool` under `epoch`:
+    /// whether a walk may find its rows. `None` for a pool not shown yet,
+    /// or not since the feed last named an id, and `Some(false)` under an
+    /// epoch behind the one held, whose pools are shown no more.
+    pub fn shown(&self, epoch: u64, pool: u32) -> Option<bool> {
+        match epoch.cmp(&self.shown_epoch) {
+            Ordering::Less => Some(false),
+            Ordering::Greater => None,
+            Ordering::Equal => {
+                let at = self
+                    .shown
+                    .binary_search_by_key(&pool, |&(number, _)| number);
+                at.ok().map(|at| self.shown[at].1)
+            }
+        }
     }
 
     /// Whether `id` was pruned within [`FENCE`] of `now` and is fenced
     /// against relearning.
     pub fn is_retired(&self, id: WorkerId, now: Instant) -> bool {
-        self.fenced
-            .get(&id)
-            .is_some_and(|&at| now.saturating_duration_since(at) < FENCE)
+        self.fence.is_retired(id, now)
     }
 
     /// Lift the fence on `id`: the feed named it as a member again.
     pub fn admit(&mut self, id: WorkerId) {
-        // Its retirements stay in the list: none is its last any more, so
-        // their lapses lift nothing.
-        self.fenced.remove(&id);
-    }
-
-    /// Forget the retirements older than [`FENCE`] at `now`.
-    fn expire(&mut self, now: Instant) {
-        while let Some(&(old, at)) = self.retired.front() {
-            if now.saturating_duration_since(at) < FENCE {
-                break;
-            }
-            self.retired.pop_front();
-            // The fence lifts with the id's last retirement. The map says
-            // whether this entry is it: no pass over the list for a lapse.
-            if self.fenced.get(&old) == Some(&at) {
-                self.fenced.remove(&old);
-            }
-        }
-    }
-
-    fn retire(&mut self, id: WorkerId, now: Instant) {
-        self.expire(now);
-        let last = self.fenced.entry(id).or_insert(now);
-        *last = (*last).max(now);
-        self.retired.push_back((id, now));
+        self.fence.admit(id);
+        self.forget_shown();
     }
 
     /// Remove a member at `now`, fencing its id for [`FENCE`]; `false` when
     /// it was none.
     pub fn remove(&mut self, id: WorkerId, now: Instant) -> bool {
-        self.retire(id, now);
+        self.fence.retire(id, now);
+        self.forget_shown();
         let Some(gone) = self.index.remove(&id) else {
             return false;
         };
@@ -263,9 +417,10 @@ impl Ring {
     /// carries its key. A ring that holds no member reads the names for no
     /// leaver, and one that holds no fence admits none.
     pub fn retain_only(&mut self, ids: &[WorkerId], now: Instant) {
+        self.forget_shown();
         // A fence a named id holds stood before the pruning, which fences
         // the ids the snapshot does not name.
-        let fenced = !self.fenced.is_empty();
+        let fenced = !self.fence.is_empty();
         if !self.members.is_empty() {
             let keep: FxHashSet<WorkerId> = ids.iter().copied().collect();
             self.prune(&keep, now);
@@ -333,19 +488,25 @@ impl Ring {
                     to[at - 1] != LEFT
                 });
                 for &id in &gone {
-                    self.retire(id, now);
+                    self.fence.retire(id, now);
                 }
             }
         }
     }
 
-    /// Walk clockwise from the key's position, showing `visit` each entry's
-    /// member until it takes one or stops; the walk goes once around.
-    pub fn walk<T>(&self, key: u64, mut visit: impl FnMut(u32) -> Probe<T>) -> Option<T> {
+    /// The members at the ring's positions clockwise from the key's, once
+    /// around: the one source of a walk's order.
+    fn around(&self, key: u64) -> impl Iterator<Item = u32> + '_ {
         let at = key_position(key);
         let start = self.entries.partition_point(|&(p, _)| p < at);
         let (before, from) = self.entries.split_at(start);
-        for &(_, member) in from.iter().chain(before) {
+        from.iter().chain(before).map(|&(_, member)| member)
+    }
+
+    /// Walk clockwise from the key's position, showing `visit` each entry's
+    /// member until it takes one or stops; the walk goes once around.
+    pub fn walk<T>(&self, key: u64, mut visit: impl FnMut(u32) -> Probe<T>) -> Option<T> {
+        for member in self.around(key) {
             match visit(member) {
                 Probe::Take(value) => return Some(value),
                 Probe::Skip => {}
@@ -480,6 +641,22 @@ impl ConsistentHash {
         }
     }
 
+    /// Shows the ring every row of the pool its host numbers `pool` under
+    /// `epoch` ([`Ring::show`]), as a whole pass shows it the survivors the
+    /// feed never named, with whether the rows stand in the order of their
+    /// ids: a walk finds a member's row by that order, and the pool of a
+    /// host that hands another is left to the whole pass. Once a pool and
+    /// membership epoch: out of line, a decision that finds its pool shown
+    /// walks the ring under the one shared lock.
+    #[cold]
+    #[inline(never)]
+    fn learn(&self, epoch: u64, pool: u32, candidates: &[Candidate]) {
+        let ordered = candidates.windows(2).all(|pair| pair[0].id < pair[1].id);
+        let rows = candidates.iter().map(|row| (row.id, row.key));
+        let now = Instant::now();
+        self.ring.write().show(epoch, pool, ordered, rows, now);
+    }
+
     /// The prefix form: a request with no routing key is keyed by its
     /// prefix, at the block size `gates` reads for the request. The key is
     /// the hash of its last whole block at the deepest of `boundaries` it
@@ -572,6 +749,97 @@ impl ConsistentHash {
     }
 }
 
+/// A ring of the pool's rows alone: [`walk_pool`] reads no mark.
+const ALONE: u8 = 0;
+/// No member is a row of several pools: a member is the pool's by its
+/// number alone, in one compare.
+const APART: u8 = 1;
+/// A member may be a row of several pools, under their one mark.
+const SHARED: u8 = 2;
+
+/// The walk of [`ConsistentHash::own`] over a ring whose members `marks`
+/// tells apart as `BY` says: the rows met for the pool `number` are asked
+/// about and the first of them kept are handed out in the ring's order.
+/// One body, built once for each form, so a walk past another pool's
+/// members costs each the compares its ring needs. `false` where the walk
+/// stopped at its bound or came round short of the rows handed.
+fn walk_pool<const BY: u8>(
+    ring: &Ring,
+    marks: &[u32],
+    key: u64,
+    number: u32,
+    candidates: &[Candidate],
+    keep: &mut dyn FnMut(&Candidate) -> bool,
+    kept: &mut Vec<u32>,
+) -> bool {
+    // The members met, kept or refused: a walk meets a member at each
+    // of its positions and asks about it once.
+    let mut met = [FREE; MAX_TARGETS + DRAW_BOUND as usize];
+    let (mut asked, mut refused) = (0, 0);
+    let mut members = ring.around(key);
+    loop {
+        let next = if BY == ALONE {
+            members.next()
+        } else {
+            passed::<BY>(&mut members, marks, number)
+        };
+        // A walk that came round the ring short of the rows handed met no
+        // member for one of them, which the whole pass places.
+        let Some(member) = next else {
+            return false;
+        };
+        if met[..asked].contains(&member) {
+            continue;
+        }
+        let id = ring.members().get(member as usize);
+        // A ring that learned one pool in its rows' order names a member
+        // by its row's position: the row there is read first, its id
+        // compared.
+        let row = id.and_then(|id| match candidates.get(member as usize) {
+            Some(row) if row.id == *id => Some(member as usize),
+            _ => candidates.binary_search_by_key(id, |row| row.id).ok(),
+        });
+        let (Some(row), Some(slot)) = (row, met.get_mut(asked)) else {
+            continue;
+        };
+        *slot = member;
+        asked += 1;
+        if keep(&candidates[row]) {
+            kept.push(row as u32);
+            if kept.len() == MAX_TARGETS {
+                return true;
+            }
+        } else {
+            refused += 1;
+            if refused == DRAW_BOUND {
+                return false;
+            }
+        }
+        // Every row handed was asked: no position further on holds
+        // another.
+        if asked == candidates.len() {
+            return !kept.is_empty();
+        }
+    }
+}
+
+/// The next of `members` that may be a row of the pool `number`: its mark
+/// is the pool's, or the mark of several pools where `BY` says a ring
+/// holds one. A member no pool showed, or another did, is passed. Out of
+/// line, a loop of its own: it holds nothing of the walk across a member
+/// it passes, so each costs one read and one compare.
+#[inline(never)]
+fn passed<const BY: u8>(
+    members: &mut impl Iterator<Item = u32>,
+    marks: &[u32],
+    number: u32,
+) -> Option<u32> {
+    members.find(|&member| {
+        let by = marks.get(member as usize);
+        by.is_some_and(|&by| by == number || (BY == SHARED && by == MANY_POOLS))
+    })
+}
+
 impl Lifecycle for ConsistentHash {
     fn on_membership(&self, change: &Membership<'_>) {
         let now = Instant::now();
@@ -589,7 +857,7 @@ impl Lifecycle for ConsistentHash {
                 ring.admit(new);
             }
             Membership::Snapshot(ids) => ring.retain_only(ids, now),
-            Membership::Relabelled(_) | Membership::Resized(_) => {}
+            Membership::Relabelled(_) | Membership::Resized(_) | Membership::Left { .. } => {}
         }
     }
 }
@@ -597,6 +865,72 @@ impl Lifecycle for ConsistentHash {
 impl Scorer for ConsistentHash {
     fn name(&self) -> &'static str {
         "consistent-hash"
+    }
+
+    /// The ring places a request that carries a routing key by its walk
+    /// alone: under the prefix form too, where a routing key leads the
+    /// prefix. The bounded-load rule reads every survivor's count, and a
+    /// request keyed by its prefix is tried at more keys than one: both
+    /// read the pool whole.
+    fn owns(&self) -> bool {
+        self.bounded.is_none()
+    }
+
+    /// The walk a whole pass ranks, with no pool read: from the request's
+    /// routing key over the ring's members, each member's row found by its
+    /// id among the rows, the filters asked about the rows met and no
+    /// others, and the first [`MAX_TARGETS`] of them kept handed out in the
+    /// ring's order. The walk ends there, or once every row handed was
+    /// asked. The targets are the whole pass's, row for row.
+    ///
+    /// The pool's list of engines is the host's word for what the walk
+    /// takes on trust: the rows are a pool's own under a membership epoch,
+    /// in the order of their ids, and the pool is numbered. `false`, with
+    /// what `kept` holds to be dropped, where the host does not say so,
+    /// where the request has no routing key, where the pool was shown
+    /// with a row the ring does not hold, once [`DRAW_BOUND`] rows were
+    /// refused, which says nothing of the rows behind them, where the walk
+    /// came round the ring short of the rows handed, one of which the ring
+    /// does not hold: the whole pass decides.
+    ///
+    /// One ring serves every pool of its profile. The walk passes a member
+    /// that another pool showed by one read of its mark, as the whole pass
+    /// passes it by one slot, so a pool is walked whatever its share of
+    /// the ring.
+    fn own(
+        &self,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        candidates: &[Candidate],
+        keep: &mut dyn FnMut(&Candidate) -> bool,
+        kept: &mut Vec<u32>,
+    ) -> bool {
+        let key = facts.session_key.hash;
+        let unsaid = pool.membership_epoch == 0 || pool.engines.is_empty();
+        if key == 0 || unsaid || !self.owns() {
+            return false;
+        }
+        let (epoch, number) = (pool.membership_epoch, pool.engines.pool());
+        let mut ring = self.ring.read();
+        let ordered = ring.shown(epoch, number).or_else(|| {
+            // No lock is held across the two.
+            RwLockReadGuard::unlocked(&mut ring, || self.learn(epoch, number, candidates));
+            ring.shown(epoch, number)
+        });
+        if ordered != Some(true) {
+            return false;
+        }
+        // One ring serves every pool of its profile, and a walk passes the
+        // other pools' members on its way, each by one read of its mark. A
+        // ring of this pool's rows alone holds no other to pass.
+        let (marks, many) = ring.marks();
+        if candidates.len() == ring.len() {
+            walk_pool::<ALONE>(&ring, marks, key, number, candidates, keep, kept)
+        } else if many {
+            walk_pool::<SHARED>(&ring, marks, key, number, candidates, keep, kept)
+        } else {
+            walk_pool::<APART>(&ring, marks, key, number, candidates, keep, kept)
+        }
     }
 
     fn score(
@@ -1138,6 +1472,35 @@ mod tests {
         assert_eq!(ring.learn([(id, key_of(id))], later + FENCE), 1);
     }
 
+    /// Two ids retired out of their clocks' order: each lapses at its own
+    /// instant, and a listing's read of the fence agrees with the clock's
+    /// on both.
+    #[test]
+    fn a_retirement_told_behind_a_later_one_lapses_at_its_own_instant() {
+        let t0 = Instant::now();
+        let (late, early) = (WorkerId(1), WorkerId(2));
+        let mut fence = Fence::default();
+        fence.retire(late, t0 + FENCE / 2);
+        fence.retire(early, t0);
+        for now in [
+            t0 + FENCE / 2,
+            t0 + FENCE,
+            t0 + FENCE + FENCE / 4,
+            t0 + FENCE + FENCE / 2,
+        ] {
+            fence.expire(now);
+            for id in [late, early] {
+                assert_eq!(
+                    fence.holds(id),
+                    fence.is_retired(id, now),
+                    "{id:?} {:?} after the first clock read",
+                    now - t0
+                );
+            }
+        }
+        assert!(fence.is_empty());
+    }
+
     /// A snapshot that drops several members leaves the ring a removal
     /// apiece leaves: every key's owner, each leaver fenced, the indices
     /// dense.
@@ -1640,5 +2003,91 @@ mod tests {
         // With no rule the deeper boundary's owner keeps the key whatever
         // it holds.
         assert_eq!(under(&levelled(None), 30, 30), ranks(deep));
+    }
+
+    #[test]
+    fn a_ring_keeps_the_pools_it_was_shown_by_number_while_their_epoch_stands() {
+        let mut ring = Ring::new();
+        let now = Instant::now();
+        assert_eq!(ring.shown(3, 0), None);
+        for pool in 0..9 {
+            let member = (WorkerId(u64::from(pool) + 1), pool);
+            ring.show(3, pool, pool != 4, [member].into_iter(), now);
+        }
+        // Nine pools under one epoch: none forgotten, each with its word.
+        for pool in 0..9 {
+            assert_eq!(ring.shown(3, pool), Some(pool != 4), "pool {pool}");
+        }
+        assert_eq!(ring.shown(3, 9), None, "a pool not shown");
+        assert_eq!(ring.len(), 9);
+        // A later epoch: its pools are shown anew, and the earlier one's
+        // are shown no more.
+        assert_eq!(ring.shown(4, 0), None);
+        ring.show(4, 0, true, [].into_iter(), now);
+        assert_eq!(ring.shown(4, 0), Some(true));
+        assert_eq!(ring.shown(4, 1), None);
+        assert_eq!(ring.shown(3, 1), Some(false), "an epoch behind");
+        // A pool of a passed epoch is learned and not noted.
+        ring.show(3, 7, true, [(WorkerId(77), 77)].into_iter(), now);
+        assert!(ring.contains(WorkerId(77)));
+        assert_eq!(ring.shown(3, 7), Some(false));
+        assert_eq!(ring.shown(4, 7), None);
+        // The feed names an id: every note is dropped. A pool shown while
+        // the fence leaves a row of it out is not walked, until the feed
+        // names the row again and the pool is shown with it.
+        let row = [(WorkerId(1), 0)];
+        ring.remove(WorkerId(1), now);
+        assert_eq!(ring.shown(4, 0), None, "a tell drops the notes");
+        ring.show(4, 0, true, row.into_iter(), now);
+        assert!(!ring.contains(WorkerId(1)));
+        assert_eq!(ring.shown(4, 0), Some(false), "a row left out");
+        ring.admit(WorkerId(1));
+        assert_eq!(ring.shown(4, 0), None);
+        ring.show(4, 0, true, row.into_iter(), now);
+        assert_eq!(ring.shown(4, 0), Some(true));
+        ring.retain_only(&[WorkerId(1)], now);
+        assert_eq!(ring.shown(4, 0), None, "a snapshot drops the notes");
+    }
+
+    #[test]
+    fn a_ring_marks_each_member_with_the_pool_that_showed_it_while_its_notes_stand() {
+        let now = Instant::now();
+        let rows = |ids: std::ops::Range<u64>| ids.map(|n| (WorkerId(n), n as u32));
+        let by = |ring: &Ring, n: u64| {
+            let member = ring.member_index(WorkerId(n)).expect("a member");
+            let mark = ring.marks().0.get(member as usize);
+            mark.copied().unwrap_or(NO_POOL)
+        };
+        let mut ring = Ring::new();
+        ring.show(1, 0, true, rows(0..4), now);
+        assert!(!ring.marks().1, "no member of two pools yet");
+        ring.show(1, 3, true, rows(2..6), now);
+        assert!(ring.marks().1, "two members of two pools");
+        assert_eq!([by(&ring, 0), by(&ring, 1)], [0, 0]);
+        assert_eq!([by(&ring, 2), by(&ring, 3)], [MANY_POOLS; 2], "of both");
+        assert_eq!([by(&ring, 4), by(&ring, 5)], [3, 3]);
+        // A pool no walk may take marks nothing, and one shown again
+        // keeps its mark.
+        ring.show(1, 7, false, rows(6..8), now);
+        ring.show(1, 0, true, rows(0..4), now);
+        assert_eq!([by(&ring, 6), by(&ring, 0)], [NO_POOL, 0]);
+        // Each word that drops the notes drops the marks: a later epoch,
+        // and the three tells of the feed that name an id.
+        let drops: [fn(&mut Ring, Instant); 4] = [
+            |ring, now| ring.show(2, 9, true, [(WorkerId(8), 8)].into_iter(), now),
+            |ring, _| ring.admit(WorkerId(100)),
+            |ring, now| {
+                ring.remove(WorkerId(5), now);
+            },
+            |ring, now| ring.retain_only(&[WorkerId(0), WorkerId(8)], now),
+        ];
+        for (epoch, dropped) in (1..).zip(drops) {
+            ring.show(epoch, 0, true, rows(0..1), now);
+            assert_eq!(by(&ring, 0), 0);
+            dropped(&mut ring, now);
+            assert_eq!(by(&ring, 0), NO_POOL, "drop {epoch}");
+            assert!(!ring.marks().1, "drop {epoch}");
+        }
+        assert_eq!(by(&ring, 8), NO_POOL, "a member the snapshot kept");
     }
 }

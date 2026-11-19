@@ -57,7 +57,7 @@
 # to two cores. The three `policy_store_held/` rows time a publication beside a reader that holds the rows it
 # would write over. The four `policy_store_pairs/` rows at 8 and at 64 a side are the two membership writes
 # of smaller fleets of pairs. The two other `policy_store_models/` rows read the same write beside a list of
-# 128 and of 4,096 models: the scan is a tenth of the first, and six rounds of one build read the second at 3.4
+# 128 and of 4,096 models: the scan is a sixth of the first, and six rounds of one build read the second at 3.4
 # to 8.9 ms.
 #
 # Threshold (the method is described in tokenizer.toml). The identical-build spread, (max - min) / median of the
@@ -125,7 +125,8 @@
 # batch after the first, four do not count steadily (`publish/8`, `publish/64`, `view_build/8`,
 # `member_write_spread/512`) and three were not read, the bench having stopped under the counter. The two rows of
 # a fleet of pairs and the row of many models, added since, do not count steadily either. A row that does not
-# count steadily, or whose count is not read, keeps the time's verdict.
+# count steadily, or whose count is not read, keeps the time's verdict; where every count of a row is within
+# half a percent, a second measurement decides it.
 #
 # Every job uploads bench-gate/results.json with the raw per-run medians of both sides; the hosted runner's
 # own spread can be read from those and the thresholds tightened once it is known.

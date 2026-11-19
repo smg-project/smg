@@ -7,7 +7,7 @@
 
 use crate::{
     counts::with_counts,
-    decision::{Decision, Lifted, Target, Trace},
+    decision::{Decision, Target, Trace},
     lease::{Lease, LeaseKind, Membership, Outcome, ReleaseReason, Side, Signal, TransportClass},
     plugins::{
         config::{Exposure, Reveal},
@@ -375,15 +375,7 @@ fn trace(t: &Trace) -> proto::Trace {
         fallback: false,
         affinity_source: 0,
         drew_first: t.drew_first(),
-        lifted: lifted(t.lifted) as i32,
-    }
-}
-
-/// The contract's word for the veto the all-vetoed rule lifted.
-const fn lifted(mark: Lifted) -> proto::LiftedVeto {
-    match mark {
-        Lifted::None => proto::LiftedVeto::None,
-        Lifted::Overload => proto::LiftedVeto::Overload,
+        lifted: proto::LiftedVeto::from(t.lifted) as i32,
     }
 }
 
@@ -488,9 +480,13 @@ pub(crate) fn released(l: &Lease, r: ReleaseReason) -> proto::lifecycle_event::E
     })
 }
 
-pub(crate) fn membership(m: &Membership<'_>) -> proto::lifecycle_event::Event {
+/// A membership word as the plugin contract carries it. `None` for
+/// [`Membership::Left`]: the contract has no kind for it, and a plugin
+/// hears the write's own word, said beside it.
+pub(crate) fn membership(m: &Membership<'_>) -> Option<proto::lifecycle_event::Event> {
     use proto::membership_change::Kind;
     let (kind, worker_id, old_worker_id, ids) = match m {
+        Membership::Left { .. } => return None,
         Membership::Added(w) => (Kind::Added, w.0, 0, Vec::new()),
         Membership::Removed(w) => (Kind::Removed, w.0, 0, Vec::new()),
         Membership::Replaced { old, new } => (Kind::Replaced, new.0, old.0, Vec::new()),
@@ -500,12 +496,14 @@ pub(crate) fn membership(m: &Membership<'_>) -> proto::lifecycle_event::Event {
             (Kind::Snapshot, 0, 0, workers.iter().map(|w| w.0).collect())
         }
     };
-    proto::lifecycle_event::Event::Membership(proto::MembershipChange {
-        kind: kind as i32,
-        worker_id,
-        old_worker_id,
-        ids,
-    })
+    Some(proto::lifecycle_event::Event::Membership(
+        proto::MembershipChange {
+            kind: kind as i32,
+            worker_id,
+            old_worker_id,
+            ids,
+        },
+    ))
 }
 
 /// A signal; a veto's instant on the host's clock becomes the microseconds
@@ -686,7 +684,8 @@ pub(crate) fn read(
 
 #[cfg(test)]
 mod tests {
-    use super::{proto, Answer, Invalid, FILTER, PICK, SCORE};
+    use super::{membership, proto, Answer, Invalid, FILTER, PICK, SCORE};
+    use crate::{lease::Membership, view::WorkerId};
 
     /// The stages' rules, under a plugin that declared no counter.
     fn read(d: proto::PluginDecision, asked: u32, count: u32) -> Result<Answer, Invalid> {
@@ -1128,5 +1127,19 @@ mod tests {
                 wire.len()
             );
         }
+    }
+
+    /// The contract has no kind for the models a worker left: the mapper
+    /// hands a plugin nothing for that word, and the write's own word as
+    /// before.
+    #[test]
+    fn a_plugin_is_told_nothing_of_the_models_a_worker_left() {
+        let (id, models) = (WorkerId(7), ["m".to_string()]);
+        let left = Membership::Left {
+            id,
+            models: &models,
+        };
+        assert!(membership(&left).is_none());
+        assert!(membership(&Membership::Relabelled(id)).is_some());
     }
 }

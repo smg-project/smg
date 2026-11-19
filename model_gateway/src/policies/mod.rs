@@ -33,6 +33,8 @@ pub mod cost;
 mod dp_min_token;
 pub mod expected_wait;
 mod factory;
+pub mod hash_ring;
+mod kept_rings;
 mod least_load;
 mod manual;
 mod passthrough;
@@ -61,11 +63,9 @@ pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;
 pub use round_robin::RoundRobinPolicy;
 
-// The ring lives with the registry that owns and rebuilds it, and the
-// periodic task beside the worker runtime. The paths they had here are kept:
-// the policies name both, and callers outside the crate name the ring.
+// The periodic task lives beside the worker runtime. The path it had here is
+// kept: the policies name it.
 pub(crate) use crate::worker::periodic_task as utils;
-pub use crate::worker::registry::hash_ring;
 
 /// Core trait for load balancing policies
 ///
@@ -489,10 +489,10 @@ pub struct SelectWorkerInfo<'a> {
     /// body access populate it); used when no valid routing-key header is
     /// present under the routing-key override.
     pub rid_key: Option<&'a str>,
-    /// Pre-computed hash ring for O(log n) consistent hashing
-    /// Built and cached by WorkerRegistry, passed through to avoid per-request rebuilds.
-    /// Single-worker placement hands it to a policy that reads it
-    /// (`policy_reads_hash_ring`) and `None` to any other.
+    /// The hash ring of the model's membership generation, for O(log n)
+    /// consistent hashing: filled once a generation and passed through, so
+    /// no request rebuilds it. A placement hands it to a policy that reads
+    /// it (`policy_reads_hash_ring`) and `None` to any other.
     pub hash_ring: Option<Arc<HashRing>>,
     /// Which PD role this selection is for (default `Single`); namespaces
     /// header-based sticky routing so prefill and decode stick independently.

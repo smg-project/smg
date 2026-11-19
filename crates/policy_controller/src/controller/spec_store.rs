@@ -15,32 +15,62 @@
 //! store's entry, one apply at a time: one process writes the directory,
 //! under the door's lock alone.
 //!
-//! One process holds a directory, and nothing here holds two apart. Where
-//! a second one writes it too, its apply of a number the first has on file
-//! is refused by name, and from then on it takes no write until it starts
-//! again: a store reads its directory at its start alone, so that process
-//! runs the generation it started with. Two that write one number at one
-//! moment in the two forms never both stay: each looks for the other
-//! form's name after its own link and backs out where it stands, so one
-//! lands or neither. A write that backs out says so, apart from a number
-//! that is on file: where both back out the number is free, and the next
-//! apply of either lands. A start removes every temporary name, a live
-//! writer's among them: that write is refused. The directory stands on a
-//! file system that links: where no link is made, every write is refused
-//! at the link in the system's own words, and nothing of it stays on file.
-//! A write refused after its link removes its name and syncs the directory
-//! again, and says which of the two failed. A name that stays may run at a
-//! start, or refuse it beside the other form's name. A name that is gone
-//! where the directory did not sync may come back after a crash.
+//! One process holds a directory: a store takes the lock of a file it keeps
+//! there (`.lock`) before it reads a name, and holds it until it is
+//! dropped; the system lets it go at any exit. The store holds the
+//! directory itself, its path resolved once at the open: the lock file, the
+//! names, every read, every write and every removal go through that
+//! directory, wherever the path leads later, and a write is refused where
+//! the path leads to another one as it begins. A start that finds the lock
+//! held waits a bound for its holder to stop and takes the directory then.
+//! One whose directory was renamed under that wait is refused once the lock
+//! is held: by name where another is laid at its path, which a new start
+//! takes, and as a path to no directory where its path leads to none. One
+//! still held at the bound's end is refused by name, and one whose lock the
+//! system does not give is refused in the system's own words: the lock asks
+//! that its file is there or can be made, and no write of it on a file
+//! system that locks as a local one does. So a start reads the directory
+//! once the process before it writes no more, and runs that one's last
+//! apply. The lock is on the file, not on its name: the file is made once
+//! and never removed, and one removed under a running store lets a second
+//! one in. It is the open file's, too: a child the process forks holds a
+//! copy until it runs its program, so the lock may outlast a drop by that
+//! moment, and a start that follows a drop in one process waits like any
+//! other. The directory stands on a file system that links and locks. Where
+//! no link is made, every write is refused at the link in the system's own
+//! words, and nothing of it stays on file.
+//!
+//! The lock holds two apart as far as the file system's locks reach:
+//! between two hosts of a network file system only where it carries them.
+//! A second process such a directory lets in writes it too, and the write
+//! itself keeps the two from one number. Its apply of a number the first
+//! has on file is refused by name, and from then on it takes no write
+//! until it starts again: a store reads its directory at its start alone,
+//! so that process runs the generation it started with. Two that write one
+//! number at one moment in the two forms never both stay: each looks for
+//! the other form's name after its own link and backs out where it stands,
+//! so one lands or neither. A write that backs out says so, apart from a
+//! number that is on file: where both back out the number is free, and the
+//! next apply of either lands. A start removes the temporary names it may,
+//! a live writer's among them: that write is refused, unless its link was
+//! made already. A write refused after its link removes its name and syncs
+//! the directory again, and says which of the two failed. A name that stays
+//! may run at a start, or refuse it beside the other form's name. A name
+//! that is gone where the directory did not sync may come back after a
+//! crash.
 //!
 //! A start reads the directory: the highest number is the generation to
-//! run, and a file a write left under its temporary name is removed. Any
-//! other name is left alone. Two files under one number, or a path that
-//! leads to no directory, refuse the start by name. The [`RETAINED`]
-//! highest numbers are kept; an apply removes the files under them. A
-//! generation on file is read by the read call and by a rollback; the read
-//! call reads its file by the directory's path alone ([`read_in`]), under
-//! no lock of the door.
+//! run, and a file a write left under its temporary name is removed, or
+//! left in place where this user may not remove it. One that is gone by
+//! then is taken as removed, and a directory under such a name refuses the
+//! start. Any other name is left alone, the lock file's among them. Two
+//! files under one number, a directory another process holds, one renamed
+//! under the start's wait, one with no lock file where none can be made, or
+//! a path that leads to no directory, refuse the start by name. The
+//! [`RETAINED`] highest numbers are kept; an apply removes the files under
+//! them. A generation on file is read by the read call and by a rollback;
+//! the read call reads its file through the directory itself ([`read_at`]),
+//! under no lock of the door.
 //!
 //! [`Generations`]: super::generations::Generations
 
@@ -49,12 +79,16 @@ use std::{
     io::{self, Read as _, Write as _},
     path::{Path, PathBuf},
     process,
-    time::{SystemTime, UNIX_EPOCH},
+    sync::Arc,
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+use tracing::info;
 
 use super::{
     generations::{Format, SpecRejected, MAX_DOCUMENT_BYTES},
-    spec_file::open_regular,
+    spec_file::NOT_A_FILE,
 };
 
 /// How many generations a store keeps: the standing one and the seven
@@ -64,6 +98,17 @@ pub(crate) const RETAINED: usize = 8;
 /// The first letters of a name a write is in flight under: no start reads
 /// it.
 const WRITING: &str = ".writing-";
+
+/// The name of the lock file in a store's directory: no generation's name
+/// and no temporary one, so a start neither reads it nor removes it.
+const HELD: &str = ".lock";
+
+/// Between two tries of a lock another process holds.
+const HELD_PACE: Duration = Duration::from_millis(50);
+
+/// What a write is refused by where the store's path leads to another
+/// directory than the one it holds.
+const MOVED: &str = "the path leads to another directory than the one this store holds";
 
 /// How many digits a generation's file name writes its number in: the
 /// widest number's.
@@ -78,6 +123,30 @@ pub enum StoreRefused {
     /// The directory could not be read.
     #[error("not read: {0}")]
     Unreadable(String),
+    /// Another controller holds the directory's lock, past the wait the
+    /// start was given.
+    #[error(
+        "another controller holds the directory, waited on for {0:?}: one controller holds a spec store"
+    )]
+    Held(Duration),
+    /// The directory's lock was not taken, in the system's own words: the
+    /// lock file does not open, or the file system takes no lock.
+    #[error("not locked: {0}")]
+    Unlocked(String),
+    /// The directory holds no lock file and this start may not make one,
+    /// in the system's words for the making: a store's first start makes
+    /// the file, and needs a directory it may write.
+    #[error(
+        "no lock file, and none can be made: {0}: a store's first start needs a directory it may write"
+    )]
+    Unmade(String),
+    /// The directory moved while the start waited for its lock: by the
+    /// time the lock is held the path leads to another one, which a new
+    /// start takes.
+    #[error(
+        "the directory moved while this start waited for its lock: the path leads to another one, which a new start takes"
+    )]
+    Moved,
     /// Two files, one in each form, are named by one number.
     #[error("generation {0} stands under two names")]
     TwoNames(u64),
@@ -120,34 +189,67 @@ fn named(name: &str) -> Option<Persisted> {
     Some(Persisted { generation, format })
 }
 
-/// The path of `persisted` in the directory at `dir`.
-fn path_in(dir: &Path, persisted: Persisted) -> PathBuf {
+/// The name of the file of `persisted` in its directory.
+fn file_name(persisted: Persisted) -> String {
     let Persisted { generation, format } = persisted;
     let form = format.as_str();
-    dir.join(format!("{generation:0DIGITS$}.{form}"))
+    format!("{generation:0DIGITS$}.{form}")
 }
 
-/// The bytes on file for `persisted` in the directory at `dir`, one past
-/// the size bound at most: a longer file is refused by its size, not read
-/// whole. The file is opened as the spec file is, without waiting, and
-/// what is no regular file is refused by its kind, unread: a pipe under a
-/// generation's name holds no start and no read call.
-pub(crate) fn read_in(dir: &Path, persisted: Persisted) -> io::Result<Vec<u8>> {
+/// Whether a name stands in the directory `root`, asked through the
+/// directory itself. A link that leads nowhere stands for no name.
+fn on_file(root: &fs::File, name: &str) -> io::Result<bool> {
+    match rustix::fs::statat(root, name, rustix::fs::AtFlags::empty()) {
+        Ok(_) => Ok(true),
+        Err(rustix::io::Errno::NOENT) => Ok(false),
+        Err(errno) => Err(errno.into()),
+    }
+}
+
+/// Removes `name` from the directory `root`, through the directory itself.
+/// A name that is gone already is taken as removed, which is what the
+/// removal wanted: another hand took it away, a second process among them
+/// where the file system's locks do not hold two apart.
+fn remove_at(root: &fs::File, name: &str) -> io::Result<()> {
+    match rustix::fs::unlinkat(root, name, rustix::fs::AtFlags::empty()) {
+        Ok(()) | Err(rustix::io::Errno::NOENT) => Ok(()),
+        Err(errno) => Err(errno.into()),
+    }
+}
+
+/// The file under `name` in the directory `root`, opened through the
+/// directory itself and without waiting. What is no regular file is
+/// refused by its kind, unread: a pipe under the name holds no call.
+fn open_at(
+    root: &fs::File,
+    name: &str,
+    flags: rustix::fs::OFlags,
+    mode: rustix::fs::Mode,
+) -> io::Result<fs::File> {
+    use rustix::fs::OFlags;
+
+    let quiet = flags | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC;
+    let opened = rustix::io::retry_on_intr(|| rustix::fs::openat(root, name, quiet, mode))?;
+    let file = fs::File::from(opened);
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::other(NOT_A_FILE));
+    }
+    Ok(file)
+}
+
+/// The bytes on file for `persisted` in the directory `root`, read through
+/// the directory itself, one past the size bound at most: a longer file is
+/// refused by its size, not read whole. What is no regular file is refused
+/// by its kind, unread ([`open_at`]): a pipe under a generation's name
+/// holds no start and no read call.
+pub(crate) fn read_at(root: &fs::File, persisted: Persisted) -> io::Result<Vec<u8>> {
+    use rustix::fs::{Mode, OFlags};
+
     let mut document = Vec::new();
-    open_regular(&path_in(dir, persisted))?
+    open_at(root, &file_name(persisted), OFlags::RDONLY, Mode::empty())?
         .take(MAX_DOCUMENT_BYTES + 1)
         .read_to_end(&mut document)?;
     Ok(document)
-}
-
-/// Syncs the directory itself, so that a rename in it outlasts a crash.
-/// Where a directory does not open as a file there is no such call.
-fn sync_dir(dir: &Path) -> io::Result<()> {
-    if cfg!(unix) {
-        fs::File::open(dir)?.sync_all()
-    } else {
-        Ok(())
-    }
 }
 
 /// The form a generation's file is not in.
@@ -194,7 +296,17 @@ fn unsynced(generation: u64, failed: &io::Error, left: &io::Error) -> io::Error 
 /// The store: the directory and the generations on file in it.
 #[derive(Debug)]
 pub(crate) struct SpecStore {
+    /// The directory's path, resolved once at the open: a link in it that
+    /// turns later leads this store nowhere else.
     dir: PathBuf,
+    /// The directory itself, open: the lock file, every read, every write
+    /// and every removal go through it, and a write is refused where the
+    /// path leads to another directory as it begins. The read call holds
+    /// it too.
+    root: Arc<fs::File>,
+    /// The lock file, open: the directory's lock is held until the store
+    /// is dropped.
+    _held: fs::File,
     /// The generations on file, ascending.
     kept: Vec<Persisted>,
     /// When this store was opened, in nanoseconds: with the process's id it
@@ -206,24 +318,192 @@ pub(crate) struct SpecStore {
 }
 
 impl SpecStore {
-    /// Reads the directory at `dir`: the generations on file. A file left
-    /// under a temporary name is removed: its write never ended.
+    /// [`SpecStore::open_within`] as the cases open theirs: a start that
+    /// waits a case's room, as the controller's waits its grace period. A
+    /// directory whose store a case dropped is free a moment later where
+    /// another case's child process holds a copy of the lock file.
+    #[cfg(test)]
     pub(crate) fn open(dir: PathBuf) -> Result<Self, StoreRefused> {
-        let unreadable = |error: io::Error| StoreRefused::Unreadable(error.to_string());
-        match fs::metadata(&dir) {
-            Ok(found) if found.is_dir() => {}
-            Ok(_) => return Err(StoreRefused::NotADirectory),
+        Self::open_within(dir, Duration::from_secs(30))
+    }
+
+    /// Takes the directory at `dir` and reads it: the generations on file.
+    /// A file left under a temporary name is removed, its write never
+    /// ended, or left in place where this user may not remove it. Where
+    /// another process holds the directory's lock it is tried again every
+    /// [`HELD_PACE`]: the directory is taken once the holder lets go, and
+    /// a start still held when `wait` has passed is refused by name. A
+    /// process that stops lets the lock go at its exit, so a start given
+    /// the time a stop takes reads the directory after that process's last
+    /// write. A directory renamed while the start waited is refused once
+    /// the lock is held: by name where another is laid at its path
+    /// ([`StoreRefused::Moved`]), which a new start takes, and as a path to
+    /// no directory where none is.
+    pub(crate) fn open_within(dir: PathBuf, wait: Duration) -> Result<Self, StoreRefused> {
+        let (dir, root) = Self::rooted(&dir)?;
+        let held = Self::hold(&dir, &root, wait)?;
+        Self::named_still(&dir, &root)?;
+        Self::read_under(dir, root, held)
+    }
+
+    /// A second store on a directory another holds, its lock file open and
+    /// not locked, as a file system whose locks do not hold between two
+    /// hosts lets one in: the cases of two writers open theirs so.
+    #[cfg(test)]
+    pub(crate) fn open_beside(dir: PathBuf) -> Result<Self, StoreRefused> {
+        let (dir, root) = Self::rooted(&dir)?;
+        let unheld = Self::lock_file(&root)?;
+        Self::read_under(dir, root, unheld)
+    }
+
+    /// What the system reads at a path that leads to a directory. A path
+    /// that leads to none is refused.
+    fn found(dir: &Path) -> Result<fs::Metadata, StoreRefused> {
+        match fs::metadata(dir) {
+            Ok(found) if found.is_dir() => Ok(found),
+            Ok(_) => Err(StoreRefused::NotADirectory),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Err(StoreRefused::NotADirectory)
+                Err(StoreRefused::NotADirectory)
             }
-            Err(error) => return Err(unreadable(error)),
+            Err(error) => Err(StoreRefused::Unreadable(error.to_string())),
         }
+    }
+
+    /// The directory at `dir`, its path resolved and itself open: what the
+    /// store locks, reads and writes from here on. A link in the path that
+    /// turns while a start waits leads that start nowhere else.
+    fn rooted(dir: &Path) -> Result<(PathBuf, fs::File), StoreRefused> {
+        use rustix::fs::{Mode, OFlags};
+
+        Self::found(dir)?;
+        let unreadable = |error: io::Error| StoreRefused::Unreadable(error.to_string());
+        let dir = fs::canonicalize(dir).map_err(unreadable)?;
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+        let root = rustix::io::retry_on_intr(|| rustix::fs::open(&dir, flags, Mode::empty()))
+            .map_err(|errno| unreadable(errno.into()))?;
+        Ok((dir, root.into()))
+    }
+
+    /// Whether an open to read serves where the open to read and write was
+    /// refused as `refused`: the user's bits and a file system mounted to
+    /// read alone refuse the write alone, and the lock asks none.
+    fn read_serves(refused: &io::Error) -> bool {
+        matches!(
+            refused.kind(),
+            io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem
+        )
+    }
+
+    /// The lock file of the directory `root`, open: made empty where it is
+    /// not there, and never truncated, since what stands in it is no part
+    /// of the lock. It is opened through the directory the store holds, so
+    /// the lock is that directory's, whatever its path leads to by then.
+    /// Neither open waits, and what is no regular file is refused by its
+    /// kind: a pipe under the name holds no start and takes no lock. On a
+    /// file system that locks as a local one does, the lock asks no write
+    /// of the file: one that stands under bits this user may not write, as
+    /// after a change of the controller's user, or on a file system
+    /// mounted to read alone, is opened to read. Where a lock is made of a
+    /// byte-range lock, as a network file system's client may make it, it
+    /// asks a file opened to write: the lock of a file this user may not
+    /// write is not given there, and the refusal is the system's for the
+    /// lock. Where the file may not be made and the open to read fails
+    /// too, the file not there or no regular file, the refusal is the
+    /// system's for the making, and where the file is not there it says
+    /// what a first start needs.
+    fn lock_file(root: &fs::File) -> Result<fs::File, StoreRefused> {
+        use rustix::fs::{Mode, OFlags};
+
+        let open = |flags: OFlags, mode: Mode| open_at(root, HELD, flags, mode);
+        let made = open(OFlags::RDWR | OFlags::CREATE, Mode::from_raw_mode(0o666));
+        let unlocked = |error: io::Error| StoreRefused::Unlocked(error.to_string());
+        match made {
+            Err(denied) if Self::read_serves(&denied) => {
+                open(OFlags::RDONLY, Mode::empty()).map_err(|read| match read.kind() {
+                    // No lock file is there, and this start may not make one.
+                    io::ErrorKind::NotFound => StoreRefused::Unmade(denied.to_string()),
+                    _ => unlocked(denied),
+                })
+            }
+            opened => opened.map_err(unlocked),
+        }
+    }
+
+    /// The directory's lock: an exclusive advisory lock on the lock file,
+    /// tried every [`HELD_PACE`] until `wait` has passed. The system lets
+    /// the lock go when the file is dropped, and at any exit.
+    fn hold(dir: &Path, root: &fs::File, wait: Duration) -> Result<fs::File, StoreRefused> {
+        let lock = Self::lock_file(root)?;
+        let started = Instant::now();
+        let mut told = false;
+        loop {
+            match lock.try_lock() {
+                Ok(()) => return Ok(lock),
+                Err(fs::TryLockError::WouldBlock) => {
+                    let Some(left) = wait.checked_sub(started.elapsed()) else {
+                        return Err(StoreRefused::Held(wait));
+                    };
+                    if !told {
+                        info!(
+                            path = %dir.display(),
+                            ?wait,
+                            "spec store held by another controller: waiting for it to stop"
+                        );
+                        told = true;
+                    }
+                    thread::sleep(left.min(HELD_PACE));
+                }
+                Err(fs::TryLockError::Error(error)) => {
+                    return Err(StoreRefused::Unlocked(error.to_string()))
+                }
+            }
+        }
+    }
+
+    /// Removes the temporary name `name` from the directory `root`: a
+    /// write that never ended. A name that is gone already is taken as
+    /// removed ([`remove_at`]): a live writer took its own name away after
+    /// its link. A file this user may not remove, by its bits or on a file
+    /// system mounted to read alone, is left in place: no start reads it.
+    /// Any other refusal refuses the start, and so does a directory under
+    /// such a name, however the system words the refusal of its removal: by
+    /// its kind, or as a permission's on some systems and behind the
+    /// store's bits on all.
+    fn clear(root: &fs::File, name: &str) -> io::Result<()> {
+        use rustix::{
+            fs::{AtFlags, FileType},
+            io::Errno,
+        };
+
+        match remove_at(root, name) {
+            Err(refused) if Self::read_serves(&refused) => {
+                match rustix::fs::statat(root, name, AtFlags::SYMLINK_NOFOLLOW) {
+                    Ok(left) if FileType::from_raw_mode(left.st_mode) == FileType::Directory => {
+                        Err(Errno::ISDIR.into())
+                    }
+                    Ok(_) | Err(Errno::NOENT) => Ok(()),
+                    Err(errno) => Err(errno.into()),
+                }
+            }
+            done => done,
+        }
+    }
+
+    /// Reads the directory `root`, whose path is `dir`, under `held`, its
+    /// lock file. The names are read through the directory itself. A
+    /// temporary name's write never ended: [`Self::clear`] removes it, or
+    /// says what stays in place and what refuses the start.
+    fn read_under(dir: PathBuf, root: fs::File, held: fs::File) -> Result<Self, StoreRefused> {
+        let unreadable = |error: io::Error| StoreRefused::Unreadable(error.to_string());
         let mut kept = Vec::new();
-        for entry in fs::read_dir(&dir).map_err(unreadable)? {
-            let name = entry.map_err(unreadable)?.file_name();
-            let Some(name) = name.to_str() else { continue };
+        let names = rustix::fs::Dir::read_from(&root).map_err(|errno| unreadable(errno.into()))?;
+        for entry in names {
+            let entry = entry.map_err(|errno| unreadable(errno.into()))?;
+            let Ok(name) = entry.file_name().to_str() else {
+                continue;
+            };
             if name.starts_with(WRITING) {
-                fs::remove_file(dir.join(name)).map_err(unreadable)?;
+                Self::clear(&root, name).map_err(unreadable)?;
             } else if let Some(persisted) = named(name) {
                 kept.push(persisted);
             }
@@ -240,10 +520,55 @@ impl SpecStore {
             .map_or(0, |since| since.as_nanos());
         Ok(Self {
             dir,
+            root: Arc::new(root),
+            _held: held,
             kept,
             opened,
             writes: 0,
         })
+    }
+
+    /// Refuses where the store's path leads to another directory than the
+    /// one it holds, or to none: an apply there would stand on file where
+    /// no start by that path reads it.
+    fn same(&self) -> io::Result<()> {
+        if Self::leads(&self.dir, &self.root)? {
+            Ok(())
+        } else {
+            Err(io::Error::other(MOVED))
+        }
+    }
+
+    /// Whether the path `dir` leads to the directory `root`. A path that
+    /// leads nowhere says so in the system's words.
+    fn leads(dir: &Path, root: &fs::File) -> io::Result<bool> {
+        Self::is_held(&fs::metadata(dir)?, root)
+    }
+
+    /// Whether `at_path`, what the system read at a path, is the directory
+    /// `root`, by the system's own identity of the two.
+    fn is_held(at_path: &fs::Metadata, root: &fs::File) -> io::Result<bool> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let held = root.metadata()?;
+        Ok((at_path.dev(), at_path.ino()) == (held.dev(), held.ino()))
+    }
+
+    /// Refuses a start whose path leads to another directory than the one
+    /// it locked, or to none, once the lock is held: the directory was
+    /// renamed or removed while the start waited, and the one held is no
+    /// longer the one its path names. The path is asked once, as a new
+    /// start asks it, and the two identities are compared on that answer:
+    /// a file laid there is a path to no directory, as it is to that
+    /// start. A link in the path that turned passes: the path was resolved
+    /// once, before the wait.
+    fn named_still(dir: &Path, root: &fs::File) -> Result<(), StoreRefused> {
+        let at_path = Self::found(dir)?;
+        match Self::is_held(&at_path, root) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(StoreRefused::Moved),
+            Err(error) => Err(StoreRefused::Unreadable(error.to_string())),
+        }
     }
 
     /// The directory's path.
@@ -256,19 +581,39 @@ impl SpecStore {
         &self.kept
     }
 
-    fn path(&self, persisted: Persisted) -> PathBuf {
-        path_in(&self.dir, persisted)
+    /// The directory itself, as the read call holds it: a generation on
+    /// file is read through it under no lock of the door.
+    pub(crate) fn root(&self) -> Arc<fs::File> {
+        Arc::clone(&self.root)
     }
 
-    /// The bytes on file for `persisted` ([`read_in`]).
+    /// The bytes on file for `persisted`, read through the directory this
+    /// store holds ([`read_at`]): what a start listed there is what it
+    /// reads, wherever the path leads by then.
     pub(crate) fn read(&self, persisted: Persisted) -> io::Result<Vec<u8>> {
-        read_in(&self.dir, persisted)
+        read_at(&self.root, persisted)
     }
 
     /// When the file of `persisted` was written: when its generation was
-    /// applied.
+    /// applied. The file is asked through the directory this store holds.
     pub(crate) fn written(&self, persisted: Persisted) -> io::Result<SystemTime> {
-        fs::metadata(self.path(persisted))?.modified()
+        use rustix::fs::{Mode, OFlags};
+
+        open_at(
+            &self.root,
+            &file_name(persisted),
+            OFlags::RDONLY,
+            Mode::empty(),
+        )?
+        .metadata()?
+        .modified()
+    }
+
+    /// Removes the file of `persisted` from the directory this store
+    /// holds, through the directory itself. One that is gone already is
+    /// taken as removed.
+    fn remove(&self, persisted: Persisted) -> io::Result<()> {
+        remove_at(&self.root, &file_name(persisted))
     }
 
     /// Persists `document` as `persisted`: written whole under a temporary
@@ -280,9 +625,12 @@ impl SpecStore {
     /// that fails leaves no file of its own behind and removes no other's:
     /// a name it linked is removed and the directory synced again, and
     /// where that fails the write says so beside its own failure, since a
-    /// start runs the newest generation on file.
+    /// start runs the newest generation on file. A write is refused where
+    /// the store's path leads to another directory than the one it holds
+    /// ([`SpecStore::same`]); behind that check every step of it goes
+    /// through the directory held ([`SpecStore::write_held`]).
     pub(crate) fn persist(&mut self, persisted: Persisted, document: &[u8]) -> io::Result<()> {
-        self.persist_synced(persisted, document, sync_dir)
+        self.persist_synced(persisted, document, fs::File::sync_all)
     }
 
     /// [`SpecStore::persist`] with the directory's sync as its argument: a
@@ -291,49 +639,73 @@ impl SpecStore {
         &mut self,
         persisted: Persisted,
         document: &[u8],
-        mut sync: impl FnMut(&Path) -> io::Result<()>,
+        sync: impl FnMut(&fs::File) -> io::Result<()>,
     ) -> io::Result<()> {
+        self.same()?;
+        self.write_held(persisted, document, sync)
+    }
+
+    /// The write behind its check, through the directory this store holds:
+    /// its looks for a name, its temporary name, its link, its removals
+    /// and its syncs. A path that turns once the check has passed leads no
+    /// step elsewhere: the write lands where the lock is held, as one a
+    /// moment before the turn does, and a back-out removes this write's
+    /// own names there and no other directory's.
+    fn write_held(
+        &mut self,
+        persisted: Persisted,
+        document: &[u8],
+        mut sync: impl FnMut(&fs::File) -> io::Result<()>,
+    ) -> io::Result<()> {
+        use rustix::fs::{AtFlags, Mode, OFlags};
+
         let Persisted { generation, format } = persisted;
         let taken = || {
             let text = format!("generation {generation} is on file already");
             io::Error::new(io::ErrorKind::AlreadyExists, text)
         };
-        let name = self.path(persisted);
-        let other = self.path(Persisted {
+        let root = &*self.root;
+        let name = file_name(persisted);
+        let other = file_name(Persisted {
             generation,
             format: other_form(format),
         });
-        if name.try_exists()? || other.try_exists()? {
+        if on_file(root, &name)? || on_file(root, &other)? {
             // Another process wrote the directory, or a refused
             // generation stayed on file.
             return Err(taken());
         }
         self.writes += 1;
         let (id, opened, write) = (process::id(), self.opened, self.writes);
-        let writing = self.dir.join(format!("{WRITING}{id}-{opened}-{write}"));
+        let writing = format!("{WRITING}{id}-{opened}-{write}");
         let mut linked = false;
         let written = (|| {
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&writing)?;
+            // Opened to read and write, as the lock file is. The write
+            // alone uses it, and the flag that says so reads as a
+            // misspelling to the repository's spelling hook.
+            let made = OFlags::RDWR | OFlags::CREATE | OFlags::EXCL;
+            let mut file = open_at(root, &writing, made, Mode::from_raw_mode(0o666))?;
             file.write_all(document)?;
             file.sync_all()?;
             drop(file);
-            fs::hard_link(&writing, &name).map_err(|error| match error.kind() {
-                // The name appeared since the look above: its file stays.
-                io::ErrorKind::AlreadyExists => taken(),
-                _ => error,
+            rustix::fs::linkat(root, &writing, root, &name, AtFlags::empty()).map_err(|errno| {
+                match io::Error::from(errno) {
+                    // The name appeared since the look above: its file stays.
+                    error if error.kind() == io::ErrorKind::AlreadyExists => taken(),
+                    error => error,
+                }
             })?;
             linked = true;
-            fs::remove_file(&writing)?;
+            // A start beside this write may have taken the temporary name
+            // away already: the link stands, and the write goes on.
+            remove_at(root, &writing)?;
             // The other form's name since the look above. A writer of that
             // form looks for this one after its own link, so one of the two
             // backs out at least: the two never both stay.
-            if other.try_exists()? {
+            if on_file(root, &other)? {
                 return Err(backs_out(generation));
             }
-            sync(&self.dir)
+            sync(root)
         })();
         let Err(failed) = written else {
             self.kept.push(persisted);
@@ -341,7 +713,7 @@ impl SpecStore {
         };
         // No name of this write stays, whichever step failed. A generation's
         // name this write did not link is another's.
-        let _ = fs::remove_file(&writing);
+        let _ = remove_at(root, &writing);
         if !linked {
             return Err(failed);
         }
@@ -349,41 +721,44 @@ impl SpecStore {
         // generation on file: the removal is synced as the link was. A name
         // that stays and a removal that did not sync are each told, in its
         // own words, beside the write's own failure.
-        if let Err(left) = fs::remove_file(&name) {
+        if let Err(left) = remove_at(root, &name) {
             return Err(stays(generation, &failed, &left));
         }
-        match sync(&self.dir) {
+        match sync(root) {
             Ok(()) => Err(failed),
             Err(left) => Err(unsynced(generation, &failed, &left)),
         }
     }
 
     /// Takes the newest generation off file again: the store's entry
-    /// refused it after it was persisted.
+    /// refused it after it was persisted. The file goes from the directory
+    /// this store holds, wherever the path leads by then: no start there
+    /// reads a generation the entry refused.
     pub(crate) fn forget(&mut self) -> io::Result<()> {
         let Some(newest) = self.kept.pop() else {
             return Ok(());
         };
-        fs::remove_file(self.path(newest))?;
-        sync_dir(&self.dir)
+        self.remove(newest)?;
+        self.root.sync_all()
     }
 
     /// Removes the generations under the [`RETAINED`] newest, and returns
     /// their numbers with what a removal failed by. A file that stays is
-    /// tried again at the next apply.
+    /// tried again at the next apply. The files go from the directory this
+    /// store holds.
     pub(crate) fn prune(&mut self) -> Vec<(u64, io::Result<()>)> {
         let over = self.kept.len().saturating_sub(RETAINED);
         let mut pruned = Vec::with_capacity(over);
         let mut stays = Vec::new();
         for old in self.kept.drain(..over).collect::<Vec<_>>() {
-            let removed = fs::remove_file(self.path(old));
+            let removed = self.remove(old);
             if removed.is_err() {
                 stays.push(old);
             }
             pruned.push((old.generation, removed));
         }
         if !pruned.is_empty() {
-            let _ = sync_dir(&self.dir);
+            let _ = self.root.sync_all();
         }
         // A file that stays is still on file, under the retained ones.
         stays.append(&mut self.kept);
@@ -399,6 +774,7 @@ pub(crate) mod tests {
     use std::{collections::BTreeSet, sync::mpsc};
 
     use super::*;
+    use crate::controller::membership::tests::Logged;
     #[cfg(unix)]
     use crate::controller::spec_file::tests::pipe_at;
 
@@ -408,12 +784,13 @@ pub(crate) mod tests {
         Persisted { generation, format }
     }
 
-    /// The names in `dir`, sorted.
+    /// The names in `dir`, sorted, the store's own lock file apart.
     pub(crate) fn names(dir: &Path) -> BTreeSet<String> {
         fs::read_dir(dir)
             .expect("the directory reads")
             .map(|entry| entry.expect("an entry").file_name())
             .map(|name| name.into_string().expect("a name in UTF-8"))
+            .filter(|name| name != HELD)
             .collect()
     }
 
@@ -489,6 +866,660 @@ pub(crate) mod tests {
         assert_eq!(refused.to_string(), "generation 7 stands under two names");
     }
 
+    /// One store holds a directory: a second open is refused by name while
+    /// the first stands, at once or at the end of the wait it was given,
+    /// and lands once the first is dropped. The lock file is the store's
+    /// own: made empty, and a start leaves its bytes as it finds them.
+    #[test]
+    fn a_held_directory_refuses_a_second_store_until_its_holder_is_dropped() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let open = |wait| SpecStore::open_within(dir.path().to_owned(), wait);
+        let first = open(Duration::ZERO).expect("it opens");
+        let lock = dir.path().join(HELD);
+        assert_eq!(fs::read(&lock).expect("the lock file"), b"");
+
+        let refused = open(Duration::ZERO).expect_err("it is held");
+        assert_eq!(refused, StoreRefused::Held(Duration::ZERO));
+        let wait = 3 * HELD_PACE;
+        let asked = Instant::now();
+        let refused = open(wait).expect_err("it is held");
+        assert!(asked.elapsed() >= wait, "{:?}", asked.elapsed());
+        assert_eq!(refused, StoreRefused::Held(wait));
+        assert_eq!(
+            refused.to_string(),
+            "another controller holds the directory, waited on for 150ms: one controller holds a spec store"
+        );
+
+        // What stands in the lock file is no part of the lock. A start
+        // after the drop waits: a child process of another case may hold a
+        // copy of the open file for a moment.
+        fs::write(&lock, "a note").expect("the file");
+        drop(first);
+        let second = open(Duration::from_secs(30)).expect("the directory is free");
+        assert_eq!(second.kept(), []);
+        assert_eq!(fs::read(&lock).expect("the lock file"), b"a note");
+    }
+
+    /// A start in a thread of its own, with the lines it says.
+    struct Waiter {
+        start: thread::JoinHandle<Result<SpecStore, StoreRefused>>,
+        lines: Logged,
+        /// A second subscriber registered beside the thread's own for as
+        /// long as a case reads the lines, as in the door's audit case.
+        _beside: tracing::Dispatch,
+    }
+
+    impl Waiter {
+        /// The room a case gives a waiting start, and its line.
+        const ROOM: Duration = Duration::from_secs(30);
+
+        /// A start on `path` whose thread's own subscriber keeps its
+        /// lines. Returns once the start said that it waits: it holds its
+        /// directory, found it locked, and has read no name yet.
+        fn held_off(path: PathBuf) -> Self {
+            let lines = Logged::default();
+            let beside = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+            let writer = lines.clone();
+            let start = thread::spawn(move || {
+                let subscriber = tracing_subscriber::fmt()
+                    .with_ansi(false)
+                    .with_writer(move || writer.clone())
+                    .finish();
+                tracing::subscriber::with_default(subscriber, || {
+                    SpecStore::open_within(path, Self::ROOM)
+                })
+            });
+            let asked = Instant::now();
+            while Self::said(&lines) == 0 {
+                assert!(
+                    asked.elapsed() < Self::ROOM,
+                    "the waiter never said it waits"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            Self {
+                start,
+                lines,
+                _beside: beside,
+            }
+        }
+
+        /// How often a start said in `lines` that it waits.
+        fn said(lines: &Logged) -> usize {
+            let text = String::from_utf8(lines.0.lock().clone()).expect("the lines are text");
+            text.matches("held by another controller: waiting for it to stop")
+                .count()
+        }
+    }
+
+    /// A start that waits reads the directory only once it holds it: what
+    /// the holder wrote while the start waited is on file for it. The wait
+    /// is said in one line.
+    #[test]
+    fn a_waiting_start_reads_the_directory_once_its_holder_let_go() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let mut first = SpecStore::open(dir.path().to_owned()).expect("it opens");
+        // The waiter found the directory held, and has read no name yet.
+        let waiter = Waiter::held_off(dir.path().to_owned());
+        // Three more tries pass under the lock: a line at every try would
+        // be said again.
+        thread::sleep(3 * HELD_PACE);
+        first.persist(at(1, YAML), b"first").expect("it persists");
+        drop(first);
+        let second = waiter
+            .start
+            .join()
+            .expect("the waiter's thread")
+            .expect("the directory is free");
+        assert_eq!(second.kept(), [at(1, YAML)]);
+        assert_eq!(Waiter::said(&waiter.lines), 1, "one line for the wait");
+    }
+
+    /// On a file system that locks as a local one does, the lock asks no
+    /// write of its file: one that stands under bits its user may not
+    /// write, as after a change of the controller's user, is opened to read
+    /// and locks all the same.
+    #[cfg(unix)]
+    #[test]
+    #[expect(
+        clippy::print_stdout,
+        reason = "a run the bits do not hold in reports it on stdout under --nocapture"
+    )]
+    fn a_lock_file_its_user_may_not_write_locks_a_local_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let lock = dir.path().join(HELD);
+        fs::write(&lock, "").expect("the file");
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o444)).expect("its bits");
+        if fs::OpenOptions::new().write(true).open(&lock).is_ok() {
+            // The bits do not hold for this user (the superuser): the first
+            // open serves, and there is nothing of the second to read here.
+            println!(
+                "a lock file its user may not write: this run asserted another lawful world: \
+                 the file's bits do not hold for this user"
+            );
+            return;
+        }
+        let open = || SpecStore::open_within(dir.path().to_owned(), Duration::ZERO);
+        let first = open().expect("the lock is taken on a file opened to read");
+        assert_eq!(
+            open().expect_err("it is held"),
+            StoreRefused::Held(Duration::ZERO)
+        );
+        drop(first);
+    }
+
+    /// Where the lock file is not there and may not be made, the refusal is
+    /// the system's for the making: the open to read that follows finds no
+    /// file, and its words are not the ones told.
+    #[cfg(unix)]
+    #[test]
+    #[expect(
+        clippy::print_stdout,
+        reason = "a run the bits do not hold in reports it on stdout under --nocapture"
+    )]
+    fn a_lock_file_that_may_not_be_made_refuses_the_start_in_the_makings_words() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("a temp dir");
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).expect("its bits");
+        if fs::File::create(dir.path().join("made")).is_ok() {
+            // The bits do not hold for this user (the superuser): the lock
+            // file is made, and there is no refusal to read here.
+            println!(
+                "a lock file that may not be made: this run asserted another lawful world: \
+                 the directory's bits do not hold for this user"
+            );
+            return;
+        }
+        let refused = SpecStore::open_within(dir.path().to_owned(), Duration::ZERO);
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).expect("its bits");
+        let refused = refused.expect_err("no lock");
+        assert!(
+            matches!(&refused, StoreRefused::Unmade(told) if told.contains("denied")),
+            "{refused:?}"
+        );
+        let said = refused.to_string();
+        assert!(
+            said.ends_with("a store's first start needs a directory it may write"),
+            "{said}"
+        );
+    }
+
+    /// A pipe under the lock file's name, under bits its user may not
+    /// write, holds no start: the open to read does not wait on it, what
+    /// is no regular file is refused unread, and the refusal is the
+    /// system's for the making. The open runs on a thread of its own,
+    /// waited five seconds, so an open that waits fails the case.
+    #[cfg(unix)]
+    #[test]
+    #[expect(
+        clippy::print_stdout,
+        reason = "a run the bits do not hold in reports it on stdout under --nocapture"
+    )]
+    fn a_pipe_its_user_may_not_write_under_the_locks_name_holds_no_start() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let lock = dir.path().join(HELD);
+        pipe_at(&lock);
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o444)).expect("its bits");
+        // An open to read and write of a pipe does not wait, as one to
+        // write alone would where the bits do not hold.
+        if fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock)
+            .is_ok()
+        {
+            // The bits do not hold for this user (the superuser): the first
+            // open serves, and there is nothing of the second to read here.
+            println!(
+                "a pipe its user may not write: this run asserted another lawful world: \
+                 the pipe's bits do not hold for this user"
+            );
+            return;
+        }
+        let path = dir.path().to_owned();
+        let (answer, answered) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = answer.send(SpecStore::open_within(path, Duration::ZERO));
+        });
+        let opened = answered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the open answers: it does not wait on the pipe");
+        let refused = opened.expect_err("no lock on a pipe");
+        assert!(
+            matches!(&refused, StoreRefused::Unlocked(told) if told.contains("denied")),
+            "{refused:?}"
+        );
+    }
+
+    /// A write of the lock file the user's bits refuse, and one a file
+    /// system mounted to read alone refuses, leave it to an open to read;
+    /// another refusal stands as it is. The case reads the system's
+    /// refusals by their numbers: it mounts no file system.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_refused_by_bits_or_a_read_only_mount_leaves_an_open_to_read() {
+        use rustix::io::Errno;
+
+        let refused = |errno: Errno| io::Error::from(errno);
+        assert!(SpecStore::read_serves(&refused(Errno::ACCESS)));
+        assert!(SpecStore::read_serves(&refused(Errno::ROFS)));
+        assert!(!SpecStore::read_serves(&refused(Errno::ISDIR)));
+        assert!(!SpecStore::read_serves(&refused(Errno::NOENT)));
+    }
+
+    /// A link in the store's path that turns while a start waits leads
+    /// that start nowhere else: the path is resolved once, and the store
+    /// reads and writes the directory it locked.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_turned_under_a_waiting_start_leaves_it_the_directory_it_locked() {
+        let base = tempfile::tempdir().expect("a temp dir");
+        let (first, second) = (base.path().join("first"), base.path().join("second"));
+        let link = base.path().join("store");
+        fs::create_dir(&first).expect("the first directory");
+        fs::create_dir(&second).expect("the second directory");
+        symlink(&first, &link).expect("the link");
+        let mut holder = SpecStore::open(first.clone()).expect("the holder");
+        // The waiter holds its directory and found it locked: the link
+        // turns under it, and the holder writes once more and lets go.
+        let waiter = Waiter::held_off(link.clone());
+        fs::remove_file(&link).expect("the link goes");
+        symlink(&second, &link).expect("the link turns");
+        holder
+            .persist(at(1, YAML), b"one")
+            .expect("the holder's write");
+        drop(holder);
+        let mut store = waiter
+            .start
+            .join()
+            .expect("the waiter")
+            .expect("the directory is taken");
+        assert_eq!(store.dir(), fs::canonicalize(&first).expect("its path"));
+        assert_eq!(store.kept(), [at(1, YAML)], "the directory it locked");
+        store.persist(at(2, YAML), b"two").expect("a write");
+        let both = BTreeSet::from([name_of(1, "yaml"), name_of(2, "yaml")]);
+        assert_eq!(names(&first), both);
+        assert!(
+            names(&second).is_empty(),
+            "nothing lands where the link leads"
+        );
+    }
+
+    /// A store whose path leads to another directory by the time of a
+    /// write refuses the write, and nothing lands there: the directory it
+    /// holds is the one it locked. A path that leads nowhere refuses the
+    /// write in the system's words.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_under_a_path_that_leads_elsewhere_is_refused() {
+        let base = tempfile::tempdir().expect("a temp dir");
+        let (dir, moved) = (base.path().join("store"), base.path().join("moved"));
+        fs::create_dir(&dir).expect("the directory");
+        let mut store = SpecStore::open(dir.clone()).expect("the store");
+        store.persist(at(1, YAML), b"one").expect("a write");
+        fs::rename(&dir, &moved).expect("the directory moves");
+        fs::create_dir(&dir).expect("another stands at its path");
+        let refused = store
+            .persist(at(2, YAML), b"two")
+            .expect_err("the path leads elsewhere");
+        assert_eq!(refused.to_string(), MOVED);
+        assert!(names(&dir).is_empty(), "nothing lands in the other");
+        assert_eq!(names(&moved), BTreeSet::from([name_of(1, "yaml")]));
+        fs::remove_dir(&dir).expect("the other goes");
+        let refused = store
+            .persist(at(2, YAML), b"two")
+            .expect_err("the path leads nowhere");
+        assert_eq!(refused.kind(), io::ErrorKind::NotFound);
+    }
+
+    /// A directory replaced at the path of an open store leaves that store
+    /// the directory it holds, whole: the generations it listed there are
+    /// the ones it reads, the bytes and the time of the file held, and a
+    /// write is refused, since the path leads to the other directory by
+    /// then.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_replaced_under_an_open_store_is_read_where_it_is_held() {
+        let base = tempfile::tempdir().expect("a temp dir");
+        let (dir, moved) = (base.path().join("store"), base.path().join("moved"));
+        fs::create_dir(&dir).expect("the directory");
+        let mut store = SpecStore::open(dir.clone()).expect("the store");
+        store.persist(at(1, YAML), b"held").expect("a write");
+        fs::rename(&dir, &moved).expect("the directory moves");
+        fs::create_dir(&dir).expect("another stands at its path");
+        let other = dir.join(name_of(1, "yaml"));
+        fs::write(&other, "other").expect("the other's first");
+        fs::write(dir.join(name_of(2, "yaml")), "newer").expect("the other's second");
+        // The other's file under the same name is of another time.
+        let apart = UNIX_EPOCH + Duration::from_secs(86_400);
+        fs::File::options()
+            .write(true)
+            .open(&other)
+            .and_then(|file| file.set_modified(apart))
+            .expect("the other's time");
+        assert_eq!(store.kept(), [at(1, YAML)], "the directory it holds");
+        assert_eq!(store.read(at(1, YAML)).expect("it reads"), b"held");
+        let held = fs::metadata(moved.join(name_of(1, "yaml")))
+            .and_then(|file| file.modified())
+            .expect("the held file's time");
+        assert_ne!(held, apart);
+        assert_eq!(store.written(at(1, YAML)).expect("its time"), held);
+        let refused = store
+            .persist(at(2, YAML), b"two")
+            .expect_err("the path leads elsewhere");
+        assert_eq!(refused.to_string(), MOVED);
+    }
+
+    /// A directory renamed while a start waits for its lock, another laid
+    /// at its path, refuses that start by name once the lock is held: the
+    /// directory it locked is no longer the one its path names. A new
+    /// start takes the one that is, whole.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_replaced_under_a_waiting_start_refuses_that_start() {
+        let base = tempfile::tempdir().expect("a temp dir");
+        let (dir, moved) = (base.path().join("store"), base.path().join("moved"));
+        fs::create_dir(&dir).expect("the directory");
+        let mut holder = SpecStore::open(dir.clone()).expect("the holder");
+        holder
+            .persist(at(1, YAML), b"held")
+            .expect("the holder's write");
+        let waiter = Waiter::held_off(dir.clone());
+        fs::rename(&dir, &moved).expect("the directory moves");
+        fs::create_dir(&dir).expect("another stands at its path");
+        fs::write(dir.join(name_of(1, "yaml")), "other").expect("the other's first");
+        fs::write(dir.join(name_of(2, "yaml")), "newer").expect("the other's second");
+        drop(holder);
+        let refused = waiter
+            .start
+            .join()
+            .expect("the waiter")
+            .expect_err("the directory moved under the wait");
+        assert_eq!(refused, StoreRefused::Moved);
+        let store = SpecStore::open(dir.clone()).expect("a new start");
+        assert_eq!(store.kept(), [at(1, YAML), at(2, YAML)]);
+        assert_eq!(store.read(at(2, YAML)).expect("it reads"), b"newer");
+        assert_eq!(names(&moved), BTreeSet::from([name_of(1, "yaml")]));
+    }
+
+    /// A directory renamed while a start waits for its lock, with nothing
+    /// laid at its path, refuses that start as a path to no directory.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_gone_under_a_waiting_start_refuses_that_start() {
+        let base = tempfile::tempdir().expect("a temp dir");
+        let (dir, moved) = (base.path().join("store"), base.path().join("moved"));
+        fs::create_dir(&dir).expect("the directory");
+        let holder = SpecStore::open(dir.clone()).expect("the holder");
+        let waiter = Waiter::held_off(dir.clone());
+        fs::rename(&dir, &moved).expect("the directory moves");
+        drop(holder);
+        let refused = waiter
+            .start
+            .join()
+            .expect("the waiter")
+            .expect_err("the path leads nowhere");
+        assert_eq!(refused, StoreRefused::NotADirectory);
+    }
+
+    /// Where a directory is renamed under a waiting start and a file is
+    /// laid at its path, that start is refused as a new start is: as a
+    /// path to no directory.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_laid_under_a_waiting_start_refuses_it_as_a_new_start_is() {
+        let base = tempfile::tempdir().expect("a temp dir");
+        let (dir, moved) = (base.path().join("store"), base.path().join("moved"));
+        fs::create_dir(&dir).expect("the directory");
+        let holder = SpecStore::open(dir.clone()).expect("the holder");
+        let waiter = Waiter::held_off(dir.clone());
+        fs::rename(&dir, &moved).expect("the directory moves");
+        fs::write(&dir, "a file").expect("a file stands at its path");
+        drop(holder);
+        let refused = waiter
+            .start
+            .join()
+            .expect("the waiter")
+            .expect_err("no directory stands at the path");
+        assert_eq!(refused, StoreRefused::NotADirectory);
+        let new = SpecStore::open(dir).expect_err("a file is no store");
+        assert_eq!(new, StoreRefused::NotADirectory);
+    }
+
+    /// A removal goes through the directory the store holds. Where the
+    /// path leads to another one by then, a refused generation still goes
+    /// off file there and the generations under the retained ones are
+    /// removed there: nothing of the other directory is touched.
+    #[cfg(unix)]
+    #[test]
+    fn a_removal_under_a_path_that_leads_elsewhere_acts_on_the_directory_held() {
+        let base = tempfile::tempdir().expect("a temp dir");
+        let (dir, moved) = (base.path().join("store"), base.path().join("moved"));
+        fs::create_dir(&dir).expect("the directory");
+        let mut store = SpecStore::open(dir.clone()).expect("the store");
+        let count = u64::try_from(RETAINED).expect("a count") + 2;
+        for generation in 1..=count {
+            store
+                .persist(at(generation, YAML), b"one")
+                .expect("a write");
+        }
+        fs::rename(&dir, &moved).expect("the directory moves");
+        fs::create_dir(&dir).expect("another stands at its path");
+        fs::write(dir.join(name_of(1, "yaml")), "other").expect("the other's own");
+        store.forget().expect("the refused one goes off file");
+        let pruned = store.prune();
+        assert!(matches!(pruned.as_slice(), [(1, Ok(()))]), "{pruned:?}");
+        assert_eq!(names(&dir), BTreeSet::from([name_of(1, "yaml")]));
+        let held = names(&moved);
+        assert_eq!(held.len(), RETAINED, "the retained ones stay: {held:?}");
+        assert!(!held.contains(&name_of(count, "yaml")), "the refused one");
+        assert!(!held.contains(&name_of(1, "yaml")), "the one under them");
+    }
+
+    /// The write behind its check goes through the directory the store
+    /// holds, every step: a path that turns once the check has passed
+    /// leads the write nowhere else, and it lands where the lock is held.
+    /// Its sync is that directory's, and its look finds a number on file
+    /// there.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_whose_path_turns_behind_its_check_lands_in_the_directory_held() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let base = tempfile::tempdir().expect("a temp dir");
+        let (dir, moved) = (base.path().join("store"), base.path().join("moved"));
+        fs::create_dir(&dir).expect("the directory");
+        let mut store = SpecStore::open(dir.clone()).expect("the store");
+        store.persist(at(1, YAML), b"one").expect("a write");
+        fs::rename(&dir, &moved).expect("the directory moves");
+        fs::create_dir(&dir).expect("another stands at its path");
+        let mut synced = Vec::new();
+        store
+            .write_held(at(2, YAML), b"two", |held| {
+                synced.push(held.metadata()?.ino());
+                Ok(())
+            })
+            .expect("the write lands");
+        let both = BTreeSet::from([name_of(1, "yaml"), name_of(2, "yaml")]);
+        assert_eq!(names(&moved), both, "where the lock is held");
+        assert!(names(&dir).is_empty(), "nothing lands where the path leads");
+        assert_eq!(store.read(at(2, YAML)).expect("it reads"), b"two");
+        let held = fs::metadata(&moved).expect("the directory held").ino();
+        assert_eq!(synced, [held], "the sync is the held directory's");
+        let taken = store
+            .write_held(at(1, Format::Json), b"{}", |_| Ok(()))
+            .expect_err("generation 1 is on file where the lock is held");
+        assert_eq!(taken.to_string(), "generation 1 is on file already");
+    }
+
+    /// A write that backs out removes its own names, in the directory the
+    /// store holds. Where the path leads to another directory by then,
+    /// that one keeps a generation under the same number, and the
+    /// directory held keeps none of the refused write.
+    #[cfg(unix)]
+    #[test]
+    fn a_back_out_under_a_path_that_turned_removes_the_writes_own_name() {
+        let base = tempfile::tempdir().expect("a temp dir");
+        let (dir, moved) = (base.path().join("store"), base.path().join("moved"));
+        fs::create_dir(&dir).expect("the directory");
+        let mut store = SpecStore::open(dir.clone()).expect("the store");
+        store.persist(at(1, YAML), b"one").expect("a write");
+        let mut syncs = 0;
+        let refused = store
+            .persist_synced(at(2, YAML), b"two", |_| {
+                syncs += 1;
+                if syncs > 1 {
+                    return Ok(());
+                }
+                // The link is made: the path turns before the sync fails.
+                fs::rename(&dir, &moved).expect("the directory moves");
+                fs::create_dir(&dir).expect("another stands at its path");
+                fs::write(dir.join(name_of(2, "yaml")), "other").expect("the other's own");
+                Err(io::Error::other("the directory did not sync"))
+            })
+            .expect_err("no sync");
+        assert_eq!(refused.to_string(), "the directory did not sync");
+        assert_eq!(names(&dir), BTreeSet::from([name_of(2, "yaml")]));
+        assert_eq!(names(&moved), BTreeSet::from([name_of(1, "yaml")]));
+        assert_eq!(store.kept(), [at(1, YAML)]);
+    }
+
+    /// A pipe its user may write under the lock file's name takes no lock:
+    /// the open to read and write does not wait on it either, and what is
+    /// no regular file is refused by its kind.
+    #[cfg(unix)]
+    #[test]
+    fn a_pipe_under_the_locks_name_takes_no_lock() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        pipe_at(&dir.path().join(HELD));
+        let refused = SpecStore::open_within(dir.path().to_owned(), Duration::ZERO)
+            .expect_err("no lock on a pipe");
+        assert_eq!(refused, StoreRefused::Unlocked(NOT_A_FILE.to_owned()));
+    }
+
+    /// A write that never ended leaves a temporary name, and a start
+    /// removes it. Where this user may not, by the directory's bits, the
+    /// name is left in place and the start goes on: no start reads it.
+    #[cfg(unix)]
+    #[test]
+    #[expect(
+        clippy::print_stdout,
+        reason = "a run the bits do not hold in reports it on stdout under --nocapture"
+    )]
+    fn a_temporary_name_a_start_may_not_remove_is_left_in_place() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let mut store = SpecStore::open(dir.path().to_owned()).expect("the store");
+        store.persist(at(1, YAML), b"one").expect("a write");
+        drop(store);
+        let left = dir.path().join(format!("{WRITING}left"));
+        fs::write(&left, "half").expect("a write that never ended");
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).expect("its bits");
+        if fs::File::create(dir.path().join("made")).is_ok() {
+            // The bits do not hold for this user (the superuser): the name
+            // is removed, and there is nothing left in place to read here.
+            println!(
+                "a temporary name a start may not remove: this run asserted another lawful \
+                 world: the directory's bits do not hold for this user"
+            );
+            return;
+        }
+        // This start waits: a child process of another case may hold a copy
+        // of the lock's open file until its exec.
+        let opened = SpecStore::open(dir.path().to_owned());
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).expect("its bits");
+        let store = opened.expect("the start goes on");
+        assert_eq!(store.kept(), [at(1, YAML)]);
+        assert!(left.is_file(), "the name is left in place");
+    }
+
+    /// A temporary name whose removal is refused in another way than by
+    /// this user's bits or a file system mounted to read alone refuses the
+    /// start: here a directory stands under such a name, which no system
+    /// removes as a file.
+    #[test]
+    fn a_temporary_name_whose_removal_fails_otherwise_refuses_the_start() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        fs::create_dir(dir.path().join(format!("{WRITING}dir"))).expect("a directory");
+        let refused = SpecStore::open_within(dir.path().to_owned(), Duration::ZERO)
+            .expect_err("the name is not removed");
+        assert!(
+            matches!(refused, StoreRefused::Unreadable(_)),
+            "{refused:?}"
+        );
+    }
+
+    /// A temporary name that is gone when a start comes to remove it is
+    /// taken as removed, which is what the start wanted: a live writer
+    /// took its own name away after its link, where the file system's
+    /// locks do not hold two apart.
+    #[test]
+    fn a_temporary_name_gone_before_its_removal_is_taken_as_removed() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let (_, root) = SpecStore::rooted(dir.path()).expect("the directory");
+        SpecStore::clear(&root, &format!("{WRITING}gone")).expect("taken as removed");
+    }
+
+    /// A directory under a temporary name refuses the start behind the
+    /// store's bits too. There the system refuses its removal as it
+    /// refuses a file's, by permission, and the name is told from a write
+    /// that never ended by its kind.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_under_a_temporary_name_refuses_the_start_behind_the_stores_bits() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("a temp dir");
+        drop(SpecStore::open(dir.path().to_owned()).expect("the store"));
+        fs::create_dir(dir.path().join(format!("{WRITING}dir"))).expect("a directory");
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).expect("its bits");
+        let opened = SpecStore::open(dir.path().to_owned());
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).expect("its bits");
+        let refused = opened.expect_err("a directory is no write that never ended");
+        assert!(
+            matches!(&refused, StoreRefused::Unreadable(told) if told.contains("directory")),
+            "{refused:?}"
+        );
+    }
+
+    /// A link under a temporary name is judged as the name it is, not by
+    /// what it leads to: behind the store's bits one that leads to a
+    /// directory refuses no start, where a directory itself does.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_to_a_directory_under_a_temporary_name_refuses_no_start() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("a temp dir");
+        drop(SpecStore::open(dir.path().to_owned()).expect("the store"));
+        let led = tempfile::tempdir().expect("another directory");
+        symlink(led.path(), dir.path().join(format!("{WRITING}link"))).expect("a link");
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).expect("its bits");
+        let opened = SpecStore::open(dir.path().to_owned());
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).expect("its bits");
+        drop(opened.expect("a link is no directory"));
+    }
+
+    /// A lock the system does not give refuses the start in the system's
+    /// own words: here a directory stands under the lock file's name.
+    #[test]
+    fn a_lock_the_system_does_not_give_refuses_the_start_in_its_words() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        fs::create_dir(dir.path().join(HELD)).expect("a directory");
+        let refused = SpecStore::open(dir.path().to_owned()).expect_err("no lock");
+        assert!(
+            matches!(&refused, StoreRefused::Unlocked(told) if told.contains("directory")),
+            "{refused:?}"
+        );
+        assert!(refused.to_string().starts_with("not locked: "), "{refused}");
+    }
+
     /// The bound of what a store keeps: at no apply does it hold more than
     /// the retained generations, on file or in its own list.
     #[test]
@@ -548,8 +1579,9 @@ pub(crate) mod tests {
     fn two_stores_that_write_one_number_at_one_moment_land_one_file() {
         const ROUNDS: u64 = 100;
         let dir = tempfile::tempdir().expect("a temp dir");
-        let open = || SpecStore::open(dir.path().to_owned()).expect("it opens");
-        let (mut first, mut second) = (open(), open());
+        let mut first = SpecStore::open(dir.path().to_owned()).expect("it opens");
+        // A second writer the lock did not keep out.
+        let mut second = SpecStore::open_beside(dir.path().to_owned()).expect("it opens");
         // Two processes' temporary names differ, whatever the clock read.
         second.writes = 1 << 32;
         let barrier = std::sync::Barrier::new(2);
@@ -558,7 +1590,7 @@ pub(crate) mod tests {
                 barrier.wait();
                 store.persist(at(generation, YAML), bytes)
             };
-            let (one, two) = std::thread::scope(|scope| {
+            let (one, two) = thread::scope(|scope| {
                 let one = scope.spawn(|| write(&mut first, b"first"));
                 let two = scope.spawn(|| write(&mut second, b"second"));
                 (one.join().expect("no panic"), two.join().expect("no panic"))
@@ -588,7 +1620,7 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().expect("a temp dir");
         let mut store = SpecStore::open(dir.path().to_owned()).expect("an empty directory");
         let mut syncs = 0;
-        let unsynced = |_: &Path| {
+        let unsynced = |_: &fs::File| {
             syncs += 1;
             if syncs == 1 {
                 return Err(io::Error::other("the directory did not sync"));
@@ -616,7 +1648,7 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().expect("a temp dir");
         let mut store = SpecStore::open(dir.path().to_owned()).expect("an empty directory");
         let name = dir.path().join(name_of(1, "yaml"));
-        let stuck = |_: &Path| {
+        let stuck = |_: &fs::File| {
             fs::remove_file(&name).expect("the linked name");
             fs::create_dir(&name).expect("a directory in its place");
             Err(io::Error::other("the directory did not sync"))
@@ -636,6 +1668,31 @@ pub(crate) mod tests {
             "{told}"
         );
         assert_eq!(store.kept(), []);
+    }
+
+    /// A back-out whose linked name is gone already, another hand's work
+    /// between the link and the back-out, takes it as removed and says the
+    /// write's own failure alone.
+    #[test]
+    fn a_back_out_whose_linked_name_is_gone_says_the_writes_own_failure() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let mut store = SpecStore::open(dir.path().to_owned()).expect("an empty directory");
+        let name = dir.path().join(name_of(1, "yaml"));
+        let mut syncs = 0;
+        let taken = |_: &fs::File| {
+            syncs += 1;
+            if syncs > 1 {
+                return Ok(());
+            }
+            fs::remove_file(&name).expect("another hand takes the linked name");
+            Err(io::Error::other("the directory did not sync"))
+        };
+        let refused = store
+            .persist_synced(at(1, YAML), b"one", taken)
+            .expect_err("no sync");
+        assert_eq!(refused.to_string(), "the directory did not sync");
+        assert_eq!(store.kept(), []);
+        assert!(!name.exists(), "the linked name is gone");
     }
 
     /// A writer that finds the other form's name after its own link backs
@@ -677,7 +1734,7 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().expect("a temp dir");
         let mut store = SpecStore::open(dir.path().to_owned()).expect("an empty directory");
         symlink(name_of(1, "yaml"), dir.path().join(name_of(1, "json"))).expect("a link");
-        let never = |_: &Path| Err(io::Error::other("the directory did not sync"));
+        let never = |_: &fs::File| Err(io::Error::other("the directory did not sync"));
         let refused = store
             .persist_synced(at(1, YAML), b"one", never)
             .expect_err("the other form's name stands");
@@ -698,8 +1755,9 @@ pub(crate) mod tests {
     fn two_stores_that_write_one_number_in_the_two_forms_do_not_both_land() {
         const ROUNDS: u64 = 100;
         let dir = tempfile::tempdir().expect("a temp dir");
-        let open = || SpecStore::open(dir.path().to_owned()).expect("it opens");
-        let (mut first, mut second) = (open(), open());
+        let mut first = SpecStore::open(dir.path().to_owned()).expect("it opens");
+        // A second writer the lock did not keep out.
+        let mut second = SpecStore::open_beside(dir.path().to_owned()).expect("it opens");
         // Two processes' temporary names differ, whatever the clock read.
         second.writes = 1 << 32;
         let barrier = std::sync::Barrier::new(2);
@@ -708,7 +1766,7 @@ pub(crate) mod tests {
                 barrier.wait();
                 store.persist(at(generation, format), b"a document")
             };
-            let (yaml, json) = std::thread::scope(|scope| {
+            let (yaml, json) = thread::scope(|scope| {
                 let yaml = scope.spawn(|| write(&mut first, YAML));
                 let json = scope.spawn(|| write(&mut second, Format::Json));
                 (
@@ -735,7 +1793,9 @@ pub(crate) mod tests {
             }
         }
         // No number holds two names, and no temporary name is left.
-        assert_eq!(names(dir.path()).len(), open().kept().len());
+        let left = names(dir.path());
+        let beside = SpecStore::open_beside(dir.path().to_owned()).expect("it opens");
+        assert_eq!(left.len(), beside.kept().len());
     }
 
     /// A pipe under a generation's name, with no writer, is refused by its
@@ -751,11 +1811,11 @@ pub(crate) mod tests {
         assert_eq!(store.kept(), [at(1, YAML)]);
 
         let (answer, answered) = mpsc::channel();
-        std::thread::spawn(move || {
+        thread::spawn(move || {
             let _ = answer.send(store.read(at(1, YAML)));
         });
         let read = answered
-            .recv_timeout(std::time::Duration::from_secs(5))
+            .recv_timeout(Duration::from_secs(5))
             .expect("the read answers: its open does not wait");
         let refused = read.expect_err("no regular file");
         assert_eq!(refused.to_string(), "the path leads to no regular file");
@@ -773,6 +1833,42 @@ pub(crate) mod tests {
         store.forget().expect("the newest is removed");
         assert_eq!(store.kept(), [at(1, YAML)]);
         assert_eq!(names(dir.path()), BTreeSet::from([name_of(1, "yaml")]));
+    }
+
+    /// A refused generation whose file another hand took off first is
+    /// taken as removed: the store forgets it and says no failure.
+    #[test]
+    fn a_refused_generation_gone_from_file_is_taken_as_removed() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let mut store = SpecStore::open(dir.path().to_owned()).expect("an empty directory");
+        for generation in [1, 2] {
+            store
+                .persist(at(generation, YAML), b"document")
+                .expect("it persists");
+        }
+        fs::remove_file(dir.path().join(name_of(2, "yaml"))).expect("another hand");
+        store.forget().expect("the newest is gone already");
+        assert_eq!(store.kept(), [at(1, YAML)]);
+    }
+
+    /// A generation under the retained ones whose file is gone already is
+    /// taken as removed: the removal says so once, and no apply tries it
+    /// again.
+    #[test]
+    fn a_generation_gone_from_file_under_the_retained_ones_is_not_tried_again() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let mut store = SpecStore::open(dir.path().to_owned()).expect("an empty directory");
+        let count = u64::try_from(RETAINED).expect("a small count") + 1;
+        for generation in 1..=count {
+            store
+                .persist(at(generation, YAML), b"document")
+                .expect("it persists");
+        }
+        fs::remove_file(dir.path().join(name_of(1, "yaml"))).expect("another hand");
+        let pruned = store.prune();
+        assert!(matches!(pruned.as_slice(), [(1, Ok(()))]), "{pruned:?}");
+        assert!(store.prune().is_empty(), "nothing is tried again");
+        assert_eq!(store.kept().len(), RETAINED);
     }
 
     #[test]

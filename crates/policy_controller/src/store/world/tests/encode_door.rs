@@ -63,6 +63,7 @@ fn the_encode_door_builds_the_pair_the_encode_pool_and_its_columns() {
         Role::Decode,
         EncodeOffer::default(),
     ));
+    store.publish_now();
 
     let mut out = EncodePairBuffers::default();
     let built = store.build_encode_pair(MODEL, &ask(now), &mut out);
@@ -130,6 +131,7 @@ fn the_encode_doors_columns_follow_the_rows_of_the_asking_gateway() {
         Role::Decode,
         EncodeOffer::default(),
     ));
+    store.publish_now();
     for (gateway, own) in [(ASKER, of_asker), (other, of_other)] {
         let asked = Ask {
             gateway,
@@ -177,6 +179,7 @@ fn the_encode_door_builds_no_class_and_no_encoder_where_the_model_has_none() {
         Role::Encode,
         EncodeOffer::default(),
     ));
+    store.publish_now();
     assert_eq!(store.build_encode_pair(MODEL, &ask(now), &mut out), None);
     // A pair whose one encoder states no end: every row names class 0.
     store.upsert(door_facts(
@@ -184,6 +187,7 @@ fn the_encode_door_builds_no_class_and_no_encoder_where_the_model_has_none() {
         Role::Decode,
         EncodeOffer::default(),
     ));
+    store.publish_now();
     assert!(store
         .build_encode_pair(MODEL, &ask(now), &mut out)
         .is_some());
@@ -200,6 +204,7 @@ fn the_encode_door_builds_no_class_and_no_encoder_where_the_model_has_none() {
         Role::Decode,
         EncodeOffer::default(),
     ));
+    alone.publish_now();
     assert!(alone
         .build_encode_pair(MODEL, &ask(now), &mut out)
         .is_some());
@@ -234,6 +239,7 @@ fn the_encode_door_states_no_push_for_an_encoder_of_a_rendezvous() {
         Role::Decode,
         EncodeOffer::default(),
     ));
+    store.publish_now();
 
     let mut out = EncodePairBuffers::default();
     let built = store.build_encode_pair(MODEL, &ask(now), &mut out);
@@ -280,6 +286,7 @@ fn a_request_with_an_item_is_decided_through_the_encode_door_and_the_engines_ent
     let p1 = ready("grpc://p1:9000", Role::Prefill, push_on("c1"));
     ready("grpc://p2:9000", Role::Prefill, push_on("c2"));
     ready("grpc://d1:9000", Role::Decode, EncodeOffer::default());
+    store.publish_now();
     let spec: PolicySpec = serde_json::from_str(ENCODE_PLAN).expect("a well-formed document");
     let engine = spec.validate().expect("the engine");
     let (mut out, mut scratch) = (EncodePairBuffers::default(), Scratch::new());
@@ -364,6 +371,7 @@ fn a_view_with_rows_left_out_is_served_under_the_class_the_pool_numbered() {
     let encoder = ready("ipc://ae", Role::Encode, push_on("asker"), Some(ASKER));
     let prefill = ready("ipc://ap", Role::Prefill, push_on("asker"), Some(ASKER));
     ready("grpc://d1:9000", Role::Decode, EncodeOffer::default(), None);
+    store.publish_now();
     let spec: PolicySpec = serde_json::from_str(ENCODE_PLAN).expect("a well-formed document");
     let engine = spec.validate().expect("the engine");
     let (mut out, mut scratch) = (EncodePairBuffers::default(), Scratch::new());
@@ -420,6 +428,7 @@ fn a_membership_write_that_moves_no_offer_carries_the_encoders_facts() {
     // What the encode pool's shape holds: one address in a later world is
     // those facts carried, never others in their place.
     let stated = || {
+        store.publish_now();
         let world = store.world();
         let shape = world.derived.shape(MODEL, Role::Encode);
         shape
@@ -458,6 +467,7 @@ fn a_membership_write_that_moves_an_encoders_end_states_its_facts_again() {
         EncodeOffer::default(),
     ));
     let facts = || {
+        store.publish_now();
         let mut out = EncodePairBuffers::default();
         store
             .build_encode_pair(MODEL, &ask(Instant::now()), &mut out)
@@ -477,4 +487,33 @@ fn a_membership_write_that_moves_an_encoders_end_states_its_facts_again() {
     let after = facts();
     assert!(after[0].references, "the door reads the end of this write");
     assert_eq!(after[0].class, before[0].class);
+}
+
+#[test]
+fn a_write_that_leaves_a_models_encoders_and_prefills_carries_the_encoders_facts() {
+    let store = MemoryStore::new();
+    store.upsert(encode_facts("grpc://e1:9000", Role::Encode, push_on("c1")));
+    store.upsert(encode_facts("grpc://p1:9000", Role::Prefill, push_on("c1")));
+    let stated = || {
+        store.publish_now();
+        let world = store.world();
+        let shape = world.derived.shape(MODEL, Role::Encode);
+        shape
+            .and_then(|shape| shape.encoders.clone())
+            .expect("the encoders' facts")
+    };
+    let before = stated();
+    // A decode joins: the encoders' facts read no decode.
+    store.upsert(facts("grpc://d1:9000", Role::Decode, &[MODEL]));
+    assert!(
+        Arc::ptr_eq(&before, &stated()),
+        "a decode joined: stated again"
+    );
+    // A prefill joins: the classes are derived again and the facts with
+    // them.
+    store.upsert(encode_facts("grpc://p2:9000", Role::Prefill, push_on("c1")));
+    assert!(
+        !Arc::ptr_eq(&before, &stated()),
+        "a prefill joined: carried"
+    );
 }

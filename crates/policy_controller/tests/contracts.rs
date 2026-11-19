@@ -26,9 +26,9 @@ use prost_types::{
 };
 use smg_policy_controller::{
     fingerprint, spec::DENIED_HEADERS, AffinityFacts, Candidate, Constraints, HashKind, Health,
-    Identity, Lease, LeaseKind, LoadRow, MediaCounts, Membership, Outcome, OverloadRegime, Pair,
-    Phase, PoolFacts, Queue, ReleaseReason, RequestFacts, Role, Shed, ShedReason, Side, Signal,
-    SignalSource, Target, Trace, TransportClass, ZoneCapacity,
+    Identity, Lease, LeaseKind, Lifted, LoadRow, MediaCounts, Membership, Outcome, OverloadRegime,
+    Pair, Phase, PoolFacts, Queue, ReleaseReason, RequestFacts, Role, Shed, ShedReason, Side,
+    Signal, SignalSource, Target, Trace, TransportClass, ZoneCapacity,
 };
 use wit_parser::{InterfaceId, PackageId, Resolve, TypeDefKind, WorldId, WorldItem, WorldKey};
 
@@ -166,6 +166,7 @@ fn request_record() -> &'static [&'static str] {
             now_micros,
             pinned_at,
             lent_in_flight,
+            session_counted,
             affinity,
             named,
             model_fingerprint,
@@ -200,7 +201,8 @@ fn constraints_record() -> &'static [&'static str] {
             wire_modes,
             overload_lifted,
             subset_hint,
-            stalled
+            stalled,
+            pins
         }
     )
 }
@@ -216,7 +218,8 @@ fn pool_record() -> &'static [&'static str] {
             generation,
             zones,
             reach,
-            rated,
+            reported,
+            engines,
         }
     )
 }
@@ -330,6 +333,7 @@ fn lease_record() -> &'static [&'static str] {
             kind,
             side,
             target_index,
+            booked,
             generation,
             session as "session_key",
             session_verdict,
@@ -489,19 +493,28 @@ fn enum_mirrors() -> Vec<(
             "MembershipChange.Kind",
             "KIND",
             "membership",
-            cases!(
-                Membership<'_>,
-                Membership {
-                    Added,
-                    Removed,
-                    Replaced,
-                    Relabelled,
-                    Resized,
-                    Snapshot,
-                }
-            ),
+            membership_cases().0,
         ),
     ]
+}
+
+/// The membership words in declaration order: the kinds the two contracts
+/// spell out, then the words they do not carry. A plugin is told nothing of
+/// a word of the second part.
+fn membership_cases() -> (&'static [&'static str], &'static [&'static str]) {
+    cases!(
+        Membership<'_>,
+        Membership {
+            Added,
+            Removed,
+            Replaced,
+            Relabelled,
+            Resized,
+            Snapshot,
+            Left,
+        }
+    )
+    .split_at(6)
 }
 
 /// The shed reasons have a proto enum and no WIT counterpart (a guest never
@@ -638,6 +651,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 "now_micros",
                 "pinned_at",
                 "lent_in_flight",
+                "session_counted",
                 "affinity",
                 "named",
                 "model_fingerprint",
@@ -670,7 +684,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "Constraints",
             record: constraints_record(),
-            host_only: &["stalled"],
+            host_only: &["stalled", "pins"],
             wire_only: &[],
             wire: &[
                 ("excluded", Type::Fixed64),
@@ -684,7 +698,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "PoolFacts",
             record: pool_record(),
-            host_only: &["reach", "rated"],
+            host_only: &["reach", "reported", "engines"],
             wire_only: &[],
             wire: &[
                 ("pool_size", Type::Uint32),
@@ -793,7 +807,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "Lease",
             record: lease_record(),
-            host_only: &["session_verdict", "issued_micros"],
+            host_only: &["booked", "session_verdict", "issued_micros"],
             wire_only: &["term", "dispatch_ttl_ms", "origin"],
             wire: &[
                 ("id", Type::Fixed64),
@@ -875,6 +889,7 @@ fn wit_mirrors() -> Vec<WitMirror> {
                 "now_micros",
                 "pinned_at",
                 "lent_in_flight",
+                "session_counted",
                 "affinity",
                 "named",
                 "model_fingerprint",
@@ -892,14 +907,14 @@ fn wit_mirrors() -> Vec<WitMirror> {
         WitMirror {
             record: "pool",
             crate_record: pool_record(),
-            host_only: &["reach", "rated"],
+            host_only: &["reach", "reported", "engines"],
             before: &[],
             beside: &[],
         },
         WitMirror {
             record: "lease",
             crate_record: lease_record(),
-            host_only: &["session_verdict", "issued_micros"],
+            host_only: &["booked", "session_verdict", "issued_micros"],
             before: &[],
             beside: &[],
         },
@@ -1149,7 +1164,7 @@ fn contracts_dir() -> PathBuf {
 /// The engine wire's protos (`smg.grpc.common`): the controller protocol
 /// imports the load record and the event batch a relay forwards unchanged.
 fn engine_wire_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../grpc_client/proto")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../worker/proto")
 }
 
 fn compile_protocol() -> io::Result<FileDescriptorSet> {
@@ -1461,8 +1476,26 @@ fn the_protocol_compiles_and_mirrors_the_engine_record() {
             .unwrap_or_else(|| panic!("enum {proto_name} is missing from {PLUGIN_PROTO}"));
         assert_eq!(found, proto_enum(prefix, cases), "enum {proto_name}");
     }
+    // The membership word no contract carries: a plugin is told nothing of
+    // it.
+    assert_eq!(membership_cases().1, ["Left"]);
     let found = enum_values(plugin, "ShedReason").expect("ShedReason is an enum");
     assert_eq!(found, proto_enum("SHED_REASON", shed_reasons()));
+    // The lifted veto: the mark's variants in order, numbered from zero.
+    // Its zero is none, a case, on purpose: the enum's comment says why.
+    let found = enum_values(plugin, "LiftedVeto").expect("LiftedVeto is an enum");
+    let expected: Vec<(String, i32)> = cases!(Lifted, Lifted { None, Overload })
+        .iter()
+        .enumerate()
+        .map(|(i, case)| {
+            let number = i32::try_from(i).unwrap_or(i32::MAX);
+            (format!("LIFTED_VETO_{}", screaming_case(case)), number)
+        })
+        .collect();
+    assert_eq!(
+        found, expected,
+        "the lifted vetoes are the mark's, from none"
+    );
     // The health bits: the record's flags in order, one bit each.
     let found = enum_values(plugin, "HealthFlag").expect("HealthFlag is an enum");
     let mut expected = vec![("HEALTH_FLAG_UNSPECIFIED".to_owned(), 0)];

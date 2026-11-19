@@ -15,6 +15,13 @@
 //! holder each), `shared` for the prompt every worker holds (the cap cuts
 //! one depth of the whole pool), a miss for prompts nobody holds.
 //!
+//! `policy_store_named/best_hit/<n>`, `best_shared/<n>` and `best_miss/<n>`
+//! are the three decisions over a fleet of the same making under the
+//! preset's stages and a picker that takes no sample: such a profile is
+//! named every holder and every warming row, under no cap, and its pass
+//! reads every row. `best_column/<n>` is that miss decided over the column
+//! instead: the two feeds of one decision, side by side.
+//!
 //! `policy_store_named/publish/<n>` is one window's publication of that
 //! fleet: under the preset's warm-up ruling it reads each row's index size
 //! and rules the pool's warming rows again.
@@ -84,9 +91,20 @@ fn stores(store: &MemoryStore, id: WorkerId, sequence: u64, tokens: &[u32]) {
 /// publish events, worker `p` holding prompt `p` and the shared prompt;
 /// their ids in order.
 fn fleet(n: usize) -> (MemoryStore, Vec<WorkerId>) {
+    fleet_picking(n, None)
+}
+
+/// [`fleet`] under the preset's stages and the picker `pick`, where one is
+/// named: `best` takes no sample.
+fn fleet_picking(n: usize, pick: Option<&str>) -> (MemoryStore, Vec<WorkerId>) {
     let store = MemoryStore::new();
     let mut document = PolicySpec::preset("cache_aware").expect("a preset of this build");
     document.generation = 1;
+    if let Some(pick) = pick {
+        for profile in document.profiles.values_mut() {
+            profile.pick = pick.into();
+        }
+    }
     let spec = AppliedSpec::validate(&document).expect("a preset validates");
     store.apply(spec).expect("above the unbound start");
     let ids: Vec<WorkerId> = (0..n)
@@ -113,6 +131,9 @@ fn fleet(n: usize) -> (MemoryStore, Vec<WorkerId>) {
             id
         })
         .collect();
+    // The build the registrations owe, asked once: a decision reads the
+    // fleet whole.
+    store.publish_now();
     for (p, id) in ids.iter().enumerate() {
         stores(&store, *id, 1, &prompt(p));
         stores(&store, *id, 2, &prompt(SHARED));
@@ -253,6 +274,42 @@ fn decisions(c: &mut Criterion) {
             b.iter(|| {
                 seed += 1;
                 decide(&store, &mut host, black_box(&shared), now, seed, true)
+            });
+        });
+        // The same fleet under a picker that takes no sample: named every
+        // holder, and a hit is still its one holder's.
+        let (whole, wholes) = fleet_picking(n, Some("best"));
+        for (p, id) in wholes.iter().enumerate() {
+            let picked = decide(&whole, &mut host, &held[p], now, p as u64, true);
+            assert_eq!(picked, Some(*id), "{n}: prompt {p} goes to its holder");
+        }
+        let cells: [(&str, &[Vec<u32>], bool); 3] = [
+            ("best_hit", &held, true),
+            ("best_miss", &unheld, true),
+            ("best_column", &unheld, false),
+        ];
+        for (name, prompts, named) in cells {
+            let mut next = 0usize;
+            group.bench_with_input(BenchmarkId::new(name, n), &n, |b, _| {
+                b.iter(|| {
+                    let tokens = &prompts[next % n];
+                    next += 1;
+                    decide(
+                        &whole,
+                        &mut host,
+                        black_box(tokens),
+                        now,
+                        next as u64,
+                        named,
+                    )
+                });
+            });
+        }
+        let mut seed = 0u64;
+        group.bench_with_input(BenchmarkId::new("best_shared", n), &n, |b, _| {
+            b.iter(|| {
+                seed += 1;
+                decide(&whole, &mut host, black_box(&shared), now, seed, true)
             });
         });
         // One window's publication: a record folded inside the window, then

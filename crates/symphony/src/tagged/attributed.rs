@@ -3011,29 +3011,30 @@ mod tests {
         }
     }
 
-    /// The reader stays to the call's end, the mark of a call written as one object; the text it
-    /// read does not: after the closing brace nothing reads it.
+    /// The reader stays to the call's end, the mark of a call written as one object; what it read
+    /// does not: after the closing brace nothing reads the text, nor the copy the scanner keeps of
+    /// a top-level name.
     #[test]
     fn a_closed_object_gives_its_text_back_at_the_brace() {
         for tags in [Tags::DSML, Tags::DSML_V4] {
-            let mut assembler = Assembler::new(0, "call_0", tags);
-            let mut out = Events::new();
-            let declared = declared();
-            assembler.feed(
-                "f\">\n{\"city\": \"Paris\", \"days\": 3",
-                &declared,
-                &mut out,
-            );
-            let open = assembler.json.as_ref().map(|object| object.held());
-            assert!(open.is_some_and(|held| held > 0), "{open:?}");
-            assembler.feed("}", &declared, &mut out);
-            let closed = assembler.json.as_ref().map(|object| object.held());
-            assert_eq!(closed, Some(0), "the closed object's text is given back");
-            assembler.close(tags.invoke_close, &mut out);
-            assert_eq!(
-                arguments(&out.drain()),
-                "{\"city\": \"Paris\", \"days\": 3}"
-            );
+            for text in [
+                "{\"city\": \"Paris\", \"days\": 3",
+                "{\"name\": \"Paris\", \"days\": 3",
+            ] {
+                let opening = format!("f\">\n{text}");
+                let mut assembler = Assembler::new(0, "call_0", tags);
+                let mut out = Events::new();
+                let declared = declared();
+                assembler.feed(&opening, &declared, &mut out);
+                let open = assembler.json.as_ref().map(|object| object.held());
+                assert!(open.is_some_and(|held| held > 0), "{open:?}");
+                assembler.feed("}", &declared, &mut out);
+                let closed = assembler.json.as_ref();
+                let closed = closed.map(|object| (object.held(), object.whole()));
+                assert_eq!(closed, Some((0, true)), "{text}: all is given back, whole");
+                assembler.close(tags.invoke_close, &mut out);
+                assert_eq!(arguments(&out.drain()), format!("{text}}}"));
+            }
         }
     }
 

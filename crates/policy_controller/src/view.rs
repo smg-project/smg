@@ -135,7 +135,13 @@ pub struct Health {
     pub stalled: bool,
     /// Being drained; nothing new goes there.
     pub draining: bool,
-    /// The latched overload verdict of the last load report.
+    /// The latched overload verdict of the last load report: the engine
+    /// is at a threshold, or an answer of it named another of its ranks
+    /// and not this one. That mark ends when an answer or a record names
+    /// the rank again, when its member's rows go, or with the build that
+    /// follows its member's registration under another rank number. The
+    /// bit reads the mark only while a rank the answer named has a record
+    /// on file.
     pub overloaded: bool,
 }
 
@@ -809,6 +815,16 @@ pub struct RequestFacts<'a> {
     /// pool, and a pair's rows carry what counts their host wrote.
     /// In-process only.
     pub lent_in_flight: Option<&'a crate::counts::LentCounts<'a>>,
+    /// The host wrote each row's count of this request's session key
+    /// ([`Candidate::session_in_flight`]), the count a capped sessions rule
+    /// asks for
+    /// ([`Needs::session_in_flight`](crate::Needs::session_in_flight)). A
+    /// sessions rule's in-flight cap reads the count either way. A key kept
+    /// on its worker over the overload veto is kept under a capped rule only
+    /// where this is set: with the count unwritten the cap could not hand
+    /// the key on, so the veto stands for it as for any request. In-process
+    /// only.
+    pub session_counted: bool,
     /// The candidates' affinity facts, by index in the candidate slice the
     /// decision is made over: the one column the affinity stages read, in
     /// the candidates' own order. It is EMPTY or holds exactly one entry a
@@ -982,6 +998,18 @@ impl<'a> RequestFacts<'a> {
     }
 }
 
+/// A table of session pins that outlives an engine's own (design 5.1, the
+/// sessions row), lent by the deciding host among a decision's
+/// [`Constraints`]. A sessions rule asks it once a decision, for a key its
+/// engine's table holds no pin of: the table goes with its generation, the
+/// pins of record do not.
+pub trait PinSource: std::fmt::Debug + Sync {
+    /// The worker `key` is pinned to, where that pin has not ended by the
+    /// host's record and was last used less than `ttl_micros` ago (`None`:
+    /// a pin of any age). The host answers by its own clock.
+    fn pinned(&self, key: Session, ttl_micros: Option<u64>) -> Option<WorkerId>;
+}
+
 /// What only the deciding host knows now: its standing vetoes, the wires it
 /// speaks and the request-level lifts around the profile. The admission bits
 /// of a prefill window and a decode room ride the candidate rows.
@@ -991,8 +1019,14 @@ pub struct Constraints<'a> {
     pub excluded: &'a [WorkerId],
     /// The wires this host speaks.
     pub wire_modes: WireModes,
-    /// The overload veto does not apply to this decision (a pool whose
-    /// policy balances load against affinity itself, a session owner).
+    /// The overload veto does not apply to this decision: the host's
+    /// override, for a pool whose policy balances load against affinity
+    /// itself. An engine built from a document lifts the veto itself for a
+    /// keyed request of a profile that places by the session key, where the
+    /// binding steers; under a sessions rule with an in-flight cap, only
+    /// where the host wrote the key's counts
+    /// ([`RequestFacts::session_counted`]). An engine built by hand does
+    /// not: its host says so here.
     pub overload_lifted: bool,
     /// A subset hint: decide over at most this many candidates.
     pub subset_hint: Option<u32>,
@@ -1002,6 +1036,12 @@ pub struct Constraints<'a> {
     /// stalled bit asks both ([`Constraints::masks`]). Empty where the rows
     /// were written for the decision. In-process only.
     pub stalled: &'a [u32],
+    /// The pins of record, where the host keeps a table that outlives the
+    /// engine's ([`PinSource`]): a sessions rule asks it for a key its own
+    /// table holds no pin of, and no other stage reads it. `None` where
+    /// the engine's table is the only one, as in a host that embeds the
+    /// engine. In-process only.
+    pub pins: Option<&'a dyn PinSource>,
 }
 
 impl Constraints<'_> {
@@ -1020,6 +1060,76 @@ pub struct ZoneCapacity {
     pub zone: u16,
     pub healthy: u32,
     pub total: u32,
+}
+
+/// The engines of a pool, as its host lists them beside the rows: each
+/// engine's rows by position, the ranks of a data-parallel engine together
+/// and in their ranks' order, a single-rank worker alone. A stage that
+/// names the engine as its unit ([`Picker::unit`](crate::Picker::unit))
+/// draws over the list and reads the rows of the engine it takes, so a
+/// decision it makes does not grow with the ranks of the engines it passes
+/// by. Empty where the host lists none: a pool with no engine of several
+/// rows, or rows whose positions are not the list's. In-process only.
+///
+/// A host that lists a pool's engines hands the pool's own rows with the
+/// list, in the order of their ids and under a membership epoch
+/// ([`PoolFacts::membership_epoch`]), and numbers the pool
+/// ([`Engines::pool`]). A stage that finds a member's row by its id, with
+/// no pool read whole ([`Scorer::own`](crate::Scorer::own)), takes the
+/// list as that word.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Engines<'a> {
+    pool: u32,
+    rows: &'a [u32],
+    ends: &'a [u32],
+}
+
+impl<'a> Engines<'a> {
+    /// The list of the pool its host numbers `pool`, over `rows`, the
+    /// positions engine after engine, and `ends`, each engine's end in
+    /// `rows` in rising order. A list whose last end is not the count of
+    /// its rows is no list, and reads as empty.
+    pub fn new(pool: u32, rows: &'a [u32], ends: &'a [u32]) -> Self {
+        if ends.last().is_some_and(|&end| end as usize == rows.len()) {
+            Self { pool, rows, ends }
+        } else {
+            Self::default()
+        }
+    }
+
+    /// The host's number for the pool: one pool's while a membership epoch
+    /// stands, and no other pool's under that epoch. A stage that keeps
+    /// what it learned of a pool keeps it by this number and the epoch.
+    pub const fn pool(&self) -> u32 {
+        self.pool
+    }
+
+    /// How many engines the pool holds.
+    pub const fn len(&self) -> usize {
+        self.ends.len()
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.ends.is_empty()
+    }
+
+    /// The rows of the engine at `engine`, by position; none for a place
+    /// past the list.
+    #[inline]
+    pub fn rows(&self, engine: usize) -> &'a [u32] {
+        let from = match engine.checked_sub(1) {
+            Some(before) => self.ends.get(before).copied(),
+            None => Some(0),
+        };
+        let to = self.ends.get(engine).copied();
+        match (from, to) {
+            (Some(from), Some(to)) => self
+                .rows
+                .get(from as usize..to as usize)
+                .unwrap_or_default(),
+            _ => &[],
+        }
+    }
 }
 
 /// Pool-wide facts beside the candidates.
@@ -1043,23 +1153,31 @@ pub struct PoolFacts<'a> {
     /// rotation does, keys it by this too. In-process only: a plugin reads
     /// the rows it is handed.
     pub reach: u64,
-    /// Whether every row of the pool holds a rate: a report whose
-    /// `live_rate` is above zero. A host says so where it knows it of the
-    /// rows it wrote, and a decision reads it once: a profile decided by
-    /// rank ([`Scorer::spread`](crate::Scorer::spread)) is asked by rank
-    /// only where it is on, since the load stage reads every row to cost a
-    /// row without a rate. By rank the targets are the whole pass's
-    /// wherever its sums tell the rows in front apart: rows it rounds to
-    /// one sum it draws among, and by rank they are ordered. Off by
-    /// default: a host that does not say it gets the whole pass. A host
-    /// that says it of a pool that holds a row without a rate is answered
-    /// in one of two ways. Among the rows in front such a row makes the
-    /// stage say that it must be asked whole
-    /// ([`Front::Whole`](crate::Front::Whole)): the decision is the whole
-    /// pass's, and it paid for its ranks' reading. Behind them it is not
-    /// read: each row in front is costed from its own report, and the
-    /// decision is the one by rank. In-process only.
-    pub rated: bool,
+    /// Whether every row of the pool holds a report. A host says so where
+    /// it knows it of the rows it wrote, and a decision reads it once: a
+    /// profile decided by rank ([`Scorer::spread`](crate::Scorer::spread))
+    /// is asked by rank only where it is on, since the load stage costs a
+    /// row without a report from every row that holds one. By rank the
+    /// targets are the whole pass's wherever its sums tell the rows in
+    /// front apart: rows it rounds to one sum it draws among, and by rank
+    /// they are ordered. Off by default: a host that does not say it gets
+    /// the whole pass. A report without a rate is a report: among the rows
+    /// in front it drains as in the whole pass, at the mean rate of the
+    /// rows that pass costs, which the load stage folds over them, and the
+    /// decision is the one by rank. A host that says the fact of a pool
+    /// that holds a row without a report is answered by what the row
+    /// lacks: in front it makes the stage say that it must be asked whole
+    /// ([`Front::Whole`](crate::Front::Whole)), and the decision is the
+    /// whole pass's, which paid for its ranks' reading. Behind the rows in
+    /// front it is not costed where they decide alone, and the decision is
+    /// the one by rank. Where they cannot, their band being wider than the
+    /// ranks leave room for, every row is asked, that row with them, and
+    /// the decision is the whole pass's. In-process only.
+    pub reported: bool,
+    /// The pool's engines, where the host lists them ([`Engines`]): the
+    /// candidates are then the rows the list's positions name. Empty by
+    /// default, and every decision then reads rows alone.
+    pub engines: Engines<'a>,
 }
 
 #[cfg(test)]

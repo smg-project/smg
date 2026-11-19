@@ -12,6 +12,7 @@ mod inkling_preprocess_golden;
 mod muse_spark_audio_golden;
 mod muse_spark_preprocess_golden;
 mod nemotron_omni_preprocess_golden;
+mod nemotron_transcribe_golden;
 mod preprocess_fingerprint;
 mod qwen3_audio_mel_bits;
 mod qwen_pixel_norm_golden;

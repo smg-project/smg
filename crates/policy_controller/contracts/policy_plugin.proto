@@ -412,11 +412,13 @@ message Lease {
   // the request's session key carries in its hash form (see Identity); 0
   // when none.
   fixed64 session_key = 6;
-  // Token-work booked on the target.
+  // The prompt size the request stated, in tokens; 0 where it stated none.
   uint32 tokens = 7;
   // The leader's term that minted the lease.
   uint64 term = 8;
   // Bounds decision to Dispatched; then Completed or the stream rule ends it.
+  // A controller's lease tells what is left of the span as its answer is
+  // sent; the span counts from the request's take.
   uint32 dispatch_ttl_ms = 9;
   LeaseOrigin origin = 10;
 }
@@ -457,14 +459,19 @@ message Trace {
   // `survivors` is unset and `drops` is empty, neither one a count, and
   // `top` is of the rows drawn.
   bool drew_first = 12;
-  // The soft veto the all-vetoed rule lifted to make this pick; none unless
-  // the rule made it. A host counts its steered picks from this field.
+  // The soft veto lifted to make this pick; none unless that veto left the
+  // pool nobody, or left a session key handed on at its sessions rule's
+  // in-flight cap nobody under the cap. The all-vetoed rule's pick sets it,
+  // and so does the pick of a session key kept on its worker. A host counts
+  // both from this field.
   LiftedVeto lifted = 13;
 }
 
 // The soft vetoes the all-vetoed rule lifts, in the order it lifts them. The
-// zero value is none, with no presence bit: a pick that no rule made reads it
-// truly, and a reader makes one comparison.
+// zero value is none, with no presence bit: a pick made with no veto lifted
+// reads it truly, and a reader makes one comparison. A zero with a meaning
+// departs on purpose from this file's rule, an UNSPECIFIED zero: an enum
+// with no such reason keeps the rule.
 enum LiftedVeto {
   LIFTED_VETO_NONE = 0;
   // Every usable worker was over its overload thresholds.
@@ -560,10 +567,12 @@ message Released {
   }
   enum Reason {
     REASON_UNSPECIFIED = 0;
-    // The host gave up before dispatch.
+    // The lease ended before a dispatch: its host gave up, no dispatch was
+    // named by its deadline, or its answer was stopped for the fence (its
+    // controller no longer led the term that minted it).
     REASON_ABANDONED = 1;
     // A late decision: it arrived after a fallback dispatch, or was cut
-    // before it left.
+    // before it left, for its request's budget or its dispatch span.
     REASON_LATE_DECISION = 2;
     // The client went away.
     REASON_CLIENT_GONE = 3;

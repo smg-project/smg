@@ -1,8 +1,10 @@
 //! The scratch rule, pinned on the `epd` plan: after the first decision on a
 //! thread (which sizes the thread's scratch and lets the ring learn the pool),
 //! an encode item's decision allocates nothing, over 8, 64 and 512 encoders
-//! and under each encode preset; and neither does the plan's one decision,
-//! the pair with its items, with every row admitted or with rows left out.
+//! and under each encode preset; and neither does the plan's one decision
+//! after its first 32, the pair with its items, with every row admitted or
+//! with rows left out, and under a mask on every side that those first
+//! decisions did not meet.
 //! The count is the test thread's own
 //! (`common::counting_alloc`), so what runs beside it in the process, the
 //! harness included, is not charged to the decisions: a second thread
@@ -52,11 +54,13 @@ fn encoders(n: u32) -> Vec<Candidate> {
 /// window is opened by the deciding thread's count first and stays open
 /// until the number moved twice: the allocation between the two moves is
 /// made inside the window, and a count that is not the deciding thread's
-/// own reads it.
+/// own reads it. Each move is released and each read acquires it. The
+/// thread is stopped and joined where its owner ends, by a failed
+/// assertion too.
 struct Beside {
     stop: Arc<AtomicBool>,
     made: Arc<AtomicUsize>,
-    allocating: thread::JoinHandle<()>,
+    allocating: Option<thread::JoinHandle<()>>,
 }
 
 impl Beside {
@@ -68,14 +72,14 @@ impl Beside {
             thread::spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
                     drop(black_box(Box::new([0u8; 64])));
-                    made.fetch_add(1, Ordering::Relaxed);
+                    made.fetch_add(1, Ordering::Release);
                 }
             })
         };
         Self {
             stop,
             made,
-            allocating,
+            allocating: Some(allocating),
         }
     }
 
@@ -83,13 +87,13 @@ impl Beside {
     /// second thread allocated in.
     fn allocations_of(&self, run: impl FnOnce()) -> usize {
         let before = calls();
-        let beside_before = self.made.load(Ordering::Relaxed);
+        let beside_before = self.made.load(Ordering::Acquire);
         run();
         // The window closes only once the second thread allocated in it:
         // its number's second move follows an allocation made after the
         // first.
         let waiting = Instant::now();
-        while self.made.load(Ordering::Relaxed) < beside_before + 2 {
+        while self.made.load(Ordering::Acquire) < beside_before + 2 {
             assert!(
                 waiting.elapsed() < Duration::from_secs(10),
                 "the second thread made no allocation in 10 s"
@@ -98,13 +102,19 @@ impl Beside {
         }
         calls() - before
     }
+}
 
-    fn stop(self) {
+impl Drop for Beside {
+    fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        assert!(
-            self.allocating.join().is_ok(),
-            "the allocating thread ended by a panic"
-        );
+        let ended = self.allocating.take().map(thread::JoinHandle::join);
+        // A case that is failing already keeps its own failure.
+        if !thread::panicking() {
+            assert!(
+                matches!(ended, Some(Ok(()))),
+                "the allocating thread ended by a panic"
+            );
+        }
     }
 }
 
@@ -153,7 +163,6 @@ fn an_encode_items_decision_allocates_nothing_after_the_first() {
             );
         }
     }
-    beside.stop();
 }
 
 /// The rows of one side of a pair: ready, of pair class 1, every admission
@@ -184,15 +193,27 @@ fn side(role: Role, first: u32, n: u32) -> Vec<Candidate> {
 /// takes no image while the request asks one of its decode: the pair is
 /// picked over pools of admitted rows. The first decisions size the
 /// scratch, the admitted pools and the placed list, and let the ring learn
-/// the encoders of both classes.
+/// the encoders of both classes. They meet no mask: the measured decisions
+/// meet one on every side from the hundredth on, and allocate nothing for
+/// the lists it is numbered anew into. Under one more engine the encode
+/// profile holds no hard filter that reads the mask: the masked encoder is
+/// offered, and the mask is numbered with the encoders offered.
 #[test]
-fn an_encode_pair_decision_allocates_nothing_after_the_first() {
+fn an_encode_pair_decision_allocates_nothing_after_its_first_32() {
     let beside = Beside::start();
-    for preset in ["consistent_hashing", "least_load", "round_robin"] {
-        let engine = PolicySpec::epd_presets(preset, "round_robin", "round_robin")
-            .expect("an epd spec")
-            .validate()
-            .expect("validates");
+    for (preset, unfiltered) in [
+        ("consistent_hashing", false),
+        ("least_load", false),
+        ("round_robin", false),
+        ("round_robin", true),
+    ] {
+        let mut spec =
+            PolicySpec::epd_presets(preset, "round_robin", "round_robin").expect("an epd spec");
+        if unfiltered {
+            let encode = spec.profiles.get_mut("encode").expect("the encode profile");
+            encode.filter.retain(|name| name != "healthy");
+        }
+        let engine = spec.validate().expect("validates");
         for n in [8u32, 64, 512] {
             for left_out in [false, true] {
                 let prefills = side(Role::Prefill, 10_000, n);
@@ -231,9 +252,15 @@ fn an_encode_pair_decision_allocates_nothing_after_the_first() {
                     ..PoolFacts::default()
                 };
                 let cx = Constraints::default();
+                // The first row of each pool, masked.
+                let stalled = [0u32];
+                let masked = Constraints {
+                    stalled: &stalled,
+                    ..Constraints::default()
+                };
                 let mut scratch = Scratch::new();
                 let mut placed = EncodePlaced::new();
-                let mut decide = |seed: u64| {
+                let mut decide = |seed: u64, cx: &Constraints<'_>| {
                     let keys = [1u64, 2, 3].map(|item| Identity::hashed(seed * 16 + item));
                     let facts = RequestFacts {
                         model: "m",
@@ -257,9 +284,9 @@ fn an_encode_pair_decision_allocates_nothing_after_the_first() {
                         pools,
                         encode,
                         items,
-                        &cx,
-                        &cx,
-                        &cx,
+                        cx,
+                        cx,
+                        cx,
                         &mut scratch,
                         &mut placed,
                     );
@@ -267,21 +294,21 @@ fn an_encode_pair_decision_allocates_nothing_after_the_first() {
                     placed.encoders().len()
                 };
                 for seed in 1..=32u64 {
-                    assert_eq!(decide(seed), 3);
+                    assert_eq!(decide(seed, &cx), 3);
                 }
                 let mut encoders_placed = 0usize;
                 let allocated = beside.allocations_of(|| {
                     for seed in 33..=231u64 {
-                        encoders_placed += decide(seed);
+                        let cx = if seed < 132 { &cx } else { &masked };
+                        encoders_placed += decide(seed, cx);
                     }
                 });
                 assert_eq!(encoders_placed, 3 * 199);
                 assert_eq!(
                     allocated, 0,
-                    "{preset} over {n} of each side, rows left out: {left_out}: {allocated} allocations in 199 decisions"
+                    "{preset} over {n} of each side, rows left out: {left_out}, no hard filter on the mask: {unfiltered}: {allocated} allocations in 199 decisions"
                 );
             }
         }
     }
-    beside.stop();
 }

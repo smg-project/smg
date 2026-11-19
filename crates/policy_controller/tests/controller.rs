@@ -347,9 +347,9 @@ async fn a_gateway_gone_past_its_grace_period_is_let_go_by_the_run_loop() {
             })
             .await
             .expect("the stream takes the Hello");
-        let answer = answers
-            .message()
+        let answer = timeout(Duration::from_secs(20), answers.message())
             .await
+            .expect("a Welcome within the case's patience")
             .expect("a frame, not a status")
             .expect("a frame, not the stream's end");
         assert_eq!(answer.term, 1, "the first take's term: {answer:?}");
@@ -377,6 +377,7 @@ async fn a_gateway_gone_past_its_grace_period_is_let_go_by_the_run_loop() {
                 issued_at: now,
                 dispatch_deadline: now + Duration::from_secs(600),
                 state: LeaseState::Issued,
+                session_ttl_micros: None,
             })
             .expect("a lease under the leader's term");
         assert_eq!(store.live(gateway), 1);
@@ -661,9 +662,9 @@ async fn a_present_gateway_is_answered_which_worker_on_its_decide_stream() {
             })
             .await
             .expect("the stream takes the Hello");
-        let answer = session
-            .message()
+        let answer = timeout(Duration::from_secs(20), session.message())
             .await
+            .expect("a Welcome within the case's patience")
             .expect("a frame, not a status")
             .expect("a frame, not the stream's end");
         let window = match answer.frame {
@@ -769,6 +770,165 @@ async fn a_present_gateway_is_answered_which_worker_on_its_decide_stream() {
     served.expect("a clean stop");
 }
 
+/// A worker added through the control listener is decided for a present
+/// gateway with no ask for a build anywhere: the served controller's own
+/// loop pays the build the registration owes. Its tick alone pays inside
+/// this case's bound, so the wake that pays at the window's end is held by
+/// the loop's own case, under paused time.
+#[tokio::test]
+async fn a_worker_added_over_the_wire_is_decided_with_no_ask_for_a_build() {
+    use smg_policy_controller::proto::{
+        register_worker_request::Mode, worker_event::Event, RegisterWorkerRequest, WireMode,
+        WorkerSpec,
+    };
+    const GATEWAY: &str = "gateway-w";
+    const MODEL: &str = "model-w";
+    let mut controller = Controller::bind(config()).await.expect("bind");
+    for name in ["gateway", "control"] {
+        controller
+            .identity_as_told(name)
+            .expect("a listener of the configuration");
+    }
+    let addresses = controller.addresses();
+    let mut readiness = controller.readiness();
+    let store = controller.store();
+    let mut document = PolicySpec::preset("random").expect("a preset of this build");
+    document.generation = 1;
+    let spec = AppliedSpec::validate(&document).expect("the preset validates");
+    store.apply(spec).expect("above the unbound start");
+
+    let (stop, stopped) = oneshot::channel::<()>();
+    let serve = controller.serve(async {
+        let _ = stopped.await;
+    });
+    let probe = async {
+        assert_eq!(readiness.wait_for(State::Leader).await, Some(State::Leader));
+        let gateway = addresses
+            .of(Scope::Gateway)
+            .expect("every scope is mounted");
+        let control = addresses
+            .of(Scope::Control)
+            .expect("every scope is mounted");
+        let mut client = PolicyControllerClient::connect(format!("http://{gateway}"))
+            .await
+            .expect("the listener accepts");
+        let mut operator = PolicyControllerClient::connect(format!("http://{control}"))
+            .await
+            .expect("the listener accepts");
+        let (frames, sent) = mpsc::channel(4);
+        let mut session = client
+            .session(stating(Some(GATEWAY), ReceiverStream::new(sent)))
+            .await
+            .expect("the stream opens")
+            .into_inner();
+        let hello = Hello {
+            gateway_id: GATEWAY.to_owned(),
+            protocol_min: 1,
+            protocol_max: 1,
+            ..Hello::default()
+        };
+        frames
+            .send(GatewayFrame {
+                seq: 0,
+                term_floor: 0,
+                frame: Some(gateway_frame::Frame::Hello(hello)),
+            })
+            .await
+            .expect("the stream takes the Hello");
+        let answer = timeout(Duration::from_secs(20), session.message())
+            .await
+            .expect("a Welcome within the case's patience")
+            .expect("a frame, not a status")
+            .expect("a frame, not the stream's end");
+        assert!(
+            matches!(answer.frame, Some(controller_frame::Frame::Welcome(_))),
+            "a Welcome answers a Hello: {answer:?}"
+        );
+        let (requests, sent) = mpsc::channel(4);
+        let mut answers = client
+            .decide(stating(Some(GATEWAY), ReceiverStream::new(sent)))
+            .await
+            .expect("a present gateway's stream opens")
+            .into_inner();
+
+        // The add, then its status at the store's door. No call asks for a
+        // build: the served loop pays it.
+        let builds = store.membership_builds();
+        let request = RegisterWorkerRequest {
+            spec: Some(WorkerSpec {
+                url: "http://w.fleet:8000".to_owned(),
+                wire: WireMode::Grpc as i32,
+                role: smg_policy_controller::proto::Role::Single as i32,
+                models: vec![MODEL.to_owned()],
+                ..WorkerSpec::default()
+            }),
+            mode: Mode::Add as i32,
+            wait_ready: false,
+        };
+        let added = operator
+            .register_worker(stating(Some("operator-w"), request))
+            .await
+            .expect("the add is taken")
+            .into_inner();
+        let id = match added.event {
+            Some(Event::Registered(row)) => WorkerId(row.id),
+            other => panic!("a registration's answer: {other:?}"),
+        };
+        let answered = Instant::now();
+        let revision = WorkersStore::get(&*store, id).expect("the row").revision;
+        store.set_status(id, WorkerStatus::Ready, revision);
+
+        // One request at a time, until a pick names the worker.
+        let mut asked = 0u32;
+        loop {
+            asked += 1;
+            requests
+                .send(DecideRequest {
+                    request_id: asked.to_be_bytes().to_vec(),
+                    facts: Some(RequestFacts {
+                        model: MODEL.to_owned(),
+                        seed: u64::from(asked),
+                        budget_micros: 5_000_000,
+                        ..RequestFacts::default()
+                    }),
+                    constraints: None,
+                })
+                .await
+                .expect("the stream takes the request");
+            let picked = loop {
+                let answer = timeout(Duration::from_secs(20), answers.message())
+                    .await
+                    .expect("an answer within the case's patience")
+                    .expect("an answer, not a status")
+                    .expect("an answer, not the stream's end");
+                match answer.answer {
+                    Some(decide_answer::Answer::Credit(_)) => {}
+                    Some(decide_answer::Answer::Decision(Decision {
+                        outcome: Some(decision::Outcome::Pick(pick)),
+                        ..
+                    })) => break pick.targets.first().map(|target| target.id),
+                    _ => break None,
+                }
+            };
+            // The bound holds for the pick too: one that comes late is no
+            // pass.
+            assert!(
+                answered.elapsed() < Config::DEFAULT_LOAD_POLL_INTERVAL / 4,
+                "not decided {:?} after its answer, over {asked} requests",
+                answered.elapsed()
+            );
+            if picked == Some(id.0) {
+                break;
+            }
+        }
+        assert_eq!(store.membership_builds(), builds + 1);
+
+        stop.send(()).expect("the serve is listening for the stop");
+    };
+    let (served, ()) = tokio::join!(serve, probe);
+    served.expect("a clean stop");
+}
+
 /// A drain under a gateway's open decide streams, one that asked and one
 /// that never did. Each ends `UNAVAILABLE` when the listeners stop
 /// accepting, and the serve returns then: a gateway that closes none of its
@@ -819,9 +979,9 @@ async fn a_drain_ends_the_open_decide_streams_and_returns_inside_its_grace_perio
             })
             .await
             .expect("the stream takes the Hello");
-        let welcome = session
-            .message()
+        let welcome = timeout(Duration::from_secs(20), session.message())
             .await
+            .expect("a Welcome within the case's patience")
             .expect("a frame, not a status")
             .expect("a frame, not the stream's end");
         assert!(
@@ -1310,6 +1470,9 @@ async fn rss_idle_and_with_a_thousand_workers_in_the_store() {
                 LoadSource::Stream,
             );
         }
+        // The fleet arrived inside one window: its one build, asked here so
+        // the figure holds the world a decision reads.
+        store.publish_now();
         let (_, rows) = store.snapshot();
         assert_eq!(rows.len(), 1_000);
         let fed = vm_rss_kib();

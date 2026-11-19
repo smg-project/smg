@@ -7,6 +7,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
+    mem,
     ops::{Deref, DerefMut},
     sync::Arc,
     time::{Duration, Instant},
@@ -20,12 +21,14 @@ use crate::{
     lease::{LeaseId, Lifecycle, Membership, Outcome, ReleaseReason, Side, TransportClass},
     spec::AppliedSpec,
     store::{
-        health::{HealthSink, VetoWrite},
+        health::{HealthSink, HealthWrite, VetoWrite},
         index::{indexed_under, KvEvent, KvTables, LaneCounts},
         journal::{Journal, Kinds, Position},
         kv_events::{BatchFacts, BatchOutcome, KvCursor, KvEventSink, ResyncReason},
-        leases::{Counts, Dispatch, LeaseRecord, LeaseRefused, LeaseState, LeasesStore, Slot},
-        loads::{LoadSample, LoadSink, LoadSource, PollMode},
+        leases::{
+            Counts, Dispatch, LeaseRecord, LeaseRefused, LeaseState, LeasesStore, Said, Slot,
+        },
+        loads::{LoadSample, LoadSink, LoadSource, PollMode, Wake},
         reservations::{ReservationKind, ReservationStore},
         sessions::{Pin, SessionsStore},
         workers::{
@@ -33,25 +36,38 @@ use crate::{
             WorkerStatus, WorkersStore,
         },
         world::{
-            micros, same_offer, Ask, Built, Classes, EncodePairBuffers, OutsideLists, PairBuffers,
-            StaleGeneration, ViewBuffers, World, Writer, PUBLISH_WINDOW,
+            left_models, micros, same_offer, Ask, Built, Classes, EncodePairBuffers, OutsideLists,
+            PairBuffers, StaleGeneration, ViewBuffers, World, Writer, PUBLISH_WINDOW,
         },
         GatewayId,
     },
     view::{LoadRow, Role, WorkerId},
 };
 
+mod blocks;
+mod turn;
+
+use blocks::Blocks;
+#[cfg(any(test, feature = "controller"))]
+use blocks::Minted;
+pub use turn::{AtWork, Hand};
+
 /// Membership changes kept for watchers; a watcher further behind snapshots
 /// again (the registry's broadcast is sized the same today).
 const CHANGE_LOG: usize = 1_024;
 
-/// The store's counts one scrape reports, both of one state of the store.
+/// The store's counts one scrape reports: the first two of one state of
+/// the store.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StoreCounts {
     /// The members outside the standing generation's lists.
     pub outside: OutsideLists,
     /// The load writes that moved an overload verdict.
     pub overload_flips: u64,
+    /// The lifecycle calls of a lease that panicked and were held
+    /// ([`MemoryStore::lifecycle_faults`]): a count of its own, read
+    /// beside the two.
+    pub lifecycle_faults: u64,
 }
 
 /// The store. `Default` is empty with term `0`.
@@ -66,12 +82,14 @@ pub struct MemoryStore {
     /// first, as the health writers take it). A load write goes into its
     /// worker's entry or is dropped, under this lock alone: the entry is the
     /// membership test, so a read that lands after a removal re-creates
-    /// nothing and a replaced incarnation starts empty. The world's write
-    /// side sits behind the same lock: a record is on file and folded into
-    /// the working rows in one step, and every world is made and shown
-    /// under it, so the deciders see the worlds in the order they were
-    /// made. It is the last lock a writer takes: the workers lock, then the
-    /// health lock, then this one.
+    /// nothing and a replaced incarnation starts empty. One load write takes
+    /// the workers lock first: a poll's answer for a rank that waits for its
+    /// build, which it pays ([`LoadSink::report`]). The world's write side
+    /// sits behind the same lock: a record is on file and folded into the
+    /// working rows in one step, and every world is made and shown under
+    /// it, so the deciders see the worlds in the order they were made. It
+    /// is the last lock a writer takes: the workers lock, then the health
+    /// lock, then this one.
     loads: Mutex<Loads>,
     /// The KV lanes and the indexes they write, behind locks of their own
     /// ([`KvTables`]): a membership write takes the table's after the
@@ -79,12 +97,21 @@ pub struct MemoryStore {
     /// tables and reads each pool's standing in them.
     kv: Arc<KvTables>,
     reservations: Mutex<Reservations>,
-    sessions: Mutex<FxHashMap<u64, Pin>>,
-    /// The instant the pins' next sweep is due ([`Self::sweep_pins`]);
-    /// `None` before the first.
+    /// The pins of record, in the shards of the engine's own table
+    /// ([`crate::sessions::shard_of`]): a dispatch's write and a lookup
+    /// hold one shard, and a sweep or a worker's removal walks them one
+    /// hold after another.
+    sessions: Vec<Mutex<FxHashMap<u64, Pin>>>,
+    /// When the pins were last swept and how often a pass runs
+    /// ([`Self::sweep_pins`]).
     #[cfg(feature = "controller")]
-    pins_due: Mutex<Option<Instant>>,
-    leases: Mutex<Leases>,
+    pins_swept: Mutex<PinsSwept>,
+    /// The files of leases behind their turns, one a decider ([`turn`]).
+    files: turn::Files,
+    /// The blocks of the leading term's counter, each block's file and the
+    /// tables kept for terms that led ([`blocks`]): how a lease's id names
+    /// its file.
+    blocks: Blocks,
     /// What a decision reads, through one load: swapped whole at each
     /// publication.
     world: ArcSwap<World>,
@@ -97,6 +124,11 @@ pub struct MemoryStore {
     /// The same journal where it carries load rows: where the load writes
     /// are told.
     load_journal: Option<Arc<dyn Journal>>,
+    /// The host's wake, once its loop handed one ([`LoadSink::wake_with`]):
+    /// called where a membership write leaves a build owed and none was,
+    /// the one instant the host's loop cannot have read. A lock of its own,
+    /// the last taken and held for the call alone.
+    wake: Mutex<Option<Wake>>,
 }
 
 /// The store's replicated tables at one place of its history
@@ -130,12 +162,18 @@ impl std::fmt::Debug for MemoryStore {
             let workers = self.workers.lock();
             (workers.rows.len(), workers.epoch)
         };
-        let leases = self.leases.lock().records.len();
-        f.debug_struct("MemoryStore")
-            .field("workers", &workers)
-            .field("epoch", &epoch)
-            .field("leases", &leases)
-            .finish_non_exhaustive()
+        // Each turn is tried, never taken: a line that prints the store
+        // from under a turn (a tell's, a panic's) reads no count there.
+        let leases = self.files.iter().try_fold(0, |leases, file| {
+            Some(leases + file.try_take()?.records.len())
+        });
+        let mut form = f.debug_struct("MemoryStore");
+        form.field("workers", &workers).field("epoch", &epoch);
+        match leases {
+            Some(leases) => form.field("leases", &leases),
+            None => form.field("leases", &format_args!("under the turn")),
+        };
+        form.finish_non_exhaustive()
     }
 }
 
@@ -146,9 +184,11 @@ impl MemoryStore {
 
     /// A store whose folded load records wait at most `window` for their
     /// publication, where [`MemoryStore::new`] takes [`PUBLISH_WINDOW`]:
-    /// for a test of the window itself. A window the clock cannot add to
-    /// an instant never ends: a waiting record is then shown by the next
-    /// status or membership write.
+    /// for a test of the window itself. The build a membership write owes
+    /// waits for the same window. A window the clock cannot add to an
+    /// instant never ends: a waiting record is then shown by the next
+    /// status write or the next build, and a build is paid by the ask
+    /// alone ([`MemoryStore::publish_now`]).
     pub fn with_publish_window(window: Duration) -> Self {
         let now = Instant::now();
         // An hour before the store was made, where the host's clock reaches
@@ -172,14 +212,18 @@ impl MemoryStore {
             }),
             kv,
             reservations: Mutex::default(),
-            sessions: Mutex::default(),
+            sessions: (0..crate::sessions::SHARDS)
+                .map(|_| Mutex::default())
+                .collect(),
             #[cfg(feature = "controller")]
-            pins_due: Mutex::default(),
-            leases: Mutex::new(leases),
+            pins_swept: Mutex::default(),
+            files: turn::Files::one(leases),
+            blocks: Blocks::default(),
             world,
             origin,
             journal: None,
             load_journal: None,
+            wake: Mutex::new(None),
         }
     }
 
@@ -263,10 +307,43 @@ impl MemoryStore {
     /// ([`Membership::Snapshot`]), and the journal's listener once the
     /// restore's locks are let go. `false`, with nothing changed, where the
     /// journal refuses the place ([`Journal::restart`]).
+    ///
+    /// The pools are built from the cut's rows at once, whatever the
+    /// publication window, and no build is left owed: a decision after the
+    /// restore reads its rows.
+    ///
+    /// A replica that restores holds no lease. What stands on file was
+    /// filed while this replica led and is another history's by now: its
+    /// end was told to another leader, and no frame of the stream ends it
+    /// here. Behind the restore's locks each lease leaves its file on the
+    /// count it booked: its end is handed to the file as a removed
+    /// worker's release ([`ReleaseReason::WorkerRemoved`]) and told as a
+    /// frame's is, by the file's decider at work or by the restore where
+    /// that decider rests. The engine of the lease's own generation hears
+    /// it once, where that generation stands. The restore returns when
+    /// every end is handed: a lease of a file whose decider works stands,
+    /// its count booked, until that decider's next take, and a full ring
+    /// holds the restore's thread until then. A gateway's
+    /// `Hello` files what it lists again once this replica leads
+    /// ([`LeasesStore::restore`]).
+    ///
+    /// A take beside the restore stands whole on one side of it. The
+    /// take's write waits for the files' turns ([`LeasesStore::set_term`]),
+    /// which the restore holds from its start until it has read the ids
+    /// on file: the leases it ends are those, and none of a term taken
+    /// behind it. Ahead of the restore, the journal weighs the cut
+    /// against the take. An issue reads its slot before it takes its
+    /// file's turn ([`LeasesStore::issue`]): one that read it ahead of the
+    /// swap and waited here books a slot the restored world does not
+    /// read, until its lease ends.
     pub fn restore_from(&self, cut: Cut) -> bool {
         // Taken before the first lock, so dropped after the last: the journal
         // restarts inside the locks, and its listener is told behind them.
         let _released = self.released();
+        // Every file's turn first, as their order has it, and held until
+        // the ids on file are read: a take's write waits for them, so a
+        // take lands whole ahead of the restore or whole behind it.
+        let mut turns = self.every_turn();
         let mut workers = self.workers.lock();
         let held: Vec<WorkerId>;
         {
@@ -328,8 +405,13 @@ impl MemoryStore {
         // id, as an apply tells a generation's.
         self.tell_members(&workers);
         drop(workers);
-        let mut leases = self.leases.lock();
-        leases.term = leases.term.max(cut.at.term);
+        // Under the turns taken at the start the term rises and the ids on
+        // file are read: each of those leases then leaves its file as a
+        // frame's release does, handed with the turns let go
+        // ([`Self::empty`]). A later generation's stages never saw the
+        // issue and hear nothing of it.
+        self.rise(&mut turns, cut.at.term);
+        self.empty(turns);
         true
     }
 
@@ -340,8 +422,18 @@ impl MemoryStore {
     /// a resize is told as a relabel and recorded as the leader recorded
     /// it, by the widths. Nothing is minted and no revision is guarded: the
     /// leader's log is the order. A row that leaves takes its tables with
-    /// it as the leader's own write does, and a row that stays keeps its
-    /// admission instant.
+    /// it as the leader's own write does, but for the sessions' pins of
+    /// record that name it, which the leader's own write alone drops, and
+    /// a row that stays keeps its admission instant. `at` is the event's
+    /// place in that log, which the applier holds ([`Journal::member`]):
+    /// the journal takes the write there, and no write of the store's own
+    /// does.
+    ///
+    /// The pools follow as at the leader's own write: a join, a refresh and
+    /// a patch leave their build owed, which the replica's loop pays at the
+    /// window's end, and a leave pays its own before it is told: a removal,
+    /// a replaced incarnation, a registration that takes its worker off a
+    /// model.
     ///
     /// The change is applied only where it fits the tables: the epoch is
     /// the next one, a new row's id is free and a registration's key too,
@@ -352,16 +444,28 @@ impl MemoryStore {
     /// caller starts again from a snapshot.
     ///
     /// The world's engine is told the change as at the leader's own write
-    /// ([`MembershipChange::as_lifecycle`]): a standby's stages hold what
-    /// its leader's hold, with no step at a take.
-    pub fn follow(&self, epoch: u64, change: MembershipChange, row: Option<WorkerRow>) {
-        let mut workers = self.writing();
+    /// ([`MembershipChange::as_lifecycle`]), and with it the models a
+    /// registration took its worker off ([`Membership::Left`]): ahead of
+    /// the change where the registration keeps its id, and behind it, for
+    /// the new id, where a new incarnation replaced the row. A standby's
+    /// stages hold what its leader's hold, with no step at a take.
+    pub fn follow(
+        &self,
+        at: Position,
+        epoch: u64,
+        change: MembershipChange,
+        row: Option<WorkerRow>,
+    ) {
+        let mut workers = self.writing_at(Some(at));
         if epoch != workers.epoch + 1 {
             return;
         }
         // A row told again with the offer it had moves no pair class, here
         // as in the leader's own write: the classes are carried.
-        let mut classes = Classes::Derive;
+        let mut carried = false;
+        // The models a registration that stays under its id takes its
+        // worker off, for the stages: here as in the leader's own write.
+        let mut off = Vec::new();
         let (change, left) = match (change, row) {
             (MembershipChange::Registered { id }, Some(row))
                 if row.id == id
@@ -382,11 +486,13 @@ impl MemoryStore {
                     return;
                 };
                 let resized = held.row.facts.dp_size != row.facts.dp_size;
-                if same_offer(&held.row.facts, &row.facts) {
-                    classes = Classes::Carry;
-                }
+                carried = same_offer(&held.row.facts, &row.facts);
                 row.admitted_at = held.row.admitted_at;
-                held.row = row;
+                let old = mem::replace(&mut held.row, row);
+                // A row that carries its offer left no model.
+                if !carried {
+                    off = left_models(old.facts, &held.row.facts);
+                }
                 if resized {
                     (MembershipChange::Resized { id }, None)
                 } else {
@@ -429,23 +535,92 @@ impl MemoryStore {
             _ => return,
         };
         workers.record_over(change, left.as_ref());
+        // The build each write leaves, as the leader's own: a join, a
+        // refresh and a patch owe it, and a leave pays its own before it is
+        // told, a registration that takes its worker off a model among
+        // them. What is owed, the replica's loop pays at the window's end.
+        let now = Instant::now();
         match change {
-            MembershipChange::Registered { id } | MembershipChange::Replaced { new: id, .. } => {
+            MembershipChange::Registered { id } => {
                 // A row's load entry is made after its telling, as a
                 // registration's is.
                 self.loads.lock().ranks.insert(id, Ranks::default());
                 self.index_member(&workers, id);
-                self.rebuild_world(&workers, Classes::Derive, change);
+                let classes = Classes::Written {
+                    left: None,
+                    joined: Some(id),
+                };
+                self.owe(classes, now);
+                self.tell_membership(change);
+            }
+            MembershipChange::Replaced { old, new } => {
+                self.loads.lock().ranks.insert(new, Ranks::default());
+                self.index_member(&workers, new);
+                let classes = Classes::Written {
+                    left: Some(old),
+                    joined: Some(new),
+                };
+                // A replacement that takes its worker off a model says so
+                // for the new id, behind the build it pays and behind its
+                // own word, as at the leader's own write.
+                let models = Self::replaced_models(left, workers.rows.get(&new));
+                self.pay_leave(&workers, classes, now);
+                self.tell_membership(change);
+                self.tell_left(new, &models);
             }
             MembershipChange::Relabelled { id } | MembershipChange::Resized { id } => {
                 self.index_member(&workers, id);
-                self.rebuild_world(&workers, classes, change);
+                let classes = if carried {
+                    Classes::Carry
+                } else {
+                    Classes::Written {
+                        left: Some(id),
+                        joined: Some(id),
+                    }
+                };
+                self.tell_leaving(&workers, classes, change, &off, now);
             }
             MembershipChange::StatusChanged { id, to, .. } => self.show_status(id, to),
-            MembershipChange::Removed { .. } => {
-                self.rebuild_world(&workers, Classes::Derive, change);
+            MembershipChange::Removed { id } => {
+                let classes = Classes::Written {
+                    left: Some(id),
+                    joined: None,
+                };
+                self.pay_leave(&workers, classes, now);
+                self.tell_membership(change);
             }
         }
+    }
+
+    /// One of the leader's load rows, applied as the replication stream
+    /// tells it: [`LoadSink::record`] on a standby, journaled at `at`, the
+    /// event's place, which the applier holds ([`Journal::load`]).
+    pub fn follow_load(
+        &self,
+        at: Position,
+        id: WorkerId,
+        rank: u16,
+        row: LoadRow,
+        received_at: Instant,
+        source: LoadSource,
+    ) {
+        self.record_at(Some(at), id, rank, row, received_at, source);
+    }
+
+    /// The start of a leader's term, applied as the replication stream
+    /// tells it: it writes no row. The journal keeps the event's place,
+    /// `at`, where the applier holds it ([`Journal::term_followed`]), and
+    /// the store's term rises to the term's. The store took nothing: it
+    /// leads no term by it, as it does by a take
+    /// ([`LeasesStore::set_term`]).
+    pub fn follow_term(&self, at: Position) {
+        // Taken before the turns, so dropped after them, as at a take.
+        let _released = self.released();
+        let mut turns = self.every_turn();
+        if let Some(journal) = &self.journal {
+            journal.term_followed(at);
+        }
+        self.rise(&mut turns, at.term);
     }
 
     /// Apply a generation: every world from here on is published under
@@ -486,11 +661,21 @@ impl MemoryStore {
             let ranks = &*ranks;
             let (world, before) = writer.apply(
                 Arc::clone(&spec),
+                workers.epoch,
                 workers.rows.values().map(|row| &row.row),
                 |id, rank| ranks.get(&id)?.samples.get(&rank).copied(),
             )?;
             writer.replaced(self.world.swap(world));
             drop(loads);
+            // The pins' sweep learns a generation's interval here, not at
+            // its first pass: a generation replaced between two ticks of
+            // the sweep still leaves its interval for the pins it ended.
+            // It is saved under the workers lock, so two applies save
+            // theirs in the order of their publications.
+            #[cfg(feature = "controller")]
+            if let Some(every) = spec.engine().pins_shortest_sweep() {
+                self.pins_swept.lock().every = Some(every);
+            }
             self.tell_members(&workers);
             before
         };
@@ -597,34 +782,11 @@ impl MemoryStore {
         micros(self.origin, at)
     }
 
-    /// Derive the pools of the membership as this write left it and publish
-    /// them in one world. Called under the workers lock by every membership
-    /// write; it takes the load lock, as those writes do, so each row
-    /// carries the load record on file and no record is lost across the
-    /// swap. `classes` names the worker whose write moved a member or a
-    /// member's offer: the pair classes are derived for it alone, or carried
-    /// where the write moved none.
-    ///
-    /// The write then tells that world's engine what `change` is to it
-    /// ([`MembershipChange::as_lifecycle`]): the swap first and the call
-    /// after it, with the load lock let go, so a load write waits for no
-    /// stage. The workers lock is still held, so the engine hears the
-    /// writes in their order, and an apply, which takes that lock, moves no
-    /// generation in between: the engine told is the one the world was
-    /// published under. A decision takes neither lock and meets the call at
-    /// a stage's own lock alone. One that built its view before the swap may
-    /// still name a worker the call took out: a stage answers that from its
-    /// own state, as the ring fences a pruned id ([`crate::ring::FENCE`]).
-    fn rebuild_world(&self, workers: &Workers, classes: Classes, change: MembershipChange) {
-        self.swap_world(workers, classes);
-        if let Some(change) = change.as_lifecycle() {
-            self.world.load().spec().engine().on_membership(&change);
-        }
-    }
-
-    /// The swap of [`MemoryStore::rebuild_world`] alone, the load lock let
-    /// go at its return: for a write that tells the engine in other words
-    /// than one change's ([`MemoryStore::restore_from`]).
+    /// Build the pools of the membership as it stands and show them in one
+    /// world, now, whatever the window: nothing is left owed. What a write
+    /// that replaces every row does, which tells the engine in other words
+    /// than one change's ([`MemoryStore::restore_from`]). Called under the
+    /// workers lock; it takes the load lock and lets it go at its return.
     fn swap_world(&self, workers: &Workers, classes: Classes) {
         let mut loads = self.loads.lock();
         let Loads { ranks, writer } = &mut *loads;
@@ -647,7 +809,161 @@ impl MemoryStore {
         let mut members: Vec<WorkerId> = workers.rows.keys().copied().collect();
         members.sort_unstable();
         let told = Membership::Snapshot(&members);
-        self.world.load().spec().engine().on_membership(&told);
+        self.tell_engine(&told);
+    }
+
+    /// Tell the engine of the world the store shows one membership word:
+    /// under the workers lock, with the load lock let go.
+    fn tell_engine(&self, word: &Membership<'_>) {
+        self.world.load().spec().engine().on_membership(word);
+    }
+
+    /// Tell the standing generation's engine what `change` is to it
+    /// ([`MembershipChange::as_lifecycle`]). Called by every membership
+    /// write under the workers lock, after the write left its build owed or
+    /// paid its leave's, and with the load lock let go: the engine hears the
+    /// writes in their order, a load write under the load lock alone waits
+    /// for no stage, and an apply, which takes the workers lock, moves no
+    /// generation in between. A leave is told after the build that takes its
+    /// rows out of their pools: the worker is in no pool when its write
+    /// returns, whoever wrote. A join is told when the store takes it, and
+    /// the world that lists its row follows at its window's build. A
+    /// decision takes neither lock and meets the call at a stage's own lock
+    /// alone. One that built its view before a leave's swap may still name
+    /// the worker: a stage answers that from its own state, as the ring
+    /// fences a pruned id ([`crate::ring::FENCE`]).
+    fn tell_membership(&self, change: MembershipChange) {
+        if let Some(change) = change.as_lifecycle() {
+            self.tell_engine(&change);
+        }
+    }
+
+    /// [`MemoryStore::tell_membership`] for a registration that stays under
+    /// its id, with `left`, the models it takes its worker off
+    /// ([`left_models`]). Where it takes the worker off none, the build is
+    /// owed to the window as a join's is. Where it does, the write is a
+    /// leave from those models' pools and pays its own build first, as a
+    /// removal does ([`MemoryStore::pay_leave`]): the worker is in none of
+    /// them when the engine hears [`Membership::Left`], said ahead of the
+    /// write's own word.
+    fn tell_leaving(
+        &self,
+        workers: &Workers,
+        classes: Classes,
+        change: MembershipChange,
+        left: &[String],
+        now: Instant,
+    ) {
+        if left.is_empty() {
+            self.owe(classes, now);
+        } else {
+            self.pay_leave(workers, classes, now);
+            let id = change.id();
+            self.tell_engine(&Membership::Left { id, models: left });
+        }
+        self.tell_membership(change);
+    }
+
+    /// Tell the engine the models a replaced incarnation left, for the id
+    /// that replaced it, and no word where it left none. Said behind the
+    /// build the replacement pays and behind its own word: a stage has
+    /// retired the old id and carried its places to the new one by then.
+    fn tell_left(&self, id: WorkerId, models: &[String]) {
+        if !models.is_empty() {
+            self.tell_engine(&Membership::Left { id, models });
+        }
+    }
+
+    /// The models a replaced incarnation stood in a pool of and its
+    /// successor does not ([`left_models`]), from the row a replacement
+    /// took out and the row it put in: none where either is not there.
+    fn replaced_models(old: Option<WorkerRow>, new: Option<&Row>) -> Vec<String> {
+        match (old, new) {
+            (Some(old), Some(new)) => left_models(old.facts, &new.row.facts),
+            _ => Vec::new(),
+        }
+    }
+
+    /// A membership write left the pools to be built again. Called under
+    /// the workers lock by every membership write, with what the write asks
+    /// of the pair classes. The build is owed until the store's window ends
+    /// and takes in every write since the last: a storm of registrations
+    /// builds once a window, never once a write. A lease or a poll's answer
+    /// that needs a worker's row asks for the build sooner
+    /// ([`Self::publish_now`]): registrations each followed by one inside
+    /// their window build once a registration.
+    fn owe(&self, classes: Classes, at: Instant) {
+        let first = self.loads.lock().writer.owe(classes, at);
+        self.wake_host(first);
+    }
+
+    /// Have the host read the due instant again where a write left the
+    /// `first` build owed: its loop sleeps to an instant it read before.
+    /// Called with the load lock released, so the host's read does not wait
+    /// for this writer.
+    fn wake_host(&self, first: bool) {
+        if first {
+            if let Some(wake) = &*self.wake.lock() {
+                wake();
+            }
+        }
+    }
+
+    /// Pay the build the membership writes left owed: the pools of the
+    /// membership as it stands, each row with its load record on file, in
+    /// one world. Called under the workers lock; it takes the load lock, as
+    /// a membership write does, so no record is lost across the swap. The
+    /// host's call names its instant, and a build is paid when it is due at
+    /// it; where none is, what waits for the window is published by the
+    /// window's own rule. The ask names no instant and is paid at once.
+    fn pay(&self, workers: &Workers, at: Option<Instant>) {
+        let mut loads = self.loads.lock();
+        let Loads { ranks, writer } = &mut *loads;
+        let ranks = &*ranks;
+        let world = match at {
+            Some(now) if !writer.build_due(now) => writer.publish_if_due(now),
+            _ => writer.build_owed(
+                at,
+                workers.epoch,
+                workers.rows.values().map(|row| &row.row),
+                |id, rank| ranks.get(&id)?.samples.get(&rank).copied(),
+            ),
+        };
+        self.show(writer, world);
+    }
+
+    /// A leave pays its own build. A removal, a replaced incarnation and a
+    /// registration that takes its worker off a model owe the build as
+    /// every membership write does and pay it in the same write, as the ask
+    /// pays it, with every write the window held. Called under the workers
+    /// lock, before the leave is told: the worker is in no pool it left
+    /// when its write returns, under every profile and stage and whoever
+    /// wrote, a served call or a followed change. A storm of removals so
+    /// builds once a removal. The window stands as it was, and the host is
+    /// not woken: nothing is left owed.
+    fn pay_leave(&self, workers: &Workers, classes: Classes, at: Instant) {
+        self.loads.lock().writer.owe(classes, at);
+        self.pay(workers, None);
+    }
+
+    /// Build what the membership writes left owed, now, whatever the
+    /// window. Where nothing is owed, nothing is done.
+    ///
+    /// The build of a registration, a refresh and a patch starts within one
+    /// publication window of their answer, when the store's host pays the
+    /// due instant ([`LoadSink::publish_due`]), and they are in force for
+    /// decisions when it ends; a registration that takes its worker off a
+    /// model has paid its own. A caller that needs its own write in force
+    /// at once asks here: a test, a bench's fill, a host with no loop. The
+    /// store asks for itself where a write is of a worker's row: a lease on
+    /// the worker, a poll's answer for a rank of it. The ask builds the
+    /// whole membership under the workers lock and the load lock: a
+    /// writer's wait. No decision asks; a host that files its decision's
+    /// lease through the issue door takes the wait where the pick left the
+    /// standing world before the lease was filed.
+    pub fn publish_now(&self) {
+        let workers = self.workers.lock();
+        self.pay(&workers, None);
     }
 
     /// Show the deciders the world a write made, when it made one. Called
@@ -694,19 +1010,20 @@ impl MemoryStore {
         health.vetoes.len() + completions.sum::<usize>()
     }
 
-    /// The counts one scrape reports, read under one hold of the load lock:
-    /// the two are of one state of the store.
+    /// The counts one scrape reports. The load table's two are read under
+    /// one hold of the load lock, so they are of one state of the store.
     pub fn counts(&self) -> StoreCounts {
         let loads = self.loads.lock();
         StoreCounts {
             outside: loads.writer.outside(),
             overload_flips: loads.writer.flips(),
+            lifecycle_faults: self.lifecycle_faults(),
         }
     }
 
     /// How many writes to the load table moved an overload verdict: a
     /// record, a report, the word that no report came, an eviction. A
-    /// membership write and an applied generation judge again and count
+    /// membership build and an applied generation judge again and count
     /// nothing.
     pub fn overload_flips(&self) -> u64 {
         self.counts().overload_flips
@@ -726,6 +1043,19 @@ impl MemoryStore {
         self.loads.lock().ranks.len()
     }
 
+    /// How many ranks stand unnamed by their engine's last answer.
+    #[cfg(test)]
+    pub(super) fn unnamed_ranks(&self) -> usize {
+        self.loads.lock().writer.unnamed_ranks()
+    }
+
+    /// Whether a load write is judged: an engine has a threshold, or a rank
+    /// stands unnamed.
+    #[cfg(test)]
+    pub(super) fn judges_writes(&self) -> bool {
+        self.loads.lock().writer.judges_writes()
+    }
+
     /// How many rows that left their pool the writer still keeps.
     #[cfg(test)]
     pub(super) fn held_rows(&self) -> usize {
@@ -740,11 +1070,12 @@ impl MemoryStore {
     }
 
     /// Whether no lock a journaled write takes is held at this instant:
-    /// the membership lock, the lease lock and the load lock, each tried.
+    /// the membership lock, the turn of the leases' file and the load lock,
+    /// each tried.
     #[cfg(test)]
     pub(crate) fn unlocked(&self) -> bool {
         self.workers.try_lock().is_some()
-            && self.leases.try_lock().is_some()
+            && self.files.iter().all(turn::File::free)
             && self.loads.try_lock().is_some()
     }
 
@@ -786,8 +1117,15 @@ impl MemoryStore {
     /// it, here and nowhere else: the health tables, the load rows and the
     /// worker's KV lane with its blocks in the index. The vetoes a world
     /// carries are not among them: they leave with the row in the
-    /// publication of the membership write that calls this. Called under
-    /// the workers lock:
+    /// publication of the membership write that calls this. Nor are the
+    /// sessions' pins of record that name the worker: the leader's own
+    /// removal or replacement drops them once it let its lock go
+    /// ([`Self::forget_pins`]), and a row that leaves by a followed change
+    /// or a restore keeps them. A standby is sent no pin, so those are of
+    /// a term this store led itself: no decision takes one while its
+    /// worker is gone, and a worker that returns under the same key and
+    /// incarnation is pinned by them again. Called under the workers
+    /// lock:
     /// the health writers take it first and a load write goes into its
     /// worker's entry or nowhere, so a write racing the removal finds the
     /// row gone or lands before the tables are cleared.
@@ -799,14 +1137,28 @@ impl MemoryStore {
         loads.ranks.remove(&id);
     }
 
+    /// The sessions' pins of record that name a worker whose row is gone
+    /// leave here, once the membership write let the workers lock go: the
+    /// walk is as long as the pins of record, and no writer of the
+    /// membership or of a worker's health waits on it. A pin a dispatch
+    /// writes past the walk names a row that is gone and is taken by no
+    /// decision; where its rule has a TTL, the pins' sweep ends it. A
+    /// worker's id is its key and incarnation: where the same incarnation
+    /// registers again before the walk ends, a pin a dispatch writes for
+    /// it in a shard the walk has not reached leaves though its row
+    /// stands, until the key's next dispatch writes it again.
+    fn forget_pins(&self, id: WorkerId) {
+        SessionsStore::drop_worker(self, id);
+    }
+
     /// How many times a publication allocated a pool's rows since the store
     /// was made. A publication writes a pool's rows over rows no world
     /// lists any more: the ones the pool published before its last, else
     /// any of its length that left a pool. It allocates when it finds
-    /// none: at a pool's first publication after a membership write,
-    /// unless rows that write retired fit it, and past that only while a
+    /// none: at a pool's first publication after a membership build,
+    /// unless rows that build retired fit it, and past that only while a
     /// reader holds a world from before the pool's last publication. A
-    /// membership write's own rows are not counted.
+    /// membership build's own rows are not counted.
     pub fn publication_allocations(&self) -> u64 {
         self.loads.lock().writer.allocations()
     }
@@ -816,6 +1168,14 @@ impl MemoryStore {
     /// leave in one.
     pub fn publications(&self) -> u64 {
         self.loads.lock().writer.publications()
+    }
+
+    /// How many times the pools were built from the membership since the
+    /// store was made. A storm of membership writes builds once a window,
+    /// never once a write, and once more where a lease or a poll's answer
+    /// asks for the build: the count says so by run.
+    pub fn membership_builds(&self) -> u64 {
+        self.loads.lock().writer.builds()
     }
 
     /// Give the row of `id` its KV lane as its facts ask
@@ -892,6 +1252,17 @@ impl Workers {
             .get_mut(&id)
             .filter(|row| row.row.revision == revision)
     }
+
+    /// What a health write says where [`Self::guarded`] gave no row: stale
+    /// where a row stands under another revision, gone where none stands.
+    /// Either way the write was judged against nothing.
+    fn unjudged(&self, id: WorkerId) -> HealthWrite {
+        if self.rows.contains_key(&id) {
+            HealthWrite::Stale
+        } else {
+            HealthWrite::Gone
+        }
+    }
 }
 
 /// Tells the journal, at its drop, that a write's locks are let go
@@ -913,6 +1284,9 @@ impl Drop for Released<'_> {
 /// no writer and no reader of the rows.
 struct Writing<'a> {
     workers: MutexGuard<'a, Workers>,
+    /// The place of the leader's event the write applies, for the journal:
+    /// none for a write of the store's own.
+    at: Option<Position>,
     _released: Released<'a>,
 }
 
@@ -953,7 +1327,7 @@ impl Writing<'_> {
         workers.log.push_back((workers.epoch, change));
         if let Some(journal) = &workers.journal {
             let row = workers.rows.get(&change.id()).map(|row| &row.row);
-            journal.member(workers.epoch, change, row, left);
+            journal.member(self.at, workers.epoch, change, row, left);
         }
         change
     }
@@ -986,9 +1360,16 @@ impl MemoryStore {
     /// The membership lock for a write the journal is told: every path
     /// that records a change takes the lock here.
     fn writing(&self) -> Writing<'_> {
+        self.writing_at(None)
+    }
+
+    /// [`MemoryStore::writing`] for a write the journal is told with `at`:
+    /// the place of the leader's event a standby's applier applies by it.
+    fn writing_at(&self, at: Option<Position>) -> Writing<'_> {
         let released = self.released();
         Writing {
             workers: self.workers.lock(),
+            at,
             _released: released,
         }
     }
@@ -997,9 +1378,15 @@ impl MemoryStore {
 impl WorkersStore for MemoryStore {
     fn upsert(&self, mut facts: WorkerFacts) -> MembershipChange {
         // A blank value of a descriptor or of an encode offer is no report:
-        // the row of record holds what the two rules read.
-        if let Some(descriptor) = facts.pairing.as_deref_mut() {
-            descriptor.normalize();
+        // the row of record holds what the two rules read. A descriptor that
+        // stands so is kept where it is, shared or not: a row written again
+        // copies none.
+        if let Some(descriptor) = facts
+            .pairing
+            .as_mut()
+            .filter(|descriptor| !descriptor.is_normalized())
+        {
+            Arc::make_mut(descriptor).normalize();
         }
         facts.encode = facts.encode.normalized();
         let mut workers = self.writing();
@@ -1015,16 +1402,22 @@ impl WorkersStore for MemoryStore {
                 };
                 let resized = row.row.facts.dp_size != facts.dp_size;
                 // A registration refreshed with the offer it had moves no
-                // pair class.
-                let classes = if same_offer(&row.row.facts, &facts) {
-                    Classes::Carry
+                // pair class and takes its worker off no model: the role and
+                // the models are the offer's. Another names the models it
+                // took the worker off, for the stages to hear ahead of the
+                // write's own word. The facts it replaces end here either
+                // way, ahead of the write's world.
+                let (classes, left) = if same_offer(&row.row.facts, &facts) {
+                    row.row.facts = facts;
+                    (Classes::Carry, Vec::new())
                 } else {
-                    Classes::Written {
+                    let old = mem::replace(&mut row.row.facts, facts);
+                    let classes = Classes::Written {
                         left: Some(old_id),
                         joined: Some(old_id),
-                    }
+                    };
+                    (classes, left_models(old, &row.row.facts))
                 };
-                row.row.facts = facts;
                 row.row.revision += 1;
                 let change = workers.record(if resized {
                     MembershipChange::Resized { id: old_id }
@@ -1032,7 +1425,7 @@ impl WorkersStore for MemoryStore {
                     MembershipChange::Relabelled { id: old_id }
                 });
                 self.index_member(&workers, old_id);
-                self.rebuild_world(&workers, classes, change);
+                self.tell_leaving(&workers, classes, change, &left, now);
                 return change;
             }
             // A new incarnation under the key: the old id leaves with its
@@ -1088,7 +1481,16 @@ impl WorkersStore for MemoryStore {
                 left: Some(old_id),
                 joined: Some(new_id),
             };
-            self.rebuild_world(&workers, classes, change);
+            // The models the new incarnation no longer stands in a pool of:
+            // the stages hear them for the new id, behind the build the
+            // replacement pays and behind its own word, which retires the
+            // old id and carries its places first.
+            let left = Self::replaced_models(old.map(|old| old.row), workers.rows.get(&new_id));
+            self.pay_leave(&workers, classes, now);
+            self.tell_membership(change);
+            self.tell_left(new_id, &left);
+            drop(workers);
+            self.forget_pins(old_id);
             return change;
         }
         let id = identity(&facts.key, facts.incarnation);
@@ -1111,13 +1513,18 @@ impl WorkersStore for MemoryStore {
         let change = workers.record(MembershipChange::Registered { id });
         // The row's load entry, created with it: what a member's load
         // writes go into.
-        self.loads.lock().ranks.insert(id, Ranks::default());
-        self.index_member(&workers, id);
-        let classes = Classes::Written {
-            left: None,
-            joined: Some(id),
+        let first = {
+            let mut loads = self.loads.lock();
+            loads.ranks.insert(id, Ranks::default());
+            let classes = Classes::Written {
+                left: None,
+                joined: Some(id),
+            };
+            loads.writer.owe(classes, now)
         };
-        self.rebuild_world(&workers, classes, change);
+        self.wake_host(first);
+        self.index_member(&workers, id);
+        self.tell_membership(change);
         change
     }
 
@@ -1143,7 +1550,8 @@ impl WorkersStore for MemoryStore {
         row.row.revision += 1;
         let change = workers.record(MembershipChange::Relabelled { id });
         // Labels, a priority and an overload are no part of an offer.
-        self.rebuild_world(&workers, Classes::Carry, change);
+        self.owe(Classes::Carry, Instant::now());
+        self.tell_membership(change);
         Some(change)
     }
 
@@ -1164,7 +1572,10 @@ impl WorkersStore for MemoryStore {
             left: Some(id),
             joined: None,
         };
-        self.rebuild_world(&workers, classes, change);
+        self.pay_leave(&workers, classes, Instant::now());
+        self.tell_membership(change);
+        drop(workers);
+        self.forget_pins(id);
         Some(change)
     }
 
@@ -1312,32 +1723,37 @@ fn next_status(row: &mut Row, ok: bool) -> Option<WorkerStatus> {
 }
 
 impl HealthSink for MemoryStore {
-    fn probe_outcome(
-        &self,
-        id: WorkerId,
-        ok: bool,
-        revision: u64,
-    ) -> Option<(WorkerStatus, WorkerStatus)> {
+    fn probe_outcome(&self, id: WorkerId, ok: bool, revision: u64) -> HealthWrite {
         let mut workers = self.writing();
-        let row = workers.guarded(id, revision)?;
+        let Some(row) = workers.guarded(id, revision) else {
+            return workers.unjudged(id);
+        };
         let from = row.row.status;
-        let to = next_status(row, ok)?;
-        workers.set_status(id, to)?;
+        let Some(to) = next_status(row, ok) else {
+            return HealthWrite::Stood(from);
+        };
+        if workers.set_status(id, to).is_none() {
+            return HealthWrite::Stood(from);
+        }
         self.show_status(id, to);
-        Some((from, to))
+        HealthWrite::Moved(from, to)
     }
 
-    fn connected(&self, id: WorkerId, revision: u64) -> Option<(WorkerStatus, WorkerStatus)> {
+    fn connected(&self, id: WorkerId, revision: u64) -> HealthWrite {
         let mut workers = self.writing();
-        let row = workers.guarded(id, revision)?;
+        let Some(row) = workers.guarded(id, revision) else {
+            return workers.unjudged(id);
+        };
         let from = row.row.status;
         if matches!(from, WorkerStatus::Draining | WorkerStatus::Ready) {
-            return None;
+            return HealthWrite::Stood(from);
         }
         row.probes = Probes::default();
-        workers.set_status(id, WorkerStatus::Ready)?;
+        if workers.set_status(id, WorkerStatus::Ready).is_none() {
+            return HealthWrite::Stood(from);
+        }
         self.show_status(id, WorkerStatus::Ready);
-        Some((from, WorkerStatus::Ready))
+        HealthWrite::Moved(from, WorkerStatus::Ready)
     }
 
     fn gateway_veto(&self, gateway: GatewayId, id: WorkerId, until: Option<Instant>) {
@@ -1468,15 +1884,62 @@ impl Ranks {
     }
 }
 
+/// What a poll's answer brought of one engine, the least first.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Brought {
+    /// No row for a rank of it.
+    Nothing,
+    /// A row for a rank that pushed since the poll began: the row is passed
+    /// over, and the engine is named.
+    Named,
+    /// A row that was written.
+    Heard,
+}
+
+/// Note what an answer brought of `engine`: the most it brought stands.
+/// Inlined: the pass over an answer's rows runs it a row.
+#[inline]
+fn note(
+    first: &mut Option<(u32, Brought)>,
+    others: &mut Vec<(u32, Brought)>,
+    engine: u32,
+    brought: Brought,
+) {
+    match first {
+        None => *first = Some((engine, brought)),
+        Some(seen) if seen.0 == engine => seen.1 = seen.1.max(brought),
+        Some(_) => match others.iter_mut().find(|seen| seen.0 == engine) {
+            Some(seen) => seen.1 = seen.1.max(brought),
+            None => others.push((engine, brought)),
+        },
+    }
+}
+
 /// The load table and the world's write side, behind one lock.
 struct Loads {
     ranks: FxHashMap<WorkerId, Ranks>,
     writer: Writer,
 }
 
-impl LoadSink for MemoryStore {
-    fn record(
+impl Loads {
+    /// Whether a rank `answer` names waits for a build ([`Writer::waits`]):
+    /// a member's rank with no row for the answer's words to be written
+    /// on. A worker with no entry here is no member and waits for none.
+    fn waits(&mut self, answer: &[(WorkerId, u16, Option<LoadRow>)]) -> bool {
+        let Self { ranks, writer } = self;
+        answer
+            .iter()
+            .any(|&(id, rank, _)| writer.waits(id, rank) && ranks.contains_key(&id))
+    }
+}
+
+impl MemoryStore {
+    /// [`LoadSink::record`], told to the journal with `at`: the place of
+    /// the leader's event the row applies, none for a row of the store's
+    /// own.
+    fn record_at(
         &self,
+        at: Option<Position>,
         id: WorkerId,
         rank: u16,
         row: LoadRow,
@@ -1505,13 +1968,26 @@ impl LoadSink for MemoryStore {
         }
         ranks.samples.insert(rank, sample);
         if let Some(journal) = &self.load_journal {
-            journal.load(id, rank, &sample);
+            journal.load(at, id, rank, &sample);
         }
         if let Some(place) = writer.fold_load(id, rank, Some(&sample)) {
-            writer.recorded(place, received_at);
+            writer.recorded(place, id, rank, received_at);
             let world = writer.folded_at(received_at);
             self.show(writer, world);
         }
+    }
+}
+
+impl LoadSink for MemoryStore {
+    fn record(
+        &self,
+        id: WorkerId,
+        rank: u16,
+        row: LoadRow,
+        received_at: Instant,
+        source: LoadSource,
+    ) {
+        self.record_at(None, id, rank, row, received_at, source);
     }
 
     fn report(
@@ -1519,19 +1995,39 @@ impl LoadSink for MemoryStore {
         answer: &[(WorkerId, u16, Option<LoadRow>)],
         polled_at: Instant,
         source: LoadSource,
-    ) {
+    ) -> Vec<usize> {
         let mut loads = self.loads.lock();
+        // A rank the answer names may have no row yet, inside the window of
+        // its registration or of a refresh that moved it. Written now, its
+        // row would be heard for no engine, the word that no report came
+        // would be said of none, and a rank left out beside it would take
+        // no mark. The build the window owes is paid first, as an ask pays
+        // it, with the load lock let go for it: one build an answer at the
+        // most, none where every rank the answer names has its row, and
+        // none for a record, whose rank the build reads by what it
+        // reported. The workers lock stays held to the answer's own write:
+        // no membership write stands between the build and the answer.
+        let _membership = loads.waits(answer).then(|| {
+            MutexGuard::unlocked(&mut loads, || {
+                let workers = self.workers.lock();
+                self.pay(&workers, None);
+                workers
+            })
+        });
         let Loads {
             ranks: table,
             writer,
         } = &mut *loads;
         // The answer is one engine's: its rows are written whole before
-        // the one judgment and the one publication, so its ranks are read
+        // its judgment and the one publication, so its ranks are read
         // as one answer left them. A caller's mix of engines judges each,
         // and each engine is heard by its own ranks' rows.
-        let mut first: Option<(u32, bool)> = None;
-        let mut others: Vec<(u32, bool)> = Vec::new();
-        for &(id, rank, row) in answer {
+        let mut first: Option<(u32, Brought)> = None;
+        let mut others: Vec<(u32, Brought)> = Vec::new();
+        let mut omits = false;
+        // The door's answer: the positions of the rows it passes over.
+        let mut passed: Vec<usize> = Vec::new();
+        for (position, &(id, rank, row)) in answer.iter().enumerate() {
             // A report that lands after its worker left (the poll was out
             // when the row went) finds no entry and is dropped.
             let Some(ranks) = table.get_mut(&id) else {
@@ -1539,10 +2035,15 @@ impl LoadSink for MemoryStore {
             };
             // A rank that pushed since the poll began keeps its record,
             // and its stream is heard: no word of the poll stands over it.
+            // A row the answer brings for it is passed over. It names its
+            // engine all the same, which is read below where it matters.
             if ranks.pushed_since(rank, polled_at) {
+                if row.is_some() {
+                    passed.push(position);
+                }
                 continue;
             }
-            let (engine, heard) = match row {
+            let (engine, brought) = match row {
                 Some(row) => {
                     let age = Duration::from_millis(u64::from(row.report_age_ms));
                     let sample = LoadSample {
@@ -1553,7 +2054,7 @@ impl LoadSink for MemoryStore {
                     };
                     ranks.samples.insert(rank, sample);
                     if let Some(journal) = &self.load_journal {
-                        journal.load(id, rank, &sample);
+                        journal.load(None, id, rank, &sample);
                     }
                     let place = writer.fold_load(id, rank, Some(&sample));
                     let engine = place.and_then(|place| {
@@ -1561,50 +2062,112 @@ impl LoadSink for MemoryStore {
                         writer.hear(place, polled_at);
                         Some(engine)
                     });
-                    (engine, true)
+                    (engine, Brought::Heard)
                 }
                 // A rank the answer omits keeps what is on file.
-                None => (writer.engine_of(id), false),
+                None => {
+                    omits = true;
+                    (writer.engine_of(id), Brought::Nothing)
+                }
             };
-            let Some(engine) = engine else {
-                continue;
-            };
-            match &mut first {
-                None => first = Some((engine, heard)),
-                Some(seen) if seen.0 == engine => seen.1 |= heard,
-                Some(_) => match others.iter_mut().find(|seen| seen.0 == engine) {
-                    Some(seen) => seen.1 |= heard,
-                    None => others.push((engine, heard)),
-                },
+            if let Some(engine) = engine {
+                note(&mut first, &mut others, engine, brought);
+            }
+        }
+        // A row passed over names its engine as a written row does: the
+        // naming is the answer's, whichever sample stands. It moves a mark
+        // only beside a rank the answer left out, so the passed-over rows
+        // are read for their engines there and nowhere else.
+        if omits && !passed.is_empty() {
+            for &(id, rank, row) in answer {
+                let pushed = table
+                    .get(&id)
+                    .is_some_and(|ranks| ranks.pushed_since(rank, polled_at));
+                if !pushed || row.is_none() {
+                    continue;
+                }
+                if let Some(engine) = writer.engine_of(id) {
+                    note(&mut first, &mut others, engine, Brought::Named);
+                }
             }
         }
         let Some(first) = first else {
-            return;
+            return passed;
         };
+        // A rank an answer leaves unnamed beside a rank it names is marked,
+        // and a rank an answer names is named again: read once the
+        // answer's engines are known and before any is judged. An answer
+        // with no row for an engine is the word that none came, which
+        // moves no mark, and a rank that pushed since the poll began
+        // named itself.
+        let marked = writer.any_unnamed();
+        if omits || marked {
+            for &(id, rank, row) in answer {
+                let pushed = table
+                    .get(&id)
+                    .is_none_or(|ranks| ranks.pushed_since(rank, polled_at));
+                if pushed {
+                    continue;
+                }
+                let Some(engine) = writer.engine_of(id) else {
+                    continue;
+                };
+                let named = if first.0 == engine {
+                    first.1 != Brought::Nothing
+                } else {
+                    others
+                        .iter()
+                        .any(|seen| seen.0 == engine && seen.1 != Brought::Nothing)
+                };
+                if named {
+                    writer.name(id, rank, row.is_none());
+                }
+            }
+        }
         let mut changed = false;
-        for (engine, heard) in std::iter::once(first).chain(others) {
-            changed |= if heard {
+        for (engine, brought) in std::iter::once(first).chain(others) {
+            changed |= match brought {
                 // A row was written: the engine is judged once, and the
                 // write is shown whether or not a verdict moved.
-                writer.judged(engine, true);
-                true
-            } else {
+                Brought::Heard => {
+                    writer.judged(engine, true);
+                    true
+                }
+                // No row was written, and the answer named a rank that
+                // pushed since the poll began beside a rank it left out:
+                // no word that none came. The mark the answer moved is
+                // judged and shown with it.
+                Brought::Named => writer.judged(engine, false),
                 // No row came for the engine: the word that none came,
-                // unless a rank of it pushed since the poll began, whether
-                // the answer names that rank or not. The word is shown
-                // where it moves a verdict.
-                let pushed = writer.ranks_of(engine).any(|(id, rank)| {
-                    table
-                        .get(&id)
-                        .is_some_and(|ranks| ranks.pushed_since(rank, polled_at))
-                });
-                !pushed && writer.silence(engine)
+                // unless a rank of it pushed since the poll began. The
+                // word is shown where it moves a verdict. A rank the answer
+                // does not name may stand inside the window of its
+                // registration, or of a refresh that moved it, with no row
+                // at its rank here: the build reads what it reported
+                // against the word and the instant this poll began.
+                Brought::Nothing => {
+                    let pushed = writer.ranks_of(engine).any(|(id, rank)| {
+                        table
+                            .get(&id)
+                            .is_some_and(|ranks| ranks.pushed_since(rank, polled_at))
+                    });
+                    !pushed && writer.silence(engine, polled_at)
+                }
             };
+        }
+        // The last mark went with this answer: every engine is judged once
+        // more, behind the answer's own judgments, which read each of its
+        // engines as the whole answer left it. A verdict that moves with
+        // the mark's end is counted once, with whatever else of its engine
+        // the answer moved.
+        if marked && !writer.any_unnamed() {
+            writer.judge_every_behind_a_door();
         }
         if changed {
             let world = writer.folded_at(polled_at);
             self.show(writer, world);
         }
+        passed
     }
 
     fn heard_every(&self, period: Duration) -> bool {
@@ -1673,9 +2236,22 @@ impl LoadSink for MemoryStore {
                 folded = writer.fold_load(id, rank, None).or(folded);
             }
             *ranks = Ranks::default();
-            if let Some(place) = folded {
-                if let Some(engine) = writer.engine_at(place) {
+            // The member's marks go with its rows: a rank with nothing on
+            // file is a rank again, and its engine is judged for it.
+            let forgot = writer.forget(id);
+            let engine = match folded {
+                Some(place) => writer.engine_at(place),
+                None if forgot => writer.engine_of(id),
+                None => None,
+            };
+            if folded.is_some() || forgot {
+                if let Some(engine) = engine {
                     writer.judged(engine, false);
+                }
+                // The last mark went with the member: every engine is
+                // judged once more, behind the eviction's own judgment.
+                if forgot && !writer.any_unnamed() {
+                    writer.judge_every_behind_a_door();
                 }
                 let world = writer.folded();
                 self.show(writer, world);
@@ -1688,9 +2264,23 @@ impl LoadSink for MemoryStore {
     }
 
     fn publish(&self, now: Instant) {
-        let mut loads = self.loads.lock();
-        let world = loads.writer.publish_if_due(now);
-        self.show(&mut loads.writer, world);
+        {
+            let mut loads = self.loads.lock();
+            if !loads.writer.build_due(now) {
+                let world = loads.writer.publish_if_due(now);
+                self.show(&mut loads.writer, world);
+                return;
+            }
+        }
+        // A build is owed and due. The workers lock comes first, as every
+        // membership write takes it, and the build is asked again under
+        // both: another call may have paid it meanwhile.
+        let workers = self.workers.lock();
+        self.pay(&workers, Some(now));
+    }
+
+    fn wake_with(&self, wake: Wake) {
+        *self.wake.lock() = Some(wake);
     }
 }
 
@@ -1821,80 +2411,135 @@ impl ReservationStore for MemoryStore {
 
 // --------------------------------------------------------------- sessions
 
+impl MemoryStore {
+    /// The shard that holds `key`'s pin of record.
+    fn pins_of(&self, key: u64) -> &Mutex<FxHashMap<u64, Pin>> {
+        &self.sessions[crate::sessions::shard_of(key)]
+    }
+}
+
 impl SessionsStore for MemoryStore {
-    fn pin(&self, key: u64, worker: WorkerId, at: Instant) {
+    fn pin(&self, key: u64, worker: WorkerId, at: Instant, ends: Option<u64>) {
         if key == 0 {
             return;
         }
-        self.sessions.lock().insert(
+        self.pins_of(key).lock().insert(
             key,
             Pin {
                 worker,
                 last_used: at,
+                ends,
             },
         );
     }
 
+    fn pin_no_earlier(&self, key: u64, worker: WorkerId, at: Instant, ends: Option<u64>) {
+        if key == 0 {
+            return;
+        }
+        let pin = Pin {
+            worker,
+            last_used: at,
+            ends,
+        };
+        let mut pins = self.pins_of(key).lock();
+        let stood = pins.entry(key).or_insert(pin);
+        // The later end stays, and no end is later than any instant.
+        let later = stood.ends.zip(ends).map(|(stood, asked)| stood.max(asked));
+        *stood = Pin { ends: later, ..pin };
+    }
+
     fn lookup(&self, key: u64) -> Option<Pin> {
-        self.sessions.lock().get(&key).copied()
+        self.pins_of(key).lock().get(&key).copied()
     }
 
     fn unpin(&self, key: u64) {
-        self.sessions.lock().remove(&key);
+        self.pins_of(key).lock().remove(&key);
     }
 
     fn drop_worker(&self, worker: WorkerId) -> usize {
-        let mut sessions = self.sessions.lock();
-        let before = sessions.len();
-        sessions.retain(|_, pin| pin.worker != worker);
-        before - sessions.len()
+        self.sessions
+            .iter()
+            .map(|shard| {
+                let mut pins = shard.lock();
+                let before = pins.len();
+                pins.retain(|_, pin| pin.worker != worker);
+                before - pins.len()
+            })
+            .sum()
     }
 
-    fn expire(&self, before: Instant) -> usize {
-        let mut sessions = self.sessions.lock();
-        let count = sessions.len();
-        sessions.retain(|_, pin| pin.last_used >= before);
-        count - sessions.len()
+    fn expire(&self, now: u64) -> usize {
+        self.sessions
+            .iter()
+            .map(|shard| {
+                let mut pins = shard.lock();
+                let count = pins.len();
+                pins.retain(|_, pin| pin.ends.is_none_or(|ends| ends > now));
+                count - pins.len()
+            })
+            .sum()
     }
 
     fn merge(&self, key: u64, pin: Pin) {
         if key == 0 {
             return;
         }
-        let mut sessions = self.sessions.lock();
-        let entry = sessions.entry(key).or_insert(pin);
+        let mut pins = self.pins_of(key).lock();
+        let entry = pins.entry(key).or_insert(pin);
         if pin.last_used > entry.last_used {
             *entry = pin;
         }
     }
 
     fn len(&self) -> usize {
-        self.sessions.lock().len()
+        self.sessions.iter().map(|shard| shard.lock().len()).sum()
     }
+}
+
+/// When the pins were last swept, and at what interval.
+#[cfg(feature = "controller")]
+#[derive(Default)]
+struct PinsSwept {
+    /// The instant of the last pass; `None` before the first.
+    last: Option<Instant>,
+    /// The interval of the last generation one of whose rules swept, in
+    /// microseconds, learned at its apply; `None` before one was applied.
+    every: Option<u64>,
 }
 
 #[cfg(feature = "controller")]
 impl MemoryStore {
-    /// One pass of the pins' sweep at `now`, where one is due: the pins of
-    /// record last used longer ago than the longest TTL among the standing
-    /// generation's sessions rules leave the table. A pass is due once an
-    /// interval of the rule that sweeps most often, so a clock that ticks
-    /// faster walks nothing between two passes. Where a rule keeps its
-    /// keys with no TTL no pass runs. Returns how many pins left.
+    /// One pass of the pins' sweep at `now`, where one is due: each pin of
+    /// record past its own end leaves the table, whatever the other rules
+    /// keep. A pass is due once the interval of the standing rule that
+    /// sweeps most often has passed since the last one, so a clock that
+    /// ticks faster walks nothing between two passes. The interval is the
+    /// standing generation's at each tick: the pins outlive generations,
+    /// and an apply that shortens it waits out no earlier one. Where no
+    /// standing rule sweeps, the interval of the last generation one of
+    /// whose rules swept stands, as its apply left it, so the pins it
+    /// ended still leave; before any such generation no pass runs. Returns
+    /// how many pins left.
     pub(crate) fn sweep_pins(&self, now: Instant) -> usize {
-        let horizon = self.with_world(|world| world.spec().engine().pins_horizon());
-        let Some((ttl, every)) = horizon else {
-            return 0;
-        };
+        let standing = self.with_world(|world| world.spec().engine().pins_shortest_sweep());
         {
-            let mut due = self.pins_due.lock();
-            if due.is_some_and(|due| now < due) {
+            let mut swept = self.pins_swept.lock();
+            let Some(every) = standing.or(swept.every) else {
+                return 0;
+            };
+            let interval = Duration::from_micros(every);
+            if swept
+                .last
+                .is_some_and(|last| now.saturating_duration_since(last) < interval)
+            {
                 return 0;
             }
-            *due = Some(now + Duration::from_micros(every));
+            swept.last = Some(now);
         }
-        now.checked_sub(Duration::from_micros(ttl))
-            .map_or(0, |before| SessionsStore::expire(self, before))
+        // The pins' ends stand on the decision clock: the pass's instant
+        // is turned into it once.
+        SessionsStore::expire(self, self.micros(now))
     }
 }
 
@@ -1908,10 +2553,10 @@ struct Leases {
     records: FxHashMap<Key, Held>,
     /// The store's counts, a cell a worker: what the leases on file book.
     counts: Arc<Counts>,
-    /// The term of the id last minted and its counter within that term
-    /// ([`MemoryStore::issue_decided`]).
+    /// The block of the term's counter the file mints from, as far as it
+    /// minted into it ([`MemoryStore::issue_decided`]).
     #[cfg(any(test, feature = "controller"))]
-    minted: (u64, u32),
+    minted: Minted,
     /// Every lease filed as issued, by its dispatch deadline, the earliest
     /// first. A lease that left the file or was dispatched keeps its place
     /// until the issues that follow step over it, so no door searches the
@@ -1937,29 +2582,30 @@ const DUE_STEPS: usize = 4;
 struct Held {
     record: LeaseRecord,
     /// `None` for a lease whose worker stood in no pool when it was
-    /// written: it books no row a decision reads.
+    /// written, the build its registration owed paid first
+    /// ([`MemoryStore::slot_ahead`]): it books no row a decision reads.
+    /// A first dispatch that moves the lease to another worker reads the
+    /// standing world and asks for no build: a worker inside its
+    /// registration window is not booked, then or later.
     booked: Option<Slot>,
 }
 
 impl Leases {
     /// The next id under the store's term: the term in bits 32 to 62 over a
     /// counter that starts at 1 in each term, as the contract bounds a
-    /// controller's ids. `None` for a term past 31 bits and for a term
-    /// whose counter is spent: an id is never 0, never carries the bit of
-    /// a gateway's own ids and never repeats.
+    /// controller's ids. The counter comes from the block `file` holds of
+    /// `blocks`, or from the next one it claims ([`Minted::mint`]). `None`
+    /// for a term past 31 bits and for a term whose counter is spent: an
+    /// id is never 0, never carries the bit of a gateway's own ids and
+    /// never repeats.
     #[cfg(any(test, feature = "controller"))]
-    fn mint(&mut self) -> Option<LeaseId> {
+    fn mint(&mut self, blocks: &Blocks, file: u8) -> Option<LeaseId> {
         let term = self.term;
         if term >= 1 << 31 {
             return None;
         }
-        if self.minted.0 != term {
-            // The store's term only rises, so a term is minted under once.
-            self.minted = (term, 0);
-        }
-        let next = self.minted.1.checked_add(1)?;
-        self.minted.1 = next;
-        Some(LeaseId(term << 32 | u64::from(next)))
+        let counter = self.minted.mint(blocks, term, file)?;
+        Some(LeaseId(term << 32 | u64::from(counter)))
     }
 
     /// Files `record` under `key`: a record on file under that key gives
@@ -1998,6 +2644,57 @@ impl Leases {
             self.counts.free(booked);
         }
         Some(held.record)
+    }
+
+    /// A dispatch of the lease under `key` at `at`; `false` where it is
+    /// not on file. A first dispatch that names another target of the pick
+    /// moves the lease to it: the record's target and index, and the count
+    /// it books, where the standing `world` lists that target.
+    fn dispatched(
+        &mut self,
+        world: &ArcSwap<World>,
+        key: &Key,
+        dispatch: Dispatch,
+        at: Instant,
+    ) -> bool {
+        let Some(held) = self.records.get_mut(key) else {
+            return false;
+        };
+        if held.record.state != LeaseState::Issued {
+            return true;
+        }
+        held.record.state = LeaseState::Dispatched { at };
+        // A dispatch on another target of the pick: the record names that
+        // target's index from here on. Where the target is another worker
+        // the lease books it and the count of the first one is free, the
+        // new count added before the first is taken; another rank of the
+        // lease's own worker moves no count.
+        let Some((target, _)) = held.record.target_at(dispatch.target_index) else {
+            return true;
+        };
+        if target != held.record.target {
+            let first = held.booked;
+            held.booked = world.load().booked_of(target);
+            self.counts.moved(first, held.booked);
+            held.record.target = target;
+        }
+        held.record.lease.target_index = dispatch.target_index;
+        true
+    }
+
+    /// A side of the lease under `key` completed; `false` where it is not
+    /// on file.
+    fn completed(&mut self, key: &Key, outcome: &Outcome) -> bool {
+        let Some(held) = self.records.get(key) else {
+            return false;
+        };
+        // A pair's room lives until its decode side ends: the prefill side's
+        // completion leaves the record standing.
+        if held.record.decode.is_some() && outcome.side == Side::Prefill {
+            return true;
+        }
+        self.end(key);
+        true
     }
 
     /// Queues `deadline` in its order. The deadlines come in rising order
@@ -2051,14 +2748,22 @@ impl MemoryStore {
     /// start here.
     #[cfg(test)]
     pub(crate) fn spend_ids(&self, left: u32) {
-        let mut leases = self.leases.lock();
-        leases.minted = (leases.term, u32::MAX - left);
+        let mut leases = self.turn_of(0);
+        leases.minted = self.blocks.spend(leases.term, left, 0);
+    }
+
+    /// The terms whose tables the blocks keep, the newest first: no door
+    /// tells them.
+    #[cfg(test)]
+    pub(crate) fn kept_terms(&self) -> Vec<u64> {
+        self.blocks.kept_terms()
     }
 
     /// The places of the deadline queue: no door tells its length.
     #[cfg(test)]
     pub(crate) fn queued(&self) -> usize {
-        self.leases.lock().due.len()
+        let files = 0..self.files.len();
+        files.map(|at| self.turn_of(at).due.len()).sum()
     }
 
     /// Issues the lease of one decision made under `record.term`, the
@@ -2073,10 +2778,13 @@ impl MemoryStore {
     /// under it: the term is not the store's own any more, is past the
     /// width an id carries, or its counter is spent.
     ///
-    /// The same call ends the leases at the head of the deadline queue
-    /// that no gateway named a dispatch for by `record.issued_at`,
-    /// [`ABANDONED`] of them at most, and hands them back released as
-    /// abandoned, for their engine to be told outside the lock. So a lease
+    /// Everything handed to the file is applied first ([`turn`]), and
+    /// `issued` is told the lease as filed under the same hold of the turn
+    /// as its write: a lease is told issued before any holder can end it.
+    /// The same call ends the leases at the head of the deadline queue that no
+    /// gateway named a dispatch for by `record.issued_at`, [`ABANDONED`]
+    /// of them at most, released as abandoned, and tells their engine
+    /// under the turn, as a frame's end is told. So a lease
     /// past its deadline stands no longer than the next issues take, and no
     /// call passes over the file: an issue adds one place to the queue and
     /// steps over [`DUE_STEPS`] at most.
@@ -2085,10 +2793,18 @@ impl MemoryStore {
         &self,
         mut record: LeaseRecord,
         booked: Option<Slot>,
-    ) -> Result<(crate::Lease, [Option<LeaseRecord>; ABANDONED]), LeaseRefused> {
+        issued: impl FnOnce(&crate::Lease),
+    ) -> Result<crate::Lease, LeaseRefused> {
         use std::collections::hash_map::Entry;
 
-        let mut leases = self.leases.lock();
+        // The file of the decider that issues, under its turn: what is
+        // handed is applied, and the due leases ended and told, where the
+        // caller may act at that file.
+        let at = self.acting();
+        let file = u8::try_from(at).unwrap_or(u8::MAX);
+        let mut leases = self.files[at].take();
+        let mut told = turn::Told::default();
+        let acts = self.applied(at, &mut leases, &mut told);
         let (lease, store) = (record.term, leases.term);
         if lease > store {
             return Err(LeaseRefused::TermAhead { lease, store });
@@ -2098,7 +2814,7 @@ impl MemoryStore {
             return Err(unminted);
         }
         let key = loop {
-            record.lease.id = leases.mint().ok_or(unminted)?;
+            record.lease.id = leases.mint(&self.blocks, file).ok_or(unminted)?;
             let key = (record.gateway, record.lease.id);
             // An id on file already is a restored lease's: the next one.
             if let Entry::Vacant(place) = leases.records.entry(key) {
@@ -2107,45 +2823,181 @@ impl MemoryStore {
             }
         };
         leases.laid(key, &record, booked);
+        // The file's write and its tell under one hold of the turn: the
+        // lease is told issued before any holder can end it.
+        issued(&record.lease);
         // A second lease is looked for where a first one was ended: a
         // call that ends none stopped at a lease that waits, at an empty
         // queue or at its last step, and so would the next.
         let (now, mut steps) = (record.issued_at, DUE_STEPS);
-        let first = leases.end_due(now, &mut steps);
-        let second = first.and_then(|_| leases.end_due(now, &mut steps));
-        Ok((record.lease, [first, second]))
+        for _ in 0..if acts { ABANDONED } else { 0 } {
+            let Some(ended) = leases.end_due(now, &mut steps) else {
+                break;
+            };
+            let said = Said::Released(None, ReleaseReason::Abandoned);
+            self.tell(at, told.world(self), &ended, said);
+        }
+        Ok(record.lease)
+    }
+}
+
+impl MemoryStore {
+    /// The store with a file of leases a decider, for a host that decides
+    /// on `deciders` threads and names them
+    /// ([`crate::decider::Decider`]): each decider issues into its own
+    /// file under its own turn, and a lease's events are told under the
+    /// name of the decider whose file it is on. The files start empty,
+    /// under the store's term, and keep the word to the engine and the
+    /// fault count the store had.
+    ///
+    /// # Panics
+    ///
+    /// Where a lease is on file: its file would go with it, and the count
+    /// it books would stand for good.
+    #[must_use]
+    pub fn with_deciders(mut self, deciders: usize) -> Self {
+        // Every file is read, each under its own turn: a lease on any of
+        // them would go with its file.
+        let mut files = self.files.iter();
+        let empty = files.all(|file| file.take().records.is_empty());
+        assert!(empty, "a store's files are laid before a lease is filed");
+        let (term, counts) = {
+            let leases = self.files[0].take();
+            (leases.term, Arc::clone(&leases.counts))
+        };
+        let files = turn::Files::of(deciders, &self.files, || Leases {
+            term,
+            counts: Arc::clone(&counts),
+            ..Leases::default()
+        });
+        self.files = files;
+        self
+    }
+
+    /// How many files of leases the store holds: one a decider.
+    #[must_use]
+    pub fn deciders(&self) -> usize {
+        self.files.len()
+    }
+
+    /// Raises the files' term to `term` where it is above theirs, and
+    /// calls `rose` under their turns, every one held
+    /// ([`Self::every_turn`]). Each file reads the term under its own
+    /// turn.
+    fn raise(&self, term: u64, rose: impl FnOnce()) {
+        if term <= self.files[0].take().term {
+            return;
+        }
+        let mut turns = self.every_turn();
+        if self.rise(&mut turns, term) {
+            rose();
+        }
+    }
+
+    /// Every file's turn, taken in the files' order with nothing applied.
+    /// A term's rise holds them, the start of a term the store follows
+    /// ([`Self::follow_term`]) and a standby's restore
+    /// ([`Self::restore_from`]): no other path holds two turns.
+    fn every_turn(&self) -> Vec<turn::Turn<'_>> {
+        self.files.iter().map(turn::File::take).collect()
+    }
+
+    /// Writes `term` on every file where it is above theirs, under their
+    /// turns, and says whether it rose.
+    fn rise(&self, turns: &mut [turn::Turn<'_>], term: u64) -> bool {
+        if !turns.first().is_some_and(|leases| term > leases.term) {
+            return false;
+        }
+        for leases in &mut *turns {
+            leases.term = term;
+        }
+        // The blocks start again under the new term, and the table the
+        // rise leaves is kept while a lease of its term is on some file.
+        let on_file = turns.iter().flat_map(|leases| leases.records.keys());
+        self.blocks.rise(term, on_file.map(|&(_, lease)| lease));
+        true
+    }
+
+    /// Takes every lease off its file: what a restore leaves of the
+    /// leases this replica filed. `turns` are the files', every one held
+    /// by the restore since its start, and nothing is told under them:
+    /// the ids on file are read and each file's deadline queue is
+    /// cleared, since every end is a removed worker's release and never a
+    /// deadline's. The turns are let go there, and each lease's end is
+    /// handed to its file with no turn held ([`Self::hand`]), in the
+    /// files' order: applied and told as a frame's is, by the file's
+    /// decider at work or by this caller where none is. A lease filed
+    /// behind the turns is none of those read, and stays.
+    fn empty(&self, mut turns: Vec<turn::Turn<'_>>) {
+        let removed = Said::Released(None, ReleaseReason::WorkerRemoved);
+        let mut on_file: Vec<Key> = Vec::new();
+        for leases in &mut turns {
+            leases.due.clear();
+            on_file.extend(leases.records.keys().copied());
+        }
+        drop(turns);
+        for (gateway, lease) in on_file {
+            self.hand(&Hand::new(gateway), lease, removed);
+        }
+    }
+}
+
+impl MemoryStore {
+    /// The slot of `target`'s count, for a lease written outside a
+    /// decision. The standing world lists a member from its first build
+    /// on, so a target it does not list may be a member whose build is
+    /// owed to the window: the build is asked for, and the world it leaves
+    /// is read. A lease on a worker that is no member asks too, and the
+    /// ask does nothing where no build is owed. Called with no lock of the
+    /// store held: the ask takes the workers lock and the load lock.
+    fn slot_ahead(&self, target: WorkerId) -> Option<Slot> {
+        if let Some(slot) = self.world.load().booked_of(target) {
+            return Some(slot);
+        }
+        self.publish_now();
+        self.world.load().booked_of(target)
     }
 }
 
 impl LeasesStore for MemoryStore {
     fn term(&self) -> u64 {
-        self.leases.lock().term
+        self.files[0].take().term
     }
 
     fn set_term(&self, term: u64) {
-        // Taken before the lock, so dropped after it: a rise is told to the
-        // journal under the lease lock, and released once that is let go.
+        // Taken before the turn, so dropped after it: a rise is told to the
+        // journal under the turn, and released once that is let go.
         let _released = self.released();
-        let mut leases = self.leases.lock();
-        if term > leases.term {
-            leases.term = term;
+        self.raise(term, || {
             if let Some(journal) = &self.journal {
                 journal.term_rose(term);
             }
-        }
+        });
     }
 
     fn issue(&self, record: LeaseRecord) -> Result<(), LeaseRefused> {
-        // The slot of the record's target's count, where the standing world
-        // lists it: read before the leases' lock, which nests with no other.
-        let world = self.world.load();
-        let booked = world.booked_of(record.target);
-        let mut leases = self.leases.lock();
+        // The slot of the record's target's count: read before the turn is
+        // taken.
+        let booked = self.slot_ahead(record.target);
+        // The file the id names, read again under that file's turn: a rise
+        // of the term holds every turn, so the name stands while this one
+        // is held.
+        let id = record.lease.id;
+        let mut leases = loop {
+            let at = self.file_of(id);
+            let leases = self.turn_of(at);
+            if self.file_of(id) == at {
+                break leases;
+            }
+        };
         if record.term > leases.term {
             return Err(LeaseRefused::TermAhead {
                 lease: record.term,
                 store: leases.term,
             });
+        }
+        if !self.blocks.settled(id, self.files.len()) {
+            return Err(LeaseRefused::Unclaimed);
         }
         let key = (record.gateway, record.lease.id);
         if leases.records.contains_key(&key) {
@@ -2162,49 +3014,13 @@ impl LeasesStore for MemoryStore {
         dispatch: Dispatch,
         at: Instant,
     ) -> bool {
-        // The standing world, for the count of a target the dispatch moves
-        // the lease to: read before the leases' lock, which nests with no
-        // other.
-        let world = self.world.load();
-        let mut leases = self.leases.lock();
-        // The records and the counts are two fields of one hold.
-        let leases = &mut *leases;
-        let Some(held) = leases.records.get_mut(&(gateway, lease)) else {
-            return false;
-        };
-        if held.record.state != LeaseState::Issued {
-            return true;
-        }
-        held.record.state = LeaseState::Dispatched { at };
-        // A dispatch on another target of the pick: the lease books that
-        // worker from here on, and the count of the first one is free.
-        let named = held.record.target_at(dispatch.target_index);
-        if let Some((target, _)) = named.filter(|(target, _)| *target != held.record.target) {
-            if let Some(booked) = held.booked {
-                leases.counts.free(booked);
-            }
-            held.booked = world.booked_of(target);
-            if let Some(booked) = held.booked {
-                leases.counts.book(booked);
-            }
-            held.record.target = target;
-            held.record.lease.target_index = dispatch.target_index;
-        }
-        true
+        self.turn_of(self.file_of(lease))
+            .dispatched(&self.world, &(gateway, lease), dispatch, at)
     }
 
     fn completed(&self, gateway: GatewayId, lease: LeaseId, outcome: &Outcome) -> bool {
-        let mut leases = self.leases.lock();
-        let Some(held) = leases.records.get(&(gateway, lease)) else {
-            return false;
-        };
-        // A pair's room lives until its decode side ends: the prefill side's
-        // completion leaves the record standing.
-        if held.record.decode.is_some() && outcome.side == Side::Prefill {
-            return true;
-        }
-        leases.end(&(gateway, lease));
-        true
+        self.turn_of(self.file_of(lease))
+            .completed(&(gateway, lease), outcome)
     }
 
     fn released(
@@ -2216,45 +3032,76 @@ impl LeasesStore for MemoryStore {
     ) -> bool {
         // No side is read yet: a release of one side of a pair ends the
         // whole lease. The step that issues a pair's lease reads it.
-        self.leases.lock().end(&(gateway, lease)).is_some()
+        self.turn_of(self.file_of(lease))
+            .end(&(gateway, lease))
+            .is_some()
     }
 
     fn get(&self, gateway: GatewayId, lease: LeaseId) -> Option<LeaseRecord> {
-        let leases = self.leases.lock();
+        let leases = self.turn_of(self.file_of(lease));
         leases
             .records
             .get(&(gateway, lease))
             .map(|held| held.record)
     }
 
+    /// Each file's turn in the files' order, one at a time, where the
+    /// caller may act at the file: a decider at work ends its own file's
+    /// due leases at its issues. Each end is told under the turn, as a
+    /// frame's end is told.
     fn expire(&self, now: Instant) -> Vec<LeaseRecord> {
-        let mut leases = self.leases.lock();
-        let (mut ended, mut steps) = (Vec::new(), usize::MAX);
-        while let Some(record) = leases.end_due(now, &mut steps) {
-            ended.push(record);
+        let mut ended = Vec::new();
+        for at in 0..self.files.len() {
+            // A file whose decider works is passed with no wait for its
+            // turn; the same is read again under the turn.
+            if !self.may_act(at) {
+                continue;
+            }
+            let mut leases = self.files[at].take();
+            let mut told = turn::Told::default();
+            if !self.applied(at, &mut leases, &mut told) {
+                continue;
+            }
+            let mut steps = usize::MAX;
+            while let Some(record) = leases.end_due(now, &mut steps) {
+                let said = Said::Released(None, ReleaseReason::Abandoned);
+                self.tell(at, told.world(self), &record, said);
+                ended.push(record);
+            }
         }
         ended
     }
 
     fn restore(&self, gateway: GatewayId, records: &[LeaseRecord]) -> usize {
+        // A page may list a lease on a member whose first build is owed.
+        // The build is asked for before the standing world is read, so
+        // each lease the pages list books its worker's count.
+        self.publish_now();
         let world = self.world.load();
-        let mut leases = self.leases.lock();
-        let term = leases.term;
-        for key in leases.of(gateway) {
-            leases.end(&key);
-        }
-        for record in records {
-            if record.gateway != gateway || record.term > term {
-                continue;
+        // Each file's turn in the files' order, one at a time: the
+        // gateway's leases there go, and the records its ids name are
+        // filed. A record whose id names no file for good is filed in
+        // none ([`LeaseRefused::Unclaimed`]).
+        let files = self.files.len();
+        let mut held = 0;
+        for at in 0..self.files.len() {
+            let mut leases = self.turn_of(at);
+            let term = leases.term;
+            for key in leases.of(gateway) {
+                leases.end(&key);
             }
-            let booked = world.booked_of(record.target);
-            leases.file((gateway, record.lease.id), *record, booked);
+            for record in records {
+                let id = record.lease.id;
+                let here = self.file_of(id) == at && self.blocks.settled(id, files);
+                if record.gateway != gateway || record.term > term || !here {
+                    continue;
+                }
+                let booked = world.booked_of(record.target);
+                leases.file((gateway, record.lease.id), *record, booked);
+            }
+            held += leases.of(gateway).len();
         }
-        leases
-            .records
-            .keys()
-            .filter(|(owner, _)| *owner == gateway)
-            .count()
+        held
     }
 
     fn drop_gateways(&self, gone: &[GatewayId]) -> Vec<usize> {
@@ -2267,8 +3114,9 @@ impl LeasesStore for MemoryStore {
         let mut sorted = gone.to_vec();
         sorted.sort_unstable();
         let mut released = vec![0_usize; sorted.len()];
-        {
-            let mut leases = self.leases.lock();
+        // Each file's turn in the files' order, one at a time.
+        for file in 0..self.files.len() {
+            let mut leases = self.turn_of(file);
             // One pass names the leases of every gateway that goes. Each
             // then leaves by the file's one end, which gives back the count
             // it books.
@@ -2282,7 +3130,7 @@ impl LeasesStore for MemoryStore {
                 leases.end(key);
             }
         }
-        // The leases lock nests with no other, so it is let go first. The
+        // The turn is taken first or not at all, so it is let go here. The
         // gateways' vetoes and completed dispatches leave under the health
         // lock and the published vetoes under the load lock inside it: the
         // order a veto's own write takes.
@@ -2295,17 +3143,21 @@ impl LeasesStore for MemoryStore {
     }
 
     fn live(&self, gateway: GatewayId) -> usize {
-        self.leases
-            .lock()
-            .records
-            .iter()
-            .filter(|((owner, _), held)| {
-                *owner == gateway
-                    && matches!(
-                        held.record.state,
-                        LeaseState::Issued | LeaseState::Dispatched { .. }
-                    )
+        let live = |held: &Held| {
+            matches!(
+                held.record.state,
+                LeaseState::Issued | LeaseState::Dispatched { .. }
+            )
+        };
+        let files = 0..self.files.len();
+        files
+            .map(|at| {
+                let leases = self.turn_of(at);
+                let records = leases.records.iter();
+                records
+                    .filter(|((owner, _), held)| *owner == gateway && live(held))
+                    .count()
             })
-            .count()
+            .sum()
     }
 }

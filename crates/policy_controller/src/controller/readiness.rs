@@ -12,6 +12,8 @@
 //! The role is never told: it is read from the fence at the instant of the
 //! question, so a leader whose renewals stalled reads as a follower from the
 //! moment its fence closes, whether or not its election thread has noticed.
+//! A waiter is woken at that moment too: it sleeps to the instant the
+//! fence's window ends, and to the one a take's window opens.
 
 use std::{
     sync::Arc,
@@ -97,8 +99,8 @@ pub struct Readiness {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Sample {
     pub(crate) state: State,
-    /// The age of the last frame applied from the leader; `None` while
-    /// this replica leads and before any frame.
+    /// The age of the last frame that left this replica at its leader's
+    /// head; `None` while this replica leads and before any such frame.
     pub(crate) lag: Option<Duration>,
     /// Whether this replica does not lead and is synced with its leader.
     pub(crate) synced: bool,
@@ -129,13 +131,15 @@ impl Readiness {
         self.sample_at(Instant::now()).0
     }
 
-    /// The state now and the instant a follower's sync lapses with no
-    /// further frame, by one read of the clock and of the lag. A waiter
-    /// that read the state synced sleeps to that instant
-    /// ([`Readiness::moved_by`]), so no lapse falls between two reads.
+    /// The state now and the instant the clock alone next turns it, by one
+    /// read of the clock, of the lag and of the fence: where a follower's
+    /// sync lapses with no further frame, and where the fence's window
+    /// opens or ends with no further write of the election. A waiter
+    /// sleeps to that instant ([`Readiness::moved_by`]), so no such turn
+    /// falls between two reads.
     pub(crate) fn read(&self) -> (State, Option<Instant>) {
-        let (sample, lapse) = self.sample_at(Instant::now());
-        (sample.state, lapse)
+        let (sample, turn) = self.sample_at(Instant::now());
+        (sample.state, turn)
     }
 
     fn sample_at(&self, now: Instant) -> (Sample, Option<Instant>) {
@@ -153,6 +157,12 @@ impl Readiness {
             Phase::Serving if self.lag.follows() && !synced => State::Syncing,
             Phase::Serving => State::Follower,
         };
+        // The clock alone turns the state at the sync's lapse and at the
+        // fence's next turn: the earlier of the two.
+        let turn = match (lapse, self.fence.turns_at(now)) {
+            (Some(lapse), Some(fence)) => Some(lapse.min(fence)),
+            (lapse, fence) => lapse.or(fence),
+        };
         let restores = self.lag.asks();
         let sample = Sample {
             state,
@@ -160,40 +170,36 @@ impl Readiness {
             synced,
             restores,
         };
-        (sample, lapse)
+        (sample, turn)
     }
 
     /// Resolves with `wanted` once the state is `wanted`, at once when it
     /// already is; `None` when the controller is gone before that. The
     /// state is read again at every move of the run loop, after every
-    /// election step, when a frame turns a standby's sync and when that
-    /// sync lapses; a fence that closes between two steps, or opens there
-    /// one renew deadline after a take, is seen at the next: a waiter for
-    /// the leader's state learns it up to a renew period late.
+    /// election step, when a frame turns a standby's sync, when that sync
+    /// lapses, and where the fence's window opens or ends: a fence that
+    /// closes between two steps, or opens there one renew deadline after a
+    /// take, is seen at that instant.
     pub async fn wait_for(&mut self, wanted: State) -> Option<State> {
         loop {
-            let (state, lapse) = self.read();
+            let (state, turn) = self.read();
             if state == wanted {
                 return Some(wanted);
             }
-            self.moved_by(lapse).await?;
+            self.moved_by(turn).await?;
         }
     }
 
     /// Resolves at the next move of the run loop or step of the election,
-    /// and when a frame turns a standby's sync: a follower of the role
-    /// reads the state again then. `None` when the controller is gone.
-    pub(crate) async fn moved(&mut self) -> Option<()> {
-        self.moved_by(None).await
-    }
-
-    /// [`Readiness::moved`], and at `lapse`, the instant its caller read
-    /// with the state ([`Readiness::read`]). One already past resolves at
-    /// once, so a sync that lapsed since that read is read again.
-    pub(crate) async fn moved_by(&mut self, lapse: Option<Instant>) -> Option<()> {
+    /// when a frame turns a standby's sync, and at `turn`, the instant
+    /// its caller read with the state ([`Readiness::read`]): a follower of
+    /// the role reads the state again then. An instant already past
+    /// resolves at once, so a state the clock turned since that read is
+    /// read again. `None` when the controller is gone.
+    pub(crate) async fn moved_by(&mut self, turn: Option<Instant>) -> Option<()> {
         tokio::select! {
             Ok(()) = self.turns.changed() => Some(()),
-            () = lapsed(lapse) => Some(()),
+            () = reached(turn) => Some(()),
             moved = self.phase.changed() => moved.ok(),
             stepped = self.steps.changed() => {
                 if stepped.is_err() {
@@ -206,11 +212,11 @@ impl Readiness {
     }
 }
 
-/// Resolves at `lapse`, at once where it is past; never where there is
+/// Resolves at `turn`, at once where it is past; never where there is
 /// none.
-async fn lapsed(lapse: Option<Instant>) {
-    match lapse {
-        Some(lapse) => tokio::time::sleep_until(lapse.into()).await,
+async fn reached(turn: Option<Instant>) {
+    match turn {
+        Some(turn) => tokio::time::sleep_until(turn.into()).await,
         None => std::future::pending().await,
     }
 }
@@ -415,6 +421,30 @@ pub(crate) mod tests {
         assert_eq!(within(&mut reader, State::Leader).await, None);
     }
 
+    /// The clock alone turns a leader's state where its fence's window
+    /// ends: a waiter is woken there, though the election took no step, no
+    /// frame came and the run loop did not move.
+    #[tokio::test]
+    async fn a_waiter_is_woken_where_the_fences_window_ends_with_no_step() {
+        let (mut elector, phase, _steps, mut reader) = fenced();
+        phase.send_replace(Phase::Serving);
+        reader.lag.follow();
+        // A take dated so that its window ends a tenth of a second from
+        // now: a renewal that stalls from here closes the fence then.
+        let now = Instant::now();
+        let ends = now + Duration::from_millis(100);
+        let taken = ends
+            .checked_sub(ElectionSettings::default().renew_deadline)
+            .expect("an instant a renew deadline back");
+        elector.lead_at(taken);
+        let (sample, turn) = reader.sample_at(now);
+        assert_eq!((sample.state, turn), (State::Leader, Some(ends)));
+        assert_eq!(
+            within(&mut reader, State::Syncing).await,
+            Some(State::Syncing)
+        );
+    }
+
     #[test]
     fn a_follower_that_runs_a_standby_is_ready_only_while_it_is_synced() {
         let (mut elector, phase, _steps, readiness) = fenced();
@@ -463,14 +493,26 @@ pub(crate) mod tests {
 
         // The fence says leader whatever the lag says, and a leader
         // follows nobody: it has no lag and is not synced.
+        let taken = Instant::now();
         assert_eq!(
-            elector.tick(Instant::now()).expect("the take"),
+            elector.tick(taken).expect("the take"),
             Tick::Acquired { term: 1 }
         );
-        assert_eq!(read(Instant::now()), sample(State::Leader, None, false));
+        assert_eq!(read(taken), sample(State::Leader, None, false));
 
-        let lapse = readiness.sample_at(Instant::now()).1;
-        assert_eq!(lapse, None, "a leader has no sync to lapse");
+        // A leader has no sync to lapse: the clock turns its state where
+        // its fence's window ends, one renew deadline past the take.
+        let ends = taken + ElectionSettings::default().renew_deadline;
+        assert_eq!(readiness.sample_at(taken).1, Some(ends));
+        assert_eq!(read(ends), sample(State::Leader, None, false));
+        // Past it the fence is closed, and the sync's lapse alone is ahead:
+        // the last frame is dated after this instant.
+        let past = ends + Duration::from_nanos(1);
+        assert_eq!(
+            read(past),
+            sample(State::Follower, Some(Duration::ZERO), true)
+        );
+        assert_eq!(readiness.sample_at(past).1, Some(frame + BOUND + BOUND));
 
         // Draining says so whatever the lag says.
         phase.send_replace(Phase::Draining);

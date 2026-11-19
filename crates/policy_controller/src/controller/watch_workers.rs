@@ -1195,9 +1195,9 @@ pub(crate) mod tests {
             let text = String::from_utf8(lines.0.lock().clone()).expect("the lines as text");
             text.matches("has no wire form").count()
         };
-        journal.member(2, MembershipChange::Removed { id }, None, None);
+        journal.member(None, 2, MembershipChange::Removed { id }, None, None);
         let replaced = MembershipChange::Replaced { old: id, new: id };
-        journal.member(3, replaced, Some(&row), None);
+        journal.member(None, 3, replaced, Some(&row), None);
         journal.released();
         let unwired = leader.head();
         leader.register(1, 1, "model-a");
@@ -1218,7 +1218,7 @@ pub(crate) mod tests {
         leader.store.set_term(3);
         let mut later = leader.watch(Start::Snapshot, &[]);
         next(&mut later).await;
-        journal.member(4, MembershipChange::Removed { id }, None, None);
+        journal.member(None, 4, MembershipChange::Removed { id }, None, None);
         journal.released();
         let again = leader.head();
         assert!(again.seq < unwired.seq && again.term == 3, "{again:?}");
@@ -1261,7 +1261,7 @@ pub(crate) mod tests {
     fn a_runs_log_starts_at_a_place_drawn_below_the_bound_and_apart_from_another_runs() {
         let starts: Vec<u64> = (0..64)
             .map(|_| {
-                journaled(&LeasePlace::Process)
+                journaled(&LeasePlace::Process, 1)
                     .1
                     .log
                     .head(Kinds::Watched)
@@ -2137,7 +2137,7 @@ pub(crate) mod tests {
     #[test]
     fn the_draw_is_made_wherever_the_lease_lives() {
         for place in [LeasePlace::Process, LeasePlace::File("lease".into())] {
-            let first = journaled(&place).1.log.head(Kinds::Watched);
+            let first = journaled(&place, 1).1.log.head(Kinds::Watched);
             assert!(
                 first.seq != 0 && first.term == 0,
                 "a drawn start: {first:?}"

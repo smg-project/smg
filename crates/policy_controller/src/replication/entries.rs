@@ -24,6 +24,7 @@ const SUBSCRIPTION: &str = "each replica hears the engines' cache events itself"
 const DISPATCHED: &str = "a new leader reads dispatched leases from the engines' in-flight \
                           snapshots and rebuilds credits from its own tally";
 const PINS: &str = "pins, reservations and lease ends are journaled once pins have one table";
+const PUBLISHED: &str = "every replica publishes its own world";
 const GENERATION: &str =
     "the applied generation joins the watched kinds with the step that journals an apply";
 
@@ -74,11 +75,8 @@ pub const ENTRIES: &[(&str, &str, Fate)] = &[
         Fate::NotYet("no caller yet: its first caller brings its event"),
     ),
     ("LoadSink", "publish_due", Fate::Read),
-    (
-        "LoadSink",
-        "publish",
-        Fate::Rebuilt("every replica publishes its own world"),
-    ),
+    ("LoadSink", "publish", Fate::Rebuilt(PUBLISHED)),
+    ("LoadSink", "wake_with", Fate::Read),
     ("KvEventSink", "admit", Fate::Rebuilt(SUBSCRIPTION)),
     ("KvEventSink", "reconnected", Fate::Rebuilt(SUBSCRIPTION)),
     ("KvEventSink", "resync", Fate::Rebuilt(SUBSCRIPTION)),
@@ -91,6 +89,7 @@ pub const ENTRIES: &[(&str, &str, Fate)] = &[
     ("ReservationStore", "release", Fate::NotYet(PINS)),
     ("ReservationStore", "held", Fate::Read),
     ("SessionsStore", "pin", Fate::NotYet(PINS)),
+    ("SessionsStore", "pin_no_earlier", Fate::NotYet(PINS)),
     ("SessionsStore", "lookup", Fate::Read),
     ("SessionsStore", "unpin", Fate::NotYet(PINS)),
     ("SessionsStore", "drop_worker", Fate::NotYet(PINS)),
@@ -122,7 +121,11 @@ pub const ENTRIES: &[(&str, &str, Fate)] = &[
         "restore_from",
         Fate::Rebuilt("the journal starts again: a reader re-syncs from this store's own snapshot"),
     ),
+    // The three doors for a followed write, one a kind of the leader's
+    // events: each is the standby's side of a journaled write.
     ("MemoryStore", "follow", Fate::Journaled),
+    ("MemoryStore", "follow_load", Fate::Journaled),
+    ("MemoryStore", "follow_term", Fate::Journaled),
     ("MemoryStore", "apply", Fate::NotYet(GENERATION)),
     ("MemoryStore", "world", Fate::Read),
     ("MemoryStore", "build_view", Fate::Read),
@@ -131,11 +134,13 @@ pub const ENTRIES: &[(&str, &str, Fate)] = &[
     ("MemoryStore", "build_encode_pair", Fate::Read),
     ("MemoryStore", "deciding", Fate::Read),
     ("MemoryStore", "micros", Fate::Read),
+    ("MemoryStore", "publish_now", Fate::Rebuilt(PUBLISHED)),
     ("MemoryStore", "counts", Fate::Read),
     ("MemoryStore", "overload_flips", Fate::Read),
     ("MemoryStore", "outside_lists", Fate::Read),
     ("MemoryStore", "publication_allocations", Fate::Read),
     ("MemoryStore", "publications", Fate::Read),
+    ("MemoryStore", "membership_builds", Fate::Read),
     ("MemoryStore", "resyncs", Fate::Read),
     ("MemoryStore", "indexed_blocks", Fate::Read),
     ("MemoryStore", "lane_counts", Fate::Read),

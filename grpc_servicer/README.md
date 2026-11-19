@@ -181,6 +181,17 @@ breaks the transfer is a 502, so a client knows whether to retry. None of
 these counts against the worker's circuit breaker, and the Router replays
 none of them on another worker, which would meet the same media.
 
+For `nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B`, the router can preprocess
+audio from `/v1/chat/completions` with `--mm-processing router`. Use a vLLM
+engine with native `Nemotron3_5TranscribeForConditionalGeneration` support;
+the worker's `--mm-processor off` accepts the router's prepared tensors.
+SMG downmixes and resamples to 16 kHz, expands each `<|audio|>` placeholder,
+and sends padded `audio_signal` rows with their true CPU `audio_signal_length`
+values. Mel extraction stays in the model's audio tower. This path supports
+`input_audio` and `audio_url` content parts, including multiple clips; it does
+not add an `/v1/audio/transcriptions` endpoint. The Rust worker's `smg` mode
+still has the audio-reference limitation described below.
+
 On the router side, `--mm-processing` selects `auto` (default: forward when
 every registered worker of the model advertises `mm_processor` and the model's
 spec opts in, or every one of those workers runs the router's own pipeline,

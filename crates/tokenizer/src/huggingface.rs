@@ -721,8 +721,23 @@ impl HuggingFaceTokenizer {
         file_path: &str,
         chat_template_path: Option<&str>,
     ) -> Result<Self> {
-        let tokenizer = LoadingTokenizer::from_file(file_path)
-            .map_err(|e| Error::msg(format!("Failed to load tokenizer: {e}")))?;
+        // The two steps of the library's `from_file`, with the text of the
+        // file kept for a second read of its model section.
+        let tokenizer = {
+            let failed =
+                |e: &dyn std::fmt::Display| Error::msg(format!("Failed to load tokenizer: {e}"));
+            let content = std::fs::read_to_string(file_path).map_err(|e| failed(&e))?;
+            let mut tokenizer: LoadingTokenizer =
+                serde_json::from_str(&content).map_err(|e| failed(&e))?;
+            // A Unigram section the library's reader took has that reader's
+            // scores: the section is read once more, for the scores the
+            // reference reads.
+            if tokenizer.get_model().rescore() {
+                let model = crate::unigram_scores::of_file(&content).map_err(|e| failed(&e))?;
+                tokenizer.with_model(LateBoundModel::from(model));
+            }
+            tokenizer
+        };
         Self::from_built_tokenizer(tokenizer, Path::new(file_path), chat_template_path)
     }
 

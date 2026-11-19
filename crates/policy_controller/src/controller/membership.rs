@@ -1679,7 +1679,7 @@ pub(crate) mod tests {
     fn a_run_draws_its_base_below_the_bound_and_apart_from_another_runs() {
         let drawn: Vec<u64> = (0..64)
             .map(|_| {
-                let (store, feed) = journaled(&LeasePlace::Process);
+                let (store, feed) = journaled(&LeasePlace::Process, 1);
                 Door::new(store, feed.log).base
             })
             .collect();
@@ -1695,7 +1695,7 @@ pub(crate) mod tests {
         // A controller with no shared lease leads under term one at every
         // start: each run's door draws where its count starts.
         let run = || {
-            let (store, feed) = journaled(&LeasePlace::Process);
+            let (store, feed) = journaled(&LeasePlace::Process, 1);
             store::LeasesStore::set_term(store.as_ref(), 1);
             let door = Door::new(Arc::clone(&store), feed.log);
             let first = row_of(

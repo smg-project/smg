@@ -16,7 +16,10 @@ use super::{
 use crate::worker::{
     identity::endpoint::Endpoint,
     kv::{
-        event_monitor::recovery::{Admission, RankState, ResyncReason},
+        event_monitor::{
+            port::{BatchFacts, ResyncReason},
+            recovery::{Admission, RankState},
+        },
         index_backend::KvIndex,
     },
     metrics::Metrics,
@@ -75,6 +78,7 @@ impl WorkerStreamState {
     /// The cursor to send when resubscribing: rank 0's last applied sequence
     /// (the servicers replay rank 0's publisher). Other ranks keep their own
     /// cursors and dedup what arrives.
+    #[cfg(test)]
     pub(super) fn resume_sequence(&self) -> u64 {
         self.ranks.get(&0).map_or(0, RankState::resume_from)
     }
@@ -137,9 +141,11 @@ pub(super) enum BatchOutcome {
 
 impl KvEventMonitor {
     /// Run one batch through its rank's admission cursor and apply it to the
-    /// worker's index state.
+    /// worker's index state. `facts` are the batch's header as the collector
+    /// read it: the cursor decides by them.
     pub(super) fn admit_batch(
         batch: &KvEventBatch,
+        facts: BatchFacts,
         worker_url: &str,
         worker_id: u32,
         indexer: &KvIndex,
@@ -148,7 +154,7 @@ impl KvEventMonitor {
     ) -> BatchOutcome {
         if let Some(chunk) = &batch.snapshot {
             return Self::admit_snapshot_chunk(
-                batch, chunk, worker_url, worker_id, indexer, state, on_batch,
+                batch, chunk, facts, worker_url, worker_id, indexer, state, on_batch,
             );
         }
         let rank = batch.dp_rank.unwrap_or(0);
@@ -160,10 +166,8 @@ impl KvEventMonitor {
             degraded_changed |= !state.saw_unranked;
             state.saw_unranked = true;
         }
-        let seq = batch.sequence_number;
-        let clears = batch.events.iter().any(|event| {
-            matches!(&event.data, Some(kv_cache_event::Data::Cleared(cleared)) if cleared.ownership.is_none())
-        });
+        let seq = facts.sequence;
+        let clears = facts.clears;
         // Whether the batch's rank is one this worker indexes: its clear
         // reaches the index only then (another rank's restart or cleared gap
         // says nothing about this worker's blocks).
@@ -288,9 +292,11 @@ impl KvEventMonitor {
     /// The chunk's blocks are accounted like an applied batch's: counted under
     /// `op="snapshot"` (they are the relay's record, not stores the publisher
     /// sent) and reflected in the worker's index-blocks gauge.
+    #[expect(clippy::too_many_arguments, reason = "hot-path plumbing, not state")]
     fn admit_snapshot_chunk(
         batch: &KvEventBatch,
         chunk: &KvSnapshotChunk,
+        facts: BatchFacts,
         worker_url: &str,
         worker_id: u32,
         indexer: &KvIndex,
@@ -301,6 +307,9 @@ impl KvEventMonitor {
         if batch.dp_rank.is_none() {
             state.saw_unranked = true;
         }
+        // Read once, from the facts the collector said: the first chunk's
+        // line and the cursor's mark stand on one answer.
+        let unknown_before = facts.snapshot.is_some_and(|said| said.unknown_before);
         if chunk.index == 0 || state.snapshot.is_none() {
             if chunk.index != 0 {
                 warn!(
@@ -319,7 +328,7 @@ impl KvEventMonitor {
                 through = batch.sequence_number + u64::from(chunk.count.saturating_sub(chunk.index + 1)),
                 "KV event relay served a state snapshot; replacing the worker's index state"
             );
-            if chunk.unknown_before > 0 {
+            if unknown_before {
                 warn!(
                     worker_url = %Endpoint::redacted_str(worker_url),
                     rank,
@@ -341,8 +350,8 @@ impl KvEventMonitor {
             });
         }
         let cursor = state.ranks.entry(rank).or_default();
-        cursor.resync_to(batch.sequence_number);
-        if chunk.unknown_before > 0 {
+        cursor.resync_to(facts.sequence);
+        if unknown_before {
             cursor.mark_degraded();
         }
         on_batch(batch);
@@ -511,9 +520,9 @@ mod tests {
         salt::namespace_seed, ContentHash, ReferenceIndexer, SequenceHash, StoredBlock,
     };
     use smg_grpc_client::common_proto::{
-        EngineLoad, KvBlock, KvBlocksRemoved, KvBlocksStored, KvCacheCleared, KvCacheEvent,
-        KvCacheTier,
+        KvBlock, KvBlocksRemoved, KvBlocksStored, KvCacheCleared, KvCacheEvent, KvCacheTier,
     };
+    use smg_worker::kv_events::batch_facts;
 
     use super::{super::apply::convert_kv_block, *};
     use crate::worker::{
@@ -753,6 +762,7 @@ mod tests {
         fn feed(&mut self, b: &KvEventBatch) -> BatchOutcome {
             KvEventMonitor::admit_batch(
                 b,
+                batch_facts(b),
                 "grpc://w1:9000",
                 self.worker,
                 &self.indexer,
@@ -1862,28 +1872,6 @@ mod tests {
         assert_eq!(sim.deliver(&next), BatchOutcome::Applied);
         sim.assert_matches_reference();
         assert_eq!(sim.reference.worker_block_count(sim.worker), 1);
-    }
-
-    /// A batch that carries only a load record repeats the last sequence and
-    /// has no events: it is recognised before admission, so it is neither a
-    /// duplicate nor a restart to the rank's cursor.
-    #[test]
-    fn a_load_only_batch_is_recognised_before_admission() {
-        let record = EngineLoad {
-            running_requests: 3,
-            load_only: true,
-            ..Default::default()
-        };
-        let mut only = batch(7, None, vec![]);
-        only.load = Some(record.clone());
-        assert!(KvEventMonitor::is_load_only(&only));
-        let mut carrying = batch(8, None, vec![stored(None, &[1])]);
-        carrying.load = Some(EngineLoad {
-            load_only: false,
-            ..record
-        });
-        assert!(!KvEventMonitor::is_load_only(&carrying));
-        assert!(!KvEventMonitor::is_load_only(&batch(9, None, vec![])));
     }
 
     /// A snapshot whose relay joined the publisher late and could not replay

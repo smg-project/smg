@@ -10,18 +10,15 @@
 //! The case reads the workspace's manifests through `cargo metadata` and
 //! walks what the default features link.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    error::Error,
-    process::Command,
-};
+mod common;
 
+use std::collections::{BTreeMap, BTreeSet};
+
+use common::{cargo_metadata, this_package, Outcome};
 use serde_json::{json, Value};
 
 const THIS_CRATE: &str = "smg-worker";
 const PROTOCOL_CRATE: &str = "openai-protocol";
-
-type Outcome<T> = Result<T, Box<dyn Error>>;
 
 /// What the walk needs of one workspace member.
 struct Member {
@@ -154,23 +151,9 @@ fn chain_from(
     Ok(None)
 }
 
-/// The workspace's manifests, as `cargo metadata --no-deps` reads them.
-fn workspace_metadata() -> Outcome<Value> {
-    let output = Command::new(env!("CARGO"))
-        .args(["metadata", "--no-deps", "--format-version", "1"])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .output()?;
-    assert!(
-        output.status.success(),
-        "cargo metadata failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    Ok(serde_json::from_slice(&output.stdout)?)
-}
-
 #[test]
 fn the_default_layer_links_nothing_that_links_the_protocol_crate() -> Outcome<()> {
-    assert_eq!(chain_to_protocol(&members(&workspace_metadata()?)?)?, None);
+    assert_eq!(chain_to_protocol(&members(&cargo_metadata()?)?)?, None);
     Ok(())
 }
 
@@ -179,7 +162,7 @@ fn the_default_layer_links_nothing_that_links_the_protocol_crate() -> Outcome<()
 #[test]
 fn no_feature_links_anything_that_links_the_protocol_crate() -> Outcome<()> {
     assert_eq!(
-        chain_to_protocol_under_any_feature(&members(&workspace_metadata()?)?)?,
+        chain_to_protocol_under_any_feature(&members(&cargo_metadata()?)?)?,
         None
     );
     Ok(())
@@ -190,16 +173,8 @@ fn no_feature_links_anything_that_links_the_protocol_crate() -> Outcome<()> {
 /// a package only when this case changes.
 #[test]
 fn the_default_feature_set_is_empty_and_its_layer_is_six_crates() -> Outcome<()> {
-    let metadata = workspace_metadata()?;
-    let this = metadata["packages"]
-        .as_array()
-        .and_then(|packages| {
-            packages
-                .iter()
-                .find(|package| package["name"].as_str() == Some(THIS_CRATE))
-        })
-        .ok_or("the workspace has no smg-worker")?;
-    assert_eq!(this["features"]["default"], json!([]));
+    let metadata = cargo_metadata()?;
+    assert_eq!(this_package(&metadata)?["features"]["default"], json!([]));
     let mut layer = members(&metadata)?
         .remove(THIS_CRATE)
         .ok_or("the workspace has no smg-worker")?

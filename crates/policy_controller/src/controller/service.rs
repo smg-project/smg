@@ -601,7 +601,8 @@ impl Service {
             is_leader,
         } = shared.leader(shared.fence.leader_term(now));
         // A replica that follows says how far behind it is, by the age of
-        // its stream's last applied frame; a leader follows nobody.
+        // the last frame that left it at its leader's head; a leader follows
+        // nobody.
         // `synced` is the same read of that lag, and reads it alone: the
         // live ranks and the generation narrow the same bit with their
         // steps.
@@ -1026,8 +1027,8 @@ mod tests {
                 tests::{stating, told, NO_PRINCIPAL},
                 Layer,
             },
-            replication::journaled_from,
-            spec_store::SpecStore,
+            replication::{journaled_for, journaled_from},
+            spec_store::{tests::names, SpecStore},
             PROTOCOL_VERSION,
         },
         elector::{
@@ -1072,7 +1073,7 @@ mod tests {
                 ADDRESS.to_owned(),
                 &elector,
                 stood,
-                journaled_from(&LeasePlace::Process, 0),
+                journaled_for(&LeasePlace::Process, 0, 2),
                 Arc::new(Catalog::builtin()),
                 2,
             )
@@ -1397,7 +1398,7 @@ mod tests {
         let elector = Elector::new(Box::new(FileLease::new(&path)), IDENTITY, settings)
             .expect("the settings are in order");
         let (standing, stood) = watch::channel(Standing::default());
-        let (store, feed) = journaled_from(&LeasePlace::Process, 0);
+        let (store, feed) = journaled_for(&LeasePlace::Process, 0, 2);
         let shared = Arc::new(
             Shared::new(
                 ID.to_owned(),
@@ -1967,7 +1968,7 @@ mod tests {
         )
         .expect("the settings are in order");
         let (standing, stood) = watch::channel(Standing::default());
-        let (store, feed) = journaled_from(&LeasePlace::Process, 0);
+        let (store, feed) = journaled_for(&LeasePlace::Process, 0, 2);
         let service = Service::new(
             vec![Scope::Gateway],
             Arc::new(
@@ -2780,11 +2781,7 @@ mod tests {
     #[tokio::test]
     async fn an_enforce_under_a_spec_store_runs_as_the_next_generation() {
         let (dir, _elector, _standing, control) = stored(true);
-        let on_file = || {
-            std::fs::read_dir(dir.path())
-                .expect("the directory")
-                .count()
-        };
+        let on_file = || names(dir.path()).len();
         let read = || {
             let standing = proto::GetPolicySpecRequest::default();
             control.get_policy_spec(from("operator-a", standing))
@@ -2887,8 +2884,7 @@ mod tests {
             .expect_err("a follower");
         assert_eq!(refused.code(), Code::FailedPrecondition);
         assert_eq!(refused.message(), "this replica does not lead");
-        let on_file = std::fs::read_dir(dir.path()).expect("the directory");
-        assert_eq!(on_file.count(), 0);
+        assert_eq!(names(dir.path()).len(), 0);
         assert_eq!(control.shared.generations.generation(), 0);
     }
 
@@ -2927,8 +2923,7 @@ mod tests {
         );
         assert_eq!(feed.after, Some(proto::NeedsSummary::default()));
         assert_eq!(control.shared.generations.generation(), 3);
-        let on_file = std::fs::read_dir(dir.path()).expect("the directory");
-        assert_eq!(on_file.count(), 3);
+        assert_eq!(names(dir.path()).len(), 3);
 
         for (asked, answered, document, digest) in [
             (1, 1, RANDOM, &first.digest),

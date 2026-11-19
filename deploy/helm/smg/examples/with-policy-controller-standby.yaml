@@ -1,0 +1,62 @@
+# Router with an elected policy controller whose standby follows its leader:
+# two replicas over one Lease, the standbys' listener taking identities as
+# told. One replica leads. The other dials the leader's pod at the
+# replication port, takes its workers and their loads and follows each write
+# of them, and reads ready only while it is synced: a rollout and a node
+# drain wait for a synced standby by themselves, and a take-over starts from
+# the workers and loads the leader held.
+# THE FENCE IS YOURS. Nothing is verified on a listener that takes identities
+# as told: whoever reaches the replication port of a controller's pod acts
+# as any principal of its scope. Admit to that port (30102 here) the
+# controller's own pods and nobody else, by a mesh that verifies its callers
+# or by a network policy. The pods carry the controller's selector labels,
+# the chart's name, the release's and the controller's component:
+#   app.kubernetes.io/name: smg
+#   app.kubernetes.io/instance: smg
+#   app.kubernetes.io/component: policy-controller
+# The chart renders no such policy: one that selects these pods isolates
+# their other listeners too. A fence that keeps the pods out leaves the
+# standby not ready, and a rollout waiting on it.
+# On a running elected release these values do not roll out: the old leader
+# takes no stated name and refuses the new pod, which stays not ready while
+# the old pods serve as before. Scale the controller to zero first, by hand
+# or with policyController.enabled=false (the schema refuses replicas: 0),
+# wait until no controller pod remains, then upgrade with the controller
+# on: the first leader under these values starts with no worker and no
+# load.
+# Usage: helm install smg deploy/helm/smg -f deploy/helm/smg/examples/with-policy-controller-standby.yaml
+router:
+  workerUrls:
+    - http://worker-1:8000
+policyController:
+  enabled: true
+  election:
+    enabled: true
+  # One leads and one stands by. With one replica the standby is a rollout's
+  # surge pod alone; the second keeps one for a pod that is lost and for a
+  # node drain, where no surge comes.
+  replicas: 2
+  # What makes a replica that does not lead a standby that follows.
+  identityAsTold: [replication]
+  # A drain evicts a controller's pod only while another is ready: the
+  # leader, or a synced standby.
+  podDisruptionBudget:
+    enabled: true
+  # The policy spec the controller runs, a document of apiVersion
+  # smg.policy/v1: here, the healthy worker with the least load.
+  spec:
+    apiVersion: smg.policy/v1
+    profiles:
+      default:
+        filter: [healthy]
+        score: [least-load]
+        pick: best
+  # The controller runs 2 runtime worker threads by default
+  # (runtimeWorkerThreads), the CPU limit here: raise the two together.
+  resources:
+    requests:
+      cpu: 500m
+      memory: 128Mi
+    limits:
+      cpu: "2"
+      memory: 512Mi

@@ -93,6 +93,7 @@ fn ready(
             ..WorkerFacts::default()
         })
         .id();
+    store.publish_now();
     let revision = store.get(id)?.revision;
     store.set_status(id, WorkerStatus::Ready, revision);
     Some(id)
@@ -123,7 +124,7 @@ async fn the_probe_polls_a_mock_engine_and_every_rank_gets_its_row() {
         0,
     )
     .expect("rank 1");
-    let probe = Arc::new(EngineProbe::new().expect("an HTTP client"));
+    let probe = Arc::new(EngineProbe::new());
     let driver = Arc::new(LoadDriver::new(
         Arc::clone(&store),
         Arc::clone(&probe),
@@ -173,7 +174,7 @@ async fn the_probe_polls_a_mock_engine_and_every_rank_gets_its_row() {
 #[tokio::test]
 async fn an_engine_that_goes_away_fails_on_the_transport_and_its_connection_is_dropped() {
     let (addr, engine) = mock_engine(1).await.expect("a mock engine");
-    let probe = EngineProbe::new().expect("an HTTP client");
+    let probe = EngineProbe::new();
     let target = Target {
         endpoint: format!("http://{addr}"),
         kind: RuntimeType::Vllm,
@@ -242,7 +243,7 @@ async fn an_engine_re_registered_under_another_kind_at_one_address_is_asked_thro
     // another family: the engine refuses that family's call, an answer,
     // which keeps the connection.
     let (addr, _engine) = mock_engine(1).await.expect("a mock engine");
-    let probe = EngineProbe::new().expect("an HTTP client");
+    let probe = EngineProbe::new();
     let endpoint = format!("http://{addr}");
     let wrong = Target {
         endpoint: endpoint.clone(),
@@ -286,7 +287,7 @@ async fn the_scrape_reads_the_metrics_endpoint_and_a_closed_port_fails() {
     let (url, _server) = metrics_server(METRICS_TEXT)
         .await
         .expect("a metrics server");
-    let probe = EngineProbe::new().expect("an HTTP client");
+    let probe = EngineProbe::new();
     let text = probe
         .scrape(&url, Duration::from_secs(3))
         .await
@@ -440,7 +441,7 @@ async fn cpu_and_rss_of_the_driver_against_a_fleet_of_mock_engines() {
         ready(&store, &endpoint, &endpoint, 0, 1, WireModes::GRPC, 0).expect("the row");
         stops.push(stop);
     }
-    let probe = Arc::new(EngineProbe::new().expect("an HTTP client"));
+    let probe = Arc::new(EngineProbe::new());
     let driver = Arc::new(LoadDriver::new(
         Arc::clone(&store),
         probe,

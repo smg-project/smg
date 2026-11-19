@@ -2,73 +2,53 @@
 //! 64 and 512 candidates, and a prefill placement with its booking. Ids:
 //! `policy_engine/decide/bucket/<n>`,
 //! `policy_engine/decide/bucket_prefill/<n>`,
+//! `policy_engine/decide/bucket_prefill_stale/<n>`,
 //! `policy_engine/decide/bucket_prefill_64_models/8`,
 //! `policy_engine/decide/bucket_prefill_64_models_shared/8`,
 //! `policy_engine/decide/bucket_prefill_joined/512` and
 //! `policy_engine/decide/bucket_prefill_two_rows/256`. The fleet is the one
 //! the `decision` bench decides over, and the first ids are the rows that
-//! bench times for every other preset. They stand here because that binary
+//! bench times for every other preset, built by the one body the two
+//! binaries share (`common/preset.rs`). They stand here because that binary
 //! runs at its gate's bound: a preset's rows there are three rows more in
-//! every pull request's gate.
+//! every pull request's gate. This file is a pull-request gate's too
+//! (`.github/bench-gates/policy-engine-bucket.toml` runs the whole binary
+//! three times a side).
 #![expect(
     clippy::expect_used,
     reason = "a bench's setup has no caller to answer; a preset that fails to validate is a bug the unit tests catch"
 )]
 
 mod common;
+#[path = "common/preset.rs"]
+mod preset;
 
-use std::hint::black_box;
+use std::{
+    hint::black_box,
+    time::{Duration, Instant},
+};
 
 use common::{build_view, engine_of, fleet};
 use criterion::{
     criterion_group, criterion_main, measurement::WallTime, BenchmarkGroup, BenchmarkId, Criterion,
 };
+use preset::SIZES;
 use smg_policy_controller::{
-    Constraints, Lease, Lifecycle, Phase, PoolFacts, RequestFacts, Scratch,
+    Constraints, Lease, Lifecycle, Membership, Phase, PoolFacts, RequestFacts, Scratch,
 };
 
-const SIZES: [usize; 3] = [8, 64, 512];
+/// How often the stale rows tell their leave again: well inside the ten
+/// seconds its fence stands.
+const RETOLD: Duration = Duration::from_secs(1);
 
 fn decide(c: &mut Criterion) {
     let mut group = c.benchmark_group("policy_engine/decide");
-    preset(&mut group);
+    preset::rows(&mut group, "bucket");
     bucket_prefill(&mut group);
+    bucket_prefill_stale(&mut group);
     bucket_prefill_models(&mut group);
     bucket_prefill_parted(&mut group);
     group.finish();
-}
-
-/// The preset's decision for a request that is no prefill placement, which
-/// the stage leaves to the picker: the row the `decision` bench times for
-/// every other preset, built as that bench builds it.
-fn preset(group: &mut BenchmarkGroup<'_, WallTime>) {
-    let engine = engine_of("bucket");
-    for &n in &SIZES {
-        let fleet = fleet(n);
-        let mut view = Vec::with_capacity(n);
-        build_view(&fleet, &mut view);
-        let mut scratch = Scratch::new();
-        let pool = PoolFacts {
-            pool_size: n as u32,
-            generation: 1,
-            ..PoolFacts::default()
-        };
-        let cx = Constraints::default();
-        group.bench_with_input(BenchmarkId::new("bucket", n), &n, |b, _| {
-            let mut seed = 0u64;
-            b.iter(|| {
-                seed += 1;
-                let facts = RequestFacts {
-                    model: "m",
-                    prompt_tokens: 512,
-                    seed,
-                    now_micros: 1_000_000,
-                    ..RequestFacts::default()
-                };
-                engine.decide(&facts, &pool, black_box(&view), &cx, &mut scratch)
-            });
-        });
-    }
 }
 
 /// A prefill placement under the bucket preset, booked as a host books it.
@@ -96,6 +76,72 @@ fn bucket_prefill(group: &mut BenchmarkGroup<'_, WallTime>) {
         group.bench_with_input(BenchmarkId::new("bucket_prefill", n), &n, |b, _| {
             b.iter(|| {
                 seed += 1;
+                let now_micros = 1_000_000 + seed * 1_000;
+                let tokens = (seed.wrapping_mul(2_654_435_761) % 4_096) as u32;
+                let facts = RequestFacts {
+                    model: "m",
+                    phase: Phase::Prefill,
+                    prompt_tokens: tokens,
+                    seed,
+                    now_micros,
+                    ..RequestFacts::default()
+                };
+                let decision = engine.decide(&facts, &pool, black_box(&view), &cx, &mut scratch);
+                let lease = Lease {
+                    tokens,
+                    issued_micros: now_micros,
+                    ..Lease::default()
+                };
+                engine.on_decision_issued(&lease, &decision);
+                decision
+            });
+        });
+    }
+}
+
+/// A prefill placement over a view older than a leave. The model's first
+/// decision lists every worker, the lifecycle prunes one the filters keep,
+/// and each timed decision's view still shows it: the decision finds a
+/// survivor its partition does not list, asks the fence of it, lists
+/// nothing new and seats the others. The fence stands ten seconds, so the
+/// leave is told again once a second, as a feed that repeats it would.
+fn bucket_prefill_stale(group: &mut BenchmarkGroup<'_, WallTime>) {
+    for &n in &SIZES {
+        let engine = engine_of("bucket");
+        let fleet = fleet(n);
+        let mut view = Vec::with_capacity(n);
+        build_view(&fleet, &mut view);
+        let mut scratch = Scratch::new();
+        let pool = PoolFacts {
+            pool_size: n as u32,
+            generation: 1,
+            ..PoolFacts::default()
+        };
+        let cx = Constraints::default();
+        let listing = RequestFacts {
+            model: "m",
+            phase: Phase::Prefill,
+            now_micros: 1_000_000,
+            ..RequestFacts::default()
+        };
+        black_box(engine.decide(&listing, &pool, &view, &cx, &mut scratch));
+        // The first healthy worker from the middle of the view on leaves: a
+        // row the filters keep, with half the view behind it.
+        let gone = view[n / 2..]
+            .iter()
+            .find(|row| row.health.healthy)
+            .expect("a healthy row in the view's second half")
+            .id;
+        engine.on_membership(&Membership::Removed(gone));
+        let mut told = Instant::now();
+        let mut seed = 0u64;
+        group.bench_with_input(BenchmarkId::new("bucket_prefill_stale", n), &n, |b, _| {
+            b.iter(|| {
+                seed += 1;
+                if seed.is_multiple_of(256) && told.elapsed() >= RETOLD {
+                    engine.on_membership(&Membership::Removed(gone));
+                    told = Instant::now();
+                }
                 let now_micros = 1_000_000 + seed * 1_000;
                 let tokens = (seed.wrapping_mul(2_654_435_761) % 4_096) as u32;
                 let facts = RequestFacts {

@@ -50,6 +50,12 @@ pub struct Lease {
     /// Which target of the pick this lease books (a reservation on a pair
     /// side names its own).
     pub target_index: u8,
+    /// The worker the lease books at its issue, as the host that issues it
+    /// names it; `WorkerId(0)` where the host names none. A stage that
+    /// books at the issue reads it at the dispatch
+    /// ([`Lifecycle::on_dispatched`]), where `target_index` names the
+    /// target the dispatch took. In-process only: no contract carries it.
+    pub booked: WorkerId,
     pub generation: u64,
     /// The request's session ([`crate::RequestFacts::session`]: its key
     /// within its model and phase), which the host fills for every keyed
@@ -66,8 +72,10 @@ pub struct Lease {
     /// The host's clock at issue, microseconds since its origin. In-process
     /// only; the wire carries the dispatch deadline as a duration.
     pub issued_micros: u64,
-    /// Token-work the decision books on its target: the prompt, or the
-    /// host's mean estimate when the prompt's size is unknown.
+    /// The prompt size the request stated, in tokens: 0 where it stated
+    /// none. The `least-load` and `resident-work` stages credit a dispatch
+    /// of no stated size at their own mean prefill; every other reader
+    /// takes the 0 as stated.
     pub tokens: u32,
 }
 
@@ -102,10 +110,12 @@ pub struct Outcome {
 /// Why a lease was released before its completion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReleaseReason {
-    /// The host gave up before dispatch.
+    /// The lease ended before a dispatch: its host gave up, no dispatch
+    /// was named by its deadline, or its answer was stopped for the fence
+    /// (its controller no longer led the term that minted it).
     Abandoned,
     /// A late decision: it arrived after a fallback dispatch, or was cut
-    /// before it left.
+    /// before it left, for its request's budget or its dispatch span.
     LateDecision,
     /// The client went away.
     ClientGone,
@@ -117,7 +127,9 @@ pub enum ReleaseReason {
     WorkerRemoved,
 }
 
-/// A membership change the host reports.
+/// A membership change the host reports. A host tells a join when it takes
+/// it, and a view that lists the row may follow: a stage that lists by the
+/// feed treats a member its candidates do not hold as one a filter took.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Membership<'a> {
     Added(WorkerId),
@@ -133,6 +145,18 @@ pub enum Membership<'a> {
     /// Every worker of every pool the engine decides over, after a resync;
     /// a host with a prefill and a decode pool sends one snapshot of both.
     Snapshot(&'a [WorkerId]),
+    /// The worker left its pool of each of `models`: its role moved, or it
+    /// serves them no longer. `id` stands when the word is said. A
+    /// registration that keeps its id says it ahead of its own word, the
+    /// [`Membership::Relabelled`] or [`Membership::Resized`]. A new
+    /// incarnation says its [`Membership::Replaced`] first and this word
+    /// behind it, for the new id. A stage that lists workers by model
+    /// unlists the worker under these alone. The plugin contracts carry
+    /// no such kind: a plugin is told nothing of it.
+    Left {
+        id: WorkerId,
+        models: &'a [String],
+    },
 }
 
 /// A signal about one worker.
@@ -234,6 +258,16 @@ impl fmt::Debug for EventSet {
 
 /// The lifecycle a stateful stage implements. Every hook defaults to a
 /// no-op, so a stateless stage implements nothing.
+///
+/// A served controller tells a lease's issue, its dispatch, its completion
+/// and its release while it holds the turn of the lease's file, and the
+/// release of a lease its decision gives up right after that turn: those
+/// hooks are bounded, and call no door of the leases' store. A hook that
+/// panics at a dispatch, a completion or a release that a frame brings,
+/// or at a dispatch deadline's end, is held there: the lease's
+/// event stands as applied. One that panics at the issue, or at the
+/// release of a lease its decision gives up, costs that request its
+/// decision.
 pub trait Lifecycle: Send + Sync {
     /// The engine issued `decision` under `lease`. In the embedded mode the
     /// commit follows at once and the accounting happens at dispatch; a
@@ -244,7 +278,9 @@ pub trait Lifecycle: Send + Sync {
     /// `side`, `since_decision_micros` after the decision on the host's clock
     /// (the wire's own field): a credit dates from the dispatch, not from a
     /// decision a queue may have held. The untaken targets are released by
-    /// the host's commit.
+    /// the host's commit. The lease told names the target the dispatch
+    /// took: its `target_index` is that target's index in the pick, and its
+    /// [`Lease::booked`] is still the worker its issue booked.
     fn on_dispatched(
         &self,
         _lease: &Lease,
@@ -273,12 +309,12 @@ pub trait Lifecycle: Send + Sync {
     /// workers it lists or the bookings it learns from. The standalone
     /// controller makes the membership call and tells a stage of a lease's
     /// issue, of its dispatch, completion and release at its gateway's word
-    /// and of its end at the dispatch deadline, and not yet of the end of a
-    /// lease whose gateway was let go: it refuses a document that names such
-    /// a stage as not in this build ([`crate::SpecError::NotInBuild`]). A
-    /// host that embeds the engine makes every call. `false` by default: a
-    /// stage that takes a call to shed state early decides the same without
-    /// it.
+    /// and of its end at the dispatch deadline or where its answer does not
+    /// leave, and not yet of the end of a lease whose gateway was let go: it
+    /// refuses a document that names such a stage as not in this build
+    /// ([`crate::SpecError::NotInBuild`]). A host that embeds the engine
+    /// makes every call. `false` by default: a stage that takes a call to
+    /// shed state early decides the same without it.
     fn needs_lifecycle(&self) -> bool {
         false
     }

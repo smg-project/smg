@@ -1421,6 +1421,25 @@ impl ResponseStreamEventEmitter {
     pub(crate) fn function_call_status(&mut self, arguments: &str) -> &'static str {
         let status = super::utils::function_call_status(self.finish_reason.as_deref(), arguments);
         self.cut_call |= status == "incomplete";
+        // A normal model finish with non-JSON arguments deserves a diagnostic,
+        // without changing the established incomplete response contract. A
+        // token limit, cancellation, steering or unknown finish is not evidence
+        // of a malformed model call. serde's message can quote private values.
+        if status == "incomplete"
+            && matches!(self.finish_reason.as_deref(), Some("stop" | "tool_calls"))
+        {
+            if let Err(error) = serde_json::from_str::<serde_json::Value>(arguments) {
+                warn!(
+                    response_id = %self.response_id,
+                    finish_reason = self.finish_reason.as_deref().unwrap_or_default(),
+                    argument_bytes = arguments.len(),
+                    json_error_class = ?error.classify(),
+                    json_error_line = error.line(),
+                    json_error_column = error.column(),
+                    "Tool-call arguments are not complete JSON at generation end"
+                );
+            }
+        }
         status
     }
 
@@ -2168,6 +2187,77 @@ pub(crate) fn attach_mcp_server_label(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn invalid_tool_call_warning_is_correlated_and_content_free() {
+        use std::{
+            io::{self, Write},
+            sync::{Arc, Mutex},
+        };
+
+        #[derive(Clone)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let capture = Capture(bytes.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_target(false)
+            .with_writer(move || capture.clone())
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let secret = r#"{"private_argument":"must-not-be-logged", "broken": private_token}"#;
+        let mut emitter =
+            ResponseStreamEventEmitter::new("resp_diagnostic".into(), "fixture-model".into(), 0);
+        emitter.set_finish_reason(Some("tool_calls"));
+        assert_eq!(emitter.function_call_status(secret), "incomplete");
+        let warning: serde_json::Value =
+            serde_json::from_slice(&bytes.lock().unwrap()).expect("one structured warning");
+        assert_eq!(warning["fields"]["response_id"], "resp_diagnostic");
+        assert_eq!(warning["fields"]["finish_reason"], "tool_calls");
+        assert_eq!(warning["fields"]["argument_bytes"], secret.len());
+        assert_eq!(warning["fields"]["json_error_class"], "Syntax");
+        let logged = warning.to_string();
+        for private in ["private_argument", "must-not-be-logged", "private_token"] {
+            assert!(
+                !logged.contains(private),
+                "private argument content in warning"
+            );
+        }
+        let terminal = emitter.emit_completed(None);
+        assert_eq!(terminal["type"], "response.incomplete");
+        assert!(terminal["response"]["incomplete_details"].is_null());
+        assert!(terminal["response"]["error"].is_null());
+
+        bytes.lock().unwrap().clear();
+        for finish in [
+            Some("length"),
+            Some("abort"),
+            Some("cancelled"),
+            Some("steered"),
+            Some("failed"),
+            Some("error"),
+            None,
+        ] {
+            emitter.set_finish_reason(finish);
+            emitter.function_call_status(secret);
+        }
+        emitter.set_finish_reason(Some("tool_calls"));
+        emitter.function_call_status(r#"{"valid":true}"#);
+        assert!(
+            bytes.lock().unwrap().is_empty(),
+            "truncation, cancellation, steering and valid calls are not malformed-call warnings"
+        );
+    }
+
     use super::*;
     use crate::routers::grpc::common::responses::utils::{
         assert_responses_api_usage, responses_api_test_usage,

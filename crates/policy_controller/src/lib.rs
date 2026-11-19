@@ -130,21 +130,24 @@ pub use decision::{
 pub use framework::{
     Binding, DecisionScope, EncodeItems, EncodePlaced, EncodePool, EncoderFacts, Engine, Filter,
     Front, Narrowed, PairPools, PairTable, PairTableError, Picker, Plan, Profile, Scorer, Scratch,
-    Spread, TieBand, Weighted, DRAW_BOUND, DRAW_FROM, RANK_FROM,
+    Spread, TieBand, Unit, Weighted, DRAW_BOUND, DRAW_FROM, RANK_FROM,
 };
 pub use lease::{
     EventKind, EventSet, Lease, LeaseId, LeaseKind, Lifecycle, Membership, Outcome, ReleaseReason,
     Side, Signal, TransportClass,
 };
 pub use ring::{ConsistentHash, Ring};
-pub use sessions::{Assignment, Pins, Recovery, SessionRule, SessionTable, SessionVerdict};
+pub use sessions::{
+    Assignment, Forgets, Pins, Recovery, SessionRule, SessionTable, SessionVerdict,
+};
 pub use spec::{
     AppliedSpec, Needs, PolicySpec, PowerOfTwoMetric, SessionsSpec, SpecError, API_VERSION, PRESETS,
 };
 pub use view::{
-    fingerprint, AffinityFacts, Candidate, Constraints, HashKind, Header, Health, Identity,
-    LoadRow, MediaCounts, ModelFingerprint, NamedAffinity, NamedHolder, OverloadRegime, Phase,
-    PoolFacts, RequestFacts, Role, Session, SignalSource, WireModes, WorkerId, ZoneCapacity,
+    fingerprint, AffinityFacts, Candidate, Constraints, Engines, HashKind, Header, Health,
+    Identity, LoadRow, MediaCounts, ModelFingerprint, NamedAffinity, NamedHolder, OverloadRegime,
+    Phase, PinSource, PoolFacts, RequestFacts, Role, Session, SignalSource, WireModes, WorkerId,
+    ZoneCapacity,
 };
 
 /// SplitMix64 over a decision's seed: the only randomness a stage gets, so a
@@ -157,6 +160,9 @@ pub use view::{
 ///   picker that draws first reads it too, and whatever follows that draw
 ///   (the order of the rows drawn, or the whole pass behind a draw that kept
 ///   nobody) reads it past those values;
+/// - one value of the seed's stream, read behind the draw of a picker whose
+///   unit is the engine: the seed of the stream that draws between equal
+///   rows of the engine taken;
 /// - the seed under the `warmup-slice` scorer's mask: that scorer's draws;
 /// - the seed under the alternates' mask: the order of equal counts among
 ///   the workers the count-first picker passed over;
@@ -164,7 +170,9 @@ pub use view::{
 ///   decode side, whose stages derive their streams from it as above;
 /// - the seed under the store's two naming masks: where the store names a
 ///   decision's rows and cuts a list at the profile's sample, the holders'
-///   draw and the warming rows' draw.
+///   draw and the warming rows' draw;
+/// - the first value of the holders' stream, and of each stream so seeded:
+///   the seed of each lookup a naming makes again, a stream a round.
 #[derive(Clone, Copy, Debug)]
 pub struct Draw(u64);
 

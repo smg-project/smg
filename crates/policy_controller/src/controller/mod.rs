@@ -13,7 +13,12 @@
 //! answers `GetPolicySpec` and a dry run of `ApplyPolicySpec`
 //! ([`Controller::spec_file`]). A controller given a spec store runs the
 //! newest generation on file, takes its document through the apply call and
-//! rolls back to a generation on file ([`Controller::spec_store`]).
+//! rolls back to a generation on file ([`Controller::spec_store`]). A host
+//! that embeds the controller hands its document to the store's entry
+//! itself ([`Controller::store`], then [`MemoryStore::apply`]): it names no
+//! source and serves no spec call. That a controller that took a source is
+//! applied through that source alone is the host's rule to keep: the entry
+//! refuses a stale number and nothing else.
 //!
 //! A controller is bound first and served second ([`Controller::bind`], then
 //! [`Controller::serve`]): the bind takes every address (port `0` for an
@@ -268,9 +273,6 @@ pub enum Error {
     /// The admin listener could not be bound or failed while serving.
     #[error("admin listener: {0}")]
     Admin(#[source] io::Error),
-    /// The engines' HTTP client could not be built.
-    #[error("the engines' probe: {0}")]
-    Probe(#[source] reqwest::Error),
     /// The spec file could not be read, or its document does not run.
     #[error("the spec file {}: {source}", .path.display())]
     SpecFile {
@@ -331,8 +333,9 @@ impl Controller {
     /// lifecycle's calls ([`crate::Lifecycle::needs_lifecycle`]) is refused
     /// as not in this build: the controller makes the membership call, and a
     /// stage hears a lease's issue, its dispatch, completion and release at
-    /// its gateway's word and its end at the dispatch deadline here, and not
-    /// yet the end of a lease whose gateway was let go.
+    /// its gateway's word and its end at the dispatch deadline or where its
+    /// answer does not leave here, and not yet the end of a lease whose
+    /// gateway was let go.
     pub async fn bind_with(config: Config, catalog: Catalog) -> Result<Self, Error> {
         config.validate()?;
         tls::install_crypto_provider();
@@ -347,10 +350,10 @@ impl Controller {
         );
         // The store makes the membership call. A served decision tells a
         // stage of its lease, a gateway's frame of the lease's dispatch,
-        // completion or release and the dispatch deadline of its end; no
-        // line tells one of a lease that left with its gateway yet: a stage
-        // that needs the calls is refused by name, never run on state half
-        // kept.
+        // completion or release, and the dispatch deadline or an answer
+        // that does not leave of its end; no line tells one of a lease
+        // that left with its gateway yet: a stage that needs the calls is
+        // refused by name, never run on state half kept.
         let catalog = Arc::new(catalog.without_lifecycle());
         let mut listeners = Vec::with_capacity(config.listeners.len());
         for listener in &config.listeners {
@@ -430,7 +433,7 @@ impl Controller {
         );
         let (standing, stood) = watch::channel(Standing::default());
         let steps = stood.clone();
-        let journal = replication::journaled(&config.election.lease);
+        let journal = replication::journaled(&config.election.lease, config.decide_shards);
         let mut shared = Shared::new(
             config.controller_id.clone(),
             address.unwrap_or_default(),
@@ -445,7 +448,7 @@ impl Controller {
         let (phase, readiness) =
             readiness::channel(elector.fence(), steps, Arc::clone(&shared.lag));
         let shared = Arc::new(shared);
-        let probe = Arc::new(EngineProbe::new().map_err(Error::Probe)?);
+        let probe = Arc::new(EngineProbe::new());
         Ok(Self {
             config,
             catalog,
@@ -487,6 +490,22 @@ impl Controller {
             return Err(NoFollow::Lease);
         }
         following(&self.listeners)
+    }
+
+    /// Refuses a replica that follows a leader ([`Controller::follows`])
+    /// with its replication listener configured on port `0`: asked first
+    /// at the serve's start, before anything is served. Replicas are
+    /// configured alike, so a standby dials its leader at the port of its
+    /// own replication listener, and a number the host drew for this
+    /// replica is no other's. A replica that follows nobody keeps port
+    /// `0`.
+    fn names_its_port(&self) -> Result<(), ConfigError> {
+        match unnamed_port(&self.config.listeners) {
+            Some(name) if self.follows().is_ok() => {
+                Err(ConfigError::ReplicationPortUnnamed(name.to_owned()))
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Names `listener` one that takes its callers' identities as told
@@ -581,10 +600,18 @@ impl Controller {
     /// file by its number. A directory with no generation on file starts
     /// the controller with no document, until the first apply.
     ///
+    /// One controller holds the directory, under a lock on a file it keeps
+    /// there. A start beside another that holds it waits for that one to
+    /// stop, for the grace period at most ([`Config::shutdown_grace`]), and
+    /// reads the directory once it holds it: it runs that one's last apply.
+    ///
     /// Refused here, before anything serves ([`StoreRefused`]): a path that
-    /// leads to no directory, a directory that is not read, two files under
-    /// one number, a newest generation that does not run, a spec source
-    /// taken before this one, and a lease another replica can take
+    /// leads to no directory, a directory another controller still holds at
+    /// the end of that wait, one renamed under that wait, a lock the system
+    /// does not give, a directory with no lock file where the controller
+    /// may make none, a directory that is not read, two files under one
+    /// number, a newest generation that does not run, a spec source taken
+    /// before this one, and a lease another replica can take
     /// ([`LeasePlace`]). A standby does not follow an applied generation in
     /// this build, so a promoted one would run without it.
     pub async fn spec_store(&mut self, dir: impl Into<PathBuf>) -> Result<(), Error> {
@@ -596,24 +623,44 @@ impl Controller {
         if self.config.election.lease.is_shared() {
             return Err(refused(StoreRefused::BesideASharedLease));
         }
+        // Asked before the directory is: a first source may hold it, and a
+        // second one does not wait on this controller's own lock. The door
+        // refuses a second source under its lock all the same.
+        if self.shared.generations.bound() {
+            return Err(refused(StoreRefused::SecondSource));
+        }
         let generations = Arc::clone(&self.shared.generations);
+        let metrics = Arc::clone(&self.metrics);
+        let controller_id = self.config.controller_id.clone();
         let bound = {
             let path = path.clone();
-            tokio::task::spawn_blocking(move || generations.bind_store(SpecStore::open(path)?))
+            // A controller that stops lets the directory go inside its
+            // grace period: a start waits that long for one before it.
+            let wait = self.config.shutdown_grace;
+            // The bind, its line and its series are one step of the task:
+            // a caller that drops this call while the start waits leaves a
+            // store bound with both.
+            tokio::task::spawn_blocking(move || {
+                let store = SpecStore::open_within(path, wait)?;
+                // The line names the directory held: its path as resolved,
+                // the one the line of a wait names.
+                let held = store.dir().to_owned();
+                generations.bind_store(store)?;
+                info!(
+                    controller_id = %controller_id,
+                    path = %held.display(),
+                    generation = generations.generation(),
+                    "spec store"
+                );
+                metrics.spec(generations);
+                Ok(())
+            })
         };
         match bound.await {
-            Ok(Ok(())) => {}
-            Ok(Err(source)) => return Err(refused(source)),
-            Err(join) => return Err(Error::Task(join.to_string())),
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(source)) => Err(refused(source)),
+            Err(join) => Err(Error::Task(join.to_string())),
         }
-        info!(
-            controller_id = %self.config.controller_id,
-            path = %path.display(),
-            generation = self.shared.generations.generation(),
-            "spec store"
-        );
-        self.metrics.spec(Arc::clone(&self.shared.generations));
-        Ok(())
     }
 
     /// The store the ingestion drivers and the scopes' calls feed and read.
@@ -656,18 +703,22 @@ impl Controller {
     /// control listener that takes a principal: `SERVING` while this replica
     /// leads, so a client that checks the service's health by that name
     /// finds the leader's control listener. That word is told at every move
-    /// of the run loop and after every step of the election, so a fence that
-    /// closes between two steps reads `SERVING` until the next; a
-    /// registration call reads the fence itself and is refused in that
-    /// window. An open watch of the rows follows the same telling: it ends
-    /// `ABORTED` when this replica stops leading, an idle one at the next
-    /// step of the election. A lead can open between two steps, and a watch
-    /// admitted before the next one is ended by any telling that finds no
-    /// leader here, the drain's first.
+    /// of the run loop, after every step of the election and where the
+    /// fence's window opens or ends, so a fence that closes between two
+    /// steps is told as it closes; a registration call reads the fence
+    /// itself. An open watch of the rows follows the same telling: it ends
+    /// `ABORTED` when this replica stops leading, an idle one where the
+    /// fence closes. A lead opens between two steps, a moment before its
+    /// telling: a watch admitted in that moment is ended by any telling
+    /// that finds no leader here, the drain's first.
     ///
     /// A listener, an election thread or a deciding thread that ends before
     /// the shutdown ends the serve with its error, the other listeners
     /// closed.
+    ///
+    /// A replica that follows a leader with its replication listener
+    /// configured on port `0` is refused before anything is served
+    /// ([`ConfigError::ReplicationPortUnnamed`]).
     pub async fn serve(self, shutdown: impl Future<Output = ()>) -> Result<(), Error> {
         self.serve_until(shutdown, std::future::pending()).await
     }
@@ -680,6 +731,7 @@ impl Controller {
         shutdown: impl Future<Output = ()>,
         fault: impl Future<Output = Error>,
     ) -> Result<(), Error> {
+        self.names_its_port()?;
         let follows = self.follows();
         let Self {
             config,
@@ -774,9 +826,15 @@ impl Controller {
         // needs. The loop itself runs on every replica: it pays the store's
         // publications, so a followed row reaches the published world.
         let polls = follows.map(|_| shared.role.subscribe());
+        let fence = Arc::clone(&shared.fence);
         tasks.spawn(async move {
             match polls {
-                Some(polls) => driver.run_while(driver_stop, polls).await,
+                // The fence's term moves at a take alone: a word that
+                // reads `true` again under another term is another lead.
+                Some(polls) => {
+                    let led = move || fence.term();
+                    driver.run_while(driver_stop, polls, led).await;
+                }
                 None => driver.run(driver_stop).await,
             }
             Ok(())
@@ -803,6 +861,14 @@ impl Controller {
         let sweep_stop = stop.subscribe();
         tasks.spawn(async move {
             gateways.run(sweep_stop).await;
+            Ok(())
+        });
+        // The restores' clock: a leader lets go of a snapshot's cut whose
+        // standby took no part of it for the bound.
+        let restores = shared.replication.clone();
+        let restores_stop = stop.subscribe();
+        tasks.spawn(async move {
+            restores.run(restores_stop).await;
             Ok(())
         });
         if let Some(file) = spec_file {
@@ -988,10 +1054,10 @@ impl Controller {
 /// does not, where a door is told at the change alone. A take with no
 /// holder to wait for leads one renew deadline after its write, between
 /// two steps of the election: the fence admits a watch from that instant,
-/// and until the next step such a watch stands under the word that nobody
-/// leads here. The word told again ends it, the drain's included; told at
-/// the change alone, the drain would leave that watch open to the end of
-/// the grace period.
+/// and until the telling that instant wakes such a watch stands under the
+/// word that nobody leads here. The word told again ends it, the drain's
+/// included; told at the change alone, the drain would leave that watch
+/// open to the end of the grace period.
 async fn tell_role(
     mut role: Readiness,
     mut stop: watch::Receiver<bool>,
@@ -1000,7 +1066,8 @@ async fn tell_role(
 ) {
     let (mut last, mut left) = (None, false);
     loop {
-        let leads = !left && role.state() == State::Leader;
+        let (state, turn) = role.read();
+        let leads = !left && state == State::Leader;
         // The watches first: nothing is awaited between the read of the
         // fence and their word.
         if leads {
@@ -1027,7 +1094,7 @@ async fn tell_role(
         // same.
         tokio::select! {
             _ = stop.wait_for(|stop| *stop) => left = true,
-            moved = role.moved() => left = moved.is_none(),
+            moved = role.moved_by(turn) => left = moved.is_none(),
         }
     }
 }
@@ -1058,6 +1125,15 @@ impl NoFollow {
             }
         }
     }
+}
+
+/// The listener configured to serve the replication scope on port `0`, by
+/// its name.
+fn unnamed_port(listeners: &[Listener]) -> Option<&str> {
+    listeners
+        .iter()
+        .find(|listener| listener.scopes.contains(&Scope::Replication) && listener.addr.port() == 0)
+        .map(|listener| listener.name.as_str())
 }
 
 /// The port a standby dials its leader at, on the leader's own host: the
@@ -1096,7 +1172,7 @@ async fn tell_readiness(
 ) -> Infallible {
     let mut said = None;
     loop {
-        let (state, lapse) = role.read();
+        let (state, turn) = role.read();
         let ready = state.is_ready();
         if told != Some(ready) {
             let word = if ready {
@@ -1126,7 +1202,7 @@ async fn tell_readiness(
             }
             said = Some(ready);
         }
-        if !follows || role.moved_by(lapse).await.is_none() {
+        if !follows || role.moved_by(turn).await.is_none() {
             std::future::pending::<()>().await;
         }
     }
@@ -1162,15 +1238,21 @@ mod tests {
         deciders::{tests as bed, TERM_MARK},
         election::{self, Standing},
         following,
+        membership::tests::Logged,
         principal::Layer,
         readiness::{self, tests::fenced, Phase},
         standby::Lag,
-        tell_readiness, tell_role, Bound, Controller, Error, NoFollow, Scope,
+        tell_readiness, tell_role, unnamed_port, Bound, ConfigError, Controller, EngineProbe,
+        Error, NoFollow, Scope,
     };
     use crate::{
         elector::{
             ElectError, ElectionSettings, Elector, LeaseBackend, LeaseRecord, MemoryLease, Tick,
             Written,
+        },
+        ingest::{
+            loads::{LoadProbe, ReadError},
+            probe::unbuildable,
         },
         store::Kinds,
     };
@@ -1200,6 +1282,39 @@ mod tests {
         fn place(&self) -> String {
             self.lease.place()
         }
+    }
+
+    /// A controller with no engine to scrape builds no HTTP client: its
+    /// start reads no root certificate of the platform.
+    #[tokio::test]
+    async fn a_start_with_no_engine_to_scrape_builds_no_http_client() {
+        let controller = Controller::bind(valid()).await.expect("the listeners bind");
+        assert!(!controller.probe.http_built());
+    }
+
+    /// A probe whose client cannot be built says so once, as a warning
+    /// that names the controller's own client and no engine.
+    #[tokio::test]
+    async fn a_client_that_cannot_be_built_is_said_once_as_the_controllers_own() {
+        let lines = Logged::default();
+        let writer = lines.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _beside = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let _kept = tracing::subscriber::set_default(subscriber);
+        let probe = EngineProbe::building(unbuildable);
+        for _ in 0..3 {
+            let read = probe
+                .scrape("http://127.0.0.1:9", Duration::from_secs(1))
+                .await;
+            assert!(matches!(read, Err(ReadError::Client(_))), "{read:?}");
+        }
+        let said = String::from_utf8(lines.0.lock().clone()).expect("the lines");
+        assert_eq!(said.matches("could not be built").count(), 1, "{said}");
+        assert!(said.contains("WARN"), "{said}");
+        assert!(!said.contains("127.0.0.1"), "no engine is named: {said}");
     }
 
     /// Every socket the controller accepts sends at once, read from the
@@ -1682,9 +1797,15 @@ mod tests {
                 );
             }
             steps.send_replace(Standing::default());
-            // The lead opens by itself and the fence admits a watch. No step
-            // came since: the word the watch finds says that nobody leads.
-            tokio::time::sleep(settings.renew_deadline).await;
+            let mut first = role.clone();
+            first.changed().await.expect("the teller tells the step");
+            assert!(!*first.borrow());
+            // The lead opens by itself and the fence admits a watch. The
+            // teller sleeps to that instant: this thread, the runtime's
+            // one, is held across it with nothing awaited, so the opening
+            // is told to no one ahead of the read below. The word the watch
+            // finds says that nobody leads.
+            thread::sleep(settings.renew_deadline);
             assert_eq!(elector.fence().leader_term(Instant::now()), Some(1));
             let mut watch = role.clone();
             assert!(!*watch.borrow_and_update());
@@ -1797,6 +1918,42 @@ mod tests {
         assert_eq!(replica.follows().ok(), port);
         // Synced reads the configured poll interval, not the stock one.
         assert_eq!(replica.shared.lag.within(), Duration::from_secs(30));
+    }
+
+    #[tokio::test]
+    async fn a_replica_that_follows_is_refused_port_zero_before_it_serves() {
+        // The replication listener on port 0, by its name.
+        let mut config = valid();
+        assert_eq!(unnamed_port(&config.listeners), Some("replication"));
+        // A lease of its own: nobody dials this replica as a leader.
+        let mut alone = Controller::bind(valid()).await.expect("the listeners bind");
+        alone
+            .identity_as_told("replication")
+            .expect("a listener of the configuration");
+        assert_eq!(alone.names_its_port(), Ok(()));
+        // A shared lease: the replica follows once the listener takes its
+        // callers' names, and is refused there.
+        let dir = tempfile::tempdir().expect("a temp dir");
+        config.election.lease = election::LeasePlace::File(dir.path().join("lease"));
+        let mut replica = Controller::bind(config.clone())
+            .await
+            .expect("the listeners bind");
+        assert_eq!(replica.names_its_port(), Ok(()));
+        replica
+            .identity_as_told("replication")
+            .expect("a listener of the configuration");
+        let refused = ConfigError::ReplicationPortUnnamed("replication".to_owned());
+        assert_eq!(replica.names_its_port(), Err(refused.clone()));
+        // Its serve ends by that refusal, though no shutdown came.
+        match timeout(Duration::from_secs(10), replica.serve(pending())).await {
+            Ok(Err(Error::Config(told))) => assert_eq!(told, refused),
+            other => panic!("the refusal, not {other:?}"),
+        }
+        // A named port is kept.
+        for listener in &mut config.listeners {
+            listener.addr.set_port(30_100);
+        }
+        assert_eq!(unnamed_port(&config.listeners), None);
     }
 
     #[tokio::test]

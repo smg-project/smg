@@ -76,20 +76,21 @@
 //! and no standby follows an applied generation in this build: a store is
 //! bound only beside a lease in the process
 //! ([`Controller::spec_store`](super::Controller::spec_store)). One process
-//! holds a store's directory, and nothing holds two apart: a second one's
-//! write of a number on file is refused by name, and it takes no write
-//! until it starts again ([`SpecStore`]). A file in the store that is no
-//! document of this build is listed nowhere: the read call does not answer
-//! it. A digest is the applier's ([`Digest`]): it travels
-//! with its bytes, and a reader of another build does not recompute it to
-//! compare.
+//! holds a store's directory, under the store's own lock, as far as the
+//! file system's locks reach. Past them a second one's write of a number
+//! on file is refused by name, and it takes no write until it starts again
+//! ([`SpecStore`]). A file in the store that is no document of this build
+//! is listed nowhere: the read call does not answer it. A digest is the
+//! applier's ([`Digest`]): it travels with its bytes, and a reader of
+//! another build does not recompute it to compare.
 
 use std::{
     any::Any,
     cell::Cell,
     fmt,
+    fs::File,
     panic::{self, AssertUnwindSafe},
-    path::{Path, PathBuf},
+    path::Path,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, OnceLock,
@@ -949,10 +950,10 @@ pub(crate) struct Generations {
     /// store's directory is written under it alone. No reader takes it. It
     /// holds the spec store, once one is bound.
     applying: Mutex<Option<SpecStore>>,
-    /// The spec store's directory, once one is bound: the source takes
-    /// writes, and the read call reads a generation on file by this path,
-    /// under no lock of the door.
-    dir: OnceLock<PathBuf>,
+    /// The spec store's directory itself, open, once one is bound: the
+    /// source takes writes, and the read call reads a generation on file
+    /// through it, under no lock of the door.
+    dir: OnceLock<Arc<File>>,
     /// The generations on file under a spec store, ascending, as the read
     /// call answers them. Written under the door's lock, at the bind and at
     /// each write; a reader copies one entry out.
@@ -1198,7 +1199,7 @@ impl Generations {
         }
         *self.on_file.lock() = on_file;
         // Set once: a second bind is refused above, under the door's lock.
-        let _ = self.dir.set(dir.dir().to_owned());
+        let _ = self.dir.set(dir.root());
         *applying = Some(dir);
         Ok(())
     }
@@ -1540,7 +1541,7 @@ impl Generations {
             return Err(Unanswered::NotHeld(not_held));
         };
         let read =
-            tokio::task::spawn_blocking(move || spec_store::read_in(&dir, retained.persisted));
+            tokio::task::spawn_blocking(move || spec_store::read_at(&dir, retained.persisted));
         let unread = |why: String| Unanswered::Unread { generation, why };
         match read.await {
             Ok(Ok(document)) => Ok(proto::PolicySpecDocument {
@@ -1753,6 +1754,9 @@ pub(crate) mod tests {
                 dp_size: 1,
                 ..WorkerFacts::default()
             });
+            // The members are read under the lists at the build the join
+            // owes.
+            store.publish_now();
         };
         join("http://a:8000", "alpha");
         assert_eq!(store.outside_lists(), OutsideLists::default());
@@ -4018,6 +4022,13 @@ pub(crate) mod tests {
         generations.bind_store(opened).expect("the store binds");
     }
 
+    /// [`bind`] for a second door on a directory another holds, as a file
+    /// system whose locks do not hold between two hosts lets one in.
+    fn bind_beside(generations: &Generations, dir: &Path) {
+        let opened = SpecStore::open_beside(dir.to_owned()).expect("the directory opens");
+        generations.bind_store(opened).expect("the store binds");
+    }
+
     /// A door with a spec store bound over a new, empty directory.
     fn stored() -> (tempfile::TempDir, Arc<MemoryStore>, Arc<Generations>) {
         let dir = tempfile::tempdir().expect("a temp dir");
@@ -4311,18 +4322,20 @@ pub(crate) mod tests {
 
     #[test]
     fn a_door_takes_one_source() {
-        let (dir, _store, generations) = stored();
-        let again = SpecStore::open(dir.path().to_owned()).expect("the directory opens");
+        let (_dir, _store, generations) = stored();
+        // A second store, on a directory of its own: the door holds its
+        // first one's.
+        let other = tempfile::tempdir().expect("a temp dir");
+        let open = || SpecStore::open(other.path().to_owned()).expect("the directory opens");
         assert_eq!(
-            generations.bind_store(again),
+            generations.bind_store(open()),
             Err(StoreRefused::SecondSource)
         );
 
         // A file's document applied first is a source too.
         let (_store, filed) = self::generations();
         assert_eq!(yaml(&filed, LEAST_LOAD), Ok(Applied::Generation(1)));
-        let store = SpecStore::open(dir.path().to_owned()).expect("the directory opens");
-        assert_eq!(filed.bind_store(store), Err(StoreRefused::SecondSource));
+        assert_eq!(filed.bind_store(open()), Err(StoreRefused::SecondSource));
         assert!(!filed.writable());
 
         // And a file's document is not applied beside a store.
@@ -4533,7 +4546,10 @@ pub(crate) mod tests {
     fn two_doors_on_one_directory_do_not_both_run_one_number() {
         for round in 0..20 {
             let dir = tempfile::tempdir().expect("a temp dir");
-            let doors = [LEAST_LOAD, RANDOM].map(|document| {
+            // The second door is a writer the directory's lock did not keep
+            // out.
+            let binds = [bind as fn(&Generations, &Path), bind_beside];
+            let doors = [(LEAST_LOAD, binds[0]), (RANDOM, binds[1])].map(|(document, bind)| {
                 let (store, generations) = generations();
                 bind(&generations, dir.path());
                 (store, generations, document)
@@ -4563,6 +4579,8 @@ pub(crate) mod tests {
             let on_file = std::fs::read(dir.path().join(name_of(1, "yaml"))).expect("the file");
             assert_eq!(on_file, won.2.as_bytes());
 
+            // The two are gone, as their processes are at the next start.
+            drop(doors);
             let (store, again) = generations();
             bind(&again, dir.path());
             assert_eq!(standing(&store), (1, Some(digest)));
@@ -4910,11 +4928,37 @@ pub(crate) mod tests {
         };
         assert_eq!(not_held.on_file, Some(two));
 
+        // The door is gone, as its process is at the next start.
+        drop(generations);
         let (_store, again) = self::generations();
         bind(&again, dir.path());
         let again = Arc::new(again);
         assert_eq!(again.read(1).await.expect("on file"), old);
         assert_eq!(again.read(2).await.expect("on file"), stands);
+    }
+
+    /// The read call reads a generation on file through the directory the
+    /// store opened. Where the path leads to another directory before the
+    /// door takes the store, the answer is still the held file's bytes,
+    /// not the other's under that name.
+    #[tokio::test]
+    async fn the_read_call_reads_the_directory_held_where_the_path_leads_elsewhere() {
+        let base = tempfile::tempdir().expect("a temp dir");
+        let (dir, moved) = (base.path().join("store"), base.path().join("moved"));
+        std::fs::create_dir(&dir).expect("the directory");
+        std::fs::write(dir.join(name_of(1, "yaml")), LEAST_LOAD).expect("the first");
+        std::fs::write(dir.join(name_of(2, "yaml")), RANDOM).expect("the second");
+        let opened = SpecStore::open(dir.clone()).expect("the directory opens");
+        std::fs::rename(&dir, &moved).expect("the directory moves");
+        std::fs::create_dir(&dir).expect("another stands at its path");
+        std::fs::write(dir.join(name_of(1, "yaml")), "other").expect("the other's own");
+        let (_store, generations) = generations();
+        generations.bind_store(opened).expect("the store binds");
+        let old = generations.read(1).await.expect("on file");
+        assert_eq!(
+            (old.generation, old.document.as_slice()),
+            (1, LEAST_LOAD.as_bytes())
+        );
     }
 
     /// An older file that is no document of this build stays on file and is

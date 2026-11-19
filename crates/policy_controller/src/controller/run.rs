@@ -63,7 +63,7 @@ struct Cli {
     /// a shared lease a replica that does not lead follows its leader: it
     /// dials the leader's advertised host at this port, so every replica
     /// listens on the same one, and the listener takes identities as told
-    /// in the clear
+    /// in the clear. A replica that follows is refused port 0
     #[arg(long, default_value = DEFAULT_REPLICATION_LISTEN, help_heading = "Listeners")]
     replication_listen: SocketAddr,
 
@@ -197,11 +197,14 @@ struct Cli {
     /// serves it, its lease in the process: beside a lease another
     /// replica can take the start is refused, since a standby does not
     /// follow an applied generation in this build. One process holds the
-    /// directory, and nothing holds two apart: one that started before
-    /// another's last apply runs the generation it started with, and
-    /// refuses each apply by name until it starts again. The directory
-    /// stands on a file system that links: a generation's file is linked
-    /// under its name
+    /// directory, under a lock on a file it makes there: a start that
+    /// cannot make that file is refused, and one that finds it held waits
+    /// for its holder to stop, refused where it is still held at the end
+    /// of the grace period. The directory stands on a file system that
+    /// links and locks: a generation's file is linked under its name.
+    /// Where the locks do not reach a second host, a process there that
+    /// started before another's last apply runs the generation it started
+    /// with, and refuses each apply by name until it starts again
     #[arg(long, value_name = "DIR", help_heading = "Policy Spec")]
     spec_store: Option<PathBuf>,
 
@@ -212,7 +215,9 @@ struct Cli {
     shutdown_settle_secs: u64,
 
     /// Seconds a shutdown may take in all, the settle window included; the
-    /// listeners close with their streams when it runs out
+    /// listeners close with their streams when it runs out. A start on a
+    /// spec store that another controller holds waits as long for that one
+    /// to stop
     #[arg(long, default_value_t = Config::DEFAULT_SHUTDOWN_GRACE.as_secs(), help_heading = "Shutdown")]
     shutdown_grace_period_secs: u64,
 
@@ -640,7 +645,8 @@ mod tests {
     use crate::{
         catalog::Catalog,
         controller::{
-            Config, ConfigError, Election, Error, LeasePlace, Scope, SpecRejected, StoreRefused,
+            membership::tests::Logged, spec_store::SpecStore, Config, ConfigError, Controller,
+            Election, Error, LeasePlace, Scope, SpecRejected, StoreRefused,
         },
         elector::ElectionSettings,
         spec::SpecError,
@@ -1432,18 +1438,73 @@ mod tests {
 
     /// A command line that names neither source is the state the parser
     /// rules out. Past the parser it has no source, and the start refuses
-    /// it before a runtime is built.
+    /// it before a runtime is built, in the refusal's own words: the case
+    /// reads the line the start wrote, on its own thread.
     #[test]
     fn a_command_line_past_the_parser_with_no_spec_source_is_refused() {
         let mut cli = parse(&[]);
         cli.spec_store = None;
         assert_eq!(cli.spec_source(), None);
-        assert_eq!(super::run_with(cli, Catalog::builtin()), ExitCode::FAILURE);
+        // The case's own subscriber keeps this thread's lines, a second one
+        // registered beside it, as in the door's audit case.
+        let lines = Logged::default();
+        let writer = lines.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _beside = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let code = tracing::subscriber::with_default(subscriber, || {
+            super::run_with(cli, Catalog::builtin())
+        });
+        assert_eq!(code, ExitCode::FAILURE);
+        let said = String::from_utf8(lines.0.lock().clone()).expect("the lines are text");
+        assert!(
+            said.contains("start refused")
+                && said
+                    .contains("no spec source is named: a start takes --spec-file or --spec-store"),
+            "{said}"
+        );
+    }
+
+    /// A caller that drops the spec store call while its start waits on a
+    /// held directory leaves the task to bind the store once the holder
+    /// lets go: its series are bound with it, and a second call is refused
+    /// as a second source.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_spec_store_call_that_binds_later_leaves_its_series() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let holder = SpecStore::open(dir.path().to_owned()).expect("the holder");
+        let config = parse(&EPHEMERAL).config().expect("the flags are in order");
+        let mut controller = Controller::bind_with(config, Catalog::builtin())
+            .await
+            .expect("the controller binds");
+        let call = controller.spec_store(dir.path().to_owned());
+        let dropped = tokio::time::timeout(Duration::from_millis(200), call).await;
+        assert!(dropped.is_err(), "the call waits on the held directory");
+        drop(holder);
+        let bound = async {
+            while !controller.metrics.spec_bound() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), bound)
+            .await
+            .expect("the task binds the store with its series");
+        assert!(controller.shared.generations.bound());
+        match controller.spec_store(dir.path().to_owned()).await {
+            Err(Error::SpecStore {
+                source: StoreRefused::SecondSource,
+                ..
+            }) => {}
+            other => panic!("a second source: {other:?}"),
+        }
     }
 
     /// A spec store starts the controller on the newest generation on file,
     /// under that file's number; a path that leads to no directory refuses
-    /// the start by name; and a controller that took a store takes no file.
+    /// the start by name; and a controller that took a store takes no file
+    /// and no second store, refused at once on the directory it holds.
     #[tokio::test]
     async fn a_spec_store_starts_on_its_newest_generation() {
         let dir = tempfile::tempdir().expect("a directory");
@@ -1465,6 +1526,13 @@ mod tests {
         match controller.spec_file(file.clone()).await {
             Err(Error::SpecFile {
                 source: SpecRejected::SecondSource,
+                ..
+            }) => {}
+            other => panic!("a second source: {other:?}"),
+        }
+        match controller.spec_store(store.clone()).await {
+            Err(Error::SpecStore {
+                source: StoreRefused::SecondSource,
                 ..
             }) => {}
             other => panic!("a second source: {other:?}"),

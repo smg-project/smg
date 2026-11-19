@@ -23,6 +23,8 @@
 mod common;
 #[path = "common/placed.rs"]
 mod placed;
+#[path = "common/preset.rs"]
+mod preset;
 
 use std::hint::black_box;
 
@@ -32,12 +34,11 @@ use criterion::{
     Throughput,
 };
 use placed::page_start_buffer;
+use preset::SIZES;
 use smg_policy_controller::{
-    Constraints, Decision, Identity, Lease, Lifecycle, ModelFingerprint, PolicySpec, PoolFacts,
-    RequestFacts, Scratch, Side, Target, PRESETS,
+    Constraints, Decision, Identity, Lease, Lifecycle, Lifted, ModelFingerprint, PolicySpec,
+    PoolFacts, RequestFacts, Scratch, Side, Target, PRESETS,
 };
-
-const SIZES: [usize; 3] = [8, 64, 512];
 
 fn view_build(c: &mut Criterion) {
     let mut group = c.benchmark_group("policy_engine/view_build");
@@ -63,37 +64,10 @@ fn decide(c: &mut Criterion) {
     let mut group = c.benchmark_group("policy_engine/decide");
     // The `bucket` preset's rows stand in the `bucket` bench target with the
     // rest of its cells. This binary runs at its gate's bound, and a preset
-    // more here is three rows more in every pull request's gate.
-    for &preset in PRESETS.iter().filter(|&&preset| preset != "bucket") {
-        let engine = engine_of(preset);
-        for &n in &SIZES {
-            let fleet = fleet(n);
-            let mut view = Vec::with_capacity(n);
-            build_view(&fleet, &mut view);
-            let mut scratch = Scratch::new();
-            let pool = PoolFacts {
-                pool_size: n as u32,
-                generation: 1,
-                // Every row of the bench's fleet reports a rate.
-                rated: true,
-                ..PoolFacts::default()
-            };
-            let cx = Constraints::default();
-            group.bench_with_input(BenchmarkId::new(preset, n), &n, |b, _| {
-                let mut seed = 0u64;
-                b.iter(|| {
-                    seed += 1;
-                    let facts = RequestFacts {
-                        model: "m",
-                        prompt_tokens: 512,
-                        seed,
-                        now_micros: 1_000_000,
-                        ..RequestFacts::default()
-                    };
-                    engine.decide(&facts, &pool, black_box(&view), &cx, &mut scratch)
-                });
-            });
-        }
+    // more here is three rows more in every pull request's gate. The two
+    // binaries build a preset's rows by one body (`common/preset.rs`).
+    for &name in PRESETS.iter().filter(|&&name| name != "bucket") {
+        preset::rows(&mut group, name);
     }
     // The least-load decision with one dispatch credit per row in the tally,
     // as between two reports under load: every decision reads and ages each
@@ -172,7 +146,7 @@ fn decide(c: &mut Criterion) {
         };
         let steers = matches!(
             engine.decide(&asked, &pool, &view, &cx, &mut scratch),
-            Decision::Pick(_)
+            Decision::Pick(pick) if pick.trace.lifted == Lifted::Overload
         );
         if !steers {
             continue;
