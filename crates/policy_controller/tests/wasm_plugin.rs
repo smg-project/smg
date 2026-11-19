@@ -4934,8 +4934,8 @@ fn one_window_of_short_holds(name: &str, arm: bool) -> (Arc<Plugin>, bool, bool)
         let arming = arm && seed == 0;
         let (fuel, traps, spent) = ran_out();
         let faulted = (fuel, traps) != (before.0, before.1);
-        let spent = spent != before.2 && !arming;
-        if faulted || spent {
+        let budget_gone = spent != before.2 && !arming;
+        if faulted || budget_gone {
             if arming || off_the_cpu < late {
                 by_the_host += 1;
             } else {

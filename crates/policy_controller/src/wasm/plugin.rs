@@ -846,7 +846,9 @@ struct Standing {
     lent: Option<Decider>,
     /// The decision whose open brought that state or checked the hold, by
     /// its number on this thread, zero where none did: its later opens take
-    /// the hold as theirs.
+    /// the hold as theirs. No later decision takes that number here: the
+    /// thread's count rises by one a decision, and a thread that takes an
+    /// exited thread's place takes its count with it ([`OpenDecisions`]).
     checked: u64,
 }
 
