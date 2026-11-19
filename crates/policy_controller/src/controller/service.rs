@@ -817,8 +817,8 @@ impl PolicyController for Service {
     /// field refused by its name, the spec slice of a controller with no
     /// spec source among them, and a refused request takes no turn. One
     /// snapshot is taken at a time, off the runtime's workers
-    /// ([`snapshot::Turn`]), from the feed's cut at the log's head, which a
-    /// watch's start shares. The lead is read again behind that wait: the
+    /// ([`snapshot::Turn`]), and its rows come by one of the roads of
+    /// [`snapshot::read`]. The lead is read again behind that wait: the
     /// answer is told while this replica still leads the term the call was
     /// admitted under. A standby is restored on its `Replicate` stream,
     /// never from this call.
@@ -3334,12 +3334,13 @@ mod tests {
         assert_eq!(refused.code(), Code::Unavailable);
     }
 
-    /// A snapshot reads the rows as a watch's start does. It shares the
-    /// cut the feed keeps at the log's head and keeps the one it takes, so
-    /// calls one behind another copy the rows once a write, and the call
-    /// behind a write tells it. The last call out lets the cut go where no
-    /// watch is open: a lone call's cut goes with it, and a call beside
-    /// another that is let in keeps it for that one.
+    /// A snapshot that states no limit and no models reads the rows as a
+    /// watch's start does. It shares the cut the feed keeps at the log's
+    /// head and keeps the one it takes, so calls one behind another copy
+    /// the rows once a write, and the call behind a write tells it. The
+    /// last call out lets the cut go where no watch is open: a lone call's
+    /// cut goes with it, and a call beside another that is let in keeps it
+    /// for that one.
     #[tokio::test]
     async fn a_snapshot_shares_the_feeds_cut_and_keeps_none_with_no_watch_open() {
         use proto::snapshot_request::Slice;
@@ -3355,7 +3356,7 @@ mod tests {
                 .workers
                 .len()
         };
-        // No watch is open: a lone call takes no cut of every row.
+        // No watch is open: the lone call's cut goes with it.
         assert_eq!(told().await, 0);
         assert!(feed.kept().is_none(), "no reader can share the cut");
 
@@ -3423,11 +3424,13 @@ mod tests {
         assert!(feed.kept().is_none(), "no watch can share the cut");
     }
 
-    /// A lone call with no watch open takes no cut of every row: nobody
-    /// could share one, so it reads the rows it may tell. Beside another
-    /// call it takes the cut the two share, once.
+    /// A lone call with no watch open that states a limit or its models
+    /// takes no cut of every row: it reads the rows it may tell. One that
+    /// states neither would copy every row anyway, so it takes the feed's
+    /// cut, which a call let in while it runs shares. Beside another call
+    /// each takes the cut the two share, once.
     #[tokio::test]
-    async fn a_lone_snapshot_takes_no_cut_of_every_row() {
+    async fn a_lone_snapshot_takes_a_cut_only_where_it_tells_every_row() {
         use proto::snapshot_request::Slice;
 
         let (_elector, _standing, control) = electing(true);
@@ -3459,14 +3462,16 @@ mod tests {
             (answer.workers.len(), answer.truncated)
         };
         assert_eq!(told(1).await, (1, true));
+        assert_eq!(feed.cuts(), 0, "a lone call for one row copied every row");
         assert_eq!(told(0).await, (3, false));
-        assert_eq!(feed.cuts(), 0, "a lone call copied every row");
+        assert_eq!(feed.cuts(), 1, "a call for every row takes the cut");
+        assert!(feed.kept().is_none(), "no reader can share the cut");
 
         // Another call is let in beside it: one cut, and both calls share it.
         let beside = control.shared.snapshots.place();
         assert_eq!(told(1).await, (1, true));
         assert_eq!(told(0).await, (3, false));
-        assert_eq!(feed.cuts(), 1, "one copy for the calls let in");
+        assert_eq!(feed.cuts(), 2, "one copy for the calls let in");
         drop(beside);
     }
 

@@ -1262,9 +1262,11 @@ async fn snapshots_numbers(workers: u32) {
 /// bound cut them, the answer's bytes, how long the call takes over the
 /// wire (the store's cut, the rows' build, the client's read), and how long
 /// the store's cut takes alone: what a membership write waits behind a
-/// snapshot that copies, whatever its limit. A last line, with a watch
-/// open: one row asked eleven times, where each call shares the cut the
-/// feed keeps and copies nothing.
+/// snapshot that copies every row, as a call with no limit and no models
+/// does, and a call let in beside another. A lone call under a limit
+/// copies its limit's worth alone. A last line, with a watch open: one row
+/// asked eleven times, where each call shares the cut the feed keeps and
+/// copies nothing.
 async fn operators_snapshot_numbers(workers: u32) {
     let dir = tempfile::tempdir().expect("a temp dir");
     with_leader(shared(&dir), |leader| async move {
