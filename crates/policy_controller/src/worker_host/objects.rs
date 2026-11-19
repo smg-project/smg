@@ -93,6 +93,9 @@ struct Held {
 /// The holder is the registry's one writer: an object any other writer left
 /// under a row's URL is replaced by the row's.
 ///
+/// A row takes the place of its own object alone: an object another row
+/// holds under its URL is dropped first.
+///
 /// The registry numbers its own objects, so an object's id is not its row's.
 /// The holder keeps the two together ([`Self::standing`], [`Self::object`]).
 /// An object's entry is written before the registry tells of the object, at
@@ -303,7 +306,9 @@ impl<G: Generation> Objects<G> {
 
     /// Build `row`'s object and put it in the registry: registered under a
     /// new id where the row's URL holds no object, else in the place of the
-    /// one that stands there, under its id and with its running state.
+    /// one that stands there, under its id and with its running state. An
+    /// object another row holds under the URL is dropped first: a row takes
+    /// the place of its own object alone.
     fn lay(&self, row: &WorkerRow) {
         let built: Arc<dyn Worker> = match &self.connector {
             Some(connector) => {
@@ -313,7 +318,13 @@ impl<G: Generation> Objects<G> {
         };
         // The id first, then the entry, then the registry's write: its
         // event finds the entry.
-        let id = self.registry.reserve_id_for_url(&row.facts.key);
+        let mut id = self.registry.reserve_id_for_url(&row.facts.key);
+        // A store restored inside a read can show a key's new incarnation
+        // before any change says the old one left.
+        if let Some(other) = self.standing(&id).filter(|other| other.row != row.id) {
+            self.end(other.row);
+            id = self.registry.reserve_id_for_url(&row.facts.key);
+        }
         {
             let mut entries = self.held.write();
             entries.objects.insert(row.id, id.clone());
@@ -380,6 +391,20 @@ mod tests {
     /// One write of a replica's store, under the name a failure says.
     type Write<'a> = (&'a str, &'a dyn Fn(&Replica));
 
+    /// What a registry told since the last read of `events`, in its order.
+    fn told(events: &mut Receiver<WorkerEvent>) -> Vec<(&'static str, ObjectId)> {
+        let mut told = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            told.push(match event {
+                WorkerEvent::Registered { worker_id, .. } => ("registered", worker_id),
+                WorkerEvent::Replaced { worker_id, .. } => ("replaced", worker_id),
+                WorkerEvent::Removed { worker_id, .. } => ("removed", worker_id),
+                WorkerEvent::StatusChanged { worker_id, .. } => ("status", worker_id),
+            });
+        }
+        told
+    }
+
     /// One replica: its store, its holder, and what its registry tells.
     struct Replica {
         store: MemoryStore,
@@ -404,16 +429,7 @@ mod tests {
 
         /// What the registry told since the last call, in its order.
         fn told(&mut self) -> Vec<(&'static str, ObjectId)> {
-            let mut told = Vec::new();
-            while let Ok(event) = self.events.try_recv() {
-                told.push(match event {
-                    WorkerEvent::Registered { worker_id, .. } => ("registered", worker_id),
-                    WorkerEvent::Replaced { worker_id, .. } => ("replaced", worker_id),
-                    WorkerEvent::Removed { worker_id, .. } => ("removed", worker_id),
-                    WorkerEvent::StatusChanged { worker_id, .. } => ("status", worker_id),
-                });
-            }
-            told
+            told(&mut self.events)
         }
 
         fn at(&self, url: &str) -> Arc<dyn Worker> {
@@ -735,11 +751,13 @@ mod tests {
         assert_eq!(replica.told().len(), 1);
     }
 
-    /// A store that takes one more registration the first time a row is
-    /// read of it: a write that lands while a read works.
+    /// A store that takes a write while a read of it works: one more
+    /// registration the first time a row is read of it, and before its tail
+    /// is read another store's rows whole with one label write over a row.
     struct Late {
         store: MemoryStore,
         late: Mutex<Option<WorkerFacts>>,
+        turn: Mutex<Option<(MemoryStore, WorkerId)>>,
     }
 
     impl WorkersStore for Late {
@@ -789,7 +807,16 @@ mod tests {
             self.store.snapshot()
         }
 
+        fn history(&self) -> u64 {
+            self.store.history()
+        }
+
         fn changes_since(&self, epoch: u64) -> MembershipTail {
+            if let Some((other, row)) = self.turn.lock().take() {
+                assert!(self.store.restore_from(other.cut(Kinds::Watched)));
+                let revision = self.store.get(row).expect("the row").revision;
+                assert!(self.store.patch(row, labels("gold"), revision).is_some());
+            }
             self.store.changes_since(epoch)
         }
     }
@@ -801,6 +828,7 @@ mod tests {
         let store = Late {
             store: MemoryStore::new(),
             late: Mutex::new(None),
+            turn: Mutex::new(None),
         };
         objects.follow(&store);
         store.upsert(facts(A, 1));
@@ -809,6 +837,47 @@ mod tests {
         assert!(registry.get_by_url(A).is_some());
         assert!(registry.get_by_url(B).is_some(), "the late row");
         assert_eq!(objects.len(), 2);
+    }
+
+    /// A restore that lands between a read of the store's history and the
+    /// read of its tail: the tail names a key's new incarnation, and no
+    /// change said the old one left.
+    #[test]
+    fn a_restore_inside_a_read_never_puts_a_new_incarnation_in_the_old_ones_place() {
+        let registry = Arc::new(WorkerRegistry::<Members>::new());
+        let mut events = registry.subscribe_events();
+        let objects = Objects::new(Arc::clone(&registry));
+        let store = Late {
+            store: MemoryStore::new(),
+            late: Mutex::new(None),
+            turn: Mutex::new(None),
+        };
+        let old = store.upsert(facts(A, 1)).id();
+        objects.follow(&store);
+        let before = objects.object(old).expect("the old one's object");
+        registry.get(&before).expect("a worker").increment_load();
+        told(&mut events);
+
+        let other = MemoryStore::new();
+        let new = other.upsert(facts(A, 2)).id();
+        assert_eq!(other.epoch(), store.epoch());
+        *store.turn.lock() = Some((other, new));
+        objects.follow(&store);
+
+        assert_eq!(objects.object(old), None);
+        let after = objects.object(new).expect("the new one's object");
+        assert_ne!(before, after);
+        assert_eq!(registry.get(&after).expect("a worker").load(), 0);
+        let seen = told(&mut events);
+        let first = seen.first().expect("an event");
+        assert_eq!(
+            *first,
+            ("removed", before),
+            "the old one's object leaves first"
+        );
+        let rest = seen.iter().skip(1);
+        assert!(rest.clone().count() > 0 && rest.clone().all(|(_, object)| *object == after));
+        assert_eq!((objects.len(), registry.len()), (1, 1));
     }
 
     /// The holder is the registry's one writer.
