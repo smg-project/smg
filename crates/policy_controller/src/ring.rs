@@ -867,6 +867,11 @@ impl Scorer for ConsistentHash {
         "consistent-hash"
     }
 
+    // Places by the ring. An owner over its bound of requests in flight is passed over.
+    fn refuses_by_reports(&self) -> bool {
+        false
+    }
+
     /// The ring places a request that carries a routing key by its walk
     /// alone: under the prefix form too, where a routing key leads the
     /// prefix. The bounded-load rule reads every survivor's count, and a

@@ -883,7 +883,7 @@ impl Deciding {
         // a key its own table holds no pin of, as after an apply of a new
         // generation.
         let pins = StorePins { store, now };
-        let taken = taken.lent(&pins);
+        let taken = taken.lent(&pins).placed(self.working.as_ref());
         let (buffers, own) = (&mut self.buffers, counts.part(self.index));
         // One load of the world for the decision and for its lease: the
         // lease books the count that load laid beside its target's row,
@@ -1046,6 +1046,7 @@ impl<'a> Taken<'a, Checked> {
             now,
             left,
             pins: None,
+            place: None,
         })
     }
 
@@ -1055,6 +1056,11 @@ impl<'a> Taken<'a, Checked> {
             pins: Some(pins),
             ..self
         }
+    }
+
+    /// The request with its decider's place at the leases' files.
+    fn placed(self, place: Option<&'a AtWork>) -> Self {
+        Self { place, ..self }
     }
 
     /// The time since the request was taken at `later`, a read of the
@@ -2958,6 +2964,233 @@ pub(crate) mod tests {
         }
     }
 
+    /// [`Seen`], as a stage that says it may refuse by a report of
+    /// leases.
+    #[derive(Debug)]
+    struct Counted(Seen);
+
+    impl Lifecycle for Counted {}
+
+    impl Picker for Counted {
+        fn name(&self) -> &'static str {
+            self.0.name()
+        }
+
+        fn pick(
+            &self,
+            facts: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            scores: &[f32],
+            band: TieBand,
+            out: &mut Targets,
+        ) {
+            self.0.pick(facts, candidates, kept, scores, band, out);
+        }
+
+        fn refuses_by_reports(&self) -> bool {
+            true
+        }
+    }
+
+    /// The `random` preset as generation 1 with the case's picker in its
+    /// profile's pick: a picker that keeps what each decision reads in
+    /// `rows`, made by `stage`.
+    fn seeing<P: Picker + 'static>(
+        rows: &Arc<Mutex<Vec<SeenRows>>>,
+        stage: impl Fn(Seen) -> P + Send + Sync + 'static,
+    ) -> AppliedSpec {
+        let kept = Arc::clone(rows);
+        picking("seen", move || {
+            let rows = Arc::clone(&kept);
+            Box::new(stage(Seen { rows }))
+        })
+    }
+
+    /// A decision under a stage that may refuse by a report of leases
+    /// reads a completion its gateway reported of a lease on another
+    /// decider's file. That decider waits for a job with its watch over
+    /// the file, so the frames were left in its ring; the deciding thread
+    /// applies them before it reads its rows. The two models are taken by
+    /// two deciders and served by the same members.
+    #[tokio::test]
+    async fn a_decision_whose_stage_may_refuse_by_reports_applies_what_waits_at_the_other_files() {
+        use crate::controller::lifecycle::tests::{a_completed, a_dispatched};
+
+        let rows = Arc::new(Mutex::new(Vec::new()));
+        let mut bed = bed(Some(seeing(&rows, Counted)), true, (2, 8), []);
+        let models = a_model_each(&bed.deciders, 2);
+        let served: Vec<&str> = models.iter().map(String::as_str).collect();
+        for name in ["s0", "s1", "s2"] {
+            serving(&bed.store, name, &served, Role::Single, WireModes::NONE);
+        }
+        let hand = lifecycle::open(&bed.store, GATEWAY);
+        let answer = bed.ask(frame_for(&models[0], 1, 1)).await;
+        let lease = lease_of(&answer).id;
+        // The first model's decider waits for a job on its watch over the
+        // lease.
+        watching(&bed, 1).await;
+        let at = Instant::now();
+        lifecycle::dispatched(&bed.store, &hand, &a_dispatched(lease), at)
+            .expect("the frame reads");
+        lifecycle::completed(&bed.store, &hand, &a_completed(lease, picked(&answer)), at)
+            .expect("the frame reads");
+        // The other model's decision, at the other file, right behind the
+        // completion: it reads no request in flight.
+        bed.ask(frame_for(&models[1], 2, 1)).await;
+        let rows = rows.lock();
+        let read: u32 = rows[1].iter().map(|(count, _)| count).sum();
+        assert_eq!(read, 0, "{rows:?}");
+    }
+
+    /// Two leases on the second file of `store`, booked on `member`, under
+    /// the watch of that file's place, and the release of the first handed
+    /// and left in the file's ring. The place is the case's own, so no
+    /// decider's look applies the frame: its next look says whether the
+    /// frame still waited ([`Watch::Fed`]) or was applied meanwhile
+    /// ([`Watch::Quiet`]).
+    fn a_frame_under_the_second_files_watch(
+        store: &Arc<MemoryStore>,
+        member: WorkerId,
+    ) -> crate::store::AtWork {
+        use crate::{
+            decider::Decider,
+            lease::ReleaseReason,
+            store::{Hand, Said, Watch},
+        };
+
+        let now = Instant::now();
+        let _acting = Decider::new(1).enter();
+        let mut place = store.at_work();
+        let issue = |request| {
+            let record = crate::store::LeaseRecord {
+                lease: Lease::default(),
+                gateway: GATEWAY,
+                request,
+                target: member,
+                picked: crate::store::Picked::default(),
+                decode: None,
+                term: 1,
+                issued_at: now,
+                dispatch_deadline: now + DISPATCH_TTL,
+                state: LeaseState::ISSUED,
+            };
+            let booked = store.world().booked_of(member);
+            let issued = store.issue_decided(record, booked, |_| ());
+            issued.expect("minted under the store's term").id
+        };
+        let first = issue(1);
+        issue(2);
+        assert_eq!(place.look(), Watch::Quiet, "two leases stand on its file");
+        let gone = Said::Released(None, ReleaseReason::ClientGone);
+        store.hand(&Hand::new(GATEWAY), first, gone);
+        place
+    }
+
+    /// A decision whose stages refuse by no report reads no place, though
+    /// its decider lent one: a frame left under another file's watch
+    /// stays there for that file's thread, and the decision takes no
+    /// turn at it.
+    #[test]
+    fn a_decision_whose_stages_refuse_by_no_report_applies_nothing_at_the_other_files() {
+        use crate::{decider::Decider, store::Watch};
+
+        const SPOKEN: &str = "model-http";
+        let store = Arc::new(MemoryStore::new().with_deciders(2));
+        store
+            .apply(preset("random", 1))
+            .expect("above the unbound start");
+        let member = ready(&store, "h0", SPOKEN, Role::Single, WireModes::HTTP);
+        LeasesStore::set_term(&*store, 1);
+        let mut watch = a_frame_under_the_second_files_watch(&store, member);
+        // The first file's decision, its place lent, under the preset's
+        // stages: each says it refuses by no report.
+        let _acting = Decider::new(0).enter();
+        let place = store.at_work();
+        let request = checked(frame_for(SPOKEN, 1, 1));
+        let now = Instant::now();
+        let taken = Taken::at(&request, GATEWAY, now, now).expect("budget is left");
+        let taken = taken.placed(Some(&place));
+        let mut buffers = Buffers::default();
+        let handed = store.deciding(|world| {
+            hand(
+                world,
+                &taken,
+                &mut buffers,
+                &AtomicU64::new(0),
+                |_, _, rows, _, _| rows.len(),
+            )
+            .0
+        });
+        assert_eq!(handed, 1, "the decision was handed its row");
+        assert_eq!(
+            watch.look(),
+            Watch::Fed,
+            "the frame waited for its file's look"
+        );
+    }
+
+    /// A pair's one decision applies what waits at the other files where
+    /// a stage of either side may refuse by a report, as a single's does:
+    /// the pair builds its own rows, so the apply is its own. Under the
+    /// same plan with stages that refuse by no report it reads no place,
+    /// and the frame waits for its file's look.
+    #[test]
+    fn a_pairs_decision_applies_what_waits_where_a_stage_of_either_side_may_refuse() {
+        use crate::{decider::Decider, store::Watch};
+
+        let waited = |prefill: &str, decode: &str| {
+            let rows = Arc::new(Mutex::new(Vec::new()));
+            let mut catalog = Catalog::builtin();
+            let counted = move || -> Box<dyn Picker> {
+                let rows = Arc::clone(&rows);
+                Box::new(Counted(Seen { rows }))
+            };
+            catalog.picker("seen", counted).expect("a free name");
+            let document = r#"{
+              "apiVersion": "smg.policy/v1",
+              "generation": 1,
+              "profiles": {
+                "p": { "pick": "PREFILL" },
+                "d": { "pick": "DECODE" }
+              },
+              "bindings": [
+                { "match": { "phase": ["prefill", "decode"] }, "plan": "pd-pair",
+                  "profiles": { "prefill": "p", "decode": "d" } },
+                { "profile": "p" }
+              ]
+            }"#;
+            let document = document
+                .replace("PREFILL", prefill)
+                .replace("DECODE", decode);
+            let document: PolicySpec =
+                serde_json::from_str(&document).expect("a document of this build");
+            let digest = document.digest().expect("the document digests");
+            let spec = AppliedSpec::validate_digested(&document, digest, &catalog);
+            let store = Arc::new(MemoryStore::new().with_deciders(2));
+            let (singles, _) = fleet(&store);
+            store
+                .apply(spec.expect("the catalog holds the stage"))
+                .expect("above the unbound start");
+            LeasesStore::set_term(&*store, 1);
+            let mut watch = a_frame_under_the_second_files_watch(&store, singles[0]);
+            let _acting = Decider::new(0).enter();
+            let place = store.at_work();
+            let request = checked(phased(frame(1, 7), proto::Phase::Prefill));
+            let now = Instant::now() + Duration::from_secs(3);
+            let taken = Taken::at(&request, GATEWAY, now, now).expect("budget is left");
+            let taken = taken.placed(Some(&place));
+            let mut buffers = Buffers::default();
+            let own = Part::default();
+            let decision = store.deciding(|world| pair_in(world, &taken, &mut buffers, &own).0);
+            assert!(matches!(decision, Decision::Pick(_)), "{decision:?}");
+            watch.look()
+        };
+        assert_eq!(waited("random", "random"), Watch::Fed, "no such stage");
+        assert_eq!(waited("random", "seen"), Watch::Quiet, "the decode side's");
+        assert_eq!(waited("seen", "random"), Watch::Quiet, "the prefill side's");
+    }
+
     /// One model a decider, in the deciders' order: the first names of an
     /// endless run whose requests each of `count` deciders takes.
     fn a_model_each(deciders: &Deciders, count: usize) -> Vec<String> {
@@ -3094,9 +3327,12 @@ pub(crate) mod tests {
     /// that two deciders take and the same members serve: each decision
     /// of the second form is made at another file than the completion
     /// before it.
-    #[tokio::test]
-    #[ignore = "a measurement for the Numbers table, run by name"]
-    async fn a_closed_loop_measured() {
+    /// The stage that reads the counts is made by `stage`, and `under`
+    /// names it in the cell's lines.
+    async fn closed_loop<P: Picker + 'static>(
+        stage: impl Fn(Seen) -> P + Send + Sync + 'static,
+        under: &str,
+    ) {
         use std::io::Write as _;
 
         use crate::controller::lifecycle::tests::{a_completed, a_dispatched};
@@ -3104,20 +3340,7 @@ pub(crate) mod tests {
         const ASKED: usize = 200;
         let mut out = io::stdout();
         let rows = Arc::new(Mutex::new(Vec::new()));
-        let kept = Arc::clone(&rows);
-        let mut catalog = Catalog::builtin();
-        let seen = move || -> Box<dyn Picker> {
-            let rows = Arc::clone(&kept);
-            Box::new(Seen { rows })
-        };
-        catalog.picker("seen", seen).expect("a free name");
-        let mut document = PolicySpec::preset("random").expect("a preset of this build");
-        let profile = document.profiles.get_mut("random");
-        profile.expect("the preset's profile").pick = "seen".into();
-        let digest = document.digest().expect("the document digests");
-        let spec = AppliedSpec::validate_digested(&document, digest, &catalog)
-            .expect("the catalog holds the stage");
-        let mut bed = bed(Some(spec), true, (2, 8), []);
+        let mut bed = bed(Some(seeing(&rows, stage)), true, (2, 8), []);
         let models = a_model_each(&bed.deciders, 2);
         let served: Vec<&str> = models.iter().map(String::as_str).collect();
         for name in ["s0", "s1", "s2"] {
@@ -3157,7 +3380,7 @@ pub(crate) mod tests {
                 let late = behind.filter(|read| read.iter().any(|(count, _)| *count > 0));
                 writeln!(
                     out,
-                    "a closed loop of {form}, served {} ms, think {} ms: {} of {} decisions read a count from before the last completion",
+                    "a closed loop of {form}{under}, served {} ms, think {} ms: {} of {} decisions read a count from before the last completion",
                     served.as_millis(),
                     think.as_millis(),
                     late.count(),
@@ -3166,6 +3389,21 @@ pub(crate) mod tests {
                 .expect("stdout");
             }
         }
+    }
+
+    /// [`closed_loop`] under a stage that only picks by its counts.
+    #[tokio::test]
+    #[ignore = "a measurement for the Numbers table, run by name"]
+    async fn a_closed_loop_measured() {
+        closed_loop(|seen| seen, "").await;
+    }
+
+    /// [`closed_loop`] under a stage that says it may refuse by a report
+    /// of leases.
+    #[tokio::test]
+    #[ignore = "a measurement for the Numbers table, run by name"]
+    async fn a_closed_loop_under_a_counting_stage_measured() {
+        closed_loop(Counted, " under a stage that may refuse by a report").await;
     }
 
     /// An abandoned lease is told to the engine whose generation issued it
@@ -3206,6 +3444,11 @@ pub(crate) mod tests {
     impl Picker for Seen {
         fn name(&self) -> &'static str {
             "seen"
+        }
+
+        // Keeps what a decision reads and picks as the random picker.
+        fn refuses_by_reports(&self) -> bool {
+            false
         }
 
         fn pick(

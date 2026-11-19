@@ -74,6 +74,31 @@ pub trait Filter: Any + Send + Sync + Debug {
         None
     }
 
+    /// Whether this stage may refuse a request by what its gateways
+    /// report of leases: a count of requests in flight it is shown
+    /// ([`RequestFacts::in_flight`]), or what it keeps of the leases'
+    /// events ([`Lifecycle`]). Either may be late on a lull where another
+    /// deciding thread's leases write it. A stage that places by it
+    /// places elsewhere; one that refuses by it would turn away a request
+    /// its host admits. So a host that applies its gateways' reports late
+    /// applies them first for a decision under such a stage
+    /// ([`Engine::reads_for`]). On a served controller that costs the
+    /// decision one more take of its own file's turn. With several
+    /// deciders it also costs a read of each other decider's word, and
+    /// that decider's turn where it keeps a watch.
+    ///
+    /// A stage that says nothing is taken as one that may, so nothing a
+    /// host or a plugin writes turns away what its host admits by a
+    /// late report. A host's own stage that only places, or that
+    /// refuses by nothing a report writes, says `false` and leaves that
+    /// price. Each built-in stage of this crate says so. A plugin's
+    /// stage cannot say it yet: its wrapper keeps the default. The
+    /// answer is read once, where the engine is built ([`Engine::new`]):
+    /// it is the stage's for the engine's whole life.
+    fn refuses_by_reports(&self) -> bool {
+        true
+    }
+
     /// Drops from `kept` (positions into `candidates`, in order) the rows this
     /// filter refuses, in place: one call per decision, with [`Filter::keep`]
     /// inlined into the loop. A filter that answers for the whole pool at
@@ -314,6 +339,11 @@ pub trait Scorer: Lifecycle + Debug {
         None
     }
 
+    /// As [`Filter::refuses_by_reports`], for a scorer.
+    fn refuses_by_reports(&self) -> bool {
+        true
+    }
+
     /// The warm-up ruling this stage applies, where it applies one: what a
     /// host that names a pool's warming rows enters
     /// ([`WarmRule::name`]). No other stage holds one.
@@ -546,6 +576,11 @@ pub trait Picker: Lifecycle + Debug {
         None
     }
 
+    /// As [`Filter::refuses_by_reports`], for a picker.
+    fn refuses_by_reports(&self) -> bool {
+        true
+    }
+
     /// Whether the picker leaves the placement to its binding's sessions
     /// assignment (the `manual` picker): the engine reads it once per
     /// profile when it is built, and places such a profile's requests
@@ -652,6 +687,14 @@ impl Profile {
             .filter_map(|f| f.scope())
             .chain(self.scorers.iter().filter_map(|w| w.scorer.scope()))
             .chain(self.picker.scope())
+    }
+
+    /// Whether any stage may refuse a request by a report of leases
+    /// ([`Filter::refuses_by_reports`]).
+    fn refuses_by_reports(&self) -> bool {
+        self.filters.iter().any(|f| f.refuses_by_reports())
+            || self.scorers.iter().any(|w| w.scorer.refuses_by_reports())
+            || self.picker.refuses_by_reports()
     }
 
     /// Opens every stage's scope over the view; the guard closes them. Out
@@ -2575,6 +2618,11 @@ impl Marks {
     /// session key, over a pool whose host lists its engines, is the
     /// scorer's to place ([`run_owned`]).
     const OWNS: u16 = 1 << 8;
+    /// A stage may refuse a request by a report of leases
+    /// ([`Filter::refuses_by_reports`]). The engine's run reads nothing of
+    /// it: the decision's host does, by its one lookup
+    /// ([`Engine::reads_for`]).
+    const BY_REPORTS: u16 = 1 << 9;
 
     fn of(profile: &Profile, order: Order) -> Self {
         let scoped = if profile.scoped() { Self::SCOPED } else { 0 };
@@ -2620,7 +2668,12 @@ impl Marks {
         } else {
             0
         };
-        Self(scoped | by_assignment | draws_first | joined | ranked | engines | owns)
+        let by_reports = if profile.refuses_by_reports() {
+            Self::BY_REPORTS
+        } else {
+            0
+        };
+        Self(scoped | by_assignment | draws_first | joined | ranked | engines | owns | by_reports)
     }
 
     /// Whether no stage asks anything before the profile's run: no scope
@@ -2632,6 +2685,11 @@ impl Marks {
     /// A scope to open, under the key's mark or under none.
     const fn scoped(self) -> bool {
         self.0 & (Self::SCOPED | Self::KEYED_SCOPE) != 0
+    }
+
+    /// A stage that may refuse by a report of leases.
+    const fn by_reports(self) -> bool {
+        self.0 & Self::BY_REPORTS != 0
     }
 
     /// A scope to open and no key's mark: the opening's first arm.
@@ -3324,22 +3382,34 @@ impl Engine {
     /// beside a side that shows its rows: for a decode decision of a model
     /// that also pairs, the word carries the pair's decode side too, as the
     /// needs do. Written rows are the safe side.
-    pub fn reads_for(&self, model: &str, phase: Phase) -> (Needs, bool) {
-        let (own, shown) = self
+    ///
+    /// The last word says whether that profile holds a stage that may
+    /// refuse a request by a report of leases
+    /// ([`Filter::refuses_by_reports`]): a host that applies its gateways'
+    /// reports late applies them first for such a decision. It carries a
+    /// pair's decode side as the second word does. A profile kept its
+    /// word when the engine was built, so a decision under no such stage
+    /// reads nothing more for it.
+    pub fn reads_for(&self, model: &str, phase: Phase) -> (Needs, bool, bool) {
+        let (own, marks) = self
             .resolve(model, phase)
             .map(|(entry, index, profile)| {
                 (
                     profile.needs().or(session_needs(&entry.binding)),
-                    self.marks[usize::from(index)].scoped(),
+                    self.marks[usize::from(index)],
                 )
             })
             .unwrap_or_default();
         match phase {
-            Phase::Decode => (
-                own.or(self.pair_decode_needs(model)),
-                shown || self.pair_decode_shown(model),
-            ),
-            _ => (own, shown),
+            Phase::Decode => {
+                let pair = self.pair_decode_marks(model);
+                (
+                    own.or(self.pair_decode_needs(model)),
+                    marks.scoped() || pair.scoped(),
+                    marks.by_reports() || pair.by_reports(),
+                )
+            }
+            _ => (own, marks.scoped(), marks.by_reports()),
         }
     }
 
@@ -3388,13 +3458,14 @@ impl Engine {
             .map_or(0, |(_, _, profile)| profile.needs().sample)
     }
 
-    /// Whether the decode profile of `model`'s pair binding shows its rows
-    /// to a plugin, `false` where the model has none.
-    fn pair_decode_shown(&self, model: &str) -> bool {
+    /// The marks of the decode profile of `model`'s pair binding, none
+    /// where the model has no such binding.
+    fn pair_decode_marks(&self, model: &str) -> Marks {
         self.pair_binding(model)
             .and_then(|b| profile_index(b, Phase::Decode))
             .and_then(|i| self.marks.get(usize::from(i)))
-            .is_some_and(|marks| marks.scoped())
+            .copied()
+            .unwrap_or_default()
     }
 
     /// The needs of the decode profile of `model`'s pair binding
@@ -5308,6 +5379,97 @@ mod tests {
         assert_eq!(lead(&decision), Some(3));
     }
 
+    /// A profile says by the decision's one lookup whether a stage of it
+    /// may refuse by what its gateways report of leases. A stage that
+    /// says nothing is taken as one that may, and is no plugin's by
+    /// that: its profile shows no plugin its rows. A profile of this
+    /// crate's stages says it holds none.
+    #[test]
+    fn a_profile_whose_stage_may_refuse_by_reports_says_so_at_the_lookup() {
+        #[derive(Debug)]
+        struct Counted;
+
+        impl Filter for Counted {
+            fn name(&self) -> &'static str {
+                "counted"
+            }
+
+            fn keep(&self, facts: &RequestFacts<'_>, c: &Candidate, _: &Constraints<'_>) -> bool {
+                facts.in_flight(c) == 0
+            }
+        }
+
+        #[derive(Debug)]
+        struct Scored;
+
+        impl Lifecycle for Scored {}
+
+        impl Scorer for Scored {
+            fn name(&self) -> &'static str {
+                "scored"
+            }
+
+            fn score(
+                &self,
+                _: &RequestFacts<'_>,
+                _: &[Candidate],
+                _: &[u32],
+                out: &mut [f32],
+            ) -> TieBand {
+                out.fill(0.0);
+                TieBand::NORMALIZED
+            }
+        }
+
+        let engine_of =
+            |profile| Engine::new(vec![profile], vec![single_binding()], 1, Needs::default());
+        let plain = engine_of(least_requests_profile());
+        assert!(!plain.reads_for("m", Phase::Single).2);
+        // A filter that says nothing, and a scorer that says nothing: each
+        // is taken as a stage that may refuse, and its word is the
+        // profile's.
+        let filtered = || Profile {
+            filters: vec![Box::new(Counted)],
+            ..least_requests_profile()
+        };
+        let scored = Profile {
+            scorers: vec![Weighted {
+                scorer: Box::new(Scored),
+                weight: 1.0,
+            }],
+            ..least_requests_profile()
+        };
+        let (_, shown, by_reports) = engine_of(filtered()).reads_for("m", Phase::Single);
+        assert!(by_reports, "the filter's word is the profile's");
+        assert!(!shown, "no plugin is shown its rows");
+        let scored = engine_of(scored).reads_for("m", Phase::Single).2;
+        assert!(scored, "the scorer's word is the profile's");
+        // A decode binding with no pair carries its own profile's word.
+        let decode = || Binding {
+            phases: vec![Phase::Decode],
+            ..single_binding()
+        };
+        let alone = Engine::new(vec![filtered()], vec![decode()], 1, Needs::default());
+        assert!(alone.reads_for("m", Phase::Decode).2);
+        // A decode binding of a profile with no such stage stands ahead of
+        // a pair binding whose decode side holds one: the decode decision
+        // carries the pair's word, as it carries the pair's needs.
+        let ahead = Engine::new(
+            vec![least_requests_profile(), filtered()],
+            vec![
+                decode(),
+                Binding {
+                    decode_profile: Some(1),
+                    ..pair_binding()
+                },
+            ],
+            1,
+            Needs::default(),
+        );
+        assert!(!ahead.reads_for("m", Phase::Prefill).2);
+        assert!(ahead.reads_for("m", Phase::Decode).2);
+    }
+
     /// A profile that shows its rows to a plugin says so by the engine's one
     /// lookup, and its decision over rows that carry a mask or a pin beside
     /// them is declined under a name of its own, in every build.
@@ -5342,7 +5504,7 @@ mod tests {
             |profile| Engine::new(vec![profile], vec![single_binding()], 1, Needs::default());
         let plain = engine_of(least_requests_profile());
         let needs = plain.needs_for("m", Phase::Single);
-        assert_eq!(plain.reads_for("m", Phase::Single), (needs, false));
+        assert_eq!(plain.reads_for("m", Phase::Single), (needs, false, false));
         let engine = engine_of(Profile {
             filters: vec![Box::new(Shown)],
             ..least_requests_profile()

@@ -58,6 +58,14 @@
 //! takes the word back over leases on file: a frame a hand left under
 //! the old word then names one, and waits for the same takes.
 //!
+//! A job behind a watch takes the turn first and says it works under it,
+//! with the take's apply behind the mark. What the watch kept was handed
+//! while nobody worked: a hand at a file with no watch would have
+//! applied it in place. So whoever holds the turn and reads the file's
+//! thread at work reads it behind that apply. A thread with no watch
+//! says it works first and then takes its turn: its hands write a frame
+//! and then read who works, and one of the two sees the other.
+//!
 //! With no watch at a file and no thread at work there, whoever takes
 //! the turn applies: the hand itself, as at a file no decider was
 //! started for, and the gateways' sweep, which ends the file's leases
@@ -113,13 +121,26 @@
 //! left to that thread's takes. That thread wrote its mark, passed a
 //! fence of its own and took the turn ([`MemoryStore::begin`]): its
 //! first take finds the frame of a hand that missed the mark, and a
-//! later one the frame of a hand that read it. None of it leans on the
-//! orderings the queue gives its own reads and writes.
+//! later one the frame of a hand that read it. A thread that begins
+//! behind its watch holds the turn already as it writes the mark and
+//! passes the fence, and applies under it
+//! ([`MemoryStore::begin_watched`]): that apply stands where the other's
+//! first take does, for a hand that read no word yet. None of it leans
+//! on the orderings the queue gives its own reads and writes.
 //!
 //! A decision reads its own file behind everything handed to it. A row
 //! that another file's leases book lags by that file's next take: a
 //! worker's count is one atomic a row, stepped under the turn of the file
-//! that books it.
+//! that books it, and a stage's own book of a lease's events is written
+//! where the lease's frame is applied. A stage that places by either
+//! places elsewhere. A stage that may refuse on a count it is shown, or
+//! on what the leases' events told it, has its decision first apply what
+//! waits ([`AtWork::apply_waiting`]): at its own file by a take that
+//! waits, and at each other file that shows a watch. A stage that says
+//! nothing is taken as one: a plugin's, whose rule is its own, and a
+//! host's own stage. Each stage of this crate says it is none. The day
+//! the reservations' `try_reserve` gets a caller, or a stage of this
+//! crate sheds on a count or on its book, it takes the same entry.
 //!
 //! The lock order, written here once: a file's turn is taken first or not
 //! at all, and one turn at a time. The term's rise holds every turn, in
@@ -443,21 +464,66 @@ impl AtWork {
     /// each request it takes, ahead of the rows' counts a decision reads.
     /// Where the turn is held the request goes on and nothing is applied:
     /// what is handed waits for the next take that applies. A decision's
-    /// issue is one, and a refused request has none.
+    /// issue is one, and a refused request has none. Another file's
+    /// decision under a stage that may refuse by a report of leases
+    /// holds this turn for one read ([`Self::apply_waiting`]), as the
+    /// sweep holds it for a pass: a look that meets either misses, and
+    /// this thread's own decision under such a stage takes the turn
+    /// again by a wait.
     pub fn apply(&self) {
         if let Some(mut turn) = self.store.files[self.file].try_take() {
             self.store.applied(self.file, &mut turn);
         }
     }
 
-    /// The thread has a job at hand again: it says so and then takes its
+    /// Applies what waits at this thread's own file and at each other
+    /// file that shows a watch, for a decision under a stage that may
+    /// refuse on a count it is shown or on its book of the leases'
+    /// events: the stage then reads what a hand would have applied in
+    /// place. Its own file comes first, by a take that waits: the
+    /// thread's look at this request tried the turn once
+    /// ([`Self::apply`]), and another file's decision under such a stage
+    /// may have held it then. It then takes each watched file's turn,
+    /// whatever the file's thread does. Where no thread works there this
+    /// caller applies, as any thread may. A thread that took up a job
+    /// behind its watch said so under the turn, with its apply behind
+    /// the mark ([`AtWork::work`]): read at work under the turn, it has
+    /// applied what its watch kept, and what is handed from there is its
+    /// own, as a hand leaves it. Each wait is one take of a file, an
+    /// apply or an issue, never a job.
+    pub fn apply_waiting(&self) {
+        drop(self.store.turn_of(self.file));
+        let files = 0..self.store.files.len();
+        for at in files.filter(|at| *at != self.file) {
+            // A decision's read, taken in the one order of the watch's
+            // writes. A file that shows no watch holds nothing for it:
+            // its hands applied in place, or left their frames to a
+            // thread at work there, and a watch that ended found no
+            // lease on file, so a frame its last look missed moves no
+            // count. Its turn is not taken.
+            if self.store.files[at].shown.watched.load(SeqCst) {
+                drop(self.store.turn_of(at));
+            }
+        }
+    }
+
+    /// The thread has a job at hand again: it says so and takes its
     /// turn, the first step of its work. A watch it keeps stands through
     /// the job, and the job starts none: the hands read a thread with no
-    /// watch as the thread at work.
+    /// watch as the thread at work. With no watch the thread says it
+    /// works and then takes the turn. Behind a watch the turn comes
+    /// first, and the thread says it works under it with the take's
+    /// apply behind the mark: a decision at another file that reads this
+    /// thread at work under the turn reads behind what its watch kept
+    /// ([`AtWork::apply_waiting`]).
     pub fn work(&mut self) {
         if !self.working {
             self.working = true;
-            self.store.begin(self.file);
+            if self.watching {
+                self.store.begin_watched(self.file);
+            } else {
+                self.store.begin(self.file);
+            }
         }
     }
 
@@ -770,11 +836,33 @@ impl MemoryStore {
     /// its turn: the first step of its work. A hand that read nobody at
     /// work and took the turn is through before this thread acts, and
     /// one that takes it behind this step reads the mark under the turn.
+    /// A thread that keeps its watch over the file begins by
+    /// [`Self::begin_watched`].
     fn begin(&self, at: usize) {
         let was = self.files[at].working.at_work.swap(me(), SeqCst);
         debug_assert_eq!(was, 0, "one thread works at a file");
         fence(SeqCst);
         drop(self.turn_of(at));
+    }
+
+    /// [`Self::begin`] for a thread that keeps its watch over the file
+    /// at `at`. Its hands read the word and not who works, so what the
+    /// watch kept was handed while nobody worked: a hand at a file with
+    /// no watch would have applied it in place, and a decision that may
+    /// refuse by a report of leases reads behind it
+    /// ([`AtWork::apply_waiting`]). So the turn comes first, and the
+    /// mark is written under it with the take's apply behind its fence:
+    /// whoever holds the turn and reads this thread at work reads it
+    /// behind that apply. The fence is the worker's half of the
+    /// hand-over all the same ([`Self::settle`]): a hand that read no
+    /// word yet, and nobody at work, wrote its frame ahead of the mark.
+    fn begin_watched(&self, at: usize) {
+        let file = &self.files[at];
+        let mut turn = file.take();
+        let was = file.working.at_work.swap(me(), SeqCst);
+        debug_assert_eq!(was, 0, "one thread works at a file");
+        fence(SeqCst);
+        self.applied(at, &mut turn);
     }
 
     /// The thread at work at the file at `at` leaves its work: it takes
@@ -859,7 +947,10 @@ impl MemoryStore {
     /// thread at work or by its hand. A thread that began work meanwhile
     /// is read under the turn, and what waits is left to it. A thread at
     /// work is read first, with no turn held: its file's turn is not
-    /// taken from it, and its next take applies what waits.
+    /// taken from it, and its next take applies what waits. A thread that
+    /// begins behind its watch writes its mark under the turn, with the
+    /// same fence ahead of its apply ([`Self::begin_watched`]): a hand
+    /// that read no word yet is one of the two there as well.
     ///
     /// Kept out of line: laid into a hand it costs each hand three
     /// instructions, by count.

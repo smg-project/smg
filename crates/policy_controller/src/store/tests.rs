@@ -10,11 +10,11 @@ use std::{
 use super::{
     identity, identity_of,
     leases::{Counts, Slot},
-    Ask, BatchFacts, BatchOutcome, ContentHash, DecodeSide, Dispatch, GatewayId, Hand, HealthSink,
-    Journal, Kinds, KvEvent, KvEventSink, LeaseRecord, LeaseRefused, LeaseState, LeasesStore,
-    LoadSample, LoadSink, LoadSource, MembershipChange, MembershipTail, MemoryStore, Picked, Pin,
-    PollMode, Position, Reachability, ReservationKind, ReservationStore, ResyncReason, Said,
-    SequenceHash, SessionsStore, Sides, Signals, SnapshotChunk, StoredBlock, VetoWrite,
+    Ask, AtWork, BatchFacts, BatchOutcome, ContentHash, DecodeSide, Dispatch, GatewayId, Hand,
+    HealthSink, Journal, Kinds, KvEvent, KvEventSink, LeaseRecord, LeaseRefused, LeaseState,
+    LeasesStore, LoadSample, LoadSink, LoadSource, MembershipChange, MembershipTail, MemoryStore,
+    Picked, Pin, PollMode, Position, Reachability, ReservationKind, ReservationStore, ResyncReason,
+    Said, SequenceHash, SessionsStore, Sides, Signals, SnapshotChunk, StoredBlock, VetoWrite,
     ViewBuffers, Watch, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore, World,
 };
 use crate::{
@@ -4175,6 +4175,299 @@ fn a_full_ring_under_a_watch_is_applied_by_its_hand() {
         (told_ids(), in_flight(&store)),
         (vec![(room + 1, GONE)], vec![(a, 1)])
     );
+}
+
+/// A place applies what waits at each other file whose thread waits, for a
+/// decision under a stage that may refuse by a report of leases. A file
+/// whose thread is at work is left to that thread, as a hand leaves it.
+/// The second file's thread is the case's own, on its watch and then at
+/// work.
+#[test]
+fn a_place_applies_what_waits_at_the_other_files_whose_threads_wait() {
+    let now = Instant::now();
+    let store = Arc::new(MemoryStore::new().with_deciders(2));
+    let a = ready(&store, "http://a:1");
+    LeasesStore::set_term(&*store, 1);
+    let (said, heard_of) = mpsc::sync_channel(1);
+    let (go, word) = mpsc::sync_channel::<()>(1);
+    std::thread::scope(|scope| {
+        // The case's own ends go with it where it fails: the other
+        // thread's waits end, and the case with it.
+        let (heard_of, go) = (heard_of, go);
+        let store = &store;
+        scope.spawn(move || {
+            let _acting = Decider::new(1).enter();
+            let ids: Vec<_> = (0..2).map(|_| issued_at(store, a, now).0).collect();
+            let mut place = store.at_work();
+            assert_eq!(place.look(), Watch::Quiet, "two leases stand on its file");
+            let second = ids[1];
+            said.send(ids).expect("the case hears the ids");
+            word.recv_timeout(PATIENCE).expect("the case's word");
+            place.work();
+            said.send(Vec::new()).expect("the case hears the work");
+            word.recv_timeout(PATIENCE).expect("the case's word");
+            drop(place);
+            assert_eq!(
+                told_ids(),
+                [(second, GONE)],
+                "what waited is its own as it leaves"
+            );
+        });
+        let _acting = Decider::new(0).enter();
+        let place = store.at_work();
+        let ids = heard_of.recv_timeout(PATIENCE).expect("the watch stands");
+        let hand = Hand::new(GatewayId(1));
+        drop(told());
+        // The other file's thread waits on its watch: the frame a hand
+        // left there is applied by this place.
+        store.hand(&hand, LeaseId(1 << 32 | ids[0]), GONE);
+        assert_eq!(told_ids(), [], "left to the watch");
+        place.apply_waiting();
+        assert_eq!(told_ids(), [(ids[0], GONE)]);
+        // That thread is at work: what waits is its own.
+        go.send(()).expect("the other thread waits");
+        heard_of.recv_timeout(PATIENCE).expect("the work began");
+        store.hand(&hand, LeaseId(1 << 32 | ids[1]), GONE);
+        place.apply_waiting();
+        assert_eq!(told_ids(), [], "left to the thread at work");
+        go.send(()).expect("the other thread waits");
+    });
+    assert_eq!(in_flight(&store), [(a, 0)]);
+}
+
+/// A file that shows no watch holds nothing for a look, so a place's apply
+/// passes it by its word and takes no turn there. The case's tell runs
+/// under the second file's turn, where a hand applies in place, and
+/// applies through the place at the first file: a take of the held turn
+/// would be refused.
+#[test]
+fn a_places_apply_takes_no_turn_at_a_file_that_shows_no_watch() {
+    thread_local! {
+        static PLACE: RefCell<Option<AtWork>> = const { RefCell::new(None) };
+        static TOLD: Cell<u32> = const { Cell::new(0) };
+    }
+    fn under(_: &MemoryStore, _: &World, _: &Sides, _: Said, _: Option<Decider>) {
+        PLACE.with_borrow(|place| place.as_ref().expect("the case's place").apply_waiting());
+        TOLD.set(TOLD.get() + 1);
+    }
+    let now = Instant::now();
+    let store = Arc::new(MemoryStore::new().with_deciders(2));
+    store.tell_through(under);
+    let a = ready(&store, "http://a:1");
+    LeasesStore::set_term(&*store, 1);
+    // A lease on the second file, issued as its decider.
+    let lease = {
+        let _acting = Decider::new(1).enter();
+        issued_at(&store, a, now).0
+    };
+    let _acting = Decider::new(0).enter();
+    PLACE.set(Some(store.at_work()));
+    // The second file shows no watch and no thread works there: the hand
+    // applies in place, and the tell runs under that file's turn.
+    store.hand(&Hand::new(GatewayId(1)), LeaseId(1 << 32 | lease), GONE);
+    assert_eq!(TOLD.get(), 1, "the release was told under its file's turn");
+    PLACE.set(None);
+    assert_eq!(in_flight(&store), [(a, 0)]);
+}
+
+/// A place's apply takes its own file's turn by a wait and applies what
+/// was handed while its thread worked. The thread's look at a request is
+/// one try of that turn, which another file's decision may hold for a
+/// read: a decision under a stage that may refuse by a report of leases
+/// does not read by that try alone.
+#[test]
+fn a_places_apply_applies_what_was_handed_at_its_own_file() {
+    let (store, a, ids) = handed_bed(1, Instant::now());
+    let place = store.at_work();
+    // Handed while the thread works: left to it.
+    store.hand(&Hand::new(GatewayId(1)), ids[0], GONE);
+    assert_eq!(told_ids(), [], "left to the thread at work");
+    place.apply_waiting();
+    assert_eq!(told_ids(), [(ids[0].0 & 0xffff_ffff, GONE)]);
+    assert_eq!(in_flight(&store), [(a, 0)]);
+}
+
+/// The rows' counts read once, as a decision reads them.
+fn in_flight_once(store: &MemoryStore, out: &mut ViewBuffers) -> u32 {
+    let ask = Ask {
+        gateway: GatewayId(1),
+        now: Instant::now(),
+        pinned: None,
+        affinity: false,
+    };
+    store.deciding(|world| {
+        if let Some(built) = world.build("m", Role::Single, &ask, &mut *out) {
+            world.count_in_flight(&built, &ask, &mut out.candidates);
+        }
+    });
+    out.candidates.iter().map(|row| row.in_flight).sum()
+}
+
+/// A place's apply reads behind what a watch kept, whatever the watching
+/// thread does meanwhile. A hand leaves a release under the second
+/// file's watch and returns; this place then applies what waits at the
+/// other files and reads the rows' count once, as a decision does. In
+/// every other round the second file's thread takes up a job as that
+/// read is made: it says it works under its turn, with its apply behind
+/// the mark, so the read finds the release applied, by this place or by
+/// the job's first step. A hand at a file with no watch would have
+/// applied it before it returned.
+#[test]
+fn a_places_apply_reads_behind_a_watchs_frames_beside_a_job_that_begins() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
+
+    const ROUNDS: u64 = 20_000;
+    // The widest pause, in spins, between the word that lets the other
+    // thread take up its job and this place's apply: the rounds sweep it.
+    const SPINS: u64 = 64;
+    // The words of a round, said by each side in turn: the other thread's
+    // watch stands over the round's lease, it may take up its job, it is
+    // at work, the round is over.
+    const WATCHES: u64 = 1;
+    const TAKE_UP: u64 = 2;
+    const WORKS: u64 = 3;
+    const OVER: u64 = 4;
+
+    // Says the case left, by its end or by an unwind: the other thread
+    // waits for no word behind it.
+    struct Leaves<'a>(&'a AtomicBool);
+    impl Drop for Leaves<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, SeqCst);
+        }
+    }
+
+    let now = Instant::now();
+    let store = Arc::new(MemoryStore::new().with_deciders(2));
+    let a = ready(&store, "http://a:1");
+    LeasesStore::set_term(&*store, 1);
+    let (word, lease, left) = (AtomicU64::new(0), AtomicU64::new(0), AtomicBool::new(false));
+    std::thread::scope(|scope| {
+        let (store, word, lease, left) = (&store, &word, &lease, &left);
+        scope.spawn(move || {
+            let _acting = Decider::new(1).enter();
+            let mut place = store.at_work();
+            // Waits for the case's word, with `pause` between its reads;
+            // `false` where the case left. The wait for its job is one
+            // side of the race and spins. The wait for the round's end
+            // is outside it and yields, as the case's own waits do: on a
+            // host with no core to spare a spin can cost a time slice.
+            let heard = |wanted: u64, pause: fn()| {
+                while word.load(SeqCst) != wanted {
+                    if left.load(SeqCst) {
+                        return false;
+                    }
+                    pause();
+                }
+                true
+            };
+            loop {
+                // At work: the round's lease, then the watch over it.
+                let id = issued_at(store, a, now).0;
+                assert_ne!(place.look(), Watch::Ended, "a lease stands on the file");
+                lease.store(id, SeqCst);
+                word.store(WATCHES, SeqCst);
+                if !heard(TAKE_UP, std::hint::spin_loop) {
+                    return;
+                }
+                // A job: the first step of its work applies what waits.
+                place.work();
+                drop(told());
+                word.store(WORKS, SeqCst);
+                if !heard(OVER, std::thread::yield_now) {
+                    return;
+                }
+            }
+        });
+        let _leaves = Leaves(left);
+        let _acting = Decider::new(0).enter();
+        let place = store.at_work();
+        let hand = Hand::new(GatewayId(1));
+        let wait_for = |wanted: u64| {
+            let since = Instant::now();
+            while word.load(SeqCst) != wanted {
+                assert!(
+                    since.elapsed() < PATIENCE,
+                    "the other thread's word {wanted}"
+                );
+                std::thread::yield_now();
+            }
+        };
+        let mut rows = ViewBuffers::default();
+        for round in 1..=ROUNDS {
+            wait_for(WATCHES);
+            drop(told());
+            store.hand(&hand, LeaseId(1 << 32 | lease.load(SeqCst)), GONE);
+            // Every other round the other thread takes up its job as this
+            // place applies and reads, a swept pause apart.
+            let begins = round % 2 == 0;
+            if begins {
+                word.store(TAKE_UP, SeqCst);
+                for _ in 0..round / 2 % SPINS {
+                    std::hint::spin_loop();
+                }
+            }
+            place.apply_waiting();
+            let counted = in_flight_once(store, &mut rows);
+            assert_eq!(
+                counted, 0,
+                "round {round}: the read is behind the release's apply"
+            );
+            if !begins {
+                assert!(!told().is_empty(), "round {round}: this place applied it");
+                word.store(TAKE_UP, SeqCst);
+            }
+            wait_for(WORKS);
+            word.store(OVER, SeqCst);
+        }
+    });
+}
+
+/// The floor of the price of a place's apply at the other files, measured:
+/// a million calls with nothing waiting and no other thread, at one, two
+/// and eight files that show no watch, then at two and eight where each
+/// other file shows one. Its own file's turn is in each call.
+#[test]
+#[ignore = "a measurement for the Numbers table, run by name"]
+fn a_places_apply_at_the_other_files_measured() {
+    use std::io::Write as _;
+
+    const CALLS: u32 = 1_000_000;
+    let mut out = std::io::stdout();
+    let now = Instant::now();
+    for (files, watched) in [(1_u8, false), (2, false), (8, false), (2, true), (8, true)] {
+        let store = Arc::new(MemoryStore::new().with_deciders(usize::from(files)));
+        let a = ready(&store, "http://a:1");
+        LeasesStore::set_term(&*store, 1);
+        // A watch at each other file: a lease on it and its place's look.
+        let others = if watched { 1..files } else { 0..0 };
+        let _watches: Vec<AtWork> = others
+            .map(|other| {
+                let _acting = Decider::new(other).enter();
+                let mut place = store.at_work();
+                issued_at(&store, a, now);
+                assert_ne!(place.look(), Watch::Ended, "a lease stands on the file");
+                place
+            })
+            .collect();
+        let _acting = Decider::new(0).enter();
+        let place = store.at_work();
+        let since = Instant::now();
+        for _ in 0..CALLS {
+            place.apply_waiting();
+        }
+        let nanos = since.elapsed().as_nanos() / u128::from(CALLS);
+        let shown = if watched {
+            "a watch at each other"
+        } else {
+            "no watch"
+        };
+        writeln!(
+            out,
+            "a place's apply, {files} files, {shown}, nothing waiting: {nanos} ns a call"
+        )
+        .expect("stdout");
+    }
 }
 
 /// The frames of one take are told under one world, the store's as it

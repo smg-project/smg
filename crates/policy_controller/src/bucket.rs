@@ -897,6 +897,11 @@ impl Scorer for Bucket {
         "bucket"
     }
 
+    // Places by its book of issues and dispatches: a late one moves the pick.
+    fn refuses_by_reports(&self) -> bool {
+        false
+    }
+
     fn score(
         &self,
         facts: &RequestFacts<'_>,

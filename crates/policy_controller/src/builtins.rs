@@ -47,6 +47,11 @@ impl Filter for Healthy {
         "healthy"
     }
 
+    // Refuses by a row's health bits and its host's mask.
+    fn refuses_by_reports(&self) -> bool {
+        false
+    }
+
     fn row_wise(&self) -> bool {
         true
     }
@@ -83,6 +88,11 @@ impl Filter for OwnBits {
         "healthy"
     }
 
+    // Refuses by a row's health bits.
+    fn refuses_by_reports(&self) -> bool {
+        false
+    }
+
     fn keep(&self, _: &RequestFacts<'_>, c: &Candidate, _: &Constraints<'_>) -> bool {
         c.health.routable_ignoring_overload()
     }
@@ -105,6 +115,11 @@ impl Filter for NotOverloaded {
         "not-overloaded"
     }
 
+    // Refuses by the overload bit of a row's health, unless its host lifts it.
+    fn refuses_by_reports(&self) -> bool {
+        false
+    }
+
     fn row_wise(&self) -> bool {
         true
     }
@@ -121,6 +136,11 @@ pub struct HasCapacity;
 impl Filter for HasCapacity {
     fn name(&self) -> &'static str {
         "has-capacity"
+    }
+
+    // Refuses by a bit its host supplies.
+    fn refuses_by_reports(&self) -> bool {
+        false
     }
 
     fn row_wise(&self) -> bool {
@@ -141,6 +161,11 @@ pub struct HasRoom;
 impl Filter for HasRoom {
     fn name(&self) -> &'static str {
         "has-room"
+    }
+
+    // Refuses by a bit its host supplies.
+    fn refuses_by_reports(&self) -> bool {
+        false
     }
 
     fn row_wise(&self) -> bool {
@@ -164,6 +189,11 @@ pub struct NotTried;
 impl Filter for NotTried {
     fn name(&self) -> &'static str {
         "not-tried"
+    }
+
+    // Refuses by the request's own tried list and its host's exclusions.
+    fn refuses_by_reports(&self) -> bool {
+        false
     }
 
     fn row_wise(&self) -> bool {
@@ -315,6 +345,11 @@ impl Scorer for LeastRequests {
         "least-requests"
     }
 
+    // Scores by the count in flight: a late count moves the pick.
+    fn refuses_by_reports(&self) -> bool {
+        false
+    }
+
     fn score(
         &self,
         facts: &RequestFacts<'_>,
@@ -341,6 +376,11 @@ impl Lifecycle for SessionAffinity {}
 impl Scorer for SessionAffinity {
     fn name(&self) -> &'static str {
         "session-affinity"
+    }
+
+    // Scores by the session's hit on a row.
+    fn refuses_by_reports(&self) -> bool {
+        false
     }
 
     fn score(
@@ -384,6 +424,11 @@ impl Lifecycle for FewestSessions {}
 impl Scorer for FewestSessions {
     fn name(&self) -> &'static str {
         "fewest-sessions"
+    }
+
+    // Scores by the sessions a row holds: a late count moves the pick.
+    fn refuses_by_reports(&self) -> bool {
+        false
     }
 
     fn score(
@@ -1102,6 +1147,11 @@ impl Scorer for LeastLoad {
         "least-load"
     }
 
+    // Costs by the count in flight and its credits: late ones move the pick.
+    fn refuses_by_reports(&self) -> bool {
+        false
+    }
+
     fn row_wise(&self) -> bool {
         true
     }
@@ -1305,6 +1355,11 @@ impl Lifecycle for ResidentWork {
 impl Scorer for ResidentWork {
     fn name(&self) -> &'static str {
         "resident-work"
+    }
+
+    // Costs by the count in flight and its credits: late ones move the pick.
+    fn refuses_by_reports(&self) -> bool {
+        false
     }
 
     /// The rows a picker drew are costed among themselves, as the
@@ -1801,6 +1856,11 @@ impl Picker for Best {
         "best"
     }
 
+    // Picks the best score of the rows kept.
+    fn refuses_by_reports(&self) -> bool {
+        false
+    }
+
     /// The targets are the best of the rows handed: a rank may put rows in
     /// front of this picker.
     fn front_wise(&self) -> bool {
@@ -1854,6 +1914,11 @@ impl Lifecycle for SampledBest {}
 impl Picker for SampledBest {
     fn name(&self) -> &'static str {
         "best"
+    }
+
+    // Picks the best score of the rows it draws.
+    fn refuses_by_reports(&self) -> bool {
+        false
     }
 
     /// The targets are the best of the rows handed: a rank may put rows in
@@ -1948,6 +2013,11 @@ impl Picker for Passthrough {
         "passthrough"
     }
 
+    // Picks the rows in the order handed.
+    fn refuses_by_reports(&self) -> bool {
+        false
+    }
+
     fn draws_first(&self) -> bool {
         true
     }
@@ -2008,6 +2078,11 @@ impl Lifecycle for Random {}
 impl Picker for Random {
     fn name(&self) -> &'static str {
         "random"
+    }
+
+    // Picks by its draw.
+    fn refuses_by_reports(&self) -> bool {
+        false
     }
 
     fn draws_first(&self) -> bool {
@@ -2119,6 +2194,11 @@ impl Lifecycle for Manual {}
 impl Picker for Manual {
     fn name(&self) -> &'static str {
         "manual"
+    }
+
+    // Declines by the placement its request's rule names, never by a count.
+    fn refuses_by_reports(&self) -> bool {
+        false
     }
 
     fn pick(
@@ -2245,6 +2325,11 @@ impl Picker for PowerOfTwo {
         "power-of-two"
     }
 
+    // Picks the better score of two draws.
+    fn refuses_by_reports(&self) -> bool {
+        false
+    }
+
     fn draws_first(&self) -> bool {
         true
     }
@@ -2315,6 +2400,11 @@ impl Lifecycle for CountFirst {}
 impl Picker for CountFirst {
     fn name(&self) -> &'static str {
         "count-first"
+    }
+
+    // Picks the fewest in flight: a late count moves the pick.
+    fn refuses_by_reports(&self) -> bool {
+        false
     }
 
     /// The targets are the best of the rows handed: a rank may put rows in
@@ -2432,6 +2522,11 @@ impl Lifecycle for PowerOfTwoCountFirst {}
 impl Picker for PowerOfTwoCountFirst {
     fn name(&self) -> &'static str {
         "power-of-two-count-first"
+    }
+
+    // Picks the fewer in flight of two draws: a late count moves the pick.
+    fn refuses_by_reports(&self) -> bool {
+        false
     }
 
     fn draws_first(&self) -> bool {
@@ -2655,6 +2750,11 @@ impl Lifecycle for RoundRobin {}
 impl Picker for RoundRobin {
     fn name(&self) -> &'static str {
         "round-robin"
+    }
+
+    // Picks by its rotation.
+    fn refuses_by_reports(&self) -> bool {
+        false
     }
 
     fn draws_first(&self) -> bool {
