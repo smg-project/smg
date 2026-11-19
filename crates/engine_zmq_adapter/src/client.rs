@@ -3577,7 +3577,9 @@ mod tests {
     /// model's vocabulary included, the per-image hashes, `do_remote_prefill`)
     /// reaches a NIXL consumer engine, held to the tokenizer's
     /// bound; the same prompt without the handoff, with an id past the
-    /// tokenizer's too, or with an out-of-vocab `logit_bias` key, does not.
+    /// tokenizer's too, ending in an id past the model's vocabulary (that
+    /// token is computed locally), or with an out-of-vocab `logit_bias` key,
+    /// does not.
     /// On an engine that would not pull on the claim (no connector, a
     /// producer, an unprojected wrapper) the claim changes nothing, nor does
     /// the legacy host/port pair on a consumer: the engine would compute the
@@ -3626,6 +3628,12 @@ mod tests {
             (
                 request(leg(), DECODE, Some(999_999_999)),
                 "[999999999] in logit_bias",
+            ),
+            // The last prompt token is computed locally even on a full KV
+            // hit, so it keeps the model's bound.
+            (
+                request(vec![5, 1000, 1000], DECODE, None),
+                "Token id 1000 is out of vocabulary",
             ),
         ] {
             let Err(status) = client.generate_vllm_streams(req).await else {

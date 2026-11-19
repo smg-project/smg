@@ -1241,17 +1241,22 @@ impl VocabBounds {
 /// narrowed by its `is_embed` mask); a tensor-less identity batch sends no
 /// feature and leaves its positions text.
 ///
-/// The decode side of a PD pair is held to vLLM's bound at every position:
-/// its prompt is the prefill side's expanded one, image-token run included,
-/// with the media stripped to an identity batch (or to nothing) because the
-/// KV it pulls supplies those positions. That holds only when the request
+/// The decode side of a PD pair is held to vLLM's bound at every position
+/// but its last: its prompt is the prefill side's expanded one, image-token
+/// run included, with the media stripped to an identity batch (or to
+/// nothing) because the KV it pulls supplies those positions. The last
+/// position keeps the ordinary bounds: every connector pulls at most the
+/// whole prompt, and on a full hit the scheduler recomputes the last token
+/// locally to sample the next (`_update_waiting_for_remote_kv`), so that
+/// token is embedded on this engine. That holds only when the request
 /// claims the handoff in the form the engine's connector pulls on
 /// ([`consumes_remote_prefill`], single-sample only) and
 /// `engine_pulls_remote_kv` says the engine's connector does
 /// ([`pulls_on_do_remote_prefill`]). An engine that does not pull on the
 /// claim computes the prompt itself, so a forged or mismatched claim there
-/// gets the ordinary bounds. A decode side whose KV load fails and is
-/// recomputed reads what vLLM's own frontend would have let through.
+/// gets the ordinary bounds. A decode side whose KV load fails, or which is
+/// preempted, and is recomputed reads what vLLM's own frontend would have
+/// let through.
 ///
 /// An id past the model's vocabulary that a position is allowed to hold is
 /// still a target of `prompt_logprobs`, which reads the logits at every
@@ -1266,12 +1271,16 @@ pub(crate) fn validate_token_ids(
     let sampling = req.sampling_params.as_ref();
     if let Some(vllm::generate_request::Input::Tokenized(tokenized)) = &req.input {
         let ids = &tokenized.input_ids;
-        let text_bound = if engine_pulls_remote_kv && consumes_remote_prefill(req) {
-            bounds.outer
-        } else {
-            bounds.model
-        };
+        let handoff = engine_pulls_remote_kv && consumes_remote_prefill(req);
+        let text_bound = if handoff { bounds.outer } else { bounds.model };
         validate_prompt_ids(ids, embed_positions, text_bound, bounds.outer)?;
+        // The decode side computes its last prompt token itself, KV pulled
+        // or not: a text id there reads the embedding table.
+        if let (true, Some(&id)) = (handoff, ids.last()) {
+            if id >= bounds.model && !in_runs(embed_positions, ids.len() - 1) {
+                return Err(format!("Token id {id} is out of vocabulary"));
+            }
+        }
         if sampling.is_some_and(|sp| sp.prompt_logprobs.is_some()) {
             refuse_unscorable_prompt_ids(ids, bounds.model)?;
         }
@@ -1300,6 +1309,12 @@ pub(crate) fn validate_token_ids(
     Ok(())
 }
 
+/// Whether `position` lies in one of `runs` (sorted, disjoint).
+fn in_runs(runs: &[Range<usize>], position: usize) -> bool {
+    let after = runs.partition_point(|run| run.start <= position);
+    after > 0 && runs[after - 1].contains(&position)
+}
+
 /// Refuse a prompt id at or past its position's bound, with vLLM's message
 /// (`InputProcessor`) naming the largest: `embed_bound` at a position in
 /// `embed_positions` (sorted runs), which takes a multimodal item's
@@ -1311,10 +1326,6 @@ pub(crate) fn validate_prompt_ids(
     text_bound: u32,
     embed_bound: u32,
 ) -> Result<(), String> {
-    let is_embed = |position: usize| {
-        let after = embed_positions.partition_point(|run| run.start <= position);
-        after > 0 && embed_positions[after - 1].contains(&position)
-    };
     // An id below both bounds, the common one, is settled without a lookup.
     let lower = text_bound.min(embed_bound);
     let largest = input_ids
@@ -1324,7 +1335,7 @@ pub(crate) fn validate_prompt_ids(
             if id < lower {
                 return false;
             }
-            let bound = if is_embed(position) {
+            let bound = if in_runs(embed_positions, position) {
                 embed_bound
             } else {
                 text_bound

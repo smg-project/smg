@@ -805,8 +805,8 @@ fn an_out_of_vocab_id_passes_at_an_image_position_only() {
 /// prefill side's expanded prompt, its image-token run included, with the
 /// media stripped (the KV it pulls supplies those positions): on an engine
 /// whose connector pulls on the claim, its prompt is held to the tokenizer's
-/// bound at every position, and its `stop_token_ids` and `logit_bias` to the
-/// model's. The same prompt without the decode-side params, at `n > 1`, or
+/// bound at every position but the last (computed locally, so held to the
+/// model's), and its `stop_token_ids` and `logit_bias` to the model's. The same prompt without the decode-side params, at `n > 1`, or
 /// on an engine that does not pull on the claim is refused.
 #[test]
 fn a_pd_decode_side_is_held_to_the_outer_bound() {
@@ -861,6 +861,17 @@ fn a_pd_decode_side_is_held_to_the_outer_bound() {
         check_on(decode(vllm::SamplingParams::default(), DECODE), false),
         refused
     );
+
+    // The last prompt token is computed on the decode side whether the KV
+    // is pulled or not, so it keeps the model's bound: at the end of a
+    // longer prompt, and as a prompt's only token.
+    for input_ids in [vec![5, 1000, 1000, 1000], vec![1000]] {
+        let mut tail = decode(vllm::SamplingParams::default(), DECODE);
+        if let Some(vllm::generate_request::Input::Tokenized(t)) = tail.input.as_mut() {
+            t.input_ids = input_ids.clone();
+        }
+        assert_eq!(check(tail), refused, "{input_ids:?}");
+    }
 
     // Not a decode side: no params, a prefill side's, a malformed field.
     for params in [
@@ -950,14 +961,15 @@ fn a_legacy_host_port_pair_alone_is_no_handoff() {
         Ok(())
     );
 
-    // JSON params beside the pair decide alone, either way.
-    let mut prefill_json = legacy(vec![1, 1500], vllm::SamplingParams::default());
+    // JSON params beside the pair decide alone, either way (the id past the
+    // model's vocabulary off the last position, which is always local).
+    let mut prefill_json = legacy(vec![1500, 1], vllm::SamplingParams::default());
     prefill_json.kv_transfer_params_json = Some(r#"{"do_remote_prefill": false}"#.to_string());
     assert_eq!(
         check(prefill_json),
         Err("Token id 1500 is out of vocabulary".to_string())
     );
-    let mut decode_json = legacy(vec![1, 1500], vllm::SamplingParams::default());
+    let mut decode_json = legacy(vec![1500, 1], vllm::SamplingParams::default());
     decode_json.kv_transfer_params_json = Some(r#"{"do_remote_prefill": true}"#.to_string());
     assert_eq!(check(decode_json), Ok(()));
 }
