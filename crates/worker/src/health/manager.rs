@@ -13,8 +13,9 @@
 //! probe from being joined by a second one.
 //!
 //! What a probe's outcome or a connect signal does to a worker's status
-//! crosses the port of [`super::port`]: the loop says the fact to a
-//! [`HealthSink`], and what the fact did to the status is the sink's answer.
+//! crosses the port of [`super::port`]: this loop is the port's collector.
+//! It says the fact to a [`HealthSink`], and what the fact did to the status
+//! is the sink's answer.
 //! The schedule still reads the status on the worker object (the places are
 //! on the trait). The registry's impl of the port, further down, is the
 //! state machine.
@@ -287,8 +288,9 @@ impl WorkerManager {
     /// did to the status is the sink's answer. `registry` holds the worker
     /// objects the loop probes, and the loop's schedule reads their status
     /// (the places are on [`HealthSink`]): a sink that keeps the status
-    /// elsewhere writes it on the worker object before it answers.
-    /// [`Self::start`] hands the registry as the sink too, since it runs
+    /// elsewhere writes it on the worker object before it answers, by the
+    /// registry's guarded transition. [`Self::start`] hands the registry as
+    /// the sink too, since it runs
     /// this crate's status state machine over those objects.
     pub fn start_with_sink<G: Generation>(
         registry: Arc<WorkerRegistry<G>>,
@@ -1215,23 +1217,26 @@ impl<G: Generation> HealthSink for WorkerRegistry<G> {
     fn probe_outcome(
         &self,
         worker_id: &WorkerId,
-        probe_ok: bool,
-        expected_revision: u64,
-        launched_status: WorkerStatus,
+        passed: bool,
+        revision: u64,
+        launched: WorkerStatus,
     ) -> ProbeAnswer {
         let Some((status, transition)) =
-            self.apply_if_revision(worker_id, expected_revision, |current_worker| {
+            self.apply_if_revision(worker_id, revision, |current_worker| {
                 let state = current_worker.runtime_state();
                 let state = state.as_deref();
-                if launched_status == WorkerStatus::Pending {
+                if launched == WorkerStatus::Pending {
                     if let Some(state) = state {
                         state.total_pending_probes_increment();
                     }
                 }
                 let health_config = &current_worker.metadata().health_config;
+                // The status that stands, read off the runtime state in hand
+                // where the worker keeps one: no second load of that state.
+                let status = state.map_or_else(|| current_worker.status(), WorkerRuntime::status);
                 (
-                    current_worker.status(),
-                    compute_next_status(current_worker, state, probe_ok, health_config),
+                    status,
+                    compute_next_status(current_worker, state, passed, health_config),
                 )
             })
         else {

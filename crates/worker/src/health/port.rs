@@ -44,12 +44,20 @@ pub enum ProbeAnswer {
 /// a probe (the probe's slot, the `launched` it hands to
 /// [`Self::probe_outcome`], the engine id's read after a recovery), and at
 /// a connect signal (the guard on a worker under removal, whether the probe
-/// decides). So a sink that keeps the status elsewhere writes it on the
-/// worker object before it answers; the registry's sink writes nowhere
-/// else.
+/// decides). The contact hook that raises a connect signal reads it there
+/// too. So a sink that keeps the status elsewhere writes it on the worker
+/// object before it answers, through the registry's guarded transition
+/// ([`transition_status_if_revision`][guarded] or
+/// [`apply_if_revision`][applied]) and never through the worker's own
+/// setter: only the registry's write takes the worker's mutation lock, runs
+/// what a status change carries and publishes it. The registry's sink
+/// writes nowhere else.
 ///
 /// A sink that holds no row for the worker answers [`ProbeAnswer::Stale`]
 /// to a probe's outcome and `None` to a connect signal.
+///
+/// [guarded]: crate::registry::WorkerRegistry::transition_status_if_revision
+/// [applied]: crate::registry::WorkerRegistry::apply_if_revision
 pub trait HealthSink: Send + Sync {
     /// One probe of the worker passed or failed. `revision` is the worker's
     /// revision at the probe's launch: the outcome of a worker replaced
@@ -67,10 +75,10 @@ pub trait HealthSink: Send + Sync {
     /// The connect signal of the worker at `revision`, where the signal
     /// itself brings the worker into service: the collector asks first
     /// whether the worker's probe decides instead, and then says nothing
-    /// here. Answers the transition, or `None` for the three things that
-    /// move nothing: the status stood (the worker serves already), the
-    /// revision moved (the signal is of a worker replaced since), or no
-    /// worker stands under the id.
+    /// here. Answers the transition as `(old, new)`, or `None` for the
+    /// three things that move nothing: the status stood (the worker serves
+    /// already), the revision moved (the signal is of a worker replaced
+    /// since), or no worker stands under the id.
     fn connected(
         &self,
         worker_id: &WorkerId,
