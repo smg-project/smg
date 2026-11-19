@@ -165,7 +165,10 @@ use super::{
 use crate::{
     decider::Decider,
     decision::Decision,
-    door::{decide_in, decider_of, issue, past_mark, summed, Buffers, Part, StorePins, Taken},
+    door::{
+        decide_in, decider_of, entry, issue, issue_pair, pair_in, past_mark, summed, Asked,
+        Buffers, Entry, Part, StorePins, Taken,
+    },
     elector::{term_said, Fence},
     framework::release,
     lease::{Lease, Lifecycle, ReleaseReason},
@@ -744,26 +747,35 @@ impl Deciding {
         // lease books the count that load laid beside its target's row,
         // and the engine told of it is the one that decided.
         store.deciding(|world| {
-            let Some((decision, booking)) = decide_in(world, &taken, buffers, own) else {
-                counts.pair_sides.fetch_add(1, Ordering::Relaxed);
-                return Err(Reason::Unspecified);
+            // The lease, for a pick: filed under the first read's term and
+            // at its instant, and the engine told, before the read that
+            // lets the answer leave. That read judges the store's write
+            // and a stage's call with the build before them. A pair's
+            // pick is filed its decode side's lease beside it.
+            let mut decode = None;
+            let (decision, filed) = match entry(world, &taken) {
+                Entry::Single => {
+                    let (decision, booking) = decide_in(world, &taken, buffers, own);
+                    let filed = booking
+                        .map(|booking| issue(store, world, &taken, term, &decision, booking))
+                        .transpose();
+                    (decision, filed)
+                }
+                Entry::Pair => pair(store, world, &taken, term, buffers, own, &mut decode),
+                Entry::Side => {
+                    counts.pair_sides.fetch_add(1, Ordering::Relaxed);
+                    return Err(Reason::Unspecified);
+                }
             };
             // No pick, while the start's document of a replica under a
             // shared lease waits for its first lead: a shed would say that
             // a document refuses the request, and no document has landed.
             // That is no decision. The mark is read behind a decision that
             // booked nothing, and there alone: a pick pays nothing for it.
-            if booking.is_none() && world.spec().awaits_document() {
+            if matches!(filed, Ok(None)) && world.spec().awaits_document() {
                 counts.awaited.fetch_add(1, Ordering::Relaxed);
                 return Err(Reason::Unspecified);
             }
-            // The lease, for a pick: filed under the first read's term and
-            // at its instant, and the engine told, before the read that
-            // lets the answer leave. That read judges the store's write
-            // and a stage's call with the build before them.
-            let filed = booking
-                .map(|booking| issue(store, world, &taken, term, &decision, booking))
-                .transpose();
             // The fence, read again where the answer is handed over, with
             // the hand-over alone behind it: the answer leaves under
             // the term it was made under, or `Busy` leaves in its place.
@@ -794,9 +806,9 @@ impl Deciding {
                     Ok(lease) => Ok((
                         term,
                         decision,
-                        lease.map(|(lease, decode)| wire::Leased {
+                        lease.map(|lease| wire::Leased {
                             lease,
-                            decode: decode.map(|decode| {
+                            decode: decode.map(|decode: Lease| {
                                 // At its issue a pair's decode side differs
                                 // from its prefill's by the side and the key.
                                 debug_assert_eq!(
@@ -822,12 +834,41 @@ impl Deciding {
             };
             // The answer does not leave, and the lease filed for it goes
             // with it.
-            if let Ok(Some((lease, decode))) = filed {
+            if let Ok(Some(lease)) = filed {
                 give_up(store, world, taken.gateway, &lease, decode.as_ref(), ended);
             }
             Err(busy)
         })
     }
+}
+
+/// A pair's decision and its leases, for the one request that enters a
+/// pair plan at its prefill ([`Entry::Pair`]): decided for both sides
+/// ([`pair_in`]) and, for a pick, issued a lease a side
+/// ([`issue_pair`]). The prefill side's lease is the one filed, as a
+/// single's is, and the decode side's is laid in `decode`. Out of line: a
+/// single's decision carries no part of a pair's.
+#[inline(never)]
+fn pair(
+    store: &MemoryStore,
+    world: &World,
+    taken: &Taken<'_, Checked>,
+    term: u64,
+    buffers: &mut Buffers<<Checked as Asked>::Lists>,
+    own: &Part,
+    decode: &mut Option<Lease>,
+) -> (Decision, Result<Option<Lease>, LeaseRefused>) {
+    let (decision, booking) = pair_in(world, taken, buffers, own);
+    let filed = booking
+        .map(|booking| issue_pair(store, world, taken, term, &decision, booking))
+        .transpose();
+    let filed = filed.map(|leases| {
+        leases.map(|(prefill, side)| {
+            *decode = Some(side);
+            prefill
+        })
+    });
+    (decision, filed)
 }
 
 impl<'a> Taken<'a, Checked> {

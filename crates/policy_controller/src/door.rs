@@ -26,6 +26,8 @@ use std::{
 
 use parking_lot::{Mutex, MutexGuard};
 
+#[cfg(feature = "controller")]
+use crate::store::{DecodeSide, PairBuffers};
 use crate::{
     counts::Slot,
     decider::Decider,
@@ -35,9 +37,9 @@ use crate::{
     sessions::{Forgets, SessionVerdict},
     spec::AppliedSpec,
     store::{
-        leases::DISPATCH_TTL, Ask, AtWork, Built, DecodeSide, GatewayId, Hand, HealthSink,
-        LeaseRecord, LeaseRefused, LeaseState, LeasesStore, MemoryStore, Named, Naming,
-        PairBuffers, Picked, Said, SessionsStore, Sides, ViewBuffers, World,
+        leases::DISPATCH_TTL, Ask, AtWork, Built, GatewayId, Hand, HealthSink, LeaseRecord,
+        LeaseRefused, LeaseState, LeasesStore, MemoryStore, Named, Naming, Picked, Said,
+        SessionsStore, Sides, ViewBuffers, World,
     },
     view::{
         fingerprint, AffinityFacts, Candidate, Constraints, NamedAffinity, Phase, PinSource,
@@ -116,7 +118,9 @@ pub(crate) const SUBSET_HINT: &str = "subset-hint";
 #[derive(Default)]
 pub(crate) struct Buffers<L> {
     pub(crate) view: ViewBuffers,
-    /// Both sides' rows of a pair decision and the table of their classes.
+    /// Both sides' rows of a pair decision and the table of their classes:
+    /// a served controller's, the one host that decides a pair.
+    #[cfg(feature = "controller")]
     pub(crate) pair: PairBuffers,
     pub(crate) scratch: Scratch,
     pub(crate) lists: L,
@@ -198,34 +202,54 @@ fn pair_side(plan: Plan, phase: Phase) -> bool {
     }
 }
 
-/// The engine's decision over the world of one load: the rows and the
-/// engine are of one publication. The request for the prefill side of a
-/// pair plan ([`pair_side`]) is the pair's one request, decided for both
-/// sides ([`pair_in`]). `None` for a request for another side of a pair
-/// plan: a pair's alternates ride its answer and a retry is a new pair
-/// request, so that side has no decision, and one side's entry of the
-/// engine never makes one. What a decision that is made counts, it counts
-/// in `own`, its decider's part.
+/// The path a request takes to its decision under the plan its model is
+/// bound to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Entry {
+    /// A request that is no side of a pair plan: decided by
+    /// [`decide_in`], and its pick issued one lease ([`issue`]).
+    Single,
+    /// The prefill side of a pair plan, the pair's one request: decided
+    /// for both sides by `pair_in`, and its pick issued a lease a side
+    /// (`issue_pair`). A served controller decides it, and no other host.
+    Pair,
+    /// Another side of a pair plan. A pair's alternates ride its answer
+    /// and a retry is a new pair request, so that side has no decision,
+    /// and one side's entry of the engine never makes one.
+    Side,
+}
+
+/// The path `taken`'s request takes in the world of one load
+/// ([`pair_side`]). A single request is no plan's side: its binding is
+/// not looked up here, and the engine looks it up once.
+pub(crate) fn entry<A: Asked>(world: &World, taken: &Taken<'_, A>) -> Entry {
+    let (model, phase) = (taken.request.model(), taken.request.phase());
+    if matches!(phase, Phase::Single) {
+        return Entry::Single;
+    }
+    let binding = world.spec().engine().binding(model, phase);
+    match binding {
+        Some(binding) if pair_side(binding.plan, phase) => match phase {
+            Phase::Prefill => Entry::Pair,
+            _ => Entry::Side,
+        },
+        _ => Entry::Single,
+    }
+}
+
+/// The engine's decision over the world of one load, for a request that
+/// is no side of a pair plan ([`Entry::Single`]): the rows and the engine
+/// are of one publication. What the decision counts, it counts in `own`,
+/// its decider's part. No part of a pair is read, built or carried here:
+/// a pair's one request takes its own path (`pair_in`).
 pub(crate) fn decide_in<A: Asked>(
     world: &World,
     taken: &Taken<'_, A>,
     buffers: &mut Buffers<A::Lists>,
     own: &Part,
-) -> Option<(Decision, Option<Booking>)> {
+) -> (Decision, Option<Booking>) {
     let spec = world.spec();
     let engine = spec.engine();
-    let (model, phase) = (taken.request.model(), taken.request.phase());
-    // A single request is no plan's side: its binding is looked up once, by
-    // the engine.
-    if !matches!(phase, Phase::Single)
-        && engine
-            .binding(model, phase)
-            .is_some_and(|binding| pair_side(binding.plan, phase))
-    {
-        // A pair enters at its prefill, and that one request decides both
-        // of its sides. Its other sides have no decision of their own.
-        return matches!(phase, Phase::Prefill).then(|| pair_in(world, taken, buffers, own));
-    }
     if taken.request.hashes() > taken.request.hashes_read(spec) {
         own.hashes_cut.fetch_add(1, Ordering::Relaxed);
     }
@@ -273,16 +297,15 @@ pub(crate) fn decide_in<A: Asked>(
                     tokens: facts.prompt_tokens,
                     now_micros: facts.now_micros,
                     built: None,
-                    decode: None,
                 })
             });
             (decision, booking)
         },
     );
-    Some((
+    (
         decision,
         booking.map(|booking| Booking { built, ..booking }),
-    ))
+    )
 }
 
 /// The engine's pair decision over the world of one load, for the request
@@ -294,12 +317,13 @@ pub(crate) fn decide_in<A: Asked>(
 /// sides. A side with rows that the gateway's own word leaves none is shed
 /// under that constraint's name, as a single's pool is. A pick's booking
 /// holds both sides, each worker's count beside its own pool's row.
+#[cfg(feature = "controller")]
 pub(crate) fn pair_in<A: Asked>(
     world: &World,
     taken: &Taken<'_, A>,
     buffers: &mut Buffers<A::Lists>,
     own: &Part,
-) -> (Decision, Option<Booking>) {
+) -> (Decision, Option<PairBooking>) {
     let Taken {
         request,
         gateway,
@@ -418,17 +442,20 @@ pub(crate) fn pair_in<A: Asked>(
                 tokens: facts.prompt_tokens,
                 target_index: 0,
             };
-            Some(Booking {
-                target: first.id,
-                picked: Picked::of(&pick.targets),
-                verdict: pick.session_verdict,
-                ttl_micros,
-                generation: pick.trace.generation,
-                session: facts.session(),
-                tokens: facts.prompt_tokens,
-                now_micros: facts.now_micros,
-                built: Some(built.0),
-                decode: Some((decode, world.booked(&built.1, chosen.decode_id))),
+            Some(PairBooking {
+                prefill: Booking {
+                    target: first.id,
+                    picked: Picked::of(&pick.targets),
+                    verdict: pick.session_verdict,
+                    ttl_micros,
+                    generation: pick.trace.generation,
+                    session: facts.session(),
+                    tokens: facts.prompt_tokens,
+                    now_micros: facts.now_micros,
+                    built: Some(built.0),
+                },
+                decode,
+                slot: world.booked(&built.1, chosen.decode_id),
             })
         });
         (decision, booking)
@@ -457,20 +484,27 @@ pub(crate) struct Booking {
     pub(crate) now_micros: u64,
     /// The build the decision read: where its target's count stands.
     pub(crate) built: Option<Built>,
-    /// A pair's decode side, with the slot of its worker's count as the
-    /// decision's build of the decode pool names it; none for a single's.
-    pub(crate) decode: Option<(DecodeSide, Option<Slot>)>,
 }
 
-/// Issues the lease of a pick, one a decision, ahead of the read that lets
-/// its answer leave: a credit on the pick's first target, minted and filed
-/// by the store under `term`, the fence's at the decision's first read, at
-/// that read's instant, from which [`DISPATCH_TTL`] runs for its gateway
-/// to name a dispatch. The lease books the count the decision's own world
-/// lays beside its target's row, and the engine that decided is told of
-/// it. A pair's pick is issued a lease a side under the one id the store
-/// mints: one record and one write of the file, each side booking the
-/// count beside its own pool's row, and the engine told once a side.
+/// What a pair's two leases take of its decision's hand-over: the prefill
+/// side's booking, which is a single's, and the decode side with the slot
+/// of its worker's count as the decision's build of the decode pool names
+/// it.
+#[cfg(feature = "controller")]
+#[derive(Clone, Copy)]
+pub(crate) struct PairBooking {
+    pub(crate) prefill: Booking,
+    pub(crate) decode: DecodeSide,
+    pub(crate) slot: Option<Slot>,
+}
+
+/// Issues the lease of a single's pick, one a decision, ahead of the read
+/// that lets its answer leave: a credit on the pick's first target, minted
+/// and filed by the store under `term`, the fence's at the decision's
+/// first read, at that read's instant, from which [`DISPATCH_TTL`] runs
+/// for its gateway to name a dispatch. The lease books the count the
+/// decision's own world lays beside its target's row, and the engine that
+/// decided is told of it.
 ///
 /// # Errors
 ///
@@ -483,14 +517,62 @@ pub(crate) fn issue<A: Asked>(
     term: u64,
     decision: &Decision,
     booking: Booking,
-) -> Result<(Lease, Option<Lease>), LeaseRefused> {
-    let side = if booking.decode.is_some() {
-        Side::Prefill
-    } else {
-        Side::Single
-    };
+) -> Result<Lease, LeaseRefused> {
+    let record = record_of(taken, term, &booking, Side::Single);
+    let booked = booked_in(world, &booking);
+    // Under one hold of the turn the store applies what is handed, files
+    // the lease, tells the engine that decided of it, and ends and tells
+    // the leases it finds past their dispatch deadline.
+    let engine = world.spec().engine();
+    store.issue_decided(record, booked, |lease| {
+        engine.on_decision_issued(lease, decision);
+    })
+}
+
+/// Issues the two leases of a pair's pick, [`issue`] for a pair: a lease a
+/// side under the one id the store mints, one record and one write of the
+/// file, each side booking the count beside its own pool's row, and the
+/// engine told once a side, the prefill's first. `Ok` is the prefill
+/// side's lease, then the decode side's.
+///
+/// # Errors
+///
+/// Those of [`issue`].
+#[cfg(feature = "controller")]
+pub(crate) fn issue_pair<A: Asked>(
+    store: &MemoryStore,
+    world: &World,
+    taken: &Taken<'_, A>,
+    term: u64,
+    decision: &Decision,
+    booking: PairBooking,
+) -> Result<(Lease, Lease), LeaseRefused> {
+    let PairBooking {
+        prefill,
+        decode,
+        slot,
+    } = booking;
+    let record = record_of(taken, term, &prefill, Side::Prefill);
+    let booked = booked_in(world, &prefill);
+    let engine = world.spec().engine();
+    let lease = store.issue_decided_pair(record, decode, [booked, slot], |lease| {
+        engine.on_decision_issued(lease, decision);
+    })?;
+    // A pair's two leases share the id the store minted.
+    Ok((lease, decode.lease(&lease)))
+}
+
+/// The record of the lease `booking` asks on `side`, as its door hands it
+/// to the store: the store mints its id, and writes the mark of a pair's
+/// lease where it files one.
+#[inline(always)]
+fn record_of<A: Asked>(
+    taken: &Taken<'_, A>,
+    term: u64,
+    booking: &Booking,
+    side: Side,
+) -> LeaseRecord {
     let lease = Lease {
-        // The store mints the id.
         id: LeaseId::default(),
         kind: LeaseKind::Credit,
         side,
@@ -502,34 +584,26 @@ pub(crate) fn issue<A: Asked>(
         issued_micros: booking.now_micros,
         tokens: booking.tokens,
     };
-    let record = LeaseRecord {
+    LeaseRecord {
         lease,
         gateway: taken.gateway,
         request: fingerprint(taken.request.id()),
         target: booking.target,
         picked: booking.picked,
-        // The store writes the mark of a pair's lease where it files one.
         decode: None,
         term,
         issued_at: taken.now,
         dispatch_deadline: taken.due(),
         state: LeaseState::issued(booking.ttl_micros),
-    };
-    let built = booking.built;
-    let booked = built.and_then(|built| world.booked(&built, booking.target));
-    // Under one hold of the turn the store applies what is handed, files
-    // the lease, tells the engine that decided of it, once a side of a
-    // pair's and the prefill's first, and ends and tells the leases it
-    // finds past their dispatch deadline.
-    let engine = world.spec().engine();
-    let issued = |lease: &Lease| engine.on_decision_issued(lease, decision);
-    let Some((side, decode)) = booking.decode else {
-        let lease = store.issue_decided(record, booked, issued)?;
-        return Ok((lease, None));
-    };
-    // A pair's two leases share the id the store minted.
-    let lease = store.issue_decided_pair(record, side, [booked, decode], issued)?;
-    Ok((lease, Some(side.lease(&lease))))
+    }
+}
+
+/// The slot of the count `booking`'s lease books: its target's, as the
+/// build its decision read names it.
+#[inline(always)]
+fn booked_in(world: &World, booking: &Booking) -> Option<Slot> {
+    let built = booking.built?;
+    world.booked(&built, booking.target)
 }
 
 /// A shed the deciders say in the engine's place, in the shape of the
@@ -1709,26 +1783,17 @@ impl Door {
         // this door's answer carries one: each side of a pair plan is
         // refused ahead of its decision. A single request is no
         // plan's side, and its binding is not looked up here.
-        let (model, phase) = (taken.request.facts.model, taken.request.facts.phase);
-        let engine = world.spec().engine();
-        if !matches!(phase, Phase::Single)
-            && engine
-                .binding(model, phase)
-                .is_some_and(|binding| pair_side(binding.plan, phase))
-        {
+        if entry(world, taken) != Entry::Single {
             return Err(Refused::PairSide);
         }
-        let decided = decide_in(world, taken, buffers, &self.parts[at]);
-        let (decision, booking) = decided.ok_or(Refused::PairSide)?;
+        let (decision, booking) = decide_in(world, taken, buffers, &self.parts[at]);
         let lease = booking
             .map(|booking| issue(&self.store, world, taken, term, &decision, booking))
             .transpose()
             .map_err(|_| Refused::Unleased)?;
         Ok(Decided {
             decision,
-            // A pair plan is refused ahead of its decision, so the
-            // issue filed one lease.
-            lease: lease.map(|(lease, _)| Leased {
+            lease: lease.map(|lease| Leased {
                 lease,
                 due: taken.due(),
             }),
