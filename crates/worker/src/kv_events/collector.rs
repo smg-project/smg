@@ -5,7 +5,7 @@
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, OnceLock, Weak,
     },
 };
@@ -86,6 +86,10 @@ pub struct KvEventCollector<H: KvEventHost> {
     /// sink, a peer in the host. Unset in a collector built alone (the
     /// tests), which holds every object.
     worker_registry: OnceLock<Weak<dyn WorkerLookup>>,
+    /// Set by [`Self::stop`] and never cleared: a stopped collector starts
+    /// no subscription. Written and read under the slot lock, so an add
+    /// finds it on the turn that would have started its task.
+    stopped: AtomicBool,
 }
 
 /// The registry as the collector holds it: it asks one thing of it, the
@@ -184,6 +188,7 @@ impl<H: KvEventHost> KvEventCollector<H> {
             worker_handles: Arc::new(Mutex::new(HashMap::new())),
             load_sink: OnceLock::new(),
             worker_registry: OnceLock::new(),
+            stopped: AtomicBool::new(false),
         }
     }
 
@@ -248,7 +253,8 @@ impl<H: KvEventHost> KvEventCollector<H> {
     /// object has under the URL is left to it. The registry's removal
     /// changes the registry before it reaches this lock: a read here sees
     /// the removal, or the removal finds the slot this add inserts. A
-    /// collector without a registry holds every object.
+    /// collector without a registry holds every object. A stopped
+    /// collector starts nothing: the add reads that on the same turns.
     pub async fn on_worker_added(&self, worker: &Arc<dyn Worker>, kind: SubscriptionKind) {
         let url = worker.url().to_string();
         // An empty model id is keyed as `UNKNOWN_MODEL_ID`.
@@ -265,6 +271,13 @@ impl<H: KvEventHost> KvEventCollector<H> {
 
         let mut handles = loop {
             let mut handles = self.worker_handles.lock().await;
+            // Under the slot lock, on every turn: a stopped collector starts
+            // nothing, so no task begins behind the stop that would have
+            // ended it.
+            if self.stopped.load(Ordering::Relaxed) {
+                debug!(worker_url = %Endpoint::redacted_str(&url), "no KV event stream from a stopped collector");
+                return;
+            }
             // Under the slot lock, on every turn: an object the registry no
             // longer holds gets no stream, and a stream another object has
             // under the URL is not stopped for it.
@@ -642,10 +655,16 @@ impl<H: KvEventHost> KvEventCollector<H> {
         Self::lift_reservation(&mut handles, &self.host, worker_url, id);
     }
 
-    /// Stop all subscriptions. What the host holds is its caller's to clear.
+    /// Stop every subscription, for good: an add that comes later, or that
+    /// was waiting for a turn of the slot lock, starts none. What the host
+    /// keeps for a model is the host's to clear: a stop tells it of no
+    /// model.
     pub async fn stop(&self) {
         let subscriptions: Vec<(String, WorkerSubscription)> = {
             let mut handles = self.worker_handles.lock().await;
+            // Under the lock, ahead of the slots taken below: an add on a
+            // later turn finds the mark.
+            self.stopped.store(true, Ordering::Relaxed);
             let mut active = Vec::new();
             for (url, slot) in std::mem::take(&mut *handles) {
                 match slot {
@@ -1779,7 +1798,7 @@ mod tests {
     }
 
     /// A stop ends the tasks and tells the host of no model: what the host
-    /// keeps is its caller's to clear.
+    /// keeps for a model is the host's to clear.
     #[tokio::test]
     async fn a_stop_tells_the_host_of_no_model() {
         let host = Arc::new(RecordingHost::default());
@@ -1798,6 +1817,59 @@ mod tests {
                 "open unknown grpc://127.0.0.1:12",
             ],
             "a stop asks the host nothing"
+        );
+    }
+
+    /// A stop is for good: an add that comes after it starts no task, takes
+    /// no slot and asks the host nothing.
+    #[tokio::test]
+    async fn an_add_after_a_stop_starts_nothing() {
+        let host = Arc::new(RecordingHost::default());
+        let collector = KvEventCollector::new(Arc::clone(&host));
+        collector.stop().await;
+        let worker = unconnected_grpc_worker_at("grpc://127.0.0.1:17");
+        collector
+            .on_worker_added(&worker, SubscriptionKind::Events)
+            .await;
+        assert_eq!(collector.slot_ids(worker.url()).await, (None, None));
+        assert!(
+            host.calls().is_empty(),
+            "a stopped collector asks the host nothing"
+        );
+    }
+
+    /// The add reads the stop on each of its turns: one that waited for an
+    /// old task to end while the stop came starts nothing on its next turn,
+    /// where it would have started a task the stop never ends.
+    #[tokio::test]
+    async fn an_add_that_waited_through_a_stop_starts_nothing() {
+        let collector = new_collector();
+        let url = "grpc://127.0.0.1:18";
+        let first = unconnected_grpc_worker_at(url);
+        collector
+            .on_worker_added(&first, SubscriptionKind::Loads)
+            .await;
+        let (old, _) = collector.slot_ids(url).await;
+        assert!(old.is_some(), "the first object's stream is active");
+
+        // Another object under the address: its add takes the old stream
+        // out and waits for the old task to end.
+        let second = unconnected_grpc_worker_at(url);
+        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        let mut restart =
+            std::pin::pin!(collector.on_worker_added(&second, SubscriptionKind::Loads));
+        assert!(
+            std::future::Future::poll(restart.as_mut(), &mut cx).is_pending(),
+            "the restart's first turn ends in its wait for the old task"
+        );
+        assert_eq!(collector.slot_ids(url).await, (None, old));
+
+        collector.stop().await;
+        restart.await;
+        assert_eq!(
+            collector.slot_ids(url).await,
+            (None, None),
+            "the add starts nothing behind the stop"
         );
     }
 
