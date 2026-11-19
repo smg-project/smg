@@ -8130,6 +8130,7 @@ dependencies = [
  "sha2 0.11.0",
  "smg-grpc-client",
  "smg-policy-controller",
+ "smg-service-discovery",
  "smg-worker",
  "tempfile",
  "thiserror 2.0.21",

@@ -71,6 +71,9 @@ smg-grpc-client = { workspace = true, optional = true }
 # object, its builder and its registry, for the host that keeps an object for
 # every row of the membership store.
 smg-worker = { workspace = true, features = ["runtime"], optional = true }
+# Worker discovery (the `discovery` feature): the discovery crate with its
+# four providers, each of which the controller's flags can select.
+smg-service-discovery = { workspace = true, features = ["consul", "file", "kubernetes", "slurm"], optional = true }
 
 # The standalone controller (the `controller` feature): the listeners, the
 # health service, the admin endpoints and the binary. Every dependency below
@@ -198,6 +201,10 @@ kubernetes = ["dep:k8s-openapi", "dep:kube", "tokio/rt"]
 # gRPC connector.
 worker-host = ["dep:smg-worker", "dep:tracing", "smg-grpc-client?/engine-port"]
 
+# Worker discovery on the leading controller, over the replica's worker
+# objects. Off by default.
+discovery = ["controller", "worker-host", "dep:smg-service-discovery"]
+
 default = ["wasm"]
 # The WebAssembly plugin host over the committed `smg:policy` worlds.
 wasm = ["dep:wasmtime", "dep:thread_local", "dep:tracing", "dep:rustix"]
@@ -216,6 +223,8 @@ test-util = ["smg-worker?/test-util"]
 # name first, and the controller image's line, which names its features so,
 # would turn them on for this test edge alone and build no binary.
 smg-policy-controller-test-util = { package = "smg-policy-controller", path = ".", default-features = false, features = ["test-util"] }
+# The discovery cases record the jobs a provider submits.
+smg-service-discovery = { workspace = true, features = ["test-util"] }
 criterion = "0.8"
 # The Kubernetes elector's tests run its client against a service in the
 # test's process that plays one Lease, and its three-process cell against

@@ -3,8 +3,8 @@
 //! binary calls [`run`] with the stock catalog, a host's own binary with
 //! the stages it added. The command line is the operator's surface: the
 //! controller's identity, its listeners, their TLS, the election, the
-//! shutdown bounds and the logging; the routing policy itself is the spec's
-//! and arrives over the control scope.
+//! shutdown bounds, logging and worker discovery. The routing policy
+//! arrives over the control scope.
 
 use std::{
     ffi::OsStr, future::pending, io::IsTerminal, net::SocketAddr, path::PathBuf, process::ExitCode,
@@ -18,6 +18,8 @@ use tokio::signal::unix::{signal, SignalKind};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
+#[cfg(feature = "discovery")]
+use super::discovery::{DiscoveryFlags, DiscoverySettings};
 use super::{
     Config, ConfigError, Controller, Election, Error, LeasePlace, Listener, Scope, Tls, VERSION,
 };
@@ -257,6 +259,10 @@ struct Cli {
     /// Output logs as JSON
     #[arg(long, default_value_t = false, help_heading = "Logging")]
     log_json: bool,
+
+    #[cfg(feature = "discovery")]
+    #[command(flatten)]
+    discovery: DiscoveryFlags,
 }
 
 /// A duration in whole milliseconds, as the election's flags take it.
@@ -396,6 +402,18 @@ impl Cli {
                 },
                 advertise: self.advertise_address.clone(),
             },
+            #[cfg(feature = "discovery")]
+            discovery: {
+                let settings = self.discovery.settings()?;
+                let credential = self.discovery.credential()?;
+                settings
+                    .map(|settings| {
+                        DiscoverySettings::new(settings, self.discovery.roles(), credential)
+                    })
+                    .transpose()?
+            },
+            #[cfg(not(feature = "discovery"))]
+            discovery: None,
         })
     }
 }
@@ -692,6 +710,63 @@ mod tests {
 
     fn config(args: &[&str]) -> Result<Config, ConfigError> {
         parse(args).config()
+    }
+
+    #[cfg(feature = "discovery")]
+    #[test]
+    fn the_discovery_flags_reach_the_configuration() {
+        use smg_service_discovery::RuntimeDiscoveryConfig;
+
+        let args = [
+            "--discovery-provider",
+            "file",
+            "--discovery-file",
+            "/run/workers.json",
+            "--discovery-check-interval-secs",
+            "13",
+            "--api-key",
+            "worker-key",
+        ];
+        let configured = config(&args).expect("discovery configuration");
+        let settings = configured.discovery.as_ref().expect("selected provider");
+        let RuntimeDiscoveryConfig::File(file) = settings.runtime() else {
+            panic!("expected the file provider");
+        };
+        assert_eq!(file.path, Path::new("/run/workers.json"));
+        assert_eq!(file.check_interval, Duration::from_secs(13));
+        assert!(settings.credential().is_some());
+        assert_eq!(configured, config(&args).expect("the same settings"));
+        assert_ne!(configured, config(&args[..6]).expect("without a key"));
+        let mut other_file = args;
+        other_file[3] = "/run/other.json";
+        assert_ne!(configured, config(&other_file).expect("another manifest"));
+        let disaggregated = [&args[..], &["--prefill-selector", "role=prefill"]].concat();
+        assert_ne!(
+            configured,
+            config(&disaggregated).expect("another set of roles")
+        );
+        assert!(config(&[]).expect("the defaults").discovery.is_none());
+        assert!(matches!(
+            config(&["--discovery-provider", "file"]),
+            Err(ConfigError::DiscoveryFlag {
+                flag: "--discovery-file",
+                ..
+            })
+        ));
+    }
+
+    #[cfg(not(feature = "discovery"))]
+    #[test]
+    fn a_build_without_discovery_refuses_its_flags() {
+        for flags in [
+            &["--service-discovery"][..],
+            &["--discovery-provider", "file"],
+            &["--discovery-file", "workers.json"],
+            &["--api-key", "worker-key"],
+            &["--api-key-file", "worker-key.txt"],
+        ] {
+            assert!(refuses(flags), "{flags:?}");
+        }
     }
 
     const IDENTITY: [&str; 4] = ["--tls-cert", "server.pem", "--tls-key", "server.key"];
