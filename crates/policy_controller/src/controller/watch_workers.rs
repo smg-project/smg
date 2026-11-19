@@ -67,8 +67,10 @@ use tonic::{codegen::tokio_stream::Stream, Status};
 use tracing::{info, warn};
 
 use super::{principal::Principal, worker_wire};
+pub(super) use crate::operator::snapshot::PAGE_BYTES;
 use crate::{
     elector::Fence,
+    operator::snapshot::serves,
     proto,
     replication::{Entry, Event, Log, Stamp},
     store::{Cut, GatewayId, Kinds, MemoryStore, Position, WorkerRow},
@@ -76,10 +78,6 @@ use crate::{
 
 /// The rows of one snapshot page.
 const PAGE: usize = 128;
-
-/// The bytes of one snapshot page's rows on the wire: half a frame of 4 MiB.
-/// A page of [`PAGE`] rows at the door's bound of a row is cut here.
-pub(super) const PAGE_BYTES: usize = 2 * 1024 * 1024;
 
 /// The log entries a stream takes at one read: what it holds of the log
 /// until its watcher took them.
@@ -581,12 +579,6 @@ pub(crate) fn open(
     })
 }
 
-/// Whether `row` serves one of `models`, the ids a caller asked for; none
-/// asked is every model. A watch and the operators' snapshot ask alike.
-pub(super) fn serves(models: &[String], row: &WorkerRow) -> bool {
-    models.is_empty() || row.facts.models.iter().any(|model| models.contains(model))
-}
-
 /// The models a watcher asked for; none is every model.
 #[derive(Debug)]
 struct Asked {
@@ -653,8 +645,7 @@ pub(super) fn fill<'a>(
 
 /// [`fill`] under a count of the caller's: at most `most` of `rows` while
 /// they take at most [`PAGE_BYTES`] on the wire, the first whatever it
-/// weighs. The operators' snapshot is one such page, under its caller's
-/// limit.
+/// weighs.
 pub(super) fn fill_within<'a>(
     most: usize,
     rows: impl IntoIterator<Item = &'a WorkerRow>,

@@ -2568,7 +2568,7 @@ pub(crate) mod tests {
         let profile = document.profiles.get_mut("random");
         profile.expect("the preset's profile").pick = name.into();
         let digest = document.digest().expect("the document digests");
-        let spec = AppliedSpec::validate_digested(&document, digest, &catalog);
+        let spec = AppliedSpec::validate_digested(&document, digest, &catalog, &[]);
         let applied = store.apply(spec.expect("the catalog holds the stage"));
         applied.expect("a later generation");
     }
@@ -4315,7 +4315,7 @@ pub(crate) mod tests {
         let rule = document.bindings[0].sessions.as_mut();
         rule.expect("the preset's rule").assignment = crate::Assignment::Delegate;
         let digest = document.digest().expect("the document digests");
-        let spec = AppliedSpec::validate_digested(&document, digest, &catalog);
+        let spec = AppliedSpec::validate_digested(&document, digest, &catalog, &[]);
         let applied = store.apply(spec.expect("the catalog holds the stage"));
         applied.expect("a later generation");
         let door = Door::new(Arc::clone(&store));

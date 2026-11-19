@@ -11,7 +11,7 @@
 //! exist. A link takes a name once and replaces none, so no write puts a
 //! file over a generation on file, whoever wrote it; a number on file in
 //! the other form is refused where the write finds it. The door
-//! ([`Generations`]) persists a document here and only then calls the
+//! ([`SpecDoor`]) persists a document here and only then calls the
 //! store's entry, one apply at a time: one process writes the directory,
 //! under the door's lock alone.
 //!
@@ -72,7 +72,12 @@
 //! the read call reads its file through the directory itself ([`read_at`]),
 //! under no lock of the door.
 //!
-//! [`Generations`]: super::generations::Generations
+//! [`SpecDoor`]: super::SpecDoor
+
+#![cfg_attr(
+    not(any(test, feature = "controller")),
+    expect(dead_code, reason = "Only a host with a spec store opens a directory.")
+)]
 
 use std::{
     fs,
@@ -86,10 +91,10 @@ use std::{
 
 use tracing::info;
 
-use super::{
-    generations::{Format, SpecRejected, MAX_DOCUMENT_BYTES},
-    spec_file::NOT_A_FILE,
-};
+use super::{Format, SpecRejected, MAX_DOCUMENT_BYTES};
+
+/// What a read says of a path that leads to no regular file.
+pub(crate) const NOT_A_FILE: &str = "the path leads to no regular file";
 
 /// How many generations a store keeps: the standing one and the seven
 /// before it.
@@ -163,6 +168,7 @@ pub enum StoreRefused {
     #[error(
         "another replica can take this controller's lease, and a standby follows a file's generations alone in this build: keep the lease in the process, or hand the spec as a file"
     )]
+    #[cfg(feature = "controller")]
     BesideASharedLease,
     /// The controller took a spec source before this one.
     #[error("the controller has a spec source already")]
@@ -777,9 +783,9 @@ pub(crate) mod tests {
     use std::{collections::BTreeSet, sync::mpsc};
 
     use super::*;
-    use crate::controller::membership::tests::Logged;
     #[cfg(unix)]
-    use crate::controller::spec_file::tests::pipe_at;
+    use crate::operator::test_support::pipe_at;
+    use crate::operator::test_support::Logged;
 
     const YAML: Format = Format::Yaml;
 

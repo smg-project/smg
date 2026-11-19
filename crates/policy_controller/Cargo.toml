@@ -87,7 +87,7 @@ prost = { workspace = true, optional = true }
 # or HTTP client; the gateway, the servicer and the mock worker install the
 # same one.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
-tokio = { workspace = true, features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"], optional = true }
+tokio = { workspace = true, features = ["sync"], optional = true }
 tonic = { workspace = true, features = ["tls-ring"], optional = true }
 tonic-health = { workspace = true, optional = true }
 tonic-prost = { workspace = true, optional = true }
@@ -136,6 +136,19 @@ ingest = [
     "dep:tokio",
     "dep:tonic",
     "dep:tracing",
+    "tokio/macros",
+    "tokio/rt",
+    "tokio/time",
+]
+# Reading and applying a policy document in process. The turn uses only
+# Tokio's sync primitives. It builds on Linux and macOS: the spec store's
+# file calls come of `rustix`, a dependency on those two alone.
+operator = [
+    "dep:rustix",
+    "dep:serde_path_to_error",
+    "dep:serde_yaml",
+    "dep:tokio",
+    "dep:tracing",
 ]
 # The standalone controller: the ingestion drivers, the listeners with their
 # scopes, the protocol's generated service and client, the election, the gRPC
@@ -145,27 +158,27 @@ ingest = [
 # peer's user through `rustix`, which is declared for those two.
 controller = [
     "ingest",
+    "operator",
     "dep:axum",
     "dep:clap",
     "dep:hyper-util",
     "dep:metrics",
     "dep:metrics-exporter-prometheus",
     "dep:prost",
-    "dep:rustix",
     "dep:rustls",
-    "dep:serde_path_to_error",
-    "dep:serde_yaml",
     "dep:thread_local",
     "dep:tikv-jemallocator",
-    "dep:tokio",
     "dep:tokio-stream",
     "dep:tonic",
     "dep:tonic-health",
     "dep:tonic-prost",
     "dep:tonic-prost-build",
     "dep:tower",
-    "dep:tracing",
     "dep:tracing-subscriber",
+    "tokio/fs",
+    "tokio/net",
+    "tokio/rt-multi-thread",
+    "tokio/signal",
 ]
 
 # The reference client of the controller's protocol, for the crate's cases
@@ -174,7 +187,7 @@ controller = [
 client = ["controller"]
 
 # The Kubernetes Lease backend of the elector.
-kubernetes = ["dep:k8s-openapi", "dep:kube", "dep:tokio"]
+kubernetes = ["dep:k8s-openapi", "dep:kube", "tokio/rt"]
 
 # A replica's worker objects: one object of the worker crate for every row of
 # the membership store, in a registry the host hands in, built, replaced and
@@ -211,6 +224,8 @@ axum = { workspace = true }
 http = { workspace = true }
 # The load driver's unit tests add the test macro and tokio's paused clock.
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "test-util"] }
+# The spec store cases collect the lines the source logs.
+tracing-subscriber = { workspace = true }
 # The corpus test reads YAML documents.
 serde_yaml = { workspace = true }
 # The contract tests (tests/contracts.rs) compile the protocol to a
@@ -251,6 +266,10 @@ required-features = ["controller"]
 [[test]]
 name = "binary"
 required-features = ["controller"]
+
+[[test]]
+name = "operator_door"
+required-features = ["operator"]
 
 [[test]]
 name = "spec_file"

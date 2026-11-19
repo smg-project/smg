@@ -50,7 +50,7 @@
 
 use std::{
     mem,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 pub(crate) use crate::door::Viewed;
@@ -58,6 +58,7 @@ use crate::{
     decision::{Decision, ShedReason, Target, Trace},
     door::Asked,
     lease::{Lease, Side},
+    operator::{Document, NeedsRow, Status},
     proto::{self, busy::Reason, decide_answer::Answer, decision::Outcome, identity::Form},
     spec::{AppliedSpec, MAX_HEADERS},
     view::{
@@ -700,6 +701,133 @@ fn trace(trace: &Trace) -> proto::Trace {
     }
 }
 
+/// A redacted snapshot row, with its age at the take's clock.
+pub(super) fn snapshot_row(row: &crate::store::WorkerRow, now: Instant) -> proto::WorkerRow {
+    let mut told = super::worker_wire::row(row);
+    told.admitted_age_ms = super::replication::age_ms(now, row.admitted_at);
+    told
+}
+
+/// The operator's status in the contract's form.
+pub(super) fn spec_status(status: Status) -> proto::SpecStatus {
+    let mode = if status.applied.is_some() {
+        proto::ApplyMode::Enforce
+    } else {
+        proto::ApplyMode::Unspecified
+    };
+    proto::SpecStatus {
+        generation: status.generation,
+        digest: status
+            .digest
+            .map_or_else(String::new, |digest| digest.to_string()),
+        applied_unix_micros: status.applied.map_or(0, unix_micros),
+        mode: mode.into(),
+        retained: status.retained,
+        source: if status.writable { "api" } else { "file" }.to_owned(),
+    }
+}
+
+/// The source's document as the spec read call answers it.
+pub(super) fn spec_document(document: Document) -> proto::PolicySpecDocument {
+    proto::PolicySpecDocument {
+        generation: document.generation,
+        digest: document.digest.to_string(),
+        document: document.document,
+        format: document.format.as_str().to_owned(),
+        applied_unix_micros: unix_micros(document.applied),
+        mode: proto::ApplyMode::Enforce.into(),
+        acks: Vec::new(),
+    }
+}
+
+/// The source's document and its status as a standby is sent them.
+pub(super) fn generation_event(document: Document) -> proto::GenerationEvent {
+    let digest = document.digest.to_string();
+    proto::GenerationEvent {
+        status: Some(proto::SpecStatus {
+            generation: document.generation,
+            digest: digest.clone(),
+            applied_unix_micros: unix_micros(document.applied),
+            mode: proto::ApplyMode::Enforce.into(),
+            ..proto::SpecStatus::default()
+        }),
+        document: Some(proto::SpecPush {
+            generation: document.generation,
+            digest,
+            document: document.document,
+            format: document.format.as_str().to_owned(),
+            needs: None,
+        }),
+    }
+}
+
+/// The feeds before and after a document's verdict.
+pub(super) fn needs_diff((before, after): (Vec<NeedsRow>, Vec<NeedsRow>)) -> proto::NeedsDiff {
+    proto::NeedsDiff {
+        before: Some(needs_summary(before)),
+        after: Some(needs_summary(after)),
+    }
+}
+
+/// A time as the contract carries it, or zero where it cannot be stated.
+pub(super) fn unix_micros(at: SystemTime) -> i64 {
+    at.duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|since| i64::try_from(since.as_micros()).ok())
+        .unwrap_or(0)
+}
+
+/// What a host must feed for these rows, as the contract writes it: a row
+/// for each of the engine's rows that has a flag to set
+/// ([`crate::Engine::needs_rows`]), in their order. A need the contract's row has
+/// no flag for is not told here: a worker's requests in flight, the
+/// sessions in flight, a key's in-flight count and the affinity column are
+/// the controller's own to hold.
+pub(super) fn needs_summary(rows: Vec<NeedsRow>) -> proto::NeedsSummary {
+    let models = rows
+        .into_iter()
+        .filter(|NeedsRow { needs, .. }| {
+            needs.text
+                || needs.token_hashes
+                || needs.text_hashes
+                || needs.loads
+                || needs.events
+                || needs.ring
+                || needs.headers
+                || needs.media
+        })
+        .map(
+            |NeedsRow {
+                 model,
+                 phase,
+                 needs,
+             }| proto::ModelNeeds {
+                model,
+                role: role(phase).into(),
+                text: needs.text,
+                token_hashes: needs.token_hashes,
+                text_hashes: needs.text_hashes,
+                loads: needs.loads,
+                events: needs.events,
+                ring: needs.ring,
+                headers: needs.headers,
+                media: needs.media,
+            },
+        )
+        .collect();
+    proto::NeedsSummary { models }
+}
+
+/// The role a phase's decision places on, as the contract writes it.
+const fn role(phase: Phase) -> proto::Role {
+    match phase {
+        Phase::Single => proto::Role::Single,
+        Phase::Prefill => proto::Role::Prefill,
+        Phase::Decode => proto::Role::Decode,
+        Phase::Encode => proto::Role::Encode,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{busy, credit, decided, emptied, Checked, Lists, Refusal, Viewed, MAX_FRAME};
@@ -715,6 +843,297 @@ mod tests {
             ModelFingerprint, Phase, RequestFacts, WireModes, WorkerId,
         },
     };
+
+    #[test]
+    fn plain_spec_answers_keep_each_wire_field() {
+        use std::time::{Duration, UNIX_EPOCH};
+
+        use prost::Message as _;
+
+        use crate::{
+            operator::{Document, Format, NeedsRow, Status},
+            spec::PolicySpec,
+            Needs,
+        };
+
+        let digest = PolicySpec::preset("random")
+            .expect("a policy")
+            .digest()
+            .expect("a digest");
+        let applied = UNIX_EPOCH + Duration::from_micros(123_456);
+        let status = super::spec_status(Status {
+            generation: 7,
+            digest: Some(digest),
+            applied: Some(applied),
+            retained: vec![2, 4],
+            writable: true,
+        });
+        assert_eq!(
+            status.encode_to_vec(),
+            proto::SpecStatus {
+                generation: 7,
+                digest: digest.to_string(),
+                applied_unix_micros: 123_456,
+                mode: proto::ApplyMode::Enforce.into(),
+                retained: vec![2, 4],
+                source: "api".to_owned(),
+            }
+            .encode_to_vec()
+        );
+        let empty = super::spec_status(Status {
+            generation: 0,
+            digest: None,
+            applied: None,
+            retained: Vec::new(),
+            writable: false,
+        });
+        assert_eq!(
+            empty,
+            proto::SpecStatus {
+                source: "file".to_owned(),
+                ..proto::SpecStatus::default()
+            }
+        );
+        let document = super::spec_document(Document {
+            generation: 7,
+            digest,
+            document: b"the source's bytes\n".to_vec(),
+            format: Format::Yaml,
+            applied,
+        });
+        assert_eq!(
+            document.encode_to_vec(),
+            proto::PolicySpecDocument {
+                generation: 7,
+                digest: digest.to_string(),
+                document: b"the source's bytes\n".to_vec(),
+                format: "yaml".to_owned(),
+                applied_unix_micros: 123_456,
+                mode: proto::ApplyMode::Enforce.into(),
+                acks: Vec::new(),
+            }
+            .encode_to_vec()
+        );
+        let row = |model: &str, phase, needs| NeedsRow {
+            model: model.to_owned(),
+            phase,
+            needs,
+        };
+        let diff = super::needs_diff((
+            vec![
+                row(
+                    "local",
+                    Phase::Single,
+                    Needs {
+                        affinity: true,
+                        ..Needs::default()
+                    },
+                ),
+                row(
+                    "paired",
+                    Phase::Prefill,
+                    Needs {
+                        headers: true,
+                        media: true,
+                        ..Needs::default()
+                    },
+                ),
+            ],
+            vec![row(
+                "paired",
+                Phase::Decode,
+                Needs {
+                    text: true,
+                    token_hashes: true,
+                    text_hashes: true,
+                    loads: true,
+                    events: true,
+                    ring: true,
+                    ..Needs::default()
+                },
+            )],
+        ));
+        assert_eq!(
+            diff.encode_to_vec(),
+            proto::NeedsDiff {
+                before: Some(proto::NeedsSummary {
+                    models: vec![proto::ModelNeeds {
+                        model: "paired".to_owned(),
+                        role: proto::Role::Prefill.into(),
+                        headers: true,
+                        media: true,
+                        ..proto::ModelNeeds::default()
+                    }],
+                }),
+                after: Some(proto::NeedsSummary {
+                    models: vec![proto::ModelNeeds {
+                        model: "paired".to_owned(),
+                        role: proto::Role::Decode.into(),
+                        text: true,
+                        token_hashes: true,
+                        text_hashes: true,
+                        loads: true,
+                        events: true,
+                        ring: true,
+                        ..proto::ModelNeeds::default()
+                    }],
+                }),
+            }
+            .encode_to_vec(),
+        );
+    }
+
+    use crate::{
+        operator::{needs_rows, test_support::LEAST_LOAD},
+        spec::PolicySpec,
+        Candidate, Catalog, Filter,
+    };
+
+    /// A need the contract's row has no flag for writes no row: the engine
+    /// reads the affinity column of a host's own stage in every phase, and
+    /// the column is the controller's to hold.
+    #[test]
+    fn a_need_with_no_flag_in_the_contract_writes_no_row() {
+        #[derive(Debug)]
+        struct Held;
+
+        impl Filter for Held {
+            fn name(&self) -> &'static str {
+                "held"
+            }
+
+            fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+                true
+            }
+
+            fn needs(&self) -> crate::Needs {
+                crate::Needs {
+                    affinity: true,
+                    ..crate::Needs::default()
+                }
+            }
+        }
+
+        let mut stages = Catalog::builtin();
+        stages
+            .filter("held", || Box::new(Held))
+            .expect("a free name");
+        let document = LEAST_LOAD.replace("[healthy]", "[held]");
+        let spec: PolicySpec = serde_yaml::from_str(&document).expect("a document");
+        let engine = spec.validate_in(&stages, &[]).expect("validates");
+        let rows = super::needs_summary(needs_rows(&engine)).models;
+        // The profile's scorer reads the loads: its rows stand, and say
+        // nothing of the column.
+        assert_eq!(rows.len(), 4, "{rows:?}");
+        let quiet = document
+            .replace("    score: [least-load]\n", "")
+            .replace("best", "random");
+        let spec: PolicySpec = serde_yaml::from_str(&quiet).expect("a document");
+        let engine = spec.validate_in(&stages, &[]).expect("validates");
+        assert_eq!(engine.needs_rows().len(), 4, "the column in every phase");
+        assert_eq!(
+            super::needs_summary(needs_rows(&engine)),
+            proto::NeedsSummary::default()
+        );
+    }
+
+    /// The summary tells each row under its own role and each need under
+    /// its own flag: a pair's prefill row and its decode row part, a row of
+    /// media alone is told, and a sessions rule's key is a row of its
+    /// binding in every phase it covers.
+    #[test]
+    fn the_summary_tells_each_role_and_each_flag_apart() {
+        /// Keeps every worker and reads what it is built to read.
+        #[derive(Debug)]
+        struct Reads(&'static str, crate::Needs);
+
+        impl Filter for Reads {
+            fn name(&self) -> &'static str {
+                self.0
+            }
+
+            fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+                true
+            }
+
+            fn needs(&self) -> crate::Needs {
+                self.1
+            }
+        }
+
+        let tokens = crate::Needs {
+            token_hashes: true,
+            ..crate::Needs::default()
+        };
+        let media = crate::Needs {
+            media: true,
+            ..crate::Needs::default()
+        };
+        let mut stages = Catalog::builtin();
+        stages
+            .filter("tokens", move || Box::new(Reads("tokens", tokens)))
+            .expect("a free name")
+            .filter("media", move || Box::new(Reads("media", media)))
+            .expect("a free name");
+        let document = r#"{
+          "apiVersion": "smg.policy/v1",
+          "view": { "headers": ["x-session-id"] },
+          "profiles": {
+            "prefill": { "filter": ["tokens"], "pick": "random" },
+            "decode": { "filter": ["media"], "pick": "random" },
+            "quiet": { "pick": "random" }
+          },
+          "bindings": [
+            { "match": { "model": "pd/*", "phase": ["prefill", "decode"] }, "plan": "pd-pair", "profiles": { "prefill": "prefill", "decode": "decode" } },
+            { "match": { "model": "chat/*" }, "profile": "quiet", "sessions": { "sticky_header": "x-session-id", "ttl_s": 600 } },
+            { "match": { "model": "*" }, "profile": "quiet" }
+          ]
+        }"#;
+        let spec: PolicySpec = serde_json::from_str(document).expect("a document");
+        let engine = spec.validate_in(&stages, &[]).expect("validates");
+        let rows = super::needs_summary(needs_rows(&engine)).models;
+        let row = |model: &str, role: proto::Role| {
+            rows.iter()
+                .find(|row| row.model == model && row.role == i32::from(role))
+                .cloned()
+        };
+        let told = |model: &str, role: proto::Role| proto::ModelNeeds {
+            model: model.to_owned(),
+            role: role.into(),
+            ..proto::ModelNeeds::default()
+        };
+        assert_eq!(
+            row("pd/*", proto::Role::Prefill),
+            Some(proto::ModelNeeds {
+                token_hashes: true,
+                ..told("pd/*", proto::Role::Prefill)
+            })
+        );
+        assert_eq!(
+            row("pd/*", proto::Role::Decode),
+            Some(proto::ModelNeeds {
+                media: true,
+                ..told("pd/*", proto::Role::Decode)
+            })
+        );
+        // The sessions rule reads its key under the view's headers, in
+        // every phase its binding covers.
+        for role in [
+            proto::Role::Single,
+            proto::Role::Prefill,
+            proto::Role::Decode,
+            proto::Role::Encode,
+        ] {
+            assert_eq!(
+                row("chat/*", role),
+                Some(proto::ModelNeeds {
+                    headers: true,
+                    ..told("chat/*", role)
+                })
+            );
+        }
+        assert_eq!(rows.len(), 6, "{rows:?}");
+    }
 
     fn key_form(form: Form) -> proto::Identity {
         proto::Identity { form: Some(form) }

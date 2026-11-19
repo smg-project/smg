@@ -637,7 +637,6 @@ fn audit_refusal(call: &'static str, by: &Principal, code: Code, why: &str) {
 #[cfg(test)]
 pub(crate) mod tests {
     use std::{
-        io,
         sync::{
             atomic::{AtomicBool, Ordering},
             Arc, Barrier,
@@ -645,7 +644,6 @@ pub(crate) mod tests {
         thread,
     };
 
-    use parking_lot::Mutex;
     use tonic::{Code, Status};
 
     #[cfg(feature = "worker-host")]
@@ -2217,20 +2215,7 @@ pub(crate) mod tests {
             .expect("removed");
     }
 
-    /// The lines a case's own subscriber wrote.
-    #[derive(Clone, Default)]
-    pub(crate) struct Logged(pub(crate) Arc<Mutex<Vec<u8>>>);
-
-    impl io::Write for Logged {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            self.0.lock().extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
+    pub(crate) use crate::operator::test_support::Logged;
 
     #[test]
     fn every_call_leaves_its_audit_line_written_unmoved_or_refused() {

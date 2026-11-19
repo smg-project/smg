@@ -317,8 +317,10 @@ impl MemoryStore {
     /// and they are sorted after the lock. The models are put in order
     /// ahead of the lock, and under it each model of a row is searched in
     /// that list, so the count asked adds little to a writer's wait. No
-    /// code of the caller runs under the lock. The rows name no write of
-    /// the journal: no reader starts a tail from them.
+    /// code of the caller runs under the lock. A model matches by the rule
+    /// a watch and a shared snapshot filter by, an equal id (`serves`, in
+    /// the operators' snapshot rules): the two change together. The rows
+    /// name no write of the journal: no reader starts a tail from them.
     pub fn rows_serving(&self, models: &[String], limit: usize) -> (Vec<WorkerRow>, usize) {
         let mut asked: Vec<&str> = models.iter().map(String::as_str).collect();
         asked.sort_unstable();
