@@ -437,7 +437,15 @@ impl Rounds {
         shutdown_rx: &mut oneshot::Receiver<()>,
     ) -> Round {
         let worker_url = sub.worker_url;
-        let backend_client = match sub.worker.engine_connection().await {
+        // The connect takes as long as the worker's transport lets it. The
+        // worker's removal ends the wait at once, as it ends the subscribe
+        // call and the backoff; the connect dropped here is made again for
+        // the worker's next caller.
+        let connected = tokio::select! {
+            connected = sub.worker.engine_connection() => connected,
+            _ = &mut *shutdown_rx => return Round::Shutdown,
+        };
+        let backend_client = match connected {
             Ok(Some(client)) => client,
             Ok(None) => {
                 // HTTP workers are filtered in on_worker_added, so this should
@@ -840,10 +848,13 @@ mod tests {
     use super::{super::port::KvCursor, *};
     use crate::{
         common_proto as common,
-        identity::basic::StallReason,
+        connection::engine::{EngineConnector, ZmqLink},
+        identity::basic::{ConnectionMode, StallReason},
         test_support::{
-            BasicWorkerBuilder, LoadReaders, Script, ScriptedEngine, WorkerMonitor, WorkerRegistry,
+            no_health_check, BasicWorkerBuilder, LoadReaders, Script, ScriptedEngine,
+            WorkerMonitor, WorkerRegistry,
         },
+        worker::{RuntimeType, WorkerType},
     };
 
     /// Where the cases' workers stand, by name alone: nothing dials it.
@@ -1542,6 +1553,67 @@ mod tests {
         assert!(matches!(round, Round::Shutdown | Round::Backoff));
         assert_eq!(request.start_sequence_number, 41);
         assert_eq!(sink.calls(), ["cursor 7 rank 0"]);
+    }
+
+    /// A connector whose connect never answers, as a dial does to an address
+    /// that neither takes the connection nor refuses it.
+    #[derive(Debug)]
+    struct NeverConnects;
+
+    #[async_trait::async_trait]
+    impl EngineConnector for NeverConnects {
+        async fn connect_grpc(
+            &self,
+            _base_url: &str,
+            _runtime: RuntimeType,
+        ) -> Result<Arc<dyn EngineConnection>, String> {
+            std::future::pending().await
+        }
+
+        async fn connect_zmq(&self, _link: ZmqLink) -> Result<Arc<dyn EngineConnection>, String> {
+            std::future::pending().await
+        }
+
+        async fn dial_grpc(&self, _base_url: &str, _timeout: Duration) -> Result<(), String> {
+            std::future::pending().await
+        }
+    }
+
+    /// The worker's removal ends a round that still waits on the engine's
+    /// connection: that wait is as long as the transport's, and a removal
+    /// must not be. The clock is paused, so the bound costs no wall time: a
+    /// round still waiting when it is reached has outlived the removal.
+    #[tokio::test(start_paused = true)]
+    async fn a_removal_ends_a_round_that_waits_on_the_connect() {
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(URL)
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Grpc)
+                .health_config(no_health_check())
+                .engine_connector(Arc::new(NeverConnects))
+                .build(),
+        );
+        let sink = Said::default();
+        let sub = said_subscription(&worker, &sink);
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+        let mut backoff = Backoff::new();
+        let removal = async {
+            // The round is inside the connect by now: it was polled first.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            shutdown_tx.send(()).unwrap();
+        };
+
+        let (round, ()) = tokio::join!(
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                Rounds::subscription_round(&sub, &mut backoff, &mut shutdown_rx),
+            ),
+            removal,
+        );
+
+        let round = round.expect("the round outlived the worker's removal");
+        assert!(matches!(round, Round::Shutdown));
+        assert!(sink.calls().is_empty(), "nothing is said to the sink");
     }
 
     /// What crosses the port from the collector's side, call by call, held
