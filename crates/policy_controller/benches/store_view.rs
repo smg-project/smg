@@ -109,7 +109,7 @@ use smg_policy_controller::{
         Ask, GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore, ViewBuffers, WorkerFacts,
         WorkerStatus, WorkersStore, PUBLISH_WINDOW,
     },
-    AppliedSpec, LoadRow, PolicySpec, Role, SignalSource, WorkerId,
+    AppliedSpec, Candidate, LoadRow, PolicySpec, Role, SignalSource, WorkerId,
 };
 
 const SIZES: [usize; 3] = [8, 64, 512];
@@ -237,9 +237,19 @@ fn floor(c: &mut Criterion, fixtures: &mut [Fixture]) {
     group.finish();
 }
 
+/// Whether a built row stands under a veto of the asking gateway, by either
+/// bit a store writes for one: the stalled bit for a doubt of the worker's
+/// liveness, the breaker's for a veto that holds. A veto said through the
+/// plain door tells no kind, and this binary is built on a pull request's
+/// base too: the two stores may write such a veto by different bits.
+fn under_veto(row: &Candidate) -> bool {
+    row.health.stalled || row.health.breaker_open
+}
+
 /// The build under standing vetoes, each ending after the decision, on
 /// members spread over the pool; every cell is held to its count of masked
-/// rows and the vetoes are cleared after the last. Of the asking gateway:
+/// rows ([`under_veto`]) and the vetoes are cleared after the last. Each is
+/// said through the store's plain door. Of the asking gateway:
 /// `policy_store/view_build_veto1/<n>` and `policy_store/view_build_veto8/<n>`
 /// with one and eight, and `policy_store_vetoes/k3/<n>` with three. Of other
 /// gateways alone, which mask nothing for the asking one:
@@ -260,13 +270,13 @@ fn vetoed(c: &mut Criterion, fixtures: &mut [Fixture]) {
         let member = |nth: usize| fixture.ids[nth * n / 8];
         let mut cell = |c: &mut Criterion, group: &str, id: &str, ask: &Ask, masked: usize| {
             assert_eq!(build(&fixture.store, ask, &mut fixture.out), n);
-            let stalled = fixture
+            let read = fixture
                 .out
                 .candidates
                 .iter()
-                .filter(|row| row.health.stalled)
+                .filter(|row| under_veto(row))
                 .count();
-            assert_eq!(stalled, masked, "{group}/{id}/{n}");
+            assert_eq!(read, masked, "{group}/{id}/{n}");
             let mut group = c.benchmark_group(group);
             group.throughput(Throughput::Elements(n as u64));
             group.bench_with_input(BenchmarkId::new(id, n), &n, |b, _| {
@@ -350,7 +360,7 @@ fn vetoed(c: &mut Criterion, fixtures: &mut [Fixture]) {
             }
         }
         assert_eq!(build(&fixture.store, &ask, &mut fixture.out), n);
-        assert!(fixture.out.candidates.iter().all(|row| !row.health.stalled));
+        assert!(!fixture.out.candidates.iter().any(under_veto));
     }
 }
 
@@ -432,7 +442,7 @@ fn writes_beside_vetoes(c: &mut Criterion, fixtures: &mut [Fixture]) {
         }
     }
     assert_eq!(build(store, &ask, &mut fixture.out), n);
-    assert!(fixture.out.candidates.iter().all(|row| !row.health.stalled));
+    assert!(!fixture.out.candidates.iter().any(under_veto));
 }
 
 /// A membership write beside vetoes spread over pools, in a store of its
