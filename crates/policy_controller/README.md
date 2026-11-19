@@ -363,7 +363,7 @@ A **plan** says how many workers one request needs.
 | `pd-pair` | A prefill worker, then a decode worker that can pair with it. | `profiles.prefill`, `profiles.decode` |
 | `epd` | An encode worker for each encode item, then the pair. | `profiles.encode`, `profiles.prefill`, `profiles.decode` |
 
-The library decides all three plans. The stock controller applies a document of any plan, and its `Decide` call decides `single` requests alone today. It answers a request for a side of a pair `Busy` with no reason: the gateway is to decide that request itself. See [what is not built yet](#what-is-not-built-yet).
+The library decides all three plans. The stock controller and the in-process door decide a pair when asked at its prefill. A decode sent on its own under a pair plan and an encode sent on its own under `epd` have no decision at either door. See [what is not built yet](#what-is-not-built-yet).
 
 A prefill and decode pair:
 
@@ -590,7 +590,7 @@ A stage is a Rust type that implements `Filter`, `Scorer` or `Picker`. You add i
 ## What is not built yet
 
 - A plan that waits for the prefill worker's answer before it picks the decode worker. `pd-pair` and `epd` pick every worker in one decision.
-- Pair decisions from the stock controller. The library decides `pd-pair` and `epd` (`Engine::decide_pair`, `Engine::decide_encode_pair`). The stock controller's `Decide` call does not decide a side of a pair yet: it answers `Busy` with no reason.
+- Encode placement through a door. The stock controller and the in-process door decide `pd-pair` and decide the prefill and decode of `epd`. Placing a worker for each encode item takes the library's `Engine::decide_encode_pair` entry.
 - A choice by the media a worker can process, outside `epd`. No built-in filter reads it.
 - A binding that matches on a tenant, a priority, a header, a prompt size or labels. The fields are in the schema. A document that writes one is refused as not in this build.
 - `shadow`, `canary`, `override: allowed` and `admission` on a binding, and `issue_session_id` in a sessions rule.

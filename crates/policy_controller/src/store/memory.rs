@@ -3447,7 +3447,6 @@ impl MemoryStore {
     /// # Errors
     ///
     /// Those of [`Self::issue_decided`].
-    #[cfg(any(test, feature = "controller"))]
     pub(crate) fn issue_decided_pair(
         &self,
         record: LeaseRecord,

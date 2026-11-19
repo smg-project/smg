@@ -29,8 +29,6 @@ use std::{
 
 use parking_lot::{Mutex, MutexGuard};
 
-#[cfg(feature = "controller")]
-use crate::store::{DecodeSide, PairBuffers};
 use crate::{
     counts::Slot,
     decider::Decider,
@@ -40,9 +38,9 @@ use crate::{
     sessions::{Forgets, SessionVerdict},
     spec::AppliedSpec,
     store::{
-        leases::DISPATCH_TTL, Ask, AtWork, Built, GatewayId, Hand, HealthSink, LeaseRecord,
-        LeaseRefused, LeaseState, LeasesStore, MemoryStore, Named, Naming, Picked, Said,
-        SessionsStore, Sides, ViewBuffers, World,
+        leases::DISPATCH_TTL, Ask, AtWork, Built, DecodeSide, GatewayId, Hand, HealthSink,
+        LeaseRecord, LeaseRefused, LeaseState, LeasesStore, MemoryStore, Named, Naming,
+        PairBuffers, Picked, Said, SessionsStore, Sides, ViewBuffers, World,
     },
     view::{
         fingerprint, AffinityFacts, Candidate, Constraints, NamedAffinity, Phase, PinSource,
@@ -129,9 +127,7 @@ pub(crate) struct Buffers<L> {
     /// The rows of a lent view's mask a hold of the asking gateway stands
     /// on ([`World::held`]): asked where a veto masks the view.
     pub(crate) held: Vec<u32>,
-    /// Both sides' rows of a pair decision and the table of their classes:
-    /// a served controller's, the one host that decides a pair.
-    #[cfg(feature = "controller")]
+    /// Both sides' rows of a pair decision and the table of their classes.
     pub(crate) pair: PairBuffers,
     pub(crate) scratch: Scratch,
     pub(crate) lists: L,
@@ -227,7 +223,7 @@ pub(crate) enum Entry {
     Single,
     /// The prefill side of a pair plan, the pair's one request: decided
     /// for both sides by `pair_in`, and its pick issued a lease a side
-    /// (`issue_pair`). A served controller decides it, and no other host.
+    /// (`issue_pair`).
     Pair,
     /// Another side of a pair plan. A pair's alternates ride its answer
     /// and a retry is a new pair request, so that side has no decision,
@@ -337,7 +333,6 @@ pub(crate) fn decide_in<A: Asked>(
 /// A pair whose profile on either side holds a stage that may refuse on a
 /// count it is shown is decided behind an apply of what waits at the files
 /// of leases, as a single is ([`hand`]), where its decider lent its place.
-#[cfg(feature = "controller")]
 pub(crate) fn pair_in<A: Asked>(
     world: &World,
     taken: &Taken<'_, A>,
@@ -517,7 +512,6 @@ pub(crate) struct Booking {
 /// side's booking, which is a single's, and the decode side with the slot
 /// of its worker's count as the decision's build of the decode pool names
 /// it.
-#[cfg(feature = "controller")]
 #[derive(Clone, Copy)]
 pub(crate) struct PairBooking {
     pub(crate) prefill: Booking,
@@ -565,7 +559,6 @@ pub(crate) fn issue<A: Asked>(
 /// # Errors
 ///
 /// Those of [`issue`].
-#[cfg(feature = "controller")]
 pub(crate) fn issue_pair<A: Asked>(
     store: &MemoryStore,
     world: &World,
@@ -1264,9 +1257,20 @@ impl Asked for Request<'_> {
 pub struct Decided {
     /// The engine's decision.
     pub decision: Decision,
-    /// The lease filed for a pick: one a decision, a credit on the pick's
-    /// first target. `None` for a decision that picks no worker.
+    /// The lease filed for a pick, a credit on the pick's first target.
+    /// For a pair this is the prefill side. `None` for a decision that
+    /// picks no worker.
     pub lease: Option<Leased>,
+}
+
+impl Decided {
+    /// Whether the lease is a pair's prefill side. The decode side's
+    /// lease shares its id and dispatch span.
+    #[must_use]
+    pub fn pair(&self) -> bool {
+        self.lease
+            .is_some_and(|leased| leased.lease.side == Side::Prefill)
+    }
 }
 
 /// A pick's lease as its door hands it over: the lease the store filed,
@@ -1293,9 +1297,8 @@ pub struct Swept {
 /// Why a door has no decision for a request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refused {
-    /// The request is for a side of a pair plan. The served path answers
-    /// a pair's one request with two leases; this door's answer carries
-    /// one, so it decides no side of a pair plan yet.
+    /// The request is a decode or encode side sent on its own. A pair is
+    /// asked at its prefill, and that one request decides both sides.
     PairSide,
     /// The store filed no lease for the pick, at the second try too: its
     /// term mints no id, or another hand raised it under both tries.
@@ -1837,16 +1840,44 @@ impl Door {
         taken: &Taken<'_, Request<'_>>,
         buffers: &mut Buffers<()>,
     ) -> Result<Decided, Refused> {
-        // A pair plan's one request is answered with two leases, and
-        // this door's answer carries one: each side of a pair plan is
-        // refused ahead of its decision. A single request is no
-        // plan's side, and its binding is not looked up here.
-        if entry(world, taken) != Entry::Single {
-            return Err(Refused::PairSide);
+        match entry(world, taken) {
+            Entry::Single => {
+                let (decision, booking) = decide_in(world, taken, buffers, &self.parts[at]);
+                let lease = booking
+                    .map(|booking| issue(&self.store, world, taken, term, &decision, booking))
+                    .transpose()
+                    .map_err(|_| Refused::Unleased)?;
+                Ok(Decided {
+                    decision,
+                    lease: lease.map(|lease| Leased {
+                        lease,
+                        due: taken.due(),
+                    }),
+                })
+            }
+            Entry::Pair => self.pair(world, at, term, taken, buffers),
+            Entry::Side => Err(Refused::PairSide),
         }
-        let (decision, booking) = decide_in(world, taken, buffers, &self.parts[at]);
+    }
+
+    /// A pair's order: decided for both sides and, for a pick, issued a
+    /// lease a side under one id. Out of line: a single's order carries no
+    /// part of a pair's.
+    #[inline(never)]
+    fn pair(
+        &self,
+        world: &World,
+        at: usize,
+        term: u64,
+        taken: &Taken<'_, Request<'_>>,
+        buffers: &mut Buffers<()>,
+    ) -> Result<Decided, Refused> {
+        let (decision, booking) = pair_in(world, taken, buffers, &self.parts[at]);
         let lease = booking
-            .map(|booking| issue(&self.store, world, taken, term, &decision, booking))
+            .map(|booking| {
+                issue_pair(&self.store, world, taken, term, &decision, booking)
+                    .map(|(prefill, _)| prefill)
+            })
             .transpose()
             .map_err(|_| Refused::Unleased)?;
         Ok(Decided {
@@ -1863,6 +1894,7 @@ impl Door {
 pub(crate) mod tests {
     use std::{
         collections::BTreeSet,
+        error::Error,
         sync::{
             atomic::{AtomicBool, Ordering},
             mpsc, Arc, Barrier,
@@ -1874,7 +1906,8 @@ pub(crate) mod tests {
     use parking_lot::Mutex;
 
     use super::{
-        decider_of, pinned, DecisionRecord, Door, Refused, Request, Swept, SEAT, TERM_MARK,
+        decider_of, pinned, DecisionRecord, Door, Refused, Request, Swept, DISPATCH_TTL, SEAT,
+        TERM_MARK,
     };
     use crate::{
         builtins::Random,
@@ -1886,7 +1919,7 @@ pub(crate) mod tests {
         sessions::SessionVerdict,
         spec::{AppliedSpec, Needs, PolicySpec},
         store::{
-            Ask, Dispatch, GatewayId, HealthSink, LeaseRecord, LeaseState, LeasesStore,
+            Ask, DecodeMark, Dispatch, GatewayId, HealthSink, LeaseRecord, LeaseState, LeasesStore,
             MemoryStore, Picked, Said, SessionsStore, VetoWrite, ViewBuffers, WorkerFacts,
             WorkerStatus, WorkersStore,
         },
@@ -1916,29 +1949,70 @@ pub(crate) mod tests {
     /// serve [`MODEL`].
     fn stocked(store: MemoryStore) -> Arc<MemoryStore> {
         for name in ["w0", "w1", "w2"] {
-            let key = format!("http://{name}:8000");
-            let facts = WorkerFacts {
-                key: key.clone(),
-                engine: key,
-                incarnation: 1,
-                role: Role::Single,
-                models: vec![MODEL.to_owned()],
-                dp_size: 1,
-                max_running: Some(4_096),
-                ..WorkerFacts::default()
-            };
-            let id = store.upsert(facts).id();
-            store.publish_now();
-            let row = WorkersStore::get(&store, id).expect("the row");
-            if row.status != WorkerStatus::Ready {
-                let ready = store.set_status(id, WorkerStatus::Ready, row.revision);
-                ready.expect("the row stands");
-            }
+            member(&store, name, Role::Single);
         }
         store
             .apply(preset("random", 1))
             .expect("above the unbound start");
         Arc::new(store)
+    }
+
+    fn member(store: &MemoryStore, name: &str, role: Role) {
+        let key = format!("http://{name}:8000");
+        let facts = WorkerFacts {
+            key: key.clone(),
+            engine: key,
+            incarnation: 1,
+            role,
+            models: vec![MODEL.to_owned()],
+            dp_size: 1,
+            max_running: Some(4_096),
+            ..WorkerFacts::default()
+        };
+        let id = store.upsert(facts).id();
+        store.publish_now();
+        let row = WorkersStore::get(store, id);
+        assert!(row.is_some(), "the worker has a row");
+        if let Some(row) = row.filter(|row| row.status != WorkerStatus::Ready) {
+            assert!(store
+                .set_status(id, WorkerStatus::Ready, row.revision)
+                .is_some());
+        }
+    }
+
+    /// A model under a pair plan, with ready workers in each pool.
+    pub(crate) fn pair_fleet(
+        prefills: usize,
+        decodes: usize,
+    ) -> Result<Arc<MemoryStore>, Box<dyn Error>> {
+        let store = MemoryStore::new();
+        for n in 0..prefills {
+            member(&store, &format!("p{n}"), Role::Prefill);
+        }
+        for n in 0..decodes {
+            member(&store, &format!("d{n}"), Role::Decode);
+        }
+        let document = PolicySpec::pair_presets("least_load", "least_load")?;
+        apply_pair_document(&store, document)?;
+        Ok(Arc::new(store))
+    }
+
+    fn apply_epd(store: &MemoryStore) -> Result<(), Box<dyn Error>> {
+        member(store, "e0", Role::Encode);
+        let mut document = PolicySpec::epd_presets("least_load", "least_load", "least_load")?;
+        document.generation = 2;
+        apply_pair_document(store, document)
+    }
+
+    fn apply_pair_document(
+        store: &MemoryStore,
+        mut document: PolicySpec,
+    ) -> Result<(), Box<dyn Error>> {
+        for profile in document.profiles.values_mut() {
+            profile.filter.clear();
+        }
+        store.apply(AppliedSpec::validate(&document)?)?;
+        Ok(())
     }
 
     /// Applies `generation` of the `random` preset with the picker `name`
@@ -1974,7 +2048,7 @@ pub(crate) mod tests {
     }
 
     /// What the leases on file book on each member, as a decision reads it.
-    fn booked(store: &MemoryStore) -> Vec<(WorkerId, u32)> {
+    fn booked(store: &MemoryStore, role: Role) -> Vec<(WorkerId, u32)> {
         let ask = Ask {
             gateway: GATEWAY,
             now: Instant::now(),
@@ -1983,7 +2057,7 @@ pub(crate) mod tests {
         };
         let mut out = ViewBuffers::default();
         store.deciding(|world| {
-            if let Some(built) = world.build(MODEL, Role::Single, &ask, &mut out) {
+            if let Some(built) = world.build(MODEL, role, &ask, &mut out) {
                 world.count_in_flight(&built, &ask, &mut out.candidates);
             }
         });
@@ -1993,9 +2067,25 @@ pub(crate) mod tests {
 
     /// The members the leases on file book, each with its count.
     pub(crate) fn counted(store: &MemoryStore) -> Vec<(WorkerId, u32)> {
-        let mut rows = booked(store);
+        let mut rows = booked(store, Role::Single);
         rows.retain(|&(_, count)| count > 0);
         rows
+    }
+
+    /// How many leases each of `workers` in the pair pools holds.
+    pub(crate) fn pair_counts<const N: usize>(
+        store: &MemoryStore,
+        workers: [WorkerId; N],
+    ) -> [u32; N] {
+        let prefill = booked(store, Role::Prefill);
+        let decode = booked(store, Role::Decode);
+        workers.map(|id| {
+            prefill
+                .iter()
+                .chain(&decode)
+                .find_map(|&(worker, count)| (id == worker).then_some(count))
+                .unwrap_or(0)
+        })
     }
 
     /// The lease of one decision of `door` and the pick's first target.
@@ -2226,7 +2316,7 @@ pub(crate) mod tests {
             "a lease a decision, no id twice"
         );
         assert_eq!(LeasesStore::live(&*store, GATEWAY), all);
-        for (member, count) in booked(&store) {
+        for (member, count) in booked(&store, Role::Single) {
             let books = leases.iter().filter(|&&(_, first)| first == member).count();
             assert_eq!(usize::try_from(count).ok(), Some(books), "{member:?}");
         }
@@ -2248,45 +2338,113 @@ pub(crate) mod tests {
         assert_eq!(LeasesStore::live(&*store, GATEWAY), 0);
     }
 
-    /// The served path answers a pair plan's one request with two leases.
-    /// The door's answer carries one, so the door refuses each side of a
-    /// pair plan ahead of its decision, and files nothing.
     #[test]
-    fn a_request_under_a_pair_plan_is_refused_and_files_no_lease() {
-        let store = MemoryStore::new().with_deciders(1);
-        for (name, role) in [("p0", Role::Prefill), ("d0", Role::Decode)] {
-            let key = format!("http://{name}:8000");
-            let facts = WorkerFacts {
-                key: key.clone(),
-                engine: key,
-                incarnation: 1,
-                role,
-                models: vec![MODEL.to_owned()],
-                dp_size: 1,
-                max_running: Some(4_096),
-                ..WorkerFacts::default()
-            };
-            let id = store.upsert(facts).id();
-            store.publish_now();
-            let row = WorkersStore::get(&store, id).expect("the row");
-            if row.status != WorkerStatus::Ready {
-                let ready = store.set_status(id, WorkerStatus::Ready, row.revision);
-                ready.expect("the row stands");
+    fn a_pair_plans_prefill_is_decided_with_a_lease_a_side() {
+        for encode in [false, true] {
+            let store = pair_fleet(1, 1).expect("a pair fleet");
+            if encode {
+                apply_epd(&store).expect("an encode pair plan");
             }
+            let door = Door::new(Arc::clone(&store));
+            if !encode {
+                store.spend_ids(0);
+            }
+            let mut asked = request(b"pair", 7);
+            asked.facts.phase = Phase::Prefill;
+            let now = Instant::now();
+            let answer = door
+                .decide(GATEWAY, &asked, now)
+                .expect("a pair's decision");
+            assert!(matches!(answer.decision, Decision::Pick(_)), "{answer:?}");
+            let pick = answer.decision.pick().expect("a pair pick");
+            let target = pick.targets.first().expect("the first pair");
+            let pair = target.pair.expect("the target names a decode");
+            let leased = answer.lease.expect("the pair's lease");
+            assert_eq!(LeasesStore::live(&*store, GATEWAY), 1);
+            let filed = store
+                .sides(GATEWAY, leased.lease.id)
+                .expect("the lease is on file");
+            assert_eq!(filed.record.term, if encode { 1 } else { 2 });
+            let (decode, state) = filed.side(Side::Decode).expect("the decode side");
+            assert_eq!(filed.record.decode, Some(DecodeMark));
+            assert!(answer.pair());
+            assert_eq!(
+                (leased.lease.side, leased.lease.booked),
+                (Side::Prefill, target.id)
+            );
+            assert_eq!(
+                (decode.id, decode.side, decode.booked),
+                (leased.lease.id, Side::Decode, pair.decode_id)
+            );
+            assert_eq!(
+                (filed.record.state, state),
+                (LeaseState::ISSUED, LeaseState::ISSUED)
+            );
+            assert_eq!(leased.due, now + DISPATCH_TTL);
+            assert_eq!(filed.record.dispatch_deadline, leased.due);
+            assert_eq!(pair_counts(&store, [target.id, pair.decode_id]), [1, 1]);
         }
-        let pair = PolicySpec::pair_presets("least_load", "least_load");
-        let mut document = pair.expect("a pair of presets of this build");
-        document.generation = 1;
-        let paired = AppliedSpec::validate(&document).expect("the document validates");
-        store.apply(paired).expect("above the unbound start");
-        let door = Door::new(Arc::new(store));
-        for phase in [Phase::Prefill, Phase::Decode] {
-            let mut asked = request(b"r-1", 7);
+    }
+
+    #[test]
+    fn a_decode_sent_on_its_own_is_refused_by_name() {
+        let store = pair_fleet(1, 1).expect("a pair fleet");
+        let door = Door::new(Arc::clone(&store));
+        let mut asked = request(b"side", 7);
+        asked.facts.phase = Phase::Decode;
+        assert_eq!(
+            door.decide(GATEWAY, &asked, Instant::now()).err(),
+            Some(Refused::PairSide)
+        );
+        assert_eq!(LeasesStore::live(&*store, GATEWAY), 0);
+
+        apply_epd(&store).expect("an encode pair plan");
+        for phase in [Phase::Decode, Phase::Encode] {
             asked.facts.phase = phase;
-            let refused = door.decide(GATEWAY, &asked, Instant::now()).err();
-            assert_eq!(refused, Some(Refused::PairSide), "{phase:?}");
+            assert_eq!(
+                door.decide(GATEWAY, &asked, Instant::now()).err(),
+                Some(Refused::PairSide)
+            );
+            assert_eq!(LeasesStore::live(&*store, GATEWAY), 0);
         }
-        assert_eq!(LeasesStore::live(&**door.store(), GATEWAY), 0);
+    }
+
+    #[test]
+    fn a_single_under_no_pair_plan_is_decided_as_before() {
+        let store = fleet(1);
+        let door = Door::new(Arc::clone(&store));
+        let asked = request(b"single", 7);
+        let answer = door
+            .decide(GATEWAY, &asked, Instant::now())
+            .expect("a single's decision");
+        assert!(!answer.pair());
+        let leased = answer.lease.expect("the single's lease");
+        let filed = store
+            .sides(GATEWAY, leased.lease.id)
+            .expect("the lease is on file");
+        assert_eq!(leased.lease.side, Side::Single);
+        assert!(filed.decode.is_none());
+        assert_eq!(LeasesStore::live(&*store, GATEWAY), 1);
+        assert_eq!(counted(&store), [(filed.record.target, 1)]);
+    }
+
+    #[test]
+    fn a_pair_whose_decode_pool_holds_no_worker_is_shed_and_files_nothing() {
+        let store = pair_fleet(1, 0).expect("a prefill fleet");
+        let door = Door::new(Arc::clone(&store));
+        let mut asked = request(b"pair", 7);
+        asked.facts.phase = Phase::Prefill;
+        let answer = door
+            .decide(GATEWAY, &asked, Instant::now())
+            .expect("a decision");
+        assert!(matches!(answer.decision, Decision::Shed(_)));
+        assert!(answer.lease.is_none());
+        assert!(!answer.pair());
+        assert_eq!(LeasesStore::live(&*store, GATEWAY), 0);
+        assert_eq!(
+            booked(&store, Role::Prefill).first().map(|row| row.1),
+            Some(0)
+        );
     }
 
     /// A gateway that shares no wire with its pool's members is shed, and
@@ -2314,7 +2472,10 @@ pub(crate) mod tests {
         let door = Door::new(Arc::clone(&store));
         let now = Instant::now();
         let until = now + Duration::from_secs(60);
-        let members: Vec<WorkerId> = booked(&store).iter().map(|&(id, _)| id).collect();
+        let members: Vec<WorkerId> = booked(&store, Role::Single)
+            .iter()
+            .map(|&(id, _)| id)
+            .collect();
         let veto = |member: WorkerId, hold: Option<Instant>, stands: bool| {
             let written = store.gateway_veto_noted(GATEWAY, member, Some(until), hold, stands, now);
             assert_eq!(written, VetoWrite::Written);
