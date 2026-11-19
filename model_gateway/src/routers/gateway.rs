@@ -41,10 +41,12 @@ use openai_protocol::{
     responses::ResponsesRequest,
     systemone::SystemOneRequest,
     transcription::{AudioFile, TranscriptionRequest},
+    worker::ProviderType,
     UNKNOWN_MODEL_ID,
 };
 use smg_data_connector::MemoryConfig;
 use smg_external_router::spec_for_provider;
+use smg_worker::identity::basic::ConnectionMode;
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -53,7 +55,11 @@ use crate::{
     middleware::TenantRequestMeta,
     policies::PolicyRegistry,
     routers::{
-        common::{body_policy::REASON_MODEL_SELECTION, header_utils::ROUTING_KEY_HINT_MAX_BYTES},
+        common::{
+            body_policy::REASON_MODEL_SELECTION,
+            header_utils::ROUTING_KEY_HINT_MAX_BYTES,
+            snapshot::{RoutingPool, WorkerRegistry, WorkerRegistryExt},
+        },
         error as route_error,
         factory::{router_ids, RouterId},
         grpc::regular::stages::decisions::supports_worker as supports_decisions_worker,
@@ -62,7 +68,6 @@ use crate::{
     },
     server::ServerConfig,
     tenant::storage_tenant,
-    worker::{ConnectionMode, ProviderType, RoutingPool, WorkerRegistry},
 };
 
 /// A router family the weighted selection chooses among: its router and the
@@ -620,9 +625,7 @@ impl Gateway {
 
     /// The router of a Messages request: in IGW mode an empty message (a
     /// `max_tokens` of 0) may go to a router that answers it without an
-    /// engine. Takes the request's `max_tokens`, not the request: a local
-    /// that was borrowed keeps its slot in the route's task across the awaits
-    /// that follow, a second copy of the request per plain request.
+    /// engine. Takes the request's `max_tokens`, the one field it reads.
     fn select_messages_router(
         &self,
         max_tokens: u32,
@@ -682,12 +685,14 @@ impl Gateway {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: CreateMessageRequest,
+        body: Arc<CreateMessageRequest>,
         model_id: &str,
     ) -> Response {
+        // The resolver rebuilds a continued turn, so it takes the request
+        // out of the pointer; the resolved request goes on behind a new one.
         let (body, turn) = match self
             .threads
-            .resolve(body, storage_tenant(tenant_meta))
+            .resolve(Arc::unwrap_or_clone(body), storage_tenant(tenant_meta))
             .await
         {
             Ok(resolved) => resolved,
@@ -698,7 +703,7 @@ impl Gateway {
         let response = match self.select_messages_router(body.max_tokens, model_id) {
             Some(router) => {
                 router
-                    .route_messages(headers, tenant_meta, body, model_id)
+                    .route_messages(headers, tenant_meta, Arc::new(body), model_id)
                     .await
             }
             None => no_router(),
@@ -859,20 +864,13 @@ impl RouterTrait for Gateway {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: CreateMessageRequest,
+        body: Arc<CreateMessageRequest>,
         model_id: &str,
     ) -> Response {
         // A thread turn runs as its own boxed future: its locals (the chain
         // walk, the rebuild, the answer read back) would otherwise size every
-        // plain request's task. The request is read by value and moved, never
-        // borrowed, before the awaits: a borrowed local keeps a second copy of
-        // the request in every plain request's task (`is_some()` borrows it;
-        // the `matches!` reads the discriminant in place).
-        #[expect(
-            clippy::redundant_pattern_matching,
-            reason = "is_some() borrows the request; a borrowed local keeps its slot in the task"
-        )]
-        if matches!(body.thread, Some(_)) {
+        // plain request's task, which holds the request's pointer alone.
+        if body.thread.is_some() {
             return Box::pin(self.route_messages_thread(headers, tenant_meta, body, model_id))
                 .await;
         }
@@ -1255,14 +1253,18 @@ mod tests {
     use async_trait::async_trait;
     use axum::{http::StatusCode, response::IntoResponse};
     use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
+    use smg_worker::{
+        health::circuit_breaker::CircuitBreakerConfig,
+        identity::basic::{RuntimeType, WorkerType},
+    };
 
     use super::*;
     use crate::{
         config::types::{PolicyConfig, RoutingKeyOverrideConfig},
         middleware::{RouteRequestMeta, TenantKey},
-        routers::{factory::router_ids, tests::error_shape},
-        worker::{
-            BasicWorkerBuilder, CircuitBreakerConfig, RuntimeType, WorkerRegistry, WorkerType,
+        routers::{
+            common::snapshot::WorkerRegistry, factory::router_ids,
+            grpc::backend_client::BasicWorkerBuilder, tests::error_shape,
         },
     };
 
@@ -1595,10 +1597,10 @@ mod tests {
                     .route_messages(
                         None,
                         &meta,
-                        body(json!({
+                        Arc::new(body(json!({
                             "model": "m", "max_tokens": 16,
                             "messages": [{"role": "user", "content": "hi"}]
-                        })),
+                        }))),
                         "m",
                     )
                     .await,
@@ -1941,7 +1943,7 @@ mod tests {
             &self,
             _headers: Option<&HeaderMap>,
             _tenant_meta: &TenantRequestMeta,
-            _body: CreateMessageRequest,
+            _body: Arc<CreateMessageRequest>,
             _model_id: &str,
         ) -> Response {
             (StatusCode::OK, self.0).into_response()
@@ -2191,27 +2193,31 @@ mod tests {
         .unwrap()
     }
 
-    /// A plain Messages request's task holds the request once: a local
-    /// borrowed before the move keeps a second copy across the awaits (the
-    /// task read 1,072 bytes around a 488-byte request that way, 584 with
-    /// the request moved).
+    /// A plain Messages request's task holds the request's pointer, never
+    /// the request: the task is smaller than one request (it read 584
+    /// bytes around a 488-byte request while the request came by value).
     #[test]
-    fn a_plain_messages_task_holds_the_request_once() {
+    fn a_plain_messages_task_holds_the_request_behind_its_pointer() {
         let gateway = test_gateway(true);
         let meta = test_tenant_meta();
-        let task = gateway.route_messages(None, &meta, message_request(1), "m");
+        let task = gateway.route_messages(None, &meta, Arc::new(message_request(1)), "m");
         let task = size_of_val(&*task);
         let request = size_of::<CreateMessageRequest>();
         assert!(
-            task < 2 * request,
-            "the task is {task} bytes around a request of {request}"
+            task < request,
+            "the task is {task} bytes beside a request of {request}"
         );
     }
 
     /// The name of the router that answered a Messages request for `m`.
     async fn messages_router(gateway: &Gateway, max_tokens: u32) -> String {
         let response = gateway
-            .route_messages(None, &test_tenant_meta(), message_request(max_tokens), "m")
+            .route_messages(
+                None,
+                &test_tenant_meta(),
+                Arc::new(message_request(max_tokens)),
+                "m",
+            )
             .await;
         assert_eq!(response.status(), StatusCode::OK);
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -2342,7 +2348,7 @@ mod tests {
         let mut no_router = Gateway::new(Arc::new(WorkerRegistry::new()));
         no_router.enable_igw = true;
         let response = no_router
-            .route_messages(None, &test_tenant_meta(), message_request(0), "m")
+            .route_messages(None, &test_tenant_meta(), Arc::new(message_request(0)), "m")
             .await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
@@ -2717,7 +2723,7 @@ mod tests {
             &self,
             headers: Option<&HeaderMap>,
             _tenant_meta: &TenantRequestMeta,
-            _body: CreateMessageRequest,
+            _body: Arc<CreateMessageRequest>,
             _model_id: &str,
         ) -> Response {
             self.seen.lock().unwrap().push(headers.cloned());
@@ -2810,7 +2816,7 @@ mod tests {
                 .map(str::to_string)
         };
         gateway
-            .route_messages(None, &meta, turn(json!("conv_t2"), true), "m")
+            .route_messages(None, &meta, Arc::new(turn(json!("conv_t2"), true)), "m")
             .await;
         assert_eq!(
             seen.last_routing_key().as_deref(),
@@ -2824,7 +2830,7 @@ mod tests {
         );
 
         gateway
-            .route_messages(None, &meta, turn(json!("conv_t1_t2"), true), "m")
+            .route_messages(None, &meta, Arc::new(turn(json!("conv_t1_t2"), true)), "m")
             .await;
         assert_eq!(
             placed(&seen).as_deref(),
@@ -2836,7 +2842,7 @@ mod tests {
         let base = "a".repeat(ROUTING_KEY_HINT_MAX_BYTES - 3);
         let long = format!("{base}_t1_t2");
         gateway
-            .route_messages(None, &meta, turn(json!(long), true), "m")
+            .route_messages(None, &meta, Arc::new(turn(json!(long), true)), "m")
             .await;
         assert_eq!(
             seen.last_routing_key().as_deref(),
@@ -2863,7 +2869,7 @@ mod tests {
             ),
         ] {
             gateway
-                .route_messages(None, &meta, turn(json!(rid), true), "m")
+                .route_messages(None, &meta, Arc::new(turn(json!(rid), true)), "m")
                 .await;
             assert_eq!(placed(&seen).as_deref(), Some(key.as_str()), "{why}");
         }
@@ -2871,23 +2877,28 @@ mod tests {
         let mut mine = HeaderMap::new();
         mine.insert("x-smg-routing-key", "mine".parse().unwrap());
         gateway
-            .route_messages(Some(&mine), &meta, turn(json!("conv_t2"), true), "m")
+            .route_messages(
+                Some(&mine),
+                &meta,
+                Arc::new(turn(json!("conv_t2"), true)),
+                "m",
+            )
             .await;
         assert_eq!(placed(&seen).as_deref(), Some("mine"));
 
         gateway
-            .route_messages(None, &meta, turn(json!(null), true), "m")
+            .route_messages(None, &meta, Arc::new(turn(json!(null), true)), "m")
             .await;
         assert_eq!(seen.last_routing_key(), None, "no client rid");
 
         gateway
-            .route_messages(None, &meta, turn(json!("conv_t2"), false), "m")
+            .route_messages(None, &meta, Arc::new(turn(json!("conv_t2"), false)), "m")
             .await;
         assert_eq!(seen.last_routing_key(), None, "a plain request");
 
         let (gateway, seen) = recording_gateway(false);
         gateway
-            .route_messages(None, &meta, turn(json!("conv_t2"), true), "m")
+            .route_messages(None, &meta, Arc::new(turn(json!("conv_t2"), true)), "m")
             .await;
         assert_eq!(seen.last_routing_key(), None, "the override off");
     }
@@ -2921,7 +2932,9 @@ mod tests {
                 .map(str::to_string)
         };
 
-        gateway.route_messages(None, &meta, turn(), "m").await;
+        gateway
+            .route_messages(None, &meta, Arc::new(turn()), "m")
+            .await;
         assert_eq!(
             seen.last_header("x-routing-key").as_deref(),
             Some("conv_t2"),
@@ -2952,7 +2965,7 @@ mod tests {
         let mut mine = HeaderMap::new();
         mine.insert("x-smg-routing-key", "mine".parse().unwrap());
         gateway
-            .route_messages(Some(&mine), &meta, turn(), "m")
+            .route_messages(Some(&mine), &meta, Arc::new(turn()), "m")
             .await;
         assert_eq!(
             seen.last_header("x-routing-key"),

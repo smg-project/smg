@@ -26,6 +26,7 @@ use std::{
 
 use dashmap::{mapref::entry::Entry, DashMap};
 use rand::RngExt;
+use smg_worker::identity::basic::Worker;
 use tracing::info;
 
 use super::{
@@ -34,7 +35,7 @@ use super::{
 };
 use crate::{
     config::ManualAssignmentMode, observability::metrics::Metrics,
-    routers::common::header_utils::extract_routing_key_hint, worker::Worker,
+    routers::common::header_utils::extract_routing_key_hint,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

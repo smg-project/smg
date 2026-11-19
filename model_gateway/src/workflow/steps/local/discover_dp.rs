@@ -3,16 +3,14 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use openai_protocol::worker::WorkerSpec;
+use openai_protocol::{worker::WorkerSpec, UNKNOWN_MODEL_ID};
 use reqwest::Client;
+use smg_worker::identity::{basic::ConnectionMode, endpoint::Endpoint};
 use tracing::{debug, warn};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use super::discover_metadata::get_server_info;
-use crate::{
-    worker::{identity::endpoint::Endpoint, ConnectionMode, UNKNOWN_MODEL_ID},
-    workflow::data::{WorkerKind, WorkerWorkflowData},
-};
+use crate::workflow::data::{WorkerKind, WorkerWorkflowData};
 
 /// DP (Data Parallel) information for a worker.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

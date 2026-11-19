@@ -4,10 +4,14 @@ use std::{collections::HashSet, sync::Arc};
 
 use async_trait::async_trait;
 use llm_tokenizer::{registry::TokenizerEntry, LoadOutcome};
+use smg_worker::identity::basic::Worker;
 use tracing::{debug, info, warn};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
-use crate::{app_context::AppContext, worker::Worker, workflow::data::WorkerRemovalWorkflowData};
+use crate::{
+    app_context::AppContext,
+    workflow::data::{require_app_context, WorkerRemovalWorkflowData},
+};
 
 /// Step to release the tokenizer of a model no worker serves any more.
 ///
@@ -38,11 +42,7 @@ impl StepExecutor<WorkerRemovalWorkflowData> for ReleaseTokenizerStep {
         &self,
         context: &mut WorkflowContext<WorkerRemovalWorkflowData>,
     ) -> WorkflowResult<StepResult> {
-        let app_context = context
-            .data
-            .app_context
-            .as_ref()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
+        let app_context = require_app_context(context.data.app_context.as_ref())?;
         // The gateway manages no tokenizer when autoload is off: every entry
         // is the operator's, as the registration step leaves them.
         if app_context.router_config.disable_tokenizer_autoload {
@@ -221,6 +221,8 @@ mod tests {
 
     use llm_multimodal::PreProcessorConfig;
     use llm_tokenizer::{mock::MockTokenizer, traits::Tokenizer, LoadOutcome, TokenizerRegistry};
+    use openai_protocol::model_card::ModelCard;
+    use smg_worker::identity::basic::{ConnectionMode, Worker};
     use tokio::sync::Notify;
     use wfaas::{StepExecutor, WorkflowContext, WorkflowInstanceId};
 
@@ -228,8 +230,10 @@ mod tests {
     use crate::{
         app_context::{testing::app_context_for_tests, AppContext},
         config::RouterConfig,
-        routers::grpc::multimodal::MultimodalModelConfig,
-        worker::{BasicWorkerBuilder, ConnectionMode, ModelCard, Worker, WorkerRegistry},
+        routers::{
+            common::snapshot::WorkerRegistry,
+            grpc::{backend_client::BasicWorkerBuilder, multimodal::MultimodalModelConfig},
+        },
         workflow::{
             data::WorkerRemovalWorkflowData,
             steps::local::{

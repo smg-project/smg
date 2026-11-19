@@ -1368,7 +1368,7 @@ def test_serve_rust_starts_the_engine_cores_from_this_process(monkeypatch, tmp_p
     _install_fake_servicer(monkeypatch, FakeServer)
     monkeypatch.setattr(rust.multiprocessing, "get_context", lambda method: pytest.fail(method))
     monkeypatch.setattr(rust, "resolve_tokenizer_dir", lambda *a, **k: str(tmp_path))
-    monkeypatch.setattr(rust_lifecycle, "free_port", lambda: 24321)
+    monkeypatch.setattr(rust_lifecycle, "free_port", lambda exclude=(): 24321)
     monkeypatch.setenv("SMG_ZMQ_SOCKET_DIR", str(tmp_path))
     supervised: dict = {}
 
@@ -1431,7 +1431,7 @@ def test_serve_rust_constructs_the_server_with_keywords_the_binding_takes(monkey
     _stub_engine_exceptions(monkeypatch)
     _install_fake_servicer(monkeypatch, FakeServer)
     monkeypatch.setattr(rust, "resolve_tokenizer_dir", lambda *a, **k: str(tmp_path))
-    monkeypatch.setattr(rust_lifecycle, "free_port", lambda: 24321)
+    monkeypatch.setattr(rust_lifecycle, "free_port", lambda exclude=(): 24321)
     monkeypatch.setenv("SMG_ZMQ_SOCKET_DIR", str(tmp_path))
     constructed: dict = {}
 
@@ -1475,7 +1475,7 @@ def test_serve_rust_holds_readiness_for_the_planned_warm_up(monkeypatch, tmp_pat
     _install_fake_servicer(monkeypatch, FakeServer)
     monkeypatch.setattr(rust, "launch_engine_cores", lambda ns: FakeEngine())
     monkeypatch.setattr(rust, "resolve_tokenizer_dir", lambda *a, **k: str(tmp_path))
-    monkeypatch.setattr(rust_lifecycle, "free_port", lambda: 24321)
+    monkeypatch.setattr(rust_lifecycle, "free_port", lambda exclude=(): 24321)
     monkeypatch.setenv("SMG_ZMQ_SOCKET_DIR", str(tmp_path))
     recorded: dict = {}
 
@@ -1823,7 +1823,7 @@ def test_serve_rust_wires_the_server_the_engine_and_the_supervisor(monkeypatch, 
 
     monkeypatch.setattr(rust, "launch_engine_cores", fake_launch)
     monkeypatch.setattr(rust, "resolve_tokenizer_dir", lambda *a, **k: str(tmp_path))
-    monkeypatch.setattr(rust_lifecycle, "free_port", lambda: 24321)
+    monkeypatch.setattr(rust_lifecycle, "free_port", lambda exclude=(): 24321)
     monkeypatch.setattr(sys, "argv", ["vllm", "serve", "org/m", "--grpc", "--port", "50051"])
     monkeypatch.setenv("SMG_ZMQ_SOCKET_DIR", str(tmp_path))
     monkeypatch.setenv("SMG_VLLM_SERVICER_DRAIN_SECS", "0")

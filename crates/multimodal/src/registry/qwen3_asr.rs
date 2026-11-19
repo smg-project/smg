@@ -318,10 +318,7 @@ impl ModelProcessorSpec for Qwen3AsrSpec {
                 }
             }
             Modality::Image | Modality::Video | Modality::ImageEmbeds => {
-                Err(ModelRegistryError::UnsupportedModality {
-                    spec: self.name(),
-                    modality,
-                })
+                Err(ModelRegistryError::unsupported(self.name(), modality))
             }
         }
     }
@@ -334,10 +331,7 @@ impl ModelProcessorSpec for Qwen3AsrSpec {
         match modality {
             Modality::Audio => Self::audio_token_id(metadata),
             Modality::Image | Modality::Video | Modality::ImageEmbeds => {
-                Err(ModelRegistryError::UnsupportedModality {
-                    spec: self.name(),
-                    modality,
-                })
+                Err(ModelRegistryError::unsupported(self.name(), modality))
             }
         }
     }
@@ -405,10 +399,7 @@ impl ModelProcessorSpec for Qwen3AsrSpec {
                 ))
             }
             Modality::Image | Modality::Video | Modality::ImageEmbeds => {
-                Err(ModelRegistryError::UnsupportedModality {
-                    spec: self.name(),
-                    modality,
-                })
+                Err(ModelRegistryError::unsupported(self.name(), modality))
             }
         }
     }

@@ -19,6 +19,8 @@ mkdir -p "$OUTPUT_DIR/vllm"
 # Copy proto files
 echo "Copying proto files..."
 cp "$PROTO_SOURCE_DIR"/*.proto "$GO_PROTO_DIR"/
+# The shared messages' file is the worker crate's.
+cp "$SCRIPT_DIR/../../worker/proto/common.proto" "$GO_PROTO_DIR"/
 
 # Find tools in PATH or GOPATH
 PROTOC_GEN_GO=$(command -v protoc-gen-go || echo "$(go env GOPATH)/bin/protoc-gen-go")

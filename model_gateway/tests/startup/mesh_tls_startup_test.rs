@@ -28,7 +28,7 @@ use common::{
     test_certs::TestCertificates,
 };
 use openssl::ssl::{HandshakeError, SslConnector, SslFiletype, SslMethod};
-use smg::worker::test_support::RefusedAddress;
+use smg_worker::test_support::RefusedAddress;
 
 use crate::{
     common,

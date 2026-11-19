@@ -4,15 +4,13 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use openai_protocol::worker::WorkerStatus;
+use smg_worker::identity::{basic::Worker, endpoint::Endpoint};
 use tracing::{debug, warn};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
-use crate::{
-    worker::{identity::endpoint::Endpoint, Worker},
-    workflow::{
-        data::WorkerRemovalWorkflowData,
-        steps::shared::{pool_group, refresh_worker_pool_sizes, PoolGroups},
-    },
+use crate::workflow::{
+    data::WorkerRemovalWorkflowData,
+    steps::shared::{pool_group, refresh_worker_pool_sizes, PoolGroups},
 };
 
 /// Step to remove workers from the worker registry.
@@ -184,13 +182,14 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
+    use smg_worker::identity::basic::{Worker, WorkerType};
     use wfaas::WorkflowInstanceId;
 
     use super::*;
     use crate::{
         app_context::{testing::app_context_for_tests, AppContext},
         config::RouterConfig,
-        worker::{BasicWorkerBuilder, Worker, WorkerRegistry, WorkerType},
+        routers::{common::snapshot::WorkerRegistry, grpc::backend_client::BasicWorkerBuilder},
         workflow::{data::WorkerList, steps::local::WorkerRemovalRequest},
     };
 

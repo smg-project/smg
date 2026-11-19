@@ -11,7 +11,9 @@ use tracing::{debug, error};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use crate::{
-    policies::PolicyRegistry, worker::WorkerRegistry, workflow::data::WorkerRemovalWorkflowData,
+    policies::PolicyRegistry,
+    routers::common::snapshot::WorkerRegistry,
+    workflow::data::{require_app_context, WorkerRemovalWorkflowData},
 };
 
 /// Bound CPU-heavy radix-tree purges during a fleet-wide scale-down. The
@@ -57,11 +59,7 @@ impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromPolicyRegistryStep {
         &self,
         context: &mut WorkflowContext<WorkerRemovalWorkflowData>,
     ) -> WorkflowResult<StepResult> {
-        let app_context = context
-            .data
-            .app_context
-            .as_ref()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
+        let app_context = require_app_context(context.data.app_context.as_ref())?;
         let workers_to_remove = context
             .data
             .actual_workers_to_remove

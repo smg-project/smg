@@ -312,7 +312,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use crate::config::RouterConfig;
+    use crate::{config::RouterConfig, routers::common::snapshot::WorkerRegistry};
 
     fn config_with(timeout_secs: u64, check_interval_secs: u64) -> RouterConfig {
         RouterConfig::builder()
@@ -395,7 +395,7 @@ mod tests {
         metadata: serde_json::Value,
     ) -> (
         wfaas::WorkflowState<WorkerWorkflowData>,
-        Arc<crate::worker::WorkerRegistry>,
+        Arc<WorkerRegistry>,
         String,
     ) {
         use crate::workflow::steps::local::test_support::serve_json_routes;
@@ -412,16 +412,14 @@ mod tests {
         url: String,
     ) -> (
         wfaas::WorkflowState<WorkerWorkflowData>,
-        Arc<crate::worker::WorkerRegistry>,
+        Arc<WorkerRegistry>,
         String,
     ) {
         use openai_protocol::{model_card::ModelCard, worker::WorkerModels};
+        use smg_worker::worker::RuntimeType;
         use wfaas::{WorkflowEngine, WorkflowStatus};
 
-        use crate::{
-            app_context::testing::app_context_for_tests,
-            worker::{RuntimeType, WorkerRegistry},
-        };
+        use crate::app_context::testing::app_context_for_tests;
 
         let config = RouterConfig::builder()
             .regular_mode(vec![url.clone()])

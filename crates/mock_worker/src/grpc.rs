@@ -1056,7 +1056,8 @@ impl MockScheduler {
     /// alone, as the servicers answer; each wire shapes the rows into its
     /// `SchedulerLoad`. A canned worker is one rank whose running count is
     /// the canned and scripted answers with a stream still open on this
-    /// worker (not the process's other workers); nothing waits there.
+    /// worker (not the process's other workers); nothing waits there, and
+    /// with no engine to count them its row carries no resident tokens.
     pub(crate) fn load_rows(&self, wanted: Option<i32>) -> Vec<(i32, engine::LoadSnapshot)> {
         self.overrides.note_loads_poll();
         let mut rows: Vec<(i32, engine::LoadSnapshot)> = if self.ranks.is_empty() {
@@ -1077,6 +1078,7 @@ impl MockScheduler {
                     num_cached_blocks: 0,
                     num_preemptions: 0,
                     num_kv_batches: 0,
+                    num_resident_tokens: None,
                 },
             )]
         } else {
@@ -1111,7 +1113,12 @@ impl MockScheduler {
             // The load records alone, every rank's at the record's cadence,
             // from the ranks' engines whether or not they publish KV events:
             // a servicer's own figures need no relay.
-            let sources: Vec<RankLoadSource> = self.ranks.iter().map(RankLoadSource::of).collect();
+            let wire = self.cfg.grpc_wire;
+            let sources: Vec<RankLoadSource> = self
+                .ranks
+                .iter()
+                .map(|rank| RankLoadSource::of(rank, wire))
+                .collect();
             if sources.is_empty() {
                 return Err(Status::unimplemented(
                     "mock-worker (load records require --engine realistic)",
@@ -1128,10 +1135,7 @@ impl MockScheduler {
             .ranks
             .iter()
             .filter(|rank| rank.engine.kv_enabled())
-            .map(|rank| RankLoadSource {
-                engine: rank.engine.clone(),
-                prefill_pending: Arc::clone(&rank.prefill_pending),
-            })
+            .map(|rank| RankLoadSource::of(rank, self.cfg.grpc_wire))
             .collect();
         if sources.is_empty() {
             // Unimplemented, on which the gateway's KvEventMonitor gives up
@@ -1780,26 +1784,35 @@ const LOAD_TICK: Duration = Duration::from_millis(100);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 const HEARTBEAT_BACKOFF: Duration = Duration::from_secs(5);
 
-/// Where a rank's load record comes from: its engine and the prompt tokens
-/// handed to it with no token yet.
+/// Where a rank's load record comes from: its engine, the prompt tokens
+/// handed to it with no token yet, and whether its wire's report counts
+/// resident tokens.
 struct RankLoadSource {
     engine: Engine,
     prefill_pending: Arc<AtomicU64>,
+    counts_resident: bool,
 }
 
 impl RankLoadSource {
-    fn of(rank: &Rank) -> Self {
+    fn of(rank: &Rank, wire: SchedulerWire) -> Self {
         Self {
             engine: rank.engine.clone(),
             prefill_pending: Arc::clone(&rank.prefill_pending),
+            counts_resident: wire.counts_resident_tokens(),
         }
     }
 
     /// The rank's current record, numbered `sample`: its engine's load as
-    /// `GetLoads` reports it plus the liveness fields.
+    /// `GetLoads` reports it plus the liveness fields. One report on two
+    /// wires: the record carries the resident figure where the polled
+    /// answer does.
     fn record(&self, like: LoadsLike, step_reports: bool, sample: u64) -> common::EngineLoad {
         let snapshot = self.engine.load().as_reported_by(like);
         let mut record = load_record(&snapshot, like, sample);
+        record.num_resident_tokens = snapshot
+            .num_resident_tokens
+            .filter(|_| self.counts_resident)
+            .map(|held| u64::try_from(held).unwrap_or(0));
         record.engine_silence_ms = silence_ms(&self.engine);
         record.engine_reports_steps = Some(step_reports);
         record.prefill_pending_tokens = Some(pending_u32(&self.prefill_pending));
@@ -2903,6 +2916,29 @@ mod tests {
         }
     }
 
+    /// A canned worker runs no engine: its one polled row holds requests
+    /// and counts none of them, so it carries no resident figure where a
+    /// rank that runs nothing carries zero.
+    #[tokio::test]
+    async fn a_canned_workers_polled_row_carries_no_resident_tokens() {
+        let (service, _stop) = MockScheduler::for_tests(Config::default(), 65_131);
+        let loads = service
+            .get_loads(Request::new(ts::GetLoadsRequest::default()))
+            .await
+            .expect("loads")
+            .into_inner();
+        let counted: Vec<Option<i64>> = loads
+            .loads
+            .iter()
+            .map(|load| load.num_resident_tokens)
+            .collect();
+        assert_eq!(
+            counted,
+            vec![None],
+            "one row, and no count of what it holds"
+        );
+    }
+
     /// `GetLoads` lists one entry per rank, the request's `dp_rank` keeping
     /// one; `GetServerInfo` advertises the width.
     #[tokio::test]
@@ -2922,6 +2958,13 @@ mod tests {
                 .iter()
                 .all(|load| load.prefill_throughput.is_none()),
             "no rank has prefilled: no measured capacity yet"
+        );
+        assert!(
+            loads
+                .loads
+                .iter()
+                .all(|load| load.num_resident_tokens == Some(0)),
+            "an idle rank counts zero resident tokens, never none"
         );
         let one = service
             .get_loads(Request::new(ts::GetLoadsRequest {
@@ -2950,6 +2993,23 @@ mod tests {
             width.kind,
             Some(prost_types::value::Kind::StringValue("4".to_string()))
         );
+    }
+
+    /// One report on two wires: a rank's pushed record carries the resident
+    /// figure where its wire's polled answer does, zero for an idle rank,
+    /// and none on a wire whose engine reports none.
+    #[tokio::test]
+    async fn a_load_record_counts_resident_tokens_where_the_wire_reports_them() {
+        let engine = Engine::spawn(engine::EngineParams::default());
+        for (counts_resident, wanted) in [(true, Some(0)), (false, None)] {
+            let source = RankLoadSource {
+                engine: engine.clone(),
+                prefill_pending: Arc::new(AtomicU64::new(0)),
+                counts_resident,
+            };
+            let record = source.record(LoadsLike::Mock, false, 0);
+            assert_eq!(record.num_resident_tokens, wanted);
+        }
     }
 
     /// A `loads_only` subscription carries every rank's record and never an
@@ -3159,6 +3219,7 @@ mod tests {
                 vec![RankLoadSource {
                     engine: engine.clone(),
                     prefill_pending: Arc::new(AtomicU64::new(0)),
+                    counts_resident: false,
                 }],
                 LoadsLike::Mock,
                 false,
@@ -3226,6 +3287,7 @@ mod tests {
                 vec![RankLoadSource {
                     engine: engine.clone(),
                     prefill_pending: Arc::new(AtomicU64::new(0)),
+                    counts_resident: false,
                 }],
                 LoadsLike::Mock,
                 false,

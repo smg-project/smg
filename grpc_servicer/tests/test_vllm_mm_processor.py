@@ -425,6 +425,7 @@ class TestMmSettings:
             mm_turbojpeg=None,
             mm_fetch_timeout_ms=None,
             mm_video_fetch_timeout_ms=None,
+            mm_allow_private_media_hosts=None,
             model="m",
         )
         settings = mm_processor.MmSettings.from_args(args)
@@ -445,6 +446,39 @@ class TestMmSettings:
             mm_processor.MmSettings(max_item_bytes=0).resolve(env={})
         with pytest.raises(ValueError, match="SMG_VLLM_MM_MAX_INFLIGHT"):
             mm_processor.MmSettings().resolve(env={"SMG_VLLM_MM_MAX_INFLIGHT": "0"})
+
+    def test_private_media_hosts_are_refused_unless_the_flag_or_variable_allows_them(self):
+        resolved = mm_processor.MmSettings().resolve(env={})
+        assert resolved.allow_private_media_hosts is False
+        assert resolved.sources["allow_private_media_hosts"] == "default"
+        env = {"SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS": "true"}
+        resolved = mm_processor.MmSettings().resolve(env=env)
+        assert (
+            resolved.allow_private_media_hosts,
+            resolved.sources["allow_private_media_hosts"],
+        ) == (
+            True,
+            "env",
+        )
+        with pytest.raises(ValueError, match="is not a boolean"):
+            mm_processor.MmSettings().resolve(env={"SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS": "maybe"})
+        parser = argparse.ArgumentParser()
+        assert "--mm-allow-private-media-hosts" in mm_processor.add_mm_arguments(parser)
+        args = parser.parse_args(["--mm-allow-private-media-hosts"])
+        assert args.mm_allow_private_media_hosts is True
+        assert parser.parse_args([]).mm_allow_private_media_hosts is None
+        resolved = mm_processor.MmSettings.from_args(args).resolve(env={})
+        assert (
+            resolved.allow_private_media_hosts,
+            resolved.sources["allow_private_media_hosts"],
+        ) == (
+            True,
+            "flag",
+        )
+        # Carried into the environment as the servicer without a namespace reads it.
+        environ: dict[str, str] = {}
+        mm_processor.export_mm_flags(args, environ)
+        assert mm_processor.MmSettings().resolve(env=environ).allow_private_media_hosts is True
 
     def test_turbojpeg_policy_reads_prefer_or_require_and_refuses_the_rest(self):
         """The TurboJPEG policy: `prefer` by default, either value in any case
@@ -636,6 +670,7 @@ class TestInProcessConstruction:
             media.VideoMediaIO = _VideoMediaIO
             module("vllm.multimodal.media.video", VideoMediaIO=_VideoMediaIO)
         module("vllm.multimodal.media.connector", MEDIA_CONNECTOR_REGISTRY=_Registry)
+        module("vllm.connections", HTTPConnection=type("HTTPConnection", (), {}))
         module("vllm.transformers_utils")
         module("vllm.transformers_utils.processor", get_video_processor_cls_name=lambda cfg: "vp")
 
@@ -665,6 +700,32 @@ class TestInProcessConstruction:
         assert engine.model_config.get_multimodal_config().media_io_kwargs == {
             "video": {"num_frames": 40}
         }
+
+    def test_the_connector_fetches_through_the_media_host_guard(self, monkeypatch):
+        loaded = {}
+        self._stub_vllm(monkeypatch, loaded)
+        mm_processor.InProcessMediaProcessor(self._engine(None))
+        assert type(loaded["connection"]).__name__ == "GuardedHTTPConnection"
+        assert loaded["allowed_media_domains"] == ["example.com"]
+
+    def test_vllm_checks_the_first_url_against_the_allow_list_as_the_guard_reads_it(
+        self, monkeypatch
+    ):
+        # vLLM's own check is exact membership: an entry it is handed with a
+        # space or a capital would refuse the host the guard admits.
+        loaded = {}
+        self._stub_vllm(monkeypatch, loaded)
+        engine = self._engine(None)
+        engine.model_config.allowed_media_domains = [" Images.Example.com ", "", "[::1]"]
+        mm_processor.InProcessMediaProcessor(engine)
+        assert loaded["allowed_media_domains"] == ["[::1]", "images.example.com"]
+        # A list that names no host still refuses every host, as it did.
+        engine.model_config.allowed_media_domains = [" ", ""]
+        mm_processor.InProcessMediaProcessor(engine)
+        assert loaded["allowed_media_domains"] == [" ", ""]
+        engine.model_config.allowed_media_domains = None
+        mm_processor.InProcessMediaProcessor(engine)
+        assert loaded["allowed_media_domains"] is None
 
     def test_budget_above_vllms_default_keeps_the_default(self, monkeypatch):
         loaded = {}

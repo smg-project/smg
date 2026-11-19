@@ -1,0 +1,46 @@
+# Router with the standalone policy controller on a spec store: the
+# controller runs the document an operator applies, kept on a claim of
+# yours, and no document of the values.
+# Make the claim first, in the release's namespace, on a file system that
+# links a file under a second name and locks one. It holds eight documents.
+# One pod at a time holds the store, under the controller's own lock:
+# ReadWriteOncePod keeps a second pod off the claim as well while the first
+# still stops. Where the cluster offers no such mode, write ReadWriteOnce.
+#   apiVersion: v1
+#   kind: PersistentVolumeClaim
+#   metadata:
+#     name: smg-policy-spec
+#   spec:
+#     accessModes: [ReadWriteOncePod]
+#     resources:
+#       requests:
+#         storage: 64Mi
+# The chart renders no claim: one a release owned would go with the release,
+# and the generations on file are the only copy of an applied document.
+# Usage: helm install smg deploy/helm/smg -f deploy/helm/smg/examples/with-policy-controller-spec-store.yaml
+router:
+  workerUrls:
+    - http://worker-1:8000
+policyController:
+  enabled: true
+  # The claim the controller is passed as its --spec-store. With nothing on
+  # file the controller starts ready and sheds every decision until the
+  # first ApplyPolicySpec on its operators' listener; a pod that starts
+  # later runs the newest generation on file. One replica and no election:
+  # the chart refuses a store beside a second replica or the election.
+  specStoreClaim: smg-policy-spec
+  # No listener admits a caller until it is named here, and nothing is
+  # verified on a named listener: whoever reaches its port acts as any
+  # principal of its scopes. The apply call needs the operators' listener
+  # named. Name it only behind a mesh that verifies its callers, or a
+  # network policy that admits them alone:
+  # identityAsTold: [control]
+  # The controller runs 2 runtime worker threads by default
+  # (runtimeWorkerThreads), the CPU limit here: raise the two together.
+  resources:
+    requests:
+      cpu: 500m
+      memory: 128Mi
+    limits:
+      cpu: "2"
+      memory: 512Mi

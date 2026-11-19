@@ -47,8 +47,12 @@
     reason = "a bench's setup has no caller to answer"
 )]
 
+#[path = "common/filled.rs"]
+mod filled;
+
 use std::{
     hint::black_box,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -204,7 +208,7 @@ fn fleet(fleet: &str) -> Vec<WorkerFacts> {
             engine_kind: runtime,
             models: vec![MODEL.to_string()],
             dp_size: 1,
-            pairing,
+            pairing: pairing.map(Arc::new),
             ..WorkerFacts::default()
         }
     };
@@ -224,7 +228,7 @@ fn fleet(fleet: &str) -> Vec<WorkerFacts> {
 }
 
 /// One role's workers as the pairing rule reads them, in id order, as the
-/// store hands them to the derivation.
+/// store hands them to a derivation of the whole model.
 fn members(fleet: &[WorkerFacts], role: Role) -> Vec<Member<'_>> {
     let mut members: Vec<Member<'_>> = fleet
         .iter()
@@ -234,7 +238,7 @@ fn members(fleet: &[WorkerFacts], role: Role) -> Vec<Member<'_>> {
                 identity(&facts.key, facts.incarnation),
                 facts.wire_modes,
                 &facts.engine_kind,
-                facts.pairing.as_ref(),
+                facts.pairing.as_deref(),
             )
         })
         .collect();
@@ -259,6 +263,14 @@ fn store_of(fleet: &[WorkerFacts], mode: Pairing) -> MemoryStore {
         .expect("the first generation");
     for facts in fleet {
         store.upsert(facts.clone());
+    }
+    store.publish_now();
+    if let Some(first) = fleet.first() {
+        let rows = fleet
+            .iter()
+            .filter(|facts| facts.role == first.role)
+            .count();
+        filled::filled(&store, MODEL, first.role, rows);
     }
     store
 }
@@ -365,7 +377,11 @@ fn membership_write(c: &mut Criterion) {
         group.bench_function(name, |b| {
             b.iter_batched(
                 || refreshed.clone(),
-                |facts| store.upsert(black_box(facts)),
+                |facts| {
+                    let change = store.upsert(black_box(facts));
+                    store.publish_now();
+                    change
+                },
                 BatchSize::SmallInput,
             );
         });

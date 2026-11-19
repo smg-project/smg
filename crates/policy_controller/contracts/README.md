@@ -54,7 +54,7 @@ clock, a lease's issue instant), and each file's comments name them.
 
 - A gRPC plugin or a client of the controller compiles the two proto files
   with `protoc` and the generator of its language; the include path holds
-  this directory and the engine wire's directory (`crates/grpc_client/proto`
+  this directory and the engine wire's directory (`crates/worker/proto`
   in this repository) for `common.proto`. In Rust the generated types come
   from `tonic-prost-build` as the repository's own gRPC clients do.
 - A WebAssembly plugin targets one world of `smg-policy.wit` with
@@ -63,11 +63,15 @@ clock, a lease's issue instant), and each file's comments name them.
   guest builds without `std` and exports its own `cabi_realloc`. The host
   imports are `log`, `now-micros`, `counter` and `random-u64`; the exports are
   `init`, the `decision` resource (constructor, `filter`, `score`, `pick`) and
-  `observe`. A `policy-packed` guest reads its three blocks in place: the
+  `observe`, which the host calls with the kinds of lifecycle event the
+  plugin's row lists, none by default (a gRPC plugin's `Observe` stream
+  carries those). A `policy-packed` guest reads its three blocks in place: the
   offsets are in the WIT comments, the model name is padded so the u64
   sections stay 8-byte aligned for any name length, and the guest's
   `cabi_realloc` returns 8-aligned memory for the blocks (or it reads with
-  unaligned loads).
+  unaligned loads). Either world's view carries the request's block hashes
+  only where the plugin's row declares them among its needs, 8,190 at most,
+  as a gRPC plugin's frame does.
 - The validity rules a plugin must keep are in the files: surviving positions
   unique and in range, one finite score per candidate clamped to `0..1`, a
   pick inside the surviving set; a violation is a trap (the instance is
@@ -98,7 +102,9 @@ about 170 bytes out (a pair with two decode alternates 260); a candidate row
 with its load row is about 90 bytes (up to 6 more with the index's block count
 set), so a gRPC plugin's record view is about 42 KB at 512 candidates, hence
 `plugins[].max_candidates`
-(default 128); a credit grant (a delta: each decide request spends one, no
+(default 128), and its frame carries the request's block hashes only where
+the plugin's row declares them, 8,190 at most (64 KB);
+a credit grant (a delta: each decide request spends one, no
 answer returns one, a new stream starts at the welcome's window) is 6 bytes
 in its envelope (20 on the wire); a
 `HelloPage` of 100 leases and 50 pins is about 9.3 KB, so a 64 KB page holds

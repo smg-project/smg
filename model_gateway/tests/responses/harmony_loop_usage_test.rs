@@ -18,15 +18,15 @@ use serde_json::{json, Value};
 use smg::{
     config::{RouterConfig, RoutingMode},
     middleware::TenantRequestMeta,
-    routers::RouterFactory,
+    routers::{grpc::backend_client::BasicWorkerBuilder, RouterFactory},
     tenant::TenantKey,
-    worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType},
 };
 use smg_grpc_client::tokenspeed_scheduler::tokenspeed_proto as ts;
 use smg_test_harness::{
     engine_answers::{TokenSpeedAnswers, TokenSpeedGenerateStream},
     grpc_harness::serve_engine,
 };
+use smg_worker::identity::basic::{ConnectionMode, RuntimeType, WorkerType};
 use tokio::time::timeout;
 use tonic::{Request, Response, Status};
 use ts::generate_response::Response as GenResp;

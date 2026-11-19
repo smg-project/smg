@@ -14,14 +14,13 @@
 use std::sync::Arc;
 
 use axum::response::Response;
+use smg_worker::identity::basic::{ConnectionMode, Worker, WorkerType};
 use tracing::debug;
 
-use crate::{
-    routers::{
-        error,
-        grpc::context::{PreparationOutput, RequestType, WorkerSelection},
-    },
-    worker::{ConnectionMode, ModelWorkerSnapshot, RoutingPool, WindowFloor, Worker, WorkerType},
+use crate::routers::{
+    common::snapshot::{ModelWorkerSnapshot, RoutingPool, WindowFloor},
+    error,
+    grpc::context::{PreparationOutput, RequestType, WorkerSelection},
 };
 
 /// The window that binds `worker` for `model_id`, and whether the worker
@@ -408,13 +407,13 @@ mod tests {
         chat::ChatCompletionRequest, model_card::ModelCard, validated::Normalizable,
         worker::HealthCheckConfig,
     };
+    use smg_worker::identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType};
 
     use super::*;
-    use crate::{
-        routers::{error::HEADER_X_SMG_ERROR_CODE, grpc::context::CompletionItem},
-        worker::{
-            BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerRegistry, WorkerType,
-        },
+    use crate::routers::{
+        common::snapshot::{WorkerRegistry, WorkerRegistryExt},
+        error::HEADER_X_SMG_ERROR_CODE,
+        grpc::{backend_client::BasicWorkerBuilder, context::CompletionItem},
     };
 
     const MODEL: &str = "ctx-test-model";

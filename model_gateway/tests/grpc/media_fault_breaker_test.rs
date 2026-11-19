@@ -21,15 +21,15 @@ use serde_json::{json, Value};
 use smg::{
     config::{RetryConfig, RouterConfig, RoutingMode},
     middleware::TenantRequestMeta,
-    routers::RouterFactory,
+    routers::{grpc::backend_client::BasicWorkerBuilder, RouterFactory},
     tenant::TenantKey,
-    worker::{
-        health::circuit_breaker::CircuitState, BasicWorkerBuilder, ConnectionMode, RuntimeType,
-        Worker, WorkerType,
-    },
 };
 use smg_grpc_client::{
     stamp_media_code, tokenspeed_scheduler::tokenspeed_proto as ts, WorkerMediaFault,
+};
+use smg_worker::{
+    health::circuit_breaker::CircuitState,
+    identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType},
 };
 use tokio::{net::TcpListener, time::timeout};
 use tonic::{transport::Server, Request, Response, Status};

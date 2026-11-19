@@ -3,24 +3,31 @@
 //! of 64 and of 512 rows, a decision over rows with a credit held in the
 //! least-load tally, and a pair decision allocate nothing (design 4.4: a
 //! scorer or picker allocates nothing per decision; the host keeps one scratch
-//! per thread so the framework allocates nothing after the first). A separate
-//! executable, so it can declare the counting allocator the pins need.
+//! per thread so the framework allocates nothing after the first). The
+//! store's pins stand beside them: a build from the store allocates nothing
+//! after the first, and two membership writes are held to each other, a
+//! write that moves an offer to one that moves none and a registration into
+//! 512 workers to one into 8. A separate executable, so it can declare the
+//! counting allocator the pins need.
 
 #![expect(clippy::expect_used, reason = "tests that stop on a broken setup")]
 
 mod common;
 
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use common::counting_alloc::{calls, Counting};
 use smg_policy_controller::{
     store::{
-        Ask, GatewayId, LoadSink, LoadSource, MemoryStore, PairBuffers, PairingDescriptor,
-        ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
+        Ask, GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore, PairBuffers,
+        PairingDescriptor, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
     },
-    Candidate, Constraints, Engine, Health, Lease, Lifecycle, LoadRow, PairPools, PolicySpec,
-    PoolFacts, RequestFacts, Role, Scratch, Side, SignalSource, Target, WireModes, WorkerId,
-    PRESETS,
+    AffinityFacts, Candidate, Constraints, Engine, Health, Lease, Lifecycle, LoadRow,
+    NamedAffinity, NamedHolder, PairPools, PolicySpec, PoolFacts, RequestFacts, Role, Scratch,
+    Side, SignalSource, Target, WireModes, WorkerId, PRESETS,
 };
 
 #[global_allocator]
@@ -101,6 +108,135 @@ fn a_decision_after_the_first_allocates_nothing_for_any_preset() {
                 allocations_during(|| engine.decide(&facts(2), &pool(n), &view, &cx, &mut scratch));
             assert!(decision.pick().is_some(), "{preset} at {n} routes");
             assert_eq!(allocations, 0, "{preset} at {n}: a decision allocated");
+        }
+    }
+}
+
+/// A decision asked by rank allocates nothing after the thread's first of
+/// its size, whatever that first was: by rank where no row holds the
+/// request's prefix, a draw for a request that names rows, or the whole
+/// pass over a pool not said to hold a report on every row. The second
+/// decision puts the holders in front: one row in eight, each running one
+/// request at a rate a token a second from the next, with a long queue on
+/// one row behind them. Its targets are the four fastest holders in their
+/// order, which shows the front: the whole pass spreads the load over that
+/// queue, reads the holders alike and draws among them. What the decision
+/// keeps of the rows in front stands in buffers every first decision
+/// sized: their sums in the stage's, their list in the soft filter's
+/// backup. The preset is read with its soft filters and without them. A
+/// profile without one takes the list's room at its first decision by
+/// rank: behind a whole pass that decision allocates once, and the next
+/// allocates nothing.
+#[test]
+fn a_decision_by_rank_after_the_first_allocates_nothing() {
+    let mut bare = PolicySpec::preset("cache_aware").expect("a preset");
+    for profile in bare.profiles.values_mut() {
+        profile
+            .filter
+            .retain(|name| name != "not-tried" && name != "has-room");
+    }
+    let engines = [
+        (true, engine_of("cache_aware")),
+        (false, bare.validate().expect("the document validates")),
+    ];
+    for (soft, engine, n) in engines
+        .iter()
+        .flat_map(|(soft, engine)| [(*soft, engine, 64u32), (*soft, engine, 512)])
+    {
+        let mut view = fleet(n);
+        for (step, row) in (0u32..).zip(view.iter_mut().step_by(8)) {
+            row.in_flight = 0;
+            if let Some(load) = row.load.as_mut() {
+                load.running = 1;
+                load.queued = 0;
+                load.kv_usage_permille = 100;
+                load.live_rate = 20_000 + step;
+            }
+        }
+        if let Some(load) = view[1].load.as_mut() {
+            load.queued = 200;
+        }
+        let fastest = [n - 8, n - 16, n - 24, n - 32];
+        let column = |blocks: u32| -> Vec<AffinityFacts> {
+            (0..n)
+                .map(|i| AffinityFacts {
+                    overlap_blocks: if i % 8 == 0 { blocks } else { 0 },
+                    ..AffinityFacts::default()
+                })
+                .collect()
+        };
+        let (cold, held) = (column(0), column(4));
+        let names = [NamedHolder {
+            row: 0,
+            overlap_blocks: 4,
+            predicted_blocks: 0,
+        }];
+        // Each first, and whether the host says the pool's fact of it.
+        let firsts = [
+            (
+                RequestFacts {
+                    affinity: &cold,
+                    ..facts(1)
+                },
+                true,
+            ),
+            (
+                RequestFacts {
+                    named: Some(NamedAffinity {
+                        holders: &names,
+                        ..NamedAffinity::default()
+                    }),
+                    ..facts(1)
+                },
+                true,
+            ),
+            (
+                RequestFacts {
+                    affinity: &cold,
+                    ..facts(1)
+                },
+                false,
+            ),
+        ];
+        let said = PoolFacts {
+            reported: true,
+            ..pool(n)
+        };
+        let unsaid = pool(n);
+        let cx = Constraints::default();
+        for (order, (first, reported)) in firsts.iter().enumerate() {
+            let mut scratch = Scratch::new();
+            let of_first = if *reported { &said } else { &unsaid };
+            engine
+                .decide(first, of_first, &view, &cx, &mut scratch)
+                .pick()
+                .expect("the fleet routes");
+            let second = RequestFacts {
+                affinity: &held,
+                ..facts(2)
+            };
+            let (decision, allocations) =
+                allocations_during(|| engine.decide(&second, &said, &view, &cx, &mut scratch));
+            let pick = decision.pick().expect("the fleet routes");
+            let targets: Vec<u32> = pick.targets.iter().map(|target| target.position).collect();
+            assert_eq!(
+                targets, fastest,
+                "soft {soft} at {n}, order {order}: the fastest holders, in their order"
+            );
+            // A whole pass sizes no list of the rows in front: without a
+            // soft filter the first decision by rank takes that room.
+            let lists_late = !soft && !*reported;
+            assert_eq!(
+                allocations,
+                usize::from(lists_late),
+                "soft {soft} at {n}, order {order}: a decision by rank allocated"
+            );
+            let (_, again) =
+                allocations_during(|| engine.decide(&second, &said, &view, &cx, &mut scratch));
+            assert_eq!(
+                again, 0,
+                "soft {soft} at {n}, order {order}: the next decision by rank allocated"
+            );
         }
     }
 }
@@ -334,6 +470,7 @@ fn store_of(n: usize) -> (MemoryStore, Vec<WorkerId>, Instant) {
                 ..WorkerFacts::default()
             })
             .id();
+        store.publish_now();
         let revision = WorkersStore::get(&store, id).expect("the row").revision;
         store
             .set_status(id, WorkerStatus::Ready, revision)
@@ -395,12 +532,15 @@ fn a_pair_build_with_its_table_allocates_nothing_after_the_first() {
             wire_modes: WireModes::GRPC,
             models: vec!["m".to_string()],
             dp_size: 1,
-            pairing: transport.map(|transport| PairingDescriptor {
-                transport: Some(transport.to_string()),
-                ..PairingDescriptor::default()
+            pairing: transport.map(|transport| {
+                Arc::new(PairingDescriptor {
+                    transport: Some(transport.to_string()),
+                    ..PairingDescriptor::default()
+                })
             }),
             ..WorkerFacts::default()
         });
+        store.publish_now();
     };
     for (index, transport) in ["tx-a", "tx-b"].into_iter().enumerate() {
         register(
@@ -437,6 +577,93 @@ fn a_pair_build_with_its_table_allocates_nothing_after_the_first() {
     assert_eq!((classes.classes(), classes.entries()), (2, 4));
     assert_eq!(pools.table.validate(), Ok(()));
     assert_eq!(allocations, 0, "a pair build through the door allocated");
+}
+
+#[test]
+fn a_write_that_moves_an_offer_allocates_what_a_write_that_moves_none_does() {
+    // Pairs that name no runtime. One prefill names its runtime and unnames
+    // it in turn, which moves its offer at every write and no class: the
+    // writer derives for that worker alone from what it keeps, and hands
+    // back the classes it had.
+    for n in [8_usize, 64] {
+        let store = MemoryStore::new();
+        let facts_of = |index: usize, runtime: &str| {
+            let (role, key) = if index < n {
+                (Role::Prefill, format!("grpc://p{index}:9000"))
+            } else {
+                (Role::Decode, format!("grpc://d{index}:9000"))
+            };
+            WorkerFacts {
+                key: key.clone(),
+                engine: key,
+                incarnation: 1,
+                role,
+                wire_modes: WireModes::GRPC,
+                engine_kind: runtime.to_string(),
+                models: vec!["m".to_string()],
+                dp_size: 1,
+                ..WorkerFacts::default()
+            }
+        };
+        for index in 0..2 * n {
+            store.upsert(facts_of(index, ""));
+            store.publish_now();
+        }
+        // The fewest allocation calls of one write and the build it owes
+        // among a few: the store's change log grows by doubling, and one
+        // write in many pays for it.
+        let fewest = |runtimes: [&str; 2]| {
+            let one = |turn: usize| {
+                let facts = facts_of(n / 2, runtimes[turn % 2]);
+                allocations_during(|| {
+                    store.upsert(facts);
+                    store.publish_now();
+                })
+                .1
+            };
+            (0..8).map(one).min()
+        };
+        // The first writes size what the writer keeps of the derivation.
+        fewest(["rt-b", ""]);
+        let (kept, moved) = (fewest(["", ""]), fewest(["rt-b", ""]));
+        assert_eq!(
+            moved, kept,
+            "{n} a side: the written worker's derive allocated"
+        );
+    }
+}
+
+#[test]
+fn a_registrations_allocations_do_not_follow_the_fleet() {
+    // A membership write walks every member into its pool's list. A
+    // standing pool's list starts at the pool's last length and one more,
+    // so what a registration allocates does not follow the fleet: one into
+    // 512 workers makes the allocator calls of one into 8.
+    let fewest = |n: usize| {
+        let (store, _, _) = store_of(n);
+        // The fewest allocation calls of one registration and the build it
+        // owes among a few: the store's tables and the writer's kept lists
+        // grow by doubling, and one write in many pays for it.
+        let one = |turn: usize| {
+            let key = format!("http://new{turn}:8000");
+            let facts = WorkerFacts {
+                key: key.clone(),
+                engine: key,
+                incarnation: 1,
+                models: vec!["m".to_string()],
+                dp_size: 1,
+                ..WorkerFacts::default()
+            };
+            allocations_during(|| {
+                store.upsert(facts);
+                store.publish_now();
+            })
+            .1
+        };
+        (0..8).map(one).min()
+    };
+    let (few, many) = (fewest(8), fewest(512));
+    assert_eq!(many, few, "a registration's allocations follow the fleet");
 }
 
 #[test]
@@ -480,4 +707,43 @@ fn index_keys_that_pass_add_no_allocation_to_a_validation() {
         allocations
     };
     assert_eq!(allocations(2_000), allocations(1_000));
+}
+
+#[test]
+fn a_lent_view_from_the_store_after_the_first_allocates_nothing() {
+    for n in [8usize, 64, 512] {
+        let (store, ids, opened) = store_of(n);
+        let asker = GatewayId(1);
+        store.gateway_veto(asker, ids[1], Some(opened + Duration::from_secs(3_600)));
+        let mut out = ViewBuffers::default();
+        for affinity in [false, true] {
+            let ask = Ask {
+                gateway: asker,
+                now: opened + Duration::from_secs(1),
+                pinned: Some(ids[0]),
+                affinity,
+            };
+            // The first view sizes the host's buffers: the mask and the
+            // column.
+            store.with_world(|world| {
+                let first = world.view("m", Role::Single, &ask, false, &mut out);
+                assert!(first.is_some());
+            });
+            let (read, allocations) = allocations_during(|| {
+                store.with_world(|world| {
+                    let view = world
+                        .view("m", Role::Single, &ask, false, &mut out)
+                        .expect("the pool");
+                    let (rows, column) = (view.candidates.len(), view.affinity.len());
+                    (rows, view.stalled.len(), view.pinned_at != 0, column)
+                })
+            });
+            assert_eq!(read, (n, 1, true, if affinity { n } else { 0 }));
+            assert_eq!(
+                allocations, 0,
+                "a lent view of {n} rows allocated (affinity {affinity})"
+            );
+        }
+        assert!(out.candidates.is_empty(), "a lent view copies no row");
+    }
 }

@@ -54,8 +54,8 @@
 # records it: two of them are the ids its note names, 15.2 and 11.9 % slower on 2 and 6 instructions more.
 repeats = 3
 count = true
-# The count ends 2,280 s into the run: the gate step's bound is 40 minutes, and the report is written
-# in the two minutes behind the count. No count starts in the budget's last 30 s.
+# The count ends 2,280 s into the run. The gate step's bound is 60 minutes, which the `decision` row needs,
+# and this binary's runs and its report end long before it. No count starts in the budget's last 30 s.
 run_budget = 2280
 filter = "^policy_affinity/"
 

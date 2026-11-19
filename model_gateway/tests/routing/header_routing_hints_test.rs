@@ -18,9 +18,11 @@ use serde_json::json;
 use smg::{
     config::PolicyConfig,
     policies::{CacheAwareConfig, CacheAwarePolicy, LoadBalancingPolicy, SelectWorkerInfo},
-    routers::common::header_utils::parse_routing_tokens_hint,
-    worker::{BasicWorkerBuilder, Worker, WorkerType},
+    routers::{
+        common::header_utils::parse_routing_tokens_hint, grpc::backend_client::BasicWorkerBuilder,
+    },
 };
+use smg_worker::identity::basic::{Worker, WorkerType};
 use tower::ServiceExt;
 
 use crate::common::{

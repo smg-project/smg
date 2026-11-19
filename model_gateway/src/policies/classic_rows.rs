@@ -3,11 +3,11 @@
 //! the classic policy picked for it. The policy controller crate replays the
 //! rows through its own decision (`crates/policy_controller/tests/classic_rows.rs`).
 //!
-//! This file is not part of the gateway. It is kept beside the recorded rows
-//! with the commit it records from, and run in a checkout of that commit:
-//! copy it to `model_gateway/src/policies/classic_rows.rs`, add
-//! `#[cfg(test)] mod classic_rows;` to `model_gateway/src/policies/mod.rs`,
-//! then
+//! This file is an ignored test of the gateway crate, kept beside the code
+//! it runs. It records from the checkout it is built in and writes the sheet
+//! under `CLASSIC_ROWS_OUT`, naming `CLASSIC_ROWS_COMMIT` as the commit it
+//! recorded from. The sheets the policy controller crate replays are in
+//! `crates/policy_controller/tests/classic/sheets`; to record this one again:
 //!
 //! ```text
 //! CLASSIC_ROWS_OUT=<dir> CLASSIC_ROWS_COMMIT=<commit> \
@@ -22,13 +22,10 @@ use std::{collections::HashMap, fs, path::PathBuf, sync::Arc, thread, time::Dura
 
 use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
 use serde::Serialize;
+use smg_worker::{identity::basic::Worker, load::state::TestFeed};
 
 use super::{LoadBalancingPolicy, PowerOfTwoPolicy, SelectWorkerInfo};
-use crate::{
-    config::PowerOfTwoLoadMetric,
-    policies::test_support::make_worker,
-    worker::{load::state::TestFeed, Worker},
-};
+use crate::{config::PowerOfTwoLoadMetric, policies::test_support::make_worker};
 
 /// What a worker's report says: running and waiting requests, the resident
 /// context tokens when the engine counts them, the token-work of its queue,

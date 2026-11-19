@@ -25,8 +25,9 @@ use std::{fmt, sync::Arc};
 use llm_multimodal::{
     EncoderDtype, ImageFrame, MediaConnectorError, MediaItemInfo, Modality, VisionPreProcessor,
 };
+use smg_worker::identity::basic::Worker;
 
-use crate::worker::{Worker, WorkerRegistry};
+use crate::routers::common::snapshot::WorkerRegistry;
 
 /// Worker label carrying the engine's encoder budget in feature tokens: the
 /// vLLM servicer's `GetServerInfo.mm_encoder_budget` (the "budget of N
@@ -233,12 +234,10 @@ mod tests {
         types::ImageSize, ImageSource, MediaErrorCode, MediaFault, PreprocessedEncoderInputs,
         TransformError, VideoSamplingInfo,
     };
+    use smg_worker::identity::basic::RuntimeType;
 
     use super::*;
-    use crate::worker::{
-        test_support::{grpc_worker, registry_with},
-        RuntimeType,
-    };
+    use crate::routers::common::snapshot::test_support::{grpc_worker, registry_with};
 
     const MODEL: &str = "vision-model";
 

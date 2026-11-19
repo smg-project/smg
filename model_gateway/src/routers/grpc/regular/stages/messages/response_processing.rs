@@ -65,14 +65,7 @@ impl ProcessStage for MessageResponseProcessingStage {
             // Read derived skip_special_tokens (set in preparation, survives request_building .take())
             let skip_special_tokens = ctx.response.skip_special_tokens.unwrap_or(true);
 
-            // Reserved (if tenant rate limiting is enabled): settled with real
-            // usage inside the streaming processor on success, or abandoned
-            // on early disconnect/error by the reservation's safety net the
-            // processor hands the response body (ReservationAttachment's Drop).
-            let reservation = ctx
-                .rate_limit_cell
-                .as_deref()
-                .and_then(RateLimitCell::take_for_streaming_handoff);
+            let reservation = RateLimitCell::stream_reservation(ctx.rate_limit_cell.as_deref());
 
             // Streaming: use StreamingProcessor and return SSE response
             let source = StreamSource::new(

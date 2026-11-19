@@ -9,12 +9,8 @@ use axum::{body::to_bytes, http::StatusCode};
 use llm_tokenizer::MockTokenizer;
 use openai_protocol::{messages::CreateMessageRequest, model_card::ModelCard};
 use serde_json::json;
-use smg::{
-    middleware::TenantRequestMeta,
-    routers::RouterTrait,
-    tenant::TenantKey,
-    worker::{RuntimeType, WorkerType},
-};
+use smg::{middleware::TenantRequestMeta, routers::RouterTrait, tenant::TenantKey};
+use smg_worker::identity::basic::{RuntimeType, WorkerType};
 
 use crate::common::{
     engine_answers::VllmAnswers,
@@ -79,7 +75,9 @@ async fn a_replayed_mcp_exchange_is_refused_before_the_engine() {
     }))
     .expect("a Messages request");
     let tenant = TenantRequestMeta::new(TenantKey::new("mcp-replay-test-tenant"));
-    let response = router.route_messages(None, &tenant, request, MODEL).await;
+    let response = router
+        .route_messages(None, &tenant, Arc::new(request), MODEL)
+        .await;
     let status = response.status();
     let body = to_bytes(response.into_body(), 1 << 20)
         .await

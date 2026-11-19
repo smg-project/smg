@@ -2010,9 +2010,9 @@ mod tests {
         },
         server::posture::SecretSource,
         service_discovery::RuntimeDiscoveryConfig,
-        worker::{ConnectionMode, RuntimeType},
     };
     use smg_auth::Role;
+    use smg_worker::identity::basic::{ConnectionMode, RuntimeType};
 
     use super::*;
 

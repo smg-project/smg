@@ -3,18 +3,20 @@
 use std::{collections::HashMap, time::Duration};
 
 use async_trait::async_trait;
+use openai_protocol::UNKNOWN_MODEL_ID;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use smg_worker::identity::{
+    basic::ConnectionMode,
+    endpoint::Endpoint,
+    sampling_defaults::{SamplingDefaults, DEFAULT_SAMPLING_PARAMS_LABEL},
+};
 use tool_parser::GrammarStart;
 use tracing::{debug, warn};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use crate::{
     routers::grpc::client::{flat_labels, GrpcClient},
-    worker::{
-        identity::{endpoint::Endpoint, sampling_defaults::SamplingDefaults},
-        ConnectionMode, DEFAULT_SAMPLING_PARAMS_LABEL, UNKNOWN_MODEL_ID,
-    },
     workflow::{
         data::{WorkerKind, WorkerWorkflowData},
         steps::{
@@ -225,10 +227,9 @@ async fn http_get_vllm_models_classified(
             "status {status} from {shown}"
         )));
     }
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| MetadataError::Failed(format!("Failed to read {shown}: {e}")))?;
+    let bytes = resp.bytes().await.map_err(|e| {
+        MetadataError::Failed(format!("Failed to read {shown}: {}", e.without_url()))
+    })?;
     let body: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|e| MetadataError::Failed(format!("Failed to parse {shown}: {e}")))?;
     #[derive(Deserialize)]
@@ -458,30 +459,6 @@ async fn fetch_vllm_http_metadata_into(
     }
 
     Ok(())
-}
-
-/// Re-read the KV transfer engine id a gRPC engine reports, for a PD worker
-/// that came back on the same address (#2491): a restarted engine process
-/// carries a new id, and a handoff minted for the old one strands the decode.
-///
-/// Unlike registration discovery, a server-info failure is an error here
-/// rather than a tolerated gap: the caller must tell a read that did not
-/// complete (retry later) from an engine that reports no id (nothing to
-/// retry).
-pub(crate) async fn discover_grpc_kv_engine_id(
-    url: &str,
-    runtime_type: &str,
-) -> Result<Option<String>, String> {
-    let client = GrpcClient::connect(&grpc_base_url(url), runtime_type)
-        .await
-        .map_err(|e| format!("Failed to connect to gRPC: {e}"))?;
-    let mut labels = client
-        .get_server_info()
-        .await
-        .map_err(|e| format!("Failed to fetch gRPC server info: {e}"))?
-        .to_labels();
-    normalize_grpc_keys(&mut labels);
-    Ok(labels.remove("kv_engine_id").filter(|id| !id.is_empty()))
 }
 
 /// The gRPC model and server info as labels. Registration tolerates a
@@ -1150,8 +1127,9 @@ mod tests {
     async fn vllm_smg_http_extension_reaches_pairing_and_preserves_explicit_priority() {
         use http::StatusCode;
         use openai_protocol::worker::WorkerSpec;
+        use smg_worker::pd::pairing::PdPairing;
 
-        use crate::{worker::PdPairing, workflow::steps::local::test_support::serve_json_routes};
+        use crate::workflow::steps::local::test_support::serve_json_routes;
 
         for (value, expected) in [
             (None, None),
@@ -1306,11 +1284,9 @@ mod tests {
     #[tokio::test]
     async fn registration_preserves_legacy_absent_valid_and_optional_failures() {
         use http::StatusCode;
+        use smg_worker::test_support::RefusedAddress;
 
-        use crate::{
-            worker::test_support::RefusedAddress,
-            workflow::steps::local::test_support::serve_json_routes,
-        };
+        use crate::workflow::steps::local::test_support::serve_json_routes;
 
         for (status, body, expected) in [
             (
@@ -1406,7 +1382,7 @@ mod tests {
     #[tokio::test]
     async fn an_engine_that_refuses_the_connection_leaves_registration_empty_and_fails_a_strict_read(
     ) {
-        use crate::worker::test_support::RefusedAddress;
+        use smg_worker::test_support::RefusedAddress;
 
         let refused = RefusedAddress::reserve();
         let base = refused.http_url();
@@ -1601,7 +1577,7 @@ mod tests {
     /// named, strict or not.
     #[tokio::test]
     async fn an_engine_that_refuses_the_connection_fails_the_grpc_read_at_the_dial() {
-        use crate::worker::test_support::RefusedAddress;
+        use smg_worker::test_support::RefusedAddress;
 
         let refused = RefusedAddress::reserve();
         let url = format!("grpc://{}", refused.addr());
@@ -1784,7 +1760,7 @@ mod tests {
     /// ends with the request URL, the query kept.
     #[tokio::test]
     async fn a_refused_connection_goes_without_the_clients_url() {
-        use crate::worker::test_support::RefusedAddress;
+        use smg_worker::test_support::RefusedAddress;
 
         let refused = RefusedAddress::reserve();
         let url = format!("{}?token=s3cret", refused.http_url());
@@ -1794,6 +1770,51 @@ mod tests {
             .expect_err("nothing listens at the address");
 
         assert!(!err.contains("s3cret"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_truncated_vllm_models_body_goes_without_the_clients_url() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test-only truncated HTTP server; its handle is joined below"
+        )]
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let count = stream.read(&mut chunk).await.unwrap();
+                assert_ne!(count, 0, "client must send the HTTP request");
+                request.extend_from_slice(&chunk[..count]);
+                assert!(request.len() <= 8192, "bounded test request headers");
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 128\r\nConnection: close\r\n\r\n{",
+                )
+                .await
+                .unwrap();
+            stream.shutdown().await.unwrap();
+        });
+
+        let err = http_get_vllm_models_classified(
+            &http_client(),
+            &format!("http://127.0.0.1:{port}/v1/models?token=body-read-canary"),
+            None,
+        )
+        .await
+        .expect_err("the declared response body must be truncated");
+        server.await.unwrap();
+
+        assert!(matches!(err, MetadataError::Failed(_)), "{err:?}");
+        let message = err.to_string();
+        assert!(message.contains("Failed to read"), "{message}");
+        assert!(!message.contains("body-read-canary"), "{message}");
+        assert!(!message.contains("token="), "{message}");
     }
 
     /// An address registered with a query that answers a body that is no

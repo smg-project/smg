@@ -1,0 +1,250 @@
+[
+  {
+    "name": "deepseek-v4.1-flash",
+    "family": "DeepSeek V4.1",
+    "vocabulary": "byte-level BPE",
+    "repo": "deepseek-ai/DeepSeek-V4.1-Flash",
+    "revision": "2cba9e42aa026125f3ed06c6d98c1db82f7ca027",
+    "files": {
+      "chat_template.jinja": "d959d804d5101b79a49b6ff1bf3c54cd5affa9a5a78c503d925f3090040b31c3",
+      "config.json": "8be45ce0476004a3f529fd896115a4a2e800a129ad2d3ec05b16050f52e21879",
+      "tokenizer.json": "c90dfa01249db1be4245780a052ede752e1361c612ac6d08e2bdada7d599476b",
+      "tokenizer_config.json": "6ac8c8dc065ed118161d02dd532749ae3f52c243deac27872134fae2f50d8547"
+    }
+  },
+  {
+    "name": "deepseek-v3.2",
+    "family": "DeepSeek V3.2",
+    "vocabulary": "byte-level BPE",
+    "repo": "deepseek-ai/DeepSeek-V3.2",
+    "revision": "a7e62ac04ecb2c0a54d736dc46601c5606cf10a6",
+    "files": {
+      "config.json": "c7fa8b191e9936d8e6a57d864baab82b792fae16a116416cdd3a75ba76bc5af1",
+      "generation_config.json": "c9ce7f8d4a66c6cedd053650db3596328f241f00a7e49e67b89e5c9e336e7205",
+      "tokenizer.json": "cd050be35cae877f8f0aa847f45aa87e23835a56ca32b29b28545597852784e5",
+      "tokenizer_config.json": "b5de6cc1c6758d02c0d3cec0efa062f1161654475458003f6f293f6ef28acdaa"
+    }
+  },
+  {
+    "name": "llama-3.2-1b",
+    "family": "Llama 3.2",
+    "vocabulary": "byte-level BPE",
+    "repo": "unsloth/Llama-3.2-1B-Instruct",
+    "revision": "5a8abab4a5d6f164389b1079fb721cfab8d7126c",
+    "files": {
+      "chat_template.jinja": "5816fce10444e03c2e9ee1ef8a4a1ea61ae7e69e438613f3b17b69d0426223a4",
+      "config.json": "dfb67fd8afe73a1c75245824ef9d64a6ba8983025447e3bf76aa1ea57ee46152",
+      "generation_config.json": "6d4f979915331212d7672c68b22a4ddad9e21ed8126cf2bd1ea6b2b88f595c1c",
+      "special_tokens_map.json": "94e708c3f5e64acf85bbe5ad01467a1248faadb73e83b41793087ecced586e8f",
+      "tokenizer.json": "6b9e4e7fb171f92fd137b777cc2714bf87d11576700a1dcd7a399e7bbe39537b",
+      "tokenizer_config.json": "9ddd255c19fe319c8d4e891163540382e9fbda99f394674f2a929efc47d57458"
+    }
+  },
+  {
+    "name": "llama-4-scout",
+    "family": "Llama 4",
+    "vocabulary": "byte-level BPE",
+    "repo": "unsloth/Llama-4-Scout-17B-16E-Instruct",
+    "revision": "afd8e498c87bda51c7ea8ec68ea2f7c066e6340b",
+    "files": {
+      "chat_template.jinja": "93c6a232af67e2b3bc9218179ec3fea5176ec88b2a4a4fb66e51feb2ef63c0bd",
+      "config.json": "4cd670eadedaff9ba7eb42e97f08ec8a384b91652198378cc67e2c32e86191ec",
+      "generation_config.json": "bab4cab48a19ec65f3c0bca3a39ba7a663bae7766e88f41c8d6dc8cf3cbf6dc3",
+      "preprocessor_config.json": "11a1b41f43161e324bf8302299bce8d59aba671d1505137d9d01179ae9aeacde",
+      "special_tokens_map.json": "39aa13d7e53f700671e7af6464a745ed2d23ac3d2edba757a77b28ecb9a615cf",
+      "tokenizer.json": "172c9eb4beafc72601690da3ccfcede5c2e6806a8d5ec1fca33e22acea8023a4",
+      "tokenizer.model": "d0bdbaf59b0762c8c807617e2d8ea51420eb1b1de266df2495be755c8e0ed6ed",
+      "tokenizer_config.json": "102f782a8bf57e53ad563d6327106df106016fc52c13c2fa62f34ad5acfb77ff"
+    }
+  },
+  {
+    "name": "gpt-oss-20b",
+    "family": "gpt-oss",
+    "vocabulary": "byte-level BPE",
+    "repo": "openai/gpt-oss-20b",
+    "revision": "6cee5e81ee83917806bbde320786a8fb61efebee",
+    "files": {
+      "chat_template.jinja": "a4c9919cbbd4acdd51ccffe22da049264b1b73e59055fa58811a99efbd7c8146",
+      "config.json": "3a2a26ded679375b7928ddeca59764df7cea83220c1961035f6d6e232659e9ce",
+      "generation_config.json": "f9970ada892d2d1f72e3ed0a6535ccebadd11897318794ca671d8c7014c957da",
+      "special_tokens_map.json": "dd5e191d20c12d2fee1da5bae14ca1db0f5f4215300af691f23cdee97120a293",
+      "tokenizer.json": "0614fe83cadab421296e664e1f48f4261fa8fef6e03e63bb75c20f38e37d07d3",
+      "tokenizer_config.json": "9279e942392b742d633c7adbb89ebe002c98399db8926a7af5125c726f404070"
+    }
+  },
+  {
+    "name": "qwen3.6-27b",
+    "family": "Qwen 3.6",
+    "vocabulary": "byte-level BPE",
+    "repo": "Qwen/Qwen3.6-27B",
+    "revision": "6a9e13bd6fc8f0983b9b99948120bc37f49c13e9",
+    "files": {
+      "chat_template.jinja": "e84f32a23fdda27689f868aa4a1a5621f41133e51a48d7f3efcbea2839574259",
+      "config.json": "69db4eb7196bc8190813231b3018ca05d8c2e3abc7b1af19d55c157af44a9d9c",
+      "generation_config.json": "e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e",
+      "merges.txt": "a9d356d7bdf1ef4949e3e748e95b8e10ad9d4e2e838eddc38a0a7b6b94d1db8d",
+      "preprocessor_config.json": "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516",
+      "tokenizer.json": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
+      "tokenizer_config.json": "5186f0defcd7f232382c7f0aebcd2252d073bb921ab240e407b7ae8745d2b29b",
+      "vocab.json": "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003"
+    }
+  },
+  {
+    "name": "glm-5.3-flash",
+    "family": "GLM-5.3",
+    "vocabulary": "byte-level BPE",
+    "repo": "zai-org/GLM-5.3-Flash",
+    "revision": "eb9eb208eb0d988989d07a6a12d0fdeb5f52574a",
+    "files": {
+      "chat_template.jinja": "0c4099f3382d6c92700dfb99725025360966fd73032f0ecf32377c0d9e6309c5",
+      "config.json": "bb8f01c42cb92a52ca72e65afb4d5bd8d11aef083cd210e8de25dfb904f23e9f",
+      "generation_config.json": "230c30609ecbbb9e6583bedde8e7bdda0c6eb8fe5fad0eaeb3d1b293d751cb4f",
+      "tokenizer.json": "19e773648cb4e65de8660ea6365e10acca112d42a854923df93db4a6f333a82d",
+      "tokenizer_config.json": "98b1271574f41abf89427ae2dda030d94dc9478f0edc5a8bd240db213c6fd5fc"
+    }
+  },
+  {
+    "name": "minimax-m3",
+    "family": "MiniMax M3",
+    "vocabulary": "byte-level BPE",
+    "repo": "MiniMaxAI/MiniMax-M3",
+    "revision": "f0e1c1e04d40177e4673a22097036854f536e9c0",
+    "files": {
+      "added_tokens.json": "63f277741fb061e615cb604286a845d971178ba4716732a59cf42b3752c0ce4e",
+      "chat_template.jinja": "11421244f67553498e5c8112dae02802025bcc4305ec45ad380af95c96f9fe64",
+      "config.json": "c9c97ce1e4eece60012d5a10ea87717458bfb1f19c2c7a615a3dbff83d090c6b",
+      "configuration_minimax_m3_vl.py": "836c3e4aff06f88bd2891b18292424ed7a90158b508d9235d490a33d9e3cba32",
+      "generation_config.json": "272d19efac5060ff8c9f76c7ed67909a5da1be466284ee4f1f1bd2a810c6fad2",
+      "merges.txt": "ca47ea60cf5bd48832586adc264f439d0ea4254176b24a95f85eaa9750e2b5f9",
+      "preprocessor_config.json": "36785da1dc7a00324048bd7c537c24247fca97c626884818257fd0b92287de31",
+      "special_tokens_map.json": "401b624ec44507183d1dc65c74f7f3387699a77971aa19fa5a0cc57a3989ba97",
+      "tokenizer.json": "bb1f1626cf01448f1e3b6036d0a061ffc66c91d9046aada14ea23a5441b5ad6e",
+      "tokenizer_config.json": "15caca9f74fbce9b86dc014e9324cbefa56703d81ccd6d56020faa1c41d2eae5",
+      "vocab.json": "b44c066b5dc34c800c4e3ecbd85f3e95ce3bfdbf8a5fe30223e005175103578a"
+    }
+  },
+  {
+    "name": "mimo-v2.6-flash-rl",
+    "family": "MiMo V2.6",
+    "vocabulary": "byte-level BPE",
+    "repo": "XiaomiMiMo/MiMo-V2.6-Flash-RL",
+    "revision": "5711b268169967567844e1e560e8a3966da959b1",
+    "files": {
+      "chat_template.jinja": "853650bee57bf95020373e4c928bd5a4b41b9915adf964a77711d2b49a291887",
+      "config.json": "61bea4a0f7a0dd8969f8cae528761e26b697dd12ff63e98804c3f0945492e621",
+      "configuration_mimo_v2.py": "773062ac9850b908eb54751b3e4dbe00e653c0e80595599409e97d0c1af2ce3e",
+      "generation_config.json": "eecf00d9701921271c904a916c425ba6db61bcd190902e200d0a322bfd5572dd",
+      "merges.txt": "599bab54075088774b1733fde865d5bd747cbcc7a547c5bc12610e874e26f5e3",
+      "preprocessor_config.json": "b269e51bdc1c53ef7c82522984378513f462869cf83c4c75ec3f98bd92aa7972",
+      "tokenizer.json": "ff15eb925890d6b71b5160de4b846fbd13178438ab463b38ecc953e8cd1dcb3e",
+      "tokenizer_config.json": "413a7845f52943ccf4de0e5c838414507d16c44dbf573da9e20bc8902b384d06",
+      "vocab.json": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910"
+    }
+  },
+  {
+    "name": "mistral-tekken",
+    "family": "Mistral (tekken)",
+    "vocabulary": "byte-level BPE (tekken.json)",
+    "repo": "mistralai/Ministral-3-3B-Instruct-2512",
+    "revision": "b35d4dfe56c142746f54dbd64f579faab2744308",
+    "files": {
+      "chat_template.jinja": "0701cfbdc2b7d44fdbad104dff604faee4b0543e8247624568777fe465746f9b",
+      "config.json": "a9c3658d7bb45ab5be77e660d483a9d3f8a3d54bda2c69a1c576bdfefbc16be6",
+      "generation_config.json": "e0923390059f84a9180b00e5501778acc45ea9856cd7f2fd68208b360927c677",
+      "params.json": "184afbdca12f4075121650335d65ada27b471b8b2952c8f2b699c16516306459",
+      "tekken.json": "600bb27946565481ecf51ba8aee252e49b9a68507866080ac9c30185bb312843",
+      "tokenizer.json": "99cf274236c60277fcfad861a5a1007518687ad06ba8938760f50b55ffa0b1ef",
+      "tokenizer_config.json": "4a05af595aa11c3436d3b68a616219ae99b303426f708a12b31bc9ce32530728"
+    }
+  },
+  {
+    "name": "gemma-3-1b-it",
+    "family": "Gemma 3",
+    "vocabulary": "byte-fallback BPE",
+    "repo": "unsloth/gemma-3-1b-it",
+    "revision": "5b11413a10db4e486ef16a20101fd028f8f2499c",
+    "files": {
+      "added_tokens.json": "50b2f405ba56a26d4913fd772089992252d7f942123cc0a034d96424221ba946",
+      "chat_template.jinja": "7de1c58e208eda46e9c7f86397df37ec49883aeece39fb961e0a6b24088dd3c4",
+      "config.json": "c5b2136c452797c0c52cba5793ced59d95453dfdc3444433b03e27699ff1c2cd",
+      "generation_config.json": "faa83f23a56aee7b9722f2a7263f6419341b62496d604a78775aeff9660701c3",
+      "special_tokens_map.json": "45a857d8a2495d0be30a5d2d6de03278195eb028b6e0b8efc248bfa697d65f05",
+      "tokenizer.json": "4667f2089529e8e7657cfb6d1c19910ae71ff5f28aa7ab2ff2763330affad795",
+      "tokenizer.model": "1299c11d7cf632ef3b4e11937501358ada021bbdf7c47638d13c0ee982f2e79c",
+      "tokenizer_config.json": "a622f3103725cffe1f19deed01e8675cea4443bc3eff27680f9484e5dc4acf7b"
+    }
+  },
+  {
+    "name": "gemma-4-e2b-it",
+    "family": "Gemma 4",
+    "vocabulary": "byte-fallback BPE",
+    "repo": "google/gemma-4-e2b-it",
+    "revision": "4adf15748de9e1a0097b6274cee9c15836c41c37",
+    "files": {
+      "chat_template.jinja": "0a2c8073c878ab1da004bee933a998606537bbb62016310352c7285c3f01c5b5",
+      "config.json": "1b28f3d2c3100f6c594754b81107428bd7b822a7f48272ca681dae9d2ec38330",
+      "generation_config.json": "d4226bbe3117d2d253ba4609720ba82c6c4ce4627a9a6ae05387c78983ac03de",
+      "tokenizer.json": "ab26b2add729e6f645bd869f228f14190a06615538f3be6f7786f33d13d78ad2",
+      "tokenizer_config.json": "9f4fec4b1dc6ecddf8f4a92e9caea5971c0e67d81309f3f9066a2bee8c362633"
+    }
+  },
+  {
+    "name": "llama-2-bytefallback",
+    "family": "Llama 2 (byte fallback)",
+    "vocabulary": "byte-fallback BPE",
+    "repo": "NousResearch/Llama-2-7b-chat-hf",
+    "revision": "351844e75ed0bcbbe3f10671b3c808d2b83894ee",
+    "files": {
+      "added_tokens.json": "39c257654f85e478a9cb3bf34da53b3e4625e7b05ce15f193fe41724fae7b825",
+      "config.json": "3c66a81e29ce617a74ff2e4055e7fb275b5c9457103864745693fbce59b368a2",
+      "generation_config.json": "7495350e3f00cac9cb72be86f453c25ed10d2eb8a48a27e9d120428df9015c11",
+      "special_tokens_map.json": "2ea88203b955648951a454e73a73967ff77ba4e79ae8ceb4400d4ab2cb040777",
+      "tokenizer.json": "f7b50bcf6d6672eade5e43514d48e9c1e4e63a56aef7b14acdaca94ce93436f7",
+      "tokenizer.model": "9e556afd44213b6bd1be2b850ebbbd98f5481437a8021afaf58ee7fb1818d347",
+      "tokenizer_config.json": "37951d5a1e0c6a77f88c61f79972f17e889b62258aadff4c61eacd3fb567fe72"
+    }
+  },
+  {
+    "name": "kimi-k3",
+    "family": "Kimi K3",
+    "vocabulary": "tiktoken file",
+    "repo": "moonshotai/Kimi-K3",
+    "revision": "f831ab66814297da540d832a5235f8e904f29d06",
+    "files": {
+      "config.json": "9710e121a58d03ac92c8d6da287a19541994319afbbe6d6202af001ffd379213",
+      "configuration_kimi_k3.py": "735eb9ebe593e17d231e08e1df7f7be9b5ee0e079f511aa201f9572077b416ae",
+      "generation_config.json": "c6648c25e9705af7fba8847e243840d21b5cc63ddeb6297f750a7ddbb6a02836",
+      "preprocessor_config.json": "4be333605990c53a816e586dee9d5dd545afb7a59947c17f8f7ef26b4782668e",
+      "tiktoken.model": "b6c497a7469b33ced9c38afb1ad6e47f03f5e5dc05f15930799210ec050c5103",
+      "tokenization_kimi.py": "f28ea66e2d862a2a5814970b2ce40c2f7d8296ff09aed90a7e7def689b906944",
+      "tokenizer_config.json": "5d0803c94db9cd78763499e0956c95fd5a225c14a727e5a6cf5db3f96f010a6e"
+    }
+  },
+  {
+    "name": "bert-base-uncased",
+    "family": "BERT base",
+    "vocabulary": "WordPiece",
+    "repo": "google-bert/bert-base-uncased",
+    "revision": "86b5e0934494bd15c9632b12f734a8a67f723594",
+    "files": {
+      "config.json": "7160e1553ad2ca51d8c1cb066be533db31826e12d173824c1bb0cb1a4f187d20",
+      "tokenizer.json": "ce64fce797c24f68df90b40a3f74f579b336a493db14bd583fd520ea0d8c9a98",
+      "tokenizer_config.json": "a025160ef0431f1a392f6f050c1310f4c5d9fb6f275932dbccba73c4d214bf10",
+      "vocab.txt": "07eced375cec144d27c900241f3e339478dec958f92fddbc551f295c992038a3"
+    }
+  },
+  {
+    "name": "t5-small",
+    "family": "T5 small",
+    "vocabulary": "Unigram",
+    "repo": "google-t5/t5-small",
+    "revision": "df1b051c49625cf57a3d0d8d3863ed4d13564fe4",
+    "files": {
+      "config.json": "530e25060e3a8d5f7b0fcf53bfea9f3601165161f3b1914676e98d97cf07bcf1",
+      "generation_config.json": "f5a1c7e2be8092018d8835128987edf0111637dd98e90599cc80310fef75d95a",
+      "spiece.model": "d60acb128cf7b7f2536e8f38a5b18a05535c9e14c7a355904270e15b0945ea86",
+      "tokenizer.json": "d2acde0d8d71dd30a711834b07781b9c89feaac33fd332f60507699282740066",
+      "tokenizer_config.json": "d1e7146101aa96282057f374aa9c3b260fba2109e5990edb1775d6efc70ffa3c"
+    }
+  }
+]

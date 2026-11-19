@@ -29,11 +29,9 @@ use std::sync::Arc;
 
 use axum::{http::StatusCode, response::Response};
 use parking_lot::Mutex;
+use smg_worker::identity::basic::{Worker, WorkerType};
 
-use crate::{
-    routers::common::{placement::CandidateFilter, retry::mark_non_retryable},
-    worker::{Worker, WorkerType},
-};
+use crate::routers::common::{placement::CandidateFilter, retry::mark_non_retryable};
 
 /// Response extension: the worker answered the request itself, so the status
 /// is the worker's verdict on this payload rather than a transport failure or
@@ -182,15 +180,15 @@ mod tests {
     use std::time::Duration;
 
     use axum::response::IntoResponse;
+    use smg_worker::{
+        health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
+        test_support::no_health_check,
+    };
 
     use super::*;
-    use crate::{
-        routers::common::retry::is_retryable_response,
-        worker::{
-            health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
-            test_support::{no_health_check, worker_of},
-            BasicWorkerBuilder,
-        },
+    use crate::routers::{
+        common::{retry::is_retryable_response, snapshot::test_support::worker_of},
+        grpc::backend_client::BasicWorkerBuilder,
     };
 
     fn worker(url: &str, failure_threshold: u32) -> Arc<dyn Worker> {

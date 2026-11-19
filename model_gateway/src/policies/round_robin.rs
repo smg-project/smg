@@ -10,9 +10,9 @@ use std::{
 
 use dashmap::DashMap;
 use rustc_hash::FxHasher;
+use smg_worker::identity::basic::Worker;
 
 use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
-use crate::worker::Worker;
 
 /// Distinct candidate sets one instance keeps a rotation for; past this a
 /// new set evicts the least recently used one. Sets come and go with worker
@@ -185,11 +185,12 @@ impl LoadBalancingPolicy for RoundRobinPolicy {
 #[cfg(test)]
 mod tests {
     use openai_protocol::worker::WorkerStatus;
+    use smg_worker::{identity::basic::WorkerType, test_support::no_health_check};
 
     use super::*;
     use crate::{
         policies::{test_support::make_workers, NamedList},
-        worker::{test_support::no_health_check, BasicWorkerBuilder, WorkerType},
+        routers::grpc::backend_client::BasicWorkerBuilder,
     };
 
     #[test]

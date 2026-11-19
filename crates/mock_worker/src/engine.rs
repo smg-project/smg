@@ -650,6 +650,13 @@ pub struct LoadSnapshot {
     pub num_preemptions: i64,
     /// KV-event batches produced so far (the current gRPC sequence number).
     pub num_kv_batches: i64,
+    /// Context tokens of the requests the rank runs, the prompt plus the
+    /// committed output of each as its sequence holds them right now: a
+    /// request still waiting holds none, and a prefix two requests share
+    /// counts for both. A servicer sends it where its wire's load report
+    /// has the figure. `None` on the row of a worker that runs no engine:
+    /// it holds requests and counts none of them.
+    pub num_resident_tokens: Option<i64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2243,6 +2250,7 @@ impl SchedulerState {
             num_cached_blocks: self.pool.cached().min(i32::MAX as usize) as i32,
             num_preemptions: self.preemptions.min(i64::MAX as u64) as i64,
             num_kv_batches: self.kv_seq.min(i64::MAX as u64) as i64,
+            num_resident_tokens: Some(self.running.iter().map(|r| i64::from(r.seq_len())).sum()),
         }
     }
 
@@ -2997,6 +3005,7 @@ impl LoadSnapshot {
             num_cached_blocks: 0,
             num_preemptions: 0,
             num_kv_batches: 0,
+            num_resident_tokens: Some(0),
         }
     }
 }
@@ -4510,6 +4519,52 @@ mod tests {
         ));
     }
 
+    /// The resident figure counts each running sequence, its prompt plus
+    /// its output so far, a prefix two requests share once for each, and
+    /// nothing once the requests are done.
+    #[test]
+    fn resident_tokens_count_each_running_sequence() {
+        let p = EngineParams::default();
+        let mut st = SchedulerState::new();
+        assert_eq!(st.snapshot(&p).num_resident_tokens, Some(0), "an idle rank");
+        let (first, mut first_rx) = req("resident-1", vec![7; 48], 6);
+        let (second, mut second_rx) = req("resident-2", vec![7; 48], 6);
+        st.enqueue(first, &p);
+        st.enqueue(second, &p);
+        let mut tokens = [0i64; 2];
+        let mut done = [false; 2];
+        let mut counted = false;
+        for _ in 0..400 {
+            for (tx, event) in st.step(&p).sends {
+                tx.send(event).expect("the receiver is alive");
+            }
+            for (which, rx) in [&mut first_rx, &mut second_rx].into_iter().enumerate() {
+                while let Ok(event) = rx.try_recv() {
+                    match event {
+                        GenEvent::Token { .. } => tokens[which] += 1,
+                        GenEvent::Done { .. } => done[which] = true,
+                    }
+                }
+            }
+            if done == [true; 2] {
+                break;
+            }
+            // Both sequences past their prefill and neither done: each
+            // holds its whole prompt and what it generated.
+            if done == [false; 2] && tokens.iter().all(|sent| *sent > 0) {
+                assert_eq!(
+                    st.snapshot(&p).num_resident_tokens,
+                    Some(2 * 48 + tokens[0] + tokens[1]),
+                    "tokens so far: {tokens:?}"
+                );
+                counted = true;
+            }
+        }
+        assert!(counted, "both requests ran together past their prefill");
+        assert_eq!(done, [true; 2], "both requests finished");
+        assert_eq!(st.snapshot(&p).num_resident_tokens, Some(0), "nothing runs");
+    }
+
     #[test]
     fn vllm_like_loads_drop_what_the_vllm_servicer_does_not_report() {
         let full = LoadSnapshot {
@@ -4526,6 +4581,7 @@ mod tests {
             num_cached_blocks: 42_000,
             num_preemptions: 0,
             num_kv_batches: 10,
+            num_resident_tokens: Some(90_000),
         };
         assert_eq!(full.as_reported_by(LoadsLike::Mock), full);
         let v = full.as_reported_by(LoadsLike::Vllm);

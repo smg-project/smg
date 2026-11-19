@@ -8,10 +8,16 @@
 //! pipeline (which works against `ProtoStream`/`ProtoGenerateRequest`) is
 //! shared unchanged.
 
+use std::sync::{Arc, LazyLock};
+
+use async_trait::async_trait;
 use engine_zmq_adapter::admin::{flush_reply_wait, PROFILE_WAIT};
 use openai_protocol::{
-    chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
-    messages::CreateMessageRequest, worker::WorkerLoadResponse,
+    chat::ChatCompletionRequest,
+    completion::CompletionRequest,
+    generate::GenerateRequest,
+    messages::CreateMessageRequest,
+    worker::{ProfileOptions, WorkerLoadResponse},
 };
 use smg_grpc_client::{
     common_proto, sglang_proto,
@@ -20,25 +26,33 @@ use smg_grpc_client::{
     tokenspeed_proto, vllm_proto, OutputConstraint, SglangGenerateRequestOptions,
     SglangSchedulerClient, TokenSpeedSchedulerClient, VllmEngineClient,
 };
-
-use crate::{
-    routers::grpc::{
-        client::{
-            GenerateRequestBuildOptions, GrpcClient, HealthCheckResponse, ModelInfo, ServerInfo,
-            TokenSpeedMmBuilder, TokenSpeedPlainBuilder, VllmMmBuilder, VllmPlainBuilder,
-        },
-        common::stages::helpers,
-        proto_wrapper::{
-            finish_tokenspeed_request, finish_vllm_request, ProtoEmbedComplete, ProtoEmbedRequest,
-            ProtoGenerateRequest, ProtoStream,
-        },
-        zmq_client::{
-            self, fold_tokenizer_eos_backstop, EncodeRendezvous, SglangProfileStart, ZmqDialect,
-            ZmqEngineClient,
-        },
-        MultimodalData,
+use smg_worker::{
+    connection::engine::{
+        AdminAnswer, ConnectorDefault, EngineConnection, EngineConnector, ZmqLink,
     },
-    worker::{identity::endpoint::Endpoint, RuntimeType, Worker},
+    identity::{
+        basic::{RuntimeType, Worker},
+        builder,
+        endpoint::Endpoint,
+        error::{WorkerError, WorkerResult},
+    },
+};
+
+use crate::routers::grpc::{
+    client::{
+        GenerateRequestBuildOptions, GrpcClient, HealthCheckResponse, ModelInfo, ServerInfo,
+        TokenSpeedMmBuilder, TokenSpeedPlainBuilder, VllmMmBuilder, VllmPlainBuilder,
+    },
+    common::stages::helpers,
+    proto_wrapper::{
+        finish_tokenspeed_request, finish_vllm_request, ProtoEmbedComplete, ProtoEmbedRequest,
+        ProtoGenerateRequest, ProtoStream,
+    },
+    zmq_client::{
+        self, fold_tokenizer_eos_backstop, EncodeRendezvous, SglangProfileStart, ZmqDialect,
+        ZmqEngineClient,
+    },
+    MultimodalData,
 };
 
 /// A backend connection: gRPC (any engine) or direct ZMQ (vLLM EngineCore,
@@ -151,7 +165,7 @@ impl BackendClient {
     pub fn finalize_generate_request(
         &self,
         request: &mut ProtoGenerateRequest,
-        tokenizer: Option<&std::sync::Arc<dyn llm_tokenizer::traits::Tokenizer>>,
+        tokenizer: Option<&Arc<dyn llm_tokenizer::traits::Tokenizer>>,
     ) -> Vec<String> {
         let token_only_wire = self.is_zmq();
         let router_stops = helpers::resolve_string_stops(request, tokenizer, token_only_wire);
@@ -171,25 +185,6 @@ impl BackendClient {
             fold_tokenizer_eos_backstop(request, tokenizer);
         }
         router_stops
-    }
-
-    /// Whether the backend answers the admin RPCs (cache flush, profiling):
-    /// a gRPC servicer does, a ZMQ engine when its wire carries control calls
-    /// (an SGLang scheduler, or a TokenSpeed one that declares them).
-    pub fn carries_admin_calls(&self) -> bool {
-        match self {
-            Self::Grpc(_) => true,
-            Self::Zmq(client) => client.carries_control_calls(),
-        }
-    }
-
-    /// Local liveness. gRPC has no cheap local flag (it uses a health RPC), so
-    /// this reports `true` for gRPC; ZMQ reflects its connection liveness.
-    pub fn is_alive(&self) -> bool {
-        match self {
-            Self::Grpc(_) => true,
-            Self::Zmq(client) => client.is_alive(),
-        }
     }
 
     pub async fn health_check(&self) -> Result<HealthCheckResponse, tonic::Status> {
@@ -216,79 +211,6 @@ impl BackendClient {
         match self {
             Self::Grpc(client) => client.get_server_info().await,
             Self::Zmq(client) => Ok(zmq_client::server_info(client)),
-        }
-    }
-
-    pub async fn get_loads(&self) -> Result<WorkerLoadResponse, tonic::Status> {
-        match self {
-            Self::Grpc(client) => client.get_loads().await,
-            Self::Zmq(client) => Ok(client.get_loads()),
-        }
-    }
-
-    pub async fn flush_cache(
-        &self,
-        timeout_s: f32,
-    ) -> Result<common_proto::FlushCacheResponse, tonic::Status> {
-        match self {
-            Self::Grpc(client) => client.flush_cache(timeout_s).await,
-            // The reply wait is the servicers' rule, read from the adapter.
-            Self::Zmq(client) => {
-                let (success, message) = client
-                    .flush_cache_control(timeout_s, flush_reply_wait(timeout_s))
-                    .await?;
-                Ok(common_proto::FlushCacheResponse { success, message })
-            }
-        }
-    }
-
-    pub async fn start_profile(
-        &self,
-        req: common_proto::StartProfileRequest,
-    ) -> Result<common_proto::ProfileResponse, tonic::Status> {
-        match self {
-            Self::Grpc(client) => client.start_profile(req).await,
-            Self::Zmq(client) => {
-                let (success, message) = client
-                    .profile_control(Some(SglangProfileStart::from_request(req)), PROFILE_WAIT)
-                    .await?;
-                Ok(common_proto::ProfileResponse { success, message })
-            }
-        }
-    }
-
-    pub async fn stop_profile(&self) -> Result<common_proto::ProfileResponse, tonic::Status> {
-        match self {
-            Self::Grpc(client) => client.stop_profile().await,
-            Self::Zmq(client) => {
-                let (success, message) = client.profile_control(None, PROFILE_WAIT).await?;
-                Ok(common_proto::ProfileResponse { success, message })
-            }
-        }
-    }
-
-    pub async fn subscribe_kv_events(
-        &self,
-        start_seq: u64,
-    ) -> Result<tonic::Streaming<common_proto::KvEventBatch>, tonic::Status> {
-        match self {
-            Self::Grpc(client) => client.subscribe_kv_events(start_seq).await,
-            Self::Zmq(_) => Err(tonic::Status::unimplemented(
-                "SubscribeKvEvents not supported over ZMQ",
-            )),
-        }
-    }
-
-    /// The worker's load records alone, no events; `Unimplemented` over ZMQ
-    /// (the engine pushes its scheduler stats on that wire already).
-    pub async fn subscribe_load_records(
-        &self,
-    ) -> Result<tonic::Streaming<common_proto::KvEventBatch>, tonic::Status> {
-        match self {
-            Self::Grpc(client) => client.subscribe_load_records().await,
-            Self::Zmq(_) => Err(tonic::Status::unimplemented(
-                "SubscribeKvEvents not supported over ZMQ",
-            )),
         }
     }
 
@@ -444,6 +366,250 @@ impl BackendClient {
     }
 }
 
+/// The worker runtime's view of the client. A call the runtime alone makes
+/// has its one body here: the client has no inherent method of its name, so
+/// the call cannot resolve to itself.
+#[async_trait]
+impl EngineConnection for BackendClient {
+    /// Whether the backend answers the admin RPCs (cache flush, profiling):
+    /// a gRPC servicer does, a ZMQ engine when its wire carries control calls
+    /// (an SGLang scheduler, or a TokenSpeed one that declares them).
+    fn carries_admin_calls(&self) -> bool {
+        match self {
+            Self::Grpc(_) => true,
+            Self::Zmq(client) => client.carries_control_calls(),
+        }
+    }
+
+    /// Local liveness. gRPC has no cheap local flag (it uses a health RPC), so
+    /// this reports `true` for gRPC; ZMQ reflects its connection liveness.
+    fn is_alive(&self) -> bool {
+        match self {
+            Self::Grpc(_) => true,
+            Self::Zmq(client) => client.is_alive(),
+        }
+    }
+
+    /// The client's own health read, narrowed to its verdict. The inherent
+    /// method answers the whole reply, so this path cannot come back here:
+    /// without that method `healthy` names no field.
+    async fn health_check(&self) -> Result<bool, tonic::Status> {
+        BackendClient::health_check(self)
+            .await
+            .map(|response| response.healthy)
+    }
+
+    async fn get_loads(&self) -> Result<WorkerLoadResponse, tonic::Status> {
+        match self {
+            Self::Grpc(client) => client.get_loads().await,
+            Self::Zmq(client) => Ok(client.get_loads()),
+        }
+    }
+
+    async fn flush_cache(&self, timeout_s: f32) -> Result<AdminAnswer, tonic::Status> {
+        let (success, message) = match self {
+            Self::Grpc(client) => {
+                let answer = client.flush_cache(timeout_s).await?;
+                (answer.success, answer.message)
+            }
+            // The reply wait is the servicers' rule, read from the adapter.
+            Self::Zmq(client) => {
+                client
+                    .flush_cache_control(timeout_s, flush_reply_wait(timeout_s))
+                    .await?
+            }
+        };
+        Ok(AdminAnswer { success, message })
+    }
+
+    async fn start_profile(&self, options: &ProfileOptions) -> Result<AdminAnswer, tonic::Status> {
+        let req = common_proto::StartProfileRequest {
+            output_dir: options.output_dir.clone(),
+            start_step: options.start_step,
+            num_steps: options.num_steps,
+            activities: options.activities.clone().unwrap_or_default(),
+            with_stack: options.with_stack,
+            record_shapes: options.record_shapes,
+            profile_by_stage: options.profile_by_stage,
+        };
+        let (success, message) = match self {
+            Self::Grpc(client) => {
+                let answer = client.start_profile(req).await?;
+                (answer.success, answer.message)
+            }
+            Self::Zmq(client) => {
+                client
+                    .profile_control(Some(SglangProfileStart::from_request(req)), PROFILE_WAIT)
+                    .await?
+            }
+        };
+        Ok(AdminAnswer { success, message })
+    }
+
+    async fn stop_profile(&self) -> Result<AdminAnswer, tonic::Status> {
+        let (success, message) = match self {
+            Self::Grpc(client) => {
+                let answer = client.stop_profile().await?;
+                (answer.success, answer.message)
+            }
+            Self::Zmq(client) => client.profile_control(None, PROFILE_WAIT).await?,
+        };
+        Ok(AdminAnswer { success, message })
+    }
+
+    async fn kv_engine_id(&self) -> Result<Option<String>, tonic::Status> {
+        let mut labels = BackendClient::get_server_info(self).await?.to_labels();
+        Ok(labels.remove("kv_engine_id").filter(|id| !id.is_empty()))
+    }
+
+    async fn subscribe_kv_events(
+        &self,
+        start_seq: u64,
+    ) -> Result<tonic::Streaming<common_proto::KvEventBatch>, tonic::Status> {
+        match self {
+            Self::Grpc(client) => client.subscribe_kv_events(start_seq).await,
+            Self::Zmq(_) => Err(tonic::Status::unimplemented(
+                "SubscribeKvEvents not supported over ZMQ",
+            )),
+        }
+    }
+
+    /// The worker's load records alone, no events; `Unimplemented` over ZMQ
+    /// (the engine pushes its scheduler stats on that wire already).
+    async fn subscribe_load_records(
+        &self,
+    ) -> Result<tonic::Streaming<common_proto::KvEventBatch>, tonic::Status> {
+        match self {
+            Self::Grpc(client) => client.subscribe_load_records().await,
+            Self::Zmq(_) => Err(tonic::Status::unimplemented(
+                "SubscribeKvEvents not supported over ZMQ",
+            )),
+        }
+    }
+}
+
+/// Makes the gateway's client for a worker. It is the default of the worker
+/// builder as the gateway names it, and the gateway hands it to the registry
+/// it builds, for the workers the registry imports.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BackendConnector;
+
+impl BackendConnector {
+    /// The connector as a worker builder and the registry take it: one
+    /// allocation for the process, and each worker holds a clone of it.
+    pub fn shared() -> Arc<dyn EngineConnector> {
+        static SHARED: LazyLock<Arc<dyn EngineConnector>> =
+            LazyLock::new(|| Arc::new(BackendConnector));
+        Arc::clone(&SHARED)
+    }
+}
+
+impl ConnectorDefault for BackendConnector {
+    fn default_connector() -> Option<Arc<dyn EngineConnector>> {
+        Some(Self::shared())
+    }
+}
+
+/// The worker builder as the gateway names it: a worker it builds connects
+/// through the gateway's client unless the builder is handed another
+/// connector. The builder is the worker crate's; this name for it is the
+/// gateway's.
+pub type BasicWorkerBuilder = builder::BasicWorkerBuilder<BackendConnector>;
+
+#[async_trait]
+impl EngineConnector for BackendConnector {
+    async fn connect_grpc(
+        &self,
+        base_url: &str,
+        runtime: RuntimeType,
+    ) -> Result<Arc<dyn EngineConnection>, String> {
+        match GrpcClient::connect(base_url, &runtime.to_string()).await {
+            Ok(client) => Ok(Arc::new(BackendClient::Grpc(client))),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    async fn connect_zmq(&self, link: ZmqLink) -> Result<Arc<dyn EngineConnection>, String> {
+        let client = zmq_client::connect_for_worker(
+            &link.base_url,
+            link.model_id,
+            link.runtime,
+            link.handshake_address.as_deref(),
+            link.engine_count.map_or(
+                zmq_client::EngineCount::Declared,
+                zmq_client::EngineCount::Exactly,
+            ),
+            link.startup,
+            link.request_timeout,
+        )
+        .await?;
+        client.check_declared_role(link.worker_type)?;
+        Ok(Arc::new(BackendClient::Zmq(client)))
+    }
+}
+
+/// The gateway's client behind a worker's engine connection: the same
+/// allocation. A connection another host made is an error that says so,
+/// never `None`: `None` is what a worker without a connection answers.
+pub(crate) fn typed(
+    worker: &dyn Worker,
+    connection: Arc<dyn EngineConnection>,
+) -> WorkerResult<Arc<BackendClient>> {
+    connection
+        .downcast_arc()
+        .ok_or_else(|| not_the_gateways(worker))
+}
+
+/// The error for a connection another host made: never built on a request
+/// the gateway serves.
+#[cold]
+fn not_the_gateways(worker: &dyn Worker) -> WorkerError {
+    WorkerError::ConnectionFailed {
+        url: worker.url().to_string(),
+        reason: "its engine connection is not the gateway's backend client".to_string(),
+    }
+}
+
+/// The worker's engine connection as the gateway's client; `None` for an
+/// HTTP worker. A connected worker answers from its slot
+/// ([`Worker::engine_connection_if_initialized`]): the allocation its
+/// connect handed out, read without the boxed future of the trait's async
+/// call. The first use, and a worker still connecting, go through
+/// [`Worker::engine_connection`].
+pub async fn get_backend_client(worker: &dyn Worker) -> WorkerResult<Option<Arc<BackendClient>>> {
+    if let Some(connection) = worker.engine_connection_if_initialized() {
+        return typed(worker, connection).map(Some);
+    }
+    match worker.engine_connection().await? {
+        Some(connection) => typed(worker, connection).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// [`get_backend_client`] without the connect
+/// ([`Worker::engine_connection_if_initialized`]): `None` for a worker
+/// still connecting and for an HTTP worker.
+pub fn backend_client_if_initialized(
+    worker: &dyn Worker,
+) -> WorkerResult<Option<Arc<BackendClient>>> {
+    worker
+        .engine_connection_if_initialized()
+        .map(|connection| typed(worker, connection))
+        .transpose()
+}
+
+/// [`backend_client_if_initialized`] for a reader with no error path: a
+/// connection that is not the gateway's client is said at error level, and
+/// the reader goes on as it does before a connect.
+pub(crate) fn connected_backend_client(worker: &dyn Worker) -> Option<Arc<BackendClient>> {
+    let client = worker.engine_connection_if_initialized()?.downcast_arc();
+    if client.is_none() {
+        let error = not_the_gateways(worker);
+        tracing::error!(%error, "Reading the worker as not connected");
+    }
+    client
+}
+
 // The encode-worker wires of a rendezvous handoff (the EPD encode stage's
 // dispatch): the encoder RPC of a gRPC encode worker and the encode frame of
 // a TokenSpeed encode server on the direct ZMQ lane.
@@ -460,8 +626,7 @@ pub(crate) async fn send_tokenspeed_encode_frame(
     // A failure's text is the dispatch's error line: it names the worker by
     // its masked address.
     let shown = worker.redacted_url();
-    let client = worker
-        .get_backend_client()
+    let client = get_backend_client(worker)
         .await
         .map_err(|e| format!("encode worker {shown} is not connected: {e}"))?
         .ok_or_else(|| format!("encode worker {shown} has no ZMQ connection"))?;
@@ -695,4 +860,278 @@ fn mm_variant_mismatch(expected: &str, got: &MultimodalData) -> String {
         MultimodalData::TokenSpeed(_) => "TokenSpeed",
     };
     format!("multimodal data variant mismatch: {expected} ZMQ backend got {got} data")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+    };
+
+    use smg_worker::{
+        identity::basic::ConnectionMode,
+        test_support::{no_health_check, NoEngine},
+    };
+
+    use super::*;
+    use crate::routers::grpc::test_engine::mock_engine;
+
+    /// A connected worker's client is read from its slot: the acquisition
+    /// after the connect, and the reader that never connects, hand out the
+    /// allocation the connect made.
+    #[tokio::test]
+    async fn a_connected_workers_client_is_the_slots_own_allocation() {
+        let (url, engine) = mock_engine("m").await;
+        let worker = BasicWorkerBuilder::new(url.replacen("http://", "grpc://", 1))
+            .connection_mode(ConnectionMode::Grpc)
+            .runtime_type(RuntimeType::Vllm)
+            .health_config(no_health_check())
+            .build();
+        assert!(backend_client_if_initialized(&worker).unwrap().is_none());
+
+        let connected = get_backend_client(&worker).await.unwrap().unwrap();
+        let again = get_backend_client(&worker).await.unwrap().unwrap();
+        let peeked = backend_client_if_initialized(&worker).unwrap().unwrap();
+        assert!(Arc::ptr_eq(&connected, &again));
+        assert!(Arc::ptr_eq(&connected, &peeked));
+        engine.abort();
+    }
+
+    /// The handle's health read is the engine's verdict, not the arrival of
+    /// a reply: an engine that answers unhealthy reads `false`.
+    #[tokio::test]
+    async fn an_engine_that_answers_unhealthy_reads_unhealthy_through_the_handle() {
+        let (url, engine) = mock_engine("m").await;
+        let port: u16 = url
+            .rsplit(':')
+            .next()
+            .and_then(|port| port.parse().ok())
+            .expect("the mock engine's port");
+        let connection = BackendConnector
+            .connect_grpc(
+                &url.replacen("http://", "grpc://", 1),
+                RuntimeType::TokenSpeed,
+            )
+            .await
+            .expect("the mock engine connects");
+        assert!(connection.health_check().await.expect("the engine answers"));
+
+        mock_worker::overrides::for_port(port).set_serving(false);
+        assert!(!connection.health_check().await.expect("the engine answers"));
+        engine.abort();
+    }
+
+    /// A worker the gateway builds without naming a connector carries the
+    /// gateway's own: the default of the builder as the gateway names it.
+    #[tokio::test]
+    async fn a_worker_the_gateway_builds_carries_the_gateways_connector() {
+        let worker = BasicWorkerBuilder::new("grpc://engine:50051")
+            .connection_mode(ConnectionMode::Grpc)
+            .health_config(no_health_check())
+            .build();
+
+        let connector = worker.engine_connector.as_ref().expect("the default");
+        assert_eq!(format!("{connector:?}"), "BackendConnector");
+    }
+
+    /// A connection the gateway did not make is an error that says so on
+    /// both readers, never the `None` of a worker without a connection. A
+    /// reader with no error path reads the worker as not connected.
+    #[tokio::test]
+    async fn a_connection_the_gateway_did_not_make_is_an_error_that_says_so() {
+        let worker = BasicWorkerBuilder::new("grpc://engine:50051")
+            .connection_mode(ConnectionMode::Grpc)
+            .health_config(no_health_check())
+            .engine_connection(NoEngine)
+            .build();
+
+        for refusal in [
+            get_backend_client(&worker).await.err(),
+            backend_client_if_initialized(&worker).err(),
+        ] {
+            let refusal = refusal.expect("an error, never None").to_string();
+            assert!(
+                refusal.contains("not the gateway's backend client"),
+                "{refusal}"
+            );
+        }
+        assert!(connected_backend_client(&worker).is_none());
+    }
+
+    /// A worker without an engine connection answers `None` on both readers.
+    #[tokio::test]
+    async fn an_http_worker_has_no_backend_client() {
+        let worker = BasicWorkerBuilder::new("http://worker:8000")
+            .health_config(no_health_check())
+            .build();
+
+        assert!(get_backend_client(&worker).await.unwrap().is_none());
+        assert!(backend_client_if_initialized(&worker).unwrap().is_none());
+    }
+
+    /// Whether `source` names the worker crate's builder. Its module: the
+    /// path written out, or `builder` as an item of an `identity::{...}`
+    /// group, as a merged `use` writes it. Or the crate's test name for the
+    /// builder, which pins no connector either: `BasicWorkerBuilder` of its
+    /// `test_support`, written out, as an item of a group, or by a glob of
+    /// that module.
+    fn names_the_crates_builder(source: &str) -> bool {
+        let text: String = source.split_whitespace().collect();
+        text.contains("identity::builder")
+            || text.contains("builder::BasicWorkerBuilder")
+            || text.contains("test_support::BasicWorkerBuilder")
+            || text.contains("smg_worker::test_support::*")
+            || a_group_holds(&text, "identity::{", is_the_builder)
+            || a_group_holds(&text, "test_support::{", is_the_test_builder)
+            || a_group_holds(&text, "smg_worker::{", is_the_test_glob)
+    }
+
+    /// Whether an item at the top of a group that `opens` starts is one
+    /// `wanted` knows. `text` holds no whitespace.
+    fn a_group_holds(text: &str, opens: &str, wanted: fn(&str) -> bool) -> bool {
+        text.split(opens).skip(1).any(|group| {
+            let mut depth = 1_usize;
+            let mut item = String::new();
+            for c in group.chars() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => depth -= 1,
+                    ',' if depth == 1 => {
+                        if wanted(&item) {
+                            return true;
+                        }
+                        item.clear();
+                    }
+                    _ if depth == 1 => item.push(c),
+                    _ => {}
+                }
+                if depth == 0 {
+                    break;
+                }
+            }
+            wanted(&item)
+        })
+    }
+
+    /// Whether one item of an `identity::{...}` group is the builder module,
+    /// under that name or another, or a path through it. The item holds no
+    /// whitespace, so a renamed module reads `builderas...`.
+    fn is_the_builder(item: &str) -> bool {
+        item == "builder" || item.starts_with("builder::") || item.starts_with("builderas")
+    }
+
+    /// Whether one item of a `test_support::{...}` group is the crate's test
+    /// name for the builder, under that name or another.
+    fn is_the_test_builder(item: &str) -> bool {
+        item.starts_with("BasicWorkerBuilder")
+    }
+
+    /// Whether one item of a `smg_worker::{...}` group is a glob of the
+    /// crate's test names.
+    fn is_the_test_glob(item: &str) -> bool {
+        item == "test_support::*"
+    }
+
+    /// Every Rust source under `dir`, its directories read through.
+    fn sources_under(dir: &Path, found: &mut Vec<PathBuf>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                sources_under(&path, found);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                found.push(path);
+            }
+        }
+    }
+
+    /// The worker crate's builder names no connector by default, and a worker
+    /// built so refuses a gRPC or ZMQ connect. The gateway names the builder
+    /// by [`BasicWorkerBuilder`], which pins the gateway's connector, and
+    /// this file alone names the crate's builder module or its test name
+    /// for the builder. A file of the gateway, of its test harness or of a
+    /// binding that names either is found here, by its path. The walk is held
+    /// to one known file of each root it reads.
+    #[test]
+    fn this_file_alone_names_the_worker_crates_builder() {
+        let package = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let this_file = package.join("src/routers/grpc/backend_client.rs");
+        let mut sources = Vec::new();
+        sources_under(package, &mut sources);
+        for binding in ["golang", "python"] {
+            sources_under(
+                &package.join("../bindings").join(binding).join("src"),
+                &mut sources,
+            );
+        }
+        assert!(
+            sources.contains(&this_file),
+            "the walk read {} files and not this one",
+            sources.len()
+        );
+        for known in [
+            "tests/api_tests.rs",
+            "benches/access_log.rs",
+            "test_harness/src/lib.rs",
+            "../bindings/golang/src/lib.rs",
+            "../bindings/python/src/lib.rs",
+        ] {
+            assert!(
+                sources.contains(&package.join(known)),
+                "the walk left out {known}"
+            );
+        }
+
+        let named_by: Vec<&PathBuf> = sources
+            .iter()
+            .filter(|path| **path != this_file)
+            .filter(|path| {
+                fs::read_to_string(path).is_ok_and(|source| names_the_crates_builder(&source))
+            })
+            .collect();
+        assert!(
+            named_by.is_empty(),
+            "the worker crate's builder defaults to no connector: name the builder by the \
+             gateway's `BasicWorkerBuilder` in {named_by:?}"
+        );
+    }
+
+    /// The forms a path to the crate's builder takes, and six that are not
+    /// one: the gateway's own name, the crate's other identity modules, one
+    /// of them under another name, the configuration's builder module, the
+    /// crate's other test names, and a glob of the gateway's own test
+    /// support.
+    #[test]
+    fn the_crates_builder_is_found_in_each_form_its_path_takes() {
+        for named in [
+            "use smg_worker::identity::builder;",
+            "use smg_worker::identity::builder::BasicWorkerBuilder;",
+            "use smg_worker::identity::{basic::Worker, builder};",
+            "use smg_worker::identity::{basic::Worker, builder::BasicWorkerBuilder};",
+            "use smg_worker::identity::{builder as b, endpoint::Endpoint};",
+            "use smg_worker::{\n    identity::{\n        basic::Worker,\n        builder,\n    },\n    registry,\n};",
+            "use smg_worker::identity::{builder::*, endpoint::Endpoint};",
+            "let worker = identity::builder::BasicWorkerBuilder::new(url).build();",
+            "use smg_worker::identity as id;\nlet worker = id::builder::BasicWorkerBuilder::new(url);",
+            "use smg_worker::test_support::BasicWorkerBuilder;",
+            "use smg_worker::test_support::*;",
+            "use smg_worker::{registry::WorkerId, test_support::*};",
+            "use smg_worker::test_support::{\n    BasicWorkerBuilder as Bare, RefusedAddress,\n};",
+        ] {
+            assert!(names_the_crates_builder(named), "{named}");
+        }
+        for other in [
+            "use crate::routers::grpc::backend_client::BasicWorkerBuilder;",
+            "use smg_worker::identity::{basic::Worker, endpoint::Endpoint};",
+            "use smg_worker::identity::{basic as b, endpoint::Endpoint};",
+            "pub use builder::*;",
+            "use smg_worker::test_support::{RefusedAddress, WorkerRegistry};",
+            "use crate::middleware::test_support::*;",
+        ] {
+            assert!(!names_the_crates_builder(other), "{other}");
+        }
+    }
 }

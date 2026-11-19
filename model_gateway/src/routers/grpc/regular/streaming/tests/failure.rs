@@ -7,6 +7,10 @@
 use std::{net::TcpListener, time::Instant};
 
 use smg_grpc_client::vllm_engine::proto;
+use smg_worker::{
+    identity::basic::{Worker, WorkerType},
+    test_support::{no_health_check, RefusedAddress},
+};
 use tracing_test::traced_test;
 
 use super::{
@@ -15,14 +19,14 @@ use super::{
 };
 use crate::{
     observability::metrics::test_support::render_with_recorder,
-    routers::grpc::{
-        context::WorkerSelection,
-        proto_wrapper::ENGINE_ERROR_MESSAGE,
-        utils::{stream_failure::UpstreamStream, StreamFailure, StreamSource},
-    },
-    worker::{
-        test_support::{no_health_check, RefusedAddress},
-        BasicWorkerBuilder, Worker, WorkerRegistry, WorkerType,
+    routers::{
+        common::snapshot::WorkerRegistry,
+        grpc::{
+            backend_client::BasicWorkerBuilder,
+            context::WorkerSelection,
+            proto_wrapper::ENGINE_ERROR_MESSAGE,
+            utils::{stream_failure::UpstreamStream, StreamFailure, StreamSource},
+        },
     },
 };
 

@@ -8,14 +8,14 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use smg_worker::identity::{basic::ConnectionMode, endpoint::Endpoint};
 use tracing::{debug, info};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use crate::{
     app_context::AppContext,
-    worker::{identity::endpoint::Endpoint, ConnectionMode},
     workflow::{
-        data::{WorkerKind, WorkerWorkflowData},
+        data::{require_app_context, WorkerKind, WorkerWorkflowData},
         steps::util::{try_grpc_reachable, try_http_reachable},
     },
 };
@@ -116,12 +116,7 @@ impl StepExecutor<WorkerWorkflowData> for DetectConnectionModeStep {
             return Ok(StepResult::Skip);
         }
 
-        let app_context = context
-            .data
-            .app_context
-            .as_ref()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?
-            .clone();
+        let app_context = require_app_context(context.data.app_context.as_ref())?.clone();
         let config = &context.data.config;
 
         let url = config.url.clone();
@@ -203,10 +198,6 @@ impl StepExecutor<WorkerWorkflowData> for DetectConnectionModeStep {
         context.data.connection_mode = Some(connection_mode);
         Ok(StepResult::Success)
     }
-
-    fn is_retryable(&self, _error: &WorkflowError) -> bool {
-        true
-    }
 }
 
 #[cfg(test)]
@@ -218,6 +209,7 @@ mod tests {
     use smg_data_connector::{
         MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
     };
+    use smg_worker::test_support::RefusedAddress;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use wfaas::WorkflowInstanceId;
 
@@ -225,8 +217,8 @@ mod tests {
     use crate::{
         config::RouterConfig,
         policies::PolicyRegistry,
+        routers::common::snapshot::WorkerRegistry,
         server::http_client,
-        worker::{test_support::RefusedAddress, WorkerRegistry},
         workflow::{data::WorkerRegistrationMode, steps::create_worker_workflow_data},
     };
 

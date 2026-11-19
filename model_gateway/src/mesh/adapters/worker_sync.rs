@@ -72,18 +72,17 @@ use std::{
 
 use parking_lot::Mutex;
 use smg_mesh::{gossip::NodeStatus, ClusterState, CrdtNamespace, WorkerState};
+use smg_worker::{
+    identity::{
+        basic::{ConnectionMode, Worker},
+        endpoint::{endpoint_key, Endpoint, EndpointKey},
+    },
+    registry::{event::WorkerEvent, RemoteWorkerState, WorkerId, WorkerOrigin},
+};
 use tokio::{sync::broadcast, time::Instant};
 use tracing::{debug, info, warn};
 
-use crate::{
-    service_discovery::DISCOVERY_ID_LABEL,
-    worker::{
-        endpoint_key,
-        identity::endpoint::Endpoint,
-        registry::{event::WorkerEvent, WorkerId},
-        ConnectionMode, EndpointKey, Worker, WorkerOrigin, WorkerRegistry,
-    },
-};
+use crate::{routers::common::snapshot::WorkerRegistry, service_discovery::DISCOVERY_ID_LABEL};
 
 const PREFIX: &str = "worker:";
 
@@ -420,7 +419,7 @@ impl WorkerSyncAdapter {
             else {
                 continue;
             };
-            self.apply_state(worker_id, &state);
+            self.apply_state(worker_id, state);
             if self.worker_registry.get_by_url(url).is_some() {
                 return;
             }
@@ -612,7 +611,7 @@ impl WorkerSyncAdapter {
 
     fn apply_incoming(&self, worker_id: &str, bytes: &[u8]) {
         match decode_worker_state(bytes) {
-            Ok(state) => self.apply_state(worker_id, &state),
+            Ok(state) => self.apply_state(worker_id, state),
             Err(err) => warn!(worker_id, %err, "failed to decode WorkerState"),
         }
     }
@@ -622,8 +621,8 @@ impl WorkerSyncAdapter {
     /// is published over, a dead owner's import dropped, a gone owner's left
     /// alone inside the grace, a live owner's imported or refreshed unless
     /// this node retired the endpoint.
-    fn apply_state(&self, worker_id: &str, state: &WorkerState) {
-        if self.is_own_orphan(worker_id, state) {
+    fn apply_state(&self, worker_id: &str, state: WorkerState) {
+        if self.is_own_orphan(worker_id, &state) {
             info!(
                 worker_id,
                 url = %Endpoint::redacted_str(&state.url),
@@ -633,11 +632,11 @@ impl WorkerSyncAdapter {
             self.on_worker_removed(worker_id);
             return;
         }
-        if self.republish_above_own_key(worker_id, state) {
+        if self.republish_above_own_key(worker_id, &state) {
             return;
         }
         match self.owner_liveness(&state.owner) {
-            OwnerLiveness::Dead => self.drop_dead_owner_import(state),
+            OwnerLiveness::Dead => self.drop_dead_owner_import(&state),
             // Inside the grace a gone owner's key creates no import and
             // refreshes none: a router that starts after an owner died never
             // imports its keys, while an owner that blips keeps its imports
@@ -648,10 +647,11 @@ impl WorkerSyncAdapter {
                 "leaving worker state alone: its owner node is gone, inside the grace"
             ),
             OwnerLiveness::Live => {
-                if self.holds_back(state) {
-                    self.drop_held_back_import(state);
+                if self.holds_back(&state) {
+                    self.drop_held_back_import(&state);
                 } else {
-                    self.worker_registry.on_remote_worker_state(state);
+                    self.worker_registry
+                        .on_remote_worker_state(&remote_worker_state(state));
                 }
             }
         }
@@ -860,6 +860,20 @@ impl WorkerSyncAdapter {
     }
 }
 
+/// A mesh record as the registry takes it: the six fields the registry
+/// reads, moved out of the record. The published load and the owner stay
+/// behind; the registry reads neither.
+fn remote_worker_state(state: WorkerState) -> RemoteWorkerState {
+    RemoteWorkerState {
+        worker_id: state.worker_id,
+        model_id: state.model_id,
+        url: state.url,
+        health: state.health,
+        version: state.version,
+        spec: state.spec,
+    }
+}
+
 /// Snapshot a live worker into the mesh wire shape. `spec` carries the
 /// `WorkerSpec` (minus `api_key`, which never leaves the node) so the
 /// importing side can rebuild the worker; `version` is the registry
@@ -997,11 +1011,12 @@ mod tests {
 
     use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
     use smg_mesh::{gossip::NodeState, MergeStrategy, MeshKV};
+    use smg_worker::identity::basic::WorkerType;
     use tokio::{sync::mpsc::error::TryRecvError, time::sleep};
     use tracing_test::traced_test;
 
     use super::*;
-    use crate::worker::{BasicWorkerBuilder, WorkerType};
+    use crate::routers::grpc::backend_client::BasicWorkerBuilder;
 
     fn worker_namespace(mesh: &MeshKV) -> Arc<CrdtNamespace> {
         mesh.configure_crdt_prefix(PREFIX, MergeStrategy::LastWriterWins)
@@ -1173,6 +1188,42 @@ mod tests {
             sleep(Duration::from_millis(10)).await;
         }
         panic!("registry did not see the remote worker");
+    }
+
+    /// The record's health is the import's status. Every other case here
+    /// sends a healthy record, so the field the conversion moves is read
+    /// here: an unhealthy record is imported not ready, and the owner's
+    /// next record, healthy, makes the import ready.
+    #[tokio::test]
+    async fn a_remote_records_health_is_the_imports_status() {
+        let mesh = MeshKV::new("node-a".into());
+        let ns = worker_namespace(&mesh);
+
+        let registry = Arc::new(WorkerRegistry::new());
+        let subscriber = adapter(ns.clone(), registry.clone());
+        subscriber.start();
+
+        let publisher = adapter(ns, Arc::new(WorkerRegistry::new()));
+        let unhealthy = WorkerState {
+            health: false,
+            ..sample_state("w1", "http://remote:8080")
+        };
+        publisher.on_worker_changed("w1", &unhealthy);
+        let status = || {
+            registry
+                .get_by_url("http://remote:8080")
+                .map(|worker| worker.status())
+        };
+        assert!(
+            wait_for(|| matches!(status(), Some(WorkerStatus::NotReady))).await,
+            "an unhealthy record is imported not ready"
+        );
+
+        publisher.on_worker_changed("w1", &sample_state("w1", "http://remote:8080"));
+        assert!(
+            wait_for(|| matches!(status(), Some(WorkerStatus::Ready))).await,
+            "the owner's healthy record makes the import ready"
+        );
     }
 
     #[tokio::test]
@@ -1669,7 +1720,10 @@ mod tests {
         let local_id = registry
             .register(local_worker("http://local:8080"))
             .unwrap();
-        registry.on_remote_worker_state(&sample_state("peer-w1", "http://remote:8080"));
+        registry.on_remote_worker_state(&remote_worker_state(sample_state(
+            "peer-w1",
+            "http://remote:8080",
+        )));
         let phantom = WorkerId::from_string("gone-w9".to_string());
         ns.put(
             "worker:gone-w9",
@@ -2449,7 +2503,7 @@ mod tests {
         assert_eq!(version_of(&ns, &key), Some(revision));
 
         worker.set_status(WorkerStatus::NotReady);
-        adapter.apply_state(id.as_str(), &published);
+        adapter.apply_state(id.as_str(), published.clone());
         assert_eq!(
             worker.revision(),
             revision,
@@ -2461,7 +2515,7 @@ mod tests {
             model_id: "other-model".to_string(),
             ..published
         };
-        adapter.apply_state(id.as_str(), &foreign);
+        adapter.apply_state(id.as_str(), foreign);
         assert_eq!(
             worker.revision(),
             revision + 1,

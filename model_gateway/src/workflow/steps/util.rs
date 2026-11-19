@@ -5,17 +5,12 @@ use std::{future::Future, time::Duration};
 use futures::stream::{FuturesUnordered, StreamExt};
 use reqwest::Client;
 use smg_grpc_client::connect_channel_with_timeout;
+// The gRPC base URL stands beside the address type, where the worker module
+// reads it too; its path here is kept for the steps.
+pub(crate) use smg_worker::identity::endpoint::grpc_base_url;
+use smg_worker::identity::endpoint::{strip_protocol, strip_scheme, Endpoint};
 
-use crate::{
-    routers::grpc::client::{GrpcClient, HealthCheckResponse},
-    worker::identity::endpoint::Endpoint,
-};
-
-fn strip_scheme<'a>(url: &'a str, scheme: &str) -> Option<&'a str> {
-    url.get(..scheme.len())
-        .filter(|prefix| prefix.eq_ignore_ascii_case(scheme))
-        .map(|_| &url[scheme.len()..])
-}
+use crate::routers::grpc::client::{GrpcClient, HealthCheckResponse};
 
 /// The scheme `url` starts with, lowercased: a word of scheme characters
 /// (RFC 3986's, a digit or a sign first too, and the empty word) before a
@@ -30,31 +25,12 @@ fn url_scheme(url: &str) -> Option<String> {
         .then(|| word.to_ascii_lowercase())
 }
 
-/// Strip protocol prefix (http://, https://, grpc://, grpcs://) from URL.
-pub(crate) fn strip_protocol(url: &str) -> String {
-    for scheme in ["http://", "https://", "grpc://", "grpcs://"] {
-        if let Some(rest) = strip_scheme(url, scheme) {
-            return rest.to_string();
-        }
-    }
-    url.to_string()
-}
-
 /// Ensure URL has an HTTP(S) scheme — handles bare `host:port` and gRPC inputs.
 pub(crate) fn http_base_url(url: &str) -> String {
     if strip_scheme(url, "http://").is_some() || strip_scheme(url, "https://").is_some() {
         url.trim_end_matches('/').to_string()
     } else {
         format!("http://{}", strip_protocol(url).trim_end_matches('/'))
-    }
-}
-
-/// Ensure URL has a gRPC scheme — handles bare `host:port` and HTTP(S) inputs.
-pub(crate) fn grpc_base_url(url: &str) -> String {
-    if strip_scheme(url, "grpc://").is_some() || strip_scheme(url, "grpcs://").is_some() {
-        url.trim_end_matches('/').to_string()
-    } else {
-        format!("grpc://{}", strip_protocol(url).trim_end_matches('/'))
     }
 }
 
@@ -318,8 +294,10 @@ mod tests {
         },
     };
 
+    use smg_worker::test_support::RefusedAddress;
+
     use super::*;
-    use crate::{server::http_client, worker::test_support::RefusedAddress};
+    use crate::server::http_client;
 
     struct DropFlag(Arc<AtomicBool>);
 

@@ -21,19 +21,19 @@ use axum::{
     response::Response,
 };
 use rand::RngExt;
+use smg_worker::{
+    health::overload::{
+        BRANCH_ALL_OVERLOADED_FALLBACK, BRANCH_ALL_OVERLOADED_SHED, BRANCH_ALL_STALLED_FALLBACK,
+        BRANCH_OVERLOADED_AT_DISPATCH, BRANCH_PD_ADMISSION_SHED, STAGE_DISPATCH,
+        STAGE_PD_ADMISSION, STAGE_SELECTION,
+    },
+    identity::basic::Worker,
+};
 use tracing::debug;
 
 use crate::{
     observability::metrics::Metrics,
     routers::{common::retry::mark_non_retryable, error},
-    worker::{
-        health::overload::{
-            BRANCH_ALL_OVERLOADED_FALLBACK, BRANCH_ALL_OVERLOADED_SHED,
-            BRANCH_ALL_STALLED_FALLBACK, BRANCH_OVERLOADED_AT_DISPATCH, BRANCH_PD_ADMISSION_SHED,
-            STAGE_DISPATCH, STAGE_PD_ADMISSION, STAGE_SELECTION,
-        },
-        Worker,
-    },
 };
 
 /// Retry-After seconds advertised on every shed: the load-monitor poll
@@ -281,14 +281,13 @@ pub(crate) fn least_loaded_uniform<'a, R: RngExt>(
 mod tests {
     use axum::http::StatusCode;
     use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
+    use smg_worker::identity::basic::{ConnectionMode, WorkerType};
 
     use super::*;
-    use crate::{
-        routers::{
-            common::retry::{is_retryable_response, is_retryable_status},
-            error::extract_error_code_from_response,
-        },
-        worker::{BasicWorkerBuilder, ConnectionMode, WorkerType},
+    use crate::routers::{
+        common::retry::{is_retryable_response, is_retryable_status},
+        error::extract_error_code_from_response,
+        grpc::backend_client::BasicWorkerBuilder,
     };
 
     fn worker(url: &str, model_id: &str) -> Arc<dyn Worker> {
@@ -358,7 +357,7 @@ mod tests {
 
     #[test]
     fn fallback_respects_open_and_half_open_circuit_execution() {
-        use crate::worker::health::circuit_breaker::{CircuitBreakerConfig, CircuitState};
+        use smg_worker::health::circuit_breaker::{CircuitBreakerConfig, CircuitState};
 
         let w: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("http://127.0.0.1:9871")
@@ -564,7 +563,7 @@ mod tests {
     /// to an overloaded one.
     #[test]
     fn all_stalled_falls_back_to_the_least_loaded_ready_worker() {
-        use crate::worker::identity::basic::StallReason;
+        use smg_worker::identity::basic::StallReason;
 
         let a = worker("http://127.0.0.1:9841", "m");
         let b = worker("http://127.0.0.1:9842", "m");

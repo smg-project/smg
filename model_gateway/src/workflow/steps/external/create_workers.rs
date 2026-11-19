@@ -4,22 +4,22 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
+use smg_worker::{
+    health::{
+        circuit_breaker::CircuitBreakerConfig,
+        resilience::{resolve_resilience, ResolvedResilience},
+    },
+    identity::{
+        basic::{BasicWorker, ConnectionMode, RuntimeType, Worker, WorkerType},
+        endpoint::Endpoint,
+    },
+};
 use tracing::{debug, info};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use crate::{
-    worker::{
-        health::{
-            circuit_breaker::CircuitBreakerConfig,
-            resilience::{resolve_resilience, ResolvedResilience},
-        },
-        identity::{
-            basic::{RuntimeType, WorkerType},
-            endpoint::Endpoint,
-        },
-        BasicWorker, BasicWorkerBuilder, ConnectionMode, Worker,
-    },
-    workflow::data::{WorkerKind, WorkerList, WorkerWorkflowData},
+    routers::grpc::backend_client::BasicWorkerBuilder,
+    workflow::data::{require_app_context, WorkerKind, WorkerList, WorkerWorkflowData},
 };
 
 /// Normalize URL for external APIs (ensure https://).
@@ -95,11 +95,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateExternalWorkersStep {
         }
 
         let config = &context.data.config;
-        let app_context = context
-            .data
-            .app_context
-            .as_ref()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
+        let app_context = require_app_context(context.data.app_context.as_ref())?;
         let model_cards = &context.data.model_cards;
 
         // Build configs from router settings — resolve per-worker resilience

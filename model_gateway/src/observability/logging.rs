@@ -64,6 +64,7 @@ const WORKSPACE_CRATES: &[&str] = &[
     "smg_mcp",
     "smg_mesh",
     "smg_wasm",
+    "smg_worker",
     "tool_parser",
     "wfaas",
 ];
@@ -1462,6 +1463,17 @@ mod filter_tests {
         assert!(!targets.would_enable("symphonia_core::formats::probe", &Level::ERROR));
         assert!(targets.would_enable("symphonia_core::formats", &Level::WARN));
         assert!(targets.would_enable("smg", &Level::INFO));
+    }
+
+    /// The worker crate's lines take the configured level, as the gateway's
+    /// own do: its debug lines show at a debug level, and its warnings fall
+    /// silent at an error level.
+    #[test]
+    fn the_default_filter_gives_the_worker_crate_the_configured_level() {
+        let debug = targets(&build_workspace_filter("debug"));
+        assert!(debug.would_enable("smg_worker::periodic_task", &Level::DEBUG));
+        let error = targets(&build_workspace_filter("error"));
+        assert!(!error.would_enable("smg_worker::load::metrics_aggregator", &Level::WARN));
     }
 
     #[test]

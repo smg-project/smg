@@ -16,6 +16,10 @@ use smg_grpc_client::{
     sglang_proto::{self, DisaggregatedParams},
     tokenspeed_proto, vllm_proto,
 };
+use smg_worker::identity::{
+    basic::{Worker, DEFAULT_BOOTSTRAP_PORT},
+    sampling_defaults::{SamplingDefaults, DEFAULT_SAMPLING_PARAMS_LABEL},
+};
 use tool_parser::{GrammarStart, ParserFactory as ToolParserFactory};
 use tracing::{debug, error, warn};
 
@@ -25,7 +29,7 @@ use crate::{
     routers::{
         error,
         grpc::{
-            backend_client::BackendClient,
+            backend_client::{connected_backend_client, BackendClient},
             context::{
                 stage_output, AttemptStamp, ClientSelection, EncodeOutputs, ExecutionPlan,
                 RequestContext, RequestType, WorkerSelection,
@@ -38,10 +42,6 @@ use crate::{
             proto_wrapper::{AnswerConstraint, MultimodalData, ProtoGenerateRequest},
             utils,
         },
-    },
-    worker::{
-        identity::sampling_defaults::SamplingDefaults, Worker, DEFAULT_BOOTSTRAP_PORT,
-        DEFAULT_SAMPLING_PARAMS_LABEL,
     },
 };
 
@@ -1141,7 +1141,7 @@ fn inject_kv_bootstrap_room(
     dp_placement: DpPlacement,
 ) {
     let metadata = prefill_worker.metadata();
-    let backend = prefill_worker.backend_client_if_initialized();
+    let backend = connected_backend_client(prefill_worker.as_ref());
     let (hostname, bootstrap_port) = bootstrap_rendezvous(
         metadata.bootstrap_host(),
         metadata.bootstrap_port(),

@@ -3,11 +3,12 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
+use smg_worker::identity::endpoint::Endpoint;
 use tracing::debug;
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use super::find_workers_by_url;
-use crate::{worker::identity::endpoint::Endpoint, workflow::data::WorkerRemovalWorkflowData};
+use crate::workflow::data::{require_app_context, WorkerRemovalWorkflowData};
 
 /// Request structure for worker removal.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -44,11 +45,7 @@ impl StepExecutor<WorkerRemovalWorkflowData> for FindWorkersToRemoveStep {
         context: &mut WorkflowContext<WorkerRemovalWorkflowData>,
     ) -> WorkflowResult<StepResult> {
         let request = &context.data.config;
-        let app_context = context
-            .data
-            .app_context
-            .as_ref()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
+        let app_context = require_app_context(context.data.app_context.as_ref())?;
 
         let mut workers_to_remove = find_workers_by_url(&app_context.worker_registry, &request.url);
 

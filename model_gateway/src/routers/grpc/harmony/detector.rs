@@ -1,6 +1,8 @@
 //! Harmony model detection
 
-use crate::worker::{Worker, WorkerRegistry};
+use smg_worker::identity::basic::Worker;
+
+use crate::routers::common::snapshot::{WorkerRegistry, WorkerRegistryExt};
 
 /// Harmony model detector
 ///
@@ -79,8 +81,11 @@ pub fn is_harmony_card(architectures: &[String], hf_model_type: Option<&str>, id
 mod tests {
     use std::sync::Arc;
 
+    use openai_protocol::model_card::ModelCard;
+    use smg_worker::identity::basic::{ConnectionMode, WorkerType};
+
     use super::*;
-    use crate::worker::{BasicWorkerBuilder, ConnectionMode, ModelCard, WorkerType};
+    use crate::routers::grpc::backend_client::BasicWorkerBuilder;
 
     fn builder() -> BasicWorkerBuilder {
         builder_at("grpc://127.0.0.1:1")

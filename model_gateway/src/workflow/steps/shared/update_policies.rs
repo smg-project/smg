@@ -3,6 +3,10 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use smg_worker::{
+    identity::basic::{ConnectionMode, RuntimeType, Worker},
+    kv_events::SubscriptionKind,
+};
 use tracing::{debug, warn};
 use wfaas::{
     StepExecutor, StepResult, WorkflowContext, WorkflowData, WorkflowError, WorkflowResult,
@@ -10,8 +14,7 @@ use wfaas::{
 
 use crate::{
     app_context::AppContext,
-    worker::{ConnectionMode, RuntimeType, SubscriptionKind, Worker},
-    workflow::data::WorkerRegistrationData,
+    workflow::data::{require_app_context, WorkerRegistrationData},
 };
 
 /// Start the worker's stream on the KV event monitor, or restart it for the
@@ -161,11 +164,7 @@ impl UpdatePoliciesStep {
 #[async_trait]
 impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for UpdatePoliciesStep {
     async fn execute(&self, context: &mut WorkflowContext<D>) -> WorkflowResult<StepResult> {
-        let app_context = context
-            .data
-            .get_app_context()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?
-            .clone();
+        let app_context = require_app_context(context.data.get_app_context())?.clone();
 
         let workers = context
             .data
@@ -250,7 +249,10 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for UpdatePolicie
 
 #[cfg(test)]
 mod tests {
-    use openai_protocol::worker::{HealthCheckConfig, RuntimeType, WorkerSpec, WorkerType};
+    use openai_protocol::{
+        model_card::ModelCard,
+        worker::{HealthCheckConfig, RuntimeType, WorkerSpec, WorkerType},
+    };
     use tracing_test::traced_test;
     use wfaas::WorkflowInstanceId;
 
@@ -258,8 +260,8 @@ mod tests {
     use crate::{
         app_context::{testing::app_context_for_tests, AppContext},
         config::{PolicyConfig, RouterConfig},
-        policies::{as_cache_aware, PolicyFactory},
-        worker::{BasicWorkerBuilder, KvEventMonitor, ModelCard, WorkerRegistry},
+        policies::{as_cache_aware, kv_index::event_monitor::KvEventMonitor, PolicyFactory},
+        routers::{common::snapshot::WorkerRegistry, grpc::backend_client::BasicWorkerBuilder},
         workflow::{data::WorkerRegistrationMode, steps::create_worker_workflow_data},
     };
 

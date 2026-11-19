@@ -26,12 +26,13 @@ use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
 
 use crate::{
-    framework::{Scorer, TieBand},
+    counts::with_counts,
+    framework::{Front, Scorer, Spread, TieBand},
     lease::{Lifecycle, Membership},
     spec::{AffinitySource, KvPressureParams, Needs, PrefixAffinityParams, WarmupSliceParams},
     view::{
-        AffinityFacts, Candidate, Feed, HashKind, NamedAffinity, Phase, RequestFacts, Walk,
-        WorkerId,
+        mean_in_flight, AffinityFacts, Candidate, Feed, HashKind, NamedAffinity, Phase,
+        RequestFacts, Walk, WorkerId,
     },
     Draw,
 };
@@ -67,8 +68,9 @@ const DEFAULT_BLOCK_SIZE: u32 = 16;
 /// a held prefix is priced by.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Gates {
-    /// A holder loaded past this multiple of the kept rows' mean in flight
-    /// AND past the absolute margin above it spills.
+    /// A holder loaded past this multiple of the mean in flight (the kept
+    /// rows', or the drawn rows' behind a draw) AND past the absolute
+    /// margin above it spills.
     pub rel: f32,
     /// The absolute margin's configured part, in requests; the margin is
     /// capped at the larger of the count's natural swing at the mean and
@@ -98,6 +100,18 @@ impl Default for Gates {
             block_size: DEFAULT_BLOCK_SIZE,
         }
     }
+}
+
+/// How many whole blocks of `block_size` lie within the first `tokens`
+/// tokens of a request hashed in `kind`: the tokens over the block size,
+/// under the text kind their characters over the character block size. A
+/// block size is one at least.
+pub(crate) fn blocks_within(tokens: u32, kind: HashKind, block_size: u32) -> u32 {
+    let units = match kind {
+        HashKind::Token => tokens,
+        HashKind::Text => tokens.saturating_mul(CHARS_PER_TOKEN),
+    };
+    units / block_size
 }
 
 impl Gates {
@@ -165,9 +179,19 @@ impl Gates {
     }
 
     /// Whether a candidate with `load` requests in flight is over the spill
-    /// gate at the kept rows' mean `avg`.
+    /// gate at the mean `avg`.
     fn over(&self, load: f32, avg: f32, held_tokens: f32) -> bool {
         load > avg * self.rel && load > avg + self.margin(avg, held_tokens)
+    }
+
+    /// The spill gate at the mean `avg` for a candidate holding
+    /// `held_tokens` of the request, as [`Self::over`] tests it: the two
+    /// bounds a pass behind a draw takes once.
+    fn spill(&self, avg: f32, held_tokens: f32) -> Spill {
+        Spill {
+            rel: avg * self.rel,
+            abs: avg + self.margin(avg, held_tokens),
+        }
     }
 
     /// The size of one of the request's blocks: the facts' own when the
@@ -180,6 +204,13 @@ impl Gates {
         }
     }
 
+    /// How many whole blocks of the request lie within its first `tokens`
+    /// tokens ([`blocks_within`]), at the block size the request was
+    /// counted with.
+    pub(crate) fn whole_blocks(&self, tokens: u32, facts: &RequestFacts<'_>) -> u32 {
+        blocks_within(tokens, facts.hash_kind, self.block_size_of(facts))
+    }
+
     /// The request's size in blocks: its token count over the block size
     /// (the text kind's characters over the character block size, as
     /// `tokens_of` reads them back), never under one and never under the
@@ -187,11 +218,7 @@ impl Gates {
     /// request's hashes alone would understate it and overstate every
     /// holder's share.
     fn request_blocks(&self, facts: &RequestFacts<'_>) -> u32 {
-        let units = match facts.hash_kind {
-            HashKind::Token => facts.prompt_tokens,
-            HashKind::Text => facts.prompt_tokens.saturating_mul(CHARS_PER_TOKEN),
-        };
-        let from_tokens = (units / self.block_size_of(facts)).max(1);
+        let from_tokens = self.whole_blocks(facts.prompt_tokens, facts).max(1);
         let from_hashes = u32::try_from(facts.block_hashes.len()).unwrap_or(u32::MAX);
         from_tokens.max(from_hashes)
     }
@@ -204,6 +231,24 @@ impl Gates {
             HashKind::Token => units,
             HashKind::Text => units / CHARS_PER_TOKEN as f32,
         }
+    }
+}
+
+/// The spill gate at one mean and one held prefix ([`Gates::spill`]).
+#[derive(Clone, Copy, Debug)]
+struct Spill {
+    rel: f32,
+    abs: f32,
+}
+
+impl Spill {
+    /// Whether `load` requests in flight are over the gate, as
+    /// [`Gates::over`] answers. Both bounds are tested whatever the first
+    /// says: over rows a draw chose, a test that stops at the first is a
+    /// branch nothing predicts.
+    #[inline]
+    fn over(self, load: f32) -> bool {
+        (load > self.rel) & (load > self.abs)
     }
 }
 
@@ -237,6 +282,7 @@ impl Warm<'_> {
 /// they hold, how a warming row is told, the request's deepest index match
 /// and size, and the decision's draw.
 struct Pass<'a> {
+    facts: &'a RequestFacts<'a>,
     candidates: &'a [Candidate],
     kept: &'a [u32],
     feed: Feed<'a>,
@@ -248,43 +294,55 @@ struct Pass<'a> {
 
 impl Pass<'_> {
     /// The slot of the least-loaded kept row `wanted` admits, equal loads
-    /// drawn uniformly from the decision's seed.
-    fn least_loaded(&mut self, mut wanted: impl FnMut(u32, &Candidate) -> bool) -> Option<usize> {
+    /// drawn uniformly from the decision's seed. `wanted` is asked with
+    /// the row's requests in flight, the decision's one number for the
+    /// row.
+    fn least_loaded(
+        &mut self,
+        mut wanted: impl FnMut(u32, &Candidate, u32) -> bool,
+    ) -> Option<usize> {
         let mut pick: Option<(usize, u32)> = None;
         let mut tied = 0usize;
-        for (slot, &i) in self.kept.iter().enumerate() {
-            let c = &self.candidates[i as usize];
-            if !wanted(i, c) {
-                continue;
-            }
-            match pick {
-                Some((_, load)) if c.in_flight > load => {}
-                Some((_, load)) if c.in_flight == load => {
-                    tied += 1;
-                    if self.draw.below(tied + 1) == 0 {
-                        pick = Some((slot, load));
+        with_counts!(self.facts, |counts| {
+            for (slot, &i) in self.kept.iter().enumerate() {
+                let c = &self.candidates[i as usize];
+                let held = counts(c);
+                if !wanted(i, c, held) {
+                    continue;
+                }
+                match pick {
+                    Some((_, load)) if held > load => {}
+                    Some((_, load)) if held == load => {
+                        tied += 1;
+                        if self.draw.below(tied + 1) == 0 {
+                            pick = Some((slot, load));
+                        }
+                    }
+                    _ => {
+                        pick = Some((slot, held));
+                        tied = 0;
                     }
                 }
-                _ => {
-                    pick = Some((slot, c.in_flight));
-                    tied = 0;
-                }
             }
-        }
+        });
         pick.map(|(slot, _)| slot)
     }
 }
 
-/// The mean of the kept rows' in-flight counts.
-fn mean_in_flight(candidates: &[Candidate], kept: &[u32]) -> f32 {
-    if kept.is_empty() {
-        return 0.0;
-    }
-    let sum: u64 = kept
-        .iter()
-        .map(|&i| u64::from(candidates[i as usize].in_flight))
-        .sum();
-    sum as f32 / kept.len() as f32
+/// The mean in flight the spill gate reads: the drawn rows' where the
+/// engine set it
+/// ([`NamedAffinity::mean_in_flight`]),
+/// else the kept rows'.
+// Forced into the stage's passes with the mean it reads
+// ([`mean_in_flight`]): out of line the mean's walk costs a pass a call.
+#[inline(always)]
+fn spill_mean(
+    drawn: Option<f32>,
+    facts: &RequestFacts<'_>,
+    candidates: &[Candidate],
+    kept: &[u32],
+) -> f32 {
+    drawn.unwrap_or_else(|| mean_in_flight(facts, candidates, kept))
 }
 
 /// Every row scores alike: the stage has nothing to say about this request.
@@ -337,11 +395,16 @@ impl PrefixAffinity {
         index.max(predicted)
     }
 
-    /// The stage's scores over what its two passes read of the kept rows;
-    /// `holds` is whether anybody holds anything. `reads` hands each pass a
+    /// The stage's scores over what its two passes read of the kept rows.
+    /// `feed` says whether anybody holds anything and carries the drawn
+    /// rows' mean where the engine set one. `reads` hands each pass a
     /// reader of its own: a column's is a read by index, and the rows a
     /// host named are walked beside the kept rows. One body a feed, the
-    /// feed chosen where the body is entered.
+    /// feed chosen where the body is entered. The rows of a draw are
+    /// scored by [`Self::rank_drawn`]. The count of the rows written the
+    /// ceiling comes back beside the band: the entry that says the stage's
+    /// word reads it ([`Scorer::score_front`]), and an entry that does not
+    /// carries no count.
     #[inline(always)]
     fn rank<R: FnMut(u32) -> AffinityFacts>(
         &self,
@@ -349,10 +412,11 @@ impl PrefixAffinity {
         candidates: &[Candidate],
         kept: &[u32],
         out: &mut [f32],
-        holds: bool,
+        feed: Feed<'_>,
         reads: impl Fn() -> R,
-    ) -> TieBand {
+    ) -> (TieBand, u32) {
         let request_blocks = self.gates.request_blocks(facts);
+        let holds = !feed.is_empty();
         // Nobody holding anything, the deepest match is zero without a
         // pass; any other feed answers for every kept row.
         let best = if holds {
@@ -364,7 +428,7 @@ impl PrefixAffinity {
         } else {
             0
         };
-        let avg = mean_in_flight(candidates, kept);
+        let avg = spill_mean(feed.drawn_mean(), facts, candidates, kept);
         // A decode worker prefills nothing again: its held prefix is not
         // priced.
         let priced = self.gates.prefix_margin_tokens > 0 && facts.phase != Phase::Decode;
@@ -374,27 +438,83 @@ impl PrefixAffinity {
             0.0
         };
         let mut entry = reads();
-        for (o, &i) in out.iter_mut().zip(kept) {
-            let c = &candidates[i as usize];
-            let load = c.in_flight as f32;
-            // A match above zero was read from a feed that holds entries.
-            *o = if best > 0
-                && self.matched(entry(i), request_blocks) == best
-                && !self.gates.over(load, avg, held)
-            {
-                1.0
-            } else if !self.gates.over(load, avg, 0.0) {
-                0.5
-            } else {
-                0.0
-            };
+        let mut ceilings = 0u32;
+        with_counts!(facts, |counts| {
+            for (o, &i) in out.iter_mut().zip(kept) {
+                let c = &candidates[i as usize];
+                let load = counts(c) as f32;
+                // A match above zero was read from a feed that holds entries.
+                *o = if best > 0
+                    && self.matched(entry(i), request_blocks) == best
+                    && !self.gates.over(load, avg, held)
+                {
+                    // Counted where it is written: a row under the ceiling
+                    // adds nothing to the pass.
+                    ceilings += 1;
+                    1.0
+                } else if !self.gates.over(load, avg, 0.0) {
+                    0.5
+                } else {
+                    0.0
+                };
+            }
+        });
+        (TieBand(0.0), ceilings)
+    }
+
+    /// The stage's scores behind a draw, as [`Self::rank`] says them over
+    /// the rows a host named. The rows come in the draw's order, and no
+    /// test of a row is one a processor predicts: each row's entry is
+    /// found once, by a search (its match rides the row's score slot, bit
+    /// for bit, to the pass that scores), the spill gate's bounds are
+    /// taken once and both tested, and the score is chosen by a table. A
+    /// pool read whole keeps [`Self::rank`]: its rows come in the host's
+    /// order decision after decision, its tests are predicted, and this
+    /// body costs it more instructions a row.
+    fn rank_drawn(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        out: &mut [f32],
+        named: NamedAffinity<'_>,
+    ) -> TieBand {
+        let request_blocks = self.gates.request_blocks(facts);
+        // Nobody holding anything, the deepest match is zero without a
+        // pass.
+        let mut best = 0;
+        if !named.holders.is_empty() {
+            for (o, &i) in out.iter_mut().zip(kept) {
+                let matched = self.matched(named.entry(i), request_blocks);
+                *o = f32::from_bits(matched);
+                best = best.max(matched);
+            }
         }
+        let avg = spill_mean(named.mean_in_flight, facts, candidates, kept);
+        let priced = self.gates.prefix_margin_tokens > 0 && facts.phase != Phase::Decode;
+        let held = if priced {
+            self.gates.tokens_of(best, facts)
+        } else {
+            0.0
+        };
+        let (holder, anyone) = (self.gates.spill(avg, held), self.gates.spill(avg, 0.0));
+        with_counts!(facts, |counts| {
+            for (o, &i) in out.iter_mut().zip(kept) {
+                let load = counts(&candidates[i as usize]) as f32;
+                // A match above zero was read into this slot.
+                let deepest = (best > 0) & (o.to_bits() == best);
+                let own = usize::from(deepest & !holder.over(load));
+                *o = [0.0, 0.5, 1.0, 1.0][own << 1 | usize::from(!anyone.over(load))];
+            }
+        });
         TieBand(0.0)
     }
 
     /// The stage's scores over the rows a host named: a holder reads its
-    /// depth, and each pass walks the holders beside its kept rows. Out of
-    /// line: see [`Scorer::score`] of this stage.
+    /// depth. Each pass walks the holders beside its kept rows where the
+    /// pool is read whole; behind a draw each row is searched once
+    /// ([`Self::rank_drawn`]). Out of line: see [`Scorer::score`] of this
+    /// stage.
     #[inline(never)]
     fn rank_named(
         &self,
@@ -404,11 +524,16 @@ impl PrefixAffinity {
         out: &mut [f32],
         named: NamedAffinity<'_>,
     ) -> TieBand {
-        let holds = !named.holders.is_empty();
-        self.rank(facts, candidates, kept, out, holds, || {
+        if named.drawn() {
+            // Behind a draw the rows stand in the draw's order: each is
+            // read by a search, once, and no cursor is kept.
+            return self.rank_drawn(facts, candidates, kept, out, named);
+        }
+        self.rank(facts, candidates, kept, out, Feed::Named(named), || {
             let mut walk = named.walk();
             move |i: u32| walk.entry(i)
         })
+        .0
     }
 }
 
@@ -417,6 +542,50 @@ impl Lifecycle for PrefixAffinity {}
 impl Scorer for PrefixAffinity {
     fn name(&self) -> &'static str {
         "prefix-affinity"
+    }
+
+    /// Row by row, unless the fleet's KV gate is configured: that gate
+    /// reads every row.
+    fn row_wise(&self) -> bool {
+        !self.gates.kv_configured()
+    }
+
+    /// A holder of the deepest match, a row under the gate, a row over it.
+    fn spread(&self) -> Spread {
+        Spread::Levels(0.5)
+    }
+
+    /// [`Self::score`] with the word of its scores, said by the pass that
+    /// writes them: it counts the rows it writes the ceiling, and no pass
+    /// reads the scores again. Under the fleet's KV gate every row stands
+    /// alike. The rows a host named say nothing.
+    fn score_front(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        _: &[u32],
+        asked: &[u32],
+        out: &mut [f32],
+    ) -> (TieBand, Front) {
+        if facts.named_alone().is_some() {
+            return (self.score(facts, candidates, asked, out), Front::Unsaid);
+        }
+        if self.gates.kv_imbalanced(candidates, asked) {
+            return (neutral(out), Front::Alike);
+        }
+        let column = facts.affinity;
+        let (band, ceilings) =
+            self.rank(facts, candidates, asked, out, Feed::Column(column), || {
+                |i: u32| column[i as usize]
+            });
+        // The values are the ceiling, a half and nothing: every row not
+        // counted stands a level or more under the rows that are.
+        let said = if ceilings as usize == out.len() {
+            Front::Alike
+        } else {
+            Front::At(ceilings)
+        };
+        (band, said)
     }
 
     fn score(
@@ -437,10 +606,10 @@ impl Scorer for PrefixAffinity {
             return self.rank_named(facts, candidates, kept, out, named);
         }
         let column = facts.affinity;
-        let holds = !column.is_empty();
-        self.rank(facts, candidates, kept, out, holds, || {
+        self.rank(facts, candidates, kept, out, Feed::Column(column), || {
             |i: u32| column[i as usize]
         })
+        .0
     }
 
     fn needs(&self) -> Needs {
@@ -475,6 +644,18 @@ impl Scorer for KvPressure {
         "kv-pressure"
     }
 
+    /// The stage orders nothing: the gate it configures is read by the
+    /// profile's affinity stages, which answer for it.
+    fn row_wise(&self) -> bool {
+        true
+    }
+
+    /// Every row reads alike: the stage configures the gate and orders
+    /// nothing.
+    fn spread(&self) -> Spread {
+        Spread::Alike
+    }
+
     fn score(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &[u32], out: &mut [f32]) -> TieBand {
         neutral(out)
     }
@@ -488,6 +669,131 @@ impl Scorer for KvPressure {
 }
 
 // ---------------------------------------------------------------- warm-up slice
+
+/// How a host reads the rows a ruling named ([`WarmRule::name`]) at an
+/// instant of the ruling's clock.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Warming {
+    /// The rows named are the thin.
+    pub thin: bool,
+    /// The instant from which the rows are named: `0`, unless every row
+    /// was young. Such a fleet has nobody to catch up to until the first
+    /// of its rows is young no more.
+    pub from: u64,
+}
+
+/// The warm-up stage's ruling of who warms, as its three numbers: what the
+/// stage rules a host's column by, and what a host that names a pool's
+/// warming rows enters ([`WarmRule::name`]). The ruling has this one home: a
+/// host hands it the pool's sizes and admissions and never restates it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WarmRule {
+    /// How long after its admission a worker is young, in microseconds; `0`
+    /// keeps nobody young.
+    window_micros: u64,
+    /// The level from which a fleet holds a cache worth catching up to, and
+    /// the growth a young worker is short of, in blocks.
+    blocks: u32,
+    /// The share of the fleet's level under which an index is thin; `0`
+    /// keeps nobody thin.
+    thin_ratio: f32,
+}
+
+impl WarmRule {
+    /// Whether an index of `indexed` blocks is thin against the fleet's
+    /// `level`: empty, or below the ratio of the level, once the fleet holds
+    /// a cache worth catching up to.
+    #[inline]
+    fn is_thin(&self, indexed: u32, level: u32) -> bool {
+        self.thin_ratio > 0.0
+            && level >= self.blocks
+            && (indexed == 0 || f64::from(indexed) < f64::from(level) * f64::from(self.thin_ratio))
+    }
+
+    /// Whether a worker admitted `age_micros` ago whose index grew by
+    /// `growth` blocks since is young: within the window and short of its
+    /// first blocks.
+    #[inline]
+    fn is_young(&self, age_micros: u64, growth: u32) -> bool {
+        age_micros < self.window_micros && growth < self.blocks
+    }
+
+    /// The fleet's index level: the upper median of the rows' index sizes,
+    /// so one emptied worker does not drag it down. Reorders `sizes`.
+    #[inline]
+    fn level(sizes: &mut [u32]) -> u32 {
+        if sizes.is_empty() {
+            return 0;
+        }
+        let mid = sizes.len() / 2;
+        let (_, level, _) = sizes.select_nth_unstable(mid);
+        *level
+    }
+
+    /// The pool's warming rows by this ruling, for a host that names them
+    /// ([`NamedAffinity::warming`]). `sizes` holds each row's index size
+    /// and `admitted` each row's admission, on the clock `now` is read on,
+    /// in microseconds; `scratch` is the host's, for the level. The rows go
+    /// to `out`, emptied first, ascending, each with the instant its naming
+    /// ends: the thin whatever the fleet's age, with no end (`u64::MAX`),
+    /// else the young, each until its window is over, as the stage rules a
+    /// column of the same sizes and ages. A row is admitted with nothing
+    /// indexed, so its growth since admission is its size.
+    ///
+    /// The rows stand for every later instant of that clock while the sizes
+    /// do: at an instant a host names the rows whose end is past it, and
+    /// nobody before [`Warming::from`]. So a host that reads the sizes at
+    /// its own pace still ends a young row's naming on time.
+    pub fn name(
+        &self,
+        sizes: &[u32],
+        admitted: &[u64],
+        now: u64,
+        scratch: &mut Vec<u32>,
+        out: &mut Vec<(u32, u64)>,
+    ) -> Warming {
+        out.clear();
+        let young = |size: u32, admitted: u64| self.is_young(now.saturating_sub(admitted), size);
+        let any_indexed = sizes.iter().any(|&size| size > 0);
+        let youngs = sizes
+            .iter()
+            .zip(admitted)
+            .filter(|&(&size, &admitted)| young(size, admitted))
+            .count();
+        if !any_indexed && youngs == 0 {
+            return Warming::default();
+        }
+        let level = if any_indexed {
+            scratch.clear();
+            scratch.extend_from_slice(sizes);
+            Self::level(scratch)
+        } else {
+            0
+        };
+        let rows = (0u32..).zip(sizes.iter().zip(admitted));
+        out.extend(
+            rows.clone()
+                .filter(|&(_, (&size, _))| self.is_thin(size, level))
+                .map(|(row, _)| (row, u64::MAX)),
+        );
+        if !out.is_empty() {
+            return Warming {
+                thin: true,
+                from: 0,
+            };
+        }
+        let window = self.window_micros;
+        out.extend(
+            rows.filter(|&(_, (&size, &admitted))| young(size, admitted))
+                .map(|(row, (_, &admitted))| (row, admitted.saturating_add(window))),
+        );
+        // A fleet that is all young has nobody to catch up to, until the
+        // first of its rows is young no more.
+        let first_end = out.iter().map(|&(_, until)| until).min();
+        let from = first_end.filter(|_| youngs == sizes.len()).unwrap_or(0);
+        Warming { thin: false, from }
+    }
+}
 
 /// The warm-up slice. One miss in `1 / share` goes to the least-loaded
 /// warming worker (one with a thin index against the fleet's level, or a
@@ -540,6 +846,16 @@ impl WarmupSlice {
         }
     }
 
+    /// The stage's ruling of who warms, as a host enters it.
+    #[inline]
+    fn rule(&self) -> WarmRule {
+        WarmRule {
+            window_micros: self.secs_micros,
+            blocks: self.blocks,
+            thin_ratio: self.thin_ratio,
+        }
+    }
+
     /// Every how many misses one goes to a warming worker.
     fn period(&self) -> u64 {
         if self.share <= 0.0 {
@@ -552,16 +868,14 @@ impl WarmupSlice {
     /// `level`: empty, or below the ratio of the level, once the fleet holds
     /// a cache worth catching up to.
     fn is_thin(&self, indexed: u32, level: u32) -> bool {
-        self.thin_ratio > 0.0
-            && level >= self.blocks
-            && (indexed == 0 || f64::from(indexed) < f64::from(level) * f64::from(self.thin_ratio))
+        self.rule().is_thin(indexed, level)
     }
 
     /// Whether a worker is young: admitted within the window and short of
     /// its first blocks.
     fn is_young(&self, held: AffinityFacts) -> bool {
-        u64::from(held.admitted_age_ms).saturating_mul(1_000) < self.secs_micros
-            && held.indexed_growth < self.blocks
+        let age = u64::from(held.admitted_age_ms).saturating_mul(1_000);
+        self.rule().is_young(age, held.indexed_growth)
     }
 
     /// The fleet's index level: the upper median of the index sizes in the
@@ -570,12 +884,7 @@ impl WarmupSlice {
         let mut sizes = self.sizes.lock();
         sizes.clear();
         sizes.extend(column.iter().map(|held| held.indexed_blocks));
-        if sizes.is_empty() {
-            return 0;
-        }
-        let mid = sizes.len() / 2;
-        let (_, level, _) = sizes.select_nth_unstable(mid);
-        *level
+        WarmRule::level(&mut sizes)
     }
 
     /// The stage over the rows a host named: it ruled the warming rows
@@ -597,14 +906,20 @@ impl WarmupSlice {
             rows: named.warming,
             thin: named.thin,
         };
-        self.turn(facts, candidates, kept, out, Feed::Named(named), warm)
+        // Behind a draw the pass reads the rows named by a search: one
+        // body a read, the read chosen where the body is entered.
+        if named.drawn() {
+            return self.turn::<true>(facts, candidates, kept, out, Feed::Named(named), warm);
+        }
+        self.turn::<false>(facts, candidates, kept, out, Feed::Named(named), warm)
     }
 
     /// One pass where somebody warms: the request is a miss the slice may
     /// take or a hit the divert may take, and the row that takes it scores
-    /// alone.
+    /// alone. `DRAWN` is a pass behind a draw: it reads the rows named by a
+    /// search and keeps no cursor.
     #[inline(always)]
-    fn turn(
+    fn turn<const DRAWN: bool>(
         &self,
         facts: &RequestFacts<'_>,
         candidates: &[Candidate],
@@ -617,12 +932,13 @@ impl WarmupSlice {
         let mut reads = feed.reads();
         let best = kept
             .iter()
-            .map(|&i| reads.entry(i).overlap_blocks)
+            .map(|&i| feed.read::<DRAWN>(&mut reads, i).overlap_blocks)
             .max()
             .unwrap_or(0);
         let thin_overlap = best as f32 / request_blocks as f32 <= self.miss_share
             || (best <= WARMUP_MISS_BLOCKS && best * 2 < request_blocks);
         let mut pass = Pass {
+            facts,
             candidates,
             kept,
             feed,
@@ -632,9 +948,9 @@ impl WarmupSlice {
             draw: Draw::new(facts.seed ^ 0x77a7_2d5e_6f1c_3b09),
         };
         let slot = if thin_overlap {
-            self.slice(&mut pass)
+            self.slice::<DRAWN>(&mut pass)
         } else if warm.thin() {
-            self.divert(&mut pass, facts.now_micros)
+            self.divert::<DRAWN>(&mut pass, facts.now_micros)
         } else {
             None
         };
@@ -682,8 +998,13 @@ impl WarmupSlice {
     /// A thin worker is one whatever the fleet's age; workers warming only
     /// because they are young are ones only when the fleet is not all
     /// young. A host that named the rows ruled the same where it derived
-    /// them, and the pass walks its list beside the kept rows.
-    fn warming<'a>(&'a self, warm: Warm<'a>, feed: Feed<'a>) -> impl FnMut(u32) -> bool + 'a {
+    /// them: the pass walks its list beside the kept rows of a pool read
+    /// whole, and searches it a row behind a draw (`DRAWN`).
+    fn warming<'a, const DRAWN: bool>(
+        &'a self,
+        warm: Warm<'a>,
+        feed: Feed<'a>,
+    ) -> impl FnMut(u32) -> bool + 'a {
         let mut reads = feed.reads();
         let mut named = Walk::new(match warm {
             Warm::Named { rows, .. } => rows,
@@ -702,26 +1023,33 @@ impl WarmupSlice {
                     !young_all && self.is_young(held)
                 }
             }
+            Warm::Named { rows, .. } if DRAWN => rows.binary_search(&i).is_ok(),
             Warm::Named { .. } => named.find(i, |&row| row).is_some(),
         }
     }
 
     /// The slot of the kept row the slice sends this miss to, if it is due.
-    fn slice(&self, pass: &mut Pass<'_>) -> Option<usize> {
-        let avg = mean_in_flight(pass.candidates, pass.kept);
-        let mut warming = self.warming(pass.warm, pass.feed);
+    fn slice<const DRAWN: bool>(&self, pass: &mut Pass<'_>) -> Option<usize> {
+        let avg = spill_mean(
+            pass.feed.drawn_mean(),
+            pass.facts,
+            pass.candidates,
+            pass.kept,
+        );
+        let mut warming = self.warming::<DRAWN>(pass.warm, pass.feed);
         let slot =
-            pass.least_loaded(|i, c| warming(i) && !self.gates.over(c.in_flight as f32, avg, 0.0))?;
+            pass.least_loaded(|i, _, load| warming(i) && !self.gates.over(load as f32, avg, 0.0))?;
         let seen = self.misses.fetch_add(1, Ordering::Relaxed);
         seen.is_multiple_of(self.period()).then_some(slot)
     }
 
     /// The slot of the kept row a hit is diverted to, if one is due.
-    fn divert(&self, pass: &mut Pass<'_>, now: u64) -> Option<usize> {
+    fn divert<const DRAWN: bool>(&self, pass: &mut Pass<'_>, now: u64) -> Option<usize> {
         if self.divert_every == 0 {
             return None;
         }
         let Pass {
+            facts,
             candidates,
             kept,
             feed,
@@ -749,8 +1077,8 @@ impl WarmupSlice {
         } else {
             let mut reads = feed.reads();
             kept.iter()
-                .filter(|&&i| reads.entry(i).overlap_blocks == best)
-                .map(|&i| candidates[i as usize].in_flight)
+                .filter(|&&i| feed.read::<DRAWN>(&mut reads, i).overlap_blocks == best)
+                .map(|&i| facts.in_flight(&candidates[i as usize]))
                 .min()
         };
         // The eligibility read and the window's reservation on one lock
@@ -759,12 +1087,12 @@ impl WarmupSlice {
         // warming rows are the thin, so a warming row here is a thin one.
         let slot = {
             let mut until = self.divert_until.lock();
-            let (mut warming, mut held) = (self.warming(warm, feed), feed.reads());
-            let slot = pass.least_loaded(|i, c| {
+            let (mut warming, mut held) = (self.warming::<DRAWN>(warm, feed), feed.reads());
+            let slot = pass.least_loaded(|i, c, load| {
                 warming(i)
-                    && !(c.in_flight > 0 && until.get(&c.id).is_some_and(|&t| now < t))
-                    && !(holder_load.is_some_and(|h| c.in_flight >= h)
-                        && held.entry(i).overlap_blocks != best)
+                    && !(load > 0 && until.get(&c.id).is_some_and(|&t| now < t))
+                    && !(holder_load.is_some_and(|h| load >= h)
+                        && feed.read::<DRAWN>(&mut held, i).overlap_blocks != best)
             })?;
             until.insert(
                 candidates[kept[slot] as usize].id,
@@ -791,7 +1119,7 @@ impl Lifecycle for WarmupSlice {
                     .lock()
                     .retain(|worker, _| ids.contains(worker));
             }
-            Membership::Added(_) | Membership::Relabelled(_) => {}
+            Membership::Added(_) | Membership::Relabelled(_) | Membership::Left { .. } => {}
         }
     }
 }
@@ -799,6 +1127,42 @@ impl Lifecycle for WarmupSlice {
 impl Scorer for WarmupSlice {
     fn name(&self) -> &'static str {
         "warmup-slice"
+    }
+
+    /// Row by row, unless the fleet's KV gate is configured: that gate
+    /// reads every row. What the stage reads of the pool (its level, who
+    /// warms) comes from the host's feed, never from the rows handed.
+    fn row_wise(&self) -> bool {
+        !self.gates.kv_configured()
+    }
+
+    /// The row that takes the request scores alone, or every row alike.
+    fn spread(&self) -> Spread {
+        Spread::Levels(1.0)
+    }
+
+    /// [`Self::score`], and the word of its scores read off two of them.
+    /// The pass writes every row the ceiling, or one row the ceiling and
+    /// every other nothing: the first two rows tell the answers apart, and
+    /// no pass reads the scores again. A lone row stands at the ceiling
+    /// either way, which reads alike. The rows a host named say nothing.
+    fn score_front(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        _: &[u32],
+        asked: &[u32],
+        out: &mut [f32],
+    ) -> (TieBand, Front) {
+        let band = self.score(facts, candidates, asked, out);
+        if facts.named_alone().is_some() {
+            return (band, Front::Unsaid);
+        }
+        let alike = match *out {
+            [first, second, ..] => first >= 1.0 && second >= 1.0,
+            _ => true,
+        };
+        (band, if alike { Front::Alike } else { Front::At(1) })
     }
 
     fn score(
@@ -830,7 +1194,7 @@ impl Scorer for WarmupSlice {
         let Some(warm) = self.ruled(column) else {
             return neutral(out);
         };
-        self.turn(facts, candidates, kept, out, Feed::Column(column), warm)
+        self.turn::<false>(facts, candidates, kept, out, Feed::Column(column), warm)
     }
 
     fn needs(&self) -> Needs {
@@ -843,12 +1207,17 @@ impl Scorer for WarmupSlice {
             ..Needs::default()
         }
     }
+
+    fn warm_rule(&self) -> Option<WarmRule> {
+        Some(self.rule())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
+        counts::tests::Lent,
         spec::SpillParams,
         view::{Health, LoadRow, NamedHolder},
     };
@@ -919,13 +1288,18 @@ mod tests {
         rows: &[Candidate],
         column: &[AffinityFacts],
     ) -> Vec<f32> {
-        let facts = RequestFacts {
+        // The counts a case wrote into its rows stand in a table lent
+        // beside them, each row reading zero: every case that scores
+        // through here holds its stage to the one reader of a row's count.
+        let mut rows = rows.to_vec();
+        let lent = Lent::take(&mut rows);
+        let facts = lent.beside(&RequestFacts {
             affinity: column,
             ..*facts
-        };
+        });
         let kept = kept(rows.len() as u32);
         let mut out = vec![0.0; rows.len()];
-        scorer.score(&facts, rows, &kept, &mut out);
+        scorer.score(&facts, &rows, &kept, &mut out);
         out
     }
 
@@ -951,7 +1325,7 @@ mod tests {
             rel: Some(1.5),
             ..SpillParams::default()
         }));
-        let mean = mean_in_flight(&rows(&pool), &kept(3));
+        let mean = mean_in_flight(&RequestFacts::default(), &rows(&pool), &kept(3));
         assert!((mean - 40.0 / 3.0).abs() < 1e-6);
         assert_eq!(scores(&gated, &facts(16), &pool), vec![0.0, 0.5, 0.5]);
         // Under a lifted relative part the holder keeps the request.
@@ -1122,6 +1496,37 @@ mod tests {
         assert_eq!(slice.misses.load(Ordering::Relaxed), 8);
     }
 
+    /// Two thin workers part by the counts the request's facts read: beside
+    /// a lent table that the rows' own fields contradict, a sliced miss
+    /// goes to the thin worker the table says is the least loaded.
+    #[test]
+    fn a_thin_miss_goes_to_the_thin_worker_the_lent_counts_say_is_least_loaded() {
+        let slice = warmup(0.25, 0);
+        // Level 64 (the median of 64, 64, 64, 0, 0): rows 3 and 4 are thin,
+        // and row 4 has the fewer requests by the counts lent.
+        let pool = [
+            sized(0, 3, 0, 64),
+            sized(1, 2, 0, 64),
+            sized(2, 4, 0, 64),
+            sized(3, 5, 0, 0),
+            sized(4, 1, 0, 0),
+        ];
+        let column = column(&pool);
+        let mut rows = rows(&pool);
+        let lent = Lent::take(&mut rows);
+        // The rows' own fields say the contrary.
+        rows[3].in_flight = 1;
+        rows[4].in_flight = 5;
+        let facts = lent.beside(&RequestFacts {
+            affinity: &column,
+            ..facts(16)
+        });
+        let kept = kept(rows.len() as u32);
+        let mut out = vec![0.0; rows.len()];
+        slice.score(&facts, &rows, &kept, &mut out);
+        assert_eq!(out, vec![0.0, 0.0, 0.0, 0.0, 1.0]);
+    }
+
     /// A few-block hit on a long request is a miss for the slice: at most
     /// four blocks held that cover less than half the request. A fifth
     /// block, or half the request, is a hit the slice leaves alone.
@@ -1282,6 +1687,10 @@ mod tests {
         }
         let shallow = [sized(0, 0, 7, 64), sized(1, 0, 0, 64), sized(2, 1, 0, 0)];
         assert_eq!(scores(&slice, &now, &shallow), vec![0.0, 0.0, 1.0]);
+        // A holder with more in flight than the thin worker gives its due
+        // deep hit up: the holder's count is read as the thin worker's is.
+        let busier = [sized(0, 4, 12, 64), sized(1, 0, 0, 64), sized(2, 1, 0, 0)];
+        assert_eq!(scores(&warmup(0.25, 1), &now, &busier), vec![0.0, 0.0, 1.0]);
     }
 
     /// A thin worker among a deep hit's deepest holders recomputes nothing:
@@ -1552,6 +1961,7 @@ mod tests {
             holders,
             warming,
             thin,
+            mean_in_flight: None,
         }
     }
 
@@ -1562,14 +1972,67 @@ mod tests {
         rows: &[Candidate],
         named: NamedAffinity<'_>,
     ) -> Vec<f32> {
-        let facts = RequestFacts {
+        // The rows' counts are lent beside them, as [`scores_beside`] lends
+        // them.
+        let mut rows = rows.to_vec();
+        let lent = Lent::take(&mut rows);
+        let facts = lent.beside(&RequestFacts {
             named: Some(named),
             ..*facts
-        };
+        });
         let kept = kept(rows.len() as u32);
         let mut out = vec![0.0; rows.len()];
-        scorer.score(&facts, rows, &kept, &mut out);
+        scorer.score(&facts, &rows, &kept, &mut out);
         out
+    }
+
+    /// Under no cap the two feeds are still one reading: a profile that
+    /// takes no sample is named every holder and every warming row. Over a
+    /// pool where thirty-three of forty rows hold the request, more than
+    /// any sample names, and two rows are thin, each stage scores the rows
+    /// named as the column they were derived from, turn by turn.
+    #[test]
+    fn every_holder_named_scores_as_the_column_past_any_cap() {
+        // Rows 0 to 23 hold the deepest match and rows 24 to 31 a shallower
+        // one; rows 38 and 39 are thin, and row 38 holds the deepest too.
+        let pool: Vec<Held> = (0..40u32)
+            .map(|row| match row {
+                0..=23 => sized(row, row % 3, 12, 64),
+                24..=31 => sized(row, row % 3, 4, 64),
+                38 => sized(row, 1, 12, 12),
+                39 => sized(row, 0, 0, 12),
+                _ => sized(row, row % 3, 0, 64),
+            })
+            .collect();
+        let each: Vec<NamedHolder> = pool
+            .iter()
+            .filter(|(_, held)| held.overlap_blocks > 0)
+            .map(|(row, held)| holder(row.position, held.overlap_blocks))
+            .collect();
+        assert_eq!(each.len(), 33);
+        let stage = affinity(None);
+        assert_eq!(
+            scores_named(
+                &stage,
+                &facts(16),
+                &rows(&pool),
+                named(&each, &[38, 39], true)
+            ),
+            scores(&stage, &facts(16), &pool)
+        );
+        let (by_column, by_named) = (warmup(0.25, 1), warmup(0.25, 1));
+        for turn in 0..8 {
+            assert_eq!(
+                scores_named(
+                    &by_named,
+                    &facts(16),
+                    &rows(&pool),
+                    named(&each, &[38, 39], true)
+                ),
+                scores(&by_column, &facts(16), &pool),
+                "turn {turn}"
+            );
+        }
     }
 
     /// The two feeds are one reading: over one pool, the rows a host named
@@ -1837,5 +2300,459 @@ mod tests {
             ),
             (0, 0)
         );
+    }
+
+    /// Behind a draw the rows handed are the drawn rows and the rows a host
+    /// named. The gate's mean is the drawn rows' alone: a busy holder lifts
+    /// a mean taken over the rows handed, and passes the gate it is judged
+    /// by.
+    #[test]
+    fn the_spill_gate_reads_the_drawn_rows_mean_where_the_engine_set_one() {
+        // The holder has 8 in flight and the two drawn rows 2 each. Over the
+        // rows handed the mean is 4: 8 is not past 4 + 4, the holder stays.
+        // Over the drawn rows it is 2: 8 is past 1.5 times 2 and past 2 + 4,
+        // the holder spills.
+        let pool = rows(&[candidate(0, 8, 0), candidate(1, 2, 0), candidate(2, 2, 0)]);
+        let stage = affinity(None);
+        let holders = [holder(0, 8)];
+        let held = named(&holders, &[], false);
+        assert_eq!(
+            scores_named(&stage, &facts(16), &pool, held),
+            vec![1.0, 0.5, 0.5]
+        );
+        let behind_a_draw = NamedAffinity {
+            mean_in_flight: Some(2.0),
+            ..held
+        };
+        assert_eq!(
+            scores_named(&stage, &facts(16), &pool, behind_a_draw),
+            vec![0.0, 0.5, 0.5]
+        );
+        // The slice's gate reads the same mean: a warming row that busy
+        // takes a miss by the mean of the rows handed, and none by the
+        // drawn rows'.
+        let warming = named(&[], &[0], true);
+        assert_eq!(
+            scores_named(&warmup(1.0, 0), &facts(16), &pool, warming),
+            vec![1.0, 0.0, 0.0]
+        );
+        let behind_a_draw = NamedAffinity {
+            mean_in_flight: Some(2.0),
+            ..warming
+        };
+        let slice = warmup(1.0, 0);
+        assert_eq!(
+            scores_named(&slice, &facts(16), &pool, behind_a_draw),
+            vec![1.0, 1.0, 1.0]
+        );
+        assert_eq!(slice.misses.load(Ordering::Relaxed), 0);
+    }
+
+    /// Behind a draw the rows handed stand in the draw's order, and both
+    /// stages read the rows a host named by a search: no pass looks behind
+    /// a cursor, where the walk of a whole read asked in that order does,
+    /// and the two read the same scores.
+    #[test]
+    fn behind_a_draw_the_stages_search_the_rows_named_and_keep_no_cursor() {
+        use crate::view::LOOKS_BEHIND;
+        let pool: Vec<Held> = (0..6).map(|row| candidate(row, 2, 0)).collect();
+        let pool = rows(&pool);
+        // A draw's order. The holders are shallow, so the slice takes the
+        // miss and asks its warming rows.
+        let order = [4u32, 1, 5, 0, 3, 2];
+        let holders = [holder(1, 4), holder(4, 4), holder(5, 3)];
+        let whole = named(&holders, &[0, 3], true);
+        // The mean of the rows handed, so both reads judge by one mean.
+        let drawn = NamedAffinity {
+            mean_in_flight: Some(2.0),
+            ..whole
+        };
+        let (prefix, slice) = (affinity(None), warmup(1.0, 0));
+        for stage in [&prefix as &dyn Scorer, &slice] {
+            let [by_walk, by_search] = [whole, drawn].map(|named| {
+                LOOKS_BEHIND.with(|looks| looks.set(0));
+                let facts = RequestFacts {
+                    named: Some(named),
+                    ..facts(16)
+                };
+                let mut out = vec![0.0; order.len()];
+                stage.score(&facts, &pool, &order, &mut out);
+                (out, LOOKS_BEHIND.with(std::cell::Cell::get))
+            });
+            assert_eq!(by_search.0, by_walk.0, "{}", stage.name());
+            assert!(by_walk.1 > 0, "{}: a walk looks behind", stage.name());
+            assert_eq!(by_search.1, 0, "{}: a search keeps no cursor", stage.name());
+        }
+    }
+
+    /// The prefix stage's body behind a draw scores as the whole pass's
+    /// does: over pools, holders, loads and orders drawn at random, under
+    /// a plain gate, a relative one and one that prices the held prefix,
+    /// a decode phase among them. Both reads judge by one mean.
+    #[test]
+    fn behind_a_draw_the_prefix_stage_scores_as_the_whole_pass_does() {
+        let gate = |prefix_margin_tokens| {
+            affinity(Some(SpillParams {
+                rel: Some(1.1),
+                prefix_margin_tokens,
+                ..SpillParams::default()
+            }))
+        };
+        let stages = [affinity(None), gate(None), gate(Some(8))];
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = |below: u64| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) % below
+        };
+        let mut reached = [0u32; 3];
+        for round in 0..3_000u32 {
+            let n = 1 + next(24) as u32;
+            let pool: Vec<Candidate> = (0..n)
+                .map(|row| candidate(row, next(40) as u32, 0).0)
+                .collect();
+            // Every fourth round names nobody.
+            let mut holders = Vec::new();
+            for row in 0..n {
+                if round % 4 != 0 && next(3) == 0 {
+                    holders.push(holder(row, 1 + next(16) as u32));
+                }
+            }
+            // A draw's order: some of the rows, each once.
+            let mut order: Vec<u32> = (0..n).filter(|&row| row == 0 || next(4) != 0).collect();
+            for i in (1..order.len()).rev() {
+                order.swap(i, next(i as u64 + 1) as usize);
+            }
+            let whole = named(&holders, &[], false);
+            let drawn = NamedAffinity {
+                mean_in_flight: Some(mean_in_flight(&RequestFacts::default(), &pool, &order)),
+                ..whole
+            };
+            let stage = &stages[round as usize % stages.len()];
+            let [by_pass, by_draw] = [whole, drawn].map(|named| {
+                let facts = RequestFacts {
+                    named: Some(named),
+                    phase: if round % 5 == 0 {
+                        Phase::Decode
+                    } else {
+                        Phase::Single
+                    },
+                    ..facts(16)
+                };
+                let mut out = vec![0.0; order.len()];
+                stage.score(&facts, &pool, &order, &mut out);
+                out
+            });
+            assert_eq!(
+                by_draw, by_pass,
+                "round {round}: {holders:?}, order {order:?}"
+            );
+            for (score, count) in [0.0, 0.5, 1.0].into_iter().zip(&mut reached) {
+                *count += u32::from(by_pass.contains(&score));
+            }
+        }
+        // The rounds reach every score.
+        assert!(reached.iter().all(|&rounds| rounds > 300), "{reached:?}");
+    }
+
+    /// A hit the slice diverts behind a draw reads the rows named by a
+    /// search too: its holders' load, its warming rows and a busy warming
+    /// row's entry look behind no cursor, where a whole read asked in that
+    /// order does, and the two divert to the same row.
+    #[test]
+    fn behind_a_draw_a_diverted_hit_searches_the_rows_named_and_keeps_no_cursor() {
+        use crate::view::LOOKS_BEHIND;
+        // Rows 1 and 4 hold the request deep. Of the thin rows 3 and 0 are
+        // busier than the holders, so the entry of each is read, and row 2
+        // takes the hit.
+        let pool: Vec<Held> = (0..)
+            .zip([6, 5, 1, 6, 5, 1])
+            .map(|(row, busy)| candidate(row, busy, 0))
+            .collect();
+        let pool = rows(&pool);
+        // A draw's order: each of the three reads meets a row behind the
+        // one before it.
+        let order = [4u32, 1, 5, 3, 0, 2];
+        let holders = [holder(1, 12), holder(4, 12)];
+        let whole = named(&holders, &[0, 2, 3], true);
+        let drawn = NamedAffinity {
+            mean_in_flight: Some(4.0),
+            ..whole
+        };
+        let [by_walk, by_search] = [whole, drawn].map(|named| {
+            LOOKS_BEHIND.with(|looks| looks.set(0));
+            let facts = RequestFacts {
+                named: Some(named),
+                ..facts(16)
+            };
+            let mut out = vec![0.0; order.len()];
+            // A stage of its own a read: a diversion reserves its row's
+            // window. Its first hit is due.
+            warmup(0.25, 1).score(&facts, &pool, &order, &mut out);
+            (out, LOOKS_BEHIND.with(std::cell::Cell::get))
+        });
+        assert_eq!(by_walk.0, [0.0, 0.0, 0.0, 0.0, 0.0, 1.0]);
+        assert_eq!(by_search.0, by_walk.0);
+        assert!(by_walk.1 > 0, "the walk looks behind");
+        assert_eq!(by_search.1, 0, "a search keeps no cursor");
+    }
+
+    /// A host that names a pool's warming rows enters the stage's own
+    /// ruling: for fleets of every kind the rows it is handed, and the bit,
+    /// are what the stage's pass rules over a column of the same sizes and
+    /// ages; a young row leaves the rows named with its window; and a
+    /// parameter of the stage moves the rows named.
+    #[test]
+    fn a_host_that_names_warming_rows_enters_the_stages_own_ruling() {
+        const NOW: u64 = 600_000_000;
+        let stage = warmup(0.25, 8);
+        let rule = stage.warm_rule().expect("the stage rules who warms");
+        // A row: its index size and how many seconds ago it was admitted.
+        let fleets: [&[(u32, u64)]; 8] = [
+            &[(40, 500), (40, 500), (4, 500), (40, 500)],
+            &[(40, 500), (40, 10), (0, 10), (40, 500)],
+            &[(6, 500), (2, 10), (7, 500), (3, 20)],
+            &[(0, 10), (0, 20), (0, 30)],
+            &[(0, 500), (0, 500)],
+            &[(50, 500), (50, 500)],
+            &[(40, 10), (40, 500), (5, 10)],
+            &[(9, 10), (3, 10), (6, 500), (7, 500)],
+        ];
+        // The rows a host names at `now` from the ruling's entry at `read`.
+        let read_at = |rule: &WarmRule, fleet: &[(u32, u64)], read: u64, now: u64| {
+            let sizes: Vec<u32> = fleet.iter().map(|row| row.0).collect();
+            let admitted: Vec<u64> = fleet.iter().map(|row| NOW - row.1 * 1_000_000).collect();
+            let (mut scratch, mut rows) = (Vec::new(), vec![(99, 0)]);
+            let warming = rule.name(&sizes, &admitted, read, &mut scratch, &mut rows);
+            let named = rows
+                .iter()
+                .filter(|&&(_, until)| warming.from <= now && now < until);
+            (
+                named.map(|&(row, _)| row).collect::<Vec<u32>>(),
+                warming.thin,
+            )
+        };
+        let named_by =
+            |rule: &WarmRule, fleet: &[(u32, u64)], now: u64| read_at(rule, fleet, now, now);
+        let mut seen = Vec::new();
+        for fleet in fleets {
+            let column: Vec<AffinityFacts> = fleet
+                .iter()
+                .map(|&(size, age)| AffinityFacts {
+                    admitted_age_ms: (age * 1_000) as u32,
+                    indexed_growth: size,
+                    indexed_blocks: size,
+                    ..AffinityFacts::default()
+                })
+                .collect();
+            let by_stage = stage.ruled(&column).map_or((Vec::new(), false), |warm| {
+                let mut warming = stage.warming::<false>(warm, Feed::Column(&column));
+                let rows: Vec<u32> = (0..column.len() as u32)
+                    .filter(|&row| warming(row))
+                    .collect();
+                (rows, warm.thin())
+            });
+            let named = named_by(&rule, fleet, NOW);
+            assert_eq!(named, by_stage, "{fleet:?}");
+            seen.push(named);
+        }
+        // The fleets hold each kind: the thin, the young, and nobody.
+        assert_eq!(seen[0], (vec![2], true));
+        assert_eq!(seen[2], (vec![1, 3], false));
+        assert_eq!(seen[3], (vec![], false));
+        // A young row is named until its window ends: sixty seconds from its
+        // admission.
+        assert_eq!(named_by(&rule, fleets[2], 639_999_999).0, vec![1, 3]);
+        assert_eq!(named_by(&rule, fleets[2], 640_000_000).0, vec![1]);
+        // The rows of one entry stand for every later instant while the
+        // sizes do: read then, they are the ruling's own of that instant.
+        let laters = [
+            1, 29_999_999, 30_000_000, 39_999_999, 40_000_000, 49_999_999, 50_000_000, 70_000_000,
+        ];
+        for fleet in fleets {
+            for later in laters {
+                let now = NOW + later;
+                let stood = read_at(&rule, fleet, NOW, now);
+                assert_eq!(stood, named_by(&rule, fleet, now), "{fleet:?} +{later}");
+            }
+        }
+        // A fleet that is all young names nobody until its first row is
+        // young no more, then the rest, each until its own end.
+        let all_young = |later: u64| read_at(&rule, fleets[3], NOW, NOW + later).0;
+        assert_eq!(all_young(29_999_999), Vec::<u32>::new());
+        assert_eq!(all_young(30_000_000), vec![0, 1]);
+        assert_eq!(all_young(40_000_000), vec![0]);
+        assert_eq!(all_young(50_000_000), Vec::<u32>::new());
+        // A parameter of the stage moves the rows named.
+        let fleet = [(40, 500), (40, 500), (15, 500), (40, 500)];
+        assert_eq!(named_by(&rule, &fleet, NOW).0, vec![2]);
+        let narrow = WarmupSliceParams {
+            thin_ratio: Some(0.25),
+            blocks: Some(8),
+            ..WarmupSliceParams::default()
+        };
+        let narrow = WarmupSlice::new(&narrow, Gates::of(None, None, Some(16)));
+        let narrow = narrow.warm_rule().expect("the stage rules who warms");
+        assert_eq!(named_by(&narrow, &fleet, NOW).0, Vec::<u32>::new());
+    }
+
+    #[test]
+    fn the_affinity_stages_answer_row_by_row_unless_the_fleet_kv_gate_is_configured() {
+        let kv = KvPressureParams {
+            spread: Some(0.3),
+            ..KvPressureParams::default()
+        };
+        let plain = Gates::of(None, None, Some(16));
+        let gated = Gates::of(None, Some(&kv), Some(16));
+        for (gates, row_wise) in [(plain, true), (gated, false)] {
+            let affinity = PrefixAffinity::new(&PrefixAffinityParams::default(), gates);
+            let slice = WarmupSlice::new(&WarmupSliceParams::default(), gates);
+            assert_eq!(
+                (affinity.row_wise(), slice.row_wise()),
+                (row_wise, row_wise)
+            );
+        }
+        assert!(KvPressure.row_wise());
+    }
+
+    /// The two ranks say the word their scores read as ([`Front::of`]), and
+    /// score a row alike by either entry. Seeded pools of one to forty
+    /// rows, a part of them kept: nobody, some or every row holds the
+    /// request, rows stand over and under the spill gate, and some rows
+    /// warm. Two builds of each stage are asked side by side, one by each
+    /// entry, so the slice's counters turn alike.
+    #[test]
+    fn the_ranks_say_the_word_their_scores_read_as() {
+        let spill = || {
+            Some(SpillParams {
+                abs: Some(64),
+                rel: Some(1.5),
+                ..SpillParams::default()
+            })
+        };
+        let plain: [Box<dyn Scorer>; 2] = [Box::new(affinity(spill())), Box::new(warmup(0.25, 3))];
+        let said: [Box<dyn Scorer>; 2] = [Box::new(affinity(spill())), Box::new(warmup(0.25, 3))];
+        let mut draw = Draw::new(0x51ce);
+        // The words said, a stage: alike, no row at the ceiling, one, more.
+        let mut words = [[0u32; 4]; 2];
+        for round in 0..4_000u64 {
+            let n = 1 + draw.below(40) as u32;
+            let odds = [0, 1, 2, 8][draw.below(4)];
+            let pool: Vec<Held> = (0..n)
+                .map(|i| {
+                    let holds = odds != 0 && draw.below(odds) == 0;
+                    let indexed = [0, 64][draw.below(2)];
+                    sized(i, draw.below(12) as u32, if holds { 8 } else { 0 }, indexed)
+                })
+                .collect();
+            let (rows, column) = (rows(&pool), column(&pool));
+            // One row in four is left out, and never every row.
+            let mut kept: Vec<u32> = (0..n).filter(|_| draw.below(4) != 0).collect();
+            if kept.is_empty() {
+                kept.push(draw.below(n as usize) as u32);
+            }
+            let facts = RequestFacts {
+                affinity: &column,
+                seed: round,
+                ..facts(16)
+            };
+            for (stage, (plain, said)) in plain.iter().zip(&said).enumerate() {
+                let mut by_score = vec![0.0; kept.len()];
+                let mut by_front = vec![0.0; kept.len()];
+                let band = plain.score(&facts, &rows, &kept, &mut by_score);
+                let (front_band, word) =
+                    said.score_front(&facts, &rows, &kept, &kept, &mut by_front);
+                let name = plain.name();
+                assert_eq!(by_front, by_score, "{name}, round {round}");
+                assert_eq!(front_band, band, "{name}, round {round}");
+                assert_eq!(
+                    word,
+                    Front::of(plain.spread(), &by_score),
+                    "{name}, round {round}: {by_score:?}"
+                );
+                let which = match word {
+                    Front::Alike => 0,
+                    Front::At(0) => 1,
+                    Front::At(1) => 2,
+                    _ => 3,
+                };
+                words[stage][which] += 1;
+            }
+        }
+        // Each stage said each of its words in some rounds: the holders'
+        // stage every one, the slice alike and its one row.
+        assert!(words[0].iter().all(|&rounds| rounds > 50), "{words:?}");
+        assert!(words[1][0] > 50 && words[1][2] > 50, "{words:?}");
+        assert_eq!((words[1][1], words[1][3]), (0, 0), "{words:?}");
+        // A lone kept row that takes the request stands at the ceiling,
+        // which reads alike.
+        let pool = [sized(0, 3, 0, 64), sized(1, 2, 0, 64), sized(2, 5, 0, 0)];
+        let (three, held) = (rows(&pool), column(&pool));
+        let fed = RequestFacts {
+            affinity: &held,
+            ..facts(16)
+        };
+        let mut lone = [0.0];
+        let (_, word) = warmup(0.25, 0).score_front(&fed, &three, &[2], &[2], &mut lone);
+        assert_eq!((lone, word), ([1.0], Front::Alike));
+        // A decision fed no column: the slice stands alike, and no row
+        // holds the request.
+        let unfed = facts(16);
+        let (mut slices, mut holds) = ([0.0; 3], [0.0; 3]);
+        let (_, word) =
+            warmup(0.25, 0).score_front(&unfed, &three, &kept(3), &kept(3), &mut slices);
+        assert_eq!((slices, word), ([1.0; 3], Front::Alike));
+        let (_, word) = affinity(None).score_front(&unfed, &three, &kept(3), &kept(3), &mut holds);
+        assert_eq!((holds, word), ([0.5; 3], Front::At(0)));
+        // The rows a host named say nothing, and score as by the plain
+        // entry: the second row holds the request and the third warms.
+        let holders = [holder(1, 8)];
+        let naming = RequestFacts {
+            named: Some(named(&holders, &[2], true)),
+            ..facts(16)
+        };
+        let pairs: [[Box<dyn Scorer>; 2]; 2] = [
+            [Box::new(affinity(None)), Box::new(affinity(None))],
+            [Box::new(warmup(0.25, 0)), Box::new(warmup(0.25, 0))],
+        ];
+        for [plain, said] in &pairs {
+            let (mut by_score, mut by_front) = ([0.0; 3], [0.0; 3]);
+            let band = plain.score(&naming, &three, &kept(3), &mut by_score);
+            assert_eq!(
+                said.score_front(&naming, &three, &kept(3), &kept(3), &mut by_front),
+                (band, Front::Unsaid),
+                "{}",
+                plain.name()
+            );
+            assert_eq!(by_front, by_score, "{}", plain.name());
+        }
+        // Under the fleet's KV gate both ranks stand alike.
+        let kv = KvPressureParams {
+            spread: Some(0.3),
+            ceiling: Some(0.9),
+            ..KvPressureParams::default()
+        };
+        let params = PrefixAffinityParams::default();
+        let gates = Gates::of(Some(&params), Some(&kv), Some(16));
+        let slicing = WarmupSliceParams {
+            share: Some(0.25),
+            ..WarmupSliceParams::default()
+        };
+        let gated: [Box<dyn Scorer>; 2] = [
+            Box::new(PrefixAffinity::new(&params, gates)),
+            Box::new(WarmupSlice::new(&slicing, gates)),
+        ];
+        let ceiling = [reporting(0, 0, 8, 950), reporting(1, 0, 0, 900)];
+        let (two, usage) = (rows(&ceiling), column(&ceiling));
+        let pressed = RequestFacts {
+            affinity: &usage,
+            ..facts(16)
+        };
+        for stage in &gated {
+            let mut out = [0.0; 2];
+            let (_, word) = stage.score_front(&pressed, &two, &kept(2), &kept(2), &mut out);
+            assert_eq!((out, word), ([1.0, 1.0], Front::Alike), "{}", stage.name());
+        }
     }
 }

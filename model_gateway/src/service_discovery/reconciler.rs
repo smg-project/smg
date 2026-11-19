@@ -23,6 +23,10 @@ use std::{
 };
 
 use openai_protocol::worker::WorkerSpec;
+use smg_worker::{
+    identity::endpoint::{Endpoint, EndpointKey},
+    registry::{WorkerId, WorkerOrigin},
+};
 use tokio::time;
 use tracing::{error, info, warn};
 
@@ -31,7 +35,6 @@ use crate::{
     app_context::AppContext,
     config::RouterConfig,
     observability::metrics::{metrics_labels, Metrics},
-    worker::{identity::endpoint::Endpoint, registry::WorkerId, EndpointKey, WorkerOrigin},
     workflow::{Job, WorkerRegistrationMode},
 };
 
@@ -40,7 +43,8 @@ use crate::{
 /// worker API (`WorkerService` refuses them).
 pub const DISCOVERY_LABEL_PREFIX: &str = "smg.ai/discovery-";
 /// Which provider owns the worker: `kubernetes`, `file`, `slurm` or `consul`.
-pub const DISCOVERY_PROVIDER_LABEL: &str = "smg.ai/discovery-provider";
+/// It lives in the worker crate, whose health checker reads it.
+pub use smg_worker::labels::DISCOVERY_PROVIDER_LABEL;
 /// The provider's stable identity for the worker instance.
 pub const DISCOVERY_ID_LABEL: &str = "smg.ai/discovery-id";
 /// BLAKE3 fingerprint of the `DiscoveredWorker` it was registered from. A

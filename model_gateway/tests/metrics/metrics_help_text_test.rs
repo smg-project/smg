@@ -12,6 +12,7 @@
 use std::collections::BTreeSet;
 
 use smg::observability::{metrics::Metrics, metrics_server::start_metrics_server};
+use smg_worker::metrics::writers::Metrics as WorkerMetrics;
 
 use crate::metrics::recorder;
 
@@ -42,16 +43,16 @@ async fn every_smg_family_has_help_text() {
     Metrics::record_worker_manual_policy_branch("vacant");
     Metrics::record_worker_consistent_hashing_policy_branch("routing_key_hit");
     Metrics::record_worker_prefix_hash_policy_branch("ring_hit");
-    Metrics::set_worker_routing_keys_active(worker, 1);
+    WorkerMetrics::set_worker_routing_keys_active(worker, 1);
     Metrics::record_pd_admission_wait();
     Metrics::record_pd_admission_shed();
     Metrics::record_worker_overload_shed("selection");
     Metrics::record_worker_retry("regular", "chat");
-    Metrics::set_worker_health(worker, true);
-    Metrics::set_worker_cb_state(worker, 0);
-    Metrics::record_worker_cb_transition(worker, "closed", "open");
+    WorkerMetrics::set_worker_health(worker, true);
+    WorkerMetrics::set_worker_cb_state(worker, 0);
+    WorkerMetrics::record_worker_cb_transition(worker, "closed", "open");
     // A worker of its own: the lag histogram test counts the samples on the workers it names.
-    Metrics::record_kv_event_lag("grpc://worker-help:50051", 0.004);
+    WorkerMetrics::record_kv_event_lag("grpc://worker-help:50051", 0.004);
 
     let body = smg::server::http_client()
         .get(format!("http://{addr}/metrics"))

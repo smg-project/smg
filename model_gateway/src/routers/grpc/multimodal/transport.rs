@@ -19,14 +19,17 @@ use std::{
 use llm_multimodal::{EncoderDtype, Modality};
 use openai_protocol::worker::{ConnectionMode, RuntimeType, TransportMode};
 use smg_mm_rdma::{RdmaConfig, RdmaExporter, STAGES_OVER_RDMA};
+use smg_worker::identity::basic::Worker;
 use tracing::{error, info, warn};
 
 use super::{encoder_budget::WIRE_MESSAGE_CAP, serialize::wire_dtype, settings::mm_settings};
-use crate::{
-    routers::grpc::{
-        backend_client::BackendClient, context::WorkerSelection, proto_wrapper::mm_shm_dev_writable,
+use crate::routers::{
+    common::snapshot::{RoutingPool, WorkerRegistry, WorkerRegistryExt},
+    grpc::{
+        backend_client::{connected_backend_client, BackendClient},
+        context::WorkerSelection,
+        proto_wrapper::mm_shm_dev_writable,
     },
-    worker::{RoutingPool, Worker, WorkerRegistry},
 };
 
 const DEFAULT_SHM_MIN_BYTES: usize = 64 * 1024;
@@ -523,7 +526,7 @@ fn with_worker_encoder_dtype<T>(
     let Some(worker) = primary_worker(workers) else {
         return read(None);
     };
-    let backend = worker.backend_client_if_initialized();
+    let backend = connected_backend_client(worker.as_ref());
     read(encoder_dtype_label_with_backend(
         worker.as_ref(),
         backend.as_deref(),
@@ -624,7 +627,7 @@ fn agree_on_image_wire_dtype<'a>(
     overrides: &DtypeOverrides,
 ) -> Option<()> {
     for worker in workers {
-        let backend = worker.backend_client_if_initialized();
+        let backend = connected_backend_client(worker.as_ref());
         let dtype = image_wire_dtype_with_backend(worker.as_ref(), overrides, backend.as_deref())?;
         match agreed {
             None => *agreed = Some(dtype),
@@ -897,8 +900,11 @@ mod allocation_pins;
 
 #[cfg(test)]
 mod tests {
+    use openai_protocol::model_card::ModelCard;
+    use smg_worker::{identity::basic::WorkerType, test_support::no_health_check};
+
     use super::*;
-    use crate::worker::{test_support::no_health_check, BasicWorkerBuilder, ModelCard, WorkerType};
+    use crate::routers::grpc::backend_client::BasicWorkerBuilder;
 
     fn worker(url: &str, runtime: RuntimeType, labels: &[(&str, &str)]) -> Arc<dyn Worker> {
         let mut builder = BasicWorkerBuilder::new(url)
@@ -1079,7 +1085,7 @@ mod tests {
                 .build(),
         );
         let policy = DtypeOverrides::default();
-        let pending_backend = pending.backend_client_if_initialized();
+        let pending_backend = connected_backend_client(pending.as_ref());
         assert_eq!(shared_image_wire_dtype(&[pending], &policy), None);
 
         for (advertised, explicit, expected) in [
@@ -1137,7 +1143,7 @@ mod tests {
                 .runtime_type(RuntimeType::Sglang)
                 .connection_mode(ConnectionMode::Zmq)
                 .health_config(no_health_check())
-                .backend_client(BackendClient::Zmq(client.unwrap()));
+                .engine_connection(BackendClient::Zmq(client.unwrap()));
             if let Some(dtype) = explicit {
                 builder = builder.label("multimodal_encoder_dtype", dtype);
             }
@@ -1148,7 +1154,7 @@ mod tests {
             assert_eq!(mm_sglang_encoder_input_dtype(Some(&workers)), expected);
             // Retain the snapshot from before initialization while the worker
             // now has a live backend. The planner must not resample that backend.
-            assert!(worker.backend_client_if_initialized().is_some());
+            assert!(worker.engine_connection_if_initialized().is_some());
             assert_eq!(
                 image_wire_dtype_with_backend(worker.as_ref(), &policy, pending_backend.as_deref()),
                 explicit.map(|_| expected),
@@ -1167,9 +1173,11 @@ mod tests {
     /// are the settings module's tests.
     #[test]
     fn the_one_pass_wire_write_is_the_default_and_its_switch_turns_it_off() {
-        use crate::{
-            routers::grpc::{mode::Mode, multimodal::MultimodalSettings},
-            worker::{ConnectionMode, WorkerRegistry},
+        use smg_worker::identity::basic::ConnectionMode;
+
+        use crate::routers::{
+            common::snapshot::WorkerRegistry,
+            grpc::{mode::Mode, multimodal::MultimodalSettings},
         };
 
         let registry = WorkerRegistry::new();
@@ -1214,10 +1222,11 @@ mod tests {
     #[test]
     fn the_image_wire_cap_holds_only_for_an_inline_grpc_fleet() {
         use openai_protocol::worker::WorkerSpec;
+        use smg_worker::identity::basic::ConnectionMode;
 
-        use crate::{
-            routers::grpc::{mode::Mode, proto_wrapper::mm_shm_dev_writable},
-            worker::{ConnectionMode, WorkerRegistry},
+        use crate::routers::{
+            common::snapshot::WorkerRegistry,
+            grpc::{mode::Mode, proto_wrapper::mm_shm_dev_writable},
         };
 
         let pools = Mode::Regular.multimodal_wire_pools();
@@ -1355,10 +1364,9 @@ mod tests {
     /// over the union, never a wire for the wrong pool.
     #[test]
     fn the_wire_dtype_is_resolved_over_the_pools_a_modes_pixels_can_reach() {
-        use crate::{
-            routers::grpc::mode::Mode,
-            worker::{ConnectionMode, WorkerRegistry},
-        };
+        use smg_worker::identity::basic::ConnectionMode;
+
+        use crate::routers::{common::snapshot::WorkerRegistry, grpc::mode::Mode};
 
         let plain = DtypeOverrides::default();
         let registry = WorkerRegistry::new();

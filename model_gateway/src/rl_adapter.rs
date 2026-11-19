@@ -14,12 +14,17 @@ use smg_rl::{
     resolve_control_url, CallFailure, RankReply, RlControlCalls, RlState, RlWorkerInfo,
     RlWorkerView,
 };
+use smg_worker::{
+    connection::http_client::WorkerHttpClientCache, identity::basic::Worker, registry::WorkerId,
+};
 use tracing::warn;
 
 use crate::{
     config::RouterConfig,
-    routers::grpc::backend_client::BackendClient,
-    worker::{registry::WorkerId, Worker, WorkerHttpClientCache, WorkerRegistry},
+    routers::{
+        common::snapshot::WorkerRegistry,
+        grpc::backend_client::{connected_backend_client, get_backend_client, BackendClient},
+    },
 };
 
 /// Label an engine (or an operator) sets to name the worker's RL control app.
@@ -120,7 +125,7 @@ impl RegistryRlView {
         // at its word until it lands.
         let control_calls = (*worker.connection_mode() == ConnectionMode::Zmq
             && spec.runtime_type == RuntimeType::TokenSpeed
-            && worker.backend_client_if_initialized().is_none_or(|client| {
+            && connected_backend_client(worker.as_ref()).is_none_or(|client| {
                 matches!(client.as_ref(), BackendClient::Zmq(client) if client.carries_control_calls())
             }))
             .then(|| {
@@ -171,9 +176,7 @@ impl RlControlCalls for EngineConnectionControl {
         body: Option<serde_json::Value>,
         timeout: Duration,
     ) -> Result<Vec<RankReply>, CallFailure> {
-        let client = self
-            .worker
-            .get_backend_client()
+        let client = get_backend_client(self.worker.as_ref())
             .await
             .map_err(|e| CallFailure::Failed(format!("the engine is not connected: {e}")))?
             .ok_or_else(|| {
@@ -240,7 +243,10 @@ mod tests {
     use openai_protocol::worker::ConnectionMode;
 
     use super::*;
-    use crate::{config::RouterConfig, server::http_client, worker::BasicWorkerBuilder};
+    use crate::{
+        config::RouterConfig, routers::grpc::backend_client::BasicWorkerBuilder,
+        server::http_client,
+    };
 
     fn view_with(config: &RouterConfig, workers: Vec<Arc<dyn Worker>>) -> RegistryRlView {
         let registry = Arc::new(WorkerRegistry::new());

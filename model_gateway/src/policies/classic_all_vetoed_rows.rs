@@ -5,18 +5,18 @@
 //! policy the pool runs under, whether shedding is on, a list of steps and
 //! what the gateway's single-worker placement answered at each request. The
 //! policy controller crate replays the rows through its own decision
-//! (`crates/policy_controller/tests/classic/all_vetoed.rs`).
+//! (`crates/policy_controller/tests/classic_rows.rs`).
 //!
 //! A request's answer is the worker it was placed on, by its place in the
 //! row's list. A request that is placed nowhere is recorded as a number past
 //! the last worker: the count of the workers when the gateway sheds it as an
 //! overload shed, the count plus one when it finds no worker to use.
 //!
-//! This file is not part of the gateway. It is kept beside the recorded rows
-//! with the commit it records from, and run in a checkout of that commit:
-//! copy it to `model_gateway/src/policies/classic_all_vetoed_rows.rs`, add
-//! `#[cfg(test)] mod classic_all_vetoed_rows;` to
-//! `model_gateway/src/policies/mod.rs`, then
+//! This file is an ignored test of the gateway crate, kept beside the code
+//! it runs. It records from the checkout it is built in and writes the sheet
+//! under `CLASSIC_ROWS_OUT`, naming `CLASSIC_ROWS_COMMIT` as the commit it
+//! recorded from. The sheets the policy controller crate replays are in
+//! `crates/policy_controller/tests/classic/sheets`; to record this one again:
 //!
 //! ```text
 //! CLASSIC_ROWS_OUT=<dir> CLASSIC_ROWS_COMMIT=<commit> \
@@ -43,13 +43,14 @@ use std::{fs, path::PathBuf, sync::Arc};
 use http::HeaderMap;
 use openai_protocol::worker::WorkerStatus;
 use serde::Serialize;
+use smg_worker::{identity::basic::Worker, runtime::StallReason, test_support::ready_worker};
 
 use super::PolicyRegistry;
 use crate::{
     config::types::PolicyConfig,
-    routers::common::placement::{self, PlacementFailure, PlacementInputs},
-    worker::{
-        runtime::StallReason, test_support::ready_worker, RoutingPool, Worker, WorkerRegistry,
+    routers::common::{
+        placement::{self, PlacementFailure, PlacementInputs},
+        snapshot::{RoutingPool, WorkerRegistry},
     },
 };
 

@@ -19,20 +19,27 @@ use llm_tokenizer::{
 };
 use serde::{Deserialize, Serialize};
 use smg_grpc_client::{tokenizer_bundle, tokenizer_bundle::StreamBundle};
+use smg_worker::identity::basic::{ConnectionMode, Worker};
 use tracing::{debug, error, info, warn};
 use wfaas::{
     BackoffStrategy, FailureAction, RetryPolicy, StepDefinition, StepExecutor, StepId, StepResult,
     WorkflowContext, WorkflowDefinition, WorkflowError, WorkflowResult,
 };
 
-use super::data::TokenizerWorkflowData;
+use super::data::{require_app_context, TokenizerWorkflowData};
 use crate::{
     app_context::AppContext,
     config::{TokenizerCacheConfig, TEMPLATE_PARSER},
-    routers::grpc::multimodal::{
-        load_image_preprocessor_config, load_video_preprocessor_config, MultimodalModelConfig,
+    routers::{
+        common::snapshot::WorkerRegistry,
+        grpc::{
+            backend_client::get_backend_client,
+            multimodal::{
+                load_image_preprocessor_config, load_video_preprocessor_config,
+                MultimodalModelConfig,
+            },
+        },
     },
-    worker::{ConnectionMode, Worker, WorkerRegistry},
     workflow::steps::local::ReleaseTokenizerStep,
 };
 
@@ -272,12 +279,7 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
         context: &mut WorkflowContext<TokenizerWorkflowData>,
     ) -> WorkflowResult<StepResult> {
         let config = &context.data.config;
-        let app_context = context
-            .data
-            .app_context
-            .as_ref()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?
-            .clone();
+        let app_context = require_app_context(context.data.app_context.as_ref())?.clone();
 
         info!(
             "Loading tokenizer '{}' (id: {}) from source: {}{}",
@@ -590,7 +592,7 @@ async fn fetch_tokenizer_from_worker(
 async fn fetch_bundle(worker: &dyn Worker) -> Result<StreamBundle, String> {
     let runtime = worker.metadata().spec.runtime_type;
 
-    let backend_client = match worker.get_backend_client().await {
+    let backend_client = match get_backend_client(worker).await {
         Ok(Some(client)) => client,
         Ok(None) => {
             return Err(format!(
@@ -749,13 +751,13 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use openai_protocol::{model_card::ModelCard, worker::WorkerType};
+    use smg_worker::test_support::no_health_check;
     use wfaas::WorkflowInstanceId;
 
     use super::*;
     use crate::{
-        app_context::testing::app_context_for_tests,
-        config::RouterConfig,
-        worker::{test_support::no_health_check, BasicWorkerBuilder},
+        app_context::testing::app_context_for_tests, config::RouterConfig,
+        routers::grpc::backend_client::BasicWorkerBuilder,
     };
 
     #[test]

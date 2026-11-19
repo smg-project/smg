@@ -25,9 +25,9 @@ use http_body_util::BodyExt;
 use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
 use smg::{
     config::{RouterConfig, RoutingMode},
-    routers::RouterFactory,
-    worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType},
+    routers::{grpc::backend_client::BasicWorkerBuilder, RouterFactory},
 };
+use smg_worker::identity::basic::{ConnectionMode, RuntimeType, WorkerType};
 use tokio::{net::TcpListener, task::JoinHandle, time::Instant};
 use tower::ServiceExt;
 

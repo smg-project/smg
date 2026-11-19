@@ -127,10 +127,20 @@ and never schedules. vLLM's `--allowed-media-domains`,
 `--allowed-local-media-path`, `--media-io-kwargs`, `--limit-mm-per-prompt` and
 `VLLM_*_FETCH_TIMEOUT` govern fetching on the worker; without
 `--allowed-media-domains` the worker fetches from any public host the router
-forwards. A media URL that names or resolves to a loopback, link-local or
+forwards. The worker reads that list as the router reads its own, for vLLM's
+check of the first URL and for its own check of every redirect: entries are
+trimmed and compared case-insensitively (an entry with padding or capitals,
+which used to match no host, now matches its host), and an IPv6 address is
+listed in brackets (`[2001:db8::1]`). vLLM's check wants the first URL to spell
+an IPv6 address as the entry does; on redirects any spelling of the address
+matches. A list whose entries are all blank still refuses every host. A media
+URL whose host carries an IPv6 zone ID (`[fe80::1%25eth0]`) is refused, as on
+the router, and an entry with one is ignored with a warning. A media URL that
+names or resolves to a loopback, link-local or
 private address is refused on the worker as on the router, redirects included,
-unless `SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS=1` is set for a deployment whose media
-origin is internal.
+unless `--mm-allow-private-media-hosts` (the sidecar's
+`--allow-private-media-hosts`, or `SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS=1`) is set
+for a deployment whose media origin is internal.
 Related knobs: `--mm-max-inflight` (`SMG_VLLM_MM_MAX_INFLIGHT`, default 64)
 bounds concurrent media jobs; `--mm-max-items` (`SMG_VLLM_MM_MAX_ITEMS`, unset
 by default) overrides the model's per-modality reference limits;
@@ -180,6 +190,17 @@ is a 400; a host that does not deliver within the budget, answers 5xx or
 breaks the transfer is a 502, so a client knows whether to retry. None of
 these counts against the worker's circuit breaker, and the Router replays
 none of them on another worker, which would meet the same media.
+
+For `nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B`, the router can preprocess
+audio from `/v1/chat/completions` with `--mm-processing router`. Use a vLLM
+engine with native `Nemotron3_5TranscribeForConditionalGeneration` support;
+the worker's `--mm-processor off` accepts the router's prepared tensors.
+SMG downmixes and resamples to 16 kHz, expands each `<|audio|>` placeholder,
+and sends padded `audio_signal` rows with their true CPU `audio_signal_length`
+values. Mel extraction stays in the model's audio tower. This path supports
+`input_audio` and `audio_url` content parts, including multiple clips; it does
+not add an `/v1/audio/transcriptions` endpoint. The Rust worker's `smg` mode
+still has the audio-reference limitation described below.
 
 On the router side, `--mm-processing` selects `auto` (default: forward when
 every registered worker of the model advertises `mm_processor` and the model's
@@ -1023,6 +1044,16 @@ disaggregation role; under attention data parallelism the servicer routes a
 request by load, not by rank, so each prefill shape, the chunk remainders
 included, warms one rank and the log says so: there the remainder hazard
 stays open on the ranks a count did not reach until the wire can pin a rank),
+`SMG_TOKENSPEED_SERVICER_WARMUP_REMAINDERS` (whether the `full` level plans
+those remainders: `auto`, the default, on an engine of more than one process
+or of an unknown layout, as above; `on` whatever the layout; `off` never, for
+an engine that loads those kernels itself before it reports ready, with a
+WARNING at start on an engine of more than one process or of an unknown
+layout; any other value refuses to start, on either servicer and whatever
+the warm-up level or the role: one ERROR line and exit code 2 before the
+engine starts; the engine's prefill graphs do not cover the remainders,
+since those library GEMMs run eagerly, in the attention graph break or the
+eager narrowing layer, at each forward's real token count),
 `SMG_TOKENSPEED_SERVICER_STARTUP_TIMEOUT_SECS` (default 1800) and
 `SMG_TOKENSPEED_SERVICER_STARTUP_CEILING_SECS` (default 14400; the two startup
 bounds as for vLLM above: the launcher reports the scheduler process alive each
@@ -1145,6 +1176,16 @@ livenessProbe:
 ```bash
 sglang serve --model-path meta-llama/Llama-2-7b-hf --grpc-mode
 ```
+
+With an object storage source (`s3://`, `gs://`, or `az://`), the frontend
+prepares SGLang's metadata cache before reading model configuration. Weights
+keep streaming from the original URI; only metadata is downloaded to disk.
+Both servicers use that local cache for `GetTokenizer`, so the gateway can
+fetch the tokenizer, chat templates, generation and processor configs from
+the worker without object storage credentials or a shared filesystem.
+The checkpoint must include those files. An explicit `--tokenizer-path`
+selects its own tokenizer source, including a local directory or Hub ID.
+Metadata download errors stop startup before the gRPC server binds.
 
 Without `--kv-events-config`, the servicer turns SGLang's ZMQ KV-event
 publisher on by itself, under either implementation, before the schedulers are
