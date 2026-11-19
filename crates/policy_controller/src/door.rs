@@ -846,9 +846,10 @@ pub(crate) struct Viewed<'a> {
 /// applies.
 ///
 /// A stage's call that panics is held here, whoever applies: a decider
-/// inside a decision or as it takes up or leaves its work, a session, the
-/// gateways' sweep, a host's own thread. The lease's event stands on file
-/// as applied and the fault is counted on the store
+/// inside a decision, as it takes up or leaves its work or behind the
+/// give-up of an answer its stream refused, a session, the gateways'
+/// sweep, a host's own thread. The lease's event stands on file as
+/// applied and the fault is counted on the store
 /// ([`MemoryStore::lifecycle_faults`]). It costs no request its decision
 /// and ends no thread.
 pub(crate) fn told(
