@@ -77,16 +77,18 @@
 # bytes further (0x0c0 to 0x240 of its page). The hosted job failed `decide/cache_aware/8` at +10.4 % with
 # every run apart, and six more rows of four presets read +3.9 to +8.7 %, every run apart (2026-11-15). Each
 # of the seven runs the same instruction count on both sides, 3,234 to 16,657 an iteration. So
-# `count = true`: an id that still fails after its re-measurement, within twice its threshold, is counted
-# on both binaries under valgrind's callgrind (scripts/bench_gate.py) until the run's budget ends
-# (`run_budget` below). It is a placement, reported with the count and the two places and not failed, on
-# three facts: the same count in every batch after the first, a measured function that starts at another
-# address in the pull request's binary, and a change within twice the id's threshold. The same count with
-# the function where it was leaves the failure. An id beyond twice its threshold, one whose base median is
-# zero and one whose turn the budget cuts are not counted: each keeps the time's verdict, and its line says
-# why. Two counts that differ are each taken once more, and the failure stands. That job's own results read
-# PASS under it with one placement: `decide/cache_aware/8`, +10.4 % against 10 %, 4,001 instructions an
-# iteration on both sides, the decision at 0x0c0 of its page in one binary and at 0x240 in the other.
+# `count = true`: an id that still fails after its re-measurement is counted on both binaries under
+# valgrind's callgrind (scripts/bench_gate.py) until the run's budget ends (`run_budget` below). It is a
+# placement, reported with the count and the two places and not failed, on three facts: the same count in
+# every batch after the first, a measured function that starts at another address in the pull request's
+# binary, and a change within twice the id's threshold. The same count with the function where it was
+# places nothing, and no count places an id beyond twice its threshold. An id that still fails on a count
+# that reads level is measured again from a fresh copy of each binary, and fails where that measurement
+# fails it too. An id whose base median is zero and one whose turn the budget cuts are not counted: each
+# keeps the time's verdict, and its line says why. Two counts that differ are each taken once more, and
+# neither places the id. That job's own results read PASS under it with one placement:
+# `decide/cache_aware/8`, +10.4 % against 10 %, 4,001 instructions an iteration on both sides, the decision
+# at 0x0c0 of its page in one binary and at 0x240 in the other.
 #
 # A whole pass. The `decide/` ids that score the pool time a whole decision: about 150 code lines of 64
 # bytes over 16 to 20 pages, where a set of the processor's op cache holds four or five. Every build
@@ -123,10 +125,11 @@
 # instructions an iteration more or fewer from one process to the next (0.01 to 0.03 %): it reads as moved
 # when each side happens to repeat itself, as not steady otherwise. `decide/manual_keyed_miss/8` and
 # `spec/parse_validate` differ between two counts of one binary by 0.03 to 3.3 %. Each keeps the time's
-# verdict. The count does not see a change that runs the same instructions slower (a load that misses, a
-# branch that stops predicting): where its measured function moved too, or for a marked id on any level
-# count, such a row reads as a placement up to twice its threshold, by name, in the summary. A placement is
-# still a row to read.
+# verdict, which a second measurement decides where every count is within half a percent. The count does
+# not see a change that runs the same instructions slower (a load that misses, a branch that stops
+# predicting): where its measured function moved too, or for a marked id on any level count, such a row
+# reads as a placement up to twice its threshold, by name, in the summary. A placement is still a row to
+# read.
 #
 # A build that starts every function on a page of its own was read on the same pairs and not taken. The pull
 # request's head against its parent reads level under it (-2.2 to +4.1 % on the seven rows, fifteen runs a
