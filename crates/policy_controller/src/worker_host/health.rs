@@ -6,6 +6,13 @@
 //! registry under separate locks. Its status mirror reads the row under
 //! the same mutation lock as the adapter and writes through the
 //! registry as the adapter does.
+//!
+//! The store guards a write by the row's id and revision, and a row's id is
+//! its key and incarnation. A URL's next life under another incarnation is
+//! another row: an outcome of the earlier life's object finds no row under
+//! the id it names and writes nothing. So the guard tells lives apart where
+//! the host numbers each life apart, as a registration door does with
+//! [`life`](crate::store::membership::life).
 
 use std::sync::Arc;
 
@@ -115,7 +122,7 @@ mod tests {
     use super::*;
     use crate::{
         store::{
-            HealthPolicy, LeasesStore, MemoryStore, WorkerFacts, WorkerPatch,
+            membership::life, HealthPolicy, LeasesStore, MemoryStore, WorkerFacts, WorkerPatch,
             WorkerStatus as RowStatus, WorkersStore,
         },
         worker_host::{object, Members, SoleLead},
@@ -342,6 +349,34 @@ mod tests {
         );
         assert_eq!(adapter.connected(&replica.id, replica.revision), None);
         replica.assert_statuses(None, ObjectStatus::Pending);
+    }
+
+    /// A URL's next life, numbered as a registration door numbers one, is
+    /// another row under another id. An outcome of the earlier life's
+    /// object, which the holder has not ended yet, finds no row under the id
+    /// it names and writes nothing on the new one.
+    #[test]
+    fn an_outcome_of_a_urls_earlier_life_writes_nothing_on_its_next() {
+        let replica = Replica::new(1, true).expect("a laid worker");
+        let adapter = replica.adapter();
+        let earlier = replica.store.by_key(URL).expect("a row");
+        assert!(replica.store.remove(earlier.id, earlier.revision).is_some());
+        let next = replica
+            .store
+            .upsert(WorkerFacts {
+                incarnation: life(1, 0, replica.store.epoch()),
+                ..earlier.facts.clone()
+            })
+            .id();
+        assert_ne!(next, earlier.id, "another life takes another id");
+
+        // The holder has not followed: its object is the earlier life's.
+        assert_eq!(
+            adapter.probe_outcome(&replica.id, true, replica.revision, ObjectStatus::Pending),
+            ProbeAnswer::Stale
+        );
+        assert_eq!(adapter.connected(&replica.id, replica.revision), None);
+        replica.assert_statuses(Some(RowStatus::Pending), ObjectStatus::Pending);
     }
 
     #[test]
