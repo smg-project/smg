@@ -1897,6 +1897,31 @@ async fn a_dropped_collector_says_nothing_to_its_sink() {
     assert_eq!(*sink.said.lock(), said_before, "the drop says nothing");
 }
 
+/// Dropping a collector stops the lazy pushed-report flusher after it has
+/// published a record and returned to waiting for another notification.
+#[tokio::test(start_paused = true)]
+async fn dropping_a_monitor_stops_its_parked_pushed_flusher() {
+    let (registry, monitor) = build_monitor();
+    let worker = ready_worker("http://w:1", "m");
+    registry.register(Arc::clone(&worker)).unwrap();
+    monitor.apply_pushed_load(&worker, 0, &pushed(1), Instant::now());
+    tokio::time::sleep(PUSHED_PUBLISH_WINDOW + PUSHED_PUBLISH_WINDOW).await;
+    assert_eq!(monitor.pending_pushed_len(), 0, "the record was published");
+
+    let flusher = monitor
+        .pushed_flush_task
+        .lock()
+        .as_ref()
+        .expect("the pushed record started its flusher")
+        .abort_handle();
+    assert!(!flusher.is_finished(), "the flusher is parked");
+
+    drop(monitor);
+    tokio::task::yield_now().await;
+
+    assert!(flusher.is_finished(), "drop stopped the pushed flusher");
+}
+
 /// Register `worker` and put it under the overload veto by another hand.
 fn veto(registry: &WorkerRegistry, worker: &Arc<dyn Worker>) {
     registry.register(Arc::clone(worker)).unwrap();
