@@ -3890,33 +3890,10 @@ impl LeftLent {
         Self::of(&runtime(), row)
     }
 
-    /// As [`Self::by_a_thread_that_exited`], the first thread deciding a
-    /// pair as decider 1 ahead of the decision it leaves lent. Both sides
-    /// are the plugin's: the second side's open checks the hold the first
-    /// brought, so the place remembers the pair's decision.
-    fn by_a_thread_that_checked_a_hold_and_exited(name: &str) -> Self {
-        let row = spec(name, guest::record_guest(), mode::LOG_IN_DESTRUCTOR);
-        Self::of_behind(&runtime(), row, |left| {
-            let side = || plugin_profile(&left.plugin, None, None, None);
-            let pair = pair_engine(vec![side(), side()], 1);
-            let before = left.plugin.stats().answered;
-            let _turn = Decider::new(1).enter();
-            let _ = pair_decide(&pair);
-            let answered = left.plugin.stats().answered - before;
-            assert!(answered > 4, "both sides asked the plugin: {answered}");
-        })
-    }
-
     /// As [`Self::by_a_thread_that_exited`], the plugin loaded from `row` on
     /// `runtime`: a guest of the row's mode writes a log line in its
     /// destructor.
     fn of(runtime: &Arc<Runtime>, row: PluginSpec) -> Self {
-        Self::of_behind(runtime, row, |_| {})
-    }
-
-    /// As [`Self::of`], the first thread doing `earlier` ahead of the
-    /// decision whose close panics.
-    fn of_behind(runtime: &Arc<Runtime>, row: PluginSpec, earlier: fn(&Self)) -> Self {
         let name = row.name.clone();
         let plugin = loaded(runtime, row);
         let engine = single_engine(Profile {
@@ -3935,12 +3912,11 @@ impl LeftLent {
             place: thread_local::ThreadLocal::new(),
         };
         left.place.get_or_default().set(false);
+        panic_in_a_line_of(&name);
         let ended = std::thread::scope(|scope| {
             scope
                 .spawn(|| {
                     left.place.get_or_default().set(true);
-                    earlier(&left);
-                    panic_in_a_line_of(&name);
                     let _turn = Decider::new(1).enter();
                     decide(&left.engine, &left.candidates, 1)
                 })
@@ -4083,37 +4059,6 @@ fn a_turn_under_the_same_name_in_a_place_left_lent_runs_on_the_state_at_rest() {
         shared,
         Some((true, [0, 1], (2, false), 0, 2)),
         "the second thread's turn as decider 1 heard the two changes on the state at rest, kept no instance of the stale hold, and left that state at rest"
-    );
-}
-
-/// The number a place remembers is one decision's alone. The first thread
-/// decides a pair as decider 1, whose second open checks the hold its first
-/// brought, and then exits with decider 1's instance in its place: the
-/// place remembers the pair's decision. The rest is the case's above. The
-/// thread that takes the place acts as decider 1 under a later number. It
-/// checks the hold, finds it stale and decides on the state at rest. A
-/// remembered number that stood for any decision would let that turn run on
-/// the instance the first thread left.
-#[test]
-fn a_number_a_place_remembers_is_no_later_decisions() {
-    // One pair, as above.
-    let pair = || {
-        let left = LeftLent::by_a_thread_that_checked_a_hold_and_exited("remembered");
-        let before = left.two_turns_then_two_members();
-        let (shared, turn) = left.taken(|left| (left.heard_as_decider_1(), left.plugin.is_warm()));
-        (
-            shared,
-            before,
-            turn,
-            left.heard_as_decider_1(),
-            left.plugin.stats().instantiations,
-        )
-    };
-    let shared = (0..PLACES).map(|_| pair()).find(|(shared, ..)| *shared);
-    assert_eq!(
-        shared,
-        Some((true, [0, 1], (2, false), 0, 2)),
-        "the second thread's turn checked the hold under its own number and ran on the state at rest"
     );
 }
 
@@ -8760,6 +8705,8 @@ enum Inside {
     HandsAMember(WorkerId),
     /// Moves the case's own clock to a time, in microseconds.
     MovesTheClock(&'static AtomicU64, u64),
+    /// Lets another thread take a whole turn as a decider, and exit.
+    TurnsElsewhereAs(Decider),
 }
 
 thread_local! {
@@ -8815,6 +8762,18 @@ impl smg_policy_controller::DecisionScope for ActsInside {
                     .on_membership(&smg_policy_controller::Membership::Added(worker));
             }
             Inside::MovesTheClock(clock, to) => clock.store(to, Ordering::Relaxed),
+            Inside::TurnsElsewhereAs(other) => {
+                let tells = &self.tells;
+                std::thread::scope(|scope| {
+                    scope
+                        .spawn(|| {
+                            let _turn = other.enter();
+                            let _ = decide(tells, &pool(4), 1);
+                        })
+                        .join()
+                        .expect("the thread that takes its turn elsewhere");
+                });
+            }
         }
     }
 
@@ -8919,6 +8878,51 @@ fn a_thread_whose_name_ends_gives_the_held_decider_back_before_it_acts_as_itself
             .expect("the thread that acts as the first decider")
     });
     assert_eq!(as_first, Some(102), "its two dispatches and no more");
+}
+
+/// Both opens of a decision run on the instance its bring brought. A
+/// thread acts as a decider whose instance heard two dispatches, and
+/// decides a pair. Between the pair's two opens another thread takes a
+/// whole turn as that decider: the rest then names that thread's place and
+/// keeps an instance that heard none. The pair's second side still decides
+/// on the instance its first side brought. An open that checked that hold
+/// would find it stale, drop it and decide on the instance at rest.
+#[test]
+fn both_opens_of_a_pair_decide_on_the_instance_its_bring_brought() {
+    let runtime = runtime();
+    let plugin = load(
+        &runtime,
+        "one-pair",
+        guest::record_guest(),
+        mode::COUNT_DISPATCHES,
+    );
+    let plain = Arc::new(plugin_engine(&plugin));
+    let first = Decider::new(5);
+    // The first side's profile: the plugin's scope opens and brings the
+    // decider's instance, then the host's scope lets another thread take a
+    // turn as that decider. The second side's open follows it.
+    let prefill = profile_that(&plugin, &plain, Inside::TurnsElsewhereAs(first));
+    let decode = plugin_profile(&plugin, None, None, None);
+    let engine = pair_engine(vec![prefill, decode], 1);
+    let _turn = first.enter();
+    for _ in 0..2 {
+        plain.on_dispatched(&Lease::default(), &Target::default(), Side::Single, 3);
+    }
+    let decision = pair_decide(&engine);
+    let Some(pick) = decision.pick() else {
+        panic!("a pair pick, not {decision:?}")
+    };
+    let lead = pick.targets.first().expect("a target");
+    let stats = plugin.stats();
+    assert_eq!(
+        (lead.id, lead.pair.map(|p| p.decode_id)),
+        (WorkerId(102), Some(WorkerId(202))),
+        "each side counted the two dispatches its instance heard: {stats:?}"
+    );
+    assert_eq!(
+        stats.instantiations, 2,
+        "the other thread's turn made an instance of its own: {stats:?}"
+    );
 }
 
 /// An instance hears the feed once a decision, at the first open that

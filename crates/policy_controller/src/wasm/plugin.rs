@@ -853,13 +853,13 @@ struct Standing {
 #[derive(Default)]
 struct Working {
     standing: Cell<Standing>,
-    /// The decision whose open last checked a hold in this place, by its
-    /// number on this thread, zero where none did: its later opens take the
-    /// hold as theirs. No later decision takes that number here: the
-    /// thread's count rises by one a decision, and a thread that takes an
-    /// exited thread's place takes its count with it ([`OpenDecisions`]).
-    /// A word of its own, which a bring neither reads nor writes: the first
-    /// later open of a bring's decision checks the hold it brought, once.
+    /// The decision whose open brought the hold in this place or last
+    /// checked it, by its number on this thread, zero where none did: its
+    /// later opens take the hold as theirs. No later decision takes that
+    /// number here: the thread's count rises by one a decision, and a
+    /// thread that takes an exited thread's place takes its count with it
+    /// ([`OpenDecisions`]). A word of its own, so the standing a bring
+    /// copies stays small: the bring stores this word and does not read it.
     checked: Cell<u64>,
     slot: RefCell<Option<Instance>>,
 }
@@ -1321,8 +1321,9 @@ impl Plugin {
     /// under another name or under none: a thread decides on no instance
     /// but the one of the decider it acts as. `decision` numbers the
     /// decision whose open calls, zero for a call outside one: a hold of
-    /// the same decider is checked by the first open of a decision that
-    /// finds it, and by every call outside one.
+    /// the same decider is taken as it stands by the later opens of the
+    /// decision that brought it or last checked it, and is checked by
+    /// every other call.
     fn lend(&self, working: &Working, decision: u64) -> bool {
         let mut now = working.standing.get();
         let Some(decider) = Decider::acting() else {
@@ -1335,13 +1336,13 @@ impl Plugin {
             return false;
         };
         match now.lent {
-            // The state is here. An open of the decision that last checked
-            // the hold takes it as it stands. Any other call takes it only
-            // where the rest still names this place: the first later open
-            // of the decision that brought it does, once. A close that did
-            // not return can have left the hold, and the decider can have
-            // been brought elsewhere since: such a hold is stale, its
-            // instance is dropped, and the state at rest comes.
+            // The state is here. An open of the decision that brought the
+            // hold or last checked it takes it as it stands, so a decision
+            // of two opens decides both on one instance. Any other call
+            // takes it only where the rest still names this place. A close
+            // that did not return can have left the hold, and the decider
+            // can have been brought elsewhere since: such a hold is stale,
+            // its instance is dropped, and the state at rest comes.
             Some(held) if held == decider => {
                 if decision != 0 && working.checked.get() == decision {
                     return false;
@@ -1357,6 +1358,10 @@ impl Plugin {
             Some(held) => self.give_back(working, held),
             None => {}
         }
+        // The bring. Its decision need not check the hold it brings: the
+        // number is stored ahead of the lock, while it is at hand, and
+        // nothing below returns early.
+        working.checked.set(decision);
         let mut rest = self.rest_of(decider).lock();
         let rest = rest.get_or_insert_with(Rest::new);
         let mut slot = working.slot.borrow_mut();
