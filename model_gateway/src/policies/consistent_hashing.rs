@@ -19,7 +19,7 @@
 //!
 //! The ring is filled once for a generation, off the request path: until
 //! the gateway's warm task has filled it, a request walks the ring kept
-//! from an earlier generation, and a model's first requests walk none.
+//! from another generation, and a model's first requests walk none.
 //! This ensures O(log n) lookup performance.
 //!
 //! Complexity per request: O(log n) binary search + O(k) walk where k =
@@ -113,11 +113,12 @@ impl ConsistentHashingPolicy {
             if on_ring.is_some() {
                 return found.get();
             }
-            // No eligible worker is on the ring. The ring can be of an
-            // earlier membership than `workers`, kept while the next ring
-            // is filled: the workers that joined since are placed below, as
-            // with no ring. On the ring of these very workers none is
-            // eligible, and the answer below is the same `None`.
+            // No eligible worker is on the ring. The ring can be of another
+            // membership than `workers`, kept while the next ring is
+            // filled: the key is then placed below over the workers that
+            // joined since, as with no ring. On the ring of these very
+            // workers none is eligible, and the answer below is the same
+            // `None`.
         }
 
         // No ring, as for a model's first requests, or none of its workers
@@ -790,7 +791,7 @@ mod tests {
         assert_eq!(branch, Branch::RandomFallback);
     }
 
-    /// The ring can be of an earlier membership than the workers a request
+    /// The ring can be of another membership than the workers a request
     /// is placed over. Where no worker of the ring is eligible among them,
     /// as after a fleet was replaced whole, the key is placed as with no
     /// ring: the request is not refused while a worker is eligible.

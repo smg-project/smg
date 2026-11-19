@@ -11,19 +11,28 @@
 //! is filled, its requests are placed on the kept one: a request reads a
 //! ring and builds none.
 //!
-//! So a request can be placed on the ring of an earlier membership than its
+//! So a request can be placed on the ring of another membership than its
 //! own. The policies that walk a ring take a URL only where the request's
 //! workers hold an eligible worker at it, and a URL's places on a ring
 //! depend on the URL alone. A worker that left is therefore passed over at
 //! once, and its keys land where the generation's own ring puts them. A
 //! worker that joined takes no keyed request until its ring is filled: its
-//! keys stay with the workers that held them. No other key moves. The
+//! keys stay with the workers that held them. Where none of those is
+//! eligible, a key is placed as with no ring, and the worker that joined
+//! can take it. No other key moves. The
 //! registry publishes a generation before it sends the event the task
 //! wakes on, so the task fills that generation or a newer one. The task
 //! alone writes a kept ring, from the generation that stands, so a kept
 //! ring never steps back to an earlier membership, and trails the one that
 //! stands by one fill. A request writes none. A model's first requests,
 //! before a ring is kept for it, are placed with no ring.
+//!
+//! A generation can be published again over the same list with no event, as
+//! a refresh of model cards does, and the task does not come to it. The
+//! kept ring is its ring, and the first read puts it into the generation's
+//! cell ([`ModelWorkerSnapshot::put_hash_ring`]). A ring keeps its URLs in
+//! an order of its own, which a replacement moves apart from its list's, so
+//! a kept ring stands with the list it was filled over and is known by it.
 //!
 //! The task ([`KeptRings::keep_warm`]) wakes on the registry's events, and
 //! fills and keeps the ring of each generation a membership change
@@ -44,7 +53,7 @@ use tokio::sync::broadcast::{
     self,
     error::{RecvError, TryRecvError},
 };
-use tracing::debug;
+use tracing::{debug, error};
 
 use super::hash_ring::HashRing;
 use crate::worker::{
@@ -56,7 +65,7 @@ use crate::worker::{
 /// the model-less ring under [`UNKNOWN_MODEL_ID`].
 #[derive(Debug, Default)]
 pub(crate) struct KeptRings {
-    kept: DashMap<Box<str>, Arc<HashRing>, FxBuildHasher>,
+    kept: DashMap<Box<str>, Kept, FxBuildHasher>,
     /// How many warm tasks live ([`Warming`]). A request reads it to learn
     /// who fills a generation's ring. A count read a moment late places no
     /// request wrongly: a ring a request fills is its generation's own.
@@ -68,7 +77,7 @@ impl KeptRings {
     /// registry's generation of the model: `None` for a generation without
     /// a member, as a model nobody serves has no ring. It is the
     /// generation's own ring once that is filled. Until then it is the ring
-    /// kept for the model, of an earlier membership, and `None` where none
+    /// kept for the model, of another membership, and `None` where none
     /// is kept yet (see the module).
     pub(crate) fn of(
         &self,
@@ -88,24 +97,26 @@ impl KeptRings {
     /// line, so the read of a filled ring pays nothing for it.
     #[cold]
     fn standing(&self, model_id: &str, generation: &ModelWorkerSnapshot) -> Option<Arc<HashRing>> {
-        let kept = self.kept_for(model_id);
         if self.warming.load(Ordering::Relaxed) == 0 {
             // No task will fill this generation's ring: this request does.
+            let kept = self.kept_for(model_id);
             return Some(Arc::clone(generation.fill_hash_ring(kept)));
         }
-        let kept = kept?;
-        // A generation published again over the same members sends no
-        // event, so the task never comes to it. The kept ring is its ring,
-        // and is put there for the next read.
-        generation.take_hash_ring(&kept);
-        Some(kept)
+        let kept = self.kept.get(model_id).map(|kept| Kept::clone(&kept))?;
+        // A generation published again over the same list sends no event,
+        // so the task never comes to it. The kept ring is its ring, and is
+        // put there for the next read.
+        generation.put_hash_ring(&kept.ring, &kept.listed);
+        Some(kept.ring)
     }
 
     /// Whether a request placed now walks the ring of its own membership:
-    /// no task lives, so the request fills that ring itself, or the task
-    /// has filled the ring of every generation that stands. For a caller
-    /// that changed the membership and waits for the placements to follow,
-    /// as a test bed does.
+    /// no task lives, so the request fills that ring itself, or every
+    /// generation that stands holds its ring. It reads as a request reads,
+    /// so a generation published again with no event takes its kept ring
+    /// here. For a caller that changed the membership and waits for the
+    /// placements to follow, as a test bed does.
+    #[cfg(any(test, feature = "test-util"))]
     pub(crate) fn are_current(&self, registry: &WorkerRegistry) -> bool {
         if self.warming.load(Ordering::Relaxed) == 0 {
             return true;
@@ -117,13 +128,15 @@ impl KeptRings {
             .chain([UNKNOWN_MODEL_ID])
             .all(|model_id| {
                 let generation = registry.get_routing_snapshot(model_id);
-                generation.is_empty() || generation.hash_ring().is_some()
+                generation.is_empty()
+                    || (self.of(model_id, &generation).is_some()
+                        && generation.hash_ring().is_some())
             })
     }
 
     /// The ring kept for `model_id`.
     fn kept_for(&self, model_id: &str) -> Option<Arc<HashRing>> {
-        self.kept.get(model_id).map(|kept| Arc::clone(&kept))
+        self.kept.get(model_id).map(|kept| Arc::clone(&kept.ring))
     }
 
     /// Fills the ring of the generation that stands for `model_id` and keeps
@@ -144,7 +157,8 @@ impl KeptRings {
             elapsed = ?started.elapsed(),
             "Filled the hash ring"
         );
-        self.kept.insert(model_id.into(), ring);
+        let listed = generation.listed_urls(&ring);
+        self.kept.insert(model_id.into(), Kept { ring, listed });
     }
 
     /// The ring a fill of `generation`, the one that stands for `model_id`,
@@ -231,7 +245,10 @@ impl KeptRings {
                 let filled = tokio::task::spawn_blocking(move || rings.fill(&registry, heard));
                 // A fill that panicked is this task's last: the requests
                 // fill from here on.
-                if filled.await.is_err() {
+                if let Err(ended) = filled.await {
+                    if ended.is_panic() {
+                        error!("A hash ring fill panicked: requests fill the rings from here on");
+                    }
                     return;
                 }
                 match events.recv().await {
@@ -242,6 +259,15 @@ impl KeptRings {
             }
         });
     }
+}
+
+/// A ring the warm task filled, kept with the list it filled it over.
+#[derive(Debug, Clone)]
+struct Kept {
+    ring: Arc<HashRing>,
+    /// The URLs of the generation the ring was filled for, in that
+    /// generation's order ([`ModelWorkerSnapshot::listed_urls`]).
+    listed: Arc<[Arc<str>]>,
 }
 
 /// A warm task's life, counted in [`KeptRings::warming`] from the task's

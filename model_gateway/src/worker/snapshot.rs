@@ -266,7 +266,7 @@ impl ModelWorkerSnapshot {
     }
 
     /// The consistent-hash ring over the URLs of this generation's members,
-    /// once it is filled ([`Self::fill_hash_ring`], [`Self::take_hash_ring`]).
+    /// once it is filled ([`Self::fill_hash_ring`], [`Self::put_hash_ring`]).
     pub(crate) fn hash_ring(&self) -> Option<&Arc<HashRing>> {
         self.hash_ring.get()
     }
@@ -289,15 +289,36 @@ impl ModelWorkerSnapshot {
         })
     }
 
-    /// Puts `ring` into the ring cell where it is the ring over these very
-    /// members, as after a generation is published again over the same
-    /// list: a compare of the URLs, with nothing hashed. Any other ring is
-    /// left out, and so is every ring once the cell is filled.
-    pub(crate) fn take_hash_ring(&self, ring: &Arc<HashRing>) {
-        let urls = self.all.iter().map(|worker| worker.url());
-        if ring.worker_count() == self.all.len() && ring.is_over(urls) {
+    /// Puts `ring` into the ring cell where `listed` are these members'
+    /// URLs in this list's order, as after a generation is published again
+    /// over the same list. `ring` is the ring over `listed`
+    /// ([`Self::listed_urls`] of the generation it was filled for), so it
+    /// is then the ring of these members: a compare of the URLs, with
+    /// nothing hashed. Any other ring is left out, and so is every ring
+    /// once the cell is filled.
+    pub(crate) fn put_hash_ring(&self, ring: &Arc<HashRing>, listed: &[Arc<str>]) {
+        let same_list = listed.len() == self.all.len()
+            && self
+                .all
+                .iter()
+                .zip(listed)
+                .all(|(worker, url)| &**url == worker.url());
+        if same_list {
             // A fill that got there first put in a ring of the same content.
             let _ = self.hash_ring.set(Arc::clone(ring));
+        }
+    }
+
+    /// These members' URLs in this list's order, kept beside `ring`, this
+    /// generation's ring, for a later generation's [`Self::put_hash_ring`].
+    /// A ring keeps an order of its own, so they are the ring's own list
+    /// only where that is in this order, and a copy elsewhere.
+    pub(crate) fn listed_urls(&self, ring: &HashRing) -> Arc<[Arc<str>]> {
+        let urls = || self.all.iter().map(|worker| worker.url());
+        if ring.is_over(urls()) {
+            Arc::clone(ring.urls())
+        } else {
+            urls().map(Arc::<str>::from).collect()
         }
     }
 

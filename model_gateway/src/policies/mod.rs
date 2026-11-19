@@ -491,7 +491,7 @@ pub struct SelectWorkerInfo<'a> {
     pub rid_key: Option<&'a str>,
     /// The hash ring the model's requests are placed on, for O(log n)
     /// consistent hashing: the ring of the model's membership generation,
-    /// or the ring kept from an earlier generation while that one is
+    /// or the ring kept from another generation while that one is
     /// filled, so no request builds it. The ring can therefore name workers
     /// that left and lack workers that joined: a policy that walks it takes
     /// a URL only where its own workers hold an eligible worker there, and

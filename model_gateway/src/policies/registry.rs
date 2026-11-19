@@ -279,7 +279,7 @@ impl PolicyRegistry {
     /// ring of the generation the registry holds for the model, `None` for a
     /// model nobody serves. The model-less id reads the ring over every
     /// worker, the candidates of a request that names no model. While that
-    /// generation's ring is filled it is the ring kept from an earlier
+    /// generation's ring is filled it is the ring kept from another
     /// generation, and `None` before the model's first ring
     /// ([`KeptRings::of`]). A caller holding a client's name for the model
     /// resolves it at request entry, as for the registry's other reads by
@@ -305,9 +305,10 @@ impl PolicyRegistry {
 
     /// Whether the hash rings have followed the membership: a request
     /// placed now walks the ring of its own generation. After a membership
-    /// change that holds again within one fill of the task that keeps the
+    /// change, that holds again within one fill of the task that keeps the
     /// rings warm. For a caller that changed the membership and waits for
     /// the placements to follow, as a test bed does.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn hash_rings_are_current(&self, registry: &WorkerRegistry) -> bool {
         self.rings.are_current(registry)
     }

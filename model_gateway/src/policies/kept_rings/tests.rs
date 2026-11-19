@@ -404,6 +404,99 @@ fn a_generation_published_again_over_its_members_reads_the_kept_ring() {
     );
 }
 
+/// A replacement puts its worker last in the model's list and leaves it
+/// where it stood in the ring, and the model-less list is in no order of
+/// the ring's. A generation published again still takes the kept ring: the
+/// ring is known by the list it was filled over, not by its own order.
+#[test]
+fn a_generation_published_again_takes_the_kept_ring_whatever_order_the_ring_keeps() {
+    let registry = WorkerRegistry::new();
+    let first = registry
+        .register(worker_serving(&url(0), &["model"]))
+        .expect("the first worker");
+    for n in 1..4 {
+        registry
+            .register(worker_serving(&url(n), &["model"]))
+            .expect("a worker of the model");
+    }
+    let everything = || Changed {
+        everything: true,
+        models: Vec::new(),
+    };
+    let rings = KeptRings::default();
+    rings.fill(&registry, everything());
+    assert!(registry.replace(&first, worker_serving(&url(0), &["model"])));
+    rings.fill(&registry, everything());
+    let _task = Warming::start(&rings.warming);
+    let listed: Vec<String> = registry
+        .get_routing_snapshot("model")
+        .iter()
+        .map(|worker| worker.url().to_string())
+        .collect();
+    let warmed = kept(&rings, "model").expect("the task's step keeps the ring");
+    assert_eq!(listed.last(), Some(&url(0)), "the replacement stands last");
+    assert!(!warmed.is_over(&listed), "and where it stood in the ring");
+
+    let member = registry
+        .get_routing_snapshot("model")
+        .first()
+        .cloned()
+        .expect("a member of the model");
+    assert!(registry.refresh_models(
+        &member,
+        vec![ModelCard::new("model").with_context_length(8_192)]
+    ));
+    for model_id in ["model", UNKNOWN_MODEL_ID] {
+        let published_again = registry.get_routing_snapshot(model_id);
+        assert!(
+            !published_again.hash_ring_is_filled(),
+            "{model_id}: a new generation"
+        );
+        let read = rings.of(model_id, &published_again).expect("a ring");
+        let warmed = kept(&rings, model_id).expect("the ring the task kept");
+        assert!(Arc::ptr_eq(&read, &warmed), "{model_id}: the kept ring");
+        assert!(
+            published_again.hash_ring_is_filled(),
+            "{model_id}: the next read is of a filled ring"
+        );
+    }
+}
+
+/// A generation over other members at equal count reads the kept ring and
+/// leaves its cell empty: the kept ring is not its ring. The task's fill
+/// then puts in the ring of its own members.
+#[test]
+fn a_generation_over_other_members_at_equal_count_takes_no_kept_ring() {
+    let registry = registry_of(2);
+    let rings = KeptRings::default();
+    rings.warm(&registry, "model");
+    let _task = Warming::start(&rings.warming);
+    let warmed = kept(&rings, "model").expect("the task's step keeps the ring");
+
+    registry.remove_by_url(&url(1));
+    registry
+        .register(worker_serving(&url(2), &["model"]))
+        .expect("a worker in its place");
+    let other_members = registry.get_routing_snapshot("model");
+    assert_eq!(other_members.len(), warmed.worker_count());
+
+    let read = rings.of("model", &other_members).expect("the kept ring");
+    assert!(Arc::ptr_eq(&read, &warmed), "placed on the kept ring");
+    assert!(
+        !other_members.hash_ring_is_filled(),
+        "the kept ring is not this generation's: the cell waits for the fill"
+    );
+
+    rings.warm(&registry, "model");
+    let both = [url(0), url(2)];
+    assert_ring_urls(
+        &rings,
+        &registry,
+        "model",
+        &both.each_ref().map(String::as_str),
+    );
+}
+
 /// The task's step and the requests of a fresh generation race for its
 /// cell: one of them fills it, and all read that one ring.
 #[test]
@@ -439,7 +532,7 @@ fn readers_that_race_the_task_for_a_generation_read_the_one_ring_it_holds() {
         let kept = rings
             .kept
             .get("model")
-            .map(|ring| Arc::clone(&ring))
+            .map(|kept| Arc::clone(&kept.ring))
             .expect("the task's step keeps the ring");
         for ring in &read {
             assert!(Arc::ptr_eq(ring, &kept), "round {round}");
@@ -450,7 +543,7 @@ fn readers_that_race_the_task_for_a_generation_read_the_one_ring_it_holds() {
 
 /// The ring the task keeps for `model_id`.
 fn kept(rings: &KeptRings, model_id: &str) -> Option<Arc<HashRing>> {
-    rings.kept.get(model_id).map(|ring| Arc::clone(&ring))
+    rings.kept.get(model_id).map(|kept| Arc::clone(&kept.ring))
 }
 
 #[tokio::test]
@@ -844,6 +937,50 @@ async fn the_rings_are_current_once_the_task_has_followed_a_change() {
         "model",
         &both.each_ref().map(String::as_str),
     );
+}
+
+/// A refresh of model cards publishes the generations again and sends no
+/// event, so the task does not come. The rings still read current with no
+/// request in between: the reader takes the kept rings as a request would.
+#[test]
+fn the_rings_read_current_after_a_card_refresh_with_no_request() {
+    let registry = registry_of(4);
+    let rings = KeptRings::default();
+    rings.fill(
+        &registry,
+        Changed {
+            everything: true,
+            models: Vec::new(),
+        },
+    );
+    let _task = Warming::start(&rings.warming);
+    assert!(rings.are_current(&registry), "the task's step filled them");
+
+    let member = registry
+        .get_routing_snapshot("model")
+        .first()
+        .cloned()
+        .expect("a member of the model");
+    assert!(registry.refresh_models(
+        &member,
+        vec![ModelCard::new("model").with_context_length(8_192)]
+    ));
+    assert!(
+        !registry.get_routing_snapshot("model").hash_ring_is_filled(),
+        "a new generation"
+    );
+    assert!(
+        rings.are_current(&registry),
+        "the kept rings are the rings of the generations published again"
+    );
+    for model_id in ["model", UNKNOWN_MODEL_ID] {
+        assert!(
+            registry
+                .get_routing_snapshot(model_id)
+                .hash_ring_is_filled(),
+            "{model_id}: its ring stands in its cell"
+        );
+    }
 }
 
 /// The task alone writes a kept ring, from the generation that stands when
