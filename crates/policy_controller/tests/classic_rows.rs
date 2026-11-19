@@ -607,6 +607,13 @@ fn the_classic_prefix_hash_rows_replay_pick_for_pick_and_share_for_share() {
 }
 
 #[test]
+fn the_classic_cache_aware_rows_replay_pick_for_pick_and_share_for_share() {
+    let (rows, defects) = replay_sheet(classic::cache_aware::INLINE, "the inline rows");
+    assert!(rows >= 8, "{rows} inline rows");
+    assert!(defects.is_empty(), "{defects:#?}");
+}
+
+#[test]
 fn the_classic_sticky_rank_rows_replay_rank_for_rank_and_count_for_count() {
     let (rows, defects) = replay_sheet(classic::sticky_rank::INLINE, "the inline rows");
     assert!(rows >= 8, "{rows} inline rows");

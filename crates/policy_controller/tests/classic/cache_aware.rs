@@ -164,47 +164,82 @@ pub struct Row {
     outcome: Outcome,
 }
 
+/// The gateway's command line defaults. The crate's preset states the same
+/// numbers by stating none, so a row recorded under them asks the preset as
+/// it is named.
+const NAMED: Config = Config {
+    cache_threshold: 0.3,
+    balance_abs_threshold: 64,
+    balance_rel_threshold: 1.5,
+    block_size: 16,
+    balance_token_usage_threshold: 1.0,
+    overload_token_usage_threshold: 1.0,
+};
+
+/// Whether two numbers of a configuration are the same number as written.
+fn same(one: f32, other: f32) -> bool {
+    one.to_bits() == other.to_bits()
+}
+
 impl Row {
-    /// The row's profile, stated from its configuration: the preset's
-    /// stages in the preset's order, with the classic's match threshold,
-    /// its count gate and its two KV gates. A tree is a predictor of
-    /// placements, so a tree row reads the predicted placements and an
-    /// index row the index.
+    /// The row's profile: the crate's `cache_aware` preset, with each
+    /// number of the classic's configuration set on the preset's own stage
+    /// where it differs from the gateway's command line default. The
+    /// filters, the stages and their order, their weights and the pick are
+    /// the preset's, so a change of the preset reaches every row, and a row
+    /// recorded under those defaults asks the preset as it is named. A tree
+    /// is a predictor of placements: a tree row names that source, and an
+    /// index row names none.
     fn spec(&self) -> Result<PolicySpec, String> {
         let config = &self.config;
-        let source = match self.matcher {
-            Matcher::Events => "index",
-            Matcher::Text | Matcher::Tokens => "predictor",
-        };
-        let document = serde_json::json!({
-            "apiVersion": "smg.policy/v1",
-            "generation": 1,
-            "view": { "block_size": config.block_size },
-            "profiles": {
-                "cache_aware": {
-                    "filter": ["healthy", "not-overloaded", "not-tried"],
-                    "score": [
-                        { "warmup-slice": { "weight": 8.0 } },
-                        { "prefix-affinity": {
-                            "weight": 4.0,
-                            "threshold": config.cache_threshold,
-                            "source": source,
-                            "spill": {
-                                "abs": config.balance_abs_threshold,
-                                "rel": config.balance_rel_threshold
-                            }
-                        } },
-                        { "kv-pressure": {
-                            "spread": config.balance_token_usage_threshold,
-                            "ceiling": config.overload_token_usage_threshold
-                        } },
-                        "least-load"
-                    ],
-                    "pick": { "best": { "sample": 16 } }
+        let preset = PolicySpec::preset(POLICY).map_err(|err| err.to_string())?;
+        let mut document = serde_json::to_value(&preset).map_err(|err| err.to_string())?;
+        if config.block_size != NAMED.block_size {
+            document["view"]["block_size"] = config.block_size.into();
+        }
+        let spill = config.balance_abs_threshold != NAMED.balance_abs_threshold
+            || !same(config.balance_rel_threshold, NAMED.balance_rel_threshold);
+        let gates = !same(
+            config.balance_token_usage_threshold,
+            NAMED.balance_token_usage_threshold,
+        ) || !same(
+            config.overload_token_usage_threshold,
+            NAMED.overload_token_usage_threshold,
+        );
+        let stages = document["profiles"][POLICY]["score"]
+            .as_array_mut()
+            .ok_or("the preset states its score stages as a list")?;
+        let (mut gated, mut pressed) = (false, false);
+        for stage in stages {
+            if let Some(affinity) = stage.get_mut("prefix-affinity") {
+                gated = true;
+                if !same(config.cache_threshold, NAMED.cache_threshold) {
+                    affinity["threshold"] = config.cache_threshold.into();
                 }
-            },
-            "bindings": [{ "match": { "model": "*" }, "profile": "cache_aware" }]
-        });
+                if self.matcher != Matcher::Events {
+                    affinity["source"] = "predictor".into();
+                }
+                if spill {
+                    affinity["spill"] = serde_json::json!({
+                        "abs": config.balance_abs_threshold,
+                        "rel": config.balance_rel_threshold
+                    });
+                }
+            }
+            // A stage at its defaults is stated by its bare name.
+            if stage.as_str() == Some("kv-pressure") || stage.get("kv-pressure").is_some() {
+                pressed = true;
+                if gates {
+                    *stage = serde_json::json!({ "kv-pressure": {
+                        "spread": config.balance_token_usage_threshold,
+                        "ceiling": config.overload_token_usage_threshold
+                    } });
+                }
+            }
+        }
+        if !(gated && pressed) {
+            return Err("the preset holds no prefix-affinity stage or no kv-pressure stage".into());
+        }
         serde_json::from_value(document).map_err(|err| err.to_string())
     }
 
@@ -289,8 +324,7 @@ fn blocks(prompt: &[u32], block_size: usize) -> Vec<StoredBlock> {
 /// A store under the row's profile whose index holds what the row's workers
 /// report: each `stored` and `removed` step reaches it as a batch of the
 /// worker's events, and each request asks it which rows hold the request's
-/// leading blocks. One store serves every run of its row: a run starts by
-/// emptying the index, as a worker that emptied its cache reports it.
+/// leading blocks. One store serves one run of its row.
 struct Served {
     store: MemoryStore,
     ids: Vec<WorkerId>,
@@ -344,21 +378,10 @@ impl Served {
         self.sequence[place] += 1;
         let facts = BatchFacts {
             sequence: self.sequence[place],
-            clears: matches!(event, KvEvent::Cleared),
             ..BatchFacts::default()
         };
         let outcome = self.store.admit(self.ids[place], 0, facts, &[event]);
         assert_eq!(outcome, BatchOutcome::Applied, "the batch is applied");
-    }
-
-    /// Every worker that holds a block reports its cache emptied.
-    fn clear(&mut self) {
-        let holding: Vec<usize> = (0..self.ids.len())
-            .filter(|&place| self.store.indexed_blocks(self.ids[place], 0) > 0)
-            .collect();
-        for place in holding {
-            self.admit(place, KvEvent::Cleared);
-        }
     }
 
     /// What each worker holds of a request for `prompt`, and the blocks the
@@ -427,27 +450,24 @@ struct Bed<'a> {
     /// the requests placed on it. Under the index: every prefix of whole
     /// blocks it stored and did not remove.
     held: Vec<Vec<Vec<u32>>>,
-    /// The lease, the target and the worker of each request so far.
-    picked: Vec<(Lease, Target, usize)>,
+    /// The lease, the target and the worker of each request so far, or
+    /// nothing where the request was not placed: a row numbers its
+    /// requests by every pick, as its recorder does.
+    picked: Vec<Option<(Lease, Target, usize)>>,
     /// The store that names the holders, under the served feed.
     served: Option<&'a mut Served>,
-    /// Where the store's index and the row's own count read a request
-    /// apart, the first such request in its own words.
+    /// What stops the row's run, the first such thing in its own words:
+    /// the store's index and the row's own count reading a request apart,
+    /// or the end of a request that no worker holds.
     parted: Option<String>,
 }
 
 impl<'a> Bed<'a> {
     /// The bed, or the validator's words when this crate does not build the
-    /// row's profile. Under the served feed the store's index starts empty.
-    fn new(
-        row: &Row,
-        spec: &PolicySpec,
-        mut served: Option<&'a mut Served>,
-    ) -> Result<Self, String> {
+    /// row's profile. Under the served feed the store is new, and its index
+    /// empty.
+    fn new(row: &Row, spec: &PolicySpec, served: Option<&'a mut Served>) -> Result<Self, String> {
         let engine = spec.validate().map_err(|err| err.to_string())?;
-        if let Some(served) = &mut served {
-            served.clear();
-        }
         let clock = 1_000;
         let pool = row
             .workers
@@ -565,7 +585,7 @@ impl<'a> Bed<'a> {
         let tried: Vec<WorkerId> = tried.iter().map(|&i| id(i)).collect();
         let text = self.matcher == Matcher::Text;
         let facts = RequestFacts {
-            model: "m",
+            model: MODEL,
             // A text of four characters an id is an estimate of one token
             // an id.
             prompt_tokens: prompt.len() as u32,
@@ -596,8 +616,11 @@ impl<'a> Bed<'a> {
         );
         let pick = match &decision {
             Decision::Pick(pick) => pick,
-            Decision::Shed(shed) if shed.reason == ShedReason::Saturated => return self.pool.len(),
-            Decision::Shed(_) | Decision::Queue(_) => return self.pool.len() + 1,
+            Decision::Shed(_) | Decision::Queue(_) => {
+                self.picked.push(None);
+                let saturated = matches!(&decision, Decision::Shed(shed) if shed.reason == ShedReason::Saturated);
+                return self.pool.len() + usize::from(!saturated);
+            }
         };
         let target = *pick.targets.first().expect("a target");
         let lease = Lease {
@@ -610,7 +633,7 @@ impl<'a> Bed<'a> {
         self.engine.on_dispatched(&lease, &target, Side::Single, 0);
         let place = target.position as usize;
         self.pool[place].in_flight += 1;
-        self.picked.push((lease, target, place));
+        self.picked.push(Some((lease, target, place)));
         // A tree is written at every request, for the worker it chose.
         if self.matcher != Matcher::Events {
             self.held[place].push(prompt);
@@ -619,9 +642,15 @@ impl<'a> Bed<'a> {
     }
 
     /// The request of pick `n` ends: its worker holds one fewer, and the
-    /// engine is told.
+    /// engine is told. A row that ends a request no worker holds, one
+    /// placed nowhere or one not picked yet, stops in those words.
     fn complete(&mut self, n: usize) {
-        let (lease, target, place) = self.picked[n];
+        let Some((lease, target, place)) = self.picked.get(n).copied().flatten() else {
+            self.parted.get_or_insert_with(|| {
+                format!("the row ends the request of pick {n}, which no worker holds")
+            });
+            return;
+        };
         self.pool[place].in_flight -= 1;
         self.engine.on_completed(
             &lease,
@@ -710,8 +739,9 @@ fn shared_blocks(a: &[u32], b: &[u32], ids_per_block: usize) -> u32 {
 }
 
 /// The row run once from a fresh engine: where each request was placed, or
-/// the validator's words, or where the store's index and the row's own
-/// count read a request apart. `draw` separates the seeds of a drawn row's
+/// the validator's words, or what stopped the run: the store's index and
+/// the row's own count reading a request apart, or the end of a request
+/// that no worker holds. `draw` separates the seeds of a drawn row's
 /// runs; a sequence row is run `0`. `spec` is the row's profile, read once
 /// a row, and `served` the store of the served feed.
 fn run(
@@ -778,20 +808,25 @@ fn replay_over(row: &Row, feed: Feed) -> Replayed {
             Err(why) => Replayed::Refused(why),
         },
         Outcome::Counts { draws, .. } => {
+            // A store serves one run, so the draws run over the lent feed
+            // alone. A drawn row's served run is the one draw `replay`
+            // makes over a store of its own.
+            if served.is_some() {
+                return Replayed::Refused("a drawn row draws over the lent feed alone".to_string());
+            }
             // Each draw runs the row from a fresh engine, as the recorder
             // ran it from a fresh policy. The row's last request is the one
-            // counted; a drawn row places every request.
+            // counted. A drawn row places every request: a draw that places
+            // one nowhere answers as its sequence, which no count equals.
             let mut counts = vec![0u32; row.workers.len()];
             for draw in 1..=u64::from(*draws) {
-                match run(row, &spec, draw, served.as_mut()) {
+                match run(row, &spec, draw, None) {
                     Ok(picked) => {
-                        let last = *picked.last().expect("a drawn row ends with a request");
-                        match counts.get_mut(last) {
-                            Some(count) => *count += 1,
-                            None => {
-                                return Replayed::Ran(Outcome::Sequence(picked));
-                            }
+                        if picked.iter().any(|&place| place >= counts.len()) {
+                            return Replayed::Ran(Outcome::Sequence(picked));
                         }
+                        let last = *picked.last().expect("a drawn row ends with a request");
+                        counts[last] += 1;
                     }
                     Err(why) => return Replayed::Refused(why),
                 }
@@ -826,7 +861,7 @@ impl Recorded for Row {
 /// holders, the deepest holder tried, a removed block and a drawn pair of
 /// holders; under the tree of text a match at the threshold.
 pub const INLINE: &str = r#"{
-  "recorded_from": "cf54401bbe057e75476c4f22ade5c14d96fecc06",
+  "recorded_from": "bfe189b332349c44cf7e3b6e1102a9b5a2699d9d",
   "policy": "cache_aware",
   "rows": [
     {
@@ -958,14 +993,17 @@ pub const INLINE: &str = r#"{
       ],
       "steps": [
         {"stored": {"worker": 0, "prompt": [[1000, 64]]}},
-        {"stored": {"worker": 1, "prompt": [[7000, 16]]}},
+        {"stored": {"worker": 1, "prompt": [[1000, 32]]}},
+        {"stored": {"worker": 2, "prompt": [[7000, 16]]}},
         {"pick": {"prompt": [[1000, 64]], "tried": []}},
-        {"removed": {"worker": 0, "prompt": [[1000, 64]], "kept_blocks": 2}},
+        {"removed": {"worker": 0, "prompt": [[1000, 64]], "kept_blocks": 1}},
+        {"pick": {"prompt": [[1000, 64]], "tried": []}},
+        {"removed": {"worker": 1, "prompt": [[1000, 32]], "kept_blocks": 0}},
         {"pick": {"prompt": [[1000, 64]], "tried": []}},
         {"removed": {"worker": 0, "prompt": [[1000, 64]], "kept_blocks": 0}},
         {"pick": {"prompt": [[1000, 64]], "tried": []}}
       ],
-      "outcome": {"sequence": [0, 0, 2]}
+      "outcome": {"sequence": [0, 1, 0, 2]}
     },
     {
       "name": "events-equal-holders-at-equal-loads-are-drawn",
@@ -981,7 +1019,7 @@ pub const INLINE: &str = r#"{
         {"stored": {"worker": 1, "prompt": [[1000, 64]]}},
         {"pick": {"prompt": [[1000, 64]], "tried": []}}
       ],
-      "outcome": {"counts": {"draws": 6000, "counts": [3039, 2961, 0]}}
+      "outcome": {"counts": {"draws": 6000, "counts": [3013, 2987, 0]}}
     },
     {
       "name": "text-a-match-at-the-threshold-is-a-miss",
@@ -1001,3 +1039,116 @@ pub const INLINE: &str = r#"{
     }
   ]
 }"#;
+
+/// A row recorded under the gateway's command line defaults sets no number
+/// on the preset: an index row asks it as it is named, and a tree row names
+/// its source alone. The sheet holds such rows under both readings, so the
+/// preset's own numbers are held to the gateway's.
+#[test]
+fn a_row_at_the_command_lines_defaults_asks_the_preset_as_it_is_named() {
+    let sheet: serde_json::Value =
+        serde_json::from_str(include_str!("sheets/cache_aware.json")).expect("the sheet parses");
+    let rows: Vec<Row> = serde_json::from_value(sheet["rows"].clone()).expect("the sheet's rows");
+    let preset = PolicySpec::preset(POLICY).expect("a preset of this build");
+    let named = serde_json::to_value(&preset).expect("the preset is a document");
+    let (mut index, mut tree) = (0, 0);
+    for row in &rows {
+        let config = &row.config;
+        let at_defaults = same(config.cache_threshold, NAMED.cache_threshold)
+            && config.balance_abs_threshold == NAMED.balance_abs_threshold
+            && same(config.balance_rel_threshold, NAMED.balance_rel_threshold)
+            && config.block_size == NAMED.block_size
+            && same(
+                config.balance_token_usage_threshold,
+                NAMED.balance_token_usage_threshold,
+            )
+            && same(
+                config.overload_token_usage_threshold,
+                NAMED.overload_token_usage_threshold,
+            );
+        if !at_defaults {
+            continue;
+        }
+        let spec = row.spec().expect("a row's profile");
+        if row.matcher == Matcher::Events {
+            assert_eq!(spec, preset, "{}", row.name);
+            index += 1;
+        } else {
+            let mut sourced = named.clone();
+            for stage in sourced["profiles"][POLICY]["score"]
+                .as_array_mut()
+                .expect("the preset's score list")
+            {
+                if let Some(affinity) = stage.get_mut("prefix-affinity") {
+                    affinity["source"] = "predictor".into();
+                }
+            }
+            let stated = serde_json::to_value(&spec).expect("a profile is a document");
+            assert_eq!(stated, sourced, "{}", row.name);
+            tree += 1;
+        }
+    }
+    assert!(
+        index >= 2 && tree >= 1,
+        "{index} index rows and {tree} tree rows at the command line's defaults"
+    );
+}
+
+/// A row that parts from what its recorder holds fails by its name, not by
+/// a panic of the walk. The end of a request that no worker holds stops the
+/// row in those words. A draw that places a request nowhere answers as its
+/// sequence, though its last request is placed.
+#[test]
+fn a_request_placed_nowhere_fails_its_row() {
+    let row = |steps: serde_json::Value, outcome: serde_json::Value| -> Row {
+        let down = serde_json::json!({"in_flight": 0, "state": "down", "report": null});
+        serde_json::from_value(serde_json::json!({
+            "name": "a-request-placed-nowhere",
+            "matcher": "tokens",
+            "config": {
+                "cache_threshold": 0.3,
+                "balance_abs_threshold": 64,
+                "balance_rel_threshold": 1.5,
+                "block_size": 16,
+                "balance_token_usage_threshold": 1.0,
+                "overload_token_usage_threshold": 1.0
+            },
+            "workers": [down, down, down],
+            "steps": steps,
+            "outcome": outcome
+        }))
+        .expect("a row of the sheet's shape")
+    };
+    let pick = serde_json::json!({"pick": {"prompt": [[1000, 32]], "tried": []}});
+    let refused = |row: &Row| match replay(row) {
+        Replayed::Refused(why) => why,
+        Replayed::Ran(outcome) => panic!("the row ran: {outcome:?}"),
+    };
+
+    // No worker is ready, so the pick places nothing, and the row ends it.
+    let ended = row(
+        serde_json::json!([pick, {"complete": 0}]),
+        serde_json::json!({"sequence": [4]}),
+    );
+    assert!(refused(&ended).contains("pick 0"), "{}", refused(&ended));
+    // A row that ends a request ahead of its pick stops the same way.
+    let early = row(
+        serde_json::json!([{"complete": 1}, pick]),
+        serde_json::json!({"sequence": [4]}),
+    );
+    assert!(refused(&early).contains("pick 1"), "{}", refused(&early));
+
+    // The first pick places nothing and the last, with every worker back,
+    // is placed: no draw of the row is counted.
+    let drawn = row(
+        serde_json::json!([pick, {"states": ["free", "free", "free"]}, pick]),
+        serde_json::json!({"counts": {"draws": 6, "counts": [2, 2, 2]}}),
+    );
+    match replay(&drawn) {
+        Replayed::Ran(Outcome::Sequence(picked)) => {
+            assert!(picked[0] >= 3 && picked[1] < 3, "{picked:?}");
+        }
+        Replayed::Ran(outcome) => panic!("the draws were counted: {outcome:?}"),
+        Replayed::Refused(why) => panic!("{why}"),
+    }
+}
