@@ -6852,7 +6852,10 @@ mod tests {
     /// thread a rank credits dispatches and two more decide and read. A
     /// row is decided once its report was told, as a host shows a world it
     /// told, and the row told before it is decided on: every number a row
-    /// is handed is its own rank's, and rows are handed numbers.
+    /// is handed is its own rank's. The round ends on one more instant, of
+    /// the rank told last alone, so a reader is handed a number on a
+    /// runner of any size. On one or two cores that number may be the
+    /// only one: the turns then showed no hand-over of their own.
     #[test]
     fn a_slot_told_under_two_ranks_hands_each_row_its_own_ranks_number() {
         const INSTANTS: u64 = 20_000;
