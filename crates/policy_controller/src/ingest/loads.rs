@@ -144,8 +144,8 @@ pub enum ReadError {
     /// The family has no `GetLoads`.
     #[error("no GetLoads on a {0} engine")]
     Unsupported(String),
-    /// The probe's own client could not be built: the controller's
-    /// failure, no engine's.
+    /// The probe's own client was not built, or not within the scrape's
+    /// timeout: the controller's failure, no engine's.
     #[error("the probe's client is not built: {0}")]
     Client(String),
 }

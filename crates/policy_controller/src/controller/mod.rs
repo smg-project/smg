@@ -1250,7 +1250,10 @@ mod tests {
             ElectError, ElectionSettings, Elector, LeaseBackend, LeaseRecord, MemoryLease, Tick,
             Written,
         },
-        ingest::{loads::LoadProbe, probe::unbuildable},
+        ingest::{
+            loads::{LoadProbe, ReadError},
+            probe::unbuildable,
+        },
         store::Kinds,
     };
 
@@ -1302,14 +1305,16 @@ mod tests {
         let _beside = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
         let _kept = tracing::subscriber::set_default(subscriber);
         let probe = EngineProbe::building(unbuildable);
-        for _ in 0..2 {
+        for _ in 0..3 {
             let read = probe
                 .scrape("http://127.0.0.1:9", Duration::from_secs(1))
                 .await;
-            assert!(read.is_err(), "{read:?}");
+            assert!(matches!(read, Err(ReadError::Client(_))), "{read:?}");
         }
         let said = String::from_utf8(lines.0.lock().clone()).expect("the lines");
         assert_eq!(said.matches("could not be built").count(), 1, "{said}");
+        assert!(said.contains("WARN"), "{said}");
+        assert!(!said.contains("127.0.0.1"), "no engine is named: {said}");
     }
 
     /// Every socket the controller accepts sends at once, read from the

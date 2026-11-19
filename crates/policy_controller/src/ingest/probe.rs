@@ -278,12 +278,15 @@ impl LoadProbe for EngineProbe {
     async fn scrape(&self, url: &str, timeout: Duration) -> Result<String, ReadError> {
         // The client's build is the first scrape's own time: the request
         // has what the build left of the timeout, so the scrape ends by
-        // its deadline. A build that outlasted the timeout sends nothing.
+        // its deadline. A build that outlasted the timeout sends nothing:
+        // that scrape's failure is the client's own, no engine's.
         let asked = Instant::now();
         let http = self.http().await?;
         let left = timeout.saturating_sub(asked.elapsed());
         if left.is_zero() {
-            return Err(ReadError::Deadline(timeout));
+            return Err(ReadError::Client(format!(
+                "its build outlasted the timeout of {timeout:?}"
+            )));
         }
         let response = http
             .get(format!("{}/metrics", url.trim_end_matches('/')))
@@ -411,8 +414,8 @@ mod tests {
     }
 
     /// The build's time is the first scrape's own: a build that outlasts
-    /// the timeout fails that scrape by its deadline with nothing sent,
-    /// and the client is kept for the next.
+    /// the timeout fails that scrape as the client's own, with nothing
+    /// sent, and the client is kept for the next.
     #[tokio::test]
     async fn a_build_that_outlasts_the_timeout_fails_its_scrape_unsent() {
         fn slow() -> Result<reqwest::Client, reqwest::Error> {
@@ -432,10 +435,7 @@ mod tests {
 
         let read = probe.scrape(&url, timeout).await;
 
-        assert!(
-            matches!(read, Err(ReadError::Deadline(bound)) if bound == timeout),
-            "{read:?}"
-        );
+        assert!(matches!(read, Err(ReadError::Client(_))), "{read:?}");
         assert!(probe.http_built(), "the build is kept");
         let came = listener.accept();
         assert!(
