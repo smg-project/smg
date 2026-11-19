@@ -281,7 +281,8 @@ and `tiktoken-rs` 0.12.1 on gpt-oss and Kimi K3.
 
 Corpus: 33 texts per size class of about 256, 2,000, 32,000, 128,000, 500,000 and 1,000,000 tokens (counted with the
 DeepSeek V4.1 vocabulary; a 1M text is two 500k texts joined), assembled from public text: XL-Sum news articles in Arabic, Chinese, English, Hindi, Japanese,
-Korean, Russian and Thai, and open-source code in six languages; 17 to 39 % of the bytes of a size class are outside ASCII.
+Korean, Russian and Thai, and open-source code and configuration (Rust, Python, Go, shell, C, Jinja templates, TOML and YAML,
+protobuf, JSON) with generated tool-call payloads; 17 to 39 % of the bytes of a size class are outside ASCII.
 
 Families: the tokenizer files of sixteen public checkpoints. Ten byte-level BPE vocabularies (DeepSeek V4.1 Flash,
 DeepSeek V3.2, Llama 3.2, Llama 4 Scout, gpt-oss, Qwen3.6, GLM-5.3 Flash, MiniMax M3, MiMo V2.6, and Ministral 3 through
