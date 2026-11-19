@@ -17,6 +17,7 @@ use openai_protocol::worker::{
 };
 use serde_json::json;
 use smg_auth::AuditResource;
+use smg_service_discovery::{DISCOVERY_LABEL_PREFIX, DISCOVERY_PROVIDER_LABEL};
 use smg_worker::{
     health::manager::MAX_PROBE_DELAY,
     identity::{
@@ -32,7 +33,6 @@ use crate::{
     config::{unused_credentials_warning, validate_worker_url, RouterConfig},
     observability::log_format::has_control_character,
     routers::{common::snapshot::WorkerRegistry, provider_support},
-    service_discovery::{DISCOVERY_LABEL_PREFIX, DISCOVERY_PROVIDER_LABEL},
     workflow::{Job, JobQueue, WorkerRegistrationMode},
 };
 

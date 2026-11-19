@@ -11,8 +11,8 @@ use smg_worker::{
 
 /// The host of worker discovery: the process whose registry a provider's
 /// workers are reconciled against, and whose job queue takes what a pass
-/// finds to register and to remove. A gateway implements it for its
-/// application context.
+/// finds to register and to remove. A host implements it once, for the
+/// state its tasks share.
 pub trait DiscoveryHost: Send + Sync + 'static {
     /// Every registered worker, with its id.
     fn workers(&self) -> Vec<(WorkerId, Arc<dyn Worker>)>;

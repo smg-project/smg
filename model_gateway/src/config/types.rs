@@ -9,6 +9,11 @@ use serde::{de, Deserialize, Deserializer, Serialize};
 pub use smg_data_connector::{
     HistoryBackend, MemoryConfig, OracleConfig, PostgresConfig, RedisConfig, SchemaConfig,
 };
+use smg_service_discovery::Roles;
+pub use smg_service_discovery::{
+    deserialize_discovery, ConsulDiscoveryConfig, DiscoveryConfig, FileDiscoveryConfig,
+    KubernetesDiscoveryConfig, SlurmDiscoveryConfig, DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS,
+};
 // The worker's settings vocabulary lives in the worker crate.
 pub use smg_worker::settings::{
     PdPairingMode, RetryConfig, UnhealthyRemovalScope, DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS,
@@ -22,12 +27,8 @@ use smg_worker::{
 };
 
 use super::{validation::ConfigValidator, ConfigResult};
-pub use crate::service_discovery::{
-    deserialize_discovery, ConsulDiscoveryConfig, DiscoveryConfig, FileDiscoveryConfig,
-    KubernetesDiscoveryConfig, SlurmDiscoveryConfig, DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS,
-};
 use crate::{
-    routers::common::pd_admission::DEFAULT_PD_ADMISSION_WAIT_SECS, service_discovery::Roles,
+    routers::common::pd_admission::DEFAULT_PD_ADMISSION_WAIT_SECS,
     tenant::DEFAULT_TENANT_HEADER_NAME,
 };
 

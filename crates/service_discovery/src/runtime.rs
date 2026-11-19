@@ -1,4 +1,4 @@
-//! Worker discovery as the running gateway uses it, and the one conversion
+//! Worker discovery as a running host uses it, and the one conversion
 //! that produces it from configuration.
 
 use std::{error::Error, sync::Arc, time::Duration};
@@ -17,7 +17,7 @@ use super::{
     slurm::{self, SlurmProviderConfig},
 };
 
-/// The selected worker-discovery provider, resolved for the running gateway.
+/// The selected worker-discovery provider, resolved for the running host.
 ///
 /// `Option<RuntimeDiscoveryConfig>` is on versus off; a variant carries no
 /// `enabled` flag of its own.
@@ -32,11 +32,11 @@ pub enum RuntimeDiscoveryConfig {
 impl RuntimeDiscoveryConfig {
     /// Resolve configuration into its runtime form.
     ///
-    /// Every input surface — the CLI and the Python binding — converts
-    /// through here, so a setting cannot reach the runtime through one surface
-    /// and be dropped by another. Values arrive as the surface built them,
-    /// defaults included: the CLI's port 80 and `KubernetesDiscoveryConfig`'s
-    /// port 8000 are each kept, not reconciled.
+    /// Every input surface of a host (a command line, a language binding)
+    /// converts through here, so a setting cannot reach the runtime through one
+    /// surface and be dropped by another. Values arrive as the surface built
+    /// them, defaults included: a command line's port 80 and
+    /// `KubernetesDiscoveryConfig`'s port 8000 are each kept, not reconciled.
     pub fn from_config(
         discovery: &DiscoveryConfig,
         roles: Option<Roles>,

@@ -26,7 +26,7 @@ pub enum DiscoveryConfigError {
 /// What resolving a provider's settings answers.
 pub type DiscoveryConfigResult<T> = Result<T, DiscoveryConfigError>;
 
-/// Worker discovery: the one provider that finds this router's workers, and
+/// Worker discovery: the one provider that finds this host's workers, and
 /// that provider's settings. Presence means discovery is on; there is no
 /// `enabled` flag.
 ///
@@ -220,7 +220,7 @@ pub struct FileDiscoveryConfig {
 /// name maps to a worker type.
 ///
 /// Every `check_interval_secs`, `squeue` lists the running jobs with a mapped
-/// name, scoped to `user` (by default, the user the gateway runs as) and, when
+/// name, scoped to `user` (by default, the user the host runs as) and, when
 /// given, to `account` and `partition`. `scontrol` resolves each job's nodes,
 /// and every node serves one inference server on `port`.
 ///

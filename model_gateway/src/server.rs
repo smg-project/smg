@@ -62,6 +62,7 @@ pub(crate) mod tls;
 // The HTTP client constructors and the process crypto provider they install
 // first live in the worker tree, which builds the worker-directed clients
 // with them; callers read them as `server::http_client()` and its siblings.
+use smg_service_discovery::{export_manifest, start_service_discovery, RuntimeDiscoveryConfig};
 pub use smg_worker::connection::client_factory::{
     blocking_http_client, http_client, http_client_builder, install_crypto_provider,
 };
@@ -110,7 +111,6 @@ use crate::{
         connection_timeouts::{ConnectionTimeoutAcceptor, ConnectionTimeouts},
         health::{liveness_response, spawn_readiness_maintainer, start_probe_listener, ProbeState},
     },
-    service_discovery::{export_manifest, start_service_discovery, RuntimeDiscoveryConfig},
     tenant,
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
     workflow::{

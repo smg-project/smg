@@ -1,10 +1,11 @@
-//! A watch on one directory for the files a running gateway reads again:
-//! the worker-discovery manifest and the mounted key files. The directory
-//! rather than the file: a writer that renames a new file over the watched
-//! one replaces its inode, and a watch on the old inode never reports it.
-//! Kubernetes updates a mounted ConfigMap or Secret by swapping a `..data`
-//! symlink beside the files, never touching their names, so that swap wakes
-//! the watch too. A burst of events settles into one wake.
+//! A watch on one directory for the files a running host reads again when
+//! they change: the file provider's manifest of workers, and files of the
+//! host's own, such as mounted key files. The directory rather than the
+//! file: a writer that renames a new file over the watched one replaces its
+//! inode, and a watch on the old inode never reports it. Kubernetes updates
+//! a mounted ConfigMap or Secret by swapping a `..data` symlink beside the
+//! files, never touching their names, so that swap wakes the watch too. A
+//! burst of events settles into one wake.
 
 use std::{
     ffi::{OsStr, OsString},

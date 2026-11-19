@@ -539,8 +539,8 @@ mod discovery_ownership_tests {
     use smg::{
         config::RouterConfig,
         routers::{grpc::backend_client::BasicWorkerBuilder, http::router::Router as HttpRouter},
-        service_discovery::{DISCOVERY_ID_LABEL, DISCOVERY_PROVIDER_LABEL},
     };
+    use smg_service_discovery::{DISCOVERY_ID_LABEL, DISCOVERY_PROVIDER_LABEL};
 
     use super::*;
     use crate::common::{create_test_context, test_app::create_test_app_with_context};

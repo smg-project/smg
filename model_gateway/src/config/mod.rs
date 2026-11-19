@@ -9,6 +9,7 @@ pub(crate) mod validation;
 mod worker_settings;
 
 pub use builder::*;
+use smg_service_discovery::DiscoveryConfigError;
 pub use types::*;
 pub(crate) use validation::parse_listen_ip;
 pub use validation::{
@@ -18,8 +19,6 @@ pub use validation::{
     validate_mesh_server_name, validate_worker_url, RUNTIME_WORKER_THREADS_CEILING,
     RUNTIME_WORKER_THREADS_PER_CPU,
 };
-
-use crate::service_discovery::DiscoveryConfigError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -109,7 +108,7 @@ mod config_error_tests {
     /// of the same kind, in the same words.
     #[test]
     fn a_discovery_refusal_keeps_its_kind_and_its_words() {
-        use crate::service_discovery::DiscoveryConfigError;
+        use smg_service_discovery::DiscoveryConfigError;
 
         let refusal = DiscoveryConfigError::ValidationFailed {
             reason: "no worker pools".to_string(),

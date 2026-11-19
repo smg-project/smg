@@ -5,12 +5,10 @@
 
 use std::{path::Path, sync::Arc, time::Duration};
 
-use smg::{
-    app_context::AppContext,
-    service_discovery::{
-        start_service_discovery, DiscoveryHost, FileProviderConfig, Roles, RuntimeDiscoveryConfig,
-        DISCOVERY_ID_LABEL, DISCOVERY_PROVIDER_LABEL,
-    },
+use smg::app_context::AppContext;
+use smg_service_discovery::{
+    start_service_discovery, DiscoveryHost, FileProviderConfig, Roles, RuntimeDiscoveryConfig,
+    DISCOVERY_ID_LABEL, DISCOVERY_PROVIDER_LABEL,
 };
 use tokio::task::JoinHandle;
 

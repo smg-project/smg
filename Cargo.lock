@@ -8170,6 +8170,7 @@ dependencies = [
  "smg-grpc-client",
  "smg-mesh",
  "smg-rl",
+ "smg-service-discovery",
  "smg-symphony",
  "tempfile",
  "tikv-jemallocator",

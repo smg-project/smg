@@ -7,6 +7,7 @@ use std::{
 };
 
 use openai_protocol::worker::{RuntimeType, WorkerSpec, WorkerType};
+use smg_service_discovery::DiscoveryHost;
 use smg_worker::{
     identity::basic::{ConnectionMode, DEFAULT_BOOTSTRAP_PORT},
     jobs::WorkerRegistrationMode,
@@ -19,7 +20,6 @@ use crate::{
     config::RouterConfig,
     routers::common::snapshot::WorkerRegistry,
     server::http_client,
-    service_discovery::DiscoveryHost,
     workflow::{
         data::WorkerKind,
         steps::{create_worker_workflow_data, CreateLocalWorkerStep, RegisterWorkersStep},

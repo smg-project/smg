@@ -54,10 +54,10 @@ use super::{
 };
 use crate::fs_watch::{settle, DirectoryWatch};
 
-/// The manifest version this gateway reads.
+/// The manifest version this crate reads.
 const MANIFEST_VERSION: u64 = 1;
 
-/// File discovery as the running gateway needs it.
+/// File discovery as the running host needs it.
 #[derive(Debug, Clone)]
 pub struct FileProviderConfig {
     /// The manifest. An absent file is a retryable error, not an empty fleet.
@@ -132,12 +132,11 @@ struct ManifestWorker {
     kv_engine_id: Option<String>,
 }
 
-/// The registered fleet in the manifest's shape, for
-/// `GET /workers?format=manifest`: what a second gateway reads with
-/// `--discovery-provider file`. A data-parallel group is one record at the
-/// address it was registered with. No `id` is written: the reader derives
-/// one from the address, and an id that changed with every restart of the
-/// exporting gateway would re-register the fleet on every reader. A
+/// The registered fleet in the manifest's shape, for a host to export: what
+/// a second host's file provider reads. A data-parallel group is one record
+/// at the address it was registered with. No `id` is written: the reader
+/// derives one from the address, and an id that changed with every restart
+/// of the exporting host would re-register the fleet on every reader. A
 /// worker's key is no manifest field and an address's credentials never
 /// leave: both are dropped, and each such address is named in `warnings`.
 pub fn export_manifest(workers: &[WorkerInfo]) -> Manifest {

@@ -72,6 +72,7 @@ use std::{
 
 use parking_lot::Mutex;
 use smg_mesh::{gossip::NodeStatus, ClusterState, CrdtNamespace, WorkerState};
+use smg_service_discovery::DISCOVERY_ID_LABEL;
 use smg_worker::{
     identity::{
         basic::{ConnectionMode, Worker},
@@ -82,7 +83,7 @@ use smg_worker::{
 use tokio::{sync::broadcast, time::Instant};
 use tracing::{debug, info, warn};
 
-use crate::{routers::common::snapshot::WorkerRegistry, service_discovery::DISCOVERY_ID_LABEL};
+use crate::routers::common::snapshot::WorkerRegistry;
 
 const PREFIX: &str = "worker:";
 

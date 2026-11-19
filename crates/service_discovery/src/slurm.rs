@@ -81,7 +81,7 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 /// How much of a command's stderr an error repeats.
 const STDERR_EXCERPT: usize = 200;
 
-/// Slurm discovery as the running gateway needs it.
+/// Slurm discovery as the running host needs it.
 #[derive(Debug, Clone)]
 pub struct SlurmProviderConfig {
     /// The worker type of each job name, in name order so that `--name` is
@@ -97,7 +97,7 @@ pub struct SlurmProviderConfig {
 }
 
 impl SlurmProviderConfig {
-    /// The router's validation has checked the mapping against the routing
+    /// The host's validation has checked the mapping against the routing
     /// mode; a mode with no worker pools to fill is still refused here.
     /// `routing` is the roles the routing mode accepts: `roles` here names
     /// the provider's own map of job names.

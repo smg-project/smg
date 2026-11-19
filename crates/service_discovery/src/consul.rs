@@ -49,7 +49,7 @@
 //! rejected rather than applied, since instances it holds are missing from
 //! it. One it does not mark is applied as it stands: a token that cannot read
 //! the service at all gets an empty answer, like a service with no instances.
-//! An empty answer from a Consul that denies by default, to a gateway with no
+//! An empty answer from a Consul that denies by default, to a host with no
 //! token, is the likeliest case, and is warned about while it lasts; it is
 //! still applied, because the agent's default token may be what reads the
 //! service. The token needs `service:read` on the service and `node:read` on
@@ -149,7 +149,7 @@ const UNSUPPORTED_ENV: [(&str, &str); 5] = [
     ),
 ];
 
-/// Consul discovery as the running gateway needs it.
+/// Consul discovery as the running host needs it.
 #[derive(Debug, Clone)]
 pub struct ConsulProviderConfig {
     /// The service's health endpoint, `<address>/v1/health/service/<service>`.
