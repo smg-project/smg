@@ -2145,15 +2145,11 @@ impl LoadSink for MemoryStore {
         // A row passed over names its engine as a written row does: the
         // naming is the answer's, whichever sample stands. It moves a mark
         // only beside a rank the answer left out, so the passed-over rows
-        // are read for their engines there and nowhere else.
-        if omits && !passed.is_empty() {
-            for &(id, rank, row) in answer {
-                let pushed = table
-                    .get(&id)
-                    .is_some_and(|ranks| ranks.pushed_since(rank, polled_at));
-                if !pushed || row.is_none() {
-                    continue;
-                }
+        // are read for their engines there and nowhere else: by the list,
+        // which holds exactly them, in the answer's order.
+        if omits {
+            for &position in &passed {
+                let id = answer[position].0;
                 if let Some(engine) = writer.engine_of(id) {
                     note(&mut first, &mut others, engine, Brought::Named);
                 }
