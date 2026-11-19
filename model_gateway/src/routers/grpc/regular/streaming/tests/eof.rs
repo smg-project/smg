@@ -18,20 +18,21 @@ use smg_grpc_client::{
         VllmEngineClient,
     },
 };
+use smg_worker::{
+    health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
+    identity::basic::Worker,
+};
 use tokio::{sync::oneshot, task::JoinHandle, time::timeout};
 use tonic::codec::Codec;
 use tool_parser::types::ToolCallItem;
 
 pub(super) use super::super::character_tokenizer::CharacterTokenizer;
 use super::super::*;
-use crate::{
-    routers::{
-        common::sse::SseReceiver,
-        grpc::{regular::processor::ResponseProcessor, test_engine::mock_engine},
-    },
-    worker::{
-        health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
-        BasicWorkerBuilder, Worker, WorkerRegistry,
+use crate::routers::{
+    common::{snapshot::WorkerRegistry, sse::SseReceiver},
+    grpc::{
+        backend_client::BasicWorkerBuilder, regular::processor::ResponseProcessor,
+        test_engine::mock_engine,
     },
 };
 

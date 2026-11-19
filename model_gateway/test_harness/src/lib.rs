@@ -35,7 +35,10 @@ use std::{
 
 use llm_tokenizer::{mock::MockTokenizer, registry::TokenizerRegistry, traits::Tokenizer};
 use mock_worker::{MockWorker, MockWorkerConfig};
-use openai_protocol::common::{Function, Tool};
+use openai_protocol::{
+    common::{Function, Tool},
+    model_card::ModelCard,
+};
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use serde_json::json;
 use smg::{
@@ -43,15 +46,20 @@ use smg::{
     config::{RouterConfig, RoutingMode},
     middleware::TokenBucket,
     policies::PolicyRegistry,
-    routers::{gateway::Gateway, RouterFactory, RouterTrait},
-    worker::{
-        BasicWorkerBuilder, ModelCard, RuntimeType, Worker, WorkerMonitor, WorkerRegistry,
-        WorkerType,
+    routers::{
+        common::snapshot::{WorkerMonitor, WorkerRegistry},
+        gateway::Gateway,
+        grpc::backend_client::BasicWorkerBuilder,
+        RouterFactory, RouterTrait,
     },
     workflow::Job,
 };
 use smg_data_connector::{
     MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage, StorageBundle,
+};
+use smg_worker::{
+    health::liveness,
+    identity::basic::{RuntimeType, Worker, WorkerType},
 };
 #[allow(unused_imports)]
 pub use test_config::{TestRouterConfig, TestWorkerConfig};
@@ -491,7 +499,7 @@ async fn build_test_app_context(
     // The configuration's liveness budgets before the policy registry is
     // built, as `AppContextBuilder::from_config` orders them: the first call
     // in a process wins.
-    smg::worker::configure_liveness(config.worker_liveness_budgets());
+    liveness::configure_from(config.worker_liveness_budgets());
 
     // Initialize registries. The policy registry takes the configuration's
     // pairing mode, as `AppContextBuilder::from_config` gives it: without it

@@ -5,17 +5,17 @@ use std::{any::Any, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use openai_protocol::worker::{ConnectionMode, WorkerStatus, WorkerType};
-
-use crate::{
-    routers::grpc::proto_wrapper::DispatchBooking,
-    worker::{
-        connection::engine::EngineConnection,
-        health::circuit_breaker::CircuitState,
-        identity::basic::{BasicWorker, WorkerMetadata},
-        runtime::WorkerRuntime,
-        BasicWorkerBuilder, ResolvedResilience, Worker, WorkerResult,
+use smg_worker::{
+    connection::engine::EngineConnection,
+    health::{circuit_breaker::CircuitState, resilience::ResolvedResilience},
+    identity::{
+        basic::{BasicWorker, Worker, WorkerMetadata},
+        error::WorkerResult,
     },
+    runtime::WorkerRuntime,
 };
+
+use crate::routers::grpc::{backend_client::BasicWorkerBuilder, proto_wrapper::DispatchBooking};
 
 /// A worker that answers the door with its state and overrides nothing that
 /// has a default: the shape of a worker written outside this crate that

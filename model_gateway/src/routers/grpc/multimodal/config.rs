@@ -12,6 +12,7 @@ use llm_multimodal::{
 };
 use openai_protocol::worker::MmProcessingMode;
 use parking_lot::RwLock;
+use smg_worker::connection::http_client::build_with;
 use tracing::{debug, warn};
 
 use super::{
@@ -20,7 +21,7 @@ use super::{
     process::preprocessor_config_for,
     settings::MultimodalSettings,
 };
-use crate::{observability::metrics::Metrics, worker::connection::http_client::build_with};
+use crate::observability::metrics::Metrics;
 
 /// Cached model configuration files loaded from the tokenizer directory.
 #[derive(Debug)]

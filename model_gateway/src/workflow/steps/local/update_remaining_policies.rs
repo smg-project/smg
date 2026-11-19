@@ -1,12 +1,12 @@
 //! Step to update cache-aware policies for remaining workers after removal.
 
 use async_trait::async_trait;
+use smg_worker::identity::endpoint::Endpoint;
 use tracing::{debug, info};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use crate::{
     policies::as_cache_aware,
-    worker::identity::endpoint::Endpoint,
     workflow::data::{require_app_context, WorkerRemovalWorkflowData},
 };
 
@@ -81,13 +81,14 @@ impl StepExecutor<WorkerRemovalWorkflowData> for UpdateRemainingPoliciesStep {
 mod tests {
     use std::sync::Arc;
 
+    use smg_worker::test_support::ready_worker;
     use wfaas::WorkflowInstanceId;
 
     use super::*;
     use crate::{
         app_context::{testing::app_context_for_tests, AppContext},
         config::{PolicyConfig, RouterConfig},
-        worker::{test_support::ready_worker, WorkerRegistry},
+        routers::common::snapshot::WorkerRegistry,
         workflow::steps::local::create_worker_removal_workflow_data,
     };
 

@@ -1,5 +1,4 @@
-//! What the gateway's tests build their workers with. The worker crate's
-//! test support is re-exported at the paths it had here; what stands here
+//! What the gateway's tests build their workers with. What stands here
 //! names the gateway's own builder and registry: a worker of a given role, a
 //! labelled gRPC worker, the registry holding a test's workers, and the KV
 //! cache event that clears a worker's cache.
@@ -11,12 +10,12 @@ use openai_protocol::{
     worker::{RuntimeType, WorkerType},
 };
 use smg_grpc_client::common_proto::{kv_cache_event, KvCacheCleared, KvCacheEvent};
-pub use smg_worker::test_support::{
-    assert_metric, gone, held, no_health_check, ready_worker, render_with_recorder, sorted_series,
-    worker_with_model_aliases, CountingConnector, LoadReaders, NoEngine, RefusedAddress,
+use smg_worker::{
+    identity::basic::{ConnectionMode, Worker},
+    test_support::no_health_check,
 };
 
-use crate::worker::{BasicWorkerBuilder, ConnectionMode, Worker, WorkerRegistry};
+use crate::routers::{common::snapshot::WorkerRegistry, grpc::backend_client::BasicWorkerBuilder};
 
 /// A worker of `worker_type` at `url` with no health checker behind it: what
 /// a test fills a pool with when no health checker may run.

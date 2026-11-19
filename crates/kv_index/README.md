@@ -160,7 +160,7 @@ The servicer relays the engine's publisher into `SubscribeKvEvents` through one 
 
 ## Routing and recovery in the gateway
 
-- **One index, one type.** `KvIndex` (`model_gateway/src/worker/kv/index_backend.rs`) holds the
+- **One index, one type.** `KvIndex` (`model_gateway/src/policies/kv_index/index_backend.rs`) holds the
   chain index; the monitor and the policy see the operations they used before. An in-gateway
   exactness test replays generated engine streams and a synthetic hole corpus through the
   monitor's own apply path into the index and the reference indexer.

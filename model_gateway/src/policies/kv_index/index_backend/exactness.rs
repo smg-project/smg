@@ -37,9 +37,9 @@ use super::{
     mock_streams::{self, Shape, Stream},
     KvIndex,
 };
-use crate::worker::{
-    kv::event_monitor::{KvEventMonitor, WorkerIndexState},
-    test_support::kv_cache_cleared,
+use crate::{
+    policies::kv_index::event_monitor::{KvEventMonitor, WorkerIndexState},
+    routers::common::snapshot::test_support::kv_cache_cleared,
 };
 
 // ---------------------------------------------------------------------------

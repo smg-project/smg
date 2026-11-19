@@ -12,6 +12,7 @@ use axum::{
 };
 use futures::{future::Either, FutureExt};
 use openai_protocol::common::CachePartition;
+use smg_worker::identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType};
 use tracing::{debug, error, warn};
 
 use super::{
@@ -31,6 +32,7 @@ use crate::{
     },
     routers::{
         common::{
+            pair_index::{PdPairIndex, PdWire},
             placement::{
                 self, CandidateFilter, PairFailure, PipelinePin, PlacementFailure, PlacementInputs,
                 RefusalSite,
@@ -40,6 +42,7 @@ use crate::{
                 PrefillCandidateError, PrefillLoadGuard, PrefillSelectionContext,
             },
             retry::mark_non_retryable,
+            snapshot::{ModelWorkerSnapshot, RoutingPool, WorkerRegistry, WorkerRegistryExt},
         },
         error,
         grpc::{
@@ -51,10 +54,6 @@ use crate::{
             multimodal,
         },
         prefill_queue_full, prefill_queue_timeout,
-    },
-    worker::{
-        ConnectionMode, ModelWorkerSnapshot, PdPairIndex, PdWire, RoutingPool, RuntimeType, Worker,
-        WorkerRegistry, WorkerRegistryExt, WorkerType,
     },
 };
 
@@ -2433,8 +2432,14 @@ mod tests {
 
     use axum::http::{header::RETRY_AFTER, StatusCode};
     use llm_tokenizer::TokenizerRegistry;
-    use openai_protocol::{generate::GenerateRequest, worker::HealthCheckConfig};
+    use openai_protocol::{
+        generate::GenerateRequest, model_card::ModelCard, worker::HealthCheckConfig,
+    };
     use smg_grpc_client::vllm_proto as vllm;
+    use smg_worker::{
+        identity::basic::{ConnectionMode, WorkerLoadGuard},
+        test_support::no_health_check,
+    };
 
     use super::*;
     use crate::{
@@ -2450,6 +2455,7 @@ mod tests {
                 retry::is_retryable_response,
             },
             grpc::{
+                backend_client::BasicWorkerBuilder,
                 common::stages::execute_plan,
                 context::{ExecutionPlanKind, PreparationOutput, SharedComponents},
                 proto_wrapper::{ProtoGenerateRequest, ProtoRequest},
@@ -2459,10 +2465,6 @@ mod tests {
             PD_PREFILL_QUEUE_FULL,
         },
         tenant::TenantKey,
-        worker::{
-            test_support::no_health_check, BasicWorkerBuilder, ConnectionMode, ModelCard,
-            WorkerLoadGuard,
-        },
     };
 
     fn retry_after(response: &Response) -> Option<&str> {

@@ -8,15 +8,13 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use llm_tokenizer::TokenizerRegistry;
+use smg_worker::identity::basic::ConnectionMode;
 use tracing::{debug, info, warn};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
-use crate::{
-    worker::ConnectionMode,
-    workflow::{
-        data::{require_app_context, WorkerKind, WorkerWorkflowData},
-        Job, TokenizerConfigRequest, TokenizerLoadFailure,
-    },
+use crate::workflow::{
+    data::{require_app_context, WorkerKind, WorkerWorkflowData},
+    Job, TokenizerConfigRequest, TokenizerLoadFailure,
 };
 
 /// Step: Submit tokenizer registration job for the worker's model

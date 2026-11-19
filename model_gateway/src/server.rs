@@ -62,9 +62,14 @@ pub(crate) mod tls;
 // The HTTP client constructors and the process crypto provider they install
 // first live in the worker tree, which builds the worker-directed clients
 // with them; callers read them as `server::http_client()` and its siblings.
-pub use crate::worker::connection::client_factory::{
+pub use smg_worker::connection::client_factory::{
     blocking_http_client, http_client, http_client_builder, install_crypto_provider,
 };
+use smg_worker::{
+    health::manager::{WorkerJobs, WorkerManager, WorkerManagerConfig},
+    identity::{basic::ConnectionMode, endpoint::Endpoint},
+};
+
 use crate::{
     admin::{
         json::AdminJson,
@@ -86,11 +91,9 @@ use crate::{
     },
     middleware::{self, inert::InertLayer, AdmissionQueue, AuthConfig},
     observability::{
-        heap_profile, history_metrics,
-        inflight_tracker::InFlightRequestTracker,
-        logging::{self, LoggingConfig},
-        metrics::{self, PrometheusConfig},
-        metrics_server, otel_trace, runtime_metrics,
+        heap_profile, history_metrics, inflight_tracker::InFlightRequestTracker, logging,
+        logging::LoggingConfig, metrics, metrics::PrometheusConfig, metrics_server, otel_trace,
+        runtime_metrics,
     },
     routers::{
         common::realtime::ws::RealtimeQueryParams,
@@ -109,11 +112,6 @@ use crate::{
     service_discovery::{export_manifest, start_service_discovery, RuntimeDiscoveryConfig},
     tenant,
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
-    worker::{
-        health::manager::{WorkerJobs, WorkerManager, WorkerManagerConfig},
-        identity::endpoint::Endpoint,
-        ConnectionMode,
-    },
     workflow::{
         job_queue::{JobQueue, JobQueueConfig},
         Job, TokenizerConfigRequest, WorkflowEngines,

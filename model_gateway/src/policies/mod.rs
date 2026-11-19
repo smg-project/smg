@@ -5,13 +5,11 @@
 
 use std::{fmt::Debug, sync::Arc};
 
+use openai_protocol::UNKNOWN_MODEL_ID;
 use rand::RngExt as _;
+use smg_worker::{identity::basic::Worker, load::state::LoadReceiver, runtime::RoutingState};
 
-use crate::{
-    config::CacheIndexKind,
-    policies::hash_ring::HashRing,
-    worker::{load::state::LoadReceiver, runtime::RoutingState, Worker, UNKNOWN_MODEL_ID},
-};
+use crate::{config::CacheIndexKind, policies::hash_ring::HashRing};
 
 mod bucket;
 mod cache_aware;
@@ -35,6 +33,7 @@ pub mod expected_wait;
 mod factory;
 pub mod hash_ring;
 mod kept_rings;
+pub mod kv_index;
 mod least_load;
 mod manual;
 mod passthrough;
@@ -45,15 +44,17 @@ mod registry;
 mod round_robin;
 #[cfg(test)]
 pub(crate) mod test_support;
+#[cfg(test)]
+mod worker_load_tests;
 
+// Re-export PrefixMatchResult from kv_index for production use
+pub use ::kv_index::PrefixMatchResult;
 pub use bucket::BucketPolicy;
 pub use cache_aware::{CacheAwarePolicy, TreeHandle, TreeKind};
 pub use cache_namespace::{CacheNamespace, TEXT_MARKER_LEN, TOKEN_MARKER_LEN};
 pub use consistent_hashing::ConsistentHashingPolicy;
 pub use dp_min_token::MinimumTokensPolicy;
 pub use factory::PolicyFactory;
-// Re-export PrefixMatchResult from kv_index for production use
-pub use kv_index::PrefixMatchResult;
 pub use least_load::LeastLoadPolicy;
 pub use manual::{ManualConfig, ManualPolicy};
 pub use passthrough::PassthroughPolicy;
@@ -62,10 +63,9 @@ pub use prefix_hash::{PrefixHashConfig, PrefixHashPolicy};
 pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;
 pub use round_robin::RoundRobinPolicy;
-
 // The periodic task lives beside the worker runtime. The path it had here is
 // kept: the policies name it.
-pub(crate) use crate::worker::periodic_task as utils;
+pub(crate) use smg_worker::periodic_task as utils;
 
 /// Core trait for load balancing policies
 ///
@@ -569,12 +569,14 @@ impl SelectWorkerInfo<'_> {
 #[cfg(test)]
 mod tests {
     use openai_protocol::worker::WorkerStatus;
+    use smg_worker::{
+        identity::basic::{WorkerLoadGuard, WorkerType},
+        runtime::StallReason,
+        test_support::no_health_check,
+    };
 
     use super::*;
-    use crate::worker::{
-        runtime::StallReason, test_support::no_health_check, BasicWorkerBuilder, WorkerLoadGuard,
-        WorkerType,
-    };
+    use crate::routers::grpc::backend_client::BasicWorkerBuilder;
 
     #[test]
     fn test_get_healthy_worker_indices() {
@@ -749,10 +751,9 @@ mod tests {
         use std::{sync::Arc, time::Duration};
 
         use openai_protocol::worker::WorkerStatus;
+        use smg_worker::{health::circuit_breaker::CircuitBreakerConfig, identity::basic::Worker};
 
-        use crate::worker::{
-            health::circuit_breaker::CircuitBreakerConfig, BasicWorkerBuilder, Worker,
-        };
+        use crate::routers::grpc::backend_client::BasicWorkerBuilder;
 
         fn worker(url: &str) -> Arc<dyn Worker> {
             let worker: Arc<dyn Worker> = Arc::new(

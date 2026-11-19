@@ -31,12 +31,13 @@ use rustls::crypto::ring;
 use smg::{
     app_context::AppContext,
     mesh::discovery::{start_mesh_discovery_with_client, MeshDiscoveryConfig},
+    routers::grpc::backend_client::BasicWorkerBuilder,
     service_discovery::{
         start_service_discovery_with_client, ServiceDiscoveryConfig, DISCOVERY_ID_LABEL,
         DISCOVERY_PROVIDER_LABEL, POD_UID_LABEL,
     },
-    worker::{test_support::RefusedAddress, BasicWorkerBuilder},
 };
+use smg_worker::test_support::RefusedAddress;
 use tokio::sync::broadcast;
 
 use super::{start_mock_engine, test_context_with_drain};

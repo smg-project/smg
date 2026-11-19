@@ -6,18 +6,16 @@
 use std::sync::Arc;
 
 use axum::response::Response;
+use smg_worker::identity::basic::Worker;
 use tracing::error;
 
-use crate::{
-    routers::{
-        common::overload,
-        error,
-        grpc::{
-            backend_client::{get_backend_client, BackendClient},
-            context::{ClientSelection, WorkerSelection},
-        },
+use crate::routers::{
+    common::overload,
+    error,
+    grpc::{
+        backend_client::{get_backend_client, BackendClient},
+        context::{ClientSelection, WorkerSelection},
     },
-    worker::Worker,
 };
 
 /// Acquire backend clients for the selected workers, with a dispatch-time

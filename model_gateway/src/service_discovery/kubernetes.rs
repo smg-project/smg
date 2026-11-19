@@ -39,6 +39,13 @@ use kube::{
 };
 use openai_protocol::worker::WorkerType;
 use rustls::crypto::ring;
+use smg_worker::{
+    identity::{
+        basic::{MOONCAKE_CONNECTOR, NIXL_CONNECTOR},
+        endpoint::Endpoint,
+    },
+    pd::pairing::{connector_profile, KvTransferProfile},
+};
 use tokio::{sync::Notify, task, time};
 use tracing::{debug, error, info, warn};
 
@@ -46,14 +53,7 @@ use super::{
     provider::{DiscoveredWorker, DiscoveryKind},
     reconciler::{self, DesiredState},
 };
-use crate::{
-    app_context::AppContext,
-    worker::{
-        identity::endpoint::Endpoint,
-        pd::pairing::{connector_profile, KvTransferProfile},
-        MOONCAKE_CONNECTOR, NIXL_CONNECTOR,
-    },
-};
+use crate::app_context::AppContext;
 
 /// Labels Kubernetes discovery has always stamped on the workers it registers,
 /// kept for existing selectors and dashboards. Ownership no longer depends on

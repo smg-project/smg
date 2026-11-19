@@ -7,16 +7,14 @@ use llm_tokenizer::traits::Tokenizer;
 use openai_protocol::{common::InputIds, generate::GenerateRequest};
 use tracing::error;
 
-use crate::{
-    routers::{
-        error,
-        grpc::{
-            context::{PreparationOutput, RequestContext},
-            regular::stages::token_ids::{reject_unknown_token_id, reported_embedding_rows},
-            utils,
-        },
+use crate::routers::{
+    common::snapshot::WorkerRegistry,
+    error,
+    grpc::{
+        context::{PreparationOutput, RequestContext},
+        regular::stages::token_ids::{reject_unknown_token_id, reported_embedding_rows},
+        utils,
     },
-    worker::WorkerRegistry,
 };
 
 /// Generate preparation stage

@@ -33,16 +33,18 @@ pub enum WorkerKind {
     External,
 }
 
+use smg_worker::{
+    identity::basic::{ConnectionMode, Worker},
+    registry::WorkerId,
+};
+
 use super::{
     mcp_registration::McpServerConfigRequest, steps::local::WorkerRemovalRequest,
     tokenizer_registration::TokenizerConfigRequest,
     wasm_module_registration::WasmModuleConfigRequest,
     wasm_module_removal::WasmModuleRemovalRequest,
 };
-use crate::{
-    app_context::AppContext,
-    worker::{registry::WorkerId, ConnectionMode, Worker},
-};
+use crate::app_context::AppContext;
 
 /// The application context a workflow's data was given, or the workflow's
 /// error for a run that was started without one.

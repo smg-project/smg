@@ -20,7 +20,7 @@ use smg_grpc_client::common_proto::{
 use tracing::warn;
 
 use super::KvEventMonitor;
-use crate::worker::kv::index_backend::{KvIndex, WorkerBlocks};
+use crate::policies::kv_index::index_backend::{KvIndex, WorkerBlocks};
 
 impl KvEventMonitor {
     /// Apply a single KV cache event to the indexer.

@@ -37,6 +37,10 @@ use smg_grpc_client::{
     common_proto as common, constraint_failed_status, tokenspeed_proto as ts, vllm_proto,
 };
 use smg_mcp::{McpConfig, McpOrchestrator};
+use smg_worker::{
+    health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
+    identity::basic::{ConnectionMode, RequestCompletionSink, RuntimeType, Worker, WorkerType},
+};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{transport::Server, Request as TonicRequest, Response as TonicResponse, Status};
@@ -53,6 +57,7 @@ use crate::{
             test_support::fast_retry_config,
         },
         grpc::{
+            backend_client::BasicWorkerBuilder,
             client::ModelInfo,
             common::responses::{
                 background::{queued_response, store_record},
@@ -75,10 +80,6 @@ use crate::{
         },
     },
     tenant::TenantKey,
-    worker::{
-        health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
-        BasicWorkerBuilder, ConnectionMode, RequestCompletionSink, RuntimeType, Worker, WorkerType,
-    },
 };
 
 const MODEL: &str = "request-release-test-model";
@@ -3942,9 +3943,10 @@ async fn a_request_that_completes_before_the_request_timeout_is_unchanged() {
 #[cfg(unix)]
 #[tokio::test]
 async fn a_refused_dial_is_answered_without_the_workers_address() {
+    use smg_worker::test_support::RefusedAddress;
     use tokio::sync::oneshot;
 
-    use crate::{routers::grpc::test_engine::serve_until, worker::test_support::RefusedAddress};
+    use crate::routers::grpc::test_engine::serve_until;
 
     // The worker comes up on a port that stays taken after it: the port
     // refuses again once the worker's listener is gone.

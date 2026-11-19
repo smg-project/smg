@@ -11,12 +11,17 @@ use openai_protocol::{
     model_card::ModelCard,
     worker::{HealthCheckConfig, RuntimeType, WorkerGroupKey, WorkerType},
 };
+use smg_worker::{
+    identity::basic::{ConnectionMode, Worker},
+    load::monitor::poll_group_once_for_test,
+    test_support::LoadReaders,
+};
 
 use crate::{
     policies::{DPRankLoadPolicy, MinimumTokensPolicy},
-    worker::{
-        load::monitor::poll_group_once_for_test, test_support::LoadReaders, BasicWorkerBuilder,
-        ConnectionMode, Worker, WorkerMonitor, WorkerRegistry,
+    routers::{
+        common::snapshot::{WorkerMonitor, WorkerRegistry},
+        grpc::backend_client::BasicWorkerBuilder,
     },
 };
 

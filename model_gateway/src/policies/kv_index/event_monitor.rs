@@ -35,6 +35,17 @@ use std::{
 
 use dashmap::{mapref::entry::Entry, DashMap};
 use futures::FutureExt as _;
+use openai_protocol::UNKNOWN_MODEL_ID;
+use smg_worker::{
+    identity::{
+        basic::{ConnectionMode, Worker},
+        endpoint::Endpoint,
+    },
+    load::monitor::WorkerMonitor,
+    metrics::writers::{KvIndexChainStats, Metrics},
+    periodic_task::PeriodicTask,
+    registry::{Generation, WorkerRegistry},
+};
 use tokio::{
     sync::{oneshot, watch, Mutex},
     task::JoinHandle,
@@ -42,14 +53,6 @@ use tokio::{
 use tracing::{debug, error, info, warn};
 
 use super::index_backend::KvIndex;
-use crate::worker::{
-    identity::endpoint::Endpoint,
-    load::monitor::WorkerMonitor,
-    metrics::{KvIndexChainStats, Metrics},
-    periodic_task::PeriodicTask,
-    registry::{Generation, WorkerRegistry},
-    ConnectionMode, Worker, UNKNOWN_MODEL_ID,
-};
 
 mod admission;
 mod apply;
@@ -946,7 +949,10 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::*;
-    use crate::worker::{kv::index_backend::WorkerBlocks, BasicWorkerBuilder, WorkerRegistry};
+    use crate::{
+        policies::kv_index::index_backend::WorkerBlocks,
+        routers::{common::snapshot::WorkerRegistry, grpc::backend_client::BasicWorkerBuilder},
+    };
 
     async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
         for _ in 0..200 {
@@ -998,8 +1004,7 @@ mod tests {
     #[test]
     fn a_removals_late_write_recreates_no_series_for_the_address() {
         use metrics_exporter_prometheus::PrometheusBuilder;
-
-        use crate::worker::metrics::series::{self as worker_series, WorkerSeriesRecorder};
+        use smg_worker::metrics::{series as worker_series, series::WorkerSeriesRecorder};
 
         let series = worker_series::installed_or_default();
         let recorder = WorkerSeriesRecorder::new(

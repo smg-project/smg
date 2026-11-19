@@ -15,6 +15,11 @@ use futures::{
 use smg_grpc_client::{
     is_transport_failure, media_identity::sglang as media_contract, RequestDeadline,
 };
+use smg_worker::{
+    health::{liveness, liveness::SideReprieve},
+    identity::basic::{ConnectionModeExt, Worker, WorkerTypeExt},
+    metrics::writers::Metrics as WorkerMetrics,
+};
 use tokio::sync::{oneshot, watch};
 use tracing::{debug, error, info_span, warn, Instrument};
 
@@ -59,12 +64,6 @@ use crate::{
                 tonic_ext::{TonicResultExt, TonicStatusExt},
             },
         },
-    },
-    worker::{
-        health::liveness::{self, SideReprieve},
-        identity::basic::WorkerTypeExt,
-        metrics::Metrics as WorkerMetrics,
-        ConnectionModeExt, Worker,
     },
 };
 
@@ -2783,14 +2782,16 @@ pub(crate) mod tests {
     use std::{collections::HashSet, sync::Arc, time::Duration};
 
     use smg_grpc_client::{sglang_proto as sglang, tokenspeed_proto as ts, vllm_proto as vllm};
+    use smg_worker::{
+        health::{circuit_breaker::CircuitBreakerConfig, resilience::ResolvedResilience},
+        identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType},
+        test_support::no_health_check,
+    };
 
     use super::*;
-    use crate::{
-        routers::common::{attempt_ledger::FailedSide, retry::is_retryable_response},
-        worker::{
-            test_support::no_health_check, BasicWorkerBuilder, CircuitBreakerConfig,
-            ConnectionMode, ResolvedResilience, RuntimeType, Worker, WorkerType,
-        },
+    use crate::routers::{
+        common::{attempt_ledger::FailedSide, retry::is_retryable_response},
+        grpc::backend_client::BasicWorkerBuilder,
     };
 
     /// A boxed encode send, as the supervisor's tests build them.
@@ -2839,7 +2840,7 @@ pub(crate) mod tests {
     /// the next one opens a breaker set to two.
     #[tokio::test]
     async fn the_late_stream_of_a_side_retired_for_its_partners_failure_earns_no_breaker_success() {
-        use crate::worker::health::circuit_breaker::CircuitState;
+        use smg_worker::health::circuit_breaker::CircuitState;
         let decode: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("grpc://decode:30002")
                 .worker_type(WorkerType::Decode)
@@ -4856,7 +4857,7 @@ pub(crate) mod tests {
     #[test]
     fn a_decode_verdict_on_the_prefills_dispatch_is_charged_to_the_decode_when_both_sides_answered()
     {
-        use crate::worker::health::circuit_breaker::CircuitState;
+        use smg_worker::health::circuit_breaker::CircuitState;
         let pair = || {
             let worker = |url: &str, worker_type: WorkerType| -> Arc<dyn Worker> {
                 Arc::new(

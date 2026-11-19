@@ -5,12 +5,16 @@
 use std::{sync::Barrier, time::Duration};
 
 use openai_protocol::{model_card::ModelCard, worker::WorkerType};
+use smg_worker::{
+    identity::basic::{ConnectionMode, Worker},
+    test_support::no_health_check,
+};
 use tokio::runtime::Handle;
 
 use super::*;
 use crate::{
     policies::{ConsistentHashingPolicy, LoadBalancingPolicy, SelectWorkerInfo},
-    worker::{test_support::no_health_check, BasicWorkerBuilder, ConnectionMode, Worker},
+    routers::grpc::backend_client::BasicWorkerBuilder,
 };
 
 fn worker_serving(url: &str, model_ids: &[&str]) -> Arc<dyn Worker> {

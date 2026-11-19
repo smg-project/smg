@@ -455,11 +455,11 @@ mod tests {
     };
 
     use axum::{body::Body, http::Request, routing::get, Router};
+    use smg_worker::metrics::writers::is_interned;
     use tokio::sync::mpsc;
     use tower::{ServiceBuilder, ServiceExt};
 
     use super::*;
-    use crate::worker::metrics::is_interned;
 
     #[test]
     fn matched_path_label_defaults_to_other_when_absent() {

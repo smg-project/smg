@@ -1,14 +1,14 @@
 use std::net::TcpListener;
 
 use metrics_exporter_prometheus::PrometheusBuilder;
+use smg_worker::{
+    metrics::writers::Metrics as WorkerMetrics,
+    test_support::{gone, held},
+};
 
 use super::{
     test_support::{assert_metric, render_with_recorder, sorted_series},
     *,
-};
-use crate::worker::{
-    metrics::Metrics as WorkerMetrics,
-    test_support::{gone, held},
 };
 
 #[test]

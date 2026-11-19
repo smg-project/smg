@@ -17,15 +17,13 @@ use openai_protocol::{
 };
 use reasoning_parser::{ParserFactory as ReasoningParserFactory, ReasoningParser};
 use serde_json::Value;
+use smg_worker::identity::basic::{Worker, WorkerType};
 use tool_parser::{
     GrammarStart, ParserFactory as ToolParserFactory, PooledParser as ToolPooledParser, ToolParser,
 };
 use tracing::warn;
 
-use crate::{
-    routers::grpc::context::WorkerSelection,
-    worker::{Worker, WorkerRegistry, WorkerType},
-};
+use crate::routers::{common::snapshot::WorkerRegistry, grpc::context::WorkerSelection};
 
 /// Per-request parser-name resolution.
 ///
@@ -1018,14 +1016,13 @@ mod tests {
     use std::sync::Arc;
 
     use llm_multimodal::MediaPartOrder;
+    use smg_worker::identity::basic::WorkerType;
 
     use super::*;
-    use crate::{
-        routers::grpc::{
-            testing::{forced_call_on_a_thinking_prompt, worker},
-            utils::{chat_utils, message_utils},
-        },
-        worker::{BasicWorkerBuilder, WorkerType},
+    use crate::routers::grpc::{
+        backend_client::BasicWorkerBuilder,
+        testing::{forced_call_on_a_thinking_prompt, worker},
+        utils::{chat_utils, message_utils},
     };
 
     /// A parser that registers a reasoning prefix, so a forced call on a
@@ -2323,9 +2320,12 @@ mod tests {
 #[cfg(test)]
 mod parser_resolver_tests {
     use openai_protocol::model_card::ModelCard;
+    use smg_worker::identity::basic::WorkerType;
 
     use super::*;
-    use crate::worker::{BasicWorkerBuilder, WorkerRegistry, WorkerType};
+    use crate::routers::{
+        common::snapshot::WorkerRegistry, grpc::backend_client::BasicWorkerBuilder,
+    };
 
     fn registry_with_card(card: ModelCard) -> Arc<WorkerRegistry> {
         let registry = Arc::new(WorkerRegistry::new());

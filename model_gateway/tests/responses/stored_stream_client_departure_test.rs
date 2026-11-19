@@ -20,10 +20,10 @@ use serde_json::{json, Value};
 use smg::{
     config::{RouterConfig, RoutingMode},
     observability::metrics::{start_prometheus, PrometheusConfig},
-    routers::RouterFactory,
-    worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType},
+    routers::{grpc::backend_client::BasicWorkerBuilder, RouterFactory},
 };
 use smg_test_harness::{held_worker::HeldWorker, scripted_tokenizer::ScriptedTokenizer};
+use smg_worker::identity::basic::{ConnectionMode, RuntimeType, WorkerType};
 use tokio::net::TcpListener;
 use tower::ServiceExt;
 

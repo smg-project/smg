@@ -26,15 +26,18 @@ use smg_data_connector::{
     MemoryConversationStorage, MemoryResponseStorage, ResponseStorage,
 };
 use smg_mcp::{McpConfig, McpOrchestrator};
+use smg_worker::identity::basic::WorkerType;
 use tool_parser::{ParserFactory as ToolParserFactory, ToolConstraint};
 
 use crate::{
     app_context::AppContext,
     config::{ParserChoice, PolicyConfig, RouterConfig, RouterConfigBuilder, RoutingMode},
     policies::PolicyRegistry,
-    routers::grpc::context::WorkerSelection,
+    routers::{
+        common::snapshot::WorkerRegistry,
+        grpc::{backend_client::BasicWorkerBuilder, context::WorkerSelection},
+    },
     server::http_client,
-    worker::{BasicWorkerBuilder, WorkerRegistry, WorkerType},
 };
 
 /// Minimal `AppContext` for constructing a gRPC router in `mode`. Regular and

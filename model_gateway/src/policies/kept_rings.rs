@@ -50,7 +50,9 @@ use std::{
 };
 
 use dashmap::DashMap;
+use openai_protocol::UNKNOWN_MODEL_ID;
 use rustc_hash::FxBuildHasher;
+use smg_worker::registry::{event::WorkerEvent, worker_model_ids};
 use tokio::sync::broadcast::{
     self,
     error::{RecvError, TryRecvError},
@@ -58,10 +60,7 @@ use tokio::sync::broadcast::{
 use tracing::{debug, error};
 
 use super::hash_ring::HashRing;
-use crate::worker::{
-    registry::{event::WorkerEvent, worker_model_ids},
-    ModelWorkerSnapshot, WorkerRegistry, WorkerRegistryExt, UNKNOWN_MODEL_ID,
-};
+use crate::routers::common::snapshot::{ModelWorkerSnapshot, WorkerRegistry, WorkerRegistryExt};
 
 /// The last ring the warm task filled for each model the registry holds,
 /// the model-less ring under [`UNKNOWN_MODEL_ID`].

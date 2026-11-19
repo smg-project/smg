@@ -84,14 +84,14 @@ use crate::{
     rate_limit::{RateLimitManager, UsageSettlement},
     routers::{
         common::{
-            json_response,
-            placement::{self, Candidates, WireConstraint},
+            json_response, placement,
+            placement::{Candidates, WireConstraint},
             prefill_admission::PrefillAdmission,
             retry::{is_retryable_response, BackoffCalculator},
+            snapshot::{RoutingPool, WorkerRegistry},
         },
         error,
     },
-    worker::{RoutingPool, WorkerRegistry},
 };
 
 /// Which endpoint a pipeline serves. Selects the endpoint-specific stage set

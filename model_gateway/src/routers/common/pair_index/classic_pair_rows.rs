@@ -16,7 +16,7 @@
 //!
 //! ```text
 //! CLASSIC_ROWS_OUT=<dir> CLASSIC_ROWS_COMMIT=<commit> \
-//!   cargo test -p smg --lib worker::pd::pair_index::classic_pair_rows -- --ignored --nocapture
+//!   cargo test -p smg --lib routers::common::pair_index::classic_pair_rows -- --ignored --nocapture
 //! ```
 //!
 //! It is a child of the pair index's module and reads the descriptor the
@@ -27,16 +27,17 @@
 
 use std::{fs, path::PathBuf, sync::Arc};
 
-use openai_protocol::worker::WorkerSpec;
+use openai_protocol::{model_card::ModelCard, worker::WorkerSpec};
 use serde::Serialize;
-
-use crate::worker::{
-    pd::{
-        pair_index::{PdPairIndex, PdWire},
-        pairing::{PdPairing, PdPairingMode},
-    },
+use smg_worker::{
+    identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType},
+    pd::pairing::{PdPairing, PdPairingMode},
     test_support::no_health_check,
-    BasicWorkerBuilder, ConnectionMode, ModelCard, RuntimeType, Worker, WorkerType,
+};
+
+use crate::routers::{
+    common::pair_index::{PdPairIndex, PdWire},
+    grpc::backend_client::BasicWorkerBuilder,
 };
 
 /// The label a transfer backend is reported under by the runtimes that name

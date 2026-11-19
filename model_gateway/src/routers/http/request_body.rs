@@ -16,13 +16,11 @@ use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
 };
 use serde_json::value::{to_raw_value, RawValue};
+use smg_worker::identity::{basic::Worker, error::WorkerError};
 
-use crate::{
-    routers::common::{
-        request_to_value, serialize_json_sized,
-        sglang_fields::{is_stripped_sglang_default, strip_default_sglang_fields, SGLANG_FIELDS},
-    },
-    worker::{Worker, WorkerError},
+use crate::routers::common::{
+    request_to_value, serialize_json_sized,
+    sglang_fields::{is_stripped_sglang_default, strip_default_sglang_fields, SGLANG_FIELDS},
 };
 
 #[derive(Debug)]
@@ -337,16 +335,17 @@ mod tests {
         worker::{ConnectionMode, WorkerStatus},
     };
     use serde_json::{json, Value};
-
-    use super::*;
-    use crate::{
-        routers::http::set_request_model,
-        worker::{
-            connection::engine::EngineConnection, health::circuit_breaker::CircuitState,
-            identity::basic::WorkerMetadata, BasicWorker, BasicWorkerBuilder, ResolvedResilience,
-            WorkerResult, WorkerType,
+    use smg_worker::{
+        connection::engine::EngineConnection,
+        health::{circuit_breaker::CircuitState, resilience::ResolvedResilience},
+        identity::{
+            basic::{BasicWorker, WorkerMetadata, WorkerType},
+            error::WorkerResult,
         },
     };
+
+    use super::*;
+    use crate::routers::{grpc::backend_client::BasicWorkerBuilder, http::set_request_model};
 
     fn worker() -> BasicWorker {
         BasicWorkerBuilder::new("http://worker:8080")

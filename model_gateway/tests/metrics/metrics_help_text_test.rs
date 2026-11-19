@@ -11,10 +11,8 @@
 
 use std::collections::BTreeSet;
 
-use smg::{
-    observability::{metrics::Metrics, metrics_server::start_metrics_server},
-    worker::metrics::Metrics as WorkerMetrics,
-};
+use smg::observability::{metrics::Metrics, metrics_server::start_metrics_server};
+use smg_worker::metrics::writers::Metrics as WorkerMetrics;
 
 use crate::metrics::recorder;
 

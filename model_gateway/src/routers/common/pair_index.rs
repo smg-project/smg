@@ -1,6 +1,6 @@
 //! The compatible prefill/decode pairs of a membership snapshot (#2483).
 //!
-//! Pairing descriptors ([`super::pairing`]) never change after a worker is
+//! Pairing descriptors ([`smg_worker::pd::pairing`]) never change after a worker is
 //! built and membership changes rarely, so which decodes a prefill may pair
 //! with is decided once per snapshot, here, and shared by every request.
 //! Placement then reads a prefill's partner list instead of comparing
@@ -8,8 +8,12 @@
 
 use std::sync::Arc;
 
-use super::pairing::{PairingMismatch, PdPairing, PdPairingMode};
-use crate::worker::{snapshot::RoutingPool, Worker};
+use smg_worker::{
+    identity::basic::Worker,
+    pd::pairing::{PairingMismatch, PdPairing, PdPairingMode},
+};
+
+use crate::routers::common::snapshot::RoutingPool;
 
 /// A shared, immutable list of workers, as the routing snapshot holds them.
 type Workers = Arc<[Arc<dyn Worker>]>;
@@ -207,11 +211,14 @@ fn pairing_mismatches(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::worker::{
-        test_support::no_health_check, BasicWorkerBuilder, ConnectionMode, ModelCard, RuntimeType,
-        WorkerType,
+    use openai_protocol::model_card::ModelCard;
+    use smg_worker::{
+        identity::basic::{ConnectionMode, RuntimeType, WorkerType},
+        test_support::no_health_check,
     };
+
+    use super::*;
+    use crate::routers::grpc::backend_client::BasicWorkerBuilder;
 
     fn worker(url: &str, worker_type: WorkerType, connector: Option<&str>) -> Arc<dyn Worker> {
         let mut builder = BasicWorkerBuilder::new(url)

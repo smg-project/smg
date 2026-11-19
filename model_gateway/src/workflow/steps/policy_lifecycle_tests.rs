@@ -6,7 +6,11 @@
 
 use std::sync::Arc;
 
-use openai_protocol::worker::{WorkerSpec, WorkerUpdateRequest};
+use openai_protocol::{
+    model_card::ModelCard,
+    worker::{WorkerSpec, WorkerUpdateRequest},
+};
+use smg_worker::identity::basic::Worker;
 use wfaas::{StepExecutor, WorkflowContext, WorkflowInstanceId};
 
 use super::{
@@ -18,7 +22,7 @@ use crate::{
     app_context::{testing::app_context_for_tests, AppContext},
     config::RouterConfig,
     policies::CacheAwarePolicy,
-    worker::{BasicWorkerBuilder, ModelCard, Worker, WorkerRegistry},
+    routers::{common::snapshot::WorkerRegistry, grpc::backend_client::BasicWorkerBuilder},
     workflow::data::WorkerRegistrationMode,
 };
 
@@ -422,7 +426,7 @@ async fn a_mesh_import_removed_here_leaves_the_local_workers_policy() {
     .await;
     app_context
         .worker_registry
-        .on_remote_worker_state(&crate::worker::RemoteWorkerState {
+        .on_remote_worker_state(&smg_worker::registry::RemoteWorkerState {
             worker_id: "peer-w1".to_string(),
             model_id: "llama".to_string(),
             url: "http://remote:8080".to_string(),

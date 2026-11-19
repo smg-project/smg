@@ -15,16 +15,11 @@ use openai_protocol::worker::{ConnectionMode, WorkerType};
 pub(crate) use register::registration_hold;
 pub(crate) use register::REGISTER_WORKERS_STEP;
 pub use register::{registered_entries, registered_in, RegisterWorkersStep};
+use smg_worker::identity::basic::{ConnectionModeExt, Worker, WorkerTypeExt};
 pub(crate) use update_policies::start_kv_stream;
 pub use update_policies::UpdatePoliciesStep;
 
-use crate::{
-    observability::metrics::Metrics,
-    worker::{
-        identity::basic::{ConnectionModeExt, WorkerTypeExt},
-        Worker, WorkerRegistry,
-    },
-};
+use crate::{observability::metrics::Metrics, routers::common::snapshot::WorkerRegistry};
 
 /// The key the pool-size gauge is kept by: a worker's type, connection mode
 /// and primary model id.

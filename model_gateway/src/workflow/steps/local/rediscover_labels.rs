@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
+use smg_worker::identity::basic::ConnectionMode;
 use tracing::debug;
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
@@ -20,7 +21,6 @@ use crate::{
         backend_client::{backend_client_if_initialized, BackendClient},
         zmq_client,
     },
-    worker::ConnectionMode,
     workflow::data::WorkerUpdateWorkflowData,
 };
 
@@ -126,12 +126,13 @@ mod tests {
     use std::sync::Arc;
 
     use openai_protocol::worker::{WorkerStatus, WorkerUpdateRequest};
+    use smg_worker::identity::basic::Worker;
     use wfaas::WorkflowInstanceId;
 
     use super::*;
     use crate::{
+        routers::grpc::backend_client::BasicWorkerBuilder,
         service_discovery::testing::create_test_app_context,
-        worker::{BasicWorkerBuilder, Worker},
     };
 
     fn context(

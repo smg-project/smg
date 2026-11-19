@@ -7,22 +7,19 @@ use std::{
 };
 
 use smg_grpc_client::common_proto::{kv_cache_event, KvEventBatch, KvSnapshotChunk};
+use smg_worker::{identity::endpoint::Endpoint, metrics::writers::Metrics};
 use tracing::{debug, info, warn};
 
 use super::{
     apply::{WorkerIndexCounters, WorkerIndexState},
     KvEventMonitor,
 };
-use crate::worker::{
-    identity::endpoint::Endpoint,
-    kv::{
-        event_monitor::{
-            port::{BatchFacts, ResyncReason},
-            recovery::{Admission, RankState},
-        },
-        index_backend::KvIndex,
+use crate::policies::kv_index::{
+    event_monitor::{
+        port::{BatchFacts, ResyncReason},
+        recovery::{Admission, RankState},
     },
-    metrics::Metrics,
+    index_backend::KvIndex,
 };
 
 /// A worker's subscription state: one admission cursor per data-parallel
@@ -525,9 +522,11 @@ mod tests {
     use smg_worker::kv_events::batch_facts;
 
     use super::{super::apply::convert_kv_block, *};
-    use crate::worker::{
-        kv::event_monitor::recovery::{Cursor, GAP_CLEAR_THRESHOLD, RESTART_WINDOW},
-        test_support::kv_cache_cleared,
+    use crate::{
+        policies::kv_index::event_monitor::recovery::{
+            Cursor, GAP_CLEAR_THRESHOLD, RESTART_WINDOW,
+        },
+        routers::common::snapshot::test_support::kv_cache_cleared,
     };
 
     /// Token ids for engine block `id`: distinct content per id.

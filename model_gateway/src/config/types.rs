@@ -13,16 +13,18 @@ pub use smg_data_connector::{
 pub use smg_worker::settings::{
     PdPairingMode, RetryConfig, UnhealthyRemovalScope, DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS,
 };
+use smg_worker::{
+    health::overload::{DEFAULT_TOKEN_USAGE_CEILING, DEFAULT_WAITING_REQUESTS},
+    identity::{
+        basic::{ConnectionMode, RuntimeType},
+        endpoint::Endpoint,
+    },
+};
 
 use super::{validation::ConfigValidator, ConfigResult};
 use crate::{
     routers::common::pd_admission::DEFAULT_PD_ADMISSION_WAIT_SECS,
     tenant::DEFAULT_TENANT_HEADER_NAME,
-    worker::{
-        health::overload::{DEFAULT_TOKEN_USAGE_CEILING, DEFAULT_WAITING_REQUESTS},
-        identity::endpoint::Endpoint,
-        ConnectionMode, RuntimeType,
-    },
 };
 
 /// The parser name that reads a model with the table its tokenizer's `response_template`
