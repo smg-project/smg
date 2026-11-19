@@ -180,7 +180,9 @@ commands_of() {
             local selectors
             # The example controller rides the policy crate's invocation: it asks for the crate's
             # `controller` feature, which this line turns on already, so nothing is built twice.
-            echo "-p kv-index -p smg-mesh -p smg-mm-rdma -p smg-policy-controller -p policy-controller-example --features smg-policy-controller/client,smg-policy-controller/kubernetes"
+            # `worker-host` is on for the cases of the crate's worker objects: no test target requires it,
+            # so nothing else would turn it on.
+            echo "-p kv-index -p smg-mesh -p smg-mm-rdma -p smg-policy-controller -p policy-controller-example --features smg-policy-controller/client,smg-policy-controller/kubernetes,smg-policy-controller/worker-host"
             # The radix tree without its fuzz binary (the radix-fuzz shard); --doc cannot share an invocation with --test.
             selectors=$(test_selectors_except smg-radix-tree fuzz_differential)
             echo "-p smg-radix-tree --lib$selectors"
