@@ -1510,3 +1510,6 @@ impl CliArgs {
         self.to_server_config(router_config)
     }
 }
+
+#[cfg(test)]
+mod tests;

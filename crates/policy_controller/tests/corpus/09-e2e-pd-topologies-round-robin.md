@@ -26,7 +26,7 @@ profiles:
     score: []
     pick: round-robin
 bindings:
-  - match: { model: "*", phase: [prefill, decode] }
+  - match: { model: "*" }
     plan: pd-pair
     profiles: { prefill: prefill, decode: decode }
 ```
