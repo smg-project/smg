@@ -502,8 +502,11 @@ policyController:
   #    runs, and a pod that starts takes it. A pod that starts on a document
   #    that does not run refuses to start: dry-run a document before an
   #    upgrade that moves the pods for another reason. With the election on
-  #    each pod watches its own mount: until the kubelets have turned both,
-  #    two pods hold two documents.
+  #    the leader's mount decides: a standby that follows its leader runs
+  #    the leader's document, and one that follows nobody runs none until
+  #    it leads. A pod that takes the lead applies its own mount's
+  #    document, unless that ran on it since its mount last turned (the
+  #    README says the rest).
   spec: {}
 
   # -- A spec store in place of the document: the name of a
