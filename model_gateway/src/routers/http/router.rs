@@ -172,8 +172,9 @@ struct TypedAttempt<'a, T> {
     /// The engines a failed attempt of this request dispatched to; a retry
     /// re-selects away from them while another available worker is left.
     tried: &'a parking_lot::Mutex<Vec<String>>,
-    /// The store rows of workers sent a failed attempt. A retry names them
-    /// in its ask. Each attempt can add one. Classic policies leave it empty.
+    /// The store rows the request's failed attempts were sent to, one an
+    /// attempt. A retry names them in its ask, and their count is the ask's
+    /// retry number. Classic policies leave it empty.
     tried_rows: &'a parking_lot::Mutex<Vec<WorkerId>>,
 }
 
@@ -385,12 +386,17 @@ impl Router {
     ///
     /// Uses the shared [`WorkerSelector`] (least-loaded) filtered to regular
     /// HTTP workers advertising the `realtime` label, so realtime traffic
-    /// never lands on a worker that can't serve it.
+    /// never lands on a worker that can't serve it. Under the policy
+    /// controller's host every realtime route is refused by name here: the
+    /// selector asks no controller and takes no lease.
     async fn select_realtime_worker(
         &self,
         model_id: &str,
         headers: Option<&HeaderMap>,
     ) -> Result<Arc<dyn Worker>, Response> {
+        if self.host.is_some() {
+            return Err(policy_controller::refused("a realtime request"));
+        }
         WorkerSelector::new(&self.worker_registry)
             .select_worker(&SelectWorkerRequest {
                 model_id,
@@ -807,7 +813,10 @@ impl Router {
 
     /// The attempt's placement by the policy controller, or the answer of a
     /// request it did not place. The commit keeps to this router's own pool
-    /// ([`regular_http`]).
+    /// ([`regular_http`]) and to the workers the request's ledger admits: a
+    /// worker that answered the request definitively takes no later attempt,
+    /// as on the classic arm. The controller reads the tried rows softly, so
+    /// the rule is held here.
     async fn place_attempt<T>(
         &self,
         host: &Host,
@@ -847,7 +856,14 @@ impl Router {
             tried: &tried,
             hashes: None,
         };
-        let placed = host.place_where(&ask, regular_http, Instant::now()).await;
+        let ledger = attempt.ledger;
+        let placed = host
+            .place_where(
+                &ask,
+                |worker| regular_http(worker) && ledger.admits(worker),
+                Instant::now(),
+            )
+            .await;
         placed.map_err(|unplaced| {
             self.report_refusal(
                 "Router::route_typed_request",
@@ -1102,10 +1118,7 @@ impl Router {
         // while another available worker is left to take the request.
         if is_retryable_response(&response) {
             if let Some(row) = row {
-                let mut tried_rows = attempt.tried_rows.lock();
-                if !tried_rows.contains(&row) {
-                    tried_rows.push(row);
-                }
+                attempt.tried_rows.lock().push(row);
             }
             let mut tried = attempt.tried.lock();
             if !tried.iter().any(|engine| engine == worker.base_url()) {

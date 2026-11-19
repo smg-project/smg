@@ -430,8 +430,38 @@ async fn a_stream_whose_body_fails_reads_what_the_body_showed() -> Case {
     Ok(())
 }
 
+#[tokio::test]
+async fn a_worker_that_answered_definitively_takes_no_later_attempt() -> Case {
+    let (a, hits_a) = fixed_status_upstream(&[CHAT], StatusCode::INTERNAL_SERVER_ERROR).await;
+    let (b, hits_b) = fixed_status_upstream(&[CHAT], StatusCode::SERVICE_UNAVAILABLE).await;
+    let registry = Arc::new(WorkerRegistry::new());
+    let (host, _store, _) = bed_over(Arc::clone(&registry), &[&a, &b]);
+    let mut router = router(registry, Some(host));
+    // Eight attempts: with no rule at the commit a later one goes back to
+    // A in all but one run of sixty.
+    router.retry_config = fast_retry_config(8);
+    let response = chat(&router).await?;
+    assert!(response.status().is_server_error());
+    assert_eq!(hits_a.load(Ordering::SeqCst), 1);
+    assert!(hits_b.load(Ordering::SeqCst) >= 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_realtime_request_under_the_host_is_refused_by_name() -> Case {
+    let registry = Arc::new(WorkerRegistry::new());
+    let (host, store, _) = bed_over(Arc::clone(&registry), &["http://127.0.0.1:1"]);
+    let router = router(registry, Some(host));
+    let Err(refusal) = router.select_realtime_worker(MODEL, None).await else {
+        return Err("a realtime worker was selected under the host".into());
+    };
+    assert_refused(refusal, "a realtime request").await?;
+    assert_eq!(LeasesStore::live(&*store, GATEWAY), 0);
+    Ok(())
+}
+
 #[test]
-fn a_failed_placement_adds_its_row_once() -> Case {
+fn a_failed_placement_adds_its_row_each_time() -> Case {
     let url = "http://127.0.0.1:1";
     let registry = Arc::new(WorkerRegistry::new());
     let (host, store, workers) = bed_over(Arc::clone(&registry), &[url]);
@@ -473,7 +503,7 @@ fn a_failed_placement_adds_its_row_once() -> Case {
             Some(row),
         );
     }
-    assert_eq!(*tried_rows.lock(), [row]);
+    assert_eq!(*tried_rows.lock(), [row, row]);
     Ok(())
 }
 

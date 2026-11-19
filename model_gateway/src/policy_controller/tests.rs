@@ -12,7 +12,6 @@ use openai_protocol::{
     model_card::ModelCard,
     transcription::{AudioFile, TranscriptionRequest},
     worker::WorkerStatus,
-    UNKNOWN_MODEL_ID,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
@@ -456,17 +455,30 @@ async fn a_starts_context_holds_the_store_where_the_controller_was_picked() -> C
 
 #[tokio::test]
 async fn a_starts_context_holds_the_host_where_it_holds_the_store() -> Case {
-    let hosted = AppContext::from_config(picked(quiet()), 30, None, None).await?;
+    let hosted = Arc::new(AppContext::from_config(picked(quiet()), 30, None, None).await?);
     assert!(hosted.policy_store.is_some());
     assert!(hosted.policy_host.is_some());
-    let router = Router::new(&Arc::new(hosted)).await?;
+    // A worker the registry holds and the store has no row for. The
+    // controller answers for it; the classic policy would have sent to it.
+    let worker = BasicWorkerBuilder::new("http://127.0.0.1:1")
+        .model(ModelCard::new("model-a"))
+        .status(WorkerStatus::Ready)
+        .build();
+    hosted
+        .worker_registry
+        .register(Arc::new(worker))
+        .ok_or("the worker did not register")?;
+    let router = Router::new(&hosted).await?;
     let meta = RouteRequestMeta::new(TenantKey::from("test-tenant"));
     let routed = router
-        .route_generate(None, &meta, body(json!({"text": "hi"})), UNKNOWN_MODEL_ID)
+        .route_generate(None, &meta, body(json!({"text": "hi"})), "model-a")
         .await;
     assert_eq!(
         refusal(routed).await,
-        (StatusCode::NOT_IMPLEMENTED, BY_NAME.to_owned())
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no_available_workers".to_owned()
+        )
     );
 
     let classic = AppContext::from_config(quiet(), 30, None, None).await?;
