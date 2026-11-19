@@ -351,6 +351,13 @@ pub(super) fn emptied(
     // a hold of the host stands on is not doubted: it stays masked, and a
     // mask of held rows alone gains nobody when it is lifted.
     let own = candidates.iter().any(|row| row.health.stalled);
+    // The two lengths answer for the rows only where every held row is a
+    // row of the mask: the store's view keeps that, and a host that fills
+    // the constraints by hand owes it.
+    debug_assert!(
+        cx.held.iter().all(|held| cx.stalled.contains(held)),
+        "a held row is no row of the mask"
+    );
     let masked = cx.stalled.len() > cx.held.len();
     if (own || masked) && veto_ran(profile, Healthy.name(), ended) {
         return doubted(emptied_by, own, profile, facts, cx, buf, set);
@@ -3265,7 +3272,9 @@ mod tests {
     /// A hold changes nothing on a side of a pair, which is put to no tier.
     /// A prefill side the host holds on every row, and one with a doubted
     /// row among held ones, are shed at the health stage, and the filter
-    /// listed behind that stage is asked about no prefill.
+    /// listed behind that stage is asked about no prefill. No tier reads a
+    /// side's held rows: a rule put to a pair's side brings them with it,
+    /// in the same change.
     #[test]
     fn a_pairs_side_under_a_hold_sheds_at_the_health_stage() {
         for held in [&[0, 1][..], &[0]] {

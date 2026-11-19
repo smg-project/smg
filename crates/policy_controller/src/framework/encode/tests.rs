@@ -1568,3 +1568,30 @@ fn two_cuts_of_the_prefills_turn_rotations_apart() {
         );
     }
 }
+
+/// A side's held list takes its room where a hold is first numbered, one
+/// place a row admitted. A mask with no hold takes none, and a fuller hold
+/// over as many rows grows nothing.
+#[test]
+fn a_sides_held_list_is_sized_once_where_a_hold_is_numbered() {
+    let mut side = Admitted::default();
+    for at in 0..8 {
+        side.push(&row(at, Role::Prefill, 1, 0), at as usize, &[]);
+    }
+    side.take_room();
+    side.renumber(&[1, 3], &[]);
+    assert_eq!(side.held.capacity(), 0, "a mask with no hold takes no room");
+    side.masked.clear();
+    side.renumber(&[1, 3], &[3]);
+    assert_eq!((&side.masked[..], &side.held[..]), (&[1, 3][..], &[3][..]));
+    let room = side.held.capacity();
+    assert!(
+        room >= side.rows.len(),
+        "the first hold takes a place a row"
+    );
+    side.masked.clear();
+    let every: Vec<u32> = (0..8).collect();
+    side.renumber(&every, &every);
+    assert_eq!(side.held, every);
+    assert_eq!(side.held.capacity(), room, "a fuller hold grew the list");
+}

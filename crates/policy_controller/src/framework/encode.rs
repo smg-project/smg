@@ -151,7 +151,9 @@ struct Admitted {
     /// The rows here that the mask's held rows name, by their index here.
     /// Emptied and filled where a mask is numbered anew
     /// ([`Admitted::renumber`]) and read with that mask alone: a decision
-    /// under no mask leaves it as it was.
+    /// under no mask leaves it as it was. Its room is taken where a hold is
+    /// numbered, not with the rows: a decision under no hold pays nothing
+    /// for it.
     held: Vec<u32>,
 }
 
@@ -181,18 +183,23 @@ impl Admitted {
     /// its index here: a masked row that was left out masks none. The mask
     /// and the rows both ascend by the pool's index. The mask's held rows
     /// are rows of it, numbered the same way into a list of their own: a
-    /// stage of a side reads the two as a stage of a whole pool does.
+    /// stage of a side reads the two as a stage of a whole pool does. The
+    /// held list takes its room here, one place a row admitted: the first
+    /// decision under a hold sizes it once, and no fuller hold over as many
+    /// rows grows it.
     fn renumber(&mut self, stalled: &[u32], held: &[u32]) {
         number(&self.from, stalled, &mut self.masked);
         self.held.clear();
         if !held.is_empty() {
+            self.held.reserve(self.rows.len());
             number(&self.from, held, &mut self.held);
         }
     }
 
     /// Takes the room a mask numbered anew fills at most, one place a row
     /// admitted: a decision under a mask then allocates nothing that a
-    /// decision under none did not.
+    /// decision under none did not, but the held list's room, which the
+    /// first decision under a hold takes ([`Admitted::renumber`]).
     fn take_room(&mut self) {
         self.masked.reserve(self.rows.len());
     }

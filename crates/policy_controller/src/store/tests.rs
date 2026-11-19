@@ -2167,7 +2167,8 @@ fn a_noted_veto_is_written_only_while_its_note_stands() {
     let g = GatewayId(1);
     let w = ready(&store, "http://a:8000");
 
-    // No note behind the write: written as the plain door writes it.
+    // No note behind the write: the veto is written as it is said, here
+    // with no hold.
     let written = store.gateway_veto_noted(g, w, Some(first), None, false, now);
     assert_eq!(written, VetoWrite::Written);
     assert!(store.vetoed(g, w, now));
