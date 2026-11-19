@@ -154,7 +154,7 @@ pub mod wit;
 #[cfg(feature = "worker-host")]
 pub mod worker_host;
 
-pub use catalog::{Catalog, CatalogError, StageKind};
+pub use catalog::{Catalog, CatalogError, StageBuild, StageError, StageKind};
 pub use counts::{KeptCounts, LentCounts};
 pub use decision::{
     Decision, Lifted, Pair, Pick, Queue, Shed, ShedReason, Survivors, Target, Targets, Trace,
