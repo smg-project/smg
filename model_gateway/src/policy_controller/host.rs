@@ -297,14 +297,34 @@ impl Host {
         missed: &mut Vec<WorkerId>,
         now: Instant,
     ) -> Option<Placed> {
+        self.commit_where(asked, |_| true, missed, now)
+    }
+
+    /// The commit of a route with a rule of its own: as [`Host::commit`],
+    /// and a target whose worker `holds` refuses is passed over like one
+    /// the gateway cannot send to.
+    ///
+    /// The rule is the route's and the controller does not read it. Where
+    /// few workers pass it, an attempt's asks may end with no worker while
+    /// one that passes stands. A demand the controller keeps ahead of its
+    /// stages takes the rule's place once the request can state it.
+    pub(crate) fn commit_where(
+        &self,
+        asked: Asked,
+        holds: impl Fn(&dyn Worker) -> bool,
+        missed: &mut Vec<WorkerId>,
+        now: Instant,
+    ) -> Option<Placed> {
         let Asked {
             targets,
             mut handle,
         } = asked;
         for (index, target) in targets.iter().enumerate() {
-            let sendable = self
-                .worker(target.id)
-                .filter(|worker| worker.is_healthy() && worker.circuit_breaker_can_execute());
+            let sendable = self.worker(target.id).filter(|worker| {
+                worker.is_healthy()
+                    && worker.circuit_breaker_can_execute()
+                    && holds(worker.as_ref())
+            });
             if let Some(worker) = sendable {
                 handle.take(index);
                 return Some(Placed {
@@ -322,10 +342,21 @@ impl Host {
     /// A regular attempt's worker at `now`: the ask and the commit, three
     /// asks at most. After the third the attempt has no worker.
     pub(crate) async fn place(&self, ask: &Ask<'_>, now: Instant) -> Result<Placed, Unplaced> {
+        self.place_where(ask, |_| true, now).await
+    }
+
+    /// A regular attempt's worker at `now` on a route with a rule of its
+    /// own: as [`Host::place`], over [`Host::commit_where`].
+    pub(crate) async fn place_where(
+        &self,
+        ask: &Ask<'_>,
+        holds: impl Fn(&dyn Worker) -> bool + Send + Sync,
+        now: Instant,
+    ) -> Result<Placed, Unplaced> {
         let mut missed: Vec<WorkerId> = Vec::new();
         for _ in 0..ASKS {
             let asked = self.ask(ask, &missed, now).await?;
-            if let Some(placed) = self.commit(asked, &mut missed, now) {
+            if let Some(placed) = self.commit_where(asked, &holds, &mut missed, now) {
                 return Ok(placed);
             }
         }

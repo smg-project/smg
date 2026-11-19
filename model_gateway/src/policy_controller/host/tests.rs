@@ -103,6 +103,33 @@ async fn a_worker_the_gateway_cannot_send_to_is_passed_over() {
 }
 
 #[tokio::test]
+async fn a_target_the_routes_rule_refuses_is_passed_over() {
+    let (host, _store, _workers) = bed(&["http://w0:8000", "http://w1:8000"]);
+    for turn in 0..8u8 {
+        let placed = host
+            .place_where(
+                &first(&[turn]),
+                |worker| worker.url() != "http://w0:8000",
+                Instant::now(),
+            )
+            .await
+            .expect("the worker the rule holds");
+        assert_eq!(placed.worker().url(), "http://w1:8000");
+    }
+}
+
+#[tokio::test]
+async fn a_rule_that_refuses_every_target_ends_the_attempt_and_its_leases() {
+    let (host, store, _workers) = bed(&["http://w0:8000", "http://w1:8000"]);
+    let unplaced = host
+        .place_where(&first(b"r1"), |_| false, Instant::now())
+        .await
+        .err();
+    assert_eq!(unplaced, Some(Unplaced::NoTargetHolds));
+    assert_eq!(live(&store, 0), 0);
+}
+
+#[tokio::test]
 async fn a_store_with_no_row_sheds_by_the_controllers_reason() {
     let (host, _store, _workers) = bed(&[]);
     let unplaced = host
