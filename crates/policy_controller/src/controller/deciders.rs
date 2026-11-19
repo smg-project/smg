@@ -114,11 +114,12 @@
 //!
 //! What a lease does not do yet. A stage hears a lease's issue here, its
 //! release where its decider's last read or its stream's send stops its
-//! answer or its stream's queue refuses it, its dispatch, completion and
-//! release at its gateway's word and its end at the dispatch deadline or
-//! where its request is asked again, and not the end of a lease whose
-//! gateway was let go: a document that names a stage in need of the calls
-//! stays refused.
+//! answer, where its stream's queue refuses it and where that stream ends
+//! with it still in the queue, its dispatch, completion and release at its
+//! gateway's word and its end at the dispatch deadline or where its
+//! request is asked again, and not the end of a lease whose gateway was
+//! let go: a document that names a stage in need of the calls stays
+//! refused.
 //!
 //! A term mints 2^32 - 1 ids, and under every term but the last a leader
 //! leaves before they end. The first answer a term hands over with an id at

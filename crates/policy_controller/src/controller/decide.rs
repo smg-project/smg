@@ -6,7 +6,8 @@
 //! credit, its queue of answers and its place among its gateway's streams
 //! end with it, and so does the lease of each decision still in that
 //! queue: no gateway will read one, so the stream gives its lease up at
-//! its end, as it does for a decision it stops at the send.
+//! its end, as it does for a decision it stops at the send. Its hand goes
+//! back to the store there, so what it handed is applied as it leaves.
 //!
 //! Where the replica leads, a stream is a present gateway's
 //! ([`Gateways`](super::gateways::Gateways)): it is refused at its open
@@ -71,6 +72,7 @@
 
 use std::{
     future::{self, Future},
+    mem,
     pin::Pin,
     sync::{atomic::Ordering, Arc},
     task::{Context, Poll, Waker},
@@ -184,7 +186,7 @@ pub(crate) struct Answers<S = Streaming<proto::DecideRequest>> {
     gateway: GatewayId,
     /// The stream's hand at the leases' file: a decision stopped at the
     /// send gives its lease up through it, and so does each decision still
-    /// in the queue at the stream's end.
+    /// in the queue at the stream's end, where the hand is given back.
     hand: Hand,
     /// The gateway's frames; `None` once it closed its side.
     inbound: Option<S>,
@@ -421,6 +423,12 @@ impl<S> Drop for Answers<S> {
     /// closed first: an answer a decider makes from here on is refused
     /// there, and its decider gives that lease up. Each answer found is
     /// counted as that decider counts one: dropped, its stream gone.
+    ///
+    /// The hand then goes back to the store, as a session's does at its
+    /// end ([`MemoryStore::hand_back`]). Where a file's decider keeps its
+    /// watch a hand leaves its frame for that decider's next look. This
+    /// last look applies it in place where no decider is at work: what
+    /// the stream handed here, and at each send it stopped.
     fn drop(&mut self) {
         self.decided.close();
         let abandoned = Said::Released(None, ReleaseReason::Abandoned);
@@ -440,6 +448,9 @@ impl<S> Drop for Answers<S> {
             let counts = self.shared.deciders.counts();
             counts.dropped_gone.fetch_add(dropped, Ordering::Relaxed);
         }
+        let hand = mem::replace(&mut self.hand, Hand::new(self.gateway));
+        let store: &MemoryStore = &self.shared.store;
+        store.hand_back(hand);
     }
 }
 
@@ -1761,6 +1772,33 @@ mod tests {
         assert_eq!(again.map(|count| count.load(Ordering::Relaxed)), [1, 0]);
         let store: &dyn LeasesStore = bed.shared.store.as_ref();
         assert_eq!(store.live(gateway), 2);
+    }
+
+    /// A stream's end gives its hand back, as a session's end does. With
+    /// more than one decider a file that holds a lease keeps its decider's
+    /// watch, and a hand leaves its frame there for that decider's next
+    /// look. The stream's last look applies it in place: the engine has
+    /// heard of both leases by the time the stream is gone.
+    #[tokio::test]
+    async fn a_stream_that_ends_at_a_watched_file_applies_its_releases_as_it_leaves() {
+        let (step, at_read, release) = hold();
+        let bed = bed_with((2, 8), None, [step]).await;
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let later = bed.shared.store.apply(hearing(&heard, 2));
+        later.expect("a later generation");
+        let _seat = bed.welcomed(NAME, 1);
+        let (_frames, stream) = two_queued(&bed, at_read, &release).await;
+        // Three leases stand on the decider's file, so it keeps its watch
+        // there. The watch can start ahead of the case's own request: the
+        // case goes on once the decider has left that work too.
+        let store = Arc::clone(&bed.shared.store);
+        settled(|| store.watches() == 1 && store.working() == 0).await;
+        let issued: Vec<u64> = heard.lock().iter().map(|&(id, _)| id).collect();
+        assert_eq!(issued.len(), 3);
+        drop(stream);
+        let abandoned = Some(ReleaseReason::Abandoned);
+        let told = [(issued[0], abandoned), (issued[1], abandoned)];
+        assert_eq!(heard.lock()[3..], told);
     }
 
     /// A lease tells what its dispatch span has left where its stream

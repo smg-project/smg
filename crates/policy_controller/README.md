@@ -13,7 +13,8 @@ This page explains the document.
 5. [Session keys and keyed policies](#session-keys-and-keyed-policies)
 6. [Loading and changing a document](#loading-and-changing-a-document)
 7. [A stage of your own](#a-stage-of-your-own)
-8. [What is not built yet](#what-is-not-built-yet)
+8. [When a gateway loses its stream](#when-a-gateway-loses-its-stream)
+9. [What is not built yet](#what-is-not-built-yet)
 
 ## The smallest document
 
@@ -658,8 +659,34 @@ score:
 - The keys of a parameter map carry no order. The factory reads them in key order, and two files that differ in that order alone have one digest. A key written twice is refused.
 - A filter and a picker take no parameters yet.
 
+## When a gateway loses its stream
+
+A gateway asks the stock controller for decisions on a stream. Each decision is a **lease** on its worker: the worker counts as booked for that request. A lease that no dispatch names within five seconds is given up.
+
+A stream can end with requests unanswered. Two rules keep one lease standing for one request.
+
+- **The stream's end.** A decide stream that ends gives up the lease of every decision it had not sent yet. No gateway could use them.
+- **A request asked again.** A gateway whose stream ended sends each unanswered request again and marks it `again` (`DecideRequest.again` in [`contracts`](contracts)). The controller ends the lease of the earlier ask at once, where it still waits for a dispatch, and decides the request anew.
+
+What a gateway must hold to:
+
+- The mark is for a request whose stream has ended, and the gateway reads nothing more from that stream. On a stream that is still open the earlier answer can still arrive, and it would carry a lease the mark has ended.
+- A request sent twice without the mark is two requests and two leases.
+- A repeat that the stream answers `Busy` before a decider takes it ends nothing. The next ask of that request carries the mark again.
+- The earlier lease is found by a 64-bit fingerprint of the request's id, among that gateway's own leases.
+
+Two counters tell what happened, on the admin listener's `/metrics`:
+
+| counter | what it counts |
+|---|---|
+| `smg_policy_controller_decide_asked_again_total` | requests marked `again`, by `earlier_lease`: `ended` where the earlier lease still waited, `none` where no lease of the request waited |
+| `smg_policy_controller_decide_answers_dropped_total` | answers no stream took, by `cause`: `stream_gone` where the stream had ended, before the answer was made or with it still in the stream's queue, and `queue_full` |
+
+After a stream's end most repeats read `none`: the stream gave the lease up, or the first ask was never decided. That is no error.
+
 ## What is not built yet
 
+- A client that marks a request as asked again. The controller serves the mark. The crate's own client does not set it yet.
 - A plan that waits for the prefill worker's answer before it picks the decode worker. `pd-pair` and `epd` pick every worker in one decision.
 - Encode placement through a door. The stock controller and the in-process door decide `pd-pair` and decide the prefill and decode of `epd`. Placing a worker for each encode item takes the library's `Engine::decide_encode_pair` entry.
 - A choice by the media a worker can process, outside `epd`. No built-in filter reads it.
