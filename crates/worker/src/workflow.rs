@@ -1,18 +1,16 @@
-//! The worker side of the workflows a host runs over its workers, on the
-//! workflow engine (`wfaas`): the steps, the data they pass from one to the
-//! next, and what they ask of their host.
+//! The worker side of the workflows a host runs over its workers. This
+//! module holds the steps, the data they pass along and what they ask of
+//! their host.
 //!
 //! A host is the process that keeps the worker registry: a gateway, or a
 //! controller that registers the workers it finds. A step reads its host
-//! through [`WorkflowHost`] and nothing else of it, so every host runs the
-//! same steps. A workflow's data is generic over the host: the steps a host
-//! adds to the workflow for what only it keeps of a worker read the host as
-//! the type it is.
+//! through [`WorkflowHost`]. A workflow's data is generic over the host, so
+//! the host's own steps can use its concrete type.
 //!
-//! Here stands the removal of a worker ([`worker_removal_workflow`]): the
-//! selection of the workers an address names ([`FindWorkersToRemoveStep`]),
-//! their drain ([`DrainWorkersStep`]) and their removal from the registry
-//! ([`RemoveFromWorkerRegistryStep`]).
+//! With [`RemovalOrder::Registry`], a removal selects workers, drains them
+//! and removes them from the registry.
+//! With [`RemovalOrder::Door`], it selects workers and waits for them to
+//! settle between the host's drain and removal.
 //!
 //! Of a worker's registration it holds the data
 //! ([`WorkerRegistrationWorkflowData`]: what the steps pass along, with one
@@ -55,7 +53,7 @@ pub use detect_connection::DetectConnectionModeStep;
 pub use detect_runtime::DetectRuntimeStep;
 pub use discover_dp::{dp_info_from_labels, DiscoverDpInfoStep};
 pub use discover_metadata::DiscoverMetadataStep;
-pub use drain_workers::DrainWorkersStep;
+pub use drain_workers::{DrainWorkersStep, SettleDrainedWorkersStep};
 pub use find_workers_to_remove::{FindWorkersToRemoveStep, WorkerRemovalRequest};
 pub use host::{require_host, WorkflowHost};
 pub use metadata::discover_engine_labels;
@@ -69,8 +67,8 @@ pub use registration::{
     DETECT_RUNTIME_STEP, DISCOVER_DP_STEP, DISCOVER_METADATA_STEP, WORKER_REGISTRATION_WORKFLOW,
 };
 pub use removal::{
-    worker_removal_workflow, DRAIN_WORKERS_STEP, FIND_WORKERS_TO_REMOVE_STEP,
-    REMOVE_FROM_WORKER_REGISTRY_STEP, WORKER_REMOVAL_WORKFLOW,
+    worker_removal_workflow, RemovalOrder, DRAIN_WORKERS_STEP, FIND_WORKERS_TO_REMOVE_STEP,
+    REMOVE_FROM_WORKER_REGISTRY_STEP, SETTLE_DRAINED_WORKERS_STEP, WORKER_REMOVAL_WORKFLOW,
 };
 pub use remove_from_worker_registry::RemoveFromWorkerRegistryStep;
 pub use retry::single_attempt;

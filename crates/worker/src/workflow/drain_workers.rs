@@ -28,6 +28,9 @@ use crate::{
 /// resolved drain settle window before downstream steps remove them.
 pub struct DrainWorkersStep;
 
+/// Waits for the settle windows of the workers the host's drain marked.
+pub struct SettleDrainedWorkersStep;
+
 async fn settle_drained_workers(workers: &[Arc<dyn Worker>]) {
     let Some(seconds) = workers
         .iter()
@@ -44,6 +47,17 @@ async fn settle_drained_workers(workers: &[Arc<dyn Worker>]) {
         seconds
     );
     tokio::time::sleep(Duration::from_secs(seconds)).await;
+}
+
+#[async_trait]
+impl<H: WorkflowHost> StepExecutor<WorkerRemovalWorkflowData<H>> for SettleDrainedWorkersStep {
+    async fn execute(
+        &self,
+        context: &mut WorkflowContext<WorkerRemovalWorkflowData<H>>,
+    ) -> WorkflowResult<StepResult> {
+        settle_drained_workers(&context.data.drained_workers).await;
+        Ok(StepResult::Success)
+    }
 }
 
 #[async_trait]

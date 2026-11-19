@@ -22,7 +22,8 @@ pub use rediscover_labels::RediscoverLabelsStep;
 pub use release_tokenizer::ReleaseTokenizerStep;
 pub use remove_from_policy_registry::RemoveFromPolicyRegistryStep;
 use smg_worker::workflow::{
-    single_attempt, worker_removal_workflow, WorkerRemovalRequest, REMOVE_FROM_WORKER_REGISTRY_STEP,
+    single_attempt, worker_removal_workflow, RemovalOrder, WorkerRemovalRequest,
+    REMOVE_FROM_WORKER_REGISTRY_STEP,
 };
 pub use submit_tokenizer_job::SubmitTokenizerJobStep;
 pub use update_policies_for_worker::UpdatePoliciesForWorkerStep;
@@ -59,7 +60,7 @@ use crate::{
 /// that fails or times out must not keep a departed model's tokenizer
 /// resident (a failed step's dependents are never scheduled).
 pub fn create_worker_removal_workflow() -> WorkflowDefinition<WorkerRemovalWorkflowData> {
-    worker_removal_workflow()
+    worker_removal_workflow(RemovalOrder::Registry)
         .add_step(
             StepDefinition::new(
                 "remove_from_policy_registry",
