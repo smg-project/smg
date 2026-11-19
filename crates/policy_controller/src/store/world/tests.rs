@@ -1351,6 +1351,31 @@ fn a_veto_with_no_kind_told_holds_to_its_end() {
     assert_eq!(stalled(&store, ASKER, t0), []);
 }
 
+/// A hold never outlasts its veto: one noted with a hold past the veto's
+/// own end reads held up to that end and clear at it. A hold that stood on
+/// would name a row no mask names, beside another worker's standing doubt.
+#[test]
+fn a_hold_noted_past_its_vetos_end_is_cut_to_that_end() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let first = member(&store, "http://a:8000");
+    let second = member(&store, "http://b:8000");
+    let until = t0 + Duration::from_secs(2);
+    let past = until + Duration::from_secs(2);
+    let written = store.gateway_veto_noted(ASKER, first, Some(until), Some(past), false, t0);
+    assert_eq!(written, VetoWrite::Written);
+    // A doubt of another worker that stands on: the mask is not empty when
+    // the first veto ends.
+    let written = store.gateway_veto_noted(ASKER, second, Some(past), None, false, t0);
+    assert_eq!(written, VetoWrite::Written);
+    assert_eq!(held(&store, ASKER, t0), [first]);
+    assert_eq!(doubted(&store, ASKER, t0), [second]);
+    // At the veto's end its row is clear and the lent view names no held
+    // row, though the hold as it was told would stand two seconds more.
+    assert_eq!(held(&store, ASKER, until), []);
+    assert_eq!(stalled(&store, ASKER, until), [second]);
+}
+
 #[test]
 fn two_vetoes_of_one_gateway_set_in_falling_id_order_are_each_found_by_its_id() {
     let store = MemoryStore::new();
