@@ -55,7 +55,7 @@
 //! that holds by the draw, not by construction: two runs' counts meet with
 //! odds near a run's writes over 2^38.
 
-use std::{collections::hash_map::RandomState, hash::BuildHasher, sync::Arc};
+use std::sync::Arc;
 
 use parking_lot::Mutex;
 use tonic::Status;
@@ -69,7 +69,9 @@ use crate::{
     proto::{self, register_worker_request::Mode, worker_event::Event},
     replication::Log,
     store::{
-        HealthSink, Kinds, Maker, MemoryStore, Position, WorkerRow, WorkerStatus, WorkersStore,
+        membership::{self, life},
+        HealthSink, Kinds, Laid, Maker, MemoryStore, Position, WorkerRow, WorkerStatus,
+        WorkersStore,
     },
     view::WorkerId,
 };
@@ -110,26 +112,8 @@ fn moved() -> Status {
 /// caller of that provider under another key is told so: where a new worker
 /// took an address, its provider takes the old one away by the old key.
 fn made_by(row: &WorkerRow, caller: &Maker) -> Result<(), Status> {
-    if row.maker == *caller {
-        return Ok(());
-    }
-    Err(Status::permission_denied(match (&row.maker, caller) {
-        (Maker::Control, _) => {
-            "the row was made by a control call: its maker alone changes it".to_owned()
-        }
-        (Maker::Provider(found), Maker::Provider(own)) if found.provider() == own.provider() => {
-            let provider = found.provider();
-            format!(
-                "the row is provider {provider}'s under another key: that key's caller changes it"
-            )
-        }
-        (Maker::Provider(found), _) => {
-            let provider = found.provider();
-            format!(
-                "the row is provider {provider}'s: its worker is changed at the provider's source"
-            )
-        }
-    }))
+    row.made_by(caller)
+        .map_err(|not| Status::permission_denied(not.to_string()))
 }
 
 /// The contract's names of the door's three calls, as an audit line says
@@ -141,43 +125,11 @@ const DEREGISTER: &str = "DeregisterWorker";
 /// contract has the name.
 const TAKEN_AWAY: &str = "a provider's removal";
 
-/// The low bits of a life's number hold the store's epoch, counted from the
-/// door's base; the leader's term stands above them.
-const EPOCH_BITS: u32 = 40;
-
-/// The bound of a base and of an epoch, each: their sum and one stay inside
-/// the low bits.
-const HALF: u64 = 1 << (EPOCH_BITS - 1);
-
-/// The number of the life a registration makes under `term` in a store that
-/// stands at `epoch`, at a door whose count starts at `base`.
-///
-/// Every life the store held was numbered at an earlier epoch of this term
-/// or under an earlier term, and a registration moves the epoch, so no two
-/// lives share a number, the later of two lives of one run under one term
-/// has the higher one, and the id of a URL's next life is one no life of it
-/// had. Another run under the same term counts from another base. A term
-/// past 2^24, or a base or an epoch past 2^39, would carry into the other's
-/// bits, and a number that wraps repeats: a debug build asserts the three
-/// bounds (a term a second for half a year, a thousand writes a second for
-/// seventeen years).
-fn life(term: u64, base: u64, epoch: u64) -> u64 {
-    debug_assert!(
-        term >> (u64::BITS - EPOCH_BITS) == 0,
-        "a term past its 24 bits: {term}"
-    );
-    debug_assert!(base < HALF, "a base past its 39 bits: {base}");
-    debug_assert!(epoch < HALF, "an epoch past its 39 bits: {epoch}");
-    (term << EPOCH_BITS) | (base.wrapping_add(epoch).wrapping_add(1) & ((1 << EPOCH_BITS) - 1))
-}
-
 impl Door {
-    /// The door over `store` and the log it journals to, its count starting
-    /// at a draw of this run: 39 bits of a hash under the keys the standard
-    /// library draws for a process's maps, so the crate gains no generator
-    /// for one number.
+    /// The door over `store` and the log it journals to. The count of lives
+    /// starts at a draw for this run.
     pub(crate) fn new(store: Arc<MemoryStore>, log: Arc<Log>) -> Self {
-        Self::based(store, log, RandomState::new().hash_one(0u8) % HALF)
+        Self::based(store, log, membership::base())
     }
 
     /// The door over `store` and its log, its count starting at `base`,
@@ -324,21 +276,20 @@ impl Door {
                 // Ahead of the test of equal facts: a caller that did not
                 // make the row is told so, and never that it stands unmoved.
                 made_by(&row, maker)?;
-                if mode == Mode::Upsert && facts == row.facts {
-                    let epoch = self.store.epoch();
-                    let at = self.place();
-                    let unmoved = worker_wire::relabelled(&row);
-                    return Ok(told(REGISTER, by, unmoved, false, epoch, at));
-                }
-                // The store carries a status across incarnations only where
-                // these three stand: a change of one is a new worker under
-                // the URL. The models stand as a set: a reorder alone is
-                // made in place.
-                let another = facts.role != row.facts.role
-                    || facts.wire_modes != row.facts.wire_modes
-                    || !facts.same_models(&row.facts);
-                if mode == Mode::Replace || another {
-                    facts.incarnation = self.next_life(admitted)?;
+                let laid = if mode == Mode::Replace {
+                    Laid::Another
+                } else {
+                    facts.laid_over(&row.facts)
+                };
+                match laid {
+                    Laid::Unmoved => {
+                        let epoch = self.store.epoch();
+                        let at = self.place();
+                        let unmoved = worker_wire::relabelled(&row);
+                        return Ok(told(REGISTER, by, unmoved, false, epoch, at));
+                    }
+                    Laid::InPlace => {}
+                    Laid::Another => facts.incarnation = self.next_life(admitted)?,
                 }
                 Some(row)
             }

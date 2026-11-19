@@ -165,6 +165,17 @@ pub struct WorkerFacts {
 }
 
 impl WorkerFacts {
+    /// A URL's bytes.
+    pub const URL_BYTES: usize = 2_048;
+    /// The bytes of a name: a runtime, a zone, a model id.
+    pub const NAME_BYTES: usize = 256;
+    /// A label's key, in bytes.
+    pub const LABEL_KEY_BYTES: usize = 128;
+    /// A label's value, in bytes.
+    pub const LABEL_VALUE_BYTES: usize = 4_096;
+    /// The labels of one row.
+    pub const LABELS: usize = 128;
+
     /// Whether these facts name the models `other` names, in any order and
     /// however often. The order is a fact of its own (a row's events are
     /// indexed under its first model), and a reorder alone is no other
