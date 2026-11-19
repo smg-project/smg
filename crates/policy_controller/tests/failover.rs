@@ -413,8 +413,9 @@ async fn a_killed_leaders_standby_answers_each_routing_key_on_its_worker() {
         }
 
         // Both files change, each to another document. The leader's watch
-        // applies its own as the next generation. The standby's watch looks
-        // at nothing while it follows: its document is its leader's.
+        // applies its own as the next generation. The standby's watch shows
+        // its door the file and applies nothing while it follows: its
+        // document is its leader's.
         std::fs::write(&own, OWN).expect("the standby's file");
         std::fs::write(&spec, CHANGED).expect("the leader's file");
         let changed = Instant::now();
