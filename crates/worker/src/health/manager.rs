@@ -11,6 +11,14 @@
 //! probe just passed to a probe's timeout from now (its return is
 //! consecutive reads, not consecutive intervals); `in_flight` keeps a slow
 //! probe from being joined by a second one.
+//!
+//! What a probe's outcome or a connect signal does to a worker's status
+//! crosses the port of [`super::port`]: this loop is the port's collector.
+//! It says the fact to a [`HealthSink`], and what the fact did to the status
+//! is the sink's answer.
+//! The schedule still reads the status on the worker object (the places are
+//! on the trait). The registry's impl of the port, further down, is the
+//! state machine.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -34,7 +42,10 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     connection::engine::NO_ENGINE_CONNECTOR,
-    health::liveness,
+    health::{
+        liveness,
+        port::{HealthSink, ProbeAnswer},
+    },
     identity::{
         basic::{ConnectionMode, RuntimeType, Worker, WorkerType, WorkerTypeExt},
         endpoint::{grpc_base_url, Endpoint},
@@ -247,6 +258,25 @@ impl WorkerManager {
         config: WorkerManagerConfig,
         job_queue: Option<Arc<dyn WorkerJobs>>,
     ) -> Self {
+        let sink: Arc<dyn HealthSink> = registry.clone();
+        Self::start_with_sink(registry, sink, config, job_queue)
+    }
+
+    /// [`Self::start`] over the sink a host hands: the loop says each
+    /// probe's outcome and each connect signal to `sink`, and what the fact
+    /// did to the status is the sink's answer. `registry` holds the worker
+    /// objects the loop probes, and the loop's schedule reads their status
+    /// (the places are on [`HealthSink`]): a sink that keeps the status
+    /// elsewhere writes it on the worker object before it answers, by the
+    /// registry's guarded transition. [`Self::start`] hands the registry as
+    /// the sink too, since it runs
+    /// this crate's status state machine over those objects.
+    pub fn start_with_sink<G: Generation>(
+        registry: Arc<WorkerRegistry<G>>,
+        sink: Arc<dyn HealthSink>,
+        config: WorkerManagerConfig,
+        job_queue: Option<Arc<dyn WorkerJobs>>,
+    ) -> Self {
         let shutdown_notify = Arc::new(Notify::new());
         let shutdown_clone = shutdown_notify.clone();
 
@@ -282,6 +312,7 @@ impl WorkerManager {
         let handle = tokio::spawn(async move {
             run_health_loop(
                 registry,
+                sink,
                 events_rx,
                 connect_rx,
                 next_check,
@@ -329,11 +360,6 @@ struct RemovalCandidate {
     worker_id: WorkerId,
     url: String,
     expected_revision: u64,
-}
-
-enum ProbeApplyResult {
-    Applied(Option<(WorkerStatus, WorkerStatus)>),
-    Stale,
 }
 
 type ProbeFutures = FuturesUnordered<Pin<Box<dyn Future<Output = ProbeCompletion> + Send>>>;
@@ -455,8 +481,13 @@ fn deadline_after(now: tokio::time::Instant, delay: Duration) -> tokio::time::In
 /// thread has already captured a consistent registry snapshot. The only
 /// in-loop reconcile is the lag-recovery rebuild triggered by
 /// `RecvError::Lagged`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the loop's own inputs, each handed once by the start: no caller builds them twice"
+)]
 async fn run_health_loop<G: Generation>(
     registry: Arc<WorkerRegistry<G>>,
+    sink: Arc<dyn HealthSink>,
     mut events_rx: broadcast::Receiver<WorkerEvent>,
     mut connect_rx: Option<mpsc::UnboundedReceiver<WorkerConnected>>,
     mut next_check: HashMap<WorkerId, tokio::time::Instant>,
@@ -510,13 +541,14 @@ async fn run_health_loop<G: Generation>(
                 in_flight.remove(&worker_id);
                 match apply_probe_completion(
                     &registry,
+                    sink.as_ref(),
                     completion,
                     removal_queue.as_deref().map(|queue| (queue, config.remove_unhealthy)),
                     job_queue.as_deref(),
                 )
                 .await
                 {
-                    ProbeApplyResult::Applied(Some((_, new))) => {
+                    ProbeAnswer::Moved { new, .. } => {
                         // A worker that just failed under removal leaves the
                         // schedule (its removal is in flight). Every other
                         // transition keeps the deadline armed at the probe's
@@ -550,11 +582,13 @@ async fn run_health_loop<G: Generation>(
                     // run of passes a run of reads (a flapping engine has to
                     // answer across it); a failed read, a stale outcome and a
                     // worker already Ready keep the deadline armed at the
-                    // launch.
-                    ProbeApplyResult::Applied(None)
+                    // launch. The status is the sink's answer, read where
+                    // the outcome was judged: the loop does not read the
+                    // worker object a second time for it.
+                    ProbeAnswer::Stood(status)
                         if probe_ok
                             && matches!(
-                                worker.status(),
+                                status,
                                 WorkerStatus::NotReady | WorkerStatus::Failed
                             ) =>
                     {
@@ -562,7 +596,7 @@ async fn run_health_loop<G: Generation>(
                             &registry,
                             &worker_id,
                             worker.as_ref(),
-                            worker.status(),
+                            status,
                             &config,
                         );
                         if matches!(slot, ProbeSlot::Probe(_)) {
@@ -581,7 +615,7 @@ async fn run_health_loop<G: Generation>(
                                 .or_insert(due);
                         }
                     }
-                    ProbeApplyResult::Applied(None) | ProbeApplyResult::Stale => {}
+                    ProbeAnswer::Stood(_) | ProbeAnswer::Stale => {}
                 }
             }
             () = tokio::time::sleep_until(sleep_until) => {}
@@ -590,6 +624,7 @@ async fn run_health_loop<G: Generation>(
                     Some(connected) => {
                         apply_connect_signal_and_refresh(
                             &registry,
+                            sink.as_ref(),
                             connected,
                             &mut next_check,
                             &config,
@@ -773,14 +808,17 @@ fn queue_due_probes<G: Generation>(
     removals
 }
 
+/// Says a completed probe's outcome to `sink`, and does the collector's part
+/// of the answer: the log lines and the two jobs after a transition.
 /// `removal` is where a worker that just failed goes, and which ones go:
 /// `None` when nothing is removed.
 async fn apply_probe_completion<G: Generation>(
     registry: &Arc<WorkerRegistry<G>>,
+    sink: &dyn HealthSink,
     completion: ProbeCompletion,
     removal: Option<(&dyn WorkerJobs, UnhealthyRemovalScope)>,
     refresh_queue: Option<&dyn WorkerJobs>,
-) -> ProbeApplyResult {
+) -> ProbeAnswer {
     let ProbeCompletion {
         worker_id,
         worker,
@@ -788,7 +826,6 @@ async fn apply_probe_completion<G: Generation>(
         launched_status,
         probe_result,
     } = completion;
-    let health_config = &worker.metadata().health_config;
 
     let probe_ok = match probe_result {
         Ok(()) => true,
@@ -813,30 +850,17 @@ async fn apply_probe_completion<G: Generation>(
         liveness::on_probe_passed(&worker);
     }
 
-    let Some(((), transition)) =
-        registry.apply_if_revision(&worker_id, expected_revision, |current_worker| {
-            let state = current_worker.runtime_state();
-            let state = state.as_deref();
-            if launched_status == WorkerStatus::Pending {
-                if let Some(state) = state {
-                    state.total_pending_probes_increment();
-                }
-            }
-            (
-                (),
-                compute_next_status(current_worker, state, probe_ok, health_config),
-            )
-        })
-    else {
+    let answer = sink.probe_outcome(&worker_id, probe_ok, expected_revision, launched_status);
+    if answer == ProbeAnswer::Stale {
         debug!(
             worker_url = %worker.redacted_url(),
             expected_revision,
             "Discarding stale probe outcome after worker replacement"
         );
-        return ProbeApplyResult::Stale;
-    };
+        return answer;
+    }
 
-    if let Some((old, new)) = transition {
+    if let ProbeAnswer::Moved { old, new } = answer {
         // At INFO: a worker that leaves or rejoins routing is the line an
         // outage is read from (a refusal names the pool's healthy count, not
         // why it moved); the probe failures behind it are WARN lines already.
@@ -866,7 +890,7 @@ async fn apply_probe_completion<G: Generation>(
         }
     }
 
-    ProbeApplyResult::Applied(transition)
+    answer
 }
 
 /// Await the next connect-readiness signal, or park forever when there is no
@@ -886,12 +910,14 @@ async fn recv_connect_signal(
 /// (`labels_follow_the_engine`, a job queue to run the refresh on).
 async fn apply_connect_signal_and_refresh<G: Generation>(
     registry: &Arc<WorkerRegistry<G>>,
+    sink: &dyn HealthSink,
     connected: WorkerConnected,
     next_check: &mut HashMap<WorkerId, tokio::time::Instant>,
     config: &WorkerManagerConfig,
     job_queue: Option<&dyn WorkerJobs>,
 ) {
-    let Some((worker_id, worker)) = apply_connect_signal(registry, connected, next_check, config)
+    let Some((worker_id, worker)) =
+        apply_connect_signal(registry, sink, connected, next_check, config)
     else {
         return;
     };
@@ -915,13 +941,15 @@ async fn apply_connect_signal_and_refresh<G: Generation>(
 /// not ready for. So where the worker has a health probe, the probe decides:
 /// the signal moves it to now (one round trip instead of up to an interval
 /// of waiting) and the state machine promotes on its success threshold, as
-/// for any demoted worker. The signal flips the status itself only where it
-/// is the health read: a ZMQ handshake (there is no health RPC on that wire;
-/// the handshake is what its probe reads), or a worker whose checks are off
-/// (nothing to read). Returns the worker the signal moved into service, for
-/// what follows a transition (the label refresh); `None` when nothing moved.
+/// for any demoted worker. The signal is said to `sink`, which flips the
+/// status, only where it is the health read: a ZMQ handshake (there is no
+/// health RPC on that wire; the handshake is what its probe reads), or a
+/// worker whose checks are off (nothing to read). Returns the worker the
+/// signal moved into service, for what follows a transition (the label
+/// refresh); `None` when nothing moved.
 fn apply_connect_signal<G: Generation>(
     registry: &Arc<WorkerRegistry<G>>,
+    sink: &dyn HealthSink,
     connected: WorkerConnected,
     next_check: &mut HashMap<WorkerId, tokio::time::Instant>,
     config: &WorkerManagerConfig,
@@ -963,7 +991,7 @@ fn apply_connect_signal<G: Generation>(
         );
         return None;
     }
-    match registry.transition_status_if_revision(&worker_id, revision, WorkerStatus::Ready) {
+    match sink.connected(&worker_id, revision) {
         Some((old, new)) => {
             debug!(worker_url = %Endpoint::redacted_str(&url), ?old, ?new, "Promoted worker on connect signal");
             // A promoted worker serves traffic, so it is on the schedule from
@@ -1156,6 +1184,55 @@ async fn submit_label_refresh(worker: &Arc<dyn Worker>, job_queue: &dyn WorkerJo
             %error,
             "Could not submit a label refresh for a worker that came into service"
         ),
+    }
+}
+
+/// The registry is this crate's health sink: the status state machine over
+/// the worker objects it holds. The consecutive counts are the worker's own
+/// runtime state, the thresholds the worker's own settings, and the guard
+/// the registry's: an outcome judged at an equal revision is judged on the
+/// worker the probe was launched at.
+impl<G: Generation> HealthSink for WorkerRegistry<G> {
+    fn probe_outcome(
+        &self,
+        worker_id: &WorkerId,
+        passed: bool,
+        revision: u64,
+        launched: WorkerStatus,
+    ) -> ProbeAnswer {
+        let Some((status, transition)) =
+            self.apply_if_revision(worker_id, revision, |current_worker| {
+                let state = current_worker.runtime_state();
+                let state = state.as_deref();
+                if launched == WorkerStatus::Pending {
+                    if let Some(state) = state {
+                        state.total_pending_probes_increment();
+                    }
+                }
+                let health_config = &current_worker.metadata().health_config;
+                // The status that stands, read off the runtime state in hand
+                // where the worker keeps one: no second load of that state.
+                let status = state.map_or_else(|| current_worker.status(), WorkerRuntime::status);
+                (
+                    status,
+                    compute_next_status(current_worker, state, passed, health_config),
+                )
+            })
+        else {
+            return ProbeAnswer::Stale;
+        };
+        match transition {
+            Some((old, new)) => ProbeAnswer::Moved { old, new },
+            None => ProbeAnswer::Stood(status),
+        }
+    }
+
+    fn connected(
+        &self,
+        worker_id: &WorkerId,
+        revision: u64,
+    ) -> Option<(WorkerStatus, WorkerStatus)> {
+        self.transition_status_if_revision(worker_id, revision, WorkerStatus::Ready)
     }
 }
 
