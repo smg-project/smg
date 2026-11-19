@@ -96,20 +96,33 @@ where
         let shown = self.rows.lock().get(&id).cloned().unwrap_or_default();
         let mut groups = shown.clone();
         let (restarted, mut events) = events(batch, &mut groups);
-        if restarted {
-            // The main signal's blocks go ahead of the batch's own events,
-            // but not at or under the row's cursor: there the store skips
-            // the batch or empties the rank itself, and a clear among the
-            // events would read as the engine's own, a late batch taken
-            // for a restarted publisher. One stream writes a row's rank, so
-            // the cursor read here is the one the batch meets.
+        // The store reads a clear among a batch's events as the header's
+        // fact: the engine's own clear, which makes a batch at or under the
+        // row's cursor a restarted publisher. The header counts an unowned
+        // clear alone. So where the header counts none, a clear reaches the
+        // store only above the cursor.
+        let cleared = |event: &KvEvent| matches!(event, KvEvent::Cleared);
+        if restarted || (!facts.clears && events.iter().any(cleared)) {
+            // One stream writes a row's rank, so the cursor read here is the
+            // one the batch meets.
             let late = facts.snapshot.is_none()
                 && self
                     .store
                     .cursor(id, rank)
                     .is_some_and(|cursor| cursor.applied > 0 && facts.sequence <= cursor.applied);
             if !late {
-                events.insert(0, KvEvent::Cleared);
+                if restarted {
+                    // The main signal's blocks go ahead of the batch's own
+                    // events.
+                    events.insert(0, KvEvent::Cleared);
+                }
+            } else if !facts.clears {
+                // The store skips the batch or empties the rank itself, and
+                // what stands ahead of a batch's last clear is gone by it:
+                // the events behind that clear are the batch's.
+                if let Some(last) = events.iter().rposition(cleared) {
+                    events.drain(..=last);
+                }
             }
         }
         let facts = store::BatchFacts {
@@ -1184,6 +1197,49 @@ mod tests {
         // The window group is the worker's main signal still.
         f.applied(6, &batch([Data::Stored(window_store(&[3], 0, true))]));
         assert_eq!(f.blocks(), 3);
+    }
+
+    /// A clear owned by a name the header does not count, at a sequence the
+    /// row holds: the batch is late, and the store skips it as any other.
+    #[test]
+    fn a_late_batch_with_an_owned_clear_is_skipped_as_any_late_batch() {
+        let f = Fixture::new();
+        f.applied(9, &batch([Data::Stored(stored(1))]));
+        let second = KvBlocksStored {
+            parent_block_hash: Some(1),
+            ..stored(2)
+        };
+        f.applied(10, &batch([Data::Stored(second)]));
+        let late = batch([
+            Data::Cleared(KvCacheCleared {
+                ownership: Some("engine".into()),
+            }),
+            Data::Stored(main_store(3, 0)),
+        ]);
+        assert_eq!(
+            f.sink.admit(f.row, RANK, facts(9), &late),
+            BatchOutcome::Skipped
+        );
+        assert_eq!(f.blocks(), 2);
+    }
+
+    /// The first batch of a new connection under the cursor is a restarted
+    /// publisher by the store's own rule. Its owned clear still wipes what
+    /// stood ahead of it in the batch.
+    #[test]
+    fn an_owned_clear_in_a_late_batch_the_store_takes_wipes_what_stood_ahead_of_it() {
+        let f = Fixture::new();
+        f.applied(9, &batch([Data::Stored(stored(1))]));
+        f.sink.reconnected(f.row);
+        let restarted = batch([
+            Data::Stored(main_store(5, 0)),
+            Data::Cleared(KvCacheCleared {
+                ownership: Some("engine".into()),
+            }),
+            Data::Stored(main_store(6, 0)),
+        ]);
+        f.applied(3, &restarted);
+        assert_eq!(f.blocks(), 1);
     }
 
     #[test]
