@@ -826,7 +826,9 @@ pub struct Request<'a> {
     /// The request as the engine reads it. The door writes over the
     /// host's what the deciding view adds: the instant in the rows'
     /// clock, the affinity column, the rows the store names and the
-    /// leases' counts. A budget of 0 states none.
+    /// leases' counts. A budget of 0 states none, and the engine is told
+    /// no bound. A frame's 0 says none is left: a host refuses a request
+    /// whose time is spent itself.
     pub facts: RequestFacts<'a>,
     /// What the host alone knows. The door writes its standing vetoes and
     /// the pins of record over the host's.
