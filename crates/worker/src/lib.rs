@@ -64,6 +64,8 @@ pub const UNKNOWN_MODEL_ID: &str = "unknown";
 pub mod connection;
 pub mod health;
 pub mod identity;
+#[cfg(feature = "runtime")]
+pub mod jobs;
 pub mod kv_events;
 pub mod labels;
 #[cfg(feature = "runtime")]

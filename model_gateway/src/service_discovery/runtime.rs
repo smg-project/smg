@@ -6,14 +6,15 @@ use std::{error::Error, sync::Arc, time::Duration};
 use tokio::task;
 
 use super::{
+    config::{
+        DiscoveryConfig, DiscoveryConfigError, DiscoveryConfigResult, KubernetesDiscoveryConfig,
+    },
     consul::{self, ConsulProviderConfig},
     file::{self, FileProviderConfig},
+    host::DiscoveryHost,
     kubernetes::{self, ModelIdSource, ServiceDiscoveryConfig},
+    provider::Roles,
     slurm::{self, SlurmProviderConfig},
-};
-use crate::{
-    app_context::AppContext,
-    config::{ConfigError, ConfigResult, DiscoveryConfig, KubernetesDiscoveryConfig, RoutingMode},
 };
 
 /// The selected worker-discovery provider, resolved for the running gateway.
@@ -36,21 +37,24 @@ impl RuntimeDiscoveryConfig {
     /// and be dropped by another. Values arrive as the surface built them,
     /// defaults included: the CLI's port 80 and `KubernetesDiscoveryConfig`'s
     /// port 8000 are each kept, not reconciled.
-    pub fn from_config(discovery: &DiscoveryConfig, mode: &RoutingMode) -> ConfigResult<Self> {
+    pub fn from_config(
+        discovery: &DiscoveryConfig,
+        roles: Option<Roles>,
+    ) -> DiscoveryConfigResult<Self> {
         match discovery {
             DiscoveryConfig::Kubernetes(kubernetes) => {
-                Ok(Self::Kubernetes(kubernetes_runtime(kubernetes, mode)?))
+                Ok(Self::Kubernetes(kubernetes_runtime(kubernetes, roles)?))
             }
             DiscoveryConfig::File(file) => Ok(Self::File(FileProviderConfig::new(
                 file.path.clone(),
                 Duration::from_secs(file.check_interval_secs),
-                mode,
+                roles,
             )?)),
             DiscoveryConfig::Slurm(slurm) => {
-                Ok(Self::Slurm(SlurmProviderConfig::new(slurm, mode)?))
+                Ok(Self::Slurm(SlurmProviderConfig::new(slurm, roles)?))
             }
             DiscoveryConfig::Consul(consul) => {
-                Ok(Self::Consul(ConsulProviderConfig::new(consul, mode)?))
+                Ok(Self::Consul(ConsulProviderConfig::new(consul, roles)?))
             }
         }
     }
@@ -58,13 +62,13 @@ impl RuntimeDiscoveryConfig {
 
 fn kubernetes_runtime(
     config: &KubernetesDiscoveryConfig,
-    mode: &RoutingMode,
-) -> ConfigResult<ServiceDiscoveryConfig> {
+    roles: Option<Roles>,
+) -> DiscoveryConfigResult<ServiceDiscoveryConfig> {
     let model_id_source = config
         .model_id_source
         .as_deref()
         .map(|source| {
-            ModelIdSource::parse(source).map_err(|reason| ConfigError::InvalidValue {
+            ModelIdSource::parse(source).map_err(|reason| DiscoveryConfigError::InvalidValue {
                 field: "discovery.model_id_source".to_string(),
                 value: source.to_string(),
                 reason,
@@ -78,8 +82,8 @@ fn kubernetes_runtime(
         port: config.port,
         namespace: config.namespace.clone(),
         disaggregated_mode: matches!(
-            mode,
-            RoutingMode::PrefillDecode { .. } | RoutingMode::EncodePrefillDecode { .. }
+            roles,
+            Some(Roles::PrefillDecode | Roles::EncodePrefillDecode)
         ),
         encode_selector: config.encode_selector.clone(),
         prefill_selector: config.prefill_selector.clone(),
@@ -95,33 +99,28 @@ fn kubernetes_runtime(
 /// Start the selected provider's discovery task.
 pub async fn start_service_discovery(
     config: RuntimeDiscoveryConfig,
-    app_context: Arc<AppContext>,
+    host: Arc<dyn DiscoveryHost>,
 ) -> Result<task::JoinHandle<()>, Box<dyn Error + Send + Sync>> {
     match config {
         RuntimeDiscoveryConfig::Kubernetes(config) => {
-            Ok(kubernetes::start_kubernetes_discovery(config, app_context).await?)
+            Ok(kubernetes::start_kubernetes_discovery(config, host).await?)
         }
-        RuntimeDiscoveryConfig::File(config) => Ok(file::start_file_discovery(config, app_context)),
-        RuntimeDiscoveryConfig::Slurm(config) => {
-            Ok(slurm::start_slurm_discovery(config, app_context)?)
-        }
-        RuntimeDiscoveryConfig::Consul(config) => {
-            Ok(consul::start_consul_discovery(config, app_context)?)
-        }
+        RuntimeDiscoveryConfig::File(config) => Ok(file::start_file_discovery(config, host)),
+        RuntimeDiscoveryConfig::Slurm(config) => Ok(slurm::start_slurm_discovery(config, host)?),
+        RuntimeDiscoveryConfig::Consul(config) => Ok(consul::start_consul_discovery(config, host)?),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{
-        test_support::regular_routing_mode, ConsulDiscoveryConfig, FileDiscoveryConfig,
-        SlurmDiscoveryConfig,
+    use crate::service_discovery::config::{
+        ConsulDiscoveryConfig, FileDiscoveryConfig, SlurmDiscoveryConfig,
     };
 
-    fn kubernetes(config: &DiscoveryConfig, mode: &RoutingMode) -> ServiceDiscoveryConfig {
+    fn kubernetes(config: &DiscoveryConfig, roles: Option<Roles>) -> ServiceDiscoveryConfig {
         let Ok(RuntimeDiscoveryConfig::Kubernetes(runtime)) =
-            RuntimeDiscoveryConfig::from_config(config, mode)
+            RuntimeDiscoveryConfig::from_config(config, roles)
         else {
             panic!("expected Kubernetes runtime discovery");
         };
@@ -146,7 +145,7 @@ mod tests {
             ..Default::default()
         });
 
-        let runtime = kubernetes(&config, &regular_routing_mode());
+        let runtime = kubernetes(&config, Some(Roles::Regular));
 
         assert_eq!(runtime.namespace.as_deref(), Some("prod"));
         assert_eq!(runtime.port, 9000);
@@ -169,23 +168,11 @@ mod tests {
     #[test]
     fn disaggregated_modes_select_role_selectors() {
         let config = DiscoveryConfig::Kubernetes(KubernetesDiscoveryConfig::default());
-        for mode in [
-            RoutingMode::PrefillDecode {
-                prefill_urls: vec![],
-                decode_urls: vec![],
-                prefill_policy: None,
-                decode_policy: None,
-            },
-            RoutingMode::EncodePrefillDecode {
-                encode_urls: vec![],
-                prefill_urls: vec![],
-                decode_urls: vec![],
-                encode_policy: None,
-                prefill_policy: None,
-                decode_policy: None,
-            },
-        ] {
-            assert!(kubernetes(&config, &mode).disaggregated_mode, "{mode:?}");
+        for roles in [Roles::PrefillDecode, Roles::EncodePrefillDecode] {
+            assert!(
+                kubernetes(&config, Some(roles)).disaggregated_mode,
+                "{roles:?}"
+            );
         }
     }
 
@@ -196,7 +183,7 @@ mod tests {
             check_interval_secs: 15,
         });
         let Ok(RuntimeDiscoveryConfig::File(runtime)) =
-            RuntimeDiscoveryConfig::from_config(&config, &regular_routing_mode())
+            RuntimeDiscoveryConfig::from_config(&config, Some(Roles::Regular))
         else {
             panic!("expected file runtime discovery");
         };
@@ -219,7 +206,7 @@ mod tests {
             check_interval_secs: 10,
         });
         let Ok(RuntimeDiscoveryConfig::Slurm(runtime)) =
-            RuntimeDiscoveryConfig::from_config(&config, &regular_routing_mode())
+            RuntimeDiscoveryConfig::from_config(&config, Some(Roles::Regular))
         else {
             panic!("expected Slurm runtime discovery");
         };
@@ -235,7 +222,7 @@ mod tests {
             check_interval_secs: 10,
         });
         let Ok(RuntimeDiscoveryConfig::Consul(runtime)) =
-            RuntimeDiscoveryConfig::from_config(&config, &regular_routing_mode())
+            RuntimeDiscoveryConfig::from_config(&config, Some(Roles::Regular))
         else {
             panic!("expected Consul runtime discovery");
         };
@@ -248,10 +235,9 @@ mod tests {
             model_id_source: Some("pod-name".to_string()),
             ..Default::default()
         });
-        let err =
-            RuntimeDiscoveryConfig::from_config(&config, &regular_routing_mode()).unwrap_err();
+        let err = RuntimeDiscoveryConfig::from_config(&config, Some(Roles::Regular)).unwrap_err();
         assert!(
-            matches!(err, ConfigError::InvalidValue { ref field, .. } if field == "discovery.model_id_source"),
+            matches!(err, DiscoveryConfigError::InvalidValue { ref field, .. } if field == "discovery.model_id_source"),
             "{err}"
         );
     }

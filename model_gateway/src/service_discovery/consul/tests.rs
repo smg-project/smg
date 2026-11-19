@@ -4,10 +4,7 @@ use smg_worker::test_support::RefusedAddress;
 use tokio::sync::watch;
 
 use super::*;
-use crate::{
-    config::test_support::{pd_routing_mode, regular_routing_mode},
-    service_discovery::testing::{create_test_app_context, live_app_context},
-};
+use crate::service_discovery::testing::{create_test_app_context, live_app_context};
 
 const PASSING_2_0_4: &str = include_str!("../testdata/consul/health-passing-2.0.4.json");
 const PASSING_1_22_7: &str = include_str!("../testdata/consul/health-passing-1.22.7.json");
@@ -23,7 +20,10 @@ fn discovery(service: &str, address: Option<&str>) -> ConsulDiscoveryConfig {
 
 /// The configuration of `address` (the flag), with `env` as the whole
 /// environment.
-fn resolve(address: Option<&str>, env: &[(&str, &str)]) -> ConfigResult<ConsulProviderConfig> {
+fn resolve(
+    address: Option<&str>,
+    env: &[(&str, &str)],
+) -> DiscoveryConfigResult<ConsulProviderConfig> {
     resolve_service("smg-worker", address, env)
 }
 
@@ -31,20 +31,18 @@ fn resolve_service(
     service: &str,
     address: Option<&str>,
     env: &[(&str, &str)],
-) -> ConfigResult<ConsulProviderConfig> {
+) -> DiscoveryConfigResult<ConsulProviderConfig> {
     let env: HashMap<String, String> = env
         .iter()
         .map(|(name, value)| (name.to_string(), value.to_string()))
         .collect();
-    ConsulProviderConfig::with_env(
-        &discovery(service, address),
-        &regular_routing_mode(),
-        |name| env.get(name).cloned(),
-    )
+    ConsulProviderConfig::with_env(&discovery(service, address), Some(Roles::Regular), |name| {
+        env.get(name).cloned()
+    })
 }
 
-fn config_in(mode: &RoutingMode) -> ConsulProviderConfig {
-    ConsulProviderConfig::with_env(&discovery("smg-worker", None), mode, |_| None).unwrap()
+fn config_in(roles: Option<Roles>) -> ConsulProviderConfig {
+    ConsulProviderConfig::with_env(&discovery("smg-worker", None), roles, |_| None).unwrap()
 }
 
 fn answer(entries: &str) -> Answer {
@@ -106,7 +104,7 @@ fn ids(outcome: &Outcome) -> Vec<&str> {
 #[test]
 fn recorded_answers_read_into_workers() {
     for recorded in [PASSING_2_0_4, PASSING_1_22_7] {
-        let outcome = read(answer(recorded), &config_in(&pd_routing_mode())).unwrap();
+        let outcome = read(answer(recorded), &config_in(Some(Roles::PrefillDecode))).unwrap();
         let mut workers: Vec<(&str, String, WorkerType)> = outcome
             .workers
             .iter()
@@ -157,7 +155,7 @@ fn recorded_answers_read_into_workers() {
         assert_eq!(
             outcome.skipped,
             [Skip {
-                reason: metrics_labels::DISCOVERY_SKIP_INVALID,
+                reason: series::DISCOVERY_SKIP_INVALID,
                 message: "instance dc1/gpu-09/worker-b: smg_worker_type is required in \
                               prefill-decode routing"
                     .to_string(),
@@ -170,7 +168,7 @@ fn recorded_answers_read_into_workers() {
 /// typed ones are left out, each saying why.
 #[test]
 fn regular_routing_takes_the_untyped_instance_alone() {
-    let outcome = read(answer(PASSING_2_0_4), &config_in(&regular_routing_mode())).unwrap();
+    let outcome = read(answer(PASSING_2_0_4), &config_in(Some(Roles::Regular))).unwrap();
     assert_eq!(ids(&outcome), ["dc1/gpu-09/worker-b"]);
     assert_eq!(outcome.workers[0].worker_type, WorkerType::Regular);
     assert_eq!(outcome.skipped.len(), 4, "{:?}", outcome.skipped);
@@ -274,7 +272,7 @@ fn an_instance_that_cannot_be_a_worker_says_why() {
 /// lower id keeps it.
 #[test]
 fn an_address_two_instances_claim_stays_with_the_first_registered() {
-    let config = config_in(&pd_routing_mode());
+    let config = config_in(Some(Roles::PrefillDecode));
     let answer_of = |entries: Vec<Entry>| Answer {
         index: 1,
         entries,
@@ -294,7 +292,7 @@ fn an_address_two_instances_claim_stays_with_the_first_registered() {
     assert_eq!(
         outcome.skipped,
         [Skip {
-            reason: metrics_labels::DISCOVERY_SKIP_CONFLICT,
+            reason: series::DISCOVERY_SKIP_CONFLICT,
             message: "instance dc1/n2/late: 10.0.0.1:8000 is dc1/n1/early's, registered \
                           first"
                 .to_string(),
@@ -317,7 +315,7 @@ fn an_address_two_instances_claim_stays_with_the_first_registered() {
 /// applied, an empty one as an empty fleet.
 #[test]
 fn an_answer_consul_says_it_filtered_is_rejected() {
-    let config = config_in(&pd_routing_mode());
+    let config = config_in(Some(Roles::PrefillDecode));
     let empty = |filtered, default_deny| Answer {
         index: 3,
         entries: vec![],
@@ -351,7 +349,7 @@ fn an_answer_consul_says_it_filtered_is_rejected() {
 /// left, and the warning about a missing token stands while it lasts.
 #[tokio::test]
 async fn the_last_instance_leaves_a_default_deny_consul_read_with_no_token() {
-    let config = config_in(&pd_routing_mode());
+    let config = config_in(Some(Roles::PrefillDecode));
     let client = config.client().unwrap();
     let mut discovery = ConsulDiscovery::new(config, create_test_app_context(), client);
     let deny = |mut answer: Answer| {
@@ -525,7 +523,7 @@ fn settings_it_cannot_honor_are_refused() {
         ),
     ] {
         match resolve(flag, env) {
-            Err(ConfigError::InvalidValue {
+            Err(DiscoveryConfigError::InvalidValue {
                 field: actual,
                 value,
                 ..
@@ -542,7 +540,7 @@ fn settings_it_cannot_honor_are_refused() {
 
     // A CA file that holds no certificate refuses to start too.
     match resolve(https, &[("CONSUL_CACERT", cert)]) {
-        Err(ConfigError::ValidationFailed { reason }) => {
+        Err(DiscoveryConfigError::ValidationFailed { reason }) => {
             assert!(reason.contains("CONSUL_CACERT"), "{reason}");
         }
         other => panic!("expected a refusal, got {other:?}"),
@@ -756,8 +754,8 @@ impl FakeConsul {
         Self { address, seen }
     }
 
-    fn config(&self, mode: &RoutingMode) -> ConsulProviderConfig {
-        ConsulProviderConfig::with_env(&discovery("smg-worker", Some(&self.address)), mode, |_| {
+    fn config(&self, roles: Option<Roles>) -> ConsulProviderConfig {
+        ConsulProviderConfig::with_env(&discovery("smg-worker", Some(&self.address)), roles, |_| {
             None
         })
         .unwrap()
@@ -784,7 +782,7 @@ async fn an_answer_is_read_with_its_index_and_acl_headers() {
         .with("X-Consul-Default-Acl-Policy", "deny")
         .with("X-Consul-Results-Filtered-By-Acls", "true")])
     .await;
-    let config = consul.config(&pd_routing_mode());
+    let config = consul.config(Some(Roles::PrefillDecode));
     let answer = query(config.request(&config.client().unwrap(), 0))
         .await
         .unwrap();
@@ -804,7 +802,7 @@ async fn a_query_that_fails_says_why() {
         Reply::ok(3, "not json"),
     ])
     .await;
-    let config = consul.config(&pd_routing_mode());
+    let config = consul.config(Some(Roles::PrefillDecode));
     let client = config.client().unwrap();
     let mut errors = Vec::new();
     for _ in 0..4 {
@@ -812,8 +810,8 @@ async fn a_query_that_fails_says_why() {
         errors.push((error.metric_reason(), error.to_string()));
     }
     let (unreadable, invalid) = (
-        metrics_labels::SNAPSHOT_ERROR_UNREADABLE,
-        metrics_labels::SNAPSHOT_ERROR_INVALID,
+        series::SNAPSHOT_ERROR_UNREADABLE,
+        series::SNAPSHOT_ERROR_INVALID,
     );
     assert_eq!(
         errors[..3],
@@ -845,7 +843,7 @@ async fn a_query_that_fails_says_why() {
     let closed = RefusedAddress::reserve();
     let config = ConsulProviderConfig::with_env(
         &discovery("smg-worker", Some(&closed.http_url())),
-        &pd_routing_mode(),
+        Some(Roles::PrefillDecode),
         |_| None,
     )
     .unwrap();
@@ -886,7 +884,7 @@ async fn the_index_follows_the_answers() {
         Reply::ok(0, "[]"),
     ])
     .await;
-    let config = consul.config(&pd_routing_mode());
+    let config = consul.config(Some(Roles::PrefillDecode));
     let client = config.client().unwrap();
     let mut discovery = ConsulDiscovery::new(config, create_test_app_context(), client);
 
@@ -927,7 +925,7 @@ async fn the_index_follows_the_answers() {
 /// resets the wait.
 #[tokio::test]
 async fn failures_back_off_and_an_answer_resets_the_backoff() {
-    let config = config_in(&pd_routing_mode());
+    let config = config_in(Some(Roles::PrefillDecode));
     let client = config.client().unwrap();
     let mut discovery = ConsulDiscovery::new(config, create_test_app_context(), client);
     let failure = || {
@@ -953,7 +951,7 @@ async fn ticks_never_restart_the_query_in_flight() {
         Reply::ok(11, "[]").held(Duration::from_millis(2000)),
     ])
     .await;
-    let mut config = consul.config(&pd_routing_mode());
+    let mut config = consul.config(Some(Roles::PrefillDecode));
     config.check_interval = Duration::from_millis(50);
     let client = config.client().unwrap();
     #[expect(
@@ -1053,7 +1051,7 @@ async fn an_instance_dropped_while_it_registers_is_removed_by_the_next_pass() {
     ])
     .await;
     let pass = Duration::from_secs(4);
-    let mut config = consul.config(&regular_routing_mode());
+    let mut config = consul.config(Some(Roles::Regular));
     config.check_interval = pass;
     let client = config.client().unwrap();
     let app_context = live_app_context();
@@ -1112,11 +1110,8 @@ async fn an_instance_dropped_while_it_registers_is_removed_by_the_next_pass() {
 
 #[test]
 fn modes_without_worker_pools_cannot_use_consul_discovery() {
-    let openai = RoutingMode::OpenAI {
-        worker_urls: vec![],
-    };
     assert!(matches!(
-        ConsulProviderConfig::with_env(&discovery("smg-worker", None), &openai, |_| None),
-        Err(ConfigError::ValidationFailed { .. })
+        ConsulProviderConfig::with_env(&discovery("smg-worker", None), None, |_| None),
+        Err(DiscoveryConfigError::ValidationFailed { .. })
     ));
 }

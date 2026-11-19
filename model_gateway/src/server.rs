@@ -66,8 +66,9 @@ pub use smg_worker::connection::client_factory::{
     blocking_http_client, http_client, http_client_builder, install_crypto_provider,
 };
 use smg_worker::{
-    health::manager::{WorkerJobs, WorkerManager, WorkerManagerConfig},
+    health::manager::{WorkerManager, WorkerManagerConfig},
     identity::{basic::ConnectionMode, endpoint::Endpoint},
+    jobs::WorkerJobs,
 };
 
 use crate::{

@@ -37,21 +37,22 @@ use std::{
 
 use openai_protocol::worker::{WorkerInfo, WorkerType};
 use serde::{Deserialize, Serialize};
-use smg_worker::identity::endpoint::{Endpoint, EndpointKey};
+use smg_worker::identity::{
+    endpoint::{Endpoint, EndpointKey},
+    url_door::listed_worker_url_refusal,
+};
 use tokio::{sync::mpsc, task, time};
 use tracing::{info, warn};
 
 use super::{
+    config::{DiscoveryConfigError, DiscoveryConfigResult},
+    host::DiscoveryHost,
     provider::{DiscoveredWorker, DiscoveryKind, Roles},
     reconciler::DesiredState,
+    series,
     snapshot::{LastGood, SnapshotError},
 };
-use crate::{
-    app_context::AppContext,
-    config::{validation::listed_worker_url_refusal, ConfigError, ConfigResult, RoutingMode},
-    fs_watch::{settle, DirectoryWatch},
-    observability::metrics::metrics_labels,
-};
+use crate::fs_watch::{settle, DirectoryWatch};
 
 /// The manifest version this gateway reads.
 const MANIFEST_VERSION: u64 = 1;
@@ -68,10 +69,14 @@ pub struct FileProviderConfig {
 }
 
 impl FileProviderConfig {
-    /// The routing mode decides which worker types a manifest may list; a mode
-    /// with no worker pools to fill is rejected.
-    pub fn new(path: PathBuf, check_interval: Duration, mode: &RoutingMode) -> ConfigResult<Self> {
-        let roles = Roles::of(mode).ok_or_else(|| ConfigError::ValidationFailed {
+    /// The roles decide which worker types a manifest may list. A routing mode
+    /// with no worker pools to fill has none, and is rejected.
+    pub fn new(
+        path: PathBuf,
+        check_interval: Duration,
+        roles: Option<Roles>,
+    ) -> DiscoveryConfigResult<Self> {
+        let roles = roles.ok_or_else(|| DiscoveryConfigError::ValidationFailed {
             reason: "File discovery needs regular, prefill-decode or encode-prefill-decode routing"
                 .to_string(),
         })?;
@@ -334,8 +339,8 @@ enum ManifestError {
 impl SnapshotError for ManifestError {
     fn metric_reason(&self) -> &'static str {
         match self {
-            Self::Unreadable { .. } => metrics_labels::SNAPSHOT_ERROR_UNREADABLE,
-            Self::Invalid { .. } => metrics_labels::SNAPSHOT_ERROR_INVALID,
+            Self::Unreadable { .. } => series::SNAPSHOT_ERROR_UNREADABLE,
+            Self::Invalid { .. } => series::SNAPSHOT_ERROR_INVALID,
         }
     }
 }
@@ -372,7 +377,7 @@ const REWATCH: Duration = Duration::from_secs(1);
 /// listening when its record first appeared.
 pub(super) fn start_file_discovery(
     config: FileProviderConfig,
-    app_context: Arc<AppContext>,
+    host: Arc<dyn DiscoveryHost>,
 ) -> task::JoinHandle<()> {
     info!(
         "Starting file service discovery | manifest: {} | reread on change and every {}s",
@@ -384,7 +389,7 @@ pub(super) fn start_file_discovery(
         clippy::disallowed_methods,
         reason = "worker discovery runs for the lifetime of the server; shutdown aborts the handle"
     )]
-    let handle = task::spawn(FileDiscovery::new(config, app_context).run());
+    let handle = task::spawn(FileDiscovery::new(config, host).run());
 
     handle
 }
@@ -399,7 +404,7 @@ pub(super) fn start_file_discovery(
 /// leaves it in place.
 struct FileDiscovery {
     config: FileProviderConfig,
-    app_context: Arc<AppContext>,
+    host: Arc<dyn DiscoveryHost>,
     /// The watch sends on `wake` whenever the manifest may have changed; the
     /// loop takes the wakes from `woken`.
     wake: mpsc::Sender<()>,
@@ -431,7 +436,7 @@ impl Timers {
 }
 
 impl FileDiscovery {
-    fn new(config: FileProviderConfig, app_context: Arc<AppContext>) -> Self {
+    fn new(config: FileProviderConfig, host: Arc<dyn DiscoveryHost>) -> Self {
         let (wake, woken) = mpsc::channel(1);
         let last_good = LastGood::new(
             DiscoveryKind::File,
@@ -440,7 +445,7 @@ impl FileDiscovery {
         );
         Self {
             config,
-            app_context,
+            host,
             wake,
             woken,
             watch: None,
@@ -466,7 +471,7 @@ impl FileDiscovery {
         let started_at = time::Instant::now();
         self.reread().await;
         self.last_good
-            .reconcile(&self.app_context, started_at)
+            .reconcile(self.host.as_ref(), started_at)
             .await;
     }
 
@@ -943,12 +948,8 @@ mod tests {
 
     #[test]
     fn modes_without_worker_pools_cannot_use_file_discovery() {
-        let mode = RoutingMode::OpenAI {
-            worker_urls: vec![],
-        };
         assert!(
-            FileProviderConfig::new(PathBuf::from("w.json"), Duration::from_secs(1), &mode)
-                .is_err()
+            FileProviderConfig::new(PathBuf::from("w.json"), Duration::from_secs(1), None).is_err()
         );
     }
 
@@ -958,17 +959,12 @@ mod tests {
         let config = FileProviderConfig::new(
             dir.path().join("workers.json"),
             Duration::from_secs(1),
-            &RoutingMode::Regular {
-                worker_urls: vec![],
-            },
+            Some(Roles::Regular),
         )
         .unwrap();
         let err = read_manifest(&config).await.unwrap_err();
         assert!(matches!(err, ManifestError::Unreadable { .. }), "{err}");
-        assert_eq!(
-            err.metric_reason(),
-            metrics_labels::SNAPSHOT_ERROR_UNREADABLE
-        );
+        assert_eq!(err.metric_reason(), series::SNAPSHOT_ERROR_UNREADABLE);
     }
 
     fn discovery(path: &Path) -> FileDiscovery {
@@ -976,14 +972,9 @@ mod tests {
     }
 
     fn discovery_checking_every(path: &Path, check_interval: Duration) -> FileDiscovery {
-        let config = FileProviderConfig::new(
-            path.to_path_buf(),
-            check_interval,
-            &RoutingMode::Regular {
-                worker_urls: vec![],
-            },
-        )
-        .unwrap();
+        let config =
+            FileProviderConfig::new(path.to_path_buf(), check_interval, Some(Roles::Regular))
+                .unwrap();
         FileDiscovery::new(config, create_test_app_context())
     }
 

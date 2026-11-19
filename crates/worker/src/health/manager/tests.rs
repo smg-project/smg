@@ -177,6 +177,7 @@ async fn the_engine_id_read_dials_the_base_address_of_a_rank_row() {
     );
 }
 
+use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use http::{header::AUTHORIZATION, HeaderMap};
 
@@ -189,9 +190,10 @@ use crate::{
         builder,
         error::WorkerError,
     },
+    jobs::WorkerRegistrationMode,
     model_card::ModelCard,
     test_support::{BasicWorkerBuilder, CountingConnector, RefusedAddress, WorkerRegistry},
-    worker::{HealthCheckConfig, WorkerStatus},
+    worker::{HealthCheckConfig, WorkerSpec, WorkerStatus},
 };
 
 fn make_worker(url: &str, success_threshold: u32, failure_threshold: u32) -> Arc<dyn Worker> {
@@ -468,15 +470,6 @@ impl RecordedQueue {
 
 #[async_trait]
 impl WorkerJobs for RecordedQueue {
-    async fn remove_worker(
-        &self,
-        _url: String,
-        _worker_id: &WorkerId,
-        _revision: u64,
-    ) -> Result<(), String> {
-        Ok(())
-    }
-
     async fn refresh_worker_labels(&self, url: String) -> Result<bool, String> {
         let mut held = self.held.lock();
         if held.contains_key(&url) {
@@ -485,6 +478,26 @@ impl WorkerJobs for RecordedQueue {
         }
         held.insert(url, "RefreshWorkerLabels");
         Ok(true)
+    }
+
+    async fn add_worker(
+        &self,
+        _spec: WorkerSpec,
+        _mode: WorkerRegistrationMode,
+    ) -> Result<bool, String> {
+        Ok(true)
+    }
+
+    async fn remove_workers_at(
+        &self,
+        _url: String,
+        _guards: Vec<(WorkerId, u64)>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn job_in_flight(&self, url: &str) -> bool {
+        self.held.lock().contains_key(url)
     }
 }
 
@@ -497,20 +510,32 @@ struct RecordedJobs(parking_lot::Mutex<Vec<Removal>>);
 
 #[async_trait]
 impl WorkerJobs for RecordedJobs {
-    async fn remove_worker(
+    async fn refresh_worker_labels(&self, _url: String) -> Result<bool, String> {
+        Ok(true)
+    }
+
+    async fn add_worker(
+        &self,
+        _spec: WorkerSpec,
+        _mode: WorkerRegistrationMode,
+    ) -> Result<bool, String> {
+        Ok(true)
+    }
+
+    async fn remove_workers_at(
         &self,
         url: String,
-        worker_id: &WorkerId,
-        revision: u64,
+        guards: Vec<(WorkerId, u64)>,
     ) -> Result<(), String> {
-        self.0
-            .lock()
-            .push((url, worker_id.as_str().to_string(), revision));
+        let mut removals = self.0.lock();
+        for (worker_id, revision) in guards {
+            removals.push((url.clone(), worker_id.as_str().to_string(), revision));
+        }
         Ok(())
     }
 
-    async fn refresh_worker_labels(&self, _url: String) -> Result<bool, String> {
-        Ok(true)
+    fn job_in_flight(&self, _url: &str) -> bool {
+        false
     }
 }
 
@@ -807,7 +832,7 @@ async fn manager_loop_promotes_zmq_worker_on_connect_signal() {
 }
 
 fn make_dp_worker(base: &str, rank: usize, size: usize) -> Arc<dyn Worker> {
-    let spec: crate::worker::WorkerSpec = serde_json::from_value(serde_json::json!({
+    let spec: WorkerSpec = serde_json::from_value(serde_json::json!({
         "url": format!("{base}@{rank}"),
         "dp_base_url": base,
         "dp_rank": rank,

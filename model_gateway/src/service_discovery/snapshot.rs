@@ -2,16 +2,17 @@
 //! reads, shared by the file, Slurm and Consul providers, and what such a read
 //! left out.
 
-use std::{collections::HashSet, fmt::Display, sync::Arc};
+use std::{collections::HashSet, fmt::Display};
 
 use tokio::time::Instant;
 use tracing::{info, warn};
 
 use super::{
+    host::DiscoveryHost,
     provider::DiscoveryKind,
     reconciler::{self, DesiredState},
+    series,
 };
-use crate::{app_context::AppContext, observability::metrics::Metrics};
 
 /// A record a read left out of an answer it otherwise applied.
 #[derive(Debug, Clone, PartialEq)]
@@ -44,7 +45,7 @@ impl SkipLog {
     pub(super) fn record(&mut self, skipped: Vec<Skip>) {
         let mut last = HashSet::new();
         for skip in skipped {
-            Metrics::record_discovery_skip(self.kind.metric_label(), skip.reason);
+            series::record_skip(self.kind.metric_label(), skip.reason);
             if !self.last.contains(&skip.message) {
                 warn!("{} left out {}", self.provider, skip.message);
             }
@@ -92,10 +93,7 @@ impl LastGood {
                 self.desired = Some(desired);
             }
             Err(error) => {
-                Metrics::record_discovery_snapshot_error(
-                    self.kind.metric_label(),
-                    error.metric_reason(),
-                );
+                series::record_snapshot_error(self.kind.metric_label(), error.metric_reason());
                 if self.desired.is_some() {
                     warn!("{error}; keeping the last good {}", self.noun);
                 } else {
@@ -111,9 +109,9 @@ impl LastGood {
     }
 
     /// Reconcile the last good snapshot, once there is one.
-    pub(super) async fn reconcile(&self, app_context: &Arc<AppContext>, started_at: Instant) {
+    pub(super) async fn reconcile(&self, host: &dyn DiscoveryHost, started_at: Instant) {
         if let Some(desired) = &self.desired {
-            reconciler::reconcile(desired, self.kind, app_context, started_at).await;
+            reconciler::reconcile(desired, self.kind, host, started_at).await;
         }
     }
 }

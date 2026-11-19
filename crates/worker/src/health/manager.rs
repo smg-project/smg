@@ -21,7 +21,6 @@ use std::{
     time::Duration,
 };
 
-use async_trait::async_trait;
 #[cfg(feature = "axum")]
 use axum::response::{IntoResponse, Response};
 use chrono::Utc;
@@ -41,6 +40,7 @@ use crate::{
         endpoint::{grpc_base_url, Endpoint},
         error::WorkerResult,
     },
+    jobs::WorkerJobs,
     labels::DISCOVERY_PROVIDER_LABEL,
     load::{
         metrics_aggregator::{self, MetricPack},
@@ -168,27 +168,6 @@ pub struct WorkerManagerConfig {
     pub default_check_interval_secs: u64,
     /// Which workers that reach Failed are removed ([`WorkerJobs::remove_worker`]).
     pub remove_unhealthy: UnhealthyRemovalScope,
-}
-
-/// What the health manager asks of the gateway for a worker: the removal of
-/// one that failed, and a re-read of the labels of one that came into
-/// service. The gateway's job queue implements it; the manager names no job.
-#[async_trait]
-pub trait WorkerJobs: Send + Sync {
-    /// Queue the removal of the failed worker `worker_id` at `url`, as it
-    /// stood at `revision`. `url` may be a base address other workers share:
-    /// the removal takes the named worker alone, and only at that revision.
-    async fn remove_worker(
-        &self,
-        url: String,
-        worker_id: &WorkerId,
-        revision: u64,
-    ) -> Result<(), String>;
-
-    /// Queue a re-read of the labels of the worker at `url`. `Ok(false)` when
-    /// another job for the worker is in flight: the refresh is kept and runs
-    /// when that job ends.
-    async fn refresh_worker_labels(&self, url: String) -> Result<bool, String>;
 }
 
 /// How a profiling call is spelled in its log line and its summary.

@@ -18,7 +18,7 @@ use openai_protocol::worker::{
     ConnectionMode, JobStatus, RuntimeType, WorkerSpec, WorkerType, WorkerUpdateRequest,
 };
 use smg_mcp::McpConfig;
-use smg_worker::{health::manager::WorkerJobs, identity::endpoint::Endpoint, registry::WorkerId};
+use smg_worker::{identity::endpoint::Endpoint, jobs::WorkerJobs, registry::WorkerId};
 use tokio::sync::{mpsc, oneshot, Semaphore};
 use tracing::{debug, error, info, warn};
 use wfaas::{StateStore, WorkflowData, WorkflowEngine, WorkflowError, WorkflowId, WorkflowStatus};
@@ -1751,16 +1751,34 @@ impl JobQueue {
 
 #[async_trait]
 impl WorkerJobs for JobQueue {
-    async fn remove_worker(
+    async fn refresh_worker_labels(&self, url: String) -> Result<bool, String> {
+        self.submit_or_defer(Job::RefreshWorkerLabels { url }).await
+    }
+
+    async fn add_worker(
+        &self,
+        spec: WorkerSpec,
+        mode: WorkerRegistrationMode,
+    ) -> Result<bool, String> {
+        self.submit_unless_registering(Job::AddWorker {
+            config: Box::new(spec),
+            registration_mode: mode,
+        })
+        .await
+    }
+
+    async fn remove_workers_at(
         &self,
         url: String,
-        worker_id: &WorkerId,
-        revision: u64,
+        guards: Vec<(WorkerId, u64)>,
     ) -> Result<(), String> {
-        // Guard the failed worker by its own id. The url is a DP base, so the
-        // removal step matches the whole rank group; a bare revision would take
-        // out every sibling that happens to sit at the same revision.
-        let expected_revisions = HashMap::from([(worker_id.as_str().to_string(), Some(revision))]);
+        // Each guard names a worker by its own id. The url may be a DP base, so
+        // the removal step matches the whole rank group; a bare revision would
+        // take out every sibling that happens to sit at the same revision.
+        let expected_revisions = guards
+            .into_iter()
+            .map(|(id, revision)| (id.as_str().to_string(), Some(revision)))
+            .collect();
         self.submit(Job::RemoveWorker {
             url,
             expected_revisions: Some(expected_revisions),
@@ -1768,8 +1786,9 @@ impl WorkerJobs for JobQueue {
         .await
     }
 
-    async fn refresh_worker_labels(&self, url: String) -> Result<bool, String> {
-        self.submit_or_defer(Job::RefreshWorkerLabels { url }).await
+    fn job_in_flight(&self, url: &str) -> bool {
+        self.get_status(url)
+            .is_some_and(|status| status.status == "pending" || status.status == "processing")
     }
 }
 

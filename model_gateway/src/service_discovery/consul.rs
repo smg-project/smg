@@ -80,20 +80,20 @@ use std::{
 use openai_protocol::worker::WorkerType;
 use reqwest::{header::HeaderMap, StatusCode, Url};
 use serde::Deserialize;
-use smg_worker::{connection::http_client::build_client, identity::endpoint::EndpointKey};
+use smg_worker::{
+    connection::{client_factory::http_client_builder, http_client::build_client},
+    identity::endpoint::EndpointKey,
+};
 use tokio::{task, time};
 use tracing::{info, warn};
 
 use super::{
+    config::{ConsulDiscoveryConfig, DiscoveryConfigError, DiscoveryConfigResult},
+    host::DiscoveryHost,
     provider::{endpoint_at, DiscoveredWorker, DiscoveryKind, Roles},
     reconciler::DesiredState,
+    series,
     snapshot::{LastGood, Skip, SkipLog, SnapshotError},
-};
-use crate::{
-    app_context::AppContext,
-    config::{ConfigError, ConfigResult, ConsulDiscoveryConfig, RoutingMode},
-    observability::metrics::metrics_labels,
-    server::http_client_builder,
 };
 
 /// How long Consul may hold a blocking query before answering anyway.
@@ -196,24 +196,27 @@ impl ConsulProviderConfig {
     /// Resolve the configuration with the process environment. A mode with no
     /// worker pools to fill is refused, as is a setting this provider cannot
     /// honor.
-    pub fn new(config: &ConsulDiscoveryConfig, mode: &RoutingMode) -> ConfigResult<Self> {
-        Self::with_env(config, mode, |name| std::env::var(name).ok())
+    pub fn new(
+        config: &ConsulDiscoveryConfig,
+        roles: Option<Roles>,
+    ) -> DiscoveryConfigResult<Self> {
+        Self::with_env(config, roles, |name| std::env::var(name).ok())
     }
 
     /// [`Self::new`] with `env` as the environment.
     fn with_env(
         config: &ConsulDiscoveryConfig,
-        mode: &RoutingMode,
+        roles: Option<Roles>,
         env: impl Fn(&str) -> Option<String>,
-    ) -> ConfigResult<Self> {
-        let roles = Roles::of(mode).ok_or_else(|| ConfigError::ValidationFailed {
+    ) -> DiscoveryConfigResult<Self> {
+        let roles = roles.ok_or_else(|| DiscoveryConfigError::ValidationFailed {
             reason: "Consul discovery needs regular, prefill-decode or encode-prefill-decode \
                      routing"
                 .to_string(),
         })?;
         // Consul's clients treat an empty variable as unset.
         let env = |name: &str| env(name).filter(|value| !value.is_empty());
-        let refuse = |name: &str, value: String, reason: &str| ConfigError::InvalidValue {
+        let refuse = |name: &str, value: String, reason: &str| DiscoveryConfigError::InvalidValue {
             field: name.to_string(),
             value,
             reason: reason.to_string(),
@@ -328,7 +331,7 @@ impl ConsulProviderConfig {
         // Building the client now reports bad certificates at startup.
         config
             .client()
-            .map_err(|reason| ConfigError::ValidationFailed {
+            .map_err(|reason| DiscoveryConfigError::ValidationFailed {
                 reason: format!("Consul discovery: {reason}"),
             })?;
         Ok(config)
@@ -658,7 +661,7 @@ fn read(answer: Answer, config: &ConsulProviderConfig) -> Result<Outcome, Consul
         match entry.worker(config.roles) {
             Ok(worker) => placed.push((entry.service.create_index, worker)),
             Err(why) => skipped.push(Skip {
-                reason: metrics_labels::DISCOVERY_SKIP_INVALID,
+                reason: series::DISCOVERY_SKIP_INVALID,
                 message: format!("instance {}: {why}", entry.id()),
             }),
         }
@@ -686,7 +689,7 @@ fn read(answer: Answer, config: &ConsulProviderConfig) -> Result<Outcome, Consul
             continue;
         }
         skipped.push(Skip {
-            reason: metrics_labels::DISCOVERY_SKIP_CONFLICT,
+            reason: series::DISCOVERY_SKIP_CONFLICT,
             message: format!(
                 "instance {}: {} is {holder}'s, registered first",
                 worker.discovery_id,
@@ -711,8 +714,8 @@ enum ConsulError {
 impl SnapshotError for ConsulError {
     fn metric_reason(&self) -> &'static str {
         match self {
-            Self::Unreadable { .. } => metrics_labels::SNAPSHOT_ERROR_UNREADABLE,
-            Self::Invalid { .. } => metrics_labels::SNAPSHOT_ERROR_INVALID,
+            Self::Unreadable { .. } => series::SNAPSHOT_ERROR_UNREADABLE,
+            Self::Invalid { .. } => series::SNAPSHOT_ERROR_INVALID,
         }
     }
 }
@@ -789,7 +792,7 @@ fn next_index(last: u64, answered: u64) -> u64 {
 /// the last good list on every answer and every tick.
 pub(super) fn start_consul_discovery(
     config: ConsulProviderConfig,
-    app_context: Arc<AppContext>,
+    host: Arc<dyn DiscoveryHost>,
 ) -> Result<task::JoinHandle<()>, String> {
     let client = config.client()?;
     info!(
@@ -808,7 +811,7 @@ pub(super) fn start_consul_discovery(
         clippy::disallowed_methods,
         reason = "worker discovery runs for the lifetime of the server; shutdown aborts the handle"
     )]
-    let handle = task::spawn(ConsulDiscovery::new(config, app_context, client).run());
+    let handle = task::spawn(ConsulDiscovery::new(config, host, client).run());
 
     Ok(handle)
 }
@@ -818,7 +821,7 @@ type Query = Pin<Box<dyn Future<Output = Result<Answer, ConsulError>> + Send>>;
 /// The provider's loop and its state.
 struct ConsulDiscovery {
     config: ConsulProviderConfig,
-    app_context: Arc<AppContext>,
+    host: Arc<dyn DiscoveryHost>,
     client: reqwest::Client,
     last_good: LastGood,
     skipped: SkipLog,
@@ -836,13 +839,13 @@ struct ConsulDiscovery {
 impl ConsulDiscovery {
     fn new(
         config: ConsulProviderConfig,
-        app_context: Arc<AppContext>,
+        host: Arc<dyn DiscoveryHost>,
         client: reqwest::Client,
     ) -> Self {
         let last_good = LastGood::new(DiscoveryKind::Consul, config.describe(), "instance list");
         Self {
             config,
-            app_context,
+            host,
             client,
             last_good,
             skipped: SkipLog::new(DiscoveryKind::Consul, "Consul discovery"),
@@ -863,11 +866,11 @@ impl ConsulDiscovery {
                     let started_at = time::Instant::now();
                     let delay = self.take(answer);
                     query = self.next_query(delay);
-                    self.last_good.reconcile(&self.app_context, started_at).await;
+                    self.last_good.reconcile(self.host.as_ref(), started_at).await;
                 }
                 _ = tick.tick() => {
                     let started_at = time::Instant::now();
-                    self.last_good.reconcile(&self.app_context, started_at).await;
+                    self.last_good.reconcile(self.host.as_ref(), started_at).await;
                 }
             }
         }
