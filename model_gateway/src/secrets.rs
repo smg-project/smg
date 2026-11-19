@@ -22,6 +22,7 @@ use std::{
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 use smg_auth::ApiKeySet;
+use smg_service_discovery::fs_watch::{directory_of, settle, DirectoryWatch};
 use tokio::{sync::mpsc, task, time};
 use tracing::{error, info, warn};
 
@@ -35,7 +36,6 @@ use crate::{
         validation::ConfigValidator,
         ConfigError, TenantApiKeyEntry,
     },
-    fs_watch::{directory_of, settle, DirectoryWatch},
     middleware::AuthConfig,
     server::posture::{SecretSource, SecretSources},
 };

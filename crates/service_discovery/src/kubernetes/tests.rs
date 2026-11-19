@@ -10,7 +10,7 @@ use smg_worker::{
 use tracing_test::traced_test;
 
 use super::*;
-use crate::service_discovery::testing::make_labeled_pod;
+use crate::testing::make_labeled_pod;
 
 /// The pod's Ready condition at `status` ("True", "False" or "Unknown"),
 /// every other field unset.

@@ -40,7 +40,7 @@ HELPERS = CHART / "templates" / "_helpers.tpl"
 SCHEMA = CHART / "values.schema.json"
 ROUTER_TEMPLATE = CHART / "templates" / "deployment-router.yaml"
 # The gateway's Consul provider, which reads Consul's own variables.
-CONSUL_PROVIDER = REPO / "model_gateway" / "src" / "service_discovery" / "consul.rs"
+CONSUL_PROVIDER = REPO / "crates" / "service_discovery" / "src" / "consul.rs"
 # The chart needs Kubernetes >= 1.26 and `helm template` checks it against
 # its default version, which older helm releases put below that.
 KUBE_VERSION = "1.30.0"

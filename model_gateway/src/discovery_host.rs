@@ -4,13 +4,14 @@
 use std::sync::Arc;
 
 use openai_protocol::worker::WorkerSpec;
+use smg_service_discovery::DiscoveryHost;
 use smg_worker::{
     identity::basic::Worker,
     jobs::WorkerJobs,
     registry::{WorkerId, WorkerOrigin},
 };
 
-use crate::{app_context::AppContext, config::RouterConfig, service_discovery::DiscoveryHost};
+use crate::{app_context::AppContext, config::RouterConfig};
 
 impl DiscoveryHost for AppContext {
     fn workers(&self) -> Vec<(WorkerId, Arc<dyn Worker>)> {

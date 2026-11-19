@@ -3,7 +3,7 @@ use std::{collections::VecDeque, sync::Mutex};
 use smg_worker::test_support::RefusedAddress;
 
 use super::*;
-use crate::service_discovery::testing::TestHost;
+use crate::testing::TestHost;
 
 const PASSING_2_0_4: &str = include_str!("../testdata/consul/health-passing-2.0.4.json");
 const PASSING_1_22_7: &str = include_str!("../testdata/consul/health-passing-1.22.7.json");

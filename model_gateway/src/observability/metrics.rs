@@ -857,7 +857,7 @@ pub(crate) fn init_metrics() {
     );
 
     // Layer 4: Discovery metrics
-    crate::service_discovery::describe_series();
+    smg_service_discovery::describe_series();
 
     // Layer 5: MCP metrics
     describe_counter!(

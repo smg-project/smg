@@ -27,11 +27,11 @@ use smg::{
         posture::{SecretSource, SecretSources},
         ServerConfig,
     },
-    service_discovery::RuntimeDiscoveryConfig,
     version,
 };
 use smg_auth::{ApiKeyEntry, ControlPlaneAuthConfig, JwtConfig, Role};
 use smg_mesh::{MTLSConfig, MeshServerConfig};
+use smg_service_discovery::RuntimeDiscoveryConfig;
 use smg_worker::identity::{
     basic::{ConnectionMode, RuntimeType},
     endpoint::Endpoint,

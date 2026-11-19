@@ -277,7 +277,7 @@ pub(super) fn compute_actions(
 /// Turn a published worker into the spec its registration job will carry.
 ///
 /// Compatibility labels go in first, then provenance — so a provider cannot
-/// overwrite ownership — then the router-controlled settings. The fingerprint
+/// overwrite ownership — then the settings the host controls. The fingerprint
 /// is taken from the record, never from this spec, so none of what is added
 /// here can move it.
 fn build_worker_spec(

@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     net::{SocketAddr, TcpStream},
     pin::pin,
     sync::Arc,
@@ -6,10 +7,15 @@ use std::{
     time::Duration,
 };
 
-use openai_protocol::worker::{RuntimeType, WorkerSpec, WorkerType};
+use openai_protocol::{
+    model_card::ModelCard,
+    worker::{RuntimeType, WorkerSpec, WorkerType},
+};
+use smg_service_discovery::{DiscoveryHost, DISCOVERY_PROVIDER_LABEL};
 use smg_worker::{
     identity::basic::{ConnectionMode, DEFAULT_BOOTSTRAP_PORT},
     jobs::WorkerRegistrationMode,
+    registry::{RemoteWorkerState, WorkerId, WorkerOrigin},
 };
 use tokio::time;
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowInstanceId};
@@ -17,9 +23,8 @@ use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowInstanceId};
 use crate::{
     app_context::testing::{app_context_for_tests, create_test_app_context},
     config::RouterConfig,
-    routers::common::snapshot::WorkerRegistry,
+    routers::{common::snapshot::WorkerRegistry, grpc::backend_client::BasicWorkerBuilder},
     server::http_client,
-    service_discovery::DiscoveryHost,
     workflow::{
         data::WorkerKind,
         steps::{create_worker_workflow_data, CreateLocalWorkerStep, RegisterWorkersStep},
@@ -47,6 +52,80 @@ fn the_context_stamps_its_credential_and_the_discovered_budget() {
             .connection_attempt_budget(RouterConfig::DISCOVERED_WORKER_ATTEMPTS_PER_SUCCESS)
     );
     assert_eq!(spec.max_connection_attempts, 40);
+}
+
+/// The context answers a worker's origin as the registry holds it: `Local`
+/// for a worker this node registered, `Mesh` for one a peer published, and
+/// nothing for an id it does not hold. A peer's discovered worker carries the
+/// peer's provider label and stands in the context's list like one of this
+/// node's own, so the origin answer alone keeps a pass from owning it: a
+/// context that answered `Local` would have every pass remove a worker its
+/// peer still publishes.
+#[test]
+fn the_context_answers_a_workers_origin_as_the_registry_holds_it() {
+    let context = create_test_app_context();
+
+    // A worker a pass on this node registered.
+    let own_url = "http://10.0.0.1:8080";
+    let own = BasicWorkerBuilder::new(own_url)
+        .model(ModelCard::new("m"))
+        .labels(HashMap::from([(
+            DISCOVERY_PROVIDER_LABEL.to_string(),
+            "kubernetes".to_string(),
+        )]))
+        .build();
+    context
+        .worker_registry
+        .register(Arc::new(own))
+        .expect("the registration");
+
+    // A peer's discovered worker, as mesh sync delivers it.
+    let peer_url = "http://10.0.0.3:8080";
+    let mut spec = WorkerSpec::new(peer_url);
+    spec.labels.insert(
+        DISCOVERY_PROVIDER_LABEL.to_string(),
+        "kubernetes".to_string(),
+    );
+    context
+        .worker_registry
+        .on_remote_worker_state(&RemoteWorkerState {
+            worker_id: "peer-w1".to_string(),
+            model_id: "m".to_string(),
+            url: peer_url.to_string(),
+            health: true,
+            version: 1,
+            spec: serde_json::to_vec(&spec).expect("a spec encodes"),
+        });
+
+    let host: &dyn DiscoveryHost = &*context;
+    let listed = host.workers();
+    let origin_and_provider = |url: &str| {
+        let (id, worker) = listed
+            .iter()
+            .find(|(_, worker)| worker.url() == url)
+            .expect("the context lists the worker");
+        let provider = worker
+            .metadata()
+            .spec
+            .labels
+            .get(DISCOVERY_PROVIDER_LABEL)
+            .cloned();
+        (host.origin_of(id), provider)
+    };
+    let kubernetes = Some("kubernetes".to_string());
+    assert_eq!(
+        origin_and_provider(own_url),
+        (Some(WorkerOrigin::Local), kubernetes.clone())
+    );
+    assert_eq!(
+        origin_and_provider(peer_url),
+        (Some(WorkerOrigin::Mesh), kubernetes),
+        "a peer's worker under the provider's label is not this node's to own"
+    );
+    assert_eq!(
+        host.origin_of(&WorkerId::from_string("held-by-nobody".to_string())),
+        None
+    );
 }
 
 /// An addition a pass hands the queue holds its URL's claim while it waits

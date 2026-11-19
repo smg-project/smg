@@ -196,9 +196,7 @@ impl ServiceDiscoveryConfig {
 
 /// A selector as the API server reads it: `key=value` pairs joined by commas.
 /// Shared with the mesh's router-peer watcher.
-pub(crate) fn selector_string<'a>(
-    pairs: impl IntoIterator<Item = (&'a String, &'a String)>,
-) -> String {
+pub fn selector_string<'a>(pairs: impl IntoIterator<Item = (&'a String, &'a String)>) -> String {
     pairs
         .into_iter()
         .map(|(k, v)| format!("{k}={v}"))
@@ -211,7 +209,7 @@ pub(crate) fn selector_string<'a>(
 /// selector falls back to `Config::default()` (no server-side label
 /// filtering) so the watcher still functions when no selector is set.
 /// Shared with the mesh's router-peer watcher.
-pub(crate) fn build_watcher_config(kind: &str, label_selector: &str) -> Config {
+pub fn build_watcher_config(kind: &str, label_selector: &str) -> Config {
     info!("Starting K8s {kind} watcher | selector: '{label_selector}'");
     if label_selector.is_empty() {
         Config::default()
@@ -280,7 +278,7 @@ pub struct PodInfo {
 
 /// Whether every label of `selector` is on `pod`; an empty selector matches
 /// no Pod. Shared with the mesh's router-peer watcher.
-pub(crate) fn matches_selector(pod: &Pod, selector: &HashMap<String, String>) -> bool {
+pub fn matches_selector(pod: &Pod, selector: &HashMap<String, String>) -> bool {
     if selector.is_empty() {
         return false;
     }
@@ -293,7 +291,7 @@ pub(crate) fn matches_selector(pod: &Pod, selector: &HashMap<String, String>) ->
 
 /// Whether a Pod's conditions carry `Ready = True`, Kubernetes' traffic-admission
 /// signal. Shared with the mesh's router-peer watcher.
-pub(crate) fn pod_is_ready(conditions: Option<&[PodCondition]>) -> bool {
+pub fn pod_is_ready(conditions: Option<&[PodCondition]>) -> bool {
     conditions.is_some_and(|conditions| {
         conditions
             .iter()
@@ -377,7 +375,7 @@ impl PodInfo {
 /// The Pod's address, parsed rather than kept as a string so the worker URL
 /// renders an IPv6 address in bracketed form; `format!("{ip}:{port}")` on the
 /// string would produce the unusable `fd00::1:8080`.
-pub(crate) fn pod_ip(name: &str, raw: &str) -> Option<IpAddr> {
+pub fn pod_ip(name: &str, raw: &str) -> Option<IpAddr> {
     raw.parse()
         .inspect_err(|e| warn!("Pod {} has an unparsable Pod IP '{}': {e}", name, raw))
         .ok()

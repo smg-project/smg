@@ -87,9 +87,10 @@ pub trait WorkerJobs: Send + Sync {
     /// claim. A job is recorded under the address it was asked with, so a
     /// caller reads in that form: a registration's as its spec writes the
     /// address, a removal's as the removal was asked. A discovery source
-    /// registers an address
-    /// [as published](crate::identity::endpoint::Endpoint::render) and asks
-    /// its removal at the address's
-    /// [lookup form](crate::identity::endpoint::Endpoint::lookup_form).
+    /// registers an address [as published] and asks its removal at the
+    /// address's [lookup form].
+    ///
+    /// [as published]: crate::identity::endpoint::Endpoint::render
+    /// [lookup form]: crate::identity::endpoint::Endpoint::lookup_form
     fn job_in_flight(&self, url: &str) -> bool;
 }

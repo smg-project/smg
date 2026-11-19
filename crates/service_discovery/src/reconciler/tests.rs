@@ -8,7 +8,7 @@ use smg_worker::{
 use tokio::runtime::Builder;
 
 use super::*;
-use crate::service_discovery::testing::{Queued, TestHost, STAMPED_API_KEY, STAMPED_ATTEMPTS};
+use crate::testing::{Queued, TestHost, STAMPED_API_KEY, STAMPED_ATTEMPTS};
 
 fn key(url: &str) -> EndpointKey {
     endpoint_key(url).expect(url)
@@ -226,8 +226,7 @@ fn diverged_ranks_do_not_collapse_on_equal_revisions() {
 
 fn register_with_labels(host: &TestHost, url: &str, labels: &[(&str, &str)]) {
     use openai_protocol::model_card::ModelCard;
-
-    use crate::routers::grpc::backend_client::BasicWorkerBuilder;
+    use smg_worker::test_support::BasicWorkerBuilder;
 
     let labels: HashMap<String, String> = labels
         .iter()
@@ -568,14 +567,15 @@ async fn a_pass_registers_the_spec_its_host_stamped() {
 /// A pass asks nothing for an address whose job is in flight, and asks once
 /// that job has ended. It reads a removal's address by its lookup form and
 /// an addition's as the provider published it: the forms the two jobs are
-/// queued under.
+/// queued under. Neither hold is a registration's, so the queue would take
+/// the addition: that nothing is asked is the pass's own read.
 #[tokio::test]
 async fn a_pass_leaves_an_address_whose_job_is_in_flight() {
     let (host, jobs) = TestHost::recording();
     register_an_unpublished_worker(&host, "http://10.0.0.2:8080");
     let desired = desired_state_of(&[published("http://10.0.0.1:8080", "u1")]);
-    jobs.hold("10.0.0.2:8080");
-    jobs.hold("http://10.0.0.1:8080");
+    jobs.hold_for_another_job("10.0.0.2:8080");
+    jobs.hold_for_another_job("http://10.0.0.1:8080");
 
     pass(&desired, &host).await;
     assert!(jobs.queued().is_empty(), "{:?}", jobs.queued());

@@ -115,6 +115,8 @@ jobs:
             path: crates/rl
           - crate: smg-external-router
             path: crates/external_router
+          - crate: smg-service-discovery
+            path: crates/service_discovery
           - crate: smg-symphony
             path: crates/symphony
     steps:
