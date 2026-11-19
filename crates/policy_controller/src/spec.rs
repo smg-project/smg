@@ -1475,8 +1475,8 @@ pub struct OverloadSpec {
     /// only scorer is `consistent-hash` with no `prefix_tokens` and no
     /// `bounded_load`, picked by `best` with no parameters, under no
     /// sessions rule or one that delegates. A rule with an in-flight cap
-    /// keeps the key only under a host that counts the key's requests,
-    /// which the controller's own service does not yet. A rule with
+    /// keeps the key only under a host that counts the key's requests, as
+    /// the controller's own service does. A rule with
     /// `inflight_cap: 65535` has no cap. Set, the key moves on: under a
     /// sessions rule to its next routable pin, and to the ring's next
     /// worker where no pin stands or no rule does. Unset, the key stays

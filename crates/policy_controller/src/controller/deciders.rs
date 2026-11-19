@@ -202,7 +202,7 @@ use crate::{
     store::{
         leases::DISPATCH_TTL, AtWork, GatewayId, LeaseRefused, MemoryStore, Said, Watch, World,
     },
-    view::{fingerprint, PinSource},
+    view::fingerprint,
 };
 
 /// What the deciders and the streams count on the controller's own side,
@@ -1095,8 +1095,8 @@ impl<'a> Taken<'a, Checked> {
         })
     }
 
-    /// The request with the pins of record lent to its decision.
-    fn lent(self, pins: &'a dyn PinSource) -> Self {
+    /// The request with the store's sessions lent to its decision.
+    fn lent(self, pins: &'a StorePins<'a>) -> Self {
         Self {
             pins: Some(pins),
             ..self
@@ -6495,6 +6495,64 @@ pub(crate) mod tests {
             assert_eq!(verdict(&bed, &answer), SessionVerdict::Pinned);
             assert_eq!(pins(&bed, session), Some([worker, WorkerId(0)]));
         }
+    }
+
+    /// The controller's own service counts a key's requests. Under a rule
+    /// with an in-flight cap the request that finds the cap met on its
+    /// key's worker is placed again and lands on a worker with fewer
+    /// requests, and the key's next request returns once one of them
+    /// ended.
+    #[tokio::test]
+    async fn the_service_hands_a_key_on_at_its_rules_cap() {
+        use crate::{
+            controller::lifecycle::{self, tests::a_dispatched},
+            sessions::SessionVerdict,
+        };
+        let mut document = PolicySpec::preset("manual").expect("a preset of this build");
+        let rule = document.bindings[0].sessions.as_mut();
+        let rule = rule.expect("the preset's rule");
+        rule.inflight_cap = 2;
+        // The rule places a key on the worker with the fewest requests: a
+        // request placed again at the cap leaves the key's worker.
+        rule.assignment = crate::Assignment::MinLoad;
+        let mut bed = bed(Some(applied(&document)), true, (1, 8), []);
+        let at = bed.script.taken;
+        let verdict = |bed: &Bed, answer: &proto::DecideAnswer| {
+            LeasesStore::get(&*bed.store, GATEWAY, LeaseId(lease_of(answer).id))
+                .expect("the lease is on file")
+                .lease
+                .session_verdict
+        };
+        // The key's first request claims a worker, and its gateway's
+        // Dispatched frame pins the key there.
+        let first = bed.ask(keyed(1, 1_001)).await;
+        let owner = picked(&first);
+        assert_eq!(verdict(&bed, &first), SessionVerdict::Claimed(owner));
+        let hand = lifecycle::open(&bed.store, GATEWAY);
+        lifecycle::dispatched(&bed.store, &hand, &a_dispatched(lease_of(&first).id), at)
+            .expect("the frame reads");
+        // One request of the key in flight: the second stays.
+        let second = bed.ask(keyed(1, 1_002)).await;
+        assert_eq!(picked(&second), owner);
+        assert_eq!(verdict(&bed, &second), SessionVerdict::Pinned);
+        // Two in flight on the key's worker: the third is placed again,
+        // on a worker with fewer requests.
+        let third = bed.ask(keyed(1, 1_003)).await;
+        assert_ne!(picked(&third), owner);
+        assert_eq!(verdict(&bed, &third), SessionVerdict::Respill);
+        // One of the two ended: the key's next request is under the cap.
+        let ended = LeaseId(lease_of(&second).id);
+        let gone = ReleaseReason::ClientGone;
+        assert!(LeasesStore::released(
+            &*bed.store,
+            GATEWAY,
+            ended,
+            None,
+            gone
+        ));
+        let fourth = bed.ask(keyed(1, 1_004)).await;
+        assert_eq!(picked(&fourth), owner);
+        assert_eq!(verdict(&bed, &fourth), SessionVerdict::Pinned);
     }
 
     /// A keyed lease in flight at an apply tells no engine of its dispatch.
