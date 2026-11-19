@@ -20,8 +20,9 @@
 //! one mark.
 
 use super::{
-    engines::run_owned, filter, run_single, single_emptied, trace_of, Assignment, Binding, Buffers,
-    Engine, Filter, Picker, Plan, Profile, Scorer, Scratch, SessionRule, Set,
+    engines::run_owned, filter, keep_folded, leads, run_single, single_emptied, trace_of,
+    Assignment, Binding, Buffers, Engine, Filter, Picker, Plan, Profile, Scorer, Scratch,
+    SessionRule, Set,
 };
 use crate::{
     builtins::{Best, LeastRequests, NotOverloaded},
@@ -267,6 +268,12 @@ fn veto_ran(profile: &Profile, emptied_by: &str) -> bool {
 /// reach stays: the soft filter passes over such a worker while another
 /// usable one stands, and takes it as the last resort.
 ///
+/// Where a whole pass handed its fold with the set ([`Set::fold`]) and the
+/// set is the plan's whole pool, that second pass is one pass of the test
+/// ([`keep_folded`]) where a front row passes it ([`leads`]), and the
+/// stages run only where it keeps no row. The fold is the one the engine
+/// made at its build: no decision makes one.
+///
 /// The shed stands for a set that sheds ([`AllVetoed::Shed`]: a binding's
 /// word, each side of a pair, and the rule's own second pass), for a pool
 /// emptied before the veto ran and for a pool with no row over its
@@ -310,7 +317,22 @@ pub(super) fn emptied(
     // once a decision. Where that pass leaves nobody either, its own stage
     // stands. The rows it keeps are the rule's, behind the stage the veto's
     // pass named.
-    filter(profile, &whole, &lifted, buf, set.shedding()).unwrap_or(emptied_by)
+    let set = set.shedding();
+    if set.plain() {
+        if let Some(tests) = set.fold {
+            let tests = tests.asked(&whole, &lifted);
+            if leads(tests, &whole, set.candidates, &lifted) {
+                // The fold's pass asks for every buffer's room, as the
+                // whole pass does: no pass of another kind behind it
+                // grows a list.
+                buf.reserve(set.candidates.len());
+                if keep_folded(tests, &whole, set.candidates, &lifted, &mut buf.kept) {
+                    return emptied_by;
+                }
+            }
+        }
+    }
+    filter(profile, &whole, &lifted, buf, set).unwrap_or(emptied_by)
 }
 
 /// The rule's pick among the rows its lifted pass kept (`buf.kept`): the
