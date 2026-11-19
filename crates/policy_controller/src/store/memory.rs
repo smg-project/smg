@@ -31,7 +31,7 @@ use crate::{
         },
         loads::{LoadSample, LoadSink, LoadSource, PollMode, Wake},
         reservations::{ReservationKind, ReservationStore},
-        sessions::{Pin, SessionsStore},
+        sessions::{Pin, SessionTables, SessionsStore},
         workers::{
             identity, Maker, MembershipChange, MembershipTail, WorkerFacts, WorkerPatch, WorkerRow,
             WorkerStatus, WorkersStore,
@@ -42,7 +42,7 @@ use crate::{
         },
         GatewayId,
     },
-    view::{LoadRow, Role, WorkerId, REPORT_CLOCK_HISTORY_MS},
+    view::{LoadRow, Role, Session, WorkerId, REPORT_CLOCK_HISTORY_MS},
 };
 
 mod blocks;
@@ -96,11 +96,14 @@ pub struct MemoryStore {
     /// tables and reads each pool's standing in them.
     kv: Arc<KvTables>,
     reservations: Mutex<Reservations>,
-    /// The pins of record, in the shards of the engine's own table
-    /// ([`crate::sessions::shard_of`]): a dispatch's write and a lookup
-    /// hold one shard, and a sweep or a worker's removal walks them one
-    /// hold after another.
-    sessions: Vec<Mutex<FxHashMap<u64, Pin>>>,
+    /// The pins of record and the keys' requests in flight, in the shards
+    /// of the engine's own table ([`SessionTables`]): a dispatch's write,
+    /// a lookup and a keyed decision's read hold one shard, and a sweep or
+    /// a worker's removal walks them one hold after another. The files of
+    /// leases share the tables: a lease on file books its key's count
+    /// there. A shard's lock is a leaf, taken under a file's turn or with
+    /// no lock held.
+    sessions: Arc<SessionTables>,
     /// When the pins were last swept and how often a pass runs
     /// ([`Self::sweep_pins`]).
     pins_swept: Mutex<PinsSwept>,
@@ -210,8 +213,11 @@ impl MemoryStore {
         // The leases' file writes the counts the writer's shapes name, and
         // a membership write gives a joining member its slot in them.
         let counts = writer.counts();
+        // The files book their leases' keys in the store's own tables.
+        let sessions = Arc::new(SessionTables::default());
         let leases = Leases {
             counts: Arc::clone(&counts),
+            sessions: Arc::clone(&sessions),
             ..Leases::default()
         };
         Self {
@@ -223,9 +229,7 @@ impl MemoryStore {
             }),
             kv,
             reservations: Mutex::default(),
-            sessions: (0..crate::sessions::SHARDS)
-                .map(|_| Mutex::default())
-                .collect(),
+            sessions,
             pins_swept: Mutex::default(),
             files: turn::Files::one(leases),
             blocks: Blocks::default(),
@@ -2646,9 +2650,24 @@ impl ReservationStore for MemoryStore {
 // --------------------------------------------------------------- sessions
 
 impl MemoryStore {
-    /// The shard that holds `key`'s pin of record.
-    fn pins_of(&self, key: u64) -> &Mutex<FxHashMap<u64, Pin>> {
-        &self.sessions[crate::sessions::shard_of(key)]
+    /// What a keyed decision reads of `session` under one hold of the
+    /// key's shard ([`SessionTables::read`]): its pin of record, and in
+    /// `carried`, cleared first, the workers that carry its requests in
+    /// flight with their counts. A door asks for a keyed request whose
+    /// rule has an in-flight cap, and for no other.
+    pub(crate) fn keyed(
+        &self,
+        session: Session,
+        carried: &mut Vec<(WorkerId, u32)>,
+    ) -> Option<Pin> {
+        carried.clear();
+        self.sessions.read(session, carried)
+    }
+
+    /// How many keys have a request in flight: no door tells it.
+    #[cfg(test)]
+    pub(crate) fn keys_in_flight(&self) -> usize {
+        self.sessions.keys_in_flight()
     }
 }
 
@@ -2657,7 +2676,7 @@ impl SessionsStore for MemoryStore {
         if key == 0 {
             return;
         }
-        self.pins_of(key).lock().insert(
+        self.sessions.shard(key).lock().pins.insert(
             key,
             Pin {
                 worker,
@@ -2680,26 +2699,27 @@ impl SessionsStore for MemoryStore {
             last_used: at,
             ends,
         };
-        let mut pins = self.pins_of(key).lock();
-        let stood = pins.entry(key).or_insert(pin);
+        let mut shard = self.sessions.shard(key).lock();
+        let stood = shard.pins.entry(key).or_insert(pin);
         // The later end stays, and no end is later than any instant.
         let later = stood.ends.zip(ends).map(|(stood, asked)| stood.max(asked));
         *stood = Pin { ends: later, ..pin };
     }
 
     fn lookup(&self, key: u64) -> Option<Pin> {
-        self.pins_of(key).lock().get(&key).copied()
+        self.sessions.shard(key).lock().pins.get(&key).copied()
     }
 
     fn unpin(&self, key: u64) {
-        self.pins_of(key).lock().remove(&key);
+        self.sessions.shard(key).lock().pins.remove(&key);
     }
 
     fn drop_worker(&self, worker: WorkerId) -> usize {
-        self.sessions
-            .iter()
+        let shards = self.sessions.shards().iter();
+        shards
             .map(|shard| {
-                let mut pins = shard.lock();
+                let mut shard = shard.lock();
+                let pins = &mut shard.pins;
                 let before = pins.len();
                 pins.retain(|_, pin| pin.worker != worker);
                 before - pins.len()
@@ -2708,10 +2728,11 @@ impl SessionsStore for MemoryStore {
     }
 
     fn expire(&self, now: u64) -> usize {
-        self.sessions
-            .iter()
+        let shards = self.sessions.shards().iter();
+        shards
             .map(|shard| {
-                let mut pins = shard.lock();
+                let mut shard = shard.lock();
+                let pins = &mut shard.pins;
                 let count = pins.len();
                 pins.retain(|_, pin| pin.ends.is_none_or(|ends| ends > now));
                 count - pins.len()
@@ -2723,15 +2744,16 @@ impl SessionsStore for MemoryStore {
         if key == 0 {
             return;
         }
-        let mut pins = self.pins_of(key).lock();
-        let entry = pins.entry(key).or_insert(pin);
+        let mut shard = self.sessions.shard(key).lock();
+        let entry = shard.pins.entry(key).or_insert(pin);
         if pin.last_used > entry.last_used {
             *entry = pin;
         }
     }
 
     fn len(&self) -> usize {
-        self.sessions.iter().map(|shard| shard.lock().len()).sum()
+        let shards = self.sessions.shards().iter();
+        shards.map(|shard| shard.lock().pins.len()).sum()
     }
 }
 
@@ -2797,6 +2819,9 @@ struct Leases {
     decodes: Decodes,
     /// The store's counts, a cell a worker: what the leases on file book.
     counts: Arc<Counts>,
+    /// The store's sessions' tables: what the leases on file that a
+    /// sessions rule governed book of their keys' requests in flight.
+    sessions: Arc<SessionTables>,
     /// The block of the term's counter the file mints from, as far as it
     /// minted into it ([`MemoryStore::issue_decided`]).
     minted: Minted,
@@ -2834,6 +2859,13 @@ struct Held {
     /// ([`Decodes`]), read where the record carries the mark of a pair's
     /// lease. A single's entry names no place of its own.
     decode: u32,
+    /// Whether the lease's sides book their keys' requests in flight
+    /// ([`SessionTables`]): said once, where the lease is filed, so an end
+    /// frees what the filing booked. A decision's lease counts where its
+    /// decision read the key's count ([`MemoryStore::issue_keyed`]). A
+    /// record filed whole carries no such word and counts wherever it has
+    /// a key: more than a cap reads, never less.
+    keyed: bool,
 }
 
 /// The decode side of a pair's lease on file, with the slot of the count
@@ -2939,6 +2971,26 @@ fn rebook(counts: &Counts, booked: &mut Option<Slot>, to: Option<Slot>) {
     counts.moved(first, to);
 }
 
+/// The session and the worker `record`'s own part books of its key's
+/// requests in flight ([`SessionTables`]), where its lease counts for its
+/// key (`counts`, [`Held::keyed`]): a single's lease while it is on file,
+/// and a pair's prefill part while it lives, as each books its worker's
+/// count ([`marked`]). What the decision did with the key's pin says
+/// nothing here: a request placed on a worker at its cap moves no pin and
+/// is one more of the key's requests there. The part reads as it stands
+/// at the call, so an end frees what the issue booked: a dispatch that
+/// moves it moves its booking with the record's target.
+fn keyed(counts: bool, record: &LeaseRecord) -> Option<(Session, WorkerId)> {
+    let stands = counts && (record.decode.is_none() || record.state.is_live());
+    stands.then_some((record.lease.session, record.target))
+}
+
+/// [`keyed`] for `decode`, a pair's decode side: it books while it lives.
+fn keyed_decode(counts: bool, decode: &DecodeSide) -> Option<(Session, WorkerId)> {
+    let stands = counts && decode.state.is_live();
+    stands.then_some((decode.session, decode.target))
+}
+
 impl Leases {
     /// The next id under the store's term: the term in bits 32 to 62 over a
     /// counter that starts at 1 in each term, as the contract bounds a
@@ -2965,24 +3017,31 @@ impl Leases {
         let booked = marked(&mut record, booked, &pair);
         let side = pair.map(|(side, booked)| HeldDecode::laid(side, booked));
         let decode = side.map_or(0, |side| self.decodes.lay(key, side));
+        // A record filed whole says nothing of its decision: it counts
+        // for its key wherever it has one.
         let held = Held {
             record,
             booked,
             decode,
+            keyed: true,
         };
         self.records.insert(key, held);
-        self.laid(key, &record, booked);
+        self.laid(key, &record, booked, true);
         if let Some(side) = side {
-            self.decode_laid(key, &record, &side);
+            self.decode_laid(key, &record, &side, true);
         }
     }
 
     /// What a record just laid on file takes: it books `booked`, its
-    /// worker's count, and its dispatch deadline is queued where it is
-    /// filed as issued.
-    fn laid(&mut self, key: Key, record: &LeaseRecord, booked: Option<Slot>) {
+    /// worker's count, and where its lease counts for its key (`counts`)
+    /// the key's ([`keyed`]), and its dispatch deadline is queued where it
+    /// is filed as issued.
+    fn laid(&mut self, key: Key, record: &LeaseRecord, booked: Option<Slot>, counts: bool) {
         if let Some(booked) = booked {
             self.counts.book(booked);
+        }
+        if let Some((session, worker)) = keyed(counts, record) {
+            self.sessions.book(session, worker);
         }
         if record.state.is_issued() {
             self.queue(record.dispatch_deadline, key);
@@ -2991,12 +3050,16 @@ impl Leases {
 
     /// What `decode`, the decode side just laid beside `record` under
     /// `key`, takes: it books its worker's count where it is filed live,
-    /// and the lease's dispatch deadline is queued for it where the
-    /// record's own filing queued none: a lease takes one place of the
-    /// queue.
-    fn decode_laid(&mut self, key: Key, record: &LeaseRecord, decode: &HeldDecode) {
+    /// and where the lease counts for its key (`counts`) the key's
+    /// ([`keyed_decode`]), and the lease's dispatch deadline is queued for
+    /// it where the record's own filing queued none: a lease takes one
+    /// place of the queue.
+    fn decode_laid(&mut self, key: Key, record: &LeaseRecord, decode: &HeldDecode, counts: bool) {
         if let Some(booked) = decode.booked {
             self.counts.book(booked);
+        }
+        if let Some((session, worker)) = keyed_decode(counts, &decode.side) {
+            self.sessions.book(session, worker);
         }
         if decode.side.state.is_issued() && !record.state.is_issued() {
             self.queue(record.dispatch_deadline, key);
@@ -3045,9 +3108,10 @@ impl Leases {
     }
 
     /// What `held`, a lease that just left the file under `key`, gives
-    /// back: its count, and a pair's decode side, which leaves with it
-    /// under the same hold. `shape` makes the answer of what the file
-    /// held. Every record that leaves the file passes here.
+    /// back: its count and its key's booking, and a pair's decode side,
+    /// which leaves with it under the same hold. `shape` makes the answer
+    /// of what the file held. Every record that leaves the file passes
+    /// here.
     #[inline(always)]
     fn gone<T>(
         &mut self,
@@ -3058,8 +3122,11 @@ impl Leases {
         if let Some(booked) = held.booked {
             self.counts.free(booked);
         }
+        if let Some((session, worker)) = keyed(held.keyed, &held.record) {
+            self.sessions.free(session, worker);
+        }
         let decode = if held.record.decode.is_some() {
-            self.unpaired(held.decode, key)
+            self.unpaired(held.decode, key, held.keyed)
         } else {
             None
         };
@@ -3067,13 +3134,17 @@ impl Leases {
     }
 
     /// Takes the decode side of the pair's lease under `key` out of its
-    /// place `at` and gives its count back. Out of line: the end of a
+    /// place `at` and gives its count back, and its key's booking where
+    /// the lease counts for its key (`counts`). Out of line: the end of a
     /// single's lease carries none of it.
     #[inline(never)]
-    fn unpaired(&mut self, at: u32, key: &Key) -> Option<DecodeSide> {
+    fn unpaired(&mut self, at: u32, key: &Key, counts: bool) -> Option<DecodeSide> {
         let decode = self.decodes.take(at, key)?;
         if let Some(booked) = decode.booked {
             self.counts.free(booked);
+        }
+        if let Some((session, worker)) = keyed_decode(counts, &decode.side) {
+            self.sessions.free(session, worker);
         }
         Some(decode.side)
     }
@@ -3152,6 +3223,10 @@ impl Leases {
             let first = held.booked;
             held.booked = slots.of(target);
             self.counts.moved(first, held.booked);
+            if held.keyed {
+                let session = held.record.lease.session;
+                self.sessions.moved(session, held.record.target, target);
+            }
             held.record.target = target;
         }
         held.record.lease.target_index = dispatch.target_index;
@@ -3189,6 +3264,9 @@ impl Leases {
                     if target != side.target {
                         let to = slots.of(target);
                         rebook(&self.counts, &mut decode.booked, to);
+                        if held.keyed {
+                            self.sessions.moved(side.session, side.target, target);
+                        }
                         side.target = target;
                     }
                     side.target_index = dispatch.target_index;
@@ -3237,15 +3315,21 @@ impl Leases {
     }
 
     /// Ends `side` of the pair's lease under `key` as `ended` and gives
-    /// that side's count back; the lease leaves the file with its last
-    /// side. A side the lease does not hold, or one that ended, changes
-    /// nothing.
+    /// that side's count and its key's booking back; the lease leaves the
+    /// file with its last side. A side the lease does not hold, or one
+    /// that ended, changes nothing.
     fn end_side(&mut self, key: &Key, side: Side, ended: LeaseState) {
         let Some(held) = self.records.get_mut(key) else {
             return;
         };
         let Some(decode) = self.decodes.get_mut(held.decode, key) else {
             return;
+        };
+        // What the side books of its key's requests, read while it lives.
+        let side_key = match side {
+            Side::Prefill => keyed(held.keyed, &held.record),
+            Side::Decode => keyed_decode(held.keyed, &decode.side),
+            Side::Single | Side::Encode => return,
         };
         let (state, booked) = match side {
             Side::Prefill => (&mut held.record.state, &mut held.booked),
@@ -3258,6 +3342,9 @@ impl Leases {
         *state = ended;
         if let Some(booked) = booked.take() {
             self.counts.free(booked);
+        }
+        if let Some((session, worker)) = side_key {
+            self.sessions.free(session, worker);
         }
         if !held.record.state.is_live() && !decode.side.state.is_live() {
             self.end(key);
@@ -3445,7 +3532,26 @@ impl MemoryStore {
         booked: Option<Slot>,
         issued: impl Fn(&crate::Lease),
     ) -> Result<crate::Lease, LeaseRefused> {
-        self.issue_minted(record, booked, None, issued)
+        self.issue_minted(record, booked, None, false, issued)
+    }
+
+    /// [`Self::issue_decided`] for a decision that read its key's count
+    /// ([`Self::keyed`]): the lease books one request of its key on its
+    /// worker until it leaves the file, whatever the decision did with the
+    /// key's pin. A door asks for a keyed request whose rule has an
+    /// in-flight cap, and for no other: the lease of any other decision
+    /// books no key.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Self::issue_decided`].
+    pub(crate) fn issue_keyed(
+        &self,
+        record: LeaseRecord,
+        booked: Option<Slot>,
+        issued: impl Fn(&crate::Lease),
+    ) -> Result<crate::Lease, LeaseRefused> {
+        self.issue_minted(record, booked, None, true, issued)
     }
 
     /// Issues the two leases of one pair's decision under the one id the
@@ -3465,18 +3571,21 @@ impl MemoryStore {
         [booked, decode]: [Option<Slot>; 2],
         issued: impl Fn(&crate::Lease),
     ) -> Result<crate::Lease, LeaseRefused> {
-        self.issue_minted(record, booked, Some((side, decode)), issued)
+        self.issue_minted(record, booked, Some((side, decode)), false, issued)
     }
 
-    /// The one issue behind both doors: a single's lease with no `pair`,
-    /// which then reads no decode part and takes no branch of one. Inline
-    /// in each door, so the single's door is the issue it was.
+    /// The one issue behind the doors: a single's lease with no `pair`,
+    /// which then reads no decode part and takes no branch of one, and
+    /// with `keyed` a lease that books its key's requests in flight.
+    /// Inline in each door, so the single's door is the issue it was and
+    /// tests no key.
     #[inline(always)]
     fn issue_minted(
         &self,
         mut record: LeaseRecord,
         booked: Option<Slot>,
         pair: Paired,
+        keyed: bool,
         issued: impl Fn(&crate::Lease),
     ) -> Result<crate::Lease, LeaseRefused> {
         use std::collections::hash_map::Entry;
@@ -3511,13 +3620,14 @@ impl MemoryStore {
                     record,
                     booked,
                     decode,
+                    keyed,
                 });
                 break key;
             }
         };
-        leases.laid(key, &record, booked);
+        leases.laid(key, &record, booked, keyed);
         if let Some(side) = side {
-            leases.decode_laid(key, &record, &side);
+            leases.decode_laid(key, &record, &side, keyed);
         }
         // The file's write and its tell under one hold of the turn: the
         // lease is told issued before any holder can end it. A pair's is
@@ -3622,9 +3732,11 @@ impl MemoryStore {
             let leases = self.files[0].take();
             (leases.term, Arc::clone(&leases.counts))
         };
+        let sessions = &self.sessions;
         let files = turn::Files::of(deciders, &self.files, || Leases {
             term,
             counts: Arc::clone(&counts),
+            sessions: Arc::clone(sessions),
             ..Leases::default()
         });
         self.files = files;

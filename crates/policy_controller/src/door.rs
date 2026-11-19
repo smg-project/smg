@@ -40,11 +40,11 @@ use crate::{
     store::{
         leases::DISPATCH_TTL, Ask, AtWork, Built, DecodeSide, GatewayId, Hand, HealthSink,
         LeaseRecord, LeaseRefused, LeaseState, LeasesStore, MemoryStore, Named, Naming,
-        PairBuffers, Picked, Said, SessionsStore, Sides, ViewBuffers, World,
+        PairBuffers, Picked, Pin, Said, SessionsStore, Sides, ViewBuffers, World,
     },
     view::{
-        fingerprint, AffinityFacts, Candidate, Constraints, NamedAffinity, Phase, PinSource,
-        PoolFacts, RequestFacts, Role, Session, WireModes, WorkerId,
+        fingerprint, AffinityFacts, Candidate, Constraints, KeyedRow, NamedAffinity, Phase,
+        PinSource, PoolFacts, RequestFacts, Role, Session, WireModes, WorkerId,
     },
 };
 
@@ -132,6 +132,9 @@ pub(crate) struct Buffers<L> {
     pub(crate) scratch: Scratch,
     pub(crate) lists: L,
     pub(crate) named: Named,
+    /// What a keyed decision reads of its key in the store, where its
+    /// rule has an in-flight cap.
+    pub(crate) keyed: Keyed,
 }
 
 /// A request as its decider takes it.
@@ -143,9 +146,11 @@ pub(crate) struct Taken<'a, A> {
     pub(crate) now: Instant,
     /// What is left of the request's budget at that instant.
     pub(crate) left: Duration,
-    /// The pins of record lent to the decision, where its host keeps them:
-    /// its engine asks them for a key its own table holds no pin of.
-    pub(crate) pins: Option<&'a dyn PinSource>,
+    /// The store's sessions lent to the decision, where its host keeps
+    /// them: its engine asks them for a key its own table holds no pin
+    /// of, and the door reads there the count of a key whose rule has an
+    /// in-flight cap.
+    pub(crate) pins: Option<&'a StorePins<'a>>,
     /// The place of the decider that decides, at its file of leases: a
     /// decision whose profile holds a stage that may refuse by a report
     /// of leases applies what waits at the files of leases through it.
@@ -177,9 +182,11 @@ impl std::fmt::Debug for StorePins<'_> {
     }
 }
 
-impl PinSource for StorePins<'_> {
-    fn pinned(&self, key: Session, ttl_micros: Option<u64>) -> Option<WorkerId> {
-        let pin = SessionsStore::lookup(self.store, key.get())?;
+impl StorePins<'_> {
+    /// The worker of `pin`, a pin of record as a read of the store found
+    /// it, where it stands at the decision's instant for a rule of
+    /// `ttl_micros`.
+    fn standing(&self, pin: Pin, ttl_micros: Option<u64>) -> Option<WorkerId> {
         // A pin at or past its own end is no pin, whether or not the sweep
         // has run: its end is the instant the engine's table forgot the
         // key, or the latest a lease's own rule counted where no table
@@ -197,6 +204,115 @@ impl PinSource for StorePins<'_> {
         ttl_micros
             .is_none_or(|ttl| age < Duration::from_micros(ttl))
             .then_some(pin.worker)
+    }
+}
+
+impl PinSource for StorePins<'_> {
+    fn pinned(&self, key: Session, ttl_micros: Option<u64>) -> Option<WorkerId> {
+        let pin = SessionsStore::lookup(self.store, key.get())?;
+        self.standing(pin, ttl_micros)
+    }
+}
+
+/// What a keyed decision under a rule with an in-flight cap reads of its
+/// key in the store: the lists a decider keeps across its decisions.
+#[derive(Debug, Default)]
+pub(crate) struct Keyed {
+    /// The workers that carry the key's requests in flight, each with its
+    /// count, as the store holds them.
+    carried: Vec<(WorkerId, u32)>,
+    /// The same by row of the decision's candidates, ascending: what the
+    /// engine reads beside the rows
+    /// ([`RequestFacts::lent_session_in_flight`]).
+    rows: Vec<KeyedRow>,
+}
+
+impl Keyed {
+    /// Reads `session` in the store under one hold of the key's shard:
+    /// the key's pin of record, kept for the engine's ask, and the key's
+    /// requests in flight by row of `candidates`, the rows the decision is
+    /// made over, which stand in the order of their ids. A worker with no
+    /// row there is no candidate, and its count is dropped. `None` for a
+    /// request that carries no key.
+    fn read<'a>(
+        &'a mut self,
+        pins: &'a StorePins<'a>,
+        session: Session,
+        candidates: &[Candidate],
+    ) -> Option<(KeyRead<'a>, &'a [KeyedRow])> {
+        if session == Session::NONE {
+            return None;
+        }
+        let pin = pins.store.keyed(session, &mut self.carried);
+        debug_assert!(candidates.is_sorted_by_key(|row| row.id));
+        let found = |&(worker, count): &(WorkerId, u32)| {
+            let at = candidates.binary_search_by_key(&worker, |row| row.id);
+            Some(KeyedRow {
+                row: candidates[at.ok()?].position,
+                in_flight: u16::try_from(count).unwrap_or(u16::MAX),
+            })
+        };
+        self.rows.clear();
+        self.rows.extend(self.carried.iter().filter_map(found));
+        self.rows.sort_unstable_by_key(|keyed| keyed.row);
+        Some((KeyRead { pins, session, pin }, &self.rows))
+    }
+
+    /// Hands `decide` the request with its key's count beside the rows,
+    /// where `sessions` are lent and the request carries a key. One hold
+    /// of the key's shard reads the count and the pin of record: the
+    /// engine is handed the count by row, and asks that read for the pin.
+    /// Any other request is handed on as it stands.
+    // Forced into each of the hand's two calls: out of line a decision
+    // that reads no key would pay a call ahead of its engine's.
+    #[inline(always)]
+    fn lend<'a, R>(
+        &'a mut self,
+        sessions: Option<&'a StorePins<'a>>,
+        facts: &RequestFacts<'_>,
+        constraints: &Constraints<'_>,
+        candidates: &[Candidate],
+        decide: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> R,
+    ) -> R {
+        let read = sessions.and_then(|pins| self.read(pins, facts.session(), candidates));
+        let lent;
+        let (facts, constraints) = match &read {
+            Some((pin, rows)) => {
+                let facts = RequestFacts {
+                    lent_session_in_flight: Some(rows),
+                    session_counted: true,
+                    ..*facts
+                };
+                let constraints = Constraints {
+                    pins: Some(pin),
+                    ..*constraints
+                };
+                lent = (facts, constraints);
+                (&lent.0, &lent.1)
+            }
+            None => (facts, constraints),
+        };
+        decide(facts, constraints)
+    }
+}
+
+/// A keyed decision's one read of its key's shard, as the engine asks it
+/// for the pin of record ([`PinSource`]): the pin the read found beside
+/// the key's count, so the decision holds the shard once. Another key,
+/// which a single's decision never asks, is read from the store.
+#[derive(Debug)]
+struct KeyRead<'a> {
+    pins: &'a StorePins<'a>,
+    session: Session,
+    pin: Option<Pin>,
+}
+
+impl PinSource for KeyRead<'_> {
+    fn pinned(&self, key: Session, ttl_micros: Option<u64>) -> Option<WorkerId> {
+        if key != self.session {
+            return self.pins.pinned(key, ttl_micros);
+        }
+        self.pins.standing(self.pin?, ttl_micros)
     }
 }
 
@@ -307,6 +423,7 @@ impl ByEngine<'_> {
                 },
                 generation: pick.trace.generation,
                 session: facts.session(),
+                counted: facts.session_counted,
                 tokens: facts.prompt_tokens,
                 now_micros: facts.now_micros,
                 built: None,
@@ -455,7 +572,7 @@ pub(crate) fn pair_in<A: Asked>(
         in_flight: None,
         max_block_hashes: request.hashes_read(spec),
         named: None,
-        pins,
+        pins: pins.map(|pins| pins as &dyn PinSource),
     };
     request.read(lists, viewed, |facts, constraints| {
         if emptied {
@@ -515,6 +632,9 @@ pub(crate) fn pair_in<A: Asked>(
                     ttl_micros,
                     generation: pick.trace.generation,
                     session: facts.session(),
+                    // A pair's decision reads no key's count: a sessions
+                    // rule runs under the single plan alone.
+                    counted: false,
                     tokens: facts.prompt_tokens,
                     now_micros: facts.now_micros,
                     built: Some(built.0),
@@ -543,6 +663,10 @@ pub(crate) struct Booking {
     pub(crate) generation: u64,
     /// The request's session; none for a request with no key.
     pub(crate) session: Session,
+    /// Whether the decision read its key's count: its lease then books
+    /// one request of the key on its worker
+    /// ([`MemoryStore::issue_keyed`]).
+    pub(crate) counted: bool,
     /// The token-work the lease books: the prompt, as its host counted it.
     pub(crate) tokens: u32,
     /// The decision's instant in the rows' clock.
@@ -588,9 +712,16 @@ pub(crate) fn issue<A: Asked>(
     // the lease, tells the engine that decided of it, and ends and tells
     // the leases it finds past their dispatch deadline.
     let engine = world.spec().engine();
-    store.issue_decided(record, booked, |lease| {
+    let told = |lease: &Lease| {
         engine.on_decision_issued(lease, decision);
-    })
+    };
+    // A decision that read its key's count files a lease that books the
+    // key, whatever it did with the pin: the next read holds this request.
+    if booking.counted {
+        store.issue_keyed(record, booked, told)
+    } else {
+        store.issue_decided(record, booked, told)
+    }
 }
 
 /// Issues the two leases of a pair's pick, [`issue`] for a pair: a lease a
@@ -845,6 +976,7 @@ pub(crate) fn hand<A: Asked, R>(
         scratch,
         lists,
         named,
+        keyed,
         ..
     } = buffers;
     let wires = request.wires();
@@ -923,8 +1055,11 @@ pub(crate) fn hand<A: Asked, R>(
         in_flight: counts,
         max_block_hashes: request.hashes_read(spec),
         named: None,
-        pins,
+        pins: pins.map(|pins| pins as &dyn PinSource),
     };
+    // The store's sessions, where the decision's rule has an in-flight
+    // cap: a keyed request reads its key's count there.
+    let sessions = pins.filter(|_| needs.session_in_flight);
     if names {
         // A row is named by its place among the rows the decision is made
         // over: the lent rows, or the built ones after their narrowing.
@@ -948,12 +1083,26 @@ pub(crate) fn hand<A: Asked, R>(
             ..viewed
         };
         let answer = request.read(lists, viewed, |facts, constraints| {
-            decide.over_named(facts, &pool, candidates, constraints, scratch)
+            keyed.lend(
+                sessions,
+                facts,
+                constraints,
+                candidates,
+                |facts, constraints| {
+                    decide.over_named(facts, &pool, candidates, constraints, scratch)
+                },
+            )
         });
         return (answer, built);
     }
     let answer = request.read(lists, viewed, |facts, constraints| {
-        decide.over(facts, &pool, candidates, constraints, scratch)
+        keyed.lend(
+            sessions,
+            facts,
+            constraints,
+            candidates,
+            |facts, constraints| decide.over(facts, &pool, candidates, constraints, scratch),
+        )
     });
     (answer, built)
 }
@@ -1272,10 +1421,11 @@ pub struct Request<'a> {
     pub id: &'a [u8],
     /// The request as the engine reads it. The door writes over the
     /// host's what the deciding view adds: the instant in the rows'
-    /// clock, the affinity column, the rows the store names and the
-    /// leases' counts. A budget of 0 states none, and the engine is told
-    /// no bound. A frame's 0 says none is left: a host itself refuses a
-    /// request whose time is spent.
+    /// clock, the affinity column, the rows the store names, the leases'
+    /// counts and, for a keyed request under a rule with an in-flight
+    /// cap, the count of its key. A budget of 0 states none, and the
+    /// engine is told no bound. A frame's 0 says none is left: a host
+    /// itself refuses a request whose time is spent.
     pub facts: RequestFacts<'a>,
     /// What the host alone knows. The door writes its standing vetoes and
     /// the pins of record over the host's.
@@ -1337,6 +1487,12 @@ impl Asked for Request<'_> {
             affinity: viewed.affinity,
             named: viewed.named,
             lent_in_flight: viewed.in_flight.as_ref(),
+            // The door decides over the store's rows: a list a host lent
+            // names rows of its own, and its word that it counted stands
+            // on rows the door does not read. The door's read of the key
+            // is the one source of its count.
+            lent_session_in_flight: None,
+            session_counted: false,
             ..self.facts
         };
         let constraints = Constraints {
@@ -2021,8 +2177,8 @@ pub(crate) mod tests {
             WorkerStatus, WorkersStore,
         },
         view::{
-            Candidate, Constraints, Phase, PoolFacts, RequestFacts, Role, Session, WireModes,
-            WorkerId,
+            Candidate, Constraints, Identity, KeyedRow, Phase, PoolFacts, RequestFacts, Role,
+            Session, WireModes, WorkerId,
         },
     };
 
@@ -3146,6 +3302,337 @@ pub(crate) mod tests {
         let dropped = Swept { leases: 0, pins: 1 };
         assert_eq!(door.sweep(at(61)), dropped, "a second past the pin's end");
         assert_eq!(sessions.len(), 0);
+    }
+
+    /// A request for [`MODEL`] under the session key `key`.
+    fn keyed(id: &[u8], key: u64, seed: u64) -> Request<'_> {
+        let mut request = request(id, seed);
+        request.facts.session_key = Identity::hashed(key);
+        request
+    }
+
+    /// One decision of `door` for `asked`: its lease, the pick's first
+    /// target and what the rule did with the key.
+    fn placed(door: &Door, asked: &Request<'_>) -> (LeaseId, WorkerId, SessionVerdict) {
+        let decided = door.decide(GATEWAY, asked, Instant::now());
+        let decided = decided.expect("a decision");
+        let pick = decided.decision.pick().expect("a pick");
+        let first = pick.targets.first().expect("a target").id;
+        let lease = decided.lease.expect("a pick's lease").lease.id;
+        (lease, first, pick.session_verdict)
+    }
+
+    /// The `manual` preset as `generation`, its rule capped at `cap`
+    /// requests of a key on a worker. The rule places a key on the worker
+    /// with the fewest requests, so a request placed again at the cap
+    /// leaves the key's worker, which carries the most.
+    fn capped(generation: u64, cap: u16) -> PolicySpec {
+        let mut document = PolicySpec::preset("manual").expect("a preset of this build");
+        document.generation = generation;
+        let rule = document.bindings[0].sessions.as_mut();
+        let rule = rule.expect("the preset's rule");
+        rule.inflight_cap = cap;
+        rule.assignment = crate::Assignment::MinLoad;
+        document
+    }
+
+    /// Under a rule with an in-flight cap the door counts a key's requests
+    /// by the leases on file. The key keeps its worker under the cap, the
+    /// request that finds the cap met is placed again and lands on a
+    /// worker with fewer requests, and an end on the key's worker takes
+    /// the next request back.
+    #[test]
+    fn a_key_at_its_cap_is_handed_on_and_returns_at_an_end() {
+        use SessionVerdict::{Claimed, Pinned, Respill};
+        let store = fleet(1);
+        let ruled = AppliedSpec::validate(&capped(2, 2)).expect("the document validates");
+        store.apply(ruled).expect("a later generation");
+        let door = Door::new(Arc::clone(&store));
+        // The key's first request claims a worker, and its dispatch pins
+        // the key there.
+        let (first, owner, verdict) = placed(&door, &keyed(b"r-1", 7, 1));
+        assert_eq!(verdict, Claimed(owner));
+        assert_eq!(report(&door, first, dispatched()), 1);
+        // One request of the key in flight: the second stays.
+        let (second, worker, verdict) = placed(&door, &keyed(b"r-2", 7, 2));
+        assert_eq!((worker, verdict), (owner, Pinned));
+        // Two in flight on the key's worker: the third is placed again,
+        // on a worker with fewer requests.
+        let (_, other, verdict) = placed(&door, &keyed(b"r-3", 7, 3));
+        assert_eq!(verdict, Respill);
+        assert_ne!(other, owner);
+        // Another key reads its own count, and none here.
+        let (_, _, verdict) = placed(&door, &keyed(b"r-4", 8, 4));
+        assert!(matches!(verdict, Claimed(_)), "{verdict:?}");
+        // An end on the key's worker: the next request is under the cap.
+        assert_eq!(report(&door, second, gone()), 3);
+        let (_, worker, verdict) = placed(&door, &keyed(b"r-5", 7, 5));
+        assert_eq!((worker, verdict), (owner, Pinned));
+    }
+
+    /// A request placed again at the cap counts on the worker it lands on,
+    /// whatever its pick did with the pin: on the key's worker again, on a
+    /// worker under the cap, which takes the pin, or on another worker at
+    /// the cap, which carries no verdict. So the key's counts hold every
+    /// lease of the key on file, and an end takes one off its own worker.
+    #[test]
+    fn a_request_placed_at_the_cap_counts_wherever_it_lands() {
+        let store = fleet(1);
+        let ruled = AppliedSpec::validate(&capped(2, 1)).expect("the document validates");
+        store.apply(ruled).expect("a later generation");
+        let door = Door::new(Arc::clone(&store));
+        let session = keyed(b"r-0", 7, 0).facts.session();
+        // The key's leases on file by worker, against the store's counts.
+        let holds = |placements: &[(LeaseId, WorkerId, SessionVerdict)]| {
+            let mut carried = Vec::new();
+            store.keyed(session, &mut carried);
+            let total: u32 = carried.iter().map(|&(_, count)| count).sum();
+            assert_eq!(total as usize, placements.len(), "{placements:?}");
+            for (worker, count) in carried {
+                let held = placements.iter().filter(|placed| placed.1 == worker);
+                assert_eq!(held.count(), count as usize, "{placements:?}");
+            }
+        };
+        let mut placements = Vec::new();
+        for n in 1..=9_u8 {
+            let id = [b'r', b'-', b'0' + n];
+            let placement = placed(&door, &keyed(&id, 7, u64::from(n)));
+            report(&door, placement.0, dispatched());
+            placements.push(placement);
+            holds(&placements);
+        }
+        // With every worker at the cap of one, a pick off the key's worker
+        // carries no verdict.
+        let unmoved =
+            |placed: &&(LeaseId, WorkerId, SessionVerdict)| placed.2 == SessionVerdict::None;
+        assert_ne!(
+            placements.iter().filter(unmoved).count(),
+            0,
+            "{placements:?}"
+        );
+        // An end takes one off the worker its lease booked.
+        let (first, _, _) = placements.remove(0);
+        report(&door, first, gone());
+        holds(&placements);
+    }
+
+    /// What a decision handed its picker of its key's count: each row's
+    /// worker with the row's own count, the rows lent beside them, and the
+    /// host's word that it holds the count.
+    #[derive(Clone, Debug, Default)]
+    struct Handed {
+        rows: Vec<(WorkerId, u16)>,
+        lent: Option<Vec<KeyedRow>>,
+        counted: bool,
+    }
+
+    impl Handed {
+        /// The workers the lent rows name, each with its count; `None`
+        /// where no list was lent. No row carries a count of its own.
+        fn lent(&self) -> Option<Vec<(WorkerId, u16)>> {
+            assert!(self.rows.iter().all(|&(_, own)| own == 0), "{self:?}");
+            let named = |keyed: &KeyedRow| (self.rows[keyed.row as usize].0, keyed.in_flight);
+            let lent = self.lent.as_ref()?;
+            assert!(lent.is_sorted_by(|a, b| a.row < b.row), "{self:?}");
+            Some(lent.iter().map(named).collect())
+        }
+    }
+
+    /// The `random` picker, keeping what each decision hands it of its
+    /// key's count.
+    #[derive(Debug)]
+    struct Counted(Arc<Mutex<Vec<Handed>>>);
+
+    impl Lifecycle for Counted {}
+
+    impl Picker for Counted {
+        fn name(&self) -> &'static str {
+            "counted"
+        }
+
+        fn pick(
+            &self,
+            facts: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            scores: &[f32],
+            band: TieBand,
+            out: &mut Targets,
+        ) {
+            let rows = candidates.iter().map(|row| (row.id, row.session_in_flight));
+            self.0.lock().push(Handed {
+                rows: rows.collect(),
+                lent: facts.lent_session_in_flight.map(<[KeyedRow]>::to_vec),
+                counted: facts.session_counted,
+            });
+            Random.pick(facts, candidates, kept, scores, band, out);
+        }
+    }
+
+    /// A ready member that serves [`MODEL`] and states `wires`.
+    fn dialed(store: &MemoryStore, name: &str, wires: WireModes) -> WorkerId {
+        let key = format!("http://{name}:8000");
+        let facts = WorkerFacts {
+            key: key.clone(),
+            engine: key,
+            incarnation: 1,
+            role: Role::Single,
+            wire_modes: wires,
+            models: vec![MODEL.to_owned()],
+            dp_size: 1,
+            max_running: Some(4_096),
+            ..WorkerFacts::default()
+        };
+        let id = store.upsert(facts).id();
+        store.publish_now();
+        let row = WorkersStore::get(store, id).expect("the row");
+        let ready = store.set_status(id, WorkerStatus::Ready, row.revision);
+        ready.expect("the row stands");
+        store.publish_now();
+        id
+    }
+
+    /// A request under the session key `key` whose gateway states `wires`.
+    fn stated(id: &[u8], key: u64, seed: u64, wires: WireModes) -> Request<'_> {
+        let mut asked = keyed(id, key, seed);
+        asked.constraints.wire_modes = wires;
+        asked
+    }
+
+    /// The door hands a keyed decision its key's count beside the rows, by
+    /// row, and writes none into a row: over the publication's own rows,
+    /// and over the rows written for a gateway that states its wires. A
+    /// worker that is no candidate of the decision is dropped from the
+    /// count, and a request with no key is handed none.
+    #[test]
+    fn the_door_hands_a_keys_count_beside_the_rows_and_writes_none_into_a_row() {
+        let store = fleet(1);
+        let handed = Arc::new(Mutex::new(Vec::new()));
+        let kept = Arc::clone(&handed);
+        let mut catalog = Catalog::builtin();
+        let added = catalog.picker("counted", move || Box::new(Counted(Arc::clone(&kept))));
+        added.expect("a free name");
+        // A cap of one, under a rule whose keys the profile's own stages
+        // place: the picker is handed each key no pin takes and each key
+        // placed again at its cap. Its draw may land on the key's worker
+        // again, which is the pin taken.
+        let mut document = capped(2, 1);
+        let profile = document.profiles.get_mut("manual");
+        profile.expect("the preset's profile").pick = "counted".into();
+        let rule = document.bindings[0].sessions.as_mut();
+        rule.expect("the preset's rule").assignment = crate::Assignment::Delegate;
+        let digest = document.digest().expect("the document digests");
+        let spec = AppliedSpec::validate_digested(&document, digest, &catalog);
+        let applied = store.apply(spec.expect("the catalog holds the stage"));
+        applied.expect("a later generation");
+        let door = Door::new(Arc::clone(&store));
+        let last = || {
+            let handed = handed.lock();
+            let last: Option<&Handed> = handed.last();
+            last.cloned().expect("a decision reached the picker")
+        };
+        // A key's first request: none of its requests is in flight.
+        let (first, owner, _) = placed(&door, &keyed(b"r-1", 7, 1));
+        assert_eq!((last().lent(), last().counted), (Some(vec![]), true));
+        report(&door, first, dispatched());
+        // The second finds the cap met and is placed again: the picker
+        // reads the first on the key's worker, beside rows that carry no
+        // count.
+        let (_, other, verdict) = placed(&door, &keyed(b"r-2", 7, 2));
+        assert_eq!(verdict == SessionVerdict::Pinned, other == owner);
+        assert_eq!(verdict == SessionVerdict::Respill, other != owner);
+        assert_eq!(last().lent(), Some(vec![(owner, 1)]));
+        assert_eq!(last().rows.len(), 3);
+        // A request with no key is handed no count, a list its host lent
+        // included: the door decides over the store's rows, and a host's
+        // list names rows of its own.
+        let hosts = [KeyedRow {
+            row: 0,
+            in_flight: 3,
+        }];
+        let mut hosted = request(b"r-3", 3);
+        hosted.facts.lent_session_in_flight = Some(&hosts);
+        hosted.facts.session_counted = true;
+        placed(&door, &hosted);
+        assert_eq!((last().lent(), last().counted), (None, false));
+        // Rows written for a gateway that states its wires. Two members
+        // that speak them join. The key's workers are none of that
+        // gateway's candidates, so their counts are dropped.
+        let wires = WireModes::GRPC;
+        let joined = [dialed(&store, "w3", wires), dialed(&store, "w4", wires)];
+        placed(&door, &stated(b"r-4", 7, 4, wires));
+        assert_eq!(last().lent(), Some(vec![]));
+        assert_eq!(last().rows.len(), 2);
+        // Another key's request stands on one of the two: its count names
+        // that member's row of the written list.
+        let (lease, held, _) = placed(&door, &stated(b"r-5", 9, 5, wires));
+        assert!(joined.contains(&held));
+        report(&door, lease, dispatched());
+        let (_, next, verdict) = placed(&door, &stated(b"r-6", 9, 6, wires));
+        assert_eq!(verdict == SessionVerdict::Pinned, next == held);
+        assert_eq!(verdict == SessionVerdict::Respill, next != held);
+        assert_eq!(last().lent(), Some(vec![(held, 1)]));
+        assert_eq!(last().rows.len(), 2);
+    }
+
+    /// One read of a key's shard names the rows that carry the key's
+    /// requests, ascending, with no row for a worker that is no candidate,
+    /// and keeps the key's pin of record for the engine's ask as the read
+    /// found it. Another key is asked of the store.
+    #[test]
+    fn a_keys_read_names_its_rows_in_order_and_keeps_the_pin_it_found() {
+        use super::{Keyed, StorePins};
+        use crate::view::PinSource;
+        const KEY: Session = Session::from_raw(41);
+        let store = MemoryStore::new();
+        let now = Instant::now();
+        LeasesStore::set_term(&store, 1);
+        // Requests of the key in flight on three workers, the last of
+        // which has no row among the candidates.
+        for (id, worker) in [(1, 30), (2, 10), (3, 30), (4, 99)] {
+            let record = LeaseRecord {
+                lease: Lease {
+                    id: LeaseId(id),
+                    session: KEY,
+                    session_verdict: SessionVerdict::Pinned,
+                    ..Lease::default()
+                },
+                gateway: GATEWAY,
+                request: id,
+                target: WorkerId(worker),
+                picked: Picked::default(),
+                decode: None,
+                term: 1,
+                issued_at: now,
+                dispatch_deadline: now + Duration::from_secs(5),
+                state: LeaseState::ISSUED,
+            };
+            LeasesStore::issue(&store, record).expect("filed");
+        }
+        SessionsStore::pin(&store, KEY.get(), WorkerId(30), now, None);
+        let candidates: Vec<Candidate> = (0..)
+            .zip([10, 20, 30])
+            .map(|(position, id)| Candidate {
+                position,
+                id: WorkerId(id),
+                ..Candidate::default()
+            })
+            .collect();
+        let pins = StorePins { store: &store, now };
+        let mut keyed = Keyed::default();
+        let read = keyed.read(&pins, KEY, &candidates);
+        let (read, rows) = read.expect("a keyed request");
+        let row = |row, in_flight| KeyedRow { row, in_flight };
+        assert_eq!(rows, [row(0, 1), row(2, 2)]);
+        assert_eq!(read.pinned(KEY, None), Some(WorkerId(30)));
+        // A pin written behind the read is the next decision's.
+        SessionsStore::pin(&store, KEY.get(), WorkerId(10), now, None);
+        assert_eq!(read.pinned(KEY, None), Some(WorkerId(30)));
+        let other = Session::from_raw(42);
+        SessionsStore::pin(&store, other.get(), WorkerId(20), now, None);
+        assert_eq!(read.pinned(other, None), Some(WorkerId(20)));
+        // A request with no key reads nothing.
+        assert!(keyed.read(&pins, Session::NONE, &candidates).is_none());
     }
 
     /// The `random` picker, keeping the budget each request tells it.

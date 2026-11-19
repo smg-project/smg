@@ -789,6 +789,7 @@ pub(crate) fn mean_in_flight(
 /// [`RequestFacts::session_in_flight`] reads them. Where the host lent
 /// none the copy keeps the rows' own counts and nothing is written: a
 /// walk of the rows pays no test for the list.
+#[cfg(any(feature = "controller", feature = "wasm"))]
 pub(crate) fn lay_session_in_flight<R>(
     facts: &RequestFacts<'_>,
     rows: &mut [R],

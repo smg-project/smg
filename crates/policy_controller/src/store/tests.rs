@@ -22,6 +22,7 @@ use crate::{
     decider::Decider,
     decision::{Target, Targets},
     lease::{Lease, LeaseId, Membership, Outcome, ReleaseReason, Side, TransportClass},
+    sessions::SessionVerdict,
     view::{fingerprint, LoadRow, Role, Session, SignalSource, WorkerId},
 };
 
@@ -3467,6 +3468,240 @@ fn every_door_that_takes_a_lease_off_the_file_gives_its_count_back() {
     assert_eq!(in_flight(&store), [(a, 2)]);
     assert_eq!(leases.restore(gateway, &pages[..1]), 1);
     assert_eq!(in_flight(&store), [(a, 1)]);
+}
+
+/// The workers that carry requests of `session` in flight, each with its
+/// count, as a keyed decision reads them, here in the order of their ids.
+fn carried(store: &MemoryStore, session: Session) -> Vec<(WorkerId, u32)> {
+    let mut carried = Vec::new();
+    store.keyed(session, &mut carried);
+    carried.sort_unstable();
+    carried
+}
+
+/// A lease of the cases' gateway on `target` for a request of `session`,
+/// which a sessions rule governed.
+fn keyed(id: u64, target: WorkerId, session: Session, now: Instant) -> LeaseRecord {
+    let mut record = booking(GatewayId(1), id, target, now);
+    record.lease.session = session;
+    record.lease.session_verdict = SessionVerdict::Pinned;
+    record
+}
+
+/// A lease a sessions rule governed counts one request of its key on its
+/// worker from its issue to its end, by whichever door takes it off the
+/// file, and the key leaves the table with its last request.
+#[test]
+fn a_keyed_lease_counts_for_its_key_until_a_door_takes_it_off_the_file() {
+    let store = MemoryStore::new();
+    let a = ready(&store, "http://a:1");
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, id, now) = (GatewayId(1), LeaseId(1), Instant::now());
+    leases.set_term(1);
+    let key = Session::from_raw(41);
+    let doors: [(&str, &dyn Fn()); 5] = [
+        ("a completion", &|| {
+            assert!(leases.completed(gateway, id, &done(Side::Single)));
+        }),
+        ("a release", &|| {
+            assert!(leases.released(gateway, id, None, ReleaseReason::ClientGone));
+        }),
+        ("the dispatch deadline", &|| {
+            assert_eq!(leases.expire(now + Duration::from_secs(2)).len(), 1);
+        }),
+        ("a restore that omits it", &|| {
+            assert_eq!(leases.restore(gateway, &[]), 0);
+        }),
+        ("its gateway's end", &|| {
+            assert_eq!(leases.drop_gateways(&[gateway]), [1]);
+        }),
+    ];
+    for (door, through) in doors {
+        leases.issue(keyed(1, a, key, now)).expect("the id is free");
+        assert_eq!(carried(&store, key), [(a, 1)], "{door}: the lease counts");
+        through();
+        assert_eq!(carried(&store, key), [], "{door}: the count is back");
+        assert_eq!(store.keys_in_flight(), 0, "{door}: the key left");
+    }
+    // A restore lays the pages' leases on file, each on its key's count,
+    // and a lease written again under its id counts once.
+    let pages = [keyed(1, a, key, now), keyed(2, a, key, now)];
+    assert_eq!(leases.restore(gateway, &pages), 2);
+    assert_eq!(carried(&store, key), [(a, 2)]);
+    assert_eq!(leases.restore(gateway, &pages[..1]), 1);
+    assert_eq!(carried(&store, key), [(a, 1)]);
+    assert_eq!(store.keys_in_flight(), 1);
+}
+
+/// A key counts each worker that carries a request of it, and each key
+/// counts alone. A worker leaves a key's count with its last request
+/// there, whichever worker the key's first request stood on.
+#[test]
+fn a_key_counts_each_worker_that_carries_its_requests() {
+    let store = MemoryStore::new();
+    let [a, b, c] = ["http://a:1", "http://b:1", "http://c:1"].map(|key| ready(&store, key));
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    leases.set_term(1);
+    let (key, other) = (Session::from_raw(41), Session::from_raw(42));
+    let mut filed = 0;
+    let mut issue = |target, session| {
+        filed += 1;
+        leases
+            .issue(keyed(filed, target, session, now))
+            .expect("filed");
+        LeaseId(filed)
+    };
+    let end = |id| assert!(leases.released(gateway, id, None, ReleaseReason::ClientGone));
+    let first = issue(a, key);
+    let second = issue(b, key);
+    let third = issue(a, key);
+    let fourth = issue(c, key);
+    let alone = issue(a, other);
+    assert_eq!(carried(&store, key), [(a, 2), (b, 1), (c, 1)]);
+    assert_eq!(carried(&store, other), [(a, 1)]);
+    assert_eq!(store.keys_in_flight(), 2);
+    // The worker the key's first request stood on leaves with its last.
+    end(first);
+    assert_eq!(carried(&store, key), [(a, 1), (b, 1), (c, 1)]);
+    end(third);
+    assert_eq!(carried(&store, key), [(b, 1), (c, 1)]);
+    end(second);
+    assert_eq!(carried(&store, key), [(c, 1)]);
+    assert_eq!(
+        carried(&store, other),
+        [(a, 1)],
+        "another key's count stands"
+    );
+    end(fourth);
+    end(alone);
+    assert_eq!(store.keys_in_flight(), 0);
+}
+
+/// A lease counts for its key by the word of the door that issued it, and
+/// by nothing its pick did with the key's pin. A decision that read no
+/// count files a lease that books no key, whatever key its request
+/// carried. A decision that read the count files one that books its key
+/// under any verdict: a request placed on a worker at its cap moves no
+/// pin and is one more of the key's requests there. A lease with no key
+/// counts nothing.
+#[test]
+fn a_lease_counts_for_its_key_by_its_issue_and_not_by_its_verdict() {
+    let store = MemoryStore::new();
+    let a = ready(&store, "http://a:1");
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    leases.set_term(1);
+    let key = Session::from_raw(41);
+    let world = store.world();
+    let decided = |session, verdict| {
+        let mut record = keyed(0, a, session, now);
+        record.lease.session_verdict = verdict;
+        (record, world.booked_of(a))
+    };
+    let minted = "minted under the store's term";
+    // A decision that read no count: its lease books its worker alone.
+    let (record, slot) = decided(key, SessionVerdict::Pinned);
+    let unread = store.issue_decided(record, slot, |_| ()).expect(minted).id;
+    assert_eq!(in_flight(&store), [(a, 1)]);
+    assert_eq!(store.keys_in_flight(), 0);
+    // Decisions that read the count: one that kept the pin, and one placed
+    // on a worker at its cap, which carries no verdict.
+    let (record, slot) = decided(key, SessionVerdict::Pinned);
+    let kept = store.issue_keyed(record, slot, |_| ()).expect(minted).id;
+    let (record, slot) = decided(key, SessionVerdict::None);
+    store.issue_keyed(record, slot, |_| ()).expect(minted);
+    assert_eq!(carried(&store, key), [(a, 2)]);
+    // A request with no key counts nothing, read or not.
+    let (record, slot) = decided(Session::NONE, SessionVerdict::None);
+    store.issue_keyed(record, slot, |_| ()).expect(minted);
+    assert_eq!(carried(&store, key), [(a, 2)]);
+    assert_eq!(store.keys_in_flight(), 1);
+    // The end of the lease that books no key takes nothing off, and the
+    // end of the one that kept the pin leaves the request at the cap.
+    let gone = ReleaseReason::ClientGone;
+    assert!(leases.released(gateway, unread, None, gone));
+    assert_eq!(carried(&store, key), [(a, 2)]);
+    assert!(leases.released(gateway, kept, None, gone));
+    assert_eq!(carried(&store, key), [(a, 1)]);
+}
+
+/// A dispatch on another target of the pick moves the key's count with
+/// the lease's booking, and the lease ends on the count it moved to.
+#[test]
+fn a_dispatch_on_another_target_of_the_pick_moves_the_keys_count() {
+    let store = MemoryStore::new();
+    let (a, b) = (ready(&store, "http://a:1"), ready(&store, "http://b:1"));
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, id, now) = (GatewayId(1), LeaseId(1), Instant::now());
+    leases.set_term(1);
+    let key = Session::from_raw(41);
+    let mut targets = Targets::new();
+    for id in [a, b] {
+        targets.push(Target {
+            id,
+            ..Target::default()
+        });
+    }
+    let picked = LeaseRecord {
+        picked: Picked::of(&targets),
+        ..keyed(1, a, key, now)
+    };
+    leases.issue(picked).expect("filed");
+    assert_eq!(carried(&store, key), [(a, 1)]);
+    assert!(leases.dispatched(gateway, id, on(Side::Single, 1), now));
+    assert_eq!(carried(&store, key), [(b, 1)]);
+    // A second dispatch of one lease, on the first target, moves nothing.
+    assert!(leases.dispatched(gateway, id, on(Side::Single, 0), now));
+    assert_eq!(carried(&store, key), [(b, 1)]);
+    assert!(leases.completed(gateway, id, &done(Side::Single)));
+    assert_eq!(store.keys_in_flight(), 0);
+}
+
+/// Each side of a pair's lease counts for its own session on its own
+/// worker, where a rule governed the pair: a side's end takes its count
+/// alone, and the decode's dispatch on an alternate moves the decode's.
+/// No plan files such a pair yet: a sessions rule runs under the single
+/// plan alone, and the file counts by the record whichever plan laid it.
+#[test]
+fn a_pairs_sides_count_each_for_its_own_key() {
+    let store = MemoryStore::new();
+    let [p, d0, d1] = ["http://p:1", "http://d0:1", "http://d1:1"].map(|key| ready(&store, key));
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, id, now) = (GatewayId(1), LeaseId(1), Instant::now());
+    leases.set_term(1);
+    let (prefill, decode) = (Session::from_raw(41), Session::from_raw(42));
+    let under = |id| {
+        let (mut record, mut side) = pair(id, p, &[d0, d1], now);
+        record.lease.session = prefill;
+        record.lease.session_verdict = SessionVerdict::Pinned;
+        side.session = decode;
+        (record, side)
+    };
+    issue_pair(leases, under(1)).expect("filed");
+    assert_eq!(carried(&store, prefill), [(p, 1)]);
+    assert_eq!(carried(&store, decode), [(d0, 1)]);
+    assert!(leases.dispatched(gateway, id, on(Side::Decode, 1), now));
+    assert_eq!(carried(&store, decode), [(d1, 1)]);
+    assert_eq!(carried(&store, prefill), [(p, 1)]);
+    // The prefill's end takes its key's count, and the decode's stands.
+    assert!(leases.completed(gateway, id, &done(Side::Prefill)));
+    assert_eq!(carried(&store, prefill), []);
+    assert_eq!(carried(&store, decode), [(d1, 1)]);
+    assert!(leases.completed(gateway, id, &done(Side::Decode)));
+    assert_eq!(store.keys_in_flight(), 0);
+    // A release with no side ends both, and frees both keys' counts.
+    issue_pair(leases, under(2)).expect("filed");
+    assert_eq!(store.keys_in_flight(), 2);
+    let gone = ReleaseReason::ClientGone;
+    assert!(leases.released(gateway, LeaseId(2), None, gone));
+    assert_eq!(store.keys_in_flight(), 0);
+    // A pair filed with an ended side counts the side that lives.
+    let (mut half, side) = under(3);
+    half.state = LeaseState::Completed;
+    issue_pair(leases, (half, side)).expect("filed");
+    assert_eq!(carried(&store, prefill), []);
+    assert_eq!(carried(&store, decode), [(d0, 1)]);
 }
 
 #[test]
