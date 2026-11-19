@@ -292,7 +292,7 @@ A port is a trait this crate calls and a host implements.
 | `EngineConnection` | `connection::engine` | The calls the runtime makes on a connected engine: liveness, the health and load reads, the labels the engine reports of its model and of itself, the admin calls and the two pushed streams. | Its client of an engine. |
 | `ConnectorDefault` | `connection::engine` | The connector a builder uses when it is handed none. | The same connector. |
 | `WorkerJobs` | `jobs` | How to remove workers at an address, how to read a worker's labels again, how to register a worker, and whether a job of an address is in flight. | Its job queue. |
-| `LoadSink` | `load::port` | What a pushed record or a poll's answer means for routing: the receipts and the poll decision, the overload verdict, what its readers cache. | Nothing to write: `WorkerMonitor::new` builds the monitor's own sink over the registry and the routing side. |
+| `LoadSink` | `load::port` | What a pushed record or a poll's answer means for routing: the receipts and the poll decision, the overload verdict, what its readers cache. | Nothing to write for the crate's own sink: `WorkerMonitor::new` builds it over the registry and the routing side. A host with a load store of its own writes this trait and hands it to `WorkerMonitor::with_sink`. |
 | `LoadConsumer` | `load::monitor` | Whether a reader wants loads, and how to trim what readers booked on a worker. | Its policy registry. |
 | `HealthSink` | `health::port` | What a probe's outcome or a connect signal does to a worker's status. | Nothing to write: the crate's registry is the sink, and `WorkerManager::start` hands it. |
 | `RequestCompletionSink` | `identity::basic` | What to do when a request on a worker ends. | The sink its policy registry installs. |
@@ -301,10 +301,11 @@ A port is a trait this crate calls and a host implements.
 | `WorkflowHost` | `workflow` | What the steps of a worker workflow read of their host: its registry. | Its application context. |
 
 A host must write two of them: `Generation`, to have a registry, and
-`LoadConsumer`, to run the load monitor. The others are for a host that needs
-them: one with gRPC or ZMQ workers, one that removes failed workers, one
-whose routing books requests, one that keeps an index of the engines' KV
-caches, one that runs the worker workflows.
+`LoadConsumer`, to run the load monitor over the crate's own sink. A host
+with a load store of its own writes `LoadSink` in its place. The others are
+for a host that needs them: one with gRPC or ZMQ workers, one that removes
+failed workers, one whose routing books requests, one that keeps an index of
+the engines' KV caches, one that runs the worker workflows.
 
 The KV event collector keeps one task a worker (`KvEventCollector`). A host
 adds a worker with the `SubscriptionKind` it wants and removes it. The

@@ -10,6 +10,11 @@
 //! registry and the routing side it is handed. A host states the port over
 //! its own store and hands it to
 //! [`WorkerMonitor::with_sink`](super::monitor::WorkerMonitor::with_sink).
+//!
+//! The port is not the stream's hand to the monitor: a worker's event stream
+//! gives the monitor each pushed record through `PushedLoadSink`
+//! (`kv_events::subscription`), and the monitor says what the record means
+//! to a [`LoadSink`].
 
 use std::{
     sync::Arc,
@@ -49,6 +54,7 @@ impl PollMode {
 /// engine's one worker, or one rank worker of a data-parallel engine.
 #[derive(Clone, Copy)]
 pub struct PolledMember<'a> {
+    /// The polled worker.
     pub worker: &'a Arc<dyn Worker>,
     /// The member's answer: the engine's, scoped to the member's own rank
     /// where the member is one rank of it. An answer with no row says the
@@ -75,14 +81,16 @@ pub struct PolledRanks {
 /// One polled member's report at the end of a group's tick.
 #[derive(Clone, Copy)]
 pub struct PolledReport<'a> {
+    /// The polled worker the report is of.
     pub worker: &'a Arc<dyn Worker>,
     /// The report as the collector publishes it: the poll's answer with the
     /// rows of the ranks whose stream is the newer laid over it.
     pub report: &'a WorkerLoadResponse,
-    /// Whether the answer itself, before those rows, listed the worker's
-    /// ranks with their token capacity: what a cache of rank loads asks
-    /// before it takes the report's rows as the worker's ranks.
-    pub lists_ranks: bool,
+    /// Whether the answer itself, before those rows, carried token capacity
+    /// on rows that are ranks: what a cache of rank loads asks before it
+    /// takes the report's rows as the worker's ranks. It does not read the
+    /// answer's rank count: an answer short of its own count reads true.
+    pub carries_rank_capacity: bool,
 }
 
 /// What a group's tick leaves, once every polled engine has answered and the
@@ -107,7 +115,7 @@ pub struct GroupTick<'a> {
 /// A poll's unit is one engine: its polled members cross together, so a
 /// sink that judges an engine reads the answer whole.
 ///
-/// Six calls have no default: each is a fact a sink takes or a question it
+/// Seven calls have no default: each is a fact a sink takes or a question it
 /// answers. Two have one, where doing nothing is a true answer: a sink
 /// whose readers always read loads says yes at [`Self::needs_loads`], and a
 /// sink that keeps no rank cache and trims nothing has no work at
@@ -149,6 +157,12 @@ pub trait LoadSink: Send + Sync {
     /// replaced, or its status left `Ready`.
     fn forget(&self, worker: &Arc<dyn Worker>);
 
+    /// The collector reset itself: it stopped its groups and dropped every
+    /// load it published, at its own drop, at its start and after it lost
+    /// registry events. What the sink keeps of any worker is void: a worker
+    /// that left while events were lost is never said at [`Self::forget`].
+    fn reset(&self);
+
     /// Whether a reader wants worker loads, asked by a collector that is
     /// told to fetch them on demand alone. A sink whose readers always read
     /// them keeps this answer.
@@ -158,7 +172,5 @@ pub trait LoadSink: Send + Sync {
 
     /// The end of a group's tick. A sink that keeps rows of its own took
     /// them at [`Self::report`] and needs nothing here.
-    fn tick(&self, tick: &GroupTick<'_>) {
-        let _ = tick;
-    }
+    fn tick(&self, _tick: &GroupTick<'_>) {}
 }

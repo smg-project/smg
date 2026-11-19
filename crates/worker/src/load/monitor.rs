@@ -761,8 +761,8 @@ impl<G: Generation> WorkerMonitor<G> {
 
     /// The end of a group's tick, for the sink: every Ready worker of the
     /// group, polled or served by its stream, and each polled member's
-    /// report as the tick publishes it, with whether its answer listed the
-    /// worker's ranks. It is said whether or not a fetch succeeded, and when
+    /// report as the tick publishes it, with whether its answer carried rank
+    /// capacity. It is said whether or not a fetch succeeded, and when
     /// nobody was polled.
     fn end_tick(
         &self,
@@ -771,10 +771,10 @@ impl<G: Generation> WorkerMonitor<G> {
     ) {
         let reports: Vec<PolledReport<'_>> = group_loads
             .iter()
-            .map(|(worker, report, lists_ranks)| PolledReport {
+            .map(|(worker, report, carries_rank_capacity)| PolledReport {
                 worker,
                 report,
-                lists_ranks: *lists_ranks,
+                carries_rank_capacity: *carries_rank_capacity,
             })
             .collect();
         self.sink.tick(&GroupTick {
@@ -791,8 +791,8 @@ impl<G: Generation> WorkerMonitor<G> {
     /// Each member's answer then takes the rows of its newer ranks, and
     /// every step after reads the report so reconciled. A fetch that failed
     /// for every member is said with no lock held. Returns, by member,
-    /// whether its answer listed the worker's ranks with their token
-    /// capacity.
+    /// whether its answer carried rank capacity
+    /// ([`PolledReport::carries_rank_capacity`]).
     fn reconcile_engine(
         &self,
         engine: &mut [(Arc<dyn Worker>, Option<WorkerLoadResponse>)],
@@ -804,7 +804,7 @@ impl<G: Generation> WorkerMonitor<G> {
         // the answer's. The merge reads one fact more, the answer's count
         // against its rows: a short answer feeds the cache and retracts no
         // rank from the file.
-        let lists_ranks: Vec<bool> = engine
+        let carries_rank_capacity: Vec<bool> = engine
             .iter()
             .map(|(_, response)| {
                 response
@@ -818,7 +818,7 @@ impl<G: Generation> WorkerMonitor<G> {
                 .map(|(worker, _)| Arc::clone(worker))
                 .collect();
             self.sink.fetch_failed(&members);
-            return lists_ranks;
+            return carries_rank_capacity;
         }
         let with_rows = engine
             .iter()
@@ -901,7 +901,7 @@ impl<G: Generation> WorkerMonitor<G> {
                 load.dp_rank_count = load.dp_rank_count.max(carried);
             }
         }
-        lists_ranks
+        carries_rank_capacity
     }
 
     /// The coalescing publisher of pushed reports, started on the first one:
@@ -1094,20 +1094,11 @@ impl<G: Generation> WorkerMonitor<G> {
         // otherwise leak entries, and the cost is one re-probe per
         // worker on a path that only runs on lag recovery.
         self.load_state.clear();
-        self.worker_load_manager.clear();
         self.native_loads_memo.clear();
-        // The feed that would clear the vetoes is being torn down: fail open,
-        // but say so — a wiped gauge is otherwise indistinguishable from a
-        // genuine recovery. With no thresholds anywhere no flag was ever
-        // written, so this clears nothing and stays silent.
-        let cleared = self.worker_registry.clear_all_overload_flags();
-        if cleared > 0 {
-            warn!(
-                vetoes_cleared = cleared,
-                "Overload vetoes cleared with the load feed; every worker is routable again \
-                 until its next poll"
-            );
-        }
+        // What the sink keeps is void with the feed, and the sink is told:
+        // the monitor's own drops its cache of rank loads and fails every
+        // overload veto open.
+        self.sink.reset();
     }
 
     /// Recompute the polling state for every currently-known group.
@@ -1873,8 +1864,10 @@ async fn poll_group_once<G: Generation>(
 
     let mut group_loads: Vec<(Arc<dyn Worker>, WorkerLoadResponse, bool)> = Vec::new();
     for mut engine in engines {
-        let lists_ranks = monitor.reconcile_engine(&mut engine, now);
-        for ((worker, response), lists_ranks) in engine.into_iter().zip(lists_ranks) {
+        let carries_rank_capacity = monitor.reconcile_engine(&mut engine, now);
+        for ((worker, response), carries_rank_capacity) in
+            engine.into_iter().zip(carries_rank_capacity)
+        {
             let Some(load) = response.filter(|load| !load.loads.is_empty()) else {
                 continue;
             };
@@ -1885,7 +1878,7 @@ async fn poll_group_once<G: Generation>(
                 .map(|rank| i64::from(rank.num_waiting_reqs))
                 .sum();
             liveness::on_load_report(&worker, waiting, None, false, None);
-            group_loads.push((worker, load, lists_ranks));
+            group_loads.push((worker, load, carries_rank_capacity));
         }
     }
 

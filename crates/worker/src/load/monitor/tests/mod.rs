@@ -730,6 +730,9 @@ async fn the_overload_vetos_edges_are_logged_with_their_figures() {
     assert!(logs_contain("Worker overload veto set"));
     assert!(logs_contain("waiting_requests=8"));
     assert!(logs_contain("pushed record"));
+    assert!(logs_contain(
+        "smg_worker::load::monitor: Worker overload veto set"
+    ));
     assert!(!logs_contain("Worker overload veto cleared"));
     monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
     logs_assert(|lines: &[&str]| {
@@ -1269,8 +1272,9 @@ enum Said {
     ReportEmpty(Vec<(String, Option<usize>, Option<usize>)>, bool),
     FetchFailed(Vec<String>, bool),
     Forget(String),
+    Reset,
     /// The Ready workers of the group, then each report's URL, its rows and
-    /// whether its answer listed the ranks.
+    /// whether its answer carried rank capacity.
     Tick(usize, Vec<(String, usize, bool)>),
 }
 
@@ -1366,6 +1370,10 @@ impl LoadSink for RecordingLoadSink {
             .push(Said::Forget(worker.url().to_string()));
     }
 
+    fn reset(&self) {
+        self.said.lock().push(Said::Reset);
+    }
+
     fn needs_loads(&self) -> bool {
         self.needs
     }
@@ -1378,7 +1386,7 @@ impl LoadSink for RecordingLoadSink {
                 (
                     polled.worker.url().to_string(),
                     polled.report.loads.len(),
-                    polled.lists_ranks,
+                    polled.carries_rank_capacity,
                 )
             })
             .collect();
@@ -1499,7 +1507,7 @@ async fn an_engines_answer_crosses_whole_and_the_file_is_laid_by_the_sinks_ranks
     sink.said.lock().clear();
 
     let mut engine = vec![(Arc::clone(&worker), Some(answer_of(0, 7)))];
-    let lists_ranks = monitor.reconcile_engine(&mut engine, Instant::now());
+    let carries_rank_capacity = monitor.reconcile_engine(&mut engine, Instant::now());
 
     assert_eq!(
         *sink.said.lock(),
@@ -1517,7 +1525,7 @@ async fn an_engines_answer_crosses_whole_and_the_file_is_laid_by_the_sinks_ranks
     let answer = engine[0].1.as_ref().expect("the answer stays");
     assert_eq!(rows(answer), vec![(0, 7), (1, 11)]);
     assert_eq!(
-        lists_ranks,
+        carries_rank_capacity,
         vec![false],
         "an answer with no token capacity lists no ranks for a cache"
     );
@@ -1673,6 +1681,26 @@ async fn a_status_that_leaves_ready_forgets_the_workers_loads_at_the_sink() {
     assert!(within_two_seconds(|| told_to_forget(&sink, "http://w:1")).await);
 }
 
+/// A Ready worker under overload thresholds: eight waiting requests, or a
+/// token usage of 0.8.
+fn overload_worker(url: &str) -> Arc<dyn Worker> {
+    let worker = BasicWorkerBuilder::new(url)
+        .worker_type(WorkerType::Regular)
+        .connection_mode(ConnectionMode::Http)
+        .model(ModelCard::new("m"))
+        .health_config(HealthCheckConfig {
+            disable_health_check: true,
+            ..Default::default()
+        })
+        .overload_defaults(OverloadThresholds {
+            waiting_requests: Some(8),
+            token_usage: Some(0.8),
+        })
+        .build();
+    worker.set_status(WorkerStatus::Ready);
+    Arc::new(worker)
+}
+
 /// A worker whose status leaves `Ready` has no load feed and so no verdict:
 /// the monitor's own sink clears the overload flag, which nothing else
 /// clears on that path. A record comes before the event loop starts, so the
@@ -1682,23 +1710,7 @@ async fn a_status_that_leaves_ready_forgets_the_workers_loads_at_the_sink() {
 #[tokio::test]
 async fn a_status_that_leaves_ready_clears_the_overload_flag_at_the_monitors_own_sink() {
     let (registry, monitor) = build_monitor();
-    let worker: Arc<dyn Worker> = {
-        let worker = BasicWorkerBuilder::new("http://w:1")
-            .worker_type(WorkerType::Regular)
-            .connection_mode(ConnectionMode::Http)
-            .model(ModelCard::new("m"))
-            .health_config(HealthCheckConfig {
-                disable_health_check: true,
-                ..Default::default()
-            })
-            .overload_defaults(OverloadThresholds {
-                waiting_requests: Some(8),
-                token_usage: Some(0.8),
-            })
-            .build();
-        worker.set_status(WorkerStatus::Ready);
-        Arc::new(worker)
-    };
+    let worker = overload_worker("http://w:1");
     let id = registry.register(Arc::clone(&worker)).unwrap();
     let record = pushed(1).with_requests(1, 8);
     monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
@@ -1711,4 +1723,39 @@ async fn a_status_that_leaves_ready_clears_the_overload_flag_at_the_monitors_own
         within_two_seconds(|| !worker.is_overloaded()).await,
         "no load feed, no verdict"
     );
+}
+
+/// The collector's reset crosses the port: the sink is told, and the
+/// collector itself clears no overload flag. The flag here was set by
+/// another hand and the recording sink writes nothing, so it still stands.
+#[test]
+fn a_reset_is_said_to_the_sink_and_the_collector_clears_no_flag_itself() {
+    let (registry, monitor, sink) =
+        build_recording(PollMode::Suppressed, PolledRanks::default(), true, false);
+    let worker = overload_worker("http://w:1");
+    registry.register(Arc::clone(&worker)).unwrap();
+    registry.set_worker_overloaded(&worker, true);
+
+    monitor.stop_all_groups();
+
+    assert_eq!(*sink.said.lock(), vec![Said::Reset]);
+    assert!(worker.is_overloaded(), "the flag is the sink's to clear");
+}
+
+/// At a reset the monitor's own sink fails every overload veto open and
+/// says so, under the monitor's log target as before the port.
+#[test]
+#[tracing_test::traced_test]
+fn the_monitors_own_sink_fails_the_vetoes_open_at_a_reset_and_says_so() {
+    let (registry, monitor) = build_monitor();
+    let worker = overload_worker("http://w:1");
+    registry.register(Arc::clone(&worker)).unwrap();
+    registry.set_worker_overloaded(&worker, true);
+
+    monitor.stop_all_groups();
+
+    assert!(!worker.is_overloaded());
+    assert!(logs_contain(
+        "smg_worker::load::monitor: Overload vetoes cleared with the load feed"
+    ));
 }

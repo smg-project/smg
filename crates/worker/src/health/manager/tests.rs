@@ -3306,5 +3306,8 @@ fn a_promoted_workers_next_check_follows_the_status_it_took() {
     let due = next_check
         .get(&worker_id)
         .expect("a ready worker holds a deadline");
-    assert!(*due > before, "an interval out, not at once");
+    assert!(
+        *due >= before + Duration::from_secs(3600),
+        "an interval out, not at once"
+    );
 }

@@ -249,18 +249,18 @@ fn run(gateway: Thresholds, own: Thresholds, ranks: usize, steps: &[Step]) -> Ve
                     // ranks that pushed before the poll leave the worker's
                     // pushed report.
                     let mut engine = vec![(Arc::clone(&worker), Some(load))];
-                    let lists_ranks = monitor.reconcile_engine(&mut engine, now);
+                    let carries_rank_capacity = monitor.reconcile_engine(&mut engine, now);
                     let reports: Vec<_> = engine
                         .into_iter()
-                        .zip(lists_ranks)
-                        .filter_map(|((worker, response), lists_ranks)| {
+                        .zip(carries_rank_capacity)
+                        .filter_map(|((worker, response), carries_rank_capacity)| {
                             let load = response.filter(|load| !load.loads.is_empty())?;
                             assert_eq!(
                                 format!("{:?}", load.loads),
                                 asked,
                                 "no rank pushed since the poll began"
                             );
-                            Some((worker, load, lists_ranks))
+                            Some((worker, load, carries_rank_capacity))
                         })
                         .collect();
                     monitor.end_tick(std::slice::from_ref(&worker), &reports);

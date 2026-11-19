@@ -12,7 +12,7 @@ use std::{
 
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
-use tracing::info;
+use tracing::{info, warn};
 
 use super::{dp_rank_token_loads, LoadConsumer, WorkerLoadManager};
 use crate::{
@@ -28,7 +28,7 @@ pub(super) struct ClassicLoadSink<G> {
     worker_load_manager: Arc<WorkerLoadManager>,
     /// When each rank of a worker last pushed a load record, by receipt:
     /// the tick's poll decision reads it (see [`PollMode`]). Keyed by the
-    /// worker's URL, a string of the gateway's own, and every record looks
+    /// worker's URL, a string the host registered, and every record looks
     /// its worker up: it hashes with FxHash.
     pushed_at: Mutex<FxHashMap<String, BTreeMap<i32, Instant>>>,
 }
@@ -73,7 +73,10 @@ impl<G: Generation> ClassicLoadSink<G> {
         }
         let waiting = load.map_or(0, WorkerLoadResponse::total_waiting_reqs);
         let kv_pressure = load.map_or(0.0, WorkerLoadResponse::effective_kv_pressure);
+        // The line keeps the monitor's log target: it was written there
+        // before the port.
         info!(
+            target: "smg_worker::load::monitor",
             worker_url = %worker.redacted_url(),
             overloaded = verdict,
             waiting_requests = waiting,
@@ -338,6 +341,26 @@ impl<G: Generation> LoadSink for ClassicLoadSink<G> {
         self.pushed_at.lock().remove(url);
     }
 
+    fn reset(&self) {
+        self.worker_load_manager.clear();
+        // The feed that would clear the vetoes is being torn down: fail open,
+        // but say so — a wiped gauge is otherwise indistinguishable from a
+        // genuine recovery. With no thresholds anywhere no flag was ever
+        // written, so this clears nothing and stays silent. The line keeps
+        // the monitor's log target. The receipts stay, as before the port:
+        // a worker that pushed is polled again once its receipt is older
+        // than a tick.
+        let cleared = self.worker_registry.clear_all_overload_flags();
+        if cleared > 0 {
+            warn!(
+                target: "smg_worker::load::monitor",
+                vetoes_cleared = cleared,
+                "Overload vetoes cleared with the load feed; every worker is routable again \
+                 until its next poll"
+            );
+        }
+    }
+
     fn needs_loads(&self) -> bool {
         self.load_consumer.needs_loads()
     }
@@ -375,7 +398,7 @@ impl<G: Generation> LoadSink for ClassicLoadSink<G> {
             // A fleet rollup from a gateway worker is keyed by downstream
             // worker, not by rank, so its repeated `dp_rank: 0` entries
             // would overwrite each other down to a single bogus rank.
-            if polled.lists_ranks {
+            if polled.carries_rank_capacity {
                 group_dp_loads.insert(url, dp_rank_token_loads(polled.report));
             } else {
                 dp_evict.push(url);
