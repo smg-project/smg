@@ -969,15 +969,20 @@ pub(crate) fn release_reason(r: ReleaseReason) -> wit::ReleaseReason {
     }
 }
 
-/// A membership word as the guest's world carries it. `None` for
-/// [`Membership::Left`]: the world has no case for it, and a guest hears
-/// the write's own word, said beside it.
+/// A membership word as the guest's world carries it. A snapshot's ids are
+/// written into `snapshot` and a left word's names into `names`: the word
+/// borrows them for the call.
 pub(crate) fn membership<'a>(
-    m: &Membership<'_>,
+    m: &Membership<'a>,
     snapshot: &'a mut Vec<u64>,
-) -> Option<wit::Membership<'a>> {
-    Some(match m {
-        Membership::Left { .. } => return None,
+    names: &'a mut Vec<&'a str>,
+) -> wit::Membership<'a> {
+    match *m {
+        Membership::Left { id, models } => {
+            names.clear();
+            names.extend(models.iter().map(String::as_str));
+            wit::Membership::Left((id.0, names.as_slice()))
+        }
         Membership::Added(w) => wit::Membership::Added(w.0),
         Membership::Removed(w) => wit::Membership::Removed(w.0),
         Membership::Replaced { old, new } => wit::Membership::Replaced((old.0, new.0)),
@@ -988,7 +993,7 @@ pub(crate) fn membership<'a>(
             snapshot.extend(workers.iter().map(|w| w.0));
             wit::Membership::Snapshot(snapshot)
         }
-    })
+    }
 }
 
 /// A signal; a veto's instant on the host's clock becomes the microseconds
@@ -1702,18 +1707,21 @@ mod tests {
         assert_eq!(lease(&told, &Exposure::default()).target_index, 1);
     }
 
-    /// The guest's world has no case for the models a worker left: the
-    /// mapper hands a guest nothing for that word, and the write's own word
-    /// as before.
+    /// The guest's world carries the models a worker left as the case
+    /// `left`: the mapper hands a guest the worker's id with the names, and
+    /// the write's own word as before.
     #[test]
-    fn a_guest_is_told_nothing_of_the_models_a_worker_left() {
+    fn a_guest_is_told_the_models_a_worker_left_as_the_case_left() {
         let (id, models) = (WorkerId(7), ["m".to_string()]);
         let left = Membership::Left {
             id,
             models: &models,
         };
-        let mut snapshot = Vec::new();
-        assert!(membership(&left, &mut snapshot).is_none());
-        assert!(membership(&Membership::Relabelled(id), &mut snapshot).is_some());
+        let (mut snapshot, mut names) = (Vec::new(), Vec::new());
+        let word = membership(&left, &mut snapshot, &mut names);
+        assert!(matches!(word, wit::Membership::Left((7, ["m"]))));
+        let (mut snapshot, mut names) = (Vec::new(), Vec::new());
+        let word = membership(&Membership::Relabelled(id), &mut snapshot, &mut names);
+        assert!(matches!(word, wit::Membership::Relabelled(7)));
     }
 }

@@ -1,6 +1,6 @@
 //! The policy controller's two wire contracts, compiled and parsed at test
 //! time (`contracts/README.md`): the gRPC protocol in package `smg.policy.v1`
-//! and the WebAssembly world `smg:policy@1.0.0`. Nothing at run time reads
+//! and the WebAssembly world `smg:policy@1.1.0`. Nothing at run time reads
 //! the files; the world's `types` interface is rendered from the crate's
 //! types by the `wit` module and held to the committed file by `tests/wit.rs`.
 //! The tests here hold four things: the
@@ -39,7 +39,7 @@ const WORLD_WIT: &str = "smg-policy.wit";
 const PACKAGE: &str = "smg.policy.v1";
 const WIT_NAMESPACE: &str = "smg";
 const WIT_PACKAGE: &str = "policy";
-const WIT_VERSION: &str = "1.0.0";
+const WIT_VERSION: &str = "1.1.0";
 
 /// The header deny-list of design section 4.6: the names no view may read
 /// and no routing-key override may key on, lowercase, in this order, each
@@ -493,28 +493,20 @@ fn enum_mirrors() -> Vec<(
             "MembershipChange.Kind",
             "KIND",
             "membership",
-            membership_cases().0,
+            cases!(
+                Membership<'_>,
+                Membership {
+                    Added,
+                    Removed,
+                    Replaced,
+                    Relabelled,
+                    Resized,
+                    Snapshot,
+                    Left,
+                }
+            ),
         ),
     ]
-}
-
-/// The membership words in declaration order: the kinds the two contracts
-/// spell out, then the words they do not carry. A plugin is told nothing of
-/// a word of the second part.
-fn membership_cases() -> (&'static [&'static str], &'static [&'static str]) {
-    cases!(
-        Membership<'_>,
-        Membership {
-            Added,
-            Removed,
-            Replaced,
-            Relabelled,
-            Resized,
-            Snapshot,
-            Left,
-        }
-    )
-    .split_at(6)
 }
 
 /// The shed reasons have a proto enum and no WIT counterpart (a guest never
@@ -1476,9 +1468,6 @@ fn the_protocol_compiles_and_mirrors_the_engine_record() {
             .unwrap_or_else(|| panic!("enum {proto_name} is missing from {PLUGIN_PROTO}"));
         assert_eq!(found, proto_enum(prefix, cases), "enum {proto_name}");
     }
-    // The membership word no contract carries: a plugin is told nothing of
-    // it.
-    assert_eq!(membership_cases().1, ["Left"]);
     let found = enum_values(plugin, "ShedReason").expect("ShedReason is an enum");
     assert_eq!(found, proto_enum("SHED_REASON", shed_reasons()));
     // The lifted veto: the mark's variants in order, numbered from zero.
@@ -1807,6 +1796,47 @@ const MEMBERSHIP_FIELDS: &[(&str, &[ResumeField])] = &[
     ),
     ("WorkerSpec", &[("health_policy", 14, Type::Message)]),
 ];
+
+/// A membership change on the plugin wire, by name and number: a plugin
+/// built against protocol 1 reads the first four fields and the kinds to
+/// `KIND_SNAPSHOT` as it did, and protocol 2 added the kind a worker left
+/// with its field `models`.
+#[test]
+fn the_plugin_wires_membership_change_is_pinned() {
+    let set = compile_protocol().expect("protoc compiles the two protocol files");
+    let plugin = file(&set, PLUGIN_PROTO).expect("the plugin file is in the descriptor set");
+    let compiled = message(plugin, "MembershipChange")
+        .unwrap_or_else(|| panic!("MembershipChange is missing from {PLUGIN_PROTO}"));
+    let found: Vec<(String, i32, Type, bool)> = fields(compiled)
+        .into_iter()
+        .map(|(name, number, kind, repeated, _)| (name, number, kind, repeated))
+        .collect();
+    let expected = [
+        ("kind", 1, Type::Enum, false),
+        ("worker_id", 2, Type::Fixed64, false),
+        ("old_worker_id", 3, Type::Fixed64, false),
+        ("ids", 4, Type::Fixed64, true),
+        ("models", 5, Type::String, true),
+    ]
+    .map(|(name, number, kind, repeated)| (name.to_owned(), number, kind, repeated));
+    assert_eq!(found, expected, "a field of the membership change moved");
+    let kinds = enum_values(plugin, "MembershipChange.Kind").expect("the kinds are an enum");
+    let pinned = [
+        "KIND_UNSPECIFIED",
+        "KIND_ADDED",
+        "KIND_REMOVED",
+        "KIND_REPLACED",
+        "KIND_RELABELLED",
+        "KIND_RESIZED",
+        "KIND_SNAPSHOT",
+        "KIND_LEFT",
+    ];
+    let pinned: Vec<(String, i32)> = (0..)
+        .zip(pinned)
+        .map(|(number, name)| (name.to_owned(), number))
+        .collect();
+    assert_eq!(kinds, pinned, "a kind of the membership change moved");
+}
 
 #[test]
 fn the_membership_fields_are_pinned() {

@@ -21,10 +21,11 @@ use super::{
     config::{GrpcPluginSpec, Transport},
     runtime::{
         answer_bytes, Command, Fault, Lane, LaneEvents, ObserveLane, Peer, Readiness, Runtime,
-        SendError, Wait, Witness,
+        SendError, Spoken, Wait, Witness,
     },
     unit::Unit,
     view::{self, Answer, FILTER, PICK, SCORE},
+    PROTOCOL, PROTOCOL_MIN,
 };
 use crate::{
     decision::{Decision, Target},
@@ -326,6 +327,8 @@ impl Plugin {
             counters: spec.metrics.clone(),
             connect: Duration::from_micros(u64::from(spec.connect_micros)),
             answer_bytes: answer_bytes(spec.max_candidates, spec.metrics.len()),
+            versions: PROTOCOL_MIN..=PROTOCOL,
+            spoken: Spoken::default(),
         });
         let (observe_tx, observe_rx) = mpsc::channel(OBSERVE_QUEUE);
         let inner = Arc::new_cyclic(|me| Inner {
@@ -1193,9 +1196,15 @@ impl BoundPlugin for Bound {
     }
 
     fn observe_membership(&self, change: &Membership<'_>) {
-        if let Some(event) = view::membership(change) {
-            self.plugin.inner.observe(event);
+        let (inner, word) = (&self.plugin.inner, view::membership(change));
+        // A word the standing streams' version has no kind for is not
+        // raised: in the queue it would take a place a heard event needs,
+        // and a refusal of it would number a loss the stream never had.
+        let since = view::since(&word);
+        if since > PROTOCOL_MIN && inner.peer.spoken.stands_under(since) {
+            return;
         }
+        inner.observe(word);
     }
 
     fn observe_signal(&self, signal: &Signal) {

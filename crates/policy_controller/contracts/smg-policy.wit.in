@@ -11,7 +11,10 @@
 /// module may leave unused, a module's extra exports are ignored, and a
 /// changed shape is a new type or the next major. The world is pre-release
 /// until the first shipped release that carries it; the rule binds from then
-/// on. The loader's error names the module's version and the accepted range.
+/// on. Until then a shape changes in place under the next minor and the
+/// host's floor rises with it: 1.1 added `left` to `membership`, and a module
+/// built against 1.0 is refused. The loader's error names the module's
+/// version and the accepted range.
 ///
 /// Sandbox (design 4.5): no WASI, the only imports are `host` below. One
 /// instance per module per decider, created at apply and kept; the call
@@ -19,7 +22,7 @@
 /// a decline falls back to the configured stage; a trap or an exhausted
 /// budget re-instantiates the instance, a decline keeps it.
 
-package smg:policy@1.0.0;
+package smg:policy@1.1.0;
 
 /// The view (design 4.1) and the lifecycle (4.3) as the guest sees them.
 {{types}}

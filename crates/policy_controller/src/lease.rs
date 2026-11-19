@@ -151,8 +151,9 @@ pub enum Membership<'a> {
     /// [`Membership::Relabelled`] or [`Membership::Resized`]. A new
     /// incarnation says its [`Membership::Replaced`] first and this word
     /// behind it, for the new id. A stage that lists workers by model
-    /// unlists the worker under these alone. The plugin contracts carry
-    /// no such kind: a plugin is told nothing of it.
+    /// unlists the worker under these alone. Both plugin contracts carry
+    /// the word: the guest's world as the case `left`, the remote one as a
+    /// kind a stream of protocol 2 is sent.
     Left {
         id: WorkerId,
         models: &'a [String],

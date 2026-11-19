@@ -10,6 +10,7 @@ use std::{
     fmt,
     future::Future,
     io,
+    ops::RangeInclusive,
     panic::{self, AssertUnwindSafe},
     path::PathBuf,
     pin::Pin,
@@ -30,14 +31,14 @@ use rustls::crypto::ring;
 use tokio::sync::oneshot;
 use tokio::{
     net::UnixStream,
-    sync::{mpsc, Notify},
+    sync::{mpsc, watch, Notify},
     task::JoinSet,
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity, Uri};
 use tower::service_fn;
 
-use super::{config::Transport, view, PROTOCOL};
+use super::{config::Transport, view};
 use crate::{
     plugins::OpenDecisions,
     proto::{self, policy_plugin_client::PolicyPluginClient},
@@ -233,13 +234,20 @@ pub(crate) struct Peer {
     pub(crate) connect: Duration,
     /// The most bytes one message of the plugin's holds ([`answer_bytes`]).
     pub(crate) answer_bytes: usize,
+    /// The protocol versions a `Decide` hello offers while the plugin's
+    /// version is not fixed.
+    pub(crate) versions: RangeInclusive<u32>,
+    /// The version the plugin speaks, as its `Decide` streams fix it.
+    pub(crate) spoken: Spoken,
 }
 
 impl Peer {
-    fn hello(&self) -> proto::PluginHello {
+    /// The hello of a stream that offers the versions from `protocol_min`
+    /// to `protocol_max`.
+    fn hello(&self, (protocol_min, protocol_max): (u32, u32)) -> proto::PluginHello {
         proto::PluginHello {
-            protocol_min: PROTOCOL,
-            protocol_max: PROTOCOL,
+            protocol_min,
+            protocol_max,
             plugin: self.name.clone(),
             config: self.config.clone(),
             exposure: Some(self.exposure.clone()),
@@ -251,6 +259,100 @@ impl Peer {
             // The spec's generation arrives with the `plugins` row.
             generation: 0,
         }
+    }
+}
+
+/// The protocol version one plugin speaks, by the contract's rule: the first
+/// `Decide` stream to settle fixes it, a stream opened while one stands is
+/// offered it alone, and the end of the last one frees it for the next
+/// settle.
+pub(crate) struct Spoken {
+    /// The version last fixed, and how many settled `Decide` streams stand
+    /// on it: with none the version is free.
+    fixed: watch::Sender<(u32, usize)>,
+}
+
+impl Default for Spoken {
+    fn default() -> Self {
+        Self {
+            fixed: watch::Sender::new((0, 0)),
+        }
+    }
+}
+
+impl Spoken {
+    /// The versions a `Decide` hello offers: the fixed one alone while a
+    /// stream stands on it, the host's range otherwise.
+    fn offer(&self, versions: &RangeInclusive<u32>) -> (u32, u32) {
+        match *self.fixed.borrow() {
+            (_, 0) => (*versions.start(), *versions.end()),
+            (fixed, _) => (fixed, fixed),
+        }
+    }
+
+    /// A `Decide` stream's ack named `version`: it fixes the plugin's where
+    /// no stream stands and joins it where it names the fixed one, and the
+    /// stream stands until its [`Standing`] goes. An ack that names another
+    /// version comes back with the fixed one: two streams were offered the
+    /// range, and this one settled second.
+    fn settle(&self, version: u32) -> Result<Standing<'_>, u32> {
+        let mut other = None;
+        self.fixed.send_if_modified(|(fixed, standing)| {
+            if *standing == 0 {
+                // The events task waits for the version to move, and with
+                // a word kept for a stream to stand.
+                *fixed = version;
+                *standing = 1;
+                return true;
+            }
+            if *fixed == version {
+                *standing += 1;
+            } else {
+                other = Some(*fixed);
+            }
+            false
+        });
+        match other {
+            None => Ok(Standing(self)),
+            Some(fixed) => Err(fixed),
+        }
+    }
+
+    /// Whether a stream stands on a version older than `since`. An event
+    /// that version first carries is then written to no stream of the
+    /// plugin, so it is not raised: in the queue it would take a place a
+    /// heard event needs, and a refusal of it would number a loss the
+    /// stream never had. With no stream standing the next settle may fix
+    /// any version: the event is raised, and the events task keeps it for
+    /// the call that carries it ([`Self::stands_on`]).
+    pub(crate) fn stands_under(&self, since: u32) -> bool {
+        let (fixed, standing) = *self.fixed.borrow();
+        standing != 0 && fixed < since
+    }
+
+    /// Whether a stream stands on `version`. A word that version has no
+    /// kind for, taken by an events call that named it, is then written to
+    /// no stream of the plugin. With none on it the version is free or has
+    /// moved: the word is kept, and the next settle says what becomes of
+    /// it.
+    fn stands_on(&self, version: u32) -> bool {
+        let (fixed, standing) = *self.fixed.borrow();
+        standing != 0 && fixed == version
+    }
+}
+
+/// One settled `Decide` stream's stand on its plugin's version, given up
+/// when the stream ends.
+struct Standing<'a>(&'a Spoken);
+
+impl Drop for Standing<'_> {
+    fn drop(&mut self) {
+        // No waiter reads a stream's end: the version stays the last one
+        // fixed, and the next settle says what it is.
+        self.0.fixed.send_if_modified(|(_, standing)| {
+            *standing = standing.saturating_sub(1);
+            false
+        });
     }
 }
 
@@ -961,20 +1063,32 @@ async fn channel(transport: &Transport, connect: Duration) -> Result<Channel, St
 
 type Inbound = tonic::Streaming<proto::PluginResponse>;
 
+/// A `Decide` stream as it settled: its request side, its answers, the stage
+/// bits its ack named and its stand on the version that ack named.
+type Settled<'a> = (
+    mpsc::Sender<proto::PluginRequest>,
+    Inbound,
+    u32,
+    Standing<'a>,
+);
+
 /// Opens a `Decide` stream: the connect, the hello and its ack, each under
-/// the connect frame. The ack's stage bits come back with the stream.
-async fn open_decide(
-    peer: &Peer,
-) -> Result<(mpsc::Sender<proto::PluginRequest>, Inbound, u32), Fault> {
+/// the connect frame.
+async fn open_decide(peer: &Peer) -> Result<Settled<'_>, Fault> {
     let connect = peer.connect;
     let channel = tokio::time::timeout(connect, channel(&peer.transport, connect))
         .await
         .map_err(|_| "the connect did not settle within its frame")??;
     let mut client = PolicyPluginClient::new(channel).max_decoding_message_size(peer.answer_bytes);
-    // The hello and a window of frames.
+    // The hello and a window of frames. The versions offered are read as
+    // the hello is written: the fixed one alone while another stream of the
+    // plugin stands.
     let (tx, rx) = mpsc::channel(WINDOW + 1);
+    let (min, max) = peer.spoken.offer(&peer.versions);
     tx.try_send(proto::PluginRequest {
-        request: Some(proto::plugin_request::Request::Hello(peer.hello())),
+        request: Some(proto::plugin_request::Request::Hello(
+            peer.hello((min, max)),
+        )),
     })
     .map_err(|_| "the hello did not enter the stream")?;
     let response = tokio::time::timeout(
@@ -994,15 +1108,29 @@ async fn open_decide(
             response: Some(proto::plugin_response::Response::Hello(ack)),
         }) => {
             if !ack.ok {
-                Err(Fault::Init(bounded(ack.error)))
-            } else if ack.protocol != PROTOCOL {
-                Err(format!(
-                    "the plugin chose protocol {}, outside the offered {PROTOCOL}",
+                return Err(Fault::Init(bounded(ack.error)));
+            }
+            if !(min..=max).contains(&ack.protocol) {
+                let offered = if min == max {
+                    min.to_string()
+                } else {
+                    format!("{min} to {max}")
+                };
+                return Err(format!(
+                    "the plugin chose protocol {}, outside the offered {offered}",
                     ack.protocol
                 )
-                .into())
-            } else {
-                Ok((tx, inbound, ack.stages))
+                .into());
+            }
+            // An ack that lost the race to fix the plugin's version ends
+            // its stream here: the error cancels it, and names both.
+            match peer.spoken.settle(ack.protocol) {
+                Ok(standing) => Ok((tx, inbound, ack.stages, standing)),
+                Err(fixed) => Err(format!(
+                    "the plugin chose protocol {} on this stream and {fixed} on the one that settled first",
+                    ack.protocol
+                )
+                .into()),
             }
         }
         Some(_) => Err("the first frame was not the hello's ack".into()),
@@ -1011,7 +1139,7 @@ async fn open_decide(
 }
 
 async fn run_lane(lane: Arc<Lane>) {
-    let (tx, mut inbound, stages) = match open_decide(&lane.peer).await {
+    let (tx, mut inbound, stages, standing) = match open_decide(&lane.peer).await {
         Ok(opened) => opened,
         Err(why) => {
             lane.fail_and_tell(why);
@@ -1035,13 +1163,17 @@ async fn run_lane(lane: Arc<Lane>) {
             },
         }
     };
+    // The stream's stand on its plugin's version goes first, however the
+    // stream ended: a stream opened on the word that this one failed is
+    // offered what the plugin's other streams leave it.
+    drop(standing);
     // A status's text is the plugin's: cut.
     lane.fail_and_tell(Fault::Stream(bounded(why)));
 }
 
 async fn run_observe(lane: Arc<ObserveLane>) {
     let peer = &*lane.peer;
-    observe(&lane, || open_observe(peer)).await;
+    observe(&lane, |version| open_observe(peer, version)).await;
 }
 
 /// The lines one plugin's events task has said and not armed again: the
@@ -1075,11 +1207,12 @@ impl Said {
 /// request stream, the hello already in it.
 type Opened<C> = (C, mpsc::Sender<proto::ObserveRequest>);
 
-/// The events task of one plugin over the calls `open` makes, one turn
-/// after another until the plugin is dropped.
+/// The events task of one plugin over the calls `open` makes, each under
+/// the protocol version it is handed, one turn after another until the
+/// plugin is dropped.
 async fn observe<O, F, C, T>(lane: &ObserveLane, mut open: O)
 where
-    O: FnMut() -> F,
+    O: FnMut(u32) -> F,
     F: Future<Output = Result<Opened<C>, Cow<'static, str>>>,
     C: Future<Output = Result<T, tonic::Status>>,
 {
@@ -1100,8 +1233,10 @@ where
     // asked for again a pause later. No decision asks for this stream, as
     // one does for a `Decide` stream.
     let mut said = Said::default();
+    // The word a call took and could not carry, kept for the next call.
+    let mut kept = None;
     while let Err(panicked) = Caught(Box::pin(observe_streams(
-        lane, &mut queue, &mut sent, &mut lost, &mut said, &mut open,
+        lane, &mut queue, &mut kept, &mut sent, &mut lost, &mut said, &mut open,
     )))
     .await
     {
@@ -1128,9 +1263,12 @@ fn number(sent: &mut u64, lost: &mut u64, carried: u64) -> u64 {
 }
 
 /// Opens one `Observe` call: the channel within the connect frame, then the
-/// call, its hello first on the request stream.
+/// call, its hello first on the request stream. Nothing answers a hello
+/// here, so it names `version` alone: the one the plugin's `Decide` streams
+/// fixed.
 async fn open_observe(
     peer: &Peer,
+    version: u32,
 ) -> Result<
     Opened<impl Future<Output = Result<tonic::Response<proto::Ack>, tonic::Status>>>,
     Cow<'static, str>,
@@ -1144,7 +1282,9 @@ async fn open_observe(
     let mut client = PolicyPluginClient::new(channel).max_decoding_message_size(peer.answer_bytes);
     let (tx, rx) = mpsc::channel::<proto::ObserveRequest>(OBSERVE_WINDOW);
     let hello = proto::ObserveRequest {
-        request: Some(proto::observe_request::Request::Hello(peer.hello())),
+        request: Some(proto::observe_request::Request::Hello(
+            peer.hello((version, version)),
+        )),
     };
     tx.try_send(hello)
         .map_err(|_| "the hello did not enter the stream")?;
@@ -1157,25 +1297,46 @@ async fn open_observe(
 }
 
 /// The `Observe` calls of one plugin, each opened when the one before it
-/// ended, until the plugin is dropped.
+/// ended, until the plugin is dropped. A call names the version the
+/// plugin's `Decide` streams last fixed: none opens before one has settled
+/// (the events wait in the queue), and a call lives under the version it
+/// named until a settle fixes another, when it is ended and the next names
+/// that one. With no stream standing the last version holds, so a call that
+/// ends is opened again under it. A word that version has no kind for ends
+/// the call that takes it then: the word is kept, the events behind it
+/// wait in the queue, and the next call opens once a stream stands or the
+/// version fixed carries the word.
 async fn observe_streams<O, F, C, T>(
     lane: &ObserveLane,
     queue: &mut mpsc::Receiver<proto::ObserveRequest>,
+    kept: &mut Option<proto::ObserveRequest>,
     sent: &mut u64,
     lost: &mut u64,
     said: &mut Said,
     open: &mut O,
 ) where
-    O: FnMut() -> F,
+    O: FnMut(u32) -> F,
     F: Future<Output = Result<Opened<C>, Cow<'static, str>>>,
     C: Future<Output = Result<T, tonic::Status>>,
 {
     let frame = lane.peer.connect;
+    let mut spoken = lane.peer.spoken.fixed.subscribe();
     loop {
         if lane.events.strong_count() == 0 {
             return;
         }
-        let (call, tx) = match open().await {
+        // The wait for the first settle is cut each frame: the plugin may
+        // have been dropped meanwhile. A word kept waits the same way, for
+        // a stream that stands or a version fixed that carries it.
+        let since = kept.as_ref().map_or(0, carried_since);
+        let settled =
+            spoken.wait_for(|(fixed, standing)| *fixed != 0 && (*standing != 0 || *fixed >= since));
+        let version = match tokio::time::timeout(frame, settled).await {
+            Ok(Ok(fixed)) => fixed.0,
+            Ok(Err(_)) => return,
+            Err(_) => continue,
+        };
+        let (call, tx) = match open(version).await {
             Ok(opened) => opened,
             Err(why) => {
                 // The state first, the telling after: a telling that panics
@@ -1187,8 +1348,33 @@ async fn observe_streams<O, F, C, T>(
                 continue;
             }
         };
-        let Some(ended) = forward(call, tx, queue, sent, lost, frame).await else {
-            return;
+        let moved = async {
+            if spoken
+                .wait_for(|(fixed, _)| *fixed != version)
+                .await
+                .is_err()
+            {
+                std::future::pending::<()>().await;
+            }
+        };
+        let requests = Requests {
+            tx,
+            version,
+            spoken: &lane.peer.spoken,
+            kept: &mut *kept,
+        };
+        let ended = match forward(call, requests, queue, sent, lost, frame, moved).await {
+            Turn::Dropped => return,
+            // No call failed and no pause is owed: the next call opens as
+            // soon as a stream says its version. A call that stood arms
+            // the lines again, as one that ended by itself does.
+            Turn::Moved { stood } => {
+                if stood {
+                    *said = Said::default();
+                }
+                continue;
+            }
+            Turn::Ended(ended) => ended,
         };
         if said.ended(ended.stood) {
             lane.failed(&ended.why);
@@ -1197,6 +1383,44 @@ async fn observe_streams<O, F, C, T>(
         // for the call's outcome is inside it.
         tokio::time::sleep_until(ended.at + frame).await;
     }
+}
+
+/// The first protocol version whose streams carry `request`'s event: `0`
+/// for a request that is no event.
+fn carried_since(request: &proto::ObserveRequest) -> u32 {
+    match &request.request {
+        Some(proto::observe_request::Request::Event(numbered)) => {
+            numbered.event.as_ref().map_or(0, view::since)
+        }
+        _ => 0,
+    }
+}
+
+/// The request side of one `Observe` call: where its events are written,
+/// and the protocol version its hello named, which says what it carries.
+/// A word it does not carry is judged by the plugin's version as it stands
+/// when the word is taken.
+struct Requests<'a> {
+    tx: mpsc::Sender<proto::ObserveRequest>,
+    version: u32,
+    /// The plugin's version, as its `Decide` streams stand on it.
+    spoken: &'a Spoken,
+    /// The word the call before took and could not carry: this call writes
+    /// it first, or keeps it in turn.
+    kept: &'a mut Option<proto::ObserveRequest>,
+}
+
+/// How one turn of the events task ended.
+enum Turn {
+    /// The plugin was dropped: its queue closed.
+    Dropped,
+    /// The host ended the call for the next one: a settle fixed another
+    /// version than it named, or it took a word it cannot carry while no
+    /// stream stood on its version. `stood` says whether it had stood
+    /// [`STAND`] or longer.
+    Moved { stood: bool },
+    /// The call ended with its plugin loaded.
+    Ended(Ended),
 }
 
 /// How one `Observe` call ended, its plugin still loaded.
@@ -1210,60 +1434,120 @@ struct Ended {
     at: tokio::time::Instant,
 }
 
-/// One `Observe` call until it ends, the queue's events forwarded into it:
-/// `None` once the plugin is dropped, its queue closed.
+/// What one turn of a call's select found.
+enum Found {
+    /// An event was written, or let go: the next turn takes the next.
+    Next,
+    /// The call yields to the next one: a settle fixed another version, or
+    /// the word taken is kept for a call that carries it.
+    Yields,
+    /// A send found the call's receiver gone.
+    Gone,
+    /// The plugin was dropped: its queue closed.
+    Closed,
+}
+
+/// One `Observe` call until it ends, the queue's events forwarded into it,
+/// the word kept from the call before ahead of them. The host ends it for
+/// the next call in two cases: `moved`, a settle fixed another version than
+/// the call named; or the call took a word it cannot carry while no stream
+/// stood on its version, and the word is kept.
 ///
 /// A call's end shows on two sides, and the select takes either first: the
 /// call's own outcome, or a send that finds the call's receiver gone. A send
 /// that saw the end first waits for the outcome, no longer than `frame`, so
 /// the same end is said from either side; the end is dated where it was
 /// first seen.
-async fn forward<C, T>(
+async fn forward<C, T, M>(
     call: C,
-    tx: mpsc::Sender<proto::ObserveRequest>,
+    requests: Requests<'_>,
     queue: &mut mpsc::Receiver<proto::ObserveRequest>,
     sent: &mut u64,
     lost: &mut u64,
     frame: Duration,
-) -> Option<Ended>
+    moved: M,
+) -> Turn
 where
     C: Future<Output = Result<T, tonic::Status>>,
+    M: Future<Output = ()>,
 {
+    let Requests {
+        tx,
+        version,
+        spoken,
+        kept,
+    } = requests;
     tokio::pin!(call);
+    tokio::pin!(moved);
     let opened = tokio::time::Instant::now();
-    // Sends until the plugin is dropped (its queue closes: `false`) or the
-    // call lets its receiver go (`true`).
-    let sends = async {
-        loop {
-            match queue.recv().await {
-                Some(mut event) => {
-                    // Numbered here, where it enters the stream: one
-                    // task numbers every event, in the order it sends.
-                    if let Some(proto::observe_request::Request::Event(numbered)) =
-                        event.request.as_mut()
-                    {
-                        numbered.seq = number(sent, lost, numbered.seq);
-                    }
-                    if tx.send(event).await.is_err() {
-                        return true;
-                    }
+    let (outcome, at) = loop {
+        // One event: the word kept first, then the queue's next.
+        let send = async {
+            let mut event = match kept.take() {
+                Some(event) => event,
+                None => match queue.recv().await {
+                    Some(event) => event,
+                    None => return Found::Closed,
+                },
+            };
+            // Numbered here, where it enters the stream: one task numbers
+            // every event, in the order it sends.
+            if let Some(proto::observe_request::Request::Event(numbered)) = event.request.as_mut() {
+                let newer = numbered
+                    .event
+                    .as_ref()
+                    .is_some_and(|event| view::since(event) > version);
+                // A word the call's version has no kind for is not written
+                // and takes no number. While a stream stands on that
+                // version no stream of the plugin hears the word: it is let
+                // go, and the refusals it carried still count. With none on
+                // it the version is free or has moved: the word is kept,
+                // and the call that opens next writes it first.
+                if newer && spoken.stands_on(version) {
+                    *lost = (*lost).max(numbered.seq);
+                    return Found::Next;
                 }
-                None => return false,
+                if newer {
+                    *kept = Some(event);
+                    return Found::Yields;
+                }
+                numbered.seq = number(sent, lost, numbered.seq);
             }
-        }
-    };
-    let (outcome, at) = tokio::select! {
-        outcome = &mut call => (Some(outcome), tokio::time::Instant::now()),
-        plugin_lives = sends => {
-            if !plugin_lives {
+            if tx.send(event).await.is_err() {
+                return Found::Gone;
+            }
+            Found::Next
+        };
+        // One event a turn, and the move ahead of it: a call whose version
+        // a settle has left takes no further event.
+        let found = tokio::select! {
+            biased;
+            () = &mut moved => Found::Yields,
+            outcome = &mut call => break (Some(outcome), tokio::time::Instant::now()),
+            found = send => found,
+        };
+        match found {
+            Found::Next => {}
+            Found::Closed => {
                 // The request stream ends with its sender; the plugin
                 // answers its one Ack, awaited no longer than a connect.
                 drop(tx);
                 let _ = tokio::time::timeout(frame, &mut call).await;
-                return None;
+                return Turn::Dropped;
             }
-            let at = tokio::time::Instant::now();
-            (tokio::time::timeout(frame, &mut call).await.ok(), at)
+            Found::Yields => {
+                // Ended as for a dropped plugin: the request stream closes
+                // and the plugin's one Ack is awaited no longer than a
+                // connect.
+                let stood = opened.elapsed() >= STAND;
+                drop(tx);
+                let _ = tokio::time::timeout(frame, &mut call).await;
+                return Turn::Moved { stood };
+            }
+            Found::Gone => {
+                let at = tokio::time::Instant::now();
+                break (tokio::time::timeout(frame, &mut call).await.ok(), at);
+            }
         }
     };
     let why = match outcome {
@@ -1271,7 +1555,7 @@ where
         Some(Err(status)) => Cow::Owned(bounded(status.to_string())),
         None => Cow::Borrowed("the observe stream took no more events"),
     };
-    Some(Ended {
+    Turn::Ended(Ended {
         why,
         stood: at.duration_since(opened) >= STAND,
         at,
@@ -1282,7 +1566,7 @@ where
 mod tests {
     use std::{
         borrow::Cow,
-        cell::RefCell,
+        cell::{Cell, RefCell},
         future::Future,
         path::PathBuf,
         pin::Pin,
@@ -1294,12 +1578,15 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use tokio::{sync::mpsc, task::JoinSet};
+    use tokio::{
+        sync::{mpsc, watch},
+        task::JoinSet,
+    };
 
     use super::{
-        forward, number, observe, run_commands, Command, Fault, Lane, LaneEvents, LaneState,
-        ObserveLane, Opened, Peer, Runtime, Said, SendError, Wait, Witness, OBSERVE_WINDOW,
-        PEER_TEXT, PROMISE_MICROS, RECONNECT_PAUSE, STAND, WINDOW,
+        number, observe, run_commands, Command, Ended, Fault, Lane, LaneEvents, LaneState,
+        ObserveLane, Opened, Peer, Requests, Runtime, Said, SendError, Spoken, Turn, Wait, Witness,
+        OBSERVE_WINDOW, PEER_TEXT, PROMISE_MICROS, RECONNECT_PAUSE, STAND, WINDOW,
     };
     use crate::{grpc::config::Transport, plugins::OpenDecisions, proto};
 
@@ -1318,8 +1605,20 @@ mod tests {
         fn observe_failed(&self, _why: &str) {}
     }
 
-    /// A peer nothing listens behind.
+    /// A peer nothing listens behind, none of its streams settled.
     fn nowhere() -> Arc<Peer> {
+        peer(Spoken::default())
+    }
+
+    /// A plugin's version as one settled `Decide` stream fixed it.
+    fn standing_on(version: u32) -> Spoken {
+        Spoken {
+            fixed: watch::Sender::new((version, 1)),
+        }
+    }
+
+    /// A peer nothing listens behind, its `Decide` streams as `spoken` says.
+    fn peer(spoken: Spoken) -> Arc<Peer> {
         Arc::new(Peer {
             name: "p".to_owned(),
             transport: Transport::Unix {
@@ -1331,6 +1630,8 @@ mod tests {
             counters: Vec::new(),
             connect: Duration::from_secs(1),
             answer_bytes: super::answer_bytes(128, 0),
+            versions: 1..=2,
+            spoken,
         })
     }
 
@@ -1799,7 +2100,8 @@ mod tests {
     }
 
     /// A lane nothing listens behind, with its listener, whose first
-    /// `panics` tellings panic, and its queue's sender.
+    /// `panics` tellings panic, and its queue's sender. Its plugin's
+    /// `Decide` streams stand on version 1, so its calls open.
     fn told(panics: usize) -> (Arc<Told>, ObserveLane, mpsc::Sender<proto::ObserveRequest>) {
         let events = Arc::new(Told {
             panics,
@@ -1807,7 +2109,7 @@ mod tests {
         });
         let listener: Arc<dyn LaneEvents> = Arc::clone(&events) as _;
         let (raise, raised) = mpsc::channel(4);
-        let lane = ObserveLane::new(nowhere(), Arc::downgrade(&listener), raised);
+        let lane = ObserveLane::new(peer(standing_on(1)), Arc::downgrade(&listener), raised);
         (events, lane, raise)
     }
 
@@ -1879,7 +2181,7 @@ mod tests {
     ) -> Ran {
         let ran = Ran::default();
         let mut steps = steps.into_iter();
-        let open = || {
+        let open = |_version: u32| {
             ran.opens.borrow_mut().push(tokio::time::Instant::now());
             let (step, raise, taken) = (steps.next(), raise.clone(), Rc::clone(&ran.taken));
             async move {
@@ -1918,6 +2220,376 @@ mod tests {
         };
         let _ = tokio::time::timeout(Duration::from_secs(3_600), observe(lane, open)).await;
         ran
+    }
+
+    /// An `Observe` call names the version its plugin's `Decide` streams
+    /// last fixed. None opens before the first settle, which opens one. It
+    /// lives on when the last stream ends. Once a settle fixes another
+    /// version it is ended, its answer awaited, and the next call names that
+    /// one, in the same instant and with nothing told: no call failed.
+    #[tokio::test(start_paused = true)]
+    async fn an_observe_call_names_the_version_its_plugins_decide_streams_fixed() {
+        let events = Arc::new(Told {
+            panics: 0,
+            told: parking_lot::Mutex::new(Vec::new()),
+        });
+        let listener: Arc<dyn LaneEvents> = Arc::clone(&events) as _;
+        let (_raise, raised) = mpsc::channel(4);
+        let lane = ObserveLane::new(nowhere(), Arc::downgrade(&listener), raised);
+        // Each call stands until its request stream ends, then answers.
+        let (named, answered) = (RefCell::new(Vec::new()), Rc::new(Cell::new(0)));
+        let open = |version: u32| {
+            named
+                .borrow_mut()
+                .push((tokio::time::Instant::now(), version));
+            let answered = Rc::clone(&answered);
+            async move {
+                let (tx, mut rx) = mpsc::channel::<proto::ObserveRequest>(OBSERVE_WINDOW);
+                let call: Scripted = Box::pin(async move {
+                    while rx.recv().await.is_some() {}
+                    answered.set(answered.get() + 1);
+                    Ok::<(), tonic::Status>(())
+                });
+                Ok::<Opened<Scripted>, Cow<'static, str>>((call, tx))
+            }
+        };
+        let (spoken, minute) = (&lane.peer.spoken, Duration::from_secs(60));
+        let settles = async {
+            tokio::time::sleep(minute).await;
+            assert!(named.borrow().is_empty(), "no stream has settled");
+            let first = spoken.settle(1).expect("the first settle");
+            tokio::time::sleep(minute).await;
+            drop(first);
+            tokio::time::sleep(minute).await;
+            let _second = spoken.settle(2).expect("the next settle fixes it anew");
+            tokio::time::sleep(minute).await;
+        };
+        let start = tokio::time::Instant::now();
+        tokio::select! {
+            () = observe(&lane, open) => panic!("the plugin is loaded"),
+            () = settles => {}
+        }
+        assert_eq!(
+            named.into_inner(),
+            [(start + minute, 1), (start + minute * 3, 2)],
+            "one call a version, each opened as its settle fell"
+        );
+        assert!(events.told.lock().is_empty(), "no call failed");
+        assert_eq!(answered.get(), 1, "the ended call's answer was awaited");
+    }
+
+    /// One event an `Observe` call was written: the version the call named,
+    /// the event's number, whether it is a left word, and the instant.
+    type Heard = (u32, u64, bool, tokio::time::Instant);
+
+    /// A lane nothing listens behind, none of its plugin's `Decide` streams
+    /// settled, with its listener and its queue's sender.
+    fn unsettled() -> (Arc<Told>, ObserveLane, mpsc::Sender<proto::ObserveRequest>) {
+        let events = Arc::new(Told {
+            panics: 0,
+            told: parking_lot::Mutex::new(Vec::new()),
+        });
+        let listener: Arc<dyn LaneEvents> = Arc::clone(&events) as _;
+        let (raise, raised) = mpsc::channel(4);
+        let lane = ObserveLane::new(nowhere(), Arc::downgrade(&listener), raised);
+        (events, lane, raise)
+    }
+
+    /// One `Observe` call that stands until the host ends it, and says each
+    /// event it was written: an opener's answer.
+    fn standing_call(
+        version: u32,
+        heard: Rc<RefCell<Vec<Heard>>>,
+    ) -> impl Future<Output = Result<Opened<Scripted>, Cow<'static, str>>> {
+        use crate::grpc::view;
+        let (tx, mut rx) = mpsc::channel::<proto::ObserveRequest>(OBSERVE_WINDOW);
+        let call: Scripted = Box::pin(async move {
+            while let Some(written) = rx.recv().await {
+                if let Some(proto::observe_request::Request::Event(event)) = written.request {
+                    let left = event
+                        .event
+                        .as_ref()
+                        .is_some_and(|word| view::since(word) == 2);
+                    let now = tokio::time::Instant::now();
+                    heard.borrow_mut().push((version, event.seq, left, now));
+                }
+            }
+            Ok(())
+        });
+        std::future::ready(Ok((call, tx)))
+    }
+
+    /// A membership word as the door raises it, behind no refusal.
+    fn word(change: &crate::lease::Membership<'_>) -> proto::ObserveRequest {
+        use crate::grpc::view;
+        proto::ObserveRequest {
+            request: Some(proto::observe_request::Request::Event(
+                proto::LifecycleEvent {
+                    seq: 0,
+                    event: Some(view::membership(change)),
+                },
+            )),
+        }
+    }
+
+    /// A word raised behind a settle that moves the version to 2 is written
+    /// by the call that names 2: a left word, and a word every version
+    /// carries alike. Here a call that named 1 still stands as the settle
+    /// falls, and the word is raised in the same instant: the call's next
+    /// turn finds the word and the move together, round after round. The
+    /// call on 1 is written nothing, the call on 2 the word, numbered, and
+    /// no call failed.
+    #[tokio::test(start_paused = true)]
+    async fn a_word_raised_behind_a_move_is_written_by_the_call_that_names_it() {
+        use crate::{lease::Membership, view::WorkerId};
+        let (models, minute) = (["m".to_owned()], Duration::from_secs(60));
+        for round in 0..32 {
+            // A left word in one round, a relabelling in the next.
+            let is_left = round % 2 == 0;
+            let (events, lane, raise) = unsettled();
+            let heard = Rc::new(RefCell::new(Vec::new()));
+            let open = |version| standing_call(version, Rc::clone(&heard));
+            let spoken = &lane.peer.spoken;
+            let settles = async {
+                let first = spoken.settle(1).expect("the first settle");
+                tokio::time::sleep(minute).await;
+                drop(first);
+                let _second = spoken.settle(2).expect("the next settle fixes it anew");
+                let raised = if is_left {
+                    Membership::Left {
+                        id: WorkerId(7),
+                        models: &models,
+                    }
+                } else {
+                    Membership::Relabelled(WorkerId(7))
+                };
+                raise.try_send(word(&raised)).expect("the queue takes it");
+                tokio::time::sleep(minute).await;
+            };
+            tokio::select! {
+                () = observe(&lane, open) => panic!("the plugin is loaded"),
+                () = settles => {}
+            }
+            let heard: Vec<_> = heard
+                .borrow()
+                .iter()
+                .map(|&(version, seq, left, _)| (version, seq, left))
+                .collect();
+            assert_eq!(heard, [(2, 1, is_left)], "the call on 2 writes the word");
+            assert!(events.told.lock().is_empty(), "no call failed");
+        }
+    }
+
+    /// The staging of the two cases below. The last stream on 1 ends and
+    /// the call that named 1 lives on. A minute later a left word is raised
+    /// and a relabelling behind it, and a frame and a half after that a
+    /// stream settles on `next`: inside a frame of the kept word's wait, so
+    /// the settle itself must wake it. It says that settle's instant and
+    /// what the calls were written; no call failed.
+    async fn a_stream_settles_behind_a_left_word(next: u32) -> (tokio::time::Instant, Vec<Heard>) {
+        use crate::{lease::Membership, view::WorkerId};
+        let (models, minute) = (["m".to_owned()], Duration::from_secs(60));
+        let (events, lane, raise) = unsettled();
+        let heard = Rc::new(RefCell::new(Vec::new()));
+        let open = |version| standing_call(version, Rc::clone(&heard));
+        let (spoken, settled) = (&lane.peer.spoken, Cell::new(None));
+        let settles = async {
+            let first = spoken.settle(1).expect("the first settle");
+            tokio::time::sleep(minute).await;
+            drop(first);
+            tokio::time::sleep(minute).await;
+            let left = Membership::Left {
+                id: WorkerId(7),
+                models: &models,
+            };
+            let relabelled = Membership::Relabelled(WorkerId(7));
+            raise.try_send(word(&left)).expect("the queue takes it");
+            raise
+                .try_send(word(&relabelled))
+                .expect("the queue takes it");
+            tokio::time::sleep(lane.peer.connect * 3 / 2).await;
+            let _next = spoken.settle(next).expect("the next settle");
+            settled.set(Some(tokio::time::Instant::now()));
+            tokio::time::sleep(minute).await;
+        };
+        tokio::select! {
+            () = observe(&lane, open) => panic!("the plugin is loaded"),
+            () = settles => {}
+        }
+        assert!(events.told.lock().is_empty(), "no call failed");
+        let heard = heard.borrow().clone();
+        (settled.get().expect("the settle fell"), heard)
+    }
+
+    /// A left word raised while no stream stands waits for the stream that
+    /// settles next, though the events call that named 1 still stands as
+    /// it is raised. Here that stream settles on 2: the call that names 2
+    /// writes the word and the relabelling behind it, in their order and
+    /// numbered, as the settle falls. The call on 1 was written neither.
+    #[tokio::test(start_paused = true)]
+    async fn a_left_word_raised_with_no_stream_standing_is_written_once_one_settles_on_2() {
+        let (settled, heard) = a_stream_settles_behind_a_left_word(2).await;
+        assert_eq!(heard, [(2, 1, true, settled), (2, 2, false, settled)]);
+    }
+
+    /// The same word where the next stream settles on 1: no stream of the
+    /// plugin carries it, so it is let go and takes no number. The
+    /// relabelling behind it waited with it: the call that opens as the
+    /// settle falls writes it, the first event.
+    #[tokio::test(start_paused = true)]
+    async fn a_left_word_raised_with_no_stream_standing_is_let_go_once_one_settles_on_1() {
+        let (settled, heard) = a_stream_settles_behind_a_left_word(1).await;
+        assert_eq!(heard, [(1, 1, false, settled)]);
+    }
+
+    /// A call that stood and was ended by the host arms the outage's line
+    /// again, as one that ended by itself does. Here a call fails at once
+    /// and says the line, the next stands until a settle fixes another
+    /// version, and the call that names that one fails at once. Behind a
+    /// stand that is a new outage, and its line is said; a millisecond
+    /// short of one it is the same outage, and quiet.
+    #[tokio::test(start_paused = true)]
+    async fn a_call_that_stood_and_was_ended_for_a_move_arms_the_outage_line() {
+        let short = STAND - Duration::from_millis(1);
+        for (stand, lines) in [(short, 1), (STAND, 2)] {
+            let (events, lane, _raise) = unsettled();
+            let opens = Cell::new(0);
+            // The second call alone stands, until the host ends it.
+            let open = |_version: u32| {
+                opens.set(opens.get() + 1);
+                let stands = opens.get() == 2;
+                async move {
+                    let (tx, mut rx) = mpsc::channel::<proto::ObserveRequest>(OBSERVE_WINDOW);
+                    let call: Scripted = Box::pin(async move {
+                        if stands {
+                            while rx.recv().await.is_some() {}
+                            return Ok(());
+                        }
+                        Err(tonic::Status::unavailable("the plugin went"))
+                    });
+                    Ok::<Opened<Scripted>, Cow<'static, str>>((call, tx))
+                }
+            };
+            let (spoken, frame) = (&lane.peer.spoken, lane.peer.connect);
+            let settles = async {
+                let first = spoken.settle(1).expect("the first settle");
+                // The second call opens a frame behind the first one's end.
+                tokio::time::sleep(frame + stand).await;
+                drop(first);
+                let _second = spoken.settle(2).expect("the next settle fixes it anew");
+                tokio::time::sleep(frame / 2).await;
+            };
+            tokio::select! {
+                () = observe(&lane, open) => panic!("the plugin is loaded"),
+                () = settles => {}
+            }
+            assert_eq!(opens.get(), 3, "one failed, one stood, one failed");
+            let told = events.told.lock();
+            assert_eq!(told.len(), lines, "a stand of {stand:?}: {told:?}");
+        }
+    }
+
+    /// A word taken ahead of the move's signal is kept all the same: it is
+    /// judged by the plugin's version as it stands. Here a call that named
+    /// 1 takes a left word while a stream stands on 2 and no signal comes:
+    /// the call yields, the word kept and no number taken. The call that
+    /// names 2 writes it first, numbered.
+    #[tokio::test(start_paused = true)]
+    async fn a_word_taken_ahead_of_the_moves_signal_is_kept_for_the_call_that_carries_it() {
+        use crate::{lease::Membership, view::WorkerId};
+        let (models, hour) = (["m".to_owned()], Duration::from_secs(3_600));
+        let left = Membership::Left {
+            id: WorkerId(7),
+            models: &models,
+        };
+        let (raise, mut queue) = mpsc::channel(4);
+        raise.try_send(word(&left)).expect("the queue takes it");
+        let (spoken, mut kept) = (standing_on(2), None);
+        let (mut sent, mut lost) = (0, 0);
+        let heard = Rc::new(RefCell::new(Vec::new()));
+        for version in [1, 2] {
+            let (call, tx) = standing_call(version, Rc::clone(&heard))
+                .await
+                .expect("a call opens");
+            let requests = Requests {
+                tx,
+                version,
+                spoken: &spoken,
+                kept: &mut kept,
+            };
+            let (queue, never) = (&mut queue, std::future::pending());
+            let turn = super::forward(call, requests, queue, &mut sent, &mut lost, hour, never);
+            // The call on 2 stands: an hour ends its turn here.
+            match (version, tokio::time::timeout(hour, turn).await) {
+                (1, Ok(Turn::Moved { stood: false })) => {
+                    assert!(kept.is_some(), "the word is kept");
+                    assert_eq!((sent, lost), (0, 0), "and took no number");
+                }
+                (2, Err(_)) => assert!(kept.is_none(), "the word is written"),
+                _ => panic!("the call on {version} ended another way"),
+            }
+        }
+        let heard: Vec<_> = heard
+            .borrow()
+            .iter()
+            .map(|&(version, seq, left, _)| (version, seq, left))
+            .collect();
+        assert_eq!(heard, [(2, 1, true)], "the call on 2 writes the word");
+        assert_eq!((sent, lost), (1, 0));
+    }
+
+    /// One call's turn where a stream stands on protocol 1 and nothing
+    /// moves its plugin's version: how the call ended, or `None` once the
+    /// plugin is dropped.
+    async fn forward<C, T>(
+        call: C,
+        tx: mpsc::Sender<proto::ObserveRequest>,
+        queue: &mut mpsc::Receiver<proto::ObserveRequest>,
+        sent: &mut u64,
+        lost: &mut u64,
+        frame: Duration,
+    ) -> Option<Ended>
+    where
+        C: Future<Output = Result<T, tonic::Status>>,
+    {
+        let (spoken, mut kept) = (standing_on(1), None);
+        let requests = Requests {
+            tx,
+            version: 1,
+            spoken: &spoken,
+            kept: &mut kept,
+        };
+        let never = std::future::pending();
+        match super::forward(call, requests, queue, sent, lost, frame, never).await {
+            Turn::Ended(ended) => Some(ended),
+            Turn::Dropped | Turn::Moved { .. } => None,
+        }
+    }
+
+    /// The first stream to settle fixes its plugin's version. While one
+    /// stands a hello offers that version alone, and an ack that names
+    /// another comes back with the fixed one. The end of the last stream
+    /// frees the version, and the next settle fixes it anew.
+    #[test]
+    fn the_first_settle_fixes_a_plugins_version_until_its_last_stream_ends() {
+        let (spoken, host) = (Spoken::default(), 1..=2);
+        assert_eq!(spoken.offer(&host), (1, 2), "no stream stands");
+        assert!(!spoken.stands_under(2), "none stands: the write decides");
+        let first = spoken.settle(2).expect("the first settle fixes it");
+        assert_eq!(spoken.offer(&host), (2, 2), "one stands: its version alone");
+        assert!(!spoken.stands_under(2), "a stream on 2 hears a word of 2");
+        let second = spoken.settle(2).expect("a second stream joins it");
+        assert_eq!(spoken.settle(1).err(), Some(2), "an ack names another");
+        drop(first);
+        assert_eq!(spoken.offer(&host), (2, 2), "one stands yet");
+        drop(second);
+        assert_eq!(spoken.offer(&host), (1, 2), "the last end frees it");
+        let _anew = spoken.settle(1).expect("the next settle fixes it anew");
+        assert_eq!(spoken.offer(&host), (1, 1));
+        assert!(
+            spoken.stands_under(2) && !spoken.stands_under(1),
+            "a stream on 1 hears no word of 2"
+        );
     }
 
     fn raised() -> proto::ObserveRequest {
@@ -1994,6 +2666,56 @@ mod tests {
         assert_eq!(number(&mut sent, &mut lost, 0), 5);
         // One more refusal: a gap of one, behind the third.
         assert_eq!(number(&mut sent, &mut lost, 3), 7);
+    }
+
+    /// A word the call's version has no kind for is not written and takes no
+    /// number, and the refusals it carried still count. Here a stream on
+    /// protocol 1 is handed a left word raised behind two refusals, then a
+    /// relabelling raised ahead of them: the call hears the relabelling
+    /// alone, numbered behind both.
+    #[tokio::test(start_paused = true)]
+    async fn a_word_the_calls_version_has_no_kind_for_takes_no_number_and_keeps_its_refusals() {
+        use crate::{grpc::view, lease::Membership, view::WorkerId};
+        let word = |change: Membership<'_>, refusals| proto::ObserveRequest {
+            request: Some(proto::observe_request::Request::Event(
+                proto::LifecycleEvent {
+                    seq: refusals,
+                    event: Some(view::membership(&change)),
+                },
+            )),
+        };
+        let models = ["m".to_owned()];
+        let left = Membership::Left {
+            id: WorkerId(7),
+            models: &models,
+        };
+        let (raise, mut queue) = mpsc::channel(4);
+        raise.try_send(word(left, 2)).expect("the queue takes it");
+        raise
+            .try_send(word(Membership::Relabelled(WorkerId(7)), 0))
+            .expect("the queue takes it");
+        let (tx, mut rx) = mpsc::channel::<proto::ObserveRequest>(OBSERVE_WINDOW);
+        let heard = RefCell::new(Vec::new());
+        let told = &heard;
+        let call = async move {
+            let event = rx.recv().await.expect("the call takes an event");
+            let Some(proto::observe_request::Request::Event(event)) = event.request else {
+                panic!("an event, not a hello");
+            };
+            let Some(proto::lifecycle_event::Event::Membership(change)) = event.event else {
+                panic!("a membership word");
+            };
+            told.borrow_mut().push((event.seq, change.kind));
+            Err::<(), _>(tonic::Status::unavailable("the plugin went"))
+        };
+        let (mut sent, mut lost) = (0, 0);
+        let ended = forward(call, tx, &mut queue, &mut sent, &mut lost, RECONNECT_PAUSE)
+            .await
+            .expect("the plugin is loaded");
+        assert!(ended.why.contains("the plugin went"), "{}", ended.why);
+        let relabelled = proto::membership_change::Kind::Relabelled as i32;
+        assert_eq!(heard.into_inner(), [(3, relabelled)]);
+        assert_eq!((sent, lost), (1, 2), "the left word took no number");
     }
 
     /// An outage is the failures with no call that stood between them, and

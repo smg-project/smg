@@ -150,6 +150,37 @@ fn loaded_by(mut load: impl FnMut() -> Result<Arc<Plugin>, LoadError>) -> Arc<Pl
     }
 }
 
+thread_local! {
+    /// The warm-ups this thread made again ([`warmed`]): an instance each,
+    /// for the case that counts its instances behind one.
+    static WARMED_AGAIN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// A warm-up that must succeed: its case claims nothing of the `init`'s
+/// time. As a load ([`loaded`]): made again where the host ended the `init`
+/// at the frame's deadline, [`LOADS`] warm-ups at most, and the last
+/// asserts what it says. One made again is an instance more, counted for
+/// its thread in [`WARMED_AGAIN`].
+fn warmed(plugin: &Plugin) {
+    let mut warms = 0;
+    loop {
+        let made = plugin.warm();
+        warms += 1;
+        let ended = matches!(
+            &made,
+            Err(LoadError::Trap { reason, .. }) if reason.ends_with("wasm trap: interrupt")
+        );
+        if !ended || warms == LOADS {
+            return made.expect("it warms");
+        }
+        WARMED_AGAIN.set(WARMED_AGAIN.get() + 1);
+        made_again(
+            "a warm-up",
+            "the host ended its init at the frame's deadline",
+        );
+    }
+}
+
 /// An `init` the host ended at the frame's deadline, as a load says it.
 fn ended_at_the_frame() -> LoadError {
     LoadError::Trap {
@@ -160,22 +191,26 @@ fn ended_at_the_frame() -> LoadError {
 
 /// A load that must succeed is made again after an `init` the host ended at
 /// the frame, with no witness asked. Here every load but the last one
-/// allowed is handed back as such an end, and the last is the guest's own.
+/// allowed is handed back as such an end, and the last hands back the
+/// guest's own load. That load is made ahead, by the rule: made here as the
+/// last one allowed, an `init` the host ended would have no load behind it.
 #[test]
 fn a_load_the_host_ended_is_made_again() {
     let runtime = runtime();
+    let own = loaded(
+        &runtime,
+        spec("held", guest::record_guest(), mode::LEAST_IN_FLIGHT),
+    );
     let mut made = 0;
     let plugin = loaded_by(|| {
         made += 1;
         if made < LOADS {
             return Err(ended_at_the_frame());
         }
-        Plugin::load(
-            &runtime,
-            spec("held", guest::record_guest(), mode::LEAST_IN_FLIGHT),
-        )
+        Ok(Arc::clone(&own))
     });
     assert_eq!(made, LOADS);
+    assert!(Arc::ptr_eq(&plugin, &own), "the last load's own answer");
     assert_eq!(plugin.stats().traps, 0);
 }
 
@@ -372,7 +407,7 @@ fn both_worlds_load_and_the_load_instantiates_on_the_applying_thread() {
     );
     assert_eq!(record.world(), World::Record);
     assert_eq!(packed.world(), World::Packed);
-    assert_eq!(record.abi(), Abi::V1_0);
+    assert_eq!(record.abi(), Abi::V1_1);
     assert!(record.is_warm() && packed.is_warm());
     assert_eq!(record.stats().instantiations, 1);
     assert_eq!(record.name(), "record");
@@ -444,13 +479,13 @@ fn a_component_with_an_async_export_is_refused_at_its_compile() {
 fn the_abi_pin_the_memory_floor_the_init_failure_and_bad_bytes_are_refused() {
     let runtime = runtime();
     let mut pinned = spec("pinned", guest::record_guest(), mode::LEAST_IN_FLIGHT);
-    pinned.abi = Some(Abi { major: 1, minor: 1 });
+    pinned.abi = Some(Abi { major: 1, minor: 2 });
     let err = Plugin::load(&runtime, pinned).expect_err("refused");
     assert!(
         matches!(
             err,
             LoadError::AbiPin {
-                found: Abi::V1_0,
+                found: Abi::V1_1,
                 ..
             }
         ),
@@ -2711,33 +2746,39 @@ fn a_new_builds_first_decision_on_a_thread_is_not_the_old_builds_last() {
         let new = plugin_engine(&plugin);
         // A thread of its own: its one decision under the old build, a lazy
         // `init` among what that decision paid, then its first under the new.
-        let (failed, asked, held) = std::thread::scope(|scope| {
+        let (failed, asked, took, held) = std::thread::scope(|scope| {
             scope
                 .spawn(|| {
                     let (wall, cpu) = (std::time::Instant::now(), bound_clock());
                     decide(&old, &pool(4), 1);
-                    let held = off_cpu_since(wall, cpu);
+                    let (took, held) = (wall.elapsed(), off_cpu_since(wall, cpu));
                     let failed = plugin.stats();
                     decide(&new, &pool(3), 2);
-                    (failed, plugin.stats(), held)
+                    (failed, plugin.stats(), took, held)
                 })
                 .join()
                 .expect("the deciding thread")
         });
         // Both instances the old build's decision makes come of an `init`, on
-        // the wall clock: the cold slot's, and the close's rebuild.
+        // the wall clock: the cold slot's, and the close's rebuild. An `init`
+        // the host ended took its frame on that clock, and the decision with
+        // it. The thread's own clock can count that time the thread's
+        // ([`loaded`] says where), so the witness is read on the clock of the
+        // bound.
         let made_both = (failed.traps, failed.lazy_instantiations);
-        if made_both != (1, 2) && held >= INIT_FRAME / 2 && made < TRIES {
+        if made_both != (1, 2) && took >= INIT_FRAME && made < TRIES {
             made_again(
                 CASE,
-                "the deciding thread was off the CPU half the init frame, the bound of the old build's two inits",
+                &format!(
+                    "the old build's decision took {took:?} on the wall clock, the frame of an init or more, its thread off the CPU {held:?} of it"
+                ),
             );
             return false;
         }
         assert_eq!(
             made_both,
             (1, 2),
-            "the old build's decision made its instance, trapped in the filter and was rebuilt (try {made}, the thread off the CPU {held:?}): {failed:?}"
+            "the old build's decision made its instance, trapped in the filter and was rebuilt (try {made}, {took:?} on the wall clock, the thread off the CPU {held:?}): {failed:?}"
         );
         assert_eq!(
             (asked.traps, asked.answered - failed.answered),
@@ -8155,7 +8196,7 @@ fn a_thread_that_decided_or_warmed_under_no_name_hears_what_it_tells() {
                 .spawn(|| {
                     let pick = || pick_ids(&decide(&engine, &pool(4), 1)).first().copied();
                     let before = if warm_first {
-                        plugin.warm().expect("it warms");
+                        warmed(&plugin);
                         None
                     } else {
                         pick()
@@ -8325,7 +8366,7 @@ fn an_instance_made_anew_hears_the_membership_as_it_stands() {
     let (at_the_warm_up, at_its_decision) = std::thread::scope(|scope| {
         scope
             .spawn(|| {
-                plugin.warm().expect("it warms");
+                warmed(&plugin);
                 let warmed = plugin.stats().observed;
                 assert_eq!(pick(), Some(103), "the warmed instance counts three");
                 (warmed - remade.observed, plugin.stats().observed - warmed)
@@ -8343,11 +8384,10 @@ fn an_instance_made_anew_hears_the_membership_as_it_stands() {
     assert_eq!(pick(), Some(102), "two members stand");
 }
 
-/// The feed keeps nothing of the models a worker left, since no contract
-/// carries the word yet: an instance level with the feed hears no call for
-/// it and counts the members it counted.
+/// The feed keeps the models a worker left: an instance level with the feed
+/// hears one call for the word, and counts the members it counted.
 #[test]
-fn a_guest_hears_nothing_of_the_models_a_worker_left() {
+fn a_guest_level_with_the_feed_hears_the_models_a_worker_left() {
     use smg_policy_controller::Membership;
     let runtime = runtime();
     let plugin = load(&runtime, "left", guest::record_guest(), mode::COUNT_MEMBERS);
@@ -8362,7 +8402,7 @@ fn a_guest_hears_nothing_of_the_models_a_worker_left() {
         models: &models,
     });
     assert_eq!(pick(), Some(102), "the same two members");
-    assert_eq!(plugin.stats().observed, level, "no call for the word");
+    assert_eq!(plugin.stats().observed, level + 1, "one call for the word");
 }
 
 /// The feed keeps its last 64 changes. An instance behind that many hears
@@ -8585,7 +8625,7 @@ impl smg_policy_controller::DecisionScope for ActsInside {
         match self.does {
             Inside::WarmsAs(other) => {
                 let _turn = other.enter();
-                self.plugin.warm().expect("the other decider warms");
+                warmed(&self.plugin);
             }
             Inside::TellsUnderNoName => {
                 drop(HELD_NAME.take());
@@ -8655,7 +8695,13 @@ fn a_thread_that_turns_to_another_name_gives_the_held_one_back_first() {
     });
     let stats = plugin.stats();
     assert_eq!(picked, Some(102), "the instance that heard two: {stats:?}");
-    assert_eq!(stats.instantiations, 2, "one a decider: {stats:?}");
+    // The warm-up inside the decision ran on this thread: one made again is
+    // an instance more.
+    assert_eq!(
+        stats.instantiations,
+        2 + WARMED_AGAIN.get(),
+        "one a decider: {stats:?}"
+    );
 }
 
 /// A thread that still holds a named decider's instance when its name ends
@@ -9030,4 +9076,79 @@ fn a_warm_up_that_asks_first_warms_every_named_decider() {
         "one a decider, the load's among them: {stats:?}"
     );
     assert!(!plugin.is_warm(), "the load's instance went to a decider");
+}
+
+/// The models a worker left reach a guest as one word, with its names, ahead
+/// of the relabelling of the same write: on either world an instance behind
+/// the feed hears the two in the host's order, one call each.
+#[test]
+fn an_instance_behind_hears_the_models_a_worker_left_ahead_of_its_relabelling() {
+    use smg_policy_controller::Membership;
+    let models = ["m-chat".to_owned(), "m-embed".to_owned()];
+    for (world, component) in [
+        ("left-record", guest::record_guest()),
+        ("left-packed", guest::packed_guest()),
+    ] {
+        let runtime = runtime();
+        let plugin = load(&runtime, world, component, mode::COUNT_LEFT);
+        let engine = plugin_engine(&plugin);
+        engine.on_membership(&Membership::Snapshot(&[WorkerId(100), WorkerId(101)]));
+        plugin.warm().expect("it warms");
+        let warmed = plugin.stats().observed;
+        engine.on_membership(&Membership::Left {
+            id: WorkerId(100),
+            models: &models,
+        });
+        engine.on_membership(&Membership::Relabelled(WorkerId(100)));
+        // One up each name of the word and one more up the relabelling
+        // behind it: the row at three. A word not told, or told behind its
+        // relabelling, names another row; one told twice names none of the
+        // pool; a name the guest cannot read is its fault.
+        let picked = own_pick(&plugin, &engine);
+        let stats = plugin.stats();
+        assert_eq!(picked, Some(103), "{world}: {stats:?}");
+        assert_eq!(stats.observed - warmed, 2, "{world}: {stats:?}");
+        assert_eq!(stats.traps, 0, "{world}: {stats:?}");
+    }
+}
+
+/// A module built against an older minor of the world is refused by the
+/// host's range, both versions named, before anything of it is linked. Its
+/// shapes are today's here, so nothing but its version stops it.
+#[test]
+fn a_module_of_an_older_minor_is_refused_by_the_range() {
+    let older = spec("older", guest::older_minor_guest(), mode::LEAST_IN_FLIGHT);
+    let err = Plugin::load(&runtime(), older).expect_err("refused");
+    assert!(matches!(err, LoadError::Abi { .. }), "{err}");
+    assert_eq!(
+        err.to_string(),
+        "plugin older: targets smg:policy@1.0.0; this host accepts 1.1"
+    );
+}
+
+/// A snapshot names ids and no pool. An instance further behind than the
+/// feed keeps hears the list as it stands, in one call, and no word of the
+/// models a worker left among the changes it missed.
+#[test]
+fn an_instance_that_hears_a_snapshot_for_what_it_missed_hears_no_left_word() {
+    use smg_policy_controller::Membership;
+    let models = ["m-chat".to_owned(), "m-embed".to_owned()];
+    let runtime = runtime();
+    let plugin = load(&runtime, "behind", guest::record_guest(), mode::COUNT_LEFT);
+    let engine = plugin_engine(&plugin);
+    engine.on_membership(&Membership::Snapshot(&[WorkerId(100), WorkerId(101)]));
+    plugin.warm().expect("it warms");
+    let warmed = plugin.stats().observed;
+    engine.on_membership(&Membership::Left {
+        id: WorkerId(100),
+        models: &models,
+    });
+    // The feed keeps 64 changes, and the word is the oldest of 65.
+    for _ in 0..64 {
+        engine.on_membership(&Membership::Resized(WorkerId(101)));
+    }
+    let picked = own_pick(&plugin, &engine);
+    let stats = plugin.stats();
+    assert_eq!(picked, Some(100), "no name was counted: {stats:?}");
+    assert_eq!(stats.observed - warmed, 1, "one snapshot: {stats:?}");
 }
