@@ -112,13 +112,12 @@ pub struct MemoryStore {
     /// What a decision reads, through one load: swapped whole at each
     /// publication.
     world: ArcSwap<World>,
-    /// Every member that an owed build may list and no published world
-    /// lists yet, each with its slot in the counts. The write that files
-    /// a member puts it here. So does a refresh that changes an offer: a
-    /// member that offers no model stands in no pool and in no world. A
-    /// membership build empties the table behind its publication, and no
-    /// other publication touches it. A leaf lock: nothing is taken under
-    /// it.
+    /// Every member on file that no published world names yet, each with
+    /// its slot in the counts. The write that files a member puts it
+    /// here, and no other write does: a world names every member its
+    /// build read, in a pool or in none. A membership build empties the
+    /// table behind its publication, and no other publication touches
+    /// it. A leaf lock: nothing is taken under it.
     joined: Mutex<Vec<(WorkerId, Slot)>>,
     /// The store's counts of the leases on file, for the write that gives
     /// a joining member its slot.
@@ -506,10 +505,6 @@ impl MemoryStore {
                 // A row that carries its offer left no model.
                 if !carried {
                     off = left_models(old.facts, &held.row.facts);
-                    // As at the leader's own refresh: the build this
-                    // change owes may be the first to list the member,
-                    // so its slot is filed again for the leases' doors.
-                    self.joined.lock().push((id, held.slot));
                 }
                 if resized {
                     (MembershipChange::Resized { id }, None)
@@ -1500,12 +1495,6 @@ impl WorkersStore for MemoryStore {
                     (Classes::Carry, Vec::new())
                 } else {
                     let old = mem::replace(&mut row.row.facts, facts);
-                    // The build this write owes may be the first to list
-                    // the member: one in no pool stands in no world, and
-                    // the build behind its first write emptied its entry.
-                    // Its slot is filed again for the leases' doors; a
-                    // twin of an entry on file reads the same slot.
-                    self.joined.lock().push((old_id, row.slot));
                     let classes = Classes::Written {
                         left: Some(old_id),
                         joined: Some(old_id),
@@ -3214,13 +3203,11 @@ impl MemoryStore {
 struct Slots<'a>(&'a MemoryStore);
 
 impl Slots<'_> {
-    /// The slot of `target`'s count: `None` for a worker that is no member
-    /// and for a member in no pool behind its first build: inside its
-    /// window such a member is read from the table, as every joiner is.
-    /// The standing world lists a member from its first build on, and a
-    /// listed target takes no lock. Inlined into each door: a listed
-    /// target's read costs the door no call, one read for each lease it
-    /// files.
+    /// The slot of `target`'s count: `None` for a worker that is no
+    /// member. The standing world lists a member in a pool from its first
+    /// build on, and a listed target takes no lock. Inlined into each
+    /// door: a listed target's read costs the door no call, one read for
+    /// each lease it files.
     #[inline(always)]
     fn of(self, target: WorkerId) -> Option<Slot> {
         if let Some(slot) = self.0.world.load().booked_of(target) {
@@ -3241,10 +3228,10 @@ impl Slots<'_> {
 
     /// The slot of a target the standing world does not list. A member
     /// inside its registration window is read from the table its write
-    /// filed it in, and so is one in no pool behind the refresh that may
-    /// list it. A build publishes before it empties the table, so a
-    /// target the table no longer holds is read off the world again. The
-    /// table's lock is a leaf, taken under the turn or with no lock held.
+    /// filed it in. A build publishes before it empties the table, so a
+    /// target the table no longer holds is read off the world again: its
+    /// pools, then its members in no pool. The table's lock is a leaf,
+    /// taken under the turn or with no lock held.
     #[cold]
     fn filed(self, target: WorkerId) -> Option<Slot> {
         let filed = {
@@ -3254,7 +3241,12 @@ impl Slots<'_> {
                 .find(|&&(id, _)| id == target)
                 .map(|&(_, slot)| slot)
         };
-        filed.or_else(|| self.0.world.load().booked_of(target))
+        filed.or_else(|| {
+            let world = self.0.world.load();
+            world
+                .booked_of(target)
+                .or_else(|| world.unpooled_of(target))
+        })
     }
 }
 
@@ -3273,11 +3265,10 @@ impl MemoryStore {
         slot
     }
 
-    /// Empties the table of the members no world listed. Called behind
+    /// Empties the table of the members no world named. Called behind
     /// the publication of a membership build, under the workers lock:
-    /// every member the table held is in the published world, stands in
-    /// no pool or has left. A refresh that may list a member in no pool
-    /// files its slot again.
+    /// every member the table held is named by the published world or
+    /// has left.
     fn listed(&self) {
         self.joined.lock().clear();
     }
