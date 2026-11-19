@@ -10304,7 +10304,7 @@ mod tests {
             1,
             Needs::default(),
         );
-        // It says no sample: a host feeds such a profile a column.
+        // It says no sample: a stage that is not row-wise reads the pool whole.
         assert_eq!(engine.needs().sample, 0);
         let holders = [holding(3, 12)];
         let pool = pool_of(64, |_| false);
