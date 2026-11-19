@@ -5759,6 +5759,8 @@ mod tests {
                     plan: Plan::Single,
                     profile: 0,
                     decode_profile: None,
+                    shadow: None,
+                    decode_shadow: None,
                     sessions: None,
                     overload: None,
                 }],
