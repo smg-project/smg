@@ -3,8 +3,9 @@
 //! runs, resolved from the runtime of the workers the request can reach.
 
 use llm_multimodal::{TransparencyPolicy, VisionPreProcessor};
+use smg_worker::identity::basic::RuntimeType;
 
-use crate::worker::{RoutingPool, RuntimeType, WorkerRegistry, WorkerRegistryExt};
+use crate::routers::common::snapshot::{RoutingPool, WorkerRegistry, WorkerRegistryExt};
 
 /// The policy for the frames of a request to `model_id` served from the
 /// routing pools `pools`: the pools of the pipeline's mode, read as the
@@ -81,14 +82,16 @@ mod tests {
     use std::{sync::Arc, time::Instant};
 
     use llm_multimodal::{PreprocessedEncoderInputs, TransformError, VisionPreProcessor};
+    use openai_protocol::model_card::ModelCard;
+    use smg_worker::{
+        identity::basic::{ConnectionMode, Worker, WorkerType},
+        test_support::no_health_check,
+    };
 
     use super::*;
-    use crate::{
-        routers::grpc::mode::Mode,
-        worker::{
-            test_support::{no_health_check, registry_with},
-            BasicWorkerBuilder, ConnectionMode, ModelCard, Worker, WorkerType,
-        },
+    use crate::routers::{
+        common::snapshot::test_support::registry_with,
+        grpc::{backend_client::BasicWorkerBuilder, mode::Mode},
     };
 
     const MODEL: &str = "vision-model";

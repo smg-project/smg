@@ -17,8 +17,9 @@
 //! 2. Keys are hashed to the ring, then walk clockwise to find first healthy worker
 //! 3. When workers scale up/down, only keys in the affected range redistribute (~1/N keys move)
 //!
-//! The ring is filled once for a generation, not per request, and off the
-//! request path where the gateway's warm task reaches the generation first.
+//! The ring is filled once for a generation, off the request path: until
+//! the gateway's warm task has filled it, a request walks the ring kept
+//! from another generation, and a model's first requests walk none.
 //! This ensures O(log n) lookup performance.
 //!
 //! Complexity per request: O(log n) binary search + O(k) walk where k =
@@ -29,13 +30,13 @@
 use std::{cell::Cell, sync::Arc};
 
 use rand::RngExt as _;
+use smg_worker::identity::basic::Worker;
 
 use super::{LoadBalancingPolicy, SelectWorkerInfo};
 use crate::{
     observability::metrics::Metrics,
     policies::hash_ring::HashRing,
     routers::common::header_utils::{extract_routing_key_hint, extract_target_worker},
-    worker::Worker,
 };
 
 /// Execution branch for metrics
@@ -105,15 +106,24 @@ impl ConsistentHashingPolicy {
             // found: one scan and one eligibility read per probed node, and
             // the answer cannot disagree with the probe that admitted it.
             let found = Cell::new(None);
-            ring.find_healthy_url(key, |url| {
+            let on_ring = ring.find_healthy_url(key, |url| {
                 found.set(eligible_at(url));
                 found.get().is_some()
-            })?;
-            return found.get();
+            });
+            if on_ring.is_some() {
+                return found.get();
+            }
+            // No eligible worker is on the ring. The ring can be of another
+            // membership than `workers`, kept while the next ring is
+            // filled: the key is then placed below over the workers that
+            // joined since, as with no ring. On the ring of these very
+            // workers none is eligible, and the answer below is the same
+            // `None`.
         }
 
-        // Fallback: no ring provided, use simple modulo (less optimal but functional)
-        // This shouldn't happen in normal operation as WorkerSelectionStage provides the ring
+        // No ring, as for a model's first requests, or none of its workers
+        // here: the key's position over the eligible workers (less optimal
+        // but functional).
         let healthy_indices: Vec<usize> = workers
             .iter()
             .enumerate()
@@ -779,6 +789,36 @@ mod tests {
         let (result, branch) = policy.select_worker_impl(&workers, &info);
         assert!(result.is_some());
         assert_eq!(branch, Branch::RandomFallback);
+    }
+
+    /// The ring can be of another membership than the workers a request
+    /// is placed over. Where no worker of the ring is eligible among them,
+    /// as after a fleet was replaced whole, the key is placed as with no
+    /// ring: the request is not refused while a worker is eligible.
+    #[test]
+    fn a_key_no_worker_of_the_ring_takes_is_placed_as_with_no_ring() {
+        let policy = ConsistentHashingPolicy::new();
+        let workers = make_workers(&["http://new1:8000", "http://new2:8000", "http://new3:8000"]);
+        let earlier = Arc::new(HashRing::new(["http://left1:8000", "http://left2:8000"]));
+
+        for key in ["session-a", "session-b", "session-c", "session-d"] {
+            let headers = headers_with_routing_key(key);
+            let (with_ring, branch) =
+                policy.select_worker_impl(&workers, &with_headers_and_ring(&headers, &earlier));
+            let (without, _) = policy.select_worker_impl(&workers, &with_headers(&headers));
+            assert_eq!(branch, Branch::RoutingKeyHit, "{key}");
+            assert!(with_ring.is_some(), "{key}: a worker is eligible");
+            assert_eq!(with_ring, without, "{key}");
+        }
+
+        // With no eligible worker at all the answer stays none.
+        for worker in &workers {
+            worker.set_status(WorkerStatus::NotReady);
+        }
+        let headers = headers_with_routing_key("session-a");
+        let (picked, branch) =
+            policy.select_worker_impl(&workers, &with_headers_and_ring(&headers, &earlier));
+        assert_eq!((picked, branch), (None, Branch::NoHealthyWorkers));
     }
 
     #[test]

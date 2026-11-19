@@ -1371,6 +1371,13 @@ mod tests {
         assert_eq!(fence.leader_term(t0 + 2 * S), None, "no renewal landed");
         assert_eq!(a.tick(t0 + S).expect("renew"), Tick::Renewed { term: 1 });
         assert_eq!(fence.leader_term(t0 + S), None, "inside the renew deadline");
+        // The clock alone turns that answer twice from here: at the
+        // opening still ahead, then at the window's end, and never after.
+        assert_eq!(fence.turns_at(t0 + S), Some(t0 + 2 * S));
+        assert_eq!(fence.turns_at(t0 + 2 * S), Some(t0 + 3 * S));
+        assert_eq!(fence.turns_at(t0 + 3 * S), Some(t0 + 3 * S));
+        let past = t0 + 3 * S + Duration::from_micros(1);
+        assert_eq!(fence.turns_at(past), None);
         // One renew deadline after the take the fence opens by itself, at
         // no step: the renewal behind it carries the window past that
         // instant, to its own renew deadline.

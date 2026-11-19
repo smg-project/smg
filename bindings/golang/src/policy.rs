@@ -26,21 +26,25 @@ use smg::{
         BucketPolicy, CacheAwarePolicy, LoadBalancingPolicy, PowerOfTwoPolicy, RandomPolicy,
         RoundRobinPolicy, SelectWorkerInfo,
     },
-    worker::{
-        connection::engine::EngineConnection,
-        health::{
-            circuit_breaker::{CircuitBreaker, CircuitState},
-            resilience::ResolvedResilience,
-        },
-        identity::{
-            basic::{RuntimeType, WorkerMetadata, WorkerRoutingKeyLoad},
-            endpoint::Endpoint,
-            metadata::DecodingLabels,
-        },
-        ConnectionMode, OverloadThresholds, PdPairing, Worker, WorkerResult, WorkerType,
-    },
 };
 use smg_grpc_client::sglang_scheduler::SglangSchedulerClient;
+use smg_worker::{
+    connection::engine::EngineConnection,
+    health::{
+        circuit_breaker::{CircuitBreaker, CircuitState},
+        overload::OverloadThresholds,
+        resilience::ResolvedResilience,
+    },
+    identity::{
+        basic::{
+            ConnectionMode, RuntimeType, Worker, WorkerMetadata, WorkerRoutingKeyLoad, WorkerType,
+        },
+        endpoint::Endpoint,
+        error::WorkerResult,
+        metadata::DecodingLabels,
+    },
+    pd::pairing::PdPairing,
+};
 
 use super::{
     chat_stream::{fingerprint_of, prepare_chat, start_chat_stream, weight_version_of},

@@ -1,5 +1,5 @@
 //! The typed decision (design 4.2): an ordered list of targets the host walks
-//! at commit, a shed with its reason and the stage that emptied the pool, or
+//! at dispatch, a shed with its reason and the stage that emptied the pool, or
 //! a queue ticket. A busy answer is not a decision: a remote decider gives it
 //! on its stream and the host's fallback takes over at once, so the enum
 //! never carries one.

@@ -2483,6 +2483,22 @@ fn check_profile(
         let stage_at = entry_at.sub(stage.name());
         check_stage(&stage, &stage_at)?;
         check_prefix_depth(&stage, gates, view, &stage_at)?;
+        // A host that records no prefix it sent holds no source that reads
+        // them: where no worker publishes its blocks, the stage would score
+        // every worker as holding nothing.
+        let reads_sent = matches!(
+            &stage,
+            ScoreStage::PrefixAffinity(p)
+                if matches!(p.source, Some(AffinitySource::Predictor | AffinitySource::Merged))
+        );
+        if reads_sent && !catalog.records_sent_prefixes() {
+            complete = false;
+            deferred.note(
+                stage_at.field("source"),
+                "the record of sent prefixes this source reads",
+            );
+            continue;
+        }
         match scorer_of(&stage, gates, &view.boundaries) {
             Resolved::Built(scorer) => {
                 let read = HashDepth::of_scorer(&stage, &view.boundaries, scorer.needs());
@@ -3593,7 +3609,7 @@ impl AppliedSpec {
     /// digest its caller took already: the controller's door reads the
     /// document's digest against the standing one and hands it on, so an
     /// apply digests its document once.
-    #[cfg(feature = "controller")]
+    #[cfg(any(test, feature = "controller"))]
     pub(crate) fn validate_digested(
         document: &PolicySpec,
         digest: Digest,
@@ -5193,6 +5209,39 @@ mod tests {
             .expect("a preset")
             .validate()
             .expect("the tokens alone");
+    }
+
+    /// A prefix-affinity source that reads the prefixes sent is refused by
+    /// its field where the host records none: `predictor` and `merged`
+    /// would place as with no affinity where no worker publishes its
+    /// blocks. A host that records them validates both. The event-fed
+    /// index validates on either host, named or left out.
+    #[test]
+    fn a_source_of_sent_prefixes_is_refused_where_the_host_records_none() {
+        let records_none = Catalog::builtin().without_sent_prefixes();
+        for source in ["predictor", "merged"] {
+            let score = format!(r#"{{"prefix-affinity":{{"source":"{source}"}}}}"#);
+            let spec = spec_with_score(&score);
+            let refused = spec
+                .validate_in(&records_none, &[])
+                .expect_err("a source this host cannot feed");
+            assert_eq!(
+                refused.to_string(),
+                "profiles.p.score[0].prefix-affinity.source: the record of sent prefixes this source reads is not in this build",
+                "{source}"
+            );
+            assert!(
+                spec.validate().is_ok(),
+                "{source}: a host that records them"
+            );
+        }
+        for score in [
+            r#"{"prefix-affinity":{"source":"index"}}"#,
+            r#"{"prefix-affinity":{}}"#,
+        ] {
+            let spec = spec_with_score(score);
+            assert!(spec.validate_in(&records_none, &[]).is_ok(), "{score}");
+        }
     }
 
     #[test]

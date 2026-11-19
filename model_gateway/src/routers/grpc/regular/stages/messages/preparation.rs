@@ -9,24 +9,22 @@ use openai_protocol::{
 };
 use tracing::{error, warn};
 
-use crate::{
-    routers::{
-        error,
-        grpc::{
-            common::stages::PipelineStage,
-            context::{PreparationOutput, RequestContext},
-            regular::{
-                stages::{
-                    reading,
-                    rendered_prompt::{prepare_rendered_prompt, RenderedPrompt},
-                },
-                symphony,
+use crate::routers::{
+    common::snapshot::RoutingPool,
+    error,
+    grpc::{
+        common::stages::PipelineStage,
+        context::{PreparationOutput, RequestContext},
+        regular::{
+            stages::{
+                reading,
+                rendered_prompt::{prepare_rendered_prompt, RenderedPrompt},
             },
-            spec::MessagesResponseSpec,
-            utils::{self, message_utils},
+            symphony,
         },
+        spec::MessagesResponseSpec,
+        utils::{self, message_utils},
     },
-    worker::RoutingPool,
 };
 
 /// Message API preparation stage
@@ -299,12 +297,16 @@ mod tests {
 
         use crate::{
             config::ParserChoice,
-            routers::grpc::{
-                common::stages::PipelineStage,
-                context::{PreparationOutput, RequestContext},
-                regular::stages::{messages::MessagePreparationStage, testing::components_over},
+            routers::{
+                common::snapshot::WorkerRegistry,
+                grpc::{
+                    common::stages::PipelineStage,
+                    context::{PreparationOutput, RequestContext},
+                    regular::stages::{
+                        messages::MessagePreparationStage, testing::components_over,
+                    },
+                },
             },
-            worker::WorkerRegistry,
         };
 
         const MODEL: &str = "effort-model";
@@ -367,12 +369,16 @@ mod tests {
 
         use crate::{
             config::ParserChoice,
-            routers::grpc::{
-                common::stages::PipelineStage,
-                context::{PreparationOutput, RequestContext},
-                regular::stages::{messages::MessagePreparationStage, testing::components_over},
+            routers::{
+                common::snapshot::WorkerRegistry,
+                grpc::{
+                    common::stages::PipelineStage,
+                    context::{PreparationOutput, RequestContext},
+                    regular::stages::{
+                        messages::MessagePreparationStage, testing::components_over,
+                    },
+                },
             },
-            worker::WorkerRegistry,
         };
 
         let (_dir, tokenizer) = byte_tokenizer_with_template(
@@ -447,15 +453,17 @@ mod tests {
 
         use crate::{
             config::ParserChoice,
-            routers::grpc::{
-                common::stages::PipelineStage,
-                context::{PreparationOutput, RequestContext},
-                regular::{
-                    stages::{messages::MessagePreparationStage, testing::components_over},
-                    symphony,
+            routers::{
+                common::snapshot::WorkerRegistry,
+                grpc::{
+                    common::stages::PipelineStage,
+                    context::{PreparationOutput, RequestContext},
+                    regular::{
+                        stages::{messages::MessagePreparationStage, testing::components_over},
+                        symphony,
+                    },
                 },
             },
-            worker::WorkerRegistry,
         };
 
         const MODEL: &str = "format-model";

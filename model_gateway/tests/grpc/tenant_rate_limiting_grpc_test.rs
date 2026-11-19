@@ -60,9 +60,9 @@ use smg::{
     },
     routers::RouterTrait,
     tenant::TenantKey,
-    worker::{RuntimeType, Worker, WorkerType},
 };
 use smg_grpc_client::vllm_proto as proto;
+use smg_worker::identity::basic::{RuntimeType, Worker, WorkerType};
 use tokio::time::timeout;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;

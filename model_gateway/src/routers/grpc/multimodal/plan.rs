@@ -497,6 +497,7 @@ pub(crate) mod tests {
 
     use llm_multimodal::PreProcessorConfig;
     use llm_tokenizer::mock::MockTokenizer;
+    use smg_worker::identity::basic::RuntimeType;
 
     use super::{
         super::{
@@ -506,7 +507,7 @@ pub(crate) mod tests {
         },
         *,
     };
-    use crate::worker::{RuntimeType, WorkerRegistry};
+    use crate::routers::common::snapshot::WorkerRegistry;
 
     /// The tokens a spec resolves for a modality, as `(text, id)` pairs, the
     /// anchor first.
@@ -1099,8 +1100,9 @@ pub(crate) mod tests {
     /// A registry holding one worker of `runtime` for model "m".
     fn fleet(runtime: RuntimeType) -> WorkerRegistry {
         use openai_protocol::model_card::ModelCard;
+        use smg_worker::identity::basic::{ConnectionMode, WorkerType};
 
-        use crate::worker::{BasicWorkerBuilder, ConnectionMode, WorkerType};
+        use crate::routers::grpc::backend_client::BasicWorkerBuilder;
 
         let registry = WorkerRegistry::new();
         registry

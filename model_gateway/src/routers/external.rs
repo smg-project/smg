@@ -22,6 +22,7 @@ use smg_external_router::{
     worker::{ExternalWorker, LoadHold, SelectWorkerRequest, WorkerSource, WorkerStats},
     ExternalContext, ExternalRouter, ExternalRouterSpec, RetryConfig,
 };
+use smg_worker::identity::basic::{RuntimeType, Worker, WorkerLoadGuard};
 
 use super::{
     common::worker_selection::WorkerSelector,
@@ -34,7 +35,7 @@ use crate::{
     middleware::TenantRequestMeta,
     observability::metrics::{bool_to_static_str, metrics_labels, Metrics},
     rate_limit::RateLimitManager,
-    worker::{RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry},
+    routers::common::snapshot::WorkerRegistry,
 };
 
 /// A gateway worker as an external router sees it.
@@ -438,7 +439,7 @@ mod tests {
     use super::*;
     use crate::{
         middleware::{RouteRequestMeta, TenantKey},
-        worker::BasicWorkerBuilder,
+        routers::grpc::backend_client::BasicWorkerBuilder,
     };
 
     /// A provider router of the kind the adapter mounts, keeping the

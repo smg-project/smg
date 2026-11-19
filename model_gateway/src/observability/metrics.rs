@@ -16,22 +16,25 @@ pub use smg_external_router::metrics::{
     bool_to_static_str, error_reason_from_status, intern_model_label, intern_tool_label,
     metrics_labels, STREAMING_FALSE, STREAMING_TRUE,
 };
+use smg_worker::metrics::{
+    series as worker_series,
+    series::{WorkerSeries, WorkerSeriesRecorder},
+    writers::{
+        describe_series as describe_worker_series, intern_string, KV_EVENT_APPLY_SECONDS,
+        KV_EVENT_LAG_SECONDS,
+    },
+};
 
 use crate::{
     config::{ConfigError, ConfigResult},
     routers::grpc::regular::symphony::telemetry as symphony_telemetry,
-    worker::metrics::{
-        describe_series as describe_worker_series, intern_string,
-        series::{self as worker_series, WorkerSeries, WorkerSeriesRecorder},
-        KV_EVENT_APPLY_SECONDS, KV_EVENT_LAG_SECONDS,
-    },
 };
 
 /// Per-thread caches of the handles the gateway's per-request records go
 /// through: the HTTP layer's, the stream-timing set's, the selection's, the
 /// cache-aware decision's, the index lookup's, the admission gauges' and the
 /// body path's. The worker's own caches are the worker module's
-/// (`crate::worker::metrics`); the helpers and the installed flag are the
+/// (`smg_worker::metrics::writers`); the helpers and the installed flag are the
 /// worker crate's, so every writer records the same way.
 mod handles {
     use std::{
@@ -1017,8 +1020,7 @@ pub fn init_startup_series() {
         ENDPOINT_GENERATE, ENDPOINT_MESSAGES, ENDPOINT_RERANK, ENDPOINT_RESPONSES,
         ENDPOINT_SYSTEMONE, WORKER_DECODE, WORKER_PREFILL, WORKER_REGULAR,
     };
-
-    use crate::worker::health::overload::{STAGE_DISPATCH, STAGE_PD_ADMISSION, STAGE_SELECTION};
+    use smg_worker::health::overload::{STAGE_DISPATCH, STAGE_PD_ADMISSION, STAGE_SELECTION};
 
     // Shedding happens at every stage; the two fallbacks only while the
     // candidate pool is assembled.
@@ -1122,7 +1124,7 @@ pub fn start_prometheus(config: PrometheusConfig) -> PrometheusHandle {
     let handle = recorder.handle();
 
     // Series labelled `worker` live in a store of their own so they can be
-    // dropped with their worker (see `worker::metrics::series`); it renders histograms
+    // dropped with their worker (see `smg_worker::metrics::series`); it renders histograms
     // with the exporter's buckets and quantiles.
     let workers = Arc::new(WorkerSeries::new(DistributionBuilder::new(
         parse_quantiles(DEFAULT_SUMMARY_QUANTILES),
@@ -2535,9 +2537,8 @@ pub(crate) mod test_support {
 
     /// The scrape a test renders under its own recorder, with the two
     /// readers of it: the worker's test support owns them.
-    pub(crate) use crate::worker::test_support::{
-        assert_metric, render_with_recorder, sorted_series,
-    };
+    pub(crate) use smg_worker::test_support::assert_metric;
+    pub(crate) use smg_worker::test_support::{render_with_recorder, sorted_series};
 }
 
 #[cfg(test)]

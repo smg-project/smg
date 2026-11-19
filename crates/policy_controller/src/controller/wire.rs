@@ -53,15 +53,16 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub(crate) use crate::door::Viewed;
 use crate::{
     decision::{Decision, ShedReason, Target, Trace},
+    door::Asked,
     lease::Lease,
     proto::{self, busy::Reason, decide_answer::Answer, decision::Outcome, identity::Form},
     spec::{AppliedSpec, MAX_HEADERS},
     view::{
-        fingerprint, key_of_session, AffinityFacts, Constraints, HashKind, Header, Identity,
-        MediaCounts, ModelFingerprint, NamedAffinity, Phase, PinSource, RequestFacts, WireModes,
-        WorkerId,
+        fingerprint, key_of_session, Constraints, HashKind, Header, Identity, MediaCounts,
+        ModelFingerprint, Phase, RequestFacts, WireModes, WorkerId,
     },
 };
 
@@ -336,33 +337,53 @@ impl Checked {
     }
 }
 
-/// What a decision's view adds to its request: the facts that are the
-/// deciding host's own, never the frame's.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct Viewed<'a> {
-    /// The decision's instant in the rows' clock.
-    pub(crate) now_micros: u64,
-    /// What is left of the request's budget at the decision.
-    pub(crate) budget_micros: u32,
-    /// The candidates' affinity column, as the view's build filled it.
-    pub(crate) affinity: &'a [AffinityFacts],
-    /// The rows a veto of the asking gateway masks, by position, where the
-    /// candidates are a publication's own rows; empty where they were
-    /// written for the decision and carry their own stalled bits.
-    pub(crate) stalled: &'a [u32],
-    /// What the leases on file book on each row, by position, where the
-    /// candidates are a publication's own rows; `None` where they were
-    /// written for the decision and carry their counts.
-    pub(crate) in_flight: Option<crate::LentCounts<'a>>,
-    /// How many of the request's block hashes the deciding generation
-    /// reads.
-    pub(crate) max_block_hashes: usize,
-    /// The rows the deciding host named in the column's place, where the
-    /// request's profile takes them.
-    pub(crate) named: Option<NamedAffinity<'a>>,
-    /// The pins of record the host lends the decision ([`PinSource`]);
-    /// `None` where it keeps none.
-    pub(crate) pins: Option<&'a dyn PinSource>,
+impl Asked for Checked {
+    type Lists = Lists;
+
+    fn model(&self) -> &str {
+        Self::model(self)
+    }
+
+    fn phase(&self) -> Phase {
+        Self::phase(self)
+    }
+
+    fn id(&self) -> &[u8] {
+        Self::id(self)
+    }
+
+    fn wires(&self) -> Option<WireModes> {
+        Self::wires(self)
+    }
+
+    fn subset(&self) -> Option<u32> {
+        Self::subset(self)
+    }
+
+    fn hashes(&self) -> usize {
+        Self::hashes(self)
+    }
+
+    fn hashes_read(&self, spec: &AppliedSpec) -> usize {
+        Self::hashes_read(self, spec)
+    }
+
+    fn block_hashes(&self) -> &[u64] {
+        Self::block_hashes(self)
+    }
+
+    fn seed(&self) -> u64 {
+        Self::seed(self)
+    }
+
+    fn read<R>(
+        &self,
+        lists: &mut Lists,
+        viewed: Viewed<'_>,
+        decide: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> R,
+    ) -> R {
+        Self::read(self, lists, viewed, decide)
+    }
 }
 
 /// The lists of one request in the engine's form, on buffers their decider

@@ -571,27 +571,47 @@ def check(
                 verdict.workspace_version = pinned or ""
         return verdict
     verdict.unbumped = carrier is not None
-    verdict.wire = bool(component.wire) and bool(repo.changed_since(tag, component.wire))
     if verdict.unbumped:
+        # The published copy of this version is the carrier's, the given tag or another line's.
+        verdict.wire = wire_changed(repo, carrier, component)
         verdict.level = bump_level(repo.commits_since(tag, component_paths(repo, component)))
         if verdict.wire:
             verdict.level = LEVELS[
                 max(LEVELS.index(verdict.level), LEVELS.index(breaking_level(verdict.version)))
             ]
-    elif (
-        verdict.wire
-        and verdict.tag_version is not None
-        and caret_accepts(verdict.tag_version, verdict.version)
-    ):
-        # Bumped, to a version the tagged one's caret accepts: a dependent's published copy
+    elif inside := published_inside(repo, tag, component, verdict):
+        # Bumped, to a version a published one's caret accepts: a dependent's published copy
         # resolves to it and builds messages that gained a field.
-        verdict.unbumped, verdict.inside = True, verdict.tag_version
+        verdict.wire = True
+        verdict.unbumped, verdict.inside = True, inside
         verdict.level = breaking_level(verdict.version)
     elif component.dep_key:
         pinned = workspace_dep_version(root_toml, component.dep_key)
         if pinned != verdict.version:
             verdict.workspace_version = pinned or ""
     return verdict
+
+
+def wire_changed(repo: Repo, tag: str, component: Component) -> bool:
+    """Whether the component's wire files differ from the tag's."""
+    return bool(component.wire) and bool(repo.changed_since(tag, component.wire))
+
+
+def published_inside(repo: Repo, tag: str, component: Component, verdict: Verdict) -> str | None:
+    """The newest published version whose caret accepts the version written by hand while the
+    wire files differ from that version's own: the given tag's, or the version of a tag another
+    release line made. A dependent's published copy on that line resolves to the new version."""
+    published = dict(verdict.tagged)
+    if verdict.tag_version is not None:
+        published[verdict.tag_version] = tag
+    for version in sorted(
+        published, key=lambda v: version_key(v) or (-1, 0, 0, 0, 0), reverse=True
+    ):
+        if caret_accepts(version, verdict.version) and wire_changed(
+            repo, published[version], component
+        ):
+            return version
+    return None
 
 
 # --- the report, the proposal, the fixes --------------------------------------

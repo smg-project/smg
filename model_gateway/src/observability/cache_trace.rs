@@ -16,8 +16,7 @@ use std::{
 use http::HeaderMap;
 use serde::{ser::SerializeMap, Serialize, Serializer};
 use serde_json::{json, Value};
-
-use crate::worker::Worker;
+use smg_worker::identity::basic::Worker;
 
 #[derive(Default)]
 struct Capture {
@@ -511,7 +510,7 @@ mod tests {
     async fn a_row_written_with_the_evidence_is_the_row_as_it_was_observed() {
         use openai_protocol::worker::WorkerStatus;
 
-        use crate::worker::BasicWorkerBuilder;
+        use crate::routers::grpc::backend_client::BasicWorkerBuilder;
         let worker = |url: &str, epochs: Option<&str>| -> Arc<dyn Worker> {
             // Ready, so that the health failure below moves what a worker
             // shows after its row was observed.
@@ -603,7 +602,7 @@ mod tests {
     /// pick that held.
     #[tokio::test]
     async fn a_row_without_a_worker_is_written_in_pick_order_by_the_failure_and_the_dispatch() {
-        use crate::worker::BasicWorkerBuilder;
+        use crate::routers::grpc::backend_client::BasicWorkerBuilder;
         let workers: Vec<Arc<dyn Worker>> = ["grpc://one:50051", "grpc://two:50051"]
             .into_iter()
             .map(|url| Arc::new(BasicWorkerBuilder::new(url).build()) as Arc<dyn Worker>)
@@ -642,7 +641,7 @@ mod tests {
     /// all of them; a pick beyond the 32 observed is still named.
     #[tokio::test]
     async fn a_row_observes_32_candidates_and_says_whether_that_was_all() {
-        use crate::worker::BasicWorkerBuilder;
+        use crate::routers::grpc::backend_client::BasicWorkerBuilder;
         let workers: Vec<Arc<dyn Worker>> = (0..33)
             .map(|i| {
                 Arc::new(BasicWorkerBuilder::new(format!("grpc://w{i}:50051")).build())
@@ -668,7 +667,7 @@ mod tests {
 
     #[test]
     fn candidate_observation_survives_dispatch_load_credit() {
-        use crate::worker::BasicWorkerBuilder;
+        use crate::routers::grpc::backend_client::BasicWorkerBuilder;
         let worker: Arc<dyn Worker> =
             Arc::new(BasicWorkerBuilder::new("http://worker:8000").build());
         let workers = vec![worker];
@@ -685,7 +684,7 @@ mod tests {
     fn candidate_epochs_are_replica_scoped_and_invalidated_after_failure() {
         use openai_protocol::worker::WorkerStatus;
 
-        use crate::worker::BasicWorkerBuilder;
+        use crate::routers::grpc::backend_client::BasicWorkerBuilder;
         let worker: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("http://worker:8000")
                 .labels(std::collections::HashMap::from([(
@@ -849,7 +848,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_requesting_scope_captures_its_request_alone() {
-        use crate::worker::BasicWorkerBuilder;
+        use crate::routers::grpc::backend_client::BasicWorkerBuilder;
         let worker: Arc<dyn Worker> =
             Arc::new(BasicWorkerBuilder::new("grpc://worker:50051").build());
         let workers = vec![worker];

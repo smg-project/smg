@@ -48,11 +48,12 @@ use std::{fs, path::PathBuf, sync::Arc, time::Duration};
 
 use openai_protocol::worker::WorkerStatus;
 use serde::Serialize;
+use smg_worker::identity::basic::{Worker, WorkerType};
 
 use super::BucketPolicy;
 use crate::{
     policies::{BucketConfig, LoadBalancingPolicy, SelectWorkerInfo},
-    worker::{test_support::worker_of, Worker, WorkerType},
+    routers::common::snapshot::test_support::worker_of,
 };
 
 /// The policy's configuration, in the gateway's own spelling.

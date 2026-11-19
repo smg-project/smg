@@ -3,13 +3,14 @@ use k8s_openapi::{
     apimachinery::pkg::apis::meta::v1::{ObjectMeta, Time},
 };
 use kube::runtime::watcher::Event;
+use smg_worker::{
+    identity::endpoint::{endpoint_key, Endpoint, EndpointKey},
+    registry::WorkerId,
+};
 use tracing_test::traced_test;
 
 use super::*;
-use crate::{
-    service_discovery::testing::make_labeled_pod,
-    worker::{endpoint_key, identity::endpoint::Endpoint, registry::WorkerId, EndpointKey},
-};
+use crate::service_discovery::testing::make_labeled_pod;
 
 /// The pod's Ready condition at `status` ("True", "False" or "Unknown"),
 /// every other field unset.

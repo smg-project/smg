@@ -16,6 +16,7 @@ use llm_multimodal::{
     ModelSpecificValue, PlaceholderRange, PreprocessedEncoderInputs,
 };
 use smg_grpc_client::common_proto as common;
+use smg_worker::identity::basic::RuntimeType;
 use tracing::{info, warn};
 
 use super::{
@@ -31,19 +32,16 @@ use super::{
     },
     MediaBatch, MultimodalIntermediate, PrecomputedMultimodalIntermediate, PromptBinding,
 };
-use crate::{
-    routers::grpc::{
-        backend_client::BackendClient,
-        client::GrpcClient,
-        context::WorkerSelection,
-        proto_wrapper::{
-            cleanup_tokenspeed_items_encoder_shm, SglangMultimodalData, TensorBytes,
-            TokenSpeedModality, TokenSpeedMultimodalData, TokenSpeedMultimodalItem,
-            TokenSpeedTensor, TrtllmMultimodalData, VllmMultimodalData,
-        },
-        MultimodalData,
+use crate::routers::grpc::{
+    backend_client::BackendClient,
+    client::GrpcClient,
+    context::WorkerSelection,
+    proto_wrapper::{
+        cleanup_tokenspeed_items_encoder_shm, SglangMultimodalData, TensorBytes,
+        TokenSpeedModality, TokenSpeedMultimodalData, TokenSpeedMultimodalItem, TokenSpeedTensor,
+        TrtllmMultimodalData, VllmMultimodalData,
     },
-    worker::RuntimeType,
+    MultimodalData,
 };
 
 /// Assemble backend-specific multimodal data from the intermediate.

@@ -1019,7 +1019,7 @@ mod tests {
         catalog::Catalog,
         controller::{
             config::Scope,
-            deciders::{tests as bed, TERM_MARK},
+            deciders::tests as bed,
             election::{self, LeasePlace, Standing},
             gateways::tests::PATIENT,
             generations::{tests::LEAST_LOAD, Format, Unanswered},
@@ -1031,6 +1031,7 @@ mod tests {
             spec_store::{tests::names, SpecStore},
             PROTOCOL_VERSION,
         },
+        door::TERM_MARK,
         elector::{
             ElectError, ElectionSettings, Elector, FileLease, LeaseBackend, LeaseRecord,
             MemoryLease, Tick, Written,

@@ -8,6 +8,7 @@ use openai_protocol::{model_card::ModelCard, model_type::ModelType, worker::Prov
 use regex::Regex;
 use reqwest::Client;
 use serde::Deserialize;
+use smg_worker::identity::endpoint::Endpoint;
 use tracing::{debug, info, warn};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
@@ -15,7 +16,6 @@ use crate::{
     admin::worker_service::{control_character_refusal, logged_strings},
     routers::provider_support,
     server::http_client_builder,
-    worker::identity::endpoint::Endpoint,
     workflow::data::{WorkerKind, WorkerWorkflowData},
 };
 
@@ -379,11 +379,10 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverModelsStep {
 
 #[cfg(test)]
 mod tests {
+    use smg_worker::test_support::RefusedAddress;
+
     use super::fetch_models;
-    use crate::{
-        worker::test_support::RefusedAddress,
-        workflow::steps::local::test_support::serve_json_routes,
-    };
+    use crate::workflow::steps::local::test_support::serve_json_routes;
 
     /// A model id the provider lists is refused like one a request carries:
     /// the discovery fails with the door's sentence, which does not repeat

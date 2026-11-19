@@ -895,8 +895,11 @@ impl ClassBits {
 }
 
 /// Combined scores of the rows in `kept`, written into `scores`; the
-/// profile's tie band comes back. Inlined into its two callers, as it was
-/// into its one before a draw's rows were scored too.
+/// profile's tie band comes back. A profile's one stage, where its share
+/// is the whole sum, writes into `scores` itself, and its values and band
+/// are brought to the sum's own terms where they stand. Inlined into its
+/// two callers, as it was into its one before a draw's rows were scored
+/// too.
 #[inline(always)]
 fn combine(
     profile: &Profile,
@@ -910,6 +913,24 @@ fn combine(
     scores.resize(kept.len(), 0.0);
     if profile.scorers.is_empty() {
         return TieBand::NORMALIZED;
+    }
+    if let [weighted] = profile.scorers.as_slice() {
+        // One stage whose share is the whole sum writes the scores where
+        // they stand: each value and the band are the sum's own terms, a
+        // zero plus the stage's clamped value.
+        let weight = weighted.weight;
+        if weight > 0.0 && weight * (1.0 / weight) == 1.0 {
+            let stage_band = weighted.scorer.score(facts, candidates, kept, scores);
+            debug_assert!(
+                bandless(weighted, stage_band),
+                "{} orders nothing and returned a band",
+                weighted.scorer.name()
+            );
+            for sum in scores.iter_mut() {
+                *sum = 0.0 + sum.clamp(0.0, 1.0);
+            }
+            return TieBand(0.0 + stage_band.0.clamp(0.0, 1.0));
+        }
     }
     let total: f32 = profile.scorers.iter().map(|w| w.weight).sum();
     let norm = if total > 0.0 { 1.0 / total } else { 1.0 };
@@ -4196,10 +4217,11 @@ impl Engine {
     /// The table's half of a dispatch ([`Lifecycle::on_dispatched`]): the
     /// session pin follows the dispatched worker of the side, the decode
     /// of a pair target on the decode side and the target itself
-    /// otherwise. A host that keeps its own record of the pin reads the
-    /// table behind this half, and tells the stages last
-    /// ([`dispatched_stages`](Self::dispatched_stages)).
-    pub fn dispatched_key(&self, lease: &Lease, target: &Target, side: Side) {
+    /// otherwise. The controller keeps its own record of the pin: it reads
+    /// the table behind this half, and tells the stages last
+    /// ([`dispatched_stages`](Self::dispatched_stages)). The two halves
+    /// are the crate's own: a host tells a dispatch whole, by the trait.
+    pub(crate) fn dispatched_table(&self, lease: &Lease, target: &Target, side: Side) {
         let dispatched = match (side, target.pair) {
             (Side::Decode, Some(pair)) => pair.decode_id,
             _ => target.id,
@@ -4212,7 +4234,7 @@ impl Engine {
 
     /// The stages' half of a dispatch: each profile's scorers and its
     /// picker hear it.
-    pub fn dispatched_stages(
+    pub(crate) fn dispatched_stages(
         &self,
         lease: &Lease,
         target: &Target,
@@ -4248,7 +4270,7 @@ impl Lifecycle for Engine {
         side: Side,
         since_decision_micros: u32,
     ) {
-        self.dispatched_key(lease, target, side);
+        self.dispatched_table(lease, target, side);
         self.dispatched_stages(lease, target, side, since_decision_micros);
     }
 
@@ -7618,6 +7640,69 @@ mod tests {
             .all(|&s| (s - (0.75 * 0.5 + 0.25)).abs() < 1e-6));
     }
 
+    /// A profile of one stage whose share is the whole sum has that stage
+    /// write the scores where they stand, and each value and the band are
+    /// still the sum's own terms, bit for bit: a value past either end is
+    /// brought in, a negative zero reads as zero, and a weight whose share
+    /// of itself does not round to one scores through the sum.
+    #[test]
+    fn a_profile_of_one_stage_scores_as_the_sum_scores_it() {
+        /// The values a stage may write, some outside a score's range.
+        const GIVEN: [f32; 5] = [-0.0, 1.5, -3.0, 0.25, 1.0];
+        /// A scorer that writes [`GIVEN`] under a band outside the range.
+        #[derive(Debug)]
+        struct Given;
+        impl Lifecycle for Given {}
+        impl Scorer for Given {
+            fn name(&self) -> &'static str {
+                "given"
+            }
+            fn score(
+                &self,
+                _: &RequestFacts<'_>,
+                _: &[Candidate],
+                _: &[u32],
+                out: &mut [f32],
+            ) -> TieBand {
+                out.copy_from_slice(&GIVEN);
+                TieBand(2.0)
+            }
+        }
+        let pool: Vec<Candidate> = (0..5).map(|id| candidate(id, 1)).collect();
+        let kept = [0u32, 1, 2, 3, 4];
+        for weight in [1.0f32, 3.0, 41.0] {
+            let profile = Profile {
+                name: "one".into(),
+                filters: vec![],
+                scorers: vec![Weighted {
+                    scorer: Box::new(Given),
+                    weight,
+                }],
+                picker: Box::new(Best),
+            };
+            let (mut scores, mut stage) = (Vec::new(), Vec::new());
+            let band = combine(
+                &profile,
+                &RequestFacts::default(),
+                &pool,
+                &kept,
+                &mut scores,
+                &mut stage,
+            );
+            // The sum's own terms: a zero plus the stage's share of the
+            // value brought into range.
+            let share = weight * (1.0 / weight);
+            let term = |value: f32| (0.0 + share * value.clamp(0.0, 1.0)).to_bits();
+            let written: Vec<u32> = scores.iter().map(|score| score.to_bits()).collect();
+            let summed: Vec<u32> = GIVEN.iter().map(|&value| term(value)).collect();
+            assert_eq!(written, summed, "weight {weight}");
+            assert_eq!(band.0.to_bits(), term(2.0), "weight {weight}");
+        }
+        // The weights stand on both sides: the share of 41 is not one.
+        assert_eq!(3.0f32 * (1.0 / 3.0f32), 1.0);
+        assert_ne!(41.0f32 * (1.0 / 41.0f32), 1.0);
+    }
+
     const SESSIONS: SessionRule = SessionRule {
         assignment: Assignment::Delegate,
         inflight_cap: 2,
@@ -8133,6 +8218,31 @@ mod tests {
         );
         pool[0].health.healthy = true;
         assert_eq!(place_keyed(&engine, &pool, 7, 30).position, 0);
+    }
+
+    /// A pair's dispatch moves its key's pin to the worker of the side it
+    /// names: the pair's decode worker on the decode side, the target
+    /// itself on the prefill side.
+    #[test]
+    fn a_pairs_dispatch_pins_the_worker_of_its_side() {
+        let engine = session_engine(SESSIONS);
+        let target = Target {
+            id: WorkerId(3),
+            pair: Some(Pair {
+                decode_id: WorkerId(5),
+                ..Pair::default()
+            }),
+            ..Target::default()
+        };
+        let lease = |key| Lease {
+            session: session(key),
+            session_verdict: SessionVerdict::Pinned,
+            ..Lease::default()
+        };
+        engine.on_dispatched(&lease(7), &target, Side::Decode, 0);
+        engine.on_dispatched(&lease(8), &target, Side::Prefill, 0);
+        let pin = |key| engine.sessions.pins(session(key)).map(|pins| pins[0]);
+        assert_eq!((pin(7), pin(8)), (Some(WorkerId(5)), Some(WorkerId(3))));
     }
 
     /// Two bindings' rules share the engine's table, which sweeps at the
@@ -10060,6 +10170,72 @@ mod tests {
         assert_eq!(crate::view::LOOKS_BEHIND.with(std::cell::Cell::get), 0);
     }
 
+    /// The resident-work stage answers row by row, as the least-load stage
+    /// does, so a `best` that takes a sample draws under it: for a request
+    /// whose host names rows, over a pool of more than twice the sample and
+    /// of sixteen rows or more, the decision draws, and the stage costs the
+    /// rows drawn and the rows named among themselves. The row of least work
+    /// among the rows handed leads, so the pool's least row leads where the
+    /// sample reached it and not otherwise. A request that names no row
+    /// reads the pool whole, and there that row leads.
+    #[test]
+    fn a_sampled_best_draws_under_the_resident_work_stage() {
+        let engine = Engine::new(
+            vec![Profile {
+                name: "sampled".into(),
+                filters: vec![Box::new(Healthy)],
+                scorers: vec![Weighted {
+                    scorer: Box::new(crate::builtins::ResidentWork::new(0)),
+                    weight: 1.0,
+                }],
+                picker: Box::new(crate::builtins::SampledBest::new(4)),
+            }],
+            vec![Binding {
+                model: "m".into(),
+                profile: 0,
+                ..single_binding()
+            }],
+            1,
+            Needs::default(),
+        );
+        // Every row holds one request and reports its resident tokens, fewer
+        // the further its place: no two rows hold the same work, and the
+        // last row holds the least of the pool.
+        let pool: Vec<Candidate> = pool_of(64, |_| false)
+            .into_iter()
+            .map(|row| Candidate {
+                in_flight: 1,
+                load: Some(crate::view::LoadRow {
+                    running: 1,
+                    resident_tokens: 1_000 * (64 - row.position),
+                    resident_counted: true,
+                    ..crate::view::LoadRow::default()
+                }),
+                ..row
+            })
+            .collect();
+        let holders = [holding(20, 8)];
+        let mut led = 0;
+        for seed in 0..64u64 {
+            let got = drawn(&engine, &naming(seed, &holders), &pool);
+            assert!(got.trace().drew_first(), "seed {seed}: the decision drew");
+            let handed = positions(&got);
+            assert_eq!(
+                handed.first(),
+                handed.iter().max(),
+                "seed {seed}: the furthest of the rows handed leads"
+            );
+            led += u32::from(handed.first() == Some(&63));
+        }
+        assert!(
+            led < 32,
+            "the pool's least row led {led} of 64 decisions over a sample of four"
+        );
+        let whole = drawn(&engine, &request(1), &pool);
+        assert!(!whole.trace().drew_first(), "no row named: the pool whole");
+        assert_eq!(positions(&whole).first(), Some(&63));
+    }
+
     /// A host caps each list of rows it names at the picker's sample. Past
     /// it a decision reads dearer and is never wrong, so a debug build
     /// alone stops, by the assertion's own words.
@@ -10128,7 +10304,7 @@ mod tests {
             1,
             Needs::default(),
         );
-        // It says no sample: a host feeds such a profile a column.
+        // It says no sample: a stage that is not row-wise reads the pool whole.
         assert_eq!(engine.needs().sample, 0);
         let holders = [holding(3, 12)];
         let pool = pool_of(64, |_| false);

@@ -566,6 +566,7 @@ A stage is a Rust type that implements `Filter`, `Scorer` or `Picker`. You add i
 - A sessions rule under `pd-pair` or `epd`.
 - The `best-with-temperature` picker, and three settings of `prefix-affinity`: `decay`, `accounting_ttl_ms` and `spill.uncached_credit`.
 - The `bucket` scorer in the stock controller. The library runs it. The stock controller refuses a document that names it, because it does not yet report every request's end to a stage.
+- `prefix-affinity` with `source` set to `predictor` or `merged` in the stock controller. Both read the prefixes sent to each worker. The library validates them for a host that fills that column. The stock controller refuses a document that names either, because it does not yet record the prefixes it sent.
 - Cache events in the stock controller. Its `PushKvEvents` call is not served, and nothing else feeds its cache index. So `prefix-affinity` sees no worker as holding a prefix there. The library places by cache for a host that feeds the index.
 - Two more inputs in the stock controller. A worker's row has a circuit-breaker bit that nothing feeds yet, so `healthy` reads it as closed. A gateway's own breaker still counts: its breaker veto on its session takes the worker out of that gateway's decisions. A key's count of requests in flight is not fed, so `inflight_cap` passes no worker over.
 - A plugin named in the document. The format has no field for one.

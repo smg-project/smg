@@ -34,6 +34,7 @@ pub use rediscover_labels::RediscoverLabelsStep;
 pub use release_tokenizer::ReleaseTokenizerStep;
 pub use remove_from_policy_registry::RemoveFromPolicyRegistryStep;
 pub use remove_from_worker_registry::RemoveFromWorkerRegistryStep;
+use smg_worker::identity::{basic::Worker, endpoint::Endpoint};
 pub use submit_tokenizer_job::SubmitTokenizerJobStep;
 pub use update_policies_for_worker::UpdatePoliciesForWorkerStep;
 pub use update_remaining_policies::UpdateRemainingPoliciesStep;
@@ -42,13 +43,13 @@ use wfaas::{BackoffStrategy, RetryPolicy, StepDefinition, WorkflowDefinition};
 
 use crate::{
     app_context::AppContext,
-    worker::{identity::endpoint::Endpoint, Worker, WorkerRegistry},
+    routers::common::snapshot::WorkerRegistry,
     workflow::data::{WorkerRemovalWorkflowData, WorkerUpdateWorkflowData},
 };
 
 /// Find the registered workers a query address selects.
 ///
-/// Matching is on [`EndpointKey`](crate::worker::EndpointKey), so every spelling of one backend — bare
+/// Matching is on [`EndpointKey`](smg_worker::identity::endpoint::EndpointKey), so every spelling of one backend — bare
 /// `host:port`, any scheme, either IPv6 form — selects the same group. Two
 /// narrowings apply on top of the key:
 ///
@@ -297,7 +298,7 @@ fn single_attempt() -> RetryPolicy {
 #[cfg(test)]
 mod dp_removal_tests {
     use super::*;
-    use crate::worker::BasicWorkerBuilder;
+    use crate::routers::grpc::backend_client::BasicWorkerBuilder;
 
     fn register(registry: &WorkerRegistry, base: &str, rank: Option<usize>) {
         let builder = BasicWorkerBuilder::new(base);
@@ -484,6 +485,8 @@ mod dp_removal_tests {
 #[cfg(test)]
 mod tests {
     use llm_tokenizer::TokenizerRegistry;
+    use openai_protocol::model_card::ModelCard;
+    use smg_worker::identity::basic::ConnectionMode;
     use wfaas::{
         StepExecutor, StepId, StepResult, StepStatus, WorkflowContext, WorkflowEngine,
         WorkflowError, WorkflowId, WorkflowInstanceId, WorkflowResult, WorkflowState,
@@ -494,7 +497,7 @@ mod tests {
     use crate::{
         app_context::testing::app_context_for_tests,
         config::RouterConfig,
-        worker::{BasicWorkerBuilder, ConnectionMode, ModelCard},
+        routers::grpc::backend_client::BasicWorkerBuilder,
         workflow::tokenizer_registration::{
             create_tokenizer_workflow_data, test_support::tokenizer_dir, LoadTokenizerStep,
             TokenizerConfigRequest,

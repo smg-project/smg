@@ -3,14 +3,12 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
+use smg_worker::identity::endpoint::Endpoint;
 use tracing::debug;
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use super::find_workers_by_url;
-use crate::{
-    worker::identity::endpoint::Endpoint,
-    workflow::data::{require_app_context, WorkerRemovalWorkflowData},
-};
+use crate::workflow::data::{require_app_context, WorkerRemovalWorkflowData};
 
 /// Request structure for worker removal.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

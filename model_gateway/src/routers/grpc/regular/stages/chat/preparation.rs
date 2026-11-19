@@ -8,24 +8,22 @@ use openai_protocol::{
 };
 use tracing::{error, warn};
 
-use crate::{
-    routers::{
-        error,
-        grpc::{
-            context::{PreparationOutput, RequestContext},
-            multimodal,
-            regular::{
-                stages::{
-                    reading,
-                    rendered_prompt::{prepare_rendered_prompt, RenderedPrompt},
-                    token_ids,
-                },
-                symphony,
+use crate::routers::{
+    common::snapshot::RoutingPool,
+    error,
+    grpc::{
+        context::{PreparationOutput, RequestContext},
+        multimodal,
+        regular::{
+            stages::{
+                reading,
+                rendered_prompt::{prepare_rendered_prompt, RenderedPrompt},
+                token_ids,
             },
-            utils, ProcessedMessages,
+            symphony,
         },
+        utils, ProcessedMessages,
     },
-    worker::RoutingPool,
 };
 
 /// Chat preparation stage

@@ -3,18 +3,20 @@
 use std::{collections::HashMap, time::Duration};
 
 use async_trait::async_trait;
+use openai_protocol::UNKNOWN_MODEL_ID;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use smg_worker::identity::{
+    basic::ConnectionMode,
+    endpoint::Endpoint,
+    sampling_defaults::{SamplingDefaults, DEFAULT_SAMPLING_PARAMS_LABEL},
+};
 use tool_parser::GrammarStart;
 use tracing::{debug, warn};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use crate::{
     routers::grpc::client::{flat_labels, GrpcClient},
-    worker::{
-        identity::{endpoint::Endpoint, sampling_defaults::SamplingDefaults},
-        ConnectionMode, DEFAULT_SAMPLING_PARAMS_LABEL, UNKNOWN_MODEL_ID,
-    },
     workflow::{
         data::{WorkerKind, WorkerWorkflowData},
         steps::{
@@ -953,7 +955,7 @@ mod tests {
     #[tokio::test]
     async fn an_engine_that_refuses_the_connection_leaves_registration_empty_and_fails_a_strict_read(
     ) {
-        use crate::worker::test_support::RefusedAddress;
+        use smg_worker::test_support::RefusedAddress;
 
         let refused = RefusedAddress::reserve();
         let base = refused.http_url();
@@ -1148,7 +1150,7 @@ mod tests {
     /// named, strict or not.
     #[tokio::test]
     async fn an_engine_that_refuses_the_connection_fails_the_grpc_read_at_the_dial() {
-        use crate::worker::test_support::RefusedAddress;
+        use smg_worker::test_support::RefusedAddress;
 
         let refused = RefusedAddress::reserve();
         let url = format!("grpc://{}", refused.addr());
@@ -1331,7 +1333,7 @@ mod tests {
     /// ends with the request URL, the query kept.
     #[tokio::test]
     async fn a_refused_connection_goes_without_the_clients_url() {
-        use crate::worker::test_support::RefusedAddress;
+        use smg_worker::test_support::RefusedAddress;
 
         let refused = RefusedAddress::reserve();
         let url = format!("{}?token=s3cret", refused.http_url());

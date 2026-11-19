@@ -23,12 +23,8 @@ use llm_tokenizer::{
     Decoder, Encoder, Encoding, MockTokenizer, SpecialTokens,
 };
 use openai_protocol::completion::CompletionRequest;
-use smg::{
-    middleware::TenantRequestMeta,
-    routers::RouterTrait,
-    tenant::TenantKey,
-    worker::{RuntimeType, WorkerType},
-};
+use smg::{middleware::TenantRequestMeta, routers::RouterTrait, tenant::TenantKey};
+use smg_worker::identity::basic::{RuntimeType, WorkerType};
 
 use crate::common;
 

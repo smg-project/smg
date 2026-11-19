@@ -8,14 +8,12 @@
 //! so installing the global Prometheus recorder here does not collide with
 //! other suites.
 
-use smg::{
-    observability::{
-        metrics::{init_startup_series, start_prometheus, PrometheusConfig},
-        metrics_server::start_metrics_server,
-    },
-    worker::{CircuitBreaker, CircuitBreakerConfig},
+use smg::observability::{
+    metrics::{init_startup_series, start_prometheus, PrometheusConfig},
+    metrics_server::start_metrics_server,
 };
 use smg_test_harness::test_app::scrape;
+use smg_worker::health::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 
 /// The rendered sample of `family` whose label set contains every pair in
 /// `labels`, as `(line, value)`.

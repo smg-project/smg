@@ -4,12 +4,12 @@ use std::{collections::HashSet, sync::Arc};
 
 use async_trait::async_trait;
 use llm_tokenizer::{registry::TokenizerEntry, LoadOutcome};
+use smg_worker::identity::basic::Worker;
 use tracing::{debug, info, warn};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use crate::{
     app_context::AppContext,
-    worker::Worker,
     workflow::data::{require_app_context, WorkerRemovalWorkflowData},
 };
 
@@ -221,6 +221,8 @@ mod tests {
 
     use llm_multimodal::PreProcessorConfig;
     use llm_tokenizer::{mock::MockTokenizer, traits::Tokenizer, LoadOutcome, TokenizerRegistry};
+    use openai_protocol::model_card::ModelCard;
+    use smg_worker::identity::basic::{ConnectionMode, Worker};
     use tokio::sync::Notify;
     use wfaas::{StepExecutor, WorkflowContext, WorkflowInstanceId};
 
@@ -228,8 +230,10 @@ mod tests {
     use crate::{
         app_context::{testing::app_context_for_tests, AppContext},
         config::RouterConfig,
-        routers::grpc::multimodal::MultimodalModelConfig,
-        worker::{BasicWorkerBuilder, ConnectionMode, ModelCard, Worker, WorkerRegistry},
+        routers::{
+            common::snapshot::WorkerRegistry,
+            grpc::{backend_client::BasicWorkerBuilder, multimodal::MultimodalModelConfig},
+        },
         workflow::{
             data::WorkerRemovalWorkflowData,
             steps::local::{

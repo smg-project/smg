@@ -519,7 +519,11 @@ def sha256_of(path: Path) -> str:
 ELF_SECTION_FIELDS = ((0x28, 0x30), (0x3A, 0x40))
 # The sizes of the file header and of one program header of a 64-bit ELF file.
 ELF_EHDR, ELF_PHDR = 64, 56
-PT_LOAD, PT_NOTE, NT_GNU_BUILD_ID = 1, 4, 3
+PT_LOAD, PT_INTERP, PT_NOTE, PT_GNU_PROPERTY, NT_GNU_BUILD_ID = 1, 3, 4, 0x6474E553, 3
+# The program headers whose bytes a loader reads from the file itself: the interpreter's path
+# and the notes, of which the property note has a header of its own. A run reads what any
+# other header names from memory, as the loadable segments map it.
+READ_FROM_FILE = (PT_INTERP, PT_NOTE, PT_GNU_PROPERTY)
 
 
 def image_of(path: Path) -> str | None:
@@ -527,7 +531,10 @@ def image_of(path: Path) -> str | None:
     program headers and the file bytes of every loadable segment, with the build id and the
     header's section-table fields left out. Those follow what no run reads: symbol names and
     debug sections. None for any other file, for one whose headers do not add up, and for one
-    whose file header no loadable segment covers: its entry address would go unread."""
+    whose file header, interpreter's path or notes do not lie whole inside one loadable
+    segment: a loader reads those from the file, and the image would not hold them. A header
+    of any other kind may name more file bytes than its segment holds, as the range made
+    read-only after relocation does in some linked files: no loader reads them from the file."""
     data = bytearray(path.read_bytes())
     if len(data) < ELF_EHDR or data[:6] != b"\x7fELF\x02\x01":
         return None
@@ -538,13 +545,15 @@ def image_of(path: Path) -> str | None:
     table = bytes(data[phoff : phoff + phnum * ELF_PHDR])
     for start, end in ELF_SECTION_FIELDS:
         data[start:end] = bytes(end - start)
-    loads = []
+    loads, spans = [], [(0, ELF_EHDR)]
     for n in range(phnum):
         kind, _, offset, _, _, filesz, _, _ = struct.unpack_from("<IIQQQQQQ", table, n * ELF_PHDR)
         if offset + filesz > len(data):
             return None
         if kind == PT_LOAD:
             loads.append((offset, filesz))
+        elif kind in READ_FROM_FILE and filesz:
+            spans.append((offset, filesz))
         at, end = offset, offset + filesz
         while kind == PT_NOTE and at + 12 <= end:
             namesz, descsz, note = struct.unpack_from("<III", data, at)
@@ -554,8 +563,9 @@ def image_of(path: Path) -> str | None:
             if note == NT_GNU_BUILD_ID and data[at + 12 : at + 12 + namesz] == b"GNU\x00":
                 data[desc : desc + descsz] = bytes(descsz)
             at = desc + (descsz + 3) // 4 * 4
-    if not any(offset == 0 and filesz >= ELF_EHDR for offset, filesz in loads):
-        return None
+    for offset, filesz in spans:
+        if not any(at <= offset and offset + filesz <= at + size for at, size in loads):
+            return None
     digest = hashlib.sha256(table)
     for offset, filesz in loads:
         digest.update(data[offset : offset + filesz])

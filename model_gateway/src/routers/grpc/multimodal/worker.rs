@@ -20,6 +20,7 @@ use llm_multimodal::{
 use llm_tokenizer::TokenizerTrait;
 use openai_protocol::worker::MmProcessingMode;
 use smg_grpc_client::{sglang_proto as sglang, vllm_proto as vllm, WorkerMediaFault};
+use smg_worker::{connection::http_client::build_with, identity::basic::RuntimeType};
 use tracing::{info, warn};
 
 use super::{
@@ -36,10 +37,7 @@ use super::{
     process::process_multimodal_plan,
     RegistryTokenizer,
 };
-use crate::{
-    routers::grpc::proto_wrapper::vllm_mm_identity,
-    worker::{connection::http_client::build_with, RuntimeType},
-};
+use crate::routers::grpc::proto_wrapper::vllm_mm_identity;
 
 /// A worker serves one model: the config registry's one key.
 const CONFIG_KEY: &str = "worker";

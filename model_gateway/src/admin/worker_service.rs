@@ -17,22 +17,21 @@ use openai_protocol::worker::{
 };
 use serde_json::json;
 use smg_auth::AuditResource;
+use smg_worker::{
+    health::manager::MAX_PROBE_DELAY,
+    identity::{
+        basic::{merge_labels, worker_to_info, Worker, WorkerType},
+        endpoint::Endpoint,
+    },
+    registry::WorkerId,
+};
 use tracing::warn;
 
 use crate::{
     config::{unused_credentials_warning, validate_worker_url, RouterConfig},
     observability::log_format::has_control_character,
-    routers::provider_support,
+    routers::{common::snapshot::WorkerRegistry, provider_support},
     service_discovery::{DISCOVERY_LABEL_PREFIX, DISCOVERY_PROVIDER_LABEL},
-    worker::{
-        health::manager::MAX_PROBE_DELAY,
-        identity::{
-            basic::{merge_labels, worker_to_info},
-            endpoint::Endpoint,
-        },
-        registry::WorkerId,
-        Worker, WorkerRegistry, WorkerType,
-    },
     workflow::{steps::local::find_workers_by_url, Job, JobQueue, WorkerRegistrationMode},
 };
 
@@ -1042,12 +1041,12 @@ impl WorkerService {
 #[cfg(test)]
 mod tests {
     use openai_protocol::model_card::ModelCard;
+    use smg_worker::identity::basic::WorkerType;
 
     use super::*;
     use crate::{
         app_context::testing::app_context_for_tests,
-        worker::{BasicWorkerBuilder, WorkerType},
-        workflow::JobQueueConfig,
+        routers::grpc::backend_client::BasicWorkerBuilder, workflow::JobQueueConfig,
     };
 
     fn make_service(registry: Arc<WorkerRegistry>) -> WorkerService {

@@ -192,6 +192,15 @@ fn subscriber_capacity_for_prefix(prefix: &str) -> usize {
     }
 }
 
+/// Panics, at its caller's line, when `key` is outside a namespace's prefix.
+#[track_caller]
+fn assert_key_in_prefix(key: &str, prefix: &str) {
+    assert!(
+        key.starts_with(prefix),
+        "key '{key}' does not match prefix '{prefix}'"
+    );
+}
+
 // ============================================================================
 // CrdtNamespace
 // ============================================================================
@@ -209,11 +218,7 @@ impl CrdtNamespace {
     /// Insert or update a key-value pair. The key must start with this
     /// namespace's prefix.
     pub fn put(&self, key: &str, value: Vec<u8>) {
-        assert!(
-            key.starts_with(&self.prefix),
-            "key '{key}' does not match prefix '{}'",
-            self.prefix
-        );
+        assert_key_in_prefix(key, &self.prefix);
         self.store.insert(key.to_string(), value);
         // Notify with the canonical post-insert value (matching `get`), not the
         // raw caller payload: for normalizing engines (e.g. `rl:`) the stored
@@ -226,11 +231,7 @@ impl CrdtNamespace {
 
     /// Get the current value for a key, or None if not present or tombstoned.
     pub fn get(&self, key: &str) -> Option<Vec<u8>> {
-        assert!(
-            key.starts_with(&self.prefix),
-            "key '{key}' does not match prefix '{}'",
-            self.prefix
-        );
+        assert_key_in_prefix(key, &self.prefix);
         self.store.get(key)
     }
 
@@ -238,11 +239,7 @@ impl CrdtNamespace {
     /// and wins by higher version. Actual removal happens after GC grace period.
     /// Subscribers receive `(key, None)` to indicate deletion.
     pub fn delete(&self, key: &str) {
-        assert!(
-            key.starts_with(&self.prefix),
-            "key '{key}' does not match prefix '{}'",
-            self.prefix
-        );
+        assert_key_in_prefix(key, &self.prefix);
         self.store.remove(key);
         self.subscriber_registry.notify(key, None);
     }
@@ -306,11 +303,7 @@ impl StreamNamespace {
             "publish_to() is only valid on Targeted namespaces, not Broadcast (prefix: '{}')",
             self.prefix
         );
-        assert!(
-            key.starts_with(&self.prefix),
-            "key '{key}' does not match prefix '{}'",
-            self.prefix
-        );
+        assert_key_in_prefix(key, &self.prefix);
         let value_len = value.len();
         let mut buf = self.targeted_buffer.lock();
         buf.push_back((peer_id.to_string(), key.to_string(), value));

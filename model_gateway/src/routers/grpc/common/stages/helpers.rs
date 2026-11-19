@@ -16,6 +16,10 @@ use smg_grpc_client::{
     sglang_proto::{self, DisaggregatedParams},
     tokenspeed_proto, vllm_proto,
 };
+use smg_worker::identity::{
+    basic::{Worker, DEFAULT_BOOTSTRAP_PORT},
+    sampling_defaults::{SamplingDefaults, DEFAULT_SAMPLING_PARAMS_LABEL},
+};
 use tool_parser::{GrammarStart, ParserFactory as ToolParserFactory};
 use tracing::{debug, error, warn};
 
@@ -38,10 +42,6 @@ use crate::{
             proto_wrapper::{AnswerConstraint, MultimodalData, ProtoGenerateRequest},
             utils,
         },
-    },
-    worker::{
-        identity::sampling_defaults::SamplingDefaults, Worker, DEFAULT_BOOTSTRAP_PORT,
-        DEFAULT_SAMPLING_PARAMS_LABEL,
     },
 };
 

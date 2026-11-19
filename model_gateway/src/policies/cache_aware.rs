@@ -110,6 +110,11 @@ use parking_lot::RwLock;
 use rand::RngExt;
 use rustc_hash::FxBuildHasher;
 use serde::{Deserialize, Serialize};
+use smg_worker::{
+    health::liveness,
+    identity::{basic::Worker, endpoint::Endpoint},
+    load::state::{LoadReceiver, LoadSnapshot},
+};
 use tracing::{debug, error, warn};
 
 use super::{
@@ -126,12 +131,7 @@ use crate::{
     config::CacheIndexKind,
     mesh::adapters::tree_sync::{RepairEntry, TreeDelta, TreeRepairPage, TreeSyncAdapter},
     observability::{cache_trace, metrics::Metrics},
-    worker::{
-        health::liveness,
-        identity::endpoint::Endpoint,
-        load::state::{LoadReceiver, LoadSnapshot},
-        KvEventMonitor, KvIndex, Worker,
-    },
+    policies::kv_index::{event_monitor::KvEventMonitor, index_backend::KvIndex},
 };
 
 /// An overlap of at most this many blocks counts as a miss for the warm-up

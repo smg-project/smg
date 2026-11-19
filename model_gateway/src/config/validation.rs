@@ -5,21 +5,15 @@ use std::{
 
 use axum::http::{HeaderName, HeaderValue, Uri};
 use sha2::{Digest, Sha256};
+use smg_worker::identity::{
+    basic::ConnectionMode,
+    endpoint::{Endpoint, EndpointError, Host as EndpointHost, Scheme},
+    metadata::join_base,
+};
 use tokio::sync::Semaphore;
 
 use super::*;
-use crate::{
-    middleware::scheduler,
-    policies::cost as selection_cost,
-    tenant::MAX_TENANT_ID_LEN,
-    worker::{
-        identity::{
-            endpoint::{Endpoint, EndpointError, Host as EndpointHost, Scheme},
-            metadata::join_base,
-        },
-        ConnectionMode,
-    },
-};
+use crate::{middleware::scheduler, policies::cost as selection_cost, tenant::MAX_TENANT_ID_LEN};
 
 /// The credential header names `routing_key_override.headers` may not carry
 /// (see [`ConfigValidator::validate_routing_key_headers`]). The policy

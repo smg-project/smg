@@ -7,6 +7,17 @@ use openai_protocol::{
     model_card::ModelCard,
     model_type::ModelType,
     worker::{ConstrainedDecoding, HealthCheckConfig, MmProcessingMode, WorkerSpec, WorkerType},
+    UNKNOWN_MODEL_ID,
+};
+use smg_worker::{
+    health::{circuit_breaker::CircuitBreakerConfig, resilience::resolve_resilience},
+    identity::{
+        basic::{
+            merge_labels, ConnectionMode, RuntimeType, Worker, CONTEXT_WINDOW_LABELS, WINDOW_LABELS,
+        },
+        endpoint::Endpoint,
+        metadata::join_base,
+    },
 };
 use tracing::{debug, warn};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
@@ -15,25 +26,20 @@ use super::discover_dp::DpInfo;
 use crate::{
     admin::worker_service::{control_character_refusal, logged_strings},
     config::ParserChoice,
-    routers::grpc::{
-        multimodal::{
-            mm_settings, pool_processes_media_refs, registration_lacks_media_processing,
-            SUPPORTS_VISION_LABEL,
+    routers::{
+        common::snapshot::WorkerRegistry,
+        grpc::{
+            backend_client::BasicWorkerBuilder,
+            multimodal::{
+                mm_settings, pool_processes_media_refs, registration_lacks_media_processing,
+                SUPPORTS_VISION_LABEL,
+            },
+            regular::symphony::{
+                check_names, labels_select_nothing, set_aside_by_the_registry, table_label_read,
+            },
+            utils::{ModelNames, Names},
+            zmq_client::zmq_handshake_address,
         },
-        regular::symphony::{
-            check_names, labels_select_nothing, set_aside_by_the_registry, table_label_read,
-        },
-        utils::{ModelNames, Names},
-        zmq_client::zmq_handshake_address,
-    },
-    worker::{
-        health::{circuit_breaker::CircuitBreakerConfig, resilience::resolve_resilience},
-        identity::{
-            basic::{merge_labels, RuntimeType, CONTEXT_WINDOW_LABELS, WINDOW_LABELS},
-            endpoint::Endpoint,
-            metadata::join_base,
-        },
-        BasicWorkerBuilder, ConnectionMode, Worker, WorkerRegistry, UNKNOWN_MODEL_ID,
     },
     workflow::data::{WorkerKind, WorkerRegistrationMode, WorkerWorkflowData},
 };
@@ -356,7 +362,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
                 // Promotion can be event-driven: a ZMQ worker signals the
                 // manager the instant its handshake completes, and any worker
                 // demoted by health is signalled on its first successful
-                // contact (see `worker::health::liveness`), so every worker gets the
+                // contact (see `smg_worker::health::liveness`), so every worker gets the
                 // registry's connect signal.
                 builder =
                     builder.connect_signal_tx(app_context.worker_registry.connect_signal_sender());
@@ -1164,15 +1170,11 @@ fn validate_zmq_dp(
 
 #[cfg(test)]
 mod tests {
+    use smg_worker::{identity::basic::DEFAULT_BOOTSTRAP_PORT, test_support::RefusedAddress};
     use tracing_test::traced_test;
 
     use super::*;
-    use crate::{
-        app_context::AppContext,
-        config::RouterConfig,
-        server::http_client,
-        worker::{test_support::RefusedAddress, DEFAULT_BOOTSTRAP_PORT},
-    };
+    use crate::{app_context::AppContext, config::RouterConfig, server::http_client};
 
     /// The parser-override warning skips the worker itself when it is replaced
     /// at an address registered with a trailing slash: the registry's key keeps
@@ -2713,11 +2715,11 @@ mod rank_window_tests {
     use std::collections::HashMap;
 
     use smg_grpc_client::tokenspeed_proto;
+    use smg_worker::identity::basic::{merge_labels, ConnectionMode, Worker};
 
     use super::{dp_rank_expansion, labels_for_rank};
     use crate::{
-        routers::grpc::client::ServerInfo,
-        worker::{identity::basic::merge_labels, BasicWorkerBuilder, ConnectionMode, Worker},
+        routers::grpc::{backend_client::BasicWorkerBuilder, client::ServerInfo},
         workflow::steps::local::{discover_dp::dp_info_from_labels, test_support::labels_of},
     };
 

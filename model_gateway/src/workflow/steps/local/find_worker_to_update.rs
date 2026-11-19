@@ -1,14 +1,12 @@
 //! Step to find a worker to update based on URL.
 
 use async_trait::async_trait;
+use smg_worker::{identity::endpoint::Endpoint, registry::WorkerId};
 use tracing::debug;
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use super::find_workers_by_url;
-use crate::{
-    worker::{identity::endpoint::Endpoint, registry::WorkerId},
-    workflow::data::{require_app_context, WorkerUpdateWorkflowData},
-};
+use crate::workflow::data::{require_app_context, WorkerUpdateWorkflowData};
 
 /// Step to find workers to update based on URL.
 ///

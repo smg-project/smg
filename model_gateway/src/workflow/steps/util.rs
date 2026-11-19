@@ -5,14 +5,12 @@ use std::{future::Future, time::Duration};
 use futures::stream::{FuturesUnordered, StreamExt};
 use reqwest::Client;
 use smg_grpc_client::connect_channel_with_timeout;
-
 // The gRPC base URL stands beside the address type, where the worker module
 // reads it too; its path here is kept for the steps.
-pub(crate) use crate::worker::identity::endpoint::grpc_base_url;
-use crate::{
-    routers::grpc::client::{GrpcClient, HealthCheckResponse},
-    worker::identity::endpoint::{strip_protocol, strip_scheme, Endpoint},
-};
+pub(crate) use smg_worker::identity::endpoint::grpc_base_url;
+use smg_worker::identity::endpoint::{strip_protocol, strip_scheme, Endpoint};
+
+use crate::routers::grpc::client::{GrpcClient, HealthCheckResponse};
 
 /// The scheme `url` starts with, lowercased: a word of scheme characters
 /// (RFC 3986's, a digit or a sign first too, and the empty word) before a
@@ -296,8 +294,10 @@ mod tests {
         },
     };
 
+    use smg_worker::test_support::RefusedAddress;
+
     use super::*;
-    use crate::{server::http_client, worker::test_support::RefusedAddress};
+    use crate::server::http_client;
 
     struct DropFlag(Arc<AtomicBool>);
 

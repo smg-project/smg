@@ -7,7 +7,9 @@ use k8s_openapi::{
     apimachinery::pkg::apis::meta::v1::ObjectMeta,
 };
 
-use crate::{app_context::AppContext, server::http_client, worker::WorkerRegistry};
+use crate::{
+    app_context::AppContext, routers::common::snapshot::WorkerRegistry, server::http_client,
+};
 
 /// An `AppContext` with an uninitialized worker job queue: submitted jobs are
 /// accepted and queued but never processed, so tests observe what discovery

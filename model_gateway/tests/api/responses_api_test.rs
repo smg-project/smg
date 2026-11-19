@@ -15,8 +15,8 @@ use smg::{
     endpoints::conversations,
     routers::RouterFactory,
     tenant::{RouteRequestMeta, TenantKey},
-    worker::test_support::RefusedAddress,
 };
+use smg_worker::test_support::RefusedAddress;
 
 use crate::common::{
     create_test_context, create_test_context_with_mcp_config,

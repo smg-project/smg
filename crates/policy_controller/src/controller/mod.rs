@@ -353,8 +353,10 @@ impl Controller {
         // completion or release, and the dispatch deadline or an answer
         // that does not leave of its end; no line tells one of a lease
         // that left with its gateway yet: a stage that needs the calls is
-        // refused by name, never run on state half kept.
-        let catalog = Arc::new(catalog.without_lifecycle());
+        // refused by name, never run on state half kept. Nothing here
+        // records the prefixes a worker was sent either: a prefix-affinity
+        // source that reads them is refused by its field.
+        let catalog = Arc::new(catalog.without_lifecycle().without_sent_prefixes());
         let mut listeners = Vec::with_capacity(config.listeners.len());
         for listener in &config.listeners {
             let name = listener.name.clone();
@@ -1235,7 +1237,7 @@ mod tests {
 
     use super::{
         config::tests::valid,
-        deciders::{tests as bed, TERM_MARK},
+        deciders::tests as bed,
         election::{self, Standing},
         following,
         membership::tests::Logged,
@@ -1246,6 +1248,7 @@ mod tests {
         Error, NoFollow, Scope,
     };
     use crate::{
+        door::TERM_MARK,
         elector::{
             ElectError, ElectionSettings, Elector, LeaseBackend, LeaseRecord, MemoryLease, Tick,
             Written,
@@ -1447,6 +1450,38 @@ mod tests {
             }
             terms.dedup();
             assert_eq!(terms, [1, 2], "the term of the mark, then the next");
+            stop.send(()).expect("the serve waits for its stop");
+        };
+        let (served, ()) = timeout(Duration::from_secs(60), async { tokio::join!(serve, case) })
+            .await
+            .expect("the serve ends at its stop");
+        served.expect("a serve that leaves by its signal");
+    }
+
+    /// The serve starts the restores' clock: a restore whose stream took no
+    /// part for a minute is let go at the clock's next beat, with no look
+    /// of that stream and no restore behind it.
+    #[tokio::test]
+    async fn a_served_controller_lets_a_stalled_restore_go_by_its_clock() {
+        let controller = Controller::bind(valid()).await.expect("the listeners bind");
+        let shared = Arc::clone(&controller.shared);
+        let (stop, stopped) = oneshot::channel::<()>();
+        let serve = controller.serve(async {
+            let _ = stopped.await;
+        });
+        let case = async {
+            let (wait, begun) = (Duration::from_secs(20), Instant::now());
+            // A restore held since a minute ago: no stream looks at it and
+            // no restore comes behind it.
+            let since = begun
+                .checked_sub(Duration::from_secs(60))
+                .expect("the clock is past its first minute");
+            shared.replication.stalled_since(since);
+            assert_eq!(shared.replication.held(), 1);
+            while shared.replication.held() != 0 {
+                assert!(begun.elapsed() < wait, "the clock let nothing go");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
             stop.send(()).expect("the serve waits for its stop");
         };
         let (served, ()) = timeout(Duration::from_secs(60), async { tokio::join!(serve, case) })
@@ -1690,6 +1725,55 @@ mod tests {
             teller.join_next().await.is_some(),
             "the teller ends at the stop"
         );
+    }
+
+    /// The role's teller sleeps to the fence's turn. A leader whose
+    /// renewals stop is fenced one renew deadline after the last of them,
+    /// by the clock alone: no step of the election stands there, and the
+    /// role is told at that instant all the same.
+    #[tokio::test]
+    async fn the_role_is_told_where_the_clock_alone_closes_the_fence() {
+        let settings = ElectionSettings {
+            duration: Duration::from_millis(1500),
+            renew_period: Duration::from_millis(100),
+            renew_deadline: Duration::from_millis(500),
+        };
+        let mut elector = Elector::alone("controller-0@127.0.0.1:1", settings)
+            .expect("the settings are in order");
+        let (steps, stepped) = watch::channel(Standing::default());
+        let (phase, readiness) =
+            readiness::channel(elector.fence(), stepped, Arc::new(Lag::new(Duration::ZERO)));
+        let (_stop, stopped) = watch::channel(false);
+        let (told, mut role) = watch::channel(false);
+        let mut teller = JoinSet::new();
+        teller.spawn(tell_role(readiness, stopped, Vec::new(), told));
+        let mut told_as = async |leads: bool| {
+            let reached =
+                timeout(Duration::from_secs(5), role.wait_for(|told| *told == leads)).await;
+            assert!(
+                matches!(reached, Ok(Ok(_))),
+                "the role was not told as {leads}"
+            );
+        };
+
+        // The take, and two renewals ahead of the clock, each just short of
+        // the deadline the one before it stamped: the fence stays open a
+        // second and a half from here, so the step's telling needs no
+        // narrow window.
+        phase.send_replace(Phase::Serving);
+        let taken = Instant::now();
+        assert!(matches!(elector.tick(taken), Ok(Tick::Acquired { .. })));
+        let mut renewed = taken;
+        for _ in 0..2 {
+            renewed += settings.renew_deadline - Duration::from_millis(10);
+            assert!(matches!(elector.tick(renewed), Ok(Tick::Renewed { .. })));
+        }
+        steps.send_replace(Standing::default());
+        told_as(true).await;
+        // No renewal and no step from here: the clock closes the fence one
+        // renew deadline after the last renewal, and the teller says so.
+        told_as(false).await;
+        assert_eq!(elector.fence().leader_term(Instant::now()), None);
     }
 
     /// A step that finds the leader standing tells the watches nothing: the

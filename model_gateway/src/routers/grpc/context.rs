@@ -23,6 +23,7 @@ use openai_protocol::{
 };
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use smg_grpc_client::RequestDeadline;
+use smg_worker::identity::basic::{RuntimeType, Worker, WorkerLoadGuard};
 use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::{debug, error};
 
@@ -61,12 +62,11 @@ use crate::{
     routers::{
         common::{
             attempt_ledger::AttemptLedger, pd_admission::PdAdmissionGuard,
-            prefill_admission::PrefillLoadGuard, sse::SseSender,
+            prefill_admission::PrefillLoadGuard, snapshot::WorkerRegistry, sse::SseSender,
         },
         error::internal_error,
         grpc::regular::symphony::{template::Templates, PreparedConstraint},
     },
-    worker::{RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry},
     workflow::TokenizerLoadFailures,
 };
 
@@ -1995,7 +1995,9 @@ mod tests {
     /// prefill worker to gRPC.
     #[test]
     fn a_disaggregated_selections_wire_is_the_prefill_sides() {
-        use crate::worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerType};
+        use smg_worker::identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType};
+
+        use crate::routers::grpc::backend_client::BasicWorkerBuilder;
 
         let worker = |url: &str, mode: ConnectionMode, role: WorkerType| -> Arc<dyn Worker> {
             Arc::new(
@@ -2074,7 +2076,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_missing_worker_selection_is_one_failure_whichever_stage_reads_it() {
-        use crate::worker::{BasicWorkerBuilder, WorkerType};
+        use smg_worker::identity::basic::WorkerType;
+
+        use crate::routers::grpc::backend_client::BasicWorkerBuilder;
 
         let mut slot: Option<WorkerSelection> = None;
         let failure = failure_of(stage_output(slot.as_ref(), "a_stage"));
@@ -2165,7 +2169,9 @@ mod tests {
 
     #[test]
     fn disaggregated_load_guards_hold_decode_only() {
-        use crate::worker::{BasicWorkerBuilder, WorkerType};
+        use smg_worker::identity::basic::WorkerType;
+
+        use crate::routers::grpc::backend_client::BasicWorkerBuilder;
 
         let prefill: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("grpc://prefill-load")
@@ -2193,9 +2199,10 @@ mod tests {
 
     #[tokio::test]
     async fn batch_prompts_preserve_phase_load_semantics() {
-        use crate::{
-            routers::common::prefill_admission::PrefillAdmission,
-            worker::{BasicWorkerBuilder, WorkerType},
+        use smg_worker::identity::basic::WorkerType;
+
+        use crate::routers::{
+            common::prefill_admission::PrefillAdmission, grpc::backend_client::BasicWorkerBuilder,
         };
 
         let prefill: Arc<dyn Worker> = Arc::new(
@@ -2461,7 +2468,9 @@ mod tests {
 
     #[test]
     fn load_guards_report_completion_for_each_side_they_hold() {
-        use crate::worker::{BasicWorkerBuilder, RequestCompletionSink, WorkerType};
+        use smg_worker::identity::basic::{RequestCompletionSink, WorkerType};
+
+        use crate::routers::grpc::backend_client::BasicWorkerBuilder;
         #[derive(Debug, Default)]
         struct CompletionSpy(std::sync::Mutex<Vec<String>>);
         impl RequestCompletionSink for CompletionSpy {

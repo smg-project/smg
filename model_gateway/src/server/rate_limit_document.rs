@@ -280,9 +280,8 @@ mod tests {
         app_context::AppContext,
         config::RouterConfig,
         policies::PolicyRegistry,
-        routers::gateway::Gateway,
+        routers::{common::snapshot::WorkerRegistry, gateway::Gateway},
         server::{health::ProbeState, http_client},
-        worker::WorkerRegistry,
     };
 
     const START: &str = "default_policy:\n  tokens_per_minute: 1000\n  requests_per_minute: 60\ntenants:\n  - tenant_key: auth:team-red\n    tokens_per_minute: 500\n    requests_per_minute: 30\n";

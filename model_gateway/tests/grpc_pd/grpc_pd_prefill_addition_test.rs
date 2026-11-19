@@ -13,10 +13,10 @@ use smg::{
     app_context::AppContext,
     config::{PolicyConfig, RouterConfig, RoutingMode},
     middleware::TenantRequestMeta,
-    routers::{RouterFactory, RouterTrait},
+    routers::{grpc::backend_client::BasicWorkerBuilder, RouterFactory, RouterTrait},
     tenant::TenantKey,
-    worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerType},
 };
+use smg_worker::identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType};
 use tokio::net::TcpListener;
 
 use super::prefill_worker_for;

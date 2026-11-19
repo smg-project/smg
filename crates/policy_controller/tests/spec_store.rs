@@ -458,8 +458,9 @@ fn a_start_that_names_no_spec_source_is_refused_naming_both_flags() {
 
 /// A start the store refuses exits with the refusal in its log: beside a
 /// spec file, by the two flags; beside a lease another replica can take; on
-/// a path that leads to no directory; and on a newest generation that does
-/// not run, by its number and its field. Nothing is served.
+/// a path that leads to no directory, to nothing or through a file; and on
+/// a newest generation that does not run, by its number and its field.
+/// Nothing is served.
 #[test]
 fn a_start_a_spec_store_refuses_exits_naming_why() {
     let dir = tempfile::tempdir().expect("a directory");
@@ -493,9 +494,12 @@ fn a_start_a_spec_store_refuses_exits_naming_why() {
         "{log}"
     );
 
-    let (code, log) = refused(&[OsStr::new("--spec-store"), nowhere.as_os_str()]);
-    assert_eq!(code, Some(1), "{log}");
-    assert!(log.contains("the path leads to no directory"), "{log}");
+    let through = file.join("store");
+    for path in [&nowhere, &through] {
+        let (code, log) = refused(&[OsStr::new("--spec-store"), path.as_os_str()]);
+        assert_eq!(code, Some(1), "{log}");
+        assert!(log.contains("the path leads to no directory"), "{log}");
+    }
 
     fs::write(store.join(name(1)), unweighed()).expect("a generation on file");
     let (code, log) = on_store(&[]);

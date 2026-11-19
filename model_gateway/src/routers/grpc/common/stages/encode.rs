@@ -27,34 +27,32 @@ use rand::RngExt;
 use smg_grpc_client::{
     common_proto, tokenspeed_encoder::tokenspeed_encoder_proto as tokenspeed_encoder,
 };
+use smg_worker::identity::basic::{ConnectionMode, RuntimeType, Worker};
 use tracing::error;
 use uuid::Uuid;
 
 use super::{helpers::bootstrap_rendezvous, pd_protocol::EncodeHandoff, PipelineStage};
-use crate::{
-    routers::{
-        error,
-        grpc::{
-            backend_client::{
-                backend_client_if_initialized, send_tokenspeed_encode_frame,
-                send_tokenspeed_encode_rpc, BackendClient,
-            },
-            client::GrpcClient,
-            context::{ClientSelection, EncodeOutputs, RequestContext, WorkerSelection},
-            multimodal::{
-                assemble_tokenspeed_for_encode, assembly_error_response,
-                ec_push::{push_destination, ImageFanout, PushEncodePlan},
-                mm_rdma_exporter, worker_supports_ec_transfer, MultimodalIntermediate,
-            },
-            proto_wrapper::{
-                cleanup_mm_shm_handles, cleanup_tokenspeed_items_encoder_shm,
-                collect_tokenspeed_multimodal_inputs_shm_handles, stage_tokenspeed_tensor_rdma,
-                EncodeItemBootstrapInfo, TokenSpeedMultimodalData, TokenSpeedMultimodalItem,
-            },
-            zmq_client::EncodeRendezvous,
+use crate::routers::{
+    error,
+    grpc::{
+        backend_client::{
+            backend_client_if_initialized, send_tokenspeed_encode_frame,
+            send_tokenspeed_encode_rpc, BackendClient,
         },
+        client::GrpcClient,
+        context::{ClientSelection, EncodeOutputs, RequestContext, WorkerSelection},
+        multimodal::{
+            assemble_tokenspeed_for_encode, assembly_error_response,
+            ec_push::{push_destination, ImageFanout, PushEncodePlan},
+            mm_rdma_exporter, worker_supports_ec_transfer, MultimodalIntermediate,
+        },
+        proto_wrapper::{
+            cleanup_mm_shm_handles, cleanup_tokenspeed_items_encoder_shm,
+            collect_tokenspeed_multimodal_inputs_shm_handles, stage_tokenspeed_tensor_rdma,
+            EncodeItemBootstrapInfo, TokenSpeedMultimodalData, TokenSpeedMultimodalItem,
+        },
+        zmq_client::EncodeRendezvous,
     },
-    worker::{ConnectionMode, RuntimeType, Worker},
 };
 
 /// No-op unless the request is multimodal and worker selection produced encode
@@ -501,7 +499,9 @@ fn backend_name(client: &BackendClient) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{routers::grpc::context::EncodeWorkerAssignment, worker::BasicWorkerBuilder};
+    use crate::routers::grpc::{
+        backend_client::BasicWorkerBuilder, context::EncodeWorkerAssignment,
+    };
 
     fn ec_worker(url: &str, role: &str, labels: &[(&str, &str)]) -> Arc<dyn Worker> {
         let mut builder = BasicWorkerBuilder::new(url)
@@ -627,15 +627,14 @@ mod tests {
             },
             EngineId,
         };
+        use smg_worker::identity::basic::WorkerType;
 
-        use crate::{
-            routers::grpc::{
-                context::EncodeWorkerAssignment,
-                multimodal::single_image_intermediate,
-                proto_wrapper::TokenSpeedTensorStorage,
-                zmq_client::{EosTokenIds, ZmqEngineClient},
-            },
-            worker::{BasicWorkerBuilder, WorkerType},
+        use crate::routers::grpc::{
+            backend_client::BasicWorkerBuilder,
+            context::EncodeWorkerAssignment,
+            multimodal::single_image_intermediate,
+            proto_wrapper::TokenSpeedTensorStorage,
+            zmq_client::{EosTokenIds, ZmqEngineClient},
         };
 
         let dir = tempfile::tempdir().unwrap();

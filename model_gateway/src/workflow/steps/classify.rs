@@ -11,13 +11,13 @@ use std::time::Duration;
 use async_trait::async_trait;
 use openai_protocol::worker::ProviderType;
 use reqwest::Client;
+use smg_worker::identity::{basic::RuntimeType, endpoint::Endpoint};
 use tracing::debug;
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use super::util::{http_base_url, try_grpc_reachable, try_http_reachable};
 use crate::{
     routers::provider_support,
-    worker::identity::{basic::RuntimeType, endpoint::Endpoint},
     workflow::data::{require_app_context, WorkerKind, WorkerWorkflowData},
 };
 
