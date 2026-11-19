@@ -541,6 +541,7 @@ impl From<tokenspeed_proto::SchedulerLoad> for openai_protocol::worker::Schedule
             max_running_requests: load.max_running_requests,
             memory,
             queues,
+            values: Vec::new(),
             // TokenSpeed has no disagg section; canonical PD fields stay None.
             ..Default::default()
         }

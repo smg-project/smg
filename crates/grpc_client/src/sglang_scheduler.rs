@@ -761,6 +761,7 @@ impl From<proto::SchedulerLoad> for openai_protocol::worker::SchedulerLoadSnapsh
                     .saturating_add(d.decode_retracted_queue_reqs)
             }),
             disagg_mode: disagg.map(|d| d.mode),
+            values: Vec::new(),
         }
     }
 }

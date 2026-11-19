@@ -126,6 +126,18 @@ message EngineLoad {
   // Context tokens (prompt plus committed output) of every request the rank
   // holds. Part of the routing core: sent on every record when reported.
   optional uint64 num_resident_tokens = 23;
+  // Values the engine reports by name. A servicer sends a value on the
+  // records where it has it. An omitted name says nothing about that
+  // value and carries no instruction to remove it.
+  repeated NamedValue values = 24;
+}
+
+message NamedValue {
+  string name = 1;
+  string unit = 2;
+  double value = 3;
+  // Age of this value's sample in milliseconds, when known.
+  optional uint32 age_ms = 4;
 }
 
 // The sections below mirror one engine's scheduler load messages field for

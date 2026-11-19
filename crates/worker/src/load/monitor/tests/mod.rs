@@ -1,20 +1,21 @@
 mod prom_scrape;
 mod worker_load_manager;
 
-use std::{collections::HashMap, sync::mpsc};
+use std::{borrow::Cow, collections::HashMap, sync::mpsc};
 
 use super::*;
 use crate::{
-    health::overload::OverloadThresholds,
+    health::{manager::WorkerManager, overload::OverloadThresholds},
     identity::basic::{ConnectionMode, WorkerType},
     model_card::ModelCard,
     runtime::StallReason,
     test_support::{
-        ready_worker, render_with_recorder, BasicWorkerBuilder, LoadReaders, WorkerMonitor,
-        WorkerRegistry,
+        ready_worker, render_with_recorder, BasicWorkerBuilder, LoadReaders, ScriptedAnswers,
+        WorkerMonitor, WorkerRegistry,
     },
     worker::{
-        EngineMemoryMetricsSnapshot, EngineQueueMetricsSnapshot, HealthCheckConfig, WorkerStatus,
+        EngineMemoryMetricsSnapshot, EngineQueueMetricsSnapshot, HealthCheckConfig, NamedValue,
+        WorkerStatus,
     },
 };
 
@@ -1315,6 +1316,7 @@ struct RecordingLoadSink {
     said: Mutex<Vec<Said>>,
     /// The workers the sink was told to forget, in order.
     forgotten: Mutex<Vec<Arc<dyn Worker>>>,
+    polled_values: Mutex<Vec<NamedValue>>,
     mode: PollMode,
     ranks: PolledRanks,
     needs: bool,
@@ -1372,6 +1374,14 @@ impl LoadSink for RecordingLoadSink {
 
     fn report(&self, answer: &[PolledMember<'_>], _polled_at: Instant) -> PolledRanks {
         let locked = self.locked();
+        self.polled_values.lock().extend(
+            answer
+                .iter()
+                .filter_map(|member| member.answer)
+                .flat_map(|report| &report.loads)
+                .flat_map(|rank| &rank.values)
+                .cloned(),
+        );
         self.said
             .lock()
             .push(Said::Report(Self::members(answer), locked));
@@ -1444,6 +1454,7 @@ fn build_recording(
     let sink = Arc::new(RecordingLoadSink {
         said: Mutex::new(Vec::new()),
         forgotten: Mutex::new(Vec::new()),
+        polled_values: Mutex::new(Vec::new()),
         mode,
         ranks,
         needs,
@@ -1479,6 +1490,57 @@ fn answer_of(rank: i32, running: i32) -> WorkerLoadResponse {
         }],
         ..Default::default()
     }
+}
+
+#[tokio::test]
+async fn a_connections_named_values_reach_the_load_sink_and_fleet_response() {
+    let (registry, monitor, sink) =
+        build_recording(PollMode::Poll, PolledRanks::default(), true, false);
+    let expected = vec![
+        NamedValue {
+            name: Cow::Borrowed("blocked_cycles"),
+            unit: Cow::Borrowed("cycles"),
+            value: 17.0,
+            age_ms: Some(29),
+        },
+        NamedValue {
+            name: Cow::Borrowed("wait_time"),
+            unit: Cow::Borrowed("ms"),
+            value: 2.75,
+            age_ms: None,
+        },
+    ];
+    let mut answer = answer_of(2, 3);
+    answer.loads[0].values.clone_from(&expected);
+    let worker: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("grpc://worker:9132")
+            .connection_mode(ConnectionMode::Grpc)
+            .model(ModelCard::new("m"))
+            .engine_connection(ScriptedAnswers::answering_loads(answer))
+            .build(),
+    );
+    worker.set_status(WorkerStatus::Ready);
+    registry.register(worker).unwrap();
+    let group = WorkerGroupKey {
+        model_id: "m".into(),
+        worker_type: WorkerType::Regular,
+        connection_mode: ConnectionMode::Grpc,
+    };
+    poll_group_once(&monitor, &group, Duration::from_secs(5), Instant::now()).await;
+    assert_eq!(*sink.polled_values.lock(), expected);
+
+    let fleet = WorkerManager::fleet_loads(&registry, &monitor.load_snapshot(), None, "test");
+    assert_eq!(fleet.loads[0].values, expected);
+    let json = serde_json::to_value(fleet).unwrap();
+    assert_eq!(
+        json["loads"][0]["values"],
+        serde_json::json!([
+            {"name": "blocked_cycles", "unit": "cycles", "value": 17.0, "age_ms": 29},
+            {"name": "wait_time", "unit": "ms", "value": 2.75},
+        ])
+    );
+    let decoded: WorkerLoadResponse = serde_json::from_value(json).unwrap();
+    assert_eq!(decoded.loads[0].values, expected);
 }
 
 /// A pushed record crosses the port once, after the monitor laid it in the

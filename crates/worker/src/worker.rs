@@ -4,7 +4,7 @@
 //! enums, and core configuration. These types are shared across API
 //! request/response boundaries and internal runtime state.
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{borrow::Cow, collections::HashMap, sync::Arc, time::Duration};
 
 #[cfg(feature = "axum")]
 use axum::{
@@ -603,7 +603,7 @@ impl<'de> Deserialize<'de> for WorkerModels {
 
 /// JsonSchema: wire format is `Vec<ModelCard>`.
 impl JsonSchema for WorkerModels {
-    fn schema_name() -> std::borrow::Cow<'static, str> {
+    fn schema_name() -> Cow<'static, str> {
         "WorkerModels".into()
     }
 
@@ -1565,10 +1565,23 @@ pub struct StopProfileRequest {
     pub url: Option<String>,
 }
 
-/// Per-DP-rank load snapshot from a backend.
-///
-/// Contains core metrics from the engine's `/v1/loads` endpoint or the `GetLoads` gRPC RPC.
-/// Each snapshot represents one data-parallel rank's scheduler state.
+/// A token count offered by name from the fixed used-token field.
+pub const KV_TOKENS_USED: &str = "kv_tokens_used";
+/// A token count offered by name from the fixed token-capacity field.
+pub const KV_TOKENS_CAPACITY: &str = "kv_tokens_capacity";
+
+/// One value an engine reports by name alongside its fixed fields.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct NamedValue {
+    pub name: Cow<'static, str>,
+    pub unit: Cow<'static, str>,
+    pub value: f64,
+    /// Age of this value's sample in milliseconds, when the engine reports it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub age_ms: Option<u32>,
+}
+
+/// The scheduler's load report for one data-parallel rank.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct SchedulerLoadSnapshot {
@@ -1624,6 +1637,34 @@ pub struct SchedulerLoadSnapshot {
     /// "prefill", "decode", or "null" as reported by the backend.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disagg_mode: Option<String>,
+    /// Values the engine reports by name. An omitted name says nothing
+    /// about that value and carries no instruction to remove it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub values: Vec<NamedValue>,
+}
+
+impl SchedulerLoadSnapshot {
+    /// Values the engine reports by name, followed by nonzero fixed token
+    /// counts whose names are absent from the list. Missing fixed counts
+    /// are stored as zero.
+    pub fn named_values(&self) -> impl Iterator<Item = NamedValue> + '_ {
+        let fixed = [
+            (KV_TOKENS_USED, self.num_used_tokens),
+            (KV_TOKENS_CAPACITY, self.max_total_num_tokens),
+        ]
+        .into_iter()
+        .filter_map(|(name, count)| {
+            (count != 0 && !self.values.iter().any(|value| value.name == name)).then_some(
+                NamedValue {
+                    name: Cow::Borrowed(name),
+                    unit: Cow::Borrowed("tokens"),
+                    value: f64::from(count),
+                    age_ms: None,
+                },
+            )
+        });
+        self.values.iter().cloned().chain(fixed)
+    }
 }
 
 bitflags! {
@@ -1661,9 +1702,8 @@ pub trait LoadRecord {
     /// nothing else is kept.
     fn telemetry(&self) -> LoadTelemetry;
 
-    /// The rank's entry a poll would have produced from the record, with
-    /// the telemetry it leaves out at the type's default. The rank is the
-    /// caller's to set.
+    /// The rank's entry from the record, with omitted telemetry at the
+    /// type's default. The rank is the caller's to set.
     fn snapshot(&self) -> SchedulerLoadSnapshot;
 
     /// How long the engine has produced no output while it held requests
@@ -2203,6 +2243,84 @@ mod overload_update_tests {
             token_usage: Some(1.0),
         };
         assert!(!update.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod load_snapshot_tests {
+    use std::{fs, path::Path};
+
+    use super::*;
+
+    #[test]
+    fn named_values_offer_the_fixed_token_counts_independently() {
+        let mut snapshot = SchedulerLoadSnapshot::default();
+        assert!(snapshot.named_values().next().is_none());
+
+        snapshot.num_used_tokens = 211;
+        let used = NamedValue {
+            name: "kv_tokens_used".into(),
+            unit: "tokens".into(),
+            value: 211.0,
+            age_ms: None,
+        };
+        assert_eq!(
+            snapshot.named_values().collect::<Vec<_>>().as_slice(),
+            std::slice::from_ref(&used)
+        );
+
+        snapshot.max_total_num_tokens = 1_373;
+        let capacity = NamedValue {
+            name: "kv_tokens_capacity".into(),
+            unit: "tokens".into(),
+            value: 1_373.0,
+            age_ms: None,
+        };
+        let values: Vec<_> = snapshot.named_values().collect();
+        assert_eq!(values, [used, capacity.clone()]);
+        assert!(values.iter().all(|value| {
+            matches!(value.name, Cow::Borrowed(_)) && matches!(value.unit, Cow::Borrowed(_))
+        }));
+
+        snapshot.num_used_tokens = 0;
+        assert_eq!(snapshot.named_values().collect::<Vec<_>>(), [capacity]);
+    }
+
+    #[test]
+    fn explicit_token_values_take_precedence_over_fixed_counts() {
+        for (name, other) in [
+            ("kv_tokens_used", "kv_tokens_capacity"),
+            ("kv_tokens_capacity", "kv_tokens_used"),
+        ] {
+            let value = NamedValue {
+                name: name.into(),
+                unit: "tokens".into(),
+                value: 0.0,
+                age_ms: Some(43),
+            };
+            let snapshot = SchedulerLoadSnapshot {
+                num_used_tokens: 313,
+                max_total_num_tokens: 2_812,
+                values: vec![value.clone()],
+                ..Default::default()
+            };
+            let values: Vec<_> = snapshot.named_values().collect();
+            assert_eq!(values.len(), 2);
+            assert_eq!(values[0], value);
+            assert_eq!(values[1].name, other);
+        }
+    }
+
+    #[test]
+    fn the_snapshot_schema_matches_the_snapshot_type() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("scheduler-load.schema.json");
+        let schema = schemars::schema_for!(SchedulerLoadSnapshot);
+        let generated = serde_json::to_string_pretty(&schema).unwrap() + "\n";
+        if std::env::var_os("WRITE_SCHEDULER_LOAD_SCHEMA").is_some() {
+            fs::write(path, generated).unwrap();
+        } else {
+            assert_eq!(fs::read_to_string(path).unwrap(), generated);
+        }
     }
 }
 

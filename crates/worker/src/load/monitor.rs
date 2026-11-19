@@ -568,8 +568,8 @@ impl<G: Generation> WorkerMonitor<G> {
     }
 
     /// A load record pushed on a worker's KV-event stream (`KvEventBatch.load`,
-    /// the servicer's `GetLoads` figures for `dp_rank`, received at
-    /// `received_at`): the same input as a poll of that worker. It replaces
+    /// the servicer's scheduler report for `dp_rank`, received at
+    /// `received_at`). Its fixed fields have the shape of a poll. It replaces
     /// the rank's entry in the worker's report in place, goes to the overload
     /// verdict and the wedged rule at once, which read the report where it
     /// is, to its own rank's `smg_engine_*` gauges, set through the handles
