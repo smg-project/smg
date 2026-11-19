@@ -1809,6 +1809,25 @@ fn a_pair_filed_with_an_ended_side_books_the_side_that_lives() {
     assert_eq!(leases.live(gateway), 2);
 }
 
+/// The store tells of a lease with the worker its record books. A single's
+/// lease and a pair's prefill side name the record's target, a decode side
+/// its own, and the lease on file names none.
+#[test]
+fn a_side_s_lease_names_the_worker_its_record_books() {
+    let now = Instant::now();
+    let (p, d) = (WorkerId(3), WorkerId(5));
+    let booked = |lease: Option<Lease>| lease.map(|lease| lease.booked);
+    let told = |record: &LeaseRecord, side| booked(record.side(side).map(|(lease, _)| lease));
+    let single = lease(GatewayId(1), 1, 1, now);
+    assert_eq!(single.lease.booked, WorkerId(0), "filed with no word");
+    assert_eq!(told(&single, Side::Single), Some(single.target));
+    assert_eq!(single.ending(None).map(booked), [Some(single.target), None]);
+    let both = pair(2, p, &[d], now);
+    assert_eq!(told(&both, Side::Prefill), Some(p));
+    assert_eq!(told(&both, Side::Decode), Some(d));
+    assert_eq!(both.ending(None).map(booked), [Some(p), Some(d)]);
+}
+
 #[test]
 fn a_pairs_sides_are_dispatched_and_ended_each_by_its_own_frame() {
     let store = MemoryStore::new();

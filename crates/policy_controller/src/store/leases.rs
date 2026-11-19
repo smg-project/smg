@@ -229,16 +229,29 @@ impl LeaseRecord {
         }
     }
 
+    /// The record's own lease, a single's or a pair's prefill side, as the
+    /// store tells of it at a dispatch and at an end: it names the worker
+    /// the record books ([`Lease::booked`]), whatever the lease on file
+    /// names. The record's target is the one place the store reads it
+    /// from, and a dispatch that moves the lease moves it there.
+    fn own(&self) -> Lease {
+        Lease {
+            booked: self.target,
+            ..self.lease
+        }
+    }
+
     /// The lease `side` names on this record and where that side stands.
     /// A pair's record holds a prefill side, the record's own lease and
     /// state, and a decode side; `None` for another side. A single's
-    /// record reads no side: it holds its one lease under any.
+    /// record reads no side: it holds its one lease under any. Each side's
+    /// lease names the worker that side books.
     pub fn side(&self, side: Side) -> Option<(Lease, LeaseState)> {
         let Some(decode) = self.decode else {
-            return Some((self.lease, self.state));
+            return Some((self.own(), self.state));
         };
         match side {
-            Side::Prefill => Some((self.lease, self.state)),
+            Side::Prefill => Some((self.own(), self.state)),
             Side::Decode => Some((decode.lease(&self.lease), decode.state)),
             Side::Single | Side::Encode => None,
         }
@@ -253,7 +266,7 @@ impl LeaseRecord {
                 .and_then(|(lease, state)| state.is_live().then_some(lease))
         };
         match (self.decode, side) {
-            (None, _) => [Some(self.lease), None],
+            (None, _) => [Some(self.own()), None],
             (Some(_), Some(side)) => [live(side), None],
             (Some(_), None) => [live(Side::Prefill), live(Side::Decode)],
         }
