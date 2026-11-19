@@ -1135,6 +1135,7 @@ impl Harness {
     /// `catalog` holds and on the policy document at `spec`, which the
     /// controller reads and applies itself. The case applies no generation
     /// in its own process beside it.
+    #[cfg(feature = "wasm")]
     pub async fn start_hosting(catalog: Catalog, spec: &Path) -> Result<Self, String> {
         let replica = Replica::start_over("fleet-controller", None, catalog, Some(spec)).await?;
         Self::around(replica).await
