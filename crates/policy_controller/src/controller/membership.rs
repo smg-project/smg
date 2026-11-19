@@ -1137,8 +1137,6 @@ pub(crate) mod tests {
 
     #[test]
     fn a_caller_that_did_not_make_a_row_changes_nothing_of_it() {
-        use super::worker_wire;
-
         let (store, door) = door();
         let maker = found("pods/a");
         let made = row_of(
@@ -1212,51 +1210,6 @@ pub(crate) mod tests {
         door.relabel(&operator(), &maker, &patch)
             .expect("the maker patches its row");
 
-        // A row holds its maker inside the wire's bound. The widest key a row
-        // of this spec has room for is registered; one byte more is refused
-        // by the row's name, and so is a patch of the row at its brim.
-        let wide =
-            |bytes: usize| Maker::provider("cluster", "k".repeat(bytes)).expect("a whole maker");
-        let third = "grpc://10.0.0.7:8000";
-        let (stated, _) = worker_wire::registration(&spec(third), |_| None).expect("the facts");
-        let fits =
-            |bytes: usize| worker_wire::room(&stated, &stated.labels, &wide(bytes), "spec").is_ok();
-        let widest = (0..=16_384usize)
-            .rev()
-            .find(|&bytes| fits(bytes))
-            .expect("a key the row has room for");
-        let epoch = store.epoch();
-        let past = door.upsert(
-            &operator(),
-            &wide(widest + 1),
-            TERM,
-            &ask(spec(third), Mode::Upsert),
-        );
-        let status = past.expect_err("past the bound");
-        assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
-        assert!(status.message().starts_with("spec:"), "{status:?}");
-        assert_eq!(store.epoch(), epoch);
-        let brim = row_of(
-            &door
-                .upsert(
-                    &operator(),
-                    &wide(widest),
-                    TERM,
-                    &ask(spec(third), Mode::Upsert),
-                )
-                .expect("at the bound"),
-        );
-        let more = proto::PatchWorkerRequest {
-            worker_id: brim.id,
-            revision: brim.revision,
-            ..patch.clone()
-        };
-        let status = door
-            .relabel(&operator(), &wide(widest), &more)
-            .expect_err("past the bound");
-        assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
-        assert!(status.message().starts_with("labels:"), "{status:?}");
-
         // The other way round: a provider changes nothing of a control
         // call's row.
         let other = "grpc://10.0.0.6:8000";
@@ -1277,6 +1230,68 @@ pub(crate) mod tests {
         refused(door.remove(&operator(), &maker, &leave), "a control call");
         door.deregister(&operator(), under(TERM), &leave)
             .expect("the control call removes its row");
+    }
+
+    #[test]
+    fn a_row_holds_its_maker_inside_the_wires_bound() {
+        use super::worker_wire;
+
+        let (store, door) = door();
+        let maker = found("pods/a");
+        // Three labels at a value's bound and one that fills. The widest
+        // fill a row of this maker has room for is registered; one byte more
+        // is refused by the row's name, and so is a patch of the row at its
+        // brim.
+        let stated = |fill: usize| proto::WorkerSpec {
+            labels: ["a", "b", "c"]
+                .map(|key| (key.to_owned(), "v".repeat(4_096)))
+                .into_iter()
+                .chain([("fill".to_owned(), "v".repeat(fill))])
+                .collect(),
+            ..spec(URL)
+        };
+        let fits = |fill: usize| {
+            worker_wire::registration(&stated(fill), |_| None).is_ok_and(|(facts, _)| {
+                worker_wire::room(&facts, &facts.labels, &maker, "spec").is_ok()
+            })
+        };
+        let widest = (0..=4_096usize)
+            .rev()
+            .find(|&fill| fits(fill))
+            .expect("a fill the row has room for");
+        let epoch = store.epoch();
+        let past = door.upsert(
+            &operator(),
+            &maker,
+            TERM,
+            &ask(stated(widest + 1), Mode::Upsert),
+        );
+        let status = past.expect_err("past the bound");
+        assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+        assert!(status.message().starts_with("spec:"), "{status:?}");
+        assert_eq!(store.epoch(), epoch);
+        let brim = row_of(
+            &door
+                .upsert(
+                    &operator(),
+                    &maker,
+                    TERM,
+                    &ask(stated(widest), Mode::Upsert),
+                )
+                .expect("at the bound"),
+        );
+        let more = proto::PatchWorkerRequest {
+            worker_id: brim.id,
+            labels: [("lane".to_owned(), "b".to_owned())].into(),
+            remove_labels: Vec::new(),
+            overload: None,
+            revision: brim.revision,
+        };
+        let status = door
+            .relabel(&operator(), &maker, &more)
+            .expect_err("past the bound");
+        assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+        assert!(status.message().starts_with("labels:"), "{status:?}");
     }
 
     #[test]

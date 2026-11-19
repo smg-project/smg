@@ -698,15 +698,35 @@ fn a_new_row_takes_its_maker_and_a_standing_row_keeps_it() {
 }
 
 #[test]
-fn a_providers_maker_names_its_provider_and_its_key() {
-    use super::Maker;
+fn a_providers_maker_is_made_inside_the_rules_of_its_two_parts() {
+    use super::{Maker, Unmade};
 
-    assert_eq!(Maker::provider("", "pods/a"), None);
-    assert_eq!(Maker::provider("cluster", ""), None);
-    let Some(Maker::Provider(found)) = Maker::provider("cluster", "pods/a") else {
+    let Ok(Maker::Provider(found)) = Maker::provider("cluster", "pods/a") else {
         panic!("a maker of both parts is made");
     };
     assert_eq!((found.provider(), found.key()), ("cluster", "pods/a"));
+    // Each part at its bound is taken, and the key is its provider's own
+    // text, blanks and all.
+    let name = "p".repeat(Maker::NAME_BYTES);
+    let key = "k ".repeat(Maker::KEY_BYTES / 2);
+    assert!(Maker::provider(name.as_str(), key.as_str()).is_ok());
+    // The part that breaks its rule is named, the name's rules first.
+    let unmade = |provider: &str, key: &str| Maker::provider(provider, key).expect_err("no maker");
+    assert!(matches!(unmade("", "pods/a"), Unmade::Provider(_)));
+    assert!(matches!(unmade("", ""), Unmade::Provider(_)));
+    assert!(matches!(
+        unmade(&format!("{name}p"), "pods/a"),
+        Unmade::Provider(_)
+    ));
+    for blank in ["a b", "a\nb", "a\u{7}b"] {
+        let refused = unmade(blank, "pods/a");
+        assert!(matches!(refused, Unmade::Provider(_)), "{blank:?}");
+    }
+    assert!(matches!(unmade("cluster", ""), Unmade::Key(_)));
+    assert!(matches!(
+        unmade("cluster", &format!("{key}k")),
+        Unmade::Key(_)
+    ));
 }
 
 #[test]

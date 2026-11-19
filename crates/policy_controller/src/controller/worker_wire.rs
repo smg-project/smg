@@ -22,7 +22,7 @@ use crate::{
     replication::{Entry, Event as Written},
     store::{
         GatewayId, HealthPolicy, LoadSample, LoadSource, Maker, MembershipChange, Overload,
-        Position, Reachability, Signals, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus,
+        Position, Reachability, Signals, Unmade, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus,
     },
     view::{LoadRow, Role, SignalSource, WireModes, WorkerId},
 };
@@ -85,6 +85,9 @@ const LABELS: usize = 128;
 const MODELS: usize = 128;
 /// The row whole on the wire, as [`weight`] measures it.
 const ROW_BYTES: usize = 16 * 1024;
+// A provider's name takes a label key's bound and its key a URL's. The store
+// states both numbers for a build without the wire, and each pair is one.
+const _: () = assert!(Maker::NAME_BYTES == KEY_BYTES && Maker::KEY_BYTES == URL_BYTES);
 
 /// The contract's status of a row.
 pub(crate) const fn status(status: WorkerStatus) -> proto::WorkerStatus {
@@ -150,8 +153,8 @@ pub(crate) fn row(row: &WorkerRow) -> proto::WorkerRow {
 
 /// The wire's maker of a row's: none for a control call's row, so a row
 /// that crosses with no field reads as one.
-fn maker(maker: &Maker) -> Option<proto::Maker> {
-    match maker {
+fn maker(by: &Maker) -> Option<proto::Maker> {
+    match by {
         Maker::Control => None,
         Maker::Provider(found) => Some(proto::Maker {
             provider: found.provider().to_owned(),
@@ -356,7 +359,7 @@ fn fits(
 
 /// The bytes a row's maker takes on the wire, under the contract's field
 /// numbers: none for a control call's row.
-fn made(maker: &Maker) -> usize {
+fn maker_weight(maker: &Maker) -> usize {
     use prost::encoding::{encoded_len_varint, key_len};
     let Maker::Provider(found) = maker else {
         return 0;
@@ -380,8 +383,8 @@ pub(crate) fn room(
     maker: &Maker,
     path: &'static str,
 ) -> Result<(), Refused> {
-    let made = made(maker);
-    if made > 0 && weight(facts, labels) + made > ROW_BYTES {
+    let bytes = maker_weight(maker);
+    if bytes > 0 && weight(facts, labels) + bytes > ROW_BYTES {
         return Err(refused(path, "a row is at most 16384 bytes on the wire"));
     }
     Ok(())
@@ -642,19 +645,9 @@ pub(crate) fn told_row(told: &proto::WorkerRow, now: Instant) -> Result<WorkerRo
     let maker = match &told.maker {
         None => Maker::Control,
         Some(by) => match Maker::provider(by.provider.clone(), by.key.clone()) {
-            Some(maker) => maker,
-            None if by.provider.is_empty() => {
-                return Err(refused(
-                    "row.maker.provider",
-                    "a provider's row names its provider",
-                ));
-            }
-            None => {
-                return Err(refused(
-                    "row.maker.key",
-                    "a provider's row names its key for the worker",
-                ));
-            }
+            Ok(maker) => maker,
+            Err(Unmade::Provider(why)) => return Err(refused("row.maker.provider", why)),
+            Err(Unmade::Key(why)) => return Err(refused("row.maker.key", why)),
         },
     };
     let age = Duration::from_millis(told.admitted_age_ms);
@@ -2592,8 +2585,8 @@ mod tests {
 
     #[test]
     fn a_row_crosses_with_its_maker() {
-        use super::{made, room};
-        use crate::store::Maker;
+        use super::{blank, maker_weight, room};
+        use crate::store::{Maker, Unmade};
 
         let now = Instant::now();
         // A control call's row says no maker, and a row that says none
@@ -2627,40 +2620,57 @@ mod tests {
                 ..full()
             };
             let grown = row(&with).encoded_len() - row(&by_hand).encoded_len();
-            assert_eq!(made(&maker), grown, "a key of {bytes}");
+            assert_eq!(maker_weight(&maker), grown, "a key of {bytes}");
         }
-        assert_eq!(made(&Maker::Control), 0);
+        assert_eq!(maker_weight(&Maker::Control), 0);
         let brim = facts(&weighing(ROW_BYTES), None).expect("a row at its bound");
         assert!(room(&brim, &brim.labels, &Maker::Control, "spec").is_ok());
         assert_eq!(
             room(&brim, &brim.labels, &found.maker, "spec").map_err(|refused| refused.path),
             Err("spec")
         );
-        let needs = made(&found.maker);
+        let needs = maker_weight(&found.maker);
         let under = facts(&weighing(ROW_BYTES - needs), None).expect("a row under its bound");
         assert!(room(&under, &under.labels, &found.maker, "spec").is_ok());
+        // One byte past the bound is refused, by the wire's own weight.
+        let over = facts(&weighing(ROW_BYTES - needs + 1), None).expect("a row a byte past");
+        assert_eq!(
+            room(&over, &over.labels, &found.maker, "spec").map_err(|refused| refused.path),
+            Err("spec")
+        );
         let widest = WorkerRow {
             facts: under,
             ..found.clone()
         };
         assert!(row(&widest).encoded_len() <= ROW_BYTES);
-        // A maker that lacks its provider or its key is refused by the
-        // part's path, and no leader makes one.
+        // A maker that breaks a part's rule is refused by that part's path,
+        // in the words of the routine that makes one: no leader makes it.
+        let wide = "p".repeat(Maker::NAME_BYTES + 1);
+        let long = "k".repeat(Maker::KEY_BYTES + 1);
         for (provider, key, path) in [
             ("", "pods/a", "row.maker.provider"),
             ("cluster", "", "row.maker.key"),
             ("", "", "row.maker.provider"),
+            (wide.as_str(), "pods/a", "row.maker.provider"),
+            ("a cluster", "pods/a", "row.maker.provider"),
+            ("cluster", long.as_str(), "row.maker.key"),
         ] {
-            let lacking = proto::WorkerRow {
+            let broken = proto::WorkerRow {
                 maker: Some(proto::Maker {
                     provider: provider.to_owned(),
                     key: key.to_owned(),
                 }),
                 ..told.clone()
             };
-            let refusal = told_row(&lacking, now).expect_err("refused");
-            assert_eq!(refusal.path, path);
-            assert_eq!(Maker::provider(provider, key), None);
+            let refusal = told_row(&broken, now).expect_err("refused");
+            let (Unmade::Provider(why) | Unmade::Key(why)) =
+                Maker::provider(provider, key).expect_err("no maker");
+            assert_eq!((refusal.path, refusal.why), (path, why));
+        }
+        // A provider's name holds the rule of a stated name.
+        for name in ["cluster", "a b", "a\tb", "a\u{7}b", "\u{e9}"] {
+            let refused = matches!(Maker::provider(name, "k"), Err(Unmade::Provider(_)));
+            assert_eq!(refused, blank(name), "{name:?}");
         }
     }
 

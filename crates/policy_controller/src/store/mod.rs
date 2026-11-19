@@ -100,7 +100,7 @@ pub use reservations::{ReservationKind, ReservationStore};
 pub use sessions::{Pin, SessionsStore};
 pub use workers::{
     identity, identity_of, HealthPolicy, Maker, MembershipChange, MembershipTail, Overload,
-    ProviderKey, Reachability, Signals, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus,
+    ProviderKey, Reachability, Signals, Unmade, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus,
     WorkersStore,
 };
 pub use world::{
