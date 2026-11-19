@@ -392,8 +392,13 @@ impl<D: Deref<Target = Door>> Drop for Handle<D> {
     /// A handle dropped with a report owed speaks for a lease nobody
     /// spoke for, in the word of its phase that names no cause: a release
     /// as abandoned before any dispatch, a completion of class cancelled
-    /// after one. A drop is handed no instant and reads the clock.
+    /// after one. A drop is handed no instant and reads the clock. A
+    /// handle that owes nothing says nothing and reads no clock.
     fn drop(&mut self) {
+        // The common drop: the request completed, on every side.
+        if matches!((self.owed, self.decode), (Owed::Nothing, Owed::Nothing)) {
+            return;
+        }
         self.released(ReleaseReason::Abandoned, Instant::now());
     }
 }
