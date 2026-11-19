@@ -31,6 +31,12 @@
 //! ([`TransportClass::Cancelled`]), and so are a release said then and a
 //! handle dropped with no outcome.
 //!
+//! **The instants.** A dispatch, a completion and a release each take the
+//! instant their host read, and a span is counted between two of them. A
+//! handle dropped with a report owed is handed no instant: it reads the
+//! clock, so a host whose instants are not the clock's says the release
+//! itself.
+//!
 //! **The targets not taken.** A pick's lease books the pick's first
 //! target, and a dispatch that names another moves the booking there
 //! ([`Handle::take`]). A target the host passes over holds nothing on
@@ -175,7 +181,9 @@ impl<D: Deref<Target = Door>> Handle<D> {
 
     /// The host sent the request to the target it took, at `now`: the
     /// lease is dispatched on that target, and no dispatch deadline ends
-    /// it from here. Said once: a second call says nothing.
+    /// it from here. A dispatch said after that deadline meets no lease:
+    /// the request runs unbooked, and its host is told nothing. Said once:
+    /// a second call says nothing.
     pub fn dispatched(&mut self, now: Instant) {
         let Owed::Dispatch {
             lease,
@@ -217,13 +225,14 @@ impl<D: Deref<Target = Door>> Handle<D> {
         self.owed = Owed::Nothing;
     }
 
-    /// The host gives the lease up before any dispatch, under `reason`:
-    /// its commit refused every target, or its client went away. After a
-    /// dispatch a lease lives until its completion: a release said then is
-    /// told as a completion of class cancelled, on the target the dispatch
-    /// named, with no status and no tokens, since none were read. Said
-    /// once.
-    pub fn released(&mut self, reason: ReleaseReason) {
+    /// The host gives the lease up at `now`, under `reason`. Before any
+    /// dispatch its commit refused every target, or its client went away.
+    /// After a dispatch a lease lives until its completion: a release said
+    /// then is told as a completion of class cancelled, on the target the
+    /// dispatch named, with no status and no tokens, since none were read.
+    /// Its span runs from the dispatch's instant to `now`, both the host's.
+    /// Said once.
+    pub fn released(&mut self, reason: ReleaseReason, now: Instant) {
         match self.owed {
             Owed::Nothing => {}
             Owed::Dispatch { lease, .. } => {
@@ -231,7 +240,6 @@ impl<D: Deref<Target = Door>> Handle<D> {
                 self.owed = Owed::Nothing;
             }
             Owed::Completion { side, sent, .. } => {
-                let now = Instant::now();
                 let cancelled = Outcome {
                     side,
                     served: self.target.id,
@@ -252,9 +260,9 @@ impl<D: Deref<Target = Door>> Drop for Handle<D> {
     /// A handle dropped with a report owed speaks for a lease nobody
     /// spoke for, in the word of its phase that names no cause: a release
     /// as abandoned before any dispatch, a completion of class cancelled
-    /// after one.
+    /// after one. A drop is handed no instant and reads the clock.
     fn drop(&mut self) {
-        self.released(ReleaseReason::Abandoned);
+        self.released(ReleaseReason::Abandoned, Instant::now());
     }
 }
 
@@ -423,7 +431,7 @@ mod tests {
         let later = ended + Duration::from_secs(1);
         handle.dispatched(later);
         handle.completed(&outcome(first.id, TransportClass::Ok), later);
-        handle.released(ReleaseReason::ClientGone);
+        handle.released(ReleaseReason::ClientGone, Instant::now());
         drop(handle);
         let again = store.completed_ok_since(GATEWAY, first.id, later);
         assert!(!again, "one completion is written");
@@ -474,10 +482,10 @@ mod tests {
         let now = Instant::now();
         let mut handle = held(&door, b"r-1", now);
         let first = handle.take(0).expect("the pick's first target");
-        handle.released(ReleaseReason::CommitFailed);
+        handle.released(ReleaseReason::CommitFailed, Instant::now());
         assert_eq!(counted(store), []);
         assert_eq!(LeasesStore::live(&**store, GATEWAY), 0);
-        handle.released(ReleaseReason::ClientGone);
+        handle.released(ReleaseReason::ClientGone, Instant::now());
         handle.completed(&outcome(first.id, TransportClass::Ok), now);
         drop(handle);
         let written = store.completed_ok_since(GATEWAY, first.id, now);
@@ -509,7 +517,7 @@ mod tests {
         let (door, heard) = bed();
         let store = door.store();
         let mut handle = held(&door, b"r-1", Instant::now());
-        handle.released(ReleaseReason::ClientGone);
+        handle.released(ReleaseReason::ClientGone, Instant::now());
         assert_eq!(LeasesStore::live(&**store, GATEWAY), 0);
         drop(handle);
         let told = [Call::Issued, Call::Released(ReleaseReason::ClientGone)];
@@ -532,7 +540,7 @@ mod tests {
             handle.dispatched(now);
             thread::sleep(Duration::from_millis(1));
             if released {
-                handle.released(ReleaseReason::ClientGone);
+                handle.released(ReleaseReason::ClientGone, Instant::now());
                 assert_eq!(counted(store), [], "told where it was said");
             }
             drop(handle);
@@ -581,7 +589,7 @@ mod tests {
         // for nobody.
         let mut picked = held(&door, b"r-0", now);
         let member = picked.take(0).expect("the pick's first target").id;
-        picked.released(ReleaseReason::CommitFailed);
+        picked.released(ReleaseReason::CommitFailed, Instant::now());
         heard.lock().clear();
         let mut asked = request(b"r-1", 7);
         asked.facts.model = "model-none";
@@ -592,7 +600,7 @@ mod tests {
         assert_eq!(handle.take(0), None);
         handle.dispatched(now);
         handle.completed(&outcome(member, TransportClass::Ok), now);
-        handle.released(ReleaseReason::CommitFailed);
+        handle.released(ReleaseReason::CommitFailed, Instant::now());
         drop(handle);
         assert_eq!(LeasesStore::live(&**store, GATEWAY), 0);
         assert!(!store.completed_ok_since(GATEWAY, member, now));
@@ -710,7 +718,7 @@ mod tests {
                                 handle.completed(&outcome(first.id, TransportClass::Ok), now);
                             }
                             1 => handle.dispatched(now),
-                            2 => handle.released(ReleaseReason::CommitFailed),
+                            2 => handle.released(ReleaseReason::CommitFailed, Instant::now()),
                             _ => {}
                         }
                     }
@@ -737,5 +745,55 @@ mod tests {
             (told(ok), told(cancelled), told(refused), told(dropped)),
             (quarter, quarter, quarter, quarter)
         );
+    }
+
+    /// A completion is written on the worker its host names, which need
+    /// not be the target the handle took: the health precedence reads the
+    /// worker that served.
+    #[test]
+    fn a_completion_is_written_on_the_worker_its_host_names() {
+        let (door, _) = bed();
+        let store = door.store();
+        let now = Instant::now();
+        let mut handle = held(&door, b"r-1", now);
+        let other = handle.take(1).expect("the pick's second target");
+        let taken = handle.take(0).expect("the pick's first target");
+        handle.dispatched(now);
+        handle.completed(&outcome(other.id, TransportClass::Ok), now);
+        assert!(store.completed_ok_since(GATEWAY, other.id, now));
+        assert!(!store.completed_ok_since(GATEWAY, taken.id, now));
+    }
+
+    /// A completion is written at the instant its host read: a host whose
+    /// instants run ahead of the clock writes there, as its dispatch did.
+    #[test]
+    fn a_completion_is_written_at_its_hosts_instant() {
+        let (door, _) = bed();
+        let store = door.store();
+        let now = Instant::now();
+        let mut handle = held(&door, b"r-1", now);
+        let first = handle.take(0).expect("the pick's first target");
+        let ahead = now + Duration::from_secs(2);
+        handle.completed(&outcome(first.id, TransportClass::Ok), ahead);
+        assert!(store.completed_ok_since(GATEWAY, first.id, ahead));
+    }
+
+    /// A release behind a dispatch spans its host's two instants, the
+    /// dispatch's and its own: no clock is read.
+    #[test]
+    fn a_release_behind_a_dispatch_spans_its_hosts_instants() {
+        let (door, heard) = bed();
+        let now = Instant::now();
+        let mut handle = held(&door, b"r-1", now);
+        let first = handle.take(0).expect("the pick's first target");
+        let sent = now + Duration::from_secs(3_600);
+        handle.dispatched(sent);
+        handle.released(ReleaseReason::ClientGone, sent + Duration::from_millis(7));
+        let told = [
+            Call::Issued,
+            Call::Dispatched(first.id, 0, 3_600_000_000),
+            Call::Completed(first.id, TransportClass::Cancelled, 7_000),
+        ];
+        assert_eq!(*heard.lock(), told);
     }
 }

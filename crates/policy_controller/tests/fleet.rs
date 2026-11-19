@@ -3035,7 +3035,7 @@ mod embedded {
             let decided = Handle::decide(&door, gateway, &asked(b"refused"), Instant::now());
             let mut handle = decided.expect("a decision");
             assert_eq!(live(), 1, "the issue files the lease");
-            handle.released(ReleaseReason::CommitFailed);
+            handle.released(ReleaseReason::CommitFailed, Instant::now());
             assert_eq!((booked(&fleet), live()), (vec![0; 3], 0));
             drop(handle);
 
@@ -3044,7 +3044,7 @@ mod embedded {
             let decided = Handle::decide(&door, gateway, &asked(b"left"), Instant::now());
             let mut handle = decided.expect("a decision");
             assert_eq!(live(), 1);
-            handle.released(ReleaseReason::ClientGone);
+            handle.released(ReleaseReason::ClientGone, Instant::now());
             assert_eq!((booked(&fleet), live()), (vec![0; 3], 0));
             drop(handle);
 

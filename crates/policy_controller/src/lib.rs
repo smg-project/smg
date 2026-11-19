@@ -78,9 +78,15 @@
 //!   for every host. A host that embeds the engine asks [`door::Door`],
 //!   which runs the order on the caller's thread over a
 //!   [`store::MemoryStore`]: the lease is filed at the issue, the host says
-//!   what became of it ([`door::Door::report`]) and its timer calls the
-//!   door's clock ([`door::Door::sweep`]). The standalone controller runs
-//!   the same order on its deciders' threads.
+//!   what became of it ([`door::Door::report`]), itself or through a
+//!   handle, and its timer calls the door's clock ([`door::Door::sweep`]).
+//!   The standalone controller runs the same order on its deciders'
+//!   threads.
+//! - The handle ([`handle`]): one decision of the door, held until its
+//!   request ends. A host that holds a [`handle::Handle`] says the target
+//!   it took, the dispatch, and the completion or the release, and the
+//!   handle says each report to the door once, whatever way the request
+//!   ends.
 //! - Behind the `controller` feature, the standalone controller
 //!   (`controller`): the listeners with their credentialed scopes, the
 //!   health service on each, the admin endpoints, readiness and the drain,
