@@ -3751,8 +3751,8 @@ impl Engine {
     /// keyed path before it): the profile's filters narrow the pool; the
     /// key's preferred pin, or its failover when the preferred one is
     /// unroutable, is the decision while it is under the in-flight cap; a pin
-    /// over the cap is reassigned by the stages over the candidates under the
-    /// cap (the pin stays when every candidate is over it); a key with no
+    /// at the cap puts the request to the stages again over every candidate,
+    /// and moves only to another worker under the cap; a key with no
     /// routable pin is placed by the stages. The stages are the profile's own
     /// under `delegate`, else the assignment's, and `placing` names which:
     /// the binding's placing assignment, not the rule's declared one. The
@@ -3846,11 +3846,11 @@ impl Engine {
         if let Some(i) = owner {
             let c = &candidates[i as usize];
             if Self::at_cap(rule, c) {
-                // Over the cap: the candidates under it decide; with none
-                // under it the key stays on its pin.
-                if let Some(respilled) =
-                    self.respill(profile, index, rule, placing, facts, pool, candidates, buf)
-                {
+                // At the cap: the stages place the request again, over every
+                // candidate the filters kept.
+                if let Some(respilled) = self.respill(
+                    profile, index, rule, placing, facts, pool, candidates, buf, c.id,
+                ) {
                     return respilled;
                 }
             }
@@ -3938,6 +3938,7 @@ impl Engine {
                     if capped {
                         if let Some(handed) = self.hand_on::<KEPT>(
                             profile, index, rule, placing, facts, pool, set, cx, buf, all_vetoed,
+                            first,
                         ) {
                             return handed;
                         }
@@ -3962,7 +3963,7 @@ impl Engine {
                             if Self::at_cap(rule, c) {
                                 if let Some(handed) = self.hand_on::<KEPT>(
                                     profile, index, rule, placing, facts, pool, set, cx, buf,
-                                    all_vetoed,
+                                    all_vetoed, owner,
                                 ) {
                                     return handed;
                                 }
@@ -4019,11 +4020,16 @@ impl Engine {
         rule.inflight_cap != 0 && pin.session_in_flight >= rule.inflight_cap
     }
 
-    /// A pin at its rule's in-flight cap ([`Self::at_cap`]) hands the key
-    /// on: the survivors under the cap decide, and this is their placement,
-    /// marked [`SessionVerdict::Respill`]. `None` where no survivor is under
-    /// the cap. The pin a decision reads first then keeps the key. A pin
-    /// the decision follows asks in its form's order ([`Self::hand_on`]).
+    /// A pin at its rule's in-flight cap ([`Self::at_cap`]) puts the request
+    /// to the stages again, over every survivor: the cap bounds where a pin
+    /// may move, not where a request may go. A placement on `pin` again is
+    /// the pin taken ([`SessionVerdict::Pinned`]). One on another worker
+    /// under the cap is marked [`SessionVerdict::Respill`], and its commit
+    /// fronts that worker, whichever of its targets it lands on: a
+    /// respill's alternates are the workers under the cap alone. One on
+    /// another worker at the cap carries no verdict: its commit moves no
+    /// pin. `None` where no survivor stands. A pin the decision follows
+    /// asks in its form's order ([`Self::hand_on`]).
     #[expect(
         clippy::too_many_arguments,
         reason = "the placement's inputs, as place takes them"
@@ -4038,19 +4044,35 @@ impl Engine {
         pool: &PoolFacts<'_>,
         candidates: &[Candidate],
         buf: &mut Buffers,
+        pin: WorkerId,
     ) -> Option<Decision> {
-        if !buf
-            .kept
-            .iter()
-            .any(|&k| candidates[k as usize].session_in_flight < rule.inflight_cap)
-        {
+        if buf.kept.is_empty() {
             return None;
         }
-        buf.kept
-            .retain(|&k| candidates[k as usize].session_in_flight < rule.inflight_cap);
         let mut decision = self.place(profile, index, placing, facts, pool, candidates, buf);
         if let Decision::Pick(pick) = &mut decision {
-            pick.session_verdict = SessionVerdict::Respill;
+            let taken = pick.targets.first().map(|target| target.id);
+            let under_the_cap = |id: WorkerId| {
+                buf.kept.iter().any(|&k| {
+                    let c = &candidates[k as usize];
+                    c.id == id && !Self::at_cap(rule, c)
+                })
+            };
+            pick.session_verdict = match taken {
+                Some(id) if id == pin => SessionVerdict::Pinned,
+                Some(id) if under_the_cap(id) => SessionVerdict::Respill,
+                _ => SessionVerdict::None,
+            };
+            if pick.session_verdict == SessionVerdict::Respill {
+                // A respill's commit fronts the worker it lands on, the first
+                // target or an alternate behind it: no worker at the cap
+                // stands among its targets.
+                let placed = pick.targets;
+                pick.targets.clear();
+                for target in placed.iter().filter(|target| under_the_cap(target.id)) {
+                    pick.targets.push(*target);
+                }
+            }
         }
         Some(decision)
     }
@@ -4061,8 +4083,8 @@ impl Engine {
     /// plain form asks its survivors ([`Self::respill`]). The kept form
     /// reads the veto as it stands first, as the pin read first does, and
     /// the lifted pass's survivors after: a placement of theirs says the
-    /// lift in its trace. `None` where neither holds a worker under the cap:
-    /// the key stays on the pin. Out of line: the hand-on is off a
+    /// lift in its trace. `None` where neither holds a worker: the key stays
+    /// on `pin`, the pin followed. Out of line: the hand-on is off a
     /// decision's common path.
     #[inline(never)]
     #[expect(
@@ -4081,26 +4103,28 @@ impl Engine {
         cx: &Constraints<'_>,
         buf: &mut Buffers,
         all_vetoed: bool,
+        pin: WorkerId,
     ) -> Option<Decision> {
         let candidates = set.candidates;
         if !KEPT {
-            return self.respill(profile, index, rule, placing, facts, pool, candidates, buf);
+            return self.respill(
+                profile, index, rule, placing, facts, pool, candidates, buf, pin,
+            );
         }
-        // The veto as it stands: that pass's survivors under the cap
-        // decide.
+        // The veto as it stands: that pass's survivors decide.
         if !all_vetoed && filter(profile, facts, cx, buf, set).is_none() {
-            if let Some(respilled) =
-                self.respill(profile, index, rule, placing, facts, pool, candidates, buf)
-            {
+            if let Some(respilled) = self.respill(
+                profile, index, rule, placing, facts, pool, candidates, buf, pin,
+            ) {
                 return Some(respilled);
             }
         }
-        // It keeps none under the cap: the lifted pass's survivors decide,
-        // and the trace says the lift.
+        // It keeps nobody: the lifted pass's survivors decide, and the trace
+        // says the lift.
         if vetoed::lifted(profile, index, facts, pool, set, cx, buf).is_none() {
-            if let Some(mut respilled) =
-                self.respill(profile, index, rule, placing, facts, pool, candidates, buf)
-            {
+            if let Some(mut respilled) = self.respill(
+                profile, index, rule, placing, facts, pool, candidates, buf, pin,
+            ) {
                 if let Decision::Pick(pick) = &mut respilled {
                     pick.trace.lifted = Lifted::Overload;
                 }
@@ -8206,9 +8230,11 @@ mod tests {
         }
     }
 
-    /// Two pins, the owner leading and saturated on the key, the failover
-    /// under the cap: the respill goes to the failover and the pin follows
-    /// it, so the failover leads once the owner is under the cap again.
+    /// Two pins, the owner leading and at the cap on the key. Where the
+    /// stages pick the owner again the request stays on it. Where they pick
+    /// the failover, under the cap, the respill goes there and the pin
+    /// follows it, so the failover leads once the owner is under the cap
+    /// again.
     #[test]
     fn a_saturated_owner_respills_onto_its_failover_and_the_failover_leads_after() {
         let engine = session_engine(SessionRule {
@@ -8230,7 +8256,13 @@ mod tests {
             "the first owner leads under original recovery"
         );
         pool[1].session_in_flight = 2;
-        assert_eq!(place_keyed(&engine, &pool, 7, 40).position, 2);
+        assert_eq!(
+            place_keyed(&engine, &pool, 7, 40).position,
+            1,
+            "the fewest requests are the owner's: the stages pick it again"
+        );
+        pool[1].in_flight = 5;
+        assert_eq!(place_keyed(&engine, &pool, 7, 45).position, 2);
         pool[1].session_in_flight = 0;
         assert_eq!(
             place_keyed(&engine, &pool, 7, 50).position,
@@ -8239,19 +8271,89 @@ mod tests {
         );
     }
 
-    /// With every candidate over the cap the key stays on its owner; one
-    /// candidate under the cap takes the respill.
+    /// At the cap the stages place the request over every candidate. A pick
+    /// on another worker at the cap takes the request and leaves the pin;
+    /// a pick on another worker under the cap takes the pin too.
     #[test]
-    fn with_every_candidate_over_the_cap_the_key_stays_on_its_owner() {
+    fn at_the_cap_a_request_goes_where_the_stages_say_and_the_pin_moves_only_under_the_cap() {
         let engine = session_engine(SESSIONS);
         let mut pool = vec![candidate(0, 0), candidate(1, 3), candidate(2, 3)];
         assert_eq!(place_keyed(&engine, &pool, 7, 10).position, 0);
         for c in &mut pool {
             c.session_in_flight = 2;
         }
-        assert_eq!(place_keyed(&engine, &pool, 7, 20).position, 0);
-        pool[2].session_in_flight = 1;
-        assert_eq!(place_keyed(&engine, &pool, 7, 30).position, 2);
+        assert_eq!(
+            place_keyed(&engine, &pool, 7, 20).position,
+            0,
+            "the stages pick the owner again"
+        );
+        // The fewest requests are now on a worker at the cap.
+        pool[0].in_flight = 9;
+        pool[1].in_flight = 2;
+        let decision = decide_keyed(&engine, &pool, 7, 30);
+        let pick = decision.pick().expect("the stages place");
+        assert_eq!(pick.targets.first().map(|t| t.position), Some(1));
+        assert_eq!(pick.session_verdict, SessionVerdict::None, "no pin moves");
+        assert_eq!(place_keyed(&engine, &pool, 7, 40).position, 1);
+        for c in &mut pool {
+            c.session_in_flight = 0;
+        }
+        assert_eq!(
+            place_keyed(&engine, &pool, 7, 50).position,
+            0,
+            "the pin stood on the owner"
+        );
+        // The owner at the cap again, the stages' pick under it.
+        pool[0].session_in_flight = 2;
+        assert_eq!(place_keyed(&engine, &pool, 7, 60).position, 1);
+        pool[0].session_in_flight = 0;
+        pool[0].in_flight = 0;
+        assert_eq!(
+            place_keyed(&engine, &pool, 7, 70).position,
+            1,
+            "the respill moved the pin"
+        );
+    }
+
+    /// A respill's commit fronts the worker it lands on, the first target or
+    /// an alternate behind it. So no worker at the cap stands among a
+    /// respill's targets: the pinned worker and a peer at the cap leave the
+    /// list, and an alternate's dispatch moves the pin under the cap.
+    #[test]
+    fn a_respill_names_no_alternate_at_the_cap() {
+        let engine = session_engine(SESSIONS);
+        let mut pool = vec![
+            candidate(0, 0),
+            candidate(1, 1),
+            candidate(2, 2),
+            candidate(3, 3),
+        ];
+        assert_eq!(place_keyed(&engine, &pool, 7, 10).position, 0);
+        // The pin at the cap and the busiest; the stages' second choice at
+        // the cap too.
+        pool[0].session_in_flight = 2;
+        pool[0].in_flight = 9;
+        pool[2].session_in_flight = 2;
+        let decision = decide_keyed(&engine, &pool, 7, 20);
+        let pick = decision.pick().expect("the respill places");
+        assert_eq!(pick.session_verdict, SessionVerdict::Respill);
+        let placed: Vec<u32> = pick.targets.iter().map(|t| t.position).collect();
+        assert_eq!(placed, [1, 3], "the workers under the cap alone");
+        // The alternate's dispatch, under the decision's verdict.
+        let alternate = pick.targets.as_slice()[1];
+        let lease = Lease {
+            session: session(7),
+            session_verdict: pick.session_verdict,
+            issued_micros: 20,
+            ..Lease::default()
+        };
+        engine.on_dispatched(&lease, &alternate, Side::Single, 0);
+        pool[0].session_in_flight = 0;
+        assert_eq!(
+            place_keyed(&engine, &pool, 7, 30).position,
+            3,
+            "the pin moved under the cap"
+        );
     }
 
     /// A key with no routable pin is placed by the rule's assignment: the
@@ -8898,14 +9000,15 @@ mod tests {
 
     /// A pin over the rule's in-flight cap respills by the binding's placing
     /// assignment too: under the `manual` picker a `delegate` rule hands the
-    /// key to the fewest in flight of the candidates under the cap, and the
-    /// decision says a respill.
+    /// key to the fewest in flight of the candidates, and the decision says
+    /// a respill where that is another worker under the cap.
     #[test]
     fn a_respill_under_the_manual_picker_takes_the_fewest_in_flight() {
         let engine = manual_engine(Some(SESSIONS));
         let mut pool = vec![candidate(0, 5), candidate(1, 0), candidate(2, 3)];
         assert_eq!(place_keyed(&engine, &pool, 7, 10).position, 1);
         pool[1].session_in_flight = SESSIONS.inflight_cap;
+        pool[1].in_flight = 9;
         let decision = decide_keyed(&engine, &pool, 7, 20);
         let pick = decision.pick().expect("the respill places");
         assert_eq!(pick.session_verdict, SessionVerdict::Respill);
@@ -8944,6 +9047,7 @@ mod tests {
         let pinned = (SessionVerdict::Pinned, rule.ttl_micros);
         assert_eq!(said(&engine, &pool, 7, 20), pinned);
         pool[1].session_in_flight = rule.inflight_cap;
+        pool[1].in_flight = 9;
         let respill = (SessionVerdict::Respill, rule.ttl_micros);
         assert_eq!(said(&engine, &pool, 7, 30), respill);
         let for_ever = manual_engine(Some(SESSIONS));

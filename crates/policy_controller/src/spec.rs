@@ -1384,8 +1384,10 @@ pub struct SessionsSpec {
     /// the `manual` picker, a request with no key as well.
     #[serde(default)]
     pub assignment: Assignment,
-    /// How many requests of one key a worker carries before the next steps
-    /// aside; above zero (default 2), `65535` for no cap.
+    /// How many requests of one key a worker carries before the next is
+    /// placed again; above zero (default 2), `65535` for no cap. At the cap
+    /// the stages place the request over every usable worker, and the pin
+    /// moves only to another worker under the cap.
     #[serde(default = "default_inflight_cap")]
     #[schemars(range(min = 1))]
     pub inflight_cap: u16,

@@ -2187,10 +2187,12 @@ mod tests {
     /// The rule's in-flight cap holds for a pin the lifted pass lands on as
     /// it holds for a pin read first: the lift is of the overload veto, and
     /// of no other limit. A pin that carries the cap's requests of the key
-    /// hands the key to the ring's next worker, over its thresholds as under
-    /// them. With every worker at the cap the key stays on its pin.
+    /// puts the request to the ring again. Under its thresholds the ring
+    /// places the key on its pin. Over them the veto as it stands drops
+    /// the pin, and the ring's next worker takes the key. With every
+    /// worker over its thresholds the key stays on its pin, by the lift.
     #[test]
-    fn a_followed_pin_at_the_rules_cap_hands_the_key_on() {
+    fn a_followed_pin_at_the_rules_cap_puts_the_key_to_the_ring_again() {
         let engine = ring_under_a_cap(2);
         let mut pool = [free(0, 4), free(1, 4), free(2, 4), free(3, 4)];
         let ring = ring_order(&engine_of("consistent_hashing", false), &keyed("k1"), &pool);
@@ -2210,30 +2212,32 @@ mod tests {
         // The pin carries two requests of the key, the rule's cap.
         pool[owner].session_in_flight = 2;
         pool[owner].health.overloaded = false;
-        // Under its thresholds the pin hands the key on.
+        // Under its thresholds the ring places the key on its pin again.
         let under = decide(&engine, &request, &pool);
-        assert_eq!(order(&under)[0], ring[1], "under its thresholds");
-        assert_eq!(verdict(&under), SessionVerdict::Respill);
-        // Over them it hands the key on as well.
+        assert_eq!(order(&under)[0], ring[0], "under its thresholds");
+        assert_eq!(verdict(&under), SessionVerdict::Pinned);
+        // Over them the veto as it stands drops the pin: the ring's next
+        // worker takes the key.
         pool[owner].health.overloaded = true;
         let over = decide(&engine, &request, &pool);
         assert_eq!(order(&over)[0], ring[1], "over its thresholds");
         assert_eq!(verdict(&over), SessionVerdict::Respill);
         assert_eq!(over.trace().lifted, Lifted::None);
-        // Every worker over its thresholds: the placement stands by the lift.
+        // Every worker over its thresholds: the lifted pass places the key
+        // on its pin again, and the placement stands by the lift.
         for candidate in &mut pool {
             candidate.health.overloaded = true;
         }
         let all = decide(&engine, &request, &pool);
-        assert_eq!(order(&all)[0], ring[1], "every worker over");
-        assert_eq!(verdict(&all), SessionVerdict::Respill);
+        assert_eq!(order(&all)[0], ring[0], "every worker over");
+        assert_eq!(verdict(&all), SessionVerdict::Pinned);
         assert_eq!(all.trace().lifted, Lifted::Overload);
-        // Every worker at the cap: the key stays on its pin.
+        // Every worker at the cap as well: the key stays on its pin.
         for candidate in &mut pool {
             candidate.session_in_flight = 2;
         }
         let stays = decide(&engine, &request, &pool);
-        assert_eq!(order(&stays)[0], ring[0], "no worker under the cap");
+        assert_eq!(order(&stays)[0], ring[0], "every worker at the cap");
         assert_eq!(verdict(&stays), SessionVerdict::Pinned);
     }
 
@@ -2565,11 +2569,11 @@ mod tests {
     /// placed the key on that worker or follows the claim onto it. Under
     /// the cap the decision follows the claim onto a worker over its
     /// thresholds.
-    /// Where that worker carries the cap's requests of the key, the key is
-    /// handed on by the veto as it stands. Where the lifted pass alone
-    /// keeps a worker under the cap, that worker takes the key and the
-    /// trace says the lift. With every worker at the cap the key stays on
-    /// the claim.
+    /// Where that worker carries the cap's requests of the key, the request
+    /// is put to the ring again by the veto as it stands. A survivor under
+    /// the cap takes the key. A survivor at the cap takes the request and
+    /// no pin moves, though the lifted pass would keep a worker under the
+    /// cap. Placed on the claimed worker again, the key stays on the claim.
     #[test]
     fn a_followed_claim_at_the_rules_cap_hands_the_key_on() {
         let rule = SessionRule {
@@ -2592,6 +2596,7 @@ mod tests {
             }
         };
         let (pinned, handed) = (SessionVerdict::Pinned, SessionVerdict::Respill);
+        let none = SessionVerdict::None;
         let under = followed(ring_with_a_gap(Some(rule)), &ring, at(1));
         assert_eq!(under, (ring[1], pinned, Lifted::None), "under the cap");
         let on = followed(ring_with_a_gap(Some(rule)), &ring, at(2));
@@ -2606,28 +2611,29 @@ mod tests {
             pool[last].health.overloaded = true;
             pool[last].session_in_flight = 0;
         });
-        assert_eq!(lifted, (ring[3], handed, Lifted::Overload), "by the lift");
+        assert_eq!(lifted, (ring[0], none, Lifted::None), "no veto is lifted");
         let stays = followed(ring_with_a_gap(Some(rule)), &ring, |pool| {
             for candidate in pool.iter_mut() {
                 candidate.session_in_flight = 2;
             }
             pool[claimed].health.overloaded = true;
         });
-        assert_eq!(stays, (ring[1], pinned, Lifted::None), "no worker under it");
+        assert_eq!(stays, (ring[0], none, Lifted::None), "no worker under it");
         // This decision sees the ring's first worker down as the other
         // does: its own placement is the claimed worker.
         let same = followed(ring_with_a_gap(Some(rule)), &ring, |pool| {
             pool[ring[0] as usize].health.healthy = false;
             pool[claimed].session_in_flight = 2;
         });
-        assert_eq!(same, (ring[2], handed, Lifted::None), "placed on the claim");
+        assert_eq!(same, (ring[1], pinned, Lifted::None), "placed on the claim");
     }
 
     /// The plain form follows a claim made in its gap under the same cap.
     /// The followed worker is among the survivors the standing veto kept.
-    /// At the cap it hands the key to a survivor under it. With every
-    /// survivor at the cap the key stays on the claim, though a worker
-    /// over its thresholds is under the cap: this form lifts no veto.
+    /// At the cap the ring places the request again. A survivor under the
+    /// cap takes the key. One at the cap takes the request and no pin
+    /// moves, though a worker over its thresholds is under the cap: this
+    /// form lifts no veto.
     #[test]
     fn a_followed_claim_at_the_cap_hands_the_key_on_under_the_standing_veto() {
         let rule = SessionRule {
@@ -2642,6 +2648,7 @@ mod tests {
         let ring = ring_order(&ringed, &keyed("k1"), &pool);
         let (claimed, last) = (ring[1] as usize, ring[3] as usize);
         let (pinned, handed) = (SessionVerdict::Pinned, SessionVerdict::Respill);
+        let none = SessionVerdict::None;
         let under = followed(plain_ring_with_a_gap(rule), &ring, |pool| {
             pool[claimed].session_in_flight = 1;
         });
@@ -2655,11 +2662,7 @@ mod tests {
                 candidate.session_in_flight = 2;
             }
         });
-        assert_eq!(
-            stays,
-            (ring[1], pinned, Lifted::None),
-            "no survivor under it"
-        );
+        assert_eq!(stays, (ring[0], none, Lifted::None), "no survivor under it");
         // The ring's last is under the cap and over its thresholds.
         let refused = followed(plain_ring_with_a_gap(rule), &ring, |pool| {
             for candidate in pool.iter_mut() {
@@ -2668,25 +2671,22 @@ mod tests {
             pool[last].health.overloaded = true;
             pool[last].session_in_flight = 0;
         });
-        assert_eq!(
-            refused,
-            (ring[1], pinned, Lifted::None),
-            "no veto is lifted"
-        );
+        assert_eq!(refused, (ring[0], none, Lifted::None), "no veto is lifted");
         // This decision sees the ring's first worker down as the other
         // does: its own placement is the claimed worker.
         let same = followed(plain_ring_with_a_gap(rule), &ring, |pool| {
             pool[ring[0] as usize].health.healthy = false;
             pool[claimed].session_in_flight = 2;
         });
-        assert_eq!(same, (ring[2], handed, Lifted::None), "placed on the claim");
+        assert_eq!(same, (ring[1], pinned, Lifted::None), "placed on the claim");
     }
 
-    /// A key handed on at the cap reads the veto as it stands, from a pin
-    /// over its thresholds as from one under them: it passes the ring's next
-    /// worker where that worker is over its thresholds beside free ones.
-    /// Where the standing veto keeps no worker under the cap, the lifted
-    /// pass's survivors decide, and the trace says the lift.
+    /// A key handed on at the cap reads the veto as it stands: from a pin
+    /// over its thresholds it passes the ring's next worker where that
+    /// worker is over its thresholds beside free ones. Where the free
+    /// workers carry the cap too, the first of them still takes the
+    /// request and no pin moves: the lifted pass's survivors decide only
+    /// where the standing veto keeps no worker.
     #[test]
     fn a_key_handed_on_at_the_cap_passes_a_worker_over_its_thresholds() {
         let engine = ring_under_a_cap(2);
@@ -2702,21 +2702,23 @@ mod tests {
         // next worker is over its thresholds beside two free ones.
         pool[owner].session_in_flight = 2;
         pool[next].health.overloaded = true;
+        // Under its thresholds the ring places the key on its pin again.
         let under = decide(&engine, &request, &pool);
-        assert_eq!(order(&under)[0], ring[2], "the pin under its thresholds");
+        assert_eq!(order(&under)[0], ring[0], "the pin under its thresholds");
         pool[owner].health.overloaded = true;
         let over = decide(&engine, &request, &pool);
         assert_eq!(order(&over)[0], ring[2], "the pin over its thresholds");
         assert_eq!(over.trace().lifted, Lifted::None);
-        // The free workers carry the cap too: the one worker under it is
-        // over its thresholds, and the key goes there by the lift.
+        // The free workers carry the cap too. The veto as it stands still
+        // keeps them: the ring's first of them takes the request, no veto
+        // is lifted, and no pin moves to a worker at the cap.
         pool[ring[2] as usize].session_in_flight = 2;
         pool[ring[3] as usize].session_in_flight = 2;
-        let lifted = decide(&engine, &request, &pool);
-        assert_eq!(order(&lifted)[0], ring[1], "one worker under the cap");
-        let pick = lifted.pick().expect("a pick");
-        assert_eq!(pick.session_verdict, SessionVerdict::Respill);
-        assert_eq!(lifted.trace().lifted, Lifted::Overload);
+        let standing = decide(&engine, &request, &pool);
+        assert_eq!(order(&standing)[0], ring[2], "a free worker at the cap");
+        let pick = standing.pick().expect("a pick");
+        assert_eq!(pick.session_verdict, SessionVerdict::None);
+        assert_eq!(standing.trace().lifted, Lifted::None);
     }
 
     /// A kept key leaves its worker at the rule's cap alone, so a capped

@@ -1207,7 +1207,7 @@
           "default": "delegate"
         },
         "inflight_cap": {
-          "description": "How many requests of one key a worker carries before the next steps\naside; above zero (default 2), `65535` for no cap.",
+          "description": "How many requests of one key a worker carries before the next is\nplaced again; above zero (default 2), `65535` for no cap. At the cap\nthe stages place the request over every usable worker, and the pin\nmoves only to another worker under the cap.",
           "type": "integer",
           "format": "uint16",
           "minimum": 1,
