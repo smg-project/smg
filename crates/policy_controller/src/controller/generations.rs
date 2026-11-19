@@ -1492,6 +1492,47 @@ impl Generations {
         self.dir.get().is_some()
     }
 
+    /// The spec slice of the operators' snapshot, or `None` where the
+    /// controller was given no spec source: the number and the digest the
+    /// store runs, the time its document was applied where this door holds
+    /// that document, and the generations on file that a rollback can name
+    /// beside the standing one, ascending. A file keeps its one document,
+    /// so nothing is retained under it. The holder's lock is held across
+    /// the list's read: an apply swaps the holder before it lists its file,
+    /// so no number above the standing one is told as retained.
+    pub(crate) fn status(&self) -> Option<proto::SpecStatus> {
+        let held = self.held.lock();
+        let writable = self.writable();
+        if !writable && held.is_none() {
+            return None;
+        }
+        let (generation, digest) = self.standing();
+        let applied = held
+            .as_ref()
+            .filter(|held| held.generation == generation)
+            .map(|held| held.applied);
+        let mode = if applied.is_some() {
+            proto::ApplyMode::Enforce
+        } else {
+            proto::ApplyMode::Unspecified
+        };
+        let retained = self
+            .on_file
+            .lock()
+            .iter()
+            .map(|retained| retained.persisted.generation)
+            .filter(|number| *number != generation)
+            .collect();
+        Some(proto::SpecStatus {
+            generation,
+            digest: digest.map_or_else(String::new, |digest| digest.to_string()),
+            applied_unix_micros: applied.map_or(0, unix_micros),
+            mode: mode.into(),
+            retained,
+            source: if writable { "api" } else { "file" }.to_owned(),
+        })
+    }
+
     /// The generations on file as a refusal names them, under a spec store.
     fn listed(&self) -> Option<OnFile> {
         self.writable().then(|| {
@@ -4536,6 +4577,114 @@ pub(crate) mod tests {
         assert_eq!(names(dir.path()), on_file);
         // The number the flag's help states.
         assert_eq!(names(dir.path()).len(), 8);
+    }
+
+    /// The status a snapshot tells of the spec. No source: none. A file:
+    /// the standing document's number, digest and time, and nothing
+    /// retained. A store: the generations on file that a rollback can name
+    /// beside the standing one, and a start on the directory lists the same.
+    #[test]
+    fn the_status_names_the_standing_generation_and_what_a_rollback_can_name() {
+        let (_store, sourceless) = generations();
+        assert_eq!(sourceless.status(), None);
+
+        let (_store, file) = generations();
+        yaml(&file, LEAST_LOAD).expect("it runs");
+        let status = file.status().expect("a source");
+        assert!(status.applied_unix_micros > 0, "{status:?}");
+        assert_eq!(
+            status,
+            proto::SpecStatus {
+                generation: 1,
+                digest: file.standing().1.expect("a digest").to_string(),
+                applied_unix_micros: status.applied_unix_micros,
+                mode: proto::ApplyMode::Enforce.into(),
+                retained: Vec::new(),
+                source: "file".to_owned(),
+            }
+        );
+
+        // A store with nothing on file: the store's own number, and no
+        // document's digest, time or mode.
+        let (dir, _store, stored) = stored();
+        let empty = proto::SpecStatus {
+            source: "api".to_owned(),
+            ..proto::SpecStatus::default()
+        };
+        assert_eq!(stored.status(), Some(empty));
+        for (number, document) in [
+            (1, LEAST_LOAD.to_owned()),
+            (2, RANDOM.to_owned()),
+            (3, bound_to(3)),
+        ] {
+            let ran = enforce(&stored, document).map(|(number, _)| number);
+            assert_eq!(ran, Ok(number));
+        }
+        let status = stored.status().expect("a source");
+        assert_eq!(
+            (
+                status.generation,
+                status.retained.as_slice(),
+                status.source.as_str()
+            ),
+            (3, &[1, 2][..], "api")
+        );
+        assert_eq!(
+            status.digest,
+            stored.standing().1.expect("a digest").to_string()
+        );
+        assert_eq!(status.mode, i32::from(proto::ApplyMode::Enforce));
+        assert!(status.applied_unix_micros > 0, "{status:?}");
+
+        // A rollback runs generation 1 again as generation 4: the three
+        // before it are what the next rollback can name.
+        assert_eq!(roll_back(&stored, 1).map(|(number, _)| number), Ok(4));
+        let rolled = stored.status().expect("a source");
+        assert_eq!(
+            (rolled.generation, rolled.retained.as_slice()),
+            (4, &[1, 2, 3][..])
+        );
+
+        // A start on the same directory lists the same.
+        drop(stored);
+        let (_store, again) = generations();
+        bind(&again, dir.path());
+        let listed = again.status().expect("a source");
+        assert_eq!(
+            (
+                listed.generation,
+                listed.retained,
+                listed.digest,
+                listed.source
+            ),
+            (4, vec![1, 2, 3], rolled.digest, "api".to_owned())
+        );
+    }
+
+    /// A door tells the time and the mode of a document it holds, and of no
+    /// other: where the store runs a generation another door applied, the
+    /// status names that generation with its digest and no time.
+    #[test]
+    fn the_status_tells_no_time_of_a_document_its_door_does_not_hold() {
+        let (store, first) = generations();
+        yaml(&first, LEAST_LOAD).expect("it runs");
+        let second = Generations::new(Arc::clone(&store), stock());
+        yaml(&second, RANDOM).expect("it runs");
+        let (generation, digest) = first.standing();
+        assert_eq!(generation, 2);
+        assert_eq!(
+            first.status(),
+            Some(proto::SpecStatus {
+                generation,
+                digest: digest.expect("a digest").to_string(),
+                source: "file".to_owned(),
+                ..proto::SpecStatus::default()
+            })
+        );
+        // The door that applied it tells its time.
+        let told = second.status().expect("a source");
+        assert_eq!(told.mode, i32::from(proto::ApplyMode::Enforce));
+        assert!(told.applied_unix_micros > 0, "{told:?}");
     }
 
     /// Two doors on one directory, as two processes hold one, each enforce

@@ -52,6 +52,7 @@ mod replication;
 mod run;
 mod service;
 mod session;
+mod snapshot;
 mod spec_file;
 mod spec_store;
 mod standby;

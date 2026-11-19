@@ -413,25 +413,57 @@ async fn turned(polls: &mut watch::Receiver<bool>) -> bool {
     *polls.borrow_and_update()
 }
 
-/// What a log line calls an engine: the host and port of its address, never
-/// the address whole (a worker URL may carry userinfo, which no log line
-/// gets; the gRPC client names its peers the same way). An address with an
-/// `@` past its first `/`, `?` or `#` is named by the marker the gateway
-/// writes for an address it cannot parse: a userinfo that holds one of the
+/// What stands for an address whose userinfo cannot be told from what
+/// follows it: the marker the gateway writes for an address it cannot
+/// parse.
+pub(crate) const UNPARSABLE: &str = "<unparsable address>";
+
+/// An address in its parts around the userinfo ([`split`]). The userinfo
+/// itself is in none of them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Address<'a> {
+    /// The text through `://`; empty where the address has none.
+    pub(crate) scheme: &'a str,
+    /// Whether a userinfo stood before the host.
+    pub(crate) userinfo: bool,
+    /// The host and the port.
+    pub(crate) host: &'a str,
+    /// What follows the authority: a path, a query, a fragment.
+    pub(crate) tail: &'a str,
+}
+
+/// `address` split around its userinfo: the one place of the crate that
+/// tells a credential from an address. The authority ends at the first `/`,
+/// `?` or `#`, and its last `@` ends the userinfo. `None` for an address
+/// with an `@` past the authority's end: a userinfo that holds one of the
 /// three raw reads like a path or a query that holds an `@`, and a guess
-/// could print part of the userinfo.
-fn peer(engine: &str) -> &str {
-    let rest = engine
-        .split_once("://")
-        .map_or(engine, |(_scheme, rest)| rest);
+/// could tell part of the userinfo.
+pub(crate) fn split(address: &str) -> Option<Address<'_>> {
+    let start = address.find("://").map_or(0, |at| at + "://".len());
+    let (scheme, rest) = address.split_at(start);
     let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let (authority, tail) = rest.split_at(end);
     if tail.contains('@') {
-        return "<unparsable address>";
+        return None;
     }
-    authority
+    let (userinfo, host) = authority
         .rsplit_once('@')
-        .map_or(authority, |(_userinfo, host)| host)
+        .map_or((false, authority), |(_userinfo, host)| (true, host));
+    Some(Address {
+        scheme,
+        userinfo,
+        host,
+        tail,
+    })
+}
+
+/// What a log line calls an engine: the host and port of its address, never
+/// the address whole (a worker URL may carry userinfo, which no log line
+/// gets; the gRPC client names its peers the same way). An address whose
+/// userinfo cannot be told from what follows it ([`split`]) is named by
+/// [`UNPARSABLE`].
+fn peer(engine: &str) -> &str {
+    split(engine).map_or(UNPARSABLE, |address| address.host)
 }
 
 impl<S, P> LoadDriver<S, P>

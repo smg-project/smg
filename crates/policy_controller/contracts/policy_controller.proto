@@ -919,7 +919,9 @@ message SnapshotRequest {
   repeated string models = 2;
   // Admin only in the control scope: identifiers in clear.
   bool plain_identifiers = 3;
-  // Rows per slice at most; `truncated` says when it bit.
+  // Rows per slice at most; 0 sets no limit. A slice's rows are bounded by
+  // the bytes of a page as well, whatever is asked. `truncated` says when
+  // either bound left a row out.
   uint32 limit = 4;
 }
 

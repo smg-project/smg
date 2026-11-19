@@ -528,6 +528,12 @@ pub(crate) fn open(
     })
 }
 
+/// Whether `row` serves one of `models`, the ids a caller asked for; none
+/// asked is every model. A watch and the operators' snapshot ask alike.
+pub(super) fn serves(models: &[String], row: &WorkerRow) -> bool {
+    models.is_empty() || row.facts.models.iter().any(|model| models.contains(model))
+}
+
 /// The models a watcher asked for; none is every model.
 #[derive(Debug)]
 struct Asked {
@@ -536,12 +542,7 @@ struct Asked {
 
 impl Asked {
     fn serves(&self, row: &WorkerRow) -> bool {
-        self.models.is_empty()
-            || row
-                .facts
-                .models
-                .iter()
-                .any(|model| self.models.contains(model))
+        serves(&self.models, row)
     }
 
     /// Whether a watch comes to the write: a row it names serves an asked
@@ -594,13 +595,25 @@ pub(super) fn fill<'a>(
     rows: impl IntoIterator<Item = &'a WorkerRow>,
     told: impl Fn(&WorkerRow) -> proto::WorkerRow,
 ) -> Vec<proto::WorkerRow> {
+    fill_within(PAGE, rows, told)
+}
+
+/// [`fill`] under a count of the caller's: at most `most` of `rows` while
+/// they take at most [`PAGE_BYTES`] on the wire, the first whatever it
+/// weighs. The operators' snapshot is one such page, under its caller's
+/// limit.
+pub(super) fn fill_within<'a>(
+    most: usize,
+    rows: impl IntoIterator<Item = &'a WorkerRow>,
+    told: impl Fn(&WorkerRow) -> proto::WorkerRow,
+) -> Vec<proto::WorkerRow> {
     let mut page = Vec::new();
     let mut bytes = 0;
-    for row in rows.into_iter().take(PAGE) {
+    for row in rows.into_iter().take(most) {
         let told = told(row);
         // A row in a page: its bytes under the page's tag and a length
-        // (`WorkerSnapshot.workers`, `ReplicationSnapshot.workers`: a tag
-        // of one byte each).
+        // (`WorkerSnapshot.workers`, `ReplicationSnapshot.workers`,
+        // `Snapshot.workers`: a tag of one byte each).
         let framed = message::encoded_len(1, &told);
         if !page.is_empty() && bytes + framed > PAGE_BYTES {
             break;
