@@ -3,6 +3,7 @@
 //! plus the connect entry points and metadata reads.
 
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, HashMap},
     path::Path,
     sync::{Arc, OnceLock},
@@ -877,6 +878,13 @@ impl ZmqEngineClient {
             validate_token_ids(&req, &media.embed_positions, vocab_size)
                 .map_err(tonic::Status::invalid_argument)?;
         }
+        // The EOS ids every sub carries, past-vocabulary ones dropped: they
+        // ride `_all_stop_token_ids` even under `ignore_eos`, where they would
+        // index the logits as surely as a caller's id the check refused.
+        let eos = match self.vocab_size() {
+            Some(vocab_size) => self.effective_eos().within_vocab(vocab_size),
+            None => Cow::Borrowed(self.effective_eos()),
+        };
         let subs = fan_out_requests(req);
         let last = subs.len().saturating_sub(1);
         let mut media = Some(media);
@@ -892,14 +900,9 @@ impl ZmqEngineClient {
             // Worker-processed tensors ride as aux frames; each choice's
             // message carries them (shared bytes, not copies).
             let aux_frames = sub_media.aux_frames.clone();
-            let mut request = translate_request_with_media(
-                sub,
-                sub_media,
-                max_model_len,
-                self.effective_eos(),
-                support,
-            )
-            .map_err(tonic::Status::invalid_argument)?;
+            let mut request =
+                translate_request_with_media(sub, sub_media, max_model_len, &eos, support)
+                    .map_err(tonic::Status::invalid_argument)?;
             request.trace_headers.clone_from(&trace_headers);
             // The engine returns the sampled/prompt token's logprob
             // plus the requested ranked candidates per position; carry
@@ -2776,6 +2779,15 @@ mod tests {
     /// `count` mock ranks behind one vLLM-dialect client, kept alive so they
     /// can answer utility calls.
     async fn connected_ranks(dir: &Path, count: usize) -> (ZmqEngineClient, Vec<MockEngine>) {
+        connected_ranks_with_eos(dir, count, EosTokenIds::default()).await
+    }
+
+    /// [`connected_ranks`] with a connect-time EOS set.
+    async fn connected_ranks_with_eos(
+        dir: &Path,
+        count: usize,
+        eos: EosTokenIds,
+    ) -> (ZmqEngineClient, Vec<MockEngine>) {
         let ep = |name: &str| format!("ipc://{}", dir.join(name).display());
         let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
         let ranks = (0..count as u32).map(|rank| {
@@ -2795,7 +2807,7 @@ mod tests {
                 &output,
                 count,
                 "org/repo".to_string(),
-                EosTokenIds::default(),
+                eos,
                 RuntimeType::Vllm,
                 Duration::from_secs(10)
             ),
@@ -3325,6 +3337,95 @@ mod tests {
         };
         assert_eq!(add.prompt_token_ids, Some(vec![5, 1000, 1000, 6]));
         assert!(add.mm_features.is_some(), "the image rides along");
+    }
+
+    /// EOS ids past the vocabulary never reach the engine: not the primary
+    /// (`_eos_token_id`), not the extras folded into `stop_token_ids`, and not
+    /// `_all_stop_token_ids`, which carries them even under `ignore_eos` and
+    /// which the engine's `min_tokens` mask indexes the logits with. That
+    /// holds for a connect-time set and for one adopted from the tokenizer;
+    /// in-range ids keep their places.
+    #[tokio::test]
+    async fn eos_ids_past_the_vocabulary_never_reach_the_engine() {
+        // Each request its own id: a dropped stream's abort is asynchronous.
+        let request = |id: &str, ignore_eos: bool| vllm::GenerateRequest {
+            request_id: id.to_string(),
+            input: Some(vllm::generate_request::Input::Tokenized(
+                vllm::TokenizedInput {
+                    original_text: String::new(),
+                    input_ids: vec![1, 2, 3],
+                },
+            )),
+            sampling_params: Some(vllm::SamplingParams {
+                max_tokens: Some(4),
+                min_tokens: 1,
+                stop_token_ids: vec![9],
+                ignore_eos,
+                ..Default::default()
+            }),
+            stream: true,
+            ..Default::default()
+        };
+        async fn sent(
+            client: &ZmqEngineClient,
+            engine: &mut MockEngine,
+            req: vllm::GenerateRequest,
+        ) -> EngineCoreSamplingParams {
+            let _streams = client.generate_vllm_streams(req).await.expect("accepted");
+            // Skip the abort a previous request's dropped streams sent.
+            loop {
+                if let EngineInbound::Add(add) = engine.recv().await.expect("inbound") {
+                    return add.sampling_params.expect("sampling params");
+                }
+            }
+        }
+
+        // Connect-time set: primary 1500 and extra 1600 lie past the vocabulary.
+        let dir = tempfile::tempdir().unwrap();
+        let (client, mut engines) =
+            connected_ranks_with_eos(dir.path(), 1, EosTokenIds::new(Some(1500), vec![7, 1600]))
+                .await;
+        client.set_vocab_size(1000);
+        let sp = sent(&client, &mut engines[0], request("a", false)).await;
+        assert_eq!(sp.eos_token_id, None);
+        assert_eq!(sp.stop_token_ids, vec![9, 7]);
+        assert_eq!(sp.all_stop_token_ids, [7, 9].into_iter().collect());
+        let sp = sent(&client, &mut engines[0], request("b", true)).await;
+        assert_eq!(sp.eos_token_id, None);
+        assert_eq!(sp.stop_token_ids, vec![9]);
+        assert_eq!(sp.all_stop_token_ids, [7, 9].into_iter().collect());
+
+        // An in-range primary stays; only the out-of-range extra goes.
+        let dir = tempfile::tempdir().unwrap();
+        let (client, mut engines) =
+            connected_ranks_with_eos(dir.path(), 1, EosTokenIds::new(Some(2), vec![1500, 7])).await;
+        client.set_vocab_size(1000);
+        let sp = sent(&client, &mut engines[0], request("c", false)).await;
+        assert_eq!(sp.eos_token_id, Some(2));
+        assert_eq!(sp.stop_token_ids, vec![9, 7]);
+        assert_eq!(sp.all_stop_token_ids, [2, 7, 9].into_iter().collect());
+
+        // Adopted from the tokenizer: MockTokenizer's EOS is 999, past a
+        // vocabulary of 500.
+        let dir = tempfile::tempdir().unwrap();
+        let (client, mut engines) = connected_ranks(dir.path(), 1).await;
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
+        client.adopt_tokenizer_eos(Some(&tokenizer));
+        client.set_vocab_size(500);
+        for (id, ignore_eos) in [("d", false), ("e", true)] {
+            let sp = sent(&client, &mut engines[0], request(id, ignore_eos)).await;
+            assert_eq!(sp.eos_token_id, None);
+            assert_eq!(sp.stop_token_ids, vec![9]);
+            assert_eq!(sp.all_stop_token_ids, [9].into_iter().collect());
+        }
+
+        // An unknown vocabulary leaves the set as configured.
+        let dir = tempfile::tempdir().unwrap();
+        let (client, mut engines) =
+            connected_ranks_with_eos(dir.path(), 1, EosTokenIds::new(Some(1500), vec![1600])).await;
+        let sp = sent(&client, &mut engines[0], request("f", false)).await;
+        assert_eq!(sp.eos_token_id, Some(1500));
+        assert_eq!(sp.all_stop_token_ids, [9, 1500, 1600].into_iter().collect());
     }
 
     /// A request shaped like the gateway's language-model-only PD decode

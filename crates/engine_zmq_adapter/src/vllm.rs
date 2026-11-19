@@ -1166,10 +1166,11 @@ pub(crate) fn validate_sampling(sp: &vllm::SamplingParams, max_tokens: u32) -> R
 /// illegal-address fault that takes down every DP rank of the engine.
 ///
 /// Checked before translation folds the engine's EOS ids into the stop set
-/// (those are the server's, not the caller's). A caller that derives stop ids
-/// of its own before this (the servicer's single-token string stops and EOS
-/// backstop) drops any the model cannot sample, so a refusal names the
-/// caller's ids.
+/// (those are the server's, not the caller's: the client drops any past the
+/// vocabulary instead, [`EosTokenIds::within_vocab`]). A caller that derives
+/// stop ids of its own before this (the servicer's single-token string stops
+/// and EOS backstop) drops any the model cannot sample, so a refusal names
+/// the caller's ids.
 ///
 /// Prompt ids are bounded by position. vLLM bounds them all by the larger of
 /// the model's and the tokenizer's vocabulary, because some multimodal
