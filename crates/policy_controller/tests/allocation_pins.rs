@@ -124,9 +124,9 @@ fn a_decision_after_the_first_allocates_nothing_for_any_preset() {
 /// keeps of the rows in front stands in buffers every first decision
 /// sized: their sums in the stage's, their list in the soft filter's
 /// backup. The preset is read with its soft filters and without them. A
-/// profile without one takes the list's room at its first decision by
-/// rank: behind a whole pass that decision allocates once, and the next
-/// allocates nothing.
+/// whole pass by the profile's one test of a row asks for every buffer's
+/// room, as a draw does: the decision by rank behind it allocates
+/// nothing, with a soft filter or without.
 #[test]
 fn a_decision_by_rank_after_the_first_allocates_nothing() {
     let mut bare = PolicySpec::preset("cache_aware").expect("a preset");
@@ -223,12 +223,8 @@ fn a_decision_by_rank_after_the_first_allocates_nothing() {
                 targets, fastest,
                 "soft {soft} at {n}, order {order}: the fastest holders, in their order"
             );
-            // A whole pass sizes no list of the rows in front: without a
-            // soft filter the first decision by rank takes that room.
-            let lists_late = !soft && !*reported;
             assert_eq!(
-                allocations,
-                usize::from(lists_late),
+                allocations, 0,
                 "soft {soft} at {n}, order {order}: a decision by rank allocated"
             );
             let (_, again) =

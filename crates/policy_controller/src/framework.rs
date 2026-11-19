@@ -814,9 +814,11 @@ impl Buffers {
     /// Room in every buffer for the whole pass over a pool of `rows`. A
     /// decision that draws first writes a few rows and asks for the room
     /// all the same: the pass it widens to may be many decisions away, and
-    /// it allocates nothing the thread's first decision did not. A decision
-    /// by rank asks for no more than the whole pass: what it keeps of the
-    /// rows in front stands in these buffers ([`combine_few`]).
+    /// it allocates nothing the thread's first decision did not. A whole
+    /// pass by the profile's one test of a row asks for it too
+    /// ([`run_whole`]). A decision by rank asks for no more than the whole
+    /// pass: what it keeps of the rows in front stands in these buffers
+    /// ([`combine_few`]).
     fn reserve(&mut self, rows: usize) {
         if self.room < rows {
             self.grow(rows);
@@ -1807,6 +1809,14 @@ struct Set<'a> {
 }
 
 impl<'a> Set<'a> {
+    /// Whether the set holds the single plan's whole pool: no class
+    /// narrows it and no rule of the `epd` plan reads its rows, so the
+    /// profile's filters alone decide which rows stand. A whole pass asks
+    /// the profile's fold about such a set alone ([`run_whole`]).
+    const fn plain(&self) -> bool {
+        self.class.is_none() && self.partnered.is_none() && !self.encode
+    }
+
     /// One side of a pair: `candidates` narrowed by the classes a chosen
     /// prefill pairs with or by the partnered list. A side sheds a pool the
     /// overload veto empties: the pair plan does not enter the all-vetoed
@@ -1918,6 +1928,88 @@ fn run_single(
     score_survivors(profile, index, facts, pool, candidates, buf)
 }
 
+/// The whole pass at the decision's own door, and the one a draw widens to
+/// ([`run_drawn`]). The profile and its fold are read here, by the index,
+/// as a draw reads them. Where the build folded the profile's filters into
+/// one test of a row ([`RowTests::of`]) and the set is the plan's whole
+/// pool ([`Set::plain`]), the filter half is one pass of that test
+/// ([`keep_folded`]). Where that pass keeps no row, or the profile holds a
+/// filter the engine does not fold, the stages run one by one
+/// ([`run_single`]). A side's set and an encode item's are not the whole
+/// pool's: their own rules stand ahead of the profile's, stage by stage.
+///
+/// Out of line: the decision's entry holds nothing of the pass. By count,
+/// inlined there the pass read 27 instructions fewer over 8 rows, and a
+/// decision of any other kind 7 to 9 more.
+#[inline(never)]
+fn run_whole(
+    engine: &Engine,
+    index: u16,
+    facts: &RequestFacts<'_>,
+    pool: &PoolFacts<'_>,
+    set: Set<'_>,
+    cx: &Constraints<'_>,
+    buf: &mut Buffers,
+) -> Decision {
+    let at = usize::from(index);
+    let (profile, rows) = (&engine.profiles[at], engine.row_tests[at]);
+    let candidates = set.candidates;
+    if let Some(tests) = rows {
+        if set.plain() {
+            // The fold's pass asks for every buffer's room, as a draw
+            // does: no pass of another kind behind it grows a list.
+            buf.reserve(candidates.len());
+            if keep_folded(tests, facts, candidates, cx, &mut buf.kept) {
+                return score_survivors(profile, index, facts, pool, candidates, buf);
+            }
+        }
+    }
+    run_single(profile, index, facts, pool, set, cx, buf)
+}
+
+/// The filter half of a plain request's whole pass by the profile's one
+/// test of a row, where the build folded its filters into one
+/// ([`RowTests::of`]): the rows every filter keeps, in the pool's order, are
+/// left in `kept`. Says whether a row stands.
+///
+/// Where one does, these are the rows the staged pass leaves ([`filter`]).
+/// A row every filter keeps outlives every stage, so no stage empties the
+/// pool and no soft filter steps aside, and each stage drops the rows its
+/// own `keep` refuses. Where none does, the pass says nothing of the pool:
+/// the staged pass alone names the stage that emptied it, lets a soft
+/// filter step aside and asks the all-vetoed rule.
+///
+/// The request's own facts are read once ([`RowTests::asked`]), and the
+/// host's mask is asked about a row only where a veto stands, by the row's
+/// place as the health filter's pass asks it. Out of line: the loop holds
+/// its own registers. By count, inlined into the decision it read 72
+/// instructions more over a pool of 8 rows.
+#[inline(never)]
+fn keep_folded(
+    tests: RowTests,
+    facts: &RequestFacts<'_>,
+    candidates: &[Candidate],
+    cx: &Constraints<'_>,
+    kept: &mut Vec<u32>,
+) -> bool {
+    let tests = tests.asked(facts, cx);
+    kept.clear();
+    if tests.masked(cx) {
+        for (i, c) in (0u32..).zip(candidates) {
+            if tests.keeps(facts, c, cx) && !cx.masks(i) {
+                kept.push(i);
+            }
+        }
+    } else {
+        for (i, c) in (0u32..).zip(candidates) {
+            if tests.keeps(facts, c, cx) {
+                kept.push(i);
+            }
+        }
+    }
+    !kept.is_empty()
+}
+
 /// Whether a profile's single-plan decision may draw first ([`run_drawn`]):
 /// its picker draws first and every other stage answers row by row.
 fn draws_first(profile: &Profile) -> bool {
@@ -2021,7 +2113,7 @@ fn run_drawn(
     buf: &mut Buffers,
 ) -> Decision {
     // The profile and its fold are read here, by the index: the call takes
-    // the engine where a whole pass takes the profile, and no argument more.
+    // the engine where a staged pass takes the profile, and no argument more.
     let at = usize::from(index);
     let (profile, rows) = (&engine.profiles[at], engine.row_tests[at]);
     let candidates = set.candidates;
@@ -2108,7 +2200,7 @@ fn run_drawn(
             });
         }
     }
-    let mut decision = run_single(profile, index, after, pool, set, cx, buf);
+    let mut decision = run_whole(engine, index, after, pool, set, cx, buf);
     match &mut decision {
         Decision::Pick(pick) => pick.trace.seed = facts.seed,
         Decision::Shed(shed) => shed.trace.seed = facts.seed,
@@ -2249,8 +2341,9 @@ pub struct Engine {
     named: Vec<u32>,
     /// Per profile, its filters as one test of a row, where the engine
     /// holds every one itself ([`RowTests::of`]). A decision that draws
-    /// first asks it about a row in place of a call a filter, and no other
-    /// decision reads it.
+    /// first asks it about a row in place of a call a filter, and a whole
+    /// pass keeps the rows of the single plan's pool by it
+    /// ([`keep_folded`]).
     row_tests: Vec<Option<RowTests>>,
     /// Per profile, which of its leading stages are ranks ([`Order`]). A
     /// decision reads it where the profile's mark says so, and no other
@@ -3547,7 +3640,7 @@ impl Engine {
                 }
             }
         }
-        run_single(profile, index, facts, pool, set, cx, buf)
+        run_whole(self, index, facts, pool, set, cx, buf)
     }
 
     /// A keyed decision under a sessions rule (design 4.6 and the host's
@@ -9112,11 +9205,11 @@ mod tests {
     /// The whole pass of the engine's profile over `pool`, as a decision
     /// under [`DRAW_FROM`] rows runs it.
     fn whole_pass(engine: &Engine, facts: &RequestFacts<'_>, pool: &[Candidate]) -> Decision {
-        let (entry, index, profile) = engine
+        let (entry, index, _) = engine
             .resolve(facts.model, Phase::Single)
             .expect("a binding");
-        run_single(
-            profile,
+        run_whole(
+            engine,
             index,
             facts,
             &PoolFacts::default(),
@@ -9697,49 +9790,52 @@ mod tests {
         }
     }
 
+    /// A host's filter around one of the engine's: the same word on
+    /// every row, and no filter the build knows.
+    #[derive(Debug)]
+    struct Hosted(Box<dyn Filter>);
+    impl Filter for Hosted {
+        fn name(&self) -> &'static str {
+            self.0.name()
+        }
+
+        fn soft(&self) -> bool {
+            self.0.soft()
+        }
+
+        fn row_wise(&self) -> bool {
+            self.0.row_wise()
+        }
+
+        fn keep(&self, facts: &RequestFacts<'_>, c: &Candidate, cx: &Constraints<'_>) -> bool {
+            self.0.keep(facts, c, cx)
+        }
+    }
+    /// An engine of one profile: `filters`, no scorer and `picker`.
+    fn engine_of(filters: Vec<Box<dyn Filter>>, picker: Box<dyn Picker>) -> Engine {
+        Engine::new(
+            vec![Profile {
+                name: "p".into(),
+                filters,
+                scorers: Vec::new(),
+                picker,
+            }],
+            vec![single_binding()],
+            1,
+            Needs::default(),
+        )
+    }
+    /// The pickers the cases of the folded test decide by.
+    const PICKERS: [fn() -> Box<dyn Picker>; 4] = [
+        || Box::new(Passthrough),
+        || Box::new(Random),
+        || Box::new(RoundRobin::new()),
+        || Box::new(PowerOfTwo),
+    ];
+
     #[test]
     fn a_profile_of_the_engines_own_filters_draws_as_one_asked_a_call_a_filter() {
-        /// A host's filter around one of the engine's: the same word on
-        /// every row, and no filter the build knows.
-        #[derive(Debug)]
-        struct Hosted(Box<dyn Filter>);
-        impl Filter for Hosted {
-            fn name(&self) -> &'static str {
-                self.0.name()
-            }
-
-            fn soft(&self) -> bool {
-                self.0.soft()
-            }
-
-            fn row_wise(&self) -> bool {
-                self.0.row_wise()
-            }
-
-            fn keep(&self, facts: &RequestFacts<'_>, c: &Candidate, cx: &Constraints<'_>) -> bool {
-                self.0.keep(facts, c, cx)
-            }
-        }
         use crate::builtins::filters_of;
-        fn engine_of(filters: Vec<Box<dyn Filter>>, picker: Box<dyn Picker>) -> Engine {
-            Engine::new(
-                vec![Profile {
-                    name: "p".into(),
-                    filters,
-                    scorers: Vec::new(),
-                    picker,
-                }],
-                vec![single_binding()],
-                1,
-                Needs::default(),
-            )
-        }
-        const PICKERS: [fn() -> Box<dyn Picker>; 4] = [
-            || Box::new(Passthrough),
-            || Box::new(Random),
-            || Box::new(RoundRobin::new()),
-            || Box::new(PowerOfTwo),
-        ];
         // By position modulo eight: a row each of four bits refuses and four
         // the rows' own bits keep, of which the host's mask names one. A
         // request names one row tried, and the host one excluded.
@@ -9818,6 +9914,179 @@ mod tests {
         // Most decisions drew, some of them under the health filter and a
         // standing veto, where the mask is asked beside the folded test.
         assert!(drew > 1_000 && masked > 200, "{drew} drew, {masked} masked");
+    }
+
+    #[test]
+    fn a_whole_pass_by_the_folded_test_decides_as_one_asked_a_stage_at_a_time() {
+        use crate::builtins::filters_of;
+        // A row's shape: ready, or refused by one of four bits.
+        fn shaped(rows: u32, shape: impl Fn(u32) -> u32) -> Vec<Candidate> {
+            (0..rows)
+                .map(|i| {
+                    let mut c = Candidate {
+                        has_capacity: true,
+                        has_room: true,
+                        ..candidate(i, i % 5)
+                    };
+                    match shape(i) {
+                        1 => c.health.healthy = false,
+                        2 => c.health.overloaded = true,
+                        3 => c.has_capacity = false,
+                        4 => c.has_room = false,
+                        _ => {}
+                    }
+                    c
+                })
+                .collect()
+        }
+        // Pools under the draw's floor, so each decision is a whole pass:
+        // rows all of one shape, one ready row among rows of one refusal,
+        // and mixed rows.
+        let mut pools = Vec::new();
+        for rows in [1, 2, 7, DRAW_FROM as u32 - 1] {
+            for shape in 0..5 {
+                pools.push(shaped(rows, |_| shape));
+            }
+            for shape in 1..5 {
+                pools.push(shaped(rows, |i| if i == rows / 2 { 0 } else { shape }));
+            }
+            for mix in 0..4 {
+                pools.push(shaped(rows, |i| (i * 7 + mix * 3) % 6 % 5));
+            }
+        }
+        let (mut stood, mut fell, mut shed, mut aside) = (0u32, 0u32, 0u32, 0u32);
+        for set in 0..32u8 {
+            for (which, picker) in PICKERS.into_iter().enumerate() {
+                let folded = engine_of(filters_of(set), picker());
+                let hosted = filters_of(set)
+                    .into_iter()
+                    .map(|filter| Box::new(Hosted(filter)) as Box<dyn Filter>)
+                    .collect();
+                let each = engine_of(hosted, picker());
+                let filters = filters_of(set);
+                for (number, pool) in pools.iter().enumerate() {
+                    let middle = pool.len() / 2;
+                    let ids: Vec<WorkerId> = pool.iter().map(|c| c.id).collect();
+                    let places: Vec<u32> = (0..pool.len() as u32).collect();
+                    for seed in 0..10u64 {
+                        let facts = RequestFacts {
+                            tried: match seed % 3 {
+                                0 => &[],
+                                1 => &ids[middle..=middle],
+                                _ => &ids,
+                            },
+                            ..request(seed ^ u64::from(set) << 32)
+                        };
+                        let cx = Constraints {
+                            excluded: if seed % 4 == 3 {
+                                &ids[middle..=middle]
+                            } else {
+                                &[]
+                            },
+                            stalled: match seed % 5 {
+                                3 => &places[middle..=middle],
+                                4 => &places,
+                                _ => &[],
+                            },
+                            overload_lifted: seed % 7 == 0,
+                            ..Constraints::default()
+                        };
+                        let decide = |engine: &Engine| {
+                            engine.decide(
+                                &facts,
+                                &PoolFacts::default(),
+                                pool,
+                                &cx,
+                                &mut Scratch::new(),
+                            )
+                        };
+                        let (got, want) = (decide(&folded), decide(&each));
+                        let at =
+                            format!("set {set:#07b}, picker {which}, pool {number}, seed {seed}");
+                        assert_eq!(got, want, "{at}");
+                        assert!(!got.trace().drew_first(), "{at}: a whole pass");
+                        // Whether a row stands that every filter keeps:
+                        // the folded test decides such a pool, and the
+                        // stages one by one any other.
+                        let stands = pool
+                            .iter()
+                            .any(|c| filters.iter().all(|f| f.keep(&facts, c, &cx)));
+                        let picked = matches!(got, Decision::Pick(_));
+                        stood += u32::from(stands);
+                        fell += u32::from(!stands);
+                        shed += u32::from(!picked);
+                        aside += u32::from(!stands && picked);
+                    }
+                }
+            }
+        }
+        // Both paths decided often: pools the folded test kept rows of,
+        // pools a stage emptied and shed, and pools a soft filter or the
+        // all-vetoed rule kept rows of behind an empty fold.
+        assert!(
+            stood > 10_000 && fell > 10_000 && shed > 5_000 && aside > 1_000,
+            "{stood} stood, {fell} fell, {shed} shed, {aside} aside"
+        );
+    }
+
+    /// A set that is not the plan's whole pool is asked a stage at a time:
+    /// an encode item's own rules stand ahead of the profile's filters, and
+    /// the fold holds none of them.
+    #[test]
+    fn a_whole_pass_over_an_encode_items_set_is_asked_a_stage_at_a_time() {
+        use crate::builtins::filters_of;
+        let engine = engine_of(filters_of(0b11111), Box::new(Passthrough));
+        assert!(engine.row_tests[0].is_some(), "the profile folds");
+        // Two rows every filter keeps. The item's rule refuses the first.
+        let pool: Vec<Candidate> = (0..2u32)
+            .map(|i| Candidate {
+                has_capacity: true,
+                has_room: true,
+                ec_compatible: i == 1,
+                ..candidate(i, 0)
+            })
+            .collect();
+        let facts = request(7);
+        let (entry, index, profile) = engine
+            .resolve(facts.model, Phase::Single)
+            .expect("a binding");
+        let item = Set {
+            candidates: &pool,
+            class: None,
+            partnered: None,
+            encode: true,
+            vetoed: entry.vetoed,
+        };
+        let whole = |set: Set<'_>| {
+            let (shown, cx) = (PoolFacts::default(), Constraints::default());
+            run_whole(
+                &engine,
+                index,
+                &facts,
+                &shown,
+                set,
+                &cx,
+                &mut Buffers::default(),
+            )
+        };
+        let (shown, cx) = (PoolFacts::default(), Constraints::default());
+        let staged = run_single(
+            profile,
+            index,
+            &facts,
+            &shown,
+            item,
+            &cx,
+            &mut Buffers::default(),
+        );
+        assert!(matches!(staged, Decision::Pick(_)), "the second row stands");
+        assert_eq!(whole(item), staged, "the item's set");
+        // The rule decides this pool: the plan's whole pool hands the first.
+        let plain = Set {
+            encode: false,
+            ..item
+        };
+        assert_ne!(whole(plain), staged, "the whole pool");
     }
 
     #[test]
