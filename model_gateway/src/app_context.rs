@@ -1650,8 +1650,7 @@ mod effective_max_concurrent_requests_tests {
 }
 
 /// The test fixture shared by the modules whose cases need an `AppContext`
-/// built by hand: a workflow step's, the job queue's, a router's and the
-/// discovery host's.
+/// built by hand.
 #[cfg(test)]
 pub(crate) mod testing {
     use std::sync::Arc;

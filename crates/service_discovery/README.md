@@ -41,7 +41,8 @@ crate's top-level docs list its modules.
 
 ## Features
 
-The default feature set is empty.
+The default feature set is empty, and no feature selects a provider: every
+build holds all four providers and the directory watch.
 
 | Feature | What it adds |
 |---|---|
