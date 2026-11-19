@@ -140,7 +140,8 @@ impl GrpcRouter {
                 ctx.configured_reasoning_parser.clone(),
                 &tool_parser_factory,
                 &reasoning_parser_factory,
-            ),
+            )
+            .with_flags_over_registry(ctx.router_config.parser_flags_over_registry),
             multimodal,
             tokenizer_autoload: !ctx.router_config.disable_tokenizer_autoload,
             tokenizer_load_failures: ctx.tokenizer_load_failures.clone(),
@@ -187,7 +188,8 @@ impl GrpcRouter {
             queue_timeout,
         )
         .with_request_timeout(request_timeout)
-        .with_grouped_dp_sticky(grouped_dp_sticky);
+        .with_grouped_dp_sticky(grouped_dp_sticky)
+        .with_parser_flags_over_registry(ctx.router_config.parser_flags_over_registry);
         // Deps for the parser-free endpoints (completion/embeddings/classify/
         // decisions/transcription).
         let pair_deps = PipelineDeps::pair(

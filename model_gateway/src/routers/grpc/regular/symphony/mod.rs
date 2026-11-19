@@ -10,7 +10,10 @@
 //! `--reasoning-parser` flags) and the registry: the labels, when they select anything; else the
 //! registry's table for a model it knows (`symphony::formats::for_model`); else the flags, for a
 //! model the registry does not know, so that a fleet-wide name never reads a family the registry
-//! has a table for; else the legacy parsers with their own detection. Names select a table when
+//! has a table for; else the legacy parsers with their own detection. A gateway that serves one
+//! model may put the flags before the registry (`--parser-flags-over-registry`,
+//! `RouterConfig::parser_flags_over_registry`): the labels, then the flags when they select
+//! anything, then the registry's table, then the legacy parsers. Names select a table when
 //! it answers to them (`utils::answering_to`: its own name, a legacy parser's
 //! that reads its format, `qwen` for `qwen3`, `qwen_xml` for `qwen3_tagged`, or a launcher's name
 //! for a family whose table has no older parser, `muse` for `muse_spark`), the tool-call name
@@ -26,7 +29,8 @@
 //! legacy registries in `names` holds every name to one of the two); no name at all, or a reasoning
 //! name alone that no table answers to, other than `passthrough`, selects nothing. The names are
 //! checked at startup and at a worker's registration ([`check_names`]), which also says, once per
-//! model, when the registry's table sets the flags' choice aside ([`set_aside_by_the_registry`]).
+//! model, when the registry's table sets the flags' choice aside ([`set_aside_by_the_registry`]),
+//! which it never does with the flags put first.
 //! Every request read with `legacy` keeps the older parsers. The response names
 //! the parser that read it in `x-smg-parser`, legacy when the choice was Symphony but no table
 //! took the request, so a client comparing the two can tell which one read each answer, and the

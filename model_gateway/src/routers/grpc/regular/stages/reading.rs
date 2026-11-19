@@ -450,6 +450,7 @@ pub(crate) fn decide(
                 parser,
                 labels: names.labels.clone(),
                 flags: names.flags.clone(),
+                flags_over_registry: names.flags_over_registry,
                 request,
                 reasoning_open,
                 thought_closed,

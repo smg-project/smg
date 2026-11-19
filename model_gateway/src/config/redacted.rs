@@ -126,6 +126,7 @@ const PLAIN: &[&str] = &[
     "model_aliases",
     "disable_tokenizer_autoload",
     "parser",
+    "parser_flags_over_registry",
     "history_backend",
     "memory",
     "reasoning_parser",

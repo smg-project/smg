@@ -534,6 +534,9 @@ class RouterArgs:
     # the default) for the models its registry knows, or the per-model parsers ("legacy"); a
     # request's X-SMG-Parser header overrides it
     parser: str = "symphony"
+    # Under Symphony, the parser flags read every model before Symphony's registry
+    # (--parser-flags-over-registry); off, they read only the models it does not know
+    parser_flags_over_registry: bool = False
     # Seconds a PD dispatch waits for a slot in the decode engine's running
     # window before shedding; 0 sheds immediately
     pd_admission_wait_secs: int = 30
@@ -2673,7 +2676,8 @@ class RouterArgs:
             choices=reasoning_parser_choices,
             help="Specify the parser for reasoning models (e.g., deepseek_r1, qwen3). Under --parser symphony, "
             "a worker's labels decide for its model, else Symphony's registry for a model it knows, and this "
-            "flag for the models the registry does not know: a Symphony table's name here (and in "
+            "flag for the models the registry does not know (for every model, before the registry, under "
+            "--parser-flags-over-registry): a Symphony table's name here (and in "
             "--tool-call-parser, or here alone) reads them with that table, and so does a legacy parser's "
             "name whose format a table reads (the table's aliases); any other legacy parser's name keeps "
             "the legacy parsers for them",
@@ -2686,10 +2690,24 @@ class RouterArgs:
             choices=tool_call_parser_choices,
             help="Specify the parser for tool-call interactions (e.g., json, qwen). Under --parser symphony, "
             "a worker's labels decide for its model, else Symphony's registry for a model it knows, and this "
-            "flag for the models the registry does not know: a Symphony table's name here (and in "
+            "flag for the models the registry does not know (for every model, before the registry, under "
+            "--parser-flags-over-registry): a Symphony table's name here (and in "
             "--reasoning-parser, or here alone) reads them with that table, and so does a legacy parser's "
             "name whose format a table reads (the table's aliases); any other legacy parser's name keeps "
             "the legacy parsers for them",
+        )
+        parser_group.add_argument(
+            f"--{prefix}parser-flags-over-registry",
+            action="store_true",
+            default=RouterArgs.parser_flags_over_registry,
+            help="Under --parser symphony, read every model with what --tool-call-parser and "
+            "--reasoning-parser select, before Symphony's registry: a worker's labels decide for its "
+            "model, else the flags, else the registry's table for a model it knows, else the legacy "
+            "parsers. A table the flags name that the registry also gives the model keeps the model's "
+            "own turn opener; a legacy tool-call parser's name (pythonic) or passthrough keeps the "
+            "legacy parsers for every model; a reasoning name alone that no table answers to selects "
+            "nothing and leaves the model to the registry. Off by default, so a fleet-wide name never "
+            "reads a family the registry has a table for; for a gateway that serves one model.",
         )
         parser_group.add_argument(
             f"--{prefix}mcp-config-path",

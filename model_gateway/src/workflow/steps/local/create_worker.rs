@@ -146,8 +146,9 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
 
         // Under Symphony the registry's table reads a model it knows for a
         // worker whose labels select no reader, whatever the gateway's flags
-        // name (`regular::symphony::names::reads`): the model's first such worker
-        // says so.
+        // name (`regular::symphony::names::reads`), unless
+        // `--parser-flags-over-registry` puts the flags first: the model's
+        // first such worker says so.
         let flags = Names {
             tool: app_context.router_config.tool_call_parser.clone(),
             reasoning: app_context.router_config.reasoning_parser.clone(),
@@ -157,6 +158,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
             &config.url,
             app_context.router_config.parser,
             &flags,
+            app_context.router_config.parser_flags_over_registry,
             &app_context.worker_registry,
         ) {
             warn!(model = %model_card.id, worker = %Endpoint::redacted_str(&config.url), "{message}");
@@ -286,6 +288,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
             app_context.router_config.parser,
             *connection_mode,
             &flags,
+            app_context.router_config.parser_flags_over_registry,
         );
 
         // The worker keeps the spec it was registered with, so every field
@@ -595,7 +598,7 @@ fn card_names(card: &ModelCard) -> Names {
 
 /// Under `--parser symphony`, the table whose failure classes the registration step publishes at
 /// zero for a gRPC or ZMQ worker of `card`'s model, as this worker's labels and the gateway's flags
-/// select it, so `failed`, `malformed` and the rest exist before the first such output
+/// select it (the flags before the registry under `flags_over_registry`), so `failed`, `malformed` and the rest exist before the first such output
 /// (`regular::symphony::telemetry::init_table_series`, called once the worker is in the registry).
 /// Every worker of a model resolves one (a later worker whose labels select another table brings
 /// that table's series; publishing a table again sets nothing). An HTTP worker resolves none: only
@@ -607,12 +610,20 @@ fn symphony_table_of(
     parser: ParserChoice,
     connection_mode: ConnectionMode,
     flags: &Names,
+    flags_over_registry: bool,
 ) -> Option<&'static str> {
     if parser != ParserChoice::Symphony || connection_mode == ConnectionMode::Http {
         return None;
     }
     let labels = card_names(card);
-    table_label_read(&ModelNames { labels, flags }, &card.id)
+    table_label_read(
+        &ModelNames {
+            labels,
+            flags,
+            flags_over_registry,
+        },
+        &card.id,
+    )
 }
 
 /// Under `--parser symphony`, the registry's table reads a model it knows for every worker whose
@@ -621,17 +632,20 @@ fn symphony_table_of(
 /// they name another reader, the registration of the model's first worker says so: `Some(message)`
 /// while no worker of the model is registered, naming the model, both readers and the one used;
 /// `None` for the model's later workers, a worker whose labels select a reader, a model the
-/// registry does not know, flags that select nothing or the registry's own table, and the legacy
-/// parser choice. Workers of one model registering at the same moment may each say it, as the
+/// registry does not know, flags that select nothing or the registry's own table, the legacy
+/// parser choice, and `--parser-flags-over-registry` (`flags_over_registry`), under which the flags
+/// read the model as they name it and the registry sets nothing aside. Workers of one model registering at the same moment may each say it, as the
 /// override check above may: the registry gains the worker a step later.
 fn registry_reads_over_the_flags(
     card: &ModelCard,
     worker_url: &str,
     parser: ParserChoice,
     flags: &Names,
+    flags_over_registry: bool,
     registry: &WorkerRegistry,
 ) -> Option<String> {
     if parser != ParserChoice::Symphony
+        || flags_over_registry
         || !labels_select_nothing(&card_names(card))
         || !registry.get_by_model(&card.id).is_empty()
     {
@@ -1211,7 +1225,7 @@ mod tests {
     fn a_workers_registration_resolves_the_table_whose_failure_classes_are_published() {
         let known = ModelCard::new("Qwen/Qwen3-8B");
         let table = |card: &ModelCard, parser, connection_mode| {
-            symphony_table_of(card, parser, connection_mode, &Names::default())
+            symphony_table_of(card, parser, connection_mode, &Names::default(), false)
         };
         assert_eq!(
             table(&known, ParserChoice::Legacy, ConnectionMode::Grpc),
@@ -1334,7 +1348,7 @@ mod tests {
         let registry = WorkerRegistry::new();
         let said =
             |card: &ModelCard, url: &str, parser, flags: &Names, registry: &WorkerRegistry| {
-                registry_reads_over_the_flags(card, url, parser, flags, registry)
+                registry_reads_over_the_flags(card, url, parser, flags, false, registry)
             };
 
         // The worker is named through the mask: a credential in its address
@@ -1440,6 +1454,40 @@ mod tests {
             said(&known, "grpc://a:1", ParserChoice::Legacy, &flags, &fresh),
             None,
             "the legacy parsers"
+        );
+        // `--parser-flags-over-registry`: the flags read the model as they name it, so the
+        // registry sets nothing aside, and the table the registration publishes is the flags'.
+        assert_eq!(
+            registry_reads_over_the_flags(
+                &known,
+                "grpc://a:1",
+                ParserChoice::Symphony,
+                &flags,
+                true,
+                &fresh
+            ),
+            None,
+            "the flags read before the registry"
+        );
+        assert_eq!(
+            symphony_table_of(
+                &known,
+                ParserChoice::Symphony,
+                ConnectionMode::Grpc,
+                &flags,
+                true
+            ),
+            Some("mistral_v13")
+        );
+        assert_eq!(
+            symphony_table_of(
+                &known,
+                ParserChoice::Symphony,
+                ConnectionMode::Grpc,
+                &flags,
+                false
+            ),
+            Some("qwen3")
         );
     }
 

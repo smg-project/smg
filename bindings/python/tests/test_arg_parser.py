@@ -1772,6 +1772,30 @@ class TestCacheBoundariesArgs:
             parser.parse_args(["--cache-boundaries", "2048,big"])
 
 
+class TestParserFlagsOverRegistryArgs:
+    """--parser-flags-over-registry puts the parser flags before Symphony's registry."""
+
+    def test_off_by_default_and_on_with_the_flag(self):
+        assert parse_router_args([]).parser_flags_over_registry is False
+        args = parse_router_args(["--parser-flags-over-registry"])
+        assert args.parser_flags_over_registry is True
+        with patch("smg.router._Router") as native:
+            Router.from_args(args)
+        assert native.call_args.kwargs["parser_flags_over_registry"] is True
+
+    def test_router_prefix_flag(self):
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser, use_router_prefix=True)
+        namespace = parser.parse_args(["--router-parser-flags-over-registry"])
+        router_args = RouterArgs.from_cli_args(namespace, use_router_prefix=True)
+        assert router_args.parser_flags_over_registry is True
+
+    def test_the_native_router_takes_it(self):
+        from smg.smg_rs import Router as NativeRouter
+
+        NativeRouter(worker_urls=[], parser_flags_over_registry=True)
+
+
 class TestFlagAliases:
     """Intent-revealing alias flags land on the same dests as the canonical names."""
 

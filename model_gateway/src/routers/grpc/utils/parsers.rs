@@ -50,6 +50,9 @@ pub struct ParserResolver {
     /// parser of the kind has the name ([`Self::new`]); the flags themselves
     /// for the tests' `with_flags`.
     legacy_flags: Names,
+    /// `--parser-flags-over-registry`: Symphony reads the flags before its
+    /// registry ([`ModelNames::flags_over_registry`]).
+    flags_over_registry: bool,
 }
 
 impl ParserResolver {
@@ -88,7 +91,17 @@ impl ParserResolver {
             worker_registry: Some(worker_registry),
             flags,
             legacy_flags,
+            flags_over_registry: false,
         }
+    }
+
+    /// The resolver with Symphony reading the flags before its registry when
+    /// `over` (`--parser-flags-over-registry`), as every [`ModelNames`] it
+    /// hands out says ([`ModelNames::flags_over_registry`]).
+    #[must_use]
+    pub(crate) fn with_flags_over_registry(mut self, over: bool) -> Self {
+        self.flags_over_registry = over;
+        self
     }
 
     /// A resolver whose configured names pass to the legacy parsers whole, the
@@ -108,6 +121,7 @@ impl ParserResolver {
             worker_registry: Some(worker_registry),
             legacy_flags: flags.clone(),
             flags,
+            flags_over_registry: false,
         }
     }
 
@@ -118,6 +132,7 @@ impl ParserResolver {
             worker_registry: None,
             flags: Names::default(),
             legacy_flags: Names::default(),
+            flags_over_registry: false,
         }
     }
 
@@ -152,6 +167,7 @@ impl ParserResolver {
         ModelNames {
             labels: self.card_names(model),
             flags: &self.flags,
+            flags_over_registry: self.flags_over_registry,
         }
     }
 
@@ -174,6 +190,7 @@ impl ParserResolver {
                 Names::default()
             },
             flags: &self.flags,
+            flags_over_registry: self.flags_over_registry,
         }
     }
 
@@ -184,6 +201,7 @@ impl ParserResolver {
         ModelNames {
             labels: resolved.map_or_else(|| self.card_names(model), Names::clone),
             flags: &self.flags,
+            flags_over_registry: self.flags_over_registry,
         }
     }
 
@@ -358,13 +376,18 @@ static NO_NAMES: Names = Names {
 /// names of its card, which its workers' labels (or the operator's card) set for the one model,
 /// and the gateway's flags, which every model shares. Symphony reads the two in that order with
 /// its registry between them (`regular::symphony::names::reads`): the card's names when they select
-/// anything, else the registry's table for a model it knows, else the flags; the legacy parsers
+/// anything, else the registry's table for a model it knows, else the flags; under
+/// `--parser-flags-over-registry` (`flags_over_registry`) the flags come before the
+/// registry, which reads only where they select nothing; the legacy parsers
 /// take each kind's first name, from the flags only one a legacy parser of the kind has
 /// ([`ParserResolver::tool_parser`], [`ParserResolver::legacy_tool`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ModelNames<'a> {
     pub labels: Names,
     pub flags: &'a Names,
+    /// `--parser-flags-over-registry`: the flags, when they select anything, read a model the
+    /// registry knows too, where by default they read only the models it does not know.
+    pub flags_over_registry: bool,
 }
 
 impl Default for ModelNames<'_> {
@@ -372,6 +395,7 @@ impl Default for ModelNames<'_> {
         Self {
             labels: Names::default(),
             flags: &NO_NAMES,
+            flags_over_registry: false,
         }
     }
 }
@@ -383,6 +407,7 @@ impl ModelNames<'_> {
         ModelNames {
             labels,
             flags: &NO_NAMES,
+            flags_over_registry: false,
         }
     }
 
@@ -391,6 +416,7 @@ impl ModelNames<'_> {
         ModelNames {
             labels: Names::default(),
             flags,
+            flags_over_registry: false,
         }
     }
 }

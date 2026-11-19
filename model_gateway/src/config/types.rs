@@ -50,7 +50,8 @@ pub enum ParserChoice {
     /// (`routers::grpc::regular::symphony::names::reads`):
     /// the table its worker labels select, when they select anything; else the registry's table
     /// for a model it knows; else the one the `--tool-call-parser` and `--reasoning-parser` flags
-    /// select, for a model the registry does not know. Names select a table when it answers to
+    /// select, for a model the registry does not know (the flags come before the registry under
+    /// `--parser-flags-over-registry`, `RouterConfig::parser_flags_over_registry`). Names select a table when it answers to
     /// them: its own name, a legacy parser's that reads its format (`qwen` for `qwen3`, `qwen_xml`
     /// for `qwen3_tagged`), or a launcher's for a family whose table has no older parser (`muse`
     /// for `muse_spark`); `hf` selects the model's response template's table; a reasoning name
@@ -588,6 +589,14 @@ pub struct RouterConfig {
     /// parsers (`legacy`). A request's `X-SMG-Parser` header overrides it for that request.
     #[serde(default)]
     pub parser: ParserChoice,
+    /// Under Symphony, read every model with what `tool_call_parser` and `reasoning_parser`
+    /// select, the registry's own table included only where they select nothing: a worker's
+    /// labels, then the flags, then the registry, then the legacy parsers
+    /// (`routers::grpc::regular::symphony::names::decision`). Off, the default, the registry's
+    /// table reads a model it knows and the flags read only the models it does not know. For a
+    /// gateway that serves one model, where a fleet-wide name is that model's name.
+    #[serde(default)]
+    pub parser_flags_over_registry: bool,
     #[serde(default = "default_history_backend")]
     pub history_backend: HistoryBackend,
     /// Required when history_backend = "oracle"
@@ -2058,6 +2067,7 @@ impl Default for RouterConfig {
             chat_template: None,
             disable_tokenizer_autoload: false,
             parser: ParserChoice::default(),
+            parser_flags_over_registry: false,
             model_aliases: HashMap::new(),
             history_backend: default_history_backend(),
             oracle: None,
@@ -3985,5 +3995,32 @@ discovery:
         value["parser"] = serde_json::json!("legacy");
         let legacy: RouterConfig = serde_json::from_value(value).unwrap();
         assert_eq!(legacy.parser, ParserChoice::Legacy);
+    }
+
+    #[test]
+    fn the_registry_reads_over_the_parser_flags_unless_the_config_puts_them_first() {
+        assert!(!RouterConfig::default().parser_flags_over_registry);
+        let mut value = serde_json::to_value(RouterConfig::default()).unwrap();
+        assert_eq!(
+            value["parser_flags_over_registry"],
+            serde_json::json!(false)
+        );
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("parser_flags_over_registry");
+        let defaulted: RouterConfig = serde_json::from_value(value.clone()).unwrap();
+        assert!(!defaulted.parser_flags_over_registry);
+        value["parser_flags_over_registry"] = serde_json::json!(true);
+        let flags_first: RouterConfig = serde_json::from_value(value).unwrap();
+        assert!(flags_first.parser_flags_over_registry);
+        let yaml: RouterConfig = serde_yaml::from_str(&format!(
+            "{}parser_flags_over_registry: true\n",
+            serde_yaml::to_string(&RouterConfig::default())
+                .unwrap()
+                .replace("parser_flags_over_registry: false\n", "")
+        ))
+        .unwrap();
+        assert!(yaml.parser_flags_over_registry);
     }
 }
