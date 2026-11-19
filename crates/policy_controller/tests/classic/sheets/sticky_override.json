@@ -1,0 +1,1134 @@
+{
+  "recorded_from": "26f90083091e4dd791420febd88beda3bef3faac",
+  "policy": "sticky_override",
+  "rows": [
+    {
+      "name": "sticky-min-load-a-key-keeps-its-worker-under-the-cap-past-the-load",
+      "policy": "random",
+      "assignment": "min_load",
+      "workers": [
+        {
+          "in_flight": 3,
+          "keys": 0
+        },
+        {
+          "in_flight": 1,
+          "keys": 0
+        },
+        {
+          "in_flight": 2,
+          "keys": 0
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "held": {
+            "key": "k1",
+            "on": [
+              0,
+              1,
+              0
+            ]
+          }
+        },
+        {
+          "loads": [
+            0,
+            5,
+            2
+          ]
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "pick": {
+            "key": "k2",
+            "model": "m"
+          }
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          1,
+          0,
+          1
+        ]
+      }
+    },
+    {
+      "name": "sticky-one-key-pins-apart-under-two-models",
+      "policy": "random",
+      "assignment": "min_load",
+      "workers": [
+        {
+          "in_flight": 3,
+          "keys": 0
+        },
+        {
+          "in_flight": 1,
+          "keys": 0
+        },
+        {
+          "in_flight": 2,
+          "keys": 0
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m1"
+          }
+        },
+        {
+          "loads": [
+            0,
+            5,
+            2
+          ]
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m2"
+          }
+        },
+        {
+          "loads": [
+            9,
+            9,
+            0
+          ]
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m1"
+          }
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m2"
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          0,
+          1,
+          0
+        ]
+      }
+    },
+    {
+      "name": "sticky-a-request-with-no-key-is-the-policy-s-draw-and-pins-nothing",
+      "policy": "random",
+      "assignment": "min_load",
+      "workers": [
+        {
+          "in_flight": 9,
+          "keys": 0
+        },
+        {
+          "in_flight": 0,
+          "keys": 0
+        },
+        {
+          "in_flight": 3,
+          "keys": 0
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "model": "m"
+          }
+        },
+        {
+          "pick": {
+            "key": null,
+            "model": "m"
+          }
+        }
+      ],
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "counts": [
+            2073,
+            1965,
+            1962
+          ]
+        }
+      }
+    },
+    {
+      "name": "sticky-min-group-a-new-key-takes-the-fewest-keys-whatever-the-load",
+      "policy": "random",
+      "assignment": "min_group",
+      "workers": [
+        {
+          "in_flight": 0,
+          "keys": 2
+        },
+        {
+          "in_flight": 5,
+          "keys": 0
+        },
+        {
+          "in_flight": 0,
+          "keys": 1
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "held": {
+            "key": "k1",
+            "on": [
+              0,
+              1,
+              0
+            ]
+          }
+        },
+        {
+          "held": {
+            "key": "x1",
+            "on": [
+              0,
+              1,
+              0
+            ]
+          }
+        },
+        {
+          "held": {
+            "key": "x2",
+            "on": [
+              0,
+              1,
+              0
+            ]
+          }
+        },
+        {
+          "pick": {
+            "key": "k2",
+            "model": "m"
+          }
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          2,
+          1
+        ]
+      }
+    },
+    {
+      "name": "sticky-random-a-new-key-is-drawn-over-every-worker",
+      "policy": "random",
+      "assignment": "random",
+      "workers": [
+        {
+          "in_flight": 9,
+          "keys": 0
+        },
+        {
+          "in_flight": 0,
+          "keys": 0
+        },
+        {
+          "in_flight": 3,
+          "keys": 0
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        }
+      ],
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "counts": [
+            2020,
+            1989,
+            1991
+          ]
+        }
+      }
+    },
+    {
+      "name": "sticky-min-load-a-key-moves-off-a-worker-that-is-down-and-the-first-owner-leads-again",
+      "policy": "random",
+      "assignment": "min_load",
+      "workers": [
+        {
+          "in_flight": 1,
+          "keys": 0
+        },
+        {
+          "in_flight": 2,
+          "keys": 0
+        },
+        {
+          "in_flight": 3,
+          "keys": 0
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "down": 0
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "up": 0
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0,
+          1,
+          1,
+          0
+        ]
+      }
+    },
+    {
+      "name": "sticky-delegate-a-new-key-is-the-policy-s-pick-and-stays-past-the-load",
+      "policy": "power_of_two",
+      "assignment": "delegate",
+      "workers": [
+        {
+          "in_flight": 5,
+          "keys": 0
+        },
+        {
+          "in_flight": 0,
+          "keys": 0
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "loads": [
+            0,
+            5
+          ]
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "pick": {
+            "key": null,
+            "model": "m"
+          }
+        },
+        {
+          "pick": {
+            "key": "k2",
+            "model": "m"
+          }
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          1,
+          0,
+          0,
+          1
+        ]
+      }
+    },
+    {
+      "name": "sticky-delegate-the-latest-worker-leads-after-a-failover",
+      "policy": "power_of_two",
+      "assignment": "delegate",
+      "workers": [
+        {
+          "in_flight": 0,
+          "keys": 0
+        },
+        {
+          "in_flight": 5,
+          "keys": 0
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "down": 0
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "up": 0
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "down": 1
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "up": 1
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0,
+          1,
+          1,
+          0,
+          1
+        ]
+      }
+    },
+    {
+      "name": "sticky-delegate-a-new-key-is-the-policy-s-draw",
+      "policy": "random",
+      "assignment": "delegate",
+      "workers": [
+        {
+          "in_flight": 9,
+          "keys": 0
+        },
+        {
+          "in_flight": 0,
+          "keys": 0
+        },
+        {
+          "in_flight": 3,
+          "keys": 0
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        }
+      ],
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "counts": [
+            2033,
+            1980,
+            1987
+          ]
+        }
+      }
+    },
+    {
+      "name": "sticky-the-cap-counts-the-request-s-own-key-alone",
+      "policy": "random",
+      "assignment": "min_load",
+      "workers": [
+        {
+          "in_flight": 3,
+          "keys": 0
+        },
+        {
+          "in_flight": 1,
+          "keys": 0
+        },
+        {
+          "in_flight": 2,
+          "keys": 0
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "ka",
+            "model": "m"
+          }
+        },
+        {
+          "held": {
+            "key": "kb",
+            "on": [
+              0,
+              2,
+              0
+            ]
+          }
+        },
+        {
+          "loads": [
+            0,
+            5,
+            2
+          ]
+        },
+        {
+          "pick": {
+            "key": "ka",
+            "model": "m"
+          }
+        },
+        {
+          "held": {
+            "key": "ka",
+            "on": [
+              0,
+              2,
+              0
+            ]
+          }
+        },
+        {
+          "pick": {
+            "key": "ka",
+            "model": "m"
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          1,
+          0
+        ]
+      }
+    },
+    {
+      "name": "sticky-min-load-at-the-cap-the-request-goes-to-the-least-loaded-and-the-pin-follows",
+      "policy": "random",
+      "assignment": "min_load",
+      "workers": [
+        {
+          "in_flight": 3,
+          "keys": 0
+        },
+        {
+          "in_flight": 1,
+          "keys": 0
+        },
+        {
+          "in_flight": 2,
+          "keys": 0
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "held": {
+            "key": "k1",
+            "on": [
+              0,
+              2,
+              0
+            ]
+          }
+        },
+        {
+          "loads": [
+            0,
+            5,
+            2
+          ]
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "held": {
+            "key": "k1",
+            "on": [
+              1,
+              2,
+              0
+            ]
+          }
+        },
+        {
+          "loads": [
+            5,
+            0,
+            2
+          ]
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          0,
+          0
+        ]
+      }
+    },
+    {
+      "name": "sticky-min-load-at-the-cap-the-least-loaded-is-the-pinned-worker-again",
+      "policy": "random",
+      "assignment": "min_load",
+      "workers": [
+        {
+          "in_flight": 3,
+          "keys": 0
+        },
+        {
+          "in_flight": 1,
+          "keys": 0
+        },
+        {
+          "in_flight": 2,
+          "keys": 0
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "held": {
+            "key": "k1",
+            "on": [
+              0,
+              2,
+              0
+            ]
+          }
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "held": {
+            "key": "k1",
+            "on": [
+              0,
+              3,
+              0
+            ]
+          }
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "name": "sticky-min-load-at-the-cap-the-pin-does-not-move-to-a-worker-at-the-cap",
+      "policy": "random",
+      "assignment": "min_load",
+      "workers": [
+        {
+          "in_flight": 3,
+          "keys": 0
+        },
+        {
+          "in_flight": 1,
+          "keys": 0
+        },
+        {
+          "in_flight": 2,
+          "keys": 0
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "held": {
+            "key": "k1",
+            "on": [
+              2,
+              2,
+              0
+            ]
+          }
+        },
+        {
+          "loads": [
+            0,
+            5,
+            2
+          ]
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "held": {
+            "key": "k1",
+            "on": [
+              2,
+              1,
+              0
+            ]
+          }
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          0,
+          1
+        ]
+      }
+    },
+    {
+      "name": "sticky-min-load-every-worker-at-the-cap",
+      "policy": "random",
+      "assignment": "min_load",
+      "workers": [
+        {
+          "in_flight": 3,
+          "keys": 0
+        },
+        {
+          "in_flight": 1,
+          "keys": 0
+        },
+        {
+          "in_flight": 2,
+          "keys": 0
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "held": {
+            "key": "k1",
+            "on": [
+              2,
+              2,
+              2
+            ]
+          }
+        },
+        {
+          "loads": [
+            0,
+            5,
+            2
+          ]
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "held": {
+            "key": "k1",
+            "on": [
+              2,
+              1,
+              2
+            ]
+          }
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          0,
+          1
+        ]
+      }
+    },
+    {
+      "name": "sticky-min-load-at-the-cap-with-no-other-worker-routable-the-key-stays",
+      "policy": "random",
+      "assignment": "min_load",
+      "workers": [
+        {
+          "in_flight": 1,
+          "keys": 0
+        },
+        {
+          "in_flight": 2,
+          "keys": 0
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "held": {
+            "key": "k1",
+            "on": [
+              2,
+              0
+            ]
+          }
+        },
+        {
+          "down": 1
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "up": 1
+        },
+        {
+          "loads": [
+            5,
+            0
+          ]
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0,
+          0,
+          1
+        ]
+      }
+    },
+    {
+      "name": "sticky-delegate-at-the-cap-the-policy-places-the-request-and-the-pin-follows",
+      "policy": "power_of_two",
+      "assignment": "delegate",
+      "workers": [
+        {
+          "in_flight": 0,
+          "keys": 0
+        },
+        {
+          "in_flight": 5,
+          "keys": 0
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "held": {
+            "key": "k1",
+            "on": [
+              2,
+              0
+            ]
+          }
+        },
+        {
+          "loads": [
+            5,
+            0
+          ]
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "held": {
+            "key": "k1",
+            "on": [
+              2,
+              1
+            ]
+          }
+        },
+        {
+          "loads": [
+            0,
+            5
+          ]
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0,
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "name": "sticky-delegate-at-the-cap-the-policy-picks-the-pinned-worker-again",
+      "policy": "power_of_two",
+      "assignment": "delegate",
+      "workers": [
+        {
+          "in_flight": 0,
+          "keys": 0
+        },
+        {
+          "in_flight": 5,
+          "keys": 0
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "held": {
+            "key": "k1",
+            "on": [
+              2,
+              0
+            ]
+          }
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0,
+          0
+        ]
+      }
+    },
+    {
+      "name": "sticky-delegate-at-the-cap-the-policy-draws-over-every-worker",
+      "policy": "random",
+      "assignment": "delegate",
+      "workers": [
+        {
+          "in_flight": 0,
+          "keys": 0
+        },
+        {
+          "in_flight": 0,
+          "keys": 0
+        },
+        {
+          "in_flight": 0,
+          "keys": 0
+        }
+      ],
+      "steps": [
+        {
+          "down": 1
+        },
+        {
+          "down": 2
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        },
+        {
+          "up": 1
+        },
+        {
+          "up": 2
+        },
+        {
+          "held": {
+            "key": "k1",
+            "on": [
+              2,
+              0,
+              0
+            ]
+          }
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "model": "m"
+          }
+        }
+      ],
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "counts": [
+            1959,
+            2013,
+            2028
+          ]
+        }
+      }
+    }
+  ]
+}

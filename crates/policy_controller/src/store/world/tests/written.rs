@@ -195,18 +195,22 @@ fn the_writer_keeps_a_derivation_a_paired_model_and_none_past_it() {
         status: WorkerStatus::Ready,
         revision: 1,
         admitted_at: origin,
+        maker: Default::default(),
     };
     let moved = |id: u64| Classes::Written {
         left: Some(WorkerId(id)),
         joined: Some(WorkerId(id)),
     };
     let mut writer = Writer::new(PUBLISH_WINDOW, origin);
+    // Each member's slot, as its first write gives it.
+    let counts = writer.counts();
+    let slots = [counts.claim(), counts.claim()];
     // A model of one side keeps none, and its first pair makes one.
     let mut members = vec![row(1, Role::Prefill, "m0")];
-    writer.rebuild(1, members.iter(), |_, _| None, moved(1));
+    writer.rebuild(1, members.iter().zip(slots), |_, _| None, moved(1));
     assert_eq!(writer.derivations.len(), 0);
     members.push(row(2, Role::Decode, "m0"));
-    writer.rebuild(2, members.iter(), |_, _| None, moved(2));
+    writer.rebuild(2, members.iter().zip(slots), |_, _| None, moved(2));
     assert_eq!(writer.derivations.len(), 1);
     // The pair moves through a hundred models, the decode first: the
     // model it left keeps no derivation, and the one both stand in has
@@ -214,10 +218,10 @@ fn the_writer_keeps_a_derivation_a_paired_model_and_none_past_it() {
     for n in 1..100_u64 {
         let model = format!("m{n}");
         members[1] = row(2, Role::Decode, &model);
-        writer.rebuild(2 * n + 1, members.iter(), |_, _| None, moved(2));
+        writer.rebuild(2 * n + 1, members.iter().zip(slots), |_, _| None, moved(2));
         assert_eq!(writer.derivations.len(), 0, "{model}");
         members[0] = row(1, Role::Prefill, &model);
-        writer.rebuild(2 * n + 2, members.iter(), |_, _| None, moved(1));
+        writer.rebuild(2 * n + 2, members.iter().zip(slots), |_, _| None, moved(1));
         let kept: Vec<&str> = writer.derivations.keys().map(|model| &**model).collect();
         assert_eq!(kept, [model.as_str()]);
     }

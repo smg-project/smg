@@ -2159,3 +2159,54 @@ def test_a_file_whose_header_no_loadable_segment_covers_has_no_image(mod, tmp_pa
     # No segment covers it: two entry addresses would read as one image, so there is none.
     assert mod.image_of(entered(0x1000, False)) is None
     assert mod.image_of(entered(0x2000, False)) is None
+
+
+def test_what_the_loader_reads_from_the_file_lies_inside_a_loadable_segment(mod, tmp_path):
+    def image(named: bytes, held: bool) -> str | None:
+        """The image of a file whose second program header, the interpreter's, names the two
+        notes that hold `named`, inside the loadable segment or behind its end."""
+        data = bytearray(elf(b"code" * 64, named, b"symbols"))
+        struct.pack_into("<I", data, 64 + 56, 3)
+        if not held:
+            struct.pack_into("<Q", data, 64 + 32, 64 + 2 * 56)
+        path = tmp_path / f"bench-{named[:1].decode()}-{held}"
+        path.write_bytes(bytes(data))
+        return mod.image_of(path)
+
+    # Inside the segment the path is in the image: two paths, two images.
+    one, other = image(b"A" * 20, True), image(b"B" * 20, True)
+    assert one != other and None not in (one, other)
+    # Behind the segment's end the loader still reads it, from the file: two paths would read as
+    # one image, so there is none.
+    assert image(b"A" * 20, False) is None
+    assert image(b"B" * 20, False) is None
+    # A segment that starts at the file's start holds the header only where it holds all of it.
+    data = bytearray(elf(b"code" * 64, b"A" * 20, b"symbols"))
+    # The note names no bytes here: behind so short a segment it would refuse the file itself.
+    struct.pack_into("<Q", data, 64 + 56 + 32, 0)
+    path = tmp_path / "bench-short"
+    for size, held in ((63, False), (64, True)):
+        struct.pack_into("<Q", data, 64 + 32, size)
+        path.write_bytes(bytes(data))
+        assert (mod.image_of(path) is not None) == held
+
+
+def test_a_header_no_loader_reads_from_the_file_may_pass_its_segments_end(mod, tmp_path):
+    def image(kind: int, held: bool) -> str | None:
+        """The image of a file whose second program header is of `kind` and names the two
+        notes, whole inside the loadable segment or from inside it past its end."""
+        data = bytearray(elf(b"code" * 64, b"A" * 20, b"symbols"))
+        struct.pack_into("<I", data, 64 + 56, kind)
+        if not held:
+            struct.pack_into("<Q", data, 64 + 32, 64 + 2 * 56 + 24)
+        path = tmp_path / f"bench-{kind:x}-{held}"
+        path.write_bytes(bytes(data))
+        return mod.image_of(path)
+
+    # A loader reads the interpreter's path, a note and the property note from the file: each
+    # lies whole inside the segment, or the file has no image.
+    for kind in (3, 4, 0x6474E553):
+        assert image(kind, True) is not None and image(kind, False) is None
+    # The range made read-only after relocation is read from memory alone, and a linker may
+    # round its header's file size up past the segment's end: such a file keeps its image.
+    assert image(0x6474E552, True) is not None and image(0x6474E552, False) is not None

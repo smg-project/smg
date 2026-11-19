@@ -18,7 +18,7 @@ use smg_policy_controller::proto::{
 };
 use tokio::{
     net::{TcpListener, UnixListener},
-    sync::mpsc,
+    sync::{mpsc, Semaphore},
     task::JoinSet,
 };
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream, UnixListenerStream};
@@ -74,6 +74,29 @@ pub enum Behaviour {
     EndStream,
 }
 
+/// A gate a hello's ack waits at until a case opens it: an order two
+/// streams settle in is the case's own, at any load.
+#[derive(Clone, Debug)]
+pub struct Gate(Arc<Semaphore>);
+
+impl Default for Gate {
+    fn default() -> Self {
+        Self(Arc::new(Semaphore::new(0)))
+    }
+}
+
+impl Gate {
+    /// Every ack that waits here goes, and a later one does not wait.
+    pub fn open(&self) {
+        self.0.close();
+    }
+
+    async fn opened(&self) {
+        // No permit is ever given: the wait ends when the gate is closed.
+        let _ = self.0.acquire().await;
+    }
+}
+
 /// How the plugin answers; a test changes it between decisions.
 #[derive(Clone, Debug)]
 pub struct Script {
@@ -82,6 +105,8 @@ pub struct Script {
     pub delay: Duration,
     /// Waits this long before the hello's ack.
     pub hello_delay: Duration,
+    /// When set: the hello's ack waits until the gate is opened.
+    pub hello_gate: Option<Gate>,
     /// The ack: `ok`, its error, the version it names and the stages it
     /// claims.
     pub ack_ok: bool,
@@ -106,6 +131,7 @@ impl Default for Script {
             behaviour: Behaviour::Honest,
             delay: Duration::ZERO,
             hello_delay: Duration::ZERO,
+            hello_gate: None,
             ack_ok: true,
             ack_error: String::new(),
             ack_protocol: 1,
@@ -322,6 +348,9 @@ impl PolicyPlugin for Shared {
                     Some(proto::plugin_request::Request::Hello(hello)) => {
                         lock(&shared.seen).hellos.push(hello);
                         pause(script.hello_delay).await;
+                        if let Some(gate) = &script.hello_gate {
+                            gate.opened().await;
+                        }
                         let ack = proto::PluginHelloAck {
                             protocol: script.ack_protocol,
                             ok: script.ack_ok,

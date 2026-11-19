@@ -50,11 +50,16 @@ pub struct Lease {
     /// Which target of the pick this lease books (a reservation on a pair
     /// side names its own).
     pub target_index: u8,
-    /// The worker the lease books at its issue, as the host that issues it
-    /// names it; `WorkerId(0)` where the host names none. A stage that
-    /// books at the issue reads it at the dispatch
-    /// ([`Lifecycle::on_dispatched`]), where `target_index` names the
-    /// target the dispatch took. In-process only: no contract carries it.
+    /// The worker the lease books. The decider's mint names the worker its
+    /// issue books, and the lease as issued, and as given up where its
+    /// answer does not leave, carries that word. Where the served store
+    /// tells of a lease on its file, at a dispatch and at an end, it names
+    /// its record's target: the same worker until a dispatch moves the
+    /// lease, and the worker it moved to behind one. A stage that books at
+    /// the issue reads it at the dispatch ([`Lifecycle::on_dispatched`]),
+    /// where `target_index` names the target the dispatch took.
+    /// `WorkerId(0)` where a host names none. In-process only: no contract
+    /// carries it.
     pub booked: WorkerId,
     pub generation: u64,
     /// The request's session ([`crate::RequestFacts::session`]: its key
@@ -151,8 +156,9 @@ pub enum Membership<'a> {
     /// [`Membership::Relabelled`] or [`Membership::Resized`]. A new
     /// incarnation says its [`Membership::Replaced`] first and this word
     /// behind it, for the new id. A stage that lists workers by model
-    /// unlists the worker under these alone. The plugin contracts carry
-    /// no such kind: a plugin is told nothing of it.
+    /// unlists the worker under these alone. Both plugin contracts carry
+    /// the word: the guest's world as the case `left`, the remote one as a
+    /// kind a stream of protocol 2 is sent.
     Left {
         id: WorkerId,
         models: &'a [String],
@@ -269,9 +275,9 @@ impl fmt::Debug for EventSet {
 /// release of a lease its decision gives up, costs that request its
 /// decision.
 pub trait Lifecycle: Send + Sync {
-    /// The engine issued `decision` under `lease`. In the embedded mode the
-    /// commit follows at once and the accounting happens at dispatch; a
-    /// remote controller books here.
+    /// The engine issued `decision` under `lease`. Its host filed the
+    /// lease as it issued it, in process as behind a served controller:
+    /// the lease books its first target from here.
     fn on_decision_issued(&self, _lease: &Lease, _decision: &Decision) {}
 
     /// The host dispatched to `target` (one of the decision's targets), on

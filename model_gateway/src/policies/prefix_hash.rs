@@ -41,10 +41,11 @@
 
 use std::{cell::Cell, sync::Arc};
 
+use smg_worker::identity::basic::Worker;
 use tracing::debug;
 
 use super::{LoadBalancingPolicy, SelectWorkerInfo};
-use crate::{observability::metrics::Metrics, worker::Worker};
+use crate::observability::metrics::Metrics;
 
 /// Configuration for the PrefixHash load balancing policy
 #[derive(Debug, Clone)]
@@ -412,12 +413,10 @@ impl LoadBalancingPolicy for PrefixHashPolicy {
 #[cfg(test)]
 mod tests {
     use openai_protocol::worker::WorkerStatus;
+    use smg_worker::identity::basic::WorkerLoadGuard;
 
     use super::*;
-    use crate::{
-        policies::{hash_ring::HashRing, test_support::make_workers},
-        worker::WorkerLoadGuard,
-    };
+    use crate::policies::{hash_ring::HashRing, test_support::make_workers};
 
     #[test]
     fn test_prefix_hash_consistent_routing() {
@@ -441,6 +440,53 @@ mod tests {
             let (result, _, _) = policy.select_worker_impl(&workers, &info);
             assert_eq!(result, Some(first_idx));
         }
+    }
+
+    /// The ring handed to the policy can be of another membership than the
+    /// workers a request is placed over. A worker that left is passed over
+    /// where the walk meets it, a worker that joined is not on the ring, and
+    /// a key that no worker of the ring takes is still placed.
+    #[test]
+    fn a_ring_of_another_membership_places_over_the_requests_own_workers() {
+        let policy = PrefixHashPolicy::with_defaults();
+        let earlier = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        let ring = Arc::new(HashRing::new(earlier.iter().map(|w| w.url())));
+        // Since the ring was filled, w2 left and w4 joined.
+        let workers = make_workers(&["http://w1:8000", "http://w3:8000", "http://w4:8000"]);
+
+        for seed in 0..64u32 {
+            let tokens: Vec<u32> = (seed..seed + 8).collect();
+            let info = SelectWorkerInfo {
+                tokens: Some(&tokens),
+                hash_ring: Some(Arc::clone(&ring)),
+                ..Default::default()
+            };
+            let owner = policy.select_worker_impl(&earlier, &info).0.unwrap();
+            let placed = policy.select_worker_impl(&workers, &info).0.unwrap();
+            assert_ne!(
+                workers[placed].url(),
+                "http://w4:8000",
+                "the ring names no worker that joined"
+            );
+            if earlier[owner].url() != "http://w2:8000" {
+                assert_eq!(
+                    workers[placed].url(),
+                    earlier[owner].url(),
+                    "a key whose worker stayed keeps it"
+                );
+            }
+        }
+
+        // A fleet replaced whole: no worker of the ring is among the
+        // request's own, and the key is placed as with no ring.
+        let replaced = make_workers(&["http://w5:8000", "http://w6:8000"]);
+        let tokens: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            hash_ring: Some(ring),
+            ..Default::default()
+        };
+        assert!(policy.select_worker_impl(&replaced, &info).0.is_some());
     }
 
     /// The ring lookup routes on `is_healthy_and_eligible()`, so the absolute

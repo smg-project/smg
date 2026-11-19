@@ -2233,6 +2233,7 @@ dependencies = [
  "tokio",
  "tonic",
  "tracing",
+ "zeromq",
 ]
 
 [[package]]
@@ -7813,7 +7814,6 @@ dependencies = [
  "metrics-util",
  "mock-worker",
  "ndarray",
- "notify",
  "once_cell",
  "openai-harmony",
  "openai-protocol",
@@ -7851,8 +7851,10 @@ dependencies = [
  "smg-mcp",
  "smg-mesh",
  "smg-mm-rdma",
+ "smg-policy-controller",
  "smg-response-template",
  "smg-rl",
+ "smg-service-discovery",
  "smg-symphony",
  "smg-test-harness",
  "smg-wasm",
@@ -7989,6 +7991,7 @@ dependencies = [
  "smg",
  "smg-grpc-client",
  "smg-symphony",
+ "smg-worker",
  "tikv-jemalloc-ctl",
  "tikv-jemallocator",
  "tokio",
@@ -8000,6 +8003,7 @@ dependencies = [
 name = "smg-grpc-client"
 version = "1.17.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "futures",
  "h2",
@@ -8099,6 +8103,7 @@ dependencies = [
  "axum",
  "clap",
  "criterion",
+ "crossbeam-queue",
  "http",
  "hyper-util",
  "k8s-openapi",
@@ -8125,6 +8130,7 @@ dependencies = [
  "sha2 0.11.0",
  "smg-grpc-client",
  "smg-policy-controller",
+ "smg-worker",
  "tempfile",
  "thiserror 2.0.21",
  "thread_local",
@@ -8168,6 +8174,7 @@ dependencies = [
  "smg-grpc-client",
  "smg-mesh",
  "smg-rl",
+ "smg-service-discovery",
  "smg-symphony",
  "tempfile",
  "tikv-jemallocator",
@@ -8221,6 +8228,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "smg-service-discovery"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "blake3",
+ "futures",
+ "http",
+ "k8s-openapi",
+ "kube",
+ "metrics",
+ "notify",
+ "openai-protocol",
+ "openssl",
+ "parking_lot 0.13.0",
+ "reqwest 0.13.4",
+ "rustls",
+ "serde",
+ "serde_json",
+ "smg-worker",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "tracing-test",
+ "url",
+]
+
+[[package]]
 name = "smg-symphony"
 version = "0.3.0"
 dependencies = [
@@ -8264,6 +8300,7 @@ dependencies = [
  "smg-auth",
  "smg-grpc-client",
  "smg-mcp",
+ "smg-worker",
  "tempfile",
  "tokio",
  "tokio-stream",
@@ -8332,6 +8369,7 @@ dependencies = [
  "tracing-test",
  "url",
  "uuid",
+ "wfaas",
 ]
 
 [[package]]

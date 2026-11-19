@@ -29,16 +29,16 @@ use openai_protocol::{
 use smg::{
     config::{RetryConfig, RouterConfig, RoutingMode},
     middleware::TenantRequestMeta,
-    routers::{RouterFactory, RouterTrait},
+    routers::{grpc::backend_client::BasicWorkerBuilder, RouterFactory, RouterTrait},
     tenant::TenantKey,
-    worker::{
-        health::{
-            circuit_breaker::{CircuitBreakerConfig, CircuitState},
-            manager::{WorkerManager, WorkerManagerConfig},
-        },
-        test_support::RefusedAddress,
-        BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerType,
+};
+use smg_worker::{
+    health::{
+        circuit_breaker::{CircuitBreakerConfig, CircuitState},
+        manager::{WorkerManager, WorkerManagerConfig},
     },
+    identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType},
+    test_support::RefusedAddress,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},

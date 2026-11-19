@@ -15,8 +15,15 @@ categories = ["api-bindings"]
 [lib]
 name = "smg_grpc_client"
 
+[features]
+default = []
+# The worker runtime's engine port, stated on each engine family's client
+# (`engine_port`). It adds the worker crate's runtime, whose port it is.
+engine-port = ["smg-worker/runtime", "dep:async-trait"]
+
 [dependencies]
 # Workspace dependencies
+async-trait = { workspace = true, optional = true }
 openai-protocol.workspace = true
 # The shared messages are the worker crate's. Its `proto` feature generates
 # them, re-exported here as `common_proto`; the build script reads the
@@ -60,6 +67,10 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-
 tokio-stream = { version = "0.1", features = ["net"] }
 # The stock prost codec: the codec's tests write and read each frame through both.
 tonic-prost.workspace = true
+
+[[test]]
+name = "engine_port"
+required-features = ["engine-port"]
 
 [lints]
 workspace = true

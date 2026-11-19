@@ -18,12 +18,9 @@ use common::{
 use openai_protocol::{generate::GenerateRequest, model_card::ModelCard};
 use serde_json::{json, Value};
 use smg::{
-    config::RoutingMode,
-    middleware::TenantRequestMeta,
-    routers::RouterTrait,
-    tenant::TenantKey,
-    worker::{RuntimeType, WorkerType},
+    config::RoutingMode, middleware::TenantRequestMeta, routers::RouterTrait, tenant::TenantKey,
 };
+use smg_worker::identity::basic::{RuntimeType, WorkerType};
 
 use crate::common;
 

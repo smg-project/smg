@@ -16,8 +16,9 @@ use std::sync::{
 use crate::view::Candidate;
 
 /// The place of one worker's count in the store's counts ([`Counts`]). A
-/// member is given its slot at the membership write that first lists it
-/// and keeps it while it stands, and no other member is given it after.
+/// member is given its slot at the membership write that first files it
+/// and keeps it while its row stands, and no other member is given it
+/// after.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Slot(u32);
 

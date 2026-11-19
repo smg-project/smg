@@ -5,6 +5,10 @@
 //! Included by path beside `common/engines.rs` and `common/net.rs` (the
 //! including binary names them `engines` and `net`).
 //!
+//! A second holder, [`Embedded`], is the same fleet under a host that
+//! embeds the engine: no controller, the store in the case's own hands,
+//! the same engines and the same stand-in prober.
+//!
 //! Every fact the store holds of an engine came from that engine, through a
 //! sink. Loads are the controller's own load driver's: the harness writes no
 //! load row. Health has no driver in the crate yet, so the harness stands in
@@ -70,7 +74,7 @@ use smg_policy_controller::{
         StoredBlock, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
     },
     view::{fingerprint, LoadRow, Role, WireModes, WorkerId},
-    AppliedSpec, Catalog, LeaseId, PolicySpec,
+    AppliedSpec, Catalog, LeaseId, PolicySpec, TransportClass,
 };
 use tokio::{
     io::{copy, sink},
@@ -220,6 +224,34 @@ struct Engine {
     release: Option<mpsc::Sender<()>>,
 }
 
+impl Engine {
+    /// Kills the engine: its runtime is dropped, and the call returns once
+    /// its thread has ended and the connection the harness held to it read
+    /// its end, so every socket of the engine closed. A hung engine is let
+    /// go first. `false` for an engine that is dead already.
+    async fn die(&mut self) -> Result<bool, String> {
+        let (Some(kill), Some(ended), Some(mut witness)) =
+            (self.kill.take(), self.ended.take(), self.witness.take())
+        else {
+            return Ok(false);
+        };
+        self.hang = None;
+        self.release = None;
+        drop(kill);
+        // The sender's drop is the thread's end: the wait ends on the error.
+        let _ = bounded("a killed engine's thread ends", ROOM, ended).await?;
+        // The proof of death is a socket of the harness's own: it reads to
+        // its end once the engine's side closed. A reset is an end too.
+        let _ = bounded(
+            "a killed engine's sockets close",
+            ROOM,
+            copy(&mut witness, &mut sink()),
+        )
+        .await?;
+        Ok(true)
+    }
+}
+
 /// What the stand-in prober counts and writes.
 #[derive(Default)]
 struct Turns {
@@ -337,6 +369,9 @@ pub struct Harness {
     buffers: ViewBuffers,
     stop_feeds: watch::Sender<bool>,
     feeds: JoinSet<()>,
+    /// Whether the controller the harness asks elects over a lease file: a
+    /// leader that elects can stop leading for a moment.
+    elects: bool,
 }
 
 /// Waits for `check` under the bound named `name`; the error names the
@@ -538,6 +573,71 @@ async fn start_engine(ranks: u16, runtime: RuntimeType) -> Result<Engine, String
         hang: Some(hang),
         release: None,
     })
+}
+
+/// One rank written into the store by its membership write, pending: a
+/// rank of a wider engine under a controller, and every rank of a fleet
+/// that has no control listener.
+fn written(store: &MemoryStore, endpoint: &str, shape: &Shape, rank: u16) -> WorkerId {
+    store
+        .upsert(WorkerFacts {
+            key: format!("{endpoint}@{rank}"),
+            engine: endpoint.to_owned(),
+            incarnation: 1,
+            role: shape.role,
+            wire_modes: WireModes::GRPC,
+            engine_kind: shape.runtime.as_str().to_owned(),
+            models: vec![shape.model.to_owned()],
+            dp_rank: rank,
+            dp_size: shape.ranks,
+            signals: Signals {
+                events: !counts_resident(shape.runtime),
+                ..Signals::default()
+            },
+            health: health_policy(),
+            ..WorkerFacts::default()
+        })
+        .id()
+}
+
+/// Sends one short request named `id` to the engine at `endpoint` on the
+/// fleet's first wire and reads it to its end, the whole under
+/// [`DIAL_TIMEOUT`]: the class the transport read (a stream read to its
+/// end, a connection refused or the bound run out) and the frames read.
+async fn sent(endpoint: &str, id: String) -> (Class, u32) {
+    let request = vllm_proto::GenerateRequest {
+        request_id: id,
+        input: Some(vllm_proto::generate_request::Input::Tokenized(
+            vllm_proto::TokenizedInput {
+                original_text: String::new(),
+                input_ids: vec![1; 8],
+            },
+        )),
+        sampling_params: Some(vllm_proto::SamplingParams {
+            max_tokens: Some(SENT_TOKENS),
+            ..Default::default()
+        }),
+        stream: true,
+        ..Default::default()
+    };
+    let asked = tokio::time::timeout(DIAL_TIMEOUT, async {
+        let Ok(client) = VllmEngineClient::connect(endpoint).await else {
+            return (Class::ConnectFailed, 0);
+        };
+        let Ok(mut stream) = client.generate(request).await else {
+            return (Class::ServerError, 0);
+        };
+        let mut frames = 0;
+        loop {
+            match stream.next().await {
+                Some(Ok(_)) => frames += 1,
+                Some(Err(_)) => return (Class::ServerError, frames),
+                None => return (Class::Ok, frames),
+            }
+        }
+    })
+    .await;
+    asked.unwrap_or((Class::Timeout, 0))
 }
 
 /// An engine's client on the wire its kind speaks.
@@ -1035,6 +1135,7 @@ impl Harness {
     /// `catalog` holds and on the policy document at `spec`, which the
     /// controller reads and applies itself. The case applies no generation
     /// in its own process beside it.
+    #[cfg(feature = "wasm")]
     pub async fn start_hosting(catalog: Catalog, spec: &Path) -> Result<Self, String> {
         let replica = Replica::start_over("fleet-controller", None, catalog, Some(spec)).await?;
         Self::around(replica).await
@@ -1064,6 +1165,7 @@ impl Harness {
             buffers: ViewBuffers::default(),
             stop_feeds,
             feeds: JoinSet::new(),
+            elects: false,
         })
     }
 
@@ -1077,7 +1179,9 @@ impl Harness {
         let port = leader.replication.port();
         let mut standby = Replica::start_at("fleet-standby", Some(lease), STANDBY, port).await?;
         standby.reaches(State::Follower).await?;
-        Ok((Self::around(leader).await?, standby))
+        let mut harness = Self::around(leader).await?;
+        harness.elects = true;
+        Ok((harness, standby))
     }
 
     /// The reference client at `replica`'s gateway listener and the
@@ -1140,6 +1244,31 @@ impl Harness {
         self.client = client;
         self.operator = operator;
         Ok(())
+    }
+
+    /// Whether the controller the harness asks elects over a lease file.
+    pub const fn elects(&self) -> bool {
+        self.elects
+    }
+
+    /// Opens the harness's session again at the controller it asks, as a
+    /// gateway does whose session that controller ended. The dial is tried
+    /// until the controller welcomes it, inside the room.
+    pub async fn redial(&mut self) -> Result<(), String> {
+        let gateway = format!("http://{}", self.replica.gateway());
+        let asked = Instant::now();
+        loop {
+            match Client::connect(&gateway, GATEWAY).await {
+                Ok(client) => {
+                    self.client = client;
+                    return Ok(());
+                }
+                Err(_) if asked.elapsed() < ROOM => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Err(refused) => return Err(format!("no session opens inside the room: {refused}")),
+            }
+        }
     }
 
     /// Ask: who leads, as the reference client hears it on the gateway
@@ -1237,27 +1366,7 @@ impl Harness {
         if shape.ranks == 1 {
             return self.add(endpoint, shape).await;
         }
-        let id = self
-            .store
-            .upsert(WorkerFacts {
-                key: format!("{endpoint}@{rank}"),
-                engine: endpoint.to_owned(),
-                incarnation: 1,
-                role: shape.role,
-                wire_modes: WireModes::GRPC,
-                engine_kind: shape.runtime.as_str().to_owned(),
-                models: vec![shape.model.to_owned()],
-                dp_rank: rank,
-                dp_size: shape.ranks,
-                signals: Signals {
-                    events: !counts_resident(shape.runtime),
-                    ..Signals::default()
-                },
-                health: health_policy(),
-                ..WorkerFacts::default()
-            })
-            .id();
-        Ok(id)
+        Ok(written(&self.store, endpoint, shape, rank))
     }
 
     /// An operator's add of a one-rank engine. The answer is the row the
@@ -1576,39 +1685,7 @@ impl Harness {
         self.sent += 1;
         let lease_id = self.sent;
         let started = Instant::now();
-        let request = vllm_proto::GenerateRequest {
-            request_id: format!("sent-{engine}-{lease_id}"),
-            input: Some(vllm_proto::generate_request::Input::Tokenized(
-                vllm_proto::TokenizedInput {
-                    original_text: String::new(),
-                    input_ids: vec![1; 8],
-                },
-            )),
-            sampling_params: Some(vllm_proto::SamplingParams {
-                max_tokens: Some(SENT_TOKENS),
-                ..Default::default()
-            }),
-            stream: true,
-            ..Default::default()
-        };
-        let asked = tokio::time::timeout(DIAL_TIMEOUT, async {
-            let Ok(client) = VllmEngineClient::connect(&endpoint).await else {
-                return (Class::ConnectFailed, 0);
-            };
-            let Ok(mut stream) = client.generate(request).await else {
-                return (Class::ServerError, 0);
-            };
-            let mut frames = 0;
-            loop {
-                match stream.next().await {
-                    Some(Ok(_)) => frames += 1,
-                    Some(Err(_)) => return (Class::ServerError, frames),
-                    None => return (Class::Ok, frames),
-                }
-            }
-        })
-        .await;
-        let (class, frames) = asked.unwrap_or((Class::Timeout, 0));
+        let (class, frames) = sent(&endpoint, format!("sent-{engine}-{lease_id}")).await;
         let side = Side::Single.into();
         let dispatched = Dispatched {
             lease_id,
@@ -1739,28 +1816,13 @@ impl Harness {
             .engines
             .get_mut(engine)
             .ok_or_else(|| format!("no engine {engine}"))?;
-        let (Some(kill), Some(ended), Some(mut witness)) =
-            (slot.kill.take(), slot.ended.take(), slot.witness.take())
-        else {
-            return Err(format!("engine {engine} is dead already"));
-        };
         // Both are read before a hung engine is let go: its release runs
         // the thread to its end.
         let at = Instant::now();
         let asked = self.turns.begun.load(Ordering::SeqCst);
-        slot.hang = None;
-        slot.release = None;
-        drop(kill);
-        // The sender's drop is the thread's end: the wait ends on the error.
-        let _ = bounded("a killed engine's thread ends", ROOM, ended).await?;
-        // The proof of death is a socket of the harness's own: it reads to
-        // its end once the engine's side closed. A reset is an end too.
-        let _ = bounded(
-            "a killed engine's sockets close",
-            ROOM,
-            copy(&mut witness, &mut sink()),
-        )
-        .await?;
+        if !slot.die().await? {
+            return Err(format!("engine {engine} is dead already"));
+        }
         Ok(Death {
             at,
             asked,
@@ -1861,5 +1923,156 @@ impl Harness {
             }
         }
         self.replica.stop().await
+    }
+}
+
+/// A fleet under a host that embeds the engine: the same engines and the
+/// same stand-in prober, over a store of the case's own process with no
+/// controller beside it. A store has one host at its files, so every
+/// decision over this fleet is its door's.
+pub struct Embedded {
+    store: Arc<MemoryStore>,
+    engines: Vec<Engine>,
+    probed: Arc<Mutex<Vec<Probed>>>,
+    turns: Arc<Turns>,
+    stop_feeds: watch::Sender<bool>,
+    feeds: JoinSet<()>,
+}
+
+impl Embedded {
+    /// A store of `deciders` files of leases with `document` applied as
+    /// its first generation, and no engine yet.
+    pub fn start(deciders: usize, mut document: PolicySpec) -> Result<Self, String> {
+        let store = MemoryStore::new().with_deciders(deciders);
+        document.generation = 1;
+        let spec = AppliedSpec::validate(&document).map_err(|error| error.to_string())?;
+        store.apply(spec).map_err(|error| error.to_string())?;
+        let (stop_feeds, _) = watch::channel(false);
+        Ok(Self {
+            store: Arc::new(store),
+            engines: Vec::new(),
+            probed: Arc::default(),
+            turns: Arc::default(),
+            stop_feeds,
+            feeds: JoinSet::new(),
+        })
+    }
+
+    /// Register: starts one mock engine a shape and writes each of its
+    /// ranks into the store, pending: only a probe's verdict makes a rank
+    /// ready. Returns the engines' indexes, in the shapes' order.
+    pub async fn register(&mut self, shapes: &[Shape]) -> Result<Vec<usize>, String> {
+        let mut started = Vec::with_capacity(shapes.len());
+        for shape in shapes {
+            let running = start_engine(shape.ranks, shape.runtime).await?;
+            let endpoint = running.endpoint.clone();
+            let ranks = 0..shape.ranks;
+            let ids = ranks.map(|rank| written(&self.store, &endpoint, shape, rank));
+            let probed = Probed {
+                engine: self.engines.len(),
+                runtime: shape.runtime,
+                endpoint: endpoint.clone(),
+                ids: ids.collect(),
+            };
+            // The build these registrations owe, asked: the case reads
+            // the rows at once.
+            self.store.publish_now();
+            started.push(probed.engine);
+            self.probed.lock().push(probed);
+            self.engines.push(running);
+        }
+        Ok(started)
+    }
+
+    /// Feed: starts the stand-in prober over every engine registered now
+    /// and later.
+    pub fn feed(&mut self) {
+        self.feeds.spawn(probe(
+            Arc::clone(&self.store),
+            Arc::clone(&self.probed),
+            Arc::clone(&self.turns),
+            self.stop_feeds.subscribe(),
+        ));
+    }
+
+    /// The store: the host's door decides over it.
+    pub fn store(&self) -> &Arc<MemoryStore> {
+        &self.store
+    }
+
+    /// The engine a row of the fleet stands for.
+    pub fn engine_of(&self, id: WorkerId) -> Option<usize> {
+        let probed = self.probed.lock();
+        let owner = probed.iter().find(|engine| engine.ids.contains(&id));
+        owner.map(|engine| engine.engine)
+    }
+
+    /// Each engine as a decision of `gateway` reads it in the pool that
+    /// serves `model` at this instant, in the engines' order: whether
+    /// every rank of it reads healthy, and the requests the leases on
+    /// file book on it.
+    pub fn read(&self, model: &str, gateway: GatewayId) -> Vec<(bool, u32)> {
+        let ask = Ask {
+            gateway,
+            now: Instant::now(),
+            pinned: None,
+            affinity: false,
+        };
+        let mut out = ViewBuffers::default();
+        self.store.deciding(|world| {
+            if let Some(built) = world.build(model, Role::Single, &ask, &mut out) {
+                world.count_in_flight(&built, &ask, &mut out.candidates);
+            }
+        });
+        let probed = self.probed.lock();
+        let engines = probed.iter().map(|engine| {
+            let rows = out.candidates.iter();
+            let own: Vec<_> = rows.filter(|row| engine.ids.contains(&row.id)).collect();
+            let healthy = own.len() == engine.ids.len() && own.iter().all(|row| row.health.healthy);
+            (healthy, own.iter().map(|row| row.in_flight).sum())
+        });
+        engines.collect()
+    }
+
+    /// Sends one short request named `id` to the engine at `engine` on the
+    /// engine's own wire and reads it to its end, as a host that committed
+    /// its pick sends one: the class the transport read and the frames
+    /// read.
+    pub async fn send(&self, engine: usize, id: &str) -> Result<(TransportClass, u32), String> {
+        let slot = self.engines.get(engine);
+        let endpoint = slot.map(|engine| engine.endpoint.clone());
+        let endpoint = endpoint.ok_or_else(|| format!("no engine {engine}"))?;
+        let (class, frames) = sent(&endpoint, id.to_owned()).await;
+        let class = match class {
+            Class::Ok => TransportClass::Ok,
+            Class::ConnectFailed => TransportClass::ConnectFailed,
+            Class::Timeout => TransportClass::Timeout,
+            _ => TransportClass::ServerError,
+        };
+        Ok((class, frames))
+    }
+
+    /// Kills the engine at `engine`: every socket of it has closed at the
+    /// return.
+    pub async fn kill(&mut self, engine: usize) -> Result<(), String> {
+        let slot = self.engines.get_mut(engine);
+        let slot = slot.ok_or_else(|| format!("no engine {engine}"))?;
+        if slot.die().await? {
+            Ok(())
+        } else {
+            Err(format!("engine {engine} is dead already"))
+        }
+    }
+
+    /// Ends the prober and the engines, each under a bound.
+    pub async fn stop(mut self) -> Result<(), String> {
+        self.stop_feeds.send_replace(true);
+        while let Some(joined) = bounded("a feed ends", ROOM, self.feeds.join_next()).await? {
+            joined.map_err(|error| error.to_string())?;
+        }
+        for engine in &mut self.engines {
+            engine.die().await?;
+        }
+        Ok(())
     }
 }

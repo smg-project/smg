@@ -22,6 +22,7 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 )]
 #[export_name = "_rjem_malloc_conf"]
 pub static MALLOC_CONF: &[u8; 100] = observability::metrics::SERVER_MALLOC_CONF;
+use openai_protocol::worker::{ConnectionMode, RuntimeType};
 use smg::*;
 use smg_auth as auth;
 
@@ -98,11 +99,11 @@ impl BackendType {
     /// the wire cannot be probed; a provider or TensorRT-LLM pins none, and
     /// without a backend the detection step decides, as it does for the CLI
     /// without `--backend`.
-    fn startup_worker_runtime(&self) -> Option<worker::RuntimeType> {
+    fn startup_worker_runtime(&self) -> Option<RuntimeType> {
         match self {
-            Self::Vllm => Some(worker::RuntimeType::Vllm),
-            Self::Tokenspeed => Some(worker::RuntimeType::TokenSpeed),
-            Self::Sglang => Some(worker::RuntimeType::Sglang),
+            Self::Vllm => Some(RuntimeType::Vllm),
+            Self::Tokenspeed => Some(RuntimeType::TokenSpeed),
+            Self::Sglang => Some(RuntimeType::Sglang),
             Self::Openai | Self::Anthropic | Self::Trtllm | Self::Gemini => None,
         }
     }
@@ -757,7 +758,7 @@ struct Router {
     /// silent; it alone covers the engine's init between HELLO and READY.
     zmq_startup_timeout_secs: u64,
     // Derived from the URL lists; not a parameter.
-    connection_mode: worker::ConnectionMode,
+    connection_mode: ConnectionMode,
 }
 
 /// Read the keyword-only `discovery` mapping by the same rules as
@@ -775,8 +776,7 @@ fn parse_discovery(mapping: &Bound<'_, PyAny>) -> PyResult<Option<config::Discov
 }
 
 impl Router {
-    fn determine_connection_mode(worker_urls: &[String]) -> worker::ConnectionMode {
-        use worker::ConnectionMode;
+    fn determine_connection_mode(worker_urls: &[String]) -> ConnectionMode {
         // First worker URL that declares ipc:// or grpc:// wins; http:// and bare
         // host:port fall through to the HTTP default. See ConnectionMode::from_url.
         worker_urls
@@ -1385,14 +1385,13 @@ impl Router {
         // backend additionally pins the startup workers' runtime. HTTP/gRPC,
         // and ZMQ without a backend, keep auto-detection (None). Mirrors
         // `to_router_config` in model_gateway/src/cli/configure.rs.
-        let startup_worker_runtime_type =
-            if matches!(self.connection_mode, worker::ConnectionMode::Zmq) {
-                self.backend
-                    .as_ref()
-                    .and_then(BackendType::startup_worker_runtime)
-            } else {
-                None
-            };
+        let startup_worker_runtime_type = if matches!(self.connection_mode, ConnectionMode::Zmq) {
+            self.backend
+                .as_ref()
+                .and_then(BackendType::startup_worker_runtime)
+        } else {
+            None
+        };
 
         let pd_pairing_mode = self.parse_pd_pairing_mode()?;
         let grouped_dp_sticky = self.parse_grouped_dp_sticky()?;
@@ -2347,9 +2346,9 @@ impl Router {
             .discovery
             .as_ref()
             .map(|discovery| {
-                service_discovery::RuntimeDiscoveryConfig::from_config(
+                smg_service_discovery::RuntimeDiscoveryConfig::from_config(
                     discovery,
-                    &router_config.mode,
+                    router_config.mode.discovery_roles(),
                 )
             })
             .transpose()
@@ -2643,7 +2642,6 @@ mod tests {
     /// step, as the CLI does without `--backend`.
     #[test]
     fn an_engine_backend_pins_its_wire_and_no_backend_pins_none() {
-        use worker::RuntimeType;
         let pin = |backend: Option<BackendType>| {
             backend
                 .as_ref()

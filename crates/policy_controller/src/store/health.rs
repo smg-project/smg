@@ -29,33 +29,39 @@ pub enum VetoWrite {
 /// that stands where the write was judged.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HealthWrite {
-    /// The status moved, from the first to the second.
-    Moved(WorkerStatus, WorkerStatus),
+    /// The status moved: `from` is the one the row left, `to` the one that
+    /// stands.
+    Moved {
+        from: WorkerStatus,
+        to: WorkerStatus,
+    },
     /// The write was judged and the status stands.
     Stood(WorkerStatus),
-    /// `revision` moved: the write is dropped, never applied to a
-    /// successor. It was judged against nothing, so it says no status; the
-    /// row's revision is the membership door's to say.
+    /// The row left the revision the write was read under: the write is
+    /// dropped, never applied to a successor. It was judged against
+    /// nothing, so it says no status; the row's revision is the membership
+    /// door's to say.
     Stale,
-    /// No row stands under the id: nothing is written.
-    Gone,
+    /// A write for a worker without a row: nothing is written.
+    NoRow,
 }
 
 impl HealthWrite {
-    /// The transition, where the status moved.
+    /// The transition, where the status moved: the status the row left,
+    /// then the one that stands.
     pub fn moved(self) -> Option<(WorkerStatus, WorkerStatus)> {
         match self {
-            Self::Moved(from, to) => Some((from, to)),
-            Self::Stood(_) | Self::Stale | Self::Gone => None,
+            Self::Moved { from, to } => Some((from, to)),
+            Self::Stood(_) | Self::Stale | Self::NoRow => None,
         }
     }
 
     /// The status that stands where the write was judged: none for a stale
-    /// write and for a row that is gone.
+    /// write and for a worker without a row.
     pub fn stands(self) -> Option<WorkerStatus> {
         match self {
-            Self::Moved(_, status) | Self::Stood(status) => Some(status),
-            Self::Stale | Self::Gone => None,
+            Self::Moved { to: status, .. } | Self::Stood(status) => Some(status),
+            Self::Stale | Self::NoRow => None,
         }
     }
 }
@@ -77,7 +83,7 @@ pub trait HealthSink: Send + Sync {
     /// the failure threshold fails. The answer says what happened to the
     /// write: the status moved; it stood, and the probe is counted;
     /// `revision` moved (a stale outcome is dropped, never applied to a
-    /// successor, and not counted); or the row is gone.
+    /// successor, and not counted); or the worker has no row.
     fn probe_outcome(&self, id: WorkerId, ok: bool, revision: u64) -> HealthWrite;
 
     /// The connect signal of a handshake-promoted worker (a worker whose

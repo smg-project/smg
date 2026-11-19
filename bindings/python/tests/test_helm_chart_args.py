@@ -39,8 +39,8 @@ CHART = REPO / "deploy" / "helm" / "smg"
 HELPERS = CHART / "templates" / "_helpers.tpl"
 SCHEMA = CHART / "values.schema.json"
 ROUTER_TEMPLATE = CHART / "templates" / "deployment-router.yaml"
-# The gateway's Consul provider, which reads Consul's own variables.
-CONSUL_PROVIDER = REPO / "model_gateway" / "src" / "service_discovery" / "consul.rs"
+# The discovery crate's Consul provider, which reads Consul's own variables.
+CONSUL_PROVIDER = REPO / "crates" / "service_discovery" / "src" / "consul.rs"
 # The chart needs Kubernetes >= 1.26 and `helm template` checks it against
 # its default version, which older helm releases put below that.
 KUBE_VERSION = "1.30.0"
@@ -86,8 +86,11 @@ needs_chart = pytest.mark.skipif(not HELPERS.exists(), reason="chart not present
 needs_helm = pytest.mark.skipif(
     shutil.which("helm") is None or not HELPERS.exists(), reason="helm or the chart not present"
 )
-needs_gateway_source = pytest.mark.skipif(
-    not CONSUL_PROVIDER.exists(), reason="the gateway source is not in this checkout"
+# A checkout with no Rust sources has no workspace manifest, and the test that
+# reads them stands down. With the sources there, a provider file that moved
+# fails that test: a skip would hide the move.
+needs_rust_sources = pytest.mark.skipif(
+    not (REPO / "Cargo.toml").exists(), reason="the Rust sources are not in this checkout"
 )
 
 
@@ -674,7 +677,7 @@ def test_consul_secrets_are_wired_only_for_the_consul_provider(provider):
 
 
 @needs_chart
-@needs_gateway_source
+@needs_rust_sources
 def test_chart_consul_variables_are_the_ones_the_gateway_reads():
     text = HELPERS.read_text() + ROUTER_TEMPLATE.read_text()
     assert set(re.findall(r"\bCONSUL_[A-Z_]+\b", text)) == CONSUL_VARIABLES
@@ -959,6 +962,65 @@ def test_a_tag_of_digits_quoted_names_the_image(tmp_path):
         f"docker.io/lightseekorg/smg:{version}",
         f"ghcr.io/smg-project/smg:{version}",
     }
+
+
+def worker_pods(documents: list[dict]) -> dict[str, dict]:
+    """Every worker Deployment's pod spec, by worker name."""
+    return {
+        document["metadata"]["labels"]["smg.lightseek.org/worker"]: document["spec"]["template"][
+            "spec"
+        ]
+        for document in documents
+        if document["kind"] == "Deployment"
+        and document["metadata"].get("labels", {}).get("app.kubernetes.io/component") == "worker"
+    }
+
+
+@needs_helm
+def test_a_worker_pod_gets_a_termination_grace_that_covers_the_servicer_drain(tmp_path):
+    """A worker's Rust servicer drains in-flight streams for up to 30 s on
+    SIGTERM, then stops its server and terminates the engine: 70 s, past
+    Kubernetes' default grace of 30 s. A worker pod gets 90 s unless the entry
+    names its own, 0 included."""
+    values = tmp_path / "values.yaml"
+    values.write_text(
+        WORKERS.format('"0.31"', '"0.31"')
+        + "    terminationGracePeriodSeconds: 0\n"
+        + "  - name: three\n    engine: sglang\n    model: m\n"
+        + "    terminationGracePeriodSeconds: 300\n"
+    )
+    _, documents = render(files=(values,))
+    graces = {
+        name: pod.get("terminationGracePeriodSeconds")
+        for name, pod in worker_pods(documents).items()
+    }
+    assert graces == {"one": 90, "two": 0, "three": 300}
+
+
+@needs_helm
+@pytest.mark.parametrize("written", ['"90s"', '"90"', "90.5", "-1"])
+def test_a_termination_grace_that_is_not_whole_seconds_is_refused_by_the_schema(tmp_path, written):
+    """The template reads the grace through ``int``, which turns ``"90s"`` into
+    0: a pod with no grace at all, its streams cut on SIGTERM. The schema
+    refuses a string, a fraction and a negative value under the entry's name
+    (helm 3.18 moved to a JSON pointer for it); ``null`` is the default."""
+    values = tmp_path / "values.yaml"
+    values.write_text(
+        WORKERS.format('"0.31"', '"0.31"') + f"    terminationGracePeriodSeconds: {written}\n"
+    )
+    error = render_error(files=(values,))
+    assert any(
+        name in error
+        for name in (
+            "workers.1.terminationGracePeriodSeconds",
+            "/workers/1/terminationGracePeriodSeconds",
+        )
+    ), error
+    values.write_text(
+        WORKERS.format('"0.31"', '"0.31"') + "    terminationGracePeriodSeconds: null\n"
+    )
+    _, documents = render(files=(values,))
+    assert worker_pods(documents)["two"]["terminationGracePeriodSeconds"] == 90
 
 
 @needs_helm

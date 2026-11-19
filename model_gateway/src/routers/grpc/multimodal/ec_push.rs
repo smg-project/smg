@@ -18,19 +18,17 @@ use std::sync::Arc;
 use axum::response::Response;
 use serde_json::json;
 use smg_grpc_client::vllm_proto as vllm;
+use smg_worker::identity::basic::Worker;
 use uuid::Uuid;
 
-use crate::{
-    routers::{
-        error,
-        grpc::{
-            backend_client::get_backend_client,
-            context::EncodeWorkerAssignment,
-            proto_wrapper::{ProtoGenerateRequest, ProtoGenerateResponse},
-            utils::tonic_ext::TonicStatusExt,
-        },
+use crate::routers::{
+    error,
+    grpc::{
+        backend_client::get_backend_client,
+        context::EncodeWorkerAssignment,
+        proto_wrapper::{ProtoGenerateRequest, ProtoGenerateResponse},
+        utils::tonic_ext::TonicStatusExt,
     },
-    worker::Worker,
 };
 
 mod images;
@@ -462,7 +460,7 @@ mod tests {
     /// carries an empty object.
     #[test]
     fn the_encoders_copy_of_the_prompt_mints_one_transfer_id_per_media_hash() {
-        use crate::worker::BasicWorkerBuilder;
+        use crate::routers::grpc::backend_client::BasicWorkerBuilder;
         let original = vllm::GenerateRequest {
             request_id: "req-1".into(),
             stream: true,
@@ -552,7 +550,7 @@ mod tests {
     /// Missing PUSH discovery must fail before the encoder is contacted.
     #[test]
     fn mooncake_requires_a_destination() {
-        use crate::worker::BasicWorkerBuilder;
+        use crate::routers::grpc::backend_client::BasicWorkerBuilder;
         for connector in ["ECCPUConnector", "ECMooncakeConnector"] {
             let worker = BasicWorkerBuilder::new("grpc://127.0.0.1:9000")
                 .label("ec_connector", connector)
@@ -659,8 +657,7 @@ mod tests {
     #[tokio::test]
     async fn a_refused_dial_to_the_encoder_is_answered_without_its_address() {
         use smg_grpc_client::tokenspeed_proto as ts;
-
-        use crate::worker::test_support::RefusedAddress;
+        use smg_worker::test_support::RefusedAddress;
 
         // An encoder the gateway reached once and that is gone, on a port
         // that stays taken after it: the port refuses from then on.

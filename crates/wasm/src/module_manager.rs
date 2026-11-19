@@ -68,6 +68,11 @@ fn now_nanos() -> u64 {
         .as_nanos() as u64
 }
 
+/// A poisoned lock of the module table, as the manager's error.
+fn lock_failed(poisoned: impl ToString) -> WasmError {
+    WasmManagerError::LockFailed(poisoned.to_string()).into()
+}
+
 pub struct WasmModuleManager {
     modules: Arc<RwLock<HashMap<Uuid, ModuleEntry>>>,
     runtime: Arc<WasmRuntime>,
@@ -99,20 +104,14 @@ impl WasmModuleManager {
 
     /// Register a module (for workflow steps)
     pub fn register_module_internal(&self, module: WasmModule) -> Result<()> {
-        let mut modules = self
-            .modules
-            .write()
-            .map_err(|e| WasmManagerError::LockFailed(e.to_string()))?;
+        let mut modules = self.modules.write().map_err(lock_failed)?;
         modules.insert(module.module_uuid, ModuleEntry::new(module));
         Ok(())
     }
 
     /// Remove a module (for workflow steps)
     pub fn remove_module_internal(&self, module_uuid: Uuid) -> Result<()> {
-        let mut modules = self
-            .modules
-            .write()
-            .map_err(|e| WasmManagerError::LockFailed(e.to_string()))?;
+        let mut modules = self.modules.write().map_err(lock_failed)?;
         if !modules.contains_key(&module_uuid) {
             return Err(WasmManagerError::ModuleNotFound(module_uuid).into());
         }
@@ -121,10 +120,7 @@ impl WasmModuleManager {
     }
 
     pub fn check_duplicate_sha256_hash(&self, sha256_hash: &[u8; 32]) -> Result<()> {
-        let modules = self
-            .modules
-            .read()
-            .map_err(|e| WasmManagerError::LockFailed(e.to_string()))?;
+        let modules = self.modules.read().map_err(lock_failed)?;
         if modules
             .values()
             .any(|entry| entry.module.module_meta.sha256_hash == *sha256_hash)
@@ -135,18 +131,12 @@ impl WasmModuleManager {
     }
 
     pub fn get_module(&self, module_uuid: Uuid) -> Result<Option<WasmModule>> {
-        let modules = self
-            .modules
-            .read()
-            .map_err(|e| WasmManagerError::LockFailed(e.to_string()))?;
+        let modules = self.modules.read().map_err(lock_failed)?;
         Ok(modules.get(&module_uuid).map(ModuleEntry::snapshot))
     }
 
     pub fn get_modules(&self) -> Result<Vec<WasmModule>> {
-        let modules = self
-            .modules
-            .read()
-            .map_err(|e| WasmManagerError::LockFailed(e.to_string()))?;
+        let modules = self.modules.read().map_err(lock_failed)?;
         Ok(modules.values().map(ModuleEntry::snapshot).collect())
     }
 
@@ -155,10 +145,7 @@ impl WasmModuleManager {
         &self,
         attach_point: WasmModuleAttachPoint,
     ) -> Result<Vec<WasmModule>> {
-        let modules = self
-            .modules
-            .read()
-            .map_err(|e| WasmManagerError::LockFailed(e.to_string()))?;
+        let modules = self.modules.read().map_err(lock_failed)?;
         Ok(modules
             .values()
             .filter(|entry| {
@@ -189,10 +176,7 @@ impl WasmModuleManager {
         // The SHA256 hash, the Arc-wrapped WASM bytes and the access counters'
         // bump, all under one read lock: an execution excludes no reader.
         let (sha256_hash, wasm_bytes) = {
-            let modules = self
-                .modules
-                .read()
-                .map_err(|e| WasmManagerError::LockFailed(e.to_string()))?;
+            let modules = self.modules.read().map_err(lock_failed)?;
             let entry = modules
                 .get(&module_uuid)
                 .ok_or_else(|| WasmError::from(WasmManagerError::ModuleNotFound(module_uuid)))?;

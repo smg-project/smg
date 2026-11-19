@@ -26,12 +26,13 @@ use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
 
 use crate::{
+    builtins::ReadsLoad,
     counts::with_counts,
     framework::{Front, Scorer, Spread, TieBand},
     lease::{Lifecycle, Membership},
     spec::{AffinitySource, KvPressureParams, Needs, PrefixAffinityParams, WarmupSliceParams},
     view::{
-        mean_in_flight, AffinityFacts, Candidate, Feed, HashKind, NamedAffinity, Phase,
+        mean_in_flight, AffinityFacts, Candidate, Feed, HashKind, LoadRow, NamedAffinity, Phase,
         RequestFacts, Walk, WorkerId,
     },
     Draw,
@@ -62,6 +63,31 @@ const CHARS_PER_TOKEN: u32 = 4;
 /// Tokens per block when the document names none: the block size of record
 /// of the common engines.
 const DEFAULT_BLOCK_SIZE: u32 = 16;
+
+/// The matched share under which a request is balanced instead of pinned,
+/// when the document names no threshold. The warm-up slice counts a hit as
+/// a miss at or under the same share when it names none.
+pub const DEFAULT_THRESHOLD: f32 = 0.3;
+
+/// How long after admission a worker counts as warming, in seconds, when
+/// the document names no time.
+pub const DEFAULT_WARMUP_SECS: u64 = 60;
+
+/// The share of misses offered to warming workers when the document names
+/// none.
+pub const DEFAULT_WARMUP_SHARE: f32 = 0.25;
+
+/// The index growth after which a worker is warm, in blocks, when the
+/// document names none.
+pub const DEFAULT_WARMUP_BLOCKS: u64 = 1024;
+
+/// The share of the fleet's median index under which a worker is thin, when
+/// the document names none.
+pub const DEFAULT_WARMUP_THIN_RATIO: f32 = 0.5;
+
+/// One hit in this many is diverted to a thin worker when the document
+/// names no count.
+pub const DEFAULT_WARMUP_DIVERT_EVERY: u64 = 8;
 
 /// The gates the affinity stages of one profile share: the spill gate of
 /// `prefix-affinity`, the fleet KV gate of `kv-pressure`, and the block size
@@ -145,13 +171,18 @@ impl Gates {
     /// kept candidate over the ceiling, or materially hotter than the
     /// coldest. Read from the active share of the rows that report; a pool
     /// without a report is never under pressure.
-    fn kv_imbalanced(&self, candidates: &[Candidate], kept: &[u32]) -> bool {
+    fn kv_imbalanced(
+        &self,
+        candidates: &[Candidate],
+        kept: &[u32],
+        load: impl Fn(&Candidate) -> Option<LoadRow>,
+    ) -> bool {
         if !self.kv_configured() {
             return false;
         }
         let mut bounds: Option<(f32, f32)> = None;
         for &i in kept {
-            let Some(load) = candidates[i as usize].load else {
+            let Some(load) = load(&candidates[i as usize]) else {
                 continue;
             };
             let usage = load.active_kv();
@@ -371,7 +402,7 @@ impl PrefixAffinity {
     /// The stage from its parameters and its profile's gates.
     pub fn new(params: &PrefixAffinityParams, gates: Gates) -> Self {
         Self {
-            threshold: params.threshold.unwrap_or(0.3),
+            threshold: params.threshold.unwrap_or(DEFAULT_THRESHOLD),
             source: params.source.unwrap_or_default(),
             gates,
         }
@@ -544,6 +575,11 @@ impl Scorer for PrefixAffinity {
         "prefix-affinity"
     }
 
+    // Scores by the affinity column. Its spill gate reads the mean count and places elsewhere.
+    fn refuses_by_reports(&self) -> bool {
+        false
+    }
+
     /// Row by row, unless the fleet's KV gate is configured: that gate
     /// reads every row.
     fn row_wise(&self) -> bool {
@@ -555,37 +591,15 @@ impl Scorer for PrefixAffinity {
         Spread::Levels(0.5)
     }
 
-    /// [`Self::score`] with the word of its scores, said by the pass that
-    /// writes them: it counts the rows it writes the ceiling, and no pass
-    /// reads the scores again. Under the fleet's KV gate every row stands
-    /// alike. The rows a host named say nothing.
     fn score_front(
         &self,
         facts: &RequestFacts<'_>,
         candidates: &[Candidate],
-        _: &[u32],
+        kept: &[u32],
         asked: &[u32],
         out: &mut [f32],
     ) -> (TieBand, Front) {
-        if facts.named_alone().is_some() {
-            return (self.score(facts, candidates, asked, out), Front::Unsaid);
-        }
-        if self.gates.kv_imbalanced(candidates, asked) {
-            return (neutral(out), Front::Alike);
-        }
-        let column = facts.affinity;
-        let (band, ceilings) =
-            self.rank(facts, candidates, asked, out, Feed::Column(column), || {
-                |i: u32| column[i as usize]
-            });
-        // The values are the ceiling, a half and nothing: every row not
-        // counted stands a level or more under the rows that are.
-        let said = if ceilings as usize == out.len() {
-            Front::Alike
-        } else {
-            Front::At(ceilings)
-        };
-        (band, said)
+        self.score_front_with(facts, candidates, kept, asked, out, |c| c.load)
     }
 
     fn score(
@@ -595,21 +609,7 @@ impl Scorer for PrefixAffinity {
         kept: &[u32],
         out: &mut [f32],
     ) -> TieBand {
-        if self.gates.kv_imbalanced(candidates, kept) {
-            return neutral(out);
-        }
-        // What the rows hold is taken once a pass: a read by index tests
-        // the feed and its bound for every row. The rows a host named
-        // answer out of line, so a pass over a column keeps the code it
-        // had: one entry a candidate, and a kept row reads its own.
-        if let Some(named) = facts.named_alone() {
-            return self.rank_named(facts, candidates, kept, out, named);
-        }
-        let column = facts.affinity;
-        self.rank(facts, candidates, kept, out, Feed::Column(column), || {
-            |i: u32| column[i as usize]
-        })
-        .0
+        self.score_with(facts, candidates, kept, out, |c| c.load)
     }
 
     fn needs(&self) -> Needs {
@@ -629,6 +629,71 @@ impl Scorer for PrefixAffinity {
     }
 }
 
+impl ReadsLoad for PrefixAffinity {
+    /// The pass counts the rows it writes the ceiling. Under the fleet's
+    /// KV gate every row stands alike. The rows a host named say nothing.
+    fn score_front_with(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        _: &[u32],
+        asked: &[u32],
+        out: &mut [f32],
+        load: impl Fn(&Candidate) -> Option<LoadRow> + Copy,
+    ) -> (TieBand, Front) {
+        if facts.named_alone().is_some() {
+            return (
+                self.score_with(facts, candidates, asked, out, load),
+                Front::Unsaid,
+            );
+        }
+        if self.gates.kv_imbalanced(candidates, asked, load) {
+            return (neutral(out), Front::Alike);
+        }
+        let column = facts.affinity;
+        let (band, ceilings) =
+            self.rank(facts, candidates, asked, out, Feed::Column(column), || {
+                |i: u32| column[i as usize]
+            });
+        // The values are the ceiling, a half and nothing: every row not
+        // counted stands a level or more under the rows that are.
+        let said = if ceilings as usize == out.len() {
+            Front::Alike
+        } else {
+            Front::At(ceilings)
+        };
+        (band, said)
+    }
+
+    // The front's named path calls this whole scorer. Keep it out of
+    // the pass over a column.
+    #[inline(never)]
+    fn score_with(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        out: &mut [f32],
+        load: impl Fn(&Candidate) -> Option<LoadRow> + Copy,
+    ) -> TieBand {
+        if self.gates.kv_imbalanced(candidates, kept, load) {
+            return neutral(out);
+        }
+        // What the rows hold is taken once a pass: a read by index tests
+        // the feed and its bound for every row. The rows a host named
+        // answer out of line, so a pass over a column keeps the code it
+        // had: one entry a candidate, and a kept row reads its own.
+        if let Some(named) = facts.named_alone() {
+            return self.rank_named(facts, candidates, kept, out, named);
+        }
+        let column = facts.affinity;
+        self.rank(facts, candidates, kept, out, Feed::Column(column), || {
+            |i: u32| column[i as usize]
+        })
+        .0
+    }
+}
+
 // ---------------------------------------------------------------- kv pressure
 
 /// The fleet KV gate: its parameters configure the gate every affinity stage
@@ -642,6 +707,11 @@ impl Lifecycle for KvPressure {}
 impl Scorer for KvPressure {
     fn name(&self) -> &'static str {
         "kv-pressure"
+    }
+
+    // Scores by the pressure its feed reports.
+    fn refuses_by_reports(&self) -> bool {
+        false
     }
 
     /// The stage orders nothing: the gate it configures is read by the
@@ -831,12 +901,16 @@ impl WarmupSlice {
     /// The stage from its parameters and its profile's gates.
     pub fn new(params: &WarmupSliceParams, gates: Gates) -> Self {
         Self {
-            secs_micros: params.secs.unwrap_or(60).saturating_mul(1_000_000),
-            share: params.share.unwrap_or(0.25),
-            blocks: u32::try_from(params.blocks.unwrap_or(1024)).unwrap_or(u32::MAX),
-            thin_ratio: params.thin_ratio.unwrap_or(0.5),
-            divert_every: params.divert_every.unwrap_or(8),
-            miss_share: params.miss_share.unwrap_or(0.3),
+            secs_micros: params
+                .secs
+                .unwrap_or(DEFAULT_WARMUP_SECS)
+                .saturating_mul(1_000_000),
+            share: params.share.unwrap_or(DEFAULT_WARMUP_SHARE),
+            blocks: u32::try_from(params.blocks.unwrap_or(DEFAULT_WARMUP_BLOCKS))
+                .unwrap_or(u32::MAX),
+            thin_ratio: params.thin_ratio.unwrap_or(DEFAULT_WARMUP_THIN_RATIO),
+            divert_every: params.divert_every.unwrap_or(DEFAULT_WARMUP_DIVERT_EVERY),
+            miss_share: params.miss_share.unwrap_or(DEFAULT_THRESHOLD),
             gates,
             misses: AtomicU64::new(0),
             hits: AtomicU64::new(0),
@@ -1129,6 +1203,11 @@ impl Scorer for WarmupSlice {
         "warmup-slice"
     }
 
+    // Scores by the warm-up state. Its divert reads a holder's count and places elsewhere.
+    fn refuses_by_reports(&self) -> bool {
+        false
+    }
+
     /// Row by row, unless the fleet's KV gate is configured: that gate
     /// reads every row. What the stage reads of the pool (its level, who
     /// warms) comes from the host's feed, never from the rows handed.
@@ -1141,20 +1220,57 @@ impl Scorer for WarmupSlice {
         Spread::Levels(1.0)
     }
 
-    /// [`Self::score`], and the word of its scores read off two of them.
-    /// The pass writes every row the ceiling, or one row the ceiling and
-    /// every other nothing: the first two rows tell the answers apart, and
-    /// no pass reads the scores again. A lone row stands at the ceiling
-    /// either way, which reads alike. The rows a host named say nothing.
     fn score_front(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        asked: &[u32],
+        out: &mut [f32],
+    ) -> (TieBand, Front) {
+        self.score_front_with(facts, candidates, kept, asked, out, |c| c.load)
+    }
+
+    fn score(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        out: &mut [f32],
+    ) -> TieBand {
+        self.score_with(facts, candidates, kept, out, |c| c.load)
+    }
+
+    fn needs(&self) -> Needs {
+        Needs {
+            // The admitted age, the index's growth and size and the overlap
+            // are all read from a candidate's entry of the column.
+            affinity: true,
+            events: true,
+            loads: true,
+            ..Needs::default()
+        }
+    }
+
+    fn warm_rule(&self) -> Option<WarmRule> {
+        Some(self.rule())
+    }
+}
+
+impl ReadsLoad for WarmupSlice {
+    /// A slice either scores every row alike or gives one row the ceiling.
+    /// The first two scores tell those answers apart. A lone row stands at
+    /// the ceiling either way. The rows a host named say nothing.
+    fn score_front_with(
         &self,
         facts: &RequestFacts<'_>,
         candidates: &[Candidate],
         _: &[u32],
         asked: &[u32],
         out: &mut [f32],
+        load: impl Fn(&Candidate) -> Option<LoadRow> + Copy,
     ) -> (TieBand, Front) {
-        let band = self.score(facts, candidates, asked, out);
+        let band = self.score_with(facts, candidates, asked, out, load);
         if facts.named_alone().is_some() {
             return (band, Front::Unsaid);
         }
@@ -1165,14 +1281,15 @@ impl Scorer for WarmupSlice {
         (band, if alike { Front::Alike } else { Front::At(1) })
     }
 
-    fn score(
+    fn score_with(
         &self,
         facts: &RequestFacts<'_>,
         candidates: &[Candidate],
         kept: &[u32],
         out: &mut [f32],
+        load: impl Fn(&Candidate) -> Option<LoadRow> + Copy,
     ) -> TieBand {
-        if self.share <= 0.0 || self.gates.kv_imbalanced(candidates, kept) {
+        if self.share <= 0.0 || self.gates.kv_imbalanced(candidates, kept, load) {
             return neutral(out);
         }
         // The rows a host named answer out of line, so a pass over a column
@@ -1195,21 +1312,6 @@ impl Scorer for WarmupSlice {
             return neutral(out);
         };
         self.turn::<false>(facts, candidates, kept, out, Feed::Column(column), warm)
-    }
-
-    fn needs(&self) -> Needs {
-        Needs {
-            // The admitted age, the index's growth and size and the overlap
-            // are all read from a candidate's entry of the column.
-            affinity: true,
-            events: true,
-            loads: true,
-            ..Needs::default()
-        }
-    }
-
-    fn warm_rule(&self) -> Option<WarmRule> {
-        Some(self.rule())
     }
 }
 

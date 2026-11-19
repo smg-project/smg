@@ -48,18 +48,18 @@ use tonic::{
 use tool_parser::ParserFactory as ToolParserFactory;
 
 use super::{character_tokenizer::CharacterTokenizer, GenerateStreamContext, StreamingProcessor};
-use crate::{
-    routers::{
-        common::sse::{sse_channel, SseReceiver},
-        grpc::{
-            context::DispatchMetadata,
-            proto_wrapper::ProtoStream,
-            regular::symphony::{assign_for, Asks, Assignment, Reading},
-            spec::{ChatResponseSpec, CompletionResponseSpec, MessagesResponseSpec},
-            utils::ParserResolver,
-        },
+use crate::routers::{
+    common::{
+        snapshot::WorkerRegistry,
+        sse::{sse_channel, SseReceiver},
     },
-    worker::WorkerRegistry,
+    grpc::{
+        context::DispatchMetadata,
+        proto_wrapper::ProtoStream,
+        regular::symphony::{assign_for, Asks, Assignment, Reading},
+        spec::{ChatResponseSpec, CompletionResponseSpec, MessagesResponseSpec},
+        utils::ParserResolver,
+    },
 };
 
 /// The model the requests name.

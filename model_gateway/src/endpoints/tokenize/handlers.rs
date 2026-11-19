@@ -18,10 +18,13 @@ use axum::{
     Json,
 };
 use llm_tokenizer::{registry::TokenizerEntry, traits::Tokenizer, TokenizerRegistry};
-use openai_protocol::tokenize::{
-    AddTokenizerRequest, AddTokenizerResponse, CountResult, DetokenizeRequest, DetokenizeResponse,
-    ListTokenizersResponse, RemoveTokenizerResponse, TextResult, TokenizeRequest, TokenizeResponse,
-    TokenizerInfo, TokensResult,
+use openai_protocol::{
+    tokenize::{
+        AddTokenizerRequest, AddTokenizerResponse, CountResult, DetokenizeRequest,
+        DetokenizeResponse, ListTokenizersResponse, RemoveTokenizerResponse, TextResult,
+        TokenizeRequest, TokenizeResponse, TokenizerInfo, TokensResult,
+    },
+    UNKNOWN_MODEL_ID,
 };
 use smg_auth::AuditResource;
 use tracing::{debug, error, warn};
@@ -30,10 +33,10 @@ use crate::{
     admin::json::refusal,
     app_context::AppContext,
     routers::{
+        common::snapshot::WorkerRegistry,
         error,
         grpc::utils::{encode_blocking_in_batch, InPlaceBudget},
     },
-    worker::{WorkerRegistry, UNKNOWN_MODEL_ID},
     workflow::{note_tokenizer_removed, Job, TokenizerConfigRequest},
 };
 

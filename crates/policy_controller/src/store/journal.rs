@@ -42,8 +42,9 @@ pub struct Position {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Kinds {
     /// The watched kinds, those a watcher of the rows can ask for:
-    /// membership and status writes and the starts of terms. A generation's
-    /// needs join them with the step that journals an apply.
+    /// membership and status writes, the starts of terms and the
+    /// generations applied. A watch is told nothing of a generation yet:
+    /// its needs are what one would ask for.
     Watched,
     /// Every kind: the watched kinds and the load rows. What a standby
     /// follows.
@@ -81,6 +82,25 @@ pub trait Journal: Send + Sync {
     /// the leader's event it applies as [`Journal::member`] has it. Never
     /// told to a journal that carries no load rows.
     fn load(&self, at: Option<Position>, id: WorkerId, rank: u16, sample: &LoadSample);
+
+    /// A generation applied, by its number: told under the membership lock
+    /// behind the publication of its first world, so its place orders it
+    /// among the membership writes, with the place of the leader's event
+    /// it applies as [`Journal::member`] has it. The number alone is told:
+    /// the door that applied the generation holds the document it runs
+    /// from, and whoever sends the event joins the two.
+    ///
+    /// A generation applied under no term takes no place: a standby joins a
+    /// history at a term's start, so the store tells the standing number
+    /// again behind each term it takes
+    /// ([`crate::store::LeasesStore::set_term`]). That one is told under
+    /// the term's rise, not under the membership lock: an apply that
+    /// publishes between the read of the standing number and its telling
+    /// leaves the older number behind the newer one. The older entry is
+    /// inert: it crosses by its number alone, since the door joins a
+    /// document only to the generation it still holds, and an event with
+    /// no document changes nothing on a standby.
+    fn generation(&self, at: Option<Position>, generation: u64);
 
     /// The store's term rose, told once a rise: the store took `term`, and
     /// its later writes are made under it while it leads.

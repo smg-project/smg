@@ -72,6 +72,15 @@ impl Scorer for Pack {
         }
     }
 
+    /// This scorer only places, and by the engines' own reports: it turns
+    /// no request away. Saying so leaves a price: a stage that says
+    /// nothing is taken as one that may refuse a request by what the
+    /// gateways report of leases, and each decision under it applies those
+    /// reports first.
+    fn refuses_by_reports(&self) -> bool {
+        false
+    }
+
     fn score(
         &self,
         _: &RequestFacts<'_>,

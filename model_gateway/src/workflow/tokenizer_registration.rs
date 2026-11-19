@@ -19,6 +19,7 @@ use llm_tokenizer::{
 };
 use serde::{Deserialize, Serialize};
 use smg_grpc_client::{tokenizer_bundle, tokenizer_bundle::StreamBundle};
+use smg_worker::identity::basic::{ConnectionMode, Worker};
 use tracing::{debug, error, info, warn};
 use wfaas::{
     BackoffStrategy, FailureAction, RetryPolicy, StepDefinition, StepExecutor, StepId, StepResult,
@@ -29,13 +30,16 @@ use super::data::{require_app_context, TokenizerWorkflowData};
 use crate::{
     app_context::AppContext,
     config::{TokenizerCacheConfig, TEMPLATE_PARSER},
-    routers::grpc::{
-        backend_client::get_backend_client,
-        multimodal::{
-            load_image_preprocessor_config, load_video_preprocessor_config, MultimodalModelConfig,
+    routers::{
+        common::snapshot::WorkerRegistry,
+        grpc::{
+            backend_client::get_backend_client,
+            multimodal::{
+                load_image_preprocessor_config, load_video_preprocessor_config,
+                MultimodalModelConfig,
+            },
         },
     },
-    worker::{ConnectionMode, Worker, WorkerRegistry},
     workflow::steps::local::ReleaseTokenizerStep,
 };
 
@@ -747,13 +751,13 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use openai_protocol::{model_card::ModelCard, worker::WorkerType};
+    use smg_worker::test_support::no_health_check;
     use wfaas::WorkflowInstanceId;
 
     use super::*;
     use crate::{
-        app_context::testing::app_context_for_tests,
-        config::RouterConfig,
-        worker::{test_support::no_health_check, BasicWorkerBuilder},
+        app_context::testing::app_context_for_tests, config::RouterConfig,
+        routers::grpc::backend_client::BasicWorkerBuilder,
     };
 
     #[test]

@@ -636,10 +636,9 @@ pub(crate) fn configure(stall: Duration, wedge: Duration, stale: Duration) {
 
 /// Apply every liveness budget the host hands in: the stall, wedge and
 /// stale thresholds and the warm-up slice. The one place the budgets are
-/// set from outside, for the server's start-up and, as
-/// `worker::configure_liveness`, for a host that builds the context without
-/// the builder (the test harness today); the first call in a process wins,
-/// as for the thresholds' own setter.
+/// set from outside, for the server's start-up and for a host that builds
+/// the context without the builder (the test harness today); the first
+/// call in a process wins, as for the thresholds' own setter.
 pub fn configure_from(budgets: Budgets) {
     configure(budgets.stall, budgets.wedge, budgets.stale);
     configure_warmup(Warmup {

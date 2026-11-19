@@ -11,7 +11,8 @@
 //! again before, so one engine's silence never delays another engine's
 //! sample. A poll asks the engine once, at the engine's own address, and
 //! writes one row per rank whose own records are not serving it, each
-//! rank's figures scoped from the answer. A scrape asks the metrics of an
+//! rank's figures scoped from the answer. A poll carries the sample instant
+//! when the answer gives one. A scrape asks the metrics of an
 //! engine of one rank and writes that rank's row; the gauges are
 //! engine-wide, so a data-parallel engine without a servicer is not scraped
 //! and its ranks have no row until a per-rank source names them: a row
@@ -144,9 +145,10 @@ pub enum ReadError {
     /// The family has no `GetLoads`.
     #[error("no GetLoads on a {0} engine")]
     Unsupported(String),
-    /// The probe's own client was not built, or not within the scrape's
-    /// timeout: the controller's failure, no engine's.
-    #[error("the probe's client is not built: {0}")]
+    /// The probe's own client was not ready: its build failed, its build's
+    /// task was lost, or its build outlasted the scrape's timeout. The
+    /// controller's failure, no engine's.
+    #[error("the probe's client was not ready: {0}")]
     Client(String),
 }
 
@@ -412,25 +414,73 @@ async fn turned(polls: &mut watch::Receiver<bool>) -> bool {
     *polls.borrow_and_update()
 }
 
-/// What a log line calls an engine: the host and port of its address, never
-/// the address whole (a worker URL may carry userinfo, which no log line
-/// gets; the gRPC client names its peers the same way). An address with an
-/// `@` past its first `/`, `?` or `#` is named by the marker the gateway
-/// writes for an address it cannot parse: a userinfo that holds one of the
-/// three raw reads like a path or a query that holds an `@`, and a guess
-/// could print part of the userinfo.
-fn peer(engine: &str) -> &str {
-    let rest = engine
+/// What stands for an address whose userinfo cannot be told from what
+/// follows it: the marker the gateway writes for an address it cannot
+/// parse.
+pub(crate) const UNPARSABLE: &str = "<unparsable address>";
+
+/// An address in its parts around the userinfo ([`split`]). The userinfo
+/// itself is in none of them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Address<'a> {
+    /// The scheme through its `://`; empty where the address has none.
+    pub(crate) scheme: &'a str,
+    /// Whether a userinfo stood before the host.
+    pub(crate) userinfo: bool,
+    /// The host and the port.
+    pub(crate) host: &'a str,
+    /// What follows the authority: a path, a query, a fragment.
+    pub(crate) tail: &'a str,
+}
+
+/// `address` split around its userinfo: the one place of the crate that
+/// tells a credential from an address. A scheme is one by its form
+/// ([`is_scheme`]). Where the text before the first `://` is none, the
+/// address has no scheme and its authority starts at its first byte: a
+/// `://` in a path, a query or a userinfo opens nothing. The authority ends
+/// at the first `/`, `?` or `#`, and its last `@` ends the userinfo. `None`
+/// for an address with an `@` past the authority's end: a userinfo that
+/// holds one of the three raw reads like a path or a query that holds an
+/// `@`, and a guess could tell part of the userinfo.
+pub(crate) fn split(address: &str) -> Option<Address<'_>> {
+    let start = address
         .split_once("://")
-        .map_or(engine, |(_scheme, rest)| rest);
+        .filter(|(scheme, _)| is_scheme(scheme))
+        .map_or(0, |(scheme, _)| scheme.len() + "://".len());
+    let (scheme, rest) = address.split_at(start);
     let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let (authority, tail) = rest.split_at(end);
     if tail.contains('@') {
-        return "<unparsable address>";
+        return None;
     }
-    authority
+    let (userinfo, host) = authority
         .rsplit_once('@')
-        .map_or(authority, |(_userinfo, host)| host)
+        .map_or((false, authority), |(_userinfo, host)| (true, host));
+    Some(Address {
+        scheme,
+        userinfo,
+        host,
+        tail,
+    })
+}
+
+/// Whether `text` is a URL's scheme by its form (RFC 3986): a letter, then
+/// letters, digits, `+`, `-` or `.`.
+fn is_scheme(text: &str) -> bool {
+    let mut bytes = text.bytes();
+    bytes
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic())
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
+}
+
+/// What a log line calls an engine: the host and port of its address, never
+/// the address whole (a worker URL may carry userinfo, which no log line
+/// gets; the gRPC client names its peers the same way). An address whose
+/// userinfo cannot be told from what follows it ([`split`]) is named by
+/// [`UNPARSABLE`].
+fn peer(engine: &str) -> &str {
+    split(engine).map_or(UNPARSABLE, |address| address.host)
 }
 
 impl<S, P> LoadDriver<S, P>
@@ -522,9 +572,9 @@ where
                 word = turned(&mut polls) => {
                     // The term is read after the word: a take sets it
                     // before its word is told.
-                    let led = led();
-                    if (word, led) != (polling, under) {
-                        (polling, under) = (word, led);
+                    let term = led();
+                    if (word, term) != (polling, under) {
+                        (polling, under) = (word, term);
                         schedule = Schedule::default();
                         if polling {
                             self.tick(&mut schedule);
@@ -752,6 +802,7 @@ where
                     }
                 };
                 let received = now();
+                let sampled_at = report.sampled_at.map(|at| at.min(received));
                 // A data-parallel engine's answer is scoped to each rank,
                 // whatever rows are ready; a rank the answer omits is
                 // unavailable: nothing is written for it, never another
@@ -768,7 +819,7 @@ where
                                     &scoped,
                                     engine.role,
                                     received,
-                                    received,
+                                    sampled_at.unwrap_or(received),
                                     SignalSource::Poll,
                                 )
                             });
@@ -781,7 +832,12 @@ where
                 // none and is the word that no report came, which a poll
                 // that left out a served rank does not say.
                 if rows > 0 || !served {
-                    self.store.report(&answer, polled_at, LoadSource::Poll);
+                    if let Some(sampled_at) = sampled_at {
+                        self.store
+                            .report_sampled(&answer, polled_at, sampled_at, LoadSource::Poll);
+                    } else {
+                        self.store.report(&answer, polled_at, LoadSource::Poll);
+                    }
                 }
                 self.stats.rows.fetch_add(rows as u64, Ordering::Relaxed);
             }

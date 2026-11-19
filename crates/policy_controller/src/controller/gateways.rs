@@ -849,8 +849,7 @@ pub(crate) mod tests {
             term: 0,
             issued_at: now,
             dispatch_deadline: now + Duration::from_secs(5),
-            state: LeaseState::Issued,
-            session_ttl_micros: None,
+            state: LeaseState::ISSUED,
         }
     }
 

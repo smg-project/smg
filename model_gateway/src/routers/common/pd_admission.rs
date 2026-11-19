@@ -55,14 +55,11 @@ use std::{
 };
 
 use axum::response::Response;
+use smg_worker::identity::basic::{Worker, WorkerType};
 use tokio::{sync::Notify, time::Instant};
 use tracing::{debug, warn};
 
-use crate::{
-    observability::metrics::Metrics,
-    routers::common::overload,
-    worker::{Worker, WorkerType},
-};
+use crate::{observability::metrics::Metrics, routers::common::overload};
 
 /// Default seconds a PD dispatch may wait for decode rooms. Well under the
 /// engines' bootstrap deadline (120 s on one engine), so a request that does
@@ -354,11 +351,15 @@ mod tests {
     use axum::http::{header::RETRY_AFTER, StatusCode};
     use futures::future::join_all;
     use openai_protocol::model_card::ModelCard;
+    use smg_worker::{
+        identity::basic::{ConnectionMode, WorkerType},
+        test_support::no_health_check,
+    };
 
     use super::*;
-    use crate::{
-        routers::{common::retry::is_retryable_response, error::extract_error_code_from_response},
-        worker::{test_support::no_health_check, BasicWorkerBuilder, ConnectionMode, WorkerType},
+    use crate::routers::{
+        common::retry::is_retryable_response, error::extract_error_code_from_response,
+        grpc::backend_client::BasicWorkerBuilder,
     };
 
     fn decode_worker(url: &str, window: Option<u16>) -> Arc<dyn Worker> {

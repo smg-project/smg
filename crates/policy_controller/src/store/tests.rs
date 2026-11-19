@@ -2,7 +2,7 @@
 //! the trait objects: what every implementation of a trait promises.
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     sync::{mpsc, Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -10,18 +10,18 @@ use std::{
 use super::{
     identity, identity_of,
     leases::{Counts, Slot},
-    Ask, BatchFacts, BatchOutcome, ContentHash, Dispatch, GatewayId, Hand, HealthSink, Journal,
-    Kinds, KvEvent, KvEventSink, LeaseRecord, LeaseRefused, LeaseState, LeasesStore, LoadSample,
-    LoadSink, LoadSource, MembershipChange, MembershipTail, MemoryStore, Picked, Pin, PollMode,
-    Position, Reachability, ReservationKind, ReservationStore, ResyncReason, Said, SequenceHash,
-    SessionsStore, Signals, SnapshotChunk, StoredBlock, VetoWrite, ViewBuffers, WorkerFacts,
-    WorkerPatch, WorkerRow, WorkerStatus, WorkersStore, World,
+    Ask, AtWork, BatchFacts, BatchOutcome, ContentHash, DecodeSide, Dispatch, GatewayId, Hand,
+    HealthSink, Journal, Kinds, KvEvent, KvEventSink, LeaseRecord, LeaseRefused, LeaseState,
+    LeasesStore, LoadSample, LoadSink, LoadSource, MembershipChange, MembershipTail, MemoryStore,
+    Picked, Pin, PollMode, Position, Reachability, ReservationKind, ReservationStore, ResyncReason,
+    Said, SequenceHash, SessionsStore, Sides, Signals, SnapshotChunk, StoredBlock, VetoWrite,
+    ViewBuffers, Watch, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore, World,
 };
 use crate::{
     decider::Decider,
     decision::{Target, Targets},
     lease::{Lease, LeaseId, Membership, Outcome, ReleaseReason, Side, TransportClass},
-    view::{fingerprint, LoadRow, Role, SignalSource, WorkerId},
+    view::{fingerprint, LoadRow, Role, Session, SignalSource, WorkerId},
 };
 
 fn facts(key: &str, incarnation: u64) -> WorkerFacts {
@@ -77,8 +77,7 @@ fn lease(gateway: GatewayId, id: u64, term: u64, now: Instant) -> LeaseRecord {
         term,
         issued_at: now,
         dispatch_deadline: now + Duration::from_secs(1),
-        state: LeaseState::Issued,
-        session_ttl_micros: None,
+        state: LeaseState::ISSUED,
     }
 }
 
@@ -400,7 +399,7 @@ fn a_connect_signal_read_under_a_revision_the_row_left_is_dropped() {
 
 #[test]
 fn a_health_write_says_what_happened_and_the_status_that_stands() {
-    use super::HealthWrite::{Gone, Moved, Stale, Stood};
+    use super::HealthWrite::{Moved, NoRow, Stale, Stood};
 
     let store = MemoryStore::new();
     let health: &dyn HealthSink = &store;
@@ -413,7 +412,10 @@ fn a_health_write_says_what_happened_and_the_status_that_stands() {
     );
     assert_eq!(
         health.probe_outcome(id, true, revision()),
-        Moved(WorkerStatus::Pending, WorkerStatus::Ready)
+        Moved {
+            from: WorkerStatus::Pending,
+            to: WorkerStatus::Ready
+        }
     );
     // The connect signal on a ready row stands and clears no counter: two
     // failures ahead of it and one behind it are the threshold's three.
@@ -426,7 +428,10 @@ fn a_health_write_says_what_happened_and_the_status_that_stands() {
     assert_eq!(health.connected(id, revision()), Stood(WorkerStatus::Ready));
     assert_eq!(
         health.probe_outcome(id, false, revision()),
-        Moved(WorkerStatus::Ready, WorkerStatus::NotReady),
+        Moved {
+            from: WorkerStatus::Ready,
+            to: WorkerStatus::NotReady
+        },
         "the signal cleared no counter of the ready row"
     );
     // A write read under a revision the row left is stale: it says no
@@ -443,7 +448,10 @@ fn a_health_write_says_what_happened_and_the_status_that_stands() {
     );
     assert_eq!(
         health.probe_outcome(id, true, revision()),
-        Moved(WorkerStatus::NotReady, WorkerStatus::Ready)
+        Moved {
+            from: WorkerStatus::NotReady,
+            to: WorkerStatus::Ready
+        }
     );
     // A draining row stands at the signal too.
     WorkersStore::set_status(&store, id, WorkerStatus::Draining, revision()).expect("drained");
@@ -451,18 +459,21 @@ fn a_health_write_says_what_happened_and_the_status_that_stands() {
         health.connected(id, revision()),
         Stood(WorkerStatus::Draining)
     );
-    // A write for a row that is gone says so.
+    // A write for a worker whose row is gone says no row.
     let last = revision();
     store.remove(id, last).expect("removed");
-    assert_eq!(health.probe_outcome(id, true, last), Gone);
-    assert_eq!(health.connected(id, last), Gone);
+    assert_eq!(health.probe_outcome(id, true, last), NoRow);
+    assert_eq!(health.connected(id, last), NoRow);
 }
 
 #[test]
 fn a_health_writes_two_readers_say_the_transition_and_the_status_that_stands() {
-    use super::HealthWrite::{Gone, Moved, Stale, Stood};
+    use super::HealthWrite::{Moved, NoRow, Stale, Stood};
 
-    let moved = Moved(WorkerStatus::Pending, WorkerStatus::Ready);
+    let moved = Moved {
+        from: WorkerStatus::Pending,
+        to: WorkerStatus::Ready,
+    };
     assert_eq!(
         moved.moved(),
         Some((WorkerStatus::Pending, WorkerStatus::Ready))
@@ -471,7 +482,7 @@ fn a_health_writes_two_readers_say_the_transition_and_the_status_that_stands() {
     let stood = Stood(WorkerStatus::Draining);
     assert_eq!(stood.moved(), None);
     assert_eq!(stood.stands(), Some(WorkerStatus::Draining));
-    for unjudged in [Stale, Gone] {
+    for unjudged in [Stale, NoRow] {
         assert_eq!(unjudged.moved(), None);
         assert_eq!(unjudged.stands(), None);
     }
@@ -655,6 +666,72 @@ fn a_replaced_incarnation_leaves_the_old_id_without_rows_and_the_new_id_starts_e
     loads.record(new, 0, row(0), t0, LoadSource::Stream);
     assert_eq!((loads.ranks(old), loads.ranks(new)), (0, 1));
     assert_eq!(store.load_entries(), 1);
+}
+
+#[test]
+fn a_new_row_takes_its_maker_and_a_standing_row_keeps_it() {
+    use super::Maker;
+
+    let store = MemoryStore::new();
+    let found = Maker::provider("cluster", "pods/a").expect("a whole maker");
+    let id = store
+        .upsert_by(facts("http://w:8000", 1), found.clone())
+        .id();
+    assert_eq!(WorkersStore::get(&store, id).expect("the row").maker, found);
+    // A refresh and a new incarnation keep the maker, whoever calls: the
+    // store tests no caller.
+    let mut relabelled = facts("http://w:8000", 1);
+    relabelled.zone = Some("b".to_string());
+    assert_eq!(store.upsert(relabelled).id(), id);
+    assert_eq!(WorkersStore::get(&store, id).expect("the row").maker, found);
+    let next = store.upsert(facts("http://w:8000", 2)).id();
+    assert_ne!(next, id);
+    assert_eq!(
+        WorkersStore::get(&store, next).expect("the row").maker,
+        found
+    );
+    // A row the plain write makes is a control call's.
+    let by_hand = store.upsert(facts("http://x:8000", 1)).id();
+    let held = WorkersStore::get(&store, by_hand).expect("the row");
+    assert_eq!(held.maker, Maker::Control);
+}
+
+#[test]
+fn a_providers_maker_is_made_inside_the_rules_of_its_two_parts() {
+    use super::{Maker, Unmade};
+
+    let Ok(Maker::Provider(found)) = Maker::provider("cluster", "pods/a") else {
+        panic!("a maker of both parts is made");
+    };
+    assert_eq!((found.provider(), found.key()), ("cluster", "pods/a"));
+    // Each part at its bound is taken, and the key is its provider's own
+    // text, blanks and all.
+    let name = "p".repeat(Maker::NAME_BYTES);
+    let key = "k ".repeat(Maker::KEY_BYTES / 2);
+    assert!(Maker::provider(name.as_str(), key.as_str()).is_ok());
+    // The part that breaks its rule is named, the name's rules first.
+    let unmade = |provider: &str, key: &str| Maker::provider(provider, key).expect_err("no maker");
+    // An empty name is refused in its own words, ahead of the token's.
+    assert_eq!(
+        unmade("", "pods/a"),
+        Unmade::Provider("a provider's row names its provider")
+    );
+    assert!(matches!(unmade("", ""), Unmade::Provider(_)));
+    assert!(matches!(
+        unmade(&format!("{name}p"), "pods/a"),
+        Unmade::Provider(_)
+    ));
+    // A name is one token: a blank, a control character, a comma, a letter
+    // outside ASCII and a character of no width each make none.
+    for name in ["a b", "a\nb", "a\u{7}b", "a,b", "\u{e9}", "a\u{200b}b"] {
+        let refused = unmade(name, "pods/a");
+        assert!(matches!(refused, Unmade::Provider(_)), "{name:?}");
+    }
+    assert!(matches!(unmade("cluster", ""), Unmade::Key(_)));
+    assert!(matches!(
+        unmade("cluster", &format!("{key}k")),
+        Unmade::Key(_)
+    ));
 }
 
 #[test]
@@ -842,6 +919,93 @@ fn a_record_replaces_its_rank_alone_and_a_poll_fills_only_the_ranks_that_stayed_
     assert_eq!(loads.load(id, 0).expect("rank 0").row.running, 1);
     loads.evict(id);
     assert_eq!(loads.ranks(id), 0);
+}
+
+#[test]
+fn a_report_answers_the_positions_of_the_rows_it_passed_over() {
+    let store = MemoryStore::new();
+    let loads: &dyn LoadSink = &store;
+    let id = ready(&store, "http://w:8000");
+    let stranger = WorkerId(77);
+    let t0 = Instant::now();
+    loads.record(id, 0, row(0), t0, LoadSource::Stream);
+    loads.record(id, 1, row(0), t0, LoadSource::Stream);
+    let polled = LoadRow {
+        running: 2,
+        ..row(0)
+    };
+    let quiet = t0 + Duration::from_millis(50);
+    assert_eq!(
+        loads.report(
+            &[(id, 0, Some(polled)), (id, 1, Some(polled))],
+            quiet,
+            LoadSource::Poll,
+        ),
+        Vec::<usize>::new(),
+        "no rank pushed since the poll began: both rows are written"
+    );
+    // Rank 1 pushes while the next poll is out.
+    let polled_at = quiet + Duration::from_secs(1);
+    let pushed = LoadRow {
+        running: 9,
+        ..row(0)
+    };
+    loads.record(
+        id,
+        1,
+        pushed,
+        polled_at + Duration::from_millis(1),
+        LoadSource::Stream,
+    );
+    assert_eq!(
+        loads.report(
+            &[
+                (stranger, 0, Some(polled)),
+                (id, 0, Some(polled)),
+                (id, 1, Some(polled)),
+            ],
+            polled_at,
+            LoadSource::Poll,
+        ),
+        vec![2],
+        "the row of the rank that pushed, by its position: a stranger's row is dropped and rank 0's is written"
+    );
+    assert_eq!(loads.load(id, 1).expect("rank 1").row.running, 9);
+    assert_eq!(
+        loads.report(
+            &[(id, 0, Some(polled)), (id, 1, None)],
+            polled_at,
+            LoadSource::Poll,
+        ),
+        Vec::<usize>::new(),
+        "a rank that pushed and brought no row is not on the list"
+    );
+    assert_eq!(
+        loads.report(&[(id, 1, Some(polled))], polled_at, LoadSource::Poll),
+        vec![0],
+        "an answer of passed-over rows alone says them too"
+    );
+    // Both ranks push: each row passed over is said, in the answer's order.
+    loads.record(
+        id,
+        0,
+        pushed,
+        polled_at + Duration::from_millis(2),
+        LoadSource::Stream,
+    );
+    assert_eq!(
+        loads.report(
+            &[
+                (id, 1, Some(polled)),
+                (stranger, 0, Some(polled)),
+                (id, 0, Some(polled)),
+            ],
+            polled_at,
+            LoadSource::Poll,
+        ),
+        vec![0, 2]
+    );
+    assert_eq!(loads.load(id, 0).expect("rank 0").row.running, 9);
 }
 
 #[test]
@@ -1243,7 +1407,6 @@ fn two_gateways_sharing_a_lease_number_hold_separate_reservations() {
 
 /// The manual preset as `generation`, its keys pinned for `ttl_s` and swept
 /// every `sweep_s`.
-#[cfg(feature = "controller")]
 fn manual_ruled(generation: u64, ttl_s: u32, sweep_s: u32) -> crate::spec::AppliedSpec {
     use crate::spec::{AppliedSpec, PolicySpec};
 
@@ -1255,7 +1418,6 @@ fn manual_ruled(generation: u64, ttl_s: u32, sweep_s: u32) -> crate::spec::Appli
     AppliedSpec::validate(&document).expect("the document validates")
 }
 
-#[cfg(feature = "controller")]
 #[test]
 fn the_pins_sweep_drops_each_pin_past_its_own_end_once_an_interval() {
     let store = MemoryStore::new();
@@ -1299,7 +1461,6 @@ fn the_pins_sweep_drops_each_pin_past_its_own_end_once_an_interval() {
 /// The pins outlive generations, and the interval read at a tick is the
 /// standing generation's: an apply that shortens the sweep waits out no
 /// earlier interval, however long the one the last pass ran under.
-#[cfg(feature = "controller")]
 #[test]
 fn a_shorter_sweep_applied_waits_out_no_earlier_interval() {
     let store = MemoryStore::new();
@@ -1325,7 +1486,6 @@ fn a_shorter_sweep_applied_waits_out_no_earlier_interval() {
 /// A generation that sweeps, replaced before the sweep ticked once: its
 /// interval was learned at its apply, so the pins it ended still leave
 /// under a generation that sweeps nothing.
-#[cfg(feature = "controller")]
 #[test]
 fn a_generation_replaced_before_any_pass_still_leaves_its_interval() {
     let store = MemoryStore::new();
@@ -1346,7 +1506,6 @@ fn a_generation_replaced_before_any_pass_still_leaves_its_interval() {
 /// Two standing rules, one that keeps its keys for ever and one that ends
 /// them: the sweep runs at the interval of the rule that sweeps, each pin
 /// leaves at its own end, and a pin with none stays.
-#[cfg(feature = "controller")]
 #[test]
 fn a_pin_past_its_own_end_leaves_where_another_rule_keeps_its_keys_for_ever() {
     use crate::spec::{AppliedSpec, PolicySpec};
@@ -1538,9 +1697,9 @@ fn a_pairs_record_stands_until_its_decode_side_completes() {
     let leases: &dyn LeasesStore = &store;
     let now = Instant::now();
     let gateway = GatewayId(1);
-    let mut pair = lease(gateway, 5, 0, now);
-    pair.decode = Some(WorkerId(8));
-    assert_eq!(leases.issue(pair), Ok(()));
+    let pair = lease(gateway, 5, 0, now);
+    let decode = decode_side(WorkerId(8));
+    assert_eq!(leases.issue_pair(pair, decode), Ok(()));
     let mut outcome = Outcome {
         side: Side::Prefill,
         served: WorkerId(7),
@@ -1559,6 +1718,393 @@ fn a_pairs_record_stands_until_its_decode_side_completes() {
     outcome.side = Side::Decode;
     assert!(leases.completed(gateway, LeaseId(5), &outcome));
     assert!(leases.get(gateway, LeaseId(5)).is_none());
+}
+
+/// What the leases on file book on each of `workers`, in their order.
+fn booked(store: &MemoryStore, workers: &[WorkerId]) -> Vec<u32> {
+    let rows = in_flight(store);
+    let count = |id: &WorkerId| {
+        rows.iter()
+            .find(|(row, _)| row == id)
+            .map(|(_, count)| *count)
+    };
+    workers.iter().map(|id| count(id).unwrap_or(0)).collect()
+}
+
+/// A pair's record under `id`: the prefill side on `prefill`, the decode
+/// side on the first of `decodes`, the rest the pick's alternates.
+fn pair(
+    id: u64,
+    prefill: WorkerId,
+    decodes: &[WorkerId],
+    now: Instant,
+) -> (LeaseRecord, DecodeSide) {
+    let mut targets = Targets::new();
+    for &decode_id in decodes {
+        let pair = crate::decision::Pair {
+            decode_id,
+            ..Default::default()
+        };
+        targets.push(Target {
+            id: prefill,
+            pair: Some(pair),
+            ..Target::default()
+        });
+    }
+    let mut record = booking(GatewayId(1), id, prefill, now);
+    record.lease.side = Side::Prefill;
+    record.picked = Picked::of(&targets);
+    let decode = DecodeSide {
+        picked: Picked::of_decodes(&targets),
+        ..decode_side(decodes[0])
+    };
+    (record, decode)
+}
+
+/// Files a pair's two parts by the pair's door.
+fn issue_pair(
+    leases: &dyn LeasesStore,
+    (record, decode): (LeaseRecord, DecodeSide),
+) -> Result<(), LeaseRefused> {
+    leases.issue_pair(record, decode)
+}
+
+/// A dispatch of `side` on the pick's target at `index`.
+fn on(side: Side, index: u8) -> Dispatch {
+    Dispatch {
+        target_index: index,
+        side,
+        ..Dispatch::default()
+    }
+}
+
+/// A completion of `side`.
+fn done(side: Side) -> Outcome {
+    Outcome {
+        side,
+        served: WorkerId(0),
+        status: 200,
+        class: TransportClass::Ok,
+        ttft_micros: 0,
+        tokens_in: 0,
+        tokens_out: 0,
+        duration_micros: 0,
+    }
+}
+
+/// Where each side of the pair's lease under `id` stands.
+fn sides(store: &MemoryStore, id: u64) -> Option<(LeaseState, LeaseState)> {
+    let found = LeasesStore::sides(store, GatewayId(1), LeaseId(id))?;
+    Some((found.record.state, found.decode?.state))
+}
+
+/// A pair filed with a side that ended books the side that lives, and
+/// no count for the one that ended.
+#[test]
+fn a_pair_filed_with_an_ended_side_books_the_side_that_lives() {
+    let store = MemoryStore::new();
+    let (p, d) = (ready(&store, "http://p:1"), ready(&store, "http://d:1"));
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    leases.set_term(1);
+    let ended = LeaseState::Completed;
+    let (record, side) = pair(1, p, &[d], now);
+    let half = DecodeSide {
+        state: ended,
+        ..side
+    };
+    leases.issue_pair(record, half).expect("the key is free");
+    assert_eq!(booked(&store, &[p, d]), [1, 0]);
+    let (mut half, side) = pair(2, p, &[d], now);
+    half.state = ended;
+    leases.issue_pair(half, side).expect("the key is free");
+    assert_eq!(booked(&store, &[p, d]), [1, 1]);
+    assert_eq!(leases.live(gateway), 2);
+}
+
+/// The store tells of a lease with the worker its record books. A single's
+/// lease and a pair's prefill side name the record's target, a decode side
+/// its own, and the lease on file names none.
+#[test]
+fn a_side_s_lease_names_the_worker_its_record_books() {
+    let now = Instant::now();
+    let (p, d) = (WorkerId(3), WorkerId(5));
+    let booked = |lease: Option<Lease>| lease.map(|lease| lease.booked);
+    let told = |sides: &Sides, side| booked(sides.side(side).map(|(lease, _)| lease));
+    let record = lease(GatewayId(1), 1, 1, now);
+    let single = Sides {
+        record,
+        decode: None,
+    };
+    assert_eq!(record.lease.booked, WorkerId(0), "filed with no word");
+    assert_eq!(told(&single, Side::Single), Some(record.target));
+    assert_eq!(single.ending(None).map(booked), [Some(record.target), None]);
+    // A single's end is told off its record, with no list built.
+    let mut ended = Vec::new();
+    single.each_ending(None, |lease| ended.push(lease.booked));
+    assert_eq!(ended, [record.target]);
+    let (record, decode) = pair(2, p, &[d], now);
+    let both = Sides {
+        record,
+        decode: Some(decode),
+    };
+    assert_eq!(told(&both, Side::Prefill), Some(p));
+    assert_eq!(told(&both, Side::Decode), Some(d));
+    assert_eq!(both.ending(None).map(booked), [Some(p), Some(d)]);
+}
+
+#[test]
+fn a_pairs_sides_are_dispatched_and_ended_each_by_its_own_frame() {
+    let store = MemoryStore::new();
+    let (p, d) = (ready(&store, "http://p:1"), ready(&store, "http://d:1"));
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, key, now) = (GatewayId(1), LeaseId(1), Instant::now());
+    leases.set_term(1);
+    issue_pair(leases, pair(1, p, &[d], now)).expect("the key is free");
+    // One record, and each side books its own worker.
+    assert_eq!(booked(&store, &[p, d]), [1, 1]);
+    assert_eq!(leases.live(gateway), 1);
+    // A side is dispatched by the frame that names it, and no other is.
+    let at = now + Duration::from_millis(3);
+    let dispatched = LeaseState::Dispatched { at };
+    assert!(leases.dispatched(gateway, key, on(Side::Decode, 0), at));
+    assert_eq!(sides(&store, 1), Some((LeaseState::ISSUED, dispatched)));
+    assert!(leases.dispatched(gateway, key, on(Side::Prefill, 0), at));
+    assert_eq!(sides(&store, 1), Some((dispatched, dispatched)));
+    // A frame on a side the pair does not hold changes nothing.
+    assert!(leases.dispatched(gateway, key, on(Side::Single, 0), now));
+    assert!(leases.completed(gateway, key, &done(Side::Encode)));
+    let gone = ReleaseReason::ClientGone;
+    assert!(leases.released(gateway, key, Some(Side::Single), gone));
+    assert_eq!(sides(&store, 1), Some((dispatched, dispatched)));
+    assert_eq!(booked(&store, &[p, d]), [1, 1]);
+    // The prefill's completion frees its worker's count, and the decode's
+    // stands; a second completion of that side changes nothing.
+    for _ in 0..2 {
+        assert!(leases.completed(gateway, key, &done(Side::Prefill)));
+        assert_eq!(booked(&store, &[p, d]), [0, 1]);
+        assert_eq!(sides(&store, 1), Some((LeaseState::Completed, dispatched)));
+        assert_eq!(leases.live(gateway), 1);
+    }
+    // The record leaves the file at its last side's end.
+    assert!(leases.completed(gateway, key, &done(Side::Decode)));
+    assert_eq!(booked(&store, &[p, d]), [0, 0]);
+    assert_eq!(leases.get(gateway, key), None);
+    assert!(!leases.completed(gateway, key, &done(Side::Decode)));
+}
+
+#[test]
+fn a_decodes_dispatch_on_an_alternate_moves_the_decodes_booking_alone() {
+    let store = MemoryStore::new();
+    let [p, d0, d1] = ["http://p:1", "http://d0:1", "http://d1:1"].map(|key| ready(&store, key));
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, key, now) = (GatewayId(1), LeaseId(1), Instant::now());
+    leases.set_term(1);
+    issue_pair(leases, pair(1, p, &[d0, d1], now)).expect("the key is free");
+    assert_eq!(booked(&store, &[p, d0, d1]), [1, 1, 0]);
+    // Every target of a pair's pick names the one prefill: its dispatch on
+    // the alternate's index moves no booking.
+    assert!(leases.dispatched(gateway, key, on(Side::Prefill, 1), now));
+    assert_eq!(booked(&store, &[p, d0, d1]), [1, 1, 0]);
+    assert!(leases.dispatched(gateway, key, on(Side::Decode, 1), now));
+    assert_eq!(booked(&store, &[p, d0, d1]), [1, 0, 1]);
+    let filed = leases.sides(gateway, key).expect("on file");
+    let record = filed.record;
+    assert_eq!((record.target, record.lease.target_index), (p, 0));
+    let decode = filed.decode.expect("a pair's lease");
+    assert_eq!((decode.target, decode.target_index), (d1, 1));
+    assert_eq!(filed.target_of(Side::Decode, 1), Some((d1, 0)));
+    // The decode's end frees the count of the worker it moved to.
+    assert!(leases.completed(gateway, key, &done(Side::Decode)));
+    assert_eq!(booked(&store, &[p, d0, d1]), [1, 0, 0]);
+}
+
+#[test]
+fn a_release_ends_the_side_it_names_and_with_no_side_every_side() {
+    let store = MemoryStore::new();
+    let (p, d) = (ready(&store, "http://p:1"), ready(&store, "http://d:1"));
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, now, gone) = (GatewayId(1), Instant::now(), ReleaseReason::ClientGone);
+    leases.set_term(1);
+    issue_pair(leases, pair(1, p, &[d], now)).expect("the key is free");
+    // One side given up: its count is free and the other side stands.
+    assert!(leases.released(gateway, LeaseId(1), Some(Side::Decode), gone));
+    assert_eq!(booked(&store, &[p, d]), [1, 0]);
+    let released = LeaseState::Released(gone);
+    assert_eq!(sides(&store, 1), Some((LeaseState::ISSUED, released)));
+    // The last side's release takes the record off the file.
+    assert!(leases.released(gateway, LeaseId(1), Some(Side::Prefill), gone));
+    assert_eq!(leases.get(gateway, LeaseId(1)), None);
+    assert_eq!(booked(&store, &[p, d]), [0, 0]);
+    // A release that names no side ends every side at once.
+    issue_pair(leases, pair(2, p, &[d], now)).expect("the key is free");
+    assert_eq!(booked(&store, &[p, d]), [1, 1]);
+    assert!(leases.released(gateway, LeaseId(2), None, gone));
+    assert_eq!(leases.get(gateway, LeaseId(2)), None);
+    assert_eq!(booked(&store, &[p, d]), [0, 0]);
+    assert_eq!(leases.live(gateway), 0);
+}
+
+/// A pair filed with its prefill part dispatched and its decode side
+/// waiting is due at its deadline all the same: the side that waits ends.
+#[test]
+fn a_pair_filed_with_its_decode_side_alone_waiting_is_due_at_its_deadline() {
+    let store = MemoryStore::new();
+    let (p, d) = (ready(&store, "http://p:1"), ready(&store, "http://d:1"));
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    leases.set_term(1);
+    let dispatched = LeaseState::Dispatched { at: now };
+    let (mut record, decode) = pair(1, p, &[d], now);
+    record.state = dispatched;
+    issue_pair(leases, (record, decode)).expect("the key is free");
+    assert_eq!(booked(&store, &[p, d]), [1, 1]);
+    // An issue past the deadline ends the side that waits.
+    let later = now + Duration::from_secs(2);
+    let world = store.world();
+    store
+        .issue_decided(booking(gateway, 0, p, later), world.booked_of(p), |_| ())
+        .expect("minted under the store's term");
+    let abandoned = LeaseState::Released(ReleaseReason::Abandoned);
+    assert_eq!(sides(&store, 1), Some((dispatched, abandoned)));
+    assert_eq!(booked(&store, &[p, d]), [2, 0]);
+}
+
+/// A place let go is the next one laid: a file's list of places is as
+/// long as the most pairs that stood at once.
+#[test]
+fn the_list_of_places_is_as_long_as_the_most_pairs_that_stood_at_once() {
+    let store = MemoryStore::new();
+    let (p, d) = (ready(&store, "http://p:1"), ready(&store, "http://d:1"));
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    leases.set_term(1);
+    for id in 1..=3 {
+        issue_pair(leases, pair(id, p, &[d], now)).expect("the key is free");
+    }
+    assert_eq!(store.places(), 3);
+    // Each pair that ends leaves its place to the next one filed.
+    for id in 4..=9 {
+        assert!(leases.released(gateway, LeaseId(id - 3), None, ReleaseReason::ClientGone));
+        issue_pair(leases, pair(id, p, &[d], now)).expect("the key is free");
+        assert_eq!(store.places(), 3, "pair {id}");
+    }
+}
+
+#[test]
+fn the_dispatch_deadline_ends_each_side_that_waits_and_a_dispatched_side_stands() {
+    let store = MemoryStore::new();
+    let (p, d) = (ready(&store, "http://p:1"), ready(&store, "http://d:1"));
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    leases.set_term(1);
+    // Two pairs: the first's prefill is dispatched, the second waits whole.
+    for id in [1, 2] {
+        issue_pair(leases, pair(id, p, &[d], now)).expect("the key is free");
+    }
+    assert!(leases.dispatched(gateway, LeaseId(1), on(Side::Prefill, 0), now));
+    assert_eq!(booked(&store, &[p, d]), [2, 2]);
+    // An issue past the deadline ends what waits and tells of each side
+    // it ended, the prefill's first.
+    let later = now + Duration::from_secs(2);
+    let world = store.world();
+    store.tell_through(heard);
+    drop(told_sides());
+    store
+        .issue_decided(booking(gateway, 0, p, later), world.booked_of(p), |_| ())
+        .expect("minted under the store's term");
+    let ended = told_sides().into_iter().map(|(found, said)| {
+        let Said::Released(side, ReleaseReason::Abandoned) = said else {
+            panic!("this issue tells the deadline's ends alone: {said:?}");
+        };
+        // The word reads the side's lease off the lease as the end found
+        // it.
+        let lease = found.ending(side)[0];
+        (found.record.lease.id.0, lease.map(|lease| lease.side))
+    });
+    assert_eq!(
+        ended.collect::<Vec<_>>(),
+        [
+            (1, Some(Side::Decode)),
+            (2, Some(Side::Prefill)),
+            (2, Some(Side::Decode)),
+        ]
+    );
+    let abandoned = LeaseState::Released(ReleaseReason::Abandoned);
+    let dispatched = LeaseState::Dispatched { at: now };
+    // The dispatched side stands with its count; the pair that waited
+    // whole left the file.
+    assert_eq!(sides(&store, 1), Some((dispatched, abandoned)));
+    assert_eq!(leases.get(gateway, LeaseId(2)), None);
+    assert_eq!(booked(&store, &[p, d]), [2, 0]);
+    // The side that stands ends by its own frame.
+    assert!(leases.completed(gateway, LeaseId(1), &done(Side::Prefill)));
+    assert_eq!(leases.get(gateway, LeaseId(1)), None);
+    assert_eq!(booked(&store, &[p, d]), [1, 0]);
+    // The store's own sweep hands a pair's record back as it left its
+    // prefill part.
+    issue_pair(leases, pair(3, p, &[d], later)).expect("the key is free");
+    assert!(leases.dispatched(gateway, LeaseId(3), on(Side::Decode, 0), later));
+    let swept = leases.expire(later + Duration::from_secs(9));
+    let third = |record: &LeaseRecord| (record.lease.id, record.state) == (LeaseId(3), abandoned);
+    assert!(swept.iter().any(third));
+    let at = LeaseState::Dispatched { at: later };
+    assert_eq!(sides(&store, 3), Some((abandoned, at)));
+}
+
+/// A pair under a sessions rule with a TTL stands and ends as any pair:
+/// each side's issued state carries the TTL, and what tests a side that
+/// waits asks the state, not an equality with the bare one. No plan
+/// files such a pair today, as a sessions rule runs under the single
+/// plan alone: the records are filed by hand.
+#[test]
+fn a_pair_issued_under_a_rule_with_a_ttl_stands_and_ends_as_any_pair() {
+    let store = MemoryStore::new();
+    let (p, d) = (ready(&store, "http://p:1"), ready(&store, "http://d:1"));
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    leases.set_term(1);
+    let under = LeaseState::issued(Some(60_000_000));
+    let keyed = |id: u64, at: Instant| {
+        let (mut record, side) = pair(id, p, &[d], at);
+        record.state = under;
+        let side = DecodeSide {
+            state: under,
+            ..side
+        };
+        (record, side)
+    };
+    // The first pair's sides are dispatched one by one, the second's
+    // prefill alone.
+    for id in [1, 2] {
+        issue_pair(leases, keyed(id, now)).expect("the key is free");
+    }
+    let dispatched = LeaseState::Dispatched { at: now };
+    assert!(leases.dispatched(gateway, LeaseId(1), on(Side::Prefill, 0), now));
+    assert_eq!(sides(&store, 1), Some((dispatched, under)));
+    assert!(leases.dispatched(gateway, LeaseId(1), on(Side::Decode, 0), now));
+    assert_eq!(sides(&store, 1), Some((dispatched, dispatched)));
+    assert!(leases.dispatched(gateway, LeaseId(2), on(Side::Prefill, 0), now));
+    // An issue past the deadline ends the decode side that waits, and
+    // the dispatched sides stand.
+    let later = now + Duration::from_secs(2);
+    let world = store.world();
+    store
+        .issue_decided(booking(gateway, 0, p, later), world.booked_of(p), |_| ())
+        .expect("minted under the store's term");
+    let abandoned = LeaseState::Released(ReleaseReason::Abandoned);
+    assert_eq!(sides(&store, 1), Some((dispatched, dispatched)));
+    assert_eq!(sides(&store, 2), Some((dispatched, abandoned)));
+    // The store's own sweep hands such a pair's record back as its
+    // prefill part stood, and the decode side's end is read from the
+    // store.
+    issue_pair(leases, keyed(3, later)).expect("the key is free");
+    assert!(leases.dispatched(gateway, LeaseId(3), on(Side::Prefill, 0), later));
+    let swept = leases.expire(later + Duration::from_secs(9));
+    let at = LeaseState::Dispatched { at: later };
+    let third = |record: &LeaseRecord| (record.lease.id, record.state) == (LeaseId(3), at);
+    assert!(swept.iter().any(third));
+    assert_eq!(sides(&store, 3), Some((at, abandoned)));
 }
 
 #[test]
@@ -1773,12 +2319,24 @@ fn in_flight_for(store: &MemoryStore, gateway: GatewayId) -> Vec<(WorkerId, u32)
 }
 
 /// [`in_flight_for`] the gateway the cases issue their leases to.
-fn in_flight(store: &MemoryStore) -> Vec<(WorkerId, u32)> {
+pub(super) fn in_flight(store: &MemoryStore) -> Vec<(WorkerId, u32)> {
     in_flight_for(store, GatewayId(1))
 }
 
+/// A pair's decode side on `target`: issued, with no alternate behind it.
+fn decode_side(target: WorkerId) -> DecodeSide {
+    DecodeSide {
+        target,
+        picked: Picked::default(),
+        session: Session::NONE,
+        state: LeaseState::ISSUED,
+        tokens: 0,
+        target_index: 0,
+    }
+}
+
 /// A lease of `gateway` on `target`, issued at `now` under term 1.
-fn booking(gateway: GatewayId, id: u64, target: WorkerId, now: Instant) -> LeaseRecord {
+pub(super) fn booking(gateway: GatewayId, id: u64, target: WorkerId, now: Instant) -> LeaseRecord {
     LeaseRecord {
         target,
         ..lease(gateway, id, 1, now)
@@ -1869,7 +2427,7 @@ fn a_restore_empties_the_lease_file_and_a_hello_books_what_it_lists_once() {
         .into_iter()
         .map(|(record, said)| {
             assert_eq!(said, removed);
-            assert_eq!(record.state, LeaseState::Issued);
+            assert_eq!(record.state, LeaseState::ISSUED);
             record.lease.id.0
         })
         .collect();
@@ -1950,6 +2508,8 @@ impl Journal for WaitsAtRestart {
 
     fn term_rose(&self, _: u64) {}
 
+    fn generation(&self, _: Option<Position>, _: u64) {}
+
     fn term_followed(&self, _: Position) {}
 
     fn carries_loads(&self) -> bool {
@@ -1975,10 +2535,10 @@ impl Journal for WaitsAtRestart {
 }
 
 /// A take beside a restore stands whole behind it. The take's write waits
-/// for the file's turn, which the restore holds from its start until the
-/// file is emptied: the first lease of the term taken is filed in the
-/// emptied file, on the restored row's count, and the restore ends no
-/// lease of that term.
+/// for its file's turn, and the restore holds every file's turn from its
+/// start until it has read the ids on file: the first lease of the term
+/// taken is filed behind that read, on the restored row's count, and the
+/// restore ends no lease of that term.
 #[test]
 fn a_take_beside_a_restore_files_its_first_lease_behind_it() {
     let (reached, stands) = mpsc::channel();
@@ -2173,8 +2733,8 @@ fn a_member_keeps_its_slot_and_a_leavers_slot_is_given_to_no_one() {
 
 /// Two leases filed through `file`, one on a member that is built and one
 /// on a member whose first build is owed to the window. Each books its
-/// worker's count: the row the build lists reads its lease, and each lease
-/// ends on the count it booked.
+/// worker's count and asks for no build: the row the window's build lists
+/// reads its lease, and each lease ends on the count it booked.
 fn filed_ahead_of_a_first_build(file: fn(&dyn LeasesStore, GatewayId, &[LeaseRecord; 2])) {
     let store = MemoryStore::new();
     let built = ready(&store, "http://a:1");
@@ -2193,7 +2753,13 @@ fn filed_ahead_of_a_first_build(file: fn(&dyn LeasesStore, GatewayId, &[LeaseRec
         booking(gateway, 1, built, now),
         booking(gateway, 2, owed, now),
     ];
+    let builds = store.membership_builds();
     file(leases, gateway, &records);
+    assert_eq!(
+        (store.membership_builds(), store.publish_due().is_some()),
+        (builds, true),
+        "a lease asked for the build"
+    );
     store.publish_now();
     let of = |count| {
         let mut rows = [(built, count), (owed, count)];
@@ -2207,8 +2773,8 @@ fn filed_ahead_of_a_first_build(file: fn(&dyn LeasesStore, GatewayId, &[LeaseRec
     assert_eq!(in_flight(&store), of(0));
 }
 
-/// The issue door asks for the build a lease's worker is owed before it
-/// reads the standing world.
+/// The issue door books the slot a member's write gave it, inside the
+/// member's registration window too.
 #[test]
 fn a_lease_issued_ahead_of_its_workers_first_build_books_its_count() {
     filed_ahead_of_a_first_build(|leases, _, records| {
@@ -2218,8 +2784,8 @@ fn a_lease_issued_ahead_of_its_workers_first_build_books_its_count() {
     });
 }
 
-/// The restore door asks for it too: a gateway's pages may list a lease on
-/// a member inside its registration window.
+/// The restore door reads the same slot: a gateway's pages may list a
+/// lease on a member inside its registration window.
 #[test]
 fn a_lease_restored_ahead_of_its_workers_first_build_books_its_count() {
     filed_ahead_of_a_first_build(|leases, gateway, records| {
@@ -2227,11 +2793,11 @@ fn a_lease_restored_ahead_of_its_workers_first_build_books_its_count() {
     });
 }
 
-/// The issue door asks for no build where the standing world lists the
-/// lease's worker: a build owed to a registration beside it stays with its
-/// window. A lease on the worker inside that window asks for it, once.
+/// No lease asks for a build: one on a worker the standing world lists
+/// and one on a worker inside its registration window both leave the owed
+/// build to its window.
 #[test]
-fn a_lease_issued_on_a_listed_worker_leaves_an_owed_build_to_its_window() {
+fn a_lease_issued_leaves_an_owed_build_to_its_window() {
     let store = MemoryStore::new();
     let built = ready(&store, "http://a:1");
     let owed = store.upsert(facts("http://b:1", 1)).id();
@@ -2249,12 +2815,285 @@ fn a_lease_issued_on_a_listed_worker_leaves_an_owed_build_to_its_window() {
     assert_eq!(leases.issue(booking(gateway, 2, owed, now)), Ok(()));
     assert_eq!(
         (store.membership_builds(), store.publish_due().is_some()),
-        (builds + 1, false),
-        "a lease on a worker inside its window asks once"
+        (builds, true),
+        "a lease on a worker inside its window asked for the build"
     );
     for id in [1, 2] {
         assert!(leases.released(gateway, LeaseId(id), None, ReleaseReason::ClientGone));
     }
+}
+
+/// A first dispatch that moves a lease onto a worker inside its
+/// registration window books that worker's count and asks for no build:
+/// the row the window's build lists reads the lease, and the lease ends on
+/// the count it booked.
+#[test]
+fn a_lease_dispatched_onto_a_worker_inside_its_window_books_its_count() {
+    let store = MemoryStore::new();
+    let built = ready(&store, "http://a:1");
+    let owed = store.upsert(facts("http://b:1", 1)).id();
+    let revision = WorkersStore::get(&store, owed).expect("the row").revision;
+    store
+        .set_status(owed, WorkerStatus::Ready, revision)
+        .expect("ready");
+    let builds = store.membership_builds();
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    leases.set_term(1);
+    let mut targets = Targets::new();
+    for id in [built, owed] {
+        targets.push(Target {
+            id,
+            ..Target::default()
+        });
+    }
+    let record = LeaseRecord {
+        picked: Picked::of(&targets),
+        ..booking(gateway, 1, built, now)
+    };
+    assert_eq!(leases.issue(record), Ok(()));
+    let on = Dispatch {
+        target_index: 1,
+        ..Dispatch::default()
+    };
+    assert!(leases.dispatched(gateway, LeaseId(1), on, now));
+    assert_eq!(
+        (store.membership_builds(), store.publish_due().is_some()),
+        (builds, true),
+        "the dispatch asked for the build"
+    );
+    store.publish_now();
+    let of = |count| {
+        let mut rows = [(built, 0), (owed, count)];
+        rows.sort_unstable();
+        rows
+    };
+    assert_eq!(in_flight(&store), of(1));
+    assert!(leases.released(gateway, LeaseId(1), None, ReleaseReason::ClientGone));
+    assert_eq!(in_flight(&store), of(0));
+}
+
+/// A member that leaves inside its registration window takes its slot
+/// with it: the lease filed on it ends on the count it booked, and the
+/// member that joins next is given another.
+#[test]
+fn a_member_that_leaves_inside_its_window_takes_its_slot_with_it() {
+    let store = MemoryStore::new();
+    let built = ready(&store, "http://a:1");
+    let left = store.upsert(facts("http://b:1", 1)).id();
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    leases.set_term(1);
+    assert_eq!(leases.issue(booking(gateway, 1, left, now)), Ok(()));
+    let revision = WorkersStore::get(&store, left).expect("the row").revision;
+    assert!(store.remove(left, revision).is_some());
+    let joined = ready(&store, "http://c:1");
+    let mut rows = [(built, 0), (joined, 0)];
+    rows.sort_unstable();
+    assert_eq!(in_flight(&store), rows, "the lease of the one that left");
+    assert!(leases.released(gateway, LeaseId(1), None, ReleaseReason::WorkerRemoved));
+    assert_eq!(in_flight(&store), rows);
+}
+
+/// The table holds a member from the write that files it to the build
+/// that lists it: behind a membership build it holds none, however many
+/// joined inside the window.
+#[test]
+fn a_membership_build_leaves_no_member_in_the_table() {
+    let store = MemoryStore::new();
+    let first = ready(&store, "http://a:1");
+    assert_eq!(store.filed_members(), 0, "the first build listed it");
+    let second = store.upsert(facts("http://b:1", 1)).id();
+    let third = store.upsert(facts("http://c:1", 1)).id();
+    assert!(first != second && second != third);
+    assert_eq!(store.filed_members(), 2, "two joined inside the window");
+    store.publish_now();
+    assert_eq!(store.filed_members(), 0, "the build listed both");
+}
+
+/// A generation of the standing pairing mode builds no membership: the
+/// table stands behind its publication, and a lease on a member inside
+/// its window books its count.
+#[cfg(feature = "controller")]
+#[test]
+fn a_generation_that_builds_no_membership_leaves_a_joiners_slot_on_file() {
+    let store = MemoryStore::new();
+    store.apply(manual_ruled(1, 60, 30)).expect("generation 1");
+    let built = ready(&store, "http://a:1");
+    let owed = store.upsert(facts("http://b:1", 1)).id();
+    let revision = WorkersStore::get(&store, owed).expect("the row").revision;
+    store
+        .set_status(owed, WorkerStatus::Ready, revision)
+        .expect("ready");
+    store.apply(manual_ruled(2, 60, 30)).expect("generation 2");
+    assert_eq!(
+        (store.publish_due().is_some(), store.filed_members()),
+        (true, 1),
+        "the generation built no membership"
+    );
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    leases.set_term(1);
+    assert_eq!(leases.issue(booking(gateway, 1, owed, now)), Ok(()));
+    store.publish_now();
+    let mut rows = [(built, 0), (owed, 1)];
+    rows.sort_unstable();
+    assert_eq!(in_flight(&store), rows);
+}
+
+/// A member filed with no model stands in no pool, and the world of the
+/// build behind its write names its slot all the same: a lease on it
+/// inside the window of the refresh that gives it a model books its
+/// count.
+#[test]
+fn a_member_given_its_first_model_books_a_lease_inside_that_window() {
+    let store = MemoryStore::new();
+    let built = ready(&store, "http://a:1");
+    let bare = WorkerFacts {
+        models: Vec::new(),
+        ..facts("http://b:1", 1)
+    };
+    let owed = store.upsert(bare).id();
+    store.publish_now();
+    assert_eq!(store.filed_members(), 0, "the build named it, in no pool");
+    // The same incarnation with a model: the row and its slot stay.
+    assert_eq!(store.upsert(facts("http://b:1", 1)).id(), owed);
+    let revision = WorkersStore::get(&store, owed).expect("the row").revision;
+    store
+        .set_status(owed, WorkerStatus::Ready, revision)
+        .expect("ready");
+    assert!(store.publish_due().is_some(), "the refresh owes its build");
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    leases.set_term(1);
+    assert_eq!(leases.issue(booking(gateway, 1, owed, now)), Ok(()));
+    store.publish_now();
+    let mut rows = [(built, 0), (owed, 1)];
+    rows.sort_unstable();
+    assert_eq!(in_flight(&store), rows);
+}
+
+/// A lease on a member that offers no model books its count all the same:
+/// the world behind the member's first build names its slot, and the row
+/// reads the count at the build that first lists the member in a pool.
+#[test]
+fn a_lease_on_a_member_in_no_pool_is_counted_once_a_build_lists_it() {
+    let store = MemoryStore::new();
+    let built = ready(&store, "http://a:1");
+    let bare = WorkerFacts {
+        models: Vec::new(),
+        ..facts("http://b:1", 1)
+    };
+    let owed = store.upsert(bare).id();
+    store.publish_now();
+    assert_eq!(store.filed_members(), 0, "the build named it, in no pool");
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    leases.set_term(1);
+    assert_eq!(leases.issue(booking(gateway, 1, owed, now)), Ok(()));
+    assert_eq!(in_flight(&store), [(built, 0)], "it stands in no pool");
+    assert_eq!(store.upsert(facts("http://b:1", 1)).id(), owed);
+    let revision = WorkersStore::get(&store, owed).expect("the row").revision;
+    store
+        .set_status(owed, WorkerStatus::Ready, revision)
+        .expect("ready");
+    store.publish_now();
+    let mut rows = [(built, 0), (owed, 1)];
+    rows.sort_unstable();
+    assert_eq!(in_flight(&store), rows);
+}
+
+/// A world names the slot of a member in no pool from the build behind
+/// its write to the build behind its leave, and of no worker beside the
+/// members its build read.
+#[test]
+fn a_world_names_a_member_in_no_pool_until_it_leaves() {
+    let store = MemoryStore::new();
+    let pooled = ready(&store, "http://a:1");
+    let bare = WorkerFacts {
+        models: Vec::new(),
+        ..facts("http://b:1", 1)
+    };
+    let owed = store.upsert(bare).id();
+    assert!(store.world().booked_of(pooled).is_some());
+    assert!(
+        store.world().unpooled_of(owed).is_none(),
+        "inside its window"
+    );
+    store.publish_now();
+    assert!(
+        store.world().unpooled_of(owed).is_some(),
+        "named, in no pool"
+    );
+    assert!(store.world().booked_of(owed).is_none(), "no pool lists it");
+    assert!(
+        store.world().unpooled_of(pooled).is_none(),
+        "a pool lists it"
+    );
+    let revision = WorkersStore::get(&store, owed).expect("the row").revision;
+    assert!(store.remove(owed, revision).is_some());
+    assert!(store.world().unpooled_of(owed).is_none(), "it left");
+    assert!(store.world().booked_of(pooled).is_some());
+}
+
+/// A generation of the standing pairing mode builds no membership: the
+/// world it publishes still names the slot of a member in no pool.
+#[cfg(feature = "controller")]
+#[test]
+fn a_generation_that_builds_no_membership_still_names_a_member_in_no_pool() {
+    let store = MemoryStore::new();
+    store.apply(manual_ruled(1, 60, 30)).expect("generation 1");
+    ready(&store, "http://a:1");
+    let bare = WorkerFacts {
+        models: Vec::new(),
+        ..facts("http://b:1", 1)
+    };
+    let owed = store.upsert(bare).id();
+    store.publish_now();
+    assert!(store.world().unpooled_of(owed).is_some());
+    store.apply(manual_ruled(2, 60, 30)).expect("generation 2");
+    assert!(
+        store.world().unpooled_of(owed).is_some(),
+        "the generation built no membership"
+    );
+}
+
+/// A standby follows the refresh as its leader wrote it: its restored
+/// world names the slot of the member given its first model, the
+/// followed refresh files nothing, and a lease on the member before the
+/// standby's build books its count.
+#[test]
+fn a_lease_books_on_a_standby_behind_a_followed_refresh() {
+    let leader = MemoryStore::new();
+    let bare = WorkerFacts {
+        models: Vec::new(),
+        ..facts("http://b:1", 1)
+    };
+    let owed = leader.upsert(bare).id();
+    let revision = WorkersStore::get(&leader, owed).expect("the row").revision;
+    leader
+        .set_status(owed, WorkerStatus::Ready, revision)
+        .expect("ready");
+    leader.publish_now();
+    let standby = MemoryStore::new();
+    assert!(standby.restore_from(leader.cut(Kinds::All)));
+    assert_eq!(standby.filed_members(), 0, "the restore built its world");
+    // The leader gives the member its first model and the standby follows.
+    let unjournaled = Position::default();
+    let refresh = leader.upsert(facts("http://b:1", 1));
+    let row = WorkersStore::get(&leader, owed);
+    standby.follow(unjournaled, WorkersStore::epoch(&leader), refresh, row);
+    assert_eq!(
+        (standby.publish_due().is_some(), standby.filed_members()),
+        (true, 0),
+        "the followed refresh owes its build and files nothing"
+    );
+    let leases: &dyn LeasesStore = &standby;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    leases.set_term(1);
+    assert_eq!(leases.issue(booking(gateway, 1, owed, now)), Ok(()));
+    standby.publish_now();
+    assert_eq!(in_flight(&standby), [(owed, 1)]);
 }
 
 /// A member back under its key and incarnation is one that joined: it is
@@ -2461,6 +3300,119 @@ fn a_dispatch_on_another_rank_of_the_leases_worker_moves_the_index_alone() {
     assert_eq!(filed.target_at(1), Some((a, 3)), "the rank dispatched to");
 }
 
+/// The file's records and its places of decode sides stand and fall
+/// together: after every door of the leases a decode side is on file for
+/// each record that carries the mark of a pair's lease and for no other,
+/// and both agree with the walk's own plain map of what it filed.
+#[test]
+fn a_decode_side_is_on_file_for_each_record_that_carries_the_mark_and_for_no_other() {
+    let store = MemoryStore::new();
+    let [p, d0, d1] = ["p", "d0", "d1"].map(|name| ready(&store, &format!("http://{name}:1")));
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    let gone = ReleaseReason::ClientGone;
+    leases.set_term(1);
+    // The walk's own word: each id it filed, and whether a pair's lease
+    // stands under it; an id that left the file is not a key.
+    let mut filed = std::collections::BTreeMap::<u64, bool>::new();
+    let mut seen = Vec::new();
+    let mut read = |door: &str, filed: &std::collections::BTreeMap<u64, bool>| {
+        let [sides, marks] = store.paired();
+        assert_eq!(sides, marks, "{door}: a decode side for each mark");
+        let pairs = filed.iter().filter(|(_, pair)| **pair);
+        let pairs: Vec<_> = pairs.map(|(id, _)| (gateway, *id)).collect();
+        assert_eq!(sides, pairs, "{door}: the pairs on file");
+        seen.extend(filed.keys().copied());
+        for id in &seen {
+            let found = leases.sides(gateway, LeaseId(*id));
+            let pair = found.map(|found| found.decode.is_some());
+            assert_eq!(pair, filed.get(id).copied(), "{door}: lease {id}");
+        }
+    };
+    // Filed by each door that files: a single's, a pair's, and a record
+    // alone that carries a mark, which is a single's.
+    leases.issue(booking(gateway, 1, p, now)).expect("free");
+    issue_pair(leases, pair(2, p, &[d0], now)).expect("free");
+    issue_pair(leases, pair(3, p, &[d0, d1], now)).expect("free");
+    let alone = LeaseRecord {
+        decode: Some(d0),
+        ..booking(gateway, 4, p, now)
+    };
+    leases.issue(alone).expect("free");
+    filed.extend([(1, false), (2, true), (3, true), (4, false)]);
+    read("an issue", &filed);
+    assert_eq!(
+        leases.get(gateway, LeaseId(4)).expect("on file").decode,
+        None
+    );
+    assert_eq!(
+        leases.get(gateway, LeaseId(2)).expect("on file").decode,
+        Some(d0)
+    );
+    // A side's dispatch and a side's end leave both tables as they stand;
+    // the last side's end takes both.
+    assert!(leases.dispatched(gateway, LeaseId(2), on(Side::Prefill, 0), now));
+    assert!(leases.dispatched(gateway, LeaseId(3), on(Side::Decode, 1), now));
+    read("a side's dispatch", &filed);
+    assert!(leases.completed(gateway, LeaseId(2), &done(Side::Prefill)));
+    read("a side's completion", &filed);
+    assert!(leases.completed(gateway, LeaseId(2), &done(Side::Decode)));
+    filed.remove(&2);
+    read("the last side's completion", &filed);
+    assert!(leases.released(gateway, LeaseId(3), Some(Side::Decode), gone));
+    read("a side's release", &filed);
+    assert!(leases.released(gateway, LeaseId(3), Some(Side::Prefill), gone));
+    filed.remove(&3);
+    read("the last side's release", &filed);
+    // A decision's issue, a pair's and a single's, under ids the store
+    // mints; a release of the pair whole.
+    let world = store.world();
+    let slots = [world.booked_of(p), world.booked_of(d0)];
+    let (record, side) = pair(0, p, &[d0], now);
+    let decided = store.issue_decided_pair(record, side, slots, |_| ());
+    let decided = decided.expect("minted under the store's term").id;
+    let single = store.issue_decided(booking(gateway, 0, p, now), slots[0], |_| ());
+    let single = single.expect("minted under the store's term").id;
+    filed.extend([(decided.0, true), (single.0, false)]);
+    read("a decision's issue", &filed);
+    assert!(leases.released(gateway, decided, None, gone));
+    filed.remove(&decided.0);
+    read("a pair's release whole", &filed);
+    // The dispatch deadline: a pair that waits whole leaves, and one with
+    // a dispatched side stands with its decode side ended.
+    issue_pair(leases, pair(5, p, &[d0], now)).expect("free");
+    issue_pair(leases, pair(6, p, &[d0], now)).expect("free");
+    assert!(leases.dispatched(gateway, LeaseId(6), on(Side::Prefill, 0), now));
+    filed.extend([(5, true), (6, true)]);
+    read("two pairs more", &filed);
+    leases.expire(now + Duration::from_secs(2));
+    filed.retain(|id, _| *id == 6);
+    read("the dispatch deadline", &filed);
+    // A frame applied through a hand, by whoever holds the turn next.
+    let hand = Hand::new(gateway);
+    store.hand(&hand, LeaseId(6), Said::Completed(done(Side::Prefill)));
+    store.hand_back(hand);
+    filed.remove(&6);
+    read("a handed frame", &filed);
+    // A restore over a key on file: its pages list records alone, so the
+    // pair under that key leaves whole and a single's lease stands there.
+    issue_pair(leases, pair(7, p, &[d0], now)).expect("free");
+    issue_pair(leases, pair(8, p, &[d0], now)).expect("free");
+    filed.extend([(7, true), (8, true)]);
+    read("two pairs for a restore", &filed);
+    assert_eq!(leases.restore(gateway, &[pair(7, p, &[d0], now).0]), 1);
+    filed = [(7, false)].into();
+    read("a restore", &filed);
+    // The gateway's end takes every lease, a pair's two parts together.
+    issue_pair(leases, pair(9, p, &[d1], now)).expect("free");
+    filed.insert(9, true);
+    read("a pair beside a restored lease", &filed);
+    assert_eq!(leases.drop_gateways(&[gateway]), [2]);
+    filed.clear();
+    read("the gateway's end", &filed);
+    assert_eq!(booked(&store, &[p, d0, d1]), [0, 0, 0]);
+}
+
 #[test]
 fn every_door_that_takes_a_lease_off_the_file_gives_its_count_back() {
     let store = MemoryStore::new();
@@ -2541,7 +3493,7 @@ fn the_store_mints_a_decisions_lease_under_its_own_term_alone() {
     let filed = leases.get(gateway, second).expect("under its minted id");
     assert_eq!(
         (filed.lease.id, filed.term, filed.target, filed.state),
-        (second, 3, a, LeaseState::Issued)
+        (second, 3, a, LeaseState::ISSUED)
     );
     // A term's counter starts at 1, and an id a restored lease holds is
     // passed over: the store's `Duplicate` is no decision's answer.
@@ -2624,16 +3576,17 @@ fn a_restore_that_raises_the_term_starts_the_blocks_under_it() {
 }
 
 thread_local! {
-    /// What the store told of leases on this thread, in the order told.
-    static TOLD: RefCell<Vec<(LeaseRecord, Said)>> = const { RefCell::new(Vec::new()) };
+    /// What the store told of leases on this thread, in the order told:
+    /// both parts of each lease.
+    static TOLD: RefCell<Vec<(Sides, Said)>> = const { RefCell::new(Vec::new()) };
     /// The decider each of those tells named, in the same order.
     static TOLD_BY: RefCell<Vec<Option<Decider>>> = const { RefCell::new(Vec::new()) };
 }
 
 /// A teller that keeps its word for [`told`]: the record a frame found on
 /// file and what the frame said, and for [`told_by`] the decider named.
-fn heard(_: &MemoryStore, _: &World, record: &LeaseRecord, said: Said, by: Option<Decider>) {
-    TOLD.with(|told| told.borrow_mut().push((*record, said)));
+fn heard(_: &MemoryStore, _: &World, found: &Sides, said: Said, by: Option<Decider>) {
+    TOLD.with(|told| told.borrow_mut().push((*found, said)));
     TOLD_BY.with(|told| told.borrow_mut().push(by));
 }
 
@@ -2642,8 +3595,16 @@ fn told_by() -> Vec<Option<Decider>> {
     TOLD_BY.with(|told| std::mem::take(&mut *told.borrow_mut()))
 }
 
-/// What [`heard`] kept on this thread since the last call, taken.
+/// What [`heard`] kept on this thread since the last call, taken: each
+/// lease's record.
 fn told() -> Vec<(LeaseRecord, Said)> {
+    let record = |(found, said): (Sides, Said)| (found.record, said);
+    told_sides().into_iter().map(record).collect()
+}
+
+/// What [`heard`] was told since the last call, both parts of each lease,
+/// taken.
+fn told_sides() -> Vec<(Sides, Said)> {
     TOLD.with(|told| std::mem::take(&mut *told.borrow_mut()))
 }
 
@@ -2651,24 +3612,37 @@ fn told() -> Vec<(LeaseRecord, Said)> {
 /// counter of its id, and the counters of the leases it ended, as the
 /// store told their end.
 fn issued_at(store: &MemoryStore, target: WorkerId, at: Instant) -> (u64, Vec<u64>) {
+    issued_in(store, target, at, LeaseState::ISSUED)
+}
+
+/// [`issued_at`] for a lease in `state`.
+fn issued_in(
+    store: &MemoryStore,
+    target: WorkerId,
+    at: Instant,
+    state: LeaseState,
+) -> (u64, Vec<u64>) {
     let counter = |id: LeaseId| id.0 & 0xffff_ffff;
     let record = LeaseRecord {
         dispatch_deadline: at + Duration::from_secs(5),
+        state,
         ..booking(GatewayId(1), 0, target, at)
     };
     let world = store.world();
     store.tell_through(heard);
-    let before = told();
+    let before = told_sides();
     let lease = store
         .issue_decided(record, world.booked_of(target), |_| ())
         .expect("minted under the store's term");
     // What the issue told: the ends of the leases it found past their
     // deadline, taken here, and the frames it applied, kept for the case.
     let abandoned = Said::Released(None, ReleaseReason::Abandoned);
-    let (ended, applied): (Vec<_>, Vec<_>) =
-        told().into_iter().partition(|(_, said)| *said == abandoned);
+    let (ended, applied): (Vec<_>, Vec<_>) = told_sides()
+        .into_iter()
+        .partition(|(_, said)| *said == abandoned);
     TOLD.with(|told| told.borrow_mut().extend(before.into_iter().chain(applied)));
-    let ended = ended.iter().map(|(record, _)| {
+    let ended = ended.iter().map(|(found, _)| {
+        let record = found.record;
         assert_eq!(record.state, LeaseState::Released(ReleaseReason::Abandoned));
         counter(record.lease.id)
     });
@@ -2707,6 +3681,34 @@ fn an_issue_ends_two_leases_past_their_dispatch_deadline_at_most() {
     // the three late ones, each on its worker's count.
     assert_eq!(leases.live(gateway), 5);
     assert_eq!(in_flight(&store), [(a, 5)]);
+}
+
+#[test]
+fn a_lease_issued_under_a_rule_with_a_ttl_stands_and_ends_as_any_issued_lease() {
+    let store = MemoryStore::new();
+    let a = ready(&store, "http://a:1");
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, t0) = (GatewayId(1), Instant::now());
+    leases.set_term(1);
+    let id = |counter: u64| LeaseId(1 << 32 | counter);
+    let state = |id| leases.get(gateway, id).map(|record| record.state);
+    // Two leases under a sessions rule with a TTL: each is live and on
+    // its worker's count, as a lease under no rule is.
+    let under = LeaseState::issued(Some(60_000_000));
+    assert_eq!(issued_in(&store, a, t0, under), (1, vec![]));
+    assert_eq!(issued_in(&store, a, t0, under), (2, vec![]));
+    assert_eq!(state(id(2)), Some(under));
+    assert_eq!(leases.live(gateway), 2);
+    assert_eq!(in_flight(&store), [(a, 2)]);
+    // A dispatch moves the first.
+    assert!(leases.dispatched(gateway, id(1), Dispatch::default(), t0));
+    assert_eq!(state(id(1)), Some(LeaseState::Dispatched { at: t0 }));
+    // An issue past the deadline ends the second as abandoned, and the
+    // dispatched one stands.
+    let late = t0 + Duration::from_secs(6);
+    assert_eq!(issued_at(&store, a, late).1, [2]);
+    assert_eq!(state(id(2)), None);
+    assert_eq!(leases.live(gateway), 2);
 }
 
 #[test]
@@ -2875,7 +3877,7 @@ fn a_frame_handed_where_nobody_is_at_work_is_applied_by_its_hand() {
     assert_eq!(kept.len(), 1);
     assert_eq!(
         (kept[0].0.lease.id, kept[0].0.state, kept[0].1),
-        (ids[0], LeaseState::Issued, dispatch)
+        (ids[0], LeaseState::ISSUED, dispatch)
     );
     // A second dispatch, a second release and a lease not on file tell
     // nothing.
@@ -2915,30 +3917,565 @@ fn a_frame_handed_while_a_thread_is_at_work_is_left_to_that_thread() {
     );
 }
 
+thread_local! {
+    /// The epoch of the world each tell of [`under`] was handed.
+    static UNDER: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+    /// Whether the next tell of [`under`] publishes a later world.
+    static LATER: Cell<bool> = const { Cell::new(true) };
+}
+
+/// A teller that keeps the epoch of the world each tell is handed. Its
+/// first tell publishes a later world before it returns, so a word told
+/// behind it under the same load reads the earlier epoch.
+fn under(store: &MemoryStore, world: &World, _: &Sides, _: Said, _: Option<Decider>) {
+    UNDER.with_borrow_mut(|under| under.push(world.epoch()));
+    if LATER.replace(false) {
+        ready(store, "http://b:1");
+    }
+}
+
+/// A store under term 1 that tells through [`under`], with one ready
+/// worker and `leases` leases issued on it at `now`, five seconds to their
+/// dispatch: the store, the worker, the leases' ids and the epoch of the
+/// world that stands.
+fn under_bed(leases: u64, now: Instant) -> (Arc<MemoryStore>, WorkerId, Vec<LeaseId>, u64) {
+    let store = Arc::new(MemoryStore::new());
+    store.tell_through(under);
+    let a = ready(&store, "http://a:1");
+    LeasesStore::set_term(&*store, 1);
+    let ids = (0..leases).map(|_| LeaseId(1 << 32 | issued_at(&store, a, now).0));
+    let ids = ids.collect();
+    let first = store.world().epoch();
+    (store, a, ids, first)
+}
+
+/// A thread with no job at hand keeps its watch while a lease stands on
+/// its file: a hand leaves its frame in the ring, and the thread's next
+/// look applies it, or the first step of its next job.
+#[test]
+fn a_frame_handed_under_a_watch_is_left_to_the_watching_thread() {
+    let now = Instant::now();
+    let (store, a, ids) = handed_bed(3, now);
+    let hand = Hand::new(GatewayId(1));
+    let mut place = store.at_work();
+    assert_eq!(place.look(), Watch::Quiet, "three leases stand on the file");
+    assert_eq!(store.watches(), 1);
+    store.hand(&hand, ids[0], GONE);
+    assert_eq!((told_ids(), in_flight(&store)), (vec![], vec![(a, 3)]));
+    // The thread's next look applies the frame,
+    assert_eq!(place.look(), Watch::Fed);
+    assert_eq!(
+        (told_ids(), in_flight(&store)),
+        (vec![(1, GONE)], vec![(a, 2)])
+    );
+    // and so does the first step of its next job.
+    store.hand(&hand, ids[1], GONE);
+    assert_eq!(told_ids(), []);
+    place.work();
+    assert_eq!(
+        (told_ids(), in_flight(&store)),
+        (vec![(2, GONE)], vec![(a, 1)])
+    );
+}
+
+/// A watch starts at a look that finds a lease on file, never at a job.
+/// A thread that rests behind each job shows none, as a caller of a door
+/// in process: its hands read who is at work, and its rest applies what
+/// they left. A thread that looked keeps its watch through the jobs
+/// behind the look.
+#[test]
+fn a_watch_starts_at_a_look_and_stands_through_a_job() {
+    let now = Instant::now();
+    let (store, a, ids) = handed_bed(3, now);
+    let hand = Hand::new(GatewayId(1));
+    let mut place = store.at_work();
+    assert_eq!(store.watches(), 0, "at work, and no look yet");
+    store.hand(&hand, ids[0], GONE);
+    assert_eq!(told_ids(), [], "left to the thread at work");
+    place.rest();
+    assert_eq!((told_ids(), store.watches()), (vec![(1, GONE)], 0));
+    place.work();
+    assert_eq!(store.watches(), 0, "a job starts no watch");
+    assert_eq!(place.look(), Watch::Quiet, "two leases stand on the file");
+    assert_eq!(store.watches(), 1);
+    place.work();
+    assert_eq!(store.watches(), 1, "the watch stands through the job");
+    store.hand(&hand, ids[1], GONE);
+    assert_eq!(told_ids(), []);
+    place.apply();
+    assert_eq!(
+        (told_ids(), in_flight(&store)),
+        (vec![(2, GONE)], vec![(a, 1)])
+    );
+}
+
+/// A look says whether it applied a frame, for its host to set the time
+/// to its next look by: a frame of a lease on file, and one that names no
+/// lease on file, since its gateway spoke all the same. A frame the
+/// thread applied as it took up a job is behind it at its next look.
+#[test]
+fn a_look_says_whether_it_applied_a_frame() {
+    let now = Instant::now();
+    let (store, a, ids) = handed_bed(3, now);
+    let hand = Hand::new(GatewayId(1));
+    let mut place = store.at_work();
+    assert_eq!(place.look(), Watch::Quiet, "nothing was handed");
+    store.hand(&hand, ids[0], GONE);
+    assert_eq!(place.look(), Watch::Fed);
+    assert_eq!(place.look(), Watch::Quiet, "the ring is empty again");
+    // A second release of the lease that left: a frame all the same.
+    store.hand(&hand, ids[0], GONE);
+    assert_eq!(place.look(), Watch::Fed);
+    // What the thread applies at a job's first step is not its look's.
+    store.hand(&hand, ids[1], GONE);
+    place.work();
+    assert_eq!(place.look(), Watch::Quiet);
+    assert_eq!(in_flight(&store), [(a, 1)]);
+}
+
+/// A look that finds no lease on file ends the watch: the thread owes the
+/// file no further look, and a hand applies in place again.
+#[test]
+fn a_look_that_finds_no_lease_on_file_ends_the_watch() {
+    let now = Instant::now();
+    let (store, a, ids) = handed_bed(1, now);
+    let hand = Hand::new(GatewayId(1));
+    let mut place = store.at_work();
+    assert_eq!(place.look(), Watch::Quiet);
+    store.hand(&hand, ids[0], GONE);
+    // The look applies the release of the file's last lease.
+    assert_eq!(place.look(), Watch::Ended);
+    assert_eq!(store.watches(), 0);
+    assert_eq!(
+        (told_ids(), in_flight(&store)),
+        (vec![(1, GONE)], vec![(a, 0)])
+    );
+    // A lease laid on a file nobody watches: its frame is applied by its
+    // hand.
+    let (second, _) = issued_at(&store, a, now);
+    store.hand(&hand, LeaseId(1 << 32 | second), GONE);
+    assert_eq!(
+        (told_ids(), in_flight(&store)),
+        (vec![(second, GONE)], vec![(a, 0)])
+    );
+    assert_eq!(place.look(), Watch::Ended, "no lease stands, and no watch");
+}
+
+/// A watch ends by its word first and one more look behind it. A frame a
+/// hand left under the old word is applied by that look, and a lease it
+/// finds on file keeps the watch: the cases lay the lease and the frame
+/// that reach a file between a look that found none and the word's end.
+#[test]
+fn a_watch_ends_behind_one_more_look() {
+    let now = Instant::now();
+    let (store, a, ids) = handed_bed(2, now);
+    let hand = Hand::new(GatewayId(1));
+    let mut place = store.at_work();
+    assert_eq!(place.look(), Watch::Quiet);
+    store.hand(&hand, ids[0], GONE);
+    assert_eq!(told_ids(), []);
+    // The end's own look applies the frame and finds the second lease:
+    // the watch stands, and the next frame is left to it.
+    assert_eq!(place.end_watch(), Watch::Fed);
+    assert_eq!(
+        (told_ids(), in_flight(&store), store.watches()),
+        (vec![(1, GONE)], vec![(a, 1)], 1)
+    );
+    store.hand(&hand, ids[1], GONE);
+    assert_eq!(told_ids(), [], "left to the watch that stands");
+    // With the last lease's release in the ring the end applies it, and
+    // the watch ends: the next frame is applied by its hand.
+    assert_eq!(place.end_watch(), Watch::Ended);
+    assert_eq!(
+        (told_ids(), in_flight(&store), store.watches()),
+        (vec![(2, GONE)], vec![(a, 0)], 0)
+    );
+    let (third, _) = issued_at(&store, a, now);
+    store.hand(&hand, LeaseId(1 << 32 | third), GONE);
+    assert_eq!(told_ids(), [(third, GONE)]);
+}
+
+/// A thread that rests, or drops its place, ends its watch whatever
+/// stands on its file: the hands apply in place from there.
+#[test]
+fn a_place_that_rests_or_drops_ends_its_watch() {
+    let now = Instant::now();
+    let (store, a, ids) = handed_bed(4, now);
+    let hand = Hand::new(GatewayId(1));
+    let mut place = store.at_work();
+    assert_eq!(place.look(), Watch::Quiet);
+    store.hand(&hand, ids[0], GONE);
+    assert_eq!(told_ids(), []);
+    // Its rest applies what was handed, and ends the watch over the three
+    // leases that stand.
+    place.rest();
+    assert_eq!((told_ids(), store.watches()), (vec![(1, GONE)], 0));
+    store.hand(&hand, ids[1], GONE);
+    assert_eq!(told_ids(), [(2, GONE)]);
+    // A place dropped on its watch does the same.
+    place.work();
+    assert_eq!(place.look(), Watch::Quiet);
+    store.hand(&hand, ids[2], GONE);
+    assert_eq!(told_ids(), []);
+    drop(place);
+    assert_eq!((told_ids(), store.watches()), (vec![(3, GONE)], 0));
+    store.hand(&hand, ids[3], GONE);
+    assert_eq!(
+        (told_ids(), in_flight(&store)),
+        (vec![(4, GONE)], vec![(a, 0)])
+    );
+}
+
+/// The sweep applies at a watched file while the file's thread waits: a
+/// dispatch left in the ring is applied before the sweep reads a
+/// deadline, so its lease is not ended as one no gateway dispatched.
+#[test]
+fn the_sweep_applies_at_a_watched_file_whose_thread_waits() {
+    let now = Instant::now();
+    let (store, a, ids) = handed_bed(2, now);
+    let hand = Hand::new(GatewayId(1));
+    let mut place = store.at_work();
+    assert_eq!(place.look(), Watch::Quiet);
+    let dispatch = Said::Dispatched(Dispatch::default(), now);
+    store.hand(&hand, ids[0], dispatch);
+    assert_eq!(told_ids(), []);
+    // Past both leases' dispatch deadline.
+    let ended = LeasesStore::expire(&*store, now + Duration::from_secs(6));
+    let ended: Vec<_> = ended.iter().map(|record| record.lease.id).collect();
+    assert_eq!(ended, [ids[1]]);
+    let abandoned = Said::Released(None, ReleaseReason::Abandoned);
+    assert_eq!(told_ids(), [(1, dispatch), (2, abandoned)]);
+    assert_eq!(in_flight(&store), [(a, 1)]);
+    assert_eq!(place.look(), Watch::Quiet, "the dispatched lease stands");
+}
+
+/// A full ring under a watch: the hand that finds it applies where the
+/// watching thread waits, in the order the frames were handed, and no
+/// frame is dropped.
+#[test]
+fn a_full_ring_under_a_watch_is_applied_by_its_hand() {
+    let now = Instant::now();
+    let room = u64::try_from(MemoryStore::HANDOVER).expect("the ring's room is a count");
+    let (store, a, ids) = handed_bed(room + 2, now);
+    let hand = Hand::new(GatewayId(1));
+    let mut place = store.at_work();
+    assert_eq!(place.look(), Watch::Quiet);
+    for id in &ids[..MemoryStore::HANDOVER] {
+        store.hand(&hand, *id, GONE);
+    }
+    assert_eq!(told_ids(), [], "the ring holds its room");
+    // The next hand finds the ring full and applies it; its own frame
+    // waits for the watch.
+    store.hand(&hand, ids[MemoryStore::HANDOVER], GONE);
+    let applied = told_ids();
+    assert_eq!(applied.len(), MemoryStore::HANDOVER);
+    assert!(applied.iter().map(|(lease, _)| *lease).eq(1..=room));
+    assert_eq!(place.look(), Watch::Fed, "one lease stands behind the look");
+    assert_eq!(
+        (told_ids(), in_flight(&store)),
+        (vec![(room + 1, GONE)], vec![(a, 1)])
+    );
+}
+
+/// A place applies what waits at each other file whose thread waits, for a
+/// decision under a stage that may refuse by a report of leases. A file
+/// whose thread is at work is left to that thread, as a hand leaves it.
+/// The second file's thread is the case's own, on its watch and then at
+/// work.
+#[test]
+fn a_place_applies_what_waits_at_the_other_files_whose_threads_wait() {
+    let now = Instant::now();
+    let store = Arc::new(MemoryStore::new().with_deciders(2));
+    let a = ready(&store, "http://a:1");
+    LeasesStore::set_term(&*store, 1);
+    let (said, heard_of) = mpsc::sync_channel(1);
+    let (go, word) = mpsc::sync_channel::<()>(1);
+    std::thread::scope(|scope| {
+        // The case's own ends go with it where it fails: the other
+        // thread's waits end, and the case with it.
+        let (heard_of, go) = (heard_of, go);
+        let store = &store;
+        scope.spawn(move || {
+            let _acting = Decider::new(1).enter();
+            let ids: Vec<_> = (0..2).map(|_| issued_at(store, a, now).0).collect();
+            let mut place = store.at_work();
+            assert_eq!(place.look(), Watch::Quiet, "two leases stand on its file");
+            let second = ids[1];
+            said.send(ids).expect("the case hears the ids");
+            word.recv_timeout(PATIENCE).expect("the case's word");
+            place.work();
+            said.send(Vec::new()).expect("the case hears the work");
+            word.recv_timeout(PATIENCE).expect("the case's word");
+            drop(place);
+            assert_eq!(
+                told_ids(),
+                [(second, GONE)],
+                "what waited is its own as it leaves"
+            );
+        });
+        let _acting = Decider::new(0).enter();
+        let place = store.at_work();
+        let ids = heard_of.recv_timeout(PATIENCE).expect("the watch stands");
+        let hand = Hand::new(GatewayId(1));
+        drop(told());
+        // The other file's thread waits on its watch: the frame a hand
+        // left there is applied by this place.
+        store.hand(&hand, LeaseId(1 << 32 | ids[0]), GONE);
+        assert_eq!(told_ids(), [], "left to the watch");
+        place.apply_waiting();
+        assert_eq!(told_ids(), [(ids[0], GONE)]);
+        // That thread is at work: what waits is its own.
+        go.send(()).expect("the other thread waits");
+        heard_of.recv_timeout(PATIENCE).expect("the work began");
+        store.hand(&hand, LeaseId(1 << 32 | ids[1]), GONE);
+        place.apply_waiting();
+        assert_eq!(told_ids(), [], "left to the thread at work");
+        go.send(()).expect("the other thread waits");
+    });
+    assert_eq!(in_flight(&store), [(a, 0)]);
+}
+
+/// A file that shows no watch holds nothing for a look, so a place's apply
+/// passes it by its word and takes no turn there. The case's tell runs
+/// under the second file's turn, where a hand applies in place, and
+/// applies through the place at the first file: a take of the held turn
+/// would be refused.
+#[test]
+fn a_places_apply_takes_no_turn_at_a_file_that_shows_no_watch() {
+    thread_local! {
+        static PLACE: RefCell<Option<AtWork>> = const { RefCell::new(None) };
+        static TOLD: Cell<u32> = const { Cell::new(0) };
+    }
+    fn under(_: &MemoryStore, _: &World, _: &Sides, _: Said, _: Option<Decider>) {
+        PLACE.with_borrow(|place| place.as_ref().expect("the case's place").apply_waiting());
+        TOLD.set(TOLD.get() + 1);
+    }
+    let now = Instant::now();
+    let store = Arc::new(MemoryStore::new().with_deciders(2));
+    store.tell_through(under);
+    let a = ready(&store, "http://a:1");
+    LeasesStore::set_term(&*store, 1);
+    // A lease on the second file, issued as its decider.
+    let lease = {
+        let _acting = Decider::new(1).enter();
+        issued_at(&store, a, now).0
+    };
+    let _acting = Decider::new(0).enter();
+    PLACE.set(Some(store.at_work()));
+    // The second file shows no watch and no thread works there: the hand
+    // applies in place, and the tell runs under that file's turn.
+    store.hand(&Hand::new(GatewayId(1)), LeaseId(1 << 32 | lease), GONE);
+    assert_eq!(TOLD.get(), 1, "the release was told under its file's turn");
+    PLACE.set(None);
+    assert_eq!(in_flight(&store), [(a, 0)]);
+}
+
+/// A place's apply takes its own file's turn by a wait and applies what
+/// was handed while its thread worked. The thread's look at a request is
+/// one try of that turn, which another file's decision may hold for a
+/// read: a decision under a stage that may refuse by a report of leases
+/// does not read by that try alone.
+#[test]
+fn a_places_apply_applies_what_was_handed_at_its_own_file() {
+    let (store, a, ids) = handed_bed(1, Instant::now());
+    let place = store.at_work();
+    // Handed while the thread works: left to it.
+    store.hand(&Hand::new(GatewayId(1)), ids[0], GONE);
+    assert_eq!(told_ids(), [], "left to the thread at work");
+    place.apply_waiting();
+    assert_eq!(told_ids(), [(ids[0].0 & 0xffff_ffff, GONE)]);
+    assert_eq!(in_flight(&store), [(a, 0)]);
+}
+
+/// The rows' counts read once, as a decision reads them.
+fn in_flight_once(store: &MemoryStore, out: &mut ViewBuffers) -> u32 {
+    let ask = Ask {
+        gateway: GatewayId(1),
+        now: Instant::now(),
+        pinned: None,
+        affinity: false,
+    };
+    store.deciding(|world| {
+        if let Some(built) = world.build("m", Role::Single, &ask, &mut *out) {
+            world.count_in_flight(&built, &ask, &mut out.candidates);
+        }
+    });
+    out.candidates.iter().map(|row| row.in_flight).sum()
+}
+
+/// A place's apply reads behind what a watch kept, whatever the watching
+/// thread does meanwhile. A hand leaves a release under the second
+/// file's watch and returns; this place then applies what waits at the
+/// other files and reads the rows' count once, as a decision does. In
+/// every other round the second file's thread takes up a job as that
+/// read is made: it says it works under its turn, with its apply behind
+/// the mark, so the read finds the release applied, by this place or by
+/// the job's first step. A hand at a file with no watch would have
+/// applied it before it returned.
+#[test]
+fn a_places_apply_reads_behind_a_watchs_frames_beside_a_job_that_begins() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
+
+    const ROUNDS: u64 = 20_000;
+    // The widest pause, in spins, between the word that lets the other
+    // thread take up its job and this place's apply: the rounds sweep it.
+    const SPINS: u64 = 64;
+    // The words of a round, said by each side in turn: the other thread's
+    // watch stands over the round's lease, it may take up its job, it is
+    // at work, the round is over.
+    const WATCHES: u64 = 1;
+    const TAKE_UP: u64 = 2;
+    const WORKS: u64 = 3;
+    const OVER: u64 = 4;
+
+    // Says the case left, by its end or by an unwind: the other thread
+    // waits for no word behind it.
+    struct Leaves<'a>(&'a AtomicBool);
+    impl Drop for Leaves<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, SeqCst);
+        }
+    }
+
+    let now = Instant::now();
+    let store = Arc::new(MemoryStore::new().with_deciders(2));
+    let a = ready(&store, "http://a:1");
+    LeasesStore::set_term(&*store, 1);
+    let (word, lease, left) = (AtomicU64::new(0), AtomicU64::new(0), AtomicBool::new(false));
+    std::thread::scope(|scope| {
+        let (store, word, lease, left) = (&store, &word, &lease, &left);
+        scope.spawn(move || {
+            let _acting = Decider::new(1).enter();
+            let mut place = store.at_work();
+            // Waits for the case's word, with `pause` between its reads;
+            // `false` where the case left. The wait for its job is one
+            // side of the race and spins. The wait for the round's end
+            // is outside it and yields, as the case's own waits do: on a
+            // host with no core to spare a spin can cost a time slice.
+            let heard = |wanted: u64, pause: fn()| {
+                while word.load(SeqCst) != wanted {
+                    if left.load(SeqCst) {
+                        return false;
+                    }
+                    pause();
+                }
+                true
+            };
+            loop {
+                // At work: the round's lease, then the watch over it.
+                let id = issued_at(store, a, now).0;
+                assert_ne!(place.look(), Watch::Ended, "a lease stands on the file");
+                lease.store(id, SeqCst);
+                word.store(WATCHES, SeqCst);
+                if !heard(TAKE_UP, std::hint::spin_loop) {
+                    return;
+                }
+                // A job: the first step of its work applies what waits.
+                place.work();
+                drop(told());
+                word.store(WORKS, SeqCst);
+                if !heard(OVER, std::thread::yield_now) {
+                    return;
+                }
+            }
+        });
+        let _leaves = Leaves(left);
+        let _acting = Decider::new(0).enter();
+        let place = store.at_work();
+        let hand = Hand::new(GatewayId(1));
+        let wait_for = |wanted: u64| {
+            let since = Instant::now();
+            while word.load(SeqCst) != wanted {
+                assert!(
+                    since.elapsed() < PATIENCE,
+                    "the other thread's word {wanted}"
+                );
+                std::thread::yield_now();
+            }
+        };
+        let mut rows = ViewBuffers::default();
+        for round in 1..=ROUNDS {
+            wait_for(WATCHES);
+            drop(told());
+            store.hand(&hand, LeaseId(1 << 32 | lease.load(SeqCst)), GONE);
+            // Every other round the other thread takes up its job as this
+            // place applies and reads, a swept pause apart.
+            let begins = round % 2 == 0;
+            if begins {
+                word.store(TAKE_UP, SeqCst);
+                for _ in 0..round / 2 % SPINS {
+                    std::hint::spin_loop();
+                }
+            }
+            place.apply_waiting();
+            let counted = in_flight_once(store, &mut rows);
+            assert_eq!(
+                counted, 0,
+                "round {round}: the read is behind the release's apply"
+            );
+            if !begins {
+                assert!(!told().is_empty(), "round {round}: this place applied it");
+                word.store(TAKE_UP, SeqCst);
+            }
+            wait_for(WORKS);
+            word.store(OVER, SeqCst);
+        }
+    });
+}
+
+/// The floor of the price of a place's apply at the other files, measured:
+/// a million calls with nothing waiting and no other thread, at one, two
+/// and eight files that show no watch, then at two and eight where each
+/// other file shows one. Its own file's turn is in each call.
+#[test]
+#[ignore = "a measurement for the Numbers table, run by name"]
+fn a_places_apply_at_the_other_files_measured() {
+    use std::io::Write as _;
+
+    const CALLS: u32 = 1_000_000;
+    let mut out = std::io::stdout();
+    let now = Instant::now();
+    for (files, watched) in [(1_u8, false), (2, false), (8, false), (2, true), (8, true)] {
+        let store = Arc::new(MemoryStore::new().with_deciders(usize::from(files)));
+        let a = ready(&store, "http://a:1");
+        LeasesStore::set_term(&*store, 1);
+        // A watch at each other file: a lease on it and its place's look.
+        let others = if watched { 1..files } else { 0..0 };
+        let _watches: Vec<AtWork> = others
+            .map(|other| {
+                let _acting = Decider::new(other).enter();
+                let mut place = store.at_work();
+                issued_at(&store, a, now);
+                assert_ne!(place.look(), Watch::Ended, "a lease stands on the file");
+                place
+            })
+            .collect();
+        let _acting = Decider::new(0).enter();
+        let place = store.at_work();
+        let since = Instant::now();
+        for _ in 0..CALLS {
+            place.apply_waiting();
+        }
+        let nanos = since.elapsed().as_nanos() / u128::from(CALLS);
+        let shown = if watched {
+            "a watch at each other"
+        } else {
+            "no watch"
+        };
+        writeln!(
+            out,
+            "a place's apply, {files} files, {shown}, nothing waiting: {nanos} ns a call"
+        )
+        .expect("stdout");
+    }
+}
+
 /// The frames of one take are told under one world, the store's as it
 /// stood at the take's first tell: a take loads it once, however many
 /// frames it tells.
 #[test]
 fn the_frames_of_a_take_are_told_under_one_world() {
-    thread_local! {
-        static UNDER: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
-        static LATER: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
-    }
-    // Keeps the epoch of the world each tell is handed; the first tell
-    // publishes a later world before it returns.
-    fn under(store: &MemoryStore, world: &World, _: &LeaseRecord, _: Said, _: Option<Decider>) {
-        UNDER.with_borrow_mut(|under| under.push(world.epoch()));
-        if LATER.replace(false) {
-            ready(store, "http://b:1");
-        }
-    }
-    let now = Instant::now();
-    let store = Arc::new(MemoryStore::new());
-    store.tell_through(under);
-    let a = ready(&store, "http://a:1");
-    LeasesStore::set_term(&*store, 1);
-    let ids = [0, 1, 2].map(|_| LeaseId(1 << 32 | issued_at(&store, a, now).0));
-    let first = store.world().epoch();
+    let (store, _, ids, first) = under_bed(3, Instant::now());
     let hand = Hand::new(GatewayId(1));
     let at_work = store.at_work();
     store.hand(&hand, ids[0], GONE);
@@ -2950,6 +4487,65 @@ fn the_frames_of_a_take_are_told_under_one_world() {
     store.hand(&hand, ids[2], GONE);
     at_work.apply();
     assert_eq!(UNDER.take(), [later], "the next take's own");
+}
+
+/// The leases one issue ends are told under one world, the store's as it
+/// stood at the first end's tell: an issue loads it once for its ends.
+/// The next issue's ends are told under its own.
+#[test]
+fn the_leases_an_issue_ends_are_told_under_one_world() {
+    let now = Instant::now();
+    let (store, a, _, first) = under_bed(3, now);
+    // Six seconds on, all three are past their dispatch deadline: this
+    // issue ends two, and the one behind it the third.
+    let late = now + Duration::from_secs(6);
+    issued_at(&store, a, late);
+    let later = store.world().epoch();
+    assert!(later > first);
+    assert_eq!(
+        UNDER.take(),
+        [first, first],
+        "one load for the issue's ends"
+    );
+    issued_at(&store, a, late);
+    assert_eq!(UNDER.take(), [later], "the next issue's own");
+}
+
+/// The leases a sweep ends in a file are told under one world, the
+/// store's as it stood at the first end's tell.
+#[test]
+fn the_leases_a_sweep_ends_in_a_file_are_told_under_one_world() {
+    let now = Instant::now();
+    let (store, _, ids, first) = under_bed(3, now);
+    let ended = LeasesStore::expire(&*store, now + Duration::from_secs(6));
+    assert_eq!(ended.len(), ids.len());
+    assert!(store.world().epoch() > first);
+    assert_eq!(
+        UNDER.take(),
+        [first, first, first],
+        "one load for the sweep"
+    );
+}
+
+/// An issue's frames and its ends are two runs, told under a load each:
+/// the frames under the world that stood at the apply's first tell, the
+/// ends under the one that stands at the first end's. This holds the
+/// split as a known limit, not as an aim: where one load serves both
+/// runs, the ends read the first world and this case turns with it.
+#[test]
+fn an_issues_frames_and_its_ends_are_told_under_a_load_each() {
+    let now = Instant::now();
+    let (store, a, ids, first) = under_bed(2, now);
+    let hand = Hand::new(GatewayId(1));
+    let at_work = store.at_work();
+    store.hand(&hand, ids[0], GONE);
+    // Six seconds on the other lease is past its dispatch deadline: this
+    // issue applies the handed frame, then ends that lease.
+    issued_at(&store, a, now + Duration::from_secs(6));
+    drop(at_work);
+    let later = store.world().epoch();
+    assert!(later > first);
+    assert_eq!(UNDER.take(), [first, later], "a load for each run");
 }
 
 /// A decider looks at what is handed before a decision reads its rows'
@@ -3068,7 +4664,7 @@ fn a_streams_end_applies_what_it_handed() {
 #[test]
 #[should_panic(expected = "taken first or not at all")]
 fn a_tell_that_takes_a_door_of_the_leases_is_refused_in_a_debug_build() {
-    fn takes_a_door(store: &MemoryStore, _: &World, _: &LeaseRecord, _: Said, _: Option<Decider>) {
+    fn takes_a_door(store: &MemoryStore, _: &World, _: &Sides, _: Said, _: Option<Decider>) {
         let _live = LeasesStore::live(store, GatewayId(1));
     }
     let store = MemoryStore::new();
@@ -3090,10 +4686,12 @@ fn a_tell_that_takes_a_door_of_the_leases_is_refused_in_a_debug_build() {
 fn a_frame_handed_as_a_thread_leaves_its_work_is_applied_by_one_of_the_two() {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::SeqCst};
     static HEARD: AtomicUsize = AtomicUsize::new(0);
-    fn counted(_: &MemoryStore, _: &World, _: &LeaseRecord, _: Said, _: Option<Decider>) {
+    fn counted(_: &MemoryStore, _: &World, _: &Sides, _: Said, _: Option<Decider>) {
         HEARD.fetch_add(1, SeqCst);
     }
     const ROUNDS: usize = 100_000;
+    /// How long the rounds run at most: past it the case asks no more.
+    const RUN: Duration = Duration::from_secs(20);
     const BOUND: Duration = Duration::from_secs(60);
     /// Tells the case's two threads to end, where the case unwinds too.
     struct Ends<'a>(&'a AtomicUsize);
@@ -3160,7 +4758,7 @@ fn a_frame_handed_as_a_thread_leaves_its_work_is_applied_by_one_of_the_two() {
             }
         };
         for asked in 1..=ROUNDS {
-            if now.elapsed() > PATIENCE {
+            if now.elapsed() > RUN {
                 break;
             }
             let record = booking(gateway, 0, a, now);
@@ -3187,7 +4785,7 @@ fn a_frame_handed_as_a_thread_leaves_its_work_is_applied_by_one_of_the_two() {
 fn a_thread_that_leaves_its_work_waits_for_a_held_turn() {
     use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
     static HEARD: AtomicUsize = AtomicUsize::new(0);
-    fn counted(_: &MemoryStore, _: &World, _: &LeaseRecord, _: Said, _: Option<Decider>) {
+    fn counted(_: &MemoryStore, _: &World, _: &Sides, _: Said, _: Option<Decider>) {
         HEARD.fetch_add(1, SeqCst);
     }
     let store = Arc::new(MemoryStore::new());
@@ -3258,7 +4856,7 @@ fn a_thread_that_leaves_its_work_waits_for_a_held_turn() {
 #[test]
 fn the_store_is_printed_from_under_its_leases_turn() {
     thread_local!(static PRINTED: RefCell<String> = const { RefCell::new(String::new()) });
-    fn prints(store: &MemoryStore, _: &World, _: &LeaseRecord, _: Said, _: Option<Decider>) {
+    fn prints(store: &MemoryStore, _: &World, _: &Sides, _: Said, _: Option<Decider>) {
         PRINTED.with(|printed| *printed.borrow_mut() = format!("{store:?}"));
     }
     let store = MemoryStore::new();
@@ -3374,8 +4972,8 @@ fn told_across(store: &MemoryStore, lease: LeaseId, said: Option<Said>) {
 
 #[test]
 fn a_lease_is_told_issued_before_any_holder_ends_it() {
-    fn ended(store: &MemoryStore, _: &World, record: &LeaseRecord, said: Said, _: Option<Decider>) {
-        told_across(store, record.lease.id, Some(said));
+    fn ended(store: &MemoryStore, _: &World, found: &Sides, said: Said, _: Option<Decider>) {
+        told_across(store, found.record.lease.id, Some(said));
     }
     let store = MemoryStore::new();
     let a = ready(&store, "http://a:1");
@@ -3437,9 +5035,9 @@ fn a_lease_is_told_issued_before_any_holder_ends_it() {
 #[test]
 fn a_decider_issues_into_its_own_file_and_a_leases_id_names_it() {
     static NAMES: Mutex<Vec<(LeaseId, Option<Decider>)>> = Mutex::new(Vec::new());
-    fn named(_: &MemoryStore, _: &World, record: &LeaseRecord, _: Said, by: Option<Decider>) {
+    fn named(_: &MemoryStore, _: &World, found: &Sides, _: Said, by: Option<Decider>) {
         let mut names = NAMES.lock().expect("no case fails under it");
-        names.push((record.lease.id, by));
+        names.push((found.record.lease.id, by));
     }
     let store = Arc::new(MemoryStore::new().with_deciders(3));
     assert_eq!(store.deciders(), 3);
@@ -3599,7 +5197,7 @@ fn no_thread_acts_at_a_file_beside_the_thread_at_work() {
 fn a_decider_takes_up_its_work_behind_a_hand_that_tells_at_its_file() {
     type Ends = (mpsc::SyncSender<()>, mpsc::Receiver<()>);
     static ENDS: Mutex<Option<Ends>> = Mutex::new(None);
-    fn parks(_: &MemoryStore, _: &World, _: &LeaseRecord, _: Said, _: Option<Decider>) {
+    fn parks(_: &MemoryStore, _: &World, _: &Sides, _: Said, _: Option<Decider>) {
         let ends = ENDS.lock().expect("no case fails under it").take();
         if let Some((reached, word)) = ends {
             reached.send(()).expect("the case hears the tell");
@@ -3717,9 +5315,9 @@ fn a_full_ring_stops_its_hand_until_the_thread_at_work_applied() {
 #[test]
 fn the_sweep_ends_a_resting_files_due_leases_under_its_deciders_name() {
     static NAMES: Mutex<Vec<(LeaseId, Option<Decider>)>> = Mutex::new(Vec::new());
-    fn named(_: &MemoryStore, _: &World, record: &LeaseRecord, _: Said, by: Option<Decider>) {
+    fn named(_: &MemoryStore, _: &World, found: &Sides, _: Said, by: Option<Decider>) {
         let mut names = NAMES.lock().expect("no case fails under it");
-        names.push((record.lease.id, by));
+        names.push((found.record.lease.id, by));
     }
     let store = Arc::new(MemoryStore::new().with_deciders(2));
     let a = ready(&store, "http://a:1");
@@ -3840,9 +5438,9 @@ fn a_followed_terms_start_raises_every_file_and_starts_the_blocks_under_it() {
 #[test]
 fn a_lease_of_the_term_before_is_found_in_its_file_behind_a_rise() {
     static NAMES: Mutex<Vec<(LeaseId, Option<Decider>)>> = Mutex::new(Vec::new());
-    fn named(_: &MemoryStore, _: &World, record: &LeaseRecord, _: Said, by: Option<Decider>) {
+    fn named(_: &MemoryStore, _: &World, found: &Sides, _: Said, by: Option<Decider>) {
         let mut names = NAMES.lock().expect("no case fails under it");
-        names.push((record.lease.id, by));
+        names.push((found.record.lease.id, by));
     }
     let store = MemoryStore::new().with_deciders(3);
     let a = ready(&store, "http://a:1");
@@ -3934,6 +5532,77 @@ fn a_door_files_no_id_whose_file_a_claim_would_name_anew() {
     assert_eq!(LeasesStore::restore(&one, gateway, &[by_hand(4, 9)]), 1);
 }
 
+/// A door asks the file an id names once more under the turn it took. A
+/// door that waited for the first file's turn while a decider claimed the
+/// id's block files the lease in that decider's file, where its frames
+/// look for it. No hook says the door reached its wait, so the case gives
+/// it time: a door that came late reads the claimed byte and passes too.
+#[test]
+fn a_door_that_waited_behind_a_claim_files_its_id_where_the_claim_named_it() {
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    let store = MemoryStore::new().with_deciders(2);
+    let a = ready(&store, "http://a:1");
+    LeasesStore::set_term(&store, 3);
+    let (store, booked) = (&store, store.world().booked_of(a));
+    let record = LeaseRecord {
+        target: a,
+        ..lease(gateway, 0, 3, now)
+    };
+    // An id of the term's second block, which no decider claimed yet: it
+    // reads the first file.
+    let by_hand = lease(gateway, 3 << 32 | 1 << 20 | 9, 3, now);
+    let (reached, parked) = mpsc::sync_channel(1);
+    let (go, word) = mpsc::sync_channel::<()>(1);
+    let filed = std::thread::scope(|scope| {
+        // The first decider claims the first block and is parked under its
+        // turn, in its issue's tell.
+        scope.spawn(move || {
+            let _acting = Decider::new(0).enter();
+            let issued = store.issue_decided(record, booked, |_| {
+                reached.send(()).expect("the case hears the tell");
+                word.recv().expect("the case lets the issuer go");
+            });
+            issued.expect("minted under the store's term");
+        });
+        parked.recv().expect("the issue tells");
+        // The door reads the first file and waits for its turn.
+        let door = scope.spawn(move || LeasesStore::issue(store, by_hand));
+        std::thread::sleep(Duration::from_millis(200));
+        // The second decider claims the second block, the id's.
+        let _acting = Decider::new(1).enter();
+        let second = store.issue_decided(record, booked, |_| ());
+        go.send(()).expect("the issuer holds the other end");
+        let filed = door.join().expect("the door returns");
+        (second.map(|lease| lease.id), filed)
+    });
+    assert_eq!(filed, (Ok(LeaseId(3 << 32 | 1 << 20)), Ok(())));
+    assert!(LeasesStore::get(store, gateway, by_hand.lease.id).is_some());
+}
+
+/// Once the store's term is past 31 bits no decider mints and no term
+/// leads the blocks anew, so the doors file every id where it reads its
+/// file: an id of the last term from a block no decider claimed, and an
+/// id of a term that never led here. A restore keeps both.
+#[test]
+fn the_doors_file_every_id_once_the_term_is_past_31_bits() {
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    let by_hand = |term: u64, counter: u64| lease(gateway, term << 32 | counter, term, now);
+    let store = MemoryStore::new().with_deciders(2);
+    LeasesStore::set_term(&store, 4);
+    let doors: &dyn LeasesStore = &store;
+    let (unclaimed, never) = (by_hand(4, 9), by_hand(10, 5 << 20 | 1));
+    assert_eq!(doors.issue(unclaimed), Err(LeaseRefused::Unclaimed));
+    LeasesStore::set_term(&store, 1 << 31);
+    assert_eq!(
+        (doors.issue(unclaimed), doors.issue(never)),
+        (Ok(()), Ok(()))
+    );
+    let on_file = |record: LeaseRecord| doors.get(gateway, record.lease.id).is_some();
+    assert!(on_file(unclaimed) && on_file(never));
+    assert_eq!(doors.restore(gateway, &[unclaimed, never]), 2);
+    assert!(on_file(unclaimed) && on_file(never));
+}
+
 /// The most deciders a host names each issue a first lease: every id is
 /// far below its term's mark, three quarters of the counter, so no count
 /// of deciders hands a term over at its first leases.
@@ -3963,7 +5632,7 @@ fn the_first_leases_of_the_most_deciders_are_far_below_the_terms_mark() {
 fn the_files_laid_for_deciders_keep_the_word_and_the_fault_count() {
     use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
     static HEARD: AtomicUsize = AtomicUsize::new(0);
-    fn counted(_: &MemoryStore, _: &World, _: &LeaseRecord, _: Said, _: Option<Decider>) {
+    fn counted(_: &MemoryStore, _: &World, _: &Sides, _: Said, _: Option<Decider>) {
         HEARD.fetch_add(1, SeqCst);
     }
     let store = MemoryStore::new();

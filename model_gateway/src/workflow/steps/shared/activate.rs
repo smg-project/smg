@@ -4,15 +4,13 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use openai_protocol::worker::WorkerStatus;
+use smg_worker::identity::basic::{ConnectionMode, Worker};
 use tracing::info;
 use wfaas::{
     StepExecutor, StepResult, WorkflowContext, WorkflowData, WorkflowError, WorkflowResult,
 };
 
-use crate::{
-    worker::{ConnectionMode, Worker},
-    workflow::data::{require_app_context, WorkerRegistrationData},
-};
+use crate::workflow::data::{require_app_context, WorkerRegistrationData};
 
 /// Final step in any worker registration workflow: flip Pending → Ready.
 pub struct ActivateWorkersStep;
@@ -89,13 +87,14 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for ActivateWorke
 #[cfg(test)]
 mod tests {
     use openai_protocol::worker::WorkerSpec;
+    use smg_worker::registry::event::WorkerEvent;
     use wfaas::WorkflowInstanceId;
 
     use super::*;
     use crate::{
         app_context::{testing::app_context_for_tests, AppContext},
         config::RouterConfig,
-        worker::{registry::event::WorkerEvent, BasicWorkerBuilder, WorkerRegistry},
+        routers::{common::snapshot::WorkerRegistry, grpc::backend_client::BasicWorkerBuilder},
         workflow::{data::WorkerRegistrationMode, steps::create_worker_workflow_data},
     };
 

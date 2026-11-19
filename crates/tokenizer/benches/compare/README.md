@@ -41,19 +41,24 @@ built `--locked` against the adapter's `Cargo.lock`. A `--previous` column start
 cargo changes what that release's manifest requires. `--columns` and `--families` take a subset.
 
 `ids` runs first: every column encodes the 7,015 parity strings of every family, and
-`ids-summary.txt` counts the strings on which a column's ids equal the `smg` column's. Timing two
-implementations that tokenize a text differently compares different work, so read it before the tables.
+`ids-summary.txt` counts the strings on which a column's ids equal the `smg` column's. A family's line
+also names a column whose process ended at a non-zero exit status, and a column whose file does not hold
+a whole record for every string. Timing two implementations that tokenize a text differently compares
+different work, so read it before the tables.
 
 `run` writes one JSON line per process under `--output/raw/`: `{"ctx": ..., "out": ...}`, where `ctx` is
 the column, the family, the round, the core, the exit status and the load average, and `out` is the
-cell's own line. A process that failed has a non-zero `rc`. The `v1` column on a family whose file the v1
-pipeline declines runs this crate's own encoder: its `backend` string then has no `hf:v1`, and that cell
-is no reference. The last command above is the edge pass: five more rounds on the encode cells in which
-`smg` stands within 10 % of its best reference, where three rounds can leave the side open.
+cell's own line. A process that failed has a non-zero `rc`, and one that ran into the timeout keeps what
+it wrote to stderr until then. The `v1` column on a family whose file the v1 pipeline declines takes its
+next encode path (this crate's own encoder, or the `tokenizers` crate's): its `backend` string then has
+no `hf:v1`, and that cell is no reference. The last command above is the edge pass: five more rounds on
+the encode cells in which `smg` stands within 10 % of its best reference, where three rounds can leave
+the side open.
 
 `collect` writes the three csv files that `tables.py` reads from those raw lines, one line per process:
 `encode-rounds.csv` (the p50 of nanoseconds per token), `misc-rounds.csv` (decode, streams and batch) and
-`load-memory.csv`. A process that failed keeps its line with an empty figure. `--release` names the `smg`
+`load-memory.csv`. A process that failed keeps its line with an empty figure, and so does one whose cell found
+its own stream text wrong (its status reads `incorrect`). `--release` names the `smg`
 column (`smg-1.16.0`) and `--csv` the directory, here the one `tables.py` reads.
 
 Run on an otherwise idle machine, each stream on a physical core whose sibling is idle; do not compile
@@ -78,8 +83,10 @@ from code placement alone, so a margin inside that band is not a difference betw
   call where it has one, on one thread (10 repetitions): tokens per second.
 - **`info`** and **`mem`** (load and memory): the load time and the resident set after the load; the
   high-water mark after one encode of a 500k-token and of a 1M-token text; the allocator calls of one
-  2k-token encode; the growth of the resident set per thread with 64 threads alive, on one shared
-  tokenizer and on a tokenizer per thread.
+  2k-token encode; the resident set per thread with 64 threads alive, read while every thread still
+  holds its tokenizer: the growth on one shared tokenizer, then with a tokenizer per thread the growth
+  of that phase and the level counted from before the first phase. The table shows the level: the
+  second phase starts from what the first left resident, so its own growth depends on the first.
 - **`parity`**: for every string the ids, the decoded text and the streamed text, written to a file.
 
 `cells.rs` holds more cells than the runner starts (`threads`, `fail`, `robust`, `share`, `rss`, `fuzz`:
