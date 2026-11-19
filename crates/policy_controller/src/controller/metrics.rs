@@ -85,7 +85,8 @@ pub const DECIDE_NO_DECISION_TOTAL: &str = "smg_policy_controller_decide_no_deci
 /// reads of them: decided over the first ones, the rest hashed for nothing.
 pub const DECIDE_HASHES_CUT_TOTAL: &str = "smg_policy_controller_decide_hashes_cut_total";
 /// Answers no decide stream took, by `cause`: `stream_gone` for a stream
-/// that had ended, `queue_full` for one whose queue had no place, which a
+/// that had ended, before the answer was made or with it still in the
+/// stream's queue, `queue_full` for one whose queue had no place, which a
 /// stream's window rules out.
 pub const DECIDE_ANSWERS_DROPPED_TOTAL: &str = "smg_policy_controller_decide_answers_dropped_total";
 /// Decide requests their gateway said it asked again, holding no answer to

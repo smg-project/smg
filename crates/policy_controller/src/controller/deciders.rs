@@ -77,12 +77,12 @@
 //! two at most, and the gateways' sweep ends them in a file whose decider
 //! waits for a job. Their engine is told under the turn where its
 //! generation still stands. So a lease whose answer never reached its
-//! gateway (an answer in the queue of a stream that then ended, a
-//! decision that panicked past its issue) stands until its gateway asks
-//! the request again, or else until its deadline and then the next issue
-//! of its file or the sweep's next tick. A decision
-//! its stream stops at the send is none of them: the stream hands its
-//! lease's release there, as a session hands a frame's
+//! gateway (an answer lost behind its stream's send, a decision that
+//! panicked past its issue) stands until its gateway asks the request
+//! again, or else until its deadline and then the next issue of its file
+//! or the sweep's next tick. A decision its stream stops at the send is
+//! none of them, nor one still in the queue of a stream that ends: the
+//! stream hands its lease's release there, as a session hands a frame's
 //! ([`super::decide`]). Nor is an answer its stream's queue does not
 //! take, full or closed: its decider hands the release where the queue
 //! refuses it and takes its file's turn behind the hand, so its next
@@ -229,7 +229,8 @@ pub(crate) struct Counts {
     /// Answers a stream's queue had no place for. A stream's window rules
     /// it out: its requests in flight are at most its queue's places.
     pub(crate) dropped_full: AtomicU64,
-    /// Answers whose stream had ended.
+    /// Answers whose stream had ended: at their decider's send, or with
+    /// them still in its queue.
     pub(crate) dropped_gone: AtomicU64,
     /// What a decision that is made may count, each decider's in a part of
     /// its own: read whole by [`Counts::undialed`] and
