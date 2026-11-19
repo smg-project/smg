@@ -71,10 +71,13 @@ from code placement alone, so a margin inside that band is not a difference betw
   and 30 timed encodes (10 for the `tokenizers` column at the two largest classes); the p50 of nanoseconds
   per token. *Cold* takes a different text for every encode (the class's 33 texts in order), *warm* the
   same text every time. The warm text is the first of its class, encoded again and again, so a warm
-  figure is a ceiling of what repeated text gives, not the speed of mixed traffic. The six warm texts hold
-  1,548, 8,873, 151,173, 599,401, 2,289,914 and 4,613,798 bytes (the 256 class to the 1M class), and 90, 41,
-  50, 42, 39 and 41 % of those bytes are outside ASCII, where a class as a whole holds 17 to 39 %
-  (`corpus.json`). A round is one pass over the families, the columns interleaved inside each cell
+  figure is the speed of that one text with hot caches, not the speed of mixed traffic. The six warm texts
+  hold 1,548, 8,873, 151,173, 599,401, 2,289,914 and 4,613,798 bytes (the 256 class to the 1M class), and
+  90.1, 41.2, 50.1, 42.3, 39.4 and 40.9 % of those bytes are outside ASCII, where their classes hold 17.1,
+  31.1, 37.6, 38.3, 38.7 and 38.7 % (`corpus.json`; the 1M class holds each 500k text twice). Such a text
+  can read slower warm than its class reads cold: in `encode-rounds.csv` the warm cell reads the higher
+  time in 54 of the 474 pairs of a warm and a cold cell, all of them from the 32k class up.
+  A round is one pass over the families, the columns interleaved inside each cell
   in an order that rotates from cell to cell; a cell's figure is the median of its rounds.
 - **`dec`** (decode): the first 2,048 ids of a 32k-token text. A full decode (30 repetitions, ns per
   token); the same ids stepped through one stream (ns per token, and the time of a step); the first
