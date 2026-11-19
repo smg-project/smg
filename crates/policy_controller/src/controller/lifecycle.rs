@@ -50,7 +50,7 @@ use crate::{
         completed::Class,
         released::{Reason, What},
     },
-    store::{Dispatch, GatewayId, Hand, HealthSink, LeaseRecord, MemoryStore, Said, World},
+    store::{Dispatch, GatewayId, Hand, LeaseRecord, MemoryStore, Said, World},
     view::WorkerId,
 };
 
@@ -72,7 +72,8 @@ pub(crate) fn dispatched(
 
 /// A `Completed` frame: the lease's side ends with its outcome, and the
 /// gateway's completion on the worker is written for the health
-/// precedence, whether or not the lease is on file.
+/// precedence, whether or not the lease is on file: the door's one
+/// routine says both ([`door::completed`]).
 ///
 /// # Errors
 ///
@@ -84,9 +85,9 @@ pub(crate) fn completed(
     now: Instant,
 ) -> Result<(), Status> {
     let (lease, outcome) = outcome(frame)?;
-    store.hand(hand, lease, Said::Completed(outcome));
-    // The sink writes for a worker it holds a row for and for no other.
-    HealthSink::completed(store, hand.gateway(), outcome.served, outcome.class, now);
+    door::completed(store, hand.gateway(), &outcome, now, |said| {
+        store.hand(hand, lease, said);
+    });
     Ok(())
 }
 
