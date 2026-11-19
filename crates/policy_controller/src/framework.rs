@@ -2255,8 +2255,8 @@ impl Marks {
     const JOINED: u8 = 1 << 3;
     /// The profile's leading stages are ranks ([`Order`]) and nothing else
     /// is asked before its run: a plain decision over a pool of
-    /// [`RANK_FROM`] rows or more, each said to hold a rate
-    /// ([`PoolFacts::rated`]), asks its stages by rank ([`run_ranked`]).
+    /// [`RANK_FROM`] rows or more, each said to hold a report
+    /// ([`PoolFacts::reported`]), asks its stages by rank ([`run_ranked`]).
     /// On a profile that draws for a request that names rows
     /// ([`Self::JOINED`]) that request is the draw's, and every other is
     /// the ranks'. Never set on a profile that draws for every request:
@@ -3335,12 +3335,12 @@ impl Engine {
             }
             // A profile whose leading stages are ranks is asked by rank
             // where the draw left the decision and the host says that every
-            // row of the pool holds a rate ([`PoolFacts::rated`]): such a
-            // pool holds no row without a report. The load stage costs that
-            // row from its reporting peers, so of one in front it would say
-            // that it must be asked whole, after the ranks were read: a
-            // pool not said to hold none is asked whole at once.
-            if marks.ranked() && pool.rated {
+            // row of the pool holds a report ([`PoolFacts::reported`]). The
+            // load stage costs a row without one from its reporting peers,
+            // so of one in front it would say that it must be asked whole,
+            // after the ranks were read: a pool not said to hold none is
+            // asked whole at once.
+            if marks.ranked() && pool.reported {
                 return run_ranked(self, index, facts, pool, set, cx, buf);
             }
         }
@@ -8798,11 +8798,12 @@ mod tests {
         )
     }
 
-    /// A decision over a pool whose host says that every row holds a rate
-    /// ([`PoolFacts::rated`]): what a profile is asked by rank under.
-    fn rated(engine: &Engine, facts: &RequestFacts<'_>, pool: &[Candidate]) -> Decision {
+    /// A decision over a pool whose host says that every row holds a
+    /// report ([`PoolFacts::reported`]): what a profile is asked by rank
+    /// under.
+    fn reported(engine: &Engine, facts: &RequestFacts<'_>, pool: &[Candidate]) -> Decision {
         let said = PoolFacts {
-            rated: true,
+            reported: true,
             ..PoolFacts::default()
         };
         engine.decide(
@@ -10656,7 +10657,7 @@ mod tests {
             };
             let engine = staged(vec![rank(levels, 4.0, true), probe], Box::new(Best));
             assert_eq!(engine.orders[0].ranks, 1);
-            let decision = rated(&engine, &request(7), &pool);
+            let decision = reported(&engine, &request(7), &pool);
             let rows = handed.lock().expect("the probe's rows").clone();
             (positions(&decision), rows)
         };
@@ -10687,7 +10688,7 @@ mod tests {
         let levels = [1.0, 0.5, 1.0, 0.0, 1.0, 0.5, 1.0, 0.0, 0.5];
         let engine = staged(vec![rank(&levels, 4.0, true), whole], Box::new(Best));
         assert_eq!((engine.orders[0].ranks, engine.orders[0].fronts), (1, 0));
-        rated(&engine, &request(7), &pool);
+        reported(&engine, &request(7), &pool);
         assert_eq!(*handed.lock().expect("the probe's rows"), every);
     }
 
@@ -10710,7 +10711,7 @@ mod tests {
             named: Some(NamedAffinity::default()),
             ..request(7)
         };
-        let decision = rated(&engine, &facts, &pool);
+        let decision = reported(&engine, &facts, &pool);
         assert_eq!(*handed.lock().expect("the probe's rows"), vec![0, 2, 4, 6]);
         assert_eq!(positions(&decision), vec![6, 4, 2, 0]);
     }
@@ -10848,12 +10849,12 @@ mod tests {
             engine.marks[0].ahead(),
             Marks::DRAWS_FIRST | Marks::JOINED | Marks::RANKED
         );
-        let ranked = rated(&engine, &request(7), &pool);
+        let ranked = reported(&engine, &request(7), &pool);
         assert!(!ranked.trace().drew_first());
         assert_eq!(rows(), vec![0, 1, 2, 3]);
         // One that names rows is the draw's, whatever the ranks would put in
         // front: the stage is handed the sample's two rows.
-        let drew = rated(&engine, &names, &pool);
+        let drew = reported(&engine, &names, &pool);
         assert!(drew.trace().drew_first());
         assert_eq!(rows().len(), 2);
         // The same stages under a picker that reads every score hold no
@@ -10862,7 +10863,7 @@ mod tests {
         let engine = staged(stages(), Box::new(Joining));
         assert_eq!(engine.orders[0].fronts, 0b1);
         assert_eq!(engine.marks[0].ahead(), Marks::DRAWS_FIRST | Marks::JOINED);
-        let whole = rated(&engine, &request(7), &pool);
+        let whole = reported(&engine, &request(7), &pool);
         assert!(!whole.trace().drew_first());
         assert_eq!(rows(), (0..16).collect::<Vec<u32>>());
     }
@@ -10889,7 +10890,7 @@ mod tests {
         assert_eq!((order.ranks, order.alike), (2, 0b10));
         let pool = ranked_pool(5);
         let facts = request(3);
-        let ranked = rated(&engine, &facts, &pool);
+        let ranked = reported(&engine, &facts, &pool);
         assert_eq!(*asks.lock().expect("the count"), 0);
         let summed = whole_pass(&engine, &facts, &pool);
         assert_eq!(*asks.lock().expect("the count"), 1);
@@ -10936,9 +10937,9 @@ mod tests {
         assert_ne!(engine.marks[0].0 & Marks::RANKED, 0);
         let pool: Vec<Candidate> = (0..16).map(|i| candidate(i, 0)).collect();
         let facts = request(3);
-        let under = rated(&engine, &facts, &pool[..RANK_FROM - 1]);
+        let under = reported(&engine, &facts, &pool[..RANK_FROM - 1]);
         assert_eq!(*asks.lock().expect("the count"), 1);
-        rated(&engine, &facts, &pool);
+        reported(&engine, &facts, &pool);
         assert_eq!(*asks.lock().expect("the count"), 1);
         assert_eq!(under, whole_pass(&engine, &facts, &pool[..RANK_FROM - 1]));
     }
@@ -10989,8 +10990,8 @@ mod tests {
                 for seed in 0..4 {
                     let facts = request(round * 4 + seed);
                     assert_eq!(
-                        rated(&ranked, &facts, &pool),
-                        rated(&summed, &facts, &pool),
+                        reported(&ranked, &facts, &pool),
+                        reported(&summed, &facts, &pool),
                         "{name}, round {round}, seed {seed}: levels {levels:?}, values \
                          {values:?}, band {band}, lead {lead}"
                     );
@@ -11029,8 +11030,8 @@ mod tests {
         let mut led = Vec::new();
         for seed in 0..64 {
             let facts = request(seed);
-            let decision = rated(&ranked, &facts, &pool);
-            assert_eq!(decision, rated(&summed, &facts, &pool), "seed {seed}");
+            let decision = reported(&ranked, &facts, &pool);
+            assert_eq!(decision, reported(&summed, &facts, &pool), "seed {seed}");
             led.push(positions(&decision)[0]);
         }
         assert!(led.contains(&4), "{led:?}");
@@ -11089,7 +11090,7 @@ mod tests {
         ];
         let engine = staged(stages, Box::new(Best));
         let pool = ranked_pool(12);
-        rated(&engine, &request(1), &pool);
+        reported(&engine, &request(1), &pool);
     }
 
     /// A rank that says a count of ceilings its scores do not hold fails a
@@ -11143,7 +11144,7 @@ mod tests {
             let holders = overlaps.iter().filter(|&&blocks| blocks > 0).count();
             fronts += usize::from(holders >= MAX_TARGETS && holders * 2 <= pool.len());
             let (ranked, summed) = (
-                rated(&engine, &facts, &pool),
+                reported(&engine, &facts, &pool),
                 whole_pass(&engine, &facts, &pool),
             );
             assert_eq!(
@@ -11229,7 +11230,7 @@ mod tests {
                 .count();
             let front = holders >= MAX_TARGETS && holders * 2 <= kept;
             let (ranked, summed) = (
-                rated(&engine, &facts, &pool),
+                reported(&engine, &facts, &pool),
                 whole_pass(&engine, &facts, &pool),
             );
             assert_eq!(
@@ -11300,7 +11301,7 @@ mod tests {
                     affinity: &column,
                     ..request(seed)
                 };
-                by_rank.push(positions(&rated(&engine, &facts, pool)));
+                by_rank.push(positions(&reported(&engine, &facts, pool)));
                 by_sum.push(positions(&whole_pass(&engine, &facts, pool)));
             }
             by_rank.sort_unstable();
@@ -11319,19 +11320,19 @@ mod tests {
         assert!(by_sum.iter().flatten().all(|&at| at < 8), "{by_sum:?}");
     }
 
-    /// A host that says every row holds a rate of a pool where one does
-    /// not. A report without a rate among the rows in front drains at the
-    /// mean rate of the rows the filters kept, as in the whole pass: the
-    /// load stage folds it over them and the rows in front decide alone,
-    /// so the targets are the whole pass's and the trace's scores are the
-    /// front's own. That mean is 2,000 tokens a second here. Over the rows
-    /// in front alone it is 1,000, and over the pool, with the rows a
-    /// filter dropped, 6,000: either would put that row elsewhere among
-    /// the targets. A row without a report among the rows in front makes
-    /// the stage say that it must be asked whole: the decision is the
-    /// whole pass's, and so are its trace's scores. Behind the rows in
-    /// front neither is read: they are costed alone, each from its own
-    /// report.
+    /// A pool said to hold a report on every row, and a host that says it
+    /// where one row holds none. A report without a rate among the rows in
+    /// front drains at the mean rate of the rows the filters kept, as in
+    /// the whole pass: the load stage folds it over them and the rows in
+    /// front decide alone, so the targets are the whole pass's and the
+    /// trace's scores are the front's own. That mean is 2,000 tokens a
+    /// second here. Over the rows in front alone it is 1,000, and over the
+    /// pool, with the rows a filter dropped, 6,000: either would put that
+    /// row elsewhere among the targets. A row without a report among the
+    /// rows in front makes the stage say that it must be asked whole: the
+    /// decision is the whole pass's, and so are its trace's scores. Behind
+    /// the rows in front neither is read: they are costed alone, each from
+    /// its own report.
     #[test]
     fn a_row_in_front_without_a_rate_drains_at_the_kept_rows_mean_rate() {
         let engine = preset("cache_aware");
@@ -11369,7 +11370,7 @@ mod tests {
         // trace's scores by rank are the whole pass's too.
         let decided = |pool: &[Candidate]| {
             let (ranked, summed) = (
-                rated(&engine, &facts, pool),
+                reported(&engine, &facts, pool),
                 whole_pass(&engine, &facts, pool),
             );
             assert_eq!(positions(&ranked), positions(&summed));
@@ -11406,7 +11407,7 @@ mod tests {
             let stages = vec![rank(&first, 12.0, true), rank(second, 3.0, true), probe];
             let engine = staged(stages, Box::new(Best));
             assert_eq!(engine.orders[0].ranks, 2);
-            let decision = rated(&engine, &request(9), &pool);
+            let decision = reported(&engine, &request(9), &pool);
             let rows = handed.lock().expect("the probe's rows").clone();
             (positions(&decision), rows)
         };
@@ -11444,7 +11445,7 @@ mod tests {
         };
         let stages = vec![rank(&first, 12.0, true), rank(&second, 3.0, true), probe];
         let engine = staged(stages, Box::new(Best));
-        let decision = rated(&engine, &request(9), &pool);
+        let decision = reported(&engine, &request(9), &pool);
         assert_eq!(*handed.lock().expect("the probe's rows"), vec![4, 5, 6, 7]);
         assert_eq!(positions(&decision), vec![7, 6, 5, 4]);
     }
@@ -11506,7 +11507,7 @@ mod tests {
         };
         let stages = vec![rank(&first, 12.0, true), rank(&second, 3.0, true), sparse];
         let engine = staged(stages, Box::new(Best));
-        let by_rank = positions(&rated(&engine, &request(9), &pool));
+        let by_rank = positions(&reported(&engine, &request(9), &pool));
         assert_eq!(*handed.lock().expect("the probe's rows"), vec![0, 1, 2, 3]);
         assert_eq!(by_rank, vec![2, 1, 0, 3]);
         let by_sum = positions(&whole_pass(&engine, &request(9), &pool));
@@ -11545,7 +11546,7 @@ mod tests {
         );
         assert_eq!(ranked.orders[0].ranks, 3);
         let facts = request(9);
-        let decision = rated(&ranked, &facts, &pool);
+        let decision = reported(&ranked, &facts, &pool);
         assert_eq!(
             *handed.lock().expect("the probe's rows"),
             (0..8).collect::<Vec<u32>>()
@@ -11553,17 +11554,17 @@ mod tests {
         assert_eq!(positions(&decision), vec![2, 1, 0, 5]);
         assert_eq!(
             positions(&decision),
-            positions(&rated(&summed, &facts, &pool))
+            positions(&reported(&summed, &facts, &pool))
         );
     }
 
     /// A profile is asked by rank only over a pool whose host says that
-    /// every row holds a rate ([`PoolFacts::rated`]): the stage behind the
-    /// rank is handed the four rows in front there, and every row where the
-    /// host does not say it. The turn is read in both directions over one
-    /// engine, and the targets are the same either way.
+    /// every row holds a report ([`PoolFacts::reported`]): the stage behind
+    /// the rank is handed the four rows in front there, and every row where
+    /// the host does not say it. The turn is read in both directions over
+    /// one engine, and the targets are the same either way.
     #[test]
-    fn a_pool_not_said_to_hold_a_rate_on_every_row_is_asked_whole_at_once() {
+    fn a_pool_not_said_to_hold_a_report_on_every_row_is_asked_whole_at_once() {
         let handed = Arc::new(Mutex::new(Vec::new()));
         let probe = Weighted {
             scorer: Box::new(Asked(Arc::clone(&handed))),
@@ -11573,9 +11574,9 @@ mod tests {
         let engine = staged(vec![rank(&levels, 4.0, true), probe], Box::new(Best));
         let pool = ranked_pool(9);
         // The targets by position, and the rows the stage behind was handed.
-        let asked = |rated: bool| {
+        let asked = |reported: bool| {
             let facts = PoolFacts {
-                rated,
+                reported,
                 ..PoolFacts::default()
             };
             let decision = engine.decide(
@@ -11620,7 +11621,7 @@ mod tests {
         let (four, six) = (front_of(&four), front_of(&six));
         let pool = ranked_pool(16);
         let said = PoolFacts {
-            rated: true,
+            reported: true,
             ..PoolFacts::default()
         };
         let mut scratch = Scratch::new();
@@ -11710,7 +11711,7 @@ mod tests {
         };
         let stages = vec![rank(&first, 12.0, true), rank(&second, 3.0, true), probe];
         let engine = staged(stages, Box::new(Best));
-        let decision = rated(&engine, &request(9), &pool);
+        let decision = reported(&engine, &request(9), &pool);
         let kept: Vec<u32> = (0..16).collect();
         assert_eq!(
             *shown.lock().expect("the asks"),
@@ -11781,7 +11782,7 @@ mod tests {
             };
             let engine = staged(vec![rank(&levels, 4.0, true), stage], Box::new(Best));
             assert_ne!(engine.marks[0].0 & Marks::RANKED, 0);
-            let decision = rated(&engine, &request(3), &pool);
+            let decision = reported(&engine, &request(3), &pool);
             let asks = asks.lock().expect("the asks").clone();
             (positions(&decision), asks)
         };
@@ -11855,11 +11856,11 @@ mod tests {
             now_micros: 1_000_000,
             ..request(7)
         };
-        let steered = rated(&engine, &facts, &pool);
+        let steered = reported(&engine, &facts, &pool);
         assert!(steered.pick().is_some(), "{steered:?}");
         assert_eq!(steered, whole_pass(&engine, &facts, &pool));
         engine.shed_when_all_vetoed(0);
-        let shed = rated(&engine, &facts, &pool);
+        let shed = reported(&engine, &facts, &pool);
         assert!(shed.pick().is_none(), "{shed:?}");
         assert_eq!(shed, whole_pass(&engine, &facts, &pool));
     }
@@ -11923,7 +11924,7 @@ mod tests {
         assert_eq!(usize::from(engine.orders[0].ranks), Order::MOST);
         let pool: Vec<Candidate> = (0..16).map(|i| candidate(i, 0)).collect();
         let facts = request(5);
-        let ranked = rated(&engine, &facts, &pool);
+        let ranked = reported(&engine, &facts, &pool);
         assert_eq!(*handed.lock().expect("the asks"), vec![8]);
         // The four rows at both ceilings tie, and the seed draws their order.
         let mut targets = positions(&ranked);
@@ -11994,7 +11995,7 @@ mod tests {
         assert_eq!((engine.orders[0].ranks, engine.orders[0].fronts), (2, 0b10));
         let pool: Vec<Candidate> = (0..16).map(|i| candidate(i, 0)).collect();
         let facts = request(11);
-        let ranked = rated(&engine, &facts, &pool);
+        let ranked = reported(&engine, &facts, &pool);
         assert_eq!(*asks.lock().expect("the asks"), vec![16]);
         assert_eq!(positions(&ranked), vec![0, 1, 2, 3]);
         assert_eq!(
@@ -12050,11 +12051,17 @@ mod tests {
         let host = staged(stages(&handed), Box::new(Namesake));
         assert_eq!(host.marks[0].0 & Marks::RANKED, 0);
         // The lowest sums are the rows behind the rank's ceiling.
-        assert_eq!(positions(&rated(&host, &facts, &pool)), vec![8, 9, 10, 11]);
+        assert_eq!(
+            positions(&reported(&host, &facts, &pool)),
+            vec![8, 9, 10, 11]
+        );
         assert_eq!(handed.lock().expect("the probe's rows").len(), 16);
         let built = staged(stages(&handed), Box::new(Best));
         assert_ne!(built.marks[0].0 & Marks::RANKED, 0);
-        assert_eq!(positions(&rated(&built, &facts, &pool)), vec![7, 6, 5, 4]);
+        assert_eq!(
+            positions(&reported(&built, &facts, &pool)),
+            vec![7, 6, 5, 4]
+        );
         assert_eq!(handed.lock().expect("the probe's rows").len(), 8);
     }
 
@@ -12124,7 +12131,7 @@ mod tests {
         ];
         let engine = staged(stages, Box::new(Best));
         assert_eq!(engine.orders[0].ranks, 1);
-        rated(&engine, &request(7), &ranked_pool(9));
+        reported(&engine, &request(7), &ranked_pool(9));
     }
 
     /// Behind a stage that orders the rows, a stage that says it orders
@@ -12209,7 +12216,7 @@ mod tests {
         ];
         let engine = staged(stages, Box::new(Best));
         assert_eq!(engine.orders[0].ranks, 1);
-        rated(&engine, &request(7), &ranked_pool(9));
+        reported(&engine, &request(7), &ranked_pool(9));
     }
 
     /// A leading rank that says it must be asked whole was handed every
@@ -12231,13 +12238,13 @@ mod tests {
         for seed in 0..16 {
             let facts = request(seed);
             assert_eq!(
-                positions(&rated(&ranked, &facts, &pool)),
-                positions(&rated(&summed, &facts, &pool)),
+                positions(&reported(&ranked, &facts, &pool)),
+                positions(&reported(&summed, &facts, &pool)),
                 "seed {seed}"
             );
         }
         // The five at the ceiling in the order of the stage behind.
-        let led = positions(&rated(&ranked, &request(0), &pool));
+        let led = positions(&reported(&ranked, &request(0), &pool));
         assert_eq!(led, vec![5, 8, 6, 2]);
     }
 }
