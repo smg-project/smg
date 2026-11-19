@@ -1990,11 +1990,16 @@ impl NativeEncoder {
         };
         // One slot per id of the window, written in place (the read keeps
         // its index, so the collect is one list and no concatenation); one
-        // scratch per rayon job (2048 entries or more).
+        // scratch per rayon job. A job is 2048 entries on the seed's own
+        // pool, a window being eight of them for its four threads; on a
+        // caller's pool with more threads than that it is the window's
+        // share of a thread, 256 entries or more, so that every thread
+        // of the pool reads, as it did when the pass was one list.
         let read_window = |window: Range<u32>, slots: &mut Vec<Option<Option<Seeded>>>| {
+            let job = (SEED_WINDOW / rayon::current_num_threads().max(1)).clamp(256, 2048);
             window
                 .into_par_iter()
-                .with_min_len(2048)
+                .with_min_len(job)
                 .map_init(SeedScratch::default, |scratch, id| read(id, scratch))
                 .collect_into_vec(slots);
         };
