@@ -11,9 +11,10 @@
 //! stream across a host's requests and releases the leases of a decision
 //! its caller never takes. The host makes its own fallback decisions.
 //!
-//! A watch of the controller's workers opens on the same channel
-//! ([`Client::watch_workers`]): a stream of its own, which the session and
-//! an ask do not wait for.
+//! A watch of the controller's workers opens on either client's channel
+//! ([`Client::watch_workers`], [`Link::watch_workers`]). Once open it has
+//! its own stream, so the session and asks can proceed while the watch
+//! waits.
 //!
 //! The client takes its channel and makes no credential:
 //! [`Client::connect`] dials an address in the clear, and
@@ -35,12 +36,12 @@
 //! peer gone silent ends that wait through the channel's keepalive
 //! ([`KEEPALIVE`]).
 //!
-//! A [`Link`] holds [`ANSWER_WAIT`] over its dial, its `Leader` ask and its
-//! two opens alone. Past them an ask waits its caller's budget
-//! ([`Link::ask`]), a report waits for nothing ([`Link::report`]), and the
-//! link's two readers wait with no bound of their own: the channel's
-//! keepalive, which the link sets, ends a link whose controller went
-//! silent ([`Link::connect`]).
+//! A [`Link`] holds [`ANSWER_WAIT`] over its dial, its `Leader` ask and the
+//! opens of its session, decide stream and watch. An ask waits its
+//! caller's budget ([`Link::ask`]) and a report waits for nothing
+//! ([`Link::report`]). The readers of the session and decide stream wait
+//! with no bound of their own. The link sets the channel's keepalive,
+//! which ends a link whose controller went silent ([`Link::connect`]).
 
 use std::{
     future::{poll_fn, Future},
@@ -108,7 +109,8 @@ pub enum Error {
     /// The peer did not answer inside the client's bound. Every wait that
     /// bound ends is this kind and names the wait: the dial, the `Leader`
     /// ask, the session's welcome, the session's queue, the session's
-    /// end, the decide stream's open, its queue, its end or the decision.
+    /// end, the decide stream's open, its queue, its end, the decision or
+    /// the watch's open.
     /// A time-out the caller set on its own endpoint is not this
     /// kind: it ends a call as [`Error::Status`] and the dial as
     /// [`Error::Connect`].
@@ -638,14 +640,25 @@ fn fit(request: &mut DecideRequest) -> Result<usize, Error> {
     }
 }
 
-/// A watch of the controller's workers, open on the client's channel
-/// ([`Client::watch_workers`]).
+/// A watch of the controller's workers, open on either client's channel
+/// ([`Client::watch_workers`], [`Link::watch_workers`]).
 #[derive(Debug)]
 pub struct Watch {
     events: Streaming<WorkerEvent>,
 }
 
 impl Watch {
+    async fn open(
+        stub: &mut Stub,
+        request: WatchWorkersRequest,
+        wait: Duration,
+    ) -> Result<Self, Error> {
+        let response = answered("the watch's open", wait, stub.watch_workers(request)).await??;
+        Ok(Self {
+            events: response.into_inner(),
+        })
+    }
+
     /// The watch's next event, or none where the controller ended the
     /// stream with no error: it ends a stream whose watcher took nothing
     /// for a while after an event, and the watcher opens the watch again
@@ -653,8 +666,8 @@ impl Watch {
     /// ([`Error::Status`]): `ABORTED` where its replica stopped leading.
     /// This wait holds no bound of the client's: a fleet that does not
     /// change tells nothing. A peer gone silent ends it through the
-    /// channel's keepalive ([`KEEPALIVE`]); a caller that brings its own
-    /// endpoint ([`Client::connect_with`]) sets one on it.
+    /// channel's keepalive ([`KEEPALIVE`]). A caller that brings its own
+    /// endpoint to [`Client::connect_with`] sets one on it.
     pub async fn next(&mut self) -> Result<Option<WorkerEvent>, Error> {
         Ok(self.events.message().await?)
     }
@@ -838,11 +851,7 @@ impl Client {
     /// is [`Error::NoAnswer`]; one the controller refuses tells its status
     /// ([`Error::Status`]).
     pub async fn watch_workers(&mut self, request: WatchWorkersRequest) -> Result<Watch, Error> {
-        let open = self.stub.watch_workers(request);
-        let events = answered("the watch's open", self.wait, open)
-            .await??
-            .into_inner();
-        Ok(Watch { events })
+        Watch::open(&mut self.stub, request, self.wait).await
     }
 
     /// The session's end, awaited within the client's bound: the status the

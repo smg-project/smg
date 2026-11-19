@@ -1,5 +1,6 @@
 //! A host's link to its controller. The session takes lifecycle reports and
-//! one decide stream carries the host's concurrent asks.
+//! one decide stream carries the host's concurrent asks. A watch opens on
+//! the same channel in a stream of its own.
 
 use std::{pin::pin, sync::Arc, time::Duration};
 
@@ -18,13 +19,15 @@ use tokio_stream::{
 use tonic::{transport::Endpoint, Status};
 
 use super::{
-    dial_leader, fit, hello, numbered, Answer, Decide, Error, Session, ANSWER_WAIT, KEEPALIVE,
+    dial_leader, fit, hello, numbered, Answer, Decide, Error, Session, Stub, Watch, ANSWER_WAIT,
+    KEEPALIVE,
 };
 use crate::{
     controller::wire::{self, Refusal},
     proto::{
         busy, controller_frame, decide_answer, gateway_frame, released, Busy, ControllerFrame,
-        DecideAnswer, DecideRequest, Decision, GatewayFrame, Released, Welcome,
+        DecideAnswer, DecideRequest, Decision, GatewayFrame, Released, WatchWorkersRequest,
+        Welcome,
     },
 };
 
@@ -57,14 +60,15 @@ pub enum Unanswered {
     Late,
     /// An ask under this id is in flight already. Nothing was sent.
     InFlight,
-    /// The link has ended ([`Link::ended`] says why).
+    /// The link ended or the request queue closed. [`Link::ended`] tells
+    /// the cause once the link has ended.
     Ended,
     /// The request's id, its size or a field out of its range prevents
     /// sending it. Nothing was sent, and the link stands.
     Unsent(Error),
 }
 
-/// The report queue was full or the link had ended.
+/// The report queue was full or closed.
 #[derive(Debug)]
 pub struct Full;
 
@@ -85,7 +89,7 @@ impl Link {
         let (mut stub, floor) = dial_leader(endpoint.connect(), gateway_id, ANSWER_WAIT).await?;
         let (report, reports) = mpsc::channel(REPORT_QUEUE);
         let (request, requests) = mpsc::unbounded_channel();
-        let shared = Shared::new(floor, report, request);
+        let shared = Shared::new(stub.clone(), floor, report, request);
         let frames = shared.session_frames(hello(gateway_id, floor), reports);
         let (controller, welcome, term) =
             Session::welcomed(&mut stub, frames, floor, ANSWER_WAIT).await?;
@@ -100,18 +104,34 @@ impl Link {
         &self.welcome
     }
 
-    /// Whether both streams still stand.
+    /// Whether the session and decide stream still stand.
     pub fn stands(&self) -> bool {
         self.shared.stands()
     }
 
     /// Why the link ended, and none while it stands. The first cause is
-    /// kept: a stream's status whole (a clean end reads as an `OK` status
-    /// that names the stream), a frame's term below the floor, a replica
-    /// that stopped leading, an answer that carries nothing, or a full
-    /// report queue.
+    /// kept, including the whole status of the session or decide stream.
+    /// A clean end reads as an `OK` status that names the stream. A frame
+    /// below the term floor, a replica that stopped leading, an empty
+    /// answer or a full report queue can also end the link.
     pub fn ended(&self) -> Option<Arc<Error>> {
         self.shared.state.lock().ended.clone()
+    }
+
+    /// Waits for the link to end, returning at once if it already has.
+    pub async fn closed(&self) {
+        let _ = self.shared.stopped.clone().changed().await;
+    }
+
+    /// Opens a watch of the controller's workers on the link's channel,
+    /// within [`ANSWER_WAIT`]. The watch has its own stream, so the session
+    /// and asks can proceed while it waits.
+    ///
+    /// The watch can outlive the link. Wait for [`Self::closed`] alongside
+    /// [`Watch::next`] to stop following it when the link ends.
+    pub async fn watch_workers(&self, request: WatchWorkersRequest) -> Result<Watch, Error> {
+        let mut stub = self.shared.stub.clone();
+        Watch::open(&mut stub, request, ANSWER_WAIT).await
     }
 
     /// The highest term an answer carried.
@@ -182,6 +202,7 @@ fn in_range(request: &DecideRequest) -> Result<(), Error> {
 
 #[derive(Debug)]
 struct Shared {
+    stub: Stub,
     state: Mutex<State>,
     stopped: watch::Receiver<()>,
 }
@@ -237,12 +258,14 @@ impl Waiting {
 
 impl Shared {
     fn new(
+        stub: Stub,
         floor: u64,
         reports: mpsc::Sender<gateway_frame::Frame>,
         requests: mpsc::UnboundedSender<DecideRequest>,
     ) -> Arc<Self> {
         let (stop, stopped) = watch::channel(());
         Arc::new(Self {
+            stub,
             state: Mutex::new(State {
                 floor,
                 open: Some(Open {
@@ -328,13 +351,14 @@ impl Shared {
     fn report(&self, frame: gateway_frame::Frame) -> Result<(), Full> {
         let state = self.state.lock();
         let open = state.open.as_ref().ok_or(Full)?;
-        let why = match open.reports.try_send(frame) {
-            Ok(()) => return Ok(()),
-            Err(mpsc::error::TrySendError::Full(_)) => Error::ReportsFull,
-            Err(mpsc::error::TrySendError::Closed(_)) => Status::ok(SESSION_ENDED).into(),
-        };
-        Self::end(state, why);
-        Err(Full)
+        match open.reports.try_send(frame) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                Self::end(state, Error::ReportsFull);
+                Err(Full)
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(Full),
+        }
     }
 
     fn begin(
@@ -352,11 +376,10 @@ impl Shared {
             return Err(Unanswered::NoCredit);
         }
         let id = Arc::<[u8]>::from(request.request_id.as_slice());
-        open.credit -= 1;
         if open.requests.send(request).is_err() {
-            Self::end(state, Status::ok(DECIDE_ENDED).into());
             return Err(Unanswered::Ended);
         }
+        open.credit -= 1;
         // A reader takes this same lock before it can deliver an answer.
         let (sender, answer) = oneshot::channel();
         open.pending.insert(
@@ -510,6 +533,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        client::{PolicyControllerClient, Principal},
         proto::{
             busy, controller_frame, decide_answer, released, Credit, Header, Lease, NotLeader,
             Released, RequestFacts, Side,
@@ -536,12 +560,19 @@ mod tests {
 
     impl Peer {
         fn new(window: u32) -> Self {
+            Self::over(window, Endpoint::from_static("http://127.0.0.1:1"))
+        }
+
+        fn over(window: u32, endpoint: Endpoint) -> Self {
+            const GATEWAY: &str = "gateway";
+            let principal = Principal::of(GATEWAY).expect("a gateway id");
+            let stub = PolicyControllerClient::with_interceptor(endpoint.connect_lazy(), principal);
             let (report, reports) = mpsc::channel(REPORT_QUEUE);
             let (request, requests) = mpsc::unbounded_channel();
             let (controller, session) = mpsc::unbounded_channel();
             let (decide, decisions) = mpsc::unbounded_channel();
-            let shared = Shared::new(LEADER_TERM, report, request);
-            let reports = Box::pin(shared.session_frames(hello("gateway", LEADER_TERM), reports));
+            let shared = Shared::new(stub, LEADER_TERM, report, request);
+            let reports = Box::pin(shared.session_frames(hello(GATEWAY, LEADER_TERM), reports));
             let requests = Box::pin(shared.decide_requests(requests));
             let welcome = Welcome {
                 decide_window: window,
@@ -622,6 +653,13 @@ mod tests {
         future.poll(&mut Context::from_waker(Waker::noop()))
     }
 
+    async fn closes(link: &Link, end: impl FnOnce()) {
+        let mut closed = pin!(link.closed());
+        assert!(poll(closed.as_mut()).is_pending());
+        tokio::join!(biased; within(closed), async { end() });
+        assert!(poll(pin!(link.closed())).is_ready());
+    }
+
     fn request(id: u8) -> DecideRequest {
         DecideRequest {
             request_id: vec![id],
@@ -698,12 +736,15 @@ mod tests {
             assert!(peer.link.report(report.clone()).is_ok());
         }
         assert!(peer.link.stands());
-        assert!(matches!(peer.link.report(report.clone()), Err(Full)));
-        assert!(!peer.link.stands());
-        assert!(matches!(
-            peer.link.ended().as_deref(),
-            Some(Error::ReportsFull)
-        ));
+        closes(&peer.link, || {
+            assert!(matches!(peer.link.report(report.clone()), Err(Full)));
+            assert!(!peer.link.stands());
+            assert!(matches!(
+                peer.link.ended().as_deref(),
+                Some(Error::ReportsFull)
+            ));
+        })
+        .await;
         assert!(matches!(peer.link.report(report), Err(Full)));
         assert!(matches!(within(asked).await, Err(Unanswered::Ended)));
         assert_eq!(within(peer.reports.next()).await, None);
@@ -951,11 +992,14 @@ mod tests {
             peer.at_term(6).await;
             let mut asked = Box::pin(peer.link.ask(request(1), WAIT));
             assert!(poll(asked.as_mut()).is_pending());
-            if stale_session {
-                peer.controller(5, None);
-            } else {
-                peer.answer(1, 5, decision(7, &[Side::Single]));
-            }
+            closes(&peer.link, || {
+                if stale_session {
+                    peer.controller(5, None);
+                } else {
+                    peer.answer(1, 5, decision(7, &[Side::Single]));
+                }
+            })
+            .await;
             assert!(matches!(within(asked).await, Err(Unanswered::Ended)));
             assert!(!peer.link.stands());
             assert_eq!(peer.link.term_floor(), 6);
@@ -974,33 +1018,52 @@ mod tests {
             }
             check_end(session, None).await;
         }
+    }
 
-        let peer = Peer::new(1);
-        drop(peer.requests);
-        assert!(matches!(
-            peer.link.ask(request(1), WAIT).await,
-            Err(Unanswered::Ended)
-        ));
-        assert!(!peer.link.stands());
-        assert!(matches!(
-            peer.link.ended().as_deref(),
-            Some(Error::Status(status)) if status.message() == DECIDE_ENDED
-        ));
-        Peer::readers_end(peer.readers).await;
+    #[tokio::test]
+    async fn a_closed_queue_leaves_the_end_to_its_reader() {
+        for session in [false, true] {
+            let peer = Peer::new(2);
+            let mut asked = pin!(peer.link.ask(request(1), WAIT));
+            assert!(poll(asked.as_mut()).is_pending());
+            if session {
+                drop(peer.reports);
+                let report = release(7, Side::Single, released::Reason::ClientGone);
+                assert!(matches!(peer.link.report(report), Err(Full)));
+            } else {
+                drop(peer.requests);
+                for _ in 0..2 {
+                    assert!(matches!(
+                        peer.link.ask(request(2), WAIT).await,
+                        Err(Unanswered::Ended)
+                    ));
+                }
+            }
+            assert!(peer.link.stands(), "the reader has seen no end");
+            assert!(peer.link.ended().is_none());
+            assert!(poll(asked.as_mut()).is_pending());
 
-        let peer = Peer::new(1);
-        drop(peer.reports);
-        assert!(matches!(
-            peer.link
-                .report(release(7, Side::Single, released::Reason::ClientGone)),
-            Err(Full)
-        ));
-        assert!(!peer.link.stands());
-        assert!(matches!(
-            peer.link.ended().as_deref(),
-            Some(Error::Status(status)) if status.message() == SESSION_ENDED
-        ));
-        Peer::readers_end(peer.readers).await;
+            let status = Status::unavailable("the stream was reset");
+            if session {
+                peer.controller
+                    .expect("the controller stream is open")
+                    .send(Err(status))
+                    .expect("the session reader takes the status");
+            } else {
+                peer.decide
+                    .expect("the decide stream is open")
+                    .send(Err(status))
+                    .expect("the decide reader takes the status");
+            }
+            assert!(matches!(within(asked).await, Err(Unanswered::Ended)));
+            Peer::readers_end(peer.readers).await;
+            assert!(matches!(
+                peer.link.ended().as_deref(),
+                Some(Error::Status(status))
+                    if status.code() == tonic::Code::Unavailable
+                        && status.message() == "the stream was reset"
+            ));
+        }
     }
 
     /// Ends a link by one stream's clean end, by its status or by the
@@ -1008,11 +1071,12 @@ mod tests {
     /// and the link say of it.
     async fn check_end(session: bool, closed: Option<bool>) {
         let mut peer = Peer::new(2);
-        let mut first = Box::pin(peer.link.ask(request(1), WAIT));
-        let mut second = Box::pin(peer.link.ask(request(2), WAIT));
+        let link = peer.link.clone();
+        let mut first = Box::pin(link.ask(request(1), WAIT));
+        let mut second = Box::pin(link.ask(request(2), WAIT));
         assert!(poll(first.as_mut()).is_pending());
         assert!(poll(second.as_mut()).is_pending());
-        match (session, closed) {
+        let end = || match (session, closed) {
             (true, Some(true)) => drop(peer.controller.take()),
             (false, Some(true)) => drop(peer.decide.take()),
             (true, Some(false)) => peer
@@ -1042,7 +1106,8 @@ mod tests {
                     ..Busy::default()
                 }),
             ),
-        }
+        };
+        closes(&link, end).await;
         assert!(matches!(within(first).await, Err(Unanswered::Ended)));
         assert!(matches!(within(second).await, Err(Unanswered::Ended)));
         Peer::readers_end(peer.readers).await;
@@ -1078,6 +1143,31 @@ mod tests {
                 .report(release(7, Side::Single, released::Reason::ClientGone)),
             Err(Full)
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_link_watch_open_has_the_answer_bound() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a listener that answers nothing");
+        let address = listener.local_addr().expect("the listener's address");
+        let endpoint = Endpoint::from_shared(format!("http://{address}")).expect("a URI");
+        let peer = Peer::over(1, endpoint);
+        let open = peer.link.watch_workers(WatchWorkersRequest::default());
+        let opened = timeout(3 * WAIT, open)
+            .await
+            .expect("the watch's open ends inside its room");
+        assert!(
+            matches!(
+                opened,
+                Err(Error::NoAnswer {
+                    what: "the watch's open",
+                    wait: WAIT
+                })
+            ),
+            "{opened:?}"
+        );
+        assert!(peer.link.stands());
     }
 
     #[tokio::test]

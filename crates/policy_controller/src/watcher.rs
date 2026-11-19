@@ -8,7 +8,8 @@
 //! applier uses for a row ([`MemoryStore::follow`]). Nothing is minted: a
 //! row holds the controller's id and revision, and the store's epoch is
 //! the controller's. The watcher keeps the place of the last event it
-//! took, and its next stream goes on after it ([`Watcher::open`]).
+//! took, and its next stream goes on after it ([`Watcher::open`],
+//! [`Watcher::open_on`]).
 //!
 //! **One stream at a time.** A stream is followed through the watcher
 //! ([`Following`]), which borrows it: the watcher takes that stream's
@@ -33,10 +34,10 @@
 //! store. The next stream starts from a snapshot, and what the store held
 //! stands until that snapshot's last page.
 
-use std::{mem, sync::Arc, time::Instant};
+use std::{future::Future, mem, sync::Arc, time::Instant};
 
 use crate::{
-    client::{self, Client, Watch},
+    client::{self, Client, Link, Watch},
     controller::worker_wire::{self, Refused},
     proto::{self, worker_event::Event},
     store::{Cut, MemoryStore, Position, WorkerRow, WorkersStore},
@@ -197,8 +198,20 @@ impl Watcher {
     /// The client's: the open had no answer inside its bound, or the
     /// controller refused it.
     pub async fn open(&mut self, client: &mut Client) -> Result<Following<'_>, client::Error> {
-        let request = self.request();
-        let watch = client.watch_workers(request).await?;
+        self.open_with(move |request| client.watch_workers(request))
+            .await
+    }
+
+    /// Opens the watch as [`Self::open`] does, on the link's channel.
+    pub async fn open_on(&mut self, link: &Link) -> Result<Following<'_>, client::Error> {
+        self.open_with(|request| link.watch_workers(request)).await
+    }
+
+    async fn open_with<F: Future<Output = Result<Watch, client::Error>>>(
+        &mut self,
+        open: impl FnOnce(proto::WatchWorkersRequest) -> F,
+    ) -> Result<Following<'_>, client::Error> {
+        let watch = open(self.request()).await?;
         Ok(Following {
             watcher: self,
             watch,
