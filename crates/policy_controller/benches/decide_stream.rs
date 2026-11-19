@@ -163,16 +163,18 @@
 //! credits stay beneath the next band as its leases stay beneath a report,
 //! and no row's place moves. A handle row tells more dispatches than that
 //! at 64 callers: the load stage keeps a bounded count of them a row
-//! between two reports, far under a band. The bands stand in for the ties
-//! a fleet's leases make: here the reports fix them, and a row whose
-//! decisions fall under more than one count of the tally stops the bench,
-//! its pool having moved. A door pass reads its fleet's three best rows
-//! before its callers and behind them, and stops the bench where their
-//! order or their ties differ. Every wire
-//! row prints how the three best rows of
-//! its measured decisions scored (`ties`, four counts): each alone, the
-//! best alone and the next two alike, the best two alike, all three
-//! alike. Two builds are compared where they print one tally.
+//! between two reports, far under a band. A kind that tells its dispatches
+//! needs one row alone in its least band: from 128 members that band's
+//! rows tie, the dispatches told would take them in turn, and a handle
+//! count is refused. The bands stand in for the ties a fleet's leases
+//! make: here the reports fix them, and a row whose decisions fall under
+//! more than one count of the tally stops the bench, its pool having
+//! moved. A door pass reads its fleet's best rows before its callers and
+//! behind them, and stops the bench where their order or their ties
+//! differ. Every wire row prints how the three best rows of its measured
+//! decisions scored (`ties`, four counts): each alone, the best alone and
+//! the next two alike, the best two alike, all three alike. Two builds are
+//! compared where they print one tally.
 //!
 //! Every row runs on the allocator the binary registers, under a copy of
 //! its settings (`MALLOC_CONF`). A served decision's frame holds lists
@@ -2208,9 +2210,23 @@ const DOOR_DECISIONS: u64 = 16;
 /// dispatches (`told`), as a gateway row's stand. No controller is served
 /// beside it: a store has one host at its files.
 fn door_over(members: u32, told: bool) -> Door {
+    assert!(
+        !told || least_alone(members),
+        "a fleet of {members} members holds more than one row in its least band"
+    );
     let store = MemoryStore::new().with_deciders(1);
     fill(&store, Shape::bar(members, 1, Fleet::Shared, told, 0, 0));
     Door::new(Arc::new(store))
+}
+
+/// Whether one row alone stands in the least band of a fleet of `members`
+/// ([`bands`]): under 128 members. A kind of rows that tells its
+/// dispatches needs it so: the rows of one band tie, and the dispatches
+/// told would take them in turn, a pool that moves with every request.
+fn least_alone(members: u32) -> bool {
+    let bands = bands(members);
+    let least = bands.iter().min();
+    bands.iter().filter(|band| Some(*band) == least).count() == 1
 }
 
 /// The host that asks at the door, as the store names a gateway.
@@ -2220,13 +2236,14 @@ const HOST: GatewayId = GatewayId(1);
 const MOVED: &str =
     "the callers' dispatches moved the pool: its best rows' order or their ties differ";
 
-/// The fleet's three best rows as one decision at the door reads them:
-/// their members in order, and how they score by the places of a wire
-/// row's tally ([`Tally::ties`]). The decision is asked under `probe` and
-/// released at once, so it leaves no lease and no credit behind. A pass
-/// reads it before its callers and behind them: a dispatch told is
-/// credited to its member, and credits that reach the next band would
-/// have the callers decide over a pool no other row holds.
+/// The fleet's best rows as one decision at the door reads them, three
+/// where the fleet holds as many: their members in order, and how three
+/// score by the places of a wire row's tally ([`Tally::ties`]). The
+/// decision is asked under `probe` and released at once, so it leaves no
+/// lease and no credit behind. A pass reads it before its callers and
+/// behind them: a dispatch told is credited to its member, and credits
+/// that reach the next band would have the callers decide over a pool no
+/// other row holds.
 fn pool_at(door: &Door, probe: u64) -> impl PartialEq + std::fmt::Debug {
     let name = model(0);
     let id = probe.to_le_bytes();
@@ -2258,7 +2275,6 @@ fn pool_at(door: &Door, probe: u64) -> impl PartialEq + std::fmt::Debug {
         _ => 0,
     };
     let members: Vec<_> = top.iter().take(3).map(|row| row.0).collect();
-    assert_eq!(members.len(), 3, "a fleet of three rows or more: {trace:?}");
     (members, place)
 }
 
@@ -2571,6 +2587,12 @@ fn count(cell: &str, out: &mut impl Write) -> io::Result<()> {
         cycles: false,
         pair: mode == "pair",
     };
+    if mode == "handle" && !least_alone(shape.members) {
+        return writeln!(
+            out,
+            "a handle count reads a fleet whose least band holds one row: under 128 members"
+        );
+    }
     let (calls, busy) = match mode {
         "in_process" | "commit" => {
             let served = serve(shape);
@@ -2720,7 +2742,14 @@ fn main() -> io::Result<()> {
     if quick && all {
         // A count cell takes any fleet, and one under three members has
         // no third row to trace.
-        for cell in ["stream:1:200", "stream:2:200"] {
+        for cell in [
+            "stream:1:200",
+            "stream:2:200",
+            "door:1:200",
+            "door:2:200",
+            "handle:1:200",
+            "handle:2:200",
+        ] {
             count(cell, &mut out)?;
         }
     }
