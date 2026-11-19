@@ -122,10 +122,10 @@
 //! reads the answer, as a session hands a gateway's frame, so a wire row
 //! holds as many leases as it has decisions in flight (a gateway row,
 //! those of its frames on their way too) and its numbers hold a lease's
-//! issue and its end. A build that
-//! files no lease answers with none: its rows run the same, and every wire
-//! row prints the leases its measured picks carried (`leases`). A row
-//! whose picks carry a lease for some and none for others stops the bench.
+//! issue and its end. A build that files no lease answers with none: its
+//! rows run the same, and every wire row prints the leases its measured
+//! picks carried (`leases`). A row whose picks carry a lease for some and
+//! none for others stops the bench.
 //! `DECIDE_STREAM_ROWS=round_trip`, `offered`, `door`, `rate` or `gateway`
 //! runs one kind alone, and `--test` runs every row for a moment. A run with
 //! no `--bench` is a test too, as criterion reads one: `cargo bench` passes
@@ -592,9 +592,9 @@ const WINDOW: u64 = 128;
 /// An offered request handed over this long after it was due is counted
 /// late: the client's own lag.
 const LATE: Duration = Duration::from_micros(100);
-/// The requests every member reports beneath its band: more than a row has
-/// decisions ([`wire`] checks each row's count), so no count of leases on
-/// file reaches it and a lease on file moves no row's cost.
+/// The requests every member reports beneath its band: more than a wire row
+/// has decisions ([`wire`] checks each row's count), so no count of leases
+/// on file reaches it and a lease on file moves no row's cost.
 const HELD: u32 = 1 << 21;
 /// The requests between two bands of a row that tells its dispatches,
 /// where a row that tells none has one: twice the floor beneath the bands,
@@ -2178,9 +2178,12 @@ fn in_process(store: &MemoryStore, decisions: u64, commit: bool) -> u64 {
 /// one model.
 const DOOR: [(u32, usize); 3] = [(64, 1), (64, 8), (64, 64)];
 
-/// The decisions a door row measures, over a wire stream's: a decision at
-/// the door ends in microseconds, and a stream's count of them would be a
-/// pass under a second.
+/// How many times a wire stream's decisions a door row measures: a decision
+/// at the door ends in microseconds, and a stream's count of them would be
+/// a pass under a second. A door row so asks more decisions than the
+/// [`HELD`] requests beneath a band. None of its leases stays on file: a
+/// caller reports its pick's lease released at once, so about one lease a
+/// caller stands there, far under that floor.
 const DOOR_DECISIONS: u64 = 16;
 
 /// A host's door over a store of one file, its fleet filled as a wire
@@ -2264,12 +2267,27 @@ struct Called {
     counted: Option<(u64, u64)>,
 }
 
+/// Ends the process where a door caller unwinds. A barrier never learns of
+/// a caller that does not arrive: the others would wait there for ever, and
+/// the row would hang where it should fail. The panic's message is printed
+/// before the end.
+struct EndsOnUnwind;
+
+impl Drop for EndsOnUnwind {
+    fn drop(&mut self) {
+        if thread::panicking() {
+            std::process::abort();
+        }
+    }
+}
+
 /// Runs one pass of a door row: `callers` threads at once on one model at
 /// one door, each asking `warm` decisions and then, all from one instant,
 /// `measured`, a caller a core where the process was given as many
 /// ([`GIVEN`]). The rate is the callers' measured decisions together over
 /// the one interval they share, from the first of them to the last. A
-/// `counted` pass opens each caller's counters, and its rate is not read.
+/// `counted` pass opens each caller's counters, and its rate is not read. A
+/// caller that unwinds ends the process ([`EndsOnUnwind`]).
 fn door_pass(members: u32, callers: usize, warm: u64, measured: u64, counted: bool) -> DoorPass {
     let door = Arc::new(door_over(members));
     let cores = GIVEN
@@ -2286,6 +2304,7 @@ fn door_pass(members: u32, callers: usize, warm: u64, measured: u64, counted: bo
                 (Arc::clone(&door), Arc::clone(&start), Arc::clone(&measure));
             let core = cores.as_ref().and_then(|cores| cores.get(index).copied());
             let caller = move || {
+                let _ends = EndsOnUnwind;
                 if let Some(core) = core {
                     assert!(kernel::pin(0, core), "a caller sits on core {core}");
                 }
