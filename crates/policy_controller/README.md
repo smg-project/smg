@@ -587,7 +587,7 @@ Set `explain: {sample: N}` in the policy document. Use a whole number from 0 to 
 
 The first sample at a seat allocates its slots, and the ring overwrites the oldest record when full. The slot storage per decider is 1,024 times the size of a record. A decision keeps its seat when only the sampling rate changes.
 
-Use `Explain` on the control listener with `gateway_id` and `request_id`. A miss returns `NOT_FOUND`. The leader serves this call, with each new term starting empty. A replica that follows returns the leader's address when it knows one. In process, `Door::explain` reads the same key, using the store's gateway id.
+Use `Explain` on the control listener with `gateway_id` and `request_id`. Use the subject the gateway authenticates as on the gateway listener for `gateway_id` because `Explain` hashes it the same way as the decide stream. A miss returns `NOT_FOUND`. The leader serves this call, with each new term starting empty. A replica that follows returns the leader's address when it knows one. In process, `Door::explain` reads the same key, using the store's gateway id.
 
 **Limits**
 
@@ -597,7 +597,7 @@ Use `Explain` on the control listener with `gateway_id` and `request_id`. A miss
 - The view digest is unset.
 - Plugin projections are unset.
 - The lifecycle outcome is unset.
-- Stage and plan names come from the standing generation. An older record keeps its positions and trace.
+- The control call keeps the record's original binding position and trace. `binding` is 0 when no binding matched or when the first binding matched. The name fields are empty for unmatched decisions and records from older generations.
 
 ## A stage of your own
 
