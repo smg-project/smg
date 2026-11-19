@@ -3716,6 +3716,30 @@ fn a_door_that_waited_behind_a_claim_files_its_id_where_the_claim_named_it() {
     assert!(LeasesStore::get(store, gateway, by_hand.lease.id).is_some());
 }
 
+/// Once the store's term is past 31 bits no decider mints and no term
+/// leads the blocks anew, so the doors file every id where it reads its
+/// file: an id of the last term from a block no decider claimed, and an
+/// id of a term that never led here. A restore keeps both.
+#[test]
+fn the_doors_file_every_id_once_the_term_is_past_31_bits() {
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    let by_hand = |term: u64, counter: u64| lease(gateway, term << 32 | counter, term, now);
+    let store = MemoryStore::new().with_deciders(2);
+    LeasesStore::set_term(&store, 4);
+    let doors: &dyn LeasesStore = &store;
+    let (unclaimed, never) = (by_hand(4, 9), by_hand(10, 5 << 20 | 1));
+    assert_eq!(doors.issue(unclaimed), Err(LeaseRefused::Unclaimed));
+    LeasesStore::set_term(&store, 1 << 31);
+    assert_eq!(
+        (doors.issue(unclaimed), doors.issue(never)),
+        (Ok(()), Ok(()))
+    );
+    let on_file = |record: LeaseRecord| doors.get(gateway, record.lease.id).is_some();
+    assert!(on_file(unclaimed) && on_file(never));
+    assert_eq!(doors.restore(gateway, &[unclaimed, never]), 2);
+    assert!(on_file(unclaimed) && on_file(never));
+}
+
 /// The most deciders a host names each issue a first lease: every id is
 /// far below its term's mark, three quarters of the counter, so no count
 /// of deciders hands a term over at its first leases.
