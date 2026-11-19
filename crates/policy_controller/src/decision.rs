@@ -171,7 +171,7 @@ impl fmt::Debug for Survivors {
 /// picks from. The rule's own pick writes it, and so does the pick of a
 /// session key kept on its worker where the veto as it stands kept no
 /// worker. A key handed on at its sessions rule's in-flight cap writes it
-/// too, where the veto as it stands kept no worker under the cap. Every
+/// too, where the veto as it stands kept no worker. Every
 /// other pick reads `None`, the default. One mark is the decision's, since
 /// the pick and its alternates are of the one lifted pool. The mark sits in
 /// a byte the record had spare: the trace is no larger for it.
@@ -225,7 +225,7 @@ pub struct Trace {
     pub generation: u64,
     /// The soft veto lifted for this pick ([`Lifted`]): `None` unless that
     /// veto as it stands left the pool nobody, or left a key handed on at
-    /// its sessions rule's in-flight cap nobody under the cap.
+    /// its sessions rule's in-flight cap nobody.
     pub lifted: Lifted,
 }
 

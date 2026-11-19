@@ -18,14 +18,19 @@ use parking_lot::{Mutex, MutexGuard};
 use rustc_hash::{FxHashMap, FxHasher};
 
 use crate::{
+    affinity::WarmRule,
     counts::{with_counts, LentCounts, Pieces, Slot},
     decision::{Target, Targets, MAX_TARGETS},
     framework::{
-        top_drawn, top_pass, Filter, Front, Narrowed, Picker, Scorer, TieBand, Unit, DRAW_BOUND,
+        top_drawn, top_pass, Filter, Front, Narrowed, Picker, Scorer, Spread, TieBand, Unit,
+        DRAW_BOUND,
     },
     lease::{Lease, Lifecycle, Membership, Side, Signal},
     spec::Needs,
-    view::{Candidate, Constraints, LoadRow, ModelFingerprint, PoolFacts, RequestFacts, WorkerId},
+    view::{
+        Candidate, Constraints, LoadRow, ModelFingerprint, PoolFacts, ReportCutoff, RequestFacts,
+        WorkerId,
+    },
     Draw,
 };
 
@@ -45,6 +50,11 @@ pub struct Healthy;
 impl Filter for Healthy {
     fn name(&self) -> &'static str {
         "healthy"
+    }
+
+    // Refuses by a row's health bits and its host's mask.
+    fn refuses_by_reports(&self) -> bool {
+        false
     }
 
     fn row_wise(&self) -> bool {
@@ -83,6 +93,11 @@ impl Filter for OwnBits {
         "healthy"
     }
 
+    // Refuses by a row's health bits.
+    fn refuses_by_reports(&self) -> bool {
+        false
+    }
+
     fn keep(&self, _: &RequestFacts<'_>, c: &Candidate, _: &Constraints<'_>) -> bool {
         c.health.routable_ignoring_overload()
     }
@@ -105,6 +120,11 @@ impl Filter for NotOverloaded {
         "not-overloaded"
     }
 
+    // Refuses by the overload bit of a row's health, unless its host lifts it.
+    fn refuses_by_reports(&self) -> bool {
+        false
+    }
+
     fn row_wise(&self) -> bool {
         true
     }
@@ -121,6 +141,11 @@ pub struct HasCapacity;
 impl Filter for HasCapacity {
     fn name(&self) -> &'static str {
         "has-capacity"
+    }
+
+    // Refuses by a bit its host supplies.
+    fn refuses_by_reports(&self) -> bool {
+        false
     }
 
     fn row_wise(&self) -> bool {
@@ -141,6 +166,11 @@ pub struct HasRoom;
 impl Filter for HasRoom {
     fn name(&self) -> &'static str {
         "has-room"
+    }
+
+    // Refuses by a bit its host supplies.
+    fn refuses_by_reports(&self) -> bool {
+        false
     }
 
     fn row_wise(&self) -> bool {
@@ -164,6 +194,11 @@ pub struct NotTried;
 impl Filter for NotTried {
     fn name(&self) -> &'static str {
         "not-tried"
+    }
+
+    // Refuses by the request's own tried list and its host's exclusions.
+    fn refuses_by_reports(&self) -> bool {
+        false
     }
 
     fn row_wise(&self) -> bool {
@@ -265,6 +300,127 @@ impl RowTests {
 
 // ---------------------------------------------------------------- scorers
 
+/// A scorer that can read reports through a decision's cutoff. The bare
+/// scorer reads the row directly, and the document wraps it only when it
+/// sets a limit.
+pub(crate) trait ReadsLoad: Scorer {
+    fn score_with(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        out: &mut [f32],
+        load: impl Fn(&Candidate) -> Option<LoadRow> + Copy,
+    ) -> TieBand;
+
+    fn score_front_with(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        _kept: &[u32],
+        asked: &[u32],
+        out: &mut [f32],
+        load: impl Fn(&Candidate) -> Option<LoadRow> + Copy,
+    ) -> (TieBand, Front) {
+        (
+            self.score_with(facts, candidates, asked, out, load),
+            Front::Unsaid,
+        )
+    }
+}
+
+#[derive(Debug)]
+struct ReportAge<S> {
+    stage: S,
+    max_age_ms: u64,
+}
+
+pub(crate) fn with_report_age(
+    stage: impl ReadsLoad + 'static,
+    max_age_ms: Option<u64>,
+) -> Box<dyn Scorer> {
+    match max_age_ms {
+        Some(max_age_ms) => Box::new(ReportAge { stage, max_age_ms }),
+        None => Box::new(stage),
+    }
+}
+
+impl<S: ReadsLoad> Lifecycle for ReportAge<S> {
+    fn on_dispatched(
+        &self,
+        lease: &Lease,
+        target: &Target,
+        side: Side,
+        since_decision_micros: u32,
+    ) {
+        self.stage
+            .on_dispatched(lease, target, side, since_decision_micros);
+    }
+
+    fn on_membership(&self, change: &Membership<'_>) {
+        self.stage.on_membership(change);
+    }
+
+    fn on_signal(&self, signal: &Signal) {
+        self.stage.on_signal(signal);
+    }
+
+    fn keeps_loads(&self) -> bool {
+        self.stage.keeps_loads()
+    }
+}
+
+impl<S: ReadsLoad> Scorer for ReportAge<S> {
+    fn name(&self) -> &'static str {
+        self.stage.name()
+    }
+
+    fn score(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        out: &mut [f32],
+    ) -> TieBand {
+        let cutoff = ReportCutoff::new(facts.now_micros, self.max_age_ms);
+        self.stage
+            .score_with(facts, candidates, kept, out, |row| cutoff.load(row))
+    }
+
+    fn score_front(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        asked: &[u32],
+        out: &mut [f32],
+    ) -> (TieBand, Front) {
+        let cutoff = ReportCutoff::new(facts.now_micros, self.max_age_ms);
+        self.stage
+            .score_front_with(facts, candidates, kept, asked, out, |row| cutoff.load(row))
+    }
+
+    fn row_wise(&self) -> bool {
+        self.stage.row_wise()
+    }
+
+    fn front_wise(&self) -> bool {
+        self.stage.front_wise()
+    }
+
+    fn spread(&self) -> Spread {
+        self.stage.spread()
+    }
+
+    fn needs(&self) -> Needs {
+        self.stage.needs()
+    }
+
+    fn warm_rule(&self) -> Option<WarmRule> {
+        self.stage.warm_rule()
+    }
+}
+
 /// The rows whose least and greatest cost are found by compares
 /// ([`normalize_costs`]): the ranks of one engine, the rows of a draw.
 const FEW_COSTS: usize = 16;
@@ -315,6 +471,11 @@ impl Scorer for LeastRequests {
         "least-requests"
     }
 
+    // Scores by the count in flight: a late count moves the pick.
+    fn refuses_by_reports(&self) -> bool {
+        false
+    }
+
     fn score(
         &self,
         facts: &RequestFacts<'_>,
@@ -341,6 +502,11 @@ impl Lifecycle for SessionAffinity {}
 impl Scorer for SessionAffinity {
     fn name(&self) -> &'static str {
         "session-affinity"
+    }
+
+    // Scores by the session's hit on a row.
+    fn refuses_by_reports(&self) -> bool {
+        false
     }
 
     fn score(
@@ -384,6 +550,11 @@ impl Lifecycle for FewestSessions {}
 impl Scorer for FewestSessions {
     fn name(&self) -> &'static str {
         "fewest-sessions"
+    }
+
+    // Scores by the sessions a row holds: a late count moves the pick.
+    fn refuses_by_reports(&self) -> bool {
+        false
     }
 
     fn score(
@@ -1085,10 +1256,15 @@ impl LeastLoad {
 
     /// The mean rate of the kept rows that report one, which a report
     /// without a rate drains at: the default where none reports one.
-    fn mean_rate(&self, candidates: &[Candidate], kept: &[u32]) -> f32 {
+    fn mean_rate(
+        &self,
+        candidates: &[Candidate],
+        kept: &[u32],
+        load: impl Fn(&Candidate) -> Option<LoadRow>,
+    ) -> f32 {
         let (sum, n) = kept
             .iter()
-            .filter_map(|&i| candidates[i as usize].load)
+            .filter_map(|&i| load(&candidates[i as usize]))
             .filter(|r| r.live_rate > 0)
             .fold((0.0f32, 0u32), |(s, n), r| (s + r.live_rate as f32, n + 1));
         if n > 0 && sum.is_finite() {
@@ -1110,6 +1286,7 @@ impl LeastLoad {
         rows: &[u32],
         nominal: f32,
         out: &mut [f32],
+        load: impl Fn(&Candidate) -> Option<LoadRow>,
     ) -> TieBand {
         // One load of the tally: each reporting row's held work is read
         // (released first when its report's sample reaches a dispatch) and
@@ -1122,7 +1299,7 @@ impl LeastLoad {
             with_counts!(facts, |counts| {
                 for (slot, &i) in out.iter_mut().zip(rows) {
                     let c = &candidates[i as usize];
-                    *slot = match c.load {
+                    *slot = match load(c) {
                         Some(_) => {
                             let (tokens, requests) =
                                 tally.get(&(c.id, c.dp_rank)).map_or((0, 0), |since| {
@@ -1137,7 +1314,7 @@ impl LeastLoad {
             });
         }
         for (slot, &i) in out.iter_mut().zip(rows) {
-            if let Some(r) = candidates[i as usize].load {
+            if let Some(r) = load(&candidates[i as usize]) {
                 *slot = self.reported_cost(r, *slot, nominal);
             }
         }
@@ -1187,6 +1364,11 @@ impl Scorer for LeastLoad {
         "least-load"
     }
 
+    // Costs by the count in flight and its credits: late ones move the pick.
+    fn refuses_by_reports(&self) -> bool {
+        false
+    }
+
     fn row_wise(&self) -> bool {
         true
     }
@@ -1205,12 +1387,44 @@ impl Scorer for LeastLoad {
         kept: &[u32],
         out: &mut [f32],
     ) -> TieBand {
+        self.score_with(facts, candidates, kept, out, |c| c.load)
+    }
+
+    fn score_front(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        asked: &[u32],
+        out: &mut [f32],
+    ) -> (TieBand, Front) {
+        self.score_front_with(facts, candidates, kept, asked, out, |c| c.load)
+    }
+
+    fn needs(&self) -> Needs {
+        Needs {
+            loads: true,
+            ..Needs::default()
+        }
+    }
+}
+
+impl ReadsLoad for LeastLoad {
+    fn score_with(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        out: &mut [f32],
+        load: impl Fn(&Candidate) -> Option<LoadRow> + Copy,
+    ) -> TieBand {
         self.costs(
             facts,
             candidates,
             kept,
-            self.mean_rate(candidates, kept),
+            self.mean_rate(candidates, kept, load),
             out,
+            load,
         )
     }
 
@@ -1231,17 +1445,18 @@ impl Scorer for LeastLoad {
     /// span, as one behind the front widens the pool's. Among every row, a
     /// difference that is a small enough share of the pool's span falls
     /// under the last bit of a profile's sum, and the rows are drawn among.
-    fn score_front(
+    fn score_front_with(
         &self,
         facts: &RequestFacts<'_>,
         candidates: &[Candidate],
         kept: &[u32],
         asked: &[u32],
         out: &mut [f32],
+        load: impl Fn(&Candidate) -> Option<LoadRow> + Copy,
     ) -> (TieBand, Front) {
         let mut rated = true;
         for &i in asked {
-            let Some(report) = candidates[i as usize].load else {
+            let Some(report) = load(&candidates[i as usize]) else {
                 return (TieBand::NORMALIZED, Front::Whole);
             };
             rated &= report.live_rate > 0;
@@ -1251,19 +1466,12 @@ impl Scorer for LeastLoad {
         let nominal = if rated {
             self.default_throughput
         } else {
-            self.mean_rate(candidates, kept)
+            self.mean_rate(candidates, kept, load)
         };
         (
-            self.costs(facts, candidates, asked, nominal, out),
+            self.costs(facts, candidates, asked, nominal, out, load),
             Front::Unsaid,
         )
-    }
-
-    fn needs(&self) -> Needs {
-        Needs {
-            loads: true,
-            ..Needs::default()
-        }
     }
 }
 
@@ -1667,10 +1875,11 @@ impl ResidentWork {
         &self,
         tally: &FxHashMap<RankKey, Arc<SinceReport>>,
         row: &Candidate,
+        report: Option<LoadRow>,
         in_flight: impl FnOnce() -> u32,
         reporting: &mut usize,
     ) -> f32 {
-        let Some(r) = row.load else {
+        let Some(r) = report else {
             return PENDING;
         };
         let (tokens, requests) = tally.get(&(row.id, row.dp_rank)).map_or((0, 0), |since| {
@@ -1708,6 +1917,7 @@ impl ResidentWork {
         candidates: &[Candidate],
         kept: &[u32],
         out: &mut [f32],
+        load: impl Fn(&Candidate) -> Option<LoadRow>,
     ) -> usize {
         let mut reporting = 0usize;
         let run = lent.run();
@@ -1715,9 +1925,10 @@ impl ResidentWork {
         let mut tally = None;
         for (slot, &i) in out.iter_mut().zip(kept) {
             let c = &candidates[i as usize];
-            *slot = match &c.load {
+            let report = load(c);
+            *slot = match report {
                 None => PENDING,
-                Some(report) if report.resident_counted => {
+                Some(counted) if counted.resident_counted => {
                     let in_flight = run.of(c);
                     let cell = self.kept.cell_from(first, run.slot_of(c));
                     match cell.and_then(|cell| cell.read(c)) {
@@ -1727,7 +1938,8 @@ impl ResidentWork {
                         }
                         _ => {
                             let tally = tally.get_or_insert_with(|| self.credits.tally.load());
-                            let cost = self.cost_reported(tally, c, || in_flight, &mut reporting);
+                            let cost =
+                                self.cost_reported(tally, c, report, || in_flight, &mut reporting);
                             // The report's first decision keeps the
                             // rank's number from here on.
                             if cell.is_some_and(|cell| cell.awaits(c)) {
@@ -1739,7 +1951,7 @@ impl ResidentWork {
                 }
                 Some(_) => {
                     let tally = tally.get_or_insert_with(|| self.credits.tally.load());
-                    self.cost_reported(tally, c, || run.of(c), &mut reporting)
+                    self.cost_reported(tally, c, report, || run.of(c), &mut reporting)
                 }
             };
         }
@@ -1752,12 +1964,18 @@ impl ResidentWork {
     /// Out of line: inside the score, beside the other loop, it read two
     /// instructions a row more than it did before.
     #[inline(never)]
-    fn cost_own(&self, candidates: &[Candidate], kept: &[u32], out: &mut [f32]) -> usize {
+    fn cost_own(
+        &self,
+        candidates: &[Candidate],
+        kept: &[u32],
+        out: &mut [f32],
+        load: impl Fn(&Candidate) -> Option<LoadRow>,
+    ) -> usize {
         let mut reporting = 0usize;
         let tally = self.credits.tally.load();
         for (slot, &i) in out.iter_mut().zip(kept) {
             let c = &candidates[i as usize];
-            *slot = self.cost_reported(&tally, c, || c.in_flight, &mut reporting);
+            *slot = self.cost_reported(&tally, c, load(c), || c.in_flight, &mut reporting);
         }
         reporting
     }
@@ -1858,6 +2076,11 @@ impl Scorer for ResidentWork {
         "resident-work"
     }
 
+    // Costs by the count in flight and its credits: late ones move the pick.
+    fn refuses_by_reports(&self) -> bool {
+        false
+    }
+
     /// The rows a picker drew are costed among themselves, as the
     /// least-load scorer costs them: a row with no report, or whose report
     /// counts no resident tokens, is costed against the rows handed.
@@ -1872,12 +2095,34 @@ impl Scorer for ResidentWork {
         kept: &[u32],
         out: &mut [f32],
     ) -> TieBand {
+        self.score_with(facts, candidates, kept, out, |c| c.load)
+    }
+
+    fn needs(&self) -> Needs {
+        Needs {
+            loads: true,
+            ..Needs::default()
+        }
+    }
+}
+
+impl ReadsLoad for ResidentWork {
+    fn score_with(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        out: &mut [f32],
+        load: impl Fn(&Candidate) -> Option<LoadRow> + Copy,
+    ) -> TieBand {
         // A loop a kind of host. The loop beside a lent table stands here;
         // the loop of a host that lends no counts is a call, and stays the
-        // one it was before a number was kept.
+        // one it was before a number was kept. Each reads a row's report
+        // through `load`: a row past a decision's cutoff has none, so no
+        // cell and no tally is read for it.
         let reporting = match facts.lent_in_flight {
-            Some(lent) => self.cost_lent(lent, candidates, kept, out),
-            None => self.cost_own(candidates, kept, out),
+            Some(lent) => self.cost_lent(lent, candidates, kept, out, load),
+            None => self.cost_own(candidates, kept, out, load),
         };
         if reporting < kept.len() {
             self.cost_pending(facts, candidates, kept, out, reporting > 0);
@@ -1889,13 +2134,6 @@ impl Scorer for ResidentWork {
             TieBand((TIE_EPSILON_SECS / span).min(1.0))
         } else {
             TieBand::NORMALIZED
-        }
-    }
-
-    fn needs(&self) -> Needs {
-        Needs {
-            loads: true,
-            ..Needs::default()
         }
     }
 }
@@ -2331,6 +2569,11 @@ impl Picker for Best {
         "best"
     }
 
+    // Picks the best score of the rows kept.
+    fn refuses_by_reports(&self) -> bool {
+        false
+    }
+
     /// The targets are the best of the rows handed: a rank may put rows in
     /// front of this picker.
     fn front_wise(&self) -> bool {
@@ -2384,6 +2627,11 @@ impl Lifecycle for SampledBest {}
 impl Picker for SampledBest {
     fn name(&self) -> &'static str {
         "best"
+    }
+
+    // Picks the best score of the rows it draws.
+    fn refuses_by_reports(&self) -> bool {
+        false
     }
 
     /// The targets are the best of the rows handed: a rank may put rows in
@@ -2478,6 +2726,11 @@ impl Picker for Passthrough {
         "passthrough"
     }
 
+    // Picks the rows in the order handed.
+    fn refuses_by_reports(&self) -> bool {
+        false
+    }
+
     fn draws_first(&self) -> bool {
         true
     }
@@ -2538,6 +2791,11 @@ impl Lifecycle for Random {}
 impl Picker for Random {
     fn name(&self) -> &'static str {
         "random"
+    }
+
+    // Picks by its draw.
+    fn refuses_by_reports(&self) -> bool {
+        false
     }
 
     fn draws_first(&self) -> bool {
@@ -2649,6 +2907,11 @@ impl Lifecycle for Manual {}
 impl Picker for Manual {
     fn name(&self) -> &'static str {
         "manual"
+    }
+
+    // Declines by the placement its request's rule names, never by a count.
+    fn refuses_by_reports(&self) -> bool {
+        false
     }
 
     fn pick(
@@ -2775,6 +3038,11 @@ impl Picker for PowerOfTwo {
         "power-of-two"
     }
 
+    // Picks the better score of two draws.
+    fn refuses_by_reports(&self) -> bool {
+        false
+    }
+
     fn draws_first(&self) -> bool {
         true
     }
@@ -2845,6 +3113,11 @@ impl Lifecycle for CountFirst {}
 impl Picker for CountFirst {
     fn name(&self) -> &'static str {
         "count-first"
+    }
+
+    // Picks the fewest in flight: a late count moves the pick.
+    fn refuses_by_reports(&self) -> bool {
+        false
     }
 
     /// The targets are the best of the rows handed: a rank may put rows in
@@ -2962,6 +3235,11 @@ impl Lifecycle for PowerOfTwoCountFirst {}
 impl Picker for PowerOfTwoCountFirst {
     fn name(&self) -> &'static str {
         "power-of-two-count-first"
+    }
+
+    // Picks the fewer in flight of two draws: a late count moves the pick.
+    fn refuses_by_reports(&self) -> bool {
+        false
     }
 
     fn draws_first(&self) -> bool {
@@ -3185,6 +3463,11 @@ impl Lifecycle for RoundRobin {}
 impl Picker for RoundRobin {
     fn name(&self) -> &'static str {
         "round-robin"
+    }
+
+    // Picks by its rotation.
+    fn refuses_by_reports(&self) -> bool {
+        false
     }
 
     fn draws_first(&self) -> bool {
@@ -6876,6 +7159,72 @@ mod tests {
         assert_eq!(number, None, "the number steps aside");
         alike(&rows, "the member's row as it stands");
         assert_eq!(kept_of(&told, slots[0], &rows[0]), Some((1_700.0, 1)));
+    }
+
+    /// A stage under a report-age limit is told its reports through the
+    /// limit's wrapper and keeps their numbers. A row past the limit is
+    /// read as unreported before its cell: it scores as under a stage told
+    /// nothing, though the cell still holds its number.
+    #[test]
+    fn a_row_past_the_report_age_limit_is_read_without_its_kept_number() {
+        let mut rows = [candidate(0, 1), candidate(1, 1), candidate(2, 1)];
+        rows[0].load = Some(resident(1, 1_000));
+        rows[1].load = Some(resident(1, 500));
+        rows[2].load = Some(resident(1, 40_000));
+        // The member under test was sampled 8 ms ahead of its peers.
+        rows[0].load_sampled_at_micros = 12_000;
+        rows[1].load_sampled_at_micros = 20_000;
+        rows[2].load_sampled_at_micros = 20_000;
+        let lent = Lent::take(&mut rows);
+        let slots = [0, 1, 2].map(|at: usize| lent.slot_of(&rows[at]));
+        let limited = || ReportAge {
+            stage: ResidentWork::new(700),
+            max_age_ms: 10,
+        };
+        let (told, untold) = (limited(), limited());
+        assert!(told.keeps_loads(), "the wrapper says what its stage keeps");
+        let scores = |stage: &ReportAge<ResidentWork>, now_micros: u64| {
+            let facts = lent.beside(&RequestFacts {
+                now_micros,
+                ..RequestFacts::default()
+            });
+            let mut out = [0.0f32; 3];
+            stage.score(&facts, &rows, &kept(3), &mut out);
+            out.map(f32::to_bits)
+        };
+        for (row, slot) in rows.iter().zip(slots) {
+            told.on_signal(&Signal::Load {
+                worker: row.id,
+                dp_rank: row.dp_rank,
+                row: row.load.expect("a report"),
+                slot,
+                sampled_at_micros: row.load_sampled_at_micros,
+            });
+        }
+
+        // Every report within the limit: the first decision keeps the
+        // numbers, the second reads them.
+        let within = scores(&untold, 21_000);
+        assert_eq!(scores(&told, 21_000), within, "within the limit");
+        assert_eq!(
+            scores(&told, 21_000),
+            within,
+            "within the limit: by the number"
+        );
+        let number = kept_of(&told.stage, slots[0], &rows[0]);
+        assert_eq!(number, Some((1_700.0, 1)), "told through the wrapper");
+
+        // Two milliseconds on the member's report is past the limit: its
+        // row is costed against its peers, as a row with no report is.
+        let past = scores(&untold, 23_000);
+        assert_ne!(past, within, "the row past the limit scores apart");
+        assert_eq!(scores(&told, 23_000), past, "past the limit");
+        assert_eq!(
+            kept_of(&told.stage, slots[0], &rows[0]),
+            number,
+            "the cell holds it still"
+        );
+        assert_eq!(scores(&told, 21_000), within, "within the limit again");
     }
 
     /// A told stage beside a stage told nothing through a long walk of a

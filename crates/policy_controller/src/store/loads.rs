@@ -49,12 +49,10 @@ pub enum PollMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LoadSample {
     pub row: LoadRow,
-    /// When the store received it, on the host's clock: what the poll
-    /// decision reads.
+    /// A pushed row's receipt or a poll's start, on the host's clock.
     pub received_at: Instant,
-    /// When the engine's state behind it was sampled: the receipt less the
-    /// row's age. A load scorer releases the dispatches it made at or
-    /// before it.
+    /// When the state behind the report was sampled, on the host's clock.
+    /// A load scorer releases the dispatches it made at or before it.
     pub sampled_at: Instant,
     pub source: LoadSource,
 }
@@ -134,6 +132,21 @@ pub trait LoadSink: Send + Sync {
         polled_at: Instant,
         source: LoadSource,
     ) -> Vec<usize>;
+
+    /// A poll answer with a known sample instant, on the host's clock.
+    /// The rows carry the age at receipt. The sample instant may lie
+    /// before or during the poll, whose start still arbitrates with
+    /// pushed records. A sink that only keeps the rows can use `report`.
+    fn report_sampled(
+        &self,
+        answer: &[(WorkerId, u16, Option<LoadRow>)],
+        polled_at: Instant,
+        sampled_at: Instant,
+        source: LoadSource,
+    ) -> Vec<usize> {
+        let _ = sampled_at;
+        self.report(answer, polled_at, source)
+    }
 
     /// The poll decision for the worker at `now` under the poll `interval`.
     fn poll_mode(&self, id: WorkerId, now: Instant, interval: Duration) -> PollMode;

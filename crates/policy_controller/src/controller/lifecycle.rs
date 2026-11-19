@@ -18,11 +18,11 @@
 //! who is present, never with what a frame names.
 //!
 //! What a frame says of a lease is handed to the leases' file, never
-//! written by its session ([`MemoryStore::hand`]): whoever holds the
-//! file's turn next applies it, a decider at work or the session itself
-//! where none is, in the order the frames were read. A `Decide` stream
-//! hands the release of a decision it stops at its send through a hand
-//! of its own ([`open`]).
+//! written by its session ([`MemoryStore::hand`]): the file's decider
+//! applies it where it is at work or keeps its watch over the file, and
+//! the session itself where it does neither, in the order the frames
+//! were read. A `Decide` stream hands the release of a decision it stops
+//! at its send through a hand of its own ([`open`]).
 //!
 //! A frame whose lease is on file tells the engine that issued it, the
 //! generation's own, what became of the decision: its dispatch, its

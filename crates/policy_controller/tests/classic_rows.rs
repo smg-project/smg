@@ -70,6 +70,7 @@ mod classic {
     pub mod pair_index;
     pub mod power_of_two;
     pub mod prefix_hash;
+    pub mod sticky_override;
     pub mod sticky_rank;
 }
 
@@ -274,7 +275,7 @@ const fn module<R: Recorded>(inline: &'static str) -> Module {
 /// An encode-pair row is replayed in its store part by its own module;
 /// its copied rows name no runtime either, and the pair index's rule
 /// holds them.
-const MODULES: [Module; 11] = [
+const MODULES: [Module; 12] = [
     module::<classic::all_vetoed::Row>(classic::all_vetoed::INLINE),
     module::<classic::bucket::Row>(classic::bucket::INLINE),
     module::<classic::cache_aware::Row>(classic::cache_aware::INLINE),
@@ -310,6 +311,7 @@ const MODULES: [Module; 11] = [
         replay: classic::prefix_hash::replay_rows,
         copied: copied_row_defects,
     },
+    module::<classic::sticky_override::Row>(classic::sticky_override::INLINE),
     Module {
         policy: classic::sticky_rank::POLICY,
         inline: classic::sticky_rank::INLINE,
@@ -602,6 +604,13 @@ fn the_classic_overload_rows_replay_verdict_for_verdict() {
 #[test]
 fn the_classic_prefix_hash_rows_replay_pick_for_pick_and_share_for_share() {
     let (rows, defects) = replay_sheet(classic::prefix_hash::INLINE, "the inline rows");
+    assert!(rows >= 8, "{rows} inline rows");
+    assert!(defects.is_empty(), "{defects:#?}");
+}
+
+#[test]
+fn the_classic_sticky_override_rows_replay_pick_for_pick_and_share_for_share() {
+    let (rows, defects) = replay_sheet(classic::sticky_override::INLINE, "the inline rows");
     assert!(rows >= 8, "{rows} inline rows");
     assert!(defects.is_empty(), "{defects:#?}");
 }
@@ -1090,6 +1099,7 @@ fn every_json_file_of_the_directory_is_a_sheet_to_answer_for() {
             "pair-index.json",
             "power_of_two.json",
             "prefix_hash.json",
+            "sticky_override.json",
             "sticky_rank.json",
             "stray.json",
         ]

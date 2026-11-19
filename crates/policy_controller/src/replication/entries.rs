@@ -60,6 +60,7 @@ pub const ENTRIES: &[(&str, &str, Fate)] = &[
     // standby holds the verdict of the engine's last rows until its own
     // first poll.
     ("LoadSink", "report", Fate::Journaled),
+    ("LoadSink", "report_sampled", Fate::Journaled),
     ("LoadSink", "poll_mode", Fate::Read),
     // The report period is the load driver's own setting, told where the
     // driver is built: every replica builds its own.

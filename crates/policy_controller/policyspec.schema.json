@@ -96,6 +96,16 @@
           "maximum": 8190,
           "default": 256
         },
+        "max_report_age_ms": {
+          "description": "Maximum load report age in milliseconds. Built-in scorers use their\nunreported path for a sample older than this at the decision's instant.\nOmit to use reports of any age.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 1,
+          "maximum": 3599999
+        },
         "labels": {
           "description": "The worker labels a stage may read, each a selector of one label\nkey: `key` (the worker carries the label, whatever its value) or\n`key=value` (it carries the label with that value), split at the\nfirst `=`. A worker's row holds one bit for each selector it meets,\nin this order. At most 64; empty for none.",
           "type": "array",
@@ -1207,7 +1217,7 @@
           "default": "delegate"
         },
         "inflight_cap": {
-          "description": "How many requests of one key a worker carries before the next steps\naside; above zero (default 2), `65535` for no cap.",
+          "description": "How many requests of one key a worker carries before the next is\nplaced again; above zero (default 2), `65535` for no cap. At the cap\nthe stages place the request over every usable worker, and the pin\nmoves only to another worker under the cap.",
           "type": "integer",
           "format": "uint16",
           "minimum": 1,

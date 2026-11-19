@@ -41,10 +41,11 @@ bindings:
 | `match: { model: "*" }` | This binding matches every model. |
 | `profile: default` | A matching request uses the profile `default`. |
 
-Four more rules:
+A few more rules:
 
 - `filter` and `score` may be left out. `pick` is required.
 - With one profile, `bindings` may be left out. The profile then serves every request. With two profiles or more, the bindings are required.
+- `view.max_report_age_ms` is optional and takes a whole number from 1 to 3,599,999. At decision time, built-in load scorers treat a report older than the limit like a missing report. A report exactly at the limit still counts. Omit the limit to use reports of any age.
 - A field the format does not know is refused by name. Nothing is ignored.
 - The document has no `kind` line. A document that writes one is refused.
 
@@ -459,10 +460,10 @@ The `manual` preset is a **sessions rule** and nothing else. A rule sits on a bi
 | `assignment` | `delegate` | How a new key gets its worker: `random`, `min_load` (the fewest running requests), `min_group` (the fewest active keys) or `delegate` (the profile's own stages). |
 | `ttl_s` | 14400 | Seconds an idle key stays remembered. |
 | `sweep_s` | 120 | Seconds between two sweeps of idle keys. |
-| `inflight_cap` | 2 | Requests of one key a worker carries before the next one goes elsewhere. `65535` means no cap. |
+| `inflight_cap` | 2 | Requests of one key a worker carries before the next one is placed again, over every usable worker. The key's worker changes only to another worker under the cap. `65535` means no cap. |
 | `recovery` | `original` | Which worker leads when both of a key's workers are usable: `original`, the first, or `latest`. |
 
-One more rule for the hash ring. Under `consistent_hashing`, a key stays on its worker while that worker is over the overload thresholds. `overload.shed_when_all_vetoed: true` on the binding moves the key to the ring's next worker instead.
+One more rule for the hash ring. Under `consistent_hashing`, a key stays on its worker while that worker is over the overload thresholds. `overload.shed_when_all_vetoed: true` on the binding moves the key to the ring's next worker instead. At the in-flight cap the ring places the request on the key's worker again, so the cap moves the key only where the overload veto drops that worker.
 
 ## Loading and changing a document
 
