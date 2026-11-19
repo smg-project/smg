@@ -1843,6 +1843,25 @@ fn is_legacy_space_replace(step: &NormalizerWrapper) -> bool {
             .is_some_and(|pattern| pattern == serde_json::json!({"String": " "}))
 }
 
+impl HuggingFaceTokenizer {
+    /// The Unigram arm of `encode`. Never inlined: with the Unigram encoder
+    /// inlined there, `encode` came out longer, and a WordPiece encode,
+    /// which returns above this arm, took three to five instructions more
+    /// per token at identical work. As a call, the arms above pay nothing
+    /// for it and a Unigram encode pays the call.
+    #[inline(never)]
+    fn encode_unigram(
+        &self,
+        unigram: &UnigramEncoder,
+        input: &str,
+        add_special_tokens: bool,
+    ) -> Option<Encoding> {
+        unigram
+            .encode(&self.core.tokenizer, input, add_special_tokens)
+            .map(Encoding::Plain)
+    }
+}
+
 impl Encoder for HuggingFaceTokenizer {
     fn encode(&self, input: &str, add_special_tokens: bool) -> Result<Encoding> {
         #[cfg(feature = "tokenizers-v1")]
@@ -1885,8 +1904,8 @@ impl Encoder for HuggingFaceTokenizer {
         // tokenizer is the one it was made from. It returns nothing when a
         // kind is another, and the encode then runs in `tokenizers`.
         if let Some(unigram) = &self.core.unigram {
-            if let Some(ids) = unigram.encode(&self.core.tokenizer, input, add_special_tokens) {
-                return Ok(Encoding::Plain(ids));
+            if let Some(encoding) = self.encode_unigram(unigram, input, add_special_tokens) {
+                return Ok(encoding);
             }
         }
         self.core
