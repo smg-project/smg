@@ -528,8 +528,9 @@ pub(crate) struct TranslatedMedia {
     pub(crate) aux_frames: Vec<Bytes>,
     pub(crate) cache_salt: Option<String>,
     /// The prompt positions `mm_features` fill with their items' embeddings
-    /// (sorted, merged runs), which the out-of-vocab prompt check exempts
-    /// ([`validate_token_ids`]); empty without features.
+    /// (sorted, merged runs), which the out-of-vocab prompt check holds to
+    /// the outer bound only ([`validate_token_ids`]); empty without features.
+    /// Read by that check, before the request fans out.
     pub(crate) embed_positions: Vec<Range<usize>>,
 }
 
@@ -950,22 +951,29 @@ pub(crate) fn kv_transfer_params(
 }
 
 /// Whether the request is the decode side of a PD pair, whose prompt's KV
-/// comes from the prefill side. Read from its connector params as
-/// [`kv_transfer_params`] resolves them, the JSON field first and alone:
-/// there, NIXL's `do_remote_prefill = true` says so. Without it, the legacy
-/// typed host/port pair, which the gateway injects into a Mooncake decode
-/// side only (and never into a prefill side), says so for a single-sample
-/// request; at `n > 1` the gateway injects it all the same, but that decode
-/// side recomputes the prompt itself (and keeps its media to do it).
-/// Unreadable params say no (the translation refuses them).
+/// comes from the prefill side. Only a single-sample request is: the gateway
+/// relays no handoff at `n > 1` (each choice's decode side recomputes the
+/// prompt itself, and keeps its media to do it), whatever params it carries.
+/// Then read from its connector params as [`kv_transfer_params`] resolves
+/// them, the JSON field first and alone: there, NIXL's
+/// `do_remote_prefill = true` says so. Without it, the legacy typed host/port
+/// pair, which the gateway injects into a Mooncake decode side only (and
+/// never into a prefill side), says so. Unreadable params say no (the
+/// translation refuses them).
+///
+/// This is what the request claims; whether the engine can pull any KV is
+/// the engine's configuration ([`validate_token_ids`]).
 pub(crate) fn consumes_remote_prefill(req: &vllm::GenerateRequest) -> bool {
+    if req.sampling_params.as_ref().map_or(1, |sp| sp.n) > 1 {
+        return false;
+    }
     let Ok(Some(params)) = kv_transfer_params(req) else {
         return false;
     };
     if req.kv_transfer_params_json.is_some() {
         return params.get("do_remote_prefill") == Some(&serde_json::Value::Bool(true));
     }
-    req.sampling_params.as_ref().map_or(1, |sp| sp.n) <= 1
+    true
 }
 
 /// Connector encoder-cache transfer params for encode-prefill-decode
@@ -1158,6 +1166,34 @@ pub(crate) fn validate_sampling(sp: &vllm::SamplingParams, max_tokens: u32) -> R
     Ok(())
 }
 
+/// The vocabulary bounds client-supplied token ids are held to
+/// ([`validate_token_ids`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct VocabBounds {
+    /// The model's vocabulary: the rows of the logits a sampling id (a stop
+    /// id, a `logit_bias` key, a prompt-logprob target) indexes, and of the
+    /// embedding table a text position reads.
+    pub(crate) model: u32,
+    /// The larger of the model's vocabulary and the tokenizer's (its largest
+    /// id plus one): the bound vLLM's frontend (`InputProcessor`) holds every
+    /// prompt position to, because some multimodal models' placeholder
+    /// tokens lie past the model's vocabulary. The model's own when the
+    /// tokenizer is unknown, so such a placeholder is then refused.
+    pub(crate) outer: u32,
+}
+
+impl VocabBounds {
+    /// The bounds of a model of `model_vocab_size` rows whose tokenizer's
+    /// largest id, added tokens included, is `tokenizer_max_token_id`.
+    pub(crate) fn new(model_vocab_size: u32, tokenizer_max_token_id: Option<u32>) -> Self {
+        let tokenizer = tokenizer_max_token_id.map_or(0, |id| id.saturating_add(1));
+        Self {
+            model: model_vocab_size,
+            outer: model_vocab_size.max(tokenizer),
+        }
+    }
+}
+
 /// Refuse client-supplied token ids outside the model's vocabulary, as vLLM's
 /// frontend does in `InputProcessor` (prompt ids) and `SamplingParams.verify`
 /// (`stop_token_ids`, `logit_bias`) — checks the ZMQ path otherwise bypasses.
@@ -1172,41 +1208,54 @@ pub(crate) fn validate_sampling(sp: &vllm::SamplingParams, max_tokens: u32) -> R
 /// and EOS backstop) drops any the model cannot sample, so a refusal names
 /// the caller's ids.
 ///
-/// Prompt ids are bounded by position. vLLM bounds them all by the larger of
-/// the model's and the tokenizer's vocabulary, because some multimodal
-/// models' placeholder tokens lie past the model's vocabulary (those
-/// positions take the item's embedding, not a table row). This client knows
-/// only the model's size, so it bounds text positions by it and leaves the
-/// positions the request's media fills unbounded, as they were before this
-/// check: `embed_positions`, read from the features the engine is sent (each
-/// item's `mm_position`, narrowed by its `is_embed` mask), so only a position
-/// an item's embedding replaces is exempt. A tensor-less identity batch sends
-/// no feature and exempts nothing.
+/// Prompt ids are bounded by position. A text position reads a row of the
+/// embedding table, so it is held to the model's vocabulary
+/// ([`VocabBounds::model`]). A position the request's media fills takes the
+/// item's embedding instead, and is held to vLLM's own bound
+/// ([`VocabBounds::outer`]): its placeholder token may lie past the model's
+/// vocabulary, but never past the tokenizer's. Those are `embed_positions`,
+/// read from the features the engine is sent (each item's `mm_position`,
+/// narrowed by its `is_embed` mask); a tensor-less identity batch sends no
+/// feature and leaves its positions text.
 ///
-/// The decode side of a PD pair ([`consumes_remote_prefill`]) skips the
-/// prompt bound, and only that one. Its prompt is the prefill side's expanded
-/// one, image-token run included, with the media stripped to an identity
-/// batch (or to nothing) because the KV it pulls supplies those positions; the
-/// prefill side of the same request ran the bound against its full features.
-/// The gateway builds these params, and a caller that forges them gets only
-/// what it had before this check existed: no prompt bound here. The risk
-/// left is the same one: should the KV load fail and the engine recompute the
-/// prompt, a text-position id past the vocabulary would reach the embedding
-/// table on the decode side. `stop_token_ids` and `logit_bias` are checked on
-/// every leg.
+/// The decode side of a PD pair is held to vLLM's bound at every position:
+/// its prompt is the prefill side's expanded one, image-token run included,
+/// with the media stripped to an identity batch (or to nothing) because the
+/// KV it pulls supplies those positions. That holds only when the request
+/// claims the handoff ([`consumes_remote_prefill`], single-sample only) and
+/// `engine_pulls_remote_kv` says the engine was started as a KV consumer: an
+/// engine without a connector ignores the params and computes the prompt
+/// itself, so a forged claim there gets the ordinary bounds. A decode side
+/// whose KV load fails and is recomputed reads what vLLM's own frontend
+/// would have let through.
+///
+/// An id past the model's vocabulary that a position is allowed to hold is
+/// still a target of `prompt_logprobs`, which reads the logits at every
+/// prompt id after the first: such a request is refused.
+/// `stop_token_ids` and `logit_bias` index the logits on every leg.
 pub(crate) fn validate_token_ids(
     req: &vllm::GenerateRequest,
     embed_positions: &[Range<usize>],
-    vocab_size: u32,
+    bounds: VocabBounds,
+    engine_pulls_remote_kv: bool,
 ) -> Result<(), String> {
+    let sampling = req.sampling_params.as_ref();
     if let Some(vllm::generate_request::Input::Tokenized(tokenized)) = &req.input {
-        if !consumes_remote_prefill(req) {
-            validate_prompt_ids(&tokenized.input_ids, embed_positions, vocab_size)?;
+        let ids = &tokenized.input_ids;
+        let text_bound = if engine_pulls_remote_kv && consumes_remote_prefill(req) {
+            bounds.outer
+        } else {
+            bounds.model
+        };
+        validate_prompt_ids(ids, embed_positions, text_bound, bounds.outer)?;
+        if sampling.is_some_and(|sp| sp.prompt_logprobs.is_some()) {
+            refuse_unscorable_prompt_ids(ids, bounds.model)?;
         }
     }
-    let Some(sp) = req.sampling_params.as_ref() else {
+    let Some(sp) = sampling else {
         return Ok(());
     };
+    let vocab_size = bounds.model;
     let bad = out_of_vocab(
         sp.stop_token_ids.iter().map(|&id| i64::from(id)),
         vocab_size,
@@ -1227,28 +1276,62 @@ pub(crate) fn validate_token_ids(
     Ok(())
 }
 
-/// Refuse a prompt id past the model's vocabulary at a text position, with
-/// vLLM's message (`InputProcessor`) naming the largest; a position in
-/// `embed_positions` (sorted runs) takes a multimodal item's embedding and
-/// is not bounded (see [`validate_token_ids`]). Prompt ids are unsigned, so
-/// only the upper bound applies.
+/// Refuse a prompt id at or past its position's bound, with vLLM's message
+/// (`InputProcessor`) naming the largest: `embed_bound` at a position in
+/// `embed_positions` (sorted runs), which takes a multimodal item's
+/// embedding, `text_bound` elsewhere (see [`validate_token_ids`]). Prompt ids
+/// are unsigned, so only the upper bound applies.
 pub(crate) fn validate_prompt_ids(
     input_ids: &[u32],
     embed_positions: &[Range<usize>],
-    vocab_size: u32,
+    text_bound: u32,
+    embed_bound: u32,
 ) -> Result<(), String> {
     let is_embed = |position: usize| {
         let after = embed_positions.partition_point(|run| run.start <= position);
         after > 0 && embed_positions[after - 1].contains(&position)
     };
-    let text_max = input_ids
+    // An id below both bounds, the common one, is settled without a lookup.
+    let lower = text_bound.min(embed_bound);
+    let largest = input_ids
         .iter()
         .enumerate()
-        .filter(|&(position, &id)| id >= vocab_size && !is_embed(position))
+        .filter(|&(position, &id)| {
+            if id < lower {
+                return false;
+            }
+            let bound = if is_embed(position) {
+                embed_bound
+            } else {
+                text_bound
+            };
+            id >= bound
+        })
         .map(|(_, &id)| id)
         .max();
-    match text_max {
+    match largest {
         Some(id) => Err(format!("Token id {id} is out of vocabulary")),
+        None => Ok(()),
+    }
+}
+
+/// Refuse `prompt_logprobs` on a prompt holding an id past the model's
+/// vocabulary after its first position (a multimodal placeholder, or a
+/// decode side's): the engine scores each prompt position by gathering the
+/// next id's logit from a tensor of `vocab_size` columns, whether or not the
+/// position took an item's embedding, so that id would index past it.
+fn refuse_unscorable_prompt_ids(input_ids: &[u32], vocab_size: u32) -> Result<(), String> {
+    match input_ids
+        .iter()
+        .skip(1)
+        .copied()
+        .filter(|&id| id >= vocab_size)
+        .max()
+    {
+        Some(id) => Err(format!(
+            "prompt_logprobs cannot score token id {id}: it lies past the model's \
+             vocabulary (size {vocab_size})"
+        )),
         None => Ok(()),
     }
 }

@@ -559,18 +559,21 @@ fn kv_transfer_params_prefer_json_then_the_legacy_pair() {
 #[test]
 fn out_of_vocab_token_ids_are_refused() {
     const VOCAB: u32 = 1000;
+    let check = |req: &vllm::GenerateRequest| {
+        validate_token_ids(req, &[], VocabBounds::new(VOCAB, None), false)
+    };
     let ok = tokenized_req(vllm::SamplingParams {
         stop_token_ids: vec![0, 999],
         logit_bias: [(0, 1.0), (999, -5.0)].into_iter().collect(),
         ..Default::default()
     });
-    assert_eq!(validate_token_ids(&ok, &[], VOCAB), Ok(()));
+    assert_eq!(check(&ok), Ok(()));
 
     let bias = tokenized_req(vllm::SamplingParams {
         logit_bias: [(5, 1.0), (999_999_999, 5.0)].into_iter().collect(),
         ..Default::default()
     });
-    let error = validate_token_ids(&bias, &[], VOCAB).unwrap_err();
+    let error = check(&bias).unwrap_err();
     assert!(error.contains("[999999999] in logit_bias"), "{error}");
     assert!(error.contains("Vocabulary size: 1000"), "{error}");
 
@@ -578,15 +581,13 @@ fn out_of_vocab_token_ids_are_refused() {
         logit_bias: [(-1, 1.0)].into_iter().collect(),
         ..Default::default()
     });
-    assert!(validate_token_ids(&negative, &[], VOCAB)
-        .unwrap_err()
-        .contains("[-1] in logit_bias"));
+    assert!(check(&negative).unwrap_err().contains("[-1] in logit_bias"));
 
     let stop = tokenized_req(vllm::SamplingParams {
         stop_token_ids: vec![1000, 7, 1000],
         ..Default::default()
     });
-    assert!(validate_token_ids(&stop, &[], VOCAB)
+    assert!(check(&stop)
         .unwrap_err()
         .contains("[1000] in stop_token_ids"));
 
@@ -595,11 +596,28 @@ fn out_of_vocab_token_ids_are_refused() {
         t.input_ids = vec![1, 4000, 2];
     }
     assert_eq!(
-        validate_token_ids(&prompt, &[], VOCAB).unwrap_err(),
+        check(&prompt).unwrap_err(),
         "Token id 4000 is out of vocabulary"
     );
-    assert_eq!(validate_prompt_ids(&[0, 999], &[], VOCAB), Ok(()));
-    assert_eq!(validate_prompt_ids(&[], &[], VOCAB), Ok(()));
+    assert_eq!(validate_prompt_ids(&[0, 999], &[], VOCAB, VOCAB), Ok(()));
+    assert_eq!(validate_prompt_ids(&[], &[], VOCAB, VOCAB), Ok(()));
+}
+
+/// The outer bound is the larger of the model's vocabulary and the
+/// tokenizer's (its largest id plus one); an unknown tokenizer leaves the
+/// model's.
+#[test]
+fn the_outer_bound_is_the_larger_vocabulary() {
+    assert_eq!(
+        VocabBounds::new(1000, Some(1004)),
+        VocabBounds {
+            model: 1000,
+            outer: 1005
+        }
+    );
+    assert_eq!(VocabBounds::new(1000, Some(500)).outer, 1000);
+    assert_eq!(VocabBounds::new(1000, None).outer, 1000);
+    assert_eq!(VocabBounds::new(1000, Some(u32::MAX)).outer, u32::MAX);
 }
 
 /// Embed-position runs from `(start, end)` pairs.
@@ -646,15 +664,17 @@ fn image_req(
 
 /// The prompt-id bound is per position: a placeholder id past the model's
 /// vocabulary (some multimodal models' image token is) passes where the
-/// image's embedding replaces it, and the same id at a text position, or at
-/// a structural position inside the placeholder range that `is_embed`
-/// leaves to the table, is refused.
+/// image's embedding replaces it, up to the tokenizer's bound, and the same
+/// id at a text position, or at a structural position inside the placeholder
+/// range that `is_embed` leaves to the table, is refused.
 #[test]
 fn an_out_of_vocab_id_passes_at_an_image_position_only() {
-    const VOCAB: u32 = 1000;
+    // The model's 1000 rows; the tokenizer's ids reach 1000, the image token.
+    let bounds = VocabBounds::new(1000, Some(1000));
     let check = |mut req: vllm::GenerateRequest| {
         let media = translate_media(&mut req, ModelDtype::BFloat16).expect("translated");
-        validate_token_ids(&req, &media.embed_positions, VOCAB).map(|()| media.embed_positions)
+        validate_token_ids(&req, &media.embed_positions, bounds, false)
+            .map(|()| media.embed_positions)
     };
 
     // The image token 1000 at the image's positions 1..4.
@@ -687,6 +707,48 @@ fn an_out_of_vocab_id_passes_at_an_image_position_only() {
         check(image_req(vec![5, 1000, 1001, 1000, 6], (1, 3), Some(1000))),
         Err("Token id 1001 is out of vocabulary".to_string())
     );
+    // An image position is held to the tokenizer's bound: a caller naming
+    // an id past it as the image token is refused there too.
+    assert_eq!(
+        check(image_req(
+            vec![5, 999_999_999, 999_999_999, 6],
+            (1, 2),
+            Some(999_999_999)
+        )),
+        Err("Token id 999999999 is out of vocabulary".to_string())
+    );
+    // Without a known tokenizer the outer bound is the model's.
+    let mut req = image_req(vec![5, 1000, 1000, 6], (1, 2), Some(1000));
+    let media = translate_media(&mut req, ModelDtype::BFloat16).expect("translated");
+    assert_eq!(
+        validate_token_ids(
+            &req,
+            &media.embed_positions,
+            VocabBounds::new(1000, None),
+            false
+        ),
+        Err("Token id 1000 is out of vocabulary".to_string())
+    );
+    // `prompt_logprobs` scores each prompt id after the first against the
+    // model's logits, the image's own included.
+    let scored = |prompt: Vec<u32>, placeholder| {
+        let mut req = image_req(prompt, placeholder, Some(1000));
+        req.sampling_params = Some(vllm::SamplingParams {
+            prompt_logprobs: Some(0),
+            ..Default::default()
+        });
+        req
+    };
+    assert_eq!(
+        check(scored(vec![5, 1000, 1000, 6], (1, 2))),
+        Err(
+            "prompt_logprobs cannot score token id 1000: it lies past the model's \
+             vocabulary (size 1000)"
+                .to_string()
+        )
+    );
+    // The first position is never a target.
+    assert_eq!(check(scored(vec![1000, 5, 6], (0, 1))), Ok(runs(&[(0, 1)])));
     // And a text-only request gets no exemption at all.
     let mut text = tokenized_req(vllm::SamplingParams::default());
     if let Some(vllm::generate_request::Input::Tokenized(t)) = text.input.as_mut() {
@@ -741,16 +803,19 @@ fn an_out_of_vocab_id_passes_at_an_image_position_only() {
 
 /// The decode side of a PD pair (`do_remote_prefill = true`) gets the
 /// prefill side's expanded prompt, its image-token run included, with the
-/// media stripped (the KV it pulls supplies those positions): its prompt is
-/// not bounded, but its `stop_token_ids` and `logit_bias` still are. The
-/// same prompt without the decode-side params is refused.
+/// media stripped (the KV it pulls supplies those positions): on an engine
+/// started as a KV consumer, its prompt is held to the tokenizer's bound at
+/// every position, and its `stop_token_ids` and `logit_bias` to the model's.
+/// The same prompt without the decode-side params, at `n > 1`, or on an
+/// engine with no connector (which ignores the claim) is refused.
 #[test]
-fn a_pd_decode_side_skips_the_prompt_bound_only() {
-    const VOCAB: u32 = 1000;
-    let check = |mut req: vllm::GenerateRequest| {
+fn a_pd_decode_side_is_held_to_the_outer_bound() {
+    let bounds = VocabBounds::new(1000, Some(1000));
+    let check_on = |mut req: vllm::GenerateRequest, pulls_remote_kv: bool| {
         let media = translate_media(&mut req, ModelDtype::BFloat16).expect("translated");
-        validate_token_ids(&req, &media.embed_positions, VOCAB)
+        validate_token_ids(&req, &media.embed_positions, bounds, pulls_remote_kv)
     };
+    let check = |req| check_on(req, true);
     // The gateway's language-model-only decode leg: the expanded ids, the
     // per-image hashes only, the KV handoff.
     let decode = |sampling: vllm::SamplingParams, params: Option<&str>| {
@@ -767,6 +832,7 @@ fn a_pd_decode_side_skips_the_prompt_bound_only() {
         req
     };
     const DECODE: Option<&str> = Some(r#"{"do_remote_prefill": true, "do_remote_decode": false}"#);
+    let refused = Err("Token id 1000 is out of vocabulary".to_string());
 
     assert_eq!(
         check(decode(vllm::SamplingParams::default(), DECODE)),
@@ -780,6 +846,21 @@ fn a_pd_decode_side_skips_the_prompt_bound_only() {
         vllm::SamplingParams::default(),
         DECODE
     )));
+    // An id past the tokenizer's ids too is refused there.
+    let mut forged = decode(vllm::SamplingParams::default(), DECODE);
+    if let Some(vllm::generate_request::Input::Tokenized(t)) = forged.input.as_mut() {
+        t.input_ids = vec![5, 999_999_999, 6];
+    }
+    assert_eq!(
+        check(forged),
+        Err("Token id 999999999 is out of vocabulary".to_string())
+    );
+
+    // A forged claim on an engine with no KV connector changes nothing.
+    assert_eq!(
+        check_on(decode(vllm::SamplingParams::default(), DECODE), false),
+        refused
+    );
 
     // Not a decode side: no params, a prefill side's, a malformed field.
     for params in [
@@ -789,10 +870,17 @@ fn a_pd_decode_side_skips_the_prompt_bound_only() {
     ] {
         assert_eq!(
             check(decode(vllm::SamplingParams::default(), params)),
-            Err("Token id 1000 is out of vocabulary".to_string()),
+            refused,
             "{params:?}"
         );
     }
+    // Nor at `n > 1`, where the gateway relays no handoff.
+    let fan_out = vllm::SamplingParams {
+        n: 2,
+        ..Default::default()
+    };
+    assert!(!consumes_remote_prefill(&decode(fan_out.clone(), DECODE)));
+    assert_eq!(check(decode(fan_out, DECODE)), refused);
 
     // The sampling ids index the logits on every leg.
     let bias = vllm::SamplingParams {
@@ -813,15 +901,20 @@ fn a_pd_decode_side_skips_the_prompt_bound_only() {
 
 /// The legacy Mooncake handoff, the typed host/port pair the gateway injects
 /// into a decode side only, marks a single-sample decode side as JSON
-/// `do_remote_prefill` does: its prompt is not bounded, its `logit_bias` and
-/// `stop_token_ids` still are. At `n > 1` that decode side recomputes the
-/// prompt, so the bound holds; and JSON params, when present, decide alone.
+/// `do_remote_prefill` does: its prompt is held to the tokenizer's bound, its
+/// `logit_bias` and `stop_token_ids` to the model's. At `n > 1` that decode
+/// side recomputes the prompt, so the model's bound holds; and JSON params,
+/// when present, decide alone.
 #[test]
-fn a_legacy_mooncake_decode_side_skips_the_prompt_bound_only() {
-    const VOCAB: u32 = 1000;
+fn a_legacy_mooncake_decode_side_is_held_to_the_outer_bound() {
     let check = |mut req: vllm::GenerateRequest| {
         let media = translate_media(&mut req, ModelDtype::BFloat16).expect("translated");
-        validate_token_ids(&req, &media.embed_positions, VOCAB)
+        validate_token_ids(
+            &req,
+            &media.embed_positions,
+            VocabBounds::new(1000, Some(1000)),
+            true,
+        )
     };
     let decode = |sampling: vllm::SamplingParams| {
         let mut req = tokenized_req(sampling);
@@ -954,12 +1047,16 @@ fn encoded_media_embed_positions_follow_mm_position_and_is_embed() {
     // So an id past the vocabulary passes at 1..3 and 4, not at 3.
     let runs = vec![1..3, 4..5];
     assert_eq!(
-        validate_prompt_ids(&[5, 1000, 1000, 7, 1000], &runs, 1000),
+        validate_prompt_ids(&[5, 1000, 1000, 7, 1000], &runs, 1000, 1001),
         Ok(())
     );
     assert_eq!(
-        validate_prompt_ids(&[5, 1000, 1000, 1000, 1000], &runs, 1000),
+        validate_prompt_ids(&[5, 1000, 1000, 1000, 1000], &runs, 1000, 1001),
         Err("Token id 1000 is out of vocabulary".to_string())
+    );
+    assert_eq!(
+        validate_prompt_ids(&[5, 1000, 1001, 7, 1000], &runs, 1000, 1001),
+        Err("Token id 1001 is out of vocabulary".to_string())
     );
 }
 

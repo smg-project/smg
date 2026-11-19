@@ -34,7 +34,21 @@ pub(super) async fn connect_engine(state: Arc<State>, inputs: ConnectInputs) {
                 structured_outputs_backend_from_config(&state.model.structured_outputs_backend)
                     .into(),
             );
-            client.set_vocab_size(state.model.vocab_size);
+            // The model's vocabulary, widened where vLLM's frontend widens
+            // it by the tokenizer's largest id (a multimodal placeholder can
+            // lie past the model's).
+            client.set_vocab_size(
+                state.model.vocab_size,
+                state
+                    .tokenizer()
+                    .and_then(|tokenizer| tokenizer.max_token_id()),
+            );
+            // A PD decode side's prompt KV is pulled only by an engine
+            // started as a KV consumer; elsewhere a handoff claim is ignored
+            // and the engine computes the prompt itself.
+            if matches!(state.model.kv_role.as_str(), "kv_consumer" | "kv_both") {
+                client.note_engine_pulls_remote_kv();
+            }
             // Known at start: the wire reports every scheduler step while the
             // engine's statistics are on, before its first batch shows it.
             if state.model.log_stats == Some(true) {

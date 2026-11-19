@@ -78,8 +78,9 @@ impl ZmqEngineClient {
             .map_err(Status::invalid_argument)?;
         // A pooling prompt indexes the same embedding table as a generate one
         // (text only: no position takes a multimodal embedding).
-        if let (Some(vocab_size), Some(ids)) = (self.vocab_size(), &request.prompt_token_ids) {
-            validate_prompt_ids(ids, &[], vocab_size).map_err(Status::invalid_argument)?;
+        if let (Some(bounds), Some(ids)) = (self.vocab_bounds(), &request.prompt_token_ids) {
+            validate_prompt_ids(ids, &[], bounds.model, bounds.model)
+                .map_err(Status::invalid_argument)?;
         }
         // vLLM's frontend refuses a task the model runner does not serve
         // (`InputProcessor._validate_params`, in its words); the engine's own
@@ -254,7 +255,7 @@ mod tests {
     async fn embed_refuses_an_out_of_vocab_prompt_id() {
         let dir = tempfile::tempdir().unwrap();
         let (client, mut engine_in, _engine_out) = connected(dir.path()).await;
-        client.set_vocab_size(1000);
+        client.set_vocab_size(1000, None);
         let status = client
             .embed(
                 embed_request("e1", vec![1, 1000]),
