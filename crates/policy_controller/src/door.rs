@@ -16,6 +16,7 @@
 //! A seat has one lock for decisions and another for sampled picks and
 //! sheds. A sampling decision takes the slot lock before the ring lock.
 //! [`Door::explain`] reads by gateway and request id under the ring lock.
+//! [`Door::explained`] also reads the names when their generation stands.
 //!
 //! A host with encode items can place them through [`Door::decide_encode_pair`].
 //! The pair's prefill and decode are the sides that hold leases.
@@ -58,8 +59,8 @@ use crate::{
 
 mod explain;
 
-pub use explain::DecisionRecord;
 pub(crate) use explain::Samples;
+pub use explain::{DecisionRecord, Explained, Names};
 
 /// A request as a door reads it: what the rows' narrowing, the engine's
 /// request and the lease take of it, in whatever form it was asked.
@@ -1931,6 +1932,17 @@ impl Door {
             .max_by_key(|record| record.at)
     }
 
+    /// [`Door::explain`] with names from one read of the store's world.
+    /// The record is copied and each ring lock released before that read.
+    #[must_use]
+    pub fn explained(&self, gateway: GatewayId, request_id: &[u8]) -> Option<Explained> {
+        let record = self.explain(gateway, request_id)?;
+        let names = self
+            .store
+            .deciding(|world| record.names(world.spec().engine()));
+        Some(Explained { record, names })
+    }
+
     /// What `gateway` says of `lease`: a dispatch, a completion or a
     /// release, on whichever thread the host says it. The thread is never
     /// held for a decision: it stands at most behind one hold of the
@@ -2766,6 +2778,52 @@ pub(crate) mod tests {
             assert_eq!(record.at, now);
             assert!(door.explain(GatewayId::LOCAL, id).is_none());
         }
+    }
+
+    #[test]
+    fn the_door_explains_a_sampled_decision_with_its_names() {
+        use crate::{Explained, Names};
+
+        let store = fleet(1);
+        sampling(&store, 2, 1);
+        let door = Door::new(Arc::clone(&store));
+        let id = b"named";
+        assert!(door.explained(GATEWAY, id).is_none());
+
+        let now = Instant::now();
+        let answer = door
+            .decide(GATEWAY, &request(id, 7), now)
+            .expect("a decision");
+        let record = door.explain(GATEWAY, id).expect("a sample");
+        assert_eq!(record.decision, answer.decision);
+        assert_eq!(record.at, now);
+        assert!(door.explained(GatewayId::LOCAL, id).is_none());
+        assert_eq!(
+            door.explained(GATEWAY, id),
+            Some(Explained {
+                record,
+                names: Some(Names {
+                    plan: "single",
+                    profile: "random".into(),
+                    picker: "random".into(),
+                    filters: vec![
+                        "healthy".into(),
+                        "not-overloaded".into(),
+                        "not-tried".into()
+                    ],
+                    scorers: vec![],
+                }),
+            })
+        );
+
+        sampling(&store, 3, 0);
+        assert_eq!(
+            door.explained(GATEWAY, id),
+            Some(Explained {
+                record,
+                names: None
+            })
+        );
     }
 
     #[test]

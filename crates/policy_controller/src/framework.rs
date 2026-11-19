@@ -3756,7 +3756,6 @@ impl Engine {
             .and_then(|at| u32::try_from(at).ok())
     }
 
-    #[cfg(feature = "controller")]
     pub(crate) fn binding_at(&self, at: u32) -> Option<&Binding> {
         self.bindings.get(at as usize).map(|entry| &entry.binding)
     }
