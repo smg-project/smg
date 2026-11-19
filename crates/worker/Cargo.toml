@@ -39,7 +39,6 @@ runtime = [
     "dep:anyhow",
     "dep:arc-swap",
     "dep:async-trait",
-    "dep:blake3",
     "dep:chrono",
     "dep:futures",
     "dep:metrics",
@@ -67,7 +66,6 @@ arc-swap = { version = "1.9.1", optional = true }
 async-trait = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
 bitflags.workspace = true
-blake3 = { workspace = true, optional = true }
 chrono = { workspace = true, optional = true }
 dashmap = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }

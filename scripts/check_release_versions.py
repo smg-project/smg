@@ -11,8 +11,11 @@ too, so they move its version. A version is bumped when no release tag
 code: the registries take a version once. A crate held at its published version is
 republished when a workspace dependency's new version leaves a requirement its published
 copy carries (cargo's caret): at a patch step, or at its own breaking step when the crate's
-public API carries the dependency. Then the files that must mirror the gateway's
-version. Issues are listed with the bump conventional commits ask for (``feat!:`` or
+public API carries the dependency. A crate whose wire files changed (the proto files a
+dependent builds messages from) steps past its own caret whatever its commits ask: a field
+more breaks a dependent's published copy, which would resolve to a patch of it. Then the
+files that must mirror the gateway's version. Issues are listed with the bump conventional
+commits ask for (``feat!:`` or
 ``BREAKING CHANGE``: major; ``feat:``: minor; otherwise patch), stepped past the
 versions release tags carry, and, on request, applied.
 
@@ -61,10 +64,13 @@ class Component:
     path: str  # its directory, relative to the repository root
     version_file: str  # the file carrying its version, relative to the root
     dep_key: str | None = None  # its key under [workspace.dependencies]; None = no entry
+    # the wire files a dependent builds messages from, relative to the root: their change breaks
+    # a dependent's published copy, so it steps the crate past its own caret
+    wire: tuple[str, ...] = ()
 
 
-def crate(name: str, path: str, dep_key: str | None = None) -> Component:
-    return Component("crate", name, path, f"{path}/Cargo.toml", dep_key)
+def crate(name: str, path: str, dep_key: str | None = None, wire: Sequence[str] = ()) -> Component:
+    return Component("crate", name, path, f"{path}/Cargo.toml", dep_key, tuple(wire))
 
 
 def package(name: str, path: str, version_file: str) -> Component:
@@ -84,7 +90,7 @@ GATEWAY = "smg"
 
 CRATES = (
     crate("openai-protocol", "crates/protocols", "openai-protocol"),
-    crate("smg-worker", "crates/worker", "smg-worker"),
+    crate("smg-worker", "crates/worker", "smg-worker", wire=("crates/worker/proto/",)),
     crate("smg-mm-rdma", "crates/mm_rdma", "smg-mm-rdma"),
     crate("engine-zmq-client", "crates/engine_zmq_client", "engine-zmq-client"),
     crate("reasoning-parser", "crates/reasoning_parser", "reasoning-parser"),
@@ -455,6 +461,9 @@ class Verdict:
     carried_by: str | None = None  # the release tag, not the given one, that carries the version
     unbumped: bool = False  # the version is a release tag's, carried there with other code
     level: str | None = None  # the bump asked for when the version was not bumped
+    wire: bool = False  # its wire files changed: the step asked leaves the version's own caret
+    # the tagged version whose caret a bump by hand stays inside, the wire files changed
+    inside: str | None = None
     workspace_version: str | None = None  # the root's entry when it disagrees
     # why a held crate moves: the published requirement a dependency's new version leaves
     dependency: str | None = None
@@ -562,8 +571,22 @@ def check(
                 verdict.workspace_version = pinned or ""
         return verdict
     verdict.unbumped = carrier is not None
+    verdict.wire = bool(component.wire) and bool(repo.changed_since(tag, component.wire))
     if verdict.unbumped:
         verdict.level = bump_level(repo.commits_since(tag, component_paths(repo, component)))
+        if verdict.wire:
+            verdict.level = LEVELS[
+                max(LEVELS.index(verdict.level), LEVELS.index(breaking_level(verdict.version)))
+            ]
+    elif (
+        verdict.wire
+        and verdict.tag_version is not None
+        and caret_accepts(verdict.tag_version, verdict.version)
+    ):
+        # Bumped, to a version the tagged one's caret accepts: a dependent's published copy
+        # resolves to it and builds messages that gained a field.
+        verdict.unbumped, verdict.inside = True, verdict.tag_version
+        verdict.level = breaking_level(verdict.version)
     elif component.dep_key:
         pinned = workspace_dep_version(root_toml, component.dep_key)
         if pinned != verdict.version:
@@ -653,12 +676,19 @@ def report(verdict: Verdict, out: Out) -> None:
             f"  {warn} {name} {where} — unchanged, but its published requirement{plural}"
             f" {verdict.dependency} [{out.level(verdict.level)}]"
         )
+    elif verdict.inside:
+        out.line(
+            f"  {warn} {name} {where} — {n}, its wire files among them, but v{verdict.version}"
+            f" is inside ^{verdict.inside} [{out.level(verdict.level)}]"
+        )
     elif verdict.unbumped:
         carried = f", {verdict.carried_by}'s" if verdict.carried_by else ""
         out.line(
             f"  {warn} {name} {where} — {n} but version not bumped (v{verdict.version}{carried})"
             f" [{out.level(verdict.level)}]"
         )
+        if verdict.wire:
+            out.line(f"    {warn} and its wire files changed: the step leaves ^{verdict.version}")
         if verdict.dependency:
             out.line(f"    {warn} and its published requirement{plural} {verdict.dependency}")
     elif verdict.tag_version is None:

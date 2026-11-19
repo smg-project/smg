@@ -541,6 +541,12 @@ impl AppContextBuilder {
         {
             start_prefill_admission_notifier(&worker_registry, admission)?;
         }
+        // The hash rings are filled where a membership change is heard, off
+        // the request path. Where no runtime is entered nothing warms them,
+        // and the first reader of a generation fills its ring.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            policy_registry.keep_rings_warm(&worker_registry, &runtime);
+        }
 
         // Create WorkerService from the already-built components
         let worker_service = Arc::new(WorkerService::new(
