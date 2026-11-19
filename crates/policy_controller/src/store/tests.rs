@@ -2,7 +2,7 @@
 //! the trait objects: what every implementation of a trait promises.
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     sync::{mpsc, Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -3550,30 +3550,44 @@ fn a_frame_handed_while_a_thread_is_at_work_is_left_to_that_thread() {
     );
 }
 
+thread_local! {
+    /// The epoch of the world each tell of [`under`] was handed.
+    static UNDER: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+    /// Whether the next tell of [`under`] publishes a later world.
+    static LATER: Cell<bool> = const { Cell::new(true) };
+}
+
+/// A teller that keeps the epoch of the world each tell is handed. Its
+/// first tell publishes a later world before it returns, so a word told
+/// behind it under the same load reads the earlier epoch.
+fn under(store: &MemoryStore, world: &World, _: &LeaseRecord, _: Said, _: Option<Decider>) {
+    UNDER.with_borrow_mut(|under| under.push(world.epoch()));
+    if LATER.replace(false) {
+        ready(store, "http://b:1");
+    }
+}
+
+/// A store under term 1 that tells through [`under`], with one ready
+/// worker and `leases` leases issued on it at `now`, five seconds to their
+/// dispatch: the store, the worker, the leases' ids and the epoch of the
+/// world that stands.
+fn under_bed(leases: u64, now: Instant) -> (Arc<MemoryStore>, WorkerId, Vec<LeaseId>, u64) {
+    let store = Arc::new(MemoryStore::new());
+    store.tell_through(under);
+    let a = ready(&store, "http://a:1");
+    LeasesStore::set_term(&*store, 1);
+    let ids = (0..leases).map(|_| LeaseId(1 << 32 | issued_at(&store, a, now).0));
+    let ids = ids.collect();
+    let first = store.world().epoch();
+    (store, a, ids, first)
+}
+
 /// The frames of one take are told under one world, the store's as it
 /// stood at the take's first tell: a take loads it once, however many
 /// frames it tells.
 #[test]
 fn the_frames_of_a_take_are_told_under_one_world() {
-    thread_local! {
-        static UNDER: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
-        static LATER: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
-    }
-    // Keeps the epoch of the world each tell is handed; the first tell
-    // publishes a later world before it returns.
-    fn under(store: &MemoryStore, world: &World, _: &LeaseRecord, _: Said, _: Option<Decider>) {
-        UNDER.with_borrow_mut(|under| under.push(world.epoch()));
-        if LATER.replace(false) {
-            ready(store, "http://b:1");
-        }
-    }
-    let now = Instant::now();
-    let store = Arc::new(MemoryStore::new());
-    store.tell_through(under);
-    let a = ready(&store, "http://a:1");
-    LeasesStore::set_term(&*store, 1);
-    let ids = [0, 1, 2].map(|_| LeaseId(1 << 32 | issued_at(&store, a, now).0));
-    let first = store.world().epoch();
+    let (store, _, ids, first) = under_bed(3, Instant::now());
     let hand = Hand::new(GatewayId(1));
     let at_work = store.at_work();
     store.hand(&hand, ids[0], GONE);
@@ -3585,6 +3599,65 @@ fn the_frames_of_a_take_are_told_under_one_world() {
     store.hand(&hand, ids[2], GONE);
     at_work.apply();
     assert_eq!(UNDER.take(), [later], "the next take's own");
+}
+
+/// The leases one issue ends are told under one world, the store's as it
+/// stood at the first end's tell: an issue loads it once for its ends.
+/// The next issue's ends are told under its own.
+#[test]
+fn the_leases_an_issue_ends_are_told_under_one_world() {
+    let now = Instant::now();
+    let (store, a, _, first) = under_bed(3, now);
+    // Six seconds on, all three are past their dispatch deadline: this
+    // issue ends two, and the one behind it the third.
+    let late = now + Duration::from_secs(6);
+    issued_at(&store, a, late);
+    let later = store.world().epoch();
+    assert!(later > first);
+    assert_eq!(
+        UNDER.take(),
+        [first, first],
+        "one load for the issue's ends"
+    );
+    issued_at(&store, a, late);
+    assert_eq!(UNDER.take(), [later], "the next issue's own");
+}
+
+/// The leases a sweep ends in a file are told under one world, the
+/// store's as it stood at the first end's tell.
+#[test]
+fn the_leases_a_sweep_ends_in_a_file_are_told_under_one_world() {
+    let now = Instant::now();
+    let (store, _, ids, first) = under_bed(3, now);
+    let ended = LeasesStore::expire(&*store, now + Duration::from_secs(6));
+    assert_eq!(ended.len(), ids.len());
+    assert!(store.world().epoch() > first);
+    assert_eq!(
+        UNDER.take(),
+        [first, first, first],
+        "one load for the sweep"
+    );
+}
+
+/// An issue's frames and its ends are two runs, told under a load each:
+/// the frames under the world that stood at the apply's first tell, the
+/// ends under the one that stands at the first end's. This holds the
+/// split as a known limit, not as an aim: where one load serves both
+/// runs, the ends read the first world and this case turns with it.
+#[test]
+fn an_issues_frames_and_its_ends_are_told_under_a_load_each() {
+    let now = Instant::now();
+    let (store, a, ids, first) = under_bed(2, now);
+    let hand = Hand::new(GatewayId(1));
+    let at_work = store.at_work();
+    store.hand(&hand, ids[0], GONE);
+    // Six seconds on the other lease is past its dispatch deadline: this
+    // issue applies the handed frame, then ends that lease.
+    issued_at(&store, a, now + Duration::from_secs(6));
+    drop(at_work);
+    let later = store.world().epoch();
+    assert!(later > first);
+    assert_eq!(UNDER.take(), [first, later], "a load for each run");
 }
 
 /// A decider looks at what is handed before a decision reads its rows'

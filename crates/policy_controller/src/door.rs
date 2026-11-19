@@ -828,12 +828,15 @@ pub(crate) struct Viewed<'a> {
 /// call panicked and was held, for the first of a streak: its host may
 /// write a line for that one.
 ///
-/// The engine told is the one of the lease's own generation, where that
-/// generation still stands: a later generation's stages never saw the
-/// issue and hear nothing of it. A dispatch is told on the target its
-/// report names by index, as the record holds the pick, and the lease told
-/// names that index: the record was read before the door wrote it. A
-/// report that names no target of the pick tells nothing.
+/// The engine told is the one of the lease's own generation, where
+/// `world` holds that generation: a later generation's stages never saw
+/// the issue and hear nothing of it. The caller loads `world` for this
+/// word, or once for the words it tells in a row: behind a later
+/// generation's start, a word told under such a load still reaches the
+/// lease's own engine. A dispatch is told on the target its report names
+/// by index, as the record holds the pick, and the lease told names that
+/// index: the record was read before the door wrote it. A report that
+/// names no target of the pick tells nothing.
 ///
 /// A pair's lease is told by side: a dispatch on the side its frame names,
 /// with that side's lease and on that side's worker, and an end once a
