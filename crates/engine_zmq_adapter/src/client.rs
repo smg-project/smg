@@ -61,10 +61,10 @@ use crate::{
         TrtllmGenerateStream,
     },
     vllm::{
-        fan_out_requests, has_media, kv_transfer_params, now_secs, ranked_candidate_count,
-        refuse_greedy_choices, translate_media, translate_request_with_media,
-        translated_from_processed, validate_token_ids, ProcessedMedia, TranslatedMedia,
-        VllmGenerateStream, VocabBounds,
+        fan_out_requests, has_media, kv_transfer_params, now_secs, pulls_on_do_remote_prefill,
+        ranked_candidate_count, refuse_greedy_choices, translate_media,
+        translate_request_with_media, translated_from_processed, validate_token_ids,
+        ProcessedMedia, TranslatedMedia, VllmGenerateStream, VocabBounds,
     },
 };
 
@@ -182,9 +182,10 @@ pub(crate) struct ZmqConnectionMeta {
     /// token-id checks.
     vocab_bounds: OnceLock<VocabBounds>,
     /// Set once by the caller that knows it (the servicer that launched the
-    /// engine) when the engine was started as a KV consumer, the decode side
-    /// of a PD pair: only then does a request's handoff claim loosen its
-    /// prompt bound (see [`ZmqEngineClient::note_engine_pulls_remote_kv`]).
+    /// engine) when the engine's KV connector pulls a PD decode side's prompt
+    /// KV on `do_remote_prefill`: only then does a request's handoff claim
+    /// loosen its prompt bound
+    /// (see [`ZmqEngineClient::note_kv_transfer_config`]).
     engine_pulls_remote_kv: OnceLock<()>,
     /// The engine's supported tasks (`get_supported_tasks`), fetched on first
     /// use and kept for the connection, as vLLM's frontend keeps them.
@@ -605,14 +606,18 @@ impl ZmqEngineClient {
         self.meta.vocab_bounds.get().copied()
     }
 
-    /// Note that the engine was started as a KV consumer (`kv_role`
-    /// `kv_consumer` or `kv_both`): a request claiming a PD decode side's
-    /// handoff then pulls its prompt's KV, and its prompt is held to vLLM's
-    /// own bound rather than the model's (see `validate_token_ids`). Unnoted,
-    /// the claim changes nothing: an engine without a connector computes the
-    /// prompt itself.
-    pub fn note_engine_pulls_remote_kv(&self) {
-        let _ = self.meta.engine_pulls_remote_kv.set(());
+    /// Note the engine's KV connector and role, as the servicer reports
+    /// them for PD (`kv_connector` projects a `MultiConnector` onto its one
+    /// P2P child). When that connector pulls a decode side's prompt KV on
+    /// `do_remote_prefill: true` (NIXL, Mooncake, MoRIIO, as a consumer), a
+    /// request claiming that handoff has its prompt held to vLLM's own bound
+    /// rather than the model's (see `validate_token_ids`). Any other
+    /// configuration leaves the claim changing nothing: such an engine
+    /// computes the prompt itself. The first matching call wins.
+    pub fn note_kv_transfer_config(&self, kv_connector: &str, kv_role: &str) {
+        if pulls_on_do_remote_prefill(kv_connector, kv_role) {
+            let _ = self.meta.engine_pulls_remote_kv.set(());
+        }
     }
 
     /// The tasks the engine's model runner serves (vLLM's
@@ -3489,11 +3494,13 @@ mod tests {
     /// A request shaped like the gateway's language-model-only PD decode
     /// leg (the prefill side's expanded prompt, image-token run past the
     /// model's vocabulary included, the per-image hashes, `do_remote_prefill`)
-    /// reaches an engine started as a KV consumer, held to the tokenizer's
+    /// reaches a NIXL consumer engine, held to the tokenizer's
     /// bound; the same prompt without the handoff, with an id past the
     /// tokenizer's too, or with an out-of-vocab `logit_bias` key, does not.
-    /// On an engine with no connector the claim changes nothing: the engine
-    /// would compute the prompt itself, so a forged one is refused.
+    /// On an engine that would not pull on the claim (no connector, a
+    /// producer, an unprojected wrapper) the claim changes nothing, nor does
+    /// the legacy host/port pair on a consumer: the engine would compute the
+    /// prompt itself, so these are refused.
     #[tokio::test]
     async fn a_pd_decode_leg_is_held_to_the_tokenizers_bound() {
         let request = |input_ids: Vec<u32>,
@@ -3525,7 +3532,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (client, mut engines) = connected_ranks(dir.path(), 1).await;
         client.set_vocab_size(1000, Some(1000));
-        client.note_engine_pulls_remote_kv();
+        client.note_kv_transfer_config("NixlConnector", "kv_both");
         for (req, refusal) in [
             (
                 request(leg(), None, None),
@@ -3561,23 +3568,46 @@ mod tests {
         };
         assert_eq!(add.prompt_token_ids, Some(vec![5, 1000, 1000, 6]));
 
-        // The same forged claim on an engine with no KV connector.
-        let dir = tempfile::tempdir().unwrap();
-        let (plain, mut engines) = connected_ranks(dir.path(), 1).await;
-        plain.set_vocab_size(1000, Some(1000));
-        let Err(status) = plain
-            .generate_vllm_streams(request(leg(), DECODE, None))
-            .await
-        else {
-            panic!("a forged handoff claim lifted the bound on an engine without a connector");
+        // On the same consumer, the legacy host/port pair alone: the
+        // connector pulls only on `do_remote_prefill`, so the engine would
+        // compute this prompt itself.
+        let mut legacy = request(leg(), None, None);
+        legacy.kv_transfer_params = Some(vllm::KvTransferParams {
+            remote_host: "10.0.0.1".to_string(),
+            remote_port: 8998,
+        });
+        let Err(status) = client.generate_vllm_streams(legacy).await else {
+            panic!("a legacy host/port pair lifted the bound on a NIXL consumer");
         };
-        assert_eq!(status.code(), Code::InvalidArgument);
         assert_eq!(status.message(), "Token id 1000 is out of vocabulary");
-        let quiet = tokio::time::timeout(Duration::from_millis(200), engines[0].recv()).await;
-        assert!(
-            quiet.is_err(),
-            "a refused request reached the engine: {quiet:?}"
-        );
+
+        // The forged claim on engines that would not pull on it: no KV
+        // connector, a producer, an unprojected wrapper.
+        for config in [
+            None,
+            Some(("NixlConnector", "kv_producer")),
+            Some(("MultiConnector", "kv_both")),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (other, mut engines) = connected_ranks(dir.path(), 1).await;
+            other.set_vocab_size(1000, Some(1000));
+            if let Some((connector, role)) = config {
+                other.note_kv_transfer_config(connector, role);
+            }
+            let Err(status) = other
+                .generate_vllm_streams(request(leg(), DECODE, None))
+                .await
+            else {
+                panic!("a forged handoff claim lifted the bound ({config:?})");
+            };
+            assert_eq!(status.code(), Code::InvalidArgument);
+            assert_eq!(status.message(), "Token id 1000 is out of vocabulary");
+            let quiet = tokio::time::timeout(Duration::from_millis(200), engines[0].recv()).await;
+            assert!(
+                quiet.is_err(),
+                "a refused request reached the engine: {quiet:?}"
+            );
+        }
     }
 
     /// Answer each rank's next utility call with its entry in `answers`,

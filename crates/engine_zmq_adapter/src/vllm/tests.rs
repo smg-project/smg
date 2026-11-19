@@ -804,10 +804,10 @@ fn an_out_of_vocab_id_passes_at_an_image_position_only() {
 /// The decode side of a PD pair (`do_remote_prefill = true`) gets the
 /// prefill side's expanded prompt, its image-token run included, with the
 /// media stripped (the KV it pulls supplies those positions): on an engine
-/// started as a KV consumer, its prompt is held to the tokenizer's bound at
-/// every position, and its `stop_token_ids` and `logit_bias` to the model's.
-/// The same prompt without the decode-side params, at `n > 1`, or on an
-/// engine with no connector (which ignores the claim) is refused.
+/// whose connector pulls on the claim, its prompt is held to the tokenizer's
+/// bound at every position, and its `stop_token_ids` and `logit_bias` to the
+/// model's. The same prompt without the decode-side params, at `n > 1`, or
+/// on an engine that does not pull on the claim is refused.
 #[test]
 fn a_pd_decode_side_is_held_to_the_outer_bound() {
     let bounds = VocabBounds::new(1000, Some(1000));
@@ -899,81 +899,102 @@ fn a_pd_decode_side_is_held_to_the_outer_bound() {
         .contains("[1000] in stop_token_ids"));
 }
 
-/// The legacy Mooncake handoff, the typed host/port pair the gateway injects
-/// into a decode side only, marks a single-sample decode side as JSON
-/// `do_remote_prefill` does: its prompt is held to the tokenizer's bound, its
-/// `logit_bias` and `stop_token_ids` to the model's. At `n > 1` that decode
-/// side recomputes the prompt, so the model's bound holds; and JSON params,
-/// when present, decide alone.
+/// The legacy typed host/port pair alone is no handoff claim: every PD
+/// connector in vLLM pulls only on `do_remote_prefill`, so an engine handed
+/// the pair computes the prompt itself, and its prompt keeps the model's
+/// bound even on a NIXL consumer (the mismatched form). JSON params beside
+/// the pair decide alone, either way.
 #[test]
-fn a_legacy_mooncake_decode_side_is_held_to_the_outer_bound() {
+fn a_legacy_host_port_pair_alone_is_no_handoff() {
+    // A NIXL `kv_both` engine: model vocabulary 1000, tokenizer ids to 1500.
+    let pulls = pulls_on_do_remote_prefill("NixlConnector", "kv_both");
+    assert!(pulls);
     let check = |mut req: vllm::GenerateRequest| {
         let media = translate_media(&mut req, ModelDtype::BFloat16).expect("translated");
         validate_token_ids(
             &req,
             &media.embed_positions,
-            VocabBounds::new(1000, Some(1000)),
-            true,
+            VocabBounds::new(1000, Some(1500)),
+            pulls,
         )
     };
-    let decode = |sampling: vllm::SamplingParams| {
+    let legacy = |input_ids: Vec<u32>, sampling: vllm::SamplingParams| {
         let mut req = tokenized_req(sampling);
         if let Some(vllm::generate_request::Input::Tokenized(t)) = req.input.as_mut() {
-            t.input_ids = vec![5, 1000, 1000, 1000, 6];
+            t.input_ids = input_ids;
         }
-        req.mm_inputs = Some(vllm::MultimodalInputs {
-            mm_hashes: vec!["h0".to_string()],
-            ..Default::default()
-        });
         req.kv_transfer_params = Some(vllm::KvTransferParams {
             remote_host: "10.0.0.1".to_string(),
             remote_port: 8998,
         });
         req
     };
-    let refused = Err("Token id 1000 is out of vocabulary".to_string());
 
-    assert_eq!(check(decode(vllm::SamplingParams::default())), Ok(()));
+    let forged = legacy(vec![1, 1500], vllm::SamplingParams::default());
+    assert!(!consumes_remote_prefill(&forged));
+    assert_eq!(
+        check(forged),
+        Err("Token id 1500 is out of vocabulary".to_string())
+    );
     let single = vllm::SamplingParams {
         n: 1,
         ..Default::default()
     };
-    assert_eq!(check(decode(single)), Ok(()));
-
-    let bias = vllm::SamplingParams {
-        logit_bias: [(999_999_999, 5.0)].into_iter().collect(),
-        ..Default::default()
-    };
-    assert!(check(decode(bias))
-        .unwrap_err()
-        .contains("[999999999] in logit_bias"));
-    let stop = vllm::SamplingParams {
-        stop_token_ids: vec![1000],
-        ..Default::default()
-    };
-    assert!(check(decode(stop))
-        .unwrap_err()
-        .contains("[1000] in stop_token_ids"));
-
-    // A fan-out's decode side recomputes the prompt.
-    let fan_out = vllm::SamplingParams {
-        n: 2,
-        ..Default::default()
-    };
-    assert_eq!(check(decode(fan_out)), refused);
-
-    // An unusable pair is no handoff.
-    let mut no_port = decode(vllm::SamplingParams::default());
-    no_port.kv_transfer_params.as_mut().unwrap().remote_port = 0;
-    assert!(!consumes_remote_prefill(&no_port));
+    assert_eq!(
+        check(legacy(vec![5, 1000, 6], single)),
+        Err("Token id 1000 is out of vocabulary".to_string())
+    );
+    // In-vocabulary prompts pass as on any request.
+    assert_eq!(
+        check(legacy(vec![5, 999, 6], vllm::SamplingParams::default())),
+        Ok(())
+    );
 
     // JSON params beside the pair decide alone, either way.
-    let mut prefill_json = decode(vllm::SamplingParams::default());
+    let mut prefill_json = legacy(vec![1, 1500], vllm::SamplingParams::default());
     prefill_json.kv_transfer_params_json = Some(r#"{"do_remote_prefill": false}"#.to_string());
-    assert_eq!(check(prefill_json), refused);
-    let mut decode_json = decode(vllm::SamplingParams::default());
+    assert_eq!(
+        check(prefill_json),
+        Err("Token id 1500 is out of vocabulary".to_string())
+    );
+    let mut decode_json = legacy(vec![1, 1500], vllm::SamplingParams::default());
     decode_json.kv_transfer_params_json = Some(r#"{"do_remote_prefill": true}"#.to_string());
     assert_eq!(check(decode_json), Ok(()));
+}
+
+/// Only a consumer of a connector that pulls on `do_remote_prefill` lets the
+/// claim loosen the bound: NIXL, Mooncake and MoRIIO as `kv_consumer` or
+/// `kv_both`, a `MultiConnector` as the P2P child it is reported as. A
+/// producer, a store or offloading connector, an unprojected wrapper, an
+/// unknown connector or none do not.
+#[test]
+fn only_a_consumer_of_a_pulling_connector_honours_the_claim() {
+    for (connector, role) in [
+        ("NixlConnector", "kv_consumer"),
+        ("NixlConnector", "kv_both"),
+        ("MooncakeConnector", "kv_consumer"),
+        ("MoRIIOConnector", "kv_both"),
+    ] {
+        assert!(
+            pulls_on_do_remote_prefill(connector, role),
+            "{connector} {role}"
+        );
+    }
+    for (connector, role) in [
+        ("NixlConnector", "kv_producer"),
+        ("MooncakeConnector", ""),
+        ("MultiConnector", "kv_both"),
+        ("LMCacheConnectorV1", "kv_both"),
+        ("OffloadingConnector", "kv_both"),
+        ("SomeOtherConnector", "kv_consumer"),
+        ("", "kv_consumer"),
+        ("", ""),
+    ] {
+        assert!(
+            !pulls_on_do_remote_prefill(connector, role),
+            "{connector:?} {role:?}"
+        );
+    }
 }
 
 /// Worker-processed media in vLLM's own encoding: the exempt positions are

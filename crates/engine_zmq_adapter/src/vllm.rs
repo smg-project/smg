@@ -950,30 +950,51 @@ pub(crate) fn kv_transfer_params(
     Ok(None)
 }
 
-/// Whether the request is the decode side of a PD pair, whose prompt's KV
-/// comes from the prefill side. Only a single-sample request is: the gateway
-/// relays no handoff at `n > 1` (each choice's decode side recomputes the
-/// prompt itself, and keeps its media to do it), whatever params it carries.
-/// Then read from its connector params as [`kv_transfer_params`] resolves
-/// them, the JSON field first and alone: there, NIXL's
-/// `do_remote_prefill = true` says so. Without it, the legacy typed host/port
-/// pair, which the gateway injects into a Mooncake decode side only (and
-/// never into a prefill side), says so. Unreadable params say no (the
-/// translation refuses them).
+/// Whether the request claims to be the decode side of a PD pair, whose
+/// prompt's KV comes from the prefill side, in the one form vLLM's PD
+/// connectors act on: `do_remote_prefill: true` in its connector params, read
+/// as [`kv_transfer_params`] resolves them (the JSON field first and alone).
+/// Only a single-sample request claims it: the gateway relays no handoff at
+/// `n > 1` (each choice's decode side recomputes the prompt itself, and keeps
+/// its media to do it), whatever params it carries.
 ///
-/// This is what the request claims; whether the engine can pull any KV is
-/// the engine's configuration ([`validate_token_ids`]).
+/// The legacy typed host/port pair alone is no claim. The scheduler half of
+/// every PD connector in vLLM (`NixlConnector`, `MooncakeConnector`,
+/// `MoRIIOConnector`, checked in 0.19 and 0.32) pulls only on
+/// `do_remote_prefill`, so an engine handed the pair alone computes the
+/// prompt itself. Unreadable params say no (the translation refuses them).
+///
+/// This is what the request claims; whether the engine pulls on it is its
+/// connector's business ([`pulls_on_do_remote_prefill`]).
 pub(crate) fn consumes_remote_prefill(req: &vllm::GenerateRequest) -> bool {
     if req.sampling_params.as_ref().map_or(1, |sp| sp.n) > 1 {
         return false;
     }
-    let Ok(Some(params)) = kv_transfer_params(req) else {
-        return false;
-    };
-    if req.kv_transfer_params_json.is_some() {
-        return params.get("do_remote_prefill") == Some(&serde_json::Value::Bool(true));
-    }
-    true
+    matches!(
+        kv_transfer_params(req),
+        Ok(Some(params)) if params.get("do_remote_prefill") == Some(&serde_json::Value::Bool(true))
+    )
+}
+
+/// The PD connectors whose scheduler pulls a request's prompt KV from the
+/// prefill side when, and only when, the request carries
+/// `do_remote_prefill: true` ([`consumes_remote_prefill`]).
+const DO_REMOTE_PREFILL_CONNECTORS: [&str; 3] =
+    ["NixlConnector", "MooncakeConnector", "MoRIIOConnector"];
+
+/// Whether an engine configured with `kv_connector` in `kv_role` pulls a PD
+/// decode side's prompt KV on `do_remote_prefill: true`: a consumer
+/// (`kv_consumer` or `kv_both`) of one of [`DO_REMOTE_PREFILL_CONNECTORS`].
+///
+/// `kv_connector` is the connector the servicer reports for PD, which
+/// projects a `MultiConnector` onto its one P2P child, so a wrapper around one
+/// of these is judged as that child. Anything else says no and keeps the
+/// model's bound: no connector, a producer, a store or offloading connector
+/// (it serves cached prefixes, not the handoff), an unprojected wrapper, a
+/// connector this list does not know.
+pub(crate) fn pulls_on_do_remote_prefill(kv_connector: &str, kv_role: &str) -> bool {
+    matches!(kv_role, "kv_consumer" | "kv_both")
+        && DO_REMOTE_PREFILL_CONNECTORS.contains(&kv_connector)
 }
 
 /// Connector encoder-cache transfer params for encode-prefill-decode
@@ -1222,12 +1243,13 @@ impl VocabBounds {
 /// its prompt is the prefill side's expanded one, image-token run included,
 /// with the media stripped to an identity batch (or to nothing) because the
 /// KV it pulls supplies those positions. That holds only when the request
-/// claims the handoff ([`consumes_remote_prefill`], single-sample only) and
-/// `engine_pulls_remote_kv` says the engine was started as a KV consumer: an
-/// engine without a connector ignores the params and computes the prompt
-/// itself, so a forged claim there gets the ordinary bounds. A decode side
-/// whose KV load fails and is recomputed reads what vLLM's own frontend
-/// would have let through.
+/// claims the handoff in the form the engine's connector pulls on
+/// ([`consumes_remote_prefill`], single-sample only) and
+/// `engine_pulls_remote_kv` says the engine's connector does
+/// ([`pulls_on_do_remote_prefill`]). An engine that does not pull on the
+/// claim computes the prompt itself, so a forged or mismatched claim there
+/// gets the ordinary bounds. A decode side whose KV load fails and is
+/// recomputed reads what vLLM's own frontend would have let through.
 ///
 /// An id past the model's vocabulary that a position is allowed to hold is
 /// still a target of `prompt_logprobs`, which reads the logits at every
