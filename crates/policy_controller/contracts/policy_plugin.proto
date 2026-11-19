@@ -602,9 +602,10 @@ message MembershipChange {
     // After a resync, `ids` lists every worker of every pool, never one pool.
     KIND_SNAPSHOT = 6;
     // Since protocol 2; a stream on protocol 1 is not sent it. The worker
-    // keeps its registration and its id and stands in no pool of `models`
-    // any more: its role moved, or it serves them no longer. Sent ahead of
-    // the KIND_RELABELLED or KIND_RESIZED of the same write. A plugin that
+    // stands in no pool of `models` any more: its role moved, or it serves
+    // them no longer. A registration that keeps its id sends it ahead of
+    // its KIND_RELABELLED or KIND_RESIZED. A new incarnation sends its
+    // KIND_REPLACED first and this behind it, for the new id. A plugin that
     // lists workers by model unlists the worker under these names and keeps
     // what it holds by id. A model joined has no kind, a role move names
     // every model of the old list, and a write that moves neither sends
