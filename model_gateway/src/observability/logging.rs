@@ -63,6 +63,7 @@ const WORKSPACE_CRATES: &[&str] = &[
     "smg_grpc_client",
     "smg_mcp",
     "smg_mesh",
+    "smg_service_discovery",
     "smg_wasm",
     "smg_worker",
     "tool_parser",
@@ -1474,6 +1475,20 @@ mod filter_tests {
         assert!(debug.would_enable("smg_worker::periodic_task", &Level::DEBUG));
         let error = targets(&build_workspace_filter("error"));
         assert!(!error.would_enable("smg_worker::load::metrics_aggregator", &Level::WARN));
+    }
+
+    /// The discovery crate's lines take the configured level by the crate's
+    /// own entry. They do not rest on the gateway's entry, whose name is a
+    /// prefix of the crate's: with that entry out they still show.
+    #[test]
+    fn the_default_filter_names_the_discovery_crate_itself() {
+        let filter = build_workspace_filter("info");
+        let without_the_gateways_entry = filter.replace(",smg=info", "");
+        assert_ne!(without_the_gateways_entry, filter);
+        let shown = targets(&without_the_gateways_entry);
+        assert!(shown.would_enable("smg_service_discovery::reconciler", &Level::INFO));
+        assert!(!shown.would_enable("smg_service_discovery::reconciler", &Level::DEBUG));
+        assert!(!shown.would_enable("smg::server", &Level::INFO));
     }
 
     #[test]

@@ -100,6 +100,8 @@ impl DirectoryWatch {
         })
     }
 
+    /// Whether the watched directory was removed or moved away. The watch
+    /// reports nothing more then, so its owner starts a new one.
     pub fn is_lost(&self) -> bool {
         self.lost.load(Ordering::Relaxed)
     }

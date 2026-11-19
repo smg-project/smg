@@ -59,10 +59,10 @@ pub mod posture;
 mod rate_limit_document;
 pub(crate) mod tls;
 
+use smg_service_discovery::{export_manifest, start_service_discovery, RuntimeDiscoveryConfig};
 // The HTTP client constructors and the process crypto provider they install
 // first live in the worker tree, which builds the worker-directed clients
 // with them; callers read them as `server::http_client()` and its siblings.
-use smg_service_discovery::{export_manifest, start_service_discovery, RuntimeDiscoveryConfig};
 pub use smg_worker::connection::client_factory::{
     blocking_http_client, http_client, http_client_builder, install_crypto_provider,
 };

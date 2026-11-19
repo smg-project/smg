@@ -95,8 +95,8 @@ struct ManifestVersion {
     version: u64,
 }
 
-/// The manifest as the file holds it, and as `GET /workers?format=manifest`
-/// writes it (see [`export_manifest`]).
+/// The manifest as the file holds it, and as a host writes its registry out
+/// (see [`export_manifest`]).
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
