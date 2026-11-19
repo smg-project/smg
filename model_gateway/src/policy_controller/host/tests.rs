@@ -2,6 +2,7 @@
 //! door, beside workers registered by hand.
 
 use std::{
+    collections::BTreeSet,
     sync::Arc,
     thread,
     time::{Duration, Instant},
@@ -115,6 +116,22 @@ async fn a_pick_lands_on_the_gateways_worker_of_its_row() {
         .expect("a worker");
     let row = WorkersStore::get(&*store, placed.id()).expect("the target's row");
     assert_eq!(placed.worker().url(), row.facts.key);
+}
+
+#[tokio::test]
+async fn a_drawn_pick_is_not_the_same_worker_for_every_request() {
+    let (host, _store, _workers) = bed(&["http://w0:8000", "http://w1:8000"]);
+    let mut picked = BTreeSet::new();
+    for turn in 0..64u8 {
+        let placed = host
+            .place(&first(&[turn]), Instant::now())
+            .await
+            .expect("a worker");
+        picked.insert(placed.worker().url().to_owned());
+    }
+    // Each ask draws its own seed. Under one seed the default profile's
+    // draw lands every request on the same worker of an unchanged pool.
+    assert_eq!(picked.len(), 2, "64 requests landed on {picked:?}");
 }
 
 #[tokio::test]

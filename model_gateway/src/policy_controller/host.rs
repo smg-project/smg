@@ -31,6 +31,7 @@ use std::{
     time::Instant,
 };
 
+use rand::RngExt;
 use smg_policy_controller::{
     decision::{Decision, ShedReason, Targets},
     door::{Door, Refused, Request},
@@ -68,6 +69,10 @@ impl<'a> Ask<'a> {
     /// The request as the controller reads it, with the targets the gateway
     /// `missed` at this attempt's earlier commits. The one place a fact of
     /// a request is stated: a later step adds its fact here.
+    ///
+    /// Each call draws the decision's seed anew. The seed is the one
+    /// randomness a stage gets: under a constant seed a policy that draws
+    /// picks the same worker of an unchanged pool every time.
     fn request(&self, missed: &'a [WorkerId]) -> Request<'a> {
         Request {
             id: self.id,
@@ -76,6 +81,7 @@ impl<'a> Ask<'a> {
                 streaming: self.streaming,
                 attempt: u8::try_from(self.tried.len()).unwrap_or(u8::MAX),
                 tried: self.tried,
+                seed: rand::rng().random(),
                 ..RequestFacts::default()
             },
             constraints: Constraints {
