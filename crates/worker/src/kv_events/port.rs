@@ -65,8 +65,8 @@ pub enum BatchOutcome {
 /// Why a rank's cursor was reset or its blocks replaced, and the label the
 /// resync is counted under. This crate's collector says four: `OutOfRange`
 /// and `DataLoss`, the server's own status codes, and a snapshot's two ends,
-/// `Snapshot` and `SnapshotAbandoned`. The gateway's sink finds two with its
-/// cursor, `PublisherRestart` and `GapCleared`, and counts a `Snapshot`
+/// `Snapshot` and `SnapshotAbandoned`. A host's sink may find two with its
+/// cursor, `PublisherRestart` and `GapCleared`, and count a `Snapshot`
 /// where it clears for one. The store's statement holds three more, a
 /// relay's frames, which no stream of this crate carries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

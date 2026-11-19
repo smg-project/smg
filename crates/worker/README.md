@@ -294,6 +294,7 @@ A port is a trait this crate calls and a host implements.
 | `LoadConsumer` | `load::monitor` | Whether a reader wants loads, and how to trim what readers booked on a worker. | Its policy registry. |
 | `RequestCompletionSink` | `identity::basic` | What to do when a request on a worker ends. | The sink its policy registry installs. |
 | `KvEventSink` | `kv_events::port` | What to do with the KV cache events a worker's stream brings: keep each rank's cursor, apply what it admits, and drop a worker's blocks when it leaves. | The sink over its KV indexes. |
+| `KvEventHost` | `kv_events` | What a worker's events subscription feeds: the sink its task opens, and what goes when a model's last events subscription is gone. | Its index side: the models' KV indexes. |
 
 A host must write two of them: `Generation`, to have a registry, and
 `LoadConsumer`, to run the load monitor. The others are for a host that needs
@@ -301,10 +302,16 @@ them: one with gRPC or ZMQ workers, one that removes failed workers, one
 whose routing books requests, one that keeps an index of the engines' KV
 caches.
 
-The KV event collector runs one loop a worker
-(`KvEventCollector::subscription_loop`). Today the host starts each loop and
-ends it when the worker is removed. A lifecycle that does this for the host
-is in work.
+The KV event collector keeps one task a worker (`KvEventCollector`). A host
+adds a worker with the `SubscriptionKind` it wants and removes it. The
+collector starts the task, restarts it when the worker is registered again
+under its address, and ends it.
+
+The collector is built over a `KvEventHost`, which says what an events
+subscription feeds: `enroll` when the subscription is added, `open` when its
+task opens the worker's place in the sink, and `model_left` when a model's
+last events subscription is gone. A subscription for the pushed load records
+alone (`SubscriptionKind::Loads`) calls none of the three.
 
 ## Versioning
 
@@ -329,7 +336,7 @@ is always there.
 |---|---|---|
 | `health` | | The overload thresholds. With `runtime`: the health manager, liveness, the circuit breaker, the resilience settings and the probe of a bootstrap port. |
 | `identity` | | A worker's address, parsed once and keyed, and the sampling defaults a worker reports. With `runtime`: the `Worker` trait, `BasicWorker`, its builder, its metadata and the worker errors. |
-| `kv_events` | | The port between the collector of the KV cache events an engine pushes and a host's sink. With `runtime`: the collector. |
+| `kv_events` | | The port between the collector of the KV cache events an engine pushes and a host's sink. With `runtime`: the collector, which keeps one task a worker, and the port of its host. |
 | `labels` | | The labels of a worker's spec that the worker's own code reads. |
 | `metrics_labels` | | The metric label values the worker's writers share with a host's. |
 | `model_card` | | The model card a worker serves. |

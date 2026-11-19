@@ -27,17 +27,21 @@ pub enum SubscriptionKind {
     /// The worker's KV events to the sink, with the load records that ride
     /// them: a worker whose cache the host indexes.
     Events,
-    /// The worker's load records alone (`SubscribeKvEventsRequest.
-    /// loads_only`): a worker whose load the host reads and whose cache it
-    /// does not index. A servicer that predates the field streams its
-    /// events too; they are dropped.
+    /// The worker's load records alone
+    /// (`SubscribeKvEventsRequest.loads_only`): a worker whose load the host
+    /// reads and whose cache it does not index. A servicer that predates the
+    /// field streams its events too; they are dropped.
     Loads,
 }
+
+/// A worker's place in a sink, as a host hands it to the worker's task: the
+/// sink, and the worker's id in it.
+pub type KvEventFeed<S> = (Arc<S>, <S as KvEventSink>::Id);
 
 /// Where a load record pushed on a worker's event stream goes: the load
 /// monitor, as the collector's streams hold it. Held by this name,
 /// the sink brings nothing of the registry the load monitor is built over.
-pub trait PushedLoadSink: Send + Sync {
+pub(super) trait PushedLoadSink: Send + Sync {
     /// Take the record of `dp_rank` received at `received_at`
     /// ([`WorkerMonitor::apply_pushed_load`]).
     fn push_load(
@@ -103,14 +107,15 @@ const RECONNECT_FLOOR: Duration = Duration::from_millis(INITIAL_RECONNECT_DELAY_
 
 /// Maximum backoff between subscription attempts. Kept short: a worker that
 /// restarts is healthy again within a few seconds, and until the stream is
-/// back the blocks it stores are invisible to routing (the servicers resume
+/// back the blocks it stores are invisible to the sink (the servicers resume
 /// after the cursor and never resend them). A connect attempt is cheap.
 const MAX_RECONNECT_DELAY_MS: u64 = 5_000;
 
-/// Index cleanup is CPU-bound and can touch many blocks. Keep it
-/// off Tokio workers and bound concurrent purges during fleet-wide drains.
-pub const MAX_CONCURRENT_INDEX_REMOVALS: usize = 4;
-pub static INDEX_REMOVAL_PERMITS: Semaphore = Semaphore::const_new(MAX_CONCURRENT_INDEX_REMOVALS);
+/// A sink's removal of a worker can be CPU-bound and touch many blocks. Keep
+/// it off Tokio workers and bound the removals that run at once during
+/// fleet-wide drains.
+pub const MAX_CONCURRENT_SINK_REMOVALS: usize = 4;
+pub static SINK_REMOVAL_PERMITS: Semaphore = Semaphore::const_new(MAX_CONCURRENT_SINK_REMOVALS);
 
 /// Result of processing a stream connection to completion.
 enum StreamResult {
@@ -321,12 +326,12 @@ async fn subscribe_with_deadline(
     }
 }
 
-/// The collector of one worker's pushed stream: the subscription loop and
-/// its rounds. It keeps nothing: a subscription's state is its task's, and
-/// what a stream brought is the sink's.
-pub struct KvEventCollector;
+/// The rounds of one worker's pushed stream, and the loop that runs them. It
+/// keeps nothing: a subscription's state is its task's, and what a stream
+/// brought is the sink's.
+pub(super) struct Rounds;
 
-impl KvEventCollector {
+impl Rounds {
     /// Tell the sink the worker left, when its subscription ends: on the
     /// blocking pool and under a fleet-wide bound, since the worker's blocks
     /// leave the sink's index inside the call.
@@ -334,7 +339,7 @@ impl KvEventCollector {
     where
         S: KvEventSink + 'static,
     {
-        let Ok(permit) = INDEX_REMOVAL_PERMITS.acquire().await else {
+        let Ok(permit) = SINK_REMOVAL_PERMITS.acquire().await else {
             error!(
                 worker_url = %Endpoint::redacted_str(worker_url),
                 "Index cleanup semaphore closed"
@@ -363,14 +368,14 @@ impl KvEventCollector {
     /// the worker left; without one it streams the worker's load records
     /// alone. Exits when `shutdown_rx`
     /// fires or the backend returns `Unimplemented`. Each round
-    /// (`subscription_round`) gets the backend client, subscribes
+    /// (`subscription_round`) gets the engine connection, subscribes
     /// under the deadline and drains one stream, then says what comes next;
     /// this loop is the one place that sleeps the reconnect backoff and the
     /// one place that ends the task.
-    pub async fn subscription_loop<S>(
+    pub(super) async fn subscription_loop<S>(
         worker: Arc<dyn Worker>,
         worker_url: String,
-        feed: Option<(Arc<S>, S::Id)>,
+        feed: Option<KvEventFeed<S>>,
         model_id: String,
         mut shutdown_rx: oneshot::Receiver<()>,
         load_sink: Option<Weak<dyn PushedLoadSink>>,
@@ -415,14 +420,15 @@ impl KvEventCollector {
         if let Some((sink, id)) = feed {
             Self::remove_from_sink(sink, id, &worker_url).await;
         }
-        // The gauge is the index's: a loads-only subscription a backend refuses
-        // leaves the worker on the poll, which is the designed fallback.
+        // The gauge is the events subscription's: a loads-only one a backend
+        // refuses leaves the worker on the poll, which is the designed
+        // fallback.
         if unsupported && events {
             Metrics::set_kv_events_unavailable(&worker_url, true);
         }
     }
 
-    /// One round of a worker's subscription: the backend client, the
+    /// One round of a worker's subscription: the engine connection, the
     /// subscribe call under its deadline, the stream drained to its end;
     /// returns what the loop does next.
     async fn subscription_round<S: KvEventSink<Batch = KvEventBatch>>(
@@ -733,7 +739,7 @@ impl KvEventCollector {
     ) -> StreamResult {
         use futures::StreamExt;
 
-        // One line a stream, however many of its batches carry no rank.
+        // One line a stream, however many of its batches carry such a rank.
         let mut misfit_rank_said = false;
         while let Some(result) = stream.next().await {
             let batch = match result {
@@ -867,7 +873,7 @@ mod tests {
             clippy::disallowed_methods,
             reason = "the case ends the loop and awaits its task"
         )]
-        let task = tokio::spawn(KvEventCollector::subscription_loop(
+        let task = tokio::spawn(Rounds::subscription_loop(
             Arc::clone(worker),
             worker.url().to_string(),
             Some((Arc::new(Said::default()), 7)),
@@ -1135,7 +1141,7 @@ mod tests {
             }
             let drained = tokio::time::timeout(
                 Duration::from_secs(5),
-                KvEventCollector::drain_stream(&sub, stream, &mut snapshot, &mut shutdown_rx),
+                Rounds::drain_stream(&sub, stream, &mut snapshot, &mut shutdown_rx),
             )
             .await
             .unwrap_or_else(|_| panic!("case {which}: the drain ends"));
@@ -1240,7 +1246,7 @@ mod tests {
         };
         let drained = tokio::time::timeout(
             Duration::from_secs(5),
-            KvEventCollector::drain_stream(&sub, stream, &mut snapshot, &mut shutdown_rx),
+            Rounds::drain_stream(&sub, stream, &mut snapshot, &mut shutdown_rx),
         )
         .await
         .expect("the drain ends");
@@ -1333,7 +1339,7 @@ mod tests {
             let mut snapshot = None;
             let drained = tokio::time::timeout(
                 Duration::from_secs(5),
-                KvEventCollector::drain_stream(&sub, stream, &mut snapshot, &mut shutdown_rx),
+                Rounds::drain_stream(&sub, stream, &mut snapshot, &mut shutdown_rx),
             )
             .await
             .expect("the finite stream ends");
@@ -1530,7 +1536,7 @@ mod tests {
             request
         };
         let (round, request) = tokio::join!(
-            KvEventCollector::subscription_round(&sub, &mut backoff, &mut shutdown_rx),
+            Rounds::subscription_round(&sub, &mut backoff, &mut shutdown_rx),
             request,
         );
         assert!(matches!(round, Round::Shutdown | Round::Backoff));
@@ -1584,8 +1590,7 @@ mod tests {
             let sub = said_subscription(&worker, &sink);
             let (_keep, mut shutdown_rx) = oneshot::channel::<()>();
             let round =
-                KvEventCollector::subscription_round(&sub, &mut Backoff::new(), &mut shutdown_rx)
-                    .await;
+                Rounds::subscription_round(&sub, &mut Backoff::new(), &mut shutdown_rx).await;
             if again {
                 assert!(matches!(round, Round::Again), "{expected:?}");
             } else {
@@ -1603,7 +1608,7 @@ mod tests {
         }
 
         let sink = Arc::new(Said::default());
-        KvEventCollector::remove_from_sink(Arc::clone(&sink), 7, "grpc://w1:9000").await;
+        Rounds::remove_from_sink(Arc::clone(&sink), 7, "grpc://w1:9000").await;
         assert_eq!(sink.calls(), ["removed 7"]);
     }
 
@@ -1630,8 +1635,7 @@ mod tests {
         let sink = Said::default();
         let sub = said_subscription(&worker, &sink);
         let (_keep, mut shutdown_rx) = oneshot::channel::<()>();
-        let round =
-            KvEventCollector::subscription_round(&sub, &mut Backoff::new(), &mut shutdown_rx).await;
+        let round = Rounds::subscription_round(&sub, &mut Backoff::new(), &mut shutdown_rx).await;
         assert!(matches!(round, Round::Backoff));
         let said: Vec<String> = sink
             .calls()
@@ -1663,8 +1667,7 @@ mod tests {
         let (_keep, mut shutdown_rx) = oneshot::channel::<()>();
         let mut backoff = Backoff::new();
         backoff.grow();
-        let round =
-            KvEventCollector::subscription_round(&sub, &mut backoff, &mut shutdown_rx).await;
+        let round = Rounds::subscription_round(&sub, &mut backoff, &mut shutdown_rx).await;
         assert!(matches!(round, Round::Again));
         assert_eq!(backoff.delay_ms(), INITIAL_RECONNECT_DELAY_MS);
         assert_eq!(
@@ -1692,8 +1695,7 @@ mod tests {
         let sink = Said::default();
         let sub = said_subscription(&worker, &sink);
         let (_keep, mut shutdown_rx) = oneshot::channel::<()>();
-        let round =
-            KvEventCollector::subscription_round(&sub, &mut Backoff::new(), &mut shutdown_rx).await;
+        let round = Rounds::subscription_round(&sub, &mut Backoff::new(), &mut shutdown_rx).await;
         assert!(matches!(round, Round::Backoff));
         let said: Vec<String> = sink
             .calls()
@@ -1728,7 +1730,7 @@ mod tests {
             load: Some(record.clone()),
             ..Default::default()
         };
-        assert!(KvEventCollector::is_load_only(&only));
+        assert!(Rounds::is_load_only(&only));
         let carrying = KvEventBatch {
             sequence_number: 8,
             load: Some(EngineLoad {
@@ -1737,8 +1739,8 @@ mod tests {
             }),
             ..stored_batch(&[(1, 16)])
         };
-        assert!(!KvEventCollector::is_load_only(&carrying));
-        assert!(!KvEventCollector::is_load_only(&KvEventBatch {
+        assert!(!Rounds::is_load_only(&carrying));
+        assert!(!Rounds::is_load_only(&KvEventBatch {
             sequence_number: 9,
             ..Default::default()
         }));
@@ -1747,10 +1749,17 @@ mod tests {
     /// A batch whose rank fits no `u16` names no rank of an engine: it is
     /// said to no sink, where rank 0's cursor would have taken it, and the
     /// batches around it are said as they come. The operator reads one line
-    /// a stream, with the first such rank as the engine sent it.
+    /// a stream, with the first such rank as the engine sent it, and each
+    /// such batch is counted `not_indexed`.
     #[tracing_test::traced_test]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_batch_of_a_rank_that_fits_none_is_said_to_no_sink() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        // The round runs on this thread, under the local recorder.
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let rendered = recorder.handle();
+        let _recording = metrics::set_default_local_recorder(&recorder);
         let ranked = |sequence_number, dp_rank| KvEventBatch {
             sequence_number,
             dp_rank,
@@ -1771,8 +1780,7 @@ mod tests {
         let sink = Said::default();
         let sub = said_subscription(&worker, &sink);
         let (_keep, mut shutdown_rx) = oneshot::channel::<()>();
-        let round =
-            KvEventCollector::subscription_round(&sub, &mut Backoff::new(), &mut shutdown_rx).await;
+        let round = Rounds::subscription_round(&sub, &mut Backoff::new(), &mut shutdown_rx).await;
         assert!(matches!(round, Round::Backoff));
         let said: Vec<String> = sink
             .calls()
@@ -1797,6 +1805,59 @@ mod tests {
                 other => Err(format!("one line with the first rank, got {other:?}")),
             }
         });
+        let body = rendered.render();
+        let counted = body
+            .lines()
+            .find(|line| {
+                line.starts_with("smg_kv_event_batches_total{")
+                    && line.contains("disposition=\"not_indexed\"")
+            })
+            .and_then(|line| line.rsplit(' ').next())
+            .and_then(|count| count.parse::<f64>().ok());
+        assert_eq!(counted, Some(2.0), "{body}");
+    }
+
+    /// A batch of a rank that fits none is read no further than its rank: a
+    /// snapshot chunk it carries is not counted, and its snapshot's start is
+    /// not said. The next first chunk of a rank that fits opens the snapshot
+    /// for the sink, once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_snapshot_chunk_of_a_rank_that_fits_none_opens_no_snapshot() {
+        let chunk = |sequence_number, dp_rank, index| KvEventBatch {
+            sequence_number,
+            dp_rank,
+            snapshot: Some(KvSnapshotChunk {
+                index,
+                count: 2,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let script = vec![
+            Ok(chunk(6, Some(-1), 0)),
+            Ok(chunk(7, None, 0)),
+            Ok(chunk(8, None, 1)),
+        ];
+        let (worker, _engine) = connected(Script::Stream(script));
+        let sink = Said::default();
+        let sub = said_subscription(&worker, &sink);
+        let (_keep, mut shutdown_rx) = oneshot::channel::<()>();
+        let round = Rounds::subscription_round(&sub, &mut Backoff::new(), &mut shutdown_rx).await;
+        assert!(matches!(round, Round::Backoff));
+        let said: Vec<String> = sink
+            .calls()
+            .into_iter()
+            .filter(|call| !call.starts_with("cursor"))
+            .collect();
+        assert_eq!(
+            said,
+            [
+                "reconnected 7",
+                "resync 7 None snapshot",
+                "admit 7 rank 0 seq 7 chunk",
+                "admit 7 rank 0 seq 8 chunk",
+            ]
+        );
     }
 
     /// The count of a relay snapshot's chunks, rule by rule: a first chunk

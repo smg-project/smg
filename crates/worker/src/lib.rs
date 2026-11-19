@@ -21,8 +21,9 @@
 //!
 //! [`kv_events`] holds the port between the collector of the KV cache events
 //! an engine pushes and a host's sink: the sink's calls and the facts that
-//! cross them. The collector itself, one subscription a worker over the
-//! engine handle's two stream calls, comes with the `runtime` feature.
+//! cross them. The collector itself comes with the `runtime` feature: it
+//! keeps one subscription task a worker, over the engine handle's two stream
+//! calls, for a host that says what an events subscription feeds.
 //!
 //! The `metrics` feature adds `metrics`, the mechanism those writers share
 //! with a host's: the bounded label set, the model labels' one set and the
