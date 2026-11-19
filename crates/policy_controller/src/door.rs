@@ -2604,6 +2604,31 @@ pub(crate) mod tests {
         assert_eq!(LeasesStore::live(&*store, GATEWAY), 1, "its lease alone");
     }
 
+    /// A door's caller keeps no watch over its file. No thread of a door
+    /// looks at a file again, so no report is left for a look: with a
+    /// lease on file the file shows no watch while a decision stands and
+    /// none behind it, and what is said of a lease then is applied before
+    /// its report returns.
+    #[test]
+    fn a_doors_file_shows_no_watch_while_a_decision_stands_or_behind_it() {
+        let store = fleet(1);
+        let door = Arc::new(Door::new(Arc::clone(&store)));
+        let (first, _) = leased(&door, b"r-1", 7);
+        let ends = Ends::over(&store);
+        let held = held(&door);
+        ends.stands("pick");
+        let deciding = store.watches();
+        ends.go();
+        ends.stands("issue");
+        ends.go();
+        let second = held.join().expect("the held decision's thread");
+        assert!(second.is_some(), "the held request has its lease");
+        assert_eq!(deciding, 0, "a lease is on file and a caller decides");
+        assert_eq!(store.watches(), 0, "two leases are on file, no caller");
+        door.report(GATEWAY, first, gone());
+        assert_eq!(LeasesStore::live(&*store, GATEWAY), 1, "applied as said");
+    }
+
     /// What is said of one lease reaches its file in the order said, past
     /// a full ring. A first lease's dispatch finds the ring full and is
     /// kept beside it. Its completion and a second lease's dispatch are

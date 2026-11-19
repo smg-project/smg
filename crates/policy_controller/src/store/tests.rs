@@ -15,7 +15,7 @@ use super::{
     LoadSample, LoadSink, LoadSource, MembershipChange, MembershipTail, MemoryStore, Picked, Pin,
     PollMode, Position, Reachability, ReservationKind, ReservationStore, ResyncReason, Said,
     SequenceHash, SessionsStore, Sides, Signals, SnapshotChunk, StoredBlock, VetoWrite,
-    ViewBuffers, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore, World,
+    ViewBuffers, Watch, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore, World,
 };
 use crate::{
     decider::Decider,
@@ -3947,6 +3947,234 @@ fn under_bed(leases: u64, now: Instant) -> (Arc<MemoryStore>, WorkerId, Vec<Leas
     let ids = ids.collect();
     let first = store.world().epoch();
     (store, a, ids, first)
+}
+
+/// A thread with no job at hand keeps its watch while a lease stands on
+/// its file: a hand leaves its frame in the ring, and the thread's next
+/// look applies it, or the first step of its next job.
+#[test]
+fn a_frame_handed_under_a_watch_is_left_to_the_watching_thread() {
+    let now = Instant::now();
+    let (store, a, ids) = handed_bed(3, now);
+    let hand = Hand::new(GatewayId(1));
+    let mut place = store.at_work();
+    assert_eq!(place.look(), Watch::Quiet, "three leases stand on the file");
+    assert_eq!(store.watches(), 1);
+    store.hand(&hand, ids[0], GONE);
+    assert_eq!((told_ids(), in_flight(&store)), (vec![], vec![(a, 3)]));
+    // The thread's next look applies the frame,
+    assert_eq!(place.look(), Watch::Fed);
+    assert_eq!(
+        (told_ids(), in_flight(&store)),
+        (vec![(1, GONE)], vec![(a, 2)])
+    );
+    // and so does the first step of its next job.
+    store.hand(&hand, ids[1], GONE);
+    assert_eq!(told_ids(), []);
+    place.work();
+    assert_eq!(
+        (told_ids(), in_flight(&store)),
+        (vec![(2, GONE)], vec![(a, 1)])
+    );
+}
+
+/// A watch starts at a look that finds a lease on file, never at a job.
+/// A thread that rests behind each job shows none, as a caller of a door
+/// in process: its hands read who is at work, and its rest applies what
+/// they left. A thread that looked keeps its watch through the jobs
+/// behind the look.
+#[test]
+fn a_watch_starts_at_a_look_and_stands_through_a_job() {
+    let now = Instant::now();
+    let (store, a, ids) = handed_bed(3, now);
+    let hand = Hand::new(GatewayId(1));
+    let mut place = store.at_work();
+    assert_eq!(store.watches(), 0, "at work, and no look yet");
+    store.hand(&hand, ids[0], GONE);
+    assert_eq!(told_ids(), [], "left to the thread at work");
+    place.rest();
+    assert_eq!((told_ids(), store.watches()), (vec![(1, GONE)], 0));
+    place.work();
+    assert_eq!(store.watches(), 0, "a job starts no watch");
+    assert_eq!(place.look(), Watch::Quiet, "two leases stand on the file");
+    assert_eq!(store.watches(), 1);
+    place.work();
+    assert_eq!(store.watches(), 1, "the watch stands through the job");
+    store.hand(&hand, ids[1], GONE);
+    assert_eq!(told_ids(), []);
+    place.apply();
+    assert_eq!(
+        (told_ids(), in_flight(&store)),
+        (vec![(2, GONE)], vec![(a, 1)])
+    );
+}
+
+/// A look says whether it applied a frame, for its host to set the time
+/// to its next look by: a frame of a lease on file, and one that names no
+/// lease on file, since its gateway spoke all the same. A frame the
+/// thread applied as it took up a job is behind it at its next look.
+#[test]
+fn a_look_says_whether_it_applied_a_frame() {
+    let now = Instant::now();
+    let (store, a, ids) = handed_bed(3, now);
+    let hand = Hand::new(GatewayId(1));
+    let mut place = store.at_work();
+    assert_eq!(place.look(), Watch::Quiet, "nothing was handed");
+    store.hand(&hand, ids[0], GONE);
+    assert_eq!(place.look(), Watch::Fed);
+    assert_eq!(place.look(), Watch::Quiet, "the ring is empty again");
+    // A second release of the lease that left: a frame all the same.
+    store.hand(&hand, ids[0], GONE);
+    assert_eq!(place.look(), Watch::Fed);
+    // What the thread applies at a job's first step is not its look's.
+    store.hand(&hand, ids[1], GONE);
+    place.work();
+    assert_eq!(place.look(), Watch::Quiet);
+    assert_eq!(in_flight(&store), [(a, 1)]);
+}
+
+/// A look that finds no lease on file ends the watch: the thread owes the
+/// file no further look, and a hand applies in place again.
+#[test]
+fn a_look_that_finds_no_lease_on_file_ends_the_watch() {
+    let now = Instant::now();
+    let (store, a, ids) = handed_bed(1, now);
+    let hand = Hand::new(GatewayId(1));
+    let mut place = store.at_work();
+    assert_eq!(place.look(), Watch::Quiet);
+    store.hand(&hand, ids[0], GONE);
+    // The look applies the release of the file's last lease.
+    assert_eq!(place.look(), Watch::Ended);
+    assert_eq!(store.watches(), 0);
+    assert_eq!(
+        (told_ids(), in_flight(&store)),
+        (vec![(1, GONE)], vec![(a, 0)])
+    );
+    // A lease laid on a file nobody watches: its frame is applied by its
+    // hand.
+    let (second, _) = issued_at(&store, a, now);
+    store.hand(&hand, LeaseId(1 << 32 | second), GONE);
+    assert_eq!(
+        (told_ids(), in_flight(&store)),
+        (vec![(second, GONE)], vec![(a, 0)])
+    );
+    assert_eq!(place.look(), Watch::Ended, "no lease stands, and no watch");
+}
+
+/// A watch ends by its word first and one more look behind it. A frame a
+/// hand left under the old word is applied by that look, and a lease it
+/// finds on file keeps the watch: the cases lay the lease and the frame
+/// that reach a file between a look that found none and the word's end.
+#[test]
+fn a_watch_ends_behind_one_more_look() {
+    let now = Instant::now();
+    let (store, a, ids) = handed_bed(2, now);
+    let hand = Hand::new(GatewayId(1));
+    let mut place = store.at_work();
+    assert_eq!(place.look(), Watch::Quiet);
+    store.hand(&hand, ids[0], GONE);
+    assert_eq!(told_ids(), []);
+    // The end's own look applies the frame and finds the second lease:
+    // the watch stands, and the next frame is left to it.
+    assert_eq!(place.end_watch(), Watch::Fed);
+    assert_eq!(
+        (told_ids(), in_flight(&store), store.watches()),
+        (vec![(1, GONE)], vec![(a, 1)], 1)
+    );
+    store.hand(&hand, ids[1], GONE);
+    assert_eq!(told_ids(), [], "left to the watch that stands");
+    // With the last lease's release in the ring the end applies it, and
+    // the watch ends: the next frame is applied by its hand.
+    assert_eq!(place.end_watch(), Watch::Ended);
+    assert_eq!(
+        (told_ids(), in_flight(&store), store.watches()),
+        (vec![(2, GONE)], vec![(a, 0)], 0)
+    );
+    let (third, _) = issued_at(&store, a, now);
+    store.hand(&hand, LeaseId(1 << 32 | third), GONE);
+    assert_eq!(told_ids(), [(third, GONE)]);
+}
+
+/// A thread that rests, or drops its place, ends its watch whatever
+/// stands on its file: the hands apply in place from there.
+#[test]
+fn a_place_that_rests_or_drops_ends_its_watch() {
+    let now = Instant::now();
+    let (store, a, ids) = handed_bed(4, now);
+    let hand = Hand::new(GatewayId(1));
+    let mut place = store.at_work();
+    assert_eq!(place.look(), Watch::Quiet);
+    store.hand(&hand, ids[0], GONE);
+    assert_eq!(told_ids(), []);
+    // Its rest applies what was handed, and ends the watch over the three
+    // leases that stand.
+    place.rest();
+    assert_eq!((told_ids(), store.watches()), (vec![(1, GONE)], 0));
+    store.hand(&hand, ids[1], GONE);
+    assert_eq!(told_ids(), [(2, GONE)]);
+    // A place dropped on its watch does the same.
+    place.work();
+    assert_eq!(place.look(), Watch::Quiet);
+    store.hand(&hand, ids[2], GONE);
+    assert_eq!(told_ids(), []);
+    drop(place);
+    assert_eq!((told_ids(), store.watches()), (vec![(3, GONE)], 0));
+    store.hand(&hand, ids[3], GONE);
+    assert_eq!(
+        (told_ids(), in_flight(&store)),
+        (vec![(4, GONE)], vec![(a, 0)])
+    );
+}
+
+/// The sweep applies at a watched file while the file's thread waits: a
+/// dispatch left in the ring is applied before the sweep reads a
+/// deadline, so its lease is not ended as one no gateway dispatched.
+#[test]
+fn the_sweep_applies_at_a_watched_file_whose_thread_waits() {
+    let now = Instant::now();
+    let (store, a, ids) = handed_bed(2, now);
+    let hand = Hand::new(GatewayId(1));
+    let mut place = store.at_work();
+    assert_eq!(place.look(), Watch::Quiet);
+    let dispatch = Said::Dispatched(Dispatch::default(), now);
+    store.hand(&hand, ids[0], dispatch);
+    assert_eq!(told_ids(), []);
+    // Past both leases' dispatch deadline.
+    let ended = LeasesStore::expire(&*store, now + Duration::from_secs(6));
+    let ended: Vec<_> = ended.iter().map(|record| record.lease.id).collect();
+    assert_eq!(ended, [ids[1]]);
+    let abandoned = Said::Released(None, ReleaseReason::Abandoned);
+    assert_eq!(told_ids(), [(1, dispatch), (2, abandoned)]);
+    assert_eq!(in_flight(&store), [(a, 1)]);
+    assert_eq!(place.look(), Watch::Quiet, "the dispatched lease stands");
+}
+
+/// A full ring under a watch: the hand that finds it applies where the
+/// watching thread waits, in the order the frames were handed, and no
+/// frame is dropped.
+#[test]
+fn a_full_ring_under_a_watch_is_applied_by_its_hand() {
+    let now = Instant::now();
+    let room = u64::try_from(MemoryStore::HANDOVER).expect("the ring's room is a count");
+    let (store, a, ids) = handed_bed(room + 2, now);
+    let hand = Hand::new(GatewayId(1));
+    let mut place = store.at_work();
+    assert_eq!(place.look(), Watch::Quiet);
+    for id in &ids[..MemoryStore::HANDOVER] {
+        store.hand(&hand, *id, GONE);
+    }
+    assert_eq!(told_ids(), [], "the ring holds its room");
+    // The next hand finds the ring full and applies it; its own frame
+    // waits for the watch.
+    store.hand(&hand, ids[MemoryStore::HANDOVER], GONE);
+    let applied = told_ids();
+    assert_eq!(applied.len(), MemoryStore::HANDOVER);
+    assert!(applied.iter().map(|(lease, _)| *lease).eq(1..=room));
+    assert_eq!(place.look(), Watch::Fed, "one lease stands behind the look");
+    assert_eq!(
+        (told_ids(), in_flight(&store)),
+        (vec![(room + 1, GONE)], vec![(a, 1)])
+    );
 }
 
 /// The frames of one take are told under one world, the store's as it

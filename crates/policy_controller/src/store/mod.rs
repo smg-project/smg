@@ -96,7 +96,7 @@ pub use leases::{
     DecodeSide, Dispatch, LeaseRecord, LeaseRefused, LeaseState, LeasesStore, Picked, Said, Sides,
 };
 pub use loads::{LoadSample, LoadSink, LoadSource, PollMode};
-pub use memory::{AtWork, Cut, Hand, MemoryStore, StoreCounts};
+pub use memory::{AtWork, Cut, Hand, MemoryStore, StoreCounts, Watch};
 pub use pairing::{PairClasses, PairingDescriptor};
 pub use reservations::{ReservationKind, ReservationStore};
 pub use sessions::{Pin, SessionsStore};

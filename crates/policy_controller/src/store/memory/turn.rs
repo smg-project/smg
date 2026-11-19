@@ -29,22 +29,61 @@
 //! applies at its file: a thread that holds the file's turn and finds its
 //! decider at work lets go and applies nothing, and what was handed waits
 //! for the decider's next take. So a file's lines stay with the one
-//! thread that reads them. With the file's decider waiting for a job,
-//! whoever takes the turn applies: the session that hands, and the
-//! gateways' sweep, which ends the file's leases past their dispatch
-//! deadline ([`LeasesStore::expire`](crate::store::LeasesStore::expire)).
-//! So no handed frame waits on a lull, but behind a thread that left its
-//! work by an unwind: what it left is the next take's.
+//! thread that reads them.
+//!
+//! A decider that waits for a job keeps its watch while its file holds a
+//! lease ([`AtWork::look`]): it looks at the file again within its host's
+//! period, and a hand leaves its frame in the ring for that look. The
+//! watch starts at a look that finds a lease on file and stands through
+//! the jobs behind it. A hand reads it from a word the decider writes
+//! only where a watch starts or ends, so a session that hands to a
+//! watched file writes the ring and reads nothing a decider writes at a
+//! job. The price is a lag on a lull: a frame handed while the file's
+//! decider waits is applied one period later at most, and another file's
+//! decision reads what its apply writes that much later: its worker's
+//! count, high for a lease that ended and low on a target a dispatch
+//! moved a lease to, and what a stage keeps of a lease's events. A
+//! session's pin of record is read by its own model's decisions alone,
+//! which the file's decider makes behind its apply. A look says whether
+//! it applied a frame ([`Watch`]), and its host sets the time to its next
+//! look by that: short while the file's frames flow, longer over a quiet
+//! file. A watch ends where a look finds no lease on file: the decider
+//! takes its word back and looks once more. A frame that look misses was
+//! handed against the old word and names no lease on file: it changes
+//! nothing, and it is the next take's. Where another thread lays that
+//! lease behind the look, the next take is near: the next hand at the
+//! file applies in place and finds the frame first in the ring, and the
+//! sweep's next pass applies it otherwise. A thread that rests on its
+//! watch ([`AtWork::rest`]), as a decider does where its queue ends,
+//! takes the word back over leases on file: a frame a hand left under
+//! the old word then names one, and waits for the same takes.
+//!
+//! With no watch at a file and no thread at work there, whoever takes
+//! the turn applies: the hand itself, as at a file no decider was
+//! started for, and the gateways' sweep, which ends the file's leases
+//! past their dispatch deadline
+//! ([`LeasesStore::expire`](crate::store::LeasesStore::expire)). The
+//! sweep applies at a watched file too while its decider waits, and so
+//! do a stream's end ([`MemoryStore::hand_back`]) and a hand that finds
+//! the ring full. So a frame of a lease on file waits one period at
+//! most, but behind a thread that left its work by an unwind or rested
+//! on its watch: what it left is the next take's.
 //!
 //! A door in process has no deciding thread ([`crate::door::Door`]): each
-//! caller is at work at its seat's file for its one decision, and leaves
-//! that work as a decider that waits for a job does. A report said
-//! through the door does not wait at a full ring: the door keeps it
-//! beside the ring, and the caller at work hands it on as it leaves.
+//! caller is at work at its seat's file for its one decision and rests
+//! as it leaves ([`AtWork::rest`]). No caller looks at a file again, so
+//! a door's file shows no watch: what is said of a lease is applied at
+//! once where no caller decides at its file, and by the caller at work
+//! otherwise, as it leaves. A report said through the door does not wait
+//! at a full ring: the door keeps it beside the ring, and the caller at
+//! work hands it on as it leaves.
 //!
-//! The hand-over. A frame handed while the file's decider leaves its work
-//! waits on no lull: the leaver's last take finds it, or its hand reads
-//! the word the leaver wrote, or a later one. The proof is an argument
+//! The hand-over, where a file shows no watch. A frame handed while the
+//! file's decider leaves its work waits on no lull: the leaver's last
+//! take finds it, or its hand reads the mark the leaver wrote, or a
+//! later one. A hand at a watched file reads the watch's word and no
+//! mark: its frame waits for the watching thread's next take, and
+//! nothing of this argument is asked there. The proof is an argument
 //! from the language's memory model. It asks nothing of a processor's
 //! own ordering, and no case of the suite tells a fence from none. A
 //! hand writes its frame, passes a sequentially consistent fence and
@@ -102,7 +141,7 @@ use std::{
     ops::{Deref, DerefMut},
     sync::{
         atomic::{
-            fence, AtomicU64, AtomicUsize,
+            fence, AtomicBool, AtomicU64, AtomicUsize,
             Ordering::{Relaxed, SeqCst},
         },
         Arc, OnceLock,
@@ -198,20 +237,44 @@ mod ring {
         pub(super) fn take(&mut self) -> Option<Handed> {
             self.0.pop()
         }
+
+        /// Whether a frame waits: a look's read, ahead of its apply
+        /// ([`MemoryStore::looked`]).
+        pub(super) fn waits(&self) -> bool {
+            !self.0.is_empty()
+        }
     }
 }
 
-/// What a hand reads of a file, on lines of its own: the threads that
-/// write the file share no line with the threads that only hand to it.
+/// What a hand reads of a file at each frame, on lines of its own: no
+/// thread writes them while the file's decider keeps its watch.
 #[repr(align(128))]
 struct Shown {
+    /// The ring's writing end, every hand's.
+    hands: ring::Hands,
+    /// Whether the file's decider keeps its watch over the ring: with a
+    /// job at hand or none, it takes what the ring holds within its
+    /// host's period ([`AtWork::look`]). A hand that reads `true` leaves
+    /// its frame in the ring. Written where a watch starts and where it
+    /// ends.
+    watched: AtomicBool,
+}
+
+/// Who is at work at a file, in a block of its own. A hand at a file with
+/// no watch reads it at each frame, and the file's decider writes it at
+/// each job that ends a wait. So it stands off the lines every hand reads
+/// ([`Shown`]), which no decider writes at a job. It stands off the lines
+/// behind the turn too, which the turn's holder writes at each issue and
+/// each apply: on one line with the last of them, a hand's read met a
+/// write of each decision, and a controller's only decider served 6 to 8
+/// per cent fewer by a timed pair.
+#[repr(align(128))]
+struct Working {
     /// The mark of the thread at work at the file ([`me`]); 0 for none.
     /// One thread at most works at a file: its decider, with a job at
     /// hand. It applies what is handed while it works, and once more as
     /// it leaves.
     at_work: AtomicUsize,
-    /// The ring's writing end, every hand's.
-    hands: ring::Hands,
 }
 
 /// What stands behind the turn: the file, and the reading end of its
@@ -226,8 +289,11 @@ pub(super) struct Behind {
 pub(super) struct File {
     /// The turn: its holder writes the file.
     turn: Mutex<Behind>,
-    /// What a hand reads.
+    /// What a hand reads at each frame.
     shown: Shown,
+    /// Who is at work at the file: what a hand reads where no watch
+    /// stands.
+    working: Working,
     /// The decider whose file this is, where the store's host named its
     /// deciders: a lease's events are told under it.
     name: Option<Decider>,
@@ -242,8 +308,11 @@ impl File {
         Self {
             turn: Mutex::new(Behind { leases, ring }),
             shown: Shown {
-                at_work: AtomicUsize::new(0),
                 hands,
+                watched: AtomicBool::new(false),
+            },
+            working: Working {
+                at_work: AtomicUsize::new(0),
             },
             name,
             #[cfg(debug_assertions)]
@@ -325,17 +394,48 @@ impl DerefMut for Turn<'_> {
     }
 }
 
+/// What a look says of its thread's watch ([`AtWork::look`]): whether it
+/// stands, and whether the look applied a frame. Its host sets the time
+/// to its next look by it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Watch {
+    /// The thread keeps no watch: the file holds no lease, and a watch
+    /// it kept has ended, by its word first and one more look behind it.
+    /// The hands apply in place, and the thread may wait with no bound.
+    /// Said too where another thread is at work at the file: what waits
+    /// there is that thread's.
+    Ended,
+    /// A lease stands on the file and the look applied no frame: the
+    /// watch stands over a quiet file. The hands leave their frames in
+    /// the ring, and the thread owes the file its next look, by
+    /// [`AtWork::look`] or by its next job.
+    Quiet,
+    /// A lease stands on the file and the look applied a frame: the
+    /// watch stands as under [`Watch::Quiet`], over a file whose frames
+    /// flow.
+    Fed,
+}
+
 /// A decider's place at its file ([`MemoryStore::at_work`]). While its
 /// thread works the hands leave what they hand to that file to it: it
 /// applies where it finds its turn free at each request it takes
 /// ([`AtWork::apply`]), at each issue, and behind the give-up of an
-/// answer its stream refused. A thread that rests ([`AtWork::rest`]) or
-/// drops its place takes the turn once more: what was handed behind its
-/// last take is applied before the thread waits.
+/// answer its stream refused. A thread with no job at hand looks at its
+/// file ([`AtWork::look`]) and keeps its watch while the file holds a
+/// lease: the hands still leave their frames to it, and it owes the file
+/// its next look within its host's period. A thread that rests
+/// ([`AtWork::rest`]) or drops its place leaves its work, ends a watch it
+/// keeps and takes the turn once more: what was handed behind its last
+/// take is applied before the thread waits, and the hands apply in place
+/// from there. A thread that rests behind each job never looks, and
+/// keeps no watch: a caller of a door in process.
 pub struct AtWork {
     store: Arc<MemoryStore>,
     file: usize,
     working: bool,
+    /// Whether the file shows this thread's watch ([`Shown::watched`]):
+    /// from a look that found a lease on file to the watch's end.
+    watching: bool,
 }
 
 impl AtWork {
@@ -351,7 +451,9 @@ impl AtWork {
     }
 
     /// The thread has a job at hand again: it says so and then takes its
-    /// turn, the first step of its work.
+    /// turn, the first step of its work. A watch it keeps stands through
+    /// the job, and the job starts none: the hands read a thread with no
+    /// watch as the thread at work.
     pub fn work(&mut self) {
         if !self.working {
             self.working = true;
@@ -359,23 +461,100 @@ impl AtWork {
         }
     }
 
-    /// The thread waits for its next job: it says so, and what was handed
-    /// behind its last take is applied before it waits.
-    pub fn rest(&mut self) {
+    /// The thread has no job at hand: it leaves its work, applies what
+    /// was handed behind its last take and says what stands of its watch
+    /// ([`Watch`]). While its file holds a lease the watch stands, and
+    /// starts here where the thread kept none: the hands leave their
+    /// frames in the ring, and the thread owes the file its next look
+    /// within its host's period, by this call or by its next job. Where
+    /// the file holds none the watch has ended, by its word first and one
+    /// more look behind it: the hands apply in place, and the thread may
+    /// wait with no bound.
+    #[must_use = "a thread that keeps its watch owes its file the next look"]
+    pub fn look(&mut self) -> Watch {
         if self.working {
             self.working = false;
-            self.store.leave(self.file, true);
+            self.store.leave(self.file);
         }
+        match self.store.looked(self.file) {
+            // A watch ends by its word first and one more look. A thread
+            // that kept none has no word to take back.
+            Watch::Ended if self.watching => self.end_watch(),
+            Watch::Ended => Watch::Ended,
+            stands => {
+                if !self.watching {
+                    // A hand that read no word read who is at work behind
+                    // its fence: it applied in place, or the look above
+                    // applied its frame. The watch starts with nothing
+                    // left behind it.
+                    self.watching = true;
+                    self.word().store(true, SeqCst);
+                }
+                stands
+            }
+        }
+    }
+
+    /// Ends the watch of a thread whose look found no lease on file, and
+    /// says what stands of it after all. The word is taken back first and
+    /// the file looked at once more behind it. A hand that read the old
+    /// word left its frame in the ring: this look applies it, or it finds
+    /// no lease on file and the frame names none. A lease it finds, laid
+    /// by another thread since the first look, keeps the watch: its
+    /// frames may wait in the ring.
+    pub(crate) fn end_watch(&mut self) -> Watch {
+        self.word().store(false, SeqCst);
+        fence(SeqCst);
+        let found = self.store.looked(self.file);
+        if found == Watch::Ended {
+            self.watching = false;
+        } else {
+            self.word().store(true, SeqCst);
+        }
+        found
+    }
+
+    /// The thread waits for its next job and owes its file no look: it
+    /// ends a watch it keeps and says it left its work, and what was
+    /// handed behind its last take is applied before it waits. The hands
+    /// apply in place from there. A thread that kept no watch leaves no
+    /// frame behind: its hands read who is at work, with a fence on both
+    /// sides. One that ends a watch here takes the word back over leases
+    /// on file: a hand that read the old word may leave a frame of one
+    /// behind this take, for the file's next: the next hand's, which
+    /// applies in place, or the sweep's pass.
+    pub fn rest(&mut self) {
+        if self.working || self.watching {
+            self.working = false;
+            if self.watching {
+                self.watching = false;
+                self.word().store(false, SeqCst);
+            }
+            self.store.leave(self.file);
+            self.store.settle(self.file);
+        }
+    }
+
+    /// The word of this place's watch, as its file shows it.
+    fn word(&self) -> &AtomicBool {
+        &self.store.files[self.file].shown.watched
     }
 }
 
 impl Drop for AtWork {
     /// A thread that leaves by an unwind looks at nothing: what it left
     /// is the next take's, and a tell that unwound is not asked again
-    /// under it.
+    /// under it. A watch it keeps ends either way, as at a rest
+    /// ([`AtWork::rest`]): the hands apply in place.
     fn drop(&mut self) {
-        if self.working {
-            self.store.leave(self.file, !thread::panicking());
+        if self.working || self.watching {
+            if self.watching {
+                self.word().store(false, SeqCst);
+            }
+            self.store.leave(self.file);
+            if !thread::panicking() {
+                self.store.settle(self.file);
+            }
         }
     }
 }
@@ -552,6 +731,24 @@ impl MemoryStore {
         }
     }
 
+    /// How many files show a watch, for the cases: no door of the store
+    /// tells it.
+    #[cfg(test)]
+    pub(crate) fn watches(&self) -> usize {
+        let files = self.files.iter();
+        files.filter(|file| file.shown.watched.load(SeqCst)).count()
+    }
+
+    /// How many files show a thread at work, for the deciders' cases: no
+    /// door of the store tells it.
+    #[cfg(all(test, feature = "controller"))]
+    pub(crate) fn working(&self) -> usize {
+        let files = self.files.iter();
+        files
+            .filter(|file| file.working.at_work.load(SeqCst) != 0)
+            .count()
+    }
+
     /// The calling thread's place at its file, at work: a decider's, from
     /// a job at hand to an empty queue. The file is the one of the
     /// decider the thread acts as ([`Decider::acting`]), and one thread
@@ -563,6 +760,7 @@ impl MemoryStore {
             store: Arc::clone(self),
             file: self.acting(),
             working: false,
+            watching: false,
         };
         place.work();
         place
@@ -573,20 +771,46 @@ impl MemoryStore {
     /// work and took the turn is through before this thread acts, and
     /// one that takes it behind this step reads the mark under the turn.
     fn begin(&self, at: usize) {
-        let was = self.files[at].shown.at_work.swap(me(), SeqCst);
+        let was = self.files[at].working.at_work.swap(me(), SeqCst);
         debug_assert_eq!(was, 0, "one thread works at a file");
         fence(SeqCst);
         drop(self.turn_of(at));
     }
 
-    /// The thread at work at the file at `at` leaves its work. Where it
-    /// `looks`, it takes the turn once more: the leaver's half of the
-    /// hand-over ([`Self::settle`]).
-    fn leave(&self, at: usize, looks: bool) {
-        self.files[at].shown.at_work.store(0, SeqCst);
-        if looks {
-            fence(SeqCst);
-            self.settle(at);
+    /// The thread at work at the file at `at` leaves its work: it takes
+    /// its mark back, with a fence behind the write. The take that
+    /// follows, its look ([`Self::looked`]) or its last apply, is the
+    /// leaver's half of the hand-over ([`Self::settle`]).
+    fn leave(&self, at: usize) {
+        self.files[at].working.at_work.store(0, SeqCst);
+        fence(SeqCst);
+    }
+
+    /// A look at the file at `at` by its own decider with no job at hand:
+    /// what waits is applied under the turn, and the answer is what
+    /// stands of the watch behind it: whether the file holds a lease, and
+    /// whether this look applied a frame. The look reads that from the
+    /// ring under its turn, ahead of the apply: the apply is every
+    /// take's, and it counts no frame. A frame handed while the look
+    /// applies is applied all the same and not said: the time to the
+    /// next look then grows once where it would have fallen.
+    /// [`Watch::Ended`] too where another thread is at work there: what
+    /// waits is that thread's.
+    fn looked(&self, at: usize) -> Watch {
+        if !self.may_act(at) {
+            return Watch::Ended;
+        }
+        let mut turn = self.files[at].take();
+        let fed = turn.behind.ring.waits();
+        if !self.applied(at, &mut turn) {
+            return Watch::Ended;
+        }
+        if turn.records.is_empty() {
+            Watch::Ended
+        } else if fed {
+            Watch::Fed
+        } else {
+            Watch::Quiet
         }
     }
 
@@ -604,7 +828,7 @@ impl MemoryStore {
     /// wait for that file's turn; what an apply goes by is read under the
     /// turn ([`Self::applied`]).
     pub(super) fn may_act(&self, at: usize) -> bool {
-        let worker = self.files[at].shown.at_work.load(SeqCst);
+        let worker = self.files[at].working.at_work.load(SeqCst);
         worker == 0 || worker == me()
     }
 
@@ -627,15 +851,15 @@ impl MemoryStore {
     }
 
     /// Applies what waits at the file at `at` where the caller found no
-    /// thread at work, and says whether it did. A hand writes its frame
-    /// and then reads who is at work; a thread that leaves work says so
-    /// and then comes here. Each puts a fence between its write and its
-    /// read, so one of the two sees the other whatever the ring's own
-    /// orderings are: the frame is applied by the thread at work or by
-    /// its hand. A thread that began work meanwhile is read under the
-    /// turn, and what waits is left to it. A thread at work is read
-    /// first, with no turn held: its file's turn is not taken from it, and
-    /// its next take applies what waits.
+    /// thread at work, and says whether it did. A hand at a file with no
+    /// watch writes its frame and then reads who is at work; a thread
+    /// that leaves work says so and then comes here. Each puts a fence
+    /// between its write and its read, so one of the two sees the other
+    /// whatever the ring's own orderings are: the frame is applied by the
+    /// thread at work or by its hand. A thread that began work meanwhile
+    /// is read under the turn, and what waits is left to it. A thread at
+    /// work is read first, with no turn held: its file's turn is not
+    /// taken from it, and its next take applies what waits.
     ///
     /// Kept out of line: laid into a hand it costs each hand three
     /// instructions, by count.
@@ -670,16 +894,28 @@ impl MemoryStore {
     /// Hands the file a lease's id names what a frame said of `lease`: a
     /// session's own hand. A host in process says the same through its
     /// door ([`Door::report`](crate::door::Door::report)), which a full
-    /// ring does not hold. The frame is written into the file's ring and
-    /// applied by whoever may act at the file next: its decider at work,
-    /// or this caller where none is. A full ring stops its caller until a
-    /// holder applied, so no frame is dropped: the caller applies where
-    /// no thread is at work, and waits for the one that is, which looks
-    /// at its ring at each request it takes, whatever its answer. The
-    /// caller's thread is held for that wait, to the first such look that
-    /// finds the file's turn free: it yields `FULL_RING_YIELDS` times,
-    /// then sleeps `FULL_RING_SLEEP` between its looks, so a slow
-    /// decision costs its waiting hands no core.
+    /// ring does not hold. The frame is written into the file's ring.
+    /// Where the file's decider keeps its watch the hand leaves it there:
+    /// the decider applies it at its next take, one period of its host
+    /// away at most. The word is read with no fence behind the ring's
+    /// write, so a hand can read the old word behind a watch's last look:
+    /// its frame then names no lease on file, and waits for the file's
+    /// next take. Where another thread lays that lease behind the look,
+    /// that take is the next hand's, which applies in place, or the
+    /// sweep's next pass. Behind a thread that rested on its watch
+    /// ([`AtWork::rest`]) such a frame may name a lease on file, and
+    /// waits for the same takes. With no watch a frame is applied by
+    /// whoever may act at the file next: a thread at work there, or this
+    /// caller where none is.
+    ///
+    /// A full ring stops its caller until a holder applied, so no frame
+    /// is dropped: the caller applies where no thread is at work, and
+    /// waits for the one that is, which looks at its ring at each request
+    /// it takes, whatever its answer. The caller's thread is held for
+    /// that wait, to the first such look that finds the file's turn free:
+    /// it yields `FULL_RING_YIELDS` times, then sleeps `FULL_RING_SLEEP`
+    /// between its looks, so a slow decision costs its waiting hands no
+    /// core.
     pub fn hand(&self, hand: &Hand, lease: LeaseId, said: Said) {
         let at = self.file_of(lease);
         let mut looks = 0_u32;
@@ -715,9 +951,15 @@ impl MemoryStore {
             }
         }
         hand.mark(at);
+        // A watched file: the frame is its decider's. The word shares its
+        // line with the ring's end alone, and no decider writes it at a
+        // job.
+        if file.shown.watched.load(Relaxed) {
+            return true;
+        }
         // The hand's half of the hand-over ([`Self::settle`]).
         fence(SeqCst);
-        if file.shown.at_work.load(SeqCst) == 0 {
+        if file.working.at_work.load(SeqCst) == 0 {
             self.settle(at);
         }
         true
