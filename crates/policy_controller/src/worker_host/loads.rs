@@ -1,12 +1,14 @@
 //! The worker load sink over the store.
 //!
-//! The collector holds its reports lock at a record, a poll answer or a
-//! forget, so an object's forget and a later object's first call never
-//! interleave. The adapter takes its member map lock inside it, then reads
-//! the registry. On a miss it also reads the holder, under the map's write
-//! lock. It releases the map before calling the store, which takes its own
-//! locks and may pay for a membership build on a poll answer. The adapter
-//! calls no collector.
+//! The collector holds its reports lock at a record, a poll's report or a
+//! forget, so a later object's first sample never lands between an
+//! object's forget and its eviction. Its poll question and a failed fetch
+//! run outside that lock, and neither lays a sample an eviction could wipe.
+//! Where the collector holds the lock, the adapter takes its member map
+//! lock inside it, then reads the registry. On a miss it also reads the
+//! holder, under the map's write lock. It releases the map before calling
+//! the store, which takes its own locks and may pay for a membership build
+//! on a poll answer. The adapter calls no collector.
 
 use std::{
     sync::Arc,
@@ -275,10 +277,10 @@ impl<G: Generation, S: StoreLoadSink + ?Sized + 'static> LoadSink for LoadAdapte
             return;
         }
         // Loads are a row's, and the entry says whose stand on it: a later
-        // object's first record, report or poll question puts its own entry
-        // at the address. Under this object's own entry none has written,
-        // so the loads go whatever stands under the row, and the engine is
-        // judged again: a replacement that is never asked would hold them.
+        // object's first call puts its own entry at the address. Under this
+        // object's own entry none has laid a sample, so the loads go
+        // whatever stands under the row, and the engine is judged again: a
+        // replacement that is never asked would hold them.
         // With no entry of its own, behind a reset or a later object's
         // call, they go only where this object still stands under the row.
         let Some(kept) = kept.or_else(|| self.read_member(worker)) else {
