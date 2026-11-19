@@ -30,7 +30,8 @@ impl Predictor {
     /// The rules every state keeps: the counts are the entries', a block's
     /// followers are the blocks behind it, a worker of the pool that was
     /// sent a block was sent the block before it, every block that none
-    /// follows is on the list, and the list reads the same both ways.
+    /// follows is on a list, the blocks that wait on their own with no
+    /// other block, and each list reads the same both ways.
     fn check(&self) {
         let mut followers: HashMap<u32, u32> = HashMap::new();
         let (mut placements, mut blocks, mut listed) = (0, 0, 0);
@@ -79,10 +80,19 @@ impl Predictor {
         while at != NONE {
             let block = self.block(at);
             assert_ne!(block.after, FREE, "{at}");
+            assert!(!block.waits(), "a block that waits among the ends: {at}");
             assert_eq!(block.older, older, "{at}");
             (older, at, walked) = (at, block.newer, walked + 1);
         }
-        assert_eq!((older, walked), (self.newest, listed));
+        assert_eq!(older, self.newest);
+        let (mut at, mut older) = (self.waiting, NONE);
+        while at != NONE {
+            let block = self.block(at);
+            assert!(block.waits(), "an end among the blocks that wait: {at}");
+            assert_eq!(block.older, older, "{at}");
+            (older, at, walked) = (at, block.newer, walked + 1);
+        }
+        assert_eq!(walked, listed);
     }
 }
 
@@ -486,7 +496,7 @@ fn a_path_no_worker_is_left_of_leaves_a_block_a_step_of_the_sweep() {
     assert_eq!(predictor.sweep(43), 43);
     assert_eq!((predictor.len(), predictor.blocks()), (0, 36));
     predictor.check();
-    // The rest waits at the old end, and leaves a block a step.
+    // The rest leaves a block a step: each waits once none follows it.
     let mut calls = 0;
     while predictor.blocks() != 0 {
         let held = predictor.blocks();
@@ -540,8 +550,8 @@ fn a_block_no_worker_is_left_of_leaves_though_a_request_ended_there() {
     predictor.sent(SEED, &[1, 2], worker(1));
     predictor.forget(worker(1));
     // Three visits empty the path and take its third block out. The
-    // second waits at the old end then, not where the request ended, and
-    // two steps take it and the first. The last visit ends the pass.
+    // second waits then, off the list where the request ended, and two
+    // steps take it and the first. The last visit ends the pass.
     assert_eq!(predictor.sweep(usize::MAX), 3 + 2 + 1);
     assert_eq!((predictor.len(), predictor.blocks()), (1, 1));
     assert_eq!(read(&mut predictor, &[1, 2, 3]), (0, vec![]));
@@ -625,7 +635,7 @@ fn a_list_of_workers_keeps_no_room_for_the_workers_that_left() {
 }
 
 #[test]
-fn a_block_no_worker_is_left_of_goes_back_to_the_old_end_behind_a_write_it_gave_no_room() {
+fn a_block_no_worker_is_left_of_waits_again_behind_a_write_it_gave_no_room() {
     let mut predictor = Predictor::new(1_000);
     // A path of twelve that a request ended at every block of, then two
     // blocks of a worker that leaves.
@@ -637,12 +647,12 @@ fn a_block_no_worker_is_left_of_goes_back_to_the_old_end_behind_a_write_it_gave_
     predictor.sent(SEED, &[500, 501], worker(1));
     predictor.forget(worker(1));
     // The pass ends with the call's budget: its last visit takes the
-    // second of the two blocks out, and the first waits at the old end.
+    // second of the two blocks out, and the first waits.
     assert_eq!(predictor.sweep(14), 14);
     assert_eq!((predictor.len(), predictor.blocks()), (12, 13));
     // A write of that block at the bound stands on it, spends its ten
     // steps passing over the path's blocks and gets no room. The block
-    // goes back to the old end, and the next step takes it.
+    // waits again, and the next step takes it.
     predictor.set_bound(12);
     predictor.sent(SEED, &[500], worker(2));
     assert_eq!(
@@ -652,6 +662,140 @@ fn a_block_no_worker_is_left_of_goes_back_to_the_old_end_behind_a_write_it_gave_
     assert_eq!(predictor.sweep(usize::MAX), 1);
     assert_eq!((predictor.len(), predictor.blocks()), (12, 12));
     assert_eq!(read(&mut predictor, &path), (12, vec![2]));
+    predictor.check();
+}
+
+#[test]
+fn a_block_that_waits_leaves_though_a_held_block_became_the_oldest_end() {
+    let mut predictor = Predictor::new(1_000);
+    // A path of twelve that a request ended at eleven blocks of, and a
+    // block of the second worker that a path of the first follows.
+    let path: Vec<u64> = (1..=12).collect();
+    predictor.sent(SEED, &path, worker(2));
+    for blocks in 1..=11 {
+        predictor.sent(SEED, &path[..blocks], worker(2));
+    }
+    predictor.sent(SEED, &[600], worker(2));
+    predictor.sent(SEED, &[700], worker(1));
+    predictor.sent(SEED, &[600, 601, 602], worker(1));
+    predictor.sent(SEED, &[700, 701], worker(1));
+    predictor.sent(SEED, &path, worker(2));
+    // The first worker leaves, and the pass stops before its last block,
+    // 701: the visit of 602 takes it out, and 601 waits.
+    predictor.forget(worker(1));
+    assert_eq!(predictor.sweep(16), 16);
+    assert_eq!((predictor.len(), predictor.blocks()), (14, 16));
+    // A third worker's write stands on 601 at the bound. Eleven of its
+    // twelve steps pass over the path's blocks and the last takes 701:
+    // 700 waits too, and the write gets no room.
+    predictor.set_bound(13);
+    predictor.sent(SEED, &[600, 601], worker(3));
+    assert_eq!(
+        (predictor.len(), predictor.blocks(), predictor.dropped()),
+        (13, 15, 2)
+    );
+    predictor.check();
+    // 601 leaves, and 600 before it, which the second worker holds, is
+    // the oldest end. 700 leaves all the same, and a last step ends the
+    // pass.
+    assert_eq!(predictor.sweep(usize::MAX), 3);
+    assert_eq!((predictor.len(), predictor.blocks()), (13, 13));
+    assert_eq!(read(&mut predictor, &[600, 601]), (1, vec![2]));
+    assert_eq!(read(&mut predictor, &[700]), (0, vec![]));
+    assert_eq!(read(&mut predictor, &path), (12, vec![2]));
+    predictor.check();
+}
+
+#[test]
+fn a_write_with_room_on_a_block_that_waits_makes_it_the_newest() {
+    let mut predictor = Predictor::new(1_000);
+    predictor.sent(SEED, &[500, 501], worker(1));
+    predictor.sent(SEED, &[8], worker(2));
+    predictor.sent(SEED, &[9], worker(2));
+    // The first worker leaves: two visits take its second block out, and
+    // its first waits.
+    predictor.forget(worker(1));
+    assert_eq!(predictor.sweep(2), 2);
+    assert_eq!((predictor.len(), predictor.blocks()), (2, 3));
+    // A third worker is sent that block, and there is room: the block is
+    // held again, and the newest end.
+    predictor.sent(SEED, &[500], worker(3));
+    assert_eq!((predictor.len(), predictor.blocks()), (3, 3));
+    predictor.check();
+    // One step over the bound takes the oldest path, not the written one.
+    predictor.set_bound(2);
+    assert_eq!(predictor.sweep(1), 1);
+    assert_eq!(read(&mut predictor, &[500]), (1, vec![3]));
+    assert_eq!(read(&mut predictor, &[8]), (0, vec![]));
+    assert_eq!(read(&mut predictor, &[9]), (1, vec![2]));
+    predictor.check();
+}
+
+#[test]
+fn a_block_another_follows_keeps_its_place_behind_a_write_it_gave_no_room() {
+    let mut predictor = Predictor::new(1_000);
+    let path: Vec<u64> = (1..=20).collect();
+    predictor.sent(SEED, &path, worker(2));
+    predictor.sent(SEED, &[500, 501], worker(1));
+    // The first worker leaves, and the pass stops before its second
+    // block: no worker is left of the first, and the second follows it.
+    predictor.forget(worker(1));
+    assert_eq!(predictor.sweep(21), 21);
+    assert_eq!((predictor.len(), predictor.blocks()), (21, 22));
+    // A write stands on that first block at a bound far below. Its ten
+    // steps take ten blocks of the path and make no room.
+    predictor.set_bound(1);
+    predictor.sent(SEED, &[500], worker(2));
+    assert_eq!(
+        (predictor.len(), predictor.blocks(), predictor.dropped()),
+        (11, 12, 1)
+    );
+    predictor.check();
+    // The block stays the newest: the next step takes the path's next
+    // block and does not pass over this one.
+    assert_eq!(predictor.sweep(1), 1);
+    assert_eq!((predictor.len(), predictor.blocks()), (10, 11));
+    assert_eq!(read(&mut predictor, &path), (9, vec![2]));
+    predictor.check();
+}
+
+#[test]
+fn the_sweep_spends_no_step_on_a_block_another_follows() {
+    let mut predictor = Predictor::new(1_000);
+    // A request ends at the first block, then one at the second: the
+    // first stands oldest on the list, with the second behind it.
+    predictor.sent(SEED, &[1, 2], worker(1));
+    predictor.sent(SEED, &[1], worker(1));
+    predictor.sent(SEED, &[1, 2], worker(1));
+    predictor.forget(worker(1));
+    // Two visits, then the one block that waits: no step passes over the
+    // first block while the second follows it.
+    assert_eq!(predictor.sweep(usize::MAX), 3);
+    assert_eq!((predictor.len(), predictor.blocks()), (0, 0));
+    predictor.check();
+}
+
+#[test]
+fn a_block_whose_follower_waits_stays_while_a_write_stands_on_it() {
+    let mut predictor = Predictor::new(1_000);
+    predictor.sent(SEED, &[1, 2, 3], worker(1));
+    predictor.sent(SEED, &[8], worker(2));
+    // The first worker leaves: three visits take its third block out,
+    // and its second waits.
+    predictor.forget(worker(1));
+    assert_eq!(predictor.sweep(3), 3);
+    assert_eq!((predictor.len(), predictor.blocks()), (1, 3));
+    // A write of the first block alone stands on it at the bound. Its
+    // room takes the second block, then the other path: the first block
+    // stays where the write stands, and the write is made.
+    predictor.set_bound(1);
+    predictor.sent(SEED, &[1], worker(2));
+    assert_eq!(
+        (predictor.len(), predictor.blocks(), predictor.dropped()),
+        (1, 1, 0)
+    );
+    assert_eq!(read(&mut predictor, &[1]), (1, vec![2]));
+    assert_eq!(read(&mut predictor, &[8]), (0, vec![]));
     predictor.check();
 }
 
@@ -755,6 +899,13 @@ fn drawn(seed: u64, bound: Option<usize>, steps: usize) {
         }
     }
     predictor.check();
+    // A sweep run dry leaves no block that no worker is left of.
+    predictor.sweep(usize::MAX);
+    predictor.check();
+    for at in 0..predictor.span {
+        let block = predictor.block(at);
+        assert!(block.after == FREE || !block.unheld(), "{at}");
+    }
 }
 
 #[test]
