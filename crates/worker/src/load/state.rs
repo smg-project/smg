@@ -268,7 +268,10 @@ impl<G: Generation> LoadState<G> {
         });
     }
 
-    fn is_current_incarnation(&self, worker: &Arc<dyn Worker>) -> bool {
+    /// Whether `worker` is the `Ready` worker the registry holds at its URL
+    /// now, by pointer. One test at three places: the publish fence, the
+    /// start of a pushed report, and the pushers a reset keeps.
+    pub(crate) fn is_current_incarnation(&self, worker: &Arc<dyn Worker>) -> bool {
         self.registry
             .get_by_url(worker.url())
             .is_some_and(|current| {

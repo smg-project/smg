@@ -31,7 +31,9 @@
 //!   alone and will skip non-Ready workers on its next tick).
 //! - `RecvError::Lagged`: stop every loop, clear shared state, and
 //!   rebuild from the current registry snapshot. Monitoring state is
-//!   derived data; full rebuild is the recovery mechanism.
+//!   derived data; full rebuild is the recovery mechanism. A worker
+//!   that pushed its loads and left in the lost window is evicted
+//!   there, as its event would have.
 //!
 //! ## Polling
 //!
@@ -340,6 +342,27 @@ pub trait LoadConsumer: Send + Sync {
     fn reconcile_in_flight(&self, worker: &dyn Worker);
 }
 
+/// A worker's pushed report on file, with the incarnation whose record
+/// started it. A reset holds the report to that worker: one that left, was
+/// replaced or left `Ready` while registry events were lost is evicted
+/// there ([`WorkerMonitor::evict_lost_pushers`]). The pusher was the
+/// registry's `Ready` worker at the URL when its record started the
+/// report: no other starts one, and no later record writes it.
+struct PushedFile {
+    report: WorkerLoadResponse,
+    pusher: Arc<dyn Worker>,
+}
+
+impl PushedFile {
+    /// An empty report that the first record of `pusher` starts.
+    fn started_by(pusher: &Arc<dyn Worker>) -> Self {
+        Self {
+            report: WorkerLoadResponse::default(),
+            pusher: Arc::clone(pusher),
+        }
+    }
+}
+
 /// Load monitoring service that subscribes to `WorkerRegistry` events.
 pub struct WorkerMonitor<G> {
     worker_registry: Arc<WorkerRegistry<G>>,
@@ -383,8 +406,9 @@ pub struct WorkerMonitor<G> {
     /// and the one below are keyed by the worker's URL, a string of the
     /// gateway's own, and every record looks its worker up in each: they
     /// hash with FxHash. The sink is called under this map's lock at a
-    /// record and at a poll's answer: the lock rule of [`LoadSink`].
-    pushed_reports: Mutex<FxHashMap<String, WorkerLoadResponse>>,
+    /// record and at a poll's answer: the lock rule of [`LoadSink`]. Each
+    /// report stands with the incarnation that started it ([`PushedFile`]).
+    pushed_reports: Mutex<FxHashMap<String, PushedFile>>,
     /// The workers whose report changed since the last coalesced publish,
     /// each with the incarnation that pushed, for the publish fence.
     pending_pushed: Mutex<FxHashMap<String, Arc<dyn Worker>>>,
@@ -472,6 +496,11 @@ impl<G: Generation> WorkerMonitor<G> {
     /// The caller must invoke [`Self::start_event_loop`] once initial
     /// workers have been registered. Until then, `worker_load_manager`
     /// is still safe to read; it just stays empty.
+    ///
+    /// The sink this builds writes its overload vetoes on the registry's
+    /// workers. The monitor's drop says no reset, so a host that drops the
+    /// monitor and keeps the registry takes the vetoes off with
+    /// [`WorkerRegistry::clear_all_overload_flags`].
     pub fn new(
         worker_registry: Arc<WorkerRegistry<G>>,
         load_consumer: Arc<impl LoadConsumer + 'static>,
@@ -550,7 +579,11 @@ impl<G: Generation> WorkerMonitor<G> {
     /// age and the one-way margin, what a policy releases its dispatch credit
     /// against. Negative ranks and records for another virtual worker's rank
     /// are ignored before updating freshness, liveness, metrics or routing
-    /// state, and before any reader of the record is called.
+    /// state, and before any reader of the record is called. A record that
+    /// would start a report is dropped unless its worker is the registry's
+    /// `Ready` worker at the URL: ahead of the report, the sink, the series
+    /// and the publish. Its worker is still marked as one whose stream
+    /// pushes, as for any record.
     pub fn apply_pushed_load<R: LoadRecord>(
         self: &Arc<Self>,
         worker: &Arc<dyn Worker>,
@@ -582,10 +615,19 @@ impl<G: Generation> WorkerMonitor<G> {
         // finds it copies no key.
         let mut reports = self.pushed_reports.lock();
         if !reports.contains_key(url) {
-            reports.insert(url.to_string(), WorkerLoadResponse::default());
+            // A report is on file for the registry's `Ready` worker at its
+            // URL alone, by the publish fence's test. A host ends a worker's
+            // stream after the registry let the worker go, so a record can
+            // land behind the worker's eviction: a report it started would
+            // hold a worker that is gone, and the next worker at the URL
+            // would publish its rows.
+            if !self.load_state.is_current_incarnation(worker) {
+                return;
+            }
+            reports.insert(url.to_string(), PushedFile::started_by(worker));
         }
         // On file: made just above when it was not.
-        let Some(report) = reports.get_mut(url) else {
+        let Some(report) = reports.get_mut(url).map(|file| &mut file.report) else {
             return;
         };
         // What a poll would have put in the rank's entry, with the telemetry
@@ -690,7 +732,8 @@ impl<G: Generation> WorkerMonitor<G> {
         let mut reports = self.pushed_reports.lock();
         let mut ranks = PolledRanks::default();
         if let Some(classic) = self.classic.as_ref() {
-            classic.merge(url, load, reports.get(url), polled_at, &mut ranks);
+            let on_file = reports.get(url).map(|file| &file.report);
+            classic.merge(url, load, on_file, polled_at, &mut ranks);
         }
         Self::lay_polled(&mut reports, url, load, &ranks)
     }
@@ -706,7 +749,7 @@ impl<G: Generation> WorkerMonitor<G> {
     /// sample instant, for a publish that carries them over the poll's under
     /// their own sample boundary.
     fn lay_polled(
-        reports: &mut FxHashMap<String, WorkerLoadResponse>,
+        reports: &mut FxHashMap<String, PushedFile>,
         url: &str,
         load: &WorkerLoadResponse,
         ranks: &PolledRanks,
@@ -718,7 +761,7 @@ impl<G: Generation> WorkerMonitor<G> {
         if !load.ranks_are_dp_ranks() {
             return (Vec::new(), None);
         }
-        let Some(report) = reports.get_mut(url) else {
+        let Some(report) = reports.get_mut(url).map(|file| &mut file.report) else {
             return (Vec::new(), None);
         };
         let on_file = report.loads.len();
@@ -748,12 +791,8 @@ impl<G: Generation> WorkerMonitor<G> {
     /// The file's half of an answer that brought a member no row: the rows
     /// of the ranks that leave are dropped. A report left without ranks
     /// publishes nothing.
-    fn drop_leaving(
-        reports: &mut FxHashMap<String, WorkerLoadResponse>,
-        url: &str,
-        leaving: &[i32],
-    ) {
-        if let Some(report) = reports.get_mut(url) {
+    fn drop_leaving(reports: &mut FxHashMap<String, PushedFile>, url: &str, leaving: &[i32]) {
+        if let Some(report) = reports.get_mut(url).map(|file| &mut file.report) {
             report.loads.retain(|load| !leaving.contains(&load.dp_rank));
             report.dp_rank_count = i32::try_from(report.loads.len()).unwrap_or(i32::MAX);
         }
@@ -833,7 +872,7 @@ impl<G: Generation> WorkerMonitor<G> {
                     .map(|(worker, response)| PolledMember {
                         worker,
                         answer: response.as_ref(),
-                        on_file: reports.get(worker.url()),
+                        on_file: reports.get(worker.url()).map(|file| &file.report),
                     })
                     .collect();
                 if with_rows {
@@ -947,6 +986,7 @@ impl<G: Generation> WorkerMonitor<G> {
         for (url, worker) in changed {
             let Some(report) = reports
                 .get(url.as_str())
+                .map(|file| &file.report)
                 .filter(|report| !report.loads.is_empty())
             else {
                 continue;
@@ -1062,10 +1102,11 @@ impl<G: Generation> WorkerMonitor<G> {
         *self.liveness_sweep_task.lock() = Some(sweep_handle);
     }
 
-    /// Stop every per-group polling loop, clear the shared load snapshot
-    /// and the probe memo, and say the reset to the sink
-    /// ([`LoadSink::reset`]): the monitor's own drops its DP-rank cache
-    /// and fails every overload veto open.
+    /// Stop every per-group polling loop, evict every pusher an event the
+    /// monitor lost would have ([`Self::evict_lost_pushers`]), clear the
+    /// shared load snapshot and the probe memo, and say the reset to the
+    /// sink ([`LoadSink::reset`]): the monitor's own drops its DP-rank
+    /// cache and fails every overload veto open.
     ///
     /// Called from the rebuild from the registry alone, which is the
     /// bootstrap reconcile path and the `RecvError::Lagged` rebuild. The
@@ -1086,6 +1127,13 @@ impl<G: Generation> WorkerMonitor<G> {
                 state.handle.abort();
             }
         }
+
+        // The lost pushers go first, and every queued eviction is applied
+        // at once: the sentinel of a worker's engine series follows the
+        // snapshot entry an eviction removes, and the clear below leaves
+        // none.
+        self.evict_lost_pushers();
+        self.flush_pending_evictions();
 
         // Always clear every cache. Skipping when `drained.is_empty()`
         // would leave stale per-rank loads behind for any caller that
@@ -1195,8 +1243,30 @@ impl<G: Generation> WorkerMonitor<G> {
         }
     }
 
+    /// Evict the loads of every pusher that is no longer the `Ready` worker
+    /// the registry holds at its URL: it left, was replaced or left `Ready`
+    /// while registry events were lost, so no event evicted it. The test is
+    /// the publish fence's ([`LoadState::is_current_incarnation`]): a report
+    /// the fence refuses is not kept on file. A pusher that stays keeps its
+    /// report, and the sink its receipts: its stream is not the monitor's
+    /// to stop. A worker registered at the URL later starts a report of its
+    /// own.
+    fn evict_lost_pushers(&self) {
+        let lost: Vec<Arc<dyn Worker>> = self
+            .pushed_reports
+            .lock()
+            .values()
+            .filter(|file| !self.load_state.is_current_incarnation(&file.pusher))
+            .map(|file| Arc::clone(&file.pusher))
+            .collect();
+        for pusher in &lost {
+            self.evict_worker_loads(pusher);
+        }
+    }
+
     /// Evict a single worker's cached loads. Used by the event loop on
-    /// `Removed`, `Replaced`, and `StatusChanged` away from `Ready`.
+    /// `Removed`, `Replaced`, and `StatusChanged` away from `Ready`, and by
+    /// a reset for a pusher whose event was lost.
     ///
     /// The probe memo, the pushed report and what the sink holds of the
     /// worker (its overload flag, its receipts, its cached rank loads) are

@@ -85,22 +85,26 @@ fn install_recorder() {
 }
 
 /// A monitor with nothing spawned, as the gateway holds it before the event
-/// loop starts; the pin drives `apply_pushed_load` directly, as the KV-event
-/// subscription does for every record its stream carries.
-fn monitor() -> Arc<WorkerMonitor> {
+/// loop starts, and its registry; the pin drives `apply_pushed_load`
+/// directly, as the KV-event subscription does for every record its stream
+/// carries.
+fn monitor() -> (Arc<WorkerRegistry>, Arc<WorkerMonitor>) {
     let registry = Arc::new(WorkerRegistry::new());
     let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
-    Arc::new(WorkerMonitor::new(
-        registry,
+    let monitor = Arc::new(WorkerMonitor::new(
+        Arc::clone(&registry),
         policy_registry,
         1,
         false,
         false,
-    ))
+    ));
+    (registry, monitor)
 }
 
-fn worker(url: &str) -> Arc<dyn Worker> {
-    Arc::new(
+/// A `Ready` worker `registry` holds, as the worker of a stream is: a record
+/// of any other starts no report.
+fn worker(registry: &WorkerRegistry, url: &str) -> Arc<dyn Worker> {
+    let worker: Arc<dyn Worker> = Arc::new(
         BasicWorkerBuilder::new(url)
             .worker_type(WorkerType::Regular)
             .connection_mode(ConnectionMode::Http)
@@ -110,7 +114,12 @@ fn worker(url: &str) -> Arc<dyn Worker> {
                 ..Default::default()
             })
             .build(),
-    )
+    );
+    assert!(
+        registry.register(Arc::clone(&worker)).is_some(),
+        "the registry takes the worker"
+    );
+    worker
 }
 
 /// A heartbeat-shaped record: the core figures with the telemetry an engine
@@ -142,18 +151,21 @@ fn record(running: u32, sample: u64) -> EngineLoad {
 #[tokio::test(flavor = "current_thread")]
 async fn a_record_for_a_rank_on_file_allocates_nothing() {
     install_recorder();
-    let monitor = monitor();
+    let (registry, monitor) = monitor();
     let t0 = Instant::now();
 
-    let single = worker("http://engine-a:8000");
+    let single = worker(&registry, "http://engine-a:8000");
     // The worker's first record makes its entries, builds its rank's gauge
     // handles and starts the publisher.
-    monitor.apply_pushed_load(&single, 0, &record(2, 1), t0);
+    let ((), first) = allocations_during(|| {
+        monitor.apply_pushed_load(&single, 0, &record(2, 1), t0);
+    });
+    assert!(first > 0, "the worker's first record starts its report");
     let ((), one_rank) = allocations_during(|| {
         monitor.apply_pushed_load(&single, 0, &record(3, 2), t0 + Duration::from_millis(1));
     });
 
-    let two_ranks = worker("http://engine-b:8000");
+    let two_ranks = worker(&registry, "http://engine-b:8000");
     monitor.apply_pushed_load(&two_ranks, 0, &record(2, 1), t0);
     let ((), second_rank) = allocations_during(|| {
         monitor.apply_pushed_load(&two_ranks, 1, &record(5, 2), t0 + Duration::from_millis(1));
@@ -215,8 +227,8 @@ async fn cost_per_pushed_record() {
         .and_then(|n| n.parse().ok())
         .unwrap_or(200_000);
     install_recorder();
-    let monitor = monitor();
-    let worker = worker("http://engine-a:8000");
+    let (registry, monitor) = monitor();
+    let worker = worker(&registry, "http://engine-a:8000");
     let t0 = Instant::now();
     monitor.apply_pushed_load(&worker, 0, &record(2, 0), t0);
     let start = Instant::now();

@@ -159,9 +159,14 @@ pub trait LoadSink: Send + Sync {
 
     /// The collector reset itself: it stopped its groups and dropped every
     /// load it published. It does so on two paths: at its start and after
-    /// it lost registry events. What the sink keeps of any worker is void:
-    /// a worker that left while events were lost is never said at
-    /// [`Self::forget`].
+    /// it lost registry events. What the sink derived from loads is void:
+    /// its verdicts and its rows. Just before this call the collector says
+    /// [`Self::forget`] for every worker whose pushed report it held and
+    /// that is no longer the registry's `Ready` worker at its URL. So a
+    /// sink may keep what it knows of a stream, as the collector keeps the
+    /// report of a pusher that stays. A polled worker that left while
+    /// events were lost is never said: nothing of a polled worker outlives
+    /// this call.
     ///
     /// A dropped collector says nothing: its drop stops its tasks and calls
     /// no sink. The host that drops a collector owns the sink too: it voids
