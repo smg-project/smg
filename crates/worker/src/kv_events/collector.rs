@@ -57,7 +57,9 @@ pub trait KvEventHost: Send + Sync + 'static {
         model: &str,
     ) -> Option<KvEventFeed<Self::Sink>>;
 
-    /// The model's last events subscription is gone.
+    /// The model's last events subscription is gone: no slot of the model
+    /// is left, active or held by a removal still under way. Told once each
+    /// time the model's slots go to none.
     ///
     /// Called under the slot lock like [`enroll`](Self::enroll), by whoever
     /// frees the subscription's slot: it must not wait, and it must not
@@ -507,9 +509,14 @@ impl<H: KvEventHost> KvEventCollector<H> {
         if kind != SubscriptionKind::Events {
             return;
         }
+        // A reservation counts until it is lifted: its task may still feed
+        // the sink, and its own lift tells the host if it is the last.
         let last_of_model = !handles.values().any(|slot| {
-            matches!(slot, Slot::Active(other)
-                if other.kind == SubscriptionKind::Events && other.model_id == model_id)
+            let (other_kind, other_model) = match slot {
+                Slot::Active(other) => (other.kind, &other.model_id),
+                Slot::Removing(other) => (other.kind, &other.model_id),
+            };
+            other_kind == SubscriptionKind::Events && other_model == model_id
         });
         if last_of_model {
             host.model_left(model_id);
@@ -1837,6 +1844,43 @@ mod tests {
             Some("model_left unknown"),
             "the remover's lift tells the host"
         );
+    }
+
+    /// The host hears that a model left once, when the model's last slot is
+    /// freed: a reservation counts until it is lifted, since its task may
+    /// still feed the sink. Two reservations of one model are laid here as
+    /// two removals' first turns leave them.
+    #[tokio::test]
+    async fn a_model_leaves_with_its_last_reservation() {
+        let host = Arc::new(RecordingHost::default());
+        let collector = KvEventCollector::new(Arc::clone(&host));
+        let urls = ["grpc://127.0.0.1:21", "grpc://127.0.0.1:22"];
+        // The senders are held to the case's end: both tasks still run.
+        let (_first_tx, first_done) = watch::channel(());
+        let (_second_tx, second_done) = watch::channel(());
+        let mut handles = collector.worker_handles.lock().await;
+        let mut ids = Vec::new();
+        for (url, done) in urls.into_iter().zip([first_done, second_done]) {
+            let id = NEXT_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed);
+            ids.push(id);
+            handles.insert(
+                url.to_string(),
+                Slot::Removing(Reservation {
+                    id,
+                    done,
+                    model_id: "m".to_string(),
+                    kind: SubscriptionKind::Events,
+                }),
+            );
+        }
+
+        KvEventCollector::<RecordingHost>::lift_reservation(&mut handles, &host, urls[0], ids[0]);
+        assert!(
+            host.calls().is_empty(),
+            "the model keeps a subscription that is still leaving"
+        );
+        KvEventCollector::<RecordingHost>::lift_reservation(&mut handles, &host, urls[1], ids[1]);
+        assert_eq!(host.calls(), ["model_left m"]);
     }
 
     /// A stop ends the tasks and tells the host of no model: what the host
