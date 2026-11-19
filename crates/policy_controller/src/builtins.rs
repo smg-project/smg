@@ -210,6 +210,20 @@ impl Filter for NotTried {
         !facts.tried.contains(&c.id) && !cx.excluded.contains(&c.id)
     }
 
+    fn retain(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        cx: &Constraints<'_>,
+        kept: &mut Vec<u32>,
+    ) {
+        // With neither list naming a worker, every row stays in the pool.
+        if facts.tried.is_empty() && cx.excluded.is_empty() {
+            return;
+        }
+        kept.retain(|&i| self.keep(facts, &candidates[i as usize], cx));
+    }
+
     fn soft(&self) -> bool {
         true
     }
@@ -6126,6 +6140,16 @@ mod tests {
         };
         assert!(!NotTried.keep(&facts, &c, &excluded));
         assert!(NotTried.soft() && HasRoom.soft() && !Healthy.soft() && !HasCapacity.soft());
+
+        let pool = [c];
+        let mut kept = vec![0];
+        NotTried.retain(&facts, &pool, &cx, &mut kept);
+        assert_eq!(kept, [0]);
+        NotTried.retain(&facts, &pool, &excluded, &mut kept);
+        assert!(kept.is_empty());
+        kept.push(0);
+        NotTried.retain(&retry, &pool, &cx, &mut kept);
+        assert!(kept.is_empty());
     }
 
     #[test]
