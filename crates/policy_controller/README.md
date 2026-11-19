@@ -352,6 +352,7 @@ bindings:
 - `match.model` is an exact model id, `prefix*`, `*suffix` or `*`.
 - `match.phase` lists the phases the binding covers: `single`, `prefill`, `decode`, `encode`. Left out, it covers every phase.
 - A request that no binding matches is shed. The answer names the stage `binding`.
+- A `single` binding can name a second profile with `shadow: next`. Its stages run through the library's `Engine::shadow` for comparison. Request handling runs the live profile. Use native stages and a profile that no binding uses live.
 
 ### Plans
 
@@ -651,7 +652,8 @@ score:
 - Encode placement through a door. The stock controller and the in-process door decide `pd-pair` and decide the prefill and decode of `epd`. Placing a worker for each encode item takes the library's `Engine::decide_encode_pair` entry.
 - A choice by the media a worker can process, outside `epd`. No built-in filter reads it.
 - A binding that matches on a tenant, a priority, a header, a prompt size or labels. The fields are in the schema. A document that writes one is refused as not in this build.
-- `shadow`, `canary`, `override: allowed` and `admission` on a binding, and `issue_session_id` in a sessions rule.
+- Shadow execution during request handling, shadow maps by side, and plugin stages in a shadow profile.
+- `canary`, `override: allowed` and `admission` on a binding, and `issue_session_id` in a sessions rule.
 - A sessions rule under `pd-pair` or `epd`.
 - The `best-with-temperature` picker, and three settings of `prefix-affinity`: `decay`, `accounting_ttl_ms` and `spill.uncached_credit`.
 - The `bucket` scorer in the stock controller. The library runs it. The stock controller refuses a document that names it, because it does not yet report every request's end to a stage.

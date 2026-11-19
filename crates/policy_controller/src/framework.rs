@@ -13,7 +13,7 @@ use crate::{
         MAX_TARGETS, TRACE_TOP,
     },
     lease::{Lease, Lifecycle, Membership, Outcome, ReleaseReason, Side, Signal},
-    sessions::{Assignment, Claim, SessionRule, SessionTable, SessionVerdict},
+    sessions::{Assignment, Claim, Forgets, SessionRule, SessionTable, SessionVerdict},
     spec::Needs,
     view::{
         mean_in_flight, AffinityFacts, Candidate, Constraints, NamedAffinity, Phase, PoolFacts,
@@ -2412,6 +2412,10 @@ pub struct Binding {
     pub profile: u16,
     /// The decode profile of the `pd-pair` plan; `None` under `single`.
     pub decode_profile: Option<u16>,
+    /// The shadow of `profile`, by position.
+    pub shadow: Option<u16>,
+    /// The shadow of `decode_profile`, by position.
+    pub decode_shadow: Option<u16>,
     /// Sticky sessions: a keyed request of the `single` plan stays on the
     /// worker its key was placed on (design 4.6).
     pub sessions: Option<SessionRule>,
@@ -2422,6 +2426,10 @@ pub struct Binding {
 }
 
 impl Binding {
+    fn single_shadow(&self) -> Option<u16> {
+        (self.plan == Plan::Single).then_some(self.shadow).flatten()
+    }
+
     fn matches(&self, model: &str, phase: Phase) -> bool {
         let model_ok = match (self.model.strip_prefix('*'), self.model.strip_suffix('*')) {
             _ if self.model == "*" => true,
@@ -2441,6 +2449,9 @@ pub struct Engine {
     /// The bindings in the spec's order, each beside what the build derived
     /// from it ([`Entry`]).
     bindings: Vec<Entry>,
+    /// A shadow's placing assignment beside each binding, in the same
+    /// order. Empty when no binding names a shadow.
+    shadow_placing: Box<[Option<Assignment>]>,
     generation: u64,
     needs: Needs,
     /// The needs of every binding that covers a phase, its profile's stages
@@ -2465,8 +2476,7 @@ pub struct Engine {
     /// decision reads it where the profile's mark says so, and no other
     /// decision does.
     orders: Vec<Order>,
-    /// What the door needs of a seat, zero when it can use the caller's
-    /// seat without sampling.
+    /// What the door needs of a seat, zero on the plain path.
     seat_flags: u8,
     explain_sample: u32,
     max_report_age_ms: Option<u64>,
@@ -2515,6 +2525,8 @@ impl Keeper {
 pub(crate) const KEEPS_DECIDERS: u8 = 1;
 /// The generation samples decisions at the seat where they were made.
 pub(crate) const SAMPLES_DECISIONS: u8 = 2;
+/// A binding of the generation names a shadow.
+pub(crate) const SHADOWS: u8 = 4;
 
 /// No scorer of a profile states a pick's overlap: a place no profile's
 /// list of scorers is read at.
@@ -2806,6 +2818,10 @@ impl Marks {
     /// The scope the key's arm opens.
     const fn keyed_scope(self) -> bool {
         self.0 & Self::KEYED_SCOPE != 0
+    }
+
+    const fn keyed(self) -> bool {
+        self.0 & Self::KEYED != 0
     }
 
     /// The marks of a profile the plain ring alone places by the session key.
@@ -3297,6 +3313,8 @@ impl Engine {
     /// declares: a sessions rule's counts and the view's list of headers.
     /// Every profile's stages are folded in here, so the summary
     /// ([`Self::needs`]) holds a stage's needs however the engine was built.
+    /// A binding built in code can shadow with a separate profile without
+    /// a decision scope under the single plan.
     pub fn new(
         profiles: Vec<Profile>,
         bindings: Vec<Binding>,
@@ -3320,8 +3338,15 @@ impl Engine {
                 if let Some(&own) =
                     profile_index(binding, phase).and_then(|i| profile_needs.get(usize::from(i)))
                 {
-                    phase_needs[slot(phase)] =
-                        phase_needs[slot(phase)].or(own).or(session_needs(binding));
+                    let shadow = binding
+                        .single_shadow()
+                        .and_then(|i| profile_needs.get(usize::from(i)))
+                        .copied()
+                        .unwrap_or_default();
+                    phase_needs[slot(phase)] = phase_needs[slot(phase)]
+                        .or(own)
+                        .or(shadow)
+                        .or(session_needs(binding));
                 }
                 if binding.model == "*" {
                     break;
@@ -3370,6 +3395,24 @@ impl Engine {
             .map(|profile| RowTests::of(&profile.filters))
             .collect();
         let keepers = Keeper::of(&profiles);
+        let shadows = bindings
+            .iter()
+            .any(|binding| binding.shadow.is_some() || binding.decode_shadow.is_some());
+        let mut shadow_placing = Vec::new();
+        let mut live = Vec::new();
+        if shadows {
+            shadow_placing.reserve_exact(bindings.len());
+            live.resize(profiles.len(), false);
+            for binding in &bindings {
+                for phase in PHASES {
+                    if let Some(used) =
+                        profile_index(binding, phase).and_then(|i| live.get_mut(usize::from(i)))
+                    {
+                        *used = true;
+                    }
+                }
+            }
+        }
         // A picker that leaves the placement to its rule has no stages to
         // delegate to: the assignment that places is written beside each
         // binding here, once, so no decision asks. The binding itself keeps
@@ -3384,6 +3427,17 @@ impl Engine {
                 let declared = binding
                     .sessions
                     .map_or(Assignment::Delegate, |rule| rule.assignment);
+                if shadows {
+                    // Bindings built in code must keep the same isolation
+                    // as bindings built from a document.
+                    let placing = binding.single_shadow().and_then(|i| {
+                        let i = usize::from(i);
+                        let marks = marks.get(i)?;
+                        (!live[i] && !marks.scoped())
+                            .then(|| placed_by(declared, marks.by_assignment()))
+                    });
+                    shadow_placing.push(placing);
+                }
                 Entry {
                     placing: placed_by(declared, by_assignment),
                     vetoed: AllVetoed::default(),
@@ -3394,6 +3448,7 @@ impl Engine {
         Self {
             profiles,
             bindings,
+            shadow_placing: shadow_placing.into_boxed_slice(),
             generation,
             needs,
             phase_needs,
@@ -3403,7 +3458,7 @@ impl Engine {
             named,
             row_tests,
             orders,
-            seat_flags: u8::from(keeping) * KEEPS_DECIDERS,
+            seat_flags: (u8::from(keeping) * KEEPS_DECIDERS) | (u8::from(shadows) * SHADOWS),
             explain_sample: 0,
             max_report_age_ms: None,
             keepers,
@@ -3448,11 +3503,11 @@ impl Engine {
     }
 
     /// What a decision of `phase` for `model` reads: the needs of the stages
-    /// of the profile its binding resolves to and of the binding's sessions
-    /// rule, nothing when no binding matches. A decode decision may also be the decode side of a pair,
-    /// whose profile the prefill lookup names ([`Self::decide_pair`]); the
-    /// decode answer carries that profile's needs too. The host reads it per
-    /// worker, at registration, to choose the worker's stream.
+    /// of its live and shadow profiles and of the binding's sessions rule,
+    /// nothing when no binding matches. The decode answer also carries the
+    /// needs of the pair's decode profile where the prefill lookup names a
+    /// pair ([`Self::decide_pair`]). The host reads it at registration to
+    /// choose the worker's stream.
     pub fn needs_for(&self, model: &str, phase: Phase) -> Needs {
         self.reads_for(model, phase).0
     }
@@ -3480,7 +3535,10 @@ impl Engine {
             .resolve(model, phase)
             .map(|(entry, index, profile)| {
                 (
-                    profile.needs().or(session_needs(&entry.binding)),
+                    profile
+                        .needs()
+                        .or(self.shadow_needs(&entry.binding))
+                        .or(session_needs(&entry.binding)),
                     self.marks[usize::from(index)],
                 )
             })
@@ -3602,8 +3660,8 @@ impl Engine {
     /// order nor the pair's rule. The union feeds over where an earlier
     /// binding with fewer needs shadows a later one.
     ///
-    /// A binding's row is its profile's stages and its sessions rule, for
-    /// each phase it covers. A pair's decode profile is a decode row of the
+    /// A binding's row is its live and shadow stages and its sessions rule,
+    /// for each phase it covers. A pair's decode profile is a decode row of the
     /// pair binding's glob, whichever binding a decode lookup resolves to.
     /// Two bindings of one glob write one row a phase.
     pub fn needs_rows(&self) -> Vec<(&str, Phase, Needs)> {
@@ -3620,7 +3678,10 @@ impl Engine {
             for phase in PHASES {
                 let mut needs = Needs::default();
                 if let Some(profile) = profile(phase).filter(|_| covers(phase)) {
-                    needs = profile.needs().or(session_needs(binding));
+                    needs = profile
+                        .needs()
+                        .or(self.shadow_needs(binding))
+                        .or(session_needs(binding));
                 }
                 // The decode side of every pair this binding's prefill
                 // lookup starts.
@@ -3640,6 +3701,14 @@ impl Engine {
             }
         }
         rows
+    }
+
+    fn shadow_needs(&self, binding: &Binding) -> Needs {
+        binding
+            .single_shadow()
+            .and_then(|index| self.profiles.get(usize::from(index)))
+            .map(Profile::needs)
+            .unwrap_or_default()
     }
 
     pub fn profiles(&self) -> &[Profile] {
@@ -3957,6 +4026,120 @@ impl Engine {
         }
     }
 
+    /// Make the binding's decision with its shadow profile on the same
+    /// rows. The run only updates the shadow's stages and scratch. It reads
+    /// session pins without claiming or renewing them.
+    ///
+    /// Returns `None` where the phase resolves to no shadow. When the live
+    /// and shadow profiles need different sets of named affinity rows,
+    /// supply the affinity column.
+    pub fn shadow(
+        &self,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        candidates: &[Candidate],
+        cx: &Constraints<'_>,
+        scratch: &mut Scratch,
+    ) -> Option<Decision> {
+        let (entry, placing) = self
+            .bindings
+            .iter()
+            .zip(&self.shadow_placing)
+            .find(|(entry, _)| entry.binding.matches(facts.model, facts.phase))?;
+        let placing = (*placing)?;
+        let index = entry.binding.shadow?;
+        let profile = &self.profiles[usize::from(index)];
+        let marks = self.marks[usize::from(index)];
+        debug_assert_indexed(candidates);
+        debug_assert_named(facts, candidates);
+        if !column_fits(facts.affinity, candidates) {
+            let trace = Trace {
+                seed: facts.seed,
+                generation: pool.generation,
+                ..Trace::default()
+            };
+            return Some(shed(ShedReason::PolicyDeclined, AFFINITY_COLUMN, trace));
+        }
+        let set = Set {
+            candidates,
+            class: None,
+            partnered: None,
+            fold: None,
+            encode: false,
+            vetoed: entry.vetoed,
+        };
+        let binding = &entry.binding;
+        let keyed = !facts.session_key.is_none();
+        let rule = binding.sessions.as_ref().filter(|_| keyed);
+        if marks.by_assignment() && rule.is_none() {
+            return Some(self.assign(profile, index, placing, facts, pool, set, cx, scratch));
+        }
+        if marks.keyed() && vetoed::keeps_its_key(binding, placing, entry.vetoed, facts) {
+            // The binding's own set, as the live decision hands it: a pool
+            // the lifted run leaves nobody is put to the liveness tier.
+            return Some(match rule {
+                Some(rule) => self.decide_with_session::<true, false>(
+                    profile, index, rule, placing, facts, pool, set, cx, scratch,
+                ),
+                None => self.keep(profile, index, None, facts, pool, set, cx, scratch),
+            });
+        }
+        if let Some(rule) = rule {
+            return Some(self.decide_with_session::<false, false>(
+                profile, index, rule, placing, facts, pool, set, cx, scratch,
+            ));
+        }
+        let buf = &mut scratch.single;
+        if !pool.engines.is_empty() {
+            if marks.engines() {
+                return Some(run_engines(self, index, facts, pool, set, cx, buf));
+            }
+            if marks.owns() && keyed {
+                if let Some(decision) = run_owned(self, index, facts, pool, candidates, cx, buf) {
+                    return Some(decision);
+                }
+            }
+        }
+        let ahead = marks.ahead();
+        if ahead != 0 && candidates.len() >= DRAW_FROM {
+            if ahead == Marks::DRAWS_FIRST || (facts.named.is_some() && ahead & Marks::JOINED != 0)
+            {
+                return Some(run_drawn(self, index, facts, pool, set, cx, buf));
+            }
+            if marks.ranked()
+                && pool.reported
+                && self.max_report_age_ms.is_none_or(|max_age| {
+                    all_reports_current(candidates, facts.now_micros, max_age)
+                })
+            {
+                return Some(run_ranked(self, index, facts, pool, set, cx, buf));
+            }
+        }
+        Some(run_whole(self, index, facts, pool, set, cx, buf))
+    }
+
+    #[inline(always)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the profile run's inputs, as run_profile takes them"
+    )]
+    fn decide_session<const KEPT: bool>(
+        &self,
+        profile: &Profile,
+        index: u16,
+        rule: &SessionRule,
+        placing: Assignment,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        set: Set<'_>,
+        cx: &Constraints<'_>,
+        scratch: &mut Scratch,
+    ) -> Decision {
+        self.decide_with_session::<KEPT, true>(
+            profile, index, rule, placing, facts, pool, set, cx, scratch,
+        )
+    }
+
     /// A keyed decision under a sessions rule (design 4.6 and the host's
     /// keyed path before it): the profile's filters narrow the pool; the
     /// key's preferred pin, or its failover when the preferred one is
@@ -3984,11 +4167,14 @@ impl Engine {
     /// A pin of record whose worker the standing pass left out is written
     /// back where the lifted pass kept that worker, and is one of the
     /// key's pins from there on.
+    ///
+    /// With `WRITE_SESSIONS` off, pins are read where they stand and
+    /// restores are local to the decision.
     #[expect(
         clippy::too_many_arguments,
         reason = "the profile run's inputs, as run_profile takes them"
     )]
-    fn decide_session<const KEPT: bool>(
+    fn decide_with_session<const KEPT: bool, const WRITE_SESSIONS: bool>(
         &self,
         profile: &Profile,
         index: u16,
@@ -4015,7 +4201,22 @@ impl Engine {
             return answer;
         }
         let key = facts.session();
-        let mut pins = self.sessions.lookup(key, facts.now_micros, rule);
+        let mut pins = if WRITE_SESSIONS {
+            self.sessions.lookup(key, facts.now_micros, rule)
+        } else {
+            match self.sessions.held(key) {
+                Some((pins, Forgets::At(at))) if facts.now_micros < at => pins,
+                Some((pins, Forgets::Never)) if facts.now_micros < u64::MAX => pins,
+                _ => [WorkerId(0); 2],
+            }
+        };
+        let restore = |stored| {
+            if WRITE_SESSIONS {
+                self.sessions.restore(key, facts.now_micros, rule, stored)
+            } else {
+                [stored, WorkerId(0)]
+            }
+        };
         // The first pin the filters kept, by the pins' order.
         let owner = pins
             .iter()
@@ -4046,7 +4247,7 @@ impl Engine {
                 left_out = Some(stored);
                 return None;
             }
-            let pins = self.sessions.restore(key, facts.now_micros, rule, stored);
+            let pins = restore(stored);
             pins.iter()
                 .filter(|p| **p != WorkerId(0))
                 .find_map(|p| buf.kept.iter().find(|&&i| candidates[i as usize].id == *p))
@@ -4110,7 +4311,7 @@ impl Engine {
                     // sees it and follows it. Where another worker leads,
                     // the first read stands, and the claim follows that
                     // worker.
-                    let written = self.sessions.restore(key, facts.now_micros, rule, stored);
+                    let written = restore(stored);
                     if written[0] == stored {
                         pins = [stored, WorkerId(0)];
                     }
@@ -4119,7 +4320,9 @@ impl Engine {
         }
         let mut decision = self.place(profile, index, placing, facts, pool, candidates, buf);
         if let Decision::Pick(pick) = &mut decision {
-            pick.session_verdict = SessionVerdict::Pinned;
+            if WRITE_SESSIONS {
+                pick.session_verdict = SessionVerdict::Pinned;
+            }
             if all_vetoed {
                 // The lifted pass alone kept a worker: the placement stands
                 // by the lift and says so, as the all-vetoed rule's pick does.
@@ -4135,6 +4338,7 @@ impl Engine {
                 // withdraw it. The plain form never names a pin here, and
                 // carries no test for one.
                 if KEPT && pins.contains(&first) {
+                    pick.session_verdict = SessionVerdict::Pinned;
                     // A dispatch on an alternate writes that worker among
                     // the key's pins: none at the rule's cap stands behind
                     // the pin.
@@ -4156,6 +4360,9 @@ impl Engine {
                             return handed;
                         }
                     }
+                    return decision;
+                }
+                if !WRITE_SESSIONS {
                     return decision;
                 }
                 match self.sessions.claim(key, pins, first) {
@@ -4893,12 +5100,503 @@ mod tests {
                 plan: Plan::Single,
                 profile: 0,
                 decode_profile: None,
+                shadow: None,
+                decode_shadow: None,
                 sessions: None,
                 overload: None,
             }],
             1,
             Needs::default(),
         )
+    }
+
+    fn with_shadow(shadow: Profile, sessions: Option<SessionRule>) -> Engine {
+        Engine::new(
+            vec![least_requests_profile(), shadow],
+            vec![Binding {
+                shadow: Some(1),
+                sessions,
+                ..single_binding()
+            }],
+            23,
+            Needs::default(),
+        )
+    }
+
+    fn by_sessions() -> Profile {
+        Profile {
+            name: "by-sessions".into(),
+            scorers: vec![Weighted {
+                scorer: Box::new(FewestSessions),
+                weight: 1.0,
+            }],
+            ..least_requests_profile()
+        }
+    }
+
+    #[test]
+    fn shadow_picks_with_its_own_profile_over_the_same_rows() {
+        let engine = with_shadow(by_sessions(), None);
+        let mut busy = candidate(1, 3);
+        busy.active_sessions = 17;
+        let rows = [candidate(0, 13), busy];
+        let (facts, pool, cx) = (
+            RequestFacts::default(),
+            PoolFacts::default(),
+            Constraints::default(),
+        );
+        let mut scratch = Scratch::new();
+        let live = engine.decide(&facts, &pool, &rows, &cx, &mut scratch);
+        let shadow = engine
+            .shadow(&facts, &pool, &rows, &cx, &mut scratch)
+            .expect("a shadow decision");
+        let first = |decision: &Decision| {
+            decision
+                .pick()
+                .and_then(|pick| pick.targets.first())
+                .map(|t| t.id)
+        };
+        assert_eq!(first(&live), Some(rows[1].id));
+        assert_eq!(first(&shadow), Some(rows[0].id));
+        assert_eq!(shadow.trace().profile, 1);
+        assert_eq!(
+            crate::decision::ShadowKind::of(&live, &shadow),
+            crate::decision::ShadowKind::OtherTarget
+        );
+
+        let malformed = RequestFacts {
+            affinity: &[AffinityFacts::default()],
+            ..facts
+        };
+        assert_eq!(
+            engine.shadow(&malformed, &pool, &rows, &cx, &mut scratch),
+            Some(engine.decide(&malformed, &pool, &rows, &cx, &mut scratch))
+        );
+    }
+
+    #[test]
+    fn shadow_uses_the_bindings_all_vetoed_rule() {
+        let profile = Profile {
+            filters: vec![
+                Box::new(Healthy),
+                Box::new(NotOverloaded),
+                Box::new(NotTried),
+            ],
+            ..least_requests_profile()
+        };
+        let mut engine = with_shadow(profile, None);
+        let mut rows = [candidate(0, 29), candidate(1, 7)];
+        for row in &mut rows {
+            row.health.overloaded = true;
+        }
+        let (facts, pool, cx) = (
+            RequestFacts::default(),
+            PoolFacts::default(),
+            Constraints::default(),
+        );
+        let mut scratch = Scratch::new();
+        let steered = engine
+            .shadow(&facts, &pool, &rows, &cx, &mut scratch)
+            .expect("the binding shadows");
+        assert!(matches!(steered, Decision::Pick(pick) if pick.trace.lifted == Lifted::Overload));
+        engine.shed_when_all_vetoed(0);
+        let shed = engine
+            .shadow(&facts, &pool, &rows, &cx, &mut scratch)
+            .expect("the binding shadows");
+        assert!(matches!(shed, Decision::Shed(shed) if shed.reason == ShedReason::Saturated));
+    }
+
+    #[test]
+    fn shadow_places_by_its_pickers_assignment() {
+        let engine = with_shadow(
+            Profile {
+                scorers: vec![],
+                picker: Box::new(Manual),
+                ..least_requests_profile()
+            },
+            Some(SESSIONS),
+        );
+        let rows = [candidate(0, 21), candidate(1, 6)];
+        let decision = engine
+            .shadow(
+                &RequestFacts::default(),
+                &PoolFacts::default(),
+                &rows,
+                &Constraints::default(),
+                &mut Scratch::new(),
+            )
+            .expect("the binding shadows");
+        assert_eq!(
+            decision
+                .pick()
+                .and_then(|pick| pick.targets.first())
+                .map(|t| t.id),
+            Some(rows[1].id)
+        );
+    }
+
+    #[test]
+    fn shadow_sampling_draws_from_the_seed_and_leaves_the_live_draw_alone() {
+        let mut document = PolicySpec::preset("random").expect("a preset");
+        let profile = document.profiles["random"].clone();
+        document.profiles.insert("second".into(), profile);
+        document.bindings[0].shadow = Some(crate::spec::ShadowSpec::Profile("second".into()));
+        let engine = document.validate().expect("a shadow binding");
+        let control = document.validate().expect("the same binding");
+        let rows: Vec<_> = (0..23).map(|row| candidate(row, row)).collect();
+        let facts = RequestFacts {
+            seed: 137,
+            ..RequestFacts::default()
+        };
+        let pool = PoolFacts::default();
+        let cx = Constraints::default();
+        let mut scratch = Scratch::new();
+        let shadow = engine
+            .shadow(&facts, &pool, &rows, &cx, &mut scratch)
+            .expect("a shadow draw");
+        assert!(shadow.trace().drew_first());
+        let again = engine
+            .shadow(&facts, &pool, &rows, &cx, &mut scratch)
+            .expect("the same shadow draw");
+        assert_eq!(shadow, again);
+        let without = control.decide(&facts, &pool, &rows, &cx, &mut Scratch::new());
+        assert_eq!(
+            shadow.pick().map(|pick| pick.targets),
+            without.pick().map(|pick| pick.targets)
+        );
+        assert_eq!(
+            engine.decide(&facts, &pool, &rows, &cx, &mut scratch),
+            without
+        );
+    }
+
+    #[test]
+    fn shadow_uses_session_pins_without_claiming_touching_or_sweeping() {
+        let rule = SessionRule {
+            ttl_micros: Some(41),
+            sweep_micros: 11,
+            ..SESSIONS
+        };
+        let engine = with_shadow(by_sessions(), Some(rule));
+        let control = with_shadow(by_sessions(), Some(rule));
+        let mut busy = candidate(1, 3);
+        busy.active_sessions = 17;
+        let rows = [candidate(0, 13), busy];
+        let mut facts = RequestFacts {
+            model: "m",
+            session_key: Identity::hashed(59),
+            now_micros: 71,
+            ..RequestFacts::default()
+        };
+        let key = facts.session();
+        let (pool, cx) = (PoolFacts::default(), Constraints::default());
+        let mut scratch = Scratch::new();
+        let first = |decision: &Decision| {
+            decision
+                .pick()
+                .and_then(|pick| pick.targets.first())
+                .map(|t| t.id)
+        };
+        let fresh = engine
+            .shadow(&facts, &pool, &rows, &cx, &mut scratch)
+            .expect("a shadow placement");
+        assert_eq!(first(&fresh), Some(rows[0].id));
+        assert_eq!(
+            fresh.pick().map(|pick| pick.session_verdict),
+            Some(SessionVerdict::None)
+        );
+        assert!(engine.sessions().is_empty());
+        let live = engine.decide(&facts, &pool, &rows, &cx, &mut scratch);
+        assert_eq!(first(&live), Some(rows[1].id));
+        assert_eq!(
+            live,
+            control.decide(&facts, &pool, &rows, &cx, &mut Scratch::new())
+        );
+        let pinned = control.sessions().held(key);
+        assert!(pinned.is_some());
+        assert_eq!(engine.sessions().held(key), pinned);
+
+        facts.now_micros += 17;
+        let shadow = engine
+            .shadow(&facts, &pool, &rows, &cx, &mut scratch)
+            .expect("a pinned shadow");
+        assert_eq!(first(&shadow), first(&live));
+        assert_eq!(
+            shadow.pick().map(|pick| pick.session_verdict),
+            Some(SessionVerdict::Pinned)
+        );
+        assert_eq!(engine.sessions().held(key), pinned);
+
+        facts.now_micros += 31;
+        let expired = engine
+            .shadow(&facts, &pool, &rows, &cx, &mut scratch)
+            .expect("an expired pin leaves a fresh placement");
+        assert_eq!(first(&expired), Some(rows[0].id));
+        assert_eq!(engine.sessions().held(key), pinned);
+
+        let untimed = with_shadow(by_sessions(), Some(SESSIONS));
+        let live = untimed.decide(&facts, &pool, &rows, &cx, &mut scratch);
+        facts.now_micros += 71;
+        let shadow = untimed
+            .shadow(&facts, &pool, &rows, &cx, &mut scratch)
+            .expect("a pin with no expiry");
+        assert_eq!(first(&shadow), first(&live));
+    }
+
+    #[test]
+    fn shadow_reads_a_pin_of_record_without_writing_it_back() {
+        let engine = with_shadow(least_requests_profile(), Some(SESSIONS));
+        let rows = [candidate(0, 13), candidate(1, 3)];
+        let facts = RequestFacts {
+            model: "m",
+            session_key: Identity::hashed(59),
+            now_micros: 71,
+            ..RequestFacts::default()
+        };
+        let stored = Stored::of(59, rows[0].id);
+        let cx = Constraints {
+            pins: Some(&stored),
+            ..Constraints::default()
+        };
+        let decision = engine
+            .shadow(
+                &facts,
+                &PoolFacts::default(),
+                &rows,
+                &cx,
+                &mut Scratch::new(),
+            )
+            .expect("a shadow placement");
+        let pick = decision.pick().expect("the recorded worker");
+        assert_eq!(
+            pick.targets.first().map(|target| target.id),
+            Some(rows[0].id)
+        );
+        assert_eq!(pick.session_verdict, SessionVerdict::Pinned);
+        assert!(engine.sessions().is_empty());
+    }
+
+    #[test]
+    fn shadow_can_keep_a_key_over_the_overload_veto_without_restoring_its_pin() {
+        for sessions in [None, Some(SESSIONS)] {
+            let profile = Profile {
+                filters: vec![Box::new(Healthy), Box::new(NotOverloaded)],
+                ..least_requests_profile()
+            };
+            let mut engine = with_shadow(profile, sessions);
+            engine.places_by_key(1);
+            let mut rows = [candidate(0, 3), candidate(1, 13)];
+            rows[0].health.overloaded = true;
+            let facts = RequestFacts {
+                model: "m",
+                session_key: Identity::hashed(59),
+                session_counted: true,
+                now_micros: 71,
+                ..RequestFacts::default()
+            };
+            let stored = Stored::of(59, rows[0].id);
+            let cx = Constraints {
+                pins: Some(&stored),
+                ..Constraints::default()
+            };
+            let decision = engine
+                .shadow(
+                    &facts,
+                    &PoolFacts::default(),
+                    &rows,
+                    &cx,
+                    &mut Scratch::new(),
+                )
+                .expect("a shadow placement");
+            assert_eq!(
+                decision
+                    .pick()
+                    .and_then(|pick| pick.targets.first())
+                    .map(|t| t.id),
+                Some(rows[0].id)
+            );
+            assert!(engine.sessions().is_empty());
+        }
+    }
+
+    #[test]
+    fn shadow_stages_count_live_dispatches_but_a_shadow_pick_sends_nothing() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        #[derive(Debug)]
+        struct Dispatches(Arc<AtomicU32>);
+
+        impl Lifecycle for Dispatches {
+            fn on_dispatched(&self, _: &Lease, _: &Target, _: Side, _: u32) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        impl Scorer for Dispatches {
+            fn name(&self) -> &'static str {
+                "dispatch-count"
+            }
+
+            fn score(
+                &self,
+                _: &RequestFacts<'_>,
+                rows: &[Candidate],
+                kept: &[u32],
+                out: &mut [f32],
+            ) -> TieBand {
+                let count = self.0.load(Ordering::Relaxed);
+                for (score, &i) in out.iter_mut().zip(kept) {
+                    *score = if rows[i as usize].position == count {
+                        1.0
+                    } else {
+                        0.0
+                    };
+                }
+                TieBand::NORMALIZED
+            }
+        }
+
+        let count = Arc::new(AtomicU32::new(0));
+        let engine = with_shadow(
+            Profile {
+                scorers: vec![Weighted {
+                    scorer: Box::new(Dispatches(Arc::clone(&count))),
+                    weight: 1.0,
+                }],
+                ..least_requests_profile()
+            },
+            None,
+        );
+        let rows = [candidate(0, 3), candidate(1, 13)];
+        let (facts, pool, cx) = (
+            RequestFacts::default(),
+            PoolFacts::default(),
+            Constraints::default(),
+        );
+        let mut scratch = Scratch::new();
+        let live = engine.decide(&facts, &pool, &rows, &cx, &mut scratch);
+        let target = live
+            .pick()
+            .and_then(|pick| pick.targets.first())
+            .expect("a live target");
+        assert_eq!(target.id, rows[0].id);
+        engine.on_dispatched(&Lease::default(), target, Side::Single, 0);
+        let shadow = engine
+            .shadow(&facts, &pool, &rows, &cx, &mut scratch)
+            .expect("the binding shadows");
+        assert_eq!(
+            shadow
+                .pick()
+                .and_then(|pick| pick.targets.first())
+                .map(|t| t.id),
+            Some(rows[1].id)
+        );
+        assert_eq!(count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn shadow_flags_compose_with_sampling_and_plain_bindings_have_no_shadow() {
+        let mut plain = engine();
+        let facts = RequestFacts::default();
+        assert_eq!(plain.seat_flags(), 0);
+        plain.set_explain_sample(17);
+        assert_eq!(plain.seat_flags(), 2);
+        assert!(plain
+            .shadow(
+                &facts,
+                &PoolFacts::default(),
+                &[],
+                &Constraints::default(),
+                &mut Scratch::new(),
+            )
+            .is_none());
+        let mut shadowed = with_shadow(by_sessions(), None);
+        assert_eq!(shadowed.seat_flags(), 4);
+        shadowed.set_explain_sample(17);
+        assert_eq!(shadowed.seat_flags(), 6);
+        shadowed.set_explain_sample(0);
+        assert_eq!(shadowed.seat_flags(), 4);
+    }
+
+    #[test]
+    fn shadow_respects_binding_order_and_separate_profile_state() {
+        let fallback = Binding {
+            shadow: Some(1),
+            ..single_binding()
+        };
+        let first = Binding {
+            model: "first".into(),
+            ..single_binding()
+        };
+        let build = |first, fallback| {
+            Engine::new(
+                vec![least_requests_profile(), by_sessions()],
+                vec![first, fallback],
+                23,
+                Needs::default(),
+            )
+        };
+        let run = |engine: &Engine, model| {
+            engine.shadow(
+                &RequestFacts {
+                    model,
+                    ..RequestFacts::default()
+                },
+                &PoolFacts::default(),
+                &[],
+                &Constraints::default(),
+                &mut Scratch::new(),
+            )
+        };
+        let engine = build(first.clone(), fallback.clone());
+        assert!(run(&engine, "first").is_none());
+        assert!(run(&engine, "second").is_some());
+        let reused = build(
+            Binding {
+                profile: 1,
+                ..first
+            },
+            fallback,
+        );
+        assert!(run(&reused, "second").is_none());
+    }
+
+    #[test]
+    fn shadow_needs_join_the_matching_bindings_live_needs() {
+        let mut document = PolicySpec::preset("least_load").expect("a preset");
+        let mut next = PolicySpec::preset("cache_aware").expect("a preset");
+        let mut profile = next
+            .profiles
+            .remove("cache_aware")
+            .expect("the affinity profile");
+        profile.pick = crate::spec::PickStage::Best(crate::spec::BestParams { sample: 13 }).into();
+        document.profiles.insert("second".into(), profile);
+        document.bindings[0].matcher.phase = vec![Phase::Single];
+        document.bindings[0].shadow = Some(crate::spec::ShadowSpec::Profile("second".into()));
+        let engine = document
+            .validate()
+            .expect("a binding with affinity in its shadow");
+        assert!(!engine.profiles()[0].needs().affinity);
+        assert!(engine.needs_for("m", Phase::Single).affinity);
+        assert!(engine.needs_for_phase(Phase::Single).affinity);
+        assert!(!engine.needs_for("m", Phase::Decode).affinity);
+        assert!(!engine.needs_for_phase(Phase::Decode).affinity);
+        assert!(
+            matches!(engine.needs_rows().as_slice(), [("*", Phase::Single, needs)] if needs.affinity)
+        );
+        assert_eq!(engine.named[1], 13);
+        assert!(engine
+            .shadow(
+                &RequestFacts {
+                    phase: Phase::Decode,
+                    ..RequestFacts::default()
+                },
+                &PoolFacts::default(),
+                &[],
+                &Constraints::default(),
+                &mut Scratch::new(),
+            )
+            .is_none());
     }
 
     #[test]
@@ -4958,6 +5656,8 @@ mod tests {
                 plan: Plan::Single,
                 profile: 0,
                 decode_profile: None,
+                shadow: None,
+                decode_shadow: None,
                 sessions: None,
                 overload: None,
             }],
@@ -5030,6 +5730,8 @@ mod tests {
                 plan: Plan::Single,
                 profile: 0,
                 decode_profile: None,
+                shadow: None,
+                decode_shadow: None,
                 sessions: None,
                 overload: None,
             }],
@@ -5192,6 +5894,8 @@ mod tests {
                 plan: Plan::Single,
                 profile: 0,
                 decode_profile: None,
+                shadow: None,
+                decode_shadow: None,
                 sessions: None,
                 overload: None,
             }],
@@ -5222,6 +5926,8 @@ mod tests {
             plan: Plan::PdPair,
             profile: 0,
             decode_profile: Some(0),
+            shadow: None,
+            decode_shadow: None,
             sessions: None,
             overload: None,
         }
@@ -6494,6 +7200,8 @@ mod tests {
                     plan: Plan::Single,
                     profile: 1,
                     decode_profile: None,
+                    shadow: None,
+                    decode_shadow: None,
                     sessions: None,
                     overload: None,
                 },
@@ -6747,6 +7455,8 @@ mod tests {
                 plan: Plan::Single,
                 profile: 0,
                 decode_profile: None,
+                shadow: None,
+                decode_shadow: None,
                 sessions: None,
                 overload: None,
             }],
@@ -6817,6 +7527,8 @@ mod tests {
                 plan: Plan::PdPair,
                 profile: 0,
                 decode_profile: Some(1),
+                shadow: None,
+                decode_shadow: None,
                 sessions: None,
                 overload: None,
             }],
@@ -6838,6 +7550,8 @@ mod tests {
                 plan: Plan::PdPair,
                 profile: 0,
                 decode_profile: Some(1),
+                shadow: None,
+                decode_shadow: None,
                 sessions: None,
                 overload: None,
             }],
@@ -6866,6 +7580,8 @@ mod tests {
                 plan: Plan::PdPair,
                 profile: 0,
                 decode_profile: Some(0),
+                shadow: None,
+                decode_shadow: None,
                 sessions: None,
                 overload: None,
             }],
@@ -6989,6 +7705,8 @@ mod tests {
                 plan: Plan::PdPair,
                 profile: 0,
                 decode_profile: Some(0),
+                shadow: None,
+                decode_shadow: None,
                 sessions: None,
                 overload: None,
             }],
@@ -7072,6 +7790,8 @@ mod tests {
                 plan: Plan::Single,
                 profile: 0,
                 decode_profile: None,
+                shadow: None,
+                decode_shadow: None,
                 sessions,
                 overload: None,
             }],
@@ -7376,6 +8096,8 @@ mod tests {
                     plan: Plan::PdPair,
                     profile: 0,
                     decode_profile: Some(1),
+                    shadow: None,
+                    decode_shadow: None,
                     sessions: None,
                     overload: None,
                 }],
@@ -7485,6 +8207,8 @@ mod tests {
                 plan: Plan::PdPair,
                 profile: 0,
                 decode_profile: Some(1),
+                shadow: None,
+                decode_shadow: None,
                 sessions: None,
                 overload: None,
             }],
@@ -8338,6 +9062,8 @@ mod tests {
             plan: Plan::Single,
             profile: 0,
             decode_profile: None,
+            shadow: None,
+            decode_shadow: None,
             sessions: None,
             overload: None,
         };
@@ -8350,6 +9076,8 @@ mod tests {
             plan: Plan::Single,
             profile: 0,
             decode_profile: None,
+            shadow: None,
+            decode_shadow: None,
             sessions: None,
             overload: None,
         };
@@ -8497,6 +9225,8 @@ mod tests {
                 plan: Plan::Single,
                 profile: 0,
                 decode_profile: None,
+                shadow: None,
+                decode_shadow: None,
                 sessions: Some(rule),
                 overload: None,
             }],
@@ -9163,6 +9893,8 @@ mod tests {
             plan: Plan::Single,
             profile: 0,
             decode_profile: None,
+            shadow: None,
+            decode_shadow: None,
             sessions: Some(rule),
             overload: None,
         };
@@ -9252,6 +9984,8 @@ mod tests {
                 plan: Plan::Single,
                 profile: 0,
                 decode_profile: None,
+                shadow: None,
+                decode_shadow: None,
                 sessions: None,
                 overload: None,
             }],
@@ -9371,6 +10105,8 @@ mod tests {
                 plan: Plan::Single,
                 profile: 0,
                 decode_profile: None,
+                shadow: None,
+                decode_shadow: None,
                 sessions,
                 overload: None,
             }],
@@ -9394,6 +10130,8 @@ mod tests {
             plan: Plan::Single,
             profile: 0,
             decode_profile: None,
+            shadow: None,
+            decode_shadow: None,
             sessions,
             overload: None,
         };
@@ -9766,6 +10504,8 @@ mod tests {
                 plan: Plan::Epd { encode: 1 },
                 profile: 0,
                 decode_profile: Some(0),
+                shadow: None,
+                decode_shadow: None,
                 sessions: None,
                 overload: None,
             }],
@@ -9807,6 +10547,8 @@ mod tests {
                 plan: Plan::Epd { encode: 1 },
                 profile: 0,
                 decode_profile: Some(0),
+                shadow: None,
+                decode_shadow: None,
                 sessions: None,
                 overload: None,
             }],

@@ -127,6 +127,8 @@ fn engine_of(profile: Profile) -> Engine {
             plan: Plan::Single,
             profile: 0,
             decode_profile: None,
+            shadow: None,
+            decode_shadow: None,
             sessions: None,
             overload: None,
         }],
