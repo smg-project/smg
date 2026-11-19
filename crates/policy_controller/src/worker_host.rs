@@ -10,10 +10,6 @@
 //! its object is dropped. A leader and a standby run the same path over the
 //! same rows.
 //!
-//! The holder is the registry's one writer. No job step writes it: under a
-//! host that keeps a store a registration ends at the membership door, and
-//! the row's change builds the object here.
-//!
 //! # The one table
 //!
 //! [`object()`] reads the table from row to object and [`facts()`] reads it
@@ -71,6 +67,11 @@
 //! The host hands out a [`Membership`] door. A host without election uses
 //! [`StoreDoor`]. A replica that may lead uses the controller's door.
 //!
+//! [`registration_at_door`] writes the created workers' rows.
+//! [`removal_at_door`] marks the selected rows draining, waits for the
+//! workers to settle and removes their rows. The steps write the store
+//! through the door. [`Objects`] remains the registry's one writer.
+//!
 //! # What the module does not hold
 //!
 //! It builds no registry, no engine and no task. The host builds the
@@ -85,10 +86,13 @@ mod lead;
 mod loads;
 mod object;
 mod objects;
+pub mod steps;
 
+#[cfg(all(test, feature = "controller"))]
+pub(crate) use door::tests::{check_guard, check_health_scope, check_maker, check_provider};
 #[cfg(feature = "controller")]
 pub(crate) use door::{drain, lay, take, Turn};
-pub use door::{Membership, Refused, StoreDoor, Wrote};
+pub use door::{Membership, Refused, Remover, StoreDoor, Wrote};
 pub use found::facts;
 pub use health::HealthAdapter;
 pub use kv::{KvAdapter, KvHost, NoFeed, Unfed};
@@ -96,3 +100,8 @@ pub use lead::{Lead, SoleLead};
 pub use loads::LoadAdapter;
 pub use object::object;
 pub use objects::{Members, Objects, Standing};
+pub use steps::{
+    maker_of, registration_at_door, removal_at_door, remover_of, DrainWorkersAtDoor,
+    RemoveWorkersAtDoor, Unasked, WriteWorkersAtDoor, DISCOVERY, DRAIN_WORKERS_AT_DOOR_STEP,
+    REMOVE_WORKERS_AT_DOOR_STEP, WRITE_WORKERS_AT_DOOR_STEP,
+};

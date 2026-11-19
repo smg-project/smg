@@ -1,12 +1,14 @@
-//! The writes a provider can make through a host's membership door.
+//! Writes through a host's membership door.
 
 use std::sync::Arc;
 
 use parking_lot::Mutex;
+use smg_worker::settings::UnhealthyRemovalScope;
 
+use super::Standing;
 use crate::{
     store::{
-        membership::{self, Past},
+        membership::{self, NotMaker, Past},
         HealthSink, Laid, Maker, MembershipChange, MemoryStore, WorkerFacts, WorkerRow,
         WorkerStatus, WorkersStore,
     },
@@ -29,7 +31,10 @@ pub enum Wrote {
 pub enum Refused {
     /// Another maker's row, named by its maker.
     NotMaker(String),
-    /// A fact past its bound, or the row past its size.
+    /// A fact the door does not take, or the row past its size. A fact is
+    /// refused past its bound, under a key that is not the call's URL, or,
+    /// at the controller's door, when its log does not carry it to a standby
+    /// or when it states a host-local wire and names no gateway.
     Past(Past),
     /// No row stands under the URL.
     Absent,
@@ -37,9 +42,27 @@ pub enum Refused {
     NotLeading(String),
     /// Another writer moved the row under the call.
     Moved,
+    /// The row's maker is outside the health removal scope.
+    OutOfScope,
 }
 
-/// The membership door a host hands the steps that write a found worker.
+impl Refused {
+    pub(crate) const OUT_OF_SCOPE: &str = "the row's maker is outside the health removal scope";
+}
+
+/// Who asks to drain or remove a row.
+#[derive(Clone, Copy, Debug)]
+pub enum Remover<'a> {
+    /// A caller acting as the row's whole maker.
+    Maker(&'a Maker),
+    /// The host's discovery source, acting under a row's maker if it has
+    /// this provider name. The guard names the row under any key.
+    Provider(&'a str),
+    /// The host's health checks, acting under the maker of a row in scope.
+    Health(UnhealthyRemovalScope),
+}
+
+/// The membership door a host hands its registration and removal steps.
 pub trait Membership: Send + Sync + 'static {
     /// Register a worker, or refresh the maker's row. The callback states
     /// facts for `url` during the door's turn and must leave writes to the door.
@@ -52,11 +75,11 @@ pub trait Membership: Send + Sync + 'static {
         state: &dyn Fn(Option<&WorkerFacts>) -> WorkerFacts,
     ) -> Result<Wrote, Refused>;
 
-    /// Mark the maker's row as draining.
-    fn drained(&self, maker: &Maker, url: &str) -> Result<Wrote, Refused>;
+    /// Mark the row the asker saw as draining. Its revision stays the same.
+    fn drained(&self, by: Remover<'_>, url: &str, seen: Standing) -> Result<Wrote, Refused>;
 
-    /// Remove the maker's row under the registered URL.
-    fn gone(&self, maker: &Maker, url: &str) -> Result<Wrote, Refused>;
+    /// Remove the row the asker saw under the registered URL.
+    fn gone(&self, by: Remover<'_>, url: &str, seen: Standing) -> Result<Wrote, Refused>;
 }
 
 /// What a door owns of a write, beside the rules every door shares.
@@ -66,7 +89,8 @@ pub(crate) trait Turn {
     /// The number of the life a registration makes now.
     fn life(&self) -> Result<u64, Refused>;
 
-    /// A size rule of the door's own, behind the store's measure.
+    /// The door's own rules of the facts it is about to write, behind the
+    /// store's measure.
     fn room(&self, facts: &WorkerFacts, maker: &Maker) -> Result<(), Refused>;
 }
 
@@ -138,10 +162,52 @@ fn changed(
         .ok_or(Refused::Moved)
 }
 
-/// Mark a maker's row as draining while the door holds its turn.
-pub(crate) fn drain(store: &MemoryStore, maker: &Maker, url: &str) -> Result<Wrote, Refused> {
+fn removal_row(
+    store: &MemoryStore,
+    by: Remover<'_>,
+    url: &str,
+    seen: Standing,
+) -> Result<WorkerRow, Refused> {
     let row = store.by_key(url).ok_or(Refused::Absent)?;
-    made_by(&row, maker)?;
+    if (row.id, row.revision) != (seen.row, seen.revision) {
+        return Err(Refused::Moved);
+    }
+    match by {
+        Remover::Maker(maker) => made_by(&row, maker)?,
+        Remover::Provider(name) => match &row.maker {
+            Maker::Provider(provider) if provider.provider() == name => {}
+            Maker::Provider(provider) => {
+                return Err(Refused::NotMaker(
+                    NotMaker::Provider {
+                        provider: provider.provider(),
+                    }
+                    .to_string(),
+                ));
+            }
+            Maker::Control => return Err(Refused::NotMaker(NotMaker::Control.to_string())),
+        },
+        Remover::Health(scope) => {
+            let allowed = match scope {
+                UnhealthyRemovalScope::Disabled => false,
+                UnhealthyRemovalScope::DiscoveryOwned => matches!(row.maker, Maker::Provider(_)),
+                UnhealthyRemovalScope::AllLocal => true,
+            };
+            if !allowed {
+                return Err(Refused::OutOfScope);
+            }
+        }
+    }
+    Ok(row)
+}
+
+/// Mark the guarded row as draining while the door holds its turn.
+pub(crate) fn drain(
+    store: &MemoryStore,
+    by: Remover<'_>,
+    url: &str,
+    seen: Standing,
+) -> Result<Wrote, Refused> {
+    let row = removal_row(store, by, url, seen)?;
     if row.status == WorkerStatus::Draining {
         return Ok(Wrote::Unmoved(row.id));
     }
@@ -151,16 +217,14 @@ pub(crate) fn drain(store: &MemoryStore, maker: &Maker, url: &str) -> Result<Wro
     )
 }
 
-/// Remove the row under the registered URL while the door holds its turn.
-/// The maker is checked whole and the removal uses the revision just read.
-/// A provider may treat [`Refused::Absent`] and [`Refused::NotMaker`] as done.
-/// Another spelling of the URL names no row. A late or repeated removal
-/// leaves workers under another key alone. Reusing a key lets the old
-/// removal take the later worker.
-/// Control calls remove by id and revision through their own door.
-pub(crate) fn take(store: &MemoryStore, maker: &Maker, url: &str) -> Result<Wrote, Refused> {
-    let row = store.by_key(url).ok_or(Refused::Absent)?;
-    made_by(&row, maker)?;
+/// Remove the guarded row while the door holds its turn.
+pub(crate) fn take(
+    store: &MemoryStore,
+    by: Remover<'_>,
+    url: &str,
+    seen: Standing,
+) -> Result<Wrote, Refused> {
+    let row = removal_row(store, by, url, seen)?;
     changed(store.remove(row.id, row.revision), Wrote::Removed)
 }
 
@@ -232,17 +296,17 @@ impl Membership for StoreDoor {
         self.call(|| lay(self, maker, url, state))
     }
 
-    fn drained(&self, maker: &Maker, url: &str) -> Result<Wrote, Refused> {
-        self.call(|| drain(&self.store, maker, url))
+    fn drained(&self, by: Remover<'_>, url: &str, seen: Standing) -> Result<Wrote, Refused> {
+        self.call(|| drain(&self.store, by, url, seen))
     }
 
-    fn gone(&self, maker: &Maker, url: &str) -> Result<Wrote, Refused> {
-        self.call(|| take(&self.store, maker, url))
+    fn gone(&self, by: Remover<'_>, url: &str, seen: Standing) -> Result<Wrote, Refused> {
+        self.call(|| take(&self.store, by, url, seen))
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::{
         sync::{
             atomic::{AtomicUsize, Ordering},
@@ -252,13 +316,15 @@ mod tests {
         time::Duration,
     };
 
-    use super::{changed, lay, Membership, Refused, StoreDoor, Turn, Wrote};
+    use smg_worker::settings::UnhealthyRemovalScope;
+
+    use super::{changed, lay, Membership, Refused, Remover, Standing, StoreDoor, Turn, Wrote};
     use crate::{
         store::{
             membership::{self, Past},
             Maker, MemoryStore, WorkerFacts, WorkerRow, WorkerStatus, WorkersStore,
         },
-        view::{Role, WireModes},
+        view::{Role, WireModes, WorkerId},
     };
 
     const URL: &str = "http://worker:8000";
@@ -278,6 +344,164 @@ mod tests {
             dp_size: 1,
             ..WorkerFacts::default()
         }
+    }
+
+    fn standing(row: &WorkerRow) -> Standing {
+        Standing {
+            row: row.id,
+            revision: row.revision,
+        }
+    }
+
+    const ABSENT: Standing = Standing {
+        row: WorkerId(0),
+        revision: 0,
+    };
+
+    fn local_door() -> (Arc<MemoryStore>, Box<dyn Membership>) {
+        let (store, door) = door();
+        (store, Box::new(door))
+    }
+
+    #[test]
+    fn a_removal_takes_only_the_row_its_asker_saw() {
+        check_guard(local_door).expect("both registrations stand in turn");
+    }
+
+    pub(crate) fn check_guard(
+        open: impl FnOnce() -> (Arc<MemoryStore>, Box<dyn Membership>),
+    ) -> Result<(), &'static str> {
+        let (store, door) = open();
+        let maker = Maker::Control;
+        let by = Remover::Maker(&maker);
+        assert!(door.found(&maker, URL, &|_| stated()).is_ok());
+        let first = store.by_key(URL).ok_or("the first row")?;
+        assert!(door
+            .found(&maker, URL, &|_| WorkerFacts {
+                role: Role::Decode,
+                ..stated()
+            })
+            .is_ok());
+        let replacement = store.by_key(URL).ok_or("the replacement row")?;
+        assert_ne!(first.id, replacement.id);
+        assert_eq!(first.revision, replacement.revision);
+        let epoch = store.epoch();
+        let wrong_revision = Standing {
+            revision: replacement.revision + 1,
+            ..standing(&replacement)
+        };
+        for seen in [wrong_revision, standing(&first)] {
+            assert_eq!(door.drained(by, URL, seen), Err(Refused::Moved));
+            assert_eq!(door.gone(by, URL, seen), Err(Refused::Moved));
+            assert_eq!(
+                door.gone(Remover::Provider("other"), URL, seen),
+                Err(Refused::Moved)
+            );
+        }
+        assert_eq!(store.by_key(URL), Some(replacement));
+        assert_eq!(store.epoch(), epoch);
+        Ok(())
+    }
+
+    #[test]
+    fn the_hosts_own_source_removes_its_rows_under_any_key() {
+        check_provider(local_door).expect("the makers and their rows");
+    }
+
+    pub(crate) fn check_provider(
+        open: impl Fn() -> (Arc<MemoryStore>, Box<dyn Membership>),
+    ) -> Result<(), &'static str> {
+        let own = Maker::provider("pool", "private/key").map_err(|_| "the source's maker")?;
+        let another =
+            Maker::provider("other", "private/key").map_err(|_| "another source's maker")?;
+        for (maker, refusal) in [
+            (own, None),
+            (
+                Maker::Control,
+                Some("the row was made by a control call: its maker alone changes it"),
+            ),
+            (
+                another,
+                Some("the row is provider other's: its worker is changed at the provider's source"),
+            ),
+        ] {
+            let (store, door) = open();
+            assert!(door.found(&maker, URL, &|_| stated()).is_ok());
+            let row = store.by_key(URL).ok_or("the registered row")?;
+            let by = Remover::Provider("pool");
+            let seen = standing(&row);
+            if let Some(refusal) = refusal {
+                let expected = Err(Refused::NotMaker(refusal.to_owned()));
+                assert_eq!(door.drained(by, URL, seen), expected);
+                assert_eq!(door.gone(by, URL, seen), expected);
+                assert_eq!(store.by_key(URL), Some(row));
+            } else {
+                assert_eq!(door.drained(by, URL, seen), Ok(Wrote::Draining(row.id)));
+                assert_eq!(door.gone(by, URL, seen), Ok(Wrote::Removed(row.id)));
+                assert_eq!(store.by_key(URL), None);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn health_removes_inside_its_scope_alone() {
+        check_health_scope(local_door).expect("the makers and their rows");
+    }
+
+    pub(crate) fn check_health_scope(
+        open: impl Fn() -> (Arc<MemoryStore>, Box<dyn Membership>),
+    ) -> Result<(), &'static str> {
+        let provider = Maker::provider("pool", "private/key").map_err(|_| "the source's maker")?;
+        for (scope, control, discovered) in [
+            (UnhealthyRemovalScope::Disabled, false, false),
+            (UnhealthyRemovalScope::DiscoveryOwned, false, true),
+            (UnhealthyRemovalScope::AllLocal, true, true),
+        ] {
+            for (maker, allowed) in [(&Maker::Control, control), (&provider, discovered)] {
+                let (store, door) = open();
+                assert!(door.found(maker, URL, &|_| stated()).is_ok());
+                let row = store.by_key(URL).ok_or("the registered row")?;
+                let by = Remover::Health(scope);
+                let seen = standing(&row);
+                if allowed {
+                    assert_eq!(door.drained(by, URL, seen), Ok(Wrote::Draining(row.id)));
+                    assert_eq!(door.gone(by, URL, seen), Ok(Wrote::Removed(row.id)));
+                    assert_eq!(store.by_key(URL), None);
+                } else {
+                    assert_eq!(door.drained(by, URL, seen), Err(Refused::OutOfScope));
+                    assert_eq!(door.gone(by, URL, seen), Err(Refused::OutOfScope));
+                    assert_eq!(store.by_key(URL), Some(row));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_removal_leaves_the_rows_maker_as_it_was() {
+        check_maker(local_door).expect("the maker and its row");
+    }
+
+    pub(crate) fn check_maker(
+        open: impl FnOnce() -> (Arc<MemoryStore>, Box<dyn Membership>),
+    ) -> Result<(), &'static str> {
+        let (store, door) = open();
+        let maker = Maker::provider("pool", "private/key").map_err(|_| "the source's maker")?;
+        assert!(door.found(&maker, URL, &|_| stated()).is_ok());
+        let row = store.by_key(URL).ok_or("the registered row")?;
+        assert_eq!(
+            door.drained(Remover::Provider("pool"), URL, standing(&row)),
+            Ok(Wrote::Draining(row.id))
+        );
+        assert_eq!(
+            store.by_key(URL),
+            Some(WorkerRow {
+                status: WorkerStatus::Draining,
+                ..row
+            })
+        );
+        Ok(())
     }
 
     #[test]
@@ -319,12 +543,13 @@ mod tests {
             door.found(&maker, URL, &|_| stated()),
             Ok(Wrote::Unmoved(row.id))
         );
+        let seen = standing(&row);
         assert_eq!(store.by_key(URL), Some(row));
         assert_eq!(store.epoch(), 1);
         assert_eq!(count.load(Ordering::Relaxed), 1);
 
         assert!(matches!(
-            door.gone(&Maker::Control, URL),
+            door.gone(Remover::Maker(&Maker::Control), URL, seen),
             Err(Refused::NotMaker(_))
         ));
         assert_eq!(count.load(Ordering::Relaxed), 1);
@@ -394,8 +619,14 @@ mod tests {
                 door.found(&caller, URL, &|_| panic!("only the maker states facts")),
                 expected
             );
-            assert_eq!(door.drained(&caller, URL), expected);
-            assert_eq!(door.gone(&caller, URL), expected);
+            assert_eq!(
+                door.drained(Remover::Maker(&caller), URL, standing(&row)),
+                expected
+            );
+            assert_eq!(
+                door.gone(Remover::Maker(&caller), URL, standing(&row)),
+                expected
+            );
             assert_eq!(store.by_key(URL), Some(row));
             assert_eq!(store.epoch(), 1);
         }
@@ -469,7 +700,10 @@ mod tests {
             changed(store.remove(row.id, stale), Wrote::Removed),
             Err(Refused::Moved)
         );
-        assert_eq!(door.drained(&maker, URL), Ok(Wrote::Draining(row.id)));
+        assert_eq!(
+            door.drained(Remover::Maker(&maker), URL, standing(&row)),
+            Ok(Wrote::Draining(row.id))
+        );
         assert_eq!(
             store.by_key(URL),
             Some(WorkerRow {
@@ -478,9 +712,15 @@ mod tests {
             })
         );
         assert_eq!(store.epoch(), 2);
-        assert_eq!(door.drained(&maker, URL), Ok(Wrote::Unmoved(row.id)));
+        assert_eq!(
+            door.drained(Remover::Maker(&maker), URL, standing(&row)),
+            Ok(Wrote::Unmoved(row.id))
+        );
         assert_eq!(store.epoch(), 2);
-        assert_eq!(door.gone(&maker, URL), Ok(Wrote::Removed(row.id)));
+        assert_eq!(
+            door.gone(Remover::Maker(&maker), URL, standing(&row)),
+            Ok(Wrote::Removed(row.id))
+        );
         assert_eq!(store.epoch(), 3);
         assert_eq!(store.by_key(URL), None);
     }
@@ -489,8 +729,14 @@ mod tests {
     fn no_row_under_the_url_is_absent() {
         let (store, door) = door();
         let maker = Maker::provider("pool", "first").expect("a maker");
-        assert_eq!(door.drained(&maker, URL), Err(Refused::Absent));
-        assert_eq!(door.gone(&maker, URL), Err(Refused::Absent));
+        assert_eq!(
+            door.drained(Remover::Maker(&maker), URL, ABSENT),
+            Err(Refused::Absent)
+        );
+        assert_eq!(
+            door.gone(Remover::Maker(&maker), URL, ABSENT),
+            Err(Refused::Absent)
+        );
         assert_eq!(store.epoch(), 0);
     }
 
@@ -502,18 +748,22 @@ mod tests {
         let maker = Maker::provider("pool", "first").expect("a maker");
         let door = Arc::new_cyclic(|door: &Weak<StoreDoor>| {
             let door = door.clone();
-            let maker = maker.clone();
-            StoreDoor::new(store).telling(move || {
+            StoreDoor::new(Arc::clone(&store)).telling(move || {
                 let door = door.upgrade().expect("the calling door");
-                assert_eq!(door.gone(&maker, "http://absent"), Err(Refused::Absent));
+                assert_eq!(
+                    door.gone(Remover::Maker(&Maker::Control), "http://absent", ABSENT),
+                    Err(Refused::Absent)
+                );
                 heard.fetch_add(1, Ordering::Relaxed);
             })
         });
         let (done, finished) = mpsc::channel();
         let writer = thread::spawn(move || {
             let found = door.found(&maker, URL, &|_| stated());
-            let drained = door.drained(&maker, URL);
-            let gone = door.gone(&maker, URL);
+            let seen = standing(&store.by_key(URL).expect("the registered row"));
+            let by = Remover::Maker(&maker);
+            let drained = door.drained(by, URL, seen);
+            let gone = door.gone(by, URL, seen);
             done.send([found, drained, gone]).expect("the answers");
         });
         let [found, drained, gone] = finished
@@ -546,7 +796,8 @@ mod tests {
         assert_eq!(wrote, Ok(Wrote::InPlace(row.id)));
         assert_eq!((row.status, row.revision), (WorkerStatus::Ready, 2));
 
-        door.gone(&maker, URL).expect("removed");
+        door.gone(Remover::Maker(&maker), URL, standing(&row))
+            .expect("removed");
         let wrote = door.found(&maker, URL, &|_| row.facts.clone());
         let fresh = store.by_key(URL).expect("the newly registered row");
         assert_eq!(wrote, Ok(Wrote::Registered(fresh.id)));
