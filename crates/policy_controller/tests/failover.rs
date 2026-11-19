@@ -58,7 +58,7 @@ use engines::{eventually, mock_engine};
 use openai_protocol::worker::RuntimeType;
 use replicas::{Lease, Replica, ROOM};
 use smg_policy_controller::{
-    client::{Answer, Client},
+    client::{self, Answer, Client},
     elector::ElectionSettings,
     proto::{
         self, decision::Outcome, identity::Form, policy_controller_client::PolicyControllerClient,
@@ -66,7 +66,7 @@ use smg_policy_controller::{
         Identity, Released, RequestFacts,
     },
 };
-use tonic::{metadata::AsciiMetadataValue, transport::Channel, Request};
+use tonic::{metadata::AsciiMetadataValue, transport::Channel, Code, Request};
 
 /// The one model the fleet serves.
 const MODEL: &str = "fleet-model";
@@ -173,10 +173,23 @@ async fn session_at(replica: &Replica) -> Result<Client, String> {
     }
 }
 
+/// Whether `error` is a session its controller ended because it stopped
+/// leading, or leads under a later term: a gateway opens its session again.
+fn ended(error: &client::Error) -> bool {
+    matches!(error, client::Error::Status(status) if status.code() == Code::Aborted)
+}
+
 /// One ask of the routing key `key`, the `n`th of the case: the worker its
 /// pick names first. Its lease is given up on the session, as a gateway
-/// whose client left.
-async fn placed(gateway: &mut Client, key: u64, n: u64) -> Result<u64, String> {
+/// whose client left. The session stands at `replica`.
+///
+/// A leader whose renewal lands past its renew deadline leads nobody until
+/// one lands in time, and the lease's store on a busy host can hold a
+/// renewal that long. Meanwhile it answers that it does not lead: a gateway
+/// asks again. A renewal that took the deadline whole ends the session,
+/// which a gateway hears at its next report: it opens its session again
+/// and says the report there. The case does both, inside the room.
+async fn placed(gateway: &mut Client, replica: &Replica, key: u64, n: u64) -> Result<u64, String> {
     let ask = DecideRequest {
         request_id: format!("ask-{n}").into_bytes(),
         facts: Some(RequestFacts {
@@ -190,10 +203,17 @@ async fn placed(gateway: &mut Client, key: u64, n: u64) -> Result<u64, String> {
         }),
         constraints: None,
     };
-    let answer = gateway
-        .decide(ask)
-        .await
-        .map_err(|error| format!("no answer: {error}"))?;
+    let began = Instant::now();
+    let answer = loop {
+        match gateway.decide(ask.clone()).await {
+            Ok(Answer::Busy(busy))
+                if busy.reason() == proto::busy::Reason::NotLeader && began.elapsed() < ROOM =>
+            {
+                tokio::time::sleep(PACE).await;
+            }
+            answer => break answer.map_err(|error| format!("no answer: {error}"))?,
+        }
+    };
     let Answer::Decision(Decision {
         leases,
         outcome: Some(Outcome::Pick(pick)),
@@ -209,10 +229,14 @@ async fn placed(gateway: &mut Client, key: u64, n: u64) -> Result<u64, String> {
             reason: released::Reason::ClientGone.into(),
             ..Released::default()
         };
-        gateway
-            .released(released)
-            .await
-            .map_err(|error| format!("a lease is not given up: {error}"))?;
+        let reported = match gateway.released(released).await {
+            Err(error) if ended(&error) => {
+                *gateway = session_at(replica).await?;
+                gateway.released(released).await
+            }
+            reported => reported,
+        };
+        reported.map_err(|error| format!("a lease is not given up: {error}"))?;
     }
     Ok(worker)
 }
@@ -353,8 +377,13 @@ async fn a_killed_leaders_standby_answers_each_routing_key_on_its_worker() {
             let mut named = HashSet::new();
             for key in 1..=KEYS {
                 asked += 1;
-                if let Ok(worker) = placed(&mut gateway, key, asked).await {
+                if let Ok(worker) = placed(&mut gateway, &leader, key, asked).await {
                     named.insert(worker);
+                }
+                // An ask can wait a room out by itself: the round ends at
+                // its own room, and the assert below reads it.
+                if whole.elapsed() >= ROOM {
+                    break;
                 }
             }
             if workers.iter().all(|worker| named.contains(worker)) {
@@ -377,7 +406,7 @@ async fn a_killed_leaders_standby_answers_each_routing_key_on_its_worker() {
         while read.len() < 2 {
             for key in 1..=KEYS {
                 asked += 1;
-                let worker = placed(&mut gateway, key, asked)
+                let worker = placed(&mut gateway, &leader, key, asked)
                     .await
                     .expect("the leader answers a key over its fleet");
                 assert!(
@@ -417,7 +446,7 @@ async fn a_killed_leaders_standby_answers_each_routing_key_on_its_worker() {
         leader.kill().expect("the kill");
         leader.exited().expect("a killed leader is gone");
         asked += 1;
-        let unanswered = placed(&mut gateway, 1, asked).await;
+        let unanswered = placed(&mut gateway, &leader, 1, asked).await;
         assert!(
             unanswered.is_err(),
             "a dead leader answers no ask: {unanswered:?}"
@@ -437,7 +466,7 @@ async fn a_killed_leaders_standby_answers_each_routing_key_on_its_worker() {
         // Each routing key is on the worker the dead leader named, by the
         // id the leader gave the row: the ask the kill left unanswered
         // first, asked again under its own id.
-        let worker = placed(&mut gateway, 1, asked)
+        let worker = placed(&mut gateway, &standby, 1, asked)
             .await
             .expect("the promoted standby answers the ask the kill left unanswered");
         assert_eq!(
@@ -446,7 +475,7 @@ async fn a_killed_leaders_standby_answers_each_routing_key_on_its_worker() {
         );
         for key in 1..=KEYS {
             asked += 1;
-            let worker = placed(&mut gateway, key, asked)
+            let worker = placed(&mut gateway, &standby, key, asked)
                 .await
                 .expect("the promoted standby answers a key over its leader's fleet");
             assert_eq!(
