@@ -13,7 +13,9 @@ use crate::{
         ready_worker, render_with_recorder, BasicWorkerBuilder, LoadReaders, WorkerMonitor,
         WorkerRegistry,
     },
-    worker::{EngineMemoryMetricsSnapshot, HealthCheckConfig, WorkerStatus},
+    worker::{
+        EngineMemoryMetricsSnapshot, EngineQueueMetricsSnapshot, HealthCheckConfig, WorkerStatus,
+    },
 };
 
 /// Build an isolated monitor and registry beside a routing side that reads
@@ -128,6 +130,16 @@ impl PushedRecord {
     pub(super) fn total_tokens(mut self, total: i32) -> Self {
         self.snapshot.max_total_num_tokens = total;
         self.telemetry |= LoadTelemetry::TOTAL_TOKENS;
+        self
+    }
+
+    /// The record carrying a queues section of `waiting` waiting requests.
+    pub(super) fn queues_waiting(mut self, waiting: i32) -> Self {
+        self.snapshot.queues = Some(EngineQueueMetricsSnapshot {
+            waiting,
+            ..Default::default()
+        });
+        self.telemetry |= LoadTelemetry::QUEUES;
         self
     }
 
@@ -808,6 +820,63 @@ async fn a_pushed_records_telemetry_feeds_the_gauges_and_outlives_core_only_reco
     assert_eq!(rank0.memory.as_ref().map(|m| m.token_capacity), Some(8_192));
     assert_eq!(rank0.disagg_mode.as_deref(), Some("prefill"));
     assert_eq!(rank0.prefill_queue_reqs, Some(9));
+}
+
+/// A memory section of `token_capacity` tokens.
+fn memory_of(token_capacity: i32) -> EngineMemoryMetricsSnapshot {
+    EngineMemoryMetricsSnapshot {
+        token_capacity,
+        ..Default::default()
+    }
+}
+
+/// Rank 0 of `url` as published once the pushed records are flushed.
+fn published_rank0(monitor: &WorkerMonitor, url: &str) -> SchedulerLoadSnapshot {
+    monitor.flush_pushed();
+    let snapshot = monitor.load_state.snapshot();
+    snapshot.get(url).expect("published").loads[0].clone()
+}
+
+/// A record that carries other telemetry and neither its memory section nor
+/// its queues section keeps both as the last record that carried them said.
+#[tokio::test]
+async fn a_record_keeps_the_memory_and_queues_sections_it_does_not_carry() {
+    let (registry, monitor) = build_monitor();
+    let worker = ready_worker("grpc://w1:9000", "llama-3");
+    registry.register(Arc::clone(&worker)).unwrap();
+    let first = pushed(7).memory(memory_of(8_192)).queues_waiting(4);
+    monitor.apply_pushed_load(&worker, 0, &first, Instant::now());
+    let other = pushed(8).cache_hit_rate(0.5);
+    monitor.apply_pushed_load(&worker, 0, &other, Instant::now());
+
+    let rank0 = published_rank0(&monitor, "grpc://w1:9000");
+    assert_eq!(rank0.num_running_reqs, 8);
+    assert!((rank0.cache_hit_rate - 0.5).abs() < f64::EPSILON);
+    assert_eq!(rank0.memory.map(|m| m.token_capacity), Some(8_192));
+    assert_eq!(rank0.queues.map(|q| q.waiting), Some(4));
+}
+
+/// A record that carries its memory section or its queues section replaces
+/// the last one, each by its own flag: the section it does not carry stays.
+#[tokio::test]
+async fn a_record_replaces_the_memory_or_queues_section_it_carries() {
+    let (registry, monitor) = build_monitor();
+    let worker = ready_worker("grpc://w1:9000", "llama-3");
+    registry.register(Arc::clone(&worker)).unwrap();
+    let first = pushed(7).memory(memory_of(8_192)).queues_waiting(4);
+    monitor.apply_pushed_load(&worker, 0, &first, Instant::now());
+
+    let memory_only = pushed(8).memory(memory_of(4_096));
+    monitor.apply_pushed_load(&worker, 0, &memory_only, Instant::now());
+    let rank0 = published_rank0(&monitor, "grpc://w1:9000");
+    assert_eq!(rank0.memory.map(|m| m.token_capacity), Some(4_096));
+    assert_eq!(rank0.queues.map(|q| q.waiting), Some(4));
+
+    let queues_only = pushed(9).queues_waiting(6);
+    monitor.apply_pushed_load(&worker, 0, &queues_only, Instant::now());
+    let rank0 = published_rank0(&monitor, "grpc://w1:9000");
+    assert_eq!(rank0.memory.map(|m| m.token_capacity), Some(4_096));
+    assert_eq!(rank0.queues.map(|q| q.waiting), Some(6));
 }
 
 /// The poll decision reads the receipt of the worker's pushed records
