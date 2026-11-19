@@ -13,8 +13,9 @@
 //! has a table for; else the legacy parsers with their own detection. A gateway that serves one
 //! model may put the flags before the registry (`--parser-flags-over-registry`,
 //! `RouterConfig::parser_flags_over_registry`): the labels, then the flags when they select
-//! anything, then the registry's table, then the legacy parsers. Names select a table when
-//! it answers to them (`utils::answering_to`: its own name, a legacy parser's
+//! anything, then the registry's table, then the legacy parsers (a reasoning name alone that
+//! selects a table excepted, which reads only the models the registry does not know). Names
+//! select a table when it answers to them (`utils::answering_to`: its own name, a legacy parser's
 //! that reads its format, `qwen` for `qwen3`, `qwen_xml` for `qwen3_tagged`, or a launcher's name
 //! for a family whose table has no older parser, `muse` for `muse_spark`), the tool-call name
 //! deciding, and the table then reads every request for the model; [`TEMPLATE_PARSER`](crate::config::TEMPLATE_PARSER) selects
@@ -148,9 +149,9 @@ pub(crate) use self::{
         worker_constraint, Asks, AutoRequest, AutoTag, Prepared, PreparedConstraint,
     },
     names::{
-        check_names, keeps_special_tokens_for, labels_select_nothing, named_table, reading,
-        reasoning_open, reasoning_open_for, set_aside_by_the_registry, table_label_read,
-        PromptReplay, Reading,
+        check_names, flags_read_first, keeps_special_tokens_for, labels_select_nothing,
+        named_table, names_template, reading, reasoning_open, reasoning_open_for,
+        set_aside_by_the_registry, table_label_read, PromptReplay, Reading,
     },
     reader::{assign_for, engine_finish, finished, Assignment, Delta, Reader},
 };

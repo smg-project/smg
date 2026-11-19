@@ -1742,6 +1742,60 @@ async fn an_unlabeled_model_the_registry_knows_is_read_by_its_table_beside_the_f
     }
 }
 
+/// `--parser-flags-over-registry` reaches the readers from the router's configuration, in both
+/// modes: under `--parser symphony --tool-call-parser step3`, a legacy tool-call name no table
+/// answers to, the model the registry knows is read by its table by default, and by the legacy
+/// parsers the flags name once the option puts them first; the answer's header says which.
+#[tokio::test]
+async fn the_parser_flags_over_registry_option_reaches_the_readers_through_the_router() {
+    assert_eq!(
+        ::symphony::formats::table_for(KNOWN_MODEL).map(|table| table.name()),
+        Some("qwen3")
+    );
+    for mode in [Mode::Regular, Mode::PrefillDecode] {
+        for (over, read_by) in [(false, "symphony"), (true, "legacy")] {
+            let mcp_orchestrator = mcp_orchestrator().await;
+            let config = grpc_config(routing_mode(mode))
+                .parser(ParserChoice::Symphony)
+                .tool_call_parser("step3")
+                .parser_flags_over_registry(over)
+                .build_unchecked();
+            let ctx = grpc_ctx_from(&config, mcp_orchestrator);
+            register_tokenizer_for(
+                &ctx,
+                KNOWN_MODEL,
+                CHAT_TEMPLATE,
+                (TABLE_OUTPUT, TABLE_OUTPUT_ID),
+            )
+            .await;
+            for worker_type in roles(mode) {
+                let port = spawn_engine(vec![TABLE_OUTPUT_ID]).await;
+                register_worker(
+                    &ctx,
+                    &format!("grpc://127.0.0.1:{port}"),
+                    *worker_type,
+                    ModelCard::new(KNOWN_MODEL),
+                );
+            }
+            let router = GrpcRouter::new(&ctx, mode).expect("router");
+            // The response processors of the parser-reading pipelines take it too.
+            for pipeline in [&router.pipeline, &router.messages_pipeline]
+                .into_iter()
+                .chain(router.harmony_pipeline.as_ref())
+            {
+                assert_eq!(pipeline.parser_flags_over_registry(), over, "{mode:?}");
+            }
+            let (status, parser, answer) = chat(&router, KNOWN_MODEL, &HeaderMap::new()).await;
+            assert_eq!(status, StatusCode::OK, "{mode:?} over={over}: {answer}");
+            assert_eq!(
+                parser.as_deref(),
+                Some(read_by),
+                "{mode:?} over={over}: {answer}"
+            );
+        }
+    }
+}
+
 /// One gateway under `--parser symphony` with no parser names: the model the registry does
 /// not know is read by the legacy parsers, its answer says so, and the request is counted
 /// once, under `no_table` and no table; a second request counts a second; the model the

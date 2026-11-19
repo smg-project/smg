@@ -219,7 +219,8 @@ means passthrough, the output read as content. Under `--parser symphony` (the ga
 decide for its model, else the registry's table for a model it knows, else the two flags, for the
 models the registry does not know (a gateway that serves one model may put the flags before the
 registry with `--parser-flags-over-registry`, so they read a model the registry knows too, the
-registry's table reading only where they select nothing): a table's name in them reads those models with that table, and
+registry's table reading only where they select nothing or a reasoning name alone selects a
+table): a table's name in them reads those models with that table, and
 the name `hf` reads each with the table its tokenizer's `response_template` compiles into
 (`smg-response-template`). Symphony's tables carry one name each, the **Table** column, and the
 Qwen3 table takes its call syntax as a second selector (JSON calls, or the tagged calls of Qwen 3.5

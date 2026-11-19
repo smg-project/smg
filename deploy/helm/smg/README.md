@@ -186,8 +186,11 @@ request. `router.toolCallParser` and `router.reasoningParser` are read
 differently by each parser: under Symphony, a model the registry knows keeps
 its own table and the flags apply only to models it does not know, unless
 `--parser-flags-over-registry` (through `router.extraArgs`, on an image that
-has the flag) puts the flags first for every model; under
-`legacy`, each flag takes only a legacy parser's name of its own kind: `hf`
+has the flag) puts the flags before the registry for every model. A worker's
+parser labels still decide for its model ahead of the flags, so the flags
+come first only where the labels select nothing, and a `reasoningParser`
+alone that names a table still leaves a model the registry knows to its
+table. Under `legacy`, each flag takes only a legacy parser's name of its own kind: `hf`
 and a Symphony-only name (`muse`, for one) are refused at startup, while a
 name a legacy parser of that kind also has (`qwen` as `toolCallParser`, for
 one) keeps that parser.

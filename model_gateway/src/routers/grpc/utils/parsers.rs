@@ -380,7 +380,8 @@ static NO_NAMES: Names = Names {
 /// its registry between them (`regular::symphony::names::reads`): the card's names when they select
 /// anything, else the registry's table for a model it knows, else the flags; under
 /// `--parser-flags-over-registry` (`flags_over_registry`) the flags come before the
-/// registry, which reads only where they select nothing; the legacy parsers
+/// registry, which reads only where they select nothing or select a table through a reasoning
+/// name alone; the legacy parsers
 /// take each kind's first name, from the flags only one a legacy parser of the kind has
 /// ([`ParserResolver::tool_parser`], [`ParserResolver::legacy_tool`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2445,6 +2446,38 @@ mod parser_resolver_tests {
         let resolver = ParserResolver::with_flags(registry, None, None);
         assert_eq!(resolver.tool_parser("m"), None);
         assert_eq!(resolver.reasoning_parser("m"), None);
+    }
+
+    /// `--parser-flags-over-registry` reaches every `ModelNames` the resolver hands out, the
+    /// tests' walk, a request's cards and its resolved names alike; off by default.
+    #[test]
+    fn the_flags_over_registry_option_reaches_every_names_the_resolver_hands_out() {
+        let registry = registry_with_card(ModelCard::new("m"));
+        let names = |resolver: &ParserResolver| {
+            [
+                resolver.names("m").flags_over_registry,
+                resolver.names_of(Names::default()).flags_over_registry,
+                resolver.names_for(None, "m").flags_over_registry,
+                resolver
+                    .names_for(Some(&Names::default()), "m")
+                    .flags_over_registry,
+            ]
+        };
+        let tools = ToolParserFactory::new();
+        let reasoning = ReasoningParserFactory::new();
+        let resolver = ParserResolver::new(
+            registry.clone(),
+            Some("step3".to_string()),
+            None,
+            &tools,
+            &reasoning,
+        );
+        assert_eq!(names(&resolver), [false; 4]);
+        assert_eq!(names(&resolver.with_flags_over_registry(true)), [true; 4]);
+        let flagged = ParserResolver::with_flags(registry, Some("step3".to_string()), None)
+            .with_flags_over_registry(true);
+        assert_eq!(names(&flagged), [true; 4]);
+        assert_eq!(flagged.names("m").flags.tool.as_deref(), Some("step3"));
     }
 
     #[test]

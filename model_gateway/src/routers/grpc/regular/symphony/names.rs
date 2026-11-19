@@ -29,7 +29,7 @@ fn is_passthrough(name: Option<&str>) -> bool {
 
 /// Whether the parser names select the response template's table: either name is
 /// [`TEMPLATE_PARSER`]; [`check_names`] binds the other to it or to nothing.
-fn names_template(names: &Names) -> bool {
+pub(crate) fn names_template(names: &Names) -> bool {
     is_named(names.tool.as_deref(), TEMPLATE_PARSER)
         || is_named(names.reasoning.as_deref(), TEMPLATE_PARSER)
 }
@@ -148,15 +148,17 @@ fn nothing_reason(names: &ModelNames<'_>) -> Fallback {
 /// the flags come before the registry: labels, then the flags when they select anything, then the
 /// registry, then the legacy parsers. The flags' legacy tool-call name or `passthrough` then keeps
 /// the legacy parsers for a model the registry knows too, and a reasoning name alone that no
-/// table answers to still selects nothing, so the registry reads. A table the labels, or the
-/// flags put first, select reads a model the registry gives the same table with the model's own
-/// turn opener; another model, or one the registry does not know, replays from the table's own.
-/// The registry is asked once per path, as before the flags came apart.
+/// table answers to still selects nothing, so the registry reads. A reasoning name alone that a
+/// table answers to does not come first either ([`flags_read_first`]): the registry reads a model
+/// it knows, and the name's table one it does not. A table the labels, or the flags put first,
+/// select reads a model the registry gives the same table with the model's own turn opener;
+/// another model, or one the registry does not know, replays from the table's own. The registry
+/// is asked once per path, as before the flags came apart.
 pub(super) fn decision(names: &ModelNames<'_>, model: &str) -> Decision {
     if let Some(decided) = decided_by(&names.labels, model) {
         return decided;
     }
-    if names.flags_over_registry {
+    if names.flags_over_registry && flags_read_first(names.flags) {
         if let Some(decided) = decided_by(names.flags, model) {
             return decided;
         }
@@ -172,6 +174,18 @@ pub(super) fn decision(names: &ModelNames<'_>, model: &str) -> Decision {
             Selection::Nothing => Decision::Legacy(nothing_reason(names)),
         },
     }
+}
+
+/// Whether the gateway's flags, under `--parser-flags-over-registry`, decide ahead of the registry
+/// ([`decision`]): they do unless they select a table through a reasoning name alone. That name is
+/// the usual engine flag of a whole family (`--reasoning-parser qwen3` for every Qwen 3 model), and
+/// its table need not read the call syntax the registry reads the model with (the JSON calls of
+/// `qwen3` for a model the registry reads with the tagged calls of `qwen3_tagged`), so the
+/// registry reads a model it knows, as it does where a reasoning name alone that no table answers
+/// to selects nothing. A worker's labels are not asked this: a reasoning name alone in them names
+/// the table for their one model.
+pub(crate) fn flags_read_first(flags: &Names) -> bool {
+    flags.tool.is_some() || !matches!(selection(flags), Selection::Table(_))
 }
 
 /// What one source's names decide for `model` ahead of the registry ([`decision`]): the response
@@ -279,7 +293,9 @@ pub(crate) fn table_label_read(names: &ModelNames<'_>, model: &str) -> Option<&'
 /// `the model's response template`, `the legacy parsers`). `None` when the flags select nothing or
 /// the registry's own table, or when the registry does not know the model. Registration warns with
 /// it once per model (`workflow::steps::local::create_worker`), except under
-/// `--parser-flags-over-registry`, where the flags read the model and nothing is set aside.
+/// `--parser-flags-over-registry` where the flags read first ([`flags_read_first`]): they read the
+/// model then and nothing is set aside; a reasoning name alone that selects a table is still set
+/// aside.
 pub(crate) fn set_aside_by_the_registry(
     flags: &Names,
     model: &str,
@@ -1658,6 +1674,40 @@ mod tests {
             why(&first(Names::default(), &r1), "acme/unknown-model"),
             Some(Fallback::ReasoningNameOnly)
         );
+        // A reasoning name alone that a table answers to does not come first either: the family's
+        // usual engine flag (`--reasoning-parser qwen3`) leaves Step 3.5 Flash to the registry's
+        // tagged-call format, not the JSON-call `qwen3` table, and still selects its table for a
+        // model the registry does not know. A tool-call name beside it puts the flags first.
+        let qwen3_reasoning = pair(None, Some("qwen3"));
+        assert!(!flags_read_first(&qwen3_reasoning));
+        let Decision::Table(by_registry) =
+            decision(&first(Names::default(), &qwen3_reasoning), step)
+        else {
+            panic!("the registry's table reads Step 3.5 Flash");
+        };
+        assert!(Arc::ptr_eq(&by_registry, &registry));
+        let Decision::Table(unknown) = decision(
+            &first(Names::default(), &qwen3_reasoning),
+            "acme/unknown-model",
+        ) else {
+            panic!("the reasoning name's table reads a model the registry does not know");
+        };
+        assert!(Arc::ptr_eq(&unknown, &Table::Qwen3.shared()));
+        assert!(flags_read_first(&pair(Some("qwen"), Some("qwen3"))));
+        let Decision::Table(json_calls) = decision(
+            &first(Names::default(), &pair(Some("qwen"), Some("qwen3"))),
+            step,
+        ) else {
+            panic!("the flags' table reads Step 3.5 Flash");
+        };
+        assert!(Arc::ptr_eq(&json_calls, &Table::Qwen3.shared()));
+        // The flags' reasoning-only table name is set aside for the model the registry knows,
+        // and the registration says so under the option too.
+        assert_eq!(
+            set_aside_by_the_registry(&qwen3_reasoning, step).map(|(table, _)| table),
+            Some(Table::Qwen3Tagged)
+        );
+
         // No flags at all: the registry, as by default.
         assert_eq!(
             table(&first(Names::default(), &Names::default()), step).as_deref(),

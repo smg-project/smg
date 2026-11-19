@@ -1553,10 +1553,12 @@ struct ModelArgs {
     /// for a model it knows, else the legacy parsers. A table the flags name
     /// that the registry also gives the model keeps the model's own turn
     /// opener; a legacy tool-call parser's name (pythonic) or passthrough
-    /// keeps the legacy parsers for every model; a reasoning name alone that
-    /// no table answers to selects nothing and leaves the model to the
-    /// registry. Off by default, so a fleet-wide name never reads a family the
-    /// registry has a table for; for a gateway that serves one model.
+    /// keeps the legacy parsers for every model; any other reasoning name
+    /// alone leaves a model the registry knows to the registry, whether a
+    /// table answers to it (that table then reads only the models the
+    /// registry does not know) or not. Off by default, so a fleet-wide name
+    /// never reads a family the registry has a table for; for a gateway that
+    /// serves one model.
     #[arg(long, default_value_t = false, help_heading = "Parsers")]
     parser_flags_over_registry: bool,
 

@@ -44,12 +44,13 @@ pub enum ParserChoice {
     /// the table its worker labels select, when they select anything; else the registry's table
     /// for a model it knows; else the one the `--tool-call-parser` and `--reasoning-parser` flags
     /// select, for a model the registry does not know (the flags come before the registry under
-    /// `--parser-flags-over-registry`, `RouterConfig::parser_flags_over_registry`). Names select a table when it answers to
-    /// them: its own name, a legacy parser's that reads its format (`qwen` for `qwen3`, `qwen_xml`
-    /// for `qwen3_tagged`), or a launcher's for a family whose table has no older parser (`muse`
-    /// for `muse_spark`); `hf` selects the model's response template's table; a reasoning name
-    /// alone that no table answers to selects nothing, `passthrough` excepted; any other legacy
-    /// tool-call parser's name, `passthrough`, and a model no table reads, keep the legacy parsers.
+    /// `--parser-flags-over-registry`, `RouterConfig::parser_flags_over_registry`). Names select a
+    /// table when it answers to them: its own name, a legacy parser's that reads its format (`qwen`
+    /// for `qwen3`, `qwen_xml` for `qwen3_tagged`), or a launcher's for a family whose table has no
+    /// older parser (`muse` for `muse_spark`); `hf` selects the model's response template's
+    /// table; a reasoning name alone that no table answers to selects nothing, `passthrough`
+    /// excepted; any other legacy tool-call parser's name, `passthrough`, and a model no table
+    /// reads, keep the legacy parsers.
     #[default]
     Symphony,
 }
@@ -585,9 +586,11 @@ pub struct RouterConfig {
     /// Under Symphony, read every model with what `tool_call_parser` and `reasoning_parser`
     /// select, the registry's own table included only where they select nothing: a worker's
     /// labels, then the flags, then the registry, then the legacy parsers
-    /// (`routers::grpc::regular::symphony::names::decision`). Off, the default, the registry's
-    /// table reads a model it knows and the flags read only the models it does not know. For a
-    /// gateway that serves one model, where a fleet-wide name is that model's name.
+    /// (`routers::grpc::regular::symphony::names::decision`). A `reasoning_parser` alone that
+    /// selects a table does not come first: the registry still reads a model it knows (the
+    /// family's usual reasoning name need not read the model's call syntax). Off, the default,
+    /// the registry's table reads a model it knows and the flags read only the models it does not
+    /// know. For a gateway that serves one model, where a fleet-wide name is that model's name.
     #[serde(default)]
     pub parser_flags_over_registry: bool,
     #[serde(default = "default_history_backend")]

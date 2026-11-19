@@ -35,7 +35,7 @@ use crate::{
         grpc::{
             backend_client::BackendConnector,
             multimodal::MultimodalConfigRegistry,
-            regular::symphony::{check_names, named_table},
+            regular::symphony::{check_names, named_table, names_template},
             utils::{Names, ALIASES},
         },
     },
@@ -497,9 +497,12 @@ impl AppContextBuilder {
             );
             return Err(AppContextBuildError::InvalidConfig(why.into()));
         }
+        // `hf` names no table either, but selects the response template's, so it is not warned
+        // of here.
         if router_config.parser == ParserChoice::Symphony
             && names.tool.is_some()
             && named_table(&names).is_none()
+            && !names_template(&names)
         {
             // Under `--parser-flags-over-registry` the flags read before the registry, so such
             // a name keeps the legacy parsers for the models the registry knows too.
