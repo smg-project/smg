@@ -104,12 +104,14 @@ where
         let cleared = |event: &KvEvent| matches!(event, KvEvent::Cleared);
         if restarted || (!facts.clears && events.iter().any(cleared)) {
             // One stream writes a row's rank, so the cursor read here is the
-            // one the batch meets.
+            // one the batch meets. A cursor that reads 0 holds batch 0, or
+            // no batch since a resync, which emptied the rank: a batch 0
+            // read as late there loses a clear that had nothing to empty.
             let late = facts.snapshot.is_none()
                 && self
                     .store
                     .cursor(id, rank)
-                    .is_some_and(|cursor| cursor.applied > 0 && facts.sequence <= cursor.applied);
+                    .is_some_and(|cursor| facts.sequence <= cursor.applied);
             if !late {
                 if restarted {
                     // The main signal's blocks go ahead of the batch's own
@@ -672,7 +674,8 @@ mod tests {
 
         fn applied(&self, sequence: u64, batch: &KvEventBatch) {
             assert_eq!(
-                self.sink.admit(self.row, RANK, facts(sequence), batch),
+                self.sink
+                    .admit(self.row, RANK, facts_of(sequence, batch), batch),
                 BatchOutcome::Applied
             );
         }
@@ -691,6 +694,20 @@ mod tests {
     fn facts(sequence: u64) -> BatchFacts {
         BatchFacts {
             sequence,
+            ..BatchFacts::default()
+        }
+    }
+
+    /// The header's facts of `batch` at `sequence`, by the collector's rule:
+    /// a clear no name owns is the header's clear, and a clear a name owns
+    /// is not.
+    fn facts_of(sequence: u64, batch: &KvEventBatch) -> BatchFacts {
+        let clears = batch.events.iter().any(|event| {
+            matches!(&event.data, Some(Data::Cleared(cleared)) if cleared.ownership.is_none())
+        });
+        BatchFacts {
+            sequence,
+            clears,
             ..BatchFacts::default()
         }
     }
@@ -1240,6 +1257,72 @@ mod tests {
         ]);
         f.applied(3, &restarted);
         assert_eq!(f.blocks(), 1);
+        // The block that stands is the one behind the clear.
+        f.applied(4, &batch([Data::Removed(group_removal(&[6], 0))]));
+        assert_eq!(f.blocks(), 0);
+    }
+
+    /// Engines number batches from 0, and the row's cursor reads 0 behind
+    /// batch 0. A batch 0 that arrives again is late there as at any other
+    /// sequence: its owned clear empties nothing.
+    #[test]
+    fn a_repeated_first_batch_with_an_owned_clear_is_skipped() {
+        let f = Fixture::new();
+        f.applied(0, &batch([Data::Stored(stored(1))]));
+        let late = batch([
+            Data::Cleared(KvCacheCleared {
+                ownership: Some("engine".into()),
+            }),
+            Data::Stored(main_store(3, 0)),
+        ]);
+        assert_eq!(
+            f.sink.admit(f.row, RANK, facts_of(0, &late), &late),
+            BatchOutcome::Skipped
+        );
+        // The first batch's block stands: its removal empties the rank.
+        assert_eq!(f.blocks(), 1);
+        f.applied(1, &batch([Data::Removed(removed(&[1]))]));
+        assert_eq!(f.blocks(), 0);
+    }
+
+    /// A main store in a batch 0 that arrives again would restart the
+    /// worker by the adapter's own clear. Behind batch 0 it is late as
+    /// well, and the store skips it.
+    #[test]
+    fn a_repeated_first_batch_that_shows_a_main_group_is_no_restarted_publisher() {
+        let f = Fixture::new();
+        f.applied(0, &batch([Data::Stored(window_store(&[1], 0, true))]));
+        let late = batch([Data::Stored(main_store(7, 1))]);
+        assert_eq!(
+            f.sink.admit(f.row, RANK, facts_of(0, &late), &late),
+            BatchOutcome::Skipped
+        );
+        assert_eq!(f.blocks(), 1);
+        // The window group is the worker's main signal still.
+        f.applied(1, &batch([Data::Stored(window_store(&[2], 0, true))]));
+        assert_eq!(f.blocks(), 2);
+    }
+
+    /// A cursor reads 0 behind a resync too, and the resync emptied the
+    /// rank. A batch 0 there is the stream's first: the store takes it, and
+    /// what it holds behind its last clear stands.
+    #[test]
+    fn a_first_batch_behind_a_resync_stands_from_its_last_clear() {
+        let f = Fixture::new();
+        f.applied(4, &batch([Data::Stored(stored(1))]));
+        f.sink.resync(f.row, None, ResyncReason::DataLoss);
+        assert_eq!(f.blocks(), 0);
+        let first = batch([
+            Data::Stored(main_store(5, 0)),
+            Data::Cleared(KvCacheCleared {
+                ownership: Some("engine".into()),
+            }),
+            Data::Stored(main_store(6, 0)),
+        ]);
+        f.applied(0, &first);
+        assert_eq!(f.blocks(), 1);
+        f.applied(1, &batch([Data::Removed(group_removal(&[6], 0))]));
+        assert_eq!(f.blocks(), 0);
     }
 
     #[test]
