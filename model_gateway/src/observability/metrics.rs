@@ -49,7 +49,7 @@ mod handles {
     #[cfg(test)]
     pub(super) use smg_external_router::metrics::handles::force_on_this_thread;
     pub(super) use smg_external_router::metrics::handles::{
-        keep_handles, nested, recorder_installed, with_handle, with_model_handle, ByLabels,
+        keep_handles, kept, nested, recorder_installed, with_handle, with_model_handle, ByLabels,
     };
 
     /// Handles by the matched path (the only label a request computes: the
@@ -78,6 +78,15 @@ mod handles {
         pub(super) worker_type: &'static str,
         pub(super) connection_mode: &'static str,
         pub(super) policy: &'static str,
+    }
+
+    /// The profile is keyed by the generation and index in the decision.
+    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+    pub(super) struct DecisionLabels {
+        pub(super) generation: u64,
+        pub(super) profile: u16,
+        pub(super) outcome: &'static str,
+        pub(super) mode: &'static str,
     }
 
     /// The handles of one label set of the stream-timing set, each built
@@ -151,6 +160,11 @@ mod handles {
         pub(super) static STREAMS: RefCell<ByLabels<StreamLabels, StreamHandles>> = RefCell::new(FxHashMap::default());
         /// `smg_worker_selection_total` by its static labels, then the model.
         pub(super) static WORKER_SELECTIONS: RefCell<ByLabels<SelectionLabels, Counter>> = RefCell::new(FxHashMap::default());
+        /// Decision counters for the newest generation seen on this thread,
+        /// by static labels, then by the bounded set of interned models.
+        pub(super) static POLICY_DECISIONS: RefCell<(u64, ByLabels<DecisionLabels, Counter>)> = RefCell::new((0, FxHashMap::default()));
+        /// Decision times by mode and outcome.
+        pub(super) static POLICY_DECISION_SECONDS: RefCell<FxHashMap<(&'static str, &'static str), Histogram>> = RefCell::new(FxHashMap::default());
         /// `smg_cache_aware_policy_branch_total` by branch.
         pub(super) static CACHE_AWARE_BRANCHES: RefCell<FxHashMap<&'static str, Counter>> = RefCell::new(FxHashMap::default());
         /// `smg_manual_policy_branch_total` by branch.
@@ -188,6 +202,8 @@ mod handles {
         HTTP_CONNECTIONS_ACTIVE.set(None);
         STREAMS.with_borrow_mut(HashMap::clear);
         WORKER_SELECTIONS.with_borrow_mut(HashMap::clear);
+        POLICY_DECISIONS.set((0, FxHashMap::default()));
+        POLICY_DECISION_SECONDS.with_borrow_mut(HashMap::clear);
         CACHE_AWARE_BRANCHES.with_borrow_mut(HashMap::clear);
         MANUAL_BRANCHES.with_borrow_mut(HashMap::clear);
         CONSISTENT_HASHING_BRANCHES.with_borrow_mut(HashMap::clear);
@@ -318,6 +334,9 @@ pub(crate) const UPKEEP_INTERVAL_SECS: u64 = 5 * 60;
 pub(crate) const CACHE_AWARE_MATCH_RATIO_BUCKETS: &[f64] =
     &[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0];
 
+const POLICY_DECISIONS_TOTAL: &str = "smg_policy_decisions_total";
+const POLICY_DECISION_SECONDS: &str = "smg_policy_decision_seconds";
+
 /// Time to first token on edges that resolve it. The same observation as
 /// `smg_router_ttft_seconds`, which keeps the request-duration buckets (and
 /// so the `le` values recording rules were written against).
@@ -349,10 +368,9 @@ pub(crate) const REQUEST_TIME_PER_OUTPUT_TOKEN_BUCKETS: &[f64] = &[
     0.2, 0.3, 0.5, 0.75, 1.0, 2.5, 10.0,
 ];
 
-/// Histogram buckets for `smg_kv_index_lookup_seconds` and
-/// `smg_kv_event_apply_seconds`: a lookup takes microseconds and a batch
-/// apply tens of microseconds, below the request-latency buckets' first
-/// edge, so these double from half a microsecond to a quarter of a second.
+/// Histogram buckets for KV index lookups, KV event applies and policy
+/// decisions. Their times can fall below the request-latency buckets'
+/// first edge, so these start at half a microsecond.
 pub(crate) const KV_INDEX_MICRO_BUCKETS: &[f64] = &[
     0.000_000_5,
     0.000_001,
@@ -751,6 +769,14 @@ pub(crate) fn init_metrics() {
     describe_counter!(
         "smg_worker_selection_total",
         "Worker selection events by worker_type, connection_mode, model, policy"
+    );
+    describe_counter!(
+        POLICY_DECISIONS_TOTAL,
+        "Policy controller decisions by model, profile, outcome (pick, shed, queue, refused) and mode (embedded)"
+    );
+    describe_histogram!(
+        POLICY_DECISION_SECONDS,
+        "Seconds spent asking the policy controller for one decision, by mode and outcome"
     );
     describe_counter!(
         "smg_worker_errors_total",
@@ -1209,6 +1235,10 @@ fn histogram_bucket_overrides(duration_buckets: Option<Vec<f64>>) -> HashMap<Mat
             match_ratio_matcher,
             CACHE_AWARE_MATCH_RATIO_BUCKETS.to_vec(),
         ),
+        (
+            Matcher::Full(POLICY_DECISION_SECONDS.into()),
+            KV_INDEX_MICRO_BUCKETS.to_vec(),
+        ),
         (kv_lookup_matcher, KV_INDEX_MICRO_BUCKETS.to_vec()),
         (kv_apply_matcher, KV_INDEX_MICRO_BUCKETS.to_vec()),
         (kv_lag_matcher, KV_EVENT_LAG_BUCKETS.to_vec()),
@@ -1323,6 +1353,17 @@ pub(crate) mod allocator_stats {
 /// - Dynamic labels use string interning (single allocation per unique value)
 /// - Static labels use the metrics crate's internal caching
 pub struct Metrics;
+
+/// A decision of the policy controller as its series label it.
+#[derive(Clone, Copy, Debug)]
+pub struct PolicyDecision {
+    pub generation: u64,
+    pub profile: u16,
+    /// `pick`, `shed`, `queue`, or `refused` where the controller made no decision.
+    pub outcome: &'static str,
+    /// `embedded` for decisions made in this process.
+    pub mode: &'static str,
+}
 
 /// A streamed request the gateway aborted at the engine because its own
 /// stop had ended every choice for the client while the engine was still
@@ -2212,6 +2253,70 @@ impl Metrics {
                 |count| count.increment(1),
             );
         });
+    }
+
+    /// Count and time one policy decision for `model_id`. The counter asks
+    /// `profile_name` only when it needs a handle. If the profile's generation
+    /// is gone or the controller refused the ask, use an empty `profile`
+    /// label and discard that handle after counting.
+    pub fn record_policy_decision(
+        model_id: &str,
+        decision: PolicyDecision,
+        profile_name: impl FnOnce() -> Option<Arc<str>>,
+        seconds: f64,
+    ) {
+        let PolicyDecision {
+            generation,
+            profile,
+            outcome,
+            mode,
+        } = decision;
+        let build = |model: Arc<str>, profile: Option<Arc<str>>| {
+            let profile = profile.map_or_else(|| "".into(), metrics::SharedString::from);
+            counter!(
+                POLICY_DECISIONS_TOTAL,
+                "model" => model,
+                "profile" => profile,
+                "outcome" => outcome,
+                "mode" => mode
+            )
+        };
+        if handles::keep_handles() {
+            let labels = handles::DecisionLabels {
+                generation,
+                profile,
+                outcome,
+                mode,
+            };
+            handles::POLICY_DECISIONS.with_borrow_mut(|(newest, by_labels)| {
+                if generation > *newest {
+                    by_labels.clear();
+                    *newest = generation;
+                }
+                let models = (generation == *newest).then(|| by_labels.entry(labels).or_default());
+                if let Some(count) = models.as_ref().and_then(|models| models.get(model_id)) {
+                    count.increment(1);
+                    return;
+                }
+                let model = intern_model_label(model_id);
+                let name = profile_name();
+                let models =
+                    models.filter(|map| name.is_some() && handles::kept(map.len(), &model));
+                let count = build(Arc::clone(&model), name);
+                count.increment(1);
+                if let Some(models) = models {
+                    models.insert(model, count);
+                }
+            });
+        } else {
+            build(intern_model_label(model_id), profile_name()).increment(1);
+        }
+        handles::with_static(
+            &handles::POLICY_DECISION_SECONDS,
+            (mode, outcome),
+            || histogram!(POLICY_DECISION_SECONDS, "mode" => mode, "outcome" => outcome),
+            |time| time.record(seconds),
+        );
     }
 
     /// Record worker error
