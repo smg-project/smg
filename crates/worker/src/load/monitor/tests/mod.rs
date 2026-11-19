@@ -2801,7 +2801,7 @@ async fn a_successors_first_record_clears_the_ranks_its_predecessor_reported() {
 /// file's lay, the answer's series and the published row.
 fn polled(monitor: &WorkerMonitor, worker: &Arc<dyn Worker>, answer: WorkerLoadResponse) {
     let _ = monitor.apply_polled_load("http://w:1", &answer, Instant::now());
-    Metrics::record_engine_load("http://w:1", "m", &answer);
+    Metrics::record_engine_load("http://w:1", worker.model_id(), &answer);
     monitor.load_state.publish_group(
         &["http://w:1".to_string()],
         vec![(Arc::clone(worker), Arc::new(answer))],
@@ -2874,6 +2874,139 @@ async fn a_held_successor_does_not_keep_a_polled_predecessors_sentinel_away() {
         monitor.flush_pending_evictions();
     });
     assert!(running_series(&rendered).ends_with(" -1"), "{rendered}");
+}
+
+/// The guard is by rank. A polled successor's row keeps the ranks it
+/// holds, and a rank of the evicted worker's report that the row does not
+/// hold reads the sentinel.
+#[tokio::test]
+async fn an_eviction_clears_the_ranks_a_polled_successor_does_not_hold() {
+    let rendered = render_with_recorder(|| {
+        let (monitor, replaced, next) = a_replaced_pusher_ahead_of_its_event();
+        polled(&monitor, &next, answer_of(0, 9));
+
+        monitor.evict_worker_loads(&replaced);
+    });
+    assert!(running_series(&rendered).ends_with(" 9"), "{rendered}");
+    assert!(
+        running_series_of(&rendered, 1).ends_with(" -1"),
+        "{rendered}"
+    );
+}
+
+/// The same at the successor's first record: a rank of the replaced
+/// report that the successor's row does not hold reads the sentinel.
+#[tokio::test]
+async fn a_first_record_clears_the_ranks_its_workers_row_does_not_hold() {
+    let rendered = render_with_recorder(|| {
+        let (monitor, _replaced, next) = a_replaced_pusher_ahead_of_its_event();
+        polled(&monitor, &next, answer_of(0, 9));
+
+        monitor.apply_pushed_load(&next, 0, &pushed(5), Instant::now());
+    });
+    assert!(running_series(&rendered).ends_with(" 5"), "{rendered}");
+    assert!(
+        running_series_of(&rendered, 1).ends_with(" -1"),
+        "{rendered}"
+    );
+}
+
+/// The running-requests series of rank 0 of the worker at `http://w:1`
+/// under `model`, as rendered.
+fn running_series_under<'a>(rendered: &'a str, model: &str) -> &'a str {
+    let model = format!("model=\"{model}\"");
+    rendered
+        .lines()
+        .find(|l| {
+            l.starts_with("smg_engine_running_requests{")
+                && l.contains("http://w:1")
+                && l.contains(&model)
+                && l.contains("dp_rank=\"0\"")
+        })
+        .unwrap_or_else(|| panic!("no running series with {model}:\n{rendered}"))
+}
+
+/// The guard is by model too. A successor that serves another model has
+/// written none of its predecessor's series, and its row keeps no
+/// sentinel away from them.
+#[tokio::test]
+async fn an_eviction_clears_the_series_of_a_model_its_successor_does_not_serve() {
+    let rendered = render_with_recorder(|| {
+        let (registry, monitor) = build_monitor();
+        let first = ready_worker("http://w:1", "a");
+        let id = registry.register(Arc::clone(&first)).unwrap();
+        monitor.apply_pushed_load(&first, 0, &pushed(7), Instant::now());
+        let next = ready_worker("http://w:1", "b");
+        assert!(registry.replace(&id, Arc::clone(&next)));
+        polled(&monitor, &next, answer_of(0, 9));
+
+        monitor.evict_worker_loads(&first);
+    });
+    assert!(
+        running_series_under(&rendered, "a").ends_with(" -1"),
+        "{rendered}"
+    );
+    assert!(
+        running_series_under(&rendered, "b").ends_with(" 9"),
+        "{rendered}"
+    );
+}
+
+/// A poll's series and its rows go out under one hold of the lock of the
+/// reports, where a record and the sentinel write theirs: nothing runs
+/// between a tick's series and its row.
+#[test]
+fn a_polls_rows_wait_for_the_lock_of_the_reports() {
+    let (registry, monitor) = build_monitor();
+    let worker = ready_worker("http://w:1", "m");
+    registry.register(Arc::clone(&worker)).unwrap();
+    let reports = monitor.pushed_reports.lock();
+    let tick = std::thread::spawn({
+        let monitor = Arc::clone(&monitor);
+        move || {
+            monitor.publish_polled(
+                "m",
+                &["http://w:1".to_string()],
+                vec![(worker, answer_of(0, 9), false)],
+            );
+        }
+    });
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        monitor.load_state.snapshot().get("http://w:1").is_none(),
+        "no row while the lock is held"
+    );
+    drop(reports);
+    tick.join().unwrap();
+    assert_eq!(
+        rows(monitor.load_state.snapshot().get("http://w:1").unwrap()),
+        vec![(0, 9)]
+    );
+}
+
+/// A poll's answer for a worker that left during the fetch writes no
+/// series: the publish's fence holds them back with the row, and the
+/// sentinel of the leave's eviction stands.
+#[test]
+fn a_polls_answer_for_a_worker_that_left_writes_no_series() {
+    let (registry, monitor) = build_monitor();
+    let worker = ready_worker("http://w:1", "m");
+    let id = registry.register(Arc::clone(&worker)).unwrap();
+    registry.transition_status(&id, WorkerStatus::NotReady);
+
+    let rendered = render_with_recorder(|| {
+        monitor.publish_polled(
+            "m",
+            &["http://w:1".to_string()],
+            vec![(worker, answer_of(0, 9), false)],
+        );
+    });
+
+    assert!(
+        !rendered.contains("smg_engine_running_requests{"),
+        "{rendered}"
+    );
+    assert!(monitor.load_state.snapshot().get("http://w:1").is_none());
 }
 
 /// A report can hold a rank far past its worker's width. The eviction's
