@@ -539,12 +539,14 @@ impl Turn for HostedTurn<'_> {
     }
 
     fn room(&self, facts: &WorkerFacts, maker: &Maker) -> Result<(), HostRefused> {
-        worker_wire::room(facts, &facts.labels, maker, "row").map_err(|refusal| {
-            HostRefused::Past(Past {
-                fact: refusal.path,
-                why: refusal.why,
+        worker_wire::carried(facts)
+            .and_then(|()| worker_wire::room(facts, &facts.labels, maker, "row"))
+            .map_err(|refusal| {
+                HostRefused::Past(Past {
+                    fact: refusal.path,
+                    why: refusal.why,
+                })
             })
-        })
     }
 }
 
@@ -1480,6 +1482,48 @@ pub(crate) mod tests {
         }
     }
 
+    /// A standby builds its rows from the log. A fact the log's row does not
+    /// carry would leave it another row than its leader holds.
+    #[cfg(feature = "worker-host")]
+    #[test]
+    fn a_fact_the_log_does_not_carry_is_refused_by_its_name_and_nothing_is_written() {
+        use super::super::worker_wire;
+        type State = fn(&mut WorkerFacts);
+
+        let (store, door) = door();
+        let hosted = Hosted::new(Arc::new(door), operator(), under(TERM));
+        let maker = found("pods/a");
+        let epoch = store.epoch();
+        let lost: [(&str, State); 6] = [
+            ("row.vision", |facts| facts.vision = true),
+            ("row.priority", |facts| facts.priority = 5),
+            ("row.zone", |facts| facts.zone = Some(String::new())),
+            ("row.max_running", |facts| facts.max_running = Some(0)),
+            ("row.kv_block_size", |facts| facts.kv_block_size = Some(0)),
+            ("row.bootstrap_port", |facts| facts.bootstrap_port = Some(0)),
+        ];
+        for (fact, state) in lost {
+            let answer = hosted.found(&maker, URL, &|_| {
+                let mut facts = found_facts();
+                state(&mut facts);
+                facts
+            });
+            let Err(Refused::Past(past)) = answer else {
+                panic!("{fact}: wrong answer: {answer:?}")
+            };
+            assert_eq!(past.fact, fact);
+        }
+        assert_eq!((store.by_key(URL), store.epoch()), (None, epoch));
+
+        // What the log carries is taken, and a standby reads it back whole.
+        hosted
+            .found(&maker, URL, &|_| found_facts())
+            .expect("found");
+        let row = store.by_key(URL).expect("the found row");
+        let back = worker_wire::told_row(&worker_wire::row(&row), std::time::Instant::now());
+        assert_eq!(back.map(|back| back.facts), Ok(row.facts));
+    }
+
     #[cfg(feature = "worker-host")]
     #[test]
     fn a_provider_takes_away_by_url_only_the_row_it_made() {
@@ -1668,7 +1712,7 @@ pub(crate) mod tests {
                 Ok(Wrote::Unmoved(first.id))
             );
             let refresh = || WorkerFacts {
-                priority: 5,
+                max_running: Some(8),
                 ..found_facts()
             };
             assert_eq!(

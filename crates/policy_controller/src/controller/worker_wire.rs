@@ -363,6 +363,46 @@ fn maker_weight(maker: &Maker) -> usize {
     key_len(27) + length(inner) + inner
 }
 
+/// Refuses, by its fact's path, a row the log would not give back whole. A
+/// standby builds its rows from the log, so it would hold the row without
+/// the fact, and a promoted one would decide by other facts than its leader
+/// did. The row on the wire carries a pairing's port alone and no encode
+/// offer, vision bit or priority, and it reads an empty zone and a zero
+/// window, block size or port as none. The facts are written as the log
+/// writes them and read back as a standby reads them, so a fact the wire
+/// gains is taken here with no second list.
+#[cfg(feature = "worker-host")]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the host's door asks it of each registration")
+)]
+pub(crate) fn carried(facts: &WorkerFacts) -> Result<(), Refused> {
+    const WHY: &str = "the log's row does not carry this fact: not served by this build";
+    let sent = told(WorkerId(0), facts, WorkerStatus::Ready, 1);
+    let back = told_row(&sent, Instant::now())?.facts;
+    let lost = [
+        ("row.pairing", back.pairing != facts.pairing),
+        ("row.encode", back.encode != facts.encode),
+        ("row.vision", back.vision != facts.vision),
+        ("row.priority", back.priority != facts.priority),
+        ("row.zone", back.zone != facts.zone),
+        ("row.max_running", back.max_running != facts.max_running),
+        (
+            "row.kv_block_size",
+            back.kv_block_size != facts.kv_block_size,
+        ),
+        (
+            "row.bootstrap_port",
+            back.bootstrap_port != facts.bootstrap_port,
+        ),
+        ("row", back != *facts),
+    ];
+    match lost.iter().find(|(_, lost)| *lost) {
+        Some((path, _)) => Err(refused(path, WHY)),
+        None => Ok(()),
+    }
+}
+
 /// Refuses, by `path`, a row of these facts under `labels` that passes
 /// [`ROW_BYTES`] with its maker: the facts' own bound ([`fits`]) is told
 /// where they are read, and a provider's row holds its maker inside the

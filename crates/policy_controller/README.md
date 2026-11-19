@@ -867,7 +867,7 @@ The controller keeps one row a worker. A registration states the row's facts. On
 
 No count bounds a row's model ids: the row's size does. A control call's row is weighed as the wire frames it. A row that a host writes in its own process is weighed by the store: 160 bytes for its numbers, and for each text its bytes and five more. That measure is never under the wire's weight, so a row the store takes fits a frame.
 
-A host that links the library with the `worker-host` feature writes rows at a membership door, `worker_host::Membership`. The door lays a found worker's facts over the row at its URL, marks a row draining and takes a row away. Only a row's maker changes it. `worker_host::StoreDoor` is the door over a store alone, for a host with no election. `worker_host::facts` reads a worker object back to a row's facts. No step of the stock controller calls the door yet.
+A host that links the library with the `worker-host` feature writes rows at a membership door, `worker_host::Membership`. The door lays a found worker's facts over the row at its URL, marks a row draining and takes a row away. Only a row's maker changes it, and facts that name another URL than the call's are refused. `worker_host::StoreDoor` is the door over a store alone, for a host with no election. The controller's own door also refuses a fact that its log does not carry to a standby: a pairing descriptor, an encode offer, the vision bit, a priority, an empty zone, and a zero where the row means none. `worker_host::facts` reads a worker object back to a row's facts. No step of the stock controller calls the door yet.
 
 ## What is not built yet
 

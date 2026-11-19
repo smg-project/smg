@@ -43,6 +43,8 @@ pub enum Refused {
 pub trait Membership: Send + Sync + 'static {
     /// Register a worker, or refresh the maker's row. The callback states
     /// facts for `url` during the door's turn and must leave writes to the door.
+    /// Facts whose key is not `url` are refused: the maker was asked of the
+    /// row under `url`, and the store writes by the facts' key.
     fn found(
         &self,
         maker: &Maker,
@@ -87,7 +89,12 @@ pub(crate) fn lay(
     }
 
     let mut facts = state(standing.as_ref().map(|row| &row.facts));
-    debug_assert!(facts.key == url, "the facts name the URL of the call");
+    if facts.key != url {
+        return Err(Refused::Past(Past {
+            fact: "key",
+            why: "the facts name the URL of the call",
+        }));
+    }
     if let Some(row) = &standing {
         facts.incarnation = row.facts.incarnation;
     }
@@ -612,19 +619,18 @@ mod tests {
         assert_eq!(row.facts.zone.as_deref(), Some("east"));
         assert_eq!(row.facts.priority, 5);
 
-        #[cfg(debug_assertions)]
-        {
-            use std::panic::{catch_unwind, AssertUnwindSafe};
-
-            let mismatch = catch_unwind(AssertUnwindSafe(|| {
-                door.found(&maker, URL, &|_| WorkerFacts {
-                    key: "http://another".to_owned(),
-                    ..stated()
-                })
-            }));
-            assert!(mismatch.is_err());
-            assert_eq!(store.by_key(URL), Some(row));
-            assert_eq!(store.by_key("http://another"), None);
-        }
+        // Facts under another key are refused in every build: the store
+        // writes by the facts' key, and no maker was asked of that row.
+        let mismatch = door.found(&maker, URL, &|_| WorkerFacts {
+            key: "http://another".to_owned(),
+            ..stated()
+        });
+        let refused = Refused::Past(Past {
+            fact: "key",
+            why: "the facts name the URL of the call",
+        });
+        assert_eq!(mismatch, Err(refused));
+        assert_eq!(store.by_key(URL), Some(row));
+        assert_eq!(store.by_key("http://another"), None);
     }
 }
