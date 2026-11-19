@@ -6576,10 +6576,10 @@ mod tests {
     /// One entry writes a cell at a time, whatever ranks its slot is told
     /// under: two ranks of one member are told in turn under one slot,
     /// each instant once a rank and the first of the two by turns, while a
-    /// thread a rank credits dispatches and two more read. A row is read
-    /// once its report was told, as a host shows a world it told, and the
-    /// row told before it is read on: every number a row is handed is its
-    /// own rank's.
+    /// thread a rank credits dispatches and two more decide and read. A
+    /// row is decided once its report was told, as a host shows a world it
+    /// told, and the row told before it is decided on: every number a row
+    /// is handed is its own rank's, and rows are handed numbers.
     #[test]
     fn a_slot_told_under_two_ranks_hands_each_row_its_own_ranks_number() {
         const INSTANTS: u64 = 20_000;
@@ -6598,17 +6598,27 @@ mod tests {
             row
         };
         let (shown, done) = (AtomicU64::new(0), AtomicBool::new(false));
+        let handed = AtomicU64::new(0);
         std::thread::scope(|scope| {
             for rank in 0..2 {
                 scope.spawn(|| {
+                    // A table of the reader's own: the one row books the
+                    // same slot in each.
+                    let mut own = [candidate(0, 0)];
+                    let lent = Lent::take(&mut own);
+                    assert_eq!(lent.slot_of(&own[0]), slot);
                     let mut before = 0;
                     while !done.load(Ordering::Relaxed) {
                         let last = shown.load(Ordering::Acquire);
                         for word in [last, before] {
                             let row = row_of(word);
+                            // A number is kept from a report's first
+                            // decision on.
+                            decide(&stage, &lent, &row);
                             if let Some((cost, _)) = kept_of(&stage, slot, &row) {
                                 let band = usize::from(cost >= 500_000_000.0);
                                 assert_eq!(band, usize::from(row.dp_rank), "at {word}");
+                                handed.fetch_add(1, Ordering::Relaxed);
                             }
                         }
                         before = last;
@@ -6636,6 +6646,8 @@ mod tests {
             }
             done.store(true, Ordering::Relaxed);
         });
+        let handed = handed.load(Ordering::Relaxed);
+        assert!(handed > 0, "no reader was handed a number");
     }
 
     /// A stage told its ranks' reports scores every row as a stage told
