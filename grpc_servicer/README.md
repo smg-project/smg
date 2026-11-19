@@ -434,7 +434,9 @@ vLLM's fixed default, so two engines on one host do not collide; an explicit
 one is kept as given, its endpoint included, and
 `SMG_VLLM_SERVICER_KV_EVENTS=0` leaves the publisher off). Tuning:
 `SMG_VLLM_SERVICER_HANDSHAKE_PORT` (default: a free port),
-`SMG_VLLM_SERVICER_DRAIN_SECS` (default 5),
+`SMG_VLLM_SERVICER_DRAIN_SECS` (default 30: the most a shutdown signal waits
+for in-flight streams; it stops as soon as none is left; see the shutdown note
+below),
 `SMG_VLLM_SERVICER_STARTUP_TIMEOUT_SECS` (default 1800: how long the servicer
 waits for a sign of life from the engine during its handshake; the launcher
 reports the engine process alive each time it polls it, and the handshake's
@@ -464,6 +466,25 @@ TokenSpeed Rust servicers alike: one runtime worker carries about 100k output
 tokens/s on one connection with its lock uncontended; raise it to 2-4 when one
 engine serves more than about 512 concurrent streams and their inter-token p99
 matters more than the servicer's CPU).
+
+**Shutdown (Rust mode).** On SIGTERM or SIGINT the servicer turns NOT_SERVING
+and drains: in-flight streams get up to `SMG_VLLM_SERVICER_DRAIN_SECS` to
+finish with the engine still up, and a second signal ends the drain at once.
+Once no stream is left the engine stays up
+`SMG_VLLM_SERVICER_DRAIN_LINGER_SECS` longer, within the drain bound: default
+5 when `--kv-transfer-config`'s `kv_role` is `kv_producer` or `kv_both`
+(the decode worker pulls a prefill's KV after its stream ended, which the
+servicer does not see), else 1. A busy decode worker can pull the KV later
+than that: NIXL reads it when the decode scheduler admits the request, so
+raise `SMG_VLLM_SERVICER_DRAIN_LINGER_SECS` for a decode tier that queues.
+Then the server stops (up to 5 s) and the engine is terminated: vLLM's own
+process manager first gives the engine cores vLLM's `--shutdown-timeout`
+(5 s when it is 0, the default) before force-killing them, then the launcher
+waits up to 30 s for them to exit. The pod's `terminationGracePeriodSeconds`
+must cover the drain bound + 5 + 5 + 30 s with a margin: 70 s by default,
+against Kubernetes' default grace of 30 s; a `--shutdown-timeout N` puts N in
+place of the second 5. The smg chart's `workers[].terminationGracePeriodSeconds`
+defaults to 90; raise it with the drain bound and the shutdown timeout.
 
 ##### Prefill/decode over NIXL on one host: restarting a side in place
 
@@ -1017,7 +1038,11 @@ included; `SMG_TOKENSPEED_SERVICER_KV_EVENTS=0` leaves the publisher off; a
 hybrid model's State groups leave it off, as above).
 Tuning:
 `SMG_TOKENSPEED_SERVICER_HANDSHAKE_PORT` (default: a
-free port), `SMG_TOKENSPEED_SERVICER_DRAIN_SECS` (default 5),
+free port), `SMG_TOKENSPEED_SERVICER_DRAIN_SECS` (default 30: the most a shutdown signal
+waits for in-flight streams; it stops as soon as none is left, a second signal
+at once; the pod's termination grace must cover it as for vLLM above),
+`SMG_TOKENSPEED_SERVICER_DRAIN_LINGER_SECS` (default 1: how long the scheduler
+stays up after the last stream, within the drain bound),
 `SMG_TOKENSPEED_SERVICER_WARMUP` (the planned warm-up before SERVING, as for
 vLLM above: `full` by default, `fast`, `off`, a budget in seconds or
 `<level>:<seconds>`; planned from `--max-num-seqs` and the chunk size or
@@ -1416,7 +1441,11 @@ SGLang's fixed default (an explicit one is kept as given, its endpoint
 included; `SMG_SGLANG_SERVICER_KV_EVENTS=0` leaves the publisher off). SGLang's
 HTTP sidecar (metrics and profiling endpoints) is not started on this path.
 Tuning: `SMG_SGLANG_SERVICER_HANDSHAKE_PORT` (default: a
-free port), `SMG_SGLANG_SERVICER_DRAIN_SECS` (default 5),
+free port), `SMG_SGLANG_SERVICER_DRAIN_SECS` (default 30: the most a shutdown
+signal waits for in-flight streams; it stops as soon as none is left, a second
+signal at once; the pod's termination grace must cover it as for vLLM above),
+`SMG_SGLANG_SERVICER_DRAIN_LINGER_SECS` (default 1: how long the scheduler
+stays up after the last stream, within the drain bound),
 `SMG_SGLANG_SERVICER_WARMUP` (the planned warm-up before SERVING, as for vLLM
 above: `full` by default, `fast`, `off`, a budget in seconds or
 `<level>:<seconds>`; planned from `--max-running-requests` and
@@ -1611,8 +1640,8 @@ refused by name instead of dropped: beam search, the logits-returning flags,
 KV-cache retention, prompt-tuning and lookahead configs. `Embed` and
 `SubscribeKvEvents` answer UNIMPLEMENTED, as the Python servicer answers them;
 `GetTokenizer` serves the local tokenizer directory. The launcher's knobs are
-the shared ones under the `SMG_TRTLLM_SERVICER_*` names (handshake port, drain,
-start-up and silence bounds, prefill allowance); `--metrics-port` (and
+the shared ones under the `SMG_TRTLLM_SERVICER_*` names (handshake port, drain
+and its linger, start-up and silence bounds, prefill allowance); `--metrics-port` (and
 `--metrics-host`, `SMG_TRTLLM_SERVICER_METRICS_PORT/_HOST`) serves the Rust
 servicer's Prometheus metrics, the families every engine's Rust servicer
 exposes (see the vLLM section above), with `wire="trtllm"`.
