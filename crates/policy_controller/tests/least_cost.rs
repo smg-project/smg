@@ -618,6 +618,24 @@ fn the_document_round_trips_in_canonical_order_and_in_yaml() {
     );
 }
 
+/// A document whose terms read no report says nothing of a missing value,
+/// and is written back with no such key.
+#[test]
+fn a_document_with_no_rule_for_missing_values_writes_none_back() {
+    let written = document("terms: {candidate.in_flight: 3}");
+    written.validate().expect("the document validates");
+    let json = serde_json::to_string(&written).expect("the document writes as JSON");
+    assert!(!json.contains("unreported"), "{json}");
+    let read: PolicySpec = serde_json::from_str(&json).expect("the JSON reads back");
+    assert_eq!(written, read);
+    let yaml = serde_yaml::to_string(&written).expect("the document writes as YAML");
+    assert!(!yaml.contains("unreported"), "{yaml}");
+    assert_eq!(
+        written,
+        serde_yaml::from_str(&yaml).expect("the YAML reads back")
+    );
+}
+
 #[test]
 fn a_term_written_twice_is_refused() {
     let err = parse(

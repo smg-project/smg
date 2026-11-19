@@ -737,6 +737,7 @@ pub struct LeastCostParams {
     pub margin: CostMargin,
     /// What a row costs when a named value is missing. Required for terms
     /// that read a report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unreported: Option<Unreported>,
 }
 
