@@ -292,6 +292,7 @@ A port is a trait this crate calls and a host implements.
 | `EngineConnection` | `connection::engine` | The calls the runtime makes on a connected engine: liveness, the health and load reads, the labels the engine reports of its model and of itself, the admin calls and the two pushed streams. | Its client of an engine. |
 | `ConnectorDefault` | `connection::engine` | The connector a builder uses when it is handed none. | The same connector. |
 | `WorkerJobs` | `jobs` | How to remove workers at an address, how to read a worker's labels again, how to register a worker, and whether a job of an address is in flight. | Its job queue. |
+| `LoadSink` | `load::port` | What a pushed record or a poll's answer means for routing: the receipts and the poll decision, the overload verdict, what its readers cache. | Nothing to write: `WorkerMonitor::new` builds the monitor's own sink over the registry and the routing side. |
 | `LoadConsumer` | `load::monitor` | Whether a reader wants loads, and how to trim what readers booked on a worker. | Its policy registry. |
 | `HealthSink` | `health::port` | What a probe's outcome or a connect signal does to a worker's status. | Nothing to write: the crate's registry is the sink, and `WorkerManager::start` hands it. |
 | `RequestCompletionSink` | `identity::basic` | What to do when a request on a worker ends. | The sink its policy registry installs. |

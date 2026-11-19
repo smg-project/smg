@@ -1250,3 +1250,465 @@ async fn the_liveness_sweep_follows_the_registrys_membership_tick_by_tick() {
     );
     sweep.abort();
 }
+
+/// What a recording sink was told, in order, with whether the monitor's
+/// reports were locked at the call.
+#[derive(Clone, Debug, PartialEq)]
+enum Said {
+    Record {
+        url: String,
+        rank: i32,
+        rows: usize,
+        received_at: Instant,
+        sampled_at: Instant,
+        locked: bool,
+    },
+    PollMode(String),
+    /// Each member's URL, the rows of its answer and the rows on file.
+    Report(Vec<(String, Option<usize>, Option<usize>)>, bool),
+    ReportEmpty(Vec<(String, Option<usize>, Option<usize>)>, bool),
+    FetchFailed(Vec<String>, bool),
+    Forget(String),
+    /// The Ready workers of the group, then each report's URL, its rows and
+    /// whether its answer listed the ranks.
+    Tick(usize, Vec<(String, usize, bool)>),
+}
+
+/// A sink that only records: what the monitor says is kept in order, each
+/// question gets the answer the case set, and nothing is written anywhere.
+/// It reads the lock of the monitor's reports at each call, so a case tells
+/// which calls the monitor makes under it.
+struct RecordingLoadSink {
+    said: Mutex<Vec<Said>>,
+    mode: PollMode,
+    ranks: PolledRanks,
+    needs: bool,
+    monitor: std::sync::OnceLock<Weak<WorkerMonitor>>,
+}
+
+impl RecordingLoadSink {
+    fn locked(&self) -> bool {
+        self.monitor
+            .get()
+            .and_then(Weak::upgrade)
+            .is_some_and(|monitor| monitor.pushed_reports.is_locked())
+    }
+
+    fn members(answer: &[PolledMember<'_>]) -> Vec<(String, Option<usize>, Option<usize>)> {
+        answer
+            .iter()
+            .map(|member| {
+                (
+                    member.worker.url().to_string(),
+                    member.answer.map(|load| load.loads.len()),
+                    member.on_file.map(|load| load.loads.len()),
+                )
+            })
+            .collect()
+    }
+}
+
+impl LoadSink for RecordingLoadSink {
+    fn record(
+        &self,
+        worker: &Arc<dyn Worker>,
+        rank: i32,
+        report: &WorkerLoadResponse,
+        received_at: Instant,
+        sampled_at: Instant,
+    ) {
+        let locked = self.locked();
+        self.said.lock().push(Said::Record {
+            url: worker.url().to_string(),
+            rank,
+            rows: report.loads.len(),
+            received_at,
+            sampled_at,
+            locked,
+        });
+    }
+
+    fn poll_mode(&self, worker: &Arc<dyn Worker>, _now: Instant, _interval: Duration) -> PollMode {
+        self.said
+            .lock()
+            .push(Said::PollMode(worker.url().to_string()));
+        self.mode
+    }
+
+    fn report(&self, answer: &[PolledMember<'_>], _polled_at: Instant) -> PolledRanks {
+        let locked = self.locked();
+        self.said
+            .lock()
+            .push(Said::Report(Self::members(answer), locked));
+        self.ranks.clone()
+    }
+
+    fn report_empty(&self, answer: &[PolledMember<'_>], _polled_at: Instant) -> Vec<i32> {
+        let locked = self.locked();
+        self.said
+            .lock()
+            .push(Said::ReportEmpty(Self::members(answer), locked));
+        self.ranks.leaving.clone()
+    }
+
+    fn fetch_failed(&self, members: &[Arc<dyn Worker>]) {
+        let locked = self.locked();
+        let urls = members
+            .iter()
+            .map(|worker| worker.url().to_string())
+            .collect();
+        self.said.lock().push(Said::FetchFailed(urls, locked));
+    }
+
+    fn forget(&self, worker: &Arc<dyn Worker>) {
+        self.said
+            .lock()
+            .push(Said::Forget(worker.url().to_string()));
+    }
+
+    fn needs_loads(&self) -> bool {
+        self.needs
+    }
+
+    fn tick(&self, tick: &GroupTick<'_>) {
+        let reports = tick
+            .reports
+            .iter()
+            .map(|polled| {
+                (
+                    polled.worker.url().to_string(),
+                    polled.report.loads.len(),
+                    polled.lists_ranks,
+                )
+            })
+            .collect();
+        self.said
+            .lock()
+            .push(Said::Tick(tick.workers.len(), reports));
+    }
+}
+
+/// A monitor over a recording sink that answers `mode` to the poll question
+/// and `ranks` to a poll's answer, with the sink and the registry.
+fn build_recording(
+    mode: PollMode,
+    ranks: PolledRanks,
+    needs: bool,
+    conditional_polling: bool,
+) -> (
+    Arc<WorkerRegistry>,
+    Arc<WorkerMonitor>,
+    Arc<RecordingLoadSink>,
+) {
+    let registry = Arc::new(WorkerRegistry::new());
+    let sink = Arc::new(RecordingLoadSink {
+        said: Mutex::new(Vec::new()),
+        mode,
+        ranks,
+        needs,
+        monitor: std::sync::OnceLock::new(),
+    });
+    let monitor = Arc::new(WorkerMonitor::with_sink(
+        registry.clone(),
+        sink.clone(),
+        5,
+        false,
+        conditional_polling,
+    ));
+    assert!(sink.monitor.set(Arc::downgrade(&monitor)).is_ok());
+    (registry, monitor, sink)
+}
+
+/// The rank and the running requests of each row, in order.
+fn rows(load: &WorkerLoadResponse) -> Vec<(i32, i32)> {
+    load.loads
+        .iter()
+        .map(|row| (row.dp_rank, row.num_running_reqs))
+        .collect()
+}
+
+/// An answer that names `rank` alone, with `running` requests.
+fn answer_of(rank: i32, running: i32) -> WorkerLoadResponse {
+    WorkerLoadResponse {
+        dp_rank_count: 1,
+        loads: vec![SchedulerLoadSnapshot {
+            dp_rank: rank,
+            num_running_reqs: running,
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
+/// A pushed record crosses the port once, after the monitor laid it in the
+/// worker's report and under the lock of the reports. The sink is told the
+/// worker, the rank, the report as it stands, the receipt, and a sample
+/// instant that is the receipt less the record's age and the one-way margin.
+#[tokio::test]
+async fn a_pushed_record_crosses_the_port_under_the_lock_of_the_reports() {
+    let (_registry, monitor, sink) =
+        build_recording(PollMode::Poll, PolledRanks::default(), true, false);
+    let worker = ready_worker("http://w:1", "m");
+    let received_at = Instant::now();
+    let mut aged = PushedRecord::requests(3, 2);
+    aged.age = Duration::from_millis(30);
+
+    monitor.apply_pushed_load(&worker, 1, &aged, received_at);
+    monitor.apply_pushed_load(&worker, 0, &PushedRecord::requests(1, 0), received_at);
+
+    assert_eq!(
+        *sink.said.lock(),
+        vec![
+            Said::Record {
+                url: "http://w:1".to_string(),
+                rank: 1,
+                rows: 1,
+                received_at,
+                sampled_at: received_at - Duration::from_millis(30) - PUSHED_ONE_WAY_MARGIN,
+                locked: true,
+            },
+            Said::Record {
+                url: "http://w:1".to_string(),
+                rank: 0,
+                rows: 2,
+                received_at,
+                sampled_at: received_at - PUSHED_ONE_WAY_MARGIN,
+                locked: true,
+            },
+        ]
+    );
+}
+
+/// One engine's answer crosses whole and under the lock of the reports: the
+/// member with its answer's rows and the rows on file. The file is then laid
+/// by the ranks the sink names: the rank whose stream is the newer keeps its
+/// row and hands it to the answer, the rank that leaves loses its row, and
+/// the other takes the answer's entry.
+#[tokio::test]
+async fn an_engines_answer_crosses_whole_and_the_file_is_laid_by_the_sinks_ranks() {
+    let ranks = PolledRanks {
+        newer: vec![1],
+        leaving: vec![2],
+    };
+    let (_registry, monitor, sink) = build_recording(PollMode::Fallback, ranks, true, false);
+    let worker = ready_worker("http://w:1", "m");
+    for rank in 0..3 {
+        let record = PushedRecord::requests(10 + rank, 0);
+        monitor.apply_pushed_load(&worker, rank, &record, Instant::now());
+    }
+    sink.said.lock().clear();
+
+    let mut engine = vec![(Arc::clone(&worker), Some(answer_of(0, 7)))];
+    let lists_ranks = monitor.reconcile_engine(&mut engine, Instant::now());
+
+    assert_eq!(
+        *sink.said.lock(),
+        vec![Said::Report(
+            vec![("http://w:1".to_string(), Some(1), Some(3))],
+            true
+        )]
+    );
+    {
+        let reports = monitor.pushed_reports.lock();
+        let file = &reports["http://w:1"];
+        assert_eq!(rows(file), vec![(0, 7), (1, 11)]);
+        assert_eq!(file.dp_rank_count, 2);
+    }
+    let answer = engine[0].1.as_ref().expect("the answer stays");
+    assert_eq!(rows(answer), vec![(0, 7), (1, 11)]);
+    assert_eq!(
+        lists_ranks,
+        vec![false],
+        "an answer with no token capacity lists no ranks for a cache"
+    );
+}
+
+/// An answer that brought no row and a fetch that failed are said apart: the
+/// first under the lock of the reports, with the file laid by the ranks the
+/// sink says leave; the second with no lock held and nothing laid.
+#[tokio::test]
+async fn an_answer_with_no_row_and_a_failed_fetch_are_said_apart() {
+    let ranks = PolledRanks {
+        newer: Vec::new(),
+        leaving: vec![0],
+    };
+    let (_registry, monitor, sink) = build_recording(PollMode::Poll, ranks, true, false);
+    let worker = ready_worker("http://w:1", "m");
+    monitor.apply_pushed_load(&worker, 0, &PushedRecord::requests(1, 0), Instant::now());
+    monitor.apply_pushed_load(&worker, 1, &PushedRecord::requests(2, 0), Instant::now());
+    sink.said.lock().clear();
+
+    let mut failed = vec![(Arc::clone(&worker), None)];
+    monitor.reconcile_engine(&mut failed, Instant::now());
+    assert_eq!(
+        rows(&monitor.pushed_reports.lock()["http://w:1"]),
+        vec![(0, 1), (1, 2)],
+        "a failed fetch lays nothing"
+    );
+    let mut empty = vec![(Arc::clone(&worker), Some(WorkerLoadResponse::default()))];
+    monitor.reconcile_engine(&mut empty, Instant::now());
+
+    assert_eq!(
+        *sink.said.lock(),
+        vec![
+            Said::FetchFailed(vec!["http://w:1".to_string()], false),
+            Said::ReportEmpty(vec![("http://w:1".to_string(), Some(0), Some(2))], true),
+        ]
+    );
+    assert_eq!(
+        rows(&monitor.pushed_reports.lock()["http://w:1"]),
+        vec![(1, 2)],
+        "the rank the sink named left the file"
+    );
+}
+
+/// A tick that polled nobody still ends at the sink, with every Ready worker
+/// of the group and no report: a sink that trims what its readers booked
+/// does it on every tick. Nothing is fetched and nothing is published.
+#[tokio::test]
+async fn a_tick_that_polled_nobody_ends_at_the_sink_with_every_ready_worker() {
+    let (registry, monitor, sink) =
+        build_recording(PollMode::Suppressed, PolledRanks::default(), true, false);
+    let worker = ready_worker("http://w:1", "m");
+    registry.register(Arc::clone(&worker)).unwrap();
+    let key = WorkerGroupKey {
+        model_id: "m".to_string(),
+        worker_type: WorkerType::Regular,
+        connection_mode: ConnectionMode::Http,
+    };
+
+    poll_group_once(&monitor, &key, Duration::from_secs(5), Instant::now()).await;
+
+    assert_eq!(
+        *sink.said.lock(),
+        vec![
+            Said::PollMode("http://w:1".to_string()),
+            Said::Tick(1, Vec::new()),
+        ]
+    );
+    assert!(monitor.load_state.snapshot().is_empty());
+}
+
+/// Under the conditional poll gate the monitor asks its sink whether a
+/// reader wants loads, and takes the answer.
+#[tokio::test]
+async fn the_conditional_gate_asks_the_sink_whether_loads_are_wanted() {
+    let worker = ready_worker("http://w:1", "m");
+    for needs in [false, true] {
+        let (_registry, monitor, _sink) =
+            build_recording(PollMode::Poll, PolledRanks::default(), needs, true);
+        assert_eq!(
+            monitor.loads_wanted(std::slice::from_ref(&worker)),
+            needs,
+            "the sink says {needs}"
+        );
+    }
+}
+
+/// The monitor running over a recording sink, with one Ready worker
+/// registered and the event loop started.
+fn recording_with_a_worker() -> (
+    Arc<WorkerRegistry>,
+    Arc<WorkerMonitor>,
+    Arc<RecordingLoadSink>,
+    crate::registry::WorkerId,
+) {
+    let (registry, monitor, sink) =
+        build_recording(PollMode::Suppressed, PolledRanks::default(), true, false);
+    let id = registry.register(ready_worker("http://w:1", "m")).unwrap();
+    monitor.start_event_loop();
+    (registry, monitor, sink, id)
+}
+
+/// Whether the sink has been told to forget the worker at `url`.
+fn told_to_forget(sink: &RecordingLoadSink, url: &str) -> bool {
+    sink.said.lock().contains(&Said::Forget(url.to_string()))
+}
+
+/// The event loop's turn: it runs on its own task.
+async fn settle() {
+    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+}
+
+/// Wait, up to two seconds, until `done` holds: what the event loop does
+/// arrives on its own task.
+async fn within_two_seconds(mut done: impl FnMut() -> bool) -> bool {
+    for _ in 0..200 {
+        if done() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    done()
+}
+
+/// A worker's removal forgets its loads at the sink.
+#[tokio::test]
+async fn a_removal_forgets_the_workers_loads_at_the_sink() {
+    let (registry, _monitor, sink, id) = recording_with_a_worker();
+    settle().await;
+    assert!(!told_to_forget(&sink, "http://w:1"));
+    registry.remove(&id);
+    assert!(within_two_seconds(|| told_to_forget(&sink, "http://w:1")).await);
+}
+
+/// A worker's replacement forgets the old worker's loads at the sink.
+#[tokio::test]
+async fn a_replacement_forgets_the_old_workers_loads_at_the_sink() {
+    let (registry, _monitor, sink, id) = recording_with_a_worker();
+    settle().await;
+    assert!(!told_to_forget(&sink, "http://w:1"));
+    assert!(registry.replace(&id, ready_worker("http://w:1", "m")));
+    assert!(within_two_seconds(|| told_to_forget(&sink, "http://w:1")).await);
+}
+
+/// A status that leaves `Ready` forgets the worker's loads at the sink.
+#[tokio::test]
+async fn a_status_that_leaves_ready_forgets_the_workers_loads_at_the_sink() {
+    let (registry, _monitor, sink, id) = recording_with_a_worker();
+    settle().await;
+    assert!(!told_to_forget(&sink, "http://w:1"));
+    registry.transition_status(&id, WorkerStatus::NotReady);
+    assert!(within_two_seconds(|| told_to_forget(&sink, "http://w:1")).await);
+}
+
+/// A worker whose status leaves `Ready` has no load feed and so no verdict:
+/// the monitor's own sink clears the overload flag, which nothing else
+/// clears on that path. A record comes before the event loop starts, so the
+/// first tick finds a fresh receipt and polls nobody, and no failed fetch
+/// clears the flag in the eviction's place. The loop's start resets every
+/// flag, so the record that sets this one comes after it.
+#[tokio::test]
+async fn a_status_that_leaves_ready_clears_the_overload_flag_at_the_monitors_own_sink() {
+    let (registry, monitor) = build_monitor();
+    let worker: Arc<dyn Worker> = {
+        let worker = BasicWorkerBuilder::new("http://w:1")
+            .worker_type(WorkerType::Regular)
+            .connection_mode(ConnectionMode::Http)
+            .model(ModelCard::new("m"))
+            .health_config(HealthCheckConfig {
+                disable_health_check: true,
+                ..Default::default()
+            })
+            .overload_defaults(OverloadThresholds {
+                waiting_requests: Some(8),
+                token_usage: Some(0.8),
+            })
+            .build();
+        worker.set_status(WorkerStatus::Ready);
+        Arc::new(worker)
+    };
+    let id = registry.register(Arc::clone(&worker)).unwrap();
+    let record = pushed(1).with_requests(1, 8);
+    monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
+    monitor.start_event_loop();
+    settle().await;
+    monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
+    assert!(worker.is_overloaded(), "eight waiting is the threshold");
+    registry.transition_status(&id, WorkerStatus::NotReady);
+    assert!(
+        within_two_seconds(|| !worker.is_overloaded()).await,
+        "no load feed, no verdict"
+    );
+}
