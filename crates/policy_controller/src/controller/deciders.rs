@@ -497,9 +497,10 @@ impl Deciding {
     /// at hand the decider is at work at its own file of leases: what the
     /// sessions hand to that file is left to it, applied as it takes up
     /// its work, by each request it takes, refused or decided, where the
-    /// file's turn is free, and at each issue. It leaves that work before
-    /// it waits on an empty queue: what is handed meanwhile is applied by
-    /// the session that hands it.
+    /// file's turn is free, at each issue, and behind the give-up of an
+    /// answer its stream refused. It leaves that work before it waits on
+    /// an empty queue: what is handed meanwhile is applied by the session
+    /// that hands it.
     fn run(mut self, jobs: &Receiver<Job>) {
         loop {
             let job = match jobs.try_recv() {
