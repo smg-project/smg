@@ -39,7 +39,7 @@ CHART = REPO / "deploy" / "helm" / "smg"
 HELPERS = CHART / "templates" / "_helpers.tpl"
 SCHEMA = CHART / "values.schema.json"
 ROUTER_TEMPLATE = CHART / "templates" / "deployment-router.yaml"
-# The gateway's Consul provider, which reads Consul's own variables.
+# The discovery crate's Consul provider, which reads Consul's own variables.
 CONSUL_PROVIDER = REPO / "crates" / "service_discovery" / "src" / "consul.rs"
 # The chart needs Kubernetes >= 1.26 and `helm template` checks it against
 # its default version, which older helm releases put below that.
@@ -86,8 +86,11 @@ needs_chart = pytest.mark.skipif(not HELPERS.exists(), reason="chart not present
 needs_helm = pytest.mark.skipif(
     shutil.which("helm") is None or not HELPERS.exists(), reason="helm or the chart not present"
 )
-needs_gateway_source = pytest.mark.skipif(
-    not CONSUL_PROVIDER.exists(), reason="the gateway source is not in this checkout"
+# A checkout with no Rust sources has no workspace manifest, and the test that
+# reads them stands down. With the sources there, a provider file that moved
+# fails that test: a skip would hide the move.
+needs_rust_sources = pytest.mark.skipif(
+    not (REPO / "Cargo.toml").exists(), reason="the Rust sources are not in this checkout"
 )
 
 
@@ -674,7 +677,7 @@ def test_consul_secrets_are_wired_only_for_the_consul_provider(provider):
 
 
 @needs_chart
-@needs_gateway_source
+@needs_rust_sources
 def test_chart_consul_variables_are_the_ones_the_gateway_reads():
     text = HELPERS.read_text() + ROUTER_TEMPLATE.read_text()
     assert set(re.findall(r"\bCONSUL_[A-Z_]+\b", text)) == CONSUL_VARIABLES

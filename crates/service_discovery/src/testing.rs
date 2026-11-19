@@ -1,11 +1,14 @@
 //! Shared test fixtures for the discovery modules.
 
+#[cfg(feature = "kubernetes")]
+use std::collections::BTreeMap;
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     sync::Arc,
 };
 
 use async_trait::async_trait;
+#[cfg(feature = "kubernetes")]
 use k8s_openapi::{
     api::core::v1::{Pod, PodCondition, PodSpec, PodStatus},
     apimachinery::pkg::apis::meta::v1::ObjectMeta,
@@ -26,9 +29,12 @@ pub const STAMPED_API_KEY: &str = "host-key";
 /// The budget of connection attempts [`TestHost`] stamps beside it.
 pub const STAMPED_ATTEMPTS: u32 = 7;
 
-/// A host for the module's cases: a registry of its own, a stamp a case can
-/// read back, and a job queue that records what a pass asks of it.
+/// A host for the crate's cases and for those of a crate that hosts
+/// discovery: a registry of its own, a stamp a case can read back, and a job
+/// queue that records what a pass asks of it.
 pub struct TestHost {
+    /// The registry the host answers from: a case registers workers in it and
+    /// reads back what a pass left there.
     pub registry: Arc<WorkerRegistry>,
     jobs: Option<Arc<RecordedJobs>>,
 }
@@ -127,7 +133,9 @@ struct Queue {
 /// A job queue that records the jobs it took, in order, and the additions it
 /// refused. An address a case holds reads as in flight. Its addition is
 /// refused under a registration's hold and taken under another job's, as the
-/// job port says of a host's queue.
+/// job port says of a host's queue. In one place it is not a host's queue:
+/// its removal takes each worker a guard names whatever its revision, where
+/// a host's queue takes it at the guard's revision alone.
 #[derive(Default)]
 pub struct RecordedJobs {
     queue: Mutex<Queue>,
@@ -262,6 +270,7 @@ impl WorkerJobs for RecordedJobs {
 
 /// A running, ready pod named `name` at `ip`, carrying `labels`: the shape
 /// the Kubernetes watchers' tests feed to their label selectors.
+#[cfg(feature = "kubernetes")]
 pub fn make_labeled_pod(name: &str, ip: &str, labels: &[(&str, &str)]) -> Pod {
     let mut label_map = BTreeMap::new();
     for &(k, v) in labels {

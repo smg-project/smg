@@ -173,7 +173,10 @@ commands_of() {
             # Opt-in (#[ignore]) cases against the database the workflow creates for the job.
             echo "-p data-connector --test postgres_integration --test conformance :: --ignored --test-threads=1" ;;
         protocols)
-            echo "-p openai-protocol -p smg-worker -p smg-external-router -p smg-service-discovery -p smg-auth -p smg-rl -p smg-client -p openapi-gen --features openai-protocol/axum,smg-worker/runtime,smg-worker/workflow,smg-external-router/openai,smg-external-router/anthropic,smg-external-router/gemini" ;;
+            echo "-p openai-protocol -p smg-worker -p smg-external-router -p smg-service-discovery -p smg-auth -p smg-rl -p smg-client -p openapi-gen --features openai-protocol/axum,smg-worker/runtime,smg-worker/workflow,smg-external-router/openai,smg-external-router/anthropic,smg-external-router/gemini,smg-service-discovery/consul,smg-service-discovery/file,smg-service-discovery/kubernetes,smg-service-discovery/slurm"
+            # The discovery crate with no provider built: its shared cases, and the refusal of
+            # each provider's settings.
+            echo "-p smg-service-discovery" ;;
         engine)
             echo "-p smg-grpc-client -p engine-zmq-client -p engine-zmq-adapter -p engine-servicer -p mock-worker -p gateway-perf --features engine-zmq-client/mock-engine" ;;
         kv)
@@ -223,6 +226,22 @@ run_commands() {
     return "$status"
 }
 
+# Every set of the discovery crate's four provider features but the empty one, a comma list
+# a line, and each set that does not hold the file provider once more with the directory
+# watch (`file` names `fs-watch`): the 23 distinct builds a host can name.
+discovery_feature_sets() {
+    local mask features
+    for mask in $(seq 0 15); do
+        features=""
+        [ $((mask & 1)) -eq 0 ] || features="consul"
+        [ $((mask & 2)) -eq 0 ] || features="${features:+$features,}file"
+        [ $((mask & 4)) -eq 0 ] || features="${features:+$features,}kubernetes"
+        [ $((mask & 8)) -eq 0 ] || features="${features:+$features,}slurm"
+        [ -z "$features" ] || echo "$features"
+        [ $((mask & 2)) -ne 0 ] || echo "${features:+$features,}fs-watch"
+    done
+}
+
 lint() {
     case "$1" in
         all-features)
@@ -241,6 +260,13 @@ lint() {
             (set -x; cargo check -p llm-multimodal)
             # Standalone consumers that resolve model files themselves build without `hf-hub`.
             (set -x; cargo check -p llm-multimodal --no-default-features --all-targets)
+            # The discovery crate builds each provider under a feature of its own, and a host
+            # names the ones it runs: with none, under every set of them, and with the test
+            # helpers alone, nothing is left unused and no lint reads one set apart.
+            (set -x; cargo clippy -p smg-service-discovery --all-targets -- -D warnings)
+            for features in $(discovery_feature_sets) test-util; do
+                (set -x; cargo clippy -p smg-service-discovery --features "$features" --all-targets -- -D warnings)
+            done
             (set -x; cargo check --manifest-path bindings/python/Cargo.toml)
             (set -x; cargo check --manifest-path bindings/golang/Cargo.toml) ;;
         *) echo "ci_rust_tests.sh: unknown lint leg '$1' (all-features, self-hosted, anthropic-only, default-build)" >&2; exit 2 ;;

@@ -8,7 +8,7 @@
 //! burst of events settles into one wake.
 
 use std::{
-    ffi::{OsStr, OsString},
+    ffi::OsString,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -17,6 +17,10 @@ use std::{
     time::Duration,
 };
 
+/// The watcher package. A start answers with its error, so the package is
+/// named here: a host reads that error by this crate's version of it and
+/// pins none of its own.
+pub use notify;
 use notify::{event::ModifyKind, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::{sync::mpsc, time};
 
@@ -45,13 +49,11 @@ pub struct DirectoryWatch {
 }
 
 impl DirectoryWatch {
-    /// The watch for one file: its directory, for its name.
+    /// The watch for one file: its directory, for its name. The file provider
+    /// is its one caller, so it is built with that provider and for the cases.
+    #[cfg(any(test, feature = "file"))]
     pub(crate) fn of_file(path: &Path, wake: mpsc::Sender<()>) -> notify::Result<Self> {
-        let names = path
-            .file_name()
-            .map(OsStr::to_os_string)
-            .into_iter()
-            .collect();
+        let names = path.file_name().map(OsString::from).into_iter().collect();
         Self::start(directory_of(path), names, wake)
     }
 
@@ -98,6 +100,8 @@ impl DirectoryWatch {
         })
     }
 
+    /// Whether the watched directory was removed or moved away. The watch
+    /// reports nothing more then, so its owner starts a new one.
     pub fn is_lost(&self) -> bool {
         self.lost.load(Ordering::Relaxed)
     }
