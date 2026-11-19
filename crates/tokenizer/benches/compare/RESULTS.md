@@ -109,31 +109,31 @@ Written by `tables.py` from `encode-rounds.csv`, `misc-rounds.csv` and `load-mem
 
 ## Load and memory (each cell: SMG 1.16.0 / SMG v1.15.0 / fastokens)
 
-| family | load, ms | resident memory after the load, MB | high-water mark after a 1m-token encode, MB | growth per thread at 64 threads, one shared tokenizer, kB | growth per thread, a tokenizer per thread, MB |
+| family | load, ms | resident memory after the load, MB | high-water mark after a 1m-token encode, MB | growth per thread at 64 threads, one shared tokenizer, kB | resident level per thread, a tokenizer per thread, MB |
 |---|---|---|---|---|---|
-| DeepSeek V4.1 | 281.4 / 483.5 / 743.3 | 72.4 / 138.2 / 112.8 | 94 / 145 / 197 | 698 / 971 / 16305 | 69.4 / 123.4 / 123.1 |
-| DeepSeek V3.2 | 290.4 / 685.2 / 724.9 | 71.0 / 136.9 / 113.0 | 93 / 143 / 197 | 698 / 971 / 14390 | 72.4 / 118.5 / 118.1 |
-| Llama 3.2 | 269.9 / 794.5 / 1169.5 | 93.3 / 184.4 / 284.1 | 116 / 252 / 336 | 707 / 998 / 15531 | 98.0 / 244.0 / 294.2 |
-| Llama 4 | 455.5 / 1329.1 / 2280.4 | 116.8 / 284.2 / 439.9 | 132 / 390 / 526 | 707 / 988 / 32629 | 108.5 / 342.9 / 465.4 |
-| gpt-oss | 440.9 / 1294.2 / 2105.8 | 114.0 / 287.6 / 442.0 | 133 / 396 / 528 | 716 / 987 / 32827 | 118.3 / 350.0 / 463.4 |
-| Qwen 3.6 | 407.7 / 1074.8 / 1481.1 | 112.7 / 244.5 / 186.0 | 134 / 246 / 270 | 655 / 894 / 32854 | 145.9 / 209.0 / 175.5 |
-| GLM-5.3 | 324.7 / 972.8 / 1430.4 | 107.4 / 211.4 / 326.0 | 123 / 291 / 377 | 717 / 1001 / 14776 | 109.3 / 265.7 / 334.7 |
-| MiniMax M3 | 319.9 / 800.2 / 1170.3 | 87.4 / 170.6 / 158.8 | 111 / 177 / 276 | 724 / 990 / 32791 | 101.6 / 152.8 / 190.9 |
-| MiMo V2.6 | 242.5 / 703.5 / 947.5 | 71.9 / 140.3 / 209.5 | 95 / 162 / 270 | 703 / 1000 / 15276 | 79.0 / 171.7 / 228.5 |
-| Mistral (tekken) | 345.6 / 393.7 / 193.1 | 81.0 / 99.7 / 71.9 | 112 / 130 / 95 | 692 / 926 / 463 | 71.9 / 90.1 / 90.6 |
-| Gemma 3 | 674.6 / 1769.0 / 2435.4 | 157.1 / 288.8 / 473.0 | 177 / 466 / 506 | 604 / 696 / 1883 | 174.2 / 419.7 / 461.2 |
-| Gemma 4 | 578.4 / 1755.6 / 2597.3 | 156.9 / 288.5 / 467.8 | 173 / 464 / 499 | 599 / 690 / 1822 | 171.8 / 415.8 / 462.3 |
-| Llama 2 (byte fallback) | 43.1 / 115.5 / 142.0 | 26.4 / 40.5 / 42.7 | 52 / 58 / 119 | 631 / 976 / 1841 | 19.9 / 28.9 / 39.9 |
-| Kimi K3 | 370.6 / 431.0 / 2328.2 | 83.3 / 101.9 / 72.1 | 113 / 130 / 79 | 711 / 999 / 181 | 75.7 / 93.8 / 66.3 |
-| BERT base | 14.6 / 22.2 / 51.8 | 14.5 / 20.2 / 19.5 | 24 / 603 / 596 | 52 / 1882 / 1934 | 7.4 / 12.0 / 13.9 |
-| T5 small | 42.8 / 50.0 / 85.5 | 35.5 / 43.1 / 44.6 | 393 / 462 / 455 | 1656 / 1657 / 1672 | 31.4 / 39.0 / 36.0 |
+| DeepSeek V4.1 | 196.5 / 442.5 / 678.1 | 72.2 / 138.4 / 112.8 | 94 / 145 / 197 | 697 / 969 / 16562 | 70.6 / 124.0 / 141.5 |
+| DeepSeek V3.2 | 199.4 / 430.6 / 669.0 | 71.0 / 136.8 / 112.8 | 93 / 143 / 197 | 698 / 969 / 16559 | 72.9 / 119.9 / 131.8 |
+| Llama 3.2 | 264.1 / 747.7 / 1127.4 | 93.3 / 184.4 / 284.0 | 114 / 250 / 337 | 707 / 996 / 16553 | 98.7 / 248.5 / 309.4 |
+| Llama 4 | 458.3 / 1225.2 / 2043.8 | 116.8 / 284.4 / 439.7 | 133 / 390 / 526 | 708 / 985 / 32950 | 110.1 / 345.4 / 498.1 |
+| gpt-oss | 460.8 / 1263.7 / 2094.7 | 113.9 / 287.1 / 442.1 | 133 / 396 / 528 | 718 / 986 / 32965 | 120.4 / 354.8 / 495.5 |
+| Qwen 3.6 | 413.1 / 1038.0 / 1492.4 | 112.7 / 237.6 / 186.1 | 133 / 243 / 270 | 655 / 892 / 32950 | 150.1 / 209.7 / 208.2 |
+| GLM-5.3 | 313.4 / 885.4 / 1391.2 | 107.4 / 211.0 / 325.9 | 122 / 289 / 377 | 717 / 999 / 16568 | 113.1 / 269.1 / 349.6 |
+| MiniMax M3 | 310.1 / 753.8 / 1107.4 | 87.3 / 172.2 / 158.9 | 111 / 177 / 276 | 724 / 989 / 32985 | 104.0 / 157.4 / 223.3 |
+| MiMo V2.6 | 221.3 / 603.0 / 888.5 | 71.8 / 141.0 / 212.9 | 95 / 162 / 266 | 704 / 997 / 16553 | 79.7 / 174.9 / 243.8 |
+| Mistral (tekken) | 317.2 / 355.4 / 183.6 | 81.2 / 99.6 / 72.1 | 112 / 130 / 94 | 690 / 926 / 461 | 72.6 / 91.1 / 91.1 |
+| Gemma 3 | 595.8 / 1614.2 / 2411.0 | 156.9 / 289.1 / 473.2 | 176 / 466 / 506 | 605 / 695 / 1883 | 172.2 / 417.7 / 463.6 |
+| Gemma 4 | 571.2 / 1627.9 / 2446.3 | 156.8 / 288.6 / 467.8 | 173 / 464 / 499 | 599 / 689 / 1831 | 173.9 / 417.3 / 464.0 |
+| Llama 2 (byte fallback) | 40.2 / 106.0 / 133.2 | 26.4 / 40.2 / 42.7 | 52 / 59 / 119 | 632 / 974 / 1819 | 20.5 / 29.7 / 41.9 |
+| Kimi K3 | 363.4 / 412.1 / 2574.7 | 83.3 / 101.9 / 71.9 | 112 / 129 / 79 | 704 / 996 / 179 | 76.4 / 95.5 / 66.5 |
+| BERT base | 16.6 / 22.1 / 52.4 | 14.5 / 20.1 / 19.5 | 24 / 602 / 596 | 49 / 1882 / 1929 | 7.4 / 13.9 / 15.8 |
+| T5 small | 42.4 / 51.9 / 89.4 | 35.3 / 43.0 / 44.5 | 393 / 462 / 455 | 1660 / 1658 / 1665 | 33.0 / 40.6 / 37.5 |
 
 ## Reading the tables
 
 - Of 192 encode cells SMG 1.16.0 reads a lower time than every reference in the csv files (fastokens, tiktoken-rs, tokenizers, v1) on 127: 42 of 96 cold and 85 of 96 warm; SMG v1.15.0 in the same rounds reads 83.
 - Against v1.15.0, cold: of 96 encode cells 91 read faster and 0 slower by more than 5 %, 5 within it; the median change is -17.3 %.
 - Against v1.15.0, warm: of 96 encode cells 95 read faster and 0 slower by more than 5 %, 1 within it; the median change is -23.7 %.
-- Against v1.15.0, decode, streaming and batch: of 96 cells 47 read faster and 2 slower by more than 5 %, 47 within it. Slower: Mistral (tekken), 64 streams: first delta, 241.0 against 120.0 ns (+100.8 %); Llama 3.2, 64 streams: first delta, 120.0 against 110.0 ns (+9.1 %).
+- Against v1.15.0, decode, streaming and batch: of 96 cells 47 read faster and 2 slower by more than 5 %, 47 within it. Slower: Mistral (tekken), 64 streams: first delta, 241.0 against 120.0 ns (+100.8 %); Llama 3.2, 64 streams: first delta, 120.0 against 110.0 ns (+9.1 %, one step of the clock). The step and first-delta cells read a clock that moves in steps of about 10 ns; 9 of the faster cells differ by one step or less.
 - Against fastokens, cold: of 96 encode cells SMG is ahead beyond the placement band (20 %) on 40 and behind beyond it on 36; 20 read inside the band (the margins run from -43 % to +1647 %).
 - Against fastokens, warm: of 96 encode cells SMG is ahead beyond the placement band (20 %) on 82 and behind beyond it on 0; 14 read inside the band (the margins run from -14 % to +6873 %).
 - Against v1, cold: of 72 encode cells SMG is ahead beyond the placement band (20 %) on 66 and behind beyond it on 0; 6 read inside the band (the margins run from +9 % to +2120 %).
@@ -145,8 +145,8 @@ Written by `tables.py` from `encode-rounds.csv`, `misc-rounds.csv` and `load-mem
 - 64 streams: first delta, against fastokens: SMG is ahead beyond the band on 16 of 16 families, behind beyond it on 0, inside it on 0 (the margins run from +75 % to +821 %).
 - Batch of 1,000 texts, one thread, against fastokens: SMG is ahead beyond the band on 8 of 16 families, behind beyond it on 0, inside it on 8 (the margins run from -13 % to +2693 %).
 - Batch of 1,000 texts, one thread, against v1: SMG is ahead beyond the band on 12 of 12 families, behind beyond it on 0, inside it on 0 (the margins run from +268 % to +1642 %).
-- Load and memory, against v1.15.0: SMG 1.16.0 reads lower by more than 5 % on 16 of 16 families in the load time; on 16 of 16 families in the resident memory after the load; on 16 of 16 families in the high-water mark after a 1m-token encode; on 15 of 16 families in the growth per thread on one shared tokenizer; on 16 of 16 families in the growth per thread with a tokenizer per thread.
-- Load and memory, against fastokens: SMG 1.16.0 reads lower by more than 5 % on 15 of 16 families in the load time (higher on Mistral (tekken)); on 14 of 16 families in the resident memory after the load (higher on Mistral (tekken), Kimi K3); on 14 of 16 families in the high-water mark after a 1m-token encode (higher on Mistral (tekken), Kimi K3); on 13 of 16 families in the growth per thread on one shared tokenizer (higher on Mistral (tekken), Kimi K3); on 15 of 16 families in the growth per thread with a tokenizer per thread (higher on Kimi K3).
-- The v1 column reads `-` for Mistral (tekken), Kimi K3, BERT base, T5 small: the v1 pipeline declines their files, and that build runs SMG's own encoder there.
+- Load and memory, against v1.15.0: SMG 1.16.0 reads lower by more than 5 % on 16 of 16 families in the load time; on 16 of 16 families in the resident memory after the load; on 16 of 16 families in the high-water mark after a 1m-token encode; on 15 of 16 families in the growth per thread on one shared tokenizer; on 16 of 16 families in the resident level per thread with a tokenizer per thread.
+- Load and memory, against fastokens: SMG 1.16.0 reads lower by more than 5 % on 15 of 16 families in the load time (higher on Mistral (tekken)); on 14 of 16 families in the resident memory after the load (higher on Mistral (tekken), Kimi K3); on 14 of 16 families in the high-water mark after a 1m-token encode (higher on Mistral (tekken), Kimi K3); on 13 of 16 families in the growth per thread on one shared tokenizer (higher on Mistral (tekken), Kimi K3); on 15 of 16 families in the resident level per thread with a tokenizer per thread (higher on Kimi K3).
+- The v1 column reads `-` for Mistral (tekken), Kimi K3, BERT base, T5 small: the v1 pipeline declines their files, and that build takes its next encode path there (SMG's own, or the `tokenizers` crate's).
 - The placement band: the v1 build shares SMG's decode and streaming code, and between the two builds those 80 cells read -18 % to +25 %.
 - The corpus: 17 to 39 % of the bytes of a size class are outside ASCII (`corpus.json`).
