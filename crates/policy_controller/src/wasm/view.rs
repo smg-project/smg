@@ -1004,6 +1004,7 @@ pub(crate) fn signal(s: &Signal, now_micros: u64) -> wit::Signal {
             worker,
             dp_rank,
             row,
+            ..
         } => wit::Signal::Load((worker.0, *dp_rank, load(row))),
         Signal::Health { worker, health: h } => wit::Signal::Health((worker.0, health(*h))),
         Signal::GatewayVeto {

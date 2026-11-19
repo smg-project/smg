@@ -543,6 +543,7 @@ pub(crate) fn signal(s: &Signal, now_micros: u64) -> proto::lifecycle_event::Eve
             worker,
             dp_rank,
             row,
+            ..
         } => (worker.0, u32::from(*dp_rank), Kind::Load(load(row))),
         Signal::Health { worker, health: h } => (worker.0, 0, Kind::Health(health_bits(*h))),
         Signal::GatewayVeto {

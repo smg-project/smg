@@ -15,17 +15,18 @@ use std::sync::{
 
 use crate::view::Candidate;
 
-/// The place of one worker's count in the store's counts ([`Counts`]). A
-/// member is given its slot at the membership write that first files it
-/// and keeps it while its row stands, and no other member is given it
-/// after.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Slot(u32);
+/// The place of one worker's count in the store's counts. A member is
+/// given its slot at the membership write that first files it and keeps
+/// it while its row stands, and no other member is given it after.
+/// In-process only: the store gives a slot, and a host that keeps no
+/// counts names [`Slot::NONE`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Slot(u32);
 
 impl Slot {
     /// The slot that names no cell: its count reads zero and books
     /// nothing. What a table that gave every slot gives.
-    pub(crate) const NONE: Self = Self(u32::MAX);
+    pub const NONE: Self = Self(u32::MAX);
 }
 
 /// The cells of the first piece of the counts; each piece after holds
@@ -35,6 +36,76 @@ const FIRST: u64 = 1 << 10;
 /// The pieces of the counts: together they hold every slot but the last
 /// 1,024 a `u32` names, [`Slot::NONE`] among those.
 const PIECES: usize = 22;
+
+/// Cells by slot, grown in pieces that never move: piece `k` holds the
+/// `FIRST << k` cells from slot `(FIRST << k) - FIRST` on, laid when a
+/// slot of it is first asked for. The counts stand in one, and a stage
+/// that keeps a number a member stands its cells in another, beside them.
+#[derive(Debug)]
+pub(crate) struct Pieces<T> {
+    pieces: [OnceLock<Box<[T]>>; PIECES],
+}
+
+impl<T> Default for Pieces<T> {
+    fn default() -> Self {
+        Self {
+            pieces: std::array::from_fn(|_| OnceLock::new()),
+        }
+    }
+}
+
+impl<T: Default> Pieces<T> {
+    /// The cell of `slot`, its piece laid with every cell at its default
+    /// where it was not: `None` for a slot no piece holds.
+    pub(crate) fn lay(&self, slot: Slot) -> Option<&T> {
+        let (piece, first) = Self::place(slot);
+        let cells = self.pieces.get(piece)?;
+        let cells = cells.get_or_init(|| (0..FIRST << piece).map(|_| T::default()).collect());
+        cells.get(slot.0.wrapping_sub(first) as usize)
+    }
+}
+
+impl<T> Pieces<T> {
+    /// The first piece: the cells of the first 1,024 slots, and no cell
+    /// before it is laid.
+    pub(crate) fn first(&self) -> &[T] {
+        let first = self.pieces.first().and_then(OnceLock::get);
+        first.map_or(&[], |cells| cells)
+    }
+
+    /// The cell of `slot` where its piece is laid.
+    pub(crate) fn cell(&self, slot: Slot) -> Option<&T> {
+        let (cells, first) = self.piece(slot);
+        cells.get(slot.0.wrapping_sub(first) as usize)
+    }
+
+    /// The cell of `slot` read through `first`, the first piece found once
+    /// for a run of reads: no search for a slot the first piece holds.
+    #[inline]
+    pub(crate) fn cell_from<'a>(&'a self, first: &'a [T], slot: Slot) -> Option<&'a T> {
+        match first.get(slot.0 as usize) {
+            Some(cell) => Some(cell),
+            None => self.cell(slot),
+        }
+    }
+
+    /// The cells of the piece that holds `slot` and the piece's first
+    /// slot: no cells where the piece is not laid yet or no piece holds
+    /// the slot.
+    fn piece(&self, slot: Slot) -> (&[T], u32) {
+        let (piece, first) = Self::place(slot);
+        let cells = self.pieces.get(piece).and_then(OnceLock::get);
+        (cells.map_or(&[], |cells| cells), first)
+    }
+
+    /// The piece `slot` falls in and that piece's first slot.
+    fn place(slot: Slot) -> (usize, u32) {
+        let at = u64::from(slot.0) + FIRST;
+        let piece = at.ilog2() - FIRST.trailing_zeros();
+        let first = (FIRST << piece) - FIRST;
+        (piece as usize, first as u32)
+    }
+}
 
 /// What the leases on file book on each worker: the counts a decision
 /// reads as its rows' requests in flight ([`RequestFacts::in_flight`]).
@@ -50,9 +121,8 @@ const PIECES: usize = 22;
 /// [`RequestFacts::in_flight`]: crate::view::RequestFacts::in_flight
 #[derive(Debug, Default)]
 pub(crate) struct Counts {
-    /// Piece `k` holds the `FIRST << k` cells from slot
-    /// `(FIRST << k) - FIRST` on: laid when its first slot is given.
-    pieces: [OnceLock<Box<[AtomicU32]>>; PIECES],
+    /// A cell a slot, its piece laid when its first slot is given.
+    cells: Pieces<AtomicU32>,
     /// The slots given so far.
     given: AtomicU32,
 }
@@ -68,12 +138,10 @@ impl Counts {
         let Ok(slot) = given.map(Slot) else {
             return Slot::NONE;
         };
-        let (piece, _) = Self::place(slot);
-        let Some(cells) = self.pieces.get(piece) else {
-            return Slot::NONE;
-        };
-        cells.get_or_init(|| (0..FIRST << piece).map(|_| AtomicU32::new(0)).collect());
-        slot
+        match self.cells.lay(slot) {
+            Some(_) => slot,
+            None => Slot::NONE,
+        }
     }
 
     /// The counts of `slots`, in their order: one load a slot, the piece
@@ -85,7 +153,7 @@ impl Counts {
             if let Some(cell) = cells.get(at) {
                 return cell.load(Ordering::Relaxed);
             }
-            (cells, first) = self.piece(slot);
+            (cells, first) = self.cells.piece(slot);
             let at = slot.0.wrapping_sub(first) as usize;
             cells.get(at).map_or(0, |cell| cell.load(Ordering::Relaxed))
         })
@@ -160,30 +228,11 @@ impl Counts {
     /// The table's first piece: the cells of the first 1,024 members that
     /// ever stood, and no cell before the first slot is given.
     fn first(&self) -> &[AtomicU32] {
-        let first = self.pieces.first().and_then(OnceLock::get);
-        first.map_or(&[], |cells| cells)
+        self.cells.first()
     }
 
     fn cell(&self, slot: Slot) -> Option<&AtomicU32> {
-        let (cells, first) = self.piece(slot);
-        cells.get(slot.0.wrapping_sub(first) as usize)
-    }
-
-    /// The cells of the piece that holds `slot` and the piece's first
-    /// slot: no cells where the piece is not laid yet or no piece holds
-    /// the slot.
-    fn piece(&self, slot: Slot) -> (&[AtomicU32], u32) {
-        let (piece, first) = Self::place(slot);
-        let cells = self.pieces.get(piece).and_then(OnceLock::get);
-        (cells.map_or(&[], |cells| cells), first)
-    }
-
-    /// The piece `slot` falls in and that piece's first slot.
-    fn place(slot: Slot) -> (usize, u32) {
-        let at = u64::from(slot.0) + FIRST;
-        let piece = at.ilog2() - FIRST.trailing_zeros();
-        let first = (FIRST << piece) - FIRST;
-        (piece as usize, first as u32)
+        self.cells.cell(slot)
     }
 }
 
@@ -270,6 +319,13 @@ impl LentRun<'_> {
     #[inline]
     pub(crate) fn of(&self, row: &Candidate) -> u32 {
         self.at(row.position)
+    }
+
+    /// The slot of `row`: the one that names no cell past the rows.
+    #[inline]
+    pub(crate) fn slot_of(&self, row: &Candidate) -> Slot {
+        let slot = self.slots.get(row.position as usize);
+        slot.copied().unwrap_or(Slot::NONE)
     }
 
     /// The count of the row at `position`, one number for the decision:
@@ -395,6 +451,11 @@ pub(crate) mod tests {
                 kept,
                 lent: OnceCell::new(),
             }
+        }
+
+        /// The slot the count of `row` stands in.
+        pub(crate) fn slot_of(&self, row: &Candidate) -> Slot {
+            self.slots[row.position as usize]
         }
 
         /// `facts` with the table lent beside the rows: every call lends

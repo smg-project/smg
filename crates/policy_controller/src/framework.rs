@@ -4513,6 +4513,12 @@ impl Lifecycle for Engine {
         }
     }
 
+    fn keeps_loads(&self) -> bool {
+        self.profiles.iter().any(|profile| {
+            profile.picker.keeps_loads() || profile.scorers.iter().any(|w| w.scorer.keeps_loads())
+        })
+    }
+
     fn needs_lifecycle(&self) -> bool {
         self.profiles.iter().any(|profile| {
             profile.picker.needs_lifecycle()
