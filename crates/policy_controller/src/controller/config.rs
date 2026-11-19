@@ -396,7 +396,6 @@ pub enum ConfigError {
         second: Scope,
     },
     /// A discovery flag was refused.
-    #[cfg(feature = "discovery")]
     #[error("{flag}: {reason}")]
     DiscoveryFlag {
         /// The flag that was refused.

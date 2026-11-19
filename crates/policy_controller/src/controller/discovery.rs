@@ -1,5 +1,6 @@
 //! The elected controller's discovery task. The election wakes it, and
-//! the fence tells it which term the replica leads under.
+//! the fence tells it which term the replica leads under. A lead the
+//! election renews no more ends by the fence's clock, with no further word.
 
 mod flags;
 mod host;
@@ -21,7 +22,7 @@ use tracing::error;
 
 use self::flags::Credential;
 pub(super) use self::{flags::DiscoveryFlags, host::Host};
-use super::{election::Standing, ConfigError};
+use super::{election::Standing, readiness::reached, ConfigError};
 use crate::elector::Fence;
 
 /// The selected worker discovery provider and the credential it stamps.
@@ -112,19 +113,37 @@ impl Discovery {
 
     pub(crate) async fn run(
         &self,
+        standing: watch::Receiver<Standing>,
+        stop: watch::Receiver<bool>,
+    ) {
+        let start = || start_service_discovery(self.settings.clone(), self.host.clone());
+        self.run_with(standing, stop, start).await;
+    }
+
+    /// [`Discovery::run`] over `start`, the start of the provider.
+    async fn run_with<F>(
+        &self,
         mut standing: watch::Receiver<Standing>,
         mut stop: watch::Receiver<bool>,
-    ) {
+        start: impl Fn() -> F + Send + Sync,
+    ) where
+        F: Future<Output = Started> + Send,
+    {
+        let (provider, _) = self.provider();
         let stopped = async {
             let _ = stop.wait_for(|stop| *stop).await;
         };
         tokio::pin!(stopped);
+        // The term whose provider ended by itself: its next start waits the
+        // check interval first, as a failed start does.
+        let mut ended = None;
         loop {
-            let Some(term) = self.leader_term() else {
+            let now = Instant::now();
+            let Some(term) = self.fence.leader_term(now) else {
                 tokio::select! {
                     () = &mut stopped => return,
-                    changed = standing.changed() => {
-                        if changed.is_err() {
+                    open = self.turned(now, &mut standing) => {
+                        if !open {
                             return;
                         }
                     }
@@ -136,7 +155,6 @@ impl Discovery {
             // ends the old provider even when both reads find a leader.
             let left = self.left(term, &mut standing);
             tokio::pin!(left);
-            let start = || start_service_discovery(self.settings.clone(), self.host.clone());
             let mut task = tokio::select! {
                 biased;
                 () = &mut stopped => return,
@@ -146,7 +164,7 @@ impl Discovery {
                     }
                     continue;
                 }
-                started = self.start(term, start) => {
+                started = self.start(term, &start, ended == Some(term)) => {
                     let Some(task) = started else {
                         continue;
                     };
@@ -157,6 +175,23 @@ impl Discovery {
                 biased;
                 () = &mut stopped => false,
                 open = &mut left => open,
+                end = &mut task.0 => {
+                    // A provider that stops by itself would leave the
+                    // workers as they stood: it is said and started again.
+                    match end {
+                        Ok(()) => error!(
+                            provider,
+                            "worker discovery ended by itself and starts again after the check interval"
+                        ),
+                        Err(error) => error!(
+                            provider,
+                            %error,
+                            "worker discovery failed and starts again after the check interval"
+                        ),
+                    }
+                    ended = Some(term);
+                    continue;
+                }
             };
             task.0.abort();
             let _ = (&mut task.0).await;
@@ -170,23 +205,9 @@ impl Discovery {
         self.fence.leader_term(Instant::now())
     }
 
-    /// Wait for a different term, returning whether the watch is still open.
-    async fn left(&self, term: u64, standing: &mut watch::Receiver<Standing>) -> bool {
-        loop {
-            if self.leader_term() != Some(term) {
-                return true;
-            }
-            if standing.changed().await.is_err() {
-                return false;
-            }
-        }
-    }
-
-    async fn start<F>(&self, term: u64, start: impl Fn() -> F + Send) -> Option<ProviderTask>
-    where
-        F: Future<Output = Result<JoinHandle<()>, Box<dyn Error + Send + Sync>>> + Send,
-    {
-        let (provider, interval) = match &self.settings {
+    /// The provider's name in the logs and its check interval.
+    fn provider(&self) -> (&'static str, Duration) {
+        match &self.settings {
             RuntimeDiscoveryConfig::Kubernetes(config) => ("kubernetes", config.check_interval),
             RuntimeDiscoveryConfig::File(config) => ("file", config.check_interval),
             RuntimeDiscoveryConfig::Slurm(config) => ("slurm", config.check_interval),
@@ -196,17 +217,66 @@ impl Discovery {
                 "other",
                 Duration::from_secs(DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS),
             ),
-        };
-        while self.leader_term() == Some(term) {
+        }
+    }
+
+    /// Waits for the election's next word, or for the instant the clock
+    /// alone turns the fence's answer as it stood at `now`: a lead the
+    /// election renews no more ends there with no word. Returns whether
+    /// the watch is still open.
+    async fn turned(&self, now: Instant, standing: &mut watch::Receiver<Standing>) -> bool {
+        tokio::select! {
+            changed = standing.changed() => changed.is_ok(),
+            () = reached(self.fence.turns_at(now)) => true,
+        }
+    }
+
+    /// Waits for a different term, returning whether the watch is still open.
+    async fn left(&self, term: u64, standing: &mut watch::Receiver<Standing>) -> bool {
+        loop {
+            // One read of the clock serves the term and its next turn, so
+            // no end of the window falls between two reads.
+            let now = Instant::now();
+            if self.fence.leader_term(now) != Some(term) {
+                return true;
+            }
+            if !self.turned(now, standing).await {
+                return false;
+            }
+        }
+    }
+
+    /// Starts the provider while the replica leads under `term`. A start
+    /// that fails is said and tried again after the check interval, and
+    /// `paused` holds the first try back by the same interval.
+    async fn start<F>(
+        &self,
+        term: u64,
+        start: impl Fn() -> F + Send,
+        mut paused: bool,
+    ) -> Option<ProviderTask>
+    where
+        F: Future<Output = Started> + Send,
+    {
+        let (provider, interval) = self.provider();
+        loop {
+            if paused {
+                time::sleep(interval).await;
+            }
+            if self.leader_term() != Some(term) {
+                return None;
+            }
             match start().await {
                 Ok(task) => return Some(ProviderTask(task)),
                 Err(error) => error!(provider, %error, "worker discovery could not start"),
             }
-            time::sleep(interval).await;
+            paused = true;
         }
-        None
     }
 }
+
+/// What the provider's start returns: its task, or why it did not start.
+type Started = Result<JoinHandle<()>, Box<dyn Error + Send + Sync>>;
 
 /// If the serve is cancelled, its provider must stop with it.
 struct ProviderTask(JoinHandle<()>);

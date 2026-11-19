@@ -7,7 +7,12 @@
 //! arrives over the control scope.
 
 use std::{
-    ffi::OsStr, future::pending, io::IsTerminal, net::SocketAddr, path::PathBuf, process::ExitCode,
+    ffi::{OsStr, OsString},
+    future::pending,
+    io::IsTerminal,
+    net::SocketAddr,
+    path::PathBuf,
+    process::ExitCode,
     time::Duration,
 };
 
@@ -19,7 +24,7 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[cfg(feature = "discovery")]
-use super::discovery::{DiscoveryFlags, DiscoverySettings};
+use super::discovery::DiscoveryFlags;
 use super::{
     Config, ConfigError, Controller, Election, Error, LeasePlace, Listener, Scope, Tls, VERSION,
 };
@@ -295,6 +300,19 @@ impl Cli {
     /// listener, one client authority per scope, one credential rule per
     /// listener.
     fn config(&self) -> Result<Config, ConfigError> {
+        self.config_with(|name| std::env::var_os(name))
+    }
+
+    /// [`Cli::config`] over `env`, the read of one environment variable.
+    /// The worker key of a selected discovery provider alone is read so.
+    #[cfg_attr(
+        not(feature = "discovery"),
+        expect(
+            unused_variables,
+            reason = "only the discovery flags read the environment"
+        )
+    )]
+    fn config_with(&self, env: impl Fn(&str) -> Option<OsString>) -> Result<Config, ConfigError> {
         let identity = match (&self.tls_cert, &self.tls_key) {
             (Some(cert), Some(key)) => Some((cert, key)),
             (None, None) => None,
@@ -403,15 +421,7 @@ impl Cli {
                 advertise: self.advertise_address.clone(),
             },
             #[cfg(feature = "discovery")]
-            discovery: {
-                let settings = self.discovery.settings()?;
-                let credential = self.discovery.credential()?;
-                settings
-                    .map(|settings| {
-                        DiscoverySettings::new(settings, self.discovery.roles(), credential)
-                    })
-                    .transpose()?
-            },
+            discovery: self.discovery.configured(env)?,
             #[cfg(not(feature = "discovery"))]
             discovery: None,
         })
@@ -708,8 +718,10 @@ mod tests {
         Cli::try_parse_from(argv).is_err()
     }
 
+    /// The configuration of `args` under an empty environment: a case
+    /// reads nothing of the process's own.
     fn config(args: &[&str]) -> Result<Config, ConfigError> {
-        parse(args).config()
+        parse(args).config_with(|_| None)
     }
 
     #[cfg(feature = "discovery")]
@@ -753,6 +765,52 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[cfg(feature = "discovery")]
+    #[test]
+    fn the_worker_key_is_read_only_for_a_selected_provider() {
+        use std::ffi::OsString;
+
+        let file = [
+            "--discovery-provider",
+            "file",
+            "--discovery-file",
+            "/run/workers.json",
+        ];
+        let key = |name: &str| (name == "SMG_API_KEY").then(|| OsString::from("worker-key"));
+        let keyed = parse(&file).config_with(key).expect("a key to send");
+        assert!(keyed
+            .discovery
+            .as_ref()
+            .is_some_and(|settings| settings.credential().is_some()));
+        assert_ne!(keyed, config(&file).expect("no key to send"));
+
+        // A key file that is not there fails every read of the key.
+        let missing =
+            |name: &str| (name == "SMG_API_KEY_FILE").then(|| OsString::from("/missing/key"));
+        assert!(matches!(
+            parse(&file).config_with(missing),
+            Err(ConfigError::DiscoveryFlag {
+                flag: "--api-key-file",
+                ..
+            })
+        ));
+        let unread = parse(&[]).config_with(missing).expect("no key is read");
+        assert!(unread.discovery.is_none());
+
+        for flag in [
+            ["--api-key", "worker-key"],
+            ["--api-key-file", "/missing/key"],
+        ] {
+            assert!(
+                matches!(
+                    config(&flag),
+                    Err(ConfigError::DiscoveryFlag { flag: refused, .. }) if refused == flag[0]
+                ),
+                "{flag:?}"
+            );
+        }
     }
 
     #[cfg(not(feature = "discovery"))]

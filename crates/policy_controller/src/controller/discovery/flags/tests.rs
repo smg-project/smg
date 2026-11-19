@@ -166,6 +166,8 @@ fn flags_without_their_providers_are_refused() -> Result<(), Box<dyn Error>> {
         ["--consul-service", "worker"],
         ["--consul-address", "127.0.0.1:8500"],
         ["--consul-datacenter", "dc"],
+        ["--api-key", "worker-key"],
+        ["--api-key-file", "worker-key.txt"],
     ] {
         let error = parse(&args)?
             .settings()
@@ -318,6 +320,35 @@ fn the_defaults_are_the_gateways() -> Result<(), Box<dyn Error>> {
     assert_eq!(config.kv_connector_annotation, "smg.ai/kv-connector");
     assert_eq!(config.kv_engine_id_annotation, "smg.ai/kv-engine-id");
     assert_eq!(config.check_interval_secs, 30);
+    Ok(())
+}
+
+#[test]
+fn the_key_is_read_only_for_a_selected_provider() -> Result<(), Box<dyn Error>> {
+    let dir = tempdir()?;
+    // A key file that is not there fails every read of the key.
+    let missing = dir.path().join("missing");
+    let env = |name: &str| match name {
+        "SMG_API_KEY_FILE" => Some(missing.clone().into_os_string()),
+        _ => None,
+    };
+    assert_eq!(parse(&[])?.configured(env)?, None);
+    assert_eq!(parse(&["--selector", "app=worker"])?.configured(env)?, None);
+    let error = parse(&[
+        "--discovery-provider",
+        "file",
+        "--discovery-file",
+        "workers.json",
+    ])?
+    .configured(env)
+    .expect_err("the provider's key is read");
+    assert!(matches!(
+        error,
+        ConfigError::DiscoveryFlag {
+            flag: "--api-key-file",
+            ..
+        }
+    ));
     Ok(())
 }
 

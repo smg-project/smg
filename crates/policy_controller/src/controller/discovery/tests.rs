@@ -67,16 +67,19 @@ struct Bed {
 
 impl Bed {
     fn new() -> Result<Self, Box<dyn Error>> {
+        Self::with_lease(ElectionSettings {
+            duration: Duration::from_secs(60),
+            renew_deadline: Duration::from_secs(30),
+            ..ElectionSettings::default()
+        })
+    }
+
+    /// A bed whose lead ends `lease.renew_deadline` after a take, unless
+    /// the case takes it again.
+    fn with_lease(lease: ElectionSettings) -> Result<Self, Box<dyn Error>> {
         let file = ManifestFile(tempfile::tempdir()?);
         let settings = RuntimeDiscoveryConfig::from_config(&file.settings(), Some(Roles::Regular))?;
-        let elector = Elector::alone(
-            "controller",
-            ElectionSettings {
-                duration: Duration::from_secs(60),
-                renew_deadline: Duration::from_secs(30),
-                ..ElectionSettings::default()
-            },
-        )?;
+        let elector = Elector::alone("controller", lease)?;
         let (standing, _) = watch::channel(Standing::default());
         let (stop, _) = watch::channel(false);
         let store = Arc::new(MemoryStore::new());
@@ -266,6 +269,40 @@ async fn a_lost_lead_ends_the_provider() -> Result<(), Box<dyn Error>> {
 }
 
 #[tokio::test]
+async fn a_lead_that_ends_by_the_clock_ends_the_provider_with_no_word_from_the_election(
+) -> Result<(), Box<dyn Error>> {
+    // The election takes the lead once and is not heard again: no renewal
+    // moves the fence's window and no word reaches the watch.
+    let lead = Duration::from_secs(3);
+    let mut bed = Bed::with_lease(ElectionSettings {
+        duration: 2 * lead,
+        renew_deadline: lead,
+        ..ElectionSettings::default()
+    })?;
+    bed.file.publish(&[WORKER])?;
+    assert!(bed.install_queue());
+    bed.take()?;
+    bed.run();
+    assert!(bed.wait_for_job(0).await.is_some());
+    bed.jobs.hold(WORKER);
+
+    let ended = until(lead + PASS, || {
+        (Arc::strong_count(&bed.host) == 2).then_some(())
+    })
+    .await;
+    bed.file.publish(&[OTHER])?;
+    assert!(
+        bed.stays_at(1).await,
+        "a provider queued a worker past the end of its lead"
+    );
+    assert!(
+        ended.is_some(),
+        "the provider held the host past the end of its lead"
+    );
+    bed.stop().await
+}
+
+#[tokio::test]
 async fn a_second_take_starts_the_provider_again() -> Result<(), Box<dyn Error>> {
     let mut bed = Bed::new()?;
     bed.file.publish(&[WORKER])?;
@@ -345,6 +382,10 @@ async fn a_row_the_provider_registered_is_not_asked_again_and_one_it_no_longer_l
         bed.stays_at(1).await,
         "the same manifest queued another job"
     );
+    // The queue holds the removal in flight once a pass has asked it, as a
+    // host's queue does. The watch's pass and the tick's can both land
+    // before the row is gone, and the second then asks nothing.
+    bed.jobs.hold_after_the_next_read("worker:8000");
     bed.file.publish(&[])?;
     let Some(Queued::Remove { url, guards }) = bed.wait_for_job(1).await else {
         panic!("the provider did not remove its departed worker");
@@ -404,11 +445,12 @@ async fn a_failed_start_retries_at_the_check_interval_only_while_leading(
         .with_writer(fs::File::create(&log)?)
         .finish();
     let (attempted, mut attempts) = mpsc::unbounded_channel();
+    let refused = || async {
+        let _ = attempted.send(time::Instant::now());
+        Err(io::Error::other("start refused").into())
+    };
     let retry = discovery
-        .start(term, || async {
-            let _ = attempted.send(time::Instant::now());
-            Err(io::Error::other("start refused").into())
-        })
+        .start(term, refused, false)
         .with_subscriber(subscriber);
     let lead = async {
         let first = attempts.recv().await.expect("first attempt");
@@ -428,5 +470,65 @@ async fn a_failed_start_retries_at_the_check_interval_only_while_leading(
     let text = fs::read_to_string(log)?;
     assert_eq!(text.matches("ERROR").count(), 2);
     assert_eq!(text.matches("provider=\"file\"").count(), 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_provider_that_ends_by_itself_is_said_and_starts_again_after_the_check_interval(
+) -> Result<(), Box<dyn Error>> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use tokio::sync::mpsc;
+    use tracing::instrument::WithSubscriber as _;
+
+    let mut bed = Bed::new()?;
+    bed.take()?;
+    let discovery = bed.discovery();
+    let log = bed.file.0.path().join("ends.log");
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_writer(fs::File::create(&log)?)
+        .finish();
+    let count = AtomicUsize::new(0);
+    let (started, mut starts) = mpsc::unbounded_channel();
+    // The first provider returns at once and the second panics.
+    let start = || {
+        let nth = count.fetch_add(1, Ordering::Relaxed);
+        let _ = started.send(Instant::now());
+        async move {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the runner holds the handle of the case's provider"
+            )]
+            let task = tokio::spawn(async move {
+                assert_ne!(nth, 1, "the case's second provider panics");
+            });
+            Started::Ok(task)
+        }
+    };
+    let serve = discovery
+        .run_with(bed.standing.subscribe(), bed.stop.subscribe(), start)
+        .with_subscriber(subscriber);
+    let said = async {
+        let said = until(WAIT, || {
+            let text = fs::read_to_string(&log).ok()?;
+            (text.matches("ERROR").count() >= 2).then_some(text)
+        })
+        .await;
+        bed.stop.send_replace(true);
+        said
+    };
+    let ((), said) = time::timeout(WAIT, async { tokio::join!(serve, said) }).await?;
+    let text = said.expect("the two ends were not said");
+    assert_eq!(text.matches("ended by itself").count(), 1);
+    assert_eq!(text.matches("worker discovery failed").count(), 1);
+    assert!(text.matches("provider=\"file\"").count() >= 2);
+    let first = starts.recv().await.expect("the first start");
+    let second = starts.recv().await.expect("the second start");
+    assert!(
+        second.duration_since(first) >= INTERVAL,
+        "the provider started again before the check interval"
+    );
     Ok(())
 }

@@ -2,7 +2,6 @@
 
 use std::{
     collections::HashMap,
-    env,
     ffi::OsString,
     fmt, fs,
     path::{Path, PathBuf},
@@ -17,6 +16,7 @@ use smg_service_discovery::{
     ModelIdSource, Roles, SlurmDiscoveryConfig, DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS,
 };
 
+use super::DiscoverySettings;
 use crate::controller::ConfigError;
 
 const KEY_ENV: &str = "SMG_API_KEY";
@@ -225,8 +225,23 @@ impl DiscoveryFlags {
         }
     }
 
+    /// The selected provider with its roles and its key, or `None` where no
+    /// flag selects one. The key's two variables are read through `env`, and
+    /// only for a selected provider: a variable left set for another program
+    /// fails no start that has no use for it.
+    pub(crate) fn configured(
+        &self,
+        env: impl Fn(&str) -> Option<OsString>,
+    ) -> Result<Option<DiscoverySettings>, ConfigError> {
+        let Some(settings) = self.settings()? else {
+            return Ok(None);
+        };
+        let credential = self.credential_with_env(env)?;
+        DiscoverySettings::new(settings, self.roles(), credential).map(Some)
+    }
+
     /// The selected provider's settings, or `None` where no flag selects one.
-    pub(crate) fn settings(&self) -> Result<Option<DiscoveryConfig>, ConfigError> {
+    fn settings(&self) -> Result<Option<DiscoveryConfig>, ConfigError> {
         let provider = self.provider();
         self.validate_companions(provider)?;
         let selector = labels("--selector", &self.selector)?;
@@ -322,11 +337,20 @@ impl DiscoveryFlags {
                 "applies only to --discovery-provider file",
             ));
         }
-        if provider.is_none() && self.discovery_check_interval_secs.is_some() {
-            return Err(refuse(
-                "--discovery-check-interval-secs",
-                "needs a discovery provider",
-            ));
+        if provider.is_none() {
+            // The key is sent to discovered workers alone.
+            for (flag, given) in [
+                (
+                    "--discovery-check-interval-secs",
+                    self.discovery_check_interval_secs.is_some(),
+                ),
+                ("--api-key", self.api_key.is_some()),
+                ("--api-key-file", self.api_key_file.is_some()),
+            ] {
+                if given {
+                    return Err(refuse(flag, "needs a discovery provider"));
+                }
+            }
         }
         if provider != Some(Provider::Slurm) {
             for (flag, given) in self
@@ -364,7 +388,7 @@ impl DiscoveryFlags {
     }
 
     /// The roles the provider registers.
-    pub(crate) fn roles(&self) -> Option<Roles> {
+    fn roles(&self) -> Option<Roles> {
         let prefill_decode = [
             &self.prefill_selector,
             &self.decode_selector,
@@ -382,11 +406,8 @@ impl DiscoveryFlags {
         )
     }
 
-    /// The credential the discovered workers are called with, if one is given.
-    pub(crate) fn credential(&self) -> Result<Option<Credential>, ConfigError> {
-        self.credential_with_env(|name| env::var_os(name))
-    }
-
+    /// The credential the discovered workers are called with, if a flag or
+    /// a variable read through `env` gives one.
     fn credential_with_env(
         &self,
         env: impl Fn(&str) -> Option<OsString>,
