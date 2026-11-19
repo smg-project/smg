@@ -2013,17 +2013,7 @@ impl Picker for Random {
         // rows left names one of them by stepping over these.
         let mut drawn = [pick; MAX_TARGETS];
         for len in 1..MAX_TARGETS.min(candidates.len()) {
-            let mut row = draw.below(candidates.len() - len);
-            let mut at = len;
-            for (i, &taken) in drawn[..len].iter().enumerate() {
-                if row < taken {
-                    at = i;
-                    break;
-                }
-                row += 1;
-            }
-            drawn.copy_within(at..len, at + 1);
-            drawn[at] = row;
+            let row = step_over(&mut drawn, len, draw.below(candidates.len() - len));
             if keep(&candidates[row]) {
                 kept.push(row as u32);
             }
@@ -2054,27 +2044,37 @@ impl Picker for Random {
     ) {
         let mut draw = Draw::new(facts.seed);
         let n = kept.len();
+        // The positions taken so far, ascending.
         let mut taken = [usize::MAX; MAX_TARGETS];
         for slot in 0..MAX_TARGETS.min(n) {
             // The j-th position among those not taken yet: a partial
             // Fisher-Yates without the copy of the survivor list.
-            let j = draw.below(n - slot);
-            let mut seen = 0usize;
-            let mut chosen = 0usize;
-            for i in 0..n {
-                if taken[..slot].contains(&i) {
-                    continue;
-                }
-                if seen == j {
-                    chosen = i;
-                    break;
-                }
-                seen += 1;
-            }
-            taken[slot] = chosen;
+            let chosen = step_over(&mut taken, slot, draw.below(n - slot));
             out.push(target_of(&candidates[kept[chosen] as usize]));
         }
     }
+}
+
+/// The `j`-th position not among `taken[..len]`, which stand ascending,
+/// entered among them in its place. Neither the step over a position
+/// taken nor the entry branches on `j`: a drawn value is no pattern a
+/// branch can learn, and a branch missed costs more than every step here.
+#[inline]
+fn step_over(taken: &mut [usize; MAX_TARGETS], len: usize, j: usize) -> usize {
+    let mut row = j;
+    for &at in &taken[..len] {
+        row += usize::from(row >= at);
+    }
+    // Entered by least and greatest: each position above the row moves up
+    // one place.
+    let mut held = row;
+    for at in &mut taken[..len] {
+        let (least, greatest) = ((*at).min(held), (*at).max(held));
+        *at = least;
+        held = greatest;
+    }
+    taken[len] = held;
+    row
 }
 
 /// The picker of a profile that leaves the placement to its binding's
@@ -5421,6 +5421,43 @@ mod tests {
                 let written = picked(picker, &own, &pool, &flat);
                 let read = picked(picker, &beside, &bare, &flat);
                 assert_eq!(written, read, "{} at seed {seed}", picker.name());
+            }
+        }
+    }
+
+    /// Random's pick and its draw name the row the loops they replace
+    /// named: the j-th position not taken yet, found by stepping over the
+    /// positions taken, which stand ascending behind each step. Every
+    /// pool size the whole pass and the draw meet, over many seeds.
+    #[test]
+    fn a_random_draw_steps_over_the_positions_taken_as_the_loop_did() {
+        for n in 1..=40usize {
+            for seed in 0..400u64 {
+                let mut draw = Draw::new(seed);
+                let mut taken = [usize::MAX; MAX_TARGETS];
+                let mut looped = [usize::MAX; MAX_TARGETS];
+                for slot in 0..MAX_TARGETS.min(n) {
+                    let j = draw.below(n - slot);
+                    let stepped = step_over(&mut taken, slot, j);
+                    // The loop as it stood: the j-th position not taken.
+                    let (mut seen, mut chosen) = (0usize, 0usize);
+                    for i in 0..n {
+                        if looped[..slot].contains(&i) {
+                            continue;
+                        }
+                        if seen == j {
+                            chosen = i;
+                            break;
+                        }
+                        seen += 1;
+                    }
+                    looped[slot] = chosen;
+                    assert_eq!(stepped, chosen, "{n} rows, seed {seed}, slot {slot}");
+                    assert!(taken[..=slot].is_sorted(), "{n} rows, seed {seed}");
+                    let mut ascending = looped;
+                    ascending[..=slot].sort_unstable();
+                    assert_eq!(taken, ascending, "{n} rows, seed {seed}");
+                }
             }
         }
     }
