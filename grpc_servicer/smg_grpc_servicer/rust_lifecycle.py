@@ -335,10 +335,21 @@ def check_metrics_port_needs_rust(
     )
 
 
-def free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
+FREE_PORT_ATTEMPTS = 64
+
+
+def free_port(exclude: Iterable[int | None] = ()) -> int:
+    """An unused loopback TCP port that is none of ``exclude`` (ports about to be bound)."""
+    excluded = {port for port in exclude if port}
+    for _ in range(FREE_PORT_ATTEMPTS):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = int(sock.getsockname()[1])
+        if port not in excluded:
+            return port
+    raise OSError(
+        f"no free loopback port outside {sorted(excluded)} after {FREE_PORT_ATTEMPTS} draws"
+    )
 
 
 def default_socket_dir(environ: Mapping[str, str] | None = None) -> str:
@@ -1685,11 +1696,20 @@ class RustLauncher:
                 knob=self.warmup_env,
                 nonce=warmup_nonce,
             )
-        handshake_port = knobs.handshake_port or free_port()
         # The metrics endpoint, resolved and checked before the port is
         # bound and the engine starts (a clash with the gRPC port is refused
         # here, not by a bind after the engine loaded).
         metrics_bind_address = self.metrics_bind_address(args)
+        # The gRPC and metrics ports are not bound yet, so the kernel may hand them out.
+        # The metrics port is read off the resolved address, not the flag: a
+        # launcher may resolve its own (TokenSpeed's `--metrics-port` is the
+        # engine's, and its servicer's comes from the variable).
+        handshake_port = knobs.handshake_port or free_port(
+            exclude=(
+                int(getattr(args, "port", 0) or 0),
+                int(metrics_bind_address.rpartition(":")[2]) if metrics_bind_address else None,
+            )
+        )
         server = getattr(servicer, self.server_class)(
             bind_address=self.bind_address(args),
             # Per process, not per requested port: `--port 0` launchers would
