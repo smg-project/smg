@@ -384,6 +384,9 @@ def ids(args):
         command += [str(args.models / family), str(corpus), str(out), "--no-inc"]
         done = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         status[column] = done.returncode
+        # The cell makes its file once the column has loaded the family.
+        if out.exists():
+            written.add(column)
         found = {}
         try:
             for record in records(out):
@@ -400,7 +403,7 @@ def ids(args):
 
     for family in families_of(args):
         columns = columns_of(args, family)
-        digests, status = {}, {}
+        digests, status, written = {}, {}, set()
         # The columns of a family side by side: no time is read here.
         with tempfile.TemporaryDirectory(dir=args.output) as scratch:
             workers = [
@@ -416,8 +419,9 @@ def ids(args):
         parts = [f"{family}: {len(ours)} strings, smg failed on {failed}"]
         for column in columns[1:]:
             theirs = digests[column]
-            if not theirs:
-                # The column has no file of this family to load: no string of it is counted.
+            if column not in written:
+                # A column that cannot load the family ends before its cell makes the file: no
+                # string of it is counted. A file without a record is compared as any other.
                 parts.append(f"{column} did not load")
                 continue
             same = sum(1 for index, value in ours.items() if theirs.get(index) == value)
@@ -430,12 +434,12 @@ def ids(args):
         if ended:
             parts.append("exit status not 0: " + ", ".join(ended))
         # A file without a whole record for every string is named whatever the exit status: a
-        # write that failed leaves it short, or cut off inside a line, and the cell still ends
-        # at status 0. A column that did not load has no record and is named above.
+        # write that failed leaves it short, cut off inside a line or empty, and the cell still
+        # ends at status 0. A column that did not load made no file and is named above.
         short = [
             f"{column} {len(digests[column])} of {strings}"
             for column in columns
-            if len(digests[column]) != strings and (digests[column] or column == "smg")
+            if len(digests[column]) != strings and (column in written or column == "smg")
         ]
         if short:
             parts.append("incomplete output: " + ", ".join(short))

@@ -89,12 +89,43 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("incomplete output: fastokens 1 of 3", line)
         self.assertNotIn("exit status", line)
 
+    def test_an_empty_file_is_named_at_exit_status_0(self):
+        # Every write failed, the first one too: the column loaded, and its file holds no string.
+        self.parity("smg", WHOLE)
+        self.parity("fastokens", "")
+        line = self.summary()
+        self.assertIn("smg failed on 0; fastokens 0 of 3", line)
+        self.assertIn("incomplete output: fastokens 0 of 3", line)
+        self.assertNotIn("did not load", line)
+        self.assertNotIn("exit status", line)
+        # The strings of a column that loaded stand in the total of the run.
+        total = (self.args.output / "ids-summary.txt").read_text().splitlines()[-1]
+        self.assertEqual(total, "TOTAL SAME: fastokens 0 of 3")
+
+    def test_a_file_cut_off_inside_its_first_line_is_named_at_exit_status_0(self):
+        self.parity("smg", WHOLE)
+        self.parity("fastokens", WHOLE[:9])
+        line = self.summary()
+        self.assertIn("smg failed on 0; fastokens 0 of 3", line)
+        self.assertIn("incomplete output: fastokens 0 of 3", line)
+        self.assertNotIn("did not load", line)
+        self.assertNotIn("exit status", line)
+
     def test_a_non_zero_exit_status_is_named_beside_the_short_file(self):
         self.parity("smg", WHOLE)
         self.parity("fastokens", record(0, [1, 2]) + '{"i": 1, "ids": [3', status=7)
         line = self.summary()
         self.assertIn("exit status not 0: fastokens 7", line)
         self.assertIn("incomplete output: fastokens 1 of 3", line)
+
+    def test_a_non_zero_exit_status_is_named_beside_the_empty_file(self):
+        # A process that died before its first write had loaded: its file is there.
+        self.parity("smg", WHOLE)
+        self.parity("fastokens", "", status=7)
+        line = self.summary()
+        self.assertIn("exit status not 0: fastokens 7", line)
+        self.assertIn("incomplete output: fastokens 0 of 3", line)
+        self.assertNotIn("did not load", line)
 
     def test_a_column_that_did_not_load_is_not_named_as_incomplete(self):
         self.parity("smg", WHOLE)
@@ -103,6 +134,15 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("fastokens did not load", line)
         self.assertIn("exit status not 0: fastokens 1", line)
         self.assertNotIn("incomplete output", line)
+
+    def test_a_column_without_a_file_reads_did_not_load_at_exit_status_0(self):
+        # The cell makes its file once the column has loaded: without one, no string is counted.
+        self.parity("smg", WHOLE)
+        self.column("fastokens", "exit 0\n")
+        line = self.summary()
+        self.assertIn("fastokens did not load", line)
+        self.assertNotIn("incomplete output", line)
+        self.assertNotIn("exit status", line)
 
     def test_a_cell_that_ran_into_the_timeout_keeps_its_stderr(self):
         # A thread that panicked before a barrier leaves its cell waiting until the timeout.
