@@ -50,6 +50,12 @@ pub struct Lease {
     /// Which target of the pick this lease books (a reservation on a pair
     /// side names its own).
     pub target_index: u8,
+    /// The worker the lease books at its issue, as the host that issues it
+    /// names it; `WorkerId(0)` where the host names none. A stage that
+    /// books at the issue reads it at the dispatch
+    /// ([`Lifecycle::on_dispatched`]), where `target_index` names the
+    /// target the dispatch took. In-process only: no contract carries it.
+    pub booked: WorkerId,
     pub generation: u64,
     /// The request's session ([`crate::RequestFacts::session`]: its key
     /// within its model and phase), which the host fills for every keyed
@@ -272,7 +278,9 @@ pub trait Lifecycle: Send + Sync {
     /// `side`, `since_decision_micros` after the decision on the host's clock
     /// (the wire's own field): a credit dates from the dispatch, not from a
     /// decision a queue may have held. The untaken targets are released by
-    /// the host's commit.
+    /// the host's commit. The lease told names the target the dispatch
+    /// took: its `target_index` is that target's index in the pick, and its
+    /// [`Lease::booked`] is still the worker its issue booked.
     fn on_dispatched(
         &self,
         _lease: &Lease,
