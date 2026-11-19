@@ -10,12 +10,13 @@ use std::{
 use super::{
     identity, identity_of,
     leases::{Counts, Slot},
-    Ask, AtWork, BatchFacts, BatchOutcome, ContentHash, DecodeSide, Dispatch, GatewayId, Hand,
-    HealthSink, Journal, Kinds, KvEvent, KvEventSink, LeaseRecord, LeaseRefused, LeaseState,
-    LeasesStore, LoadSample, LoadSink, LoadSource, MembershipChange, MembershipTail, MemoryStore,
-    Picked, Pin, PollMode, Position, Reachability, ReservationKind, ReservationStore, ResyncReason,
-    Said, SequenceHash, SessionsStore, Sides, Signals, SnapshotChunk, StoredBlock, VetoWrite,
-    ViewBuffers, Watch, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore, World,
+    Ask, AtWork, BatchFacts, BatchOutcome, ContentHash, DecodeMark, DecodeSide, Dispatch,
+    GatewayId, Hand, HealthSink, Journal, Kinds, KvEvent, KvEventSink, LeaseRecord, LeaseRefused,
+    LeaseState, LeasesStore, LoadSample, LoadSink, LoadSource, MembershipChange, MembershipTail,
+    MemoryStore, Picked, Pin, PollMode, Position, Reachability, ReservationKind, ReservationStore,
+    ResyncReason, Said, SequenceHash, SessionsStore, Sides, Signals, SnapshotChunk, StoredBlock,
+    VetoWrite, ViewBuffers, Watch, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
+    World,
 };
 use crate::{
     decider::Decider,
@@ -3302,9 +3303,10 @@ fn a_dispatch_on_another_rank_of_the_leases_worker_moves_the_index_alone() {
 }
 
 /// The file's records and its places of decode sides stand and fall
-/// together: after every door of the leases a decode side is on file for
-/// each record that carries the mark of a pair's lease and for no other,
-/// and both agree with the walk's own plain map of what it filed.
+/// together: at every check of a walk over the leases' doors a decode
+/// side is on file for each record that carries the mark of a pair's
+/// lease and for no other, and both agree with the walk's own plain map
+/// of what it filed.
 #[test]
 fn a_decode_side_is_on_file_for_each_record_that_carries_the_mark_and_for_no_other() {
     let store = MemoryStore::new();
@@ -3336,7 +3338,7 @@ fn a_decode_side_is_on_file_for_each_record_that_carries_the_mark_and_for_no_oth
     issue_pair(leases, pair(2, p, &[d0], now)).expect("free");
     issue_pair(leases, pair(3, p, &[d0, d1], now)).expect("free");
     let alone = LeaseRecord {
-        decode: Some(d0),
+        decode: Some(DecodeMark),
         ..booking(gateway, 4, p, now)
     };
     leases.issue(alone).expect("free");
@@ -3348,7 +3350,7 @@ fn a_decode_side_is_on_file_for_each_record_that_carries_the_mark_and_for_no_oth
     );
     assert_eq!(
         leases.get(gateway, LeaseId(2)).expect("on file").decode,
-        Some(d0)
+        Some(DecodeMark)
     );
     // A side's dispatch and a side's end leave both tables as they stand;
     // the last side's end takes both.

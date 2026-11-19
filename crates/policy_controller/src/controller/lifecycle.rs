@@ -29,8 +29,9 @@
 //! completion or its release. A generation that no longer stands is told
 //! nothing: the stages of a later one never saw the issue.
 //!
-//! A pair's lease is one record under one id with a part a side, and a
-//! frame moves the side it names: the engine is told of that side alone,
+//! A pair's lease stands under one id: its record is the prefill side,
+//! and its decode side is filed beside the record. A frame moves the
+//! side it names: the engine is told of that side alone,
 //! with that side's lease and on that side's worker, and a `Released`
 //! that names no side tells every side that stood. A frame on a side the
 //! pair's lease does not hold, or on a side that ended, writes nothing
@@ -503,9 +504,9 @@ pub(crate) mod tests {
         assert_eq!(heard.lock()[1..], [("released", 1, WorkerId(0))]);
     }
 
-    /// A pair's lease is one record with a part a side: the engine is told
-    /// of each side once, by that side's own frame and on that side's
-    /// worker.
+    /// A pair's lease is a record with a decode side beside it: the engine
+    /// is told of each side once, by that side's own frame and on that
+    /// side's worker.
     #[test]
     fn a_pairs_frames_tell_the_engine_once_a_side_on_that_sides_worker() {
         let store = MemoryStore::new();

@@ -26,8 +26,8 @@ use crate::{
         journal::{Journal, Kinds, Position},
         kv_events::{BatchFacts, BatchOutcome, KvCursor, KvEventSink, ResyncReason},
         leases::{
-            Counts, DecodeSide, Dispatch, LeaseRecord, LeaseRefused, LeaseState, LeasesStore, Said,
-            Sides, Slot,
+            Counts, DecodeMark, DecodeSide, Dispatch, LeaseRecord, LeaseRefused, LeaseState,
+            LeasesStore, Said, Sides, Slot,
         },
         loads::{LoadSample, LoadSink, LoadSource, PollMode, Wake},
         reservations::{ReservationKind, ReservationStore},
@@ -3350,12 +3350,12 @@ impl Leases {
 }
 
 /// Marks `record` as a door files it, in place, and gives the slot it
-/// books: with `pair` the record takes the mark of a pair's lease from
-/// its decode side's worker, and a prefill side that ended books none; a
+/// books: with `pair` the record takes the mark of a pair's lease, and a
+/// prefill side that ended books none; a
 /// record alone is a single's and carries no mark. In place: the record
 /// is not copied on its way to the file.
 fn marked(record: &mut LeaseRecord, booked: Option<Slot>, pair: &Paired) -> Option<Slot> {
-    record.decode = pair.as_ref().map(|(side, _)| side.target);
+    record.decode = pair.as_ref().map(|_| DecodeMark);
     booked.filter(|_| pair.is_none() || record.state.is_live())
 }
 
@@ -3454,7 +3454,6 @@ impl MemoryStore {
     /// # Errors
     ///
     /// Those of [`Self::issue_decided`].
-    #[cfg(any(test, feature = "controller"))]
     pub(crate) fn issue_decided_pair(
         &self,
         record: LeaseRecord,

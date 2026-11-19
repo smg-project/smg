@@ -94,7 +94,8 @@ pub use kv_events::{
     SnapshotChunk,
 };
 pub use leases::{
-    DecodeSide, Dispatch, LeaseRecord, LeaseRefused, LeaseState, LeasesStore, Picked, Said, Sides,
+    DecodeMark, DecodeSide, Dispatch, LeaseRecord, LeaseRefused, LeaseState, LeasesStore, Picked,
+    Said, Sides,
 };
 pub use loads::{LoadSample, LoadSink, LoadSource, PollMode};
 pub use membership::{Laid, NotMaker};

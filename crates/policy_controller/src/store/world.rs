@@ -246,7 +246,6 @@ impl PairBuffers {
     /// Both sides' views, the prefill's first: what a request's own
     /// gateway states of itself is taken from each ahead of the engine's
     /// pair entry.
-    #[cfg(feature = "controller")]
     pub(crate) fn sides_mut(&mut self) -> [&mut ViewBuffers; 2] {
         [&mut self.prefill, &mut self.decode]
     }
