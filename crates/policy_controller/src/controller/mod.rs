@@ -59,7 +59,7 @@ mod standby;
 pub mod tls;
 mod watch_workers;
 mod wire;
-mod worker_wire;
+pub(crate) mod worker_wire;
 
 use std::{
     convert::Infallible, future::Future, io, net::SocketAddr, path::PathBuf, pin::pin, sync::Arc,
