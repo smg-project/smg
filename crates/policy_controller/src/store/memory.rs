@@ -1254,13 +1254,13 @@ impl Workers {
     }
 
     /// What a health write says where [`Self::guarded`] gave no row: stale
-    /// where a row stands under another revision, gone where none stands.
+    /// where a row stands under another revision, no row where none stands.
     /// Either way the write was judged against nothing.
     fn unjudged(&self, id: WorkerId) -> HealthWrite {
         if self.rows.contains_key(&id) {
             HealthWrite::Stale
         } else {
-            HealthWrite::Gone
+            HealthWrite::NoRow
         }
     }
 }
@@ -1732,11 +1732,15 @@ impl HealthSink for MemoryStore {
         let Some(to) = next_status(row, ok) else {
             return HealthWrite::Stood(from);
         };
+        // The table refuses a status write for an absent row or for the
+        // status that stands. The row stands under this lock and the
+        // machine never names the status it stands in, so no write reaches
+        // this arm; it answers what stands.
         if workers.set_status(id, to).is_none() {
             return HealthWrite::Stood(from);
         }
         self.show_status(id, to);
-        HealthWrite::Moved(from, to)
+        HealthWrite::Moved { from, to }
     }
 
     fn connected(&self, id: WorkerId, revision: u64) -> HealthWrite {
@@ -1749,11 +1753,16 @@ impl HealthSink for MemoryStore {
             return HealthWrite::Stood(from);
         }
         row.probes = Probes::default();
+        // No write reaches this arm either, as at a probe's outcome: the
+        // row stands under this lock, and it is not ready.
         if workers.set_status(id, WorkerStatus::Ready).is_none() {
             return HealthWrite::Stood(from);
         }
         self.show_status(id, WorkerStatus::Ready);
-        HealthWrite::Moved(from, WorkerStatus::Ready)
+        HealthWrite::Moved {
+            from,
+            to: WorkerStatus::Ready,
+        }
     }
 
     fn gateway_veto(&self, gateway: GatewayId, id: WorkerId, until: Option<Instant>) {
