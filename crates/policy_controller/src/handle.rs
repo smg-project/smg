@@ -65,6 +65,7 @@ use std::{
 use crate::{
     decision::{Decision, Target},
     door::{self, Decided, Door, Leased, Refused, Request},
+    framework::{EncodeItems, EncodePlaced},
     lease::{LeaseId, Outcome, ReleaseReason, Side, TransportClass},
     store::{Dispatch, GatewayId, Said},
     view::WorkerId,
@@ -134,6 +135,29 @@ impl<D: Deref<Target = Door>> Handle<D> {
         now: Instant,
     ) -> Result<Self, Refused> {
         let decided = door.decide(gateway, request, now)?;
+        Ok(Self::hold(door, gateway, decided, now))
+    }
+
+    /// Holds the decision made with the request's encode items
+    /// ([`Door::decide_encode_pair`]). For a pair, the handle reports
+    /// the prefill and decode.
+    ///
+    /// # Errors
+    ///
+    /// [`Refused`]: the door made no decision for the request.
+    pub fn decide_encode_pair(
+        door: D,
+        gateway: GatewayId,
+        request: &Request<'_>,
+        items: EncodeItems<'_>,
+        placed: &mut EncodePlaced,
+        now: Instant,
+    ) -> Result<Self, Refused> {
+        let decided = door.decide_encode_pair(gateway, request, items, placed, now)?;
+        Ok(Self::hold(door, gateway, decided, now))
+    }
+
+    fn hold(door: D, gateway: GatewayId, decided: Decided, now: Instant) -> Self {
         let first = decided
             .decision
             .pick()
@@ -157,7 +181,7 @@ impl<D: Deref<Target = Door>> Handle<D> {
         } else {
             Owed::Nothing
         };
-        Ok(Self {
+        Self {
             door,
             gateway,
             decided,
@@ -165,7 +189,7 @@ impl<D: Deref<Target = Door>> Handle<D> {
             target,
             owed,
             decode,
-        })
+        }
     }
 
     /// The engine's decision.
@@ -433,15 +457,15 @@ mod tests {
         decision::{Decision, Target, Targets},
         door::{
             tests::{
-                counted, fleet, held as deciding, pair_counts, pair_fleet, picking, request, Ends,
-                GATEWAY, PATIENCE,
+                counted, fleet, held as deciding, pair_counts, pair_fleet, pair_request, picking,
+                push_fleet, request, Ends, GATEWAY, PATIENCE,
             },
             Door, Refused,
         },
-        framework::{Picker, TieBand},
+        framework::{EncodeItems, EncodePlaced, Picker, TieBand},
         lease::{Lease, LeaseId, Lifecycle, Outcome, ReleaseReason, Side, TransportClass},
         store::{Dispatch, HealthSink, LeaseState, LeasesStore, MemoryStore, Said, WorkersStore},
-        view::{Candidate, Phase, RequestFacts, WorkerId},
+        view::{Candidate, Identity, RequestFacts, WorkerId},
     };
 
     /// What a stage heard of a lease.
@@ -956,14 +980,54 @@ mod tests {
     }
 
     fn paired(door: &Door, now: Instant) -> Result<Handle<&Door>, Refused> {
-        let mut asked = request(b"pair", 7);
-        asked.facts.phase = Phase::Prefill;
-        Handle::decide(door, GATEWAY, &asked, now)
+        Handle::decide(door, GATEWAY, &pair_request(b"pair"), now)
     }
 
     fn states(store: &MemoryStore, lease: LeaseId) -> Option<[LeaseState; 2]> {
         let filed = store.sides(GATEWAY, lease)?;
         Some([filed.record.state, filed.decode?.state])
+    }
+
+    #[test]
+    fn a_handle_of_an_encode_pair_holds_the_pairs_two_sides() -> Result<(), Box<dyn Error>> {
+        let (door, encoder) = push_fleet()?;
+        let store = door.store();
+        let now = Instant::now();
+        let items = EncodeItems {
+            keys: &[Identity::hashed(11)],
+            ..EncodeItems::default()
+        };
+        let mut placed = EncodePlaced::new();
+        let mut handle = Handle::decide_encode_pair(
+            &door,
+            GATEWAY,
+            &pair_request(b"pair"),
+            items,
+            &mut placed,
+            now,
+        )
+        .expect("a decision");
+        let lease = handle.lease().expect("the prefill's lease");
+        let id = lease.lease.id;
+        assert_eq!(lease.lease.side, Side::Prefill);
+        let target = handle.take(0).expect("the first pair");
+        let decode = target.pair.expect("the decode's target");
+        assert_eq!(placed.encoders().len(), 1);
+        assert_eq!(
+            placed.encoders().first().map(|target| target.id),
+            Some(encoder)
+        );
+        assert_eq!(states(store, id), Some([LeaseState::ISSUED; 2]));
+        handle.dispatched_decode(now);
+        assert_eq!(
+            states(store, id),
+            Some([LeaseState::ISSUED, LeaseState::Dispatched { at: now }])
+        );
+        drop(handle);
+        assert!(store.sides(GATEWAY, id).is_none());
+        assert_eq!(pair_counts(store, [target.id, decode.decode_id]), [0, 0]);
+        assert_eq!(LeasesStore::live(&**store, GATEWAY), 0);
+        Ok(())
     }
 
     #[test]

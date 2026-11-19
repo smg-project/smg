@@ -373,9 +373,9 @@ A **plan** says how many workers one request needs.
 |---|---|---|
 | `single` (the default) | One worker. | `profile` |
 | `pd-pair` | A prefill worker, then a decode worker that can pair with it. | `profiles.prefill`, `profiles.decode` |
-| `epd` | An encode worker for each encode item, then the pair. | `profiles.encode`, `profiles.prefill`, `profiles.decode` |
+| `epd` | A prefill-decode pair and encoder placement for its items, chosen together. | `profiles.encode`, `profiles.prefill`, `profiles.decode` |
 
-The library decides all three plans. The stock controller and the in-process door decide a pair when asked at its prefill. A decode sent on its own under a pair plan and an encode sent on its own under `epd` have no decision at either door. See [what is not built yet](#what-is-not-built-yet).
+The library decides all three plans. A pair request is asked at its prefill. A decode sent on its own under a pair plan and an encode sent on its own under `epd` have no decision at either door. See [what is not built yet](#what-is-not-built-yet).
 
 A prefill and decode pair:
 
@@ -692,7 +692,7 @@ After a stream's end most repeats read `none`: the stream gave the lease up, or 
 
 - A client that marks a request as asked again. The controller serves the mark. The crate's own client does not set it yet.
 - A plan that waits for the prefill worker's answer before it picks the decode worker. `pd-pair` and `epd` pick every worker in one decision.
-- Encode placement through a door. The stock controller and the in-process door decide `pd-pair` and decide the prefill and decode of `epd`. Placing a worker for each encode item takes the library's `Engine::decide_encode_pair` entry.
+- Encode placement through a served controller. The in-process door places the encode items with `Door::decide_encode_pair`. The served controller decides an `epd` request as its pair alone because the wire carries no item.
 - A choice by the media a worker can process, outside `epd`. No built-in filter reads it.
 - A binding that matches on a tenant, a priority, a header, a prompt size or labels. The fields are in the schema. A document that writes one is refused as not in this build.
 - Shadow execution during request handling, shadow maps by side, and plugin stages in a shadow profile.
