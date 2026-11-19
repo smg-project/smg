@@ -871,9 +871,22 @@ impl SinceReport {
     /// loop: two loads and a compare a row, the release behind a call.
     #[inline(always)]
     fn credit_through(&self, sampled_at_micros: u64) -> (u64, u64) {
-        if self.oldest_micros.load(Ordering::Acquire) <= sampled_at_micros {
+        if self.reaches(sampled_at_micros) {
             self.release_through(sampled_at_micros);
         }
+        self.held_credit()
+    }
+
+    /// Whether the row holds a dispatch made at or before the sample: one
+    /// a report sampled then reflects, which its release takes.
+    #[inline(always)]
+    fn reaches(&self, sampled_at_micros: u64) -> bool {
+        self.oldest_micros.load(Ordering::Acquire) <= sampled_at_micros
+    }
+
+    /// The held token-work and requests, as the word stands.
+    #[inline(always)]
+    fn held_credit(&self) -> (u64, u64) {
         let held = self.held.load(Ordering::Relaxed);
         (held >> REQUEST_BITS, held & REQUEST_MASK)
     }
@@ -1865,10 +1878,10 @@ impl ResidentWork {
     /// call it read 19 instructions a row more for a host that lends no
     /// counts.
     ///
-    /// The release rides with its test, whichever view the row came in:
+    /// A release rides with its test, whichever view the row came in:
     /// under a later sample than the report whose number the stage keeps
     /// it may have taken dispatches that number counts, and the number is
-    /// sent back ([`ResidentWork::settle`]). One stage can be handed rows
+    /// sent back ([`ResidentWork::release`]). One stage can be handed rows
     /// beside a lent table and rows a host wrote.
     #[inline(always)]
     fn cost_reported(
@@ -1882,22 +1895,35 @@ impl ResidentWork {
         let Some(r) = report else {
             return PENDING;
         };
-        let since = tally.get(&(row.id, row.dp_rank));
-        let (tokens, requests) = since.map_or((0, 0), |since| {
-            since.credit_through(row.load_sampled_at_micros)
+        let (tokens, requests) = tally.get(&(row.id, row.dp_rank)).map_or((0, 0), |since| {
+            // Only a release that takes a dispatch can leave a kept
+            // number stale, so the test rides that release: a row that
+            // holds none at or before its sample reads the word alone.
+            if since.reaches(row.load_sampled_at_micros) {
+                self.release(since, row);
+            }
+            since.held_credit()
         });
-        let cost = if r.resident_counted {
+        if r.resident_counted {
             *reporting += 1;
             self.reported_cost(in_flight(), r, tokens, requests)
         } else {
             PENDING
-        };
-        // Behind the cost: in front of it the test's call held the row's
-        // parts live across it, at every row.
-        if let Some(since) = since.filter(|since| since.keeps_before(row.load_sampled_at_micros)) {
+        }
+    }
+
+    /// Releases the dispatches `row`'s report reflects, as a stage told
+    /// nothing does, and sends back a number kept of an earlier report:
+    /// the release may have taken dispatches that number counts
+    /// ([`ResidentWork::settle`]). Cold and out of line: a decision reads
+    /// a row far more often than a report releases from it.
+    #[cold]
+    #[inline(never)]
+    fn release(&self, since: &SinceReport, row: &Candidate) {
+        since.release_through(row.load_sampled_at_micros);
+        if since.keeps_before(row.load_sampled_at_micros) {
             self.settle(None, since, row, Slot::NONE);
         }
-        cost
     }
 }
 
