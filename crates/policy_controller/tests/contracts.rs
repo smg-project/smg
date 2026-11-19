@@ -27,8 +27,8 @@ use prost_types::{
 use smg_policy_controller::{
     fingerprint, spec::DENIED_HEADERS, AffinityFacts, Candidate, Constraints, HashKind, Health,
     Identity, Lease, LeaseKind, Lifted, LoadRow, MediaCounts, Membership, Outcome, OverloadRegime,
-    Pair, Phase, PoolFacts, Queue, ReleaseReason, RequestFacts, Role, Shed, ShedReason, Side,
-    Signal, SignalSource, Target, Trace, TransportClass, ZoneCapacity,
+    Pair, Phase, PolicySpec, PoolFacts, Queue, ReleaseReason, RequestFacts, Role, Shed, ShedReason,
+    Side, Signal, SignalSource, Target, Trace, TransportClass, ZoneCapacity,
 };
 use wit_parser::{InterfaceId, PackageId, Resolve, TypeDefKind, WorldId, WorldItem, WorldKey};
 
@@ -1180,6 +1180,41 @@ fn message<'a>(file: &'a FileDescriptorProto, name: &str) -> Option<&'a Descript
     file.message_type
         .iter()
         .find(|message| message.name() == name)
+}
+
+#[test]
+fn least_cost_term_names_match_the_plugin_contract_fields() {
+    let set = compile_protocol().expect("the protocol compiles");
+    let plugin = file(&set, PLUGIN_PROTO).expect("the plugin contract");
+    for (prefix, record, terms) in [
+        (
+            "load",
+            "LoadRow",
+            &[
+                "running",
+                "queued",
+                "waiting_uncached_tokens",
+                "kv_usage_permille",
+                "active_kv_permille",
+                "resident_tokens",
+            ][..],
+        ),
+        ("candidate", "Candidate", &["in_flight"][..]),
+    ] {
+        let record = message(plugin, record).expect("the term's record");
+        for field in terms {
+            assert!(
+                record.field.iter().any(|f| f.name() == *field),
+                "{prefix}.{field}"
+            );
+            let profile = serde_yaml::from_str(&format!(
+                "score: [{{least-cost: {{terms: {{{prefix}.{field}: 7}}, unreported: missing-as-zero}}}}]\npick: best"
+            )).expect("a profile with one term");
+            let spec = PolicySpec::new([("p".to_string(), profile)].into());
+            spec.validate()
+                .unwrap_or_else(|err| panic!("{prefix}.{field}: {err}"));
+        }
+    }
 }
 
 fn service<'a>(file: &'a FileDescriptorProto, name: &str) -> Option<&'a ServiceDescriptorProto> {

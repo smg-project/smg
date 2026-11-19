@@ -135,12 +135,13 @@ fn engine_of(preset: &str) -> Engine {
 }
 
 /// An engine of one profile that holds the built-in `name` and nothing a
-/// document can leave out: the stage by its name, or by its name and the one
-/// parameter the spec has no default for. A built-in that gains such a
+/// document can leave out: the stage by its name, or by its name and the
+/// parameters the spec has no default for. A built-in that gains such a
 /// parameter is refused here by its path, and takes its line.
 fn alone(kind: &str, name: &str) -> Result<Engine, SpecError> {
     let stage = match name {
         "resident-work" => r#"{"resident-work":{"request_tokens":2048}}"#.to_string(),
+        "least-cost" => r#"{"least-cost":{"terms":{"load.queued":7},"unreported":{"over-least":{"request_cost":23}}}}"#.to_string(),
         "best-with-temperature" => r#"{"best-with-temperature":{"temperature":0.5}}"#.to_string(),
         name => format!(r#""{name}""#),
     };
@@ -282,8 +283,8 @@ fn a_decision_over_lent_rows_answers_as_the_one_over_written_rows() {
 
 #[test]
 fn each_built_in_alone_answers_over_lent_rows_as_over_written_rows() {
-    // The catalog's own lists: a built-in added to the build is held here
-    // with no line of this case moved. Each stands alone in a profile,
+    // The catalog's own lists give one profile per built-in.
+    // Each stands alone in a profile,
     // under a standing veto, a pin and reports of different ages. A
     // built-in that read the stalled bit, the session bit or the report's
     // age off the row, and not what stands beside a lent row, would answer

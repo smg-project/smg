@@ -114,7 +114,16 @@ Every scorer takes `weight`, 1 by default. The table lists the other settings, e
 | `bucket` | For a prefill decision, the worker that owns the range of prompt sizes the request falls in. | `abs_threshold` (64), `rel_threshold` (1.5), `adjust_interval_s` (5) |
 | `consistent-hash` | The owner of the request's key on a hash ring, then the ring's next workers. | `prefix_tokens` (unset), `bounded_load` (unset; written, its `factor` is 1.25 and its `abs_margin` 10) |
 | `resident-work` | The least work in residence: the context tokens a worker holds, plus `request_tokens` for each request it holds. | `request_tokens` (required) |
+| `least-cost` | Workers within the cost margin of the least weighted sum of the named fields. | `terms` (required), `margin` (zero), `unreported` (required when a term reads a report) |
 <!-- scorers: end -->
+
+`least-cost` adds each named value times its coefficient in the document's units. It reads `candidate.in_flight` from the host and `load.running`, `load.queued`, `load.waiting_uncached_tokens`, `load.kv_usage_permille`, `load.active_kv_permille`, and `load.resident_tokens` from the report. Resident tokens are present only when the report counts them. Waiting tokens are missing when they read zero beside a queue: a report of a queue's depth alone carries no token count.
+
+For example, `terms: { load.queued: 11, candidate.in_flight: 2.5 }` adds 11 for each queued request and 2.5 for each request in flight.
+
+With `unreported: { over-least: { request_cost: 13 } }`, a row missing a named value costs 13 per request in flight above the least reported cost, or above zero if no row reports. `unreported: missing-as-zero` sums the available named values. The absolute margin and the relative share of the magnitude of the least cost add together. Each row within that margin scores 1. With this scorer alone, `best` draws from those rows before the others.
+
+Coefficients can be positive or negative and must be nonzero. Numeric settings are finite. The weight, coefficient magnitudes, absolute margin, and request cost are at most `1e15`, and the relative margin is at most `1e6`. Both margin parts and the request cost are nonnegative.
 
 ### Pickers
 
