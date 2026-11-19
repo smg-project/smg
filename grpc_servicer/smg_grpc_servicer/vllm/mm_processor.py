@@ -49,6 +49,7 @@ from smg_grpc_servicer.mm_sidecar_protocol import (
 from smg_grpc_servicer.vllm import config_view
 from smg_grpc_servicer.vllm.media_host_guard import (
     MediaHostRefused,
+    MediaRedirectRefused,
     media_connector_kwargs,
     raised_by_fetch,
 )
@@ -485,14 +486,16 @@ class InProcessMediaProcessor:
     def _client_media_code(self, exc: BaseException) -> str:
         """The public code for the caller's error `exc`, by where the fetcher
         raised it, as the router names the same failure: a download the origin
-        refused (a 4xx) is `media_fetch_failed`, and one over the download
-        size cap `media_too_large`; a host the
-        policy refuses, and anything raised before the download (a URL, a
-        domain or a data URL refused as sent) or while decoding the bytes it
-        delivered (an image that does not decode, bad base64), is
-        `invalid_multimodal_request`. vLLM wraps a download's error before
-        it gets here, so the whole chain is read."""
+        refused (a 4xx) or redirected to a host the policy refuses is
+        `media_fetch_failed`, and one over the download size cap
+        `media_too_large`; a named host the policy refuses, and anything
+        raised before the download (a URL, a domain or a data URL refused as
+        sent) or while decoding the bytes it delivered (an image that does
+        not decode, bad base64), is `invalid_multimodal_request`. vLLM wraps
+        a download's error before it gets here, so the whole chain is read."""
         chain = list(_raised_from(exc))
+        if any(isinstance(e, MediaRedirectRefused) for e in chain):
+            return MEDIA_FETCH_FAILED
         if any(isinstance(e, MediaHostRefused) for e in chain):
             return INVALID_MULTIMODAL_REQUEST
         if any(isinstance(e, self._download_too_large) for e in chain):

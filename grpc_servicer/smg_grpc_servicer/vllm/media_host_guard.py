@@ -28,8 +28,10 @@ an HTTP connection whose session:
   unchecked. A hop sent directly is resolved and pinned as above.
 
 A refusal is a :class:`MediaHostRefused` (a ``ValueError``): the request's
-media, terminal, answered as ``invalid_multimodal_request``, as the router
-answers a host its policy refuses.
+media, terminal. A refusal of the URL the request named is answered as
+``invalid_multimodal_request``; one of a redirect target, a
+:class:`MediaRedirectRefused`, as ``media_fetch_failed``, as the router
+answers a redirect its policy refuses.
 """
 
 from __future__ import annotations
@@ -50,6 +52,13 @@ IpAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
 
 class MediaHostRefused(ValueError):
     """A media URL's host the policy refuses: the caller's, never retried."""
+
+
+class MediaRedirectRefused(MediaHostRefused):
+    """A redirect target the policy refuses: the URL the request named was
+    admitted and its origin sent the fetch somewhere the worker does not go,
+    a fetch that failed (as the router answers a redirect its policy
+    refuses), not a reference refused as the request sent it."""
 
 
 # Set on whatever the guarded connection's download raised (a hop refused, an
@@ -303,6 +312,15 @@ _HOP_PROXY_HOST: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 )
 
 
+# Whether the hop being sent is a redirect target rather than the URL the
+# request named: cleared when a request starts and set when it follows a
+# redirect (aiohttp's trace signals, sent in the request's own context around
+# each hop), so the middleware and the resolver of that hop read it.
+_HOP_IS_REDIRECT: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "media_hop_is_redirect", default=False
+)
+
+
 def _same_host(a: str, b: str) -> bool:
     return a.rstrip(".").lower() == b.rstrip(".").lower()
 
@@ -346,19 +364,37 @@ def guarded_session(policy: MediaHostPolicy):
         # (from Location or URI, joined as it joins them) and `req.proxy` the
         # proxy it chose for that URL, NO_PROXY applied.
         proxy = req.proxy
-        await policy.check_hop(req.url, resolve=proxy is not None)
-        token = _HOP_PROXY_HOST.set(proxy.raw_host if proxy is not None else None)
         try:
-            return await handler(req)
-        finally:
-            _HOP_PROXY_HOST.reset(token)
+            await policy.check_hop(req.url, resolve=proxy is not None)
+            token = _HOP_PROXY_HOST.set(proxy.raw_host if proxy is not None else None)
+            try:
+                return await handler(req)
+            finally:
+                _HOP_PROXY_HOST.reset(token)
+        except MediaHostRefused as e:
+            # Refused here or by the resolver as this hop connects.
+            if not _HOP_IS_REDIRECT.get() or isinstance(e, MediaRedirectRefused):
+                raise
+            raise MediaRedirectRefused(f"redirect refused: {e}") from e
+
+    async def request_started(session, ctx, params) -> None:
+        _HOP_IS_REDIRECT.set(False)
+
+    async def redirected(session, ctx, params) -> None:
+        _HOP_IS_REDIRECT.set(True)
+
+    hops = aiohttp.TraceConfig()
+    hops.on_request_start.append(request_started)
+    hops.on_request_redirect.append(redirected)
 
     connector = None
     if not policy.allow_private_hosts:
         # No DNS cache: every connect resolves (and is checked) in the
         # request's own context, never from an answer another hop resolved.
         connector = aiohttp.TCPConnector(resolver=_resolver_class()(), use_dns_cache=False)
-    return aiohttp.ClientSession(trust_env=True, connector=connector, middlewares=(guard_hop,))
+    return aiohttp.ClientSession(
+        trust_env=True, connector=connector, middlewares=(guard_hop,), trace_configs=[hops]
+    )
 
 
 def guarded_connection(policy: MediaHostPolicy):

@@ -195,7 +195,8 @@ worker answers the same way for the media vLLM's own fetcher refuses under
 the download (a host the policy refuses, a URL or data URL the fetcher does
 not take) or bytes that do not decode (an image the loader cannot read, bad
 base64) is a 400 `invalid_multimodal_request`; a download the origin refuses
-(a 4xx) is a 400 `media_fetch_failed`; a download over vLLM's size cap or an
+(a 4xx) or redirects to a host the policy refuses is a 400
+`media_fetch_failed`; a download over vLLM's size cap or an
 inline payload over `--mm-max-item-bytes` is a 400 `media_too_large`. A
 timeout, a refused connection or an origin 5xx stays retryable there.
 

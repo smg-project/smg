@@ -957,7 +957,17 @@ class TestFetchErrorClassification:
             mm_processor.MediaHostRefused("media host '127.0.0.1' is a loopback address"),
             self._CallerError("Failed to fetch media from URL: Invalid URL"),
         )
-        assert self.code_of(refused, url="http://127.0.0.1/a.png") == ("invalid_multimodal_request")
+        assert self.code_of(refused, url="http://127.0.0.1/a.png") == "invalid_multimodal_request"
+
+    def test_a_redirect_the_policy_refuses_is_a_failed_fetch(self):
+        """The guard's refusal of a redirect target, wrapped by vLLM: the URL
+        the request named was fetched and its origin redirected somewhere the
+        worker does not go, which the router answers `media_fetch_failed`."""
+        refused = self.from_download(
+            mm_processor.MediaRedirectRefused("redirect refused: media host '10.0.0.1' is private"),
+            self._CallerError("Failed to fetch media from URL: Invalid URL"),
+        )
+        assert self.code_of(refused) == "media_fetch_failed"
 
     def test_a_reference_form_the_fetcher_does_not_take_is_the_callers_fault(self):
         """A data URL that is not base64: the fetcher refuses it as not

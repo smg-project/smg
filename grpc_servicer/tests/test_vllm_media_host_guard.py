@@ -138,8 +138,10 @@ def test_loopback_is_refused_by_name_by_literal_and_as_a_redirect_target():
                 f"http://127.0.0.1:{port}/media",
                 f"http://[::ffff:127.0.0.1]:{port}/media",
             ):
-                with pytest.raises(MediaHostRefused):
+                with pytest.raises(MediaHostRefused) as raised:
                     await _fetch(strict, url)
+                # The URL the request named: refused as sent, not a redirect.
+                assert type(raised.value) is MediaHostRefused
             assert state["hits"] == 0
 
             # A redirect hop is checked like the first: allowed by name, the
@@ -152,9 +154,13 @@ def test_loopback_is_refused_by_name_by_literal_and_as_a_redirect_target():
             )
             assert state["hits"] == 1
             only_listed = MediaHostPolicy(["localhost"], allow_private_hosts=True)
-            with pytest.raises(MediaHostRefused, match="allowed-media-domains"):
+            with pytest.raises(guard.MediaRedirectRefused, match="allowed-media-domains"):
                 await _fetch(only_listed, f"http://localhost:{port}/bounce?to={target}")
             assert state["hits"] == 1
+            # The next request in the same task starts at its own first hop.
+            with pytest.raises(MediaHostRefused) as raised:
+                await _fetch(only_listed, f"http://127.0.0.1:{port}/media")
+            assert type(raised.value) is MediaHostRefused
         finally:
             await runner.cleanup()
 
@@ -180,16 +186,16 @@ def test_a_redirect_to_a_non_public_literal_is_refused_before_it_is_sent(monkeyp
         strict = MediaHostPolicy(None, allow_private_hosts=False)
         try:
             target = f"http://127.0.0.1:{port}/media"
-            with pytest.raises(MediaHostRefused, match="loopback"):
+            with pytest.raises(guard.MediaRedirectRefused, match="loopback"):
                 await _fetch(strict, f"http://localhost:{port}/{bounce}?to={target}")
             assert state["hits"] == 0
             # Decimal spelling of 127.0.0.1, which aiohttp takes for a literal.
             numeric = f"http://2130706433:{port}/media"
-            with pytest.raises(MediaHostRefused, match="loopback"):
+            with pytest.raises(guard.MediaRedirectRefused, match="loopback"):
                 await _fetch(strict, f"http://localhost:{port}/{bounce}?to={numeric}")
             assert state["hits"] == 0
             listed = MediaHostPolicy(["localhost"], allow_private_hosts=True)
-            with pytest.raises(MediaHostRefused, match="allowed-media-domains"):
+            with pytest.raises(guard.MediaRedirectRefused, match="allowed-media-domains"):
                 await _fetch(listed, f"http://localhost:{port}/{bounce}?to={target}")
             assert state["hits"] == 0
             assert await _fetch(strict, f"http://localhost:{port}/media") == b"img"
@@ -278,6 +284,38 @@ def test_a_host_with_an_ipv6_zone_id_is_refused_whatever_the_policy(url, allow_p
             _hop(policy, url)
 
 
+def test_a_redirect_to_a_name_the_resolver_refuses_is_a_redirect_refusal(monkeypatch):
+    # The first hop's literal passes (as a public address would); its
+    # redirect names a host that resolves to loopback, which the resolver
+    # refuses as that hop connects: still the redirect's refusal.
+    real = guard.check_address
+
+    def check_address(host, address):
+        if host != "127.0.0.1":
+            real(host, address)
+
+    monkeypatch.setattr(guard, "check_address", check_address)
+
+    async def run():
+        state = {"hits": 0}
+        runner, port = await _serve(_routes(state))
+        strict = MediaHostPolicy(None, allow_private_hosts=False)
+        try:
+            target = f"http://localhost:{port}/media"
+            with pytest.raises(guard.MediaRedirectRefused, match="loopback"):
+                await _fetch(strict, f"http://127.0.0.1:{port}/bounce?to={target}")
+            assert state["hits"] == 0
+            # The same name as the URL the request named: refused as sent.
+            with pytest.raises(MediaHostRefused, match="loopback") as raised:
+                await _fetch(strict, target)
+            assert type(raised.value) is MediaHostRefused
+            assert state["hits"] == 0
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("allow_private", [False, True])
 @pytest.mark.parametrize("bounce", ["bounce", "bounce-uri"])
 def test_a_redirect_to_a_host_with_a_zone_id_is_refused(monkeypatch, allow_private, bounce):
@@ -297,10 +335,11 @@ def test_a_redirect_to_a_host_with_a_zone_id_is_refused(monkeypatch, allow_priva
         policy = MediaHostPolicy(None, allow_private_hosts=allow_private)
         try:
             for target in (f"http://[::1%25lo]:{port}/media", f"http://[fe80::1%25eth0]:{port}/x"):
-                with pytest.raises(MediaHostRefused, match="zone ID"):
+                with pytest.raises(guard.MediaRedirectRefused, match="zone ID"):
                     await _fetch(policy, f"http://localhost:{port}/{bounce}?to={target}")
-            with pytest.raises(MediaHostRefused, match="zone ID"):
+            with pytest.raises(MediaHostRefused, match="zone ID") as raised:
                 await _fetch(policy, f"http://[::1%25lo]:{port}/media")
+            assert type(raised.value) is MediaHostRefused
             assert state["hits"] == 0
         finally:
             await runner.cleanup()
