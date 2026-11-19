@@ -5,6 +5,7 @@ edition = "2021"
 description = "Worker wire types, settings and optional runtime for SMG"
 license = "Apache-2.0"
 repository = "https://github.com/smg-project/smg"
+readme = "README.md"
 keywords = ["smg", "llm", "gateway", "worker", "types"]
 categories = ["data-structures"]
 # The default-layer case walks the workspace's manifests, which a published

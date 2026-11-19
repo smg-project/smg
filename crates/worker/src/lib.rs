@@ -99,3 +99,9 @@ pub mod common_proto {
     )]
     include!(concat!(env!("OUT_DIR"), "/smg.grpc.common.rs"));
 }
+
+// The README's Rust blocks, run as doc tests. Its host blocks name the
+// runtime, so the page is read where the runtime is built.
+#[cfg(all(doctest, feature = "runtime"))]
+#[doc = include_str!("../README.md")]
+mod readme {}
