@@ -72,7 +72,8 @@
 //! A replica that follows a leader has one writer at this door, the log
 //! ([`Generations::following`]): it runs each generation its leader applied,
 //! under the leader's number, by this build's own pass over the leader's
-//! bytes, and its own file is looked at while it leads alone. A leader's
+//! bytes. Its own file is looked at all the while and shown to this door
+//! ([`Generations::shown`]), and applied only while it leads. A leader's
 //! stream is told a generation by this door ([`Generations::sent`]): the
 //! log holds the number, and the document crosses where it still stands.
 //!
@@ -94,8 +95,9 @@
 //! one the file's watch reads its file as a start does, though it never
 //! moved ([`Generations::takes`]), while the file's document has not stood
 //! on this replica since the file took it. The watch of a replica that
-//! follows shows the door what its file holds, by a digest, and applies
-//! nothing ([`Generations::shown`]): so the door knows a document that
+//! follows shows the door what its file holds, passed and by its digest
+//! and its own line, and applies nothing ([`Generations::shown`]): so the
+//! door knows a document that
 //! was applied here, or told by a leader, since the file took it. Such a
 //! file is a mount that lags: it is left for its next move, and brings
 //! nothing older back ([`Generations::source_stood`]).
@@ -2107,15 +2109,24 @@ impl Generations {
     /// The document is compared with the standing generation under the
     /// lock of the bytes held, which a generation enters under: the hand
     /// and an entry stand in one order, whichever thread runs first. The
-    /// pass runs ahead of that lock: it takes its time.
+    /// pass runs ahead of that lock: it takes its time. A document the
+    /// pass found standing stood, whichever generation stands under the
+    /// lock by then: one that entered under the pass replaced it.
+    ///
+    /// A file that does not run leaves one debug line here, at each state
+    /// of the file: no count and no warning, which are the take's.
     pub(crate) fn shown(&self, document: Option<&[u8]>, format: Format) {
         let passed = document.and_then(|document| {
             self.pass(self.standing(), document, format, Line::Claim)
+                .inspect_err(|rejected| {
+                    debug!(%rejected, "policy spec file does not run on a standby: its take tells it");
+                })
                 .ok()
         });
         let _entry = self.held.lock();
         let (number, standing) = self.standing();
         *self.handed.lock() = match passed {
+            Some(Checked { next: None, .. }) => Handed::Stood,
             Some(Checked { digest, line, .. })
                 if standing == Some(digest) && (line == 0 || line == number) =>
             {
