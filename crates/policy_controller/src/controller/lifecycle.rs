@@ -188,9 +188,11 @@ fn tell(store: &MemoryStore, world: &World, record: &LeaseRecord, said: Said) {
             // The table hears first and the pin of record reads it.
             // The stages hear last, so nothing is held across their
             // loop: a value kept for the pin behind it cost every
-            // lease a store and a reload a profile.
+            // lease a store and a reload a profile. A stage's call
+            // that unwinds there leaves the pin of record written,
+            // beside the table's entry.
             if let Some(engine) = engine {
-                engine.dispatched_key(&lease, &target, dispatch.side);
+                engine.dispatched_table(&lease, &target, dispatch.side);
             }
             pinned(store, record, engine, id, at);
             if let Some(engine) = engine {
