@@ -1031,10 +1031,16 @@ struct Slot {
     seat: Option<AtWork>,
 }
 
+/// The decider a door decides as at a store that names none: such a store
+/// has one file ([`MemoryStore::new`]).
+const UNNAMED: Decider = Decider::new(0);
+
 /// The door's word to the engine of a report applied to a lease
-/// ([`told`]). A stage's call that panics there is counted on the store
-/// for the host to read ([`MemoryStore::lifecycle_faults`]), and no line
-/// is written: a host in process writes its own.
+/// ([`told`]), under the name the lease's decision ran under: its file's
+/// decider, and [`UNNAMED`] at a store that names none. A stage's call
+/// that panics there is counted on the store for the host to read
+/// ([`MemoryStore::lifecycle_faults`]), and no line is written: a host in
+/// process writes its own.
 fn quiet(
     store: &MemoryStore,
     world: &World,
@@ -1042,13 +1048,17 @@ fn quiet(
     said: Said,
     by: Option<Decider>,
 ) {
-    told(store, world, record, said, by);
+    // A stage that keeps a decider's state hears a lease's events under
+    // the name it heard the issue under, whichever thread applies them.
+    told(store, world, record, said, Some(by.unwrap_or(UNNAMED)));
 }
 
 impl Door {
     /// A door over `store`, with a slot for each of its files. The store
     /// is given the door's word to the engine: whoever applies a report
-    /// to a lease tells the engine that issued it.
+    /// to a lease tells the engine that issued it. A store that names no
+    /// decider has one file: the door decides there, and tells what is
+    /// said of its leases, as decider 0.
     #[must_use]
     pub fn new(store: Arc<MemoryStore>) -> Self {
         let deciders = store.deciders();
@@ -1351,7 +1361,12 @@ mod tests {
     /// A store of `deciders` files under the `random` preset, with three
     /// ready members that serve [`MODEL`].
     fn fleet(deciders: usize) -> Arc<MemoryStore> {
-        let store = MemoryStore::new().with_deciders(deciders);
+        stocked(MemoryStore::new().with_deciders(deciders))
+    }
+
+    /// `store` under the `random` preset, with three ready members that
+    /// serve [`MODEL`].
+    fn stocked(store: MemoryStore) -> Arc<MemoryStore> {
         for name in ["w0", "w1", "w2"] {
             let key = format!("http://{name}:8000");
             let facts = WorkerFacts {
@@ -2139,5 +2154,31 @@ mod tests {
         let decided = door.decide(GATEWAY, &bounded, Instant::now());
         assert!(decided.is_ok_and(|decided| decided.lease.is_some()));
         assert_eq!(*told.lock(), [u32::MAX, 5_000]);
+    }
+
+    /// A store that names no decider has one file, and the door decides
+    /// for it as decider 0. The engine hears each report of a lease under
+    /// that name too, whichever thread applies it: a report's own thread,
+    /// or the pass of the door's clock.
+    #[test]
+    fn a_store_that_names_no_decider_hears_its_leases_as_decider_zero() {
+        let store = stocked(MemoryStore::new());
+        let heard = Heard::default();
+        let kept = Arc::clone(&heard);
+        picking(&store, 2, "hears", move || {
+            Box::new(Hears(Arc::clone(&kept)))
+        });
+        let door = Door::new(Arc::clone(&store));
+        let (first, served) = leased(&door, b"r-1", 7);
+        assert_eq!(report(&door, first, dispatched()), 1);
+        assert_eq!(report(&door, first, completed(served)), 0);
+        let decided = door.decide(GATEWAY, &request(b"r-2", 8), Instant::now());
+        let second = decided.expect("a decision").lease;
+        let due = second.expect("a pick's lease").due;
+        assert_eq!(door.sweep(due), Swept { leases: 1, pins: 0 });
+        let by = Some(Decider::new(0));
+        let calls = ["issued", "dispatched", "completed", "issued", "released"];
+        assert_eq!(*heard.lock(), calls.map(|call| (call, by)));
+        assert_eq!(store.lifecycle_faults(), 0);
     }
 }
