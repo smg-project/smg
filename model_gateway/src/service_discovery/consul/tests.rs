@@ -1,10 +1,9 @@
 use std::{collections::VecDeque, sync::Mutex};
 
 use smg_worker::test_support::RefusedAddress;
-use tokio::sync::watch;
 
 use super::*;
-use crate::service_discovery::testing::{create_test_app_context, live_app_context};
+use crate::service_discovery::testing::TestHost;
 
 const PASSING_2_0_4: &str = include_str!("../testdata/consul/health-passing-2.0.4.json");
 const PASSING_1_22_7: &str = include_str!("../testdata/consul/health-passing-1.22.7.json");
@@ -351,7 +350,7 @@ fn an_answer_consul_says_it_filtered_is_rejected() {
 async fn the_last_instance_leaves_a_default_deny_consul_read_with_no_token() {
     let config = config_in(Some(Roles::PrefillDecode));
     let client = config.client().unwrap();
-    let mut discovery = ConsulDiscovery::new(config, create_test_app_context(), client);
+    let mut discovery = ConsulDiscovery::new(config, TestHost::without_a_queue(), client);
     let deny = |mut answer: Answer| {
         answer.default_deny = true;
         answer
@@ -886,7 +885,7 @@ async fn the_index_follows_the_answers() {
     .await;
     let config = consul.config(Some(Roles::PrefillDecode));
     let client = config.client().unwrap();
-    let mut discovery = ConsulDiscovery::new(config, create_test_app_context(), client);
+    let mut discovery = ConsulDiscovery::new(config, TestHost::without_a_queue(), client);
 
     let mut seen = Vec::new();
     for _ in 0..7 {
@@ -927,7 +926,7 @@ async fn the_index_follows_the_answers() {
 async fn failures_back_off_and_an_answer_resets_the_backoff() {
     let config = config_in(Some(Roles::PrefillDecode));
     let client = config.client().unwrap();
-    let mut discovery = ConsulDiscovery::new(config, create_test_app_context(), client);
+    let mut discovery = ConsulDiscovery::new(config, TestHost::without_a_queue(), client);
     let failure = || {
         Err(ConsulError::Unreadable {
             reason: "connection refused".to_string(),
@@ -958,7 +957,8 @@ async fn ticks_never_restart_the_query_in_flight() {
         clippy::disallowed_methods,
         reason = "the loop under test is aborted at the end of the test"
     )]
-    let handle = task::spawn(ConsulDiscovery::new(config, create_test_app_context(), client).run());
+    let handle =
+        task::spawn(ConsulDiscovery::new(config, TestHost::without_a_queue(), client).run());
 
     // The first answer at once; the second query a gap later, held.
     time::sleep(Duration::from_millis(1500)).await;
@@ -977,61 +977,16 @@ async fn ticks_never_restart_the_query_in_flight() {
 
 // ---- A change that lands while the instance still registers. ----
 
-/// An engine for one instance of the scripted service: `/health`, held
-/// until the gate opens when the test passes one, then the metadata a
-/// registration reads; 404 elsewhere, as the metadata fallbacks expect.
-async fn fake_engine(held: Option<watch::Receiver<bool>>) -> (u16, task::JoinHandle<()>) {
-    use axum::{routing::get, Json, Router};
-    let app = Router::new()
-        .route(
-            "/health",
-            get(move || {
-                let held = held.clone();
-                async move {
-                    if let Some(mut held) = held {
-                        while !*held.borrow() {
-                            held.changed()
-                                .await
-                                .expect("the test keeps the gate until its end");
-                        }
-                    }
-                    Json(serde_json::json!({"status": "ok"}))
-                }
-            }),
-        )
-        .route(
-            "/model_info",
-            get(|| async { Json(serde_json::json!({"model_path": "m", "is_generation": true})) }),
-        )
-        .route(
-            "/server_info",
-            get(|| async { Json(serde_json::json!({"version": "test"})) }),
-        );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "the engine lives for the duration of the test"
-    )]
-    let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    (port, handle)
-}
-
-/// An instance Consul drops while the gateway is still registering it is
-/// not removed by the answer that drops it: that answer's pass finds no
-/// worker of the instance yet, and the registration lands afterwards.
-/// The next periodic pass removes it, and nothing before that does; the
-/// e2e keeps its pass on for this reason.
+/// An instance Consul drops while its host is still registering it is not
+/// removed by the answer that drops it: that answer's pass finds no worker
+/// of the instance yet, and the registration lands afterwards. The next
+/// periodic pass removes it, and nothing before that does; the e2e keeps
+/// its pass on for this reason.
 #[tokio::test]
 async fn an_instance_dropped_while_it_registers_is_removed_by_the_next_pass() {
-    let (a, _engine_a) = fake_engine(None).await;
-    // Its registration waits on this engine's health answer, which the
-    // test holds until Consul has dropped the instance. That is 2 s or
-    // more, as long as the classification probe waits, so the case leans
-    // on classify defaulting to Local and on connection detection's
-    // retried probe taking the answer.
-    let (answer, held) = watch::channel(false);
-    let (b, _engine_b) = fake_engine(Some(held)).await;
+    // The host's queue registers what it is handed and dials no worker, so
+    // nothing listens on either port.
+    let (a, b) = (18101, 18102);
     let instance = |node: &str, id: &str, port: u16, created: u64| {
         serde_json::json!({
             "Node": {"Node": node, "Address": "127.0.0.1", "Datacenter": "dc1"},
@@ -1054,8 +1009,12 @@ async fn an_instance_dropped_while_it_registers_is_removed_by_the_next_pass() {
     let mut config = consul.config(Some(Roles::Regular));
     config.check_interval = pass;
     let client = config.client().unwrap();
-    let app_context = live_app_context();
-    let registry = Arc::clone(&app_context.worker_registry);
+    // worker-b's registration waits in the host's queue, its address held,
+    // until the test releases it: after Consul has dropped the instance.
+    let (host, jobs) = TestHost::applying();
+    let address_b = endpoint_at("127.0.0.1", b).unwrap().render();
+    jobs.register_at_release(&address_b);
+    let registry = Arc::clone(&host.registry);
     let registered = move |port: u16| {
         registry
             .get_all()
@@ -1067,10 +1026,10 @@ async fn an_instance_dropped_while_it_registers_is_removed_by_the_next_pass() {
         clippy::disallowed_methods,
         reason = "the loop under test is aborted at the end of the test"
     )]
-    let handle = task::spawn(ConsulDiscovery::new(config, app_context, client).run());
+    let handle = task::spawn(ConsulDiscovery::new(config, host, client).run());
 
-    // Consul drops worker-b while its engine has not answered. The query
-    // after the dropping answer starts once that answer's pass is done.
+    // Consul drops worker-b while its registration waits. The query after
+    // the dropping answer starts once that answer's pass is done.
     let guard = Duration::from_secs(30);
     while consul.requests() < 3 {
         assert!(
@@ -1079,20 +1038,17 @@ async fn an_instance_dropped_while_it_registers_is_removed_by_the_next_pass() {
         );
         time::sleep(Duration::from_millis(20)).await;
     }
-    assert!(!registered(b), "registered before its engine answered");
+    assert!(registered(a));
+    assert!(!registered(b), "registered before its registration landed");
 
-    // worker-b registers once its engine answers, after Consul dropped it.
-    answer.send(true).expect("worker-b's engine holds the gate");
-    while !registered(b) {
-        assert!(started.elapsed() < guard, "worker-b never registered");
-        time::sleep(Duration::from_millis(20)).await;
-    }
+    // worker-b's registration lands, after Consul dropped it.
+    jobs.release(&address_b);
+    assert!(registered(b), "worker-b never registered");
     assert_eq!(
         consul.requests(),
         3,
         "the answer that dropped worker-b was taken before it registered"
     );
-    assert!(registered(a));
 
     // Nothing but a pass removes it, and the first pass comes one interval
     // after the start: a removal before that is not the pass's.

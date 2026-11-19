@@ -961,7 +961,7 @@ fn test_list_label_selector_regular_mode() {
 #[test]
 fn test_list_label_selector_pd_mode_common_labels() {
     let config = create_pd_config();
-    // Only the common label "app=sglang" should be in the selector.
+    // Only the common label should be in the selector.
     assert_eq!(config.list_label_selector(), "app=sglang");
 }
 

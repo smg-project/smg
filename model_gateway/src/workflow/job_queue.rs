@@ -1923,7 +1923,7 @@ mod tests {
     #[tokio::test]
     #[tracing_test::traced_test]
     async fn a_refused_start_up_submission_names_its_worker_masked() {
-        use crate::service_discovery::testing::create_test_app_context;
+        use crate::app_context::testing::create_test_app_context;
         let context = create_test_app_context();
         let refusing = JobQueue::new(JobQueueConfig::default(), Weak::new());
         assert!(context.worker_job_queue.set(refusing).is_ok());
@@ -2002,7 +2002,7 @@ mod tests {
     #[tokio::test]
     #[tracing_test::traced_test]
     async fn a_worker_jobs_result_names_its_worker_masked() {
-        use crate::service_discovery::testing::live_app_context;
+        use crate::app_context::testing::live_app_context;
         let host = a_registering_engine().await;
         let first = format!("http://alice:s3cret-a@{host}");
         let second = format!("http://bob:s3cret-b@{host}");
@@ -2112,7 +2112,7 @@ mod tests {
     async fn a_cancelled_registrations_warning_and_status_name_its_worker_masked() {
         use smg_worker::test_support::RefusedAddress;
 
-        use crate::service_discovery::testing::live_app_context;
+        use crate::app_context::testing::live_app_context;
         // Held for the whole case: no other case's listener can draw the
         // port and answer a registration's probe.
         let refused = RefusedAddress::reserve();
@@ -2715,7 +2715,7 @@ mod tests {
     /// under its own status: that status is the run's evidence.
     #[tokio::test]
     async fn a_job_kept_behind_the_in_flight_one_runs_when_it_ends() {
-        use crate::service_discovery::testing::create_test_app_context;
+        use crate::app_context::testing::create_test_app_context;
         let context = create_test_app_context();
         let queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&context));
         let url = "http://w:8000";
@@ -2764,7 +2764,7 @@ mod tests {
     /// status left to it, and runs under its own kind when the holder ends.
     #[tokio::test]
     async fn a_refresh_asked_through_the_workers_trait_is_the_queues_refresh() {
-        use crate::service_discovery::testing::create_test_app_context;
+        use crate::app_context::testing::create_test_app_context;
         let context = create_test_app_context();
         let queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&context));
         let jobs: Arc<dyn WorkerJobs> = queue.clone();
@@ -2820,6 +2820,34 @@ mod tests {
         );
     }
 
+    /// The queue as a discovery pass reads it ([`WorkerJobs::job_in_flight`]):
+    /// an address reads as in flight while a job of it is pending or
+    /// processing, whatever the job, and no longer once that job has ended,
+    /// done or failed, so the next pass retries what failed.
+    #[tokio::test]
+    async fn an_address_reads_as_in_flight_until_its_job_ends() {
+        use crate::app_context::testing::create_test_app_context;
+        let context = create_test_app_context();
+        let queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&context));
+        let jobs: Arc<dyn WorkerJobs> = queue.clone();
+        let url = "http://held:8000";
+        assert!(!jobs.job_in_flight(url), "no job of the address");
+
+        let ends: [Result<String, String>; 2] =
+            [Ok("done".to_string()), Err("refused".to_string())];
+        for (job_type, end) in ["AddWorker", "RemoveWorker"].into_iter().zip(ends) {
+            queue.hold_url_for_tests(url, job_type);
+            assert!(jobs.job_in_flight(url), "{job_type} is processing");
+            JobQueue::record_job_completion(job_type, url, Duration::ZERO, &end, &queue.status_map);
+            assert!(!jobs.job_in_flight(url), "{job_type} ended: {end:?}");
+        }
+
+        queue
+            .status_map
+            .insert(url.to_string(), JobStatus::pending("AddWorker", url));
+        assert!(jobs.job_in_flight(url), "a pending job is in flight");
+    }
+
     /// The wiring at `process_job`: a kept job runs at the completion of the
     /// job that held the URL, through the dispatcher and not by hand. A hold
     /// by hand keeps the first submission; a plain submission for the same
@@ -2829,7 +2857,7 @@ mod tests {
     /// failed, and the URL's last status is the kept job's.
     #[tokio::test]
     async fn a_kept_job_runs_at_the_dispatcher_completion_of_its_holder() {
-        use crate::service_discovery::testing::create_test_app_context;
+        use crate::app_context::testing::create_test_app_context;
         let context = create_test_app_context();
         let queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&context));
         let url = "http://w:8001";
@@ -2875,7 +2903,7 @@ mod tests {
     /// DELETE waited dropped the accepted DELETE.
     #[tokio::test]
     async fn a_refresh_kept_beside_a_kept_removal_runs_after_it() {
-        use crate::service_discovery::testing::create_test_app_context;
+        use crate::app_context::testing::create_test_app_context;
         let context = create_test_app_context();
         let queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&context));
         let url = "http://w:8002";
@@ -2927,7 +2955,7 @@ mod tests {
     /// first.
     #[tokio::test]
     async fn a_removal_kept_beside_a_kept_refresh_runs_first() {
-        use crate::service_discovery::testing::create_test_app_context;
+        use crate::app_context::testing::create_test_app_context;
         let context = create_test_app_context();
         let queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&context));
         let url = "http://w:8003";
@@ -2992,7 +3020,7 @@ mod tests {
     /// provisional labels until another transition into service.
     #[tokio::test]
     async fn a_fresh_workers_refresh_kept_beside_an_old_id_removal_runs_after_it() {
-        use crate::service_discovery::testing::create_test_app_context;
+        use crate::app_context::testing::create_test_app_context;
         let context = create_test_app_context();
         let queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&context));
         let url = "http://w:8005";
@@ -3363,7 +3391,7 @@ mod tests {
     /// keeps its entry through the update's writes.
     #[tokio::test]
     async fn an_update_submitted_unless_registering_leaves_a_registrations_entry() {
-        use crate::service_discovery::testing::create_test_app_context;
+        use crate::app_context::testing::create_test_app_context;
         let context = create_test_app_context();
         // A queue that accepts jobs and never runs one: no slot to run one in.
         let queue = JobQueue::new(
@@ -3477,7 +3505,7 @@ mod tests {
     /// next claim.
     #[tokio::test]
     async fn a_claimed_submission_dropped_in_its_slot_wait_leaves_no_entry() {
-        use crate::service_discovery::testing::create_test_app_context;
+        use crate::app_context::testing::create_test_app_context;
         let context = create_test_app_context();
         let queue = a_full_one_slot_queue(&context).await;
         let url = "http://w:8008";
@@ -3514,7 +3542,7 @@ mod tests {
     /// same type dropped inside its wait on a full queue.
     #[tokio::test]
     async fn a_plain_submission_dropped_in_its_slot_wait_leaves_the_entry_it_found() {
-        use crate::service_discovery::testing::create_test_app_context;
+        use crate::app_context::testing::create_test_app_context;
         let context = create_test_app_context();
         let queue = a_full_one_slot_queue(&context).await;
         let url = "http://w:8009";
@@ -3975,8 +4003,8 @@ mod tests {
         use smg_worker::identity::basic::Worker;
 
         use crate::{
+            app_context::testing::live_app_context,
             routers::grpc::backend_client::BasicWorkerBuilder,
-            service_discovery::testing::live_app_context,
         };
 
         async fn ended(queue: &JobQueue, url: &str) {

@@ -2925,6 +2925,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        app_context::testing::create_test_app_context,
         config::types::{PolicyConfig, RoutingKeyOverrideConfig},
         middleware::ReportedRefusal,
         observability::logging::test_support::{test_subscriber, RefusalLineCounter},
@@ -2943,7 +2944,6 @@ mod tests {
             http::test_support,
         },
         server::{http_client, http_client_builder},
-        service_discovery::testing::create_test_app_context,
         tenant::TenantKey,
     };
 

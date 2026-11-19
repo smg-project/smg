@@ -34,3 +34,6 @@ impl DiscoveryHost for AppContext {
             .map(|queue| Arc::clone(queue) as Arc<dyn WorkerJobs>)
     }
 }
+
+#[cfg(test)]
+mod tests;

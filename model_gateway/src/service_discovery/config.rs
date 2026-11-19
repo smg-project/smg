@@ -35,7 +35,7 @@ pub type DiscoveryConfigResult<T> = Result<T, DiscoveryConfigError>;
 /// ```yaml
 /// discovery:
 ///   provider: kubernetes
-///   selector: { app: sglang }
+///   selector: { app: worker }
 ///   port: 8000
 /// ```
 ///
