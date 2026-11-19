@@ -498,7 +498,10 @@ impl Pool {
     /// `None` where that instant is more than `window_micros` before the
     /// booking at the window's front, which [`Pool::book`] ages by: the
     /// dispatch aged before it was told. Booked there, it would read as a
-    /// clock that went back, and end every booking it passed.
+    /// clock that went back, and end every booking it passed. `None` too
+    /// where the window is full and that instant is as far before the
+    /// booking behind the front: a full window loses its front to the cap
+    /// before any booking is aged, and that one is aged first.
     fn dispatched_at(
         &self,
         issued_micros: u64,
@@ -510,7 +513,15 @@ impl Pool {
             return Some(said);
         };
         let at_micros = said.min(newest.at_micros.max(issued_micros));
-        (at_micros.saturating_add(window_micros) >= oldest.at_micros).then_some(at_micros)
+        // The newest date a booking can bear and not be aged by this one.
+        let reach = at_micros.saturating_add(window_micros);
+        let behind = if self.window.len() < WINDOW_CAP {
+            None
+        } else {
+            self.window.get(1)
+        };
+        (reach >= oldest.at_micros && behind.is_none_or(|next| reach >= next.at_micros))
+            .then_some(at_micros)
     }
 
     /// Book `tokens` on a member at `at_micros`. The bookings older than the
@@ -1839,6 +1850,68 @@ mod tests {
         // nothing, and the three newer bookings stand.
         dispatch(&scorer, pool[2].id, 1, 16, 89 * tenth, 0);
         assert_eq!(loads(&scorer), (vec![7, 8, 0], 15));
+    }
+
+    #[test]
+    fn a_late_dispatch_into_a_full_window_ends_no_newer_booking() {
+        let scorer = scorer(NEVER, 1.5, 1);
+        let pool = pool(3);
+        let tenth = SECOND / 10;
+        led(&scorer, &pool, 0, 10 * SECOND);
+        book(&scorer, &pool, 0, 1, 100 * tenth);
+        for _ in 2..WINDOW_CAP {
+            book(&scorer, &pool, 1, 1, 105 * tenth);
+        }
+        let full = WINDOW_CAP as u64;
+        assert_eq!(loads(&scorer), (vec![1, full - 2, 0], full - 1));
+        // One booking short of its cap the window loses no front unaged,
+        // and the front alone holds the date: a dispatch dated within an
+        // interval of it is booked, and fills the window.
+        dispatch(&scorer, pool[2].id, 1, 8, 92 * tenth, 0);
+        assert_eq!(loads(&scorer), (vec![1, full - 2, 8], full + 7));
+        assert_eq!(of(&scorer, "m").lock().window.len(), WINDOW_CAP);
+        // A full window loses its front to the cap, whatever its age, and
+        // the booking behind it is the first one aged. The same dispatch
+        // now books nothing: more than an interval before that booking, it
+        // would end every booking the issues made.
+        dispatch(&scorer, pool[2].id, 1, 8, 92 * tenth, 0);
+        assert_eq!(loads(&scorer), (vec![1, full - 2, 8], full + 7));
+        assert_eq!(of(&scorer, "m").lock().window.len(), WINDOW_CAP);
+        // One dated within an interval of both is booked, and the cap ends
+        // the front alone.
+        dispatch(&scorer, pool[2].id, 1, 8, 96 * tenth, 0);
+        assert_eq!(loads(&scorer), (vec![0, full - 2, 16], full + 14));
+        assert_eq!(of(&scorer, "m").lock().window.len(), WINDOW_CAP);
+    }
+
+    #[test]
+    fn a_late_dispatch_is_held_against_the_front_of_a_full_window_too() {
+        let scorer = scorer(NEVER, 1.5, 1);
+        let pool = pool(3);
+        let tenth = SECOND / 10;
+        led(&scorer, &pool, 0, 10 * SECOND);
+        // The second booking arrived out of its clock's order, an interval
+        // before the first, and the window fills behind the two.
+        book(&scorer, &pool, 0, 1, 100 * tenth);
+        book(&scorer, &pool, 1, 1, 90 * tenth);
+        for _ in 2..WINDOW_CAP {
+            book(&scorer, &pool, 1, 1, 105 * tenth);
+        }
+        let full = WINDOW_CAP as u64;
+        assert_eq!(loads(&scorer), (vec![1, full - 1, 0], full));
+        // A dispatch dated within an interval of the booking behind the
+        // front, and more than an interval before the front, aged before it
+        // was told, as it did in a window short of its cap: it books
+        // nothing.
+        dispatch(&scorer, pool[2].id, 1, 8, 85 * tenth, 0);
+        assert_eq!(loads(&scorer), (vec![1, full - 1, 0], full));
+        assert_eq!(of(&scorer, "m").lock().window.len(), WINDOW_CAP);
+        // One dated within an interval of both is booked, and the cap ends
+        // the front alone: the booking step stops at the one behind it,
+        // and the newer bookings behind that one stand.
+        dispatch(&scorer, pool[2].id, 1, 8, 92 * tenth, 0);
+        assert_eq!(loads(&scorer), (vec![0, full - 1, 8], full + 7));
+        assert_eq!(of(&scorer, "m").lock().window.len(), WINDOW_CAP);
     }
 
     #[test]
