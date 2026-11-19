@@ -185,10 +185,10 @@ fn ended(error: &client::Error) -> bool {
 ///
 /// A leader whose renewal lands past its renew deadline leads nobody until
 /// one lands in time, and the lease's store on a busy host can hold a
-/// renewal that long. Meanwhile it answers that it does not lead, and a
-/// renewal that took the deadline whole ends the session. A gateway asks
-/// again, on a session it opens again where its own was ended, and so does
-/// the case, inside the room.
+/// renewal that long. Meanwhile it answers that it does not lead: a gateway
+/// asks again. A renewal that took the deadline whole ends the session,
+/// which a gateway hears at its next report: it opens its session again
+/// and says the report there. The case does both, inside the room.
 async fn placed(gateway: &mut Client, replica: &Replica, key: u64, n: u64) -> Result<u64, String> {
     let ask = DecideRequest {
         request_id: format!("ask-{n}").into_bytes(),
@@ -206,9 +206,6 @@ async fn placed(gateway: &mut Client, replica: &Replica, key: u64, n: u64) -> Re
     let began = Instant::now();
     let answer = loop {
         match gateway.decide(ask.clone()).await {
-            Err(error) if ended(&error) && began.elapsed() < ROOM => {
-                *gateway = session_at(replica).await?;
-            }
             Ok(Answer::Busy(busy))
                 if busy.reason() == proto::busy::Reason::NotLeader && began.elapsed() < ROOM =>
             {
@@ -382,6 +379,11 @@ async fn a_killed_leaders_standby_answers_each_routing_key_on_its_worker() {
                 asked += 1;
                 if let Ok(worker) = placed(&mut gateway, &leader, key, asked).await {
                     named.insert(worker);
+                }
+                // An ask can wait a room out by itself: the round ends at
+                // its own room, and the assert below reads it.
+                if whole.elapsed() >= ROOM {
+                    break;
                 }
             }
             if workers.iter().all(|worker| named.contains(worker)) {

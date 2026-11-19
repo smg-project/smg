@@ -337,6 +337,9 @@ pub struct Harness {
     buffers: ViewBuffers,
     stop_feeds: watch::Sender<bool>,
     feeds: JoinSet<()>,
+    /// Whether the controller the harness asks elects over a lease file: a
+    /// leader that elects can stop leading for a moment.
+    elects: bool,
 }
 
 /// Waits for `check` under the bound named `name`; the error names the
@@ -1064,6 +1067,7 @@ impl Harness {
             buffers: ViewBuffers::default(),
             stop_feeds,
             feeds: JoinSet::new(),
+            elects: false,
         })
     }
 
@@ -1077,7 +1081,9 @@ impl Harness {
         let port = leader.replication.port();
         let mut standby = Replica::start_at("fleet-standby", Some(lease), STANDBY, port).await?;
         standby.reaches(State::Follower).await?;
-        Ok((Self::around(leader).await?, standby))
+        let mut harness = Self::around(leader).await?;
+        harness.elects = true;
+        Ok((harness, standby))
     }
 
     /// The reference client at `replica`'s gateway listener and the
@@ -1140,6 +1146,11 @@ impl Harness {
         self.client = client;
         self.operator = operator;
         Ok(())
+    }
+
+    /// Whether the controller the harness asks elects over a lease file.
+    pub const fn elects(&self) -> bool {
+        self.elects
     }
 
     /// Opens the harness's session again at the controller it asks, as a

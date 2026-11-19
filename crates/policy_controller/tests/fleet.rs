@@ -487,25 +487,20 @@ fn ended(error: &client::Error) -> bool {
     matches!(error, client::Error::Status(status) if status.code() == Code::Aborted)
 }
 
-/// One ask's answer, as a gateway comes to it at a leader that stops
-/// leading for a moment. A leader whose renewal lands past its renew
-/// deadline leads nobody until one lands in time, and the lease's store on
-/// a busy host can hold a renewal that long. Meanwhile it answers that it
-/// does not lead, and a renewal that took the deadline whole ends the
-/// session. A gateway asks again, on a session it opens again where its own
-/// was ended, and so does the case, inside the room.
+/// One ask's answer. A controller that elects over a lease file is asked
+/// again while it answers that it does not lead. A leader whose renewal
+/// lands past its renew deadline leads nobody until one lands in time, and
+/// the lease's store on a busy host can hold a renewal that long. A gateway
+/// asks again, and so does the case, inside the room. A controller that
+/// leads itself is asked once: a case counts what its client sent.
 async fn answered(harness: &mut Harness, ask: DecideRequest) -> Result<Answer, client::Error> {
     let began = Instant::now();
     loop {
         match harness.client().decide(ask.clone()).await {
-            Err(error) if ended(&error) && began.elapsed() < ROOM => {
-                // Boxed: the dial's future is large, and every ask of a case would carry it.
-                if Box::pin(harness.redial()).await.is_err() {
-                    return Err(error);
-                }
-            }
             Ok(Answer::Busy(busy))
-                if busy.reason() == busy::Reason::NotLeader && began.elapsed() < ROOM =>
+                if harness.elects()
+                    && busy.reason() == busy::Reason::NotLeader
+                    && began.elapsed() < ROOM =>
             {
                 tokio::time::sleep(AGAIN).await;
             }
@@ -524,7 +519,12 @@ async fn given_up(harness: &mut Harness, leases: &[u64], left: usize) -> Result<
             ..Released::default()
         };
         let reported = match harness.client().released(released).await {
-            Err(error) if ended(&error) => {
+            // A leader that took its renew deadline whole ended its
+            // sessions, and a gateway hears it at its next report: it opens
+            // its session again and says the report there. Boxed: the
+            // dial's future is large, and every pick of a case would carry
+            // it.
+            Err(error) if harness.elects() && ended(&error) => {
                 Box::pin(harness.redial()).await?;
                 harness.client().released(released).await
             }
