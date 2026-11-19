@@ -1323,14 +1323,13 @@ impl World {
     /// its caller may have narrowed by its gateway's wires since. `named`
     /// takes the request's deepest holders, by one lookup of the pool's
     /// index under the profile's cap (its sample, or no cap where it takes
-    /// none), and the pool's warming
-    /// rows as this publication read them, less those whose naming ended by
-    /// the decision's instant. Under a cap the holders' lookup lists
-    /// nothing of the pool's length, and the warming rows are read where
-    /// the publication holds them: they are copied only for a view that is
-    /// not the pool whole, and past the first row's end. No row is named,
-    /// and no index is read, where the view holds no row or no member
-    /// serves `model` in `role`.
+    /// none), and the pool's warming rows as this publication read them,
+    /// less those whose naming ended by the decision's instant. Under a cap
+    /// the holders' lookup lists nothing of the pool's length, and the
+    /// warming rows are read where the publication holds them: they are
+    /// copied only for a view that is not the pool whole, and past the
+    /// first row's end. No row is named, and no index is read, where the
+    /// view holds no row or no member serves `model` in `role`.
     ///
     /// The lookup is of this instant: an index is written between two
     /// publications, so a holder may be named a window before its row's

@@ -30,12 +30,12 @@
 //! write last read them. The lookup itself is live, as the index is: the
 //! request's blocks are looked up once a decision, under the cap of its
 //! profile (its sample, or no cap where it takes none), and the holders
-//! are named by their place in the
-//! decision's rows. An index id is free for the next row once its row
-//! leaves, and a decision may read a world published before that: the
-//! index counts its takes and keeps the count each id was last taken at
-//! (`Index`), and a row is named a holder only where its id was not taken
-//! since the tables the decision holds were known whole.
+//! are named by their place in the decision's rows. An index id is free
+//! for the next row once its row leaves, and a decision may read a world
+//! published before that: the index counts its takes and keeps the count
+//! each id was last taken at (`Index`), and a row is named a holder only
+//! where its id was not taken since the tables the decision holds were
+//! known whole.
 //!
 //! Locks: the table's, taken under the workers lock by a membership write
 //! and alone by a batch, each for as long as it takes to find or to change

@@ -1241,9 +1241,9 @@ fn hand<R>(
     // profile that takes none is named every one. A profile that shows
     // its rows to a plugin, or whose warm-up stages rule by two rulings,
     // is named no row and keeps its column. The deciding profile answers
-    // for itself: the needs are merged
-    // over a pair's two phases and a sessions rule, so they say only
-    // where to ask, and no other decision pays the second walk.
+    // for itself: the needs are merged over a pair's two phases and a
+    // sessions rule, so they say only where to ask, and no other decision
+    // pays the second walk.
     let cap = if needs.affinity {
         engine.named_for(model, phase)
     } else {
