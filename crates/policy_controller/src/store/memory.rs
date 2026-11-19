@@ -2161,7 +2161,7 @@ impl LoadSink for MemoryStore {
         // the mark's end is counted once, with whatever else of its engine
         // the answer moved.
         if marked && !writer.any_unnamed() {
-            writer.judge_every();
+            writer.judge_every_behind_a_door();
         }
         if changed {
             let world = writer.folded_at(polled_at);
@@ -2251,7 +2251,7 @@ impl LoadSink for MemoryStore {
                 // The last mark went with the member: every engine is
                 // judged once more, behind the eviction's own judgment.
                 if forgot && !writer.any_unnamed() {
-                    writer.judge_every();
+                    writer.judge_every_behind_a_door();
                 }
                 let world = writer.folded();
                 self.show(writer, world);

@@ -2418,9 +2418,12 @@ impl Writer {
     /// read the written engine as the whole write left it, the mark gone,
     /// and counted the write, so the write is counted once. This pass
     /// finds every verdict as its last write left it and moves none: from
-    /// it an engine with no threshold is judged at no write.
-    pub(super) fn judge_every(&mut self) {
+    /// it an engine with no threshold is judged at no write. Whether any
+    /// row's bit moved, which a door holds to none
+    /// ([`Self::judge_every_behind_a_door`]).
+    pub(super) fn judge_every(&mut self) -> bool {
         self.judging = false;
+        let mut moved = false;
         for index in 0..self.engines.len() {
             // A rank stands unnamed only while the writer judges: a record
             // reads a mark behind that one test.
@@ -2431,12 +2434,24 @@ impl Writer {
             };
             let had = mem::replace(&mut engine.judged, true);
             if had || has {
-                self.judge(index as u32);
+                moved |= self.judge(index as u32);
             }
             if let Some(engine) = self.engines.get_mut(index) {
                 engine.judged = has;
             }
         }
+        moved
+    }
+
+    /// The pass over every engine as a door runs it, behind its own
+    /// judgment of a write that ended the last mark
+    /// ([`Self::judge_every`]). That judgment counted the write and this
+    /// pass counts nothing, so the pass must move no verdict: one it moved
+    /// would go uncounted, and unpublished where the door's own judgment
+    /// moved none. A debug build stops there.
+    pub(super) fn judge_every_behind_a_door(&mut self) {
+        let moved = self.judge_every();
+        debug_assert!(!moved, "the pass behind a door's judgment moved a verdict");
     }
 
     /// Judge one engine over what is on file for its ranks and write the
@@ -2628,7 +2643,8 @@ impl Writer {
     /// rank again, which ends the mark an answer left on the rank
     /// ([`Self::name`]), and its engine is heard and judged as at any
     /// record. Where the last mark went with it, every engine is judged
-    /// once more behind that judgment ([`Self::judge_every`]). Cold and
+    /// once more behind that judgment
+    /// ([`Self::judge_every_behind_a_door`]). Cold and
     /// out of line: the record door runs at every pushed record and comes
     /// here only while a mark stands, and with this step inlined a record
     /// paid for it in a store that holds no mark.
@@ -2638,7 +2654,7 @@ impl Writer {
         self.name(id, rank, false);
         let moved = self.judge_heard(place, at);
         if self.unnamed.is_empty() {
-            self.judge_every();
+            self.judge_every_behind_a_door();
         }
         moved
     }
@@ -2741,7 +2757,8 @@ impl Writer {
     /// of the member `id` (`unnamed`), or an answer or a record names the
     /// rank again. The caller judges the engine once its write is whole
     /// ([`Self::judged`]), and every engine once more behind that where
-    /// the write ended the last mark ([`Self::judge_every`]). From the
+    /// the write ended the last mark
+    /// ([`Self::judge_every_behind_a_door`]). From the
     /// mark on the engine is judged at each write, threshold or none,
     /// until the last mark's end, a membership write or a generation
     /// finds it with no mark and no threshold. Whether the mark moved.
@@ -2775,7 +2792,8 @@ impl Writer {
     /// The member's rows went with an eviction: its ranks' marks go with
     /// them, and a rank with nothing on file is a rank again. The caller
     /// judges the engine, and every engine once more behind it where the
-    /// last mark went ([`Self::judge_every`]). Whether a mark went.
+    /// last mark went ([`Self::judge_every_behind_a_door`]). Whether a
+    /// mark went.
     pub(super) fn forget(&mut self, id: WorkerId) -> bool {
         let before = self.unnamed.len();
         self.unnamed.retain(|&(member, _)| member != id);
