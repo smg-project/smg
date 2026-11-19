@@ -166,6 +166,21 @@ async fn through_the_door(
     }
 }
 
+/// [`document`], asked again inside the room while the replica holds none: a
+/// new leader's first document lands a moment behind the start of its lead,
+/// and its standby is told it behind that.
+async fn first_document(
+    door: &mut PolicyControllerClient<Channel>,
+) -> Result<proto::PolicySpecDocument, String> {
+    let asked = Instant::now();
+    loop {
+        match document(door).await {
+            Err(_) if asked.elapsed() < ROOM => tokio::time::sleep(PACE).await,
+            held => return held,
+        }
+    }
+}
+
 /// The document the replica behind `door` runs, as its operator reads it.
 async fn document(
     door: &mut PolicyControllerClient<Channel>,
@@ -404,7 +419,7 @@ async fn a_killed_leaders_standby_answers_each_routing_key_on_its_worker() {
         std::fs::write(&spec, CHANGED).expect("the leader's file");
         let changed = Instant::now();
         loop {
-            let held = document(&mut door)
+            let held = first_document(&mut door)
                 .await
                 .expect("the leader answers its document");
             if held.generation == 2 {
@@ -655,7 +670,7 @@ async fn a_replica_that_starts_over_another_document_follows_its_leader() {
             .await
             .expect("the standby's control listener accepts");
         let mut door = PolicyControllerClient::new(channel);
-        let held = document(&mut door)
+        let held = first_document(&mut door)
             .await
             .expect("the standby answers its document");
         assert_eq!(

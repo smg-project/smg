@@ -291,6 +291,12 @@ impl SpecFile {
     /// case hands in a file that moves under its read. No clock is read:
     /// "stood still for one poll" is two looks in a row that agree.
     fn poll_looking(&mut self, mut look: impl FnMut(&Path) -> Seen) -> Look {
+        // The lead this look's bytes are read under: the door applies them
+        // while its fence shows that term, and under no other. The start's
+        // document, where it still waits for the replica's first lead, goes
+        // through the door first.
+        let lead = self.generations.lead();
+        self.generations.deferred_now();
         let now = look(&self.path);
         // Behind a take the file is read though it never moved.
         let takes = self.generations.takes();
@@ -314,12 +320,13 @@ impl SpecFile {
                     self.moved = Some(after);
                     return self.settling();
                 }
-                document.and_then(|document| self.generations.apply(document, self.format))
+                document
+                    .and_then(|document| self.generations.apply_under(lead, document, self.format))
             }
         };
         // The door read nothing: this replica stopped leading while the
-        // look was in flight. The state stays unread, so a look reads it
-        // once the replica leads again.
+        // look was in flight, or leads under another term by now. The state
+        // stays unread, so a look reads it once the replica leads again.
         if let Ok(waits @ Applied::Waits(_)) = outcome {
             self.moved = None;
             self.unsettled = 0;
@@ -330,6 +337,18 @@ impl SpecFile {
         self.moved = None;
         self.unsettled = 0;
         Look::Read(outcome.map_err(|rejected| self.generations.reject(rejected)))
+    }
+
+    /// The loop's step behind a sleep of `nap`. Woken short of a poll, at
+    /// the opening of a lead the start's document waited for, it hands the
+    /// door that document and makes no look: two looks are never closer
+    /// than a poll. Behind a whole poll it looks.
+    fn woken(&mut self, nap: Duration, look: impl FnMut(&Path) -> Seen) {
+        if nap < POLL {
+            self.generations.deferred_now();
+        } else {
+            self.poll_looking(look);
+        }
     }
 
     /// A look that found the file moved since the look before. A file that
@@ -378,15 +397,18 @@ impl SpecFile {
         loop {
             // A poll after the last look ended: two looks are never closer,
             // so "stood still for one poll" holds after a look that stalled.
+            // The sleep is shorter where the start's document waits for a
+            // lead that opens sooner.
+            let nap = self.generations.nap(POLL);
             tokio::select! {
-                () = sleep(POLL) => {}
+                () = sleep(nap) => {}
                 _ = stop.wait_for(|stop| *stop) => return Ok(()),
             }
             if !self.generations.source_writes() {
                 continue;
             }
             let looking = tokio::task::spawn_blocking(move || {
-                self.poll_looking(&mut look);
+                self.woken(nap, &mut look);
                 (self, look)
             });
             let (file, looked) = tokio::select! {
@@ -1568,8 +1590,11 @@ pub(crate) mod tests {
 
         // A lead comes back with no take as well: a fence closes by itself
         // at the renew deadline, and the holder's next renewal opens it
-        // again under the same term. A look refused in between is read
-        // behind that renewal.
+        // again under the same term. A take whose write returned past its
+        // window shows no term: it publishes nothing, and the start's
+        // document waits on. A look refused in between stays unread. Behind
+        // the renewal that opens the fence the watch brings both: the
+        // start's document, then the file as it stands.
         let deadline = Duration::from_secs(1);
         let bed = self::bed(LEAST_LOAD.as_bytes());
         let mut elector = election_under(deadline);
@@ -1583,10 +1608,11 @@ pub(crate) mod tests {
             .checked_sub(2 * deadline)
             .expect("a host that is up for two seconds");
         elector.tick(late).expect("a take");
-        assert_eq!(bed.generation(), 1, "the start's document, at the take");
         assert!(!bed.generations.source_writes(), "past its deadline");
+        assert_eq!(bed.generation(), 0, "no term showed at the take's step");
+        assert!(bed.generations.bound(), "the door keeps its source");
         replace(&bed.path, bound_to(1).as_bytes());
-        assert_eq!(settle(&mut file), Ok(Applied::Waits(1)));
+        assert_eq!(settle(&mut file), Ok(Applied::Waits(0)));
         // A round whose window closed again ahead of its read waits as the
         // first look did.
         let read = (0..8).find_map(|_| {
@@ -1595,6 +1621,127 @@ pub(crate) mod tests {
             Some(settle(&mut file)).filter(|read| !matches!(read, Ok(Applied::Waits(_))))
         });
         assert_eq!(read, Some(Ok(Applied::Generation(2))));
+        assert_eq!(bed.answered().2, bound_to(1).as_bytes());
         assert_eq!(bed.generations.takes(), 1, "no take since the first");
+    }
+
+    /// The loop sleeps no poll ahead of the start's document where its lead
+    /// is open: the document is applied at once, by the loop's own clock.
+    #[tokio::test(start_paused = true)]
+    async fn the_loop_brings_the_starts_document_with_no_polls_sleep_ahead_of_it() {
+        let bed = bed(LEAST_LOAD.as_bytes());
+        let mut elector = election();
+        bed.generations.under(elector.fence());
+        let file = SpecFile::start_deferred(bed.path.clone(), Arc::clone(&bed.generations))
+            .expect("a file that runs");
+        // A take with no step of its own: the start's document waits under
+        // an open fence.
+        elector.tick(Instant::now()).expect("a take");
+        assert_eq!(bed.generation(), 0);
+        let (stop, stopped) = watch::channel(false);
+        let mut watching = JoinSet::new();
+        let began = tokio::time::Instant::now();
+        watching.spawn(file.run(stopped));
+        while bed.generation() == 0 {
+            assert!(began.elapsed() < 20 * POLL, "the loop brings the document");
+            sleep(POLL / 100).await;
+        }
+        assert!(
+            began.elapsed() < POLL,
+            "ahead of a poll's sleep: {:?}",
+            began.elapsed()
+        );
+        stop.send_replace(true);
+        ended(&mut watching).await.expect("the loop's last join");
+    }
+
+    /// Woken short of a poll, at the opening of a lead the start's document
+    /// waited for, the watch hands the door that document and looks at
+    /// nothing. Behind a whole poll it looks.
+    #[test]
+    fn woken_at_a_leads_opening_the_watch_hands_over_the_starts_document_and_looks_at_nothing() {
+        let bed = bed(LEAST_LOAD.as_bytes());
+        let mut elector = election();
+        bed.generations.under(elector.fence());
+        let mut file = SpecFile::start_deferred(bed.path.clone(), Arc::clone(&bed.generations))
+            .expect("a file that runs");
+        // A take with no step of its own: the start's document waits under
+        // an open fence.
+        elector.tick(Instant::now()).expect("a take");
+        assert_eq!(bed.generation(), 0);
+        assert_eq!(bed.generations.nap(POLL), Duration::ZERO);
+        let looks = AtomicUsize::new(0);
+        let counted = |path: &Path| {
+            looks.fetch_add(1, Ordering::SeqCst);
+            look(path)
+        };
+        file.woken(Duration::ZERO, &counted);
+        assert_eq!(bed.generation(), 1, "the start's document");
+        assert_eq!(looks.load(Ordering::SeqCst), 0, "no look");
+        file.woken(POLL, &counted);
+        assert_eq!(looks.load(Ordering::SeqCst), 1, "a whole poll looks");
+        assert_eq!(bed.generation(), 1);
+    }
+
+    /// A look whose replica was deposed and took again under its read
+    /// applies nothing: its bytes were read under the term before. The
+    /// state stays unread, and the next looks read the file as it stands.
+    #[test]
+    fn a_look_whose_lead_changed_under_its_read_applies_nothing_and_reads_again() {
+        let bed = bed(LEAST_LOAD.as_bytes());
+        let mut elector = election();
+        bed.generations.under(elector.fence());
+        let mut file = SpecFile::start_deferred(bed.path.clone(), Arc::clone(&bed.generations))
+            .expect("a file that runs");
+        let door = Arc::clone(&bed.generations);
+        elector.at_take(move || door.at_take());
+        elector.tick(Instant::now()).expect("a take");
+        assert_eq!(bed.generation(), 1, "the start's document, at the take");
+        replace(&bed.path, bound_to(1).as_bytes());
+        assert_eq!(file.poll(), Look::Settling);
+        // The second look of a poll stands behind its read: there the
+        // replica is deposed and takes again.
+        let mut looks = 0;
+        let retaken = file.poll_looking(|path| {
+            looks += 1;
+            if looks == 2 {
+                assert!(elector.release().expect("a release"), "it held the lease");
+                elector.tick(Instant::now()).expect("a second take");
+            }
+            look(path)
+        });
+        assert_eq!(retaken, Look::Read(Ok(Applied::Waits(1))));
+        assert_eq!(bed.generation(), 1);
+        assert!(bed.generations.source_writes(), "it leads again");
+        // Read again under the term that shows now, the file is applied.
+        assert_eq!(settle(&mut file), Ok(Applied::Generation(2)));
+        assert_eq!(bed.answered().2, bound_to(1).as_bytes());
+        assert_eq!(bed.rejected(), 0);
+    }
+
+    /// A take that never led publishes nothing, so its replica follows the
+    /// next leader under any number, the first included: no number of its
+    /// own stands in the way.
+    #[test]
+    fn a_take_past_its_window_publishes_nothing_and_follows_any_number() {
+        let deadline = Duration::from_secs(1);
+        let bed = bed(LEAST_LOAD.as_bytes());
+        let mut elector = election_under(deadline);
+        bed.generations.under(elector.fence());
+        SpecFile::start_deferred(bed.path.clone(), Arc::clone(&bed.generations))
+            .expect("a file that runs");
+        let door = Arc::clone(&bed.generations);
+        elector.at_take(move || door.at_take());
+        let late = Instant::now()
+            .checked_sub(2 * deadline)
+            .expect("a host that is up for two seconds");
+        elector.tick(late).expect("a take");
+        assert_eq!(bed.generation(), 0, "no term showed at the take's step");
+        // Another replica leads meanwhile, under generation 1 of another
+        // document.
+        follow(&bed, &[RANDOM]);
+        assert_eq!(bed.generation(), 1);
+        assert_eq!(bed.answered().2, RANDOM.as_bytes());
+        assert_eq!(bed.rejected(), 0);
     }
 }

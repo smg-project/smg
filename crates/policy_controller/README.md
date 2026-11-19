@@ -486,6 +486,7 @@ smg-policy-controller --controller-id controller-0 --spec-file policy.yaml
 - A changed file that is refused is rejected whole. The running document stays.
 - With a standby, the leader's file decides. The standby follows each document its leader applies and runs it under the leader's number. Each time it takes the lead it reads its own file again, as a start does: a document other than the running one is applied as the next generation, and the running one changes nothing. The read comes within about two seconds of the take, and the replica runs the document it followed until then.
 - Under a shared lease a replica checks its file at the start and applies it when it leads. Two replicas that start over two versions of the file still pair up: the second follows the first, and runs its own file's document once it leads. So a rollout of a new file takes effect as the new replicas take over.
+- A leader that followed nobody applies its file's document a moment behind the start of its lead. Until then its `Decide` call answers `Busy` with no reason: the gateway is to decide that request itself. The controller counts those under the cause `document_awaited` of `smg_policy_controller_decide_no_decision_total`, and `GetPolicySpec` says no document is held.
 
 **A store.** `--spec-store <directory>` takes the place of the file. Documents then arrive through the apply call, `ApplyPolicySpec`, in its enforce mode.
 

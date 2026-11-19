@@ -673,7 +673,22 @@ impl MemoryStore {
     /// The journal is told the generation's number there too, behind the
     /// publication ([`Journal::generation`]).
     pub fn apply(&self, spec: AppliedSpec) -> Result<(), StaleGeneration> {
-        self.apply_at(None, spec)
+        self.apply_at(None, spec, || true).map(drop)
+    }
+
+    /// [`MemoryStore::apply`] where `admit` has the last word: it is asked
+    /// under the lock the generation is published under, ahead of the
+    /// publication, and where it refuses nothing is published and the
+    /// answer is `false`. The entry of a source that writes only while its
+    /// replica leads reads the replica's fence here, so a lead that ended
+    /// while the entry waited for this lock publishes nothing.
+    #[cfg(feature = "controller")]
+    pub(crate) fn apply_admitted(
+        &self,
+        spec: AppliedSpec,
+        admit: impl FnOnce() -> bool,
+    ) -> Result<bool, StaleGeneration> {
+        self.apply_at(None, spec, admit)
     }
 
     /// A leader's generation, applied as the replication stream tells it:
@@ -686,7 +701,7 @@ impl MemoryStore {
         at: Position,
         spec: AppliedSpec,
     ) -> Result<(), StaleGeneration> {
-        self.apply_at(Some(at), spec)
+        self.apply_at(Some(at), spec, || true).map(drop)
     }
 
     /// A leader's generation event that changes nothing here: the store
@@ -703,8 +718,14 @@ impl MemoryStore {
     }
 
     /// [`MemoryStore::apply`], its telling at `at` where a standby's
-    /// applier holds that place.
-    fn apply_at(&self, at: Option<Position>, spec: AppliedSpec) -> Result<(), StaleGeneration> {
+    /// applier holds that place, and `admit` asked under the workers lock
+    /// ([`MemoryStore::apply_admitted`]): `false` where it refused.
+    fn apply_at(
+        &self,
+        at: Option<Position>,
+        spec: AppliedSpec,
+        admit: impl FnOnce() -> bool,
+    ) -> Result<bool, StaleGeneration> {
         // The writer takes a second reference: when it refuses, the last
         // one is this one, let go after the lock.
         let spec = Arc::new(spec);
@@ -714,6 +735,10 @@ impl MemoryStore {
             // wakes its readers with the membership lock let go.
             let _released = self.released();
             let workers = self.workers.lock();
+            // The last word, under the lock every publication takes.
+            if !admit() {
+                return Ok(false);
+            }
             let mut loads = self.loads.lock();
             let Loads { ranks, writer } = &mut *loads;
             let ranks = &*ranks;
@@ -747,7 +772,7 @@ impl MemoryStore {
             before
         };
         drop(before);
-        Ok(())
+        Ok(true)
     }
 
     /// The world as the last publication left it, taken through no lock.
