@@ -292,6 +292,8 @@ struct FileVocabulary {
     /// The split pattern the ranks were trained under.
     pattern: Cow<'static, str>,
     /// Special token spellings to id: recognized in text, decoded by spelling.
+    /// Never an empty spelling: each reader of a vocabulary leaves one out
+    /// (`added_token_entries`) or refuses the file (`tekken::read`).
     specials: HashMap<String, TokenIdType>,
     /// The ids `skip_special_tokens` strips.
     skip_token_ids: HashSet<TokenIdType>,
@@ -3146,11 +3148,11 @@ mod tests {
 
     /// An added token whose spelling is empty is left out of the set a
     /// tiktoken file's checkpoint gives (see `added_token_entries`): the
-    /// file loads, and it reads
-    /// as the same file without that entry under a template that builds its
-    /// control spellings, one that builds a value of several and one that
-    /// spells them whole. The cases run on a thread of their own, so that a
-    /// load or an encode that does not come back fails the test.
+    /// file loads, and it reads as the same file without that entry under a
+    /// template that builds its control spellings, one that builds a value
+    /// of several and one that spells them whole. The cases run on a thread
+    /// of their own, so that a load or an encode that does not come back
+    /// fails the test.
     #[test]
     fn a_tiktoken_file_s_added_token_with_an_empty_spelling_is_left_out() {
         let several = builds_its_controls()
