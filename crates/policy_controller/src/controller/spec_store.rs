@@ -52,20 +52,21 @@
 //! so one lands or neither. A write that backs out says so, apart from a
 //! number that is on file: where both back out the number is free, and the
 //! next apply of either lands. A start removes the temporary names it may,
-//! a live writer's among them: that write is refused. A write refused after
-//! its link removes its name and syncs the directory again, and says which
-//! of the two failed. A name that stays may run at a start, or refuse it
-//! beside the other form's name. A name that is gone where the directory
-//! did not sync may come back after a crash.
+//! a live writer's among them: that write is refused, unless its link was
+//! made already. A write refused after its link removes its name and syncs
+//! the directory again, and says which of the two failed. A name that stays
+//! may run at a start, or refuse it beside the other form's name. A name
+//! that is gone where the directory did not sync may come back after a
+//! crash.
 //!
 //! A start reads the directory: the highest number is the generation to
 //! run, and a file a write left under its temporary name is removed, or
 //! left in place where this user may not remove it. One that is gone by
-//! then is removed, and a directory under such a name refuses the start.
-//! Any other name is left alone, the lock file's among them. Two files
-//! under one number, a directory another process holds, one renamed under
-//! the start's wait, one with no lock file where none can be made, or a
-//! path that leads to no directory, refuse the start by name. The
+//! then is taken as removed, and a directory under such a name refuses the
+//! start. Any other name is left alone, the lock file's among them. Two
+//! files under one number, a directory another process holds, one renamed
+//! under the start's wait, one with no lock file where none can be made, or
+//! a path that leads to no directory, refuse the start by name. The
 //! [`RETAINED`] highest numbers are kept; an apply removes the files under
 //! them. A generation on file is read by the read call and by a rollback;
 //! the read call reads its file through the directory itself ([`read_at`]),
@@ -201,6 +202,17 @@ fn on_file(root: &fs::File, name: &str) -> io::Result<bool> {
     match rustix::fs::statat(root, name, rustix::fs::AtFlags::empty()) {
         Ok(_) => Ok(true),
         Err(rustix::io::Errno::NOENT) => Ok(false),
+        Err(errno) => Err(errno.into()),
+    }
+}
+
+/// Removes `name` from the directory `root`, through the directory itself.
+/// A name that is gone already is taken as removed, which is what the
+/// removal wanted: another hand took it away, a second process among them
+/// where the file system's locks do not hold two apart.
+fn remove_at(root: &fs::File, name: &str) -> io::Result<()> {
+    match rustix::fs::unlinkat(root, name, rustix::fs::AtFlags::empty()) {
+        Ok(()) | Err(rustix::io::Errno::NOENT) => Ok(()),
         Err(errno) => Err(errno.into()),
     }
 }
@@ -344,10 +356,11 @@ impl SpecStore {
         Self::read_under(dir, root, unheld)
     }
 
-    /// Refuses a path that leads to no directory.
-    fn found(dir: &Path) -> Result<(), StoreRefused> {
+    /// What the system reads at a path that leads to a directory. A path
+    /// that leads to none is refused.
+    fn found(dir: &Path) -> Result<fs::Metadata, StoreRefused> {
         match fs::metadata(dir) {
-            Ok(found) if found.is_dir() => Ok(()),
+            Ok(found) if found.is_dir() => Ok(found),
             Ok(_) => Err(StoreRefused::NotADirectory),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 Err(StoreRefused::NotADirectory)
@@ -448,23 +461,21 @@ impl SpecStore {
     }
 
     /// Removes the temporary name `name` from the directory `root`: a
-    /// write that never ended. A name that is gone already is removed: a
-    /// live writer took its own name away after its link, where the file
-    /// system's locks do not hold two apart. A file this user may not
-    /// remove, by its bits or on a file system mounted to read alone, is
-    /// left in place: no start reads it. Any other refusal refuses the
-    /// start, and so does a directory under such a name, however the
-    /// system words the refusal of its removal: by its kind, or as a
-    /// permission's on some systems and behind the store's bits on all.
+    /// write that never ended. A name that is gone already is taken as
+    /// removed ([`remove_at`]): a live writer took its own name away after
+    /// its link. A file this user may not remove, by its bits or on a file
+    /// system mounted to read alone, is left in place: no start reads it.
+    /// Any other refusal refuses the start, and so does a directory under
+    /// such a name, however the system words the refusal of its removal: by
+    /// its kind, or as a permission's on some systems and behind the
+    /// store's bits on all.
     fn clear(root: &fs::File, name: &str) -> io::Result<()> {
         use rustix::{
             fs::{AtFlags, FileType},
             io::Errno,
         };
 
-        let removed = rustix::fs::unlinkat(root, name, AtFlags::empty());
-        match removed.map_err(io::Error::from) {
-            Err(gone) if gone.kind() == io::ErrorKind::NotFound => Ok(()),
+        match remove_at(root, name) {
             Err(refused) if Self::read_serves(&refused) => {
                 match rustix::fs::statat(root, name, AtFlags::SYMLINK_NOFOLLOW) {
                     Ok(left) if FileType::from_raw_mode(left.st_mode) == FileType::Directory => {
@@ -474,7 +485,7 @@ impl SpecStore {
                     Err(errno) => Err(errno.into()),
                 }
             }
-            removed => removed,
+            done => done,
         }
     }
 
@@ -528,28 +539,34 @@ impl SpecStore {
         }
     }
 
-    /// Whether the path `dir` leads to the directory `root`, by the
-    /// system's own identity of the two. A path that leads nowhere says
-    /// so in the system's words.
+    /// Whether the path `dir` leads to the directory `root`. A path that
+    /// leads nowhere says so in the system's words.
     fn leads(dir: &Path, root: &fs::File) -> io::Result<bool> {
+        Self::is_held(&fs::metadata(dir)?, root)
+    }
+
+    /// Whether `at_path`, what the system read at a path, is the directory
+    /// `root`, by the system's own identity of the two.
+    fn is_held(at_path: &fs::Metadata, root: &fs::File) -> io::Result<bool> {
         use std::os::unix::fs::MetadataExt as _;
 
-        let (path, held) = (fs::metadata(dir)?, root.metadata()?);
-        Ok((path.dev(), path.ino()) == (held.dev(), held.ino()))
+        let held = root.metadata()?;
+        Ok((at_path.dev(), at_path.ino()) == (held.dev(), held.ino()))
     }
 
     /// Refuses a start whose path leads to another directory than the one
     /// it locked, or to none, once the lock is held: the directory was
     /// renamed or removed while the start waited, and the one held is no
-    /// longer the one its path names. A link in the path that turned
-    /// passes: the path was resolved once, before the wait.
+    /// longer the one its path names. The path is asked once, as a new
+    /// start asks it, and the two identities are compared on that answer:
+    /// a file laid there is a path to no directory, as it is to that
+    /// start. A link in the path that turned passes: the path was resolved
+    /// once, before the wait.
     fn named_still(dir: &Path, root: &fs::File) -> Result<(), StoreRefused> {
-        match Self::leads(dir, root) {
+        let at_path = Self::found(dir)?;
+        match Self::is_held(&at_path, root) {
             Ok(true) => Ok(()),
             Ok(false) => Err(StoreRefused::Moved),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                Err(StoreRefused::NotADirectory)
-            }
             Err(error) => Err(StoreRefused::Unreadable(error.to_string())),
         }
     }
@@ -593,11 +610,10 @@ impl SpecStore {
     }
 
     /// Removes the file of `persisted` from the directory this store
-    /// holds, through the directory itself.
+    /// holds, through the directory itself. One that is gone already is
+    /// taken as removed.
     fn remove(&self, persisted: Persisted) -> io::Result<()> {
-        let name = file_name(persisted);
-        rustix::fs::unlinkat(&self.root, name, rustix::fs::AtFlags::empty())
-            .map_err(io::Error::from)
+        remove_at(&self.root, &file_name(persisted))
     }
 
     /// Persists `document` as `persisted`: written whole under a temporary
@@ -662,11 +678,11 @@ impl SpecStore {
         self.writes += 1;
         let (id, opened, write) = (process::id(), self.opened, self.writes);
         let writing = format!("{WRITING}{id}-{opened}-{write}");
-        let remove = |name: &str| {
-            rustix::fs::unlinkat(root, name, AtFlags::empty()).map_err(io::Error::from)
-        };
         let mut linked = false;
         let written = (|| {
+            // Opened to read and write, as the lock file is. The write
+            // alone uses it, and the flag that says so reads as a
+            // misspelling to the repository's spelling hook.
             let made = OFlags::RDWR | OFlags::CREATE | OFlags::EXCL;
             let mut file = open_at(root, &writing, made, Mode::from_raw_mode(0o666))?;
             file.write_all(document)?;
@@ -680,7 +696,9 @@ impl SpecStore {
                 }
             })?;
             linked = true;
-            remove(&writing)?;
+            // A start beside this write may have taken the temporary name
+            // away already: the link stands, and the write goes on.
+            remove_at(root, &writing)?;
             // The other form's name since the look above. A writer of that
             // form looks for this one after its own link, so one of the two
             // backs out at least: the two never both stay.
@@ -695,7 +713,7 @@ impl SpecStore {
         };
         // No name of this write stays, whichever step failed. A generation's
         // name this write did not link is another's.
-        let _ = remove(&writing);
+        let _ = remove_at(root, &writing);
         if !linked {
             return Err(failed);
         }
@@ -703,7 +721,7 @@ impl SpecStore {
         // generation on file: the removal is synced as the link was. A name
         // that stays and a removal that did not sync are each told, in its
         // own words, beside the write's own failure.
-        if let Err(left) = remove(&name) {
+        if let Err(left) = remove_at(root, &name) {
             return Err(stays(generation, &failed, &left));
         }
         match sync(root) {
@@ -1249,6 +1267,30 @@ pub(crate) mod tests {
         assert_eq!(refused, StoreRefused::NotADirectory);
     }
 
+    /// Where a directory is renamed under a waiting start and a file is
+    /// laid at its path, that start is refused as a new start is: as a
+    /// path to no directory.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_laid_under_a_waiting_start_refuses_it_as_a_new_start_is() {
+        let base = tempfile::tempdir().expect("a temp dir");
+        let (dir, moved) = (base.path().join("store"), base.path().join("moved"));
+        fs::create_dir(&dir).expect("the directory");
+        let holder = SpecStore::open(dir.clone()).expect("the holder");
+        let waiter = Waiter::held_off(dir.clone());
+        fs::rename(&dir, &moved).expect("the directory moves");
+        fs::write(&dir, "a file").expect("a file stands at its path");
+        drop(holder);
+        let refused = waiter
+            .start
+            .join()
+            .expect("the waiter")
+            .expect_err("no directory stands at the path");
+        assert_eq!(refused, StoreRefused::NotADirectory);
+        let new = SpecStore::open(dir).expect_err("a file is no store");
+        assert_eq!(new, StoreRefused::NotADirectory);
+    }
+
     /// A removal goes through the directory the store holds. Where the
     /// path leads to another one by then, a refused generation still goes
     /// off file there and the generations under the retained ones are
@@ -1388,7 +1430,9 @@ pub(crate) mod tests {
             );
             return;
         }
-        let opened = SpecStore::open_within(dir.path().to_owned(), Duration::ZERO);
+        // This start waits: a child process of another case may hold a copy
+        // of the lock's open file until its exec.
+        let opened = SpecStore::open(dir.path().to_owned());
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).expect("its bits");
         let store = opened.expect("the start goes on");
         assert_eq!(store.kept(), [at(1, YAML)]);
@@ -1412,14 +1456,14 @@ pub(crate) mod tests {
     }
 
     /// A temporary name that is gone when a start comes to remove it is
-    /// removed, which is what the start wanted: a live writer took its own
-    /// name away after its link, where the file system's locks do not
-    /// hold two apart.
+    /// taken as removed, which is what the start wanted: a live writer
+    /// took its own name away after its link, where the file system's
+    /// locks do not hold two apart.
     #[test]
-    fn a_temporary_name_gone_before_its_removal_is_removed() {
+    fn a_temporary_name_gone_before_its_removal_is_taken_as_removed() {
         let dir = tempfile::tempdir().expect("a temp dir");
         let (_, root) = SpecStore::rooted(dir.path()).expect("the directory");
-        SpecStore::clear(&root, &format!("{WRITING}gone")).expect("gone is removed");
+        SpecStore::clear(&root, &format!("{WRITING}gone")).expect("taken as removed");
     }
 
     /// A directory under a temporary name refuses the start behind the
@@ -1626,6 +1670,31 @@ pub(crate) mod tests {
         assert_eq!(store.kept(), []);
     }
 
+    /// A back-out whose linked name is gone already, another hand's work
+    /// between the link and the back-out, takes it as removed and says the
+    /// write's own failure alone.
+    #[test]
+    fn a_back_out_whose_linked_name_is_gone_says_the_writes_own_failure() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let mut store = SpecStore::open(dir.path().to_owned()).expect("an empty directory");
+        let name = dir.path().join(name_of(1, "yaml"));
+        let mut syncs = 0;
+        let taken = |_: &fs::File| {
+            syncs += 1;
+            if syncs > 1 {
+                return Ok(());
+            }
+            fs::remove_file(&name).expect("another hand takes the linked name");
+            Err(io::Error::other("the directory did not sync"))
+        };
+        let refused = store
+            .persist_synced(at(1, YAML), b"one", taken)
+            .expect_err("no sync");
+        assert_eq!(refused.to_string(), "the directory did not sync");
+        assert_eq!(store.kept(), []);
+        assert!(!name.exists(), "the linked name is gone");
+    }
+
     /// A writer that finds the other form's name after its own link backs
     /// out, and is told so apart from a number that is on file: its name is
     /// gone again, and once the other name is too, its next write of the
@@ -1764,6 +1833,42 @@ pub(crate) mod tests {
         store.forget().expect("the newest is removed");
         assert_eq!(store.kept(), [at(1, YAML)]);
         assert_eq!(names(dir.path()), BTreeSet::from([name_of(1, "yaml")]));
+    }
+
+    /// A refused generation whose file another hand took off first is
+    /// taken as removed: the store forgets it and says no failure.
+    #[test]
+    fn a_refused_generation_gone_from_file_is_taken_as_removed() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let mut store = SpecStore::open(dir.path().to_owned()).expect("an empty directory");
+        for generation in [1, 2] {
+            store
+                .persist(at(generation, YAML), b"document")
+                .expect("it persists");
+        }
+        fs::remove_file(dir.path().join(name_of(2, "yaml"))).expect("another hand");
+        store.forget().expect("the newest is gone already");
+        assert_eq!(store.kept(), [at(1, YAML)]);
+    }
+
+    /// A generation under the retained ones whose file is gone already is
+    /// taken as removed: the removal says so once, and no apply tries it
+    /// again.
+    #[test]
+    fn a_generation_gone_from_file_under_the_retained_ones_is_not_tried_again() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let mut store = SpecStore::open(dir.path().to_owned()).expect("an empty directory");
+        let count = u64::try_from(RETAINED).expect("a small count") + 1;
+        for generation in 1..=count {
+            store
+                .persist(at(generation, YAML), b"document")
+                .expect("it persists");
+        }
+        fs::remove_file(dir.path().join(name_of(1, "yaml"))).expect("another hand");
+        let pruned = store.prune();
+        assert!(matches!(pruned.as_slice(), [(1, Ok(()))]), "{pruned:?}");
+        assert!(store.prune().is_empty(), "nothing is tried again");
+        assert_eq!(store.kept().len(), RETAINED);
     }
 
     #[test]
