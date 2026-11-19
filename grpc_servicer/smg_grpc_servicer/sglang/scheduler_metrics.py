@@ -53,6 +53,10 @@ def serve_scheduler_metrics(server_args: Any) -> SchedulerMetricsEndpoint | None
     port = getattr(server_args, "smg_http_sidecar_port", None) or int(server_args.port) + 1
     address = host_port(host, port)
     try:
+        # On Linux, bind() raises OverflowError (not an OSError) for a port past
+        # 65535; --port 65535 derives one.
+        if not 0 < port < 65536:
+            raise ValueError(f"port {port} is outside the TCP range 1-65535")
         registry = CollectorRegistry()
         # Raises ValueError when this process has no metrics directory.
         MultiProcessCollector(registry)

@@ -210,3 +210,17 @@ def test_the_servicer_serves_on_when_the_scheduler_metrics_cannot_be_served(
     (warning,) = [r for r in caplog.records if "scheduler metrics" in r.getMessage()]
     assert warning.levelno == logging.WARNING
     assert "are not served" in warning.getMessage()
+
+
+def test_a_sidecar_port_past_the_tcp_range_is_logged_and_the_servicer_serves_on(
+    monkeypatch, tmp_path, caplog
+):
+    """--port 65535 puts the sidecar's default port past the TCP range."""
+    monkeypatch.setenv("PROMETHEUS_MULTIPROC_DIR", str(tmp_path))
+    with caplog.at_level(logging.WARNING):
+        code = _serve(monkeypatch, tmp_path, _server_args(port=65535), exit_code=5)
+
+    assert code == 5
+    (warning,) = [r for r in caplog.records if "scheduler metrics" in r.getMessage()]
+    assert warning.levelno == logging.WARNING
+    assert "outside the TCP range" in warning.getMessage()
