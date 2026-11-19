@@ -159,8 +159,8 @@ pub mod worker_host;
 pub use catalog::{Catalog, CatalogError, StageBuild, StageError, StageKind};
 pub use counts::{KeptCounts, LentCounts};
 pub use decision::{
-    Decision, Lifted, Pair, Pick, Queue, Shed, ShedReason, Survivors, Target, Targets, Trace,
-    MAX_TARGETS, TRACE_TOP,
+    Decision, Lifted, Overlap, OverlapSource, Pair, Pick, Queue, Shed, ShedReason, Survivors,
+    Target, Targets, Trace, MAX_TARGETS, TRACE_TOP,
 };
 pub use framework::{
     Binding, DecisionScope, EncodeItems, EncodePlaced, EncodePool, EncoderFacts, Engine, Filter,

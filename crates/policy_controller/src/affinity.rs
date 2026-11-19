@@ -20,7 +20,7 @@
 //! today. A share-weighted sum cannot hold a deeper holder ahead of a lighter
 //! one, which is the rule the preset keeps.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
@@ -28,6 +28,7 @@ use rustc_hash::FxHashMap;
 use crate::{
     builtins::ReadsLoad,
     counts::with_counts,
+    decision::{Overlap, OverlapSource},
     framework::{Front, Scorer, Spread, TieBand},
     lease::{Lifecycle, Membership},
     spec::{AffinitySource, KvPressureParams, Needs, PrefixAffinityParams, WarmupSliceParams},
@@ -382,6 +383,48 @@ fn neutral(out: &mut [f32]) -> TieBand {
     TieBand(0.0)
 }
 
+/// What a pass of a prefix stage judged its rows by, kept for the word the
+/// stage says of a pick behind its decision ([`Scorer::said`]). A scorer's
+/// call is handed no scratch of its decision's, and the pick is made
+/// behind it, so the two numbers wait in a slot of the thread: a decision
+/// is made and asked about on one thread, and the pass that decided is the
+/// last that ran. A pass writes the slot only where it prices the held
+/// prefix, and the engine clears it ahead of a decision whose overlap it
+/// states ([`forget_judged`]).
+#[derive(Clone, Copy)]
+struct Judged {
+    /// The stage that judged ([`PrefixAffinity::id`]): a profile may hold
+    /// two, and one's pass is no word of the other's.
+    by: u32,
+    /// The deepest match of the rows judged, in blocks.
+    best: u32,
+    /// The mean in flight the spill gate read.
+    mean: f32,
+}
+
+impl Judged {
+    /// No pass judged: no stage's number, and a match no row holds.
+    const NONE: Self = Self {
+        by: 0,
+        best: 0,
+        mean: 0.0,
+    };
+}
+
+thread_local! {
+    static JUDGED: std::cell::Cell<Judged> = const { std::cell::Cell::new(Judged::NONE) };
+}
+
+/// Forgets what a pass on this thread judged by: a decision no pass
+/// judged for then says that no margin held.
+pub(crate) fn forget_judged() {
+    JUDGED.set(Judged::NONE);
+}
+
+/// The number the next prefix stage takes ([`PrefixAffinity::id`]): none
+/// takes `0`, which reads as no stage.
+static NEXT_STAGE: AtomicU32 = AtomicU32::new(1);
+
 // ---------------------------------------------------------------- prefix affinity
 
 /// The holders of the request's prefix first. A candidate's match is its
@@ -396,6 +439,9 @@ pub struct PrefixAffinity {
     threshold: f32,
     source: AffinitySource,
     gates: Gates,
+    /// The stage's own number, by which a pass's word is told from another
+    /// stage's ([`Judged`]).
+    id: u32,
 }
 
 impl PrefixAffinity {
@@ -405,7 +451,14 @@ impl PrefixAffinity {
             threshold: params.threshold.unwrap_or(DEFAULT_THRESHOLD),
             source: params.source.unwrap_or_default(),
             gates,
+            id: NEXT_STAGE.fetch_add(1, Ordering::Relaxed),
         }
+    }
+
+    /// Whether a held prefix is priced for this request: the document
+    /// prices the margin, and a decode worker prefills nothing again.
+    fn priced(&self, facts: &RequestFacts<'_>) -> bool {
+        self.gates.prefix_margin_tokens > 0 && facts.phase != Phase::Decode
     }
 
     /// The blocks of the request a candidate holds by this stage's source.
@@ -462,8 +515,13 @@ impl PrefixAffinity {
         let avg = spill_mean(feed.drawn_mean(), facts, candidates, kept);
         // A decode worker prefills nothing again: its held prefix is not
         // priced.
-        let priced = self.gates.prefix_margin_tokens > 0 && facts.phase != Phase::Decode;
-        let held = if priced {
+        let held = if self.priced(facts) {
+            // What this pass judges by waits for the word of the pick.
+            JUDGED.set(Judged {
+                by: self.id,
+                best,
+                mean: avg,
+            });
             self.gates.tokens_of(best, facts)
         } else {
             0.0
@@ -522,8 +580,13 @@ impl PrefixAffinity {
             }
         }
         let avg = spill_mean(named.mean_in_flight, facts, candidates, kept);
-        let priced = self.gates.prefix_margin_tokens > 0 && facts.phase != Phase::Decode;
-        let held = if priced {
+        let held = if self.priced(facts) {
+            // What this pass judges by waits for the word of the pick.
+            JUDGED.set(Judged {
+                by: self.id,
+                best,
+                mean: avg,
+            });
             self.gates.tokens_of(best, facts)
         } else {
             0.0
@@ -589,6 +652,53 @@ impl Scorer for PrefixAffinity {
     /// A holder of the deepest match, a row under the gate, a row over it.
     fn spread(&self) -> Spread {
         Spread::Levels(0.5)
+    }
+
+    fn states_overlap(&self) -> bool {
+        true
+    }
+
+    /// The row's match by the stage's source, of the request's blocks, and
+    /// whether the held prefix's price kept the row in front: it is a
+    /// deepest holder of the pass that decided, and at the mean that pass
+    /// judged by it stands over the swing's margin and under the priced
+    /// one. The row's count is read again here: where another decider
+    /// booked on the row since the pass, it stands one off the count the
+    /// pass read. Under the fleet's KV gate the stage ordered nothing, and
+    /// the row's match is said all the same.
+    fn said(&self, facts: &RequestFacts<'_>, candidates: &[Candidate], row: u32) -> Overlap {
+        let request_blocks = self.gates.request_blocks(facts);
+        // A row past a column holds nothing, as a row no host named.
+        let held = match facts.feed() {
+            Feed::Column(column) => column.get(row as usize).copied().unwrap_or_default(),
+            Feed::Named(named) => named.entry(row),
+        };
+        let blocks = self.matched(held, request_blocks);
+        let source = if blocks == 0 {
+            OverlapSource::None
+        } else if self.source != AffinitySource::Predictor && held.overlap_blocks == blocks {
+            OverlapSource::Index
+        } else {
+            OverlapSource::Predictor
+        };
+        // The pass's word is taken whichever row is asked about: it is
+        // the word of one decision.
+        let judged = JUDGED.replace(Judged::NONE);
+        let margin_held = blocks > 0
+            && judged.by == self.id
+            && judged.best == blocks
+            && candidates.get(row as usize).is_some_and(|candidate| {
+                let load = facts.in_flight(candidate) as f32;
+                let price = self.gates.tokens_of(blocks, facts);
+                self.gates.over(load, judged.mean, 0.0)
+                    && !self.gates.over(load, judged.mean, price)
+            });
+        Overlap {
+            blocks: u16::try_from(blocks).unwrap_or(u16::MAX),
+            of: u16::try_from(request_blocks).unwrap_or(u16::MAX),
+            source,
+            margin_held,
+        }
     }
 
     fn score_front(
@@ -2485,6 +2595,214 @@ mod tests {
             assert!(by_walk.1 > 0, "{}: a walk looks behind", stage.name());
             assert_eq!(by_search.1, 0, "{}: a search keeps no cursor", stage.name());
         }
+    }
+
+    /// The stage's word of a row: its match by the stage's source, of the
+    /// request's blocks, and where the match was read.
+    #[test]
+    fn the_stage_says_what_a_row_holds_by_its_source() {
+        use AffinitySource::{Index, Merged, Predictor};
+        let said = |source, overlap_blocks, predicted_blocks| {
+            let params = PrefixAffinityParams {
+                source: Some(source),
+                ..PrefixAffinityParams::default()
+            };
+            let stage = PrefixAffinity::new(&params, Gates::of(Some(&params), None, Some(16)));
+            let column = [AffinityFacts {
+                overlap_blocks,
+                predicted_blocks,
+                ..AffinityFacts::default()
+            }];
+            let facts = RequestFacts {
+                affinity: &column,
+                ..facts(16)
+            };
+            let said = stage.said(&facts, &rows(&[candidate(0, 0, 0)]), 0);
+            assert!(!said.margin_held);
+            (said.blocks, said.of, said.source)
+        };
+        // The index's blocks, at any depth.
+        assert_eq!(said(Index, 3, 12), (3, 16, OverlapSource::Index));
+        // The predictor's, past the stage's threshold alone.
+        assert_eq!(said(Predictor, 9, 12), (12, 16, OverlapSource::Predictor));
+        assert_eq!(said(Predictor, 9, 4), (0, 16, OverlapSource::None));
+        // Merged: the larger of the two, the index on a tie.
+        assert_eq!(said(Merged, 3, 12), (12, 16, OverlapSource::Predictor));
+        assert_eq!(said(Merged, 13, 12), (13, 16, OverlapSource::Index));
+        assert_eq!(said(Merged, 12, 12), (12, 16, OverlapSource::Index));
+        assert_eq!(said(Merged, 0, 0), (0, 16, OverlapSource::None));
+    }
+
+    /// A row no host named and a row past a column hold nothing, and the
+    /// word's two counts are held at their sixteen bits.
+    #[test]
+    fn a_row_nobody_named_holds_nothing_and_the_words_counts_keep_sixteen_bits() {
+        let stage = affinity(None);
+        let pool = rows(&[candidate(0, 0, 0), candidate(1, 0, 0)]);
+        let holders = [holder(1, 5)];
+        let named = RequestFacts {
+            named: Some(named(&holders, &[], false)),
+            ..facts(16)
+        };
+        let nothing = Overlap {
+            of: 16,
+            ..Overlap::default()
+        };
+        assert_eq!(stage.said(&named, &pool, 1).blocks, 5);
+        assert_eq!(stage.said(&named, &pool, 0), nothing);
+        let column = [AffinityFacts {
+            overlap_blocks: 70_000,
+            ..AffinityFacts::default()
+        }];
+        let long = RequestFacts {
+            affinity: &column,
+            prompt_tokens: 16 * 80_000,
+            ..facts(16)
+        };
+        let said = stage.said(&long, &pool, 0);
+        assert_eq!((said.blocks, said.of), (u16::MAX, u16::MAX));
+        assert_eq!(stage.said(&long, &pool, 9).blocks, 0);
+    }
+
+    /// One holder over the swing's margin and under the priced one: the
+    /// stage says the margin held. It says so once, of its own pass, of a
+    /// deepest holder, and not behind [`forget_judged`].
+    #[test]
+    fn the_word_of_a_pass_is_one_decisions_and_one_stages() {
+        let gate = || {
+            affinity(Some(SpillParams {
+                rel: Some(1.1),
+                prefix_margin_tokens: Some(8),
+                ..SpillParams::default()
+            }))
+        };
+        let (stage, other) = (gate(), gate());
+        let pool = [
+            candidate(0, 10, 8),
+            candidate(1, 0, 0),
+            candidate(2, 0, 0),
+            candidate(3, 0, 0),
+        ];
+        let (rows, column) = (rows(&pool), column(&pool));
+        let facts = RequestFacts {
+            affinity: &column,
+            ..facts(16)
+        };
+        let pass = |stage: &PrefixAffinity| {
+            let mut out = vec![0.0; 4];
+            stage.score(&facts, &rows, &kept(4), &mut out);
+            out
+        };
+        assert_eq!(pass(&stage), vec![1.0, 0.5, 0.5, 0.5]);
+        let held = Overlap {
+            blocks: 8,
+            of: 16,
+            source: OverlapSource::Index,
+            margin_held: true,
+        };
+        assert_eq!(stage.said(&facts, &rows, 0), held);
+        // Asked again, the word is spent.
+        assert!(!stage.said(&facts, &rows, 0).margin_held);
+        // A row that is no deepest holder was kept by no price.
+        pass(&stage);
+        assert!(!stage.said(&facts, &rows, 1).margin_held);
+        // Another stage's pass is no word of this one's.
+        pass(&stage);
+        pass(&other);
+        assert!(!stage.said(&facts, &rows, 0).margin_held);
+        // A decision whose overlap the engine states begins with no word.
+        pass(&stage);
+        forget_judged();
+        assert!(!stage.said(&facts, &rows, 0).margin_held);
+    }
+
+    /// The margin's bit is the difference of two scores: the stage that
+    /// prices the held prefix puts the row in front, and the same gate
+    /// with no price puts it behind. Over pools, holders, loads and
+    /// orders drawn at random, on a column, on named rows and behind a
+    /// draw with the engine's mean, a decode phase among them. The word
+    /// is one decision's: asked a second time it says no margin.
+    #[test]
+    fn the_margin_held_is_the_price_alone_keeping_a_row_in_front() {
+        let gate = |prefix_margin_tokens| {
+            affinity(Some(SpillParams {
+                rel: Some(1.1),
+                prefix_margin_tokens,
+                ..SpillParams::default()
+            }))
+        };
+        let (priced, plain) = (gate(Some(8)), gate(None));
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = |below: u64| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) % below
+        };
+        let mut held = [0u32; 3];
+        for round in 0..3_000u32 {
+            let n = 1 + next(24) as u32;
+            let pool: Vec<Candidate> = (0..n)
+                .map(|row| candidate(row, next(40) as u32, 0).0)
+                .collect();
+            // Every fourth round names nobody.
+            let mut holders = Vec::new();
+            let mut column = vec![AffinityFacts::default(); n as usize];
+            for row in 0..n {
+                if round % 4 != 0 && next(3) == 0 {
+                    let blocks = 1 + next(16) as u32;
+                    holders.push(holder(row, blocks));
+                    column[row as usize].overlap_blocks = blocks;
+                }
+            }
+            // A draw's order: some of the rows, each once.
+            let mut order: Vec<u32> = (0..n).filter(|&row| row == 0 || next(4) != 0).collect();
+            for i in (1..order.len()).rev() {
+                order.swap(i, next(i as u64 + 1) as usize);
+            }
+            let whole = named(&holders, &[], false);
+            let drawn = NamedAffinity {
+                mean_in_flight: Some(mean_in_flight(&RequestFacts::default(), &pool, &order)),
+                ..whole
+            };
+            // Named rows, named rows behind a draw, a column.
+            let feed = round as usize % 3;
+            let facts = RequestFacts {
+                affinity: if feed == 2 { &column } else { &[] },
+                named: [Some(whole), Some(drawn), None][feed],
+                phase: if round % 5 == 0 {
+                    Phase::Decode
+                } else {
+                    Phase::Single
+                },
+                ..facts(16)
+            };
+            let scored = |stage: &PrefixAffinity| {
+                let mut out = vec![0.0; order.len()];
+                stage.score(&facts, &pool, &order, &mut out);
+                out
+            };
+            let unpriced = scored(&plain);
+            for (at, &row) in order.iter().enumerate() {
+                // The pass that decided is the last that ran.
+                let by_price = scored(&priced);
+                let kept = by_price[at] >= 1.0 && unpriced[at] <= 0.0;
+                assert_eq!(
+                    priced.said(&facts, &pool, row).margin_held,
+                    kept,
+                    "round {round}, row {row}: {holders:?}, order {order:?}"
+                );
+                assert!(
+                    !priced.said(&facts, &pool, row).margin_held,
+                    "round {round}, row {row}: asked twice"
+                );
+                held[feed] += u32::from(kept);
+            }
+        }
+        assert!(
+            held.iter().all(|&rows| rows > 30),
+            "rows the price alone kept, a feed: {held:?}"
+        );
     }
 
     /// The prefix stage's body behind a draw scores as the whole pass's

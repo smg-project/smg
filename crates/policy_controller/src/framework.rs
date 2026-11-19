@@ -6,10 +6,10 @@
 use std::{any::Any, collections::HashMap, fmt::Debug};
 
 use crate::{
-    affinity::WarmRule,
+    affinity::{forget_judged, WarmRule},
     builtins::{target_of, Best, FewestSessions, LeastRequests, Random, RowTests},
     decision::{
-        Decision, Lifted, Pair, Pick, Shed, ShedReason, Survivors, Target, Targets, Trace,
+        Decision, Lifted, Overlap, Pair, Pick, Shed, ShedReason, Survivors, Target, Targets, Trace,
         MAX_TARGETS, TRACE_TOP,
     },
     lease::{Lease, Lifecycle, Membership, Outcome, ReleaseReason, Side, Signal},
@@ -321,6 +321,22 @@ pub trait Scorer: Lifecycle + Debug {
         out: &mut [f32],
     ) -> (TieBand, Front) {
         (self.score(facts, candidates, asked, out), Front::Unsaid)
+    }
+
+    /// Whether this scorer says what a pick's first target holds of its
+    /// request ([`Self::said`]); the default is no. The engine reads it
+    /// once per profile when it is built, and asks the profile's first
+    /// such scorer behind a decision whose overlap it states
+    /// ([`Engine::decide_stated`]).
+    fn states_overlap(&self) -> bool {
+        false
+    }
+
+    /// What `row` holds of the request ([`Overlap`]), asked behind the
+    /// decision that picked the row, on the thread that made it. The
+    /// default says nothing.
+    fn said(&self, _facts: &RequestFacts<'_>, _candidates: &[Candidate], _row: u32) -> Overlap {
+        Overlap::default()
     }
 
     /// What the host must feed for this scorer to mean anything. A scorer
@@ -2458,6 +2474,11 @@ pub struct Engine {
     /// ([`Lifecycle::keeps_loads`]), each by its place: listed once at the
     /// build, so a publication asks no stage whether it keeps them.
     keepers: Vec<Keeper>,
+    /// Per profile, the place among its scorers of the first that states a
+    /// pick's overlap ([`Scorer::states_overlap`]), [`UNSTATED`] where the
+    /// profile holds none. A decision reads it where its host asks the
+    /// overlap stated ([`Engine::decide_stated`]), and no other does.
+    stating: Vec<u8>,
 }
 
 /// A stage that keeps a number of the reports, by its place in the engine.
@@ -2494,6 +2515,10 @@ impl Keeper {
 pub(crate) const KEEPS_DECIDERS: u8 = 1;
 /// The generation samples decisions at the seat where they were made.
 pub(crate) const SAMPLES_DECISIONS: u8 = 2;
+
+/// No scorer of a profile states a pick's overlap: a place no profile's
+/// list of scorers is read at.
+const UNSTATED: u8 = u8::MAX;
 
 /// Which of a profile's leading stages are ranks, read once when the engine
 /// is built: a stage that writes levels ([`Spread::Levels`]) and whose
@@ -3332,6 +3357,14 @@ impl Engine {
             .collect();
         let keeping = marks.iter().any(|marks| marks.scoped());
         let named: Vec<u32> = profiles.iter().map(Profile::named_cap).collect();
+        let stating = profiles
+            .iter()
+            .map(|profile| {
+                let stated = |weighted: &Weighted| weighted.scorer.states_overlap();
+                let at = profile.scorers.iter().position(stated);
+                at.and_then(|at| u8::try_from(at).ok()).unwrap_or(UNSTATED)
+            })
+            .collect();
         let row_tests = profiles
             .iter()
             .map(|profile| RowTests::of(&profile.filters))
@@ -3374,6 +3407,7 @@ impl Engine {
             explain_sample: 0,
             max_report_age_ms: None,
             keepers,
+            stating,
         }
     }
 
@@ -3875,6 +3909,52 @@ impl Engine {
             }
         }
         run_whole(self, index, facts, pool, set, cx, buf)
+    }
+
+    /// [`Self::decide`], with what the pick's first target holds of the
+    /// request stated in the pick ([`Overlap`]): the word of the deciding
+    /// profile's first scorer that states one ([`Scorer::said`]), and
+    /// nothing where the profile holds none. A host calls it for a
+    /// decision it fed the rows' holdings for, and [`Self::decide`] for
+    /// any other: that entry asks no stage a thing more and states
+    /// nothing.
+    pub fn decide_stated(
+        &self,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        candidates: &[Candidate],
+        cx: &Constraints<'_>,
+        scratch: &mut Scratch,
+    ) -> Decision {
+        // What a pass of an earlier decision judged by is no word of this
+        // one's pick.
+        forget_judged();
+        let mut decision = self.decide(facts, pool, candidates, cx, scratch);
+        if let Decision::Pick(pick) = &mut decision {
+            let overlap = self.overlap_of(facts, candidates, pick);
+            pick.targets.state(overlap);
+        }
+        decision
+    }
+
+    /// What `pick`'s first target holds of the request, by the first
+    /// scorer of the profile that decided that states it.
+    fn overlap_of(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        pick: &Pick,
+    ) -> Overlap {
+        let profile = usize::from(pick.trace.profile);
+        let stage = self.stating.get(profile).copied().unwrap_or(UNSTATED);
+        let stage = self
+            .profiles
+            .get(profile)
+            .and_then(|profile| profile.scorers.get(usize::from(stage)));
+        match (stage, pick.targets.first()) {
+            (Some(stage), Some(target)) => stage.scorer.said(facts, candidates, target.position),
+            _ => Overlap::default(),
+        }
     }
 
     /// A keyed decision under a sessions rule (design 4.6 and the host's
@@ -4767,13 +4847,14 @@ mod tests {
 
     use super::*;
     use crate::{
+        affinity::{Gates, PrefixAffinity},
         builtins::{
             Best, CountFirst, Healthy, LeastRequests, Manual, NotOverloaded, NotTried, Passthrough,
             PowerOfTwo, PowerOfTwoCountFirst, Random, RoundRobin,
         },
         counts::tests::Lent,
         sessions::Recovery,
-        spec::{PolicySpec, PowerOfTwoMetric},
+        spec::{PolicySpec, PowerOfTwoMetric, PrefixAffinityParams, SpillParams},
         view::{Health, Identity, MediaCounts, Role, Session, WorkerId},
     };
 
@@ -4842,6 +4923,100 @@ mod tests {
         assert_eq!(pick.trace.survivors.get(), Some(3));
         assert_eq!(pick.trace.top[0].0, WorkerId(101));
         assert_eq!(pick.trace.top_len, 3);
+    }
+
+    /// A stated decision begins with no word of an earlier pass. The plain
+    /// entry asks no stage what it judged, so the word of its priced pass
+    /// stays on the thread. The next stated decision is a decode phase's
+    /// and prices nothing: the word it finds is not its own, and it says
+    /// no margin.
+    #[test]
+    fn a_stated_decision_begins_with_no_word_of_an_earlier_pass() {
+        let params = PrefixAffinityParams {
+            spill: Some(SpillParams {
+                rel: Some(1.1),
+                prefix_margin_tokens: Some(8),
+                ..SpillParams::default()
+            }),
+            ..PrefixAffinityParams::default()
+        };
+        let stage = PrefixAffinity::new(&params, Gates::of(Some(&params), None, Some(16)));
+        let engine = Engine::new(
+            vec![Profile {
+                name: "cache".into(),
+                filters: vec![Box::new(Healthy)],
+                scorers: vec![Weighted {
+                    scorer: Box::new(stage),
+                    weight: 1.0,
+                }],
+                picker: Box::new(Best),
+            }],
+            vec![Binding {
+                model: "*".into(),
+                phases: vec![],
+                plan: Plan::Single,
+                profile: 0,
+                decode_profile: None,
+                sessions: None,
+                overload: None,
+            }],
+            1,
+            Needs::default(),
+        );
+        // Row 0 holds eight of the request's sixteen blocks.
+        let mut column = [AffinityFacts::default(); 4];
+        column[0] = AffinityFacts {
+            overlap_blocks: 8,
+            admitted_age_ms: u32::MAX,
+            ..AffinityFacts::default()
+        };
+        let hashes = [0u64; 16];
+        let facts = |phase| RequestFacts {
+            model: "m",
+            block_hashes: &hashes,
+            prompt_tokens: 256,
+            seed: 7,
+            affinity: &column,
+            phase,
+            ..RequestFacts::default()
+        };
+        let (prefill, decode) = (facts(Phase::Single), facts(Phase::Decode));
+        let busy = [
+            candidate(0, 10),
+            candidate(1, 0),
+            candidate(2, 0),
+            candidate(3, 0),
+        ];
+        let level = [
+            candidate(0, 10),
+            candidate(1, 10),
+            candidate(2, 10),
+            candidate(3, 10),
+        ];
+        let mut scratch = Scratch::new();
+        let stated = |facts: &RequestFacts<'_>, pool: &[Candidate], scratch: &mut Scratch| {
+            let decision = engine.decide_stated(
+                facts,
+                &PoolFacts::default(),
+                pool,
+                &Constraints::default(),
+                scratch,
+            );
+            let pick = decision.pick().expect("a pick");
+            let first = pick.targets.first().map(|target| target.position);
+            (first, pick.overlap().blocks, pick.overlap().margin_held)
+        };
+        // The price alone keeps the busy holder in front.
+        assert_eq!(stated(&prefill, &busy, &mut scratch), (Some(0), 8, true));
+        // The plain entry's pass leaves its word on the thread.
+        engine.decide(
+            &prefill,
+            &PoolFacts::default(),
+            &busy,
+            &Constraints::default(),
+            &mut scratch,
+        );
+        assert_eq!(stated(&decode, &level, &mut scratch), (Some(0), 8, false));
     }
 
     #[test]
