@@ -62,7 +62,6 @@ use crate::lease::LeaseId;
 const BLOCK_BITS: u32 = 20;
 
 /// The ids of one block.
-#[cfg(any(test, feature = "controller"))]
 const BLOCK: u32 = 1 << BLOCK_BITS;
 
 /// The blocks of one term's counter.
@@ -148,7 +147,6 @@ impl Blocks {
     /// where `term` does not lead the blocks, its last block is claimed or
     /// the store's term is past 31 bits: the file mints no further id
     /// under it.
-    #[cfg(any(test, feature = "controller"))]
     pub(super) fn claim(&self, term: u64, file: u8) -> Option<u16> {
         let _one = self.claims.lock();
         if self.past.load(Ordering::Acquire) {
@@ -333,7 +331,6 @@ impl Blocks {
 
 /// What one file holds of the counter, under its turn: the block it
 /// claimed last, as far as it minted into it.
-#[cfg(any(test, feature = "controller"))]
 #[derive(Debug, Default)]
 pub(super) struct Minted {
     /// The term the block was claimed under.
@@ -344,7 +341,6 @@ pub(super) struct Minted {
     left: u32,
 }
 
-#[cfg(any(test, feature = "controller"))]
 impl Minted {
     /// The counter of `file`'s next id under `term`: the next of the block
     /// it holds, or the first of the block it claims where that one is

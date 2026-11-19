@@ -17,8 +17,9 @@
 //! - 4.2, the decision ([`decision`]): an ordered [`Pick`] of up to
 //!   [`MAX_TARGETS`] targets, a [`Shed`] with its reason and the stage that
 //!   emptied the pool, or a [`Queue`] ticket (specified in v1; no built-in
-//!   issues one yet). A decision books nothing: the host commits one target
-//!   under its own locks and reports the lifecycle back.
+//!   issues one yet). A decision books nothing by itself: its door files
+//!   the pick's lease at the issue, which books the first target, and the
+//!   host reports the lifecycle back.
 //! - 4.3, the lifecycle ([`lease`]): the [`Lease`] a decision carries and the
 //!   [`Lifecycle`] hooks a stateful stage learns from (issued, dispatched,
 //!   completed, released, membership, signal).
@@ -73,6 +74,13 @@
 //!   the load helpers (the row conversion, the scrape parser). The KV
 //!   subscription, the prober and discovery arrive in the step's later PRs.
 //!
+//! - The door ([`door`]): the order of one decision's calls, written once
+//!   for every host. A host that embeds the engine asks [`door::Door`],
+//!   which runs the order on the caller's thread over a
+//!   [`store::MemoryStore`]: the lease is filed at the issue, the host says
+//!   what became of it ([`door::Door::report`]) and its timer calls the
+//!   door's clock ([`door::Door::sweep`]). The standalone controller runs
+//!   the same order on its deciders' threads.
 //! - Behind the `controller` feature, the standalone controller
 //!   (`controller`): the listeners with their credentialed scopes, the
 //!   health service on each, the admin endpoints, readiness and the drain,
@@ -102,6 +110,7 @@ pub mod controller;
 pub mod counts;
 pub mod decider;
 pub mod decision;
+pub mod door;
 pub mod elector;
 pub mod framework;
 #[cfg(feature = "controller")]

@@ -1237,7 +1237,7 @@ mod tests {
 
     use super::{
         config::tests::valid,
-        deciders::{tests as bed, TERM_MARK},
+        deciders::tests as bed,
         election::{self, Standing},
         following,
         membership::tests::Logged,
@@ -1248,6 +1248,7 @@ mod tests {
         Error, NoFollow, Scope,
     };
     use crate::{
+        door::TERM_MARK,
         elector::{
             ElectError, ElectionSettings, Elector, LeaseBackend, LeaseRecord, MemoryLease, Tick,
             Written,

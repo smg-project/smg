@@ -100,9 +100,10 @@
 //! filter of the catalog reads them, and no profile picks a member its
 //! gateway cannot dial. The candidates the wires take are counted, and a
 //! decision whose pool has rows and whose gateway shares a wire with none
-//! of them is shed under [`WIRES`]. One whose gateway hints a subset of 0,
-//! a decision over no candidates, is shed under [`SUBSET_HINT`]. A positive
-//! hint is read by no stage yet.
+//! of them is shed under [`WIRES`](crate::door::WIRES). One whose gateway
+//! hints a subset of 0, a decision over no candidates, is shed under
+//! [`SUBSET_HINT`](crate::door::SUBSET_HINT). A positive hint is read by
+//! no stage yet.
 //!
 //! What this build has no decision for is answered `Busy` with no reason,
 //! and its gateway decides it locally at once: a shed is a policy's word
@@ -150,24 +151,18 @@ use tracing::{error, info, warn};
 use super::{
     election::Standing,
     lifecycle,
-    wire::{self, Checked, Lists, Viewed},
+    wire::{self, Checked, Lists},
 };
 use crate::{
     decider::Decider,
-    decision::{Decision, Shed, ShedReason, Trace},
+    decision::Decision,
+    door::{decide_in, decider_of, issue, past_mark, summed, Buffers, Part, StorePins, Taken},
     elector::{term_said, Fence},
-    framework::{release, Plan, Scratch},
-    lease::{Lease, LeaseId, LeaseKind, Lifecycle, ReleaseReason, Side},
+    framework::release,
+    lease::{Lease, Lifecycle, ReleaseReason},
     proto::{self, busy::Reason},
-    sessions::SessionVerdict,
-    store::{
-        leases::DISPATCH_TTL, Ask, AtWork, Built, GatewayId, LeaseRecord, LeaseRefused, LeaseState,
-        MemoryStore, Named, Naming, Picked, Said, SessionsStore, ViewBuffers, World,
-    },
-    view::{
-        fingerprint, AffinityFacts, Candidate, Constraints, Phase, PinSource, PoolFacts,
-        RequestFacts, Role, Session, WireModes, WorkerId,
-    },
+    store::{leases::DISPATCH_TTL, AtWork, GatewayId, LeaseRefused, MemoryStore, Said, World},
+    view::PinSource,
 };
 
 /// What the deciders and the streams count on the controller's own side,
@@ -215,22 +210,6 @@ pub(crate) struct Counts {
 /// one at its index, and deciders past this many share one.
 const PARTS: usize = 16;
 
-/// One decider's part of the counts that every decision can move, on cache
-/// lines of its own. Where a fleet's gateways speak fewer wires than its
-/// members, each decision counts the candidates it lost; where a host
-/// hashes past what its generation reads, each counts its request. One
-/// count for every decider would be a line they all write.
-#[derive(Debug, Default)]
-#[repr(align(128))]
-pub(crate) struct Part {
-    /// Candidates the wires of their decision's gateway took from its
-    /// view, members that share no wire with it.
-    pub(crate) undialed: AtomicU64,
-    /// Requests that carried more block hashes than their generation
-    /// reads of them.
-    pub(crate) hashes_cut: AtomicU64,
-}
-
 impl Counts {
     /// The reasons of a `Busy`, in the order of their numbers on the wire.
     pub(crate) const BUSY: [&'static str; 5] = [
@@ -258,18 +237,9 @@ impl Counts {
 
     /// One of a part's counts, summed over the parts.
     fn whole(&self, count: impl Fn(&Part) -> &AtomicU64) -> u64 {
-        let parts = self.parts.iter();
-        parts.map(|part| count(part).load(Ordering::Relaxed)).sum()
+        summed(&self.parts, count)
     }
 }
-
-/// The stage a decision is shed under when its pool has rows and its
-/// gateway shares a wire with none of them.
-pub(crate) const WIRES: &str = "wires";
-
-/// The stage a decision is shed under when its gateway hints a subset of 0
-/// of a pool that has rows: a decision over no candidates, as it asked.
-pub(crate) const SUBSET_HINT: &str = "subset-hint";
 
 /// The requests one decider's queue holds: one stream's window. At the
 /// design's cost of a decision a full queue is one cross-node budget of
@@ -278,21 +248,6 @@ pub(crate) const QUEUE_DEPTH: usize = 128;
 
 /// The clock a decider reads, twice a decision.
 pub(crate) type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
-
-/// The counter at which a term's leader is told to leave: three quarters of
-/// the ids one term mints. A leader that leaves there takes its next term
-/// with the counter at its start, so no term reaches the counter's end; the
-/// quarter left is what the term still mints between the word and its
-/// fence's close.
-pub(crate) const TERM_MARK: u32 = 3 << 30;
-
-/// Whether `id` is at or past its term's mark ([`TERM_MARK`]): the counter
-/// is the id's low half, as the contract lays an id out. At or past, and
-/// not the mark's own id alone: the mint steps over an id on file, and a
-/// term's ids need not all pass through one decider.
-fn past_mark(id: LeaseId) -> bool {
-    (id.0 & u64::from(u32::MAX)) >= u64::from(TERM_MARK)
-}
 
 /// What a decider calls once it handed over a term's first answer at or
 /// past the mark: the election's planned hand-over, handed that term.
@@ -455,7 +410,7 @@ impl Deciders {
     /// The decider `model`'s decisions run on: every request for a model
     /// goes to one, whichever stream carries it.
     pub(crate) fn of(&self, model: &str) -> usize {
-        (fingerprint(model.as_bytes()) % self.queues.len() as u64) as usize
+        decider_of(model, self.queues.len())
     }
 
     /// The deciders' clock. A stream's reader stamps a frame's receipt by
@@ -490,18 +445,6 @@ impl Deciders {
     }
 }
 
-/// What a decider keeps across decisions: the engine's run of a decision
-/// allocates only while these grow. A decision is handed to its stream as
-/// it was made ([`wire::Decided`]), and the stream builds its frame: a
-/// decider makes no list for an answer.
-#[derive(Default)]
-struct Buffers {
-    view: ViewBuffers,
-    scratch: Scratch,
-    lists: Lists,
-    named: Named,
-}
-
 /// Starts decider `index`'s thread. The thread holds the guard that tells
 /// its unwind, whatever it runs.
 fn watched(
@@ -521,7 +464,7 @@ fn watched(
 /// One deciding thread.
 struct Deciding {
     reads: Reads,
-    buffers: Buffers,
+    buffers: Buffers<Lists>,
     /// The last decision panicked: a streak of them writes one line.
     faulted: bool,
     /// Its place among the deciders, which names its part of a count.
@@ -739,7 +682,7 @@ impl Deciding {
         gateway: GatewayId,
         received: Instant,
         now: Instant,
-    ) -> Result<(u64, Taken<'a>), Reason> {
+    ) -> Result<(u64, Taken<'a, Checked>), Reason> {
         let Reads { fence, counts, .. } = &self.reads;
         let term = fence.leader_term(now).ok_or(Reason::NotLeader)?;
         if request.has_text() {
@@ -771,7 +714,7 @@ impl Deciding {
         // What the sessions handed is applied where the turn is free,
         // whatever was judged: before the rows' counts are read, and by a
         // request refused above too, so a hand at a full ring waits for
-        // one request of this decider at most.
+        // the first request of this decider that finds the turn free.
         if let Some(at_work) = &self.working {
             at_work.apply();
         }
@@ -854,21 +797,7 @@ impl Deciding {
     }
 }
 
-/// A request as its decider takes it.
-#[derive(Clone, Copy)]
-struct Taken<'a> {
-    request: &'a Checked,
-    gateway: GatewayId,
-    /// The decider's first read of its clock: the decision's instant.
-    now: Instant,
-    /// What is left of the request's budget at that instant.
-    left: Duration,
-    /// The pins of record lent to the decision, where its host keeps them:
-    /// its engine asks them for a key its own table holds no pin of.
-    pins: Option<&'a dyn PinSource>,
-}
-
-impl<'a> Taken<'a> {
+impl<'a> Taken<'a, Checked> {
     /// `request` as its decider takes it at `now`; `None` when its budget
     /// is gone. The budget counts from the frame's receipt: what the queue
     /// used of it is not the decision's. Under one microsecond left is
@@ -908,232 +837,11 @@ impl<'a> Taken<'a> {
         later.saturating_duration_since(self.now)
     }
 
-    /// When the dispatch span of a lease filed for the request ends: the
-    /// span counts from the read the request was taken at.
-    fn due(&self) -> Instant {
-        self.now + DISPATCH_TTL
-    }
-
     /// Whether the budget is gone `since` the request was taken: what was
     /// left then, less that time, under the same rule.
     fn outlasted(&self, since: Duration) -> bool {
         self.left.saturating_sub(since) < Duration::from_micros(1)
     }
-}
-
-/// The store's pins of record as a decision's engine reads them
-/// ([`PinSource`]): asked for a key the engine's table holds no pin of,
-/// under no lock but the pins' own.
-struct StorePins<'a> {
-    store: &'a MemoryStore,
-    /// The decision's instant: a pin's end and its age are read against
-    /// it.
-    now: Instant,
-}
-
-impl std::fmt::Debug for StorePins<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StorePins").finish_non_exhaustive()
-    }
-}
-
-impl PinSource for StorePins<'_> {
-    fn pinned(&self, key: Session, ttl_micros: Option<u64>) -> Option<WorkerId> {
-        let pin = SessionsStore::lookup(self.store, key.get())?;
-        // A pin at or past its own end is no pin, whether or not the sweep
-        // has run: its end is the instant the engine's table forgot the
-        // key, or the latest a lease's own rule counted where no table
-        // held it. A TTL counted from the dispatch ends later than that,
-        // and so may the TTL of a rule applied since. The end stands on
-        // the decision clock: the ask's instant is turned into it here, at
-        // a miss that finds a pin with an end and nowhere else.
-        let ended = |ends: u64| ends <= self.store.micros(self.now);
-        if pin.ends.is_some_and(ended) {
-            return None;
-        }
-        // The asking rule's TTL holds as well, against the pin's last use:
-        // a pin as old as that TTL is no pin, to the microsecond.
-        let age = self.now.saturating_duration_since(pin.last_used);
-        ttl_micros
-            .is_none_or(|ttl| age < Duration::from_micros(ttl))
-            .then_some(pin.worker)
-    }
-}
-
-/// Whether `phase` is a side of `plan` that the pair door decides: prefill
-/// and decode under either pair plan, and encode under the plan that names
-/// an encode side. That side rides the pair: the engine's entry keeps the
-/// encoders the pair is compatible with, a bit the store sets on no row
-/// yet, so it would shed each encode request as if no encoder stood.
-fn pair_side(plan: Plan, phase: Phase) -> bool {
-    match plan {
-        Plan::Single => false,
-        Plan::PdPair => matches!(phase, Phase::Prefill | Phase::Decode),
-        Plan::Epd { .. } => !matches!(phase, Phase::Single),
-    }
-}
-
-/// The engine's decision over the world of one load: the rows and the
-/// engine are of one publication. `None` for a request for a side of a
-/// pair plan ([`pair_side`]): the pair door decides those, and one side's
-/// entry of the engine never does. What a decision that is made counts, it
-/// counts in `own`, its decider's part.
-fn decide_in(
-    world: &World,
-    taken: &Taken<'_>,
-    buffers: &mut Buffers,
-    own: &Part,
-) -> Option<(Decision, Option<Booking>)> {
-    let spec = world.spec();
-    let engine = spec.engine();
-    let (model, phase) = (taken.request.model(), taken.request.phase());
-    // A single request is no plan's side: its binding is looked up once, by
-    // the engine.
-    if !matches!(phase, Phase::Single)
-        && engine
-            .binding(model, phase)
-            .is_some_and(|binding| pair_side(binding.plan, phase))
-    {
-        return None;
-    }
-    if taken.request.hashes() > taken.request.hashes_read(spec) {
-        own.hashes_cut.fetch_add(1, Ordering::Relaxed);
-    }
-    let ((decision, booking), built) = hand(
-        world,
-        taken,
-        buffers,
-        &own.undialed,
-        |facts, pool, candidates, constraints, scratch| {
-            if candidates.is_empty() && pool.pool_size > 0 {
-                // What the gateway states of itself left none of a pool
-                // that has rows: said under that constraint's name, where
-                // the engine would name no stage.
-                let emptied_by = if constraints.subset_hint == Some(0) {
-                    SUBSET_HINT
-                } else {
-                    WIRES
-                };
-                let none = shed(
-                    ShedReason::NoEndpoints,
-                    emptied_by,
-                    facts.seed,
-                    pool.generation,
-                );
-                return (none, None);
-            }
-            let decision = engine.decide(facts, pool, candidates, constraints, scratch);
-            // What a pick's lease takes of its request, read where the
-            // request stands as the engine read it.
-            let booking = decision.pick().and_then(|pick| {
-                Some(Booking {
-                    target: pick.targets.first()?.id,
-                    picked: Picked::of(&pick.targets),
-                    verdict: pick.session_verdict,
-                    // The scratch holds this decision's rule's TTL where
-                    // a rule governed the pick, and an earlier decision's
-                    // where none did.
-                    ttl_micros: if pick.session_verdict == SessionVerdict::None {
-                        None
-                    } else {
-                        scratch.session_ttl_micros()
-                    },
-                    generation: pick.trace.generation,
-                    session: facts.session(),
-                    tokens: facts.prompt_tokens,
-                    now_micros: facts.now_micros,
-                    built: None,
-                })
-            });
-            (decision, booking)
-        },
-    );
-    Some((
-        decision,
-        booking.map(|booking| Booking { built, ..booking }),
-    ))
-}
-
-/// What a pick's lease takes of its decision's hand-over.
-#[derive(Clone, Copy)]
-struct Booking {
-    /// The pick's first target: the worker the lease books.
-    target: WorkerId,
-    /// The pick's other targets and the ranks, for a `Dispatched` that
-    /// names one by its index.
-    picked: Picked,
-    /// What the decision did with the request's session key.
-    verdict: SessionVerdict,
-    /// The TTL of the rule behind that verdict; none without one.
-    ttl_micros: Option<u64>,
-    /// The generation that decided.
-    generation: u64,
-    /// The request's session; none for a request with no key.
-    session: Session,
-    /// The token-work the lease books: the prompt, as its host counted it.
-    tokens: u32,
-    /// The decision's instant in the rows' clock.
-    now_micros: u64,
-    /// The build the decision read: where its target's count stands.
-    built: Option<Built>,
-}
-
-/// Issues the lease of a pick, one a decision, ahead of the read that lets
-/// its answer leave: a credit on the pick's first target, minted and filed
-/// by the store under `term`, the fence's at the decision's first read, at
-/// that read's instant, from which [`DISPATCH_TTL`] runs for its gateway
-/// to name a dispatch. The lease books the count the decision's own world
-/// lays beside its target's row, and the engine that decided is told of
-/// it.
-///
-/// # Errors
-///
-/// The store's refusal: it stands under another term, or mints no id
-/// under this one.
-fn issue(
-    store: &MemoryStore,
-    world: &World,
-    taken: &Taken<'_>,
-    term: u64,
-    decision: &Decision,
-    booking: Booking,
-) -> Result<Lease, LeaseRefused> {
-    let lease = Lease {
-        // The store mints the id.
-        id: LeaseId::default(),
-        kind: LeaseKind::Credit,
-        side: Side::Single,
-        target_index: 0,
-        booked: booking.target,
-        generation: booking.generation,
-        session: booking.session,
-        session_verdict: booking.verdict,
-        issued_micros: booking.now_micros,
-        tokens: booking.tokens,
-    };
-    let record = LeaseRecord {
-        lease,
-        gateway: taken.gateway,
-        request: fingerprint(taken.request.id()),
-        target: booking.target,
-        picked: booking.picked,
-        decode: None,
-        term,
-        issued_at: taken.now,
-        dispatch_deadline: taken.due(),
-        state: LeaseState::Issued,
-        session_ttl_micros: booking.ttl_micros,
-    };
-    let built = booking.built;
-    let booked = built.and_then(|built| world.booked(&built, booking.target));
-    // Under one hold of the turn the store applies what is handed, files
-    // the lease, tells the engine that decided of it, and ends and tells
-    // the leases it finds past their dispatch deadline.
-    let engine = world.spec().engine();
-    let lease = store.issue_decided(record, booked, |lease| {
-        engine.on_decision_issued(lease, decision);
-    })?;
-    Ok(lease)
 }
 
 /// Gives up the lease of a decision whose answer does not leave: the
@@ -1152,266 +860,6 @@ fn give_up(
     if crate::store::LeasesStore::released(store, gateway, lease.id, None, reason) {
         world.spec().engine().on_released(lease, reason);
     }
-}
-
-/// A shed the deciders say in the engine's place, in the shape of the
-/// engine's own.
-fn shed(reason: ShedReason, emptied_by: &'static str, seed: u64, generation: u64) -> Decision {
-    Decision::Shed(Shed {
-        reason,
-        emptied_by,
-        retry_after_secs: 1,
-        wait_allowed: false,
-        trace: Trace {
-            seed,
-            generation,
-            ..Trace::default()
-        },
-    })
-}
-
-/// What [`hand`] reads of a pool for one request: the pool's facts, the
-/// decision's instant in the rows' clock, the rows, the mask of the asking
-/// gateway's vetoes beside lent rows, the affinity column, the leases'
-/// counts beside lent rows, and the build the rows were read by.
-type Read<'a> = (
-    PoolFacts<'a>,
-    u64,
-    &'a [Candidate],
-    &'a [u32],
-    &'a [AffinityFacts],
-    Option<crate::LentCounts<'a>>,
-    Option<Built>,
-);
-
-/// Hands `decide` what the engine reads for one request: the request with
-/// what is left of its budget, the pool's facts under the generation its
-/// rows were published under, and those rows as the asking gateway reaches
-/// them at the decision's instant, with the affinity column where the
-/// request's profile declares it. A request that states no wires and no
-/// hint of 0 reads its pool by the store's one door ([`World::view`]): the
-/// rows where their publication left them, with its gateway's standing
-/// vetoes and the leases' counts beside them, or rows the door writes
-/// where the request's profile shows them to a plugin. One that states
-/// wires or a hint of 0 is handed rows written for it ([`World::build`]),
-/// what the leases on file book on each row's worker written over them
-/// ([`World::count_in_flight`]), less what the gateway states of itself
-/// takes ([`narrow`]). The rows its wires take are counted in `undialed`,
-/// the decider's own part, and the list they leave takes a name of its
-/// own ([`cut_reach`]). The request's block hashes are cut at what that
-/// generation reads of them. `decide`'s answer comes back with the build
-/// its rows were read by, `None` where no member serves the model.
-///
-/// A request whose profile reads the affinity column by its own stages is
-/// handed no column: the rows the store names for it stand in the column's
-/// place ([`World::name`]), at most its sample of each list, and every
-/// holder and every warming row where it takes none
-/// ([`Engine::named_for`](crate::framework::Engine::named_for)). The
-/// naming is the store's one reader of its index: the column it builds
-/// holds a row's age and no holder.
-fn hand<R>(
-    world: &World,
-    taken: &Taken<'_>,
-    buffers: &mut Buffers,
-    undialed: &AtomicU64,
-    decide: impl FnOnce(
-        &RequestFacts<'_>,
-        &PoolFacts<'_>,
-        &[Candidate],
-        &Constraints<'_>,
-        &mut Scratch,
-    ) -> R,
-) -> (R, Option<Built>) {
-    let Taken {
-        request,
-        gateway,
-        now,
-        left,
-        pins,
-    } = *taken;
-    let spec = world.spec();
-    let (model, phase) = (request.model(), request.phase());
-    let engine = spec.engine();
-    // What the decision's profile reads, and whether it shows its rows to
-    // a plugin.
-    let (needs, shown) = engine.reads_for(model, phase);
-    // A profile whose own stages read the column is handed the rows the
-    // store names in the column's place, and no column: a stage that
-    // reads holders is fed them. The sample caps the rows named, and a
-    // profile that takes none is named every one. A profile that shows
-    // its rows to a plugin, or whose warm-up stages rule by two rulings,
-    // is named no row and keeps its column. The deciding profile answers
-    // for itself: the needs are merged over a pair's two phases and a
-    // sessions rule, so they say only where to ask, and no other decision
-    // pays the second walk.
-    let cap = if needs.affinity {
-        engine.named_for(model, phase)
-    } else {
-        0
-    };
-    let names = cap > 0;
-    let ask = Ask {
-        gateway,
-        now,
-        pinned: None,
-        affinity: needs.affinity && !names,
-    };
-    let role = match phase {
-        Phase::Single => Role::Single,
-        Phase::Prefill => Role::Prefill,
-        Phase::Decode => Role::Decode,
-        Phase::Encode => Role::Encode,
-    };
-    let Buffers {
-        view,
-        scratch,
-        lists,
-        named,
-    } = buffers;
-    let wires = request.wires();
-    // No member serves the model in the role: the engine answers over no
-    // candidate, as it answers any host that hands it none.
-    let none = || PoolFacts {
-        generation: spec.generation(),
-        ..PoolFacts::default()
-    };
-    // Nothing of the request's own is cut out of the rows the door hands:
-    // the publication's own, the leases' counts beside them, or a copy the
-    // door writes with the counts on it for a plugin, which is shown a
-    // row's bits and ages as the row's own fields.
-    let by_door = wires.is_none() && request.subset() != Some(0);
-    let (pool, now_micros, candidates, stalled, affinity, counts, built): Read<'_> = if by_door {
-        match world.view(model, role, &ask, shown, view) {
-            Some(read) => (
-                read.pool_facts(),
-                read.built.now_micros,
-                read.candidates,
-                read.stalled,
-                read.affinity,
-                read.in_flight,
-                Some(read.built),
-            ),
-            None => (none(), world.micros(now), &[], &[], &[], None, None),
-        }
-    } else {
-        let built = world.build(model, role, &ask, view);
-        let (pool, now_micros) = match built {
-            Some(built) => {
-                // What the leases on file book on each row's worker,
-                // written before the request's own narrowing moves a row:
-                // rows that are written carry their counts. A request that
-                // keeps no row is counted nothing.
-                if keeps_a_row(wires, request.subset()) {
-                    world.count_in_flight(&built, &ask, &mut view.candidates);
-                }
-                // The pool's facts are of the rows before the request's own
-                // narrowing, all but the list's name: the rows the wires
-                // left are another list of the pool.
-                let mut pool: PoolFacts<'_> = built.pool_facts();
-                let took = narrow(view, wires, request.subset());
-                if took > 0 {
-                    undialed.fetch_add(took, Ordering::Relaxed);
-                    if let Some(wires) = wires {
-                        pool.reach = cut_reach(pool.reach, wires);
-                    }
-                } else {
-                    // Every row stands where the build left it, so the
-                    // pool's engines name these rows as they name the
-                    // publication's: a key is placed alike over both.
-                    pool.engines = world.engines(&built);
-                }
-                (pool, built.now_micros)
-            }
-            None => (none(), world.micros(now)),
-        };
-        (
-            pool,
-            now_micros,
-            &view.candidates,
-            &[],
-            &view.affinity,
-            None,
-            built,
-        )
-    };
-    if names {
-        // A row is named by its place among the rows the decision is made
-        // over: the lent rows, or the built ones after their narrowing.
-        let hashes = request.block_hashes();
-        let naming = Naming {
-            gateway,
-            // The first hashes, as many as the generation reads of them:
-            // the engine's request takes the same count.
-            block_hashes: hashes.get(..request.hashes_read(spec)).unwrap_or(hashes),
-            seed: request.seed(),
-            cap,
-            wires,
-            now_micros,
-        };
-        world.name(model, role, &naming, candidates, named);
-    }
-    let viewed = Viewed {
-        now_micros,
-        budget_micros: u32::try_from(left.as_micros()).unwrap_or(u32::MAX),
-        affinity,
-        stalled,
-        in_flight: counts,
-        max_block_hashes: request.hashes_read(spec),
-        named: names.then(|| named.affinity()),
-        pins,
-    };
-    let answer = request.read(lists, viewed, |facts, constraints| {
-        decide(facts, &pool, candidates, constraints, scratch)
-    });
-    (answer, built)
-}
-
-/// Whether the request's own narrowing can leave a row: a subset of none
-/// and a mask of no wire clear every row ([`narrow`]).
-fn keeps_a_row(wires: Option<WireModes>, subset: Option<u32>) -> bool {
-    subset != Some(0) && wires != Some(WireModes::NONE)
-}
-
-/// Narrows a built view by what the request's gateway states of itself,
-/// and returns how many rows its wires took. A hint of 0 keeps none, and
-/// leaves the wires nothing to take. A gateway that states wires keeps the
-/// members that share one with it: a member that states none is taken as
-/// one that states another is, and a gateway that states none keeps every
-/// row. A positive hint cuts nothing. The kept rows keep their order and
-/// take their positions, and the affinity column follows them. A request
-/// that states neither pays the two compares.
-fn narrow(view: &mut ViewBuffers, wires: Option<WireModes>, subset: Option<u32>) -> u64 {
-    if subset == Some(0) {
-        view.candidates.clear();
-        view.affinity.clear();
-        return 0;
-    }
-    let Some(wires) = wires else {
-        return 0;
-    };
-    let rows = view.candidates.len();
-    let dialed = |row: &Candidate| row.wire_modes.intersects(wires);
-    // The column is by row, where the profile declared one: it is cut by
-    // the rows' wires before the rows are.
-    let mut beside = view.candidates.iter();
-    view.affinity.retain(|_| beside.next().is_some_and(dialed));
-    view.candidates.retain(dialed);
-    let took = rows - view.candidates.len();
-    if took > 0 {
-        for (row, position) in view.candidates.iter_mut().zip(0..) {
-            row.position = position;
-        }
-    }
-    took as u64
-}
-
-/// The name of the list a gateway's wires cut out of a build's
-/// ([`PoolFacts::reach`]): the build's word turned by the wires. Each of the
-/// eight sets of wires turns it by its own multiple of one odd word, eight
-/// words that differ and none of them zero: no cut reads as its build's
-/// whole list, and no two cuts of one build read alike.
-fn cut_reach(built: u64, wires: WireModes) -> u64 {
-    built ^ (u64::from(wires.bits()) + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
 
 #[cfg(test)]
@@ -1435,8 +883,8 @@ pub(crate) mod tests {
     };
 
     use super::{
-        cut_reach, hand, keeps_a_row, narrow, watched, Buffers, Clock, Counts, Deciders, Deciding,
-        Job, Part, Reads, Refused, Taken, PARTS, TERM_MARK,
+        watched, Buffers, Clock, Counts, Deciders, Deciding, Job, Part, Reads, Refused, Taken,
+        PARTS,
     };
     use crate::{
         builtins::Random,
@@ -1449,6 +897,7 @@ pub(crate) mod tests {
         },
         decider::Decider,
         decision::{Decision, Targets},
+        door::{cut_reach, hand, keeps_a_row, narrow, Door, Request, TERM_MARK},
         elector::{Elector, Tick, TERM_CEILING},
         framework::{DecisionScope, Filter, Picker, Scratch, TieBand},
         lease::{Lease, LeaseId, Lifecycle, ReleaseReason},
@@ -1882,6 +1331,51 @@ pub(crate) mod tests {
         }
     }
 
+    /// Same facts, same answer: over two stores laid alike, the served
+    /// path and the door in process pick the same targets for a request,
+    /// and file its lease under the same id on the same first target.
+    #[tokio::test]
+    async fn the_door_and_the_served_path_decide_alike() {
+        let mut bed = bed(Some(preset("random", 1)), true, (1, 8), []);
+        let beside = Arc::new(MemoryStore::new().with_deciders(1));
+        fleet(&beside);
+        let applied = beside.apply(preset("random", 1));
+        applied.expect("above the unbound start");
+        let door = Door::new(Arc::clone(&beside));
+        let first_on_file = |store: &MemoryStore, lease: u64| {
+            let record = LeasesStore::get(store, GATEWAY, LeaseId(lease));
+            record.map(|record| record.target)
+        };
+        for (id, seed) in (1..=9).zip(100..) {
+            let served = bed.ask(frame(id, seed)).await;
+            let asked = Request {
+                id: &[id],
+                facts: RequestFacts {
+                    model: MODEL,
+                    seed,
+                    budget_micros: u32::try_from(BUDGET.as_micros()).expect("five seconds"),
+                    ..RequestFacts::default()
+                },
+                constraints: Constraints::default(),
+            };
+            let decided = door.decide(GATEWAY, &asked, bed.script.taken);
+            let decided = decided.expect("the door decides");
+            let pick = decided.decision.pick().expect("a pick over the fleet");
+            let Outcome::Pick(sent) = outcome(&served) else {
+                panic!("a pick: {served:?}");
+            };
+            let sent = sent.targets.iter().map(|target| WorkerId(target.id));
+            let sent: Vec<_> = sent.collect();
+            let made: Vec<_> = pick.targets.iter().map(|target| target.id).collect();
+            assert_eq!(sent, made, "request {id}: the same targets, in order");
+            let lease = decided.lease.expect("a pick's lease").lease.id.0;
+            assert_eq!(lease_of(&served).id, lease, "request {id}: the same id");
+            let booked = first_on_file(&beside, lease);
+            assert_eq!(first_on_file(&bed.store, lease), booked, "request {id}");
+            assert_eq!(booked, made.first().copied(), "request {id}");
+        }
+    }
+
     /// A decision waits in its stream's queue as it was made, with the
     /// lease issued for its pick and what is left of that lease's span: its
     /// frame is its stream's to build. A `Busy` is handed over as its
@@ -1953,6 +1447,37 @@ pub(crate) mod tests {
             let answer = bed.ask(frame(id, u64::from(id))).await;
             assert_eq!(picked(&answer), freed, "request {id}");
         }
+    }
+
+    /// A decision reads its rows behind what was handed while its decider
+    /// worked: a release handed while the decider is held at a request is
+    /// applied by that request ahead of its reads. Under the fewest
+    /// requests the request then picks as the first one did under its
+    /// seed: that worker stands at no request again.
+    #[tokio::test]
+    async fn a_decision_reads_its_rows_behind_what_was_handed_ahead_of_it() {
+        let mut document = PolicySpec::power_of_two(PowerOfTwoMetric::LeastRequests)
+            .expect("a form of this build's preset");
+        document.generation = 1;
+        let mut bed = bed(Some(applied(&document)), true, (1, 8), []);
+        let first = bed.ask(frame(1, 7)).await;
+        // The second request is held at its read of the clock: its decider
+        // is at work, and what is handed is left to it.
+        let (reached, held) = std_mpsc::sync_channel(1);
+        let (go, word) = std_mpsc::sync_channel(1);
+        let hold = Step::Hold { reached, go: word };
+        bed.script.steps.lock().push_back(hold);
+        assert_eq!(bed.submit(frame(2, 7)), None);
+        held.recv_timeout(PATIENCE)
+            .expect("the decider reads the clock");
+        let gone = Said::Released(None, ReleaseReason::ClientGone);
+        let hand = lifecycle::open(&bed.store, GATEWAY);
+        bed.store.hand(&hand, LeaseId(lease_of(&first).id), gone);
+        let live = LeasesStore::live(&*bed.store, GATEWAY);
+        assert_eq!(live, 1, "the hand leaves the release to the decider");
+        go.send(()).expect("the decider holds the other end");
+        let second = bed.answer().await;
+        assert_eq!(picked(&second), picked(&first), "no request stands there");
     }
 
     #[tokio::test]

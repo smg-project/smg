@@ -509,8 +509,9 @@ message Busy {
 }
 
 // The leases it books, one outcome, the trace. The record is the outcome
-// enum with the trace inside each variant and no leases (the host mints the
-// lease at commit); the wire hoists the trace and carries the leases.
+// enum with the trace inside each variant and no leases (its door files the
+// lease at the issue and hands it beside the record); the wire hoists the
+// trace and carries the leases.
 message Decision {
   repeated Lease leases = 1;
   oneof outcome {

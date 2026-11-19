@@ -47,9 +47,7 @@ use crate::{
 mod blocks;
 mod turn;
 
-use blocks::Blocks;
-#[cfg(any(test, feature = "controller"))]
-use blocks::Minted;
+use blocks::{Blocks, Minted};
 pub use turn::{AtWork, Hand};
 
 /// Membership changes kept for watchers; a watcher further behind snapshots
@@ -104,7 +102,6 @@ pub struct MemoryStore {
     sessions: Vec<Mutex<FxHashMap<u64, Pin>>>,
     /// When the pins were last swept and how often a pass runs
     /// ([`Self::sweep_pins`]).
-    #[cfg(feature = "controller")]
     pins_swept: Mutex<PinsSwept>,
     /// The files of leases behind their turns, one a decider ([`turn`]).
     files: turn::Files,
@@ -228,7 +225,6 @@ impl MemoryStore {
             sessions: (0..crate::sessions::SHARDS)
                 .map(|_| Mutex::default())
                 .collect(),
-            #[cfg(feature = "controller")]
             pins_swept: Mutex::default(),
             files: turn::Files::one(leases),
             blocks: Blocks::default(),
@@ -702,7 +698,6 @@ impl MemoryStore {
             // the sweep still leaves its interval for the pins it ended.
             // It is saved under the workers lock, so two applies save
             // theirs in the order of their publications.
-            #[cfg(feature = "controller")]
             if let Some(every) = spec.engine().pins_shortest_sweep() {
                 self.pins_swept.lock().every = Some(every);
             }
@@ -2562,7 +2557,6 @@ impl SessionsStore for MemoryStore {
 }
 
 /// When the pins were last swept, and at what interval.
-#[cfg(feature = "controller")]
 #[derive(Default)]
 struct PinsSwept {
     /// The instant of the last pass; `None` before the first.
@@ -2572,7 +2566,6 @@ struct PinsSwept {
     every: Option<u64>,
 }
 
-#[cfg(feature = "controller")]
 impl MemoryStore {
     /// One pass of the pins' sweep at `now`, where one is due: each pin of
     /// record past its own end leaves the table, whatever the other rules
@@ -2619,7 +2612,6 @@ struct Leases {
     counts: Arc<Counts>,
     /// The block of the term's counter the file mints from, as far as it
     /// minted into it ([`MemoryStore::issue_decided`]).
-    #[cfg(any(test, feature = "controller"))]
     minted: Minted,
     /// Every lease filed as issued, by its dispatch deadline, the earliest
     /// first. A lease that left the file or was dispatched keeps its place
@@ -2633,13 +2625,11 @@ struct Leases {
 type Key = (GatewayId, LeaseId);
 
 /// The leases past their dispatch deadline that one issue ends at most.
-#[cfg(any(test, feature = "controller"))]
 pub(crate) const ABANDONED: usize = 2;
 
 /// The places of the deadline queue one issue steps over at most, the
 /// places of leases that were dispatched or left the file among them: four
 /// for the one it adds, so the queue shortens under any run of issues.
-#[cfg(any(test, feature = "controller"))]
 const DUE_STEPS: usize = 4;
 
 /// A lease on file with the slot of the count it books on its worker.
@@ -2659,7 +2649,6 @@ impl Leases {
     /// for a term past 31 bits and for a term whose counter is spent: an
     /// id is never 0, never carries the bit of a gateway's own ids and
     /// never repeats.
-    #[cfg(any(test, feature = "controller"))]
     fn mint(&mut self, blocks: &Blocks, file: u8) -> Option<LeaseId> {
         let term = self.term;
         if term >= 1 << 31 {
@@ -2844,7 +2833,6 @@ impl MemoryStore {
     /// past its deadline stands no longer than the next issues take, and no
     /// call passes over the file: an issue adds one place to the queue and
     /// steps over [`DUE_STEPS`] at most.
-    #[cfg(any(test, feature = "controller"))]
     pub(crate) fn issue_decided(
         &self,
         mut record: LeaseRecord,
@@ -2914,8 +2902,7 @@ impl MemoryStore {
     pub fn with_deciders(mut self, deciders: usize) -> Self {
         // Every file is read, each under its own turn: a lease on any of
         // them would go with its file.
-        let mut files = self.files.iter();
-        let empty = files.all(|file| file.take().records.is_empty());
+        let empty = self.files.iter().all(|file| file.take().records.is_empty());
         assert!(empty, "a store's files are laid before a lease is filed");
         let (term, counts) = {
             let leases = self.files[0].take();
@@ -3063,6 +3050,42 @@ impl MemoryStore {
     fn listed(&self) {
         self.joined.lock().clear();
     }
+
+    /// Ends the leases past their dispatch deadline at `now`
+    /// ([`LeasesStore::expire`]): each file's turn in the files' order,
+    /// one at a time, where the caller may act at the file: a decider at
+    /// work ends its own file's due leases at its issues. Each end is
+    /// told under the turn, as a frame's end is told. A file is passed
+    /// too where `settled` says no, asked under the file's turn behind
+    /// everything handed to it: a host that keeps what was said of a
+    /// file's leases beside its ring says no until it has handed that
+    /// on, so no lease is ended ahead of a dispatch said of it.
+    pub(crate) fn expire_where(
+        &self,
+        now: Instant,
+        settled: impl Fn(usize) -> bool,
+    ) -> Vec<LeaseRecord> {
+        let mut ended = Vec::new();
+        for at in 0..self.files.len() {
+            // A file whose decider works is passed with no wait for its
+            // turn; the same is read again under the turn.
+            if !self.may_act(at) {
+                continue;
+            }
+            let mut leases = self.files[at].take();
+            let mut told = turn::Told::default();
+            if !self.applied(at, &mut leases, &mut told) || !settled(at) {
+                continue;
+            }
+            let mut steps = usize::MAX;
+            while let Some(record) = leases.end_due(now, &mut steps) {
+                let said = Said::Released(None, ReleaseReason::Abandoned);
+                self.tell(at, told.world(self), &record, said);
+                ended.push(record);
+            }
+        }
+        ended
+    }
 }
 
 impl LeasesStore for MemoryStore {
@@ -3157,31 +3180,9 @@ impl LeasesStore for MemoryStore {
             .map(|held| held.record)
     }
 
-    /// Each file's turn in the files' order, one at a time, where the
-    /// caller may act at the file: a decider at work ends its own file's
-    /// due leases at its issues. Each end is told under the turn, as a
-    /// frame's end is told.
+    /// The store's pass over its files, none held back by a host.
     fn expire(&self, now: Instant) -> Vec<LeaseRecord> {
-        let mut ended = Vec::new();
-        for at in 0..self.files.len() {
-            // A file whose decider works is passed with no wait for its
-            // turn; the same is read again under the turn.
-            if !self.may_act(at) {
-                continue;
-            }
-            let mut leases = self.files[at].take();
-            let mut told = turn::Told::default();
-            if !self.applied(at, &mut leases, &mut told) {
-                continue;
-            }
-            let mut steps = usize::MAX;
-            while let Some(record) = leases.end_due(now, &mut steps) {
-                let said = Said::Released(None, ReleaseReason::Abandoned);
-                self.tell(at, told.world(self), &record, said);
-                ended.push(record);
-            }
-        }
-        ended
+        self.expire_where(now, |_| true)
     }
 
     fn restore(&self, gateway: GatewayId, records: &[LeaseRecord]) -> usize {
@@ -3191,8 +3192,8 @@ impl LeasesStore for MemoryStore {
         let slots = self.slots();
         // Each file's turn in the files' order, one at a time: the
         // gateway's leases there go, and the records its ids name are
-        // filed. A record whose id names no file for good is filed in
-        // none ([`LeaseRefused::Unclaimed`]).
+        // filed. A record whose id names no file yet is filed in none
+        // ([`LeaseRefused::Unclaimed`]).
         let files = self.files.len();
         let mut held = 0;
         for at in 0..self.files.len() {

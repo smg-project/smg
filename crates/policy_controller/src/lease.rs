@@ -269,9 +269,9 @@ impl fmt::Debug for EventSet {
 /// release of a lease its decision gives up, costs that request its
 /// decision.
 pub trait Lifecycle: Send + Sync {
-    /// The engine issued `decision` under `lease`. In the embedded mode the
-    /// commit follows at once and the accounting happens at dispatch; a
-    /// remote controller books here.
+    /// The engine issued `decision` under `lease`. Its host filed the
+    /// lease as it issued it, in process as behind a served controller:
+    /// the lease books its first target from here.
     fn on_decision_issued(&self, _lease: &Lease, _decision: &Decision) {}
 
     /// The host dispatched to `target` (one of the decision's targets), on
