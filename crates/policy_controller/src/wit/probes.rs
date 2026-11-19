@@ -311,7 +311,7 @@ mod tests {
     }
 
     #[test]
-    fn the_probes_cover_every_record_the_host_does_not_compose() {
+    fn the_probes_cover_every_record_that_mirrors_a_struct() {
         let probed: Vec<&str> = all().into_iter().map(|p| p.record).collect();
         let records: Vec<&str> = super::super::types::TYPES
             .iter()
@@ -319,8 +319,10 @@ mod tests {
             .map(|i| i.name())
             .collect();
         for record in records {
+            // The host composes `dispatched` and the guest `score-answer`:
+            // neither mirrors a struct of the crate.
             assert!(
-                record == "dispatched" || probed.contains(&record),
+                matches!(record, "dispatched" | "score-answer") || probed.contains(&record),
                 "{record} has no probe"
             );
         }

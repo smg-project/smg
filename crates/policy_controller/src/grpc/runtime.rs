@@ -278,8 +278,8 @@ struct Stand {
     /// How many settled streams stand on it: with none the version is free.
     standing: usize,
     /// The settles that fixed a version, the last one with them. A stream
-    /// that settles on the version that stands and ends between two looks
-    /// of the events task shows in this count alone.
+    /// that settles where none stands and ends between two looks of the
+    /// events task shows in this count alone.
     settles: u64,
 }
 
@@ -2927,11 +2927,11 @@ mod tests {
                 "the window is full: the turn waits for room"
             );
             drop(raise);
-            tokio::time::timeout(Duration::from_secs(60), &mut turn).await
+            tokio::time::timeout(2 * RECONNECT_PAUSE, &mut turn).await
         };
         assert!(
             matches!(ended, Ok(None)),
-            "the dropped plugin's call ends within the minute"
+            "the dropped plugin's call ends within two frames"
         );
         assert_eq!(
             u64::try_from(OBSERVE_WINDOW).ok(),

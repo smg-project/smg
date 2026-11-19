@@ -15,13 +15,16 @@ mod support {
     pub mod wasm_guest;
 }
 
-use std::sync::{
-    atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering},
-    mpsc, Arc,
+use std::{
+    ops::Range,
+    sync::{
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering},
+        mpsc, Arc,
+    },
 };
 
 use smg_policy_controller::{
-    builtins::{Best, Healthy, LeastRequests, PowerOfTwo},
+    builtins::{Best, Healthy, LeastRequests, PowerOfTwo, SessionAffinity},
     decider::Decider,
     plugins::OpenDecisions,
     wasm::{
@@ -29,8 +32,8 @@ use smg_policy_controller::{
         Reveal, Runtime, WasmFilter, WasmPicker, WasmScorer, World,
     },
     Binding, Candidate, Constraints, Decision, Draw, Engine, Health, Identity, Lease, Lifecycle,
-    Needs, PairPools, Pick, Plan, PoolFacts, Profile, RequestFacts, Scratch, ShedReason, Side,
-    Target, Weighted, WorkerId,
+    Needs, PairPools, Pick, Plan, PoolFacts, Profile, RequestFacts, Scorer as _, Scratch,
+    ShedReason, Side, Target, Weighted, WorkerId,
 };
 use support::wasm_guest::{self as guest, canonical, counter, mode};
 use wit_component::{ComponentEncoder, StringEncoding};
@@ -355,13 +358,17 @@ fn timed(seed: u64) -> RequestFacts<'static> {
 }
 
 fn decide(engine: &Engine, candidates: &[Candidate], seed: u64) -> Decision {
+    decide_with(engine, candidates, &facts(seed))
+}
+
+fn decide_with(engine: &Engine, candidates: &[Candidate], facts: &RequestFacts<'_>) -> Decision {
     let pool_facts = PoolFacts {
         pool_size: candidates.len() as u32,
         generation: 1,
         ..PoolFacts::default()
     };
     engine.decide(
-        &facts(seed),
+        facts,
         &pool_facts,
         candidates,
         &Constraints::default(),
@@ -387,7 +394,7 @@ fn counter_value(plugin: &Plugin, id: u32) -> u64 {
 }
 
 #[test]
-fn the_record_guests_offsets_match_the_canonical_layout() {
+fn the_guests_offsets_match_the_canonical_layout() {
     guest::check_canonical_layout();
     assert_eq!(canonical::CANDIDATE_SIZE % 8, 0);
 }
@@ -409,7 +416,8 @@ fn both_worlds_load_and_the_load_instantiates_on_the_applying_thread() {
     );
     assert_eq!(record.world(), World::Record);
     assert_eq!(packed.world(), World::Packed);
-    assert_eq!(record.abi(), Abi::V1_1);
+    assert_eq!(record.abi(), Abi::V1_2);
+    assert_eq!(packed.abi(), Abi::V1_2);
     assert!(record.is_warm() && packed.is_warm());
     assert_eq!(record.stats().instantiations, 1);
     assert_eq!(record.name(), "record");
@@ -481,13 +489,13 @@ fn a_component_with_an_async_export_is_refused_at_its_compile() {
 fn the_abi_pin_the_memory_floor_the_init_failure_and_bad_bytes_are_refused() {
     let runtime = runtime();
     let mut pinned = spec("pinned", guest::record_guest(), mode::LEAST_IN_FLIGHT);
-    pinned.abi = Some(Abi { major: 1, minor: 2 });
+    pinned.abi = Some(Abi { major: 1, minor: 3 });
     let err = Plugin::load(&runtime, pinned).expect_err("refused");
     assert!(
         matches!(
             err,
             LoadError::AbiPin {
-                found: Abi::V1_1,
+                found: Abi::V1_2,
                 ..
             }
         ),
@@ -587,6 +595,190 @@ fn the_honest_guest_picks_the_least_in_flight_through_either_world() {
             "{name}"
         );
         assert_eq!(plugin.counters().undeclared(), 0);
+    }
+}
+
+const BAND_SEEDS: Range<u64> = 129..193;
+
+/// Each score differs from the next. Only the two highest fit within the
+/// guest's band of the top score.
+fn band_pool() -> Vec<Candidate> {
+    let mut candidates = pool(4);
+    for (candidate, in_flight) in candidates.iter_mut().zip([87, 63, 29, 11]) {
+        candidate.in_flight = in_flight;
+    }
+    candidates
+}
+
+fn band_guests() -> [(&'static str, Vec<u8>); 2] {
+    [
+        ("record", guest::record_guest()),
+        ("packed", guest::packed_guest()),
+    ]
+}
+
+fn band_engine(
+    plugin: &Arc<Plugin>,
+    fallback: Option<Box<dyn smg_policy_controller::Scorer>>,
+) -> Engine {
+    single_engine(Profile {
+        name: "band".into(),
+        filters: vec![],
+        scorers: vec![Weighted {
+            scorer: Box::new(WasmScorer::new(plugin.bind(), fallback)),
+            weight: 1.0,
+        }],
+        picker: Box::new(Best),
+    })
+}
+
+fn lead(decision: &Decision) -> Option<WorkerId> {
+    decision.pick()?.targets.first().map(|target| target.id)
+}
+
+/// A guest's band reaches the built-in picker. Over 64 seeds the lead is
+/// one of the two rows within the band of the best score, and each of the
+/// two leads at least once, in either world.
+#[test]
+fn a_guests_band_widens_the_tie_the_built_in_picker_draws_from() {
+    use std::collections::BTreeSet;
+
+    let runtime = runtime();
+    let candidates = band_pool();
+    let leads = band_guests().map(|(world, component)| {
+        let plugin = load(&runtime, world, component, mode::SCORE_BAND);
+        let engine = band_engine(&plugin, None);
+        let leads = BAND_SEEDS
+            .map(|seed| lead(&decide(&engine, &candidates, seed)))
+            .collect::<BTreeSet<_>>();
+        let stats = plugin.stats();
+        assert_eq!(stats.answered, 2 * BAND_SEEDS.count() as u64, "{world}");
+        assert_eq!(stats.invalid, 0, "{world}");
+        leads
+    });
+    let tied = BTreeSet::from([Some(candidates[2].id), Some(candidates[3].id)]);
+    assert_eq!(leads, [tied.clone(), tied], "record and packed leads");
+}
+
+/// A guest that answers no band draws within the default one: the best row
+/// leads at every seed.
+#[test]
+fn a_guest_that_answers_no_band_decides_as_before() {
+    let runtime = runtime();
+    let candidates = band_pool();
+    for (world, component) in band_guests() {
+        let plugin = load(&runtime, world, component, mode::LEAST_IN_FLIGHT);
+        let engine = band_engine(&plugin, None);
+        for seed in BAND_SEEDS {
+            assert_eq!(
+                lead(&decide(&engine, &candidates, seed)),
+                Some(candidates[3].id),
+                "{world}, seed {seed}"
+            );
+        }
+        let stats = plugin.stats();
+        assert_eq!(stats.answered, 2 * BAND_SEEDS.count() as u64, "{world}");
+        assert_eq!(stats.invalid, 0, "{world}");
+    }
+}
+
+/// A band that is no number, below zero or above one is an invalid answer,
+/// as a score that is no number is: the stage's fallback decides and the
+/// fault is counted once.
+#[test]
+fn a_band_that_is_no_value_from_0_to_1_is_an_invalid_answer() {
+    let runtime = runtime();
+    let mut candidates = band_pool();
+    candidates[1].session_hit = true;
+    for ((world, component), (_, negative)) in band_guests()
+        .into_iter()
+        .zip(guest::guests_with_band(-0.375))
+    {
+        for (label, component, mode) in [
+            ("bad score", &component, mode::NAN_SCORE),
+            ("NaN band", &component, mode::NAN_BAND),
+            ("band above one", &component, mode::ABOVE_ONE_BAND),
+            ("band below zero", &negative, mode::SCORE_BAND),
+        ] {
+            let plugin = load(&runtime, world, component.clone(), mode);
+            let engine = band_engine(&plugin, Some(Box::new(SessionAffinity)));
+            let picked = lead(&decide(&engine, &candidates, BAND_SEEDS.start));
+            assert_eq!(
+                (picked, plugin.stats().invalid),
+                (Some(candidates[1].id), 1),
+                "{world}: {label}"
+            );
+        }
+    }
+}
+
+/// A band belongs to its decision. On one instance each decision with a
+/// band is followed by one without, and the second draws within the default
+/// band.
+#[test]
+fn a_band_is_not_carried_to_the_next_decision() {
+    let runtime = runtime();
+    let candidates = band_pool();
+    for (world, component) in band_guests() {
+        let plugin = load(&runtime, world, component, mode::SCORE_BAND);
+        let engine = band_engine(&plugin, None);
+        let mut second_row_led = false;
+        for seed in BAND_SEEDS {
+            let first = lead(&decide(&engine, &candidates, seed));
+            second_row_led |= first == Some(candidates[2].id);
+            let without_band = RequestFacts {
+                now_micros: 0,
+                ..facts(seed)
+            };
+            assert_eq!(
+                lead(&decide_with(&engine, &candidates, &without_band)),
+                Some(candidates[3].id),
+                "{world}, seed {seed}: the next decision has no band"
+            );
+        }
+        assert!(second_row_led, "{world}: the band put the second row first");
+        let stats = plugin.stats();
+        assert_eq!(stats.answered, 4 * BAND_SEEDS.count() as u64, "{world}");
+        assert_eq!(stats.invalid, 0, "{world}");
+        assert_eq!(stats.instantiations, 1, "{world}");
+    }
+}
+
+/// The band stays with the scores of its decision: a second read of the
+/// kept answer says the same band, at both ends of the range and at the
+/// default, and asks the guest no second time.
+#[test]
+fn a_score_answer_keeps_its_band_with_its_scores() {
+    let runtime = runtime();
+    let candidates = band_pool();
+    let facts = facts(BAND_SEEDS.start);
+    let pool = PoolFacts {
+        pool_size: candidates.len() as u32,
+        ..PoolFacts::default()
+    };
+    for band in [Some(0.0), Some(1.0), None] {
+        let guest_mode = if band.is_some() {
+            mode::SCORE_BAND
+        } else {
+            mode::LEAST_IN_FLIGHT
+        };
+        let expected = band.unwrap_or(smg_policy_controller::TieBand::NORMALIZED.0);
+        for (world, component) in guest::guests_with_band(band.unwrap_or_default()) {
+            let plugin = load(&runtime, world, component, guest_mode);
+            let scorer = WasmScorer::new(plugin.bind(), None);
+            let scope = scorer.scope().expect("the scorer opens a decision");
+            scope.open(&facts, &candidates, &pool);
+            let mut scores = [0.0; 2];
+            let first = scorer.score(&facts, &candidates, &[1, 3], &mut scores);
+            let [lower, higher] = scores;
+            let cached = scorer.score(&facts, &candidates, &[3, 1], &mut scores);
+            scope.close();
+            assert_eq!(first.0, expected, "{world}: the first read");
+            assert_eq!(cached.0, expected, "{world}: the cached read");
+            assert!(higher > lower, "{world}: scoring answered");
+            assert_eq!(scores, [higher, lower], "{world}: cached scores");
+            assert_eq!(plugin.stats().answered, 2, "{world}: one guest score");
+        }
     }
 }
 
@@ -9314,17 +9506,26 @@ fn an_instance_behind_hears_the_models_a_worker_left_ahead_of_its_relabelling() 
 }
 
 /// A module built against an older minor of the world is refused by the
-/// host's range, both versions named, before anything of it is linked. Its
-/// shapes are today's here, so nothing but its version stops it.
+/// host's range, both versions named, before anything of it is linked, in
+/// either world. Its shapes are today's here, so nothing but its version
+/// stops it.
 #[test]
 fn a_module_of_an_older_minor_is_refused_by_the_range() {
-    let older = spec("older", guest::older_minor_guest(), mode::LEAST_IN_FLIGHT);
-    let err = Plugin::load(&runtime(), older).expect_err("refused");
-    assert!(matches!(err, LoadError::Abi { .. }), "{err}");
-    assert_eq!(
-        err.to_string(),
-        "plugin older: targets smg:policy@1.0.0; this host accepts 1.1"
-    );
+    let runtime = runtime();
+    for world in ["policy", "policy-packed"] {
+        let older = spec(
+            "older",
+            guest::older_minor_guest(world),
+            mode::LEAST_IN_FLIGHT,
+        );
+        let err = Plugin::load(&runtime, older).expect_err("refused");
+        assert!(matches!(err, LoadError::Abi { .. }), "{world}: {err}");
+        assert_eq!(
+            err.to_string(),
+            "plugin older: targets smg:policy@1.1.0; this host accepts 1.2",
+            "{world}"
+        );
+    }
 }
 
 /// A snapshot names ids and no pool. An instance further behind than the

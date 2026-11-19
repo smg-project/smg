@@ -1,6 +1,6 @@
 //! The policy controller's two wire contracts, compiled and parsed at test
 //! time (`contracts/README.md`): the gRPC protocol in package `smg.policy.v1`
-//! and the WebAssembly world `smg:policy@1.1.0`. Nothing at run time reads
+//! and the WebAssembly world `smg:policy@1.2.0`. Nothing at run time reads
 //! the files; the world's `types` interface is rendered from the crate's
 //! types by the `wit` module and held to the committed file by `tests/wit.rs`.
 //! The tests here hold four things: the
@@ -39,7 +39,7 @@ const WORLD_WIT: &str = "smg-policy.wit";
 const PACKAGE: &str = "smg.policy.v1";
 const WIT_NAMESPACE: &str = "smg";
 const WIT_PACKAGE: &str = "policy";
-const WIT_VERSION: &str = "1.1.0";
+const WIT_VERSION: &str = "1.2.0";
 
 /// The header deny-list of design section 4.6: the names no view may read
 /// and no routing-key override may key on, lowercase, in this order, each
