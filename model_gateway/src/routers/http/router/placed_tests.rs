@@ -1,14 +1,22 @@
 //! The regular HTTP router over a store and a registry of loopback workers.
 
-use std::{error::Error, sync::atomic::Ordering};
+use std::{
+    error::Error,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
+use axum::{
+    body::BodyDataStream,
+    routing::{post, MethodRouter},
+};
 use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
 use serde_json::{json, Value};
 use smg_policy_controller::{
-    store::{GatewayId, LeasesStore, WorkersStore},
+    store::{GatewayId, HealthSink, LeasesStore, WorkerStatus as RowStatus, WorkersStore},
     AppliedSpec, PolicySpec, PowerOfTwoMetric,
 };
-use tokio::time::timeout;
+use smg_worker::test_support::RefusedAddress;
+use tokio::{net::TcpListener, time::timeout};
 
 use super::{
     tests::{fixed_status_upstream, streamed_request},
@@ -24,6 +32,7 @@ use crate::{
             test_support::fast_retry_config,
         },
         grpc::backend_client::BasicWorkerBuilder,
+        http::test_support::spawn_sized_sse_worker_cut_after,
     },
     tenant::TenantKey,
 };
@@ -52,10 +61,15 @@ fn router(worker_registry: Arc<WorkerRegistry>, host: Option<Host>) -> Router {
 }
 
 async fn chat(router: &Router) -> Case<Response> {
+    chat_with_stream(router, false).await
+}
+
+async fn chat_with_stream(router: &Router, streaming: bool) -> Case<Response> {
     let meta = TenantRequestMeta::new(TenantKey::from("test-tenant"));
     let request = serde_json::from_value(json!({
         "model": MODEL,
-        "messages": [{"role": "user", "content": "hi"}]
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": streaming
     }))?;
     Ok(router
         .route_chat(None, &meta, Arc::new(request), MODEL)
@@ -207,6 +221,210 @@ async fn a_retry_names_the_row_of_its_failed_attempt() -> Case {
     assert_eq!(LeasesStore::live(&*store, GATEWAY), 1);
     drop(booking);
     assert_eq!(LeasesStore::live(&*store, GATEWAY), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_whole_answer_completes_its_lease_as_ok() -> Case {
+    let (url, hits) = fixed_status_upstream(&[CHAT], StatusCode::OK).await;
+    let registry = Arc::new(WorkerRegistry::new());
+    let (host, store, _) = bed_over(Arc::clone(&registry), &[&url]);
+    let row = store.by_key(&url).ok_or("the worker has no row")?.id;
+    let router = router(registry, Some(host));
+    let start = Instant::now();
+
+    let response = chat(&router).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert_eq!(LeasesStore::live(&*store, GATEWAY), 0);
+    assert!(store.completed_ok_since(GATEWAY, row, start));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_workers_failure_completes_its_lease_before_the_retry_asks() -> Case {
+    let first = TcpListener::bind("127.0.0.1:0").await?;
+    let retry = TcpListener::bind("127.0.0.1:0").await?;
+    let a = format!("http://{}", first.local_addr()?);
+    let b = format!("http://{}", retry.local_addr()?);
+    let registry = Arc::new(WorkerRegistry::new());
+    let (host, store, _) = bed_over(Arc::clone(&registry), &[&a, &b]);
+    let a_row = store.by_key(&a).ok_or("worker A has no row")?.id;
+    let b_row = store.by_key(&b).ok_or("worker B has no row")?;
+    store
+        .set_status(b_row.id, RowStatus::NotReady, b_row.revision)
+        .ok_or("worker B's row stood")?;
+    store.publish_now();
+    let b_row = store.by_key(&b).ok_or("worker B has no row")?;
+
+    // Only A can take the first attempt. Its answer makes B ready to retry.
+    let first_store = Arc::clone(&store);
+    serve_chat(
+        first,
+        post(move || {
+            let ready = first_store
+                .set_status(b_row.id, RowStatus::Ready, b_row.revision)
+                .is_some();
+            first_store.publish_now();
+            async move {
+                assert!(ready);
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+        }),
+    );
+    let at_retry = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&at_retry);
+    let retry_store = Arc::clone(&store);
+    serve_chat(
+        retry,
+        post(move || {
+            count.store(LeasesStore::live(&*retry_store, GATEWAY), Ordering::SeqCst);
+            async { StatusCode::OK }
+        }),
+    );
+
+    let mut router = router(registry, Some(host));
+    router.retry_config = fast_retry_config(2);
+    let start = Instant::now();
+    assert_eq!(chat(&router).await?.status(), StatusCode::OK);
+    assert_eq!(at_retry.load(Ordering::SeqCst), 1);
+    assert_eq!(LeasesStore::live(&*store, GATEWAY), 0);
+    assert!(!store.completed_ok_since(GATEWAY, a_row, start));
+    assert!(store.completed_ok_since(GATEWAY, b_row.id, start));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_send_that_reaches_no_worker_completes_as_a_failed_connection() -> Case {
+    let refused = RefusedAddress::reserve();
+    let url = refused.http_url();
+    let registry = Arc::new(WorkerRegistry::new());
+    let (host, store, _) = bed_over(Arc::clone(&registry), &[&url]);
+    let row = store.by_key(&url).ok_or("the worker has no row")?.id;
+    let router = router(registry, Some(host));
+    let start = Instant::now();
+
+    let response = chat(&router).await?;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        extract_error_code_from_response(&response),
+        "call_upstream_connection_failed"
+    );
+    assert_eq!(LeasesStore::live(&*store, GATEWAY), 0);
+    assert!(!store.completed_ok_since(GATEWAY, row, start));
+    Ok(())
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the test server stops with its runtime"
+)]
+fn serve_chat(listener: TcpListener, handler: MethodRouter) {
+    tokio::spawn(
+        async move { axum::serve(listener, axum::Router::new().route(CHAT, handler)).await },
+    );
+}
+
+const FIRST_FRAME: &[u8] = b"data: a\n\n";
+const FRAME_WAIT: Duration = Duration::from_secs(5);
+
+/// The caller sends each frame after reading the previous one.
+async fn gated_stream() -> Case<(String, mpsc::Sender<Bytes>)> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let url = format!("http://{}", listener.local_addr()?);
+    let (frames, body) = mpsc::channel(1);
+    let body = Arc::new(parking_lot::Mutex::new(Some(body)));
+    serve_chat(
+        listener,
+        post(move || {
+            let body = body.lock().take();
+            async move {
+                let body = body.map_or_else(Body::empty, |body| {
+                    Body::from_stream(ReceiverStream::new(body).map(Ok::<_, Infallible>))
+                });
+                ([(CONTENT_TYPE, "text/event-stream")], body)
+            }
+        }),
+    );
+    Ok((url, frames))
+}
+
+async fn next_frame(body: &mut BodyDataStream) -> Case<Bytes> {
+    Ok(timeout(FRAME_WAIT, body.next())
+        .await?
+        .ok_or("the body ended before the next frame")??)
+}
+
+#[tokio::test]
+async fn a_stream_holds_its_lease_to_its_last_frame() -> Case {
+    let (url, frames) = gated_stream().await?;
+    let registry = Arc::new(WorkerRegistry::new());
+    let (host, store, _) = bed_over(Arc::clone(&registry), &[&url]);
+    let row = store.by_key(&url).ok_or("the worker has no row")?.id;
+    let router = router(registry, Some(host));
+
+    let response = timeout(FRAME_WAIT, chat_with_stream(&router, true)).await??;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[CONTENT_TYPE], "text/event-stream");
+    let at_head = LeasesStore::live(&*store, GATEWAY);
+    let mut body = response.into_body().into_data_stream();
+    frames.send(Bytes::from_static(FIRST_FRAME)).await?;
+    assert_eq!(next_frame(&mut body).await?.as_ref(), FIRST_FRAME);
+    assert_eq!((at_head, LeasesStore::live(&*store, GATEWAY)), (1, 1));
+    for frame in [b"data: b\n\n".as_slice(), b"data: [DONE]\n\n"] {
+        frames.send(Bytes::from_static(frame)).await?;
+        assert_eq!(next_frame(&mut body).await?.as_ref(), frame);
+    }
+    let last_frame = Instant::now();
+    drop(frames);
+    assert!(timeout(FRAME_WAIT, body.next()).await?.is_none());
+    assert_eq!(LeasesStore::live(&*store, GATEWAY), 0);
+    assert!(store.completed_ok_since(GATEWAY, row, last_frame));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_stream_dropped_before_its_end_is_cancelled() -> Case {
+    let (url, frames) = gated_stream().await?;
+    let registry = Arc::new(WorkerRegistry::new());
+    let (host, store, workers) = bed_over(Arc::clone(&registry), &[&url]);
+    let row = store.by_key(&url).ok_or("the worker has no row")?.id;
+    let router = router(registry, Some(host));
+    let start = Instant::now();
+
+    let response = timeout(FRAME_WAIT, chat_with_stream(&router, true)).await??;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body().into_data_stream();
+    frames.send(Bytes::from_static(FIRST_FRAME)).await?;
+    assert_eq!(next_frame(&mut body).await?.as_ref(), FIRST_FRAME);
+    assert_eq!(LeasesStore::live(&*store, GATEWAY), 1);
+    assert_eq!(workers[0].load(), 1);
+    drop(body);
+    assert_eq!(LeasesStore::live(&*store, GATEWAY), 0);
+    assert_eq!(workers[0].load(), 0);
+    assert!(!store.completed_ok_since(GATEWAY, row, start));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_stream_whose_body_fails_reads_what_the_body_showed() -> Case {
+    const BODY: &str = "data: a\n\ndata: b\n\ndata: [DONE]\n\n";
+    let url = spawn_sized_sse_worker_cut_after(BODY, FIRST_FRAME.len()).await;
+    let registry = Arc::new(WorkerRegistry::new());
+    let (host, store, _) = bed_over(Arc::clone(&registry), &[&url]);
+    let row = store.by_key(&url).ok_or("the worker has no row")?.id;
+    let router = router(registry, Some(host));
+    let start = Instant::now();
+
+    let response = chat_with_stream(&router, true).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(LeasesStore::live(&*store, GATEWAY), 1);
+    let bytes = to_bytes(response.into_body(), 1024).await?;
+    assert!(bytes.starts_with(FIRST_FRAME));
+    assert!(bytes.ends_with(b"data: [DONE]\n\n"));
+    assert!(std::str::from_utf8(&bytes)?.contains("\"type\":\"stream_error\""));
+    assert_eq!(LeasesStore::live(&*store, GATEWAY), 0);
+    assert!(store.completed_ok_since(GATEWAY, row, start));
     Ok(())
 }
 

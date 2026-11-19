@@ -18,7 +18,8 @@
 //! the router says the dispatch at the send, then the request's end, or a
 //! release before any send. One dropped with a report owed says it, as the
 //! handle does. [`Held`] carries the worker crate's load guard beside it,
-//! so one value travels with a response to its end.
+//! so one value travels with a response to its end. The regular HTTP router
+//! holds its placement over the body that carries the guard.
 //!
 //! The gateway's own check of a target is what it alone knows: the worker's
 //! status as its probes read it, and its circuit breaker. The overload and
@@ -34,7 +35,7 @@ use std::{
 };
 
 use axum::{
-    http::{header::RETRY_AFTER, HeaderMap, HeaderValue},
+    http::{header::RETRY_AFTER, HeaderMap, HeaderValue, StatusCode},
     response::Response,
 };
 use rand::RngExt;
@@ -562,6 +563,7 @@ impl Host {
                     worker,
                     target: *target,
                     handle,
+                    sent: None,
                 });
             }
         }
@@ -599,11 +601,11 @@ impl Host {
 /// A request's end, as its router read it.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct End {
-    /// The status the worker answered with, 0 where none was read.
+    /// The response status, 0 where none was read.
     pub status: u16,
     /// What became of the transport.
     pub class: TransportClass,
-    /// The time to the first token, in microseconds.
+    /// The time to the first token or data frame, in microseconds.
     pub ttft_micros: u32,
     /// The tokens the worker read.
     pub tokens_in: u32,
@@ -613,12 +615,51 @@ pub(crate) struct End {
     pub duration_micros: u32,
 }
 
+/// What became of the transport, for the status a request ended with.
+/// `answered` says the worker gave that status itself.
+pub(crate) fn transport_class(status: StatusCode, answered: bool) -> TransportClass {
+    match status {
+        status if status < StatusCode::BAD_REQUEST => TransportClass::Ok,
+        StatusCode::GATEWAY_TIMEOUT => TransportClass::Timeout,
+        status if status.is_client_error() => TransportClass::ClientError,
+        _ if answered => TransportClass::ServerError,
+        _ => TransportClass::ConnectFailed,
+    }
+}
+
+impl End {
+    /// An HTTP answer with timing from the send and any first data frame.
+    fn http(
+        status: StatusCode,
+        class: TransportClass,
+        sent: Instant,
+        first: Option<Instant>,
+        now: Instant,
+    ) -> Self {
+        Self {
+            status: status.as_u16(),
+            class,
+            ttft_micros: first.map_or(0, |first| elapsed_micros(first, sent)),
+            tokens_in: 0,
+            tokens_out: 0,
+            duration_micros: elapsed_micros(now, sent),
+        }
+    }
+}
+
+/// The time since `sent` in whole microseconds, saturating at `u32::MAX`.
+fn elapsed_micros(now: Instant, sent: Instant) -> u32 {
+    u32::try_from(now.saturating_duration_since(sent).as_micros()).unwrap_or(u32::MAX)
+}
+
 /// An attempt's worker, with its decision's lease held to the request's
 /// end.
 pub(crate) struct Placed {
     worker: Arc<dyn Worker>,
     target: Target,
     handle: Handle<Arc<Door>>,
+    /// The instant of the send, `None` before one.
+    sent: Option<Instant>,
 }
 
 impl Placed {
@@ -640,7 +681,20 @@ impl Placed {
 
     /// The request was sent to the worker at `now`. Said once.
     pub(crate) fn dispatched(&mut self, now: Instant) {
+        self.sent = Some(now);
         self.handle.dispatched(now);
+    }
+
+    /// The request ended with a whole answer of `status` at `now`.
+    /// `answered` says the worker gave it itself. Before dispatch, the
+    /// placement's drop gives the lease up as abandoned.
+    pub(crate) fn ended(mut self, status: StatusCode, answered: bool, now: Instant) {
+        if let Some(sent) = self.sent {
+            self.completed(
+                End::http(status, transport_class(status, answered), sent, None, now),
+                now,
+            );
+        }
     }
 
     /// The request ended with `end`, as the router read it at `now`. Said
@@ -705,6 +759,7 @@ impl Held {
     }
 }
 
+mod ride;
 #[cfg(test)]
 pub(crate) mod testing;
 #[cfg(test)]

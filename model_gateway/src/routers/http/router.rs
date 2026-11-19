@@ -78,7 +78,7 @@ use crate::{
     routers::{
         common::{
             attach_sized_body,
-            attempt_ledger::{mark_upstream_answer, AttemptLedger},
+            attempt_ledger::{mark_upstream_answer, AttemptLedger, UpstreamAnswer},
             body_policy::{
                 decide_body_path, BodyPath, BodyPathInputs, BODY_PATH_BUFFERED, BODY_PATH_STREAMED,
                 REASON_MODEL_AMBIGUOUS, REASON_MODEL_SELECTION, REASON_NO_AVAILABLE_WORKER,
@@ -715,8 +715,9 @@ impl Router {
 
     /// One attempt of a typed request as a sequence of named stages: the
     /// placement or classic selection with its overload re-check, the adapter,
-    /// the dispatch, the adapter's verdict and the accounting. The placement
-    /// holds the controller's lease until the attempt returns.
+    /// the dispatch, the adapter's verdict and the accounting. A successful
+    /// stream carries its placement to the body's end. Other attempts report
+    /// their status before returning.
     async fn route_typed_request_once<T: GenerationRequest + serde::Serialize>(
         &self,
         attempt: &TypedAttempt<'_, T>,
@@ -773,13 +774,23 @@ impl Router {
 
         events::RequestReceivedEvent {}.emit();
 
-        self.account_attempt_outcome(
+        let response = self.account_attempt_outcome(
             attempt,
             &worker,
             response,
             head_success_recorded,
             placed.as_ref().map(Placed::id),
-        )
+        );
+
+        match placed {
+            None => response,
+            Some(placed) if head_success_recorded => placed.held_to_the_end_of(response),
+            Some(placed) => {
+                let answered = response.extensions().get::<UpstreamAnswer>().is_some();
+                placed.ended(response.status(), answered, Instant::now());
+                response
+            }
+        }
     }
 
     /// The attempt's placement by the policy controller, or the answer of a

@@ -3,16 +3,24 @@
 
 use std::{
     collections::{BTreeSet, HashSet},
-    sync::{Arc, Barrier},
+    convert::Infallible,
+    io,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Barrier,
+    },
     thread,
     time::{Duration, Instant},
 };
 
 use axum::{
-    body::to_bytes,
+    body::{to_bytes, Body},
     http::{header::RETRY_AFTER, HeaderMap, HeaderValue, StatusCode},
+    response::Response,
 };
+use bytes::Bytes;
 use futures::FutureExt;
+use futures_util::{stream, StreamExt};
 use kv_index::compute_request_content_hashes;
 use openai_protocol::worker::WorkerStatus;
 use serde_json::{json, Value};
@@ -22,8 +30,8 @@ use smg_policy_controller::{
     lease::{ReleaseReason, TransportClass},
     spec::{KeySourceSpec, RoutingKeySpec},
     store::{
-        BatchOutcome, KvEventSink, LeasesStore, LoadSink, LoadSource, MemoryStore, SessionsStore,
-        WorkerFacts, WorkerStatus as RowStatus, WorkersStore, PUBLISH_WINDOW,
+        BatchOutcome, HealthSink, KvEventSink, LeasesStore, LoadSink, LoadSource, MemoryStore,
+        SessionsStore, WorkerFacts, WorkerStatus as RowStatus, WorkersStore, PUBLISH_WINDOW,
     },
     view::{fingerprint, Identity, LoadRow},
     AppliedSpec, PolicySpec,
@@ -31,13 +39,14 @@ use smg_policy_controller::{
 use smg_worker::identity::basic::WorkerLoadGuard;
 
 use super::{
-    left_no_worker, mark, profile_of,
+    elapsed_micros, left_no_worker, mark, profile_of,
     testing::{bed, bed_under, cache_bed, store_blocks, MODEL},
-    Ask, End, Hashes, Held, Prompt, Unplaced, GATEWAY, NO_STAGE,
+    transport_class, Ask, End, Hashes, Held, Prompt, Unplaced, GATEWAY, NO_STAGE,
 };
 use crate::{
     config::{ManualAssignmentMode, PolicyConfig, RouterConfig},
     observability::{cache_trace, metrics::test_support::render_with_recorder},
+    routers::common::stream::GuardedStream,
 };
 
 /// The workers of a keyed case.
@@ -118,6 +127,69 @@ fn each_mark_is_new() {
     assert_eq!(marks.len(), 1000);
 }
 
+#[test]
+fn each_status_reads_its_class() {
+    for (status, answered, class) in [
+        (StatusCode::OK, true, TransportClass::Ok),
+        (StatusCode::FOUND, true, TransportClass::Ok),
+        (StatusCode::NOT_FOUND, false, TransportClass::ClientError),
+        (StatusCode::GATEWAY_TIMEOUT, true, TransportClass::Timeout),
+        (StatusCode::GATEWAY_TIMEOUT, false, TransportClass::Timeout),
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            true,
+            TransportClass::ServerError,
+        ),
+        (
+            StatusCode::BAD_GATEWAY,
+            false,
+            TransportClass::ConnectFailed,
+        ),
+    ] {
+        assert_eq!(
+            transport_class(status, answered),
+            class,
+            "{status}, {answered}"
+        );
+    }
+}
+
+#[test]
+fn elapsed_microseconds_saturate_at_the_limits() {
+    let sent = Instant::now();
+    let later = sent + Duration::from_micros(17);
+    assert_eq!(elapsed_micros(later, sent), 17);
+    assert_eq!(elapsed_micros(sent, later), 0);
+    let too_late = sent + Duration::from_micros(u64::from(u32::MAX) + 1);
+    assert_eq!(elapsed_micros(too_late, sent), u32::MAX);
+}
+
+#[test]
+fn an_http_end_times_the_send_and_any_first_data_frame() {
+    let sent = Instant::now();
+    let first = sent + Duration::from_micros(17);
+    let now = sent + Duration::from_micros(41);
+    let whole = End::http(StatusCode::OK, TransportClass::Ok, sent, None, now);
+    let streamed = End::http(
+        StatusCode::ACCEPTED,
+        TransportClass::Ok,
+        sent,
+        Some(first),
+        now,
+    );
+    assert_eq!(whole.status, 200);
+    assert_eq!(whole.class, TransportClass::Ok);
+    assert_eq!(whole.ttft_micros, 0);
+    assert_eq!(streamed.status, 202);
+    assert_eq!(streamed.ttft_micros, 17);
+    for end in [whole, streamed] {
+        assert_eq!(
+            (end.tokens_in, end.tokens_out, end.duration_micros),
+            (0, 0, 41)
+        );
+    }
+}
+
 /// A first attempt's ask of the request `id`.
 pub(super) fn first(id: &[u8]) -> Ask<'_> {
     Ask {
@@ -154,6 +226,116 @@ fn live(store: &MemoryStore, expected: usize) -> usize {
         }
         thread::sleep(Duration::from_millis(1));
     }
+}
+
+#[tokio::test]
+async fn a_placement_never_sent_says_nothing_at_its_end() {
+    let (host, store, _) = bed(&["http://w0:8000"]);
+    let now = Instant::now();
+    let placed = host.place(&first(b"r1"), now).await.expect("a worker");
+    let row = placed.id();
+    assert_eq!(live(&store, 1), 1);
+
+    placed.ended(StatusCode::OK, true, now);
+    assert_eq!(live(&store, 0), 0);
+    assert!(!store.completed_ok_since(GATEWAY, row, now));
+}
+
+#[tokio::test]
+async fn a_whole_end_records_a_success_at_its_instant() {
+    let (host, store, _) = bed(&["http://w0:8000"]);
+    let sent = Instant::now();
+    let mut placed = host.place(&first(b"r1"), sent).await.expect("a worker");
+    let row = placed.id();
+    placed.dispatched(sent);
+    let end = sent + Duration::from_millis(1);
+
+    placed.ended(StatusCode::OK, true, end);
+    assert_eq!(live(&store, 0), 0);
+    assert!(store.completed_ok_since(GATEWAY, row, end));
+    assert!(!store.completed_ok_since(GATEWAY, row, end + Duration::from_micros(1)));
+}
+
+#[tokio::test]
+async fn a_body_keeps_its_head_and_reports_what_its_frames_show() {
+    for failed in [false, true] {
+        let (host, store, _) = bed(&["http://w0:8000"]);
+        let sent = Instant::now();
+        let mut placed = host.place(&first(b"r1"), sent).await.expect("a worker");
+        let row = placed.id();
+        placed.dispatched(sent);
+
+        let data = stream::iter([Ok(Bytes::from_static(b"a"))]);
+        let error = stream::iter(failed.then(|| Err(io::Error::other("body failed"))));
+        let mut response = Response::new(Body::from_stream(data.chain(error)));
+        *response.status_mut() = StatusCode::ACCEPTED;
+        response
+            .headers_mut()
+            .insert("x-test", HeaderValue::from_static("worker"));
+        response.extensions_mut().insert(42u32);
+
+        let response = placed.held_to_the_end_of(response);
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(response.headers()["x-test"], "worker");
+        assert_eq!(response.extensions().get::<u32>(), Some(&42));
+        assert_eq!(LeasesStore::live(&*store, GATEWAY), 1);
+        let mut body = response.into_body().into_data_stream();
+        let first = body.next().await.expect("the data frame").expect("data");
+        assert_eq!(first.as_ref(), b"a");
+        if failed {
+            let error = body
+                .next()
+                .await
+                .expect("the error frame")
+                .expect_err("body failure");
+            assert_eq!(error.to_string(), "body failed");
+        }
+        assert_eq!(LeasesStore::live(&*store, GATEWAY), 1);
+        assert!(body.next().await.is_none());
+        assert_eq!(live(&store, 0), 0);
+        assert_eq!(store.completed_ok_since(GATEWAY, row, sent), !failed);
+    }
+}
+
+#[tokio::test]
+async fn the_placement_drops_before_its_body() {
+    struct ReadLiveOnDrop {
+        store: Arc<MemoryStore>,
+        live: Arc<AtomicUsize>,
+    }
+
+    impl Drop for ReadLiveOnDrop {
+        fn drop(&mut self) {
+            self.live
+                .store(LeasesStore::live(&*self.store, GATEWAY), Ordering::SeqCst);
+        }
+    }
+
+    let (host, store, workers) = bed(&["http://w0:8000"]);
+    let sent = Instant::now();
+    let mut placed = host.place(&first(b"r1"), sent).await.expect("a worker");
+    let row = placed.id();
+    placed.dispatched(sent);
+    let observed = Arc::new(AtomicUsize::new(1));
+    let probe = ReadLiveOnDrop {
+        store: Arc::clone(&store),
+        live: Arc::clone(&observed),
+    };
+    let guard = WorkerLoadGuard::with_key(Arc::clone(placed.worker()), None);
+    let body = Body::from_stream(GuardedStream::new(
+        stream::pending::<Result<Bytes, Infallible>>(),
+        (probe, guard),
+    ));
+
+    let response = placed.held_to_the_end_of(Response::new(body));
+    assert_eq!(
+        (LeasesStore::live(&*store, GATEWAY), workers[0].load()),
+        (1, 1)
+    );
+    drop(response);
+    assert_eq!(observed.load(Ordering::SeqCst), 0);
+    assert_eq!(workers[0].load(), 0);
+    assert!(!store.completed_ok_since(GATEWAY, row, sent));
 }
 
 #[tokio::test]

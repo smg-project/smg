@@ -48,7 +48,7 @@ pub(crate) mod follower;
     not(test),
     expect(
         dead_code,
-        reason = "the request's end and the pair's routers call the rest in later changes"
+        reason = "the rank accessor, explicit release and Held are exercised by tests"
     )
 )]
 pub(crate) mod host;
