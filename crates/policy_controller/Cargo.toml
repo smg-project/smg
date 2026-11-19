@@ -373,6 +373,12 @@ harness = false
 name = "prefix_hash"
 harness = false
 
+# A session key kept on its ring worker over the overload veto. Apart from
+# `decision`, whose binary takes no new id.
+[[bench]]
+name = "vetoed"
+harness = false
+
 # The `bucket` preset's rows. Apart from `decision`, as `spec_index` is:
 # that binary runs at its gate's bound.
 [[bench]]
