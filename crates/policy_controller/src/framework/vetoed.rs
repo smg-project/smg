@@ -147,6 +147,9 @@ impl Engine {
             ..*cx
         };
         let buf = &mut scratch.single;
+        // The rule's own mark of this decision, read back below: none until
+        // one of its tiers picks.
+        buf.lifted = Lifted::None;
         // Over a pool whose host lists its engines the ring places the key
         // by its walk, the veto lifted in it as in the pass: the rows it
         // hands are the whole pass's, and `buf` holds the rows it kept.
@@ -160,8 +163,11 @@ impl Engine {
             None => run_single(profile, index, facts, pool, set, &lifted, buf),
         };
         if let Decision::Pick(pick) = &mut decision {
-            // A pick of the liveness tier carries its own mark.
-            if pick.trace.lifted == Lifted::None && all_vetoed(profile, facts, set, cx, buf) {
+            // A pick of the rule's own carries its mark already. The rule
+            // left that mark in `buf`, and it is read there: read through
+            // the pick, it had the decision built aside and copied whole
+            // to the caller's place.
+            if buf.lifted == Lifted::None && all_vetoed(profile, facts, set, cx, buf) {
                 pick.trace.lifted = Lifted::Overload;
             }
         }
