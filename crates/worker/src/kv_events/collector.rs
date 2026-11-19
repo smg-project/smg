@@ -1883,6 +1883,43 @@ mod tests {
         assert_eq!(host.calls(), ["model_left m"]);
     }
 
+    /// A task's lift turn marks its own slot alone: one that makes it after
+    /// a later subscription stands under its address leaves that slot as it
+    /// is. Marked by the old task, the later subscription's removal would
+    /// free the slot at once while its task still runs.
+    #[tokio::test]
+    async fn a_lift_turn_behind_a_later_subscription_marks_nothing() {
+        let host = Arc::new(RecordingHost::default());
+        let collector = KvEventCollector::new(Arc::clone(&host));
+        let worker = unconnected_grpc_worker_at("grpc://127.0.0.1:23");
+        let url = worker.url();
+        // The id of an older subscription of the address, whose slot is gone.
+        let old = NEXT_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed);
+        collector
+            .on_worker_added(&worker, SubscriptionKind::Loads)
+            .await;
+        let (later, _) = collector.slot_ids(url).await;
+        assert!(later.is_some(), "the later subscription is active");
+
+        KvEventCollector::<RecordingHost>::lift_turn(
+            &collector.worker_handles,
+            &host,
+            &worker,
+            old,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                collector.worker_handles.lock().await.get(url),
+                Some(Slot::Active(sub)) if !sub.ended
+            ),
+            "the old task leaves the later subscription unmarked"
+        );
+        assert_eq!(collector.slot_ids(url).await, (later, None));
+        collector.on_worker_removed(url).await;
+    }
+
     /// A stop ends the tasks and tells the host of no model: what the host
     /// keeps for a model is the host's to clear.
     #[tokio::test]
