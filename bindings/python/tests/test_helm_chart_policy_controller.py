@@ -2680,9 +2680,11 @@ def test_the_notes_of_an_elected_controller_say_that_its_standby_follows_nobody(
     standby follows no leader and takes over with no worker and no load, and
     why, as the controller tells the two apart: the standbys' listener not
     named to take identities as told, or named and serving TLS, where a
-    standby's dial has no credential yet."""
+    standby's dial has no credential yet. Either line ends by sending its
+    reader to the README's part."""
     said = [line for line in notes(*ELECTED, *settings).splitlines() if "Standby" in line]
     assert len(said) == 1 and said[0].startswith(f"{NO_STANDBY_FOLLOWS}: {why}"), said
+    assert said[0].endswith("(the chart's README, Standby)"), said
 
 
 @needs_helm
