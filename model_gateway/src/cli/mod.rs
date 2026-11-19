@@ -677,19 +677,19 @@ struct RoutingArgs {
     policy_controller: bool,
 
     /// Follow workers from the policy controller's gateway listener (requires --policy-controller).
-    #[arg(long, value_name = "host:port", help_heading = "Routing Policy")]
+    #[arg(long, value_name = "host:port", help_heading = "Policy Controller")]
     policy_controller_address: Option<String>,
 
     /// PEM certificate authority file for the controller connection.
-    #[arg(long, value_name = "path", help_heading = "Routing Policy")]
+    #[arg(long, value_name = "path", help_heading = "Policy Controller")]
     policy_controller_tls_ca_cert: Option<String>,
 
     /// PEM client certificate file for the controller connection.
-    #[arg(long, value_name = "path", help_heading = "Routing Policy")]
+    #[arg(long, value_name = "path", help_heading = "Policy Controller")]
     policy_controller_tls_cert: Option<String>,
 
     /// PEM client private key file for the controller connection.
-    #[arg(long, value_name = "path", help_heading = "Routing Policy")]
+    #[arg(long, value_name = "path", help_heading = "Policy Controller")]
     policy_controller_tls_key: Option<String>,
 }
 
@@ -2121,6 +2121,7 @@ mod tests {
         Cli::parse_from(argv).router_args
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn the_policy_controller_flags_reach_the_router_configuration() {
         let cli = Cli::try_parse_from([

@@ -134,6 +134,7 @@ const PLAIN: &[&str] = &[
     "upstream_http2",
     "enable_wasm",
     "storage_hook_wasm_path",
+    "policy_controller",
     "policy_controller_address",
     "policy_controller_tls_ca_cert",
     "policy_controller_tls_cert",

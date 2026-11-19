@@ -1770,11 +1770,10 @@ async fn start_discovery(
     app_context: &Arc<AppContext>,
     mesh_cluster_state: Option<ClusterState>,
     mesh_port: Option<u16>,
-    following: bool,
 ) -> DiscoveryTasks {
     let mut discovery_tasks = DiscoveryTasks::default();
 
-    if following {
+    if app_context.follows_controller() {
         info!("Skipping worker discovery because --policy-controller-address is set");
     } else if let Some(service_discovery_config) = service_discovery_config {
         let app_context_arc = Arc::clone(app_context);
@@ -1833,7 +1832,6 @@ async fn start_discovery(
 async fn start_workflow_engines(
     app_context: &Arc<AppContext>,
     config: &ServerConfig,
-    following: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let weak_context = Arc::downgrade(app_context);
     let worker_job_queue = JobQueue::new(
@@ -1922,7 +1920,7 @@ async fn start_workflow_engines(
         .worker_job_queue
         .get()
         .expect("JobQueue should be initialized");
-    if following {
+    if app_context.follows_controller() {
         info!("Skipping startup worker registration because --policy-controller-address is set");
     } else {
         info!(
@@ -2232,8 +2230,8 @@ pub(crate) async fn serving_router(
 }
 
 /// Start the local health loop and keep its handle until the server stops.
-fn start_worker_health_checks(app_context: &AppContext, following: bool) -> Option<WorkerManager> {
-    if following {
+fn start_worker_health_checks(app_context: &AppContext) -> Option<WorkerManager> {
+    if app_context.follows_controller() {
         info!("Skipping worker health checks because --policy-controller-address is set");
         return None;
     }
@@ -2281,8 +2279,9 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // of construction path — a bypassed empty/duplicate tenant key would
     // otherwise silently reach `AuthConfig`.
     config.router_config.validate()?;
-    let following = config.router_config.policy_controller_address.is_some();
-    if following && config.service_discovery_config.is_some() {
+    if config.router_config.policy_controller_address.is_some()
+        && config.service_discovery_config.is_some()
+    {
         return Err("--policy-controller-address conflicts with service_discovery_config (--service-discovery or --discovery-provider)".into());
     }
     // The mesh listener's port against the others: the mesh configuration is
@@ -2482,7 +2481,9 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         )
         .await?,
     );
-    let follower_on_exit = following.then(|| FollowerOnExit(&app_context));
+    let follower_on_exit = app_context
+        .follows_controller()
+        .then(|| FollowerOnExit(&app_context));
     // The history store's size on /metrics, from the stores that can count.
     if config.prometheus_config.is_some() {
         history_metrics::spawn_sampler(Arc::clone(&app_context));
@@ -2507,7 +2508,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     // The job queue, the typed workflow engines and the start-up jobs on
     // them. The jobs complete in the background.
-    start_workflow_engines(&app_context, &config, following).await?;
+    start_workflow_engines(&app_context, &config).await?;
 
     // Note: MCP orchestrator handles background refresh internally via refresh channel
     // configured by inventory.refresh_interval in mcp.yaml
@@ -2520,7 +2521,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     let (router, gateway) = serving_router(&config, &app_context).await?;
 
-    let _worker_manager = start_worker_health_checks(&app_context, following);
+    let _worker_manager = start_worker_health_checks(&app_context);
 
     // WorkerMonitor subscribes to registry events. Starting its event
     // loop here (after the synchronous worker population in
@@ -2642,11 +2643,10 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         &app_state.context,
         mesh_cluster_state,
         mesh_port,
-        following,
     )
     .await;
 
-    if !following {
+    if !app_state.context.follows_controller() {
         info!(
             "Router ready | workers: {:?}",
             WorkerManager::get_worker_urls(&app_state.context.worker_registry)
@@ -3725,6 +3725,7 @@ mod tests {
         .unwrap()
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn worker_writes_are_refused_only_while_following_a_controller() {
         use axum::body::{to_bytes, Body};
@@ -3792,6 +3793,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn readiness_waits_for_the_first_snapshot_on_both_routers() {
         use axum::body::{to_bytes, Body};
@@ -3859,8 +3861,17 @@ mod tests {
             assert!(context.worker_monitor.is_none());
             stop.send(()).unwrap();
             serving.await.unwrap().unwrap();
+            for app in &apps {
+                assert_eq!(ready(app.clone()).await.status(), StatusCode::OK);
+            }
+            // A draining gateway is not ready, whatever it follows: load
+            // balancers are told for the whole settle window.
+            context.inflight_tracker.begin_drain();
             for app in apps {
-                assert_eq!(ready(app).await.status(), StatusCode::OK);
+                let response = ready(app).await;
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+                let body = to_bytes(response.into_body(), 4096).await.unwrap();
+                assert!(std::str::from_utf8(&body).unwrap().contains("draining"));
             }
         })
         .await
@@ -3883,6 +3894,7 @@ mod tests {
         .unwrap()
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn startup_refuses_runtime_worker_discovery_beside_a_controller_address() {
         let mut config = ServerConfig::minimal(RouterConfig {
@@ -3903,6 +3915,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     #[tracing_test::traced_test]
     async fn following_skips_startup_registration_health_load_and_worker_discovery() {
@@ -3920,9 +3933,8 @@ mod tests {
                     .await
                     .unwrap(),
             );
-            start_workflow_engines(&context, &config, following)
-                .await
-                .unwrap();
+            assert_eq!(context.follows_controller(), following);
+            start_workflow_engines(&context, &config).await.unwrap();
             assert_eq!(
                 context
                     .worker_job_queue
@@ -3932,20 +3944,10 @@ mod tests {
                     .is_none(),
                 following
             );
-            assert_eq!(
-                start_worker_health_checks(&context, following).is_none(),
-                following
-            );
+            assert_eq!(start_worker_health_checks(&context).is_none(), following);
             assert_eq!(context.worker_monitor.is_none(), following);
-            let discovery = start_discovery(
-                Some(file_discovery()),
-                None,
-                &context,
-                None,
-                None,
-                following,
-            )
-            .await;
+            let discovery =
+                start_discovery(Some(file_discovery()), None, &context, None, None).await;
             assert_eq!(discovery.0.is_empty(), following);
             if following {
                 let follower = context.policy_follower.as_ref().unwrap();

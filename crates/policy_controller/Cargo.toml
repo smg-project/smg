@@ -168,9 +168,10 @@ controller = [
     "dep:tracing-subscriber",
 ]
 
-# The reference client of the controller's protocol, for the crate's cases
-# and for examples: the generated client behind one type. It adds no
-# dependency to the controller's, and no shipped binary builds it.
+# The gateway's side of the controller's protocol: the reference client, the
+# link a host's requests share and the watcher. It adds no dependency to the
+# controller's. The gateway builds it on the targets the controller builds
+# on, to follow a controller.
 client = ["controller"]
 
 # The Kubernetes Lease backend of the elector.

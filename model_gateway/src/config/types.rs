@@ -652,8 +652,9 @@ pub struct RouterConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_hook_wasm_path: Option<String>,
     /// Select the policy controller for this process. The classic policies
-    /// are the default.
-    #[serde(skip)]
+    /// are the default. Written where it is on, so a configuration under a
+    /// controller's address reads back with the setting the address needs.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub policy_controller: bool,
     /// Address of the controller's gateway listener, as `host:port`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2210,7 +2211,12 @@ mod tests {
             assert!(default.get(name).is_none(), "{name}");
             configured[name] = value.into();
         }
+        // The setting the address needs is written where it is on, and
+        // nowhere else.
+        assert!(default.get("policy_controller").is_none());
+        configured["policy_controller"] = true.into();
         let config: RouterConfig = serde_json::from_value(configured).unwrap();
+        assert!(config.policy_controller);
         assert_eq!(
             config.policy_controller_address.as_deref(),
             Some("controller:30100")
@@ -2228,6 +2234,7 @@ mod tests {
         for (name, value) in paths {
             assert_eq!(serialized[name], value);
         }
+        assert_eq!(serialized["policy_controller"], true);
     }
 
     /// The mode is in the gateway's start-up lines: a worker URL's secret is

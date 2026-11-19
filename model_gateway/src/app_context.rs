@@ -268,6 +268,15 @@ impl AppContext {
         AppContextBuilder::new()
     }
 
+    /// Whether a policy controller supplies this gateway's workers: the
+    /// context was built under a controller's address and holds the
+    /// follower of its watch. The start asks it at each step such a
+    /// gateway leaves to the controller: the startup registration, the
+    /// health checks and the discovery.
+    pub(crate) fn follows_controller(&self) -> bool {
+        self.policy_follower.is_some()
+    }
+
     /// Create AppContext from config with all components initialized
     /// This is the main entry point that replaces ~194 lines of initialization in server.rs
     pub fn from_config(

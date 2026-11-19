@@ -147,29 +147,53 @@ fn next_delay(delay: Duration) -> Duration {
     (delay * 2).min(MAX_RETRY)
 }
 
+/// The leaders followed at once, one after another, before the watch holds a
+/// place again. Two replicas that name each other would else be dialed in a
+/// loop with no wait.
+const REDIRECTS: u32 = 2;
+
+/// The leader `error` names, where the next dial goes to it at once: a
+/// replica that does not lead named one, and fewer than [`REDIRECTS`] were
+/// followed since the watch last held a place.
+fn named_leader(error: &anyhow::Error, followed: u32) -> Option<&str> {
+    match error.downcast_ref() {
+        Some(Error::NotLeader(leader)) if !leader.is_empty() && followed < REDIRECTS => {
+            Some(leader)
+        }
+        _ => None,
+    }
+}
+
 async fn run(settings: Settings, store: Arc<MemoryStore>, progress: watch::Sender<Followed>) {
     let mut watcher = Watcher::new(store);
     let mut delay = FIRST_RETRY;
     let mut redirect: Option<String> = None;
+    // The leaders followed at once since the watch last held a place.
+    let mut followed = 0;
     loop {
         let address = redirect.as_deref().unwrap_or(&settings.address);
         let error = match settings.connect(address).await {
-            Ok(mut client) => follow(&mut client, &mut watcher, &progress, &mut delay)
-                .await
-                .into(),
+            Ok(mut client) => follow(
+                &mut client,
+                &mut watcher,
+                &progress,
+                &mut delay,
+                &mut followed,
+            )
+            .await
+            .into(),
             Err(error) => error,
         };
-        match error.downcast_ref() {
-            Some(Error::NotLeader(leader)) if !leader.is_empty() => {
-                redirect = Some(leader.clone());
-            }
-            _ => {
-                warn!(address, error = %format_args!("{error:#}"), ?delay, "Retrying the controller's worker watch");
-                sleep(delay).await;
-                delay = next_delay(delay);
-                redirect = None;
-            }
+        if let Some(leader) = named_leader(&error, followed) {
+            followed += 1;
+            redirect = Some(leader.to_owned());
+            continue;
         }
+        warn!(address, error = %format_args!("{error:#}"), ?delay, "Retrying the controller's worker watch");
+        sleep(delay).await;
+        delay = next_delay(delay);
+        redirect = None;
+        followed = 0;
     }
 }
 
@@ -178,6 +202,7 @@ async fn follow(
     watcher: &mut Watcher,
     progress: &watch::Sender<Followed>,
     delay: &mut Duration,
+    followed: &mut u32,
 ) -> Error {
     loop {
         let mut following = match watcher.open(client).await {
@@ -203,6 +228,7 @@ async fn follow(
             if following.watcher().at().is_some() {
                 placed = true;
                 *delay = FIRST_RETRY;
+                *followed = 0;
                 if *progress.borrow() == Followed::Nothing {
                     progress.send_replace(Followed::Fleet);
                 }
@@ -236,7 +262,10 @@ pub(crate) mod tests {
     use tokio::{sync::oneshot, time};
     use tonic::{transport::Channel, Request};
 
-    use super::{gateway_id, next_delay, Followed, Follower, Settings, FIRST_RETRY};
+    use super::{
+        gateway_id, named_leader, next_delay, Error, Followed, Follower, Settings, FIRST_RETRY,
+        REDIRECTS,
+    };
 
     const WAIT: Duration = Duration::from_secs(5);
 
@@ -475,6 +504,24 @@ pub(crate) mod tests {
         time::timeout(Duration::from_secs(1), follower.stop())
             .await
             .unwrap();
+    }
+
+    /// A leader a replica names is dialed at once, and so is the leader that
+    /// one names. A third in a row waits: replicas that name each other
+    /// are not dialed in a loop.
+    #[test]
+    fn a_named_leader_is_followed_at_once_twice_and_then_waited_for() {
+        let named = |leader: &str| anyhow::Error::from(Error::NotLeader(leader.to_owned()));
+        for followed in 0..REDIRECTS {
+            assert_eq!(named_leader(&named("b:30100"), followed), Some("b:30100"));
+        }
+        assert_eq!(named_leader(&named("b:30100"), REDIRECTS), None);
+        assert_eq!(
+            named_leader(&named(""), 0),
+            None,
+            "a replica that names none"
+        );
+        assert_eq!(named_leader(&anyhow::Error::from(Error::NoCredit), 0), None);
     }
 
     #[test]

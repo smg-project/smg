@@ -2224,6 +2224,11 @@ impl ConfigValidator {
         if !config.policy_controller {
             return refuse("--policy-controller-address requires the policy_controller setting (--policy-controller)");
         }
+        // The follower dials through the controller crate's client, which
+        // the gateway's manifest takes on these two targets alone.
+        if cfg!(not(any(target_os = "linux", target_os = "macos"))) {
+            return refuse("--policy-controller-address is followed on Linux and macOS alone");
+        }
         let valid_address = address.parse::<Authority>().is_ok_and(|authority| {
             !address.contains('@')
                 && url::Host::parse(authority.host()).is_ok()
@@ -2235,6 +2240,13 @@ impl ConfigValidator {
         if config.policy_controller_tls_cert.is_some() != config.policy_controller_tls_key.is_some()
         {
             return refuse("--policy-controller-tls-cert and --policy-controller-tls-key must be given together");
+        }
+        // The connection trusts the authority's file and no other root: a
+        // client certificate without it could verify no controller.
+        if config.policy_controller_tls_cert.is_some()
+            && config.policy_controller_tls_ca_cert.is_none()
+        {
+            return refuse("--policy-controller-tls-cert requires --policy-controller-tls-ca-cert, the one root the connection trusts");
         }
         if config.mode.worker_count() != 0 {
             return refuse("--policy-controller-address supplies the workers and conflicts with --worker-urls, --encode, --prefill and --decode");
@@ -2360,6 +2372,9 @@ mod tests {
 
     use super::*;
 
+    /// A configuration under an address. Startup refuses the address first
+    /// on a target that does not build the follower, so the cases that
+    /// read past that refusal are built on the two targets that do.
     fn following_config() -> RouterConfig {
         RouterConfig {
             policy_controller: true,
@@ -2389,6 +2404,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn a_controller_address_is_a_host_with_a_port() {
         for address in [
@@ -2411,7 +2427,14 @@ mod tests {
                 &["--policy-controller-address", "host:port"],
             );
         }
-        for address in ["controller:30100", "127.0.0.1:80", "[::1]:443"] {
+        // Each end of the port range is taken.
+        for address in [
+            "controller:30100",
+            "127.0.0.1:80",
+            "[::1]:443",
+            "controller:1",
+            "controller:65535",
+        ] {
             RouterConfig {
                 policy_controller_address: Some(address.to_owned()),
                 ..following_config()
@@ -2450,6 +2473,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn a_controller_tls_certificate_and_key_require_each_other() {
         for config in [
@@ -2472,6 +2496,30 @@ mod tests {
         }
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_controller_client_certificate_requires_its_authority() {
+        let pair = || RouterConfig {
+            policy_controller_tls_cert: Some("cert.pem".to_owned()),
+            policy_controller_tls_key: Some("key.pem".to_owned()),
+            ..following_config()
+        };
+        controller_refusal(
+            &pair(),
+            &[
+                "--policy-controller-tls-cert",
+                "--policy-controller-tls-ca-cert",
+            ],
+        );
+        RouterConfig {
+            policy_controller_tls_ca_cert: Some("ca.pem".to_owned()),
+            ..pair()
+        }
+        .validate()
+        .expect("a pair beside its authority's file is taken");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn a_controller_address_refuses_worker_urls() {
         controller_refusal(
@@ -2485,6 +2533,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn a_controller_address_refuses_service_discovery() {
         controller_refusal(
@@ -2506,6 +2555,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn a_followed_fleet_can_use_power_of_two_without_static_workers() {
         let config = RouterConfig {
@@ -2521,6 +2571,19 @@ mod tests {
         }
         .validate()
         .is_err());
+    }
+
+    /// A following configuration read back from its own record is the one
+    /// that was written: the setting the address needs is written with it.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_following_configuration_read_back_from_its_record_is_valid() {
+        let record = serde_json::to_value(following_config()).unwrap();
+        let back: RouterConfig = serde_json::from_value(record.clone()).unwrap();
+        back.validate()
+            .expect("the record of a following gateway reads back whole");
+        assert_eq!(record["policy_controller"], true);
+        assert!(back.policy_controller);
     }
 
     /// The reason reads "Must be > 0", so a signed zero and a negative are refused alike.

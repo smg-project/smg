@@ -496,15 +496,29 @@ impl ProbeState {
     /// Build the `/readiness` response from the follower's first snapshot
     /// or the cached registry state.
     ///
-    /// With registry-based readiness, draining yields reason `"draining"`
-    /// so load balancers stop routing new connections during shutdown
-    /// (liveness intentionally stays OK). Under worker-side media placement,
+    /// Draining yields reason `"draining"` under either source, read ahead
+    /// of both, so load balancers stop routing new connections during
+    /// shutdown (liveness intentionally stays OK). Under worker-side media placement,
     /// the ready body names models no worker processes media for under
     /// `models_without_media_processing`; status stays ready because the pod
     /// serves everything else. PD/EPD responses additionally expose the
     /// cached per-role capacity decision. The registry-based bodies carry the per-model
     /// section (`models`).
     pub fn readiness_response(&self) -> Response {
+        // Ahead of either source: a gateway that drains is not ready,
+        // whatever it follows.
+        if self.inflight_tracker.is_draining() {
+            return mark_probe(
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({
+                        "status": "not ready",
+                        "reason": "draining"
+                    })),
+                )
+                    .into_response(),
+            );
+        }
         if let Some(follower) = &self.follower {
             let followed = follower
                 .upgrade()
@@ -520,18 +534,6 @@ impl ProbeState {
                 Followed::Fleet => (StatusCode::OK, Json(json!({"status": "ready"}))),
             };
             return mark_probe(response.into_response());
-        }
-        if self.inflight_tracker.is_draining() {
-            return mark_probe(
-                (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(json!({
-                        "status": "not ready",
-                        "reason": "draining"
-                    })),
-                )
-                    .into_response(),
-            );
         }
 
         let snapshot = self.readiness.load();
@@ -593,7 +595,7 @@ fn mark_probe(mut response: Response) -> Response {
 /// event can fall between snapshot and subscription): workers registered
 /// before this call are reflected the moment it returns.
 ///
-/// The task holds the worker and tokenizer registries by [`Weak`](std::sync::Weak) and
+/// The task holds the worker and tokenizer registries by [`Weak`] and
 /// `upgrade()`s them each iteration, stopping the moment the owning server
 /// drops them. Holding strong `Arc`s would form a reference cycle — the
 /// registry owns the event `Sender`, so a task that also owned a registry
