@@ -97,7 +97,7 @@ is a new experiment):
 
 How it was assembled: news articles of the XL-Sum test split in Arabic, Chinese, English, Hindi,
 Japanese, Korean, Russian and Thai (the first 400 of each language's first file, named in `corpus.json`),
-and pieces of open-source code and configuration (Rust, Python, Go, shell, C headers, Jinja templates,
+and pieces of open-source code and configuration (Rust, Python, Go, shell, C, Jinja templates,
 TOML and YAML, protobuf, JSON) with generated tool-call payloads. A seeded assembly draws from those
 pools until a text reaches its class's token count.
 
