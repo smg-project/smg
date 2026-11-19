@@ -98,27 +98,39 @@ fn parse_tiktoken_config(value: &serde_json::Value) -> TiktokenConfig {
     }
 }
 
+/// The entries of `added_tokens_decoder` that name a token: the id, the
+/// spelling and the `"special"` flag of each. An entry whose id does not
+/// parse, or whose `content` is missing or empty, names no text: it is left
+/// out of the load whole, as the Hugging Face library leaves one out of its
+/// added vocabulary. It gives no spelling and no skipped id, and no encoder
+/// or matcher is built over it.
+fn added_token_entries(
+    config: &serde_json::Value,
+) -> impl Iterator<Item = (TokenIdType, &str, bool)> {
+    config
+        .get("added_tokens_decoder")
+        .and_then(|v| v.as_object())
+        .into_iter()
+        .flatten()
+        .filter_map(|(id_str, token_info)| {
+            let id = id_str.parse::<TokenIdType>().ok()?;
+            let content = token_info.get("content").and_then(|v| v.as_str())?;
+            let special = token_info
+                .get("special")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            (!content.is_empty()).then_some((id, content, special))
+        })
+}
+
 /// Ids of `added_tokens_decoder` entries flagged `"special": true`: the set
 /// `skip_special_tokens` strips, as HuggingFace defines it. Added tokens
 /// without the flag (Kimi-K3's `<|open|>` / `<|close|>` / `<|sep|>`) are
 /// control tokens for encoding but stay in decoded text.
 fn parse_skip_token_ids(config: &serde_json::Value) -> HashSet<TokenIdType> {
-    let mut ids = HashSet::new();
-    if let Some(added) = config
-        .get("added_tokens_decoder")
-        .and_then(|v| v.as_object())
-    {
-        for (id_str, token_info) in added {
-            let special = token_info
-                .get("special")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            if let (true, Ok(id)) = (special, id_str.parse::<TokenIdType>()) {
-                ids.insert(id);
-            }
-        }
-    }
-    ids
+    added_token_entries(config)
+        .filter_map(|(id, _, special)| special.then_some(id))
+        .collect()
 }
 
 /// Load `tokenizer_config.json` from `dir`, returning both the parsed
@@ -141,21 +153,9 @@ fn load_tiktoken_config_from_dir(
 ///
 /// Format: `{ "163584": { "content": "[BOS]", "special": true }, ... }`
 fn parse_added_tokens_decoder(config: &serde_json::Value) -> HashMap<String, TokenIdType> {
-    let mut tokens = HashMap::new();
-    if let Some(added) = config
-        .get("added_tokens_decoder")
-        .and_then(|v| v.as_object())
-    {
-        for (id_str, token_info) in added {
-            if let (Ok(id), Some(content)) = (
-                id_str.parse::<TokenIdType>(),
-                token_info.get("content").and_then(|v| v.as_str()),
-            ) {
-                tokens.insert(content.to_string(), id);
-            }
-        }
-    }
-    tokens
+    added_token_entries(config)
+        .map(|(id, content, _)| (content.to_string(), id))
+        .collect()
 }
 
 /// Extract named special tokens (bos, eos, unk, etc.) from config JSON.
@@ -517,17 +517,11 @@ impl TiktokenTokenizer {
     /// template from an explicit path, else the configuration's, else a file
     /// beside the vocabulary; the EOS ids; the renderer).
     fn from_vocabulary(
-        mut vocabulary: FileVocabulary,
+        vocabulary: FileVocabulary,
         dir: &Path,
         chat_template_path: Option<&str>,
         config_chat_template: ConfigChatTemplates,
     ) -> Result<Self> {
-        // An added token with an empty spelling names no text: it is left
-        // out of the set, as the Hugging Face library leaves one out of its
-        // added vocabulary, and no encoder or matcher is built over it.
-        vocabulary
-            .specials
-            .retain(|spelling, _| !spelling.is_empty());
         let FileVocabulary {
             ranks,
             pattern,
@@ -3151,8 +3145,8 @@ mod tests {
     }
 
     /// An added token whose spelling is empty is left out of the set a
-    /// tiktoken file's checkpoint gives (see
-    /// `TiktokenTokenizer::from_vocabulary`): the file loads, and it reads
+    /// tiktoken file's checkpoint gives (see `added_token_entries`): the
+    /// file loads, and it reads
     /// as the same file without that entry under a template that builds its
     /// control spellings, one that builds a value of several and one that
     /// spells them whole. The cases run on a thread of their own, so that a
@@ -3191,6 +3185,108 @@ mod tests {
             assert_eq!(with, without);
             assert_eq!((with.0, with.1, with.2), (true, marked, None));
         }
+    }
+
+    /// An entry of `added_tokens_decoder` that names no token, by an empty
+    /// spelling or by none, is left out of the load whole (see
+    /// `added_token_entries`), also where it is flagged special: at the rank
+    /// of a byte a decode that skips special tokens keeps that byte, far
+    /// beyond the ranks the per-id byte table is still built, and the file
+    /// reads as the same file without the entry.
+    #[test]
+    fn a_tiktoken_file_s_entry_that_names_no_token_skips_no_id() {
+        let read = |entry: Option<(&str, serde_json::Value)>| {
+            let mut config = serde_json::json!({
+                "added_tokens_decoder": {"300": {"content": "</s:x>", "special": true}},
+                "eos_token": "</s:x>",
+            });
+            if let Some((id, entry)) = entry {
+                config["added_tokens_decoder"][id] = entry;
+            }
+            let dir = write_tiktoken_dir(&full_byte_tiktoken_model(), &config.to_string(), None);
+            let tokenizer = TiktokenTokenizer::from_dir(dir.path()).unwrap();
+            (
+                tokenizer.decode(&[72, 65, 66, 300], true).unwrap(),
+                tokenizer.decode(&[72, 65, 66, 300], false).unwrap(),
+                tokenizer.encode("HAB", false).unwrap().token_ids().to_vec(),
+                tokenizer.token_to_id(""),
+                tokenizer.vocab_size,
+                tokenizer.byte_level.is_some(),
+            )
+        };
+        let without = read(None);
+        assert_eq!(
+            without,
+            (
+                "HAB".to_string(),
+                "HAB</s:x>".to_string(),
+                vec![72, 65, 66],
+                None,
+                301,
+                true
+            )
+        );
+        for (id, entry) in [
+            ("65", serde_json::json!({"content": "", "special": true})),
+            ("65", serde_json::json!({"special": true})),
+            (
+                "100000000",
+                serde_json::json!({"content": "", "special": true}),
+            ),
+        ] {
+            assert_eq!(read(Some((id, entry.clone()))), without, "{id}: {entry}");
+        }
+    }
+
+    /// The id of such an entry stays skipped where a second entry names a
+    /// special token at it: each entry is read on its own.
+    #[test]
+    fn an_id_a_named_special_entry_shares_with_one_that_names_no_token_stays_skipped() {
+        let config = serde_json::json!({"added_tokens_decoder": {
+            "0300": {"content": "", "special": true},
+            "300": {"content": "</s:x>", "special": true},
+            "301": {"special": true},
+            "65": {"content": "", "special": true},
+        }});
+        assert_eq!(parse_skip_token_ids(&config), HashSet::from([300]));
+        assert_eq!(
+            parse_added_tokens_decoder(&config),
+            HashMap::from([("</s:x>".to_string(), 300)])
+        );
+    }
+
+    /// A reserved slot of a Kimi checkpoint that such an entry sits on is
+    /// filled as a free slot is: the checkpoint reads as the same files
+    /// without the entry.
+    #[test]
+    fn a_kimi_checkpoint_s_entry_that_names_no_token_holds_no_reserved_slot() {
+        let read = |added: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            // 'a' 0, 'b' 1, 'ab' 2: the reserved slots begin at 3.
+            std::fs::write(
+                dir.path().join("tiktoken.model"),
+                "YQ== 0\nYg== 1\nYWI= 2\n",
+            )
+            .unwrap();
+            std::fs::write(
+                dir.path().join("tokenizer_config.json"),
+                format!(
+                    r#"{{"tokenizer_class": "TikTokenTokenizer",
+                    "auto_map": {{"AutoTokenizer": ["tokenization_kimi.TikTokenTokenizer", null]}},
+                    "added_tokens_decoder": {added}}}"#
+                ),
+            )
+            .unwrap();
+            let tokenizer = TiktokenTokenizer::from_dir(dir.path()).unwrap();
+            (
+                tokenizer.token_to_id("<|reserved_token_5|>"),
+                tokenizer.decode(&[0, 5], true).unwrap(),
+                tokenizer.vocab_size,
+            )
+        };
+        let without = read("{}");
+        assert_eq!(without, (Some(5), "a<|reserved_token_5|>".to_string(), 259));
+        assert_eq!(read(r#"{"5": {"content": "", "special": true}}"#), without);
     }
 
     /// A template that builds its control spellings and also writes an
