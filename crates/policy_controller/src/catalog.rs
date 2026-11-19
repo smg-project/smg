@@ -80,7 +80,9 @@ impl StageBuild<'_> {
         serde_json::from_value(Value::Object(self.written.clone())).map_err(StageError::from)
     }
 
-    /// The document's parameter map with `weight` removed.
+    /// The document's parameter map with `weight` removed, the keys of
+    /// every map in order: the order of the canonical bytes, whatever
+    /// order the document wrote them in.
     pub fn written(&self) -> &Map<String, Value> {
         self.written
     }
@@ -1236,7 +1238,7 @@ profiles:
                 assert!(written
                     .keys()
                     .map(String::as_str)
-                    .eq(["per_request", "flat"]));
+                    .eq(["flat", "per_request"]));
                 let price: Price = build.params()?;
                 assert_eq!((price.per_request, price.flat), (41, 13));
                 Ok(Box::new(QueuePrice {
@@ -1247,6 +1249,42 @@ profiles:
         score_document("[{ queue-price: { weight: 6.25, per_request: 41, flat: 13 } }]")
             .validate_in(&catalog, &[])
             .expect("the weight is outside the parameters");
+    }
+
+    /// A factory reads its parameters in one order whatever order the
+    /// document wrote their keys in, at every depth: the order of the
+    /// canonical bytes, which the digest reads. Two files that are one
+    /// document by their digest hand a factory the same map.
+    #[test]
+    fn a_factory_reads_its_parameters_in_key_order() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let heard = Arc::clone(&seen);
+        let mut catalog = Catalog::builtin();
+        catalog
+            .scorer_with("queue-price", move |build| {
+                let written = serde_json::to_string(build.written()).expect("serializes");
+                heard.lock().expect("no panic under the lock").push(written);
+                Ok(Box::new(QueuePrice { per_request: 0 }))
+            })
+            .expect("a free name");
+        let one = score_document(
+            "[{ queue-price: { weight: 2, per_request: 500, costs: [{ unit: 17, flat: 3 }] } }]",
+        );
+        let other = score_document(
+            "[{ queue-price: { costs: [{ flat: 3, unit: 17 }], per_request: 500, weight: 2 } }]",
+        );
+        assert_eq!(
+            one.digest().expect("digests"),
+            other.digest().expect("digests")
+        );
+        one.validate_in(&catalog, &[]).expect("validates");
+        other.validate_in(&catalog, &[]).expect("validates");
+        let seen = seen.lock().expect("no panic under the lock");
+        assert_eq!(seen[0], seen[1], "two orders of one map");
+        assert_eq!(
+            seen[0],
+            r#"{"costs":[{"flat":3,"unit":17}],"per_request":500}"#
+        );
     }
 
     #[test]

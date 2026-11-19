@@ -46,7 +46,7 @@ A few more rules:
 - `filter` and `score` may be left out. `pick` is required.
 - With one profile, `bindings` may be left out. The profile then serves every request. With two profiles or more, the bindings are required.
 - `view.max_report_age_ms` is optional and takes a whole number from 1 to 3,599,999. At decision time, built-in load scorers treat a report older than the limit like a missing report. A report exactly at the limit still counts. Omit the limit to use reports of any age.
-- A field the format does not know is refused by name. Nothing is ignored.
+- A field the format does not know is refused by name. Nothing is ignored. The one exception is the parameters of a scorer you register: its own type reads them, and must deny unknown fields to refuse one.
 - The document has no `kind` line. A document that writes one is refused.
 
 ## Filter, score, pick
@@ -586,6 +586,32 @@ A stage is a Rust type that implements `Filter`, `Scorer` or `Picker`. You add i
 - The code above is from [`examples/policy-controller`](../../examples/policy-controller), the guide with the scorer, its tests and its document. That page also lists the data the stock controller feeds a stage today.
 - [`policyspec.schema.json`](policyspec.schema.json) is the JSON schema of the document, generated from the crate's types. It lists every field with its description.
 - [`contracts`](contracts) holds the wire contracts: the controller's calls and the plugin interfaces.
+
+A scorer can take settings of its own from the document. Register it with `scorer_with`. The factory reads the entry's parameters into a type of its own and returns the scorer, or refuses a value.
+
+```rust
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreferWorker {
+    preferred: u64,
+}
+
+stages.scorer_with("prefer-worker", |build| {
+    Ok(Box::new(build.params::<PreferWorker>()?))
+})?;
+```
+
+```text
+score:
+  - least-requests
+  - prefer-worker: { preferred: 89, weight: 7 }
+```
+
+- `weight` is the profile's and stays out of the parameters. A bare name hands the factory an empty map.
+- The factory runs for each entry that names it, at every start, apply and dry run. A value it refuses is reported at its field's path in the document.
+- Derive `deny_unknown_fields` on the parameters' type. Without it a misspelled key is ignored and its default runs.
+- The keys of a parameter map carry no order. The factory reads them in key order, and two files that differ in that order alone have one digest. A key written twice is refused.
+- A filter and a picker take no parameters yet.
 
 ## What is not built yet
 
