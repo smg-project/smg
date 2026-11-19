@@ -942,6 +942,71 @@ pub(crate) mod tests {
         assert_eq!((table, pin.worker, pin.ends), (1, WorkerId(7), Some(ends)));
     }
 
+    /// Each side of a pair carries the rule's TTL in its own issued state.
+    /// The prefill's dispatch ends the record's own issued state, and the
+    /// decode's dispatch behind it still ends its key's pin by the rule.
+    /// No plan files such a pair today, as a sessions rule runs under the
+    /// single plan alone: the record is filed by hand. No generation 7
+    /// stands, so no engine is told and each pin names its side's worker.
+    #[test]
+    fn a_pairs_second_dispatch_ends_its_keys_pin_by_its_own_sides_state() {
+        const DECODE_KEY: Session = Session::from_raw(43);
+        let store = MemoryStore::new();
+        let [p, d] = ["p", "d"].map(|key| worker(&store, key));
+        let t0 = Instant::now();
+        let mut targets = Targets::new();
+        targets.push(Target {
+            id: p,
+            pair: Some(Pair {
+                decode_id: d,
+                ..Pair::default()
+            }),
+            ..Target::default()
+        });
+        let issued = LeaseState::issued(Some(60_000_000));
+        let record = LeaseRecord {
+            lease: Lease {
+                id: LeaseId(1),
+                side: Side::Prefill,
+                generation: 7,
+                session: KEY,
+                session_verdict: SessionVerdict::Claimed(p),
+                issued_micros: store.micros(t0),
+                ..Lease::default()
+            },
+            gateway: A,
+            request: 1,
+            target: p,
+            picked: Picked::of(&targets),
+            decode: Some(DecodeSide {
+                target: d,
+                picked: Picked::of_decodes(&targets),
+                session: DECODE_KEY,
+                state: issued,
+                tokens: 0,
+                target_index: 0,
+            }),
+            term: 0,
+            issued_at: t0,
+            dispatch_deadline: t0 + Duration::from_secs(5),
+            state: issued,
+        };
+        LeasesStore::issue(&store, record).expect("the key is free");
+        let at = t0 + Duration::from_millis(3);
+        for side in [proto::Side::Prefill, proto::Side::Decode] {
+            let frame = proto::Dispatched {
+                side: side.into(),
+                ..a_dispatched(1)
+            };
+            dispatched(&store, &open(&store, A), &frame, at).expect("the frame reads");
+        }
+        let ends = Some(store.micros(t0) + 60_000_000);
+        for (key, worker) in [(KEY, p), (DECODE_KEY, d)] {
+            let pin = SessionsStore::lookup(&store, key.get()).expect("a pin");
+            assert_eq!((pin.worker, pin.ends), (worker, ends));
+        }
+    }
+
     /// A lease whose generation left tells no engine: its pin ends by the
     /// TTL its own decision was made under, counted from its issue,
     /// whatever the standing rules keep. Here one of them keeps its keys
