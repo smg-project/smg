@@ -2499,6 +2499,43 @@ fn a_member_given_its_first_model_books_a_lease_inside_that_window() {
     assert_eq!(in_flight(&store), rows);
 }
 
+/// A standby follows the refresh as its leader wrote it: the member given
+/// its first model is filed again there too, and a lease on it before the
+/// standby's build books its count.
+#[test]
+fn a_followed_refresh_files_the_slot_of_a_member_given_its_first_model() {
+    let leader = MemoryStore::new();
+    let bare = WorkerFacts {
+        models: Vec::new(),
+        ..facts("http://b:1", 1)
+    };
+    let owed = leader.upsert(bare).id();
+    let revision = WorkersStore::get(&leader, owed).expect("the row").revision;
+    leader
+        .set_status(owed, WorkerStatus::Ready, revision)
+        .expect("ready");
+    leader.publish_now();
+    let standby = MemoryStore::new();
+    assert!(standby.restore_from(leader.cut(Kinds::All)));
+    assert_eq!(standby.filed_members(), 0, "the restore built its world");
+    // The leader gives the member its first model and the standby follows.
+    let unjournaled = Position::default();
+    let refresh = leader.upsert(facts("http://b:1", 1));
+    let row = WorkersStore::get(&leader, owed);
+    standby.follow(unjournaled, WorkersStore::epoch(&leader), refresh, row);
+    assert_eq!(
+        (standby.publish_due().is_some(), standby.filed_members()),
+        (true, 1),
+        "the followed refresh owes its build"
+    );
+    let leases: &dyn LeasesStore = &standby;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    leases.set_term(1);
+    assert_eq!(leases.issue(booking(gateway, 1, owed, now)), Ok(()));
+    standby.publish_now();
+    assert_eq!(in_flight(&standby), [(owed, 1)]);
+}
+
 /// A member back under its key and incarnation is one that joined: it is
 /// given the table's next slot, and the leases on file for the one that
 /// left end on the count they booked.

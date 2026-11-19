@@ -510,6 +510,10 @@ impl MemoryStore {
                 // A row that carries its offer left no model.
                 if !carried {
                     off = left_models(old.facts, &held.row.facts);
+                    // As at the leader's own refresh: the build this
+                    // change owes may be the first to list the member,
+                    // so its slot is filed again for the leases' doors.
+                    self.joined.lock().push((id, held.slot));
                 }
                 if resized {
                     (MembershipChange::Resized { id }, None)
