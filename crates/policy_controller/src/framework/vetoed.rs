@@ -446,7 +446,7 @@ pub(super) fn steered(
     candidates: &[Candidate],
     buf: &mut Buffers,
 ) -> Decision {
-    buf.scores.clear();
+    // Sized and not cleared: the scorer writes every score it is handed.
     buf.scores.resize(buf.kept.len(), 0.0);
     let band = LeastRequests.score(facts, candidates, &buf.kept, &mut buf.scores);
     let mut targets = Targets::new();
