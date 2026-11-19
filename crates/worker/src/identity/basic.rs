@@ -1244,15 +1244,22 @@ impl BasicWorker {
     /// a replacement starting from an empty cell would unbind the live sockets,
     /// rebind, and wait for a HELLO that never arrives.
     ///
+    /// Only a replacement that dials the same base address adopts it. The
+    /// URL alone does not say so: a host may key a worker by a URL of its own
+    /// and state the engine's address beside it, and a replacement under that
+    /// key whose address moved reads another engine.
+    ///
     /// `zmq_connect_started` is deliberately left cleared rather than copied:
     /// the shared cell already dedupes a handshake in flight, and a cleared
     /// guard lets the replacement retry (and signal under its own revision) if
     /// that handshake fails.
     fn adopt_backend_client_from(&self, other: &BasicWorker) {
-        // A transport or runtime change means a different wire protocol, and a
-        // replacement that arrived with its own client keeps it.
+        // A transport or runtime change means a different wire protocol, a
+        // base address change another engine, and a replacement that arrived
+        // with its own client keeps it.
         if self.metadata.spec.connection_mode != other.metadata.spec.connection_mode
             || self.metadata.spec.runtime_type != other.metadata.spec.runtime_type
+            || self.metadata.base_url() != other.metadata.base_url()
             || self.engine_connection.load_full().get().is_some()
         {
             return;

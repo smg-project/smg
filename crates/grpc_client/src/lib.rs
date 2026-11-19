@@ -13,6 +13,8 @@ pub mod codec;
 pub mod constraint_failure;
 pub mod engine_labels;
 pub mod engine_load;
+#[cfg(feature = "engine-port")]
+pub mod engine_port;
 mod framed;
 pub mod media_fault;
 pub mod media_identity;
