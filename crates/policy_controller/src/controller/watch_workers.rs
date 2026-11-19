@@ -21,7 +21,9 @@
 //! parks its waker with the feed. A watched write wakes one task of the
 //! feed, once its store has let its locks go, and that task wakes the
 //! parked streams, as it does at the role's word: a write pays one wake
-//! however many watch, and none of it under the membership lock. The task
+//! however many watch, and none of it under the membership lock. Where the
+//! replica hosts worker objects the same write wakes their follower too,
+//! once and the same way. The task
 //! is the feed's. It is started with the feed's first watch, on that
 //! watch's runtime, and ended with the last feed; the serve does not tell
 //! it the stop and the drain does not join it, since it holds nothing a
@@ -146,7 +148,8 @@ impl Feed {
     /// another runtime is woken by no write from that end until that next
     /// watch. The task wakes the parked streams after each watched write
     /// and at each word of `role`, off the writer and under no lock of the
-    /// store: a write wakes this task alone, however many watch.
+    /// store: of the feed a write wakes this task alone, however many
+    /// watch.
     ///
     /// The task takes nothing of a watch. `role` is the replica's word, one
     /// for every watch: the watch that starts the task hands it a handle of
