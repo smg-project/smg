@@ -75,9 +75,8 @@ from code placement alone, so a margin inside that band is not a difference betw
   hold 1,548, 8,873, 151,173, 599,401, 2,289,914 and 4,613,798 bytes (the 256 class to the 1M class), and
   90.1, 41.2, 50.1, 42.3, 39.4 and 40.9 % of those bytes are outside ASCII, where their classes hold 17.1,
   31.1, 37.6, 38.3, 38.7 and 38.7 % (`corpus.json`; the 1M class holds each 500k text twice). Such a text
-  can read slower warm than its class reads cold: in `encode-rounds.csv` the warm cell reads the higher
-  time in 54 of the 474 pairs of a warm and a cold cell, all of them from the 32k class up.
-  A round is one pass over the families, the columns interleaved inside each cell
+  can read slower warm than its class reads cold, as some cells from the 32k class up do in
+  `encode-rounds.csv`. A round is one pass over the families, the columns interleaved inside each cell
   in an order that rotates from cell to cell; a cell's figure is the median of its rounds.
 - **`dec`** (decode): the first 2,048 ids of a 32k-token text. A full decode (30 repetitions, ns per
   token); the same ids stepped through one stream (ns per token, and the time of a step); the first

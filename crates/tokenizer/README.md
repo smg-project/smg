@@ -296,8 +296,7 @@ A warm cell encodes one text, the first of its size class, again and again: a wa
 text with hot caches, not the speed of mixed traffic. Those six texts are 1,548 bytes (256), 8,873 (2k), 151,173 (32k),
 599,401 (128k), 2,289,914 (500k) and 4,613,798 (1M), with 90.1, 41.2, 50.1, 42.3, 39.4 and 40.9 % of their bytes
 outside ASCII, where their classes hold 17.1, 31.1, 37.6, 38.3, 38.7 and 38.7 %. Such a text can read slower warm
-than its class reads cold: in `benches/compare/encode-rounds.csv` the warm cell reads the higher time in 54 of the
-474 pairs of a warm and a cold cell, all of them from the 32k class up.
+than its class reads cold, as some cells from the 32k class up do in `benches/compare/encode-rounds.csv`.
 
 Families: the tokenizer files of sixteen public checkpoints. Ten byte-level BPE vocabularies (DeepSeek V4.1 Flash,
 DeepSeek V3.2, Llama 3.2, Llama 4 Scout, gpt-oss, Qwen3.6, GLM-5.3 Flash, MiniMax M3, MiMo V2.6, and Ministral 3 through
