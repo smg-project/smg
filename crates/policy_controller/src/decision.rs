@@ -382,9 +382,130 @@ impl Decision {
     }
 }
 
+/// How a shadow's decision stands beside the live one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ShadowKind {
+    /// The same first target, or the same outcome without a pick.
+    Agreed,
+    /// Both picked, with different first targets.
+    OtherTarget,
+    /// One picked, shed or queued where the other did something else.
+    OtherOutcome,
+    /// No shadow decision was made.
+    Skipped,
+}
+
+impl ShadowKind {
+    /// Compare the outcomes and, for two picks, their first targets.
+    pub fn of(live: &Decision, shadow: &Decision) -> Self {
+        use Decision::{Pick, Queue, Shed};
+
+        match (live, shadow) {
+            (Pick(a), Pick(b)) => {
+                if a.targets.first() == b.targets.first() {
+                    Self::Agreed
+                } else {
+                    Self::OtherTarget
+                }
+            }
+            (Shed(_), Shed(_)) | (Queue(_), Queue(_)) => Self::Agreed,
+            (Pick(_), Shed(_) | Queue(_))
+            | (Shed(_), Pick(_) | Queue(_))
+            | (Queue(_), Pick(_) | Shed(_)) => Self::OtherOutcome,
+        }
+    }
+
+    /// The comparison's label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Agreed => "agreed",
+            Self::OtherTarget => "other-target",
+            Self::OtherOutcome => "other-outcome",
+            Self::Skipped => "skipped",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shadow_kind_compares_the_outcome_and_first_target() {
+        let first = Target {
+            id: WorkerId(73),
+            ..Target::default()
+        };
+        let second = Target {
+            id: WorkerId(91),
+            position: 1,
+            ..Target::default()
+        };
+        let rank = Target {
+            dp_rank: 5,
+            ..first
+        };
+        let pick = |items: &[Target]| {
+            let mut targets = Targets::new();
+            for &target in items {
+                targets.push(target);
+            }
+            Decision::Pick(Pick {
+                targets,
+                ..Pick::default()
+            })
+        };
+        let shed = Decision::Shed(Shed {
+            reason: ShedReason::NoEndpoints,
+            emptied_by: "healthy",
+            retry_after_secs: 0,
+            wait_allowed: false,
+            trace: Trace::default(),
+        });
+        let queue = |ticket| {
+            Decision::Queue(Queue {
+                ticket,
+                max_wait_micros: 113,
+                trace: Trace::default(),
+            })
+        };
+        for (a, b, kind) in [
+            (pick(&[first]), pick(&[first, second]), ShadowKind::Agreed),
+            (
+                pick(&[first, second]),
+                pick(&[second, first]),
+                ShadowKind::OtherTarget,
+            ),
+            (pick(&[first]), pick(&[rank]), ShadowKind::OtherTarget),
+            (pick(&[first]), shed, ShadowKind::OtherOutcome),
+            (pick(&[first]), queue(67), ShadowKind::OtherOutcome),
+            (shed, queue(67), ShadowKind::OtherOutcome),
+            (
+                shed,
+                Decision::Shed(Shed {
+                    reason: ShedReason::Saturated,
+                    emptied_by: "not-overloaded",
+                    retry_after_secs: 3,
+                    wait_allowed: false,
+                    trace: Trace::default(),
+                }),
+                ShadowKind::Agreed,
+            ),
+            (queue(67), queue(79), ShadowKind::Agreed),
+        ] {
+            assert_eq!(ShadowKind::of(&a, &b), kind);
+            assert_eq!(ShadowKind::of(&b, &a), kind);
+        }
+        for (kind, label) in [
+            (ShadowKind::Agreed, "agreed"),
+            (ShadowKind::OtherTarget, "other-target"),
+            (ShadowKind::OtherOutcome, "other-outcome"),
+            (ShadowKind::Skipped, "skipped"),
+        ] {
+            assert_eq!(kind.as_str(), label);
+        }
+    }
 
     /// The mark of a lifted veto costs the trace no byte: it sits in one the
     /// record had spare, and a trace no rule wrote reads none.
