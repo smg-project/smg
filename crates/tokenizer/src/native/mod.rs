@@ -280,8 +280,8 @@ const LONG_PIECE_ENTRY_BYTES: usize = size_of::<(Box<[u8]>, Box<[u32]>)>();
 
 /// Inputs at least this long are encoded unit by unit on the thread pool (a
 /// text between added tokens, or a chunk of one cut at a stable boundary)
-/// while the texts of [`COUNTED_MIN_BYTES`] or more in flight are few for
-/// the threads of the pool and it has more than one (see
+/// when the texts of [`COUNTED_MIN_BYTES`] or more in flight as they came
+/// in were few for the threads of the pool and it has more than one (see
 /// `worth_the_pool`); shorter inputs would spend more on the hand-offs than
 /// they save.
 const PARALLEL_MIN_BYTES: usize = 64 << 10;
@@ -296,13 +296,14 @@ const COUNTED_MIN_BYTES: usize = 4 << 10;
 /// Texts of [`COUNTED_MIN_BYTES`] or more that are being encoded now, by
 /// every encoder of the process: the thread pool is one for the process, so
 /// two encoders have to see each other. A long text takes the pool only
-/// while the texts counted are few (see `worth_the_pool`).
+/// when the texts counted as it came in were few (see `worth_the_pool`).
 static ENCODES_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 /// The threads of the pool a long text in flight is counted for: a long
-/// text takes the pool while the texts in flight, itself among them, are
-/// at most one for every so many of its threads (see `pooled_texts`). A
-/// text in the pool costs about twice the CPU of one on its caller's
-/// thread, so it comes out ahead only with two threads or more to itself.
+/// text takes the pool when the texts in flight as it came in, itself
+/// among them, were at most one for every so many of its threads (see
+/// `pooled_texts`). A text in the pool costs about twice the CPU of one on
+/// its caller's thread, so it comes out ahead only with two threads or
+/// more to itself.
 const POOL_THREADS_A_TEXT: usize = 2;
 
 /// One text counted among the encodes in flight until it drops.
@@ -2461,10 +2462,11 @@ impl NativeEncoder {
     /// declines, found after the pieces before it were tokenized, so that
     /// the error surfaces from the `tokenizers` encode. A long input is
     /// encoded on the thread pool, unit by unit (see [`Self::units`]), with
-    /// the same code per unit, while the texts of `COUNTED_MIN_BYTES` or
-    /// more in flight are few for the threads of the pool (see
-    /// [`Self::worth_the_pool`]); otherwise on the caller's
-    /// thread. `model` is the model behind the vocabulary,
+    /// the same code per unit, when the texts of `COUNTED_MIN_BYTES` or
+    /// more in flight as it came in, itself among them, were at most one
+    /// for every `POOL_THREADS_A_TEXT` threads of the pool and the pool has
+    /// more than one (see [`Self::worth_the_pool`]); otherwise on the
+    /// caller's thread. `model` is the model behind the vocabulary,
     /// read for the whole-piece lookup of `ignore_merges` and for the
     /// pieces of a model whose merge table declined; `None` for a
     /// vocabulary read from ranks ([`Self::from_ranks`]), whose table is
@@ -2488,8 +2490,8 @@ impl NativeEncoder {
     }
 
     /// Whether `text` is encoded through the thread pool: long enough
-    /// (`PARALLEL_MIN_BYTES`), one of the few texts in flight (`in_flight`,
-    /// `pooled_texts`) and a pool with more than one thread to cut it for.
+    /// (`PARALLEL_MIN_BYTES`), one of the few texts in flight as it came in
+    /// (`in_flight`, `pooled_texts`), with more than one thread to cut it for.
     /// The pool buys a long text's wall time with idle cores, and callers
     /// that already fill the cores leave it none: sixteen callers under a
     /// quota of four CPUs encode 22 to 41 % more tokens a second when
