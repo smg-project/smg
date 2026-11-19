@@ -1328,6 +1328,43 @@ mod tests {
         );
     }
 
+    /// A context built on a runtime starts the task that fills the hash
+    /// rings: the ring of a generation is filled with no request to read it.
+    #[tokio::test]
+    async fn a_context_built_on_a_runtime_fills_the_hash_rings_itself() {
+        use crate::worker::{WorkerRegistryExt as _, UNKNOWN_MODEL_ID};
+
+        let mut config = RouterConfig::builder()
+            .round_robin_policy()
+            .build_unchecked();
+        config.health_check.disable_health_check = true;
+        let context = AppContext::from_config(config, 30, None, None)
+            .await
+            .expect("a context");
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://ring:8080")
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        context.worker_registry.register(worker).expect("a worker");
+
+        let bound = std::time::Instant::now() + Duration::from_secs(30);
+        while !context
+            .worker_registry
+            .get_routing_snapshot(UNKNOWN_MODEL_ID)
+            .hash_ring_is_filled()
+        {
+            assert!(
+                std::time::Instant::now() < bound,
+                "no task filled the ring of the generation"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
     #[test]
     fn maybe_rate_limit_manager_disabled_is_ok_none() {
         let config = RouterConfig::default();

@@ -804,3 +804,18 @@ async fn replace_aborts_the_replaced_workers_zmq_handshake_driver() {
         "replacement must abort the replaced worker's handshake driver"
     );
 }
+
+/// The registry holds no generation for a model it never saw, where the
+/// routing read answers the empty one: a reader that asks whether a model
+/// has a generation is told of none that nobody published.
+#[test]
+fn a_model_the_registry_never_saw_has_no_generation() {
+    let registry = WorkerRegistry::new();
+    registry
+        .register(worker_with_a_window("grpc://127.0.0.1:8431", "qwen", 8_192))
+        .unwrap();
+
+    assert!(registry.model_routing_snapshot("qwen").is_some());
+    assert!(registry.model_routing_snapshot("never-seen").is_none());
+    assert!(registry.get_routing_snapshot("never-seen").is_empty());
+}

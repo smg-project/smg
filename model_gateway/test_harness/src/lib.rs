@@ -356,6 +356,21 @@ impl AppTestContext {
 
                     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 }
+
+                // A hash policy places a request on the ring the gateway
+                // keeps for the model, and that ring follows a registration
+                // by one fill of a task: a case starts on the ring of the
+                // workers it asked for.
+                while !app_context
+                    .policy_registry
+                    .hash_rings_are_current(&app_context.worker_registry)
+                {
+                    assert!(
+                        start.elapsed() <= timeout_duration,
+                        "Timeout waiting for the hash rings to follow the registered workers"
+                    );
+                    tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+                }
             }
 
             let inner_router = RouterFactory::create_router(&app_context).await.unwrap();

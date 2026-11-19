@@ -4329,21 +4329,11 @@ mod tests {
         }
     }
 
-    /// Two capable encoders of the pair's runtime, one on the prefill's EC
-    /// connector and one on another: under a rotating encode policy both
-    /// items of a request land on the pairing encoder (the pool is narrowed
-    /// before the policy); without the narrowing the rotation would hand the
-    /// second item to the other encoder.
-    #[test]
-    fn the_encode_assignment_is_narrowed_to_encoders_that_pair_with_the_prefill() {
+    /// A registry of the workers `fleet` names by port, role and EC connector,
+    /// each fit for an EPD set of `model`.
+    fn ec_registry(model: &str, fleet: &[(u16, WorkerType, &str)]) -> Arc<WorkerRegistry> {
         let registry = Arc::new(WorkerRegistry::new());
-        let model = "epd-pairing";
-        for (port, role, connector) in [
-            (8910, WorkerType::Encode, "ECCPUConnector"),
-            (8911, WorkerType::Encode, "ECOtherConnector"),
-            (8912, WorkerType::Prefill, "ECCPUConnector"),
-            (8913, WorkerType::Decode, "ECCPUConnector"),
-        ] {
+        for &(port, role, connector) in fleet {
             registry
                 .register(Arc::new(
                     BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
@@ -4370,6 +4360,26 @@ mod tests {
                 ))
                 .unwrap();
         }
+        registry
+    }
+
+    /// Two capable encoders of the pair's runtime, one on the prefill's EC
+    /// connector and one on another: under a rotating encode policy both
+    /// items of a request land on the pairing encoder (the pool is narrowed
+    /// before the policy); without the narrowing the rotation would hand the
+    /// second item to the other encoder.
+    #[test]
+    fn the_encode_assignment_is_narrowed_to_encoders_that_pair_with_the_prefill() {
+        let model = "epd-pairing";
+        let registry = ec_registry(
+            model,
+            &[
+                (8910, WorkerType::Encode, "ECCPUConnector"),
+                (8911, WorkerType::Encode, "ECOtherConnector"),
+                (8912, WorkerType::Prefill, "ECCPUConnector"),
+                (8913, WorkerType::Decode, "ECCPUConnector"),
+            ],
+        );
         let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
         policies.set_encode_policy(PolicyFactory::create_from_config(&PolicyConfig::RoundRobin));
         let stage = WorkerSelectionStage::new(
@@ -4407,6 +4417,62 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The encode stage reads the hash ring off the generation it holds for
+    /// an encode policy that walks it, and for no other: whether a request
+    /// of two media items filled the ring of the model's generation.
+    #[test]
+    fn the_encode_stage_reads_the_hash_ring_for_a_policy_that_walks_it_alone() {
+        let fills_the_ring = |encode: &PolicyConfig| {
+            let model = "epd-ring";
+            let registry = ec_registry(
+                model,
+                &[
+                    (8920, WorkerType::Encode, "ECCPUConnector"),
+                    (8921, WorkerType::Encode, "ECCPUConnector"),
+                    (8922, WorkerType::Prefill, "ECCPUConnector"),
+                    (8923, WorkerType::Decode, "ECCPUConnector"),
+                ],
+            );
+            let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+            policies.set_encode_policy(PolicyFactory::create_from_config(encode));
+            let stage = WorkerSelectionStage::new(
+                Arc::clone(&registry),
+                Arc::new(policies),
+                WorkerSelectionMode::EncodePrefillDecode,
+                None,
+            );
+            let (encoders, ..) = stage
+                .select_encode_prefill_decode_workers(
+                    model,
+                    PlacementInputs::default(),
+                    &[vec![1], vec![2]],
+                    EpdDemands {
+                        wire: None,
+                        encode: MediaDemands {
+                            media_refs: false,
+                            vision: true,
+                            pipeline: PipelinePin::Any,
+                        },
+                        decode_vision: false,
+                        image_fanout: true,
+                    },
+                    None,
+                )
+                .unwrap_or_else(|_| panic!("the EPD set is selected"));
+            assert_eq!(encoders.len(), 2);
+            registry.get_routing_snapshot(model).hash_ring_is_filled()
+        };
+
+        assert!(
+            !fills_the_ring(&PolicyConfig::RoundRobin),
+            "the encode policy walks no ring"
+        );
+        assert!(
+            fills_the_ring(&PolicyConfig::ConsistentHashing),
+            "the encode policy walks the ring"
+        );
     }
 
     /// EPD selects a compatible EC consumer even with mixed runtimes and connectors.

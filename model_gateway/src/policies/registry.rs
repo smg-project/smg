@@ -278,9 +278,12 @@ impl PolicyRegistry {
     /// The consistent-hash ring `model_id`'s requests are placed on: the
     /// ring of the generation the registry holds for the model, `None` for a
     /// model nobody serves. The model-less id reads the ring over every
-    /// worker, the candidates of a request that names no model. A caller
-    /// holding a client's name for the model resolves it at request entry,
-    /// as for the registry's other reads by model.
+    /// worker, the candidates of a request that names no model. While that
+    /// generation's ring is filled it is the ring kept from another
+    /// generation, and `None` before the model's first ring
+    /// ([`KeptRings::of`]). A caller holding a client's name for the model
+    /// resolves it at request entry, as for the registry's other reads by
+    /// model.
     pub(crate) fn hash_ring(
         &self,
         registry: &WorkerRegistry,
@@ -290,14 +293,24 @@ impl PolicyRegistry {
             .of(model_id, &registry.get_routing_snapshot(model_id))
     }
 
-    /// [`Self::hash_ring`] of a generation the caller holds, so the ring and
-    /// what else it reads of the generation are of one membership.
+    /// [`Self::hash_ring`] for a generation the caller holds: no second read
+    /// of the registry, and that generation's own ring once it is filled.
     pub(crate) fn hash_ring_of(
         &self,
         model_id: &str,
         generation: &ModelWorkerSnapshot,
     ) -> Option<Arc<HashRing>> {
         self.rings.of(model_id, generation)
+    }
+
+    /// Whether the hash rings have followed the membership: a request
+    /// placed now walks the ring of its own generation. After a membership
+    /// change, that holds again within one fill of the task that keeps the
+    /// rings warm. For a caller that changed the membership and waits for
+    /// the placements to follow, as a test bed does.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn hash_rings_are_current(&self, registry: &WorkerRegistry) -> bool {
+        self.rings.are_current(registry)
     }
 
     /// Starts the task that fills the hash rings off the request path

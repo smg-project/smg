@@ -1996,12 +1996,13 @@ mod tests {
     /// fills the ring of no generation.
     #[test]
     fn a_pair_reads_the_hash_ring_for_a_policy_that_walks_it_alone() {
-        // A pair is placed under `decode` beside a prefill policy that walks
-        // no ring: whether the generation's ring was filled for it.
-        let fills_the_ring = |decode: Arc<dyn LoadBalancingPolicy>| {
+        // A pair is placed under `prefill` and `decode`: whether the
+        // generation's ring was filled for it.
+        type Policy = Arc<dyn LoadBalancingPolicy>;
+        let fills_the_ring = |prefill: Policy, decode: Policy| {
             let registry = gated_pd_registry(2);
             let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
-            policies.set_prefill_policy(Arc::new(RoundRobinPolicy::new()));
+            policies.set_prefill_policy(prefill);
             policies.set_decode_policy(decode);
             let pairs = pairs_of(&registry, &policies);
             select_pair(
@@ -2017,13 +2018,19 @@ mod tests {
             registry.get_routing_snapshot(MODEL).hash_ring_is_filled()
         };
 
+        let walks_none = || -> Policy { Arc::new(RoundRobinPolicy::new()) };
+        let walks_the_ring = || -> Policy { Arc::new(ConsistentHashingPolicy::new()) };
         assert!(
-            !fills_the_ring(Arc::new(RoundRobinPolicy::new())),
+            !fills_the_ring(walks_none(), walks_none()),
             "no policy of the pair walks the ring"
         );
         assert!(
-            fills_the_ring(Arc::new(ConsistentHashingPolicy::new())),
+            fills_the_ring(walks_none(), walks_the_ring()),
             "the decode policy walks the ring"
+        );
+        assert!(
+            fills_the_ring(walks_the_ring(), walks_none()),
+            "the prefill policy walks the ring"
         );
     }
 
