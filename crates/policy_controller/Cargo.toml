@@ -192,7 +192,7 @@ wasm = ["dep:wasmtime", "dep:thread_local", "dep:tracing", "dep:rustix"]
 # host that takes the thread's core. The package's own tests and benches
 # turn it on through the dev-dependency on the package itself; no build of
 # a product has it.
-test-util = []
+test-util = ["smg-worker?/test-util"]
 
 [dev-dependencies]
 # The package itself with `test-util`, for its own tests and benches alone.

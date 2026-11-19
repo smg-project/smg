@@ -43,6 +43,8 @@ pub mod election;
 mod floor;
 mod gateways;
 mod generations;
+#[cfg(feature = "worker-host")]
+mod kv_feed;
 mod lifecycle;
 mod membership;
 pub mod metrics;
@@ -157,6 +159,8 @@ pub struct Controller {
     /// of the store, followed by one task of the serve.
     #[cfg(feature = "worker-host")]
     workers: Arc<worker_objects::WorkerObjects>,
+    #[cfg(feature = "worker-host")]
+    kv_feed: kv_feed::KvFeed,
 }
 
 /// Sets an accepted socket to send at once. An answer is a few small writes
@@ -453,6 +457,8 @@ impl Controller {
             Arc::clone(&journal.0),
             woken,
         ));
+        #[cfg(feature = "worker-host")]
+        let kv_feed = kv_feed::KvFeed::new(Arc::clone(&journal.0), workers.holder());
         let mut shared = Shared::new(
             config.controller_id.clone(),
             address.unwrap_or_default(),
@@ -484,6 +490,8 @@ impl Controller {
             admin_addr,
             #[cfg(feature = "worker-host")]
             workers,
+            #[cfg(feature = "worker-host")]
+            kv_feed,
         })
     }
 
@@ -801,6 +809,8 @@ impl Controller {
             admin,
             #[cfg(feature = "worker-host")]
             workers,
+            #[cfg(feature = "worker-host")]
+            kv_feed,
             ..
         } = self;
         let store = Arc::clone(&shared.store);
@@ -918,6 +928,11 @@ impl Controller {
             let workers_stop = stop.subscribe();
             tasks.spawn(async move {
                 workers.run(workers_stop).await;
+                Ok(())
+            });
+            let kv_stop = stop.subscribe();
+            tasks.spawn(async move {
+                kv_feed.run(kv_stop).await;
                 Ok(())
             });
         }
