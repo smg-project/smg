@@ -4910,13 +4910,16 @@ fn one_window_of_short_holds(name: &str, arm: bool) -> (Arc<Plugin>, bool, bool)
     // of that again was held by the runner too, and a call that runs out in
     // it ran out under what the runner left.
     let late = short + (frame - short) / 2;
-    let faults = || {
+    // Such a call is the decision's budget spent and no fault of the
+    // plugin's, so the witness reads that count beside the two faults. The
+    // arming decision's long hold spends its own budget by design.
+    let ran_out = || {
         let stats = plugin.stats();
-        (stats.fuel_exhausted, stats.traps)
+        (stats.fuel_exhausted, stats.traps, stats.budget_spent)
     };
     let (mut cheap, mut by_the_runner, mut by_the_host) = (true, 0, 0);
     for seed in 0..64 {
-        let before = faults();
+        let before = ran_out();
         let (wall, cpu) = (std::time::Instant::now(), bound_clock());
         let decision = engine.decide(
             &timed(seed),
@@ -4928,8 +4931,12 @@ fn one_window_of_short_holds(name: &str, arm: bool) -> (Arc<Plugin>, bool, bool)
         let off_the_cpu = off_cpu_since(wall, cpu);
         cheap &= bound_clock().saturating_sub(cpu) < frame / 4;
         assert!(matches!(decision, Decision::Pick(_)), "decision {seed}");
-        if faults() != before {
-            if (arm && seed == 0) || off_the_cpu < late {
+        let arming = arm && seed == 0;
+        let (fuel, traps, spent) = ran_out();
+        let faulted = (fuel, traps) != (before.0, before.1);
+        let spent = spent != before.2 && !arming;
+        if faulted || spent {
+            if arming || off_the_cpu < late {
                 by_the_host += 1;
             } else {
                 by_the_runner += 1;
@@ -4989,9 +4996,14 @@ fn a_hold_short_of_late_on_an_armed_thread_is_no_slow_sample() {
         a_window_of_short_holds("a window of holds short of late", "held-short", true);
     let stats = plugin.stats();
     assert_eq!(
-        (stats.fuel_exhausted, stats.traps, stats.instantiations),
-        (0, 0, 1),
-        "a hold fails nothing: {stats:?}"
+        (
+            stats.fuel_exhausted,
+            stats.traps,
+            stats.budget_spent,
+            stats.instantiations
+        ),
+        (0, 0, 1, 1),
+        "a hold fails nothing, and the arming hold alone spends its decision's budget: {stats:?}"
     );
     assert!(
         stats.unread >= 1,
@@ -5038,8 +5050,13 @@ fn a_window_of_holds_short_of_late_on_a_thread_nothing_armed_is_one_slow_sample(
     );
     let stats = plugin.stats();
     assert_eq!(
-        (stats.fuel_exhausted, stats.traps, stats.instantiations),
-        (0, 0, 1),
+        (
+            stats.fuel_exhausted,
+            stats.traps,
+            stats.budget_spent,
+            stats.instantiations
+        ),
+        (0, 0, 0, 1),
         "a hold fails nothing: {stats:?}"
     );
     assert!(
