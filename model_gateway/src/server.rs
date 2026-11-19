@@ -2407,12 +2407,13 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // gossip starts further down, after the metrics and probe listeners are
     // bound. Order matters: see the note at the mesh build above.
     let mesh_adapters = mesh_handler.as_ref().map(|handler| {
-        MeshAdapters::start(
+        MeshAdapters::start_with_context(
             handler.mesh_kv(),
             handler.self_name.clone(),
             app_context.worker_registry.clone(),
             handler.state.clone(),
             app_context.policy_registry.clone(),
+            Arc::downgrade(&app_context),
         )
     });
 

@@ -38,6 +38,7 @@ fn context(
     WorkflowContext::new(
         WorkflowInstanceId::new(),
         WorkerWorkflowData {
+            tokenizer_preparation: None,
             config: openai_protocol::worker::WorkerSpec::new("grpc://127.0.0.1:1"),
             registration_mode: WorkerRegistrationMode::Upsert,
             worker_kind: Some(kind),

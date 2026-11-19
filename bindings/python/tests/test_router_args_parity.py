@@ -55,6 +55,15 @@ CONSUL_DISCOVERY = RouterArgs(
 )
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_wait_for_tokenizer_reaches_the_native_constructor(enabled: bool):
+    args = RouterArgs(enable_igw=True, wait_for_tokenizer=enabled)
+    with patch("smg.router._Router") as constructor:
+        Router.from_args(args)
+    assert constructor.call_args.kwargs["wait_for_tokenizer"] is enabled
+    _Router(worker_urls=[], enable_igw=True, wait_for_tokenizer=enabled)
+
+
 def constructor_parameters() -> set[str]:
     return set(inspect.signature(_Router).parameters)
 

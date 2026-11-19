@@ -733,6 +733,7 @@ struct Router {
     trust_tenant_header: bool,
     upstream_http2: bool,
     upstream_pool_idle_timeout_secs: u64,
+    wait_for_tokenizer: bool,
     webrtc_bind_addr: Option<String>,
     webrtc_stun_server: Option<String>,
     worker_overload_protection: bool,
@@ -1482,6 +1483,7 @@ impl Router {
                 l1_max_memory: self.tokenizer_cache_l1_max_memory,
             })
             .disable_tokenizer_autoload(self.disable_tokenizer_autoload)
+            .wait_for_tokenizer(self.wait_for_tokenizer)
             .parser(parser)
             .history_backend(history_backend)
             .memory_config(config::MemoryConfig {
@@ -1796,6 +1798,7 @@ impl Router {
         trust_tenant_header = false,
         upstream_http2 = false,
         upstream_pool_idle_timeout_secs = 3,
+        wait_for_tokenizer = false,
         webrtc_bind_addr = None,
         webrtc_stun_server = None,
         worker_overload_protection = true,
@@ -2023,6 +2026,7 @@ impl Router {
         trust_tenant_header: bool,
         upstream_http2: bool,
         upstream_pool_idle_timeout_secs: u64,
+        wait_for_tokenizer: bool,
         webrtc_bind_addr: Option<String>,
         webrtc_stun_server: Option<String>,
         worker_overload_protection: bool,
@@ -2301,6 +2305,7 @@ impl Router {
             trust_tenant_header,
             upstream_http2,
             upstream_pool_idle_timeout_secs,
+            wait_for_tokenizer,
             webrtc_bind_addr,
             webrtc_stun_server,
             worker_overload_protection,

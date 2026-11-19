@@ -681,6 +681,8 @@ class RouterArgs:
     trust_tenant_header: bool = False
     upstream_http2: bool = False
     upstream_pool_idle_timeout_secs: int = 3
+    # Prepare gateway-local tokenizers before worker activation (also for mesh imports).
+    wait_for_tokenizer: bool = False
     # WebRTC: the UDP bind address (an IP; None = the unspecified address of
     # the host's family)
     webrtc_bind_addr: str | None = None
@@ -2617,6 +2619,12 @@ class RouterArgs:
             default=RouterArgs.disable_tokenizer_autoload,
             help="Disable automatic tokenizer loading at startup. "
             "Use this when tokenizers are not needed (e.g., pure load balancing).",
+        )
+        tokenizer_group.add_argument(
+            f"--{prefix}wait-for-tokenizer",
+            action="store_true",
+            default=RouterArgs.wait_for_tokenizer,
+            help="Prepare gateway-local tokenizers before admitting gRPC/ZMQ workers and mesh imports",
         )
         tokenizer_group.add_argument(
             f"--{prefix}parser",

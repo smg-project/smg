@@ -21,7 +21,7 @@ pub use local::{
 };
 use local::{
     DetectBackendStep, DiscoverDPInfoStep as DPStep, EnsureHarmonyEncodingStep,
-    SubmitTokenizerJobStep,
+    PrepareTokenizerStep, SubmitTokenizerJobStep,
 };
 use openai_protocol::worker::WorkerSpec;
 use shared::REGISTER_WORKERS_STEP;
@@ -58,6 +58,8 @@ use crate::{
 ///       |                               |
 ///  ensure_harmony_encoding              |
 ///  (gRPC gpt-oss only)                  |
+///       |                               |
+///  prepare_tokenizer (opt-in)           |
 ///       +---------------+---------------+
 ///                        |
 ///                 register_workers  (shared)
@@ -228,6 +230,8 @@ pub fn create_worker_registration_workflow(
             .with_failure_action(FailureAction::FailWorkflow)
             .depends_on(&["discover_models"]),
         )
+        // Prepare local tokenizers before the serving registry can see the workers.
+        .add_step(PrepareTokenizerStep::definition())
         // === SHARED (both branches converge) ===
         // Step 4: Register workers
         .add_step(
@@ -238,13 +242,10 @@ pub fn create_worker_registration_workflow(
             )
             .with_timeout(Duration::from_secs(5))
             .with_failure_action(FailureAction::FailWorkflow)
-            .depends_on(&[
-                "create_local_worker",
-                "ensure_harmony_encoding",
-                "create_external_workers",
-            ]),
+            .depends_on(&["prepare_tokenizer", "create_external_workers"]),
         )
-        // Step 5a: Submit tokenizer job (local only)
+        // Keep fire-and-forget autoload as the default; opt-in preparation
+        // has already loaded the tokenizer before register_workers.
         .add_step(
             StepDefinition::new(
                 "submit_tokenizer_job",
@@ -286,6 +287,10 @@ pub fn create_worker_workflow_data(
     app_context: Arc<AppContext>,
 ) -> WorkerWorkflowData {
     WorkerWorkflowData {
+        tokenizer_preparation: app_context
+            .router_config
+            .wait_for_tokenizer
+            .then(|| super::tokenizer_preparation::TokenizerPreparation::new(&app_context)),
         config,
         registration_mode,
         worker_kind: None,

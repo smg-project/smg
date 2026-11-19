@@ -675,6 +675,12 @@ impl RouterConfigBuilder {
         self
     }
 
+    /// Wait for gateway-local tokenizers before admitting gRPC/ZMQ workers.
+    pub fn wait_for_tokenizer(mut self, wait: bool) -> Self {
+        self.config.wait_for_tokenizer = wait;
+        self
+    }
+
     pub fn disable_tokenizer_autoload(mut self, disable: bool) -> Self {
         self.config.disable_tokenizer_autoload = disable;
         self

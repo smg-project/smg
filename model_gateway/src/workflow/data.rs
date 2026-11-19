@@ -61,6 +61,13 @@ pub(crate) fn require_app_context(
 /// Implemented by `WorkerWorkflowData`, allowing shared steps
 /// (register, activate, update policies) to work generically.
 pub trait WorkerRegistrationData: WorkflowData {
+    /// A preparation whose tokenizers must remain pinned through publication.
+    fn tokenizer_preparation(
+        &self,
+    ) -> Option<&Arc<super::tokenizer_preparation::TokenizerPreparation>> {
+        None
+    }
+
     /// Get the application context (transient, not serialized).
     fn get_app_context(&self) -> Option<&Arc<AppContext>>;
 
@@ -140,6 +147,8 @@ impl WorkerList {
 /// when they don't apply.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerWorkflowData {
+    #[serde(skip, default)]
+    pub tokenizer_preparation: Option<Arc<super::tokenizer_preparation::TokenizerPreparation>>,
     pub config: WorkerSpec,
     /// Defaults to upsert so persisted workflows from older versions preserve
     /// their historical registration behavior when deserialized.
@@ -204,6 +213,21 @@ impl WorkerWorkflowData {
 }
 
 impl WorkerRegistrationData for WorkerWorkflowData {
+    fn tokenizer_preparation(
+        &self,
+    ) -> Option<&Arc<super::tokenizer_preparation::TokenizerPreparation>> {
+        (self.worker_kind == Some(WorkerKind::Local)
+            && self
+                .connection_mode
+                .is_some_and(|mode| mode.uses_grpc_pipeline())
+            && self.app_context.as_ref().is_some_and(|app| {
+                app.router_config.wait_for_tokenizer
+                    && !app.router_config.disable_tokenizer_autoload
+            }))
+        .then_some(self.tokenizer_preparation.as_ref())
+        .flatten()
+    }
+
     fn get_app_context(&self) -> Option<&Arc<AppContext>> {
         self.app_context.as_ref()
     }

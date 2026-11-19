@@ -48,7 +48,10 @@ use crate::{
         health::liveness,
         KvEventMonitor, WorkerHttpClientCache, WorkerMonitor, WorkerRegistry,
     },
-    workflow::{JobQueue, TokenizerLoadFailures, WorkflowEngines},
+    workflow::{
+        tokenizer_preparation::TokenizerPreparations, JobQueue, TokenizerLoadFailures,
+        WorkflowEngines,
+    },
 };
 
 /// Error type for AppContext builder
@@ -97,6 +100,7 @@ pub struct AppContext {
     /// included: that ends the worker's ownership, and the model's next
     /// registration loads afresh and records again.
     pub worker_loaded_tokenizers: Arc<DashSet<String>>,
+    pub tokenizer_preparations: Arc<TokenizerPreparations>,
     pub multimodal_config_registry: Arc<MultimodalConfigRegistry>,
     pub reasoning_parser_factory: Option<ReasoningParserFactory>,
     pub tool_parser_factory: Option<ToolParserFactory>,
@@ -579,6 +583,7 @@ impl AppContextBuilder {
             multimodal_config_registry: Arc::new(MultimodalConfigRegistry::new()),
             tokenizer_load_failures: Arc::new(TokenizerLoadFailures::new()),
             worker_loaded_tokenizers: Arc::new(DashSet::new()),
+            tokenizer_preparations: Arc::default(),
             reasoning_parser_factory: self.reasoning_parser_factory,
             tool_parser_factory: self.tool_parser_factory,
             worker_registry,
@@ -1698,6 +1703,7 @@ pub(crate) mod testing {
             multimodal_config_registry: Arc::new(MultimodalConfigRegistry::new()),
             tokenizer_load_failures: Arc::default(),
             worker_loaded_tokenizers: Arc::default(),
+            tokenizer_preparations: Arc::default(),
             wasm_manager: None,
             worker_client_cache: Arc::new(WorkerHttpClientCache::new(
                 router_config.worker_http_client_settings(),

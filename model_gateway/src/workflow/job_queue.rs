@@ -20,7 +20,10 @@ use openai_protocol::worker::{
 use smg_mcp::McpConfig;
 use tokio::sync::{mpsc, oneshot, Semaphore};
 use tracing::{debug, error, info, warn};
-use wfaas::{StateStore, WorkflowData, WorkflowEngine, WorkflowError, WorkflowId, WorkflowStatus};
+use wfaas::{
+    StateStore, WorkflowData, WorkflowEngine, WorkflowError, WorkflowId, WorkflowInstanceId,
+    WorkflowState, WorkflowStatus,
+};
 
 use crate::{
     app_context::AppContext,
@@ -30,10 +33,13 @@ use crate::{
         create_mcp_workflow_data, create_tokenizer_workflow_data,
         create_wasm_registration_workflow_data, create_wasm_removal_workflow_data,
         create_worker_removal_workflow_data, create_worker_update_workflow_data,
-        create_worker_workflow_data, note_tokenizer_load_outcome, note_tokenizer_removed,
-        registered_entries, registered_in, McpServerConfigRequest, TokenizerConfigRequest,
-        TokenizerRemovalRequest, WasmModuleConfigRequest, WasmModuleRemovalRequest,
-        WorkerRegistrationMode, WorkflowEngines,
+        create_worker_workflow_data,
+        data::{WorkerRegistrationData, WorkerWorkflowData},
+        engines::WorkerRegistrationEngine,
+        note_tokenizer_load_outcome, note_tokenizer_removed, registered_entries, registered_in,
+        steps::local::PrepareTokenizerStep,
+        McpServerConfigRequest, TokenizerConfigRequest, TokenizerRemovalRequest,
+        WasmModuleConfigRequest, WasmModuleRemovalRequest, WorkerRegistrationMode, WorkflowEngines,
     },
 };
 
@@ -978,7 +984,12 @@ impl JobQueue {
             match state.status {
                 WorkflowStatus::Pending | WorkflowStatus::Running => {
                     match engine.cancel_workflow(state.instance_id).await {
-                        Ok(()) => cancelled += 1,
+                        Ok(()) => {
+                            if let Some(scope) = &state.context.data.tokenizer_preparation {
+                                scope.close();
+                            }
+                            cancelled += 1;
+                        }
                         // Ended between the listing and the cancel: its job's
                         // end path runs as for any registration that ended.
                         Err(WorkflowError::NotFound(_)) => {}
@@ -1176,6 +1187,36 @@ impl JobQueue {
             .await
     }
 
+    /// Close the preparation before inspecting its committed workers. A
+    /// guarded registration cannot insert after this close, even when a
+    /// later step outlives the bounded cancellation-settlement wait.
+    async fn settle_registration(
+        engine: &WorkerRegistrationEngine,
+        instance_id: WorkflowInstanceId,
+        label: &str,
+        preparation: &super::tokenizer_preparation::TokenizerPreparation,
+        timeout: Duration,
+    ) -> Result<WorkflowState<WorkerWorkflowData>, String> {
+        preparation.close();
+        match engine
+            .wait_for_terminal_state(instance_id, label, timeout)
+            .await
+        {
+            Ok(state) => Ok(state),
+            Err(settle) => {
+                let state = engine
+                    .get_status(instance_id)
+                    .await
+                    .map_err(|read| format!("{settle}; state unavailable: {read:?}"))?;
+                if state.context.data.tokenizer_preparation().is_none() {
+                    return Err(settle);
+                }
+                warn!(%instance_id, %settle, "Reading guarded registration after cancellation settlement timeout");
+                Ok(state)
+            }
+        }
+    }
+
     /// Execute a specific job
     async fn execute_job(
         job: &Job,
@@ -1207,6 +1248,9 @@ impl JobQueue {
                     registration_mode.clone(),
                     Arc::clone(context),
                 );
+                // Terminal workflow state can outlive the owning job.
+                let preparation = workflow_data.tokenizer_preparation.clone();
+                let _preparation_guard = preparation.as_ref().map(|scope| scope.guard());
                 let instance_id = engines
                     .worker_registration
                     .start_workflow(WorkflowId::new("worker_registration"), workflow_data)
@@ -1223,6 +1267,9 @@ impl JobQueue {
                         .map_err(|e| {
                             format!("Failed to cancel worker registration workflow: {e:?}")
                         })?;
+                    if let Some(scope) = &preparation {
+                        scope.close();
+                    }
                 }
 
                 debug!(
@@ -1232,11 +1279,63 @@ impl JobQueue {
                 );
 
                 let label = Job::workflow_label(&config.url);
-                let state = engines
+                let mut wait = engines
                     .worker_registration
                     .wait_for_terminal_state(instance_id, &label, timeout_duration)
-                    .await?;
-                let outcome = wfaas::completion_outcome(&state, &label);
+                    .await;
+                if wait.is_err() && preparation.is_some() {
+                    let state = engines
+                        .worker_registration
+                        .get_status(instance_id)
+                        .await
+                        .map_err(|error| format!("Failed to get registration state: {error:?}"))?;
+                    // Eligibility is known only after classification and wire
+                    // detection; HTTP/external/autoload-disabled registrations
+                    // keep their existing deadline even with the flag set.
+                    let budget = PrepareTokenizerStep::budget(&state.context.data);
+                    if !budget.is_zero()
+                        && matches!(
+                            state.status,
+                            WorkflowStatus::Pending
+                                | WorkflowStatus::Running
+                                | WorkflowStatus::Paused
+                        )
+                    {
+                        wait = engines
+                            .worker_registration
+                            .wait_for_terminal_state(instance_id, &label, budget)
+                            .await;
+                    }
+                }
+                let (state, wait_error) = match (wait, preparation.as_ref()) {
+                    (Ok(state), _) => (state, None),
+                    (Err(error), Some(preparation)) => {
+                        let cancelled = engines
+                            .worker_registration
+                            .cancel_workflow_if_active(instance_id)
+                            .await
+                            .map_err(|cancel| {
+                                format!("{error}; cancellation failed: {cancel:?}")
+                            })?;
+                        // A registry commit may have won the deadline race;
+                        // settle cancellation before the identity-bound cleanup.
+                        let state = Self::settle_registration(
+                            &engines.worker_registration,
+                            instance_id,
+                            &label,
+                            preparation,
+                            Duration::from_secs(10),
+                        )
+                        .await
+                        .map_err(|settle| {
+                            format!("{error}; cancellation did not settle: {settle}")
+                        })?;
+                        (state, cancelled.then_some(error))
+                    }
+                    (Err(error), None) => return Err(error),
+                };
+                let outcome =
+                    wait_error.map_or_else(|| wfaas::completion_outcome(&state, &label), Err);
                 // A POST's registration that put its worker in the registry
                 // and did not finish (a DELETE's cancel landing after the
                 // registry step, a later step's failure) leaves no worker
@@ -1280,6 +1379,13 @@ impl JobQueue {
                     }
                     outcome => outcome,
                 }
+                .map_err(|failure| {
+                    if context.router_config.wait_for_tokenizer {
+                        format!("{failure} (instance: {instance_id})")
+                    } else {
+                        failure
+                    }
+                })
             }
             Job::UpdateWorker { url, update } => {
                 let engines = Self::workflow_engines(context)?;
@@ -1601,6 +1707,7 @@ impl JobQueue {
             }
             Job::RemoveTokenizer { request } => {
                 // Tokenizer removal is synchronous and fast
+                let _preparations = context.tokenizer_preparations.lock();
                 if let Some(entry) = context.tokenizer_registry.remove_by_id(&request.id) {
                     context.multimodal_config_registry.remove(&entry.id);
                     context.worker_loaded_tokenizers.remove(&entry.id);
@@ -1863,6 +1970,79 @@ fn build_external_worker_config(
 mod tests {
     use super::*;
     use crate::wasm::{WasmModuleDescriptor, WasmModuleType};
+
+    #[tokio::test]
+    async fn a_guarded_commit_remains_available_for_cleanup_when_cancellation_does_not_settle() {
+        use wfaas::{StepId, StepState, StepStatus};
+
+        use crate::{
+            app_context::testing::app_context_for_tests,
+            worker::{BasicWorkerBuilder, Worker, WorkerRegistry},
+            workflow::data::WorkerKind,
+        };
+
+        for wire in [ConnectionMode::Grpc, ConnectionMode::Http] {
+            let registry = Arc::new(WorkerRegistry::new());
+            let app = app_context_for_tests(
+                RouterConfig::builder()
+                    .wait_for_tokenizer(true)
+                    .build_unchecked(),
+                Arc::clone(&registry),
+                None,
+            );
+            let worker: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new("http://committed:8000")
+                    .connection_mode(wire)
+                    .build(),
+            );
+            let id = registry.register(Arc::clone(&worker)).unwrap();
+            let mut data = create_worker_workflow_data(
+                WorkerSpec::new(worker.url()),
+                WorkerRegistrationMode::CreateOnly,
+                app,
+            );
+            data.worker_kind = Some(WorkerKind::Local);
+            data.connection_mode = Some(wire);
+            data.actual_workers = Some(vec![Arc::clone(&worker)]);
+            let preparation = data.tokenizer_preparation.clone().unwrap();
+            let instance = WorkflowInstanceId::new();
+            let mut state =
+                WorkflowState::new(instance, WorkflowId::new("worker_registration"), data);
+            state.status = WorkflowStatus::Cancelled;
+            state.step_states.insert(
+                StepId::new("post_commit"),
+                StepState {
+                    status: StepStatus::Running,
+                    ..StepState::default()
+                },
+            );
+            let engine = WorkerRegistrationEngine::new();
+            engine.state_store().save(state).await.unwrap();
+            let settled = JobQueue::settle_registration(
+                &engine,
+                instance,
+                worker.url(),
+                &preparation,
+                Duration::ZERO,
+            )
+            .await;
+            assert!(
+                preparation.pin("late-commit").is_err(),
+                "no insert can follow the cleanup snapshot"
+            );
+            if wire == ConnectionMode::Grpc {
+                assert_eq!(
+                    registered_entries(&registry, &settled.unwrap()),
+                    HashMap::from([(id.as_str().to_string(), worker.revision())])
+                );
+            } else {
+                assert!(
+                    settled.is_err(),
+                    "an unguarded HTTP commit must settle before cleanup"
+                );
+            }
+        }
+    }
 
     /// A job line writes a worker's address masked and a non-address name as
     /// it is; a job type the list does not name counts as a worker's, so a
