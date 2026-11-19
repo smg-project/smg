@@ -1181,8 +1181,8 @@ impl World {
     /// nothing. The pinned worker's row is handed as one more than its
     /// position. Under `ask.affinity` the column is filled as the build
     /// fills it. A row's report age stays what the report carried when it
-    /// was recorded: the age at the decision is the decision's instant less
-    /// the row's sample instant, and no stage of this crate reads it.
+    /// was recorded. The report age limit uses the decision's instant less
+    /// the row's sample instant on either form of the row.
     ///
     /// The rows are copied and written ([`World::build`]) where they cannot
     /// be lent: in a pool that holds host-local rows, where the asking

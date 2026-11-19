@@ -18,14 +18,19 @@ use parking_lot::{Mutex, MutexGuard};
 use rustc_hash::{FxHashMap, FxHasher};
 
 use crate::{
+    affinity::WarmRule,
     counts::with_counts,
     decision::{Target, Targets, MAX_TARGETS},
     framework::{
-        top_drawn, top_pass, Filter, Front, Narrowed, Picker, Scorer, TieBand, Unit, DRAW_BOUND,
+        top_drawn, top_pass, Filter, Front, Narrowed, Picker, Scorer, Spread, TieBand, Unit,
+        DRAW_BOUND,
     },
     lease::{Lease, Lifecycle, Membership, Side},
     spec::Needs,
-    view::{Candidate, Constraints, LoadRow, ModelFingerprint, PoolFacts, RequestFacts, WorkerId},
+    view::{
+        Candidate, Constraints, LoadRow, ModelFingerprint, PoolFacts, ReportCutoff, RequestFacts,
+        WorkerId,
+    },
     Draw,
 };
 
@@ -264,6 +269,119 @@ impl RowTests {
 }
 
 // ---------------------------------------------------------------- scorers
+
+/// A scorer that can read reports through a decision's cutoff. The bare
+/// scorer reads the row directly, and the document wraps it only when it
+/// sets a limit.
+pub(crate) trait ReadsLoad: Scorer {
+    fn score_with(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        out: &mut [f32],
+        load: impl Fn(&Candidate) -> Option<LoadRow> + Copy,
+    ) -> TieBand;
+
+    fn score_front_with(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        _kept: &[u32],
+        asked: &[u32],
+        out: &mut [f32],
+        load: impl Fn(&Candidate) -> Option<LoadRow> + Copy,
+    ) -> (TieBand, Front) {
+        (
+            self.score_with(facts, candidates, asked, out, load),
+            Front::Unsaid,
+        )
+    }
+}
+
+#[derive(Debug)]
+struct ReportAge<S> {
+    stage: S,
+    max_age_ms: u64,
+}
+
+pub(crate) fn with_report_age(
+    stage: impl ReadsLoad + 'static,
+    max_age_ms: Option<u64>,
+) -> Box<dyn Scorer> {
+    match max_age_ms {
+        Some(max_age_ms) => Box::new(ReportAge { stage, max_age_ms }),
+        None => Box::new(stage),
+    }
+}
+
+impl<S: ReadsLoad> Lifecycle for ReportAge<S> {
+    fn on_dispatched(
+        &self,
+        lease: &Lease,
+        target: &Target,
+        side: Side,
+        since_decision_micros: u32,
+    ) {
+        self.stage
+            .on_dispatched(lease, target, side, since_decision_micros);
+    }
+
+    fn on_membership(&self, change: &Membership<'_>) {
+        self.stage.on_membership(change);
+    }
+}
+
+impl<S: ReadsLoad> Scorer for ReportAge<S> {
+    fn name(&self) -> &'static str {
+        self.stage.name()
+    }
+
+    fn score(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        out: &mut [f32],
+    ) -> TieBand {
+        let cutoff = ReportCutoff::new(facts.now_micros, self.max_age_ms);
+        self.stage
+            .score_with(facts, candidates, kept, out, |row| cutoff.load(row))
+    }
+
+    fn score_front(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        asked: &[u32],
+        out: &mut [f32],
+    ) -> (TieBand, Front) {
+        let cutoff = ReportCutoff::new(facts.now_micros, self.max_age_ms);
+        self.stage
+            .score_front_with(facts, candidates, kept, asked, out, |row| cutoff.load(row))
+    }
+
+    fn row_wise(&self) -> bool {
+        self.stage.row_wise()
+    }
+
+    fn front_wise(&self) -> bool {
+        self.stage.front_wise()
+    }
+
+    fn spread(&self) -> Spread {
+        self.stage.spread()
+    }
+
+    fn needs(&self) -> Needs {
+        self.stage.needs()
+    }
+
+    fn warm_rule(&self) -> Option<WarmRule> {
+        self.stage.warm_rule()
+    }
+}
 
 /// The rows whose least and greatest cost are found by compares
 /// ([`normalize_costs`]): the ranks of one engine, the rows of a draw.
@@ -1001,10 +1119,15 @@ impl LeastLoad {
 
     /// The mean rate of the kept rows that report one, which a report
     /// without a rate drains at: the default where none reports one.
-    fn mean_rate(&self, candidates: &[Candidate], kept: &[u32]) -> f32 {
+    fn mean_rate(
+        &self,
+        candidates: &[Candidate],
+        kept: &[u32],
+        load: impl Fn(&Candidate) -> Option<LoadRow>,
+    ) -> f32 {
         let (sum, n) = kept
             .iter()
-            .filter_map(|&i| candidates[i as usize].load)
+            .filter_map(|&i| load(&candidates[i as usize]))
             .filter(|r| r.live_rate > 0)
             .fold((0.0f32, 0u32), |(s, n), r| (s + r.live_rate as f32, n + 1));
         if n > 0 && sum.is_finite() {
@@ -1026,6 +1149,7 @@ impl LeastLoad {
         rows: &[u32],
         nominal: f32,
         out: &mut [f32],
+        load: impl Fn(&Candidate) -> Option<LoadRow>,
     ) -> TieBand {
         // One load of the tally: each reporting row's held work is read
         // (released first when its report's sample reaches a dispatch) and
@@ -1038,7 +1162,7 @@ impl LeastLoad {
             with_counts!(facts, |counts| {
                 for (slot, &i) in out.iter_mut().zip(rows) {
                     let c = &candidates[i as usize];
-                    *slot = match c.load {
+                    *slot = match load(c) {
                         Some(_) => {
                             let (tokens, requests) =
                                 tally.get(&(c.id, c.dp_rank)).map_or((0, 0), |since| {
@@ -1053,7 +1177,7 @@ impl LeastLoad {
             });
         }
         for (slot, &i) in out.iter_mut().zip(rows) {
-            if let Some(r) = candidates[i as usize].load {
+            if let Some(r) = load(&candidates[i as usize]) {
                 *slot = self.reported_cost(r, *slot, nominal);
             }
         }
@@ -1120,12 +1244,44 @@ impl Scorer for LeastLoad {
         kept: &[u32],
         out: &mut [f32],
     ) -> TieBand {
+        self.score_with(facts, candidates, kept, out, |c| c.load)
+    }
+
+    fn score_front(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        asked: &[u32],
+        out: &mut [f32],
+    ) -> (TieBand, Front) {
+        self.score_front_with(facts, candidates, kept, asked, out, |c| c.load)
+    }
+
+    fn needs(&self) -> Needs {
+        Needs {
+            loads: true,
+            ..Needs::default()
+        }
+    }
+}
+
+impl ReadsLoad for LeastLoad {
+    fn score_with(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        out: &mut [f32],
+        load: impl Fn(&Candidate) -> Option<LoadRow> + Copy,
+    ) -> TieBand {
         self.costs(
             facts,
             candidates,
             kept,
-            self.mean_rate(candidates, kept),
+            self.mean_rate(candidates, kept, load),
             out,
+            load,
         )
     }
 
@@ -1146,17 +1302,18 @@ impl Scorer for LeastLoad {
     /// span, as one behind the front widens the pool's. Among every row, a
     /// difference that is a small enough share of the pool's span falls
     /// under the last bit of a profile's sum, and the rows are drawn among.
-    fn score_front(
+    fn score_front_with(
         &self,
         facts: &RequestFacts<'_>,
         candidates: &[Candidate],
         kept: &[u32],
         asked: &[u32],
         out: &mut [f32],
+        load: impl Fn(&Candidate) -> Option<LoadRow> + Copy,
     ) -> (TieBand, Front) {
         let mut rated = true;
         for &i in asked {
-            let Some(report) = candidates[i as usize].load else {
+            let Some(report) = load(&candidates[i as usize]) else {
                 return (TieBand::NORMALIZED, Front::Whole);
             };
             rated &= report.live_rate > 0;
@@ -1166,19 +1323,12 @@ impl Scorer for LeastLoad {
         let nominal = if rated {
             self.default_throughput
         } else {
-            self.mean_rate(candidates, kept)
+            self.mean_rate(candidates, kept, load)
         };
         (
-            self.costs(facts, candidates, asked, nominal, out),
+            self.costs(facts, candidates, asked, nominal, out, load),
             Front::Unsaid,
         )
-    }
-
-    fn needs(&self) -> Needs {
-        Needs {
-            loads: true,
-            ..Needs::default()
-        }
     }
 }
 
@@ -1321,6 +1471,26 @@ impl Scorer for ResidentWork {
         kept: &[u32],
         out: &mut [f32],
     ) -> TieBand {
+        self.score_with(facts, candidates, kept, out, |c| c.load)
+    }
+
+    fn needs(&self) -> Needs {
+        Needs {
+            loads: true,
+            ..Needs::default()
+        }
+    }
+}
+
+impl ReadsLoad for ResidentWork {
+    fn score_with(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        out: &mut [f32],
+        load: impl Fn(&Candidate) -> Option<LoadRow> + Copy,
+    ) -> TieBand {
         // One load of the tally, as the least-load scorer reads it: a row
         // that counts resident tokens is costed with its credit, any other
         // is marked and costed after the reporting peers' baseline is known.
@@ -1333,7 +1503,7 @@ impl Scorer for ResidentWork {
                     // A report releases the dispatches it reflects whatever the
                     // score reads of them: a rank whose report counts no
                     // resident tokens would hold its credit at the bound.
-                    let reported = c.load.map(|r| {
+                    let reported = load(c).map(|r| {
                         let credit = tally.get(&(c.id, c.dp_rank)).map_or((0, 0), |since| {
                             since.credit_through(c.load_sampled_at_micros)
                         });
@@ -1359,13 +1529,6 @@ impl Scorer for ResidentWork {
             TieBand((TIE_EPSILON_SECS / span).min(1.0))
         } else {
             TieBand::NORMALIZED
-        }
-    }
-
-    fn needs(&self) -> Needs {
-        Needs {
-            loads: true,
-            ..Needs::default()
         }
     }
 }

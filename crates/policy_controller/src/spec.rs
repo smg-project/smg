@@ -37,14 +37,15 @@ use crate::{
     affinity::{blocks_within, Gates, KvPressure, PrefixAffinity, WarmupSlice},
     bucket::Bucket,
     builtins::{
-        FewestSessions, LeastLoad, LeastRequests, ResidentWork, SampledBest, SessionAffinity,
-        DEFAULT_KV_PRESSURE_WEIGHT, DEFAULT_MEAN_PREFILL_TOKENS, DEFAULT_THROUGHPUT,
+        with_report_age, FewestSessions, LeastLoad, LeastRequests, ResidentWork, SampledBest,
+        SessionAffinity, DEFAULT_KV_PRESSURE_WEIGHT, DEFAULT_MEAN_PREFILL_TOKENS,
+        DEFAULT_THROUGHPUT,
     },
     catalog::{Catalog, Found},
     framework::{Binding, Engine, OverloadThresholds, Picker, Plan, Profile, Scorer, Weighted},
     ring::ConsistentHash,
     sessions::SessionRule,
-    view::{permille, HashKind, Phase},
+    view::{permille, HashKind, Phase, MAX_REPORT_AGE_MS},
 };
 
 pub const API_VERSION: &str = "smg.policy/v1";
@@ -265,6 +266,12 @@ pub struct ViewSpec {
     /// at most: one frame of the Decide call carries no more.
     #[schemars(range(min = 1, max = 8190))]
     pub max_block_hashes: u32,
+    /// Maximum load report age in milliseconds. Built-in scorers use their
+    /// unreported path for a sample older than this at the decision's instant.
+    /// Omit to use reports of any age.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = MAX_REPORT_AGE_MS))]
+    pub max_report_age_ms: Option<u64>,
     /// The worker labels a stage may read, each a selector of one label
     /// key: `key` (the worker carries the label, whatever its value) or
     /// `key=value` (it carries the label with that value), split at the
@@ -297,6 +304,7 @@ impl Default for ViewSpec {
             block_size: None,
             boundaries: Vec::new(),
             max_block_hashes: 256,
+            max_report_age_ms: None,
             labels: Vec::new(),
             zones: Vec::new(),
             engines: Vec::new(),
@@ -1891,6 +1899,12 @@ fn check_view(view: &ViewSpec, denied: &[&str]) -> Result<(), SpecError> {
     }
     check_unique(&view.headers, "view.headers")?;
     at.nonzero("block_size", view.block_size)?;
+    at.number(
+        "max_report_age_ms",
+        view.max_report_age_ms,
+        |ms| (1..=u64::from(MAX_REPORT_AGE_MS)).contains(&ms),
+        "a whole number from 1 to 3599999",
+    )?;
     if view.boundaries.first() == Some(&0) {
         return Err(SpecError::BadField {
             path: "view.boundaries[0]".to_string(),
@@ -2244,13 +2258,17 @@ fn gates_of(p: &ProfileSpec, view: &ViewSpec) -> Gates {
     Gates::of(affinity, kv, view.block_size)
 }
 
-/// The stage's scorer. `boundaries` are the view's, where a prefix ring keys.
-fn scorer_of(stage: &ScoreStage, gates: Gates, boundaries: &[u32]) -> Resolved<Box<dyn Scorer>> {
+/// The stage's scorer, with its profile's gates and the view's settings.
+fn scorer_of(stage: &ScoreStage, gates: Gates, view: &ViewSpec) -> Resolved<Box<dyn Scorer>> {
+    let max_age = view.max_report_age_ms;
     match stage {
-        ScoreStage::LeastLoad(p) => built_scorer(LeastLoad::new(
-            p.kv_pressure_weight.unwrap_or(DEFAULT_KV_PRESSURE_WEIGHT),
-            p.mean_prefill_tokens.unwrap_or(DEFAULT_MEAN_PREFILL_TOKENS),
-            p.default_throughput.unwrap_or(DEFAULT_THROUGHPUT),
+        ScoreStage::LeastLoad(p) => Resolved::Built(with_report_age(
+            LeastLoad::new(
+                p.kv_pressure_weight.unwrap_or(DEFAULT_KV_PRESSURE_WEIGHT),
+                p.mean_prefill_tokens.unwrap_or(DEFAULT_MEAN_PREFILL_TOKENS),
+                p.default_throughput.unwrap_or(DEFAULT_THROUGHPUT),
+            ),
+            max_age,
         )),
         ScoreStage::LeastRequests(_) => built_scorer(LeastRequests),
         ScoreStage::FewestSessions(_) => built_scorer(FewestSessions),
@@ -2268,18 +2286,25 @@ fn scorer_of(stage: &ScoreStage, gates: Gates, boundaries: &[u32]) -> Resolved<B
         {
             Resolved::NotInBuild("the prefix-affinity uncached credit")
         }
-        ScoreStage::PrefixAffinity(p) => built_scorer(PrefixAffinity::new(p, gates)),
+        ScoreStage::PrefixAffinity(p) => {
+            Resolved::Built(with_report_age(PrefixAffinity::new(p, gates), max_age))
+        }
         ScoreStage::KvPressure(_) => built_scorer(KvPressure),
-        ScoreStage::WarmupSlice(p) => built_scorer(WarmupSlice::new(p, gates)),
+        ScoreStage::WarmupSlice(p) => {
+            Resolved::Built(with_report_age(WarmupSlice::new(p, gates), max_age))
+        }
         ScoreStage::Bucket(p) => built_scorer(Bucket::new(p)),
         ScoreStage::ConsistentHash(p) => {
             let ring = ConsistentHash::new(p.bounded_load.as_ref());
             built_scorer(match p.prefix_tokens {
-                Some(tokens) => ring.keyed_by_prefix(tokens, gates, boundaries),
+                Some(tokens) => ring.keyed_by_prefix(tokens, gates, &view.boundaries),
                 None => ring,
             })
         }
-        ScoreStage::ResidentWork(p) => built_scorer(ResidentWork::new(p.request_tokens)),
+        ScoreStage::ResidentWork(p) => Resolved::Built(with_report_age(
+            ResidentWork::new(p.request_tokens),
+            max_age,
+        )),
     }
 }
 
@@ -2516,7 +2541,7 @@ fn check_profile(
             );
             continue;
         }
-        match scorer_of(&stage, gates, &view.boundaries) {
+        match scorer_of(&stage, gates, view) {
             Resolved::Built(scorer) => {
                 let read = HashDepth::of_scorer(&stage, &view.boundaries, scorer.needs());
                 depth.deepen(read);
@@ -3420,6 +3445,7 @@ impl PolicySpec {
         needs.headers |= !self.view.headers.is_empty();
         let mut engine = Engine::new(profiles, bindings, self.generation, needs);
         engine.set_explain_sample(self.explain.sample);
+        engine.limit_report_age(self.view.max_report_age_ms);
         for at in sheds {
             engine.shed_when_all_vetoed(at);
         }
