@@ -146,6 +146,7 @@ pub mod proto;
 pub mod replication;
 pub mod ring;
 pub mod routing_key;
+pub mod sent;
 pub mod sessions;
 pub mod spec;
 pub mod store;
@@ -176,6 +177,7 @@ pub use lease::{
 };
 pub use ring::{ConsistentHash, Ring};
 pub use routing_key::{DerivedKey, KeySource, KeySources};
+pub use sent::{Sent, SentCredit};
 pub use sessions::{
     Assignment, Forgets, Pins, Recovery, SessionRule, SessionTable, SessionVerdict,
 };

@@ -611,7 +611,7 @@ impl Scorer for FewestSessions {
 /// lock. `oldest_micros` tells a decision whether its report's sample reaches
 /// any held dispatch without taking one.
 #[derive(Debug)]
-struct SinceReport {
+pub(crate) struct SinceReport {
     /// The held token-work in the high bits and the held requests in the low
     /// [`REQUEST_BITS`]: one word, so a reader never sees a torn pair.
     held: AtomicU64,
@@ -775,7 +775,7 @@ impl SinceReport {
         u64::from(tokens) << REQUEST_BITS | 1
     }
 
-    fn record(&self, at_micros: u64, tokens: u32) {
+    pub(crate) fn record(&self, at_micros: u64, tokens: u32) {
         // Past the bound the row's oldest batch retires before this dispatch
         // lands, by instant across the lanes: the newest credits stay,
         // whichever lane holds them, past a partial release.
@@ -893,7 +893,7 @@ impl SinceReport {
     /// of them reads the word alone. Inlined into each load scorer's row
     /// loop: two loads and a compare a row, the release behind a call.
     #[inline(always)]
-    fn credit_through(&self, sampled_at_micros: u64) -> (u64, u64) {
+    pub(crate) fn credit_through(&self, sampled_at_micros: u64) -> (u64, u64) {
         if self.reaches(sampled_at_micros) {
             self.release_through(sampled_at_micros);
         }
@@ -968,8 +968,8 @@ type RankKey = (WorkerId, u16);
 /// Within a row the dispatches take per-thread lanes: deciders that read the
 /// same minimum book the same rank, and one lock there queued them too.
 #[derive(Debug)]
-struct Credits {
-    tally: ArcSwap<FxHashMap<RankKey, Arc<SinceReport>>>,
+pub(crate) struct Credits {
+    pub(crate) tally: ArcSwap<FxHashMap<RankKey, Arc<SinceReport>>>,
 }
 
 impl Default for Credits {
@@ -1046,7 +1046,7 @@ impl Credits {
     /// dispatch's instant and its size, and records it
     /// ([`SinceReport::record`]): a stage that keeps the rank's number
     /// records it under the report it was told.
-    fn dispatched(
+    pub(crate) fn dispatched(
         &self,
         lease: &Lease,
         target: &Target,
@@ -1084,7 +1084,7 @@ impl Credits {
 
     /// Drops the ranks a membership change takes away, each entry that
     /// goes shown to `dropped` first.
-    fn membership(&self, change: &Membership<'_>, dropped: impl FnMut(&SinceReport)) {
+    pub(crate) fn membership(&self, change: &Membership<'_>, dropped: impl FnMut(&SinceReport)) {
         match change {
             // Every rank of the worker goes with it. A resized worker's ranks
             // are a new set: what a vanished rank held would never release,
