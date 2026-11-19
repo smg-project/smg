@@ -1037,8 +1037,8 @@ Policy controller image -- policyController.image, each part falling back to
 the router's image: the global registry, the global repository, and the
 router's tag with -policy-controller appended, the tag a release publishes
 the controller under. One version names both images: a release publishes one
-controller image, so the router's -slurm variant takes it too, its own
-suffix cut first. The default tag belongs to the router's repository and
+controller image, so the router's -slurm or -ol9 variant takes it too, its
+own suffix cut first. The default tag belongs to the router's repository and
 stands on the router's tag, so a repository of the operator's own is refused
 without its tag, and so is a router image named by a digest. No release
 older than the first that publishes a controller image has one, so a tag
@@ -1064,7 +1064,7 @@ comparer can hold: any other tag takes the default.
 {{- end -}}
 {{- $registry := $image.registry | default .Values.global.image.registry -}}
 {{- $repository := $image.repository | default .Values.global.image.repository -}}
-{{- $tag := $image.tag | default (printf "%s-policy-controller" (trimSuffix "-slurm" $routerTag)) -}}
+{{- $tag := $image.tag | default (printf "%s-policy-controller" ($routerTag | trimSuffix "-slurm" | trimSuffix "-ol9")) -}}
 {{- printf "%s/%s:%s" $registry $repository $tag -}}
 {{- end }}
 
