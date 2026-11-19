@@ -1,8 +1,9 @@
 //! The worker load sink over the store.
 //!
 //! The collector holds its reports lock at a record, a poll answer or a
-//! forget. The adapter takes its member map lock inside it, then reads the
-//! registry. On a miss it also reads the holder, under the map's write
+//! forget, so an object's forget and a later object's first call never
+//! interleave. The adapter takes its member map lock inside it, then reads
+//! the registry. On a miss it also reads the holder, under the map's write
 //! lock. It releases the map before calling the store, which takes its own
 //! locks and may pay for a membership build on a poll answer. The adapter
 //! calls no collector.
@@ -53,8 +54,9 @@ struct KeptMember {
 /// An unready rank counts as served when checking an empty
 /// answer, so the engine's verdict stands until its next record or report.
 /// Loads are a row's, not an object's. A forgotten object's row is evicted
-/// and its engine judged again, unless another object stands under the row:
-/// a replacement keeps the row's loads, and its records overwrite them.
+/// and its engine judged again, unless a later object was heard or asked
+/// under the row first: the loads are that object's then. Behind a reset
+/// no entry says whose they are, and a replaced object's forget keeps them.
 /// The host publishes the store's pending writes.
 pub struct LoadAdapter<G, S: ?Sized> {
     objects: Arc<Objects<G>>,
@@ -272,21 +274,17 @@ impl<G: Generation, S: StoreLoadSink + ?Sized + 'static> LoadSink for LoadAdapte
         if !self.leads() {
             return;
         }
+        // Loads are a row's, and the entry says whose stand on it: a later
+        // object's first record, report or poll question puts its own entry
+        // at the address. Under this object's own entry none has written,
+        // so the loads go whatever stands under the row, and the engine is
+        // judged again: a replacement that is never asked would hold them.
+        // With no entry of its own, behind a reset or a later object's
+        // call, they go only where this object still stands under the row.
         let Some(kept) = kept.or_else(|| self.read_member(worker)) else {
             return;
         };
-        // Loads are a row's. Where another object stands under the row, a
-        // replacement, they are its own now and stay: its first record may
-        // be on file already. Where this object stands, its status left
-        // `Ready`, or none does, they go, and the engine is judged again.
-        let replaced = self
-            .objects
-            .registry()
-            .get(&kept.id)
-            .is_some_and(|current| !Arc::ptr_eq(&current, worker));
-        if !replaced {
-            self.store.evict(kept.member.row);
-        }
+        self.store.evict(kept.member.row);
     }
 
     fn reset(&self) {
@@ -889,12 +887,12 @@ mod tests {
         assert!(adapter.members.read().is_empty());
     }
 
-    /// The holder replaced the object under a row that stands. The row's
-    /// loads are the replacement's now: the old object's forget drops its
-    /// entry and evicts nothing, so no order of the two can wipe a record
-    /// of the replacement.
+    /// The holder replaced the object under a row that stands, and no call
+    /// for the replacement has come: the entry is still the old object's,
+    /// and so is the sample. Its forget evicts the row. A replacement that
+    /// is never asked would hold the old sample otherwise.
     #[test]
-    fn a_forget_of_a_replaced_object_leaves_the_rows_loads_to_its_replacement() {
+    fn a_replaced_object_forgotten_before_its_replacement_is_heard_has_nothing_on_file() {
         let replica = Replica::new();
         let (id, old) = replica.add(facts(URL));
         let adapter = replica.lead();
@@ -902,14 +900,13 @@ mod tests {
         adapter.record(&old, 0, &report(0, 3), now, now);
         let _replacement = replica.replace(id);
         adapter.forget(&old);
-        assert_eq!(replica.store.calls.lock().evicts, 0);
-        assert_eq!(
-            replica.store.load(id, 0).map(|sample| sample.row.running),
-            Some(3)
-        );
+        assert_eq!(replica.store.calls.lock().evicts, 1);
+        assert_eq!(replica.store.ranks(id), 0);
         assert!(adapter.members.read().is_empty());
     }
 
+    /// The replacement's record came first: the entry is its own, and so
+    /// are the row's loads. The old object's late forget evicts nothing.
     #[test]
     fn a_late_forget_of_an_old_object_keeps_the_replacements_load() {
         let replica = Replica::new();
@@ -920,11 +917,31 @@ mod tests {
         let replacement = replica.replace(id);
         adapter.record(&replacement, 0, &report(0, 2), now, now);
         adapter.forget(&old);
+        assert_eq!(replica.store.calls.lock().evicts, 0);
         assert_eq!(
             replica.store.load(id, 0).map(|sample| sample.row.running),
             Some(2)
         );
         assert_eq!(adapter.members.read().len(), 1);
+    }
+
+    /// Behind a reset no entry says whose loads stand on a replaced row:
+    /// the old object's forget keeps them for the object that stands.
+    #[test]
+    fn a_forget_of_a_replaced_object_behind_a_reset_keeps_the_rows_loads() {
+        let replica = Replica::new();
+        let (id, old) = replica.add(facts(URL));
+        let adapter = replica.lead();
+        let now = Instant::now();
+        adapter.record(&old, 0, &report(0, 3), now, now);
+        let _replacement = replica.replace(id);
+        adapter.reset();
+        adapter.forget(&old);
+        assert_eq!(replica.store.calls.lock().evicts, 0);
+        assert_eq!(
+            replica.store.load(id, 0).map(|sample| sample.row.running),
+            Some(3)
+        );
     }
 
     #[test]
