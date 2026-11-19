@@ -98,6 +98,7 @@ pub(crate) mod testing {
                 startup_timeout_secs: 1,
                 startup_delay_secs: 0,
                 startup_check_interval_secs: 1,
+                dp_aware: false,
             };
             &SETTINGS
         }
@@ -119,6 +120,19 @@ pub(crate) mod testing {
 
     impl ProbingHost {
         pub(crate) fn new(upstream_http2: bool, connector: ScriptedConnector) -> Arc<Self> {
+            Self::with_settings(upstream_http2, false, connector)
+        }
+
+        /// A host whose settings turn the DP read on.
+        pub(crate) fn reading_dp(connector: ScriptedConnector) -> Arc<Self> {
+            Self::with_settings(false, true, connector)
+        }
+
+        fn with_settings(
+            upstream_http2: bool,
+            dp_aware: bool,
+            connector: ScriptedConnector,
+        ) -> Arc<Self> {
             Arc::new(Self {
                 worker_registry: Arc::new(WorkerRegistry::new()),
                 clients: WorkerHttpClientCache::new(WorkerHttpClientSettings {
@@ -134,6 +148,7 @@ pub(crate) mod testing {
                     startup_timeout_secs: 1,
                     startup_delay_secs: 0,
                     startup_check_interval_secs: 1,
+                    dp_aware,
                 },
                 connector: Arc::new(connector),
             })

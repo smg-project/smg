@@ -15,12 +15,11 @@ pub use external::{
 pub use local::{
     create_worker_removal_workflow, create_worker_removal_workflow_data,
     create_worker_update_workflow, create_worker_update_workflow_data, CreateLocalWorkerStep,
-    DiscoverDPInfoStep, FindWorkerToUpdateStep, ReleaseTokenizerStep, RemoveFromPolicyRegistryStep,
+    FindWorkerToUpdateStep, ReleaseTokenizerStep, RemoveFromPolicyRegistryStep,
     UpdatePoliciesForWorkerStep, UpdateRemainingPoliciesStep, UpdateWorkerPropertiesStep,
 };
 use local::{
-    DiscoverDPInfoStep as DPStep, DiscoverZmqLabelsStep, EnsureHarmonyEncodingStep,
-    SubmitTokenizerJobStep, ZMQ_LABELS_STEP,
+    DiscoverZmqLabelsStep, EnsureHarmonyEncodingStep, SubmitTokenizerJobStep, ZMQ_LABELS_STEP,
 };
 use openai_protocol::worker::WorkerSpec;
 use shared::REGISTER_WORKERS_STEP;
@@ -29,7 +28,8 @@ pub use shared::{
     UpdatePoliciesStep, WorkerList,
 };
 use smg_worker::workflow::{
-    startup_attempts, worker_registration_workflow, RegistrationGates, DISCOVER_METADATA_STEP,
+    startup_attempts, worker_registration_workflow, RegistrationGates, DISCOVER_DP_STEP,
+    DISCOVER_METADATA_STEP,
 };
 use wfaas::{BackoffStrategy, FailureAction, RetryPolicy, StepDefinition, WorkflowDefinition};
 
@@ -54,10 +54,12 @@ use crate::{
 ///       |                               |
 ///  discover_metadata                    |
 ///       |                               |
-///  discover_zmq_labels                  |
-///  (ZMQ only)                           |
-///       |                               |
-///  discover_dp_info                     |
+///       +----------------+              |
+///       |                |              |
+///  discover_dp_info discover_zmq_labels |
+///       |           (ZMQ only)          |
+///       |                |              |
+///       +----------------+              |
 ///       |                               |
 ///  create_local_worker           create_external_workers
 ///       |                               |
@@ -96,9 +98,10 @@ pub fn create_worker_registration_workflow(
         classify_worker_type = classify_worker_type.with_delay(startup_delay);
     }
 
-    // Steps 1, 1.5 and 2a, the connection mode (HTTP vs gRPC), the runtime
-    // and the metadata read, are the worker crate's. The first waits on the
-    // classification, which carries the startup delay.
+    // Steps 1, 1.5, 2a and 2b, the connection mode (HTTP vs gRPC), the
+    // runtime, the metadata read and the DP read, are the worker crate's.
+    // The first waits on the classification, which carries the startup
+    // delay.
     worker_registration_workflow::<AppContext>(
         &settings,
         RegistrationGates {
@@ -125,18 +128,8 @@ pub fn create_worker_registration_workflow(
         .with_failure_action(FailureAction::ContinueNextStep)
         .depends_on(&[DISCOVER_METADATA_STEP]),
     )
-    // Step 2b: Discover DP info (after metadata)
-    .add_step(
-        StepDefinition::new("discover_dp_info", "Discover DP Info", Arc::new(DPStep))
-            .with_retry(RetryPolicy {
-                max_attempts: 3,
-                backoff: BackoffStrategy::Fixed(Duration::from_secs(1)),
-            })
-            .with_timeout(Duration::from_secs(10))
-            .with_failure_action(FailureAction::FailWorkflow)
-            .depends_on(&[DISCOVER_METADATA_STEP, ZMQ_LABELS_STEP]),
-    )
-    // Step 3 (local): Create local worker(s)
+    // Step 3 (local): Create local worker(s), behind the crate's DP read and
+    // the ZMQ label step: the creation reads what both wrote.
     .add_step(
         StepDefinition::new(
             "create_local_worker",
@@ -145,7 +138,7 @@ pub fn create_worker_registration_workflow(
         )
         .with_timeout(Duration::from_secs(5))
         .with_failure_action(FailureAction::FailWorkflow)
-        .depends_on(&["discover_dp_info"]),
+        .depends_on(&[DISCOVER_DP_STEP, ZMQ_LABELS_STEP]),
     )
     // Step 3b (local): gRPC gpt-oss workers need the Harmony encoding; load
     // it before registration so an unavailable vocab fails this worker

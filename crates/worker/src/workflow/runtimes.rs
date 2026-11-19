@@ -12,6 +12,8 @@ pub(super) struct HttpRuntime {
     pub(super) path: &'static str,
     /// How its metadata is read.
     pub(super) metadata: MetadataRead,
+    /// Whether its server info reports its data-parallel (DP) size.
+    pub(super) reports_dp: bool,
 }
 
 /// How an HTTP worker's metadata is read.
@@ -34,12 +36,14 @@ pub(super) const HTTP_RUNTIMES: [HttpRuntime; 2] = [
         owners: &["vllm"],
         path: "/version",
         metadata: MetadataRead::ModelListAndPath,
+        reports_dp: false,
     },
     HttpRuntime {
         runtime: RuntimeType::Sglang,
         owners: &["sglang", "nvidia"],
         path: "/server_info",
         metadata: MetadataRead::InfoRoutes,
+        reports_dp: true,
     },
 ];
 
@@ -73,6 +77,12 @@ pub(super) fn http_runtime(runtime_type: &str) -> Option<&'static HttpRuntime> {
     HTTP_RUNTIMES
         .iter()
         .find(|row| row.runtime.as_str() == runtime_type)
+}
+
+/// Whether the runtime that `runtime_type` names by its id reports its DP
+/// size in its server info over HTTP. A runtime with no row reports none.
+pub(super) fn reports_dp(runtime_type: &str) -> bool {
+    http_runtime(runtime_type).is_some_and(|row| row.reports_dp)
 }
 
 /// The runtime a model list's owner names, if it names one.
@@ -144,5 +154,16 @@ mod tests {
         assert!(http_runtime("a-runtime-with-no-row").is_none());
         let default = http_runtime(METADATA_DEFAULT.as_str()).map(|row| row.metadata);
         assert_eq!(default, Some(MetadataRead::InfoRoutes));
+    }
+
+    /// A runtime reports its DP size over HTTP where its row says so, and a
+    /// runtime with no row reports none. One row at least says so.
+    #[test]
+    fn a_runtime_reports_its_dp_size_where_its_row_says_so() {
+        for row in &HTTP_RUNTIMES {
+            assert_eq!(reports_dp(row.runtime.as_str()), row.reports_dp);
+        }
+        assert!(!reports_dp("a-runtime-with-no-row"));
+        assert!(HTTP_RUNTIMES.iter().any(|row| row.reports_dp));
     }
 }

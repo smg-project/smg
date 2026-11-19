@@ -18,8 +18,9 @@
 //! ([`WorkerRegistrationWorkflowData`]: what the steps pass along, with one
 //! slot for what the host's own steps keep between them) and the detection
 //! of how the worker is spoken to ([`DetectConnectionModeStep`]) and of
-//! the runtime it runs ([`DetectRuntimeStep`]), and the read of what its
-//! engine reports about itself ([`DiscoverMetadataStep`]), in the order of
+//! the runtime it runs ([`DetectRuntimeStep`]), and the reads of what its
+//! engine reports about itself ([`DiscoverMetadataStep`]) and of its
+//! data-parallel shape ([`DiscoverDpInfoStep`]), in the order of
 //! [`worker_registration_workflow`]. A host names in
 //! [`RegistrationGates`] the steps of its own that this crate's steps wait
 //! on.
@@ -31,6 +32,7 @@
 mod data;
 mod detect_connection;
 mod detect_runtime;
+mod discover_dp;
 mod discover_metadata;
 mod drain_workers;
 mod find_workers_to_remove;
@@ -51,6 +53,7 @@ pub use data::{
 };
 pub use detect_connection::DetectConnectionModeStep;
 pub use detect_runtime::DetectRuntimeStep;
+pub use discover_dp::{dp_info_from_labels, DiscoverDpInfoStep};
 pub use discover_metadata::DiscoverMetadataStep;
 pub use drain_workers::DrainWorkersStep;
 pub use find_workers_to_remove::{FindWorkersToRemoveStep, WorkerRemovalRequest};
@@ -63,7 +66,7 @@ pub use reach::{
 };
 pub use registration::{
     startup_attempts, worker_registration_workflow, RegistrationGates, DETECT_CONNECTION_MODE_STEP,
-    DETECT_RUNTIME_STEP, DISCOVER_METADATA_STEP, WORKER_REGISTRATION_WORKFLOW,
+    DETECT_RUNTIME_STEP, DISCOVER_DP_STEP, DISCOVER_METADATA_STEP, WORKER_REGISTRATION_WORKFLOW,
 };
 pub use removal::{
     worker_removal_workflow, DRAIN_WORKERS_STEP, FIND_WORKERS_TO_REMOVE_STEP,

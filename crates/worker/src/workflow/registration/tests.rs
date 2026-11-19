@@ -18,6 +18,7 @@ fn settings(timeout_secs: u64, delay_secs: u64, interval_secs: u64) -> Registrat
         startup_timeout_secs: timeout_secs,
         startup_delay_secs: delay_secs,
         startup_check_interval_secs: interval_secs,
+        dp_aware: false,
     }
 }
 
@@ -146,4 +147,30 @@ fn the_metadata_read_waits_on_the_runtime_detection() {
     assert_eq!(step.depends_on, vec![StepId::new(DETECT_RUNTIME_STEP)]);
     assert_eq!(step.retry_policy.as_ref().unwrap().max_attempts, 3);
     assert_eq!(step.timeout, Some(Duration::from_secs(10)));
+}
+
+/// The DP read waits on the metadata read alone, whatever gate the host
+/// names. It fails the workflow when it fails, after three attempts of ten
+/// seconds each.
+#[test]
+fn the_dp_read_waits_on_the_metadata_read() {
+    for gates in [
+        RegistrationGates::default(),
+        RegistrationGates {
+            detection: Some(HOST_GATE_STEP),
+        },
+    ] {
+        let workflow = worker_registration_workflow::<RegistryHost>(&settings(300, 7, 5), gates);
+
+        let step = workflow
+            .steps
+            .iter()
+            .find(|step| step.id == StepId::new(DISCOVER_DP_STEP))
+            .unwrap();
+        assert_eq!(step.depends_on, vec![StepId::new(DISCOVER_METADATA_STEP)]);
+        assert_eq!(step.delay, None);
+        assert_eq!(step.retry_policy.as_ref().unwrap().max_attempts, 3);
+        assert_eq!(step.timeout, Some(Duration::from_secs(10)));
+        assert!(matches!(step.on_failure, FailureAction::FailWorkflow));
+    }
 }

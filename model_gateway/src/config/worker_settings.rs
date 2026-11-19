@@ -65,8 +65,8 @@ impl RouterConfig {
     }
 
     /// What the worker crate's registration steps read of this
-    /// configuration: the HTTP/2 switch, the health probe's timeout and the
-    /// three startup timings.
+    /// configuration: the HTTP/2 switch, the health probe's timeout, the
+    /// three startup timings and the DP switch.
     pub fn registration_settings(&self) -> RegistrationSettings {
         RegistrationSettings {
             upstream_http2: self.upstream_http2,
@@ -74,6 +74,7 @@ impl RouterConfig {
             startup_timeout_secs: self.worker_startup_timeout_secs,
             startup_delay_secs: self.worker_startup_delay_secs,
             startup_check_interval_secs: self.worker_startup_check_interval_secs,
+            dp_aware: self.dp_aware,
         }
     }
 }

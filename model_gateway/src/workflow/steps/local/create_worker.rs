@@ -1124,7 +1124,7 @@ fn attention_dp_width(labels: &HashMap<String, String>, size: usize) -> Option<u
 /// one dp-annotated worker per rank. A width-1 advertisement (older
 /// servicers emit it as a capability signal) and a missing one both
 /// register a plain worker: there is no placement to choose, and pinning
-/// rank 0 anyway still alters engine-side scheduling. discover_dp already
+/// rank 0 anyway still alters engine-side scheduling. The DP read already
 /// logged the degradation for the missing-label case.
 fn dp_rank_expansion(
     dp_info: Option<&DpInfo>,
@@ -2714,12 +2714,15 @@ mod rank_window_tests {
     use std::collections::HashMap;
 
     use smg_grpc_client::{engine_labels::ServerInfo, tokenspeed_proto};
-    use smg_worker::identity::basic::{merge_labels, ConnectionMode, Worker};
+    use smg_worker::{
+        identity::basic::{merge_labels, ConnectionMode, Worker},
+        workflow::dp_info_from_labels,
+    };
 
     use super::{dp_rank_expansion, labels_for_rank};
     use crate::{
         routers::grpc::backend_client::BasicWorkerBuilder,
-        workflow::steps::local::{discover_dp::dp_info_from_labels, test_support::labels_of},
+        workflow::steps::local::test_support::labels_of,
     };
 
     #[test]

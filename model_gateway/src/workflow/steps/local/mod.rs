@@ -1,5 +1,4 @@
 mod create_worker;
-mod discover_dp;
 mod ensure_harmony_encoding;
 mod find_worker_to_update;
 mod rediscover_labels;
@@ -16,7 +15,6 @@ mod zmq_labels;
 use std::{sync::Arc, time::Duration};
 
 pub use create_worker::CreateLocalWorkerStep;
-pub use discover_dp::{get_dp_info, DiscoverDPInfoStep};
 pub use ensure_harmony_encoding::EnsureHarmonyEncodingStep;
 pub use find_worker_to_update::FindWorkerToUpdateStep;
 use openai_protocol::worker::WorkerUpdateRequest;
