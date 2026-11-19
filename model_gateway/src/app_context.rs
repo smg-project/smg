@@ -54,7 +54,7 @@ use crate::{
     },
     server::http_client_builder,
     wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
-    workflow::{JobQueue, TokenizerLoadFailures, WorkflowEngines},
+    workflow::{data::RegistrationNotes, JobQueue, TokenizerLoadFailures, WorkflowEngines},
 };
 
 /// Error type for AppContext builder
@@ -227,12 +227,18 @@ pub struct AppContextBuilder {
 }
 
 /// The context hosts the worker crate's workflow steps: they read the
-/// registry through this and nothing else of the gateway.
+/// registry and the worker clients through this and nothing else of the
+/// gateway.
 impl WorkflowHost for AppContext {
     type Generation = ModelWorkerSnapshot;
+    type RegistrationNotes = RegistrationNotes;
 
     fn worker_registry(&self) -> &Arc<WorkerRegistry> {
         &self.worker_registry
+    }
+
+    fn worker_client_cache(&self) -> &WorkerHttpClientCache {
+        &self.worker_client_cache
     }
 }
 

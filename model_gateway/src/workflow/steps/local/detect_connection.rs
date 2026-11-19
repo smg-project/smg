@@ -8,14 +8,17 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use smg_worker::identity::{basic::ConnectionMode, endpoint::Endpoint};
+use smg_worker::{
+    identity::{basic::ConnectionMode, endpoint::Endpoint},
+    workflow::WorkerKind,
+};
 use tracing::{debug, info};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use crate::{
     app_context::AppContext,
     workflow::{
-        data::{require_app_context, WorkerKind, WorkerWorkflowData},
+        data::{require_app_context, WorkerWorkflowData},
         steps::util::{try_grpc_reachable, try_http_reachable},
     },
 };
@@ -116,7 +119,7 @@ impl StepExecutor<WorkerWorkflowData> for DetectConnectionModeStep {
             return Ok(StepResult::Skip);
         }
 
-        let app_context = require_app_context(context.data.app_context.as_ref())?.clone();
+        let app_context = require_app_context(context.data.host.as_ref())?.clone();
         let config = &context.data.config;
 
         let url = config.url.clone();

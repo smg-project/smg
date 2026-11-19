@@ -1,12 +1,25 @@
 //! The data the worker workflows pass from step to step.
 
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use serde::{Deserialize, Serialize};
-use wfaas::WorkflowData;
+use wfaas::{StepId, WorkflowData, WorkflowError, WorkflowResult};
 
-use super::{find_workers_to_remove::WorkerRemovalRequest, removal::WORKER_REMOVAL_WORKFLOW};
-use crate::identity::basic::Worker;
+use super::{
+    find_workers_to_remove::WorkerRemovalRequest,
+    host::{require_host, WorkflowHost},
+    registration::WORKER_REGISTRATION_WORKFLOW,
+    removal::WORKER_REMOVAL_WORKFLOW,
+};
+use crate::{
+    identity::basic::{ConnectionMode, Worker},
+    jobs::WorkerRegistrationMode,
+    model_card::ModelCard,
+    worker::WorkerSpec,
+};
 
 /// Wrapper for worker list that can be serialized
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -37,7 +50,8 @@ pub struct WorkerRemovalWorkflowData<H> {
     pub workers_to_remove: Option<WorkerList>,
     /// URLs of workers being removed
     pub worker_urls: Vec<String>,
-    /// Model IDs affected by the removal
+    /// Model IDs affected by the removal. The selection writes it; no step of
+    /// this crate reads it.
     pub affected_models: HashSet<String>,
     /// The host (transient, must be re-initialized after deserialization)
     #[serde(skip, default)]
@@ -89,3 +103,113 @@ impl<H: Send + Sync + 'static> WorkflowData for WorkerRemovalWorkflowData<H> {
         WORKER_REMOVAL_WORKFLOW
     }
 }
+
+/// What a registration adds: a worker this deployment runs, or an API another
+/// party serves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorkerKind {
+    /// An inference engine this deployment runs.
+    Local,
+    /// An API another party serves.
+    External,
+}
+
+/// What a worker reports of its data-parallel ranks.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DpInfo {
+    pub dp_size: usize,
+    pub model_id: String,
+}
+
+/// Data for the worker registration workflow, over the host `H` that runs it.
+///
+/// One workflow registers both kinds of worker. The host's first step sets
+/// `worker_kind`, and a step of one kind skips a worker of the other.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(bound = "")]
+pub struct WorkerRegistrationWorkflowData<H: WorkflowHost> {
+    pub config: WorkerSpec,
+    /// Defaults to upsert so persisted workflows from older versions preserve
+    /// their historical registration behavior when deserialized.
+    #[serde(default)]
+    pub registration_mode: WorkerRegistrationMode,
+    /// Which kind of worker this is, set by the host's first step.
+    pub worker_kind: Option<WorkerKind>,
+    // -- Local-only fields --
+    pub connection_mode: Option<ConnectionMode>,
+    /// HTTP workers: whether the host speaks HTTP/2 with prior knowledge to
+    /// the worker, resolved by the connection detection.
+    #[serde(default)]
+    pub http2: Option<bool>,
+    /// The worker-directed client for `http2` (transient; see
+    /// [`Self::http_client`]).
+    #[serde(skip, default)]
+    pub http_client_handle: Option<Arc<reqwest::Client>>,
+    pub detected_runtime_type: Option<String>,
+    pub discovered_labels: HashMap<String, String>,
+    pub dp_info: Option<DpInfo>,
+    /// What the host's own steps keep on this registration between them
+    /// (transient). No step of this crate reads or writes it.
+    #[serde(skip, default)]
+    pub host_notes: H::RegistrationNotes,
+    // -- External-only fields --
+    pub model_cards: Vec<ModelCard>,
+    // -- Shared fields --
+    pub workers: Option<WorkerList>,
+    pub final_labels: HashMap<String, String>,
+    /// The host (transient, must be re-initialized after deserialization)
+    #[serde(skip, default)]
+    pub host: Option<Arc<H>>,
+    /// Actual worker objects (transient, not serialized)
+    #[serde(skip, default)]
+    pub actual_workers: Option<Vec<Arc<dyn Worker>>>,
+}
+
+// By hand: the derive would ask `H: Clone`, and the host is shared, not copied.
+impl<H: WorkflowHost> Clone for WorkerRegistrationWorkflowData<H> {
+    fn clone(&self) -> Self {
+        Self {
+            config: self.config.clone(),
+            registration_mode: self.registration_mode.clone(),
+            worker_kind: self.worker_kind,
+            connection_mode: self.connection_mode,
+            http2: self.http2,
+            http_client_handle: self.http_client_handle.clone(),
+            detected_runtime_type: self.detected_runtime_type.clone(),
+            discovered_labels: self.discovered_labels.clone(),
+            dp_info: self.dp_info.clone(),
+            host_notes: self.host_notes.clone(),
+            model_cards: self.model_cards.clone(),
+            workers: self.workers.clone(),
+            final_labels: self.final_labels.clone(),
+            host: self.host.clone(),
+            actual_workers: self.actual_workers.clone(),
+        }
+    }
+}
+
+impl<H: WorkflowHost> WorkerRegistrationWorkflowData<H> {
+    /// The worker-directed client for the resolved HTTP version, re-fetched
+    /// from the host's cache when a deserialize dropped the transient handle.
+    pub fn http_client(&self, step_id: &str) -> WorkflowResult<Arc<reqwest::Client>> {
+        if let Some(client) = &self.http_client_handle {
+            return Ok(Arc::clone(client));
+        }
+        require_host(self.host.as_ref())?
+            .worker_client_cache()
+            .get(&self.config.http_pool, self.http2.unwrap_or(false))
+            .map_err(|message| WorkflowError::StepFailed {
+                step_id: StepId::new(step_id),
+                message,
+            })
+    }
+}
+
+impl<H: WorkflowHost> WorkflowData for WorkerRegistrationWorkflowData<H> {
+    fn workflow_type() -> &'static str {
+        WORKER_REGISTRATION_WORKFLOW
+    }
+}
+
+#[cfg(test)]
+mod tests;

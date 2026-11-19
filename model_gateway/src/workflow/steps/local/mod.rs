@@ -20,7 +20,7 @@ use std::{sync::Arc, time::Duration};
 pub use create_worker::CreateLocalWorkerStep;
 pub use detect_backend::DetectBackendStep;
 pub use detect_connection::DetectConnectionModeStep;
-pub use discover_dp::{get_dp_info, DiscoverDPInfoStep, DpInfo};
+pub use discover_dp::{get_dp_info, DiscoverDPInfoStep};
 pub use discover_metadata::DiscoverMetadataStep;
 pub use ensure_harmony_encoding::EnsureHarmonyEncodingStep;
 pub use find_worker_to_update::FindWorkerToUpdateStep;

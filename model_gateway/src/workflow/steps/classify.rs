@@ -11,14 +11,17 @@ use std::time::Duration;
 use async_trait::async_trait;
 use openai_protocol::worker::ProviderType;
 use reqwest::Client;
-use smg_worker::identity::{basic::RuntimeType, endpoint::Endpoint};
+use smg_worker::{
+    identity::{basic::RuntimeType, endpoint::Endpoint},
+    workflow::WorkerKind,
+};
 use tracing::debug;
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use super::util::{http_base_url, try_grpc_reachable, try_http_reachable};
 use crate::{
     routers::provider_support,
-    workflow::data::{require_app_context, WorkerKind, WorkerWorkflowData},
+    workflow::data::{require_app_context, WorkerWorkflowData},
 };
 
 /// Quick-probe timeout for classification. Deliberately short — the full
@@ -133,7 +136,7 @@ impl StepExecutor<WorkerWorkflowData> for ClassifyWorkerTypeStep {
         }
 
         // Unspecified + unknown URL — probe the endpoint
-        let app_context = require_app_context(context.data.app_context.as_ref())?;
+        let app_context = require_app_context(context.data.host.as_ref())?;
         let timeout = CLASSIFY_PROBE_TIMEOUT_SECS;
         let client = &app_context.client;
 

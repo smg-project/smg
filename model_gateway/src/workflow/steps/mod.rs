@@ -14,9 +14,9 @@ pub use external::{
 pub use local::{
     create_worker_removal_workflow, create_worker_removal_workflow_data,
     create_worker_update_workflow, create_worker_update_workflow_data, CreateLocalWorkerStep,
-    DetectConnectionModeStep, DiscoverDPInfoStep, DiscoverMetadataStep, DpInfo,
-    FindWorkerToUpdateStep, ReleaseTokenizerStep, RemoveFromPolicyRegistryStep,
-    UpdatePoliciesForWorkerStep, UpdateRemainingPoliciesStep, UpdateWorkerPropertiesStep,
+    DetectConnectionModeStep, DiscoverDPInfoStep, DiscoverMetadataStep, FindWorkerToUpdateStep,
+    ReleaseTokenizerStep, RemoveFromPolicyRegistryStep, UpdatePoliciesForWorkerStep,
+    UpdateRemainingPoliciesStep, UpdateWorkerPropertiesStep,
 };
 use local::{
     DetectBackendStep, DiscoverDPInfoStep as DPStep, EnsureHarmonyEncodingStep,
@@ -33,7 +33,7 @@ use wfaas::{BackoffStrategy, FailureAction, RetryPolicy, StepDefinition, Workflo
 use crate::{
     app_context::AppContext,
     config::RouterConfig,
-    workflow::data::{WorkerRegistrationMode, WorkerWorkflowData},
+    workflow::data::{RegistrationNotes, WorkerRegistrationMode, WorkerWorkflowData},
 };
 
 /// Create the unified worker registration workflow definition.
@@ -294,11 +294,11 @@ pub fn create_worker_workflow_data(
         detected_runtime_type: None,
         discovered_labels: std::collections::HashMap::new(),
         dp_info: None,
-        symphony_table: None,
+        host_notes: RegistrationNotes::default(),
         model_cards: Vec::new(),
         workers: None,
         final_labels: std::collections::HashMap::new(),
-        app_context: Some(app_context),
+        host: Some(app_context),
         actual_workers: None,
     }
 }

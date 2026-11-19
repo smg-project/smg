@@ -5,19 +5,15 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use openai_protocol::{worker::WorkerSpec, UNKNOWN_MODEL_ID};
 use reqwest::Client;
-use smg_worker::identity::{basic::ConnectionMode, endpoint::Endpoint};
+use smg_worker::{
+    identity::{basic::ConnectionMode, endpoint::Endpoint},
+    workflow::{DpInfo, WorkerKind},
+};
 use tracing::{debug, warn};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use super::discover_metadata::get_server_info;
-use crate::workflow::data::{WorkerKind, WorkerWorkflowData};
-
-/// DP (Data Parallel) information for a worker.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct DpInfo {
-    pub dp_size: usize,
-    pub model_id: String,
-}
+use crate::workflow::data::WorkerWorkflowData;
 
 /// Get DP info for a worker URL.
 pub async fn get_dp_info(
@@ -124,7 +120,7 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverDPInfoStep {
         let config = &context.data.config;
         let app_context = context
             .data
-            .app_context
+            .host
             .as_ref()
             .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
 

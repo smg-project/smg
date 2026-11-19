@@ -7,12 +7,13 @@
 //! non-gpt-oss and HTTP workers skip.
 
 use async_trait::async_trait;
+use smg_worker::workflow::WorkerKind;
 use tracing::info;
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use crate::{
     routers::grpc::harmony::{try_harmony_encoding, HarmonyDetector},
-    workflow::data::{WorkerKind, WorkerWorkflowData},
+    workflow::data::WorkerWorkflowData,
 };
 
 pub struct EnsureHarmonyEncodingStep;

@@ -19,11 +19,11 @@ use smg_worker::{
         metadata::join_base,
     },
     labels::SUPPORTS_VISION_LABEL,
+    workflow::{DpInfo, WorkerKind},
 };
 use tracing::{debug, warn};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
-use super::discover_dp::DpInfo;
 use crate::{
     admin::worker_service::{control_character_refusal, logged_strings},
     config::ParserChoice,
@@ -41,7 +41,7 @@ use crate::{
             zmq_client::zmq_handshake_address,
         },
     },
-    workflow::data::{WorkerKind, WorkerRegistrationMode, WorkerWorkflowData},
+    workflow::data::{WorkerRegistrationMode, WorkerWorkflowData},
 };
 
 /// Step 3: Create worker object(s) with merged configuration + metadata.
@@ -60,7 +60,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
         let config = &context.data.config;
         let app_context = context
             .data
-            .app_context
+            .host
             .as_ref()
             .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
         let connection_mode =
@@ -281,7 +281,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
         // names are, and published by the registration step once the worker
         // is in the registry, so a registration refused there leaves no
         // series behind.
-        context.data.symphony_table = symphony_table_of(
+        context.data.host_notes.symphony_table = symphony_table_of(
             &model_card,
             app_context.router_config.parser,
             *connection_mode,
@@ -1268,7 +1268,7 @@ mod tests {
             CreateLocalWorkerStep.execute(&mut ctx).await.unwrap(),
             StepResult::Success
         );
-        assert_eq!(ctx.data.symphony_table, Some("qwen3"));
+        assert_eq!(ctx.data.host_notes.symphony_table, Some("qwen3"));
         assert!(RegisterWorkersStep.execute(&mut ctx).await.is_err());
         assert!(
             !handle.render().contains("smg_symphony_"),
@@ -1282,7 +1282,7 @@ mod tests {
             CreateLocalWorkerStep.execute(&mut ctx).await.unwrap(),
             StepResult::Success
         );
-        assert_eq!(ctx.data.symphony_table, Some("qwen3"));
+        assert_eq!(ctx.data.host_notes.symphony_table, Some("qwen3"));
         assert_eq!(
             RegisterWorkersStep.execute(&mut ctx).await.unwrap(),
             StepResult::Success

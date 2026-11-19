@@ -298,7 +298,7 @@ A port is a trait this crate calls and a host implements.
 | `RequestCompletionSink` | `identity::basic` | What to do when a request on a worker ends. | The sink its policy registry installs. |
 | `KvEventSink` | `kv_events::port` | What to do with the KV cache events a worker's stream brings: keep each rank's cursor, apply what it admits, and drop a worker's blocks when it leaves. | The sink over its KV indexes. |
 | `KvEventHost` | `kv_events` | What a worker's events subscription feeds: the sink its task opens, and what goes when a model's last events subscription is gone. | Its index side: the models' KV indexes. |
-| `WorkflowHost` | `workflow` | What the steps of a worker workflow read of their host: its registry. | Its application context. |
+| `WorkflowHost` | `workflow` | What the steps of a worker workflow read of their host: its registry and its worker clients. It also names the type of the notes a host keeps on a registration. | Its application context. |
 
 A host must write two of them: `Generation`, to have a registry, and
 `LoadConsumer`, to run the load monitor over the crate's own sink. A host

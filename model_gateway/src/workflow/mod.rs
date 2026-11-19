@@ -13,7 +13,7 @@ pub mod wasm_module_removal;
 // Typed workflow data structures
 pub use data::{
     McpWorkflowData, ProtocolUpdateRequest, TokenizerWorkflowData, WasmRegistrationWorkflowData,
-    WasmRemovalWorkflowData, WorkerKind, WorkerRegistrationData, WorkerRegistrationMode,
+    WasmRemovalWorkflowData, WorkerRegistrationData, WorkerRegistrationMode,
     WorkerRemovalWorkflowData, WorkerSpec, WorkerUpdateWorkflowData, WorkerWorkflowData,
 };
 // Typed workflow engines
@@ -49,7 +49,6 @@ pub use steps::{
     DiscoverDPInfoStep,
     DiscoverMetadataStep,
     DiscoverModelsStep,
-    DpInfo,
     // Update steps
     FindWorkerToUpdateStep,
     ModelInfo,

@@ -13,13 +13,14 @@ use smg_worker::{
         sampling_defaults::{SamplingDefaults, DEFAULT_SAMPLING_PARAMS_LABEL},
     },
     labels::flat_labels,
+    workflow::WorkerKind,
 };
 use tool_parser::GrammarStart;
 use tracing::{debug, warn};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use crate::workflow::{
-    data::{WorkerKind, WorkerWorkflowData},
+    data::WorkerWorkflowData,
     steps::{
         local::create_worker::resolve_model_id,
         util::{connect_grpc_as, grpc_base_url, http_base_url},
@@ -613,7 +614,7 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverMetadataStep {
             ConnectionMode::Zmq => {
                 let router_model = context
                     .data
-                    .app_context
+                    .host
                     .as_ref()
                     .and_then(|app| app.router_config.model_path.clone());
                 let model = zmq_model(router_model, resolve_model_id(config, &config.labels));

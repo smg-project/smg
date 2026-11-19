@@ -12,13 +12,16 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use reqwest::Client;
-use smg_worker::identity::{basic::ConnectionMode, endpoint::Endpoint};
+use smg_worker::{
+    identity::{basic::ConnectionMode, endpoint::Endpoint},
+    workflow::WorkerKind,
+};
 use tracing::{debug, warn};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use super::discover_metadata::ModelsResponse;
 use crate::workflow::{
-    data::{require_app_context, WorkerKind, WorkerWorkflowData},
+    data::{require_app_context, WorkerWorkflowData},
     steps::util::{grpc_base_url, grpc_health_answer, http_base_url},
 };
 
@@ -281,7 +284,7 @@ impl StepExecutor<WorkerWorkflowData> for DetectBackendStep {
             context.data.connection_mode.as_ref().ok_or_else(|| {
                 WorkflowError::ContextValueNotFound("connection_mode".to_string())
             })?;
-        let app_context = require_app_context(context.data.app_context.as_ref())?;
+        let app_context = require_app_context(context.data.host.as_ref())?;
 
         let timeout = config
             .health
