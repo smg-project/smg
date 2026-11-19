@@ -50,12 +50,13 @@ pub(crate) mod follower;
     not(test),
     expect(
         dead_code,
-        reason = "the regular routers place through the host in the next change"
+        reason = "the request's end and the pair's routers call the rest in later changes"
     )
 )]
 pub(crate) mod host;
 mod undecided;
 
+pub(crate) use undecided::refused;
 use undecided::Undecided;
 
 /// Why the controller's store did not start.

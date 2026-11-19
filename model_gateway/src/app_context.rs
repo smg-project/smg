@@ -41,6 +41,7 @@ use crate::{
     policy_controller::{
         self,
         follower::{Follower, Settings},
+        host::Host,
     },
     rate_limit::RateLimitManager,
     rl_adapter,
@@ -142,6 +143,9 @@ pub struct AppContext {
     pub policy_store: Option<Arc<MemoryStore>>,
     /// The worker watch, owned by the context until server teardown.
     pub(crate) policy_follower: Option<Arc<Mutex<Option<Follower>>>>,
+    /// The policy controller's host. Routers ask it for placement wherever
+    /// the policy store is present.
+    pub(crate) policy_host: Option<Arc<Host>>,
     /// RL control plane state; `None` unless `router_config.rl.enabled`.
     pub rl: Option<Arc<smg_rl::RlState>>,
     pub realtime_registry: Arc<RealtimeRegistry>,
@@ -623,6 +627,10 @@ impl AppContextBuilder {
         );
 
         let rl = rl_adapter::build_rl_state(&worker_registry, &worker_client_cache, &router_config);
+        let policy_host = self
+            .policy_store
+            .as_ref()
+            .map(|store| Arc::new(Host::new(Arc::clone(store), Arc::clone(&worker_registry))));
 
         Ok(AppContext {
             gateway_auth,
@@ -672,6 +680,7 @@ impl AppContextBuilder {
             kv_event_monitor: self.kv_event_monitor,
             policy_store: self.policy_store,
             policy_follower: self.policy_follower,
+            policy_host,
             rl,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: self.webrtc_bind_addr,
@@ -1818,6 +1827,7 @@ pub(crate) mod testing {
             kv_event_monitor: None,
             policy_store: None,
             policy_follower: None,
+            policy_host: None,
             rl: None,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: None,

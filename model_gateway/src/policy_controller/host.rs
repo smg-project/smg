@@ -24,7 +24,14 @@
 //! status as its probes read it, and its circuit breaker. The overload and
 //! stall vetoes are the controller's, read from its rows.
 
-use std::{fmt, sync::Arc, time::Instant};
+use std::{
+    fmt,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Instant,
+};
 
 use axum::{
     http::{header::RETRY_AFTER, HeaderValue},
@@ -117,6 +124,13 @@ fn profile_of(decision: &Decision) -> Option<u16> {
         }
         _ => Some(decision.trace().profile),
     }
+}
+
+/// The next ask's process-local number, in eight bytes. The gateway assigns
+/// it independently of any request id supplied by a client.
+pub(crate) fn mark() -> [u8; 8] {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    NEXT.fetch_add(1, Ordering::Relaxed).to_be_bytes()
 }
 
 /// What an attempt states of its request.

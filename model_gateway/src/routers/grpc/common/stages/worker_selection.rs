@@ -30,6 +30,10 @@ use crate::{
         hash_ring::HashRing, policy_reads_hash_ring, CacheNamespace, LoadBalancingPolicy,
         PolicyRegistry, SelectWorkerInfo, WorkerRole,
     },
+    policy_controller::{
+        self,
+        host::{self, Ask, Host, Placed},
+    },
     routers::{
         common::{
             pair_index::{PdPairIndex, PdWire},
@@ -124,6 +128,7 @@ pub(crate) const SELECTION_QUEUE_TIMEOUT_ERROR_CODE: &str = "selection_queue_tim
 pub(crate) struct WorkerSelectionStage {
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
+    host: Option<Arc<Host>>,
     mode: WorkerSelectionMode,
     prefill_admission: Option<Arc<PrefillAdmission>>,
     /// The longest a request may have waited inside the gateway when it
@@ -151,10 +156,17 @@ impl WorkerSelectionStage {
         Self {
             worker_registry,
             policy_registry,
+            host: None,
             mode,
             prefill_admission,
             queue_timeout: None,
         }
+    }
+
+    /// Use the controller's host for regular selection when configured.
+    pub(crate) fn with_host(mut self, host: Option<Arc<Host>>) -> Self {
+        self.host = host;
+        self
     }
 
     /// Refuse a request that reaches selection more than `timeout` after the
@@ -529,7 +541,7 @@ impl WorkerSelectionStage {
             .map(str::to_string);
         ctx.state.routing_snapshot = Some(inputs.snapshot());
 
-        let (workers, prefill_guard) = self.pick(ctx, accepted, &inputs).await?;
+        let (workers, prefill_guard, placed) = self.pick(ctx, accepted, &inputs).await?;
         if let Some(guard) = prefill_guard {
             ctx.state.pd_prefill_guard = Some(guard);
         }
@@ -573,19 +585,20 @@ impl WorkerSelectionStage {
         }
 
         ctx.state.workers = Some(workers);
+        ctx.state.placed = placed;
         Ok(())
     }
 
     /// The mode's pick over the gathered inputs: the single worker that
-    /// meets every demand, or the pair admitted within the queue budget (with
-    /// the encode assignments in EPD mode) and the Prefill admission slot it
-    /// holds.
+    /// meets every demand with any controller placement, or the pair
+    /// admitted within the queue budget with its prefill slot and any
+    /// encode assignments.
     async fn pick(
         &self,
         ctx: &RequestContext,
         accepted: Option<Instant>,
         inputs: &SelectionInputs<'_>,
-    ) -> Result<(WorkerSelection, Option<PrefillLoadGuard>), Response> {
+    ) -> Result<(WorkerSelection, Option<PrefillLoadGuard>, Option<Placed>), Response> {
         let model_id = inputs.model_id;
         let media = inputs.media;
         let context_requirements = inputs.context_requirements;
@@ -595,27 +608,20 @@ impl WorkerSelectionStage {
         let sticky_key = ctx.state.sticky_key.as_deref();
         match self.mode {
             WorkerSelectionMode::Regular => {
-                match self.select_regular(
-                    model_id,
-                    context_requirements,
-                    media,
-                    None,
-                    inputs.text,
-                    inputs.tokens(),
-                    inputs.headers,
-                    inputs.rid_key.as_deref(),
-                    inputs.cache_namespace,
-                    wire,
-                    &[],
-                ) {
-                    Some(w) => Ok((WorkerSelection::Single { worker: w }, None)),
-                    None => Err(self.context_selection_failure(
+                let (worker, placed) = self
+                    .select_regular_attempt(
                         model_id,
-                        wire,
-                        media,
                         context_requirements,
-                    )),
-                }
+                        media,
+                        wire,
+                        PlacementInputs {
+                            candidate_filter: None,
+                            ..placement
+                        },
+                        RegularAttempt::First(ctx),
+                    )
+                    .await?;
+                Ok((WorkerSelection::Single { worker }, None, placed))
             }
             WorkerSelectionMode::PrefillDecode => {
                 let (pair, guard) = self
@@ -632,7 +638,7 @@ impl WorkerSelectionStage {
                         ),
                     )
                     .await?;
-                Ok((disaggregated(pair), Some(guard)))
+                Ok((disaggregated(pair), Some(guard), None))
             }
             WorkerSelectionMode::EncodePrefillDecode => {
                 let hashes = if let Some(plan) = ctx.state.multimodal_refs.as_ref() {
@@ -695,6 +701,7 @@ impl WorkerSelectionStage {
                         runtime_type,
                     },
                     Some(guard),
+                    None,
                 ))
             }
         }
@@ -775,31 +782,28 @@ impl WorkerSelectionStage {
                 && decided_on.is_none_or(|decoding| decoding.decides_alike(worker))
         };
 
-        let workers = match self.mode {
+        let (workers, placed) = match self.mode {
             WorkerSelectionMode::Regular => {
-                match self.select_regular(
-                    model_id,
-                    context_requirements,
-                    media,
-                    Some(&admits),
+                let inputs = PlacementInputs {
                     text,
                     tokens,
                     headers,
                     rid_key,
                     cache_namespace,
-                    wire,
-                    &ctx.tried,
-                ) {
-                    Some(w) => WorkerSelection::Single { worker: w },
-                    None => {
-                        return Err(self.context_selection_failure(
-                            model_id,
-                            wire,
-                            media,
-                            context_requirements,
-                        ))
-                    }
-                }
+                    candidate_filter: Some(&admits),
+                    tried: &ctx.tried,
+                };
+                let (worker, placed) = self
+                    .select_regular_attempt(
+                        model_id,
+                        context_requirements,
+                        media,
+                        wire,
+                        inputs,
+                        RegularAttempt::Retry(ctx),
+                    )
+                    .await?;
+                (WorkerSelection::Single { worker }, placed)
             }
             WorkerSelectionMode::PrefillDecode | WorkerSelectionMode::EncodePrefillDecode => {
                 let pinned = |worker: &dyn Worker| media.accepts_refs(worker) && admits(worker);
@@ -834,11 +838,12 @@ impl WorkerSelectionStage {
                     )
                     .await?;
                 ctx.pd_prefill_guard = Some(guard);
-                disaggregated(pair)
+                (disaggregated(pair), None)
             }
         };
 
         ctx.workers = Some(workers);
+        ctx.placed = placed;
         Ok(())
     }
 
@@ -1103,6 +1108,41 @@ fn pair_admitted_by(
                 .iter()
                 .any(|decode| admitted(decode) && decode.metadata().spec.runtime_type == runtime)
         })
+}
+
+/// The request state still available when a regular attempt selects.
+enum RegularAttempt<'a> {
+    First(&'a RequestContext),
+    Retry(&'a DispatchContext),
+}
+
+impl<'a> RegularAttempt<'a> {
+    /// The facts still available for the controller's ask, under the
+    /// gateway's own `id` for it. Nothing a client sent names an ask.
+    fn ask(self, model: &'a str, id: &'a [u8]) -> Ask<'a> {
+        let (streaming, tried) = match self {
+            Self::First(ctx) => (ctx.is_streaming(), &[][..]),
+            Self::Retry(ctx) => (ctx.streaming, &ctx.tried_rows[..]),
+        };
+        Ask {
+            id,
+            model,
+            streaming,
+            tried,
+            hashes: None,
+        }
+    }
+}
+
+/// The regular route's rule at the controller's commit: a worker this
+/// pipeline sends to, on the request's wire. The controller reads no
+/// connection and no wire, so a target off either is passed over like one
+/// the gateway cannot send to. A demand the controller keeps ahead of its
+/// stages takes this function's place once a request can state it.
+fn on_route(wire: Option<WireConstraint>) -> impl Fn(&dyn Worker) -> bool + Send + Sync {
+    move |worker| {
+        worker.connection_mode().uses_grpc_pipeline() && WireConstraint::admits(wire, worker)
+    }
 }
 
 /// What a request's media demands of a regular-mode candidate, beyond the
@@ -1701,6 +1741,66 @@ impl WorkerSelectionStage {
             model_id,
             self.worker_registry.overload_shed_enabled(),
         )
+    }
+
+    /// Place a regular attempt through the configured host or the classic policies.
+    async fn select_regular_attempt(
+        &self,
+        model_id: &str,
+        context: ContextRequirements,
+        media: MediaDemands,
+        wire: Option<WireConstraint>,
+        inputs: PlacementInputs<'_>,
+        attempt: RegularAttempt<'_>,
+    ) -> Result<(Arc<dyn Worker>, Option<Placed>), Response> {
+        let no_worker = || self.context_selection_failure(model_id, wire, media, context);
+        let Some(host) = self.host.as_ref() else {
+            return self
+                .select_regular(
+                    model_id,
+                    context,
+                    media,
+                    inputs.candidate_filter,
+                    inputs.text,
+                    inputs.tokens,
+                    inputs.headers,
+                    inputs.rid_key,
+                    inputs.cache_namespace,
+                    wire,
+                    inputs.tried,
+                )
+                .map(|worker| (worker, None))
+                .ok_or_else(no_worker);
+        };
+
+        // The store builds the candidates and reads none of these demands.
+        // The commit's rule only passes a target over, and a demand few
+        // workers meet could end the asks with no worker. So these shapes
+        // are refused by name until a request can state them.
+        if media != MediaDemands::NONE {
+            return Err(policy_controller::refused("media input"));
+        }
+        let demand = context.left_by(
+            &self.worker_registry.get_routing_snapshot(model_id),
+            &[RoutingPool::GrpcPipelineRegular],
+            model_id,
+        );
+        if !demand.binds_nobody() {
+            return Err(policy_controller::refused(
+                "a context demand a worker's window binds",
+            ));
+        }
+        if matches!(attempt, RegularAttempt::Retry(ctx) if ctx.constraint_decided_on.is_some()) {
+            return Err(policy_controller::refused("a retry under a decoding rule"));
+        }
+
+        let id = host::mark();
+        let ask = attempt.ask(model_id, &id);
+        let placed = host
+            .place_where(&ask, on_route(wire), Instant::now())
+            .await
+            .map_err(|unplaced| unplaced.answer(model_id))?;
+        Ok((Arc::clone(placed.worker()), Some(placed)))
     }
 
     /// One attempt's single worker from the regular pool. One snapshot
@@ -2423,6 +2523,7 @@ impl SelectionBench {
 #[cfg(test)]
 mod tests {
     mod lora;
+    mod policy_controller;
 
     use std::{
         collections::HashMap,
@@ -3653,6 +3754,7 @@ mod tests {
             attempt: 0,
             ledger: AttemptLedger::default(),
             tried: Vec::new(),
+            tried_rows: Box::default(),
             model_id: model_id.to_string(),
             dispatch_model: model_id.to_string(),
             streaming: false,
@@ -3671,6 +3773,7 @@ mod tests {
             constraint_decided_on: None,
             tokenizer: None,
             workers: None,
+            placed: None,
             sticky_key: None,
             clients: None,
             encode_outputs: None,

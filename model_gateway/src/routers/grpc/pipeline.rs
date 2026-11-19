@@ -81,6 +81,7 @@ use crate::{
         metrics::{bool_to_static_str, metrics_labels, Metrics},
     },
     policies::PolicyRegistry,
+    policy_controller::host::Host,
     rate_limit::{RateLimitManager, UsageSettlement},
     routers::{
         common::{
@@ -118,6 +119,7 @@ pub(crate) enum Endpoint {
 pub(crate) struct PipelineDeps {
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
+    pub(super) host: Option<Arc<Host>>,
     prefill_admission: Option<Arc<PrefillAdmission>>,
     tool_parser_factory: ToolParserFactory,
     reasoning_parser_factory: ReasoningParserFactory,
@@ -159,6 +161,7 @@ impl PipelineDeps {
         Self {
             worker_registry,
             policy_registry,
+            host: None,
             prefill_admission,
             tool_parser_factory,
             reasoning_parser_factory,
@@ -183,6 +186,7 @@ impl PipelineDeps {
         Self {
             worker_registry,
             policy_registry,
+            host: None,
             prefill_admission,
             tool_parser_factory: ToolParserFactory::default(),
             reasoning_parser_factory: ReasoningParserFactory::default(),
@@ -272,6 +276,7 @@ impl PipelineDeps {
         Self {
             worker_registry: Arc::new(WorkerRegistry::new()),
             policy_registry: Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+            host: None,
             prefill_admission: None,
             tool_parser_factory: ToolParserFactory::default(),
             reasoning_parser_factory: ReasoningParserFactory::default(),
@@ -352,6 +357,7 @@ impl RequestPipeline {
             mode.worker_selection(),
             deps.prefill_admission.clone(),
         )
+        .with_host(deps.host.clone())
         .with_queue_timeout(deps.queue_timeout);
         let plan_settings = mode.plan_settings();
         let encode = matches!(mode, Mode::EncodePrefillDecode).then(EncodeStage::new);
@@ -683,10 +689,9 @@ impl RequestPipeline {
     /// iteration, so the pipeline is not where that turn is counted);
     /// `retry_config` enables the dispatch-phase retry loop.
     ///
-    /// The run is boxed once, here: it holds ingress + per-attempt state
-    /// across awaits. The 2.5 KiB context comes in a box of its own, so every
-    /// hop from the entry point into this future moves a pointer; by value,
-    /// each hop copied the context whole.
+    /// The run is boxed once, here. It holds ingress and per-attempt state
+    /// across awaits. The ingress context comes in a box of its own, so every
+    /// hop from the entry point into this future moves a pointer.
     fn run<'a>(
         &'a self,
         ctx: Box<RequestContext>,
@@ -801,7 +806,7 @@ impl RequestPipeline {
                 // the backoff window (a fresh context dropped them here before).
                 // This releases its PD admission claim too, so the retry is not
                 // queued behind its own predecessor's bootstrap rooms.
-                dctx.load_guards = None;
+                dctx.release_attempt();
                 dctx.pd_prefill_guard = None;
                 // A worker's definitive answer closes the retry window on that
                 // worker: the next attempt goes to another available worker, or
