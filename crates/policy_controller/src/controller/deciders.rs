@@ -1175,10 +1175,13 @@ type Read<'a> = (
 /// generation reads of them. `decide`'s answer comes back with the build
 /// its rows were read by, `None` where no member serves the model.
 ///
-/// A request whose profile reads the affinity column and takes a sample is
+/// A request whose profile reads the affinity column by its own stages is
 /// handed no column: the rows the store names for it stand in the column's
-/// place ([`World::name`]), at most that sample of each list
-/// ([`Engine::named_for`](crate::framework::Engine::named_for)).
+/// place ([`World::name`]), at most its sample of each list, and every
+/// holder and every warming row where it takes none
+/// ([`Engine::named_for`](crate::framework::Engine::named_for)). The
+/// naming is the store's one reader of its index: the column it builds
+/// holds a row's age and no holder.
 fn hand<R>(
     world: &World,
     taken: &Taken<'_>,
@@ -1205,12 +1208,14 @@ fn hand<R>(
     // What the decision's profile reads, and whether it shows its rows to
     // a plugin.
     let (needs, shown) = engine.reads_for(model, phase);
-    // A profile whose picker takes a sample is handed the rows the store
-    // names in the column's place, capped by that sample, and no column.
-    // The deciding profile answers for itself: the needs are merged over
-    // a pair's two phases and a sessions rule, so they say only where to
-    // ask, and no other decision pays the second walk.
-    let cap = if needs.affinity && needs.sample > 0 {
+    // A profile whose own stages read the column is handed the rows the
+    // store names in the column's place, and no column: a stage that
+    // reads holders is fed them, whatever the picker's sample. The sample
+    // caps the rows named, and a profile that takes none is named every
+    // one. The deciding profile answers for itself: the needs are merged
+    // over a pair's two phases and a sessions rule, so they say only
+    // where to ask, and no other decision pays the second walk.
+    let cap = if needs.affinity {
         engine.named_for(model, phase)
     } else {
         0
@@ -3826,8 +3831,9 @@ pub(crate) mod tests {
             (named.column, named.named, named.pool),
             (0, Some((0, 0)), (3, 2))
         );
-        // A profile that declares the column and takes no sample is handed
-        // one entry a candidate, and no other profile is.
+        // A profile whose own stages read the column and whose picker takes
+        // no sample is named too, under no cap: no column, and here nobody
+        // to name.
         let mut document = PolicySpec::preset("cache_aware").expect("a preset of this build");
         document.generation = 3;
         for profile in document.profiles.values_mut() {
@@ -3836,10 +3842,10 @@ pub(crate) mod tests {
         store
             .apply(applied(&document))
             .expect("above the standing one");
-        let column = handed(&store, frame(1, 1), OTHER, now);
+        let whole = handed(&store, frame(1, 1), OTHER, now);
         assert_eq!(
-            (column.column, column.named, column.pool),
-            (3, None, (3, 3))
+            (whole.column, whole.named, whole.pool),
+            (0, Some((0, 0)), (3, 3))
         );
     }
 
@@ -4094,9 +4100,9 @@ pub(crate) mod tests {
 
     /// A decode decision of a model that also pairs is decided by its own
     /// profile, and the hand reads that profile's sample: it caps the rows
-    /// it names by it, and a profile that takes none keeps its column. So
-    /// does one whose own stages read no column, and one whose warm-up
-    /// stages rule by different numbers. The needs of its workers' stream
+    /// it names by it, and a profile that takes none is named every row.
+    /// One whose own stages read no column keeps its column, and so does
+    /// one whose warm-up stages rule by different numbers. The needs of its workers' stream
     /// carry the pair's decode side, which reads the column and samples
     /// sixteen here.
     #[test]
@@ -4105,18 +4111,20 @@ pub(crate) mod tests {
 
         // What the hand gives a decode request asked alone under `pick`:
         // the holders named with the rows handed, and the column's length.
+        // The pair's profile is the document's first, so the cap of the
+        // profile that decides is not the first the engine keeps.
         let handed = |score: &str, pick: &str, (own, named, ruled): (u32, u32, bool)| {
             let document: PolicySpec = serde_json::from_str(&format!(
                 r#"{{
                   "apiVersion": "smg.policy/v1",
                   "generation": 1,
                   "profiles": {{
-                    "alone": {{ "score": [{score}], "pick": {pick} }},
-                    "wide": {{ "score": ["prefix-affinity"], "pick": {{ "best": {{ "sample": 16 }} }} }}
+                    "pair": {{ "score": ["prefix-affinity"], "pick": {{ "best": {{ "sample": 16 }} }} }},
+                    "solo": {{ "score": [{score}], "pick": {pick} }}
                   }},
                   "bindings": [
-                    {{ "match": {{ "phase": ["decode"] }}, "profile": "alone" }},
-                    {{ "plan": "pd-pair", "profiles": {{ "prefill": "wide", "decode": "wide" }} }}
+                    {{ "match": {{ "phase": ["decode"] }}, "profile": "solo" }},
+                    {{ "plan": "pd-pair", "profiles": {{ "prefill": "pair", "decode": "pair" }} }}
                   ]
                 }}"#
             ))
@@ -4165,9 +4173,11 @@ pub(crate) mod tests {
         let affinity = r#""prefix-affinity""#;
         let four = r#"{ "best": { "sample": 4 } }"#;
         assert_eq!(handed(affinity, four, (4, 4, false)), (Some((4, 20)), 0));
-        // No sample: the column, an entry a row, and no row named. Lists
-        // capped at the pair's sample would hide holders from its pass.
-        assert_eq!(handed(affinity, r#""best""#, (0, 0, false)), (None, 20));
+        // No sample: every one of the twenty holders is named, and no
+        // column. Lists capped at the pair's sample would hide holders from
+        // its pass.
+        let all = (0, u32::MAX, false);
+        assert_eq!(handed(affinity, r#""best""#, all), (Some((20, 20)), 0));
         // A sample and no stage of its own that reads the column: the
         // pair's needs alone ask for it, and the profile is named no row.
         assert_eq!(handed(r#""least-load""#, four, (4, 0, false)), (None, 20));
@@ -4178,6 +4188,156 @@ pub(crate) mod tests {
         assert_eq!(handed(one, four, (4, 4, true)), (Some((4, 20)), 0));
         let two = r#"{ "warmup-slice": { "secs": 30 } }, { "warmup-slice": { "secs": 90 } }"#;
         assert_eq!(handed(two, four, (4, 0, false)), (None, 20));
+    }
+
+    /// A stage that reads holders is fed them served, whatever its picker's
+    /// sample: under a profile that ranks by the prefix and takes no sample
+    /// a request goes to the one member that holds its block, among
+    /// members that hold other blocks and nothing in flight. A request
+    /// for a block nobody holds reads no holder, and its seeds spread it.
+    #[test]
+    fn a_profile_that_takes_no_sample_reads_its_requests_holder_served() {
+        let document: PolicySpec = serde_json::from_str(
+            r#"{
+              "apiVersion": "smg.policy/v1",
+              "generation": 1,
+              "profiles": { "p": { "score": ["prefix-affinity"], "pick": "best" } },
+              "bindings": [{ "profile": "p" }]
+            }"#,
+        )
+        .expect("a document of this build");
+        let store = MemoryStore::new();
+        store
+            .apply(applied(&document))
+            .expect("above the unbound start");
+        // Eight ready members, each holding a block of its own: the sixth
+        // holds the request's.
+        let members: Vec<WorkerId> = (0..8u64)
+            .map(|n| {
+                let facts = WorkerFacts {
+                    wire_modes: WireModes::HTTP,
+                    ..WorkerFacts::default()
+                };
+                let block = if n == 5 { 1 } else { 100 + n };
+                let id = held_by(&store, &format!("w{n}"), facts, &[block]);
+                let row = WorkersStore::get(&store, id).expect("the row");
+                store
+                    .set_status(id, WorkerStatus::Ready, row.revision)
+                    .expect("the row stands");
+                id
+            })
+            .collect();
+        store.publish_now();
+        let now = Instant::now() + Duration::from_secs(3);
+        let asked = |block: u64, seed: u64| {
+            let mut frame = frame(1, seed);
+            let facts = frame.facts.as_mut().expect("the case's frame has facts");
+            facts.block_hashes = vec![block];
+            facts.hash_kind = proto::HashKind::Text.into();
+            decided(&store, frame, now, &[]).1
+        };
+        let held = (1..=32).filter(|&seed| asked(1, seed) == Some(members[5]));
+        assert_eq!(
+            held.count(),
+            32,
+            "decisions that go to the block's one holder"
+        );
+        let spread: BTreeSet<Option<WorkerId>> = (1..=32).map(|seed| asked(999, seed)).collect();
+        assert!(spread.len() > 1, "a block nobody holds: {spread:?}");
+    }
+
+    /// One document, one pool, one answer on both feeds: served, the rows
+    /// named under no cap decide as a column a host fills from them. Twenty
+    /// of twenty-eight members hold the request's first block, more than
+    /// any sample names, and eight of those its second: every one is named
+    /// with its depth, and each seed's pick is one of the deepest holders
+    /// on either feed.
+    #[test]
+    fn rows_named_under_no_cap_decide_as_the_column_filled_from_them() {
+        let document: PolicySpec = serde_json::from_str(
+            r#"{
+              "apiVersion": "smg.policy/v1",
+              "generation": 1,
+              "profiles": { "p": { "score": ["prefix-affinity"], "pick": "best" } },
+              "bindings": [{ "profile": "p" }]
+            }"#,
+        )
+        .expect("a document of this build");
+        let store = MemoryStore::new();
+        store
+            .apply(applied(&document))
+            .expect("above the unbound start");
+        let members: Vec<WorkerId> = (0..28u64)
+            .map(|n| {
+                let facts = WorkerFacts {
+                    wire_modes: WireModes::HTTP,
+                    ..WorkerFacts::default()
+                };
+                let held: &[u64] = match n {
+                    0..=7 => &[1, 2],
+                    8..=19 => &[1],
+                    _ => &[77],
+                };
+                let id = held_by(&store, &format!("w{n:02}"), facts, held);
+                let row = WorkersStore::get(&store, id).expect("the row");
+                store
+                    .set_status(id, WorkerStatus::Ready, row.revision)
+                    .expect("the row stands");
+                id
+            })
+            .collect();
+        store.publish_now();
+        let deepest: BTreeSet<WorkerId> = members[..8].iter().copied().collect();
+        let now = Instant::now() + Duration::from_secs(3);
+        let mut picked = BTreeSet::new();
+        for seed in 1..=64 {
+            let mut frame = frame(1, seed);
+            let facts = frame.facts.as_mut().expect("the case's frame has facts");
+            facts.block_hashes = vec![1, 2];
+            facts.hash_kind = proto::HashKind::Text.into();
+            let request = checked(frame);
+            let taken = Taken::at(&request, GATEWAY, now, now).expect("budget is left");
+            let mut buffers = Buffers::default();
+            let (named, by_named, by_column) = store.deciding(|world| {
+                let engine = world.spec().engine();
+                hand(
+                    world,
+                    &taken,
+                    &mut buffers,
+                    &AtomicU64::new(0),
+                    |facts, pool, rows, cx, scratch| {
+                        let named = facts.named.expect("a profile that reads holders is named");
+                        assert!(facts.affinity.is_empty(), "no column beside the rows named");
+                        // The column a host fills from the same holders.
+                        let mut column = vec![AffinityFacts::default(); rows.len()];
+                        for holder in named.holders {
+                            column[holder.row as usize].overlap_blocks = holder.overlap_blocks;
+                        }
+                        let over_column = RequestFacts {
+                            affinity: &column,
+                            named: None,
+                            ..*facts
+                        };
+                        let mut first = |facts: &RequestFacts<'_>| {
+                            let decision = engine.decide(facts, pool, rows, cx, scratch);
+                            let pick = decision.pick();
+                            pick.and_then(|pick| pick.targets.as_slice().first().map(|to| to.id))
+                        };
+                        let depths: Vec<u32> =
+                            named.holders.iter().map(|at| at.overlap_blocks).collect();
+                        (depths, first(facts), first(&over_column))
+                    },
+                )
+                .0
+            });
+            assert_eq!(named.len(), 20, "every holder is named: seed {seed}");
+            assert_eq!(named.iter().filter(|&&depth| depth == 2).count(), 8);
+            assert_eq!(by_named, by_column, "seed {seed}");
+            let to = by_named.expect("a pick");
+            assert!(deepest.contains(&to), "seed {seed} went to {to:?}");
+            picked.insert(to);
+        }
+        assert!(picked.len() > 1, "the deepest holders tie: {picked:?}");
     }
 
     #[tokio::test]
