@@ -119,9 +119,9 @@ impl WordArena {
     /// the step that took the block off that run. That step stands ahead of the block's push:
     /// in its own thread, or through the count's decrement, which acquires and releases, where
     /// two runs shared an array. The list hands the block from its push to this pop in order.
-    /// A later holder's stores are not this fence's, and at least two of them stand behind no
-    /// release: the hash words of an append in place, and the shape word of a partial put in
-    /// place.
+    /// A later holder's stores are not this fence's. The rule for a holder that did not take
+    /// the block: write it by release, by a read-modify-write behind a store of the taker's,
+    /// or behind the start of a step.
     fn freed(list: &SegQueue<u32>) -> Option<u32> {
         let block = list.pop()?;
         fence(Ordering::Release);
@@ -616,8 +616,10 @@ impl WordArena {
             return false;
         }
         self.partial_set(table, used, worker, cutoff);
+        // A release store, as the entry's: a later holder puts into a table it did not take,
+        // and a reader of the life before may read this word first.
         self.word(table)
-            .store(slots as u64 | ((used as u64 + 1) << 32), Ordering::Relaxed);
+            .store(slots as u64 | ((used as u64 + 1) << 32), Ordering::Release);
         self.word(table + 1).fetch_add(1, Ordering::Relaxed);
         true
     }

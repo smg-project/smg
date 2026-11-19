@@ -774,10 +774,10 @@ impl PoolIndex {
 /// count of takes stands where its tables were known whole before it
 /// ([`Self::taken`]), and the answer must be no older than the blocks the
 /// lookup read. Where it moved, each row the lookup kept is asked whether
-/// its id was taken since ([`Self::taken_since`]). The chain writes and
-/// reads its coverage relaxed. Its reader runs an acquire fence after its
-/// reads, for its own snapshot: this file does not rest on where that fence
-/// stands. What orders the answer after a block, by who wrote it:
+/// its id was taken since ([`Self::taken_since`]). The chain reads its
+/// coverage relaxed and writes it by release, and its reader runs an
+/// acquire fence after its reads, for its own snapshot: this file rests on
+/// neither. What orders the answer after a block, by who wrote it:
 ///
 /// - the row's own lane: the take is said under the table's lock before
 ///   the row's lane exists ([`KvTables::member`]), a batch finds its lane

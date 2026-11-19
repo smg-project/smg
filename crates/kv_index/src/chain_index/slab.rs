@@ -262,12 +262,16 @@ pub(super) fn has(coverage: &[AtomicU64], worker: u32) -> bool {
     coverage[(worker / 64) as usize].load(Ordering::Relaxed) & (1u64 << (worker % 64)) != 0
 }
 
+/// By release, as [`clear`]: a later holder writes a word of a run it did not make, and a
+/// reader may still hold the run from the life before. One that reads the word and then
+/// passes its acquire fence reads, in its check of the version, the step that ended that
+/// life.
 pub(super) fn set(coverage: &[AtomicU64], worker: u32) {
-    coverage[(worker / 64) as usize].fetch_or(1u64 << (worker % 64), Ordering::Relaxed);
+    coverage[(worker / 64) as usize].fetch_or(1u64 << (worker % 64), Ordering::Release);
 }
 
 pub(super) fn clear(coverage: &[AtomicU64], worker: u32) {
-    coverage[(worker / 64) as usize].fetch_and(!(1u64 << (worker % 64)), Ordering::Relaxed);
+    coverage[(worker / 64) as usize].fetch_and(!(1u64 << (worker % 64)), Ordering::Release);
 }
 
 pub(super) fn coverage_is_empty(coverage: &[AtomicU64]) -> bool {
