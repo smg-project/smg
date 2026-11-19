@@ -14,6 +14,7 @@ use smg_data_connector::{
 };
 use smg_external_router::realtime::webrtc::default_bind_addr;
 use smg_mcp::McpOrchestrator;
+use smg_policy_controller::store::MemoryStore;
 use smg_worker::{
     connection::http_client::{
         build_client, connect_timeout_secs_below, WorkerHttpClientCache,
@@ -32,6 +33,7 @@ use crate::{
     middleware::{AuthConfig, TokenBucket},
     observability::inflight_tracker::InFlightRequestTracker,
     policies::{kv_index::event_monitor::KvEventMonitor, PolicyRegistry},
+    policy_controller,
     rate_limit::RateLimitManager,
     rl_adapter,
     routers::{
@@ -125,6 +127,9 @@ pub struct AppContext {
     pub worker_client_cache: Arc<WorkerHttpClientCache>,
     pub inflight_tracker: Arc<InFlightRequestTracker>,
     pub kv_event_monitor: Option<Arc<KvEventMonitor>>,
+    /// The policy controller's store, where the controller was picked to
+    /// decide for this process; `None` under the classic policies.
+    pub policy_store: Option<Arc<MemoryStore>>,
     /// RL control plane state; `None` unless `router_config.rl.enabled`.
     pub rl: Option<Arc<smg_rl::RlState>>,
     pub realtime_registry: Arc<RealtimeRegistry>,
@@ -216,6 +221,7 @@ pub struct AppContextBuilder {
     mcp_format_registry: Option<FormatRegistry>,
     wasm_manager: Option<Arc<WasmModuleManager>>,
     kv_event_monitor: Option<Arc<KvEventMonitor>>,
+    policy_store: Option<Arc<MemoryStore>>,
     webrtc_bind_addr: Option<std::net::IpAddr>,
     webrtc_stun_server: Option<String>,
 }
@@ -314,6 +320,7 @@ impl AppContextBuilder {
             mcp_format_registry: None,
             wasm_manager: None,
             kv_event_monitor: None,
+            policy_store: None,
             webrtc_bind_addr: None,
             webrtc_stun_server: None,
         }
@@ -624,6 +631,7 @@ impl AppContextBuilder {
             worker_client_cache,
             inflight_tracker: InFlightRequestTracker::new(),
             kv_event_monitor: self.kv_event_monitor,
+            policy_store: self.policy_store,
             rl,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: self.webrtc_bind_addr,
@@ -660,6 +668,7 @@ impl AppContextBuilder {
             .with_tool_parser_factory()
             .with_worker_registry()
             .with_policy_registry(&router_config)
+            .with_policy_controller(&router_config)?
             .with_storage(&router_config)
             .await?
             .with_worker_monitor(&router_config)?
@@ -834,6 +843,15 @@ impl AppContextBuilder {
             WorkerRegistry::new().with_engine_connector(BackendConnector::shared()),
         ));
         self
+    }
+
+    /// Start the policy controller's store where the controller was picked
+    /// to decide for this process. A start it refuses stops this one, by
+    /// name.
+    fn with_policy_controller(mut self, config: &RouterConfig) -> Result<Self, String> {
+        self.policy_store =
+            policy_controller::start(config).map_err(|refusal| refusal.to_string())?;
+        Ok(self)
     }
 
     /// Create policy registry
@@ -1731,6 +1749,7 @@ pub(crate) mod testing {
             )),
             inflight_tracker: InFlightRequestTracker::new(),
             kv_event_monitor: None,
+            policy_store: None,
             rl: None,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: None,
