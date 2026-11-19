@@ -1345,8 +1345,8 @@ impl LeastLoad {
                 }
             });
         }
-        let mut rate = None;
-        let mut nominal = || *rate.get_or_insert_with(|| self.mean_rate(candidates, kept, load));
+        let mut mean = None;
+        let mut nominal = || *mean.get_or_insert_with(|| self.mean_rate(candidates, kept, load));
         for (slot, &i) in out.iter_mut().zip(rows) {
             if let Some(r) = load(&candidates[i as usize]) {
                 let drain = if r.live_rate > 0 {
@@ -4265,6 +4265,28 @@ mod tests {
             scores[1] < 1.0,
             "the dark worker starts from the baseline plus its in-flight"
         );
+    }
+
+    /// A row without a report drains at the mean rate of the peers that
+    /// report one, not at the default. Its peers report 8,000 and 1,000
+    /// tokens a second, so its four requests wait 4 x 1,024 / 4,500 =
+    /// 0.91 s, ahead of the peer whose one request waits 1.02 s. At the
+    /// default of 2,000 they would wait 2.05 s, behind it.
+    #[test]
+    fn a_row_without_a_report_drains_at_its_peers_mean_rate() {
+        let ll = LeastLoad::new(0.15, 1024, 2000.0);
+        let mut pool = [candidate(0, 0), candidate(1, 4), candidate(2, 0)];
+        pool[0].load = Some(LoadRow {
+            live_rate: 8_000,
+            ..report(0, 0)
+        });
+        pool[2].load = Some(LoadRow {
+            live_rate: 1_000,
+            ..report(1, 0)
+        });
+        let mut scores = [0.0f32; 3];
+        ll.score(&RequestFacts::default(), &pool, &kept(3), &mut scores);
+        assert!(scores[0] > scores[1] && scores[1] > scores[2], "{scores:?}");
     }
 
     #[test]
