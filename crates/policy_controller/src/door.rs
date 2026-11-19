@@ -30,13 +30,13 @@ use crate::{
     decider::Decider,
     decision::{Decision, Shed, ShedReason, Target, Trace},
     framework::{release, Engine, Plan, Scratch},
-    lease::{Lease, LeaseId, LeaseKind, Lifecycle, Side},
+    lease::{Lease, LeaseId, LeaseKind, Lifecycle, Outcome, Side},
     sessions::{Forgets, SessionVerdict},
     spec::AppliedSpec,
     store::{
-        leases::DISPATCH_TTL, Ask, AtWork, Built, DecodeSide, GatewayId, Hand, LeaseRecord,
-        LeaseRefused, LeaseState, LeasesStore, MemoryStore, Named, Naming, PairBuffers, Picked,
-        Said, SessionsStore, ViewBuffers, World,
+        leases::DISPATCH_TTL, Ask, AtWork, Built, DecodeSide, GatewayId, Hand, HealthSink,
+        LeaseRecord, LeaseRefused, LeaseState, LeasesStore, MemoryStore, Named, Naming,
+        PairBuffers, Picked, Said, SessionsStore, ViewBuffers, World,
     },
     view::{
         fingerprint, AffinityFacts, Candidate, Constraints, NamedAffinity, Phase, PinSource,
@@ -1007,6 +1007,24 @@ fn pinned_by_rule(
         .session_ttl_micros()
         .map(|ttl| issued_micros.saturating_add(ttl));
     SessionsStore::pin_no_earlier(store, key, worker, at, ends);
+}
+
+/// A completion, said whole: the lease's word goes where `hand` takes it, a
+/// session's hand at the file or the door's report, and the gateway's
+/// completion is written on the served worker for the health precedence,
+/// whether or not the lease is on file. A served controller's handler of a
+/// `Completed` frame and a host's handle both say a completion here, so
+/// what one means stands once.
+pub(crate) fn completed(
+    store: &MemoryStore,
+    gateway: GatewayId,
+    outcome: &Outcome,
+    now: Instant,
+    hand: impl FnOnce(Said),
+) {
+    hand(Said::Completed(*outcome));
+    // The sink writes for a worker it holds a row for and for no other.
+    HealthSink::completed(store, gateway, outcome.served, outcome.class, now);
 }
 
 /// The counter at which a term's leader is told to leave: three quarters of

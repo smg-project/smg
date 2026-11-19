@@ -47,9 +47,9 @@ use std::{
 
 use crate::{
     decision::{Decision, Target},
-    door::{Decided, Door, Leased, Refused, Request},
+    door::{self, Decided, Door, Leased, Refused, Request},
     lease::{LeaseId, Outcome, ReleaseReason, Side, TransportClass},
-    store::{Dispatch, GatewayId, HealthSink, Said},
+    store::{Dispatch, GatewayId, Said},
 };
 
 /// What a handle still owes its lease.
@@ -211,10 +211,9 @@ impl<D: Deref<Target = Door>> Handle<D> {
         let Owed::Completion { lease, .. } = self.owed else {
             return;
         };
-        self.say(lease, Said::Completed(*outcome));
-        let store = self.door.store();
-        let gateway = self.gateway;
-        HealthSink::completed(&**store, gateway, outcome.served, outcome.class, now);
+        door::completed(self.door.store(), self.gateway, outcome, now, |said| {
+            self.say(lease, said);
+        });
         self.owed = Owed::Nothing;
     }
 
