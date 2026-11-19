@@ -1328,7 +1328,7 @@ impl Door {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{
         collections::BTreeSet,
         sync::{
@@ -1358,7 +1358,7 @@ mod tests {
     };
 
     const MODEL: &str = "model-a";
-    const GATEWAY: GatewayId = GatewayId(11);
+    pub(crate) const GATEWAY: GatewayId = GatewayId(11);
 
     /// A preset of this build as generation `generation`.
     fn preset(name: &str, generation: u64) -> AppliedSpec {
@@ -1369,7 +1369,7 @@ mod tests {
 
     /// A store of `deciders` files under the `random` preset, with three
     /// ready members that serve [`MODEL`].
-    fn fleet(deciders: usize) -> Arc<MemoryStore> {
+    pub(crate) fn fleet(deciders: usize) -> Arc<MemoryStore> {
         stocked(MemoryStore::new().with_deciders(deciders))
     }
 
@@ -1404,7 +1404,7 @@ mod tests {
 
     /// Applies `generation` of the `random` preset with the picker `name`
     /// in its pick's place.
-    fn picking<F>(store: &MemoryStore, generation: u64, name: &'static str, picker: F)
+    pub(crate) fn picking<F>(store: &MemoryStore, generation: u64, name: &'static str, picker: F)
     where
         F: Fn() -> Box<dyn Picker> + Send + Sync + 'static,
     {
@@ -1422,7 +1422,7 @@ mod tests {
     }
 
     /// A request for [`MODEL`] under `id` and `seed`.
-    fn request(id: &[u8], seed: u64) -> Request<'_> {
+    pub(crate) fn request(id: &[u8], seed: u64) -> Request<'_> {
         Request {
             id,
             facts: RequestFacts {
@@ -1453,7 +1453,7 @@ mod tests {
     }
 
     /// The members the leases on file book, each with its count.
-    fn counted(store: &MemoryStore) -> Vec<(WorkerId, u32)> {
+    pub(crate) fn counted(store: &MemoryStore) -> Vec<(WorkerId, u32)> {
         let mut rows = booked(store);
         rows.retain(|&(_, count)| count > 0);
         rows
@@ -1766,7 +1766,7 @@ mod tests {
 
     /// How long a case waits for a thread it holds, or for one it expects
     /// back.
-    const PATIENCE: Duration = Duration::from_secs(20);
+    pub(crate) const PATIENCE: Duration = Duration::from_secs(20);
 
     /// The seed of the request a [`Stops`] picker holds.
     const HELD: u64 = 99;
@@ -1855,7 +1855,7 @@ mod tests {
 
     /// A case's ends of a scene: where the held request says it stands,
     /// and the word that sends it on.
-    struct Ends {
+    pub(crate) struct Ends {
         scene: Arc<Scene>,
         stood: mpsc::Receiver<&'static str>,
         word: mpsc::Sender<()>,
@@ -1863,7 +1863,7 @@ mod tests {
 
     impl Ends {
         /// Applies the [`Stops`] picker to `store` as generation 2.
-        fn over(store: &MemoryStore) -> Self {
+        pub(crate) fn over(store: &MemoryStore) -> Self {
             let (stands, stood) = mpsc::channel();
             let (word, heard) = mpsc::channel();
             let scene = Arc::new(Scene {
@@ -1881,19 +1881,19 @@ mod tests {
         }
 
         /// Waits until the held request stands at `place`.
-        fn stands(&self, place: &str) {
+        pub(crate) fn stands(&self, place: &str) {
             assert_eq!(self.stood.recv_timeout(PATIENCE), Ok(place));
         }
 
         /// Sends the held request on from its stop.
-        fn go(&self) {
+        pub(crate) fn go(&self) {
             self.word.send(()).expect("the held request waits");
         }
     }
 
     /// One decision of `door` for the request under [`HELD`], on a thread
     /// of its own: its lease.
-    fn held(door: &Arc<Door>) -> thread::JoinHandle<Option<LeaseId>> {
+    pub(crate) fn held(door: &Arc<Door>) -> thread::JoinHandle<Option<LeaseId>> {
         let door = Arc::clone(door);
         thread::spawn(move || {
             let decided = door.decide(GATEWAY, &request(b"held", HELD), Instant::now());
