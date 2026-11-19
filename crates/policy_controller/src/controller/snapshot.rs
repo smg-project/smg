@@ -50,9 +50,15 @@
 //! No standby is restored from the answer: redacted, and cut where a bound
 //! bit, it names no place of the log.
 
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Instant,
+};
 
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::Mutex;
 use tonic::Status;
 
 use super::{generations::Generations, replication::age_ms, watch_workers, worker_wire};
@@ -117,45 +123,49 @@ fn names(keep: impl Fn(Slice) -> bool) -> String {
 /// the turn, so a caller that leaves frees it no earlier than its take
 /// ends. The last call out is told ([`Place`]): the one that leaves no
 /// other call let in.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(crate) struct Turn {
     /// The calls let in: the one that is taken and the ones that wait.
-    places: Arc<Semaphore>,
+    let_in: Arc<AtomicUsize>,
     turn: Arc<Mutex<()>>,
 }
 
 /// A call's place in the turn. It goes back when the call's take ends, or
 /// when its caller leaves before the take began. The call whose place goes
 /// back while no other call is let in is the last call out, and its `out`
-/// runs then: what the calls shared is let go by the last of them.
-struct Place<Out: FnOnce()> {
-    permit: Option<tokio::sync::OwnedSemaphorePermit>,
-    places: Arc<Semaphore>,
+/// runs then: what the calls shared is let go by the last of them. The
+/// place goes back and the count is read in one step, so of calls that
+/// leave together one alone is the last.
+pub(crate) struct Place<Out: FnOnce()> {
+    let_in: Arc<AtomicUsize>,
     out: Option<Out>,
 }
 
 impl<Out: FnOnce()> Drop for Place<Out> {
     fn drop(&mut self) {
-        // The place goes back first: the count then tells whether another
-        // call is let in.
-        drop(self.permit.take());
-        let last = self.places.available_permits() > SNAPSHOTS_WAITING;
+        let last = self.let_in.fetch_sub(1, Ordering::AcqRel) == 1;
         if let Some(out) = self.out.take().filter(|_| last) {
             out();
         }
     }
 }
 
-impl Default for Turn {
-    fn default() -> Self {
-        Self {
-            places: Arc::new(Semaphore::new(SNAPSHOTS_WAITING + 1)),
-            turn: Arc::new(Mutex::new(())),
-        }
-    }
-}
-
 impl Turn {
+    /// A place for one call more, or none where [`SNAPSHOTS_WAITING`] wait
+    /// behind the one that is taken. `out` runs where the place is the
+    /// last one back.
+    fn enter<Out: FnOnce()>(&self, out: Option<Out>) -> Option<Place<Out>> {
+        self.let_in
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |let_in| {
+                (let_in <= SNAPSHOTS_WAITING).then_some(let_in + 1)
+            })
+            .ok()?;
+        Some(Place {
+            let_in: Arc::clone(&self.let_in),
+            out,
+        })
+    }
+
     /// What `take` answers, run in its turn on a thread of the runtime's
     /// blocking pool; or the refusal of a call no place is left for, or of
     /// one whose take did not end. `out` runs where this call is the last
@@ -166,15 +176,10 @@ impl Turn {
         take: impl FnOnce() -> T + Send + 'static,
         out: impl FnOnce() + Send + 'static,
     ) -> Result<T, Status> {
-        let Ok(permit) = Arc::clone(&self.places).try_acquire_owned() else {
+        let Some(place) = self.enter(Some(out)) else {
             return Err(Status::resource_exhausted(format!(
                 "{SNAPSHOTS_WAITING} snapshots wait their turn: ask again later"
             )));
-        };
-        let place = Place {
-            permit: Some(permit),
-            places: Arc::clone(&self.places),
-            out: Some(out),
         };
         let turn = Arc::clone(&self.turn).lock_owned().await;
         let taking = tokio::task::spawn_blocking(move || {
@@ -190,22 +195,20 @@ impl Turn {
     /// wait.
     #[cfg(test)]
     pub(crate) fn let_in(&self) -> usize {
-        SNAPSHOTS_WAITING + 1 - self.places.available_permits()
+        self.let_in.load(Ordering::Acquire)
     }
 
     /// Every place left, taken for a case: the next call is told to ask
     /// again while the case holds them.
     #[cfg(test)]
-    pub(crate) fn fill(&self) -> Vec<tokio::sync::OwnedSemaphorePermit> {
-        std::iter::from_fn(|| Arc::clone(&self.places).try_acquire_owned().ok()).collect()
+    pub(crate) fn fill(&self) -> Vec<Place<fn()>> {
+        std::iter::from_fn(|| self.enter(None)).collect()
     }
 
     /// One place, taken for a case: a call beside it is not the last out.
     #[cfg(test)]
-    pub(crate) fn place(&self) -> tokio::sync::OwnedSemaphorePermit {
-        Arc::clone(&self.places)
-            .try_acquire_owned()
-            .expect("a place is free")
+    pub(crate) fn place(&self) -> Place<fn()> {
+        self.enter(None).expect("a place is free")
     }
 
     /// The turn, held for a case: a call let in waits behind it.
@@ -1123,5 +1126,44 @@ mod tests {
         assert_eq!(turn.let_in(), 0, "its place went back");
         assert_eq!(outs.load(Ordering::SeqCst), 3, "the caller that left");
         drop(held);
+    }
+
+    /// Of calls that leave together one alone is the last out: a place
+    /// goes back and the count is read in one step. Two places go back
+    /// from two threads at one instant, round after round.
+    #[test]
+    fn of_calls_that_leave_together_one_alone_is_the_last_out() {
+        let turn = Turn::default();
+        let outs = Arc::new(AtomicUsize::new(0));
+        for round in 1..=2_000 {
+            let (go, ready) = (AtomicBool::new(false), AtomicUsize::new(0));
+            thread::scope(|scope| {
+                for _ in 0..2 {
+                    let outs = Arc::clone(&outs);
+                    let counted = move || {
+                        outs.fetch_add(1, Ordering::SeqCst);
+                    };
+                    let place = turn.enter(Some(counted)).expect("a place is free");
+                    let (go, ready) = (&go, &ready);
+                    scope.spawn(move || {
+                        ready.fetch_add(1, Ordering::SeqCst);
+                        while !go.load(Ordering::SeqCst) {
+                            std::hint::spin_loop();
+                        }
+                        drop(place);
+                    });
+                }
+                while ready.load(Ordering::SeqCst) < 2 {
+                    thread::yield_now();
+                }
+                go.store(true, Ordering::SeqCst);
+            });
+            assert_eq!(turn.let_in(), 0, "each place went back");
+            assert_eq!(
+                outs.load(Ordering::SeqCst),
+                round,
+                "one last call out a round"
+            );
+        }
     }
 }
