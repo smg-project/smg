@@ -138,11 +138,11 @@ impl Discovery {
         // check interval first, as a failed start does.
         let mut ended = None;
         loop {
-            let now = Instant::now();
-            let Some(term) = self.fence.leader_term(now) else {
+            let (leads, turn) = self.fence.term_and_turn(Instant::now());
+            let Some(term) = leads else {
                 tokio::select! {
                     () = &mut stopped => return,
-                    open = self.turned(now, &mut standing) => {
+                    open = Self::turned(turn, &mut standing) => {
                         if !open {
                             return;
                         }
@@ -220,27 +220,28 @@ impl Discovery {
         }
     }
 
-    /// Waits for the election's next word, or for the instant the clock
-    /// alone turns the fence's answer as it stood at `now`: a lead the
-    /// election renews no more ends there with no word. Returns whether
-    /// the watch is still open.
-    async fn turned(&self, now: Instant, standing: &mut watch::Receiver<Standing>) -> bool {
+    /// Waits for the election's next word, or for `turn`, the instant the
+    /// clock alone turns the fence's answer: a lead the election renews no
+    /// more ends there with no word. Returns whether the watch is still
+    /// open.
+    async fn turned(turn: Option<Instant>, standing: &mut watch::Receiver<Standing>) -> bool {
         tokio::select! {
             changed = standing.changed() => changed.is_ok(),
-            () = reached(self.fence.turns_at(now)) => true,
+            () = reached(turn) => true,
         }
     }
 
     /// Waits for a different term, returning whether the watch is still open.
     async fn left(&self, term: u64, standing: &mut watch::Receiver<Standing>) -> bool {
         loop {
-            // One read of the clock serves the term and its next turn, so
-            // no end of the window falls between two reads.
-            let now = Instant::now();
-            if self.fence.leader_term(now) != Some(term) {
+            // One read of the fence gives the term and its next turn. No
+            // release and no end of the window falls between the two, so a
+            // lead always comes with the instant to sleep to.
+            let (leads, turn) = self.fence.term_and_turn(Instant::now());
+            if leads != Some(term) {
                 return true;
             }
-            if !self.turned(now, standing).await {
+            if !Self::turned(turn, standing).await {
                 return false;
             }
         }

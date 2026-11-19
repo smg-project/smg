@@ -353,6 +353,24 @@ struct Lead {
     window: Option<(Instant, Instant)>,
 }
 
+impl Lead {
+    /// The term led under at `now`, where the window holds that instant.
+    fn term_at(&self, now: Instant) -> Option<u64> {
+        let (opens, until) = self.window?;
+        (opens <= now && now <= until).then_some(self.term)
+    }
+
+    /// The instant the clock alone next turns [`Lead::term_at`].
+    fn turns_at(&self, now: Instant) -> Option<Instant> {
+        let (opens, until) = self.window?;
+        if now < opens {
+            Some(opens)
+        } else {
+            (now <= until).then_some(until)
+        }
+    }
+}
+
 impl Fence {
     fn new() -> Self {
         Self {
@@ -366,9 +384,7 @@ impl Fence {
     /// decision it sends; past the deadline it answers `NotLeader` and
     /// releases nothing.
     pub fn leader_term(&self, now: Instant) -> Option<u64> {
-        let lead = self.lead.load();
-        let (opens, until) = lead.window?;
-        (opens <= now && now <= until).then_some(lead.term)
+        self.lead.load().term_at(now)
     }
 
     /// The term of the last lease this process held, `0` before any: what
@@ -384,12 +400,18 @@ impl Fence {
     /// stands or it has ended: only a write of the elector turns the answer
     /// then. A reader that waits on the role sleeps to this instant.
     pub fn turns_at(&self, now: Instant) -> Option<Instant> {
-        let (opens, until) = self.lead.load().window?;
-        if now < opens {
-            Some(opens)
-        } else {
-            (now <= until).then_some(until)
-        }
+        self.lead.load().turns_at(now)
+    }
+
+    /// [`Fence::leader_term`] and [`Fence::turns_at`] at `now`, by one read
+    /// of the fence. A reader that holds work to the lead takes the pair
+    /// from here. Two reads can stand astride a write of the elector: a
+    /// lead read before a release, beside a turn read after it, has no
+    /// instant to sleep to. A term from this read comes with its window's
+    /// end.
+    pub fn term_and_turn(&self, now: Instant) -> (Option<u64>, Option<Instant>) {
+        let lead = self.lead.load();
+        (lead.term_at(now), lead.turns_at(now))
     }
 
     fn set(&self, term: u64, window: Option<(Instant, Instant)>) {
@@ -1458,6 +1480,13 @@ mod tests {
         assert_eq!(fence.turns_at(t0 + 3 * S), Some(t0 + 3 * S));
         let past = t0 + 3 * S + Duration::from_micros(1);
         assert_eq!(fence.turns_at(past), None);
+        // The pair by one read is the two reads at one instant.
+        for at in [t0 + S, t0 + 2 * S, t0 + 3 * S, past] {
+            assert_eq!(
+                fence.term_and_turn(at),
+                (fence.leader_term(at), fence.turns_at(at))
+            );
+        }
         // One renew deadline after the take the fence opens by itself, at
         // no step: the renewal behind it carries the window past that
         // instant, to its own renew deadline.
@@ -4504,6 +4533,39 @@ mod tests {
             renew_deadline: Duration::from_secs(10),
         };
         assert!(long.validate().is_ok());
+    }
+
+    #[test]
+    fn a_read_that_finds_a_lead_finds_the_end_of_its_window() {
+        // An elector that takes and leaves the lead as fast as it can, under
+        // a reader of the pair. One read of the fence never shows a lead
+        // beside no turn, as two reads astride a release would.
+        let fence = Arc::new(Fence::new());
+        let t0 = Instant::now();
+        let until = t0 + 3_600 * S;
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let (fence, stop) = (Arc::clone(&fence), Arc::clone(&stop));
+            thread::spawn(move || {
+                let mut term = 0;
+                while !stop.load(Ordering::Relaxed) {
+                    term += 1;
+                    fence.set(term, Some((t0, until)));
+                    fence.set(term, None);
+                }
+            })
+        };
+        let mut led = 0;
+        while led < 50_000 && t0.elapsed() < 10 * S {
+            let (term, turn) = fence.term_and_turn(Instant::now());
+            if term.is_some() {
+                led += 1;
+                assert_eq!(turn, Some(until), "a lead with no instant to sleep to");
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        writer.join().expect("the writer thread");
+        assert!(led > 0, "the reader saw no lead");
     }
 
     #[test]
