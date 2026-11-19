@@ -314,6 +314,20 @@ impl Replication {
             }
         }
     }
+
+    /// A restore's hold as a stream that took no part since `at` leaves
+    /// it, over the cut at the head with no admission: a served case's own.
+    #[cfg(test)]
+    pub(super) fn stalled_since(&self, at: Instant) {
+        let cut = self.cuts.at_head(&self.store, &self.log);
+        self.cuts.holds.lock().push(Arc::new(Hold::of(cut, at)));
+    }
+
+    /// How many restores this leader holds: a served case's own.
+    #[cfg(test)]
+    pub(super) fn held(&self) -> usize {
+        self.cuts.holds.lock().len()
+    }
 }
 
 /// The cut of every kind at one place of the log: taken by the first stream
@@ -2001,17 +2015,37 @@ mod tests {
         assert!(batch(feed.look(at)).snapshot.is_some());
         assert!(matches!(feed.restore, Restore::Parts(_)));
         let held = || source.cuts.holds.lock().len();
-        // Short of the bound the leader's clock leaves the hold,
-        source.cuts.sweep(at + STALLED - Duration::from_millis(1));
+        // Short of the bound the leader's clock leaves the hold: 60 s by
+        // the case's own number, the one the contract tells a standby,
+        let bound = Duration::from_secs(60);
+        source.cuts.sweep(at + bound - Duration::from_millis(1));
         assert_eq!(held(), 1);
         // and at the bound it lets the cut go, though no look came.
-        source.cuts.sweep(at + STALLED);
+        source.cuts.sweep(at + bound);
         assert_eq!(held(), 0);
         // The stream ends at its next look, where the transport asks one.
         match feed.look(at) {
             Step::Close(status) => assert_eq!(status.code(), Code::DeadlineExceeded),
             other => panic!("the stream's end, not {other:?}"),
         }
+    }
+
+    /// A part taken dates its hold anew: a stream that takes its parts a
+    /// beat short of the bound apart is never let go for its age.
+    #[test]
+    fn a_part_taken_renews_its_hold() {
+        let leader = Leader::leading();
+        leader.writes(3);
+        let at = leader.at;
+        let cut = leader.replication().cut(leader.term).expect("a cut");
+        let hold = Hold::of(cut, at);
+        let taken = at + STALLED - BEAT;
+        assert!(hold.take(taken).is_some());
+        // The bound counts from the part, not from the hold's start.
+        assert!(hold.keeps(at + STALLED));
+        assert!(hold.keeps(taken + STALLED - Duration::from_millis(1)));
+        assert!(!hold.keeps(taken + STALLED));
+        assert!(hold.take(taken + STALLED).is_none(), "the cut was let go");
     }
 
     #[tokio::test(start_paused = true)]
