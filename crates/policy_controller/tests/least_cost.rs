@@ -325,6 +325,50 @@ fn uncounted_resident_tokens_make_a_row_unreported_only_when_named() {
     );
 }
 
+/// A report of a queue's depth alone writes zero waiting tokens. Beside a
+/// queue that zero is a missing value, priced by the document's rule. Over an
+/// empty queue it is a count.
+#[test]
+fn zero_waiting_tokens_beside_a_queue_are_a_missing_value() {
+    let report = |queued, waiting_uncached_tokens| {
+        Some(LoadRow {
+            queued,
+            waiting_uncached_tokens,
+            ..LoadRow::default()
+        })
+    };
+    // Tokens over a queue, a depth alone, and an empty queue.
+    let rows = [
+        row(0, 0, report(8, 40)),
+        row(1, 4, report(16, 0)),
+        row(2, 1, report(0, 0)),
+    ];
+    // The depth alone costs the least reported cost, 0, plus 4 * 5.
+    assert_eq!(
+        scores(
+            "terms: {load.waiting_uncached_tokens: 1}, unreported: {over-least: {request_cost: 5}}",
+            &rows
+        ),
+        [(3, 1.0), (2, 0.5), (1, 0.0)]
+    );
+    // Its tokens add nothing and its queue still counts: 64, 48 and 0.
+    assert_eq!(
+        scores(
+            "terms: {load.queued: 3, load.waiting_uncached_tokens: 1}, unreported: missing-as-zero",
+            &rows
+        ),
+        [(3, 1.0), (2, 0.25), (1, 0.0)]
+    );
+    // With no such term the same report is a reported row: 8, 16 and 0.
+    assert_eq!(
+        scores(
+            "terms: {load.queued: 1}, unreported: {over-least: {request_cost: 5}}",
+            &rows
+        ),
+        [(3, 1.0), (1, 0.5), (2, 0.0)]
+    );
+}
+
 /// A report past the document's age limit is no report to this scorer: its
 /// row is costed as an unreported one. A report at the limit is read.
 #[test]

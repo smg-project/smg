@@ -81,6 +81,11 @@ impl LoadField {
         let value = match self {
             Self::Running => row.running,
             Self::Queued => row.queued,
+            // A report of a queue's depth alone writes zero here: beside a
+            // queue that zero is no count of its tokens.
+            Self::WaitingUncachedTokens if row.waiting_uncached_tokens == 0 && row.queued > 0 => {
+                return None
+            }
             Self::WaitingUncachedTokens => row.waiting_uncached_tokens,
             Self::KvUsage => u32::from(row.kv_usage_permille),
             Self::ActiveKv => u32::from(row.active_kv_permille),
