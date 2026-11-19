@@ -48,6 +48,8 @@ pub trait KvEventHost: Send + Sync + 'static {
 
     /// The task opens the worker's place in the sink, ahead of its first
     /// round. `None` ends the task: the host has said why and counted it.
+    /// The slot stays taken, so the worker is not offered again before its
+    /// removal or its next registration.
     fn open(
         &self,
         ticket: Self::Ticket,
@@ -59,7 +61,8 @@ pub trait KvEventHost: Send + Sync + 'static {
     ///
     /// Called under the slot lock like [`enroll`](Self::enroll), by whoever
     /// frees the subscription's slot: it must not wait, and it must not
-    /// call the collector.
+    /// call the collector. Neither a stop nor a dropped collector calls
+    /// it: what the host keeps for a model is then the host's to clear.
     fn model_left(&self, _model: &str) {}
 }
 
