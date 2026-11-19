@@ -240,6 +240,8 @@ impl<G: Generation> LoadState<G> {
     /// A report that is admitted voids the eviction queued for its worker:
     /// an eviction is for what the worker published before it was queued,
     /// and a worker that left `Ready` and came back publishes ahead of it.
+    /// The fence is read again for that worker under the queue's lock: one
+    /// that left since the first read keeps its eviction.
     pub(crate) fn publish_group(
         &self,
         group_urls: &[String],
@@ -266,11 +268,16 @@ impl<G: Generation> LoadState<G> {
             }
             if !admitted.is_empty() {
                 // Under the publishers' lock, as the batch that applies the
-                // queue takes it: the two do not cross.
+                // queue takes it: the two do not cross. The fence above was
+                // read ahead of this lock, and a worker can leave in
+                // between. So the fence is read again here, under the
+                // queue's lock: the eviction such a leave queues, now or
+                // later, stands and removes the row laid below.
                 self.pending_evictions.lock().retain(|queued| {
-                    !admitted.iter().any(|(_, entry)| {
+                    let published = admitted.iter().any(|(_, entry)| {
                         std::ptr::addr_eq(entry.source.as_ptr(), Arc::as_ptr(queued))
-                    })
+                    });
+                    !(published && self.is_current_incarnation(queued))
                 });
             }
             for (url, entry) in admitted {
@@ -380,7 +387,7 @@ impl<G: Generation> LoadState<G> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Barrier;
+    use std::{sync::Barrier, time::Duration};
 
     use super::*;
     use crate::{
@@ -621,5 +628,31 @@ mod tests {
 
         assert!(removed.is_empty(), "the eviction is older than the entry");
         assert_eq!(waiting_of(&state.snapshot(), "http://w1:8080"), Some(2));
+    }
+
+    /// A poll's publish reads the fence before it takes the publishers'
+    /// lock, and its worker can leave `Ready` in between. The eviction that
+    /// leave queues is not voided: the batch removes the row the publish
+    /// laid. The case holds the publishers' lock while the publish reads
+    /// its fence. The wait only gives the publish the time to read it: the
+    /// answer holds without it.
+    #[test]
+    fn a_publish_keeps_the_eviction_of_a_worker_that_left_behind_its_fence() {
+        let (registry, state) = setup();
+        let worker = ready_worker("http://w1:8080", "m");
+        registry.register(Arc::clone(&worker)).unwrap();
+
+        std::thread::scope(|scope| {
+            state.rebuild(|_| {
+                scope.spawn(|| state.publish_group(&[], vec![(Arc::clone(&worker), load(2))]));
+                std::thread::sleep(Duration::from_millis(50));
+                worker.set_status(WorkerStatus::NotReady);
+                state.enqueue_eviction(Arc::clone(&worker));
+                false
+            });
+        });
+        state.apply_pending_evictions();
+
+        assert!(state.snapshot().is_empty(), "no row outlives the eviction");
     }
 }

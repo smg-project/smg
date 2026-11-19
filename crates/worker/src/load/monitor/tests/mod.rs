@@ -2478,6 +2478,26 @@ async fn a_reset_leaves_the_series_a_returned_worker_reported_since() {
     assert!(running_series(&rendered).ends_with(" 9"), "{rendered}");
 }
 
+/// The series is held back with the rows. A record of a worker that is not
+/// `Ready` leaves the sentinel its eviction wrote: a stream that ends
+/// there leaves no load that reads as live.
+#[tokio::test]
+async fn a_record_of_a_worker_that_is_not_ready_leaves_the_sentinel_on_its_series() {
+    let rendered = render_with_recorder(|| {
+        let (registry, monitor) = build_monitor();
+        let worker = ready_worker("http://w:1", "m");
+        let id = registry.register(Arc::clone(&worker)).unwrap();
+        monitor.apply_pushed_load(&worker, 0, &pushed(7), Instant::now());
+        monitor.flush_pushed();
+        registry.transition_status(&id, WorkerStatus::NotReady);
+        monitor.evict_worker_loads(&worker);
+        monitor.flush_pending_evictions();
+
+        monitor.apply_pushed_load(&worker, 0, &pushed(9), Instant::now());
+    });
+    assert!(running_series(&rendered).ends_with(" -1"), "{rendered}");
+}
+
 /// A pusher that left `Ready` while registry events were lost stays
 /// registered, so its engine series would read its last load as live. The
 /// reset's eviction writes the series' sentinel, as its event's would.

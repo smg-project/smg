@@ -160,7 +160,9 @@ pub trait LoadSink: Send + Sync {
     /// whose pushed report a record of the registry's worker at the URL
     /// replaced. It is not said at the eviction of a worker whose URL holds
     /// another worker's report: what the sink holds at the URL is that
-    /// worker's since its first record.
+    /// worker's since its first record. A worker that never pushed is then
+    /// not said at all: a sink that keys its rows by the worker and not by
+    /// the URL lets them go at the first record of the URL's next worker.
     fn forget(&self, worker: &Arc<dyn Worker>);
 
     /// The collector reset itself: it stopped its groups and dropped every

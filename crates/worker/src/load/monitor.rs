@@ -584,7 +584,7 @@ impl<G: Generation> WorkerMonitor<G> {
     /// finds no report, or the report of another worker, starts one for the
     /// registry's worker at the URL alone, whatever its status: the sink
     /// and the wedged rule hear a registered worker that is not `Ready`,
-    /// and the publish fence holds its rows back. Any other is dropped
+    /// and its rows and its series are held back. Any other is dropped
     /// ahead of the report, the sink, the series and the publish. Its
     /// worker is still marked as one whose stream pushes, as for any record.
     pub fn apply_pushed_load<R: LoadRecord>(
@@ -610,10 +610,14 @@ impl<G: Generation> WorkerMonitor<G> {
             .unwrap_or(received_at);
         let url = worker.url();
         // The stream pushes: silence from this worker is judged by the
-        // stream's cadence from now on (`liveness`, the stale rule).
-        if let Some(state) = worker.runtime_state() {
+        // stream's cadence from now on (`liveness`, the stale rule). Its
+        // status is read from the same state, for the series below.
+        let ready = if let Some(state) = worker.runtime_state() {
             state.note_load_record();
-        }
+            state.status() == WorkerStatus::Ready
+        } else {
+            worker.status() == WorkerStatus::Ready
+        };
         // A worker's entry is made on its first record; the lookup that
         // finds it copies no key.
         let mut reports = self.pushed_reports.lock();
@@ -679,8 +683,13 @@ impl<G: Generation> WorkerMonitor<G> {
             record.prefill_pending(),
         );
         // The record feeds its own rank's `smg_engine_*` series through the
-        // handles kept for it; a poll's report feeds every rank's.
-        Metrics::record_engine_rank_load(url, worker.model_id(), &report.loads[at]);
+        // handles kept for it; a poll's report feeds every rank's. The
+        // series is held back with the rows: a worker that is not `Ready`
+        // keeps the sentinel its eviction wrote, so a stream that ends
+        // there leaves no load that reads as live.
+        if ready {
+            Metrics::record_engine_rank_load(url, worker.model_id(), &report.loads[at]);
+        }
         // A record feeds the DP-rank token cache nothing. The cache's one
         // reader is the HTTP pair router's rank pick, and a stream is opened
         // for a gRPC worker alone: no pick reads a pushing worker's entry. A
