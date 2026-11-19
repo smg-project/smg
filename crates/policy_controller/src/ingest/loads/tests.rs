@@ -1337,6 +1337,11 @@ fn a_log_line_names_an_engine_by_host_and_port_never_its_url() {
         ("grpc://us@er:se@cret@host:1", "host:1"),
         ("http://[::1]:8000/metrics", "[::1]:8000"),
         ("host:9000", "host:9000"),
+        // A `://` behind the authority is no scheme's: the host is the
+        // address's first.
+        ("user:secret@host:9000/next/http://other", "host:9000"),
+        ("user:secret@host:9000?next=http://other", "host:9000"),
+        ("host:9000#http://other", "host:9000"),
     ] {
         assert_eq!(peer(engine), named, "{engine}");
     }

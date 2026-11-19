@@ -806,7 +806,8 @@ impl PolicyController for Service {
     /// slices this build serves, redacted, under the term this replica
     /// leads. A replica that does not lead refuses it as it refuses a
     /// watch's open. The request's own rules come behind the lead, each
-    /// field refused by its name, and a refused request takes no turn. One
+    /// field refused by its name, the spec slice of a controller with no
+    /// spec source among them, and a refused request takes no turn. One
     /// snapshot is taken at a time, off the runtime's workers
     /// ([`snapshot::Turn`]). The lead is read again behind that wait: the
     /// answer is told while this replica still leads the term the call was
@@ -819,6 +820,7 @@ impl PolicyController for Service {
         self.admit(Call::GetSnapshot, &request)?;
         let term = self.watched(Instant::now())?;
         let asked = snapshot::asked(request.into_inner())?;
+        asked.sourced(self.shared.generations.bound())?;
         let shared = Arc::clone(&self.shared);
         let take = move || {
             snapshot::taken(
@@ -3218,7 +3220,7 @@ mod tests {
 
         let (_elector, _standing, control) = electing(true);
         let places = control.shared.snapshots.fill();
-        assert_eq!(places.len(), super::snapshot::SNAPSHOTS_WAITING);
+        assert_eq!(places.len(), super::snapshot::SNAPSHOTS_WAITING + 1);
         let past = control
             .get_snapshot(snapshot(&[Slice::Workers]))
             .await
@@ -3236,6 +3238,19 @@ mod tests {
             .await
             .expect_err("refused");
         assert_eq!(health.code(), Code::Unimplemented);
+        // So is the spec slice of a controller with no spec source: the
+        // source is read ahead of the turn.
+        let spec = control
+            .get_snapshot(snapshot(&[Slice::Spec]))
+            .await
+            .expect_err("refused");
+        assert_eq!(
+            (spec.code(), spec.message()),
+            (
+                Code::Unimplemented,
+                "slices: SLICE_SPEC is not served by a controller started with no spec source"
+            )
+        );
         drop(places);
         let rows = control
             .get_snapshot(snapshot(&[Slice::Workers]))

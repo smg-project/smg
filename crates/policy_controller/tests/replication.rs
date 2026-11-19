@@ -1137,9 +1137,25 @@ async fn a_store_past_one_message_restores_a_standby_whole_on_its_stream() {
     .await;
 }
 
+/// A worker's facts of a production row's shape: a 53-byte address, one
+/// 36-byte model, four labels, a zone.
+fn wide(worker: u32) -> WorkerFacts {
+    let address = format!("http://engine-{worker:04}.serving-pool.example.internal:8000");
+    let labels = (0..4)
+        .map(|n| (format!("label-key-{n:02}"), format!("value-{worker:04}")))
+        .collect();
+    WorkerFacts {
+        models: vec!["organization/model-name-70b-instruct".to_owned()],
+        labels,
+        zone: Some("region-1-zone-a".to_owned()),
+        engine_kind: "engine-kind".to_owned(),
+        ..facts(&address, 1, 64)
+    }
+}
+
 /// A measurement, run by name with `--ignored --nocapture`: a standby's
 /// snapshot at the design's top fleet and at 4,096 workers of a production
-/// row's shape (a 56-byte address, one 36-byte model, four labels, a zone)
+/// row's shape (a 53-byte address, one 36-byte model, four labels, a zone)
 /// with 0, 1, 8 and 64 load rows a worker. Each line: the parts, their
 /// bytes together and the widest one, and how long a standby that asks
 /// waits for the whole (the leader's cut, its parts, the client's read),
@@ -1168,19 +1184,7 @@ async fn snapshots_numbers(workers: u32) {
     with_leader(shared(&dir), |leader| async move {
         let mut ids = Vec::new();
         for worker in 0..workers {
-            let address =
-                format!("http://engine-{worker:04}.serving-pool.example.internal:8000");
-            let labels = (0..4)
-                .map(|n| (format!("label-key-{n:02}"), format!("value-{worker:04}")))
-                .collect();
-            let wide = WorkerFacts {
-                models: vec!["organization/model-name-70b-instruct".to_owned()],
-                labels,
-                zone: Some("region-1-zone-a".to_owned()),
-                engine_kind: "engine-kind".to_owned(),
-                ..facts(&address, 1, 64)
-            };
-            ids.push(leader.store.upsert(wide).id());
+            ids.push(leader.store.upsert(wide(worker)).id());
         }
         let now = Instant::now();
         let mut out = std::io::stdout();
@@ -1253,7 +1257,7 @@ async fn snapshots_numbers(workers: u32) {
 
 /// A measurement, run by name with `--ignored --nocapture`: the operators'
 /// snapshot of the worker rows at a fleet of a production row's shape (a
-/// 56-byte address, one 36-byte model, four labels, a zone), asked whole
+/// 53-byte address, one 36-byte model, four labels, a zone), asked whole
 /// and under a limit of one row. Each line: the rows told and whether a
 /// bound cut them, the answer's bytes, how long the call takes over the
 /// wire (the store's cut, the rows' build, the client's read), and how long
@@ -1263,19 +1267,7 @@ async fn operators_snapshot_numbers(workers: u32) {
     let dir = tempfile::tempdir().expect("a temp dir");
     with_leader(shared(&dir), |leader| async move {
         for worker in 0..workers {
-            let address =
-                format!("http://engine-{worker:04}.serving-pool.example.internal:8000");
-            let labels = (0..4)
-                .map(|n| (format!("label-key-{n:02}"), format!("value-{worker:04}")))
-                .collect();
-            let wide = WorkerFacts {
-                models: vec!["organization/model-name-70b-instruct".to_owned()],
-                labels,
-                zone: Some("region-1-zone-a".to_owned()),
-                engine_kind: "engine-kind".to_owned(),
-                ..facts(&address, 1, 64)
-            };
-            leader.store.upsert(wide);
+            leader.store.upsert(wide(worker));
         }
         let mut cuts = Vec::new();
         for _ in 0..11 {

@@ -22,10 +22,14 @@
 //! The rows are the store's cut of the watched kinds, as a watch's open
 //! reads them: every row is copied under the membership lock, whatever the
 //! limit. A decision reads the published world and does not wait on it.
+//! What takes that lock waits for the copy, on the thread that brought it:
+//! a membership write, the report of a completed request on a gateway's
+//! session, a load report, a probe's outcome, a veto, and the world's
+//! publication.
 //! **One snapshot is taken at a time, off the runtime's workers**
-//! ([`Turn`]): one copy of the rows stands at a time, a membership write
-//! waits behind one snapshot at most, and no stream of the listener waits
-//! on a thread an operator's read holds.
+//! ([`Turn`]): one copy of the rows stands at a time, each of those waits
+//! behind one snapshot at most, and the take itself holds no thread a
+//! stream of the listener runs on.
 //!
 //! No standby is restored from the answer: redacted, and cut where a bound
 //! bit, it names no place of the log.
@@ -65,8 +69,8 @@ const PLAIN: &str =
 const NO_SOURCE: &str =
     "slices: SLICE_SPEC is not served by a controller started with no spec source";
 
-/// The snapshots let in: the one that is taken and the ones that wait their
-/// turn.
+/// How many snapshots may wait their turn behind the one that is taken: a
+/// call past them is told to ask again.
 pub(crate) const SNAPSHOTS_WAITING: usize = 32;
 
 /// Whether this build serves `slice`.
@@ -93,9 +97,9 @@ fn names(keep: impl Fn(Slice) -> bool) -> String {
 /// every worker row under the membership lock and builds its answer from
 /// the copy: tens of milliseconds and megabytes at ten thousand rows. A
 /// second call waits its turn, in the order the calls came, and a call past
-/// the [`SNAPSHOTS_WAITING`] that are let in is told to ask again. The take
-/// holds the turn, so a caller that leaves frees it no earlier than its
-/// take ends.
+/// the [`SNAPSHOTS_WAITING`] that wait is told to ask again. The take holds
+/// the turn, so a caller that leaves frees it no earlier than its take
+/// ends.
 #[derive(Debug)]
 pub(crate) struct Turn {
     /// The calls let in: the one that is taken and the ones that wait.
@@ -106,7 +110,7 @@ pub(crate) struct Turn {
 impl Default for Turn {
     fn default() -> Self {
         Self {
-            places: Arc::new(Semaphore::new(SNAPSHOTS_WAITING)),
+            places: Arc::new(Semaphore::new(SNAPSHOTS_WAITING + 1)),
             turn: Arc::new(Mutex::new(())),
         }
     }
@@ -139,7 +143,7 @@ impl Turn {
     /// wait.
     #[cfg(test)]
     pub(crate) fn let_in(&self) -> usize {
-        SNAPSHOTS_WAITING - self.places.available_permits()
+        SNAPSHOTS_WAITING + 1 - self.places.available_permits()
     }
 
     /// Every place left, taken for a case: the next call is told to ask
@@ -166,6 +170,19 @@ pub(crate) struct Asked {
     models: Vec<String>,
     /// The rows a slice tells at most.
     limit: usize,
+}
+
+impl Asked {
+    /// The refusal of the spec slice, by its name, where the controller was
+    /// given no spec source (`bound` says whether it was). The handler
+    /// reads it ahead of the turn, as it reads each rule of the request: a
+    /// refused call takes no place.
+    pub(crate) fn sourced(&self, bound: bool) -> Result<(), Status> {
+        if self.spec && !bound {
+            return Err(Status::unimplemented(NO_SOURCE));
+        }
+        Ok(())
+    }
 }
 
 /// What `request` asks for, or the refusal of a field by its name, the
@@ -226,11 +243,12 @@ pub(crate) fn asked(request: proto::SnapshotRequest) -> Result<Asked, Status> {
 }
 
 /// The snapshot `asked` for, as this replica holds it at `now` under
-/// `term`: the header, then each slice asked. The spec slice is refused by
-/// its name where the controller was given no spec source, before a row is
-/// copied. The header's generation is the spec slice's own where that slice
-/// is told: one read. The answer names no place of the log, no id table and
-/// no document: it is no base a standby starts from.
+/// `term`: the header, then each slice asked. The spec slice of a
+/// controller with no spec source is refused ahead of the turn
+/// ([`Asked::sourced`]), and the take keeps its own read of the source,
+/// before a row is copied. The header's generation is the spec slice's own
+/// where that slice is told: one read. The answer names no place of the
+/// log, no id table and no document: it is no base a standby starts from.
 pub(crate) fn taken(
     asked: &Asked,
     term: u64,
@@ -299,10 +317,9 @@ fn redacted(row: &WorkerRow, now: Instant) -> proto::WorkerRow {
 /// userinfo goes, and every other byte stays as registered. The crate's one
 /// split tells the userinfo from the address ([`split`]): an address it
 /// cannot split is told as [`UNPARSABLE`], the marker a log line writes for
-/// it. The scheme is told beside the host here, so it is kept where it is
-/// one by its form ([`is_scheme`]). Any other text before `://` may be part
-/// of a userinfo that holds `://`: such an address is told by the marker
-/// too.
+/// it. The scheme is told beside the host, and the split reads one by its
+/// form alone: any other text before a `://` is the address's own, read
+/// for its userinfo with the rest.
 ///
 /// The userinfo is the one credential a URL carries by its form. A secret a
 /// registrant wrote into a path or a query is not known as one here.
@@ -316,24 +333,7 @@ fn without_userinfo(address: &str) -> Option<String> {
     else {
         return Some(UNPARSABLE.to_owned());
     };
-    if !userinfo {
-        return None;
-    }
-    let named = scheme.strip_suffix("://").unwrap_or(scheme);
-    if !scheme.is_empty() && !is_scheme(named) {
-        return Some(UNPARSABLE.to_owned());
-    }
-    Some(format!("{scheme}{host}{tail}"))
-}
-
-/// Whether `text` is a URL's scheme by its form (RFC 3986): a letter, then
-/// letters, digits, `+`, `-` or `.`.
-fn is_scheme(text: &str) -> bool {
-    let mut bytes = text.bytes();
-    bytes
-        .next()
-        .is_some_and(|first| first.is_ascii_alphabetic())
-        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
+    userinfo.then(|| format!("{scheme}{host}{tail}"))
 }
 
 #[cfg(test)]
@@ -599,8 +599,27 @@ mod tests {
                 "grpc+tls://user@10.0.0.5:8000",
                 Some("grpc+tls://10.0.0.5:8000"),
             ),
+            // A `://` behind the authority is no scheme's: the authority
+            // starts at the address's first byte, and its userinfo goes.
+            (
+                "user:secret@10.0.0.5:8000/next/http://other",
+                Some("10.0.0.5:8000/next/http://other"),
+            ),
+            (
+                "user:secret@10.0.0.5:8000?next=http://other",
+                Some("10.0.0.5:8000?next=http://other"),
+            ),
+            (
+                "user:secret@10.0.0.5:8000#http://other",
+                Some("10.0.0.5:8000#http://other"),
+            ),
+            (
+                "grpc://user:secret@10.0.0.5:8000?next=http://other",
+                Some("grpc://10.0.0.5:8000?next=http://other"),
+            ),
             // No userinfo: every byte stays.
             ("grpc://10.0.0.5:8000", None),
+            ("10.0.0.5:8000?next=http://other", None),
             ("http://[::1]:8000/v1?x=1", None),
             ("10.0.0.5:8000", None),
             ("1http://10.0.0.5:8000", None),
@@ -611,8 +630,8 @@ mod tests {
             ("http://user:se?cret@10.0.0.5:8000", Some(UNPARSABLE)),
             ("http://user:se#cret@10.0.0.5:8000", Some(UNPARSABLE)),
             ("http://10.0.0.5:8000/a@b", Some(UNPARSABLE)),
-            // No scheme by its form stands before `://`: the text may be a
-            // userinfo's own, and none of it is told.
+            // No scheme by its form stands before `://`: its `/` ends the
+            // authority, and the `@` behind it stands past that end.
             ("user:se://cret@10.0.0.5:8000", Some(UNPARSABLE)),
             ("1http://user:secret@10.0.0.5:8000", Some(UNPARSABLE)),
         ] {
@@ -769,6 +788,18 @@ mod tests {
             )
         );
 
+        // The handler reads the source ahead of the turn, in the same
+        // words, and asks nothing of a request for the rows alone.
+        let ahead = Asked { spec: true, ..ROWS }
+            .sourced(false)
+            .expect_err("refused");
+        assert_eq!(
+            (ahead.code(), ahead.message()),
+            (refused.code(), refused.message())
+        );
+        assert!(ROWS.sourced(false).is_ok());
+        assert!(Asked { spec: true, ..ROWS }.sourced(true).is_ok());
+
         let answer = take(&ROWS).expect("the rows");
         assert_eq!(
             (
@@ -839,7 +870,7 @@ mod tests {
         let most = Arc::new(AtomicUsize::new(0));
         let on_runtime = Arc::new(AtomicBool::new(false));
         let mut calls = JoinSet::new();
-        for n in 0..SNAPSHOTS_WAITING {
+        for n in 0..=SNAPSHOTS_WAITING {
             let turn = Arc::clone(&turn);
             let (word, inside, most) = (Arc::clone(&word), Arc::clone(&inside), Arc::clone(&most));
             let on_runtime = Arc::clone(&on_runtime);
@@ -865,14 +896,14 @@ mod tests {
         }
         // Every call is let in: one is taken, the others wait their turn.
         let began = Instant::now();
-        while turn.let_in() < SNAPSHOTS_WAITING && began.elapsed() < Duration::from_secs(20) {
+        while turn.let_in() <= SNAPSHOTS_WAITING && began.elapsed() < Duration::from_secs(20) {
             tokio::task::yield_now().await;
         }
         assert!(
             !on_runtime.load(Ordering::SeqCst),
             "a take ran on the runtime's thread"
         );
-        assert_eq!(turn.let_in(), SNAPSHOTS_WAITING);
+        assert_eq!(turn.let_in(), SNAPSHOTS_WAITING + 1);
         let past = tokio::time::timeout(Duration::from_secs(5), turn.run(|| ()))
             .await
             .expect("an answer at once")
@@ -884,7 +915,7 @@ mod tests {
                 "32 snapshots wait their turn: ask again later"
             )
         );
-        for _ in 0..SNAPSHOTS_WAITING {
+        for _ in 0..=SNAPSHOTS_WAITING {
             release.send(()).expect("a take waits for the word");
         }
         let mut ended = Vec::new();
@@ -892,7 +923,7 @@ mod tests {
             ended.push(call.expect("the call's task").expect("its turn came"));
         }
         ended.sort_unstable();
-        assert_eq!(ended, (0..SNAPSHOTS_WAITING).collect::<Vec<_>>());
+        assert_eq!(ended, (0..=SNAPSHOTS_WAITING).collect::<Vec<_>>());
         assert_eq!(most.load(Ordering::SeqCst), 1, "two takes ran at once");
         assert_eq!(turn.let_in(), 0, "each place went back");
     }
