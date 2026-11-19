@@ -2401,6 +2401,38 @@ pub struct Engine {
     /// seat without sampling.
     seat_flags: u8,
     explain_sample: u32,
+    /// The stages that keep a number of the reports
+    /// ([`Lifecycle::keeps_loads`]), each by its place: listed once at the
+    /// build, so a publication asks no stage whether it keeps them.
+    keepers: Vec<Keeper>,
+}
+
+/// A stage that keeps a number of the reports, by its place in the engine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Keeper {
+    /// The scorer at `stage` of the profile at `profile`.
+    Scorer { profile: u16, stage: u16 },
+    /// The picker of the profile at `profile`.
+    Picker { profile: u16 },
+}
+
+impl Keeper {
+    /// The stages of `profiles` that say they keep the reports, in the
+    /// profiles' order, a profile's scorers ahead of its picker.
+    fn of(profiles: &[Profile]) -> Vec<Self> {
+        let mut keepers = Vec::new();
+        for (at, profile) in (0u16..).zip(profiles) {
+            for (stage, weighted) in (0u16..).zip(&profile.scorers) {
+                if weighted.scorer.keeps_loads() {
+                    keepers.push(Self::Scorer { profile: at, stage });
+                }
+            }
+            if profile.picker.keeps_loads() {
+                keepers.push(Self::Picker { profile: at });
+            }
+        }
+        keepers
+    }
 }
 
 /// A stage keeps state a decider, so each model decides at its own seat.
@@ -3234,6 +3266,7 @@ impl Engine {
             .iter()
             .map(|profile| RowTests::of(&profile.filters))
             .collect();
+        let keepers = Keeper::of(&profiles);
         // A picker that leaves the placement to its rule has no stages to
         // delegate to: the assignment that places is written beside each
         // binding here, once, so no decision asks. The binding itself keeps
@@ -3269,6 +3302,7 @@ impl Engine {
             orders,
             seat_flags: u8::from(keeping) * KEEPS_DECIDERS,
             explain_sample: 0,
+            keepers,
         }
     }
 
@@ -4451,21 +4485,24 @@ impl Engine {
 }
 
 impl Engine {
-    /// Tells `report`, a rank's report as its host shows it to decisions,
-    /// to each stage that keeps a number of the reports
-    /// ([`Lifecycle::keeps_loads`]), and to no other stage. A publication
-    /// sends no signal to a stage that keeps none: a plugin that watches
-    /// signals hears of a world's reports no more than it did before a
-    /// stage kept any.
-    pub(crate) fn tell_load(&self, report: &Signal) {
-        for profile in &self.profiles {
-            for w in &profile.scorers {
-                if w.scorer.keeps_loads() {
-                    w.scorer.on_signal(report);
+    /// Tells a world's reports, each as its host shows it to decisions, to
+    /// every stage that keeps a number of the reports
+    /// ([`Lifecycle::keeps_loads`]), and to no other stage. `reports` is
+    /// run once for each such stage and hands every report to the call it
+    /// is given. An engine with no such stage never runs it: a publication
+    /// that tells nobody walks no row. A plugin that watches signals hears
+    /// of a world's reports no more than it did before a stage kept any.
+    pub(crate) fn tell_loads(&self, reports: impl Fn(&mut dyn FnMut(&Signal))) {
+        for keeper in &self.keepers {
+            match *keeper {
+                Keeper::Scorer { profile, stage } => {
+                    let scorer = &self.profiles[usize::from(profile)].scorers[usize::from(stage)];
+                    reports(&mut |report| scorer.scorer.on_signal(report));
                 }
-            }
-            if profile.picker.keeps_loads() {
-                profile.picker.on_signal(report);
+                Keeper::Picker { profile } => {
+                    let picker = &self.profiles[usize::from(profile)].picker;
+                    reports(&mut |report| picker.on_signal(report));
+                }
             }
         }
     }
@@ -4535,9 +4572,7 @@ impl Lifecycle for Engine {
     }
 
     fn keeps_loads(&self) -> bool {
-        self.profiles.iter().any(|profile| {
-            profile.picker.keeps_loads() || profile.scorers.iter().any(|w| w.scorer.keeps_loads())
-        })
+        !self.keepers.is_empty()
     }
 
     fn needs_lifecycle(&self) -> bool {

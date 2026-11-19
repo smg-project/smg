@@ -917,7 +917,9 @@ impl World {
     /// Tells this world's engine each rank's report, where a stage of it
     /// keeps a number of them ([`Lifecycle::keeps_loads`]): what the store
     /// does before it shows a world, so a decision over the world finds
-    /// the numbers of its own rows.
+    /// the numbers of its own rows. An engine with no such stage says so
+    /// by one word made at its build, and the tell is not entered: by
+    /// count the call alone read 29 instructions a publication.
     pub(crate) fn tell_kept_loads(&self) {
         let engine = self.spec.engine();
         if engine.keeps_loads() {
@@ -931,19 +933,21 @@ impl World {
     /// stage that keeps none is sent nothing. A member of several pools is
     /// told once a pool, the same word.
     pub fn tell_loads(&self, engine: &Engine) {
-        for (rows, shape) in self.rows.iter().zip(self.derived.pools.iter()) {
-            for (row, &slot) in rows.iter().zip(shape.booked.iter()) {
-                if let Some(load) = row.load {
-                    engine.tell_load(&Signal::Load {
-                        worker: row.id,
-                        dp_rank: row.dp_rank,
-                        row: load,
-                        slot,
-                        sampled_at_micros: row.load_sampled_at_micros,
-                    });
+        engine.tell_loads(|tell| {
+            for (rows, shape) in self.rows.iter().zip(self.derived.pools.iter()) {
+                for (row, &slot) in rows.iter().zip(shape.booked.iter()) {
+                    if let Some(load) = row.load {
+                        tell(&Signal::Load {
+                            worker: row.id,
+                            dp_rank: row.dp_rank,
+                            row: load,
+                            slot,
+                            sampled_at_micros: row.load_sampled_at_micros,
+                        });
+                    }
                 }
             }
-        }
+        });
     }
 
     /// `at` in the rows' clock: microseconds since the store's origin.

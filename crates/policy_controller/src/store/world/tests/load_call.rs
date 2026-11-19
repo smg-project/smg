@@ -15,8 +15,10 @@ mod held {
 
     use super::super::{ask, load, member, MODEL};
     use crate::{
+        builtins::target_of,
         counts::Slot,
-        framework::{Scorer, TieBand},
+        decision::Targets,
+        framework::{Picker, Scorer, TieBand},
         lease::{Lifecycle, Signal},
         spec::BindingSpec,
         store::{world::ViewBuffers, Kinds, LoadSink, LoadSource, MemoryStore},
@@ -88,6 +90,27 @@ mod held {
         }
     }
 
+    impl Picker for Keeper {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        /// The first row handed, whatever it scores.
+        fn pick(
+            &self,
+            _: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            _: &[f32],
+            _: TieBand,
+            out: &mut Targets,
+        ) {
+            if let Some(&row) = kept.first() {
+                out.push(target_of(&candidates[row as usize]));
+            }
+        }
+    }
+
     /// The sample instant of the report the standing world shows for
     /// `worker`: zero where it shows none.
     fn shown(store: &MemoryStore, worker: WorkerId) -> u64 {
@@ -106,16 +129,18 @@ mod held {
     /// Generation `number` of one profile for every model, scored by a
     /// keeper that says `keeps` of the reports.
     fn generation(number: u64, store: &Arc<MemoryStore>, told: &Told, keeps: bool) -> AppliedSpec {
-        generation_of(number, store, &[("keeper", told, keeps)])
+        generation_of(number, store, &[("keeper", told, keeps)], None)
     }
 
     /// Generation `number` of one profile for every model, scored by one
     /// keeper a name: each writes down what it is told and says of the
-    /// reports what its entry says.
+    /// reports what its entry says. A keeper named as `picks` is the
+    /// profile's picker; with none the built-in best picks.
     fn generation_of(
         number: u64,
         store: &Arc<MemoryStore>,
         stages: &[(&'static str, &Told, bool)],
+        picks: Option<(&'static str, &Told, bool)>,
     ) -> AppliedSpec {
         let mut catalog = Catalog::builtin();
         for &(name, told, keeps) in stages {
@@ -131,10 +156,24 @@ mod held {
                 })
                 .expect("a free name");
         }
+        let pick = picks.map_or("best", |(name, told, keeps)| {
+            let (told, store) = (Arc::clone(told), Arc::downgrade(store));
+            catalog
+                .picker(name, move || {
+                    Box::new(Keeper {
+                        name,
+                        keeps,
+                        told: Arc::clone(&told),
+                        store: Weak::clone(&store),
+                    })
+                })
+                .expect("a free name");
+            name
+        });
         let names: Vec<&str> = stages.iter().map(|&(name, ..)| name).collect();
         let score = serde_json::to_string(&names).expect("the names");
         let mut document: PolicySpec = serde_json::from_str(&format!(
-            r#"{{"apiVersion":"smg.policy/v1","profiles":{{"p":{{"score":{score},"pick":"best"}}}}}}"#
+            r#"{{"apiVersion":"smg.policy/v1","profiles":{{"p":{{"score":{score},"pick":"{pick}"}}}}}}"#
         ))
         .expect("a document");
         document.generation = number;
@@ -246,11 +285,31 @@ mod held {
         let (told, heard) = (Told::default(), Told::default());
         let stages = [("keeper", &told, true), ("watcher", &heard, false)];
         store
-            .apply(generation_of(1, &store, &stages))
+            .apply(generation_of(1, &store, &stages, None))
             .expect("applied");
         let id = member(&store, "http://a:8000");
         store.record(id, 0, load(3, 0), Instant::now(), LoadSource::Stream);
         assert_eq!(told.lock().len(), 1, "the keeper's one word");
         assert!(heard.lock().is_empty(), "a stage that keeps none heard");
+    }
+
+    /// A picker hears a world's reports by the same word as a scorer: one
+    /// that keeps them is told each, and one that keeps none is told
+    /// nothing, beside a scorer that keeps them.
+    #[test]
+    fn a_picker_is_told_a_world_s_reports_where_it_keeps_them() {
+        for keeps in [true, false] {
+            let store = Arc::new(MemoryStore::new());
+            let (told, picked) = (Told::default(), Told::default());
+            let stages = [("keeper", &told, true)];
+            let picks = Some(("picks", &picked, keeps));
+            store
+                .apply(generation_of(1, &store, &stages, picks))
+                .expect("applied");
+            let id = member(&store, "http://a:8000");
+            store.record(id, 0, load(3, 0), Instant::now(), LoadSource::Stream);
+            assert_eq!(told.lock().len(), 1, "the scorer's one word");
+            assert_eq!(picked.lock().len(), usize::from(keeps), "keeps: {keeps}");
+        }
     }
 }

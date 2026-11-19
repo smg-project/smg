@@ -18,7 +18,7 @@ use parking_lot::{Mutex, MutexGuard};
 use rustc_hash::{FxHashMap, FxHasher};
 
 use crate::{
-    counts::{with_counts, Pieces, Slot},
+    counts::{with_counts, LentCounts, Pieces, Slot},
     decision::{Target, Targets, MAX_TARGETS},
     framework::{
         top_drawn, top_pass, Filter, Front, Narrowed, Picker, Scorer, TieBand, Unit, DRAW_BOUND,
@@ -670,7 +670,7 @@ impl SinceReport {
     /// before the report's sample are released. A sample that reaches none
     /// of them reads the word alone. Inlined into each load scorer's row
     /// loop: two loads and a compare a row, the release behind a call.
-    #[inline]
+    #[inline(always)]
     fn credit_through(&self, sampled_at_micros: u64) -> (u64, u64) {
         if self.oldest_micros.load(Ordering::Acquire) <= sampled_at_micros {
             self.release_through(sampled_at_micros);
@@ -1513,13 +1513,17 @@ impl ResidentWork {
     /// the tally, or the mark of a row costed after the reporting peers'
     /// baseline is known. A report releases the dispatches it reflects
     /// whatever the score reads of them: a rank whose report counts no
-    /// resident tokens would hold its credit at the bound.
-    #[inline]
+    /// resident tokens would hold its credit at the bound. The row's
+    /// requests in flight are asked for where the row is costed, and of no
+    /// row that is marked. Inlined into each row loop of the score: as a
+    /// call it read 19 instructions a row more for a host that lends no
+    /// counts.
+    #[inline(always)]
     fn cost_reported(
         &self,
         tally: &FxHashMap<RankKey, Arc<SinceReport>>,
         row: &Candidate,
-        in_flight: u32,
+        in_flight: impl FnOnce() -> u32,
         reporting: &mut usize,
     ) -> f32 {
         let reported = row.load.map(|r| {
@@ -1531,10 +1535,78 @@ impl ResidentWork {
         match reported {
             Some((r, (tokens, requests))) if r.resident_counted => {
                 *reporting += 1;
-                self.reported_cost(in_flight, r, tokens, requests)
+                self.reported_cost(in_flight(), r, tokens, requests)
             }
             _ => PENDING,
         }
+    }
+}
+
+impl ResidentWork {
+    /// The rows' costs beside a lent table, and how many of them report.
+    /// A row whose member's number the stage keeps is costed by one read
+    /// of it, where the row holds no request beyond those the number
+    /// accounts for. Any other row is costed by its report and its
+    /// credit, under one load of the tally taken at the first such row,
+    /// or marked and costed after the reporting peers' baseline is known.
+    /// A row with no report is marked at once: no count, no cell and no
+    /// tally is read for it. A cell holds a number only of a report that
+    /// counts resident tokens, so a row with any other report is asked for
+    /// none. Inlined into the score: as a call it read 19 to 37
+    /// instructions a decision more.
+    #[inline(always)]
+    fn cost_lent(
+        &self,
+        lent: &LentCounts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        out: &mut [f32],
+    ) -> usize {
+        let mut reporting = 0usize;
+        let run = lent.run();
+        let first = self.kept.first();
+        let mut tally = None;
+        for (slot, &i) in out.iter_mut().zip(kept) {
+            let c = &candidates[i as usize];
+            *slot = match &c.load {
+                None => PENDING,
+                Some(report) if report.resident_counted => {
+                    let in_flight = run.of(c);
+                    let cell = self.kept.cell_from(first, run.slot_of(c));
+                    match cell.and_then(|cell| cell.read(c)) {
+                        Some((cost, accounted)) if in_flight <= accounted => {
+                            reporting += 1;
+                            cost
+                        }
+                        _ => {
+                            let tally = tally.get_or_insert_with(|| self.credits.tally.load());
+                            self.cost_reported(tally, c, || in_flight, &mut reporting)
+                        }
+                    }
+                }
+                Some(_) => {
+                    let tally = tally.get_or_insert_with(|| self.credits.tally.load());
+                    self.cost_reported(tally, c, || run.of(c), &mut reporting)
+                }
+            };
+        }
+        reporting
+    }
+
+    /// The rows' costs by each row's own count, for a host that lends
+    /// none, and how many of them report: every row by its report and its
+    /// credit under one load of the tally, as before a number was kept.
+    /// Out of line: inside the score, beside the other loop, it read two
+    /// instructions a row more than it did before.
+    #[inline(never)]
+    fn cost_own(&self, candidates: &[Candidate], kept: &[u32], out: &mut [f32]) -> usize {
+        let mut reporting = 0usize;
+        let tally = self.credits.tally.load();
+        for (slot, &i) in out.iter_mut().zip(kept) {
+            let c = &candidates[i as usize];
+            *slot = self.cost_reported(&tally, c, || c.in_flight, &mut reporting);
+        }
+        reporting
     }
 }
 
@@ -1630,42 +1702,13 @@ impl Scorer for ResidentWork {
         kept: &[u32],
         out: &mut [f32],
     ) -> TieBand {
-        // Beside a lent table a row whose member's number the stage keeps
-        // is costed by one read of it, where the row holds no request
-        // beyond those the number accounts for. Any other row is costed by
-        // its report and its credit, under one load of the tally taken at
-        // the first such row, or marked and costed after the reporting
-        // peers' baseline is known.
-        let mut reporting = 0usize;
-        match facts.lent_in_flight {
-            Some(lent) => {
-                let run = lent.run();
-                let first = self.kept.first();
-                let mut tally = None;
-                for (slot, &i) in out.iter_mut().zip(kept) {
-                    let c = &candidates[i as usize];
-                    let in_flight = run.of(c);
-                    let cell = self.kept.cell_from(first, run.slot_of(c));
-                    *slot = match cell.and_then(|cell| cell.read(c)) {
-                        Some((cost, accounted)) if in_flight <= accounted => {
-                            reporting += 1;
-                            cost
-                        }
-                        _ => {
-                            let tally = tally.get_or_insert_with(|| self.credits.tally.load());
-                            self.cost_reported(tally, c, in_flight, &mut reporting)
-                        }
-                    };
-                }
-            }
-            None => {
-                let tally = self.credits.tally.load();
-                for (slot, &i) in out.iter_mut().zip(kept) {
-                    let c = &candidates[i as usize];
-                    *slot = self.cost_reported(&tally, c, c.in_flight, &mut reporting);
-                }
-            }
-        }
+        // A loop a kind of host. The loop beside a lent table stands here;
+        // the loop of a host that lends no counts is a call, and stays the
+        // one it was before a number was kept.
+        let reporting = match facts.lent_in_flight {
+            Some(lent) => self.cost_lent(lent, candidates, kept, out),
+            None => self.cost_own(candidates, kept, out),
+        };
         if reporting < kept.len() {
             self.cost_pending(facts, candidates, kept, out, reporting > 0);
         }
@@ -5959,6 +6002,52 @@ mod tests {
         assert_eq!(kept_of(&stage, slot, &was), None);
     }
 
+    /// A rank told under a second slot lets the cell of its first go: a
+    /// row that still holds the first slot and the report told there is
+    /// costed from its parts, behind a dispatch too. The cell keeps no
+    /// number of that instant for another rank told under it, and keeps
+    /// the next instant's.
+    #[test]
+    fn a_rank_told_under_a_second_slot_lets_its_first_cell_go() {
+        let stage = ResidentWork::new(700);
+        let mut pool = [candidate(0, 0), candidate(1, 0)];
+        pool[0].load = Some(resident(1, 2_000));
+        pool[0].load_sampled_at_micros = 1_000;
+        let lent = Lent::take(&mut pool);
+        let (first, second) = (lent.slot_of(&pool[0]), lent.slot_of(&pool[1]));
+        let was = pool[0];
+        tell(&stage, first, &was);
+        assert_eq!(kept_of(&stage, first, &was), Some((2_700.0, 1)));
+
+        let mut is = was;
+        is.load = Some(resident(2, 4_000));
+        is.load_sampled_at_micros = 2_000;
+        tell(&stage, second, &is);
+        assert_eq!(kept_of(&stage, second, &is), Some((5_400.0, 2)));
+        assert_eq!(kept_of(&stage, first, &was), None, "the cell let go");
+
+        let lease = Lease {
+            issued_micros: 3_000,
+            tokens: 1_500,
+            ..Lease::default()
+        };
+        stage.on_dispatched(&lease, &target_of(&is), Side::Single, 0);
+        assert_eq!(kept_of(&stage, first, &was), None, "behind a dispatch");
+        assert_eq!(kept_of(&stage, second, &is), Some((7_600.0, 3)));
+
+        // Another rank told under the first slot at that instant is kept
+        // no number of it: the row above names that instant too.
+        let mut other = candidate(2, 0);
+        other.load = Some(resident(3, 6_000));
+        other.load_sampled_at_micros = 1_000;
+        tell(&stage, first, &other);
+        assert_eq!(kept_of(&stage, first, &other), None, "that instant");
+        assert_eq!(kept_of(&stage, first, &was), None, "another rank's");
+        other.load_sampled_at_micros = 1_500;
+        tell(&stage, first, &other);
+        assert_eq!(kept_of(&stage, first, &other), Some((8_100.0, 3)));
+    }
+
     /// A cell that changes hands keeps no number of an instant the entry
     /// that wrote it before was told a report of: a decision that still
     /// reads that entry's row would be handed another rank's number under
@@ -6077,13 +6166,14 @@ mod tests {
     /// late one, another report under the same instant, a report that
     /// counts no resident tokens, and the rank's leave. It keeps a number
     /// of each row whose report counts resident tokens, the row that holds
-    /// more requests than that number accounts for among them.
+    /// one request more than that number accounts for among them: that row
+    /// is costed from its parts.
     #[test]
     fn a_told_stage_scores_its_rows_as_an_untold_one_does() {
         let mut pool = [
             candidate(0, 1),
             candidate(1, 2),
-            candidate(2, 5),
+            candidate(2, 3),
             candidate(3, 1),
         ];
         pool[0].load = Some(resident(1, 2_000));
