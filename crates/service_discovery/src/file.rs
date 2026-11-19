@@ -99,7 +99,7 @@ struct ManifestVersion {
 /// writes it (see [`export_manifest`]).
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Manifest {
+pub struct Manifest {
     /// Checked by [`ManifestVersion`]; named here only so it is a known field.
     #[serde(rename = "version")]
     _version: u64,
@@ -140,7 +140,7 @@ struct ManifestWorker {
 /// exporting gateway would re-register the fleet on every reader. A
 /// worker's key is no manifest field and an address's credentials never
 /// leave: both are dropped, and each such address is named in `warnings`.
-pub(crate) fn export_manifest(workers: &[WorkerInfo]) -> Manifest {
+pub fn export_manifest(workers: &[WorkerInfo]) -> Manifest {
     // One record per data-parallel group: the lowest rank speaks for it.
     let mut lowest_rank: HashMap<&str, usize> = HashMap::new();
     for info in workers {
@@ -554,7 +554,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::service_discovery::testing::TestHost;
+    use crate::testing::TestHost;
 
     fn parse(json: &str, roles: Roles) -> Result<Vec<DiscoveredWorker>, String> {
         parse_manifest(json.as_bytes(), roles)
@@ -1131,9 +1131,10 @@ mod tests {
     #[test]
     fn an_exported_fleet_parses_back_without_its_credentials() {
         use openai_protocol::model_card::ModelCard;
-        use smg_worker::identity::basic::{worker_to_info, Worker};
-
-        use crate::routers::grpc::backend_client::BasicWorkerBuilder;
+        use smg_worker::{
+            identity::basic::{worker_to_info, Worker},
+            test_support::BasicWorkerBuilder,
+        };
 
         fn info(worker: BasicWorkerBuilder) -> WorkerInfo {
             let worker: Arc<dyn Worker> = Arc::new(worker.build());
@@ -1225,9 +1226,10 @@ mod tests {
     /// that one record, not one per rank.
     #[test]
     fn a_data_parallel_group_exports_as_one_record_at_its_base_address() {
-        use smg_worker::identity::basic::{worker_to_info, Worker};
-
-        use crate::routers::grpc::backend_client::BasicWorkerBuilder;
+        use smg_worker::{
+            identity::basic::{worker_to_info, Worker},
+            test_support::BasicWorkerBuilder,
+        };
 
         let fleet: Vec<WorkerInfo> = (0..2)
             .map(|rank| {

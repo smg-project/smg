@@ -7853,6 +7853,7 @@ dependencies = [
  "smg-mm-rdma",
  "smg-response-template",
  "smg-rl",
+ "smg-service-discovery",
  "smg-symphony",
  "smg-test-harness",
  "smg-wasm",
@@ -8219,6 +8220,35 @@ dependencies = [
  "tokio",
  "tower",
  "tracing",
+]
+
+[[package]]
+name = "smg-service-discovery"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "blake3",
+ "futures",
+ "http",
+ "k8s-openapi",
+ "kube",
+ "metrics",
+ "notify",
+ "openai-protocol",
+ "openssl",
+ "parking_lot 0.13.0",
+ "reqwest 0.13.4",
+ "rustls",
+ "serde",
+ "serde_json",
+ "smg-worker",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "tracing-test",
+ "url",
 ]
 
 [[package]]

@@ -114,9 +114,7 @@ pub async fn start_service_discovery(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::service_discovery::config::{
-        ConsulDiscoveryConfig, FileDiscoveryConfig, SlurmDiscoveryConfig,
-    };
+    use crate::config::{ConsulDiscoveryConfig, FileDiscoveryConfig, SlurmDiscoveryConfig};
 
     fn kubernetes(config: &DiscoveryConfig, roles: Option<Roles>) -> ServiceDiscoveryConfig {
         let Ok(RuntimeDiscoveryConfig::Kubernetes(runtime)) =

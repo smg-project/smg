@@ -35,9 +35,9 @@ use crate::{
         validation::ConfigValidator,
         ConfigError, TenantApiKeyEntry,
     },
-    fs_watch::{directory_of, settle, DirectoryWatch},
     middleware::AuthConfig,
     server::posture::{SecretSource, SecretSources},
+    service_discovery::fs_watch::{directory_of, settle, DirectoryWatch},
 };
 
 /// How often a lost watch (the key files' directory removed or moved away) is

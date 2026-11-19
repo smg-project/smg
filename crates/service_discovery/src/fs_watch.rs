@@ -26,7 +26,7 @@ pub(crate) const SETTLE: Duration = Duration::from_millis(200);
 
 /// The directory a file is watched in: its parent, or the working directory
 /// for a bare name, which has none.
-pub(crate) fn directory_of(path: &Path) -> &Path {
+pub fn directory_of(path: &Path) -> &Path {
     match path.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => dir,
         _ => Path::new("."),
@@ -35,7 +35,7 @@ pub(crate) fn directory_of(path: &Path) -> &Path {
 
 /// A watch on a directory for the named files in it. Dropping it stops the
 /// watch.
-pub(crate) struct DirectoryWatch {
+pub struct DirectoryWatch {
     _watcher: RecommendedWatcher,
     /// Set once the watched directory itself is removed or moved away. The
     /// watch then reports nothing more, not even for a directory recreated at
@@ -58,11 +58,7 @@ impl DirectoryWatch {
     /// have changed, or the watch stopped working. A send that finds the
     /// channel full is dropped, because a wake is already pending and the
     /// reread it causes reads the latest files.
-    pub(crate) fn start(
-        dir: &Path,
-        names: Vec<OsString>,
-        wake: mpsc::Sender<()>,
-    ) -> notify::Result<Self> {
+    pub fn start(dir: &Path, names: Vec<OsString>, wake: mpsc::Sender<()>) -> notify::Result<Self> {
         // Watched by its absolute path, which is how inotify names the
         // directory in an event about the directory itself. FSEvents names it
         // resolved.
@@ -101,7 +97,7 @@ impl DirectoryWatch {
         })
     }
 
-    pub(crate) fn is_lost(&self) -> bool {
+    pub fn is_lost(&self) -> bool {
         self.lost.load(Ordering::Relaxed)
     }
 }
@@ -136,7 +132,7 @@ fn concerns(event: &Event, names: &[OsString]) -> bool {
 }
 
 /// Let a burst of events settle, then take every wake it sent as one.
-pub(crate) async fn settle(wake: &mut mpsc::Receiver<()>) {
+pub async fn settle(wake: &mut mpsc::Receiver<()>) {
     time::sleep(SETTLE).await;
     while wake.try_recv().is_ok() {}
 }

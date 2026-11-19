@@ -7,6 +7,9 @@
 //!   Pod-to-desired-worker conversion.
 //! - `file` rereads a JSON manifest of workers when it changes, and on a
 //!   fixed interval.
+//! - `fs_watch` is the watch on a directory that tells it of a change. The
+//!   watch stands in this crate because the file provider needs it; it is
+//!   public so that a host's own file readers share it and keep no copy.
 //! - `slurm` polls Slurm for the running jobs whose names map to worker
 //!   types, and places a worker on each of their nodes.
 //! - `consul` watches a Consul service with blocking queries, and makes a
@@ -36,6 +39,7 @@
 mod config;
 mod consul;
 mod file;
+pub mod fs_watch;
 mod host;
 mod kubernetes;
 mod provider;
@@ -44,8 +48,8 @@ mod runtime;
 mod series;
 mod slurm;
 mod snapshot;
-#[cfg(test)]
-pub(crate) mod testing;
+#[cfg(any(test, feature = "test-util"))]
+pub mod testing;
 
 pub use config::{
     deserialize_discovery, ConsulDiscoveryConfig, DiscoveryConfig, DiscoveryConfigError,
@@ -53,16 +57,13 @@ pub use config::{
     DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS,
 };
 pub use consul::ConsulProviderConfig;
-pub(crate) use file::export_manifest;
-pub use file::FileProviderConfig;
+pub use file::{export_manifest, FileProviderConfig, Manifest};
 pub use host::DiscoveryHost;
 #[cfg(feature = "test-util")]
 pub use kubernetes::start_service_discovery_with_client;
-pub(crate) use kubernetes::{
-    build_watcher_config, matches_selector, pod_ip, pod_is_ready, selector_string,
-};
 pub use kubernetes::{
-    ModelIdSource, PodInfo, PodType, ServiceDiscoveryConfig, POD_NAME_LABEL, POD_UID_LABEL,
+    build_watcher_config, matches_selector, pod_ip, pod_is_ready, selector_string, ModelIdSource,
+    PodInfo, PodType, ServiceDiscoveryConfig, POD_NAME_LABEL, POD_UID_LABEL,
 };
 pub use provider::Roles;
 pub use reconciler::{

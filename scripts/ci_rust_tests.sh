@@ -76,7 +76,7 @@ packages_of() {
         multimodal) echo llm-multimodal ;;
         symphony)   echo smg-symphony tool-parser reasoning-parser smg-response-template ;;
         agentic)    echo data-connector smg-mcp smg-wasm wfaas ;;
-        protocols)  echo openai-protocol smg-worker smg-external-router smg-auth smg-rl smg-client openapi-gen ;;
+        protocols)  echo openai-protocol smg-worker smg-external-router smg-service-discovery smg-auth smg-rl smg-client openapi-gen ;;
         engine)     echo smg-grpc-client engine-zmq-client engine-zmq-adapter engine-servicer mock-worker gateway-perf ;;
         kv)         echo kv-index smg-mesh smg-mm-rdma smg-policy-controller policy-controller-example smg-radix-tree ;;
         radix-fuzz) echo smg-radix-tree ;;
@@ -173,7 +173,7 @@ commands_of() {
             # Opt-in (#[ignore]) cases against the database the workflow creates for the job.
             echo "-p data-connector --test postgres_integration --test conformance :: --ignored --test-threads=1" ;;
         protocols)
-            echo "-p openai-protocol -p smg-worker -p smg-external-router -p smg-auth -p smg-rl -p smg-client -p openapi-gen --features openai-protocol/axum,smg-worker/runtime,smg-worker/workflow,smg-external-router/openai,smg-external-router/anthropic,smg-external-router/gemini" ;;
+            echo "-p openai-protocol -p smg-worker -p smg-external-router -p smg-service-discovery -p smg-auth -p smg-rl -p smg-client -p openapi-gen --features openai-protocol/axum,smg-worker/runtime,smg-worker/workflow,smg-external-router/openai,smg-external-router/anthropic,smg-external-router/gemini" ;;
         engine)
             echo "-p smg-grpc-client -p engine-zmq-client -p engine-zmq-adapter -p engine-servicer -p mock-worker -p gateway-perf --features engine-zmq-client/mock-engine" ;;
         kv)

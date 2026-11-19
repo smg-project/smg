@@ -8,7 +8,7 @@ use smg_worker::{
 use tokio::runtime::Builder;
 
 use super::*;
-use crate::service_discovery::testing::{Queued, TestHost, STAMPED_API_KEY, STAMPED_ATTEMPTS};
+use crate::testing::{Queued, TestHost, STAMPED_API_KEY, STAMPED_ATTEMPTS};
 
 fn key(url: &str) -> EndpointKey {
     endpoint_key(url).expect(url)
@@ -226,8 +226,7 @@ fn diverged_ranks_do_not_collapse_on_equal_revisions() {
 
 fn register_with_labels(host: &TestHost, url: &str, labels: &[(&str, &str)]) {
     use openai_protocol::model_card::ModelCard;
-
-    use crate::routers::grpc::backend_client::BasicWorkerBuilder;
+    use smg_worker::test_support::BasicWorkerBuilder;
 
     let labels: HashMap<String, String> = labels
         .iter()

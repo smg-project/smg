@@ -14,7 +14,7 @@
 //! - [`rl_adapter`]: the RL control plane's read-only view of the worker registry.
 //! - [`routers`]: the request paths (HTTP, gRPC, external providers) and what they share.
 //! - [`server`]: start-up and its phases, the route table, the listeners and their limits, graceful shutdown, the posture log, the private-key-file check, the process TLS crypto provider and the HTTP client constructors that need it; in [`server::health`](mod@server::health), liveness and readiness, the readiness snapshot and the optional probe listener.
-//! - [`service_discovery`]: worker discovery providers and the reconciler.
+//! - [`service_discovery`]: worker discovery providers and the reconciler: the `smg_service_discovery` crate, re-exported under this name.
 //! - [`tenant`]: tenant identity, keys and per-request metadata.
 //! - [`version`]: the build identity.
 //! - [`wasm`]: WebAssembly module support and its routes.
@@ -28,7 +28,6 @@ pub mod app_context;
 pub mod config;
 mod discovery_host;
 pub mod endpoints;
-pub(crate) mod fs_watch;
 pub mod mesh;
 pub mod middleware;
 pub mod observability;
@@ -38,7 +37,7 @@ pub mod rl_adapter;
 pub mod routers;
 pub mod secrets;
 pub mod server;
-pub mod service_discovery;
+pub use smg_service_discovery as service_discovery;
 pub mod tenant;
 pub mod version;
 pub mod wasm;
