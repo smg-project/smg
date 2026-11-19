@@ -4886,7 +4886,9 @@ fn a_score_the_host_held_that_then_declines_is_a_decline_and_the_hosts_stall() {
 /// hold and half of what the hold leaves of the budget, where the calls
 /// after the score run out under what is left. The case's hold is off the
 /// CPU and a decision's own work is not: a call that work ends is the
-/// host's fault, however long its decision took.
+/// host's fault, however long its decision took. A budget spent with no
+/// call failed is the runner's wherever the time went: the hold leaves
+/// four tenths of the budget, and the clock alone took the rest.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn one_window_of_short_holds(name: &str, arm: bool) -> (Arc<Plugin>, bool, bool) {
     let runtime = runtime();
@@ -4935,12 +4937,16 @@ fn one_window_of_short_holds(name: &str, arm: bool) -> (Arc<Plugin>, bool, bool)
         let (fuel, traps, spent) = ran_out();
         let faulted = (fuel, traps) != (before.0, before.1);
         let budget_gone = spent != before.2 && !arming;
-        if faulted || budget_gone {
+        if faulted {
             if arming || off_the_cpu < late {
                 by_the_host += 1;
             } else {
                 by_the_runner += 1;
             }
+        } else if budget_gone {
+            // No call failed and the decision's calls still took its whole
+            // budget: on the CPU or off it, that time was the clock's.
+            by_the_runner += 1;
         }
     }
     (plugin, cheap, by_the_runner > 0 && by_the_host == 0)
@@ -4950,7 +4956,7 @@ fn one_window_of_short_holds(name: &str, arm: bool) -> (Arc<Plugin>, bool, bool)
 /// is made again.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 const A_HOLD_REACHED_A_PICK: &str =
-    "a call ran out in a decision whose thread was off the CPU for its short hold and half of what the hold leaves of the budget";
+    "a call ran out in a decision whose thread was off the CPU for its short hold and half of what the hold leaves of the budget, or a decision's budget ran out with no call failed";
 
 /// [`one_window_of_short_holds`], made again while its faults are the
 /// runner's, [`TRIES`] windows at most, each under a plugin name of its own
@@ -4987,7 +4993,8 @@ fn a_window_of_short_holds(case: &str, name: &str, arm: bool) -> (Arc<Plugin>, b
 /// A call that runs out is the host's fault unless its decision's thread
 /// was off the CPU for its short hold and half of what the hold leaves of
 /// the budget: a hold of the runner's own past that reaches the remainder
-/// the later calls run under. A window whose faults all fell there says so
+/// the later calls run under. A decision's budget spent with no call failed
+/// is the runner's too. A window whose faults are all the runner's says so
 /// and is made again, [`TRIES`] windows at most.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
