@@ -8,6 +8,28 @@ use serde::{Deserialize, Serialize};
 
 use crate::{registry::WorkerId, worker::WorkerSpec};
 
+/// Who asked for a worker job. The caller states it when it asks. The host
+/// carries it on the job, and a host's step reads it from the workflow data.
+///
+/// An asker is always stated, so the type has no default:
+///
+/// ```compile_fail
+/// use smg_worker::jobs::WorkerJobAsker;
+/// let _ = WorkerJobAsker::default();
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum WorkerJobAsker {
+    /// A call of the worker API.
+    Api,
+    /// An address the host was started with.
+    Startup,
+    /// A discovery source. It names no source today. It carries the
+    /// source's name the day a host runs two.
+    Discovery,
+    /// The health manager.
+    Health,
+}
+
 /// Semantics of the final worker registry write.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WorkerRegistrationMode {
@@ -36,7 +58,7 @@ pub enum WorkerRegistrationMode {
 /// of the labels of one that came into service. A discovery source asks for
 /// a registration, for the removal of the workers at an address, and whether
 /// a job of an address is in flight. The host's job queue implements it;
-/// no caller names a job.
+/// no caller names a job. Each caller states who it is when it asks.
 #[async_trait]
 pub trait WorkerJobs: Send + Sync {
     /// Queue the removal of workers at `url`: each one a guard names by its
@@ -47,6 +69,7 @@ pub trait WorkerJobs: Send + Sync {
         &self,
         url: String,
         guards: Vec<(WorkerId, u64)>,
+        asker: WorkerJobAsker,
     ) -> Result<(), String>;
 
     /// Queue the removal of the one worker `worker_id` at `url`, as it stood
@@ -56,15 +79,20 @@ pub trait WorkerJobs: Send + Sync {
         url: String,
         worker_id: &WorkerId,
         revision: u64,
+        asker: WorkerJobAsker,
     ) -> Result<(), String> {
-        self.remove_workers_at(url, vec![(worker_id.clone(), revision)])
+        self.remove_workers_at(url, vec![(worker_id.clone(), revision)], asker)
             .await
     }
 
     /// Queue a re-read of the labels of the worker at `url`. `Ok(false)` when
     /// another job for the worker is in flight: the refresh is kept and runs
     /// when that job ends.
-    async fn refresh_worker_labels(&self, url: String) -> Result<bool, String>;
+    async fn refresh_worker_labels(
+        &self,
+        url: String,
+        asker: WorkerJobAsker,
+    ) -> Result<bool, String>;
 
     /// Queue the registration of the worker `spec` describes, under `mode`.
     /// `Ok(false)` when a registration of that address is in flight: nothing
@@ -76,6 +104,7 @@ pub trait WorkerJobs: Send + Sync {
         &self,
         spec: WorkerSpec,
         mode: WorkerRegistrationMode,
+        asker: WorkerJobAsker,
     ) -> Result<bool, String>;
 
     /// Whether the host's record of the address `url`, as written, shows a

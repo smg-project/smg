@@ -113,6 +113,7 @@ mod tests {
     };
     use smg_worker::{
         identity::basic::{ConnectionMode, Worker},
+        jobs::WorkerJobAsker,
         kv_events::SubscriptionKind,
         test_support::ready_worker,
     };
@@ -185,6 +186,7 @@ mod tests {
             "http://w1:8000".to_string(),
             update,
             Arc::clone(&app_context),
+            WorkerJobAsker::Api,
         );
         data.updated_workers = Some(workers);
         let mut context = WorkflowContext::new(WorkflowInstanceId::new(), data);
@@ -270,6 +272,7 @@ mod tests {
         drop(first);
 
         let data = WorkerUpdateWorkflowData {
+            asker: WorkerJobAsker::Health,
             config: WorkerUpdateRequest {
                 priority: None,
                 cost: None,
@@ -331,6 +334,7 @@ mod tests {
         drop(first);
 
         let data = WorkerUpdateWorkflowData {
+            asker: WorkerJobAsker::Health,
             config: WorkerUpdateRequest {
                 priority: None,
                 cost: None,
@@ -403,6 +407,7 @@ mod tests {
         );
 
         let data = WorkerUpdateWorkflowData {
+            asker: WorkerJobAsker::Health,
             config: WorkerUpdateRequest {
                 priority: None,
                 cost: None,
@@ -469,6 +474,7 @@ mod tests {
         let url = second.url().to_string();
 
         let data = WorkerUpdateWorkflowData {
+            asker: WorkerJobAsker::Health,
             config: WorkerUpdateRequest {
                 priority: None,
                 cost: None,
@@ -562,6 +568,7 @@ mod tests {
         );
 
         let data = WorkerUpdateWorkflowData {
+            asker: WorkerJobAsker::Health,
             config: WorkerUpdateRequest {
                 priority: None,
                 cost: None,

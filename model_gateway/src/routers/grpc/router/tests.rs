@@ -16,6 +16,7 @@ use serde_json::json;
 use smg_grpc_client::{common_proto as common, tokenspeed_proto as ts};
 use smg_worker::{
     identity::basic::{BasicWorker, ConnectionMode, RuntimeType},
+    jobs::WorkerJobAsker,
     workflow::WorkerKind,
 };
 use tonic::{transport::Server, Request as TonicRequest, Response as TonicResponse, Status};
@@ -463,6 +464,7 @@ fn tokenizer_step_input(
         WorkerSpec::new("grpc://worker:30000"),
         WorkerRegistrationMode::Upsert,
         ctx.clone(),
+        WorkerJobAsker::Api,
     );
     data.worker_kind = Some(WorkerKind::Local);
     data.connection_mode = Some(ConnectionMode::Grpc);

@@ -186,6 +186,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        jobs::WorkerJobAsker,
         test_support::{BasicWorkerBuilder, WorkerRegistry},
         worker::{HealthCheckConfig, WorkerType},
         workflow::{data::WorkerList, host::testing::RegistryHost},
@@ -224,6 +225,7 @@ mod tests {
     ) -> WorkflowContext<WorkerRemovalWorkflowData> {
         let worker_urls: Vec<String> = workers.iter().map(|w| w.url().to_string()).collect();
         let data = WorkerRemovalWorkflowData {
+            asker: WorkerJobAsker::Api,
             config: crate::workflow::WorkerRemovalRequest {
                 url: worker_urls.first().cloned().unwrap_or_default(),
                 expected_revisions: None,
@@ -356,6 +358,7 @@ mod tests {
 
         let saved = serde_json::json!({
             "config": {"url": url, "expected_revisions": null},
+            "asker": "Api",
             "workers_to_remove": {"worker_urls": [url]},
             "worker_urls": [url],
             "affected_models": [],

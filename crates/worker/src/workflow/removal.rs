@@ -114,6 +114,7 @@ mod tests {
     use super::*;
     use crate::{
         identity::basic::Worker,
+        jobs::WorkerJobAsker,
         test_support::{BasicWorkerBuilder, WorkerRegistry},
         worker::{HealthCheckConfig, WorkerStatus},
         workflow::{find_workers_to_remove::WorkerRemovalRequest, host::testing::RegistryHost},
@@ -248,6 +249,7 @@ mod tests {
                 url: URL.to_string(),
                 expected_revisions: None,
             },
+            asker: WorkerJobAsker::Api,
             workers_to_remove: None,
             worker_urls: Vec::new(),
             affected_models: Default::default(),

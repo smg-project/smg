@@ -126,7 +126,7 @@ mod tests {
     use std::sync::Arc;
 
     use openai_protocol::worker::{WorkerStatus, WorkerUpdateRequest};
-    use smg_worker::identity::basic::Worker;
+    use smg_worker::{identity::basic::Worker, jobs::WorkerJobAsker};
     use wfaas::WorkflowInstanceId;
 
     use super::*;
@@ -140,6 +140,11 @@ mod tests {
         refresh: bool,
     ) -> WorkflowContext<WorkerUpdateWorkflowData> {
         let data = WorkerUpdateWorkflowData {
+            asker: if refresh {
+                WorkerJobAsker::Health
+            } else {
+                WorkerJobAsker::Api
+            },
             config: WorkerUpdateRequest {
                 priority: None,
                 cost: None,

@@ -6,7 +6,7 @@ use wfaas::WorkflowInstanceId;
 use super::*;
 use crate::{
     connection::engine::HealthAnswer,
-    jobs::WorkerRegistrationMode,
+    jobs::{WorkerJobAsker, WorkerRegistrationMode},
     test_support::{RefusedAddress, ScriptedAnswers, ScriptedConnector},
     worker::{HttpPoolConfig, WorkerSpec},
     workflow::{host::testing::ProbingHost, runtimes::GRPC_RUNTIMES},
@@ -21,7 +21,12 @@ fn local_context(
     host: Arc<ProbingHost>,
     spec: WorkerSpec,
 ) -> WorkflowContext<WorkerRegistrationWorkflowData<ProbingHost>> {
-    let mut data = WorkerRegistrationWorkflowData::new(spec, WorkerRegistrationMode::Upsert, host);
+    let mut data = WorkerRegistrationWorkflowData::new(
+        spec,
+        WorkerRegistrationMode::Upsert,
+        host,
+        WorkerJobAsker::Api,
+    );
     data.worker_kind = Some(WorkerKind::Local);
     WorkflowContext::new(WorkflowInstanceId::new(), data)
 }

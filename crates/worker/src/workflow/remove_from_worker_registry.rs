@@ -183,6 +183,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        jobs::WorkerJobAsker,
         model_card::ModelCard,
         test_support::{BasicWorkerBuilder, WorkerRegistry},
         worker::WorkerType,
@@ -215,6 +216,7 @@ mod tests {
         expected_revisions: Option<HashMap<String, Option<u64>>>,
     ) -> WorkflowContext<WorkerRemovalWorkflowData> {
         let data = WorkerRemovalWorkflowData {
+            asker: WorkerJobAsker::Api,
             config: WorkerRemovalRequest {
                 url: url.to_string(),
                 expected_revisions,

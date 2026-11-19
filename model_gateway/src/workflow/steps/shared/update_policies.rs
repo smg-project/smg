@@ -253,6 +253,7 @@ mod tests {
         model_card::ModelCard,
         worker::{HealthCheckConfig, RuntimeType, WorkerSpec, WorkerType},
     };
+    use smg_worker::jobs::WorkerJobAsker;
     use tracing_test::traced_test;
     use wfaas::WorkflowInstanceId;
 
@@ -331,6 +332,7 @@ mod tests {
             WorkerSpec::new(worker.url()),
             WorkerRegistrationMode::Upsert,
             Arc::clone(app_context),
+            WorkerJobAsker::Api,
         );
         data.final_labels = labels
             .iter()

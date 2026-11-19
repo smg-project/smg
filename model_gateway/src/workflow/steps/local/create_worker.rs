@@ -1170,7 +1170,9 @@ fn validate_zmq_dp(
 
 #[cfg(test)]
 mod tests {
-    use smg_worker::{identity::basic::DEFAULT_BOOTSTRAP_PORT, test_support::RefusedAddress};
+    use smg_worker::{
+        identity::basic::DEFAULT_BOOTSTRAP_PORT, jobs::WorkerJobAsker, test_support::RefusedAddress,
+    };
     use tracing_test::traced_test;
 
     use super::*;
@@ -1313,7 +1315,8 @@ mod tests {
 
         let mut spec = WorkerSpec::new("grpc://127.0.0.1:18001");
         spec.models = WorkerModels::Single(Box::new(ModelCard::new(model)));
-        let mut data = create_worker_workflow_data(spec, registration_mode, app_context);
+        let mut data =
+            create_worker_workflow_data(spec, registration_mode, app_context, WorkerJobAsker::Api);
         data.worker_kind = Some(WorkerKind::Local);
         data.connection_mode = Some(ConnectionMode::Grpc);
         WorkflowContext::new(WorkflowInstanceId::new(), data)
@@ -1484,8 +1487,12 @@ mod tests {
             ("tier".to_string(), "gold".to_string()),
         ]);
 
-        let mut data =
-            create_worker_workflow_data(spec, WorkerRegistrationMode::Upsert, make_app_context());
+        let mut data = create_worker_workflow_data(
+            spec,
+            WorkerRegistrationMode::Upsert,
+            make_app_context(),
+            WorkerJobAsker::Api,
+        );
         data.worker_kind = Some(WorkerKind::Local);
         data.connection_mode = Some(ConnectionMode::Http);
         data.http_client_handle = Some(Arc::new(http_client()));
@@ -1531,8 +1538,12 @@ mod tests {
             ("tier".to_string(), "gold".to_string()),
         ]);
 
-        let mut data =
-            create_worker_workflow_data(spec, WorkerRegistrationMode::Upsert, make_app_context());
+        let mut data = create_worker_workflow_data(
+            spec,
+            WorkerRegistrationMode::Upsert,
+            make_app_context(),
+            WorkerJobAsker::Api,
+        );
         data.worker_kind = Some(WorkerKind::Local);
         data.connection_mode = Some(ConnectionMode::Http);
         data.http_client_handle = Some(Arc::new(http_client()));
@@ -1576,6 +1587,7 @@ mod tests {
             spec,
             WorkerRegistrationMode::Upsert,
             app_context_with(router_config),
+            WorkerJobAsker::Api,
         );
         data.worker_kind = Some(WorkerKind::Local);
         data.connection_mode = Some(ConnectionMode::Http);
@@ -1686,7 +1698,12 @@ mod tests {
         spec.bootstrap_port = bootstrap_port;
         spec.runtime_type = runtime;
         spec.kv_connector = kv_connector.map(str::to_string);
-        let mut data = create_worker_workflow_data(spec, registration_mode, make_app_context());
+        let mut data = create_worker_workflow_data(
+            spec,
+            registration_mode,
+            make_app_context(),
+            WorkerJobAsker::Api,
+        );
         data.worker_kind = Some(WorkerKind::Local);
         data.connection_mode = Some(ConnectionMode::Http);
         data.http_client_handle = Some(Arc::new(http_client()));
@@ -1944,8 +1961,12 @@ mod tests {
             waiting_requests: Some(0),
             ..Default::default()
         };
-        let mut data =
-            create_worker_workflow_data(spec, WorkerRegistrationMode::Upsert, make_app_context());
+        let mut data = create_worker_workflow_data(
+            spec,
+            WorkerRegistrationMode::Upsert,
+            make_app_context(),
+            WorkerJobAsker::Api,
+        );
         data.worker_kind = Some(WorkerKind::Local);
         data.connection_mode = Some(ConnectionMode::Http);
         data.http_client_handle = Some(Arc::new(http_client()));
@@ -1971,8 +1992,12 @@ mod tests {
         use crate::workflow::steps::{create_worker_workflow_data, local::test_support::labels_of};
 
         let spec = WorkerSpec::new("http://worker:8000");
-        let mut data =
-            create_worker_workflow_data(spec, WorkerRegistrationMode::Upsert, make_app_context());
+        let mut data = create_worker_workflow_data(
+            spec,
+            WorkerRegistrationMode::Upsert,
+            make_app_context(),
+            WorkerJobAsker::Api,
+        );
         data.worker_kind = Some(WorkerKind::Local);
         data.connection_mode = Some(ConnectionMode::Http);
         data.http_client_handle = Some(Arc::new(http_client()));

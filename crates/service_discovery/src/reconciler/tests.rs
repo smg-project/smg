@@ -542,6 +542,29 @@ fn register_an_unpublished_worker(host: &TestHost, url: &str) {
     );
 }
 
+#[tokio::test]
+async fn the_reconciler_asks_as_discovery() {
+    let (host, jobs) = TestHost::recording();
+    register_an_unpublished_worker(&host, "http://10.0.0.2:8080");
+    let desired = desired_state_of(&[published("http://10.0.0.1:8080", "u1")]);
+
+    pass(&desired, &host).await;
+
+    assert!(matches!(
+        jobs.queued().as_slice(),
+        [
+            Queued::Remove {
+                asker: WorkerJobAsker::Discovery,
+                ..
+            },
+            Queued::Add {
+                asker: WorkerJobAsker::Discovery,
+                ..
+            },
+        ]
+    ));
+}
+
 /// What a pass hands the queue is the spec its host stamped, the credential
 /// and the budget of attempts on it, under an Upsert.
 #[tokio::test]
@@ -551,7 +574,7 @@ async fn a_pass_registers_the_spec_its_host_stamped() {
     pass(&desired_state_of(slice::from_ref(&worker)), &host).await;
 
     let queued = jobs.queued();
-    let [Queued::Add { spec, mode }] = queued.as_slice() else {
+    let [Queued::Add { spec, mode, .. }] = queued.as_slice() else {
         panic!("one addition and nothing else: {queued:?}");
     };
     assert_eq!(*mode, WorkerRegistrationMode::Upsert);
@@ -585,7 +608,7 @@ async fn a_pass_leaves_an_address_whose_job_is_in_flight() {
     jobs.release("http://10.0.0.1:8080");
     pass(&desired, &host).await;
     let queued = jobs.queued();
-    let [Queued::Remove { url, guards }, Queued::Add { spec, .. }] = queued.as_slice() else {
+    let [Queued::Remove { url, guards, .. }, Queued::Add { spec, .. }] = queued.as_slice() else {
         panic!("the removal, then the addition: {queued:?}");
     };
     assert_eq!(url, "10.0.0.2:8080");
