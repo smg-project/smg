@@ -1640,6 +1640,19 @@ fn list_of<T>(standing: usize) -> Vec<T> {
     }
 }
 
+/// One side's whole entries for a model's pools. `places` lists the side's
+/// members by their place in `entries`, in order, and the list is made
+/// once at its length. `last` says no model behind this one reads
+/// `entries`: a side that lists every member then takes them as they
+/// stand, so a fleet of one model on one side writes each entry once.
+fn side_of<T: Copy>(entries: &mut Vec<T>, places: &[u32], last: bool) -> Vec<T> {
+    if last && places.len() == entries.len() {
+        mem::take(entries)
+    } else {
+        places.iter().map(|&at| entries[at as usize]).collect()
+    }
+}
+
 /// What the pairing rule reads of one side's entries, in place: each
 /// worker's id, wires, runtime and descriptor.
 impl<'a> Pool<'a> for [Entry<'a>] {
@@ -2889,7 +2902,9 @@ impl Writer {
         let mut ranked: Vec<(WorkerId, u32, u64)> = Vec::new();
         // A member names a threshold of its own.
         let mut owned = false;
-        let mut groups: FxHashMap<Box<str>, [Vec<Entry<'a>>; ROLES]> = FxHashMap::default();
+        // Each model's members a side, by their place in `entries`: a
+        // member's entry is written once, whatever it offers.
+        let mut groups: FxHashMap<Box<str>, [Vec<u32>; ROLES]> = FxHashMap::default();
         // The members' ids are read by the vetoes alone: a membership build
         // with no veto standing does not collect them.
         let standing = !self.vetoes.by_gateway.is_empty();
@@ -2903,6 +2918,11 @@ impl Writer {
             .map(|(member, slot)| (member.id, member, slot))
             .collect();
         members.sort_unstable_by_key(|&(id, ..)| id);
+        // Every member's entry, in that order. A pool's list of whole
+        // entries is made from it below for one model at a time, at its
+        // length: a build holds one model's lists and never every
+        // model's, and moves none to grow.
+        let mut entries: Vec<Entry<'a>> = Vec::with_capacity(members.len());
         // Each member's three fields under the standing generation's lists:
         // carried from the last read where the member's row stands at the
         // revision it was read at, read again where it moved or is new. A
@@ -2987,17 +3007,19 @@ impl Writer {
                 // none and moves none.
                 booked: slot,
             };
+            let at = entries.len() as u32;
+            entries.push(entry);
             let side = role_slot(facts.role);
             for model in &facts.models {
                 match groups.get_mut(model.as_str()) {
                     // A model listed twice is one pool's one row. A member's
-                    // entry is the last of its side until the next member is
+                    // place is the last of its side until the next member is
                     // read, so an earlier listing is found there: no model
                     // before this one is read again.
                     Some(sides) => {
                         let list = &mut sides[side];
-                        if list.last().is_none_or(|last| last.row.id != member.id) {
-                            list.push(entry);
+                        if list.last() != Some(&at) {
+                            list.push(at);
                         }
                     }
                     None => {
@@ -3007,8 +3029,8 @@ impl Writer {
                         let room = before.map_or([0; ROLES], |pools| {
                             pools.map(|pool| self.derived.members(pool))
                         });
-                        let mut sides: [Vec<Entry<'a>>; ROLES] = room.map(list_of);
-                        sides[side].push(entry);
+                        let mut sides: [Vec<u32>; ROLES] = room.map(list_of);
+                        sides[side].push(at);
                         groups.insert(model.as_str().into(), sides);
                     }
                 }
@@ -3027,7 +3049,14 @@ impl Writer {
         // Each data-parallel engine's place among the engines of the pool
         // being derived: a slot a group, free between two pools.
         let mut placed = vec![u32::MAX; by_key.len()];
-        for (model, mut sides) in groups {
+        let models = groups.len();
+        for (nth, (model, sides_at)) in groups.into_iter().enumerate() {
+            // The model's whole entries a side, freed with the model: the
+            // build holds one model's lists at a time. No model behind the
+            // last reads `entries`.
+            let last_model = nth + 1 == models;
+            let mut sides: [Vec<Entry<'a>>; ROLES] =
+                sides_at.map(|side| side_of(&mut entries, &side, last_model));
             // Every side stands in id order, as the walk above pushed it,
             // before a class is derived: the classes are numbered in it, and
             // each row is built with its class.
