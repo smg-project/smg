@@ -64,7 +64,7 @@ use std::{
 
 use crate::{
     decision::{Decision, Target},
-    door::{self, Decided, Door, Leased, Refused, Request},
+    door::{self, Decided, Door, Leased, Maker, Refused, Request},
     framework::{EncodeItems, EncodePlaced},
     lease::{LeaseId, Outcome, ReleaseReason, Side, TransportClass},
     store::{Dispatch, GatewayId, Said},
@@ -135,6 +135,22 @@ impl<D: Deref<Target = Door>> Handle<D> {
         now: Instant,
     ) -> Result<Self, Refused> {
         let decided = door.decide(gateway, request, now)?;
+        Ok(Self::hold(door, gateway, decided, now))
+    }
+
+    /// [`Handle::decide`] for a request its host makes from the world the
+    /// door decides under ([`Door::decide_under`]).
+    ///
+    /// # Errors
+    ///
+    /// [`Refused`]: the door made no decision for the request.
+    pub fn decide_under(
+        door: D,
+        gateway: GatewayId,
+        maker: &impl Maker,
+        now: Instant,
+    ) -> Result<Self, Refused> {
+        let decided = door.decide_under(gateway, maker, now)?;
         Ok(Self::hold(door, gateway, decided, now))
     }
 

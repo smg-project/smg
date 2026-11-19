@@ -1589,6 +1589,58 @@ impl Asked for Request<'_> {
     }
 }
 
+/// A request its host makes from the world the door decides under
+/// ([`Door::decide_under`]). What the host reads of the applied document to
+/// state the request, the sources of its routing key for one
+/// ([`AppliedSpec::key_sources_for`]), is then of the same load as the
+/// engine and the rows.
+pub trait Maker {
+    /// The model of the request. The door takes its seat by it, ahead of
+    /// the load.
+    fn model(&self) -> &str;
+    /// The request, made from the world its decision is made under.
+    fn make<'w>(&'w self, world: &'w World) -> Request<'w>;
+}
+
+/// A request as the door's order takes it up under the world it loaded:
+/// one its host stated ahead of the load ([`Request`]), or one its host
+/// makes from that world ([`Maker`]).
+trait Stated {
+    /// The model the request is for. The door takes its seat by it, ahead
+    /// of the load.
+    fn model(&self) -> &str;
+    /// Hands `order` the request as it stands under `world`.
+    fn under<R>(&self, world: &World, order: impl FnOnce(&Request<'_>) -> R) -> R;
+}
+
+impl Stated for Request<'_> {
+    fn model(&self) -> &str {
+        self.facts.model
+    }
+
+    // Forced into the order's one call: a request stated ahead of the load
+    // pays nothing for the form a host's maker takes.
+    #[inline(always)]
+    fn under<R>(&self, _: &World, order: impl FnOnce(&Request<'_>) -> R) -> R {
+        order(self)
+    }
+}
+
+/// A [`Maker`]'s request, as the door's order takes it up.
+struct Made<'m, M>(&'m M);
+
+impl<M: Maker> Stated for Made<'_, M> {
+    fn model(&self) -> &str {
+        self.0.model()
+    }
+
+    fn under<R>(&self, world: &World, order: impl FnOnce(&Request<'_>) -> R) -> R {
+        let request = self.0.make(world);
+        debug_assert_eq!(request.facts.model, self.0.model(), "the seat's model");
+        order(&request)
+    }
+}
+
 /// A decision as its host takes it.
 #[derive(Debug)]
 pub struct Decided {
@@ -1881,6 +1933,31 @@ impl Door {
         })
     }
 
+    /// [`Door::decide`] for a request its host makes from the world the
+    /// door decides under. `maker` is handed that world behind the door's
+    /// load ([`Maker::make`]), once for each run of the order: a load an
+    /// apply moved to another decider is dropped before it asks. It is
+    /// asked again where the order runs a second time behind a lease the
+    /// store refused.
+    ///
+    /// A maker that panics is a decision that faulted.
+    ///
+    /// # Errors
+    ///
+    /// [`Refused`]: no decision is made for the request.
+    pub fn decide_under(
+        &self,
+        gateway: GatewayId,
+        maker: &impl Maker,
+        now: Instant,
+    ) -> Result<Decided, Refused> {
+        let made = Made(maker);
+        self.deciding(gateway, &made, now, |world, at, term, taken, buffers| {
+            let entry = entry(world, taken);
+            self.order(world, at, term, taken, buffers, entry)
+        })
+    }
+
     /// Decides an `epd` request's pair and places its encode items in
     /// `placed`. A pair pick books the prefill and decode. For other
     /// plans this answers as [`Door::decide`] and clears `placed`.
@@ -2000,7 +2077,7 @@ impl Door {
     fn deciding(
         &self,
         gateway: GatewayId,
-        request: &Request<'_>,
+        request: &impl Stated,
         now: Instant,
         mut order: impl FnMut(
             &World,
@@ -2023,7 +2100,7 @@ impl Door {
     fn once(
         &self,
         gateway: GatewayId,
-        request: &Request<'_>,
+        request: &impl Stated,
         now: Instant,
         order: impl FnOnce(
             &World,
@@ -2056,7 +2133,7 @@ impl Door {
         &self,
         term: u64,
         gateway: GatewayId,
-        request: &Request<'_>,
+        request: &impl Stated,
         now: Instant,
         order: impl FnOnce(
             &World,
@@ -2070,7 +2147,7 @@ impl Door {
         let mut seen = self.seat_flags.load(Ordering::Relaxed);
         loop {
             let (at, mut slot) = if seen & KEEPS_DECIDERS != 0 {
-                self.home(request.facts.model)
+                self.home(request.model())
             } else {
                 self.seat()
             };
@@ -2099,32 +2176,36 @@ impl Door {
                 }
             }
             let pins = StorePins { store, now };
-            let taken = Taken {
-                request,
-                gateway,
-                now,
-                // The host's own budget, as the engine is told it.
-                left: match request.facts.budget_micros {
-                    0 => Duration::MAX,
-                    micros => Duration::from_micros(micros.into()),
-                },
-                pins: Some(&pins),
-                // No place is lent in process: no file's frames wait
-                // for a look. What is said of a lease is applied at once
-                // where no caller decides at its file, and a file whose
-                // caller decides is that caller's, as a decider's at
-                // work is.
-                place: None,
-            };
-            let decided = catch_unwind(AssertUnwindSafe(|| {
-                order(&world, at, term, &taken, buffers)
-            }));
-            if flags & SAMPLES_DECISIONS != 0 {
-                if let Ok(Ok(answer)) = &decided {
-                    let samples = &self.seats[at].samples;
-                    samples.lock().keep(0, engine, &taken, &answer.decision);
+            // The request is taken up under this load: one its host makes
+            // is made here, of the world its decision and its sample read.
+            let taken_up = |request: &Request<'_>| {
+                let taken = Taken {
+                    request,
+                    gateway,
+                    now,
+                    // The host's own budget, as the engine is told it.
+                    left: match request.facts.budget_micros {
+                        0 => Duration::MAX,
+                        micros => Duration::from_micros(micros.into()),
+                    },
+                    pins: Some(&pins),
+                    // No place is lent in process: no file's frames wait
+                    // for a look. What is said of a lease is applied at
+                    // once where no caller decides at its file, and a file
+                    // whose caller decides is that caller's, as a
+                    // decider's at work is.
+                    place: None,
+                };
+                let decided = order(&world, at, term, &taken, buffers);
+                if flags & SAMPLES_DECISIONS != 0 {
+                    if let Ok(answer) = &decided {
+                        let samples = &self.seats[at].samples;
+                        samples.lock().keep(0, engine, &taken, &answer.decision);
+                    }
                 }
-            }
+                decided
+            };
+            let decided = catch_unwind(AssertUnwindSafe(|| request.under(&world, taken_up)));
             // The load ends with the decision.
             drop(world);
             self.leave(at, at_file);
@@ -2332,6 +2413,7 @@ impl Door {
 #[cfg(test)]
 pub(crate) mod tests {
     use std::{
+        cell::Cell,
         collections::BTreeSet,
         error::Error,
         sync::{
@@ -2345,8 +2427,8 @@ pub(crate) mod tests {
     use parking_lot::Mutex;
 
     use super::{
-        decider_of, pinned, DecisionRecord, Door, Refused, Request, Swept, DISPATCH_TTL,
-        ON_SAMPLE_READ, SEAT, TERM_MARK,
+        decider_of, pinned, DecisionRecord, Door, Maker, Refused, Request, Swept, World,
+        DISPATCH_TTL, ON_SAMPLE_READ, SEAT, TERM_MARK,
     };
     use crate::{
         builtins::Random,
@@ -2882,6 +2964,59 @@ pub(crate) mod tests {
             slots * bytes
         )
         .expect("stdout");
+    }
+
+    /// A maker that says the generation it was handed, and applies another
+    /// before its request is back at the door where it is told one.
+    struct Reads<'t> {
+        store: &'t MemoryStore,
+        handed: Cell<u64>,
+        applies: Option<u64>,
+        id: &'t [u8],
+    }
+
+    impl Maker for Reads<'_> {
+        fn model(&self) -> &str {
+            MODEL
+        }
+
+        fn make<'w>(&'w self, world: &'w World) -> Request<'w> {
+            self.handed.set(world.spec().generation());
+            if let Some(generation) = self.applies {
+                let later = self.store.apply(preset("random", generation));
+                later.expect("a later generation");
+            }
+            request(self.id, 7)
+        }
+    }
+
+    /// A request its host makes is made from the world its decision is made
+    /// under. An apply that lands while the host makes it is the next
+    /// decision's: the one in hand keeps the world it handed.
+    #[test]
+    fn a_request_is_made_from_the_world_its_decision_is_made_under() {
+        let store = fleet(1);
+        let door = Door::new(Arc::clone(&store));
+        let standing = || store.with_world(|world| world.spec().generation());
+        let reads = |applies, id| Reads {
+            store: &store,
+            handed: Cell::new(0),
+            applies,
+            id,
+        };
+        let raced = reads(Some(2), b"made");
+        let decided = door.decide_under(GATEWAY, &raced, Instant::now());
+        let decided = decided.expect("a decision");
+        assert_eq!(decided.decision.trace().generation, raced.handed.get());
+        assert_eq!((raced.handed.get(), standing()), (1, 2));
+
+        let next = reads(None, b"next");
+        let decided = door.decide_under(GATEWAY, &next, Instant::now());
+        let decided = decided.expect("a decision");
+        assert_eq!(
+            (next.handed.get(), decided.decision.trace().generation),
+            (2, 2)
+        );
     }
 
     #[test]
