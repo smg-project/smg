@@ -406,6 +406,7 @@ impl MemoryStore {
             workers.by_key.clear();
             workers.log.clear();
             workers.epoch = cut.epoch;
+            workers.history += 1;
             // A world's vetoes leave with their rows at a membership write:
             // one over no row takes them all, and its world is shown to
             // no one. The fields each member was read at under the
@@ -1380,6 +1381,9 @@ struct Workers {
     rows: FxHashMap<WorkerId, Row>,
     by_key: HashMap<String, WorkerId>,
     epoch: u64,
+    /// How often the rows were replaced whole by another store's
+    /// ([`WorkersStore::history`]).
+    history: u64,
     log: VecDeque<(u64, MembershipChange)>,
     /// The store's journal: every membership and status write passes
     /// [`Writing::record`], which tells it.
@@ -1769,6 +1773,10 @@ impl WorkersStore for MemoryStore {
 
     fn epoch(&self) -> u64 {
         self.workers.lock().epoch
+    }
+
+    fn history(&self) -> u64 {
+        self.workers.lock().history
     }
 
     fn snapshot(&self) -> (u64, Vec<WorkerRow>) {

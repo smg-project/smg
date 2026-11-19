@@ -38,6 +38,8 @@ pub const ENTRIES: &[(&str, &str, Fate)] = &[
     ("WorkersStore", "epoch", Fate::Read),
     ("WorkersStore", "snapshot", Fate::Read),
     ("WorkersStore", "changes_since", Fate::Read),
+    // A replica's own count of the restores it took: nothing of it crosses.
+    ("WorkersStore", "history", Fate::Read),
     // The status a verdict moves is journaled as the status write it makes.
     // The streak between two moves is the prober's own count: a promoted
     // standby's prober starts it again.

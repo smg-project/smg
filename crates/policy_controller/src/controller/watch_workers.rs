@@ -121,18 +121,13 @@ pub(crate) struct Feed {
 }
 
 impl Feed {
-    /// The feed of `log`, whose watched writes wake the feed's one task,
-    /// each once its store has let its locks go. The store that journals
-    /// to the log is built beside it
-    /// ([`journaled`](super::replication::journaled)).
-    pub(crate) fn of(log: Log) -> Self {
-        let landed = Arc::new(Notify::new());
-        let log = {
-            let landed = Arc::clone(&landed);
-            // One wake of one task, whatever the count of watches. While
-            // that task is busy or not started the wake is kept, once.
-            Arc::new(log.on_watched(move || landed.notify_one()))
-        };
+    /// The feed of `log`, whose watched writes wake the feed's one task
+    /// through `landed`, each once its store has let its locks go: one wake
+    /// of one task, whatever the count of watches, and while that task is
+    /// busy or not started the wake is kept, once. The log's listener is
+    /// made where the log is, beside the store that journals to it
+    /// ([`journaled_at`](super::replication::journaled_at)).
+    pub(crate) fn of(log: Arc<Log>, landed: Arc<Notify>) -> Self {
         Self {
             log,
             landed,

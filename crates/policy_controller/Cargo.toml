@@ -67,6 +67,11 @@ openai-protocol = { workspace = true, optional = true }
 reqwest = { workspace = true, features = ["rustls-no-provider"], optional = true }
 smg-grpc-client = { workspace = true, optional = true }
 
+# A replica's worker objects (the `worker-host` feature): the worker crate's
+# object, its builder and its registry, for the host that keeps an object for
+# every row of the membership store.
+smg-worker = { workspace = true, features = ["runtime"], optional = true }
+
 # The standalone controller (the `controller` feature): the listeners, the
 # health service, the admin endpoints and the binary. Every dependency below
 # is optional so a host that embeds the engine (the gateway, a binding)
@@ -170,6 +175,13 @@ client = ["controller"]
 
 # The Kubernetes Lease backend of the elector.
 kubernetes = ["dep:k8s-openapi", "dep:kube", "dep:tokio"]
+
+# A replica's worker objects: one object of the worker crate for every row of
+# the membership store, in a registry the host hands in, built, replaced and
+# dropped as the rows come, change and go. Off by default: it brings the
+# worker crate's runtime. It names nothing of the controller, and builds
+# without it.
+worker-host = ["dep:smg-worker"]
 
 default = ["wasm"]
 # The WebAssembly plugin host over the committed `smg:policy` worlds.
