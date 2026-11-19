@@ -52,9 +52,9 @@ struct KeptMember {
 /// read, so its load under-reads until its registration states the width.
 /// An unready rank counts as served when checking an empty
 /// answer, so the engine's verdict stands until its next record or report.
-/// Loads are a row's, not an object's: a forgotten object's row keeps them
-/// while an object stands under it, the same or its replacement, and its
-/// engine is judged again at its next record or report.
+/// Loads are a row's, not an object's. A forgotten object's row is evicted
+/// and its engine judged again, unless another object stands under the row:
+/// a replacement keeps the row's loads, and its records overwrite them.
 /// The host publishes the store's pending writes.
 pub struct LoadAdapter<G, S: ?Sized> {
     objects: Arc<Objects<G>>,
@@ -269,13 +269,22 @@ impl<G: Generation, S: StoreLoadSink + ?Sized + 'static> LoadSink for LoadAdapte
                 None
             }
         };
-        let Some(kept) = kept else {
+        if !self.leads() {
+            return;
+        }
+        let Some(kept) = kept.or_else(|| self.read_member(worker)) else {
             return;
         };
-        // Loads are a row's. While an object stands under the row, the same
-        // or its replacement, nothing is evicted: an eviction here could
-        // wipe a replacement's first record. A row that went has no object.
-        if self.leads() && self.objects.registry().get(&kept.id).is_none() {
+        // Loads are a row's. Where another object stands under the row, a
+        // replacement, they are its own now and stay: its first record may
+        // be on file already. Where this object stands, its status left
+        // `Ready`, or none does, they go, and the engine is judged again.
+        let replaced = self
+            .objects
+            .registry()
+            .get(&kept.id)
+            .is_some_and(|current| !Arc::ptr_eq(&current, worker));
+        if !replaced {
             self.store.evict(kept.member.row);
         }
     }
@@ -474,6 +483,14 @@ mod tests {
                 .expect("a candidate")
                 .health
                 .overloaded
+        }
+
+        /// Show what the store's load writes left waiting, as its host
+        /// does.
+        fn publish(&self) {
+            if let Some(due) = self.store.memory.publish_due() {
+                self.store.memory.publish(due);
+            }
         }
     }
 
@@ -790,9 +807,8 @@ mod tests {
         assert!(!replica.overloaded(one, Instant::now()));
     }
 
-    /// Loads are a row's, not an object's. A worker whose status left
-    /// `Ready` is forgotten and its row stands: the adapter drops its entry
-    /// and the row keeps its loads.
+    /// A rank that pushed while the poll was out is the newer: the failed
+    /// fetch's word that no report came leaves its verdict.
     #[test]
     fn a_failed_fetch_leaves_the_verdict_of_a_push_during_its_poll() {
         let replica = Replica::new();
@@ -806,8 +822,10 @@ mod tests {
         assert!(replica.overloaded(one, pushed));
     }
 
+    /// A worker whose status left `Ready` is forgotten, and its object
+    /// still stands under its row: the row's loads go with the entry.
     #[test]
-    fn a_forgotten_worker_whose_object_stands_keeps_its_rows_loads() {
+    fn a_forgotten_worker_whose_status_left_ready_has_nothing_on_file() {
         let replica = Replica::new();
         let (id, worker) = replica.add(facts(URL));
         let adapter = replica.lead();
@@ -815,9 +833,42 @@ mod tests {
         adapter.record(&worker, 0, &report(0, 2), now, now);
         worker.set_status(ObjectStatus::NotReady);
         adapter.forget(&worker);
-        assert_eq!(replica.store.calls.lock().evicts, 0);
-        assert_eq!(replica.store.ranks(id), 1);
+        assert_eq!(replica.store.calls.lock().evicts, 1);
+        assert_eq!(replica.store.ranks(id), 0);
         assert!(adapter.members.read().is_empty());
+    }
+
+    /// A busy rank that leaves `Ready` does not hold its engine's verdict
+    /// over the rank that stays: its forget takes its sample off the file,
+    /// and the engine is judged again. An eviction names no instant, so the
+    /// judgment waits for the host's publication.
+    #[test]
+    fn a_rank_that_left_ready_does_not_hold_its_engines_verdict() {
+        let replica = Replica::new();
+        let adapter = replica.lead();
+        let now = Instant::now();
+        let [(zero, first), (one, _second)] = busy_pair(&replica, &adapter, now);
+        first.set_status(ObjectStatus::NotReady);
+        adapter.forget(&first);
+        assert_eq!(replica.store.ranks(zero), 0);
+        replica.publish();
+        assert!(!replica.overloaded(one, now));
+    }
+
+    /// A reset drops the adapter's entries and keeps the store's rows. A
+    /// worker forgotten behind it is read again, and its row is evicted.
+    #[test]
+    fn a_forget_behind_a_reset_still_evicts_its_row() {
+        let replica = Replica::new();
+        let (id, worker) = replica.add(facts(URL));
+        let adapter = replica.lead();
+        let now = Instant::now();
+        adapter.record(&worker, 0, &report(0, 2), now, now);
+        adapter.reset();
+        worker.set_status(ObjectStatus::NotReady);
+        adapter.forget(&worker);
+        assert_eq!(replica.store.calls.lock().evicts, 1);
+        assert_eq!(replica.store.ranks(id), 0);
     }
 
     /// A worker whose row went leaves the registry. Its forget evicts the
