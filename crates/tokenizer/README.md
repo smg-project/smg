@@ -252,9 +252,9 @@ without the gate.
 
 ### Against other implementations
 
-The tables below come from a comparative harness kept outside this repository (test data and reference binaries live
-outside the crates): one shared cell module compiled behind a small adapter per implementation, so every
-implementation runs the same cells on the same texts. What a cell measures:
+The tables below come from the comparative harness in [`benches/compare`](benches/compare/README.md), which says how
+to run it (the corpus is test data and lives outside the crates): one shared cell module compiled behind a small
+adapter per implementation, so every implementation runs the same cells on the same texts. What a cell measures:
 
 - **encode**: one process per implementation, family, text size and mode, pinned to one core; 3 warm-ups and 30
   timed encodes; the p50 of nanoseconds per token. *Cold* = every encode a different text (the class's 33 texts),
