@@ -1190,6 +1190,51 @@ mod tests {
         }
     }
 
+    /// The controller records no prefix it sent a worker: a spec file whose
+    /// prefix affinity reads them, alone or merged with the index, refuses
+    /// the start by the source's field, and the same stage by the index
+    /// starts.
+    #[tokio::test]
+    async fn a_spec_file_whose_affinity_reads_the_prefixes_sent_refuses_the_start() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let path = dir.path().join("policy.yaml");
+        let start = |source: &str| {
+            let document = format!(
+                "apiVersion: smg.policy/v1\nprofiles:\n  default:\n    score:\n      - prefix-affinity: {{source: {source}}}\n    pick: best\n"
+            );
+            std::fs::write(&path, document).expect("the file");
+            let config = parse(&EPHEMERAL).config().expect("the flags are in order");
+            bind(
+                config,
+                Catalog::builtin(),
+                &[],
+                SpecSource::File(path.clone()),
+            )
+        };
+
+        let controller = start("index").await.expect("the index's source starts");
+        assert_eq!(controller.store().world().spec().generation(), 1);
+        drop(controller);
+
+        for reads in ["predictor", "merged"] {
+            match start(reads).await {
+                Err(Error::SpecFile {
+                    source: SpecRejected::Invalid(SpecError::NotInBuild { path: field, what }),
+                    ..
+                }) => assert_eq!(
+                    (field.as_str(), what),
+                    (
+                        "profiles.default.score[0].prefix-affinity.source",
+                        "the record of sent prefixes this source reads"
+                    ),
+                    "{reads}"
+                ),
+                Err(other) => panic!("{reads}: the start was refused as {other}"),
+                Ok(_) => panic!("{reads}: nothing here records the prefixes sent"),
+            }
+        }
+    }
+
     /// The flag's names reach the bound controller: a name the flags mount
     /// no listener under refuses the start, by that name.
     #[tokio::test]
