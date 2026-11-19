@@ -53,6 +53,7 @@
 //! present gateway's key is refused, never merged into that gateway's row.
 
 use std::{
+    collections::BTreeSet,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Weak,
@@ -170,6 +171,11 @@ pub(crate) struct Gateways {
 #[derive(Default)]
 struct Table {
     rows: FxHashMap<GatewayId, Row>,
+    /// The next instant each row needs a sweep visit, ordered by instant.
+    /// A row has at most one entry, kept in step with [`Row::deadline`].
+    deadlines: BTreeSet<(Instant, GatewayId)>,
+    #[cfg(test)]
+    sweep_visits: usize,
     /// The highest term the table was read under since this replica last
     /// led; `None` when the last read found the fence closed, and before
     /// the first.
@@ -203,6 +209,8 @@ struct Row {
     /// ends past their instants ([`Row::prune`]) sets it to the earliest
     /// end left. `None` only while the note holds no end.
     next_end: Option<Instant>,
+    /// This row's entry in [`Table::deadlines`].
+    deadline: Option<Instant>,
     /// The membership epoch at the note's last walk for rows that left
     /// ([`Row::left`]), `None` before the first: a row leaves by a
     /// membership write alone, so one walk an epoch finds every one.
@@ -366,9 +374,51 @@ impl Gateways {
             .map_or(0, |row| row.replaced.len())
     }
 
+    /// How many rows the sweep has visited.
+    #[cfg(test)]
+    fn take_sweep_visits(&self) -> usize {
+        std::mem::take(&mut self.table.lock().sweep_visits)
+    }
+
     /// The grace period, as a `Welcome` tells it.
     pub(crate) fn grace(&self) -> Duration {
         self.grace
+    }
+
+    /// The next instant a row needs pruning or may be over. A gone row is
+    /// first asked at one grace period; if a replaced session still runs,
+    /// it is asked once more at the hard two-period limit.
+    fn deadline(&self, row: &Row, now: Instant) -> Option<Instant> {
+        let presence = row.gone.and_then(|gone| {
+            let first = gone.checked_add(self.grace)?;
+            let runs = row
+                .replaced
+                .iter()
+                .any(|session| session.strong_count() > 0);
+            if first <= now && runs {
+                gone.checked_add(self.grace.saturating_mul(2))
+            } else {
+                Some(first)
+            }
+        });
+        presence.into_iter().chain(row.next_end).min()
+    }
+
+    /// Replace one row's scheduled instant. Removing the old entry before
+    /// adding the new one keeps the index bounded to one entry per row.
+    fn set_deadline(table: &mut Table, gateway: GatewayId, deadline: Option<Instant>) {
+        let Some(row) = table.rows.get_mut(&gateway) else {
+            return;
+        };
+        if row.deadline == deadline {
+            return;
+        }
+        if let Some(old) = std::mem::replace(&mut row.deadline, deadline) {
+            table.deadlines.remove(&(old, gateway));
+        }
+        if let Some(deadline) = deadline {
+            table.deadlines.insert((deadline, gateway));
+        }
     }
 
     /// A `Welcome` at `now` under `term`, the session's read of the fence,
@@ -394,7 +444,7 @@ impl Gateways {
     ) -> Result<Seat, Refused> {
         let mut table = self.table.lock();
         let shown = self.fence.leader_term(now);
-        Self::observe(&mut table, shown, now);
+        self.observe(&mut table, shown, now);
         // The seat is taken under the term this read shows or not at all:
         // a Hello read under a term the election has left would supersede
         // a session of the term that stands.
@@ -406,6 +456,7 @@ impl Gateways {
             .get(&gateway)
             .is_some_and(|row| self.over(row, now))
         {
+            Self::set_deadline(&mut table, gateway, None);
             if let Some(row) = table.rows.remove(&gateway) {
                 self.end(vec![(gateway, row)]);
             }
@@ -447,6 +498,7 @@ impl Gateways {
             vetoes: FxHashMap::default(),
             held: 0,
             next_end: None,
+            deadline: None,
             left_at: None,
             ended: watch::channel(()).0,
         });
@@ -461,11 +513,14 @@ impl Gateways {
         row.session = session;
         row.gone = None;
         row.superseded = Arc::new(Replaced::default());
+        let superseded = Arc::clone(&row.superseded);
+        let deadline = self.deadline(row, now);
+        Self::set_deadline(&mut table, gateway, deadline);
         Ok(Seat {
             gateways: Arc::clone(self),
             gateway,
             session,
-            superseded: Arc::clone(&row.superseded),
+            superseded,
         })
     }
 
@@ -473,7 +528,7 @@ impl Gateways {
     /// when it is not present. No decision asks: a stream's open and end do.
     pub(crate) fn presence(&self, gateway: GatewayId, now: Instant) -> Option<Presence> {
         let mut table = self.table.lock();
-        Self::observe(&mut table, self.fence.leader_term(now), now);
+        self.observe(&mut table, self.fence.leader_term(now), now);
         let row = table.rows.get(&gateway)?;
         (!self.over(row, now)).then(|| Presence(row.ended.subscribe()))
     }
@@ -483,18 +538,39 @@ impl Gateways {
     /// were let go. A replica that does not lead at `now` lets nothing go.
     pub(crate) fn sweep(&self, now: Instant) -> usize {
         let mut table = self.table.lock();
-        if !Self::observe(&mut table, self.fence.leader_term(now), now) {
+        if !self.observe(&mut table, self.fence.leader_term(now), now) {
             return 0;
         }
-        for row in table.rows.values_mut() {
+        let mut gone = Vec::new();
+        while table
+            .deadlines
+            .first()
+            .is_some_and(|(deadline, _)| *deadline <= now)
+        {
+            let Some((deadline, gateway)) = table.deadlines.pop_first() else {
+                break;
+            };
+            #[cfg(test)]
+            {
+                table.sweep_visits += 1;
+            }
+            let Some(row) = table.rows.get_mut(&gateway) else {
+                continue;
+            };
+            row.deadline = None;
             row.prune(now);
+            if self.over(row, now) {
+                if let Some(row) = table.rows.remove(&gateway) {
+                    gone.push((gateway, row));
+                }
+            } else {
+                let next = self.deadline(row, now);
+                debug_assert_ne!(next, Some(deadline));
+                Self::set_deadline(&mut table, gateway, next);
+            }
         }
-        let over: Vec<(GatewayId, Row)> = table
-            .rows
-            .extract_if(|_, row| self.over(row, now))
-            .collect();
-        let let_go = over.len();
-        self.end(over);
+        let let_go = gone.len();
+        self.end(gone);
         let_go
     }
 
@@ -631,6 +707,8 @@ impl Gateways {
             row.next_end = first.into_iter().chain(row.next_end).min();
             row.vetoes.insert(worker, ends);
         }
+        let deadline = self.deadline(row, now);
+        Self::set_deadline(&mut table, gateway, deadline);
         vetoed
     }
 
@@ -687,7 +765,10 @@ impl Gateways {
         row.left_at = None;
         row.held = row.vetoes.values().map(Vec::len).sum();
         row.next_end = row.vetoes.values().flatten().map(|&(_, end)| end).min();
-        row.held
+        let held = row.held;
+        let deadline = self.deadline(row, now);
+        Self::set_deadline(&mut table, gateway, deadline);
+        held
     }
 
     /// How many ends the table keeps for the gateway: the row's count,
@@ -712,17 +793,23 @@ impl Gateways {
     /// above the one the table was last read under, or after a read that
     /// found the fence closed, every gone gateway's period starts again at
     /// `now`.
-    fn observe(table: &mut Table, term: Option<u64>, now: Instant) -> bool {
+    fn observe(&self, table: &mut Table, term: Option<u64>, now: Instant) -> bool {
         match (term, table.led) {
             // The term the table was last read under, or a read that lost
             // its race to a later one: nothing moved.
             (Some(term), Some(led)) if term <= led => {}
             (Some(_), _) => {
-                for row in table.rows.values_mut() {
+                let mut deadlines = BTreeSet::new();
+                for (&gateway, row) in &mut table.rows {
                     if row.gone.is_some() {
                         row.gone = Some(now);
                     }
+                    row.deadline = self.deadline(row, now);
+                    if let Some(deadline) = row.deadline {
+                        deadlines.insert((deadline, gateway));
+                    }
                 }
+                table.deadlines = deadlines;
                 table.led = term;
             }
             (None, _) => table.led = None,
@@ -770,10 +857,17 @@ impl Gateways {
     /// starts, unless a newer session stands or the period already runs.
     fn gone(&self, gateway: GatewayId, session: u64, now: Instant) {
         let mut table = self.table.lock();
-        if let Some(row) = table.rows.get_mut(&gateway) {
+        let deadline = table.rows.get_mut(&gateway).and_then(|row| {
             if row.session == session && row.gone.is_none() {
                 row.gone = Some(now);
+                self.deadline(row, now)
+            } else {
+                let first = row.gone.and_then(|gone| gone.checked_add(self.grace));
+                row.deadline.into_iter().chain(first).min()
             }
+        });
+        if deadline.is_some() {
+            Self::set_deadline(&mut table, gateway, deadline);
         }
     }
 }
@@ -911,6 +1005,37 @@ pub(crate) mod tests {
         assert_eq!(store.live(A), 1, "the gap's lease stands");
         assert!(gateways.presence(A, t0 + 100 * GRACE).is_some());
         drop(seat);
+    }
+
+    #[test]
+    fn the_sweep_visits_only_rows_with_a_due_deadline() {
+        const ROWS: u64 = 4_096;
+
+        let (_elector, store, gateways, t0) = ceiled(GRACE, ROWS as usize);
+        let gone = welcomed(&gateways, GatewayId(1), "gateway-1", TERM, t0);
+        let standing: Vec<Seat> = (2..=ROWS)
+            .map(|id| welcomed(&gateways, GatewayId(id), &format!("gateway-{id}"), TERM, t0))
+            .collect();
+
+        assert_eq!(gateways.sweep(t0 + Duration::from_secs(1)), 0);
+        assert_eq!(gateways.take_sweep_visits(), 0, "no row has work due");
+
+        let noted = worker(&store, "http://noted:8000");
+        assert_eq!(
+            standing[0].veto(noted, 1, Some(t0 + 2 * GRACE), t0),
+            Vetoed::Shown
+        );
+        gone.end(t0);
+        assert_eq!(gateways.sweep(t0 + GRACE), 1);
+        assert_eq!(
+            gateways.take_sweep_visits(),
+            1,
+            "only the expired row is visited"
+        );
+
+        assert_eq!(gateways.sweep(t0 + 2 * GRACE), 0);
+        assert_eq!(gateways.take_sweep_visits(), 1, "the due note is visited");
+        assert_eq!(gateways.kept(GatewayId(2)), 0);
     }
 
     #[tokio::test]
