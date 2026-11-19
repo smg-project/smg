@@ -845,6 +845,93 @@ fn a_record_replaces_its_rank_alone_and_a_poll_fills_only_the_ranks_that_stayed_
 }
 
 #[test]
+fn a_report_answers_the_positions_of_the_rows_it_passed_over() {
+    let store = MemoryStore::new();
+    let loads: &dyn LoadSink = &store;
+    let id = ready(&store, "http://w:8000");
+    let stranger = WorkerId(77);
+    let t0 = Instant::now();
+    loads.record(id, 0, row(0), t0, LoadSource::Stream);
+    loads.record(id, 1, row(0), t0, LoadSource::Stream);
+    let polled = LoadRow {
+        running: 2,
+        ..row(0)
+    };
+    let quiet = t0 + Duration::from_millis(50);
+    assert_eq!(
+        loads.report(
+            &[(id, 0, Some(polled)), (id, 1, Some(polled))],
+            quiet,
+            LoadSource::Poll,
+        ),
+        Vec::<usize>::new(),
+        "no rank pushed since the poll began: both rows are written"
+    );
+    // Rank 1 pushes while the next poll is out.
+    let polled_at = quiet + Duration::from_secs(1);
+    let pushed = LoadRow {
+        running: 9,
+        ..row(0)
+    };
+    loads.record(
+        id,
+        1,
+        pushed,
+        polled_at + Duration::from_millis(1),
+        LoadSource::Stream,
+    );
+    assert_eq!(
+        loads.report(
+            &[
+                (stranger, 0, Some(polled)),
+                (id, 0, Some(polled)),
+                (id, 1, Some(polled)),
+            ],
+            polled_at,
+            LoadSource::Poll,
+        ),
+        vec![2],
+        "the row of the rank that pushed, by its position: a stranger's row is dropped and rank 0's is written"
+    );
+    assert_eq!(loads.load(id, 1).expect("rank 1").row.running, 9);
+    assert_eq!(
+        loads.report(
+            &[(id, 0, Some(polled)), (id, 1, None)],
+            polled_at,
+            LoadSource::Poll,
+        ),
+        Vec::<usize>::new(),
+        "a rank that pushed and brought no row is not on the list"
+    );
+    assert_eq!(
+        loads.report(&[(id, 1, Some(polled))], polled_at, LoadSource::Poll),
+        vec![0],
+        "an answer of passed-over rows alone says them too"
+    );
+    // Both ranks push: each row passed over is said, in the answer's order.
+    loads.record(
+        id,
+        0,
+        pushed,
+        polled_at + Duration::from_millis(2),
+        LoadSource::Stream,
+    );
+    assert_eq!(
+        loads.report(
+            &[
+                (id, 1, Some(polled)),
+                (stranger, 0, Some(polled)),
+                (id, 0, Some(polled)),
+            ],
+            polled_at,
+            LoadSource::Poll,
+        ),
+        vec![0, 2]
+    );
+    assert_eq!(loads.load(id, 0).expect("rank 0").row.running, 9);
+}
+
+#[test]
 fn the_poll_mode_reads_the_receipts_of_the_pushing_ranks_alone() {
     let store = MemoryStore::new();
     let loads: &dyn LoadSink = &store;
