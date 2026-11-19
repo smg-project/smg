@@ -181,9 +181,10 @@ impl<D: Deref<Target = Door>> Handle<D> {
 
     /// The host sent the request to the target it took, at `now`: the
     /// lease is dispatched on that target, and no dispatch deadline ends
-    /// it from here. A dispatch said after that deadline meets no lease:
-    /// the request runs unbooked, and its host is told nothing. Said once:
-    /// a second call says nothing.
+    /// it from here. A dispatch said after the door's clock ended the
+    /// lease past that deadline (a sweep, or another decision's issue at
+    /// its file) meets no lease: the request runs unbooked, and its host
+    /// is told nothing. Said once: a second call says nothing.
     pub fn dispatched(&mut self, now: Instant) {
         let Owed::Dispatch {
             lease,

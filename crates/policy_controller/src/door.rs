@@ -1378,6 +1378,12 @@ impl Door {
     ///
     /// What the door keeps grows with what its host says while one
     /// decision stands: the host's requests in flight bound it.
+    ///
+    /// A completion said here ends the lease and is no health write: the
+    /// gateway's completed dispatch on the worker that served is the
+    /// host's to write ([`HealthSink::completed`]). A host that holds a
+    /// handle says one completion and the handle writes both
+    /// ([`crate::handle::Handle::completed`]).
     pub fn report(&self, gateway: GatewayId, lease: LeaseId, said: Said) {
         let at = self.store.file_of(lease);
         let hand = Hand::new(gateway);
