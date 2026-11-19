@@ -151,6 +151,12 @@ class Sidecar:
         self._max_video_frames = env_int(
             os.environ, ENV_MAX_VIDEO_FRAMES, DEFAULT_MAX_VIDEO_FRAMES, minimum=0
         )
+        # The allow-list vLLM checks the first URL against and the guarded
+        # connection every hop goes through, both read as the router reads it.
+        connector_kwargs = media_connector_kwargs(
+            model_config.allowed_media_domains,
+            bool(settings is not None and settings.allow_private_media_hosts),
+        )
         # The fingerprint keeps the engine's kwargs: the budget bounds this
         # sidecar's sampling, it does not describe a different engine.
         self._connector = MEDIA_CONNECTOR_REGISTRY.load(
@@ -159,11 +165,7 @@ class Sidecar:
                 mm_config.media_io_kwargs, self._max_video_frames, vllm_default_video_frames()
             ),
             allowed_local_media_path=model_config.allowed_local_media_path,
-            allowed_media_domains=model_config.allowed_media_domains,
-            **media_connector_kwargs(
-                model_config.allowed_media_domains,
-                bool(settings is not None and settings.allow_private_media_hosts),
-            ),
+            **connector_kwargs,
         )
         self._video_processor = get_video_processor_cls_name(model_config)
         self._schemes = advertised_schemes(model_config.allowed_local_media_path)
@@ -176,7 +178,7 @@ class Sidecar:
                 self._short_side_floor.floor,
             )
         self._started_at = time.time()
-        if not model_config.allowed_media_domains:
+        if not connector_kwargs["allowed_media_domains"]:
             logger.warning(
                 "no --allowed-media-domains: this sidecar will fetch media from any public host"
             )

@@ -708,6 +708,21 @@ class TestInProcessConstruction:
         assert type(loaded["connection"]).__name__ == "GuardedHTTPConnection"
         assert loaded["allowed_media_domains"] == ["example.com"]
 
+    def test_vllm_checks_the_first_url_against_the_allow_list_as_the_guard_reads_it(
+        self, monkeypatch
+    ):
+        # vLLM's own check is exact membership: an entry it is handed with a
+        # space or a capital would refuse the host the guard admits.
+        loaded = {}
+        self._stub_vllm(monkeypatch, loaded)
+        engine = self._engine(None)
+        engine.model_config.allowed_media_domains = [" Images.Example.com ", "", "[::1]"]
+        mm_processor.InProcessMediaProcessor(engine)
+        assert loaded["allowed_media_domains"] == ["[::1]", "images.example.com"]
+        engine.model_config.allowed_media_domains = [" ", ""]
+        mm_processor.InProcessMediaProcessor(engine)
+        assert loaded["allowed_media_domains"] is None
+
     def test_budget_above_vllms_default_keeps_the_default(self, monkeypatch):
         loaded = {}
         self._stub_vllm(monkeypatch, loaded)

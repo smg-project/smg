@@ -324,6 +324,11 @@ class InProcessMediaProcessor:
         self.max_inflight = max_inflight
         # The fetcher already decides which failures are the caller's.
         self._caller_error = VLLMClientError
+        # The allow-list vLLM checks the first URL against and the guarded
+        # connection every hop goes through, both read as the router reads it.
+        connector_kwargs = media_connector_kwargs(
+            model_config.allowed_media_domains, allow_private_media_hosts
+        )
         # Same construction as vLLM's OpenAI frontend, so the engine-level
         # allowlists and media_io_kwargs apply to refs fetched here.
         self._connector = MEDIA_CONNECTOR_REGISTRY.load(
@@ -332,8 +337,7 @@ class InProcessMediaProcessor:
                 mm_config.media_io_kwargs, max_video_frames, vllm_default_video_frames()
             ),
             allowed_local_media_path=model_config.allowed_local_media_path,
-            allowed_media_domains=model_config.allowed_media_domains,
-            **media_connector_kwargs(model_config.allowed_media_domains, allow_private_media_hosts),
+            **connector_kwargs,
         )
         self._video_processor = get_video_processor_cls_name(model_config)
         self.schemes = advertised_schemes(model_config.allowed_local_media_path)
@@ -345,7 +349,7 @@ class InProcessMediaProcessor:
                 "processor, as the router's own pipeline does for this model family",
                 self._short_side_floor.floor,
             )
-        if not model_config.allowed_media_domains:
+        if not connector_kwargs["allowed_media_domains"]:
             logger.warning(
                 "%s=inprocess with no --allowed-media-domains: this worker will fetch media "
                 "from any public host the router forwards",

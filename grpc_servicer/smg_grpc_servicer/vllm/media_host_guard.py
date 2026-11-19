@@ -20,7 +20,8 @@ an HTTP connection whose session:
   legacy IPv4 spellings ``inet_aton`` accepts (``2130706433``, ``127.1``,
   ``0177.0.0.1``, ``0x7f.1``) included, read as the router's URL parser reads
   them; the host name is checked against the allow-list when one is
-  configured. A hop sent through an egress proxy is resolved by the proxy, so
+  configured, read as the router reads it (an IPv6 address named bracketed,
+  as vLLM's own first-URL check names it). A hop sent through an egress proxy is resolved by the proxy, so
   its name is resolved and checked here instead, without a pin, as the router
   does; the resolver passes that hop's proxy name, and only that one,
   unchecked. A hop sent directly is resolved and pinned as above.
@@ -162,12 +163,48 @@ def _ip_literal(host: str) -> IpAddress | None:
     return None
 
 
+def effective_allowed_domains(allowed_domains: Iterable[str] | None) -> list[str] | None:
+    """An allow-list as the router reads it (``effective_allowed_domains`` in
+    ``fetch_policy.rs``): each entry trimmed and lowercased, empty entries
+    dropped, each once; None when nothing is left, which allows any host.
+    The one reading for both of a worker's checks, vLLM's own first-URL
+    check and the policy's check of every hop."""
+    domains = sorted({d.strip().lower() for d in (allowed_domains or ()) if d and d.strip()})
+    return domains or None
+
+
+def _bracketed_ipv6(text: str) -> str | None:
+    """`text`, an IPv6 literal with or without brackets, as ``[address]`` in
+    its compressed spelling (a zone ID kept, ``%25`` read as ``%``); None
+    when it is no IPv6 address."""
+    bare = text[1:-1] if text.startswith("[") and text.endswith("]") else text
+    if ":" not in bare:
+        return None
+    try:
+        return f"[{ipaddress.IPv6Address(bare.replace('%25', '%', 1))}]"
+    except ValueError:
+        return None
+
+
+def _allow_list_key(entry: str) -> str:
+    """An allow-list entry as hops are compared with it. An IPv6 address is
+    named bracketed, as vLLM's check (urllib3's hostname) and the router's
+    URL parser spell it, and compared by address, so any spelling of the
+    entry matches any spelling of the URL; a bare IPv6 entry names no host,
+    as for them."""
+    if entry.startswith("["):
+        return _bracketed_ipv6(entry) or entry
+    return entry
+
+
 class MediaHostPolicy:
     """The allow-list and the address policy one worker's fetches follow."""
 
     def __init__(self, allowed_domains: Iterable[str] | None, allow_private_hosts: bool) -> None:
-        domains = {d.strip().lower() for d in (allowed_domains or ()) if d and d.strip()}
-        self.allowed_domains = frozenset(domains) or None
+        domains = effective_allowed_domains(allowed_domains)
+        self.allowed_domains = (
+            frozenset(_allow_list_key(d) for d in domains) if domains is not None else None
+        )
         self.allow_private_hosts = allow_private_hosts
 
     def check_name(self, host: str | None, *spellings: str | None) -> str:
@@ -188,7 +225,17 @@ class MediaHostPolicy:
         `resolve` checks a name by its addresses here (a hop sent through a
         proxy, where the resolver never sees it); otherwise the resolver
         checks names as it connects."""
-        host = self.check_name(url.raw_host, url.host)
+        raw_host = url.raw_host
+        if raw_host and ":" in raw_host:
+            # An IPv6 literal, which yarl gives bare and compressed: named
+            # bracketed on the allow-list, judged bare by address.
+            name = _bracketed_ipv6((url.host or raw_host).lower())
+            if name is None:
+                raise MediaHostRefused(f"media host {raw_host!r} is not a valid IP address")
+            self.check_name(name)
+            host = raw_host.lower()
+        else:
+            host = self.check_name(raw_host, url.host)
         if self.allow_private_hosts:
             return
         if (ip := _ip_literal(host)) is not None:
@@ -294,11 +341,16 @@ def guarded_connection(policy: MediaHostPolicy):
 def media_connector_kwargs(
     allowed_media_domains: Iterable[str] | None, allow_private_hosts: bool
 ) -> dict[str, Any]:
-    """The `connection=` a worker's MediaConnector is built with."""
+    """The `connection=` and `allowed_media_domains=` a worker's
+    MediaConnector is built with: vLLM checks the first URL against the same
+    reading of the allow-list the connection checks every hop against."""
     policy = MediaHostPolicy(allowed_media_domains, allow_private_hosts)
     if allow_private_hosts:
         logger.warning(
             "worker media fetches may reach private, loopback and link-local hosts "
             "(--mm-allow-private-media-hosts)"
         )
-    return {"connection": guarded_connection(policy)}
+    return {
+        "connection": guarded_connection(policy),
+        "allowed_media_domains": effective_allowed_domains(allowed_media_domains),
+    }

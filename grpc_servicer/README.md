@@ -127,7 +127,9 @@ and never schedules. vLLM's `--allowed-media-domains`,
 `--allowed-local-media-path`, `--media-io-kwargs`, `--limit-mm-per-prompt` and
 `VLLM_*_FETCH_TIMEOUT` govern fetching on the worker; without
 `--allowed-media-domains` the worker fetches from any public host the router
-forwards. A media URL that names or resolves to a loopback, link-local or
+forwards. The worker reads that list as the router reads its own: entries are
+trimmed and compared case-insensitively, and an IPv6 address is listed in
+brackets (`[2001:db8::1]`), as the URL spells it. A media URL that names or resolves to a loopback, link-local or
 private address is refused on the worker as on the router, redirects included,
 unless `--mm-allow-private-media-hosts` (the sidecar's
 `--allow-private-media-hosts`, or `SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS=1`) is set

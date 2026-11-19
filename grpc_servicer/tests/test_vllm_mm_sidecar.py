@@ -357,6 +357,62 @@ class TestNativeAudio:
         assert result.prompt_token_ids == [258881]
 
 
+class TestConnector:
+    def test_the_connector_reads_the_allow_list_as_the_guard_does(self, monkeypatch):
+        """vLLM's own first-URL check is handed the list the guarded
+        connection checks every hop against: trimmed, lowercased, blanks
+        dropped; with nothing left, no list."""
+        loaded = {}
+
+        def module(name, **attrs):
+            mod = types.ModuleType(name)
+            mod.__dict__.update(attrs)
+            monkeypatch.setitem(sys.modules, name, mod)
+
+        class _Registry:
+            @staticmethod
+            def load(name, **kwargs):
+                loaded.update(kwargs)
+                return object()
+
+        module(
+            "vllm",
+            TokensPrompt=dict,
+            envs=types.SimpleNamespace(VLLM_MEDIA_CONNECTOR="http"),
+        )
+        module("vllm.multimodal")
+        module("vllm.multimodal.media")
+        module("vllm.multimodal.media.connector", MEDIA_CONNECTOR_REGISTRY=_Registry)
+        module("vllm.connections", HTTPConnection=type("HTTPConnection", (), {}))
+        module("vllm.transformers_utils")
+        module("vllm.transformers_utils.processor", get_video_processor_cls_name=lambda cfg: "vp")
+        module("vllm.v1")
+        module("vllm.v1.serial_utils", MsgpackEncoder=lambda **kwargs: object())
+        monkeypatch.setattr(mm_sidecar, "config_fingerprint", lambda cfg: fingerprint())
+        monkeypatch.setattr(mm_sidecar, "floor_rule", lambda cfg: None)
+
+        def build(domains):
+            mm_config = types.SimpleNamespace(media_io_kwargs=None)
+            model_config = types.SimpleNamespace(
+                get_multimodal_config=lambda: mm_config,
+                allowed_local_media_path="",
+                allowed_media_domains=domains,
+            )
+            mm_sidecar.Sidecar(
+                types.SimpleNamespace(model_config=model_config),
+                renderer=None,
+                client=None,
+                namespace="t",
+                concurrency=1,
+            )
+            return loaded
+
+        loaded = build([" Images.Example.com ", "", "[::1]"])
+        assert type(loaded["connection"]).__name__ == "GuardedHTTPConnection"
+        assert loaded["allowed_media_domains"] == ["[::1]", "images.example.com"]
+        assert build([" "])["allowed_media_domains"] is None
+
+
 class TestShortSideFloor:
     def test_a_fetched_image_below_the_familys_floor_is_raised_before_the_renderer(self):
         from smg_grpc_servicer.vllm.short_side_floor import FloorRule

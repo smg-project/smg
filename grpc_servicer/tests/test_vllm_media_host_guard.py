@@ -72,12 +72,12 @@ aiohttp = pytest.importorskip("aiohttp")
 from aiohttp import web  # noqa: E402
 
 
-async def _serve(handler_routes):
+async def _serve(handler_routes, host="127.0.0.1"):
     app = web.Application()
     app.add_routes(handler_routes)
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "127.0.0.1", 0)
+    site = web.TCPSite(runner, host, 0)
     await site.start()
     port = site._server.sockets[0].getsockname()[1]  # noqa: SLF001
     return runner, port
@@ -235,6 +235,51 @@ def test_a_numeric_host_that_is_no_address_is_refused_not_passed_on(host, monkey
     strict = MediaHostPolicy(None, allow_private_hosts=False)
     with pytest.raises(MediaHostRefused, match="not a valid IPv4"):
         asyncio.run(strict.check_hop(yarl.URL(f"http://{host}:80/x"), resolve=False))
+
+
+def _hop(policy, url):
+    yarl = pytest.importorskip("yarl")
+    asyncio.run(policy.check_hop(yarl.URL(url), resolve=False))
+
+
+def test_ipv6_allow_list_entries_are_bracketed_and_compared_by_address():
+    # vLLM's first-URL check (urllib3's hostname) and the router's URL parser
+    # both name an IPv6 host bracketed, so that is how the list names it.
+    for allow_private in (False, True):
+        for entry in ("[2606:4700::1111]", "[2606:4700:0:0::1111]", " [2606:4700::1111] "):
+            policy = MediaHostPolicy([entry], allow_private_hosts=allow_private)
+            _hop(policy, "http://[2606:4700::1111]/x")
+            _hop(policy, "http://[2606:4700:0:0::1111]/x")
+            with pytest.raises(MediaHostRefused, match="allowed-media-domains"):
+                _hop(policy, "http://[2606:4700::2222]/x")
+        # A bare IPv6 entry names no host, as for vLLM and the router.
+        with pytest.raises(MediaHostRefused, match="allowed-media-domains"):
+            _hop(
+                MediaHostPolicy(["2606:4700::1111"], allow_private_hosts=allow_private),
+                "http://[2606:4700::1111]/x",
+            )
+    # Listed, a loopback address is still refused by address...
+    with pytest.raises(MediaHostRefused, match="loopback"):
+        _hop(MediaHostPolicy(["[::1]"], allow_private_hosts=False), "http://[::1]/x")
+    # ...and reached once private hosts are allowed.
+    _hop(MediaHostPolicy(["[::1]"], allow_private_hosts=True), "http://[::1]/x")
+
+
+def test_an_ipv6_zone_id_is_stripped_and_the_address_judged():
+    # The router's URL parser refuses a zone ID; here the address is judged.
+    strict = MediaHostPolicy(None, allow_private_hosts=False)
+    with pytest.raises(MediaHostRefused, match="link-local"):
+        _hop(strict, "http://[fe80::1%25eth0]/x")
+    with pytest.raises(MediaHostRefused, match="loopback"):
+        _hop(strict, "http://[::1%25lo]/x")
+    _hop(strict, "http://[2606:4700::1111%25eth0]/x")
+    # On the allow-list the zone is part of the name, spelled % or %25.
+    for entry in ("[fe80::1%eth0]", "[FE80::1%25ETH0]"):
+        listed = MediaHostPolicy([entry], allow_private_hosts=True)
+        _hop(listed, "http://[fe80::1%25eth0]/x")
+        for other in ("http://[fe80::1%25eth1]/x", "http://[fe80::1]/x"):
+            with pytest.raises(MediaHostRefused, match="allowed-media-domains"):
+                _hop(listed, other)
 
 
 def test_public_numeric_hosts_pass_and_names_stay_names():
@@ -399,3 +444,76 @@ def test_the_connection_hands_vllm_the_guarded_session(monkeypatch):
             connection.get_sync_client()
 
     asyncio.run(run())
+
+
+class _RawBytes:
+    """A MediaIO that hands back the fetched bytes."""
+
+    def get_max_bytes(self):
+        # Asked by later vLLM releases before a fetch; no cap here.
+        return None
+
+    def load_bytes(self, data):
+        return data
+
+
+async def _ipv6_loopback_server(state):
+    try:
+        return await _serve(_routes(state), host="::1")
+    except OSError:
+        pytest.skip("no IPv6 loopback here")
+
+
+@pytest.mark.parametrize(
+    "entries,host,v6",
+    [
+        # vLLM was handed the list as given: an exact-match miss on its side.
+        ([" LocalHost "], "localhost", False),
+        (["Images.Example.com", "localhost", ""], "localhost", False),
+        # The guard compared a bare IPv6 host with the bracketed entry.
+        (["[::1]"], "[::1]", True),
+        (["[0:0::1]"], "[0:0::1]", True),
+    ],
+)
+def test_vllms_connector_and_the_guard_read_the_allow_list_alike(entries, host, v6):
+    connector_module = pytest.importorskip("vllm.multimodal.media.connector")
+    vllm_exceptions = pytest.importorskip("vllm.exceptions")
+
+    async def run():
+        state = {"hits": 0}
+        if v6:
+            runner, port = await _ipv6_loopback_server(state)
+        else:
+            runner, port = await _serve(_routes(state))
+        connector = connector_module.MediaConnector(
+            **guard.media_connector_kwargs(entries, allow_private_hosts=True)
+        )
+        try:
+            url = f"http://{host}:{port}/media"
+            assert await connector.load_from_url_async(url, _RawBytes()) == b"img"
+            assert state["hits"] == 1
+            # A redirect off the list is still refused by the guard (which
+            # later vLLM releases re-raise as their own client error).
+            elsewhere = f"http://127.0.0.2:{port}/media"
+            refused = (ValueError, getattr(vllm_exceptions, "VLLMClientError", ValueError))
+            with pytest.raises(refused, match="127.0.0.2|Invalid URL"):
+                await connector.load_from_url_async(
+                    f"http://{host}:{port}/bounce?to={elsewhere}", _RawBytes()
+                )
+            assert state["hits"] == 1
+        finally:
+            session = connector.connection._guarded  # noqa: SLF001
+            if session is not None:
+                await session.close()
+            await runner.cleanup()
+
+    asyncio.run(run())
+
+
+def test_vllms_connector_refuses_a_host_off_the_list_before_the_guard():
+    connector_module = pytest.importorskip("vllm.multimodal.media.connector")
+    connector = connector_module.MediaConnector(
+        **guard.media_connector_kwargs(["[::1]"], allow_private_hosts=True)
+    )
+    with pytest.raises(ValueError, match="allowed domains"):
+        asyncio.run(connector.load_from_url_async("http://localhost:1/x", _RawBytes()))
