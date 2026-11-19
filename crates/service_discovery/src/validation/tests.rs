@@ -127,42 +127,34 @@ fn kubernetes_requires_a_selector_for_each_of_the_three_roles() {
 }
 
 #[test]
-fn kubernetes_refuses_a_zero_worker_port() {
-    assert_invalid(
-        KubernetesDiscoveryConfig {
-            port: 0,
-            ..kubernetes()
-        },
-        "discovery.port",
-        "0",
-        "Port must be > 0",
-    );
-}
-
-#[test]
-fn slurm_refuses_a_zero_worker_port() {
-    assert_invalid(
-        SlurmDiscoveryConfig {
-            port: 0,
-            ..regular_slurm()
-        },
-        "discovery.port",
-        "0",
-        "Port must be > 0",
-    );
-}
-
-#[test]
-fn slurm_refuses_a_zero_bootstrap_port() {
-    assert_invalid(
-        SlurmDiscoveryConfig {
-            bootstrap_port: Some(0),
-            ..slurm([&[], &["encode"], &["prefill"], &["decode"]])
-        },
-        "discovery.bootstrap_port",
-        "0",
-        "Port must be > 0",
-    );
+fn a_port_of_zero_is_refused() {
+    for (config, field) in [
+        (
+            DiscoveryConfig::from(KubernetesDiscoveryConfig {
+                port: 0,
+                ..kubernetes()
+            }),
+            "discovery.port",
+        ),
+        (
+            SlurmDiscoveryConfig {
+                port: 0,
+                ..regular_slurm()
+            }
+            .into(),
+            "discovery.port",
+        ),
+        (
+            SlurmDiscoveryConfig {
+                bootstrap_port: Some(0),
+                ..slurm([&[], &["encode"], &["prefill"], &["decode"]])
+            }
+            .into(),
+            "discovery.bootstrap_port",
+        ),
+    ] {
+        assert_invalid(config, field, "0", "Port must be > 0");
+    }
 }
 
 #[test]
