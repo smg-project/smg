@@ -6,11 +6,13 @@ use async_trait::async_trait;
 use openai_protocol::UNKNOWN_MODEL_ID;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use smg_grpc_client::engine_labels::flat_labels;
-use smg_worker::identity::{
-    basic::ConnectionMode,
-    endpoint::Endpoint,
-    sampling_defaults::{SamplingDefaults, DEFAULT_SAMPLING_PARAMS_LABEL},
+use smg_worker::{
+    identity::{
+        basic::ConnectionMode,
+        endpoint::Endpoint,
+        sampling_defaults::{SamplingDefaults, DEFAULT_SAMPLING_PARAMS_LABEL},
+    },
+    labels::flat_labels,
 };
 use tool_parser::GrammarStart;
 use tracing::{debug, warn};

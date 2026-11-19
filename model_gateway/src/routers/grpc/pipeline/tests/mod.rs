@@ -41,6 +41,7 @@ use smg_mcp::{McpConfig, McpOrchestrator};
 use smg_worker::{
     health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
     identity::basic::{ConnectionMode, RequestCompletionSink, RuntimeType, Worker, WorkerType},
+    labels::SUPPORTS_VISION_LABEL,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -64,10 +65,7 @@ use crate::{
                 BackgroundResponses, BackgroundStream,
             },
             harmony::serve_harmony_responses_stream,
-            multimodal::{
-                MultimodalComponents, MultimodalConfigRegistry, MultimodalSettings,
-                SUPPORTS_VISION_LABEL,
-            },
+            multimodal::{MultimodalComponents, MultimodalConfigRegistry, MultimodalSettings},
             proto_wrapper::ENGINE_ERROR_MESSAGE,
             regular::{
                 responses::{route_responses, route_responses_background_stream},

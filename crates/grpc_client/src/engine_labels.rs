@@ -11,15 +11,12 @@
 use std::collections::HashMap;
 
 use openai_protocol::worker::ConstrainedDecoding;
+use smg_worker::labels::{flat_labels, SUPPORTS_VISION_LABEL};
 
 use crate::{
     media_identity::sglang as media_contract, mlx_proto, sglang_proto, tokenspeed_proto,
     trtllm_proto, vllm_proto,
 };
-
-/// The label of a model info answer that says whether the engine takes image
-/// input: the name of the answers' own `supports_vision` field.
-pub const SUPPORTS_VISION_LABEL: &str = "supports_vision";
 
 // ---------------------------------------------------------------------------
 // Metadata wrappers
@@ -282,41 +279,6 @@ const TOKENSPEED_GRPC_KEYS: &[&str] = &[
 // Label helpers
 // ---------------------------------------------------------------------------
 
-/// Serialize to flat label map, skipping nulls/zeros/empty.
-///
-/// Booleans are emitted as `"true"` / `"false"` so downstream consumers
-/// (e.g. `is_generation == "false"` for embedding detection) work correctly.
-pub fn flat_labels<T: serde::Serialize>(value: &T) -> HashMap<String, String> {
-    let mut labels = HashMap::new();
-    if let Ok(serde_json::Value::Object(obj)) = serde_json::to_value(value) {
-        for (key, val) in obj {
-            match val {
-                serde_json::Value::String(s) if !s.is_empty() && s != "null" => {
-                    labels.insert(key, s);
-                }
-                serde_json::Value::Number(n) if n.as_f64().is_some_and(|v| v != 0.0) => {
-                    // Format integers without decimal point
-                    let formatted = n
-                        .as_i64()
-                        .map(|i| i.to_string())
-                        .unwrap_or_else(|| n.to_string());
-                    labels.insert(key, formatted);
-                }
-                serde_json::Value::Bool(b) => {
-                    labels.insert(key, b.to_string());
-                }
-                serde_json::Value::Array(arr) if !arr.is_empty() => {
-                    if let Ok(s) = serde_json::to_string(&arr) {
-                        labels.insert(key, s);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    labels
-}
-
 /// Pick specific keys from a `prost_types::Struct`.
 fn pick_prost_fields(labels: &mut HashMap<String, String>, s: &prost_types::Struct, keys: &[&str]) {
     for key in keys {
@@ -346,9 +308,9 @@ fn pick_prost_fields(labels: &mut HashMap<String, String>, s: &prost_types::Stru
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
 
-    use super::{ModelInfo, ServerInfo, SUPPORTS_VISION_LABEL};
+    use super::{pick_prost_fields, ModelInfo, ServerInfo, SUPPORTS_VISION_LABEL};
     use crate::{sglang_proto, tokenspeed_proto, trtllm_proto, vllm_proto};
 
     /// EC compatibility fields survive discovery as routing labels.
@@ -1051,5 +1013,28 @@ mod tests {
         );
         assert!(!labels.contains_key("tokenizer_path"));
         assert!(!labels.contains_key("pad_token_id"));
+    }
+
+    /// A picked number that is zero is left out; a whole number is written with
+    /// no point and a fraction in full.
+    #[test]
+    fn a_picked_zero_is_left_out_and_a_fraction_is_kept_whole() {
+        let number = |n: f64| prost_types::Value {
+            kind: Some(prost_types::value::Kind::NumberValue(n)),
+        };
+        let report = prost_types::Struct {
+            fields: [
+                ("unset".to_string(), number(0.0)),
+                ("whole".to_string(), number(8.0)),
+                ("part".to_string(), number(0.5)),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let mut labels = HashMap::new();
+        pick_prost_fields(&mut labels, &report, &["unset", "whole", "part"]);
+        assert_eq!(labels.get("unset"), None);
+        assert_eq!(labels.get("whole").map(String::as_str), Some("8"));
+        assert_eq!(labels.get("part").map(String::as_str), Some("0.5"));
     }
 }

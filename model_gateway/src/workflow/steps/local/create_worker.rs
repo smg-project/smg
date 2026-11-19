@@ -18,6 +18,7 @@ use smg_worker::{
         endpoint::Endpoint,
         metadata::join_base,
     },
+    labels::SUPPORTS_VISION_LABEL,
 };
 use tracing::{debug, warn};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
@@ -32,7 +33,6 @@ use crate::{
             backend_client::BasicWorkerBuilder,
             multimodal::{
                 mm_settings, pool_processes_media_refs, registration_lacks_media_processing,
-                SUPPORTS_VISION_LABEL,
             },
             regular::symphony::{
                 check_names, labels_select_nothing, set_aside_by_the_registry, table_label_read,

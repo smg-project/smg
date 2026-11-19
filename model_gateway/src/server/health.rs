@@ -1246,9 +1246,7 @@ mod tests {
     /// field.
     #[tokio::test]
     async fn worker_media_placement_names_models_without_media_processing_while_ready() {
-        use smg_worker::identity::basic::RuntimeType;
-
-        use crate::routers::grpc::multimodal::SUPPORTS_VISION_LABEL;
+        use smg_worker::{identity::basic::RuntimeType, labels::SUPPORTS_VISION_LABEL};
 
         fn vision_worker(url: &str, labels: &[(&str, &str)]) -> Arc<dyn Worker> {
             let mut builder = BasicWorkerBuilder::new(url)
