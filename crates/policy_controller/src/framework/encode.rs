@@ -130,7 +130,8 @@ impl EncodePlaced {
         self.one
     }
 
-    fn clear(&mut self) {
+    /// Empties the list and keeps its room.
+    pub(crate) fn clear(&mut self) {
         self.encoders.clear();
         self.one = false;
     }

@@ -210,6 +210,54 @@ pub struct ViewBuffers {
     pub kept: KeptCounts,
 }
 
+/// Narrows a built view by the gateway's wires and subset hint. Returns
+/// how many rows the wires took. A hint of zero clears the view first.
+/// A stated wire set keeps rows that share a wire. Omitted wires keep
+/// every row. Kept rows keep their order and take their new positions.
+pub(crate) fn narrow(view: &mut ViewBuffers, wires: Option<WireModes>, subset: Option<u32>) -> u64 {
+    narrow_view::<()>(view, wires, subset, None)
+}
+
+#[inline]
+fn narrow_view<T>(
+    view: &mut ViewBuffers,
+    wires: Option<WireModes>,
+    subset: Option<u32>,
+    column: Option<&mut Vec<T>>,
+) -> u64 {
+    if subset == Some(0) {
+        view.candidates.clear();
+        view.affinity.clear();
+        if let Some(column) = column {
+            column.clear();
+        }
+        return 0;
+    }
+    let Some(wires) = wires else {
+        return 0;
+    };
+    let rows = view.candidates.len();
+    let dialed = |row: &Candidate| row.wire_modes.intersects(wires);
+    // Each column follows the rows before the rows move.
+    retain_column(&view.candidates, &mut view.affinity, dialed);
+    if let Some(column) = column {
+        retain_column(&view.candidates, column, dialed);
+    }
+    view.candidates.retain(dialed);
+    let took = rows - view.candidates.len();
+    if took > 0 {
+        for (row, position) in view.candidates.iter_mut().zip(0..) {
+            row.position = position;
+        }
+    }
+    took as u64
+}
+
+fn retain_column<T>(rows: &[Candidate], column: &mut Vec<T>, dialed: impl Fn(&Candidate) -> bool) {
+    let mut beside = rows.iter();
+    column.retain(|_| beside.next().is_some_and(&dialed));
+}
+
 /// The buffers a host keeps across pair decisions: both sides' views and
 /// the table that says which of their classes pair, all of one publication.
 /// A pair build clears and fills them ([`World::build_pair`]).
@@ -243,11 +291,46 @@ impl PairBuffers {
         }
     }
 
-    /// Both sides' views, the prefill's first: what a request's own
-    /// gateway states of itself is taken from each ahead of the engine's
-    /// pair entry.
-    pub(crate) fn sides_mut(&mut self) -> [&mut ViewBuffers; 2] {
-        [&mut self.prefill, &mut self.decode]
+    /// Narrows both sides and reports what the wires took and whether a
+    /// side went empty.
+    pub(crate) fn narrow(
+        &mut self,
+        wires: Option<WireModes>,
+        subset: Option<u32>,
+        built: &(Built, Built),
+    ) -> (u64, bool) {
+        self.narrow_with_classes(wires, subset, built, None)
+    }
+
+    #[inline]
+    fn narrow_with_classes(
+        &mut self,
+        wires: Option<WireModes>,
+        subset: Option<u32>,
+        built: &(Built, Built),
+        classes: Option<&mut Vec<u32>>,
+    ) -> (u64, bool) {
+        let prefill = narrow_view(&mut self.prefill, wires, subset, classes);
+        let decode = narrow(&mut self.decode, wires, subset);
+        (prefill + decode, self.emptied(built))
+    }
+
+    fn emptied(&self, built: &(Built, Built)) -> bool {
+        (built.0.pool_size > 0 && self.prefill.candidates.is_empty())
+            || (built.1.pool_size > 0 && self.decode.candidates.is_empty())
+    }
+
+    /// Reports the pair's narrowing when the wire cut may have included
+    /// another view. A subset of zero counts no rows as taken by wires.
+    pub(crate) fn narrowing(&self, built: &(Built, Built), cut_by_wires: bool) -> (u64, bool) {
+        let took = if cut_by_wires {
+            u64::from(built.0.pool_size) + u64::from(built.1.pool_size)
+                - self.prefill.candidates.len() as u64
+                - self.decode.candidates.len() as u64
+        } else {
+            0
+        };
+        (took, self.emptied(built))
     }
 
     fn clear(&mut self) {
@@ -291,6 +374,31 @@ impl EncodePairBuffers {
             affinity: &self.encode.affinity,
         };
         (self.pair.pools(), encode)
+    }
+
+    /// The pair's buffers, for the lease counts on each side's rows.
+    pub(crate) fn pair_mut(&mut self) -> &mut PairBuffers {
+        &mut self.pair
+    }
+
+    /// Narrows the three views by the gateway's wires and subset hint.
+    /// The prefill classes and encoder facts follow their rows. Returns
+    /// how many rows the wires took and whether a populated view went empty.
+    pub(crate) fn narrow(
+        &mut self,
+        wires: Option<WireModes>,
+        subset: Option<u32>,
+        built: &(Built, Built),
+    ) -> (u64, bool) {
+        let (took, emptied) =
+            self.pair
+                .narrow_with_classes(wires, subset, built, Some(&mut self.prefill_classes));
+        let had_encoders = !self.encode.candidates.is_empty();
+        let encoded = narrow_view(&mut self.encode, wires, subset, Some(&mut self.facts));
+        (
+            took + encoded,
+            emptied || (had_encoders && self.encode.candidates.is_empty()),
+        )
     }
 }
 
