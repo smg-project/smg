@@ -391,11 +391,11 @@ class RouterArgs:
     enable_igw: bool = False  # Enable IGW (Inference Gateway) mode for multi-model support
     # The mesh server (the mesh_* fields configure it)
     enable_mesh: bool = False
+    enable_responses_websocket: bool = False
     enable_rl: bool = False  # Mount the RL control plane under /v1/rl
     # Tracing (otlp_traces_endpoint names the collector)
     enable_trace: bool = False
     # WASM support
-    enable_responses_websocket: bool = False
     enable_wasm: bool = False
     encode_policy: str | None = None  # Specific policy for encode nodes in EPD mode
     encode_selector: dict[str, str] = dataclasses.field(default_factory=dict)
