@@ -192,6 +192,17 @@ impl Filter for HasRoom {
 #[derive(Debug)]
 pub struct NotTried;
 
+impl NotTried {
+    /// Whether the request names no row tried and its host none excluded:
+    /// the filter then keeps every row. The one test behind both
+    /// shortcuts that read it: the filter's own pass and the fold's set
+    /// ([`RowTests::asked`]).
+    #[inline(always)]
+    fn names_none(facts: &RequestFacts<'_>, cx: &Constraints<'_>) -> bool {
+        facts.tried.is_empty() && cx.excluded.is_empty()
+    }
+}
+
 impl Filter for NotTried {
     fn name(&self) -> &'static str {
         "not-tried"
@@ -217,8 +228,7 @@ impl Filter for NotTried {
         cx: &Constraints<'_>,
         kept: &mut Vec<u32>,
     ) {
-        // With neither list naming a worker, every row stays in the pool.
-        if facts.tried.is_empty() && cx.excluded.is_empty() {
+        if Self::names_none(facts, cx) {
             return;
         }
         kept.retain(|&i| self.keep(facts, &candidates[i as usize], cx));
@@ -280,7 +290,7 @@ impl RowTests {
         if cx.overload_lifted {
             tests &= !Self::NOT_OVERLOADED;
         }
-        if facts.tried.is_empty() && cx.excluded.is_empty() {
+        if NotTried::names_none(facts, cx) {
             tests &= !Self::NOT_TRIED;
         }
         Self(tests)
