@@ -58,7 +58,7 @@ mod spec_store;
 mod standby;
 pub mod tls;
 mod watch_workers;
-mod wire;
+pub(crate) mod wire;
 mod worker_objects;
 pub(crate) mod worker_wire;
 

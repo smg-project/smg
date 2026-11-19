@@ -20,13 +20,21 @@ use tonic::{transport::Endpoint, Status};
 use super::{
     dial_leader, fit, hello, numbered, Answer, Decide, Error, Session, ANSWER_WAIT, KEEPALIVE,
 };
-use crate::proto::{
-    busy, controller_frame, decide_answer, gateway_frame, released, Busy, ControllerFrame,
-    DecideAnswer, DecideRequest, Decision, GatewayFrame, Released, Welcome,
+use crate::{
+    controller::wire::{self, Refusal},
+    proto::{
+        busy, controller_frame, decide_answer, gateway_frame, released, Busy, ControllerFrame,
+        DecideAnswer, DecideRequest, Decision, GatewayFrame, Released, Welcome,
+    },
 };
 
 /// About six seconds at ten thousand reports a second.
 const REPORT_QUEUE: usize = 65_536;
+
+/// A stream's clean end, as the message of the `OK` status the link keeps
+/// of it ([`Link::ended`]).
+const SESSION_ENDED: &str = "the session ended";
+const DECIDE_ENDED: &str = "the decide stream ended";
 
 /// A host's session and one decide stream, shared by its requests.
 #[derive(Clone, Debug)]
@@ -49,9 +57,10 @@ pub enum Unanswered {
     Late,
     /// An ask under this id is in flight already. Nothing was sent.
     InFlight,
-    /// The link has ended.
+    /// The link has ended ([`Link::ended`] says why).
     Ended,
-    /// The request's id or size prevents sending it.
+    /// The request's id, its size or a field out of its range prevents
+    /// sending it. Nothing was sent, and the link stands.
     Unsent(Error),
 }
 
@@ -62,9 +71,13 @@ pub struct Full;
 impl Link {
     /// Dials the endpoint, asks who leads, opens the session and one decide
     /// stream, and starts their readers on the calling runtime.
+    ///
+    /// The link sets its own keepalive on the endpoint, over any the caller
+    /// set: a ping every [`KEEPALIVE`], idle or not, and [`ANSWER_WAIT`]
+    /// for its answer. The link's readers wait with no bound of their own,
+    /// as a watch does, so the keepalive is what ends a link whose
+    /// controller went silent.
     pub async fn connect(endpoint: Endpoint, gateway_id: &str) -> Result<Self, Error> {
-        // The link's readers wait with no bound, as a watch does. Its channel
-        // is kept alive, so a controller gone silent ends the link.
         let endpoint = endpoint
             .http2_keep_alive_interval(KEEPALIVE)
             .keep_alive_timeout(ANSWER_WAIT)
@@ -92,28 +105,47 @@ impl Link {
         self.shared.stands()
     }
 
+    /// Why the link ended, and none while it stands. The first cause is
+    /// kept: a stream's status whole (a clean end reads as an `OK` status
+    /// that names the stream), a frame's term below the floor, a replica
+    /// that stopped leading, an answer that carries nothing, or a full
+    /// report queue.
+    pub fn ended(&self) -> Option<Arc<Error>> {
+        self.shared.state.lock().ended.clone()
+    }
+
     /// The highest term an answer carried.
     pub fn term_floor(&self) -> u64 {
         self.shared.state.lock().floor
     }
 
+    /// The block hashes the link cut from the tails of the asks it queued,
+    /// each cut to fit its ask in a frame: the count the contract has a
+    /// sender keep on its own side.
+    pub fn hashes_cut(&self) -> usize {
+        self.shared.state.lock().cut
+    }
+
     /// Sends one ask if the stream holds credit and waits up to `budget`
-    /// for its answer. Use a distinct id for each request that may still
-    /// have an answer on the wire.
+    /// for its answer. A budget past the clock's range waits with no bound.
+    /// Use a distinct id for each request that may still have an answer on
+    /// the wire.
+    ///
+    /// A request the controller's check refuses is refused here, by the
+    /// same check, and nothing is sent: a frame out of its ranges ends the
+    /// stream it is sent on, and the link's stream is every caller's.
     pub async fn ask(
         &self,
         mut request: DecideRequest,
         budget: Duration,
     ) -> Result<Decision, Unanswered> {
-        if let Err(error) = fit(&mut request) {
-            return Err(if self.stands() {
-                Unanswered::Unsent(error)
-            } else {
-                Unanswered::Ended
-            });
-        }
+        let cut = match fit(&mut request).and_then(|cut| in_range(&request).map(|()| cut)) {
+            Ok(cut) => cut,
+            Err(_) if !self.stands() => return Err(Unanswered::Ended),
+            Err(error) => return Err(Unanswered::Unsent(error)),
+        };
         let deadline = Instant::now().checked_add(budget);
-        let mut pending = self.shared.begin(request, deadline)?;
+        let mut pending = self.shared.begin(request, deadline, cut)?;
         if budget.is_zero() {
             return Err(Unanswered::Late);
         }
@@ -136,6 +168,18 @@ impl Link {
     }
 }
 
+/// The ranges the controller's check reads in a request's facts, by that
+/// check's own function.
+fn in_range(request: &DecideRequest) -> Result<(), Error> {
+    let Some(facts) = &request.facts else {
+        return Ok(());
+    };
+    match wire::ranges(facts) {
+        Ok(_) => Ok(()),
+        Err(Refusal::OutOfRange(field)) => Err(Error::OutOfRange(field)),
+    }
+}
+
 #[derive(Debug)]
 struct Shared {
     state: Mutex<State>,
@@ -146,6 +190,10 @@ struct Shared {
 struct State {
     floor: u64,
     open: Option<Open>,
+    // Why the link ended: the first cause, written as the queues are taken.
+    ended: Option<Arc<Error>>,
+    // The block hashes cut from the asks the link queued.
+    cut: usize,
 }
 
 impl State {
@@ -204,6 +252,8 @@ impl Shared {
                     pending: FxHashMap::default(),
                     _stop: stop,
                 }),
+                ended: None,
+                cut: 0,
             }),
             stopped,
         })
@@ -248,8 +298,8 @@ impl Shared {
             }
         }
         let readers = [
-            self.reader(controller, Self::read_session),
-            self.reader(decisions, Self::read_decide),
+            self.reader(controller, Self::read_session, SESSION_ENDED),
+            self.reader(decisions, Self::read_decide, DECIDE_ENDED),
         ];
         let link = Link {
             welcome: Arc::new(welcome),
@@ -263,9 +313,14 @@ impl Shared {
     }
 
     /// Takes the queues and waiters together, then drops them outside the
-    /// lock. Neither stream can send new frames past this point.
-    fn end(mut state: MutexGuard<'_, State>) {
+    /// lock. Neither stream can send new frames past this point. The end
+    /// that takes them writes why: a later end finds none, and its cause
+    /// is dropped.
+    fn end(mut state: MutexGuard<'_, State>, why: Error) {
         let open = state.open.take();
+        if open.is_some() {
+            state.ended = Some(Arc::new(why));
+        }
         drop(state);
         drop(open);
     }
@@ -273,17 +328,20 @@ impl Shared {
     fn report(&self, frame: gateway_frame::Frame) -> Result<(), Full> {
         let state = self.state.lock();
         let open = state.open.as_ref().ok_or(Full)?;
-        if open.reports.try_send(frame).is_err() {
-            Self::end(state);
-            return Err(Full);
-        }
-        Ok(())
+        let why = match open.reports.try_send(frame) {
+            Ok(()) => return Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => Error::ReportsFull,
+            Err(mpsc::error::TrySendError::Closed(_)) => Status::ok(SESSION_ENDED).into(),
+        };
+        Self::end(state, why);
+        Err(Full)
     }
 
     fn begin(
         &self,
         request: DecideRequest,
         deadline: Option<Instant>,
+        cut: usize,
     ) -> Result<Pending<'_>, Unanswered> {
         let mut state = self.state.lock();
         let open = state.open.as_mut().ok_or(Unanswered::Ended)?;
@@ -296,7 +354,7 @@ impl Shared {
         let id = Arc::<[u8]>::from(request.request_id.as_slice());
         open.credit -= 1;
         if open.requests.send(request).is_err() {
-            Self::end(state);
+            Self::end(state, Status::ok(DECIDE_ENDED).into());
             return Err(Unanswered::Ended);
         }
         // A reader takes this same lock before it can deliver an answer.
@@ -308,6 +366,8 @@ impl Shared {
                 answer: Some(sender),
             },
         );
+        // The cut of an ask is counted once the ask is queued.
+        state.cut += cut;
         Ok(Pending {
             shared: self,
             id,
@@ -323,6 +383,7 @@ impl Shared {
         self: &Arc<Self>,
         frames: impl Stream<Item = Result<T, Status>> + Send + 'static,
         read: fn(&Self, T),
+        clean_end: &'static str,
     ) -> JoinHandle<()>
     where
         T: Send + 'static,
@@ -342,30 +403,35 @@ impl Shared {
                 let Some(shared) = shared.upgrade() else {
                     break;
                 };
-                match next {
-                    Some(Ok(frame)) => read(&shared, frame),
-                    Some(Err(_)) | None => {
-                        Self::end(shared.state.lock());
-                        break;
+                let status = match next {
+                    Some(Ok(frame)) => {
+                        read(&shared, frame);
+                        continue;
                     }
-                }
+                    Some(Err(status)) => status,
+                    None => Status::ok(clean_end),
+                };
+                Self::end(shared.state.lock(), status.into());
+                break;
             }
         })
     }
 
     fn read_session(&self, frame: ControllerFrame) {
         let mut state = self.state.lock();
-        if state.observe(frame.term).is_none()
-            || matches!(frame.frame, Some(controller_frame::Frame::NotLeader(_)))
-        {
-            Self::end(state);
+        let (term, floor) = (frame.term, state.floor);
+        if state.observe(term).is_none() {
+            Self::end(state, Error::BelowFloor { term, floor });
+        } else if let Some(controller_frame::Frame::NotLeader(told)) = frame.frame {
+            Self::end(state, Error::NotLeader(told.leader_address));
         }
     }
 
     fn read_decide(&self, frame: DecideAnswer) {
         let mut state = self.state.lock();
-        let Some(open) = state.observe(frame.term) else {
-            Self::end(state);
+        let (term, floor) = (frame.term, state.floor);
+        let Some(open) = state.observe(term) else {
+            Self::end(state, Error::BelowFloor { term, floor });
             return;
         };
         let answer = match frame.answer {
@@ -377,8 +443,13 @@ impl Shared {
             Some(decide_answer::Answer::Busy(busy)) if busy.reason() != busy::Reason::NotLeader => {
                 Answer::Busy(busy)
             }
-            Some(decide_answer::Answer::Busy(_)) | None => {
-                Self::end(state);
+            Some(decide_answer::Answer::Busy(_)) => {
+                Self::end(state, Error::NotLeader(String::new()));
+                return;
+            }
+            None => {
+                let nothing = "an answer of the decide stream carries nothing";
+                Self::end(state, Error::NoDecision(nothing.to_owned()));
                 return;
             }
         };
@@ -438,15 +509,21 @@ mod tests {
     use tokio::time::{advance, timeout};
 
     use super::*;
-    use crate::proto::{
-        busy, controller_frame, decide_answer, released, Credit, Lease, NotLeader, Released,
-        RequestFacts, Side,
+    use crate::{
+        proto::{
+            busy, controller_frame, decide_answer, released, Credit, Header, Lease, NotLeader,
+            Released, RequestFacts, Side,
+        },
+        spec::MAX_HEADERS,
     };
 
     const WAIT: Duration = Duration::from_secs(5);
     const LEADER_TERM: u64 = 3;
     const WELCOME_TERM: u64 = 4;
     const ASKS: u8 = 64;
+
+    /// One change of a request's facts.
+    type Edit = fn(&mut RequestFacts);
 
     struct Peer {
         link: Link,
@@ -623,6 +700,10 @@ mod tests {
         assert!(peer.link.stands());
         assert!(matches!(peer.link.report(report.clone()), Err(Full)));
         assert!(!peer.link.stands());
+        assert!(matches!(
+            peer.link.ended().as_deref(),
+            Some(Error::ReportsFull)
+        ));
         assert!(matches!(peer.link.report(report), Err(Full)));
         assert!(matches!(within(asked).await, Err(Unanswered::Ended)));
         assert_eq!(within(peer.reports.next()).await, None);
@@ -672,6 +753,7 @@ mod tests {
         peer.credit(6, 1);
         peer.at_term(6).await;
 
+        assert_eq!(peer.link.hashes_cut(), 0, "no cut frame was queued");
         let mut large = request(2);
         let blocks: Vec<_> = (0..8192).collect();
         large.facts = Some(RequestFacts {
@@ -686,12 +768,51 @@ mod tests {
         assert_eq!(fitted.request_id, [2]);
         let fitted = fitted.facts.expect("the fitted ask's facts").block_hashes;
         assert!(!fitted.is_empty() && fitted.len() < blocks.len() && blocks.starts_with(&fitted));
+        assert_eq!(peer.link.hashes_cut(), blocks.len() - fitted.len());
         assert_eq!(within(peer.requests.next()).await, Some(request(3)));
         assert!(matches!(
             peer.link.ask(request(4), WAIT).await,
             Err(Unanswered::NoCredit)
         ));
         assert!(poll(Box::pin(peer.requests.next()).as_mut()).is_pending());
+    }
+
+    /// A frame out of the ranges the controller's check reads would end the
+    /// stream for every caller: the link's door refuses it by the field,
+    /// sends nothing, spends no credit and stands.
+    #[tokio::test]
+    async fn an_ask_out_of_the_calls_ranges_sends_nothing_and_the_link_stands() {
+        let mut peer = Peer::new(1);
+        let edits: [(&str, Edit); 4] = [
+            ("facts.phase", |facts| facts.phase = 99),
+            ("facts.hash_kind", |facts| facts.hash_kind = 99),
+            ("facts.headers", |facts| {
+                facts.headers = vec![Header::default(); MAX_HEADERS + 1];
+            }),
+            ("facts.headers.name", |facts| {
+                facts.headers = vec![Header {
+                    name: 256,
+                    ..Header::default()
+                }];
+            }),
+        ];
+        for (field, edit) in edits {
+            let mut wrong = request(1);
+            let mut facts = RequestFacts::default();
+            edit(&mut facts);
+            wrong.facts = Some(facts);
+            let refused = peer.link.ask(wrong, WAIT).await;
+            assert!(
+                matches!(refused, Err(Unanswered::Unsent(Error::OutOfRange(named))) if named == field),
+                "{field}: {refused:?}"
+            );
+        }
+        assert!(poll(Box::pin(peer.requests.next()).as_mut()).is_pending());
+        assert!(peer.link.stands() && peer.link.ended().is_none());
+        // The window of one is whole: the next ask is sent.
+        let mut asked = Box::pin(peer.link.ask(request(1), WAIT));
+        assert!(poll(asked.as_mut()).is_pending());
+        assert_eq!(within(peer.requests.next()).await, Some(request(1)));
     }
 
     #[tokio::test]
@@ -797,7 +918,7 @@ mod tests {
         let mut closed = peer
             .link
             .shared
-            .begin(request(3), None)
+            .begin(request(3), None, 0)
             .expect("the ask is sent");
         closed.answer.close();
         assert_eq!(within(peer.requests.next()).await, Some(request(3)));
@@ -838,6 +959,10 @@ mod tests {
             assert!(matches!(within(asked).await, Err(Unanswered::Ended)));
             assert!(!peer.link.stands());
             assert_eq!(peer.link.term_floor(), 6);
+            assert!(matches!(
+                peer.link.ended().as_deref(),
+                Some(Error::BelowFloor { term: 5, floor: 6 })
+            ));
         }
     }
 
@@ -857,6 +982,10 @@ mod tests {
             Err(Unanswered::Ended)
         ));
         assert!(!peer.link.stands());
+        assert!(matches!(
+            peer.link.ended().as_deref(),
+            Some(Error::Status(status)) if status.message() == DECIDE_ENDED
+        ));
         Peer::readers_end(peer.readers).await;
 
         let peer = Peer::new(1);
@@ -867,9 +996,16 @@ mod tests {
             Err(Full)
         ));
         assert!(!peer.link.stands());
+        assert!(matches!(
+            peer.link.ended().as_deref(),
+            Some(Error::Status(status)) if status.message() == SESSION_ENDED
+        ));
         Peer::readers_end(peer.readers).await;
     }
 
+    /// Ends a link by one stream's clean end, by its status or by the
+    /// controller's word that it leads no more, and reads what the waiters
+    /// and the link say of it.
     async fn check_end(session: bool, closed: Option<bool>) {
         let mut peer = Peer::new(2);
         let mut first = Box::pin(peer.link.ask(request(1), WAIT));
@@ -893,7 +1029,10 @@ mod tests {
                 .expect("the decide reader takes the status"),
             (true, None) => peer.controller(
                 5,
-                Some(controller_frame::Frame::NotLeader(NotLeader::default())),
+                Some(controller_frame::Frame::NotLeader(NotLeader {
+                    leader_address: "replica-b:9000".to_owned(),
+                    ..NotLeader::default()
+                })),
             ),
             (false, None) => peer.answer(
                 1,
@@ -908,6 +1047,24 @@ mod tests {
         assert!(matches!(within(second).await, Err(Unanswered::Ended)));
         Peer::readers_end(peer.readers).await;
         assert!(!peer.link.stands());
+        // The link keeps why it ended: a stream's status whole, and the
+        // leader's address where the session named one.
+        let ended = peer.link.ended().expect("an ended link says why");
+        let said = match (session, closed, &*ended) {
+            (_, Some(clean), Error::Status(status)) => {
+                let (code, message) = match (clean, session) {
+                    (true, true) => (tonic::Code::Ok, SESSION_ENDED),
+                    (true, false) => (tonic::Code::Ok, DECIDE_ENDED),
+                    (false, true) => (tonic::Code::Unavailable, "session ended"),
+                    (false, false) => (tonic::Code::Unavailable, "decide ended"),
+                };
+                status.code() == code && status.message() == message
+            }
+            (true, None, Error::NotLeader(address)) => address == "replica-b:9000",
+            (false, None, Error::NotLeader(address)) => address.is_empty(),
+            _ => false,
+        };
+        assert!(said, "session {session}, closed {closed:?}: {ended:?}");
         assert!(matches!(
             poll(Box::pin(peer.link.ask(request(3), WAIT)).as_mut()),
             Poll::Ready(Err(Unanswered::Ended))

@@ -2626,6 +2626,43 @@ async fn a_link_releases_the_lease_of_a_zero_budget_ask() {
         .expect("the case ends inside its outer bound");
 }
 
+/// A frame the call refuses ends the stream it is sent on, and a link's
+/// stream is every caller's. The link refuses such a frame at its own door:
+/// nothing is sent, the link stands, and the next ask is answered on the
+/// stream that stood.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_link_refuses_a_frame_out_of_the_calls_ranges_and_stands() {
+    const GATEWAY: &str = "fleet-ranged-link";
+    let case = async {
+        let (harness, link) = Box::pin(linked_fleet(GATEWAY))
+            .await
+            .expect("a ready fleet");
+        let first = linked_pick(&link, ask(b"first"))
+            .await
+            .expect("a first pick");
+        let mut wrong = ask(b"wrong");
+        wrong.facts.as_mut().expect("the ask states facts").phase = 99;
+        let refused = link.ask(wrong, ROOM).await;
+        assert!(
+            matches!(&refused, Err(Unanswered::Unsent(error))
+                if error.to_string().contains("facts.phase")),
+            "{refused:?}"
+        );
+        assert!(link.stands(), "the link stands");
+        let last = linked_pick(&link, ask(b"last"))
+            .await
+            .expect("a pick after the refusal");
+        // Both picks ran on the same decider: no lease was booked between
+        // them, so the refused frame reached no decider.
+        assert_eq!(last.id, first.id + 1);
+        drop(link);
+        harness.stop().await.expect("a clean stop");
+    };
+    tokio::time::timeout(CASE, case)
+        .await
+        .expect("the case ends inside its outer bound");
+}
+
 /// A replica that does not lead refuses the client's session and names the
 /// leader: two controllers elect over one lease file, and the client dials
 /// each.

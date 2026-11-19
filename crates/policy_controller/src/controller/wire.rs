@@ -101,6 +101,58 @@ const TEXT: u8 = 1;
 /// (`DecideRequest.again`).
 const AGAIN: u8 = 1 << 1;
 
+/// What the ranges of a frame's facts read as: its phase, the kind of its
+/// block hashes and its session key's fingerprint (`0` for a key carried
+/// plain, and for none). Refuses by the first field the record cannot
+/// hold. The check of a frame received reads its facts here
+/// ([`Checked::new`]), and so does a sender whose callers share one
+/// stream: a frame out of its ranges ends the stream it is sent on.
+/// Inline in both, so the check of a frame received pays no call for it.
+#[inline(always)]
+pub(crate) fn ranges(facts: &proto::RequestFacts) -> Result<(Phase, HashKind, u64), Refusal> {
+    let phase = match proto::Phase::try_from(facts.phase) {
+        Ok(proto::Phase::Unspecified | proto::Phase::Single) => Phase::Single,
+        Ok(proto::Phase::Prefill) => Phase::Prefill,
+        Ok(proto::Phase::Decode) => Phase::Decode,
+        Ok(proto::Phase::Encode) => Phase::Encode,
+        Err(_) => return Err(Refusal::OutOfRange("facts.phase")),
+    };
+    let hash_kind = match proto::HashKind::try_from(facts.hash_kind) {
+        Ok(proto::HashKind::Unspecified | proto::HashKind::Token) => HashKind::Token,
+        Ok(proto::HashKind::Text) => HashKind::Text,
+        Err(_) => return Err(Refusal::OutOfRange("facts.hash_kind")),
+    };
+    // The headers by their count first: an empty one is two bytes as
+    // encoded and a record of its own as read, so the frame's size
+    // does not bound them, and a list longer than a view's names
+    // repeats one.
+    if facts.headers.len() > MAX_HEADERS {
+        return Err(Refusal::OutOfRange("facts.headers"));
+    }
+    if facts
+        .headers
+        .iter()
+        .any(|header| u8::try_from(header.name).is_err())
+    {
+        return Err(Refusal::OutOfRange("facts.headers.name"));
+    }
+    // A session key's hash form is the session's value: the key's
+    // fingerprint is read back from it within the request's model and
+    // phase. A value of zero is no session.
+    let session = facts.session_key.as_ref();
+    let session_key = match session.and_then(|key| key.form.as_ref()) {
+        Some(Form::Hash(value @ 1..)) => {
+            let model = fingerprint(facts.model.as_bytes());
+            match key_of_session(*value, model, phase) {
+                0 => return Err(Refusal::OutOfRange("facts.session_key.hash")),
+                key => key,
+            }
+        }
+        _ => 0,
+    };
+    Ok((phase, hash_kind, session_key))
+}
+
 /// A `DecideRequest` the engine's record holds whole.
 #[derive(Debug)]
 pub(crate) struct Checked {
@@ -132,46 +184,7 @@ impl Checked {
         let mut facts = request.facts.unwrap_or_default();
         // The prompt as text is said and not kept: no step reads it yet.
         let text = !mem::take(&mut facts.prompt_text).is_empty();
-        let phase = match proto::Phase::try_from(facts.phase) {
-            Ok(proto::Phase::Unspecified | proto::Phase::Single) => Phase::Single,
-            Ok(proto::Phase::Prefill) => Phase::Prefill,
-            Ok(proto::Phase::Decode) => Phase::Decode,
-            Ok(proto::Phase::Encode) => Phase::Encode,
-            Err(_) => return Err(Refusal::OutOfRange("facts.phase")),
-        };
-        let hash_kind = match proto::HashKind::try_from(facts.hash_kind) {
-            Ok(proto::HashKind::Unspecified | proto::HashKind::Token) => HashKind::Token,
-            Ok(proto::HashKind::Text) => HashKind::Text,
-            Err(_) => return Err(Refusal::OutOfRange("facts.hash_kind")),
-        };
-        // The headers by their count first: an empty one is two bytes as
-        // encoded and a record of its own as read, so the frame's size
-        // does not bound them, and a list longer than a view's names
-        // repeats one.
-        if facts.headers.len() > MAX_HEADERS {
-            return Err(Refusal::OutOfRange("facts.headers"));
-        }
-        if facts
-            .headers
-            .iter()
-            .any(|header| u8::try_from(header.name).is_err())
-        {
-            return Err(Refusal::OutOfRange("facts.headers.name"));
-        }
-        // A session key's hash form is the session's value: the key's
-        // fingerprint is read back from it within the request's model and
-        // phase. A value of zero is no session.
-        let session = facts.session_key.as_ref();
-        let session_key = match session.and_then(|key| key.form.as_ref()) {
-            Some(Form::Hash(value @ 1..)) => {
-                let model = fingerprint(facts.model.as_bytes());
-                match key_of_session(*value, model, phase) {
-                    0 => return Err(Refusal::OutOfRange("facts.session_key.hash")),
-                    key => key,
-                }
-            }
-            _ => 0,
-        };
+        let (phase, hash_kind, session_key) = ranges(&facts)?;
         let rare = (u8::from(text) * TEXT) | (u8::from(request.again) * AGAIN);
         Ok(Self {
             id: request.request_id,

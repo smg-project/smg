@@ -22,7 +22,7 @@
 //! (`x-smg-principal`); a stated id is no credential. [`blocking::Client`]
 //! drives the same calls for a caller that runs no runtime.
 //!
-//! No wait of the client for its peer but one outlasts [`ANSWER_WAIT`], on
+//! No wait of [`Client`] for its peer but one outlasts [`ANSWER_WAIT`], on
 //! any endpoint: the dial, each call from its send to its answer's end, the
 //! session's call with its first frame, a report's wait for room in the
 //! session's queue, the wait for the session's end, the decide stream's
@@ -34,6 +34,13 @@
 //! ([`Watch::next`]): a fleet that does not change tells nothing, and a
 //! peer gone silent ends that wait through the channel's keepalive
 //! ([`KEEPALIVE`]).
+//!
+//! A [`Link`] holds [`ANSWER_WAIT`] over its dial, its `Leader` ask and its
+//! two opens alone. Past them an ask waits its caller's budget
+//! ([`Link::ask`]), a report waits for nothing ([`Link::report`]), and the
+//! link's two readers wait with no bound of their own: the channel's
+//! keepalive, which the link sets, ends a link whose controller went
+//! silent ([`Link::connect`]).
 
 use std::{
     future::{poll_fn, Future},
@@ -148,6 +155,18 @@ pub enum Error {
     /// nothing.
     #[error("a DecideRequest of {0} bytes is over the call's limit of {limit} bytes with no block hash to cut", limit = MAX_FRAME)]
     TooLarge(usize),
+    /// A field of an ask's facts is outside the range the call reads, named
+    /// by its path in the contract. The controller ends a stream at such a
+    /// frame, and a link's one stream is every caller's: the link refuses
+    /// the frame at its own door and sends nothing ([`Link::ask`]).
+    #[error("an ask's {0} is out of its range in this protocol version")]
+    OutOfRange(&'static str),
+    /// A link's report queue was full: its session took no report for as
+    /// long as the queue covers. The link ended, and the controller's
+    /// session grace covers the leases whose end was not said
+    /// ([`Link::report`]).
+    #[error("the link's report queue was full")]
+    ReportsFull,
     /// The decide stream has no credit left: the gateway decides this
     /// request itself. Nothing was sent, and the stream stands.
     #[error("the decide stream has no credit left: the gateway decides this request itself")]
