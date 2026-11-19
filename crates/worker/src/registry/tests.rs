@@ -3019,3 +3019,205 @@ fn remove_if_removes_the_worker_only_while_its_condition_holds() {
         "a worker gone reads None"
     );
 }
+
+/// The lines a rendered scrape holds for the worker at `url`, sorted.
+fn series_of(rendered: &str, url: &str) -> Vec<String> {
+    let label = format!("worker=\"{url}\"");
+    let mut lines: Vec<String> = rendered
+        .lines()
+        .filter(|line| line.contains(&label))
+        .map(str::to_owned)
+        .collect();
+    lines.sort_unstable();
+    lines
+}
+
+/// The sample of `family` that carries the label of the worker at `url`
+/// alone.
+fn worker_sample(rendered: &str, family: &str, url: &str) -> Option<f64> {
+    let prefix = format!("{family}{{worker=\"{url}\"}} ");
+    rendered
+        .lines()
+        .find_map(|line| line.strip_prefix(prefix.as_str()))
+        .map(|value| value.parse().unwrap())
+}
+
+/// A breaker that opens on one failed request and stays open for an hour.
+fn opens_on_one_failure() -> CircuitBreakerConfig {
+    CircuitBreakerConfig {
+        failure_threshold: 1,
+        success_threshold: 1,
+        timeout_duration: std::time::Duration::from_secs(3600),
+        window_duration: std::time::Duration::from_secs(3600),
+    }
+}
+
+/// Building a worker writes no series. Its registration starts them: its
+/// health, its HTTP/2 flag, its breaker's state and two counts, and at zero
+/// the breaker's five transition counters and its health readmissions.
+#[test]
+fn a_workers_series_start_at_its_registration_and_not_at_its_build() {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let url = "http://series-start:8080";
+    metrics::with_local_recorder(&recorder, || {
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .health_config(no_health_check())
+                .http2(true)
+                .build(),
+        );
+        assert_eq!(
+            series_of(&handle.render(), url),
+            Vec::<String>::new(),
+            "a build writes no series"
+        );
+
+        let registry = WorkerRegistry::new();
+        registry.register(worker).expect("a fresh URL registers");
+        let rendered = handle.render();
+        assert_eq!(
+            worker_sample(&rendered, "smg_worker_health", url),
+            Some(1.0)
+        );
+        assert_eq!(worker_sample(&rendered, "smg_worker_http2", url), Some(1.0));
+        assert_eq!(
+            worker_sample(&rendered, "smg_worker_cb_state", url),
+            Some(0.0)
+        );
+        // The breaker's two counts are on the scrape from the registration,
+        // ahead of the worker's first outcome.
+        for count in [
+            "smg_worker_cb_consecutive_failures",
+            "smg_worker_cb_consecutive_successes",
+        ] {
+            assert_eq!(worker_sample(&rendered, count, url), Some(0.0), "{count}");
+        }
+        let zero_counters: Vec<String> = series_of(&rendered, url)
+            .into_iter()
+            .filter(|line| {
+                line.starts_with("smg_worker_cb_transitions_total{")
+                    || line.starts_with("smg_worker_cb_health_readmissions_total{")
+            })
+            .collect();
+        assert_eq!(zero_counters.len(), 6, "{rendered}");
+        assert!(
+            zero_counters.iter().all(|line| line.ends_with(" 0")),
+            "{rendered}"
+        );
+    });
+}
+
+/// A replacement is built for an address a live worker serves, and its host
+/// refuses it before it enters the registry. Its build wrote no series, so
+/// every series of the address reads as the live worker left it: healthy,
+/// on HTTP/2, its breaker open.
+#[test]
+fn a_replacement_that_never_enters_leaves_the_live_workers_series_as_they_stood() {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let url = "http://refused-replacement:8080";
+    metrics::with_local_recorder(&recorder, || {
+        let registry = WorkerRegistry::new();
+        let live: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .health_config(no_health_check())
+                .http2(true)
+                .circuit_breaker_config(opens_on_one_failure())
+                .build(),
+        );
+        registry
+            .register(Arc::clone(&live))
+            .expect("a fresh URL registers");
+        live.record_outcome(503);
+        let rendered = handle.render();
+        let stood = series_of(&rendered, url);
+        assert_eq!(
+            worker_sample(&rendered, "smg_worker_health", url),
+            Some(1.0)
+        );
+        assert_eq!(worker_sample(&rendered, "smg_worker_http2", url), Some(1.0));
+        assert_eq!(
+            worker_sample(&rendered, "smg_worker_cb_state", url),
+            Some(1.0)
+        );
+
+        // The replacement differs in each of them: its health checks are on,
+        // so it starts pending; it speaks HTTP/1.1; its breaker is closed.
+        let refused = BasicWorkerBuilder::new(url)
+            .worker_type(WorkerType::Regular)
+            .build();
+        assert!(!refused.is_healthy());
+        drop(refused);
+
+        assert_eq!(series_of(&handle.render(), url), stood);
+    });
+}
+
+/// A replacement's series are its own from the moment it enters: its HTTP/2
+/// flag, and the breaker it ends with. A replacement with the old worker's
+/// breaker settings adopts the live breaker, whose open state and failure
+/// count stand. One with other settings keeps its own breaker: the state
+/// reads closed and the failure count zero. The status is the address's:
+/// a replacement built pending serves as ready, and reads healthy. The
+/// counter of the trip keeps its count through both.
+#[test]
+fn a_replacement_publishes_its_own_series_where_it_enters() {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let url = "http://replacement-series:8080";
+    let replacement = |http2: bool, breaker: CircuitBreakerConfig| -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .http2(http2)
+                .circuit_breaker_config(breaker)
+                .build(),
+        )
+    };
+    metrics::with_local_recorder(&recorder, || {
+        let read = |family: &str| worker_sample(&handle.render(), family, url);
+        let registry = WorkerRegistry::new();
+        let live: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .health_config(no_health_check())
+                .circuit_breaker_config(opens_on_one_failure())
+                .build(),
+        );
+        let id = registry
+            .register(Arc::clone(&live))
+            .expect("a fresh URL registers");
+        live.record_outcome(503);
+        assert_eq!(read("smg_worker_http2"), Some(0.0));
+        assert_eq!(read("smg_worker_cb_state"), Some(1.0));
+        assert_eq!(read("smg_worker_cb_consecutive_failures"), Some(1.0));
+
+        assert!(registry.replace(&id, replacement(true, opens_on_one_failure())));
+        assert_eq!(read("smg_worker_http2"), Some(1.0));
+        assert_eq!(read("smg_worker_cb_state"), Some(1.0));
+        assert_eq!(read("smg_worker_cb_consecutive_failures"), Some(1.0));
+        assert_eq!(read("smg_worker_health"), Some(1.0));
+
+        let other = CircuitBreakerConfig {
+            failure_threshold: 2,
+            ..opens_on_one_failure()
+        };
+        assert!(registry.replace(&id, replacement(false, other)));
+        assert_eq!(read("smg_worker_http2"), Some(0.0));
+        assert_eq!(read("smg_worker_cb_state"), Some(0.0));
+        assert_eq!(read("smg_worker_cb_consecutive_failures"), Some(0.0));
+        assert_eq!(read("smg_worker_health"), Some(1.0));
+
+        let trips = series_of(&handle.render(), url)
+            .into_iter()
+            .find(|line| {
+                line.starts_with("smg_worker_cb_transitions_total{")
+                    && line.contains("from=\"closed\",to=\"open\"")
+            })
+            .expect("the trip's counter");
+        assert!(trips.ends_with(" 1"), "{trips}");
+    });
+}
