@@ -624,6 +624,8 @@ fn main() -> Result<ExitCode, CatalogError> {
 
 A stage is a Rust type that implements `Filter`, `Scorer` or `Picker`. You add it to the catalog under a new name and hand the catalog to `controller::run`: the result is the stock controller with your stage in it. A document then names your stage as it names a built-in, here `score: [pack]`.
 
+A host that holds a store of its own, with no controller around it, validates a document over the same catalog. `AppliedSpec::validate_in(&document, &stages, &denied_headers)` returns the generation that `MemoryStore::apply` takes. The host numbers its documents with `generation`. The store takes a number above the one that stands, so it refuses a document with no number.
+
 - The code above is from [`examples/policy-controller`](../../examples/policy-controller), the guide with the scorer, its tests and its document. That page also lists the data the stock controller feeds a stage today.
 - A stage that keeps a number of each worker's load report says so through `Lifecycle::keeps_loads`. The controller then tells it every report before a decision can read that report, through `Lifecycle::on_signal`. A stage that does not say so is told no report. In process the load signal names two more things: the worker's slot in the host's counts and the report's sample instant. A host that builds the signal itself fills both.
 - [`policyspec.schema.json`](policyspec.schema.json) is the JSON schema of the document, generated from the crate's types. It lists every field with its description.
