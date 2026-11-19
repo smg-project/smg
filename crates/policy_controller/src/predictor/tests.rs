@@ -85,7 +85,7 @@ impl Predictor {
             (older, at, walked) = (at, block.newer, walked + 1);
         }
         assert_eq!(older, self.newest);
-        let (mut at, mut older) = (self.waits, NONE);
+        let (mut at, mut older) = (self.waiting, NONE);
         while at != NONE {
             let block = self.block(at);
             assert!(block.waits(), "an end among the blocks that wait: {at}");
@@ -496,7 +496,7 @@ fn a_path_no_worker_is_left_of_leaves_a_block_a_step_of_the_sweep() {
     assert_eq!(predictor.sweep(43), 43);
     assert_eq!((predictor.len(), predictor.blocks()), (0, 36));
     predictor.check();
-    // The rest waits at the old end, and leaves a block a step.
+    // The rest leaves a block a step: each waits once none follows it.
     let mut calls = 0;
     while predictor.blocks() != 0 {
         let held = predictor.blocks();
@@ -550,8 +550,8 @@ fn a_block_no_worker_is_left_of_leaves_though_a_request_ended_there() {
     predictor.sent(SEED, &[1, 2], worker(1));
     predictor.forget(worker(1));
     // Three visits empty the path and take its third block out. The
-    // second waits at the old end then, not where the request ended, and
-    // two steps take it and the first. The last visit ends the pass.
+    // second waits then, off the list where the request ended, and two
+    // steps take it and the first. The last visit ends the pass.
     assert_eq!(predictor.sweep(usize::MAX), 3 + 2 + 1);
     assert_eq!((predictor.len(), predictor.blocks()), (1, 1));
     assert_eq!(read(&mut predictor, &[1, 2, 3]), (0, vec![]));
@@ -635,7 +635,7 @@ fn a_list_of_workers_keeps_no_room_for_the_workers_that_left() {
 }
 
 #[test]
-fn a_block_no_worker_is_left_of_goes_back_to_the_old_end_behind_a_write_it_gave_no_room() {
+fn a_block_no_worker_is_left_of_waits_again_behind_a_write_it_gave_no_room() {
     let mut predictor = Predictor::new(1_000);
     // A path of twelve that a request ended at every block of, then two
     // blocks of a worker that leaves.
@@ -647,12 +647,12 @@ fn a_block_no_worker_is_left_of_goes_back_to_the_old_end_behind_a_write_it_gave_
     predictor.sent(SEED, &[500, 501], worker(1));
     predictor.forget(worker(1));
     // The pass ends with the call's budget: its last visit takes the
-    // second of the two blocks out, and the first waits at the old end.
+    // second of the two blocks out, and the first waits.
     assert_eq!(predictor.sweep(14), 14);
     assert_eq!((predictor.len(), predictor.blocks()), (12, 13));
     // A write of that block at the bound stands on it, spends its ten
     // steps passing over the path's blocks and gets no room. The block
-    // goes back to the old end, and the next step takes it.
+    // waits again, and the next step takes it.
     predictor.set_bound(12);
     predictor.sent(SEED, &[500], worker(2));
     assert_eq!(

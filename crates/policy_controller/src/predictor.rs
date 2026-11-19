@@ -54,9 +54,10 @@ use rustc_hash::FxHashMap;
 
 use crate::view::WorkerId;
 
-/// No block: the end of the list, and the block before a request's first.
+/// No block: the end of a list, and the block before a request's first.
 const NONE: u32 = u32::MAX;
-/// In a block's links: the block is not on the list of ends.
+/// In a block's links: the block is on neither list, the ends or the
+/// blocks that wait.
 const UNLISTED: u32 = u32::MAX - 1;
 /// In a block's count of followers: the entry is free.
 const FREE: u32 = u32::MAX;
@@ -91,10 +92,12 @@ struct Block {
     before: u32,
     /// How many blocks have it before them; `FREE` in a free entry.
     after: u32,
-    /// The next older block of its list, the ends or the blocks that
-    /// wait; `UNLISTED` off both.
+    /// The next older block of the list of ends. Among the blocks that
+    /// wait the links are places, not ages: this is the block linked
+    /// after it. `UNLISTED` off both lists.
     older: u32,
-    /// The next newer one; `UNLISTED` off both.
+    /// The next newer block of the list of ends, or the block linked
+    /// before it among those that wait; `UNLISTED` off both lists.
     newer: u32,
     /// The group of the workers sent the block; `NONE` where one worker
     /// was, or none is left.
@@ -162,7 +165,7 @@ pub struct Predictor {
     /// The first of the blocks that wait: none follows such a block and
     /// no worker is left of it. They stand in a list of their own, and
     /// the next step takes one out.
-    waits: u32,
+    waiting: u32,
     /// The worker of each place.
     workers: Vec<WorkerId>,
     /// The place of each worker of the pool.
@@ -244,7 +247,7 @@ impl Predictor {
             free_groups: Vec::new(),
             oldest: NONE,
             newest: NONE,
-            waits: NONE,
+            waiting: NONE,
             workers: Vec::new(),
             places: FxHashMap::default(),
             live: Vec::new(),
@@ -416,7 +419,7 @@ impl Predictor {
     pub fn sweep(&mut self, budget: usize) -> usize {
         let mut steps = 0;
         while steps < budget {
-            if (self.waits != NONE || self.placements > self.bound) && self.forget_one(NONE) {
+            if (self.waiting != NONE || self.placements > self.bound) && self.forget_one(NONE) {
                 steps += 1;
                 continue;
             }
@@ -656,7 +659,7 @@ impl Predictor {
 
     /// Puts a block that waits first on its list.
     fn link_waiting(&mut self, at: u32) {
-        let first = mem::replace(&mut self.waits, at);
+        let first = mem::replace(&mut self.waiting, at);
         let block = self.block_mut(at);
         block.older = NONE;
         block.newer = first;
@@ -671,7 +674,7 @@ impl Predictor {
         let older = mem::replace(&mut block.older, UNLISTED);
         let newer = mem::replace(&mut block.newer, UNLISTED);
         if older == NONE {
-            self.waits = newer;
+            self.waiting = newer;
         } else {
             self.block_mut(older).newer = newer;
         }
@@ -696,10 +699,10 @@ impl Predictor {
     /// block that others follow leaves the list, one that none follows
     /// leaves the predictor. Whether a step was taken.
     fn forget_one(&mut self, keep: u32) -> bool {
-        let at = if self.waits == NONE {
+        let at = if self.waiting == NONE {
             self.oldest
         } else {
-            debug_assert_ne!(self.waits, keep, "a write's block is an end while it runs");
+            debug_assert_ne!(self.waiting, keep, "a write's block is an end as it runs");
             self.take_waiting()
         };
         if at == NONE || at == keep {
@@ -719,7 +722,7 @@ impl Predictor {
     #[cold]
     #[inline(never)]
     fn take_waiting(&mut self) -> u32 {
-        let at = self.waits;
+        let at = self.waiting;
         self.unlink_waiting(at);
         at
     }
@@ -810,7 +813,7 @@ impl Predictor {
     /// The pass's next entry: the workers that left are taken out of its
     /// holders, and a block left with no worker and no follower goes.
     fn clear_next(&mut self) {
-        debug_assert_eq!(self.waits, NONE, "the sweep takes what waits first");
+        debug_assert_eq!(self.waiting, NONE, "the sweep takes what waits first");
         let at = self.cursor;
         self.cursor += 1;
         self.to_visit -= 1;
