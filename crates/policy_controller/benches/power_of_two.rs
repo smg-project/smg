@@ -3,7 +3,8 @@
 //! fewer in flight of two drawn workers, the fewest in flight over every
 //! worker, and the least resident work over every worker, that last one
 //! also with a dispatch credit held per row, as between two reports under
-//! load. Ids: `policy_engine/power_of_two/<form>/<n>`. The fleet is the one
+//! load, and the expected wait once more over reports that state no drain
+//! rate. Ids: `policy_engine/power_of_two/<form>/<n>`. The fleet is the one
 //! the `decision` bench decides over, with the resident tokens a report of
 //! that fleet would carry; the decision runs with a fresh seed per iteration
 //! so the drawing forms draw.
@@ -124,6 +125,19 @@ fn forms(c: &mut Criterion) {
             engine.on_dispatched(&lease, &target, Side::Single, 0);
         }
         decide_over(&mut group, "resident_tokens_credited", &engine, &view);
+    }
+    // The expected-wait form over reports that state no drain rate: no
+    // drawn row's own rate prices it, so every decision reads the mean
+    // rate of the kept rows.
+    let engine = engine_of("power_of_two");
+    for &n in &SIZES {
+        let mut view = view_of(n);
+        for c in &mut view {
+            if let Some(row) = &mut c.load {
+                row.live_rate = 0;
+            }
+        }
+        decide_over(&mut group, "expected_wait_unrated", &engine, &view);
     }
     group.finish();
 }
