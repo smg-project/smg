@@ -32,6 +32,14 @@ use crate::{
     routers::RouterTrait,
 };
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the regular routers place through the host in the next change"
+    )
+)]
+pub(crate) mod host;
 mod undecided;
 
 use undecided::Undecided;
