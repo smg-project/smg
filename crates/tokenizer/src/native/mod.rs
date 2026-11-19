@@ -297,6 +297,10 @@ const PARALLEL_CHUNK_BYTES: usize = 32 << 10;
 /// load that runs on a worker of a rayon pool already (the Python binding
 /// loads on its own, sized by its host) reads on that pool instead.
 const SEED_THREADS: usize = 4;
+/// Ids the vocabulary seed's pass reads at a time: one list of this many
+/// slots, a megabyte and a half, is all the pass holds of its reads beside
+/// what the tables are built from (see `vocabulary_seed`).
+const SEED_WINDOW: usize = 1 << 14;
 /// Text on each side of a candidate cut that every stage's pattern is run
 /// over to confirm a piece starts there (widened to the spaces around it:
 /// the window starts where the text's match loop begins a piece and ends
@@ -1945,16 +1949,54 @@ impl NativeEncoder {
             })();
             Some(seeded)
         };
-        let ids = 0..bpe.get_vocab_size() as u32;
-        // One slot per id, written in place (the read keeps its index, so the
-        // collect is one list and no concatenation); one scratch per rayon job
-        // (2048 entries or more).
-        let read_all = || {
-            ids.clone()
+        let vocab_size = bpe.get_vocab_size();
+        // The pass reads a window of ids at a time into one list of slots
+        // the calling thread owns and reuses, and keeps of each window what
+        // the tables are built from, packed: the key and the ids of a short
+        // piece, the bytes of a long one. One list of a slot per entry
+        // (ninety-six bytes each, 25 MB for a vocabulary of 262k entries),
+        // collected by a thread of the pool, stayed behind after the load
+        // as free memory in that thread's heap: the system allocator gives
+        // back no free top below the threshold that a freed block as large
+        // as the vocabulary file has raised.
+        let mut slots: Vec<Option<Option<Seeded>>> =
+            Vec::with_capacity(SEED_WINDOW.min(vocab_size));
+        let mut entries = 0usize;
+        let mut keys: Vec<ShortPieceKey> = Vec::with_capacity(vocab_size);
+        let mut counts: Vec<u8> = Vec::with_capacity(vocab_size);
+        let mut short_ids: Vec<u32> = Vec::with_capacity(vocab_size);
+        let mut long_entries: Vec<Box<[u8]>> = Vec::new();
+        // An id that was an entry has a slot that is `Some`; the seeded
+        // pieces are the inner `Some`s.
+        let mut keep = |slots: &mut Vec<Option<Option<Seeded>>>| {
+            for read in slots.drain(..) {
+                let Some(seeded) = read else { continue };
+                entries += 1;
+                match seeded {
+                    Some(Seeded::Short(key, ids)) => {
+                        keys.push(key);
+                        counts.push(ids.count);
+                        short_ids.extend_from_slice(ids.as_slice());
+                    }
+                    Some(Seeded::Long(bytes)) => long_entries.push(bytes),
+                    None => {}
+                }
+            }
+        };
+        let windows = || {
+            (0..vocab_size)
+                .step_by(SEED_WINDOW)
+                .map(|start| start as u32..(start + SEED_WINDOW).min(vocab_size) as u32)
+        };
+        // One slot per id of the window, written in place (the read keeps
+        // its index, so the collect is one list and no concatenation); one
+        // scratch per rayon job (2048 entries or more).
+        let read_window = |window: Range<u32>, slots: &mut Vec<Option<Option<Seeded>>>| {
+            window
                 .into_par_iter()
                 .with_min_len(2048)
                 .map_init(SeedScratch::default, |scratch, id| read(id, scratch))
-                .collect::<Vec<Option<Option<Seeded>>>>()
+                .collect_into_vec(slots);
         };
         // A caller that is a worker of a rayon pool already (the Python
         // binding loads on its own, sized by its host) reads on that pool,
@@ -1963,44 +2005,55 @@ impl NativeEncoder {
         // entries are returned, so the load leaves no pool behind; a process
         // that cannot spawn them reads on the calling thread and says so.
         // (The name fits the fifteen bytes a thread's name keeps.)
-        let (entries, threads) = if rayon::current_thread_index().is_some() {
-            (read_all(), rayon::current_num_threads())
+        let threads = if rayon::current_thread_index().is_some() {
+            for window in windows() {
+                read_window(window, &mut slots);
+                keep(&mut slots);
+            }
+            rayon::current_num_threads()
         } else {
             let pooled = rayon::ThreadPoolBuilder::new()
                 .num_threads(SEED_THREADS)
                 .thread_name(|index| format!("vocab-seed-{index}"))
-                .build_scoped(|thread| thread.run(), |pool| pool.install(read_all));
+                .build_scoped(
+                    |thread| thread.run(),
+                    |pool| {
+                        for window in windows() {
+                            pool.install(|| read_window(window, &mut slots));
+                            keep(&mut slots);
+                        }
+                    },
+                );
             match pooled {
-                Ok(entries) => (entries, SEED_THREADS),
+                Ok(()) => SEED_THREADS,
                 Err(error) => {
                     tracing::warn!(
                         %error,
                         "could not build the vocabulary seed's pool; reading on the calling thread"
                     );
                     let mut scratch = SeedScratch::default();
-                    (ids.map(|id| read(id, &mut scratch)).collect::<Vec<_>>(), 1)
+                    for window in windows() {
+                        slots.extend(window.map(|id| read(id, &mut scratch)));
+                        keep(&mut slots);
+                    }
+                    1
                 }
             }
         };
-        // An id that was an entry has a slot that is `Some`; the seeded pieces
-        // are the inner `Some`s.
-        let covers = entries.iter().filter(|read| read.is_some()).count() == bpe.get_vocab_size();
-        let short = entries
-            .iter()
-            .flatten()
-            .flatten()
-            .filter(|seeded| matches!(seeded, Seeded::Short(..)))
-            .count();
-        let long = entries.iter().flatten().flatten().count() - short;
+        let covers = entries == vocab_size;
+        let (short, long) = (keys.len(), long_entries.len());
         let mut table = ShortPieceTable::for_entries(short);
         let mut filter = LongEntryFilter::for_entries(long);
-        for seeded in entries.iter().flatten().flatten() {
-            match seeded {
-                Seeded::Short(key, ids) => {
-                    table.insert(*key, ids.as_slice(), short);
-                }
-                Seeded::Long(bytes) => filter.insert(bytes),
-            }
+        // The inserts the one list gave, in its order: the short pieces by
+        // id into the table, the long ones by id into the filter.
+        let mut at = 0;
+        for (key, &count) in keys.iter().zip(&counts) {
+            let end = at + usize::from(count);
+            table.insert(*key, &short_ids[at..end], short);
+            at = end;
+        }
+        for bytes in &long_entries {
+            filter.insert(bytes);
         }
         let filter = (covers && chars.is_none()).then_some(filter);
         tracing::debug!(
