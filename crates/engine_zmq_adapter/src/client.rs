@@ -1925,17 +1925,11 @@ fn zmq_status_of(error: &engine_zmq_client::Error) -> tonic::Status {
     // requests in flight when decoding failed saw the protocol mismatch
     // itself, which replaying on another worker of the same build will not
     // cure, while the later submit only finds a closed link.
-    if !is_served_elsewhere(error) {
-        return tonic::Status::internal(error.to_string());
+    if is_served_elsewhere(error) {
+        tonic::Status::unavailable(error.to_string())
+    } else {
+        tonic::Status::internal(error.to_string())
     }
-    let mut status = tonic::Status::unavailable(error.to_string());
-    if is_engine_gone(error) {
-        status.metadata_mut().insert(
-            crate::ENGINE_LOST,
-            tonic::metadata::MetadataValue::from_static("1"),
-        );
-    }
-    status
 }
 
 /// Whether `error` says the engine, or the link to it, is gone or not
@@ -1950,37 +1944,23 @@ fn zmq_status_of(error: &engine_zmq_client::Error) -> tonic::Status {
 /// requests see the dispatcher's terminal error wrapped in `Shared`, so the
 /// check looks through it.
 ///
-/// A request stream closed without a terminal output is also "not served
-/// here", but it is not a gone engine: the dispatcher always delivers a
-/// terminal error before it drops the senders on an engine death, so a bare
-/// close only arises when it retires a request vLLM listed as finished
-/// out of band, or when the client itself is dropped. The engine is healthy
-/// in both cases, so the status stays UNAVAILABLE without the
-/// [`crate::ENGINE_LOST`] mark, which would spend the gateway's replay
-/// budget for engine loss.
+/// A request stream closed without a terminal output is also not served
+/// here, though the engine behind it is healthy: the dispatcher always
+/// delivers a terminal error before it drops the senders on an engine
+/// death, so a bare close only arises when it retires a request vLLM listed
+/// as finished out of band, or when the client itself is dropped.
 fn is_served_elsewhere(error: &engine_zmq_client::Error) -> bool {
     use engine_zmq_client::Error;
     match error {
-        Error::EngineInputBlocked { .. }
+        Error::EngineCoreDead
+        | Error::Io(_)
+        | Error::Transport(_)
+        | Error::ClientClosed { .. }
+        | Error::EngineInputBlocked { .. }
         | Error::EngineInputFull { .. }
         | Error::EngineInputBytesFull { .. }
         | Error::RequestStreamClosed { .. } => true,
         Error::Shared(inner) => is_served_elsewhere(inner),
-        other => is_engine_gone(other),
-    }
-}
-
-/// The part of [`is_served_elsewhere`] that says the engine, or the link to it,
-/// went away under the request (the engine died, or the connector to it is
-/// shutting down), rather than an engine that is alive and only not reading
-/// its input now. Such a status is marked [`crate::ENGINE_LOST`].
-fn is_engine_gone(error: &engine_zmq_client::Error) -> bool {
-    use engine_zmq_client::Error;
-    match error {
-        Error::EngineCoreDead | Error::Io(_) | Error::Transport(_) | Error::ClientClosed { .. } => {
-            true
-        }
-        Error::Shared(inner) => is_engine_gone(inner),
         _ => false,
     }
 }
@@ -2230,7 +2210,6 @@ mod tests {
             request_id: "r".to_string(),
         };
         assert_eq!(zmq_status(stream_closed()).code(), Code::Unavailable);
-        assert!(!crate::engine_lost(&zmq_status(stream_closed())));
         let shared_dead = Error::Shared(Arc::new(Error::EngineCoreDead));
         assert_eq!(zmq_status(shared_dead).code(), Code::Unavailable);
         let shared_closed = Error::Shared(Arc::new(closed()));
@@ -2246,35 +2225,6 @@ mod tests {
         // not cure (see `zmq_status`).
         let shared_decode = Error::Shared(Arc::new(decode()));
         assert_eq!(zmq_status(shared_decode).code(), Code::Internal);
-    }
-
-    /// A gone engine is marked as lost, so the gateway can bound the
-    /// replays of a request that keeps killing engines; an engine that is
-    /// alive and only not reading its input, or that closed one request's
-    /// stream without a terminal output, is not.
-    #[test]
-    fn only_a_gone_engine_is_marked_lost() {
-        use engine_zmq_client::Error;
-
-        let lost = |error: Error| crate::engine_lost(&zmq_status(error));
-        assert!(lost(Error::EngineCoreDead));
-        assert!(lost(Error::Shared(Arc::new(Error::EngineCoreDead))));
-        assert!(lost(Error::Io(std::io::Error::from(
-            std::io::ErrorKind::BrokenPipe
-        ))));
-        assert!(!lost(Error::EngineInputBlocked {
-            timeout: Duration::from_secs(1),
-        }));
-        assert!(!lost(Error::RequestStreamClosed {
-            request_id: "r".to_string(),
-        }));
-        assert!(!lost(Error::Shared(Arc::new(Error::RequestStreamClosed {
-            request_id: "r".to_string(),
-        }))));
-        assert!(!lost(Error::Decode {
-            target_type: "EngineCoreOutputs",
-            message: "bad frame".to_string(),
-        }));
     }
 
     /// A connected client over a throwaway ipc endpoint. The mock engine is

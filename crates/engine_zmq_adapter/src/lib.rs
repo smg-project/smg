@@ -78,19 +78,3 @@ pub use tokenspeed::{
 };
 pub use trtllm::{to_trtllm_response, TrtllmGenerateStream};
 pub use vllm::{structured_outputs_backend_from_config, ProcessedMedia, VllmGenerateStream};
-
-/// The metadata key a status carries when the engine, or the servicer's
-/// link to it, went away under the request (the engine core died, its socket
-/// broke, the client was closed under the call), as opposed to an engine
-/// that is alive and only not taking input now. Both answer UNAVAILABLE; a
-/// request whose attempts keep ending with this mark may be what kills the
-/// engines, so a caller can bound how often it replays such a request.
-/// Metadata leaves the status and its message as they are and reaches a gRPC
-/// client as a trailer.
-pub const ENGINE_LOST: &str = "x-smg-engine-lost";
-
-/// Whether `status` says the engine, or the link to it, went away under the
-/// request (see [`ENGINE_LOST`]).
-pub fn engine_lost(status: &tonic::Status) -> bool {
-    status.metadata().contains_key(ENGINE_LOST)
-}
