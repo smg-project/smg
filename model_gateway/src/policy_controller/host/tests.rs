@@ -1,5 +1,5 @@
-//! Cases of the host over rows written by hand through the store's own
-//! door, beside workers registered by hand.
+//! Cases of the host over the module's test support: rows written by hand
+//! through the store's own door, beside workers registered by hand.
 
 use std::{
     collections::BTreeSet,
@@ -8,69 +8,24 @@ use std::{
     time::{Duration, Instant},
 };
 
-use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
+use axum::{
+    body::to_bytes,
+    http::{header::RETRY_AFTER, StatusCode},
+};
+use openai_protocol::worker::WorkerStatus;
+use serde_json::Value;
 use smg_policy_controller::{
     decision::ShedReason,
+    door::Refused,
     lease::{ReleaseReason, TransportClass},
-    store::{LeasesStore, MemoryStore, WorkerFacts, WorkerStatus as RowStatus, WorkersStore},
-    view::Role,
+    store::{LeasesStore, MemoryStore, WorkersStore},
 };
-use smg_worker::identity::basic::{Worker, WorkerLoadGuard};
+use smg_worker::identity::basic::WorkerLoadGuard;
 
-use super::{Ask, End, Held, Host, Unplaced, GATEWAY};
-use crate::{
-    config::RouterConfig,
-    policy_controller::start,
-    routers::{common::snapshot::WorkerRegistry, grpc::backend_client::BasicWorkerBuilder},
+use super::{
+    testing::{bed, MODEL},
+    Ask, End, Held, Unplaced, GATEWAY,
 };
-
-const MODEL: &str = "model-a";
-
-/// The store a start makes under the controller with one ready row a URL,
-/// a registry with one worker a URL, and the host over the two.
-fn bed(urls: &[&str]) -> (Host, Arc<MemoryStore>, Vec<Arc<dyn Worker>>) {
-    let config = RouterConfig {
-        policy_controller: true,
-        ..RouterConfig::default()
-    };
-    let store = start(&config)
-        .expect("the start takes the default routing")
-        .expect("the controller was picked");
-    let registry = Arc::new(WorkerRegistry::new());
-    let mut workers = Vec::new();
-    for url in urls {
-        let facts = WorkerFacts {
-            key: (*url).to_string(),
-            engine: (*url).to_string(),
-            incarnation: 1,
-            role: Role::Single,
-            models: vec![MODEL.to_string()],
-            dp_size: 1,
-            max_running: Some(64),
-            ..WorkerFacts::default()
-        };
-        let id = store.upsert(facts).id();
-        store.publish_now();
-        let row = WorkersStore::get(&*store, id).expect("the row");
-        if row.status != RowStatus::Ready {
-            store
-                .set_status(id, RowStatus::Ready, row.revision)
-                .expect("the row stands");
-        }
-        let worker: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new(*url)
-                .model(ModelCard::new(MODEL))
-                .status(WorkerStatus::Ready)
-                .build(),
-        );
-        registry
-            .register(Arc::clone(&worker))
-            .expect("the worker registers");
-        workers.push(worker);
-    }
-    store.publish_now();
-    (Host::new(Arc::clone(&store), registry), store, workers)
-}
 
 /// A first attempt's ask of the request `id`.
 fn first(id: &[u8]) -> Ask<'_> {
@@ -217,4 +172,86 @@ async fn a_held_request_dropped_after_its_send_ends_its_lease_and_its_load() {
     // and the worker's load is given back.
     drop(held);
     assert_eq!((live(&store, 0), workers[0].load()), (0, 0));
+}
+
+#[tokio::test]
+async fn each_reason_an_attempt_has_no_worker_reads_its_own_answer() {
+    let shed = |reason| Unplaced::Shed {
+        reason,
+        emptied_by: "not-overloaded",
+        retry_after_secs: 7,
+    };
+    let unavailable = StatusCode::SERVICE_UNAVAILABLE;
+    let shed_code = "worker_overload_protection_shed";
+    let rows = [
+        (
+            shed(ShedReason::Saturated),
+            unavailable,
+            shed_code,
+            Some("7"),
+        ),
+        (Unplaced::Queued, unavailable, shed_code, Some("1")),
+        (
+            shed(ShedReason::NoEndpoints),
+            unavailable,
+            "no_available_workers",
+            Some("1"),
+        ),
+        (
+            Unplaced::NoTargetHolds,
+            unavailable,
+            "no_available_workers",
+            Some("1"),
+        ),
+        (
+            shed(ShedReason::FlowLimit),
+            StatusCode::TOO_MANY_REQUESTS,
+            "admission_queue_full",
+            Some("2"),
+        ),
+        (
+            shed(ShedReason::Deadline),
+            unavailable,
+            "admission_queue_timeout",
+            None,
+        ),
+        (
+            shed(ShedReason::PolicyDeclined),
+            unavailable,
+            "policy_declined",
+            None,
+        ),
+        (
+            Unplaced::Refused(Refused::Faulted),
+            unavailable,
+            "policy_controller_unavailable",
+            Some("1"),
+        ),
+    ];
+    for (unplaced, status, code, retry_after) in rows {
+        let answer = unplaced.answer(MODEL);
+        let hint = answer
+            .headers()
+            .get(RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        assert_eq!(answer.status(), status, "{unplaced:?}");
+        assert_eq!(hint.as_deref(), retry_after, "{unplaced:?}");
+        let body = to_bytes(answer.into_body(), usize::MAX)
+            .await
+            .expect("the answer's body");
+        let error: Value = serde_json::from_slice(&body).expect("a JSON error object");
+        assert_eq!(error["error"]["code"], code, "{unplaced:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_placement_names_the_rank_its_decision_named() {
+    let (host, store, _workers) = bed(&["http://w0:8000"]);
+    let placed = host
+        .place(&first(b"r1"), Instant::now())
+        .await
+        .expect("a worker");
+    let row = WorkersStore::get(&*store, placed.id()).expect("the target's row");
+    assert_eq!(placed.rank(), row.facts.dp_rank);
 }
