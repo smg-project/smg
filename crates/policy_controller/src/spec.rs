@@ -1,9 +1,9 @@
 //! `PolicySpec` (design 4.6): the one versioned document. The view says what
 //! the host builds into every decision, the index map what the prefix index
 //! keeps per model, profiles name stages with their parameters, plans carry
-//! their rules, and bindings match requests to profiles or plans and carry
-//! the per-binding rules. Validation answers what the host must feed before
-//! any request exists.
+//! their rules, bindings match requests to profiles or plans, and explain
+//! sets the decision sampling rate. Validation answers what the host must
+//! feed before any request exists.
 //!
 //! The document has an `apiVersion` and no `kind`: its forms are a file and
 //! the API. An unknown field is refused by name, never ignored. A field this
@@ -1546,6 +1546,16 @@ pub struct BindingSpec {
     pub admission: Option<AdmissionSpec>,
 }
 
+/// Which decisions a decider keeps for explain.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ExplainSpec {
+    /// Keep every Nth pick or shed per decider under this generation. Zero
+    /// turns sampling off and one keeps every pick and shed.
+    #[serde(default)]
+    pub sample: u32,
+}
+
 /// The policy specification, version `smg.policy/v1`: what the host builds
 /// into the view, the per-model index settings, the profiles with their
 /// stages, the plans' rules and the ordered bindings. An unknown field at
@@ -1590,6 +1600,9 @@ pub struct PolicySpec {
     /// profile to everything.
     #[serde(default)]
     pub bindings: Vec<BindingSpec>,
+    /// The sampling rate for explain.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub explain: ExplainSpec,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -3206,6 +3219,7 @@ impl PolicySpec {
                 sessions,
                 ..BindingSpec::default()
             }],
+            explain: ExplainSpec::default(),
         })
     }
 
@@ -3403,6 +3417,7 @@ impl PolicySpec {
         }
         needs.headers |= !self.view.headers.is_empty();
         let mut engine = Engine::new(profiles, bindings, self.generation, needs);
+        engine.set_explain_sample(self.explain.sample);
         for at in sheds {
             engine.shed_when_all_vetoed(at);
         }
@@ -3425,6 +3440,7 @@ impl PolicySpec {
             profiles,
             plans: PlansSpec::default(),
             bindings: Vec::new(),
+            explain: ExplainSpec::default(),
         }
     }
 
@@ -3478,6 +3494,7 @@ impl PolicySpec {
             profiles,
             plans,
             bindings,
+            explain,
         } = self;
         Lineless {
             api_version,
@@ -3487,6 +3504,7 @@ impl PolicySpec {
             profiles,
             plans,
             bindings,
+            explain,
         }
     }
 }
@@ -3508,6 +3526,8 @@ struct Lineless<'a> {
     #[serde(skip_serializing_if = "is_default::<PlansSpec>")]
     plans: &'a PlansSpec,
     bindings: &'a [BindingSpec],
+    #[serde(skip_serializing_if = "is_default::<ExplainSpec>")]
+    explain: &'a ExplainSpec,
 }
 
 /// A document's digest: SHA-256 over its canonical bytes, which are the
@@ -4112,6 +4132,40 @@ mod tests {
             Err(SpecError::BadField { path, .. }) => path,
             other => panic!("validated as {other:?}"),
         }
+    }
+
+    #[test]
+    fn explain_sample_is_an_unsigned_count_that_defaults_to_off() {
+        let base = PolicySpec::preset("random").expect("a preset");
+        let serde_json::Value::Object(mut json) = serde_json::to_value(&base).expect("a document")
+        else {
+            panic!("a document is an object");
+        };
+        assert!(!json.contains_key("explain"));
+        for sample in [0, 1, 3, u32::MAX] {
+            json.insert("explain".into(), serde_json::json!({ "sample": sample }));
+            let read = serde_json::from_value::<PolicySpec>(json.clone().into())
+                .expect("an unsigned count");
+            assert_eq!(read.explain.sample, sample);
+            assert_eq!(
+                read.validate().expect("a valid document").explain_sample(),
+                sample
+            );
+            assert_eq!(read.digest().ok() == base.digest().ok(), sample == 0);
+        }
+        for invalid in [
+            serde_json::json!({ "sample": -1 }),
+            serde_json::json!({ "sample": 1.5 }),
+            serde_json::json!({ "sample": "1" }),
+            serde_json::json!({ "sample": u64::from(u32::MAX) + 1 }),
+            serde_json::json!({ "slots": 1_024 }),
+        ] {
+            json.insert("explain".into(), invalid);
+            assert!(serde_json::from_value::<PolicySpec>(json.clone().into()).is_err());
+        }
+        json.insert("explain".into(), serde_json::json!({}));
+        let empty = serde_json::from_value::<PolicySpec>(json.into()).expect("an empty section");
+        assert_eq!(empty, base);
     }
 
     #[test]
@@ -6609,6 +6663,13 @@ mod tests {
                 },
             ),
             (
+                "explain",
+                PolicySpec {
+                    explain: ExplainSpec { sample: 2 },
+                    ..base.clone()
+                },
+            ),
+            (
                 "generation",
                 PolicySpec {
                     generation: base.generation + 9,
@@ -6670,6 +6731,7 @@ mod tests {
     fn a_digest_hashes_what_the_document_itself_writes_under_a_zeroed_line() {
         let base = PolicySpec::preset("least_load").expect("a preset");
         let every_field = PolicySpec {
+            explain: ExplainSpec { sample: 2 },
             view: ViewSpec {
                 headers: vec!["x-team".to_owned()],
                 ..base.view.clone()
