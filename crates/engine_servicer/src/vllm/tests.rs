@@ -1996,6 +1996,9 @@ async fn structured_output_backend_follows_the_launcher_config() {
     ));
     let status = h.client.generate(request).await.expect_err("refused");
     assert_eq!(status.code(), Code::InvalidArgument);
+    // The refusal crosses the wire under its trailer, which a router answers
+    // as the request's 400 rather than a failure of the worker.
+    assert!(smg_grpc_client::is_constraint_refusal(&status));
     assert!(
         status.message().contains("`multipleOf` at its root"),
         "{}",
@@ -2017,6 +2020,7 @@ async fn structured_output_backend_follows_the_launcher_config() {
     ));
     let status = h.client.generate(request).await.expect_err("refused");
     assert_eq!(status.code(), Code::InvalidArgument);
+    assert!(smg_grpc_client::is_constraint_refusal(&status));
     assert!(
         status.message().contains(
             "`uniqueItems` at `/format/tags/0/content/json_schema/properties/tags` (inside the \

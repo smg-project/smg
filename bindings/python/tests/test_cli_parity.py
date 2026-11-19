@@ -34,6 +34,7 @@ def cli_source() -> str:
 # Flags of the Rust CLI the launcher does not take, with the reason.
 CLI_ONLY = {
     "--disable-audit-logging": "the launcher's switch is --control-plane-audit-enabled",
+    "--print-policy-spec": "the binary prints its policy document and exits; the launcher does not",
 }
 
 # Options of the launcher with no Rust CLI flag of that spelling, with the reason.

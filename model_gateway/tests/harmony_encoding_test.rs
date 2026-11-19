@@ -7,12 +7,17 @@
 
 use std::sync::Arc;
 
+use openai_protocol::model_card::ModelCard;
 use smg::{
-    worker::{BasicWorkerBuilder, ConnectionMode, ModelCard, Worker, WorkerType},
+    routers::grpc::backend_client::BasicWorkerBuilder,
     workflow::{
-        data::{WorkerKind, WorkerRegistrationMode, WorkerWorkflowData},
+        data::{WorkerRegistrationMode, WorkerWorkflowData},
         steps::local::EnsureHarmonyEncodingStep,
     },
+};
+use smg_worker::{
+    identity::basic::{ConnectionMode, Worker, WorkerType},
+    workflow::WorkerKind,
 };
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowInstanceId};
 
@@ -47,11 +52,11 @@ fn context(
             detected_runtime_type: None,
             discovered_labels: Default::default(),
             dp_info: None,
-            symphony_table: None,
+            host_notes: Default::default(),
             model_cards: Vec::new(),
             workers: None,
             final_labels: Default::default(),
-            app_context: None,
+            host: None,
             actual_workers: Some(workers),
         },
     )

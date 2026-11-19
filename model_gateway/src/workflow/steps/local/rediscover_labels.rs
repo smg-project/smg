@@ -11,16 +11,15 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
+use smg_worker::{identity::basic::ConnectionMode, workflow::discover_engine_labels};
 use tracing::debug;
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
-use super::discover_metadata::discover_engine_labels;
 use crate::{
     routers::grpc::{
-        backend_client::{backend_client_if_initialized, BackendClient},
+        backend_client::{backend_client_if_initialized, BackendClient, BackendConnector},
         zmq_client,
     },
-    worker::ConnectionMode,
     workflow::data::WorkerUpdateWorkflowData,
 };
 
@@ -91,6 +90,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for RediscoverLabelsStep {
         // HTTP/2 setting); the gRPC read ignores it.
         let (fresh, _) = discover_engine_labels(
             worker.http_client(),
+            BackendConnector::shared().as_ref(),
             worker.base_url(),
             connection_mode,
             spec.runtime_type.as_str(),
@@ -126,12 +126,13 @@ mod tests {
     use std::sync::Arc;
 
     use openai_protocol::worker::{WorkerStatus, WorkerUpdateRequest};
+    use smg_worker::identity::basic::Worker;
     use wfaas::WorkflowInstanceId;
 
     use super::*;
     use crate::{
-        service_discovery::testing::create_test_app_context,
-        worker::{BasicWorkerBuilder, Worker},
+        app_context::testing::create_test_app_context,
+        routers::grpc::backend_client::BasicWorkerBuilder,
     };
 
     fn context(

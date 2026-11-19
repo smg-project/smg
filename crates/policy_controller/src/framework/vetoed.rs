@@ -7,6 +7,12 @@
 //! hard filter leaves nobody, by the word the pass's set carries, so a pass
 //! that keeps a worker holds nothing for the rule and runs none of it.
 //!
+//! The liveness veto is the second soft veto, and it is lifted last. A pool
+//! whose every usable worker is doubted, or over its thresholds too, goes
+//! to the fewest requests in flight as well, the workers over their
+//! thresholds alone first. A doubt is not an outage. The pick's trace says
+//! which veto it lifted ([`Lifted`]).
+//!
 //! A profile that places a request by its session key reads the same word
 //! ahead of its pass ([`keeps_its_key`]): where the binding steers, a keyed
 //! request is decided with the veto lifted ([`Engine::keep`]), so the key
@@ -20,14 +26,15 @@
 //! one mark.
 
 use super::{
-    engines::run_owned, filter, run_single, single_emptied, trace_of, Assignment, Binding, Buffers,
-    Engine, Filter, Picker, Plan, Profile, Scorer, Scratch, SessionRule, Set,
+    engines::run_owned, filter, keep_folded, leads, run_single, single_emptied, trace_of,
+    Assignment, Binding, Buffers, Engine, Filter, Picker, Plan, Profile, Scorer, Scratch,
+    SessionRule, Set,
 };
 use crate::{
-    builtins::{Best, LeastRequests, NotOverloaded},
+    builtins::{Best, Healthy, LeastRequests, NotOverloaded},
     decision::{Decision, Lifted, Pick, Targets, Trace},
     sessions::SessionVerdict,
-    view::{Candidate, Constraints, PoolFacts, RequestFacts},
+    view::{Candidate, Constraints, Health, PoolFacts, RequestFacts},
 };
 
 /// What a binding does with a pool whose every usable worker the overload
@@ -39,8 +46,14 @@ pub(super) enum AllVetoed {
     /// would turn a load signal into an outage.
     #[default]
     Steer,
-    /// The request is shed as saturated.
+    /// The request is shed as saturated. The word is the overload veto's
+    /// alone: a doubted worker under its thresholds still takes a request
+    /// no other worker can.
     Shed,
+    /// No rule is asked: a pool a veto empties is shed at the stage that
+    /// emptied it. A set's word, never a binding's: a side of a pair and
+    /// the rule's own passes carry it ([`Set::shedding`]).
+    Unasked,
 }
 
 impl Engine {
@@ -88,9 +101,10 @@ impl Engine {
     /// does not draw first. It is the scorer's walk over a pool whose host
     /// lists its engines ([`run_owned`]), the veto lifted in it, and the
     /// profile's whole pass over any other and where the walk gives no
-    /// answer: the rows handed are the pass's either way. The set it is
-    /// handed sheds ([`Set::shedding`]): no pass of a kept key is put to
-    /// the all-vetoed rule, which the lifted run stands in for.
+    /// answer: the rows handed are the pass's either way. The lifted run
+    /// stands in for the all-vetoed rule's overload tier: a pass that reads
+    /// the veto as it stands is put to no rule ([`Set::shedding`]), and a
+    /// pool the lifted run leaves nobody is put to the liveness tier alone.
     ///
     /// A pick the lift alone made possible says so: where the veto as it
     /// stands leaves the pool nobody ([`all_vetoed`]), the trace carries the
@@ -133,6 +147,9 @@ impl Engine {
             ..*cx
         };
         let buf = &mut scratch.single;
+        // The rule's own mark of this decision, read back below: none until
+        // one of its tiers picks.
+        buf.lifted = Lifted::None;
         // Over a pool whose host lists its engines the ring places the key
         // by its walk, the veto lifted in it as in the pass: the rows it
         // hands are the whole pass's, and `buf` holds the rows it kept.
@@ -146,7 +163,11 @@ impl Engine {
             None => run_single(profile, index, facts, pool, set, &lifted, buf),
         };
         if let Decision::Pick(pick) = &mut decision {
-            if all_vetoed(profile, facts, set, cx, buf) {
+            // A pick of the rule's own carries its mark already. The rule
+            // left that mark in `buf`, and it is read there: read through
+            // the pick, it had the decision built aside and copied whole
+            // to the caller's place.
+            if buf.lifted == Lifted::None && all_vetoed(profile, facts, set, cx, buf) {
                 pick.trace.lifted = Lifted::Overload;
             }
         }
@@ -188,8 +209,9 @@ pub(super) fn keeps_its_key(
 
 /// The profile's filters again with the overload veto lifted, for a keyed
 /// request no pin of its sessions rule took under the veto as it stands.
-/// Answers the shed of a pool the lifted pass leaves nobody; `buf` holds
-/// the lifted pass's survivors otherwise, and the placement runs over them.
+/// Answers for a pool the lifted pass leaves nobody, with the liveness
+/// tier's pick or the shed; `buf` holds the lifted pass's survivors
+/// otherwise, and the placement runs over them.
 pub(super) fn lifted(
     profile: &Profile,
     index: u16,
@@ -232,15 +254,14 @@ fn all_vetoed(
 ) -> bool {
     let candidates = set.candidates;
     let stands = |&row: &u32| NotOverloaded.keep(facts, &candidates[row as usize], cx);
-    !buf.kept.iter().any(stands) && filter(profile, facts, cx, buf, set).is_some()
+    !buf.kept.iter().any(stands) && filter(profile, facts, cx, buf, set.shedding()).is_some()
 }
 
-/// Whether the overload veto stood in the pass the stage `emptied_by`
-/// ended: the overload filter is one of the profile's hard filters, at or
-/// before that stage. A pool emptied before the veto ran is no nearer a
+/// Whether the veto of the stage `veto` stood in the pass the stage
+/// `emptied_by` ended: that filter is one of the profile's hard filters, at
+/// or before that stage. A pool emptied before a veto ran is no nearer a
 /// worker with the veto lifted.
-fn veto_ran(profile: &Profile, emptied_by: &str) -> bool {
-    let veto = NotOverloaded.name();
+fn veto_ran(profile: &Profile, veto: &str, emptied_by: &str) -> bool {
     let mut seen = false;
     for hard in profile.filters.iter().filter(|f| !f.soft()) {
         seen |= hard.name() == veto;
@@ -254,24 +275,46 @@ fn veto_ran(profile: &Profile, emptied_by: &str) -> bool {
 /// The rule, asked by the filter half where a hard filter leaves a pass
 /// nobody: the stage whose shed stands, with `buf.kept` empty, or the stage
 /// `emptied_by` with the rows the rule kept in `buf.kept`, for the plan's
-/// pick among them ([`steered`]).
+/// pick among them ([`steered`]), and the veto lifted for them in
+/// `buf.lifted`.
 ///
-/// Under [`AllVetoed::Steer`], when the overload veto stood in that pass,
-/// the profile's filters run again with the veto lifted. The rows they keep
-/// are the usable ones, every one over its thresholds. So a hard filter
-/// listed behind the overload filter does not hide such a pool, and the
-/// answer does not turn on the order a document lists its filters in. The
-/// retry's tried list is set aside for that pass, as the gateway's fallback
+/// Two vetoes are soft, and they are lifted in one order: the overload
+/// veto, then the liveness veto. A worker over its thresholds is alive and
+/// busy; a doubted one may be gone. Each lift runs the profile's filters
+/// once more, and the rows such a pass keeps are the usable ones. So a hard
+/// filter listed behind a veto does not hide such a pool, and the answer
+/// does not turn on the order a document lists its filters in. The retry's
+/// tried list is set aside for those passes, as the gateway's fallback
 /// sets it aside: a worker an earlier attempt tried is taken again when it
 /// holds the fewest requests. The host's list of workers it just failed to
 /// reach stays: the soft filter passes over such a worker while another
 /// usable one stands, and takes it as the last resort.
 ///
-/// The shed stands for a set that sheds ([`AllVetoed::Shed`]: a binding's
-/// word, each side of a pair, and the rule's own second pass), for a pool
-/// emptied before the veto ran and for a pool with no row over its
-/// thresholds, as under a veto its host lifted: none of them is filtered
-/// a second time. A pool nobody is usable in even with the veto lifted is
+/// The overload veto is lifted under [`AllVetoed::Steer`], where it stood
+/// in the emptied pass and a row reads as over its thresholds. Under a veto
+/// its host lifted none does, and that tier ends there. The liveness veto
+/// is lifted next, under either word of the binding, where the doubt alone
+/// refuses a row ([`doubted_alone`], [`mask_doubts`]) and the health stage
+/// stood in the pass that ended empty. That pass reads the rows with no
+/// doubt ([`undoubted`]) and is otherwise as the pass before it: a steering
+/// binding has the overload veto lifted there too, a binding that sheds
+/// keeps it. So under a binding that sheds a doubted worker under its
+/// thresholds takes the request. A pool that pass leaves nobody is shed at
+/// the stage that ended it, as a pool with no doubt in it is: as saturated
+/// where that stage is the overload veto's. A document that lists the
+/// health stage ahead of that veto, as every preset does, sheds a pool
+/// over on every ready worker so. Nothing harder is lifted: a worker that
+/// is not ready, behind an open breaker or draining stays refused, and a
+/// doubt on such a worker opens no pass. So does a row a hold of the host
+/// stands on, whichever way the host says it: by the breaker bit beside
+/// the stalled one on a row it wrote, or among its held rows beside lent
+/// ones ([`Constraints::held`]). The lifted pass leaves such a row both
+/// bits and keeps the held rows masked, so a stage reads it as vetoed in
+/// every pass.
+///
+/// A set put to no rule is shed where it emptied ([`AllVetoed::Unasked`]):
+/// each side of a pair, and the rule's own passes, so the rule is asked
+/// once a decision. A pool nobody is usable in with its vetoes lifted is
 /// shed at the stage that says why.
 ///
 /// Cold and out of line: a pass whose filters keep a row never comes here.
@@ -285,32 +328,191 @@ pub(super) fn emptied(
     buf: &mut Buffers,
     set: Set<'_>,
 ) -> &'static str {
-    if set.vetoed == AllVetoed::Shed || !veto_ran(profile, emptied_by) {
+    if set.vetoed == AllVetoed::Unasked {
         return emptied_by;
     }
-    // A pool with no row over its thresholds gains nobody when the veto is
-    // lifted: the shed stands, for this one look at the whole set. Under a
-    // veto its host lifted no row reads as over.
-    if !set
-        .candidates
-        .iter()
-        .any(|row| !NotOverloaded.keep(facts, row, cx))
+    let candidates = set.candidates;
+    let steers = set.vetoed == AllVetoed::Steer;
+    // The stage that ended the last pass. Each pass is put to no rule:
+    // where it leaves nobody, its own stage stands.
+    let mut ended = emptied_by;
+    // A pool with no row over its thresholds gains nobody when the overload
+    // veto is lifted: that tier is one look at the whole set.
+    if steers
+        && veto_ran(profile, NotOverloaded.name(), emptied_by)
+        && candidates
+            .iter()
+            .any(|row| !NotOverloaded.keep(facts, row, cx))
     {
-        return emptied_by;
+        let whole = RequestFacts {
+            tried: &[],
+            ..*facts
+        };
+        let pass = Constraints {
+            overload_lifted: true,
+            ..*cx
+        };
+        match overload_pass(profile, &whole, &pass, buf, set.shedding()) {
+            None => {
+                buf.lifted = Lifted::Overload;
+                return emptied_by;
+            }
+            Some(stage) => ended = stage,
+        }
     }
-    let lifted = Constraints {
-        overload_lifted: true,
-        ..*cx
-    };
+    // A doubt is a row's own bit or the host's mask beside the rows, and
+    // the tier opens for a row the doubt alone refuses. A doubt on a row a
+    // harder veto refuses too gains nobody when it is lifted. Nor does a
+    // row a hold of the host stands on: it stays masked.
+    let own = candidates.iter().any(|row| doubted_alone(row.health));
+    // The two lengths answer for the rows only where every held row is a
+    // row of the mask, named once: the store's view keeps that, and a host
+    // that fills the constraints by hand owes it.
+    debug_assert!(
+        cx.held.iter().all(|held| cx.stalled.contains(held)),
+        "a held row is no row of the mask"
+    );
+    let masked = cx.stalled.len() > cx.held.len() && mask_doubts(candidates, cx);
+    if (own || masked) && veto_ran(profile, Healthy.name(), ended) {
+        return doubted(emptied_by, own, profile, facts, cx, buf, set);
+    }
+    ended
+}
+
+/// The pass that lifts the overload veto, over `set` under `cx`, the lift
+/// in it: `None` where a row stands, the rows in `buf.kept`, or the stage
+/// that left nobody.
+///
+/// Where a whole pass handed its fold with the set ([`Set::fold`]) and the
+/// set is the plan's whole pool, the pass is one pass of the test
+/// ([`keep_folded`]) where a front row passes it ([`leads`]), and the
+/// stages run only where it keeps no row. The fold is the one the engine
+/// made at its build: no decision makes one. The pass that lifts the
+/// liveness veto is staged.
+#[inline(always)]
+fn overload_pass(
+    profile: &Profile,
+    whole: &RequestFacts<'_>,
+    cx: &Constraints<'_>,
+    buf: &mut Buffers,
+    set: Set<'_>,
+) -> Option<&'static str> {
+    if set.plain() {
+        if let Some(tests) = set.fold {
+            let tests = tests.asked(whole, cx);
+            if leads(tests, whole, set.candidates, cx) {
+                // The fold's pass asks for every buffer's room, as the
+                // whole pass does: no pass of another kind behind it
+                // grows a list.
+                buf.reserve(set.candidates.len());
+                if keep_folded(tests, whole, set.candidates, cx, &mut buf.kept) {
+                    return None;
+                }
+            }
+        }
+    }
+    filter(profile, whole, cx, buf, set)
+}
+
+/// The pass of [`emptied`] that lifts the liveness veto: the profile's
+/// filters once more, over the rows with no doubt ([`undoubted`]) where a
+/// row's own bit is set (`own`), with the host's mask cut to the rows a
+/// hold stands on. `emptied_by` with the rows the pass kept in `buf.kept`
+/// and the lift said in `buf.lifted`, or the stage that left it nobody.
+///
+/// The overload veto is lifted in this pass under a steering binding,
+/// whether its own tier ran or not: that tier runs under no other.
+///
+/// Out of line: the overload tier's pass, the one a pool over its
+/// thresholds on every worker takes, keeps nothing of this one in hand.
+#[cold]
+#[inline(never)]
+fn doubted(
+    emptied_by: &'static str,
+    own: bool,
+    profile: &Profile,
+    facts: &RequestFacts<'_>,
+    cx: &Constraints<'_>,
+    buf: &mut Buffers,
+    set: Set<'_>,
+) -> &'static str {
     let whole = RequestFacts {
         tried: &[],
         ..*facts
     };
-    // The second pass is put to no rule: its set sheds, so the rule is asked
-    // once a decision. Where that pass leaves nobody either, its own stage
-    // stands. The rows it keeps are the rule's, behind the stage the veto's
-    // pass named.
-    filter(profile, &whole, &lifted, buf, set.shedding()).unwrap_or(emptied_by)
+    let pass = Constraints {
+        overload_lifted: cx.overload_lifted || set.vetoed == AllVetoed::Steer,
+        stalled: cx.held,
+        ..*cx
+    };
+    let stage = if own {
+        let mut rows = std::mem::take(&mut buf.undoubted);
+        undoubted(set.candidates, &mut rows);
+        let lifted = Set {
+            candidates: &rows,
+            ..set.shedding()
+        };
+        let stage = filter(profile, &whole, &pass, buf, lifted);
+        buf.undoubted = rows;
+        stage
+    } else {
+        filter(profile, &whole, &pass, buf, set.shedding())
+    };
+    match stage {
+        None => {
+            buf.lifted = Lifted::Liveness;
+            emptied_by
+        }
+        Some(stage) => stage,
+    }
+}
+
+/// The rows as they read with no doubt, into `rows`: each row of
+/// `candidates` with its stalled bit cleared where its breaker bit is
+/// clear, in the same order, so a stage handed a row reads the lift
+/// whatever it reads of the row. A row that carries both bits is one a hold
+/// of the host stands on, where the host wrote its rows. It keeps both, as
+/// a held row stays in the mask beside lent rows. The pass that lifts the
+/// liveness veto is shown these where a row's own bit is set. Rows the
+/// host's mask alone doubts are read as they are, with the mask cut to the
+/// rows a hold stands on. A stage that answers from its own scope answers
+/// as it did: the scope was opened over the decision's rows. One pool of
+/// rows a scratch, sized at the first pass that needs it.
+fn undoubted(candidates: &[Candidate], rows: &mut Vec<Candidate>) {
+    rows.clear();
+    rows.extend(candidates.iter().map(|row| Candidate {
+        health: Health {
+            stalled: row.health.stalled && row.health.breaker_open,
+            ..row.health
+        },
+        ..*row
+    }));
+}
+
+/// Whether the liveness veto alone refuses a row of these bits: the row
+/// carries the doubt and stands once it is lifted. The health stage's own
+/// test of the row with no doubt on it
+/// ([`Health::routable_ignoring_overload`]), so the two cannot part.
+const fn doubted_alone(health: Health) -> bool {
+    health.stalled
+        && Health {
+            stalled: false,
+            ..health
+        }
+        .routable_ignoring_overload()
+}
+
+/// Whether the host's mask alone refuses a row: a row of the mask no hold
+/// stands on whose own bits refuse nothing. Both lists are in order, so a
+/// held row is found by a search. Asked only of a pool the rule was put
+/// to, and only where the mask is longer than the held list.
+fn mask_doubts(candidates: &[Candidate], cx: &Constraints<'_>) -> bool {
+    cx.stalled.iter().any(|&at| {
+        cx.held.binary_search(&at).is_err()
+            && candidates
+                .get(at as usize)
+                .is_some_and(|row| row.health.routable_ignoring_overload())
+    })
 }
 
 /// The rule's pick among the rows its lifted pass kept (`buf.kept`): the
@@ -318,8 +520,9 @@ pub(super) fn emptied(
 /// by the decision's seed, the next fewest as alternates. The pick is the
 /// engine's rule and no stage of the profile makes it, so a document cannot
 /// put a scorer where a safety default stands. It pins no session key, and
-/// its trace says the veto it lifted ([`Lifted::Overload`]): the mark a host
-/// counts its steered picks from.
+/// its trace says the veto the rule lifted for those rows ([`Lifted`], as
+/// [`emptied`] left it in `buf.lifted`): the mark a host counts its steered
+/// picks from, each tier apart.
 pub(super) fn steered(
     index: u16,
     facts: &RequestFacts<'_>,
@@ -327,7 +530,7 @@ pub(super) fn steered(
     candidates: &[Candidate],
     buf: &mut Buffers,
 ) -> Decision {
-    buf.scores.clear();
+    // Sized and not cleared: the scorer writes every score it is handed.
     buf.scores.resize(buf.kept.len(), 0.0);
     let band = LeastRequests.score(facts, candidates, &buf.kept, &mut buf.scores);
     let mut targets = Targets::new();
@@ -340,7 +543,7 @@ pub(super) fn steered(
         &mut targets,
     );
     let trace = Trace {
-        lifted: Lifted::Overload,
+        lifted: buf.lifted,
         ..trace_of(index, facts, pool, candidates, &buf.kept, &buf.scores)
     };
     Decision::Pick(Pick {
@@ -353,7 +556,7 @@ pub(super) fn steered(
 #[cfg(test)]
 mod tests {
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex, OnceLock, Weak,
     };
 
@@ -370,8 +573,8 @@ mod tests {
         sessions::{SessionRule, SessionVerdict},
         spec::{Assignment, Needs, OverloadSpec, PolicySpec, Recovery},
         view::{
-            Candidate, Constraints, Health, Identity, NamedAffinity, NamedHolder, Phase, PoolFacts,
-            RequestFacts, WorkerId,
+            Candidate, Constraints, Engines, Health, Identity, NamedAffinity, NamedHolder, Phase,
+            PoolFacts, RequestFacts, WorkerId,
         },
     };
 
@@ -456,6 +659,19 @@ mod tests {
         fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
             self.0.fetch_add(1, Ordering::Relaxed);
             false
+        }
+    }
+
+    /// Keeps every row and counts the rows it was asked about.
+    #[derive(Debug)]
+    struct Counts(Arc<AtomicUsize>);
+    impl Filter for Counts {
+        fn name(&self) -> &'static str {
+            "counts"
+        }
+        fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            true
         }
     }
 
@@ -635,8 +851,10 @@ mod tests {
         assert!(firsts[0] > 200 && firsts[1] > 200, "{firsts:?}");
     }
 
-    /// A worker that is down, draining, stalled or behind an open breaker is
-    /// not usable: it is never the steer, however few requests it holds.
+    /// A worker that is down, draining or behind an open breaker is not
+    /// usable: it is never the steer, however few requests it holds. A
+    /// doubted worker is the last to be taken, once no worker over its
+    /// thresholds alone is left.
     #[test]
     fn a_worker_another_veto_refuses_is_never_the_steer() {
         let engine = engine_of("least_load", false);
@@ -646,8 +864,11 @@ mod tests {
         pool[2].health.stalled = true;
         pool[3].health.breaker_open = true;
         assert_eq!(order(&decide(&engine, &facts(1), &pool)), vec![4]);
-        // With no usable row left the stage that refused them names the shed.
+        // With no worker over its thresholds alone the doubted one is taken.
         pool[4].health.healthy = false;
+        assert_eq!(order(&decide(&engine, &facts(1), &pool)), vec![2]);
+        // With no usable row left the stage that refused them names the shed.
+        pool[2].health.healthy = false;
         assert_eq!(
             shed_of(&decide(&engine, &facts(1), &pool)),
             (ShedReason::NoEndpoints, "healthy")
@@ -945,19 +1166,20 @@ mod tests {
         }
     }
 
-    /// Each side of a pair sheds a pool the overload veto empties: the pair
-    /// plan does not enter the rule. Under a binding that steers, a prefill
-    /// side over its thresholds on every worker is shed at the veto, and the
-    /// filter listed behind the veto is asked about no prefill.
-    #[test]
-    fn a_pairs_side_sheds_at_the_veto_and_is_filtered_once() {
+    /// The pair plan's shed over `prefills` and one free decode. The prefill
+    /// side is filtered by `veto` and then by a filter that refuses every
+    /// row, under the host's mask over the prefills and the rows of it the
+    /// host holds (`masks`). With the shed, the count of the prefills that
+    /// filter was asked about.
+    fn pairs_side_shed(
+        veto: Box<dyn Filter>,
+        prefills: [Candidate; 2],
+        masks: (&[u32], &[u32]),
+    ) -> ((ShedReason, &'static str), usize) {
         let asked = Arc::new(AtomicUsize::new(0));
         let prefill_side = Profile {
             name: "counted".into(),
-            filters: vec![
-                Box::new(NotOverloaded),
-                Box::new(Refuses(Arc::clone(&asked))),
-            ],
+            filters: vec![veto, Box::new(Refuses(Arc::clone(&asked)))],
             scorers: vec![],
             picker: Box::new(Best),
         };
@@ -985,7 +1207,7 @@ mod tests {
             worker.pair_class = 1;
             worker
         };
-        let prefills = [paired(over(0, 1)), paired(over(1, 2))];
+        let prefills = prefills.map(paired);
         let mut free = paired(over(0, 0));
         free.health.overloaded = false;
         let decodes = [free];
@@ -997,15 +1219,69 @@ mod tests {
                 decodes: &decodes,
                 ..PairPools::default()
             },
-            &Constraints::default(),
+            &Constraints {
+                stalled: masks.0,
+                held: masks.1,
+                ..Constraints::default()
+            },
             &Constraints::default(),
             &mut Scratch::new(),
         );
-        assert_eq!(
-            shed_of(&decision),
-            (ShedReason::Saturated, "not-overloaded")
+        (shed_of(&decision), asked.load(Ordering::Relaxed))
+    }
+
+    /// Each side of a pair sheds a pool the overload veto empties: the pair
+    /// plan does not enter the rule. Under a binding that steers, a prefill
+    /// side over its thresholds on every worker is shed at the veto, and the
+    /// filter listed behind the veto is asked about no prefill.
+    #[test]
+    fn a_pairs_side_sheds_at_the_veto_and_is_filtered_once() {
+        let none: (&[u32], &[u32]) = (&[], &[]);
+        let side = pairs_side_shed(Box::new(NotOverloaded), [over(0, 1), over(1, 2)], none);
+        assert_eq!(side, ((ShedReason::Saturated, "not-overloaded"), 0));
+    }
+
+    /// An engine of one profile: `veto` and a filter that refuses every row,
+    /// the veto listed first when `veto_first`. With it, the count of the
+    /// rows the refusing filter was asked about.
+    fn counted(veto: Box<dyn Filter>, veto_first: bool) -> (Engine, Arc<AtomicUsize>) {
+        counted_among(|refuses| {
+            if veto_first {
+                vec![veto, refuses]
+            } else {
+                vec![refuses, veto]
+            }
+        })
+    }
+
+    /// An engine of one profile under the filters `listed` gives, among
+    /// them a filter that refuses every row. With it, the count of the rows
+    /// that filter was asked about.
+    fn counted_among(
+        listed: impl FnOnce(Box<dyn Filter>) -> Vec<Box<dyn Filter>>,
+    ) -> (Engine, Arc<AtomicUsize>) {
+        let asked = Arc::new(AtomicUsize::new(0));
+        let filters = listed(Box::new(Refuses(Arc::clone(&asked))));
+        let engine = Engine::new(
+            vec![Profile {
+                name: "counted".into(),
+                filters,
+                scorers: vec![],
+                picker: Box::new(Best),
+            }],
+            vec![Binding {
+                model: "*".into(),
+                phases: vec![],
+                plan: Plan::Single,
+                profile: 0,
+                decode_profile: None,
+                sessions: None,
+                overload: None,
+            }],
+            1,
+            Needs::default(),
         );
-        assert_eq!(asked.load(Ordering::Relaxed), 0);
+        (engine, asked)
     }
 
     /// A shed the veto had no part in is not filtered a second time: a pool
@@ -1015,36 +1291,7 @@ mod tests {
     /// is filtered again, and sheds at the stage behind the veto.
     #[test]
     fn a_shed_the_veto_had_no_part_in_costs_one_pass() {
-        let counted = |veto_first: bool| {
-            let asked = Arc::new(AtomicUsize::new(0));
-            let refuses: Box<dyn Filter> = Box::new(Refuses(Arc::clone(&asked)));
-            let veto: Box<dyn Filter> = Box::new(NotOverloaded);
-            let filters = if veto_first {
-                vec![veto, refuses]
-            } else {
-                vec![refuses, veto]
-            };
-            let engine = Engine::new(
-                vec![Profile {
-                    name: "counted".into(),
-                    filters,
-                    scorers: vec![],
-                    picker: Box::new(Best),
-                }],
-                vec![Binding {
-                    model: "*".into(),
-                    phases: vec![],
-                    plan: Plan::Single,
-                    profile: 0,
-                    decode_profile: None,
-                    sessions: None,
-                    overload: None,
-                }],
-                1,
-                Needs::default(),
-            );
-            (engine, asked)
-        };
+        let counted = |veto_first: bool| counted(Box::new(NotOverloaded), veto_first);
         let pool = [over(0, 1), over(1, 2)];
         // Listed ahead of the veto: the veto never ran.
         let (engine, asked) = counted(false);
@@ -1858,18 +2105,14 @@ mod tests {
         }
     }
 
-    /// The ring's profile built by hand with [`InTheGap`] among its filters,
-    /// marked as the validator marks the ring's profile, under `rule`.
-    fn ring_with_a_gap(rule: Option<SessionRule>) -> (Arc<Engine>, Arc<Gap>) {
-        let gap = Arc::new(Gap::default());
+    /// The ring's profile built by hand with `last` behind the health stage
+    /// and the overload veto, marked as the validator marks the ring's
+    /// profile, under `rule`.
+    fn ring_behind(last: Box<dyn Filter>, rule: Option<SessionRule>) -> Engine {
         let mut engine = Engine::new(
             vec![Profile {
                 name: "ring".into(),
-                filters: vec![
-                    Box::new(Healthy),
-                    Box::new(NotOverloaded),
-                    Box::new(InTheGap(Arc::clone(&gap))),
-                ],
+                filters: vec![Box::new(Healthy), Box::new(NotOverloaded), last],
                 scorers: vec![Weighted {
                     scorer: Box::new(ConsistentHash::new(None)),
                     weight: 1.0,
@@ -1889,7 +2132,13 @@ mod tests {
             Needs::default(),
         );
         engine.places_by_key(0);
-        let engine = Arc::new(engine);
+        engine
+    }
+
+    /// [`ring_behind`] with [`InTheGap`] as that filter.
+    fn ring_with_a_gap(rule: Option<SessionRule>) -> (Arc<Engine>, Arc<Gap>) {
+        let gap = Arc::new(Gap::default());
+        let engine = Arc::new(ring_behind(Box::new(InTheGap(Arc::clone(&gap))), rule));
         gap.engine
             .set(Arc::downgrade(&engine))
             .expect("the engine is set once");
@@ -2162,13 +2411,130 @@ mod tests {
         );
     }
 
+    /// A pin the lifted pass lands on leads no worker that carries the cap's
+    /// requests of the key. A dispatch on an alternate writes that worker
+    /// among the key's pins, and the cap bounds where a pin may go. The free
+    /// alternates stay behind the pin.
+    #[test]
+    fn a_kept_key_on_its_pin_names_no_alternate_at_the_rules_cap() {
+        let engine = ring_under_a_cap(2);
+        let mut pool = [free(0, 4), free(1, 4), free(2, 4), free(3, 4)];
+        let ring = ring_order(&engine_of("consistent_hashing", false), &keyed("k1"), &pool);
+        let owner = ring[0] as usize;
+        assert_eq!(dispatched(&engine, &pool, 1_000), ring[0], "the pin");
+        let request = RequestFacts {
+            now_micros: 2_000,
+            ..keyed("k1")
+        };
+        // The pin over its thresholds and under the cap. The ring's next
+        // worker carries the cap's requests of the key.
+        pool[owner].health.overloaded = true;
+        pool[owner].session_in_flight = 1;
+        pool[ring[1] as usize].session_in_flight = 2;
+        let one = decide(&engine, &request, &pool);
+        let verdict = one.pick().expect("a pick").session_verdict;
+        assert_eq!(verdict, SessionVerdict::Pinned);
+        assert_eq!(
+            order(&one),
+            [ring[0], ring[2], ring[3]],
+            "the free alternates alone"
+        );
+        // Every other worker carries them: the pin alone.
+        for &other in &ring[1..] {
+            pool[other as usize].session_in_flight = 2;
+        }
+        assert_eq!(order(&decide(&engine, &request, &pool)), [ring[0]]);
+    }
+
+    /// No dispatch of a kept key's decision writes a worker at the cap as
+    /// the key's failover. Every worker but the pin carries the cap's
+    /// requests of the key, and the host dispatches the decision's last
+    /// target. Once the pin is down and the requests have ended, the key
+    /// follows no failover: the ring places it anew.
+    #[test]
+    fn a_kept_keys_dispatch_writes_no_failover_at_the_rules_cap() {
+        let engine = ring_under_a_cap(2);
+        let mut pool = [free(0, 4), free(1, 4), free(2, 4), free(3, 4)];
+        let ring = ring_order(&engine_of("consistent_hashing", false), &keyed("k1"), &pool);
+        let owner = ring[0] as usize;
+        assert_eq!(dispatched(&engine, &pool, 1_000), ring[0], "the pin");
+        let request = RequestFacts {
+            now_micros: 2_000,
+            ..keyed("k1")
+        };
+        pool[owner].health.overloaded = true;
+        pool[owner].session_in_flight = 1;
+        for &other in &ring[1..] {
+            pool[other as usize].session_in_flight = 2;
+        }
+        let decision = decide(&engine, &request, &pool);
+        let pick = *decision.pick().expect("a pick");
+        assert_eq!(pick.session_verdict, SessionVerdict::Pinned);
+        let last = *pick.targets.as_slice().last().expect("a target");
+        let lease = Lease {
+            issued_micros: 2_000,
+            session: request.session(),
+            session_verdict: pick.session_verdict,
+            ..Lease::default()
+        };
+        engine.on_dispatched(&lease, &last, Side::Single, 0);
+        pool[owner].health.healthy = false;
+        for candidate in &mut pool {
+            candidate.session_in_flight = 0;
+        }
+        assert_eq!(
+            dispatched(&engine, &pool, 3_000),
+            ring[1],
+            "no failover was written at the cap"
+        );
+    }
+
+    /// A followed claim leads no worker that carries the cap's requests of
+    /// the key either. This decision's own placement, the ring's first
+    /// worker, carries them: it leaves the targets behind the claimed
+    /// worker, where a dispatch would write it among the key's pins.
+    #[test]
+    fn a_followed_claim_names_no_alternate_at_the_rules_cap() {
+        let rule = SessionRule {
+            assignment: Assignment::Delegate,
+            inflight_cap: 2,
+            ttl_micros: None,
+            sweep_micros: 0,
+            recovery: Recovery::Original,
+        };
+        let (ringed, _) = ring_with_a_gap(None);
+        let mut pool = [free(0, 4), free(1, 4), free(2, 4), free(3, 4)];
+        let ring = ring_order(&ringed, &keyed("k1"), &pool);
+        let (engine, gap) = ring_with_a_gap(Some(rule));
+        // The other decision sees the ring's first worker down and claims
+        // the ring's second.
+        let mut theirs = pool.to_vec();
+        theirs[ring[0] as usize].health.healthy = false;
+        *gap.staged.lock().expect("the staged pool") = theirs;
+        pool[ring[0] as usize].session_in_flight = 2;
+        let decision = decide(&engine, &keyed("k1"), &pool);
+        assert!(
+            gap.staged.lock().expect("the staged pool").is_empty(),
+            "the other decision ran"
+        );
+        let pick = decision.pick().expect("a pick");
+        assert_eq!(pick.session_verdict, SessionVerdict::Pinned);
+        assert_eq!(
+            order(&decision),
+            [ring[1], ring[2], ring[3]],
+            "the free alternates alone"
+        );
+    }
+
     /// The rule's in-flight cap holds for a pin the lifted pass lands on as
     /// it holds for a pin read first: the lift is of the overload veto, and
     /// of no other limit. A pin that carries the cap's requests of the key
-    /// hands the key to the ring's next worker, over its thresholds as under
-    /// them. With every worker at the cap the key stays on its pin.
+    /// puts the request to the ring again. Under its thresholds the ring
+    /// places the key on its pin. Over them the veto as it stands drops
+    /// the pin, and the ring's next worker takes the key. With every
+    /// worker over its thresholds the key stays on its pin, by the lift.
     #[test]
-    fn a_followed_pin_at_the_rules_cap_hands_the_key_on() {
+    fn a_followed_pin_at_the_rules_cap_puts_the_key_to_the_ring_again() {
         let engine = ring_under_a_cap(2);
         let mut pool = [free(0, 4), free(1, 4), free(2, 4), free(3, 4)];
         let ring = ring_order(&engine_of("consistent_hashing", false), &keyed("k1"), &pool);
@@ -2188,30 +2554,32 @@ mod tests {
         // The pin carries two requests of the key, the rule's cap.
         pool[owner].session_in_flight = 2;
         pool[owner].health.overloaded = false;
-        // Under its thresholds the pin hands the key on.
+        // Under its thresholds the ring places the key on its pin again.
         let under = decide(&engine, &request, &pool);
-        assert_eq!(order(&under)[0], ring[1], "under its thresholds");
-        assert_eq!(verdict(&under), SessionVerdict::Respill);
-        // Over them it hands the key on as well.
+        assert_eq!(order(&under)[0], ring[0], "under its thresholds");
+        assert_eq!(verdict(&under), SessionVerdict::Pinned);
+        // Over them the veto as it stands drops the pin: the ring's next
+        // worker takes the key.
         pool[owner].health.overloaded = true;
         let over = decide(&engine, &request, &pool);
         assert_eq!(order(&over)[0], ring[1], "over its thresholds");
         assert_eq!(verdict(&over), SessionVerdict::Respill);
         assert_eq!(over.trace().lifted, Lifted::None);
-        // Every worker over its thresholds: the placement stands by the lift.
+        // Every worker over its thresholds: the lifted pass places the key
+        // on its pin again, and the placement stands by the lift.
         for candidate in &mut pool {
             candidate.health.overloaded = true;
         }
         let all = decide(&engine, &request, &pool);
-        assert_eq!(order(&all)[0], ring[1], "every worker over");
-        assert_eq!(verdict(&all), SessionVerdict::Respill);
+        assert_eq!(order(&all)[0], ring[0], "every worker over");
+        assert_eq!(verdict(&all), SessionVerdict::Pinned);
         assert_eq!(all.trace().lifted, Lifted::Overload);
-        // Every worker at the cap: the key stays on its pin.
+        // Every worker at the cap as well: the key stays on its pin.
         for candidate in &mut pool {
             candidate.session_in_flight = 2;
         }
         let stays = decide(&engine, &request, &pool);
-        assert_eq!(order(&stays)[0], ring[0], "no worker under the cap");
+        assert_eq!(order(&stays)[0], ring[0], "every worker at the cap");
         assert_eq!(verdict(&stays), SessionVerdict::Pinned);
     }
 
@@ -2543,11 +2911,11 @@ mod tests {
     /// placed the key on that worker or follows the claim onto it. Under
     /// the cap the decision follows the claim onto a worker over its
     /// thresholds.
-    /// Where that worker carries the cap's requests of the key, the key is
-    /// handed on by the veto as it stands. Where the lifted pass alone
-    /// keeps a worker under the cap, that worker takes the key and the
-    /// trace says the lift. With every worker at the cap the key stays on
-    /// the claim.
+    /// Where that worker carries the cap's requests of the key, the request
+    /// is put to the ring again by the veto as it stands. A survivor under
+    /// the cap takes the key. A survivor at the cap takes the request and
+    /// no pin moves, though the lifted pass would keep a worker under the
+    /// cap. Placed on the claimed worker again, the key stays on the claim.
     #[test]
     fn a_followed_claim_at_the_rules_cap_hands_the_key_on() {
         let rule = SessionRule {
@@ -2570,6 +2938,7 @@ mod tests {
             }
         };
         let (pinned, handed) = (SessionVerdict::Pinned, SessionVerdict::Respill);
+        let none = SessionVerdict::None;
         let under = followed(ring_with_a_gap(Some(rule)), &ring, at(1));
         assert_eq!(under, (ring[1], pinned, Lifted::None), "under the cap");
         let on = followed(ring_with_a_gap(Some(rule)), &ring, at(2));
@@ -2584,28 +2953,29 @@ mod tests {
             pool[last].health.overloaded = true;
             pool[last].session_in_flight = 0;
         });
-        assert_eq!(lifted, (ring[3], handed, Lifted::Overload), "by the lift");
+        assert_eq!(lifted, (ring[0], none, Lifted::None), "no veto is lifted");
         let stays = followed(ring_with_a_gap(Some(rule)), &ring, |pool| {
             for candidate in pool.iter_mut() {
                 candidate.session_in_flight = 2;
             }
             pool[claimed].health.overloaded = true;
         });
-        assert_eq!(stays, (ring[1], pinned, Lifted::None), "no worker under it");
+        assert_eq!(stays, (ring[0], none, Lifted::None), "no worker under it");
         // This decision sees the ring's first worker down as the other
         // does: its own placement is the claimed worker.
         let same = followed(ring_with_a_gap(Some(rule)), &ring, |pool| {
             pool[ring[0] as usize].health.healthy = false;
             pool[claimed].session_in_flight = 2;
         });
-        assert_eq!(same, (ring[2], handed, Lifted::None), "placed on the claim");
+        assert_eq!(same, (ring[1], pinned, Lifted::None), "placed on the claim");
     }
 
     /// The plain form follows a claim made in its gap under the same cap.
     /// The followed worker is among the survivors the standing veto kept.
-    /// At the cap it hands the key to a survivor under it. With every
-    /// survivor at the cap the key stays on the claim, though a worker
-    /// over its thresholds is under the cap: this form lifts no veto.
+    /// At the cap the ring places the request again. A survivor under the
+    /// cap takes the key. One at the cap takes the request and no pin
+    /// moves, though a worker over its thresholds is under the cap: this
+    /// form lifts no veto.
     #[test]
     fn a_followed_claim_at_the_cap_hands_the_key_on_under_the_standing_veto() {
         let rule = SessionRule {
@@ -2620,6 +2990,7 @@ mod tests {
         let ring = ring_order(&ringed, &keyed("k1"), &pool);
         let (claimed, last) = (ring[1] as usize, ring[3] as usize);
         let (pinned, handed) = (SessionVerdict::Pinned, SessionVerdict::Respill);
+        let none = SessionVerdict::None;
         let under = followed(plain_ring_with_a_gap(rule), &ring, |pool| {
             pool[claimed].session_in_flight = 1;
         });
@@ -2633,11 +3004,7 @@ mod tests {
                 candidate.session_in_flight = 2;
             }
         });
-        assert_eq!(
-            stays,
-            (ring[1], pinned, Lifted::None),
-            "no survivor under it"
-        );
+        assert_eq!(stays, (ring[0], none, Lifted::None), "no survivor under it");
         // The ring's last is under the cap and over its thresholds.
         let refused = followed(plain_ring_with_a_gap(rule), &ring, |pool| {
             for candidate in pool.iter_mut() {
@@ -2646,25 +3013,22 @@ mod tests {
             pool[last].health.overloaded = true;
             pool[last].session_in_flight = 0;
         });
-        assert_eq!(
-            refused,
-            (ring[1], pinned, Lifted::None),
-            "no veto is lifted"
-        );
+        assert_eq!(refused, (ring[0], none, Lifted::None), "no veto is lifted");
         // This decision sees the ring's first worker down as the other
         // does: its own placement is the claimed worker.
         let same = followed(plain_ring_with_a_gap(rule), &ring, |pool| {
             pool[ring[0] as usize].health.healthy = false;
             pool[claimed].session_in_flight = 2;
         });
-        assert_eq!(same, (ring[2], handed, Lifted::None), "placed on the claim");
+        assert_eq!(same, (ring[1], pinned, Lifted::None), "placed on the claim");
     }
 
-    /// A key handed on at the cap reads the veto as it stands, from a pin
-    /// over its thresholds as from one under them: it passes the ring's next
-    /// worker where that worker is over its thresholds beside free ones.
-    /// Where the standing veto keeps no worker under the cap, the lifted
-    /// pass's survivors decide, and the trace says the lift.
+    /// A key handed on at the cap reads the veto as it stands: from a pin
+    /// over its thresholds it passes the ring's next worker where that
+    /// worker is over its thresholds beside free ones. Where the free
+    /// workers carry the cap too, the first of them still takes the
+    /// request and no pin moves: the lifted pass's survivors decide only
+    /// where the standing veto keeps no worker.
     #[test]
     fn a_key_handed_on_at_the_cap_passes_a_worker_over_its_thresholds() {
         let engine = ring_under_a_cap(2);
@@ -2680,21 +3044,94 @@ mod tests {
         // next worker is over its thresholds beside two free ones.
         pool[owner].session_in_flight = 2;
         pool[next].health.overloaded = true;
+        // Under its thresholds the ring places the key on its pin again.
         let under = decide(&engine, &request, &pool);
-        assert_eq!(order(&under)[0], ring[2], "the pin under its thresholds");
+        assert_eq!(order(&under)[0], ring[0], "the pin under its thresholds");
         pool[owner].health.overloaded = true;
         let over = decide(&engine, &request, &pool);
         assert_eq!(order(&over)[0], ring[2], "the pin over its thresholds");
         assert_eq!(over.trace().lifted, Lifted::None);
-        // The free workers carry the cap too: the one worker under it is
-        // over its thresholds, and the key goes there by the lift.
+        // The free workers carry the cap too. The veto as it stands still
+        // keeps them: the ring's first of them takes the request, no veto
+        // is lifted, and no pin moves to a worker at the cap.
         pool[ring[2] as usize].session_in_flight = 2;
         pool[ring[3] as usize].session_in_flight = 2;
-        let lifted = decide(&engine, &request, &pool);
-        assert_eq!(order(&lifted)[0], ring[1], "one worker under the cap");
-        let pick = lifted.pick().expect("a pick");
-        assert_eq!(pick.session_verdict, SessionVerdict::Respill);
-        assert_eq!(lifted.trace().lifted, Lifted::Overload);
+        let standing = decide(&engine, &request, &pool);
+        assert_eq!(order(&standing)[0], ring[2], "a free worker at the cap");
+        let pick = standing.pick().expect("a pick");
+        assert_eq!(pick.session_verdict, SessionVerdict::None);
+        assert_eq!(standing.trace().lifted, Lifted::None);
+    }
+
+    /// What a filter that turns was asked, and whether it turned.
+    #[derive(Debug, Default)]
+    struct Turn {
+        asked: AtomicUsize,
+        turned: AtomicBool,
+    }
+
+    /// A filter whose answer turns within a decision. It keeps every row
+    /// until it is asked under the lifted veto, and from then on it refuses
+    /// every row it is asked about under the veto as it stands.
+    #[derive(Debug)]
+    struct Turns(Arc<Turn>);
+
+    impl Filter for Turns {
+        fn name(&self) -> &'static str {
+            "turns"
+        }
+        fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, cx: &Constraints<'_>) -> bool {
+            self.0.asked.fetch_add(1, Ordering::Relaxed);
+            if cx.overload_lifted {
+                self.0.turned.store(true, Ordering::Relaxed);
+            }
+            cx.overload_lifted || !self.0.turned.load(Ordering::Relaxed)
+        }
+    }
+
+    /// The hand-on's pass under the veto as it stands is put to no rule. It
+    /// runs where the same pass kept a worker earlier in the decision, so
+    /// it ends empty only under a filter whose answer turned since. The
+    /// lifted pass's survivors then decide and the trace says the lift, and
+    /// the emptied pass is not run again with the veto lifted: the filter
+    /// is asked about the rows of the decision's four passes and no more.
+    #[test]
+    fn a_hand_ons_pass_a_filter_emptied_is_put_to_no_rule() {
+        let rule = SessionRule {
+            assignment: Assignment::Delegate,
+            inflight_cap: 2,
+            ttl_micros: None,
+            sweep_micros: 0,
+            recovery: Recovery::Original,
+        };
+        let turn = Arc::new(Turn::default());
+        let engine = ring_behind(Box::new(Turns(Arc::clone(&turn))), Some(rule));
+        let (ringed, _) = ring_with_a_gap(None);
+        let mut pool = [free(0, 4), free(1, 4), free(2, 4), free(3, 4)];
+        let ring = ring_order(&ringed, &keyed("k1"), &pool);
+        let owner = ring[0] as usize;
+        assert_eq!(dispatched(&engine, &pool, 1_000), ring[0], "the pin");
+        // The pin carries the cap's two requests of the key, over its
+        // thresholds: the lifted pass lands on it and puts the request to
+        // the ring again.
+        pool[owner].session_in_flight = 2;
+        pool[owner].health.overloaded = true;
+        turn.turned.store(false, Ordering::Relaxed);
+        turn.asked.store(0, Ordering::Relaxed);
+        let request = RequestFacts {
+            now_micros: 2_000,
+            ..keyed("k1")
+        };
+        let decision = decide(&engine, &request, &pool);
+        // The lifted pass's survivors hold the pin, and the ring places the
+        // key on it again.
+        assert_eq!(order(&decision)[0], ring[0]);
+        let pick = decision.pick().expect("a pick");
+        assert_eq!(pick.session_verdict, SessionVerdict::Pinned);
+        assert_eq!(decision.trace().lifted, Lifted::Overload);
+        // Two passes under the veto as it stands reach the filter with the
+        // three workers under their thresholds, two lifted passes with all.
+        assert_eq!(turn.asked.load(Ordering::Relaxed), 2 * 3 + 2 * 4);
     }
 
     /// A kept key leaves its worker at the rule's cap alone, so a capped
@@ -2749,5 +3186,684 @@ mod tests {
     fn a_profile_the_engine_does_not_hold_is_refused_in_a_debug_build() {
         let mut engine = engine_of("consistent_hashing", false);
         engine.places_by_key(7);
+    }
+
+    /// A ready worker under its thresholds that the liveness veto doubts.
+    fn doubted(position: u32, in_flight: u32) -> Candidate {
+        let mut worker = free(position, in_flight);
+        worker.health.stalled = true;
+        worker
+    }
+
+    /// A ready worker over its thresholds that the liveness veto doubts.
+    fn doubted_over(position: u32, in_flight: u32) -> Candidate {
+        let mut worker = over(position, in_flight);
+        worker.health.stalled = true;
+        worker
+    }
+
+    /// A pool doubted on every ready worker goes to the fewest requests in
+    /// flight, under every preset and under either word of the binding: a
+    /// doubt is not an outage.
+    #[test]
+    fn a_pool_doubted_on_every_worker_goes_to_the_fewest_in_flight() {
+        let pool = [doubted(0, 3), doubted(1, 1), doubted(2, 2)];
+        for preset in [
+            "random",
+            "round_robin",
+            "passthrough",
+            "power_of_two",
+            "least_load",
+        ] {
+            for shed in [false, true] {
+                let decision = decide(&engine_of(preset, shed), &facts(1), &pool);
+                assert_eq!(order(&decision), vec![1, 2, 0], "{preset}, shed {shed}");
+                let pick = decision.pick().expect("a pick");
+                assert_eq!(pick.session_verdict, SessionVerdict::None, "{preset}");
+            }
+        }
+    }
+
+    /// The overload veto is lifted first: a worker over its thresholds
+    /// alone takes the request before any doubted one, whatever it holds.
+    /// With no such worker the doubted ones are taken by their load, over
+    /// their thresholds or not.
+    #[test]
+    fn a_worker_over_alone_is_taken_before_the_doubted_ones() {
+        let engine = engine_of("least_load", false);
+        let pool = [doubted_over(0, 0), doubted(1, 3), over(2, 5)];
+        assert_eq!(order(&decide(&engine, &facts(1), &pool)), vec![2]);
+        let pool = [doubted_over(0, 2), doubted(1, 1)];
+        assert_eq!(order(&decide(&engine, &facts(1), &pool)), vec![1, 0]);
+        let pool = [doubted_over(0, 0), doubted(1, 5)];
+        assert_eq!(order(&decide(&engine, &facts(1), &pool)), vec![0, 1]);
+    }
+
+    /// A binding that sheds keeps the overload veto in the lifted pass: a
+    /// doubted worker under its thresholds takes the request, a doubted one
+    /// over them does not, and a pool over on every ready worker is shed as
+    /// saturated, doubted or not.
+    #[test]
+    fn a_binding_that_sheds_takes_a_doubted_worker_under_its_thresholds() {
+        let engine = engine_of("least_load", true);
+        let pool = [over(0, 0), doubted(1, 3), doubted(2, 1)];
+        assert_eq!(order(&decide(&engine, &facts(1), &pool)), vec![2, 1]);
+        let pool = [doubted_over(0, 0), doubted(1, 3)];
+        assert_eq!(order(&decide(&engine, &facts(1), &pool)), vec![1]);
+        for pool in [
+            vec![over(0, 3), doubted_over(1, 1)],
+            vec![doubted_over(0, 3), doubted_over(1, 1), doubted_over(2, 2)],
+        ] {
+            assert_eq!(
+                shed_of(&decide(&engine, &facts(1), &pool)),
+                (ShedReason::Saturated, "not-overloaded")
+            );
+        }
+    }
+
+    /// A worker that is down, draining or behind an open breaker is not
+    /// usable with both vetoes lifted: it is never the steer, and a pool of
+    /// such workers alone is shed at the health stage.
+    #[test]
+    fn a_doubted_pool_never_steers_to_a_worker_another_veto_refuses() {
+        let engine = engine_of("least_load", false);
+        let mut pool = [doubted(0, 0), doubted(1, 0), doubted(2, 0), doubted(3, 7)];
+        pool[0].health.healthy = false;
+        pool[1].health.draining = true;
+        pool[2].health.breaker_open = true;
+        assert_eq!(order(&decide(&engine, &facts(1), &pool)), vec![3]);
+        pool[3].health.healthy = false;
+        assert_eq!(
+            shed_of(&decide(&engine, &facts(1), &pool)),
+            (ShedReason::NoEndpoints, "healthy")
+        );
+    }
+
+    /// Equal loads among doubted workers are drawn by the decision's seed,
+    /// over the tied rows alone.
+    #[test]
+    fn a_tie_among_the_doubted_is_drawn_by_the_seed() {
+        let engine = engine_of("round_robin", false);
+        let pool = [doubted(0, 2), doubted(1, 2), doubted(2, 5)];
+        let mut firsts = [0u32; 3];
+        for seed in 1..=600 {
+            let first = order(&decide(&engine, &facts(seed), &pool))[0];
+            firsts[first as usize] += 1;
+        }
+        assert_eq!(firsts[2], 0, "{firsts:?}");
+        assert!(firsts[0] > 200 && firsts[1] > 200, "{firsts:?}");
+    }
+
+    /// A host's own lift of the overload veto ends the overload tier alone:
+    /// a doubted pool under it is still steered. The lifted pass is as its
+    /// host made it, so under a binding that sheds a host's lift stands
+    /// there too, and a doubted worker over its thresholds is taken.
+    #[test]
+    fn a_hosts_lift_leaves_the_liveness_tier_its_own() {
+        let pool = [doubted_over(0, 3), doubted_over(1, 1), doubted(2, 2)];
+        let lifted = Constraints {
+            overload_lifted: true,
+            ..Constraints::default()
+        };
+        for shed in [false, true] {
+            let decision = engine_of("least_load", shed).decide(
+                &facts(1),
+                &PoolFacts::default(),
+                &pool,
+                &lifted,
+                &mut Scratch::new(),
+            );
+            assert_eq!(order(&decision), vec![1, 2, 0], "shed {shed}");
+        }
+        // With no lift of the host's, a binding that sheds keeps the veto.
+        let shedding = engine_of("least_load", true);
+        assert_eq!(order(&decide(&shedding, &facts(1), &pool)), vec![2]);
+    }
+
+    /// Affinity outlives a load signal, not a doubt. A key whose ring
+    /// worker is doubted passes to the ring's next member, over its
+    /// thresholds or not. With every worker doubted the key goes to the
+    /// fewest requests in flight, whichever worker the ring names, and no
+    /// pin is written: the key is its ring's again when the doubt ends.
+    /// Under a binding that sheds, a doubted ring worker under its
+    /// thresholds takes its key once every other worker is over.
+    #[test]
+    fn a_key_with_every_worker_doubted_goes_to_the_fewest_in_flight() {
+        let engine = engine_of("consistent_hashing", false);
+        let request = keyed("k1");
+        let mut pool = [free(0, 5), free(1, 4), free(2, 3), free(3, 2)];
+        let ring = ring_order(&engine, &request, &pool);
+        let (owner, next) = (ring[0] as usize, ring[1] as usize);
+        pool[owner].health.stalled = true;
+        let first = order(&decide(&engine, &request, &pool))[0];
+        assert_eq!(first, ring[1], "beside free workers");
+        for worker in &mut pool {
+            worker.health.overloaded = !worker.health.stalled;
+        }
+        let first = order(&decide(&engine, &request, &pool))[0];
+        assert_eq!(first, ring[1], "beside workers over their thresholds");
+        for worker in &mut pool {
+            worker.health.overloaded = false;
+            worker.health.stalled = true;
+        }
+        pool[owner].in_flight = 9;
+        pool[next].in_flight = 8;
+        let fewest = (0..pool.len())
+            .min_by_key(|&i| pool[i].in_flight)
+            .expect("a worker");
+        let decision = decide(&engine, &request, &pool);
+        assert_eq!(order(&decision)[0] as usize, fewest, "every worker doubted");
+        let pick = decision.pick().expect("a pick");
+        assert_eq!(pick.session_verdict, SessionVerdict::None);
+
+        let shedding = engine_of("consistent_hashing", true);
+        let mut pool = [over(0, 5), over(1, 4), over(2, 3), over(3, 2)];
+        let ring = ring_order(&shedding, &request, &pool);
+        let owner = ring[0] as usize;
+        pool[owner].health.overloaded = false;
+        pool[owner].health.stalled = true;
+        assert_eq!(order(&decide(&shedding, &request, &pool)), vec![ring[0]]);
+    }
+
+    /// A shed no doubt had a part in is not filtered again for the liveness
+    /// veto: a pool with no doubted row, and a doubted pool emptied before
+    /// the health stage ran, cost the one pass they cost without the tier.
+    /// A doubted pool behind the health stage costs the tier's one pass
+    /// more, and its shed names the stage that refused the rows with no
+    /// doubt on them.
+    #[test]
+    fn a_shed_no_doubt_had_a_part_in_costs_no_further_pass() {
+        // No doubted row: the health stage keeps both and the next refuses.
+        let pool = [free(0, 1), free(1, 2)];
+        let (engine, asked) = counted(Box::new(Healthy), true);
+        assert_eq!(
+            shed_of(&decide(&engine, &facts(1), &pool)),
+            (ShedReason::NoEndpoints, "refuses")
+        );
+        assert_eq!(asked.load(Ordering::Relaxed), pool.len());
+        // Doubted rows refused ahead of the health stage: it never ran.
+        let pool = [doubted(0, 1), doubted(1, 2)];
+        let (engine, asked) = counted(Box::new(Healthy), false);
+        assert_eq!(
+            shed_of(&decide(&engine, &facts(1), &pool)),
+            (ShedReason::NoEndpoints, "refuses")
+        );
+        assert_eq!(asked.load(Ordering::Relaxed), pool.len());
+        // Doubted rows behind it: the first pass ends at the health stage
+        // and the tier's pass asks the next stage about each row once.
+        let (engine, asked) = counted(Box::new(Healthy), true);
+        assert_eq!(
+            shed_of(&decide(&engine, &facts(1), &pool)),
+            (ShedReason::NoEndpoints, "refuses")
+        );
+        assert_eq!(asked.load(Ordering::Relaxed), pool.len());
+    }
+
+    /// The rule is asked once a decision: its own passes are put to no rule.
+    /// A pool over and doubted on every worker ends its first pass at the
+    /// overload veto, and the overload lift's pass at the health stage. The
+    /// liveness tier's pass alone reaches the filter listed behind both,
+    /// and asks it about each row once.
+    #[test]
+    fn the_rules_own_passes_are_put_to_no_rule() {
+        let pool = [doubted_over(0, 1), doubted_over(1, 2)];
+        let (engine, asked) =
+            counted_among(|refuses| vec![Box::new(NotOverloaded), Box::new(Healthy), refuses]);
+        assert_eq!(
+            shed_of(&decide(&engine, &facts(1), &pool)),
+            (ShedReason::NoEndpoints, "refuses")
+        );
+        assert_eq!(asked.load(Ordering::Relaxed), pool.len());
+    }
+
+    /// A side of a pair is put to the liveness tier no more than to the
+    /// overload tier: a prefill side doubted on every worker is shed at the
+    /// health stage, and the filter listed behind that stage is asked about
+    /// no prefill.
+    #[test]
+    fn a_pairs_side_doubted_on_every_worker_sheds_at_the_health_stage() {
+        let none: (&[u32], &[u32]) = (&[], &[]);
+        let side = pairs_side_shed(Box::new(Healthy), [doubted(0, 1), doubted(1, 2)], none);
+        assert_eq!(side, ((ShedReason::NoEndpoints, "healthy"), 0));
+    }
+
+    /// A hold changes nothing on a side of a pair, which is put to no tier.
+    /// A prefill side the host holds on every row, and one with a doubted
+    /// row among held ones, are shed at the health stage, and the filter
+    /// listed behind that stage is asked about no prefill. No tier reads a
+    /// side's held rows: a rule put to a pair's side brings them with it,
+    /// in the same change.
+    #[test]
+    fn a_pairs_side_under_a_hold_sheds_at_the_health_stage() {
+        for held in [&[0, 1][..], &[0]] {
+            let masks: (&[u32], &[u32]) = (&[0, 1], held);
+            let side = pairs_side_shed(Box::new(Healthy), [free(0, 1), free(1, 2)], masks);
+            assert_eq!(side, ((ShedReason::NoEndpoints, "healthy"), 0));
+        }
+    }
+
+    /// The liveness tier follows the pass the overload lift ended. Where a
+    /// document lists the overload filter ahead of the health stage, a pool
+    /// over and doubted on every worker ends its first pass before the
+    /// health stage ran; the overload lift's pass ends at the health stage,
+    /// and the tier takes it from there. A binding that sheds lifts no
+    /// overload veto, and that pool is shed as saturated.
+    #[test]
+    fn the_liveness_tier_follows_the_pass_the_overload_lift_ended() {
+        let filters = ["not-overloaded", "healthy", "not-tried"];
+        let pool = [doubted_over(0, 3), doubted_over(1, 1), doubted_over(2, 2)];
+        let steering = engine_filtering(&filters, false);
+        assert_eq!(order(&decide(&steering, &facts(1), &pool)), vec![1, 2, 0]);
+        let shedding = engine_filtering(&filters, true);
+        assert_eq!(
+            shed_of(&decide(&shedding, &facts(1), &pool)),
+            (ShedReason::Saturated, "not-overloaded")
+        );
+    }
+
+    /// The retry's tried list does not narrow the liveness tier either: a
+    /// doubted worker an earlier attempt tried is taken again when it holds
+    /// the fewest requests, whether its own bit doubts it or the host's
+    /// mask. A worker the host just failed to reach is passed over while
+    /// another doubted one stands.
+    #[test]
+    fn a_doubted_worker_tried_is_taken_again_when_it_holds_the_fewest() {
+        let engine = engine_of("round_robin", true);
+        let pool = [doubted(0, 3), doubted(1, 1), doubted(2, 2)];
+        let tried = [WorkerId(101)];
+        let retry = RequestFacts {
+            tried: &tried,
+            attempt: 1,
+            ..facts(1)
+        };
+        assert_eq!(order(&decide(&engine, &retry, &pool)), vec![1, 2, 0]);
+        // The pass that leaves the host's mask out sets the list aside too.
+        let masked = Constraints {
+            stalled: &[0, 1, 2],
+            ..Constraints::default()
+        };
+        let bare = [free(0, 3), free(1, 1), free(2, 2)];
+        let decision = engine.decide(
+            &retry,
+            &PoolFacts::default(),
+            &bare,
+            &masked,
+            &mut Scratch::new(),
+        );
+        assert_eq!(order(&decision), vec![1, 2, 0]);
+        let excluded = Constraints {
+            excluded: &tried,
+            ..Constraints::default()
+        };
+        let decision = engine.decide(
+            &facts(1),
+            &PoolFacts::default(),
+            &pool,
+            &excluded,
+            &mut Scratch::new(),
+        );
+        assert_eq!(order(&decision), vec![2, 0]);
+    }
+
+    /// The pass that lifts the liveness veto hands its rows back to the
+    /// scratch: the next doubted decision finds them sized.
+    #[test]
+    fn the_lifted_pass_hands_its_rows_back_to_the_scratch() {
+        let engine = engine_of("least_load", true);
+        let pool = [doubted(0, 3), doubted(1, 1), doubted(2, 2)];
+        let mut scratch = Scratch::new();
+        let decision = engine.decide(
+            &facts(1),
+            &PoolFacts::default(),
+            &pool,
+            &Constraints::default(),
+            &mut scratch,
+        );
+        assert_eq!(order(&decision), vec![1, 2, 0]);
+        assert!(scratch.single.undoubted.capacity() >= pool.len());
+    }
+
+    /// The trace says which veto the rule lifted: the overload veto for a
+    /// worker over its thresholds alone, the liveness veto for a doubted
+    /// one, under either word of the binding, and none for a pick no lift
+    /// made.
+    #[test]
+    fn a_steered_pick_says_which_veto_was_lifted() {
+        let mark =
+            |engine: &Engine, pool: &[Candidate]| decide(engine, &facts(1), pool).trace().lifted;
+        let steering = engine_of("least_load", false);
+        assert_eq!(
+            mark(&steering, &[over(0, 1), doubted(1, 0)]),
+            Lifted::Overload
+        );
+        assert_eq!(
+            mark(&steering, &[doubted(0, 1), doubted_over(1, 0)]),
+            Lifted::Liveness
+        );
+        assert_eq!(mark(&steering, &[free(0, 1), doubted(1, 0)]), Lifted::None);
+        let shedding = engine_of("least_load", true);
+        assert_eq!(
+            mark(&shedding, &[over(0, 1), doubted(1, 3)]),
+            Lifted::Liveness
+        );
+    }
+
+    /// A doubt the host hands beside the rows is the same doubt: a pool its
+    /// mask covers whole is steered as one the rows' own bits doubt, and no
+    /// row is copied for it. A row with its own bit beside masked rows is
+    /// read with no doubt too, and a row the mask leaves out stands with no
+    /// lift.
+    #[test]
+    fn a_pool_the_hosts_mask_doubts_is_steered_too() {
+        let engine = engine_of("least_load", true);
+        let ask = |pool: &[Candidate], stalled: &[u32], scratch: &mut Scratch| {
+            let masked = Constraints {
+                stalled,
+                ..Constraints::default()
+            };
+            engine.decide(&facts(1), &PoolFacts::default(), pool, &masked, scratch)
+        };
+        let mut scratch = Scratch::new();
+        let decision = ask(
+            &[free(0, 3), free(1, 1), free(2, 2)],
+            &[0, 1, 2],
+            &mut scratch,
+        );
+        assert_eq!(order(&decision), vec![1, 2, 0]);
+        assert_eq!(decision.trace().lifted, Lifted::Liveness);
+        assert_eq!(scratch.single.undoubted.capacity(), 0, "no row is copied");
+        let decision = ask(
+            &[free(0, 3), doubted(1, 1), free(2, 2)],
+            &[0, 2],
+            &mut scratch,
+        );
+        assert_eq!(order(&decision), vec![1, 2, 0]);
+        assert_eq!(decision.trace().lifted, Lifted::Liveness);
+        let decision = ask(&[free(0, 0), free(1, 5)], &[0], &mut scratch);
+        assert_eq!(order(&decision), vec![1]);
+        assert_eq!(decision.trace().lifted, Lifted::None);
+    }
+
+    /// A row a hold of the host stands on is not doubted: the tier lifts the
+    /// host's mask and leaves its held rows masked. A pool held on every
+    /// row is shed at the health stage under either word of the binding, as
+    /// with no tier. One doubted row among held ones takes the request
+    /// whatever it holds. So it does where the host wrote its rows: there a
+    /// held row carries the breaker bit beside the stalled one.
+    #[test]
+    fn a_row_the_host_holds_stays_refused_through_the_liveness_tier() {
+        let pool = [free(0, 0), free(1, 1), free(2, 9), free(3, 2)];
+        let ask = |engine: &Engine, pool: &[Candidate], stalled: &[u32], held: &[u32]| {
+            let masked = Constraints {
+                stalled,
+                held,
+                ..Constraints::default()
+            };
+            let mut scratch = Scratch::new();
+            engine.decide(
+                &facts(1),
+                &PoolFacts::default(),
+                pool,
+                &masked,
+                &mut scratch,
+            )
+        };
+        let mut written = pool;
+        for row in &mut written {
+            row.health.stalled = true;
+            row.health.breaker_open = row.position != 2;
+        }
+        for shed in [false, true] {
+            let engine = engine_of("least_load", shed);
+            let whole = ask(&engine, &pool, &[0, 1, 2, 3], &[0, 1, 2, 3]);
+            assert_eq!(shed_of(&whole), (ShedReason::NoEndpoints, "healthy"));
+            for one in [
+                ask(&engine, &pool, &[0, 1, 2, 3], &[0, 1, 3]),
+                ask(&engine, &written, &[], &[]),
+            ] {
+                assert_eq!(order(&one), vec![2], "shed {shed}");
+                assert_eq!(one.trace().lifted, Lifted::Liveness);
+            }
+        }
+    }
+
+    /// Keeps every row, and writes down what a stage that knows no lift
+    /// reads of each: whether the row's stalled bit or the host's mask
+    /// refuses it.
+    #[derive(Debug)]
+    struct Shown(Arc<Mutex<Vec<bool>>>);
+    impl Filter for Shown {
+        fn name(&self) -> &'static str {
+            "shown"
+        }
+        fn keep(&self, _: &RequestFacts<'_>, row: &Candidate, cx: &Constraints<'_>) -> bool {
+            let mut shown = self.0.lock().expect("no reader panics");
+            shown.push(row.health.stalled || cx.masks(row.position));
+            true
+        }
+    }
+
+    /// A stage of a host's own that reads the stalled bit and the mask, and
+    /// knows no lift, refuses a held row in every pass: the first, and the
+    /// lifted one, where a doubted row reads clear. Rows the host wrote and
+    /// rows it lent beside its lists show the stage the same.
+    #[test]
+    fn a_held_row_reads_as_vetoed_to_a_stage_in_every_pass() {
+        let shown = Arc::new(Mutex::new(Vec::new()));
+        let stage: Box<dyn Filter> = Box::new(Shown(Arc::clone(&shown)));
+        let (engine, _) = counted_among(|_| vec![stage, Box::new(Healthy)]);
+        let lent = [free(0, 0), free(1, 1)];
+        let mut written = lent;
+        written[0].health.stalled = true;
+        written[0].health.breaker_open = true;
+        written[1].health.stalled = true;
+        let hosts: [(&[Candidate], &[u32], &[u32]); 2] =
+            [(&lent, &[0, 1], &[0]), (&written, &[], &[])];
+        for (pool, stalled, held) in hosts {
+            let masked = Constraints {
+                stalled,
+                held,
+                ..Constraints::default()
+            };
+            let mut scratch = Scratch::new();
+            let decision = engine.decide(
+                &facts(1),
+                &PoolFacts::default(),
+                pool,
+                &masked,
+                &mut scratch,
+            );
+            assert_eq!(order(&decision), vec![1]);
+            assert_eq!(decision.trace().lifted, Lifted::Liveness);
+            // Row by row: the first pass, then the lifted one.
+            let passes = std::mem::take(&mut *shown.lock().expect("no reader panics"));
+            assert_eq!(passes, [true, true, true, false]);
+        }
+    }
+
+    /// The tier runs where it would gain a row and nowhere else: over a mask
+    /// of held rows alone it makes no pass. A filter listed ahead of the
+    /// health stage is asked about each row once there, and once more by the
+    /// tier's pass where one row of the mask is doubted.
+    #[test]
+    fn a_mask_of_held_rows_alone_costs_no_further_pass() {
+        let pool = [free(0, 0), free(1, 1), free(2, 9), free(3, 2)];
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counts: Box<dyn Filter> = Box::new(Counts(Arc::clone(&asked)));
+        let (engine, _) = counted_among(|_| vec![counts, Box::new(Healthy)]);
+        let ask = |held: &[u32]| {
+            let masked = Constraints {
+                stalled: &[0, 1, 2, 3],
+                held,
+                ..Constraints::default()
+            };
+            let mut scratch = Scratch::new();
+            let decision = engine.decide(
+                &facts(1),
+                &PoolFacts::default(),
+                &pool,
+                &masked,
+                &mut scratch,
+            );
+            (decision, asked.swap(0, Ordering::Relaxed))
+        };
+        let (whole, passes) = ask(&[0, 1, 2, 3]);
+        assert_eq!(shed_of(&whole), (ShedReason::NoEndpoints, "healthy"));
+        assert_eq!(passes, pool.len());
+        let (one, passes) = ask(&[0, 1, 3]);
+        assert_eq!(order(&one), vec![2]);
+        assert_eq!(passes, 2 * pool.len());
+    }
+
+    /// A doubt on a row a harder veto refuses too opens no tier: lifting it
+    /// gains nobody. A pool with no ready worker but the doubted one, which
+    /// is not ready, draining or behind an open breaker, costs the one pass
+    /// it costs with no doubt in it, by the host's mask and by the row's own
+    /// bit alike. A doubt alone on a ready row costs the tier's pass, and
+    /// that row takes the request.
+    #[test]
+    fn a_doubt_on_a_row_a_harder_veto_refuses_costs_no_further_pass() {
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counts: Box<dyn Filter> = Box::new(Counts(Arc::clone(&asked)));
+        let (engine, _) = counted_among(|_| vec![counts, Box::new(Healthy)]);
+        let ask = |pool: &[Candidate], stalled: &[u32]| {
+            let masked = Constraints {
+                stalled,
+                ..Constraints::default()
+            };
+            let mut scratch = Scratch::new();
+            let decision = engine.decide(
+                &facts(1),
+                &PoolFacts::default(),
+                pool,
+                &masked,
+                &mut scratch,
+            );
+            (decision, asked.swap(0, Ordering::Relaxed))
+        };
+        // No row is ready but the second, which each case refuses its way.
+        let pool_of = |refuse: fn(&mut Health)| {
+            let mut pool = [free(0, 0), free(1, 0), free(2, 0)];
+            pool[0].health.healthy = false;
+            pool[2].health.healthy = false;
+            refuse(&mut pool[1].health);
+            pool
+        };
+        let harder: [fn(&mut Health); 3] = [
+            |health| health.healthy = false,
+            |health| health.draining = true,
+            |health| health.breaker_open = true,
+        ];
+        for refuse in harder {
+            let mut pool = pool_of(refuse);
+            let (masked, passes) = ask(&pool, &[1]);
+            assert_eq!(shed_of(&masked), (ShedReason::NoEndpoints, "healthy"));
+            assert_eq!(passes, pool.len());
+            pool[1].health.stalled = true;
+            let (own, passes) = ask(&pool, &[]);
+            assert_eq!(shed_of(&own), (ShedReason::NoEndpoints, "healthy"));
+            assert_eq!(passes, pool.len());
+        }
+        let mut pool = pool_of(|_| {});
+        let (masked, passes) = ask(&pool, &[1]);
+        assert_eq!(order(&masked), vec![1]);
+        assert_eq!(passes, 2 * pool.len());
+        pool[1].health.stalled = true;
+        let (own, passes) = ask(&pool, &[]);
+        assert_eq!(order(&own), vec![1]);
+        assert_eq!(passes, 2 * pool.len());
+    }
+
+    /// A kept key in a pool doubted on every worker is steered to the fewest
+    /// requests in flight, under a sessions rule too: the pick says the
+    /// liveness veto and claims no pin. So it does where every worker is
+    /// over its thresholds as well: the lift that kept a row there is the
+    /// liveness veto's, and the kept run's own mark does not write over it.
+    #[test]
+    fn a_kept_key_in_a_doubted_pool_is_steered_and_claims_nothing() {
+        let request = keyed("k1");
+        let under = [doubted(0, 5), doubted(1, 4), doubted(2, 1), doubted(3, 2)];
+        let over = [
+            doubted_over(0, 5),
+            doubted_over(1, 4),
+            doubted_over(2, 1),
+            doubted_over(3, 2),
+        ];
+        for pool in [under, over] {
+            for engine in [
+                engine_of("consistent_hashing", false),
+                ring_under_a_rule(Assignment::Delegate),
+            ] {
+                let decision = decide(&engine, &request, &pool);
+                assert_eq!(order(&decision)[0], 2);
+                assert_eq!(decision.trace().lifted, Lifted::Liveness);
+                let pick = decision.pick().expect("a pick");
+                assert_eq!(pick.session_verdict, SessionVerdict::None);
+            }
+        }
+    }
+
+    /// A kept key reaches the liveness tier over a pool whose host lists its
+    /// engines as over one that lists none. The ring's walk places the key
+    /// while a row it reads stands. With every worker doubted the walk
+    /// keeps no row and the whole pass decides: the key goes to the fewest
+    /// requests in flight by the lift of the liveness veto and claims no
+    /// pin, with the workers under their thresholds and over them.
+    #[test]
+    fn a_kept_key_in_a_doubted_pool_is_steered_past_the_rings_walk() {
+        let engine = engine_of("consistent_hashing", false);
+        let request = keyed("k1");
+        let (listed, ends) = ([0, 1, 2, 3], [1, 2, 3, 4]);
+        let listing = PoolFacts {
+            pool_size: 4,
+            membership_epoch: 1,
+            generation: 1,
+            engines: Engines::new(0, &listed, &ends),
+            ..PoolFacts::default()
+        };
+        let decide = |pool: &[Candidate]| {
+            let cx = Constraints::default();
+            engine.decide(&request, &listing, pool, &cx, &mut Scratch::new())
+        };
+        // No worker doubted: the walk alone decides, and counts no survivor.
+        let calm = [free(0, 5), free(1, 4), free(2, 1), free(3, 2)];
+        let walked = decide(&calm);
+        assert!(walked.trace().survivors.get().is_none(), "by the walk");
+        let under = [doubted(0, 5), doubted(1, 4), doubted(2, 1), doubted(3, 2)];
+        let over = [
+            doubted_over(0, 5),
+            doubted_over(1, 4),
+            doubted_over(2, 1),
+            doubted_over(3, 2),
+        ];
+        for pool in [under, over] {
+            let decision = decide(&pool);
+            assert_eq!(order(&decision)[0], 2);
+            assert_eq!(decision.trace().lifted, Lifted::Liveness);
+            let pick = decision.pick().expect("a pick");
+            assert_eq!(pick.session_verdict, SessionVerdict::None);
+        }
+    }
+
+    /// An encode item of the `epd` plan is put to the liveness tier as it is
+    /// put to the overload tier, behind the plan's own rules: encoders
+    /// doubted on every worker take it by the fewest requests in flight, and
+    /// an encoder the pair cannot use stays unusable.
+    #[test]
+    fn an_encode_item_over_doubted_encoders_is_steered_among_those_the_plan_admits() {
+        let engine = PolicySpec::epd_presets("round_robin", "round_robin", "round_robin")
+            .expect("the presets' form")
+            .validate()
+            .expect("the presets build");
+        let mut pool = [doubted(0, 0), doubted(1, 4), doubted(2, 2)];
+        pool[1].ec_compatible = true;
+        pool[2].ec_compatible = true;
+        let item = RequestFacts {
+            phase: Phase::Encode,
+            ..facts(1)
+        };
+        let decision = decide(&engine, &item, &pool);
+        assert_eq!(order(&decision), vec![2, 1]);
+        assert_eq!(decision.trace().lifted, Lifted::Liveness);
     }
 }

@@ -9,7 +9,10 @@
 //!
 //! with whatever classes stand in those places, the clitic group in both
 //! letter alternatives or in neither (the Mistral tekken template has none
-//! and takes one digit at a time), and whatever bound the digit rule has.
+//! and takes one digit at a time), whatever bound the digit rule has, and
+//! in front of the seven, or not, an alternative that is a run of one class
+//! (the Kimi template opens with its ideographs, `[\p{Han}]+`, and takes
+//! them out of both letter classes).
 //! Run as the backtracking program the template costs 750 instructions a
 //! piece (the optional lead-in and the two overlapping runs are entered and
 //! given back at most positions); decided alternative by alternative it
@@ -39,14 +42,31 @@
 //! Each is what the engine's backtracking arrives at: a greedy optional
 //! lead-in is kept only when the rest matches after it, a greedy run before a
 //! required class gives back characters until the class follows, and the
-//! first alternative to reach the end of the pattern wins. The classes are
+//! first alternative to reach the end of the pattern wins.
+//!
+//! The opening run, in a template that has one, is the first alternative: a
+//! piece that starts at a character of its class is that run, whatever else
+//! the character is (a Han radical is punctuation and a Han numeral a digit
+//! inside a piece that began before it, and a run of their own where one
+//! begins). Such a template is the scanner's when no character of the run's
+//! class is one a letter body can begin with (the upper and the lower class
+//! of the first letter alternative, the upper class of the second). A
+//! character of the run then reaches a letter alternative as its lead-in
+//! alone, a role it never plays, since the run is tried first: the role
+//! table holds no lead-in bit for it, and the scanner reads the run in the
+//! digit test, one mask for both. The letter, punctuation and whitespace
+//! pieces of a template with no opening run take the tests they took, and a
+//! digit piece one more. A template whose run shares a character with those
+//! letter classes keeps the program. The classes are
 //! the parser's ([`Roles`] reads them), so the scanner and the program cannot
 //! read a category differently, and the program stays as the matcher the
 //! tests hold the scanner against.
 
 use super::{
+    block,
     pattern::{
-        clitic_match, concat, each_match, plain_class, previous_boundary, repeat, Class, Node,
+        clitic_match, concat, each_match, each_match_by_blocks, plain_class, previous_boundary,
+        repeat, Class, Node,
     },
     scan::{Bits, Roles, WordScan},
 };
@@ -87,10 +107,13 @@ pub(super) enum Role {
     NotTrail,
     /// A whitespace run (`\s+`).
     Space,
+    /// The run a template opens with (`[\p{Han}]+`): the last role, which a
+    /// template without the run has no class for.
+    Run,
 }
 
 /// The roles, in the order of their bits.
-const ROLES: [Role; 15] = [
+const ROLES: [Role; 16] = [
     Role::Lead1,
     Role::Upper1,
     Role::Lower1,
@@ -106,6 +129,7 @@ const ROLES: [Role; 15] = [
     Role::TrailSpace,
     Role::NotTrail,
     Role::Space,
+    Role::Run,
 ];
 
 impl Role {
@@ -130,6 +154,12 @@ pub(super) struct Scanner {
     clitic_beyond_ascii: bool,
     /// The most digits the digit alternative takes at once.
     digit_cap: u32,
+    /// Whether [`block`]'s pass cuts ASCII text as this scanner does
+    /// ([`Self::reads_ascii_as_blocks`]) and the alternatives leave no gap.
+    blocks: bool,
+    /// Whether the run behind punctuation takes the slash (`[\r\n/]*`; the
+    /// Kimi template's takes the line breaks alone).
+    take_slash: bool,
 }
 
 /// The lead-in, upper and lower classes of a letter alternative with runs
@@ -186,7 +216,12 @@ impl Scanner {
         let Node::Alt { alternatives, .. } = root else {
             return None;
         };
-        let [first, second, digits, punct, breaks, trail, space] = alternatives.as_slice() else {
+        // An eighth alternative in front is the opening run.
+        let (run, alternatives) = match alternatives.as_slice() {
+            [run, seven @ ..] if seven.len() == 7 => (Some(repeat(run, 1, u32::MAX)?), seven),
+            alternatives => (None, alternatives),
+        };
+        let [first, second, digits, punct, breaks, trail, space] = alternatives else {
             return None;
         };
         let (lead1, upper1, lower1, clitics1) = letters(first, 0, 1)?;
@@ -233,12 +268,25 @@ impl Scanner {
                 Role::TrailSpace => repeat(trail_space, 1, u32::MAX)?,
                 Role::NotTrail => *not_trail,
                 Role::Space => repeat(space, 1, u32::MAX)?,
+                Role::Run => run?,
             })
         };
-        let role_classes = ROLES
+        // The run's role is the last: a template without the run has the
+        // tables it had, and no character holds the role's bit.
+        let role_classes = ROLES[..ROLES.len() - usize::from(run.is_none())]
             .iter()
             .map(|&role| of(role).map(|class| &classes[class]))
             .collect::<Option<Vec<&Class>>>()?;
+        let mut roles = Roles::build(&role_classes);
+        if run.is_some() {
+            // See the module documentation: no character of the run may
+            // begin a letter body, and none is a lead-in.
+            let bodies = Role::Upper1.bit() | Role::Lower1.bit() | Role::Upper2.bit();
+            if roles.some_char_holds_both(Role::Run.bit(), bodies) {
+                return None;
+            }
+            roles.clear_where(Role::Run.bit(), Role::Lead1.bit() | Role::Lead2.bit());
+        }
         let mut clitic_start = [false; 128];
         let mut clitic_beyond_ascii = false;
         for alternative in clitics1.iter().chain(&clitics2) {
@@ -248,14 +296,150 @@ impl Scanner {
             }
             clitic_beyond_ascii |= class.may_hold_beyond_ascii();
         }
-        Some(Self {
-            roles: Roles::build(&role_classes),
+        let mut scanner = Self {
+            roles,
             clitics1,
             clitics2,
             clitic_start,
             clitic_beyond_ascii,
             digit_cap,
-        })
+            blocks: false,
+            take_slash: false,
+        };
+        scanner.take_slash = (scanner.roles.ascii_members(Role::PunctBreak.bit()) >> b'/') & 1 != 0;
+        scanner.blocks = scanner.tiles() && scanner.reads_ascii_as_blocks(classes);
+        Some(scanner)
+    }
+
+    /// Whether the encoder may read a text of this template by blocks.
+    pub(super) fn blocks(&self) -> bool {
+        self.blocks
+    }
+
+    /// Whether the alternatives leave no gap in any text: every character
+    /// holds a role that starts a piece of one character at least (the
+    /// encoder's block routine keeps no cursor to find a gap by).
+    fn tiles(&self) -> bool {
+        self.roles.every_char_holds(
+            Role::Lower1.bit()
+                | Role::Upper2.bit()
+                | Role::Digit.bit()
+                | Role::Punct.bit()
+                | Role::Space.bit()
+                | Role::Run.bit(),
+        )
+    }
+
+    /// Whether [`block`]'s pass cuts ASCII text as this scanner does. The
+    /// pass computes the starts from the plain ASCII sets, so every role
+    /// must hold exactly its set of them (the opening run none); the two
+    /// letter alternatives must carry one clitic group, whose clitics begin
+    /// with the apostrophe alone and go on in letters; and the digit rule's
+    /// bound must fit a block's shifts.
+    fn reads_ascii_as_blocks(&self, classes: &[Class]) -> bool {
+        let ascii = |test: &dyn Fn(u8) -> bool| {
+            (0..128u8)
+                .filter(|&code| test(code))
+                .fold(0u128, |set, code| set | (1 << code))
+        };
+        let capitals = ascii(&|code| code.is_ascii_uppercase());
+        let smalls = ascii(&|code| code.is_ascii_lowercase());
+        let letters = capitals | smalls;
+        let digits = ascii(&block::is_digit);
+        let spaces = ascii(&block::is_space);
+        let breaks = ascii(&block::is_break);
+        let lead = !(letters | digits | breaks);
+        let roles = [
+            (Role::Lead1, lead),
+            (Role::Upper1, capitals),
+            (Role::Lower1, smalls),
+            (Role::Lead2, lead),
+            (Role::Upper2, capitals),
+            (Role::Lower2, smalls),
+            (Role::Digit, digits),
+            (Role::PunctPrefix, 1 << b' '),
+            (Role::Punct, !(letters | digits | spaces)),
+            (
+                Role::PunctBreak,
+                breaks | (u128::from(self.take_slash) << b'/'),
+            ),
+            (Role::BreakSpace, spaces),
+            (Role::Break, breaks),
+            (Role::TrailSpace, spaces),
+            (Role::NotTrail, !spaces),
+            (Role::Space, spaces),
+            (Role::Run, 0),
+        ];
+        let clitics_go_on_in_letters = self.clitics1.iter().all(|clitic| {
+            (2..=block::BLOCK).contains(&clitic.len())
+                && clitic[1..].iter().all(|&class| {
+                    ascii(&|code| classes[class].contains(char::from(code))) & !letters == 0
+                })
+        });
+        // The two groups are two sets of classes to the parser: the same
+        // group when they hold the same ASCII, place by place.
+        let members = |class: usize| ascii(&|code| classes[class].contains(char::from(code)));
+        let same_clitics = self.clitics1.len() == self.clitics2.len()
+            && self
+                .clitics1
+                .iter()
+                .zip(&self.clitics2)
+                .all(|(one, other)| {
+                    one.len() == other.len()
+                        && one
+                            .iter()
+                            .zip(other)
+                            .all(|(&a, &b)| members(a) == members(b))
+                });
+        let quote = !self.clitics1.is_empty();
+        roles
+            .into_iter()
+            .all(|(role, set)| self.roles.ascii_members(role.bit()) == set)
+            && same_clitics
+            && (0..128).all(|code| self.clitic_start[code] == (quote && code == usize::from(b'\'')))
+            && clitics_go_on_in_letters
+            && (self.digit_cap < u64::BITS || self.digit_cap == u32::MAX)
+    }
+
+    /// [`block::cased_pieces`] from `from`, a piece's start, with this
+    /// scanner's digit bound and clitics.
+    #[inline(always)]
+    pub(super) fn block_pass<F: FnMut(usize, usize)>(
+        &self,
+        classes: &[Class],
+        text: &str,
+        from: usize,
+        f: &mut F,
+    ) -> usize {
+        block::cased_pieces(
+            text.as_bytes(),
+            from,
+            self.digit_cap,
+            self.take_slash,
+            |at| clitic_match(classes, text, at, &self.clitics1),
+            f,
+        )
+    }
+
+    /// [`Self::for_each_match`] through [`block`]'s pass, for a text
+    /// `Pattern::by_cased_blocks` gives a reader of: the templates' one walk
+    /// (`pattern::each_match_by_blocks`) with this template's pass
+    /// ([`Self::block_pass`]) and its `match_at`.
+    #[inline(always)]
+    pub(super) fn for_each_match_by_blocks<const WORDS: bool, F: FnMut(usize, usize)>(
+        &self,
+        classes: &[Class],
+        text: &str,
+        f: &mut F,
+    ) {
+        each_match_by_blocks(
+            text,
+            #[inline(always)]
+            |from, f| self.block_pass(classes, text, from, f),
+            #[inline(always)]
+            |pos| self.match_at::<WORDS>(classes, text, pos),
+            f,
+        );
     }
 
     /// The most digits the digit alternative takes at once.
@@ -354,7 +538,8 @@ impl Scanner {
     }
 
     /// The end of the piece that starts at `pos`, if one does: the first of
-    /// the seven alternatives that matches there, as the engine picks it.
+    /// the template's alternatives that matches there, as the engine picks
+    /// it.
     /// Compiled into its callers' loops: out of line it was a call per
     /// piece, and every value the loop keeps across a call is a spill.
     #[inline(always)]
@@ -414,8 +599,15 @@ impl Scanner {
                 &self.clitics2,
             );
         }
-        // 3. Up to the bound of digits.
-        if c & Role::Digit.bit() != 0 {
+        // 3. Up to the bound of digits; and, behind the same test, the
+        //    opening run of a template that has one: no letter alternative
+        //    takes a character of it (see the module documentation), so the
+        //    first alternative is read here and the pieces of every other
+        //    kind pay no test for it.
+        if c & (Role::Digit.bit() | Role::Run.bit()) != 0 {
+            if c & Role::Run.bit() != 0 {
+                return Some(self.roles.run_end(text, after, Role::Run.bit()));
+            }
             let mut end = after;
             let mut count = 1;
             while count < self.digit_cap {

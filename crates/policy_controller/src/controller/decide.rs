@@ -4,7 +4,9 @@
 //!
 //! One invariant: **a stream holds nothing a reconnect must find.** Its
 //! credit, its queue of answers and its place among its gateway's streams
-//! end with it.
+//! end with it, and so does the lease of each decision still in that
+//! queue: no gateway will read one, so the stream gives its lease up at
+//! its end, as it does for a decision it stops at the send.
 //!
 //! Where the replica leads, a stream is a present gateway's
 //! ([`Gateways`](super::gateways::Gateways)): it is refused at its open
@@ -181,7 +183,8 @@ pub(crate) struct Answers<S = Streaming<proto::DecideRequest>> {
     shared: Arc<Shared>,
     gateway: GatewayId,
     /// The stream's hand at the leases' file: a decision stopped at the
-    /// send gives its lease up through it.
+    /// send gives its lease up through it, and so does each decision still
+    /// in the queue at the stream's end.
     hand: Hand,
     /// The gateway's frames; `None` once it closed its side.
     inbound: Option<S>,
@@ -409,6 +412,37 @@ impl<S> Answers<S> {
     }
 }
 
+impl<S> Drop for Answers<S> {
+    /// The stream's end, however it came: the lease of each decision
+    /// still in its queue is given up. No gateway will read such a
+    /// decision, and its lease would book its worker until the dispatch
+    /// deadline. Each is released as abandoned by a word handed to the
+    /// leases' file, as a decision stopped at the send is. The queue is
+    /// closed first: an answer a decider makes from here on is refused
+    /// there, and its decider gives that lease up. Each answer found is
+    /// counted as that decider counts one: dropped, its stream gone.
+    fn drop(&mut self) {
+        self.decided.close();
+        let abandoned = Said::Released(None, ReleaseReason::Abandoned);
+        let mut dropped = 0;
+        while let Ok(decided) = self.decided.try_recv() {
+            dropped += 1;
+            if let wire::Decided::Decision {
+                lease: Some(leased),
+                ..
+            } = decided
+            {
+                let store: &MemoryStore = &self.shared.store;
+                store.hand(&self.hand, leased.lease.id, abandoned);
+            }
+        }
+        if dropped != 0 {
+            let counts = self.shared.deciders.counts();
+            counts.dropped_gone.fetch_add(dropped, Ordering::Relaxed);
+        }
+    }
+}
+
 impl<S> Stream for Answers<S>
 where
     S: Stream<Item = Result<proto::DecideRequest, Status>> + Unpin,
@@ -533,8 +567,8 @@ mod tests {
             config::Scope,
             deciders::{
                 tests::{
-                    busy, fleet, frame, frame_for, gone, hearing, lease_of, picked, preset, Script,
-                    Step, BUDGET, PATIENCE,
+                    busy, fleet, frame, frame_for, gone, hearing, lease_of, picked, preset,
+                    settled, Script, Step, BUDGET, PATIENCE,
                 },
                 Clock, Counts, Deciders, Job, Reads,
             },
@@ -1599,10 +1633,134 @@ mod tests {
             (busy(&second), second.request_id.as_slice(), second.term),
             (Reason::NotLeader, &[2][..], 1)
         );
-        assert_eq!(store.get(gateway, LeaseId(id(2))), None);
+        // The lease's release was handed at the send: its file's decider
+        // applies it as it leaves its work, or this read does.
+        settled(|| store.get(gateway, LeaseId(id(2))).is_none()).await;
         assert_eq!(store.live(gateway), 2);
         let abandoned = (id(2), Some(ReleaseReason::Abandoned));
         assert_eq!(heard.lock()[3..], [abandoned]);
+    }
+
+    /// The word is for a request whose stream ended (the contract's field).
+    /// Said while the earlier answer waits in an open stream's queue, it
+    /// ends the lease all the same, and nothing holds that answer back: it
+    /// leaves with the ended lease, which no dispatch can name. The send's
+    /// fence reads the term and the span alone, and no read there could
+    /// call back an answer that left before the repeat was read.
+    #[tokio::test]
+    async fn an_answer_queued_before_its_request_is_asked_again_leaves_with_the_ended_lease() {
+        let (step, at_read, release) = hold();
+        let bed = bed_with((1, 8), None, [step]).await;
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let later = bed.shared.store.apply(hearing(&heard, 2));
+        later.expect("a later generation");
+        let _seat = bed.welcomed(NAME, 1);
+        let (_frames, mut stream) = two_queued(&bed, at_read, &release).await;
+        let gateway = told(NAME).gateway();
+        let id = |count: u64| 1 << 32 | count;
+        let store: &dyn LeasesStore = bed.shared.store.as_ref();
+        assert_eq!(store.live(gateway), 3);
+        // Request 1 again, as on a second stream of its gateway, while the
+        // answer to its first ask waits in the open stream's queue.
+        let mut repeat = frame(1, 1);
+        repeat.again = true;
+        let (sender, mut answers) = mpsc::channel(1);
+        let job = Job {
+            request: Checked::new(repeat).expect("a frame the record holds"),
+            gateway,
+            received: bed.now(),
+            answers: sender,
+        };
+        assert!(bed.shared.deciders.submit(job).is_none());
+        let anew = timeout(PATIENCE, answers.recv()).await;
+        let leased = matches!(
+            anew,
+            Ok(Some(super::wire::Decided::Decision { lease: Some(_), .. }))
+        );
+        assert!(leased, "{anew:?}");
+        // The word ended the first ask's lease, its engine told ahead of
+        // the repeat's own lease: one lease of the request is on file.
+        let ended = (id(1), Some(ReleaseReason::Abandoned));
+        assert_eq!(heard.lock()[3..], [ended, (id(4), None)]);
+        assert!(store.get(gateway, LeaseId(id(1))).is_none());
+        assert_eq!(store.live(gateway), 3);
+        // The queued answer leaves all the same, with the ended lease.
+        let first = match timeout(PATIENCE, stream.next()).await {
+            Ok(Some(Ok(answer))) => answer,
+            other => panic!("an answer within the case's patience: {other:?}"),
+        };
+        let lease = lease_of(&first);
+        assert_eq!((first.request_id.as_slice(), lease.id), (&[1][..], id(1)));
+        assert!(store.get(gateway, LeaseId(id(1))).is_none());
+        assert_eq!(store.live(gateway), 3);
+    }
+
+    /// A stream that ends gives up the lease of each decision still in
+    /// its queue: no gateway will read one. Both leave the file at the
+    /// stream's drop, and the engine that issued them is told once of
+    /// each, as of a lease whose answer never left. A lease that another
+    /// stream's decision holds stands.
+    #[tokio::test]
+    async fn a_stream_that_ends_gives_up_the_leases_of_the_decisions_in_its_queue() {
+        let (step, at_read, release) = hold();
+        let bed = bed_with((1, 8), None, [step]).await;
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let later = bed.shared.store.apply(hearing(&heard, 2));
+        later.expect("a later generation");
+        let _seat = bed.welcomed(NAME, 1);
+        let (_frames, stream) = two_queued(&bed, at_read, &release).await;
+        let gateway = told(NAME).gateway();
+        let id = |count: u64| 1 << 32 | count;
+        let store: &dyn LeasesStore = bed.shared.store.as_ref();
+        // Two leases of the stream's decisions and the case's own.
+        assert_eq!(store.live(gateway), 3);
+        drop(stream);
+        // Their releases were handed at the drop: the file's decider
+        // applies them as it leaves its work, or this read does.
+        settled(|| store.live(gateway) == 1).await;
+        let abandoned = |count| (id(count), Some(ReleaseReason::Abandoned));
+        assert_eq!(heard.lock()[3..], [abandoned(1), abandoned(2)]);
+        assert!(store.get(gateway, LeaseId(id(3))).is_some());
+        // Both answers are counted as dropped for a stream that is gone.
+        assert_eq!(bed.counts().dropped_gone.load(Ordering::Relaxed), 2);
+    }
+
+    /// A request asked again behind its stream's end finds the lease of
+    /// its queued answer given up already. The stream's word is applied
+    /// ahead of the search: the engine hears of that lease once, the
+    /// repeat ends none, and one lease stands for the request.
+    #[tokio::test]
+    async fn a_request_asked_again_behind_its_streams_end_finds_no_lease_to_end() {
+        let (step, at_read, release) = hold();
+        let bed = bed_with((1, 8), None, [step]).await;
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let later = bed.shared.store.apply(hearing(&heard, 2));
+        later.expect("a later generation");
+        let _seat = bed.welcomed(NAME, 1);
+        let (_frames, stream) = two_queued(&bed, at_read, &release).await;
+        let gateway = told(NAME).gateway();
+        let id = |count: u64| 1 << 32 | count;
+        drop(stream);
+        let mut repeat = frame(1, 1);
+        repeat.again = true;
+        let (sender, mut answers) = mpsc::channel(1);
+        let job = Job {
+            request: Checked::new(repeat).expect("a frame the record holds"),
+            gateway,
+            received: bed.now(),
+            answers: sender,
+        };
+        assert!(bed.shared.deciders.submit(job).is_none());
+        let anew = timeout(PATIENCE, answers.recv()).await;
+        assert!(matches!(anew, Ok(Some(_))), "{anew:?}");
+        let abandoned = |count| (id(count), Some(ReleaseReason::Abandoned));
+        let told = [abandoned(1), abandoned(2), (id(4), None)];
+        assert_eq!(heard.lock()[3..], told);
+        // The repeat found no lease that waits: `none` is counted, not `ended`.
+        let again = bed.counts().again.each_ref();
+        assert_eq!(again.map(|count| count.load(Ordering::Relaxed)), [1, 0]);
+        let store: &dyn LeasesStore = bed.shared.store.as_ref();
+        assert_eq!(store.live(gateway), 2);
     }
 
     /// A lease tells what its dispatch span has left where its stream
@@ -1638,7 +1796,9 @@ mod tests {
             (Reason::BudgetGoneOnArrival, &[2][..], 1)
         );
         let store: &dyn LeasesStore = bed.shared.store.as_ref();
-        assert_eq!(store.get(gateway, LeaseId(id(2))), None);
+        // The lease's release was handed at the send: its file's decider
+        // applies it as it leaves its work, or this read does.
+        settled(|| store.get(gateway, LeaseId(id(2))).is_none()).await;
         assert_eq!(store.live(gateway), 2);
         let late = (id(2), Some(ReleaseReason::LateDecision));
         assert_eq!(heard.lock()[3..], [late]);

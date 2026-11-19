@@ -29,33 +29,39 @@ pub enum VetoWrite {
 /// that stands where the write was judged.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HealthWrite {
-    /// The status moved, from the first to the second.
-    Moved(WorkerStatus, WorkerStatus),
+    /// The status moved: `from` is the one the row left, `to` the one that
+    /// stands.
+    Moved {
+        from: WorkerStatus,
+        to: WorkerStatus,
+    },
     /// The write was judged and the status stands.
     Stood(WorkerStatus),
-    /// `revision` moved: the write is dropped, never applied to a
-    /// successor. It was judged against nothing, so it says no status; the
-    /// row's revision is the membership door's to say.
+    /// The row left the revision the write was read under: the write is
+    /// dropped, never applied to a successor. It was judged against
+    /// nothing, so it says no status; the row's revision is the membership
+    /// door's to say.
     Stale,
-    /// No row stands under the id: nothing is written.
-    Gone,
+    /// A write for a worker without a row: nothing is written.
+    NoRow,
 }
 
 impl HealthWrite {
-    /// The transition, where the status moved.
+    /// The transition, where the status moved: the status the row left,
+    /// then the one that stands.
     pub fn moved(self) -> Option<(WorkerStatus, WorkerStatus)> {
         match self {
-            Self::Moved(from, to) => Some((from, to)),
-            Self::Stood(_) | Self::Stale | Self::Gone => None,
+            Self::Moved { from, to } => Some((from, to)),
+            Self::Stood(_) | Self::Stale | Self::NoRow => None,
         }
     }
 
     /// The status that stands where the write was judged: none for a stale
-    /// write and for a row that is gone.
+    /// write and for a worker without a row.
     pub fn stands(self) -> Option<WorkerStatus> {
         match self {
-            Self::Moved(_, status) | Self::Stood(status) => Some(status),
-            Self::Stale | Self::Gone => None,
+            Self::Moved { to: status, .. } | Self::Stood(status) => Some(status),
+            Self::Stale | Self::NoRow => None,
         }
     }
 }
@@ -77,7 +83,7 @@ pub trait HealthSink: Send + Sync {
     /// the failure threshold fails. The answer says what happened to the
     /// write: the status moved; it stood, and the probe is counted;
     /// `revision` moved (a stale outcome is dropped, never applied to a
-    /// successor, and not counted); or the row is gone.
+    /// successor, and not counted); or the worker has no row.
     fn probe_outcome(&self, id: WorkerId, ok: bool, revision: u64) -> HealthWrite;
 
     /// The connect signal of a handshake-promoted worker (a worker whose
@@ -87,9 +93,17 @@ pub trait HealthSink: Send + Sync {
     fn connected(&self, id: WorkerId, revision: u64) -> HealthWrite;
 
     /// A gateway's standing veto on a worker until `until`; `None` clears
-    /// it. The breaker's open window and the liveness veto travel this way,
-    /// and a veto standing across a reconnect is re-asserted in the gateway's
-    /// `Hello`. A veto for a worker without a row (never registered, or
+    /// it. A veto standing across a reconnect is re-asserted in the
+    /// gateway's `Hello`. The store keeps no kind of a veto. It keeps two
+    /// ends: the veto's, and the hold's where a part of the veto is one no
+    /// rule may lift, as a breaker's open window is
+    /// ([`gateway_veto_noted`](Self::gateway_veto_noted) writes both). A
+    /// veto written here tells no kind, so the whole of it holds: a
+    /// decision reads it as an open breaker's to its end, and no rule
+    /// lifts it. A caller that means a doubt of the worker's liveness, the
+    /// veto the all-vetoed rule lifts as its last resort, says so through
+    /// the noted door, with no hold. A veto for a worker without a row
+    /// (never registered, or
     /// removed) writes nothing; the clear needs no such guard. A gateway
     /// gone past its grace period takes its vetoes with it
     /// ([`LeasesStore::drop_gateways`](super::LeasesStore::drop_gateways)).
@@ -102,19 +116,26 @@ pub trait HealthSink: Send + Sync {
     fn gateway_veto(&self, gateway: GatewayId, id: WorkerId, until: Option<Instant>);
 
     /// [`gateway_veto`](Self::gateway_veto) for a caller that keeps a note
-    /// of the gateway's vetoes on the worker: the note's check and the
-    /// write under one hold of the store, so no row leaves or comes back
-    /// between them. `stands` says the note holds an end that stands at
-    /// `now` apart from this write. Where it does and the store shows no
-    /// veto of the gateway on the worker at `now`, the worker's row left
-    /// since the note was written, with its vetoes: nothing is written and
-    /// the caller is told. A row registered again under the same id is
-    /// never written an end of the row before it.
+    /// of the gateway's vetoes on the worker, with the veto's hold. The
+    /// note's check and the write run under the store's locks taken once,
+    /// so no row leaves or comes back between them. `hold` is the end of
+    /// the part of the veto no rule may lift, and `None` where the whole
+    /// veto is a doubt of the worker's liveness. The store keeps it beside
+    /// `until` and never past it: while it stands a decision of the
+    /// gateway reads the worker as behind an open breaker, and from then
+    /// to the veto's own end as doubted. The caller alone knows a veto's
+    /// kinds and says which of them hold. `stands` says the note keeps an
+    /// end that stands at `now` apart from this write. Where it does and
+    /// the store shows no veto of the gateway on the worker at `now`, the
+    /// worker's row left since the note was written, with its vetoes:
+    /// nothing is written and the caller is told. A row registered again
+    /// under the same id is never written an end of the row before it.
     fn gateway_veto_noted(
         &self,
         gateway: GatewayId,
         id: WorkerId,
         until: Option<Instant>,
+        hold: Option<Instant>,
         stands: bool,
         now: Instant,
     ) -> VetoWrite;

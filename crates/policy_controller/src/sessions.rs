@@ -42,14 +42,17 @@ pub struct SessionRule {
 /// verdict and no other request's reading of the key can erase it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SessionVerdict {
-    /// No sessions rule governed the decision: its commit pins nothing.
+    /// No sessions rule governed the decision, or its rule placed a request
+    /// of a key at its cap on another worker at the cap: its commit pins
+    /// nothing.
     #[default]
     None,
     /// The pin was taken, or the key was placed by the rule: the commit
     /// records the worker by the key's recovery.
     Pinned,
-    /// The routable pin was over the in-flight cap and the stages placed the
-    /// request: the commit fronts the worker it lands on.
+    /// The routable pin was at the in-flight cap and the stages placed the
+    /// request on another worker under the cap: the commit fronts the
+    /// worker it lands on.
     Respill,
     /// The key had no routable pin and the decision claimed the worker it
     /// placed the request on: that decision's commit confirms the claim on

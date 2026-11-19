@@ -52,6 +52,7 @@ use crate::{
         Encoder, Encoding, IncrementalDecoder, MediaHandling, PromptEncoding, RendererCapabilities,
         SpecialTokens, TokenIdType, Tokenizer as TokenizerTrait,
     },
+    unigram::UnigramEncoder,
     word_cache::{LateBoundModel, Listing, LoadingTokenizer, ModelView, TokenizerOf},
     wordpiece::WordPieceEncoder,
 };
@@ -249,15 +250,16 @@ struct DirectEncoders {
     v1: Option<V1Encoder>,
     native: Option<NativeEncoder>,
     wordpiece: Option<WordPieceEncoder>,
+    unigram: Option<UnigramEncoder>,
 }
 
 impl DirectEncoders {
     /// The first path, in order of preference, that takes `tokenizer`: the
     /// opt-in v1 pipeline (behind its feature), the direct byte-level
-    /// encoder, the direct WordPiece encoder, else none and `tokenizers`
-    /// encodes. The choice is logged
-    /// once, with the reasons the paths before it declined, and counted per
-    /// path ([`encode_path::encode_path_loads`]).
+    /// encoder, the direct WordPiece encoder, the direct Unigram encoder,
+    /// else none and `tokenizers` encodes. The choice is logged once, with
+    /// the reasons the paths before it declined, and counted per path
+    /// ([`encode_path::encode_path_loads`]).
     fn choose<M: Model + ModelView + Serialize>(tokenizer: &TokenizerOf<M>) -> Self {
         #[cfg(feature = "tokenizers-v1")]
         let v1_declined = match V1Encoder::from_tokenizer(
@@ -271,29 +273,30 @@ impl DirectEncoders {
                     v1: Some(v1),
                     native: None,
                     wordpiece: None,
+                    unigram: None,
                 };
             }
             Err(declined) => declined,
         };
         // Each direct encoder declines first a model kind that is not its
-        // own, so a tokenizer both decline is logged with the reason of the
-        // encoder whose kind it is.
-        let (native, wordpiece, path, native_declined) =
+        // own, so a tokenizer all three decline is logged with the reason of
+        // the encoder whose kind it is.
+        let (native, wordpiece, unigram, path, native_declined) =
             match NativeEncoder::from_tokenizer(tokenizer) {
-                Ok(native) => (Some(native), None, EncodePath::Native, None),
+                Ok(native) => (Some(native), None, None, EncodePath::Native, None),
                 Err(byte_level) => match WordPieceEncoder::from_tokenizer(tokenizer) {
-                    Ok(wordpiece) => (None, Some(wordpiece), EncodePath::Native, None),
-                    Err(wordpiece) => {
-                        let declined = if matches!(
-                            tokenizer.get_model().wrapper(),
-                            ModelWrapper::WordPiece(_)
-                        ) {
-                            wordpiece.to_string()
-                        } else {
-                            byte_level.to_string()
-                        };
-                        (None, None, EncodePath::Tokenizers, Some(declined))
-                    }
+                    Ok(wordpiece) => (None, Some(wordpiece), None, EncodePath::Native, None),
+                    Err(wordpiece) => match UnigramEncoder::from_tokenizer(tokenizer) {
+                        Ok(unigram) => (None, None, Some(unigram), EncodePath::Native, None),
+                        Err(unigram) => {
+                            let declined = match tokenizer.get_model().wrapper() {
+                                ModelWrapper::WordPiece(_) => wordpiece.to_string(),
+                                ModelWrapper::Unigram(_) => unigram.to_string(),
+                                _ => byte_level.to_string(),
+                            };
+                            (None, None, None, EncodePath::Tokenizers, Some(declined))
+                        }
+                    },
                 },
             };
         encode_path::note_load(path);
@@ -327,6 +330,7 @@ impl DirectEncoders {
             v1: None,
             native,
             wordpiece,
+            unigram,
         }
     }
 
@@ -374,6 +378,10 @@ struct EncoderCore {
     /// [`DirectEncoders::choose`] took it for a tokenizer `native` does
     /// not serve.
     wordpiece: Option<WordPieceEncoder>,
+    /// The crate's direct Unigram encoder (see `unigram`), when
+    /// [`DirectEncoders::choose`] took it for a tokenizer neither encoder
+    /// above serves.
+    unigram: Option<UnigramEncoder>,
     /// Every added token, special or not, as one leftmost-longest matcher
     /// over the raw text, built on first use (only a renderer with an
     /// encoder of its own asks, and the load of a template that builds its
@@ -405,11 +413,13 @@ impl EncoderCore {
         tokenizer: HfTokenizer,
         native: Option<NativeEncoder>,
         wordpiece: Option<WordPieceEncoder>,
+        unigram: Option<UnigramEncoder>,
     ) -> Self {
         Self {
             tokenizer,
             native,
             wordpiece,
+            unigram,
             added: OnceLock::new(),
             plain: OnceLock::new(),
             plain_after_control: OnceLock::new(),
@@ -504,6 +514,8 @@ impl EncoderCore {
     /// into its spelling, which the matcher of [`Self::added`], a reader of
     /// the raw text, passes. A prompt rendered by segments is encoded by
     /// segments under such a pipeline: there the text is its characters.
+    /// A template that builds its control spellings stays as it is under
+    /// it (see `ChatTemplateState::mark_built_controls`).
     fn matches_after_normalization(&self) -> bool {
         *self.matches_after_normalization.get_or_init(|| {
             let normalizes = match self.tokenizer.get_normalizer() {
@@ -640,7 +652,10 @@ impl HuggingFaceTokenizer {
         if self.v1.is_some() {
             return EncodePath::V1;
         }
-        if self.core.native.is_some() || self.core.wordpiece.is_some() {
+        if self.core.native.is_some()
+            || self.core.wordpiece.is_some()
+            || self.core.unigram.is_some()
+        {
             EncodePath::Native
         } else {
             EncodePath::Tokenizers
@@ -1087,6 +1102,7 @@ impl HuggingFaceTokenizer {
             tokenizer,
             encoders.native,
             encoders.wordpiece,
+            encoders.unigram,
         ));
         let structural_controls = tokenizer_path
             .parent()
@@ -1105,6 +1121,7 @@ impl HuggingFaceTokenizer {
                     &|text: &str| core.is_added(text),
                     || core.added_entries(),
                     || core.added(),
+                    &|| !core.matches_after_normalization(),
                     &special_tokens,
                 )
                 .map(|written| {
@@ -1440,6 +1457,7 @@ impl HuggingFaceTokenizer {
                 tokenizer,
                 encoders.native,
                 encoders.wordpiece,
+                encoders.unigram,
             )),
             special_tokens,
             chat_template: ChatTemplateState::empty(),
@@ -1832,6 +1850,25 @@ fn is_legacy_space_replace(step: &NormalizerWrapper) -> bool {
             .is_some_and(|pattern| pattern == serde_json::json!({"String": " "}))
 }
 
+impl HuggingFaceTokenizer {
+    /// The Unigram arm of `encode`. Never inlined: with the Unigram encoder
+    /// inlined there, `encode` came out longer, and a WordPiece encode,
+    /// which returns above this arm, took three to five instructions more
+    /// per token at identical work. As a call, the arms above pay nothing
+    /// for it and a Unigram encode pays the call.
+    #[inline(never)]
+    fn encode_unigram(
+        &self,
+        unigram: &UnigramEncoder,
+        input: &str,
+        add_special_tokens: bool,
+    ) -> Option<Encoding> {
+        unigram
+            .encode(&self.core.tokenizer, input, add_special_tokens)
+            .map(Encoding::Plain)
+    }
+}
+
 impl Encoder for HuggingFaceTokenizer {
     fn encode(&self, input: &str, add_special_tokens: bool) -> Result<Encoding> {
         #[cfg(feature = "tokenizers-v1")]
@@ -1868,6 +1905,16 @@ impl Encoder for HuggingFaceTokenizer {
                 )));
             }
         }
+        // The direct Unigram encoder gives the ids alone too. It reads the
+        // character map and the pieces from the tokenizer at every encode
+        // and checks the kind of each, not the map or the pieces: the
+        // tokenizer is the one it was made from. It returns nothing when a
+        // kind is another, and the encode then runs in `tokenizers`.
+        if let Some(unigram) = &self.core.unigram {
+            if let Some(encoding) = self.encode_unigram(unigram, input, add_special_tokens) {
+                return Ok(encoding);
+            }
+        }
         self.core
             .tokenizer
             .encode_fast(input, add_special_tokens)
@@ -1887,7 +1934,10 @@ impl Encoder for HuggingFaceTokenizer {
         // the calling thread (the `tokenizers` batch fanned out with rayon):
         // the gateway reaches a batch through `CachedTokenizer::encode_batch`,
         // which fans out over `encode` itself.
-        if self.core.native.is_some() || self.core.wordpiece.is_some() {
+        if self.core.native.is_some()
+            || self.core.wordpiece.is_some()
+            || self.core.unigram.is_some()
+        {
             return inputs
                 .iter()
                 .map(|input| self.encode(input, add_special_tokens))
@@ -2865,6 +2915,7 @@ impl TokenizerTrait for HuggingFaceTokenizer {
                 &|text: &str| core.is_added(text),
                 || core.added_entries(),
                 || core.added(),
+                &|| !core.matches_after_normalization(),
                 &self.special_tokens,
             );
             self.kept = written.as_deref().and_then(|written| core.kept(written));

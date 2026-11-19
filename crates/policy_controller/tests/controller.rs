@@ -376,8 +376,7 @@ async fn a_gateway_gone_past_its_grace_period_is_let_go_by_the_run_loop() {
                 term: 1,
                 issued_at: now,
                 dispatch_deadline: now + Duration::from_secs(600),
-                state: LeaseState::Issued,
-                session_ttl_micros: None,
+                state: LeaseState::ISSUED,
             })
             .expect("a lease under the leader's term");
         assert_eq!(store.live(gateway), 1);
@@ -695,6 +694,7 @@ async fn a_present_gateway_is_answered_which_worker_on_its_decide_stream() {
                         ..RequestFacts::default()
                     }),
                     constraints: None,
+                    again: false,
                 })
                 .await
                 .expect("the stream takes the request");
@@ -739,6 +739,7 @@ async fn a_present_gateway_is_answered_which_worker_on_its_decide_stream() {
                     ..RequestFacts::default()
                 }),
                 constraints: None,
+                again: false,
             })
             .await
             .expect("the stream takes the request");
@@ -892,6 +893,7 @@ async fn a_worker_added_over_the_wire_is_decided_with_no_ask_for_a_build() {
                         ..RequestFacts::default()
                     }),
                     constraints: None,
+                    again: false,
                 })
                 .await
                 .expect("the stream takes the request");
@@ -1004,6 +1006,7 @@ async fn a_drain_ends_the_open_decide_streams_and_returns_inside_its_grace_perio
                     ..RequestFacts::default()
                 }),
                 constraints: None,
+                again: false,
             })
             .await
             .expect("the stream takes the request");

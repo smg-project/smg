@@ -4,10 +4,11 @@
 //! generated service.
 
 use std::{
+    collections::HashMap,
     convert::Infallible,
     sync::Arc,
     task::{Context, Poll},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -24,7 +25,7 @@ use tonic_prost::ProstCodec;
 use super::{no_engine, no_health_check, BasicWorkerBuilder};
 use crate::{
     common_proto::{KvEventBatch, SubscribeKvEventsRequest},
-    connection::engine::{AdminAnswer, EngineConnection, EngineConnector, ZmqLink},
+    connection::engine::{AdminAnswer, EngineConnection, EngineConnector, HealthAnswer, ZmqLink},
     identity::basic::{ConnectionMode, Worker},
     worker::{ProfileOptions, RuntimeType, WorkerLoadResponse, WorkerType},
 };
@@ -168,7 +169,7 @@ impl EngineConnection for ScriptedEngine {
         true
     }
 
-    async fn health_check(&self) -> Result<bool, Status> {
+    async fn health_answer(&self) -> Result<HealthAnswer, Status> {
         no_engine()
     }
 
@@ -188,7 +189,11 @@ impl EngineConnection for ScriptedEngine {
         no_engine()
     }
 
-    async fn kv_engine_id(&self) -> Result<Option<String>, Status> {
+    async fn model_labels(&self) -> Result<HashMap<String, String>, Status> {
+        no_engine()
+    }
+
+    async fn server_labels(&self) -> Result<HashMap<String, String>, Status> {
         no_engine()
     }
 
@@ -221,5 +226,9 @@ impl EngineConnector for ScriptedEngine {
 
     async fn connect_zmq(&self, _link: ZmqLink) -> Result<Arc<dyn EngineConnection>, String> {
         Ok(Arc::new(self.clone()))
+    }
+
+    async fn dial_grpc(&self, _base_url: &str, _timeout: Duration) -> Result<(), String> {
+        Ok(())
     }
 }

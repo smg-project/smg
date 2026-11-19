@@ -31,12 +31,13 @@ use rustls::crypto::ring;
 use smg::{
     app_context::AppContext,
     mesh::discovery::{start_mesh_discovery_with_client, MeshDiscoveryConfig},
-    service_discovery::{
-        start_service_discovery_with_client, ServiceDiscoveryConfig, DISCOVERY_ID_LABEL,
-        DISCOVERY_PROVIDER_LABEL, POD_UID_LABEL,
-    },
-    worker::{test_support::RefusedAddress, BasicWorkerBuilder},
+    routers::grpc::backend_client::BasicWorkerBuilder,
 };
+use smg_service_discovery::{
+    start_service_discovery_with_client, DiscoveryHost, ServiceDiscoveryConfig, DISCOVERY_ID_LABEL,
+    DISCOVERY_PROVIDER_LABEL, POD_UID_LABEL,
+};
+use smg_worker::test_support::RefusedAddress;
 use tokio::sync::broadcast;
 
 use super::{start_mock_engine, test_context_with_drain};
@@ -291,7 +292,7 @@ async fn multi_port_pod_registers_and_removes_all_workers() {
     let handle = start_service_discovery_with_client(
         fake.client(),
         discovery_config(),
-        Arc::clone(&app_context),
+        Arc::clone(&app_context) as Arc<dyn DiscoveryHost>,
     );
 
     wait_for(
@@ -334,7 +335,7 @@ async fn terminating_pod_drains_before_final_deletion() {
     let handle = start_service_discovery_with_client(
         fake.client(),
         discovery_config(),
-        Arc::clone(&app_context),
+        Arc::clone(&app_context) as Arc<dyn DiscoveryHost>,
     );
     wait_for(
         &app_context,
@@ -389,7 +390,7 @@ async fn zombie_worker_removed_and_manual_worker_kept() {
     let handle = start_service_discovery_with_client(
         fake.client(),
         discovery_config(),
-        Arc::clone(&app_context),
+        Arc::clone(&app_context) as Arc<dyn DiscoveryHost>,
     );
 
     wait_for(
@@ -420,7 +421,7 @@ async fn watch_interruption_relists_and_converges() {
     let handle = start_service_discovery_with_client(
         fake.client(),
         discovery_config(),
-        Arc::clone(&app_context),
+        Arc::clone(&app_context) as Arc<dyn DiscoveryHost>,
     );
     wait_for(
         &app_context,
@@ -463,7 +464,7 @@ async fn drain_window_is_honored_despite_reconcile_passes() {
     let handle = start_service_discovery_with_client(
         fake.client(),
         discovery_config(),
-        Arc::clone(&app_context),
+        Arc::clone(&app_context) as Arc<dyn DiscoveryHost>,
     );
     wait_for(
         &app_context,
@@ -605,7 +606,7 @@ async fn failed_registration_retries_until_engine_appears() {
     let handle = start_service_discovery_with_client(
         fake.client(),
         discovery_config(),
-        Arc::clone(&app_context),
+        Arc::clone(&app_context) as Arc<dyn DiscoveryHost>,
     );
 
     // Many reconcile passes with the engine down: registration keeps failing
@@ -648,7 +649,7 @@ async fn pod_added_after_start_registers_only_once_ready() {
     let handle = start_service_discovery_with_client(
         fake.client(),
         discovery_config(),
-        Arc::clone(&app_context),
+        Arc::clone(&app_context) as Arc<dyn DiscoveryHost>,
     );
 
     fake.apply_pod(worker_pod("flip-0", "uid-flip-0", &port.to_string(), false));
@@ -682,7 +683,7 @@ async fn ready_pod_becoming_unready_removes_all_workers_and_recovers() {
     let handle = start_service_discovery_with_client(
         fake.client(),
         discovery_config(),
-        Arc::clone(&app_context),
+        Arc::clone(&app_context) as Arc<dyn DiscoveryHost>,
     );
     wait_for_ready_pod_uid(
         &app_context,
@@ -761,7 +762,7 @@ async fn same_url_pod_replacement_reregisters_with_new_uid() {
     let handle = start_service_discovery_with_client(
         fake.client(),
         discovery_config(),
-        Arc::clone(&app_context),
+        Arc::clone(&app_context) as Arc<dyn DiscoveryHost>,
     );
     wait_for_pod_uid(
         &app_context,
@@ -853,7 +854,7 @@ async fn kv_annotation_edit_on_a_live_pod_updates_its_worker_in_place() {
     let handle = start_service_discovery_with_client(
         fake.client(),
         discovery_config(),
-        Arc::clone(&app_context),
+        Arc::clone(&app_context) as Arc<dyn DiscoveryHost>,
     );
     wait_for_ready_pod_uid(&app_context, port, "uid-kv-0", "the Ready worker").await;
     assert_eq!(kv_connectors_at(&app_context, port), mooncake());
@@ -907,7 +908,7 @@ async fn annotation_port_change_reconciles_worker_set() {
     let handle = start_service_discovery_with_client(
         fake.client(),
         discovery_config(),
-        Arc::clone(&app_context),
+        Arc::clone(&app_context) as Arc<dyn DiscoveryHost>,
     );
     wait_for(
         &app_context,
@@ -959,7 +960,7 @@ async fn severed_watch_reconnects_and_converges_without_relist() {
     let handle = start_service_discovery_with_client(
         fake.client(),
         discovery_config(),
-        Arc::clone(&app_context),
+        Arc::clone(&app_context) as Arc<dyn DiscoveryHost>,
     );
     wait_for(
         &app_context,

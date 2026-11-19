@@ -215,6 +215,19 @@ impl HashRing {
             && own.next().is_none()
     }
 
+    /// This ring's URLs in the ring's own order: each where its first list
+    /// put it, new ones behind.
+    pub(crate) fn urls(&self) -> &Arc<[Arc<str>]> {
+        &self.urls
+    }
+
+    /// Whether this ring and `other` are one table of positions, for the
+    /// cases that say a ring was taken from another and not built again.
+    #[cfg(test)]
+    pub(crate) fn shares_positions_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.entries, &other.entries)
+    }
+
     /// Hash a string to a ring position using blake3 (stable across versions).
     #[inline]
     #[expect(

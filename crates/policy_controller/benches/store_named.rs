@@ -9,7 +9,7 @@
 //! cells are the naming and the decision over rows already in hand. Ids:
 //! `policy_store_named/<hit|shared|miss>/<n>` at 8 to 1,024 workers, and
 //! `policy_store_named/column/<n>` for the same miss decided over the
-//! column a profile with no sample is handed. Every worker holds one prompt
+//! column a profile named no row is handed. Every worker holds one prompt
 //! of four blocks of its own and one prompt the whole fleet holds, stored
 //! through the KV sink: a hit asks for the workers' own prompts in turn (one
 //! holder each), `shared` for the prompt every worker holds (the cap cuts
@@ -151,7 +151,7 @@ struct Host {
 
 /// One decision for a request of `tokens` over lent rows: the worker it
 /// picks. With `named` the decision is handed the rows the store names;
-/// without, the column, as under a profile whose picker takes no sample.
+/// without, the column, as under a profile that is named no row.
 /// Out of line, so a count reads it by name.
 #[inline(never)]
 fn decide(

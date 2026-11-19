@@ -33,7 +33,16 @@ const TOKENIZER_JSON: &str = r#"{
 const TEMPLATE: &str = "{{ bos_token }}{% if note is defined %}{{ note }}{% endif %}{% if documents %}{% for document in documents %}{{ document['text'] }}{% endfor %}{% endif %}{% for message in messages %}{% if message['role'] == 'user' %}[INST]{{ message['content'] }}[/INST]{% else %}{{ message['content'] }}{{ eos_token }}{% endif %}{% endfor %}";
 
 fn checkpoint(dir: &std::path::Path, with_vocabulary_file: bool) -> HuggingFaceTokenizer {
-    fs::write(dir.join("tokenizer.json"), TOKENIZER_JSON).unwrap();
+    checkpoint_of(dir, TOKENIZER_JSON, with_vocabulary_file)
+}
+
+/// [`checkpoint`] over `conversion` in place of [`TOKENIZER_JSON`].
+fn checkpoint_of(
+    dir: &std::path::Path,
+    conversion: &str,
+    with_vocabulary_file: bool,
+) -> HuggingFaceTokenizer {
+    fs::write(dir.join("tokenizer.json"), conversion).unwrap();
     fs::write(dir.join("chat_template.jinja"), TEMPLATE).unwrap();
     fs::write(
         dir.join("tokenizer_config.json"),
@@ -92,6 +101,37 @@ fn a_control_spelling_typed_into_a_message_stays_text() {
     assert_eq!(text, "<s>[INST]a[/INST]b[/INST]ab</s>");
     // The typed `[/INST]` is its characters; the template's is the control.
     assert_eq!(ids, [1, 3, 12, 5, 6, 7, 8, 9, 10, 11, 13, 4, 12, 13, 2]);
+}
+
+/// A pipeline that matches an added token after normalization reads as
+/// that token a text its normalizer turns into the spelling. Under it a
+/// prompt rendered by segments is encoded by segments: such a text typed
+/// into a message is read by its characters, and the prompt is not
+/// encoded from its text.
+#[test]
+fn a_text_the_normalizer_turns_into_an_added_token_stays_text() {
+    let conversion = TOKENIZER_JSON
+        .replace(
+            r#""special": true}],"#,
+            r#""special": true},
+        {"id": 18, "content": "<b>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": true, "special": true}],"#,
+        )
+        .replace(r#"">": 17}"#, r#"">": 17, "<b>": 18}"#)
+        .replace(
+            r#""normalizer": null"#,
+            r#""normalizer": {"type": "Lowercase"}"#,
+        );
+    assert!(conversion.contains(r#""id": 18"#) && conversion.contains("Lowercase"));
+    let temp = TempDir::new().unwrap();
+    let tok = checkpoint_of(temp.path(), &conversion, true);
+    let (text, ids, from_text) = render(&tok, "a<B>b");
+    assert!(
+        !from_text,
+        "the flat encode would read the typed text as the entry"
+    );
+    assert_eq!(text, "<s>[INST]a<B>b[/INST]ab</s>");
+    // The typed `<B>` is its characters, lowered; the entry is not read.
+    assert_eq!(ids, [1, 3, 12, 15, 13, 17, 13, 4, 12, 13, 2]);
 }
 
 #[test]

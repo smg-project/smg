@@ -71,13 +71,15 @@ pub trait BoundPlugin: DecisionScope + 'static {
     fn retain(&self, facts: &RequestFacts<'_>, kept: &mut Vec<u32>) -> Result<(), Fallback>;
     /// One row of the filter's answer.
     fn keep(&self, facts: &RequestFacts<'_>, position: u32) -> Result<bool, Fallback>;
-    /// The scorer's answer: `out[i]` is the score of `kept[i]`.
+    /// The scorer's answer. `out[i]` is the score of `kept[i]`. The result
+    /// carries the plugin's tie band, or [`TieBand::NORMALIZED`] if the
+    /// plugin left it unset.
     fn score(
         &self,
         facts: &RequestFacts<'_>,
         kept: &[u32],
         out: &mut [f32],
-    ) -> Result<(), Fallback>;
+    ) -> Result<TieBand, Fallback>;
     /// The picker's answer over the survivors (`scores[i]` belongs to
     /// `kept[i]`): one surviving position.
     fn pick(&self, facts: &RequestFacts<'_>, kept: &[u32], scores: &[f32])
@@ -228,7 +230,7 @@ impl<B: BoundPlugin> Scorer for PluginScorer<B> {
         out: &mut [f32],
     ) -> TieBand {
         match self.bound.score(facts, kept, out) {
-            Ok(()) => TieBand::NORMALIZED,
+            Ok(band) => band,
             Err(Fallback) => match &self.fallback {
                 Some(fallback) => fallback.score(facts, candidates, kept, out),
                 None => {
@@ -425,9 +427,9 @@ mod tests {
         view::{Candidate, Health, Phase, PoolFacts, RequestFacts, WorkerId},
     };
 
-    /// A plugin that declares nothing and answers no call.
-    #[derive(Debug)]
-    struct Quiet;
+    /// A plugin that declares nothing and can answer scores alone.
+    #[derive(Debug, Default)]
+    struct Quiet(Option<TieBand>);
 
     impl DecisionScope for Quiet {
         fn open(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &PoolFacts<'_>) {}
@@ -464,8 +466,15 @@ mod tests {
             Err(Fallback)
         }
 
-        fn score(&self, _: &RequestFacts<'_>, _: &[u32], _: &mut [f32]) -> Result<(), Fallback> {
-            Err(Fallback)
+        fn score(
+            &self,
+            _: &RequestFacts<'_>,
+            _: &[u32],
+            out: &mut [f32],
+        ) -> Result<TieBand, Fallback> {
+            let band = self.0.ok_or(Fallback)?;
+            out.fill(0.5);
+            Ok(band)
         }
 
         fn pick(&self, _: &RequestFacts<'_>, _: &[u32], _: &[f32]) -> Result<u32, Fallback> {
@@ -551,7 +560,12 @@ mod tests {
             Err(Fallback)
         }
 
-        fn score(&self, _: &RequestFacts<'_>, _: &[u32], _: &mut [f32]) -> Result<(), Fallback> {
+        fn score(
+            &self,
+            _: &RequestFacts<'_>,
+            _: &[u32],
+            _: &mut [f32],
+        ) -> Result<TieBand, Fallback> {
             Err(Fallback)
         }
 
@@ -590,6 +604,8 @@ mod tests {
     struct Kept(Arc<AtomicU32>);
 
     impl Kept {
+        const BAND: TieBand = TieBand(0.625);
+
         fn count(&self) {
             self.0.fetch_add(1, Ordering::Relaxed);
         }
@@ -638,7 +654,7 @@ mod tests {
             out: &mut [f32],
         ) -> TieBand {
             out.fill(0.0);
-            TieBand::NORMALIZED
+            Self::BAND
         }
     }
 
@@ -671,8 +687,9 @@ mod tests {
     /// A host names a decision's rows in the affinity column's place only
     /// for a profile whose every stage answers row by row, and a plugin's
     /// stage does not. A profile that holds one, as a filter or as a scorer
-    /// beside the affinity stage, takes no sample and is named no rows: its
-    /// plugin reads the column whole.
+    /// beside the affinity stage, is named no rows: its plugin reads the
+    /// column whole. A profile of row-wise stages that reads the column and
+    /// takes no sample is named every holder.
     #[test]
     fn a_profile_that_holds_a_plugins_stage_is_named_no_rows() {
         // The sample of the profile that decides, and the cap a host names
@@ -697,7 +714,7 @@ mod tests {
         let mut filtering = Catalog::builtin();
         filtering
             .filter("quiet", || {
-                Box::new(PluginFilter::new(Arc::new(Quiet), None))
+                Box::new(PluginFilter::new(Arc::new(Quiet::default()), None))
             })
             .expect("a free name, the stage's own");
         let filtered = r#""filter":["quiet"],"score":["prefix-affinity"]"#;
@@ -705,11 +722,44 @@ mod tests {
         let mut scoring = Catalog::builtin();
         scoring
             .scorer("quiet", || {
-                Box::new(PluginScorer::new(Arc::new(Quiet), None))
+                Box::new(PluginScorer::new(Arc::new(Quiet::default()), None))
             })
             .expect("a free name, the stage's own");
         let scored = r#""score":["prefix-affinity","quiet"]"#;
         assert_eq!(named(&scoring, scored), (0, 0));
+    }
+
+    /// A plugin's rule is its own, and its stage of each kind says
+    /// nothing of what it may refuse by: the trait's own answer stands,
+    /// that it may refuse by a report of leases, and the host of its
+    /// decision applies what its gateways reported first.
+    #[test]
+    fn a_plugins_stage_of_each_kind_is_taken_as_one_that_may_refuse_by_reports() {
+        use crate::framework::{Filter, Picker};
+
+        assert!(PluginFilter::new(Arc::new(Quiet::default()), None).refuses_by_reports());
+        assert!(PluginScorer::new(Arc::new(Quiet::default()), None).refuses_by_reports());
+        assert!(PluginPicker::new(Arc::new(Quiet::default()), None).refuses_by_reports());
+    }
+
+    /// The scorer's adapter returns the band its plugin answered, and its
+    /// fallback's band where it takes the fallback.
+    #[test]
+    fn the_scorer_adapter_returns_the_band_its_plugin_answered() {
+        let facts = RequestFacts::default();
+        let candidates = [Candidate::default()];
+        let kept = [0];
+        let mut out = [0.0];
+        let band = TieBand(0.3125);
+        let scorer = PluginScorer::new(Arc::new(Quiet(Some(band))), None);
+        assert_eq!(scorer.score(&facts, &candidates, &kept, &mut out), band);
+
+        let fallback = Box::new(Kept(Arc::default()));
+        let scorer = PluginScorer::new(Arc::new(Quiet::default()), Some(fallback));
+        assert_eq!(
+            scorer.score(&facts, &candidates, &kept, &mut out),
+            Kept::BAND
+        );
     }
 
     /// The forwarding adapter hands the plugin the kinds its row lists and

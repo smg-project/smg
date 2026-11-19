@@ -10,10 +10,11 @@ use std::{
 };
 
 use super::{
-    run_of, seek, Ask, Built, Classes, GatewayRun, OutsideLists, PairBuffers, PoolVeto, PoolVetoes,
-    StaleGeneration, ViewBuffers, World, Writer, PUBLISH_WINDOW, WALKED_RUNS,
+    run_of, seek, side_of, Ask, Built, Classes, GatewayRun, OutsideLists, PairBuffers, PoolVeto,
+    PoolVetoes, StaleGeneration, VetoEnds, ViewBuffers, World, Writer, PUBLISH_WINDOW, WALKED_RUNS,
 };
 use crate::{
+    counts::Slot,
     spec::{BindingSpec, Match, OverloadSpec, Pairing},
     store::{
         loads::LoadSample, pairing::Refusal, GatewayId, HealthSink, LeasesStore, LoadSink,
@@ -31,6 +32,7 @@ mod encode_classes;
 mod encode_door;
 mod engines;
 mod list_room;
+mod load_call;
 mod membership_call;
 mod mode_and_overload;
 mod owed;
@@ -41,6 +43,21 @@ mod written;
 
 const MODEL: &str = "m";
 const ASKER: GatewayId = GatewayId(1);
+
+/// A store's write gives each member its slot. The cases here hand a writer
+/// rows no store filed and read no count of theirs, so a row is given the
+/// next slot of the writer's counts where it is handed.
+trait Filed {
+    fn filed(&self, writer: &Writer) -> std::vec::IntoIter<(&WorkerRow, Slot)>;
+}
+
+impl Filed for [WorkerRow] {
+    fn filed(&self, writer: &Writer) -> std::vec::IntoIter<(&WorkerRow, Slot)> {
+        let counts = writer.counts();
+        let filed: Vec<_> = self.iter().map(|row| (row, counts.claim())).collect();
+        filed.into_iter()
+    }
+}
 
 fn facts(key: &str, role: Role, models: &[&str]) -> WorkerFacts {
     WorkerFacts {
@@ -122,8 +139,24 @@ fn lent_agrees(store: &MemoryStore, ask: &Ask) {
             }
         }
         assert!(view.stalled.is_sorted(), "the mask is in the rows' order");
+        // The rows of the mask a hold stands on, asked apart. A held row is
+        // a row of the mask. The build writes every row of the mask the
+        // stalled bit, and a held one the breaker bit beside it.
+        let mut buffer = Vec::new();
+        let holds = world.held(&view, ask, &mut buffer);
+        // Strictly: the all-vetoed rule reads the two lists by their
+        // lengths, so the held list names a row once.
+        let rising = holds.windows(2).all(|pair| pair[0] < pair[1]);
+        assert!(rising, "the held rows are in the rows' order, each once");
+        let held = |position: &u32| holds.binary_search(position).is_ok();
+        let masked = |position: &u32| view.stalled.binary_search(position).is_ok();
+        assert!(holds.iter().all(masked), "a held row is masked");
         for &position in view.stalled {
-            rows[position as usize].health.stalled = true;
+            let health = &mut rows[position as usize].health;
+            health.stalled = true;
+            if held(&position) {
+                health.breaker_open = true;
+            }
         }
         if let Some(at) = view.pinned_at.checked_sub(1) {
             rows[at as usize].session_hit = true;
@@ -141,7 +174,9 @@ fn running(store: &MemoryStore, now: Instant) -> Option<u32> {
     view(store, &ask(now)).0[0].load.map(|load| load.running)
 }
 
-/// The workers of the pool that `gateway`'s vetoes mask at `now`, by id.
+/// The workers of the pool that `gateway`'s vetoes mask at `now`, by id: a
+/// build writes a veto's row the stalled bit, and the breaker bit beside
+/// it while its hold stands.
 fn stalled(store: &MemoryStore, gateway: GatewayId, now: Instant) -> Vec<WorkerId> {
     let asked = Ask {
         gateway,
@@ -151,6 +186,38 @@ fn stalled(store: &MemoryStore, gateway: GatewayId, now: Instant) -> Vec<WorkerI
         .0
         .iter()
         .filter(|row| row.health.stalled)
+        .map(|row| row.id)
+        .collect()
+}
+
+/// The workers of the pool `gateway` doubts at `now`, by id: the rows a
+/// build writes the stalled bit alone on.
+fn doubted(store: &MemoryStore, gateway: GatewayId, now: Instant) -> Vec<WorkerId> {
+    let asked = Ask {
+        gateway,
+        ..ask(now)
+    };
+    view(store, &asked)
+        .0
+        .iter()
+        .filter(|row| row.health.stalled && !row.health.breaker_open)
+        .map(|row| row.id)
+        .collect()
+}
+
+/// The workers of the pool a hold of `gateway` stands on at `now`, by id:
+/// the rows a build writes the breaker bit on, each beside the stalled
+/// bit.
+fn held(store: &MemoryStore, gateway: GatewayId, now: Instant) -> Vec<WorkerId> {
+    let asked = Ask {
+        gateway,
+        ..ask(now)
+    };
+    view(store, &asked)
+        .0
+        .iter()
+        .filter(|row| row.health.breaker_open)
+        .inspect(|row| assert!(row.health.stalled, "a held row is masked"))
         .map(|row| row.id)
         .collect()
 }
@@ -1202,20 +1269,116 @@ fn a_noted_veto_is_shown_and_lifted_in_the_published_world() {
     let t0 = Instant::now();
     let vetoed = member(&store, "http://a:8000");
     let until = t0 + Duration::from_secs(1);
-    let written = store.gateway_veto_noted(ASKER, vetoed, Some(until), false, t0);
+    let written = store.gateway_veto_noted(ASKER, vetoed, Some(until), None, false, t0);
     assert_eq!(written, VetoWrite::Written);
     assert_eq!(stalled(&store, ASKER, t0), [vetoed]);
     assert_eq!(stalled(&store, GatewayId(2), t0), []);
     assert_eq!(stalled(&store, ASKER, until), []);
 
     let later = until + Duration::from_secs(1);
-    let written = store.gateway_veto_noted(ASKER, vetoed, Some(later), true, t0);
+    let written = store.gateway_veto_noted(ASKER, vetoed, Some(later), None, true, t0);
     assert_eq!(written, VetoWrite::Written);
     assert_eq!(stalled(&store, ASKER, until), [vetoed]);
 
-    let written = store.gateway_veto_noted(ASKER, vetoed, None, true, t0);
+    let written = store.gateway_veto_noted(ASKER, vetoed, None, None, true, t0);
     assert_eq!(written, VetoWrite::Written);
     assert_eq!(stalled(&store, ASKER, t0), []);
+}
+
+/// The store keeps no kind of a veto and two ends. While the hold stands
+/// the worker reads to its gateway as behind an open breaker, and not as
+/// doubted. From the hold's end to the veto's it reads as doubted, and past
+/// the veto's end it reads clear. A veto written with no hold is a doubt
+/// from its first instant. A membership write keeps both ends, a later
+/// write moves the hold alone, and a hold handed past the veto's end is cut
+/// to it.
+#[test]
+fn a_veto_reads_as_an_open_breaker_while_its_hold_stands_and_as_a_doubt_after() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let (first, second) = (
+        member(&store, "http://a:8000"),
+        member(&store, "http://b:8000"),
+    );
+    let mut both = [first, second];
+    both.sort_unstable();
+    let (hold, until) = (t0 + Duration::from_secs(1), t0 + Duration::from_secs(2));
+    let written = store.gateway_veto_noted(ASKER, first, Some(until), Some(hold), false, t0);
+    assert_eq!(written, VetoWrite::Written);
+    let written = store.gateway_veto_noted(ASKER, second, Some(until), None, false, t0);
+    assert_eq!(written, VetoWrite::Written);
+    assert_eq!(held(&store, ASKER, t0), [first]);
+    assert_eq!(doubted(&store, ASKER, t0), [second]);
+    assert_eq!(held(&store, GatewayId(2), t0), []);
+    assert_eq!(doubted(&store, GatewayId(2), t0), []);
+    // A membership write builds every run again from the writer's lists.
+    member(&store, "http://c:8000");
+    assert_eq!(held(&store, ASKER, t0), [first]);
+    assert_eq!(doubted(&store, ASKER, t0), [second]);
+    // From the hold's end to the veto's: a doubt.
+    assert_eq!(held(&store, ASKER, hold), []);
+    assert_eq!(doubted(&store, ASKER, hold), both);
+    assert_eq!(held(&store, ASKER, until), []);
+    assert_eq!(doubted(&store, ASKER, until), []);
+    // The hold lifted under a veto that stands: a doubt at once.
+    let written = store.gateway_veto_noted(ASKER, first, Some(until), None, true, t0);
+    assert_eq!(written, VetoWrite::Written);
+    assert_eq!(held(&store, ASKER, t0), []);
+    assert_eq!(doubted(&store, ASKER, t0), both);
+    // A hold handed past the veto's end is cut to it.
+    let past = until + Duration::from_secs(9);
+    let written = store.gateway_veto_noted(ASKER, first, Some(until), Some(past), true, t0);
+    assert_eq!(written, VetoWrite::Written);
+    assert_eq!(held(&store, ASKER, t0), [first]);
+    assert_eq!(held(&store, ASKER, until), []);
+    assert_eq!(doubted(&store, ASKER, until), []);
+}
+
+#[test]
+fn a_veto_with_no_kind_told_holds_to_its_end() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let first = member(&store, "http://a:8000");
+    member(&store, "http://b:8000");
+    let until = t0 + Duration::from_secs(2);
+    // The plain door tells no kind, and no rule lifts a veto it cannot
+    // name: the whole of it holds.
+    store.gateway_veto(ASKER, first, Some(until));
+    assert_eq!(held(&store, ASKER, t0), [first]);
+    assert_eq!(doubted(&store, ASKER, t0), []);
+    assert_eq!(held(&store, GatewayId(2), t0), []);
+    // Across a membership write, and to its own end.
+    member(&store, "http://c:8000");
+    assert_eq!(held(&store, ASKER, t0), [first]);
+    assert_eq!(held(&store, ASKER, until), []);
+    assert_eq!(doubted(&store, ASKER, until), []);
+    store.gateway_veto(ASKER, first, None);
+    assert_eq!(stalled(&store, ASKER, t0), []);
+}
+
+/// A hold never outlasts its veto: one noted with a hold past the veto's
+/// own end reads held up to that end and clear at it. A hold that stood on
+/// would name a row no mask names, beside another worker's standing doubt.
+#[test]
+fn a_hold_noted_past_its_vetos_end_is_cut_to_that_end() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let first = member(&store, "http://a:8000");
+    let second = member(&store, "http://b:8000");
+    let until = t0 + Duration::from_secs(2);
+    let past = until + Duration::from_secs(2);
+    let written = store.gateway_veto_noted(ASKER, first, Some(until), Some(past), false, t0);
+    assert_eq!(written, VetoWrite::Written);
+    // A doubt of another worker that stands on: the mask is not empty when
+    // the first veto ends.
+    let written = store.gateway_veto_noted(ASKER, second, Some(past), None, false, t0);
+    assert_eq!(written, VetoWrite::Written);
+    assert_eq!(held(&store, ASKER, t0), [first]);
+    assert_eq!(doubted(&store, ASKER, t0), [second]);
+    // At the veto's end its row is clear and the lent view names no held
+    // row, though the hold as it was told would stand two seconds more.
+    assert_eq!(held(&store, ASKER, until), []);
+    assert_eq!(stalled(&store, ASKER, until), [second]);
 }
 
 #[test]
@@ -1575,7 +1738,7 @@ fn a_veto_masks_its_workers_row_in_every_pool_it_serves() {
             .expect("the pool");
         out.candidates
             .iter()
-            .filter(|row| row.health.stalled)
+            .filter(|row| row.health.breaker_open)
             .map(|row| row.id)
             .collect::<Vec<_>>()
     };
@@ -1816,6 +1979,7 @@ fn a_publication_before_a_departing_workers_row_leaves_still_shows_its_veto() {
         status: WorkerStatus::Ready,
         revision: 1,
         admitted_at: origin,
+        maker: Default::default(),
     };
     let members = [row(1, "http://a:8000"), row(2, "http://b:8000")];
     let masked = |world: &World| {
@@ -1831,9 +1995,9 @@ fn a_publication_before_a_departing_workers_row_leaves_still_shows_its_veto() {
     };
     let leaving = WorkerId(1);
     let mut writer = Writer::new(PUBLISH_WINDOW, origin);
-    writer.rebuild(1, members.iter(), |_, _| None, Classes::Derive);
+    writer.rebuild(1, members.filed(&writer), |_, _| None, Classes::Derive);
     let vetoed = writer
-        .veto(ASKER, leaving, Some(t0 + Duration::from_secs(60)))
+        .veto(ASKER, leaving, Some(t0 + Duration::from_secs(60)), None)
         .expect("a new veto");
     assert_eq!(masked(&vetoed), [leaving]);
     // Another worker's load write publishes while the removal is under
@@ -1841,11 +2005,11 @@ fn a_publication_before_a_departing_workers_row_leaves_still_shows_its_veto() {
     let between = writer.publish_window(t0);
     assert_eq!(masked(&between), [leaving]);
     // The membership write takes the row and its vetoes out together,
-    let after = writer.rebuild(2, members[1..].iter(), |_, _| None, Classes::Derive);
+    let after = writer.rebuild(2, members[1..].filed(&writer), |_, _| None, Classes::Derive);
     assert_eq!(after.members(MODEL, Role::Single), Some(1));
     assert_eq!(masked(&after), []);
     // and the same id registered again starts without them.
-    let again = writer.rebuild(3, members.iter(), |_, _| None, Classes::Derive);
+    let again = writer.rebuild(3, members.filed(&writer), |_, _| None, Classes::Derive);
     assert_eq!(again.members(MODEL, Role::Single), Some(2));
     assert_eq!(masked(&again), []);
 }
@@ -1983,13 +2147,13 @@ fn a_gateways_run_is_found_by_the_walk_and_by_the_search_and_none_where_it_holds
         3 * WALKED_RUNS,
     ] {
         let runs: Vec<GatewayRun> = (0..count)
-            .map(|place| GatewayRun {
-                gateway: GatewayId(3 * place as u64 + 3),
-                vetoes: Arc::from([PoolVeto {
+            .map(|place| {
+                let veto = PoolVeto {
                     row: place as u32,
                     id: WorkerId(place as u64),
-                    until,
-                }]),
+                    ends: VetoEnds::new(until, None),
+                };
+                GatewayRun::new(GatewayId(3 * place as u64 + 3), Arc::from([veto]))
             })
             .collect();
         for asker in 0..=3 * count as u64 + 4 {
@@ -2072,6 +2236,7 @@ fn row_serving(id: u64, models: &[&str], admitted_at: Instant) -> WorkerRow {
         status: WorkerStatus::Ready,
         revision: 1,
         admitted_at,
+        maker: Default::default(),
     }
 }
 
@@ -2083,7 +2248,7 @@ fn a_spare_of_another_length_is_left_and_the_publication_allocates() {
         row_serving(2, &[MODEL], origin),
     ];
     let mut writer = Writer::new(PUBLISH_WINDOW, origin);
-    writer.rebuild(1, members.iter(), |_, _| None, Classes::Derive);
+    writer.rebuild(1, members.filed(&writer), |_, _| None, Classes::Derive);
     // No write leaves a pool a spare of another length: one is planted,
     // the rows of a pool of one, held by the pool alone.
     writer.spares[0] = Some(Arc::from(&writer.working[0].rows[..1]));
@@ -2110,7 +2275,7 @@ fn a_membership_write_leaves_the_writers_lists_at_one_slot_a_pool() {
     ];
     let mut writer = Writer::new(PUBLISH_WINDOW, origin);
     for epoch in 1..=4 {
-        writer.rebuild(epoch, members.iter(), |_, _| None, Classes::Derive);
+        writer.rebuild(epoch, members.filed(&writer), |_, _| None, Classes::Derive);
         // Two models, a pool each: one slot a pool in each list, however
         // many membership writes came before.
         assert_eq!(
@@ -2146,11 +2311,11 @@ fn a_vetos_write_builds_its_own_gateways_run_and_shares_every_other() {
         })
         .collect();
     let mut writer = Writer::new(PUBLISH_WINDOW, origin);
-    writer.rebuild(1, members.iter(), |_, _| None, Classes::Derive);
+    writer.rebuild(1, members.filed(&writer), |_, _| None, Classes::Derive);
     let (writing, other) = (GatewayId(3), GatewayId(7));
     for (gateway, id) in [(other, 2), (other, 6), (writing, 3)] {
         writer
-            .veto(gateway, WorkerId(id), Some(until))
+            .veto(gateway, WorkerId(id), Some(until), None)
             .expect("a new veto");
     }
     let run = |runs: &PoolVetoes, gateway: GatewayId| {
@@ -2162,7 +2327,7 @@ fn a_vetos_write_builds_its_own_gateways_run_and_shares_every_other() {
     // alone.
     let before = Arc::clone(&writer.pool_vetoes);
     writer
-        .veto(writing, WorkerId(7), Some(until))
+        .veto(writing, WorkerId(7), Some(until), None)
         .expect("a new veto");
     let after = Arc::clone(&writer.pool_vetoes);
     let mut whole = 0;
@@ -2185,7 +2350,9 @@ fn a_vetos_write_builds_its_own_gateways_run_and_shares_every_other() {
     // gateway takes its run out of the pool, and the last of the store
     // leaves no list at all.
     let before = Arc::clone(&writer.pool_vetoes);
-    writer.veto(writing, WorkerId(7), None).expect("a clear");
+    writer
+        .veto(writing, WorkerId(7), None, None)
+        .expect("a clear");
     let after = Arc::clone(&writer.pool_vetoes);
     assert_eq!(
         before
@@ -2195,13 +2362,17 @@ fn a_vetos_write_builds_its_own_gateways_run_and_shares_every_other() {
             .count(),
         1
     );
-    writer.veto(writing, WorkerId(3), None).expect("a clear");
+    writer
+        .veto(writing, WorkerId(3), None, None)
+        .expect("a clear");
     assert!(writer
         .pool_vetoes
         .iter()
         .all(|runs| run(runs, writing).is_none()));
     for id in [2, 6] {
-        writer.veto(other, WorkerId(id), None).expect("a clear");
+        writer
+            .veto(other, WorkerId(id), None, None)
+            .expect("a clear");
     }
     assert!(writer.pool_vetoes.is_empty());
 }
@@ -2223,7 +2394,8 @@ fn the_runs_each_write_leaves_are_the_runs_a_derive_builds_again() {
         .collect();
     let mut present = [true; 12];
     let mut writer = Writer::new(PUBLISH_WINDOW, origin);
-    writer.rebuild(1, all.iter(), |_, _| None, Classes::Derive);
+    writer.rebuild(1, all.filed(&writer), |_, _| None, Classes::Derive);
+    let counts = writer.counts();
     // A fixed sequence: the case makes the same writes at every run.
     let mut state = 0x9E37_79B9_7F4A_7C15_u64;
     let mut next = |bound: u64| {
@@ -2244,7 +2416,7 @@ fn the_runs_each_write_leaves_are_the_runs_a_derive_builds_again() {
                 let members = all
                     .iter()
                     .zip(present)
-                    .filter_map(|(row, here)| here.then_some(row));
+                    .filter_map(|(row, here)| here.then_some((row, counts.claim())));
                 writer.rebuild(step + 2, members, |_, _| None, Classes::Derive);
             }
             // A window's publication, which drops what its instant ended.
@@ -2253,9 +2425,9 @@ fn the_runs_each_write_leaves_are_the_runs_a_derive_builds_again() {
                 writer.publish_window(at(clock));
             }
             // A clear, of a veto that stands or of none.
-            2..=5 => drop(writer.veto(gateway, worker, None)),
+            2..=5 => drop(writer.veto(gateway, worker, None, None)),
             // A veto, new or with a new end.
-            _ => drop(writer.veto(gateway, worker, Some(at(clock + 1 + next(60))))),
+            _ => drop(writer.veto(gateway, worker, Some(at(clock + 1 + next(60))), None)),
         }
         let left = runs_of(&writer);
         for runs in &left {
@@ -2282,7 +2454,7 @@ fn the_runs_each_write_leaves_are_the_runs_a_derive_builds_again() {
     // leaves what a derive builds, the last one no list at all.
     for gateway in (0..5).map(|n| GatewayId(n * 11 + 2)) {
         for worker in (1..=12).map(WorkerId) {
-            if writer.veto(gateway, worker, None).is_none() {
+            if writer.veto(gateway, worker, None, None).is_none() {
                 continue;
             }
             let left = runs_of(&writer);
@@ -2482,7 +2654,7 @@ fn an_applied_generation_is_published_at_once_with_the_rows_as_they_stand() {
     let (rows, _, built) = view(&store, &ask(t0));
     assert_eq!((built.generation, built.membership_epoch), (1, epoch));
     assert_eq!(rows[0].load.map(|load| load.running), Some(2));
-    assert!(rows[0].health.healthy && rows[0].health.stalled);
+    assert!(rows[0].health.healthy && rows[0].health.breaker_open);
 }
 
 #[test]
@@ -3489,7 +3661,7 @@ fn the_pass_over_every_engine_says_whether_it_moved_a_verdict() {
         })
     };
     let mut writer = Writer::new(PUBLISH_WINDOW, origin);
-    writer.rebuild(1, [member].iter(), sample, Classes::Derive);
+    writer.rebuild(1, [member].filed(&writer), sample, Classes::Derive);
     let verdict = |writer: &Writer| writer.working[0].rows[0].health.overloaded;
     // The build judged every engine: the row carries its verdict, and a
     // pass finds it as that write left it.
@@ -4475,6 +4647,47 @@ fn a_report_moves_the_count_of_each_pool_its_row_stands_in() {
     assert_eq!(counts(at(6)), (0, 1));
 }
 
+/// One publication that writes two pools takes the list of counts again
+/// where either pool's count moved. A pool whose count stands, written in
+/// the same publication as one whose count moved, does not keep the old
+/// list for both: held in both orders of the two pools.
+#[test]
+fn a_publication_of_two_pools_lists_the_count_that_moved_in_either() {
+    const OTHER: &str = "n";
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let at = |turn: u32| t0 + PUBLISH_WINDOW * turn;
+    let counts = |now: Instant| {
+        let count = |model: &str| {
+            let (asked, mut out) = (ask(now), ViewBuffers::default());
+            let built = store.build_view(model, Role::Single, &asked, &mut out);
+            built.expect("the pool").unreported
+        };
+        (count(MODEL), count(OTHER))
+    };
+    let first = member(&store, "http://a:8000");
+    let second = admit(&store, facts("http://b:8000", Role::Single, &[OTHER]));
+    assert_eq!(counts(t0), (1, 1));
+    store.record(second, 0, load(1, 0), at(1), LoadSource::Stream);
+    assert_eq!(counts(at(1)), (1, 0));
+    // One window holds a first report in the first pool and one more in
+    // the second: the first pool's count moves and the second's stands.
+    let inside = at(1) + Duration::from_millis(1);
+    store.record(first, 0, load(1, 0), inside, LoadSource::Stream);
+    store.record(second, 0, load(2, 0), inside, LoadSource::Stream);
+    store.publish(at(2));
+    assert_eq!(counts(at(2)), (0, 0));
+    // The other order. A member joins the second pool, and one window
+    // holds one more report in the first pool and a first in the second.
+    let third = admit(&store, facts("http://c:8000", Role::Single, &[OTHER]));
+    assert_eq!(counts(at(2)), (0, 1));
+    let inside = at(2) + Duration::from_millis(1);
+    store.record(first, 0, load(2, 0), inside, LoadSource::Stream);
+    store.record(third, 0, load(1, 0), inside, LoadSource::Stream);
+    store.publish(at(3));
+    assert_eq!(counts(at(3)), (0, 0));
+}
+
 /// Where the published rows of the model's single pool stand.
 fn published(world: &World) -> *const Candidate {
     rows_of(world, MODEL).as_ptr()
@@ -4523,7 +4736,7 @@ fn a_pool_every_gateway_reaches_whole_is_lent_where_it_stands_and_copied_when_as
         let bits = |id: WorkerId| {
             let found = view.candidates.iter().find(|row| row.id == id);
             let row = found.expect("a member");
-            (row.health.stalled, row.session_hit)
+            (row.health.breaker_open, row.session_hit)
         };
         assert_eq!((bits(first), bits(second)), ((false, true), (true, false)));
     });
@@ -5135,6 +5348,7 @@ fn a_member_whose_rows_revision_stands_is_carried_and_one_whose_revision_moved_i
         status: WorkerStatus::Ready,
         revision,
         admitted_at: origin,
+        maker: Default::default(),
     };
     let zones = |world: &World| (listed(world, WorkerId(3)).1, listed(world, WorkerId(7)).1);
     let mut writer = Writer::new(PUBLISH_WINDOW, origin);
@@ -5143,44 +5357,62 @@ fn a_member_whose_rows_revision_stands_is_carried_and_one_whose_revision_moved_i
         .apply(lists, 0, std::iter::empty(), |_, _| None)
         .expect("applied");
     let members = [row(3, "east", 1), row(7, "west", 1)];
-    let first = writer.rebuild(1, members.iter(), |_, _| None, Classes::Derive);
+    let first = writer.rebuild(1, members.filed(&writer), |_, _| None, Classes::Derive);
     assert_eq!(zones(&first), (1, 2));
     // The revision is what says a row's facts moved. At a standing revision
     // a member's fields are the last read's, whatever the row states: a
     // store hands no such row, and the case does, to tell a carry from a
     // read.
     let members = [row(3, "west", 1), row(7, "east", 1)];
-    let carried = writer.rebuild(2, members.iter(), |_, _| None, Classes::Derive);
+    let carried = writer.rebuild(2, members.filed(&writer), |_, _| None, Classes::Derive);
     assert_eq!(zones(&carried), (1, 2));
     // At another revision a member is read, and the other is carried.
     let members = [row(3, "west", 1), row(7, "east", 2)];
-    let read = writer.rebuild(3, members.iter(), |_, _| None, Classes::Derive);
+    let read = writer.rebuild(3, members.filed(&writer), |_, _| None, Classes::Derive);
     assert_eq!(zones(&read), (1, 1));
     // An apply whose lists differ reads every member, at any revision and
     // in whatever order the store's table hands them,
     let other = Arc::new(generation_listing(2, &[], &["west", "east"], &[]));
     let members = [row(7, "east", 2), row(3, "east", 1)];
     let (relisted, _) = writer
-        .apply(other, 3, members.iter(), |_, _| None)
+        .apply(other, 3, members.filed(&writer), |_, _| None)
         .expect("applied");
     assert_eq!(zones(&relisted), (2, 2));
     // and the write after it carries that reading.
     let members = [row(3, "west", 1), row(7, "west", 2)];
-    let after = writer.rebuild(4, members.iter(), |_, _| None, Classes::Derive);
+    let after = writer.rebuild(4, members.filed(&writer), |_, _| None, Classes::Derive);
     assert_eq!(zones(&after), (2, 2));
     // A member that leaves takes its entry with it, on either side of a
     // member that stays. One that joins again at the id and the revision
     // it left at is read: no field of its last life is carried.
     let members = [row(7, "west", 2)];
-    let left = writer.rebuild(5, members.iter(), |_, _| None, Classes::Derive);
+    let left = writer.rebuild(5, members.filed(&writer), |_, _| None, Classes::Derive);
     assert_eq!(listed(&left, WorkerId(7)).1, 2);
     let members = [row(3, "west", 1), row(7, "west", 2)];
-    let back = writer.rebuild(6, members.iter(), |_, _| None, Classes::Derive);
+    let back = writer.rebuild(6, members.filed(&writer), |_, _| None, Classes::Derive);
     assert_eq!(zones(&back), (1, 2));
     let members = [row(3, "west", 1)];
-    let left = writer.rebuild(7, members.iter(), |_, _| None, Classes::Derive);
+    let left = writer.rebuild(7, members.filed(&writer), |_, _| None, Classes::Derive);
     assert_eq!(listed(&left, WorkerId(3)).1, 1);
     let members = [row(3, "west", 1), row(7, "west", 2)];
-    let back = writer.rebuild(8, members.iter(), |_, _| None, Classes::Derive);
+    let back = writer.rebuild(8, members.filed(&writer), |_, _| None, Classes::Derive);
     assert_eq!(zones(&back), (1, 1));
+}
+
+/// A side's whole entries are a list of its own, made once at its length.
+/// The last model's side that lists every member is the entries
+/// themselves: none is copied.
+#[test]
+fn the_last_models_side_of_every_member_takes_the_entries_whole() {
+    let mut entries: Vec<u64> = (10..14).collect();
+    let stood = entries.as_ptr();
+    // Some members of the last model, then every member of an earlier one.
+    let some = side_of(&mut entries, &[1, 3], true);
+    assert_eq!((some.as_slice(), some.capacity()), (&[11, 13][..], 2));
+    let every = side_of(&mut entries, &[0, 1, 2, 3], false);
+    assert_eq!(every, [10, 11, 12, 13]);
+    assert!(every.as_ptr() != stood && entries.len() == 4);
+    let whole = side_of(&mut entries, &[0, 1, 2, 3], true);
+    assert_eq!(whole, [10, 11, 12, 13]);
+    assert!(whole.as_ptr() == stood && entries.is_empty());
 }

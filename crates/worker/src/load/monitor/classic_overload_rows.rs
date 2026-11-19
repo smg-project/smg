@@ -240,20 +240,35 @@ fn run(gateway: Thresholds, own: Thresholds, ranks: usize, steps: &[Step]) -> Ve
             match step {
                 Step::Poll(figures) => {
                     let load = answer(ranks, figures);
-                    let named = Some(&load).filter(|load| !load.loads.is_empty());
-                    if let Some(load) = named {
-                        let (newer, _) = monitor.apply_polled_load(URL, load, now);
-                        assert!(newer.is_empty(), "no rank pushed since the poll began");
-                    }
-                    monitor.apply_overload_verdict(&worker, named, "poll");
+                    let asked = format!("{:?}", load.loads);
+                    // The engine's answer as the loop hands it over: to the
+                    // sink and the reports on file under one hold, then to
+                    // the tick's end, where an answer with rows is judged.
                     // An answer with no row is the engine's own word that it
-                    // has no rank: the ranks that pushed before the poll
-                    // leave the worker's pushed report.
-                    if named.is_none() {
-                        monitor.retract_pushed_load(URL, worker.dp_rank(), now);
-                    }
+                    // has no rank: the verdict reads no report, and the
+                    // ranks that pushed before the poll leave the worker's
+                    // pushed report.
+                    let mut engine = vec![(Arc::clone(&worker), Some(load))];
+                    let carries_rank_capacity = monitor.reconcile_engine(&mut engine, now);
+                    let reports: Vec<_> = engine
+                        .into_iter()
+                        .zip(carries_rank_capacity)
+                        .filter_map(|((worker, response), carries_rank_capacity)| {
+                            let load = response.filter(|load| !load.loads.is_empty())?;
+                            assert_eq!(
+                                format!("{:?}", load.loads),
+                                asked,
+                                "no rank pushed since the poll began"
+                            );
+                            Some((worker, load, carries_rank_capacity))
+                        })
+                        .collect();
+                    monitor.end_tick(std::slice::from_ref(&worker), &reports);
                 }
-                Step::NoReport => monitor.apply_overload_verdict(&worker, None, "poll"),
+                Step::NoReport => {
+                    let mut engine = vec![(Arc::clone(&worker), None)];
+                    monitor.reconcile_engine(&mut engine, now);
+                }
                 Step::Record { rank, figures } => {
                     let mut record = PushedRecord::requests(0, count(figures.waiting))
                         .token_usage(figures.usage);

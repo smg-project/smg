@@ -5,10 +5,10 @@ use std::sync::{
     Arc,
 };
 
+use smg_worker::identity::basic::Worker;
 use tracing::warn;
 
 use super::{LoadBalancingPolicy, SelectWorkerInfo};
-use crate::worker::Worker;
 
 /// Passthrough selection policy for single-backend deployments.
 ///

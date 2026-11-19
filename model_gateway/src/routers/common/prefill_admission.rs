@@ -5,12 +5,10 @@ use std::{
 };
 
 use parking_lot::Mutex;
+use smg_worker::identity::basic::{Worker, WorkerLoadGuard};
 use tokio::sync::Notify;
 
-use crate::{
-    observability::metrics::Metrics,
-    worker::{Worker, WorkerLoadGuard},
-};
+use crate::observability::metrics::Metrics;
 
 const HEAD_RECHECK_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -547,8 +545,9 @@ impl Drop for QueueTicket {
 pub(crate) mod test_support {
     use std::sync::Arc;
 
+    use smg_worker::identity::basic::Worker;
+
     use super::{PrefillAdmissionAttempt, PrefillSelectionContext};
-    use crate::worker::Worker;
 
     /// The attempt a test makes when it wants exactly `worker`: it is selected,
     /// with a unit payload, whenever it has capacity.
@@ -569,13 +568,14 @@ mod tests {
     };
 
     use openai_protocol::worker::WorkerStatus;
+    use smg_worker::{health::circuit_breaker::CircuitBreakerConfig, identity::basic::WorkerType};
     use tokio::{
         sync::{mpsc, oneshot},
         task::JoinHandle,
     };
 
     use super::{test_support::select_worker, *};
-    use crate::worker::{BasicWorkerBuilder, CircuitBreakerConfig, WorkerType};
+    use crate::routers::grpc::backend_client::BasicWorkerBuilder;
 
     fn worker(url: &str) -> Arc<dyn Worker> {
         Arc::new(
@@ -1076,7 +1076,9 @@ mod tests {
 
     #[tokio::test]
     async fn an_admitted_prefill_reports_completion_when_its_reservation_drops() {
-        use crate::worker::{BasicWorkerBuilder, RequestCompletionSink, Worker, WorkerType};
+        use smg_worker::identity::basic::{RequestCompletionSink, Worker, WorkerType};
+
+        use crate::routers::grpc::backend_client::BasicWorkerBuilder;
         #[derive(Debug, Default)]
         struct CompletionSpy(std::sync::Mutex<Vec<String>>);
         impl RequestCompletionSink for CompletionSpy {

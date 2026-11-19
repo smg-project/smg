@@ -7,12 +7,8 @@ use std::time::Duration;
 use common::grpc_harness::{
     build_grpc_router, grpc_router_config, grpc_workers, serve_canned_worker, Canned,
 };
-use smg::{
-    middleware::TenantRequestMeta,
-    routers::RouterTrait,
-    tenant::TenantKey,
-    worker::{RuntimeType, WorkerType},
-};
+use smg::{middleware::TenantRequestMeta, routers::RouterTrait, tenant::TenantKey};
+use smg_worker::identity::basic::{RuntimeType, WorkerType};
 
 use super::completion_request;
 use crate::common;

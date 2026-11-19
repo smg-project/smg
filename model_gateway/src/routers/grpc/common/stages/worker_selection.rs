@@ -12,6 +12,7 @@ use axum::{
 };
 use futures::{future::Either, FutureExt};
 use openai_protocol::common::CachePartition;
+use smg_worker::identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType};
 use tracing::{debug, error, warn};
 
 use super::{
@@ -31,6 +32,7 @@ use crate::{
     },
     routers::{
         common::{
+            pair_index::{PdPairIndex, PdWire},
             placement::{
                 self, CandidateFilter, PairFailure, PipelinePin, PlacementFailure, PlacementInputs,
                 RefusalSite,
@@ -40,6 +42,7 @@ use crate::{
                 PrefillCandidateError, PrefillLoadGuard, PrefillSelectionContext,
             },
             retry::mark_non_retryable,
+            snapshot::{ModelWorkerSnapshot, RoutingPool, WorkerRegistry, WorkerRegistryExt},
         },
         error,
         grpc::{
@@ -51,10 +54,6 @@ use crate::{
             multimodal,
         },
         prefill_queue_full, prefill_queue_timeout,
-    },
-    worker::{
-        ConnectionMode, ModelWorkerSnapshot, PdPairIndex, PdWire, RoutingPool, RuntimeType, Worker,
-        WorkerRegistry, WorkerRegistryExt, WorkerType,
     },
 };
 
@@ -2433,8 +2432,14 @@ mod tests {
 
     use axum::http::{header::RETRY_AFTER, StatusCode};
     use llm_tokenizer::TokenizerRegistry;
-    use openai_protocol::{generate::GenerateRequest, worker::HealthCheckConfig};
+    use openai_protocol::{
+        generate::GenerateRequest, model_card::ModelCard, worker::HealthCheckConfig,
+    };
     use smg_grpc_client::vllm_proto as vllm;
+    use smg_worker::{
+        identity::basic::{ConnectionMode, WorkerLoadGuard},
+        test_support::no_health_check,
+    };
 
     use super::*;
     use crate::{
@@ -2450,6 +2455,7 @@ mod tests {
                 retry::is_retryable_response,
             },
             grpc::{
+                backend_client::BasicWorkerBuilder,
                 common::stages::execute_plan,
                 context::{ExecutionPlanKind, PreparationOutput, SharedComponents},
                 proto_wrapper::{ProtoGenerateRequest, ProtoRequest},
@@ -2459,10 +2465,6 @@ mod tests {
             PD_PREFILL_QUEUE_FULL,
         },
         tenant::TenantKey,
-        worker::{
-            test_support::no_health_check, BasicWorkerBuilder, ConnectionMode, ModelCard,
-            WorkerLoadGuard,
-        },
     };
 
     fn retry_after(response: &Response) -> Option<&str> {
@@ -4329,21 +4331,11 @@ mod tests {
         }
     }
 
-    /// Two capable encoders of the pair's runtime, one on the prefill's EC
-    /// connector and one on another: under a rotating encode policy both
-    /// items of a request land on the pairing encoder (the pool is narrowed
-    /// before the policy); without the narrowing the rotation would hand the
-    /// second item to the other encoder.
-    #[test]
-    fn the_encode_assignment_is_narrowed_to_encoders_that_pair_with_the_prefill() {
+    /// A registry of the workers `fleet` names by port, role and EC connector,
+    /// each fit for an EPD set of `model`.
+    fn ec_registry(model: &str, fleet: &[(u16, WorkerType, &str)]) -> Arc<WorkerRegistry> {
         let registry = Arc::new(WorkerRegistry::new());
-        let model = "epd-pairing";
-        for (port, role, connector) in [
-            (8910, WorkerType::Encode, "ECCPUConnector"),
-            (8911, WorkerType::Encode, "ECOtherConnector"),
-            (8912, WorkerType::Prefill, "ECCPUConnector"),
-            (8913, WorkerType::Decode, "ECCPUConnector"),
-        ] {
+        for &(port, role, connector) in fleet {
             registry
                 .register(Arc::new(
                     BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
@@ -4370,6 +4362,26 @@ mod tests {
                 ))
                 .unwrap();
         }
+        registry
+    }
+
+    /// Two capable encoders of the pair's runtime, one on the prefill's EC
+    /// connector and one on another: under a rotating encode policy both
+    /// items of a request land on the pairing encoder (the pool is narrowed
+    /// before the policy); without the narrowing the rotation would hand the
+    /// second item to the other encoder.
+    #[test]
+    fn the_encode_assignment_is_narrowed_to_encoders_that_pair_with_the_prefill() {
+        let model = "epd-pairing";
+        let registry = ec_registry(
+            model,
+            &[
+                (8910, WorkerType::Encode, "ECCPUConnector"),
+                (8911, WorkerType::Encode, "ECOtherConnector"),
+                (8912, WorkerType::Prefill, "ECCPUConnector"),
+                (8913, WorkerType::Decode, "ECCPUConnector"),
+            ],
+        );
         let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
         policies.set_encode_policy(PolicyFactory::create_from_config(&PolicyConfig::RoundRobin));
         let stage = WorkerSelectionStage::new(
@@ -4407,6 +4419,62 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The encode stage reads the hash ring off the generation it holds for
+    /// an encode policy that walks it, and for no other: whether a request
+    /// of two media items filled the ring of the model's generation.
+    #[test]
+    fn the_encode_stage_reads_the_hash_ring_for_a_policy_that_walks_it_alone() {
+        let fills_the_ring = |encode: &PolicyConfig| {
+            let model = "epd-ring";
+            let registry = ec_registry(
+                model,
+                &[
+                    (8920, WorkerType::Encode, "ECCPUConnector"),
+                    (8921, WorkerType::Encode, "ECCPUConnector"),
+                    (8922, WorkerType::Prefill, "ECCPUConnector"),
+                    (8923, WorkerType::Decode, "ECCPUConnector"),
+                ],
+            );
+            let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+            policies.set_encode_policy(PolicyFactory::create_from_config(encode));
+            let stage = WorkerSelectionStage::new(
+                Arc::clone(&registry),
+                Arc::new(policies),
+                WorkerSelectionMode::EncodePrefillDecode,
+                None,
+            );
+            let (encoders, ..) = stage
+                .select_encode_prefill_decode_workers(
+                    model,
+                    PlacementInputs::default(),
+                    &[vec![1], vec![2]],
+                    EpdDemands {
+                        wire: None,
+                        encode: MediaDemands {
+                            media_refs: false,
+                            vision: true,
+                            pipeline: PipelinePin::Any,
+                        },
+                        decode_vision: false,
+                        image_fanout: true,
+                    },
+                    None,
+                )
+                .unwrap_or_else(|_| panic!("the EPD set is selected"));
+            assert_eq!(encoders.len(), 2);
+            registry.get_routing_snapshot(model).hash_ring_is_filled()
+        };
+
+        assert!(
+            !fills_the_ring(&PolicyConfig::RoundRobin),
+            "the encode policy walks no ring"
+        );
+        assert!(
+            fills_the_ring(&PolicyConfig::ConsistentHashing),
+            "the encode policy walks the ring"
+        );
     }
 
     /// EPD selects a compatible EC consumer even with mixed runtimes and connectors.
@@ -5286,12 +5354,12 @@ mod tests {
         let refs_with_vision = [
             ("mm_processor", "inprocess"),
             ("mm_media_ref_schemes", "http,https,data"),
-            (multimodal::SUPPORTS_VISION_LABEL, "true"),
+            (smg_worker::labels::SUPPORTS_VISION_LABEL, "true"),
         ];
         let refs_without_vision = [
             ("mm_processor", "inprocess"),
             ("mm_media_ref_schemes", "http,https,data"),
-            (multimodal::SUPPORTS_VISION_LABEL, "false"),
+            (smg_worker::labels::SUPPORTS_VISION_LABEL, "false"),
         ];
         let worker_registry = Arc::new(WorkerRegistry::new());
         let stage = regular_stage(Arc::clone(&worker_registry));
@@ -5407,7 +5475,7 @@ mod tests {
             let labels = [
                 ("mm_processor", "inprocess"),
                 ("mm_media_ref_schemes", "http,https,data"),
-                (multimodal::SUPPORTS_VISION_LABEL, verdict),
+                (smg_worker::labels::SUPPORTS_VISION_LABEL, verdict),
             ];
             registry
                 .register(regular_worker(url, "test-model", &labels))
@@ -5691,12 +5759,12 @@ mod tests {
         let pipeline_without_vision = [
             ("mm_processor", multimodal::GATEWAY_PIPELINE_PROCESSOR),
             ("mm_media_ref_schemes", "http,https,data"),
-            (multimodal::SUPPORTS_VISION_LABEL, "false"),
+            (smg_worker::labels::SUPPORTS_VISION_LABEL, "false"),
         ];
         let engine_with_vision = [
             ("mm_processor", "inprocess"),
             ("mm_media_ref_schemes", "http,https,data"),
-            (multimodal::SUPPORTS_VISION_LABEL, "true"),
+            (smg_worker::labels::SUPPORTS_VISION_LABEL, "true"),
         ];
         let worker_registry = Arc::new(WorkerRegistry::new());
         for (url, worker_type, labels) in [
@@ -6088,7 +6156,7 @@ mod tests {
         ];
         let refs_with = |verdict: &'static str| -> Vec<(&'static str, &'static str)> {
             let mut labels = REFS.to_vec();
-            labels.push((multimodal::SUPPORTS_VISION_LABEL, verdict));
+            labels.push((smg_worker::labels::SUPPORTS_VISION_LABEL, verdict));
             labels
         };
         let model_id = "test-model-vision-prefill-refs";
@@ -6151,7 +6219,7 @@ mod tests {
         ];
         let refs_with = |verdict: &'static str| -> Vec<(&'static str, &'static str)> {
             let mut labels = REFS.to_vec();
-            labels.push((multimodal::SUPPORTS_VISION_LABEL, verdict));
+            labels.push((smg_worker::labels::SUPPORTS_VISION_LABEL, verdict));
             labels
         };
         let model_id = "test-model-vision-prefill-refs-refusal";
@@ -6546,7 +6614,7 @@ mod tests {
                         .worker_type(WorkerType::Regular)
                         .runtime_type(RuntimeType::Vllm)
                         .connection_mode(ConnectionMode::Grpc)
-                        .label(multimodal::SUPPORTS_VISION_LABEL, vision)
+                        .label(smg_worker::labels::SUPPORTS_VISION_LABEL, vision)
                         .health_config(no_health_check())
                         .build(),
                 );
@@ -6613,8 +6681,9 @@ mod tests {
 
     /// The vision verdict of a worker without the encoder, of one with it,
     /// and of one whose servicer gave none.
-    const NO_VISION_ENCODER: &[(&str, &str)] = &[(multimodal::SUPPORTS_VISION_LABEL, "false")];
-    const VISION_ENCODER: &[(&str, &str)] = &[(multimodal::SUPPORTS_VISION_LABEL, "true")];
+    const NO_VISION_ENCODER: &[(&str, &str)] =
+        &[(smg_worker::labels::SUPPORTS_VISION_LABEL, "false")];
+    const VISION_ENCODER: &[(&str, &str)] = &[(smg_worker::labels::SUPPORTS_VISION_LABEL, "true")];
     const UNLABELED: &[(&str, &str)] = &[];
 
     /// A gRPC worker of `worker_type`, with `labels`.
@@ -6890,7 +6959,7 @@ mod tests {
         ];
         let refs_with = |verdict: &'static str| -> Vec<(&'static str, &'static str)> {
             let mut labels = REFS.to_vec();
-            labels.push((multimodal::SUPPORTS_VISION_LABEL, verdict));
+            labels.push((smg_worker::labels::SUPPORTS_VISION_LABEL, verdict));
             labels
         };
         let model_id = "test-model-vision-decode-refs";

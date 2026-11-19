@@ -79,7 +79,7 @@ pub(crate) use assemble::{
 };
 pub(crate) use capability::{
     ensure_backend_supports_modalities, ensure_model_accepts_media, fleet_reads_format,
-    request_needs_vision, worker_language_model_only, SUPPORTS_VISION_LABEL,
+    request_needs_vision, worker_language_model_only,
 };
 pub(crate) use config::{
     load_image_preprocessor_config, load_video_preprocessor_config, MultimodalComponents,

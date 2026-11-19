@@ -14,11 +14,12 @@ use std::{
 use rustls::crypto::ring;
 use smg_policy_controller::proto::{
     self,
+    decline::Reason,
     policy_plugin_server::{PolicyPlugin, PolicyPluginServer},
 };
 use tokio::{
     net::{TcpListener, UnixListener},
-    sync::mpsc,
+    sync::{mpsc, Semaphore},
     task::JoinSet,
 };
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream, UnixListenerStream};
@@ -48,6 +49,8 @@ pub enum Behaviour {
     /// A score that rises with the row's in-flight count: the most loaded
     /// row scores highest, the opposite of the built-in scorer.
     ScoreMostLoaded,
+    /// Honest scores with a tie band in thousandths.
+    ScoreBand(u16),
     /// Declines these stages for this reason and answers the rest.
     Decline { stages: u32, reason: i32 },
     /// Answers with no field at all.
@@ -62,6 +65,16 @@ pub enum Behaviour {
     ScoreCount,
     /// A score that is not a number.
     ScoreNan,
+    /// A band that is not a number.
+    BandNan,
+    /// A band above one.
+    BandAboveOne,
+    /// A band below zero.
+    BandBelowZero,
+    /// A band with a named decline of the scorer.
+    BandWithScoreDecline,
+    /// A band without scores.
+    BandWithoutScores,
     /// A pick outside the plugin's own survivors.
     PickOutsideOwnSurvivors,
     /// Asked for the pick alone: a row the frame marked as dropped.
@@ -74,6 +87,29 @@ pub enum Behaviour {
     EndStream,
 }
 
+/// A gate a hello's ack waits at until a case opens it: an order two
+/// streams settle in is the case's own, at any load.
+#[derive(Clone, Debug)]
+pub struct Gate(Arc<Semaphore>);
+
+impl Default for Gate {
+    fn default() -> Self {
+        Self(Arc::new(Semaphore::new(0)))
+    }
+}
+
+impl Gate {
+    /// Every ack that waits here goes, and a later one does not wait.
+    pub fn open(&self) {
+        self.0.close();
+    }
+
+    async fn opened(&self) {
+        // No permit is ever given: the wait ends when the gate is closed.
+        let _ = self.0.acquire().await;
+    }
+}
+
 /// How the plugin answers; a test changes it between decisions.
 #[derive(Clone, Debug)]
 pub struct Script {
@@ -82,6 +118,8 @@ pub struct Script {
     pub delay: Duration,
     /// Waits this long before the hello's ack.
     pub hello_delay: Duration,
+    /// When set: the hello's ack waits until the gate is opened.
+    pub hello_gate: Option<Gate>,
     /// The ack: `ok`, its error, the version it names and the stages it
     /// claims.
     pub ack_ok: bool,
@@ -106,6 +144,7 @@ impl Default for Script {
             behaviour: Behaviour::Honest,
             delay: Duration::ZERO,
             hello_delay: Duration::ZERO,
+            hello_gate: None,
             ack_ok: true,
             ack_error: String::new(),
             ack_protocol: 1,
@@ -194,6 +233,7 @@ fn honest(frame: &proto::PluginDecide) -> proto::PluginDecision {
         pick: if asked & PICK != 0 { pick } else { None },
         decline: None,
         counters: Vec::new(),
+        tie_band: None,
     }
 }
 
@@ -223,6 +263,7 @@ fn answer(frame: &proto::PluginDecide, script: &Script) -> Option<proto::PluginD
                 *score = c.in_flight as f32 / most as f32;
             }
         }
+        Behaviour::ScoreBand(band) => out.tie_band = Some(f32::from(band) / 1_000.0),
         Behaviour::Decline { stages, reason } => {
             if stages & FILTER != 0 {
                 out.survivors = None;
@@ -265,6 +306,22 @@ fn answer(frame: &proto::PluginDecide, script: &Script) -> Option<proto::PluginD
                 *first = f32::NAN;
             }
         }
+        Behaviour::BandNan => out.tie_band = Some(f32::NAN),
+        Behaviour::BandAboveOne => out.tie_band = Some(1.375),
+        Behaviour::BandBelowZero => out.tie_band = Some(-0.375),
+        Behaviour::BandWithScoreDecline => {
+            out.scores.clear();
+            out.tie_band = Some(0.0625);
+            out.decline = Some(proto::Decline {
+                stage: SCORE,
+                reason: Reason::NotApplicable as i32,
+                detail: String::new(),
+            });
+        }
+        Behaviour::BandWithoutScores => {
+            out.scores.clear();
+            out.tie_band = Some(0.8125);
+        }
         Behaviour::PickOutsideOwnSurvivors => {
             out.survivors = Some(proto::Survivors { positions: vec![0] });
             out.pick = Some(1);
@@ -282,7 +339,7 @@ fn answer(frame: &proto::PluginDecide, script: &Script) -> Option<proto::PluginD
         Behaviour::DeclinedAndAnswered => {
             out.decline = Some(proto::Decline {
                 stage: FILTER,
-                reason: proto::decline::Reason::NotApplicable as i32,
+                reason: Reason::NotApplicable as i32,
                 detail: String::new(),
             });
         }
@@ -322,6 +379,9 @@ impl PolicyPlugin for Shared {
                     Some(proto::plugin_request::Request::Hello(hello)) => {
                         lock(&shared.seen).hellos.push(hello);
                         pause(script.hello_delay).await;
+                        if let Some(gate) = &script.hello_gate {
+                            gate.opened().await;
+                        }
                         let ack = proto::PluginHelloAck {
                             protocol: script.ack_protocol,
                             ok: script.ack_ok,

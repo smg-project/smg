@@ -8,8 +8,17 @@ use std::{
 
 use dashmap::DashMap;
 use http::{header::HeaderName, HeaderMap};
+#[cfg(test)]
+use openai_protocol::UNKNOWN_MODEL_ID;
 use parking_lot::{Mutex, RwLock};
 use rustc_hash::FxBuildHasher;
+use smg_worker::{
+    identity::{
+        basic::{RequestCompletionSink, Worker, WorkerType},
+        endpoint::Endpoint,
+    },
+    load::{monitor::LoadConsumer, state::LoadReceiver},
+};
 use tracing::{debug, info, warn};
 
 /// Policy Registry for managing model-to-policy mappings
@@ -26,19 +35,16 @@ use super::{
     normalize_model_key, DPRankLoadPolicy, LoadBalancingPolicy, ManualConfig, ManualPolicy,
     PolicyFactory, SelectWorkerInfo, WorkerRole,
 };
-#[cfg(test)]
-use crate::worker::UNKNOWN_MODEL_ID;
 use crate::{
     config::types::{ManualAssignmentMode, PdPairingMode, PolicyConfig, RoutingKeyOverrideConfig},
     mesh::adapters::TreeSyncAdapter,
     observability::{cache_trace, metrics::Metrics},
-    routers::common::header_utils::{
-        extract_routing_key_hint_named, parse_routing_tokens_hint, ROUTING_KEY_HINT_MAX_BYTES,
-    },
-    worker::{
-        identity::endpoint::Endpoint, load::state::LoadReceiver, KvEventMonitor, LoadConsumer,
-        ModelWorkerSnapshot, RequestCompletionSink, Worker, WorkerRegistry, WorkerRegistryExt,
-        WorkerType,
+    policies::kv_index::event_monitor::KvEventMonitor,
+    routers::common::{
+        header_utils::{
+            extract_routing_key_hint_named, parse_routing_tokens_hint, ROUTING_KEY_HINT_MAX_BYTES,
+        },
+        snapshot::{ModelWorkerSnapshot, WorkerRegistry, WorkerRegistryExt},
     },
 };
 
@@ -278,9 +284,12 @@ impl PolicyRegistry {
     /// The consistent-hash ring `model_id`'s requests are placed on: the
     /// ring of the generation the registry holds for the model, `None` for a
     /// model nobody serves. The model-less id reads the ring over every
-    /// worker, the candidates of a request that names no model. A caller
-    /// holding a client's name for the model resolves it at request entry,
-    /// as for the registry's other reads by model.
+    /// worker, the candidates of a request that names no model. While that
+    /// generation's ring is filled it is the ring kept from another
+    /// generation, and `None` before the model's first ring
+    /// ([`KeptRings::of`]). A caller holding a client's name for the model
+    /// resolves it at request entry, as for the registry's other reads by
+    /// model.
     pub(crate) fn hash_ring(
         &self,
         registry: &WorkerRegistry,
@@ -290,14 +299,24 @@ impl PolicyRegistry {
             .of(model_id, &registry.get_routing_snapshot(model_id))
     }
 
-    /// [`Self::hash_ring`] of a generation the caller holds, so the ring and
-    /// what else it reads of the generation are of one membership.
+    /// [`Self::hash_ring`] for a generation the caller holds: no second read
+    /// of the registry, and that generation's own ring once it is filled.
     pub(crate) fn hash_ring_of(
         &self,
         model_id: &str,
         generation: &ModelWorkerSnapshot,
     ) -> Option<Arc<HashRing>> {
         self.rings.of(model_id, generation)
+    }
+
+    /// Whether the hash rings have followed the membership: a request
+    /// placed now walks the ring of its own generation. After a membership
+    /// change, that holds again within one fill of the task that keeps the
+    /// rings warm. For a caller that changed the membership and waits for
+    /// the placements to follow, as a test bed does.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn hash_rings_are_current(&self, registry: &WorkerRegistry) -> bool {
+        self.rings.are_current(registry)
     }
 
     /// Starts the task that fills the hash rings off the request path
@@ -1209,6 +1228,11 @@ impl LoadConsumer for PolicyRegistry {
 #[cfg(test)]
 mod tests {
     use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
+    use smg_worker::{
+        identity::basic::{Worker, WorkerLoadGuard, WorkerType},
+        load::state::LoadSnapshot,
+        test_support::ready_worker,
+    };
     use tokio::sync::watch;
     use tracing_test::traced_test;
 
@@ -1218,11 +1242,7 @@ mod tests {
             hash_ring::HashRing, test_support::headers_with_routing_key, BucketConfig,
             BucketPolicy, CacheAwareConfig, CacheAwarePolicy, LeastLoadPolicy, SelectWorkerInfo,
         },
-        worker::{
-            load::state::LoadSnapshot,
-            test_support::{ready_worker, worker_of},
-            Worker, WorkerLoadGuard, WorkerType,
-        },
+        routers::common::snapshot::test_support::worker_of,
     };
 
     /// The static needs the host answers before any request exists: a
@@ -2600,7 +2620,7 @@ mod tests {
     fn hinted_policy_publication_races_integration_setter() {
         use std::sync::Barrier;
 
-        use crate::worker::KvEventMonitor;
+        use crate::policies::kv_index::event_monitor::KvEventMonitor;
 
         const ADDERS: usize = 4;
 
@@ -2650,7 +2670,7 @@ mod tests {
 
         use smg_mesh::MeshKV;
 
-        use crate::{mesh::MeshAdapters, worker::WorkerRegistry};
+        use crate::{mesh::MeshAdapters, routers::common::snapshot::WorkerRegistry};
 
         let registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
         registry.set_kv_event_monitor(Some(Arc::new(KvEventMonitor::new())));
@@ -2849,7 +2869,9 @@ mod tests {
 
     #[test]
     fn completion_sink_reports_to_the_policy_that_owns_the_worker_type() {
-        use crate::worker::{BasicWorkerBuilder, WorkerLoadGuard};
+        use smg_worker::identity::basic::WorkerLoadGuard;
+
+        use crate::routers::grpc::backend_client::BasicWorkerBuilder;
 
         let registry = Arc::new(PolicyRegistry::new(PolicyConfig::Random));
         let prefill_policy = Arc::new(CompletionRecorder::default());
@@ -2899,7 +2921,9 @@ mod tests {
 
     #[test]
     fn reconcile_in_flight_reaches_the_policy_that_owns_the_worker_type() {
-        use crate::worker::{BasicWorkerBuilder, WorkerLoadGuard};
+        use smg_worker::identity::basic::WorkerLoadGuard;
+
+        use crate::routers::grpc::backend_client::BasicWorkerBuilder;
 
         let registry = Arc::new(PolicyRegistry::new(PolicyConfig::Random));
         let decode_policy = Arc::new(CompletionRecorder::default());

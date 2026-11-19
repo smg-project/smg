@@ -34,9 +34,15 @@ use smg_data_connector::{
     MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage, ResponseId,
 };
 use smg_grpc_client::{
-    common_proto as common, constraint_failed_status, tokenspeed_proto as ts, vllm_proto,
+    common_proto as common, constraint_failed_status, engine_labels::ModelInfo,
+    tokenspeed_proto as ts, vllm_proto,
 };
 use smg_mcp::{McpConfig, McpOrchestrator};
+use smg_worker::{
+    health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
+    identity::basic::{ConnectionMode, RequestCompletionSink, RuntimeType, Worker, WorkerType},
+    labels::SUPPORTS_VISION_LABEL,
+};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{transport::Server, Request as TonicRequest, Response as TonicResponse, Status};
@@ -53,16 +59,13 @@ use crate::{
             test_support::fast_retry_config,
         },
         grpc::{
-            client::ModelInfo,
+            backend_client::BasicWorkerBuilder,
             common::responses::{
                 background::{queued_response, store_record},
                 BackgroundResponses, BackgroundStream,
             },
             harmony::serve_harmony_responses_stream,
-            multimodal::{
-                MultimodalComponents, MultimodalConfigRegistry, MultimodalSettings,
-                SUPPORTS_VISION_LABEL,
-            },
+            multimodal::{MultimodalComponents, MultimodalConfigRegistry, MultimodalSettings},
             proto_wrapper::ENGINE_ERROR_MESSAGE,
             regular::{
                 responses::{route_responses, route_responses_background_stream},
@@ -75,10 +78,6 @@ use crate::{
         },
     },
     tenant::TenantKey,
-    worker::{
-        health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
-        BasicWorkerBuilder, ConnectionMode, RequestCompletionSink, RuntimeType, Worker, WorkerType,
-    },
 };
 
 const MODEL: &str = "request-release-test-model";
@@ -652,9 +651,7 @@ async fn image_to_a_worker_without_a_vision_verdict_is_not_refused() {
 async fn image_to_an_sglang_worker_that_carries_no_media_is_refused_before_dispatch() {
     use std::collections::BTreeMap;
 
-    use smg_grpc_client::sglang_proto;
-
-    use crate::routers::grpc::client::ServerInfo;
+    use smg_grpc_client::{engine_labels::ServerInfo, sglang_proto};
 
     let mut merged = ModelInfo::Sglang(Box::default()).to_labels();
     merged.extend(
@@ -3942,9 +3939,10 @@ async fn a_request_that_completes_before_the_request_timeout_is_unchanged() {
 #[cfg(unix)]
 #[tokio::test]
 async fn a_refused_dial_is_answered_without_the_workers_address() {
+    use smg_worker::test_support::RefusedAddress;
     use tokio::sync::oneshot;
 
-    use crate::{routers::grpc::test_engine::serve_until, worker::test_support::RefusedAddress};
+    use crate::routers::grpc::test_engine::serve_until;
 
     // The worker comes up on a port that stays taken after it: the port
     // refuses again once the worker's listener is gone.

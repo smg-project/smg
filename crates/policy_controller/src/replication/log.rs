@@ -44,6 +44,10 @@ pub enum Event {
     /// head of a store that leads is never under term `0`, and how a
     /// follower of the log learns the term before the leader's next write.
     Term,
+    /// A generation applied, by its number: one of the watched kinds, and
+    /// told to no watch. The document it runs from is its door's to hold,
+    /// never the log's: an apply costs the ring one small entry.
+    Generation { generation: u64 },
 }
 
 /// An event at its place in the history.
@@ -316,12 +320,13 @@ impl Ring {
 ///
 /// The bound in bytes: a slot is at most 120 bytes whatever the event. A
 /// load row is its slot alone: 65,536 of them are 7.9 MB, held from the
-/// start. A membership event's rows stand apart from its slot, 320 bytes a
-/// row and its strings: about 0.51 KB an event at a row of a short URL, one
+/// start. A membership event's rows stand apart from its slot, 328 bytes a
+/// row and its strings: about 0.52 KB an event at a row of a short URL, one
 /// model, no label, no pairing descriptor and no encode connector, a second
 /// row for a replacement, so 4,096 membership events are about 2.1 MB at
 /// that row. A pairing descriptor stands apart from its row, 168 bytes and
-/// its strings, held once for every copy of that row.
+/// its strings, held once for every copy of that row, and so does a
+/// provider's key, 64 bytes and its strings.
 ///
 /// The fields stand in the order written (`repr(C)`), the lock first: a
 /// read addresses the ring off the log's own pointer, whatever the ring's
@@ -669,6 +674,11 @@ impl Log {
                 let term = self.own(&ring);
                 let mut seq = ring.head.seq + 1;
                 if term == 0 {
+                    // A generation applied under no term takes no place:
+                    // the take that starts a term tells the standing one.
+                    if matches!(event, Event::Generation { .. }) {
+                        return;
+                    }
                     // Its number is the write's whole name: past the head,
                     // and past every own write a restart left above it.
                     seq = ring.fresh(seq);
@@ -962,6 +972,10 @@ impl Journal for Log {
         );
     }
 
+    fn generation(&self, at: Option<Position>, generation: u64) {
+        self.push(at, Event::Generation { generation });
+    }
+
     fn term_rose(&self, term: u64) {
         let mut ring = self.ring.lock();
         if term <= self.term.load(Ordering::Relaxed) {
@@ -1026,6 +1040,8 @@ mod tests {
     const TERM: u32 = u32::MAX;
     /// The mark a membership event reads as, above its epoch.
     const MEMBER: u32 = 1_000_000;
+    /// A generation's mark: its number above this.
+    const GENERATION: u32 = 2_000_000;
 
     /// A load row of the store's own, marked by its `running`.
     fn load(log: &Log, running: u32) {
@@ -1078,6 +1094,9 @@ mod tests {
                     MEMBER + u32::try_from(*epoch).expect("a test's epoch")
                 }
                 Event::Term => TERM,
+                Event::Generation { generation } => {
+                    GENERATION + u32::try_from(*generation).expect("a test's generation")
+                }
             })
             .collect()
     }
@@ -1134,6 +1153,9 @@ mod tests {
                     follower.load(Some(entry.at), *id, *rank, sample);
                 }
                 Event::Term => follower.term_followed(entry.at),
+                Event::Generation { generation } => {
+                    follower.generation(Some(entry.at), *generation);
+                }
                 Event::Member {
                     epoch,
                     change,
@@ -1153,11 +1175,13 @@ mod tests {
 
     #[test]
     fn a_slot_is_at_most_120_bytes_and_a_membership_row_stands_apart() {
-        // The log's bound in bytes is told from these two: a ring's slots,
-        // and apart from its slot a membership event's rows (two for a
-        // replacement), each with its strings.
+        // The log's bound in bytes is told from these: a ring's slots, and
+        // apart from its slot a membership event's rows (two for a
+        // replacement), each with its strings. A provider's key stands
+        // apart from its row, behind a pointer's two counts.
         assert!(size_of::<Entry>() <= 120);
-        assert!(size_of::<WorkerRow>() <= 320);
+        assert!(size_of::<WorkerRow>() <= 328);
+        assert!(size_of::<crate::store::ProviderKey>() + 2 * size_of::<usize>() <= 64);
     }
 
     #[test]

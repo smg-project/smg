@@ -342,6 +342,34 @@ fn a_mixed_answer_marks_the_rank_left_out_of_each_engine_it_names() {
 }
 
 #[test]
+fn an_answer_that_passes_a_row_of_two_engines_over_marks_the_rank_each_left_out() {
+    // Two engines, and a rank of each pushes as a poll begins. The poll's
+    // answer brings a row for each rank that pushed and leaves each
+    // engine's other rank out: both rows are passed over, and each names
+    // its own engine.
+    let (store, t0, zero, one) = two_ranks();
+    let [far_zero, far_one] = [0, 1].map(|rank| rank_of(&store, OTHER, rank));
+    names_both(&store, far_zero, far_one, t0);
+    store.record(one, 1, load(2, 0), t0, LoadSource::Stream);
+    store.record(far_one, 1, load(2, 0), t0, LoadSource::Stream);
+    let passed = store.report(
+        &[
+            (zero, 0, None),
+            (one, 1, Some(load(2, 0))),
+            (far_zero, 0, None),
+            (far_one, 1, Some(load(2, 0))),
+        ],
+        t0,
+        LoadSource::Poll,
+    );
+    assert_eq!(passed, [1, 3], "both rows are passed over");
+    let mut left_out = [zero, far_zero];
+    left_out.sort_unstable();
+    assert_eq!(overloaded(&store, t0), left_out);
+    assert_eq!(store.unnamed_ranks(), 2);
+}
+
+#[test]
 fn the_word_that_no_report_came_moves_no_mark() {
     let (store, t0, zero, one) = two_ranks();
     let nobody = [(zero, 0, None), (one, 1, None)];

@@ -7,35 +7,41 @@ use openai_protocol::{
     model_card::ModelCard,
     model_type::ModelType,
     worker::{ConstrainedDecoding, HealthCheckConfig, MmProcessingMode, WorkerSpec, WorkerType},
+    UNKNOWN_MODEL_ID,
+};
+use smg_worker::{
+    health::{circuit_breaker::CircuitBreakerConfig, resilience::resolve_resilience},
+    identity::{
+        basic::{
+            merge_labels, ConnectionMode, RuntimeType, Worker, CONTEXT_WINDOW_LABELS, WINDOW_LABELS,
+        },
+        endpoint::Endpoint,
+        metadata::join_base,
+    },
+    labels::SUPPORTS_VISION_LABEL,
+    workflow::{DpInfo, WorkerKind},
 };
 use tracing::{debug, warn};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
-use super::discover_dp::DpInfo;
 use crate::{
     admin::worker_service::{control_character_refusal, logged_strings},
     config::ParserChoice,
-    routers::grpc::{
-        multimodal::{
-            mm_settings, pool_processes_media_refs, registration_lacks_media_processing,
-            SUPPORTS_VISION_LABEL,
+    routers::{
+        common::snapshot::WorkerRegistry,
+        grpc::{
+            backend_client::BasicWorkerBuilder,
+            multimodal::{
+                mm_settings, pool_processes_media_refs, registration_lacks_media_processing,
+            },
+            regular::symphony::{
+                check_names, labels_select_nothing, set_aside_by_the_registry, table_label_read,
+            },
+            utils::{ModelNames, Names},
+            zmq_client::zmq_handshake_address,
         },
-        regular::symphony::{
-            check_names, labels_select_nothing, set_aside_by_the_registry, table_label_read,
-        },
-        utils::{ModelNames, Names},
-        zmq_client::zmq_handshake_address,
     },
-    worker::{
-        health::{circuit_breaker::CircuitBreakerConfig, resilience::resolve_resilience},
-        identity::{
-            basic::{merge_labels, RuntimeType, CONTEXT_WINDOW_LABELS, WINDOW_LABELS},
-            endpoint::Endpoint,
-            metadata::join_base,
-        },
-        BasicWorkerBuilder, ConnectionMode, Worker, WorkerRegistry, UNKNOWN_MODEL_ID,
-    },
-    workflow::data::{WorkerKind, WorkerRegistrationMode, WorkerWorkflowData},
+    workflow::data::{WorkerRegistrationMode, WorkerWorkflowData},
 };
 
 /// Step 3: Create worker object(s) with merged configuration + metadata.
@@ -54,7 +60,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
         let config = &context.data.config;
         let app_context = context
             .data
-            .app_context
+            .host
             .as_ref()
             .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
         let connection_mode =
@@ -275,7 +281,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
         // names are, and published by the registration step once the worker
         // is in the registry, so a registration refused there leaves no
         // series behind.
-        context.data.symphony_table = symphony_table_of(
+        context.data.host_notes.symphony_table = symphony_table_of(
             &model_card,
             app_context.router_config.parser,
             *connection_mode,
@@ -356,7 +362,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
                 // Promotion can be event-driven: a ZMQ worker signals the
                 // manager the instant its handshake completes, and any worker
                 // demoted by health is signalled on its first successful
-                // contact (see `worker::health::liveness`), so every worker gets the
+                // contact (see `smg_worker::health::liveness`), so every worker gets the
                 // registry's connect signal.
                 builder =
                     builder.connect_signal_tx(app_context.worker_registry.connect_signal_sender());
@@ -1118,7 +1124,7 @@ fn attention_dp_width(labels: &HashMap<String, String>, size: usize) -> Option<u
 /// one dp-annotated worker per rank. A width-1 advertisement (older
 /// servicers emit it as a capability signal) and a missing one both
 /// register a plain worker: there is no placement to choose, and pinning
-/// rank 0 anyway still alters engine-side scheduling. discover_dp already
+/// rank 0 anyway still alters engine-side scheduling. The DP read already
 /// logged the degradation for the missing-label case.
 fn dp_rank_expansion(
     dp_info: Option<&DpInfo>,
@@ -1164,15 +1170,11 @@ fn validate_zmq_dp(
 
 #[cfg(test)]
 mod tests {
+    use smg_worker::{identity::basic::DEFAULT_BOOTSTRAP_PORT, test_support::RefusedAddress};
     use tracing_test::traced_test;
 
     use super::*;
-    use crate::{
-        app_context::AppContext,
-        config::RouterConfig,
-        server::http_client,
-        worker::{test_support::RefusedAddress, DEFAULT_BOOTSTRAP_PORT},
-    };
+    use crate::{app_context::AppContext, config::RouterConfig, server::http_client};
 
     /// The parser-override warning skips the worker itself when it is replaced
     /// at an address registered with a trailing slash: the registry's key keeps
@@ -1266,7 +1268,7 @@ mod tests {
             CreateLocalWorkerStep.execute(&mut ctx).await.unwrap(),
             StepResult::Success
         );
-        assert_eq!(ctx.data.symphony_table, Some("qwen3"));
+        assert_eq!(ctx.data.host_notes.symphony_table, Some("qwen3"));
         assert!(RegisterWorkersStep.execute(&mut ctx).await.is_err());
         assert!(
             !handle.render().contains("smg_symphony_"),
@@ -1280,7 +1282,7 @@ mod tests {
             CreateLocalWorkerStep.execute(&mut ctx).await.unwrap(),
             StepResult::Success
         );
-        assert_eq!(ctx.data.symphony_table, Some("qwen3"));
+        assert_eq!(ctx.data.host_notes.symphony_table, Some("qwen3"));
         assert_eq!(
             RegisterWorkersStep.execute(&mut ctx).await.unwrap(),
             StepResult::Success
@@ -2565,9 +2567,8 @@ mod tests {
     /// carries no override, and its grammar start reads as advertised.
     #[test]
     fn an_engines_advertised_reasoning_parser_is_not_a_parser_override() {
+        use smg_grpc_client::engine_labels::ServerInfo;
         use tool_parser::GrammarStart;
-
-        use crate::routers::grpc::client::ServerInfo;
 
         let tool_factory = tool_parser::ParserFactory::default();
         let reasoning_factory = reasoning_parser::ParserFactory::default();
@@ -2712,13 +2713,16 @@ mod tests {
 mod rank_window_tests {
     use std::collections::HashMap;
 
-    use smg_grpc_client::tokenspeed_proto;
+    use smg_grpc_client::{engine_labels::ServerInfo, tokenspeed_proto};
+    use smg_worker::{
+        identity::basic::{merge_labels, ConnectionMode, Worker},
+        workflow::dp_info_from_labels,
+    };
 
     use super::{dp_rank_expansion, labels_for_rank};
     use crate::{
-        routers::grpc::client::ServerInfo,
-        worker::{identity::basic::merge_labels, BasicWorkerBuilder, ConnectionMode, Worker},
-        workflow::steps::local::{discover_dp::dp_info_from_labels, test_support::labels_of},
+        routers::grpc::backend_client::BasicWorkerBuilder,
+        workflow::steps::local::test_support::labels_of,
     };
 
     #[test]

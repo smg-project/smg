@@ -24,10 +24,11 @@ use std::{
 
 use openai_protocol::model_card::ModelCard;
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
-use smg::{
-    routers::grpc::utils::ParserResolver,
-    worker::{BasicWorkerBuilder, WorkerRegistry, WorkerType},
+use smg::routers::{
+    common::snapshot::WorkerRegistry,
+    grpc::{backend_client::BasicWorkerBuilder, utils::ParserResolver},
 };
+use smg_worker::identity::basic::WorkerType;
 use tool_parser::ParserFactory as ToolParserFactory;
 
 thread_local! {

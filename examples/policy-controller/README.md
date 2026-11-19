@@ -46,8 +46,11 @@ instead ([`wasm-guest-policy`](../wasm/wasm-guest-policy)).
 1. Write the stage. Implement `Scorer`, `Filter` or `Picker` for a type of
    yours. A scorer writes one score for each row it is handed, from 0 to 1
    with higher better, and allocates nothing. A stage declares what it reads
-   in `needs`: `Pack` declares the load reports. A stage that keeps no state
-   takes every default of `Lifecycle`.
+   in `needs`: `Pack` declares the load reports. A stage that only places
+   says so in `refuses_by_reports`, as `Pack` does. A stage that says nothing
+   is taken as one that may refuse a request by its gateways' reports of
+   leases, and each decision under it applies those reports first. A stage
+   that keeps no state takes every default of `Lifecycle`.
 2. Register it. Start from `Catalog::builtin()` and add the stage under a new
    name with `scorer`, `filter` or `picker`. The name must be free among the
    built-ins and across the three kinds, and it must be the name the stage
@@ -80,7 +83,7 @@ with no error: a stage over one ties or keeps every worker.
 
 | A stage reads | Where it comes from | In this controller today |
 |---|---|---|
-| `Candidate::health` | The prober's status of the worker, the pool's circuit breaker and the overload verdict on its engine's load reports. | The prober's status, and a stall where a veto of the asking gateway stands. The breaker is not fed yet and reads as clear. The overload bit reads as clear unless the store judges the engine's load reports over a threshold. |
+| `Candidate::health` | The prober's status of the worker, the pool's circuit breaker and the overload verdict on its engine's load reports. | The prober's status, and a stall where a veto of the asking gateway stands. The breaker bit reads as open where that veto holds, as the gateway's own open breaker does, and as clear everywhere else: the controller keeps no breaker of its own. The overload bit reads as clear unless the store judges the engine's load reports over a threshold. |
 | `Candidate::load` (`LoadRow`) | The engine's own load report: requests running and queued, KV-cache usage, the drain rate, the report's age. A stage that reads it declares `Needs::loads`. | Fed. |
 | `Candidate::in_flight` | The requests the deciding host holds on the worker right now. | The leases on file that book the worker, read through `RequestFacts::in_flight`: beside the rows the store lends, in the row where the rows are written for the request. The field itself reads 0 beside lent rows, so a stage asks the request's facts. A decision reads one count a row. |
 | `Candidate::session_hit`, `session_in_flight` | The request's session key: whether it is pinned to this worker, and its requests in flight there. | `session_hit` is set on the worker the ask names as pinned. `session_in_flight` is not fed yet and reads 0. |

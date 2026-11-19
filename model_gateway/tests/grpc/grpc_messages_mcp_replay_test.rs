@@ -9,12 +9,8 @@ use axum::{body::to_bytes, http::StatusCode};
 use llm_tokenizer::MockTokenizer;
 use openai_protocol::{messages::CreateMessageRequest, model_card::ModelCard};
 use serde_json::json;
-use smg::{
-    middleware::TenantRequestMeta,
-    routers::RouterTrait,
-    tenant::TenantKey,
-    worker::{RuntimeType, WorkerType},
-};
+use smg::{middleware::TenantRequestMeta, routers::RouterTrait, tenant::TenantKey};
+use smg_worker::identity::basic::{RuntimeType, WorkerType};
 
 use crate::common::{
     engine_answers::VllmAnswers,

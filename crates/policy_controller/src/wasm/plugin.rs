@@ -30,7 +30,7 @@ use super::{
 use crate::{
     decider::Decider,
     decision::{Decision, Target, MAX_TARGETS},
-    framework::{self, DecisionScope},
+    framework::{self, DecisionScope, TieBand},
     lease::{Lease, Membership, Outcome, ReleaseReason, Side, Signal},
     plugins::{
         breaker::{Breaker, Latency},
@@ -583,7 +583,7 @@ struct Instance {
     heard: u64,
     /// The feed's list, and its changes, as copied out for one telling.
     members: Vec<WorkerId>,
-    changes: Vec<Membership<'static>>,
+    changes: Vec<Kept>,
     /// The instance's number on its plugin: a resource is live on the store
     /// that made it and on no other.
     generation: u64,
@@ -744,7 +744,8 @@ fn bump(counter: &AtomicU64) {
 }
 
 /// How many membership changes a plugin's feed keeps for the instances
-/// behind it. An instance further behind hears the list as it stands.
+/// behind it. An instance further behind hears the list as it stands: ids
+/// and no pool, so a `Left` among the changes it missed is not told.
 const FEED_CHANGES: usize = 64;
 
 /// The membership feed of a plugin whose row lists the kind: the pool's one
@@ -766,7 +767,35 @@ struct Told {
     members: Vec<WorkerId>,
     /// The last changes told, the newest last, [`FEED_CHANGES`] at most. A
     /// snapshot is `None`: the list above holds it.
-    changes: VecDeque<Option<Membership<'static>>>,
+    changes: VecDeque<Option<Kept>>,
+}
+
+/// A membership change as the feed keeps it for the instances behind it:
+/// the host's word, case for case, the names of a `Left` owned once for
+/// every instance that hears it. A snapshot is not kept: the feed's list
+/// holds it.
+#[derive(Clone)]
+enum Kept {
+    Added(WorkerId),
+    Removed(WorkerId),
+    Replaced { old: WorkerId, new: WorkerId },
+    Relabelled(WorkerId),
+    Resized(WorkerId),
+    Left { id: WorkerId, models: Arc<[String]> },
+}
+
+impl Kept {
+    /// The word as the host told it.
+    fn word(&self) -> Membership<'_> {
+        match *self {
+            Self::Added(worker) => Membership::Added(worker),
+            Self::Removed(worker) => Membership::Removed(worker),
+            Self::Replaced { old, new } => Membership::Replaced { old, new },
+            Self::Relabelled(worker) => Membership::Relabelled(worker),
+            Self::Resized(worker) => Membership::Resized(worker),
+            Self::Left { id, ref models } => Membership::Left { id, models },
+        }
+    }
 }
 
 impl Feed {
@@ -824,6 +853,14 @@ struct Standing {
 #[derive(Default)]
 struct Working {
     standing: Cell<Standing>,
+    /// The decision whose open brought the hold in this place or last
+    /// checked it, by its number on this thread, zero where none did: its
+    /// later opens take the hold as theirs. No later decision takes that
+    /// number here: the thread's count rises by one a decision, and a
+    /// thread that takes an exited thread's place takes its count with it
+    /// ([`OpenDecisions`]). A word of its own, so the standing a bring
+    /// copies stays small: the bring stores this word and does not read it.
+    checked: Cell<u64>,
     slot: RefCell<Option<Instance>>,
 }
 
@@ -1000,12 +1037,7 @@ impl Plugin {
             .ok_or_else(|| LoadError::Abi {
                 name: name.clone(),
                 found: version.to_string(),
-                accepted: format!(
-                    "{}.0 to {}.{}",
-                    Abi::MAJOR,
-                    Abi::MAJOR,
-                    Abi::SUPPORTED_MINOR
-                ),
+                accepted: Abi::accepted_range(),
             })?;
         if let Some(pinned) = spec.abi {
             if pinned != abi {
@@ -1287,10 +1319,12 @@ impl Plugin {
     /// What the place never gave back (a close that did not return, on this
     /// thread or on one that exited and left it the place) goes back first,
     /// under another name or under none: a thread decides on no instance
-    /// but the one of the decider it acts as. `start` says the call begins
-    /// a span of its own, a decision's first open or a call outside a
-    /// decision: a hold of the same decider found there is checked.
-    fn lend(&self, working: &Working, start: bool) -> bool {
+    /// but the one of the decider it acts as. `decision` numbers the
+    /// decision whose open calls, zero for a call outside one: a hold of
+    /// the same decider is taken as it stands by the later opens of the
+    /// decision that brought it or last checked it, and is checked by
+    /// every other call.
+    fn lend(&self, working: &Working, decision: u64) -> bool {
         let mut now = working.standing.get();
         let Some(decider) = Decider::acting() else {
             // Under no name the thread acts as itself. The mark is read in
@@ -1302,14 +1336,21 @@ impl Plugin {
             return false;
         };
         match now.lent {
-            // The state is here: an earlier open of the decision brought it,
-            // or a decision open around a told event did. At a start that
-            // holds only where the rest still names this place. A close that
-            // did not return can have left the hold, and the decider can
-            // have been brought elsewhere since: such a hold is stale, its
-            // instance is dropped, and the state at rest comes.
+            // The state is here. An open of the decision that brought the
+            // hold or last checked it takes it as it stands, so a decision
+            // of two opens decides both on one instance. Any other call
+            // takes it only where the rest still names this place. A close
+            // that did not return can have left the hold, and the decider
+            // can have been brought elsewhere since: such a hold is stale,
+            // its instance is dropped, and the state at rest comes.
             Some(held) if held == decider => {
-                if !start || self.brought_here(working, decider) {
+                if decision != 0 && working.checked.get() == decision {
+                    return false;
+                }
+                if self.brought_here(working, decider) {
+                    if decision != 0 {
+                        working.checked.set(decision);
+                    }
                     return false;
                 }
                 *working.slot.borrow_mut() = None;
@@ -1317,6 +1358,10 @@ impl Plugin {
             Some(held) => self.give_back(working, held),
             None => {}
         }
+        // The bring. Its decision need not check the hold it brings: the
+        // number is stored ahead of the lock, while it is at hand, and
+        // nothing below returns early.
+        working.checked.set(decision);
         let mut rest = self.rest_of(decider).lock();
         let rest = rest.get_or_insert_with(Rest::new);
         let mut slot = working.slot.borrow_mut();
@@ -1394,7 +1439,8 @@ impl Plugin {
         Lent {
             plugin: self,
             working,
-            brought: self.lend(working, true),
+            // No decision's open: a hold found is checked.
+            brought: self.lend(working, 0),
         }
     }
 
@@ -1768,17 +1814,19 @@ impl Plugin {
     }
 
     /// One of this plugin's opens of decision `decision` on this thread;
-    /// says whether the plugin already failed that decision, and whether
-    /// this open is its first of it (the one read of the cell an open
-    /// makes).
-    fn note_open(&self, decision: u64) -> (bool, bool) {
+    /// says whether the plugin already failed that decision (the one read
+    /// of the cell an open makes).
+    fn note_open(&self, decision: u64) -> bool {
         let opens = self.decision_opens.get_or_default();
         let (mut part, init) = opens.get();
-        let first = !part.is_of(decision);
-        let init = if first { OwnTime::default() } else { init };
+        let init = if part.is_of(decision) {
+            init
+        } else {
+            OwnTime::default()
+        };
         let failed = part.open(decision);
         opens.set((part, init));
-        (failed, first)
+        failed
     }
 
     /// The time of a lazy `init` decision `decision` paid on this thread:
@@ -1905,11 +1953,11 @@ impl Plugin {
                 if !told.members.contains(&worker) {
                     told.members.push(worker);
                 }
-                Some(Membership::Added(worker))
+                Some(Kept::Added(worker))
             }
             Membership::Removed(worker) => {
                 told.members.retain(|member| *member != worker);
-                Some(Membership::Removed(worker))
+                Some(Kept::Removed(worker))
             }
             Membership::Replaced { old, new } => {
                 if let Some(member) = told.members.iter_mut().find(|member| **member == old) {
@@ -1917,12 +1965,16 @@ impl Plugin {
                 } else if !told.members.contains(&new) {
                     told.members.push(new);
                 }
-                Some(Membership::Replaced { old, new })
+                Some(Kept::Replaced { old, new })
             }
-            Membership::Relabelled(worker) => Some(Membership::Relabelled(worker)),
-            Membership::Resized(worker) => Some(Membership::Resized(worker)),
-            // No contract carries the word yet: a plugin is told nothing.
-            Membership::Left { .. } => return,
+            Membership::Relabelled(worker) => Some(Kept::Relabelled(worker)),
+            Membership::Resized(worker) => Some(Kept::Resized(worker)),
+            // The list holds ids and no pool, so the worker stays in it. Its
+            // names are owned here, once for every instance that hears them.
+            Membership::Left { id, models } => Some(Kept::Left {
+                id,
+                models: models.into(),
+            }),
         };
         if told.changes.len() == FEED_CHANGES {
             told.changes.pop_front();
@@ -1969,23 +2021,26 @@ impl Plugin {
                 members.extend_from_slice(&told.members);
             } else {
                 let level = told.changes.len() - behind;
-                changes.extend(told.changes.iter().skip(level).flatten());
+                changes.extend(told.changes.iter().skip(level).flatten().cloned());
             }
             instance.heard = place;
             whole
         };
         if whole {
-            if let Some(event) = marshal::membership(&Membership::Snapshot(&members), &mut ids) {
-                self.tell(slot, wit::LifecycleEvent::Membership(event));
-            }
+            let (word, mut names) = (Membership::Snapshot(&members), Vec::new());
+            let event = marshal::membership(&word, &mut ids, &mut names);
+            self.tell(slot, wit::LifecycleEvent::Membership(event));
         } else {
-            for change in &changes {
+            // Each change is told and let go: a left word lends its names
+            // to its one call, and the buffer alone stays with the instance.
+            // A fault ends the telling, and the changes behind it go too.
+            for change in changes.drain(..) {
                 if slot.is_none() {
                     break;
                 }
-                if let Some(event) = marshal::membership(change, &mut ids) {
-                    self.tell(slot, wit::LifecycleEvent::Membership(event));
-                }
+                let (word, mut names) = (change.word(), Vec::new());
+                let event = marshal::membership(&word, &mut ids, &mut names);
+                self.tell(slot, wit::LifecycleEvent::Membership(event));
             }
         }
         if let Some(instance) = slot.as_mut() {
@@ -2305,8 +2360,7 @@ impl Bound {
         let mut budget = plugin.runtime.decisions.on_this_thread();
         let decision = budget.open(facts.budget_micros);
         open.decision = decision;
-        let (failed, first) = plugin.note_open(decision);
-        if failed {
+        if plugin.note_open(decision) {
             // The plugin already failed this decision (the other side of a
             // pair, another binding): its part in the decision is over, with
             // no call, no `init` and no second count.
@@ -2337,7 +2391,7 @@ impl Bound {
         // A named decider's kept state comes to this thread for the
         // decision; the plugin's last close of it gives it back.
         let working = plugin.working();
-        plugin.lend(working, first);
+        plugin.lend(working, decision);
         let mut guard = working.slot.borrow_mut();
         if guard.is_none() {
             if plugin.emptied.get_or_default().get() {
@@ -2723,7 +2777,7 @@ impl BoundPlugin for Bound {
         facts: &RequestFacts<'_>,
         kept: &[u32],
         out: &mut [f32],
-    ) -> Result<(), Fallback> {
+    ) -> Result<TieBand, Fallback> {
         let mut open = self.state(facts.phase);
         if !open.scores_set {
             if open.score_declined {
@@ -2757,7 +2811,7 @@ impl BoundPlugin for Bound {
         for (o, &i) in out.iter_mut().zip(kept) {
             *o = open.scores.get(i as usize).copied().unwrap_or(0.0);
         }
-        Ok(())
+        Ok(TieBand::NORMALIZED)
     }
 
     /// The picker's answer over the survivors: `scores[i]` belongs to

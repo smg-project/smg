@@ -19,6 +19,7 @@ use axum::{
 };
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
+use smg_worker::identity::basic::WorkerLoadGuard;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::Instrument;
@@ -26,13 +27,10 @@ use tracing::Instrument;
 use super::stream_failure::{
     mark_head_success_recorded, note_sent, RelaySource, SentTail, UpstreamCut,
 };
-use crate::{
-    routers::common::{
-        sse::SSE_CHANNEL_BUFFER,
-        sse_rechunk::{NoopObserver, SseRechunker},
-        stream::GuardedStream,
-    },
-    worker::WorkerLoadGuard,
+use crate::routers::common::{
+    sse::SSE_CHANNEL_BUFFER,
+    sse_rechunk::{NoopObserver, SseRechunker},
+    stream::GuardedStream,
 };
 
 /// What a chunk became through the relay's hook, and whether it ends the
@@ -320,6 +318,10 @@ mod tests {
     use bytes::Bytes;
     use futures_util::{stream, Stream, StreamExt};
     use http_body_util::BodyExt;
+    use smg_worker::{
+        identity::basic::{Worker, WorkerLoadGuard},
+        test_support::RefusedAddress,
+    };
     use tokio::sync::mpsc;
     use tokio_stream::wrappers::ReceiverStream;
 
@@ -327,11 +329,10 @@ mod tests {
     use crate::{
         routers::{
             common::{sse::SSE_CHANNEL_BUFFER, sse_rechunk::SseRechunker},
-            grpc::wire::Wire,
+            grpc::{backend_client::BasicWorkerBuilder, wire::Wire},
             http::stream_failure::RelaySource,
         },
         server::http_client_builder,
-        worker::{test_support::RefusedAddress, BasicWorkerBuilder, Worker, WorkerLoadGuard},
     };
 
     /// The relay of `upstream` in `mode`: a successful SSE head from a worker

@@ -5,18 +5,22 @@ use std::sync::Arc;
 
 use llm_multimodal::MediaContentPart;
 use llm_tokenizer::TokenizerRegistry;
-use openai_protocol::generate::GenerateRequest;
+use openai_protocol::{generate::GenerateRequest, model_card::ModelCard};
 use smg_grpc_client::VllmEngineClient;
+use smg_worker::identity::basic::{ConnectionMode, WorkerType};
 use tokio::task::JoinHandle;
 
 use super::*;
 use crate::{
     config::ParserChoice,
-    routers::grpc::{
-        client::GrpcClient, context::SharedComponents, multimodal::MediaPlan,
-        regular::symphony::template::Templates, test_engine::mock_engine,
+    routers::{
+        common::snapshot::WorkerRegistry,
+        grpc::{
+            backend_client::BasicWorkerBuilder, client::GrpcClient, context::SharedComponents,
+            multimodal::MediaPlan, regular::symphony::template::Templates,
+            test_engine::mock_engine,
+        },
     },
-    worker::{BasicWorkerBuilder, ConnectionMode, ModelCard, WorkerRegistry, WorkerType},
 };
 
 /// A request context after worker selection and client acquisition: one
