@@ -1743,10 +1743,17 @@ mod tests {
     /// A batch whose rank fits no `u16` names no rank of an engine: it is
     /// said to no sink, where rank 0's cursor would have taken it, and the
     /// batches around it are said as they come. The operator reads one line
-    /// a stream, with the first such rank as the engine sent it.
+    /// a stream, with the first such rank as the engine sent it, and each
+    /// such batch is counted `not_indexed`.
     #[tracing_test::traced_test]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_batch_of_a_rank_that_fits_none_is_said_to_no_sink() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        // The round runs on this thread, under the local recorder.
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let rendered = recorder.handle();
+        let _recording = metrics::set_default_local_recorder(&recorder);
         let ranked = |sequence_number, dp_rank| KvEventBatch {
             sequence_number,
             dp_rank,
@@ -1792,6 +1799,59 @@ mod tests {
                 other => Err(format!("one line with the first rank, got {other:?}")),
             }
         });
+        let body = rendered.render();
+        let counted = body
+            .lines()
+            .find(|line| {
+                line.starts_with("smg_kv_event_batches_total{")
+                    && line.contains("disposition=\"not_indexed\"")
+            })
+            .and_then(|line| line.rsplit(' ').next())
+            .and_then(|count| count.parse::<f64>().ok());
+        assert_eq!(counted, Some(2.0), "{body}");
+    }
+
+    /// A batch of a rank that fits none is read no further than its rank: a
+    /// snapshot chunk it carries is not counted, and its snapshot's start is
+    /// not said. The next first chunk of a rank that fits opens the snapshot
+    /// for the sink, once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_snapshot_chunk_of_a_rank_that_fits_none_opens_no_snapshot() {
+        let chunk = |sequence_number, dp_rank, index| KvEventBatch {
+            sequence_number,
+            dp_rank,
+            snapshot: Some(KvSnapshotChunk {
+                index,
+                count: 2,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let script = vec![
+            Ok(chunk(6, Some(-1), 0)),
+            Ok(chunk(7, None, 0)),
+            Ok(chunk(8, None, 1)),
+        ];
+        let (worker, _engine) = connected(Script::Stream(script));
+        let sink = Said::default();
+        let sub = said_subscription(&worker, &sink);
+        let (_keep, mut shutdown_rx) = oneshot::channel::<()>();
+        let round = Rounds::subscription_round(&sub, &mut Backoff::new(), &mut shutdown_rx).await;
+        assert!(matches!(round, Round::Backoff));
+        let said: Vec<String> = sink
+            .calls()
+            .into_iter()
+            .filter(|call| !call.starts_with("cursor"))
+            .collect();
+        assert_eq!(
+            said,
+            [
+                "reconnected 7",
+                "resync 7 None snapshot",
+                "admit 7 rank 0 seq 7 chunk",
+                "admit 7 rank 0 seq 8 chunk",
+            ]
+        );
     }
 
     /// The count of a relay snapshot's chunks, rule by rule: a first chunk

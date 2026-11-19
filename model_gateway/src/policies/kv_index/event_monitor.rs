@@ -307,6 +307,12 @@ impl KvEventMonitor {
         self.collector.task_ended(worker_url).await
     }
 
+    /// Leave the URL's running stream as a reservation whose task is gone.
+    #[cfg(test)]
+    async fn strand_reservation(&self, worker_url: &str) {
+        self.collector.strand_reservation(worker_url).await;
+    }
+
     /// Get the indexer for a model (used by `CacheAwarePolicy` for queries).
     pub fn get_indexer(&self, model_id: &str) -> Option<Arc<KvIndex>> {
         self.indexers.get(model_id).map(|r| Arc::clone(&r))
@@ -603,6 +609,105 @@ mod tests {
             current.worker_id(&url).is_some()
         })
         .await;
+        monitor.stop().await;
+    }
+
+    /// An add can find a reservation whose task is gone and that nobody
+    /// lifted. It lifts it before it starts the worker's stream: behind the
+    /// model's last events subscription the model's index is dropped and the
+    /// add makes a fresh one, and the worker's gauge is lowered.
+    #[test]
+    fn an_add_behind_a_dead_reservation_builds_the_model_a_fresh_index() {
+        use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+
+        fn gauge(handle: &PrometheusHandle, worker_url: &str) -> Option<f64> {
+            let prefix = format!("smg_kv_events_unavailable{{worker=\"{worker_url}\"}}");
+            handle
+                .render()
+                .lines()
+                .find(|line| line.starts_with(&prefix))
+                .and_then(|line| line.rsplit(' ').next())
+                .and_then(|value| value.parse().ok())
+        }
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        // The add publishes from the runtime's thread, which must be the one
+        // holding the local recorder.
+        metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let monitor = KvEventMonitor::new();
+                let worker = refusing_grpc_worker_at("grpc://127.0.0.1:4");
+                let url = worker.url();
+                monitor
+                    .on_worker_added(&worker, SubscriptionKind::Events)
+                    .await;
+                let before = monitor
+                    .get_indexer(UNKNOWN_MODEL_ID)
+                    .expect("the model's index");
+                // Raised as an engine's refusal of the stream raises it.
+                Metrics::set_kv_events_unavailable(url, true);
+                assert_eq!(gauge(&handle, url), Some(1.0));
+                let (stranded, _) = monitor.slot_ids(url).await;
+                monitor.strand_reservation(url).await;
+                assert_eq!(monitor.slot_ids(url).await, (None, stranded));
+
+                monitor
+                    .on_worker_added(&worker, SubscriptionKind::Events)
+                    .await;
+                let after = monitor
+                    .get_indexer(UNKNOWN_MODEL_ID)
+                    .expect("the re-added worker's model has an index");
+                assert!(
+                    !Arc::ptr_eq(&before, &after),
+                    "the lift dropped the index of the model's last events subscription; the \
+                     add made a fresh one"
+                );
+                let (active, removing) = monitor.slot_ids(url).await;
+                assert!(active.is_some_and(|id| Some(id) != stranded));
+                assert_eq!(removing, None, "the add lifted the dead reservation");
+                assert_eq!(gauge(&handle, url), Some(0.0), "the lift lowers the gauge");
+                monitor.stop().await;
+            });
+        });
+    }
+
+    /// The same add while another worker of the model still feeds the index:
+    /// the model keeps its index.
+    #[tokio::test]
+    async fn an_add_behind_a_dead_reservation_keeps_an_index_another_worker_feeds() {
+        let monitor = KvEventMonitor::new();
+        let stays = refusing_grpc_worker_at("grpc://127.0.0.1:5");
+        let worker = refusing_grpc_worker_at("grpc://127.0.0.1:6");
+        let url = worker.url();
+        monitor
+            .on_worker_added(&stays, SubscriptionKind::Events)
+            .await;
+        monitor
+            .on_worker_added(&worker, SubscriptionKind::Events)
+            .await;
+        let before = monitor
+            .get_indexer(UNKNOWN_MODEL_ID)
+            .expect("the model's index");
+        monitor.strand_reservation(url).await;
+
+        monitor
+            .on_worker_added(&worker, SubscriptionKind::Events)
+            .await;
+        let (active, removing) = monitor.slot_ids(url).await;
+        assert!(active.is_some(), "the add starts a stream of its own");
+        assert_eq!(removing, None, "the add lifted the dead reservation");
+        let after = monitor
+            .get_indexer(UNKNOWN_MODEL_ID)
+            .expect("the model's index");
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "another events worker of the model is active: its index stays"
+        );
         monitor.stop().await;
     }
 

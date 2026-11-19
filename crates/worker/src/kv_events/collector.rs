@@ -683,6 +683,22 @@ impl<H: KvEventHost> KvEventCollector<H> {
         }
     }
 
+    /// Leave the URL's running stream as a reservation whose task is gone:
+    /// a removal's first turn, then its task ended short of its own lift
+    /// and no remover behind it. For the cases of the add that finds such a
+    /// reservation.
+    #[cfg(any(test, feature = "test-util"))]
+    pub async fn strand_reservation(&self, worker_url: &str) {
+        let taken = {
+            let mut handles = self.worker_handles.lock().await;
+            Self::begin_removal(&mut handles, &self.host, worker_url)
+        };
+        if let Some(sub) = taken {
+            sub.handle.abort();
+            let _ = sub.handle.await;
+        }
+    }
+
     /// [`Self::slot_ids`] under a lock the caller holds.
     #[cfg(any(test, feature = "test-util"))]
     fn ids_under(handles: &HashMap<String, Slot>, worker_url: &str) -> (Option<u64>, Option<u64>) {
@@ -725,7 +741,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        kv_events::port::{BatchFacts, BatchOutcome, KvCursor, ResyncReason},
+        kv_events::{
+            port::{BatchFacts, BatchOutcome, KvCursor, ResyncReason},
+            INDEX_REMOVAL_PERMITS, MAX_CONCURRENT_INDEX_REMOVALS,
+        },
         test_support::{BasicWorkerBuilder, WorkerRegistry},
         worker::{HealthCheckConfig, RuntimeType, WorkerType},
     };
@@ -1484,6 +1503,184 @@ mod tests {
                 )),
             }
         });
+        collector.stop().await;
+    }
+
+    /// A worker removed and added again under its URL while the old task
+    /// still waits to tell the sink that the worker left: the add waits for
+    /// that task's end, so the host hears that the model left before the new
+    /// subscription enrolls. The removal permits are the process's: held
+    /// here, they hold the old task at its last word to the sink.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_same_url_re_add_waits_for_the_old_tasks_end() {
+        let host = Arc::new(RecordingHost::default());
+        let collector = Arc::new(KvEventCollector::new(Arc::clone(&host)));
+        let worker = unconnected_grpc_worker_at("grpc://127.0.0.1:10");
+        let url = worker.url().to_string();
+        collector
+            .on_worker_added(&worker, SubscriptionKind::Events)
+            .await;
+        wait_until("the task opens its place", || host.calls().len() == 2).await;
+
+        let permits = INDEX_REMOVAL_PERMITS
+            .acquire_many(MAX_CONCURRENT_INDEX_REMOVALS as u32)
+            .await
+            .expect("the removal semaphore is open");
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the removal and the re-add are awaited below"
+        )]
+        let removal = tokio::spawn({
+            let collector = Arc::clone(&collector);
+            let url = url.clone();
+            async move { collector.on_worker_removed(&url).await }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!removal.is_finished(), "the removal waits for the old task");
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the removal and the re-add are awaited below"
+        )]
+        let re_add = tokio::spawn({
+            let collector = Arc::clone(&collector);
+            let worker = Arc::clone(&worker);
+            async move {
+                collector
+                    .on_worker_added(&worker, SubscriptionKind::Events)
+                    .await;
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!re_add.is_finished(), "the re-add waits for the old task");
+        assert_eq!(host.calls().len(), 2, "the host hears nothing meanwhile");
+
+        drop(permits);
+        removal.await.expect("removal task");
+        re_add.await.expect("re-add task");
+        assert_eq!(
+            host.calls()[..4],
+            [
+                "enroll unknown grpc://127.0.0.1:10",
+                "open unknown grpc://127.0.0.1:10",
+                "model_left unknown",
+                "enroll unknown grpc://127.0.0.1:10",
+            ]
+        );
+        collector.stop().await;
+    }
+
+    /// A caller may drop the removal before the old task has ended (a
+    /// registry's removal step runs under a timeout). The reservation it
+    /// left does not outlive the task: the task lifts it at its own end,
+    /// with nobody awaiting the removal, and the host hears that the model
+    /// left.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_removal_leaves_its_reservation_to_the_task() {
+        let host = Arc::new(RecordingHost::default());
+        let collector = KvEventCollector::new(Arc::clone(&host));
+        let worker = unconnected_grpc_worker_at("grpc://127.0.0.1:11");
+        let url = worker.url();
+        collector
+            .on_worker_added(&worker, SubscriptionKind::Events)
+            .await;
+        wait_until("the task opens its place", || host.calls().len() == 2).await;
+        let (reserved, _) = collector.slot_ids(url).await;
+
+        let permits = INDEX_REMOVAL_PERMITS
+            .acquire_many(MAX_CONCURRENT_INDEX_REMOVALS as u32)
+            .await
+            .expect("the removal semaphore is open");
+        let removal =
+            tokio::time::timeout(Duration::from_millis(200), collector.on_worker_removed(url))
+                .await;
+        assert!(
+            removal.is_err(),
+            "the removal was still waiting for the old task"
+        );
+        assert_eq!(
+            collector.slot_ids(url).await,
+            (None, reserved),
+            "the reservation stands while the old task has not ended"
+        );
+        assert_eq!(host.calls().len(), 2, "the host hears nothing meanwhile");
+
+        drop(permits);
+        wait_until("the old task lifts its reservation", || {
+            host.calls().len() == 3
+        })
+        .await;
+        assert_eq!(host.calls()[2], "model_left unknown");
+        assert_eq!(collector.slot_ids(url).await, (None, None));
+    }
+
+    /// An add can find a reservation whose task is gone and that nobody
+    /// lifted. It lifts it as the task would have, before it starts the
+    /// worker's stream: the host hears that the model's last events
+    /// subscription left, ahead of the new one's `enroll`.
+    #[tokio::test]
+    async fn an_add_behind_a_dead_reservation_tells_the_host_the_model_left() {
+        let host = Arc::new(RecordingHost::default());
+        let collector = KvEventCollector::new(Arc::clone(&host));
+        let worker = unconnected_grpc_worker_at("grpc://127.0.0.1:7");
+        let url = worker.url();
+        collector
+            .on_worker_added(&worker, SubscriptionKind::Events)
+            .await;
+        wait_until("the task opens its place", || host.calls().len() == 2).await;
+        let (stranded, _) = collector.slot_ids(url).await;
+        collector.strand_reservation(url).await;
+        assert_eq!(collector.slot_ids(url).await, (None, stranded));
+
+        collector
+            .on_worker_added(&worker, SubscriptionKind::Events)
+            .await;
+        let (active, removing) = collector.slot_ids(url).await;
+        assert!(
+            active.is_some_and(|id| Some(id) != stranded),
+            "the add starts a stream of its own"
+        );
+        assert_eq!(removing, None, "the add lifted the dead reservation");
+        assert_eq!(
+            host.calls()[..4],
+            [
+                "enroll unknown grpc://127.0.0.1:7",
+                "open unknown grpc://127.0.0.1:7",
+                "model_left unknown",
+                "enroll unknown grpc://127.0.0.1:7",
+            ]
+        );
+        collector.stop().await;
+    }
+
+    /// The same add while another worker of the model still streams its
+    /// events: the model has not left, and the host hears nothing of it.
+    #[tokio::test]
+    async fn an_add_behind_a_dead_reservation_keeps_a_model_another_worker_feeds() {
+        let host = Arc::new(RecordingHost::default());
+        let collector = KvEventCollector::new(Arc::clone(&host));
+        let stays = unconnected_grpc_worker_at("grpc://127.0.0.1:8");
+        let worker = unconnected_grpc_worker_at("grpc://127.0.0.1:9");
+        let url = worker.url();
+        collector
+            .on_worker_added(&stays, SubscriptionKind::Events)
+            .await;
+        collector
+            .on_worker_added(&worker, SubscriptionKind::Events)
+            .await;
+        wait_until("both tasks open their places", || host.calls().len() == 4).await;
+        collector.strand_reservation(url).await;
+
+        collector
+            .on_worker_added(&worker, SubscriptionKind::Events)
+            .await;
+        let (active, removing) = collector.slot_ids(url).await;
+        assert!(active.is_some(), "the add starts a stream of its own");
+        assert_eq!(removing, None, "the add lifted the dead reservation");
+        let calls = host.calls();
+        assert!(
+            !calls.iter().any(|call| call.starts_with("model_left")),
+            "another worker still feeds the model: {calls:?}"
+        );
         collector.stop().await;
     }
 
