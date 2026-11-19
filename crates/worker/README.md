@@ -342,7 +342,7 @@ is always there.
 | `health` | | The overload thresholds. With `runtime`: the health manager, liveness, the circuit breaker, the resilience settings and the probe of a bootstrap port. |
 | `identity` | | A worker's address, parsed once and keyed, and the sampling defaults a worker reports. With `runtime`: the `Worker` trait, `BasicWorker`, its builder, its metadata, the worker errors and the door a worker's address passes. |
 | `kv_events` | | The port between the collector of the KV cache events an engine pushes and a host's sink. With `runtime`: the collector, which keeps one task a worker, and the port of its host. |
-| `labels` | | The labels of a worker's spec that the worker's own code reads. |
+| `labels` | | The labels of a worker's spec that the worker's own code and its hosts read, and the flat map an engine's answer becomes. |
 | `metrics_labels` | | The metric label values the worker's writers share with a host's. |
 | `model_card` | | The model card a worker serves. |
 | `model_type` | | The endpoints a model supports. |

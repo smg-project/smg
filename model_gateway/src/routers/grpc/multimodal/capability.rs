@@ -15,27 +15,13 @@
 use anyhow::Result;
 use axum::response::Response;
 use llm_multimodal::{EncoderInputFormat, Modality};
-use smg_worker::identity::basic::{RuntimeType, Worker};
+use smg_worker::{
+    identity::basic::{RuntimeType, Worker},
+    labels::SUPPORTS_VISION_LABEL,
+};
 
 use super::{plan::MediaPlan, refs::worker_accepts_media_refs, MultimodalIntermediate};
 use crate::routers::{common::snapshot::WorkerRegistry, error};
-
-/// Worker label carrying the engine's vision-input capability (the vLLM
-/// gRPC servicer's `GetModelInfoResponse.supports_vision`). `"false"` on a
-/// multimodal architecture means the engine runs `--language-model-only`:
-/// no vision encoder, encoder-cache budget 0, so no pixel payload (image,
-/// video) may reach it. A multimodal model reports `"true"`; a text-only
-/// model also reports `"false"`. The label speaks for the vision encoder
-/// only: the servicer reports `"false"` as well for an engine that still
-/// takes audio or pre-computed embeddings, so it says nothing about those
-/// (the runtime capability matrix below does). The label is tri-state:
-/// only vLLM's `false` becomes a label; for the other runtimes a `false`
-/// cannot be told from a servicer's default and is dropped
-/// (`ModelInfo::to_labels`), and an absent label reads as unknown, never as
-/// a refusal. An SGLang servicer that carries no media to its engine writes
-/// a deliberate `false` into its `server_args`, which is kept
-/// (`ServerInfo::to_labels`).
-pub(crate) const SUPPORTS_VISION_LABEL: &str = "supports_vision";
 
 /// Whether the worker's engine runs without a vision encoder (a vLLM
 /// `--language-model-only` worker), so no pixel payload may reach it. Absent

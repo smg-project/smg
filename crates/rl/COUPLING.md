@@ -24,9 +24,11 @@ stays registered and the fan-out still targets it.
 
 Gateway-side changes that carry RL data but are not crate couplings (the RL
 crate does not call into them; they exist so the data plane reports what the
-control plane changed): `src/routers/grpc/client.rs` lifts `rl.control_url`
-and the `rl.*` capability keys from TokenSpeed gRPC server info into worker
-labels (`TOKENSPEED_GRPC_KEYS`); `src/routers/grpc/proto_wrapper.rs`,
+control plane changed): the client crate's label conversions
+(`crates/grpc_client/src/engine_labels.rs`), which the gateway's dispatch
+client asks, lift `rl.control_url` and the `rl.*` capability keys from
+TokenSpeed gRPC server info into worker labels (`TOKENSPEED_GRPC_KEYS`);
+`src/routers/grpc/proto_wrapper.rs`,
 `src/routers/grpc/common/response_formatting.rs` (`effective_weight_version`),
 `src/routers/grpc/regular/{processor,streaming}.rs` and
 `src/routers/grpc/pipeline.rs` carry the engine-reported

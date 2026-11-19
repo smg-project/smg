@@ -18,6 +18,7 @@ use smg_worker::{
         endpoint::Endpoint,
         metadata::join_base,
     },
+    labels::SUPPORTS_VISION_LABEL,
 };
 use tracing::{debug, warn};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
@@ -32,7 +33,6 @@ use crate::{
             backend_client::BasicWorkerBuilder,
             multimodal::{
                 mm_settings, pool_processes_media_refs, registration_lacks_media_processing,
-                SUPPORTS_VISION_LABEL,
             },
             regular::symphony::{
                 check_names, labels_select_nothing, set_aside_by_the_registry, table_label_read,
@@ -2567,9 +2567,8 @@ mod tests {
     /// carries no override, and its grammar start reads as advertised.
     #[test]
     fn an_engines_advertised_reasoning_parser_is_not_a_parser_override() {
+        use smg_grpc_client::engine_labels::ServerInfo;
         use tool_parser::GrammarStart;
-
-        use crate::routers::grpc::client::ServerInfo;
 
         let tool_factory = tool_parser::ParserFactory::default();
         let reasoning_factory = reasoning_parser::ParserFactory::default();
@@ -2714,12 +2713,12 @@ mod tests {
 mod rank_window_tests {
     use std::collections::HashMap;
 
-    use smg_grpc_client::tokenspeed_proto;
+    use smg_grpc_client::{engine_labels::ServerInfo, tokenspeed_proto};
     use smg_worker::identity::basic::{merge_labels, ConnectionMode, Worker};
 
     use super::{dp_rank_expansion, labels_for_rank};
     use crate::{
-        routers::grpc::{backend_client::BasicWorkerBuilder, client::ServerInfo},
+        routers::grpc::backend_client::BasicWorkerBuilder,
         workflow::steps::local::{discover_dp::dp_info_from_labels, test_support::labels_of},
     };
 

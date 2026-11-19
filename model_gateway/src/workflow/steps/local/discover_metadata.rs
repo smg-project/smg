@@ -6,23 +6,23 @@ use async_trait::async_trait;
 use openai_protocol::UNKNOWN_MODEL_ID;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use smg_worker::identity::{
-    basic::ConnectionMode,
-    endpoint::Endpoint,
-    sampling_defaults::{SamplingDefaults, DEFAULT_SAMPLING_PARAMS_LABEL},
+use smg_worker::{
+    identity::{
+        basic::ConnectionMode,
+        endpoint::Endpoint,
+        sampling_defaults::{SamplingDefaults, DEFAULT_SAMPLING_PARAMS_LABEL},
+    },
+    labels::flat_labels,
 };
 use tool_parser::GrammarStart;
 use tracing::{debug, warn};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
-use crate::{
-    routers::grpc::client::flat_labels,
-    workflow::{
-        data::{WorkerKind, WorkerWorkflowData},
-        steps::{
-            local::create_worker::resolve_model_id,
-            util::{connect_grpc_as, grpc_base_url, http_base_url},
-        },
+use crate::workflow::{
+    data::{WorkerKind, WorkerWorkflowData},
+    steps::{
+        local::create_worker::resolve_model_id,
+        util::{connect_grpc_as, grpc_base_url, http_base_url},
     },
 };
 
