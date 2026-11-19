@@ -2664,6 +2664,44 @@ mod tests {
         assert_eq!(numbers, [(2, window + 1), (2, window + 2)]);
     }
 
+    /// A word kept while the version fixed already carries it is written,
+    /// though no stream stands and none has settled since. Here a stream
+    /// settled on 2 and ended, and a call that named 1 then took a left
+    /// word: the word is kept under the settles of that instant. The next
+    /// call names 2 and writes the word first.
+    #[tokio::test(start_paused = true)]
+    async fn a_word_kept_under_a_version_that_carries_it_is_written_with_no_stream_standing() {
+        use crate::{lease::Membership, view::WorkerId};
+        let models = ["m".to_owned()];
+        let left = Membership::Left {
+            id: WorkerId(7),
+            models: &models,
+        };
+        let (events, lane, _raise) = unsettled();
+        let mut queue = lane.queue.lock().take().expect("the lane's queue");
+        drop(lane.peer.spoken.settle(2).expect("the settle"));
+        let mut kept = Some(super::Kept {
+            word: word(&left),
+            settles: 1,
+        });
+        let heard = Rc::new(RefCell::new(Vec::new()));
+        let mut open = |version| standing_call(version, Rc::clone(&heard));
+        let (mut sent, mut lost, mut said) = (0, 0, Said::default());
+        let task = super::observe_streams(
+            &lane, &mut queue, &mut kept, &mut sent, &mut lost, &mut said, &mut open,
+        );
+        // The call on 2 stands: a minute ends the case's look at it.
+        let stood = tokio::time::timeout(Duration::from_secs(60), task).await;
+        assert!(stood.is_err(), "the call on 2 stands");
+        let heard: Vec<_> = heard
+            .borrow()
+            .iter()
+            .map(|&(version, seq, left, _)| (version, seq, left))
+            .collect();
+        assert_eq!(heard, [(2, 1, true)], "the call on 2 writes the kept word");
+        assert!(events.told.lock().is_empty(), "no call failed");
+    }
+
     /// One call's turn where a stream stands on protocol 1 and nothing
     /// moves its plugin's version: how the call ended, or `None` once the
     /// plugin is dropped.
