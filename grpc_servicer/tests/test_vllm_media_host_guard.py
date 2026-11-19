@@ -637,6 +637,48 @@ def test_vllms_connector_and_the_guard_read_the_allow_list_alike(entries, host, 
     asyncio.run(run())
 
 
+def test_vllms_connector_wraps_a_named_host_and_a_redirect_refusal_apart(monkeypatch):
+    # Through vLLM's own loader, which re-raises a download's error as its
+    # client error: the named URL refused is the request's reference as sent,
+    # the redirect target refused a fetch that failed, as the router answers.
+    connector_module = pytest.importorskip("vllm.multimodal.media.connector")
+    from smg_grpc_servicer.vllm import mm_processor
+
+    real = guard.check_address
+
+    def check_address(host, address):
+        if host != "localhost":
+            real(host, address)
+
+    monkeypatch.setattr(guard, "check_address", check_address)
+    processor = mm_processor.InProcessMediaProcessor.__new__(mm_processor.InProcessMediaProcessor)
+
+    async def code_of(connector, url):
+        with pytest.raises(Exception) as raised:  # noqa: B017 - vLLM's own wrapping
+            await connector.load_from_url_async(url, _RawBytes())
+        return processor._client_media_code(raised.value)  # noqa: SLF001
+
+    async def run():
+        state = {"hits": 0}
+        runner, port = await _serve(_routes(state))
+        connector = connector_module.MediaConnector(
+            **guard.media_connector_kwargs(None, allow_private_hosts=False)
+        )
+        try:
+            target = f"http://127.0.0.1:{port}/media"
+            assert await code_of(connector, target) == "invalid_multimodal_request"
+            bounce = f"http://localhost:{port}/bounce?to={target}"
+            assert await code_of(connector, bounce) == "media_fetch_failed"
+            assert state["hits"] == 0
+        finally:
+            session = connector.connection._guarded  # noqa: SLF001
+            if session is not None:
+                await session.close()
+            await runner.cleanup()
+
+    asyncio.run(run())
+
+
 def test_vllms_connector_refuses_a_host_off_the_list_before_the_guard():
     connector_module = pytest.importorskip("vllm.multimodal.media.connector")
     connector = connector_module.MediaConnector(
