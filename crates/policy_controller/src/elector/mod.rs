@@ -81,6 +81,9 @@
 //!   the record's duration, rounded up.
 //!   An elector alone over a store it made itself ([`Elector::alone`]) has
 //!   no other holder to wait for: its take leads at once.
+//!   The controller hands its candidate a step for each take. It runs
+//!   behind the take's write and ahead of the fence's stamp, so the fence
+//!   shows a term behind that term's step.
 //!
 //! The elector keeps five private instants, each with one meaning. Before
 //! the first it writes no record that names it: it takes nothing, and a
@@ -467,6 +470,9 @@ pub struct Elector {
     /// run leaves on a word ([`Elector::step_down`]), one lease duration
     /// ahead, and cleared by its next take.
     hold: Option<Instant>,
+    /// What this candidate's holder does at each take, behind the take's
+    /// write and ahead of the fence's stamp ([`Elector::at_take`]).
+    at_take: Option<Box<dyn Fn() + Send>>,
 }
 
 impl fmt::Debug for Elector {
@@ -512,6 +518,7 @@ impl Elector {
             stepped: None,
             alone: false,
             hold: None,
+            at_take: None,
         })
     }
 
@@ -533,6 +540,17 @@ impl Elector {
     /// The fence the shard threads read; one per elector, shared by handle.
     pub fn fence(&self) -> Arc<Fence> {
         Arc::clone(&self.fence)
+    }
+
+    /// Hands this candidate a step it runs at each take, behind the take's
+    /// write and ahead of the fence's stamp. A reader of the fence is shown
+    /// a term once that term's step has returned, so what the step does
+    /// stands before anything is served under the term. The step runs
+    /// inside [`Elector::tick`], on its caller's thread, and its time is
+    /// the take's: the window stamped behind it counts from the tick's
+    /// instant, and a step that outlasts it leads from the next renewal.
+    pub(crate) fn at_take(&mut self, step: impl Fn() + Send + 'static) {
+        self.at_take = Some(Box::new(step));
     }
 
     /// This run's take still waits to lead: it took a record with no holder
@@ -1149,6 +1167,11 @@ impl Elector {
         };
         match written {
             Written::Done => {
+                // The holder's step, ahead of the stamp: the fence shows
+                // this term to no reader before the step has returned.
+                if let Some(step) = &self.at_take {
+                    step();
+                }
                 self.opens = Some(self.opening(self.waits, now));
                 self.attempted = None;
                 self.hold = None;
@@ -1347,6 +1370,41 @@ mod tests {
         let mut handed = candidate(&MemoryLease::new(), "b@host:2");
         assert_eq!(handed.tick(t0).expect("tick"), Tick::Acquired { term: 1 });
         assert_eq!(handed.fence().leader_term(t0), None);
+    }
+
+    /// A take's step runs ahead of the take's fence: at the step the fence
+    /// shows no term, and the take that returns shows it. A renewal is no
+    /// take and runs no step.
+    #[test]
+    fn a_takes_step_runs_ahead_of_its_fence() {
+        let mut alone = Elector::alone("a@host:1", settings()).expect("valid settings");
+        let fence = alone.fence();
+        let t0 = Instant::now() + AHEAD;
+        let (steps, shown) = (
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let step = {
+            let (fence, steps, shown) =
+                (Arc::clone(&fence), Arc::clone(&steps), Arc::clone(&shown));
+            move || {
+                steps.fetch_add(1, Ordering::Relaxed);
+                shown.fetch_or(fence.leader_term(t0).is_some(), Ordering::Relaxed);
+            }
+        };
+        alone.at_take(step);
+        assert_eq!(alone.tick(t0).expect("tick"), Tick::Acquired { term: 1 });
+        assert_eq!(fence.leader_term(t0), Some(1));
+        assert_eq!(steps.load(Ordering::Relaxed), 1);
+        assert!(
+            !shown.load(Ordering::Relaxed),
+            "the fence showed no term at the step"
+        );
+        assert_eq!(
+            alone.tick(t0 + S).expect("renew"),
+            Tick::Renewed { term: 1 }
+        );
+        assert_eq!(steps.load(Ordering::Relaxed), 1, "a renewal is no take");
     }
 
     #[test]

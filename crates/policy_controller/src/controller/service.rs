@@ -281,9 +281,15 @@ impl Shared {
     /// The election's thread could not be started.
     pub(crate) fn elect(
         &self,
-        elector: Elector,
+        mut elector: Elector,
         standing: watch::Sender<Standing>,
     ) -> io::Result<Running> {
+        // At a take the door is its source's again, and a replica that
+        // deferred its start's document applies it at its first one, ahead
+        // of the fence: a session and a decision read the fence alone, and
+        // none is admitted before the document stands.
+        let documents = Arc::clone(&self.generations);
+        elector.at_take(move || documents.at_take());
         let election = election::start(elector, Arc::clone(&self.store), standing)?;
         let door = election.door();
         self.floors.open(door.clone());
@@ -1237,6 +1243,52 @@ mod tests {
             .expect("the election thread ends within 20 s of its handle's drop");
         assert_eq!(shared.fence.leader_term(Instant::now()), None);
         assert!(looks.borrow().holder.is_empty(), "the lease is given up");
+    }
+
+    /// A replica that deferred its start's document runs it once its fence
+    /// shows its first term: the take applies it ahead of the fence, so no
+    /// decision is admitted under a term with no generation.
+    #[tokio::test]
+    async fn a_deferred_document_stands_when_the_fence_shows_the_first_term() {
+        let settings = ElectionSettings {
+            duration: Duration::from_millis(600),
+            renew_period: Duration::from_millis(20),
+            renew_deadline: Duration::from_millis(400),
+        };
+        let elector = Elector::alone(IDENTITY, settings).expect("the settings are in order");
+        let (standing, stood) = watch::channel(Standing::default());
+        let (store, feed) = journaled_from(&LeasePlace::Process, 0);
+        let shared = Shared::new(
+            ID.to_owned(),
+            ADDRESS.to_owned(),
+            &elector,
+            stood,
+            (store, feed),
+            Arc::new(Catalog::builtin()),
+            1,
+        )
+        .expect("the decider starts");
+        shared
+            .generations
+            .defer(LEAST_LOAD.into(), Format::Yaml)
+            .expect("a valid document");
+        assert_eq!(shared.store.world().spec().generation(), 0);
+
+        let mut running = shared.elect(elector, standing).expect("a thread");
+        let shown = async {
+            while shared.fence.leader_term(Instant::now()).is_none() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(20), shown)
+            .await
+            .expect("the first take opens its fence within 20 s");
+        assert_eq!(shared.store.world().spec().generation(), 1);
+
+        running.stop();
+        tokio::time::timeout(Duration::from_secs(20), running.ended())
+            .await
+            .expect("the election thread ends within 20 s of its stop");
     }
 
     /// Who may take the lease a leader hands over at its term's mark.

@@ -93,7 +93,13 @@ pub trait Journal: Send + Sync {
     /// A generation applied under no term takes no place: a standby joins a
     /// history at a term's start, so the store tells the standing number
     /// again behind each term it takes
-    /// ([`crate::store::LeasesStore::set_term`]).
+    /// ([`crate::store::LeasesStore::set_term`]). That one is told under
+    /// the term's rise, not under the membership lock: an apply that
+    /// publishes between the read of the standing number and its telling
+    /// leaves the older number behind the newer one. The older entry is
+    /// inert: it crosses by its number alone, since the door joins a
+    /// document only to the generation it still holds, and an event with
+    /// no document changes nothing on a standby.
     fn generation(&self, at: Option<Position>, generation: u64);
 
     /// The store's term rose, told once a rise: the store took `term`, and

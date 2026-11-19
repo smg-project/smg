@@ -173,8 +173,10 @@ struct Cli {
 
     /// The policy spec as a file, in YAML (JSON under a `.json` name): read
     /// and applied at the start, as generation 1 or under the number its
-    /// `generation` line writes. A file that cannot be read, or a document
-    /// that is invalid, refuses the start. The file is then watched: a
+    /// `generation` line writes. Under `--lease-file` or `--lease-name` it
+    /// is read at the start and applied when this replica first leads. A
+    /// file that cannot be read, or a document that is invalid, refuses the
+    /// start. The file is then watched: a
     /// changed one is applied as the next generation, or under the number
     /// it writes, and one that does not run is rejected whole and the
     /// running generation stays. A start names one source of the spec, this
@@ -1584,6 +1586,60 @@ mod tests {
             ),
             Err(other) => panic!("refused as {other}"),
             Ok(_) => panic!("a shared lease takes no spec store"),
+        }
+    }
+
+    /// Beside a lease another replica can take, a spec file is passed at
+    /// the start and not applied: the replica runs no number of its own
+    /// until it leads, so it follows its leader's generation whatever the
+    /// number. The file is its source all the same, and writes while the
+    /// replica leads. One that does not run refuses the start. Under a
+    /// lease in the process the file is applied at the start, and writes
+    /// always.
+    #[tokio::test]
+    async fn a_spec_file_is_applied_at_the_start_under_a_lease_in_the_process_alone() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let document =
+            "apiVersion: smg.policy/v1\nprofiles:\n  default:\n    filter: [healthy]\n    pick: random\n";
+        let file = dir.path().join("policy.yaml");
+        std::fs::write(&file, document).expect("the file");
+        let lease = dir.path().join("lease");
+        let shared = ["--lease-file", lease.to_str().expect("a path in UTF-8")];
+        let start = |flags: &[&str]| {
+            let mut args = EPHEMERAL.to_vec();
+            args.extend_from_slice(flags);
+            let config = parse(&args).config().expect("the flags are in order");
+            bind(
+                config,
+                Catalog::builtin(),
+                &[],
+                SpecSource::File(file.clone()),
+            )
+        };
+
+        let alone = start(&[]).await.expect("the file starts");
+        assert_eq!(alone.store().world().spec().generation(), 1);
+        assert!(alone.shared.generations.source_writes());
+        drop(alone);
+
+        let paired = start(&shared).await.expect("the file starts");
+        assert_eq!(
+            paired.store().world().spec().generation(),
+            0,
+            "passed, not applied"
+        );
+        assert!(paired.shared.generations.bound(), "a source all the same");
+        assert!(
+            !paired.shared.generations.source_writes(),
+            "its source writes while it leads, and it has not led"
+        );
+        drop(paired);
+
+        std::fs::write(&file, document.replace("healthy", "no-such-stage")).expect("the file");
+        match start(&shared).await {
+            Err(Error::SpecFile { .. }) => {}
+            Err(other) => panic!("refused as {other}"),
+            Ok(_) => panic!("a document that does not run refuses the start"),
         }
     }
 }

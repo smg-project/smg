@@ -562,6 +562,15 @@ impl Controller {
     /// number it writes, and one that does not run is rejected whole, with
     /// the running generation kept.
     ///
+    /// A replica under a lease another replica can take applies nothing
+    /// here: its document is passed, and applied at the replica's first
+    /// take where the replica runs nothing by then. Until it leads, a
+    /// replica that follows a leader runs what its leader's log gives it,
+    /// under the leader's number. Behind each take its watch reads the
+    /// file as a start does: a leader runs what its file says. The lease
+    /// alone decides this, whatever the order the listeners are configured
+    /// in.
+    ///
     /// A file that cannot be read, or a document the validator refuses, is
     /// refused here, before anything serves. The document names the stages
     /// the bind was handed ([`Controller::catalog`]), a host's own among
@@ -571,9 +580,23 @@ impl Controller {
     pub async fn spec_file(&mut self, path: impl Into<PathBuf>) -> Result<(), Error> {
         let path = path.into();
         let generations = Arc::clone(&self.shared.generations);
+        // Under a shared lease a replica may follow a leader, and then
+        // runs its leader's generations: its own file is passed here and
+        // applied at its first take, and its source writes while the
+        // replica leads, by the fence.
+        let deferred = self.config.election.lease.is_shared();
+        if deferred {
+            generations.under(Arc::clone(&self.shared.fence));
+        }
         let read = {
             let path = path.clone();
-            tokio::task::spawn_blocking(move || SpecFile::start(path, generations))
+            tokio::task::spawn_blocking(move || {
+                if deferred {
+                    SpecFile::start_deferred(path, generations)
+                } else {
+                    SpecFile::start(path, generations)
+                }
+            })
         };
         match read.await {
             Ok(Ok(file)) => self.spec_file = Some(file),
@@ -584,6 +607,7 @@ impl Controller {
             controller_id = %self.config.controller_id,
             path = %path.display(),
             generation = self.shared.generations.generation(),
+            at_first_take = deferred,
             "spec file"
         );
         self.metrics.spec(Arc::clone(&self.shared.generations));
@@ -875,10 +899,10 @@ impl Controller {
         if let Some(file) = spec_file {
             let file_stop = stop.subscribe();
             // A replica that follows applies its leader's generations from
-            // the log: its own watch looks at the file while it leads.
-            let leads = follows.map(|_| shared.role.subscribe());
+            // the log: its own watch asks the door, and looks at the file
+            // while its source writes there.
             tasks.spawn(async move {
-                file.run(file_stop, leads)
+                file.run(file_stop)
                     .await
                     .map_err(|join| Error::Task(join.to_string()))
             });
