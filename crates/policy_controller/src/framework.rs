@@ -4019,6 +4019,10 @@ impl Engine {
                 // withdraw it. The plain form never names a pin here, and
                 // carries no test for one.
                 if KEPT && pins.contains(&first) {
+                    // A dispatch on an alternate writes that worker among
+                    // the key's pins: none at the rule's cap stands behind
+                    // the pin.
+                    Self::drop_alternates_at_cap(rule, candidates, &buf.kept, &mut pick.targets);
                     // The followed pin is put to the rule's cap as the pin
                     // read first is: the lift is of the overload veto alone.
                     // A rule with no cap asks no walk for the pin's row.
@@ -4053,14 +4057,6 @@ impl Engine {
                             .find(|&&i| candidates[i as usize].id == owner)
                         {
                             let c = &candidates[i as usize];
-                            if Self::at_cap(rule, c) {
-                                if let Some(handed) = self.hand_on::<KEPT>(
-                                    profile, index, rule, placing, facts, pool, set, cx, buf,
-                                    all_vetoed, owner,
-                                ) {
-                                    return handed;
-                                }
-                            }
                             if owner != first {
                                 pick.targets.lead(Target {
                                     position: c.position,
@@ -4068,6 +4064,24 @@ impl Engine {
                                     dp_rank: c.dp_rank,
                                     pair: None,
                                 });
+                            }
+                            // The alternates behind the claimed worker, as
+                            // behind a followed pin: none at the rule's cap.
+                            // Read here, ahead of the hand-on's own passes
+                            // over the buffers.
+                            Self::drop_alternates_at_cap(
+                                rule,
+                                candidates,
+                                &buf.kept,
+                                &mut pick.targets,
+                            );
+                            if Self::at_cap(rule, c) {
+                                if let Some(handed) = self.hand_on::<KEPT>(
+                                    profile, index, rule, placing, facts, pool, set, cx, buf,
+                                    all_vetoed, owner,
+                                ) {
+                                    return handed;
+                                }
                             }
                         }
                     }
@@ -4113,14 +4127,43 @@ impl Engine {
         rule.inflight_cap != 0 && pin.session_in_flight >= rule.inflight_cap
     }
 
+    /// Drops the targets behind the first that carry the rule's cap of the
+    /// key's requests. A commit writes the worker it lands on among the
+    /// key's pins by the decision's verdict, and the cap bounds where a pin
+    /// may go: an alternate at the cap is not offered. The first target
+    /// stays, the worker the decision follows or places. A rule with no cap
+    /// asks no walk.
+    fn drop_alternates_at_cap(
+        rule: &SessionRule,
+        candidates: &[Candidate],
+        kept: &[u32],
+        targets: &mut Targets,
+    ) {
+        if rule.inflight_cap == 0 || targets.len() < 2 {
+            return;
+        }
+        let placed = *targets;
+        targets.clear();
+        for (nth, target) in placed.iter().enumerate() {
+            let capped = nth > 0
+                && kept.iter().any(|&k| {
+                    let c = &candidates[k as usize];
+                    c.id == target.id && Self::at_cap(rule, c)
+                });
+            if !capped {
+                targets.push(*target);
+            }
+        }
+    }
+
     /// A pin at its rule's in-flight cap ([`Self::at_cap`]) puts the request
     /// to the stages again, over every survivor: the cap bounds where a pin
     /// may move, not where a request may go. A placement on `pin` again is
     /// the pin taken ([`SessionVerdict::Pinned`]), and the decision names no
-    /// other target, as where a pin is under the cap. One on another worker
-    /// under the cap is marked [`SessionVerdict::Respill`], and its commit
-    /// fronts that worker, whichever of its targets it lands on: a
-    /// respill's alternates are the workers under the cap alone. One on
+    /// other target: at the cap a pin moves by a respill alone. One on
+    /// another worker under the cap is marked [`SessionVerdict::Respill`],
+    /// and its commit fronts that worker, whichever of its targets it lands
+    /// on: a respill's alternates are the workers under the cap alone. One on
     /// another worker at the cap carries no verdict: its commit moves no
     /// pin. `None` where no survivor stands. A pin the decision follows
     /// asks in its form's order ([`Self::hand_on`]).
@@ -4160,17 +4203,14 @@ impl Engine {
             // A commit moves the pins by the decision's verdict, whichever of
             // its targets it lands on. So a respill names the workers under
             // the cap alone, and the pin taken again is the decision's one
-            // target, as a pin under the cap is. A placement with no verdict
-            // keeps its alternates: its commit moves no pin.
-            let placed = pick.targets;
+            // target: at the cap a pin moves by a respill alone. A placement
+            // with no verdict keeps its alternates: its commit moves no pin.
             match pick.session_verdict {
                 SessionVerdict::Respill => {
-                    pick.targets.clear();
-                    for target in placed.iter().filter(|target| under_the_cap(target.id)) {
-                        pick.targets.push(*target);
-                    }
+                    Self::drop_alternates_at_cap(rule, candidates, &buf.kept, &mut pick.targets);
                 }
                 SessionVerdict::Pinned => {
+                    let placed = pick.targets;
                     pick.targets.clear();
                     if let Some(first) = placed.first() {
                         pick.targets.push(*first);
@@ -8559,9 +8599,9 @@ mod tests {
         );
     }
 
-    /// The pin taken again at the cap is the decision's one target, as a pin
-    /// under the cap is. A dispatch on an alternate would move the pin by
-    /// the key's recovery, onto a worker at the cap as onto any other.
+    /// The pin taken again at the cap is the decision's one target. A
+    /// dispatch on an alternate would move the pin by the key's recovery,
+    /// onto a worker at the cap as onto any other.
     #[test]
     fn the_pin_taken_again_at_the_cap_names_no_alternate() {
         let engine = session_engine(SESSIONS);
