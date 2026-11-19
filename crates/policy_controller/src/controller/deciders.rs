@@ -1129,7 +1129,10 @@ pub(crate) mod tests {
         catalog::Catalog,
         controller::{
             election::Standing,
-            gateways::tests::PATIENT,
+            gateways::{
+                tests::{GRACE, PATIENT},
+                Gateways, Vetoed,
+            },
             lifecycle,
             wire::{self, Checked},
         },
@@ -3945,7 +3948,7 @@ pub(crate) mod tests {
         store.apply(spec).expect("above the unbound start");
         let taken = Instant::now();
         let now = taken + Duration::from_secs(3);
-        // The rows whose own bit says stalled, the mask's length, whether
+        // The rows whose own bit says a veto, the mask's length, whether
         // the engine picked, and the rows written into the decider's
         // buffers.
         let decided = || {
@@ -3961,7 +3964,7 @@ pub(crate) mod tests {
                     |facts, pool, rows, cx, scratch| {
                         let stalled: Vec<WorkerId> = rows
                             .iter()
-                            .filter(|row| row.health.stalled)
+                            .filter(|row| row.health.breaker_open)
                             .map(|row| row.id)
                             .collect();
                         let engine = world.spec().engine();
@@ -4377,7 +4380,7 @@ pub(crate) mod tests {
                     stalled: rows
                         .iter()
                         .zip(0..)
-                        .filter(|(row, at)| row.health.stalled || cx.masks(*at))
+                        .filter(|(row, at)| row.health.breaker_open || cx.masks(*at))
                         .map(|(row, _)| row.id)
                         .collect(),
                     pool: (pool.pool_size, pool.generation),
@@ -4986,6 +4989,55 @@ pub(crate) mod tests {
         }
         // The veto is the asking gateway's alone.
         assert!(theirs.contains(&vetoed), "{theirs:?}");
+    }
+
+    /// The kinds of a gateway's vetoes reach its decisions. A pool it doubts
+    /// for liveness on every worker is steered: a doubt is not an outage. A
+    /// breaker's open window on each worker refuses the pool, as the gateway
+    /// refuses it. One doubted worker among held ones takes every request,
+    /// a kind this build has no name for holds as a breaker does, and
+    /// another gateway reads none of it.
+    #[tokio::test]
+    async fn a_pool_behind_the_gateways_open_breakers_is_refused_and_one_it_doubts_is_steered() {
+        const BREAKER: i32 = proto::gateway_veto::Kind::Breaker as i32;
+        const LIVENESS: i32 = proto::gateway_veto::Kind::Liveness as i32;
+        let mut bed = leading([]);
+        let now = bed.script.taken;
+        let until = now + Duration::from_secs(60);
+        let workers = bed.workers.clone();
+        let fence = bed.elector.fence();
+        let gateways = Arc::new(Gateways::new(GRACE, 1_024, fence, Arc::clone(&bed.store)));
+        let seat = gateways
+            .welcome(GATEWAY, "gateway-a", 1, now)
+            .expect("the table takes the Hello");
+        let veto = |worker: WorkerId, kind: i32, until: Option<Instant>| {
+            assert_eq!(seat.veto(worker, kind, until, now), Vetoed::Shown);
+        };
+        let shed_at = |answer: &proto::DecideAnswer| match outcome(answer) {
+            Outcome::Shed(shed) => (shed.reason(), shed.emptied_by.clone()),
+            other => panic!("a shed: {other:?}"),
+        };
+        let at_health = (proto::ShedReason::NoEndpoints, "healthy".to_owned());
+        for &worker in &workers {
+            veto(worker, LIVENESS, Some(until));
+        }
+        let steered = bed.ask(frame(1, 1)).await;
+        assert!(workers.contains(&picked(&steered)));
+        for &worker in &workers {
+            veto(worker, BREAKER, Some(until));
+        }
+        assert_eq!(shed_at(&bed.ask(frame(2, 2)).await), at_health);
+        // One breaker closes: its worker is doubted alone.
+        let doubted = workers[1];
+        veto(doubted, BREAKER, None);
+        for (id, seed) in (3..=10).zip(3..) {
+            let answer = bed.ask(frame(id, seed)).await;
+            assert_eq!(picked(&answer), doubted, "seed {seed}");
+        }
+        veto(doubted, 7, Some(until));
+        assert_eq!(shed_at(&bed.ask(frame(11, 11)).await), at_health);
+        assert_eq!(bed.submit_at(frame(12, 12), OTHER, Duration::ZERO), None);
+        assert!(workers.contains(&picked(&bed.answer().await)));
     }
 
     #[tokio::test]

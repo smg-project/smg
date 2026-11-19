@@ -329,6 +329,7 @@ impl Checked {
                 // The asking gateway's standing vetoes beside lent rows,
                 // and nothing where each row carries its own bit.
                 stalled: view.stalled,
+                held: view.held,
                 pins: view.pins,
             },
         );
@@ -750,6 +751,7 @@ mod tests {
             budget_micros: 1_500,
             affinity: &affinity,
             stalled: &[],
+            held: &[],
             in_flight: None,
             max_block_hashes: 256,
             named: None,
@@ -1074,6 +1076,7 @@ mod tests {
                 budget_micros: 1,
                 affinity: &[],
                 stalled: &[],
+                held: &[],
                 in_flight: None,
                 max_block_hashes,
                 named: None,

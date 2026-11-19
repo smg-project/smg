@@ -295,6 +295,9 @@ fn veto_ran(profile: &Profile, veto: &str, emptied_by: &str) -> bool {
 /// worker under its thresholds takes the request, and a pool over on every
 /// ready worker is shed as saturated. Nothing harder is lifted: a worker
 /// that is not ready, behind an open breaker or draining stays refused.
+/// So does a row a hold of the host stands on, whichever way the host says
+/// it: by the breaker bit on a row it wrote, or among its held rows beside
+/// lent ones ([`Constraints::held`]), which the lifted pass keeps masked.
 ///
 /// A set put to no rule is shed where it emptied ([`AllVetoed::Unasked`]):
 /// each side of a pair, and the rule's own passes, so the rule is asked
@@ -342,11 +345,14 @@ pub(super) fn emptied(
             Some(stage) => ended = stage,
         }
     }
-    // A doubt is a row's own bit or the host's mask beside the rows.
+    // A doubt is a row's own bit or the host's mask beside the rows. A row
+    // a hold of the host stands on is not doubted: it stays masked, and a
+    // mask of held rows alone gains nobody when it is lifted.
     let own = candidates.iter().any(|row| row.health.stalled);
-    if (own || !cx.stalled.is_empty()) && veto_ran(profile, Healthy.name(), ended) {
+    let masked = cx.stalled.len() > cx.held.len();
+    if (own || masked) && veto_ran(profile, Healthy.name(), ended) {
         pass.overload_lifted |= steers;
-        pass.stalled = &[];
+        pass.stalled = cx.held;
         let stage = if own {
             let mut rows = std::mem::take(&mut buf.undoubted);
             undoubted(candidates, &mut rows);
@@ -411,9 +417,9 @@ fn overload_pass(
 /// stage handed a row reads the lift whatever it reads of the row. The pass
 /// that lifts the liveness veto is shown these where a row's own bit is
 /// set. Rows the host's mask alone doubts are read as they are, with the
-/// mask left out. A stage that answers from its own scope answers as it
-/// did: the scope was opened over the decision's rows. One pool of rows a
-/// scratch, sized at the first pass that needs it.
+/// mask cut to the rows a hold stands on. A stage that answers from its
+/// own scope answers as it did: the scope was opened over the decision's
+/// rows. One pool of rows a scratch, sized at the first pass that needs it.
 fn undoubted(candidates: &[Candidate], rows: &mut Vec<Candidate>) {
     rows.clear();
     rows.extend(candidates.iter().map(|row| Candidate {
@@ -569,6 +575,19 @@ mod tests {
         fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
             self.0.fetch_add(1, Ordering::Relaxed);
             false
+        }
+    }
+
+    /// Keeps every row and counts the rows it was asked about.
+    #[derive(Debug)]
+    struct Counts(Arc<AtomicUsize>);
+    impl Filter for Counts {
+        fn name(&self) -> &'static str {
+            "counts"
+        }
+        fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            true
         }
     }
 
@@ -1065,11 +1084,13 @@ mod tests {
 
     /// The pair plan's shed over `prefills` and one free decode. The prefill
     /// side is filtered by `veto` and then by a filter that refuses every
-    /// row. With the shed, the count of the prefills that filter was asked
-    /// about.
+    /// row, under the host's mask over the prefills and the rows of it the
+    /// host holds (`masks`). With the shed, the count of the prefills that
+    /// filter was asked about.
     fn pairs_side_shed(
         veto: Box<dyn Filter>,
         prefills: [Candidate; 2],
+        masks: (&[u32], &[u32]),
     ) -> ((ShedReason, &'static str), usize) {
         let asked = Arc::new(AtomicUsize::new(0));
         let prefill_side = Profile {
@@ -1114,7 +1135,11 @@ mod tests {
                 decodes: &decodes,
                 ..PairPools::default()
             },
-            &Constraints::default(),
+            &Constraints {
+                stalled: masks.0,
+                held: masks.1,
+                ..Constraints::default()
+            },
             &Constraints::default(),
             &mut Scratch::new(),
         );
@@ -1127,7 +1152,8 @@ mod tests {
     /// filter listed behind the veto is asked about no prefill.
     #[test]
     fn a_pairs_side_sheds_at_the_veto_and_is_filtered_once() {
-        let side = pairs_side_shed(Box::new(NotOverloaded), [over(0, 1), over(1, 2)]);
+        let none: (&[u32], &[u32]) = (&[], &[]);
+        let side = pairs_side_shed(Box::new(NotOverloaded), [over(0, 1), over(1, 2)], none);
         assert_eq!(side, ((ShedReason::Saturated, "not-overloaded"), 0));
     }
 
@@ -3197,8 +3223,22 @@ mod tests {
     /// no prefill.
     #[test]
     fn a_pairs_side_doubted_on_every_worker_sheds_at_the_health_stage() {
-        let side = pairs_side_shed(Box::new(Healthy), [doubted(0, 1), doubted(1, 2)]);
+        let none: (&[u32], &[u32]) = (&[], &[]);
+        let side = pairs_side_shed(Box::new(Healthy), [doubted(0, 1), doubted(1, 2)], none);
         assert_eq!(side, ((ShedReason::NoEndpoints, "healthy"), 0));
+    }
+
+    /// A hold changes nothing on a side of a pair, which is put to no tier.
+    /// A prefill side the host holds on every row, and one with a doubted
+    /// row among held ones, are shed at the health stage, and the filter
+    /// listed behind that stage is asked about no prefill.
+    #[test]
+    fn a_pairs_side_under_a_hold_sheds_at_the_health_stage() {
+        for held in [&[0, 1][..], &[0]] {
+            let masks: (&[u32], &[u32]) = (&[0, 1], held);
+            let side = pairs_side_shed(Box::new(Healthy), [free(0, 1), free(1, 2)], masks);
+            assert_eq!(side, ((ShedReason::NoEndpoints, "healthy"), 0));
+        }
     }
 
     /// The liveness tier follows the pass the overload lift ended. Where a
@@ -3341,6 +3381,83 @@ mod tests {
         let decision = ask(&[free(0, 0), free(1, 5)], &[0], &mut scratch);
         assert_eq!(order(&decision), vec![1]);
         assert_eq!(decision.trace().lifted, Lifted::None);
+    }
+
+    /// A row a hold of the host stands on is not doubted: the tier lifts the
+    /// host's mask and leaves its held rows masked. A pool held on every
+    /// row is shed at the health stage under either word of the binding, as
+    /// with no tier. One doubted row among held ones takes the request
+    /// whatever it holds. So it does where the host wrote its rows: there a
+    /// held row carries the breaker bit.
+    #[test]
+    fn a_row_the_host_holds_stays_refused_through_the_liveness_tier() {
+        let pool = [free(0, 0), free(1, 1), free(2, 9), free(3, 2)];
+        let ask = |engine: &Engine, pool: &[Candidate], stalled: &[u32], held: &[u32]| {
+            let masked = Constraints {
+                stalled,
+                held,
+                ..Constraints::default()
+            };
+            let mut scratch = Scratch::new();
+            engine.decide(
+                &facts(1),
+                &PoolFacts::default(),
+                pool,
+                &masked,
+                &mut scratch,
+            )
+        };
+        let mut written = pool;
+        for row in &mut written {
+            row.health.breaker_open = row.position != 2;
+            row.health.stalled = row.position == 2;
+        }
+        for shed in [false, true] {
+            let engine = engine_of("least_load", shed);
+            let whole = ask(&engine, &pool, &[0, 1, 2, 3], &[0, 1, 2, 3]);
+            assert_eq!(shed_of(&whole), (ShedReason::NoEndpoints, "healthy"));
+            for one in [
+                ask(&engine, &pool, &[0, 1, 2, 3], &[0, 1, 3]),
+                ask(&engine, &written, &[], &[]),
+            ] {
+                assert_eq!(order(&one), vec![2], "shed {shed}");
+                assert_eq!(one.trace().lifted, Lifted::Liveness);
+            }
+        }
+    }
+
+    /// The tier runs where it would gain a row and nowhere else: over a mask
+    /// of held rows alone it makes no pass. A filter listed ahead of the
+    /// health stage is asked about each row once there, and once more by the
+    /// tier's pass where one row of the mask is doubted.
+    #[test]
+    fn a_mask_of_held_rows_alone_costs_no_further_pass() {
+        let pool = [free(0, 0), free(1, 1), free(2, 9), free(3, 2)];
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counts: Box<dyn Filter> = Box::new(Counts(Arc::clone(&asked)));
+        let (engine, _) = counted_among(|_| vec![counts, Box::new(Healthy)]);
+        let ask = |held: &[u32]| {
+            let masked = Constraints {
+                stalled: &[0, 1, 2, 3],
+                held,
+                ..Constraints::default()
+            };
+            let mut scratch = Scratch::new();
+            let decision = engine.decide(
+                &facts(1),
+                &PoolFacts::default(),
+                &pool,
+                &masked,
+                &mut scratch,
+            );
+            (decision, asked.swap(0, Ordering::Relaxed))
+        };
+        let (whole, passes) = ask(&[0, 1, 2, 3]);
+        assert_eq!(shed_of(&whole), (ShedReason::NoEndpoints, "healthy"));
+        assert_eq!(passes, pool.len());
+        let (one, passes) = ask(&[0, 1, 3]);
+        assert_eq!(order(&one), vec![2]);
+        assert_eq!(passes, 2 * pool.len());
     }
 
     /// A kept key in a pool doubted on every worker is steered to the fewest

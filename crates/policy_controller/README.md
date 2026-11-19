@@ -58,6 +58,7 @@ A decision starts with the **pool**: the workers that serve the request's model.
 - A **hard** filter is final. Hard filters run first, in the order written. If one leaves no worker, the decision stops and the request is shed. The answer names the filter that emptied the pool.
 - A **soft** filter steps aside when it would leave no worker. The pool goes on as it was before that filter.
 - `not-overloaded` has a rule of its own. When every usable worker is over its thresholds, the request still goes to one of them. Set `overload.shed_when_all_vetoed: true` on the binding to shed it instead.
+- `healthy` has one too, for the liveness doubt alone. When every ready worker is stalled, the request still goes to one of them: a doubt is not an outage. A worker that is not ready, is draining or is behind an open circuit breaker is never taken this way.
 
 **2. Score.** Each scorer gives every remaining worker a score from 0 to 1. Higher is better. The profile's score for a worker is the weighted average of those scores.
 
@@ -598,7 +599,7 @@ A stage is a Rust type that implements `Filter`, `Scorer` or `Picker`. You add i
 - The `bucket` scorer in the stock controller. The library runs it. The stock controller refuses a document that names it, because it does not yet report every request's end to a stage.
 - `prefix-affinity` with `source` set to `predictor` or `merged` in the stock controller. Both read the prefixes sent to each worker. The library validates them for a host that fills that column. The stock controller refuses a document that names either, because it does not yet record the prefixes it sent.
 - Cache events in the stock controller. Its `PushKvEvents` call is not served, and nothing else feeds its cache index. So `prefix-affinity` sees no worker as holding a prefix there. The library places by cache for a host that feeds the index.
-- Two more inputs in the stock controller. A worker's row has a circuit-breaker bit that nothing feeds yet, so `healthy` reads it as closed. A gateway's own breaker still counts: its breaker veto on its session takes the worker out of that gateway's decisions. A key's count of requests in flight is not fed, so `inflight_cap` passes no worker over.
+- Two more inputs in the stock controller. A worker's circuit-breaker bit has one source there: a veto of the asking gateway that holds, as its breaker's open window does. Such a veto takes the worker out of that gateway's decisions, and no rule lifts it. The controller keeps no breaker of its own. A key's count of requests in flight is not fed, so `inflight_cap` passes no worker over.
 - An engine connection over the host-local ZMQ wire. A controller built with the `worker-host` feature hands each worker object a gRPC connector alone, and an object connects to its engine at its first use. A worker that serves only the ZMQ wire gets no connection there, so nothing that controller reads from an engine reaches it for that worker.
 - A plugin named in the document. The format has no field for one.
 - Four calls of the contract: `PushLoad`, `PushKvEvents`, `StepDown` and `WatchRegime`. The stock controller answers each as not served.

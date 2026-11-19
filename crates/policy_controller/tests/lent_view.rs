@@ -234,6 +234,7 @@ fn lent_agrees(
             let view = world
                 .view(MODEL, Role::Single, &ask, false, &mut out)
                 .expect("the pool");
+            let mut holds = Vec::new();
             read.masked += view.stalled.len() as u64;
             read.pinned += u64::from(view.pinned_at != 0);
             let facts = RequestFacts {
@@ -244,6 +245,7 @@ fn lent_agrees(
             };
             let cx = Constraints {
                 stalled: view.stalled,
+                held: world.held(&view, &ask, &mut holds),
                 ..Constraints::default()
             };
             let pool = view.built.pool_facts();

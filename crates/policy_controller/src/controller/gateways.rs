@@ -35,8 +35,10 @@
 //! welcomed and let go again.
 //!
 //! A gateway's vetoes are noted here by kind (design 5.1). The store shows
-//! one end a gateway and worker: the latest of the kinds' ends that still
-//! stand, so a kind that clears never lifts another. A session writes a
+//! one veto a gateway and worker, with no kind and two ends. The first is
+//! the latest of the kinds' ends that still stand, so a kind that clears
+//! never lifts another. The second is the veto's hold: the latest end of
+//! the kinds no rule lifts ([`hold_of`]). A session writes a
 //! veto through its seat, under the table's lock, where the question is
 //! asked again: a replaced session's veto is never written, and no pass
 //! reclaims one. The note follows the store: a veto is about a worker's
@@ -68,6 +70,7 @@ use tracing::{info, warn};
 
 use crate::{
     elector::Fence,
+    proto::gateway_veto::Kind,
     store::{GatewayId, HealthSink, LeasesStore, MemoryStore, VetoWrite, WorkersStore},
     view::WorkerId,
 };
@@ -78,6 +81,19 @@ type Ends = Vec<(i32, Instant)>;
 /// The latest of a worker's ends: what the store shows.
 fn latest(ends: &[(i32, Instant)]) -> Option<Instant> {
     ends.iter().map(|&(_, end)| end).max()
+}
+
+/// The kind the all-vetoed rule lifts as its last resort: the contract's
+/// `KIND_LIVENESS`, a doubt of the worker's liveness.
+const LIVENESS: i32 = Kind::Liveness as i32;
+
+/// The hold among a worker's ends, which the store shows beside the latest:
+/// the latest end of the kinds no rule lifts. Every kind but [`LIVENESS`]
+/// holds. A breaker's open window does, and so does a number this build
+/// has no name for: the rule lifts what it can name.
+fn hold_of(ends: &[(i32, Instant)]) -> Option<Instant> {
+    let holding = ends.iter().filter(|&&(kind, _)| kind != LIVENESS);
+    holding.map(|&(_, end)| end).max()
 }
 
 /// How many kinds of veto one worker holds for one gateway at most. A kind
@@ -264,7 +280,8 @@ impl Seat {
     }
 
     /// One kind's veto on `worker` set until `until`, or lifted, at `now`:
-    /// the other kinds' ends stand, and the store shows the latest.
+    /// the other kinds' ends stand, and the store shows the latest of them
+    /// with the hold among them ([`hold_of`]).
     pub(crate) fn veto(
         &self,
         worker: WorkerId,
@@ -581,9 +598,13 @@ impl Gateways {
                 }
             }
             let shown = latest(&ends).into_iter().chain(until).max();
+            // The frame's own end is a hold's unless its kind is the one a
+            // rule lifts.
+            let own = until.filter(|_| kind != LIVENESS);
+            let hold = hold_of(&ends).into_iter().chain(own).max();
             match self
                 .store
-                .gateway_veto_noted(gateway, worker, shown, stands, now)
+                .gateway_veto_noted(gateway, worker, shown, hold, stands, now)
             {
                 VetoWrite::Written => {
                     ends.extend(until.map(|until| (kind, until)));
@@ -649,9 +670,14 @@ impl Gateways {
         // The list is the gateway's word of this instant: no note stands
         // behind it, and a worker with no row keeps nothing.
         listed.retain(|worker, ends| {
-            let written = self
-                .store
-                .gateway_veto_noted(gateway, *worker, latest(ends), false, now);
+            let written = self.store.gateway_veto_noted(
+                gateway,
+                *worker,
+                latest(ends),
+                hold_of(ends),
+                false,
+                now,
+            );
             written == VetoWrite::Written
         });
         row.vetoes = listed;
@@ -771,10 +797,10 @@ pub(crate) mod tests {
         lease::{Lease, LeaseId},
         spec::{AppliedSpec, PolicySpec},
         store::{
-            GatewayId, HealthSink, LeaseRecord, LeaseState, LeasesStore, MemoryStore, Picked,
-            SessionsStore, WorkersStore,
+            Ask, GatewayId, HealthSink, LeaseRecord, LeaseState, LeasesStore, MemoryStore, Picked,
+            SessionsStore, ViewBuffers, WorkersStore,
         },
-        view::WorkerId,
+        view::{Role, WorkerId},
     };
 
     pub(crate) const GRACE: Duration = Duration::from_secs(10);
@@ -1553,6 +1579,89 @@ pub(crate) mod tests {
         );
         assert_eq!(seat.veto(w, 7, None, t0), Vetoed::Shown);
         assert!(!store.vetoed(A, w, t0));
+    }
+
+    /// What a view built for `gateway` at `now` reads of the worker: the
+    /// breaker bit and the stalled bit of its row.
+    fn bits(
+        store: &MemoryStore,
+        gateway: GatewayId,
+        worker: WorkerId,
+        now: Instant,
+    ) -> (bool, bool) {
+        let ask = Ask {
+            gateway,
+            now,
+            pinned: None,
+            affinity: false,
+        };
+        let mut out = ViewBuffers::default();
+        // A registration is in force at its window's publication: the case
+        // asks for one.
+        store.publish_now();
+        store
+            .build_view("m", Role::Single, &ask, &mut out)
+            .expect("the pool");
+        let row = out.candidates.iter().find(|row| row.id == worker);
+        let health = row.expect("the worker's row").health;
+        (health.breaker_open, health.stalled)
+    }
+
+    /// The store reads no kind: the note says which ends hold. Every kind
+    /// but the doubt of liveness holds, a number this build has no name for
+    /// among them, and the hold shown is the latest of their ends. A worker
+    /// reads to its gateway as behind an open breaker while a hold stands,
+    /// and as doubted from then to its veto's end.
+    #[test]
+    fn the_store_is_shown_the_hold_among_a_workers_kinds() {
+        let (_elector, store, gateways, t0) = leading(GRACE);
+        let w = worker(&store, "http://a:8000");
+        let seat = welcomed(&gateways, A, "gateway-a", TERM, t0);
+        let (held, doubted, clear) = ((true, false), (false, true), (false, false));
+        // A doubt of liveness alone holds nothing.
+        assert_eq!(seat.veto(w, LIVENESS, Some(t0 + 9 * S), t0), Vetoed::Shown);
+        assert_eq!(bits(&store, A, w, t0), doubted);
+        // A breaker's window beside it holds to its own end, and the doubt
+        // stands from there.
+        assert_eq!(seat.veto(w, BREAKER, Some(t0 + 5 * S), t0), Vetoed::Shown);
+        assert_eq!(bits(&store, A, w, t0 + 5 * S - MS), held);
+        assert_eq!(bits(&store, A, w, t0 + 5 * S), doubted);
+        assert_eq!(bits(&store, A, w, t0 + 9 * S), clear);
+        assert_eq!(bits(&store, B, w, t0), clear);
+        // The doubt cleared: the breaker's window holds alone.
+        assert_eq!(seat.veto(w, LIVENESS, None, t0), Vetoed::Shown);
+        assert_eq!(bits(&store, A, w, t0), held);
+        assert_eq!(bits(&store, A, w, t0 + 5 * S), clear);
+        // The breaker closed beside a new doubt: nothing holds.
+        assert_eq!(seat.veto(w, LIVENESS, Some(t0 + 9 * S), t0), Vetoed::Shown);
+        assert_eq!(seat.veto(w, BREAKER, None, t0), Vetoed::Shown);
+        assert_eq!(bits(&store, A, w, t0), doubted);
+        // A kind with no name holds: the rule lifts what it can name.
+        assert_eq!(seat.veto(w, 7, Some(t0 + 3 * S), t0), Vetoed::Shown);
+        assert_eq!(bits(&store, A, w, t0), held);
+        assert_eq!(bits(&store, A, w, t0 + 3 * S), doubted);
+    }
+
+    /// A `Hello`'s list is shown the same way: each listed worker's latest
+    /// end, with the hold among its kinds.
+    #[test]
+    fn a_hellos_list_is_shown_with_the_hold_among_each_workers_kinds() {
+        let (_elector, store, gateways, t0) = leading(GRACE);
+        let (held, doubted) = (
+            worker(&store, "http://a:8000"),
+            worker(&store, "http://b:8000"),
+        );
+        let seat = welcomed(&gateways, A, "gateway-a", TERM, t0);
+        let list = [
+            (held, BREAKER, t0 + 5 * S),
+            (held, LIVENESS, t0 + 9 * S),
+            (doubted, LIVENESS, t0 + 9 * S),
+        ];
+        assert_eq!(seat.restore(&list, t0), 3);
+        assert_eq!(bits(&store, A, held, t0), (true, false));
+        assert_eq!(bits(&store, A, held, t0 + 5 * S), (false, true));
+        assert_eq!(bits(&store, A, doubted, t0), (false, true));
+        assert_eq!(bits(&store, A, doubted, t0 + 9 * S), (false, false));
     }
 
     #[test]
