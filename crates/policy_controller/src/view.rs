@@ -1067,7 +1067,7 @@ pub struct Constraints<'a> {
     /// were written for the decision. In-process only.
     pub stalled: &'a [u32],
     /// The rows of [`Self::stalled`] a hold of this host stands on, in
-    /// order: a veto no rule lifts, as an open breaker's is. The
+    /// order, each once: a veto no rule lifts, as an open breaker's is. The
     /// all-vetoed rule lifts the mask as its last resort and leaves these
     /// rows masked. Empty where the rows were written for the decision:
     /// there a held row carries the breaker bit beside the stalled one.

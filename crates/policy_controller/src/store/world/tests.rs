@@ -143,7 +143,10 @@ fn lent_agrees(store: &MemoryStore, ask: &Ask) {
         // stalled bit, and a held one the breaker bit beside it.
         let mut buffer = Vec::new();
         let holds = world.held(&view, ask, &mut buffer);
-        assert!(holds.is_sorted(), "the held rows are in the rows' order");
+        // Strictly: the all-vetoed rule reads the two lists by their
+        // lengths, so the held list names a row once.
+        let rising = holds.windows(2).all(|pair| pair[0] < pair[1]);
+        assert!(rising, "the held rows are in the rows' order, each once");
         let held = |position: &u32| holds.binary_search(position).is_ok();
         let masked = |position: &u32| view.stalled.binary_search(position).is_ok();
         assert!(holds.iter().all(masked), "a held row is masked");

@@ -58,7 +58,7 @@ A decision starts with the **pool**: the workers that serve the request's model.
 - A **hard** filter is final. Hard filters run first, in the order written. If one leaves no worker, the decision stops and the request is shed. The answer names the filter that emptied the pool.
 - A **soft** filter steps aside when it would leave no worker. The pool goes on as it was before that filter.
 - `not-overloaded` has a rule of its own. When every usable worker is over its thresholds, the request still goes to one of them. Set `overload.shed_when_all_vetoed: true` on the binding to shed it instead.
-- `healthy` has one too, for the liveness doubt alone. When every ready worker is stalled, the request still goes to one of them: a doubt is not an outage. A worker that is not ready, is draining or is behind an open circuit breaker is never taken this way.
+- `healthy` has one too, for the liveness doubt alone. When every ready worker is stalled, the request still goes to one of them: a doubt is not an outage. Under `overload.shed_when_all_vetoed: true` a stalled worker over its thresholds is not taken, so a pool stalled and over on every ready worker is shed. A worker that is not ready, is draining or is behind an open circuit breaker is never taken this way.
 
 **2. Score.** Each scorer gives every remaining worker a score from 0 to 1. Higher is better. The profile's score for a worker is the weighted average of those scores.
 

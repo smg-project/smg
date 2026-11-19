@@ -3667,13 +3667,15 @@ impl Engine {
     /// named join ([`Picker::joined_by_named`]) draws for a request that
     /// names rows and for no other. A pass the overload veto leaves nobody is
     /// put to the binding's all-vetoed rule: the request goes to the
-    /// least-vetoed worker, or is shed where the binding says so. A shed stands
-    /// where no row of the pool is over its thresholds, or where the pool
-    /// stays empty with the veto lifted. Where the binding steers, a
-    /// keyed request of a profile that places by the session key is decided
-    /// with the overload veto lifted, so the key keeps its worker; under a
-    /// sessions rule with an in-flight cap, only where the host wrote the
-    /// key's counts ([`RequestFacts::session_counted`]). The request's
+    /// least-vetoed worker, or is shed where the binding says so. A pool the
+    /// liveness doubt leaves nobody is put to the rule's second tier under
+    /// either word: the request goes to a doubted worker, and where the
+    /// binding sheds to one under its thresholds alone. A shed stands where
+    /// the pool stays empty with those vetoes lifted. Where the binding
+    /// steers, a keyed request of a profile that places by the session key is
+    /// decided with the overload veto lifted, so the key keeps its worker;
+    /// under a sessions rule with an in-flight cap, only where the host wrote
+    /// the key's counts ([`RequestFacts::session_counted`]). The request's
     /// affinity column is empty or holds one entry a candidate; any other is
     /// refused, as a decline under the stage name `affinity-column`. Rows
     /// named in the column's place ([`NamedAffinity`]) are read as the host

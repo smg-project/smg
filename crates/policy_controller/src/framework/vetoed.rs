@@ -366,8 +366,8 @@ pub(super) fn emptied(
     // row a hold of the host stands on: it stays masked.
     let own = candidates.iter().any(|row| doubted_alone(row.health));
     // The two lengths answer for the rows only where every held row is a
-    // row of the mask: the store's view keeps that, and a host that fills
-    // the constraints by hand owes it.
+    // row of the mask, named once: the store's view keeps that, and a host
+    // that fills the constraints by hand owes it.
     debug_assert!(
         cx.held.iter().all(|held| cx.stalled.contains(held)),
         "a held row is no row of the mask"
