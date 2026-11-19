@@ -2023,6 +2023,32 @@ def test_a_count_reads_level_where_every_count_is_within_the_level(mod):
     assert not level_row(mod, (100_000, 100_000), (100_600, 100_600)).reads_level
 
 
+def test_a_count_that_ended_a_batch_early_hides_no_other_from_the_level(mod):
+    def level(base, pr):
+        """Whether a row reads level on which each executable counted the two lists given."""
+        sides = {"base": base, "pr": pr}
+        counts = {side: dict(zip(("batches", "again"), two)) for side, two in sides.items()}
+        gate = mod.Gate("^encode/", 0.10)
+        row = mod.Row("encode/a", [100, 101, 102], [115, 116, 117], gate, counts=counts)
+        return row.reads_level
+
+    short = [50_000, 100_000, 200_000], [50_000, 100_000]
+    # One executable's second count ended a batch early, and the other's own two counts are
+    # 10 % apart at the batch it left: the counts that ran that batch are read there, each way.
+    far = [50_010, 100_020, 200_040], [50_010, 100_020, 220_040]
+    assert not level(short, far)
+    assert not level(far, short)
+    # The same shape 0.005 % apart at that batch reads level.
+    near = [50_010, 100_020, 200_040], [50_010, 100_020, 200_050]
+    assert level(short, near)
+    assert level(near, short)
+    # Three counts ran the batch, each neighbour inside the level and the ends 0.9 % apart: a
+    # batch is compared on every count that ran it.
+    ends = [50_000, 100_010, 200_900], [50_000, 100_010, 201_800]
+    assert not level(short, ends)
+    assert not level(ends, short)
+
+
 def test_a_second_measurement_short_of_its_runs_leaves_the_first_to_decide(mod):
     bench_id = "policy_engine/power_of_two/least_requests/8"
     row = time_only(mod, bench_id, {"base": [100, 101, 102], "pr": [100, 101]})

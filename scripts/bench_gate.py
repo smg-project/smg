@@ -133,6 +133,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import itertools
 import json
 import math
 import os
@@ -1255,9 +1256,11 @@ class Row:
         """Whether no count read more work on the pull request's executable than the level, so
         that the id is measured again before it fails: the same count, or two counts of each
         executable that all lie within `LEVEL_COUNT` of each other at every batch where two of
-        the four last differ. A count that moved and one that is not steady are one noise in
-        two states (a few instructions an iteration more or fewer from one process to the
-        next): inside the level neither carries a failure by the clock."""
+        the four last differ. Each two are read among the batches all four ran and again over
+        the batches the two ran, and a batch is compared on every count that ran it: a count
+        that ended a batch early hides no other. A count that moved and one that is not steady
+        are one noise in two states (a few instructions an iteration more or fewer from one
+        process to the next): inside the level neither carries a failure by the clock."""
         counted = self.counted
         if counted is None or self.beyond_once is not None:
             return False
@@ -1265,13 +1268,17 @@ class Row:
             return True
         if not self.counted_twice:
             return False
-        counts = [self.counts[side][take] for take in ("batches", "again") for side in SIDES]
+        counts = [self.counts[side][take] for side in SIDES for take in ("batches", "again")]
         ran = min(len(count) for count in counts)
-        base, pr, base_again, pr_again = (count[:ran] for count in counts)
-        for n in (differs_at(base, pr), differs_at(base, base_again), differs_at(pr, pr_again)):
-            if n is not None:
-                four = [count[n] for count in (base, pr, base_again, pr_again)]
-                if max(four) - min(four) > LEVEL_COUNT * base[n]:
+        for among in ([count[:ran] for count in counts], counts):
+            for one, other in itertools.combinations(among, 2):
+                n = differs_at(one, other)
+                if n is None:
+                    continue
+                # The level is a part of the first count that ran the batch: the base's, where
+                # it did.
+                at = [count[n] for count in among if n < len(count)]
+                if max(at) - min(at) > LEVEL_COUNT * at[0]:
                     return False
         return True
 
