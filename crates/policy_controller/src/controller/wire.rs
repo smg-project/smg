@@ -57,12 +57,12 @@ pub(crate) use crate::door::Viewed;
 use crate::{
     decision::{Decision, ShedReason, Target, Trace},
     door::Asked,
-    lease::Lease,
+    lease::{Lease, Side},
     proto::{self, busy::Reason, decide_answer::Answer, decision::Outcome, identity::Form},
     spec::{AppliedSpec, MAX_HEADERS},
     view::{
         fingerprint, key_of_session, Constraints, HashKind, Header, Identity, MediaCounts,
-        ModelFingerprint, Phase, RequestFacts, WireModes, WorkerId,
+        ModelFingerprint, Phase, RequestFacts, Session, WireModes, WorkerId,
     },
 };
 
@@ -433,6 +433,11 @@ fn narrowed(count: u32) -> u16 {
 pub(crate) struct Leased {
     /// The lease as the store filed it.
     pub(crate) lease: Lease,
+    /// The session key of the decode side's lease of a pair's pick; none
+    /// for a single's. That lease is the prefill side's under this key:
+    /// one id, one record, and at the answer one index and one count of
+    /// tokens. The key alone keeps the queue's entry small.
+    pub(crate) decode: Option<Session>,
     /// What is left of its dispatch span: at the decision's last read as
     /// its decider hands it over, at the send as its stream sends it.
     pub(crate) left: Duration,
@@ -499,7 +504,8 @@ impl Decided {
 
 /// The answer that carries `decision`, made under `term`, with the lease
 /// the store filed for it where it is a pick that was issued one, and
-/// what that lease's dispatch span has left where the answer is sent.
+/// what that lease's dispatch span has left where the answer is sent. A pair's pick
+/// carries two leases of one id, the prefill side's first.
 pub(crate) fn decided(
     id: Vec<u8>,
     term: u64,
@@ -507,8 +513,18 @@ pub(crate) fn decided(
     lease: Option<&Leased>,
 ) -> proto::DecideAnswer {
     let mut decision = self::decision(decision);
-    if let Some(lease) = lease {
-        decision.leases = vec![self::lease(lease, term)];
+    if let Some(leased) = lease {
+        let mut leases = Vec::with_capacity(1 + usize::from(leased.decode.is_some()));
+        leases.push(self::lease(&leased.lease, term, leased.left));
+        if let Some(session) = leased.decode {
+            let decode = Lease {
+                side: Side::Decode,
+                session,
+                ..leased.lease
+            };
+            leases.push(self::lease(&decode, term, leased.left));
+        }
+        decision.leases = leases;
     }
     proto::DecideAnswer {
         request_id: id,
@@ -524,22 +540,27 @@ pub(super) fn millis(duration: Duration) -> u32 {
 }
 
 /// A lease this controller minted, as the wire carries it under the term
-/// that minted it, with what is left, where it is sent, of the time its
-/// gateway has to name the dispatch. The decide call issues one kind of
-/// lease, a credit on a single request's target, so the kind and the side
-/// are those two.
-fn lease(leased: &Leased, term: u64) -> proto::Lease {
-    let Leased { lease, left, .. } = leased;
+/// that minted it, with `left`: what is left, where it is sent, of the time
+/// its gateway has to name the dispatch. The decide call issues one kind of
+/// lease, a credit: on a single request's target, or on each side of a
+/// pair under one id.
+fn lease(lease: &Lease, term: u64, left: Duration) -> proto::Lease {
+    let side = match lease.side {
+        Side::Single => proto::Side::Single,
+        Side::Prefill => proto::Side::Prefill,
+        Side::Decode => proto::Side::Decode,
+        Side::Encode => proto::Side::Encode,
+    };
     proto::Lease {
         id: lease.id.0,
         kind: proto::LeaseKind::Credit.into(),
-        side: proto::Side::Single.into(),
+        side: side.into(),
         target_index: u32::from(lease.target_index),
         generation: lease.generation,
         session_key: lease.session.get(),
         tokens: lease.tokens,
         term,
-        dispatch_ttl_ms: millis(*left),
+        dispatch_ttl_ms: millis(left),
         origin: proto::LeaseOrigin::Controller.into(),
     }
 }

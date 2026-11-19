@@ -80,12 +80,12 @@ use std::{
 use arc_swap::Guard;
 use parking_lot::{Mutex, MutexGuard};
 
-use super::{Key, Leases, MemoryStore};
+use super::{waits, Key, Leases, MemoryStore};
 use crate::{
     decider::Decider,
     lease::LeaseId,
     store::{
-        leases::{LeaseRecord, LeaseState, Said},
+        leases::{LeaseRecord, Said},
         world::World,
         GatewayId,
     },
@@ -638,20 +638,24 @@ impl MemoryStore {
     /// at `at`: the record's read, the door's change and the word to the
     /// engine. A lease not on file is no error and tells nothing: its
     /// dispatch deadline ended it, or its gateway decided that request
-    /// itself. Neither does a second dispatch of one lease.
+    /// itself. Neither does a second dispatch of one lease, nor a frame on
+    /// a side of a pair's lease that ended: the word is of the sides the
+    /// record held as the frame found it.
     fn apply_frame(&self, at: usize, leases: &mut Leases, key: Key, said: Said, told: &mut Told) {
         let found = match said {
             Said::Dispatched(dispatch, when) => {
                 let found = leases.records.get(&key).map(|held| held.record);
                 leases.dispatched(self.slots(), &key, dispatch, when);
-                found.filter(|record| record.state == LeaseState::Issued)
+                // The side the frame names is told where it waited for
+                // this dispatch.
+                found.filter(|record| waits(record, dispatch.side))
             }
             Said::Completed(outcome) => {
                 let found = leases.records.get(&key).map(|held| held.record);
                 leases.completed(&key, &outcome);
                 found
             }
-            Said::Released(..) => leases.end(&key),
+            Said::Released(side, reason) => leases.released(&key, side, reason),
         };
         if let Some(record) = found {
             self.tell(at, told.world(self), &record, said);

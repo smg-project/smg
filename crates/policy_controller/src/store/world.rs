@@ -242,6 +242,13 @@ impl PairBuffers {
         }
     }
 
+    /// Both sides' views, the prefill's first: what a request's own
+    /// gateway states of itself is taken from each ahead of the engine's
+    /// pair entry.
+    pub(crate) fn sides_mut(&mut self) -> [&mut ViewBuffers; 2] {
+        [&mut self.prefill, &mut self.decode]
+    }
+
     fn clear(&mut self) {
         for side in [&mut self.prefill, &mut self.decode] {
             side.candidates.clear();
@@ -987,6 +994,15 @@ impl World {
             }
             at += booked.len();
         }
+    }
+
+    /// Writes over both sides' rows of `out`, as [`World::build_pair`] left
+    /// them for `ask`, what the leases on file book on each row's worker:
+    /// [`World::count_in_flight`], a side at a time. `built` is that
+    /// build's pair.
+    pub fn count_pair_in_flight(&self, built: &(Built, Built), ask: &Ask, out: &mut PairBuffers) {
+        self.count_in_flight(&built.0, ask, &mut out.prefill.candidates);
+        self.count_in_flight(&built.1, ask, &mut out.decode.candidates);
     }
 
     /// The engines of the pool `built` read ([`Engines`]), for a decision
