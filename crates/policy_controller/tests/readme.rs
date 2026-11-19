@@ -28,7 +28,7 @@ const PRESET: &str = "<!-- preset: ";
 
 /// The documents the page shows running: a walk that reads fewer has lost a
 /// fence, and a document the page gains raises the count.
-const DOCUMENTS: usize = 15;
+const DOCUMENTS: usize = 16;
 
 /// The documents the page shows refused.
 const REFUSALS: usize = 2;

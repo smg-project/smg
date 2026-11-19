@@ -937,6 +937,17 @@
             }
           ]
         },
+        "routing_key": {
+          "description": "Where the binding's requests take their routing key from. Absent, a\nsessions rule's own headers are the sources, and a binding with no\nrule names none.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RoutingKeySpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "sessions": {
           "description": "Sticky sessions.",
           "anyOf": [
@@ -1182,16 +1193,67 @@
       },
       "additionalProperties": false
     },
+    "RoutingKeySpec": {
+      "description": "Where a binding's requests take their routing key from: the sources a\nhost reads in order, and the first that holds a value is the key. A ring\nplaces by the key and a sessions rule pins it. No value enters a view,\nso the list is not held to `view.headers`.",
+      "type": "object",
+      "properties": {
+        "sources": {
+          "description": "The sources, read in order: one to eight, each named once.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/KeySourceSpec"
+          },
+          "minItems": 1,
+          "maxItems": 8
+        },
+        "strip_lineage": {
+          "description": "Take the turn and retry suffixes off a key, so every turn of a\nconversation shares one (`conv_t2_r1` keys as `conv`); default\nfalse.",
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "sources"
+      ]
+    },
+    "KeySourceSpec": {
+      "description": "One source of a routing key: exactly one of `header` and `rid`.",
+      "type": "object",
+      "properties": {
+        "header": {
+          "description": "A request header, lowercase. A credential header is refused, as on\n`view.headers`; `cookie` is not. A key from a header `view.headers`\ndoes not list leaves as its fingerprint alone.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rid": {
+          "description": "The request's own id, the `rid` of its body: `true` names it.",
+          "type": "boolean"
+        },
+        "max_bytes": {
+          "description": "The most bytes of a value this source hands, 8192 at most (default\n128). A longer value is passed over and the next source is read.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 1,
+          "maximum": 8192
+        }
+      },
+      "additionalProperties": false
+    },
     "SessionsSpec": {
       "description": "Sticky sessions on the binding: a keyed request stays on the worker its\nkey was first placed on.",
       "type": "object",
       "properties": {
         "sticky_header": {
-          "description": "The header whose value is the session key; listed in `view.headers`.",
+          "description": "The header whose value is the session key; listed in `view.headers`.\nLeft out where the binding names its key's sources under\n`routing_key`: a binding names them once.",
           "type": "string"
         },
         "headers": {
-          "description": "The headers looked up in order for the key, the sticky header among\nthem; empty means the sticky header alone. Each listed in\n`view.headers`.",
+          "description": "The headers looked up in order for the key, the sticky header among\nthem; empty means the sticky header alone. Each listed in\n`view.headers`. Left out under `routing_key` too.",
           "type": "array",
           "items": {
             "type": "string"
@@ -1235,10 +1297,7 @@
           "default": "original"
         }
       },
-      "additionalProperties": false,
-      "required": [
-        "sticky_header"
-      ]
+      "additionalProperties": false
     },
     "Assignment": {
       "description": "How a session key seen for the first time picks its worker. Under the\n`manual` picker the same assignment places a request with no key, which\nis not pinned, and a `manual` profile bound with no sessions rule places\nevery request by `min_load`.",

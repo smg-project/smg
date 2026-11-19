@@ -457,12 +457,44 @@ The `manual` preset is a **sessions rule** and nothing else. A rule sits on a bi
 
 | Field | Default | Meaning |
 |---|---|---|
-| `sticky_header` | required | The header whose value is the key. It must be listed in `view.headers`. |
+| `sticky_header` | required without `routing_key` | The header whose value is the key. It must be listed in `view.headers`. |
 | `assignment` | `delegate` | How a new key gets its worker: `random`, `min_load` (the fewest running requests), `min_group` (the fewest active keys) or `delegate` (the profile's own stages). |
 | `ttl_s` | 14400 | Seconds an idle key stays remembered. |
 | `sweep_s` | 120 | Seconds between two sweeps of idle keys. |
 | `inflight_cap` | 2 | Requests of one key a worker carries before the next one is placed again, over every usable worker. The key's worker changes only to another worker under the cap. `65535` means no cap. |
 | `recovery` | `original` | Which worker leads when both of a key's workers are usable: `original`, the first, or `latest`. |
+
+**Where the key comes from.** A binding names the sources of its requests' key under `routing_key`. The host reads them in order, and the first that holds a value is the key. A ring places by that key, and a sessions rule pins it.
+
+```yaml
+apiVersion: smg.policy/v1
+profiles:
+  consistent_hashing:
+    filter: [healthy, not-overloaded, not-tried]
+    score: [consistent-hash]
+    pick: best
+bindings:
+  - match: { model: "*" }
+    profile: consistent_hashing
+    routing_key:
+      sources:
+        - header: x-smg-routing-key
+        - rid: true
+        - header: x-forwarded-for
+        - header: cookie
+          max_bytes: 8192
+      strip_lineage: true
+```
+
+| Field | Default | Meaning |
+|---|---|---|
+| `sources` | required | One to eight entries, read in order. An entry is `header: <name>`, or `rid: true` for the request's own id. |
+| `max_bytes`, on an entry | 128 | The most bytes of a value the source hands, 8192 at most. A longer value is passed over. So is an empty one, and one that is not UTF-8. |
+| `strip_lineage` | `false` | Take the turn and retry suffixes off a key: `conv_t2_r1` keys as `conv`. |
+
+A source need not be in `view.headers`: its value enters no view. A credential header is refused. A key from a header that `view.headers` does not list, `cookie` for one, leaves the host as its fingerprint alone, so no stage, plugin or record sees its text.
+
+A binding names its sources once. With `routing_key`, a sessions rule leaves out `sticky_header` and `headers`. Without it, the rule's own headers are the sources. A binding with neither gives its requests no key.
 
 One more rule for the hash ring. Under `consistent_hashing`, a key stays on its worker while that worker is over the overload thresholds. `overload.shed_when_all_vetoed: true` on the binding moves the key to the ring's next worker instead. At the in-flight cap the ring places the request on the key's worker again, so the cap moves the key only where the overload veto drops that worker.
 
