@@ -2184,6 +2184,121 @@ mod tests {
         );
     }
 
+    /// A pin the lifted pass lands on leads no worker that carries the cap's
+    /// requests of the key. A dispatch on an alternate writes that worker
+    /// among the key's pins, and the cap bounds where a pin may go. The free
+    /// alternates stay behind the pin.
+    #[test]
+    fn a_kept_key_on_its_pin_names_no_alternate_at_the_rules_cap() {
+        let engine = ring_under_a_cap(2);
+        let mut pool = [free(0, 4), free(1, 4), free(2, 4), free(3, 4)];
+        let ring = ring_order(&engine_of("consistent_hashing", false), &keyed("k1"), &pool);
+        let owner = ring[0] as usize;
+        assert_eq!(dispatched(&engine, &pool, 1_000), ring[0], "the pin");
+        let request = RequestFacts {
+            now_micros: 2_000,
+            ..keyed("k1")
+        };
+        // The pin over its thresholds and under the cap. The ring's next
+        // worker carries the cap's requests of the key.
+        pool[owner].health.overloaded = true;
+        pool[owner].session_in_flight = 1;
+        pool[ring[1] as usize].session_in_flight = 2;
+        let one = decide(&engine, &request, &pool);
+        let verdict = one.pick().expect("a pick").session_verdict;
+        assert_eq!(verdict, SessionVerdict::Pinned);
+        assert_eq!(
+            order(&one),
+            [ring[0], ring[2], ring[3]],
+            "the free alternates alone"
+        );
+        // Every other worker carries them: the pin alone.
+        for &other in &ring[1..] {
+            pool[other as usize].session_in_flight = 2;
+        }
+        assert_eq!(order(&decide(&engine, &request, &pool)), [ring[0]]);
+    }
+
+    /// No dispatch of a kept key's decision writes a worker at the cap as
+    /// the key's failover. Every worker but the pin carries the cap's
+    /// requests of the key, and the host dispatches the decision's last
+    /// target. Once the pin is down and the requests have ended, the key
+    /// follows no failover: the ring places it anew.
+    #[test]
+    fn a_kept_keys_dispatch_writes_no_failover_at_the_rules_cap() {
+        let engine = ring_under_a_cap(2);
+        let mut pool = [free(0, 4), free(1, 4), free(2, 4), free(3, 4)];
+        let ring = ring_order(&engine_of("consistent_hashing", false), &keyed("k1"), &pool);
+        let owner = ring[0] as usize;
+        assert_eq!(dispatched(&engine, &pool, 1_000), ring[0], "the pin");
+        let request = RequestFacts {
+            now_micros: 2_000,
+            ..keyed("k1")
+        };
+        pool[owner].health.overloaded = true;
+        pool[owner].session_in_flight = 1;
+        for &other in &ring[1..] {
+            pool[other as usize].session_in_flight = 2;
+        }
+        let decision = decide(&engine, &request, &pool);
+        let pick = *decision.pick().expect("a pick");
+        assert_eq!(pick.session_verdict, SessionVerdict::Pinned);
+        let last = *pick.targets.as_slice().last().expect("a target");
+        let lease = Lease {
+            issued_micros: 2_000,
+            session: request.session(),
+            session_verdict: pick.session_verdict,
+            ..Lease::default()
+        };
+        engine.on_dispatched(&lease, &last, Side::Single, 0);
+        pool[owner].health.healthy = false;
+        for candidate in &mut pool {
+            candidate.session_in_flight = 0;
+        }
+        assert_eq!(
+            dispatched(&engine, &pool, 3_000),
+            ring[1],
+            "no failover was written at the cap"
+        );
+    }
+
+    /// A followed claim leads no worker that carries the cap's requests of
+    /// the key either. This decision's own placement, the ring's first
+    /// worker, carries them: it leaves the targets behind the claimed
+    /// worker, where a dispatch would write it among the key's pins.
+    #[test]
+    fn a_followed_claim_names_no_alternate_at_the_rules_cap() {
+        let rule = SessionRule {
+            assignment: Assignment::Delegate,
+            inflight_cap: 2,
+            ttl_micros: None,
+            sweep_micros: 0,
+            recovery: Recovery::Original,
+        };
+        let (ringed, _) = ring_with_a_gap(None);
+        let mut pool = [free(0, 4), free(1, 4), free(2, 4), free(3, 4)];
+        let ring = ring_order(&ringed, &keyed("k1"), &pool);
+        let (engine, gap) = ring_with_a_gap(Some(rule));
+        // The other decision sees the ring's first worker down and claims
+        // the ring's second.
+        let mut theirs = pool.to_vec();
+        theirs[ring[0] as usize].health.healthy = false;
+        *gap.staged.lock().expect("the staged pool") = theirs;
+        pool[ring[0] as usize].session_in_flight = 2;
+        let decision = decide(&engine, &keyed("k1"), &pool);
+        assert!(
+            gap.staged.lock().expect("the staged pool").is_empty(),
+            "the other decision ran"
+        );
+        let pick = decision.pick().expect("a pick");
+        assert_eq!(pick.session_verdict, SessionVerdict::Pinned);
+        assert_eq!(
+            order(&decision),
+            [ring[1], ring[2], ring[3]],
+            "the free alternates alone"
+        );
+    }
+
     /// The rule's in-flight cap holds for a pin the lifted pass lands on as
     /// it holds for a pin read first: the lift is of the overload veto, and
     /// of no other limit. A pin that carries the cap's requests of the key
