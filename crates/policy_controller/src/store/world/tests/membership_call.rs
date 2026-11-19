@@ -49,14 +49,15 @@ fn a_worker_that_leaves_by_the_store_s_doors_leaves_the_engine_s_pins() {
 #[cfg(feature = "controller")]
 mod held {
     use std::{
-        sync::{Arc, Weak},
-        time::Instant,
+        sync::{mpsc, Arc, Weak},
+        thread,
+        time::{Duration, Instant},
     };
 
     use parking_lot::Mutex;
 
     use super::{
-        super::{ask, facts, member, status, MODEL},
+        super::{ask, facts, member, status, ASKER, MODEL},
         revision,
     };
     use crate::{
@@ -64,8 +65,10 @@ mod held {
         lease::{Lifecycle, Membership},
         spec::{BindingSpec, Needs},
         store::{
-            world::ViewBuffers, Kinds, LoadSink, MembershipChange, MemoryStore, Position,
-            WorkerFacts, WorkerPatch, WorkerStatus, WorkersStore,
+            tests::{booking, in_flight},
+            world::ViewBuffers,
+            Kinds, LeasesStore, LoadSink, MembershipChange, MemoryStore, Position, WorkerFacts,
+            WorkerPatch, WorkerStatus, WorkersStore,
         },
         view::{Candidate, Constraints, Identity, RequestFacts, Role, WorkerId},
         AppliedSpec, Catalog, ConsistentHash, PolicySpec, Scratch,
@@ -83,6 +86,9 @@ mod held {
         ring: Arc<ConsistentHash>,
         told: Told,
         store: Weak<MemoryStore>,
+        /// What the case does with a worker the stage is told joined, from
+        /// inside the membership call.
+        joined: fn(&MemoryStore, WorkerId),
     }
 
     impl Lifecycle for HeldRing {
@@ -97,6 +103,9 @@ mod held {
                     "told outside the membership lock"
                 );
                 assert!(store.load_lock_free(), "told under the load lock");
+                if let Membership::Added(id) = change {
+                    (self.joined)(store, *id);
+                }
             }
             let shown = store.map_or(0, |store| store.world().epoch());
             self.told.lock().push((shown, format!("{change:?}")));
@@ -143,6 +152,18 @@ mod held {
         ring: &Arc<ConsistentHash>,
         told: &Told,
     ) -> AppliedSpec {
+        generation_with(number, store, ring, told, |_, _| {})
+    }
+
+    /// [`generation`] with a stage that hands `joined` each worker it is
+    /// told joined, from inside the membership call.
+    fn generation_with(
+        number: u64,
+        store: &Arc<MemoryStore>,
+        ring: &Arc<ConsistentHash>,
+        told: &Told,
+        joined: fn(&MemoryStore, WorkerId),
+    ) -> AppliedSpec {
         let (ring, told, store) = (Arc::clone(ring), Arc::clone(told), Arc::downgrade(store));
         let mut catalog = Catalog::builtin();
         catalog
@@ -151,6 +172,7 @@ mod held {
                     ring: Arc::clone(&ring),
                     told: Arc::clone(&told),
                     store: Weak::clone(&store),
+                    joined,
                 })
             })
             .expect("a free name");
@@ -451,6 +473,41 @@ mod held {
         let after = owners(&mut out);
         assert_eq!((out.candidates.len(), ring.ring().len()), (5, 5));
         assert!(after.contains(&fifth), "no key of 64 went to the fifth");
+    }
+
+    /// How long a case waits for a write that its stage's own call may hold.
+    const ROOM: Duration = Duration::from_secs(10);
+
+    /// A stage may file a lease on a worker from the call that tells it the
+    /// worker joined. The write filed the worker's slot, and let the slot
+    /// table's lock go, ahead of that call, and the issue door takes no
+    /// lock of the write: the write returns, and the row its build lists
+    /// reads the lease. The write runs on a thread of its own, so a door
+    /// that waits on the write fails the case and hangs no run.
+    #[test]
+    fn a_lease_filed_from_the_membership_call_books_the_joiner() {
+        let store = Arc::new(MemoryStore::new());
+        let (ring, told) = (Arc::new(ConsistentHash::new(None)), Told::default());
+        let lease_the_joiner = |store: &MemoryStore, id| {
+            let filed = LeasesStore::issue(store, booking(ASKER, 1, id, Instant::now()));
+            assert_eq!(filed, Ok(()), "the joiner's lease");
+        };
+        store
+            .apply(generation_with(1, &store, &ring, &told, lease_the_joiner))
+            .expect("applied");
+        store.set_term(1);
+        let (done, returned) = mpsc::channel();
+        let writer = {
+            let store = Arc::clone(&store);
+            thread::spawn(move || done.send(member(&store, "http://a:8000")))
+        };
+        let joined = returned
+            .recv_timeout(ROOM)
+            .expect("the write waits on its stage's lease");
+        writer.join().expect("the write").expect("sent");
+        status(&store, joined, WorkerStatus::Ready);
+        store.publish_now();
+        assert_eq!(in_flight(&store), [(joined, 1)]);
     }
 
     /// A registration that takes a worker off a model under its

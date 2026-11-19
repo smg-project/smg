@@ -47,7 +47,8 @@
 //! restore, from its start until it has read the ids on file
 //! ([`MemoryStore::restore_from`]). Under a turn come the world's load
 //! (no lock), a stage's own lock, the engine's sessions table, the store's
-//! pins and the journal's word of a term. A standby's restore takes the
+//! pins, the journal's word of a term and the table of the members no
+//! world lists yet, a leaf lock. A standby's restore takes the
 //! store's tables under its turns too: the workers', the health's and the
 //! loads', in that order. No path takes one of those and then a turn. A
 //! lifecycle call of a served controller therefore runs under a turn, or
@@ -624,7 +625,7 @@ impl MemoryStore {
         let found = match said {
             Said::Dispatched(dispatch, when) => {
                 let found = leases.records.get(&key).map(|held| held.record);
-                leases.dispatched(&self.world, &key, dispatch, when);
+                leases.dispatched(self.slots(), &key, dispatch, when);
                 found.filter(|record| record.state == LeaseState::Issued)
             }
             Said::Completed(outcome) => {
