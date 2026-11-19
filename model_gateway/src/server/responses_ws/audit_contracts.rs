@@ -40,9 +40,8 @@ fn admission_state(bucket: Arc<crate::middleware::TokenBucket>) -> Arc<crate::se
         app_context::AppContext,
         config::RouterConfig,
         policies::PolicyRegistry,
-        routers::gateway::Gateway,
+        routers::{common::snapshot::WorkerRegistry, gateway::Gateway},
         server::{health::ProbeState, http_client, AppState},
-        worker::WorkerRegistry,
     };
     let config = RouterConfig::default();
     let context = Arc::new(

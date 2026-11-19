@@ -7,13 +7,13 @@ use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
 use serde_json::{json, Value};
 use smg::{
     config::{RouterConfig, RoutingMode},
-    routers::RouterFactory,
-    worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType},
+    routers::{grpc::backend_client::BasicWorkerBuilder, RouterFactory},
 };
 use smg_test_harness::{
     grpc_harness::grpc_test_context_with_tokenizer, scripted_tokenizer::ScriptedTokenizer,
     scripted_worker::ScriptedWorker, test_app::create_test_app_with_context,
 };
+use smg_worker::identity::basic::{ConnectionMode, RuntimeType, WorkerType};
 use tokio::{net::TcpListener, task::AbortHandle, time::timeout};
 use tokio_tungstenite::{
     connect_async,
