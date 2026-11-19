@@ -613,6 +613,30 @@ Use `Explain` on the control listener with `gateway_id` and `request_id`. Use th
 - The lifecycle outcome is unset.
 - The control call keeps the record's original binding position and trace. `binding` is 0 when no binding matched or when the first binding matched. The name fields are empty for unmatched decisions and records from older generations.
 
+## Following a controller's workers
+
+With the `client` feature, a host can keep a copy of the controller's worker rows in a `MemoryStore` through a `Watcher`. Use `Watcher::open_on(&link)` to take the snapshot and the changes that follow it over the link's channel. The watch opens within the same five-second bound as `Client::watch_workers`. Once open, it has its own stream, so the link can answer asks and carry reports while the watch waits. Use one link for the gateway id. A second session with that id takes the first one's place.
+
+A watch can outlive the link. A host that follows only while the link stands can wait for either to end.
+
+```rust
+let mut following = watcher.open_on(&link).await?;
+let end = loop {
+    tokio::select! {
+        biased;
+        () = link.closed() => break None,
+        event = following.next() => match event {
+            Ok(true) => {}
+            result => break Some(result),
+        },
+    }
+};
+```
+
+`None` means the link ended. `Some` gives the watch's own end. `Link::ended()` gives the cause once the link ends. A closed send queue can refuse an ask or a report before its stream reader sees the end. A full report queue ends the link at once.
+
+Drop the stream before opening the watch again. The watcher asks for changes after the last event it took, or for a snapshot if it has no place. When a link ends, the host dials a new one.
+
 ## A stage of your own
 
 ```rust

@@ -74,7 +74,8 @@
 //!
 //! A gateway's link answers concurrent asks. Their leases leave the store
 //! on the caller's reports, or on the link's own release if an answer
-//! arrives after the caller's budget.
+//! arrives after the caller's budget. A watch on the link takes the
+//! snapshot and the tail beside an ask, and can follow after the link ends.
 //!
 //! No stub server: the engines are the mock worker's, the controller is the
 //! one the binary runs and the client is the generated one. Every wait is
@@ -136,7 +137,7 @@ use smg_policy_controller::{
     controller::{State, PROTOCOL_VERSION},
     proto::{
         busy, completed::Class, decision::Outcome, gateway_frame, identity::Form, principal,
-        released, worker_event, Completed, DecideRequest, Decision, Identity, Lease,
+        released, worker_event, Completed, DecideRequest, Decision, Hello, Identity, Lease,
         OverloadThresholds, Released, RequestFacts, ShedReason, Side, WatchWorkersRequest,
     },
     spec::{BindingSpec, Match},
@@ -2845,6 +2846,68 @@ async fn a_watcher_holds_the_fleets_rows_as_the_controller_tells_them() {
         assert_eq!((first.snapshots(), second.snapshots()), (1, 1));
 
         drop((stream, snapshot));
+        harness.stop().await.expect("a clean stop");
+    };
+    tokio::time::timeout(CASE, Box::pin(case))
+        .await
+        .expect("the case ends inside its outer bound");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_link_answers_beside_its_watch_and_the_watch_outlives_it() {
+    const GATEWAY: &str = "fleet-link-watch";
+    let case = async {
+        let (mut harness, link) = Box::pin(linked_fleet(GATEWAY))
+            .await
+            .expect("a ready fleet");
+        let first = harness.worker(0).expect("the first worker's row");
+        let mut watcher = Watcher::new(Arc::new(MemoryStore::new()));
+        let mut stream = watcher
+            .open_on(&link)
+            .await
+            .expect("the link opens a watch");
+        follows(&mut stream, |held| held.at().is_some())
+            .await
+            .expect("the watch takes a snapshot");
+        assert_eq!(watched(stream.watcher()).len(), 1);
+        assert_eq!(
+            status_of(stream.watcher(), first),
+            Some(WorkerStatus::Ready)
+        );
+
+        let tail = follows(&mut stream, |held| watched(held).len() == 2);
+        let ask_and_register = async {
+            linked_pick(&link, ask(b"watching"))
+                .await
+                .expect("the link answers while the watch waits");
+            harness
+                .register(&FLEET[1..2])
+                .await
+                .expect("a worker joins the fleet");
+        };
+        let (told, ()) = tokio::join!(biased; tail, ask_and_register);
+        told.expect("the watch takes the new row on its tail");
+        drop(stream);
+
+        let mut stream = watcher
+            .open_on(&link)
+            .await
+            .expect("the link resumes the watch");
+        link.report(gateway_frame::Frame::Hello(Hello::default()))
+            .expect("the session takes the frame");
+        tokio::time::timeout(ROOM, link.closed())
+            .await
+            .expect("the second hello ends the link");
+        drop(link);
+
+        harness.kill(0).await.expect("the first worker dies");
+        follows(&mut stream, |held| {
+            status_of(held, first).is_some_and(|status| status != WorkerStatus::Ready)
+        })
+        .await
+        .expect("the watch takes the status after the link ends");
+        assert_eq!(stream.watcher().snapshots(), 1);
+        drop(stream);
         harness.stop().await.expect("a clean stop");
     };
     tokio::time::timeout(CASE, Box::pin(case))
