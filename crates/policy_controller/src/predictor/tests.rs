@@ -45,7 +45,7 @@ impl Predictor {
             assert_eq!(self.find(block.key), Some(at), "{at}");
             if block.group != NONE {
                 assert_eq!(block.lone, NOBODY, "{at}");
-                assert!(!self.groups[block.group as usize].is_empty(), "{at}");
+                assert!(self.groups[block.group as usize].len() >= 2, "{at}");
             }
             let holders = self.holders(block);
             placements += holders.iter().filter(|&&place| place != NOBODY).count();
@@ -305,9 +305,11 @@ fn a_worker_that_left_is_not_read_and_a_shallower_holder_is() {
     predictor.forget(worker(4));
     assert_eq!(predictor.sweep(4), 4);
     assert_eq!(read(&mut predictor, &long), (5, vec![2]));
-    // The first pass's six entries left, then a second pass over all
-    // eleven, for the worker that left meanwhile.
-    assert_eq!(predictor.sweep(usize::MAX), 6 + 11);
+    // The first pass's six entries left: five visits, then a step for
+    // each of the five blocks no worker is left of, which leave at the
+    // last one. Then a second pass over all eleven, for the worker that
+    // left meanwhile.
+    assert_eq!(predictor.sweep(usize::MAX), 5 + 5 + 11);
     assert_eq!((predictor.len(), predictor.blocks()), (5, 5));
     assert_eq!(predictor.sweep(usize::MAX), 0);
     predictor.check();
@@ -469,6 +471,156 @@ fn a_write_takes_a_bounded_count_of_steps_at_the_old_end() {
     assert_eq!((predictor.len(), predictor.dropped()), (11, 1));
     assert_eq!(read(&mut predictor, &[98]), (1, vec![1]));
     assert_eq!(read(&mut predictor, &path), (10, vec![1]));
+    predictor.check();
+}
+
+#[test]
+fn a_path_no_worker_is_left_of_leaves_a_block_a_step_of_the_sweep() {
+    let mut predictor = Predictor::new(1_000);
+    let path: Vec<u64> = (1..=40).collect();
+    predictor.sent(SEED, &path, worker(1));
+    predictor.forget(worker(1));
+    // The pass empties the 39 blocks ahead of the last, an entry a step.
+    // At the last block no worker is left of the path, and the call has
+    // four steps left: four blocks leave, from the deep end.
+    assert_eq!(predictor.sweep(43), 43);
+    assert_eq!((predictor.len(), predictor.blocks()), (0, 36));
+    predictor.check();
+    // The rest waits at the old end, and leaves a block a step.
+    let mut calls = 0;
+    while predictor.blocks() != 0 {
+        let held = predictor.blocks();
+        let steps = predictor.sweep(8);
+        assert_ne!(steps, 0, "the rest of the path waits");
+        assert_eq!(held - predictor.blocks(), steps);
+        predictor.check();
+        calls += 1;
+    }
+    assert_eq!(calls, 5);
+    assert_eq!(predictor.sweep(usize::MAX), 0);
+}
+
+#[test]
+fn a_writes_room_takes_out_as_many_blocks_as_it_has_steps() {
+    let mut predictor = Predictor::new(1_000);
+    let path: Vec<u64> = (1..=40).collect();
+    predictor.sent(SEED, &path, worker(1));
+    predictor.sent(SEED, &[900], worker(2));
+    predictor.sent(SEED, &[902], worker(2));
+    // The first worker leaves, and the pass stops before the path's last
+    // block: no worker is left of the 39 before it.
+    predictor.forget(worker(1));
+    assert_eq!(predictor.sweep(39), 39);
+    assert_eq!((predictor.len(), predictor.blocks()), (3, 42));
+    // A write of one block has ten steps, and the path's end is the
+    // oldest. Ten blocks of the path leave, which frees one placement,
+    // and no step is left for the room the write still needs: it is
+    // dropped and counted, and the blocks of the second worker stay.
+    predictor.set_bound(2);
+    predictor.sent(SEED, &[901], worker(2));
+    assert_eq!((predictor.len(), predictor.blocks()), (2, 32));
+    assert_eq!(predictor.dropped(), 1);
+    assert_eq!(read(&mut predictor, &[901]), (0, vec![]));
+    assert_eq!(read(&mut predictor, &[900]), (1, vec![2]));
+    predictor.check();
+    // The sweep takes the 30 blocks left of the path, then ends the
+    // pass over its last three entries.
+    assert_eq!(predictor.sweep(usize::MAX), 30 + 3);
+    assert_eq!((predictor.len(), predictor.blocks()), (2, 2));
+    predictor.check();
+}
+
+#[test]
+fn a_block_no_worker_is_left_of_leaves_though_a_request_ended_there() {
+    let mut predictor = Predictor::new(1_000);
+    predictor.sent(SEED, &[1, 2, 3], worker(1));
+    predictor.sent(SEED, &[7], worker(2));
+    // A later request ends at the second block: it stands newest on the
+    // list, with the third behind it.
+    predictor.sent(SEED, &[1, 2], worker(1));
+    predictor.forget(worker(1));
+    // Three visits empty the path and take its third block out. The
+    // second waits at the old end then, not where the request ended, and
+    // two steps take it and the first. The last visit ends the pass.
+    assert_eq!(predictor.sweep(usize::MAX), 3 + 2 + 1);
+    assert_eq!((predictor.len(), predictor.blocks()), (1, 1));
+    assert_eq!(read(&mut predictor, &[1, 2, 3]), (0, vec![]));
+    assert_eq!(read(&mut predictor, &[7]), (1, vec![2]));
+    predictor.check();
+}
+
+#[test]
+fn a_write_on_a_block_no_worker_is_left_of_still_takes_older_paths_for_room() {
+    let mut predictor = Predictor::new(1_000);
+    predictor.sent(SEED, &[1, 2, 3], worker(1));
+    predictor.sent(SEED, &[1, 2, 3, 4], worker(1));
+    predictor.sent(SEED, &[8], worker(2));
+    predictor.sent(SEED, &[9], worker(2));
+    // The first worker leaves, and the pass stops before its last block:
+    // no worker is left of the three before it.
+    predictor.forget(worker(1));
+    assert_eq!(predictor.sweep(3), 3);
+    assert_eq!((predictor.len(), predictor.blocks()), (3, 6));
+    // A write of five blocks stands on the third. Its room takes the
+    // fourth, which leaves the third with no follower. The third stays
+    // newest, so the two older paths behind it are taken too, and three
+    // blocks of the write are made.
+    predictor.set_bound(3);
+    predictor.sent(SEED, &[1, 2, 3, 6, 7], worker(2));
+    assert_eq!(
+        (predictor.len(), predictor.blocks(), predictor.dropped()),
+        (3, 3, 2)
+    );
+    assert_eq!(read(&mut predictor, &[1, 2, 3, 6, 7]), (3, vec![2]));
+    assert_eq!(read(&mut predictor, &[8]), (0, vec![]));
+    predictor.check();
+}
+
+#[test]
+fn a_list_of_workers_keeps_no_room_for_the_workers_that_left() {
+    let room =
+        |predictor: &Predictor| -> usize { predictor.groups.iter().map(Vec::capacity).sum() };
+    let mut predictor = Predictor::new(10_000);
+    // Twenty rounds. In each, forty workers are sent one new block, and
+    // all but the first leave and are swept: the block names one worker,
+    // in itself, and the one list every round used keeps no room.
+    for round in 0..20u64 {
+        predictor.sent(SEED, &[1_000 + round], worker(1));
+        for id in 0..39 {
+            predictor.sent(SEED, &[1_000 + round], worker(100 + round * 39 + id));
+        }
+        for id in 0..39 {
+            predictor.forget(worker(100 + round * 39 + id));
+        }
+        predictor.sweep(usize::MAX);
+    }
+    assert_eq!((predictor.len(), predictor.blocks()), (20, 20));
+    assert!(room(&predictor) <= POOLED, "{} places", room(&predictor));
+    assert_eq!(read(&mut predictor, &[1_010]), (1, vec![1]));
+    predictor.check();
+    // A list left with two of its forty workers gives the spare room
+    // back.
+    predictor.sent(SEED, &[2_000], worker(1));
+    predictor.sent(SEED, &[2_000], worker(2));
+    for id in 0..38 {
+        predictor.sent(SEED, &[2_000], worker(5_000 + id));
+    }
+    for id in 0..38 {
+        predictor.forget(worker(5_000 + id));
+    }
+    predictor.sweep(usize::MAX);
+    assert!(room(&predictor) <= 2 * 2, "{} places", room(&predictor));
+    assert_eq!(read(&mut predictor, &[2_000]), (1, vec![1, 2]));
+    predictor.check();
+    // A block that forty workers were sent leaves at the bound, and its
+    // list keeps no room of forty for the next block.
+    for id in 0..40 {
+        predictor.sent(SEED, &[3_000], worker(9_000 + id));
+    }
+    predictor.set_bound(0);
+    predictor.sweep(usize::MAX);
+    assert_eq!((predictor.len(), predictor.blocks()), (0, 0));
+    assert!(room(&predictor) <= POOLED * predictor.groups.len());
     predictor.check();
 }
 
