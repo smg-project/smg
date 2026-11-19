@@ -50,11 +50,16 @@ pub struct Lease {
     /// Which target of the pick this lease books (a reservation on a pair
     /// side names its own).
     pub target_index: u8,
-    /// The worker the lease books at its issue, as the host that issues it
-    /// names it; `WorkerId(0)` where the host names none. A stage that
-    /// books at the issue reads it at the dispatch
-    /// ([`Lifecycle::on_dispatched`]), where `target_index` names the
-    /// target the dispatch took. In-process only: no contract carries it.
+    /// The worker the lease books. The decider's mint names the worker its
+    /// issue books, and the lease as issued, and as given up where its
+    /// answer does not leave, carries that word. Where the served store
+    /// tells of a lease on its file, at a dispatch and at an end, it names
+    /// its record's target: the same worker until a dispatch moves the
+    /// lease, and the worker it moved to behind one. A stage that books at
+    /// the issue reads it at the dispatch ([`Lifecycle::on_dispatched`]),
+    /// where `target_index` names the target the dispatch took.
+    /// `WorkerId(0)` where a host names none. In-process only: no contract
+    /// carries it.
     pub booked: WorkerId,
     pub generation: u64,
     /// The request's session ([`crate::RequestFacts::session`]: its key

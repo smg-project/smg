@@ -1949,6 +1949,9 @@ pub(crate) mod tests {
         let (lease, first) = leased(&door, b"r-1", 7);
         let on_file = LeasesStore::get(&*store, GATEWAY, lease).expect("the lease is on file");
         assert_eq!(on_file.target, first);
+        // The lease names the worker its issue books: the engine hears the
+        // issue with it, and a decision given up is told of it.
+        assert_eq!(on_file.lease.booked, first);
         assert_eq!(counted(&store), [(first, 1)]);
         assert_eq!(report(&door, lease, gone()), 0, "applied at once");
         assert_eq!(counted(&store), []);

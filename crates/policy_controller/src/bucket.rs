@@ -552,12 +552,12 @@ impl Pool {
     /// window leave first, each with its tokens off its worker's load. At
     /// an issue so does one dated more than the window after this one: a
     /// clock that went back that far ends what it passed. A dispatch's date
-    /// is told late and went nowhere: no booking leaves for being newer
-    /// than it. A booking dated a little before the window's oldest arrived
-    /// out of its clock's order, as the bookings of two deciders can, and
-    /// nothing leaves on its account. Inlined: the issue's booking ran it
-    /// in line while it was its one caller, and a call there costs every
-    /// decision.
+    /// is late, and no clock that went back: no booking leaves for being
+    /// newer than it. A booking dated a little before the window's oldest
+    /// arrived out of its clock's order, as the bookings of two deciders
+    /// can, and nothing leaves on its account. Inlined: the issue's booking
+    /// ran it in line while it was its one caller, and a call there costs
+    /// every decision.
     #[inline]
     fn book(&mut self, member: u32, tokens: u32, at_micros: u64, window_micros: u64, clock: Clock) {
         if let Some(booked) = self.members.get_mut(member as usize) {
@@ -1914,9 +1914,9 @@ mod tests {
         dispatch(&scorer, pool[2].id, 1, 8, 92 * tenth, 0);
         assert_eq!(loads(&scorer), (vec![1, full - 2, 8], full + 7));
         assert_eq!(of(&scorer, "m").lock().window.len(), WINDOW_CAP);
-        // One dated exactly an interval before that booking is booked, as
-        // the booking step keeps a booking exactly an interval away, and
-        // the cap ends the front alone.
+        // One dated exactly an interval before that booking is booked: the
+        // guard admits a date exactly an interval away, and the cap ends
+        // the front alone.
         dispatch(&scorer, pool[2].id, 1, 8, 95 * tenth, 0);
         assert_eq!(loads(&scorer), (vec![0, full - 2, 16], full + 14));
         assert_eq!(of(&scorer, "m").lock().window.len(), WINDOW_CAP);
@@ -1971,14 +1971,41 @@ mod tests {
         let full = WINDOW_CAP as u64;
         assert_eq!(loads(&scorer), (vec![1, full - 1, 0], full));
         assert_eq!(of(&scorer, "m").lock().window.len(), WINDOW_CAP);
-        // A dispatch dated within an interval of the front and of the
-        // booking behind it is booked. The cap ends the front, and the
-        // booking behind it leaves as aged, more than an interval older
-        // than the dispatch. The newer ones stand: the dispatch's date is
-        // late, and no clock that went back.
+        // A dispatch dated no more than an interval before the front, and
+        // no more than an interval before the booking behind it, is booked.
+        // The cap ends the front, and the booking behind it leaves as aged,
+        // more than an interval older than the dispatch. The newer ones
+        // stand: the dispatch's date is late, and no clock that went back.
         dispatch(&scorer, pool[2].id, 1, 8, 101 * tenth, 0);
         assert_eq!(loads(&scorer), (vec![0, full - 2, 8], full + 6));
         assert_eq!(of(&scorer, "m").lock().window.len(), WINDOW_CAP - 1);
+    }
+
+    #[test]
+    fn a_late_dispatch_ends_no_newer_booking_short_of_the_cap_either() {
+        let scorer = scorer(NEVER, 1.5, 1);
+        let pool = pool(3);
+        let hundredth = SECOND / 100;
+        led(&scorer, &pool, 0, 100 * SECOND);
+        // Two issues an interval apart, and a dispatch dated before both,
+        // within an interval of the front.
+        book(&scorer, &pool, 0, 1, 10_020 * hundredth);
+        book(&scorer, &pool, 0, 2, 10_120 * hundredth);
+        dispatch(&scorer, pool[2].id, 1, 4, 9_920 * hundredth, 100_000);
+        assert_eq!(loads(&scorer), (vec![3, 0, 4], 7));
+        // An issue at 101.9 s ends the front as aged. One at 100.15 s, a
+        // clock that stepped back, ends the next front. The dispatch's
+        // booking stands at the front, the booking of 101.9 s behind it.
+        book(&scorer, &pool, 1, 8, 10_190 * hundredth);
+        book(&scorer, &pool, 1, 16, 10_015 * hundredth);
+        assert_eq!(loads(&scorer), (vec![0, 24, 4], 28));
+        // A dispatch dated 100.5 s: more than an interval after the front,
+        // and more than an interval before the booking behind it. The front
+        // leaves as aged. The newer booking stands, in a window far short
+        // of its cap.
+        dispatch(&scorer, pool[2].id, 1, 32, 10_050 * hundredth, 0);
+        assert_eq!(loads(&scorer), (vec![0, 24, 32], 56));
+        assert_eq!(of(&scorer, "m").lock().window.len(), 3);
     }
 
     #[test]

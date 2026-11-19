@@ -768,14 +768,14 @@ pub(crate) mod tests {
                 });
             }
         }
-        // The lease is issued on the pick's first target, which it names as
-        // the worker it books, and the engine that decided is told: the
-        // stage books that worker.
+        // The lease is issued on the pick's first target, which its record
+        // names, and the engine that decided is told: the stage books that
+        // worker. The lease on file names no booked worker: the store names
+        // it from the record where it tells of the dispatch.
         let mut record = lease(A, 1, t0);
         record.lease.generation = 1;
         record.lease.tokens = tokens;
         record.lease.issued_micros = 1_000_000;
-        record.lease.booked = owner;
         record.target = owner;
         record.picked = Picked::of(&targets);
         let issued = record.lease;
