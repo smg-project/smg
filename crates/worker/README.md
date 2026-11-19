@@ -292,6 +292,7 @@ A port is a trait this crate calls and a host implements.
 | `ConnectorDefault` | `connection::engine` | The connector a builder uses when it is handed none. | The same connector. |
 | `WorkerJobs` | `health::manager` | How to remove a failed worker, and how to read a worker's labels again. | Its job queue. |
 | `LoadConsumer` | `load::monitor` | Whether a reader wants loads, and how to trim what readers booked on a worker. | Its policy registry. |
+| `HealthSink` | `health::port` | What a probe's outcome or a connect signal does to a worker's status. | Nothing to write: the crate's registry is the sink, and `WorkerManager::start` hands it. |
 | `RequestCompletionSink` | `identity::basic` | What to do when a request on a worker ends. | The sink its policy registry installs. |
 | `KvEventSink` | `kv_events::port` | What to do with the KV cache events a worker's stream brings: keep each rank's cursor, apply what it admits, and drop a worker's blocks when it leaves. | The sink over its KV indexes. |
 
