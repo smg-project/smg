@@ -42,6 +42,36 @@
 //! through the door does not wait at a full ring: the door keeps it
 //! beside the ring, and the caller at work hands it on as it leaves.
 //!
+//! The hand-over. A frame handed while the file's decider leaves its work
+//! waits on no lull: the leaver's last take finds it, or its hand reads
+//! the word the leaver wrote, or a later one. The proof is an argument
+//! from the language's memory model. It asks nothing of a processor's
+//! own ordering, and no case of the suite tells a fence from none. A
+//! hand writes its frame, passes a sequentially consistent fence and
+//! reads who is at work ([`MemoryStore::hand`]). A thread that leaves
+//! its work writes that nobody is at work, passes such a fence and reads
+//! the ring under the turn ([`MemoryStore::settle`]). Two pairs of a
+//! write and a read cross. The ring's pair is the queue's tail: a push
+//! has moved the tail by an atomic exchange before it returns, and a
+//! take reports an empty ring only by a read of the tail. The other pair
+//! is the mark of who is at work: the leaver stores it and the hand
+//! loads it.
+//!
+//! Atomics follow the C++20 model, which keeps one total order of every
+//! sequentially consistent operation and fence. Where a read takes a
+//! value older than a write of the same object, a fence before the read
+//! in its thread stands in that order before a fence behind the write in
+//! its thread. Suppose both reads missed. The take read the tail as it
+//! stood before the hand's push, so the leaver's fence stands before the
+//! hand's. The hand read the leaver still at work, a value older than
+//! the leaver's store, so the hand's fence stands before the leaver's.
+//! One order holds no such two fences, so one read sees the other's
+//! write. A take that reads a moved tail waits for the slot's stamp and
+//! takes the frame. A hand that reads nobody at work takes the turn and
+//! applies what waits; where a thread began work since, the frame is
+//! left to that thread's takes. None of it leans on the orderings the
+//! queue gives its own reads and writes.
+//!
 //! A decision reads its own file behind everything handed to it. A row
 //! that another file's leases book lags by that file's next take: a
 //! worker's count is one atomic a row, stepped under the turn of the file
@@ -70,7 +100,6 @@ use std::{
             fence, AtomicU64, AtomicUsize,
             Ordering::{Relaxed, SeqCst},
         },
-        mpsc::{sync_channel, Receiver, SyncSender, TrySendError},
         Arc, OnceLock,
     },
     thread,
@@ -78,6 +107,7 @@ use std::{
 };
 
 use arc_swap::Guard;
+use crossbeam_queue::ArrayQueue;
 use parking_lot::{Mutex, MutexGuard};
 
 use super::{Key, Leases, MemoryStore};
@@ -114,6 +144,37 @@ impl Told {
 /// What a frame said of a gateway's lease, as it waits in the ring.
 type Handed = (GatewayId, LeaseId, Said);
 
+/// A file's ring by its two ends: [`MemoryStore::HANDOVER`] frames
+/// written in place and taken in the order they were handed. The ends
+/// are two types: a hand writes a frame and can take none.
+fn ring() -> (Hands, Ring) {
+    let frames = Arc::new(ArrayQueue::new(MemoryStore::HANDOVER));
+    (Hands(Arc::clone(&frames)), Ring(frames))
+}
+
+/// The ring's writing end, every hand's.
+struct Hands(Arc<ArrayQueue<Handed>>);
+
+impl Hands {
+    /// Writes `frame` behind what waits, or gives it back where the ring
+    /// is full. It wakes no thread: none sleeps at a ring, and a frame is
+    /// applied by a thread that looks ([`MemoryStore::hand`]).
+    fn write(&self, frame: Handed) -> Result<(), Handed> {
+        self.0.push(frame)
+    }
+}
+
+/// The ring's reading end. It stands behind the file's turn, so the
+/// turn's holder alone takes a frame.
+struct Ring(Arc<ArrayQueue<Handed>>);
+
+impl Ring {
+    /// The frame handed first of those that wait.
+    fn take(&mut self) -> Option<Handed> {
+        self.0.pop()
+    }
+}
+
 /// What a hand reads of a file, on lines of its own: the threads that
 /// write the file share no line with the threads that only hand to it.
 #[repr(align(128))]
@@ -124,14 +185,14 @@ struct Shown {
     /// it leaves.
     at_work: AtomicUsize,
     /// The ring's writing end, every hand's.
-    hands: SyncSender<Handed>,
+    hands: Hands,
 }
 
 /// What stands behind the turn: the file, and the reading end of its
 /// ring.
 pub(super) struct Behind {
     leases: Leases,
-    ring: Receiver<Handed>,
+    ring: Ring,
 }
 
 /// One decider's file of leases behind its turn, with the ring of what is
@@ -151,7 +212,7 @@ pub(super) struct File {
 
 impl File {
     fn new(leases: Leases, name: Option<Decider>) -> Self {
-        let (hands, ring) = sync_channel(MemoryStore::HANDOVER);
+        let (hands, ring) = ring();
         Self {
             turn: Mutex::new(Behind { leases, ring }),
             shown: Shown {
@@ -532,7 +593,7 @@ impl MemoryStore {
             return false;
         }
         let Behind { leases, ring } = &mut *turn.behind;
-        while let Ok((gateway, lease, said)) = ring.try_recv() {
+        while let Some((gateway, lease, said)) = ring.take() {
             self.apply_frame(at, leases, (gateway, lease), said, told);
         }
         true
@@ -614,15 +675,12 @@ impl MemoryStore {
         let file = &self.files[at];
         let frame = (hand.gateway, lease, said);
         loop {
-            match file.shown.hands.try_send(frame) {
+            match file.shown.hands.write(frame) {
                 Ok(()) => break,
                 // The caller applies where no thread is at work, and
                 // looks again: a thread at work keeps what its ring holds.
-                Err(TrySendError::Full(_)) if self.settle(at) => {}
-                Err(TrySendError::Full(_)) => return false,
-                // The ring's reading end stands behind the file's turn
-                // for as long as the store does.
-                Err(TrySendError::Disconnected(_)) => return true,
+                Err(_) if self.settle(at) => {}
+                Err(_) => return false,
             }
         }
         hand.mark(at);
