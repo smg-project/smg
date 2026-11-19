@@ -27,7 +27,7 @@ use arc_swap::ArcSwap;
 use axum::{
     body::Body,
     extract::{Request, State},
-    http::{header, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
     Json,
@@ -110,6 +110,16 @@ impl AuthConfig {
         !self.keys.load().is_empty()
     }
 
+    /// Resolve the bearer against the current key map without consuming it.
+    pub(crate) fn require_tenant(&self, headers: &HeaderMap) -> Result<TenantKey, Response> {
+        let hash = bearer_hash(headers);
+        let keys = self.keys.load();
+        hash.as_ref()
+            .and_then(|hash| keys.get(hash))
+            .cloned()
+            .ok_or_else(|| unauthorized(hash.is_some()))
+    }
+
     /// Whether `token` matches any configured key (shared or per-tenant).
     /// For callers outside `auth_middleware` that need to distinguish "this
     /// is one of our own gateway credentials" from "unrecognized token" —
@@ -119,6 +129,14 @@ impl AuthConfig {
     pub fn contains_token(&self, token: &str) -> bool {
         self.keys.load().contains_key(&hash_key(token))
     }
+}
+
+fn bearer_hash(headers: &HeaderMap) -> Option<[u8; 32]> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(bearer_token)
+        .map(hash_key)
 }
 
 fn hash_key(key: &str) -> [u8; 32] {
@@ -162,12 +180,7 @@ pub async fn auth_middleware(
     // shared count instead.
     let keys = auth_config.keys.load();
     if !keys.is_empty() {
-        let token_hash = request
-            .headers()
-            .get(header::AUTHORIZATION)
-            .and_then(|h| h.to_str().ok())
-            .and_then(bearer_token)
-            .map(hash_key);
+        let token_hash = bearer_hash(request.headers());
 
         let tenant_key = token_hash.as_ref().and_then(|hash| keys.get(hash));
 
@@ -224,6 +237,11 @@ pub async fn deny_all_middleware(request: Request<Body>, _next: Next) -> Respons
     unauthorized(token_presented)
 }
 
+/// Internal provenance for serving-plane refusals. Upstream providers may
+/// independently return HTTP 401.
+#[derive(Clone)]
+pub(crate) struct ServingAuthRejected;
+
 /// The serving plane's 401: the `WWW-Authenticate` challenge RFC 6750
 /// requires (`error="invalid_token"` when a token was presented but is not a
 /// configured key) and an OpenAI-style error body, so SDK clients surface a
@@ -240,7 +258,7 @@ fn unauthorized(token_presented: bool) -> Response {
             "Missing API key: send it as `Authorization: Bearer <key>`",
         )
     };
-    (
+    let mut response = (
         StatusCode::UNAUTHORIZED,
         [(header::WWW_AUTHENTICATE, challenge)],
         Json(json!({
@@ -252,7 +270,9 @@ fn unauthorized(token_presented: bool) -> Response {
             }
         })),
     )
-        .into_response()
+        .into_response();
+    response.extensions_mut().insert(ServingAuthRejected);
+    response
 }
 
 #[cfg(test)]

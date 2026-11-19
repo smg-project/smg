@@ -98,7 +98,10 @@ fn sse_handles_split_utf8_crlf_comments_and_multiline_data() {
     let mut decoder = Events::default();
     let mut events = Vec::new();
     for byte in raw.as_bytes() {
-        events.extend(decoder.push(&[*byte]).unwrap());
+        let mut chunk = std::slice::from_ref(byte);
+        while let Some(event) = decoder.next_event(&mut chunk) {
+            events.push(event.unwrap());
+        }
     }
     assert_eq!(events.len(), 1);
     assert_eq!(events[0]["delta"], "café");
@@ -114,10 +117,18 @@ async fn heartbeat_keeps_the_transport_alive_without_extending_session_idle_time
     use tokio_tungstenite::{connect_async, tungstenite::Message as ClientMessage};
     let (finished, done) = oneshot::channel();
     let finished = Arc::new(std::sync::Mutex::new(Some(finished)));
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_static("Bearer fixture-key"),
+    );
+    let auth = AuthConfig::new(Some("fixture-key".into()));
+    let tenant = auth.require_tenant(&headers).unwrap();
     let app = axum::Router::new().route(
         "/",
         axum::routing::get(move |upgrade: WebSocketUpgrade| {
             let finished = finished.clone();
+            let (auth, headers, tenant) = (auth.clone(), headers.clone(), tenant.clone());
             async move {
                 upgrade.on_upgrade(move |socket| async move {
                     serve(
@@ -131,14 +142,16 @@ async fn heartbeat_keeps_the_transport_alive_without_extending_session_idle_time
                                     },
                                 ),
                             ),
+                            auth,
+                            inventory: Arc::default(),
                             tracker: InFlightRequestTracker::new(),
                             max_payload_bytes: MAX_MESSAGE_BYTES,
                             origins: Arc::default(),
                             connections: Arc::default(),
                         },
-                        HeaderMap::new(),
+                        headers,
                         None,
-                        "fixture".into(),
+                        tenant,
                         HEARTBEAT_INTERVAL + Duration::from_secs(5),
                     )
                     .await;

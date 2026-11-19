@@ -110,14 +110,16 @@ impl InFlightRequestTracker {
 
     /// Begin graceful shutdown: mark as draining. Idempotent.
     pub fn begin_drain(&self) {
-        self.draining.store(true, Ordering::Release);
+        // Pair with upgrade admission: either the upgrade sees drain, or
+        // shutdown sees the upgrade registered before its drain check.
+        self.draining.store(true, Ordering::SeqCst);
         self.drain_signal.cancel();
     }
 
     /// Returns `true` if drain has been initiated.
     #[inline]
     pub fn is_draining(&self) -> bool {
-        self.draining.load(Ordering::Acquire)
+        self.draining.load(Ordering::SeqCst)
     }
 
     pub(crate) async fn draining(&self) {
@@ -127,12 +129,16 @@ impl InFlightRequestTracker {
     /// Upgraded sessions keep the shutdown alive through their close frames.
     /// They are tracked separately from requests and worker-drain snapshots.
     pub(crate) fn track_upgrade(self: &Arc<Self>) -> UpgradeGuard {
-        self.upgraded.fetch_add(1, Ordering::AcqRel);
+        self.upgraded.fetch_add(1, Ordering::SeqCst);
         UpgradeGuard(self.clone())
     }
 
+    pub(crate) fn upgraded_sessions(&self) -> usize {
+        self.upgraded.load(Ordering::SeqCst)
+    }
+
     pub(crate) fn shutdown_pending(&self) -> bool {
-        !self.is_empty() || self.upgraded.load(Ordering::Acquire) != 0
+        !self.is_empty() || self.upgraded_sessions() != 0
     }
 
     pub(crate) async fn wait_for_shutdown(&self, timeout: Duration) -> bool {
@@ -222,7 +228,7 @@ impl Drop for InFlightGuard {
         // Notify drain waiters when we hit zero. `wait_for_drain()` re-checks
         // the condition after waking, so spurious wakeups are harmless.
         // We unconditionally notify (without checking is_draining()) to avoid a
-        // race where the last guard drops before begin_drain()'s Release store
+        // race where the last guard drops before begin_drain()'s store
         // is visible, which would skip the notification entirely.
         if was == 1 {
             self.tracker.drain_complete.notify_waiters();

@@ -341,41 +341,45 @@ async fn v1_responses(
     socket_turn: Option<Extension<responses_ws::SocketTurn>>,
     ValidatedJson(body): ValidatedJson<ResponsesRequest>,
 ) -> Response {
-    if let Some(Extension(turn)) = socket_turn {
-        // Check the final body after any WASM rewrite, before it can be stored or routed.
-        if body.store != Some(false)
+    let turn = socket_turn.map(|Extension(turn)| turn);
+    // Validate the final body after any WASM rewrite, before storage or routing.
+    if turn.is_some()
+        && (body.store != Some(false)
             || body.stream != Some(true)
             || body.background == Some(true)
             || body.conversation.is_some()
-            || body.previous_response_id.is_some()
-        {
-            return route_error::bad_request(
-                "websocket_request_mode",
-                "Responses WebSockets require a streamed, non-stored request with connection-local history",
-            );
-        }
-        if turn.prewarm {
-            return cancel
-                .guard(async {
-                    if !WorkerSelector::new(&state.context.worker_registry)
-                        .discover_openai_model(&body.model)
-                        .await
-                    {
-                        return route_error::model_not_found(&body.model);
-                    }
-                    responses_ws::prewarm_response(body)
-                })
-                .await;
-        }
+            || body.previous_response_id.is_some())
+    {
+        return route_error::bad_request(
+            "websocket_request_mode",
+            "Responses WebSockets require a streamed, non-stored request with connection-local history",
+        );
     }
-    let model = body.model.clone();
-    cancel
-        .guard(
+    let input = turn
+        .as_ref()
+        .and_then(|_| responses_ws::RetainedInput::capture(&body.input));
+    let mut response = cancel
+        .guard(async {
+            if let Some(refresh) = turn.and_then(|turn| turn.prewarm) {
+                if let Err(unavailable) = WorkerSelector::new(&state.context.worker_registry)
+                    .discover_openai_model(&body.model, &refresh)
+                    .await
+                {
+                    return unavailable;
+                }
+                return responses_ws::prewarm_response(body);
+            }
+            let model = body.model.clone();
             state
                 .router
-                .route_responses(Some(&headers), &tenant_meta, body, &model),
-        )
-        .await
+                .route_responses(Some(&headers), &tenant_meta, body, &model)
+                .await
+        })
+        .await;
+    if let Some(input) = input.filter(|_| response.status().is_success()) {
+        response.extensions_mut().insert(input);
+    }
+    response
 }
 
 async fn v1_interactions(
@@ -1470,7 +1474,12 @@ pub fn build_apps(
             // The edge takes ownership of admission and keep-alive duties
             // from the protected service and holds them on the response body.
             service: attach_edge_layers(
-                protected_routes.clone(),
+                protected_routes
+                    .clone()
+                    .layer(axum::middleware::from_fn_with_state(
+                        serving_auth_config.clone(),
+                        responses_ws::before_request_hooks,
+                    )),
                 max_payload_bytes,
                 app_state.context.inflight_tracker.clone(),
                 request_id_headers.clone(),
@@ -1478,6 +1487,8 @@ pub fn build_apps(
                 access_log_fields,
             )
             .with_state(app_state.clone()),
+            auth: serving_auth_config.clone(),
+            inventory: Arc::default(),
             tracker: app_state.context.inflight_tracker.clone(),
             max_payload_bytes,
             origins: cors_allowed_origins.clone().into(),
@@ -2954,9 +2965,10 @@ async fn graceful_shutdown(
             info!("All in-flight requests drained");
         } else {
             warn!(
-                remaining = inflight_tracker.len(),
+                remaining_requests = inflight_tracker.len(),
+                remaining_upgraded_sessions = inflight_tracker.upgraded_sessions(),
                 timeout_secs = drain_timeout.as_secs(),
-                "Drain timed out, forcing shutdown with requests still in-flight"
+                "Drain timed out, forcing shutdown with work still in flight"
             );
             return None;
         }
@@ -3122,8 +3134,9 @@ async fn drain_before_teardown(
                 let left = deadline.saturating_duration_since(tokio::time::Instant::now());
                 if !inflight_tracker.wait_for_shutdown(left).await {
                     warn!(
-                        remaining = inflight_tracker.len(),
-                        "Drain timed out, forcing shutdown with requests still in-flight"
+                        remaining_requests = inflight_tracker.len(),
+                        remaining_upgraded_sessions = inflight_tracker.upgraded_sessions(),
+                        "Drain timed out, forcing shutdown with work still in flight"
                     );
                 }
             }
@@ -3137,8 +3150,9 @@ async fn drain_before_teardown(
         let left = drain.saturating_sub(stopped.elapsed());
         if !inflight_tracker.wait_for_shutdown(left).await {
             warn!(
-                remaining = inflight_tracker.len(),
-                "Drain timed out after a listener failed, tearing down with requests still in-flight"
+                remaining_requests = inflight_tracker.len(),
+                remaining_upgraded_sessions = inflight_tracker.upgraded_sessions(),
+                "Drain timed out after a listener failed, tearing down with work still in flight"
             );
         }
     }
@@ -4240,7 +4254,8 @@ mod tests {
                     lines
                         .iter()
                         .filter(|line| line.contains("Drain timed out"))
-                        .filter(|line| line.contains("remaining=1"))
+                        .filter(|line| line.contains("remaining_requests=1"))
+                        .filter(|line| line.contains("remaining_upgraded_sessions=0"))
                         .count(),
                 );
                 Ok(())

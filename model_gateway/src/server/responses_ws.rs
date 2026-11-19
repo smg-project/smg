@@ -26,7 +26,8 @@ use axum::{
 };
 use futures::StreamExt;
 use openai_protocol::responses::{
-    ResponseStatus, ResponseUsage, ResponsesRequest, ResponsesResponse, ResponsesUsage,
+    ResponseInput, ResponseStatus, ResponseUsage, ResponsesRequest, ResponsesResponse,
+    ResponsesUsage,
 };
 use parking_lot::Mutex;
 use serde::{Serialize, Serializer as _};
@@ -35,8 +36,9 @@ use smg_external_router::sse::SseDecoder;
 use tower::ServiceExt;
 
 use crate::{
+    middleware::{auth::ServingAuthRejected, AuthConfig},
     observability::inflight_tracker::InFlightRequestTracker,
-    routers::error as route_error,
+    routers::{common::worker_selection::OpenAiInventoryRefresh, error as route_error},
     tenant::{DataPlaneCaller, TenantKey},
 };
 
@@ -44,6 +46,8 @@ use crate::{
 #[derive(Clone)]
 pub(super) struct Dispatch {
     pub(super) service: axum::Router,
+    pub(super) auth: AuthConfig,
+    pub(super) inventory: Arc<OpenAiInventoryRefresh>,
     pub(super) tracker: Arc<InFlightRequestTracker>,
     pub(super) max_payload_bytes: usize,
     pub(super) origins: Arc<[String]>,
@@ -54,7 +58,7 @@ pub(super) struct Dispatch {
 #[derive(Clone)]
 pub(super) struct SocketTurn {
     tenant: TenantKey,
-    pub(super) prewarm: bool,
+    pub(super) prewarm: Option<Arc<OpenAiInventoryRefresh>>,
 }
 
 #[derive(Default)]
@@ -106,6 +110,43 @@ impl Drop for ConnectionPermit {
 #[derive(Clone)]
 struct TenantChanged;
 
+fn tenant_changed() -> Response {
+    let mut response = route_error::create_error(
+        StatusCode::FORBIDDEN,
+        "websocket_tenant_changed",
+        "The connection's authenticated tenant changed; reconnect without retained history.",
+    );
+    response.extensions_mut().insert(TenantChanged);
+    response
+}
+
+fn require_original_tenant(
+    auth: &AuthConfig,
+    headers: &HeaderMap,
+    expected: &TenantKey,
+) -> Result<(), Response> {
+    if &auth.require_tenant(headers)? == expected {
+        Ok(())
+    } else {
+        Err(tenant_changed())
+    }
+}
+
+/// Check the current key map again before the socket's expanded body can
+/// reach request hooks. The normal auth and tenant checks also run downstream.
+pub(super) async fn before_request_hooks(
+    axum::extract::State(auth): axum::extract::State<AuthConfig>,
+    request: Request<Body>,
+    next: axum::middleware::Next,
+) -> Response {
+    if let Some(turn) = request.extensions().get::<SocketTurn>() {
+        if let Err(refusal) = require_original_tenant(&auth, request.headers(), &turn.tenant) {
+            return refusal;
+        }
+    }
+    next.run(request).await
+}
+
 /// Bound histories cannot change tenants when a serving key is reassigned.
 /// This runs after authentication/tenant resolution, before admission.
 pub(super) async fn tenant_binding_guard(
@@ -118,21 +159,25 @@ pub(super) async fn tenant_binding_guard(
             .get::<DataPlaneCaller>()
             .is_some_and(|current| current.tenant_key() == &expected.tenant);
         if !matches {
-            let mut response = (
-                StatusCode::FORBIDDEN,
-                axum::Json(json!({
-                    "error": {
-                        "type": "invalid_request_error",
-                        "code": "websocket_tenant_changed",
-                        "message": "The connection's authenticated tenant changed; reconnect without retained history.",
-                    }
-                })),
-            ).into_response();
-            response.extensions_mut().insert(TenantChanged);
-            return response;
+            return tenant_changed();
         }
     }
     next.run(request).await
+}
+
+/// The validated input the POST handler used, after request hooks.
+/// An extension keeps it off the wire and avoids rereading the request body.
+#[derive(Clone)]
+pub(super) struct RetainedInput(Vec<Value>);
+
+impl RetainedInput {
+    pub(super) fn capture(input: &ResponseInput) -> Option<Self> {
+        let items = match input {
+            ResponseInput::Items(items) => serde_json::to_value(items).ok()?,
+            ResponseInput::Text(text) => Value::String(text.clone()),
+        };
+        input_items(Some(items)).ok().map(Self)
+    }
 }
 
 /// Called by the normal POST handler after auth, tenant resolution, admission,
@@ -533,17 +578,31 @@ impl Default for Events {
     }
 }
 impl Events {
-    fn push(&mut self, chunk: &[u8]) -> Result<Vec<Value>, ()> {
-        self.0.push(chunk).map_err(|_| ())?;
-        let mut events = Vec::new();
-        while let Some(frame) = self.0.next_frame() {
-            let frame = frame.map_err(|_| ())?;
-            if !frame.is_done() && !frame.data.is_empty() {
-                events.push(frame.decode_data().map_err(|_| ())?);
+    fn next_event(&mut self, chunk: &mut &[u8]) -> Option<Result<Value, ()>> {
+        loop {
+            match self.0.next_frame() {
+                Some(Ok(frame)) if frame.is_done() || frame.data.is_empty() => continue,
+                Some(Ok(frame)) => return Some(frame.decode_data().map_err(|_| ())),
+                Some(Err(_)) => return Some(Err(())),
+                None if chunk.is_empty() => {
+                    self.0.compact();
+                    return None;
+                }
+                None => {}
             }
+
+            // Bound a pending frame even when a body chunk contains several
+            // frames or a large tail after the terminal event.
+            let room = MAX_EVENT_BYTES - self.0.buffered_len();
+            if room == 0 {
+                return Some(Err(()));
+            }
+            let (next, rest) = chunk.split_at(room.min(chunk.len()));
+            if self.0.push(next).is_err() {
+                return Some(Err(()));
+            }
+            *chunk = rest;
         }
-        self.0.compact();
-        Ok(events)
     }
 }
 
@@ -653,6 +712,19 @@ async fn busy_message(
         .await,
     }
 }
+async fn close_for_auth_change(socket: &mut WebSocket, response: Response) {
+    if upstream_error(socket, response).await {
+        let _ = write_message(
+            socket,
+            Message::Close(Some(CloseFrame {
+                code: 1008,
+                reason: "Connection authorization changed".into(),
+            })),
+        )
+        .await;
+    }
+}
+
 async fn serve(
     mut socket: WebSocket,
     dispatch: Dispatch,
@@ -703,6 +775,10 @@ async fn serve(
                 }
             }
         };
+        if let Err(refusal) = require_original_tenant(&dispatch.auth, &headers, &tenant) {
+            close_for_auth_change(&mut socket, refusal).await;
+            return;
+        }
         let value = match serde_json::from_str(&message) {
             Ok(value) => value,
             Err(_) => {
@@ -746,7 +822,9 @@ async fn serve(
             }
             continue;
         }
-        drop(prepared.body);
+        let generate = prepared.generate;
+        let full_replacement = prepared.full_replacement;
+        drop(prepared);
         drop(message);
         let mut body = Request::new(Body::from(payload.writer));
         *body.method_mut() = Method::POST;
@@ -758,7 +836,7 @@ async fn serve(
         }
         body.extensions_mut().insert(SocketTurn {
             tenant: tenant.clone(),
-            prewarm: !prepared.generate,
+            prewarm: (!generate).then(|| dispatch.inventory.clone()),
         });
         for name in [
             "host",
@@ -782,7 +860,7 @@ async fn serve(
         // hop, alternative tokenizer, parser, routing or generation path.
         let future = dispatch.service.clone().oneshot(body);
         tokio::pin!(future);
-        let response = loop {
+        let mut response = loop {
             tokio::select! {
                 () = tokio::time::sleep_until(expires) => {
                     let _ = send(&mut socket, &connection_expired_error()).await;
@@ -801,25 +879,19 @@ async fn serve(
             }
         };
         if !response.status().is_success() {
-            let authentication_lost = response.status() == StatusCode::UNAUTHORIZED
-                || response.extensions().get::<TenantChanged>().is_some();
-            if !upstream_error(&mut socket, response).await {
+            if response.extensions().get::<ServingAuthRejected>().is_some()
+                || response.extensions().get::<TenantChanged>().is_some()
+            {
+                close_for_auth_change(&mut socket, response).await;
                 return;
             }
-            if authentication_lost {
-                let _ = write_message(
-                    &mut socket,
-                    Message::Close(Some(CloseFrame {
-                        code: 1008,
-                        reason: "Connection authorization changed".into(),
-                    })),
-                )
-                .await;
+            if !upstream_error(&mut socket, response).await {
                 return;
             }
             continue;
         }
-        if !prepared.generate {
+        let retained_input = response.extensions_mut().remove::<RetainedInput>();
+        if !generate {
             let response =
                 match read_response_json(response.into_body(), dispatch.max_payload_bytes).await {
                     Ok(value) => value,
@@ -855,11 +927,12 @@ async fn serve(
             {
                 return;
             }
-            if prepared.full_replacement {
+            if full_replacement {
                 cache.clear();
             }
-            cache.remember(id, &prepared.input, &[]);
-            drop(prepared.input);
+            if let Some(input) = retained_input {
+                cache.remember(id, &input.0, &[]);
+            }
             if !send(
                 &mut socket,
                 &json!({"type":"response.completed","sequence_number":1,"response":response}),
@@ -890,24 +963,27 @@ async fn serve(
                         Some(Ok(chunk)) => chunk,
                         _ => break,
                     };
-                    let events = match decoder.push(&chunk) {
-                        Ok(events) => events,
-                        Err(()) => {
-                            let _ = send(&mut socket, &error(
-                                "upstream_stream_error", "Invalid or oversized upstream event", None,
-                            )).await;
-                            return;
-                        }
-                    };
-                    for event in events {
+                    let mut bytes = chunk.as_ref();
+                    while let Some(event) = decoder.next_event(&mut bytes) {
+                        let event = match event {
+                            Ok(event) => event,
+                            Err(()) => {
+                                let _ = send(&mut socket, &error(
+                                    "upstream_stream_error", "Invalid or oversized upstream event", None,
+                                )).await;
+                                return;
+                            }
+                        };
                         match event.get("type").and_then(Value::as_str) {
                             Some("response.completed" | "response.incomplete") => {
-                                if prepared.full_replacement && event["type"] == "response.completed" {
+                                if full_replacement && event["type"] == "response.completed" {
                                     cache.clear();
                                 }
                                 let response = &event["response"];
-                                if let (Some(id), Some(output)) = (response["id"].as_str(), response["output"].as_array()) {
-                                    cache.remember(id, &prepared.input, output);
+                                if let (Some(input), Some(id), Some(output)) = (
+                                    &retained_input, response["id"].as_str(), response["output"].as_array(),
+                                ) {
+                                    cache.remember(id, &input.0, output);
                                 }
                                 complete = true;
                             }
@@ -921,7 +997,6 @@ async fn serve(
                 }
             }
         }
-        drop(prepared.input);
         if complete {
             // Let the HTTP edge observe EOF and release its permit. The
             // terminal event has already reached the client.

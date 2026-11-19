@@ -2,11 +2,15 @@
 //!
 //! Single public API: [`WorkerSelector::select_worker`].
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, Weak},
+    time::Duration,
+};
 
 use axum::{http::HeaderValue, response::Response};
 use futures_util::future::join_all;
 use openai_protocol::{models::ListModelsResponse, worker::ProviderType};
+use parking_lot::Mutex;
 use smg_external_router::ExternalRouterSpec;
 use smg_worker::{
     health::overload::STAGE_SELECTION,
@@ -15,6 +19,7 @@ use smg_worker::{
         endpoint::Endpoint,
     },
 };
+use tokio::sync::OnceCell;
 
 use crate::routers::{
     common::{
@@ -35,6 +40,23 @@ pub struct WorkerSelector<'a> {
 
 pub use smg_external_router::worker::SelectWorkerRequest;
 
+/// One in-progress prewarm inventory read for this listener. The result
+/// expires when its callers leave. If the initiator disconnects during the
+/// read, a waiting caller can take over without a detached task.
+#[derive(Default)]
+pub(crate) struct OpenAiInventoryRefresh(Mutex<Weak<OnceCell<bool>>>);
+
+impl OpenAiInventoryRefresh {
+    fn current(&self) -> Arc<OnceCell<bool>> {
+        let mut slot = self.0.lock();
+        slot.upgrade().unwrap_or_else(|| {
+            let refresh = Arc::new(OnceCell::new());
+            *slot = Arc::downgrade(&refresh);
+            refresh
+        })
+    }
+}
+
 impl<'a> WorkerSelector<'a> {
     pub fn new(registry: &'a WorkerRegistry) -> Self {
         Self { registry }
@@ -42,7 +64,11 @@ impl<'a> WorkerSelector<'a> {
 
     /// Check the inventory before prewarm. An OpenAI-compatible worker can
     /// route requests before its model cards are known to the gateway.
-    pub(crate) async fn discover_openai_model(&self, model_id: &str) -> bool {
+    pub(crate) async fn discover_openai_model(
+        &self,
+        model_id: &str,
+        inventory: &OpenAiInventoryRefresh,
+    ) -> Result<(), Response> {
         let router = smg_external_router::known::OPENAI;
         // A lazy refresh updates the worker's cards without changing the
         // registration's model index. Read those cards directly on a miss.
@@ -56,10 +82,22 @@ impl<'a> WorkerSelector<'a> {
                 })
         };
         if has_model() {
-            return true;
+            return Ok(());
         }
-        self.refresh_external_models(None, Some(&router)).await;
-        has_model()
+        let refresh = inventory.current();
+        let complete = *refresh
+            .get_or_init(|| self.refresh_external_models(None, Some(&router)))
+            .await;
+        if has_model() {
+            Ok(())
+        } else if complete {
+            Err(error::model_not_found(model_id))
+        } else {
+            Err(error::service_unavailable(
+                "model_inventory_unavailable",
+                "Model discovery was incomplete. Retry the request.",
+            ))
+        }
     }
 
     fn matches_worker_filters(worker: &Arc<dyn Worker>, req: &SelectWorkerRequest<'_>) -> bool {
@@ -202,11 +240,12 @@ impl<'a> WorkerSelector<'a> {
     /// When `router` is set, only workers it takes are refreshed, so a caller's
     /// key never reaches another provider's workers. Each worker falls back to
     /// its own configured API key when the caller provides no auth.
+    /// Returns whether all eligible workers supplied their inventories.
     async fn refresh_external_models(
         &self,
         auth_header: Option<&HeaderValue>,
         router: Option<&ExternalRouterSpec>,
-    ) {
+    ) -> bool {
         let mut external_workers: Vec<_> = self
             .registry
             .get_routing_workers()
@@ -224,7 +263,7 @@ impl<'a> WorkerSelector<'a> {
         }
 
         if external_workers.is_empty() {
-            return;
+            return true;
         }
 
         tracing::debug!(
@@ -240,7 +279,9 @@ impl<'a> WorkerSelector<'a> {
         // Timeout prevents a slow/unresponsive worker from blocking all
         // requests that trigger refresh-on-miss.
         const REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
-        let _ = tokio::time::timeout(REFRESH_TIMEOUT, join_all(futures)).await;
+        tokio::time::timeout(REFRESH_TIMEOUT, join_all(futures))
+            .await
+            .is_ok_and(|results| results.iter().all(Result::is_ok))
     }
 }
 
@@ -281,7 +322,7 @@ async fn refresh_worker_models(
     registry: &WorkerRegistry,
     worker: &Arc<dyn Worker>,
     auth_header: Option<&HeaderValue>,
-) -> bool {
+) -> Result<(), ()> {
     let url = worker.endpoint_url("/v1/models");
     let mut backend_req = worker.http_client().get(&url);
 
@@ -300,9 +341,14 @@ async fn refresh_worker_models(
         Ok(response) if response.status().is_success() => {
             match response.json::<serde_json::Value>().await {
                 Ok(json) => {
+                    let data = json
+                        .get("data")
+                        .and_then(serde_json::Value::as_array)
+                        .ok_or(())?;
                     let provider = ProviderType::from_url(&url);
                     let model_cards = ListModelsResponse::parse_upstream(&json, provider);
 
+                    let complete = data.len() == model_cards.len();
                     if !model_cards.is_empty() {
                         tracing::info!(
                             "Model refresh: found {} models from {}",
@@ -310,9 +356,12 @@ async fn refresh_worker_models(
                             Endpoint::redacted_str(&url)
                         );
                         registry.refresh_models(worker, model_cards);
-                        return true;
                     }
-                    false
+                    if complete {
+                        Ok(())
+                    } else {
+                        Err(())
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -320,7 +369,7 @@ async fn refresh_worker_models(
                         Endpoint::redacted_str(&url),
                         e.without_url()
                     );
-                    false
+                    Err(())
                 }
             }
         }
@@ -330,7 +379,7 @@ async fn refresh_worker_models(
                 response.status(),
                 Endpoint::redacted_str(&url)
             );
-            false
+            Err(())
         }
         Err(e) => {
             tracing::warn!(
@@ -338,7 +387,7 @@ async fn refresh_worker_models(
                 Endpoint::redacted_str(&url),
                 e.without_url()
             );
-            false
+            Err(())
         }
     }
 }
@@ -549,20 +598,103 @@ mod tests {
         let published = || registry.get_routing_snapshot(openai_protocol::UNKNOWN_MODEL_ID);
         let before = published();
         assert!(
-            refresh_worker_models(&registry, &slashed, None).await,
+            refresh_worker_models(&registry, &slashed, None)
+                .await
+                .is_ok(),
             "the refresh reads the stub's one model"
         );
         // The cards go through the registry: a snapshot is published for
         // them, and none when the same cards come again.
         let after = published();
         assert!(!Arc::ptr_eq(&before, &after));
-        assert!(refresh_worker_models(&registry, &slashed, None).await);
+        refresh_worker_models(&registry, &slashed, None)
+            .await
+            .unwrap();
         assert!(Arc::ptr_eq(&after, &published()));
         assert_eq!(
             seen.lock().unwrap().as_slice(),
             ["/v1/models", "/v1/models"]
         );
         assert_eq!(slashed.url(), format!("http://{addr}/"));
+    }
+
+    #[tokio::test]
+    async fn cold_prewarm_shares_one_inventory_read_and_distinguishes_uncertain_misses() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        use axum::{http::StatusCode, routing::get, Json, Router};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let partial = Arc::new(AtomicBool::new(true));
+        let app = Router::new().route(
+            "/v1/models",
+            get({
+                let calls = calls.clone();
+                let partial = partial.clone();
+                move || {
+                    let calls = calls.clone();
+                    let partial = partial.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::Relaxed);
+                        if partial.load(Ordering::Relaxed) {
+                            Json(
+                                serde_json::json!({"data":[{"id":"confirmed"},{"malformed":true}]}),
+                            )
+                        } else {
+                            Json(serde_json::json!({"data":[]}))
+                        }
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "owned synthetic inventory server"
+        )]
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let registry = WorkerRegistry::new();
+        let spec: WorkerSpec = serde_json::from_value(serde_json::json!({
+            "url": format!("http://{address}"),
+            "runtime_type": "external",
+            "provider": "openai",
+        }))
+        .unwrap();
+        registry
+            .register(Arc::new(
+                BasicWorkerBuilder::from_spec(spec)
+                    .health_config(no_health_check())
+                    .build(),
+            ))
+            .unwrap();
+        let inventory = OpenAiInventoryRefresh::default();
+        let selector = WorkerSelector::new(&registry);
+        let (found, uncertain) = tokio::join!(
+            selector.discover_openai_model("confirmed", &inventory),
+            selector.discover_openai_model("missing-fixture-model", &inventory),
+        );
+        assert!(found.is_ok());
+        assert_eq!(
+            uncertain.unwrap_err().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(selector
+            .discover_openai_model("confirmed", &inventory)
+            .await
+            .is_ok());
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        partial.store(false, Ordering::Relaxed);
+        let confirmed_miss = selector
+            .discover_openai_model("missing-fixture-model", &inventory)
+            .await
+            .unwrap_err();
+        assert_eq!(confirmed_miss.status(), StatusCode::NOT_FOUND);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        server.abort();
     }
 
     /// A worker registered with a query whose model list is no JSON: the
@@ -591,7 +723,7 @@ mod tests {
         let refreshed = refresh_worker_models(&WorkerRegistry::new(), &queried, None).await;
         server.abort();
 
-        assert!(!refreshed);
+        assert!(refreshed.is_err());
         assert!(logs_contain(&format!(
             "Failed to parse models response from http://127.0.0.1:{port}: "
         )));

@@ -122,8 +122,9 @@ gateway. For the Helm chart, pass the flag in `router.extraArgs`.
 
 Send a gateway API key as `Authorization: Bearer <key>`. If an upgrade sends an
 `Origin` header, that origin must appear explicitly in the gateway's CORS
-allowlist. The wildcard does not permit browser upgrades. Use TLS at the
-gateway or at a trusted proxy.
+allowlist. The wildcard does not permit browser upgrades. Browser WebSocket
+clients need a trusted proxy that authenticates the browser and adds the
+gateway bearer header. Use TLS at the gateway or at the proxy.
 
 A session handles one `response.create` at a time. Set `store: false` or omit
 `store`. `previous_response_id` refers to a recent response on the same socket.

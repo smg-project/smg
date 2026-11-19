@@ -223,7 +223,7 @@ async fn native_responses_websocket_uses_auth_validation_and_grpc_tool_pipeline(
         }
     }
     assert_eq!(requests.lock().unwrap().len(), 2);
-    assert!(tracker.is_empty());
+    assert!(tracker.wait_for_drain(Duration::from_secs(3)).await);
     tracker.begin_drain();
     let close = timeout(Duration::from_secs(3), socket.next())
         .await
