@@ -854,6 +854,21 @@ cargo bench -p smg-policy-controller --locked --bench decision
 
 The gates run three interleaved measurements per side when timing is needed. Each benchmark ID uses the first matching threshold. A time regression must exceed that threshold in the median of the runs, with every changed run slower than every base run. Overlap is reported as suspect. Some gates also repeat suspect measurements or check for executable placement effects before failing a row. Missing gated IDs are detected. These are relative regressions for the measured paths. The plugin and wire round-trip benchmarks have no dedicated policy gate here. [Gate rules and report](../../scripts/bench_gate.py)
 
+## A worker's row
+
+The controller keeps one row a worker. A registration states the row's facts. One that states a fact past its bound is refused by the fact's name.
+
+| fact | bound |
+|---|---|
+| the URL | 2,048 bytes |
+| the runtime, the zone, a model id | 256 bytes each |
+| the labels | 128 of them, a key of 128 bytes, a value of 4,096 |
+| the row as a whole | 16,384 bytes |
+
+No count bounds a row's model ids: the row's size does. A control call's row is weighed as the wire frames it. A row that a host writes in its own process is weighed by the store: 160 bytes for its numbers, and for each text its bytes and five more. That measure is never under the wire's weight, so a row the store takes fits a frame.
+
+A host that links the library with the `worker-host` feature writes rows at a membership door, `worker_host::Membership`. The door lays a found worker's facts over the row at its URL, marks a row draining and takes a row away. Only a row's maker changes it, and facts that name another URL than the call's are refused. `worker_host::StoreDoor` is the door over a store alone, for a host with no election. The controller's own door also refuses a fact that its log does not carry to a standby: a pairing descriptor, an encode offer, the vision bit, a priority, an empty zone, and a zero where the row means none. It also refuses a worker of the host-local ZMQ wire whose row names no gateway, as it refuses a control call's registration of that wire. One gateway holds that socket, and such a row would stand in every gateway's pool. `worker_host::facts` reads a worker object back to a row's facts. No step of the stock controller calls the door yet.
+
 ## What is not built yet
 
 - A client that marks a request as asked again. The controller serves the mark. The crate's own client does not set it yet.
@@ -869,7 +884,7 @@ The gates run three interleaved measurements per side when timing is needed. Eac
 - `prefix-affinity` with `source` set to `predictor` or `merged` in the stock controller. Both read the prefixes sent to each worker. The library validates them for a host that fills that column. The crate's `Predictor` keeps that record for such a host: it folds a request's keys once (`Predictor::fold_into`), reads by a shared reference, and writes with a tick of the host's clock. The stock controller refuses a document that names either, because it does not yet record the prefixes it sent.
 - Cache events in the stock controller. Its `PushKvEvents` call is not served, and the stock build has nothing else that feeds its cache index. So `prefix-affinity` sees no worker as holding a prefix there. A controller built with the `worker-host` feature fills its index itself: every replica opens a cache-event stream to each gRPC worker whose row asks for events. It keeps those streams while the active document reads no index. The library places by cache for a host that feeds the index. A host built with the `worker-host` feature has the feed's two parts: `worker_host::KvAdapter` writes a worker's cache events to the index, and `worker_host::KvHost` gives each event subscription its row. A row above rank 0 of a data-parallel worker gets no feed there.
 - One more input in the stock controller. A worker's circuit-breaker bit has one source there: a veto of the asking gateway that holds, as its breaker's open window does. Such a veto takes the worker out of that gateway's decisions, and no rule lifts it. Its row reads as stalled too, as under every veto of that gateway, so a filter that reads the stalled bit refuses it. The controller keeps no breaker of its own.
-- An engine connection over the host-local ZMQ wire. A controller built with the `worker-host` feature hands each worker object a gRPC connector alone, and an object connects to its engine at its first use. A worker that serves only the ZMQ wire gets no connection there, so nothing that controller reads from an engine reaches it for that worker.
+- An engine connection over the host-local ZMQ wire. A controller built with the `worker-host` feature hands each worker object a gRPC connector alone, and an object connects to its engine at its first use. A worker that serves only the ZMQ wire gets no connection there, so nothing that controller reads from an engine reaches it for that worker. No field of a registration or of a worker object names a gateway yet, so the controller's doors refuse a worker of that wire.
 - A plugin named in the document. The format has no field for one.
 - Four calls of the contract: `PushLoad`, `PushKvEvents`, `StepDown` and `WatchRegime`. The stock controller answers each as not served.
 - Eight of the ten slices of the snapshot call, `GetSnapshot`. The stock controller serves the worker rows and the spec's status. It refuses a request for any other slice by the slice's name, and a request that names no slice asks for all ten. It also refuses a request for identifiers in clear.
