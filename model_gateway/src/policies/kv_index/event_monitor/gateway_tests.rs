@@ -624,7 +624,13 @@ fn a_connection_that_is_not_the_gateways_client_carries_no_event_stream() {
             // kept handle from an end: the loop's own task says it ended.
             let mut ended = false;
             for _ in 0..500 {
-                ended = match monitor.worker_handles.lock().await.get(worker.url()) {
+                ended = match monitor
+                    .collector
+                    .worker_handles
+                    .lock()
+                    .await
+                    .get(worker.url())
+                {
                     Some(Slot::Active(sub)) => sub.handle.is_finished(),
                     Some(Slot::Removing(_)) => false,
                     None => true,
