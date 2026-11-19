@@ -53,8 +53,10 @@
 //!
 //! [`KvAdapter`] decodes the worker's KV events for the store's index, and
 //! [`KvHost`] gives each subscription its row in the store. Every replica
-//! runs the adapter over its own streams. The three limits of the decode
-//! are described in `kv.rs`.
+//! runs the adapter over its own streams. The adapter keeps what a row's
+//! stream showed of its cache groups, as the gateway's index does. A row
+//! above rank 0 of a data-parallel worker gets no feed yet ([`NoFeed`]).
+//! The module `kv` names the decode's limits.
 //!
 //! # What the module does not hold
 //!
@@ -69,7 +71,7 @@ mod object;
 mod objects;
 
 pub use health::HealthAdapter;
-pub use kv::{KvAdapter, KvHost};
+pub use kv::{KvAdapter, KvHost, NoFeed, Unfed};
 pub use lead::{Lead, SoleLead};
 pub use object::object;
 pub use objects::{Members, Objects, Standing};

@@ -183,7 +183,7 @@ kubernetes = ["dep:k8s-openapi", "dep:kube", "dep:tokio"]
 # without it. Where the build holds the engine clients, as the controller's
 # does, it turns their engine port on: the controller hands each object the
 # gRPC connector.
-worker-host = ["dep:smg-worker", "smg-grpc-client?/engine-port"]
+worker-host = ["dep:smg-worker", "dep:tracing", "smg-grpc-client?/engine-port"]
 
 default = ["wasm"]
 # The WebAssembly plugin host over the committed `smg:policy` worlds.
