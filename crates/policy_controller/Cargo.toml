@@ -69,8 +69,10 @@ smg-grpc-client = { workspace = true, optional = true }
 
 # A replica's worker objects (the `worker-host` feature): the worker crate's
 # object, its builder and its registry, for the host that keeps an object for
-# every row of the membership store.
-smg-worker = { workspace = true, features = ["runtime"], optional = true }
+# every row of the membership store, and the membership steps that host runs.
+async-trait = { workspace = true, optional = true }
+smg-worker = { workspace = true, features = ["workflow"], optional = true }
+wfaas = { workspace = true, optional = true }
 # Worker discovery (the `discovery` feature): the discovery crate with its
 # four providers, each of which the controller's flags can select.
 smg-service-discovery = { workspace = true, features = ["consul", "file", "kubernetes", "slurm"], optional = true }
@@ -197,11 +199,17 @@ kubernetes = ["dep:k8s-openapi", "dep:kube", "tokio/rt"]
 # A replica's worker objects: one object of the worker crate for every row of
 # the membership store, in a registry the host hands in, built, replaced and
 # dropped as the rows come, change and go. Off by default: it brings the
-# worker crate's runtime. It names nothing of the controller, and builds
+# worker crate's workflows. It names nothing of the controller, and builds
 # without it. Where the build holds the engine clients, as the controller's
 # does, it turns their engine port on: the controller hands each object the
 # gRPC connector.
-worker-host = ["dep:smg-worker", "dep:tracing", "smg-grpc-client?/engine-port"]
+worker-host = [
+    "dep:async-trait",
+    "dep:smg-worker",
+    "dep:tracing",
+    "dep:wfaas",
+    "smg-grpc-client?/engine-port",
+]
 
 # Worker discovery on the leading controller, over the replica's worker
 # objects. Off by default.
