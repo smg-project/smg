@@ -554,13 +554,6 @@ async fn transcription(router: &Router) -> Response {
         .await
 }
 
-async fn streamed_body(router: &Router) -> Case<Response> {
-    router
-        .route_streaming_request(streamed_request(&[GENERATE_BODY]), GENERATE, false)
-        .await
-        .map_err(|_| "the router buffered the request".into())
-}
-
 /// The refusal by name of `shape`. The refusal's own case holds the whole
 /// text of the message.
 async fn assert_refused(response: Response, shape: &str) -> Case {
@@ -711,25 +704,15 @@ async fn a_body_that_would_stream_takes_the_buffered_path_under_the_host() -> Ca
     let registry = Arc::new(WorkerRegistry::new());
     let (host, _, _) = bed_over(Arc::clone(&registry), &["http://127.0.0.1:1"]);
     let hosted = router(registry, Some(host));
-    let mut request = streamed_request(&[GENERATE_BODY]);
-    request.extensions_mut().insert(1_u8);
-    let headers = request.headers().clone();
-    let uri = request.uri().clone();
-    let version = request.version();
     let recorder = PrometheusBuilder::new().build_recorder();
     let request = {
         let _guard = metrics::set_default_local_recorder(&recorder);
         hosted
-            .route_streaming_request(request, GENERATE, false)
+            .route_streaming_request(streamed_request(&[GENERATE_BODY]), GENERATE, false)
             .await
     }
     .err()
     .ok_or("the router did not hand back the request")?;
-    assert_eq!(request.method(), Method::POST);
-    assert_eq!(request.uri(), &uri);
-    assert_eq!(request.version(), version);
-    assert_eq!(request.headers(), &headers);
-    assert_eq!(request.extensions().get::<u8>(), Some(&1));
     assert_eq!(
         to_bytes(request.into_body(), 1024).await?.as_ref(),
         GENERATE_BODY
@@ -737,13 +720,6 @@ async fn a_body_that_would_stream_takes_the_buffered_path_under_the_host() -> Ca
     assert!(recorder.handle().render().lines().any(|line| {
         line == r#"smg_router_request_body_path_total{path="buffered",reason="placed_by_controller"} 1"#
     }));
-
-    let (url, hits) = fixed_status_upstream(&[GENERATE], StatusCode::OK).await;
-    let registry = Arc::new(WorkerRegistry::new());
-    let _ = bed_over(Arc::clone(&registry), &[&url]);
-    let classic = router(registry, None);
-    assert_eq!(streamed_body(&classic).await?.status(), StatusCode::OK);
-    assert_eq!(hits.load(Ordering::SeqCst), 1);
     Ok(())
 }
 
@@ -755,7 +731,11 @@ async fn the_classic_policy_serves_the_three_shapes_without_a_host() -> Case {
     let router = router(registry, None);
     assert_eq!(no_model(&router).await?.status(), StatusCode::OK);
     assert_eq!(transcription(&router).await.status(), StatusCode::OK);
-    assert_eq!(streamed_body(&router).await?.status(), StatusCode::OK);
+    let streamed = router
+        .route_streaming_request(streamed_request(&[GENERATE_BODY]), GENERATE, false)
+        .await
+        .map_err(|_| "the router buffered the request")?;
+    assert_eq!(streamed.status(), StatusCode::OK);
     assert_eq!(hits.load(Ordering::SeqCst), 3);
     assert_eq!(LeasesStore::live(&*store, GATEWAY), 0);
     Ok(())

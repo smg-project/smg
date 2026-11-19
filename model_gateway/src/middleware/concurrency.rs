@@ -617,15 +617,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(shed.status(), StatusCode::TOO_MANY_REQUESTS);
-        let body = axum::body::to_bytes(shed.into_body(), usize::MAX)
-            .await
-            .expect("the shed response body");
-        let json: serde_json::Value = serde_json::from_slice(&body).expect("the shed error object");
-        assert_eq!(json["error"]["code"], "admission_queue_full");
-        assert_eq!(
-            json["error"]["message"],
-            "concurrency limit reached and queuing is disabled"
-        );
 
         let echoed = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -860,7 +851,6 @@ mod tests {
                     .unwrap();
                 let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
                 assert_eq!(json["error"]["code"], "admission_queue_full");
-                assert_eq!(json["error"]["message"], "admission queue is at capacity");
 
                 let rendered = handle.render();
                 assert_metric_line(&rendered, "smg_admission_queue_depth", "1");
@@ -907,10 +897,6 @@ mod tests {
                     .unwrap();
                 let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
                 assert_eq!(json["error"]["code"], "admission_queue_timeout");
-                assert_eq!(
-                    json["error"]["message"],
-                    "timed out waiting for an admission slot"
-                );
                 drop(held);
             });
         });

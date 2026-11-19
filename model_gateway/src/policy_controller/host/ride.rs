@@ -77,10 +77,6 @@ impl Stream for Ride {
         }
         next
     }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.inner.size_hint()
-    }
 }
 
 #[cfg(test)]
@@ -114,17 +110,5 @@ mod tests {
         ride.first = Some(earlier);
         assert!(matches!(ride.next().await, Some(Ok(_))));
         assert_eq!(ride.first, Some(earlier));
-    }
-
-    #[test]
-    fn the_stream_forwards_the_inner_size_hint() {
-        let ride = Ride {
-            placed: None,
-            inner: Body::from("abc").into_data_stream(),
-            status: StatusCode::OK,
-            first: None,
-            failed: false,
-        };
-        assert_eq!(ride.size_hint(), (3, Some(3)));
     }
 }

@@ -154,14 +154,16 @@ fn regular_http(worker: &dyn Worker) -> bool {
 
 /// One dispatch attempt of a typed request: the inputs every stage of
 /// `Router::route_typed_request_once` reads. The route builds it once and
-/// every retry reads the same lease, ledger and tried lists.
+/// every retry attempt reads the same one; the lease, the ledger and the
+/// tried lists are the state the attempts share.
 struct TypedAttempt<'a, T> {
     headers: Option<&'a HeaderMap>,
     /// The parsed request and its routing derivatives, held until the
     /// lease's release point.
     lease: &'a RequestLease<T>,
     route: &'static str,
-    /// The request's model after alias resolution, or the no-model id.
+    /// The canonical model id every registry, policy and metrics lookup is
+    /// keyed by.
     model_id: &'a str,
     /// The alias the client named, resolved, for the upstream body.
     canonical_model: Option<&'a str>,
@@ -502,8 +504,10 @@ impl Router {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
         let routing = self.routing_derivatives(headers, &typed_req);
-        // Resolve aliases before reading retry settings, selecting a worker,
-        // or labelling the request's metrics.
+        // Resolve once, here, so every registry, policy and metrics lookup
+        // below is keyed by the canonical model ID. Only `get_by_model`
+        // understands aliases; retry configs, hash rings and policies do not,
+        // and an alias would silently fall back to router defaults.
         let canonical_model = self.worker_registry.resolve_model_alias(model_id);
         let estimate = tenant_rate_limit::estimate(
             self.rate_limit_manager.as_deref(),
