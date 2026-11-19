@@ -844,6 +844,10 @@ struct Standing {
     /// the working place, from the time it is brought to the time it is
     /// given back.
     lent: Option<Decider>,
+    /// The decision whose open brought that state or checked the hold, by
+    /// its number on this thread, zero where none did: its later opens take
+    /// the hold as theirs.
+    checked: u64,
 }
 
 /// A thread's working place for a plugin: its slot, and what the thread is
@@ -1311,10 +1315,11 @@ impl Plugin {
     /// What the place never gave back (a close that did not return, on this
     /// thread or on one that exited and left it the place) goes back first,
     /// under another name or under none: a thread decides on no instance
-    /// but the one of the decider it acts as. `start` says the call begins
-    /// a span of its own, a decision's first open or a call outside a
-    /// decision: a hold of the same decider found there is checked.
-    fn lend(&self, working: &Working, start: bool) -> bool {
+    /// but the one of the decider it acts as. `decision` numbers the
+    /// decision whose open calls, zero for a call outside one: a hold of
+    /// the same decider is checked by the first open of a decision that
+    /// finds it, and by every call outside one.
+    fn lend(&self, working: &Working, decision: u64) -> bool {
         let mut now = working.standing.get();
         let Some(decider) = Decider::acting() else {
             // Under no name the thread acts as itself. The mark is read in
@@ -1326,14 +1331,21 @@ impl Plugin {
             return false;
         };
         match now.lent {
-            // The state is here: an earlier open of the decision brought it,
-            // or a decision open around a told event did. At a start that
-            // holds only where the rest still names this place. A close that
-            // did not return can have left the hold, and the decider can
-            // have been brought elsewhere since: such a hold is stale, its
-            // instance is dropped, and the state at rest comes.
+            // The state is here: an earlier open of the decision brought or
+            // checked it, or a decision open around a told event did. Any
+            // other call takes the hold only where the rest still names this
+            // place. A close that did not return can have left the hold, and
+            // the decider can have been brought elsewhere since: such a hold
+            // is stale, its instance is dropped, and the state at rest comes.
             Some(held) if held == decider => {
-                if !start || self.brought_here(working, decider) {
+                if decision != 0 && now.checked == decision {
+                    return false;
+                }
+                if self.brought_here(working, decider) {
+                    if decision != 0 {
+                        now.checked = decision;
+                        working.standing.set(now);
+                    }
                     return false;
                 }
                 *working.slot.borrow_mut() = None;
@@ -1353,6 +1365,7 @@ impl Plugin {
         std::mem::swap(&mut rest.ring, &mut *self.ring().borrow_mut());
         rest.at = std::ptr::from_ref(working).addr();
         now.lent = Some(decider);
+        now.checked = decision;
         working.standing.set(now);
         true
     }
@@ -1418,7 +1431,8 @@ impl Plugin {
         Lent {
             plugin: self,
             working,
-            brought: self.lend(working, true),
+            // No decision's open: a hold found is checked.
+            brought: self.lend(working, 0),
         }
     }
 
@@ -1792,17 +1806,19 @@ impl Plugin {
     }
 
     /// One of this plugin's opens of decision `decision` on this thread;
-    /// says whether the plugin already failed that decision, and whether
-    /// this open is its first of it (the one read of the cell an open
-    /// makes).
-    fn note_open(&self, decision: u64) -> (bool, bool) {
+    /// says whether the plugin already failed that decision (the one read
+    /// of the cell an open makes).
+    fn note_open(&self, decision: u64) -> bool {
         let opens = self.decision_opens.get_or_default();
         let (mut part, init) = opens.get();
-        let first = !part.is_of(decision);
-        let init = if first { OwnTime::default() } else { init };
+        let init = if part.is_of(decision) {
+            init
+        } else {
+            OwnTime::default()
+        };
         let failed = part.open(decision);
         opens.set((part, init));
-        (failed, first)
+        failed
     }
 
     /// The time of a lazy `init` decision `decision` paid on this thread:
@@ -2336,8 +2352,7 @@ impl Bound {
         let mut budget = plugin.runtime.decisions.on_this_thread();
         let decision = budget.open(facts.budget_micros);
         open.decision = decision;
-        let (failed, first) = plugin.note_open(decision);
-        if failed {
+        if plugin.note_open(decision) {
             // The plugin already failed this decision (the other side of a
             // pair, another binding): its part in the decision is over, with
             // no call, no `init` and no second count.
@@ -2368,7 +2383,7 @@ impl Bound {
         // A named decider's kept state comes to this thread for the
         // decision; the plugin's last close of it gives it back.
         let working = plugin.working();
-        plugin.lend(working, first);
+        plugin.lend(working, decision);
         let mut guard = working.slot.borrow_mut();
         if guard.is_none() {
             if plugin.emptied.get_or_default().get() {

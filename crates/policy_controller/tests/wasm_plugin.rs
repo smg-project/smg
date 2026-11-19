@@ -3865,10 +3865,16 @@ struct LeftLent {
 
 impl LeftLent {
     fn by_a_thread_that_exited(name: &str) -> Self {
-        let plugin = loaded(
-            &runtime(),
-            spec(name, guest::record_guest(), mode::LOG_IN_DESTRUCTOR),
-        );
+        let row = spec(name, guest::record_guest(), mode::LOG_IN_DESTRUCTOR);
+        Self::of(&runtime(), row)
+    }
+
+    /// As [`Self::by_a_thread_that_exited`], the plugin loaded from `row` on
+    /// `runtime`: a guest of the row's mode writes a log line in its
+    /// destructor.
+    fn of(runtime: &Arc<Runtime>, row: PluginSpec) -> Self {
+        let name = row.name.clone();
+        let plugin = loaded(runtime, row);
         let engine = single_engine(Profile {
             name: "one-stage".into(),
             filters: vec![],
@@ -3885,7 +3891,7 @@ impl LeftLent {
             place: thread_local::ThreadLocal::new(),
         };
         left.place.get_or_default().set(false);
-        panic_in_a_line_of(name);
+        panic_in_a_line_of(&name);
         let ended = std::thread::scope(|scope| {
             scope
                 .spawn(|| {
@@ -4032,6 +4038,85 @@ fn a_turn_under_the_same_name_in_a_place_left_lent_runs_on_the_state_at_rest() {
         shared,
         Some((true, [0, 1], (2, false), 0, 2)),
         "the second thread's turn as decider 1 heard the two changes on the state at rest, kept no instance of the stale hold, and left that state at rest"
+    );
+}
+
+/// A hold of the same decider is checked by the open that reaches the bring,
+/// also where the open breaker turned the decision's first open away. The
+/// first thread exits with decider 1's instance in its place ([`LeftLent`]),
+/// and decider 1 takes a turn on the case's own thread: the rest names that
+/// place. A warm-up then faults on a snapshot of five and opens the breaker,
+/// and four members go. The thread that takes the first thread's place
+/// decides a pair as decider 1. Its prefill side meets the open breaker, the
+/// cool-down ends inside that side's scope, and the decode side's open is
+/// the first to reach the bring. The hold it finds is stale: it drops it and
+/// decides on the state at rest, which hears the list as it stands and rests
+/// behind the decision, so decider 1's next decision on the case's thread
+/// hears nothing. On the instance the first thread left, the close would
+/// come late, and that next decision would hear the list again.
+#[test]
+fn a_hold_is_checked_by_the_open_that_reaches_the_bring_behind_an_open_breaker() {
+    use smg_policy_controller::Membership;
+    const START: u64 = 1_000_000;
+    const COOL_DOWN: u64 = 1_000_000;
+    // The host's clock is the case's own: the cool-down ends when the
+    // prefill side's scope says so.
+    static CLOCK: AtomicU64 = AtomicU64::new(START);
+    // One pair: whether the second thread stood in the first's place, what
+    // decider 1's first turn here heard, the warm-up's fault, what the pair
+    // decision heard and bypassed, and what decider 1's next turn here heard.
+    let pair = || {
+        CLOCK.store(START, Ordering::Relaxed);
+        let runtime = Arc::new(
+            Runtime::with_clock(&OpenDecisions::new(), || CLOCK.load(Ordering::Relaxed))
+                .expect("a runtime"),
+        );
+        let mode = mode::TRAP_ON_FIVE_AND_LOG_IN_DESTRUCTOR;
+        let mut row = spec("corner", guest::record_guest(), mode);
+        row.breaker = BreakerSpec {
+            failures: 1,
+            window_micros: 60_000_000,
+            cooldown_micros: COOL_DOWN,
+        };
+        let left = LeftLent::of(&runtime, row);
+        let anew = left.heard_as_decider_1();
+        let five: Vec<WorkerId> = (100..105).map(WorkerId).collect();
+        left.engine.on_membership(&Membership::Snapshot(&five));
+        left.plugin.warm().expect("the warm-up's own work is done");
+        let warmed = left.plugin.stats();
+        for id in [104, 103, 102, 101] {
+            left.engine
+                .on_membership(&Membership::Removed(WorkerId(id)));
+        }
+        let plain = Arc::new(plugin_engine(&left.plugin));
+        let ends = Inside::MovesTheClock(&CLOCK, START + COOL_DOWN);
+        let prefill = profile_that(&left.plugin, &plain, ends);
+        let decode = plugin_profile(&left.plugin, None, None, None);
+        let engine = pair_engine(vec![prefill, decode], 1);
+        let (shared, paired) = left.taken(|left| {
+            let before = left.plugin.stats();
+            let _turn = Decider::new(1).enter();
+            let _ = pair_decide(&engine);
+            let after = left.plugin.stats();
+            (
+                after.observed - before.observed,
+                after.bypassed - before.bypassed,
+            )
+        });
+        let next = left.heard_as_decider_1();
+        (
+            shared,
+            anew,
+            (warmed.traps, warmed.breaker_opens),
+            paired,
+            next,
+        )
+    };
+    let shared = (0..PLACES).map(|_| pair()).find(|(shared, ..)| *shared);
+    assert_eq!(
+        shared,
+        Some((true, 0, (1, 1), (1, 1), 0)),
+        "the decode side's open checked the hold: the state at rest heard the list and rests behind the pair"
     );
 }
 
