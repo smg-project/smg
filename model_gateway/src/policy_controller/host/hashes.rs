@@ -112,11 +112,7 @@ mod tests {
             ..CachePartition::default()
         })
         .expect("the namespace");
-        let tokens: Vec<u32> = namespace
-            .token_marker()
-            .into_iter()
-            .chain(1..=BLOCK_SIZE)
-            .collect();
+        let tokens: Vec<u32> = (1..=BLOCK_SIZE).collect();
         let plain = Hashes::of(&store, MODEL, &plain_prompt(&tokens));
         let scoped = Hashes::of(
             &store,
@@ -151,6 +147,7 @@ mod tests {
             let mut naming = Naming {
                 gateway: GATEWAY,
                 block_hashes: facts.block_hashes,
+                namespace_seed: facts.namespace_seed,
                 seed: 0,
                 cap: 0,
                 wires: None,

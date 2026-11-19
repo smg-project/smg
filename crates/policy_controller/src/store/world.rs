@@ -112,19 +112,19 @@ use crate::{
     demands::DemandFacts,
     framework::{Engine, OverloadThresholds, PairPools, PairTable},
     lease::{Lifecycle, Signal},
-    spec::{AppliedSpec, Listed, Pairing},
+    spec::{AppliedSpec, IndexKind, Listed, Pairing},
     store::{
         encoding::{EncodeClasses, EncodeHandoff, EncodeMember},
         health::LeaderBits,
-        index::{KvTables, Named, PoolIndex, Reading},
+        index::{KvTables, Named, PoolIndex, Predict, Reading},
         loads::LoadSample,
         pairing::{known, Derivation, Member, PairClasses, Pool},
         workers::{Overload, Reachability, WorkerFacts, WorkerRow, WorkerStatus},
         GatewayId,
     },
     view::{
-        fingerprint, AffinityFacts, Candidate, Engines, Health, OverloadRegime, Phase, PoolFacts,
-        Role, WireModes, WorkerId,
+        fingerprint, AffinityFacts, Candidate, Engines, HashKind, Health, OverloadRegime, Phase,
+        PoolFacts, Role, WireModes, WorkerId,
     },
     EncodePool, EncoderFacts,
 };
@@ -175,6 +175,8 @@ pub struct Naming<'a> {
     /// The request's block hashes, in order from its first block
     /// ([`RequestFacts::block_hashes`](crate::RequestFacts::block_hashes)).
     pub block_hashes: &'a [u64],
+    /// The request's cache namespace ([`RequestFacts::namespace_seed`](crate::RequestFacts::namespace_seed)).
+    pub namespace_seed: u64,
     /// The decision's seed: where a list is cut, the rows kept are drawn
     /// from it, on streams of the naming's own.
     pub seed: u64,
@@ -1631,7 +1633,10 @@ impl World {
     /// index under the profile's cap (its sample, or no cap where it takes
     /// none), and the pool's warming rows as this publication read them,
     /// less those whose naming ended by the decision's instant. Under a cap
-    /// the holders' lookup lists nothing of the pool's length, and the
+    /// the holders' lookup lists nothing of the pool's length. Where the
+    /// pool holds a record of sent prefixes, its rows with no lane join
+    /// the holders in the room the cap leaves: that lookup walks the
+    /// workers at the request's deepest recorded block and no other. The
     /// warming rows are read where the publication holds them: they are
     /// copied only for a view that is not the pool whole, and past the
     /// first row's end. No row is named, and no index is read, where the
@@ -1648,7 +1653,7 @@ impl World {
         view: &[Candidate],
         named: &mut Named,
     ) {
-        self.name_in::<false>(model, role, naming, view, named);
+        self.name_in::<false>(model, role, naming, view, HashKind::Token, named);
     }
 
     /// [`World::name`] for rows its caller cut by more than its gateway's
@@ -1665,17 +1670,19 @@ impl World {
         view: &[Candidate],
         named: &mut Named,
     ) {
-        self.name_in::<true>(model, role, naming, view, named);
+        self.name_in::<true>(model, role, naming, view, HashKind::Token, named);
     }
 
     /// The one naming behind [`World::name`] and [`World::name_cut`], built
-    /// once for each.
-    fn name_in<const CUT: bool>(
+    /// once for each. Those two name a token request. The door names a
+    /// request by the kind it was hashed by.
+    pub(crate) fn name_in<const CUT: bool>(
         &self,
         model: &str,
         role: Role,
         naming: &Naming<'_>,
         view: &[Candidate],
+        hash_kind: HashKind,
         named: &mut Named,
     ) {
         named.clear();
@@ -1694,11 +1701,24 @@ impl World {
         ) else {
             return;
         };
+        let pool: (u32, &[Candidate]) = (index as u32, rows);
         if CUT {
-            held.name_cut(naming, rows, &shape.locals, view, named);
+            held.name_cut(naming, pool, &shape.locals, view, hash_kind, named);
         } else {
-            held.name(naming, rows, &shape.locals, view, named);
+            held.name(naming, pool, &shape.locals, view, hash_kind, named);
         }
+    }
+
+    /// Records the prefixes of a naming on the lease's first target.
+    #[inline]
+    pub(crate) fn sent(&self, named: &Named, target: WorkerId) {
+        let Some(pool) = named.sent_pool() else {
+            return;
+        };
+        let (Some(rows), Some(Some(held))) = (self.rows.get(pool), self.indexes.get(pool)) else {
+            return;
+        };
+        held.sent(rows, named, target);
     }
 
     /// The pool's standing in its model's index, for the cases: a
@@ -1706,6 +1726,11 @@ impl World {
     #[cfg(test)]
     pub(super) fn standing(&self, model: &str, role: Role) -> Option<Arc<PoolIndex>> {
         self.indexes.get(self.index(model, role)?)?.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sent_slices(&self, model: &str, role: Role) -> Option<usize> {
+        self.standing(model, role)?.sent_slices()
     }
 
     /// Every pool's standing, for the cases: a membership write that moved
@@ -2108,6 +2133,15 @@ pub(super) fn same_offer(old: &WorkerFacts, new: &WorkerFacts) -> bool {
         && known(&old.engine_kind) == known(&new.engine_kind)
         && old.pairing == new.pairing
         && old.encode == new.encode
+}
+
+/// Whether the prefixes sent to a worker under `old` still say what it
+/// holds under `new`, where both are one worker's facts under one
+/// registration: the same offer at the same rank. A rank is a cache of
+/// its own. Every write that keeps a worker under its id asks here, and
+/// the worker leaves the records of sent prefixes where it says no.
+pub(super) fn same_cache(old: &WorkerFacts, new: &WorkerFacts) -> bool {
+    old.dp_rank == new.dp_rank && same_offer(old, new)
 }
 
 /// The models `old` stands in a pool of and `new` does not, where both are
@@ -2663,7 +2697,7 @@ impl Writer {
             self.hear_again(sample_of);
             self.judge_every();
             // A generation may rule a pool's warming rows by other numbers,
-            // or rule none.
+            // or rule none, and it may turn a pool's record of sent prefixes.
             self.rule_indexes();
             self.publish()
         };
@@ -4200,7 +4234,9 @@ impl Writer {
     /// `before`, the pools as they stood, where the write moved its place.
     /// A write that moved no member and no offer ([`Classes::Carry`]) moved
     /// no row, no admission and no wire a row states: where no lane moved
-    /// either, every pool stands as it did and none is walked. Under
+    /// either and the generation reads no sent prefixes, every pool
+    /// stands as it did and none is walked. A pool is also made anew when
+    /// its sent-prefix settings change. Under
     /// [`Classes::Derive`] the pools may stand under a generation of another
     /// pairing mode, one the standings were not ruled by: every kept pool's
     /// warming rows are ruled and read again.
@@ -4222,7 +4258,7 @@ impl Writer {
         // pools: no pool's place in an index moved, and none is looked up.
         let moves = kv.moves();
         let still = mem::replace(lanes, moves) == moves;
-        if still && classes == Classes::Carry {
+        if still && classes == Classes::Carry && !spec.needs().sent_prefixes {
             return;
         }
         let ruled = classes != Classes::Derive;
@@ -4242,6 +4278,7 @@ impl Writer {
                     continue;
                 };
                 let (rows, admitted) = (&*rows.rows, &*shape.admitted_micros);
+                let predict = predict_of(spec, kv, model, rows);
                 let here = held.get(at).and_then(Option::as_ref);
                 let here = here.filter(|standing| standing.is_of(model, rows));
                 let was = here.map(|standing| (at, standing)).or_else(|| {
@@ -4250,7 +4287,9 @@ impl Writer {
                     Some((old, held.get(old)?.as_ref()?))
                 });
                 let kept = was.filter(|(_, standing)| {
-                    standing.holds(rows, admitted) && (still || kv.stands(model, rows, standing))
+                    standing.predict() == predict
+                        && standing.holds(rows, admitted)
+                        && (still || kv.stands(model, rows, standing))
                 });
                 let now = || admitted.iter().copied().fold(window, u64::max);
                 let read = match kept {
@@ -4268,7 +4307,7 @@ impl Writer {
                     }
                     None => {
                         let rule = ruling_of(spec, model, rows);
-                        Arc::new(kv.pool(model, rows, admitted, rule, now(), reading))
+                        Arc::new(kv.pool(model, rows, admitted, rule, predict, now(), reading))
                     }
                 };
                 let next = next.get_or_insert_with(|| held.to_vec());
@@ -4284,7 +4323,8 @@ impl Writer {
 
     /// Rule every pool's warming rows again under the standing generation,
     /// at the last window's instant: it may rule a pool by other numbers,
-    /// or rule none.
+    /// or rule none. A pool whose settings for the record of sent prefixes
+    /// moved is made anew.
     fn rule_indexes(&mut self) {
         let Self {
             derived,
@@ -4292,6 +4332,7 @@ impl Writer {
             spec,
             reading,
             indexes,
+            kv,
             origin,
             last_window,
             ..
@@ -4301,11 +4342,27 @@ impl Writer {
         for (model, sides) in &derived.by_model {
             for &pool in sides.iter().flatten() {
                 let at = pool as usize;
-                let (Some(Some(held)), Some(rows)) = (indexes.get(at), working.get(at)) else {
+                let (Some(Some(held)), Some(rows), Some(shape)) =
+                    (indexes.get(at), working.get(at), derived.pools.get(at))
+                else {
                     continue;
                 };
                 let rule = ruling_of(spec, model, &rows.rows);
-                if let Some(read) = held.again(rule, now, reading) {
+                let predict = predict_of(spec, kv, model, &rows.rows);
+                let read = if held.predict() == predict {
+                    held.again(rule, now, reading)
+                } else {
+                    Some(kv.pool(
+                        model,
+                        &rows.rows,
+                        &shape.admitted_micros,
+                        rule,
+                        predict,
+                        now,
+                        reading,
+                    ))
+                };
+                if let Some(read) = read {
                     put_read(&mut next, indexes, at, read);
                 }
             }
@@ -4386,6 +4443,32 @@ fn put_read(
 fn ruling_of(spec: &AppliedSpec, model: &str, rows: &[Candidate]) -> Option<WarmRule> {
     let role = rows.first()?.role;
     spec.engine().warm_rule_for(model, phase_of(role))
+}
+
+/// The tree's placement bound for a pool whose profile reads sent prefixes.
+fn predict_of(
+    spec: &AppliedSpec,
+    kv: &KvTables,
+    model: &str,
+    rows: &[Candidate],
+) -> Option<Predict> {
+    let phase = phase_of(rows.first()?.role);
+    if !spec.engine().reads_sent_for(model, phase) {
+        return None;
+    }
+    let index = spec.index_for(model);
+    if index.kind != IndexKind::Tree {
+        return None;
+    }
+    let size = kv
+        .block_size(model)
+        .unwrap_or_else(|| spec.block_size())
+        .max(1);
+    let bound = (index.max_size / u64::from(size)).max(1);
+    Some(Predict {
+        bound: usize::try_from(bound).unwrap_or(usize::MAX),
+        ahead: spec.engine().reads_sent_alone_for(model, phase),
+    })
 }
 
 /// How many of `rows` hold no report: the pass a membership write takes over

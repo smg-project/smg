@@ -4946,6 +4946,7 @@ pub(crate) mod tests {
                 let naming = Naming {
                     gateway: GATEWAY,
                     block_hashes: &[1, 2],
+                    namespace_seed: 0,
                     seed,
                     cap: 16,
                     wires: Some(WireModes::GRPC),

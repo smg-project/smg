@@ -704,6 +704,14 @@ impl Profile {
         }
     }
 
+    /// Whether a scorer of this profile reads sent prefixes and no cache
+    /// events ([`Engine::reads_sent_alone_for`]): asked of its scorers at
+    /// the engine's build.
+    fn reads_sent_alone(&self) -> bool {
+        let mut scorers = self.scorers.iter().map(|stage| stage.scorer.needs());
+        scorers.any(|needs| needs.sent_prefixes && !needs.events)
+    }
+
     /// Whether any stage holds a [`DecisionScope`].
     pub fn scoped(&self) -> bool {
         self.scopes().next().is_some()
@@ -2515,6 +2523,10 @@ pub struct Engine {
     /// Per profile, the cap of the rows a host names for its decisions
     /// ([`Self::named_for`]), said once at the build.
     named: Vec<u32>,
+    /// Per profile, whether a scorer of it reads sent prefixes and no cache
+    /// events ([`Self::reads_sent_alone_for`]), asked of its scorers at the
+    /// build.
+    sent_alone: Vec<bool>,
     /// Per profile, its filters as one test of a row, where the engine
     /// holds every one itself ([`RowTests::of`]). A decision that draws
     /// first asks it about a row in place of a call a filter, and a whole
@@ -3455,6 +3467,7 @@ impl Engine {
             .collect();
         let keeping = marks.iter().any(|marks| marks.scoped());
         let named: Vec<u32> = profiles.iter().map(Profile::named_cap).collect();
+        let sent_alone: Vec<bool> = profiles.iter().map(Profile::reads_sent_alone).collect();
         let stating = profiles
             .iter()
             .map(|profile| {
@@ -3529,6 +3542,7 @@ impl Engine {
             marks,
             profile_needs,
             named,
+            sent_alone,
             row_tests,
             orders,
             seat_flags: (u8::from(keeping) * KEEPS_DECIDERS) | (u8::from(shadows) * SHADOWS),
@@ -3871,6 +3885,29 @@ impl Engine {
         let mut rules = profile.warm_rules();
         let first = rules.next()?;
         rules.all(|rule| rule == first).then_some(first)
+    }
+
+    /// Whether the profile a decision resolves to reads sent prefixes: a
+    /// stage of it reads them, and its decisions are named rows
+    /// ([`Self::named_for`]). A profile that is named no row reads no
+    /// holder, so its pool keeps no record. The answer is of what the
+    /// build kept: a membership write asks it of every pool, and no stage
+    /// is asked again.
+    pub(crate) fn reads_sent_for(&self, model: &str, phase: Phase) -> bool {
+        self.needs.sent_prefixes
+            && self.resolve(model, phase).is_some_and(|(_, index, _)| {
+                let index = usize::from(index);
+                self.profile_needs[index].sent_prefixes && self.named[index] > 0
+            })
+    }
+
+    /// Whether a scorer of that profile reads sent prefixes and no cache
+    /// events: the prefix stage under the source that reads the record
+    /// alone. A host names the record's holders ahead of the index's then.
+    /// Kept at the build, as [`Self::reads_sent_for`] is.
+    pub(crate) fn reads_sent_alone_for(&self, model: &str, phase: Phase) -> bool {
+        self.resolve(model, phase)
+            .is_some_and(|(_, index, _)| self.sent_alone[usize::from(index)])
     }
 
     /// The cap of each list of rows a host names in the affinity column's

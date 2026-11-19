@@ -7,7 +7,9 @@
 //! The served controller runs it on its deciders' threads, behind the
 //! fence and the budget that a wire and an election bring. A host that
 //! embeds the engine runs it on the caller's thread ([`Door`]): no frame
-//! is built and no thread is hopped.
+//! is built and no thread is hopped. A single's issued lease records the
+//! token prefix for its first target when the naming read a record of
+//! sent prefixes and the target has no cache-event lane.
 //!
 //! A request reaches the order in the form it was asked in (the trait
 //! `Asked`): a frame as the served controller checked it, or the facts a
@@ -53,8 +55,8 @@ use crate::{
         PairBuffers, Picked, Pin, Said, SessionsStore, Sides, ViewBuffers, World,
     },
     view::{
-        fingerprint, AffinityFacts, Candidate, Constraints, KeyedRow, NamedAffinity, Phase,
-        PinSource, PoolFacts, RequestFacts, Role, Session, WireModes, WorkerId,
+        fingerprint, AffinityFacts, Candidate, Constraints, HashKind, KeyedRow, NamedAffinity,
+        Phase, PinSource, PoolFacts, RequestFacts, Role, Session, WireModes, WorkerId,
     },
 };
 
@@ -88,6 +90,8 @@ pub(crate) trait Asked {
     fn hashes_read(&self, spec: &AppliedSpec) -> usize;
     /// The request's block hashes, all of them.
     fn block_hashes(&self) -> &[u64];
+    /// The cache namespace seed and what the request's blocks hash.
+    fn cache_namespace(&self) -> (u64, HashKind);
     /// The request's seed.
     fn seed(&self) -> u64;
     /// Hands `decide` the request in the engine's form, with what the
@@ -1202,11 +1206,13 @@ pub(crate) fn hand<A: Asked, R>(
         // A row is named by its place among the rows the decision is made
         // over: the lent rows, or the built ones after their narrowing.
         let hashes = request.block_hashes();
+        let (namespace_seed, hash_kind) = request.cache_namespace();
         let naming = Naming {
             gateway,
             // The first hashes, as many as the generation reads of them:
             // the engine's request takes the same count.
             block_hashes: hashes.get(..request.hashes_read(spec)).unwrap_or(hashes),
+            namespace_seed,
             seed: request.seed(),
             cap,
             wires,
@@ -1216,9 +1222,9 @@ pub(crate) fn hand<A: Asked, R>(
         // demand cut are named within the rows that stay: a row the
         // demand took is named by nobody and takes no place of the cap.
         if cut {
-            world.name_cut(model, role, &naming, candidates, named);
+            world.name_in::<true>(model, role, &naming, candidates, hash_kind, named);
         } else {
-            world.name(model, role, &naming, candidates, named);
+            world.name_in::<false>(model, role, &naming, candidates, hash_kind, named);
         }
         // Over the rows it named the decider is asked in its form for
         // them, at this arm's own call: a decision that names no row
@@ -1241,6 +1247,7 @@ pub(crate) fn hand<A: Asked, R>(
         });
         return (answer, built);
     }
+    named.clear_sent();
     let answer = request.read(lists, viewed, |facts, constraints| match sessions {
         None => decide.over(facts, &pool, candidates, constraints, scratch),
         Some(sessions) => keyed.lend(
@@ -1700,6 +1707,10 @@ impl Asked for Request<'_> {
 
     fn block_hashes(&self) -> &[u64] {
         self.facts.block_hashes
+    }
+
+    fn cache_namespace(&self) -> (u64, HashKind) {
+        (self.facts.namespace_seed, self.facts.hash_kind)
     }
 
     fn seed(&self) -> u64 {
@@ -2516,7 +2527,11 @@ impl Door {
             Entry::Single => {
                 let (decision, booking) = decide_in(world, taken, buffers, &self.parts[at]);
                 let lease = booking
-                    .map(|booking| issue(&self.store, world, taken, term, &decision, booking))
+                    .map(|booking| -> Result<_, LeaseRefused> {
+                        let lease = issue(&self.store, world, taken, term, &decision, booking)?;
+                        world.sent(&buffers.named, booking.target);
+                        Ok(lease)
+                    })
                     .transpose()
                     .map_err(|_| Refused::Unleased)?;
                 Ok(Decided {
@@ -2575,6 +2590,8 @@ impl Door {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    pub(crate) mod sent_prefixes;
+
     use std::{
         cell::Cell,
         collections::BTreeSet,

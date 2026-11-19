@@ -1012,6 +1012,7 @@ mod tests {
             text_hashes: false,
             loads: true,
             events: true,
+            sent_prefixes: true,
             ring: true,
             headers: true,
             media: true,

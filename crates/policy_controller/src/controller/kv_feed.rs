@@ -367,6 +367,7 @@ mod tests {
                     let naming = Naming {
                         gateway,
                         block_hashes: &hashes,
+                        namespace_seed: 0,
                         seed: 0,
                         cap: 0,
                         wires: None,

@@ -195,6 +195,9 @@ pub struct Needs {
     pub loads: bool,
     /// KV events into an index.
     pub events: bool,
+    /// The stage reads the prefixes sent to each worker.
+    #[serde(default)]
+    pub sent_prefixes: bool,
     /// A consistent-hash ring per model.
     pub ring: bool,
     /// Allow-listed headers in the view.
@@ -255,6 +258,7 @@ impl Needs {
             text_hashes: self.text_hashes || other.text_hashes,
             loads: self.loads || other.loads,
             events: self.events || other.events,
+            sent_prefixes: self.sent_prefixes || other.sent_prefixes,
             ring: self.ring || other.ring,
             headers: self.headers || other.headers,
             media: self.media || other.media,
@@ -4264,11 +4268,7 @@ impl PolicySpec {
     /// any (an exact id, then the longer `prefix*` or `*suffix`, then `*`).
     #[must_use]
     pub fn index_for(&self, model: &str) -> Option<(&str, &IndexSpec)> {
-        self.index
-            .iter()
-            .filter(|(pattern, _)| glob_matches(pattern, model))
-            .max_by_key(|(pattern, _)| specificity(pattern))
-            .map(|(pattern, spec)| (pattern.as_str(), spec))
+        index_matching(&self.index, model)
     }
 
     /// The JSON schema of the document, generated from these types: the
@@ -4386,6 +4386,17 @@ impl io::Write for HashWriter<'_> {
     }
 }
 
+fn index_matching<'a>(
+    index: &'a BTreeMap<String, IndexSpec>,
+    model: &str,
+) -> Option<(&'a str, &'a IndexSpec)> {
+    index
+        .iter()
+        .filter(|(pattern, _)| glob_matches(pattern, model))
+        .max_by_key(|(pattern, _)| specificity(pattern))
+        .map(|(pattern, spec)| (pattern.as_str(), spec))
+}
+
 /// One generation as a store applies it: the engine validated from a
 /// document, with the generation's number, its needs and its view's cap on
 /// a request's block hashes.
@@ -4423,6 +4434,8 @@ pub struct AppliedSpec {
     max_block_hashes: u32,
     /// The view's block size: a request that names none is counted by it.
     block_size: u32,
+    /// The index settings a model takes at a membership write or apply.
+    index: BTreeMap<String, IndexSpec>,
     pairing: Pairing,
     lists: ViewLists,
     /// Each binding's routing key sources, by the binding's place in the
@@ -4490,6 +4503,7 @@ impl AppliedSpec {
             depth,
             max_block_hashes: document.view.max_block_hashes,
             block_size: Gates::of(None, None, document.view.block_size).block_size,
+            index: document.index.clone(),
             pairing: document.plans.pd_pair.pairing,
             lists: ViewLists::of(&document.view),
             key_sources: document
@@ -4514,6 +4528,7 @@ impl AppliedSpec {
             depth: HashDepth::Unread,
             max_block_hashes: ViewSpec::default().max_block_hashes,
             block_size: Gates::default().block_size,
+            index: BTreeMap::new(),
             pairing: Pairing::default(),
             lists: ViewLists::default(),
             key_sources: Box::default(),
@@ -4559,6 +4574,19 @@ impl AppliedSpec {
     #[must_use]
     pub fn engine(&self) -> &Engine {
         &self.engine
+    }
+
+    /// The document's block size, in tokens: the size a request's blocks
+    /// are counted by where neither the request nor a record says one.
+    pub(crate) fn block_size(&self) -> u32 {
+        self.block_size
+    }
+
+    /// The most specific matching index settings, or the default.
+    pub(crate) fn index_for(&self, model: &str) -> IndexSpec {
+        index_matching(&self.index, model)
+            .map(|(_, spec)| spec.clone())
+            .unwrap_or_default()
     }
 
     /// The most prefix block hashes of one request a decision under this

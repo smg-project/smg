@@ -37,8 +37,8 @@ use crate::{
             WorkerStatus, WorkersStore,
         },
         world::{
-            left_models, micros, same_offer, Ask, Built, Classes, EncodePairBuffers, OutsideLists,
-            PairBuffers, StaleGeneration, ViewBuffers, World, Writer, PUBLISH_WINDOW,
+            left_models, micros, same_cache, same_offer, Ask, Built, Classes, EncodePairBuffers,
+            OutsideLists, PairBuffers, StaleGeneration, ViewBuffers, World, Writer, PUBLISH_WINDOW,
         },
         GatewayId,
     },
@@ -446,6 +446,8 @@ impl MemoryStore {
         // A restore only needs the previous ids to retire their KV lanes.
         let mut previous = FxHashMap::default();
         let mut previous_ids = Vec::new();
+        // The ids a watch's cut keeps under another offer or rank.
+        let mut moved = Vec::new();
         {
             let mut health = self.health.lock();
             let mut loads = self.loads.lock();
@@ -485,6 +487,9 @@ impl MemoryStore {
                     None
                 };
                 let held = if let Some(kept) = kept {
+                    if !same_cache(&kept.row.facts, &row.facts) {
+                        moved.push(id);
+                    }
                     row.admitted_at = kept.row.admitted_at;
                     Row { row, ..kept }
                 } else {
@@ -516,7 +521,13 @@ impl MemoryStore {
         for id in previous_ids.into_iter().chain(previous.into_keys()) {
             if !workers.rows.contains_key(&id) {
                 self.kv.forget(id);
+                self.kv.forget_sent(id);
             }
+        }
+        // Its placements name pools it may stand in no longer, or another
+        // rank's cache.
+        for id in moved {
+            self.kv.forget_sent(id);
         }
         for row in workers.rows.values() {
             self.kv.member(&row.row);
@@ -598,11 +609,18 @@ impl MemoryStore {
                 };
                 let resized = held.row.facts.dp_size != row.facts.dp_size;
                 carried = same_offer(&held.row.facts, &row.facts);
+                let kept = same_cache(&held.row.facts, &row.facts);
                 row.admitted_at = held.row.admitted_at;
                 let old = mem::replace(&mut held.row, row);
                 // A row that carries its offer left no model.
                 if !carried {
                     off = left_models(old.facts, &held.row.facts);
+                }
+                // Under another offer or rank it leaves the records of
+                // sent prefixes: its placements name pools it may stand in
+                // no longer, or another rank's cache.
+                if !kept {
+                    self.kv.forget_sent(id);
                 }
                 if resized {
                     (MembershipChange::Resized { id }, None)
@@ -1345,7 +1363,8 @@ impl MemoryStore {
     /// A worker's row is gone (removed, or replaced by a new incarnation):
     /// the store's tables that live exactly as long as the row leave with
     /// it: the health tables, the load rows and the worker's KV lane with
-    /// its blocks in the index. The vetoes a world
+    /// its blocks in the index. Its sent prefixes stop being read here and
+    /// are swept at later issues. The vetoes a world
     /// carries are not among them: they leave with the row in the
     /// publication of the membership write that calls this. Nor are the
     /// sessions' pins of record that name the worker: the leader's own
@@ -1361,6 +1380,7 @@ impl MemoryStore {
     /// row gone or lands before the tables are cleared.
     fn forget_worker(&self, id: WorkerId) {
         self.kv.forget(id);
+        self.kv.forget_sent(id);
         let mut health = self.health.lock();
         health.forget(id);
         let mut loads = self.loads.lock();
@@ -1664,6 +1684,7 @@ impl WorkersStore for MemoryStore {
                     return MembershipChange::Removed { id: old_id };
                 };
                 let resized = row.row.facts.dp_size != facts.dp_size;
+                let kept = same_cache(&row.row.facts, &facts);
                 // A registration refreshed with the offer it had moves no
                 // pair class and takes its worker off no model: the role and
                 // the models are the offer's. Another names the models it
@@ -1681,6 +1702,11 @@ impl WorkersStore for MemoryStore {
                     };
                     (classes, left_models(old, &row.row.facts))
                 };
+                // Under another offer or rank its placements name pools it
+                // may stand in no longer, or another rank's cache.
+                if !kept {
+                    self.kv.forget_sent(old_id);
+                }
                 row.row.revision += 1;
                 let change = workers.record(if resized {
                     MembershipChange::Resized { id: old_id }

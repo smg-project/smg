@@ -28,8 +28,9 @@
 //!   a request; the [`Engine`] resolves a request to its binding and decides.
 //!   A scorer or picker allocates nothing per decision. The consistent-hash
 //!   scorer owns its ring ([`ring`]), fed by the membership hooks. The
-//!   prefixes sent to a model's workers are kept by the sent-prefix
-//!   predictor ([`predictor`]), which no decision reads yet.
+//!   prefixes sent to a model's workers without cache events are kept by
+//!   the sent-prefix predictor ([`predictor`]). A profile that reads sent
+//!   prefixes reads that record at the naming through the in-process door.
 //! - 4.5, the stages in code ([`catalog`]): the [`Catalog`] of the stages a
 //!   build knows by name, the stock build's and the ones a host registers.
 //!   A document names either kind the same way, and the validator resolves
