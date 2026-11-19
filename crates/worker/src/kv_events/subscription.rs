@@ -37,7 +37,7 @@ pub enum SubscriptionKind {
 /// Where a load record pushed on a worker's event stream goes: the load
 /// monitor, as the collector's streams hold it. Held by this name,
 /// the sink brings nothing of the registry the load monitor is built over.
-pub trait PushedLoadSink: Send + Sync {
+pub(super) trait PushedLoadSink: Send + Sync {
     /// Take the record of `dp_rank` received at `received_at`
     /// ([`WorkerMonitor::apply_pushed_load`]).
     fn push_load(
@@ -321,12 +321,12 @@ async fn subscribe_with_deadline(
     }
 }
 
-/// The collector of one worker's pushed stream: the subscription loop and
-/// its rounds. It keeps nothing: a subscription's state is its task's, and
-/// what a stream brought is the sink's.
-pub struct KvEventCollector;
+/// The rounds of one worker's pushed stream, and the loop that runs them. It
+/// keeps nothing: a subscription's state is its task's, and what a stream
+/// brought is the sink's.
+pub(super) struct Rounds;
 
-impl KvEventCollector {
+impl Rounds {
     /// Tell the sink the worker left, when its subscription ends: on the
     /// blocking pool and under a fleet-wide bound, since the worker's blocks
     /// leave the sink's index inside the call.
@@ -367,7 +367,7 @@ impl KvEventCollector {
     /// under the deadline and drains one stream, then says what comes next;
     /// this loop is the one place that sleeps the reconnect backoff and the
     /// one place that ends the task.
-    pub async fn subscription_loop<S>(
+    pub(super) async fn subscription_loop<S>(
         worker: Arc<dyn Worker>,
         worker_url: String,
         feed: Option<(Arc<S>, S::Id)>,
@@ -867,7 +867,7 @@ mod tests {
             clippy::disallowed_methods,
             reason = "the case ends the loop and awaits its task"
         )]
-        let task = tokio::spawn(KvEventCollector::subscription_loop(
+        let task = tokio::spawn(Rounds::subscription_loop(
             Arc::clone(worker),
             worker.url().to_string(),
             Some((Arc::new(Said::default()), 7)),
@@ -1135,7 +1135,7 @@ mod tests {
             }
             let drained = tokio::time::timeout(
                 Duration::from_secs(5),
-                KvEventCollector::drain_stream(&sub, stream, &mut snapshot, &mut shutdown_rx),
+                Rounds::drain_stream(&sub, stream, &mut snapshot, &mut shutdown_rx),
             )
             .await
             .unwrap_or_else(|_| panic!("case {which}: the drain ends"));
@@ -1240,7 +1240,7 @@ mod tests {
         };
         let drained = tokio::time::timeout(
             Duration::from_secs(5),
-            KvEventCollector::drain_stream(&sub, stream, &mut snapshot, &mut shutdown_rx),
+            Rounds::drain_stream(&sub, stream, &mut snapshot, &mut shutdown_rx),
         )
         .await
         .expect("the drain ends");
@@ -1333,7 +1333,7 @@ mod tests {
             let mut snapshot = None;
             let drained = tokio::time::timeout(
                 Duration::from_secs(5),
-                KvEventCollector::drain_stream(&sub, stream, &mut snapshot, &mut shutdown_rx),
+                Rounds::drain_stream(&sub, stream, &mut snapshot, &mut shutdown_rx),
             )
             .await
             .expect("the finite stream ends");
@@ -1530,7 +1530,7 @@ mod tests {
             request
         };
         let (round, request) = tokio::join!(
-            KvEventCollector::subscription_round(&sub, &mut backoff, &mut shutdown_rx),
+            Rounds::subscription_round(&sub, &mut backoff, &mut shutdown_rx),
             request,
         );
         assert!(matches!(round, Round::Shutdown | Round::Backoff));
@@ -1584,8 +1584,7 @@ mod tests {
             let sub = said_subscription(&worker, &sink);
             let (_keep, mut shutdown_rx) = oneshot::channel::<()>();
             let round =
-                KvEventCollector::subscription_round(&sub, &mut Backoff::new(), &mut shutdown_rx)
-                    .await;
+                Rounds::subscription_round(&sub, &mut Backoff::new(), &mut shutdown_rx).await;
             if again {
                 assert!(matches!(round, Round::Again), "{expected:?}");
             } else {
@@ -1603,7 +1602,7 @@ mod tests {
         }
 
         let sink = Arc::new(Said::default());
-        KvEventCollector::remove_from_sink(Arc::clone(&sink), 7, "grpc://w1:9000").await;
+        Rounds::remove_from_sink(Arc::clone(&sink), 7, "grpc://w1:9000").await;
         assert_eq!(sink.calls(), ["removed 7"]);
     }
 
@@ -1630,8 +1629,7 @@ mod tests {
         let sink = Said::default();
         let sub = said_subscription(&worker, &sink);
         let (_keep, mut shutdown_rx) = oneshot::channel::<()>();
-        let round =
-            KvEventCollector::subscription_round(&sub, &mut Backoff::new(), &mut shutdown_rx).await;
+        let round = Rounds::subscription_round(&sub, &mut Backoff::new(), &mut shutdown_rx).await;
         assert!(matches!(round, Round::Backoff));
         let said: Vec<String> = sink
             .calls()
@@ -1663,8 +1661,7 @@ mod tests {
         let (_keep, mut shutdown_rx) = oneshot::channel::<()>();
         let mut backoff = Backoff::new();
         backoff.grow();
-        let round =
-            KvEventCollector::subscription_round(&sub, &mut backoff, &mut shutdown_rx).await;
+        let round = Rounds::subscription_round(&sub, &mut backoff, &mut shutdown_rx).await;
         assert!(matches!(round, Round::Again));
         assert_eq!(backoff.delay_ms(), INITIAL_RECONNECT_DELAY_MS);
         assert_eq!(
@@ -1692,8 +1689,7 @@ mod tests {
         let sink = Said::default();
         let sub = said_subscription(&worker, &sink);
         let (_keep, mut shutdown_rx) = oneshot::channel::<()>();
-        let round =
-            KvEventCollector::subscription_round(&sub, &mut Backoff::new(), &mut shutdown_rx).await;
+        let round = Rounds::subscription_round(&sub, &mut Backoff::new(), &mut shutdown_rx).await;
         assert!(matches!(round, Round::Backoff));
         let said: Vec<String> = sink
             .calls()
@@ -1728,7 +1724,7 @@ mod tests {
             load: Some(record.clone()),
             ..Default::default()
         };
-        assert!(KvEventCollector::is_load_only(&only));
+        assert!(Rounds::is_load_only(&only));
         let carrying = KvEventBatch {
             sequence_number: 8,
             load: Some(EngineLoad {
@@ -1737,8 +1733,8 @@ mod tests {
             }),
             ..stored_batch(&[(1, 16)])
         };
-        assert!(!KvEventCollector::is_load_only(&carrying));
-        assert!(!KvEventCollector::is_load_only(&KvEventBatch {
+        assert!(!Rounds::is_load_only(&carrying));
+        assert!(!Rounds::is_load_only(&KvEventBatch {
             sequence_number: 9,
             ..Default::default()
         }));
@@ -1771,8 +1767,7 @@ mod tests {
         let sink = Said::default();
         let sub = said_subscription(&worker, &sink);
         let (_keep, mut shutdown_rx) = oneshot::channel::<()>();
-        let round =
-            KvEventCollector::subscription_round(&sub, &mut Backoff::new(), &mut shutdown_rx).await;
+        let round = Rounds::subscription_round(&sub, &mut Backoff::new(), &mut shutdown_rx).await;
         assert!(matches!(round, Round::Backoff));
         let said: Vec<String> = sink
             .calls()

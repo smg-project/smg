@@ -24,6 +24,7 @@ use smg_grpc_client::{
         token_speed_scheduler_server::{TokenSpeedScheduler, TokenSpeedSchedulerServer},
     },
 };
+use tokio::task::JoinHandle;
 use tonic::{transport::Server, Request, Response, Status};
 use tracing_test::traced_test;
 
@@ -575,8 +576,6 @@ fn a_connection_that_is_not_the_gateways_client_carries_no_event_stream() {
     use metrics_exporter_prometheus::PrometheusBuilder;
     use smg_worker::{connection::engine::EngineConnector, test_support::CountingConnector};
 
-    use crate::policies::kv_index::event_monitor::Slot;
-
     let recorder = PrometheusBuilder::new().build_recorder();
     let handle = recorder.handle();
     // The subscription task publishes from the runtime's thread, which
@@ -624,17 +623,7 @@ fn a_connection_that_is_not_the_gateways_client_carries_no_event_stream() {
             // kept handle from an end: the loop's own task says it ended.
             let mut ended = false;
             for _ in 0..500 {
-                ended = match monitor
-                    .collector
-                    .worker_handles
-                    .lock()
-                    .await
-                    .get(worker.url())
-                {
-                    Some(Slot::Active(sub)) => sub.handle.is_finished(),
-                    Some(Slot::Removing(_)) => false,
-                    None => true,
-                };
+                ended = monitor.task_ended(worker.url()).await;
                 if ended {
                     break;
                 }
