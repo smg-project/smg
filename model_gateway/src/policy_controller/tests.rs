@@ -451,3 +451,19 @@ async fn a_starts_context_holds_the_store_where_the_controller_was_picked() -> C
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn a_starts_context_holds_the_feed_where_it_holds_the_store() -> Case {
+    let hosted = AppContext::from_config(picked(quiet()), 30, None, None).await?;
+    assert!(hosted.policy_store.is_some());
+    let feed = hosted.policy_feed.as_ref().ok_or("the store has no feed")?;
+    assert!(Arc::ptr_eq(
+        feed.objects.registry(),
+        &hosted.worker_registry
+    ));
+
+    let classic = AppContext::from_config(quiet(), 30, None, None).await?;
+    assert!(classic.policy_store.is_none());
+    assert!(classic.policy_feed.is_none());
+    Ok(())
+}

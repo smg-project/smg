@@ -40,6 +40,7 @@ use crate::{
     policies::{kv_index::event_monitor::KvEventMonitor, PolicyRegistry},
     policy_controller::{
         self,
+        feed::Feed,
         follower::{Follower, Settings},
         host::Host,
     },
@@ -146,6 +147,12 @@ pub struct AppContext {
     /// The policy controller's host. Routers ask it for placement wherever
     /// the policy store is present.
     pub(crate) policy_host: Option<Arc<Host>>,
+    /// The membership feed over [`Self::policy_store`], present wherever the store is.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the context holds the feed for membership writes")
+    )]
+    pub(crate) policy_feed: Option<Feed>,
     /// RL control plane state; `None` unless `router_config.rl.enabled`.
     pub rl: Option<Arc<smg_rl::RlState>>,
     pub realtime_registry: Arc<RealtimeRegistry>,
@@ -579,6 +586,10 @@ impl AppContextBuilder {
         let worker_registry = self
             .worker_registry
             .ok_or(AppContextBuildError::MissingField("worker_registry"))?;
+        let policy_feed = self
+            .policy_store
+            .as_ref()
+            .map(|store| policy_controller::feed::feed(store, &worker_registry));
         let policy_registry = self
             .policy_registry
             .ok_or(AppContextBuildError::MissingField("policy_registry"))?;
@@ -681,6 +692,7 @@ impl AppContextBuilder {
             policy_store: self.policy_store,
             policy_follower: self.policy_follower,
             policy_host,
+            policy_feed,
             rl,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: self.webrtc_bind_addr,
@@ -1828,6 +1840,7 @@ pub(crate) mod testing {
             policy_store: None,
             policy_follower: None,
             policy_host: None,
+            policy_feed: None,
             rl: None,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: None,

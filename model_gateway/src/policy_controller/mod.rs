@@ -6,15 +6,12 @@
 //! ([`RouterConfig::policy_controller`]). The classic policies are the
 //! default.
 //!
-//! At this step the setting starts the store and hands it the policy
-//! document the routing configuration means. Without a controller's address
-//! nothing feeds the store yet, and no code of the controller decides. So
-//! the server answers with one refusing router in the gateway object's
-//! place ([`router`]). No gateway
-//! object and no classic router is built, and each request is refused by
-//! name: the classic policies never decide for a process the controller was
-//! picked for. With the setting off nothing here is constructed, and no
-//! request reads this module.
+//! The setting starts the store with the routing configuration's policy
+//! document. The gateway holds the membership feed, and its workflows
+//! leave that door unused. Without a controller's address nothing feeds the
+//! store yet. The server answers with one refusing router in the gateway
+//! object's place ([`router`]). With the setting off the classic policies
+//! decide and the gateway constructs neither the store nor its feed.
 //!
 //! One site reads the setting, [`start`]. Every other site asks what the
 //! start left in the context.
@@ -46,6 +43,11 @@ pub(crate) mod follower;
 #[path = "follower_absent.rs"]
 pub(crate) mod follower;
 
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the gateway holds the feed for membership writes")
+)]
+pub(crate) mod feed;
 #[cfg_attr(
     not(test),
     expect(
