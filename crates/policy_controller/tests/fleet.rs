@@ -61,6 +61,11 @@
 //! served plugin's beside the stock stages, on a spec file that names the
 //! three, answers each cache namespace of a request on a row of its own,
 //! and under either plugin passes over the row that holds a lease.
+//! A host that embeds the engine holds its own decisions: over a store
+//! with no controller beside it a door decides on the caller's thread and
+//! a handle carries each lease from its issue to its end. A request is
+//! served by the engine its pick names, and each way a request ends with
+//! no answer leaves no lease on file and no engine booked.
 //!
 //! The overload veto is read under an operator's patch on the control
 //! listener: the engine that holds requests, patched past its threshold,
@@ -2908,4 +2913,208 @@ async fn a_standby_takes_the_fleet_when_its_leader_stops() {
     tokio::time::timeout(CASE, Box::pin(case))
         .await
         .expect("the case ends inside its outer bound");
+}
+
+/// A host that embeds the engine over the fleet: no controller stands
+/// beside the store, a door decides on the caller's thread and a handle
+/// holds each decision from its answer to the end of its request.
+mod embedded {
+    use std::{sync::Arc, time::Instant};
+
+    use smg_policy_controller::{
+        door::{Door, Request},
+        handle::Handle,
+        store::{GatewayId, HealthSink, LeaseState, LeasesStore},
+        view::fingerprint,
+        Constraints, Outcome, PolicySpec, ReleaseReason, RequestFacts, Side, TransportClass,
+        WorkerId,
+    };
+
+    use super::{
+        fleet::{within, Embedded, GATEWAY, ROOM},
+        CASE, FLEET, MODEL,
+    };
+
+    /// One request for the fleet's model, as a host in process states it.
+    fn asked(id: &[u8]) -> Request<'_> {
+        Request {
+            id,
+            facts: RequestFacts {
+                model: MODEL,
+                ..RequestFacts::default()
+            },
+            constraints: Constraints::default(),
+        }
+    }
+
+    /// What a host says of a request it sent at `sent`: the class its
+    /// transport read on the worker that served, and the frames it read.
+    fn read(served: WorkerId, class: TransportClass, frames: u32, sent: Instant) -> Outcome {
+        Outcome {
+            side: Side::Single,
+            served,
+            // The gRPC code the request ended with.
+            status: if class == TransportClass::Ok { 0 } else { 14 },
+            class,
+            ttft_micros: 0,
+            tokens_in: 8,
+            tokens_out: frames,
+            duration_micros: u32::try_from(sent.elapsed().as_micros()).unwrap_or(u32::MAX),
+        }
+    }
+
+    /// Three engines, a rotation over them, and a door with handles in the
+    /// place of a controller and its client. Three requests are held at
+    /// once: each lease books the engine its pick names, each request is
+    /// sent on that engine's own wire and read to its end, and each
+    /// completion frees its engine and is written for the health
+    /// precedence. Then each way a request ends with no answer: a commit
+    /// that refuses every target, a client that leaves before the
+    /// dispatch, a request its host lets go with no word, a client that
+    /// leaves behind a dispatch on the pick's second target, and an engine
+    /// that died under a held decision. Behind each no lease stands on
+    /// file and no engine is booked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_host_in_process_holds_each_decision_to_its_requests_end() {
+        let case = async {
+            let rotation = PolicySpec::preset("round_robin").expect("a preset of this build");
+            let mut fleet = Embedded::start(4, rotation).expect("the store takes the preset");
+            let engines = fleet
+                .register(&FLEET[..3])
+                .await
+                .expect("the engines register");
+            fleet.feed();
+            let gateway = GatewayId(fingerprint(GATEWAY.as_bytes()));
+            let idle = vec![(true, 0); engines.len()];
+            within("a decision reads every engine healthy", ROOM, || {
+                fleet.read(MODEL, gateway) == idle
+            })
+            .await
+            .expect("a probe turn reads the fleet ready");
+            let store = Arc::clone(fleet.store());
+            let door = Door::new(Arc::clone(&store));
+            let live = || LeasesStore::live(store.as_ref(), gateway);
+            let booked = |fleet: &Embedded| -> Vec<u32> {
+                let rows = fleet.read(MODEL, gateway);
+                rows.into_iter().map(|(_, count)| count).collect()
+            };
+
+            // Three requests held at once. A rotation names each engine
+            // once, and each lease books the engine its pick names.
+            let started = Instant::now();
+            let ids: [&[u8]; 3] = [b"held-0", b"held-1", b"held-2"];
+            let mut held = Vec::new();
+            for id in ids {
+                let decided = Handle::decide(&door, gateway, &asked(id), Instant::now());
+                let mut handle = decided.expect("a decision");
+                let target = handle.take(0).expect("a pick over the fleet");
+                let engine = fleet.engine_of(target.id);
+                let engine = engine.expect("a pick names a row of the fleet");
+                handle.dispatched(Instant::now());
+                held.push((handle, target.id, engine));
+            }
+            assert_eq!(booked(&fleet), [1, 1, 1], "each engine holds one request");
+            assert_eq!(live(), 3);
+            // Each is sent on its engine's own wire and read to its end:
+            // the completion says what the transport read.
+            for (mut handle, served, engine) in held {
+                let sent = Instant::now();
+                let answered = fleet.send(engine, "held").await;
+                let (class, frames) = answered.expect("an engine of the fleet");
+                assert_eq!(class, TransportClass::Ok, "engine {engine}");
+                assert!(frames > 0, "engine {engine} answered no frame");
+                handle.completed(&read(served, class, frames, sent), Instant::now());
+                assert!(
+                    store.completed_ok_since(gateway, served, started),
+                    "the completion of engine {engine} is written"
+                );
+            }
+            assert_eq!((booked(&fleet), live()), (vec![0; 3], 0));
+
+            // A commit that refuses every target releases the lease.
+            let decided = Handle::decide(&door, gateway, &asked(b"refused"), Instant::now());
+            let mut handle = decided.expect("a decision");
+            assert_eq!(live(), 1, "the issue files the lease");
+            handle.released(ReleaseReason::CommitFailed);
+            assert_eq!((booked(&fleet), live()), (vec![0; 3], 0));
+            drop(handle);
+
+            // A client that leaves before the dispatch: a host that knows
+            // says so.
+            let decided = Handle::decide(&door, gateway, &asked(b"left"), Instant::now());
+            let mut handle = decided.expect("a decision");
+            assert_eq!(live(), 1);
+            handle.released(ReleaseReason::ClientGone);
+            assert_eq!((booked(&fleet), live()), (vec![0; 3], 0));
+            drop(handle);
+
+            // A request its host lets go with no word: the lease is given
+            // up where the handle is dropped.
+            let decided = Handle::decide(&door, gateway, &asked(b"dropped"), Instant::now());
+            assert_eq!((decided.is_ok(), live()), (true, 1));
+            drop(decided);
+            assert_eq!((booked(&fleet), live()), (vec![0; 3], 0));
+
+            // A request sent to the pick's second target books that
+            // engine from its dispatch. Its client leaves behind the
+            // dispatch: the lease ends as cancelled, no completion of
+            // class ok.
+            let then = Instant::now();
+            let decided = Handle::decide(&door, gateway, &asked(b"second"), then);
+            let mut handle = decided.expect("a decision");
+            let first = handle.take(0).expect("a pick over the fleet");
+            let second = handle.take(1).expect("a rotation offers a second target");
+            let passed = fleet.engine_of(first.id).expect("a row of the fleet");
+            let taken = fleet.engine_of(second.id).expect("a row of the fleet");
+            assert_ne!(passed, taken);
+            let on = |engine: usize| -> Vec<u32> {
+                let engines = 0..engines.len();
+                engines.map(|at| u32::from(at == engine)).collect()
+            };
+            assert_eq!(
+                booked(&fleet),
+                on(passed),
+                "the issue books the first target"
+            );
+            handle.dispatched(Instant::now());
+            assert_eq!(
+                booked(&fleet),
+                on(taken),
+                "the dispatch books the one taken"
+            );
+            let lease = handle.lease().expect("a pick's lease").lease.id;
+            let on_file = LeasesStore::get(store.as_ref(), gateway, lease);
+            let on_file = on_file.expect("the lease is on file");
+            assert!(
+                matches!(on_file.state, LeaseState::Dispatched { .. })
+                    && on_file.target == second.id,
+                "{on_file:?}"
+            );
+            drop(handle);
+            assert_eq!((booked(&fleet), live()), (vec![0; 3], 0));
+            assert!(!store.completed_ok_since(gateway, second.id, then));
+
+            // An engine dies under a held decision: the send fails, and
+            // the completion its host says with no dispatch ends the
+            // lease on the dead engine.
+            let decided = Handle::decide(&door, gateway, &asked(b"dead"), Instant::now());
+            let mut handle = decided.expect("a decision");
+            let target = handle.take(0).expect("a pick over the fleet");
+            let engine = fleet.engine_of(target.id).expect("a row of the fleet");
+            fleet.kill(engine).await.expect("the engine dies");
+            let sent = Instant::now();
+            let answered = fleet.send(engine, "dead").await;
+            let (class, frames) = answered.expect("an engine of the fleet");
+            assert_eq!((class, frames), (TransportClass::ConnectFailed, 0));
+            handle.completed(&read(target.id, class, frames, sent), Instant::now());
+            assert_eq!((booked(&fleet), live()), (vec![0; 3], 0));
+            assert!(!store.completed_ok_since(gateway, target.id, sent));
+
+            assert_eq!((door.faults(), store.lifecycle_faults()), (0, 0));
+            fleet.stop().await.expect("a clean stop");
+        };
+        tokio::time::timeout(CASE, Box::pin(case))
+            .await
+            .expect("the case ends inside its outer bound");
+    }
 }

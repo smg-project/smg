@@ -115,6 +115,7 @@ pub mod elector;
 pub mod framework;
 #[cfg(feature = "controller")]
 pub mod grpc;
+pub mod handle;
 #[cfg(feature = "ingest")]
 pub mod ingest;
 pub mod lease;
