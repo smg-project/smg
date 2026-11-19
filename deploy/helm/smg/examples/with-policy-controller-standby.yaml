@@ -21,8 +21,9 @@
 # takes no stated name and refuses the new pod, which stays not ready while
 # the old pods serve as before. Scale the controller to zero first, by hand
 # or with policyController.enabled=false (the schema refuses replicas: 0),
-# then upgrade: the first leader under these values starts with no worker
-# and no load.
+# wait until no controller pod remains, then upgrade with the controller
+# on: the first leader under these values starts with no worker and no
+# load.
 # Usage: helm install smg deploy/helm/smg -f deploy/helm/smg/examples/with-policy-controller-standby.yaml
 router:
   workerUrls:
