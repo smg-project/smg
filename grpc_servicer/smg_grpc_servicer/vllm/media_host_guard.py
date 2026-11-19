@@ -21,7 +21,8 @@ an HTTP connection whose session:
   ``0177.0.0.1``, ``0x7f.1``) included, read as the router's URL parser reads
   them; the host name is checked against the allow-list when one is
   configured, read as the router reads it (an IPv6 address named bracketed,
-  as vLLM's own first-URL check names it). A hop sent through an egress proxy is resolved by the proxy, so
+  as vLLM's own first-URL check names it); a host with an IPv6 zone ID is
+  refused, as the router's URL parser refuses it. A hop sent through an egress proxy is resolved by the proxy, so
   its name is resolved and checked here instead, without a pin, as the router
   does; the resolver passes that hop's proxy name, and only that one,
   unchecked. A hop sent directly is resolved and pinned as above.
@@ -163,35 +164,48 @@ def _ip_literal(host: str) -> IpAddress | None:
     return None
 
 
+def _names_a_zone(entry: str) -> bool:
+    """Whether an allow-list entry names an IPv6 address with a zone ID,
+    which no media URL may carry (:meth:`MediaHostPolicy.check_hop`)."""
+    return ":" in entry and "%" in entry
+
+
 def effective_allowed_domains(allowed_domains: Iterable[str] | None) -> list[str] | None:
-    """An allow-list as the router reads it (``effective_allowed_domains`` in
-    ``fetch_policy.rs``): each entry trimmed and lowercased, empty entries
-    dropped, each once; None when nothing is left, which allows any host.
-    The one reading for both of a worker's checks, vLLM's own first-URL
-    check and the policy's check of every hop."""
-    domains = sorted({d.strip().lower() for d in (allowed_domains or ()) if d and d.strip()})
-    return domains or None
+    """An allow-list as both of a worker's checks read it, vLLM's own
+    first-URL check and the policy's check of every hop: each entry trimmed
+    and lowercased, empty entries and entries with an IPv6 zone ID dropped,
+    each once, as the router reads its list (``effective_allowed_domains``
+    in ``fetch_policy.rs``). None when no list is configured, which allows
+    any host. A configured list none of whose entries is left is an empty
+    list, which refuses every host: a reading never allows more than the
+    list as configured did (the router would read it as no list)."""
+    configured = list(allowed_domains or ())
+    if not configured:
+        return None
+    return sorted(
+        {d.strip().lower() for d in configured if d and d.strip() and not _names_a_zone(d)}
+    )
 
 
 def _bracketed_ipv6(text: str) -> str | None:
     """`text`, an IPv6 literal with or without brackets, as ``[address]`` in
-    its compressed spelling (a zone ID kept, ``%25`` read as ``%``); None
-    when it is no IPv6 address."""
+    its compressed spelling; None when it is no IPv6 address."""
     bare = text[1:-1] if text.startswith("[") and text.endswith("]") else text
     if ":" not in bare:
         return None
     try:
-        return f"[{ipaddress.IPv6Address(bare.replace('%25', '%', 1))}]"
+        return f"[{ipaddress.IPv6Address(bare)}]"
     except ValueError:
         return None
 
 
 def _allow_list_key(entry: str) -> str:
-    """An allow-list entry as hops are compared with it. An IPv6 address is
-    named bracketed, as vLLM's check (urllib3's hostname) and the router's
-    URL parser spell it, and compared by address, so any spelling of the
-    entry matches any spelling of the URL; a bare IPv6 entry names no host,
-    as for them."""
+    """An allow-list entry as the policy compares hops with it. An IPv6
+    address is named bracketed, as vLLM's check (urllib3's hostname) and the
+    router's URL parser spell it. The policy compares it by address, so any
+    spelling of the entry matches any spelling of a hop; vLLM's first-URL
+    check is exact, so the first URL must spell it as the entry does. A bare
+    IPv6 entry names no host, as for vLLM and the router."""
     if entry.startswith("["):
         return _bracketed_ipv6(entry) or entry
     return entry
@@ -228,8 +242,14 @@ class MediaHostPolicy:
         raw_host = url.raw_host
         if raw_host and ":" in raw_host:
             # An IPv6 literal, which yarl gives bare and compressed: named
-            # bracketed on the allow-list, judged bare by address.
-            name = _bracketed_ipv6((url.host or raw_host).lower())
+            # bracketed on the allow-list, judged bare by address. A zone ID
+            # (an interface of this host) is refused whatever the policy, as
+            # the router's URL parser refuses it.
+            if "%" in raw_host:
+                raise MediaHostRefused(
+                    f"media host {raw_host!r} carries an IPv6 zone ID, not fetched"
+                )
+            name = _bracketed_ipv6(raw_host.lower())
             if name is None:
                 raise MediaHostRefused(f"media host {raw_host!r} is not a valid IP address")
             self.check_name(name)
@@ -344,7 +364,22 @@ def media_connector_kwargs(
     """The `connection=` and `allowed_media_domains=` a worker's
     MediaConnector is built with: vLLM checks the first URL against the same
     reading of the allow-list the connection checks every hop against."""
-    policy = MediaHostPolicy(allowed_media_domains, allow_private_hosts)
+    configured = list(allowed_media_domains or ())
+    for entry in configured:
+        if entry and _names_a_zone(entry):
+            logger.warning(
+                "--allowed-media-domains entry %r names an IPv6 zone ID, which no media URL "
+                "may carry: ignored",
+                entry,
+            )
+    domains = effective_allowed_domains(configured)
+    if domains == []:
+        logger.warning(
+            "--allowed-media-domains %r names no host a media URL may name: every media URL "
+            "is refused",
+            configured,
+        )
+    policy = MediaHostPolicy(configured, allow_private_hosts)
     if allow_private_hosts:
         logger.warning(
             "worker media fetches may reach private, loopback and link-local hosts "
@@ -352,5 +387,7 @@ def media_connector_kwargs(
         )
     return {
         "connection": guarded_connection(policy),
-        "allowed_media_domains": effective_allowed_domains(allowed_media_domains),
+        # A list that names no host stays as configured for vLLM, whose check
+        # reads an empty list as none; the connection refuses every hop.
+        "allowed_media_domains": domains or (configured or None),
     }

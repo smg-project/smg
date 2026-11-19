@@ -719,7 +719,11 @@ class TestInProcessConstruction:
         engine.model_config.allowed_media_domains = [" Images.Example.com ", "", "[::1]"]
         mm_processor.InProcessMediaProcessor(engine)
         assert loaded["allowed_media_domains"] == ["[::1]", "images.example.com"]
+        # A list that names no host still refuses every host, as it did.
         engine.model_config.allowed_media_domains = [" ", ""]
+        mm_processor.InProcessMediaProcessor(engine)
+        assert loaded["allowed_media_domains"] == [" ", ""]
+        engine.model_config.allowed_media_domains = None
         mm_processor.InProcessMediaProcessor(engine)
         assert loaded["allowed_media_domains"] is None
 

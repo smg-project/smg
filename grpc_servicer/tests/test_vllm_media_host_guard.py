@@ -265,21 +265,94 @@ def test_ipv6_allow_list_entries_are_bracketed_and_compared_by_address():
     _hop(MediaHostPolicy(["[::1]"], allow_private_hosts=True), "http://[::1]/x")
 
 
-def test_an_ipv6_zone_id_is_stripped_and_the_address_judged():
-    # The router's URL parser refuses a zone ID; here the address is judged.
-    strict = MediaHostPolicy(None, allow_private_hosts=False)
-    with pytest.raises(MediaHostRefused, match="link-local"):
-        _hop(strict, "http://[fe80::1%25eth0]/x")
-    with pytest.raises(MediaHostRefused, match="loopback"):
-        _hop(strict, "http://[::1%25lo]/x")
-    _hop(strict, "http://[2606:4700::1111%25eth0]/x")
-    # On the allow-list the zone is part of the name, spelled % or %25.
-    for entry in ("[fe80::1%eth0]", "[FE80::1%25ETH0]"):
-        listed = MediaHostPolicy([entry], allow_private_hosts=True)
-        _hop(listed, "http://[fe80::1%25eth0]/x")
-        for other in ("http://[fe80::1%25eth1]/x", "http://[fe80::1]/x"):
+@pytest.mark.parametrize("allow_private", [False, True])
+@pytest.mark.parametrize(
+    "url", ["http://[fe80::1%25eth0]/x", "http://[::1%25lo]/x", "http://[2606:4700::1111%25eth0]/x"]
+)
+def test_a_host_with_an_ipv6_zone_id_is_refused_whatever_the_policy(url, allow_private):
+    # The router's URL parser refuses a zone ID; so does every hop here,
+    # public address, listed host or private hosts allowed.
+    for entries in (None, ["[fe80::1%eth0]", "[::1]", "[2606:4700::1111]"]):
+        policy = MediaHostPolicy(entries, allow_private_hosts=allow_private)
+        with pytest.raises(MediaHostRefused, match="zone ID"):
+            _hop(policy, url)
+
+
+@pytest.mark.parametrize("allow_private", [False, True])
+@pytest.mark.parametrize("bounce", ["bounce", "bounce-uri"])
+def test_a_redirect_to_a_host_with_a_zone_id_is_refused(monkeypatch, allow_private, bounce):
+    # The first hop's name passes (as a public name would); the redirect's
+    # zone ID is refused before the hop is sent.
+    real = guard.check_address
+
+    def check_address(host, address):
+        if host != "localhost":
+            real(host, address)
+
+    monkeypatch.setattr(guard, "check_address", check_address)
+
+    async def run():
+        state = {"hits": 0}
+        runner, port = await _serve(_routes(state))
+        policy = MediaHostPolicy(None, allow_private_hosts=allow_private)
+        try:
+            for target in (f"http://[::1%25lo]:{port}/media", f"http://[fe80::1%25eth0]:{port}/x"):
+                with pytest.raises(MediaHostRefused, match="zone ID"):
+                    await _fetch(policy, f"http://localhost:{port}/{bounce}?to={target}")
+            with pytest.raises(MediaHostRefused, match="zone ID"):
+                await _fetch(policy, f"http://[::1%25lo]:{port}/media")
+            assert state["hits"] == 0
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(run())
+
+
+@pytest.fixture
+def stub_vllm_connections(monkeypatch):
+    connections = types.ModuleType("vllm.connections")
+
+    class HTTPConnection:
+        async def get_async_client(self):  # pragma: no cover - replaced
+            raise AssertionError("the guard must replace the session")
+
+    connections.HTTPConnection = HTTPConnection
+    monkeypatch.setitem(sys.modules, "vllm", types.ModuleType("vllm"))
+    monkeypatch.setitem(sys.modules, "vllm.connections", connections)
+
+
+def test_an_allow_list_entry_with_a_zone_id_is_ignored_with_a_warning(
+    stub_vllm_connections, caplog
+):
+    with caplog.at_level("WARNING", logger=guard.__name__):
+        kwargs = guard.media_connector_kwargs(
+            ["[fe80::1%ETH0]", "Example.com"], allow_private_hosts=True
+        )
+    assert "'[fe80::1%ETH0]' names an IPv6 zone ID" in caplog.text
+    assert kwargs["allowed_media_domains"] == ["example.com"]
+    policy = MediaHostPolicy(["[fe80::1%ETH0]", "example.com"], allow_private_hosts=True)
+    assert policy.allowed_domains == frozenset({"example.com"})
+
+
+@pytest.mark.parametrize("entries", [[" ", ""], ["[fe80::1%eth0]"]])
+def test_a_list_that_names_no_usable_host_refuses_every_host(
+    stub_vllm_connections, caplog, entries
+):
+    # Normalising never allows more than the list as configured did: vLLM
+    # refused every host for a list of blanks, and so does the worker now.
+    with caplog.at_level("WARNING", logger=guard.__name__):
+        kwargs = guard.media_connector_kwargs(entries, allow_private_hosts=True)
+    assert "every media URL is refused" in caplog.text
+    # vLLM reads an empty list as none: it is handed the list as configured.
+    assert kwargs["allowed_media_domains"] == entries
+    for allow_private in (False, True):
+        policy = MediaHostPolicy(entries, allow_private_hosts=allow_private)
+        assert policy.allowed_domains == frozenset()
+        for url in ("http://example.com/x", "http://localhost/x", "http://[::1]/x"):
             with pytest.raises(MediaHostRefused, match="allowed-media-domains"):
-                _hop(listed, other)
+                _hop(policy, url)
+    assert guard.effective_allowed_domains(None) is None
+    assert guard.effective_allowed_domains([]) is None
 
 
 def test_public_numeric_hosts_pass_and_names_stay_names():
@@ -418,17 +491,7 @@ def test_a_public_name_passes_the_resolver_and_a_private_answer_does_not():
     asyncio.run(run())
 
 
-def test_the_connection_hands_vllm_the_guarded_session(monkeypatch):
-    connections = types.ModuleType("vllm.connections")
-
-    class HTTPConnection:
-        async def get_async_client(self):  # pragma: no cover - replaced
-            raise AssertionError("the guard must replace the session")
-
-    connections.HTTPConnection = HTTPConnection
-    monkeypatch.setitem(sys.modules, "vllm", types.ModuleType("vllm"))
-    monkeypatch.setitem(sys.modules, "vllm.connections", connections)
-
+def test_the_connection_hands_vllm_the_guarded_session(stub_vllm_connections):
     async def run():
         kwargs = guard.media_connector_kwargs(None, allow_private_hosts=False)
         connection = kwargs["connection"]
@@ -517,3 +580,33 @@ def test_vllms_connector_refuses_a_host_off_the_list_before_the_guard():
     )
     with pytest.raises(ValueError, match="allowed domains"):
         asyncio.run(connector.load_from_url_async("http://localhost:1/x", _RawBytes()))
+
+
+def test_a_mixed_ipv6_spelling_passes_the_guard_but_not_vllms_exact_check():
+    # vLLM checks the first URL's host as the URL spells it, for exact
+    # membership; the guard compares an IPv6 hop with the entry by address.
+    connector_module = pytest.importorskip("vllm.multimodal.media.connector")
+    vllm_exceptions = pytest.importorskip("vllm.exceptions")
+
+    async def run():
+        state = {"hits": 0}
+        runner, port = await _ipv6_loopback_server(state)
+        connector = connector_module.MediaConnector(
+            **guard.media_connector_kwargs(["[0:0::1]"], allow_private_hosts=True)
+        )
+        try:
+            refused = (ValueError, getattr(vllm_exceptions, "VLLMClientError", ValueError))
+            with pytest.raises(refused, match="allowed domains"):
+                await connector.load_from_url_async(f"http://[::1]:{port}/media", _RawBytes())
+            assert state["hits"] == 0
+            target = f"http://[::1]:{port}/media"
+            first = f"http://[0:0::1]:{port}/bounce?to={target}"
+            assert await connector.load_from_url_async(first, _RawBytes()) == b"img"
+            assert state["hits"] == 1
+        finally:
+            session = connector.connection._guarded  # noqa: SLF001
+            if session is not None:
+                await session.close()
+            await runner.cleanup()
+
+    asyncio.run(run())

@@ -361,7 +361,8 @@ class TestConnector:
     def test_the_connector_reads_the_allow_list_as_the_guard_does(self, monkeypatch):
         """vLLM's own first-URL check is handed the list the guarded
         connection checks every hop against: trimmed, lowercased, blanks
-        dropped; with nothing left, no list."""
+        dropped; a list with nothing left stays as configured, refusing
+        every host."""
         loaded = {}
 
         def module(name, **attrs):
@@ -410,7 +411,9 @@ class TestConnector:
         loaded = build([" Images.Example.com ", "", "[::1]"])
         assert type(loaded["connection"]).__name__ == "GuardedHTTPConnection"
         assert loaded["allowed_media_domains"] == ["[::1]", "images.example.com"]
-        assert build([" "])["allowed_media_domains"] is None
+        # A list that names no host still refuses every host, as it did.
+        assert build([" "])["allowed_media_domains"] == [" "]
+        assert build(None)["allowed_media_domains"] is None
 
 
 class TestShortSideFloor:
