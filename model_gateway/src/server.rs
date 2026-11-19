@@ -97,6 +97,7 @@ use crate::{
         logging::LoggingConfig, metrics, metrics::PrometheusConfig, metrics_server, otel_trace,
         runtime_metrics,
     },
+    policy_controller,
     routers::{
         common::realtime::ws::RealtimeQueryParams,
         error as route_error,
@@ -2187,6 +2188,25 @@ fn serve_listeners(
     Ok((data_serving, admin_serving))
 }
 
+/// The one router this server answers with, and the gateway object behind it
+/// where one is built.
+///
+/// A process the policy controller was picked for answers with the
+/// controller's router ([`policy_controller::router`]) and builds no gateway
+/// object. So no classic router is built, and no selection of the gateway
+/// object runs ahead of the controller's answer.
+pub(crate) async fn serving_router(
+    config: &ServerConfig,
+    context: &Arc<AppContext>,
+) -> Result<(Arc<dyn RouterTrait>, Option<Arc<Gateway>>), String> {
+    if let Some(router) = policy_controller::router(context) {
+        return Ok((router, None));
+    }
+    let gateway = Gateway::from_config(config, context).await?;
+    let router: Arc<dyn RouterTrait> = gateway.clone();
+    Ok((router, Some(gateway)))
+}
+
 /// Start the gateway listeners and drain them within the configured shutdown budget.
 pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
     install_crypto_provider();
@@ -2433,8 +2453,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         worker_stats.total_workers, worker_stats.healthy_workers
     );
 
-    let gateway = Gateway::from_config(&config, &app_context).await?;
-    let router: Arc<dyn RouterTrait> = gateway.clone();
+    let (router, gateway) = serving_router(&config, &app_context).await?;
 
     // WorkerManager owns the background health check loop. Its handle must
     // outlive the server to keep the task alive — bind it here so its Drop
@@ -2559,7 +2578,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         router,
         context: app_context.clone(),
         admission_queue,
-        gateway: Some(gateway),
+        gateway,
         mesh_handler,
         mesh_adapters,
         probe_state,

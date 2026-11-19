@@ -47,8 +47,6 @@ pub mod router_ids {
     pub const GRPC_REGULAR: RouterId = RouterId::new("grpc-regular");
     pub const GRPC_PD: RouterId = RouterId::new("grpc-pd");
     pub const GRPC_EPD: RouterId = RouterId::new("grpc-epd");
-    /// The one router of a process the policy controller was picked for.
-    pub const POLICY_CONTROLLER: RouterId = RouterId::new("policy-controller");
 }
 
 /// One IGW registration: the router id, its label, and the constructed

@@ -678,9 +678,10 @@ struct RoutingArgs {
     /// Print the policy document these routing flags mean, as YAML, and
     /// exit. The routing part of the line is read and checked as a start
     /// checks it: the routing flags, the discovery flags and the tenant
-    /// header's name. A flag of a wrong shape is refused first, as at a
-    /// start. Nothing is started and no file is read, so no secret and no
-    /// key. A start checks the rest of the command line. A setting the
+    /// header's name. A Consul address and the Consul environment are
+    /// resolved at a start alone. A flag of a wrong shape is refused first,
+    /// as at a start. Nothing is started and no file is read, so no secret
+    /// and no key. A start checks the rest of the command line. A setting the
     /// document cannot say yet, and a part of the document this build's
     /// controller does not run yet, is named in one sentence on stderr, and
     /// the exit is then a failure

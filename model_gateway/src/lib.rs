@@ -33,7 +33,7 @@ pub mod mesh;
 pub mod middleware;
 pub mod observability;
 pub mod policies;
-pub mod policy_controller;
+pub(crate) mod policy_controller;
 pub mod rate_limit;
 pub mod rl_adapter;
 pub mod routers;
