@@ -1,7 +1,8 @@
 //! The recorder of the gateway's answer to a pool whose every usable worker
 //! is over its overload thresholds: each row is a pool of workers, what the
 //! router holds of each one (the requests in flight, and whether it is
-//! ready, over its thresholds or doubted by the liveness tracker), the
+//! ready, over its thresholds, doubted by the liveness tracker or behind an
+//! open circuit breaker), the
 //! policy the pool runs under, whether shedding is on, a list of steps and
 //! what the gateway's single-worker placement answered at each request. The
 //! policy controller crate replays the rows through its own decision
@@ -68,6 +69,8 @@ enum State {
     Stalled,
     /// Ready, over its thresholds and doubted by the liveness tracker.
     StalledOver,
+    /// Ready and under its thresholds, behind an open circuit breaker.
+    Breaker,
     /// Not ready.
     Down,
 }
@@ -211,6 +214,18 @@ impl Bed {
             worker.set_stall(
                 matches!(state, State::Stalled | State::StalledOver).then_some(StallReason::Wedged),
             );
+            // An open breaker refuses execution: failures are recorded
+            // until it does. Every other state starts from a closed one.
+            worker.reset_circuit_breaker();
+            if state == State::Breaker {
+                for _ in 0..1_000 {
+                    if !worker.circuit_breaker_can_execute() {
+                        break;
+                    }
+                    worker.record_circuit_breaker_outcome(false);
+                }
+                assert!(!worker.circuit_breaker_can_execute(), "the breaker opens");
+            }
         }
     }
 
@@ -745,6 +760,7 @@ fn rows() -> Vec<Row> {
         vec![keyed("k1"), keyed("k1")],
     ));
     liveness_rows(&mut rows);
+    breaker_rows(&mut rows);
     rows
 }
 
@@ -769,7 +785,7 @@ fn record_the_classic_all_vetoed_rows() {
 }
 
 /// A row's name under `policy`: the policy's name, then what the row shows.
-fn leaked(policy: &str, shows: &str) -> &'static str {
+fn row_name(policy: &str, shows: &str) -> &'static str {
     Box::leak(format!("{}-{shows}", policy.replace('_', "-")).into_boxed_str())
 }
 
@@ -781,7 +797,7 @@ fn liveness_rows(rows: &mut Vec<Row>) {
     // in flight, with shedding off and on.
     for policy in POLICIES {
         rows.push(sequence_row(
-            leaked(
+            row_name(
                 policy,
                 "a-pool-doubted-on-every-worker-goes-to-the-fewest-in-flight",
             ),
@@ -797,7 +813,7 @@ fn liveness_rows(rows: &mut Vec<Row>) {
             ],
         ));
         rows.push(sequence_row(
-            leaked(
+            row_name(
                 policy,
                 "a-pool-doubted-on-every-worker-is-placed-under-shedding-too",
             ),
@@ -810,7 +826,7 @@ fn liveness_rows(rows: &mut Vec<Row>) {
     // Equal loads are drawn, over the tied workers alone.
     for policy in ["round_robin", "consistent_hashing"] {
         rows.push(drawn_row(
-            leaked(policy, "equal-loads-doubted-on-every-worker-are-drawn"),
+            row_name(policy, "equal-loads-doubted-on-every-worker-are-drawn"),
             policy,
             false,
             all(Stalled, &[2, 2, 5]),
@@ -896,7 +912,7 @@ fn liveness_cells(rows: &mut Vec<Row>) {
     ];
     for (shows, shed, workers, steps) in cells {
         rows.push(sequence_row(
-            leaked(rr, shows),
+            row_name(rr, shows),
             rr,
             shed,
             mixed(&workers),
@@ -908,6 +924,61 @@ fn liveness_cells(rows: &mut Vec<Row>) {
 /// Three workers in one state, holding 3, 1 and 2 requests.
 fn all_of(state: State) -> Vec<(State, u32)> {
     vec![(state, 3), (state, 1), (state, 2)]
+}
+
+/// The rows of the breaker: a worker behind an open circuit breaker, in a
+/// pool of such workers and beside a worker a soft veto stands on.
+fn breaker_rows(rows: &mut Vec<Row>) {
+    use State::{Breaker, Over, Stalled};
+    // Under every policy, with shedding off and on: open breakers on every
+    // worker.
+    for policy in POLICIES {
+        for (shed, shows) in [
+            (false, "a-pool-behind-open-breakers-on-every-worker"),
+            (
+                true,
+                "a-pool-behind-open-breakers-on-every-worker-under-shedding",
+            ),
+        ] {
+            rows.push(sequence_row(
+                row_name(policy, shows),
+                policy,
+                shed,
+                all(Breaker, &[3, 1, 2]),
+                vec![pick()],
+            ));
+        }
+    }
+    // One worker a soft veto stands on, the fullest of the pool, between
+    // two behind open breakers.
+    let rr = "round_robin";
+    let cells: Vec<(&str, bool, State)> = vec![
+        ("a-doubted-worker-among-open-breakers", false, Stalled),
+        (
+            "a-doubted-worker-among-open-breakers-under-shedding",
+            true,
+            Stalled,
+        ),
+        (
+            "a-worker-over-its-thresholds-among-open-breakers",
+            false,
+            Over,
+        ),
+        (
+            "a-worker-over-its-thresholds-among-open-breakers-under-shedding",
+            true,
+            Over,
+        ),
+    ];
+    for (shows, shed, soft) in cells {
+        rows.push(sequence_row(
+            row_name(rr, shows),
+            rr,
+            shed,
+            mixed(&[(Breaker, 0), (soft, 9), (Breaker, 1)]),
+            vec![pick(), pick()],
+        ));
+    }
 }
 
 /// Keyed requests under the liveness veto: a pinned key of the manual
@@ -955,7 +1026,7 @@ fn liveness_keys(rows: &mut Vec<Row>) {
     ];
     for (shows, shed, workers) in cells {
         rows.push(ring_row(
-            leaked(ring, shows),
+            row_name(ring, shows),
             ring,
             shed,
             "k1",

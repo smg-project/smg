@@ -11,7 +11,8 @@ pair's placement then picks from.
 
 One sheet records one rule under every policy: `all_vetoed.json` holds what the gateway answers when every usable
 worker of a pool is over its overload thresholds or doubted by the liveness tracker, and what a routing key gets
-under consistent hashing while its own worker is over them or doubted.
+under consistent hashing while its own worker is over them or doubted. It also holds the gateway's answer over open
+circuit breakers: a pool behind them on every worker, and one worker a soft veto stands on among them.
 
 One sheet records a request that carries encode items: `encode_pair.json` holds the pair the gateway picks for it,
 the encoders it offers the request's items and the encoder each item takes, or the name of its refusal.
@@ -80,11 +81,11 @@ routing keys), one request shape and what the policy picked for it. There are tw
 The rows of `all_vetoed.json` are sequence rows and drawn rows of one shape. A row names the policy its pool runs
 under and whether shedding is on. Each worker has the requests the router holds on it and a state: `free` (ready,
 under its thresholds), `over` (ready, over them), `stalled` (ready, doubted by the liveness tracker),
-`stalled_over` (ready, doubted and over them) or `down` (not ready). A step is a pick (with the routing key the
-request carries, if any, and the workers an earlier attempt tried), new loads for every worker, or new states. A
-pick is recorded as the worker's place in the row's list. A request placed nowhere is a number past the last
-worker: the count of the workers when the gateway sheds it as an overload shed, the count plus one when it finds no
-worker to use.
+`stalled_over` (ready, doubted and over them), `breaker` (ready, under its thresholds, behind an open circuit
+breaker) or `down` (not ready). A step is a pick (with the routing key the request carries, if any, and the workers
+an earlier attempt tried), new loads for every worker, or new states. A pick is recorded as the worker's place in
+the row's list. A request placed nowhere is a number past the last worker: the count of the workers when the gateway
+sheds it as an overload shed, the count plus one when it finds no worker to use.
 
 A ring row carries `ring_key`: its request is placed by that routing key on the hash ring. Two rings put one key on
 different workers, so a ring row lists its workers in the key's ring order: the worker the key lands on first, then
@@ -262,7 +263,7 @@ directory. The sha256 is of the file as committed.
 | `power_of_two.json` | power of two, under each of its four load metrics | `1b141d03b5ca9097f54f0ebc4b95d72e810a62c3` | 44: 24 sequence, 20 drawn | `602e1fe790cc5368ad05de2297b6e482b7a8893704ee448699ec467df9e0d87c` | `classic_rows.rs` |
 | `manual.json` | manual, under each of its assignment modes | `1b141d03b5ca9097f54f0ebc4b95d72e810a62c3` | 14: 9 sequence, 5 drawn | `d34189025a50a7a31f925c632ce1964a09dac0baab89370e6e87c5c842db9a5a` | `classic_manual_rows.rs` |
 | `prefix_hash.json` | prefix hash: a key from a prompt's prefix, from a routing key and from nothing; the load bound and where a passed key goes; how deep the key reads; the boundaries a prompt is keyed at and the hand-down between their workers | `d92647556e91a3601ef647f12ae5784df2080dc3` | 47: 31 sequence, 16 drawn | `7f64bde829f86aed7615d46a82332eaa4cd55b0cdbf1fff59ef1163b59679296` | `classic_prefix_hash_rows.rs` |
-| `all_vetoed.json` | every policy, over a pool whose every usable worker is over its overload thresholds or doubted by the liveness tracker; a routing key under consistent hashing whose own worker is over them or doubted | `a27f8e992d51ff7e95dbeaee8e17b65b4b231606` | 80: 74 sequence, 6 drawn | `3fc2205471ac60f507828fe92b5ca5ddc35bcd56c04b3c93633d9cb2cd98a050` | `classic_all_vetoed_rows.rs` |
+| `all_vetoed.json` | every policy, over a pool whose every usable worker is over its overload thresholds or doubted by the liveness tracker; a routing key under consistent hashing whose own worker is over them or doubted; a pool behind open circuit breakers | `342e02185362a5f7fc3b1c2faff76e15233b3ae2` | 104: 98 sequence, 6 drawn | `c0d252e295e893e49490172a4a8db218d3800c9c4e684481653261670e015e9f` | `classic_all_vetoed_rows.rs` |
 | `pair_index.json` | the prefill and decode pair index, on both pair wires under each pairing mode | `64ff5a437b5007af5079f0492b46f4e5a712b66f` | 23 pair rows | `383783a8a28bdc3d0753111fbb84df4be2713fe332b448938b9cb75f44dec694` | `classic_pair_rows.rs` |
 | `encode_pair.json` | a request with encode items: the pair, the encoders offered and each item's encoder | `4ba2a6431357be5411a2383cdc4916b41471d722` | 52: 52 sequence, 0 drawn | `988bf253da9310aeedd08ec2704d8e01ecc4a1210453353723ba0faa9001de33` | `classic_encode_pair_rows.rs` |
 | `pair_select.json` | the placement of a prefill and decode pair: each side under its policy, a side over its overload thresholds or doubted whole, a decode's rooms, the prefill admission's bound, the least-loaded default's own rules, a role with no worker | `4ba2a6431357be5411a2383cdc4916b41471d722` | 40: 23 sequence, 17 drawn | `bd8426316ae7337ede82b5a931c1d00cd9dee1aca22c528278f32b2671846eb8` | `classic_pair_select_rows.rs` |
@@ -337,7 +338,7 @@ A limit is a recorded row the replay does not decide as recorded, with the reaso
 fails once the reason no longer holds.
 
 - `power_of_two.json`: none. All 44 rows replay.
-- `all_vetoed.json`: none. All 80 rows replay.
+- `all_vetoed.json`: none. All 104 rows replay.
 - `pair_index.json`: none. All 23 rows replay.
 - `encode_pair.json`: none is recorded yet. The module that replays it arrives with the crate's encoder lists
   and its rule for encode items; until then the replay owes this sheet.

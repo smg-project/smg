@@ -1,5 +1,5 @@
 {
-  "recorded_from": "a27f8e992d51ff7e95dbeaee8e17b65b4b231606",
+  "recorded_from": "342e02185362a5f7fc3b1c2faff76e15233b3ae2",
   "policy": "all_vetoed",
   "rows": [
     {
@@ -952,8 +952,8 @@
         "counts": {
           "draws": 6000,
           "counts": [
-            3028,
-            2972,
+            3029,
+            2971,
             0
           ]
         }
@@ -989,8 +989,8 @@
         "counts": {
           "draws": 6000,
           "counts": [
-            2992,
-            3008,
+            3000,
+            3000,
             0
           ]
         }
@@ -1026,8 +1026,8 @@
         "counts": {
           "draws": 6000,
           "counts": [
-            3009,
-            2991,
+            3029,
+            2971,
             0
           ]
         }
@@ -1063,8 +1063,8 @@
         "counts": {
           "draws": 6000,
           "counts": [
-            3008,
-            2992,
+            2958,
+            3042,
             0
           ]
         }
@@ -2777,8 +2777,8 @@
         "counts": {
           "draws": 6000,
           "counts": [
-            2991,
-            3009,
+            3010,
+            2990,
             0
           ]
         }
@@ -2814,8 +2814,8 @@
         "counts": {
           "draws": 6000,
           "counts": [
-            2997,
-            3003,
+            3087,
+            2913,
             0
           ]
         }
@@ -3480,6 +3480,802 @@
       "outcome": {
         "sequence": [
           0
+        ]
+      }
+    },
+    {
+      "name": "random-a-pool-behind-open-breakers-on-every-worker",
+      "policy": "random",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 1,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 2,
+          "state": "breaker"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          4
+        ]
+      }
+    },
+    {
+      "name": "random-a-pool-behind-open-breakers-on-every-worker-under-shedding",
+      "policy": "random",
+      "shed": true,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 1,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 2,
+          "state": "breaker"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          4
+        ]
+      }
+    },
+    {
+      "name": "round-robin-a-pool-behind-open-breakers-on-every-worker",
+      "policy": "round_robin",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 1,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 2,
+          "state": "breaker"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          4
+        ]
+      }
+    },
+    {
+      "name": "round-robin-a-pool-behind-open-breakers-on-every-worker-under-shedding",
+      "policy": "round_robin",
+      "shed": true,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 1,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 2,
+          "state": "breaker"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          4
+        ]
+      }
+    },
+    {
+      "name": "passthrough-a-pool-behind-open-breakers-on-every-worker",
+      "policy": "passthrough",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 1,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 2,
+          "state": "breaker"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          4
+        ]
+      }
+    },
+    {
+      "name": "passthrough-a-pool-behind-open-breakers-on-every-worker-under-shedding",
+      "policy": "passthrough",
+      "shed": true,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 1,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 2,
+          "state": "breaker"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          4
+        ]
+      }
+    },
+    {
+      "name": "power-of-two-a-pool-behind-open-breakers-on-every-worker",
+      "policy": "power_of_two",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 1,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 2,
+          "state": "breaker"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          4
+        ]
+      }
+    },
+    {
+      "name": "power-of-two-a-pool-behind-open-breakers-on-every-worker-under-shedding",
+      "policy": "power_of_two",
+      "shed": true,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 1,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 2,
+          "state": "breaker"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          4
+        ]
+      }
+    },
+    {
+      "name": "least-load-a-pool-behind-open-breakers-on-every-worker",
+      "policy": "least_load",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 1,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 2,
+          "state": "breaker"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          4
+        ]
+      }
+    },
+    {
+      "name": "least-load-a-pool-behind-open-breakers-on-every-worker-under-shedding",
+      "policy": "least_load",
+      "shed": true,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 1,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 2,
+          "state": "breaker"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          4
+        ]
+      }
+    },
+    {
+      "name": "cache-aware-a-pool-behind-open-breakers-on-every-worker",
+      "policy": "cache_aware",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 1,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 2,
+          "state": "breaker"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          4
+        ]
+      }
+    },
+    {
+      "name": "cache-aware-a-pool-behind-open-breakers-on-every-worker-under-shedding",
+      "policy": "cache_aware",
+      "shed": true,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 1,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 2,
+          "state": "breaker"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          4
+        ]
+      }
+    },
+    {
+      "name": "manual-a-pool-behind-open-breakers-on-every-worker",
+      "policy": "manual",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 1,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 2,
+          "state": "breaker"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          4
+        ]
+      }
+    },
+    {
+      "name": "manual-a-pool-behind-open-breakers-on-every-worker-under-shedding",
+      "policy": "manual",
+      "shed": true,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 1,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 2,
+          "state": "breaker"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          4
+        ]
+      }
+    },
+    {
+      "name": "consistent-hashing-a-pool-behind-open-breakers-on-every-worker",
+      "policy": "consistent_hashing",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 1,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 2,
+          "state": "breaker"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          4
+        ]
+      }
+    },
+    {
+      "name": "consistent-hashing-a-pool-behind-open-breakers-on-every-worker-under-shedding",
+      "policy": "consistent_hashing",
+      "shed": true,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 1,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 2,
+          "state": "breaker"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          4
+        ]
+      }
+    },
+    {
+      "name": "prefix-hash-a-pool-behind-open-breakers-on-every-worker",
+      "policy": "prefix_hash",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 1,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 2,
+          "state": "breaker"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          4
+        ]
+      }
+    },
+    {
+      "name": "prefix-hash-a-pool-behind-open-breakers-on-every-worker-under-shedding",
+      "policy": "prefix_hash",
+      "shed": true,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 1,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 2,
+          "state": "breaker"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          4
+        ]
+      }
+    },
+    {
+      "name": "bucket-a-pool-behind-open-breakers-on-every-worker",
+      "policy": "bucket",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 1,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 2,
+          "state": "breaker"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          4
+        ]
+      }
+    },
+    {
+      "name": "bucket-a-pool-behind-open-breakers-on-every-worker-under-shedding",
+      "policy": "bucket",
+      "shed": true,
+      "workers": [
+        {
+          "in_flight": 3,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 1,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 2,
+          "state": "breaker"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          4
+        ]
+      }
+    },
+    {
+      "name": "round-robin-a-doubted-worker-among-open-breakers",
+      "policy": "round_robin",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 0,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 9,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 1,
+          "state": "breaker"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "name": "round-robin-a-doubted-worker-among-open-breakers-under-shedding",
+      "policy": "round_robin",
+      "shed": true,
+      "workers": [
+        {
+          "in_flight": 0,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 9,
+          "state": "stalled"
+        },
+        {
+          "in_flight": 1,
+          "state": "breaker"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "name": "round-robin-a-worker-over-its-thresholds-among-open-breakers",
+      "policy": "round_robin",
+      "shed": false,
+      "workers": [
+        {
+          "in_flight": 0,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 9,
+          "state": "over"
+        },
+        {
+          "in_flight": 1,
+          "state": "breaker"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "name": "round-robin-a-worker-over-its-thresholds-among-open-breakers-under-shedding",
+      "policy": "round_robin",
+      "shed": true,
+      "workers": [
+        {
+          "in_flight": 0,
+          "state": "breaker"
+        },
+        {
+          "in_flight": 9,
+          "state": "over"
+        },
+        {
+          "in_flight": 1,
+          "state": "breaker"
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        },
+        {
+          "pick": {
+            "key": null,
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          3,
+          3
         ]
       }
     }
