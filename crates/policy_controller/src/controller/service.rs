@@ -836,7 +836,15 @@ impl PolicyController for Service {
                 &asked,
                 term,
                 &shared.controller_id,
-                || shared.feed.rows_at_head(&shared.store),
+                || {
+                    snapshot::read(
+                        &asked,
+                        &shared.snapshots,
+                        &shared.feed,
+                        &shared.watchers,
+                        &shared.store,
+                    )
+                },
                 &shared.generations,
                 Instant::now(),
             )
@@ -3347,8 +3355,7 @@ mod tests {
                 .workers
                 .len()
         };
-        // No watch is open: a lone call is the last call out, and the cut
-        // it takes goes with it.
+        // No watch is open: a lone call takes no cut of every row.
         assert_eq!(told().await, 0);
         assert!(feed.kept().is_none(), "no reader can share the cut");
 
@@ -3414,6 +3421,53 @@ mod tests {
         drop(watching);
         assert_eq!(told().await, 1);
         assert!(feed.kept().is_none(), "no watch can share the cut");
+    }
+
+    /// A lone call with no watch open takes no cut of every row: nobody
+    /// could share one, so it reads the rows it may tell. Beside another
+    /// call it takes the cut the two share, once.
+    #[tokio::test]
+    async fn a_lone_snapshot_takes_no_cut_of_every_row() {
+        use proto::snapshot_request::Slice;
+
+        let (_elector, _standing, control) = electing(true);
+        let feed = control.shared.feed.clone();
+        for worker in 0..3 {
+            let request = proto::RegisterWorkerRequest {
+                spec: Some(proto::WorkerSpec {
+                    url: format!("grpc://10.0.0.{worker}:8000"),
+                    wire: proto::WireMode::Grpc as i32,
+                    role: proto::Role::Single as i32,
+                    models: vec!["model-a".to_owned()],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            control
+                .register_worker(from("operator-a", request))
+                .await
+                .expect("registered");
+        }
+        let told = async |limit| {
+            let mut request = snapshot(&[Slice::Workers]);
+            request.get_mut().limit = limit;
+            let answer = control
+                .get_snapshot(request)
+                .await
+                .expect("the rows")
+                .into_inner();
+            (answer.workers.len(), answer.truncated)
+        };
+        assert_eq!(told(1).await, (1, true));
+        assert_eq!(told(0).await, (3, false));
+        assert_eq!(feed.cuts(), 0, "a lone call copied every row");
+
+        // Another call is let in beside it: one cut, and both calls share it.
+        let beside = control.shared.snapshots.place();
+        assert_eq!(told(1).await, (1, true));
+        assert_eq!(told(0).await, (3, false));
+        assert_eq!(feed.cuts(), 1, "one copy for the calls let in");
+        drop(beside);
     }
 
     /// A snapshot that waited its turn through a later take of the lease is
