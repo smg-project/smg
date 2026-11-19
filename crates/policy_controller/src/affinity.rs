@@ -176,7 +176,7 @@ impl Gates {
         &self,
         candidates: &[Candidate],
         kept: &[u32],
-        load: impl Fn(&Candidate) -> Option<LoadRow>,
+        load: impl Fn(&Candidate) -> Option<&LoadRow>,
     ) -> bool {
         if !self.kv_configured() {
             return false;
@@ -733,7 +733,7 @@ impl Scorer for PrefixAffinity {
         asked: &[u32],
         out: &mut [f32],
     ) -> (TieBand, Front) {
-        self.score_front_with(facts, candidates, kept, asked, out, |c| c.load)
+        self.score_front_with(facts, candidates, kept, asked, out, |c| c.load.as_ref())
     }
 
     fn score(
@@ -743,7 +743,7 @@ impl Scorer for PrefixAffinity {
         kept: &[u32],
         out: &mut [f32],
     ) -> TieBand {
-        self.score_with(facts, candidates, kept, out, |c| c.load)
+        self.score_with(facts, candidates, kept, out, |c| c.load.as_ref())
     }
 
     fn needs(&self) -> Needs {
@@ -773,7 +773,7 @@ impl ReadsLoad for PrefixAffinity {
         _: &[u32],
         asked: &[u32],
         out: &mut [f32],
-        load: impl Fn(&Candidate) -> Option<LoadRow> + Copy,
+        load: impl Fn(&Candidate) -> Option<&LoadRow> + Copy,
     ) -> (TieBand, Front) {
         if facts.named_alone().is_some() {
             return (
@@ -809,7 +809,7 @@ impl ReadsLoad for PrefixAffinity {
         candidates: &[Candidate],
         kept: &[u32],
         out: &mut [f32],
-        load: impl Fn(&Candidate) -> Option<LoadRow> + Copy,
+        load: impl Fn(&Candidate) -> Option<&LoadRow> + Copy,
     ) -> TieBand {
         if self.gates.kv_imbalanced(candidates, kept, load) {
             self.unjudge();
@@ -1364,7 +1364,7 @@ impl Scorer for WarmupSlice {
         asked: &[u32],
         out: &mut [f32],
     ) -> (TieBand, Front) {
-        self.score_front_with(facts, candidates, kept, asked, out, |c| c.load)
+        self.score_front_with(facts, candidates, kept, asked, out, |c| c.load.as_ref())
     }
 
     fn score(
@@ -1374,7 +1374,7 @@ impl Scorer for WarmupSlice {
         kept: &[u32],
         out: &mut [f32],
     ) -> TieBand {
-        self.score_with(facts, candidates, kept, out, |c| c.load)
+        self.score_with(facts, candidates, kept, out, |c| c.load.as_ref())
     }
 
     fn needs(&self) -> Needs {
@@ -1404,7 +1404,7 @@ impl ReadsLoad for WarmupSlice {
         _: &[u32],
         asked: &[u32],
         out: &mut [f32],
-        load: impl Fn(&Candidate) -> Option<LoadRow> + Copy,
+        load: impl Fn(&Candidate) -> Option<&LoadRow> + Copy,
     ) -> (TieBand, Front) {
         let band = self.score_with(facts, candidates, asked, out, load);
         if facts.named_alone().is_some() {
@@ -1423,7 +1423,7 @@ impl ReadsLoad for WarmupSlice {
         candidates: &[Candidate],
         kept: &[u32],
         out: &mut [f32],
-        load: impl Fn(&Candidate) -> Option<LoadRow> + Copy,
+        load: impl Fn(&Candidate) -> Option<&LoadRow> + Copy,
     ) -> TieBand {
         if self.share <= 0.0 || self.gates.kv_imbalanced(candidates, kept, load) {
             return neutral(out);

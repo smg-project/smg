@@ -266,6 +266,8 @@ impl<'a> LentCounts<'a> {
     /// found once for the reads of one run.
     #[inline]
     pub(crate) fn run(&self) -> LentRun<'a> {
+        #[cfg(test)]
+        tests::RUN_READERS.set(tests::RUN_READERS.get() + 1);
         LentRun {
             first: self.counts.first(),
             counts: self.counts,
@@ -286,14 +288,19 @@ impl<'a> LentCounts<'a> {
 /// and a stage that reads a row or two asks that.
 macro_rules! with_counts {
     ($facts:expr, |$counts:ident| $walk:expr) => {
+        $crate::counts::with_counts!($facts, |$counts, _written| $walk)
+    };
+    ($facts:expr, |$counts:ident, $written:ident| $walk:expr) => {
         match $facts.lent_in_flight {
             Some(lent) => {
                 let run = lent.run();
                 let $counts = move |row: &$crate::view::Candidate| run.of(row);
+                let $written = false;
                 $walk
             }
             None => {
                 let $counts = |row: &$crate::view::Candidate| row.in_flight;
+                let $written = true;
                 $walk
             }
         }
@@ -412,6 +419,10 @@ pub(crate) mod tests {
 
     use super::{Counts, KeptCounts, LentCounts, Slot};
     use crate::view::{Candidate, RequestFacts};
+
+    thread_local! {
+        pub(crate) static RUN_READERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
 
     /// A pool's counts taken out of its rows into a table of their own: the
     /// lent form of rows a case wrote its counts into.

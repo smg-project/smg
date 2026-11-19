@@ -738,8 +738,10 @@ impl ReportCutoff {
         Self(now_micros.saturating_sub(max_age_ms * 1_000))
     }
 
-    pub(crate) fn load(self, row: &Candidate) -> Option<LoadRow> {
-        row.load.filter(|_| row.load_sampled_at_micros >= self.0)
+    pub(crate) fn load(self, row: &Candidate) -> Option<&LoadRow> {
+        row.load
+            .as_ref()
+            .filter(|_| row.load_sampled_at_micros >= self.0)
     }
 }
 
