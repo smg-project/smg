@@ -2421,8 +2421,10 @@ impl Keeper {
     /// profiles' order, a profile's scorers ahead of its picker.
     fn of(profiles: &[Profile]) -> Vec<Self> {
         let mut keepers = Vec::new();
-        for (at, profile) in (0u16..).zip(profiles) {
-            for (stage, weighted) in (0u16..).zip(&profile.scorers) {
+        // Inclusive ranges: a walk over as many stages as a place can
+        // name ends with the list, where an open range steps past its end.
+        for (at, profile) in (0..=u16::MAX).zip(profiles) {
+            for (stage, weighted) in (0..=u16::MAX).zip(&profile.scorers) {
                 if weighted.scorer.keeps_loads() {
                     keepers.push(Self::Scorer { profile: at, stage });
                 }
@@ -10459,6 +10461,30 @@ mod tests {
             whole > 10_000 && drawn > 10_000 && emptied > 500 && steered > 500 && aside > 500,
             "{whole} whole, {drawn} drawn, {emptied} emptied, {steered} steered, {aside} aside"
         );
+    }
+
+    /// A profile may hold as many scorers as a place can name: the walk
+    /// that lists the stages that keep reports ends with the list.
+    #[test]
+    fn an_engine_of_as_many_scorers_as_a_place_names_is_built() {
+        let scorers = (0..u16::MAX)
+            .map(|_| Weighted {
+                scorer: Box::new(LeastRequests),
+                weight: 1.0,
+            })
+            .collect();
+        let engine = Engine::new(
+            vec![Profile {
+                name: "wide".into(),
+                filters: Vec::new(),
+                scorers,
+                picker: Box::new(Best),
+            }],
+            vec![single_binding()],
+            1,
+            Needs::default(),
+        );
+        assert!(!engine.keeps_loads(), "no stage of it keeps a report");
     }
 
     #[test]

@@ -327,6 +327,9 @@ pub trait Lifecycle: Send + Sync {
     /// default: a host tells no report to an engine none of whose stages
     /// keeps one, and such a stage decides the same untold. The engine asks
     /// once, at its build: the answer is the stage's for the engine's life.
+    /// A host tells such a stage under its own locks, as the policy store
+    /// does under its membership and load locks: a stage that calls from
+    /// that word a door of the host that takes one of them waits on itself.
     fn keeps_loads(&self) -> bool {
         false
     }
