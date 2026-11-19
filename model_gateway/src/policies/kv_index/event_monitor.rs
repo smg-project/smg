@@ -6,14 +6,15 @@
 //! This enables event-driven cache-aware routing as an alternative to the approximate
 //! radix tree approach.
 //!
-//! Lifecycle:
+//! Lifecycle, kept by the worker crate's KV event collector, whose host is
+//! the monitor's index side:
 //! - `on_worker_added` — spawns streaming task, creates indexer if needed
 //! - `on_worker_removed` — signals graceful shutdown, task cleans up indexer
 //! - `stop` — signals shutdown to all tasks, clears state
 //!
-//! The work of a subscription is split by stage: the worker crate's KV event
-//! collector runs the task per worker (connecting, reconnecting, the stream
-//! read loop, the pushed load records, the worker's departure);
+//! The work of a subscription is split by stage: the collector keeps one
+//! task a worker and runs it (the slots, connecting, reconnecting, the
+//! stream read loop, the pushed load records, the worker's departure);
 //! `admission.rs` keeps one stream's state (per-rank cursors, gap recovery,
 //! relay snapshots, and the metrics around an applied batch); `apply.rs`
 //! takes one event into the index (tiers, cache groups, namespaces, and the
@@ -410,7 +411,7 @@ mod tests {
         worker::{ConnectionMode, HealthCheckConfig, RuntimeType, WorkerType},
         UNKNOWN_MODEL_ID,
     };
-    use smg_worker::kv_events::{INDEX_REMOVAL_PERMITS, MAX_CONCURRENT_INDEX_REMOVALS};
+    use smg_worker::kv_events::{MAX_CONCURRENT_SINK_REMOVALS, SINK_REMOVAL_PERMITS};
     use tracing_test::traced_test;
 
     use super::*;
@@ -477,8 +478,8 @@ mod tests {
         .await;
 
         // Hold every cleanup permit: the old task's cleanup cannot finish.
-        let permits = INDEX_REMOVAL_PERMITS
-            .acquire_many(MAX_CONCURRENT_INDEX_REMOVALS as u32)
+        let permits = SINK_REMOVAL_PERMITS
+            .acquire_many(MAX_CONCURRENT_SINK_REMOVALS as u32)
             .await
             .expect("the removal semaphore is open");
         #[expect(
@@ -558,8 +559,8 @@ mod tests {
         .await;
 
         // Hold every cleanup permit: the old task's cleanup cannot finish.
-        let permits = INDEX_REMOVAL_PERMITS
-            .acquire_many(MAX_CONCURRENT_INDEX_REMOVALS as u32)
+        let permits = SINK_REMOVAL_PERMITS
+            .acquire_many(MAX_CONCURRENT_SINK_REMOVALS as u32)
             .await
             .expect("the removal semaphore is open");
         // The removal is dropped while it awaits the old task, as a timeout

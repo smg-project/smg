@@ -70,21 +70,22 @@ pub struct KvEventCollector<H: KvEventHost> {
     host: Arc<H>,
     /// Per-worker subscription slots: worker_url → the live subscription, or
     /// the reservation a removal leaves until the old task has cleaned up.
-    /// Mutex matches LoadMonitor pattern for atomic abort + remove; Arc so a
-    /// task can lift its own reservation at the end of its exit path.
+    /// One mutex over the map, so a slot is read and replaced on one turn;
+    /// Arc so a task can lift its own reservation at the end of its exit
+    /// path.
     worker_handles: Arc<Mutex<HashMap<String, Slot>>>,
     /// Where the load records on the event streams go (`KvEventBatch.load`):
-    /// the worker monitor, which treats them as polls. Weak: the monitors
-    /// are peers in the app context, neither owns the other.
+    /// the load monitor, which treats them as polls. Weak: the two are
+    /// peers in their host, neither owns the other.
     load_sink: OnceLock<Weak<dyn PushedLoadSink>>,
     /// The registry whose object under a URL an add starts a stream for:
     /// `on_worker_added` reads it under the slot lock. Weak like the load
-    /// sink, a peer in the app context. Unset in a monitor built alone (the
+    /// sink, a peer in the host. Unset in a collector built alone (the
     /// tests), which holds every object.
     worker_registry: OnceLock<Weak<dyn WorkerLookup>>,
 }
 
-/// The registry as this monitor holds it: it asks one thing of it, the
+/// The registry as the collector holds it: it asks one thing of it, the
 /// worker registered under a URL. Such a holder reads no generation, so it
 /// names no value of the registry's host.
 trait WorkerLookup: Send + Sync {
@@ -102,11 +103,11 @@ impl<G: Generation> WorkerLookup for WorkerRegistry<G> {
 /// A worker URL's slot in the subscription map.
 enum Slot {
     Active(WorkerSubscription),
-    /// The URL's old task has been told to shut down and is taking its
-    /// blocks out of the index. The index hands a URL its existing id until
-    /// that cleanup has released it, so a subscription interned in this
-    /// window would write under the old id and lose its blocks to the
-    /// cleanup; `on_worker_added` waits for the old task to end instead.
+    /// The URL's old task has been told to shut down and is telling the sink
+    /// that the worker left. A sink may hand a URL its existing place until
+    /// that cleanup has released it, so a subscription opened in this window
+    /// would write under the old place and lose its blocks to the cleanup;
+    /// `on_worker_added` waits for the old task to end instead.
     Removing(Reservation),
 }
 
@@ -131,7 +132,8 @@ struct Reservation {
     /// Closes when the task has ended.
     done: watch::Receiver<()>,
     /// The subscription's model and kind: whoever lifts the reservation
-    /// drops the model's index with the model's last events subscription.
+    /// tells the host when the model's last events subscription went with
+    /// it.
     model_id: String,
     kind: SubscriptionKind,
 }
@@ -148,8 +150,8 @@ struct WorkerSubscription {
     /// one the task holds, so an add with another object restarts it.
     started_for: Weak<dyn Worker>,
     /// Signals the subscription task to shut down gracefully. On exit the
-    /// task tells the sink the worker left, and the sink takes the worker's
-    /// blocks out of the index.
+    /// task tells the sink the worker left, and the sink drops what it
+    /// holds of the worker.
     shutdown_tx: oneshot::Sender<()>,
     /// Closes when the task has ended; a removal moves it into the
     /// reservation it leaves in the slot.
@@ -187,8 +189,8 @@ impl<H: KvEventHost> KvEventCollector<H> {
 
     /// Have the add read the registry before it stops or starts a stream
     /// (once; a later call is ignored): a worker the registry no longer
-    /// holds under its URL gets none. The app sets it where it wires the
-    /// load sink; a monitor without one holds every object.
+    /// holds under its URL gets none. The host sets it where it wires the
+    /// load sink; a collector without one holds every object.
     pub fn set_worker_registry<G: Generation>(&self, registry: &Arc<WorkerRegistry<G>>) {
         let registry = Arc::downgrade(registry);
         let _ = self.worker_registry.set(registry);
@@ -215,21 +217,21 @@ impl<H: KvEventHost> KvEventCollector<H> {
             .get_by_url(url)
     }
 
-    /// Start a worker's stream: its KV events into the model's `KvIndex`
+    /// Start a worker's stream: its KV events into the host's sink
     /// (`Events`), or its load records alone (`Loads`), on a background task
     /// that subscribes over server-streaming gRPC. Either way the records on
     /// the stream reach the load sink. A second call for the object already
     /// streaming is a no-op. A call with another object under an active URL
     /// restarts the stream for it: a re-registration replaced the worker in
     /// place (an upsert of a changed spec, a replacement by id, a label
-    /// refresh; the registration and update workflows' policy steps both
-    /// call this for the object the registry holds), and the records on the
-    /// stream must reach that object, since the load snapshot fences the
-    /// pushed loads of any other object out and its receipts suppress the
-    /// poll of the URL. The restart waits for the old task to end; a caller
-    /// whose timeout drops this call in that wait leaves the removal to the
-    /// old task's own exit path and the URL without a stream until the next
-    /// add, the worker's next registration or label refresh.
+    /// refresh; the host calls this at each, for the object the registry
+    /// holds), and the records on the stream must reach that object, since
+    /// the load snapshot fences the pushed loads of any other object out and
+    /// its receipts suppress the poll of the URL. The restart waits for the
+    /// old task to end; a caller whose timeout drops this call in that wait
+    /// leaves the removal to the old task's own exit path and the URL
+    /// without a stream until the next add, the worker's next registration
+    /// or label refresh.
     ///
     /// The add reads the registry it was given (`set_worker_registry`)
     /// under the slot lock on every turn, before it stops a stream for
@@ -239,15 +241,16 @@ impl<H: KvEventHost> KvEventCollector<H> {
     /// object has under the URL is left to it. The registry's removal
     /// changes the registry before it reaches this lock: a read here sees
     /// the removal, or the removal finds the slot this add inserts. A
-    /// monitor without a registry holds every object.
+    /// collector without a registry holds every object.
     pub async fn on_worker_added(&self, worker: &Arc<dyn Worker>, kind: SubscriptionKind) {
         let url = worker.url().to_string();
-        // Normalize model_id to match routing's normalize_model_key — empty → "unknown".
+        // An empty model id is keyed as `UNKNOWN_MODEL_ID`.
         let model_id = Self::normalize_model_id(worker.model_id());
 
-        // Only gRPC workers stream KV events. HTTP proxies don't, and a ZMQ
-        // EngineCore returns `unimplemented` for SubscribeKvEvents — subscribing
-        // there would just be a wasted handshake + round-trip per registration.
+        // Only gRPC workers stream KV events. HTTP workers don't, and a ZMQ
+        // connection answers `unimplemented` to the subscribe call:
+        // subscribing there would be a wasted handshake and round trip per
+        // registration.
         if *worker.connection_mode() != ConnectionMode::Grpc {
             debug!(worker_url = %Endpoint::redacted_str(&url), mode = %worker.connection_mode(), "non-gRPC worker, skipping KV event subscription");
             return;
@@ -287,8 +290,8 @@ impl<H: KvEventHost> KvEventCollector<H> {
                 Some(Slot::Removing(reservation)) => (reservation.id, reservation.done.clone()),
                 None => break handles,
             };
-            // The previous subscription for this URL is still being taken
-            // out of the index: intern it again only once its task has ended.
+            // The previous subscription for this URL is still leaving the
+            // sink: open it again only once its task has ended.
             if done.has_changed().is_err() {
                 // The task is gone without lifting its reservation (it was
                 // aborted, panicked past its guard, or was past its own lift
@@ -335,7 +338,7 @@ impl<H: KvEventHost> KvEventCollector<H> {
 
         #[expect(
             clippy::disallowed_methods,
-            reason = "KV event monitor: runs for the lifetime of the worker, \
+            reason = "KV event collector: runs for the lifetime of the worker, \
                       handle is stored and graceful shutdown is sent on removal"
         )]
         let handle = tokio::spawn(async move {
@@ -348,7 +351,7 @@ impl<H: KvEventHost> KvEventCollector<H> {
             let writer = Arc::clone(&worker);
             // Catch panics here so they surface when they happen — a bare
             // JoinError would only be observed at worker removal, leaving the
-            // index silently frozen for this worker until then.
+            // sink silently without this worker's events until then.
             let opener = &host;
             let result = std::panic::AssertUnwindSafe(async move {
                 // An events subscription opens its place in the host's sink
@@ -413,8 +416,9 @@ impl<H: KvEventHost> KvEventCollector<H> {
         );
     }
 
-    /// The end of a removal, run by the subscription task once its blocks
-    /// are out of the index: lift the URL's reservation if it is this task's
+    /// The end of a removal, run by the subscription task once the sink has
+    /// heard that the worker left: lift the URL's reservation if it is this
+    /// task's
     /// (a later subscription under the URL has its own), and tell the host
     /// when the model's last events subscription went with it.
     /// The task does this itself, since a caller may drop
@@ -490,15 +494,14 @@ impl<H: KvEventHost> KvEventCollector<H> {
     /// Stop the KV event subscription for a worker.
     ///
     /// Sends a graceful shutdown signal. The subscription task tells the
-    /// sink the worker left, and the sink takes the worker's blocks out of
-    /// the index from the row it keeps for the worker; that
-    /// CPU-bound cleanup runs on the bounded blocking pool rather than a Tokio
-    /// runtime worker. A write made here once the task is gone (the join
-    /// error, the gauge of a task that ended before the removal) is made
-    /// under the caller's handle on the removed worker, which the removal
-    /// step holds through this call.
+    /// sink the worker left, and the sink drops what it holds of the worker;
+    /// that cleanup can be CPU-bound, so it runs on the bounded blocking pool
+    /// rather than a Tokio runtime worker. A write made here once the task is
+    /// gone (the join error, the gauge of a task that ended before the
+    /// removal) is made under the caller's handle on the removed worker,
+    /// which the host's removal holds through this call.
     ///
-    /// The step runs after the registry let the worker go. A registration
+    /// A host calls it after the registry let the worker go. A registration
     /// under the same URL in between holds a new object, and its add may
     /// have restarted the stream for it: that stream is the new object's
     /// and stays, read under the slot lock as the add side reads the
@@ -596,7 +599,7 @@ impl<H: KvEventHost> KvEventCollector<H> {
     /// its end, then its reservation lifted where it still stands.
     async fn finish_removal(&self, worker_url: &str, sub: WorkerSubscription) {
         info!(worker_url = %Endpoint::redacted_str(worker_url), "Stopping KV event subscription");
-        // Signal graceful shutdown — task cleans up its worker_blocks in the indexer.
+        // Signal graceful shutdown: the task tells the sink the worker left.
         let _ = sub.shutdown_tx.send(());
         // The task lifts the reservation on its own (`complete_removal`);
         // this wait is for the caller, who has the worker out of the sink on
@@ -709,8 +712,8 @@ impl<H: KvEventHost> KvEventCollector<H> {
         }
     }
 
-    /// Normalize model_id to match routing's `normalize_model_key`.
-    /// Empty model IDs map to UNKNOWN_MODEL_ID for consistent keying.
+    /// The key a model's subscriptions are held under: an empty model id
+    /// maps to `UNKNOWN_MODEL_ID`.
     fn normalize_model_id(model_id: &str) -> String {
         if model_id.is_empty() {
             UNKNOWN_MODEL_ID.to_string()
@@ -743,7 +746,7 @@ mod tests {
     use crate::{
         kv_events::{
             port::{BatchFacts, BatchOutcome, KvCursor, ResyncReason},
-            INDEX_REMOVAL_PERMITS, MAX_CONCURRENT_INDEX_REMOVALS,
+            MAX_CONCURRENT_SINK_REMOVALS, SINK_REMOVAL_PERMITS,
         },
         test_support::{BasicWorkerBuilder, WorkerRegistry},
         worker::{HealthCheckConfig, RuntimeType, WorkerType},
@@ -996,7 +999,7 @@ mod tests {
 
     /// A re-registration replaces the worker object under its URL (an
     /// upsert of a changed spec, a replacement by id, a label refresh) and
-    /// runs the policy step again. The stream started for the old object
+    /// the host adds it again. The stream started for the old object
     /// must not stay: its records would reach an object the registry no
     /// longer holds, whose pushed loads the load snapshot fences out and
     /// whose receipts suppress the URL's poll. The add with the new object
@@ -1451,7 +1454,7 @@ mod tests {
     }
 
     /// The add that restarts a stream waits for the old task to end. A
-    /// caller's timeout that drops it in that wait (the policy steps run
+    /// caller's timeout that drops it in that wait (a host may run the add
     /// under one) leaves the removal to the old task's own exit path and the
     /// URL without a stream; the next add of the new object starts one
     /// afresh, with no second restart.
@@ -1522,8 +1525,8 @@ mod tests {
             .await;
         wait_until("the task opens its place", || host.calls().len() == 2).await;
 
-        let permits = INDEX_REMOVAL_PERMITS
-            .acquire_many(MAX_CONCURRENT_INDEX_REMOVALS as u32)
+        let permits = SINK_REMOVAL_PERMITS
+            .acquire_many(MAX_CONCURRENT_SINK_REMOVALS as u32)
             .await
             .expect("the removal semaphore is open");
         #[expect(
@@ -1586,8 +1589,8 @@ mod tests {
         wait_until("the task opens its place", || host.calls().len() == 2).await;
         let (reserved, _) = collector.slot_ids(url).await;
 
-        let permits = INDEX_REMOVAL_PERMITS
-            .acquire_many(MAX_CONCURRENT_INDEX_REMOVALS as u32)
+        let permits = SINK_REMOVAL_PERMITS
+            .acquire_many(MAX_CONCURRENT_SINK_REMOVALS as u32)
             .await
             .expect("the removal semaphore is open");
         let removal =

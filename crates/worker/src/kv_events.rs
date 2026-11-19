@@ -32,4 +32,4 @@ pub use subscription::{KvEventFeed, SubscriptionKind};
 /// The bound on the removals that run at once and its permits, for a host's
 /// cases of what a removal holds up.
 #[cfg(all(feature = "runtime", any(test, feature = "test-util")))]
-pub use subscription::{INDEX_REMOVAL_PERMITS, MAX_CONCURRENT_INDEX_REMOVALS};
+pub use subscription::{MAX_CONCURRENT_SINK_REMOVALS, SINK_REMOVAL_PERMITS};

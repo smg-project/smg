@@ -27,10 +27,10 @@ pub enum SubscriptionKind {
     /// The worker's KV events to the sink, with the load records that ride
     /// them: a worker whose cache the host indexes.
     Events,
-    /// The worker's load records alone (`SubscribeKvEventsRequest.
-    /// loads_only`): a worker whose load the host reads and whose cache it
-    /// does not index. A servicer that predates the field streams its
-    /// events too; they are dropped.
+    /// The worker's load records alone
+    /// (`SubscribeKvEventsRequest.loads_only`): a worker whose load the host
+    /// reads and whose cache it does not index. A servicer that predates the
+    /// field streams its events too; they are dropped.
     Loads,
 }
 
@@ -107,14 +107,15 @@ const RECONNECT_FLOOR: Duration = Duration::from_millis(INITIAL_RECONNECT_DELAY_
 
 /// Maximum backoff between subscription attempts. Kept short: a worker that
 /// restarts is healthy again within a few seconds, and until the stream is
-/// back the blocks it stores are invisible to routing (the servicers resume
+/// back the blocks it stores are invisible to the sink (the servicers resume
 /// after the cursor and never resend them). A connect attempt is cheap.
 const MAX_RECONNECT_DELAY_MS: u64 = 5_000;
 
-/// Index cleanup is CPU-bound and can touch many blocks. Keep it
-/// off Tokio workers and bound concurrent purges during fleet-wide drains.
-pub const MAX_CONCURRENT_INDEX_REMOVALS: usize = 4;
-pub static INDEX_REMOVAL_PERMITS: Semaphore = Semaphore::const_new(MAX_CONCURRENT_INDEX_REMOVALS);
+/// A sink's removal of a worker can be CPU-bound and touch many blocks. Keep
+/// it off Tokio workers and bound the removals that run at once during
+/// fleet-wide drains.
+pub const MAX_CONCURRENT_SINK_REMOVALS: usize = 4;
+pub static SINK_REMOVAL_PERMITS: Semaphore = Semaphore::const_new(MAX_CONCURRENT_SINK_REMOVALS);
 
 /// Result of processing a stream connection to completion.
 enum StreamResult {
@@ -338,7 +339,7 @@ impl Rounds {
     where
         S: KvEventSink + 'static,
     {
-        let Ok(permit) = INDEX_REMOVAL_PERMITS.acquire().await else {
+        let Ok(permit) = SINK_REMOVAL_PERMITS.acquire().await else {
             error!(
                 worker_url = %Endpoint::redacted_str(worker_url),
                 "Index cleanup semaphore closed"
@@ -367,7 +368,7 @@ impl Rounds {
     /// the worker left; without one it streams the worker's load records
     /// alone. Exits when `shutdown_rx`
     /// fires or the backend returns `Unimplemented`. Each round
-    /// (`subscription_round`) gets the backend client, subscribes
+    /// (`subscription_round`) gets the engine connection, subscribes
     /// under the deadline and drains one stream, then says what comes next;
     /// this loop is the one place that sleeps the reconnect backoff and the
     /// one place that ends the task.
@@ -419,14 +420,15 @@ impl Rounds {
         if let Some((sink, id)) = feed {
             Self::remove_from_sink(sink, id, &worker_url).await;
         }
-        // The gauge is the index's: a loads-only subscription a backend refuses
-        // leaves the worker on the poll, which is the designed fallback.
+        // The gauge is the events subscription's: a loads-only one a backend
+        // refuses leaves the worker on the poll, which is the designed
+        // fallback.
         if unsupported && events {
             Metrics::set_kv_events_unavailable(&worker_url, true);
         }
     }
 
-    /// One round of a worker's subscription: the backend client, the
+    /// One round of a worker's subscription: the engine connection, the
     /// subscribe call under its deadline, the stream drained to its end;
     /// returns what the loop does next.
     async fn subscription_round<S: KvEventSink<Batch = KvEventBatch>>(
@@ -737,7 +739,7 @@ impl Rounds {
     ) -> StreamResult {
         use futures::StreamExt;
 
-        // One line a stream, however many of its batches carry no rank.
+        // One line a stream, however many of its batches carry such a rank.
         let mut misfit_rank_said = false;
         while let Some(result) = stream.next().await {
             let batch = match result {
