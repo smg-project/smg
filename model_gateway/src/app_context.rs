@@ -1649,8 +1649,9 @@ mod effective_max_concurrent_requests_tests {
     }
 }
 
-/// The test fixture shared by the modules that drive a workflow step or a
-/// discovery pass against an `AppContext` built by hand.
+/// The test fixture shared by the modules whose cases need an `AppContext`
+/// built by hand: a workflow step's, the job queue's, a router's and the
+/// discovery host's.
 #[cfg(test)]
 pub(crate) mod testing {
     use std::sync::Arc;
@@ -1739,9 +1740,9 @@ pub(crate) mod testing {
     }
 
     /// An `AppContext` with an uninitialized worker job queue: submitted jobs are
-    /// accepted and queued but never processed, so tests observe what discovery
-    /// *submits* without spawning workflow background tasks. [`live_app_context`]
-    /// is the one whose jobs run.
+    /// accepted and queued but never processed, so a test observes what is
+    /// *submitted* without spawning workflow background tasks.
+    /// [`live_app_context`] is the one whose jobs run.
     pub(crate) fn create_test_app_context() -> Arc<AppContext> {
         let router_config = RouterConfig::builder()
             .worker_startup_timeout_secs(1)
@@ -1753,7 +1754,7 @@ pub(crate) mod testing {
     }
 
     /// An `AppContext` whose jobs run: a live job queue and workflow engines, so
-    /// tests observe what the registry *ends up with* after discovery's passes.
+    /// a test observes what the registry *ends up with* once its jobs run.
     /// Regular routing with round-robin, a five-second startup window for an
     /// engine slow to answer its probes, and no drain wait on removal.
     /// [`create_test_app_context`] is the one whose jobs never run.

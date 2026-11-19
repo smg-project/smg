@@ -1,7 +1,7 @@
 //! Shared test fixtures for the discovery modules.
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
 };
 
@@ -104,19 +104,30 @@ pub enum Queued {
     },
 }
 
+/// What holds an address in the queue.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Hold {
+    /// A registration: the address's addition is refused.
+    Registration,
+    /// A removal or a re-read of labels: the queue still takes the address's
+    /// addition.
+    AnotherJob,
+}
+
 #[derive(Default)]
 struct Queue {
     queued: Vec<Queued>,
     refused: Vec<String>,
-    held: HashSet<String>,
+    held: HashMap<String, Hold>,
     held_after_a_read: HashSet<String>,
     slow: HashSet<String>,
     waiting: Vec<WorkerSpec>,
 }
 
 /// A job queue that records the jobs it took, in order, and the additions it
-/// refused. An address a case holds reads as in flight and its addition is
-/// refused, as a host's queue refuses a registration of an address it holds.
+/// refused. An address a case holds reads as in flight. Its addition is
+/// refused under a registration's hold and taken under another job's, as the
+/// job port says of a host's queue.
 #[derive(Default)]
 pub struct RecordedJobs {
     queue: Mutex<Queue>,
@@ -134,9 +145,21 @@ impl RecordedJobs {
         self.queue.lock().refused.clone()
     }
 
-    /// Another job holds `url` from now on, until [`Self::release`].
+    /// A registration holds `url` from now on, until [`Self::release`]: the
+    /// address reads as in flight and its addition is refused.
     pub fn hold(&self, url: &str) {
-        self.queue.lock().held.insert(url.to_string());
+        self.hold_as(url, Hold::Registration);
+    }
+
+    /// A removal or a re-read of labels holds `url` from now on, until
+    /// [`Self::release`]: the address reads as in flight, and the queue still
+    /// takes its addition.
+    pub fn hold_for_another_job(&self, url: &str) {
+        self.hold_as(url, Hold::AnotherJob);
+    }
+
+    fn hold_as(&self, url: &str, hold: Hold) {
+        self.queue.lock().held.insert(url.to_string(), hold);
     }
 
     /// Another registration takes `url` right after the queue is next asked
@@ -203,7 +226,7 @@ impl WorkerJobs for RecordedJobs {
     ) -> Result<bool, String> {
         let lands_now = {
             let mut queue = self.queue.lock();
-            if queue.held.contains(&spec.url) {
+            if queue.held.get(&spec.url) == Some(&Hold::Registration) {
                 queue.refused.push(spec.url);
                 return Ok(false);
             }
@@ -212,7 +235,7 @@ impl WorkerJobs for RecordedJobs {
                 mode,
             });
             if queue.slow.remove(&spec.url) {
-                queue.held.insert(spec.url.clone());
+                queue.held.insert(spec.url.clone(), Hold::Registration);
                 queue.waiting.push(spec.clone());
                 false
             } else {
@@ -227,11 +250,11 @@ impl WorkerJobs for RecordedJobs {
 
     fn job_in_flight(&self, url: &str) -> bool {
         let mut queue = self.queue.lock();
-        if queue.held.contains(url) {
+        if queue.held.contains_key(url) {
             return true;
         }
         if queue.held_after_a_read.remove(url) {
-            queue.held.insert(url.to_string());
+            queue.held.insert(url.to_string(), Hold::Registration);
         }
         false
     }
@@ -266,5 +289,34 @@ pub fn make_labeled_pod(name: &str, ip: &str, labels: &[(&str, &str)]) -> Pod {
             }]),
             ..Default::default()
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The double refuses an addition as the job port says a host's queue
+    /// does: under a registration of the address, and under no other job.
+    #[tokio::test]
+    async fn an_addition_is_refused_under_a_registration_alone() {
+        let (_host, jobs) = TestHost::recording();
+        let url = "http://10.0.0.1:8080";
+
+        jobs.hold_for_another_job(url);
+        assert!(jobs.job_in_flight(url));
+        let taken = jobs
+            .add_worker(WorkerSpec::new(url), WorkerRegistrationMode::Upsert)
+            .await;
+        assert_eq!(taken, Ok(true));
+        assert!(jobs.refused().is_empty());
+
+        jobs.hold(url);
+        let refused = jobs
+            .add_worker(WorkerSpec::new(url), WorkerRegistrationMode::Upsert)
+            .await;
+        assert_eq!(refused, Ok(false));
+        assert_eq!(jobs.refused(), [url]);
+        assert_eq!(jobs.queued().len(), 1, "a refused addition is not queued");
     }
 }
