@@ -2251,6 +2251,16 @@ fn scorer_of(stage: &ScoreStage, gates: Gates, boundaries: &[u32]) -> Resolved<B
         {
             Resolved::NotInBuild("the prefix-affinity uncached credit")
         }
+        // Nothing records the prefixes sent: a source that reads them would
+        // place as with no affinity where no worker publishes its blocks.
+        ScoreStage::PrefixAffinity(p)
+            if matches!(
+                p.source,
+                Some(AffinitySource::Predictor | AffinitySource::Merged)
+            ) =>
+        {
+            Resolved::NotInBuild("the prefix-affinity predictor")
+        }
         ScoreStage::PrefixAffinity(p) => built_scorer(PrefixAffinity::new(p, gates)),
         ScoreStage::KvPressure(_) => built_scorer(KvPressure),
         ScoreStage::WarmupSlice(p) => built_scorer(WarmupSlice::new(p, gates)),
@@ -5195,6 +5205,31 @@ mod tests {
             .expect("the tokens alone");
     }
 
+    /// A prefix-affinity source that reads the prefixes sent is refused by
+    /// name: this build records none, so `predictor` and `merged` would
+    /// place as with no affinity where no worker publishes its blocks. The
+    /// event-fed index validates, named or left out.
+    #[test]
+    fn an_affinity_source_of_sent_prefixes_is_refused_as_not_in_this_build() {
+        for source in ["predictor", "merged"] {
+            let score = format!(r#"{{"prefix-affinity":{{"source":"{source}"}}}}"#);
+            let refused = spec_with_score(&score)
+                .validate()
+                .expect_err("a source this build cannot feed");
+            assert_eq!(
+                refused.to_string(),
+                "profiles.p.score[0].prefix-affinity: the prefix-affinity predictor is not in this build",
+                "{source}"
+            );
+        }
+        for score in [
+            r#"{"prefix-affinity":{"source":"index"}}"#,
+            r#"{"prefix-affinity":{}}"#,
+        ] {
+            assert!(spec_with_score(score).validate().is_ok(), "{score}");
+        }
+    }
+
     #[test]
     fn every_catalog_scorer_parses_and_the_ones_this_build_lacks_are_refused_by_name() {
         let in_build = [
@@ -5227,7 +5262,7 @@ mod tests {
         for score in [
             r#"{"kv-pressure":{"spread":0.3,"ceiling":0.9}}"#,
             r#"{"warmup-slice":{"secs":0,"miss_share":0.5}}"#,
-            r#"{"prefix-affinity":{"threshold":0.5,"source":"merged","spill":{"abs":8,"rel":2.0}}}"#,
+            r#"{"prefix-affinity":{"threshold":0.5,"source":"index","spill":{"abs":8,"rel":2.0}}}"#,
             r#"{"bucket":{"abs_threshold":32,"rel_threshold":1.0001,"adjust_interval_s":5}}"#,
         ] {
             assert!(spec_with_score(score).validate().is_ok(), "{score}");
