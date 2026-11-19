@@ -3042,9 +3042,11 @@ async fn test_profile_all_url_filter_without_match() {
     assert!(result.message.contains("No worker matching"));
 }
 
-/// A sink that keeps the status somewhere else: it records what the
-/// collector says, answers every probe's outcome the same way and every
-/// connect signal with no transition, and writes nothing to a worker object.
+/// A sink that only records: what the collector says is kept, every probe's
+/// outcome gets the same answer and every connect signal no transition, and
+/// nothing is written to a worker object. A host's sink has to write the
+/// status there (the doc of `HealthSink`); this one leaves it, so a case can
+/// tell what the collector itself wrote or read.
 struct RecordingSink {
     answer: ProbeAnswer,
     probes: parking_lot::Mutex<Vec<(WorkerId, bool, u64, WorkerStatus)>>,
@@ -3155,14 +3157,14 @@ async fn the_collectors_facts_cross_the_port_and_it_writes_no_status_itself() {
     );
 }
 
-/// The loop reads a stood worker's status in the sink's answer, not on the
-/// worker object, which may lag a sink that keeps the status elsewhere. This
-/// sink answers "stood, not ready" to every outcome and never writes the
-/// object, so the object keeps the status it registered with. The worker's
-/// passing probes are then a demoted worker's: each brings the next read
-/// forward to a probe's timeout (one second), and three reads land within
-/// seconds. Read on the object, the status would leave the second read a
-/// whole interval (thirty seconds) away.
+/// The loop reads a stood worker's status in the sink's answer, where the
+/// outcome was judged, not on the worker object a second time. To tell the
+/// two apart this sink answers "stood, not ready" to every outcome and never
+/// writes the object, which keeps the status it registered with. The
+/// worker's passing probes are then a demoted worker's: each brings the next
+/// read forward to a probe's timeout (one second), and three reads land
+/// within seconds. Read on the object, the status would leave the second
+/// read a whole interval (thirty seconds) away.
 #[tokio::test]
 async fn the_loop_reads_a_stood_status_in_the_sinks_answer_not_on_the_worker_object() {
     let serving = Arc::new(AtomicBool::new(true));

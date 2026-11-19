@@ -9,9 +9,11 @@
 //! The registry is this crate's sink: its impl runs the status state machine
 //! over the worker objects it holds, and
 //! [`WorkerManager::start`](super::manager::WorkerManager::start) hands it.
-//! A host that keeps the status elsewhere states the port over its own
-//! store and hands it to
+//! A host states the port over its own store and hands it to
 //! [`WorkerManager::start_with_sink`](super::manager::WorkerManager::start_with_sink).
+//! The collector's schedule goes on reading the status on the worker object,
+//! so such a sink writes the status there before it answers: the places are
+//! on [`HealthSink`].
 
 use crate::{registry::WorkerId, worker::WorkerStatus};
 
@@ -34,10 +36,20 @@ pub enum ProbeAnswer {
 /// Where the health collector's facts go. Both calls are cold: one a probe,
 /// one a connect signal.
 ///
-/// The collector calls a sink from its loop and takes the worker's status
-/// from the answer, never from a copy of its own. A sink that holds no row
-/// for the worker answers [`ProbeAnswer::Stale`] to a probe's outcome and
-/// `None` to a connect signal.
+/// The collector calls a sink from its loop and judges no outcome itself:
+/// what a fact did to the status is the sink's answer. Its schedule still
+/// reads the status on the worker object the registry holds, in three
+/// places: where it lays a worker into the schedule (a registration, a
+/// replacement, a rebuild from the registry's snapshot), where it launches
+/// a probe (the probe's slot, the `launched` it hands to
+/// [`Self::probe_outcome`], the engine id's read after a recovery), and at
+/// a connect signal (the guard on a worker under removal, whether the probe
+/// decides). So a sink that keeps the status elsewhere writes it on the
+/// worker object before it answers; the registry's sink writes nowhere
+/// else.
+///
+/// A sink that holds no row for the worker answers [`ProbeAnswer::Stale`]
+/// to a probe's outcome and `None` to a connect signal.
 pub trait HealthSink: Send + Sync {
     /// One probe of the worker passed or failed. `revision` is the worker's
     /// revision at the probe's launch: the outcome of a worker replaced

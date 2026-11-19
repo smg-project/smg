@@ -14,8 +14,10 @@
 //!
 //! What a probe's outcome or a connect signal does to a worker's status
 //! crosses the port of [`super::port`]: the loop says the fact to a
-//! [`HealthSink`] and takes the status from its answer. The registry's impl
-//! of the port, further down, is the state machine.
+//! [`HealthSink`], and what the fact did to the status is the sink's answer.
+//! The schedule still reads the status on the worker object (the places are
+//! on the trait). The registry's impl of the port, further down, is the
+//! state machine.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -281,10 +283,13 @@ impl WorkerManager {
     }
 
     /// [`Self::start`] over the sink a host hands: the loop says each
-    /// probe's outcome and each connect signal to `sink` and takes a
-    /// worker's status from its answers. `registry` holds the worker objects
-    /// the loop probes; [`Self::start`] hands it as the sink too, since the
-    /// registry runs this crate's status state machine.
+    /// probe's outcome and each connect signal to `sink`, and what the fact
+    /// did to the status is the sink's answer. `registry` holds the worker
+    /// objects the loop probes, and the loop's schedule reads their status
+    /// (the places are on [`HealthSink`]): a sink that keeps the status
+    /// elsewhere writes it on the worker object before it answers.
+    /// [`Self::start`] hands the registry as the sink too, since it runs
+    /// this crate's status state machine over those objects.
     pub fn start_with_sink<G: Generation>(
         registry: Arc<WorkerRegistry<G>>,
         sink: Arc<dyn HealthSink>,
@@ -597,8 +602,8 @@ async fn run_health_loop<G: Generation>(
                     // answer across it); a failed read, a stale outcome and a
                     // worker already Ready keep the deadline armed at the
                     // launch. The status is the sink's answer, read where
-                    // the outcome was judged: the worker object may lag a
-                    // sink that keeps the status elsewhere.
+                    // the outcome was judged: the loop does not read the
+                    // worker object a second time for it.
                     ProbeAnswer::Stood(status)
                         if probe_ok
                             && matches!(
