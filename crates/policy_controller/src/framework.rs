@@ -2397,10 +2397,16 @@ pub struct Engine {
     /// decision reads it where the profile's mark says so, and no other
     /// decision does.
     orders: Vec<Order>,
-    /// Whether any profile holds a stage that keeps state a decider
-    /// ([`Self::keeps_deciders`]), said once at the build.
-    keeping: bool,
+    /// What the door needs of a seat, zero when it can use the caller's
+    /// seat without sampling.
+    seat_flags: u8,
+    explain_sample: u32,
 }
+
+/// A stage keeps state a decider, so each model decides at its own seat.
+pub(crate) const KEEPS_DECIDERS: u8 = 1;
+/// The generation samples decisions at the seat where they were made.
+pub(crate) const SAMPLES_DECISIONS: u8 = 2;
 
 /// Which of a profile's leading stages are ranks, read once when the engine
 /// is built: a stage that writes levels ([`Spread::Levels`]) and whose
@@ -3261,7 +3267,8 @@ impl Engine {
             named,
             row_tests,
             orders,
-            keeping,
+            seat_flags: u8::from(keeping) * KEEPS_DECIDERS,
+            explain_sample: 0,
         }
     }
 
@@ -3349,7 +3356,21 @@ impl Engine {
     /// joins this fact: without it such a host would split that state by
     /// thread, with no error.
     pub fn keeps_deciders(&self) -> bool {
-        self.keeping
+        self.seat_flags & KEEPS_DECIDERS != 0
+    }
+
+    pub(crate) fn seat_flags(&self) -> u8 {
+        self.seat_flags
+    }
+
+    pub(crate) fn set_explain_sample(&mut self, sample: u32) {
+        self.explain_sample = sample;
+        self.seat_flags =
+            (self.seat_flags & !SAMPLES_DECISIONS) | (u8::from(sample != 0) * SAMPLES_DECISIONS);
+    }
+
+    pub(crate) fn explain_sample(&self) -> u32 {
+        self.explain_sample
     }
 
     /// The sample of the profile that decides a request of `phase` for
@@ -3482,6 +3503,19 @@ impl Engine {
         self.bindings
             .iter()
             .find(|entry| entry.binding.matches(model, phase))
+    }
+
+    /// The position of the first matching binding in this generation.
+    pub(crate) fn binding_position(&self, model: &str, phase: Phase) -> Option<u32> {
+        self.bindings
+            .iter()
+            .position(|entry| entry.binding.matches(model, phase))
+            .and_then(|at| u32::try_from(at).ok())
+    }
+
+    #[cfg(feature = "controller")]
+    pub(crate) fn binding_at(&self, at: u32) -> Option<&Binding> {
+        self.bindings.get(at as usize).map(|entry| &entry.binding)
     }
 
     /// The profile a request resolves to for its phase; `None` when no

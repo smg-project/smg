@@ -2347,7 +2347,7 @@ impl Following<'_> {
     }
 }
 
-fn unix_micros(at: SystemTime) -> i64 {
+pub(super) fn unix_micros(at: SystemTime) -> i64 {
     at.duration_since(UNIX_EPOCH)
         .ok()
         .and_then(|since| i64::try_from(since.as_micros()).ok())

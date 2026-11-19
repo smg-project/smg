@@ -44,6 +44,10 @@
         "$ref": "#/$defs/BindingSpec"
       },
       "default": []
+    },
+    "explain": {
+      "description": "The sampling rate for explain.",
+      "$ref": "#/$defs/ExplainSpec"
     }
   },
   "additionalProperties": false,
@@ -1323,6 +1327,20 @@
         "enabled": {
           "type": "boolean",
           "default": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "ExplainSpec": {
+      "description": "Which decisions a decider keeps for explain.",
+      "type": "object",
+      "properties": {
+        "sample": {
+          "description": "Keep every Nth pick or shed per decider under this generation. Zero\nturns sampling off and one keeps every pick and shed.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "default": 0
         }
       },
       "additionalProperties": false

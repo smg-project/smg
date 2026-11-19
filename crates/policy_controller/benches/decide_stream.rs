@@ -110,6 +110,9 @@
 //! rate and its CPU a decision over those of the one-decider cell of its
 //! members (`rate_over_one`, `cpu_over_one`).
 //!
+//! `DECIDE_STREAM_EXPLAIN_SAMPLE` sets the document's sampling rate for
+//! each row, with zero as the default.
+//!
 //! A measured run pins a cell's busy threads to a core each, over the
 //! cores the process was given, in their order: the deciders, the
 //! controller's runtime threads, the streams' clients, the session, the
@@ -1100,6 +1103,9 @@ fn fill(store: &MemoryStore, shape: Shape) {
         PolicySpec::preset(PRESET).expect("a preset of this build")
     };
     document.generation = 1;
+    if let Ok(sample) = env::var("DECIDE_STREAM_EXPLAIN_SAMPLE") {
+        document.explain.sample = sample.parse().expect("an unsigned sampling rate");
+    }
     let spec = AppliedSpec::validate(&document).expect("the document validates");
     store.apply(spec).expect("above the unbound start");
     store.publish_now();

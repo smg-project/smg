@@ -34,8 +34,8 @@
 //!    target, minted and filed by the store under the term the first read
 //!    showed, at that read's instant ([`MemoryStore::issue_decided`]). The
 //!    engine that decided is told of it, and the answer carries it;
-//! 7. the fence again, and the budget at the same read, with the answer's
-//!    hand-over alone behind it: a decision whose budget ended while it was
+//! 7. the fence again, and the budget at the same read, before sampling
+//!    and handing the answer over: a decision whose budget ended while it was
 //!    made, its lease's filing and the stages' hearing of it included,
 //!    leaves as `Busy` under the reason a late arrival is told, and under
 //!    a count of its own ([`Counts`]). So does a pick whose lease has
@@ -45,6 +45,10 @@
 //!    at once: the store's release door first, then the engine told, as
 //!    abandoned under a closed fence and as a late decision past the
 //!    budget or the span.
+//!
+//! A pick or shed past the last read can be sampled for Explain. Each
+//! decider keeps its own ring for the term, with a lock held only for a
+//! sample's write or one scan.
 //!
 //! A lease is what the next decisions read. The store counts the leases on
 //! file by the worker each books, and a decision reads that count as each
@@ -154,6 +158,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use parking_lot::Mutex;
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 
@@ -167,14 +172,14 @@ use crate::{
     decision::Decision,
     door::{
         decide_in, decider_of, entry, issue, issue_pair, pair_in, past_mark, summed, Asked,
-        Buffers, Entry, Part, StorePins, Taken,
+        Buffers, DecisionRecord, Entry, Part, Samples, StorePins, Taken,
     },
     elector::{term_said, Fence},
-    framework::release,
+    framework::{release, Engine},
     lease::{Lease, Lifecycle, ReleaseReason},
     proto::{self, busy::Reason},
     store::{leases::DISPATCH_TTL, AtWork, GatewayId, LeaseRefused, MemoryStore, Said, World},
-    view::PinSource,
+    view::{fingerprint, PinSource},
 };
 
 /// What the deciders and the streams count on the controller's own side,
@@ -281,6 +286,45 @@ struct Mark {
     said: AtomicU64,
 }
 
+#[derive(Default)]
+struct Shared {
+    mark: Mark,
+    /// One lock per decider, laid out on the first sampling write.
+    samples: OnceLock<Box<[Mutex<Samples>]>>,
+}
+
+type Answered = Result<(u64, Decision, Option<wire::Leased>), Reason>;
+
+impl Shared {
+    #[cold]
+    #[inline(never)]
+    fn sampled(
+        &self,
+        seat: (usize, usize),
+        engine: &Engine,
+        taken: &Taken<'_, Checked>,
+        order: impl FnOnce() -> Answered,
+    ) -> Answered {
+        let answer = order()?;
+        self.keep(seat, answer.0, engine, taken, &answer.1);
+        Ok(answer)
+    }
+
+    fn keep(
+        &self,
+        (index, deciders): (usize, usize),
+        term: u64,
+        engine: &Engine,
+        taken: &Taken<'_, Checked>,
+        decision: &Decision,
+    ) {
+        let seats = self
+            .samples
+            .get_or_init(|| (0..deciders).map(|_| Mutex::default()).collect());
+        seats[index].lock().keep(term, engine, taken, decision);
+    }
+}
+
 /// What every decider reads.
 #[derive(Clone)]
 pub(crate) struct Reads {
@@ -346,8 +390,7 @@ pub(crate) struct Deciders {
     /// frame's receipt is stamped by and the term the reader's own answers
     /// carry.
     reads: Reads,
-    /// A term's mark, as every decider reads it.
-    mark: Arc<Mark>,
+    shared: Arc<Shared>,
 }
 
 /// A decider's thread holds one: it tells when the thread unwinds. A thread
@@ -377,7 +420,7 @@ impl Deciders {
         }
         lifecycle::tells(&reads.store);
         let told = Arc::new(watch::Sender::new(false));
-        let mark = Arc::new(Mark::default());
+        let shared = Arc::new(Shared::default());
         let queues = (0..deciders)
             .map(|index| {
                 let (queue, jobs) = sync_channel(depth.max(1));
@@ -387,7 +430,7 @@ impl Deciders {
                     faulted: false,
                     index,
                     marked: None,
-                    mark: Arc::clone(&mark),
+                    shared: Arc::clone(&shared),
                     working: None,
                     name: u8::try_from(index).ok().map(Decider::new),
                 };
@@ -398,7 +441,7 @@ impl Deciders {
             queues,
             told,
             reads: reads.clone(),
-            mark,
+            shared,
         })
     }
 
@@ -415,7 +458,22 @@ impl Deciders {
     /// calls `leave` with that term once that answer is handed over. Set
     /// once, when the election runs: a second call changes nothing.
     pub(crate) fn leave_through(&self, leave: impl Fn(u64) + Send + Sync + 'static) {
-        let _ = self.mark.leave.set(Box::new(leave));
+        let _ = self.shared.mark.leave.set(Box::new(leave));
+    }
+
+    /// Scans one seat at a time for a record kept under the term read.
+    pub(crate) fn explain(
+        &self,
+        term: u64,
+        gateway: GatewayId,
+        request_id: &[u8],
+    ) -> Option<DecisionRecord> {
+        let seats = self.shared.samples.get()?;
+        let key = fingerprint(request_id);
+        seats
+            .iter()
+            .filter_map(|seat| seat.lock().find(term, gateway, key))
+            .max_by_key(|record| record.at)
     }
 
     /// What a decider's thread tells at its unwind, told by a case.
@@ -489,8 +547,7 @@ struct Deciding {
     /// The term of the answer in hand where its lease's id is at or past
     /// the term's mark: the word follows the answer's hand-over.
     marked: Option<u64>,
-    /// The mark's word and its latch, shared by the deciders.
-    mark: Arc<Mark>,
+    shared: Arc<Shared>,
     /// Its seat at its own file of leases, taken at its first job
     /// ([`MemoryStore::at_work`]): at work while it has a job at hand.
     working: Option<AtWork>,
@@ -611,8 +668,9 @@ impl Deciding {
         // A read first: past the mark every answer comes here until the
         // hand-over lands, and a write each time would pass the line from
         // decider to decider.
-        if self.mark.said.load(Ordering::Relaxed) >= term
-            || self.mark.said.fetch_max(term, Ordering::Relaxed) >= term
+        let mark = &self.shared.mark;
+        if mark.said.load(Ordering::Relaxed) >= term
+            || mark.said.fetch_max(term, Ordering::Relaxed) >= term
         {
             return;
         }
@@ -623,7 +681,7 @@ impl Deciding {
             );
             return;
         }
-        let Some(leave) = self.mark.leave.get() else {
+        let Some(leave) = mark.leave.get() else {
             warn!(
                 term,
                 "a term's lease ids passed their mark and no election listens: no hand-over is said, and picks are answered Busy once the ids end"
@@ -714,12 +772,7 @@ impl Deciding {
     /// One request's decision with the term both reads of the fence showed
     /// and, where it is a pick, the lease issued for it with what is left
     /// of its dispatch span, or the reason its answer is `Busy`.
-    fn decide(
-        &mut self,
-        request: &Checked,
-        gateway: GatewayId,
-        received: Instant,
-    ) -> Result<(u64, Decision, Option<wire::Leased>), Reason> {
+    fn decide(&mut self, request: &Checked, gateway: GatewayId, received: Instant) -> Answered {
         let Reads {
             store,
             fence,
@@ -746,7 +799,7 @@ impl Deciding {
         // One load of the world for the decision and for its lease: the
         // lease books the count that load laid beside its target's row,
         // and the engine told of it is the one that decided.
-        store.deciding(|world| {
+        let mut order = |world: &World| {
             // The lease, for a pick: filed under the first read's term and
             // at its instant, and the engine told, before the read that
             // lets the answer leave. That read judges the store's write
@@ -838,6 +891,18 @@ impl Deciding {
                 give_up(store, world, taken.gateway, &lease, decode.as_ref(), ended);
             }
             Err(busy)
+        };
+        store.deciding(|world| {
+            if world.samples_decisions() {
+                self.shared.sampled(
+                    (self.index, store.deciders()),
+                    world.spec().engine(),
+                    &taken,
+                    || order(world),
+                )
+            } else {
+                order(world)
+            }
         })
     }
 }
@@ -1216,7 +1281,7 @@ pub(crate) mod tests {
             name: None,
             index: 0,
             marked: None,
-            mark: Arc::default(),
+            shared: Arc::default(),
         }
     }
 
@@ -2852,8 +2917,26 @@ pub(crate) mod tests {
         // The first read finds the fence open and the decision is made; the
         // read at the hand-over is past the renew deadline.
         let mut bed = leading([Step::At(Duration::ZERO), Step::At(FENCED)]);
+        let mut document = PolicySpec::preset("random").expect("a preset");
+        document.generation = 2;
+        document.explain.sample = 1;
+        bed.store
+            .apply(applied(&document))
+            .expect("a later generation");
         let answer = bed.ask(frame(1, 1)).await;
         assert_eq!((busy(&answer), answer.term), (Reason::NotLeader, 1));
+        assert_eq!(bed.script.readers.lock().len(), 2);
+        assert!(bed.deciders.explain(1, GATEWAY, &[1]).is_none());
+        assert!(bed.deciders.shared.samples.get().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_unsampled_served_decision_lays_out_no_rings() {
+        let mut bed = leading([]);
+        let answer = bed.ask(frame(1, 1)).await;
+        assert!(matches!(outcome(&answer), Outcome::Pick(_)));
+        assert!(bed.deciders.explain(1, GATEWAY, &[1]).is_none());
+        assert!(bed.deciders.shared.samples.get().is_none());
         assert_eq!(bed.script.readers.lock().len(), 2);
     }
 
@@ -2907,7 +2990,7 @@ pub(crate) mod tests {
             queues: Box::new([queue]),
             told: Arc::new(watch::Sender::new(false)),
             reads: reads.clone(),
-            mark: Arc::default(),
+            shared: Arc::default(),
         }
     }
 
