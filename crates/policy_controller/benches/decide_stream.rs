@@ -47,9 +47,10 @@
 //!   process at a host's door (`Door::decide`) by 1, 8 and 64 callers at once
 //!   on one model over 64 members. There is no wire, no controller and no
 //!   deciding thread: each caller is a thread that decides on itself and
-//!   reports the pick's lease released at once (`Door::report`). Callers of
-//!   one model decide one at a time, so the row reads what the door's turn
-//!   costs its callers. A row asks the same count of decisions whatever its
+//!   reports the pick's lease released at once (`Door::report`). The store
+//!   lays a file a caller, so each caller decides at a seat of its own, and
+//!   the row reads what callers at once cost each other: the counts they
+//!   share. A row asks the same count of decisions whatever its
 //!   callers, shared among them, and its rate is the callers' measured
 //!   decisions, begun together, over the one interval they share. It prints
 //!   the callers' CPU (`callers_us`) and the switches they asked for a
@@ -2205,16 +2206,18 @@ const DOOR: [(u32, usize); 3] = [(64, 1), (64, 8), (64, 64)];
 /// caller stands there, far under that floor.
 const DOOR_DECISIONS: u64 = 16;
 
-/// A host's door over a store of one file, its fleet filled as a wire
-/// row's is: its bands apart ([`APART`]) where the callers tell their
-/// dispatches (`told`), as a gateway row's stand. No controller is served
-/// beside it: a store has one host at its files.
-fn door_over(members: u32, told: bool) -> Door {
+/// A host's door over a store of `files` files, its fleet filled as a
+/// wire row's is: its bands apart ([`APART`]) where the callers tell their
+/// dispatches (`told`), as a gateway row's stand. A host lays a file for
+/// each of its threads that decide, and each then decides at a seat of
+/// its own. No controller is served beside it: a store has one host at
+/// its files.
+fn door_over(members: u32, files: usize, told: bool) -> Door {
     assert!(
         !told || least_alone(members),
         "a fleet of {members} members holds more than one row in its least band"
     );
-    let store = MemoryStore::new().with_deciders(1);
+    let store = MemoryStore::new().with_deciders(files);
     fill(&store, Shape::bar(members, 1, Fleet::Shared, told, 0, 0));
     Door::new(Arc::new(store))
 }
@@ -2439,7 +2442,7 @@ fn door_pass(
     counted: bool,
 ) -> DoorPass {
     let ask = asking.ask;
-    let door = Arc::new(door_over(members, asking.told));
+    let door = Arc::new(door_over(members, callers, asking.told));
     let before = pool_at(&door, u64::MAX);
     let cores = GIVEN
         .get()
@@ -2601,11 +2604,11 @@ fn count(cell: &str, out: &mut impl Write) -> io::Result<()> {
             (calls, 0)
         }
         "door" => (
-            at_door(&door_over(shape.members, false), ask_door, decisions),
+            at_door(&door_over(shape.members, 1, false), ask_door, decisions),
             0,
         ),
         "handle" => (
-            at_door(&door_over(shape.members, true), ask_handle, decisions),
+            at_door(&door_over(shape.members, 1, true), ask_handle, decisions),
             0,
         ),
         "stream" | "pair" => {
