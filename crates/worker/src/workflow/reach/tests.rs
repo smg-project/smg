@@ -10,9 +10,8 @@ use std::{
 
 use super::*;
 use crate::{
-    connection::http_client::{WorkerHttpClientCache, WorkerHttpClientSettings},
     test_support::{RefusedAddress, ScriptedAnswers, ScriptedConnector},
-    worker::HttpPoolConfig,
+    workflow::host::testing::worker_client,
 };
 
 struct DropFlag(Arc<AtomicBool>);
@@ -21,20 +20,6 @@ impl Drop for DropFlag {
     fn drop(&mut self) {
         self.0.store(true, Ordering::SeqCst);
     }
-}
-
-/// A worker-directed client of the crate's own cache, as a step hands one to
-/// the HTTP probe.
-fn worker_client() -> Arc<Client> {
-    WorkerHttpClientCache::new(WorkerHttpClientSettings {
-        client_identity: None,
-        ca_certificates: Vec::new(),
-        upstream_http2: false,
-        request_timeout_secs: 30,
-        pool_idle_timeout_secs: 0,
-    })
-    .get(&HttpPoolConfig::default(), false)
-    .unwrap()
 }
 
 #[test]

@@ -6,11 +6,7 @@ use std::sync::Arc;
 // The gRPC base URL stands beside the address type, where the worker module
 // reads it too; its path here is kept for the steps.
 pub(crate) use smg_worker::identity::endpoint::grpc_base_url;
-use smg_worker::{
-    connection::engine::{EngineConnection, HealthAnswer},
-    identity::basic::RuntimeType,
-    workflow as worker_workflow,
-};
+use smg_worker::{connection::engine::EngineConnection, identity::basic::RuntimeType};
 
 use crate::routers::grpc::backend_client::BackendConnector;
 
@@ -26,22 +22,6 @@ pub(crate) async fn connect_grpc_as(
         .map_err(|_| format!("Unknown runtime type: {runtime_type}"))?;
     let connector = BackendConnector::shared();
     connector.connect_grpc(grpc_url, runtime).await
-}
-
-/// One gRPC health RPC to the engine at `grpc_url`, spoken to as
-/// `runtime_type`, through the gateway's connector: the worker crate's
-/// probe, for a runtime named by its text. A text that names no runtime is
-/// the connect's refusal, as it was before the probe moved.
-pub(crate) async fn grpc_health_answer(
-    grpc_url: &str,
-    timeout_secs: u64,
-    runtime_type: &str,
-) -> Result<HealthAnswer, String> {
-    let runtime: RuntimeType = runtime_type
-        .parse()
-        .map_err(|_| format!("gRPC connection failed: Unknown runtime type: {runtime_type}"))?;
-    let connector = BackendConnector::shared();
-    worker_workflow::grpc_health_answer(connector.as_ref(), grpc_url, timeout_secs, runtime).await
 }
 
 /// A mock gRPC engine on an ephemeral loopback port for the probes' tests,
@@ -90,7 +70,7 @@ pub(crate) async fn mock_grpc_engine_on(
 mod tests {
     use smg_worker::{
         identity::endpoint::Endpoint,
-        workflow::{grpc_reachable_url, http_health_url, try_grpc_reachable},
+        workflow::{grpc_health_answer, grpc_reachable_url, http_health_url, try_grpc_reachable},
     };
 
     use super::*;
@@ -139,12 +119,12 @@ mod tests {
         engine.set_serving(false);
         let connector = BackendConnector::shared();
 
-        let answer = grpc_health_answer(&url, 5, "tokenspeed")
+        let answer = grpc_health_answer(connector.as_ref(), &url, 5, RuntimeType::TokenSpeed)
             .await
             .expect("the runtime answers its health RPC whether or not the engine is healthy");
         assert!(!answer.healthy);
         assert_eq!(answer.message, "not serving");
-        grpc_health_answer(&url, 5, "vllm")
+        grpc_health_answer(connector.as_ref(), &url, 5, RuntimeType::Vllm)
             .await
             .expect_err("another runtime's service does not answer there");
         let err = try_grpc_reachable(connector.as_ref(), &url, 5)
@@ -163,18 +143,59 @@ mod tests {
             .expect("a healthy engine is reachable");
     }
 
-    /// A runtime's text that names no runtime is refused in the words of the
-    /// connect that refused it before the probe moved.
+    /// A runtime that answers its health RPC with `healthy: false` (its
+    /// engine still loading) is identified all the same, by the worker
+    /// crate's step on the gateway's connector; an endpoint nobody answers
+    /// on names every runtime's reason.
     #[tokio::test]
-    async fn a_text_that_names_no_runtime_is_refused_as_the_connect_refused_it() {
-        let err = grpc_health_answer("grpc://127.0.0.1:0", 1, "no-such-runtime")
-            .await
-            .expect_err("the text names no runtime");
+    async fn grpc_detection_identifies_a_runtime_that_reports_not_healthy() {
+        use openai_protocol::worker::WorkerSpec;
+        use smg_worker::{
+            identity::basic::ConnectionMode,
+            jobs::WorkerRegistrationMode,
+            workflow::{DetectRuntimeStep, WorkerKind},
+        };
+        use wfaas::{StepExecutor, WorkflowContext, WorkflowInstanceId};
 
+        use crate::{
+            app_context::testing::create_test_app_context,
+            workflow::steps::create_worker_workflow_data,
+        };
+
+        async fn detect(url: &str, timeout_secs: u64) -> Result<Option<String>, String> {
+            let mut spec = WorkerSpec::new(url);
+            spec.health.timeout_secs = Some(timeout_secs);
+            let mut data = create_worker_workflow_data(
+                spec,
+                WorkerRegistrationMode::Upsert,
+                create_test_app_context(),
+            );
+            data.worker_kind = Some(WorkerKind::Local);
+            data.connection_mode = Some(ConnectionMode::Grpc);
+            let mut context = WorkflowContext::new(WorkflowInstanceId::new(), data);
+            DetectRuntimeStep
+                .execute(&mut context)
+                .await
+                .map(|_| context.data.detected_runtime_type.clone())
+                .map_err(|error| error.to_string())
+        }
+
+        let (url, engine) = mock_grpc_engine().await;
+        engine.set_serving(false);
         assert_eq!(
-            err,
-            "gRPC connection failed: Unknown runtime type: no-such-runtime"
+            detect(&url, 5).await.unwrap().as_deref(),
+            Some("tokenspeed")
         );
+
+        let err = detect("grpc://127.0.0.1:0", 1)
+            .await
+            .expect_err("nothing answers on a closed endpoint");
+        for runtime in ["sglang", "vllm", "trtllm", "tokenspeed", "mlx"] {
+            assert!(
+                err.contains(&format!("{runtime}: gRPC connection")),
+                "the error does not carry {runtime}'s reason: {err}"
+            );
+        }
     }
 
     /// For an address the door takes, the host and port the probes dial are

@@ -13,7 +13,7 @@ use smg_worker::{
         sampling_defaults::{SamplingDefaults, DEFAULT_SAMPLING_PARAMS_LABEL},
     },
     labels::flat_labels,
-    workflow::{http_base_url, WorkerKind},
+    workflow::{http_base_url, ModelsResponse, WorkerKind},
 };
 use tool_parser::GrammarStart;
 use tracing::{debug, warn};
@@ -76,21 +76,6 @@ pub struct ModelInfo {
     pub has_audio_understanding: Option<bool>,
     pub model_type: Option<String>,
     pub architectures: Option<Vec<String>>,
-}
-
-/// Single entry from `/v1/models` (shared by sglang and vllm).
-#[derive(Debug, Clone, Deserialize)]
-pub(super) struct ModelsResponseEntry {
-    pub owned_by: Option<String>,
-    pub id: Option<String>,
-    pub root: Option<String>,
-    pub max_model_len: Option<usize>,
-}
-
-/// `/v1/models` response wrapper.
-#[derive(Debug, Clone, Deserialize)]
-pub(super) struct ModelsResponse {
-    pub data: Vec<ModelsResponseEntry>,
 }
 
 /// vLLM `/version` response.
@@ -608,9 +593,10 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverMetadataStep {
             // HF cache), for a worker that serves that model (one registered
             // for another model, by spec or label, must not inherit them),
             // and where the gateway's own link starts a grammar, which is
-            // the link's rule and needs no engine. The runtime stays `None`:
-            // the handshake is shared across engines, so it cannot be probed
-            // here and the configured or detected runtime is preserved.
+            // the link's rule and needs no engine. The handshake is shared
+            // across engines, so the runtime cannot be probed: a declared
+            // runtime is preserved, and a worker that declared none takes
+            // the default here.
             ConnectionMode::Zmq => {
                 let router_model = context
                     .data
@@ -618,7 +604,19 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverMetadataStep {
                     .as_ref()
                     .and_then(|app| app.router_config.model_path.clone());
                 let model = zmq_model(router_model, resolve_model_id(config, &config.labels));
-                Ok((zmq_worker_labels(model.as_deref()).await, None))
+                let runtime = context.data.detected_runtime_type.is_none().then(|| {
+                    warn!(
+                        worker = %Endpoint::redacted_str(&config.url),
+                        "runtime_type unspecified for ZMQ worker; defaulting to vLLM \
+                         EngineCore. A TokenSpeed or SGLang engine must declare its \
+                         runtime to speak the correct wire protocol: `--backend \
+                         tokenspeed` / `--backend sglang` for startup --worker-urls \
+                         workers, or an explicit runtime_type on the worker API spec \
+                         / YAML worker config."
+                    );
+                    "vllm".to_string()
+                });
+                Ok((zmq_worker_labels(model.as_deref()).await, runtime))
             }
         }
         .unwrap_or_else(|e| {
@@ -1376,5 +1374,39 @@ mod tests {
 
         assert!(err.contains("Failed to parse"), "{err}");
         assert!(!err.contains("s3cret"), "{err}");
+    }
+
+    /// A ZMQ worker that declared no runtime takes the default in this step,
+    /// and one whose runtime is settled keeps it.
+    #[tokio::test]
+    async fn a_zmq_worker_with_no_runtime_takes_the_default_here() {
+        use openai_protocol::worker::WorkerSpec;
+        use smg_worker::jobs::WorkerRegistrationMode;
+        use wfaas::WorkflowInstanceId;
+
+        use crate::{
+            app_context::testing::create_test_app_context,
+            workflow::steps::create_worker_workflow_data,
+        };
+
+        async fn runtime_after(settled: Option<&str>) -> Option<String> {
+            let mut data = create_worker_workflow_data(
+                WorkerSpec::new("ipc:///tmp/engine-a.sock"),
+                WorkerRegistrationMode::Upsert,
+                create_test_app_context(),
+            );
+            data.worker_kind = Some(WorkerKind::Local);
+            data.connection_mode = Some(ConnectionMode::Zmq);
+            data.detected_runtime_type = settled.map(str::to_string);
+            let mut context = WorkflowContext::new(WorkflowInstanceId::new(), data);
+            DiscoverMetadataStep.execute(&mut context).await.unwrap();
+            context.data.detected_runtime_type
+        }
+
+        assert_eq!(runtime_after(None).await.as_deref(), Some("vllm"));
+        assert_eq!(
+            runtime_after(Some("tokenspeed")).await.as_deref(),
+            Some("tokenspeed")
+        );
     }
 }

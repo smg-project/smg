@@ -9,7 +9,7 @@ use crate::{
     jobs::WorkerRegistrationMode,
     test_support::{RefusedAddress, ScriptedAnswers, ScriptedConnector},
     worker::{HttpPoolConfig, WorkerSpec},
-    workflow::{host::testing::ProbingHost, reach::GRPC_RUNTIMES},
+    workflow::{host::testing::ProbingHost, runtimes::GRPC_RUNTIMES},
 };
 
 /// A host whose connector reaches no engine.

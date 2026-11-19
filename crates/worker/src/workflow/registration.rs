@@ -7,7 +7,7 @@ use wfaas::{BackoffStrategy, FailureAction, RetryPolicy, StepDefinition, Workflo
 
 use super::{
     data::WorkerRegistrationWorkflowData, detect_connection::DetectConnectionModeStep,
-    host::WorkflowHost,
+    detect_runtime::DetectRuntimeStep, host::WorkflowHost,
 };
 use crate::settings::RegistrationSettings;
 
@@ -16,6 +16,8 @@ pub const WORKER_REGISTRATION_WORKFLOW: &str = "worker_registration";
 /// The id of the step that settles how a worker is spoken to: HTTP, and in
 /// which version, or gRPC.
 pub const DETECT_CONNECTION_MODE_STEP: &str = "detect_connection_mode";
+/// The id of the step that tells which runtime a worker runs.
+pub const DETECT_RUNTIME_STEP: &str = "detect_backend";
 
 /// The host's steps that this crate's steps of a registration wait on, one
 /// field a gate. A gate names a step the host adds to the workflow; the
@@ -46,7 +48,8 @@ pub fn startup_attempts(settings: &RegistrationSettings) -> u32 {
 }
 
 /// The worker side of a registration: the connection detection, polled at
-/// the startup cadence of `settings`.
+/// the startup cadence of `settings`, and the runtime detection behind it,
+/// with the same budget of attempts.
 ///
 /// The startup delay, the time a worker is left alone before its first
 /// probe, stands on the step that opens the workflow. With
@@ -81,6 +84,23 @@ pub fn worker_registration_workflow<H: WorkflowHost>(
 
     WorkflowDefinition::new(WORKER_REGISTRATION_WORKFLOW, "Worker Registration")
         .add_step(detect_connection_mode)
+        .add_step(
+            StepDefinition::new(
+                DETECT_RUNTIME_STEP,
+                "Detect Backend",
+                Arc::new(DetectRuntimeStep),
+            )
+            .with_retry(RetryPolicy {
+                max_attempts: startup_attempts(settings),
+                backoff: BackoffStrategy::Linear {
+                    increment: Duration::from_secs(1),
+                    max: Duration::from_secs(5),
+                },
+            })
+            .with_timeout(Duration::from_secs(10))
+            .with_failure_action(FailureAction::ContinueNextStep)
+            .depends_on(&[DETECT_CONNECTION_MODE_STEP]),
+        )
 }
 
 #[cfg(test)]

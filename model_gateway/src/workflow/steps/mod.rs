@@ -18,10 +18,7 @@ pub use local::{
     RemoveFromPolicyRegistryStep, UpdatePoliciesForWorkerStep, UpdateRemainingPoliciesStep,
     UpdateWorkerPropertiesStep,
 };
-use local::{
-    DetectBackendStep, DiscoverDPInfoStep as DPStep, EnsureHarmonyEncodingStep,
-    SubmitTokenizerJobStep,
-};
+use local::{DiscoverDPInfoStep as DPStep, EnsureHarmonyEncodingStep, SubmitTokenizerJobStep};
 use openai_protocol::worker::WorkerSpec;
 use shared::REGISTER_WORKERS_STEP;
 pub use shared::{
@@ -29,7 +26,7 @@ pub use shared::{
     UpdatePoliciesStep, WorkerList,
 };
 use smg_worker::workflow::{
-    startup_attempts, worker_registration_workflow, RegistrationGates, DETECT_CONNECTION_MODE_STEP,
+    startup_attempts, worker_registration_workflow, RegistrationGates, DETECT_RUNTIME_STEP,
 };
 use wfaas::{BackoffStrategy, FailureAction, RetryPolicy, StepDefinition, WorkflowDefinition};
 
@@ -93,8 +90,9 @@ pub fn create_worker_registration_workflow(
         classify_worker_type = classify_worker_type.with_delay(startup_delay);
     }
 
-    // Step 1, the connection mode (HTTP vs gRPC), is the worker crate's. It
-    // waits on the classification, which carries the startup delay.
+    // Steps 1 and 1.5, the connection mode (HTTP vs gRPC) and the runtime,
+    // are the worker crate's. The first waits on the classification, which
+    // carries the startup delay.
     worker_registration_workflow::<AppContext>(
         &settings,
         RegistrationGates {
@@ -104,24 +102,6 @@ pub fn create_worker_registration_workflow(
     // Step 0: Classify worker type (Local vs External)
     .add_step(classify_worker_type)
     // === LOCAL BRANCH ===
-    // Step 1.5: Detect backend runtime (sglang, vllm, trtllm)
-    .add_step(
-        StepDefinition::new(
-            "detect_backend",
-            "Detect Backend",
-            Arc::new(DetectBackendStep),
-        )
-        .with_retry(RetryPolicy {
-            max_attempts,
-            backoff: BackoffStrategy::Linear {
-                increment: Duration::from_secs(1),
-                max: Duration::from_secs(5),
-            },
-        })
-        .with_timeout(Duration::from_secs(10))
-        .with_failure_action(FailureAction::ContinueNextStep)
-        .depends_on(&[DETECT_CONNECTION_MODE_STEP]),
-    )
     // Step 2a: Discover metadata
     .add_step(
         StepDefinition::new(
@@ -135,7 +115,7 @@ pub fn create_worker_registration_workflow(
         })
         .with_timeout(Duration::from_secs(10))
         .with_failure_action(FailureAction::ContinueNextStep)
-        .depends_on(&["detect_backend"]),
+        .depends_on(&[DETECT_RUNTIME_STEP]),
     )
     // Step 2b: Discover DP info (after metadata)
     .add_step(
@@ -274,6 +254,8 @@ mod policy_lifecycle_tests;
 
 #[cfg(test)]
 mod tests {
+    use smg_worker::workflow::DETECT_CONNECTION_MODE_STEP;
+
     use super::*;
     use crate::config::RouterConfig;
 

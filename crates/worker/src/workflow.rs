@@ -17,8 +17,9 @@
 //! Of a worker's registration it holds the data
 //! ([`WorkerRegistrationWorkflowData`]: what the steps pass along, with one
 //! slot for what the host's own steps keep between them) and the detection
-//! of how the worker is spoken to ([`DetectConnectionModeStep`]), in the
-//! order of [`worker_registration_workflow`]. A host names in
+//! of how the worker is spoken to ([`DetectConnectionModeStep`]) and of
+//! the runtime it runs ([`DetectRuntimeStep`]), in the order of
+//! [`worker_registration_workflow`]. A host names in
 //! [`RegistrationGates`] the steps of its own that this crate's steps wait
 //! on.
 //!
@@ -28,24 +29,29 @@
 
 mod data;
 mod detect_connection;
+mod detect_runtime;
 mod drain_workers;
 mod find_workers_to_remove;
 mod host;
+mod model_list;
 mod pool;
 mod reach;
 mod registration;
 mod removal;
 mod remove_from_worker_registry;
 mod retry;
+mod runtimes;
 mod select;
 
 pub use data::{
     DpInfo, WorkerKind, WorkerList, WorkerRegistrationWorkflowData, WorkerRemovalWorkflowData,
 };
 pub use detect_connection::DetectConnectionModeStep;
+pub use detect_runtime::DetectRuntimeStep;
 pub use drain_workers::DrainWorkersStep;
 pub use find_workers_to_remove::{FindWorkersToRemoveStep, WorkerRemovalRequest};
 pub use host::{require_host, WorkflowHost};
+pub use model_list::{ModelsResponse, ModelsResponseEntry};
 pub use pool::{pool_group, refresh_worker_pool_sizes, PoolGroup, PoolGroups};
 pub use reach::{
     grpc_health_answer, grpc_reachable_url, http_base_url, http_health_url, try_grpc_reachable,
@@ -53,7 +59,7 @@ pub use reach::{
 };
 pub use registration::{
     startup_attempts, worker_registration_workflow, RegistrationGates, DETECT_CONNECTION_MODE_STEP,
-    WORKER_REGISTRATION_WORKFLOW,
+    DETECT_RUNTIME_STEP, WORKER_REGISTRATION_WORKFLOW,
 };
 pub use removal::{
     worker_removal_workflow, DRAIN_WORKERS_STEP, FIND_WORKERS_TO_REMOVE_STEP,

@@ -6,6 +6,7 @@ use std::{future::Future, time::Duration};
 use futures::stream::{FuturesUnordered, StreamExt};
 use reqwest::Client;
 
+use super::runtimes::{listed, GRPC_RUNTIMES};
 use crate::{
     connection::engine::{EngineConnector, HealthAnswer},
     identity::{
@@ -178,15 +179,6 @@ async fn grpc_transport_reachable(
     Ok(())
 }
 
-/// The runtimes a gRPC reach asks, each on its own health service.
-pub(super) const GRPC_RUNTIMES: [RuntimeType; 5] = [
-    RuntimeType::Sglang,
-    RuntimeType::Vllm,
-    RuntimeType::Trtllm,
-    RuntimeType::Mlx,
-    RuntimeType::TokenSpeed,
-];
-
 async fn first_success_or_all_errors<F>(
     mut checks: FuturesUnordered<F>,
     runtimes: &[RuntimeType],
@@ -219,11 +211,7 @@ where
 
     Err(format!(
         "gRPC not reachable (tried {}): {details}",
-        runtimes
-            .iter()
-            .map(|runtime| runtime.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
+        listed(runtimes)
     ))
 }
 

@@ -105,3 +105,26 @@ fn the_budget_of_attempts_follows_the_startup_cadence() {
         );
     }
 }
+
+/// The runtime detection waits on the connection detection and polls with
+/// the same budget of attempts.
+#[test]
+fn the_runtime_detection_waits_on_the_connection_detection() {
+    let workflow = worker_registration_workflow::<RegistryHost>(
+        &settings(300, 7, 5),
+        RegistrationGates::default(),
+    );
+
+    let step = workflow
+        .steps
+        .iter()
+        .find(|step| step.id == StepId::new(DETECT_RUNTIME_STEP))
+        .unwrap();
+    assert_eq!(
+        step.depends_on,
+        vec![StepId::new(DETECT_CONNECTION_MODE_STEP)]
+    );
+    assert_eq!(step.delay, None);
+    assert_eq!(step.retry_policy.as_ref().unwrap().max_attempts, 54);
+    assert_eq!(step.timeout, Some(Duration::from_secs(10)));
+}

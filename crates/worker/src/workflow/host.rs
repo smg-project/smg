@@ -54,6 +54,7 @@ pub(crate) mod testing {
         },
         settings::RegistrationSettings,
         test_support::{CountingConnector, Members, ScriptedConnector, WorkerRegistry},
+        worker::HttpPoolConfig,
     };
 
     /// A host that keeps a registry and nothing else.
@@ -132,6 +133,11 @@ pub(crate) mod testing {
                 connector: Arc::new(connector),
             })
         }
+
+        /// How many connects the host's connector was asked for.
+        pub(crate) fn connects(&self) -> usize {
+            self.connector.connects()
+        }
     }
 
     impl WorkflowHost for ProbingHost {
@@ -154,5 +160,14 @@ pub(crate) mod testing {
             let connector: Arc<ScriptedConnector> = Arc::clone(&self.connector);
             connector
         }
+    }
+
+    /// A worker-directed client of the crate's own cache, as a step hands one
+    /// to a probe.
+    pub(crate) fn worker_client() -> Arc<reqwest::Client> {
+        ProbingHost::new(false, ScriptedConnector::default())
+            .worker_client_cache()
+            .get(&HttpPoolConfig::default(), false)
+            .unwrap()
     }
 }
