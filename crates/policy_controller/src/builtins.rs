@@ -20,7 +20,7 @@ use rustc_hash::{FxHashMap, FxHasher};
 use crate::{
     affinity::WarmRule,
     counts::{with_counts, LentCounts, Pieces, Slot},
-    decision::{Target, Targets, MAX_TARGETS},
+    decision::{Overlap, Target, Targets, MAX_TARGETS},
     framework::{
         top_drawn, top_pass, Filter, Front, Narrowed, Picker, Scorer, Spread, TieBand, Unit,
         DRAW_BOUND,
@@ -418,6 +418,14 @@ impl<S: ReadsLoad> Scorer for ReportAge<S> {
 
     fn warm_rule(&self) -> Option<WarmRule> {
         self.stage.warm_rule()
+    }
+
+    fn states_overlap(&self) -> bool {
+        self.stage.states_overlap()
+    }
+
+    fn said(&self, facts: &RequestFacts<'_>, candidates: &[Candidate], row: u32) -> Overlap {
+        self.stage.said(facts, candidates, row)
     }
 }
 

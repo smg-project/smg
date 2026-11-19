@@ -44,6 +44,9 @@ pub struct Pair {
 pub struct Targets {
     items: [Target; MAX_TARGETS],
     len: u8,
+    /// What the profile's prefix stage says of the first target
+    /// ([`Pick::overlap`]), in the bytes the count left spare.
+    overlap: Overlap,
 }
 
 impl Targets {
@@ -56,7 +59,14 @@ impl Targets {
                 pair: None,
             }; MAX_TARGETS],
             len: 0,
+            overlap: Overlap::NONE,
         }
+    }
+
+    /// States what the first target holds of the request. A list led anew
+    /// ([`Self::lead`]) says nothing of its new first target.
+    pub(crate) fn state(&mut self, overlap: Overlap) {
+        self.overlap = overlap;
     }
 
     /// Append a target; a list already full keeps what it has.
@@ -67,8 +77,11 @@ impl Targets {
         }
     }
 
+    /// Empties the list. What was stated of its first target goes with it
+    /// ([`Pick::overlap`]).
     pub fn clear(&mut self) {
         self.len = 0;
+        self.overlap = Overlap::NONE;
     }
 
     /// Puts `target` first and keeps the others behind it in their order; a
@@ -245,6 +258,60 @@ impl Trace {
     }
 }
 
+/// Where the blocks a pick's first target holds were read ([`Overlap`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum OverlapSource {
+    /// Nothing is held, or no stage said.
+    #[default]
+    None,
+    /// The event index.
+    Index,
+    /// The sent-prefix predictor.
+    Predictor,
+}
+
+/// What a profile's prefix stage says of a pick's first target: how many
+/// leading blocks of the request the worker holds, of how many, and where
+/// they were read. A host observes its cache series from it: the share
+/// held is `blocks` over `of`, and a miss reads zero of `of`. `of` is zero
+/// only where no stage said: the profile holds no such stage, or the
+/// decision was made at an entry that asks none
+/// ([`Engine::decide_stated`](crate::Engine::decide_stated) asks). A
+/// stage counts a request as one block at the least.
+///
+/// Six bytes, in bytes a pick's targets had spare behind their count: a
+/// pick is no larger for it ([`Pick::overlap`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Overlap {
+    /// The leading blocks the worker holds, by the stage's source: the
+    /// index's, the predictor's past the stage's threshold, the larger of
+    /// the two under `merged`. Halved with `of` where the request's count
+    /// is past sixteen bits.
+    pub blocks: u16,
+    /// The request's blocks as the stage counts them. A request of more
+    /// than 65,535 halves this count and `blocks` together until it fits,
+    /// so their share stays true.
+    pub of: u16,
+    /// Where `blocks` was read: the index on a tie under `merged`.
+    pub source: OverlapSource,
+    /// The held prefix's price kept the worker in front: a deepest holder
+    /// that stood over the swing's margin and under the priced one, at the
+    /// mean its pass judged by. `false` under a document that prices no
+    /// margin, and for a decode phase.
+    pub margin_held: bool,
+}
+
+impl Overlap {
+    /// No stage said.
+    pub const NONE: Self = Self {
+        blocks: 0,
+        of: 0,
+        source: OverlapSource::None,
+        margin_held: false,
+    };
+}
+
 /// A pick: ordered targets, the trace, and what a sessions rule did with
 /// the request's key (`None` without one). The host copies that verdict
 /// onto the lease it commits, and fills the lease's session from the
@@ -255,6 +322,14 @@ pub struct Pick {
     pub targets: Targets,
     pub trace: Trace,
     pub session_verdict: SessionVerdict,
+}
+
+impl Pick {
+    /// What the profile's prefix stage says of the first target
+    /// ([`Overlap`]); nothing where no stage said.
+    pub const fn overlap(&self) -> Overlap {
+        self.targets.overlap
+    }
 }
 
 /// A shed: the reason, the stage that emptied the pool, and the pacing hint.
@@ -318,6 +393,48 @@ mod tests {
         assert_eq!(size_of::<Lifted>(), 1);
         assert_eq!(size_of::<Trace>(), 72);
         assert_eq!(Trace::default().lifted, Lifted::None);
+    }
+
+    /// The overlap costs the pick no byte: it shares the eight bytes the
+    /// targets' count stood alone in, a pick no stage spoke of reads none,
+    /// and a list led anew or cleared says nothing of a first target.
+    #[test]
+    fn the_overlap_costs_the_pick_no_byte() {
+        assert_eq!(size_of::<Overlap>(), 6);
+        assert_eq!(size_of::<Targets>(), MAX_TARGETS * size_of::<Target>() + 8);
+        assert_eq!(
+            size_of::<Pick>(),
+            size_of::<Targets>() + size_of::<Trace>() + size_of::<SessionVerdict>()
+        );
+        assert_eq!(Pick::default().overlap(), Overlap::NONE);
+        assert_eq!(Overlap::default(), Overlap::NONE);
+        let held = Overlap {
+            blocks: 3,
+            of: 4,
+            source: OverlapSource::Index,
+            margin_held: false,
+        };
+        let mut targets = Targets::new();
+        for position in 0..2u32 {
+            targets.push(Target {
+                position,
+                id: WorkerId(u64::from(position) + 1),
+                dp_rank: 0,
+                pair: None,
+            });
+        }
+        targets.state(held);
+        let mut pick = Pick {
+            targets,
+            ..Pick::default()
+        };
+        assert_eq!(pick.overlap(), held);
+        let second = *pick.targets.as_slice().last().expect("two targets");
+        pick.targets.lead(second);
+        assert_eq!(pick.overlap(), Overlap::NONE);
+        pick.targets.state(held);
+        pick.targets.clear();
+        assert_eq!(pick.overlap(), Overlap::NONE);
     }
 
     #[test]

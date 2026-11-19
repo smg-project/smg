@@ -249,6 +249,97 @@ pub(crate) fn entry<A: Asked>(world: &World, taken: &Taken<'_, A>) -> Entry {
     }
 }
 
+/// The engine's decision over one view of [`hand`]'s, with what a pick's
+/// lease takes of its request. Over rows the store named it is made at the
+/// entry that states what the pick's first target holds of them
+/// ([`Engine::decide_stated`]), and over any other view at the plain entry.
+struct ByEngine<'a>(&'a Engine);
+
+impl ByEngine<'_> {
+    // Forced into each form's one call: out of line the plain form would
+    // pay a call the closure it stands for never made.
+    #[inline(always)]
+    fn decided<const STATED: bool>(
+        self,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        candidates: &[Candidate],
+        constraints: &Constraints<'_>,
+        scratch: &mut Scratch,
+    ) -> (Decision, Option<Booking>) {
+        let engine = self.0;
+        if candidates.is_empty() && pool.pool_size > 0 {
+            // What the gateway states of itself left none of a pool
+            // that has rows: said under that constraint's name, where
+            // the engine would name no stage.
+            let emptied_by = if constraints.subset_hint == Some(0) {
+                SUBSET_HINT
+            } else {
+                WIRES
+            };
+            let none = shed(
+                ShedReason::NoEndpoints,
+                emptied_by,
+                facts.seed,
+                pool.generation,
+            );
+            return (none, None);
+        }
+        let decision = if STATED {
+            engine.decide_stated(facts, pool, candidates, constraints, scratch)
+        } else {
+            engine.decide(facts, pool, candidates, constraints, scratch)
+        };
+        // What a pick's lease takes of its request, read where the
+        // request stands as the engine read it.
+        let booking = decision.pick().and_then(|pick| {
+            Some(Booking {
+                target: pick.targets.first()?.id,
+                picked: Picked::of(&pick.targets),
+                verdict: pick.session_verdict,
+                // The scratch holds this decision's rule's TTL where
+                // a rule governed the pick, and an earlier decision's
+                // where none did.
+                ttl_micros: if pick.session_verdict == SessionVerdict::None {
+                    None
+                } else {
+                    scratch.session_ttl_micros()
+                },
+                generation: pick.trace.generation,
+                session: facts.session(),
+                tokens: facts.prompt_tokens,
+                now_micros: facts.now_micros,
+                built: None,
+            })
+        });
+        (decision, booking)
+    }
+}
+
+impl Decides<(Decision, Option<Booking>)> for ByEngine<'_> {
+    fn over(
+        self,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        candidates: &[Candidate],
+        constraints: &Constraints<'_>,
+        scratch: &mut Scratch,
+    ) -> (Decision, Option<Booking>) {
+        self.decided::<false>(facts, pool, candidates, constraints, scratch)
+    }
+
+    fn over_named(
+        self,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        candidates: &[Candidate],
+        constraints: &Constraints<'_>,
+        scratch: &mut Scratch,
+    ) -> (Decision, Option<Booking>) {
+        self.decided::<true>(facts, pool, candidates, constraints, scratch)
+    }
+}
+
 /// The engine's decision over the world of one load, for a request that
 /// is no side of a pair plan ([`Entry::Single`]): the rows and the engine
 /// are of one publication. What the decision counts, it counts in `own`,
@@ -265,55 +356,7 @@ pub(crate) fn decide_in<A: Asked>(
     if taken.request.hashes() > taken.request.hashes_read(spec) {
         own.hashes_cut.fetch_add(1, Ordering::Relaxed);
     }
-    let ((decision, booking), built) = hand(
-        world,
-        taken,
-        buffers,
-        &own.undialed,
-        |facts, pool, candidates, constraints, scratch| {
-            if candidates.is_empty() && pool.pool_size > 0 {
-                // What the gateway states of itself left none of a pool
-                // that has rows: said under that constraint's name, where
-                // the engine would name no stage.
-                let emptied_by = if constraints.subset_hint == Some(0) {
-                    SUBSET_HINT
-                } else {
-                    WIRES
-                };
-                let none = shed(
-                    ShedReason::NoEndpoints,
-                    emptied_by,
-                    facts.seed,
-                    pool.generation,
-                );
-                return (none, None);
-            }
-            let decision = engine.decide(facts, pool, candidates, constraints, scratch);
-            // What a pick's lease takes of its request, read where the
-            // request stands as the engine read it.
-            let booking = decision.pick().and_then(|pick| {
-                Some(Booking {
-                    target: pick.targets.first()?.id,
-                    picked: Picked::of(&pick.targets),
-                    verdict: pick.session_verdict,
-                    // The scratch holds this decision's rule's TTL where
-                    // a rule governed the pick, and an earlier decision's
-                    // where none did.
-                    ttl_micros: if pick.session_verdict == SessionVerdict::None {
-                        None
-                    } else {
-                        scratch.session_ttl_micros()
-                    },
-                    generation: pick.trace.generation,
-                    session: facts.session(),
-                    tokens: facts.prompt_tokens,
-                    now_micros: facts.now_micros,
-                    built: None,
-                })
-            });
-            (decision, booking)
-        },
-    );
+    let ((decision, booking), built) = hand(world, taken, buffers, &own.undialed, ByEngine(engine));
     (
         decision,
         booking.map(|booking| Booking { built, ..booking }),
@@ -647,6 +690,54 @@ pub(crate) fn shed(
     })
 }
 
+/// How a decision is made over the view [`hand`] reads, in two forms: over
+/// rows of which no stage of the profile's own reads the holdings, and
+/// over rows the store named for the profile's own affinity stages. A
+/// function of the view decides alike over both. A decider that says more
+/// of a decision over named rows writes the second form, and [`hand`] asks
+/// it at a call of its own, so a decision that names no row meets no test
+/// for it.
+pub(crate) trait Decides<R> {
+    fn over(
+        self,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        candidates: &[Candidate],
+        constraints: &Constraints<'_>,
+        scratch: &mut Scratch,
+    ) -> R;
+
+    fn over_named(
+        self,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        candidates: &[Candidate],
+        constraints: &Constraints<'_>,
+        scratch: &mut Scratch,
+    ) -> R
+    where
+        Self: Sized,
+    {
+        self.over(facts, pool, candidates, constraints, scratch)
+    }
+}
+
+impl<R, F> Decides<R> for F
+where
+    F: FnOnce(&RequestFacts<'_>, &PoolFacts<'_>, &[Candidate], &Constraints<'_>, &mut Scratch) -> R,
+{
+    fn over(
+        self,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        candidates: &[Candidate],
+        constraints: &Constraints<'_>,
+        scratch: &mut Scratch,
+    ) -> R {
+        self(facts, pool, candidates, constraints, scratch)
+    }
+}
+
 /// What [`hand`] reads of a pool for one request: the pool's facts, the
 /// decision's instant in the rows' clock, the rows, the mask of the asking
 /// gateway's vetoes beside lent rows with the rows of it a hold stands on,
@@ -686,7 +777,8 @@ type Read<'a> = (
 /// holder and every warming row where it takes none
 /// ([`Engine::named_for`](crate::framework::Engine::named_for)). The
 /// naming is the store's one reader of its index: the column it builds
-/// holds a row's age and no holder.
+/// holds a row's age and no holder. Over the rows it named the decision
+/// is asked in the decider's form for them ([`Decides::over_named`]).
 ///
 /// A request whose profile holds a stage that may refuse by a report of
 /// leases ([`Filter::refuses_by_reports`](crate::framework::Filter::refuses_by_reports))
@@ -697,13 +789,7 @@ pub(crate) fn hand<A: Asked, R>(
     taken: &Taken<'_, A>,
     buffers: &mut Buffers<A::Lists>,
     undialed: &AtomicU64,
-    decide: impl FnOnce(
-        &RequestFacts<'_>,
-        &PoolFacts<'_>,
-        &[Candidate],
-        &Constraints<'_>,
-        &mut Scratch,
-    ) -> R,
+    decide: impl Decides<R>,
 ) -> (R, Option<Built>) {
     let Taken {
         request,
@@ -828,6 +914,17 @@ pub(crate) fn hand<A: Asked, R>(
         )
     };
     let (stalled, held) = masks;
+    let viewed = Viewed {
+        now_micros,
+        budget_micros: u32::try_from(left.as_micros()).unwrap_or(u32::MAX),
+        affinity,
+        stalled,
+        held,
+        in_flight: counts,
+        max_block_hashes: request.hashes_read(spec),
+        named: None,
+        pins,
+    };
     if names {
         // A row is named by its place among the rows the decision is made
         // over: the lent rows, or the built ones after their narrowing.
@@ -843,20 +940,20 @@ pub(crate) fn hand<A: Asked, R>(
             now_micros,
         };
         world.name(model, role, &naming, candidates, named);
+        // Over the rows it named the decider is asked in its form for
+        // them, at this arm's own call: a decision that names no row
+        // meets no test for it.
+        let viewed = Viewed {
+            named: Some(named.affinity()),
+            ..viewed
+        };
+        let answer = request.read(lists, viewed, |facts, constraints| {
+            decide.over_named(facts, &pool, candidates, constraints, scratch)
+        });
+        return (answer, built);
     }
-    let viewed = Viewed {
-        now_micros,
-        budget_micros: u32::try_from(left.as_micros()).unwrap_or(u32::MAX),
-        affinity,
-        stalled,
-        held,
-        in_flight: counts,
-        max_block_hashes: request.hashes_read(spec),
-        named: names.then(|| named.affinity()),
-        pins,
-    };
     let answer = request.read(lists, viewed, |facts, constraints| {
-        decide(facts, &pool, candidates, constraints, scratch)
+        decide.over(facts, &pool, candidates, constraints, scratch)
     });
     (answer, built)
 }

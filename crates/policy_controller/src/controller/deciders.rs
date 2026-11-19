@@ -1181,16 +1181,17 @@ pub(crate) mod tests {
             wire::{self, Checked},
         },
         decider::Decider,
-        decision::{Decision, Targets},
-        door::{cut_reach, hand, keeps_a_row, narrow, pair_in, Door, Request, TERM_MARK},
+        decision::{Decision, Overlap, OverlapSource, Pick, Targets},
+        door::{self, cut_reach, keeps_a_row, narrow, pair_in, Asked, Door, Request, TERM_MARK},
         elector::{Elector, Tick, TERM_CEILING},
         framework::{DecisionScope, Filter, Picker, Scratch, TieBand},
         lease::{Lease, LeaseId, Lifecycle, ReleaseReason},
         proto::{self, busy::Reason, decide_answer::Answer, decision::Outcome},
         spec::{AppliedSpec, PolicySpec, PowerOfTwoMetric},
         store::{
-            leases::DISPATCH_TTL, Ask, Dispatch, GatewayId, HealthSink, LeaseState, LeasesStore,
-            MemoryStore, Said, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
+            leases::DISPATCH_TTL, Ask, Built, Dispatch, GatewayId, HealthSink, LeaseState,
+            LeasesStore, MemoryStore, Said, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
+            World,
         },
         view::{
             fingerprint, AffinityFacts, Candidate, Constraints, PoolFacts, RequestFacts, Role,
@@ -1207,6 +1208,24 @@ pub(crate) mod tests {
     pub(crate) const BUDGET: Duration = Duration::from_secs(5);
     /// Past the renew deadline of the bed's election.
     const FENCED: Duration = Duration::from_secs(1_801);
+
+    /// The door's hand for a decider of one form: a case's function of the
+    /// view decides alike over rows the store named and over any other.
+    fn hand<A: Asked, R>(
+        world: &World,
+        taken: &Taken<'_, A>,
+        buffers: &mut Buffers<A::Lists>,
+        undialed: &AtomicU64,
+        decide: impl FnOnce(
+            &RequestFacts<'_>,
+            &PoolFacts<'_>,
+            &[Candidate],
+            &Constraints<'_>,
+            &mut Scratch,
+        ) -> R,
+    ) -> (R, Option<Built>) {
+        door::hand(world, taken, buffers, undialed, decide)
+    }
 
     /// Waits until what a handed frame changes shows, [`PATIENCE`] at
     /// most. The frame's file applies it by its decider, as that leaves
@@ -5068,6 +5087,94 @@ pub(crate) mod tests {
         );
         let spread: BTreeSet<Option<WorkerId>> = (1..=32).map(|seed| asked(999, seed)).collect();
         assert!(spread.len() > 1, "a block nobody holds: {spread:?}");
+    }
+
+    /// A decision over rows the store named states what its first target
+    /// holds of the request: the holder's block of the request's, read
+    /// from the index, and nothing held where the block is nobody's. The
+    /// engine's plain entry states nothing over the same rows, and under a
+    /// profile with no prefix stage a pick states nothing.
+    #[test]
+    fn a_decision_states_what_its_first_target_holds_of_the_request() {
+        let stated = |score: &str, block: u64, view: &str| {
+            let document: PolicySpec = serde_json::from_str(&format!(
+                r#"{{
+                  "apiVersion": "smg.policy/v1",
+                  "generation": 1,
+                  "view": {view},
+                  "profiles": {{ "p": {{ "score": [{score}], "pick": "best" }} }},
+                  "bindings": [{{ "profile": "p" }}]
+                }}"#
+            ))
+            .expect("a document of this build");
+            let store = MemoryStore::new();
+            store
+                .apply(applied(&document))
+                .expect("above the unbound start");
+            // Eight ready members, each holding a block of its own: the
+            // sixth holds block 1.
+            let members: Vec<WorkerId> = (0..8u64)
+                .map(|n| {
+                    let facts = WorkerFacts {
+                        wire_modes: WireModes::HTTP,
+                        ..WorkerFacts::default()
+                    };
+                    let held = if n == 5 { 1 } else { 100 + n };
+                    let id = held_by(&store, &format!("w{n}"), facts, &[held]);
+                    let row = WorkersStore::get(&store, id).expect("the row");
+                    store
+                        .set_status(id, WorkerStatus::Ready, row.revision)
+                        .expect("the row stands");
+                    id
+                })
+                .collect();
+            store.publish_now();
+            let now = Instant::now() + Duration::from_secs(3);
+            let mut frame = frame(1, 7);
+            let facts = frame.facts.as_mut().expect("the case's frame has facts");
+            facts.block_hashes = vec![block];
+            facts.hash_kind = proto::HashKind::Text.into();
+            let request = checked(frame);
+            let taken = Taken::at(&request, GATEWAY, now, now).expect("budget is left");
+            let mut buffers = Buffers::default();
+            let (decision, _) = store
+                .deciding(|world| door::decide_in(world, &taken, &mut buffers, &Part::default()));
+            let pick = *decision.pick().expect("a pick over eight ready members");
+            // The same rows at the engine's plain entry: no stage is asked.
+            let plain = store.deciding(|world| {
+                let engine = world.spec().engine();
+                hand(
+                    world,
+                    &taken,
+                    &mut buffers,
+                    &AtomicU64::new(0),
+                    |facts, pool, rows, cx, scratch| engine.decide(facts, pool, rows, cx, scratch),
+                )
+                .0
+            });
+            assert_eq!(plain.pick().map(Pick::overlap), Some(Overlap::NONE));
+            let first = pick.targets.first().map(|target| target.id);
+            (first == Some(members[5]), pick.overlap())
+        };
+        let (holder, held) = stated(r#""prefix-affinity""#, 1, "{}");
+        assert!(holder, "the block's one holder is picked");
+        assert_eq!(
+            (held.blocks, held.source, held.margin_held),
+            (1, OverlapSource::Index, false)
+        );
+        assert!(held.of >= 1, "the request's blocks: {held:?}");
+        // Under a limit of the reports' age the stage stands behind the
+        // limit's reader of loads, and says the same.
+        let aged = stated(r#""prefix-affinity""#, 1, r#"{"max_report_age_ms": 1000}"#);
+        assert_eq!(aged, (true, held));
+        let (_, missed) = stated(r#""prefix-affinity""#, 999, "{}");
+        let nothing = Overlap {
+            of: held.of,
+            ..Overlap::default()
+        };
+        assert_eq!(missed, nothing, "a block nobody holds");
+        let (_, unsaid) = stated(r#""least-load""#, 1, "{}");
+        assert_eq!(unsaid, Overlap::default(), "no prefix stage");
     }
 
     /// One document, one pool, one answer on both feeds: served, the rows
