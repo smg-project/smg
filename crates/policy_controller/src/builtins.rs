@@ -4896,6 +4896,52 @@ mod tests {
         assert!(scores[0] > scores[1] && scores[1] > scores[2], "{scores:?}");
     }
 
+    /// A row whose report states no rate drains at the mean rate of the
+    /// rows that state one, wherever it stands among them: here it is the
+    /// first kept row. Its peers state 8,000 and 1,000 tokens a second, so
+    /// its four running requests wait 4 x 1,024 / 4,500 = 0.91 s, ahead of
+    /// the peer whose one request waits 1.02 s. At the default of 2,000
+    /// they would wait 2.05 s, behind it.
+    #[test]
+    fn a_first_row_without_a_rate_drains_at_the_mean_of_the_rows_behind_it() {
+        let ll = LeastLoad::new(0.15, 1024, 2000.0);
+        let mut pool = [candidate(0, 0), candidate(1, 0), candidate(2, 0)];
+        pool[0].load = Some(LoadRow {
+            live_rate: 0,
+            ..report(4, 0)
+        });
+        pool[1].load = Some(LoadRow {
+            live_rate: 8_000,
+            ..report(0, 0)
+        });
+        pool[2].load = Some(LoadRow {
+            live_rate: 1_000,
+            ..report(1, 0)
+        });
+        let mut scores = [0.0f32; 3];
+        ll.score(&RequestFacts::default(), &pool, &kept(3), &mut scores);
+        assert!(scores[1] > scores[0] && scores[0] > scores[2], "{scores:?}");
+    }
+
+    /// Reports that state no rate at all drain at the default rate, a
+    /// number: the rows rank by their work.
+    #[test]
+    fn a_fleet_whose_reports_state_no_rate_ranks_by_its_work() {
+        let ll = LeastLoad::new(0.15, 1024, 2000.0);
+        let mut pool = [candidate(0, 0), candidate(1, 0)];
+        pool[0].load = Some(LoadRow {
+            live_rate: 0,
+            ..report(2, 0)
+        });
+        pool[1].load = Some(LoadRow {
+            live_rate: 0,
+            ..report(1, 0)
+        });
+        let mut scores = [0.0f32; 2];
+        ll.score(&RequestFacts::default(), &pool, &kept(2), &mut scores);
+        assert_eq!(scores, [0.0, 1.0]);
+    }
+
     #[test]
     fn kv_pressure_raises_the_cost_of_an_otherwise_equal_worker() {
         let ll = LeastLoad::new(0.15, 1024, 2000.0);
