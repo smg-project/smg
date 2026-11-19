@@ -3677,12 +3677,17 @@ impl Writer {
             .retain_mut(|world| Arc::get_mut(world).is_none());
         let unlisted = |rows: &mut Arc<[Candidate]>| Arc::get_mut(rows).is_some();
         self.unlisted.extend(self.held.extract_if(.., unlisted));
+        // One count a pool: every membership write takes the list again.
+        debug_assert_eq!(self.unreported.len(), self.working.len());
         let pools = self.working.iter_mut().zip(&mut self.published);
-        // The counts this publication moves, copied once: the worlds that
-        // list the old counts keep them.
-        let mut moved: Option<Vec<u32>> = None;
+        // Whether this publication moves a count. The list is then taken
+        // once more from the pools: the worlds that list the old counts
+        // keep them.
+        let mut moved = false;
         for (at, ((pool, published), spare)) in pools.zip(&mut self.spares).enumerate() {
             if !pool.dirty {
+                // No write touched this pool: it holds the count listed.
+                debug_assert_eq!(self.unreported.get(at), Some(&pool.unreported));
                 continue;
             }
             let mut next = spare.take();
@@ -3703,15 +3708,11 @@ impl Writer {
             // The count the writes kept: no row is passed over for it.
             let count = pool.unreported;
             debug_assert_eq!(count, unreported(&pool.rows));
-            if self.unreported.get(at) != Some(&count) {
-                let counts = moved.get_or_insert_with(|| self.unreported.to_vec());
-                if let Some(held) = counts.get_mut(at) {
-                    *held = count;
-                }
-            }
+            moved |= self.unreported.get(at) != Some(&count);
         }
-        if let Some(counts) = moved {
-            self.unreported = counts.into();
+        if moved {
+            // One allocation: the counts go straight into their shared list.
+            self.unreported = self.working.iter().map(|pool| pool.unreported).collect();
         }
         // Rows no world lists and no pool took are freed here, by a write.
         self.unlisted.clear();
