@@ -26,7 +26,7 @@
 //! The pre-tokenizer of the GPT-4 family (Qwen 2 and 3, Llama 3, GLM 4.6
 //! and their kin ship one template, the digit rule's bound apart) is matched
 //! by a [`Scanner`] instead of the program, and the cased-letter template
-//! (gpt-oss, Llama 4, MiniMax and their kin) by [`cased::Scanner`]: each
+//! (gpt-oss, Llama 4, MiniMax, Kimi and their kin) by [`cased::Scanner`]: each
 //! alternative is decided at a position by a few class tests and class runs,
 //! which is what the backtracking engine arrives at for that shape, so the
 //! pieces are the same and no character is interpreted op by op. A scanner
@@ -4983,15 +4983,7 @@ mod tests {
         const SWAPPED: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+|\s+(?!\S)";
         const TWO_OR_MORE: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{2,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
         const LEAD_IN_RUN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]*\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
-        for pattern in [
-            DIGITS,
-            CJK,
-            DEEPSEEK,
-            KIMI,
-            SWAPPED,
-            TWO_OR_MORE,
-            LEAD_IN_RUN,
-        ] {
+        for pattern in [DIGITS, CJK, DEEPSEEK, SWAPPED, TWO_OR_MORE, LEAD_IN_RUN] {
             assert!(
                 matches!(
                     Pattern::parse(pattern).expect("parses").matcher,
@@ -5045,9 +5037,10 @@ mod tests {
     /// templates: the template's letter run is the letters, the cased
     /// template's upper and lower runs are the upper-case and the lower-case
     /// letters, and the white-space runs of both are the white space; the
-    /// digit, punctuation and line-break roles run byte by byte. A class
-    /// change that dropped a scan would keep the ids and lose the gain; it
-    /// fails here instead.
+    /// digit, punctuation and line-break roles and the opening run of the
+    /// Kimi template run byte by byte, and that template keeps the scans of
+    /// its letter and white-space runs. A class change that dropped a scan
+    /// would keep the ids and lose the gain; it fails here instead.
     #[test]
     fn the_run_sites_name_the_scans_their_roles_carry() {
         for pattern in [CL100K, QWEN2, QWEN35, TWO_DIGITS, ANY_DIGITS] {
@@ -5076,7 +5069,7 @@ mod tests {
                 );
             }
         }
-        for pattern in [CASED, TEKKEN, CASED_ONE_DIGIT] {
+        for pattern in [CASED, TEKKEN, CASED_ONE_DIGIT, KIMI] {
             let parsed = Pattern::parse(pattern).expect("parses");
             let Matcher::Cased(scanner) = &parsed.matcher else {
                 panic!("the cased template takes its scanner: {pattern}");
@@ -5108,6 +5101,7 @@ mod tests {
                 cased::Role::Punct,
                 cased::Role::PunctBreak,
                 cased::Role::Break,
+                cased::Role::Run,
             ] {
                 assert_eq!(
                     roles.scan_of(role.bit()),
@@ -5118,15 +5112,19 @@ mod tests {
         }
     }
 
-    /// The cased-letter template with the clitic group, without it and with
-    /// one digit at a time, and no other shape: the group in one letter
-    /// alternative only, the letter alternatives the other way round, a
-    /// required lead-in, a non-optional group.
+    /// The cased-letter template with the clitic group, without it, with
+    /// one digit at a time and behind the Kimi template's run of
+    /// ideographs, and no other shape: the group in one letter alternative
+    /// only, the letter alternatives the other way round, a required
+    /// lead-in, a non-optional group.
     #[test]
     fn the_cased_template_takes_its_scanner_and_no_other_shape_does() {
-        for (pattern, digit_cap, clitics) in
-            [(CASED, 3, 7), (TEKKEN, 1, 0), (CASED_ONE_DIGIT, 1, 7)]
-        {
+        for (pattern, digit_cap, clitics) in [
+            (CASED, 3, 7),
+            (TEKKEN, 1, 0),
+            (CASED_ONE_DIGIT, 1, 7),
+            (KIMI, 3, 7),
+        ] {
             let parsed = Pattern::parse(pattern).expect("parses");
             let Matcher::Cased(scanner) = &parsed.matcher else {
                 panic!("the cased template takes its scanner: {pattern}");
@@ -5144,13 +5142,75 @@ mod tests {
             LEAD_IN_REQUIRED,
             GROUP_REQUIRED,
             CL100K,
-            KIMI,
             NUMBER_GROUPS,
         ] {
             assert!(
                 !matches!(
                     Pattern::parse(pattern).expect("parses").matcher,
                     Matcher::Cased(_)
+                ),
+                "{pattern}"
+            );
+        }
+    }
+
+    /// The run a cased template may open with. A template whose first
+    /// alternative is a run of a class no letter body begins with takes the
+    /// scanner: the Kimi template, and the template behind a run of symbols
+    /// (lead-ins and punctuation as well) or of numbers (digits as well).
+    /// Its role table holds the run's role and no lead-in for a character
+    /// of it; the tables of a template without the run hold no character of
+    /// the role. A run that shares a character with the letter classes a
+    /// body begins with (ideographs left in them, capitals, small letters),
+    /// a run that is not the first alternative, a second run, and a first
+    /// alternative that is possessive, bounded or one character keep the
+    /// program.
+    #[test]
+    fn the_cased_template_takes_an_opening_run_no_letter_body_begins_with() {
+        let run = cased::Role::Run.bit();
+        let leads = cased::Role::Lead1.bit() | cased::Role::Lead2.bit();
+        let roles_of = |pattern: &str| {
+            let parsed = Pattern::parse(pattern).expect("parses");
+            let Matcher::Cased(scanner) = &parsed.matcher else {
+                panic!("the cased template takes its scanner: {pattern}");
+            };
+            scanner.roles().clone()
+        };
+        let symbols = format!(r"\p{{S}}+|{CASED}");
+        let numbers = format!(r"\p{{N}}+|{TEKKEN}");
+        for pattern in [KIMI, symbols.as_str(), numbers.as_str()] {
+            let roles = roles_of(pattern);
+            assert!(roles.some_char_holds_both(run, run), "{pattern}");
+            assert!(!roles.some_char_holds_both(run, leads), "{pattern}");
+        }
+        // A radical is a lead-in and punctuation, a Han numeral a digit, a
+        // symbol a lead-in: the classes the three runs overlap.
+        let kimi = roles_of(KIMI);
+        assert!(kimi.some_char_holds_both(run, cased::Role::Punct.bit()));
+        assert!(kimi.some_char_holds_both(run, cased::Role::Digit.bit()));
+        assert!(kimi.some_char_holds_both(leads, cased::Role::Punct.bit()));
+        for pattern in [CASED, TEKKEN, CASED_ONE_DIGIT] {
+            assert!(
+                !roles_of(pattern).some_char_holds_both(run, run),
+                "{pattern}"
+            );
+        }
+        let (opening, seven) = KIMI.split_once('|').expect("the opening run");
+        assert_eq!(opening, r"[\p{Han}]+");
+        for pattern in [
+            format!(r"[\p{{Han}}]+|{CASED}"),
+            format!(r"\p{{Lu}}+|{CASED}"),
+            format!(r"\p{{Ll}}+|{CASED}"),
+            format!("{seven}|{opening}"),
+            format!(r"\p{{S}}+|{KIMI}"),
+            format!(r"[\p{{Han}}]++|{seven}"),
+            format!(r"[\p{{Han}}]{{1,8}}|{seven}"),
+            format!(r"[\p{{Han}}]|{seven}"),
+        ] {
+            assert!(
+                matches!(
+                    Pattern::parse(&pattern).expect("parses").matcher,
+                    Matcher::Program
                 ),
                 "{pattern}"
             );
@@ -5457,6 +5517,92 @@ mod tests {
                     oracle_matches(pattern, &text),
                     "the engine; pattern {pattern:?} text {text:?}"
                 );
+            }
+        }
+    }
+
+    /// A template that opens with a run is cut by the scanner as by its
+    /// program and by the engine: the Kimi template, and the cased template
+    /// behind a run of symbols and behind a run of numbers. The text is
+    /// built of every class the Kimi template tells apart: ideographs of
+    /// the plane, of its extension and compatibility blocks and above it;
+    /// the Han characters that are no letters (iteration marks, numerals,
+    /// radicals), which are a run of their own where a piece starts and a
+    /// letter, a digit or punctuation inside one that began before them;
+    /// kana, Hangul and CJK punctuation, which are not Han; letter runs of
+    /// every case structure, in several scripts, with marks, some longer
+    /// than a word of the word scans; digits of several kinds; white space
+    /// and line ends; punctuation; the clitics in both cases and near
+    /// misses of them; and those classes side by side. Each text is read
+    /// through the iterator and through the loop with and without the word
+    /// scans, and one text in sixteen again cut at every character, from
+    /// the start and to the end.
+    #[test]
+    fn a_template_that_opens_with_a_run_cuts_as_the_program_and_the_engine_do() {
+        const PARTS: &[&str] = &[
+            "中", "中文", "汉字", "漢字", "㐀", "豈", "𠀀", "𮯰", "々", "〻", "〇", "〡", "〸",
+            "⺀", "⿕", "あ", "ア", "ー", "한", "。", "、", "〆", "a", "word", "Word", "WORD",
+            "wORD", "iPhone", "McDonald", "é", "É", "ß", "ſ", "ǅx", "xǅ", "ʰa", "Aʰ", "я", "Я",
+            "α", "Ω", "ก", "क", "ा", "\u{301}", "\u{93E}", "1", "22", "333", "4444", "٣", "²", "Ⅷ",
+            " ", "  ", "\t", "\n", "\n\n", "\r\n", "\u{A0}", "\u{2028}", "\u{3000}", ".", ",", "!",
+            "?", "-", "_", "(", ")", "[", "]", "{", "}", "\"", "/", "...", "，", "😀", "\u{200D}",
+            "\u{FE0F}", "\u{FFFD}", "'", "'s", "'S", "'t", "'re", "'RE", "'ve", "'m", "'ll", "'LL",
+            "'d", "'x", "'ſ", "’s", "中A", "A中", "a中b", "中1", "1〇", "〇1", "!⺀", "⺀!", "⺀a",
+            " 中", "中 ", "中's", "中\n", "\n中",
+        ];
+        // Runs longer than a word of the word scans.
+        const LONG: &[&str] = &[
+            "abcdefghijklmnopqrstuvwxyz",
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+            "HTTPServer",
+            "          ",
+        ];
+        let parts: Vec<&str> = PARTS.iter().chain(LONG).copied().collect();
+        let symbols = format!(r"\p{{S}}+|{CASED}");
+        let numbers = format!(r"\p{{N}}+|{TEKKEN}");
+        let mut state = 0xD1B5_4A32_D192_ED03u64;
+        for pattern in [KIMI, symbols.as_str(), numbers.as_str()] {
+            let parsed = Pattern::parse(pattern).expect("parses");
+            assert!(matches!(parsed.matcher, Matcher::Cased(_)), "{pattern}");
+            let program = parsed.program_only();
+            let engine = SysRegex::new(pattern).expect("the engine compiles the pattern");
+            for round in 0..3000 {
+                let text: String = (0..1 + round % 40)
+                    .map(|_| parts[(pseudo_random(&mut state) % parts.len() as u64) as usize])
+                    .collect();
+                let expected: Vec<(usize, usize)> = engine.find_iter(&text).collect();
+                assert_eq!(
+                    program.find_iter(&text).collect::<Vec<_>>(),
+                    expected,
+                    "the program; pattern {pattern:?} text {text:?}"
+                );
+                assert_eq!(
+                    parsed.find_iter(&text).collect::<Vec<_>>(),
+                    expected,
+                    "the scanner; pattern {pattern:?} text {text:?}"
+                );
+                for words in [false, true] {
+                    let mut ours = Vec::new();
+                    parsed.for_each_match::<false, _>(&text, words, |start, end| {
+                        ours.push((start, end));
+                    });
+                    assert_eq!(
+                        ours, expected,
+                        "the loop, word scans {words}; pattern {pattern:?} text {text:?}"
+                    );
+                }
+                if round % 16 != 0 {
+                    continue;
+                }
+                for (cut, _) in text.char_indices() {
+                    for part in [&text[..cut], &text[cut..]] {
+                        assert_eq!(
+                            parsed.find_iter(part).collect::<Vec<_>>(),
+                            engine.find_iter(part).collect::<Vec<_>>(),
+                            "a cut text; pattern {pattern:?} text {part:?}"
+                        );
+                    }
+                }
             }
         }
     }
