@@ -2031,25 +2031,114 @@ async fn a_worker_at_a_lost_pushers_address_starts_a_report_of_its_own() {
 }
 
 /// A worker registered at a lost pusher's address that pushes before the
-/// reset pushes onto its predecessor's report. The reset still evicts that
-/// report, and the worker's next record starts one of its own.
+/// reset starts a report of its own with that record: the predecessor's
+/// rank and receipts are gone at once, and the reset keeps the report.
 #[tokio::test]
-async fn a_reset_evicts_the_report_a_successor_pushed_onto() {
+async fn a_record_ahead_of_the_reset_starts_the_successors_own_report() {
     let (registry, monitor, id) = a_pusher_no_event_reaches();
     registry.remove(&id);
     let next = ready_worker("http://w:1", "m");
     registry.register(Arc::clone(&next)).unwrap();
+
     monitor.apply_pushed_load(&next, 0, &pushed(3), Instant::now());
 
+    assert_eq!(on_file(&monitor), (true, false), "no receipt of rank 1");
+    assert_eq!(published_rows(&monitor), vec![(0, 3)]);
     monitor.stop_all_groups();
-
-    assert_eq!(on_file(&monitor), (false, false));
-    monitor.apply_pushed_load(&next, 0, &pushed(3), Instant::now());
     assert_eq!(
         rows(&monitor.pushed_reports.lock()["http://w:1"].report),
         vec![(0, 3)],
-        "the predecessor's rank 1 is gone"
+        "the reset keeps the report of the registry's worker"
     );
+}
+
+/// A pusher of ranks 0 and 1 that was replaced, with its event still to
+/// come: the monitor, the replaced worker and its replacement.
+fn a_replaced_pusher_ahead_of_its_event() -> (Arc<WorkerMonitor>, Arc<dyn Worker>, Arc<dyn Worker>)
+{
+    let (registry, monitor, id) = a_pusher_no_event_reaches();
+    let replaced = registry.get(&id).unwrap();
+    let next = ready_worker("http://w:1", "m");
+    assert!(registry.replace(&id, Arc::clone(&next)));
+    (monitor, replaced, next)
+}
+
+/// A successor's stream can push before the monitor handles its
+/// predecessor's event. Its first record starts a report of its own: it
+/// holds and publishes its own rank alone, and the predecessor's receipts
+/// are gone.
+#[tokio::test]
+async fn a_successors_record_ahead_of_its_predecessors_event_starts_its_own_report() {
+    let (monitor, _replaced, next) = a_replaced_pusher_ahead_of_its_event();
+
+    monitor.apply_pushed_load(&next, 0, &pushed(9), Instant::now());
+
+    assert_eq!(on_file(&monitor), (true, false), "no receipt of rank 1");
+    assert_eq!(published_rows(&monitor), vec![(0, 9)]);
+}
+
+/// A record of the replaced worker that lands behind its successor's
+/// report is dropped: a report holds its pusher's records alone.
+#[tokio::test]
+async fn a_replaced_workers_record_behind_its_successors_report_is_dropped() {
+    let (monitor, replaced, next) = a_replaced_pusher_ahead_of_its_event();
+    monitor.apply_pushed_load(&next, 0, &pushed(9), Instant::now());
+
+    monitor.apply_pushed_load(&replaced, 1, &pushed(4), Instant::now());
+
+    assert_eq!(
+        rows(&monitor.pushed_reports.lock()["http://w:1"].report),
+        vec![(0, 9)]
+    );
+    assert!(!monitor.has_receipt("http://w:1", 1));
+}
+
+/// The sink is told to forget the worker whose report a successor's record
+/// replaces, ahead of that record.
+#[tokio::test]
+async fn the_sink_forgets_a_replaced_pusher_ahead_of_its_successors_record() {
+    let (registry, monitor, sink) =
+        build_recording(PollMode::Suppressed, PolledRanks::default(), true, false);
+    let first = ready_worker("http://w:1", "m");
+    let id = registry.register(Arc::clone(&first)).unwrap();
+    monitor.apply_pushed_load(&first, 1, &pushed(1), Instant::now());
+    let next = ready_worker("http://w:1", "m");
+    assert!(registry.replace(&id, Arc::clone(&next)));
+    sink.said.lock().clear();
+
+    monitor.apply_pushed_load(&next, 0, &pushed(9), Instant::now());
+
+    let said = sink.said.lock();
+    assert_eq!(said.len(), 2, "{said:?}");
+    assert_eq!(said[0], Said::Forget("http://w:1".to_string()));
+    assert!(
+        matches!(
+            said[1],
+            Said::Record {
+                rank: 0,
+                rows: 1,
+                ..
+            }
+        ),
+        "{said:?}"
+    );
+}
+
+/// A removed worker's late record that lands behind the next worker's
+/// report is dropped: the next flush still publishes the next worker's
+/// rank, and its predecessor's rank never joins it.
+#[tokio::test]
+async fn a_removed_workers_late_record_behind_the_next_workers_report_is_dropped() {
+    let (registry, monitor, gone) = a_pusher_its_event_evicted();
+    let next = ready_worker("http://w:1", "m");
+    registry.register(Arc::clone(&next)).unwrap();
+    monitor.apply_pushed_load(&next, 0, &pushed(9), Instant::now());
+
+    monitor.apply_pushed_load(&gone, 1, &pushed(4), Instant::now());
+
+    assert_eq!(published_rows(&monitor), vec![(0, 9)], "its own rank");
+    monitor.apply_pushed_load(&next, 0, &pushed(9), Instant::now());
+    assert_eq!(published_rows(&monitor), vec![(0, 9)]);
 }
 
 /// A pusher that was removed and that its event evicted: nothing of it is

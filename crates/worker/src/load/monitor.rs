@@ -347,7 +347,8 @@ pub trait LoadConsumer: Send + Sync {
 /// replaced or left `Ready` while registry events were lost is evicted
 /// there ([`WorkerMonitor::evict_lost_pushers`]). The pusher was the
 /// registry's `Ready` worker at the URL when its record started the
-/// report: no other starts one, and no later record writes it.
+/// report, and the report holds that worker's records alone: a record of
+/// any other worker starts it again or is dropped.
 struct PushedFile {
     report: WorkerLoadResponse,
     pusher: Arc<dyn Worker>,
@@ -580,10 +581,10 @@ impl<G: Generation> WorkerMonitor<G> {
     /// against. Negative ranks and records for another virtual worker's rank
     /// are ignored before updating freshness, liveness, metrics or routing
     /// state, and before any reader of the record is called. A record that
-    /// would start a report is dropped unless its worker is the registry's
-    /// `Ready` worker at the URL: ahead of the report, the sink, the series
-    /// and the publish. Its worker is still marked as one whose stream
-    /// pushes, as for any record.
+    /// finds no report, or the report of another worker, starts one for the
+    /// registry's `Ready` worker at the URL alone. Any other is dropped
+    /// ahead of the report, the sink, the series and the publish. Its
+    /// worker is still marked as one whose stream pushes, as for any record.
     pub fn apply_pushed_load<R: LoadRecord>(
         self: &Arc<Self>,
         worker: &Arc<dyn Worker>,
@@ -614,17 +615,27 @@ impl<G: Generation> WorkerMonitor<G> {
         // A worker's entry is made on its first record; the lookup that
         // finds it copies no key.
         let mut reports = self.pushed_reports.lock();
-        if !reports.contains_key(url) {
+        if !reports
+            .get(url)
+            .is_some_and(|file| Arc::ptr_eq(&file.pusher, worker))
+        {
             // A report is on file for the registry's `Ready` worker at its
-            // URL alone, by the publish fence's test. A host ends a worker's
-            // stream after the registry let the worker go, so a record can
-            // land behind the worker's eviction: a report it started would
-            // hold a worker that is gone, and the next worker at the URL
-            // would publish its rows.
+            // URL alone, by the publish fence's test, and holds that
+            // worker's records alone. A host ends a worker's stream after
+            // the registry let the worker go, and starts its successor's
+            // with no word to the monitor. So a record can land behind its
+            // worker's eviction or ahead of its predecessor's: it starts a
+            // report for the registry's worker and is dropped for any other.
             if !self.load_state.is_current_incarnation(worker) {
                 return;
             }
-            reports.insert(url.to_string(), PushedFile::started_by(worker));
+            let started = PushedFile::started_by(worker);
+            if let Some(left) = reports.insert(url.to_string(), started) {
+                // The report replaced was a worker's whose eviction is still
+                // to come. The sink forgets it here, under this hold, so the
+                // receipts are this worker's alone.
+                self.sink.forget(&left.pusher);
+            }
         }
         // On file: made just above when it was not.
         let Some(report) = reports.get_mut(url).map(|file| &mut file.report) else {
@@ -1102,11 +1113,12 @@ impl<G: Generation> WorkerMonitor<G> {
         *self.liveness_sweep_task.lock() = Some(sweep_handle);
     }
 
-    /// Stop every per-group polling loop, evict every pusher an event the
-    /// monitor lost would have ([`Self::evict_lost_pushers`]), clear the
-    /// shared load snapshot and the probe memo, and say the reset to the
-    /// sink ([`LoadSink::reset`]): the monitor's own drops its DP-rank
-    /// cache and fails every overload veto open.
+    /// Stop every per-group polling loop, evict every pusher that is no longer
+    /// the registry's `Ready` worker at its URL
+    /// ([`Self::evict_lost_pushers`]), clear the shared load snapshot and the
+    /// probe memo, and say the reset to the sink ([`LoadSink::reset`]): the
+    /// monitor's own drops its DP-rank cache and fails every overload veto
+    /// open.
     ///
     /// Called from the rebuild from the registry alone, which is the
     /// bootstrap reconcile path and the `RecvError::Lagged` rebuild. The
@@ -1276,8 +1288,10 @@ impl<G: Generation> WorkerMonitor<G> {
     fn evict_worker_loads(&self, worker: &Arc<dyn Worker>) {
         let url = worker.url();
         self.native_loads_memo.remove(url);
-        // The pushed report goes with the worker: a replacement is polled
-        // until its own stream pushes.
+        // The pushed report goes with the worker, by its URL: a replacement
+        // is polled until its own stream pushes. A report the replacement
+        // started ahead of this eviction goes too, and its next record
+        // starts it again.
         self.pushed_reports.lock().remove(url);
         self.sink.forget(worker);
         self.load_state.enqueue_eviction(Arc::clone(worker));
