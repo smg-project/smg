@@ -54,9 +54,9 @@ pub enum Lost {
         /// Why it is refused.
         why: &'static str,
     },
-    /// A page of another snapshot, an event of the tail where a snapshot's
-    /// page is due or at a place not past the last, or a page or a change
-    /// of a stream that lost the place.
+    /// A page of another snapshot or at a place held, an event of the tail
+    /// where a snapshot's page is due or at a place not past the last, or
+    /// a page or a change of a stream that lost the place.
     Order,
     /// The event did not land: the store does not stand where the
     /// controller's stood before it.
@@ -108,8 +108,9 @@ pub struct Following<'w> {
 pub enum Ended {
     /// The watcher lost its place: its next stream starts from a snapshot.
     Lost(Lost),
-    /// The client's error on the stream: the watcher's place stands, and
-    /// its next stream goes on after it.
+    /// The client's error on the stream: what the watcher held stands, and
+    /// its next stream goes on after its place, or starts the snapshot
+    /// again where the stream was cut inside one.
     Client(client::Error),
 }
 
@@ -289,13 +290,14 @@ impl Watcher {
         page: &proto::WorkerSnapshot,
         now: Instant,
     ) -> Result<(), Lost> {
-        // A snapshot's first page ends the place held: cut before its last
-        // page, the watcher asks for a snapshot again.
+        // A snapshot starts where the watcher stands nowhere. A page at a
+        // place held is out of its order: a stream that resumes is told
+        // the tail or the controller's word, and no page follows the tail.
         let mut staged = match mem::replace(&mut self.stands, Stands::Nowhere) {
             // Every page of one snapshot stands at its place.
             Stands::Inside(staged) if staged.at == at && staged.epoch == epoch => staged,
-            Stands::Inside(_) | Stands::LetGo => return Err(Lost::Order),
-            Stands::Nowhere | Stands::At(_) => Staged {
+            Stands::Inside(_) | Stands::At(_) | Stands::LetGo => return Err(Lost::Order),
+            Stands::Nowhere => Staged {
                 at,
                 epoch,
                 rows: Vec::new(),
@@ -528,8 +530,8 @@ mod tests {
     }
 
     /// The controller's word, an event of the tail with no snapshot behind
-    /// it or inside one, a page of another snapshot and an event of no
-    /// known kind each lose the place.
+    /// it or inside one, a page of another snapshot or at a place held, and
+    /// an event of no known kind each lose the place.
     #[test]
     fn the_controllers_word_and_an_event_out_of_its_order_lose_the_place() {
         let mut told = Told::new();
@@ -557,6 +559,10 @@ mod tests {
             let other = worker_wire::event(Event::Snapshot(page), seq, epoch, TERM);
             assert_eq!(watcher.take(&other, now), Err(Lost::Order), "another's");
         }
+        // A page at a place held.
+        let mut watcher = watching(&told, 8);
+        let again = told.pages(8);
+        assert_eq!(watcher.take(&again[0], now), Err(Lost::Order), "held");
         // An event of a kind this build does not know.
         let mut watcher = watching(&told, 8);
         let unknown = proto::WorkerEvent {
@@ -600,9 +606,10 @@ mod tests {
             last: true,
         };
         let page = worker_wire::event(Event::Snapshot(blank), told.seq + 1, 9, TERM);
-        let lost = watcher.take(&page, now);
+        let mut fresh = Watcher::new(Arc::new(MemoryStore::new()));
+        let lost = fresh.take(&page, now);
         assert!(matches!(lost, Err(Lost::Unread { .. })), "{lost:?}");
-        assert_eq!(held(watcher.store()), held(&told.store), "the rows stand");
+        assert_eq!(fresh.at(), None);
 
         let mut watcher = watching(&told, 8);
         let blank = Event::Registered(proto::WorkerRow::default());
@@ -623,7 +630,7 @@ mod tests {
             WorkersStore::upsert(&told.store, facts(&format!("grpc://10.0.0.{n}:8000"), 1));
         }
         let now = Instant::now();
-        let mut watcher = watching(&told, 8);
+        let mut watcher = Watcher::new(Arc::new(MemoryStore::new()));
         WorkersStore::upsert(&told.store, facts("grpc://10.0.0.4:8000", 1));
         let before = held(watcher.store());
         let pages = told.pages(1);

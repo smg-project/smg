@@ -2708,9 +2708,12 @@ async fn a_watch_ends_when_its_controller_goes_silent() {
         assert!(matches!(first, Ok(Ok(true))), "the snapshot: {first:?}");
 
         silent.notify_one();
-        let ended = tokio::time::timeout(ROOM, stream.next())
+        // A ping goes out one keepalive after the last frame read, and the
+        // channel ends one answer's wait after a ping with no answer.
+        let bound = client::KEEPALIVE + client::ANSWER_WAIT + Duration::from_secs(5);
+        let ended = tokio::time::timeout(bound, stream.next())
             .await
-            .expect("a silent controller ends the stream inside the room");
+            .expect("a silent controller ends the stream inside its bound");
         assert!(matches!(ended, Err(Ended::Client(_))), "{ended:?}");
 
         relayed.abort_all();
