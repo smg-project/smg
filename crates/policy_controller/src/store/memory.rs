@@ -757,7 +757,7 @@ impl MemoryStore {
 
     /// [`MemoryStore::apply`], its telling at `at` where a standby's
     /// applier holds that place, and `admit` asked under both its locks
-    /// ([`MemoryStore::apply_admitted`]): `false` where it refused.
+    /// (`MemoryStore::apply_admitted`, a controller's): `false` where it refused.
     fn apply_at(
         &self,
         at: Option<Position>,
