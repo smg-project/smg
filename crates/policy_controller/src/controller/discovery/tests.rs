@@ -211,7 +211,7 @@ async fn a_replica_that_leads_runs_the_provider_and_its_worker_reaches_the_queue
     };
     let (served, added) = tokio::join!(serve, registered);
     served?;
-    let Some(Queued::Add { spec, mode }) = added else {
+    let Some(Queued::Add { spec, mode, .. }) = added else {
         panic!("the leader did not queue the manifest worker");
     };
     assert_eq!(spec.url, WORKER);
@@ -387,7 +387,7 @@ async fn a_row_the_provider_registered_is_not_asked_again_and_one_it_no_longer_l
     // before the row is gone, and the second then asks nothing.
     bed.jobs.hold_after_the_next_read("worker:8000");
     bed.file.publish(&[])?;
-    let Some(Queued::Remove { url, guards }) = bed.wait_for_job(1).await else {
+    let Some(Queued::Remove { url, guards, .. }) = bed.wait_for_job(1).await else {
         panic!("the provider did not remove its departed worker");
     };
     assert_eq!(url, "worker:8000");

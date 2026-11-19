@@ -168,6 +168,8 @@ impl Discovery {
                     let Some(task) = started else {
                         continue;
                     };
+                    // The pause is owed once, to the start behind the end.
+                    ended = None;
                     task
                 }
             };
