@@ -29,6 +29,7 @@ use crate::{
 
 mod encode_classes;
 mod encode_door;
+mod engines;
 mod list_room;
 mod membership_call;
 mod mode_and_overload;

@@ -23,9 +23,11 @@ use crate::{
 };
 
 mod encode;
+mod engines;
 mod vetoed;
 
 pub use encode::{EncodeItems, EncodePlaced, EncodePool, EncoderFacts};
+use engines::{run_engines, run_owned};
 use vetoed::AllVetoed;
 
 /// Drops candidates before scoring. A `soft` filter steps aside when it would
@@ -225,6 +227,37 @@ pub trait Scorer: Lifecycle + Debug {
         false
     }
 
+    /// Whether this scorer places a keyed request by itself
+    /// ([`Self::own`]); the default is no. The engine reads it once per
+    /// profile when it is built, and asks such a scorer first where it is
+    /// the profile's one scorer.
+    fn owns(&self) -> bool {
+        false
+    }
+
+    /// The rows of a request this scorer places by itself, with no pool
+    /// read whole, over a pool whose host lists its engines
+    /// ([`PoolFacts::engines`]): it finds the request's rows by its own
+    /// rule, asks `keep`, every filter of the profile, about each row it
+    /// reads, and leaves in `kept` the rows it hands out, the pick first
+    /// and its alternates after it, each one kept by `keep` and none
+    /// twice. The rows it hands out are the ones the profile's run would,
+    /// in its order: only the rows read differ. On `false` nothing is
+    /// decided, what `kept` holds is dropped and the profile's run
+    /// decides: the scorer places nothing by itself, the request or the
+    /// pool gives it nothing to go by, or its rule ran out. It reads no
+    /// value of the seed's stream.
+    fn own(
+        &self,
+        _facts: &RequestFacts<'_>,
+        _pool: &PoolFacts<'_>,
+        _candidates: &[Candidate],
+        _keep: &mut dyn FnMut(&Candidate) -> bool,
+        _kept: &mut Vec<u32>,
+    ) -> bool {
+        false
+    }
+
     /// How this scorer's values lie ([`Spread`]), asked once when the engine
     /// is built. A scorer that writes levels is a rank where its weight
     /// outweighs every stage behind it: a plain decision then asks those
@@ -348,6 +381,20 @@ pub const RANK_FROM: usize = DRAW_FROM;
 // ranks.
 const _: () = assert!(RANK_FROM == DRAW_FROM);
 
+/// What a picker draws ([`Picker::unit`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Unit {
+    /// A row: a worker, or one rank of a data-parallel worker.
+    #[default]
+    Row,
+    /// An engine: a worker, or the ranks of a data-parallel worker
+    /// together. Over a pool whose host lists its engines
+    /// ([`PoolFacts::engines`]) the picker's draw is over them, and the
+    /// decision reads the rows of the engine it takes and of no other.
+    /// Over any other pool the picker draws rows.
+    Engine,
+}
+
 /// Turns the survivors into ordered targets, in two steps the engine runs
 /// around the scorers: `narrow` names the set the picker compares, the
 /// scorers are handed that set alone, and `pick` orders it. `scores[i]`
@@ -397,6 +444,16 @@ pub trait Picker: Lifecycle + Debug {
     /// asks such a picker to draw over a pool of [`DRAW_FROM`] rows or more.
     fn draws_first(&self) -> bool {
         false
+    }
+
+    /// The unit the picker draws ([`Unit`]); a row by default. The engine
+    /// reads it once per profile when it is built. A picker that says the
+    /// engine draws first ([`Picker::draws_first`]) and compares two rows:
+    /// it is handed the two rows that stand for the engines drawn, through
+    /// [`Picker::order_drawn`], and the engine of the first target it
+    /// pushes is the one taken.
+    fn unit(&self) -> Unit {
+        Unit::Row
     }
 
     /// Finds the rows the picker hands out without the survivors' list: it
@@ -459,6 +516,17 @@ pub trait Picker: Lifecycle + Debug {
     /// every score, so its profile asks every row every stage. The engine
     /// reads it once per profile when it is built.
     fn front_wise(&self) -> bool {
+        false
+    }
+
+    /// Whether the picker compares every row it is handed and takes its
+    /// targets from the best scores among them, in their order: it narrows
+    /// to no set of its own and draws between equal scores alone. A
+    /// profile whose one scorer places a request by itself
+    /// ([`Scorer::own`]) may then hand out that scorer's rows, the ones
+    /// this picker would take. The default is no: a picker that narrows,
+    /// samples or draws does not follow a scorer's order.
+    fn takes_best(&self) -> bool {
         false
     }
 
@@ -1500,6 +1568,32 @@ fn trace_drawn(
     trace_by::<true>(profile, facts, pool, candidates, kept, scores)
 }
 
+/// The trace of a decision behind a draw that handed its rows out in an
+/// order of its own: `best` names them best first, each with its score,
+/// and the trace keeps the first of them. No survivor is counted, as
+/// [`trace_drawn`] counts none, and no pass reads the scores again.
+fn trace_ordered(
+    profile: u16,
+    facts: &RequestFacts<'_>,
+    pool: &PoolFacts<'_>,
+    best: impl IntoIterator<Item = (WorkerId, f32)>,
+) -> Trace {
+    let mut trace = Trace {
+        profile,
+        survivors: Survivors::NOT_COUNTED,
+        seed: facts.seed,
+        generation: pool.generation,
+        ..Trace::default()
+    };
+    let mut len = 0;
+    for (slot, row) in trace.top.iter_mut().zip(best) {
+        *slot = row;
+        len += 1;
+    }
+    trace.top_len = len;
+    trace
+}
+
 /// The trace of a decision over the rows `kept` and their `scores`: a
 /// pool read whole, or the rows of a draw (`DRAWN`). One body, the read
 /// of the best scores chosen where it is entered.
@@ -2233,26 +2327,26 @@ impl Order {
 }
 
 /// What a profile's stages ask of a decision beyond the profile's own run,
-/// read once when the engine is built. A decision reads the byte in one
+/// read once when the engine is built. A decision reads the word in one
 /// compare, so a profile that asks nothing pays for no mark.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct Marks(u8);
+struct Marks(u16);
 
 impl Marks {
     /// A stage holds a [`DecisionScope`] to open.
-    const SCOPED: u8 = 1;
+    const SCOPED: u16 = 1;
     /// The picker leaves the placement to the binding's sessions assignment
     /// ([`Picker::by_assignment`]).
-    const BY_ASSIGNMENT: u8 = 1 << 1;
+    const BY_ASSIGNMENT: u16 = 1 << 1;
     /// The picker draws first and every other stage answers row by row
     /// ([`draws_first`]): a pool of [`DRAW_FROM`] rows or more is decided by
     /// the rows drawn. It asks nothing before the profile's run.
-    const DRAWS_FIRST: u8 = 1 << 2;
+    const DRAWS_FIRST: u16 = 1 << 2;
     /// The rows a host named join the rows the picker draws
     /// ([`Picker::joined_by_named`]): such a profile draws for a request
     /// that names rows in the column's place, and for no other. Set only
     /// beside [`Self::DRAWS_FIRST`].
-    const JOINED: u8 = 1 << 3;
+    const JOINED: u16 = 1 << 3;
     /// The profile's leading stages are ranks ([`Order`]) and nothing else
     /// is asked before its run: a plain decision over a pool of
     /// [`RANK_FROM`] rows or more, each said to hold a report
@@ -2261,18 +2355,32 @@ impl Marks {
     /// ([`Self::JOINED`]) that request is the draw's, and every other is
     /// the ranks'. Never set on a profile that draws for every request:
     /// the draw is asked first there.
-    const RANKED: u8 = 1 << 4;
+    const RANKED: u16 = 1 << 4;
     /// The plain ring alone places a keyed request by its session key:
     /// under a binding that steers, such a request keeps its key's worker
     /// over the overload veto ([`Engine::keep`]), where the kept key's test
     /// passes it ([`vetoed::keeps_its_key`]). The validator sets it for
     /// that one shape of profile, no stage does ([`Self::with_key`]).
-    const KEYED: u8 = 1 << 5;
+    const KEYED: u16 = 1 << 5;
     /// The scope of a profile under the key's mark: its [`Self::SCOPED`]
     /// word stands here. A decision's opening then asks the scope's and the
     /// assignment's marks as it does without a key, and the key's arm opens
     /// the scope.
-    const KEYED_SCOPE: u8 = 1 << 6;
+    const KEYED_SCOPE: u16 = 1 << 6;
+    /// The picker's unit is the engine ([`Picker::unit`]): a pool whose host
+    /// lists its engines ([`PoolFacts::engines`]) is decided over them
+    /// ([`run_engines`]), at any size. Set only beside
+    /// [`Self::DRAWS_FIRST`]: the rows such a decision reads are handed to
+    /// the stages as a draw's.
+    const ENGINES: u16 = 1 << 7;
+    /// The profile's one scorer places a request by itself
+    /// ([`Scorer::own`]), every filter answers row by row and the picker
+    /// takes the best scores of every row ([`Picker::takes_best`]): a
+    /// picker that narrows first does not follow the scorer's order, and
+    /// its profile runs. Under the mark a request that carries a
+    /// session key, over a pool whose host lists its engines, is the
+    /// scorer's to place ([`run_owned`]).
+    const OWNS: u16 = 1 << 8;
 
     fn of(profile: &Profile, order: Order) -> Self {
         let scoped = if profile.scoped() { Self::SCOPED } else { 0 };
@@ -2302,7 +2410,23 @@ impl Marks {
         } else {
             0
         };
-        Self(scoped | by_assignment | draws_first | joined | ranked)
+        let engines = if draws_first != 0 && profile.picker.unit() == Unit::Engine {
+            Self::ENGINES
+        } else {
+            0
+        };
+        let alone = match &profile.scorers[..] {
+            [stage] => stage.scorer.owns(),
+            _ => false,
+        };
+        let row_wise = profile.filters.iter().all(|f| f.row_wise());
+        let takes_best = profile.picker.takes_best();
+        let owns = if (scoped | by_assignment) == 0 && alone && row_wise && takes_best {
+            Self::OWNS
+        } else {
+            0
+        };
+        Self(scoped | by_assignment | draws_first | joined | ranked | engines | owns)
     }
 
     /// Whether no stage asks anything before the profile's run: no scope
@@ -2329,12 +2453,29 @@ impl Marks {
     /// decision asks once, so a profile that neither draws nor ranks pays
     /// the one compare it paid before the third mark, and one that draws
     /// for every request reads `DRAWS_FIRST` alone: it holds no rank mark.
-    const fn ahead(self) -> u8 {
+    const fn ahead(self) -> u16 {
         self.0 & (Self::DRAWS_FIRST | Self::JOINED | Self::RANKED)
     }
 
     const fn ranked(self) -> bool {
         self.0 & Self::RANKED != 0
+    }
+
+    const fn engines(self) -> bool {
+        self.0 & Self::ENGINES != 0
+    }
+
+    const fn owns(self) -> bool {
+        self.0 & Self::OWNS != 0
+    }
+
+    /// What a plain decision asks of the marks in front of the profile's
+    /// whole pass, in one masked read: what may stand ahead of it
+    /// ([`Self::ahead`]), whether the picker's unit is the engine and
+    /// whether the scorer places a request by itself. A profile that asks
+    /// none of it pays the one compare it paid for the draw and the ranks.
+    const fn first(self) -> u16 {
+        self.0 & (Self::DRAWS_FIRST | Self::JOINED | Self::RANKED | Self::ENGINES | Self::OWNS)
     }
 
     const fn by_assignment(self) -> bool {
@@ -3316,32 +3457,52 @@ impl Engine {
         ) {
             return run_encode(profile, index, facts, pool, set, cx, buf);
         }
-        // What may stand ahead of the whole pass, a draw or the ranks, is
-        // asked of the marks once, and only over a pool of `DRAW_FROM` rows
-        // or more: the ranks' floor is the draw's.
-        let ahead = marks.ahead();
-        if ahead != 0 && candidates.len() >= DRAW_FROM {
-            // A profile that draws for every request is the draw's at one
-            // compare, the one it paid before the ranks: it holds no rank
-            // mark, so its marks read `DRAWS_FIRST` alone ([`Marks::of`]).
-            if ahead == Marks::DRAWS_FIRST {
-                return run_drawn(self, index, facts, pool, set, cx, buf);
+        // What may stand ahead of the whole pass is asked of the marks
+        // once: the unit's runs, a draw or the ranks.
+        let first = marks.first();
+        if first != 0 {
+            // Over a pool whose host lists its engines, at any pool size:
+            // a picker whose unit is the engine decides by its draw over
+            // them, and a scorer that places a keyed request by itself is
+            // asked first. Where none is listed, or the scorer places
+            // nothing, the paths below decide.
+            if first & (Marks::ENGINES | Marks::OWNS) != 0 && !pool.engines.is_empty() {
+                if marks.engines() {
+                    return run_engines(self, index, facts, pool, set, cx, buf);
+                }
+                if marks.owns() && !facts.session_key.is_none() {
+                    let owned = run_owned(self, index, facts, pool, candidates, cx, buf);
+                    if let Some(decision) = owned {
+                        return decision;
+                    }
+                }
             }
-            // A picker the rows named join draws for a request that names
-            // rows. The request is asked first: one that names none skips
-            // the mark.
-            if facts.named.is_some() && ahead & Marks::JOINED != 0 {
-                return run_drawn(self, index, facts, pool, set, cx, buf);
-            }
-            // A profile whose leading stages are ranks is asked by rank
-            // where the draw left the decision and the host says that every
-            // row of the pool holds a report ([`PoolFacts::reported`]). The
-            // load stage costs a row without one from its reporting peers,
-            // so of one in front it would say that it must be asked whole,
-            // after the ranks were read: a pool not said to hold none is
-            // asked whole at once.
-            if marks.ranked() && pool.reported {
-                return run_ranked(self, index, facts, pool, set, cx, buf);
+            // A draw or the ranks, only over a pool of `DRAW_FROM` rows or
+            // more: the ranks' floor is the draw's.
+            let ahead = marks.ahead();
+            if ahead != 0 && candidates.len() >= DRAW_FROM {
+                // A profile that draws for every request is the draw's at one
+                // compare, the one it paid before the ranks: it holds no rank
+                // mark, so its marks read `DRAWS_FIRST` alone ([`Marks::of`]).
+                if ahead == Marks::DRAWS_FIRST {
+                    return run_drawn(self, index, facts, pool, set, cx, buf);
+                }
+                // A picker the rows named join draws for a request that names
+                // rows. The request is asked first: one that names none skips
+                // the mark.
+                if facts.named.is_some() && ahead & Marks::JOINED != 0 {
+                    return run_drawn(self, index, facts, pool, set, cx, buf);
+                }
+                // A profile whose leading stages are ranks is asked by rank
+                // where the draw left the decision and the host says that every
+                // row of the pool holds a report ([`PoolFacts::reported`]). The
+                // load stage costs a row without one from its reporting peers,
+                // so of one in front it would say that it must be asked whole,
+                // after the ranks were read: a pool not said to hold none is
+                // asked whole at once.
+                if marks.ranked() && pool.reported {
+                    return run_ranked(self, index, facts, pool, set, cx, buf);
+                }
             }
         }
         run_single(profile, index, facts, pool, set, cx, buf)

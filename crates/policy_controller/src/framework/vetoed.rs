@@ -20,8 +20,8 @@
 //! one mark.
 
 use super::{
-    filter, run_single, single_emptied, trace_of, Assignment, Binding, Buffers, Engine, Filter,
-    Picker, Plan, Profile, Scorer, Scratch, SessionRule, Set,
+    engines::run_owned, filter, run_single, single_emptied, trace_of, Assignment, Binding, Buffers,
+    Engine, Filter, Picker, Plan, Profile, Scorer, Scratch, SessionRule, Set,
 };
 use crate::{
     builtins::{Best, LeastRequests, NotOverloaded},
@@ -83,11 +83,14 @@ impl Engine {
     /// overload veto lifted, so the key's worker takes the request over its
     /// thresholds. Under a rule the key's pin is asked first, with the veto
     /// as it stands: a pin over its thresholds yields, and the profile then
-    /// places the key with the veto lifted. The run is the profile's whole
-    /// pass and never a draw: the ring's scorer is shown the whole view, so
-    /// a profile that holds it does not draw first. The set it is handed
-    /// sheds ([`Set::shedding`]): no pass of a kept key is put to the
-    /// all-vetoed rule, which the lifted run stands in for.
+    /// places the key with the veto lifted. The run is never a draw: the
+    /// ring's scorer is shown the whole view, so a profile that holds it
+    /// does not draw first. It is the scorer's walk over a pool whose host
+    /// lists its engines ([`run_owned`]), the veto lifted in it, and the
+    /// profile's whole pass over any other and where the walk gives no
+    /// answer: the rows handed are the pass's either way. The set it is
+    /// handed sheds ([`Set::shedding`]): no pass of a kept key is put to
+    /// the all-vetoed rule, which the lifted run stands in for.
     ///
     /// A pick the lift alone made possible says so: where the veto as it
     /// stands leaves the pool nobody ([`all_vetoed`]), the trace carries the
@@ -130,7 +133,18 @@ impl Engine {
             ..*cx
         };
         let buf = &mut scratch.single;
-        let mut decision = run_single(profile, index, facts, pool, set, &lifted, buf);
+        // Over a pool whose host lists its engines the ring places the key
+        // by its walk, the veto lifted in it as in the pass: the rows it
+        // hands are the whole pass's, and `buf` holds the rows it kept.
+        let walked = if self.marks[usize::from(index)].owns() {
+            run_owned(self, index, facts, pool, set.candidates, &lifted, buf)
+        } else {
+            None
+        };
+        let mut decision = match walked {
+            Some(decision) => decision,
+            None => run_single(profile, index, facts, pool, set, &lifted, buf),
+        };
         if let Decision::Pick(pick) = &mut decision {
             if all_vetoed(profile, facts, set, cx, buf) {
                 pick.trace.lifted = Lifted::Overload;
@@ -201,8 +215,9 @@ pub(super) fn lifted(
 }
 
 /// Whether the overload veto as it stands leaves a kept key's pool nobody.
-/// The lifted pass just placed the key: `buf` holds that pass's survivors,
-/// and `cx` is the decision's own, the veto standing in it. A survivor
+/// The lifted pass just placed the key, or the ring's walk did: `buf` holds
+/// that pass's survivors, or the rows the walk kept, each one of them, and
+/// `cx` is the decision's own, the veto standing in it. A survivor
 /// under its thresholds stands without the lift, so the pool was not
 /// emptied. The filters run again with the veto standing only over a pool
 /// whose survivors are all over: a soft filter of the lifted pass may have

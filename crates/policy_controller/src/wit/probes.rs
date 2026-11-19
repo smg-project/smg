@@ -18,9 +18,9 @@ use crate::{
     lease::{Lease, LeaseId, LeaseKind, Outcome, Side, TransportClass},
     sessions::SessionVerdict,
     view::{
-        AffinityFacts, Candidate, HashKind, Header, Health, Identity, LoadRow, MediaCounts,
-        ModelFingerprint, NamedAffinity, OverloadRegime, Phase, PoolFacts, RequestFacts, Role,
-        Session, SignalSource, WireModes, WorkerId, ZoneCapacity,
+        AffinityFacts, Candidate, Engines, HashKind, Header, Health, Identity, LoadRow,
+        MediaCounts, ModelFingerprint, NamedAffinity, OverloadRegime, Phase, PoolFacts,
+        RequestFacts, Role, Session, SignalSource, WireModes, WorkerId, ZoneCapacity,
     },
 };
 
@@ -83,6 +83,9 @@ wit! {
     // Host-only: a guest reads a candidate's requests in flight as the
     // candidate's own field, whichever feed its host read them from.
     Option<&crate::LentCounts<'_>> => "host-only",
+    // Host-only: the engines a host lists beside its rows name the rows by
+    // position, and a guest is shown rows.
+    Engines<'_> => "host-only",
 }
 
 // The spellings above that look inside a type, tied to it: an inner width that
@@ -214,8 +217,8 @@ pub(crate) fn all() -> Vec<Probe> {
         probe!("zone-capacity", before [], ZoneCapacity { zone, healthy, total } host [], &zone),
         probe!("pool", before [], PoolFacts {
             pool_size, membership_epoch, ring_epoch, regime, generation, zones, reach,
-            reported,
-        } host [reach, reported], &pool),
+            reported, engines,
+        } host [reach, reported, engines], &pool),
         // The lease's session crosses under the name both contracts still
         // spell, `session-key`: the change that first reads a lease from the
         // wire renames the field in both and takes this pair out.

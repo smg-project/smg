@@ -130,7 +130,7 @@ pub use decision::{
 pub use framework::{
     Binding, DecisionScope, EncodeItems, EncodePlaced, EncodePool, EncoderFacts, Engine, Filter,
     Front, Narrowed, PairPools, PairTable, PairTableError, Picker, Plan, Profile, Scorer, Scratch,
-    Spread, TieBand, Weighted, DRAW_BOUND, DRAW_FROM, RANK_FROM,
+    Spread, TieBand, Unit, Weighted, DRAW_BOUND, DRAW_FROM, RANK_FROM,
 };
 pub use lease::{
     EventKind, EventSet, Lease, LeaseId, LeaseKind, Lifecycle, Membership, Outcome, ReleaseReason,
@@ -144,9 +144,9 @@ pub use spec::{
     AppliedSpec, Needs, PolicySpec, PowerOfTwoMetric, SessionsSpec, SpecError, API_VERSION, PRESETS,
 };
 pub use view::{
-    fingerprint, AffinityFacts, Candidate, Constraints, HashKind, Header, Health, Identity,
-    LoadRow, MediaCounts, ModelFingerprint, NamedAffinity, NamedHolder, OverloadRegime, Phase,
-    PinSource, PoolFacts, RequestFacts, Role, Session, SignalSource, WireModes, WorkerId,
+    fingerprint, AffinityFacts, Candidate, Constraints, Engines, HashKind, Header, Health,
+    Identity, LoadRow, MediaCounts, ModelFingerprint, NamedAffinity, NamedHolder, OverloadRegime,
+    Phase, PinSource, PoolFacts, RequestFacts, Role, Session, SignalSource, WireModes, WorkerId,
     ZoneCapacity,
 };
 
@@ -160,6 +160,9 @@ pub use view::{
 ///   picker that draws first reads it too, and whatever follows that draw
 ///   (the order of the rows drawn, or the whole pass behind a draw that kept
 ///   nobody) reads it past those values;
+/// - one value of the seed's stream, read behind the draw of a picker whose
+///   unit is the engine: the seed of the stream that draws between equal
+///   rows of the engine taken;
 /// - the seed under the `warmup-slice` scorer's mask: that scorer's draws;
 /// - the seed under the alternates' mask: the order of equal counts among
 ///   the workers the count-first picker passed over;
