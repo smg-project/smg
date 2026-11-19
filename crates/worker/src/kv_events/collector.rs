@@ -840,23 +840,25 @@ mod tests {
         collector
             .on_worker_added(&loads, SubscriptionKind::Loads)
             .await;
-        collector.on_worker_removed(loads.url()).await;
         assert!(host.calls().is_empty(), "a loads-only one asks nothing");
 
+        // Both serve one model. The loads-only subscription does not keep
+        // the model for the host, and its own removal tells the host
+        // nothing more.
         let events = unconnected_grpc_worker_at("grpc://127.0.0.1:5");
         collector
             .on_worker_added(&events, SubscriptionKind::Events)
             .await;
         wait_until("the task opens its place", || host.calls().len() == 2).await;
         collector.on_worker_removed(events.url()).await;
-        assert_eq!(
-            host.calls(),
-            [
-                "enroll unknown grpc://127.0.0.1:5",
-                "open unknown grpc://127.0.0.1:5",
-                "model_left unknown",
-            ]
-        );
+        let asked = [
+            "enroll unknown grpc://127.0.0.1:5",
+            "open unknown grpc://127.0.0.1:5",
+            "model_left unknown",
+        ];
+        assert_eq!(host.calls(), asked, "the loads-only one keeps no model");
+        collector.on_worker_removed(loads.url()).await;
+        assert_eq!(host.calls(), asked, "its removal asks nothing");
     }
 
     async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
@@ -1687,6 +1689,98 @@ mod tests {
             "another worker still feeds the model: {calls:?}"
         );
         collector.stop().await;
+    }
+
+    /// A stop ends the tasks and tells the host of no model: what the host
+    /// keeps is its caller's to clear.
+    #[tokio::test]
+    async fn a_stop_tells_the_host_of_no_model() {
+        let host = Arc::new(RecordingHost::default());
+        let collector = KvEventCollector::new(Arc::clone(&host));
+        let worker = unconnected_grpc_worker_at("grpc://127.0.0.1:12");
+        collector
+            .on_worker_added(&worker, SubscriptionKind::Events)
+            .await;
+        wait_until("the task opens its place", || host.calls().len() == 2).await;
+        collector.stop().await;
+        assert_eq!(collector.slot_ids(worker.url()).await, (None, None));
+        assert_eq!(
+            host.calls(),
+            [
+                "enroll unknown grpc://127.0.0.1:12",
+                "open unknown grpc://127.0.0.1:12",
+            ],
+            "a stop asks the host nothing"
+        );
+    }
+
+    /// A dropped collector aborts its tasks, and an aborted task tells the
+    /// host of no model either.
+    #[tokio::test]
+    async fn a_dropped_collector_tells_the_host_of_no_model() {
+        let host = Arc::new(RecordingHost::default());
+        let collector = KvEventCollector::new(Arc::clone(&host));
+        let worker = unconnected_grpc_worker_at("grpc://127.0.0.1:13");
+        collector
+            .on_worker_added(&worker, SubscriptionKind::Events)
+            .await;
+        wait_until("the task opens its place", || host.calls().len() == 2).await;
+        drop(collector);
+        wait_until("the aborted task lets go of the host", || {
+            Arc::strong_count(&host) == 1
+        })
+        .await;
+        assert_eq!(
+            host.calls(),
+            [
+                "enroll unknown grpc://127.0.0.1:13",
+                "open unknown grpc://127.0.0.1:13",
+            ],
+            "a drop asks the host nothing"
+        );
+    }
+
+    /// A refused open is final for the worker object: the slot stays taken
+    /// and a second add of the same object asks the host nothing. A new
+    /// object under the URL is a new registration: the model leaves with
+    /// the old subscription, then the new one enrolls and asks to open.
+    #[tokio::test]
+    async fn a_refused_open_is_final_for_the_worker_object() {
+        let host = Arc::new(RecordingHost {
+            refuses_open: true,
+            ..Default::default()
+        });
+        let collector = KvEventCollector::new(Arc::clone(&host));
+        let url = "grpc://127.0.0.1:14";
+        let refused = unconnected_grpc_worker_at(url);
+        collector
+            .on_worker_added(&refused, SubscriptionKind::Events)
+            .await;
+        wait_until("the host refuses the open", || host.calls().len() == 2).await;
+        collector
+            .on_worker_added(&refused, SubscriptionKind::Events)
+            .await;
+        assert_eq!(
+            host.calls().len(),
+            2,
+            "the same object is not offered again"
+        );
+
+        let next = unconnected_grpc_worker_at(url);
+        collector
+            .on_worker_added(&next, SubscriptionKind::Events)
+            .await;
+        wait_until("the new object asks to open", || host.calls().len() == 5).await;
+        assert_eq!(
+            host.calls(),
+            [
+                "enroll unknown grpc://127.0.0.1:14",
+                "open unknown grpc://127.0.0.1:14",
+                "model_left unknown",
+                "enroll unknown grpc://127.0.0.1:14",
+                "open unknown grpc://127.0.0.1:14",
+            ]
+        );
     }
 
     #[tokio::test]
