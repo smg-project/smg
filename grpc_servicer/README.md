@@ -189,7 +189,16 @@ it is: a host that cannot be resolved, refuses the connection or answers 4xx
 is a 400; a host that does not deliver within the budget, answers 5xx or
 breaks the transfer is a 502, so a client knows whether to retry. None of
 these counts against the worker's circuit breaker, and the Router replays
-none of them on another worker, which would meet the same media.
+none of them on another worker, which would meet the same media. The vLLM Rust
+worker answers the same way for the media vLLM's own fetcher refuses under
+`--mm-processor inprocess`, by where it failed: a reference refused before
+the download (a host the policy refuses, a URL or data URL the fetcher does
+not take) or bytes that do not decode (an image the loader cannot read, bad
+base64) is a 400 `invalid_multimodal_request`; a download the origin refuses
+(a 4xx) or redirects to a host the policy refuses is a 400
+`media_fetch_failed`; a download over vLLM's size cap or an
+inline payload over `--mm-max-item-bytes` is a 400 `media_too_large`. A
+timeout, a refused connection or an origin 5xx stays retryable there.
 
 For `nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B`, the router can preprocess
 audio from `/v1/chat/completions` with `--mm-processing router`. Use a vLLM

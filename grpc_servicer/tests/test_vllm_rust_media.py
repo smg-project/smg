@@ -15,7 +15,11 @@ pytest.importorskip("msgspec")  # the processor module pulls in the sidecar prot
 pytest.importorskip("numpy")  # lend_buffer's views
 from smg_grpc_proto import vllm_engine_pb2  # noqa: E402
 from smg_grpc_servicer.vllm.media_refs import MediaRefItem  # noqa: E402
-from smg_grpc_servicer.vllm.mm_processor import MmProcessorUnavailable, MmSettings  # noqa: E402
+from smg_grpc_servicer.vllm.mm_processor import (  # noqa: E402
+    MmProcessorUnavailable,
+    MmSettings,
+    mark_client_media,
+)
 from smg_grpc_servicer.vllm.rust_media import RustMediaBridge  # noqa: E402
 
 
@@ -162,6 +166,13 @@ def test_failures_are_classified_like_the_python_servicers_statuses(loop):
     assert (kind, message) == ("invalid", "bad image")
     kind, message = submit(bridge(loop, FakeProcessor(RuntimeError("boom"))))
     assert (kind, message) == ("internal", "boom")
+    # The request's own media: Rust stamps the media-fault trailers under the code.
+    kind, payload = submit(bridge(loop, FakeProcessor(mark_client_media(ValueError("HTTP 403")))))
+    assert (kind, payload) == ("media", ("media_fetch_failed", "HTTP 403"))
+    for code in ("media_too_large", "invalid_multimodal_request"):
+        marked = mark_client_media(ValueError("refused"), code)
+        kind, payload = submit(bridge(loop, FakeProcessor(marked)))
+        assert (kind, payload) == ("media", (code, "refused"))
     # A scheme the processor does not accept is refused before it runs.
     processor = FakeProcessor()
     kind, message = submit(bridge(loop, processor), items=(("image", "ftp://x/y.png"),))
