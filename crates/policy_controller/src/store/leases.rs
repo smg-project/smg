@@ -145,12 +145,12 @@ pub enum LeaseRefused {
     /// counter of 1 to 2^32 - 1). Equal terms say the term itself mints no
     /// more.
     Unminted { lease: u64, store: u64 },
-    /// The record's id names no file of leases for good: it is of the
+    /// The file of the record's id is not settled yet: the id is of the
     /// store's term from a block of the counter that no file claimed, or
     /// of a term the store can still take. No decider minted it, and the
-    /// block's claim would name its file anew with the lease on file. A
-    /// store of one file refuses none by it: there every id names that
-    /// file.
+    /// block's claim would name its file anew with the lease on file. The
+    /// same id is taken once a claim settles its file. A store of one
+    /// file refuses none by it: there every id names that file.
     Unclaimed,
 }
 
@@ -211,7 +211,7 @@ pub trait LeasesStore: Send + Sync {
 
     /// Restore what a gateway's `Hello` pages list, releasing what they
     /// omit; a record above the store's term is skipped, and so is one
-    /// whose id names no file for good ([`LeaseRefused::Unclaimed`]).
+    /// whose id names no file yet ([`LeaseRefused::Unclaimed`]).
     /// Returns how many stand after it.
     fn restore(&self, gateway: GatewayId, records: &[LeaseRecord]) -> usize;
 

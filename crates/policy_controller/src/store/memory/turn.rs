@@ -22,10 +22,10 @@
 //!
 //! Who applies. A decider with a job at hand is at work at its file
 //! ([`MemoryStore::at_work`]): it says so, then takes its turn as the
-//! first step of its work, tries the turn once before each decision reads
-//! its rows' counts, takes it at each issue, takes it behind the give-up
-//! of an answer its stream refused, and takes it once more before it
-//! waits for its next job. While it is at work no other thread
+//! first step of its work, tries the turn once at each request it takes,
+//! whatever its answer, takes it at each issue, takes it behind the
+//! give-up of an answer its stream refused, and takes it once more before
+//! it waits for its next job. While it is at work no other thread
 //! applies at its file: a thread that holds the file's turn and finds its
 //! decider at work lets go and applies nothing, and what was handed waits
 //! for the decider's next take. So a file's lines stay with the one
@@ -239,7 +239,7 @@ impl DerefMut for Turn<'_> {
 
 /// A decider's seat at its file ([`MemoryStore::at_work`]). While its
 /// thread works the hands leave what they hand to that file to it: it
-/// applies where it finds its turn free before a read of the counts
+/// applies where it finds its turn free at each request it takes
 /// ([`AtWork::apply`]), at each issue, and behind the give-up of an
 /// answer its stream refused. A thread that rests ([`AtWork::rest`]) or
 /// drops its seat takes the turn once more: what was handed behind its
@@ -251,10 +251,11 @@ pub struct AtWork {
 }
 
 impl AtWork {
-    /// Applies what is handed, before a decision reads its rows' counts,
-    /// where the turn is free. Where it is held the decision reads on:
-    /// what is handed behind the holder's take waits for the next take
-    /// that applies, and the decision's issue is one.
+    /// Applies what is handed where the turn is free: a decider's look at
+    /// each request it takes, ahead of the rows' counts a decision reads.
+    /// Where the turn is held the request goes on and nothing is applied:
+    /// what is handed waits for the next take that applies. A decision's
+    /// issue is one, and a refused request has none.
     pub fn apply(&self) {
         if let Some(mut turn) = self.store.files[self.file].try_take() {
             self.store
@@ -582,10 +583,10 @@ impl MemoryStore {
     /// holder applied, so no frame is dropped: the caller applies where
     /// no thread is at work, and waits for the one that is, which looks
     /// at its ring at each request it takes, whatever its answer. The
-    /// caller's thread is held for that wait, one request of the file's
-    /// decider at most: it yields `FULL_RING_YIELDS` times, then sleeps
-    /// `FULL_RING_SLEEP` between its looks, so a slow decision costs its
-    /// waiting hands no core.
+    /// caller's thread is held for that wait, to the first such look that
+    /// finds the file's turn free: it yields `FULL_RING_YIELDS` times,
+    /// then sleeps `FULL_RING_SLEEP` between its looks, so a slow
+    /// decision costs its waiting hands no core.
     pub fn hand(&self, hand: &Hand, lease: LeaseId, said: Said) {
         let at = self.file_of(lease);
         let mut looks = 0_u32;

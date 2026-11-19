@@ -714,7 +714,7 @@ impl Deciding {
         // What the sessions handed is applied where the turn is free,
         // whatever was judged: before the rows' counts are read, and by a
         // request refused above too, so a hand at a full ring waits for
-        // one request of this decider at most.
+        // the first request of this decider that finds the turn free.
         if let Some(at_work) = &self.working {
             at_work.apply();
         }

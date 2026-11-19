@@ -2855,8 +2855,7 @@ impl MemoryStore {
     pub fn with_deciders(mut self, deciders: usize) -> Self {
         // Every file is read, each under its own turn: a lease on any of
         // them would go with its file.
-        let mut files = self.files.iter();
-        let empty = files.all(|file| file.take().records.is_empty());
+        let empty = self.files.iter().all(|file| file.take().records.is_empty());
         assert!(empty, "a store's files are laid before a lease is filed");
         let (term, counts) = {
             let leases = self.files[0].take();
@@ -3083,8 +3082,8 @@ impl LeasesStore for MemoryStore {
         let world = self.world.load();
         // Each file's turn in the files' order, one at a time: the
         // gateway's leases there go, and the records its ids name are
-        // filed. A record whose id names no file for good is filed in
-        // none ([`LeaseRefused::Unclaimed`]).
+        // filed. A record whose id names no file yet is filed in none
+        // ([`LeaseRefused::Unclaimed`]).
         let files = self.files.len();
         let mut held = 0;
         for at in 0..self.files.len() {
