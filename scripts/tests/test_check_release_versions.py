@@ -1298,7 +1298,8 @@ def test_a_crates_wire_files_are_read_against_every_published_copy_a_version_rea
     """Another release line can publish a later version of a crate with wire files of its own.
     A tree that carries that version with other wire files is compared with that line's tag, not
     with the comparison tag: the step leaves the carried version's caret. A version written by
-    hand inside the caret of a version any line published, with other wire files, is an issue."""
+    hand inside the caret of a version any line published, with other wire files, is an issue,
+    with or without another file changed beside the version."""
     root = tmp_path / "lines"
     root.mkdir()
     git(root, "init", "-q", "-b", "main")
@@ -1343,6 +1344,16 @@ def test_a_crates_wire_files_are_read_against_every_published_copy_a_version_rea
         "  ! wire (crates/wire/) — 1 file(s) changed but version not bumped (v0.2.0, v1.1.0's)"
         " [minor]\n"
         "    ! and its wire files changed: the step leaves ^0.2.0\n"
+    ) in out
+
+    # A patch written by hand over the comparison tag's own files: nothing but the version
+    # differs from v1.0.0, and ^0.2.0 accepts it over other wire files than v1.1.0 published.
+    write("0.2.1", "message A { int32 a = 1; }\n", "chore(wire): 0.2.1 alone")
+    code, out = check()
+    assert code == 1, out
+    assert (
+        "  ! wire (crates/wire/) — 1 file(s) changed, its wire files among them, but v0.2.1 is"
+        " inside ^0.2.0 [minor]"
     ) in out
 
     # A patch written by hand, with a field of its own: ^0.1.0 refuses it and ^0.2.0 accepts it.

@@ -561,6 +561,13 @@ def check(
     if carrier is not None and carrier != tag:
         verdict.carried_by = carrier
         verdict.files_changed = files_changed(repo, carrier, component)
+    if verdict.files_changed == 0 and carrier is None:
+        # A version written by hand over the comparison tag's own files can still sit inside the
+        # caret of a version another line published with other wire files: the files are counted
+        # against that line's copy, and the bumped path below asks for the step.
+        inside = published_inside(repo, tag, component, verdict)
+        if inside is not None and inside != verdict.tag_version:
+            verdict.files_changed = files_changed(repo, tagged[inside], component)
     if verdict.files_changed == 0:
         # Changed since the comparison tag, at a version another line's tag carries with this very
         # code: nothing to publish, but the workspace pin still has to follow the version (the
