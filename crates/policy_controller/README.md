@@ -361,7 +361,7 @@ A **plan** says how many workers one request needs.
 | `pd-pair` | A prefill worker, then a decode worker that can pair with it. | `profiles.prefill`, `profiles.decode` |
 | `epd` | An encode worker for each encode item, then the pair. | `profiles.encode`, `profiles.prefill`, `profiles.decode` |
 
-The library decides all three plans. The stock controller applies a document of any plan, and its `Decide` call answers for `single` alone today. See [what is not built yet](#what-is-not-built-yet).
+The library decides all three plans. The stock controller applies a document of any plan, and its `Decide` call decides `single` requests alone today. It answers a request for a side of a pair `Busy` with no reason: the gateway is to decide that request itself. See [what is not built yet](#what-is-not-built-yet).
 
 A prefill and decode pair:
 
@@ -559,7 +559,7 @@ A stage is a Rust type that implements `Filter`, `Scorer` or `Picker`. You add i
 ## What is not built yet
 
 - A plan that waits for the prefill worker's answer before it picks the decode worker. `pd-pair` and `epd` pick every worker in one decision.
-- Pair decisions from the stock controller. The library decides `pd-pair` and `epd` (`Engine::decide_pair`, `Engine::decide_encode_pair`). The stock controller's `Decide` call does not answer for a side of a pair yet.
+- Pair decisions from the stock controller. The library decides `pd-pair` and `epd` (`Engine::decide_pair`, `Engine::decide_encode_pair`). The stock controller's `Decide` call does not decide a side of a pair yet: it answers `Busy` with no reason.
 - A choice by the media a worker can process, outside `epd`. No built-in filter reads it.
 - A binding that matches on a tenant, a priority, a header, a prompt size or labels. The fields are in the schema. A document that writes one is refused as not in this build.
 - `shadow`, `canary`, `override: allowed` and `admission` on a binding, and `issue_session_id` in a sessions rule.
@@ -567,7 +567,7 @@ A stage is a Rust type that implements `Filter`, `Scorer` or `Picker`. You add i
 - The `best-with-temperature` picker, and three settings of `prefix-affinity`: `decay`, `accounting_ttl_ms` and `spill.uncached_credit`.
 - The `bucket` scorer in the stock controller. The library runs it. The stock controller refuses a document that names it, because it does not yet report every request's end to a stage.
 - Cache events in the stock controller. Its `PushKvEvents` call is not served, and nothing else feeds its cache index. So `prefix-affinity` sees no worker as holding a prefix there. The library places by cache for a host that feeds the index.
-- Two more inputs in the stock controller. The circuit breaker is not fed, so `healthy` reads it as closed. A key's count of requests in flight is not fed, so `inflight_cap` passes no worker over.
+- Two more inputs in the stock controller. A worker's row has a circuit-breaker bit that nothing feeds yet, so `healthy` reads it as closed. A gateway's own breaker still counts: its breaker veto on its session takes the worker out of that gateway's decisions. A key's count of requests in flight is not fed, so `inflight_cap` passes no worker over.
 - A plugin named in the document. The format has no field for one.
 - Six calls of the contract: `Explain`, `GetSnapshot`, `PushLoad`, `PushKvEvents`, `StepDown` and `WatchRegime`. The stock controller answers each as not served.
 - The audit mode of the apply call.
