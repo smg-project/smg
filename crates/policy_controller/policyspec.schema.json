@@ -1076,10 +1076,14 @@
           ]
         },
         "shadow": {
-          "description": "A profile evaluated after the live one on the same view, never\ndispatched, counted as disagreement.",
-          "type": [
-            "string",
-            "null"
+          "description": "A second profile for comparison on the same view. Only the live\nprofile's decision serves the request.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ShadowSpec"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "canary": {
@@ -1446,6 +1450,22 @@
       "enum": [
         "original",
         "latest"
+      ]
+    },
+    "ShadowSpec": {
+      "description": "A second profile for a binding of one profile, or a profile per side.",
+      "anyOf": [
+        {
+          "description": "The shadow of a binding that names one live profile.",
+          "type": "string"
+        },
+        {
+          "description": "Shadow profiles by side. Validation currently refuses this form.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
       ]
     },
     "CanarySpec": {

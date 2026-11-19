@@ -1708,6 +1708,17 @@ impl PlanName {
     }
 }
 
+/// A second profile for a binding of one profile, or a profile per side.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+#[non_exhaustive]
+pub enum ShadowSpec {
+    /// The shadow of a binding that names one live profile.
+    Profile(String),
+    /// Shadow profiles by side. Validation currently refuses this form.
+    Sides(#[serde(deserialize_with = "keyed_once")] BTreeMap<String, String>),
+}
+
 /// A binding: the requests it matches, the profile or plan they resolve to,
 /// and the rules around the decision.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -1747,10 +1758,10 @@ pub struct BindingSpec {
     /// Sticky sessions.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sessions: Option<SessionsSpec>,
-    /// A profile evaluated after the live one on the same view, never
-    /// dispatched, counted as disagreement.
+    /// A second profile for comparison on the same view. Only the live
+    /// profile's decision serves the request.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub shadow: Option<String>,
+    pub shadow: Option<ShadowSpec>,
     /// A second profile deciding a share of the requests.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub canary: Option<CanarySpec>,
@@ -2987,6 +2998,8 @@ struct BindingContext<'a> {
     denied: &'a [&'a str],
     /// Profile name to its position in the document's map.
     profiles: &'a BTreeMap<&'a str, u16>,
+    live_profiles: &'a BTreeSet<&'a str>,
+    scoped_stages: &'a BTreeMap<&'a str, &'static str>,
     /// The profiles whose built picker leaves the placement to a sessions
     /// rule ([`Picker::by_assignment`]), by name.
     by_assignment: &'a [&'a str],
@@ -3238,14 +3251,84 @@ fn check_canary(canary: &CanarySpec, cx: &BindingContext<'_>, at: &At) -> Result
     }
 }
 
+/// The first stage that needs to open a decision scope, in stage order.
+fn scoped_stage(profile: &Profile) -> Option<&'static str> {
+    profile
+        .filters
+        .iter()
+        .find_map(|stage| stage.scope().map(|_| stage.name()))
+        .or_else(|| {
+            profile
+                .scorers
+                .iter()
+                .find_map(|stage| stage.scorer.scope().map(|_| stage.scorer.name()))
+        })
+        .or_else(|| profile.picker.scope().map(|_| profile.picker.name()))
+}
+
+fn resolve_shadow_profile(
+    name: &str,
+    at: At,
+    cx: &BindingContext<'_>,
+    deferred: &mut Deferred,
+) -> Result<u16, SpecError> {
+    let Some(&position) = cx.profiles.get(name) else {
+        return Err(SpecError::UnknownProfileAt {
+            path: at.0,
+            name: name.to_owned(),
+        });
+    };
+    // Stages may change their state when asked to decide. A live profile
+    // must have its own stages.
+    if cx.live_profiles.contains(name) {
+        return Err(SpecError::BadField {
+            path: at.0,
+            value: name.to_owned(),
+            reason: "a profile unused by live decisions",
+        });
+    }
+    if let Some(&stage) = cx.scoped_stages.get(name) {
+        deferred.note(at.0, stage);
+    }
+    Ok(position)
+}
+
+fn check_shadow(
+    shadow: &ShadowSpec,
+    plan: PlanName,
+    cx: &BindingContext<'_>,
+    at: &At,
+    deferred: &mut Deferred,
+) -> Result<Option<u16>, SpecError> {
+    let shadow_at = at.sub("shadow");
+    match shadow {
+        ShadowSpec::Profile(name) if plan == PlanName::Single => {
+            resolve_shadow_profile(name, shadow_at, cx, deferred).map(Some)
+        }
+        ShadowSpec::Profile(name) => {
+            Err(at.bad("shadow", name, "a map of shadow profiles by side"))
+        }
+        ShadowSpec::Sides(sides) => {
+            for (side, name) in sides {
+                if !plan.sides().contains(&side.as_str()) {
+                    return Err(shadow_at.bad(side, name, "a profile on a side of the plan"));
+                }
+                resolve_shadow_profile(name, shadow_at.sub(side), cx, deferred)?;
+            }
+            deferred.note(shadow_at.0, "a shadow map");
+            Ok(None)
+        }
+    }
+}
+
 /// The binding's rules around the decision, in shape; the ones this build
-/// does not evaluate are noted as deferred.
+/// does not evaluate are noted as deferred. Returns the shadow's position.
 fn check_binding_rules(
     b: &BindingSpec,
     cx: &BindingContext<'_>,
     at: &At,
     deferred: &mut Deferred,
-) -> Result<(), SpecError> {
+) -> Result<Option<u16>, SpecError> {
     if let Some(overload) = &b.overload {
         check_overload(overload, &at.sub("overload"))?;
     }
@@ -3259,22 +3342,10 @@ fn check_binding_rules(
             deferred.note(at.field("issue_session_id"), "issuing a session id");
         }
     }
-    if let Some(shadow) = &b.shadow {
-        if !cx.profiles.contains_key(shadow.as_str()) {
-            return Err(SpecError::UnknownProfileAt {
-                path: at.field("shadow"),
-                name: shadow.clone(),
-            });
-        }
-        let live = b
-            .profile
-            .as_deref()
-            .or_else(|| b.profiles.get("single").map(String::as_str));
-        if live == Some(shadow.as_str()) {
-            return Err(at.bad("shadow", shadow, "a profile other than the live one"));
-        }
-        deferred.note(at.field("shadow"), "the shadow binding");
-    }
+    let shadow = match &b.shadow {
+        Some(shadow) => check_shadow(shadow, b.plan.unwrap_or_default(), cx, at, deferred)?,
+        None => None,
+    };
     if let Some(canary) = &b.canary {
         check_canary(canary, cx, &at.sub("canary"))?;
         deferred.note(at.field("canary"), "the canary binding");
@@ -3288,11 +3359,15 @@ fn check_binding_rules(
             reason: "admission is reserved in v1 and stays off",
         });
     }
-    Ok(())
+    Ok(shadow)
 }
 
 /// The binding's plan and sides, resolved to profile positions.
-fn resolve_plan(b: &BindingSpec, cx: &BindingContext<'_>) -> Result<Option<Binding>, SpecError> {
+fn resolve_plan(
+    b: &BindingSpec,
+    cx: &BindingContext<'_>,
+    shadow: Option<u16>,
+) -> Result<Option<Binding>, SpecError> {
     let index = cx.index;
     let plan = b.plan.unwrap_or_default();
     for key in b.profiles.keys() {
@@ -3326,6 +3401,8 @@ fn resolve_plan(b: &BindingSpec, cx: &BindingContext<'_>) -> Result<Option<Bindi
         plan,
         profile,
         decode_profile,
+        shadow,
+        decode_shadow: None,
         sessions: None,
         overload: overload_thresholds(b.overload.as_ref()),
     };
@@ -3387,8 +3464,8 @@ fn check_binding(
 ) -> Result<Option<Binding>, SpecError> {
     let at = At::new(format!("bindings[{}]", cx.index));
     check_matcher(&b.matcher, cx, &at, deferred)?;
-    check_binding_rules(b, cx, &at, deferred)?;
-    let mut built = resolve_plan(b, cx)?;
+    let shadow = check_binding_rules(b, cx, &at, deferred)?;
+    let mut built = resolve_plan(b, cx, shadow)?;
     // A picker that leaves the placement to a sessions rule, and a rule runs
     // under the single plan alone: on a side of a pair or of `epd` nothing
     // would place its requests. The built picker answers, as it answers the
@@ -3782,6 +3859,8 @@ impl PolicySpec {
         // headers. The engine folds every profile's stages in.
         let mut needs = Needs::default();
         let mut profiles = Vec::with_capacity(self.profiles.len());
+        let has_shadows = self.bindings.iter().any(|binding| binding.shadow.is_some());
+        let mut scoped_stages = BTreeMap::new();
         // Noted by name: the built vector lines up with the document's
         // positions only once nothing is deferred.
         let mut by_assignment = Vec::new();
@@ -3798,6 +3877,11 @@ impl PolicySpec {
                 &mut depth,
             )?;
             if let Some((built, by_key)) = built {
+                if has_shadows {
+                    if let Some(stage) = scoped_stage(&built) {
+                        scoped_stages.insert(name.as_str(), stage);
+                    }
+                }
                 if built.picker.by_assignment() {
                     by_assignment.push(name.as_str());
                 }
@@ -3819,6 +3903,17 @@ impl PolicySpec {
             positions.insert(name.as_str(), position);
         }
         let mut bindings = Vec::with_capacity(self.bindings.len());
+        let mut live_profiles = BTreeSet::new();
+        if has_shadows {
+            live_profiles.extend(self.bindings.iter().flat_map(|binding| {
+                binding
+                    .profile
+                    .iter()
+                    .chain(binding.profiles.values())
+                    .chain(binding.canary.iter().map(|canary| &canary.profile))
+                    .map(String::as_str)
+            }));
+        }
         // The built bindings whose document sheds a pool the overload veto
         // empties, by their place in `bindings`.
         let mut sheds = Vec::new();
@@ -3828,6 +3923,8 @@ impl PolicySpec {
                 view: &self.view,
                 denied: denied_headers,
                 profiles: &positions,
+                live_profiles: &live_profiles,
+                scoped_stages: &scoped_stages,
                 by_assignment: &by_assignment,
             };
             if let Some(built) = check_binding(binding, &cx, &mut needs, &mut deferred)? {
@@ -3857,6 +3954,8 @@ impl PolicySpec {
                 plan: Plan::Single,
                 profile: 0,
                 decode_profile: None,
+                shadow: None,
+                decode_shadow: None,
                 sessions: None,
                 overload: overload_thresholds(None),
             });
@@ -4383,7 +4482,9 @@ impl ViewLists {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Candidate, Constraints, Filter, Lifecycle, RequestFacts, Targets, TieBand};
+    use crate::{
+        Candidate, Constraints, Filter, Lifecycle, PoolFacts, RequestFacts, Targets, TieBand,
+    };
 
     #[test]
     fn a_parameter_key_written_twice_is_refused_inside_maps_and_lists() {
@@ -4672,6 +4773,264 @@ mod tests {
         doc(&format!(
             r#"{{"apiVersion":"smg.policy/v1","view":{{"headers":["x-session-id"]}},"profiles":{{"p":{{"pick":"best"}},"q":{{"pick":"random"}}}},"bindings":[{binding}]}}"#
         ))
+    }
+
+    #[test]
+    fn shadow_absent_keeps_every_preset_digest() {
+        let expected = [
+            (
+                "random",
+                "sha256:12f28a338634ac96fb8d5883f9e354341329ffb8cf23417c4b6ace700d03d3ec",
+            ),
+            (
+                "round_robin",
+                "sha256:62e5652e4940b185ed50b247c68b27c4a3f7ac43683f66b97404d449669720fc",
+            ),
+            (
+                "passthrough",
+                "sha256:3defa376775031aa71f5d87b1dd2c7dbdaf7eaf42f7f0f0616ac345cdddd6f1d",
+            ),
+            (
+                "power_of_two",
+                "sha256:4c4b153064585f5e23a4b62e1fd4cf2d6b07c0dea6340c24834260d2e4281f66",
+            ),
+            (
+                "least_load",
+                "sha256:80d7fcef3d2df7ee25aa79c1ccfa784cad0dbc91785194d48e108e660e8cda88",
+            ),
+            (
+                "consistent_hashing",
+                "sha256:9efb2b93ae8ceb8ba7468c8a611facf8c6f532e7f60f912f944cd4ca2c66bde6",
+            ),
+            (
+                "prefix_hash",
+                "sha256:f27dcbcd0d1adafc34c00bba709cad16f979a4d02c92da34e388fb1fe917e469",
+            ),
+            (
+                "manual",
+                "sha256:d12dd3db8aa8ece3fbb62bd354c3db14d97d92e57079dc191ac3546ccd04593e",
+            ),
+            (
+                "cache_aware",
+                "sha256:864958791685f8894b437e698f0bcee6ad48a81b56d248b230c93dd75b9b0513",
+            ),
+            (
+                "bucket",
+                "sha256:168a1e9a62410e6bba35226e96c40715392d7fe5e73b88cf242e2c48a0686f3c",
+            ),
+        ];
+        assert_eq!(expected.map(|(name, _)| name), PRESETS);
+        for (name, digest) in expected {
+            let spec = PolicySpec::preset(name).expect("a preset");
+            assert_eq!(
+                spec.digest().expect("a digest").to_string(),
+                digest,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn shadow_round_trips_as_a_profile_name() {
+        let spec = spec_with_binding(r#"{"profile":"p","shadow":"q"}"#);
+        let json = serde_json::to_value(&spec).expect("writes JSON");
+        assert_eq!(json["bindings"][0]["shadow"], "q");
+        assert_eq!(
+            serde_json::from_value::<PolicySpec>(json).expect("reads JSON"),
+            spec
+        );
+        let yaml = serde_yaml::to_string(&spec).expect("writes YAML");
+        assert_eq!(
+            serde_yaml::from_str::<PolicySpec>(&yaml).expect("reads YAML"),
+            spec
+        );
+        let engine = spec.validate().expect("a separate shadow profile is valid");
+        let binding = engine.binding("m", Phase::Single).expect("the binding");
+        assert_eq!(binding.shadow, Some(1));
+        assert_eq!(binding.decode_shadow, None);
+        assert_eq!(engine.profiles()[1].name, "q");
+    }
+
+    #[test]
+    fn shadow_refuses_an_unknown_profile_at_the_field() {
+        let spec = spec_with_binding(r#"{"profile":"p","shadow":"absent"}"#);
+        assert_eq!(
+            spec.validate().expect_err("the profile is absent"),
+            SpecError::UnknownProfileAt {
+                path: "bindings[0].shadow".into(),
+                name: "absent".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn shadow_refuses_a_profile_named_live_anywhere() {
+        for (bindings, name) in [
+            (r#"{"profile":"p","shadow":"p"}"#, "p"),
+            (r#"{"profiles":{"single":"p"},"shadow":"p"}"#, "p"),
+            (r#"{"profile":"p","shadow":"q"},{"profile":"q"}"#, "q"),
+            (
+                r#"{"profile":"p","shadow":"q"},{"plan":"pd-pair","profiles":{"prefill":"p","decode":"q"}}"#,
+                "q",
+            ),
+            (
+                r#"{"profile":"p","shadow":"q"},{"profile":"p","canary":{"profile":"q","percent":19}}"#,
+                "q",
+            ),
+        ] {
+            let error = spec_with_binding(bindings)
+                .validate()
+                .expect_err("the shadow is also named live");
+            assert!(
+                matches!(
+                    error,
+                    SpecError::BadField { ref path, ref value, .. }
+                        if path == "bindings[0].shadow" && value == name
+                ),
+                "{error} for {bindings}"
+            );
+        }
+    }
+
+    #[test]
+    fn shadow_on_a_pair_refuses_a_single_name_at_the_field() {
+        let spec = spec_with_binding(
+            r#"{"plan":"pd-pair","profiles":{"prefill":"p","decode":"p"},"shadow":"q"}"#,
+        );
+        let error = spec.validate().expect_err("a pair names its sides");
+        assert!(
+            matches!(
+                error,
+                SpecError::BadField { ref path, .. } if path == "bindings[0].shadow"
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn shadow_map_checks_its_sides_and_names_before_deferral() {
+        let pair = |shadow: &str| {
+            spec_with_binding(&format!(
+                r#"{{"plan":"pd-pair","profiles":{{"prefill":"p","decode":"p"}},"shadow":{shadow}}}"#,
+            ))
+        };
+        assert_eq!(
+            not_in_build(&pair(r#"{"decode":"q"}"#)),
+            ("bindings[0].shadow".to_string(), "a shadow map")
+        );
+        assert_eq!(
+            bad_field(&pair(r#"{"encode":"q"}"#)),
+            "bindings[0].shadow.encode"
+        );
+        assert_eq!(
+            pair(r#"{"decode":"absent"}"#)
+                .validate()
+                .expect_err("unknown profile"),
+            SpecError::UnknownProfileAt {
+                path: "bindings[0].shadow.decode".into(),
+                name: "absent".into(),
+            }
+        );
+        assert_eq!(
+            bad_field(&pair(r#"{"decode":"p"}"#)),
+            "bindings[0].shadow.decode"
+        );
+        let doubled = r#"{"profile":"p","shadow":{"single":"q","single":"q"}}"#;
+        assert!(serde_json::from_str::<BindingSpec>(doubled).is_err());
+    }
+
+    #[test]
+    fn shadow_refuses_each_stage_that_opens_a_plugin_scope_by_name() {
+        #[derive(Debug)]
+        struct Scoped;
+
+        impl crate::DecisionScope for Scoped {
+            fn open(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &PoolFacts<'_>) {}
+            fn close(&self) {}
+        }
+
+        impl Lifecycle for Scoped {}
+
+        impl Filter for Scoped {
+            fn name(&self) -> &'static str {
+                "scoped-filter"
+            }
+            fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+                true
+            }
+            fn scope(&self) -> Option<&dyn crate::DecisionScope> {
+                Some(self)
+            }
+        }
+
+        impl Scorer for Scoped {
+            fn name(&self) -> &'static str {
+                "scoped-scorer"
+            }
+            fn score(
+                &self,
+                _: &RequestFacts<'_>,
+                _: &[Candidate],
+                _: &[u32],
+                _: &mut [f32],
+            ) -> TieBand {
+                TieBand::NORMALIZED
+            }
+            fn scope(&self) -> Option<&dyn crate::DecisionScope> {
+                Some(self)
+            }
+        }
+
+        impl Picker for Scoped {
+            fn name(&self) -> &'static str {
+                "scoped-picker"
+            }
+            fn pick(
+                &self,
+                _: &RequestFacts<'_>,
+                _: &[Candidate],
+                _: &[u32],
+                _: &[f32],
+                _: TieBand,
+                _: &mut Targets,
+            ) {
+            }
+            fn scope(&self) -> Option<&dyn crate::DecisionScope> {
+                Some(self)
+            }
+        }
+
+        let mut catalog = Catalog::builtin();
+        catalog
+            .filter("scoped-filter", || Box::new(Scoped))
+            .and_then(|catalog| catalog.scorer("scoped-scorer", || Box::new(Scoped)))
+            .and_then(|catalog| catalog.picker("scoped-picker", || Box::new(Scoped)))
+            .expect("the stage names are available");
+        for (profile, name) in [
+            (
+                r#"{"filter":["scoped-filter"],"pick":"best"}"#,
+                "scoped-filter",
+            ),
+            (
+                r#"{"score":["scoped-scorer"],"pick":"best"}"#,
+                "scoped-scorer",
+            ),
+            (r#"{"pick":"scoped-picker"}"#, "scoped-picker"),
+        ] {
+            let mut spec = spec_with_binding(r#"{"profile":"p","shadow":"q"}"#);
+            spec.profiles.insert(
+                "q".into(),
+                serde_json::from_str(profile).expect("a profile"),
+            );
+            assert_eq!(
+                spec.validate_in(&catalog, &[])
+                    .expect_err("the stage needs a scope"),
+                SpecError::NotInBuild {
+                    path: "bindings[0].shadow".into(),
+                    what: name,
+                }
+            );
+        }
     }
 
     fn spec_with_view(view: &str) -> PolicySpec {
@@ -6454,24 +6813,6 @@ mod tests {
         );
 
         assert_eq!(
-            spec_with_binding(r#"{"profile":"p","shadow":"ghost"}"#)
-                .validate()
-                .err(),
-            Some(SpecError::UnknownProfileAt {
-                path: "bindings[0].shadow".into(),
-                name: "ghost".into()
-            })
-        );
-        assert_eq!(
-            bad_field(&spec_with_binding(r#"{"profile":"p","shadow":"p"}"#)),
-            "bindings[0].shadow"
-        );
-        assert_eq!(
-            not_in_build(&spec_with_binding(r#"{"profile":"p","shadow":"q"}"#)),
-            ("bindings[0].shadow".to_string(), "the shadow binding")
-        );
-
-        assert_eq!(
             not_in_build(&spec_with_binding(
                 r#"{"profile":"p","canary":{"profile":"q","percent":5}}"#
             )),
@@ -6770,13 +7111,14 @@ mod tests {
               ],
               "pick": { "best-with-temperature": { "temperature": 0.05 } }
             },
-            "least_load": { "filter": ["healthy"], "score": ["least-load"], "pick": "best" }
+            "least_load": { "filter": ["healthy"], "score": ["least-load"], "pick": "best" },
+            "spare": { "pick": "random" }
           },
           "plans": { "pd-pair": { "pairing": "lenient" } },
           "bindings": [
             { "match": { "model": "pd/*", "phase": ["prefill", "decode"], "tenant": "acme", "priority": { "max": -1 }, "header": { "name": "x-tenant-tier", "values": ["gold"] }, "prompt_tokens": { "min": 1, "max": 4096 }, "labels": ["large"] },
               "plan": "pd-pair", "profiles": { "prefill": "least_load", "decode": "least_load" } },
-            { "match": { "model": "*" }, "profile": "cache_aware", "shadow": "least_load",
+            { "match": { "model": "*" }, "profile": "cache_aware", "shadow": "spare",
               "canary": { "profile": "least_load", "percent": 5 }, "override": "allowed",
               "overload": { "enabled": true, "waiting_requests": 64, "token_usage": 0.9, "shed_when_all_vetoed": false },
               "sessions": { "sticky_header": "x-session-id", "headers": ["x-session-id"], "ttl_s": 600, "sweep_s": 120, "assignment": "delegate", "inflight_cap": 2, "issue_session_id": false },
