@@ -52,6 +52,26 @@ class MediaHostRefused(ValueError):
     """A media URL's host the policy refuses: the caller's, never retried."""
 
 
+# Set on whatever the guarded connection's download raised (a hop refused, an
+# origin's error status, a broken transfer, a size cap), so a caller can tell
+# a failed fetch from a failure to read the bytes a fetch delivered, whatever
+# vLLM wraps the download's error in.
+_RAISED_BY_FETCH_ATTR = "smg_raised_by_media_fetch"
+
+
+def mark_raised_by_fetch(exc: BaseException) -> BaseException:
+    """`exc`, marked as raised by a media download."""
+    setattr(exc, _RAISED_BY_FETCH_ATTR, True)
+    return exc
+
+
+def raised_by_fetch(exc: BaseException) -> bool:
+    """Whether `exc` itself was raised by a media download (see
+    :func:`mark_raised_by_fetch`); the exceptions it was raised from are the
+    caller's to walk."""
+    return getattr(exc, _RAISED_BY_FETCH_ATTR, False) is True
+
+
 def _ipv4_class(address: ipaddress.IPv4Address) -> str | None:
     first, second, third, _ = address.packed
     if first == 0:
@@ -355,6 +375,15 @@ def guarded_connection(policy: MediaHostPolicy):
 
         def get_sync_client(self):
             raise RuntimeError("worker media fetches are async only")
+
+        async def async_get_bytes(self, *args: Any, **kwargs: Any) -> bytes:
+            # The one network step of vLLM's loader: what fails here is the
+            # fetch, never the decode of the bytes it delivered.
+            try:
+                return await super().async_get_bytes(*args, **kwargs)
+            except Exception as e:
+                mark_raised_by_fetch(e)
+                raise
 
     return GuardedHTTPConnection()
 

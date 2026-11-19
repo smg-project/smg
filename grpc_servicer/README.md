@@ -191,10 +191,12 @@ breaks the transfer is a 502, so a client knows whether to retry. None of
 these counts against the worker's circuit breaker, and the Router replays
 none of them on another worker, which would meet the same media. The vLLM Rust
 worker answers the same way for the media vLLM's own fetcher refuses under
-`--mm-processor inprocess`: a host the policy refuses or a data URL that is
-not base64 is a 400 `invalid_multimodal_request`, any other media the fetcher
-refuses (an origin 4xx, bytes that do not decode) a 400 `media_fetch_failed`,
-and an inline payload over `--mm-max-item-bytes` a 400 `media_too_large`; a
+`--mm-processor inprocess`, by where it failed: a reference refused before
+the download (a host the policy refuses, a URL or data URL the fetcher does
+not take) or bytes that do not decode (an image the loader cannot read, bad
+base64) is a 400 `invalid_multimodal_request`; a download the origin refuses
+(a 4xx) is a 400 `media_fetch_failed`; a download over vLLM's size cap or an
+inline payload over `--mm-max-item-bytes` is a 400 `media_too_large`. A
 timeout, a refused connection or an origin 5xx stays retryable there.
 
 For `nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B`, the router can preprocess

@@ -491,6 +491,31 @@ def test_a_public_name_passes_the_resolver_and_a_private_answer_does_not():
     asyncio.run(run())
 
 
+def test_the_connections_download_marks_what_it_raises(stub_vllm_connections, monkeypatch):
+    """vLLM's one network step: what it raises is told apart from a failure
+    to decode the bytes it delivered, whatever vLLM later wraps it in."""
+    failure = ValueError("HTTP 403")
+    answers = [b"bytes", failure]
+
+    async def async_get_bytes(self, url, **kwargs):
+        answer = answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    connections = sys.modules["vllm.connections"]
+    monkeypatch.setattr(
+        connections.HTTPConnection, "async_get_bytes", async_get_bytes, raising=False
+    )
+    connection = guard.media_connector_kwargs(None, allow_private_hosts=False)["connection"]
+    assert asyncio.run(connection.async_get_bytes("https://a/1.png", timeout=1)) == b"bytes"
+    with pytest.raises(ValueError) as raised:
+        asyncio.run(connection.async_get_bytes("https://a/1.png", timeout=1))
+    assert raised.value is failure
+    assert guard.raised_by_fetch(failure)
+    assert not guard.raised_by_fetch(ValueError("Failed to load image"))
+
+
 def test_the_connection_hands_vllm_the_guarded_session(stub_vllm_connections):
     async def run():
         kwargs = guard.media_connector_kwargs(None, allow_private_hosts=False)

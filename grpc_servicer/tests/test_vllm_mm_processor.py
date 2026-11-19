@@ -5,6 +5,7 @@ Run with: pytest grpc_servicer/tests/test_vllm_mm_processor.py
 
 import argparse
 import asyncio
+import binascii
 import importlib.util
 import logging
 import os
@@ -22,6 +23,8 @@ mm_processor = importlib.util.module_from_spec(_spec)
 # Registered so dataclass decorators can resolve the module by name.
 sys.modules[_spec.name] = mm_processor
 _spec.loader.exec_module(mm_processor)
+
+from smg_grpc_servicer.vllm.media_host_guard import mark_raised_by_fetch  # noqa: E402
 
 
 @dataclass
@@ -874,27 +877,87 @@ class TestFetchErrorClassification:
             run(p._fetch(3, _Item("image", "https://a/1.png")))
         assert mm_processor.client_media_code(raised.value) is None
 
+    @staticmethod
+    def from_download(cause, wrapped=None):
+        """What vLLM's loader raises when its download raises `cause`: the
+        guarded connection marks it, and the loader may wrap it `from` it."""
+        mark_raised_by_fetch(cause)
+        if wrapped is None:
+            return cause
+        try:
+            raise wrapped from cause
+        except BaseException as e:  # noqa: BLE001 - the wrapped exception is the result
+            return e
+
+    def code_of(self, exc, url="https://a/1.png", processor=None):
+        p = processor or self.processor(exc)
+        with pytest.raises(type(exc)) as raised:
+            run(p._fetch(0, _Item("image", url)))
+        assert raised.value is exc
+        return mm_processor.client_media_code(raised.value)
+
     def test_caller_errors_pass_through(self):
         p = self.processor(self._CallerError("415 Unsupported Media Type"))
-        with pytest.raises(self._CallerError, match="^415 Unsupported Media Type$") as raised:
+        with pytest.raises(self._CallerError, match="^415 Unsupported Media Type$"):
             run(p._fetch(0, _Item("image", "https://a/1.png")))
-        assert mm_processor.client_media_code(raised.value) == "media_fetch_failed"
 
-    def test_an_undecodable_image_is_the_requests_media(self):
-        p = self.processor(ValueError("Failed to load image: cannot identify image file"))
-        with pytest.raises(ValueError) as raised:
-            run(p._fetch(0, _Item("image", "https://a/1.png")))
-        assert mm_processor.client_media_code(raised.value) == "media_fetch_failed"
+    def test_an_origins_refusal_is_a_failed_fetch(self):
+        """An origin's 4xx, which vLLM wraps as its caller error: the fetch
+        was attempted and failed, as the router answers it."""
+        refused = self.from_download(
+            RuntimeError("403, message='Forbidden'"),
+            self._CallerError("Failed to fetch media from URL: HTTP 403 error"),
+        )
+        assert self.code_of(refused) == "media_fetch_failed"
+        # A refusal the download raises as it is, unwrapped, reads the same.
+        assert self.code_of(self.from_download(ValueError("bad redirect"))) == "media_fetch_failed"
+
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            ValueError("Failed to load image: cannot identify image file"),
+            ValueError("Failed to load image: image file is truncated"),
+            binascii.Error("Incorrect padding"),
+        ],
+    )
+    def test_media_that_does_not_decode_is_refused_as_sent(self, failure):
+        """Bytes the fetch delivered (or a data URL carried) that do not
+        decode: the request's media as it sent it, as the router answers an
+        image that does not decode or bad base64, not a failed fetch."""
+        assert self.code_of(failure) == "invalid_multimodal_request"
+        p = self.processor(failure)
+        assert self.code_of(failure, url="data:image/png;base64,AAAA", processor=p) == (
+            "invalid_multimodal_request"
+        )
+
+    def test_a_reference_refused_before_the_download_is_refused_as_sent(self):
+        """A URL that does not parse, a domain off the allow-list, a scheme
+        the fetcher does not take, a data URL with no payload: all raised
+        before any fetch."""
+        refused = self._CallerError("The URL must be from one of the allowed domains")
+        assert self.code_of(refused) == "invalid_multimodal_request"
+
+    def test_a_download_over_the_size_cap_is_too_large(self):
+        class _TooLarge(ValueError):
+            pass
+
+        too_large = self.from_download(
+            _TooLarge("Remote media download exceeds VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB=10"),
+            self._CallerError("Failed to fetch media from URL: Remote media download exceeds"),
+        )
+        p = self.processor(too_large)
+        p._download_too_large = (_TooLarge,)
+        assert self.code_of(too_large, processor=p) == "media_too_large"
 
     def test_a_host_the_policy_refuses_is_refused_as_the_request_sent_it(self):
-        """The host guard's refusal answers as the router answers a host its
-        policy refuses: `invalid_multimodal_request`, not a failed fetch."""
-        p = self.processor(
-            mm_processor.MediaHostRefused("media host '127.0.0.1' is a loopback address")
+        """The host guard's refusal, raised in the download and wrapped by
+        vLLM, answers as the router answers a host its policy refuses:
+        `invalid_multimodal_request`, not a failed fetch."""
+        refused = self.from_download(
+            mm_processor.MediaHostRefused("media host '127.0.0.1' is a loopback address"),
+            self._CallerError("Failed to fetch media from URL: Invalid URL"),
         )
-        with pytest.raises(mm_processor.MediaHostRefused) as raised:
-            run(p._fetch(0, _Item("image", "http://127.0.0.1/a.png")))
-        assert mm_processor.client_media_code(raised.value) == "invalid_multimodal_request"
+        assert self.code_of(refused, url="http://127.0.0.1/a.png") == ("invalid_multimodal_request")
 
     def test_a_reference_form_the_fetcher_does_not_take_is_the_callers_fault(self):
         """A data URL that is not base64: the fetcher refuses it as not

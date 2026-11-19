@@ -47,7 +47,11 @@ from smg_grpc_servicer.mm_sidecar_protocol import (
     resolve_namespace,
 )
 from smg_grpc_servicer.vllm import config_view
-from smg_grpc_servicer.vllm.media_host_guard import MediaHostRefused, media_connector_kwargs
+from smg_grpc_servicer.vllm.media_host_guard import (
+    MediaHostRefused,
+    media_connector_kwargs,
+    raised_by_fetch,
+)
 from smg_grpc_servicer.vllm.media_refs import (
     BASE_SCHEMES,
     FETCHABLE_MODALITIES,
@@ -113,6 +117,17 @@ def client_media_code(exc: BaseException) -> str | None:
     """The public code `mark_client_media` put on `exc`, if any."""
     code = getattr(exc, _CLIENT_MEDIA_CODE_ATTR, None)
     return code if isinstance(code, str) else None
+
+
+def _raised_from(exc: BaseException | None):
+    """`exc` and the exceptions it was raised from, newest first."""
+    seen: set[int] = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        yield exc
+        # As the traceback reads it: the explicit cause (`from`), else the
+        # exception being handled when this one was raised.
+        exc = exc.__cause__ if exc.__suppress_context__ else exc.__context__
 
 
 def resolve_mm_processor_mode(env: Mapping[str, str] = os.environ) -> str:
@@ -315,6 +330,8 @@ class InProcessMediaProcessor:
     # The served family's short-side floor (`floor_rule`), applied to a
     # fetched image before the engine's processor sees it; None raises nothing.
     _short_side_floor: FloorRule | None = None
+    # vLLM's download size caps, the releases that have them.
+    _download_too_large: tuple[type[BaseException], ...] = ()
 
     def __init__(
         self,
@@ -348,6 +365,13 @@ class InProcessMediaProcessor:
         self.max_inflight = max_inflight
         # The fetcher already decides which failures are the caller's.
         self._caller_error = VLLMClientError
+        import vllm.connections as vllm_connections
+
+        self._download_too_large = tuple(
+            cls
+            for name in ("MediaDownloadSizeExceededError", "HTTPResponseSizeExceededError")
+            if isinstance(cls := getattr(vllm_connections, name, None), type)
+        )
         # The allow-list vLLM checks the first URL against and the guarded
         # connection every hop goes through, both read as the router reads it.
         connector_kwargs = media_connector_kwargs(
@@ -423,13 +447,11 @@ class InProcessMediaProcessor:
         data URL in a form the fetcher does not take (one that is not base64,
         which it refuses as not implemented): no other worker takes it either.
         Each leaves marked as the request's own media (`mark_client_media`)
-        under the code the router answers it with: a host the policy refuses
-        and a data URL the fetcher does not take are refused as sent
-        (`invalid_multimodal_request`), the rest failed to fetch or read
-        (`media_fetch_failed`). A timeout, a refused connection, an origin 5xx
-        or a loader the worker lacks (whatever the reference, a base64 data
-        URL included) is not: the same request can succeed elsewhere or
-        later, so it leaves here as retryable.
+        under the code the router answers it with (`_client_media_code`). A
+        timeout, a refused connection, an origin 5xx or a loader the worker
+        lacks (whatever the reference, a base64 data URL included) is not: the
+        same request can succeed elsewhere or later, so it leaves here as
+        retryable.
         """
         try:
             if item.modality == "image":
@@ -441,11 +463,8 @@ class InProcessMediaProcessor:
                 return await self._connector.fetch_video_async(
                     item.url, video_processor=self._video_processor
                 )
-        except MediaHostRefused as e:
-            mark_client_media(e, INVALID_MULTIMODAL_REQUEST)
-            raise
         except (self._caller_error, ValueError) as e:
-            mark_client_media(e)
+            mark_client_media(e, self._client_media_code(e))
             raise
         except Exception as e:
             # The fetcher refuses a non-base64 data URL as not implemented: no
@@ -462,6 +481,25 @@ class InProcessMediaProcessor:
             logger.warning("media_refs[%d]: fetch failed for %s: %s", index, item.modality, e)
             raise MmProcessorUnavailable(f"media_refs[{index}]: fetch failed: {e}") from e
         raise ValueError(f"unsupported media modality {item.modality!r}")
+
+    def _client_media_code(self, exc: BaseException) -> str:
+        """The public code for the caller's error `exc`, by where the fetcher
+        raised it, as the router names the same failure: a download the origin
+        refused (a 4xx) is `media_fetch_failed`, and one over the download
+        size cap `media_too_large`; a host the
+        policy refuses, and anything raised before the download (a URL, a
+        domain or a data URL refused as sent) or while decoding the bytes it
+        delivered (an image that does not decode, bad base64), is
+        `invalid_multimodal_request`. vLLM wraps a download's error before
+        it gets here, so the whole chain is read."""
+        chain = list(_raised_from(exc))
+        if any(isinstance(e, MediaHostRefused) for e in chain):
+            return INVALID_MULTIMODAL_REQUEST
+        if any(isinstance(e, self._download_too_large) for e in chain):
+            return MEDIA_TOO_LARGE
+        if any(raised_by_fetch(e) for e in chain):
+            return MEDIA_FETCH_FAILED
+        return INVALID_MULTIMODAL_REQUEST
 
 
 # A modality name vLLM never configures: its resolved count is the unset default.
