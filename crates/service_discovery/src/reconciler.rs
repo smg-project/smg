@@ -311,10 +311,16 @@ fn build_worker_spec(
     // API key, the retry budget, compatibility labels — can move it.
     spec.labels
         .insert(DISCOVERY_SPEC_HASH_LABEL.to_string(), worker.fingerprint());
-    // served_model_name is priority #2 in create_worker's model_id chain.
-    if let Some(ref model_id) = worker.model_id_override {
+    // A nonblank served_model_name is priority #2 in create_worker's model_id chain.
+    // It is stamped without the blanks around it: a model id is matched exactly.
+    if let Some(model_id) = worker
+        .model_id_override
+        .as_deref()
+        .map(str::trim)
+        .filter(|model_id| !model_id.is_empty())
+    {
         spec.labels
-            .insert("served_model_name".to_string(), model_id.clone());
+            .insert("served_model_name".to_string(), model_id.to_string());
     }
     spec.kv_connector.clone_from(&worker.kv_connector);
     spec.kv_role.clone_from(&worker.kv_role);
