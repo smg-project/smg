@@ -2911,6 +2911,28 @@ async fn a_first_record_clears_the_ranks_its_workers_row_does_not_hold() {
     );
 }
 
+/// An answer of a pair engine in the prefill role that names rank 0 alone:
+/// `running` requests, and `queued` in its prefill queue.
+fn a_pair_answer(running: i32, queued: i32) -> WorkerLoadResponse {
+    let mut answer = answer_of(0, running);
+    answer.loads[0].disagg_mode = Some("prefill".to_string());
+    answer.loads[0].prefill_queue_reqs = Some(queued);
+    answer
+}
+
+/// The prefill-queue series of rank 0 of the worker at `http://w:1` under
+/// the prefill role, as rendered.
+fn prefill_queue_series(rendered: &str) -> &str {
+    rendered
+        .lines()
+        .find(|l| {
+            l.starts_with("smg_engine_pd_prefill_queue_reqs{")
+                && l.contains("http://w:1")
+                && l.contains("role=\"prefill\"")
+        })
+        .unwrap_or_else(|| panic!("no prefill-queue series:\n{rendered}"))
+}
+
 /// The running-requests series of rank 0 of the worker at `http://w:1`
 /// under `model`, as rendered.
 fn running_series_under<'a>(rendered: &'a str, model: &str) -> &'a str {
@@ -2927,8 +2949,9 @@ fn running_series_under<'a>(rendered: &'a str, model: &str) -> &'a str {
 }
 
 /// The guard is by model too. A successor that serves another model has
-/// written none of its predecessor's series, and its row keeps no
-/// sentinel away from them.
+/// written none of its predecessor's load series, and its row keeps no
+/// sentinel away from them. The pair series carry no model: the
+/// successor's stand, for its row holds the rank.
 #[tokio::test]
 async fn an_eviction_clears_the_series_of_a_model_its_successor_does_not_serve() {
     let rendered = render_with_recorder(|| {
@@ -2938,7 +2961,7 @@ async fn an_eviction_clears_the_series_of_a_model_its_successor_does_not_serve()
         monitor.apply_pushed_load(&first, 0, &pushed(7), Instant::now());
         let next = ready_worker("http://w:1", "b");
         assert!(registry.replace(&id, Arc::clone(&next)));
-        polled(&monitor, &next, answer_of(0, 9));
+        polled(&monitor, &next, a_pair_answer(9, 4));
 
         monitor.evict_worker_loads(&first);
     });
@@ -2948,6 +2971,31 @@ async fn an_eviction_clears_the_series_of_a_model_its_successor_does_not_serve()
     );
     assert!(
         running_series_under(&rendered, "b").ends_with(" 9"),
+        "{rendered}"
+    );
+    assert!(
+        prefill_queue_series(&rendered).ends_with(" 4"),
+        "{rendered}"
+    );
+}
+
+/// The pair series are a family apart from the load series. An eviction
+/// with no live writer at the URL sets both to the sentinel.
+#[tokio::test]
+async fn an_eviction_clears_the_pair_series_with_the_load_series() {
+    let rendered = render_with_recorder(|| {
+        let (registry, monitor) = build_monitor();
+        let worker = ready_worker("http://w:1", "m");
+        let id = registry.register(Arc::clone(&worker)).unwrap();
+        polled(&monitor, &worker, a_pair_answer(9, 4));
+        registry.transition_status(&id, WorkerStatus::NotReady);
+
+        monitor.evict_worker_loads(&worker);
+        monitor.flush_pending_evictions();
+    });
+    assert!(running_series(&rendered).ends_with(" -1"), "{rendered}");
+    assert!(
+        prefill_queue_series(&rendered).ends_with(" -1"),
         "{rendered}"
     );
 }

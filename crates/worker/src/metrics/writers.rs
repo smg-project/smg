@@ -1504,42 +1504,24 @@ impl Metrics {
         STRING_INTERNER.remove(worker_url);
     }
 
-    /// Sentinel-out the `smg_engine_*` series of a worker whose load feed
-    /// ended while its URL stays registered: its status left `Ready`, or a
-    /// same-URL replacement has not yet published its own load (see
-    /// `WorkerMonitor::evict_worker_loads`). The worker series store keeps
-    /// those series, so the last load would read as live. Each gauge is set
-    /// to -1, an impossible value for gauges whose 0 is meaningful. A removed
+    /// Sentinel-out one rank's load series under one model: the six
+    /// `smg_engine_*` gauges that carry the worker, the model and the rank.
+    /// The collector sets them for a worker whose load feed ended while its
+    /// URL stays registered: its status left `Ready`, or a same-URL
+    /// replacement has not written them yet (see
+    /// `WorkerMonitor::clear_series`). The worker series store keeps those
+    /// series, so the last load would read as live. Each gauge is set to -1,
+    /// an impossible value for gauges whose 0 is meaningful. A removed
     /// worker needs no sentinel: the store drops every `worker`-labelled
     /// series with the registration ([`Self::remove_worker_metrics`]) and
-    /// no-ops the writes that follow, this one included.
-    /// `dp_size` bounds the rank labels; the role label is unknown at teardown,
-    /// so the full `dp_rank` × role (prefill/decode/null) space is cleared. The
-    /// label set must exactly match `record_engine_load` (including `model` and
-    /// `dp_rank`) or a fresh series is created instead of overwriting the live one.
-    pub fn remove_engine_load_metrics(worker_url: &str, model_id: &str, dp_size: usize) {
+    /// no-ops the writes that follow, this one included. The label set must
+    /// exactly match `record_engine_load` (including `model` and `dp_rank`)
+    /// or a fresh series is created instead of overwriting the live one.
+    /// One call a rank: no rank between two is written.
+    pub(crate) fn remove_engine_rank_load_metrics(worker_url: &str, model_id: &str, dp_rank: i32) {
         let worker = intern_string(worker_url);
         let model = intern_model_label(model_id);
-        for rank in 0..dp_size.max(1) {
-            Self::set_engine_rank_sentinel(&worker, &model, &rank.to_string());
-        }
-    }
-
-    /// Sentinel-out one rank's `smg_engine_*` series: a rank a worker
-    /// reported past its own width, which
-    /// [`Self::remove_engine_load_metrics`] does not reach. One call a
-    /// rank: no rank between is written.
-    pub(crate) fn remove_engine_rank_load_metrics(worker_url: &str, model_id: &str, dp_rank: i32) {
-        Self::set_engine_rank_sentinel(
-            &intern_string(worker_url),
-            &intern_model_label(model_id),
-            &dp_rank.to_string(),
-        );
-    }
-
-    /// Set every `smg_engine_*` gauge of one rank to the sentinel.
-    fn set_engine_rank_sentinel(worker: &Arc<str>, model: &Arc<str>, rank: &str) {
-        let dp_rank = intern_string(rank);
+        let dp_rank = intern_string(&dp_rank.to_string());
         for name in [
             "smg_engine_running_requests",
             "smg_engine_waiting_requests",
@@ -1550,15 +1532,24 @@ impl Metrics {
         ] {
             gauge!(
                 name,
-                "worker" => Arc::clone(worker),
-                "model" => Arc::clone(model),
+                "worker" => Arc::clone(&worker),
+                "model" => Arc::clone(&model),
                 "dp_rank" => Arc::clone(&dp_rank),
             )
             .set(-1.0);
         }
+    }
 
-        // PD gauges are labeled {worker, role, dp_rank}; the role is unknown
-        // at teardown, so clear every role for this rank.
+    /// Sentinel-out one rank's pair series: the four `smg_engine_pd_*`
+    /// gauges, which carry the worker, the engine's role and the rank, and
+    /// no model. The role is unknown at teardown, so every role is cleared
+    /// (prefill/decode/null). They are a family apart from the load series
+    /// ([`Self::remove_engine_rank_load_metrics`]): a worker of any model
+    /// at the URL writes the same pair series, so the collector clears them
+    /// by the rank alone.
+    pub(crate) fn remove_engine_rank_pd_metrics(worker_url: &str, dp_rank: i32) {
+        let worker = intern_string(worker_url);
+        let dp_rank = intern_string(&dp_rank.to_string());
         for role in ["prefill", "decode", "null"] {
             for name in [
                 "smg_engine_pd_kv_transfer_latency_ms",
@@ -1568,7 +1559,7 @@ impl Metrics {
             ] {
                 gauge!(
                     name,
-                    "worker" => Arc::clone(worker),
+                    "worker" => Arc::clone(&worker),
                     "role" => role,
                     "dp_rank" => Arc::clone(&dp_rank),
                 )

@@ -389,28 +389,37 @@ impl PushedFile {
     }
 }
 
-/// Set `worker`'s `smg_engine_*` series to the sentinel, one by one: under
-/// each of its models, its own width and each rank `file` holds past it,
-/// but for a series `live` names, which a live writer has written. Its
+/// Set `worker`'s `smg_engine_*` series to the sentinel, one by one, for
+/// its own width and each rank `file` holds past it: a rank's load series
+/// under each of the worker's models, and its pair series, which carry no
+/// model. A series a live writer has written is left. `live` answers for
+/// a rank under a model, and under any model where it is given none. Its
 /// callers hold the lock of the reports, under which every series is
 /// written.
 #[cold]
 fn write_sentinel(
     worker: &Arc<dyn Worker>,
     file: Option<&PushedFile>,
-    live: impl Fn(&str, i32) -> bool,
+    live: impl Fn(Option<&str>, i32) -> bool,
 ) {
     let url = worker.url();
     let width = worker.dp_size().unwrap_or(1).max(1);
-    let ranks: Vec<i32> = (0..width)
+    let ranks = (0..width)
         .filter_map(|rank| i32::try_from(rank).ok())
-        .chain(file.into_iter().flat_map(|file| file.ranks_past(width)))
-        .collect();
+        .chain(file.into_iter().flat_map(|file| file.ranks_past(width)));
     // A worker can serve multiple models (one load group per model),
     // so sentinel every model's series — not just the primary.
-    for model_id in worker_model_ids(worker) {
-        for rank in ranks.iter().filter(|rank| !live(&model_id, **rank)) {
-            Metrics::remove_engine_rank_load_metrics(url, &model_id, *rank);
+    let models = worker_model_ids(worker);
+    for rank in ranks {
+        for model_id in &models {
+            if !live(Some(model_id.as_str()), rank) {
+                Metrics::remove_engine_rank_load_metrics(url, model_id, rank);
+            }
+        }
+        // The pair series carry the engine's role and no model: a rank's
+        // are left where a live writer holds the rank under any model.
+        if !live(None, rank) {
+            Metrics::remove_engine_rank_pd_metrics(url, rank);
         }
     }
 }
@@ -1495,7 +1504,9 @@ impl<G: Generation> WorkerMonitor<G> {
     /// ranks in the row, under each of its models: a poll writes a
     /// worker's series with the row it publishes. Another worker whose
     /// report stands at the URL with no record held is one for the ranks
-    /// on that report, under its own model. A report with a held record
+    /// on that report, under its own model. The pair series carry the
+    /// engine's role and no model: a rank's are left where a live writer
+    /// holds the rank under any model. A report with a held record
     /// is no live writer: its worker was not `Ready` at that record, and
     /// the flush that finds it `Ready` writes its series. `reports` is
     /// the locked map of the pushed reports, and every series is written
@@ -1521,9 +1532,10 @@ impl<G: Generation> WorkerMonitor<G> {
             .filter(|other| !Arc::ptr_eq(&other.pusher, worker) && !other.series_held);
         write_sentinel(worker, file, |model_id, rank| {
             row.as_ref().is_some_and(|(models, ranks)| {
-                ranks.contains(&rank) && models.iter().any(|model| model == model_id)
+                ranks.contains(&rank)
+                    && model_id.is_none_or(|id| models.iter().any(|model| model == id))
             }) || other.is_some_and(|other| {
-                other.pusher.model_id() == model_id
+                model_id.is_none_or(|id| other.pusher.model_id() == id)
                     && other.report.loads.iter().any(|load| load.dp_rank == rank)
             })
         });
