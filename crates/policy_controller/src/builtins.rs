@@ -183,7 +183,8 @@ impl Filter for NotTried {
 /// profile holds. The engine folds a profile made of these filters alone
 /// into one at its build ([`RowTests::of`]), and a decision that draws first
 /// asks it about each row drawn: one call a row, where the filters' own
-/// `keep`s are a call a filter.
+/// `keep`s are a call a filter. A whole pass asks it about every row of
+/// the single plan's pool, in one loop where the filters are a loop each.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RowTests(u8);
 
@@ -217,6 +218,22 @@ impl RowTests {
             };
         }
         Some(Self(tests))
+    }
+
+    /// The set as one decision asks it: without the overload test where
+    /// the host lifted that veto, and without the tried test where the
+    /// request names no row tried and the host none excluded. A test left
+    /// out keeps every row under these facts, so the set that is left
+    /// keeps the rows the whole set keeps, at fewer tests a row.
+    pub(crate) fn asked(self, facts: &RequestFacts<'_>, cx: &Constraints<'_>) -> Self {
+        let mut tests = self.0;
+        if cx.overload_lifted {
+            tests &= !Self::NOT_OVERLOADED;
+        }
+        if facts.tried.is_empty() && cx.excluded.is_empty() {
+            tests &= !Self::NOT_TRIED;
+        }
+        Self(tests)
     }
 
     /// Whether a decision under `cx` asks the host's mask about a row
