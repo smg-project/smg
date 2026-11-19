@@ -373,6 +373,21 @@ impl Fence {
         self.lead.load().term
     }
 
+    /// The instant the clock alone next turns the answer of
+    /// [`Fence::leader_term`], as the fence stands at `now`: the opening of
+    /// a take's window still ahead, or the end of the window this process
+    /// leads in, past which the fence is closed. `None` where no window
+    /// stands or it has ended: only a write of the elector turns the answer
+    /// then. A reader that waits on the role sleeps to this instant.
+    pub fn turns_at(&self, now: Instant) -> Option<Instant> {
+        let (opens, until) = self.lead.load().window?;
+        if now < opens {
+            Some(opens)
+        } else {
+            (now <= until).then_some(until)
+        }
+    }
+
     fn set(&self, term: u64, window: Option<(Instant, Instant)>) {
         self.lead.store(Arc::new(Lead { term, window }));
     }

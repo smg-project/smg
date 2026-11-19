@@ -96,7 +96,8 @@
 // with another present gateway's, refused while that one stands, or an add
 // of a registered URL; NOT_FOUND a replace of an absent URL, or no worker
 // under the id; DEADLINE_EXCEEDED a Session stream that said no Hello within
-// 5 s of its open; UNAVAILABLE a standby not yet synced, a read a standby
+// 5 s of its open, or a Replicate stream whose standby took no part of its
+// snapshot for 60 s; UNAVAILABLE a standby not yet synced, a read a standby
 // cannot serve yet (WatchWorkers until its replica follows the leader's log,
 // a NotLeader in the status details), a leader whose store does not lead its
 // term, on a membership write, a spec write, its dry run and a rollback,
@@ -165,7 +166,10 @@ service PolicyController {
   // Control scope, server stream.
   rpc WatchRegime(RegimeRequest) returns (stream Regime);
   // Replication scope, one bidirectional stream per standby: the leader's
-  // ordered log, acknowledged per batch, cut past a bounded backlog.
+  // ordered log, acknowledged per batch, cut past a bounded backlog. A
+  // leader sends 4 snapshots at once: a standby past them is told to
+  // re-sync, and told again each second, until one of them ends and its
+  // own snapshot's first part follows.
   rpc Replicate(stream ReplicaFrame) returns (stream ReplicationBatch);
   // Liveness and readiness are grpc.health.v1, not here.
 }

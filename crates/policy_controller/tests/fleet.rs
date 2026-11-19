@@ -93,6 +93,8 @@ mod grpc_plugin;
 #[expect(dead_code, reason = "this binary reads no admin page")]
 #[path = "common/net.rs"]
 mod net;
+#[path = "common/pair.rs"]
+mod pair;
 #[cfg(feature = "wasm")]
 #[expect(
     dead_code,

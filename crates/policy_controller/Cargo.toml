@@ -253,6 +253,10 @@ name = "elector_k8s_cell"
 required-features = ["kubernetes"]
 
 [[test]]
+name = "failover"
+required-features = ["client"]
+
+[[test]]
 name = "fleet"
 required-features = ["client"]
 

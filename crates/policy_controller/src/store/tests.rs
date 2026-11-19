@@ -10,12 +10,12 @@ use std::{
 use super::{
     identity, identity_of,
     leases::{Counts, Slot},
-    Ask, BatchFacts, BatchOutcome, ContentHash, Dispatch, GatewayId, Hand, HealthSink, Kinds,
-    KvEvent, KvEventSink, LeaseRecord, LeaseRefused, LeaseState, LeasesStore, LoadSink, LoadSource,
-    MembershipChange, MembershipTail, MemoryStore, Picked, Pin, PollMode, Position, Reachability,
-    ReservationKind, ReservationStore, ResyncReason, Said, SequenceHash, SessionsStore, Signals,
-    SnapshotChunk, StoredBlock, VetoWrite, ViewBuffers, WorkerFacts, WorkerPatch, WorkerStatus,
-    WorkersStore,
+    Ask, BatchFacts, BatchOutcome, ContentHash, Dispatch, GatewayId, Hand, HealthSink, Journal,
+    Kinds, KvEvent, KvEventSink, LeaseRecord, LeaseRefused, LeaseState, LeasesStore, LoadSample,
+    LoadSink, LoadSource, MembershipChange, MembershipTail, MemoryStore, Picked, Pin, PollMode,
+    Position, Reachability, ReservationKind, ReservationStore, ResyncReason, Said, SequenceHash,
+    SessionsStore, Signals, SnapshotChunk, StoredBlock, VetoWrite, ViewBuffers, WorkerFacts,
+    WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
 };
 use crate::{
     decider::Decider,
@@ -1846,6 +1846,117 @@ fn a_restore_tells_each_end_under_the_decider_whose_file_holds_its_lease() {
     let mut issued = [(named.0, Some(Decider::new(3))), (unnamed.0, first)];
     issued.sort_unstable();
     assert_eq!(ended, issued);
+}
+
+/// A journal that takes every place, and whose restart waits inside the
+/// restore's locks: it says that it stands there, then waits for the
+/// case's word.
+struct WaitsAtRestart {
+    reached: mpsc::Sender<()>,
+    go: Mutex<mpsc::Receiver<()>>,
+}
+
+impl Journal for WaitsAtRestart {
+    fn member(
+        &self,
+        _: Option<Position>,
+        _: u64,
+        _: MembershipChange,
+        _: Option<&WorkerRow>,
+        _: Option<&WorkerRow>,
+    ) {
+    }
+
+    fn load(&self, _: Option<Position>, _: WorkerId, _: u16, _: &LoadSample) {}
+
+    fn term_rose(&self, _: u64) {}
+
+    fn term_followed(&self, _: Position) {}
+
+    fn carries_loads(&self) -> bool {
+        false
+    }
+
+    fn head(&self, _: Kinds) -> Position {
+        Position::default()
+    }
+
+    fn followed(&self) -> Option<u64> {
+        None
+    }
+
+    fn restart(&self, _: Position) -> bool {
+        // A case that is gone is waited for no longer.
+        let _ = self.reached.send(());
+        if let Ok(word) = self.go.lock() {
+            let _ = word.recv();
+        }
+        true
+    }
+}
+
+/// A take beside a restore stands whole behind it. The take's write waits
+/// for the file's turn, which the restore holds from its start until the
+/// file is emptied: the first lease of the term taken is filed in the
+/// emptied file, on the restored row's count, and the restore ends no
+/// lease of that term.
+#[test]
+fn a_take_beside_a_restore_files_its_first_lease_behind_it() {
+    let (reached, stands) = mpsc::channel();
+    let (go, word) = mpsc::channel();
+    let store = MemoryStore::journaled(Arc::new(WaitsAtRestart {
+        reached,
+        go: Mutex::new(word),
+    }));
+    let a = ready(&store, "http://a:1");
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    // The lead before: one lease on file.
+    store.set_term(1);
+    LeasesStore::issue(&store, booking(gateway, 1, a, now)).expect("filed");
+    // Another replica led over the same row, and this one restores from
+    // its cut.
+    let leader = MemoryStore::new();
+    assert_eq!(ready(&leader, "http://a:1"), a);
+    let cut = leader.cut(Kinds::All);
+    let store = &store;
+    let (inside, restored, filed) = std::thread::scope(move |scope| {
+        let restore = scope.spawn(move || store.restore_from(cut));
+        // The restore stands inside its locks, at its journal's restart.
+        stands
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the restore reaches its journal");
+        // The replica takes the lease there: the take's write, then the
+        // first lease of its term.
+        let (landed, lands) = mpsc::channel();
+        let take = scope.spawn(move || {
+            store.set_term(2);
+            let first = LeaseRecord {
+                target: a,
+                ..lease(gateway, 2, 2, now)
+            };
+            let filed = LeasesStore::issue(store, first);
+            let _ = landed.send(());
+            filed
+        });
+        // Nothing of the take lands while the restore stands there.
+        let inside = lands.recv_timeout(Duration::from_millis(200)).is_ok();
+        go.send(()).expect("the restore waits at its journal");
+        (
+            inside,
+            restore.join().expect("the restore"),
+            take.join().expect("the take"),
+        )
+    });
+    assert!(!inside, "the take landed inside the restore");
+    assert!(restored);
+    filed.expect("the first lease of the term taken is filed");
+    // The file holds that lease, on the restored row's count, and nothing
+    // of the lead before.
+    let leases: &dyn LeasesStore = store;
+    assert!(leases.get(gateway, LeaseId(1)).is_none());
+    assert!(leases.get(gateway, LeaseId(2)).is_some());
+    assert_eq!(leases.term(), 2);
+    assert_eq!(in_flight(store), [(a, 1)]);
 }
 
 /// A pool that holds another gateway's host-local row is walked as its

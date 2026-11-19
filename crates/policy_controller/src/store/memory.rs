@@ -326,10 +326,24 @@ impl MemoryStore {
     /// holds the restore's thread until then. A gateway's
     /// `Hello` files what it lists again once this replica leads
     /// ([`LeasesStore::restore`]).
+    ///
+    /// A take beside the restore stands whole on one side of it. The
+    /// take's write waits for the files' turns ([`LeasesStore::set_term`]),
+    /// which the restore holds from its start until it has read the ids
+    /// on file: the leases it ends are those, and none of a term taken
+    /// behind it. Ahead of the restore, the journal weighs the cut
+    /// against the take. An issue reads its slot before it takes its
+    /// file's turn ([`LeasesStore::issue`]): one that read it ahead of the
+    /// swap and waited here books a slot the restored world does not
+    /// read, until its lease ends.
     pub fn restore_from(&self, cut: Cut) -> bool {
         // Taken before the first lock, so dropped after the last: the journal
         // restarts inside the locks, and its listener is told behind them.
         let _released = self.released();
+        // Every file's turn first, as their order has it, and held until
+        // the ids on file are read: a take's write waits for them, so a
+        // take lands whole ahead of the restore or whole behind it.
+        let mut turns = self.every_turn();
         let mut workers = self.workers.lock();
         let held: Vec<WorkerId>;
         {
@@ -391,12 +405,13 @@ impl MemoryStore {
         // id, as an apply tells a generation's.
         self.tell_members(&workers);
         drop(workers);
-        // The files' turns are taken with the restore's locks let go: the
-        // term rises under every turn, and then each lease leaves its
-        // file as a frame's release does ([`Self::empty`]). A later
-        // generation's stages never saw the issue and hear nothing of it.
-        self.raise(cut.at.term, || ());
-        self.empty();
+        // Under the turns taken at the start the term rises and the ids on
+        // file are read: each of those leases then leaves its file as a
+        // frame's release does, handed with the turns let go
+        // ([`Self::empty`]). A later generation's stages never saw the
+        // issue and hear nothing of it.
+        self.rise(&mut turns, cut.at.term);
+        self.empty(turns);
         true
     }
 
@@ -2818,8 +2833,9 @@ impl MemoryStore {
     }
 
     /// Every file's turn, taken in the files' order with nothing applied.
-    /// A term's rise holds them, and the start of a term the store
-    /// follows ([`Self::follow_term`]): no other path holds two turns.
+    /// A term's rise holds them, the start of a term the store follows
+    /// ([`Self::follow_term`]) and a standby's restore
+    /// ([`Self::restore_from`]): no other path holds two turns.
     fn every_turn(&self) -> Vec<turn::Turn<'_>> {
         self.files.iter().map(turn::File::take).collect()
     }
@@ -2841,24 +2857,25 @@ impl MemoryStore {
     }
 
     /// Takes every lease off its file: what a restore leaves of the
-    /// leases this replica filed. Each file's turn is taken alone, in the
-    /// files' order, and nothing is told under it: the ids on file are
-    /// read and the file's deadline queue is cleared, since every end is
-    /// a removed worker's release and never a deadline's. Each lease's
-    /// end is then handed to its file with no turn held ([`Self::hand`]):
-    /// applied and told as a frame's is, by the file's decider at work or
-    /// by this caller where none is.
-    fn empty(&self) {
+    /// leases this replica filed. `turns` are the files', every one held
+    /// by the restore since its start, and nothing is told under them:
+    /// the ids on file are read and each file's deadline queue is
+    /// cleared, since every end is a removed worker's release and never a
+    /// deadline's. The turns are let go there, and each lease's end is
+    /// handed to its file with no turn held ([`Self::hand`]), in the
+    /// files' order: applied and told as a frame's is, by the file's
+    /// decider at work or by this caller where none is. A lease filed
+    /// behind the turns is none of those read, and stays.
+    fn empty(&self, mut turns: Vec<turn::Turn<'_>>) {
         let removed = Said::Released(None, ReleaseReason::WorkerRemoved);
-        for file in self.files.iter() {
-            let on_file: Vec<Key> = {
-                let mut leases = file.take();
-                leases.due.clear();
-                leases.records.keys().copied().collect()
-            };
-            for (gateway, lease) in on_file {
-                self.hand(&Hand::new(gateway), lease, removed);
-            }
+        let mut on_file: Vec<Key> = Vec::new();
+        for leases in &mut turns {
+            leases.due.clear();
+            on_file.extend(leases.records.keys().copied());
+        }
+        drop(turns);
+        for (gateway, lease) in on_file {
+            self.hand(&Hand::new(gateway), lease, removed);
         }
     }
 }

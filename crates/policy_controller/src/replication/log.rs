@@ -4,7 +4,7 @@
 
 use std::{
     collections::{vec_deque, VecDeque},
-    fmt,
+    fmt, mem,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -325,8 +325,8 @@ impl Ring {
 ///
 /// The fields stand in the order written (`repr(C)`), the lock first: a
 /// read addresses the ring off the log's own pointer, whatever the ring's
-/// size. Each field's size is a multiple of eight bytes, so the order
-/// costs no padding.
+/// size. On a 64-bit target each field's size is a multiple of eight
+/// bytes, so the order costs no padding. The build holds both.
 #[repr(C)]
 pub struct Log {
     ring: Mutex<Ring>,
@@ -347,6 +347,20 @@ pub struct Log {
     /// `moves` is past it, and is told under no lock.
     told_at: AtomicU64,
 }
+
+// The layout the log's doc states: the lock is the first field, and on a
+// 64-bit target the declared order leaves no padding between the fields.
+const _: () = {
+    assert!(mem::offset_of!(Log, ring) == 0);
+    #[cfg(target_pointer_width = "64")]
+    assert!(
+        size_of::<Log>()
+            == size_of::<Mutex<Ring>>()
+                + 3 * size_of::<AtomicU64>()
+                + 2 * size_of::<usize>()
+                + size_of::<Option<Box<dyn Fn() + Send + Sync>>>()
+    );
+};
 
 impl fmt::Debug for Log {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
