@@ -1292,3 +1292,69 @@ def test_a_change_of_a_crates_wire_files_steps_it_past_its_own_caret(mod, tmp_pa
     code, out = check()
     assert code == 0, out
     assert "  ✓ wire (crates/wire/) — v0.1.0 → v0.2.0 (1 file(s) changed)" in out
+
+
+def test_a_crates_wire_files_are_read_against_every_published_copy_a_version_reaches(mod, tmp_path):
+    """Another release line can publish a later version of a crate with wire files of its own.
+    A tree that carries that version with other wire files is compared with that line's tag, not
+    with the comparison tag: the step leaves the carried version's caret. A version written by
+    hand inside the caret of a version any line published, with other wire files, is an issue."""
+    root = tmp_path / "lines"
+    root.mkdir()
+    git(root, "init", "-q", "-b", "main")
+    pins = {"wire": "0.1.0"}
+
+    def write(version, proto, subject):
+        pins["wire"] = version
+        put(root, "Cargo.toml", root_manifest(pins))
+        put(root, "crates/wire/Cargo.toml", manifest("wire", version))
+        put(root, "crates/wire/proto/common.proto", proto)
+        git(root, "add", "-A")
+        git(root, "commit", "-q", "-m", subject)
+
+    put(root, "crates/wire/src/lib.rs", "// wire\n")
+    put(root, "model_gateway/Cargo.toml", manifest("smg", "1.0.0"))
+    put(root, "model_gateway/src/main.rs", "fn main() {}\n")
+    write("0.1.0", "message A { int32 a = 1; }\n", "chore: initial")
+    git(root, "tag", "v1.0.0")
+    # Another line publishes 0.2.0 with a field more.
+    git(root, "checkout", "-q", "-b", "line")
+    write("0.2.0", "message A { int32 a = 1; int32 b = 2; }\n", "feat(wire): a field more")
+    git(root, "tag", "v1.1.0")
+    # Main takes the line's version and not its field: its wire files are the comparison tag's.
+    git(root, "checkout", "-q", "main")
+    write("0.2.0", "message A { int32 a = 1; }\n", "chore(wire): 0.2.0")
+
+    crates = (
+        mod.crate("smg", "model_gateway"),
+        mod.crate("wire", "crates/wire", "wire", wire=("crates/wire/proto/",)),
+    )
+
+    def check(mode="check"):
+        stream = io.StringIO()
+        code = mod.run(
+            root, "v1.0.0", mode, None, mod.Out(stream), crates=crates, packages=(), mirrors=()
+        )
+        return code, stream.getvalue()
+
+    code, out = check()
+    assert code == 1
+    assert (
+        "  ! wire (crates/wire/) — 1 file(s) changed but version not bumped (v0.2.0, v1.1.0's)"
+        " [minor]\n"
+        "    ! and its wire files changed: the step leaves ^0.2.0\n"
+    ) in out
+
+    # A patch written by hand, with a field of its own: ^0.1.0 refuses it and ^0.2.0 accepts it.
+    write("0.2.1", "message A { int32 a = 1; int32 c = 3; }\n", "chore(wire): 0.2.1")
+    code, out = check()
+    assert code == 1
+    assert (
+        "  ! wire (crates/wire/) — 1 file(s) changed, its wire files among them, but v0.2.1 is"
+        " inside ^0.2.0 [minor]"
+    ) in out
+
+    code, out = check("fix")
+    assert "minor wire v0.2.1 → v0.3.0 (crates/wire/Cargo.toml)" in out
+    code, out = check()
+    assert code == 0, out
