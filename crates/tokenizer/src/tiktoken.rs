@@ -717,8 +717,6 @@ impl TiktokenTokenizer {
             },
             // This file's reader takes every added token as it is spelled.
             &|| true,
-            // So it is not asked what it cuts out of a text.
-            &|_: &str| Vec::new(),
             &self.special_tokens,
         );
         if let Some(written) = written {
@@ -3312,10 +3310,13 @@ mod tests {
 
     /// A template that builds its control spellings and also writes an
     /// added token in pieces that stand side by side (a literal and the text
-    /// after it, two literals, a join of two, a text a comment parts) writes
-    /// that token whole (see `written_text`): it stays unmarked, as one that
-    /// spells the token in one piece does, and every request is encoded from
-    /// its text, also under an argument no probe conversation sets.
+    /// after it, two literals, a join of two, a text a comment parts), or
+    /// in pieces a render brings together (a piece between them left out, a
+    /// whole piece between them, a macro's text written where it is called),
+    /// writes that token whole (see `written_text` and `spelled_across`): it
+    /// stays unmarked, as one that spells the token in one piece does, and
+    /// every request is encoded from its text, also under an argument no
+    /// probe conversation sets.
     #[test]
     fn a_tiktoken_file_s_template_that_writes_an_added_token_in_pieces_stays_unmarked() {
         for piece in [
@@ -3325,6 +3326,9 @@ mod tests {
             "<{# no text #}b>",
             "<{# no text #}\nb>",
             "<b>",
+            "<{% if extra %}x{% endif %}b>",
+            "<{% if extra %}x{% endif %}{{ 'b' }}{% if extra %}y{% endif %}>",
+            "{% macro tail() %}b>{% endmacro %}<{{ tail() }}",
         ] {
             let template = format!(
                 "{}{{% if tag %}}{piece}{{% endif %}}",
