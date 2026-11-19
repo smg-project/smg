@@ -18,7 +18,7 @@
 //! stream took no part for [`STALLED`] ([`Hold`]).
 //!
 //! The load rows are journaled where the lease is shared, and nowhere else
-//! ([`journaled`]): a controller that leads itself over a lease in its own
+//! ([`journaled_waking`]): a controller that leads itself over a lease in its own
 //! process can have no standby, so its log carries the watched kinds alone
 //! and the call is refused by that state of its configuration.
 
@@ -35,14 +35,15 @@ use std::{
 use parking_lot::Mutex;
 use prost::{encoding::message, Message as _};
 use tokio::{
-    sync::watch,
+    sync::{watch, Notify},
     time::{interval, Interval, MissedTickBehavior},
 };
 use tonic::{codegen::tokio_stream::Stream, Code, Status, Streaming};
 use tracing::info;
 
 use super::{
-    election::LeasePlace, generations::Generations, service::not_leader, watch_workers, worker_wire,
+    election::LeasePlace, generations::Generations, service::not_leader, watch_workers,
+    worker_objects::ObjectsWake, worker_wire,
 };
 use crate::{
     elector::Fence,
@@ -76,8 +77,10 @@ pub(crate) const BEAT: Duration = Duration::from_secs(1);
 /// of it ([`watch_workers::PAGE_BYTES`]).
 const MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 
-/// A store and the feed of the log it journals to, for a lease at `place`:
-/// the one place the two are built. Where the lease is shared the log
+/// A store and the feed of the log it journals to, for a lease at `place`,
+/// built in one place ([`journaled_at`]). A watched write wakes the feed's
+/// one task and tells `objects`, the wake of the replica's worker objects.
+/// Where the lease is shared the log
 /// carries the load rows from the start, so a replica added to a running
 /// leader follows it with no restart; where the lease lives in this process
 /// the log carries the watched kinds alone, and a load write tells nothing
@@ -93,12 +96,22 @@ const MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 /// reader is told to start again. A standby that applied nothing names no
 /// place of any run: the standby's feed joins it at the drawn start
 /// ([`Feed::join`]).
+pub(crate) fn journaled_waking(
+    place: &LeasePlace,
+    deciders: usize,
+    objects: ObjectsWake,
+) -> (Arc<MemoryStore>, watch_workers::Feed) {
+    let first = RandomState::new().hash_one(0u8) % FIRST_PLACES;
+    journaled_at(place, first, deciders, objects)
+}
+
+/// [`journaled_waking`] with no worker objects to wake, for the cases.
+#[cfg(test)]
 pub(crate) fn journaled(
     place: &LeasePlace,
     deciders: usize,
 ) -> (Arc<MemoryStore>, watch_workers::Feed) {
-    let first = RandomState::new().hash_one(0u8) % FIRST_PLACES;
-    journaled_for(place, first, deciders)
+    journaled_waking(place, deciders, ObjectsWake::default())
 }
 
 /// The same over one file of leases with the log's places starting after
@@ -111,17 +124,45 @@ pub(crate) fn journaled_from(
     journaled_for(place, first, 1)
 }
 
-/// The store and its feed with the log's places starting after `first`,
-/// the store with a file of leases a decider, `deciders` of them
-/// ([`MemoryStore::with_deciders`]).
+/// The store and its feed with the log's places starting after `first`
+/// and `deciders` files of leases, with no worker objects to wake.
+#[cfg(test)]
 pub(crate) fn journaled_for(
     place: &LeasePlace,
     first: u64,
     deciders: usize,
 ) -> (Arc<MemoryStore>, watch_workers::Feed) {
+    journaled_at(place, first, deciders, ObjectsWake::default())
+}
+
+/// The store and its feed with the log's places starting after `first`,
+/// the store with a file of leases a decider, `deciders` of them
+/// ([`MemoryStore::with_deciders`]): the one place the two are built.
+///
+/// The log tells one listener, and that listener is made here: one
+/// callback that wakes the feed's one task and tells `objects`, each on a
+/// wake of its own, so neither sleeps through a write the other took. The
+/// set is fixed for the log's life. The callback runs on the writer's
+/// thread once the store has let the write's locks go: it wakes and does
+/// no work.
+pub(super) fn journaled_at(
+    place: &LeasePlace,
+    first: u64,
+    deciders: usize,
+    objects: ObjectsWake,
+) -> (Arc<MemoryStore>, watch_workers::Feed) {
     let loads = if place.is_shared() { LOAD_EVENTS } else { 0 };
-    let log = Log::new(WATCHED_EVENTS, loads).starting_after(first);
-    let feed = watch_workers::Feed::of(log);
+    let landed = Arc::new(Notify::new());
+    let log = {
+        let landed = Arc::clone(&landed);
+        Log::new(WATCHED_EVENTS, loads)
+            .starting_after(first)
+            .on_watched(move || {
+                landed.notify_one();
+                objects.tell();
+            })
+    };
+    let feed = watch_workers::Feed::of(Arc::new(log), landed);
     let journal: Arc<dyn Journal> = Arc::<Log>::clone(&feed.log);
     let store = MemoryStore::journaled(journal).with_deciders(deciders);
     (Arc::new(store), feed)

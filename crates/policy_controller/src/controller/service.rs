@@ -214,7 +214,7 @@ impl Shared {
     /// another fence guards. A spec document names the stages `catalog`
     /// holds. `deciders` is how many threads decide. The store comes with
     /// the feed of the log it journals to, the one value one place builds
-    /// ([`journaled`](super::replication::journaled)).
+    /// ([`journaled_waking`](super::replication::journaled_waking)).
     ///
     /// # Errors
     ///

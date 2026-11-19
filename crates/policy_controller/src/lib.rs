@@ -106,7 +106,8 @@
 //! - Behind the `worker-host` feature, a replica's worker objects
 //!   (`worker_host`): one object of the worker crate for every row of the
 //!   membership store, in a registry the host hands in, built, replaced and
-//!   dropped as the rows come, change and go.
+//!   dropped as the rows come, change and go. A controller built with it
+//!   follows its own store, on a leader and on a standby alike.
 //!
 //! What this step does not hold: the gRPC plugin service, the operator calls,
 //! the other ingestion drivers and the gRPC API; they arrive in later
