@@ -73,7 +73,9 @@ const VIDEO_MARKER: &str = "<video>";
 const VIDEO_ANCHOR: &str = "<SPECIAL_30>";
 /// The engine's default video loader keeps at most this many frames of a clip.
 const MAX_SAMPLED_FRAMES: usize = 32;
-/// A Reference video's tensors beside its frames, one entry per video.
+/// A Reference video's tensors beside its frames, one entry per video, as
+/// the engine declares them. `frames_indices` is as long as its clip, so
+/// clips of different lengths stay separate batches.
 const VIDEO_SIDE_TENSORS: [&str; 3] = ["video_num_patches", "frames_indices", "frame_duration_ms"];
 
 /// The family's spec, one instance per tensor layout (see the module docs).

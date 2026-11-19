@@ -201,6 +201,11 @@ fn images_match_the_reference_tiler() {
             "{name}: reference tokens"
         );
         let [height, width] = [case.rows, case.cols].map(|v| v as u32 * PATCH as u32);
+        assert_eq!(
+            out.encoder_input.shape(),
+            [1, 3, height as usize, width as usize],
+            "{name}: reference shape"
+        );
         assert!(
             matches!(out.model_specific.get("imgs_sizes"), Some(ModelSpecificValue::TupleVec(sizes)) if sizes == &[(height, width)]),
             "{name}: reference size"
@@ -281,12 +286,11 @@ fn video_frames_match_the_reference_sizing() {
             vec![case.tokens],
             "{name}: reference tokens"
         );
-        let shape = out.encoder_input.shape();
-        let grid = [shape[0], shape[2] / PATCH, shape[3] / PATCH].map(|v| v as i64);
+        let [frames, height, width] = [0, 1, 2].map(|i| case.grid[i] as usize);
         assert_eq!(
-            grid.as_slice(),
-            case.grid.as_slice(),
-            "{name}: reference grid"
+            out.encoder_input.shape(),
+            [frames, 3, height * PATCH, width * PATCH],
+            "{name}: reference shape"
         );
         let values = out.encoder_input.as_f32();
         compare(

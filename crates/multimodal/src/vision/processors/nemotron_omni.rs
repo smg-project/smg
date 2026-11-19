@@ -191,8 +191,11 @@ impl NemotronGeometry {
         let dynamic = match field("/vision_config/args/min_num_patches") {
             None => None,
             Some(_) => {
-                let max = number("/vision_config/args/max_num_patches")?;
-                let max = if max <= 0.0 { usize::MAX } else { max as usize };
+                let max = match number("/vision_config/args/max_num_patches")? {
+                    max if max <= 0.0 => usize::MAX,
+                    max if max.fract() == 0.0 => max as usize,
+                    _ => return Err(Invalid("/vision_config/args/max_num_patches")),
+                };
                 Some((count("/vision_config/args/min_num_patches")?, max))
             }
         };
@@ -214,7 +217,14 @@ impl NemotronGeometry {
             image_size: count("/force_image_size")?,
             use_thumbnail: flag("/use_thumbnail"),
             norm_mean: triple("/norm_mean")?,
-            norm_std: triple("/norm_std")?,
+            // The writer divides by the std as `f32`.
+            norm_std: triple("/norm_std").and_then(|std| {
+                let usable = |&v: &f64| (v as f32).is_finite() && v as f32 > 0.0;
+                std.iter()
+                    .all(usable)
+                    .then_some(std)
+                    .ok_or(Invalid("/norm_std"))
+            })?,
             dynamic,
             video_frame_size,
             video_temporal_patch_size: optional_count("/vision_config/video_temporal_patch_size")?
@@ -1463,6 +1473,21 @@ mod tests {
         assert_eq!(
             NemotronGeometry::from_model_config(&broken),
             Err(NemotronConfigError::Missing("/norm_std"))
+        );
+        // A std the writer cannot divide by, and a maximum that is no whole
+        // patch count, are refused when the config is read.
+        broken["norm_std"] = json!([0.0, 1.0, 1.0]);
+        assert_eq!(
+            NemotronGeometry::from_model_config(&broken),
+            Err(NemotronConfigError::Invalid("/norm_std"))
+        );
+        let mut fractional = config("omni");
+        fractional["vision_config"]["args"]["max_num_patches"] = json!(0.5);
+        assert_eq!(
+            NemotronGeometry::from_model_config(&fractional),
+            Err(NemotronConfigError::Invalid(
+                "/vision_config/args/max_num_patches"
+            ))
         );
     }
 
