@@ -20,7 +20,7 @@ use tokio::{
 };
 
 use super::{
-    now, peer, Failures, LoadDriver, LoadDriverConfig, LoadProbe, ReadError, Schedule, Target,
+    now, peer, Failures, LoadDriver, LoadDriverConfig, LoadProbe, Read, ReadError, Schedule, Target,
 };
 use crate::{
     spec::{BindingSpec, OverloadSpec},
@@ -296,6 +296,59 @@ async fn the_first_tick_polls_every_ready_engine_once_and_writes_a_row_per_rank(
     let stats = driver.stats();
     assert_eq!(stats.polls.load(Ordering::Relaxed), 2);
     assert_eq!(stats.rows.load(Ordering::Relaxed), 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_poll_carries_its_sample_time_and_keeps_the_poll_start_for_arbitration() {
+    let store = Arc::new(MemoryStore::new());
+    let probe = Arc::new(FakeProbe::default());
+    let id = ready(&store, "grpc://a:1", "grpc://a:1", 0, 1, WireModes::GRPC, 0);
+    let driver = driver(&store, &probe, TEN);
+    let members = driver.engines(&mut None);
+    let worker = &members[0];
+
+    let before = now();
+    tokio::time::advance(Duration::from_millis(240)).await;
+    let started = now();
+    tokio::time::advance(Duration::from_millis(160)).await;
+    let during = now();
+    tokio::time::advance(Duration::from_millis(350)).await;
+    let received = now();
+    let write = |sampled_at| {
+        driver.apply(
+            worker,
+            started,
+            Read::Poll {
+                ranks: vec![(0, id)],
+                served: false,
+                answer: Ok(WorkerLoadResponse {
+                    loads: vec![SchedulerLoadSnapshot::default()],
+                    dp_rank_count: 1,
+                    sampled_at,
+                    ..Default::default()
+                }),
+            },
+        );
+    };
+    for (reported, sampled, age) in [
+        (None, started, 0),
+        (Some(before), before, 750),
+        (Some(during), during, 350),
+        (Some(received + Duration::from_millis(1)), received, 0),
+    ] {
+        write(reported);
+        let sample = store.load(id, 0).expect("the polled row");
+        assert_eq!(sample.row.report_age_ms, age);
+        assert_eq!(sample.sampled_at, sampled);
+        assert_eq!(sample.received_at, started);
+    }
+
+    store.record(id, 0, LoadRow::default(), during, LoadSource::Stream);
+    write(Some(before));
+    assert_eq!(
+        store.load(id, 0).expect("the pushed row").source,
+        LoadSource::Stream
+    );
 }
 
 #[tokio::test(start_paused = true)]

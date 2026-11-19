@@ -2150,24 +2150,12 @@ impl MemoryStore {
             self.show(writer, world);
         }
     }
-}
 
-impl LoadSink for MemoryStore {
-    fn record(
-        &self,
-        id: WorkerId,
-        rank: u16,
-        row: LoadRow,
-        received_at: Instant,
-        source: LoadSource,
-    ) {
-        self.record_at(None, id, rank, row, received_at, source);
-    }
-
-    fn report(
+    fn report_loads(
         &self,
         answer: &[(WorkerId, u16, Option<LoadRow>)],
         polled_at: Instant,
+        sampled_at: Option<Instant>,
         source: LoadSource,
     ) -> Vec<usize> {
         let mut loads = self.loads.lock();
@@ -2219,11 +2207,13 @@ impl LoadSink for MemoryStore {
             }
             let (engine, brought) = match row {
                 Some(row) => {
-                    let age = Duration::from_millis(u64::from(row.report_age_ms));
                     let sample = LoadSample {
                         row,
                         received_at: polled_at,
-                        sampled_at: polled_at.checked_sub(age).unwrap_or(polled_at),
+                        sampled_at: sampled_at.unwrap_or_else(|| {
+                            let age = Duration::from_millis(u64::from(row.report_age_ms));
+                            polled_at.checked_sub(age).unwrap_or(polled_at)
+                        }),
                         source,
                     };
                     ranks.samples.insert(rank, sample);
@@ -2338,6 +2328,38 @@ impl LoadSink for MemoryStore {
             self.show(writer, world);
         }
         passed
+    }
+}
+
+impl LoadSink for MemoryStore {
+    fn record(
+        &self,
+        id: WorkerId,
+        rank: u16,
+        row: LoadRow,
+        received_at: Instant,
+        source: LoadSource,
+    ) {
+        self.record_at(None, id, rank, row, received_at, source);
+    }
+
+    fn report(
+        &self,
+        answer: &[(WorkerId, u16, Option<LoadRow>)],
+        polled_at: Instant,
+        source: LoadSource,
+    ) -> Vec<usize> {
+        self.report_loads(answer, polled_at, None, source)
+    }
+
+    fn report_sampled(
+        &self,
+        answer: &[(WorkerId, u16, Option<LoadRow>)],
+        polled_at: Instant,
+        sampled_at: Instant,
+        source: LoadSource,
+    ) -> Vec<usize> {
+        self.report_loads(answer, polled_at, Some(sampled_at), source)
     }
 
     fn heard_every(&self, period: Duration) -> bool {
