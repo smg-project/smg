@@ -427,6 +427,20 @@ fn build_worker_spec_carries_the_record_and_stamps_provenance() {
     );
 }
 
+#[test]
+fn build_worker_spec_omits_a_blank_model_override() {
+    let host = TestHost::without_a_queue();
+    for model_id_override in ["", " \t"] {
+        let worker = DiscoveredWorker {
+            model_id_override: Some(model_id_override.to_string()),
+            ..published("10.0.0.1:8081", "uid-1:8081")
+        };
+        let spec = build_worker_spec(&worker, DiscoveryKind::Kubernetes, &*host);
+
+        assert!(!spec.labels.contains_key("served_model_name"));
+    }
+}
+
 /// Compatibility labels are opaque here: any key a provider supplies is
 /// written verbatim. The keys below are deliberately not Kubernetes' — the
 /// reconciler has no notion of which provider's labels it is carrying.
