@@ -54,6 +54,7 @@ use crate::{
     config::RoutingMode,
     middleware::TenantRequestMeta,
     policies::PolicyRegistry,
+    policy_controller::Undecided,
     routers::{
         common::{
             body_policy::REASON_MODEL_SELECTION,
@@ -226,6 +227,16 @@ impl Gateway {
             .with_thread_bounds(&memory);
         gateway.enable_igw = config.router_config.enable_igw;
         let gateway = Arc::new(gateway);
+
+        if config.router_config.policy_controller {
+            // The policy controller was picked for this process and decides
+            // nothing yet. Its one router refuses each request by name, and
+            // no classic router is built, so no classic policy decides.
+            info!("The policy controller is picked for this gateway: no classic router is built");
+            gateway.register_router(router_ids::POLICY_CONTROLLER, Arc::new(Undecided));
+            gateway.set_default_router(router_ids::POLICY_CONTROLLER);
+            return Ok(gateway);
+        }
 
         if config.router_config.enable_igw {
             info!("Initializing the gateway in multi-router mode (IGW)");
