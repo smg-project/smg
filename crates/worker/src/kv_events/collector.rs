@@ -119,8 +119,11 @@ enum Slot {
 /// removal step runs it under a timeout, and a cleanup waiting on the
 /// removal permits can outlast that; a reservation only the remover could
 /// lift would then hold every later add of the URL for good. A task that
-/// had ended before its removal began runs no such path: the remover lifts
-/// the reservation after its wait, and the URL's next add lifts one whose
+/// had ended before its removal began leaves no reservation: the removal
+/// frees the slot on the turn that finds it
+/// ([`KvEventCollector::begin_removal`]). One that was past its own lift
+/// when the removal began, or never reached it, leaves the reservation to
+/// the remover after its wait, and to the URL's next add where that
 /// remover went first ([`KvEventCollector::lift_reservation`]).
 struct Reservation {
     /// The subscription the reservation belongs to; a task lifts only its own.
@@ -268,7 +271,7 @@ impl<H: KvEventHost> KvEventCollector<H> {
             // Dropped in that wait, this add leaves the slot to the old task
             // (the reservation lifts itself) and starts nothing.
             if matches!(handles.get(&url), Some(Slot::Active(sub)) if !sub.streams_for(worker)) {
-                let stale = Self::begin_removal(&mut handles, &url);
+                let stale = Self::begin_removal(&mut handles, &self.host, &url);
                 drop(handles);
                 info!(worker_url = %Endpoint::redacted_str(&url), "Restarting KV event subscription for a re-registered worker");
                 if let Some(sub) = stale {
@@ -288,12 +291,12 @@ impl<H: KvEventHost> KvEventCollector<H> {
             // out of the index: intern it again only once its task has ended.
             if done.has_changed().is_err() {
                 // The task is gone without lifting its reservation (it was
-                // aborted, panicked past its guard, or had ended before a
-                // removal whose caller went first): nothing is left to wait
-                // for. The reservation is lifted here as its task would have
-                // lifted it, the gauge lowered and the model's last index
-                // dropped, before its successor starts, whose answer owns
-                // the gauge from here.
+                // aborted, panicked past its guard, or was past its own lift
+                // at a removal whose caller went first): nothing is left to
+                // wait for. The reservation is lifted here as its task would
+                // have lifted it, the gauge lowered and the host told of the
+                // model's last events subscription, before its successor
+                // starts, whose answer owns the gauge from here.
                 Self::lift_reservation(&mut handles, &self.host, &url, reserved);
                 break handles;
             }
@@ -414,12 +417,13 @@ impl<H: KvEventHost> KvEventCollector<H> {
     /// are out of the index: lift the URL's reservation if it is this task's
     /// (a later subscription under the URL has its own), and tell the host
     /// when the model's last events subscription went with it.
-    /// The task does this rather than `on_worker_removed`,
-    /// whose future a caller may drop before the task has ended; a slot that
-    /// is `Active` (the task ended on its own, or `stop` took the
-    /// subscription) is left as it is. `worker` is the removed worker itself,
-    /// which the task holds through the write made here (see the task in
-    /// [`Self::on_worker_added`]).
+    /// The task does this itself, since a caller may drop
+    /// `on_worker_removed` before the task has ended; the remover lifts too,
+    /// after its wait, for a task that was past this step when the removal
+    /// began. A slot that is `Active` (the task ended on its own, or `stop`
+    /// took the subscription) is left as it is. `worker` is the removed
+    /// worker itself, which the task holds through the write made here (see
+    /// the task in [`Self::on_worker_added`]).
     async fn complete_removal(
         slots: &Mutex<HashMap<String, Slot>>,
         host: &H,
@@ -431,40 +435,55 @@ impl<H: KvEventHost> KvEventCollector<H> {
     }
 
     /// Lift the reservation `id` under `worker_url`, if it still stands
-    /// there: lower the worker's gauge, free the slot, and tell the host
+    /// there: free the slot, lower the worker's gauge, and tell the host
     /// when the model's last events subscription went with it
     /// ([`KvEventHost::model_left`]). The caller holds the slot lock.
-    /// Whoever finds the subscription's task ended calls it: the task at its
-    /// own end, the remover after its wait (a task that had ended before the
-    /// removal began lifted nothing), and an add that finds the
-    /// reservation's task gone.
+    /// Whoever finds the subscription's task ended behind its reservation
+    /// calls it: the task at its own end, the remover after its wait (a
+    /// task that was past its own lift when the removal began lifted
+    /// nothing), and an add that finds the reservation's task gone.
     fn lift_reservation(handles: &mut HashMap<String, Slot>, host: &H, worker_url: &str, id: u64) {
         if !matches!(handles.get(worker_url), Some(Slot::Removing(held)) if held.id == id) {
             return;
         }
+        // The slot was read as this reservation just above, under the lock
+        // the caller holds: the `else` is never taken.
+        let Some(Slot::Removing(held)) = handles.remove(worker_url) else {
+            return;
+        };
+        Self::subscription_gone(handles, host, worker_url, &held.model_id, held.kind);
+    }
+
+    /// A subscription's task has ended and its slot is free: lower the
+    /// worker's gauge, and tell the host when the model's last events
+    /// subscription went with it. The caller holds the slot lock.
+    fn subscription_gone(
+        handles: &HashMap<String, Slot>,
+        host: &H,
+        worker_url: &str,
+        model_id: &str,
+        kind: SubscriptionKind,
+    ) {
         // A backend without KV events is no longer a blind spot once its
-        // worker has left: lowered here, under the slot lock and only while
-        // the reservation is this subscription's, so a re-add of the URL
+        // worker has left: lowered here, under the slot lock and only by
+        // whoever freed this subscription's slot, so a re-add of the URL
         // that follows the removal cannot see its fresh gauge reset by a
         // stale caller, and a caller that dropped `on_worker_removed` early
         // does not leave it raised.
         Metrics::set_kv_events_unavailable(worker_url, false);
-        let Some(Slot::Removing(held)) = handles.remove(worker_url) else {
-            return;
-        };
         // Under the slot lock, which `on_worker_added` holds from its
         // `enroll` to its insert: an add of the model racing with this is
         // either counted below (its slot is already in) or enrolls after the
         // host has heard that the model left.
-        if held.kind != SubscriptionKind::Events {
+        if kind != SubscriptionKind::Events {
             return;
         }
         let last_of_model = !handles.values().any(|slot| {
             matches!(slot, Slot::Active(other)
-                if other.kind == SubscriptionKind::Events && other.model_id == held.model_id)
+                if other.kind == SubscriptionKind::Events && other.model_id == model_id)
         });
         if last_of_model {
-            host.model_left(&held.model_id);
+            host.model_left(model_id);
         }
     }
 
@@ -497,7 +516,7 @@ impl<H: KvEventHost> KvEventCollector<H> {
                     return;
                 }
             }
-            Self::begin_removal(&mut handles, worker_url)
+            Self::begin_removal(&mut handles, &self.host, worker_url)
         };
 
         let Some(sub) = subscription else {
@@ -527,7 +546,7 @@ impl<H: KvEventHost> KvEventCollector<H> {
             if !matches!(handles.get(url), Some(Slot::Active(sub)) if !sub.streams_for(worker)) {
                 return;
             }
-            Self::begin_removal(&mut handles, url)
+            Self::begin_removal(&mut handles, &self.host, url)
         };
         if let Some(sub) = stale {
             info!(worker_url = %Endpoint::redacted_str(url), "Ending the KV event subscription of a replaced worker: its successor streams nothing");
@@ -535,15 +554,24 @@ impl<H: KvEventHost> KvEventCollector<H> {
         }
     }
 
-    /// Under the slot lock: the URL's active subscription taken out, its
-    /// reservation left in the slot for the adds that come before its task
-    /// has ended; `None` for an empty slot or a removal already under way.
+    /// Under the slot lock: the URL's active subscription taken out. One
+    /// whose task still runs leaves its reservation in the slot, for the
+    /// adds that come before the task has ended. One whose task has already
+    /// ended leaves none: that task found the slot active at its own end
+    /// and lifted nothing, so the slot is freed on this turn, as a lift
+    /// frees it, and a caller that goes away after this turn leaves nothing
+    /// behind. `None` for an empty slot or a removal already under way.
     fn begin_removal(
         handles: &mut HashMap<String, Slot>,
+        host: &H,
         worker_url: &str,
     ) -> Option<WorkerSubscription> {
         match handles.remove(worker_url) {
             Some(Slot::Active(sub)) => {
+                if sub.done.has_changed().is_err() {
+                    Self::subscription_gone(handles, host, worker_url, &sub.model_id, sub.kind);
+                    return Some(sub);
+                }
                 handles.insert(
                     worker_url.to_string(),
                     Slot::Removing(Reservation {
@@ -565,15 +593,15 @@ impl<H: KvEventHost> KvEventCollector<H> {
     }
 
     /// Outside the lock: the taken subscription told to stop and awaited to
-    /// its end; the gauge lowered while the slot still holds its reservation.
+    /// its end, then its reservation lifted where it still stands.
     async fn finish_removal(&self, worker_url: &str, sub: WorkerSubscription) {
         info!(worker_url = %Endpoint::redacted_str(worker_url), "Stopping KV event subscription");
         // Signal graceful shutdown — task cleans up its worker_blocks in the indexer.
         let _ = sub.shutdown_tx.send(());
-        // The task lifts the reservation and drops the model's last index on
-        // its own (`complete_removal`); this wait is for the caller, who has
-        // the worker out of the index on return. A caller that drops the
-        // future here loses nothing but the join error below.
+        // The task lifts the reservation on its own (`complete_removal`);
+        // this wait is for the caller, who has the worker out of the sink on
+        // return. A caller that drops the future here leaves the lift to
+        // the task and loses the join error below.
         // Panics are caught inside the task; a JoinError here (abort or a
         // panic that escaped the guard) must still be surfaced, not discarded.
         let id = sub.id;
@@ -586,13 +614,14 @@ impl<H: KvEventHost> KvEventCollector<H> {
             Metrics::record_kv_event_subscription_failure(worker_url, "join_error");
         }
         // A task that ends on the shutdown signal lifts its reservation in
-        // its own cleanup (`complete_removal`). One that had ended before
-        // this removal began (the answer that raises the gauge ends the
-        // subscription), or that did not reach its cleanup, left the
-        // reservation in place, and the gauge and the model's index with
-        // it: lifted here, under the slot lock and only while the
-        // reservation is still this subscription's. A successor under the
-        // URL owns the gauge from its add on.
+        // its own cleanup (`complete_removal`). One that was past that step
+        // when this removal began, or that did not reach it, left the
+        // reservation in place: lifted here, under the slot lock and only
+        // while the reservation is still this subscription's. A caller
+        // dropped at this lock leaves it to the URL's next add. Behind a
+        // task that had ended before the removal began nothing is left to
+        // lift: the first turn freed the slot. A successor under the URL
+        // owns the gauge from its add on.
         let mut handles = self.worker_handles.lock().await;
         Self::lift_reservation(&mut handles, &self.host, worker_url, id);
     }
@@ -706,6 +735,8 @@ mod tests {
     #[derive(Default)]
     struct RecordingHost {
         calls: parking_lot::Mutex<Vec<String>>,
+        /// Whether `open` refuses: the task then ends by itself, at once.
+        refuses_open: bool,
     }
 
     impl RecordingHost {
@@ -733,7 +764,7 @@ mod tests {
             self.calls
                 .lock()
                 .push(format!("open {model} {}", worker.url()));
-            Some((Arc::new(NullSink), ()))
+            (!self.refuses_open).then(|| (Arc::new(NullSink), ()))
         }
 
         fn model_left(&self, model: &str) {
@@ -1317,6 +1348,87 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(30), collector.stop())
             .await
             .expect("the stop ends the stream left");
+    }
+
+    /// A task that ended by itself leaves its slot active (a host that
+    /// refuses the open, an engine that serves no events). The removal that
+    /// finds it frees the slot on that same turn of the lock and tells the
+    /// host, so a caller that goes away right after that turn leaves no
+    /// reservation behind. The removal queues for a held lock with a read of
+    /// the slot right behind it: the lock is fair, so the read runs the
+    /// moment the removal's first turn ends.
+    #[tokio::test]
+    async fn a_removal_behind_an_ended_task_frees_the_slot_on_its_own_lock_turn() {
+        let host = Arc::new(RecordingHost {
+            refuses_open: true,
+            ..Default::default()
+        });
+        let collector = KvEventCollector::new(Arc::clone(&host));
+        let worker = unconnected_grpc_worker_at("grpc://127.0.0.1:6");
+        let url = worker.url();
+        collector
+            .on_worker_added(&worker, SubscriptionKind::Events)
+            .await;
+        let mut ended = false;
+        for _ in 0..200 {
+            ended = collector.task_ended(url).await;
+            if ended {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(ended, "the task ends behind the refused open");
+        let (active, removing) = collector.slot_ids(url).await;
+        assert!(
+            active.is_some(),
+            "a task that ended by itself keeps its slot"
+        );
+        assert_eq!(removing, None);
+
+        {
+            let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+            let mut removal = std::pin::pin!(collector.on_worker_removed(url));
+            let mut read = std::pin::pin!(collector.worker_handles.lock());
+            let held = collector.worker_handles.lock().await;
+            assert!(
+                std::future::Future::poll(removal.as_mut(), &mut cx).is_pending(),
+                "the removal queues for the held lock"
+            );
+            assert!(
+                std::future::Future::poll(read.as_mut(), &mut cx).is_pending(),
+                "the read queues behind the removal"
+            );
+            drop(held);
+            assert!(
+                std::future::Future::poll(removal.as_mut(), &mut cx).is_pending(),
+                "the removal's first turn ends in its wait for the lock the read has"
+            );
+            let handles = read.await;
+            assert_eq!(
+                KvEventCollector::<RecordingHost>::ids_under(&handles, url),
+                (None, None),
+                "the turn that found the ended task freed the slot"
+            );
+            // The removal is dropped here in its wait, as a timeout drops it.
+        }
+        assert_eq!(
+            host.calls(),
+            [
+                "enroll unknown grpc://127.0.0.1:6",
+                "open unknown grpc://127.0.0.1:6",
+                "model_left unknown",
+            ]
+        );
+        assert_eq!(collector.slot_ids(url).await, (None, None));
+
+        // Nothing is left to wait for: the address's next add starts afresh.
+        collector
+            .on_worker_added(&worker, SubscriptionKind::Events)
+            .await;
+        let (active, removing) = collector.slot_ids(url).await;
+        assert!(active.is_some(), "the next add starts a stream at once");
+        assert_eq!(removing, None);
+        collector.stop().await;
     }
 
     /// The add that restarts a stream waits for the old task to end. A
