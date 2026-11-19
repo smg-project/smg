@@ -107,10 +107,11 @@ pub(crate) struct Feed {
     /// The place of the last membership entry the wire had no form for
     /// ([`Feed::untold`]): such an entry is logged once a replica.
     unwired: Arc<Mutex<Position>>,
-    /// The rows at one place of the log: the cut the first watch took
-    /// there, kept for every other that starts there. It is let go when a
-    /// write moves the log past that place and when the last watch leaves:
-    /// a copy of every row is held only while a watch can share it.
+    /// The rows at one place of the log: the cut the first read took there,
+    /// kept for every other that starts there ([`Feed::rows_at_head`]). It
+    /// is let go when a write moves the log past that place, when the last
+    /// watch leaves, and by the last snapshot call out with no watch open:
+    /// a copy of every row is held only while a reader can share it.
     rows: Arc<Mutex<Option<Arc<Cut>>>>,
 }
 
@@ -190,6 +191,32 @@ impl Feed {
         {
             *kept = None;
         }
+    }
+
+    /// The rows at the log's last watched write. A cut is a write's, not a
+    /// reader's: the first read that starts at a place takes it from
+    /// `store`, under the membership lock for the copy, and every read that
+    /// starts there shares it: a watch's start, and the operators'
+    /// snapshot. Reads that come together or in a loop hold that lock once
+    /// a write, and the feed keeps one copy of the rows while a reader can
+    /// share it ([`Feed::let_go`], [`Seat`], [`Watchers::unshared`]). The
+    /// kept cut is named by its place with its term, never by a sequence
+    /// alone: a restore can leave one sequence over other rows.
+    pub(crate) fn rows_at_head(&self, store: &MemoryStore) -> Arc<Cut> {
+        let mut kept = self.rows.lock();
+        let head = self.log.head(Kinds::Watched);
+        if let Some(cut) = kept.as_ref().filter(|cut| cut.at == head) {
+            return Arc::clone(cut);
+        }
+        let cut = Arc::new(store.cut(Kinds::Watched));
+        *kept = Some(Arc::clone(&cut));
+        cut
+    }
+
+    /// The kept cut, for a case.
+    #[cfg(test)]
+    pub(crate) fn kept(&self) -> Option<Arc<Cut>> {
+        self.rows.lock().clone()
     }
 
     /// A membership entry the wire has no form for: no watch is told it,
@@ -278,23 +305,10 @@ impl Source {
         self.fence.leader_term(Instant::now()) == Some(self.term)
     }
 
-    /// The rows at the log's last watched write. A cut is a write's, not a
-    /// watcher's: the first watch that starts at a place takes it, under
-    /// the membership lock for the copy, and every watch that starts there
-    /// shares it. Watchers that open together or in a loop hold that lock
-    /// once a write, and the feed keeps one copy of the rows while a watch
-    /// can share it ([`Feed::let_go`], [`Seat`]). The kept cut is named by
-    /// its place with its term, never by a sequence alone: a restore can
-    /// leave one sequence over other rows.
+    /// The rows a watch starts from: the feed's cut at the log's last
+    /// watched write ([`Feed::rows_at_head`]).
     fn rows(&self) -> Arc<Cut> {
-        let mut kept = self.feed.rows.lock();
-        let head = self.feed.log.head(Kinds::Watched);
-        if let Some(cut) = kept.as_ref().filter(|cut| cut.at == head) {
-            return Arc::clone(cut);
-        }
-        let cut = Arc::new(self.store.cut(Kinds::Watched));
-        *kept = Some(Arc::clone(&cut));
-        cut
+        self.feed.rows_at_head(&self.store)
     }
 }
 
@@ -466,6 +480,19 @@ impl Watchers {
         })
     }
 
+    /// Lets the feed's kept cut go where no watch is open: what the last
+    /// snapshot call out does, once no other call is let in to share it.
+    /// The last seat given back does the same ([`Seat`]): a copy of every
+    /// row is held only while a reader can share it. The table's lock is
+    /// given back first, as there: a watch that opens now takes a cut of
+    /// its own at worst.
+    pub(crate) fn unshared(&self, feed: &Feed) {
+        let none = self.held.lock().is_empty();
+        if none {
+            *feed.rows.lock() = None;
+        }
+    }
+
     /// The watches `by` holds open.
     #[cfg(test)]
     fn open_of(&self, by: &Principal) -> usize {
@@ -528,6 +555,12 @@ pub(crate) fn open(
     })
 }
 
+/// Whether `row` serves one of `models`, the ids a caller asked for; none
+/// asked is every model. A watch and the operators' snapshot ask alike.
+pub(super) fn serves(models: &[String], row: &WorkerRow) -> bool {
+    models.is_empty() || row.facts.models.iter().any(|model| models.contains(model))
+}
+
 /// The models a watcher asked for; none is every model.
 #[derive(Debug)]
 struct Asked {
@@ -536,12 +569,7 @@ struct Asked {
 
 impl Asked {
     fn serves(&self, row: &WorkerRow) -> bool {
-        self.models.is_empty()
-            || row
-                .facts
-                .models
-                .iter()
-                .any(|model| self.models.contains(model))
+        serves(&self.models, row)
     }
 
     /// Whether a watch comes to the write: a row it names serves an asked
@@ -594,13 +622,25 @@ pub(super) fn fill<'a>(
     rows: impl IntoIterator<Item = &'a WorkerRow>,
     told: impl Fn(&WorkerRow) -> proto::WorkerRow,
 ) -> Vec<proto::WorkerRow> {
+    fill_within(PAGE, rows, told)
+}
+
+/// [`fill`] under a count of the caller's: at most `most` of `rows` while
+/// they take at most [`PAGE_BYTES`] on the wire, the first whatever it
+/// weighs. The operators' snapshot is one such page, under its caller's
+/// limit.
+pub(super) fn fill_within<'a>(
+    most: usize,
+    rows: impl IntoIterator<Item = &'a WorkerRow>,
+    told: impl Fn(&WorkerRow) -> proto::WorkerRow,
+) -> Vec<proto::WorkerRow> {
     let mut page = Vec::new();
     let mut bytes = 0;
-    for row in rows.into_iter().take(PAGE) {
+    for row in rows.into_iter().take(most) {
         let told = told(row);
         // A row in a page: its bytes under the page's tag and a length
-        // (`WorkerSnapshot.workers`, `ReplicationSnapshot.workers`: a tag
-        // of one byte each).
+        // (`WorkerSnapshot.workers`, `ReplicationSnapshot.workers`,
+        // `Snapshot.workers`: a tag of one byte each).
         let framed = message::encoded_len(1, &told);
         if !page.is_empty() && bytes + framed > PAGE_BYTES {
             break;

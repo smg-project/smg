@@ -568,7 +568,7 @@ pub(super) fn parts(cut: Arc<Cut>, now: Instant) -> Vec<proto::ReplicationBatch>
 }
 
 /// An instant's age at `now`, in milliseconds: what crosses in its place.
-fn age_ms(now: Instant, then: Instant) -> u64 {
+pub(super) fn age_ms(now: Instant, then: Instant) -> u64 {
     u64::try_from(now.saturating_duration_since(then).as_millis()).unwrap_or(u64::MAX)
 }
 

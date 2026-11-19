@@ -5,8 +5,9 @@
 //! `Leader` is served, on every listener and by every replica, to a caller
 //! with a principal or with none. `Session` and `Decide` are served to a
 //! gateway ([`session`], [`decide`]); the leader serves the control scope's
-//! three registration calls and the watch of the worker rows
-//! ([`watch_workers`]). A controller given a spec source serves
+//! three registration calls, the watch of the worker rows
+//! ([`watch_workers`]) and the operators' snapshot of those rows and of
+//! the spec's status ([`snapshot`]). A controller given a spec source serves
 //! `GetPolicySpec` on the control scope, and `ApplyPolicySpec` and
 //! `RollbackPolicySpec` beside it where it leads. Every other call is
 //! refused:
@@ -59,7 +60,7 @@ use super::{
     membership::Door,
     principal::{self, Layer, Principal},
     replication::{Batches, Replication},
-    session,
+    session, snapshot,
     standby::{self, Lag},
     watch_workers::{self, Feed, Source, Watchers, Watching},
     wire, PROTOCOL_VERSION,
@@ -188,6 +189,9 @@ pub(crate) struct Shared {
     /// under, the first of the three counts of design 5.4: made again
     /// where the configuration is known.
     pub(crate) lag: Arc<Lag>,
+    /// The turn of the operators' snapshots: one is taken at a time, off
+    /// the runtime's workers.
+    pub(crate) snapshots: snapshot::Turn,
 }
 
 /// Who leads, as this replica knows it at one read of its fence.
@@ -267,6 +271,7 @@ impl Shared {
             role: watch::channel(false).0,
             watchers: Arc::new(Watchers::new(session::PRESENT_MAX)),
             floors: Floors::default(),
+            snapshots: snapshot::Turn::default(),
         })
     }
 
@@ -563,18 +568,18 @@ impl Service {
     /// admitted under a take the store has since passed is told to retry.
     /// So a call that reads this guard is not served under a term the store
     /// does not lead: a membership write, a spec write, its dry run and a
-    /// rollback, the snapshot and a standby's stream here, a watch's open
-    /// through [`Service::watched`]. A session and a `Decide` read the
-    /// fence alone.
+    /// rollback, a standby's stream and its snapshot here, a watch's open
+    /// and the operators' snapshot through [`Service::watched`]. A session
+    /// and a `Decide` read the fence alone.
     pub(crate) fn leading(&self, now: Instant) -> Result<u64, Status> {
         self.led(now, Code::FailedPrecondition, "this replica does not lead")
     }
 
-    /// The term a watch of the rows is served under at `now`. A standby
-    /// serves one once it follows the leader's log; none does in this
-    /// build, so a replica that does not lead is a standby not yet synced:
-    /// `UNAVAILABLE`, with the `NotLeader` a write's refusal carries, in the
-    /// same form.
+    /// The term a read of the rows is served under at `now`: a watch's
+    /// open, and the operators' snapshot. A standby serves one once it
+    /// follows the leader's log; none does in this build, so a replica that
+    /// does not lead is a standby not yet synced: `UNAVAILABLE`, with the
+    /// `NotLeader` a write's refusal carries, in the same form.
     fn watched(&self, now: Instant) -> Result<u64, Status> {
         self.led(now, Code::Unavailable, FOLLOWS_NO_LOG)
     }
@@ -805,13 +810,46 @@ impl PolicyController for Service {
             .map(Response::new)
     }
 
-    /// The operators' read, which this build does not serve. A standby is
-    /// restored on its `Replicate` stream, never from this call.
+    /// The operators' read of what this replica holds ([`snapshot`]): the
+    /// slices this build serves, redacted, under the term this replica
+    /// leads. A replica that does not lead refuses it as it refuses a
+    /// watch's open. The request's own rules come behind the lead, each
+    /// field refused by its name, the spec slice of a controller with no
+    /// spec source among them, and a refused request takes no turn. One
+    /// snapshot is taken at a time, off the runtime's workers
+    /// ([`snapshot::Turn`]), from the feed's cut at the log's head, which a
+    /// watch's start shares. The lead is read again behind that wait: the
+    /// answer is told while this replica still leads the term the call was
+    /// admitted under. A standby is restored on its `Replicate` stream,
+    /// never from this call.
     async fn get_snapshot(
         &self,
         request: Request<proto::SnapshotRequest>,
     ) -> Result<Response<proto::Snapshot>, Status> {
-        self.unserved(Call::GetSnapshot, &request)
+        self.admit(Call::GetSnapshot, &request)?;
+        let term = self.watched(Instant::now())?;
+        let asked = snapshot::asked(request.into_inner())?;
+        asked.sourced(self.shared.generations.bound())?;
+        let shared = Arc::clone(&self.shared);
+        let take = move || {
+            snapshot::taken(
+                &asked,
+                term,
+                &shared.controller_id,
+                || shared.feed.rows_at_head(&shared.store),
+                &shared.generations,
+                Instant::now(),
+            )
+        };
+        // The last call out lets the feed's kept cut go where no watch is
+        // open to share it.
+        let last = Arc::clone(&self.shared);
+        let out = move || last.watchers.unshared(&last.feed);
+        let taken = self.shared.snapshots.run(take, out).await??;
+        if self.watched(Instant::now())? != term {
+            return Err(Status::unavailable(TAKE_OVER));
+        }
+        Ok(Response::new(taken))
     }
 
     async fn explain(
@@ -1646,13 +1684,13 @@ mod tests {
         assert_eq!(unplaced.code(), Code::Unauthenticated);
         assert_eq!(unplaced.message(), NO_PRINCIPAL);
 
-        // The snapshot is the operators' read, unserved. A standby is
-        // restored on its Replicate stream: the replication scope does not
-        // make the call.
+        // The snapshot is the operators' read and the leader's to serve:
+        // this replica does not lead. A standby is restored on its
+        // Replicate stream: the replication scope does not make the call.
         let snapshot = || from("standby-a", proto::SnapshotRequest::default());
         for (listener, code) in [
             (&gateway, Code::PermissionDenied),
-            (&control, Code::Unimplemented),
+            (&control, Code::Unavailable),
             (&replication, Code::PermissionDenied),
         ] {
             let status = listener
@@ -1828,15 +1866,18 @@ mod tests {
 
     /// The calls a step serves, beside `Leader`, each with its refusal by a
     /// replica that never took the lease: a write is the leader's alone, as
-    /// are a standby's batches; a watch of the rows is a standby's once it
-    /// follows the leader's log, which none does in this build.
+    /// are a standby's batches; a watch of the rows and the operators'
+    /// snapshot are a standby's once it follows the leader's log, which
+    /// none does in this build.
     fn refused_off_the_leader(call: Call) -> Option<(Code, &'static str)> {
         const NOT_LEADING: (Code, &str) = (Code::FailedPrecondition, "this replica does not lead");
         match call {
             Call::RegisterWorker | Call::PatchWorker | Call::DeregisterWorker | Call::Replicate => {
                 Some(NOT_LEADING)
             }
-            Call::WatchWorkers => Some((Code::Unavailable, super::FOLLOWS_NO_LOG)),
+            Call::WatchWorkers | Call::GetSnapshot => {
+                Some((Code::Unavailable, super::FOLLOWS_NO_LOG))
+            }
             _ => None,
         }
     }
@@ -1849,8 +1890,8 @@ mod tests {
     /// scopes, and on them unauthenticated to a caller the layer did not
     /// place. To the caller it placed, a call no step serves is
     /// unimplemented, `Session` is reached (the empty message is no
-    /// `Hello`), and a registration call or a watch of the rows is refused
-    /// by a replica that does not lead. The names are read from the
+    /// `Hello`), and a registration call, a watch of the rows or a snapshot
+    /// is refused by a replica that does not lead. The names are read from the
     /// contract, so a method added there joins the case, and fails it until
     /// the table holds its call.
     #[tokio::test]
@@ -2513,8 +2554,9 @@ mod tests {
     /// replica holds the lease and its store's writes stand under no term.
     /// A watch's open, a registration, a patch and a removal are refused
     /// then, `UNAVAILABLE`, and the words say that it lasts the lead. The
-    /// snapshot call is served to no caller by this build, whatever the
-    /// term: a standby's restore rides its stream, refused below.
+    /// operators' snapshot is refused the same way: its header would name a
+    /// term the store does not lead. A standby's restore rides its stream,
+    /// refused below.
     #[tokio::test]
     async fn a_take_that_started_no_term_serves_no_watch_or_membership_call() {
         for followed in [1, 5] {
@@ -2557,6 +2599,8 @@ mod tests {
             refused(service.patch_worker(patch).await.err(), "a patch");
             let removal = from("operator-a", proto::DeregisterWorkerRequest::default());
             refused(service.deregister_worker(removal).await.err(), "a removal");
+            let snapshot = from("operator-a", proto::SnapshotRequest::default());
+            refused(service.get_snapshot(snapshot).await.err(), "a snapshot");
             assert_eq!(service.shared.feed.log.head(Kinds::Watched), place);
         }
     }
@@ -3008,6 +3052,451 @@ mod tests {
             );
         }
         assert_eq!(control.shared.generations.generation(), 3);
+    }
+
+    /// A `GetSnapshot` call from `operator-a` for `slices`.
+    fn snapshot(slices: &[proto::snapshot_request::Slice]) -> Request<proto::SnapshotRequest> {
+        from(
+            "operator-a",
+            proto::SnapshotRequest {
+                slices: slices.iter().map(|slice| i32::from(*slice)).collect(),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// The operators' snapshot on the leader, under a spec store: the
+    /// header, the rows as an operator reads them and the spec's status. A
+    /// row registered under a URL with userinfo is told by the id and the
+    /// revision a patch names, its address without the userinfo. The status
+    /// lists the generation a rollback can name. A slice that was not asked
+    /// for is absent, and the answer names no place of the log.
+    #[tokio::test]
+    async fn the_leader_serves_the_snapshot_of_its_rows_and_its_spec() {
+        use proto::snapshot_request::Slice;
+
+        let (_dir, _elector, _standing, control) = stored(true);
+        for document in [LEAST_LOAD, RANDOM] {
+            let ran = control
+                .apply_policy_spec(apply(proto::ApplyMode::Enforce, document, "yaml", ""))
+                .await
+                .expect("a verdict")
+                .into_inner();
+            assert!(ran.accepted, "{ran:?}");
+        }
+        let url = "grpc://operator-name:s3cret-word@10.0.0.5:8000";
+        let spec = proto::WorkerSpec {
+            url: url.to_owned(),
+            wire: proto::WireMode::Grpc as i32,
+            role: proto::Role::Single as i32,
+            models: vec!["model-a".to_owned()],
+            ..Default::default()
+        };
+        let request = proto::RegisterWorkerRequest {
+            spec: Some(spec),
+            ..Default::default()
+        };
+        let registered = control
+            .register_worker(from("operator-a", request))
+            .await
+            .expect("registered")
+            .into_inner();
+        let Some(proto::worker_event::Event::Registered(stated)) = registered.event else {
+            panic!("a registration's event: {registered:?}");
+        };
+        // The registration's answer tells its caller the URL it stated.
+        assert_eq!(stated.url, url);
+
+        let answer = control
+            .get_snapshot(snapshot(&[Slice::Workers, Slice::Spec]))
+            .await
+            .expect("a snapshot")
+            .into_inner();
+        assert_eq!(
+            (
+                answer.term,
+                answer.generation,
+                answer.controller_id.as_str()
+            ),
+            (1, 2, ID)
+        );
+        let [row] = answer.workers.as_slice() else {
+            panic!("one row: {answer:?}");
+        };
+        // The snapshot tells the row to any operator: by what a patch names
+        // it, and without the userinfo.
+        assert_eq!((row.id, row.revision), (stated.id, stated.revision));
+        let clean = "grpc://10.0.0.5:8000";
+        assert_eq!(
+            (
+                row.url.as_str(),
+                row.registration_key.as_str(),
+                row.engine.as_str()
+            ),
+            (clean, clean, clean)
+        );
+        assert!(!answer.truncated);
+        let status = answer.spec.expect("the spec slice");
+        let standing = control.shared.generations.standing();
+        assert_eq!(status.generation, 2);
+        assert_eq!(status.digest, standing.1.expect("a digest").to_string());
+        assert_eq!(status.retained, [1]);
+        assert_eq!(status.source, "api");
+        assert_eq!(status.mode, proto::ApplyMode::Enforce as i32);
+        assert!(status.applied_unix_micros > 0, "{status:?}");
+        // Redacted, and no base a standby starts from.
+        assert_eq!(
+            (
+                answer.replication_seq,
+                answer.replication_term,
+                answer.membership_epoch
+            ),
+            (0, 0, 0)
+        );
+        assert!(answer.ids.is_none() && answer.documents.is_empty());
+
+        // One slice asked for: the other is absent.
+        let rows = control
+            .get_snapshot(snapshot(&[Slice::Workers]))
+            .await
+            .expect("the rows")
+            .into_inner();
+        assert_eq!(
+            (rows.workers.len(), rows.spec, rows.generation),
+            (1, None, 2)
+        );
+        let status = control
+            .get_snapshot(snapshot(&[Slice::Spec]))
+            .await
+            .expect("the status")
+            .into_inner();
+        assert!(status.workers.is_empty() && status.spec.is_some());
+    }
+
+    /// A replica that does not lead serves no snapshot: it refuses as it
+    /// refuses a watch's open, with the `NotLeader` that names the holder,
+    /// before it reads the request's fields.
+    #[tokio::test]
+    async fn a_replica_that_does_not_lead_serves_no_snapshot() {
+        use proto::snapshot_request::Slice;
+
+        let (_elector, _standing, control) = sourced(false);
+        for request in [
+            snapshot(&[Slice::Workers, Slice::Spec]),
+            // A request no leader serves either: the lead is read first.
+            from("operator-a", proto::SnapshotRequest::default()),
+        ] {
+            let refused = control.get_snapshot(request).await.expect_err("refused");
+            assert_eq!(
+                (refused.code(), refused.message()),
+                (Code::Unavailable, super::FOLLOWS_NO_LOG)
+            );
+            let details = RpcStatus::decode(refused.details()).expect("a google.rpc.Status");
+            let [detail] = details.details.as_slice() else {
+                panic!("one detail: {details:?}");
+            };
+            let named = proto::NotLeader::decode(detail.value.as_slice()).expect("a NotLeader");
+            assert_eq!(named.leader_address, "10.0.0.8:30100");
+        }
+    }
+
+    /// On the leader a snapshot is refused by its request's fields: one
+    /// that names no slice, a slice this build does not serve, identifiers
+    /// in clear. A leader with no spec source serves its rows, and refuses
+    /// the spec slice by its name.
+    #[tokio::test]
+    async fn the_leader_refuses_a_snapshot_by_its_requests_field() {
+        use proto::snapshot_request::Slice;
+
+        let (_elector, _standing, control) = electing(true);
+        let every = from("operator-a", proto::SnapshotRequest::default());
+        let refused = control.get_snapshot(every).await.expect_err("refused");
+        assert_eq!(refused.code(), Code::Unimplemented);
+        assert!(
+            refused
+                .message()
+                .starts_with("slices: none named is every slice"),
+            "{}",
+            refused.message()
+        );
+        let health = control
+            .get_snapshot(snapshot(&[Slice::Workers, Slice::Health]))
+            .await
+            .expect_err("refused");
+        assert_eq!(
+            (health.code(), health.message()),
+            (
+                Code::Unimplemented,
+                "slices: this build does not serve SLICE_HEALTH: it serves SLICE_WORKERS, SLICE_SPEC"
+            )
+        );
+        let plain = proto::SnapshotRequest {
+            plain_identifiers: true,
+            ..snapshot(&[Slice::Workers]).into_inner()
+        };
+        let refused = control
+            .get_snapshot(from("operator-a", plain))
+            .await
+            .expect_err("refused");
+        assert_eq!(refused.code(), Code::Unimplemented);
+        assert!(
+            refused.message().starts_with("plain_identifiers: "),
+            "{}",
+            refused.message()
+        );
+
+        // No spec source: the rows alone.
+        let spec = control
+            .get_snapshot(snapshot(&[Slice::Workers, Slice::Spec]))
+            .await
+            .expect_err("refused");
+        assert_eq!(
+            (spec.code(), spec.message()),
+            (
+                Code::Unimplemented,
+                "slices: SLICE_SPEC is not served by a controller started with no spec source"
+            )
+        );
+        let rows = control
+            .get_snapshot(snapshot(&[Slice::Workers]))
+            .await
+            .expect("the rows")
+            .into_inner();
+        assert_eq!((rows.term, rows.generation, rows.workers.len()), (1, 0, 0));
+        assert_eq!(rows.spec, None);
+    }
+
+    /// One snapshot is taken at a time, and no more calls are let in than
+    /// the turn has places: the call past them is told to ask again. A call
+    /// refused by the lead or by its request's field takes no place.
+    #[tokio::test]
+    async fn a_snapshot_past_the_ones_that_wait_is_told_to_ask_again() {
+        use proto::snapshot_request::Slice;
+
+        let (_elector, _standing, control) = electing(true);
+        let places = control.shared.snapshots.fill();
+        assert_eq!(places.len(), super::snapshot::SNAPSHOTS_WAITING + 1);
+        let past = control
+            .get_snapshot(snapshot(&[Slice::Workers]))
+            .await
+            .expect_err("no place is left");
+        assert_eq!(
+            (past.code(), past.message()),
+            (
+                Code::ResourceExhausted,
+                "32 snapshots wait their turn: ask again later"
+            )
+        );
+        // A request refused by its field is refused by it, with no place.
+        let health = control
+            .get_snapshot(snapshot(&[Slice::Health]))
+            .await
+            .expect_err("refused");
+        assert_eq!(health.code(), Code::Unimplemented);
+        // So is the spec slice of a controller with no spec source: the
+        // source is read ahead of the turn.
+        let spec = control
+            .get_snapshot(snapshot(&[Slice::Spec]))
+            .await
+            .expect_err("refused");
+        assert_eq!(
+            (spec.code(), spec.message()),
+            (
+                Code::Unimplemented,
+                "slices: SLICE_SPEC is not served by a controller started with no spec source"
+            )
+        );
+        drop(places);
+        let rows = control
+            .get_snapshot(snapshot(&[Slice::Workers]))
+            .await
+            .expect("a place is free again");
+        assert_eq!(rows.into_inner().term, 1);
+        assert_eq!(control.shared.snapshots.let_in(), 0);
+
+        // A replica that does not lead refuses by its lead, places or none.
+        let (_elector, _standing, follower) = electing(false);
+        let _places = follower.shared.snapshots.fill();
+        let refused = follower
+            .get_snapshot(snapshot(&[Slice::Workers]))
+            .await
+            .expect_err("refused");
+        assert_eq!(refused.code(), Code::Unavailable);
+    }
+
+    /// A snapshot reads the rows as a watch's start does. It shares the
+    /// cut the feed keeps at the log's head and keeps the one it takes, so
+    /// calls one behind another copy the rows once a write, and the call
+    /// behind a write tells it. The last call out lets the cut go where no
+    /// watch is open: a lone call's cut goes with it, and a call beside
+    /// another that is let in keeps it for that one.
+    #[tokio::test]
+    async fn a_snapshot_shares_the_feeds_cut_and_keeps_none_with_no_watch_open() {
+        use proto::snapshot_request::Slice;
+
+        let (_elector, _standing, control) = electing(true);
+        let feed = control.shared.feed.clone();
+        let told = async || {
+            control
+                .get_snapshot(snapshot(&[Slice::Workers]))
+                .await
+                .expect("the rows")
+                .into_inner()
+                .workers
+                .len()
+        };
+        // No watch is open: a lone call is the last call out, and the cut
+        // it takes goes with it.
+        assert_eq!(told().await, 0);
+        assert!(feed.kept().is_none(), "no reader can share the cut");
+
+        // Another call is let in beside it: the cut stays for that one, the
+        // next call shares it, and the last call out lets it go.
+        let beside = control.shared.snapshots.place();
+        assert_eq!(told().await, 0);
+        let cut = feed.kept().expect("a call is let in to share the cut");
+        assert_eq!(told().await, 0);
+        assert!(
+            Arc::ptr_eq(&cut, &feed.kept().expect("still kept")),
+            "one copy for the calls let in"
+        );
+        drop(beside);
+        assert_eq!(told().await, 0);
+        assert!(feed.kept().is_none(), "the last call out let it go");
+
+        // A watch is open: the snapshot shares the cut its start took.
+        let gateways = Service::new(vec![Scope::Gateway], Arc::clone(&control.shared));
+        let mut watching = gateways
+            .watch_workers(from("gateway-a", proto::WatchWorkersRequest::default()))
+            .await
+            .expect("opened")
+            .into_inner();
+        tokio::time::timeout(Duration::from_secs(5), watching.next())
+            .await
+            .expect("a page within five seconds")
+            .expect("the stream is open")
+            .expect("a page, not a status");
+        let cut = feed.kept().expect("the watch's cut is kept");
+        assert_eq!(told().await, 0);
+        assert!(
+            Arc::ptr_eq(&cut, &feed.kept().expect("still kept")),
+            "the snapshot shared the watch's cut"
+        );
+
+        // A write moves the log past that cut: the next snapshot tells the
+        // row and keeps the cut it took, and the call behind it shares it.
+        let request = proto::RegisterWorkerRequest {
+            spec: Some(proto::WorkerSpec {
+                url: "grpc://10.0.0.5:8000".to_owned(),
+                wire: proto::WireMode::Grpc as i32,
+                role: proto::Role::Single as i32,
+                models: vec!["model-a".to_owned()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        control
+            .register_worker(from("operator-a", request))
+            .await
+            .expect("registered");
+        assert_eq!(told().await, 1);
+        let later = feed.kept().expect("the snapshot's cut is kept");
+        assert!(!Arc::ptr_eq(&cut, &later), "a cut of the later place");
+        assert_eq!(told().await, 1);
+        assert!(
+            Arc::ptr_eq(&later, &feed.kept().expect("still kept")),
+            "one copy a write"
+        );
+
+        // The last watch leaves, and the next snapshot keeps no cut.
+        drop(watching);
+        assert_eq!(told().await, 1);
+        assert!(feed.kept().is_none(), "no watch can share the cut");
+    }
+
+    /// A snapshot that waited its turn through a later take of the lease is
+    /// told to retry: the lead is read again behind the wait, and no answer
+    /// is told under a term the store has since passed.
+    #[tokio::test]
+    async fn a_snapshot_that_waited_through_a_later_take_is_told_to_retry() {
+        use proto::snapshot_request::Slice;
+
+        let (_elector, _standing, control) = electing(true);
+        let control = Arc::new(control);
+        let held = control.shared.snapshots.hold().await;
+        let mut calls = JoinSet::new();
+        calls.spawn({
+            let control = Arc::clone(&control);
+            async move { control.get_snapshot(snapshot(&[Slice::Workers])).await }
+        });
+        // The call is let in and waits behind the held turn.
+        let began = Instant::now();
+        while control.shared.snapshots.let_in() < 1 {
+            assert!(
+                began.elapsed() < Duration::from_secs(20),
+                "the call took no place"
+            );
+            tokio::task::yield_now().await;
+        }
+        // The store is told a later take than the call was admitted under.
+        control.shared.store.set_term(2);
+        drop(held);
+        let refused = calls
+            .join_next()
+            .await
+            .expect("the one call")
+            .expect("the call's task")
+            .expect_err("a later take");
+        assert_eq!(
+            (refused.code(), refused.message()),
+            (Code::Unavailable, super::TAKE_OVER)
+        );
+    }
+
+    /// A snapshot admitted under one term waits its turn while the replica
+    /// gives its lease up and takes it again, its store told the new term.
+    /// The fence and the store both stand in the later term: the lead read
+    /// again names a term, and it is not the call's, so the compare itself
+    /// tells the call to retry.
+    #[tokio::test]
+    async fn a_snapshot_that_waited_through_a_take_its_store_follows_is_told_to_retry() {
+        use proto::snapshot_request::Slice;
+
+        let (mut elector, _standing, control) = electing(true);
+        let control = Arc::new(control);
+        let held = control.shared.snapshots.hold().await;
+        let mut calls = JoinSet::new();
+        calls.spawn({
+            let control = Arc::clone(&control);
+            async move { control.get_snapshot(snapshot(&[Slice::Workers])).await }
+        });
+        let began = Instant::now();
+        while control.shared.snapshots.let_in() < 1 {
+            assert!(
+                began.elapsed() < Duration::from_secs(20),
+                "the call took no place"
+            );
+            tokio::task::yield_now().await;
+        }
+        let now = Instant::now();
+        assert!(elector.step_down(None, now).expect("the release"));
+        assert_eq!(
+            elector.tick(now).expect("the take"),
+            Tick::Acquired { term: 2 }
+        );
+        control.shared.store.set_term(2);
+        assert_eq!(control.watched(Instant::now()).ok(), Some(2));
+        drop(held);
+        let refused = calls
+            .join_next()
+            .await
+            .expect("the one call")
+            .expect("the call's task")
+            .expect_err("a later take");
+        assert_eq!(
+            (refused.code(), refused.message()),
+            (Code::Unavailable, super::TAKE_OVER)
+        );
     }
 
     #[test]

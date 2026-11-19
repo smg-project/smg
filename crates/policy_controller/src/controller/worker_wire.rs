@@ -82,7 +82,7 @@ const VALUE_BYTES: usize = 4_096;
 const LABELS: usize = 128;
 /// The model ids of one row: a limit of this build and no number of the
 /// contract, said again once the store's cost of a row's ids is measured.
-const MODELS: usize = 128;
+pub(super) const MODELS: usize = 128;
 /// The row whole on the wire, as [`weight`] measures it.
 const ROW_BYTES: usize = 16 * 1024;
 // A provider's name takes a label key's bound and its key a URL's. The store

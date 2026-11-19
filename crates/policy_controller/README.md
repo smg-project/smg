@@ -492,6 +492,7 @@ smg-policy-controller --controller-id controller-0 --spec-file policy.yaml
 - Each document is saved in the directory before it runs, one file for each generation. The last 8 stay on file.
 - `RollbackPolicySpec` runs one of them again, as the next generation.
 - `GetPolicySpec` reads the running document, under either source.
+- `GetSnapshot` with its `SLICE_SPEC` slice tells the running generation and its digest, under either source. Under a store it also lists the generations on file that a rollback can name. The leader serves it.
 - The calls are gRPC, on the controller's control listener. [`contracts/policy_controller.proto`](contracts/policy_controller.proto) defines them. The repository ships no command-line client for them yet.
 
 **A dry run.** `ApplyPolicySpec` in its dry-run mode checks a document and applies nothing. It says whether the document would run. If not, it gives the one issue that refuses it: the field's path and the reason. It works under either source.
@@ -572,6 +573,7 @@ A stage is a Rust type that implements `Filter`, `Scorer` or `Picker`. You add i
 - Cache events in the stock controller. Its `PushKvEvents` call is not served, and nothing else feeds its cache index. So `prefix-affinity` sees no worker as holding a prefix there. The library places by cache for a host that feeds the index.
 - Two more inputs in the stock controller. A worker's row has a circuit-breaker bit that nothing feeds yet, so `healthy` reads it as closed. A gateway's own breaker still counts: its breaker veto on its session takes the worker out of that gateway's decisions. A key's count of requests in flight is not fed, so `inflight_cap` passes no worker over.
 - A plugin named in the document. The format has no field for one.
-- Six calls of the contract: `Explain`, `GetSnapshot`, `PushLoad`, `PushKvEvents`, `StepDown` and `WatchRegime`. The stock controller answers each as not served.
+- Five calls of the contract: `Explain`, `PushLoad`, `PushKvEvents`, `StepDown` and `WatchRegime`. The stock controller answers each as not served.
+- Eight of the ten slices of the snapshot call, `GetSnapshot`. The stock controller serves the worker rows and the spec's status. It refuses a request for any other slice by the slice's name, and a request that names no slice asks for all ten. It also refuses a request for identifiers in clear.
 - The audit mode of the apply call.
 - The gateway's use of the controller.
