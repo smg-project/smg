@@ -16,7 +16,7 @@ use smg_worker::{
 
 use super::object::{builder, object};
 use crate::{
-    store::{MembershipChange, MembershipTail, WorkerRow, WorkersStore},
+    store::{MembershipChange, MembershipTail, WorkerFacts, WorkerRow, WorkersStore},
     view::WorkerId,
 };
 
@@ -68,6 +68,9 @@ struct Held {
     objects: HashMap<WorkerId, ObjectId>,
     /// An object's row, by the object's id in the registry.
     rows: HashMap<ObjectId, Laid>,
+    /// The facts a row's object was built from, by the row's id: what a
+    /// snapshot read holds the row against.
+    facts: HashMap<WorkerId, WorkerFacts>,
 }
 
 /// A replica's worker objects: for every row of the membership store that
@@ -91,10 +94,13 @@ struct Held {
 /// row may stand there under the id and the revision an object was built
 /// from and state other facts. A read the store's tail no longer reaches
 /// cannot tell a row that stood through from one that left and came back.
-/// The holder trusts no revision it held in either, and lays every row
-/// again. A row laid again keeps its place: its object is replaced under
-/// its id in the registry, which carries the standing object's running
-/// state over.
+/// The holder trusts no revision it held in either. It holds each row
+/// against the facts its object was built from. A row whose facts stand
+/// keeps its object and takes the row's revision: an object built again
+/// from equal facts would state nothing new, and its replacement would
+/// start every read of its worker again. A row whose facts moved is laid
+/// again and keeps its place: its object is replaced under its id in the
+/// registry, which carries the standing object's running state over.
 ///
 /// The holder is the registry's one writer: an object any other writer left
 /// under a row's URL is replaced by the row's.
@@ -196,8 +202,9 @@ impl<G: Generation> Objects<G> {
     ///
     /// The first read is the store's snapshot. So is a read the store's
     /// tail no longer reaches back to, and one behind a move of the store's
-    /// history ([`WorkersStore::history`]). A snapshot lays every row
-    /// again, whatever its object was built from.
+    /// history ([`WorkersStore::history`]). A snapshot lays again every
+    /// row whose facts are not the facts its object was built from, at
+    /// whatever revision that was.
     ///
     /// Every other read is the changes since the last, again and again
     /// until none is left: a write that lands while this works is read
@@ -270,9 +277,10 @@ impl<G: Generation> Objects<G> {
 
     /// The store's rows, whole: the objects of rows that went are dropped
     /// first, each leaving its URL to a later incarnation's, then every row
-    /// is laid again. No revision held is trusted here: behind a gap of the
-    /// tail, as in another history, a row under a held id and revision may
-    /// be another life with other facts.
+    /// whose facts moved is laid again. No revision held is trusted here:
+    /// behind a gap of the tail, as in another history, a row under a held
+    /// id and revision may be another life with other facts. The facts
+    /// themselves are compared.
     fn reconcile(&self, rows: &[WorkerRow]) {
         let stand: HashSet<WorkerId> = rows.iter().map(|row| row.id).collect();
         let gone: Vec<WorkerId> = self
@@ -287,8 +295,29 @@ impl<G: Generation> Objects<G> {
             self.end(id);
         }
         for row in rows {
-            self.lay(row);
+            if !self.stands(row) {
+                self.lay(row);
+            }
         }
+    }
+
+    /// Whether `row`'s object was built from the facts the row states now.
+    /// One that was takes the row's revision here, and keeps its place.
+    fn stands(&self, row: &WorkerRow) -> bool {
+        let mut entries = self.held.write();
+        let Held {
+            objects,
+            rows,
+            facts,
+        } = &mut *entries;
+        if facts.get(&row.id) != Some(&row.facts) {
+            return false;
+        }
+        let Some(laid) = objects.get(&row.id).and_then(|held| rows.get_mut(held)) else {
+            return false;
+        };
+        laid.standing.revision = row.revision;
+        true
     }
 
     /// Bring the object of the row `id` to what `row` says: the row as the
@@ -319,6 +348,7 @@ impl<G: Generation> Objects<G> {
         let mut entries = self.held.write();
         entries.objects.remove(&id);
         entries.rows.remove(&held);
+        entries.facts.remove(&id);
     }
 
     /// Build `row`'s object and put it in the registry: registered under a
@@ -345,6 +375,7 @@ impl<G: Generation> Objects<G> {
         {
             let mut entries = self.held.write();
             entries.objects.insert(row.id, id.clone());
+            entries.facts.insert(row.id, row.facts.clone());
             entries.rows.insert(
                 id,
                 Laid {
@@ -736,7 +767,7 @@ mod tests {
     /// too: behind the gap it cannot be told from one that left and came
     /// back under its id and its revision, as one here did with a new label.
     #[test]
-    fn a_read_the_tail_no_longer_reaches_takes_the_snapshot_and_lays_every_row_again() {
+    fn a_read_the_tail_no_longer_reaches_takes_the_snapshot_and_lays_the_moved_rows_again() {
         let mut replica = Replica::new();
         let gone = replica.store.upsert(facts(A, 1)).id();
         replica.store.upsert(facts(B, 1));
@@ -746,6 +777,7 @@ mod tests {
         replica.follow();
         let (a, b, c) = (replica.id(A), replica.id(B), replica.id(C));
         let (e, f) = (replica.id(E), replica.id(F));
+        let stood = replica.at(E);
         let read_to = replica.store.epoch();
         replica.told();
 
@@ -756,6 +788,12 @@ mod tests {
         replica.remove(F);
         assert_eq!(replica.store.upsert(labelled(F, 1, "gold")).id(), back);
         assert_eq!(replica.row(F).revision, 1, "the first revision again");
+        // A write that moves no fact moves E's revision alone.
+        let unmoved = replica.row(E);
+        assert!(replica
+            .store
+            .set_status(unmoved.id, WorkerStatus::NotReady, unmoved.revision)
+            .is_some());
         let row = replica.row(D);
         for turn in 0..1_100 {
             let status = [WorkerStatus::Ready, WorkerStatus::NotReady][turn % 2];
@@ -779,6 +817,10 @@ mod tests {
         assert_eq!(replica.tier(B).as_deref(), Some("gold"));
         assert_eq!((replica.id(E), replica.id(F)), (e.clone(), f.clone()));
         assert_eq!(replica.tier(F).as_deref(), Some("gold"));
+        // E's facts stand: the very object, at the row's revision of now.
+        assert!(Arc::ptr_eq(&stood, &replica.at(E)));
+        let standing = replica.objects.standing(&e).expect("E's row");
+        assert_eq!(standing.revision, replica.row(E).revision);
         let (c_next, d) = (replica.id(C), replica.id(D));
         assert_ne!(c_next, c);
         assert_eq!(replica.objects.object(next), Some(c_next.clone()));
@@ -791,10 +833,9 @@ mod tests {
             ("replaced", b),
             ("registered", c_next),
             ("registered", d),
-            ("replaced", e),
             ("replaced", f),
         ];
-        assert_eq!((told.len(), laid), (7, HashSet::from(each)));
+        assert_eq!((told.len(), laid), (6, HashSet::from(each)));
 
         replica.remove(D);
         replica.follow();
@@ -957,12 +998,14 @@ mod tests {
     /// holder read to, and hold under one id and one revision a row of
     /// other facts: the tail reads empty and the row reads as the one held.
     #[test]
-    fn a_store_that_took_another_historys_rows_has_every_row_laid_again() {
+    fn a_store_that_took_another_historys_rows_has_its_moved_rows_laid_again() {
         let mut replica = Replica::new();
         let row = replica.store.upsert(facts(A, 1)).id();
         replica.store.upsert(facts(B, 1));
+        replica.store.upsert(facts(D, 1));
         replica.follow();
         let (a, b) = (replica.id(A), replica.id(B));
+        let stood = replica.at(D);
         replica.told();
 
         let other = MemoryStore::new();
@@ -971,6 +1014,7 @@ mod tests {
             ..facts(A, 1)
         });
         other.upsert(facts(C, 1));
+        other.upsert(facts(D, 1));
         let cut = other.cut(Kinds::Watched);
         let (epoch, theirs) = (cut.epoch, other.by_key(A).expect("a row"));
         assert_eq!(epoch, replica.store.epoch());
@@ -985,7 +1029,9 @@ mod tests {
         assert_eq!(replica.id(A), a);
         assert_eq!(replica.tier(A).as_deref(), Some("gold"));
         assert!(replica.objects.registry().get_by_url(B).is_none());
-        assert_eq!(replica.objects.len(), 2);
+        assert_eq!(replica.objects.len(), 3);
+        // D states the same facts in the other history: the very object.
+        assert!(Arc::ptr_eq(&stood, &replica.at(D)));
         let c = replica.id(C);
         assert_eq!(
             replica.told(),
