@@ -1605,17 +1605,28 @@ impl Door {
 
     /// Takes the seat the calling thread decides at: the one it took
     /// last, which until it moves is its number among the threads that
-    /// have called a door, counted round this door's seats.
+    /// have called a door. A number past this door's seats is counted
+    /// round them once, and the thread keeps that seat.
     fn seat(&self) -> (usize, MutexGuard<'_, DeciderSlot>) {
         let seats = self.seats.len();
         // A thread at its end no longer has its own storage: it starts
         // at the first seat.
         let last = SEAT.try_with(Cell::get).unwrap_or(0);
-        let own = if last < seats { last } else { last % seats };
+        let own = if last < seats { last } else { self.round(last) };
         match self.seats[own].0.try_lock() {
             Some(slot) => (own, slot),
             None => self.another(own),
         }
+    }
+
+    /// `last` counted round the door's seats and kept as the calling
+    /// thread's seat: the division is paid once a thread, not at each
+    /// decision.
+    #[cold]
+    fn round(&self, last: usize) -> usize {
+        let own = last % self.seats.len();
+        let _ = SEAT.try_with(|seat| seat.set(own));
+        own
     }
 
     /// The next free seat past `own`, which another thread holds: the
@@ -2777,7 +2788,7 @@ pub(crate) mod tests {
     }
 
     /// A thread's seat at a door of fewer seats is its last seat counted
-    /// round them.
+    /// round them, once: the thread keeps the seat it then takes.
     #[test]
     fn a_seat_past_a_doors_seats_is_counted_round_them() {
         let store = fleet(2);
@@ -2785,6 +2796,7 @@ pub(crate) mod tests {
         seated(5);
         let (lease, _) = leased(&door, b"r-1", 7);
         assert_eq!(store.file_of(lease), 1);
+        assert_eq!(SEAT.get(), 1, "counted once and kept");
     }
 
     /// A picker that holds a decision's scope, as a plugin's stage does:
