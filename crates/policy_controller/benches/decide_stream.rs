@@ -1421,6 +1421,7 @@ fn request(id: u64, models: &[String], pair: bool) -> DecideRequest {
             ..WireFacts::default()
         }),
         constraints: None,
+        again: false,
     }
 }
 

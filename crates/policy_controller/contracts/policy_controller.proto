@@ -426,11 +426,15 @@ message SpecPush {
 
 // --- Decide: one stream per gateway runtime thread --------------------------
 
-// Idempotent on (verified gateway id, request_id) for the lease's lifetime: a
-// repeated Decide after a stream reset returns the standing decision. A
-// frame is at most 64 KiB as encoded, and one over it is refused whole: a
-// sender cuts its block hashes at the tail until its frame fits, and
-// counts the cut on its own side.
+// One lease stands for one request. A gateway that sends a request again,
+// because the stream that carried it ended before its answer arrived, says
+// so (`again`): the lease its earlier decision was issued ends there, where
+// no Dispatched named it, and the request is decided anew. The word reaches
+// the asking gateway's own waiting leases alone, and of a pair's lease each
+// side that waits ends. A request sent twice without the word is two
+// requests. A frame is at most 64 KiB as encoded, and one over it is refused
+// whole: a sender cuts its block hashes at the tail until its frame fits,
+// and counts the cut on its own side.
 message DecideRequest {
   // 1 to 256 bytes: the gateway's own key of one request among those it has
   // standing, carried back on every answer. A longer id is sent as a digest
@@ -440,6 +444,17 @@ message DecideRequest {
   // name and is out of its range.
   RequestFacts facts = 2;
   Constraints constraints = 3;
+  // The gateway sent this request before under this id and holds no answer
+  // to it, and the stream that carried it has ended: the gateway reads
+  // nothing more from that stream. The word is not said while that stream
+  // is open: an answer on its way is not held back, and it would carry a
+  // lease the word has ended, which no Dispatched can name. The controller
+  // finds the earlier lease by the id's 64-bit fingerprint, among the
+  // gateway's leases that wait for a dispatch: two ids of one gateway that
+  // share a fingerprint read as one request. A repeat its stream answers
+  // Busy before a decider takes it (no credit, a full queue, a budget of 0)
+  // ends nothing: the earlier lease waits out its dispatch deadline.
+  bool again = 4;
 }
 
 message DecideAnswer {

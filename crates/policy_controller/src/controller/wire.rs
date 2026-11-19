@@ -93,6 +93,14 @@ pub(crate) const MAX_REQUEST_ID: usize = 256;
 /// ([`MAX_BLOCK_HASHES`](crate::spec::MAX_BLOCK_HASHES)).
 pub(crate) const MAX_FRAME: usize = 64 * 1024;
 
+/// The bit of a [`Checked`] frame's rare words for one that carried its
+/// prompt as text.
+const TEXT: u8 = 1;
+
+/// The bit for a frame whose gateway asks its request again
+/// (`DecideRequest.again`).
+const AGAIN: u8 = 1 << 1;
+
 /// A `DecideRequest` the engine's record holds whole.
 #[derive(Debug)]
 pub(crate) struct Checked {
@@ -105,8 +113,10 @@ pub(crate) struct Checked {
     /// the session's value; `0` for one that carries it plain or carries
     /// none.
     session_key: u64,
-    /// Whether the frame carried its prompt as text.
-    text: bool,
+    /// What the frame says that few frames say, a bit a word ([`TEXT`],
+    /// [`AGAIN`]): `0` for a frame that says neither, so a decider reads
+    /// both by one test.
+    rare: u8,
 }
 
 impl Checked {
@@ -162,6 +172,7 @@ impl Checked {
             }
             _ => 0,
         };
+        let rare = (u8::from(text) * TEXT) | (u8::from(request.again) * AGAIN);
         Ok(Self {
             id: request.request_id,
             facts,
@@ -169,7 +180,7 @@ impl Checked {
             phase,
             hash_kind,
             session_key,
-            text,
+            rare,
         })
     }
 
@@ -193,10 +204,23 @@ impl Checked {
         Duration::from_micros(u64::from(self.facts.budget_micros))
     }
 
+    /// Whether the frame says a word few frames say: it carried its prompt
+    /// as text, or its gateway asks its request again. A decider asks this
+    /// of every request, once, and which word it is of those that say one.
+    pub(crate) const fn says_more(&self) -> bool {
+        self.rare != 0
+    }
+
     /// Whether the request carried its prompt as text, for the controller
     /// to hash.
     pub(crate) const fn has_text(&self) -> bool {
-        self.text
+        self.rare & TEXT != 0
+    }
+
+    /// Whether the request's gateway sent it before under this id and
+    /// holds no answer to it (`DecideRequest.again`).
+    pub(crate) const fn again(&self) -> bool {
+        self.rare & AGAIN != 0
     }
 
     /// How many block hashes the frame carries: a read hands the engine
@@ -725,6 +749,7 @@ mod tests {
                 overload_lifted: true,
                 subset_hint: Some(0),
             }),
+            again: false,
         }
     }
 
@@ -1063,6 +1088,26 @@ mod tests {
         assert_eq!(text.facts.prompt_text.capacity(), 0);
     }
 
+    /// The two words few frames say are a bit each of one byte: a frame
+    /// that says neither reads as none, and each word reads apart from
+    /// the other.
+    #[test]
+    fn a_frame_that_is_asked_again_says_so_beside_its_text() {
+        let said = |frame: proto::DecideRequest| {
+            let frame = Checked::new(frame).expect("no word is a field out of its range");
+            (frame.says_more(), frame.has_text(), frame.again())
+        };
+        let texted = |text: &[u8], again| {
+            let mut frame = with(|facts| facts.prompt_text = text.to_vec());
+            frame.again = again;
+            frame
+        };
+        assert_eq!(said(full()), (false, false, false));
+        assert_eq!(said(texted(b"", true)), (true, false, true));
+        assert_eq!(said(texted(b"hello", false)), (true, true, false));
+        assert_eq!(said(texted(b"hello", true)), (true, true, true));
+    }
+
     #[test]
     fn the_hashes_past_what_the_generation_reads_are_cut_at_the_read_and_the_first_ones_kept() {
         let frame = with(|facts| facts.block_hashes = (1..=6).collect());
@@ -1100,6 +1145,7 @@ mod tests {
                 ..proto::RequestFacts::default()
             }),
             constraints: None,
+            again: false,
         };
         let at = frame(MAX_BLOCK_HASHES);
         assert_eq!(prost::Message::encoded_len(&at), MAX_FRAME - 5);

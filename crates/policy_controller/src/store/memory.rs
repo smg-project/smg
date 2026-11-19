@@ -757,7 +757,8 @@ impl MemoryStore {
 
     /// [`MemoryStore::apply`], its telling at `at` where a standby's
     /// applier holds that place, and `admit` asked under both its locks
-    /// (`MemoryStore::apply_admitted`, a controller's): `false` where it refused.
+    /// (`MemoryStore::apply_admitted`, a controller's): `false` where it
+    /// refused.
     fn apply_at(
         &self,
         at: Option<Position>,
@@ -2739,8 +2740,10 @@ struct Leases {
     /// Every lease filed as issued, by its dispatch deadline, the earliest
     /// first. A lease that left the file or was dispatched keeps its place
     /// until the issues that follow step over it, so no door searches the
-    /// queue: it holds the leases that wait for a dispatch, and behind the
-    /// first of those the places of what one dispatch deadline issued.
+    /// queue to take a place out: it holds the leases that wait for a
+    /// dispatch, and behind the first of those the places of what one
+    /// dispatch deadline issued. One door reads it through, a request
+    /// asked again's, for the lease its earlier ask was issued.
     due: VecDeque<(Instant, Key)>,
 }
 
@@ -3264,6 +3267,27 @@ impl Leases {
         }
         Some(found)
     }
+
+    /// Ends what waits of the lease `gateway`'s request was issued, the
+    /// request whose id's fingerprint is `request`: the first such lease
+    /// of the deadline queue, which holds every lease that waits for a
+    /// dispatch. The lease comes back as [`Self::abandon`] found it, both
+    /// its parts; `None` where no lease of the request waits. The walk
+    /// reads a record for each place of the gateway's it passes: the
+    /// leases that wait and, behind one that waits out its deadline, the
+    /// issues since.
+    #[cfg(feature = "controller")]
+    fn end_asked_again(&mut self, gateway: GatewayId, request: u64) -> Option<Sides> {
+        let waits = |key: &Key| {
+            key.0 == gateway
+                && self
+                    .records
+                    .get(key)
+                    .is_some_and(|held| held.record.request == request && self.waits(key, held))
+        };
+        let key = self.due.iter().map(|&(_, key)| key).find(waits)?;
+        self.abandon(&key)
+    }
 }
 
 /// Marks `record` as a door files it, in place, and gives the slot it
@@ -3455,6 +3479,41 @@ impl MemoryStore {
             self.tell_abandoned(at, one.world(self), &found);
         }
         Ok(record.lease)
+    }
+
+    /// Ends the lease `gateway`'s earlier ask of a request was issued,
+    /// where that lease still waits for its dispatch: the door of a
+    /// request its gateway asks again because the answer never arrived
+    /// (`DecideRequest.again`). The gateway holds no answer, so no dispatch
+    /// will name the lease. It ends here as its dispatch deadline would
+    /// end it, released as abandoned with its engine told
+    /// ([`Self::tell_abandoned`]), and not up to that deadline later,
+    /// beside the lease the request is issued next. `request` is the
+    /// fingerprint of the request's id, all a record keeps of it: two ids
+    /// of one gateway that share it read as one request. Of a pair's lease
+    /// each side that waits ends, and a side that was dispatched stands.
+    ///
+    /// The caller is the decider of the request's model, in its requests'
+    /// order. Every request of a model goes to one decider, which issues
+    /// into its own file: the earlier lease is on the caller's file, filed
+    /// before this call. Everything handed to the file is applied first,
+    /// as at an issue, so a lease whose dispatch was said in time stands.
+    /// `false` where no lease of the request waits there, and for a caller
+    /// that may not act at the file.
+    #[cfg(feature = "controller")]
+    #[cold]
+    pub(crate) fn asked_again(&self, gateway: GatewayId, request: u64) -> bool {
+        let at = self.acting();
+        let mut leases = self.files[at].take();
+        if !self.applied(at, &mut leases) {
+            return false;
+        }
+        let Some(found) = leases.end_asked_again(gateway, request) else {
+            return false;
+        };
+        let mut one = turn::OneLoad::default();
+        self.tell_abandoned(at, one.world(self), &found);
+        true
     }
 
     /// Tells the engine of each side the dispatch deadline's end took from

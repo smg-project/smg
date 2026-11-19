@@ -239,6 +239,7 @@ async fn placed(gateway: &mut Client, replica: &Replica, key: u64, n: u64) -> Re
             ..RequestFacts::default()
         }),
         constraints: None,
+        again: false,
     };
     let began = Instant::now();
     let answer = loop {

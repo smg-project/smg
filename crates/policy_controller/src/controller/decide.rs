@@ -1607,6 +1607,60 @@ mod tests {
         assert_eq!(heard.lock()[3..], [abandoned]);
     }
 
+    /// The word is for a request whose stream ended (the contract's field).
+    /// Said while the earlier answer waits in an open stream's queue, it
+    /// ends the lease all the same, and nothing holds that answer back: it
+    /// leaves with the ended lease, which no dispatch can name. The send's
+    /// fence reads the term and the span alone, and no read there could
+    /// call back an answer that left before the repeat was read.
+    #[tokio::test]
+    async fn an_answer_queued_before_its_request_is_asked_again_leaves_with_the_ended_lease() {
+        let (step, at_read, release) = hold();
+        let bed = bed_with((1, 8), None, [step]).await;
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let later = bed.shared.store.apply(hearing(&heard, 2));
+        later.expect("a later generation");
+        let _seat = bed.welcomed(NAME, 1);
+        let (_frames, mut stream) = two_queued(&bed, at_read, &release).await;
+        let gateway = told(NAME).gateway();
+        let id = |count: u64| 1 << 32 | count;
+        let store: &dyn LeasesStore = bed.shared.store.as_ref();
+        assert_eq!(store.live(gateway), 3);
+        // Request 1 again, as on a second stream of its gateway, while the
+        // answer to its first ask waits in the open stream's queue.
+        let mut repeat = frame(1, 1);
+        repeat.again = true;
+        let (sender, mut answers) = mpsc::channel(1);
+        let job = Job {
+            request: Checked::new(repeat).expect("a frame the record holds"),
+            gateway,
+            received: bed.now(),
+            answers: sender,
+        };
+        assert!(bed.shared.deciders.submit(job).is_none());
+        let anew = timeout(PATIENCE, answers.recv()).await;
+        let leased = matches!(
+            anew,
+            Ok(Some(super::wire::Decided::Decision { lease: Some(_), .. }))
+        );
+        assert!(leased, "{anew:?}");
+        // The word ended the first ask's lease, its engine told ahead of
+        // the repeat's own lease: one lease of the request is on file.
+        let ended = (id(1), Some(ReleaseReason::Abandoned));
+        assert_eq!(heard.lock()[3..], [ended, (id(4), None)]);
+        assert!(store.get(gateway, LeaseId(id(1))).is_none());
+        assert_eq!(store.live(gateway), 3);
+        // The queued answer leaves all the same, with the ended lease.
+        let first = match timeout(PATIENCE, stream.next()).await {
+            Ok(Some(Ok(answer))) => answer,
+            other => panic!("an answer within the case's patience: {other:?}"),
+        };
+        let lease = lease_of(&first);
+        assert_eq!((first.request_id.as_slice(), lease.id), (&[1][..], id(1)));
+        assert!(store.get(gateway, LeaseId(id(1))).is_none());
+        assert_eq!(store.live(gateway), 3);
+    }
+
     /// A lease tells what its dispatch span has left where its stream
     /// sends it, and under a millisecond is none to hand over. A decision
     /// sent with a millisecond of the span left leaves with its lease,
