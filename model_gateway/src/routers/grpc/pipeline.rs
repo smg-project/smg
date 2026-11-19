@@ -1051,8 +1051,8 @@ impl RequestPipeline {
     }
 
     /// The settlement of a non-streamed legacy completion: its usage object
-    /// is the engine's counters unchanged (no unbilled prompt tokens, no
-    /// parser), summed over the prompts of a batch.
+    /// carries the counters as `TokenCounts::settlement` takes them (no
+    /// unbilled prompt tokens, no parser), summed over the prompts of a batch.
     pub(in crate::routers::grpc) fn completion_settlement(
         usage: Option<&Usage>,
     ) -> UsageSettlement {

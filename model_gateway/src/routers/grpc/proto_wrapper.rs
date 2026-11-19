@@ -441,10 +441,15 @@ macro_rules! engine_response_basics {
             wire_field!(self, c => c.cached_tokens)
         }
 
-        /// Get reasoning tokens.
+        /// Get reasoning tokens: the engine's own count where its wire carries
+        /// one, no higher than the completion count of the same frame. A
+        /// speculative step that lands past the token limit is counted whole
+        /// as reasoning while the completion count stops at the limit; read
+        /// here, every sum, settlement and answer takes a count that was
+        /// possible for its choice. Zero on a wire that carries none.
         pub fn reasoning_tokens(&self) -> u32 {
             match self {
-                Self::Sglang(c) => c.reasoning_tokens,
+                Self::Sglang(c) => c.reasoning_tokens.min(c.completion_tokens),
                 Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => 0,
             }
         }
@@ -3586,6 +3591,35 @@ mod output_logprob_tests {
 #[cfg(test)]
 mod wire_field_tests {
     use super::*;
+
+    /// The engine's own reasoning count is read no higher than the completion
+    /// count of the same frame, on a chunk and on a `Complete` alike: a count
+    /// within it is read as it is, a count past it as the completion count.
+    #[test]
+    fn a_reasoning_count_is_read_within_its_frames_completion_count() {
+        for (reasoning, read) in [(3, 3), (5, 5), (7, 5)] {
+            let chunk = ProtoGenerateStreamChunk::Sglang(sglang::GenerateStreamChunk {
+                completion_tokens: 5,
+                reasoning_tokens: reasoning,
+                ..Default::default()
+            });
+            assert_eq!(
+                chunk.reasoning_tokens(),
+                read,
+                "a chunk that counts {reasoning} of 5"
+            );
+            let complete = ProtoGenerateComplete::Sglang(sglang::GenerateComplete {
+                completion_tokens: 5,
+                reasoning_tokens: reasoning,
+                ..Default::default()
+            });
+            assert_eq!(
+                complete.reasoning_tokens(),
+                read,
+                "a Complete that counts {reasoning} of 5"
+            );
+        }
+    }
 
     /// Every wire's counters come from its own fields: the five-wire form on the
     /// chunk and complete wrappers, and the complete wrapper's speculative pair,

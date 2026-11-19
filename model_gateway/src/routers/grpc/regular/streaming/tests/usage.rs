@@ -8,7 +8,8 @@
 //! The settlement of a request's reservation is checked the same way, on the
 //! chat, completion, generate and messages shapes: it carries the engine's
 //! cached and reasoning counts beside the prompt and completion counts, the
-//! same streamed and not, zero where the engine's frames carry none.
+//! same streamed and not, zero where the engine's frames carry none, a
+//! reasoning count above the completion count as the completion count.
 
 use futures::stream;
 use openai_protocol::{
@@ -36,7 +37,10 @@ use super::{
     },
     symphony_chat::assigned_message,
 };
-use crate::{rate_limit::test_support::RecordingBackend, routers::grpc::pipeline::RequestPipeline};
+use crate::{
+    rate_limit::{test_support::RecordingBackend, UsageSettlement},
+    routers::grpc::pipeline::RequestPipeline,
+};
 
 /// A scripted worker stream and the mock server that owns its connection.
 type Scripted = (ProtoStream, JoinHandle<()>);
@@ -143,6 +147,16 @@ fn scheduler_frames(
     (0..choices)
         .flat_map(|index| scheduler_choice_frames(index, texts, counters, reasoning))
         .collect()
+}
+
+/// The scheduler-proto frames of two choices that each generate `texts`:
+/// the first counts two reasoning tokens more than it generated, the second
+/// counts none.
+fn one_choice_overshoots(texts: &[&str], counters: Counters) -> Vec<scheduler::GenerateResponse> {
+    let generated = texts.concat().chars().count() as u32;
+    let mut frames = scheduler_choice_frames(0, texts, counters, generated + 2);
+    frames.extend(scheduler_choice_frames(1, texts, counters, 0));
+    frames
 }
 
 /// [`scheduler_frames`] as a scripted stream of the scheduler proto, owned
@@ -318,13 +332,13 @@ async fn non_streamed_completion_usage(scripted: Scripted, request: &CompletionR
 
 /// Drive one of the two generate streaming paths (the one with input
 /// logprobs serves the disaggregated mode too) over `stream` with a
-/// reservation to settle; the path must succeed.
+/// reservation to settle and return its events; the path must succeed.
 async fn streamed_generate(
     (stream, server): Scripted,
     with_input_logprobs: bool,
     choices: u32,
     reservation: Option<Arc<SharedReservationHandle>>,
-) {
+) -> Vec<Value> {
     let ctx = GenerateStreamContext {
         request_id: "cmpl-usage".to_string(),
         weight_version: "default".to_string(),
@@ -350,9 +364,10 @@ async fn streamed_generate(
             .await
     };
     drop(tx);
-    let _events = collect_events(rx).await;
+    let events = collect_events(rx).await;
     server.abort();
     assert!(result.is_ok(), "{result:?}");
+    events
 }
 
 async fn non_streamed_generate(
@@ -756,7 +771,7 @@ async fn the_engines_own_reasoning_count_is_the_same_streamed_and_not() {
         );
     }
 
-    let reasoning = 3;
+    let reasoning = 1;
     let summed = json!(reasoning * choices);
     let request = |stream: bool| -> CompletionRequest {
         let mut request = json!({
@@ -788,6 +803,426 @@ async fn the_engines_own_reasoning_count_is_the_same_streamed_and_not() {
     );
 }
 
+/// An engine's own reasoning count can run past its completion count: a
+/// speculative step that lands past the token limit is counted whole as
+/// reasoning while the completion count stops at the limit. The usage
+/// reports the part no higher than the whole: on the chat shape whether or
+/// not the gateway's parser ran, and on the legacy completion shape, the
+/// same streamed and not.
+#[tokio::test]
+async fn an_engines_reasoning_count_is_never_reported_above_its_completion_count() {
+    let counters = Counters {
+        prompt: 10,
+        cached: 4,
+        spec_accepted: 0,
+        spec_drafted: 0,
+    };
+    let choices = 2;
+    for (name, texts, separate_reasoning) in [
+        ("the gateway's parser off", vec!["ab", "cd"], false),
+        ("the gateway's parser on", vec!["<think>", "ab", "cd"], true),
+    ] {
+        // Each choice's terminal frame counts two reasoning tokens more
+        // than the choice generated.
+        let generated = texts.concat().chars().count() as u32;
+        let request = |stream: bool| -> ChatCompletionRequest {
+            let mut request = json!({
+                "model": "eof-test", "messages": [], "n": choices,
+                "separate_reasoning": separate_reasoning, "stream": stream,
+            });
+            if stream {
+                request["stream_options"] = json!({"include_usage": true});
+            }
+            serde_json::from_value(request).expect("chat request")
+        };
+        let streamed = streamed_chat_usage(
+            scheduler_stream(scheduler_frames(&texts, choices, counters, generated + 2)).await,
+            &request(true),
+            None,
+        )
+        .await;
+        let whole = non_streamed_chat_usage(
+            scheduler_stream(scheduler_frames(&texts, choices, counters, generated + 2)).await,
+            &request(false),
+        )
+        .await;
+        assert_eq!(
+            streamed, whole,
+            "chat, {name}: the streamed usage chunk vs the non-streamed usage"
+        );
+        assert_eq!(
+            streamed["completion_tokens"],
+            json!(generated * choices),
+            "chat, {name}: {streamed}"
+        );
+        assert_eq!(
+            streamed["completion_tokens_details"]["reasoning_tokens"],
+            json!(generated * choices),
+            "chat, {name}: {streamed}"
+        );
+    }
+
+    let generated = 2;
+    let request = |stream: bool| -> CompletionRequest {
+        let mut request = json!({
+            "model": "eof-test", "prompt": "hi", "n": choices, "stream": stream,
+        });
+        if stream {
+            request["stream_options"] = json!({"include_usage": true});
+        }
+        serde_json::from_value(request).expect("completion request")
+    };
+    let streamed = streamed_completion_usage(
+        scheduler_stream(scheduler_frames(&["ok"], choices, counters, generated + 2)).await,
+        &request(true),
+        None,
+    )
+    .await;
+    let whole = non_streamed_completion_usage(
+        scheduler_stream(scheduler_frames(&["ok"], choices, counters, generated + 2)).await,
+        &request(false),
+    )
+    .await;
+    assert_eq!(
+        streamed, whole,
+        "completion: the streamed usage chunk vs the non-streamed usage"
+    );
+    assert_eq!(
+        whole["completion_tokens_details"]["reasoning_tokens"],
+        json!(generated * choices),
+        "completion: {whole}"
+    );
+}
+
+/// The bound holds choice by choice: a reasoning count above one choice's
+/// completion count is not carried by the room another choice of the
+/// request left. Two choices generate the same text; the first counts two
+/// reasoning tokens more than it generated, the second counts none. The
+/// request's reasoning count is the first choice's completion count, in
+/// the usage and in the settlement: on the chat shape whether or not the
+/// gateway's parser ran, on the legacy completion shape and on the
+/// generate shape, the same streamed and not.
+#[tokio::test]
+async fn a_choices_reasoning_count_is_bounded_by_its_own_completion_count() {
+    let choices = 2;
+    let settled = |generated: u32| UsageSettlement {
+        actual_input_tokens: SETTLED.prompt,
+        completion_tokens: generated * choices,
+        cached_input_tokens: SETTLED.cached,
+        reasoning_tokens: generated,
+    };
+    for (name, texts, separate_reasoning) in [
+        ("the gateway's parser off", vec!["ab", "cd"], false),
+        ("the gateway's parser on", vec!["<think>", "ab", "cd"], true),
+    ] {
+        let generated = texts.concat().chars().count() as u32;
+        let request = |stream: bool| -> ChatCompletionRequest {
+            let mut request = json!({
+                "model": "eof-test", "messages": [], "n": choices,
+                "separate_reasoning": separate_reasoning, "stream": stream,
+            });
+            if stream {
+                request["stream_options"] = json!({"include_usage": true});
+            }
+            serde_json::from_value(request).expect("chat request")
+        };
+        let (handle, backend) = RecordingBackend::reservation();
+        let streamed = streamed_chat_usage(
+            scheduler_stream(one_choice_overshoots(&texts, SETTLED)).await,
+            &request(true),
+            Some(handle),
+        )
+        .await;
+        assert_eq!(
+            backend.settlements(),
+            vec![settled(generated)],
+            "chat, {name}: streamed"
+        );
+        let (response, counts) = non_streamed_chat(
+            scheduler_stream(one_choice_overshoots(&texts, SETTLED)).await,
+            &request(false),
+        )
+        .await;
+        assert_eq!(
+            counts.settlement(),
+            settled(generated),
+            "chat, {name}: non-streamed"
+        );
+        let whole = serde_json::to_value(response).expect("a JSON response")["usage"].clone();
+        assert_eq!(
+            streamed, whole,
+            "chat, {name}: the streamed usage chunk vs the non-streamed usage"
+        );
+        assert_eq!(
+            streamed["completion_tokens"],
+            json!(generated * choices),
+            "chat, {name}: {streamed}"
+        );
+        assert_eq!(
+            streamed["completion_tokens_details"]["reasoning_tokens"],
+            json!(generated),
+            "chat, {name}: {streamed}"
+        );
+    }
+
+    let generated = 2;
+    let request = |stream: bool| -> CompletionRequest {
+        let mut request = json!({
+            "model": "eof-test", "prompt": "hi", "n": choices, "stream": stream,
+        });
+        if stream {
+            request["stream_options"] = json!({"include_usage": true});
+        }
+        serde_json::from_value(request).expect("completion request")
+    };
+    let (handle, backend) = RecordingBackend::reservation();
+    let streamed = streamed_completion_usage(
+        scheduler_stream(one_choice_overshoots(&["ok"], SETTLED)).await,
+        &request(true),
+        Some(handle),
+    )
+    .await;
+    assert_eq!(
+        backend.settlements(),
+        vec![settled(generated)],
+        "completion: streamed"
+    );
+    let response = non_streamed_completion(
+        scheduler_stream(one_choice_overshoots(&["ok"], SETTLED)).await,
+        &request(false),
+    )
+    .await;
+    assert_eq!(
+        RequestPipeline::completion_settlement(response.usage.as_ref()),
+        settled(generated),
+        "completion: non-streamed"
+    );
+    let whole = serde_json::to_value(response).expect("a JSON response")["usage"].clone();
+    assert_eq!(
+        streamed, whole,
+        "completion: the streamed usage chunk vs the non-streamed usage"
+    );
+    assert_eq!(
+        whole["completion_tokens_details"]["reasoning_tokens"],
+        json!(generated),
+        "completion: {whole}"
+    );
+
+    for with_input_logprobs in [false, true] {
+        let (handle, backend) = RecordingBackend::reservation();
+        streamed_generate(
+            scheduler_stream(one_choice_overshoots(&["ok"], SETTLED)).await,
+            with_input_logprobs,
+            choices,
+            Some(handle),
+        )
+        .await;
+        assert_eq!(
+            backend.settlements(),
+            vec![settled(generated)],
+            "generate: streamed, input logprobs {with_input_logprobs}"
+        );
+    }
+    let responses = non_streamed_generate(
+        scheduler_stream(one_choice_overshoots(&["ok"], SETTLED)).await,
+        metrics_labels::ENDPOINT_GENERATE,
+    )
+    .await;
+    assert_eq!(
+        RequestPipeline::generate_settlement(&responses),
+        settled(generated),
+        "generate: non-streamed"
+    );
+}
+
+/// The `(index, reasoning_tokens, completion_tokens)` each finish event of a
+/// generate stream shows in its `meta_info`, by index. Every event of the
+/// stream must show a reasoning count no higher than the completion count
+/// beside it.
+fn generate_finish_counts(events: &[Value]) -> Vec<(u64, u64, u64)> {
+    let mut finished = Vec::new();
+    for event in events {
+        let meta = &event["meta_info"];
+        let (Some(reasoning), Some(completion)) = (
+            meta["reasoning_tokens"].as_u64(),
+            meta["completion_tokens"].as_u64(),
+        ) else {
+            continue;
+        };
+        assert!(reasoning <= completion, "{event}");
+        if !meta["finish_reason"].is_null() {
+            finished.push((
+                event["index"].as_u64().expect("an index"),
+                reasoning,
+                completion,
+            ));
+        }
+    }
+    finished.sort_unstable();
+    finished
+}
+
+/// A generate answer shows each choice's two counts side by side in its
+/// `meta_info`, and the reasoning count is never above the completion count
+/// beside it: on the collected answer and on every event of both streaming
+/// paths. A choice whose terminal frame counts two reasoning tokens more
+/// than it generated reads its completion count. A stream shows its own
+/// count of the ids it delivered: where the terminal frame counts more
+/// tokens than the stream delivered, the reasoning count is shown no higher
+/// than the delivered count, and the settlement takes the same, choice by
+/// choice: beside a second choice that count does not grow into the second
+/// choice's room.
+#[tokio::test]
+async fn a_generate_answers_reasoning_count_is_never_above_its_completion_count() {
+    let generated: u32 = 2;
+    let responses = non_streamed_generate(
+        scheduler_stream(one_choice_overshoots(&["ok"], SETTLED)).await,
+        metrics_labels::ENDPOINT_GENERATE,
+    )
+    .await;
+    let mut shown: Vec<_> = responses
+        .iter()
+        .map(|response| {
+            (
+                response.meta_info.reasoning_tokens,
+                response.meta_info.completion_tokens,
+            )
+        })
+        .collect();
+    shown.sort_unstable();
+    assert_eq!(
+        shown,
+        vec![(Some(0), generated), (Some(generated), generated)]
+    );
+
+    let generated = u64::from(generated);
+    for with_input_logprobs in [false, true] {
+        let events = streamed_generate(
+            scheduler_stream(one_choice_overshoots(&["ok"], SETTLED)).await,
+            with_input_logprobs,
+            2,
+            None,
+        )
+        .await;
+        assert_eq!(
+            generate_finish_counts(&events),
+            vec![(0, generated, generated), (1, 0, generated)],
+            "input logprobs {with_input_logprobs}"
+        );
+    }
+
+    // The terminal frame counts four tokens, three of them reasoning; the
+    // stream delivered two ids.
+    let counts_past_delivery = || {
+        let mut frames = scheduler_choice_frames(0, &["ok"], SETTLED, 3);
+        if let Some(SchedulerEvent::Complete(complete)) =
+            frames.last_mut().and_then(|frame| frame.response.as_mut())
+        {
+            complete.completion_tokens = 4;
+        }
+        frames
+    };
+    // The same choice beside a second one that delivers two ids and counts
+    // no reasoning.
+    let beside_a_second_choice = || {
+        let mut frames = counts_past_delivery();
+        frames.extend(scheduler_choice_frames(1, &["ok"], SETTLED, 0));
+        frames
+    };
+    let expected = UsageSettlement {
+        actual_input_tokens: SETTLED.prompt,
+        completion_tokens: 2,
+        cached_input_tokens: SETTLED.cached,
+        reasoning_tokens: 2,
+    };
+    let expected_of_two = UsageSettlement {
+        completion_tokens: 4,
+        ..expected
+    };
+    for with_input_logprobs in [false, true] {
+        let (handle, backend) = RecordingBackend::reservation();
+        let events = streamed_generate(
+            scheduler_stream(counts_past_delivery()).await,
+            with_input_logprobs,
+            1,
+            Some(handle),
+        )
+        .await;
+        assert_eq!(
+            generate_finish_counts(&events),
+            vec![(0, 2, 2)],
+            "input logprobs {with_input_logprobs}"
+        );
+        assert_eq!(
+            backend.settlements(),
+            vec![expected],
+            "input logprobs {with_input_logprobs}"
+        );
+
+        let (handle, backend) = RecordingBackend::reservation();
+        let events = streamed_generate(
+            scheduler_stream(beside_a_second_choice()).await,
+            with_input_logprobs,
+            2,
+            Some(handle),
+        )
+        .await;
+        assert_eq!(
+            generate_finish_counts(&events),
+            vec![(0, 2, 2), (1, 0, 2)],
+            "two choices, input logprobs {with_input_logprobs}"
+        );
+        assert_eq!(
+            backend.settlements(),
+            vec![expected_of_two],
+            "two choices, input logprobs {with_input_logprobs}"
+        );
+    }
+}
+
+/// The Messages shape reports its thinking count under the same bound, on
+/// the final `message_delta` and on the collected message.
+#[tokio::test]
+async fn thinking_tokens_are_never_reported_above_the_output_tokens() {
+    let counters = Counters {
+        prompt: 10,
+        cached: 0,
+        spec_accepted: 0,
+        spec_drafted: 0,
+    };
+    let texts = ["<think>", "ab", "</think>", "de"];
+    let generated = texts.concat().chars().count() as u32;
+    let spec = || {
+        let mut spec = messages_spec(true);
+        spec.prompt_tokens = counters.prompt;
+        spec
+    };
+    let events = streamed_messages(
+        scheduler_stream(scheduler_frames(&texts, 1, counters, generated + 2)).await,
+        spec(),
+        None,
+    )
+    .await;
+    let delta = events
+        .iter()
+        .rfind(|event| event["type"] == "message_delta")
+        .expect("a message_delta event");
+    let (message, _) = non_streamed_messages(
+        scheduler_stream(scheduler_frames(&texts, 1, counters, generated + 2)).await,
+        spec(),
+    )
+    .await;
+    let whole = serde_json::to_value(&message.usage).expect("a JSON usage");
+    for (name, usage) in [("streamed", &delta["usage"]), ("not streamed", &whole)] {
+        assert_eq!(usage["output_tokens"], json!(generated), "{name}: {usage}");
+        assert_eq!(
+            usage["output_tokens_details"]["thinking_tokens"],
+            json!(generated),
+            "{name}: {usage}"
+        );
+    }
+}
+
 /// The engine's counters a settlement test scripts: `reasoning` per choice
 /// is carried by the scheduler proto's terminal frame alone.
 const SETTLED: Counters = Counters {
@@ -799,7 +1234,8 @@ const SETTLED: Counters = Counters {
 
 /// The settlement of a chat request carries the engine's own cached and
 /// reasoning counts, streamed and not: the counts of the scheduler proto's
-/// terminal frame, whatever the gateway's parser split off; zero from the
+/// terminal frame, whatever the gateway's parser split off, a reasoning
+/// count above the completion count as the completion count; zero from the
 /// engine proto's, which carries no reasoning count, though the parser's
 /// split is what the usage object then shows. A stream that ends without
 /// a terminal frame is closed with the reserved amount instead, as before.
@@ -837,6 +1273,29 @@ async fn chat_settlement_carries_the_engines_counts_streamed_and_not() {
     assert_eq!(backend.closes(), 0);
     let (_, counts) = non_streamed_chat(
         scheduler_stream(scheduler_frames(&texts, choices, SETTLED, 1)).await,
+        &request(false),
+    )
+    .await;
+    assert_eq!(counts.settlement(), expected);
+
+    // The engine counts two reasoning tokens more per choice than the choice
+    // generated: the settlement takes the completion count, the part no
+    // higher than the whole.
+    let expected = UsageSettlement {
+        reasoning_tokens: completion,
+        ..expected
+    };
+    let over = completion / choices + 2;
+    let (handle, backend) = RecordingBackend::reservation();
+    streamed_chat_usage(
+        scheduler_stream(scheduler_frames(&texts, choices, SETTLED, over)).await,
+        &request(true),
+        Some(handle),
+    )
+    .await;
+    assert_eq!(backend.settlements(), vec![expected]);
+    let (_, counts) = non_streamed_chat(
+        scheduler_stream(scheduler_frames(&texts, choices, SETTLED, over)).await,
         &request(false),
     )
     .await;
@@ -897,18 +1356,20 @@ async fn chat_settlement_carries_the_engines_counts_streamed_and_not() {
     assert_eq!(backend.closes(), 1);
 }
 
-/// The two cases the completion, generate and messages settlement tests
+/// The three cases the completion, generate and messages settlement tests
 /// drive, each with the settlement it expects: the engine's counts (a
 /// scheduler stream whose terminal frames
 /// carry `reasoning` reasoning tokens per choice and the cache hit of
-/// `SETTLED`) and no counts from the engine (an engine stream, no cache
+/// `SETTLED`), a reasoning count two above each choice's completion count
+/// (settled as the completion count, the part no higher than the whole)
+/// and no counts from the engine (an engine stream, no cache
 /// hit, no reasoning); `completion` is the completion count the choices
 /// generate together.
 fn settlement_cases(
     reasoning: u32,
     completion: u32,
     choices: u32,
-) -> [(&'static str, Option<u32>, Counters, UsageSettlement); 2] {
+) -> [(&'static str, Option<u32>, Counters, UsageSettlement); 3] {
     [
         (
             "the engine's counts",
@@ -919,6 +1380,17 @@ fn settlement_cases(
                 completion_tokens: completion,
                 cached_input_tokens: SETTLED.cached,
                 reasoning_tokens: reasoning * choices,
+            },
+        ),
+        (
+            "a reasoning count above the completion count",
+            Some(completion / choices + 2),
+            SETTLED,
+            UsageSettlement {
+                actual_input_tokens: SETTLED.prompt,
+                completion_tokens: completion,
+                cached_input_tokens: SETTLED.cached,
+                reasoning_tokens: completion,
             },
         ),
         (
@@ -953,7 +1425,7 @@ async fn completion_settlement_carries_the_engines_counts_streamed_and_not() {
         }
         serde_json::from_value(request).expect("completion request")
     };
-    for (name, scheduler_reasoning, counters, expected) in settlement_cases(3, 2 * choices, choices)
+    for (name, scheduler_reasoning, counters, expected) in settlement_cases(1, 2 * choices, choices)
     {
         let scripted = || async {
             match scheduler_reasoning {
@@ -981,7 +1453,7 @@ async fn completion_settlement_carries_the_engines_counts_streamed_and_not() {
 #[tokio::test]
 async fn generate_settlement_carries_the_engines_counts_streamed_and_not() {
     let choices = 2;
-    for (name, scheduler_reasoning, counters, expected) in settlement_cases(3, 2 * choices, choices)
+    for (name, scheduler_reasoning, counters, expected) in settlement_cases(1, 2 * choices, choices)
     {
         let scripted = || async {
             match scheduler_reasoning {
@@ -1719,6 +2191,14 @@ fn continuous_spec_usage_terminal_coverage_controls() {
             |tracker: &ChatStreamUsage| serde_json::to_value(tracker.snapshot(3, None)).unwrap();
         let mut tracker = ChatStreamUsage::new(2);
         tracker.reasoning_parsed = true;
+        // Choice 0 delivered the three tokens the parser read as reasoning.
+        tracker.record_chunk(&ProtoGenerateStreamChunk::Vllm(
+            proto::GenerateStreamChunk {
+                index: 0,
+                token_ids: vec![7, 8, 9],
+                ..Default::default()
+            },
+        ));
         tracker.record_reasoning(0, 3);
         tracker.record_complete(&complete(0, first));
         // A duplicate terminal for choice 0 cannot stand in for choice 1.
@@ -1752,7 +2232,7 @@ fn continuous_spec_usage_terminal_coverage_controls() {
             },
         ));
         let usage = snapshot(&tracker);
-        assert_eq!(usage["completion_tokens"], 2);
+        assert_eq!(usage["completion_tokens"], 5);
         if first == (0, 0) {
             assert_eq!(
                 usage["completion_tokens_details"]["rejected_prediction_tokens"],
@@ -1768,7 +2248,7 @@ fn continuous_spec_usage_terminal_coverage_controls() {
         }
         tracker.record_complete(&complete(1, second));
         let usage = snapshot(&tracker);
-        assert_eq!(usage["completion_tokens"], 2);
+        assert_eq!(usage["completion_tokens"], 5);
         assert_eq!(
             usage["completion_tokens_details"]["accepted_prediction_tokens"],
             first.0 + second.0
@@ -1804,7 +2284,7 @@ async fn collected_chat_missing_choice_keeps_rejections_unknown() {
         spec_drafted: 2,
     };
     let (response, counts) = non_streamed_chat(
-        scheduler_stream(scheduler_choice_frames(0, &["ok"], counters, 3)).await,
+        scheduler_stream(scheduler_choice_frames(0, &["ok"], counters, 1)).await,
         &request,
     )
     .await;
@@ -1819,7 +2299,7 @@ async fn collected_chat_missing_choice_keeps_rejections_unknown() {
             actual_input_tokens: 10,
             completion_tokens: 2,
             cached_input_tokens: 4,
-            reasoning_tokens: 3,
+            reasoning_tokens: 1,
         }
     );
     let usage = serde_json::to_value(response).unwrap()["usage"].clone();
@@ -1855,13 +2335,13 @@ async fn collected_completion_missing_choice_in_one_prompt_keeps_rejections_unkn
         };
         let first: Vec<_> = first_indices
             .iter()
-            .flat_map(|&index| scheduler_choice_frames(index, &["ok"], counters, 3))
+            .flat_map(|&index| scheduler_choice_frames(index, &["ok"], counters, 1))
             .collect();
         let mut results = Vec::new();
         let mut servers = Vec::new();
         let second: Vec<_> = second_indices
             .iter()
-            .flat_map(|&index| scheduler_choice_frames(index, &["ok"], counters, 3))
+            .flat_map(|&index| scheduler_choice_frames(index, &["ok"], counters, 1))
             .collect();
         for frames in [first, second] {
             let (stream, server) = scheduler_stream(frames).await;
@@ -1899,7 +2379,7 @@ async fn collected_completion_missing_choice_in_one_prompt_keeps_rejections_unkn
         assert_eq!(usage["completion_tokens"], 2 * count);
         assert_eq!(
             usage["completion_tokens_details"]["reasoning_tokens"],
-            3 * count
+            count
         );
         assert_eq!(
             usage["completion_tokens_details"]["accepted_prediction_tokens"],
@@ -1946,7 +2426,7 @@ async fn collected_regular_membership_and_proposal_controls() {
                         spec_accepted: accepted,
                         spec_drafted: drafted,
                     },
-                    3,
+                    1,
                 )
             })
             .collect();
@@ -1967,7 +2447,7 @@ async fn collected_regular_membership_and_proposal_controls() {
             assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 4);
             assert_eq!(usage["completion_tokens"], 2 * entries.len());
             let details = &usage["completion_tokens_details"];
-            assert_eq!(details["reasoning_tokens"], 3 * entries.len());
+            assert_eq!(details["reasoning_tokens"], entries.len());
             if !is_chat && rejected == Some(0) && entries.iter().all(|e| e.1 == 0 && e.2 == 0) {
                 // Legacy completions do not add chat's all-zero schema defaults.
                 assert!(

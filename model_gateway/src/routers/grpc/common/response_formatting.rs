@@ -146,13 +146,26 @@ impl TokenCounts {
         }
     }
 
+    /// The engine's reasoning count as the usage and the settlement take it:
+    /// no higher than the completion count. A speculative step that lands
+    /// past the token limit can be counted whole as reasoning while the
+    /// completion count stops at the limit, and a part above the whole is
+    /// no count a client can meter by. Each choice's count arrives here
+    /// already within its own completion count: the frame's where it is
+    /// read, the ids a generate stream delivered where that stream keeps
+    /// it. This bound is the guard on the request's sum.
+    fn reasoning_within_completion(self) -> u32 {
+        self.reasoning.min(self.completion)
+    }
+
     /// The usage object the counters make: the counts with the cached,
-    /// reasoning and speculative details the engine reported. The usage of
+    /// reasoning and speculative details the engine reported, the reasoning
+    /// count as `reasoning_within_completion` reads it. The usage of
     /// a legacy completion, streamed or not, is this object.
     pub(crate) fn usage(self) -> Usage {
         let mut usage = Usage::from_counts(self.prompt, self.completion)
             .with_cached_tokens(self.cached)
-            .with_reasoning_tokens(self.reasoning)
+            .with_reasoning_tokens(self.reasoning_within_completion())
             .with_speculative_tokens(self.spec_accepted, self.spec_drafted.unwrap_or(0));
         if self.spec_drafted.is_none() {
             // Keep aggregate availability separate from the old proto's zero sentinel.
@@ -165,14 +178,16 @@ impl TokenCounts {
     }
 
     /// The settlement of the request's reservation: the engine's counts as
-    /// they are, before the client-facing usage drops unbilled prompt
-    /// tokens or substitutes the gateway parser's reasoning split.
+    /// they are, except a reasoning count above the completion count
+    /// (`reasoning_within_completion`), before the client-facing usage
+    /// drops unbilled prompt tokens or substitutes the gateway parser's
+    /// reasoning split.
     pub(crate) fn settlement(self) -> UsageSettlement {
         UsageSettlement {
             actual_input_tokens: self.prompt,
             completion_tokens: self.completion,
             cached_input_tokens: self.cached,
-            reasoning_tokens: self.reasoning,
+            reasoning_tokens: self.reasoning_within_completion(),
         }
     }
 }
@@ -205,11 +220,16 @@ pub(crate) fn chat_usage(
 /// `parsed` is the number of output tokens it routed to `reasoning_content`
 /// for the request, `None` when it did not run. Like an engine with a
 /// reasoning parser, the details are then always reported, zero included; an
-/// engine that counts reasoning itself is not overruled, whatever its count.
+/// engine that counts reasoning itself is not overruled: its count stands as
+/// [`TokenCounts::usage`] reports it. The parser's count is inserted under
+/// the same bound, no higher than the completion count.
 pub(crate) fn with_parsed_reasoning_tokens(mut usage: Usage, parsed: Option<u32>) -> Usage {
     if let Some(parsed) = parsed {
+        let whole = usage.completion_tokens;
         let details = usage.completion_tokens_details.get_or_insert_default();
-        details.reasoning_tokens.get_or_insert(parsed);
+        details
+            .reasoning_tokens
+            .get_or_insert_with(|| parsed.min(whole));
     }
     usage
 }
@@ -399,20 +419,47 @@ mod tests {
             "the parser ran and found no reasoning: zero, not absent"
         );
         assert_eq!(
-            reasoning_tokens(with_parsed_reasoning_tokens(usage, Some(7))),
-            Some(7)
+            reasoning_tokens(with_parsed_reasoning_tokens(usage.clone(), Some(3))),
+            Some(3)
         );
-        let engine_counted = Usage::from_counts(10, 4).with_reasoning_tokens(5);
+        assert_eq!(
+            reasoning_tokens(with_parsed_reasoning_tokens(usage, Some(7))),
+            Some(4),
+            "the part is not above the whole: four tokens counted, seven read as reasoning"
+        );
+        let engine_counted = Usage::from_counts(10, 4).with_reasoning_tokens(4);
         assert_eq!(
             reasoning_tokens(with_parsed_reasoning_tokens(engine_counted, Some(3))),
-            Some(5),
+            Some(4),
             "an engine that counts reasoning itself is not overruled"
         );
-        let engine_counted_fewer = Usage::from_counts(10, 4).with_reasoning_tokens(3);
+        let engine_counted_fewer = Usage::from_counts(10, 4).with_reasoning_tokens(2);
         assert_eq!(
-            reasoning_tokens(with_parsed_reasoning_tokens(engine_counted_fewer, Some(5))),
-            Some(3),
+            reasoning_tokens(with_parsed_reasoning_tokens(engine_counted_fewer, Some(3))),
+            Some(2),
             "nor when its count is lower than the parser's"
+        );
+    }
+
+    #[test]
+    fn an_engines_reasoning_count_above_its_completion_count_is_reported_and_settled_within_it() {
+        let counts = TokenCounts {
+            completion: 4,
+            reasoning: 7,
+            ..TokenCounts::default()
+        };
+        assert_eq!(
+            counts
+                .usage()
+                .completion_tokens_details
+                .and_then(|details| details.reasoning_tokens),
+            Some(4),
+            "four tokens generated, seven counted as reasoning"
+        );
+        assert_eq!(
+            counts.settlement().reasoning_tokens,
+            4,
+            "the settlement takes the count the usage reports"
         );
     }
 

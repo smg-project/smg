@@ -1621,7 +1621,9 @@ fn messages_usage_from_counts(
         messages::Usage::from_counts(prompt_tokens.saturating_sub(cached_tokens), output_tokens)
             .with_cache_read_input_tokens(cached_tokens);
     match thinking_tokens {
-        Some(thinking_tokens) => usage.with_thinking_tokens(thinking_tokens),
+        // A part of the output, even when a count of reasoning ran past the
+        // engine's count of its output.
+        Some(thinking_tokens) => usage.with_thinking_tokens(thinking_tokens.min(output_tokens)),
         None => usage,
     }
 }
