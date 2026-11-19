@@ -117,7 +117,7 @@ const DIGITS: usize = 20;
 /// Why a spec store did not become a controller's source.
 #[derive(Debug, Eq, PartialEq, thiserror::Error)]
 pub enum StoreRefused {
-    /// The path is a file, or leads nowhere.
+    /// The path leads to a file, through one, or nowhere.
     #[error("the path leads to no directory")]
     NotADirectory,
     /// The directory could not be read.
@@ -357,15 +357,19 @@ impl SpecStore {
     }
 
     /// What the system reads at a path that leads to a directory. A path
-    /// that leads to none is refused.
+    /// that leads to none is refused by that name: one to a file, one
+    /// through a file, one to nothing.
     fn found(dir: &Path) -> Result<fs::Metadata, StoreRefused> {
         match fs::metadata(dir) {
             Ok(found) if found.is_dir() => Ok(found),
             Ok(_) => Err(StoreRefused::NotADirectory),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                Err(StoreRefused::NotADirectory)
-            }
-            Err(error) => Err(StoreRefused::Unreadable(error.to_string())),
+            Err(error) => match error.kind() {
+                // Nothing is there, or a file stands in the path's way.
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory => {
+                    Err(StoreRefused::NotADirectory)
+                }
+                _ => Err(StoreRefused::Unreadable(error.to_string())),
+            },
         }
     }
 
@@ -531,8 +535,11 @@ impl SpecStore {
     /// Refuses where the store's path leads to another directory than the
     /// one it holds, or to none: an apply there would stand on file where
     /// no start by that path reads it. The path is asked as a start asks
-    /// it: a file laid there, or nothing, is a path to no directory.
+    /// it: a file laid there or in its way, or nothing, is a path to no
+    /// directory.
     fn same(&self) -> io::Result<()> {
+        // The refusal goes on as its words alone. Boxed whole it kept its
+        // debug text in the release binary: 20 KB for this one line.
         let at_path =
             Self::found(&self.dir).map_err(|refused| io::Error::other(refused.to_string()))?;
         if Self::is_held(&at_path, &self.root)? {
@@ -848,7 +855,8 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().expect("a temp dir");
         let file = dir.path().join("a-file");
         fs::write(&file, "").expect("the file");
-        for path in [file, dir.path().join("nowhere")] {
+        let through = file.join("store");
+        for path in [file, through, dir.path().join("nowhere")] {
             let refused = SpecStore::open(path).expect_err("no directory");
             assert_eq!(refused, StoreRefused::NotADirectory);
             assert_eq!(refused.to_string(), "the path leads to no directory");
@@ -1193,6 +1201,31 @@ pub(crate) mod tests {
             .expect_err("the path leads nowhere");
         assert_eq!(refused.to_string(), no_directory);
         assert_eq!(names(&moved), BTreeSet::from([name_of(1, "yaml")]));
+    }
+
+    /// A store whose path leads through a file by the time of a write
+    /// refuses the write as a start is refused there, as a path to no
+    /// directory: the directory above its own moved away, and a file
+    /// stands where that one stood.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_under_a_path_through_a_file_is_refused_as_a_start_is() {
+        let base = tempfile::tempdir().expect("a temp dir");
+        let (above, moved) = (base.path().join("above"), base.path().join("moved"));
+        let dir = above.join("store");
+        fs::create_dir_all(&dir).expect("the directory");
+        let mut store = SpecStore::open(dir.clone()).expect("the store");
+        store.persist(at(1, YAML), b"one").expect("a write");
+        fs::rename(&above, &moved).expect("the directory above moves");
+        fs::write(&above, "a file").expect("a file stands in the path's way");
+        let refused = store
+            .persist(at(2, YAML), b"two")
+            .expect_err("the path leads through a file");
+        assert_eq!(refused.to_string(), StoreRefused::NotADirectory.to_string());
+        let start = SpecStore::open(dir).expect_err("a start there");
+        assert_eq!(start, StoreRefused::NotADirectory);
+        let held = names(&moved.join("store"));
+        assert_eq!(held, BTreeSet::from([name_of(1, "yaml")]));
     }
 
     /// A directory replaced at the path of an open store leaves that store
