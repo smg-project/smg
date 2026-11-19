@@ -2442,9 +2442,19 @@ fn a_lone_spinner_on_an_armed_thread_is_charged_and_the_failure_rule_opens_it() 
 
 /// Two plugins in one profile: the scorer spends most of the budget, the
 /// picker runs out under what is left. The decision's budget is spent, the
-/// picker's instance goes, and the picker's breaker is untouched.
+/// picker's instance goes, and the picker's breaker is untouched. A call is
+/// late by the wall clock: a try whose thread was held off the CPU reads a
+/// late call that nothing read, and is made again.
 #[test]
 fn an_exhaustion_under_another_plugins_clamp_is_the_decisions_budget_spent() {
+    tried(an_exhaustion_under_another_plugins_clamp_is_the_decisions_budget_spent_in_a_try);
+}
+
+/// One try of the case above, told its number: whether it stood.
+fn an_exhaustion_under_another_plugins_clamp_is_the_decisions_budget_spent_in_a_try(
+    made: u32,
+) -> bool {
+    const CASE: &str = "an exhaustion under another plugin's clamp";
     let runtime = runtime();
     let scorer = load_slow(
         &runtime,
@@ -2488,6 +2498,7 @@ fn an_exhaustion_under_another_plugins_clamp_is_the_decisions_budget_spent() {
     // A burn and a half, plus a little for the constructors: the scorer's
     // burn fits, the picker's does not.
     let budget_micros = u32::try_from((burn * 3 / 2).div_ceil(fuel_per_micro) + 20).expect("fits");
+    let (wall, cpu) = (std::time::Instant::now(), bound_clock());
     let decision = engine.decide(
         &RequestFacts {
             budget_micros,
@@ -2502,11 +2513,20 @@ fn an_exhaustion_under_another_plugins_clamp_is_the_decisions_budget_spent() {
         &Constraints::default(),
         &mut Scratch::new(),
     );
+    let held = off_cpu_since(wall, cpu);
     assert!(
         matches!(decision, Decision::Pick(_)),
         "the fallback picker decides"
     );
     let (s, p) = (scorer.stats(), picker.stats());
+    let stood = (s.fuel_exhausted, s.traps, s.answered - gauged) == (0, 0, 2)
+        && (p.fuel_exhausted, p.traps, p.budget_spent) == (0, 0, 1)
+        && (p.unread, p.stalls) == (0, 0)
+        && (p.instantiations, p.lazy_instantiations) == (2, 1)
+        && p.breaker_opens == 0;
+    if held_counts_are_made_again(CASE, stood, held, made) {
+        return false;
+    }
     assert_eq!(
         (s.fuel_exhausted, s.traps, s.answered - gauged),
         (0, 0, 2),
@@ -2528,6 +2548,7 @@ fn an_exhaustion_under_another_plugins_clamp_is_the_decisions_budget_spent() {
         "the picker's interrupted instance went and the close rebuilt it: {p:?}"
     );
     assert_eq!(p.breaker_opens, 0);
+    true
 }
 
 /// The decision's first open seeds its budget and every later open draws on
