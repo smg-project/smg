@@ -45,7 +45,6 @@ pub use steps::{
     CreateExternalWorkersStep,
     // Local registration steps
     CreateLocalWorkerStep,
-    DetectConnectionModeStep,
     DiscoverDPInfoStep,
     DiscoverMetadataStep,
     DiscoverModelsStep,

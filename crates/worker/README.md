@@ -66,7 +66,7 @@ The default feature set is empty, so every other layer is asked for by name.
 | `proto` | `common_proto`: the Rust types of `proto/common.proto`. The build then runs `protoc`. | | `prost`, `prost-build` | A crate that speaks gRPC to an engine. `smg-grpc-client` is one. |
 | `runtime` | The worker runtime: the worker and its builder, the registry, health, the load monitor, the metric writers, the engine handle and the collector of the KV cache events. | `metrics`, `proto` | `anyhow`, `arc-swap`, `async-trait`, `chrono`, `futures`, `metrics`, `metrics-exporter-prometheus`, `metrics-util`, `once_cell`, `openmetrics-parser`, `parking_lot`, `quanta`, `reqwest`, `rustls`, `thiserror`, `tokio`, `tonic`, `tracing`, `uuid` | The process that hosts the workers. The gateway is one. |
 | `test-util` | `test_support`: what a test builds its workers with, a scripted engine among it. It also opens the test readers and hooks of the registry, the series store, the label interner and the KV event collector. | `runtime` | `tonic-prost` | The tests of a crate that hosts the runtime. |
-| `workflow` | `workflow`: the worker side of the workflows a host runs over its workers on the workflow engine. It holds a worker's removal: the steps, their order, the data they pass along and the host trait they read. | `runtime` | `wfaas` | A host that removes workers by a workflow. The gateway is one. |
+| `workflow` | `workflow`: the worker side of the workflows a host runs over its workers on the workflow engine. It holds a worker's removal (the steps, their order, the data they pass along), the start of a worker's registration (its data, the detection of how the worker is spoken to, and the order a host adds its own steps to) and the host trait the steps read. | `runtime` | `wfaas` | A host that registers or removes workers by a workflow. The gateway is one. |
 
 "Turns on" names other features of this crate. "Pulls in" names the crates a
 feature adds to the build. `runtime` turns on `proto`, so the build of a host
@@ -298,7 +298,7 @@ A port is a trait this crate calls and a host implements.
 | `RequestCompletionSink` | `identity::basic` | What to do when a request on a worker ends. | The sink its policy registry installs. |
 | `KvEventSink` | `kv_events::port` | What to do with the KV cache events a worker's stream brings: keep each rank's cursor, apply what it admits, and drop a worker's blocks when it leaves. | The sink over its KV indexes. |
 | `KvEventHost` | `kv_events` | What a worker's events subscription feeds: the sink its task opens, and what goes when a model's last events subscription is gone. | Its index side: the models' KV indexes. |
-| `WorkflowHost` | `workflow` | What the steps of a worker workflow read of their host: its registry and its worker clients. It also names the type of the notes a host keeps on a registration. | Its application context. |
+| `WorkflowHost` | `workflow` | What the steps of a worker workflow read of their host: its registry, its worker clients, its registration settings and its engine connector. It also names the type of the notes a host keeps on a registration. | Its application context. |
 
 A host must write two of them: `Generation`, to have a registry, and
 `LoadConsumer`, to run the load monitor over the crate's own sink. A host
@@ -359,7 +359,7 @@ is always there.
 | `registry` | `runtime` | The registry and its events. |
 | `runtime` | `runtime` | A worker's shared runtime state: what a replacement at the same address inherits. |
 | `test_support` | `runtime`, `test-util` | What a test builds its workers with. |
-| `workflow` | `workflow` | The worker side of the workflows a host runs over its workers: the steps of a removal, their order and the host trait they read. |
+| `workflow` | `workflow` | The worker side of the workflows a host runs over its workers: the steps of a removal and their order, a registration's data with the detection of how a worker is spoken to and its order, and the host trait they read. |
 
 ## How this page stays true
 

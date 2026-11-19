@@ -189,6 +189,32 @@ impl<H: WorkflowHost> Clone for WorkerRegistrationWorkflowData<H> {
 }
 
 impl<H: WorkflowHost> WorkerRegistrationWorkflowData<H> {
+    /// A registration of `config` as it enters the workflow: nothing found
+    /// out about the worker yet, and the host's notes at their default.
+    pub fn new(
+        config: WorkerSpec,
+        registration_mode: WorkerRegistrationMode,
+        host: Arc<H>,
+    ) -> Self {
+        Self {
+            config,
+            registration_mode,
+            worker_kind: None,
+            connection_mode: None,
+            http2: None,
+            http_client_handle: None,
+            detected_runtime_type: None,
+            discovered_labels: HashMap::new(),
+            dp_info: None,
+            host_notes: H::RegistrationNotes::default(),
+            model_cards: Vec::new(),
+            workers: None,
+            final_labels: HashMap::new(),
+            host: Some(host),
+            actual_workers: None,
+        }
+    }
+
     /// The worker-directed client for the resolved HTTP version, re-fetched
     /// from the host's cache when a deserialize dropped the transient handle.
     pub fn http_client(&self, step_id: &str) -> WorkflowResult<Arc<reqwest::Client>> {

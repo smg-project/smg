@@ -120,3 +120,34 @@ fn a_registration_saved_before_the_move_reads_back_as_it_was_written() {
     assert!(read.actual_workers.is_none());
     assert!(read.http_client_handle.is_none());
 }
+
+/// A registration enters the workflow with its spec, its mode and its host,
+/// and with nothing found out about its worker.
+#[test]
+fn a_new_registration_holds_its_spec_its_mode_and_its_host_alone() {
+    let host = host();
+
+    let data = WorkerRegistrationWorkflowData::new(
+        WorkerSpec::new("http://worker-a:8000"),
+        WorkerRegistrationMode::Upsert,
+        Arc::clone(&host),
+    );
+
+    assert_eq!(data.config.url, "http://worker-a:8000");
+    assert!(matches!(
+        data.registration_mode,
+        WorkerRegistrationMode::Upsert
+    ));
+    assert!(Arc::ptr_eq(data.host.as_ref().unwrap(), &host));
+    assert!(data.worker_kind.is_none());
+    assert!(data.connection_mode.is_none());
+    assert!(data.http2.is_none());
+    assert!(data.http_client_handle.is_none());
+    assert!(data.detected_runtime_type.is_none());
+    assert!(data.discovered_labels.is_empty());
+    assert!(data.dp_info.is_none());
+    assert!(data.model_cards.is_empty());
+    assert!(data.workers.is_none());
+    assert!(data.final_labels.is_empty());
+    assert!(data.actual_workers.is_none());
+}

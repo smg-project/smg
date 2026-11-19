@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use reqwest::Client;
 use smg_worker::{
     identity::{basic::ConnectionMode, endpoint::Endpoint},
-    workflow::WorkerKind,
+    workflow::{http_base_url, WorkerKind},
 };
 use tracing::{debug, warn};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
@@ -22,7 +22,7 @@ use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowRe
 use super::discover_metadata::ModelsResponse;
 use crate::workflow::{
     data::{require_app_context, WorkerWorkflowData},
-    steps::util::{grpc_base_url, grpc_health_answer, http_base_url},
+    steps::util::{grpc_base_url, grpc_health_answer},
 };
 
 // ─── gRPC backend detection ────────────────────────────────────────────────

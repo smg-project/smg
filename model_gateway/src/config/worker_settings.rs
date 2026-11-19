@@ -10,6 +10,7 @@ use std::time::Duration;
 use smg_worker::{
     connection::http_client::WorkerHttpClientSettings,
     health::{liveness::Budgets, overload::OverloadThresholds},
+    settings::RegistrationSettings,
 };
 
 use super::types::RouterConfig;
@@ -60,6 +61,19 @@ impl RouterConfig {
             upstream_http2: self.upstream_http2,
             request_timeout_secs: self.request_timeout_secs,
             pool_idle_timeout_secs: self.upstream_pool_idle_timeout_secs,
+        }
+    }
+
+    /// What the worker crate's registration steps read of this
+    /// configuration: the HTTP/2 switch, the health probe's timeout and the
+    /// three startup timings.
+    pub fn registration_settings(&self) -> RegistrationSettings {
+        RegistrationSettings {
+            upstream_http2: self.upstream_http2,
+            health_check_timeout_secs: self.health_check.timeout_secs,
+            startup_timeout_secs: self.worker_startup_timeout_secs,
+            startup_delay_secs: self.worker_startup_delay_secs,
+            startup_check_interval_secs: self.worker_startup_check_interval_secs,
         }
     }
 }

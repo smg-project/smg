@@ -13,12 +13,11 @@ use openai_protocol::worker::ProviderType;
 use reqwest::Client;
 use smg_worker::{
     identity::{basic::RuntimeType, endpoint::Endpoint},
-    workflow::WorkerKind,
+    workflow::{http_base_url, try_grpc_reachable, try_http_reachable, WorkerKind, WorkflowHost},
 };
 use tracing::debug;
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
-use super::util::{http_base_url, try_grpc_reachable, try_http_reachable};
 use crate::{
     routers::provider_support,
     workflow::data::{require_app_context, WorkerWorkflowData},
@@ -154,7 +153,14 @@ impl StepExecutor<WorkerWorkflowData> for ClassifyWorkerTypeStep {
         }
 
         // 5. gRPC health → Local (external APIs never use gRPC)
-        if try_grpc_reachable(&config.url, timeout).await.is_ok() {
+        if try_grpc_reachable(
+            app_context.engine_connector().as_ref(),
+            &config.url,
+            timeout,
+        )
+        .await
+        .is_ok()
+        {
             debug!(
                 "Worker {} responded to gRPC health → Local",
                 Endpoint::redacted_str(&config.url)

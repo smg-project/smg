@@ -13,7 +13,7 @@ use smg_worker::{
         sampling_defaults::{SamplingDefaults, DEFAULT_SAMPLING_PARAMS_LABEL},
     },
     labels::flat_labels,
-    workflow::WorkerKind,
+    workflow::{http_base_url, WorkerKind},
 };
 use tool_parser::GrammarStart;
 use tracing::{debug, warn};
@@ -23,7 +23,7 @@ use crate::workflow::{
     data::WorkerWorkflowData,
     steps::{
         local::create_worker::resolve_model_id,
-        util::{connect_grpc_as, grpc_base_url, http_base_url},
+        util::{connect_grpc_as, grpc_base_url},
     },
 };
 

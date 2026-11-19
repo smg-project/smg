@@ -65,8 +65,8 @@ runtime = [
 # codec.
 test-util = ["runtime", "dep:tonic-prost"]
 # The worker side of the workflows a host runs over its workers on the
-# workflow engine: the steps of a worker's removal, the data they pass along
-# and the host trait they read.
+# workflow engine: the steps of a worker's removal, the start of a worker's
+# registration, the data they pass along and the host trait they read.
 workflow = ["runtime", "dep:wfaas"]
 
 [dependencies]

@@ -1,6 +1,5 @@
 mod create_worker;
 mod detect_backend;
-mod detect_connection;
 mod discover_dp;
 mod discover_metadata;
 mod ensure_harmony_encoding;
@@ -19,7 +18,6 @@ use std::{sync::Arc, time::Duration};
 
 pub use create_worker::CreateLocalWorkerStep;
 pub use detect_backend::DetectBackendStep;
-pub use detect_connection::DetectConnectionModeStep;
 pub use discover_dp::{get_dp_info, DiscoverDPInfoStep};
 pub use discover_metadata::DiscoverMetadataStep;
 pub use ensure_harmony_encoding::EnsureHarmonyEncodingStep;

@@ -14,9 +14,9 @@ pub use external::{
 pub use local::{
     create_worker_removal_workflow, create_worker_removal_workflow_data,
     create_worker_update_workflow, create_worker_update_workflow_data, CreateLocalWorkerStep,
-    DetectConnectionModeStep, DiscoverDPInfoStep, DiscoverMetadataStep, FindWorkerToUpdateStep,
-    ReleaseTokenizerStep, RemoveFromPolicyRegistryStep, UpdatePoliciesForWorkerStep,
-    UpdateRemainingPoliciesStep, UpdateWorkerPropertiesStep,
+    DiscoverDPInfoStep, DiscoverMetadataStep, FindWorkerToUpdateStep, ReleaseTokenizerStep,
+    RemoveFromPolicyRegistryStep, UpdatePoliciesForWorkerStep, UpdateRemainingPoliciesStep,
+    UpdateWorkerPropertiesStep,
 };
 use local::{
     DetectBackendStep, DiscoverDPInfoStep as DPStep, EnsureHarmonyEncodingStep,
@@ -28,12 +28,15 @@ pub use shared::{
     registered_entries, registered_in, ActivateWorkersStep, RegisterWorkersStep,
     UpdatePoliciesStep, WorkerList,
 };
+use smg_worker::workflow::{
+    startup_attempts, worker_registration_workflow, RegistrationGates, DETECT_CONNECTION_MODE_STEP,
+};
 use wfaas::{BackoffStrategy, FailureAction, RetryPolicy, StepDefinition, WorkflowDefinition};
 
 use crate::{
     app_context::AppContext,
     config::RouterConfig,
-    workflow::data::{RegistrationNotes, WorkerRegistrationMode, WorkerWorkflowData},
+    workflow::data::{WorkerRegistrationMode, WorkerWorkflowData},
 };
 
 /// Create the unified worker registration workflow definition.
@@ -69,23 +72,11 @@ use crate::{
 pub fn create_worker_registration_workflow(
     router_config: &RouterConfig,
 ) -> WorkflowDefinition<WorkerWorkflowData> {
-    let detect_timeout = Duration::from_secs(router_config.worker_startup_timeout_secs);
-    let startup_delay = Duration::from_secs(router_config.worker_startup_delay_secs);
-    let check_interval = Duration::from_secs(router_config.worker_startup_check_interval_secs);
-
-    // Startup detection polls the starting engine every
-    // `worker_startup_check_interval_secs` until `worker_startup_timeout_secs`
-    // elapses. Derive the retry attempt budget from that cadence (reserving
-    // 10% of the timeout for workflow overhead like step transitions) so the
-    // two knobs stay consistent: total wait ≈ max_attempts × check_interval ≈
-    // worker_startup_timeout_secs. A floor keeps a very short timeout retrying
-    // a few times.
-    const EFFECTIVE_TIMEOUT_FACTOR: f64 = 0.9;
-    const MIN_ATTEMPTS: u32 = 3;
-
-    let interval_secs = (check_interval.as_secs() as f64).max(1.0);
-    let effective_timeout = detect_timeout.as_secs() as f64 * EFFECTIVE_TIMEOUT_FACTOR;
-    let max_attempts = ((effective_timeout / interval_secs).ceil() as u32).max(MIN_ATTEMPTS);
+    let settings = router_config.registration_settings();
+    let startup_delay = Duration::from_secs(settings.startup_delay_secs);
+    // The steps that poll a starting engine share one attempt budget, which
+    // the worker crate derives from the startup timings.
+    let max_attempts = startup_attempts(&settings);
 
     // Step 0: Classify worker type (Local vs External). This is the entry step,
     // so it carries the one-time startup grace period: leave the engine alone
@@ -102,180 +93,171 @@ pub fn create_worker_registration_workflow(
         classify_worker_type = classify_worker_type.with_delay(startup_delay);
     }
 
-    WorkflowDefinition::new("worker_registration", "Worker Registration")
-        // Step 0: Classify worker type (Local vs External)
-        .add_step(classify_worker_type)
-        // === LOCAL BRANCH ===
-        // Step 1: Detect connection mode (HTTP vs gRPC)
-        .add_step(
-            StepDefinition::new(
-                "detect_connection_mode",
-                "Detect Connection Mode",
-                Arc::new(DetectConnectionModeStep),
-            )
-            .with_retry(RetryPolicy {
-                max_attempts,
-                // Poll the starting engine at the configured startup cadence.
-                backoff: BackoffStrategy::Fixed(check_interval),
-            })
-            .with_timeout(detect_timeout)
-            .with_failure_action(FailureAction::FailWorkflow)
-            .depends_on(&["classify_worker_type"]),
+    // Step 1, the connection mode (HTTP vs gRPC), is the worker crate's. It
+    // waits on the classification, which carries the startup delay.
+    worker_registration_workflow::<AppContext>(
+        &settings,
+        RegistrationGates {
+            detection: Some("classify_worker_type"),
+        },
+    )
+    // Step 0: Classify worker type (Local vs External)
+    .add_step(classify_worker_type)
+    // === LOCAL BRANCH ===
+    // Step 1.5: Detect backend runtime (sglang, vllm, trtllm)
+    .add_step(
+        StepDefinition::new(
+            "detect_backend",
+            "Detect Backend",
+            Arc::new(DetectBackendStep),
         )
-        // Step 1.5: Detect backend runtime (sglang, vllm, trtllm)
-        .add_step(
-            StepDefinition::new(
-                "detect_backend",
-                "Detect Backend",
-                Arc::new(DetectBackendStep),
-            )
-            .with_retry(RetryPolicy {
-                max_attempts,
-                backoff: BackoffStrategy::Linear {
-                    increment: Duration::from_secs(1),
-                    max: Duration::from_secs(5),
-                },
-            })
-            .with_timeout(Duration::from_secs(10))
-            .with_failure_action(FailureAction::ContinueNextStep)
-            .depends_on(&["detect_connection_mode"]),
+        .with_retry(RetryPolicy {
+            max_attempts,
+            backoff: BackoffStrategy::Linear {
+                increment: Duration::from_secs(1),
+                max: Duration::from_secs(5),
+            },
+        })
+        .with_timeout(Duration::from_secs(10))
+        .with_failure_action(FailureAction::ContinueNextStep)
+        .depends_on(&[DETECT_CONNECTION_MODE_STEP]),
+    )
+    // Step 2a: Discover metadata
+    .add_step(
+        StepDefinition::new(
+            "discover_metadata",
+            "Discover Metadata",
+            Arc::new(DiscoverMetadataStep),
         )
-        // Step 2a: Discover metadata
-        .add_step(
-            StepDefinition::new(
-                "discover_metadata",
-                "Discover Metadata",
-                Arc::new(DiscoverMetadataStep),
-            )
+        .with_retry(RetryPolicy {
+            max_attempts: 3,
+            backoff: BackoffStrategy::Fixed(Duration::from_secs(1)),
+        })
+        .with_timeout(Duration::from_secs(10))
+        .with_failure_action(FailureAction::ContinueNextStep)
+        .depends_on(&["detect_backend"]),
+    )
+    // Step 2b: Discover DP info (after metadata)
+    .add_step(
+        StepDefinition::new("discover_dp_info", "Discover DP Info", Arc::new(DPStep))
             .with_retry(RetryPolicy {
                 max_attempts: 3,
                 backoff: BackoffStrategy::Fixed(Duration::from_secs(1)),
             })
             .with_timeout(Duration::from_secs(10))
-            .with_failure_action(FailureAction::ContinueNextStep)
-            .depends_on(&["detect_backend"]),
-        )
-        // Step 2b: Discover DP info (after metadata)
-        .add_step(
-            StepDefinition::new("discover_dp_info", "Discover DP Info", Arc::new(DPStep))
-                .with_retry(RetryPolicy {
-                    max_attempts: 3,
-                    backoff: BackoffStrategy::Fixed(Duration::from_secs(1)),
-                })
-                .with_timeout(Duration::from_secs(10))
-                .with_failure_action(FailureAction::FailWorkflow)
-                .depends_on(&["discover_metadata"]),
-        )
-        // Step 3 (local): Create local worker(s)
-        .add_step(
-            StepDefinition::new(
-                "create_local_worker",
-                "Create Local Worker",
-                Arc::new(CreateLocalWorkerStep),
-            )
-            .with_timeout(Duration::from_secs(5))
             .with_failure_action(FailureAction::FailWorkflow)
-            .depends_on(&["discover_dp_info"]),
+            .depends_on(&["discover_metadata"]),
+    )
+    // Step 3 (local): Create local worker(s)
+    .add_step(
+        StepDefinition::new(
+            "create_local_worker",
+            "Create Local Worker",
+            Arc::new(CreateLocalWorkerStep),
         )
-        // Step 3b (local): gRPC gpt-oss workers need the Harmony encoding; load
-        // it before registration so an unavailable vocab fails this worker
-        // instead of panicking the gateway or erroring at first request.
-        .add_step(
-            StepDefinition::new(
-                "ensure_harmony_encoding",
-                "Ensure Harmony Encoding",
-                Arc::new(EnsureHarmonyEncodingStep),
-            )
-            .with_retry(RetryPolicy {
-                max_attempts,
-                backoff: BackoffStrategy::Exponential {
-                    base: Duration::from_secs(1),
-                    max: Duration::from_secs(10),
-                },
-            })
-            .with_timeout(Duration::from_secs(30))
-            .with_failure_action(FailureAction::FailWorkflow)
-            .depends_on(&["create_local_worker"]),
+        .with_timeout(Duration::from_secs(5))
+        .with_failure_action(FailureAction::FailWorkflow)
+        .depends_on(&["discover_dp_info"]),
+    )
+    // Step 3b (local): gRPC gpt-oss workers need the Harmony encoding; load
+    // it before registration so an unavailable vocab fails this worker
+    // instead of panicking the gateway or erroring at first request.
+    .add_step(
+        StepDefinition::new(
+            "ensure_harmony_encoding",
+            "Ensure Harmony Encoding",
+            Arc::new(EnsureHarmonyEncodingStep),
         )
-        // === EXTERNAL BRANCH ===
-        // Step 1 (external): Discover models from /v1/models
-        .add_step(
-            StepDefinition::new(
-                "discover_models",
-                "Discover Models",
-                Arc::new(DiscoverModelsStep),
-            )
-            .with_retry(RetryPolicy {
-                max_attempts: 3,
-                backoff: BackoffStrategy::Exponential {
-                    base: Duration::from_secs(1),
-                    max: Duration::from_secs(10),
-                },
-            })
-            .with_timeout(Duration::from_secs(30))
-            .with_failure_action(FailureAction::FailWorkflow)
-            .depends_on(&["classify_worker_type"]),
+        .with_retry(RetryPolicy {
+            max_attempts,
+            backoff: BackoffStrategy::Exponential {
+                base: Duration::from_secs(1),
+                max: Duration::from_secs(10),
+            },
+        })
+        .with_timeout(Duration::from_secs(30))
+        .with_failure_action(FailureAction::FailWorkflow)
+        .depends_on(&["create_local_worker"]),
+    )
+    // === EXTERNAL BRANCH ===
+    // Step 1 (external): Discover models from /v1/models
+    .add_step(
+        StepDefinition::new(
+            "discover_models",
+            "Discover Models",
+            Arc::new(DiscoverModelsStep),
         )
-        // Step 2 (external): Create external workers
-        .add_step(
-            StepDefinition::new(
-                "create_external_workers",
-                "Create External Workers",
-                Arc::new(CreateExternalWorkersStep),
-            )
-            .with_timeout(Duration::from_secs(5))
-            .with_failure_action(FailureAction::FailWorkflow)
-            .depends_on(&["discover_models"]),
+        .with_retry(RetryPolicy {
+            max_attempts: 3,
+            backoff: BackoffStrategy::Exponential {
+                base: Duration::from_secs(1),
+                max: Duration::from_secs(10),
+            },
+        })
+        .with_timeout(Duration::from_secs(30))
+        .with_failure_action(FailureAction::FailWorkflow)
+        .depends_on(&["classify_worker_type"]),
+    )
+    // Step 2 (external): Create external workers
+    .add_step(
+        StepDefinition::new(
+            "create_external_workers",
+            "Create External Workers",
+            Arc::new(CreateExternalWorkersStep),
         )
-        // === SHARED (both branches converge) ===
-        // Step 4: Register workers
-        .add_step(
-            StepDefinition::new(
-                REGISTER_WORKERS_STEP,
-                "Register Workers",
-                Arc::new(RegisterWorkersStep),
-            )
-            .with_timeout(Duration::from_secs(5))
-            .with_failure_action(FailureAction::FailWorkflow)
-            .depends_on(&[
-                "create_local_worker",
-                "ensure_harmony_encoding",
-                "create_external_workers",
-            ]),
+        .with_timeout(Duration::from_secs(5))
+        .with_failure_action(FailureAction::FailWorkflow)
+        .depends_on(&["discover_models"]),
+    )
+    // === SHARED (both branches converge) ===
+    // Step 4: Register workers
+    .add_step(
+        StepDefinition::new(
+            REGISTER_WORKERS_STEP,
+            "Register Workers",
+            Arc::new(RegisterWorkersStep),
         )
-        // Step 5a: Submit tokenizer job (local only)
-        .add_step(
-            StepDefinition::new(
-                "submit_tokenizer_job",
-                "Submit Tokenizer Job",
-                Arc::new(SubmitTokenizerJobStep),
-            )
-            .with_timeout(Duration::from_secs(5))
-            .with_failure_action(FailureAction::ContinueNextStep)
-            .depends_on(&[REGISTER_WORKERS_STEP]),
+        .with_timeout(Duration::from_secs(5))
+        .with_failure_action(FailureAction::FailWorkflow)
+        .depends_on(&[
+            "create_local_worker",
+            "ensure_harmony_encoding",
+            "create_external_workers",
+        ]),
+    )
+    // Step 5a: Submit tokenizer job (local only)
+    .add_step(
+        StepDefinition::new(
+            "submit_tokenizer_job",
+            "Submit Tokenizer Job",
+            Arc::new(SubmitTokenizerJobStep),
         )
-        // Step 5b: Update policies
-        .add_step(
-            StepDefinition::new(
-                "update_policies",
-                "Update Policies",
-                Arc::new(UpdatePoliciesStep),
-            )
-            .with_timeout(Duration::from_secs(5))
-            .with_failure_action(FailureAction::ContinueNextStep)
-            .depends_on(&[REGISTER_WORKERS_STEP]),
+        .with_timeout(Duration::from_secs(5))
+        .with_failure_action(FailureAction::ContinueNextStep)
+        .depends_on(&[REGISTER_WORKERS_STEP]),
+    )
+    // Step 5b: Update policies
+    .add_step(
+        StepDefinition::new(
+            "update_policies",
+            "Update Policies",
+            Arc::new(UpdatePoliciesStep),
         )
-        // Step 5c: Activate workers
-        .add_step(
-            StepDefinition::new(
-                "activate_workers",
-                "Activate Workers",
-                Arc::new(ActivateWorkersStep),
-            )
-            .with_timeout(Duration::from_secs(5))
-            .with_failure_action(FailureAction::FailWorkflow)
-            .depends_on(&[REGISTER_WORKERS_STEP]),
+        .with_timeout(Duration::from_secs(5))
+        .with_failure_action(FailureAction::ContinueNextStep)
+        .depends_on(&[REGISTER_WORKERS_STEP]),
+    )
+    // Step 5c: Activate workers
+    .add_step(
+        StepDefinition::new(
+            "activate_workers",
+            "Activate Workers",
+            Arc::new(ActivateWorkersStep),
         )
+        .with_timeout(Duration::from_secs(5))
+        .with_failure_action(FailureAction::FailWorkflow)
+        .depends_on(&[REGISTER_WORKERS_STEP]),
+    )
 }
 
 /// Create initial workflow data for the unified worker registration workflow.
@@ -284,23 +266,7 @@ pub fn create_worker_workflow_data(
     registration_mode: WorkerRegistrationMode,
     app_context: Arc<AppContext>,
 ) -> WorkerWorkflowData {
-    WorkerWorkflowData {
-        config,
-        registration_mode,
-        worker_kind: None,
-        connection_mode: None,
-        http2: None,
-        http_client_handle: None,
-        detected_runtime_type: None,
-        discovered_labels: std::collections::HashMap::new(),
-        dp_info: None,
-        host_notes: RegistrationNotes::default(),
-        model_cards: Vec::new(),
-        workers: None,
-        final_labels: std::collections::HashMap::new(),
-        host: Some(app_context),
-        actual_workers: None,
-    }
+    WorkerWorkflowData::new(config, registration_mode, app_context)
 }
 
 #[cfg(test)]
@@ -377,6 +343,21 @@ mod tests {
         let mut config = config_with(1800, 30);
         config.worker_startup_delay_secs = 120;
         assert_eq!(startup_delay(&config), Some(Duration::from_secs(120)));
+        // The detection, the worker crate's step, waits on that entry step
+        // and carries no delay of its own: the worker is left alone once.
+        let workflow = create_worker_registration_workflow(&config);
+        let detection = workflow
+            .steps
+            .iter()
+            .find(|s| s.id.to_string() == DETECT_CONNECTION_MODE_STEP)
+            .expect("detect_connection_mode step present");
+        assert_eq!(detection.delay, None);
+        let waits_on: Vec<String> = detection
+            .depends_on
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(waits_on, ["classify_worker_type"]);
     }
 
     #[test]

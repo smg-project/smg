@@ -5,8 +5,9 @@ use std::{fmt, sync::Arc};
 use wfaas::{WorkflowError, WorkflowResult};
 
 use crate::{
-    connection::http_client::WorkerHttpClientCache,
+    connection::{engine::EngineConnector, http_client::WorkerHttpClientCache},
     registry::{Generation, WorkerRegistry},
+    settings::RegistrationSettings,
 };
 
 /// The host of the worker workflows: the process that keeps the worker
@@ -26,6 +27,12 @@ pub trait WorkflowHost: Send + Sync + 'static {
 
     /// The clients a registration reaches its worker with.
     fn worker_client_cache(&self) -> &WorkerHttpClientCache;
+
+    /// What the host fixes for every registration it runs.
+    fn registration_settings(&self) -> &RegistrationSettings;
+
+    /// The connector a registration reaches a gRPC engine with.
+    fn engine_connector(&self) -> Arc<dyn EngineConnector>;
 }
 
 /// The host a workflow's data was given, or the workflow's error for a run
@@ -34,17 +41,22 @@ pub fn require_host<H>(host: Option<&Arc<H>>) -> WorkflowResult<&Arc<H>> {
     host.ok_or_else(|| WorkflowError::ContextValueNotFound("host".to_string()))
 }
 
-/// A host that keeps a registry and nothing else, for the steps' own cases.
+/// The hosts of the steps' own cases.
 #[cfg(test)]
 pub(crate) mod testing {
     use std::sync::{Arc, OnceLock};
 
     use super::WorkflowHost;
     use crate::{
-        connection::http_client::{WorkerHttpClientCache, WorkerHttpClientSettings},
-        test_support::{Members, WorkerRegistry},
+        connection::{
+            engine::EngineConnector,
+            http_client::{WorkerHttpClientCache, WorkerHttpClientSettings},
+        },
+        settings::RegistrationSettings,
+        test_support::{CountingConnector, Members, ScriptedConnector, WorkerRegistry},
     };
 
+    /// A host that keeps a registry and nothing else.
     #[derive(Debug)]
     pub(crate) struct RegistryHost {
         pub(crate) worker_registry: Arc<WorkerRegistry>,
@@ -70,6 +82,77 @@ pub(crate) mod testing {
                     pool_idle_timeout_secs: 0,
                 })
             })
+        }
+
+        fn registration_settings(&self) -> &RegistrationSettings {
+            // No case of this host runs a detection: the values are never read.
+            static SETTINGS: RegistrationSettings = RegistrationSettings {
+                upstream_http2: false,
+                health_check_timeout_secs: 1,
+                startup_timeout_secs: 1,
+                startup_delay_secs: 0,
+                startup_check_interval_secs: 1,
+            };
+            &SETTINGS
+        }
+
+        fn engine_connector(&self) -> Arc<dyn EngineConnector> {
+            Arc::new(CountingConnector::default())
+        }
+    }
+
+    /// A host for a registration's cases: its own worker clients and
+    /// settings (`upstream_http2` decides both), and the connector a case
+    /// scripts.
+    pub(crate) struct ProbingHost {
+        worker_registry: Arc<WorkerRegistry>,
+        clients: WorkerHttpClientCache,
+        settings: RegistrationSettings,
+        connector: Arc<ScriptedConnector>,
+    }
+
+    impl ProbingHost {
+        pub(crate) fn new(upstream_http2: bool, connector: ScriptedConnector) -> Arc<Self> {
+            Arc::new(Self {
+                worker_registry: Arc::new(WorkerRegistry::new()),
+                clients: WorkerHttpClientCache::new(WorkerHttpClientSettings {
+                    client_identity: None,
+                    ca_certificates: Vec::new(),
+                    upstream_http2,
+                    request_timeout_secs: 30,
+                    pool_idle_timeout_secs: 0,
+                }),
+                settings: RegistrationSettings {
+                    upstream_http2,
+                    health_check_timeout_secs: 5,
+                    startup_timeout_secs: 1,
+                    startup_delay_secs: 0,
+                    startup_check_interval_secs: 1,
+                },
+                connector: Arc::new(connector),
+            })
+        }
+    }
+
+    impl WorkflowHost for ProbingHost {
+        type Generation = Members;
+        type RegistrationNotes = ();
+
+        fn worker_registry(&self) -> &Arc<WorkerRegistry> {
+            &self.worker_registry
+        }
+
+        fn worker_client_cache(&self) -> &WorkerHttpClientCache {
+            &self.clients
+        }
+
+        fn registration_settings(&self) -> &RegistrationSettings {
+            &self.settings
+        }
+
+        fn engine_connector(&self) -> Arc<dyn EngineConnector> {
+            let connector: Arc<ScriptedConnector> = Arc::clone(&self.connector);
+            connector
         }
     }
 }

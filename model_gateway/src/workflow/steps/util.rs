@@ -1,96 +1,18 @@
-//! Shared URL normalization and network probe utilities for worker steps.
+//! The gateway's edge of the worker crate's reach helpers, for the steps of
+//! a registration that still stand here: they name a runtime by its text.
 
-use std::{future::Future, sync::Arc, time::Duration};
+use std::sync::Arc;
 
-use futures::stream::{FuturesUnordered, StreamExt};
-use reqwest::Client;
 // The gRPC base URL stands beside the address type, where the worker module
 // reads it too; its path here is kept for the steps.
 pub(crate) use smg_worker::identity::endpoint::grpc_base_url;
 use smg_worker::{
     connection::engine::{EngineConnection, HealthAnswer},
-    identity::{
-        basic::RuntimeType,
-        endpoint::{strip_protocol, strip_scheme, Endpoint},
-    },
+    identity::basic::RuntimeType,
+    workflow as worker_workflow,
 };
 
 use crate::routers::grpc::backend_client::BackendConnector;
-
-/// The scheme `url` starts with, lowercased: a word of scheme characters
-/// (RFC 3986's, a digit or a sign first too, and the empty word) before a
-/// `://`, as every scheme the address type knows is.
-/// An address that starts with no such word has no scheme, as the address
-/// type reads it. A `://` further in belongs to its path or its query, and
-/// what stands before it may hold a userinfo, which a refusal would name.
-fn url_scheme(url: &str) -> Option<String> {
-    let (word, _) = url.split_once("://")?;
-    word.chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
-        .then(|| word.to_ascii_lowercase())
-}
-
-/// Ensure URL has an HTTP(S) scheme — handles bare `host:port` and gRPC inputs.
-pub(crate) fn http_base_url(url: &str) -> String {
-    if strip_scheme(url, "http://").is_some() || strip_scheme(url, "https://").is_some() {
-        url.trim_end_matches('/').to_string()
-    } else {
-        format!("http://{}", strip_protocol(url).trim_end_matches('/'))
-    }
-}
-
-fn http_health_url(url: &str) -> Result<String, String> {
-    match url_scheme(url).as_deref() {
-        Some("http") | Some("https") => Ok(format!("{}/health", url.trim_end_matches('/'))),
-        // The refusals name the address masked: on the detection step's
-        // auto-detect arm (a URL whose scheme names no mode) a scheme neither
-        // probe accepts ends in the step's failure message, which a log line
-        // carries.
-        Some("grpc") | Some("grpcs") => Err(format!(
-            "HTTP health check does not accept gRPC URL scheme: {}",
-            Endpoint::redacted_str(url)
-        )),
-        Some(scheme) => Err(format!(
-            "HTTP health check does not accept URL scheme '{scheme}': {}",
-            Endpoint::redacted_str(url)
-        )),
-        None => Ok(format!("http://{}/health", url.trim_end_matches('/'))),
-    }
-}
-
-fn grpc_reachable_url(url: &str) -> Result<String, String> {
-    match url_scheme(url).as_deref() {
-        Some("grpc") | Some("grpcs") => Ok(url.trim_end_matches('/').to_string()),
-        Some("http") | Some("https") => Err(format!(
-            "gRPC health check does not accept HTTP URL scheme: {}",
-            Endpoint::redacted_str(url)
-        )),
-        Some(scheme) => Err(format!(
-            "gRPC health check does not accept URL scheme '{scheme}': {}",
-            Endpoint::redacted_str(url)
-        )),
-        None => Ok(format!("grpc://{}", url.trim_end_matches('/'))),
-    }
-}
-
-/// Try HTTP health check (2xx response required).
-pub(crate) async fn try_http_reachable(
-    url: &str,
-    timeout_secs: u64,
-    client: &Client,
-) -> Result<(), String> {
-    let health_url = http_health_url(url)?;
-
-    client
-        .get(&health_url)
-        .timeout(Duration::from_secs(timeout_secs))
-        .send()
-        .await
-        .and_then(reqwest::Response::error_for_status)
-        .map_err(|e| format!("Health check failed: {}", e.without_url()))?;
-
-    Ok(())
-}
 
 /// A connection to the engine at `grpc_url`, spoken to as `runtime_type`,
 /// made by the gateway's connector. The detection reads an engine through
@@ -107,153 +29,19 @@ pub(crate) async fn connect_grpc_as(
 }
 
 /// One gRPC health RPC to the engine at `grpc_url`, spoken to as
-/// `runtime_type`: its answer, healthy or not, or why there was none (the
-/// endpoint unreachable, the RPC failed or timed out, another runtime's
-/// service there). An answer identifies the runtime whatever it says about
-/// the engine; `DetectBackendStep` reads it so.
+/// `runtime_type`, through the gateway's connector: the worker crate's
+/// probe, for a runtime named by its text. A text that names no runtime is
+/// the connect's refusal, as it was before the probe moved.
 pub(crate) async fn grpc_health_answer(
     grpc_url: &str,
     timeout_secs: u64,
     runtime_type: &str,
 ) -> Result<HealthAnswer, String> {
-    let connect_future = connect_grpc_as(grpc_url, runtime_type);
-    let connection = tokio::time::timeout(Duration::from_secs(timeout_secs), connect_future)
-        .await
-        .map_err(|_| "gRPC connection timeout".to_string())?
-        .map_err(|e| format!("gRPC connection failed: {e}"))?;
-
-    let health_future = connection.health_answer();
-    tokio::time::timeout(Duration::from_secs(timeout_secs), health_future)
-        .await
-        .map_err(|_| "gRPC health check timeout".to_string())?
-        .map_err(|e| format!("gRPC health check failed: {e}"))
-}
-
-/// Perform a single gRPC health check with a specific runtime type: the
-/// engine answered on that runtime's service and reports itself healthy.
-///
-/// The answer counts, not only the RPC: an engine that reports itself not
-/// healthy (a servicer that bound its port while its engine still loads the
-/// model answers so, as does one that is draining) is not reachable yet, as
-/// an HTTP engine whose health route answers an error status is not. The
-/// startup detection keeps polling until the engine can serve, instead of
-/// admitting a worker whose every request would fail until then.
-pub(crate) async fn do_grpc_health_check(
-    grpc_url: &str,
-    timeout_secs: u64,
-    runtime_type: &str,
-) -> Result<(), String> {
-    let response = grpc_health_answer(grpc_url, timeout_secs, runtime_type).await?;
-    if !response.healthy {
-        return Err(not_healthy_error(&response.message));
-    }
-
-    Ok(())
-}
-
-/// The error for a health answer that says the engine is not healthy, with
-/// the engine's own reason when it gives one.
-fn not_healthy_error(message: &str) -> String {
-    let message = message.trim();
-    if message.is_empty() {
-        "gRPC health check reports the engine not healthy".to_string()
-    } else {
-        format!("gRPC health check reports the engine not healthy: {message}")
-    }
-}
-
-/// Dial the endpoint once to decide whether it is worth probing per-runtime.
-///
-/// All five runtime clients dial the same authority, so an endpoint that
-/// cannot be reached at the transport level fails five identical connects.
-/// One dial answers that question, which matters during a mass worker
-/// registration: an unready pod that black-holes SYN would otherwise hold
-/// five in-flight sockets per attempt instead of one.
-async fn grpc_transport_reachable(grpc_url: &str, timeout_secs: u64) -> Result<(), String> {
-    let timeout = Duration::from_secs(timeout_secs);
+    let runtime: RuntimeType = runtime_type
+        .parse()
+        .map_err(|_| format!("gRPC connection failed: Unknown runtime type: {runtime_type}"))?;
     let connector = BackendConnector::shared();
-    let connect_future = connector.dial_grpc(grpc_url, timeout);
-
-    // The dial bounds its own connect with the timeout. Keep an outer
-    // deadline as a safety net for the rest of the channel's setup.
-    tokio::time::timeout(timeout, connect_future)
-        .await
-        .map_err(|_| "gRPC connection timeout".to_string())?
-        .map_err(|e| format!("gRPC connection failed: {e}"))?;
-    Ok(())
-}
-
-const GRPC_RUNTIME_TYPES: [&str; 5] = ["sglang", "vllm", "trtllm", "mlx", "tokenspeed"];
-
-async fn first_success_or_all_errors<F>(
-    mut checks: FuturesUnordered<F>,
-    runtimes: &[&str],
-) -> Result<(), String>
-where
-    F: Future<Output = (usize, Result<(), String>)>,
-{
-    let mut errors = vec![None; runtimes.len()];
-
-    while let Some((index, result)) = checks.next().await {
-        match result {
-            Ok(()) => return Ok(()),
-            Err(error) => {
-                if let Some(slot) = errors.get_mut(index) {
-                    *slot = Some(error);
-                }
-            }
-        }
-    }
-
-    let details = runtimes
-        .iter()
-        .enumerate()
-        .map(|(index, runtime)| match errors[index].as_deref() {
-            Some(error) => format!("{runtime}={error}"),
-            None => format!("{runtime}=health check did not complete"),
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    Err(format!(
-        "gRPC not reachable (tried {}): {details}",
-        runtimes.join(", ")
-    ))
-}
-
-/// Check if gRPC is reachable by trying all known runtime types in parallel.
-///
-/// We don't care which runtime it is here — that's `DetectBackendStep`'s job.
-/// We just need to know: does this endpoint speak gRPC at all?
-///
-/// The per-runtime fan-out is gated behind a single transport probe so an
-/// unreachable endpoint costs one connect rather than five.
-/// The remaining runtime probes are cancelled after the first success.
-/// `timeout_secs` bounds the gate and fan-out together, not each phase.
-pub(crate) async fn try_grpc_reachable(url: &str, timeout_secs: u64) -> Result<(), String> {
-    let grpc_url = grpc_reachable_url(url)?;
-    let timeout = Duration::from_secs(timeout_secs);
-
-    let reachability = Box::pin(async {
-        grpc_transport_reachable(&grpc_url, timeout_secs).await?;
-
-        let checks = FuturesUnordered::new();
-        for (index, runtime) in GRPC_RUNTIME_TYPES.iter().copied().enumerate() {
-            let grpc_url = &grpc_url;
-            checks.push(async move {
-                (
-                    index,
-                    do_grpc_health_check(grpc_url, timeout_secs, runtime).await,
-                )
-            });
-        }
-
-        first_success_or_all_errors(checks, &GRPC_RUNTIME_TYPES).await
-    });
-
-    tokio::time::timeout(timeout, reachability)
-        .await
-        .map_err(|_| "gRPC reachability timeout".to_string())?
+    worker_workflow::grpc_health_answer(connector.as_ref(), grpc_url, timeout_secs, runtime).await
 }
 
 /// A mock gRPC engine on an ephemeral loopback port for the probes' tests,
@@ -300,170 +88,12 @@ pub(crate) async fn mock_grpc_engine_on(
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        future::pending,
-        sync::{
-            atomic::{AtomicBool, Ordering},
-            Arc,
-        },
+    use smg_worker::{
+        identity::endpoint::Endpoint,
+        workflow::{grpc_reachable_url, http_health_url, try_grpc_reachable},
     };
 
-    use smg_worker::test_support::RefusedAddress;
-
     use super::*;
-    use crate::server::http_client;
-
-    struct DropFlag(Arc<AtomicBool>);
-
-    impl Drop for DropFlag {
-        fn drop(&mut self) {
-            self.0.store(true, Ordering::SeqCst);
-        }
-    }
-
-    #[test]
-    fn http_health_url_accepts_http_https_and_bare_urls() {
-        assert_eq!(
-            http_health_url("http://localhost:30000").unwrap(),
-            "http://localhost:30000/health"
-        );
-        assert_eq!(
-            http_health_url("https://example.com/").unwrap(),
-            "https://example.com/health"
-        );
-        assert_eq!(
-            http_health_url("localhost:30000").unwrap(),
-            "http://localhost:30000/health"
-        );
-    }
-
-    #[test]
-    fn http_health_url_rejects_grpc_schemes() {
-        assert!(http_health_url("grpc://localhost:30001").is_err());
-        assert!(http_health_url("grpcs://localhost:30001").is_err());
-    }
-
-    /// An address registered with a query, at a port nobody listens on: the
-    /// failure does not repeat the query. The HTTP client's own error text
-    /// ends with the request URL, the query kept.
-    #[tokio::test]
-    async fn a_failed_http_probe_goes_without_the_clients_url() {
-        let refused = RefusedAddress::reserve();
-        let url = format!("{}?token=s3cret", refused.http_url());
-
-        let err = try_http_reachable(&url, 1, &http_client())
-            .await
-            .expect_err("nothing listens at the address");
-
-        assert!(!err.contains("s3cret"), "{err}");
-    }
-
-    #[test]
-    fn grpc_reachable_url_accepts_grpc_grpcs_and_bare_urls() {
-        assert_eq!(
-            grpc_reachable_url("grpc://localhost:30001").unwrap(),
-            "grpc://localhost:30001"
-        );
-        assert_eq!(
-            grpc_reachable_url("grpcs://localhost:30001/").unwrap(),
-            "grpcs://localhost:30001"
-        );
-        assert_eq!(
-            grpc_reachable_url("localhost:30001").unwrap(),
-            "grpc://localhost:30001"
-        );
-    }
-
-    /// A scheme refusal names the address masked: a secret in the URL's
-    /// userinfo reaches no failure message through it (the detection step's
-    /// auto-detect arm runs both probes and appends their refusals to its
-    /// failure message).
-    #[test]
-    fn a_scheme_refusal_names_the_address_masked() {
-        for refusal in [
-            grpc_reachable_url("http://user:secret@worker:3000").unwrap_err(),
-            grpc_reachable_url("https://user:secret@worker:3000/").unwrap_err(),
-            http_health_url("grpc://user:secret@worker:3000").unwrap_err(),
-            http_health_url("grpcs://user:secret@worker:3000/").unwrap_err(),
-        ] {
-            assert!(!refusal.contains("secret"), "{refusal}");
-            assert!(refusal.contains("://***@worker:3000"), "{refusal}");
-        }
-        let unknown = grpc_reachable_url("ftp://user:secret@worker:3000").unwrap_err();
-        assert!(!unknown.contains("secret"), "{unknown}");
-        assert!(unknown.contains("'ftp'"), "{unknown}");
-    }
-
-    /// A scheme is read at the start of an address alone. An address with
-    /// none may hold a `://` further in, in a path or a query: both probes
-    /// dial it as they dial any address with no scheme. Read as a scheme,
-    /// what stood before that `://` was refused by name, a userinfo in it,
-    /// in the detection step's failure message, which a log line carries.
-    /// A word of scheme characters is a scheme, known or not, and one the
-    /// probes do not know is still refused by name.
-    #[test]
-    fn a_scheme_is_read_at_the_start_of_a_probed_address_alone() {
-        for url in [
-            "user:secret@10.0.0.11:8000/a://b",
-            "10.0.0.11:8000/a://b",
-            "10.0.0.11:8000/proxy/http://backend:9000",
-            "decode.internal:8000/v1?next=http://x",
-        ] {
-            assert_eq!(
-                http_health_url(url).as_deref(),
-                Ok(format!("http://{url}/health").as_str()),
-                "{url}"
-            );
-            assert_eq!(
-                grpc_reachable_url(url).as_deref(),
-                Ok(format!("grpc://{url}").as_str()),
-                "{url}"
-            );
-        }
-
-        let unknown = http_health_url("X-tls+v1.2://user:secret@worker:3000").unwrap_err();
-        assert!(!unknown.contains("secret"), "{unknown}");
-        assert!(unknown.contains("'x-tls+v1.2'"), "{unknown}");
-    }
-
-    #[test]
-    fn grpc_reachable_url_rejects_http_schemes() {
-        assert!(grpc_reachable_url("http://localhost:30000").is_err());
-        assert!(grpc_reachable_url("https://localhost:30000").is_err());
-    }
-
-    #[tokio::test]
-    async fn runtime_fanout_returns_on_first_success_and_cancels_stalled_checks() {
-        let stalled_started = Arc::new(AtomicBool::new(false));
-        let stalled_cancelled = Arc::new(AtomicBool::new(false));
-        let checks = FuturesUnordered::new();
-
-        for (index, succeeds) in [false, true].into_iter().enumerate() {
-            let stalled_started = Arc::clone(&stalled_started);
-            let stalled_cancelled = Arc::clone(&stalled_cancelled);
-            checks.push(async move {
-                let result = if succeeds {
-                    tokio::task::yield_now().await;
-                    Ok(())
-                } else {
-                    stalled_started.store(true, Ordering::SeqCst);
-                    let _drop_flag = DropFlag(stalled_cancelled);
-                    pending::<Result<(), String>>().await
-                };
-                (index, result)
-            });
-        }
-
-        let result = tokio::time::timeout(
-            Duration::from_secs(1),
-            first_success_or_all_errors(checks, &["stalled", "healthy"]),
-        )
-        .await;
-
-        assert!(matches!(result, Ok(Ok(()))));
-        assert!(stalled_started.load(Ordering::SeqCst));
-        assert!(stalled_cancelled.load(Ordering::SeqCst));
-    }
 
     /// An endpoint that cannot be reached at the transport level must
     /// short-circuit before the per-runtime fan-out, so one unreachable worker
@@ -476,7 +106,8 @@ mod tests {
     /// run, so the transport error proves the gate returned first.
     #[tokio::test]
     async fn unreachable_transport_short_circuits_the_runtime_fanout() {
-        let err = try_grpc_reachable("grpc://127.0.0.1:0", 1)
+        let connector = BackendConnector::shared();
+        let err = try_grpc_reachable(connector.as_ref(), "grpc://127.0.0.1:0", 1)
             .await
             .expect_err("closed local endpoint should not be reachable");
 
@@ -497,13 +128,16 @@ mod tests {
     }
 
     /// An engine that answers its health check but reports itself not healthy
-    /// (its model still loading, say) is not reachable yet: the probe fails
-    /// with the engine's reason, for the runtime it speaks and in the
-    /// fan-out, and passes once the engine reports healthy.
+    /// (its model still loading, say) is not reachable yet: the runtime it
+    /// speaks answers with the engine's reason, the fan-out fails with it,
+    /// and passes once the engine reports healthy. This is the worker crate's
+    /// reach on the gateway's connector and a served engine; the single
+    /// check's own text is that crate's case.
     #[tokio::test]
     async fn an_engine_that_reports_not_healthy_is_not_reachable_yet() {
         let (url, engine) = mock_grpc_engine().await;
         engine.set_serving(false);
+        let connector = BackendConnector::shared();
 
         let answer = grpc_health_answer(&url, 5, "tokenspeed")
             .await
@@ -513,14 +147,7 @@ mod tests {
         grpc_health_answer(&url, 5, "vllm")
             .await
             .expect_err("another runtime's service does not answer there");
-        let err = do_grpc_health_check(&url, 5, "tokenspeed")
-            .await
-            .expect_err("an engine reporting not healthy must not pass the probe");
-        assert_eq!(
-            err,
-            "gRPC health check reports the engine not healthy: not serving"
-        );
-        let err = try_grpc_reachable(&url, 5)
+        let err = try_grpc_reachable(connector.as_ref(), &url, 5)
             .await
             .expect_err("the fan-out must not count a not-healthy answer as reachable");
         assert!(
@@ -531,23 +158,22 @@ mod tests {
         );
 
         engine.set_serving(true);
-        do_grpc_health_check(&url, 5, "tokenspeed")
-            .await
-            .expect("a healthy engine passes the probe");
-        try_grpc_reachable(&url, 5)
+        try_grpc_reachable(connector.as_ref(), &url, 5)
             .await
             .expect("a healthy engine is reachable");
     }
 
-    #[test]
-    fn the_not_healthy_error_carries_the_engines_reason_when_it_gives_one() {
+    /// A runtime's text that names no runtime is refused in the words of the
+    /// connect that refused it before the probe moved.
+    #[tokio::test]
+    async fn a_text_that_names_no_runtime_is_refused_as_the_connect_refused_it() {
+        let err = grpc_health_answer("grpc://127.0.0.1:0", 1, "no-such-runtime")
+            .await
+            .expect_err("the text names no runtime");
+
         assert_eq!(
-            not_healthy_error("Engine is starting"),
-            "gRPC health check reports the engine not healthy: Engine is starting"
-        );
-        assert_eq!(
-            not_healthy_error("  "),
-            "gRPC health check reports the engine not healthy"
+            err,
+            "gRPC connection failed: Unknown runtime type: no-such-runtime"
         );
     }
 
