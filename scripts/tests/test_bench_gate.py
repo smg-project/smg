@@ -2163,8 +2163,8 @@ def test_a_file_whose_header_no_loadable_segment_covers_has_no_image(mod, tmp_pa
 
 def test_what_the_loader_reads_from_the_file_lies_inside_a_loadable_segment(mod, tmp_path):
     def image(named: bytes, held: bool) -> str | None:
-        """The image of a file whose second program header names `named` as the interpreter's
-        path, inside the loadable segment or behind its end."""
+        """The image of a file whose second program header, the interpreter's, names the two
+        notes that hold `named`, inside the loadable segment or behind its end."""
         data = bytearray(elf(b"code" * 64, named, b"symbols"))
         struct.pack_into("<I", data, 64 + 56, 3)
         if not held:
@@ -2189,3 +2189,24 @@ def test_what_the_loader_reads_from_the_file_lies_inside_a_loadable_segment(mod,
         struct.pack_into("<Q", data, 64 + 32, size)
         path.write_bytes(bytes(data))
         assert (mod.image_of(path) is not None) == held
+
+
+def test_a_header_no_loader_reads_from_the_file_may_pass_its_segments_end(mod, tmp_path):
+    def image(kind: int, held: bool) -> str | None:
+        """The image of a file whose second program header is of `kind` and names the two
+        notes, whole inside the loadable segment or from inside it past its end."""
+        data = bytearray(elf(b"code" * 64, b"A" * 20, b"symbols"))
+        struct.pack_into("<I", data, 64 + 56, kind)
+        if not held:
+            struct.pack_into("<Q", data, 64 + 32, 64 + 2 * 56 + 24)
+        path = tmp_path / f"bench-{kind:x}-{held}"
+        path.write_bytes(bytes(data))
+        return mod.image_of(path)
+
+    # A loader reads the interpreter's path, a note and the property note from the file: each
+    # lies whole inside the segment, or the file has no image.
+    for kind in (3, 4, 0x6474E553):
+        assert image(kind, True) is not None and image(kind, False) is None
+    # The range made read-only after relocation is read from memory alone, and a linker may
+    # round its header's file size up past the segment's end: such a file keeps its image.
+    assert image(0x6474E552, True) is not None and image(0x6474E552, False) is not None
