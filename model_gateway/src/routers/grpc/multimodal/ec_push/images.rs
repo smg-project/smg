@@ -3,11 +3,9 @@
 use std::sync::Arc;
 
 use smg_grpc_client::{common_proto::Modality, vllm_proto as vllm};
+use smg_worker::identity::basic::Worker;
 
-use crate::{
-    routers::grpc::{context::EncodeWorkerAssignment, proto_wrapper::ProtoGenerateRequest},
-    worker::Worker,
-};
+use crate::routers::grpc::{context::EncodeWorkerAssignment, proto_wrapper::ProtoGenerateRequest};
 
 pub(super) struct ImageGroup {
     pub worker: Arc<dyn Worker>,
@@ -239,7 +237,7 @@ pub(super) fn merge(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::worker::BasicWorkerBuilder;
+    use crate::routers::grpc::backend_client::BasicWorkerBuilder;
 
     fn fixture() -> (ProtoGenerateRequest, Vec<EncodeWorkerAssignment>) {
         let request = ProtoGenerateRequest::Vllm(Box::new(vllm::GenerateRequest {

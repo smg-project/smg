@@ -3,15 +3,15 @@ use std::collections::HashMap;
 use llm_multimodal::jpeg_turbo::TurboJpegPolicy;
 use openai_protocol::worker::{MmProcessingMode, TransportMode};
 use smg_mcp::McpConfig;
+use smg_worker::identity::basic::{ConnectionMode, RuntimeType};
 
 use super::{
-    AccessLogField, CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig,
-    GroupedDpSticky, HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig, MemoryConfig,
-    MetricsConfig, OracleConfig, ParserChoice, PdPairingMode, PdReadinessConfig, PolicyConfig,
-    PostgresConfig, RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode,
-    TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
+    validation::ConfigValidator, AccessLogField, CircuitBreakerConfig, ConfigError, ConfigResult,
+    DiscoveryConfig, GroupedDpSticky, HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig,
+    MemoryConfig, MetricsConfig, OracleConfig, ParserChoice, PdPairingMode, PdReadinessConfig,
+    PolicyConfig, PostgresConfig, RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig,
+    RoutingMode, TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
 };
-use crate::worker::{ConnectionMode, RuntimeType};
 
 /// Builder for RouterConfig that wraps the config itself
 /// This eliminates field duplication and stays in sync automatically
@@ -943,6 +943,16 @@ impl RouterConfigBuilder {
 
     pub fn build_unchecked(self) -> RouterConfig {
         self.into()
+    }
+
+    /// The configuration of a builder that holds the routing part alone,
+    /// checked by the validator's routing rules alone. No file is read: no
+    /// certificate, no key and no MCP configuration. What
+    /// `--print-policy-spec` converts.
+    pub fn build_routing(self) -> ConfigResult<RouterConfig> {
+        let config: RouterConfig = self.into();
+        ConfigValidator::validate_routing(&config)?;
+        Ok(config)
     }
 
     pub fn build_with_validation(mut self, validate: bool) -> ConfigResult<RouterConfig> {

@@ -94,6 +94,34 @@ pub mod mode {
     /// fills it in a loop: a call of milliseconds that answers, then an
     /// endless one.
     pub const FILL_BRIEFLY_THEN_FILL: u8 = 30;
+    /// `observe` counts the dispatches told to its instance and `pick`
+    /// names the row at that count: what one instance heard, read from a
+    /// decision made on it.
+    pub const COUNT_DISPATCHES: u8 = 31;
+    /// `observe` counts the members the feed told its instance (a snapshot's
+    /// length, one up an addition, one down a removal) and `pick` names the
+    /// row at that count.
+    pub const COUNT_MEMBERS: u8 = 32;
+    /// As `COUNT_MEMBERS`, and `observe` traps on a snapshot of five
+    /// members: a telling that faults one instance and not the next.
+    pub const TRAP_ON_FIVE_MEMBERS: u8 = 33;
+    /// As `TRAP_ON_FIVE_MEMBERS`, and the destructor writes a log line as
+    /// `LOG_IN_DESTRUCTOR` does: a close a test can stop, on a guest whose
+    /// telling can fault.
+    pub const TRAP_ON_FIVE_AND_LOG_IN_DESTRUCTOR: u8 = 37;
+    /// `observe` counts members as `COUNT_MEMBERS` does and, at a dispatch,
+    /// keeps the count as it stood then; `pick` names the row at that count:
+    /// whether a change told ahead of a dispatch was heard ahead of it.
+    pub const MEMBERS_AT_A_DISPATCH: u8 = 34;
+    /// `observe` counts one up a relabelling and two up a resize, and `pick`
+    /// names the row at that count: the kinds one instance heard.
+    pub const COUNT_KINDS: u8 = 35;
+    /// `observe` counts the names of a `left` word (it traps where the
+    /// worker's id is not 100 or the first name does not begin with `m`) and
+    /// one more up a relabelling that follows one, and `pick` names the row
+    /// at that count: a word heard once, with its id and its names, ahead of
+    /// its relabelling.
+    pub const COUNT_LEFT: u8 = 36;
     /// A second config byte: `init` asks the host's live clock once. An
     /// answer of zero lets it go on, of one makes it refuse, of two spin
     /// without end, of three trap at once.
@@ -201,12 +229,31 @@ pub fn check_canonical_layout() {
 
 /// Assembles `wat_text` and wraps it as a component of `world`.
 pub fn component(world: &str, wat_text: &str) -> Vec<u8> {
-    let mut module = wat::parse_str(wat_text).expect("the guest assembles");
     let (resolve, package) = resolve();
+    component_in(&resolve, package, world, wat_text)
+}
+
+/// A record guest built against the world as `smg:policy@1.0.0` named it.
+/// Its shapes are today's, so nothing but the version sets it apart from
+/// [`record_guest`]: a host that loads it reads no floor.
+pub fn older_minor_guest() -> Vec<u8> {
+    let committed = contracts_dir().join("smg-policy.wit");
+    let text = std::fs::read_to_string(committed).expect("the committed WIT reads");
+    let mut resolve = Resolve::new();
+    let package = resolve
+        .push_str("smg-policy.wit", &text.replace("@1.1.0", "@1.0.0"))
+        .expect("the older package parses");
+    let wat_text = guest_wat(Guest::Record).replace("@1.1.0", "@1.0.0");
+    component_in(&resolve, package, "policy", &wat_text)
+}
+
+/// Assembles `wat_text` and wraps it as a component of `world` in `package`.
+fn component_in(resolve: &Resolve, package: PackageId, world: &str, wat_text: &str) -> Vec<u8> {
+    let mut module = wat::parse_str(wat_text).expect("the guest assembles");
     let world = resolve
         .select_world(&[package], Some(world))
         .expect("the world exists");
-    wit_component::embed_component_metadata(&mut module, &resolve, world, StringEncoding::UTF8)
+    wit_component::embed_component_metadata(&mut module, resolve, world, StringEncoding::UTF8)
         .expect("the world embeds");
     ComponentEncoder::default()
         .module(&module)
@@ -278,7 +325,7 @@ pub fn wasi_importing_guest() -> Vec<u8> {
     let wasi = resolve
         .push_str("wasi-clocks.wit", wasi_text)
         .expect("the wasi package parses");
-    let extra_text = "package test:extra;\nworld with-wasi { include smg:policy/policy@1.0.0; import wasi:clocks/monotonic-clock@0.2.0; }";
+    let extra_text = "package test:extra;\nworld with-wasi { include smg:policy/policy@1.1.0; import wasi:clocks/monotonic-clock@0.2.0; }";
     let _ = (package, wasi);
     let extra = resolve
         .push_str("with-wasi.wit", extra_text)
@@ -308,12 +355,12 @@ enum Guest {
 fn guest_wat(guest: Guest) -> String {
     let (iface, row, in_flight, constructor) = match guest {
         Guest::Record => (
-            "smg:policy/plugin@1.0.0",
+            "smg:policy/plugin@1.1.0",
             canonical::CANDIDATE_SIZE,
             canonical::CANDIDATE_IN_FLIGHT,
             // One pointer to the arguments record: the list sits at +136.
             format!(
-                r#"(func (export "smg:policy/plugin@1.0.0#[constructor]decision") (param $args i32) (result i32)
+                r#"(func (export "smg:policy/plugin@1.1.0#[constructor]decision") (param $args i32) (result i32)
     (local $rep i32)
     (local.set $rep (call $alloc (i32.const 8) (i32.const 4)))
     (i32.store (local.get $rep) (i32.load offset={ptr} (local.get $args)))
@@ -325,12 +372,12 @@ fn guest_wat(guest: Guest) -> String {
             ),
         ),
         Guest::Packed => (
-            "smg:policy/plugin-packed@1.0.0",
+            "smg:policy/plugin-packed@1.1.0",
             104,
             8,
             // Seven flat params: request (ptr, len), candidates (ptr, len),
             // count, pool (ptr, len).
-            r#"(func (export "smg:policy/plugin-packed@1.0.0#[constructor]decision") (param $rptr i32) (param $rlen i32) (param $cptr i32) (param $cand_len i32) (param $count i32) (param $pptr i32) (param $plen i32) (result i32)
+            r#"(func (export "smg:policy/plugin-packed@1.1.0#[constructor]decision") (param $rptr i32) (param $rlen i32) (param $cptr i32) (param $cand_len i32) (param $count i32) (param $pptr i32) (param $plen i32) (result i32)
     (local $rep i32)
     (local.set $rep (call $alloc (i32.const 8) (i32.const 4)))
     (i32.store (local.get $rep) (local.get $cptr))
@@ -342,15 +389,18 @@ fn guest_wat(guest: Guest) -> String {
     };
     format!(
         r#"(module
-  (import "smg:policy/host@1.0.0" "counter" (func $counter (param i32 i64)))
-  (import "smg:policy/host@1.0.0" "now-micros" (func $now (result i64)))
-  (import "smg:policy/host@1.0.0" "random-u64" (func $random (result i64)))
-  (import "smg:policy/host@1.0.0" "log" (func $log (param i32 i32 i32)))
+  (import "smg:policy/host@1.1.0" "counter" (func $counter (param i32 i64)))
+  (import "smg:policy/host@1.1.0" "now-micros" (func $now (result i64)))
+  (import "smg:policy/host@1.1.0" "random-u64" (func $random (result i64)))
+  (import "smg:policy/host@1.1.0" "log" (func $log (param i32 i32 i32)))
   (import "[export]{iface}" "[resource-new]decision" (func $new (param i32) (result i32)))
   (memory (export "memory") 4)
   (table $t 1 funcref)
   (global $heap (mut i32) (i32.const 1024))
   (global $mode (mut i32) (i32.const 0))
+  (global $heard (mut i32) (i32.const 0))
+  (global $members (mut i32) (i32.const 0))
+  (global $left (mut i32) (i32.const 0))
   (data (i32.const 16) "refused")
   (data (i32.const 32) "observed")
 
@@ -553,6 +603,16 @@ fn guest_wat(guest: Guest) -> String {
       (then
         (i32.store8 offset=4 (local.get $r) (i32.const 0))
         (return (local.get $r))))
+    (if (i32.or (i32.eq (global.get $mode) (i32.const {count_dispatches})) (i32.or (i32.eq (global.get $mode) (i32.const {members_at_a_dispatch})) (i32.or (i32.eq (global.get $mode) (i32.const {count_kinds})) (i32.eq (global.get $mode) (i32.const {count_left})))))
+      (then
+        (i32.store8 offset=4 (local.get $r) (i32.const 1))
+        (i32.store offset=8 (local.get $r) (global.get $heard))
+        (return (local.get $r))))
+    (if (i32.or (i32.eq (global.get $mode) (i32.const {count_members})) (i32.or (i32.eq (global.get $mode) (i32.const {trap_on_five_members})) (i32.eq (global.get $mode) (i32.const {trap_on_five_log_dtor}))))
+      (then
+        (i32.store8 offset=4 (local.get $r) (i32.const 1))
+        (i32.store offset=8 (local.get $r) (global.get $members))
+        (return (local.get $r))))
     (local.set $i (i32.const 0))
     (local.set $found (i32.const 0))
     (local.set $top (f32.const -2))
@@ -587,6 +647,50 @@ fn guest_wat(guest: Guest) -> String {
   ;; sixth value is the lease's session key on every lease-bearing case.
   (func (export "{iface}#observe") (param i32 i64 i64 i64 i32 i64 i64 i32 i64 i64 i32 i64 i32 i32 i32 i32)
     (if (i32.eq (global.get $mode) (i32.const {trap_in_observe})) (then unreachable))
+    ;; A membership event is the outer case 4. Its inner case is the second
+    ;; value (an addition 0, a removal 1, a snapshot 5) and a snapshot's
+    ;; length the fourth: the members told to this instance, counted.
+    (if (i32.eq (local.get 0) (i32.const 4))
+      (then
+        (if (i64.eq (local.get 1) (i64.const 5))
+          (then
+            (if (i32.and (i32.or (i32.eq (global.get $mode) (i32.const {trap_on_five_members})) (i32.eq (global.get $mode) (i32.const {trap_on_five_log_dtor}))) (i64.eq (local.get 3) (i64.const 5)))
+              (then unreachable))
+            (global.set $members (i32.wrap_i64 (local.get 3)))))
+        (if (i64.eq (local.get 1) (i64.const 0))
+          (then (global.set $members (i32.add (global.get $members) (i32.const 1)))))
+        (if (i64.eq (local.get 1) (i64.const 1))
+          (then (global.set $members (i32.sub (global.get $members) (i32.const 1)))))
+        (if (i32.eq (global.get $mode) (i32.const {count_kinds}))
+          (then
+            (if (i64.eq (local.get 1) (i64.const 3))
+              (then (global.set $heard (i32.add (global.get $heard) (i32.const 1)))))
+            (if (i64.eq (local.get 1) (i64.const 4))
+              (then (global.set $heard (i32.add (global.get $heard) (i32.const 2)))))))
+        ;; A `left` word is the inner case 6: its id is the third value, its
+        ;; names the fourth (a pointer, widened) and the fifth (their count).
+        ;; A name is a pointer and a length, so the first name's first byte
+        ;; is read through two loads.
+        (if (i32.eq (global.get $mode) (i32.const {count_left}))
+          (then
+            (if (i64.eq (local.get 1) (i64.const 6))
+              (then
+                (if (i64.ne (local.get 2) (i64.const 100))
+                  (then unreachable))
+                (if (i32.ne (i32.load8_u (i32.load (i32.wrap_i64 (local.get 3)))) (i32.const 109))
+                  (then unreachable))
+                (global.set $heard (i32.add (global.get $heard) (local.get 4)))
+                (global.set $left (i32.const 1))))
+            (if (i32.and (i64.eq (local.get 1) (i64.const 3)) (global.get $left))
+              (then
+                (global.set $heard (i32.add (global.get $heard) (i32.const 1)))
+                (global.set $left (i32.const 0))))))))
+    ;; A dispatch is the outer case 1 of the event: counted on this instance.
+    (if (i32.eq (local.get 0) (i32.const 1))
+      (then
+        (if (i32.eq (global.get $mode) (i32.const {members_at_a_dispatch}))
+          (then (global.set $heard (global.get $members)))
+          (else (global.set $heard (i32.add (global.get $heard) (i32.const 1)))))))
     (call $counter (i32.const 0) (i64.const 1))
     (call $counter (i32.const 3) (call $now))
     (call $counter (i32.const 4) (local.get 6))
@@ -606,7 +710,7 @@ fn guest_wat(guest: Guest) -> String {
           (drop (call $now))
           (local.set $i (i32.sub (local.get $i) (i32.const 1)))
           (br_if $calls (local.get $i)))))
-    (if (i32.eq (global.get $mode) (i32.const {log_dtor}))
+    (if (i32.or (i32.eq (global.get $mode) (i32.const {log_dtor})) (i32.eq (global.get $mode) (i32.const {trap_on_five_log_dtor})))
       (then
         (call $log (i32.const 2) (i32.const 32) (i32.const 8))
         (loop $once (br_if $once (i32.const 0)))))
@@ -646,6 +750,13 @@ fn guest_wat(guest: Guest) -> String {
         log_then_burn = mode::LOG_THEN_BURN,
         log_then_decline = mode::LOG_THEN_DECLINE,
         fill_briefly = mode::FILL_BRIEFLY_THEN_FILL,
+        count_dispatches = mode::COUNT_DISPATCHES,
+        count_members = mode::COUNT_MEMBERS,
+        trap_on_five_members = mode::TRAP_ON_FIVE_MEMBERS,
+        trap_on_five_log_dtor = mode::TRAP_ON_FIVE_AND_LOG_IN_DESTRUCTOR,
+        members_at_a_dispatch = mode::MEMBERS_AT_A_DISPATCH,
+        count_kinds = mode::COUNT_KINDS,
+        count_left = mode::COUNT_LEFT,
     )
 }
 

@@ -43,18 +43,26 @@
 //! decision for it until a step does. Until one reads the text it is
 //! dropped at the check, so a frame that waits in a queue holds none.
 //!
-//! An answer carries no lease here: a decision is written as the engine
-//! made it, and the call that issues leases adds them.
+//! A pick's answer carries the lease its decider had the store file for it
+//! ([`decided`]): one a decision, minted under the answer's term, a credit
+//! on the pick's first target, with the time its gateway has to name the
+//! dispatch. A shed and a queue ticket carry none.
 
-use std::{mem, time::Duration};
+use std::{
+    mem,
+    time::{Duration, Instant},
+};
 
+pub(crate) use crate::door::Viewed;
 use crate::{
     decision::{Decision, ShedReason, Target, Trace},
+    door::Asked,
+    lease::{Lease, Side},
     proto::{self, busy::Reason, decide_answer::Answer, decision::Outcome, identity::Form},
     spec::{AppliedSpec, MAX_HEADERS},
     view::{
-        fingerprint, key_of_session, AffinityFacts, Constraints, HashKind, Header, Identity,
-        MediaCounts, ModelFingerprint, Phase, RequestFacts, WireModes, WorkerId,
+        fingerprint, key_of_session, Constraints, HashKind, Header, Identity, MediaCounts,
+        ModelFingerprint, Phase, RequestFacts, Session, WireModes, WorkerId,
     },
 };
 
@@ -85,6 +93,14 @@ pub(crate) const MAX_REQUEST_ID: usize = 256;
 /// ([`MAX_BLOCK_HASHES`](crate::spec::MAX_BLOCK_HASHES)).
 pub(crate) const MAX_FRAME: usize = 64 * 1024;
 
+/// The bit of a [`Checked`] frame's rare words for one that carried its
+/// prompt as text.
+const TEXT: u8 = 1;
+
+/// The bit for a frame whose gateway asks its request again
+/// (`DecideRequest.again`).
+const AGAIN: u8 = 1 << 1;
+
 /// A `DecideRequest` the engine's record holds whole.
 #[derive(Debug)]
 pub(crate) struct Checked {
@@ -97,8 +113,10 @@ pub(crate) struct Checked {
     /// the session's value; `0` for one that carries it plain or carries
     /// none.
     session_key: u64,
-    /// Whether the frame carried its prompt as text.
-    text: bool,
+    /// What the frame says that few frames say, a bit a word ([`TEXT`],
+    /// [`AGAIN`]): `0` for a frame that says neither, so a decider reads
+    /// both by one test.
+    rare: u8,
 }
 
 impl Checked {
@@ -154,6 +172,7 @@ impl Checked {
             }
             _ => 0,
         };
+        let rare = (u8::from(text) * TEXT) | (u8::from(request.again) * AGAIN);
         Ok(Self {
             id: request.request_id,
             facts,
@@ -161,7 +180,7 @@ impl Checked {
             phase,
             hash_kind,
             session_key,
-            text,
+            rare,
         })
     }
 
@@ -174,16 +193,34 @@ impl Checked {
         self.phase
     }
 
+    /// The decision's seed, which its trace carries and its naming draws from.
+    pub(crate) const fn seed(&self) -> u64 {
+        self.facts.seed
+    }
+
     /// The time the request gives its decision, counted from its frame's
     /// receipt.
     pub(crate) fn budget(&self) -> Duration {
         Duration::from_micros(u64::from(self.facts.budget_micros))
     }
 
+    /// Whether the frame says a word few frames say: it carried its prompt
+    /// as text, or its gateway asks its request again. A decider asks this
+    /// of every request, once, and which word it is of those that say one.
+    pub(crate) const fn says_more(&self) -> bool {
+        self.rare != 0
+    }
+
     /// Whether the request carried its prompt as text, for the controller
     /// to hash.
     pub(crate) const fn has_text(&self) -> bool {
-        self.text
+        self.rare & TEXT != 0
+    }
+
+    /// Whether the request's gateway sent it before under this id and
+    /// holds no answer to it (`DecideRequest.again`).
+    pub(crate) const fn again(&self) -> bool {
+        self.rare & AGAIN != 0
     }
 
     /// How many block hashes the frame carries: a read hands the engine
@@ -197,6 +234,12 @@ impl Checked {
     /// hashed them ([`AppliedSpec::block_hashes_read`]).
     pub(crate) fn hashes_read(&self, spec: &AppliedSpec) -> usize {
         spec.block_hashes_read(self.hash_kind, self.facts.block_size)
+    }
+
+    /// The request's id as its frame carried it: its lease's record keeps
+    /// the id's fingerprint.
+    pub(crate) fn id(&self) -> &[u8] {
+        &self.id
     }
 
     /// The request's id, for its answer.
@@ -218,6 +261,11 @@ impl Checked {
     /// present 0 is a decision over no candidates.
     pub(crate) const fn subset(&self) -> Option<u32> {
         self.constraints.subset_hint
+    }
+
+    /// The request's block hashes, in order from its first block.
+    pub(crate) fn block_hashes(&self) -> &[u64] {
+        &self.facts.block_hashes
     }
 
     /// Hands `decide` the request as the engine reads it, with what the
@@ -284,13 +332,18 @@ impl Checked {
                 block_size: facts.block_size,
                 now_micros: view.now_micros,
                 affinity: view.affinity,
-                // In-process only: a host names rows where it holds them.
-                named: None,
+                // In-process only: the rows the deciding host named.
+                named: view.named,
                 // The wire carries the name: each read of the request's
                 // session fingerprints it.
                 model_fingerprint: ModelFingerprint::NONE,
                 // No decider asks its view for a pinned worker's row.
                 pinned_at: 0,
+                // What the leases book, beside rows a view lent.
+                lent_in_flight: view.in_flight.as_ref(),
+                // The store writes no count of a key's requests into a
+                // decision's rows yet.
+                session_counted: false,
             },
             &Constraints {
                 excluded: &lists.excluded,
@@ -300,6 +353,8 @@ impl Checked {
                 // The asking gateway's standing vetoes beside lent rows,
                 // and nothing where each row carries its own bit.
                 stalled: view.stalled,
+                held: view.held,
+                pins: view.pins,
             },
         );
         lists.headers = emptied(headers);
@@ -307,23 +362,53 @@ impl Checked {
     }
 }
 
-/// What a decision's view adds to its request: the facts that are the
-/// deciding host's own, never the frame's.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct Viewed<'a> {
-    /// The decision's instant in the rows' clock.
-    pub(crate) now_micros: u64,
-    /// What is left of the request's budget at the decision.
-    pub(crate) budget_micros: u32,
-    /// The candidates' affinity column, as the view's build filled it.
-    pub(crate) affinity: &'a [AffinityFacts],
-    /// The rows a veto of the asking gateway masks, by position, where the
-    /// candidates are a publication's own rows; empty where they were
-    /// written for the decision and carry their own stalled bits.
-    pub(crate) stalled: &'a [u32],
-    /// How many of the request's block hashes the deciding generation
-    /// reads.
-    pub(crate) max_block_hashes: usize,
+impl Asked for Checked {
+    type Lists = Lists;
+
+    fn model(&self) -> &str {
+        Self::model(self)
+    }
+
+    fn phase(&self) -> Phase {
+        Self::phase(self)
+    }
+
+    fn id(&self) -> &[u8] {
+        Self::id(self)
+    }
+
+    fn wires(&self) -> Option<WireModes> {
+        Self::wires(self)
+    }
+
+    fn subset(&self) -> Option<u32> {
+        Self::subset(self)
+    }
+
+    fn hashes(&self) -> usize {
+        Self::hashes(self)
+    }
+
+    fn hashes_read(&self, spec: &AppliedSpec) -> usize {
+        Self::hashes_read(self, spec)
+    }
+
+    fn block_hashes(&self) -> &[u64] {
+        Self::block_hashes(self)
+    }
+
+    fn seed(&self) -> u64 {
+        Self::seed(self)
+    }
+
+    fn read<R>(
+        &self,
+        lists: &mut Lists,
+        viewed: Viewed<'_>,
+        decide: impl FnOnce(&RequestFacts<'_>, &Constraints<'_>) -> R,
+    ) -> R {
+        Self::read(self, lists, viewed, decide)
+    }
 }
 
 /// The lists of one request in the engine's form, on buffers their decider
@@ -366,12 +451,142 @@ fn narrowed(count: u32) -> u16 {
     u16::try_from(count).unwrap_or(u16::MAX)
 }
 
-/// The answer that carries `decision`, made under `term`.
-pub(crate) fn decided(id: Vec<u8>, term: u64, decision: &Decision) -> proto::DecideAnswer {
+/// A pick's lease as its decider hands it over: the lease the store filed,
+/// what its decision left of the lease's dispatch span, and when that span
+/// ends.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Leased {
+    /// The lease as the store filed it.
+    pub(crate) lease: Lease,
+    /// The session key of the decode side's lease of a pair's pick; none
+    /// for a single's. That lease is the prefill side's under this key:
+    /// one id, one record, and at the answer one index and one count of
+    /// tokens. The key alone keeps the queue's entry small.
+    pub(crate) decode: Option<Session>,
+    /// What is left of its dispatch span: at the decision's last read as
+    /// its decider hands it over, at the send as its stream sends it.
+    pub(crate) left: Duration,
+    /// When the span ends: the dispatch deadline the store filed.
+    pub(crate) due: Instant,
+}
+
+impl Leased {
+    /// The least of a dispatch span a lease is handed over with: the wire
+    /// tells the span in whole milliseconds, and under one is none.
+    pub(crate) const LEAST: Duration = Duration::from_millis(1);
+
+    /// The lease as its stream sends it at `now`, a read of the clock
+    /// behind its decider's last: with what is left of the span there.
+    pub(crate) fn sent_at(self, now: Instant) -> Self {
+        Self {
+            left: self.due.saturating_duration_since(now),
+            ..self
+        }
+    }
+
+    /// Whether too little of the span is left to hand the lease over.
+    pub(crate) fn spent(&self) -> bool {
+        self.left < Self::LEAST
+    }
+}
+
+/// A decider's answer as its stream's queue holds it. A decision waits as
+/// it was made, with the lease issued for its pick, and its frame is built
+/// where its stream sends it, behind that send's read of the fence and of
+/// the lease's span: the lists a frame carries (a pick's targets, the
+/// trace's top, the lease) are made and freed on the thread that encodes
+/// them, and a deciding thread makes none.
+#[derive(Debug)]
+pub(crate) enum Decided {
+    /// A decision made under `term` for the request `id`, and the lease
+    /// its decider hands over with it.
+    Decision {
+        id: Vec<u8>,
+        term: u64,
+        decision: Decision,
+        lease: Option<Leased>,
+    },
+    /// An answer that carries no list: a `Busy`.
+    Frame(proto::DecideAnswer),
+}
+
+#[cfg(test)]
+impl Decided {
+    /// The frame the wire carries, as a stream builds it that sends at its
+    /// decider's last read: what a case of the deciders reads.
+    pub(crate) fn frame(self) -> proto::DecideAnswer {
+        match self {
+            Self::Decision {
+                id,
+                term,
+                decision,
+                lease,
+            } => decided(id, term, &decision, lease.as_ref()),
+            Self::Frame(frame) => frame,
+        }
+    }
+}
+
+/// The answer that carries `decision`, made under `term`, with the lease
+/// the store filed for it where it is a pick that was issued one, and
+/// what that lease's dispatch span has left where the answer is sent. A pair's pick
+/// carries two leases of one id, the prefill side's first.
+pub(crate) fn decided(
+    id: Vec<u8>,
+    term: u64,
+    decision: &Decision,
+    lease: Option<&Leased>,
+) -> proto::DecideAnswer {
+    let mut decision = self::decision(decision);
+    if let Some(leased) = lease {
+        let mut leases = Vec::with_capacity(1 + usize::from(leased.decode.is_some()));
+        leases.push(self::lease(&leased.lease, term, leased.left));
+        if let Some(session) = leased.decode {
+            let decode = Lease {
+                side: Side::Decode,
+                session,
+                ..leased.lease
+            };
+            leases.push(self::lease(&decode, term, leased.left));
+        }
+        decision.leases = leases;
+    }
     proto::DecideAnswer {
         request_id: id,
         term,
-        answer: Some(Answer::Decision(self::decision(decision))),
+        answer: Some(Answer::Decision(decision)),
+    }
+}
+
+/// A duration as a wire field's milliseconds: the field's largest value
+/// for a longer one.
+pub(super) fn millis(duration: Duration) -> u32 {
+    u32::try_from(duration.as_millis()).unwrap_or(u32::MAX)
+}
+
+/// A lease this controller minted, as the wire carries it under the term
+/// that minted it, with `left`: what is left, where it is sent, of the time
+/// its gateway has to name the dispatch. The decide call issues one kind of
+/// lease, a credit: on a single request's target, or on each side of a
+/// pair under one id.
+fn lease(lease: &Lease, term: u64, left: Duration) -> proto::Lease {
+    let side = match lease.side {
+        Side::Single => proto::Side::Single,
+        Side::Prefill => proto::Side::Prefill,
+        Side::Decode => proto::Side::Decode,
+        Side::Encode => proto::Side::Encode,
+    };
+    proto::Lease {
+        id: lease.id.0,
+        kind: proto::LeaseKind::Credit.into(),
+        side: side.into(),
+        target_index: u32::from(lease.target_index),
+        generation: lease.generation,
+        session_key: lease.session.get(),
+        tokens: lease.tokens,
+        term,
+        dispatch_ttl_ms: millis(left),
+        origin: proto::LeaseOrigin::Controller.into(),
     }
 }
 
@@ -398,8 +613,9 @@ pub(crate) fn credit(term: u64, window: u32) -> proto::DecideAnswer {
     }
 }
 
-/// A decision as the wire carries it, with no lease.
-fn decision(decision: &Decision) -> proto::Decision {
+/// A decision as the wire carries it; its lease is its answer's to add
+/// ([`decided`]).
+pub(super) fn decision(decision: &Decision) -> proto::Decision {
     let outcome = match decision {
         Decision::Pick(pick) => Outcome::Pick(proto::Pick {
             targets: pick.targets.iter().map(target).collect(),
@@ -464,6 +680,7 @@ fn trace(trace: &Trace) -> proto::Trace {
             .collect(),
         seed: trace.seed,
         generation: trace.generation,
+        lifted: proto::LiftedVeto::from(trace.lifted) as i32,
         ..proto::Trace::default()
     }
 }
@@ -473,7 +690,8 @@ mod tests {
     use super::{busy, credit, decided, emptied, Checked, Lists, Refusal, Viewed, MAX_FRAME};
     use crate::{
         decision::{
-            Decision, Pair, Pick, Queue, Shed, ShedReason, Survivors, Target, Targets, Trace,
+            Decision, Lifted, Pair, Pick, Queue, Shed, ShedReason, Survivors, Target, Targets,
+            Trace,
         },
         proto::{self, busy::Reason, decide_answer::Answer, decision::Outcome, identity::Form},
         spec::MAX_BLOCK_HASHES,
@@ -532,6 +750,7 @@ mod tests {
                 overload_lifted: true,
                 subset_hint: Some(0),
             }),
+            again: false,
         }
     }
 
@@ -557,7 +776,11 @@ mod tests {
             budget_micros: 1_500,
             affinity: &affinity,
             stalled: &[],
+            held: &[],
+            in_flight: None,
             max_block_hashes: 256,
+            named: None,
+            pins: None,
         };
         checked.read(lists, view, check)
     }
@@ -867,6 +1090,26 @@ mod tests {
         assert_eq!(text.facts.prompt_text.capacity(), 0);
     }
 
+    /// The two words few frames say are a bit each of one byte: a frame
+    /// that says neither reads as none, and each word reads apart from
+    /// the other.
+    #[test]
+    fn a_frame_that_is_asked_again_says_so_beside_its_text() {
+        let said = |frame: proto::DecideRequest| {
+            let frame = Checked::new(frame).expect("no word is a field out of its range");
+            (frame.says_more(), frame.has_text(), frame.again())
+        };
+        let texted = |text: &[u8], again| {
+            let mut frame = with(|facts| facts.prompt_text = text.to_vec());
+            frame.again = again;
+            frame
+        };
+        assert_eq!(said(full()), (false, false, false));
+        assert_eq!(said(texted(b"", true)), (true, false, true));
+        assert_eq!(said(texted(b"hello", false)), (true, true, false));
+        assert_eq!(said(texted(b"hello", true)), (true, true, true));
+    }
+
     #[test]
     fn the_hashes_past_what_the_generation_reads_are_cut_at_the_read_and_the_first_ones_kept() {
         let frame = with(|facts| facts.block_hashes = (1..=6).collect());
@@ -878,7 +1121,11 @@ mod tests {
                 budget_micros: 1,
                 affinity: &[],
                 stalled: &[],
+                held: &[],
+                in_flight: None,
                 max_block_hashes,
+                named: None,
+                pins: None,
             };
             checked.read(&mut Lists::default(), view, |facts, _| {
                 facts.block_hashes.to_vec()
@@ -901,6 +1148,7 @@ mod tests {
                 ..proto::RequestFacts::default()
             }),
             constraints: None,
+            again: false,
         };
         let at = frame(MAX_BLOCK_HASHES);
         assert_eq!(prost::Message::encoded_len(&at), MAX_FRAME - 5);
@@ -960,6 +1208,24 @@ mod tests {
         assert!(emptied(spent).capacity() >= 8);
     }
 
+    /// The wire's trace carries the veto the all-vetoed rule lifted, and
+    /// none for a pick no rule made.
+    #[test]
+    fn the_wire_carries_the_lifted_veto() {
+        let steered = Trace {
+            lifted: Lifted::Overload,
+            ..Trace::default()
+        };
+        assert_eq!(
+            super::trace(&steered).lifted,
+            proto::LiftedVeto::Overload as i32
+        );
+        assert_eq!(
+            super::trace(&Trace::default()).lifted,
+            proto::LiftedVeto::None as i32
+        );
+    }
+
     fn traced() -> Trace {
         Trace {
             profile: 3,
@@ -973,6 +1239,7 @@ mod tests {
             top_len: 2,
             seed: 41,
             generation: 6,
+            ..Trace::default()
         }
     }
 
@@ -1035,7 +1302,7 @@ mod tests {
             trace: traced(),
             ..Pick::default()
         });
-        let answer = decided(vec![1, 2], 9, &pick);
+        let answer = decided(vec![1, 2], 9, &pick, None);
         assert_eq!(
             (answer.request_id.as_slice(), answer.term),
             (&[1, 2][..], 9)
@@ -1086,7 +1353,7 @@ mod tests {
             },
             ..Pick::default()
         });
-        let (_, trace, _) = carried(decided(Vec::new(), 1, &pick));
+        let (_, trace, _) = carried(decided(Vec::new(), 1, &pick, None));
         let drawn = proto::Trace {
             survivors: None,
             drew_first: true,
@@ -1114,7 +1381,7 @@ mod tests {
                 wait_allowed: true,
                 trace: traced(),
             });
-            let (outcome, trace, leases) = carried(decided(Vec::new(), 1, &shed));
+            let (outcome, trace, leases) = carried(decided(Vec::new(), 1, &shed, None));
             assert_eq!(
                 outcome,
                 Outcome::Shed(proto::Shed {
@@ -1132,7 +1399,7 @@ mod tests {
             max_wait_micros: 62,
             trace: traced(),
         });
-        let (outcome, trace, leases) = carried(decided(Vec::new(), 1, &queue));
+        let (outcome, trace, leases) = carried(decided(Vec::new(), 1, &queue, None));
         assert_eq!(
             outcome,
             Outcome::Queue(proto::Queue {

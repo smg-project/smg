@@ -26,6 +26,15 @@
 //! template, and a test cuts generated text both ways. No rule reads the
 //! text before a piece's start, so the pass can begin at any such start
 //! ([`pieces`]) and hand the text back to the scanner at any other.
+//!
+//! Two more templates take the same pass, each by three rules of its own.
+//! The three-stage chain's (`chain::Scanner`, [`chain_pieces`]) has no
+//! clitics, keeps a run of blanks before a digit whole and reads a control
+//! character as no punctuation. In the cased-letter template
+//! (`cased::Scanner`, [`cased_pieces`]) a capital behind a small letter
+//! starts a piece, a clitic belongs to the letter piece before it, and the
+//! run behind punctuation takes the slash as well as the line breaks where
+//! the template says so.
 
 /// Bytes per block: one bit of a mask per byte.
 pub(super) const BLOCK: usize = 64;
@@ -169,8 +178,11 @@ impl Edge {
     /// of blanks behind a line break ends at a character beyond ASCII,
     /// which may be whitespace too: the scanner's to say. `clitic_end(pos)`
     /// is the end of the clitic at `pos`, if one begins there.
+    /// `rules` are the template's own beside these ([`Rules`]), with what
+    /// they keep from the block before.
     #[inline(always)]
-    fn starts<C: Fn(usize) -> Option<usize>>(
+    #[expect(clippy::too_many_arguments)]
+    fn starts<const CHAIN: bool, C: Fn(usize) -> Option<usize>, R: Rules>(
         &mut self,
         text: &[u8],
         base: usize,
@@ -178,6 +190,7 @@ impl Edge {
         next: &Masks,
         digit_cap: u32,
         clitic_end: &C,
+        rules: &mut R,
     ) -> Option<u64> {
         let (letters, digits, breaks) = (block.letters, block.digits, block.breaks);
         let blanks = block.whitespace & !breaks;
@@ -191,12 +204,24 @@ impl Edge {
         let (sum, taking_breaks) =
             breaks.overflowing_add(breaks & (behind_punct | u64::from(self.taking_breaks)));
         let rest = block.whitespace & !(breaks & !sum);
+        // A template with a rule of its own for that run cuts by it.
+        let (punct_starts, rest, taking_breaks) = rules.punct(
+            block,
+            self,
+            punct,
+            behind_punct,
+            (punct_starts, rest, taking_breaks),
+        );
 
         // Whitespace. A blank behind a line break starts a piece when that
         // break is the run's last, which is where the blanks from it end:
         // in this block, in the next or beyond it.
         let run_starts = rest & !before(rest, self.rest);
-        let last_blanks = blanks & !after(block.whitespace, next.whitespace);
+        // The chain's template never sees a digit (the stage before it cut
+        // the digits out), so there a digit ends the text for this rule as
+        // whitespace does: the blank before one starts no piece of its own.
+        let (unseen, next_unseen) = if CHAIN { (digits, next.digits) } else { (0, 0) };
+        let last_blanks = blanks & !after(block.whitespace | unseen, next.whitespace | next_unseen);
         let mut starts = punct_starts | run_starts | last_blanks;
         let mut behind_break = blanks & before(breaks, self.breaks) & !starts;
         while behind_break != 0 {
@@ -230,7 +255,13 @@ impl Edge {
         let word_starts =
             letters & !before(letters, self.letters) & !before(lead_ins, self.lead_ins);
         let mut behind_clitics = std::mem::take(&mut self.behind_clitics);
-        let mut quotes = lead_ins & punct_starts;
+        // The chain's template has no clitics, and a template with a letter
+        // rule of its own reads them there.
+        let mut quotes = if CHAIN || R::OWN_CLITICS {
+            0
+        } else {
+            lead_ins & punct_starts
+        };
         while quotes != 0 {
             let at = base + quotes.trailing_zeros() as usize;
             quotes &= quotes - 1;
@@ -276,7 +307,170 @@ impl Edge {
             taking_breaks,
             behind_clitics: self.behind_clitics,
         };
-        Some(starts | word_starts | groups | behind_clitics)
+        let starts = starts | word_starts | groups | behind_clitics;
+        Some(rules.letters(
+            text,
+            base,
+            letters,
+            lead_ins & punct_starts,
+            clitic_end,
+            starts,
+        ))
+    }
+}
+
+/// The rules of a template beside the ones [`Edge::starts`] cuts by, with
+/// what they keep from block to block. `()` has none: the GPT-4 family's
+/// template and the chain's are cut by [`Edge::starts`] alone, and each call
+/// below is nothing in their copies of the pass.
+trait Rules {
+    /// Whether [`Self::letters`] reads the clitics: [`Edge::starts`] then
+    /// leaves them to it.
+    const OWN_CLITICS: bool = false;
+
+    /// Reads what the rules tell apart in the block the pass cuts next.
+    #[inline(always)]
+    fn read(&mut self, _block: &[u8; BLOCK], _masks: &Masks) {}
+
+    /// The punctuation rule's starts, the whitespace no punctuation run
+    /// takes and whether the block ends inside such a run: `cut`, as
+    /// [`Edge::starts`] found them, or the rule's own, from the block's
+    /// masks and the block before (`edge`).
+    #[inline(always)]
+    fn punct(
+        &mut self,
+        _block: &Masks,
+        _edge: &Edge,
+        _punct: u64,
+        _behind_punct: u64,
+        cut: (u64, u64, bool),
+    ) -> (u64, u64, bool) {
+        cut
+    }
+
+    /// The block's starts: `starts`, as [`Edge::starts`] found them, or
+    /// those with the letter rule's own. `quotes` are the punctuation
+    /// starts right before a letter.
+    #[inline(always)]
+    fn letters<C: Fn(usize) -> Option<usize>>(
+        &mut self,
+        _text: &[u8],
+        _base: usize,
+        _letters: u64,
+        _quotes: u64,
+        _clitic_end: &C,
+        starts: u64,
+    ) -> u64 {
+        starts
+    }
+}
+
+impl Rules for () {}
+
+/// The rules of the cased-letter template (`cased`), and what a block of it
+/// hands to the next one beside [`Edge`].
+#[derive(Default)]
+struct Cased {
+    /// Whether the run behind punctuation takes the slash.
+    take_slash: bool,
+    /// The capitals and the slashes of the block the pass cuts next.
+    capitals: u64,
+    slashes: u64,
+    /// Of the block before: the letters, the small letters and the
+    /// punctuation no run before it takes.
+    letters: u64,
+    smalls: u64,
+    free: u64,
+    /// The characters of a clitic that reaches over the edge, and the start
+    /// behind that clitic.
+    in_clitics: u64,
+    clitic_ends: u64,
+}
+
+impl Rules for Cased {
+    const OWN_CLITICS: bool = true;
+
+    /// One more flag a byte and one more gather, for this template alone:
+    /// the capitals among the letters and the slash among the punctuation.
+    #[inline(always)]
+    fn read(&mut self, block: &[u8; BLOCK], masks: &Masks) {
+        let mut flags = [0u8; BLOCK];
+        for (at, &byte) in block.iter().enumerate() {
+            flags[at] = u8::from(byte.wrapping_sub(b'A') < 26 || byte == b'/');
+        }
+        let either = gather(&flags);
+        self.capitals = either & masks.letters;
+        self.slashes = either & !masks.letters;
+    }
+
+    /// The run behind punctuation takes the slash as well as the line
+    /// breaks, in a template that says so. A slash is punctuation itself,
+    /// so that run begins at a line break (a slash right behind punctuation
+    /// is of the punctuation run still) and goes on through breaks and
+    /// slashes. One addition clears each run of the two from its first
+    /// break behind punctuation (the later such breaks of a run come back
+    /// as bits of the sum, and are taken all the same). Punctuation behind
+    /// a taken slash starts a piece: the run before it has ended.
+    #[inline(always)]
+    fn punct(
+        &mut self,
+        block: &Masks,
+        edge: &Edge,
+        punct: u64,
+        behind_punct: u64,
+        _: (u64, u64, bool),
+    ) -> (u64, u64, bool) {
+        let breaks = block.breaks;
+        let joiners = breaks | if self.take_slash { self.slashes } else { 0 };
+        let behind = (breaks & behind_punct) | (joiners & u64::from(edge.taking_breaks));
+        let (sum, taking) = joiners.overflowing_add(behind);
+        let taken = (joiners & !sum) | behind;
+        let free = punct & !taken;
+        let starts = free & !before(free, self.free) & !before(block.spaces, edge.spaces);
+        self.free = free;
+        (starts, block.whitespace & !taken, taking)
+    }
+
+    /// A capital behind a small letter starts a piece, and a clitic belongs
+    /// to the letter piece before it. Such an apostrophe stands between two
+    /// letters; one right behind a clitic begins a piece of its own (a
+    /// piece takes one clitic). No start lies inside a clitic, and one lies
+    /// behind it whatever stands there.
+    #[inline(always)]
+    fn letters<C: Fn(usize) -> Option<usize>>(
+        &mut self,
+        text: &[u8],
+        base: usize,
+        letters: u64,
+        quotes: u64,
+        clitic_end: &C,
+        starts: u64,
+    ) -> u64 {
+        let smalls = letters & !self.capitals;
+        let case_starts = self.capitals & before(smalls, self.smalls);
+        let mut in_clitics = std::mem::take(&mut self.in_clitics);
+        let mut clitic_ends = std::mem::take(&mut self.clitic_ends);
+        let mut quotes = quotes & before(letters, self.letters);
+        while quotes != 0 {
+            let bit = quotes.trailing_zeros();
+            quotes &= quotes - 1;
+            let at = base + bit as usize;
+            if text[at] != b'\'' || (clitic_ends >> bit) & 1 != 0 {
+                continue;
+            }
+            let Some(end) = clitic_end(at) else {
+                continue;
+            };
+            let behind = (1u128 << (end - at)) << bit;
+            let inside = behind - (1u128 << bit);
+            in_clitics |= inside as u64;
+            self.in_clitics |= (inside >> u64::BITS) as u64;
+            clitic_ends |= behind as u64;
+            self.clitic_ends |= (behind >> u64::BITS) as u64;
+        }
+        self.letters = letters;
+        self.smalls = smalls;
+        ((starts | case_starts) & !in_clitics) | clitic_ends
     }
 }
 
@@ -289,10 +483,88 @@ impl Edge {
 /// ahead of the text's end or of a byte beyond ASCII, and where
 /// [`Edge::starts`] declines; it takes no stretch under two blocks.
 /// `clitic_end(pos)` is the end of the clitic at `pos`, if one begins there.
+/// `rules` are the template's own beside those of [`Edge::starts`]
+/// ([`Rules`]): `()` for a template that has none.
 /// Compiled into its caller: as a routine of its own it took `piece` by
 /// reference, and the encoder's probe then kept its captures in memory
 /// through the caller's walk between two stretches as well (counted: 1.4
 /// instructions per token on a Cyrillic text, 2 to 4 on long mixed text).
+#[inline(always)]
+fn pieces_of<const CHAIN: bool, C, F, R>(
+    text: &[u8],
+    from: usize,
+    digit_cap: u32,
+    clitic_end: C,
+    mut rules: R,
+    piece: &mut F,
+) -> usize
+where
+    C: Fn(usize) -> Option<usize>,
+    F: FnMut(usize, usize),
+    R: Rules,
+{
+    let [first, rest @ ..] = text[from..].as_chunks::<BLOCK>().0 else {
+        return from;
+    };
+    if !text[from..]
+        .first_chunk::<{ 2 * BLOCK }>()
+        .is_some_and(|stretch| reads::<CHAIN>(stretch))
+    {
+        return from;
+    }
+    let mut open = from;
+    let mut edge = Edge::default();
+    let mut masks = Masks::of(first);
+    rules.read(first, &masks);
+    // The stretch's first byte starts the open piece and ends none.
+    let mut opening = 1;
+    for (index, block) in rest.iter().enumerate() {
+        if !reads::<CHAIN>(block) {
+            break;
+        }
+        let next = Masks::of(block);
+        let base = from + index * BLOCK;
+        let Some(starts) = edge.starts::<CHAIN, C, R>(
+            text,
+            base,
+            &masks,
+            &next,
+            digit_cap,
+            &clitic_end,
+            &mut rules,
+        ) else {
+            break;
+        };
+        let mut starts = starts & !opening;
+        opening = 0;
+        while starts != 0 {
+            let start = base + starts.trailing_zeros() as usize;
+            starts &= starts - 1;
+            piece(open, start);
+            open = start;
+        }
+        masks = next;
+        rules.read(block, &masks);
+    }
+    open
+}
+
+/// Whether the pass reads `bytes`: all ASCII, and for the chain's template
+/// (`CHAIN`) no control character either. There a control character is a
+/// lead-in of letters and no punctuation, which the masks do not say, so a
+/// block that holds one is the scanner's, as a block beyond ASCII is. The
+/// ASCII test stands first and alone: it ends at the first bytes beyond
+/// ASCII, so a try of the pass on text in another script costs little.
+#[inline(always)]
+fn reads<const CHAIN: bool>(bytes: &[u8]) -> bool {
+    bytes.is_ascii()
+        && !(CHAIN
+            && bytes.iter().fold(false, |odd, &byte| {
+                odd | (byte.is_ascii_control() && !is_space(byte))
+            }))
+}
+
+/// [`pieces_of`] by the GPT-4 family's template.
 #[inline(always)]
 pub(super) fn pieces<C, F>(
     text: &[u8],
@@ -305,40 +577,49 @@ where
     C: Fn(usize) -> Option<usize>,
     F: FnMut(usize, usize),
 {
-    let [first, rest @ ..] = text[from..].as_chunks::<BLOCK>().0 else {
-        return from;
+    pieces_of::<false, C, F, ()>(text, from, digit_cap, clitic_end, (), piece)
+}
+
+/// [`pieces_of`] by the cased-letter template (`cased`). On plain ASCII it
+/// cuts as the GPT-4 family's template but for three rules ([`Cased`]): a
+/// capital behind a small letter starts a piece; a clitic belongs to the
+/// letter piece before it and is no piece of its own; and, in a template
+/// that says so (`take_slash`), the run behind punctuation takes the slash
+/// as well as the line breaks.
+/// `clitic_end(pos)` is the end of the clitic at `pos`, if one begins there.
+#[inline(always)]
+pub(super) fn cased_pieces<C, F>(
+    text: &[u8],
+    from: usize,
+    digit_cap: u32,
+    take_slash: bool,
+    clitic_end: C,
+    piece: &mut F,
+) -> usize
+where
+    C: Fn(usize) -> Option<usize>,
+    F: FnMut(usize, usize),
+{
+    let rules = Cased {
+        take_slash,
+        ..Cased::default()
     };
-    if !text[from..]
-        .first_chunk::<{ 2 * BLOCK }>()
-        .is_some_and(|stretch| stretch.is_ascii())
-    {
-        return from;
-    }
-    let mut open = from;
-    let mut edge = Edge::default();
-    let mut masks = Masks::of(first);
-    // The stretch's first byte starts the open piece and ends none.
-    let mut opening = 1;
-    for (index, block) in rest.iter().enumerate() {
-        if !block.is_ascii() {
-            break;
-        }
-        let next = Masks::of(block);
-        let base = from + index * BLOCK;
-        let Some(starts) = edge.starts(text, base, &masks, &next, digit_cap, &clitic_end) else {
-            break;
-        };
-        let mut starts = starts & !opening;
-        opening = 0;
-        while starts != 0 {
-            let start = base + starts.trailing_zeros() as usize;
-            starts &= starts - 1;
-            piece(open, start);
-            open = start;
-        }
-        masks = next;
-    }
-    open
+    pieces_of::<false, C, F, Cased>(text, from, digit_cap, clitic_end, rules, piece)
+}
+
+/// [`pieces_of`] by the template of the three-stage chain (`chain`), whose
+/// first stage cuts the digits by the bound `digit_cap`. On plain ASCII it
+/// cuts as the GPT-4 family's template but for three rules: it has no
+/// clitics, a run of blanks before a digit stays whole, and a control
+/// character is no punctuation (such a block is left to the scanner).
+#[inline(always)]
+pub(super) fn chain_pieces<F: FnMut(usize, usize)>(
+    text: &[u8],
+    from: usize,
+    digit_cap: u32,
+    piece: &mut F,
+) -> usize {
+    pieces_of::<true, _, F, ()>(text, from, digit_cap, |_| None, (), piece)
 }
 
 /// Bytes between two places a text is asked at for an ASCII stretch

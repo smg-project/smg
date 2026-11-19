@@ -51,6 +51,7 @@ use openai_protocol::{
     embedding::EmbeddingRequest,
     generate::GenerateRequest,
     messages::{CountMessageTokensRequest, CreateMessageRequest},
+    model_card::ModelCard,
     rerank::RerankRequest,
     responses::ResponsesRequest,
     worker::HealthCheckConfig,
@@ -64,9 +65,10 @@ use smg::{
     rate_limit::{
         RateLimitBackend, RateLimitManager, ReserveOutcome, ReserveRequest, UsageSettlement,
     },
-    routers::{http::router::Router as HttpRouter, RouterTrait},
+    routers::{
+        grpc::backend_client::BasicWorkerBuilder, http::router::Router as HttpRouter, RouterTrait,
+    },
     tenant::TenantKey,
-    worker::{BasicWorkerBuilder, ModelCard},
 };
 use tokio::{net::TcpListener, task::JoinHandle};
 use tower::ServiceExt;

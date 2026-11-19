@@ -42,8 +42,13 @@ view:
 profiles:
   cache_aware:
     filter: [healthy, not-overloaded, not-tried]
-    score: [prefix-affinity, kv-pressure, least-load, warmup-slice]
-    pick: best
+    score:
+      - warmup-slice: { weight: 8 }
+      - prefix-affinity: { weight: 4 }
+      - kv-pressure
+      - least-load
+    pick:
+      best: { sample: 16 }
 bindings:
   - match: { model: "*" }
     profile: cache_aware

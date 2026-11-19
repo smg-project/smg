@@ -19,11 +19,13 @@ use axum::{
     Json,
 };
 use futures_util::stream;
+use openai_protocol::model_card::ModelCard;
 use serde_json::{json, Value};
 use smg::{
     config::{PolicyConfig, RouterConfig},
-    worker::{BasicWorkerBuilder, ModelCard, Worker, WorkerType},
+    routers::grpc::backend_client::BasicWorkerBuilder,
 };
+use smg_worker::identity::basic::{Worker, WorkerType};
 use tokio::sync::Mutex;
 use tower::ServiceExt;
 

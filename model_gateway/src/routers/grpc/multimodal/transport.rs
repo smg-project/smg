@@ -19,16 +19,17 @@ use std::{
 use llm_multimodal::{EncoderDtype, Modality};
 use openai_protocol::worker::{ConnectionMode, RuntimeType, TransportMode};
 use smg_mm_rdma::{RdmaConfig, RdmaExporter, STAGES_OVER_RDMA};
+use smg_worker::identity::basic::Worker;
 use tracing::{error, info, warn};
 
 use super::{encoder_budget::WIRE_MESSAGE_CAP, serialize::wire_dtype, settings::mm_settings};
-use crate::{
-    routers::grpc::{
+use crate::routers::{
+    common::snapshot::{RoutingPool, WorkerRegistry, WorkerRegistryExt},
+    grpc::{
         backend_client::{connected_backend_client, BackendClient},
         context::WorkerSelection,
         proto_wrapper::mm_shm_dev_writable,
     },
-    worker::{RoutingPool, Worker, WorkerRegistry},
 };
 
 const DEFAULT_SHM_MIN_BYTES: usize = 64 * 1024;
@@ -899,8 +900,11 @@ mod allocation_pins;
 
 #[cfg(test)]
 mod tests {
+    use openai_protocol::model_card::ModelCard;
+    use smg_worker::{identity::basic::WorkerType, test_support::no_health_check};
+
     use super::*;
-    use crate::worker::{test_support::no_health_check, BasicWorkerBuilder, ModelCard, WorkerType};
+    use crate::routers::grpc::backend_client::BasicWorkerBuilder;
 
     fn worker(url: &str, runtime: RuntimeType, labels: &[(&str, &str)]) -> Arc<dyn Worker> {
         let mut builder = BasicWorkerBuilder::new(url)
@@ -1169,9 +1173,11 @@ mod tests {
     /// are the settings module's tests.
     #[test]
     fn the_one_pass_wire_write_is_the_default_and_its_switch_turns_it_off() {
-        use crate::{
-            routers::grpc::{mode::Mode, multimodal::MultimodalSettings},
-            worker::{ConnectionMode, WorkerRegistry},
+        use smg_worker::identity::basic::ConnectionMode;
+
+        use crate::routers::{
+            common::snapshot::WorkerRegistry,
+            grpc::{mode::Mode, multimodal::MultimodalSettings},
         };
 
         let registry = WorkerRegistry::new();
@@ -1216,10 +1222,11 @@ mod tests {
     #[test]
     fn the_image_wire_cap_holds_only_for_an_inline_grpc_fleet() {
         use openai_protocol::worker::WorkerSpec;
+        use smg_worker::identity::basic::ConnectionMode;
 
-        use crate::{
-            routers::grpc::{mode::Mode, proto_wrapper::mm_shm_dev_writable},
-            worker::{ConnectionMode, WorkerRegistry},
+        use crate::routers::{
+            common::snapshot::WorkerRegistry,
+            grpc::{mode::Mode, proto_wrapper::mm_shm_dev_writable},
         };
 
         let pools = Mode::Regular.multimodal_wire_pools();
@@ -1357,10 +1364,9 @@ mod tests {
     /// over the union, never a wire for the wrong pool.
     #[test]
     fn the_wire_dtype_is_resolved_over_the_pools_a_modes_pixels_can_reach() {
-        use crate::{
-            routers::grpc::mode::Mode,
-            worker::{ConnectionMode, WorkerRegistry},
-        };
+        use smg_worker::identity::basic::ConnectionMode;
+
+        use crate::routers::{common::snapshot::WorkerRegistry, grpc::mode::Mode};
 
         let plain = DtypeOverrides::default();
         let registry = WorkerRegistry::new();

@@ -561,7 +561,11 @@ impl ImageFrame {
                 self.transparency(),
             )?;
             Ok(if self.minimax_sglang_resize {
-                resize_bicubic_pil(&image, self.size.width, self.size.height)
+                let resized = resize_bicubic_pil(&image, self.size.width, self.size.height);
+                // The cell holds the resized image, so the frame's drop would
+                // not return the decoder's buffer.
+                buffer_pool::recycle_image(image);
+                resized
             } else if self.minimax_resize {
                 resize_image(image, self.size.width, self.size.height)
             } else {
@@ -597,6 +601,9 @@ impl ImageFrame {
             if self.from_pixels {
                 // The cell is empty after `take`, so this first `set` holds.
                 let _ = self.decoded.set(apply_transparency(pixels, &[], policy));
+            } else {
+                // The decode under `policy` takes this buffer back.
+                buffer_pool::recycle_image(pixels);
             }
         }
         self
@@ -1269,6 +1276,69 @@ mod buffer_pool_tests {
             assert_eq!(MINE.held(), 4 << 20);
             let again = buffer_pool::take(1024 * 768 * 3);
             assert_eq!(again.as_ptr(), address);
+        });
+    }
+
+    /// An encoded frame of a 320x320 PNG, whose decode is the pool's 512 KiB
+    /// class with or without an alpha channel, planned at `side` pixels.
+    fn square_png_frame(alpha: bool, side: u32) -> ImageFrame {
+        let square = if alpha {
+            DynamicImage::ImageRgba8(image::RgbaImage::from_fn(320, 320, |x, y| {
+                image::Rgba([x as u8, y as u8, (x ^ y) as u8, (x + y) as u8])
+            }))
+        } else {
+            DynamicImage::ImageRgb8(RgbImage::from_fn(320, 320, |x, y| {
+                image::Rgb([x as u8, y as u8, (x ^ y) as u8])
+            }))
+        };
+        let mut png = Vec::new();
+        square
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .expect("encode");
+        ImageFrame::encoded(
+            png.into(),
+            ImageDetail::Auto,
+            ImageSource::InlineBytes,
+            String::new(),
+            ImageSize::new(side, side),
+            None,
+        )
+    }
+
+    /// A frame resized at its decode holds the resized image, so the
+    /// decoder's buffer is back in the pool once the pixels are asked for,
+    /// under either resize.
+    #[test]
+    fn a_frame_resized_at_its_decode_returns_the_decoders_buffer() {
+        static MINE: BufferPool = BufferPool::new();
+        buffer_pool::with_pool(&MINE, || {
+            let direct = square_png_frame(false, 160).with_minimax_resize();
+            assert_eq!(direct.image().expect("decoded").width(), 160);
+            assert_eq!(MINE.held(), 512 << 10);
+            let exact = square_png_frame(false, 160).with_minimax_sglang_resize(true);
+            assert_eq!(exact.image().expect("decoded").width(), 160);
+            assert_eq!(MINE.held(), 512 << 10);
+        });
+    }
+
+    /// A decoded frame given another policy drops its pixels for the next
+    /// decode: their buffer goes back to the pool, and that decode takes it.
+    #[test]
+    fn a_decode_dropped_for_another_policy_returns_the_decoders_buffer() {
+        static MINE: BufferPool = BufferPool::new();
+        buffer_pool::with_pool(&MINE, || {
+            let frame = square_png_frame(true, 320);
+            let address = frame.image().expect("decoded").as_bytes().as_ptr();
+            assert_eq!(MINE.held(), 0);
+            let frame = frame.with_transparency(TransparencyPolicy::KeepAlpha);
+            assert_eq!(MINE.held(), 0, "the same policy keeps the decode");
+            let frame = frame.with_transparency(TransparencyPolicy::DropAlpha);
+            assert_eq!(MINE.held(), 512 << 10);
+            let again = buffer_pool::take(320 * 320 * 4);
+            assert_eq!(again.as_ptr(), address);
+            buffer_pool::recycle(again);
+            assert!(!frame.image().expect("decoded").color().has_alpha());
+            assert_eq!(MINE.held(), 512 << 10);
         });
     }
 }

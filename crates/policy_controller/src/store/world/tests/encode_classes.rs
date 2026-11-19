@@ -6,7 +6,7 @@ use crate::store::{EncodeHandoff, EncodeOffer};
 
 /// A worker of the model, of one known runtime, that states `offer` as its
 /// end of the encode handoff.
-fn encode_facts(key: &str, role: Role, offer: EncodeOffer) -> WorkerFacts {
+pub(super) fn encode_facts(key: &str, role: Role, offer: EncodeOffer) -> WorkerFacts {
     WorkerFacts {
         engine_kind: "rt-a".to_string(),
         encode: offer,
@@ -15,12 +15,13 @@ fn encode_facts(key: &str, role: Role, offer: EncodeOffer) -> WorkerFacts {
 }
 
 /// The end of a worker that pushes, or takes a push, on `connector`.
-fn push_on(connector: &str) -> EncodeOffer {
+pub(super) fn push_on(connector: &str) -> EncodeOffer {
     EncodeOffer {
         handoff: EncodeHandoff::Push,
         producer: true,
         consumer: true,
         connector: Some(connector.to_string()),
+        ..EncodeOffer::default()
     }
 }
 
@@ -46,6 +47,7 @@ fn the_world_holds_a_models_encode_classes_by_the_rows_of_its_pools() {
     let p2 = upsert("grpc://p2:9000", Role::Prefill, "c2");
 
     // Each side stands in the classes as the rows of its pool.
+    store.publish_now();
     let (encoders, _, _) = side(&store, Role::Encode, &ask(now));
     let (prefills, _, _) = side(&store, Role::Prefill, &ask(now));
     let world = store.world();
@@ -85,6 +87,7 @@ fn a_blank_connector_of_an_encode_offer_is_dropped_at_the_door() {
     let p1 = upsert("grpc://p1:9000", Role::Prefill, "c1 ");
 
     // The names between blanks are one end; the blank one states none.
+    store.publish_now();
     let (encoders, _, _) = side(&store, Role::Encode, &ask(now));
     let (prefills, _, _) = side(&store, Role::Prefill, &ask(now));
     let world = store.world();
@@ -107,8 +110,10 @@ fn a_blank_connector_of_an_encode_offer_is_dropped_at_the_door() {
 fn a_model_with_no_encoder_or_no_prefill_has_no_encode_classes() {
     let store = MemoryStore::new();
     store.upsert(encode_facts("grpc://e1:9000", Role::Encode, push_on("c1")));
+    store.publish_now();
     assert!(store.world().encodes(MODEL).is_none());
     store.upsert(encode_facts("grpc://p1:9000", Role::Prefill, push_on("c1")));
+    store.publish_now();
     let world = store.world();
     assert_eq!(
         world.encodes(MODEL).map(|classes| classes.classes()),
@@ -119,6 +124,7 @@ fn a_model_with_no_encoder_or_no_prefill_has_no_encode_classes() {
     // A model of prefills alone has none either.
     let alone = MemoryStore::new();
     alone.upsert(encode_facts("grpc://p1:9000", Role::Prefill, push_on("c1")));
+    alone.publish_now();
     assert!(alone.world().encodes(MODEL).is_none());
 }
 
@@ -128,9 +134,11 @@ fn a_model_whose_encoders_state_no_end_has_no_encode_classes() {
     let silent = EncodeOffer::default();
     store.upsert(encode_facts("grpc://e1:9000", Role::Encode, silent));
     store.upsert(encode_facts("grpc://p1:9000", Role::Prefill, push_on("c1")));
+    store.publish_now();
     assert!(store.world().encodes(MODEL).is_none());
     // The first encoder to state an end makes the first class.
     store.upsert(encode_facts("grpc://e2:9000", Role::Encode, push_on("c1")));
+    store.publish_now();
     let world = store.world();
     let classes = world.encodes(MODEL).expect("an end and a prefill");
     assert_eq!((classes.classes(), classes.list(1).len()), (1, 1));
@@ -152,6 +160,8 @@ fn two_stores_of_one_membership_number_the_encode_classes_alike() {
     for &(key, role, connector) in fleet.iter().rev() {
         backward.upsert(encode_facts(key, role, push_on(connector)));
     }
+    forward.publish_now();
+    backward.publish_now();
     let (ours, theirs) = (forward.world(), backward.world());
     let classes = ours.encodes(MODEL).expect("an end and a prefill");
     assert_eq!(Some(classes), theirs.encodes(MODEL));
@@ -182,6 +192,7 @@ fn two_engine_kinds_of_one_form_are_two_encode_classes_in_the_world() {
     let e2 = of_kind("grpc://e2:9000", Role::Encode, "rt-b");
     let p1 = of_kind("grpc://p1:9000", Role::Prefill, "rt-a");
     let p2 = of_kind("grpc://p2:9000", Role::Prefill, "rt-b");
+    store.publish_now();
     let (encoders, _, _) = side(&store, Role::Encode, &ask(now));
     let (prefills, _, _) = side(&store, Role::Prefill, &ask(now));
     let world = store.world();
@@ -204,9 +215,11 @@ fn a_membership_write_that_moves_no_offer_carries_the_encode_classes() {
     // The world is kept, so its classes stand where they are: one address
     // in a later world is those classes carried, never others in their
     // place.
+    store.publish_now();
     let before = store.world();
     let derived = before.encodes(MODEL).expect("the model's classes");
     let carried = |what: &str| {
+        store.publish_now();
         let world = store.world();
         let encodes = world.encodes(MODEL).expect("the model's classes");
         assert!(std::ptr::eq(derived, encodes), "{what}: derived again");
@@ -270,6 +283,7 @@ fn a_membership_write_that_moves_an_end_derives_the_encode_classes_again() {
         let store = MemoryStore::new();
         store.upsert(first());
         rest(&store);
+        store.publish_now();
         let before = store.world();
         store.upsert(facts.clone());
         // A store that never held the first version: every write of it
@@ -277,6 +291,8 @@ fn a_membership_write_that_moves_an_end_derives_the_encode_classes_again() {
         let fresh = MemoryStore::new();
         fresh.upsert(facts);
         rest(&fresh);
+        store.publish_now();
+        fresh.publish_now();
         let (after, fresh) = (store.world(), fresh.world());
         assert_eq!(after.encodes(MODEL), fresh.encodes(MODEL), "{what}");
         assert_ne!(
@@ -285,4 +301,90 @@ fn a_membership_write_that_moves_an_end_derives_the_encode_classes_again() {
             "{what}: the classes moved"
         );
     }
+}
+
+#[test]
+fn a_write_that_leaves_a_models_encoders_and_prefills_carries_its_encode_classes() {
+    let store = MemoryStore::new();
+    store.upsert(encode_facts("grpc://e1:9000", Role::Encode, push_on("c1")));
+    store.upsert(encode_facts("grpc://p1:9000", Role::Prefill, push_on("c1")));
+    store.upsert(facts("grpc://d1:9000", Role::Decode, &[MODEL]));
+    // The world is kept, so its classes stand where they are: one address
+    // in a later world is those classes carried, never others in their
+    // place.
+    store.publish_now();
+    let before = store.world();
+    let derived = before.encodes(MODEL).expect("the model's classes");
+    let carried = |what: &str| {
+        store.publish_now();
+        let world = store.world();
+        let encodes = world.encodes(MODEL).expect("the model's classes");
+        assert!(std::ptr::eq(derived, encodes), "{what}: derived again");
+    };
+    let leave = |id: WorkerId| {
+        let revision = WorkersStore::get(&store, id).expect("the row").revision;
+        store.remove(id, revision).expect("removed");
+    };
+    // The encode handoff reads no decode: one that serves a second model
+    // from now on, one that joins and one that leaves.
+    store.upsert(facts("grpc://d1:9000", Role::Decode, &[MODEL, "wider"]));
+    carried("a decode's models moved");
+    let second = store
+        .upsert(facts("grpc://d2:9000", Role::Decode, &[MODEL]))
+        .id();
+    carried("a decode joined");
+    leave(second);
+    carried("a decode left");
+    // Another model's encoder joins, moves its end and leaves.
+    let apart = |connector: &str| WorkerFacts {
+        engine_kind: "rt-a".to_string(),
+        encode: push_on(connector),
+        ..facts("grpc://e9:9000", Role::Encode, &["another"])
+    };
+    let other = store.upsert(apart("c1")).id();
+    carried("another model's encoder joined");
+    store.upsert(apart("c2"));
+    carried("another model's end moved");
+    leave(other);
+    carried("another model's encoder left");
+}
+
+#[test]
+fn a_write_that_moves_a_models_encoder_or_prefill_derives_its_encode_classes_again() {
+    let store = MemoryStore::new();
+    store.upsert(encode_facts("grpc://e1:9000", Role::Encode, push_on("c1")));
+    store.upsert(encode_facts("grpc://p1:9000", Role::Prefill, push_on("c1")));
+    // Every world is kept, so the classes of a later one at another
+    // address are others, derived again.
+    store.publish_now();
+    let mut worlds = vec![store.world()];
+    let mut again = |what: &str, encoders: usize, prefills: usize| {
+        store.publish_now();
+        let world = store.world();
+        let last = worlds.last().expect("a world");
+        let before = last.encodes(MODEL).expect("the model's classes");
+        let after = world.encodes(MODEL).expect("the model's classes");
+        assert!(!std::ptr::eq(before, after), "{what}: carried");
+        let sides = (after.encoders().len(), after.prefills().len());
+        assert_eq!(sides, (encoders, prefills), "{what}");
+        worlds.push(world);
+    };
+    // An encoder of the model joins and leaves.
+    let second = store
+        .upsert(encode_facts("grpc://e2:9000", Role::Encode, push_on("c2")))
+        .id();
+    again("an encoder joined", 2, 1);
+    let revision = WorkersStore::get(&store, second).expect("the row").revision;
+    store.remove(second, revision).expect("removed");
+    again("an encoder left", 1, 1);
+    // A prefill's next incarnation takes its place: as many rows as
+    // before, and another worker in one of them.
+    store.upsert(WorkerFacts {
+        incarnation: 2,
+        ..encode_facts("grpc://p1:9000", Role::Prefill, push_on("c1"))
+    });
+    again("a prefill's next incarnation", 1, 1);
+    // A prefill joins.
+    store.upsert(encode_facts("grpc://p2:9000", Role::Prefill, push_on("c1")));
+    again("a prefill joined", 1, 2);
 }

@@ -337,6 +337,14 @@
           "shutdownGracePeriodSeconds",
           "terminationGraceMarginSeconds"
         ],
+        "if": {
+          "required": ["specStoreClaim"],
+          "properties": { "specStoreClaim": { "type": "string", "minLength": 1 } }
+        },
+        "else": {
+          "required": ["spec"],
+          "properties": { "spec": { "type": "object", "minProperties": 1 } }
+        },
         "properties": {
           "replicas": { "type": "integer" },
           "ports": {
@@ -413,6 +421,11 @@
           }
         },
         "spec": { "type": ["object", "null"] },
+        "specStoreClaim": {
+          "type": ["string", "null"],
+          "maxLength": 253,
+          "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+        },
         "ports": {
           "type": ["object", "null"],
           "additionalProperties": false,
@@ -496,6 +509,11 @@
                 "description": "The worker's image tag; none takes the router's. A tag is text: a tag of digits alone is quoted."
               }
             }
+          },
+          "terminationGracePeriodSeconds": {
+            "type": ["integer", "null"],
+            "minimum": 0,
+            "description": "Seconds the kubelet waits between SIGTERM and SIGKILL on the worker's pod; none is 90, enough for the servicer's drain. A whole number of seconds: a duration such as 90s is refused, not read as 0."
           }
         }
       }

@@ -8,7 +8,10 @@
 //! the lease), so its commit moves the pins by that verdict alone: a hit
 //! leaves them, a respill fronts the worker taken. The one write before a
 //! commit is a fresh key's claim of the worker its decision chose, so
-//! concurrent first requests agree on one.
+//! concurrent first requests agree on one. A key the table holds no pin of
+//! asks the host's pins of record first, where the host lends them
+//! ([`crate::PinSource`]): a pin a dispatch made under an earlier
+//! generation is written back, and no claim is made.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -39,14 +42,17 @@ pub struct SessionRule {
 /// verdict and no other request's reading of the key can erase it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SessionVerdict {
-    /// No sessions rule governed the decision: its commit pins nothing.
+    /// No sessions rule governed the decision, or its rule placed a request
+    /// of a key at its cap on another worker at the cap: its commit pins
+    /// nothing.
     #[default]
     None,
     /// The pin was taken, or the key was placed by the rule: the commit
     /// records the worker by the key's recovery.
     Pinned,
-    /// The routable pin was over the in-flight cap and the stages placed the
-    /// request: the commit fronts the worker it lands on.
+    /// The routable pin was at the in-flight cap and the stages placed the
+    /// request on another worker under the cap: the commit fronts the
+    /// worker it lands on.
     Respill,
     /// The key had no routable pin and the decision claimed the worker it
     /// placed the request on: that decision's commit confirms the claim on
@@ -57,6 +63,19 @@ pub enum SessionVerdict {
 /// The pins of one key: the preferred worker first, the failover second;
 /// `WorkerId(0)` is an empty slot.
 pub type Pins = [WorkerId; 2];
+
+/// When a table forgets a key it holds, on the decision clock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Forgets {
+    /// At this instant: the key's rule has a TTL.
+    At(u64),
+    /// At no instant: the key's rule has no TTL.
+    Never,
+    /// No decision has read the key since its entry was made: a dispatch
+    /// made the entry anew, behind a worker's leave or the end of the
+    /// key's TTL, and the next decision's read starts the key over.
+    Unread,
+}
 
 /// What [`SessionTable::claim`] did for a decision that found no routable
 /// pin.
@@ -74,7 +93,7 @@ pub(crate) enum Claim {
 struct Entry {
     pins: Pins,
     /// The instant the key's pins expire on the decision clock; `u64::MAX`
-    /// under a rule without a TTL.
+    /// under a rule without a TTL, and `0` until a decision reads the key.
     expires_at_micros: u64,
     recovery: Recovery,
     /// The pin a decision's claim wrote before its commit; `WorkerId(0)`
@@ -129,7 +148,12 @@ impl Entry {
 
 /// Shards of the table, by the key's low bits: keyed decisions on different
 /// keys take different locks.
-const SHARDS: usize = 16;
+pub(crate) const SHARDS: usize = 16;
+
+/// The shard of `key`, in this table and in the store's pins of record.
+pub(crate) fn shard_of(key: u64) -> usize {
+    (key % SHARDS as u64) as usize
+}
 
 /// The session table: every key's pins, swept on the decision clock.
 #[derive(Debug)]
@@ -158,7 +182,7 @@ impl SessionTable {
     }
 
     fn shard(&self, key: u64) -> &Mutex<FxHashMap<u64, Entry>> {
-        &self.shards[(key % SHARDS as u64) as usize]
+        &self.shards[shard_of(key)]
     }
 
     /// The pins of `key` at a decision taken at `now_micros` under `rule`,
@@ -166,6 +190,9 @@ impl SessionTable {
     /// table swept when a sweep is due. A key never seen, or one whose TTL
     /// passed, has empty pins: expiry is the key's own compare, the sweep
     /// only reclaims.
+    /// Always inlined: the keyed decision has two forms, and a second caller
+    /// would otherwise move this out of line under the first.
+    #[inline(always)]
     pub(crate) fn lookup(&self, key: Session, now_micros: u64, rule: &SessionRule) -> Pins {
         let key = key.get();
         self.sweep_if_due(now_micros);
@@ -189,6 +216,9 @@ impl SessionTable {
     /// claim is the one pin made before a commit, and it is marked as such:
     /// any dispatch to it confirms it, the claiming decision's own dispatch
     /// elsewhere withdraws it (`dispatched`), the TTL sweeps it otherwise.
+    /// Always inlined: the keyed decision has two forms, and a second caller
+    /// would otherwise move this out of line under the first.
+    #[inline(always)]
     pub(crate) fn claim(&self, key: Session, seen: Pins, target: WorkerId) -> Claim {
         let key = key.get();
         if key == 0 || target == WorkerId(0) {
@@ -212,6 +242,34 @@ impl SessionTable {
                 .find(|pin| *pin != WorkerId(0) && !seen.contains(pin))
                 .unwrap_or(target),
         )
+    }
+
+    /// A pin of record read for a key the table held no pin of (a key it
+    /// never saw, or one a new generation's table starts without): `worker`
+    /// becomes the key's preferred pin where the key still has none, under
+    /// the entry's lock, and the pins that stand are returned. It is a pin
+    /// a dispatch made, never a claim: no commit withdraws it. A key that
+    /// took a pin since the decision read it keeps that pin.
+    pub(crate) fn restore(
+        &self,
+        key: Session,
+        now_micros: u64,
+        rule: &SessionRule,
+        worker: WorkerId,
+    ) -> Pins {
+        let key = key.get();
+        if key == 0 || worker == WorkerId(0) {
+            return [WorkerId(0); 2];
+        }
+        let mut shard = self.shard(key).lock();
+        let entry = shard.entry(key).or_default();
+        if entry.pins[0] == WorkerId(0) {
+            entry.pins[0] = worker;
+            // The entry may be new here: a worker's leave drops a key with
+            // no pin left, between the decision's read and this write.
+            entry.touch(now_micros, rule);
+        }
+        entry.pins
     }
 
     /// The commit dispatched a decision for `key` to `target` under the
@@ -280,7 +338,9 @@ impl SessionTable {
 
     /// Forget every key whose TTL passed, once per the table's sweep
     /// interval; a table without one (no rule has a TTL) never walks its
-    /// shards.
+    /// shards. Always inlined with its one caller ([`Self::lookup`]): the
+    /// check is two compares on the pin's path.
+    #[inline(always)]
     fn sweep_if_due(&self, now_micros: u64) {
         if self.sweep_micros == 0 {
             return;
@@ -308,6 +368,20 @@ impl SessionTable {
     pub fn pins(&self, key: Session) -> Option<Pins> {
         let key = key.get();
         self.shard(key).lock().get(&key).map(|e| e.pins)
+    }
+
+    /// What a host keeps of `key` beside its own pin of record: the pins,
+    /// and when the table forgets the key.
+    pub fn held(&self, key: Session) -> Option<(Pins, Forgets)> {
+        let key = key.get();
+        self.shard(key).lock().get(&key).map(|entry| {
+            let forgets = match entry.expires_at_micros {
+                0 => Forgets::Unread,
+                u64::MAX => Forgets::Never,
+                at => Forgets::At(at),
+            };
+            (entry.pins, forgets)
+        })
     }
 
     /// Keys the table holds.
@@ -427,6 +501,37 @@ mod tests {
         // hourly key stays.
         assert_eq!(table.lookup(s(2), 2_000, &RULE), [WorkerId(0); 2]);
         assert_eq!(table.pins(s(1)), Some([WorkerId(1), WorkerId(0)]));
+    }
+
+    /// A host reads a key's pins with the instant its rule forgets it, and
+    /// no instant under a rule without a TTL. A key a dispatch alone wrote
+    /// is held unread.
+    #[test]
+    fn a_key_is_held_with_the_instant_its_rule_forgets_it() {
+        let table = SessionTable::new(RULE.sweep_micros);
+        assert_eq!(table.held(s(1)), None);
+        table.lookup(s(1), 50, &RULE);
+        table.dispatched(s(1), SessionVerdict::Pinned, WorkerId(1));
+        assert_eq!(
+            table.held(s(1)),
+            Some(([WorkerId(1), WorkerId(0)], Forgets::At(1_050)))
+        );
+        let for_ever = SessionRule {
+            ttl_micros: None,
+            sweep_micros: 0,
+            ..RULE
+        };
+        table.lookup(s(2), 50, &for_ever);
+        table.dispatched(s(2), SessionVerdict::Pinned, WorkerId(2));
+        assert_eq!(
+            table.held(s(2)),
+            Some(([WorkerId(2), WorkerId(0)], Forgets::Never))
+        );
+        table.dispatched(s(3), SessionVerdict::Pinned, WorkerId(3));
+        assert_eq!(
+            table.held(s(3)),
+            Some(([WorkerId(3), WorkerId(0)], Forgets::Unread))
+        );
     }
 
     /// A key whose TTL passed is forgotten at its next lookup even when no
@@ -673,6 +778,46 @@ mod tests {
             Some([WorkerId(1), WorkerId(3)]),
             "a commit elsewhere by another request confirms nothing"
         );
+    }
+
+    #[test]
+    fn a_pin_of_record_is_restored_where_the_key_has_none_and_is_no_claim() {
+        let table = SessionTable::new(RULE.sweep_micros);
+        assert_eq!(table.lookup(s(7), 10, &RULE), [WorkerId(0); 2]);
+        assert_eq!(
+            table.restore(s(7), 10, &RULE, WorkerId(3)),
+            [WorkerId(3), WorkerId(0)]
+        );
+        // A second restore, of another worker, keeps the first: two first
+        // requests of one key agree.
+        assert_eq!(
+            table.restore(s(7), 11, &RULE, WorkerId(4)),
+            [WorkerId(3), WorkerId(0)]
+        );
+        // It is a pin a dispatch made, no claim: a commit elsewhere under a
+        // claim's verdict withdraws nothing, and the pins move by the rule.
+        table.dispatched(s(7), SessionVerdict::Claimed(WorkerId(3)), WorkerId(5));
+        assert_eq!(table.pins(s(7)), Some([WorkerId(5), WorkerId(3)]));
+        // An empty key or worker writes nothing.
+        assert_eq!(
+            table.restore(s(8), 10, &RULE, WorkerId(0)),
+            [WorkerId(0); 2]
+        );
+        assert_eq!(table.pins(s(8)), None);
+    }
+
+    #[test]
+    fn a_restored_pin_on_a_key_the_table_dropped_lives_by_the_rules_ttl() {
+        // The key's entry left the table between the decision's read and
+        // the write (a worker's leave drops a key with no pin): the pin
+        // restored is the key's from that instant, for one TTL.
+        let table = SessionTable::new(RULE.sweep_micros);
+        assert_eq!(
+            table.restore(s(9), 10, &RULE, WorkerId(3)),
+            [WorkerId(3), WorkerId(0)]
+        );
+        assert_eq!(table.lookup(s(9), 11, &RULE), [WorkerId(3), WorkerId(0)]);
+        assert_eq!(table.lookup(s(9), 1_011, &RULE), [WorkerId(0); 2]);
     }
 
     #[test]

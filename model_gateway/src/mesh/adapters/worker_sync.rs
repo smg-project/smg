@@ -72,18 +72,18 @@ use std::{
 
 use parking_lot::Mutex;
 use smg_mesh::{gossip::NodeStatus, ClusterState, CrdtNamespace, WorkerState};
+use smg_service_discovery::DISCOVERY_ID_LABEL;
+use smg_worker::{
+    identity::{
+        basic::{ConnectionMode, Worker},
+        endpoint::{endpoint_key, Endpoint, EndpointKey},
+    },
+    registry::{event::WorkerEvent, RemoteWorkerState, WorkerId, WorkerOrigin},
+};
 use tokio::{sync::broadcast, time::Instant};
 use tracing::{debug, info, warn};
 
-use crate::{
-    service_discovery::DISCOVERY_ID_LABEL,
-    worker::{
-        endpoint_key,
-        identity::endpoint::Endpoint,
-        registry::{event::WorkerEvent, WorkerId},
-        ConnectionMode, EndpointKey, RemoteWorkerState, Worker, WorkerOrigin, WorkerRegistry,
-    },
-};
+use crate::routers::common::snapshot::WorkerRegistry;
 
 const PREFIX: &str = "worker:";
 
@@ -1012,11 +1012,12 @@ mod tests {
 
     use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
     use smg_mesh::{gossip::NodeState, MergeStrategy, MeshKV};
+    use smg_worker::identity::basic::WorkerType;
     use tokio::{sync::mpsc::error::TryRecvError, time::sleep};
     use tracing_test::traced_test;
 
     use super::*;
-    use crate::worker::{BasicWorkerBuilder, WorkerType};
+    use crate::routers::grpc::backend_client::BasicWorkerBuilder;
 
     fn worker_namespace(mesh: &MeshKV) -> Arc<CrdtNamespace> {
         mesh.configure_crdt_prefix(PREFIX, MergeStrategy::LastWriterWins)
@@ -1188,6 +1189,42 @@ mod tests {
             sleep(Duration::from_millis(10)).await;
         }
         panic!("registry did not see the remote worker");
+    }
+
+    /// The record's health is the import's status. Every other case here
+    /// sends a healthy record, so the field the conversion moves is read
+    /// here: an unhealthy record is imported not ready, and the owner's
+    /// next record, healthy, makes the import ready.
+    #[tokio::test]
+    async fn a_remote_records_health_is_the_imports_status() {
+        let mesh = MeshKV::new("node-a".into());
+        let ns = worker_namespace(&mesh);
+
+        let registry = Arc::new(WorkerRegistry::new());
+        let subscriber = adapter(ns.clone(), registry.clone());
+        subscriber.start();
+
+        let publisher = adapter(ns, Arc::new(WorkerRegistry::new()));
+        let unhealthy = WorkerState {
+            health: false,
+            ..sample_state("w1", "http://remote:8080")
+        };
+        publisher.on_worker_changed("w1", &unhealthy);
+        let status = || {
+            registry
+                .get_by_url("http://remote:8080")
+                .map(|worker| worker.status())
+        };
+        assert!(
+            wait_for(|| matches!(status(), Some(WorkerStatus::NotReady))).await,
+            "an unhealthy record is imported not ready"
+        );
+
+        publisher.on_worker_changed("w1", &sample_state("w1", "http://remote:8080"));
+        assert!(
+            wait_for(|| matches!(status(), Some(WorkerStatus::Ready))).await,
+            "the owner's healthy record makes the import ready"
+        );
     }
 
     #[tokio::test]

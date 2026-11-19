@@ -42,6 +42,7 @@ from smg_grpc_servicer.mm_sidecar_protocol import (
     failure,
     resolve_namespace,
 )
+from smg_grpc_servicer.vllm.media_host_guard import media_connector_kwargs
 from smg_grpc_servicer.vllm.media_refs import advertised_schemes, parse_scheme_list, url_scheme
 from smg_grpc_servicer.vllm.mm_processor import (
     MmSettings,
@@ -64,10 +65,11 @@ RECONNECT_PAUSE_S = 1
 # The worker settings this process runs on, and the flags it spells them as.
 # The worker's job timeout is not one of them: it reaches the sidecar as
 # each job's deadline.
-SIDECAR_SETTINGS = ("redis_url", "sidecar_namespace")
+SIDECAR_SETTINGS = ("redis_url", "sidecar_namespace", "allow_private_media_hosts")
 SIDECAR_FLAGS = {
     "redis_url": "--redis-url",
     "sidecar_namespace": "--namespace",
+    "allow_private_media_hosts": "--allow-private-media-hosts",
 }
 # The least time a finished job's answer gets to reach the requester.
 PUSH_FLOOR_S = 5
@@ -149,6 +151,12 @@ class Sidecar:
         self._max_video_frames = env_int(
             os.environ, ENV_MAX_VIDEO_FRAMES, DEFAULT_MAX_VIDEO_FRAMES, minimum=0
         )
+        # The allow-list vLLM checks the first URL against and the guarded
+        # connection every hop goes through, both read as the router reads it.
+        connector_kwargs = media_connector_kwargs(
+            model_config.allowed_media_domains,
+            bool(settings is not None and settings.allow_private_media_hosts),
+        )
         # The fingerprint keeps the engine's kwargs: the budget bounds this
         # sidecar's sampling, it does not describe a different engine.
         self._connector = MEDIA_CONNECTOR_REGISTRY.load(
@@ -157,7 +165,7 @@ class Sidecar:
                 mm_config.media_io_kwargs, self._max_video_frames, vllm_default_video_frames()
             ),
             allowed_local_media_path=model_config.allowed_local_media_path,
-            allowed_media_domains=model_config.allowed_media_domains,
+            **connector_kwargs,
         )
         self._video_processor = get_video_processor_cls_name(model_config)
         self._schemes = advertised_schemes(model_config.allowed_local_media_path)
@@ -170,9 +178,9 @@ class Sidecar:
                 self._short_side_floor.floor,
             )
         self._started_at = time.time()
-        if not model_config.allowed_media_domains:
+        if not connector_kwargs["allowed_media_domains"]:
             logger.warning(
-                "no --allowed-media-domains: this sidecar will fetch media from any host"
+                "no --allowed-media-domains: this sidecar will fetch media from any public host"
             )
 
     async def run(self) -> None:
@@ -436,6 +444,7 @@ async def serve(args: argparse.Namespace) -> None:
     settings = MmSettings(
         redis_url=getattr(args, "redis_url", None),
         sidecar_namespace=getattr(args, "namespace", None),
+        allow_private_media_hosts=getattr(args, "allow_private_media_hosts", None),
     ).resolve(only=SIDECAR_SETTINGS, flags=SIDECAR_FLAGS)
     logger.info(
         "media sidecar settings: redis_url=%s namespace=%s (%s)",
@@ -489,6 +498,14 @@ def build_parser(add_engine_args, parser_cls=argparse.ArgumentParser):
         help="override the derived key namespace (falls back to SMG_VLLM_MM_SIDECAR_NAMESPACE)",
     )
     parser.add_argument("--concurrency", type=int, default=2)
+    parser.add_argument(
+        "--allow-private-media-hosts",
+        action="store_const",
+        const=True,
+        default=None,
+        help="fetch media from loopback, link-local and private addresses too "
+        "(falls back to SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS; refused by default)",
+    )
     return add_engine_args(parser)
 
 

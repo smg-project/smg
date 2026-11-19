@@ -72,6 +72,15 @@ impl Scorer for Pack {
         }
     }
 
+    /// This scorer only places, and by the engines' own reports: it turns
+    /// no request away. Saying so leaves a price: a stage that says
+    /// nothing is taken as one that may refuse a request by what the
+    /// gateways report of leases, and each decision under it applies those
+    /// reports first.
+    fn refuses_by_reports(&self) -> bool {
+        false
+    }
+
     fn score(
         &self,
         _: &RequestFacts<'_>,
@@ -220,6 +229,10 @@ mod tests {
                     ..WorkerFacts::default()
                 })
                 .id();
+            // The store dates the build a registration owes by its own
+            // clock, and the fleet's windows are counted, not timed: the
+            // build is asked for here, as a host with no loop asks.
+            store.publish_now();
             let revision = WorkersStore::get(store, id).expect("the row").revision;
             store
                 .set_status(id, WorkerStatus::Ready, revision)
@@ -360,6 +373,18 @@ mod tests {
         // prober takes out of rotation is not picked, however busy.
         fleet.set(fleet.busy, WorkerStatus::NotReady);
         assert_eq!(fleet.pick(&engine), Some(fleet.idle));
+    }
+
+    #[test]
+    fn a_join_is_in_force_however_far_the_real_clock_ran() {
+        let mut fleet = Fleet::new();
+        // The fleet's windows are counted from its start, and real time
+        // passes four of them before the join: its build is not left to a
+        // window the store's clock is already past.
+        std::thread::sleep(PUBLISH_WINDOW * 4);
+        fleet.join_unreported("late");
+        fleet.report(fleet.busy, 0, 0);
+        assert_eq!(fleet.scores(), [1.0; 3]);
     }
 
     #[test]

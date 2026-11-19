@@ -142,18 +142,16 @@ impl RetryExecutor {
         let max = config.max_retries.max(1);
         let mut attempt: u32 = 0;
         loop {
-            match operation(attempt).await {
-                Ok(val) => return Ok(val),
-                Err(()) => {
-                    let is_last = attempt + 1 >= max;
-                    if is_last {
-                        return Err(RetryError::MaxRetriesExceeded);
-                    }
-                    let delay = BackoffCalculator::calculate_delay(config, attempt);
-                    attempt += 1;
-                    tokio::time::sleep(delay).await;
-                }
+            if let Ok(val) = operation(attempt).await {
+                return Ok(val);
             }
+            let is_last = attempt + 1 >= max;
+            if is_last {
+                return Err(RetryError::MaxRetriesExceeded);
+            }
+            let delay = BackoffCalculator::calculate_delay(config, attempt);
+            attempt += 1;
+            tokio::time::sleep(delay).await;
         }
     }
 

@@ -24,12 +24,12 @@ const SUBSCRIPTION: &str = "each replica hears the engines' cache events itself"
 const DISPATCHED: &str = "a new leader reads dispatched leases from the engines' in-flight \
                           snapshots and rebuilds credits from its own tally";
 const PINS: &str = "pins, reservations and lease ends are journaled once pins have one table";
-const GENERATION: &str =
-    "the applied generation joins the watched kinds with the step that journals an apply";
+const PUBLISHED: &str = "every replica publishes its own world";
 
 /// The list: `(trait or type, entry, fate)`, each in its file's own order.
 pub const ENTRIES: &[(&str, &str, Fate)] = &[
     ("WorkersStore", "upsert", Fate::Journaled),
+    ("WorkersStore", "upsert_by", Fate::Journaled),
     ("WorkersStore", "patch", Fate::Journaled),
     ("WorkersStore", "remove", Fate::Journaled),
     ("WorkersStore", "set_status", Fate::Journaled),
@@ -38,6 +38,8 @@ pub const ENTRIES: &[(&str, &str, Fate)] = &[
     ("WorkersStore", "epoch", Fate::Read),
     ("WorkersStore", "snapshot", Fate::Read),
     ("WorkersStore", "changes_since", Fate::Read),
+    // A replica's own count of the restores it took: nothing of it crosses.
+    ("WorkersStore", "history", Fate::Read),
     // The status a verdict moves is journaled as the status write it makes.
     // The streak between two moves is the prober's own count: a promoted
     // standby's prober starts it again.
@@ -58,6 +60,7 @@ pub const ENTRIES: &[(&str, &str, Fate)] = &[
     // standby holds the verdict of the engine's last rows until its own
     // first poll.
     ("LoadSink", "report", Fate::Journaled),
+    ("LoadSink", "report_sampled", Fate::Journaled),
     ("LoadSink", "poll_mode", Fate::Read),
     // The report period is the load driver's own setting, told where the
     // driver is built: every replica builds its own.
@@ -74,11 +77,8 @@ pub const ENTRIES: &[(&str, &str, Fate)] = &[
         Fate::NotYet("no caller yet: its first caller brings its event"),
     ),
     ("LoadSink", "publish_due", Fate::Read),
-    (
-        "LoadSink",
-        "publish",
-        Fate::Rebuilt("every replica publishes its own world"),
-    ),
+    ("LoadSink", "publish", Fate::Rebuilt(PUBLISHED)),
+    ("LoadSink", "wake_with", Fate::Read),
     ("KvEventSink", "admit", Fate::Rebuilt(SUBSCRIPTION)),
     ("KvEventSink", "reconnected", Fate::Rebuilt(SUBSCRIPTION)),
     ("KvEventSink", "resync", Fate::Rebuilt(SUBSCRIPTION)),
@@ -91,6 +91,7 @@ pub const ENTRIES: &[(&str, &str, Fate)] = &[
     ("ReservationStore", "release", Fate::NotYet(PINS)),
     ("ReservationStore", "held", Fate::Read),
     ("SessionsStore", "pin", Fate::NotYet(PINS)),
+    ("SessionsStore", "pin_no_earlier", Fate::NotYet(PINS)),
     ("SessionsStore", "lookup", Fate::Read),
     ("SessionsStore", "unpin", Fate::NotYet(PINS)),
     ("SessionsStore", "drop_worker", Fate::NotYet(PINS)),
@@ -102,31 +103,54 @@ pub const ENTRIES: &[(&str, &str, Fate)] = &[
     // The term is told to the journal: every later position is under it.
     ("LeasesStore", "set_term", Fate::Journaled),
     ("LeasesStore", "issue", Fate::NotYet(PINS)),
+    ("LeasesStore", "issue_pair", Fate::NotYet(PINS)),
     ("LeasesStore", "dispatched", Fate::Rebuilt(DISPATCHED)),
     ("LeasesStore", "completed", Fate::NotYet(PINS)),
     ("LeasesStore", "released", Fate::NotYet(PINS)),
     ("LeasesStore", "get", Fate::Read),
+    ("LeasesStore", "sides", Fate::Read),
     ("LeasesStore", "expire", Fate::NotYet(PINS)),
     ("LeasesStore", "restore", Fate::Rebuilt(HELLO)),
-    ("LeasesStore", "drop_gateway", Fate::NotYet(PINS)),
+    ("LeasesStore", "drop_gateways", Fate::NotYet(PINS)),
     ("LeasesStore", "live", Fate::Read),
-    // The store type's own entries. A generation's apply is its one write:
-    // a standby holds the generation applied to it, not its leader's.
+    // The store type's own entries. A generation's apply is its one write.
     ("MemoryStore", "new", Fate::Read),
     ("MemoryStore", "with_publish_window", Fate::Read),
     ("MemoryStore", "journaled", Fate::Read),
     ("MemoryStore", "followed", Fate::Read),
     ("MemoryStore", "cut", Fate::Read),
-    ("MemoryStore", "apply", Fate::NotYet(GENERATION)),
+    ("MemoryStore", "rows_serving", Fate::Read),
+    (
+        "MemoryStore",
+        "restore_from",
+        Fate::Rebuilt("the journal starts again: a reader re-syncs from this store's own snapshot"),
+    ),
+    // The three doors for a followed write, one a kind of the leader's
+    // events: each is the standby's side of a journaled write.
+    ("MemoryStore", "follow", Fate::Journaled),
+    ("MemoryStore", "follow_load", Fate::Journaled),
+    ("MemoryStore", "follow_term", Fate::Journaled),
+    // The generation's number is journaled, one of the watched kinds. The
+    // document it runs from is its door's to hold: whoever sends the event
+    // joins the two, and a standby applies the document through its own
+    // door under the leader's number.
+    ("MemoryStore", "apply", Fate::Journaled),
+    ("MemoryStore", "follow_generation", Fate::Journaled),
+    ("MemoryStore", "follow_generation_place", Fate::Journaled),
     ("MemoryStore", "world", Fate::Read),
     ("MemoryStore", "build_view", Fate::Read),
     ("MemoryStore", "with_world", Fate::Read),
     ("MemoryStore", "build_pair", Fate::Read),
+    ("MemoryStore", "build_encode_pair", Fate::Read),
     ("MemoryStore", "deciding", Fate::Read),
     ("MemoryStore", "micros", Fate::Read),
+    ("MemoryStore", "publish_now", Fate::Rebuilt(PUBLISHED)),
+    ("MemoryStore", "counts", Fate::Read),
     ("MemoryStore", "overload_flips", Fate::Read),
     ("MemoryStore", "outside_lists", Fate::Read),
     ("MemoryStore", "publication_allocations", Fate::Read),
+    ("MemoryStore", "publications", Fate::Read),
+    ("MemoryStore", "membership_builds", Fate::Read),
     ("MemoryStore", "resyncs", Fate::Read),
     ("MemoryStore", "indexed_blocks", Fate::Read),
     ("MemoryStore", "lane_counts", Fate::Read),

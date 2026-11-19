@@ -820,6 +820,8 @@ impl<P: EngineProtocol> ClientInner<P> {
             if let Some(load) = routing.load.get_mut(&engine_index) {
                 load.num_running = 0;
                 load.num_waiting = 0;
+                load.num_resident_tokens = load.num_resident_tokens.map(|_| 0);
+                load.num_waiting_uncached_tokens = load.num_waiting_uncached_tokens.map(|_| 0);
             }
         }
     }
@@ -1059,23 +1061,24 @@ impl<P: EngineProtocol> ClientInner<P> {
             })
     }
 
-    /// Tell every rank to start `wave`. Does nothing for a protocol without a
-    /// wave protocol.
+    /// Queue a START_DP_WAVE for `wave` to every rank, returning where each
+    /// write's result arrives. Does nothing for a protocol without a wave
+    /// protocol.
     ///
     /// No rank is excluded, not even the one already holding the request: a
     /// rank that skips an update keeps a lower `current_wave` than its peers,
     /// and the group's wave numbers must stay identical for
     /// [`Self::wake_group`]'s ordering argument to hold.
-    async fn broadcast_start_wave(&self, wave: u64) -> Result<()> {
+    ///
+    /// Every rank's frame is queued before any is waited for: a window that
+    /// runs out (a frame is blocked ahead in the queue) then never leaves the
+    /// group half woken; the wake reaches every rank when the engine reads
+    /// again.
+    fn queue_start_wave_writes(&self, wave: u64) -> Result<Vec<oneshot::Receiver<Result<()>>>> {
         let Some((frame, payload)) = P::encode_start_wave(wave)? else {
-            return Ok(());
+            return Ok(Vec::new());
         };
-        // Every rank's frame is queued before any is waited for: a window that
-        // runs out (a frame is blocked ahead in the queue) then never leaves
-        // the group half woken; the wake reaches every rank when the engine
-        // reads again.
-        let pending = self
-            .engines
+        self.engines
             .iter()
             .map(|engine| {
                 self.queue_write(
@@ -1086,13 +1089,12 @@ impl<P: EngineProtocol> ClientInner<P> {
                     None,
                 )
             })
-            .collect::<Result<Vec<_>>>()?;
-        self.await_writes(pending).await
+            .collect()
     }
 
-    /// [`Self::broadcast_start_wave`] without waiting for the engines to
-    /// accept the frames: the dispatcher's wake, which must keep routing the
-    /// output of every rank while a frame ahead in the queue is blocked.
+    /// [`Self::queue_start_wave_writes`] without a result to wait for: the
+    /// dispatcher's wake, which must keep routing the output of every rank
+    /// while a frame ahead in the queue is blocked.
     fn queue_start_wave(&self, wave: u64) -> Result<()> {
         let Some((frame, payload)) = P::encode_start_wave(wave)? else {
             return Ok(());
@@ -1120,9 +1122,10 @@ impl<P: EngineProtocol> ClientInner<P> {
     /// The wake is UNCONDITIONAL for a lockstep group. Gating it on the
     /// tracked `running` flag raced the drain: between the ranks agreeing to
     /// park and this client processing their `wave_complete`, a submit would
-    /// see a stale "running" state, skip the wake, and — without a
-    /// coordinator, a parked engine does not self-wake on ADD — strand the
-    /// request until the silence watchdog killed the group.
+    /// see a stale "running" state and skip the wake. Without a coordinator
+    /// nothing else wakes the holder's peers: the holder steps on its own
+    /// request and blocks alone in the all-reduce, stranding the request
+    /// until the silence watchdog killed the group.
     ///
     /// The wave number is a logical clock this client owns, bumped on every
     /// wake, and an engine only obeys a wave at or above its own. Bumping is
@@ -1134,19 +1137,36 @@ impl<P: EngineProtocol> ClientInner<P> {
     /// engine. Bumping keeps us ahead: every rank sits at the last number we
     /// broadcast plus at most one self-increment (a second needs another wave,
     /// which needs another wake), so `last + 1` is never stale.
+    ///
+    /// Bumping alone does not cover a wake that lands on SOME ranks before the
+    /// park and on others after it: the early readers adopt it while still
+    /// running and then park past it, the late readers start the wave without
+    /// them. [`Self::observe_wave`] closes that hole by re-waking when the
+    /// group reports a park while a prompt it was handed is still unanswered
+    /// ([`RequestRegistry::take_rewake`]).
+    ///
+    /// The wake is numbered and queued under the clock's lock
+    /// ([`Self::queue_next_wave`]), so every rank reads the wakes in
+    /// numbering order: a re-wake numbered after this one can never overtake
+    /// it in a rank's input. Only the wait for the engines to accept the
+    /// frames happens outside it.
     async fn wake_group(&self) -> Result<()> {
-        let Some(wave) = self.next_wave() else {
+        let Some(pending) = self.queue_next_wave(|wave| self.queue_start_wave_writes(wave)) else {
             return Ok(());
         };
-        self.broadcast_start_wave(wave).await
+        self.await_writes(pending?).await
     }
 
-    /// Bump the group's wave clock for a wake; `None` for independent ranks.
-    fn next_wave(&self) -> Option<u64> {
+    /// Bump the group's wave clock for a wake and hand the new number to
+    /// `queue`, which queues the wake, all under the clock's lock: wakes
+    /// reach the input queue in the order they are numbered. `queue` only
+    /// queues frames (no lock of its own, no wait). `None` for independent
+    /// ranks.
+    fn queue_next_wave<T>(&self, queue: impl FnOnce(u64) -> Result<T>) -> Option<Result<T>> {
         let state = self.wave.as_ref()?;
         let mut current = state.lock();
         *current = current.saturating_add(1);
-        Some(*current)
+        Some(queue(*current))
     }
 
     /// Fold a wave notification from an engine into the group's clock. Never
@@ -1215,10 +1235,9 @@ impl<P: EngineProtocol> ClientInner<P> {
     /// keeps flowing), and the wake reaches the whole group when the engine
     /// reads again. `wave` and `why` name the notification it answers.
     fn queue_wake(&self, wave: u64, why: &str) {
-        let queued = match self.next_wave() {
-            Some(next) => self.queue_start_wave(next),
-            None => Ok(()),
-        };
+        let queued = self
+            .queue_next_wave(|next| self.queue_start_wave(next))
+            .unwrap_or(Ok(()));
         if let Err(error) = queued {
             warn!(%error, wave, "failed to queue the wake for {why}");
         }

@@ -6,7 +6,8 @@
 //! (`smg:policy/policy`, the view as records) or the packed world
 //! (`smg:policy/policy-packed`, the view as the bytes of the WIT's layout
 //! table); the host reads which from its exports. The host accepts
-//! `smg:policy@1.x` up to [`Abi::SUPPORTED_MINOR`] and a spec may pin the
+//! `smg:policy@1.x` from [`Abi::FLOOR_MINOR`] up to
+//! [`Abi::SUPPORTED_MINOR`] and a spec may pin the
 //! version. `examples/wasm/wasm-guest-policy` is a record-world module to
 //! copy, with its build line; `tests/wasm_example.rs` loads what that line
 //! builds.
@@ -16,10 +17,24 @@
 //! functions: a rate-limited log with a level cap, the decision's clock, the
 //! counters the spec declared, and a draw from the decision's seed.
 //!
-//! How a module runs: one instance per module per deciding thread, created
-//! at apply ([`Plugin::warm`] on every shard thread; a thread that was not
-//! warmed instantiates at its first decision and the plugin counts it) and
-//! kept. Each profile that binds the plugin holds one [`Bound`] set, taken
+//! How a module runs: one instance per module per decider, created at apply
+//! ([`Plugin::warm`] as every decider; one that was not warmed instantiates
+//! at its first decision and the plugin counts it) and kept. A decider is a
+//! thread that decides, or the name a host gives one of its deciders
+//! ([`Decider`](crate::decider::Decider)): a named decider's instance rests
+//! with the name and is brought to the thread that acts as it, for a
+//! decision or a told event, so it is one instance whichever thread holds
+//! the decider's turn. The apply's own instance goes to the first decider
+//! that needs one. A thread that names no decider and never decided with the
+//! plugin only tells: a lease's event or a signal it tells reaches no
+//! instance and makes none ([`Stats::events_dropped`]). The membership is
+//! fed apart, to a plugin whose row lists it: the host tells a change once,
+//! on whatever thread, with no guest call there, and every instance hears it
+//! before its decider's next decision or told event, one call a change. An
+//! instance new to the feed, or behind more than the 64 changes the feed
+//! keeps, hears the membership as it stands, as one snapshot of ids: the
+//! models a worker left, among the changes it missed, are not told. Each
+//! profile that binds the plugin holds one [`Bound`] set, taken
 //! from its engine build's [`Binder`] (one adapter of a build forwards the
 //! lifecycle, so an event reaches the plugin once per engine); the
 //! engine opens it once per decision over the profile's view (a pair
@@ -116,6 +131,21 @@
 //! never forwarded: the stages fall back and the breaker counts a budget
 //! hit, the instance standing.
 //!
+//! What a module hears: `observe` is called with the kinds of lifecycle
+//! event the plugin's row lists ([`PluginSpec::observes`]), none by default.
+//! A lease's event or a signal is told on the thread that tells it, on the
+//! instance of the decider that thread acts as; a membership change reaches
+//! an instance on the thread that acts as its decider (the feed, above).
+//! Either call is a told event's: it runs under a frame of its own (the
+//! plugin's frame budget, a millisecond where the row sets none), outside
+//! every decision's budget. So a decision that opens behind the feed waits
+//! for the changes it missed, at most the 64 the feed keeps, or for one
+//! snapshot, before its first stage call. A row that lists none is never
+//! told: no call is made, and a thread that only tells makes no instance. A
+//! row that lists any has its plugin's scorer and picker say they need the
+//! lifecycle's calls ([`crate::Lifecycle::needs_lifecycle`]), so a host
+//! that makes none refuses them.
+//!
 //! What a failure does: a `decline` falls back to the stage's configured
 //! fallback and keeps the instance; a trap, an exhausted budget or an answer
 //! that breaks a validity rule (a duplicate or out-of-range filter position,
@@ -166,7 +196,10 @@ pub mod config;
 mod plugin;
 mod view;
 
-pub use config::{Abi, BreakerSpec, Exposure, Failure, HeaderSet, LogLimit, PluginSpec, Reveal};
+pub use config::{
+    Abi, BreakerSpec, EventKind, EventSet, Exposure, Failure, HeaderSet, LogLimit, PluginSpec,
+    Reveal,
+};
 pub use plugin::{Binder, Bound, LoadError, Plugin, Runtime, Stats, World};
 /// The packed form's layout, as the WIT's table names it.
 pub use view::layout;

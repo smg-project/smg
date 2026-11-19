@@ -5,8 +5,14 @@
 //! - `policy_store_journal/load_write/<plain|watched|journaled>/<n>`: one
 //!   load record's write inside the publication window; `watched` is a
 //!   journal of the watched kinds alone, which carries no load row;
-//! - `policy_store_journal/status_write/<plain|journaled>/<n>`: one status
-//!   flip of a member, published at once;
+//! - `policy_store_journal/status_write/<plain|journaled|told>/<n>`: one
+//!   status flip of a member, published at once; `told` is the journaled
+//!   write on a log with a listener of the watched kinds, as a controller
+//!   with a watch open has: the write's telling is in the cell. Under the
+//!   `worker-host` feature `followed` is that write with the worker
+//!   objects following the store: the listener wakes their follower, which
+//!   reads the store's tail on a thread of its own and waits again. The
+//!   wake is in the cell. For a run pinned to two cores; no gate reads it;
 //! - `policy_store_journal/member_write/<plain|journaled>/<n>`: one refresh
 //!   of a member's facts, the pool derived again;
 //! - `policy_store_journal/view_build/<plain|journaled>/<n>`: one
@@ -15,6 +21,10 @@
 //!   clock cannot;
 //! - `policy_store_journal/read/<events>`: one reader's copy of a batch out
 //!   of the log, the longest the log's lock is held;
+//! - `policy_store_journal/read/watched_at_head`: a watch's read of the
+//!   watched kinds at their head, beside the load rows: nothing to copy,
+//!   the lock and the look at the log alone. The log of the three read
+//!   cells holds a full ring of the watched kinds;
 //! - `policy_store_journal/cut/<watched|every>/<n>`: one cut of the tables
 //!   of the watched kinds or of every kind: the copy a writer of those
 //!   tables waits for, and the sort after it;
@@ -31,6 +41,9 @@
     reason = "a bench's setup has no caller to answer"
 )]
 
+#[path = "common/filled.rs"]
+mod filled;
+
 use std::{
     hint::black_box,
     sync::{
@@ -41,7 +54,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{
+    criterion_group, criterion_main, measurement::WallTime, BenchmarkGroup, BenchmarkId, Criterion,
+};
+#[cfg(feature = "worker-host")]
+use smg_policy_controller::worker_host::{Members, Objects};
 use smg_policy_controller::{
     replication::Log,
     store::{
@@ -50,6 +67,10 @@ use smg_policy_controller::{
     },
     LoadRow, Role, SignalSource, WorkerId,
 };
+#[cfg(feature = "worker-host")]
+use smg_worker::registry::WorkerRegistry;
+#[cfg(feature = "worker-host")]
+use tokio::{runtime::Builder, sync::Notify, task::JoinSet};
 
 const SIZES: [usize; 3] = [8, 64, 512];
 const MODEL: &str = "m";
@@ -100,7 +121,15 @@ struct Pool {
 }
 
 fn pool_of(n: usize, loads: Option<usize>) -> Pool {
-    let log = loads.map(|loads| Arc::new(Log::new(WATCHED, loads)));
+    pool_on(n, loads.map(|loads| Log::new(WATCHED, loads)))
+}
+
+/// How a cell builds its pool of so many members.
+type PoolOf = fn(usize) -> Pool;
+
+/// [`pool_of`] on `log`.
+fn pool_on(n: usize, log: Option<Log>) -> Pool {
+    let log = log.map(Arc::new);
     let store = match &log {
         Some(log) => MemoryStore::journaled(Arc::clone(log) as _),
         None => MemoryStore::new(),
@@ -111,6 +140,7 @@ fn pool_of(n: usize, loads: Option<usize>) -> Pool {
     let ids: Vec<WorkerId> = (0..n)
         .map(|index| {
             let id = store.upsert(facts(index, 0)).id();
+            store.publish_now();
             let revision = WorkersStore::get(&store, id).expect("the row").revision;
             store
                 .set_status(id, WorkerStatus::Ready, revision)
@@ -121,6 +151,7 @@ fn pool_of(n: usize, loads: Option<usize>) -> Pool {
         .collect();
     let opened = opened + PUBLISH_WINDOW;
     store.publish(opened);
+    filled::filled(&store, MODEL, Role::Single, n);
     Pool {
         store,
         log,
@@ -168,28 +199,78 @@ fn load_write(c: &mut Criterion) {
 
 fn status_write(c: &mut Criterion) {
     let mut group = c.benchmark_group("policy_store_journal/status_write");
-    for (kind, loads) in KINDS {
+    let pools: [(&str, PoolOf); 3] = [
+        ("plain", |n| pool_of(n, None)),
+        ("journaled", |n| pool_of(n, Some(LOADS))),
+        // The listener does nothing: the cell holds what the log's telling
+        // adds to the write, and none of a watch's work.
+        ("told", |n| {
+            pool_on(n, Some(Log::new(WATCHED, LOADS).on_watched(|| {})))
+        }),
+    ];
+    for (kind, build) in pools {
         for n in SIZES {
-            let pool = pool_of(n, loads);
-            let id = pool.ids[n / 2];
-            let mut ready = true;
-            group.bench_with_input(BenchmarkId::new(kind, n), &n, |b, _| {
-                b.iter(|| {
-                    ready = !ready;
-                    let status = if ready {
-                        WorkerStatus::Ready
-                    } else {
-                        WorkerStatus::NotReady
-                    };
-                    let revision = WorkersStore::get(&pool.store, id)
-                        .expect("the row")
-                        .revision;
-                    black_box(pool.store.set_status(id, status, revision));
-                });
-            });
+            flips(&mut group, kind, n, &build(n));
         }
     }
+    #[cfg(feature = "worker-host")]
+    followed(&mut group);
     group.finish();
+}
+
+/// One status flip of the pool's middle member, published at once.
+fn flips(group: &mut BenchmarkGroup<'_, WallTime>, kind: &str, n: usize, pool: &Pool) {
+    let id = pool.ids[n / 2];
+    let mut ready = true;
+    group.bench_with_input(BenchmarkId::new(kind, n), &n, |b, _| {
+        b.iter(|| {
+            ready = !ready;
+            let status = if ready {
+                WorkerStatus::Ready
+            } else {
+                WorkerStatus::NotReady
+            };
+            let revision = WorkersStore::get(&pool.store, id)
+                .expect("the row")
+                .revision;
+            black_box(pool.store.set_status(id, status, revision));
+        });
+    });
+}
+
+/// The `told` write with the worker objects following the store, as a
+/// controller that hosts them has: the log's listener wakes their follower
+/// on a runtime thread of its own, and each wake reads the store's tail to
+/// its end. A status change builds nothing there, so the cell holds the
+/// wake and what the follower's read takes of the store's lock.
+#[cfg(feature = "worker-host")]
+fn followed(group: &mut BenchmarkGroup<'_, WallTime>) {
+    let runtime = Builder::new_multi_thread()
+        .worker_threads(1)
+        .build()
+        .expect("a runtime");
+    for n in SIZES {
+        let moved = Arc::new(Notify::new());
+        let told = Arc::clone(&moved);
+        let log = Log::new(WATCHED, LOADS).on_watched(move || told.notify_one());
+        let pool = Arc::new(pool_on(n, Some(log)));
+        let objects = Objects::new(Arc::new(WorkerRegistry::<Members>::new()));
+        // Ended with the set, at the end of this size.
+        let mut follower = JoinSet::new();
+        follower.spawn_on(
+            {
+                let pool = Arc::clone(&pool);
+                async move {
+                    loop {
+                        objects.follow(&pool.store);
+                        moved.notified().await;
+                    }
+                }
+            },
+            runtime.handle(),
+        );
+        flips(group, "followed", n, &pool);
+    }
 }
 
 fn member_write(c: &mut Criterion) {
@@ -203,6 +284,7 @@ fn member_write(c: &mut Criterion) {
                 b.iter(|| {
                     turn = turn.wrapping_add(1);
                     black_box(pool.store.upsert(facts(n / 2, turn)));
+                    pool.store.publish_now();
                 });
             });
         }
@@ -240,6 +322,22 @@ fn read(c: &mut Criterion) {
     let mut group = c.benchmark_group("policy_store_journal/read");
     let pool = pool_of(64, Some(LOADS));
     let log = pool.log.as_ref().expect("the journaled pool's log");
+    // The watched ring full and written half over again, as a controller
+    // that ran a while holds it: the ring's buffer is wrapped at its
+    // middle, and a reader's search of it is the search of a full ring.
+    for turn in 0..WATCHED + WATCHED / 2 {
+        let status = if turn % 2 == 0 {
+            WorkerStatus::NotReady
+        } else {
+            WorkerStatus::Ready
+        };
+        let revision = WorkersStore::get(&pool.store, pool.ids[0])
+            .expect("the row")
+            .revision;
+        pool.store
+            .set_status(pool.ids[0], status, revision)
+            .expect("a flip");
+    }
     let at = pool.opened + Duration::from_millis(1);
     for turn in 0..4_096u64 {
         let index = (turn as usize).wrapping_mul(67) % 64;
@@ -271,6 +369,18 @@ fn read(c: &mut Criterion) {
             });
         });
     }
+    let head = log.head(Kinds::Watched);
+    let mut out = Vec::with_capacity(16);
+    log.read(Kinds::Watched, head, 16, &mut out)
+        .expect("retained");
+    assert!(out.is_empty(), "the reader is at the head");
+    group.bench_function("watched_at_head", |b| {
+        b.iter(|| {
+            log.read(Kinds::Watched, black_box(head), 16, &mut out)
+                .expect("retained");
+            black_box(out.len())
+        });
+    });
     group.finish();
 }
 

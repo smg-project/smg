@@ -15,6 +15,11 @@ use futures::{
 use smg_grpc_client::{
     is_transport_failure, media_identity::sglang as media_contract, RequestDeadline,
 };
+use smg_worker::{
+    health::{liveness, liveness::SideReprieve},
+    identity::basic::{ConnectionModeExt, Worker, WorkerTypeExt},
+    metrics::writers::Metrics as WorkerMetrics,
+};
 use tokio::sync::{oneshot, watch};
 use tracing::{debug, error, info_span, warn, Instrument};
 
@@ -59,12 +64,6 @@ use crate::{
                 tonic_ext::{TonicResultExt, TonicStatusExt},
             },
         },
-    },
-    worker::{
-        health::liveness::{self, SideReprieve},
-        identity::basic::WorkerTypeExt,
-        metrics::Metrics as WorkerMetrics,
-        ConnectionModeExt, Worker,
     },
 };
 
@@ -1259,6 +1258,18 @@ pub(crate) fn start_failure_response(
             function = function,
             error = %e,
             "{}: the engine could not continue the request under its constraint",
+            description
+        );
+        return response;
+    }
+    // The worker refused the request's constraint as one its engine cannot
+    // enforce (see `TonicStatusExt::constraint_refusal_response`): the
+    // request's 400, in the worker's words, under no side's code.
+    if let Some(response) = e.constraint_refusal_response() {
+        warn!(
+            function = function,
+            error = %e,
+            "{}: the worker refused the request's constraint",
             description
         );
         return response;
@@ -2783,14 +2794,16 @@ pub(crate) mod tests {
     use std::{collections::HashSet, sync::Arc, time::Duration};
 
     use smg_grpc_client::{sglang_proto as sglang, tokenspeed_proto as ts, vllm_proto as vllm};
+    use smg_worker::{
+        health::{circuit_breaker::CircuitBreakerConfig, resilience::ResolvedResilience},
+        identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType},
+        test_support::no_health_check,
+    };
 
     use super::*;
-    use crate::{
-        routers::common::{attempt_ledger::FailedSide, retry::is_retryable_response},
-        worker::{
-            test_support::no_health_check, BasicWorkerBuilder, CircuitBreakerConfig,
-            ConnectionMode, ResolvedResilience, RuntimeType, Worker, WorkerType,
-        },
+    use crate::routers::{
+        common::{attempt_ledger::FailedSide, retry::is_retryable_response},
+        grpc::backend_client::BasicWorkerBuilder,
     };
 
     /// A boxed encode send, as the supervisor's tests build them.
@@ -2839,7 +2852,7 @@ pub(crate) mod tests {
     /// the next one opens a breaker set to two.
     #[tokio::test]
     async fn the_late_stream_of_a_side_retired_for_its_partners_failure_earns_no_breaker_success() {
-        use crate::worker::health::circuit_breaker::CircuitState;
+        use smg_worker::health::circuit_breaker::CircuitState;
         let decode: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("grpc://decode:30002")
                 .worker_type(WorkerType::Decode)
@@ -3077,6 +3090,108 @@ pub(crate) mod tests {
                 .get(error::HEADER_X_SMG_ERROR_CODE)
                 .unwrap(),
             "start_generation_failed"
+        );
+    }
+
+    /// A worker's refusal of a constraint its engine cannot enforce is the
+    /// request's 400 under `unsupported_constraint`, in the worker's words
+    /// alone: on a single worker it is not `start_generation_failed`, on a
+    /// disaggregated pair not the prefill's `prefill_worker_failed_to_start`,
+    /// and no other worker is tried. On `/v1/messages` it leaves in the
+    /// messages envelope, the code in the header alone.
+    #[tokio::test]
+    async fn a_refused_constraint_at_start_is_the_requests_400_under_no_sides_code() {
+        use smg_grpc_client::constraint_refused_status;
+
+        use crate::{
+            middleware::messages_errors::into_messages_envelope,
+            routers::common::retry::NonRetryable,
+        };
+
+        let why = "The structural tag constraint cannot be enforced: xgrammar drops \
+                   `propertyNames` at `/properties/config`";
+        for (function, description, code) in [
+            (
+                "execute_single",
+                "Failed to start generation",
+                "start_generation_failed",
+            ),
+            (
+                "execute_parallel_pd",
+                PdSide::Prefill.description(SidePhase::Start),
+                PdSide::Prefill.code(SidePhase::Start),
+            ),
+        ] {
+            let response = start_failure_response(
+                &constraint_refused_status(why),
+                function,
+                description,
+                code,
+            );
+            assert_eq!(response.status(), http::StatusCode::BAD_REQUEST, "{code}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(error::HEADER_X_SMG_ERROR_CODE)
+                    .unwrap(),
+                "unsupported_constraint",
+                "{code}"
+            );
+            assert!(
+                response.extensions().get::<NonRetryable>().is_some(),
+                "{code}"
+            );
+            let body = axum::body::to_bytes(response.into_body(), 1 << 16)
+                .await
+                .expect("body");
+            let body: serde_json::Value = serde_json::from_slice(&body).expect("json");
+            assert_eq!(body["error"]["message"], why, "{code}");
+            assert_eq!(body["error"]["code"], "unsupported_constraint", "{code}");
+
+            // The same words without the worker's trailer keep the side's
+            // code.
+            let plain = start_failure_response(
+                &tonic::Status::invalid_argument(why),
+                function,
+                description,
+                code,
+            );
+            assert_eq!(
+                plain.headers().get(error::HEADER_X_SMG_ERROR_CODE).unwrap(),
+                code
+            );
+        }
+
+        // On `/v1/messages` the same answer leaves in the messages envelope:
+        // the request's `invalid_request_error` in the worker's words, the
+        // code in the header alone.
+        let messages = into_messages_envelope(
+            start_failure_response(
+                &constraint_refused_status(why),
+                "execute_parallel_pd",
+                PdSide::Prefill.description(SidePhase::Start),
+                PdSide::Prefill.code(SidePhase::Start),
+            ),
+            "msg_refused".to_string(),
+        )
+        .await;
+        assert_eq!(messages.status(), http::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            messages
+                .headers()
+                .get(error::HEADER_X_SMG_ERROR_CODE)
+                .unwrap(),
+            "unsupported_constraint"
+        );
+        let messages = axum::body::to_bytes(messages.into_body(), 1 << 16)
+            .await
+            .expect("body");
+        let messages: serde_json::Value = serde_json::from_slice(&messages).expect("json");
+        assert_eq!(messages["error"]["type"], "invalid_request_error");
+        assert_eq!(messages["error"]["message"], why);
+        assert!(
+            messages["error"].get("code").is_none(),
+            "the messages envelope carries no code: {messages}"
         );
     }
 
@@ -4856,7 +4971,7 @@ pub(crate) mod tests {
     #[test]
     fn a_decode_verdict_on_the_prefills_dispatch_is_charged_to_the_decode_when_both_sides_answered()
     {
-        use crate::worker::health::circuit_breaker::CircuitState;
+        use smg_worker::health::circuit_breaker::CircuitState;
         let pair = || {
             let worker = |url: &str, worker_type: WorkerType| -> Arc<dyn Worker> {
                 Arc::new(
@@ -5987,3 +6102,7 @@ pub(crate) mod tests {
         assert_eq!(batch_breaker_status(&answers, &capacity_503), Some(500));
     }
 }
+
+#[cfg(test)]
+#[expect(clippy::print_stdout, reason = "a recorder says where its sheet went")]
+mod classic_sticky_rank_rows;

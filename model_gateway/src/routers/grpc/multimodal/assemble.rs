@@ -16,6 +16,7 @@ use llm_multimodal::{
     ModelSpecificValue, PlaceholderRange, PreprocessedEncoderInputs,
 };
 use smg_grpc_client::common_proto as common;
+use smg_worker::identity::basic::RuntimeType;
 use tracing::{info, warn};
 
 use super::{
@@ -31,19 +32,16 @@ use super::{
     },
     MediaBatch, MultimodalIntermediate, PrecomputedMultimodalIntermediate, PromptBinding,
 };
-use crate::{
-    routers::grpc::{
-        backend_client::BackendClient,
-        client::GrpcClient,
-        context::WorkerSelection,
-        proto_wrapper::{
-            cleanup_tokenspeed_items_encoder_shm, SglangMultimodalData, TensorBytes,
-            TokenSpeedModality, TokenSpeedMultimodalData, TokenSpeedMultimodalItem,
-            TokenSpeedTensor, TrtllmMultimodalData, VllmMultimodalData,
-        },
-        MultimodalData,
+use crate::routers::grpc::{
+    backend_client::BackendClient,
+    client::GrpcClient,
+    context::WorkerSelection,
+    proto_wrapper::{
+        cleanup_tokenspeed_items_encoder_shm, SglangMultimodalData, TensorBytes,
+        TokenSpeedModality, TokenSpeedMultimodalData, TokenSpeedMultimodalItem, TokenSpeedTensor,
+        TrtllmMultimodalData, VllmMultimodalData,
     },
-    worker::RuntimeType,
+    MultimodalData,
 };
 
 /// Assemble backend-specific multimodal data from the intermediate.
@@ -399,7 +397,13 @@ fn assemble_vllm(
     intermediate: PrecomputedMultimodalIntermediate,
     assembly: &VllmAssembly,
 ) -> Result<VllmMultimodalData> {
-    let dtype = vllm_pixel_dtype(&intermediate.preprocessed, assembly)?;
+    // Audio follows vLLM's floating-point model dtype, independently of
+    // the worker's image-only device-normalization setting.
+    let dtype = if intermediate.media.modality() == Modality::Audio {
+        assembly.encoder_dtype.as_ref()
+    } else {
+        vllm_pixel_dtype(&intermediate.preprocessed, assembly)?
+    };
     let (pixel_values, pixel_values_shape, pixel_values_dtype) =
         serialize_encoder_input_owned(intermediate.preprocessed.encoder_input, dtype)?;
     let model_specific_tensors = serialize_model_specific(intermediate.preprocessed.model_specific);
@@ -412,9 +416,10 @@ fn assemble_vllm(
             common::Modality::Video,
             videos.iter().map(|video| video.hash.clone()).collect(),
         ),
-        MediaBatch::Audios(_) => {
-            anyhow::bail!("vLLM assembly requires an image or video batch")
-        }
+        MediaBatch::Audios(audios) => (
+            common::Modality::Audio,
+            audios.iter().map(|audio| audio.hash.clone()).collect(),
+        ),
     };
     let mm_placeholders = placeholders_for_bindings(&intermediate.bindings, false)?;
     // The primary tensor travels in the proto's `pixel_values` field but is

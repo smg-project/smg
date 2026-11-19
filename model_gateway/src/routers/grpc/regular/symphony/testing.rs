@@ -17,12 +17,10 @@ pub(super) use tool_parser::ToolConstraint;
 pub(super) use super::{
     constraint::*, names::*, reader::*, telemetry::Who, template::Templates, *,
 };
-pub(super) use crate::{
-    routers::grpc::{
-        spec::scans_for_tool_calls_for,
-        utils::{ModelNames, Names, TagVocabulary},
-    },
-    worker::BasicWorkerBuilder,
+pub(super) use crate::routers::grpc::{
+    backend_client::BasicWorkerBuilder,
+    spec::scans_for_tool_calls_for,
+    utils::{ModelNames, Names, TagVocabulary},
 };
 pub(super) fn request(extra: Value) -> ChatCompletionRequest {
     let mut request = json!({"model": "Qwen/Qwen3-8B", "messages": [], "stream": true});

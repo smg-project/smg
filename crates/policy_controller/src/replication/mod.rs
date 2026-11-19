@@ -14,14 +14,16 @@
 //!
 //! What the store tells its [`Journal`](crate::store::Journal), each inside
 //! the write's own critical section: a membership or status write with its
-//! row, a load row, and the store's take of a term, which is a position of
-//! its own ([`Event::Term`]). A worker's load rows stand between its
+//! row, a load row, an applied generation by its number
+//! ([`Event::Generation`]), and the store's take of a term, which is a
+//! position of its own ([`Event::Term`]). A worker's load rows stand between its
 //! registration and its leaving. Every other entry of the store stands on one
 //! list with what rebuilds it on a standby ([`ENTRIES`]): a gateway's own
 //! facts return in its hello, each replica hears the engines' cache events
 //! itself, and a decision's writes (pins, reservations, lease ends) are not
-//! journaled yet, nor is the applied generation: a standby holds the
-//! generation applied to it, not its leader's.
+//! journaled yet. A generation's document is not the log's to hold: the
+//! door that applied it keeps the bytes, and the stream that sends the
+//! event joins them.
 //!
 //! Two readers follow the log, and each asks for its kinds
 //! ([`Kinds`](crate::store::Kinds)): a standby reads every kind, a watcher
@@ -53,4 +55,4 @@ mod log;
 mod tests;
 
 pub use entries::{Fate, ENTRIES};
-pub use log::{Adopting, Entry, Event, Log, Lost, Unled};
+pub use log::{Adopting, Entry, Event, Log, Lost, Stamp, Unled};

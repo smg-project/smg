@@ -17,8 +17,9 @@
 //! - 4.2, the decision ([`decision`]): an ordered [`Pick`] of up to
 //!   [`MAX_TARGETS`] targets, a [`Shed`] with its reason and the stage that
 //!   emptied the pool, or a [`Queue`] ticket (specified in v1; no built-in
-//!   issues one yet). A decision books nothing: the host commits one target
-//!   under its own locks and reports the lifecycle back.
+//!   issues one yet). A decision books nothing by itself: its door files
+//!   the pick's lease at the issue, which books the first target, and the
+//!   host reports the lifecycle back.
 //! - 4.3, the lifecycle ([`lease`]): the [`Lease`] a decision carries and the
 //!   [`Lifecycle`] hooks a stateful stage learns from (issued, dispatched,
 //!   completed, released, membership, signal).
@@ -26,7 +27,9 @@
 //!   weighted [`Scorer`]s and one [`Picker`]; a [`Plan`] sequences profiles for
 //!   a request; the [`Engine`] resolves a request to its binding and decides.
 //!   A scorer or picker allocates nothing per decision. The consistent-hash
-//!   scorer owns its ring ([`ring`]), fed by the membership hooks.
+//!   scorer owns its ring ([`ring`]), fed by the membership hooks. The
+//!   prefixes sent to a model's workers are kept by the sent-prefix
+//!   predictor ([`predictor`]), which no decision reads yet.
 //! - 4.5, the stages in code ([`catalog`]): the [`Catalog`] of the stages a
 //!   build knows by name, the stock build's and the ones a host registers.
 //!   A document names either kind the same way, and the validator resolves
@@ -61,7 +64,7 @@
 //!
 //! - Section 9, the WebAssembly plugin host (the `wasm` module, behind the `wasm`
 //!   feature): user policies as components of the committed `smg:policy`
-//!   package, one kept instance per deciding thread, every call under fuel,
+//!   package, one kept instance per decider, every call under fuel,
 //!   bound to a profile as the framework's own stages. What every plugin
 //!   kind shares (the breaker, the counters, the stage adapters) is the
 //!   `plugins` module.
@@ -71,6 +74,19 @@
 //!   the load helpers (the row conversion, the scrape parser). The KV
 //!   subscription, the prober and discovery arrive in the step's later PRs.
 //!
+//! - The door ([`door`]): the order of one decision's calls, written once
+//!   for every host. A host that embeds the engine asks [`door::Door`],
+//!   which runs the order on the caller's thread over a
+//!   [`store::MemoryStore`]: the lease is filed at the issue, the host says
+//!   what became of it ([`door::Door::report`]), itself or through a
+//!   handle, and its timer calls the door's clock ([`door::Door::sweep`]).
+//!   The standalone controller runs the same order on its deciders'
+//!   threads.
+//! - The handle ([`handle`]): one decision of the door, held until its
+//!   request ends. A host that holds a [`handle::Handle`] says the target
+//!   it took, the dispatch, and the completion or the release, and the
+//!   handle says each report to the door once, whatever way the request
+//!   ends.
 //! - Behind the `controller` feature, the standalone controller
 //!   (`controller`): the listeners with their credentialed scopes, the
 //!   health service on each, the admin endpoints, readiness and the drain,
@@ -79,9 +95,21 @@
 //!   later PRs.
 //! - Behind the `client` feature, the reference client of the controller's
 //!   protocol (`client`): one gateway's side of it (the dial, `Leader`,
-//!   the session's `Hello` answered by a `Welcome`, and a request's
-//!   lifecycle reports on that session), with a blocking form. No shipped
-//!   binary builds it.
+//!   the session's `Hello` answered by a `Welcome`, a request's lifecycle
+//!   reports on that session, and the watch of the workers' rows), with a
+//!   blocking form. No shipped binary builds it.
+//! - Behind the same feature, the watcher (`watcher`): a gateway's copy of
+//!   the controller's workers. It takes the watch's events in their order
+//!   into a [`store::MemoryStore`] of its own, through the door a
+//!   standby's applier writes a followed row by, and names the place a
+//!   watch opened again goes on from.
+//! - Behind the `worker-host` feature, a replica's worker objects
+//!   (`worker_host`): one object of the worker crate for every row of the
+//!   membership store, in a registry the host hands in, built, replaced and
+//!   dropped as the rows come, change and go. A controller built with it
+//!   follows its own store, on a leader and on a standby alike, and hands
+//!   each object a gRPC connector: an object connects to its engine at its
+//!   first use.
 //!
 //! What this step does not hold: the gRPC plugin service, the operator calls,
 //! the other ingestion drivers and the gRPC API; they arrive in later
@@ -90,22 +118,28 @@
 //! report's sample instant); the wire carries durations only.
 
 pub mod affinity;
+pub mod bucket;
 pub mod builtins;
 pub mod catalog;
 #[cfg(feature = "client")]
 pub mod client;
 #[cfg(feature = "controller")]
 pub mod controller;
+pub mod counts;
+pub mod decider;
 pub mod decision;
+pub mod door;
 pub mod elector;
 pub mod framework;
 #[cfg(feature = "controller")]
 pub mod grpc;
+pub mod handle;
 #[cfg(feature = "ingest")]
 pub mod ingest;
 pub mod lease;
 #[cfg(any(feature = "wasm", feature = "controller"))]
 pub mod plugins;
+pub mod predictor;
 #[cfg(feature = "controller")]
 pub mod proto;
 pub mod replication;
@@ -116,30 +150,39 @@ pub mod store;
 pub mod view;
 #[cfg(feature = "wasm")]
 pub mod wasm;
+#[cfg(feature = "client")]
+pub mod watcher;
 pub mod wit;
+#[cfg(feature = "worker-host")]
+pub mod worker_host;
 
-pub use catalog::{Catalog, CatalogError, StageKind};
+pub use catalog::{Catalog, CatalogError, StageBuild, StageError, StageKind};
+pub use counts::{KeptCounts, LentCounts};
 pub use decision::{
-    Decision, Pair, Pick, Queue, Shed, ShedReason, Survivors, Target, Targets, Trace, MAX_TARGETS,
-    TRACE_TOP,
+    Decision, Lifted, Overlap, OverlapSource, Pair, Pick, Queue, Shed, ShedReason, Survivors,
+    Target, Targets, Trace, MAX_TARGETS, TRACE_TOP,
 };
 pub use framework::{
-    Binding, DecisionScope, Engine, Filter, Narrowed, PairPools, PairTable, PairTableError, Picker,
-    Plan, Profile, Scorer, Scratch, TieBand, Weighted, DRAW_BOUND, DRAW_FROM,
+    Binding, DecisionScope, EncodeItems, EncodePlaced, EncodePool, EncoderFacts, Engine, Filter,
+    Front, Narrowed, PairPools, PairTable, PairTableError, Picker, Plan, Profile, Scorer, Scratch,
+    Spread, TieBand, Unit, Weighted, DRAW_BOUND, DRAW_FROM, RANK_FROM,
 };
 pub use lease::{
-    Lease, LeaseId, LeaseKind, Lifecycle, Membership, Outcome, ReleaseReason, Side, Signal,
-    TransportClass,
+    EventKind, EventSet, Lease, LeaseId, LeaseKind, Lifecycle, Membership, Outcome, ReleaseReason,
+    Side, Signal, TransportClass,
 };
 pub use ring::{ConsistentHash, Ring};
-pub use sessions::{Assignment, Pins, Recovery, SessionRule, SessionTable, SessionVerdict};
+pub use sessions::{
+    Assignment, Forgets, Pins, Recovery, SessionRule, SessionTable, SessionVerdict,
+};
 pub use spec::{
     AppliedSpec, Needs, PolicySpec, PowerOfTwoMetric, SessionsSpec, SpecError, API_VERSION, PRESETS,
 };
 pub use view::{
-    fingerprint, AffinityFacts, Candidate, Constraints, HashKind, Header, Health, Identity,
-    LoadRow, MediaCounts, ModelFingerprint, NamedAffinity, NamedHolder, OverloadRegime, Phase,
-    PoolFacts, RequestFacts, Role, Session, SignalSource, WireModes, WorkerId, ZoneCapacity,
+    fingerprint, AffinityFacts, Candidate, Constraints, Engines, HashKind, Header, Health,
+    Identity, LoadRow, MediaCounts, ModelFingerprint, NamedAffinity, NamedHolder, OverloadRegime,
+    Phase, PinSource, PoolFacts, RequestFacts, Role, Session, SignalSource, WireModes, WorkerId,
+    ZoneCapacity,
 };
 
 /// SplitMix64 over a decision's seed: the only randomness a stage gets, so a
@@ -152,11 +195,19 @@ pub use view::{
 ///   picker that draws first reads it too, and whatever follows that draw
 ///   (the order of the rows drawn, or the whole pass behind a draw that kept
 ///   nobody) reads it past those values;
+/// - one value of the seed's stream, read behind the draw of a picker whose
+///   unit is the engine: the seed of the stream that draws between equal
+///   rows of the engine taken;
 /// - the seed under the `warmup-slice` scorer's mask: that scorer's draws;
 /// - the seed under the alternates' mask: the order of equal counts among
 ///   the workers the count-first picker passed over;
 /// - the first value of the seed's stream: the seed a pair plan hands its
-///   decode side, whose stages derive their streams from it as above.
+///   decode side, whose stages derive their streams from it as above;
+/// - the seed under the store's two naming masks: where the store names a
+///   decision's rows and cuts a list at the profile's sample, the holders'
+///   draw and the warming rows' draw;
+/// - the first value of the holders' stream, and of each stream so seeded:
+///   the seed of each lookup a naming makes again, a stream a round.
 #[derive(Clone, Copy, Debug)]
 pub struct Draw(u64);
 

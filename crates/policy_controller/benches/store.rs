@@ -5,10 +5,17 @@
 //! `policy_store/remove_with_health`. The writers take the workers lock
 //! before the health lock, so a write landing after the worker's removal
 //! lands nowhere; this bench prices that lock on the completion path.
+//!
+//! `policy_store/load_answer` is one poll's answer for one of the workers
+//! inside the publication window, with no build owed: the answer door as
+//! every answer but a new rank's first takes it.
 #![expect(
     clippy::expect_used,
     reason = "a bench's setup has no caller to answer; a store that refuses its own registration is a bug the unit tests catch"
 )]
+
+#[path = "common/filled.rs"]
+mod filled;
 
 use std::{
     hint::black_box,
@@ -17,8 +24,8 @@ use std::{
 
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 use smg_policy_controller::{
-    store::{GatewayId, HealthSink, MemoryStore, WorkerFacts, WorkersStore},
-    TransportClass, WorkerId,
+    store::{GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore, WorkerFacts, WorkersStore},
+    LoadRow, Role, TransportClass, WorkerId,
 };
 
 const WORKERS: u64 = 64;
@@ -38,9 +45,11 @@ fn facts(key: &str, incarnation: u64) -> WorkerFacts {
 /// A store with `WORKERS` registered workers, and their ids in order.
 fn populated() -> (MemoryStore, Vec<WorkerId>) {
     let store = MemoryStore::new();
-    let ids = (0..WORKERS)
+    let ids: Vec<WorkerId> = (0..WORKERS)
         .map(|i| store.upsert(facts(&format!("http://w{i}:8000"), 1)).id())
         .collect();
+    store.publish_now();
+    filled::filled(&store, "m", Role::Single, ids.len());
     (store, ids)
 }
 
@@ -99,6 +108,7 @@ fn remove(c: &mut Criterion) {
             },
             |(store, id, revision)| {
                 black_box(store.remove(black_box(id), revision).expect("removed"));
+                store.publish_now();
                 // Returned, so criterion drops the store outside the timed section.
                 store
             },
@@ -108,5 +118,29 @@ fn remove(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, health, remove);
+fn answer(c: &mut Criterion) {
+    let (store, ids) = populated();
+    let sink: &dyn LoadSink = &store;
+    let row = |turn: usize| LoadRow {
+        running: (turn % 12) as u32,
+        ..LoadRow::default()
+    };
+    // The first answer is shown at once and opens the window: the timed
+    // ones are written inside it and wait, so no publication is timed.
+    let at = Instant::now();
+    sink.report(&[(ids[0], 0, Some(row(0)))], at, LoadSource::Poll);
+    let mut turn = 0usize;
+    c.bench_function("policy_store/load_answer", |b| {
+        b.iter(|| {
+            turn += 1;
+            let answer = [(ids[turn % ids.len()], 0, Some(row(turn)))];
+            sink.report(black_box(&answer), at, LoadSource::Poll);
+        });
+    });
+    // A run the filter left out wrote the first answer alone, and it was
+    // shown: nothing waits.
+    assert!(turn == 0 || store.publish_due().is_some());
+}
+
+criterion_group!(benches, health, remove, answer);
 criterion_main!(benches);

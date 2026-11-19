@@ -4,8 +4,8 @@ use axum::response::Response;
 use http::StatusCode;
 use llm_multimodal::MediaErrorCode;
 use smg_grpc_client::{
-    dial_failure_without_peer, is_constraint_failure, is_request_timeout, is_transport_failure,
-    WorkerMediaFault,
+    dial_failure_without_peer, is_constraint_failure, is_constraint_refusal, is_request_timeout,
+    is_transport_failure, WorkerMediaFault,
 };
 use tonic::Code;
 
@@ -23,6 +23,11 @@ use crate::{
 /// request under the request's own constraint (see
 /// [`TonicStatusExt::constraint_failure_response`]).
 pub(crate) const CONSTRAINT_FAILED_CODE: &str = "constraint_failed";
+
+/// The code the public API answers when the worker refused the request's
+/// constraint as one its engine cannot enforce (see
+/// [`TonicStatusExt::constraint_refusal_response`]).
+pub(crate) const UNSUPPORTED_CONSTRAINT_CODE: &str = "unsupported_constraint";
 
 /// Extension methods for `tonic::Status`.
 pub(crate) trait TonicStatusExt {
@@ -90,7 +95,8 @@ pub(crate) trait TonicStatusExt {
     /// The HTTP status the circuit breaker samples for this failure; `None`
     /// for a failure of the request's media, which says nothing about the
     /// worker that fetched it, and for a constraint the engine could not
-    /// continue the request under, which says nothing about the worker
+    /// continue the request under, or one the worker refused as
+    /// unenforceable, which say nothing about the worker
     /// either.
     fn breaker_status(&self) -> Option<u16>;
 
@@ -104,6 +110,17 @@ pub(crate) trait TonicStatusExt {
     /// this worker or another of its kind, each replay a prefill, so it is
     /// not a transient 5xx either. `None` for any other status.
     fn constraint_failure_response(&self) -> Option<Response>;
+
+    /// The client's answer when the status is a worker's refusal of a
+    /// constraint its engine cannot enforce (the `smg-constraint-refused`
+    /// trailer, see `smg_grpc_client::constraint_refused_status`): a 400
+    /// under [`UNSUPPORTED_CONSTRAINT_CODE`] with the worker's words, which
+    /// name the keyword and where it stands, terminal for the retry layer.
+    /// The request's own schema is refused, not the worker that read it, so
+    /// the answer carries no side's code or words (on a disaggregated pair,
+    /// not `prefill_worker_failed_to_start`): every worker of the kind
+    /// refuses it alike. `None` for any other status.
+    fn constraint_refusal_response(&self) -> Option<Response>;
 }
 
 /// Whether a status message is the media connector's account of a fetch that
@@ -263,7 +280,10 @@ impl TonicStatusExt for tonic::Status {
     }
 
     fn breaker_status(&self) -> Option<u16> {
-        if is_constraint_failure(self) || self.media_fault().is_some() {
+        if is_constraint_failure(self)
+            || is_constraint_refusal(self)
+            || self.media_fault().is_some()
+        {
             return None;
         }
         Some(self.http_status().as_u16())
@@ -274,6 +294,16 @@ impl TonicStatusExt for tonic::Status {
             return None;
         }
         let mut response = self.to_http_error(CONSTRAINT_FAILED_CODE, self.message().to_string());
+        mark_non_retryable(&mut response);
+        Some(response)
+    }
+
+    fn constraint_refusal_response(&self) -> Option<Response> {
+        if !is_constraint_refusal(self) {
+            return None;
+        }
+        let mut response =
+            self.to_http_error(UNSUPPORTED_CONSTRAINT_CODE, self.message().to_string());
         mark_non_retryable(&mut response);
         Some(response)
     }
@@ -306,10 +336,11 @@ impl<T> TonicResultExt for Result<T, tonic::Status> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::worker::health::resilience::{
+    use smg_worker::health::resilience::{
         DEFAULT_CAPACITY_STATUS_CODES, DEFAULT_RETRYABLE_STATUS_CODES,
     };
+
+    use super::*;
 
     /// A status tonic made of an HTTP/2 fault under the call (the h2 error in
     /// its source chain) is the worker's connection failing, whatever code
@@ -368,6 +399,37 @@ mod tests {
         let plain = tonic::Status::failed_precondition("the scheduler aborted the request");
         assert_eq!(plain.http_status(), StatusCode::BAD_REQUEST);
         assert!(plain.constraint_failure_response().is_none());
+    }
+
+    /// A worker's refusal of a constraint its engine cannot enforce is the
+    /// request's 400 under its own code with the worker's words, terminal for
+    /// the retry layer and sampled by no breaker; an `INVALID_ARGUMENT`
+    /// without the trailer is no refusal of the kind.
+    #[test]
+    fn a_constraint_refusal_is_a_terminal_400_the_breaker_does_not_sample() {
+        use smg_grpc_client::constraint_refused_status;
+
+        use crate::routers::{common::retry::NonRetryable, error};
+
+        let status = constraint_refused_status("The JSON schema constraint cannot be enforced");
+        assert_eq!(status.http_status(), StatusCode::BAD_REQUEST);
+        let result: Result<(), tonic::Status> = Err(status.clone());
+        assert_eq!(result.breaker_status(), None);
+        let response = status
+            .constraint_refusal_response()
+            .expect("the refusal is answered");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            UNSUPPORTED_CONSTRAINT_CODE
+        );
+        // A 400 is not replayed by status alone; the refusal is marked
+        // terminal whatever statuses the operator makes retryable.
+        assert!(response.extensions().get::<NonRetryable>().is_some());
+        let plain =
+            tonic::Status::invalid_argument("The JSON schema constraint cannot be enforced");
+        assert!(plain.constraint_refusal_response().is_none());
+        assert_eq!(plain.breaker_status(), Some(400));
     }
 
     /// The reason a status names for the router error family, by the same

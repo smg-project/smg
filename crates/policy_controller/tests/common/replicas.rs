@@ -12,7 +12,7 @@
 use std::{
     ffi::OsStr,
     io::{BufRead, BufReader, Write},
-    net::SocketAddr,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::Path,
     process::{Child, Command, ExitStatus, Stdio},
     sync::Arc,
@@ -179,7 +179,23 @@ pub struct Replica {
     /// Where its admin endpoints listen.
     pub admin: SocketAddr,
     client: Option<PolicyControllerClient<Channel>>,
+    /// The directory of the spec source it was given where its flags named
+    /// none, kept as long as the process.
+    _spec: Option<tempfile::TempDir>,
+    /// It was given a spec file beside a lease another replica can take:
+    /// its start's document lands a moment behind the start of its first
+    /// lead, and [`Record::agreed`] waits for it.
+    filed: bool,
 }
+
+/// Where a replica listens unless its start names a place: the loopback
+/// address, every port the system's pick.
+const LOOPBACK: (IpAddr, u16) = (IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+
+/// A document of one plain profile: what a replica runs where its flags
+/// name no spec source and a store is refused.
+const PLAIN_SPEC: &str =
+    "apiVersion: smg.policy/v1\nprofiles:\n  default:\n    filter: [healthy]\n    pick: random\n";
 
 impl Replica {
     /// Starts the binary as `id` over `lease`, every listener on an
@@ -194,7 +210,7 @@ impl Replica {
         settings: ElectionSettings,
         settle_secs: u64,
     ) -> Result<Self, String> {
-        Self::start_as(id, None, lease, settings, settle_secs, &[])
+        Self::start_as(id, None, lease, settings, settle_secs, &[], LOOPBACK)
     }
 
     /// Starts the binary as [`Replica::start`] does, under an advertised
@@ -208,7 +224,15 @@ impl Replica {
         settings: ElectionSettings,
         settle_secs: u64,
     ) -> Result<Self, String> {
-        Self::start_as(id, Some(advertise), lease, settings, settle_secs, &[])
+        Self::start_as(
+            id,
+            Some(advertise),
+            lease,
+            settings,
+            settle_secs,
+            &[],
+            LOOPBACK,
+        )
     }
 
     /// [`Replica::start`] with `flags` after its own on the command line.
@@ -219,7 +243,22 @@ impl Replica {
         settle_secs: u64,
         flags: &[&OsStr],
     ) -> Result<Self, String> {
-        Self::start_as(id, None, lease, settings, settle_secs, flags)
+        Self::start_as(id, None, lease, settings, settle_secs, flags, LOOPBACK)
+    }
+
+    /// [`Replica::start_with`] with every listener at the address `ip` and
+    /// the replication listener at `port` there (`0` takes one), its
+    /// listeners closed at once on a stop's signal. A standby dials its
+    /// leader's host at its own replication port: the replicas of a pair
+    /// listen on one replication port, each at an address of its own.
+    pub fn start_on(
+        id: &str,
+        place: (IpAddr, u16),
+        lease: Lease<'_>,
+        settings: ElectionSettings,
+        flags: &[&OsStr],
+    ) -> Result<Self, String> {
+        Self::start_as(id, None, lease, settings, 0, flags, place)
     }
 
     fn start_as(
@@ -229,13 +268,16 @@ impl Replica {
         settings: ElectionSettings,
         settle_secs: u64,
         flags: &[&OsStr],
+        (ip, replication): (IpAddr, u16),
     ) -> Result<Self, String> {
+        let at = |port: u16| SocketAddr::new(ip, port).to_string();
         let millis = |duration: Duration| duration.as_millis().to_string();
         let grace_secs = (2 * settle_secs).max(5);
         let mut command = Command::new(BIN);
         for variable in AMBIENT {
             command.env_remove(variable);
         }
+        let alone = matches!(lease, Lease::Own);
         match lease {
             Lease::File(path) => {
                 command.arg("--lease-file").arg(path);
@@ -250,12 +292,36 @@ impl Replica {
         if let Some(address) = advertise {
             command.args(["--advertise-address", address]);
         }
+        // A start names its spec's source. A replica whose flags name none
+        // takes one that changes nothing it runs where it can: a store on an
+        // empty directory, alone. Beside a lease another replica can take a
+        // store is refused, so there it takes a file of one plain profile.
+        let named = flags.iter().any(|flag| {
+            ["--spec-file", "--spec-store"]
+                .map(OsStr::new)
+                .contains(flag)
+        });
+        let spec = if named {
+            None
+        } else {
+            let dir =
+                tempfile::tempdir().map_err(|error| format!("{id}: a spec directory: {error}"))?;
+            if alone {
+                command.arg("--spec-store").arg(dir.path());
+            } else {
+                let file = dir.path().join("policy.yaml");
+                std::fs::write(&file, PLAIN_SPEC)
+                    .map_err(|error| format!("{id}: a spec file: {error}"))?;
+                command.arg("--spec-file").arg(file);
+            }
+            Some(dir)
+        };
         command
             .args(["--controller-id", id])
-            .args(["--gateway-listen", "127.0.0.1:0"])
-            .args(["--control-listen", "127.0.0.1:0"])
-            .args(["--replication-listen", "127.0.0.1:0"])
-            .args(["--admin-listen", "127.0.0.1:0"])
+            .args(["--gateway-listen", &at(0)])
+            .args(["--control-listen", &at(0)])
+            .args(["--replication-listen", &at(replication)])
+            .args(["--admin-listen", &at(0)])
             .args(["--lease-duration-ms", &millis(settings.duration)])
             .args(["--lease-renew-period-ms", &millis(settings.renew_period)])
             .args([
@@ -303,6 +369,8 @@ impl Replica {
             replication: unbound(),
             admin: unbound(),
             client: None,
+            filed: spec.is_some() && !alone,
+            _spec: spec,
         };
         let started = Instant::now();
         loop {
@@ -654,7 +722,9 @@ impl Record {
 
     /// Samples until one replica answers as the leader and every replica
     /// names it under its term: the leader's place in `replicas` and the
-    /// term.
+    /// term. A leader this helper gave a file is agreed once its log says
+    /// a document was applied: its start's lands a moment behind the start
+    /// of its lead, and until then it has no decision for a request.
     pub async fn agreed(&mut self, replicas: &mut [Replica]) -> Result<(usize, u64), String> {
         let started = Instant::now();
         loop {
@@ -668,7 +738,10 @@ impl Record {
                 });
                 let place = replicas.iter().position(|r| r.id == leader.replica);
                 if let (true, Some(place)) = (named, place) {
-                    return Ok((place, leader.info.term));
+                    let leads = &replicas[place];
+                    if !leads.filed || leads.logged("policy spec applied") {
+                        return Ok((place, leader.info.term));
+                    }
                 }
             }
             if started.elapsed() > ROOM {

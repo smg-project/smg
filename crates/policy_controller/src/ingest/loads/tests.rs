@@ -5,8 +5,11 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    sync::{atomic::Ordering, Arc},
-    time::Duration,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
 };
 
 use openai_protocol::worker::{RuntimeType, SchedulerLoadSnapshot, WorkerLoadResponse};
@@ -17,13 +20,14 @@ use tokio::{
 };
 
 use super::{
-    now, peer, Failures, LoadDriver, LoadDriverConfig, LoadProbe, ReadError, Schedule, Target,
+    now, peer, Failures, LoadDriver, LoadDriverConfig, LoadProbe, Read, ReadError, Schedule, Target,
 };
 use crate::{
     spec::{BindingSpec, OverloadSpec},
     store::{
-        Ask, GatewayId, LoadSink, LoadSource, MemoryStore, Reachability, Signals, ViewBuffers,
-        WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
+        Ask, GatewayId, Kinds, LoadSink, LoadSource, MembershipChange, MemoryStore, Position,
+        Reachability, Signals, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
+        PUBLISH_WINDOW,
     },
     view::{LoadRow, Role, SignalSource, WireModes, WorkerId},
     AppliedSpec, PolicySpec,
@@ -150,6 +154,33 @@ impl LoadProbe for FakeProbe {
 }
 
 /// A ready row: one rank of `engine` at `key`.
+fn facts(
+    key: &str,
+    engine: &str,
+    rank: u16,
+    size: u16,
+    wires: WireModes,
+    scrape_ms: u32,
+) -> WorkerFacts {
+    WorkerFacts {
+        key: key.to_owned(),
+        engine: engine.to_owned(),
+        incarnation: 1,
+        role: Role::Single,
+        wire_modes: wires,
+        engine_kind: RuntimeType::Vllm.as_str().to_owned(),
+        models: vec!["m".to_owned()],
+        dp_rank: rank,
+        dp_size: size,
+        signals: Signals {
+            events: false,
+            loads: false,
+            scrape_interval_ms: scrape_ms,
+        },
+        ..WorkerFacts::default()
+    }
+}
+
 fn ready(
     store: &MemoryStore,
     key: &str,
@@ -160,24 +191,9 @@ fn ready(
     scrape_ms: u32,
 ) -> WorkerId {
     let id = store
-        .upsert(WorkerFacts {
-            key: key.to_owned(),
-            engine: engine.to_owned(),
-            incarnation: 1,
-            role: Role::Single,
-            wire_modes: wires,
-            engine_kind: RuntimeType::Vllm.as_str().to_owned(),
-            models: vec!["m".to_owned()],
-            dp_rank: rank,
-            dp_size: size,
-            signals: Signals {
-                events: false,
-                loads: false,
-                scrape_interval_ms: scrape_ms,
-            },
-            ..WorkerFacts::default()
-        })
+        .upsert(facts(key, engine, rank, size, wires, scrape_ms))
         .id();
+    store.publish_now();
     let revision = store.get(id).expect("the row").revision;
     store.set_status(id, WorkerStatus::Ready, revision);
     id
@@ -280,6 +296,59 @@ async fn the_first_tick_polls_every_ready_engine_once_and_writes_a_row_per_rank(
     let stats = driver.stats();
     assert_eq!(stats.polls.load(Ordering::Relaxed), 2);
     assert_eq!(stats.rows.load(Ordering::Relaxed), 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_poll_carries_its_sample_time_and_keeps_the_poll_start_for_arbitration() {
+    let store = Arc::new(MemoryStore::new());
+    let probe = Arc::new(FakeProbe::default());
+    let id = ready(&store, "grpc://a:1", "grpc://a:1", 0, 1, WireModes::GRPC, 0);
+    let driver = driver(&store, &probe, TEN);
+    let members = driver.engines(&mut None);
+    let worker = &members[0];
+
+    let before = now();
+    tokio::time::advance(Duration::from_millis(240)).await;
+    let started = now();
+    tokio::time::advance(Duration::from_millis(160)).await;
+    let during = now();
+    tokio::time::advance(Duration::from_millis(350)).await;
+    let received = now();
+    let write = |sampled_at| {
+        driver.apply(
+            worker,
+            started,
+            Read::Poll {
+                ranks: vec![(0, id)],
+                served: false,
+                answer: Ok(WorkerLoadResponse {
+                    loads: vec![SchedulerLoadSnapshot::default()],
+                    dp_rank_count: 1,
+                    sampled_at,
+                    ..Default::default()
+                }),
+            },
+        );
+    };
+    for (reported, sampled, age) in [
+        (None, started, 0),
+        (Some(before), before, 750),
+        (Some(during), during, 350),
+        (Some(received + Duration::from_millis(1)), received, 0),
+    ] {
+        write(reported);
+        let sample = store.load(id, 0).expect("the polled row");
+        assert_eq!(sample.row.report_age_ms, age);
+        assert_eq!(sample.sampled_at, sampled);
+        assert_eq!(sample.received_at, started);
+    }
+
+    store.record(id, 0, LoadRow::default(), during, LoadSource::Stream);
+    write(Some(before));
+    assert_eq!(
+        store.load(id, 0).expect("the pushed row").source,
+        LoadSource::Stream
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -450,6 +519,7 @@ async fn a_rank_ready_alone_takes_its_own_figures_from_the_engines_answer() {
             ..WorkerFacts::default()
         })
         .id();
+    store.publish_now();
     let rank1 = ready(
         &store,
         "grpc://b:1@1",
@@ -541,6 +611,7 @@ async fn rows_the_controller_never_dials_are_not_polled() {
             ..WorkerFacts::default()
         })
         .id();
+    store.publish_now();
     let revision = store.get(relayed).expect("the row").revision;
     store.set_status(relayed, WorkerStatus::Ready, revision);
     // An HTTP engine with no scrape interval: nothing to ask it.
@@ -554,6 +625,7 @@ async fn rows_the_controller_never_dials_are_not_polled() {
         dp_size: 1,
         ..WorkerFacts::default()
     });
+    store.publish_now();
     let driver = driver(&store, &probe, TEN);
     let mut schedule = Schedule::default();
 
@@ -908,6 +980,7 @@ async fn an_engine_that_left_is_forgotten_by_the_probe() {
 
     let revision = store.get(id).expect("the row").revision;
     store.remove(id, revision);
+    store.publish_now();
     tokio::time::advance(Duration::from_secs(1)).await;
     tick(&driver, &mut schedule).await;
 
@@ -1008,6 +1081,60 @@ async fn run_shows_a_row_that_landed_inside_the_window_at_the_windows_end() {
     .await;
     assert_eq!(seen(late), Some(4));
     assert_eq!(store.publish_due(), None);
+
+    stop.send_replace(true);
+    tasks
+        .join_next()
+        .await
+        .expect("the run task")
+        .expect("it ended without a panic");
+}
+
+#[tokio::test(start_paused = true)]
+async fn run_pays_the_build_another_tasks_registration_owes_before_any_tick() {
+    let store = Arc::new(MemoryStore::new());
+    let probe = Arc::new(FakeProbe::default());
+    let driver = Arc::new(driver(&store, &probe, TEN));
+    let (stop, stopped) = watch::channel(false);
+    let mut tasks = JoinSet::new();
+    let running = Arc::clone(&driver);
+    tasks.spawn(async move { running.run(stopped).await });
+    // The loop is up: its first tick is behind it and it reads no instant.
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    let started = now();
+    let register = |key: &str| {
+        store.upsert(WorkerFacts {
+            key: key.to_owned(),
+            engine: key.to_owned(),
+            incarnation: 1,
+            role: Role::Single,
+            wire_modes: WireModes::HTTP,
+            models: vec!["m".to_owned()],
+            dp_size: 1,
+            ..WorkerFacts::default()
+        });
+    };
+    let after = |instant: Instant| {
+        tokio::time::sleep_until(tokio::time::Instant::from_std(instant) + Duration::from_millis(1))
+    };
+    // A registration from this task: its answer is back and its build is
+    // owed. The store wakes the loop, which pays the build at the instant
+    // the store names, with no later write.
+    register("http://a:1");
+    assert_eq!(store.membership_builds(), 0);
+    after(store.publish_due().expect("a build is owed")).await;
+    assert_eq!((store.membership_builds(), store.publish_due()), (1, None));
+    // That build opened a window: two registrations inside it are one build
+    // at its end.
+    register("http://b:1");
+    register("http://c:1");
+    after(store.publish_due().expect("a build is owed")).await;
+    assert_eq!((store.membership_builds(), store.publish_due()), (2, None));
+    // Both were paid well before the loop's next tick, a period after its
+    // first. The store stamps a write by the system clock, so the time this
+    // thread loses ahead of a registration moves the instants the case
+    // sleeps to: a bound of milliseconds would count that time.
+    assert!(now() < started + TEN / 2);
 
     stop.send_replace(true);
     tasks
@@ -1170,6 +1297,7 @@ async fn a_poll_that_lands_after_its_worker_left_writes_nothing() {
     // The worker leaves with its call out; the engine answers afterwards.
     let revision = store.get(id).expect("the row").revision;
     store.remove(id, revision);
+    store.publish_now();
     probe.release.notify_one();
     while let Some(joined) = schedule.calls.join_next().await {
         driver.land(&mut schedule.due, joined);
@@ -1205,6 +1333,7 @@ async fn a_call_that_lands_after_its_engine_left_leaves_no_connection_behind() {
     // it, which finds nothing to drop yet.
     let revision = store.get(id).expect("the row").revision;
     store.remove(id, revision);
+    store.publish_now();
     driver.tick(&mut schedule);
     assert_eq!(*probe.forgotten.lock(), vec!["grpc://a:1"]);
     assert_eq!(probe.connections(), 0);
@@ -1232,6 +1361,7 @@ fn a_failure_counts_under_its_own_label() {
         ReadError::Deadline(Duration::ZERO),
         ReadError::NoLoad(String::new()),
         ReadError::Unsupported(String::new()),
+        ReadError::Client(String::new()),
     ];
     assert_eq!(
         errors.len(),
@@ -1260,6 +1390,11 @@ fn a_log_line_names_an_engine_by_host_and_port_never_its_url() {
         ("grpc://us@er:se@cret@host:1", "host:1"),
         ("http://[::1]:8000/metrics", "[::1]:8000"),
         ("host:9000", "host:9000"),
+        // A `://` behind the authority is no scheme's: the host is the
+        // address's first.
+        ("user:secret@host:9000/next/http://other", "host:9000"),
+        ("user:secret@host:9000?next=http://other", "host:9000"),
+        ("host:9000#http://other", "host:9000"),
     ] {
         assert_eq!(peer(engine), named, "{engine}");
     }
@@ -1728,4 +1863,192 @@ async fn an_engines_answer_is_one_write_so_ranks_that_trade_their_queues_move_no
         (vec![false; 2], 0)
     );
     assert_eq!(driver.stats().rows.load(Ordering::Relaxed), 4);
+}
+
+/// A replica that leads, follows and leads again runs the one loop
+/// through: its polls end while it follows and start again at the take.
+/// Between the two a restore left the store at the epoch the first stretch
+/// grouped at, with another membership.
+#[tokio::test(start_paused = true)]
+async fn the_polls_group_the_membership_anew_at_a_take_after_a_restore_to_the_same_epoch() {
+    let store = Arc::new(MemoryStore::new());
+    let probe = Arc::new(FakeProbe::default());
+    let own = ready(&store, "grpc://w:1", "grpc://w:1", 0, 1, WireModes::GRPC, 0);
+    let figures = Figures {
+        running: 4,
+        waiting: 2,
+        usage: 0.5,
+    };
+    probe.answers("grpc://w:1", &[figures]);
+    probe.answers("grpc://x:1", &[figures]);
+    let driver = Arc::new(driver(&store, &probe, TEN));
+    let (_stop, stopped) = watch::channel(false);
+    let (leads, polls) = watch::channel(true);
+    let mut tasks = JoinSet::new();
+    let running = Arc::clone(&driver);
+    tasks.spawn(async move { running.run_while(stopped, polls, || 1).await });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(row(&store, own, 0).is_some());
+    leads.send_replace(false);
+    // It follows: a leader's cut of as many writes, of another engine.
+    let leader = MemoryStore::new();
+    let theirs = ready(
+        &leader,
+        "grpc://x:1",
+        "grpc://x:1",
+        0,
+        1,
+        WireModes::GRPC,
+        0,
+    );
+    assert_eq!(leader.epoch(), store.epoch());
+    assert!(store.restore_from(leader.cut(Kinds::All)));
+    let before = probe.polls().len();
+    tokio::time::sleep(TEN + TEN).await;
+    assert_eq!(probe.polls().len(), before, "a follower polled");
+    // The take: the polls start at once, over the membership as it stands.
+    leads.send_replace(true);
+    tokio::time::sleep(TEN + TEN).await;
+    let polled = probe.polls().split_off(before);
+    assert!(
+        !polled.is_empty() && polled.iter().all(|engine| engine == "grpc://x:1"),
+        "{polled:?}"
+    );
+    assert!(row(&store, theirs, 0).is_some());
+    // The engine that left between the two stretches is let go by the probe.
+    assert_eq!(*probe.forgotten.lock(), ["grpc://w:1"]);
+    assert_eq!(probe.connections(), 1);
+}
+
+/// A loss and the take after it, both told before the loop looked, leave
+/// the watch one word, `true` as it read before. The term beside it moved:
+/// the run of polls ends and the next starts over the membership a restore
+/// between the two left, at the epoch the last run grouped at.
+#[tokio::test(start_paused = true)]
+async fn a_take_whose_word_folded_over_a_loss_starts_the_polls_anew() {
+    let store = Arc::new(MemoryStore::new());
+    let probe = Arc::new(FakeProbe::default());
+    let own = ready(&store, "grpc://w:1", "grpc://w:1", 0, 1, WireModes::GRPC, 0);
+    let figures = Figures {
+        running: 4,
+        waiting: 2,
+        usage: 0.5,
+    };
+    probe.answers("grpc://w:1", &[figures]);
+    probe.answers("grpc://x:1", &[figures]);
+    let driver = Arc::new(driver(&store, &probe, TEN));
+    let (_stop, stopped) = watch::channel(false);
+    let (leads, polls) = watch::channel(true);
+    let term = Arc::new(AtomicU64::new(1));
+    let mut tasks = JoinSet::new();
+    let (running, led) = (Arc::clone(&driver), Arc::clone(&term));
+    tasks.spawn(async move {
+        let led = move || led.load(Ordering::Relaxed);
+        running.run_while(stopped, polls, led).await;
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(row(&store, own, 0).is_some());
+    // The loss, a leader's cut of as many writes of another engine, and
+    // the take under the next term: nothing is awaited between them, so
+    // the loop reads one word.
+    leads.send_replace(false);
+    let leader = MemoryStore::new();
+    let theirs = ready(
+        &leader,
+        "grpc://x:1",
+        "grpc://x:1",
+        0,
+        1,
+        WireModes::GRPC,
+        0,
+    );
+    assert_eq!(leader.epoch(), store.epoch());
+    assert!(store.restore_from(leader.cut(Kinds::All)));
+    term.store(2, Ordering::Relaxed);
+    leads.send_replace(true);
+    let before = probe.polls().len();
+    tokio::time::sleep(TEN + TEN).await;
+    let polled = probe.polls().split_off(before);
+    assert!(
+        !polled.is_empty() && polled.iter().all(|engine| engine == "grpc://x:1"),
+        "{polled:?}"
+    );
+    assert!(row(&store, theirs, 0).is_some());
+    assert_eq!(*probe.forgotten.lock(), ["grpc://w:1"]);
+}
+
+/// On a replica that follows, the loop polls no engine and pays the store's
+/// publications all the same: a followed registration and a followed load
+/// row reach the published world with no decision asked and no poll made,
+/// and at the take the first tick polls the worker that joined meanwhile.
+#[tokio::test(start_paused = true)]
+async fn a_followers_loop_pays_the_stores_publications_and_polls_no_engine() {
+    let store = Arc::new(MemoryStore::new());
+    let probe = Arc::new(FakeProbe::default());
+    let driver = Arc::new(driver(&store, &probe, TEN));
+    let (_stop, stopped) = watch::channel(false);
+    let (leads, polls) = watch::channel(false);
+    let mut tasks = JoinSet::new();
+    let running = Arc::clone(&driver);
+    tasks.spawn(async move { running.run_while(stopped, polls, || 1).await });
+    // What a decision reads of the worker's load; `None` while the worker
+    // is no member of the published world.
+    let seen = |id: WorkerId| {
+        let mut out = ViewBuffers::default();
+        let ask = Ask {
+            gateway: GatewayId::LOCAL,
+            now: now(),
+            pinned: None,
+            affinity: false,
+        };
+        store.build_view("m", Role::Single, &ask, &mut out)?;
+        let row = out.candidates.iter().find(|row| row.id == id)?;
+        Some(row.load.map(|load| load.running))
+    };
+    // The leader's registration and its status, followed as the applier
+    // follows them.
+    let leader = MemoryStore::new();
+    let id = leader
+        .upsert(facts("grpc://a:1", "grpc://a:1", 0, 1, WireModes::GRPC, 0))
+        .id();
+    let told = leader.get(id).expect("the row");
+    assert_eq!(seen(id), None);
+    let ready = MembershipChange::StatusChanged {
+        id,
+        from: told.status,
+        to: WorkerStatus::Ready,
+    };
+    let unjournaled = Position::default();
+    store.follow(
+        unjournaled,
+        1,
+        MembershipChange::Registered { id },
+        Some(told),
+    );
+    store.follow(unjournaled, 2, ready, None);
+    // The followed registration left its build owed: the loop pays it at
+    // the instant the store names, with no decision asked.
+    let due = store.publish_due().expect("a build is owed");
+    let paid = tokio::time::Instant::from_std(due) + Duration::from_millis(1);
+    tokio::time::sleep_until(paid).await;
+    assert_eq!(seen(id), Some(None), "a followed registration");
+    // The window that build opened ends. Two followed load rows then, the
+    // leader's polls: the first opens the store's window and shows by
+    // itself, the second lands inside it and waits for the payer.
+    tokio::time::sleep(PUBLISH_WINDOW + Duration::from_millis(1)).await;
+    let load = |running| LoadRow {
+        running,
+        ..LoadRow::default()
+    };
+    store.record(id, 0, load(4), now(), LoadSource::Poll);
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    store.record(id, 0, load(7), now(), LoadSource::Poll);
+    assert_eq!(seen(id), Some(Some(4)));
+    tokio::time::sleep(Duration::from_millis(100) + PUBLISH_WINDOW).await;
+    assert_eq!(seen(id), Some(Some(7)), "a followed load row");
+    assert!(probe.polls().is_empty(), "a follower polled");
+    // The take: the first tick polls the worker that joined meanwhile.
+    leads.send_replace(true);
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    assert_eq!(probe.polls(), ["grpc://a:1"]);
 }

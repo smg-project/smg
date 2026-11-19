@@ -272,17 +272,12 @@ impl Llama4VisionProcessor {
         let (img_w, img_h, raw) = transforms::rgb_bytes(image);
         let canvas_pixels = canvas_h * canvas_w;
 
-        // Precompute fused scale/bias: (pixel/255 - mean) / std
-        let scale: [f32; 3] = std::array::from_fn(|c| 1.0 / (255.0 * self.std[c] as f32));
-        let bias: [f32; 3] = std::array::from_fn(|c| -(self.mean[c] as f32) / (self.std[c] as f32));
-
         let mut data = vec![0.0f32; 3 * canvas_pixels];
-        transforms::paint_rgb_onto_planes(
+        transforms::paint_rgb_onto_planes_by_table(
             &raw,
             (img_w, img_h),
             (canvas_w, canvas_h),
-            scale,
-            bias,
+            &transforms::to_tensor_and_normalize_table(&self.mean, &self.std),
             &mut data,
         );
 

@@ -98,9 +98,9 @@ jobs:
 
       - name: Copy protos and build
         run: |
-          rm -f crates/grpc_client/python/smg_grpc_proto/proto
+          rm -rf crates/grpc_client/python/smg_grpc_proto/proto
           mkdir -p crates/grpc_client/python/smg_grpc_proto/proto
-          cp crates/grpc_client/proto/*.proto crates/grpc_client/python/smg_grpc_proto/proto/
+          cp crates/grpc_client/proto/*.proto crates/worker/proto/*.proto crates/grpc_client/python/smg_grpc_proto/proto/
           pip install build grpcio-tools
           rm -rf crates/grpc_client/python/dist/
           cd crates/grpc_client/python && python -m build
@@ -257,16 +257,17 @@ jobs:
 
       - name: Run grpc_servicer unit tests
         run: |
-          rm -f crates/grpc_client/python/smg_grpc_proto/proto
+          rm -rf crates/grpc_client/python/smg_grpc_proto/proto
           mkdir -p crates/grpc_client/python/smg_grpc_proto/proto
-          cp crates/grpc_client/proto/*.proto crates/grpc_client/python/smg_grpc_proto/proto/
+          cp crates/grpc_client/proto/*.proto crates/worker/proto/*.proto crates/grpc_client/python/smg_grpc_proto/proto/
           # msgspec and pydantic gate the sidecar-protocol, fake-redis and
           # limit-options tests; numpy gates the Rust servicer's media bridge
-          # tests (it lends tensor buffers as numpy views). Modules gated on
+          # tests (it lends tensor buffers as numpy views); prometheus_client
+          # gates the SGLang scheduler-metrics tests. Modules gated on
           # zmq or vllm still skip here (-rs lists them): the zmq ones import
           # engine servicers that need torch, and the vllm cases run on the
           # vLLM e2e lane.
-          pip install ./crates/grpc_client/python msgspec pydantic numpy pyzmq
+          pip install ./crates/grpc_client/python msgspec pydantic numpy pyzmq prometheus_client
           pytest -q grpc_servicer/tests -rs
 
       # The release tests drive scripts/release/release.sh, which runs `make`; this
@@ -951,6 +952,7 @@ jobs:
               - 'crates/tokenizer/**'
               - 'crates/protocols/**'
               - 'crates/worker/**'
+              - 'crates/workflow/**'
             rust-multimodal:
               - *rust-infra
               - 'crates/multimodal/**'
@@ -962,6 +964,7 @@ jobs:
               - 'crates/response_template/**'
               - 'crates/protocols/**'
               - 'crates/worker/**'
+              - 'crates/workflow/**'
             rust-agentic:
               - *rust-infra
               - 'crates/data_connector/**'
@@ -975,7 +978,9 @@ jobs:
               - *rust-infra
               - 'crates/protocols/**'
               - 'crates/worker/**'
+              - 'crates/workflow/**'
               - 'crates/external_router/**'
+              - 'crates/service_discovery/**'
               - 'crates/auth/**'
               - 'crates/rl/**'
               - 'clients/rust/**'
@@ -992,6 +997,7 @@ jobs:
               - 'crates/gateway_perf/**'
               - 'crates/protocols/**'
               - 'crates/worker/**'
+              - 'crates/workflow/**'
               - 'crates/tokenizer/**'
               - 'crates/kv_index/**'
             rust-kv:
@@ -1014,6 +1020,7 @@ jobs:
               - 'crates/mock_worker/**'
               - 'crates/protocols/**'
               - 'crates/worker/**'
+              - 'crates/workflow/**'
               - 'crates/tokenizer/**'
             rust-radix:
               - *rust-infra
@@ -1288,7 +1295,6 @@ jobs:
               ("model_gateway/src/rate_limit/**",                CORE),
               ("model_gateway/src/policies/**",                  CORE_EVERY_ENGINE_GO),
               ("model_gateway/src/mesh/**",                      CORE),
-              ("model_gateway/src/service_discovery/**",         CORE),
               ("model_gateway/src/wasm/**",                      CORE),
               ("model_gateway/src/server/tls.rs",                CORE),
               ("model_gateway/src/version.rs",                   CORE),
@@ -1353,6 +1359,10 @@ jobs:
               ("crates/mesh/**",                                 CORE),
               ("crates/mm_rdma/**",                              CORE),
               ("crates/rl/**",                                   CORE),
+              # worker discovery: the core, as the gateway's module was; its directory
+              # watch every lane, as the gateway's file was
+              ("crates/service_discovery/src/fs_watch.rs",       FULL),
+              ("crates/service_discovery/**",                    CORE),
               ("crates/wasm/**",                                 CORE),
               # the protocol types, the gRPC client with its proto package and the
               # workflow engine of the worker registration: every lane

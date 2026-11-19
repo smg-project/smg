@@ -34,7 +34,8 @@ const DEFAULT_ADMIN_LISTEN: &str = "0.0.0.0:30103";
 #[command(
     name = VERSION.name,
     version = VERSION.version,
-    about = "The SMG policy controller: the owner of the routing data, serving decisions to the gateways"
+    about = "The SMG policy controller: the owner of the routing data, serving decisions to the gateways",
+    group = clap::ArgGroup::new("spec_source").required(true).multiple(false).args(["spec_file", "spec_store"])
 )]
 struct Cli {
     // ==================== Identity ====================
@@ -58,7 +59,11 @@ struct Cli {
     #[arg(long, default_value = DEFAULT_CONTROL_LISTEN, help_heading = "Listeners")]
     control_listen: SocketAddr,
 
-    /// The standbys' listener: Replicate
+    /// The standbys' listener: Replicate, which restores a standby too. Under
+    /// a shared lease a replica that does not lead follows its leader: it
+    /// dials the leader's advertised host at this port, so every replica
+    /// listens on the same one, and the listener takes identities as told
+    /// in the clear. A replica that follows is refused port 0
     #[arg(long, default_value = DEFAULT_REPLICATION_LISTEN, help_heading = "Listeners")]
     replication_listen: SocketAddr,
 
@@ -116,8 +121,14 @@ struct Cli {
 
     // ==================== Election ====================
     /// The lease as a file on this host: the replicas of one host elect
-    /// their leader over it; its directory must exist. With no lease flag
-    /// the controller runs alone and leads itself
+    /// their leader over it; its directory must exist. Each renewal is a
+    /// durable write: on a volume whose sync can take over a second the
+    /// leader answers Busy for that time, ends its gateways' sessions
+    /// where a renewal takes two, and can lose its lease where one takes
+    /// three; keep the file on a quiet local volume or run a slower
+    /// timing (15000, 10000 and 2000 for --lease-duration-ms,
+    /// --lease-renew-deadline-ms and --lease-renew-period-ms). With no
+    /// lease flag the controller runs alone and leads itself
     #[arg(long, help_heading = "Election")]
     lease_file: Option<PathBuf>,
 
@@ -168,12 +179,18 @@ struct Cli {
 
     /// The policy spec as a file, in YAML (JSON under a `.json` name): read
     /// and applied at the start, as generation 1 or under the number its
-    /// `generation` line writes. A file that cannot be read, or a document
-    /// that is invalid, refuses the start. The file is then watched: a
-    /// changed one is applied as the next generation, or under the number
-    /// it writes, and one that does not run is rejected whole and the
-    /// running generation stays. With no file the controller runs no policy
-    /// spec.
+    /// `generation` line writes. Under `--lease-file` or `--lease-name` it
+    /// is read and checked at the start, and applied when this replica
+    /// leads: while it follows a leader it runs the leader's document, and
+    /// once it leads it applies its own file's, unless that document ran
+    /// on it since the file last changed. A file that cannot be read, or a
+    /// document that is invalid, refuses the start. The file is watched
+    /// from then on. While the replica leads, a changed one is applied as
+    /// the next generation, or under the number it writes, and one that
+    /// does not run is rejected whole and the running generation stays.
+    /// While the replica follows, nothing of the file is applied and
+    /// nothing is said of it. A start names one source of the spec, this
+    /// file or `--spec-store`: with neither it is refused.
     ///
     /// YAML reads as JSON does: text that looks like a number or a boolean
     /// is quoted where a field takes text, and a key with no value is null,
@@ -185,22 +202,22 @@ struct Cli {
     /// comes in through the apply call, is persisted in the directory, one
     /// file a generation, and is then applied as the next generation. The
     /// newest generation on file is applied at the start, and one that does
-    /// not run refuses the start. The last 8 generations stay on file, and a
+    /// not run refuses the start. A directory with none on file is a source
+    /// too: the controller starts, reads ready and declines every decision
+    /// until the first apply. The last 8 generations stay on file, and a
     /// rollback runs one of them again as the next generation. One replica
     /// serves it, its lease in the process: beside a lease another
-    /// replica can take the start is refused, since a standby does not
-    /// follow an applied generation in this build. One process holds the
-    /// directory, and nothing holds two apart: one that started before
-    /// another's last apply runs the generation it started with, and
-    /// refuses each apply by name until it starts again. The directory
-    /// stands on a file system that links: a generation's file is linked
-    /// under its name
-    #[arg(
-        long,
-        value_name = "DIR",
-        conflicts_with = "spec_file",
-        help_heading = "Policy Spec"
-    )]
+    /// replica can take the start is refused, since a standby follows a
+    /// file's generations alone in this build. One process holds the
+    /// directory, under a lock on a file it makes there: a start that
+    /// cannot make that file is refused, and one that finds it held waits
+    /// for its holder to stop, refused where it is still held at the end
+    /// of the grace period. The directory stands on a file system that
+    /// links and locks: a generation's file is linked under its name.
+    /// Where the locks do not reach a second host, a process there that
+    /// started before another's last apply runs the generation it started
+    /// with, and refuses each apply by name until it starts again
+    #[arg(long, value_name = "DIR", help_heading = "Policy Spec")]
     spec_store: Option<PathBuf>,
 
     // ==================== Shutdown ====================
@@ -210,7 +227,9 @@ struct Cli {
     shutdown_settle_secs: u64,
 
     /// Seconds a shutdown may take in all, the settle window included; the
-    /// listeners close with their streams when it runs out
+    /// listeners close with their streams when it runs out. A start on a
+    /// spec store that another controller holds waits as long for that one
+    /// to stop
     #[arg(long, default_value_t = Config::DEFAULT_SHUTDOWN_GRACE.as_secs(), help_heading = "Shutdown")]
     shutdown_grace_period_secs: u64,
 
@@ -514,7 +533,7 @@ fn served<F: std::future::Future>(runtime: Runtime, serve: F) -> F::Output {
     answer
 }
 
-/// The spec's source as the flags state it: one of the two, or none.
+/// The spec's source as the flags state it: one of the two.
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum SpecSource {
     /// `--spec-file`.
@@ -524,8 +543,9 @@ enum SpecSource {
 }
 
 impl Cli {
-    /// The spec's source. The parser refuses the two flags together, so at
-    /// most one is set.
+    /// The spec's source: the one flag the parser took. The parser refuses
+    /// a command line that names neither, so `None` is a state it rules
+    /// out, and a start that meets it all the same refuses in its own words.
     fn spec_source(&self) -> Option<SpecSource> {
         let file = self.spec_file.clone().map(SpecSource::File);
         file.or_else(|| self.spec_store.clone().map(SpecSource::Store))
@@ -533,22 +553,21 @@ impl Cli {
 }
 
 /// Binds the controller over `catalog`, names the listeners that take
-/// identities as told, then takes the spec's source where one is given: a
-/// refusal of any arrives before anything is served.
+/// identities as told, then takes the spec's source: a refusal of any
+/// arrives before anything is served.
 async fn bind(
     config: Config,
     catalog: Catalog,
     as_told: &[String],
-    spec: Option<SpecSource>,
+    spec: SpecSource,
 ) -> Result<Controller, Error> {
     let mut controller = Controller::bind_with(config, catalog).await?;
     for listener in as_told {
         controller.identity_as_told(listener)?;
     }
     match spec {
-        Some(SpecSource::File(path)) => controller.spec_file(path).await?,
-        Some(SpecSource::Store(dir)) => controller.spec_store(dir).await?,
-        None => {}
+        SpecSource::File(path) => controller.spec_file(path).await?,
+        SpecSource::Store(dir) => controller.spec_store(dir).await?,
     }
     Ok(controller)
 }
@@ -575,9 +594,10 @@ pub fn run(catalog: Catalog) -> ExitCode {
     run_with(cli, catalog)
 }
 
-/// [`run`] from its parsed command line on, the log set: configure, then
-/// the runtime, bind and serve on it. Apart from the parse, which reads the
-/// process's own arguments, and from the log, which a process sets once.
+/// [`run`] from its parsed command line on, the log set: configure, take
+/// the spec's source, then the runtime, bind and serve on it. Apart from
+/// the parse, which reads the process's own arguments, and from the log,
+/// which a process sets once.
 fn run_with(cli: Cli, catalog: Catalog) -> ExitCode {
     let config = match cli.config() {
         Ok(config) => config,
@@ -585,6 +605,13 @@ fn run_with(cli: Cli, catalog: Catalog) -> ExitCode {
             error!(%error, "configuration refused");
             return ExitCode::FAILURE;
         }
+    };
+    let Some(spec) = cli.spec_source() else {
+        error!(
+            error = "no spec source is named: a start takes --spec-file or --spec-store",
+            "start refused"
+        );
+        return ExitCode::FAILURE;
     };
     let runtime = match runtime(cli.runtime_worker_threads) {
         Ok(runtime) => runtime,
@@ -594,7 +621,7 @@ fn run_with(cli: Cli, catalog: Catalog) -> ExitCode {
         }
     };
     served(runtime, async {
-        let bound = bind(config, catalog, &cli.identity_as_told, cli.spec_source());
+        let bound = bind(config, catalog, &cli.identity_as_told, spec);
         let controller = match bound.await {
             Ok(controller) => controller,
             Err(error) => {
@@ -630,17 +657,37 @@ mod tests {
     use crate::{
         catalog::Catalog,
         controller::{
-            Config, ConfigError, Election, Error, LeasePlace, Scope, SpecRejected, StoreRefused,
+            membership::tests::Logged, spec_store::SpecStore, Config, ConfigError, Controller,
+            Election, Error, LeasePlace, Scope, SpecRejected, StoreRefused,
         },
         elector::ElectionSettings,
         spec::SpecError,
         Candidate, Constraints, Filter, RequestFacts,
     };
 
+    /// A spec source for a command line that names none: a start names one,
+    /// and the parser reads this one's flag and opens nothing.
+    const SOURCE: [&str; 2] = ["--spec-store", "/var/lib/smg/spec"];
+
     fn parse(args: &[&str]) -> Cli {
         let mut argv = vec!["smg-policy-controller", "--controller-id", "controller-0"];
+        if !args
+            .iter()
+            .any(|arg| ["--spec-file", "--spec-store"].contains(arg))
+        {
+            argv.extend(SOURCE);
+        }
         argv.extend_from_slice(args);
         Cli::try_parse_from(argv).expect("the flags parse")
+    }
+
+    /// Whether the parser refuses `flags` beside an id and a spec source:
+    /// the refusal is then the flags' own.
+    fn refuses(flags: &[&str]) -> bool {
+        let mut argv = vec!["smg-policy-controller", "--controller-id", "c"];
+        argv.extend(SOURCE);
+        argv.extend_from_slice(flags);
+        Cli::try_parse_from(argv).is_err()
     }
 
     fn config(args: &[&str]) -> Result<Config, ConfigError> {
@@ -993,9 +1040,7 @@ mod tests {
                 "/run/smg/lease",
             ],
         ] {
-            let mut argv = vec!["smg-policy-controller", "--controller-id", "c"];
-            argv.extend_from_slice(refused);
-            assert!(Cli::try_parse_from(argv).is_err(), "{refused:?}");
+            assert!(refuses(refused), "{refused:?}");
         }
     }
 
@@ -1050,7 +1095,9 @@ mod tests {
         let config = parse(&EPHEMERAL).config().expect("the flags are in order");
         let mut stages = Catalog::builtin();
         stages.filter("any", || Box::new(Any)).expect("a free name");
-        let controller = bind(config, stages, &[], None).await.expect("binds");
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let source = SpecSource::Store(dir.path().to_owned());
+        let controller = bind(config, stages, &[], source).await.expect("binds");
         assert!(controller.catalog().filters().any(|name| name == "any"));
         // The stock build holds no such stage.
         assert!(Catalog::builtin().filters().all(|name| name != "any"));
@@ -1068,7 +1115,7 @@ mod tests {
         std::fs::write(&path, document).expect("the file");
         let start = |stages: Catalog| {
             let config = parse(&EPHEMERAL).config().expect("the flags are in order");
-            bind(config, stages, &[], Some(SpecSource::File(path.clone())))
+            bind(config, stages, &[], SpecSource::File(path.clone()))
         };
 
         let mut stages = Catalog::builtin();
@@ -1115,9 +1162,10 @@ mod tests {
         }
     }
 
-    /// The controller makes the membership call alone: a spec file that
-    /// names a stage in need of the lifecycle's calls refuses the start by
-    /// the stage's field, and the same stage with no such need starts.
+    /// The controller makes the membership call and a lease's calls but
+    /// the end of a lease whose gateway was let go: a spec file that names
+    /// a stage in need of them refuses the start by the stage's field, and
+    /// the same stage with no such need starts.
     #[tokio::test]
     async fn a_spec_file_that_names_a_stage_in_need_of_the_lifecycle_refuses_the_start() {
         let dir = tempfile::tempdir().expect("a directory");
@@ -1131,7 +1179,7 @@ mod tests {
             stages
                 .scorer("level", move || Box::new(Level(needs)))
                 .expect("a free name");
-            bind(config, stages, &[], Some(SpecSource::File(path.clone())))
+            bind(config, stages, &[], SpecSource::File(path.clone()))
         };
 
         let controller = start(false).await.expect("no need of the calls starts");
@@ -1154,12 +1202,61 @@ mod tests {
         }
     }
 
+    /// The controller records no prefix it sent a worker: a spec file whose
+    /// prefix affinity reads them, alone or merged with the index, refuses
+    /// the start by the source's field, and the same stage by the index
+    /// starts.
+    #[tokio::test]
+    async fn a_spec_file_whose_affinity_reads_the_prefixes_sent_refuses_the_start() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let path = dir.path().join("policy.yaml");
+        let start = |source: &str| {
+            let document = format!(
+                "apiVersion: smg.policy/v1\nprofiles:\n  default:\n    score:\n      - prefix-affinity: {{source: {source}}}\n    pick: best\n"
+            );
+            std::fs::write(&path, document).expect("the file");
+            let config = parse(&EPHEMERAL).config().expect("the flags are in order");
+            bind(
+                config,
+                Catalog::builtin(),
+                &[],
+                SpecSource::File(path.clone()),
+            )
+        };
+
+        let controller = start("index").await.expect("the index's source starts");
+        assert_eq!(controller.store().world().spec().generation(), 1);
+        drop(controller);
+
+        for reads in ["predictor", "merged"] {
+            match start(reads).await {
+                Err(Error::SpecFile {
+                    source: SpecRejected::Invalid(SpecError::NotInBuild { path: field, what }),
+                    ..
+                }) => assert_eq!(
+                    (field.as_str(), what),
+                    (
+                        "profiles.default.score[0].prefix-affinity.source",
+                        "the record of sent prefixes this source reads"
+                    ),
+                    "{reads}"
+                ),
+                Err(other) => panic!("{reads}: the start was refused as {other}"),
+                Ok(_) => panic!("{reads}: nothing here records the prefixes sent"),
+            }
+        }
+    }
+
     /// The flag's names reach the bound controller: a name the flags mount
     /// no listener under refuses the start, by that name.
     #[tokio::test]
     async fn a_listener_named_as_told_is_one_the_flags_mount() {
+        // The start binds: its source is a store that is there.
+        let dir = tempfile::tempdir().expect("a directory");
+        let store = dir.path().to_str().expect("a path in UTF-8");
         let start = |flags: &[&str]| {
             let mut args = EPHEMERAL.to_vec();
+            args.extend_from_slice(&["--spec-store", store]);
             args.extend_from_slice(flags);
             let cli = parse(&args);
             let config = cli.config().expect("the flags are in order");
@@ -1168,7 +1265,7 @@ mod tests {
                     config,
                     Catalog::builtin(),
                     &cli.identity_as_told,
-                    cli.spec_source(),
+                    cli.spec_source().expect("the flags name a store"),
                 )
                 .await
                 .map(drop)
@@ -1196,22 +1293,8 @@ mod tests {
 
     #[test]
     fn the_command_line_refuses_what_it_cannot_read() {
-        assert!(Cli::try_parse_from([
-            "smg-policy-controller",
-            "--controller-id",
-            "c",
-            "--gateway-listen",
-            "nowhere"
-        ])
-        .is_err());
-        assert!(Cli::try_parse_from([
-            "smg-policy-controller",
-            "--controller-id",
-            "c",
-            "--log-level",
-            "loud"
-        ])
-        .is_err());
+        assert!(refuses(&["--gateway-listen", "nowhere"]));
+        assert!(refuses(&["--log-level", "loud"]));
     }
 
     /// A blocking call that has not returned does not hold the run's end:
@@ -1303,14 +1386,7 @@ mod tests {
         let three = config(&["--decide-shards", "3"]).expect("parsed");
         assert_eq!(three.decide_shards, 3);
         for bad in ["0", "257", "many"] {
-            let flags = [
-                "smg-policy-controller",
-                "--controller-id",
-                "c",
-                "--decide-shards",
-                bad,
-            ];
-            assert!(Cli::try_parse_from(flags).is_err(), "{bad}");
+            assert!(refuses(&["--decide-shards", bad]), "{bad}");
         }
     }
 
@@ -1322,17 +1398,7 @@ mod tests {
         );
         assert_eq!(parse(&[]).runtime_worker_threads, None);
         for bad in ["0", "4097", "many"] {
-            assert!(
-                Cli::try_parse_from([
-                    "smg-policy-controller",
-                    "--controller-id",
-                    "c",
-                    "--runtime-worker-threads",
-                    bad
-                ])
-                .is_err(),
-                "{bad}"
-            );
+            assert!(refuses(&["--runtime-worker-threads", bad]), "{bad}");
         }
     }
 
@@ -1393,10 +1459,12 @@ mod tests {
         );
     }
 
+    /// A start names one source of its spec. The parser refuses a command
+    /// line that names none, and one that names both, by both flags' names.
     #[test]
-    fn the_spec_store_is_a_flag_with_no_default_and_the_spec_file_is_refused_beside_it() {
-        let none = parse(&with_identity(&[]));
-        assert_eq!((none.spec_store.clone(), none.spec_source()), (None, None));
+    fn a_start_names_one_spec_source_and_the_parser_refuses_none_and_both() {
+        use clap::error::ErrorKind;
+
         let dir = PathBuf::from("/var/lib/smg/spec");
         let stored = parse(&with_identity(&["--spec-store", "/var/lib/smg/spec"]));
         assert_eq!(stored.spec_source(), Some(SpecSource::Store(dir)));
@@ -1407,26 +1475,93 @@ mod tests {
         ]));
         assert_eq!(filed.spec_source(), Some(SpecSource::File(file)));
 
-        // One source: the parser refuses the two flags together, by both
-        // names.
         let mut argv = vec!["smg-policy-controller", "--controller-id", "controller-0"];
-        argv.extend(with_identity(&[
-            "--spec-file",
-            "/a.yaml",
-            "--spec-store",
-            "/b",
-        ]));
+        argv.extend(with_identity(&[]));
+        let neither = Cli::try_parse_from(argv.clone()).expect_err("a source is named");
+        argv.extend(["--spec-file", "/a.yaml", "--spec-store", "/b"]);
         let both = Cli::try_parse_from(argv).expect_err("one source");
-        let told = both.to_string();
+        for (refused, kind) in [
+            (neither, ErrorKind::MissingRequiredArgument),
+            (both, ErrorKind::ArgumentConflict),
+        ] {
+            assert_eq!(refused.kind(), kind);
+            let told = refused.to_string();
+            assert!(
+                told.contains("--spec-file") && told.contains("--spec-store"),
+                "{told}"
+            );
+        }
+    }
+
+    /// A command line that names neither source is the state the parser
+    /// rules out. Past the parser it has no source, and the start refuses
+    /// it before a runtime is built, in the refusal's own words: the case
+    /// reads the line the start wrote, on its own thread.
+    #[test]
+    fn a_command_line_past_the_parser_with_no_spec_source_is_refused() {
+        let mut cli = parse(&[]);
+        cli.spec_store = None;
+        assert_eq!(cli.spec_source(), None);
+        // The case's own subscriber keeps this thread's lines, a second one
+        // registered beside it, as in the door's audit case.
+        let lines = Logged::default();
+        let writer = lines.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _beside = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let code = tracing::subscriber::with_default(subscriber, || {
+            super::run_with(cli, Catalog::builtin())
+        });
+        assert_eq!(code, ExitCode::FAILURE);
+        let said = String::from_utf8(lines.0.lock().clone()).expect("the lines are text");
         assert!(
-            told.contains("--spec-file") && told.contains("--spec-store"),
-            "{told}"
+            said.contains("start refused")
+                && said
+                    .contains("no spec source is named: a start takes --spec-file or --spec-store"),
+            "{said}"
         );
+    }
+
+    /// A caller that drops the spec store call while its start waits on a
+    /// held directory leaves the task to bind the store once the holder
+    /// lets go: its series are bound with it, and a second call is refused
+    /// as a second source.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_spec_store_call_that_binds_later_leaves_its_series() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let holder = SpecStore::open(dir.path().to_owned()).expect("the holder");
+        let config = parse(&EPHEMERAL).config().expect("the flags are in order");
+        let mut controller = Controller::bind_with(config, Catalog::builtin())
+            .await
+            .expect("the controller binds");
+        let call = controller.spec_store(dir.path().to_owned());
+        let dropped = tokio::time::timeout(Duration::from_millis(200), call).await;
+        assert!(dropped.is_err(), "the call waits on the held directory");
+        drop(holder);
+        let bound = async {
+            while !controller.metrics.spec_bound() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), bound)
+            .await
+            .expect("the task binds the store with its series");
+        assert!(controller.shared.generations.bound());
+        match controller.spec_store(dir.path().to_owned()).await {
+            Err(Error::SpecStore {
+                source: StoreRefused::SecondSource,
+                ..
+            }) => {}
+            other => panic!("a second source: {other:?}"),
+        }
     }
 
     /// A spec store starts the controller on the newest generation on file,
     /// under that file's number; a path that leads to no directory refuses
-    /// the start by name; and a controller that took a store takes no file.
+    /// the start by name; and a controller that took a store takes no file
+    /// and no second store, refused at once on the directory it holds.
     #[tokio::test]
     async fn a_spec_store_starts_on_its_newest_generation() {
         let dir = tempfile::tempdir().expect("a directory");
@@ -1439,12 +1574,7 @@ mod tests {
         }
         let start = |path: PathBuf| {
             let config = parse(&EPHEMERAL).config().expect("the flags are in order");
-            bind(
-                config,
-                Catalog::builtin(),
-                &[],
-                Some(SpecSource::Store(path)),
-            )
+            bind(config, Catalog::builtin(), &[], SpecSource::Store(path))
         };
 
         let mut controller = start(store.clone()).await.expect("the store starts");
@@ -1453,6 +1583,13 @@ mod tests {
         match controller.spec_file(file.clone()).await {
             Err(Error::SpecFile {
                 source: SpecRejected::SecondSource,
+                ..
+            }) => {}
+            other => panic!("a second source: {other:?}"),
+        }
+        match controller.spec_store(store.clone()).await {
+            Err(Error::SpecStore {
+                source: StoreRefused::SecondSource,
                 ..
             }) => {}
             other => panic!("a second source: {other:?}"),
@@ -1477,7 +1614,7 @@ mod tests {
     }
 
     /// Beside a lease another replica can take, a spec store refuses the
-    /// start by name: a standby would not follow an applied generation.
+    /// start by name: a standby follows a file's generations alone.
     #[tokio::test]
     async fn a_spec_store_refuses_the_start_beside_a_lease_another_replica_can_take() {
         let dir = tempfile::tempdir().expect("a directory");
@@ -1490,7 +1627,7 @@ mod tests {
         let config = parse(&args).config().expect("the flags are in order");
         assert!(matches!(config.election.lease, LeasePlace::File(_)));
 
-        let source = Some(SpecSource::Store(store.clone()));
+        let source = SpecSource::Store(store.clone());
         match bind(config, Catalog::builtin(), &[], source).await {
             Err(refused @ Error::SpecStore {
                 source: StoreRefused::BesideASharedLease,
@@ -1498,12 +1635,66 @@ mod tests {
             }) => assert_eq!(
                 refused.to_string(),
                 format!(
-                    "the spec store {}: another replica can take this controller's lease, and a standby does not follow an applied generation in this build: keep the lease in the process, or hand the spec as a file",
+                    "the spec store {}: another replica can take this controller's lease, and a standby follows a file's generations alone in this build: keep the lease in the process, or hand the spec as a file",
                     store.display()
                 )
             ),
             Err(other) => panic!("refused as {other}"),
             Ok(_) => panic!("a shared lease takes no spec store"),
+        }
+    }
+
+    /// Beside a lease another replica can take, a spec file is passed at
+    /// the start and not applied: the replica runs no number of its own
+    /// until it leads, so it follows its leader's generation whatever the
+    /// number. The file is its source all the same, and writes while the
+    /// replica leads. One that does not run refuses the start. Under a
+    /// lease in the process the file is applied at the start, and writes
+    /// always.
+    #[tokio::test]
+    async fn a_spec_file_is_applied_at_the_start_under_a_lease_in_the_process_alone() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let document =
+            "apiVersion: smg.policy/v1\nprofiles:\n  default:\n    filter: [healthy]\n    pick: random\n";
+        let file = dir.path().join("policy.yaml");
+        std::fs::write(&file, document).expect("the file");
+        let lease = dir.path().join("lease");
+        let shared = ["--lease-file", lease.to_str().expect("a path in UTF-8")];
+        let start = |flags: &[&str]| {
+            let mut args = EPHEMERAL.to_vec();
+            args.extend_from_slice(flags);
+            let config = parse(&args).config().expect("the flags are in order");
+            bind(
+                config,
+                Catalog::builtin(),
+                &[],
+                SpecSource::File(file.clone()),
+            )
+        };
+
+        let alone = start(&[]).await.expect("the file starts");
+        assert_eq!(alone.store().world().spec().generation(), 1);
+        assert!(alone.shared.generations.source_writes());
+        drop(alone);
+
+        let paired = start(&shared).await.expect("the file starts");
+        assert_eq!(
+            paired.store().world().spec().generation(),
+            0,
+            "passed, not applied"
+        );
+        assert!(paired.shared.generations.bound(), "a source all the same");
+        assert!(
+            !paired.shared.generations.source_writes(),
+            "its source writes while it leads, and it has not led"
+        );
+        drop(paired);
+
+        std::fs::write(&file, document.replace("healthy", "no-such-stage")).expect("the file");
+        match start(&shared).await {
+            Err(Error::SpecFile { .. }) => {}
+            Err(other) => panic!("refused as {other}"),
+            Ok(_) => panic!("a document that does not run refuses the start"),
         }
     }
 }

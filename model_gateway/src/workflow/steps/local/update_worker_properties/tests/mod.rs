@@ -14,6 +14,12 @@ use openai_protocol::{
         WorkerUpdateRequest,
     },
 };
+use smg_worker::{
+    connection::engine::EngineConnection,
+    health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
+    identity::basic::{BasicWorker, ConnectionMode, RuntimeType},
+    registry::WorkerId,
+};
 use tracing_test::traced_test;
 use wfaas::WorkflowInstanceId;
 
@@ -28,12 +34,6 @@ use crate::{
         },
     },
     server::http_client,
-    worker::{
-        connection::engine::EngineConnection,
-        health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
-        registry::WorkerId,
-        BasicWorker, ConnectionMode, RuntimeType,
-    },
     workflow::steps::local::test_support::labels_of,
 };
 
@@ -48,7 +48,8 @@ fn make_app_context_with(
     tool_parser_factory: Option<tool_parser::ParserFactory>,
 ) -> Arc<AppContext> {
     use crate::{
-        app_context::testing::app_context_for_tests, config::RouterConfig, worker::WorkerRegistry,
+        app_context::testing::app_context_for_tests, config::RouterConfig,
+        routers::common::snapshot::WorkerRegistry,
     };
 
     let router_config = RouterConfig::builder()
@@ -1742,9 +1743,10 @@ async fn a_conflicting_parser_override_from_a_label_update_is_warned_about() {
 #[tokio::test]
 async fn a_refresh_fills_the_fields_an_empty_registration_label_left_unset() {
     use openai_protocol::worker::WorkerModels;
+    use smg_worker::workflow::WorkerKind;
 
     use crate::workflow::{
-        data::{WorkerKind, WorkerRegistrationMode},
+        data::WorkerRegistrationMode,
         steps::{create_worker_workflow_data, local::CreateLocalWorkerStep},
     };
 

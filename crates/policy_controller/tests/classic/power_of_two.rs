@@ -7,9 +7,8 @@ use std::time::Instant;
 use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
 use serde::Deserialize;
 use smg_policy_controller::{
-    builtins::DEFAULT_MEAN_PREFILL_TOKENS, ingest::rows, Candidate, Constraints, Engine, Health,
-    Lease, Lifecycle, LoadRow, PolicySpec, PoolFacts, PowerOfTwoMetric, RequestFacts, Role,
-    Scratch, Side, SignalSource, WorkerId,
+    ingest::rows, Candidate, Constraints, Engine, Health, Lease, Lifecycle, LoadRow, PolicySpec,
+    PoolFacts, PowerOfTwoMetric, RequestFacts, Role, Scratch, Side, SignalSource, WorkerId,
 };
 
 use crate::{Outcome, Recorded, Replayed};
@@ -231,8 +230,9 @@ impl Bed {
         };
         let lease = Lease {
             issued_micros: self.clock,
-            // A request of unknown size is booked at the host's mean.
-            tokens: prompt_tokens.unwrap_or(DEFAULT_MEAN_PREFILL_TOKENS),
+            // A request of unknown size states none: the stage credits
+            // its dispatch at its own mean.
+            tokens: prompt_tokens.unwrap_or(0),
             ..Lease::default()
         };
         self.engine.on_dispatched(&lease, &target, Side::Single, 0);

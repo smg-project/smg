@@ -10,7 +10,8 @@ use crate::{
     spec::Pairing,
     store::{
         world::{Classes, Writer, PUBLISH_WINDOW},
-        MemoryStore, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
+        Kinds, MembershipChange, MemoryStore, Position, WorkerFacts, WorkerPatch, WorkerRow,
+        WorkerStatus, WorkersStore,
     },
     view::{Role, WireModes, WorkerId},
 };
@@ -20,12 +21,25 @@ fn fresh_of(store: &MemoryStore) -> MemoryStore {
     let fresh = MemoryStore::new();
     for row in store.snapshot().1 {
         fresh.upsert(row.facts);
+        fresh.publish_now();
     }
     fresh
 }
 
 #[test]
 fn a_walk_of_membership_writes_leaves_the_classes_a_fresh_store_derives() {
+    walk(1);
+}
+
+#[test]
+fn a_walk_built_once_a_burst_of_writes_leaves_the_classes_a_fresh_store_derives() {
+    walk(4);
+}
+
+/// 150 drawn membership writes under each of 16 seeds. One build is asked
+/// for a burst of writes, of `longest` at most and drawn anew at each
+/// build, and holds the classes a fresh store derives.
+fn walk(longest: usize) {
     const MODELS: [&[&str]; 3] = [&[MODEL], &["other"], &[MODEL, "other"]];
     for seed in 0..16_u64 {
         let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
@@ -37,6 +51,7 @@ fn a_walk_of_membership_writes_leaves_the_classes_a_fresh_store_derives() {
         };
         let store = MemoryStore::new();
         let mut incarnations = [1_u64; 8];
+        let mut burst = 1;
         for step in 0..150 {
             let worker = draw(8);
             let key = format!("grpc://w{worker}:9000");
@@ -72,6 +87,17 @@ fn a_walk_of_membership_writes_leaves_the_classes_a_fresh_store_derives() {
                     });
                 }
             }
+            // The build this burst owes, asked at its last write.
+            burst -= 1;
+            if burst > 0 {
+                continue;
+            }
+            if longest > 1 {
+                burst = 1 + draw(longest);
+            } else {
+                burst = 1;
+            }
+            store.publish_now();
             let fresh = fresh_of(&store);
             for model in [MODEL, "other"] {
                 assert_eq!(
@@ -103,9 +129,11 @@ fn a_write_that_moves_an_offer_and_no_class_carries_the_classes() {
     let prefills = ["grpc://pa:9000", "grpc://pb:9000"];
     for key in prefills {
         store.upsert(bare(key, Role::Prefill, ""));
+        store.publish_now();
     }
     for key in ["grpc://da:9000", "grpc://db:9000"] {
         store.upsert(bare(key, Role::Decode, ""));
+        store.publish_now();
     }
     // The world is kept, so its classes stand where they are: one address
     // in a later world is those classes carried.
@@ -115,6 +143,7 @@ fn a_write_that_moves_an_offer_and_no_class_carries_the_classes() {
     for key in prefills {
         for runtime in ["rt-b", ""] {
             store.upsert(bare(key, Role::Prefill, runtime));
+            store.publish_now();
             let world = store.world();
             let pairs = world.pairs(MODEL).expect("the model's classes");
             assert!(
@@ -134,9 +163,11 @@ fn a_worker_that_leaves_one_of_its_models_moves_that_models_classes_alone() {
         ..pair_facts("grpc://pa:9000", Role::Prefill, Some("tx-a"))
     };
     store.upsert(both(&[MODEL, "other"]));
+    store.publish_now();
     for model in [MODEL, "other"] {
         for (key, role) in [("p", Role::Prefill), ("d", Role::Decode)] {
             store.upsert(facts(&format!("grpc://{key}-{model}:9000"), role, &[model]));
+            store.publish_now();
         }
     }
     let before = store.world();
@@ -145,6 +176,7 @@ fn a_worker_that_leaves_one_of_its_models_moves_that_models_classes_alone() {
     // classes are carried, and the second's are those of a store that never
     // held it there.
     store.upsert(both(&[MODEL]));
+    store.publish_now();
     let (after, fresh) = (store.world(), fresh_of(&store).world());
     assert!(std::ptr::eq(
         kept,
@@ -163,18 +195,22 @@ fn the_writer_keeps_a_derivation_a_paired_model_and_none_past_it() {
         status: WorkerStatus::Ready,
         revision: 1,
         admitted_at: origin,
+        maker: Default::default(),
     };
     let moved = |id: u64| Classes::Written {
         left: Some(WorkerId(id)),
         joined: Some(WorkerId(id)),
     };
     let mut writer = Writer::new(PUBLISH_WINDOW, origin);
+    // Each member's slot, as its first write gives it.
+    let counts = writer.counts();
+    let slots = [counts.claim(), counts.claim()];
     // A model of one side keeps none, and its first pair makes one.
     let mut members = vec![row(1, Role::Prefill, "m0")];
-    writer.rebuild(1, members.iter(), |_, _| None, moved(1));
+    writer.rebuild(1, members.iter().zip(slots), |_, _| None, moved(1));
     assert_eq!(writer.derivations.len(), 0);
     members.push(row(2, Role::Decode, "m0"));
-    writer.rebuild(2, members.iter(), |_, _| None, moved(2));
+    writer.rebuild(2, members.iter().zip(slots), |_, _| None, moved(2));
     assert_eq!(writer.derivations.len(), 1);
     // The pair moves through a hundred models, the decode first: the
     // model it left keeps no derivation, and the one both stand in has
@@ -182,13 +218,107 @@ fn the_writer_keeps_a_derivation_a_paired_model_and_none_past_it() {
     for n in 1..100_u64 {
         let model = format!("m{n}");
         members[1] = row(2, Role::Decode, &model);
-        writer.rebuild(2 * n + 1, members.iter(), |_, _| None, moved(2));
+        writer.rebuild(2 * n + 1, members.iter().zip(slots), |_, _| None, moved(2));
         assert_eq!(writer.derivations.len(), 0, "{model}");
         members[0] = row(1, Role::Prefill, &model);
-        writer.rebuild(2 * n + 2, members.iter(), |_, _| None, moved(1));
+        writer.rebuild(2 * n + 2, members.iter().zip(slots), |_, _| None, moved(1));
         let kept: Vec<&str> = writer.derivations.keys().map(|model| &**model).collect();
         assert_eq!(kept, [model.as_str()]);
     }
+}
+
+#[test]
+fn the_writes_one_build_pays_are_one_workers_or_one_whole_derivation() {
+    let offered = |key: &str, role: Role, transport: &str, incarnation: u64| WorkerFacts {
+        incarnation,
+        ..pair_facts(key, role, Some(transport))
+    };
+    let same_as_fresh = |store: &MemoryStore| {
+        assert_eq!(
+            store.world().pairs(MODEL),
+            fresh_of(store).world().pairs(MODEL)
+        );
+    };
+    let store = MemoryStore::new();
+    // The model's first pair, in one build: the one whole derivation.
+    store.upsert(offered("grpc://pa:9000", Role::Prefill, "tx-a", 1));
+    store.upsert(offered("grpc://da:9000", Role::Decode, "tx-a", 1));
+    store.publish_now();
+    assert_eq!(store.whole_derivations(MODEL), Some(1));
+    // One worker joins, moves its offer and starts a new life between two
+    // builds: the build answers the three writes for that worker alone.
+    store.upsert(offered("grpc://pb:9000", Role::Prefill, "tx-b", 1));
+    store.upsert(offered("grpc://pb:9000", Role::Prefill, "tx-a", 1));
+    store.upsert(offered("grpc://pb:9000", Role::Prefill, "tx-b", 2));
+    store.publish_now();
+    assert_eq!(store.whole_derivations(MODEL), Some(1));
+    same_as_fresh(&store);
+    // A worker that joins and leaves between two builds was in neither: the
+    // classes are carried.
+    let passing = store
+        .upsert(offered("grpc://dc:9000", Role::Decode, "tx-b", 1))
+        .id();
+    let revision = WorkersStore::get(&store, passing)
+        .expect("the row")
+        .revision;
+    store.remove(passing, revision).expect("removed");
+    store.publish_now();
+    assert_eq!(store.whole_derivations(MODEL), Some(1));
+    same_as_fresh(&store);
+    // Two workers' writes between two builds are one whole derivation.
+    store.upsert(offered("grpc://db:9000", Role::Decode, "tx-b", 1));
+    let row = store.by_key("grpc://da:9000").expect("the decode's row");
+    store.remove(row.id, row.revision).expect("removed");
+    store.publish_now();
+    assert_eq!(store.whole_derivations(MODEL), Some(2));
+    same_as_fresh(&store);
+}
+
+/// A standby's follow door asks the pair classes what its leader's writes
+/// ask. A refresh that moved no offer asks nothing: the build it shares
+/// with another worker's join is that worker's alone, at the leader and at
+/// the standby. A refresh that moved its offer is its worker's write, and
+/// with another worker's join the two are one whole derivation.
+#[test]
+fn a_followed_refresh_asks_the_pair_classes_what_the_leaders_refresh_asks() {
+    let offered = |key: &str, role: Role, transport: &str| pair_facts(key, role, Some(transport));
+    let leader = MemoryStore::new();
+    leader.upsert(offered("grpc://pa:9000", Role::Prefill, "tx-a"));
+    leader.upsert(offered("grpc://da:9000", Role::Decode, "tx-a"));
+    leader.publish_now();
+    let standby = MemoryStore::new();
+    assert!(standby.restore_from(leader.cut(Kinds::All)));
+    // Each store's build asked, then its count of whole derivations.
+    let wholes = || {
+        leader.publish_now();
+        standby.publish_now();
+        (
+            leader.whole_derivations(MODEL),
+            standby.whole_derivations(MODEL),
+        )
+    };
+    assert_eq!(wholes(), (Some(1), Some(1)));
+    let follow = |change: MembershipChange| {
+        let row = WorkersStore::get(&leader, change.id());
+        standby.follow(
+            Position::default(),
+            WorkersStore::epoch(&leader),
+            change,
+            row,
+        );
+    };
+    // No offer moved, and another worker joins inside the window.
+    follow(leader.upsert(WorkerFacts {
+        zone: Some("z".to_owned()),
+        ..offered("grpc://pa:9000", Role::Prefill, "tx-a")
+    }));
+    follow(leader.upsert(offered("grpc://pb:9000", Role::Prefill, "tx-b")));
+    assert_eq!(wholes(), (Some(1), Some(1)));
+    // The offer moved, and another worker joins inside the window.
+    follow(leader.upsert(offered("grpc://pa:9000", Role::Prefill, "tx-b")));
+    follow(leader.upsert(offered("grpc://db:9000", Role::Decode, "tx-b")));
+    assert_eq!(wholes(), (Some(2), Some(2)));
+    assert_eq!(standby.world().pairs(MODEL), leader.world().pairs(MODEL));
 }
 
 #[test]
@@ -200,19 +330,27 @@ fn every_kind_of_membership_write_is_answered_for_its_worker_alone() {
     let store = MemoryStore::new();
     // The model's first pair makes the one whole derivation.
     store.upsert(offered("grpc://pa:9000", Role::Prefill, "tx-a", 1));
+    store.publish_now();
     assert_eq!(store.whole_derivations(MODEL), None);
     store.upsert(offered("grpc://da:9000", Role::Decode, "tx-a", 1));
+    store.publish_now();
     assert_eq!(store.whole_derivations(MODEL), Some(1));
     // Two workers that join, an offer that moves, a new incarnation, a
     // registration again as it stands and a worker that leaves: each write
     // is answered for its worker, and nothing is derived whole again.
     store.upsert(offered("grpc://pb:9000", Role::Prefill, "tx-b", 1));
+    store.publish_now();
     store.upsert(offered("grpc://db:9000", Role::Decode, "tx-b", 1));
+    store.publish_now();
     store.upsert(offered("grpc://pb:9000", Role::Prefill, "tx-a", 1));
+    store.publish_now();
     store.upsert(offered("grpc://pb:9000", Role::Prefill, "tx-b", 2));
+    store.publish_now();
     store.upsert(offered("grpc://db:9000", Role::Decode, "tx-b", 1));
+    store.publish_now();
     let row = store.by_key("grpc://db:9000").expect("the decode's row");
     store.remove(row.id, row.revision).expect("removed");
+    store.publish_now();
     assert_eq!(store.whole_derivations(MODEL), Some(1));
     assert_eq!(
         store.world().pairs(MODEL),

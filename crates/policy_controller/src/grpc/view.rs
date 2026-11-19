@@ -6,6 +6,7 @@
 //! the engine's types as the WIT is are a later step.
 
 use crate::{
+    counts::with_counts,
     decision::{Decision, Target, Trace},
     lease::{Lease, LeaseKind, Membership, Outcome, ReleaseReason, Side, Signal, TransportClass},
     plugins::{
@@ -125,8 +126,9 @@ fn load(row: &LoadRow) -> proto::LoadRow {
 
 /// One candidate as the frame carries it: the row, and the affinity facts the
 /// host holds for it beside the row (`held`), which the record carries as
-/// five of its own fields.
-fn candidate(c: &Candidate, held: AffinityFacts) -> proto::Candidate {
+/// five of its own fields. Its requests in flight are what the request's
+/// facts read for it (`in_flight`).
+fn candidate(c: &Candidate, held: AffinityFacts, in_flight: u32) -> proto::Candidate {
     proto::Candidate {
         id: c.id.0,
         role: role(c.role),
@@ -136,7 +138,7 @@ fn candidate(c: &Candidate, held: AffinityFacts) -> proto::Candidate {
         wire_modes: wire_bits(c.wire_modes),
         engine_kind: u32::from(c.engine_kind),
         connector: u32::from(c.connector),
-        in_flight: c.in_flight,
+        in_flight,
         load: c.load.as_ref().map(load),
         overlap_blocks: held.overlap_blocks,
         predicted_blocks: held.predicted_blocks,
@@ -285,10 +287,10 @@ pub(crate) fn decide(
         request: Some(request(facts, exposure, needs)),
         // A candidate's affinity facts ride the request's column, by its
         // index: the same index reads the row and its entry.
-        candidates: (0u32..)
+        candidates: with_counts!(facts, |counts| (0u32..)
             .zip(candidates)
-            .map(|(index, c)| candidate(c, facts.affinity_at(index)))
-            .collect(),
+            .map(|(index, c)| candidate(c, facts.affinity_at(index), counts(c)))
+            .collect()),
         pool: Some(pool(pool_facts)),
         stages: 0,
         scores_in: Vec::new(),
@@ -373,6 +375,7 @@ fn trace(t: &Trace) -> proto::Trace {
         fallback: false,
         affinity_source: 0,
         drew_first: t.drew_first(),
+        lifted: proto::LiftedVeto::from(t.lifted) as i32,
     }
 }
 
@@ -477,9 +480,16 @@ pub(crate) fn released(l: &Lease, r: ReleaseReason) -> proto::lifecycle_event::E
     })
 }
 
+/// A membership word as the plugin contract carries it. A stream whose
+/// protocol version has no kind for a word is not sent it ([`since`]).
 pub(crate) fn membership(m: &Membership<'_>) -> proto::lifecycle_event::Event {
     use proto::membership_change::Kind;
+    let mut models = Vec::new();
     let (kind, worker_id, old_worker_id, ids) = match m {
+        Membership::Left { id, models: left } => {
+            models.extend_from_slice(left);
+            (Kind::Left, id.0, 0, Vec::new())
+        }
         Membership::Added(w) => (Kind::Added, w.0, 0, Vec::new()),
         Membership::Removed(w) => (Kind::Removed, w.0, 0, Vec::new()),
         Membership::Replaced { old, new } => (Kind::Replaced, new.0, old.0, Vec::new()),
@@ -494,7 +504,34 @@ pub(crate) fn membership(m: &Membership<'_>) -> proto::lifecycle_event::Event {
         worker_id,
         old_worker_id,
         ids,
+        models,
     })
+}
+
+/// What [`since`] says of the word [`membership`] makes of `change`, read
+/// before that word is made.
+#[inline]
+pub(crate) fn since_of(change: &Membership<'_>) -> u32 {
+    match change {
+        Membership::Left { .. } => 2,
+        Membership::Added(_)
+        | Membership::Removed(_)
+        | Membership::Replaced { .. }
+        | Membership::Relabelled(_)
+        | Membership::Resized(_)
+        | Membership::Snapshot(_) => 1,
+    }
+}
+
+/// The first protocol version whose streams carry `event`. A stream on an
+/// older one is not sent it, and hears what it heard before the word came.
+#[inline]
+pub(crate) fn since(event: &proto::lifecycle_event::Event) -> u32 {
+    use proto::{lifecycle_event::Event, membership_change::Kind};
+    match event {
+        Event::Membership(change) if change.kind == Kind::Left as i32 => 2,
+        _ => 1,
+    }
 }
 
 /// A signal; a veto's instant on the host's clock becomes the microseconds
@@ -506,6 +543,7 @@ pub(crate) fn signal(s: &Signal, now_micros: u64) -> proto::lifecycle_event::Eve
             worker,
             dp_rank,
             row,
+            ..
         } => (worker.0, u32::from(*dp_rank), Kind::Load(load(row))),
         Signal::Health { worker, health: h } => (worker.0, 0, Kind::Health(health_bits(*h))),
         Signal::GatewayVeto {
@@ -531,12 +569,14 @@ pub(crate) fn signal(s: &Signal, now_micros: u64) -> proto::lifecycle_event::Eve
 /// Why an answer broke the contract; the log line names it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Invalid {
-    /// A declined stage whose answer field is filled.
+    /// A declined stage that carries an answer.
     DeclinedAndAnswered,
     /// A survivor position out of range or named twice.
     Survivor,
     /// Not one finite score per candidate.
     Scores,
+    /// A tie band outside its range or without scores.
+    Band,
     /// A pick outside the surviving set.
     Pick,
     /// More counter increments than the plugin declared counters.
@@ -549,6 +589,7 @@ impl std::fmt::Display for Invalid {
             Self::DeclinedAndAnswered => "a declined stage carries an answer",
             Self::Survivor => "a surviving position is out of range or repeated",
             Self::Scores => "the scores are not one finite value per candidate",
+            Self::Band => "the tie band is not a finite value from 0 to 1 beside its scores",
             Self::Pick => "the pick is outside the surviving set",
             Self::Counters => "more counter increments than declared counters",
         })
@@ -569,6 +610,8 @@ pub(crate) struct Answer {
     /// One score per candidate, clamped by the host, when the scorer
     /// answered.
     pub(crate) scores: Vec<f32>,
+    /// The band the scorer gave with its scores.
+    pub(crate) band: Option<f32>,
     /// The pick, when the picker answered.
     pub(crate) pick: Option<u32>,
     /// The counter increments by declared id.
@@ -580,11 +623,11 @@ pub(crate) fn bit(mask: &[u64], position: u32) -> bool {
         .is_some_and(|word| word & (1 << (position % 64)) != 0)
 }
 
-/// Reads a frame's answer under the validity rules (design appendix B and
-/// the protocol's own comments): each asked stage answers its own field;
-/// `survivors` present and empty sheds; a pick after a PICK decline is
-/// unset; an asked stage left unanswered is declined; a declined stage
-/// with its field filled is invalid. The pick is judged here against the
+/// Reads a frame's answer under the protocol's validity rules. A present
+/// `survivors` field with no positions sheds. A pick after a PICK decline
+/// is unset, and an asked stage left unanswered is declined. A declined
+/// stage that carries an answer is invalid. The scorer's band must be
+/// finite, from 0 to 1, and beside scores. The pick is judged here against the
 /// plugin's own survivors when its filter answered in the frame, and against
 /// the candidate count otherwise; the picker judges it against the rows the
 /// profile's filters left. The counter list is judged first: an answer
@@ -633,15 +676,24 @@ pub(crate) fn read(
     }
     // The scorer.
     if named & SCORE != 0 {
-        if !d.scores.is_empty() {
+        if !d.scores.is_empty() || d.tie_band.is_some() {
             return Err(Invalid::DeclinedAndAnswered);
         }
     } else if asked & SCORE != 0 {
         if d.scores.is_empty() {
+            if d.tie_band.is_some() {
+                return Err(Invalid::Band);
+            }
             answer.declined |= SCORE;
         } else {
             if d.scores.len() != count as usize || d.scores.iter().any(|s| !s.is_finite()) {
                 return Err(Invalid::Scores);
+            }
+            if let Some(band) = d.tie_band {
+                if !(0.0..=1.0).contains(&band) {
+                    return Err(Invalid::Band);
+                }
+                answer.band = Some(band);
             }
             answer.scores = d.scores;
             for s in &mut answer.scores {
@@ -675,7 +727,14 @@ pub(crate) fn read(
 
 #[cfg(test)]
 mod tests {
-    use super::{proto, Answer, Invalid, FILTER, PICK, SCORE};
+    use prost::Message;
+
+    use super::{
+        membership,
+        proto::{self, decline::Reason as DeclineReason},
+        since, since_of, Answer, Invalid, FILTER, PICK, SCORE,
+    };
+    use crate::{lease::Membership, view::WorkerId};
 
     /// The stages' rules, under a plugin that declared no counter.
     fn read(d: proto::PluginDecision, asked: u32, count: u32) -> Result<Answer, Invalid> {
@@ -699,6 +758,7 @@ mod tests {
                 detail: String::new(),
             }),
             counters: Vec::new(),
+            tie_band: None,
         }
     }
 
@@ -841,6 +901,95 @@ mod tests {
     }
 
     #[test]
+    fn a_band_beside_asked_scores_is_read() {
+        for band in [Some(0.375), Some(0.0), Some(1.0), None] {
+            let d = proto::PluginDecision {
+                tie_band: band,
+                ..decision(None, vec![0.625], None, None)
+            };
+            let answer = read(d, SCORE, 1).expect("scores with an optional band");
+            assert_eq!(answer.band, band);
+        }
+    }
+
+    #[test]
+    fn a_band_that_is_no_value_from_0_to_1_is_refused() {
+        for band in [f32::NAN, -0.125, 1.125, f32::INFINITY, f32::NEG_INFINITY] {
+            let d = proto::PluginDecision {
+                tie_band: Some(band),
+                ..decision(None, vec![0.875], None, None)
+            };
+            assert_eq!(
+                read(d, SCORE, 1).expect_err("a band outside the range"),
+                Invalid::Band,
+                "{band}"
+            );
+        }
+        assert_eq!(
+            Invalid::Band.to_string(),
+            "the tie band is not a finite value from 0 to 1 beside its scores"
+        );
+    }
+
+    #[test]
+    fn a_band_beside_a_declined_scorer_or_beside_no_scores_is_refused() {
+        let band = Some(0.1875);
+        for (decline, invalid) in [
+            (
+                Some((SCORE, DeclineReason::NotApplicable as i32)),
+                Invalid::DeclinedAndAnswered,
+            ),
+            (None, Invalid::Band),
+        ] {
+            let d = proto::PluginDecision {
+                tie_band: band,
+                ..decision(None, Vec::new(), None, decline)
+            };
+            assert_eq!(
+                read(d, SCORE, 1).expect_err("a band without scores"),
+                invalid
+            );
+        }
+    }
+
+    #[test]
+    fn a_band_where_the_scorer_was_not_asked_is_not_read() {
+        for band in [0.6875, f32::NAN] {
+            let d = proto::PluginDecision {
+                tie_band: Some(band),
+                ..decision(None, vec![0.4375], Some(0), None)
+            };
+            let answer = read(d, PICK, 1).expect("the pick answers the only stage asked");
+            assert_eq!((answer.pick, answer.band), (Some(0), None));
+            assert!(answer.scores.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_decision_with_no_band_encodes_as_before_and_tag_7_reads_as_the_band() {
+        let d = proto::PluginDecision {
+            decision_id: 29,
+            ..decision(None, vec![0.625], None, None)
+        };
+        let before = [
+            0x09, 0x1d, 0, 0, 0, 0, 0, 0, 0, // decision id
+            0x1a, 0x04, 0, 0, 0x20, 0x3f, // scores
+        ];
+        assert_eq!(d.encode_to_vec(), before);
+
+        let mut with_band = before.to_vec();
+        with_band.extend([0x3d, 0, 0, 0, 0x3e]);
+        let decoded = proto::PluginDecision::decode(with_band.as_slice()).expect("a decision");
+        assert_eq!(
+            decoded,
+            proto::PluginDecision {
+                tie_band: Some(0.125),
+                ..d
+            }
+        );
+    }
+
+    #[test]
     fn more_increments_than_declared_counters_break_the_contract() {
         let counted = |increments: usize| proto::PluginDecision {
             counters: vec![proto::CounterDelta { id: 0, by: 1 }; increments],
@@ -935,6 +1084,40 @@ mod tests {
         );
     }
 
+    /// The frame carries each candidate's requests in flight as the
+    /// request's facts read them: the lent count where the host lends a
+    /// table, the rows themselves reading zero.
+    #[test]
+    fn the_frame_gives_a_row_the_count_its_request_reads() {
+        use crate::{
+            counts::tests::Lent,
+            plugins::config::Exposure,
+            spec::Needs,
+            view::{Candidate, PoolFacts, RequestFacts},
+        };
+
+        let mut rows: Vec<Candidate> = (0..)
+            .zip([4, 0, 9])
+            .map(|(position, in_flight)| Candidate {
+                position,
+                in_flight,
+                ..Candidate::default()
+            })
+            .collect();
+        let lent = Lent::take(&mut rows);
+        let facts = lent.beside(&RequestFacts::default());
+        let frame = super::decide(
+            1,
+            &facts,
+            &rows,
+            &PoolFacts::default(),
+            &Exposure::default(),
+            Needs::default(),
+        );
+        let read: Vec<u32> = frame.candidates.iter().map(|c| c.in_flight).collect();
+        assert_eq!(read, [4, 0, 9]);
+    }
+
     /// The view's trace is the contract's pair. A counted trace leaves with
     /// its count and no word of a draw; a drawn one leaves with the count
     /// unset, which is no zero, and `drew_first` set.
@@ -957,6 +1140,25 @@ mod tests {
         };
         let wire = super::trace(&drawn);
         assert_eq!((wire.survivors, wire.drew_first), (None, true));
+    }
+
+    /// The trace a plugin is shown carries the veto the all-vetoed rule
+    /// lifted, and none for a pick no rule made.
+    #[test]
+    fn the_views_trace_carries_the_lifted_veto() {
+        use crate::decision::{Lifted, Trace};
+        let steered = Trace {
+            lifted: Lifted::Overload,
+            ..Trace::default()
+        };
+        assert_eq!(
+            super::trace(&steered).lifted,
+            proto::LiftedVeto::Overload as i32
+        );
+        assert_eq!(
+            super::trace(&Trace::default()).lifted,
+            proto::LiftedVeto::None as i32
+        );
     }
 
     /// A measurement for the Numbers table, not a check: run in release
@@ -1063,6 +1265,50 @@ mod tests {
                 "a frame of {n} candidates and {hashes} block hashes: built in {build} ns, encoded in {encode} ns, {} bytes",
                 wire.len()
             );
+        }
+    }
+
+    /// The contract carries the models a worker left as a kind of protocol
+    /// 2: the mapper hands a plugin the word with its models, and the
+    /// write's own word as a kind every version carries.
+    #[test]
+    fn a_plugin_is_told_the_models_a_worker_left_as_a_kind_of_protocol_2() {
+        let (id, models) = (WorkerId(7), ["m".to_string()]);
+        let left = Membership::Left {
+            id,
+            models: &models,
+        };
+        let word = membership(&left);
+        assert_eq!(since(&word), 2);
+        let proto::lifecycle_event::Event::Membership(change) = word else {
+            panic!("a membership word");
+        };
+        let kind = proto::membership_change::Kind::Left as i32;
+        assert_eq!((change.kind, change.worker_id), (kind, 7));
+        assert_eq!(change.models, models);
+        assert_eq!(since(&membership(&Membership::Relabelled(id))), 1);
+    }
+
+    /// The version that first carries a word reads the same before the word
+    /// is made and after, for every kind the feed tells.
+    #[test]
+    fn a_words_first_version_is_read_alike_before_and_after_it_is_made() {
+        let (id, models) = (WorkerId(7), ["m".to_string()]);
+        let members = [id];
+        let words = [
+            Membership::Snapshot(&members),
+            Membership::Added(id),
+            Membership::Removed(id),
+            Membership::Replaced { old: id, new: id },
+            Membership::Relabelled(id),
+            Membership::Resized(id),
+            Membership::Left {
+                id,
+                models: &models,
+            },
+        ];
+        for word in &words {
+            assert_eq!(since_of(word), since(&membership(word)));
         }
     }
 }

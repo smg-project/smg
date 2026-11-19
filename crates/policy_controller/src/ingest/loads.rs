@@ -11,7 +11,8 @@
 //! again before, so one engine's silence never delays another engine's
 //! sample. A poll asks the engine once, at the engine's own address, and
 //! writes one row per rank whose own records are not serving it, each
-//! rank's figures scoped from the answer. A scrape asks the metrics of an
+//! rank's figures scoped from the answer. A poll carries the sample instant
+//! when the answer gives one. A scrape asks the metrics of an
 //! engine of one rank and writes that rank's row; the gauges are
 //! engine-wide, so a data-parallel engine without a servicer is not scraped
 //! and its ranks have no row until a per-rank source names them: a row
@@ -34,7 +35,9 @@
 //!
 //! The loop also keeps the instant the store names for its publication
 //! ([`LoadSink::publish_due`]): a row that lands inside the store's window
-//! is shown to decisions at the window's end, with no later write.
+//! is shown to decisions at the window's end, with no later write. The
+//! build a membership write owes is paid at the same instant: the write is
+//! another task's, so the store wakes the loop ([`LoadSink::wake_with`]).
 
 use std::{
     collections::{BTreeMap, HashSet},
@@ -49,7 +52,7 @@ use std::{
 use openai_protocol::worker::{RuntimeType, WorkerLoadResponse};
 use parking_lot::Mutex;
 use tokio::{
-    sync::watch,
+    sync::{watch, Notify},
     task::{JoinError, JoinSet},
     time::MissedTickBehavior,
 };
@@ -142,6 +145,11 @@ pub enum ReadError {
     /// The family has no `GetLoads`.
     #[error("no GetLoads on a {0} engine")]
     Unsupported(String),
+    /// The probe's own client was not ready: its build failed, its build's
+    /// task was lost, or its build outlasted the scrape's timeout. The
+    /// controller's failure, no engine's.
+    #[error("the probe's client was not ready: {0}")]
+    Client(String),
 }
 
 impl ReadError {
@@ -153,6 +161,7 @@ impl ReadError {
             Self::Deadline(_) => "deadline",
             Self::NoLoad(_) => "no_load",
             Self::Unsupported(_) => "unsupported",
+            Self::Client(_) => "client",
         }
     }
 }
@@ -167,7 +176,9 @@ pub trait LoadProbe: Send + Sync + 'static {
         deadline: Duration,
     ) -> impl Future<Output = Result<WorkerLoadResponse, ReadError>> + Send;
 
-    /// The text of the engine's metrics endpoint, within `timeout`.
+    /// The text of the engine's metrics endpoint, within `timeout`. A probe
+    /// whose client's build outlasts `timeout` answers that scrape at the
+    /// build's end.
     fn scrape(
         &self,
         url: &str,
@@ -209,22 +220,30 @@ pub struct Failures {
     pub deadline: AtomicU64,
     pub no_load: AtomicU64,
     pub unsupported: AtomicU64,
+    pub client: AtomicU64,
 }
 
 impl Failures {
     /// The labels of the series, in the order of [`Self::each`]: each is its
     /// variant's [`ReadError::label`].
-    pub const LABELS: [&'static str; 5] =
-        ["transport", "answer", "deadline", "no_load", "unsupported"];
+    pub const LABELS: [&'static str; 6] = [
+        "transport",
+        "answer",
+        "deadline",
+        "no_load",
+        "unsupported",
+        "client",
+    ];
 
     /// The counters, in the order of [`Self::LABELS`].
-    fn counters(&self) -> [&AtomicU64; 5] {
+    fn counters(&self) -> [&AtomicU64; 6] {
         [
             &self.transport,
             &self.answer,
             &self.deadline,
             &self.no_load,
             &self.unsupported,
+            &self.client,
         ]
     }
 
@@ -237,13 +256,14 @@ impl Failures {
             ReadError::Deadline(_) => &self.deadline,
             ReadError::NoLoad(_) => &self.no_load,
             ReadError::Unsupported(_) => &self.unsupported,
+            ReadError::Client(_) => &self.client,
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
     /// The counts, with their labels.
-    pub fn each(&self) -> [(&'static str, u64); 5] {
-        let mut out = [("", 0); 5];
+    pub fn each(&self) -> [(&'static str, u64); 6] {
+        let mut out = [("", 0); 6];
         for (slot, (counter, name)) in out
             .iter_mut()
             .zip(self.counters().into_iter().zip(Self::LABELS))
@@ -260,8 +280,11 @@ pub struct LoadDriver<S, P> {
     probe: Arc<P>,
     config: LoadDriverConfig,
     stats: Arc<Stats>,
-    /// The membership grouped by engine, kept until the store's epoch moves.
-    grouped: Mutex<Option<Grouped>>,
+    /// The engines the probe was asked about and not told to forget since:
+    /// it may hold a connection for each. The set outlives a run, as the
+    /// probe does, so an engine that leaves the membership between two
+    /// runs is let go at the next run's first tick.
+    asked: Mutex<HashSet<String>>,
 }
 
 /// The engines of one membership epoch.
@@ -290,10 +313,15 @@ struct Engine {
     ranks: Vec<(u16, WorkerId)>,
 }
 
-/// What the loop keeps between ticks: when each engine is next due, and the
-/// calls that are out.
+/// What a run of polls keeps between its ticks: the membership as last
+/// grouped, when each engine is next due, and the calls that are out.
 #[derive(Default)]
 struct Schedule {
+    /// The membership grouped by engine, kept until the store's epoch
+    /// moves. An epoch names one membership within a run of polls alone:
+    /// between two runs a restore may leave the store at the same epoch
+    /// with another, so a run of polls starts with no grouping.
+    grouped: Option<Grouped>,
     due: BTreeMap<String, Due>,
     /// The calls that have not answered yet. A tick starts calls and waits
     /// for none: an answer is written when it lands, and dropping the
@@ -378,25 +406,81 @@ async fn at(instant: Option<Instant>) {
     }
 }
 
-/// What a log line calls an engine: the host and port of its address, never
-/// the address whole (a worker URL may carry userinfo, which no log line
-/// gets; the gRPC client names its peers the same way). An address with an
-/// `@` past its first `/`, `?` or `#` is named by the marker the gateway
-/// writes for an address it cannot parse: a userinfo that holds one of the
-/// three raw reads like a path or a query that holds an `@`, and a guess
-/// could print part of the userinfo.
-fn peer(engine: &str) -> &str {
-    let rest = engine
+/// The gate's next word; for ever once its teller is gone.
+async fn turned(polls: &mut watch::Receiver<bool>) -> bool {
+    if polls.changed().await.is_err() {
+        std::future::pending::<()>().await;
+    }
+    *polls.borrow_and_update()
+}
+
+/// What stands for an address whose userinfo cannot be told from what
+/// follows it: the marker the gateway writes for an address it cannot
+/// parse.
+pub(crate) const UNPARSABLE: &str = "<unparsable address>";
+
+/// An address in its parts around the userinfo ([`split`]). The userinfo
+/// itself is in none of them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Address<'a> {
+    /// The scheme through its `://`; empty where the address has none.
+    pub(crate) scheme: &'a str,
+    /// Whether a userinfo stood before the host.
+    pub(crate) userinfo: bool,
+    /// The host and the port.
+    pub(crate) host: &'a str,
+    /// What follows the authority: a path, a query, a fragment.
+    pub(crate) tail: &'a str,
+}
+
+/// `address` split around its userinfo: the one place of the crate that
+/// tells a credential from an address. A scheme is one by its form
+/// ([`is_scheme`]). Where the text before the first `://` is none, the
+/// address has no scheme and its authority starts at its first byte: a
+/// `://` in a path, a query or a userinfo opens nothing. The authority ends
+/// at the first `/`, `?` or `#`, and its last `@` ends the userinfo. `None`
+/// for an address with an `@` past the authority's end: a userinfo that
+/// holds one of the three raw reads like a path or a query that holds an
+/// `@`, and a guess could tell part of the userinfo.
+pub(crate) fn split(address: &str) -> Option<Address<'_>> {
+    let start = address
         .split_once("://")
-        .map_or(engine, |(_scheme, rest)| rest);
+        .filter(|(scheme, _)| is_scheme(scheme))
+        .map_or(0, |(scheme, _)| scheme.len() + "://".len());
+    let (scheme, rest) = address.split_at(start);
     let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let (authority, tail) = rest.split_at(end);
     if tail.contains('@') {
-        return "<unparsable address>";
+        return None;
     }
-    authority
+    let (userinfo, host) = authority
         .rsplit_once('@')
-        .map_or(authority, |(_userinfo, host)| host)
+        .map_or((false, authority), |(_userinfo, host)| (true, host));
+    Some(Address {
+        scheme,
+        userinfo,
+        host,
+        tail,
+    })
+}
+
+/// Whether `text` is a URL's scheme by its form (RFC 3986): a letter, then
+/// letters, digits, `+`, `-` or `.`.
+fn is_scheme(text: &str) -> bool {
+    let mut bytes = text.bytes();
+    bytes
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic())
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
+}
+
+/// What a log line calls an engine: the host and port of its address, never
+/// the address whole (a worker URL may carry userinfo, which no log line
+/// gets; the gRPC client names its peers the same way). An address whose
+/// userinfo cannot be told from what follows it ([`split`]) is named by
+/// [`UNPARSABLE`].
+fn peer(engine: &str) -> &str {
+    split(engine).map_or(UNPARSABLE, |address| address.host)
 }
 
 impl<S, P> LoadDriver<S, P>
@@ -421,7 +505,7 @@ where
             probe,
             config,
             stats: Arc::new(Stats::default()),
-            grouped: Mutex::new(None),
+            asked: Mutex::new(HashSet::new()),
         }
     }
 
@@ -435,34 +519,85 @@ where
     /// is written when it lands, so an engine that does not answer delays
     /// its own rows alone, never the fleet's or the stop, which cancels the
     /// calls still out.
-    pub async fn run(&self, mut stop: watch::Receiver<bool>) {
+    pub async fn run(&self, stop: watch::Receiver<bool>) {
+        // No role to read: the polls run for the loop's length.
+        let (_always, polls) = watch::channel(true);
+        self.run_while(stop, polls, || 0).await;
+    }
+
+    /// [`LoadDriver::run`] on a replica that may follow a leader: the loop
+    /// runs for the process's life and polls only while `polls` reads
+    /// `true`. It pays the store's publications either way, whoever wrote
+    /// the rows: a follower's applier writes them, and the instant the
+    /// store names is read again at each tick. A turn to `false` ends the
+    /// run of polls, with its calls still out and its grouping of the
+    /// membership; a turn to `true` starts the next with a tick at once.
+    ///
+    /// `led` says the term the replica last took, read beside each word.
+    /// The watch keeps its last word alone: a loss and the take after it,
+    /// told before the loop looked, read as one `true`. Under another
+    /// term that word ends the run of polls and starts the next all the
+    /// same, so no call of the last lead lands on a store restored since.
+    pub async fn run_while(
+        &self,
+        mut stop: watch::Receiver<bool>,
+        mut polls: watch::Receiver<bool>,
+        led: impl Fn() -> u64,
+    ) {
         let mut ticker = tokio::time::interval(self.config.tick);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut schedule = Schedule::default();
+        // The word, and the term it was read under: one run of polls.
+        let (mut polling, mut under) = (*polls.borrow_and_update(), led());
+        // A write of another task can leave the store an instant this loop
+        // read none of (a registration's build): the store wakes the loop,
+        // which reads the instant again.
+        let woken = Arc::new(Notify::new());
+        self.store.wake_with(Box::new({
+            let woken = Arc::clone(&woken);
+            move || woken.notify_one()
+        }));
         loop {
             // The instant the store names for the rows its publication
             // window still holds, read after every write of this loop: the
             // last row of a burst is shown within one window of its
-            // receipt, with no later write.
+            // receipt, with no later write. A row another writer brought,
+            // a follower's applier, is read at the next tick.
             let due = self.store.publish_due();
             // The stop first; then the answers before the tick, which finds
             // the engines whose calls landed free to be asked again.
             tokio::select! {
                 biased;
                 _ = stop.wait_for(|stop| *stop) => return,
+                word = turned(&mut polls) => {
+                    // The term is read after the word: a take sets it
+                    // before its word is told.
+                    let term = led();
+                    if (word, term) != (polling, under) {
+                        (polling, under) = (word, term);
+                        schedule = Schedule::default();
+                        if polling {
+                            self.tick(&mut schedule);
+                        }
+                    }
+                }
                 Some(joined) = schedule.calls.join_next() => self.land(&mut schedule.due, joined),
+                () = woken.notified() => {}
                 () = at(due) => self.store.publish(now()),
-                _ = ticker.tick() => self.tick(&mut schedule),
+                _ = ticker.tick() => {
+                    if polling {
+                        self.tick(&mut schedule);
+                    }
+                }
             }
         }
     }
 
     /// The membership grouped by engine: the snapshot is read and regrouped
-    /// only when the store's epoch moved since the last tick (every write,
-    /// a status change included, moves it).
-    fn engines(&self) -> Arc<Vec<Engine>> {
+    /// only when the store's epoch moved since the run's last tick (every
+    /// write, a status change included, moves it).
+    fn engines(&self, grouped: &mut Option<Grouped>) -> Arc<Vec<Engine>> {
         let epoch = self.store.epoch();
-        let mut grouped = self.grouped.lock();
         if let Some(kept) = grouped.as_ref() {
             if kept.epoch == epoch {
                 return Arc::clone(&kept.engines);
@@ -480,10 +615,12 @@ where
     /// One tick: the membership read, the engines that left dropped, the due
     /// calls started. Nothing here waits on an engine.
     fn tick(&self, schedule: &mut Schedule) {
-        let engines = self.engines();
+        let engines = self.engines(&mut schedule.grouped);
         let tick_at = tokio::time::Instant::now();
         let live: HashSet<&str> = engines.iter().map(|engine| engine.key.as_str()).collect();
-        schedule.due.retain(|key, _| {
+        schedule.due.retain(|key, _| live.contains(key.as_str()));
+        let mut asked = self.asked.lock();
+        asked.retain(|key| {
             let kept = live.contains(key.as_str());
             if !kept {
                 self.probe.forget(key);
@@ -491,6 +628,9 @@ where
             kept
         });
         for (index, engine) in engines.iter().enumerate() {
+            if !asked.contains(&engine.key) {
+                asked.insert(engine.key.clone());
+            }
             let slot = schedule
                 .due
                 .entry(engine.key.clone())
@@ -662,6 +802,7 @@ where
                     }
                 };
                 let received = now();
+                let sampled_at = report.sampled_at.map(|at| at.min(received));
                 // A data-parallel engine's answer is scoped to each rank,
                 // whatever rows are ready; a rank the answer omits is
                 // unavailable: nothing is written for it, never another
@@ -678,7 +819,7 @@ where
                                     &scoped,
                                     engine.role,
                                     received,
-                                    received,
+                                    sampled_at.unwrap_or(received),
                                     SignalSource::Poll,
                                 )
                             });
@@ -691,7 +832,12 @@ where
                 // none and is the word that no report came, which a poll
                 // that left out a served rank does not say.
                 if rows > 0 || !served {
-                    self.store.report(&answer, polled_at, LoadSource::Poll);
+                    if let Some(sampled_at) = sampled_at {
+                        self.store
+                            .report_sampled(&answer, polled_at, sampled_at, LoadSource::Poll);
+                    } else {
+                        self.store.report(&answer, polled_at, LoadSource::Poll);
+                    }
                 }
                 self.stats.rows.fetch_add(rows as u64, Ordering::Relaxed);
             }

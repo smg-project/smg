@@ -1494,7 +1494,7 @@ mod tests {
             .expect("the warned decode is kept")
             .to_rgb8();
         assert!(
-            warned.as_raw() == reference.as_raw(),
+            warned == reference,
             "the warned decode's pixels are the clean file's"
         );
     }
@@ -1557,7 +1557,7 @@ mod tests {
             .expect("the comment tail is served")
             .to_rgb8();
         assert!(
-            served.as_raw() == reference.as_raw(),
+            served == reference,
             "the served pixels are the clean file's"
         );
     }
@@ -1952,7 +1952,7 @@ mod tests {
             .expect("the warned file with an appendage is kept")
             .to_rgb8();
         assert!(
-            warned.as_raw() == reference.as_raw(),
+            warned == reference,
             "the warned decode's pixels are the clean file's"
         );
     }

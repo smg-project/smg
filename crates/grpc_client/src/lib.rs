@@ -4,20 +4,17 @@
 //! the vLLM engine, TensorRT-LLM engine, MLX engine, TokenSpeed scheduler,
 //! and SGLang scheduler backends.
 
-pub mod common_proto {
-    #![allow(
-        clippy::all,
-        clippy::absolute_paths,
-        clippy::trivially_copy_pass_by_ref,
-        unused_qualifications
-    )]
-    tonic::include_proto!("smg.grpc.common");
-}
+/// The messages every engine's service shares (`common.proto`). The worker
+/// crate generates them; this is its module, at the path it had here.
+pub use smg_worker::common_proto;
 pub mod abort_on_drop;
 pub mod channel;
 pub mod codec;
 pub mod constraint_failure;
+pub mod engine_labels;
 pub mod engine_load;
+#[cfg(feature = "engine-port")]
+pub mod engine_port;
 mod framed;
 pub mod media_fault;
 pub mod media_identity;
@@ -40,7 +37,8 @@ pub use channel::{
     normalize_grpc_endpoint, Channel, DEFAULT_CONNECT_TIMEOUT,
 };
 pub use constraint_failure::{
-    constraint_failed_status, is_constraint_failure, CONSTRAINT_FAILED_METADATA_KEY,
+    constraint_failed_status, constraint_refused_status, is_constraint_failure,
+    is_constraint_refusal, CONSTRAINT_FAILED_METADATA_KEY, CONSTRAINT_REFUSED_METADATA_KEY,
 };
 /// The HTTP/2 layer under the channels, re-exported for callers that build
 /// or classify the transport faults [`is_transport_failure`] recognises.

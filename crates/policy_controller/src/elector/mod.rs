@@ -81,6 +81,10 @@
 //!   the record's duration, rounded up.
 //!   An elector alone over a store it made itself ([`Elector::alone`]) has
 //!   no other holder to wait for: its take leads at once.
+//!   The controller hands its candidate a step for each take. It runs
+//!   behind the take's write and behind the fence's stamp, so the step
+//!   reads the fence as any reader does: the take's term where its window
+//!   is open, and none where the window is past or the lead still waits.
 //!
 //! The elector keeps five private instants, each with one meaning. Before
 //! the first it writes no record that names it: it takes nothing, and a
@@ -373,6 +377,21 @@ impl Fence {
         self.lead.load().term
     }
 
+    /// The instant the clock alone next turns the answer of
+    /// [`Fence::leader_term`], as the fence stands at `now`: the opening of
+    /// a take's window still ahead, or the end of the window this process
+    /// leads in, past which the fence is closed. `None` where no window
+    /// stands or it has ended: only a write of the elector turns the answer
+    /// then. A reader that waits on the role sleeps to this instant.
+    pub fn turns_at(&self, now: Instant) -> Option<Instant> {
+        let (opens, until) = self.lead.load().window?;
+        if now < opens {
+            Some(opens)
+        } else {
+            (now <= until).then_some(until)
+        }
+    }
+
     fn set(&self, term: u64, window: Option<(Instant, Instant)>) {
         self.lead.store(Arc::new(Lead { term, window }));
     }
@@ -452,6 +471,9 @@ pub struct Elector {
     /// run leaves on a word ([`Elector::step_down`]), one lease duration
     /// ahead, and cleared by its next take.
     hold: Option<Instant>,
+    /// What this candidate's holder does at each take, behind the take's
+    /// write and behind the fence's stamp ([`Elector::at_take`]).
+    at_take: Option<Box<dyn Fn() + Send>>,
 }
 
 impl fmt::Debug for Elector {
@@ -497,6 +519,7 @@ impl Elector {
             stepped: None,
             alone: false,
             hold: None,
+            at_take: None,
         })
     }
 
@@ -518,6 +541,20 @@ impl Elector {
     /// The fence the shard threads read; one per elector, shared by handle.
     pub fn fence(&self) -> Arc<Fence> {
         Arc::clone(&self.fence)
+    }
+
+    /// Hands this candidate a step it runs at each take, behind the take's
+    /// write and behind the fence's stamp. The step reads the fence as any
+    /// reader does. It finds the take's term where the take's window is
+    /// open, and no term where the write returned past that window or the
+    /// lead still waits to open: what a step does for its term it does
+    /// under the fence, so a take that never leads does nothing by it. The
+    /// step runs inside [`Elector::tick`], on its caller's thread; a
+    /// renewal is no take and runs no step.
+    /// Built with the controller, its one caller.
+    #[cfg(any(test, feature = "controller"))]
+    pub(crate) fn at_take(&mut self, step: impl Fn() + Send + 'static) {
+        self.at_take = Some(Box::new(step));
     }
 
     /// This run's take still waits to lead: it took a record with no holder
@@ -716,26 +753,79 @@ impl Elector {
     /// is told none, closes its fence, releases the lease as
     /// [`Elector::release`] does and takes nothing for the duration its
     /// record said, from `now`: a candidate that followed it takes at its
-    /// next look. A candidate, and a holder that leads at or above the term
-    /// said, keep on as they are. An elector alone ([`Elector::alone`])
+    /// next look. A holder that leads at or above the term said keeps on as
+    /// it is. A candidate keeps on too, and where it saw the lease released
+    /// under a term below the highest its run saw, the term said counted,
+    /// it writes that release again under that highest, an empty record
+    /// and one gone for this run apart: whoever takes next takes above it.
+    /// An elector alone ([`Elector::alone`])
     /// holds nothing back: its next step takes its own lease again, above
     /// the term said.
     ///
-    /// `true` when the lease is released now. On an error the fence is
-    /// closed, and every later [`Elector::tick`] tries the release again in
-    /// place of a renewal, until it lands or the record moves.
+    /// `true` when the lease is released now. On a holder's error the fence
+    /// is closed, and every later [`Elector::tick`] tries the release again
+    /// in place of a renewal, until it lands or the record moves. A
+    /// candidate's error is its write over a release: the term is counted
+    /// and the record stays under the lower one.
     pub fn step_down(&mut self, above: Option<u64>, now: Instant) -> Result<bool, ElectError> {
         term_said(above)?;
         self.step_at(now);
         self.highest_term = self.highest_term.max(above.unwrap_or(0));
         let duration = match &self.held {
             Some(mine) if above.is_none_or(|term| term > mine.term) => mine.duration(),
-            _ => return Ok(false),
+            Some(_) => return Ok(false),
+            None => return self.raise(above, now),
         };
         // An elector alone holds nothing back: no other candidate can take
         // its lease, so its next step takes it again, above the term said.
         self.hold = (!self.alone).then_some(now + duration);
         self.release()
+    }
+
+    /// A term said to a run that holds no lease, over a release it saw
+    /// under a lower term: the release is written again under the highest
+    /// term this run saw, conditional on the record seen, so the candidate
+    /// that takes the lease next takes above that term. The term said is
+    /// counted before this call, so the highest is at or above it, and a
+    /// term whose write failed goes into the lease at the next word. A
+    /// holder's release carries the highest term its run saw at that write
+    /// ([`Elector::release`]), and a term said after it reached the lease by
+    /// no record before this. A record that is held, absent, or released at
+    /// or above the highest stays as it is, and so does one that moved
+    /// since it was seen: its writer took the lease, and is told the term by
+    /// the gateway that holds it. A record gone for this run, released under
+    /// a term below the one it last saw held, stays as it is too: no
+    /// holder's release made it so, that holder may still lead, and written
+    /// under a higher term the record would read as its release. An empty
+    /// record, released under term zero, stays as it is for the same
+    /// reason: no holder wrote it, one this run never saw may still lead,
+    /// and the take over it opens its fence a renew deadline late, which a
+    /// take over a release under a higher term does not. Never `true`:
+    /// this call releases no lease.
+    fn raise(&mut self, above: Option<u64>, now: Instant) -> Result<bool, ElectError> {
+        let gone = self
+            .gone(self.observed.as_ref().map(|seen| &seen.record))
+            .is_some();
+        let (Some(_), Some(observation)) = (above, self.observed.as_mut()) else {
+            return Ok(false);
+        };
+        let term = self.highest_term;
+        let seen = &observation.record;
+        if gone || !seen.is_released() || seen.term == 0 || seen.term >= term {
+            return Ok(false);
+        }
+        let raised = LeaseRecord {
+            term,
+            renewed_at_micros: next_wall_micros(seen.renewed_at_micros),
+            ..seen.clone()
+        };
+        if self.backend.write(Some(seen), &raised)? == Written::Done {
+            // The record's wait, where it says one, is timed from this
+            // sight of it, as every candidate times it from its own.
+            observation.since = observation.since.max(now);
+            observation.record = raised;
+        }
+        Ok(false)
     }
 
     /// A step of a holder that was told to leave and whose release has not
@@ -1095,6 +1185,12 @@ impl Elector {
                     since: now,
                 });
                 self.held = Some(record);
+                // The holder's step, behind the stamp: it reads the fence
+                // as any reader does, and a take whose window is past or
+                // still ahead shows it no term.
+                if let Some(step) = &self.at_take {
+                    step();
+                }
                 Ok(Tick::Acquired { term })
             }
             // Another write landed first and nothing is taken.
@@ -1281,6 +1377,58 @@ mod tests {
         assert_eq!(handed.fence().leader_term(t0), None);
     }
 
+    /// A take's step runs behind the take's stamp and reads the fence as
+    /// any reader does: the take's term where its window is open, and no
+    /// term where the lead still waits to open. A renewal is no take and
+    /// runs no step.
+    #[test]
+    fn a_takes_step_runs_behind_its_stamp() {
+        let t0 = Instant::now() + AHEAD;
+        // The steps a candidate ran, and whether the last was shown the
+        // first term.
+        let stepping = |elector: &mut Elector| {
+            let fence = elector.fence();
+            let (steps, shown) = (
+                Arc::new(AtomicU32::new(0)),
+                Arc::new(AtomicBool::new(false)),
+            );
+            let step = {
+                let (steps, shown) = (Arc::clone(&steps), Arc::clone(&shown));
+                move || {
+                    steps.fetch_add(1, Ordering::Relaxed);
+                    shown.store(fence.leader_term(t0) == Some(1), Ordering::Relaxed);
+                }
+            };
+            elector.at_take(step);
+            (steps, shown)
+        };
+        let mut alone = Elector::alone("a@host:1", settings()).expect("valid settings");
+        let (steps, shown) = stepping(&mut alone);
+        assert_eq!(alone.tick(t0).expect("tick"), Tick::Acquired { term: 1 });
+        assert_eq!(steps.load(Ordering::Relaxed), 1);
+        assert!(
+            shown.load(Ordering::Relaxed),
+            "the fence showed the take's term at the step"
+        );
+        assert_eq!(
+            alone.tick(t0 + S).expect("renew"),
+            Tick::Renewed { term: 1 }
+        );
+        assert_eq!(steps.load(Ordering::Relaxed), 1, "a renewal is no take");
+
+        // A take with no holder to wait for leads one renew deadline
+        // later: its step is shown no term.
+        let lease = MemoryLease::new();
+        let mut waiting = candidate(&lease, "b@host:1");
+        let (steps, shown) = stepping(&mut waiting);
+        assert_eq!(waiting.tick(t0).expect("tick"), Tick::Acquired { term: 1 });
+        assert_eq!(steps.load(Ordering::Relaxed), 1);
+        assert!(
+            !shown.load(Ordering::Relaxed),
+            "the lead still waits to open"
+        );
+    }
+
     #[test]
     fn a_candidate_takes_an_absent_lease_at_term_one_and_leads_a_renew_deadline_later() {
         let lease = MemoryLease::new();
@@ -1303,6 +1451,13 @@ mod tests {
         assert_eq!(fence.leader_term(t0 + 2 * S), None, "no renewal landed");
         assert_eq!(a.tick(t0 + S).expect("renew"), Tick::Renewed { term: 1 });
         assert_eq!(fence.leader_term(t0 + S), None, "inside the renew deadline");
+        // The clock alone turns that answer twice from here: at the
+        // opening still ahead, then at the window's end, and never after.
+        assert_eq!(fence.turns_at(t0 + S), Some(t0 + 2 * S));
+        assert_eq!(fence.turns_at(t0 + 2 * S), Some(t0 + 3 * S));
+        assert_eq!(fence.turns_at(t0 + 3 * S), Some(t0 + 3 * S));
+        let past = t0 + 3 * S + Duration::from_micros(1);
+        assert_eq!(fence.turns_at(past), None);
         // One renew deadline after the take the fence opens by itself, at
         // no step: the renewal behind it carries the window past that
         // instant, to its own renew deadline.
@@ -2518,6 +2673,184 @@ mod tests {
         assert_eq!(b.tick(t0).expect("take"), Tick::Acquired { term: 1 });
         assert!(b.step_down(None, t0 + 2 * S).expect("the word"));
         assert_eq!(b.observed().expect("the release").duration_ms, 0);
+    }
+
+    #[test]
+    fn a_higher_term_said_after_the_release_goes_into_the_released_record() {
+        // Three gateways show rising floors to one leader. The first word
+        // releases the lease under five; the second, nine, finds no lease
+        // held here and is written over the release; the third, twelve, is
+        // written over the record the second wrote, which this run's sight
+        // of the lease moved to. The candidate that takes next takes above
+        // twelve, so no gateway refuses its lead.
+        let lease = MemoryLease::new();
+        let mut a = candidate(&lease, "a@host:1");
+        let t0 = Instant::now() + AHEAD;
+        a.lead_at(t0);
+        let mut b = candidate(&lease, "b@host:2");
+        assert!(matches!(
+            b.tick(t0).expect("follow"),
+            Tick::Following { term: 1, .. }
+        ));
+        let word = t0 + S / 2;
+        assert!(a.step_down(Some(5), word).expect("the release"));
+        assert!(!a.step_down(Some(9), word).expect("the term is written"));
+        let stored = lease.clone().read().expect("read").expect("the record");
+        assert_eq!(
+            (stored.holder.as_str(), stored.term, stored.duration_ms),
+            ("", 9, 0)
+        );
+        assert!(!a.step_down(Some(12), word).expect("the term is written"));
+        let stored = lease.clone().read().expect("read").expect("the record");
+        assert_eq!(
+            (stored.holder.as_str(), stored.term, stored.duration_ms),
+            ("", 12, 0)
+        );
+        // A term at or under the record's writes nothing more.
+        assert!(!a.step_down(Some(12), word).expect("no write"));
+        assert!(!a.step_down(Some(7), word).expect("no write"));
+        assert_eq!(lease.clone().read().expect("read"), Some(stored));
+        assert_eq!(a.tick(word).expect("look"), Tick::Waiting { term: 12 });
+        assert_eq!(b.tick(word).expect("take"), Tick::Acquired { term: 13 });
+        assert_eq!(b.fence().leader_term(word), Some(13));
+    }
+
+    #[test]
+    fn a_term_said_over_a_release_that_moved_is_counted_and_writes_nothing() {
+        // The candidate took the released lease before the higher term was
+        // said: the record is that holder's and stays as it is. The gateway
+        // that holds the term tells it to that holder.
+        let lease = MemoryLease::new();
+        let mut a = candidate(&lease, "a@host:1");
+        let t0 = Instant::now() + AHEAD;
+        a.lead_at(t0);
+        let mut b = candidate(&lease, "b@host:2");
+        assert!(matches!(
+            b.tick(t0).expect("follow"),
+            Tick::Following { term: 1, .. }
+        ));
+        let word = t0 + S / 2;
+        assert!(a.step_down(Some(5), word).expect("the release"));
+        assert_eq!(b.tick(word).expect("take"), Tick::Acquired { term: 6 });
+        assert!(!a.step_down(Some(9), word).expect("the record moved"));
+        let stored = lease.clone().read().expect("read").expect("the record");
+        assert_eq!((stored.holder.as_str(), stored.term), ("b@host:2", 6));
+        assert_eq!(a.highest_term(), 9);
+    }
+
+    #[test]
+    fn a_term_whose_write_failed_goes_into_the_release_at_the_next_word() {
+        // The write of nine over the release fails: the term is counted and
+        // the record stays under five. A lower word, seven, then writes the
+        // highest term this run saw and not its own: the candidate that
+        // takes next takes above nine.
+        let lease = MemoryLease::new();
+        let fails = Arc::new(AtomicU32::new(0));
+        let backend = Failing {
+            lease: lease.clone(),
+            fails: Arc::clone(&fails),
+        };
+        let mut a = Elector::new(Box::new(backend), "a@host:1", settings()).expect("settings");
+        let t0 = Instant::now() + AHEAD;
+        a.lead_at(t0);
+        let mut b = candidate(&lease, "b@host:2");
+        assert!(matches!(
+            b.tick(t0).expect("follow"),
+            Tick::Following { term: 1, .. }
+        ));
+        let word = t0 + S / 2;
+        assert!(a.step_down(Some(5), word).expect("the release"));
+        fails.store(1, Ordering::Relaxed);
+        a.step_down(Some(9), word).expect_err("the backend is away");
+        let stored = lease.clone().read().expect("read").expect("the record");
+        assert_eq!((stored.term, a.highest_term()), (5, 9));
+        assert!(!a.step_down(Some(7), word).expect("the highest is written"));
+        let stored = lease.clone().read().expect("read").expect("the record");
+        assert_eq!(
+            (stored.holder.as_str(), stored.term, stored.duration_ms),
+            ("", 9, 0)
+        );
+        assert_eq!(b.tick(word).expect("take"), Tick::Acquired { term: 10 });
+    }
+
+    #[test]
+    fn a_term_said_over_a_record_gone_for_the_run_writes_nothing() {
+        // A hand writes an old release over a holder's record. For the
+        // candidate that saw that holder the record is gone: no holder's
+        // release made it so, and the holder may still lead. A term said
+        // inside the wait the candidate owes is counted and the record
+        // stays as it is: written under the term it would read as the
+        // holder's release and be taken at once, beside an open fence.
+        let lease = MemoryLease::new();
+        let mut w = candidate(&lease, "w@host:1");
+        let t0 = Instant::now() + AHEAD;
+        w.lead_at(t0);
+        let mut x = candidate(&lease, "x@host:2");
+        let mut c = candidate(&lease, "c@host:3");
+        x.tick(t0).expect("follow");
+        assert!(w.step_down(Some(4), t0 + S).expect("the release"));
+        let released = lease.clone().read().expect("read").expect("the release");
+        let took = x.tick(t0 + S).expect("take");
+        assert!(matches!(took, Tick::Acquired { .. }), "{took:?}");
+        c.tick(t0 + 2 * S).expect("follow");
+        x.tick(t0 + 2 * S).expect("renew");
+        let held = lease.clone().read().expect("read").expect("the record");
+        assert_eq!(
+            lease
+                .clone()
+                .write(Some(&held), &released)
+                .expect("a write"),
+            Written::Done
+        );
+        let at = t0 + 3 * S;
+        let gone = c.tick(at).expect("look");
+        assert!(!matches!(gone, Tick::Acquired { .. }), "{gone:?}");
+        let said = held.term;
+        assert!(!c.step_down(Some(said), at).expect("the word"));
+        assert_eq!(lease.clone().read().expect("read"), Some(released));
+        assert_eq!(c.highest_term(), said);
+        let next = c.tick(at).expect("look");
+        assert!(!matches!(next, Tick::Acquired { .. }), "{next:?}");
+        assert_eq!(c.fence().leader_term(at), None);
+        assert_eq!(x.fence().leader_term(at), Some(said));
+    }
+
+    #[test]
+    fn a_term_said_over_an_empty_record_writes_nothing() {
+        // An empty record, released under term zero, is no holder's
+        // release: a manifest put under a live holder reads so, and the
+        // take over it opens its fence a renew deadline late for a holder
+        // the taker never saw. A candidate whose take over it failed is
+        // told a term: the term is counted and the record stays empty.
+        // Written under the term it would read as a release, and the next
+        // take would lead at once.
+        let mut lease = MemoryLease::new();
+        let empty = LeaseRecord::default();
+        assert_eq!(lease.write(None, &empty).expect("a write"), Written::Done);
+        let fails = Arc::new(AtomicU32::new(1));
+        let backend = Failing {
+            lease: lease.clone(),
+            fails: Arc::clone(&fails),
+        };
+        let mut c = Elector::new(Box::new(backend), "c@host:3", settings()).expect("settings");
+        let t0 = Instant::now() + AHEAD;
+        c.tick(t0).expect_err("the backend is away");
+        assert!(!c.step_down(Some(5), t0).expect("the word"));
+        assert_eq!(lease.clone().read().expect("read"), Some(empty));
+        assert_eq!(c.highest_term(), 5);
+        // The next take is still a take over an empty record: at once, and
+        // its fence a renew deadline late.
+        let mut d = candidate(&lease, "d@host:4");
+        assert_eq!(d.tick(t0).expect("take"), Tick::Acquired { term: 1 });
+        let fence = d.fence();
+        assert_eq!(fence.leader_term(t0), None);
+        assert_eq!(d.tick(t0 + S).expect("renew"), Tick::Renewed { term: 1 });
+        assert_eq!(fence.leader_term(t0 + S), None, "inside the renew deadline");
+        assert_eq!(
+            d.tick(t0 + 2 * S).expect("renew"),
+            Tick::Renewed { term: 1 }
+        );
+        assert_eq!(fence.leader_term(t0 + 2 * S), Some(1));
     }
 
     #[test]

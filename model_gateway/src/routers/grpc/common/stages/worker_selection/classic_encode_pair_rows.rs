@@ -43,14 +43,15 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use openai_protocol::worker::WorkerStatus;
+use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
 use serde::{Serialize, Serializer};
+use smg_worker::{identity::basic::ConnectionMode, test_support::no_health_check};
 
 use super::*;
 use crate::{
     config::types::PolicyConfig,
     policies::PolicyFactory,
-    worker::{test_support::no_health_check, BasicWorkerBuilder, ConnectionMode, ModelCard},
+    routers::{common::snapshot::WorkerRegistryExt, grpc::backend_client::BasicWorkerBuilder},
 };
 
 const MODEL: &str = "m";

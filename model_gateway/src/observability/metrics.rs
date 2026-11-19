@@ -16,22 +16,25 @@ pub use smg_external_router::metrics::{
     bool_to_static_str, error_reason_from_status, intern_model_label, intern_tool_label,
     metrics_labels, STREAMING_FALSE, STREAMING_TRUE,
 };
+use smg_worker::metrics::{
+    series as worker_series,
+    series::{WorkerSeries, WorkerSeriesRecorder},
+    writers::{
+        describe_series as describe_worker_series, intern_string, KV_EVENT_APPLY_SECONDS,
+        KV_EVENT_LAG_SECONDS,
+    },
+};
 
 use crate::{
     config::{ConfigError, ConfigResult},
     routers::grpc::regular::symphony::telemetry as symphony_telemetry,
-    worker::metrics::{
-        describe_series as describe_worker_series, intern_string,
-        series::{self as worker_series, WorkerSeries, WorkerSeriesRecorder},
-        KV_EVENT_APPLY_SECONDS, KV_EVENT_LAG_SECONDS,
-    },
 };
 
 /// Per-thread caches of the handles the gateway's per-request records go
 /// through: the HTTP layer's, the stream-timing set's, the selection's, the
 /// cache-aware decision's, the index lookup's, the admission gauges' and the
 /// body path's. The worker's own caches are the worker module's
-/// (`crate::worker::metrics`); the helpers and the installed flag are the
+/// (`smg_worker::metrics::writers`); the helpers and the installed flag are the
 /// worker crate's, so every writer records the same way.
 mod handles {
     use std::{
@@ -541,7 +544,7 @@ pub(crate) fn init_metrics() {
     );
     describe_counter!("smg_tokenizer_cache_reused_bytes_total", "UTF-8 input bytes served by tokenizer cache hits: whole inputs for L0, matched prefixes for L1; not memory usage");
     describe_counter!("smg_detokenize_prefix_mismatch_total", "Incremental decode steps and end-of-input finishes whose output no longer started with the text already decoded and went on with the remainder (several per stream are possible; unary responses count too), by kind: byte_run (an invalid byte collapsed a ByteFallback run whose characters were already decoded) or decoder (another decoder step rewrote the decoded prefix)");
-    describe_counter!("smg_tokenizer_encode_path_loads_total", "Hugging Face tokenizers loaded, by the encode path chosen at load: v1 (the opt-in tokenizers v1 pipeline), native (the direct byte-level encoder) or tokenizers (the reference implementation); a tokenizer loaded twice counts twice");
+    describe_counter!("smg_tokenizer_encode_path_loads_total", "Hugging Face tokenizers loaded, by the encode path chosen at load: v1 (the opt-in tokenizers v1 pipeline), native (one of the crate's direct encoders: byte-level BPE or WordPiece) or tokenizers (the reference implementation); a tokenizer loaded twice counts twice");
     describe_counter!("smg_tokenizer_encode_fallbacks_total", "Inputs the direct byte-level encoder gave up to the reference implementation after the load's choice, by reason: piece_declined (the model declined a piece)");
 
     #[cfg(all(
@@ -743,10 +746,6 @@ pub(crate) fn init_metrics() {
     );
 
     // Layer 3: Worker metrics
-    describe_gauge!(
-        "smg_worker_pool_size",
-        "Current worker pool size by worker_type, connection_mode, model"
-    );
     // The worker's own series, described by the worker's module.
     describe_worker_series();
     describe_counter!(
@@ -858,30 +857,7 @@ pub(crate) fn init_metrics() {
     );
 
     // Layer 4: Discovery metrics
-    describe_counter!(
-        "smg_discovery_registrations_total",
-        "Worker registration attempts by source and result"
-    );
-    describe_counter!(
-        "smg_discovery_deregistrations_total",
-        "Worker deregistration events by source and reason"
-    );
-    describe_histogram!(
-        "smg_discovery_sync_duration_seconds",
-        "Discovery sync duration by source"
-    );
-    describe_gauge!(
-        "smg_discovery_workers_discovered",
-        "Workers known via discovery by source"
-    );
-    describe_counter!(
-        "smg_discovery_snapshot_errors_total",
-        "Discovery source observations rejected, by source and reason"
-    );
-    describe_counter!(
-        "smg_discovery_skipped_total",
-        "Discovered workers left out of an otherwise good snapshot, by source and reason"
-    );
+    smg_service_discovery::describe_series();
 
     // Layer 5: MCP metrics
     describe_counter!(
@@ -1017,8 +993,7 @@ pub fn init_startup_series() {
         ENDPOINT_GENERATE, ENDPOINT_MESSAGES, ENDPOINT_RERANK, ENDPOINT_RESPONSES,
         ENDPOINT_SYSTEMONE, WORKER_DECODE, WORKER_PREFILL, WORKER_REGULAR,
     };
-
-    use crate::worker::health::overload::{STAGE_DISPATCH, STAGE_PD_ADMISSION, STAGE_SELECTION};
+    use smg_worker::health::overload::{STAGE_DISPATCH, STAGE_PD_ADMISSION, STAGE_SELECTION};
 
     // Shedding happens at every stage; the two fallbacks only while the
     // candidate pool is assembled.
@@ -1122,7 +1097,7 @@ pub fn start_prometheus(config: PrometheusConfig) -> PrometheusHandle {
     let handle = recorder.handle();
 
     // Series labelled `worker` live in a store of their own so they can be
-    // dropped with their worker (see `worker::metrics::series`); it renders histograms
+    // dropped with their worker (see `smg_worker::metrics::series`); it renders histograms
     // with the exporter's buckets and quantiles.
     let workers = Arc::new(WorkerSeries::new(DistributionBuilder::new(
         parse_quantiles(DEFAULT_SUMMARY_QUANTILES),
@@ -2204,23 +2179,6 @@ impl Metrics {
     // Layer 3: Worker metrics
     // ========================================================================
 
-    /// Set worker pool size
-    pub fn set_worker_pool_size(
-        worker_type: &'static str,
-        connection_mode: &'static str,
-        model_id: &str,
-        size: usize,
-    ) {
-        let model = intern_model_label(model_id);
-        gauge!(
-            "smg_worker_pool_size",
-            "worker_type" => worker_type,
-            "connection_mode" => connection_mode,
-            "model" => model
-        )
-        .set(size as f64);
-    }
-
     /// Record worker selection
     pub fn record_worker_selection(
         worker_type: &'static str,
@@ -2440,70 +2398,6 @@ impl Metrics {
     // ========================================================================
 
     // ========================================================================
-    // Layer 4: Discovery metrics
-    // ========================================================================
-
-    /// Record worker registration attempt
-    pub fn record_discovery_registration(source: &'static str, result: &'static str) {
-        counter!(
-            "smg_discovery_registrations_total",
-            "source" => source,
-            "result" => result
-        )
-        .increment(1);
-    }
-
-    /// Record worker deregistration
-    pub fn record_discovery_deregistration(source: &'static str, reason: &'static str) {
-        counter!(
-            "smg_discovery_deregistrations_total",
-            "source" => source,
-            "reason" => reason
-        )
-        .increment(1);
-    }
-
-    /// Record discovery sync duration
-    pub fn record_discovery_sync_duration(source: &'static str, duration: Duration) {
-        histogram!(
-            "smg_discovery_sync_duration_seconds",
-            "source" => source
-        )
-        .record(duration.as_secs_f64());
-    }
-
-    /// Set workers discovered count
-    pub fn set_discovery_workers_discovered(source: &'static str, count: usize) {
-        gauge!(
-            "smg_discovery_workers_discovered",
-            "source" => source
-        )
-        .set(count as f64);
-    }
-
-    /// Record a discovered worker a provider left out of a snapshot it
-    /// otherwise applied
-    pub fn record_discovery_skip(source: &'static str, reason: &'static str) {
-        counter!(
-            "smg_discovery_skipped_total",
-            "source" => source,
-            "reason" => reason
-        )
-        .increment(1);
-    }
-
-    /// Record a discovery source observation that was rejected; the provider
-    /// keeps reconciling its last good snapshot meanwhile
-    pub fn record_discovery_snapshot_error(source: &'static str, reason: &'static str) {
-        counter!(
-            "smg_discovery_snapshot_errors_total",
-            "source" => source,
-            "reason" => reason
-        )
-        .increment(1);
-    }
-
-    // ========================================================================
     // Layer 5: MCP metrics
     // ========================================================================
 
@@ -2535,9 +2429,8 @@ pub(crate) mod test_support {
 
     /// The scrape a test renders under its own recorder, with the two
     /// readers of it: the worker's test support owns them.
-    pub(crate) use crate::worker::test_support::{
-        assert_metric, render_with_recorder, sorted_series,
-    };
+    pub(crate) use smg_worker::test_support::assert_metric;
+    pub(crate) use smg_worker::test_support::{render_with_recorder, sorted_series};
 }
 
 #[cfg(test)]

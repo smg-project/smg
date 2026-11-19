@@ -25,13 +25,15 @@ use smg::{
     config::{GroupedDpSticky, ParserChoice},
     middleware::{RouteRequestMeta, TenantKey},
     routers::{
-        grpc::backend_client::{get_backend_client, BackendClient, BackendConnector},
+        grpc::backend_client::{
+            get_backend_client, BackendClient, BackendConnector, BasicWorkerBuilder,
+        },
         RouterTrait,
     },
-    worker::{
-        connection::engine::{EngineConnector, ZmqLink},
-        BasicWorker, BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerType,
-    },
+};
+use smg_worker::{
+    connection::engine::{EngineConnector, ZmqLink},
+    identity::basic::{BasicWorker, ConnectionMode, RuntimeType, Worker, WorkerType},
 };
 
 use crate::common;

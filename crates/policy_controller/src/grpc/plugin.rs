@@ -21,17 +21,18 @@ use super::{
     config::{GrpcPluginSpec, Transport},
     runtime::{
         answer_bytes, Command, Fault, Lane, LaneEvents, ObserveLane, Peer, Readiness, Runtime,
-        SendError, Wait, Witness,
+        SendError, Spoken, Wait, Witness,
     },
     unit::Unit,
     view::{self, Answer, FILTER, PICK, SCORE},
+    PROTOCOL, PROTOCOL_MIN,
 };
 use crate::{
     decision::{Decision, Target},
-    framework::DecisionScope,
+    framework::{DecisionScope, TieBand},
     lease::{Lease, Membership, Outcome, ReleaseReason, Side, Signal},
     plugins::{
-        config::{Exposure, Failure, FrameBudget},
+        config::{EventSet, Exposure, Failure, FrameBudget},
         intern, own_bound, BoundPlugin, Counters, Fallback, HalfOpen, OpenDecision, Stage,
     },
     proto,
@@ -178,6 +179,7 @@ struct Inner {
     frame: FrameBudget,
     exposure: Exposure,
     needs: Needs,
+    observes: EventSet,
     failure: Failure,
     max_candidates: u32,
     counters: Counters,
@@ -186,7 +188,8 @@ struct Inner {
     peer: Arc<Peer>,
     observe_tx: mpsc::Sender<proto::ObserveRequest>,
     /// The `Observe` stream's queue until the first `Decide` stream
-    /// settles, which opens it.
+    /// settles, which opens it. None from the load on where the row lists no
+    /// kind of event: no stream is opened, and nothing is told.
     observe_rx: Mutex<Option<mpsc::Receiver<proto::ObserveRequest>>>,
     /// How many counters the row declares: an answer holds no more
     /// increments.
@@ -213,7 +216,14 @@ impl Inner {
         self.unit.fail(self.now());
     }
 
-    fn observe(&self, event: proto::lifecycle_event::Event) {
+    /// Raises one event. The queue's room comes first and `event` makes the
+    /// event behind it: one the full queue refuses is counted and not built.
+    fn observe(&self, event: impl FnOnce() -> proto::lifecycle_event::Event) {
+        let Ok(room) = self.observe_tx.try_reserve() else {
+            bump(&self.tally.observe_dropped);
+            return;
+        };
+        let event = event();
         // The number is the stream's: the I/O thread writes it where the
         // event enters the stream, so threads that raise events at once
         // cannot send a later number first. A refused event is counted
@@ -222,18 +232,15 @@ impl Inner {
         // every event that entered the queue before the loss. An event whose
         // thread stood between this read and its entry when the loss fell
         // can arrive on either side.
-        let request = proto::ObserveRequest {
+        room.send(proto::ObserveRequest {
             request: Some(proto::observe_request::Request::Event(
                 proto::LifecycleEvent {
                     seq: self.tally.observe_dropped.load(Ordering::Relaxed),
                     event: Some(event),
                 },
             )),
-        };
-        match self.observe_tx.try_send(request) {
-            Ok(()) => bump(&self.tally.observed),
-            Err(_) => bump(&self.tally.observe_dropped),
-        }
+        });
+        bump(&self.tally.observed);
     }
 }
 
@@ -324,6 +331,8 @@ impl Plugin {
             counters: spec.metrics.clone(),
             connect: Duration::from_micros(u64::from(spec.connect_micros)),
             answer_bytes: answer_bytes(spec.max_candidates, spec.metrics.len()),
+            versions: PROTOCOL_MIN..=PROTOCOL,
+            spoken: Spoken::default(),
         });
         let (observe_tx, observe_rx) = mpsc::channel(OBSERVE_QUEUE);
         let inner = Arc::new_cyclic(|me| Inner {
@@ -333,6 +342,7 @@ impl Plugin {
             frame,
             exposure: spec.view,
             needs: spec.needs,
+            observes: spec.observes,
             failure: spec.failure,
             max_candidates: spec.max_candidates,
             declared: spec.metrics.len(),
@@ -341,7 +351,7 @@ impl Plugin {
             tally: Tally::default(),
             peer,
             observe_tx,
-            observe_rx: Mutex::new(Some(observe_rx)),
+            observe_rx: Mutex::new((!spec.observes.is_empty()).then_some(observe_rx)),
         });
         let plugin = Arc::new(Self {
             inner,
@@ -399,6 +409,12 @@ impl Plugin {
 
     pub fn needs(&self) -> Needs {
         self.inner.needs
+    }
+
+    /// The kinds of lifecycle event the plugin hears, as its row lists
+    /// them.
+    pub fn observes(&self) -> EventSet {
+        self.inner.observes
     }
 
     /// The counters the plugin adds to.
@@ -1020,7 +1036,7 @@ impl Bound {
         facts: &RequestFacts<'_>,
         kept: &[u32],
         out: &mut [f32],
-    ) -> Result<(), Fallback> {
+    ) -> Result<TieBand, Fallback> {
         let mut open = self.state(facts.phase);
         if open.asked & SCORE == 0 {
             return Err(Fallback);
@@ -1032,7 +1048,7 @@ impl Bound {
         for (o, &i) in out.iter_mut().zip(kept) {
             *o = answer.scores.get(i as usize).copied().unwrap_or(0.0);
         }
-        Ok(())
+        Ok(answer.band.map_or(TieBand::NORMALIZED, TieBand))
     }
 
     /// The picker's answer over the survivors (`scores[i]` belongs to
@@ -1104,15 +1120,19 @@ impl DecisionScope for Bound {
 /// kind's answers, named by the plugin.
 impl BoundPlugin for Bound {
     fn name(&self) -> &'static str {
-        self.plugin.inner.name
+        self.plugin.name()
     }
 
     fn failure(&self) -> Failure {
-        self.plugin.inner.failure
+        self.plugin.failure()
     }
 
     fn needs(&self) -> Needs {
-        self.plugin.inner.needs
+        self.plugin.needs()
+    }
+
+    fn observes(&self) -> EventSet {
+        self.plugin.observes()
     }
 
     fn take_observer(&self) -> bool {
@@ -1141,7 +1161,7 @@ impl BoundPlugin for Bound {
         facts: &RequestFacts<'_>,
         kept: &[u32],
         out: &mut [f32],
-    ) -> Result<(), Fallback> {
+    ) -> Result<TieBand, Fallback> {
         Bound::score(self, facts, kept, out)
     }
 
@@ -1156,7 +1176,7 @@ impl BoundPlugin for Bound {
 
     fn observe_issued(&self, lease: &Lease, decision: &Decision) {
         let inner = &self.plugin.inner;
-        inner.observe(view::issued(lease, decision, &inner.exposure));
+        inner.observe(|| view::issued(lease, decision, &inner.exposure));
     }
 
     fn observe_dispatched(
@@ -1168,24 +1188,34 @@ impl BoundPlugin for Bound {
     ) {
         self.plugin
             .inner
-            .observe(view::dispatched(lease, side, since_decision_micros));
+            .observe(|| view::dispatched(lease, side, since_decision_micros));
     }
 
     fn observe_completed(&self, lease: &Lease, outcome: &Outcome) {
-        self.plugin.inner.observe(view::completed(lease, outcome));
+        self.plugin
+            .inner
+            .observe(|| view::completed(lease, outcome));
     }
 
     fn observe_released(&self, lease: &Lease, reason: ReleaseReason) {
-        self.plugin.inner.observe(view::released(lease, reason));
+        self.plugin.inner.observe(|| view::released(lease, reason));
     }
 
     fn observe_membership(&self, change: &Membership<'_>) {
-        self.plugin.inner.observe(view::membership(change));
+        let inner = &self.plugin.inner;
+        // A word the standing streams' version has no kind for is not
+        // raised: in the queue it would take a place a heard event needs,
+        // and a refusal of it would number a loss the stream never had.
+        let since = view::since_of(change);
+        if since > PROTOCOL_MIN && inner.peer.spoken.stands_under(since) {
+            return;
+        }
+        inner.observe(|| view::membership(change));
     }
 
     fn observe_signal(&self, signal: &Signal) {
         let inner = &self.plugin.inner;
-        inner.observe(view::signal(signal, inner.now()));
+        inner.observe(|| view::signal(signal, inner.now()));
     }
 }
 

@@ -4023,6 +4023,401 @@ fn the_seed_answers_a_vocabulary_piece_before_the_model_does() {
     assert_eq!(caches, [(2, 0)]);
 }
 
+/// A byte-level encoder for the tests of the waiting pieces: "xy" is an
+/// entry the one merge reaches (one id from the seed), "ab" an entry no
+/// merge reaches (the seed holds the two ids the model gives it), and "xyq"
+/// is no entry (merged into two ids).
+fn waiting_fixture() -> (HfTokenizer, NativeEncoder) {
+    let mut vocab = Vocab::default();
+    for (id, c) in bytes_char().iter().enumerate() {
+        vocab.insert(c.to_string(), id as u32);
+    }
+    let xy = vocab.len() as u32;
+    vocab.insert("xy".to_owned(), xy);
+    let ab = vocab.len() as u32;
+    vocab.insert("ab".to_owned(), ab);
+    let bpe = BPE::builder()
+        .vocab_and_merges(vocab, vec![("x".to_owned(), "y".to_owned())])
+        .build()
+        .expect("bpe");
+    let mut tokenizer = HfTokenizer::new(bpe);
+    tokenizer.with_pre_tokenizer(Some(byte_level(true)));
+    tokenizer.with_decoder(Some(ByteLevelDecoder::default()));
+    let native = seeded(&tokenizer);
+    (tokenizer, native)
+}
+
+/// Probes the thread's table for `piece`, a piece it does not hold, and
+/// hands the miss to `NativeEncoder::seeded`, as the probe of a piece does.
+fn miss(native: &NativeEncoder, piece: &[u8], ids: &mut Vec<u32>, cache: &mut PieceCache) -> bool {
+    let key = ShortPieceKey::of(piece).expect("a short piece");
+    let vacancy = cache.packed.lookup(key, ids).expect("a miss");
+    native.seeded(vacancy, ids, cache)
+}
+
+/// A miss close behind another takes a hole of one id and waits; the answer
+/// writes the seed's id into the hole, and the thread's table has learned
+/// the piece.
+#[test]
+fn a_miss_close_behind_another_waits_and_takes_its_id_at_its_hole() {
+    let (tokenizer, native) = waiting_fixture();
+    let model = tokenizer.get_model();
+    let xy = model.token_to_id("xy").expect("xy");
+    let mut cache = native.thread_piece_cache().borrow_mut();
+    let mut ids = vec![7, 8, 9];
+    cache.last_miss = 2;
+    assert!(miss(&native, b"xy", &mut ids, &mut cache), "it waits");
+    assert_eq!(ids, [7, 8, 9, 0], "a hole of one id");
+    assert_eq!(cache.waiting.len(), 1);
+    assert_eq!(
+        cache.packed.len(),
+        0,
+        "nothing is learned before the answer"
+    );
+    ids.push(10);
+    native.answer_waiting(&mut ids, &mut cache);
+    assert_eq!(ids, [7, 8, 9, xy, 10]);
+    assert!(cache.waiting.is_empty());
+    assert_eq!(cache.packed.len(), 1, "the piece is learned");
+    let key = ShortPieceKey::of(b"xy").expect("key");
+    assert!(cache.packed.ids_into(key, &mut ids));
+    assert_eq!(ids, [7, 8, 9, xy, 10, xy]);
+}
+
+/// An answer that is not one id moves the ids behind its own hole and
+/// leaves the holes before it where they are: the seed's two ids of an
+/// entry no merge reaches, and the two ids of a merged piece.
+#[test]
+fn an_answer_of_several_ids_moves_only_the_ids_behind_its_hole() {
+    let (tokenizer, native) = waiting_fixture();
+    let model = tokenizer.get_model();
+    let id = |token: &str| model.token_to_id(token).expect("a token");
+    let mut cache = native.thread_piece_cache().borrow_mut();
+    let mut ids = vec![7];
+    cache.last_miss = 0;
+    assert!(miss(&native, b"ab", &mut ids, &mut cache));
+    ids.push(8);
+    assert!(miss(&native, b"xy", &mut ids, &mut cache));
+    assert!(miss(&native, b"xyq", &mut ids, &mut cache));
+    ids.push(9);
+    assert_eq!(ids, [7, 0, 8, 0, 0, 9]);
+    native.answer_waiting(&mut ids, &mut cache);
+    assert_eq!(
+        ids,
+        [7, id("a"), id("b"), 8, id("xy"), id("xy"), id("q"), 9]
+    );
+    assert_eq!(cache.packed.len(), 3);
+}
+
+/// A piece met twice while it waits takes its ids at both holes: the later
+/// hole's answer is learned, and the earlier hole reads it from the
+/// thread's table, so the piece is merged once.
+#[test]
+fn a_piece_that_waits_twice_takes_its_ids_at_both_holes() {
+    let (tokenizer, native) = waiting_fixture();
+    let model = tokenizer.get_model();
+    let id = |token: &str| model.token_to_id(token).expect("a token");
+    let mut cache = native.thread_piece_cache().borrow_mut();
+    let mut ids = vec![7];
+    cache.last_miss = 0;
+    assert!(miss(&native, b"xyq", &mut ids, &mut cache));
+    assert!(miss(&native, b"xy", &mut ids, &mut cache));
+    assert!(
+        miss(&native, b"xyq", &mut ids, &mut cache),
+        "not learned yet"
+    );
+    assert_eq!(ids, [7, 0, 0, 0]);
+    native.answer_waiting(&mut ids, &mut cache);
+    assert_eq!(ids, [7, id("xy"), id("q"), id("xy"), id("xy"), id("q")]);
+    assert_eq!(cache.packed.len(), 2);
+}
+
+/// A piece the seed holds that is met twice while it waits is learned once:
+/// the later hole's answer takes the vacancy, the earlier hole's copy is
+/// refused on the taken slot, and its insert finds the piece stored.
+#[test]
+fn a_seeded_piece_that_waits_twice_is_learned_once() {
+    let (tokenizer, native) = waiting_fixture();
+    let model = tokenizer.get_model();
+    let id = |token: &str| model.token_to_id(token).expect("a token");
+    let mut cache = native.thread_piece_cache().borrow_mut();
+    let mut ids = vec![7];
+    cache.last_miss = 0;
+    assert!(miss(&native, b"xy", &mut ids, &mut cache));
+    assert!(miss(&native, b"q", &mut ids, &mut cache));
+    assert!(
+        miss(&native, b"xy", &mut ids, &mut cache),
+        "not learned yet"
+    );
+    assert_eq!(ids, [7, 0, 0, 0]);
+    native.answer_waiting(&mut ids, &mut cache);
+    assert_eq!(ids, [7, id("xy"), id("q"), id("xy")]);
+    assert_eq!(cache.packed.len(), 2);
+}
+
+/// The answers of one group that are not one id wait in the scratch list
+/// for the one pass, each with its own ids: a piece merged after the seed
+/// gave the two ids of a later hole is placed and learned with its own.
+#[test]
+fn answers_of_several_ids_in_one_group_keep_their_own_ids() {
+    let (tokenizer, native) = waiting_fixture();
+    let model = tokenizer.get_model();
+    let id = |token: &str| model.token_to_id(token).expect("a token");
+    let mut cache = native.thread_piece_cache().borrow_mut();
+    let mut ids = vec![7];
+    cache.last_miss = 0;
+    assert!(miss(&native, b"xyq", &mut ids, &mut cache));
+    ids.push(8);
+    assert!(miss(&native, b"ab", &mut ids, &mut cache));
+    ids.push(9);
+    assert_eq!(ids, [7, 0, 8, 0, 9]);
+    native.answer_waiting(&mut ids, &mut cache);
+    assert_eq!(ids, [7, id("xy"), id("q"), 8, id("a"), id("b"), 9]);
+    assert_eq!(cache.packed.len(), 2);
+    for (piece, learned) in [
+        (&b"xyq"[..], [id("xy"), id("q")]),
+        (&b"ab"[..], [id("a"), id("b")]),
+    ] {
+        let key = ShortPieceKey::of(piece).expect("key");
+        ids.clear();
+        assert!(cache.packed.ids_into(key, &mut ids));
+        assert_eq!(ids, learned);
+    }
+}
+
+/// An answer of no id closes its hole, and the other pieces take their ids
+/// where they belong. No encoder that waits gives such an answer (its table
+/// has a token for every byte): here the merge table is taken away.
+#[test]
+fn a_waiting_piece_with_no_id_has_its_hole_closed() {
+    let (tokenizer, mut native) = waiting_fixture();
+    let model = tokenizer.get_model();
+    let id = |token: &str| model.token_to_id(token).expect("a token");
+    native.merges = None;
+    let mut cache = native.thread_piece_cache().borrow_mut();
+    let mut ids = vec![7];
+    cache.last_miss = 0;
+    assert!(miss(&native, b"xyq", &mut ids, &mut cache));
+    assert!(miss(&native, b"ab", &mut ids, &mut cache));
+    ids.push(8);
+    assert!(miss(&native, b"xy", &mut ids, &mut cache));
+    assert_eq!(ids, [7, 0, 0, 8, 0]);
+    native.answer_waiting(&mut ids, &mut cache);
+    assert_eq!(ids, [7, id("a"), id("b"), 8, id("xy")]);
+}
+
+/// A thread at its share clears its table when it learns a piece. The
+/// pieces that still wait are answered all the same: each asks the table as
+/// it is at its own answer.
+#[test]
+fn a_table_cleared_while_pieces_wait_answers_every_one_of_them() {
+    let (tokenizer, native) = waiting_fixture();
+    let model = tokenizer.get_model();
+    let id = |token: &str| model.token_to_id(token).expect("a token");
+    let mut cache = native.thread_piece_cache().borrow_mut();
+    cache.share = 1;
+    let mut ids = vec![7];
+    cache.last_miss = 0;
+    for piece in [&b"xy"[..], b"ab", b"xyq", b"q"] {
+        assert!(miss(&native, piece, &mut ids, &mut cache));
+    }
+    native.answer_waiting(&mut ids, &mut cache);
+    assert_eq!(
+        ids,
+        [7, id("xy"), id("a"), id("b"), id("xy"), id("q"), id("q")]
+    );
+    assert_eq!(
+        cache.packed.len(),
+        1,
+        "cleared at every piece after the first"
+    );
+}
+
+/// A miss far behind the last one stands alone: the seed answers it where
+/// it is met and nothing waits; a piece the seed does not hold is left to
+/// the slow call, with no hole. The miss close behind it waits.
+#[test]
+fn a_miss_that_stands_alone_is_answered_where_it_is_met() {
+    let (tokenizer, native) = waiting_fixture();
+    let model = tokenizer.get_model();
+    let xy = model.token_to_id("xy").expect("xy");
+    let mut cache = native.thread_piece_cache().borrow_mut();
+    let mut ids = vec![7; WAITING_GAP + 1];
+    cache.last_miss = 0;
+    assert!(
+        miss(&native, b"xy", &mut ids, &mut cache),
+        "the seed answered"
+    );
+    assert_eq!(ids.len(), WAITING_GAP + 2);
+    assert_eq!(ids.last(), Some(&xy));
+    assert!(cache.waiting.is_empty());
+    assert_eq!(cache.packed.len(), 1);
+    cache.last_miss = 0;
+    assert!(
+        !miss(&native, b"xyq", &mut ids, &mut cache),
+        "the slow call's"
+    );
+    assert_eq!(ids.len(), WAITING_GAP + 2, "no hole");
+    assert!(cache.waiting.is_empty());
+    assert!(
+        miss(&native, b"ab", &mut ids, &mut cache),
+        "close behind: it waits"
+    );
+    assert_eq!(cache.waiting.len(), 1);
+}
+
+/// A miss far behind the last one, while pieces wait, waits with them and
+/// has them all answered there, itself the last of them.
+#[test]
+fn a_miss_far_behind_the_last_one_has_the_waiting_pieces_answered() {
+    let (tokenizer, native) = waiting_fixture();
+    let model = tokenizer.get_model();
+    let id = |token: &str| model.token_to_id(token).expect("a token");
+    let mut cache = native.thread_piece_cache().borrow_mut();
+    let mut ids = vec![7];
+    cache.last_miss = 0;
+    assert!(miss(&native, b"xy", &mut ids, &mut cache));
+    assert_eq!(cache.waiting.len(), 1);
+    ids.resize(ids.len() + WAITING_GAP + 1, 8);
+    assert!(miss(&native, b"ab", &mut ids, &mut cache), "answered");
+    assert!(cache.waiting.is_empty());
+    let mut expected = vec![7, id("xy")];
+    expected.resize(expected.len() + WAITING_GAP + 1, 8);
+    expected.extend([id("a"), id("b")]);
+    assert_eq!(ids, expected);
+    assert_eq!(cache.packed.len(), 2, "both are learned");
+}
+
+/// As many pieces as are answered together are answered at the last of
+/// them, and the answer gives each piece the ids the model gives it.
+#[test]
+fn as_many_pieces_as_are_answered_together_are_answered_at_the_last() {
+    let (tokenizer, native) = waiting_fixture();
+    let model = tokenizer.get_model();
+    let mut cache = native.thread_piece_cache().borrow_mut();
+    let mut ids = vec![7];
+    cache.last_miss = 0;
+    let words: Vec<String> = (0..WAITING_PIECES as u32).map(word).collect();
+    let (last, waiting) = words.split_last().expect("words");
+    for piece in waiting {
+        assert!(miss(&native, piece.as_bytes(), &mut ids, &mut cache));
+    }
+    assert_eq!(cache.waiting.len(), WAITING_PIECES - 1);
+    assert!(miss(&native, last.as_bytes(), &mut ids, &mut cache));
+    assert!(cache.waiting.is_empty());
+    let mut expected = vec![7];
+    for piece in &words {
+        expected.extend(model.tokenize(piece).expect("tokens").iter().map(|t| t.id));
+    }
+    assert_eq!(ids, expected);
+}
+
+/// The waiting pieces are answered with no model at hand, so a miss waits
+/// only where the table merges every short piece. Where it lacks a byte's
+/// token, and where `ignore_merges` keeps the whole-piece lookup (a
+/// vocabulary with gaps in its ids), a miss close behind another takes no
+/// hole: it is left to the slow call, which has the model.
+#[test]
+fn a_miss_does_not_wait_where_a_short_piece_may_need_the_model() {
+    for (gone, ignore_merges) in [(Some(0x0B), false), (None, true)] {
+        let mut vocab = Vocab::default();
+        for (id, c) in bytes_char().iter().enumerate() {
+            if Some(id) != gone {
+                vocab.insert(c.to_string(), id as u32);
+            }
+        }
+        // Beyond the ids the seed reads: the seed does not hold it.
+        vocab.insert("xy".to_owned(), 300);
+        let bpe = BPE::builder()
+            .vocab_and_merges(vocab, vec![("x".to_owned(), "y".to_owned())])
+            .ignore_merges(ignore_merges)
+            .build()
+            .expect("bpe");
+        let mut tokenizer = HfTokenizer::new(bpe);
+        tokenizer.with_pre_tokenizer(Some(byte_level(true)));
+        tokenizer.with_decoder(Some(ByteLevelDecoder::default()));
+        let native = seeded(&tokenizer);
+        assert!(!native.misses_wait, "{gone:?} {ignore_merges}");
+        let mut cache = native.thread_piece_cache().borrow_mut();
+        let mut ids = vec![7, 8, 9];
+        cache.last_miss = 2;
+        assert!(
+            !miss(&native, b"xy", &mut ids, &mut cache),
+            "the slow call's"
+        );
+        assert_eq!(ids, [7, 8, 9], "no hole");
+        assert!(cache.waiting.is_empty());
+    }
+}
+
+/// A young thread's close miss waits. A thread whose table has outgrown its
+/// reservation has its misses answered where they are met, however close
+/// together they come.
+#[test]
+fn a_thread_whose_table_outgrew_its_reservation_does_not_wait() {
+    let (tokenizer, native) = waiting_fixture();
+    let model = tokenizer.get_model();
+    let id = |token: &str| model.token_to_id(token).expect("a token");
+    let mut cache = native.thread_piece_cache().borrow_mut();
+    let mut ids = vec![7];
+    cache.last_miss = 0;
+    assert!(
+        miss(&native, b"xy", &mut ids, &mut cache),
+        "young: it waits"
+    );
+    assert_eq!(ids, [7, 0]);
+    native.answer_waiting(&mut ids, &mut cache);
+    assert_eq!(ids, [7, id("xy")]);
+    let share = cache.share;
+    let mut pieces = 0u32;
+    while cache.packed.slots() <= THREAD_BACKING_SLOTS {
+        let piece = format!("{pieces:07}");
+        let key = ShortPieceKey::of(piece.as_bytes()).expect("key");
+        assert!(cache.packed.insert(key, &[1], share));
+        pieces += 1;
+    }
+    let mut ids = vec![7];
+    cache.last_miss = 0;
+    assert!(
+        miss(&native, b"ab", &mut ids, &mut cache),
+        "the seed answered"
+    );
+    assert_eq!(ids, [7, id("a"), id("b")]);
+    assert!(cache.waiting.is_empty());
+}
+
+/// A waiting piece is merged under its own flag, not the flag of the unit
+/// being encoded when its answer comes, and that unit's flag is as it was.
+#[test]
+fn a_waiting_piece_is_merged_under_its_own_ascii_flag() {
+    let (tokenizer, native) = waiting_fixture();
+    let model = tokenizer.get_model();
+    let piece = "x\u{e9}";
+    let spelled: String = piece
+        .bytes()
+        .map(|b| native.alphabet[usize::from(b)])
+        .collect();
+    let mut expected = vec![7];
+    expected.extend(
+        model
+            .tokenize(&spelled)
+            .expect("tokens")
+            .iter()
+            .map(|t| t.id),
+    );
+    let mut cache = native.thread_piece_cache().borrow_mut();
+    let mut ids = vec![7];
+    cache.last_miss = 0;
+    assert!(miss(&native, piece.as_bytes(), &mut ids, &mut cache));
+    cache.unit_ascii = true;
+    native.answer_waiting(&mut ids, &mut cache);
+    assert!(
+        cache.unit_ascii,
+        "the flag of the unit being encoded is as it was"
+    );
+    assert_eq!(ids, expected);
+}
+
 /// Distinct words for distinct `i`: distinct pieces.
 fn word(mut i: u32) -> String {
     let mut word = String::new();
@@ -5172,7 +5567,11 @@ fn an_ascii_free_line_splits_into_its_pieces_in_one_pass() {
 /// pair inside a word becomes the next token), the byte tokens ranked
 /// first or, as in a file whose byte tokens are not its first lines, last.
 fn tiktoken_ranks(state: &mut u64, merges: usize, bytes_last: bool) -> FxHashMap<Vec<u8>, u32> {
-    let corpus = random_text(state, 6000, &[]);
+    tiktoken_ranks_of(&random_text(state, 6000, &[]), merges, bytes_last)
+}
+
+/// [`tiktoken_ranks`] learnt from `corpus`.
+fn tiktoken_ranks_of(corpus: &str, merges: usize, bytes_last: bool) -> FxHashMap<Vec<u8>, u32> {
     let mut symbols: Vec<Vec<u8>> = corpus.bytes().map(|b| vec![b]).collect();
     let mut tokens: Vec<Vec<u8>> = Vec::new();
     let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
@@ -5275,6 +5674,102 @@ fn a_tiktoken_vocabulary_encodes_on_the_direct_path_as_its_own_encoder_does() {
             Ok(own.encode_ordinary(&long))
         );
     }
+}
+
+/// The Kimi template on the direct path cuts shaped text as the file's own
+/// encoder does. The direct path reads the template's matches by the scanner
+/// of the cased template behind its opening run; the file's encoder runs the
+/// pattern itself. The vocabulary is learnt from text of the same parts, so
+/// tokens span the edges the template cuts at (an ideograph and the letter,
+/// the digit or the mark beside it, a radical and the punctuation beside
+/// it): a piece cut elsewhere merges to other ids. The parts are every class
+/// the template tells apart: ideographs of the plane and above it, the Han
+/// characters that are no letters (iteration marks, numerals, radicals),
+/// kana and CJK punctuation, letter runs of every case structure with
+/// marks, digits, white space and line ends, punctuation, the clitics in
+/// both cases, and those side by side, with the special tokens among them,
+/// whole and cut. One text in sixteen is encoded again cut at every
+/// character, from the start and to the end, and one is long enough for
+/// the thread pool.
+#[test]
+fn the_kimi_template_encodes_shaped_text_as_the_files_own_encoder_does() {
+    const SPECIALS: [&str; 4] = ["[BOS]", "[EOS]", "<|im_end|>", "<|reserved_token_1|>"];
+    const PARTS: &[&str] = &[
+        "中", "中文", "汉字", "漢字", "㐀", "豈", "𠀀", "々", "〻", "〇", "〡", "⺀", "⿕", "あ",
+        "ア", "ー", "。", "、", "a", "word", "Word", "WORD", "wORD", "iPhone", "McDonald", "HTTPd",
+        "é", "É", "ß", "ſ", "ǅx", "ʰa", "я", "Я", "ก", "ा", "\u{301}", "1", "22", "333", "4444",
+        "٣", "²", " ", "  ", "\t", "\n", "\n\n", "\r\n", "\u{A0}", "\u{3000}", ".", ",", "!", "?",
+        "-", "(", ")", "\"", "/", "...", "，", "😀", "\u{200D}", "\u{FFFD}", "'", "'s", "'S", "'t",
+        "'re", "'RE", "'ve", "'m", "'ll", "'LL", "'d", "'x", "’s", "中A", "A中", "a中b", "中1",
+        "1〇", "〇1", "!⺀", "⺀!", "⺀a", " 中", "中 ", "中's", "中\n",
+    ];
+    let shaped = |state: &mut u64, parts: usize, specials: &[&str]| -> String {
+        let mut text = String::new();
+        for _ in 0..parts {
+            let roll = pseudo_random(state);
+            if !specials.is_empty() && roll.is_multiple_of(13) {
+                let special = specials[(roll / 13) as usize % specials.len()];
+                // Whole, or cut so that only a prefix of it stands.
+                let cut = if roll.is_multiple_of(3) {
+                    special.len() / 2
+                } else {
+                    special.len()
+                };
+                text.push_str(&special[..cut]);
+            } else {
+                text.push_str(PARTS[(roll % PARTS.len() as u64) as usize]);
+            }
+        }
+        text
+    };
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let ranks = tiktoken_ranks_of(&shaped(&mut state, 2500, &[]), 600, false);
+    let next = ranks.len() as u32 + 7;
+    let specials: Vec<(String, u32)> = SPECIALS
+        .iter()
+        .enumerate()
+        .map(|(i, special)| ((*special).to_owned(), next + i as u32))
+        .collect();
+    let native =
+        NativeEncoder::from_ranks(&ranks, KIMI_K2_PATTERN, &specials).expect("the direct path");
+    assert!(native.stages[0].pattern.has_scanner());
+    let own = CoreBPE::new(
+        ranks.clone(),
+        specials.iter().cloned().collect(),
+        KIMI_K2_PATTERN,
+    )
+    .expect("the file's encoder");
+    let same = |text: &str| {
+        if text.is_empty() {
+            return;
+        }
+        assert_eq!(
+            native.encode(None, text, false),
+            Ok(own.encode_with_special_tokens(text)),
+            "{text:?}"
+        );
+        assert_eq!(
+            native.encode_plain(None, text, true),
+            Ok(own.encode_ordinary(text)),
+            "plain: {text:?}"
+        );
+    };
+    for round in 0..2000 {
+        let text = shaped(&mut state, 1 + round % 40, &SPECIALS);
+        same(&text);
+        if round % 16 == 0 {
+            for (cut, _) in text.char_indices() {
+                same(&text[..cut]);
+                same(&text[cut..]);
+            }
+        }
+    }
+    let mut long = String::new();
+    while long.len() < 3 * PARALLEL_MIN_BYTES {
+        long.push_str(&shaped(&mut state, 24, &SPECIALS));
+        long.push(' ');
+    }
+    same(&long);
 }
 
 /// Characters of the pool the sentencepiece vocabulary below has no token

@@ -153,7 +153,7 @@ fn ok_body(admin: &str, path: &str) -> Result<String, String> {
 
 #[test]
 fn the_built_binary_binds_leads_and_reads_ready() {
-    let started = start(&[]).expect("the example controller starts");
+    let started = start(&["--spec-file", POLICY]).expect("the example controller starts");
     let ready = ok_body(&started.admin, "/readiness").expect("it reads ready");
     assert!(ready.contains(r#""status":"ready""#), "{ready}");
     assert!(ready.contains(r#""role":"leader""#), "{ready}");
@@ -167,7 +167,7 @@ fn the_built_binary_binds_leads_and_reads_ready() {
 
 #[test]
 fn the_built_binary_holds_the_stages_of_this_build() {
-    let started = start(&[]).expect("the example controller starts");
+    let started = start(&["--spec-file", POLICY]).expect("the example controller starts");
     // The stock build's line names no `pack`.
     assert!(started.stages.contains(r#""pack""#), "{}", started.stages);
 }
@@ -472,6 +472,7 @@ async fn the_started_binary_decides_by_its_document_over_the_fleet_its_door_was_
                     ..Default::default()
                 }),
                 constraints: None,
+                again: false,
             })
             .await
             .expect("the controller answers the ask");

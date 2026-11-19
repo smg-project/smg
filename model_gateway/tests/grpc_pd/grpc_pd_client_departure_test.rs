@@ -35,13 +35,9 @@ use common::{
     },
 };
 use openai_protocol::model_card::ModelCard;
-use smg::{
-    middleware::TenantRequestMeta,
-    routers::RouterTrait,
-    tenant::TenantKey,
-    worker::{RuntimeType, Worker, WorkerType},
-};
+use smg::{middleware::TenantRequestMeta, routers::RouterTrait, tenant::TenantKey};
 use smg_grpc_client::{tokenspeed_scheduler::tokenspeed_proto as ts, vllm_proto as proto};
+use smg_worker::identity::basic::{RuntimeType, Worker, WorkerType};
 use tokio::sync::{mpsc, Notify};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};

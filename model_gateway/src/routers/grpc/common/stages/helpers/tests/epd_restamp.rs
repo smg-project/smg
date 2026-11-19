@@ -3,11 +3,12 @@
 use std::sync::Arc;
 
 use smg_grpc_client::tokenspeed_proto;
+use smg_worker::identity::basic::{RuntimeType, Worker, WorkerType};
 
 use super::*;
-use crate::{
-    routers::grpc::{context::ExecutionPlanKind, proto_wrapper::EncodeItemBootstrapInfo},
-    worker::{BasicWorkerBuilder, RuntimeType, Worker, WorkerType},
+use crate::routers::grpc::{
+    backend_client::BasicWorkerBuilder, context::ExecutionPlanKind,
+    proto_wrapper::EncodeItemBootstrapInfo,
 };
 
 fn tokenspeed_pd_pair(prefill_url: &str, decode_url: &str) -> WorkerSelection {

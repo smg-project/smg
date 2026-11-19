@@ -1,7 +1,7 @@
 # Regression gate for `cargo bench -p smg-policy-controller --bench store_view`, run by
 # .github/workflows/benchmark-policy-store.yml on pull requests through scripts/bench_gate.py.
 #
-# The gate runs thirty-one single-threaded rows of the store's view and holds each of them to a threshold.
+# The gate runs thirty-two single-threaded rows of the store's view and holds each of them to a threshold.
 # Twenty-one are at 8, 64 and 512 workers:
 # a decision's build from the published world without the affinity column (`policy_store/view_build/<n>`) and
 # with it (`policy_store/view_build_column/<n>`), the build with one and with eight standing vetoes of the asking
@@ -30,6 +30,12 @@
 # when a run is reserved for the whole list, which no case can see. With that reserve put back the row read
 # 790.8 µs against 321.5 through this gate, and the gate failed it.
 #
+# One row reads a membership write under a generation that declares the view's three lists: 512 members of one
+# pool, each stating an engine family, a zone and twelve labels, under two families, four zones and eight
+# selectors (`policy_store/member_write_listed/512`). A membership write reads the worker it writes under the
+# lists and carries every other member's fields: the row fails when a write reads every member again. Its
+# identical-build spread is not read yet, so it stands at the membership write's threshold.
+#
 # Two rows read one membership write of a fleet of pairs, 512 prefills and 512 decodes of one model that name
 # no runtime and report no descriptor: one prefill's registration written again as it stands, which moves no
 # offer (`policy_store_pairs/kept/512`), and its runtime named and unnamed in turn, which moves its offer at
@@ -51,7 +57,7 @@
 # to two cores. The three `policy_store_held/` rows time a publication beside a reader that holds the rows it
 # would write over. The four `policy_store_pairs/` rows at 8 and at 64 a side are the two membership writes
 # of smaller fleets of pairs. The two other `policy_store_models/` rows read the same write beside a list of
-# 128 and of 4,096 models: the scan is a tenth of the first, and six rounds of one build read the second at 3.4
+# 128 and of 4,096 models: the scan is a sixth of the first, and six rounds of one build read the second at 3.4
 # to 8.9 ms.
 #
 # Threshold (the method is described in tokenizer.toml). The identical-build spread, (max - min) / median of the
@@ -80,6 +86,7 @@
 #   veto_write/512                              1.2 %             10 %
 #   member_write/512                            7.8 %             20 %
 #   member_write_spread/512                     12.9 - 17.6 %     40 %
+#   member_write_listed/512                     not read          20 %
 #   pairs kept/512                              8.5 %             20 %
 #   pairs moved/512                             12.5 %            25 %
 #   models member_write/1024                    5.8 %             15 %
@@ -118,7 +125,8 @@
 # batch after the first, four do not count steadily (`publish/8`, `publish/64`, `view_build/8`,
 # `member_write_spread/512`) and three were not read, the bench having stopped under the counter. The two rows of
 # a fleet of pairs and the row of many models, added since, do not count steadily either. A row that does not
-# count steadily, or whose count is not read, keeps the time's verdict.
+# count steadily, or whose count is not read, keeps the time's verdict; where every count of a row is within
+# half a percent, a second measurement decides it.
 #
 # Every job uploads bench-gate/results.json with the raw per-run medians of both sides; the hosted runner's
 # own spread can be read from those and the thresholds tightened once it is known.
@@ -156,6 +164,11 @@ note = "identical build 12.9 - 17.6 %, the second read while the host's load ros
 pattern = "^policy_store/member_write/512$"
 threshold = 0.20
 note = "identical build 7.8 %, read on a busier host"
+
+[[gate]]
+pattern = "^policy_store/member_write_listed/512$"
+threshold = 0.20
+note = "a membership write, held as member_write/512 is: its own identical-build spread is not read yet"
 
 [[gate]]
 pattern = "^policy_store_pairs/kept/512$"

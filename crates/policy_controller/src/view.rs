@@ -126,16 +126,29 @@ impl WireModes {
 pub struct Health {
     /// The worker's status is ready.
     pub healthy: bool,
-    /// The pool's circuit breaker refuses execution.
+    /// The pool's circuit breaker refuses execution, and no rule lifts it.
+    /// A host writes it into a row it copies for the decision, for a veto
+    /// of its own that holds, beside the stalled bit every veto of its own
+    /// writes. Over a publication's own rows such a row stands among the
+    /// host's held rows instead ([`Constraints::held`]).
     pub breaker_open: bool,
-    /// The liveness veto: unreachable or wedged. A host writes it into a
-    /// row it copies for the decision. Over a publication's own rows the
-    /// asking host's vetoes stand beside the rows instead, and a reader of
-    /// this bit asks both ([`Constraints::masks`]).
+    /// A standing veto of the asking host masks the row: the liveness
+    /// veto, unreachable or wedged, or a veto that holds, which writes the
+    /// breaker bit too. A host writes it into a row it copies for the
+    /// decision. Over a publication's own rows the asking host's vetoes
+    /// stand beside the rows instead, and a reader of this bit asks both
+    /// ([`Constraints::masks`]). The all-vetoed rule lifts it as its last
+    /// resort, on a row whose breaker bit is clear.
     pub stalled: bool,
     /// Being drained; nothing new goes there.
     pub draining: bool,
-    /// The latched overload verdict of the last load report.
+    /// The latched overload verdict of the last load report: the engine
+    /// is at a threshold, or an answer of it named another of its ranks
+    /// and not this one. That mark ends when an answer or a record names
+    /// the rank again, when its member's rows go, or with the build that
+    /// follows its member's registration under another rank number. The
+    /// bit reads the mark only while a rank the answer named has a record
+    /// on file.
     pub overloaded: bool,
 }
 
@@ -190,8 +203,8 @@ pub struct LoadRow {
     pub resident_counted: bool,
     /// Age of the report's sample at the decision, in milliseconds. On a
     /// row a store lends, it is the age the report carried when it was
-    /// recorded: the age at the decision is then the request's
-    /// `now_micros` less the row's `load_sampled_at_micros`.
+    /// recorded. The request's `now_micros` less the row's
+    /// `load_sampled_at_micros` gives the age on either form of the row.
     pub report_age_ms: u32,
     /// Where the row came from.
     pub source: SignalSource,
@@ -623,7 +636,10 @@ pub struct Candidate {
     /// takes one row and no index, so a filter that read the affinity
     /// column there would have to read it at the position; no filter of
     /// this crate does. A debug build asserts that the two agree where a
-    /// decision takes its inputs; a release build does not check.
+    /// decision takes its inputs; a release build does not check. A count
+    /// the host lent beside its rows is read at the position too
+    /// ([`RequestFacts::in_flight`]): the row's place in the host's pool,
+    /// whatever its index.
     pub position: u32,
     pub id: WorkerId,
     pub role: Role,
@@ -638,7 +654,10 @@ pub struct Candidate {
     /// The pairing descriptor's connector, as a position into the spec's
     /// declared list; `0` when none.
     pub connector: u16,
-    /// Requests the deciding host holds on the worker right now.
+    /// Requests the deciding host holds on the worker right now. A host
+    /// that lends its counts beside the rows
+    /// ([`RequestFacts::lent_in_flight`]) leaves this zero, so a reader
+    /// asks [`RequestFacts::in_flight`].
     pub in_flight: u32,
     /// The latest load row, when the host has a report for the worker.
     pub load: Option<LoadRow>,
@@ -701,6 +720,26 @@ pub struct Candidate {
     pub key: u32,
 }
 
+/// How far back the store's decision clock starts.
+pub(crate) const REPORT_CLOCK_HISTORY_MS: u32 = 3_600_000;
+
+/// A sample clipped to the clock's origin must already be past the limit.
+pub(crate) const MAX_REPORT_AGE_MS: u32 = REPORT_CLOCK_HISTORY_MS - 1;
+
+/// The oldest sample a decision can use under a report age limit.
+#[derive(Clone, Copy)]
+pub(crate) struct ReportCutoff(u64);
+
+impl ReportCutoff {
+    pub(crate) fn new(now_micros: u64, max_age_ms: u64) -> Self {
+        Self(now_micros.saturating_sub(max_age_ms * 1_000))
+    }
+
+    pub(crate) fn load(self, row: &Candidate) -> Option<LoadRow> {
+        row.load.filter(|_| row.load_sampled_at_micros >= self.0)
+    }
+}
+
 /// Media on the request: counts and bytes, for workers that take media.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MediaCounts {
@@ -721,14 +760,22 @@ pub struct Header<'a> {
 
 /// The mean of the in-flight counts of `rows` of `candidates`; zero over no
 /// row.
-pub(crate) fn mean_in_flight(candidates: &[Candidate], rows: &[u32]) -> f32 {
+// Forced into its callers: the walk is two small loops, one a kind of rows.
+// Out of line they cost an affinity pass a call and one instruction a row
+// more than the one loop that stood inside the pass.
+#[inline(always)]
+pub(crate) fn mean_in_flight(
+    facts: &RequestFacts<'_>,
+    candidates: &[Candidate],
+    rows: &[u32],
+) -> f32 {
     if rows.is_empty() {
         return 0.0;
     }
-    let sum: u64 = rows
+    let sum: u64 = crate::counts::with_counts!(facts, |counts| rows
         .iter()
-        .map(|&i| u64::from(candidates[i as usize].in_flight))
-        .sum();
+        .map(|&i| u64::from(counts(&candidates[i as usize])))
+        .sum());
     sum as f32 / rows.len() as f32
 }
 
@@ -762,6 +809,9 @@ pub struct RequestFacts<'a> {
     pub tried: &'a [WorkerId],
     /// Time left for the whole decision, relative to the host's receipt; a
     /// plugin's own share of it rides its frame, clamped to at most this.
+    /// A host that asks in process states no budget by `0`
+    /// ([`crate::door::Request`]); on the wire a frame's `0` says none is
+    /// left.
     pub budget_micros: u32,
     /// Allow-listed headers only.
     pub headers: &'a [Header<'a>],
@@ -786,6 +836,25 @@ pub struct RequestFacts<'a> {
     /// for the decision. A pair takes none: a pin is a position in one
     /// pool, and neither side reads it. In-process only.
     pub pinned_at: u32,
+    /// What the leases on file book on each row, where the host did not
+    /// write the count into the row: a view of a publication's own rows
+    /// lends the table here. A reader of a row's requests in flight asks
+    /// both ([`RequestFacts::in_flight`]). `None` where the rows carry
+    /// their counts: rows written for the decision, and a host that keeps
+    /// the count itself. A pair takes none: a position is a place in one
+    /// pool, and a pair's rows carry what counts their host wrote.
+    /// In-process only.
+    pub lent_in_flight: Option<&'a crate::counts::LentCounts<'a>>,
+    /// The host wrote each row's count of this request's session key
+    /// ([`Candidate::session_in_flight`]), the count a capped sessions rule
+    /// asks for
+    /// ([`Needs::session_in_flight`](crate::Needs::session_in_flight)). A
+    /// sessions rule's in-flight cap reads the count either way. A key kept
+    /// on its worker over the overload veto is kept under a capped rule only
+    /// where this is set: with the count unwritten the cap could not hand
+    /// the key on, so the veto stands for it as for any request. In-process
+    /// only.
+    pub session_counted: bool,
     /// The candidates' affinity facts, by index in the candidate slice the
     /// decision is made over: the one column the affinity stages read, in
     /// the candidates' own order. It is EMPTY or holds exactly one entry a
@@ -890,6 +959,20 @@ impl<'a> RequestFacts<'a> {
         self.pinned_at != 0 && self.pinned_at - 1 == position
     }
 
+    /// The requests in flight of `row`: what the host lent for the row's
+    /// position where it lent a table ([`RequestFacts::lent_in_flight`]),
+    /// the row's own count otherwise. Every reader of a row's count asks
+    /// here, and none learns which rows it was given. A decision reads one
+    /// count a row: beside lent rows the first read is kept, and every
+    /// later read returns it.
+    #[inline]
+    pub fn in_flight(&self, row: &Candidate) -> u32 {
+        match self.lent_in_flight {
+            Some(lent) => lent.at(row.position),
+            None => row.in_flight,
+        }
+    }
+
     /// The affinity facts of the candidate at `index` of the slice the
     /// decision is made over. An empty column reads as nothing held for
     /// every candidate. Any other column holds the candidate's own entry,
@@ -945,6 +1028,18 @@ impl<'a> RequestFacts<'a> {
     }
 }
 
+/// A table of session pins that outlives an engine's own (design 5.1, the
+/// sessions row), lent by the deciding host among a decision's
+/// [`Constraints`]. A sessions rule asks it once a decision, for a key its
+/// engine's table holds no pin of: the table goes with its generation, the
+/// pins of record do not.
+pub trait PinSource: std::fmt::Debug + Sync {
+    /// The worker `key` is pinned to, where that pin has not ended by the
+    /// host's record and was last used less than `ttl_micros` ago (`None`:
+    /// a pin of any age). The host answers by its own clock.
+    fn pinned(&self, key: Session, ttl_micros: Option<u64>) -> Option<WorkerId>;
+}
+
 /// What only the deciding host knows now: its standing vetoes, the wires it
 /// speaks and the request-level lifts around the profile. The admission bits
 /// of a prefill window and a decode room ride the candidate rows.
@@ -954,8 +1049,14 @@ pub struct Constraints<'a> {
     pub excluded: &'a [WorkerId],
     /// The wires this host speaks.
     pub wire_modes: WireModes,
-    /// The overload veto does not apply to this decision (a pool whose
-    /// policy balances load against affinity itself, a session owner).
+    /// The overload veto does not apply to this decision: the host's
+    /// override, for a pool whose policy balances load against affinity
+    /// itself. An engine built from a document lifts the veto itself for a
+    /// keyed request of a profile that places by the session key, where the
+    /// binding steers; under a sessions rule with an in-flight cap, only
+    /// where the host wrote the key's counts
+    /// ([`RequestFacts::session_counted`]). An engine built by hand does
+    /// not: its host says so here.
     pub overload_lifted: bool,
     /// A subset hint: decide over at most this many candidates.
     pub subset_hint: Option<u32>,
@@ -965,6 +1066,19 @@ pub struct Constraints<'a> {
     /// stalled bit asks both ([`Constraints::masks`]). Empty where the rows
     /// were written for the decision. In-process only.
     pub stalled: &'a [u32],
+    /// The rows of [`Self::stalled`] a hold of this host stands on, in
+    /// order, each once: a veto no rule lifts, as an open breaker's is. The
+    /// all-vetoed rule lifts the mask as its last resort and leaves these
+    /// rows masked. Empty where the rows were written for the decision:
+    /// there a held row carries the breaker bit beside the stalled one.
+    /// In-process only.
+    pub held: &'a [u32],
+    /// The pins of record, where the host keeps a table that outlives the
+    /// engine's ([`PinSource`]): a sessions rule asks it for a key its own
+    /// table holds no pin of, and no other stage reads it. `None` where
+    /// the engine's table is the only one, as in a host that embeds the
+    /// engine. In-process only.
+    pub pins: Option<&'a dyn PinSource>,
 }
 
 impl Constraints<'_> {
@@ -983,6 +1097,76 @@ pub struct ZoneCapacity {
     pub zone: u16,
     pub healthy: u32,
     pub total: u32,
+}
+
+/// The engines of a pool, as its host lists them beside the rows: each
+/// engine's rows by position, the ranks of a data-parallel engine together
+/// and in their ranks' order, a single-rank worker alone. A stage that
+/// names the engine as its unit ([`Picker::unit`](crate::Picker::unit))
+/// draws over the list and reads the rows of the engine it takes, so a
+/// decision it makes does not grow with the ranks of the engines it passes
+/// by. Empty where the host lists none: a pool with no engine of several
+/// rows, or rows whose positions are not the list's. In-process only.
+///
+/// A host that lists a pool's engines hands the pool's own rows with the
+/// list, in the order of their ids and under a membership epoch
+/// ([`PoolFacts::membership_epoch`]), and numbers the pool
+/// ([`Engines::pool`]). A stage that finds a member's row by its id, with
+/// no pool read whole ([`Scorer::own`](crate::Scorer::own)), takes the
+/// list as that word.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Engines<'a> {
+    pool: u32,
+    rows: &'a [u32],
+    ends: &'a [u32],
+}
+
+impl<'a> Engines<'a> {
+    /// The list of the pool its host numbers `pool`, over `rows`, the
+    /// positions engine after engine, and `ends`, each engine's end in
+    /// `rows` in rising order. A list whose last end is not the count of
+    /// its rows is no list, and reads as empty.
+    pub fn new(pool: u32, rows: &'a [u32], ends: &'a [u32]) -> Self {
+        if ends.last().is_some_and(|&end| end as usize == rows.len()) {
+            Self { pool, rows, ends }
+        } else {
+            Self::default()
+        }
+    }
+
+    /// The host's number for the pool: one pool's while a membership epoch
+    /// stands, and no other pool's under that epoch. A stage that keeps
+    /// what it learned of a pool keeps it by this number and the epoch.
+    pub const fn pool(&self) -> u32 {
+        self.pool
+    }
+
+    /// How many engines the pool holds.
+    pub const fn len(&self) -> usize {
+        self.ends.len()
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.ends.is_empty()
+    }
+
+    /// The rows of the engine at `engine`, by position; none for a place
+    /// past the list.
+    #[inline]
+    pub fn rows(&self, engine: usize) -> &'a [u32] {
+        let from = match engine.checked_sub(1) {
+            Some(before) => self.ends.get(before).copied(),
+            None => Some(0),
+        };
+        let to = self.ends.get(engine).copied();
+        match (from, to) {
+            (Some(from), Some(to)) => self
+                .rows
+                .get(from as usize..to as usize)
+                .unwrap_or_default(),
+            _ => &[],
+        }
+    }
 }
 
 /// Pool-wide facts beside the candidates.
@@ -1006,11 +1190,60 @@ pub struct PoolFacts<'a> {
     /// rotation does, keys it by this too. In-process only: a plugin reads
     /// the rows it is handed.
     pub reach: u64,
+    /// Whether every row of the pool holds a report. A host says so where
+    /// it knows it of the rows it wrote, and a decision reads it once: a
+    /// profile decided by rank ([`Scorer::spread`](crate::Scorer::spread))
+    /// is asked by rank only where it is on, since the load stage costs a
+    /// row without a report from every row that holds one. By rank the
+    /// targets are the whole pass's wherever its sums tell the rows in
+    /// front apart: rows it rounds to one sum it draws among, and by rank
+    /// they are ordered. Off by default: a host that does not say it gets
+    /// the whole pass. A report without a rate is a report: among the rows
+    /// in front it drains as in the whole pass, at the mean rate of the
+    /// rows that pass costs, which the load stage folds over them, and the
+    /// decision is the one by rank. A host that says the fact of a pool
+    /// that holds a row without a report is answered by what the row
+    /// lacks: in front it makes the stage say that it must be asked whole
+    /// ([`Front::Whole`](crate::Front::Whole)), and the decision is the
+    /// whole pass's, which paid for its ranks' reading. Behind the rows in
+    /// front it is not costed where they decide alone, and the decision is
+    /// the one by rank. Where they cannot, their band being wider than the
+    /// ranks leave room for, every row is asked, that row with them, and
+    /// the decision is the whole pass's. In-process only.
+    pub reported: bool,
+    /// The pool's engines, where the host lists them ([`Engines`]): the
+    /// candidates are then the rows the list's positions name. Empty by
+    /// default, and every decision then reads rows alone.
+    pub engines: Engines<'a>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::counts::tests::Lent;
+
+    /// One reader, two feeds: a row's requests in flight are the lent count
+    /// at the row's position where the host lends a table, whatever the
+    /// row's own field holds, and the row's own field where it lends none.
+    #[test]
+    fn a_rows_requests_in_flight_are_the_lent_count_or_the_rows_own() {
+        let row = |position, in_flight| Candidate {
+            position,
+            in_flight,
+            ..Candidate::default()
+        };
+        let mut rows = [row(0, 5), row(1, 2)];
+        let own = RequestFacts::default();
+        let read = |facts: &RequestFacts<'_>, rows: &[Candidate]| -> Vec<u32> {
+            rows.iter().map(|row| facts.in_flight(row)).collect()
+        };
+        assert_eq!(read(&own, &rows), [5, 2]);
+        let lent = Lent::take(&mut rows);
+        assert_eq!(read(&own, &rows), [0, 0]);
+        // A count a host left on a row does not speak over its table.
+        rows[0].in_flight = 9;
+        assert_eq!(read(&lent.beside(&own), &rows), [5, 2]);
+    }
 
     #[test]
     fn health_flags_compose_into_the_two_routability_reads() {
@@ -1033,6 +1266,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::print_stdout, reason = "the case reports the candidate layout")]
     fn a_candidate_row_is_two_lines_and_its_affinity_facts_20_bytes() {
         // The filters walk the rows once a filter, so the rows' stride is a
         // cost every policy pays: the pin is exact, 128 bytes at a 64-byte
@@ -1040,8 +1274,10 @@ mod tests {
         // decision bench (`benches/decision.rs`) where the pull-request gate
         // runs as well as on a build host: the two read a narrower stride in
         // opposite directions.
-        assert_eq!(size_of::<Candidate>(), 128);
-        assert_eq!(align_of::<Candidate>(), 64);
+        let size = size_of::<Candidate>();
+        let alignment = align_of::<Candidate>();
+        println!("Candidate size {size} bytes, alignment {alignment} bytes");
+        assert_eq!((size, alignment), (128, 64));
         assert_eq!(size_of::<AffinityFacts>(), 20);
     }
 

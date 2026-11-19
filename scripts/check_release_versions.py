@@ -5,14 +5,17 @@ For every component (a workspace crate or a Python package), since the given tag
 whether its files changed, whether its version was bumped, and, for a crate, whether
 the workspace root's dependency entry agrees. A component's files include what the
 symlinks under its path point at: a package that ships another directory's files through
-a link (the proto package ships crates/grpc_client/proto that way) ships their changes
+a link (the proto package ships both proto directories' files that way) ships their changes
 too, so they move its version. A version is bumped when no release tag
 ``v<x.y.z>`` (the given tag, or one another release line made) carries it with other
 code: the registries take a version once. A crate held at its published version is
 republished when a workspace dependency's new version leaves a requirement its published
 copy carries (cargo's caret): at a patch step, or at its own breaking step when the crate's
-public API carries the dependency. Then the files that must mirror the gateway's
-version. Issues are listed with the bump conventional commits ask for (``feat!:`` or
+public API carries the dependency. A crate whose wire files changed (the proto files a
+dependent builds messages from) steps past its own caret whatever its commits ask: a field
+more breaks a dependent's published copy, which would resolve to a patch of it. Then the
+files that must mirror the gateway's version. Issues are listed with the bump conventional
+commits ask for (``feat!:`` or
 ``BREAKING CHANGE``: major; ``feat:``: minor; otherwise patch), stepped past the
 versions release tags carry, and, on request, applied.
 
@@ -61,10 +64,13 @@ class Component:
     path: str  # its directory, relative to the repository root
     version_file: str  # the file carrying its version, relative to the root
     dep_key: str | None = None  # its key under [workspace.dependencies]; None = no entry
+    # the wire files a dependent builds messages from, relative to the root: their change breaks
+    # a dependent's published copy, so it steps the crate past its own caret
+    wire: tuple[str, ...] = ()
 
 
-def crate(name: str, path: str, dep_key: str | None = None) -> Component:
-    return Component("crate", name, path, f"{path}/Cargo.toml", dep_key)
+def crate(name: str, path: str, dep_key: str | None = None, wire: Sequence[str] = ()) -> Component:
+    return Component("crate", name, path, f"{path}/Cargo.toml", dep_key, tuple(wire))
 
 
 def package(name: str, path: str, version_file: str) -> Component:
@@ -84,7 +90,8 @@ GATEWAY = "smg"
 
 CRATES = (
     crate("openai-protocol", "crates/protocols", "openai-protocol"),
-    crate("smg-worker", "crates/worker", "smg-worker"),
+    crate("smg-worker", "crates/worker", "smg-worker", wire=("crates/worker/proto/",)),
+    crate("smg-service-discovery", "crates/service_discovery", "smg-service-discovery"),
     crate("smg-mm-rdma", "crates/mm_rdma", "smg-mm-rdma"),
     crate("engine-zmq-client", "crates/engine_zmq_client", "engine-zmq-client"),
     crate("reasoning-parser", "crates/reasoning_parser", "reasoning-parser"),
@@ -106,6 +113,7 @@ CRATES = (
     crate("smg-rl", "crates/rl", "smg-rl"),
     crate("engine-zmq-adapter", "crates/engine_zmq_adapter", "engine-zmq-adapter"),
     crate("engine-servicer", "crates/engine_servicer", "engine-servicer"),
+    crate("smg-policy-controller", "crates/policy_controller", "smg-policy-controller"),
     crate("smg-client", "clients/rust"),
     crate("openapi-gen", "clients/openapi-gen"),
     crate(GATEWAY, "model_gateway"),
@@ -455,6 +463,9 @@ class Verdict:
     carried_by: str | None = None  # the release tag, not the given one, that carries the version
     unbumped: bool = False  # the version is a release tag's, carried there with other code
     level: str | None = None  # the bump asked for when the version was not bumped
+    wire: bool = False  # its wire files changed: the step asked leaves the version's own caret
+    # the tagged version whose caret a bump by hand stays inside, the wire files changed
+    inside: str | None = None
     workspace_version: str | None = None  # the root's entry when it disagrees
     # why a held crate moves: the published requirement a dependency's new version leaves
     dependency: str | None = None
@@ -552,6 +563,15 @@ def check(
     if carrier is not None and carrier != tag:
         verdict.carried_by = carrier
         verdict.files_changed = files_changed(repo, carrier, component)
+    alone = None
+    if verdict.files_changed == 0 and carrier is None:
+        # A version written by hand over the comparison tag's own files can still sit inside the
+        # caret of a version another line published with other wire files: the files are counted
+        # against that line's copy, and the bumped path below asks for the step. The comparison
+        # tag's own copy is this code, a rename aside, so it is no candidate here.
+        alone = published_inside(repo, tag, component, verdict, own=False)
+        if alone is not None:
+            verdict.files_changed = files_changed(repo, tagged[alone], component)
     if verdict.files_changed == 0:
         # Changed since the comparison tag, at a version another line's tag carries with this very
         # code: nothing to publish, but the workspace pin still has to follow the version (the
@@ -563,12 +583,52 @@ def check(
         return verdict
     verdict.unbumped = carrier is not None
     if verdict.unbumped:
+        # The published copy of this version is the carrier's, the given tag or another line's.
+        verdict.wire = wire_changed(repo, carrier, component)
         verdict.level = bump_level(repo.commits_since(tag, component_paths(repo, component)))
+        if verdict.wire:
+            verdict.level = LEVELS[
+                max(LEVELS.index(verdict.level), LEVELS.index(breaking_level(verdict.version)))
+            ]
+    elif inside := alone or published_inside(repo, tag, component, verdict):
+        # Bumped, to a version a published one's caret accepts: a dependent's published copy
+        # resolves to it and builds messages that gained a field.
+        verdict.wire = True
+        verdict.unbumped, verdict.inside = True, inside
+        verdict.level = breaking_level(verdict.version)
     elif component.dep_key:
         pinned = workspace_dep_version(root_toml, component.dep_key)
         if pinned != verdict.version:
             verdict.workspace_version = pinned or ""
     return verdict
+
+
+def wire_changed(repo: Repo, tag: str, component: Component) -> bool:
+    """Whether the component's wire files differ from the tag's."""
+    return bool(component.wire) and bool(repo.changed_since(tag, component.wire))
+
+
+def published_inside(
+    repo: Repo, tag: str, component: Component, verdict: Verdict, *, own: bool = True
+) -> str | None:
+    """The newest published version whose caret accepts the version written by hand while the
+    wire files differ from that version's own: the given tag's, or the version of a tag another
+    release line made. A dependent's published copy on that line resolves to the new version.
+    With ``own`` false the given tag's version is no candidate."""
+    published = dict(verdict.tagged)
+    if verdict.tag_version is not None:
+        if own:
+            published[verdict.tag_version] = tag
+        else:
+            published.pop(verdict.tag_version, None)
+    for version in sorted(
+        published, key=lambda v: version_key(v) or (-1, 0, 0, 0, 0), reverse=True
+    ):
+        if caret_accepts(version, verdict.version) and wire_changed(
+            repo, published[version], component
+        ):
+            return version
+    return None
 
 
 # --- the report, the proposal, the fixes --------------------------------------
@@ -653,12 +713,19 @@ def report(verdict: Verdict, out: Out) -> None:
             f"  {warn} {name} {where} — unchanged, but its published requirement{plural}"
             f" {verdict.dependency} [{out.level(verdict.level)}]"
         )
+    elif verdict.inside:
+        out.line(
+            f"  {warn} {name} {where} — {n}, its wire files among them, but v{verdict.version}"
+            f" is inside ^{verdict.inside} [{out.level(verdict.level)}]"
+        )
     elif verdict.unbumped:
         carried = f", {verdict.carried_by}'s" if verdict.carried_by else ""
         out.line(
             f"  {warn} {name} {where} — {n} but version not bumped (v{verdict.version}{carried})"
             f" [{out.level(verdict.level)}]"
         )
+        if verdict.wire:
+            out.line(f"    {warn} and its wire files changed: the step leaves ^{verdict.version}")
         if verdict.dependency:
             out.line(f"    {warn} and its published requirement{plural} {verdict.dependency}")
     elif verdict.tag_version is None:

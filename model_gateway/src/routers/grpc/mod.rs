@@ -35,6 +35,8 @@ pub mod utils; // Used by routers/http and bindings/golang
 #[cfg(any(test, feature = "test-util"))]
 pub use regular::streaming::bench::{EngineScript, ForcedChat, StreamBench};
 pub(crate) mod wire;
+#[cfg(test)]
+mod worker_identity_tests;
 /// The worker selection stage's benchmark seam: what
 /// `benches/policy_selection.rs` drives for the stage's own placements,
 /// compiled for the crate's test targets only.

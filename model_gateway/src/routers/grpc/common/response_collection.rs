@@ -5,6 +5,7 @@
 use std::sync::Arc;
 
 use axum::response::Response;
+use smg_worker::identity::basic::Worker;
 use tracing::error as trace_error;
 
 use crate::{
@@ -27,7 +28,6 @@ use crate::{
             },
         },
     },
-    worker::Worker,
 };
 
 /// Drain each Prefill sample through its terminal response, releasing only that
@@ -333,12 +333,16 @@ mod tests {
 
     use axum::http::StatusCode;
     use smg_grpc_client::sglang_proto as sglang;
+    use smg_worker::{
+        identity::basic::{ConnectionMode, WorkerType},
+        test_support::RefusedAddress,
+    };
     use tracing_test::traced_test;
 
     use super::*;
-    use crate::{
-        routers::grpc::proto_wrapper::{ProtoGenerateResponse, ENGINE_ERROR_MESSAGE},
-        worker::{test_support::RefusedAddress, BasicWorkerBuilder, ConnectionMode, WorkerType},
+    use crate::routers::grpc::{
+        backend_client::BasicWorkerBuilder,
+        proto_wrapper::{ProtoGenerateResponse, ENGINE_ERROR_MESSAGE},
     };
 
     /// A stream that is already at EOF, as sequential PD hands to the

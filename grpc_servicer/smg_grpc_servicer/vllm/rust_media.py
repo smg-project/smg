@@ -33,6 +33,7 @@ from smg_grpc_servicer.vllm.mm_processor import (
     MmProcessorUnavailable,
     MmSettings,
     build_mm_processor,
+    client_media_code,
 )
 
 logger = logging.getLogger(__name__)
@@ -42,6 +43,8 @@ KIND_OK = "ok"
 KIND_INVALID = "invalid"
 KIND_UNAVAILABLE = "unavailable"
 KIND_INTERNAL = "internal"
+# The request's own media failed; the payload is `(code, message)`.
+KIND_MEDIA = "media"
 
 _RETRYABLE_CODES = (
     grpc.StatusCode.UNAVAILABLE,
@@ -309,13 +312,19 @@ class RustMediaBridge:
     def _finish(request_id: str, future: Future, done: Callable[[str, Any], None]) -> None:
         """Classify the outcome the way the Python servicer maps it to a
         status (`kind_for_code`): retryable failures UNAVAILABLE, the caller's
-        INVALID_ARGUMENT and NOT_FOUND, anything else INTERNAL."""
+        INVALID_ARGUMENT and NOT_FOUND, anything else INTERNAL; a failure of the
+        request's own media (`mark_client_media`) is `media`, with its code."""
         try:
             result = future.result()
         except MmProcessorUnavailable as e:
             logger.warning("Media processing unavailable for request %s: %s", request_id, e)
             done(KIND_UNAVAILABLE, str(e))
         except Exception as e:  # noqa: BLE001 - every failure must reach the caller
+            media_code = client_media_code(e)
+            if media_code is not None:
+                logger.warning("Media of request %s failed (%s): %s", request_id, media_code, e)
+                done(KIND_MEDIA, (media_code, str(e)))
+                return
             code = _grpc_code_for(e)
             kind = kind_for_code(code)
             if kind == KIND_INTERNAL:

@@ -18,16 +18,26 @@ generation: 1
 profiles:
   prefill:
     filter: [healthy, not-overloaded, has-capacity, not-tried]
-    score: [prefix-affinity, kv-pressure, least-load, warmup-slice]
-    pick: best
+    score:
+      - warmup-slice: { weight: 8 }
+      - prefix-affinity: { weight: 4 }
+      - kv-pressure
+      - least-load
+    pick:
+      best: { sample: 16 }
   decode:
     filter: [healthy, not-overloaded, has-room, not-tried]
-    score: [prefix-affinity, kv-pressure, least-load, warmup-slice]
-    pick: best
+    score:
+      - warmup-slice: { weight: 8 }
+      - prefix-affinity: { weight: 4 }
+      - kv-pressure
+      - least-load
+    pick:
+      best: { sample: 16 }
 plans:
   pd-pair: { pairing: strict }
 bindings:
-  - match: { model: "*", phase: [prefill, decode] }
+  - match: { model: "*" }
     plan: pd-pair
     profiles: { prefill: prefill, decode: decode }
 ```

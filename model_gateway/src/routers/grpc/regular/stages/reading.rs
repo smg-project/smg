@@ -14,12 +14,14 @@ use std::sync::Arc;
 use axum::response::Response;
 use llm_tokenizer::traits::Tokenizer;
 use openai_protocol::{common::Tool, profile::ProviderProfile};
+use smg_worker::identity::basic::Worker;
 use tool_parser::ToolConstraint;
 use tracing::{debug, error};
 
 use crate::{
     config::ParserChoice,
     routers::{
+        common::snapshot::{ModelLabels, WorkerRegistryExt},
         error,
         grpc::{
             common::stages::helpers::TagForStart,
@@ -30,7 +32,6 @@ use crate::{
             utils::{self, Names},
         },
     },
-    worker::{ModelLabels, Worker},
 };
 
 /// What preparation found for the response.
@@ -519,15 +520,17 @@ mod tests {
         chat::ChatCompletionRequest, messages::CreateMessageRequest, model_card::ModelCard,
     };
     use serde_json::json;
+    use smg_worker::identity::basic::WorkerType;
 
     use super::*;
-    use crate::{
-        routers::grpc::{
+    use crate::routers::{
+        common::snapshot::WorkerRegistry,
+        grpc::{
+            backend_client::BasicWorkerBuilder,
             context::SharedComponents,
             regular::stages::testing::{components, components_over},
             utils::message_utils,
         },
-        worker::{BasicWorkerBuilder, WorkerRegistry, WorkerType},
     };
 
     /// A model the registry has a table for, named by no label or flag.

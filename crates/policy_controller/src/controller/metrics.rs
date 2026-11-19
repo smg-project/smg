@@ -21,19 +21,36 @@ use metrics::{Counter, Gauge, Key, KeyName, Label, Level, Metadata, Recorder};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle, PrometheusRecorder};
 use parking_lot::Mutex;
 
-use super::{deciders::Counts, generations::Generations, readiness::State};
+use super::{
+    deciders::Counts,
+    generations::Generations,
+    readiness::{Sample, State},
+};
 use crate::{
     ingest::loads::{Failures, Stats},
-    store::{MemoryStore, OutsideLists},
+    store::StoreCounts,
 };
 
-/// `1` for the controller's state (`starting`, `leader`, `follower`,
-/// `draining`), `0` for the other three. The admin listener sets it from the
+/// `1` for the controller's state (`starting`, `leader`, `syncing`,
+/// `follower`, `draining`), `0` for the other four. The admin listener sets it from the
 /// readiness at each render, so the role is the fence's at the scrape, and
 /// one scrape's sample is one write: two scrapes never mix theirs.
 pub const STATE: &str = "smg_policy_controller_state";
 /// The controller's start, in seconds since the Unix epoch.
 pub const START_TIME_SECONDS: &str = "smg_policy_controller_start_time_seconds";
+/// `1` while this replica does not lead and its standby is synced with its
+/// leader, `0` otherwise: a leader's is `0`.
+pub const REPLICATION_SYNCED: &str = "smg_policy_controller_replication_synced";
+/// The age in seconds of the last frame that left this replica at its
+/// leader's head. `0` while it leads and before any such frame, where
+/// [`REPLICATION_SYNCED`] is `0` too.
+pub const REPLICATION_LAG_SECONDS: &str = "smg_policy_controller_replication_lag_seconds";
+/// How many times this replica asked its leader to be restored from a
+/// snapshot: an event of the leader's did not land on its tables or its
+/// log. The leader cannot tell such an ask from a place it does not hold,
+/// so the count is the standby's.
+pub const REPLICATION_RESTORES_ASKED_TOTAL: &str =
+    "smg_policy_controller_replication_restores_asked_total";
 /// Load polls by the arbitration's decision (`mode`: `poll`, `fallback`,
 /// `suppressed`; a suppressed one made no call), each counted once per
 /// engine and poll interval.
@@ -59,23 +76,33 @@ pub const SPEC_APPLY_TOTAL: &str = "smg_policy_spec_apply_total";
 /// `not_leader`): each is one the gateway decided locally.
 pub const DECIDE_BUSY_TOTAL: &str = "smg_policy_controller_decide_busy_total";
 /// Decide requests this build had no decision for, by `cause` (`fault`,
-/// `pair_side`, `prompt_text`, `decider_gone`): the `Busy` answers with no
-/// reason, each under what took its decision.
+/// `pair_side`, `prompt_text`, `decider_gone`, `lease_ids_spent`,
+/// `document_awaited`): the `Busy` answers with no reason, each under what
+/// took its decision. `document_awaited` is a new leader's moment: the
+/// start's document of a replica under a shared lease had not landed yet.
 pub const DECIDE_NO_DECISION_TOTAL: &str = "smg_policy_controller_decide_no_decision_total";
 /// Decide requests that carried more block hashes than their generation
 /// reads of them: decided over the first ones, the rest hashed for nothing.
 pub const DECIDE_HASHES_CUT_TOTAL: &str = "smg_policy_controller_decide_hashes_cut_total";
 /// Answers no decide stream took, by `cause`: `stream_gone` for a stream
-/// that had ended, `queue_full` for one whose queue had no place, which a
+/// that had ended, before the answer was made or with it still in the
+/// stream's queue, `queue_full` for one whose queue had no place, which a
 /// stream's window rules out.
 pub const DECIDE_ANSWERS_DROPPED_TOTAL: &str = "smg_policy_controller_decide_answers_dropped_total";
+/// Decide requests their gateway said it asked again, holding no answer to
+/// the first ask, by what became of the lease that ask was issued
+/// (`earlier_lease`): `ended` where it still waited for a dispatch, `none`
+/// where no lease of the request waited.
+pub const DECIDE_ASKED_AGAIN_TOTAL: &str = "smg_policy_controller_decide_asked_again_total";
 /// Candidates a gateway's wires took from its decisions: members that
 /// share no wire with the gateway that asked.
 pub const DECIDE_CANDIDATES_UNDIALED_TOTAL: &str =
     "smg_policy_controller_decide_candidates_undialed_total";
-/// Decisions whose budget ended while they were made: each is answered
-/// `Busy` under `budget_gone_on_arrival`, and counted here apart from a
-/// request that arrived late.
+/// Decisions cut at their last read, with under a microsecond of the budget
+/// or under a millisecond of the lease's dispatch span left: each is
+/// answered `Busy` under `budget_gone_on_arrival`, and counted here apart
+/// from a request that arrived late and from a pick whose span ended while
+/// it waited to be sent.
 pub const DECIDE_BUDGET_OUTLASTED_TOTAL: &str =
     "smg_policy_controller_decide_budget_outlasted_total";
 /// Members whose engine family or zone the standing generation's list does
@@ -84,19 +111,31 @@ pub const DECIDE_BUDGET_OUTLASTED_TOTAL: &str =
 pub const MEMBERS_OUTSIDE_LIST: &str = "smg_policy_controller_members_outside_list";
 /// Writes to the load table that moved an overload verdict.
 pub const OVERLOAD_FLIPS_TOTAL: &str = "smg_policy_controller_overload_flips_total";
+/// Lifecycle calls that panicked as a lease's event was applied (a
+/// dispatch, a completion, a release a frame brings, a dispatch
+/// deadline's end): each is held there, so it ends no thread. A call that
+/// panics inside a decision (the issue's, the release of a lease the
+/// decision gives up) counts with the requests that got no decision.
+pub const LIFECYCLE_FAULTS_TOTAL: &str = "smg_policy_controller_lifecycle_faults_total";
 
 /// The controller's series and the handle that renders them.
 pub(crate) struct Metrics {
     handle: PrometheusHandle,
     /// One gauge per [`State::ALL`] entry, in that order.
-    state: [Gauge; 4],
+    state: [Gauge; 5],
+    /// The standby's sync and its lag, from the same sample as the state.
+    synced: Gauge,
+    lag: Gauge,
+    /// The restores this replica asked of its leader, from that sample too.
+    restores: Counter,
     loads: LoadCounters,
     decides: DecideCounters,
     /// The members outside a list: `engines`, then `zones`.
     outside: [Gauge; 2],
     overload_flips: Counter,
+    lifecycle_faults: Counter,
     /// Held from a scrape's sample of the state to the end of its render:
-    /// the four gauges are written from one sample and read back whole.
+    /// the gauges are written from one sample and read back whole.
     scrape: Mutex<()>,
     /// The recorder itself: the spec's series is registered on it when a
     /// spec source is bound, so a controller with none renders none.
@@ -131,32 +170,16 @@ struct LoadCounters {
 struct DecideCounters {
     /// In the order of [`Counts::BUSY`].
     busy: [Counter; 5],
-    /// `fault`, `pair_side`, `prompt_text`, `decider_gone`.
-    no_decision: [Counter; 4],
+    /// `fault`, `pair_side`, `prompt_text`, `decider_gone`,
+    /// `lease_ids_spent`, `document_awaited`.
+    no_decision: [Counter; 6],
     hashes_cut: Counter,
     /// `queue_full`, `stream_gone`.
     dropped: [Counter; 2],
+    /// `none`, `ended`: in the order of [`Counts::again`].
+    again: [Counter; 2],
     undialed: Counter,
     outlasted: Counter,
-}
-
-/// The store's counts one scrape reports.
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct StoreCounts {
-    /// The members outside the standing generation's lists.
-    pub(crate) outside: OutsideLists,
-    /// The load writes that moved an overload verdict.
-    pub(crate) overload_flips: u64,
-}
-
-impl StoreCounts {
-    /// What `store` counts now.
-    pub(crate) fn of(store: &MemoryStore) -> Self {
-        Self {
-            outside: store.outside_lists(),
-            overload_flips: store.overload_flips(),
-        }
-    }
 }
 
 impl Metrics {
@@ -171,13 +194,28 @@ impl Metrics {
         recorder.describe_gauge(
             KeyName::from_const_str(STATE),
             None,
-            "1 for the controller's state (starting, leader, follower, draining), 0 for the others"
+            "1 for the controller's state (starting, leader, syncing, follower, draining), 0 for the others"
                 .into(),
         );
         recorder.describe_gauge(
             KeyName::from_const_str(START_TIME_SECONDS),
             None,
             "The controller's start, in seconds since the Unix epoch".into(),
+        );
+        recorder.describe_gauge(
+            KeyName::from_const_str(REPLICATION_SYNCED),
+            None,
+            "1 while this replica does not lead and its standby is synced with its leader, 0 otherwise".into(),
+        );
+        recorder.describe_gauge(
+            KeyName::from_const_str(REPLICATION_LAG_SECONDS),
+            None,
+            "Seconds since the last frame that left this replica at its leader's head, 0 while this replica leads and before any such frame".into(),
+        );
+        recorder.describe_counter(
+            KeyName::from_const_str(REPLICATION_RESTORES_ASKED_TOTAL),
+            None,
+            "Restores from a snapshot this replica asked of its leader after an event that did not land".into(),
         );
         recorder.describe_counter(
             KeyName::from_const_str(LOAD_POLLS_TOTAL),
@@ -225,6 +263,11 @@ impl Metrics {
             "Answers no decide stream took, by cause".into(),
         );
         recorder.describe_counter(
+            KeyName::from_const_str(DECIDE_ASKED_AGAIN_TOTAL),
+            None,
+            "Decide requests asked again, by what became of the earlier lease".into(),
+        );
+        recorder.describe_counter(
             KeyName::from_const_str(DECIDE_CANDIDATES_UNDIALED_TOTAL),
             None,
             "Candidates a gateway's wires took from its decisions".into(),
@@ -232,8 +275,13 @@ impl Metrics {
         recorder.describe_counter(
             KeyName::from_const_str(DECIDE_BUDGET_OUTLASTED_TOTAL),
             None,
-            "Decisions whose budget ended while they were made, of the Busy answers under budget_gone_on_arrival"
+            "Decisions cut at their last read with under a microsecond of budget or under a millisecond of the lease's dispatch span left, of the Busy answers under budget_gone_on_arrival"
                 .into(),
+        );
+        recorder.describe_counter(
+            KeyName::from_const_str(LIFECYCLE_FAULTS_TOTAL),
+            None,
+            "Lifecycle calls that panicked as a lease's event was applied, each held there".into(),
         );
         recorder.describe_gauge(
             KeyName::from_const_str(MEMBERS_OUTSIDE_LIST),
@@ -250,6 +298,10 @@ impl Metrics {
             recorder.register_gauge(&key, &metadata)
         });
         let start = recorder.register_gauge(&Key::from_name(START_TIME_SECONDS), &metadata);
+        let synced = recorder.register_gauge(&Key::from_name(REPLICATION_SYNCED), &metadata);
+        let lag = recorder.register_gauge(&Key::from_name(REPLICATION_LAG_SECONDS), &metadata);
+        let restores =
+            recorder.register_counter(&Key::from_name(REPLICATION_RESTORES_ASKED_TOTAL), &metadata);
         let counter = |name: &'static str, label: &'static str, value: &'static str| {
             recorder.register_counter(
                 &Key::from_parts(name, vec![Label::new(label, value)]),
@@ -272,12 +324,21 @@ impl Metrics {
         };
         let decides = DecideCounters {
             busy: Counts::BUSY.map(|reason| counter(DECIDE_BUSY_TOTAL, "reason", reason)),
-            no_decision: ["fault", "pair_side", "prompt_text", "decider_gone"]
-                .map(|cause| counter(DECIDE_NO_DECISION_TOTAL, "cause", cause)),
+            no_decision: [
+                "fault",
+                "pair_side",
+                "prompt_text",
+                "decider_gone",
+                "lease_ids_spent",
+                "document_awaited",
+            ]
+            .map(|cause| counter(DECIDE_NO_DECISION_TOTAL, "cause", cause)),
             hashes_cut: recorder
                 .register_counter(&Key::from_name(DECIDE_HASHES_CUT_TOTAL), &metadata),
             dropped: ["queue_full", "stream_gone"]
                 .map(|cause| counter(DECIDE_ANSWERS_DROPPED_TOTAL, "cause", cause)),
+            again: ["none", "ended"]
+                .map(|lease| counter(DECIDE_ASKED_AGAIN_TOTAL, "earlier_lease", lease)),
             undialed: recorder
                 .register_counter(&Key::from_name(DECIDE_CANDIDATES_UNDIALED_TOTAL), &metadata),
             outlasted: recorder
@@ -289,6 +350,8 @@ impl Metrics {
         });
         let overload_flips =
             recorder.register_counter(&Key::from_name(OVERLOAD_FLIPS_TOTAL), &metadata);
+        let lifecycle_faults =
+            recorder.register_counter(&Key::from_name(LIFECYCLE_FAULTS_TOTAL), &metadata);
         start.set(
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -298,16 +361,26 @@ impl Metrics {
         let metrics = Self {
             handle,
             state,
+            synced,
+            lag,
+            restores,
             loads,
             decides,
             outside,
             overload_flips,
+            lifecycle_faults,
             scrape: Mutex::new(()),
             recorder,
             spec: OnceLock::new(),
         };
         metrics.set_state(State::Starting);
         metrics
+    }
+
+    /// Whether the spec series are bound, as a case reads it.
+    #[cfg(test)]
+    pub(crate) fn spec_bound(&self) -> bool {
+        self.spec.get().is_some()
     }
 
     /// Renders the generation `generations` runs and its apply counter by
@@ -343,20 +416,25 @@ impl Metrics {
         });
     }
 
-    /// One scrape's text form: the state sampled once by `state` and its
-    /// gauge written, the load driver's counts, the decide call's and the
-    /// store's read, and the render, with no other scrape between the
-    /// sample and the render. Two scrapes across a change of role each
-    /// render one state, their own.
-    pub(crate) fn render(
+    /// One scrape's text form: the state and the standby's lag sampled once
+    /// by `sample` and their gauges written, the load driver's counts, the
+    /// decide call's and the store's read, and the render, with no other
+    /// scrape between the sample and the render. Two scrapes across a change
+    /// of role each render one state, their own.
+    pub(crate) fn render<S: Into<Sample>>(
         &self,
-        state: impl FnOnce() -> State,
+        sample: impl FnOnce() -> S,
         loads: &Stats,
         decides: &Counts,
         store: impl FnOnce() -> StoreCounts,
     ) -> String {
         let _one = self.scrape.lock();
-        self.set_state(state());
+        let sample = sample().into();
+        self.set_state(sample.state);
+        self.synced.set(if sample.synced { 1.0 } else { 0.0 });
+        self.lag
+            .set(sample.lag.map_or(0.0, |lag| lag.as_secs_f64()));
+        self.restores.absolute(sample.restores);
         self.observe_loads(loads);
         if let Some(spec) = self.spec.get() {
             let counts = spec.generations.counts();
@@ -380,6 +458,8 @@ impl Metrics {
             &counts.pair_sides,
             &counts.texts,
             &counts.gone,
+            &counts.unleased,
+            &counts.awaited,
         ];
         for (counter, count) in self.decides.no_decision.iter().zip(causes) {
             counter.absolute(read(count));
@@ -387,6 +467,9 @@ impl Metrics {
         self.decides.hashes_cut.absolute(counts.hashes_cut());
         let dropped = [&counts.dropped_full, &counts.dropped_gone];
         for (counter, count) in self.decides.dropped.iter().zip(dropped) {
+            counter.absolute(read(count));
+        }
+        for (counter, count) in self.decides.again.iter().zip(&counts.again) {
             counter.absolute(read(count));
         }
         self.decides.undialed.absolute(counts.undialed());
@@ -399,6 +482,7 @@ impl Metrics {
         engines.set(f64::from(counts.outside.engines));
         zones.set(f64::from(counts.outside.zones));
         self.overload_flips.absolute(counts.overload_flips);
+        self.lifecycle_faults.absolute(counts.lifecycle_faults);
     }
 
     /// Sets the load counters from the driver's atomics.
@@ -442,11 +526,15 @@ mod tests {
     use std::{sync::Arc, time::Duration};
 
     use super::{
-        Generations, Metrics, StoreCounts, MEMBERS_OUTSIDE_LIST, SPEC_APPLY_TOTAL, SPEC_GENERATION,
+        Generations, Metrics, StoreCounts, MEMBERS_OUTSIDE_LIST, REPLICATION_LAG_SECONDS,
+        REPLICATION_RESTORES_ASKED_TOTAL, REPLICATION_SYNCED, SPEC_APPLY_TOTAL, SPEC_GENERATION,
         START_TIME_SECONDS, STATE,
     };
     use crate::{
-        controller::{deciders::Counts, readiness::State},
+        controller::{
+            deciders::Counts,
+            readiness::{Sample, State},
+        },
         ingest::loads::Stats,
         store::OutsideLists,
     };
@@ -649,13 +737,24 @@ mod tests {
             ),
             (
                 "decide_no_decision_total",
-                &["fault", "pair_side", "prompt_text", "decider_gone"]
-                    .map(|cause| format!("{{cause=\"{cause}\"}}"))[..],
+                &[
+                    "fault",
+                    "pair_side",
+                    "prompt_text",
+                    "decider_gone",
+                    "lease_ids_spent",
+                    "document_awaited",
+                ]
+                .map(|cause| format!("{{cause=\"{cause}\"}}"))[..],
             ),
             ("decide_hashes_cut_total", &[String::new()][..]),
             (
                 "decide_answers_dropped_total",
                 &["queue_full", "stream_gone"].map(|cause| format!("{{cause=\"{cause}\"}}"))[..],
+            ),
+            (
+                "decide_asked_again_total",
+                &["none", "ended"].map(|lease| format!("{{earlier_lease=\"{lease}\"}}"))[..],
             ),
             ("decide_candidates_undialed_total", &[String::new()][..]),
             ("decide_budget_outlasted_total", &[String::new()][..]),
@@ -675,6 +774,10 @@ mod tests {
             &counts.dropped_full,
             &counts.dropped_gone,
             &counts.outlasted,
+            &counts.unleased,
+            &counts.awaited,
+            &counts.again[0],
+            &counts.again[1],
         ]);
         for (count, value) in all.zip(1..) {
             count.store(value, Ordering::Relaxed);
@@ -705,6 +808,10 @@ mod tests {
             "decide_answers_dropped_total{cause=\"queue_full\"} 10",
             "decide_answers_dropped_total{cause=\"stream_gone\"} 11",
             "decide_budget_outlasted_total 12",
+            "decide_no_decision_total{cause=\"lease_ids_spent\"} 13",
+            "decide_no_decision_total{cause=\"document_awaited\"} 14",
+            "decide_asked_again_total{earlier_lease=\"none\"} 15",
+            "decide_asked_again_total{earlier_lease=\"ended\"} 16",
             "decide_candidates_undialed_total 31",
             "decide_hashes_cut_total 42",
         ] {
@@ -727,6 +834,7 @@ mod tests {
             Some("smg_policy_controller_members_outside_list{list=\"engines\"} 0")
         );
         assert!(rendered.contains("smg_policy_controller_overload_flips_total 0"));
+        assert!(rendered.contains("smg_policy_controller_lifecycle_faults_total 0"));
         assert!(rendered.contains("# HELP smg_policy_controller_members_outside_list "));
 
         let counts = StoreCounts {
@@ -735,6 +843,7 @@ mod tests {
                 zones: 5,
             },
             overload_flips: 9,
+            lifecycle_faults: 4,
         };
         let rendered = metrics.render(
             || State::Leader,
@@ -751,6 +860,7 @@ mod tests {
             Some("smg_policy_controller_members_outside_list{list=\"zones\"} 5")
         );
         assert!(rendered.contains("smg_policy_controller_overload_flips_total 9"));
+        assert!(rendered.contains("smg_policy_controller_lifecycle_faults_total 4"));
 
         // The count outside a list falls once a generation names the member.
         let rendered = metrics.render(
@@ -842,5 +952,97 @@ mod tests {
             .apply(RANDOM.into(), Format::Yaml)
             .expect("a valid document");
         series(2, 2, 1);
+    }
+
+    #[test]
+    fn a_scrape_tells_the_standbys_sync_and_its_lag_from_one_sample() {
+        let metrics = Metrics::new();
+        let scrape = |state, lag, synced| {
+            let rendered = metrics.render(
+                || Sample {
+                    state,
+                    lag,
+                    synced,
+                    restores: 0,
+                },
+                &Stats::default(),
+                &Counts::default(),
+                StoreCounts::default,
+            );
+            (
+                line(&rendered, REPLICATION_SYNCED, ""),
+                line(&rendered, REPLICATION_LAG_SECONDS, ""),
+            )
+        };
+        let read = |synced: &str, lag: &str| {
+            (
+                Some(format!("smg_policy_controller_replication_synced {synced}")),
+                Some(format!(
+                    "smg_policy_controller_replication_lag_seconds {lag}"
+                )),
+            )
+        };
+        // A follower a second and a half behind its leader, and synced.
+        assert_eq!(
+            scrape(State::Follower, Some(Duration::from_millis(1500)), true),
+            read("1", "1.5")
+        );
+        // Its stream fell silent: the lag grows and the sync is gone.
+        assert_eq!(
+            scrape(State::Syncing, Some(Duration::from_secs(40)), false),
+            read("0", "40")
+        );
+        // A leader follows nobody: both read zero, as before any frame.
+        let rendered = metrics.render(
+            || State::Leader,
+            &Stats::default(),
+            &Counts::default(),
+            StoreCounts::default,
+        );
+        assert_eq!(
+            (
+                line(&rendered, REPLICATION_SYNCED, ""),
+                line(&rendered, REPLICATION_LAG_SECONDS, "")
+            ),
+            read("0", "0")
+        );
+        assert!(rendered.contains("# HELP smg_policy_controller_replication_synced "));
+        assert!(rendered.contains("# HELP smg_policy_controller_replication_lag_seconds "));
+    }
+
+    #[test]
+    fn a_scrape_tells_the_restores_this_replica_asked_of_its_leader() {
+        let metrics = Metrics::new();
+        let scrape = |restores| {
+            let rendered = metrics.render(
+                || Sample {
+                    restores,
+                    ..Sample::from(State::Syncing)
+                },
+                &Stats::default(),
+                &Counts::default(),
+                StoreCounts::default,
+            );
+            line(&rendered, REPLICATION_RESTORES_ASKED_TOTAL, "")
+        };
+        let read = |asked: u64| {
+            Some(format!(
+                "smg_policy_controller_replication_restores_asked_total {asked}"
+            ))
+        };
+        // The series is there before any ask.
+        assert_eq!(scrape(0), read(0));
+        // A scrape tells the standby's own count: it is set, never added.
+        assert_eq!(scrape(2), read(2));
+        assert_eq!(scrape(2), read(2));
+        assert_eq!(scrape(3), read(3));
+        let rendered = metrics.render(
+            || State::Leader,
+            &Stats::default(),
+            &Counts::default(),
+            StoreCounts::default,
+        );
+        assert!(rendered
+            .contains("# TYPE smg_policy_controller_replication_restores_asked_total counter"));
     }
 }

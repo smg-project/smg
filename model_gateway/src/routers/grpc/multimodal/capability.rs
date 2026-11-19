@@ -15,29 +15,13 @@
 use anyhow::Result;
 use axum::response::Response;
 use llm_multimodal::{EncoderInputFormat, Modality};
-
-use super::{plan::MediaPlan, refs::worker_accepts_media_refs, MultimodalIntermediate};
-use crate::{
-    routers::error,
-    worker::{RuntimeType, Worker, WorkerRegistry},
+use smg_worker::{
+    identity::basic::{RuntimeType, Worker},
+    labels::SUPPORTS_VISION_LABEL,
 };
 
-/// Worker label carrying the engine's vision-input capability (the vLLM
-/// gRPC servicer's `GetModelInfoResponse.supports_vision`). `"false"` on a
-/// multimodal architecture means the engine runs `--language-model-only`:
-/// no vision encoder, encoder-cache budget 0, so no pixel payload (image,
-/// video) may reach it. A multimodal model reports `"true"`; a text-only
-/// model also reports `"false"`. The label speaks for the vision encoder
-/// only: the servicer reports `"false"` as well for an engine that still
-/// takes audio or pre-computed embeddings, so it says nothing about those
-/// (the runtime capability matrix below does). The label is tri-state:
-/// only vLLM's `false` becomes a label; for the other runtimes a `false`
-/// cannot be told from a servicer's default and is dropped
-/// (`ModelInfo::to_labels`), and an absent label reads as unknown, never as
-/// a refusal. An SGLang servicer that carries no media to its engine writes
-/// a deliberate `false` into its `server_args`, which is kept
-/// (`ServerInfo::to_labels`).
-pub(crate) const SUPPORTS_VISION_LABEL: &str = "supports_vision";
+use super::{plan::MediaPlan, refs::worker_accepts_media_refs, MultimodalIntermediate};
+use crate::routers::{common::snapshot::WorkerRegistry, error};
 
 /// Whether the worker's engine runs without a vision encoder (a vLLM
 /// `--language-model-only` worker), so no pixel payload may reach it. Absent
@@ -210,7 +194,7 @@ fn unsupported_modality_message(runtimes: &[RuntimeType], modality: Modality) ->
 /// - Image: SGLang, vLLM, TRT-LLM, TokenSpeed
 /// - ImageEmbeds: TokenSpeed only (pre-computed embeddings are an EPD feature)
 /// - Video: vLLM, TokenSpeed
-/// - Audio: TokenSpeed
+/// - Audio: vLLM, TokenSpeed
 /// - MLX: none
 ///
 /// `Modality::ImageEmbeds` cannot actually reach either check today because a
@@ -225,7 +209,7 @@ pub(crate) fn runtime_supports_modality(runtime: RuntimeType, modality: Modality
         ),
         Modality::ImageEmbeds => matches!(runtime, RuntimeType::TokenSpeed),
         Modality::Video => matches!(runtime, RuntimeType::Vllm | RuntimeType::TokenSpeed),
-        Modality::Audio => matches!(runtime, RuntimeType::TokenSpeed),
+        Modality::Audio => matches!(runtime, RuntimeType::Vllm | RuntimeType::TokenSpeed),
     }
 }
 
@@ -324,7 +308,7 @@ mod tests {
             (Sglang, Audio, false),
             (Vllm, Image, true),
             (Vllm, Video, true),
-            (Vllm, Audio, false),
+            (Vllm, Audio, true),
             (Trtllm, Image, true),
             (Trtllm, Video, false),
             (Trtllm, Audio, false),
@@ -474,11 +458,12 @@ mod tests {
 
         use llm_multimodal::MediaContentPart;
         use openai_protocol::model_card::ModelCard;
+        use smg_worker::identity::basic::{ConnectionMode, WorkerType};
 
         use super::*;
-        use crate::worker::{
-            test_support::{grpc_worker, registry_with},
-            BasicWorkerBuilder, ConnectionMode, WorkerType,
+        use crate::routers::{
+            common::snapshot::test_support::{grpc_worker, registry_with},
+            grpc::backend_client::BasicWorkerBuilder,
         };
 
         const MODEL: &str = "pool-test-model";
@@ -631,10 +616,15 @@ mod tests {
 
             let audio = MediaPlan::new([audio_part()]);
             let vllm = registry_with(vec![engine_worker("grpc://10.0.0.1:1", RuntimeType::Vllm)]);
-            let response = ensure_model_accepts_media(&vllm, MODEL, &audio, false).unwrap_err();
+            assert!(ensure_model_accepts_media(&vllm, MODEL, &audio, false).is_ok());
+            let sglang = registry_with(vec![engine_worker(
+                "grpc://10.0.0.1:1",
+                RuntimeType::Sglang,
+            )]);
+            let response = ensure_model_accepts_media(&sglang, MODEL, &audio, false).unwrap_err();
             let (code, message) = refusal(response).await;
             assert_eq!(code, "multimodal_not_supported");
-            assert_eq!(message, "backend vllm does not support audio inputs");
+            assert_eq!(message, "backend sglang does not support audio inputs");
 
             let tokenspeed = registry_with(vec![engine_worker(
                 "grpc://10.0.0.1:1",
@@ -654,11 +644,10 @@ mod tests {
 
         /// Where the gateway processes every item itself it hands a worker
         /// no reference, so the worker's own media processor takes nothing
-        /// off the matrix: the audio is refused in preparation, with the
-        /// sentence selection gave it after the fetch and the decode. What
-        /// the engine takes by the matrix goes on.
-        #[tokio::test]
-        async fn a_workers_own_processor_takes_nothing_off_the_matrix_where_the_router_processes() {
+        /// off the matrix. vLLM accepts preprocessed audio as well as images,
+        /// whether the worker also advertises its own processor or not.
+        #[test]
+        fn a_workers_own_processor_takes_nothing_off_the_matrix_where_the_router_processes() {
             use crate::routers::grpc::multimodal::refs::MM_PROCESSOR_LABEL;
 
             let audio = MediaPlan::new([audio_part()]);
@@ -666,10 +655,7 @@ mod tests {
                 "grpc://10.0.0.1:1",
                 &[(MM_PROCESSOR_LABEL, "inprocess")],
             )]);
-            let response = ensure_model_accepts_media(&refs, MODEL, &audio, true).unwrap_err();
-            let (code, message) = refusal(response).await;
-            assert_eq!(code, "multimodal_not_supported");
-            assert_eq!(message, "backend vllm does not support audio inputs");
+            assert!(ensure_model_accepts_media(&refs, MODEL, &audio, true).is_ok());
             assert!(ensure_model_accepts_media(&refs, MODEL, &image_plan(), true).is_ok());
         }
 
@@ -851,10 +837,7 @@ mod tests {
                 "grpc://10.0.0.1:1",
                 &[(SUPPORTS_VISION_LABEL, "false")],
             )]);
-            let response = ensure_model_accepts_media(&all_lmo, MODEL, &audio, false).unwrap_err();
-            let (code, message) = refusal(response).await;
-            assert_eq!(code, "multimodal_not_supported");
-            assert_eq!(message, "backend vllm does not support audio inputs");
+            assert!(ensure_model_accepts_media(&all_lmo, MODEL, &audio, false).is_ok());
 
             let mixed = MediaPlan::new([audio_part(), image_part()]);
             assert_eq!(pixel_modalities(&mixed), vec![Modality::Image]);

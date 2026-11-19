@@ -107,8 +107,14 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdatePoliciesForWorkerStep {
 mod tests {
     use std::sync::Arc;
 
-    use openai_protocol::worker::{
-        HealthCheckConfig, RuntimeType, WorkerType, WorkerUpdateRequest,
+    use openai_protocol::{
+        model_card::ModelCard,
+        worker::{HealthCheckConfig, RuntimeType, WorkerType, WorkerUpdateRequest},
+    };
+    use smg_worker::{
+        identity::basic::{ConnectionMode, Worker},
+        kv_events::SubscriptionKind,
+        test_support::ready_worker,
     };
     use tracing_test::traced_test;
     use wfaas::WorkflowInstanceId;
@@ -117,10 +123,8 @@ mod tests {
     use crate::{
         app_context::{testing::app_context_for_tests, AppContext},
         config::{PolicyConfig, RouterConfig},
-        worker::{
-            test_support::ready_worker, BasicWorkerBuilder, ConnectionMode, KvEventMonitor,
-            ModelCard, SubscriptionKind, Worker, WorkerRegistry,
-        },
+        policies::kv_index::event_monitor::KvEventMonitor,
+        routers::{common::snapshot::WorkerRegistry, grpc::backend_client::BasicWorkerBuilder},
         workflow::steps::local::create_worker_update_workflow_data,
     };
 

@@ -9,6 +9,7 @@ use super::{
     config::{Exposure, Reveal},
 };
 use crate::{
+    counts::with_counts,
     decision::{Decision, Target, MAX_TARGETS},
     lease::{Lease, LeaseKind, Membership, Outcome, ReleaseReason, Side, Signal, TransportClass},
     plugins::shown_hashes,
@@ -158,8 +159,9 @@ pub(crate) fn load(row: &LoadRow) -> wit::Load {
 
 /// One candidate as the record form carries it: the row, and the affinity
 /// facts the host holds for it beside the row (`held`), which the record
-/// keeps as fields of its own.
-pub(crate) fn candidate(c: &Candidate, held: AffinityFacts) -> wit::Candidate {
+/// keeps as fields of its own. Its requests in flight are what the
+/// request's facts read for it (`in_flight`).
+pub(crate) fn candidate(c: &Candidate, held: AffinityFacts, in_flight: u32) -> wit::Candidate {
     wit::Candidate {
         id: c.id.0,
         role: role(c.role),
@@ -169,7 +171,7 @@ pub(crate) fn candidate(c: &Candidate, held: AffinityFacts) -> wit::Candidate {
         wire_modes: wire_modes(c.wire_modes),
         engine_kind: c.engine_kind,
         connector: c.connector,
-        in_flight: c.in_flight,
+        in_flight,
         load: c.load.as_ref().map(load),
         overlap_blocks: held.overlap_blocks,
         predicted_blocks: held.predicted_blocks,
@@ -305,11 +307,12 @@ impl Records {
         // index reads the row and what it holds. The packed fill walks
         // either feed instead; this one keeps the read by index, whose
         // tests are lost in what a record a candidate costs.
-        self.candidates.extend(
-            (0u32..)
+        with_counts!(facts, |counts| {
+            let records = (0u32..)
                 .zip(candidates)
-                .map(|(index, c)| candidate(c, facts.affinity_at(index))),
-        );
+                .map(|(index, c)| candidate(c, facts.affinity_at(index), counts(c)));
+            self.candidates.extend(records);
+        });
         self.zones.clear();
         self.zones.extend(pool.zones.iter().map(zone));
         self.tried.clear();
@@ -645,6 +648,14 @@ fn put(buf: &mut [u8], at: usize, bytes: &[u8]) {
     buf[at..at + bytes.len()].copy_from_slice(bytes);
 }
 
+/// Appends a section of u64 values, eight little-endian bytes each: the
+/// block grows once, by the section's length, and one pass extends it from
+/// the values' bytes.
+fn put_u64s(buf: &mut Vec<u8>, values: impl ExactSizeIterator<Item = u64>) {
+    buf.reserve(8 * values.len());
+    buf.extend(values.flat_map(u64::to_le_bytes));
+}
+
 /// The bits whose flag is set.
 fn bits<const N: usize>(flags: [(bool, u8); N]) -> u8 {
     flags
@@ -722,12 +733,8 @@ impl Packed {
         put(buf, REQ_BLOCK_SIZE, &facts.block_size.to_le_bytes());
         buf.extend_from_slice(facts.model.as_bytes());
         buf.resize(buf.len().next_multiple_of(8), 0);
-        for h in hashes {
-            buf.extend_from_slice(&h.to_le_bytes());
-        }
-        for t in facts.tried {
-            buf.extend_from_slice(&t.0.to_le_bytes());
-        }
+        put_u64s(buf, hashes.iter().copied());
+        put_u64s(buf, facts.tried.iter().map(|t| t.0));
         for h in exposed {
             let len = section_len(h.value)?;
             buf.push(h.name);
@@ -760,33 +767,34 @@ impl Packed {
         // depths, and every row reads its age, growth and index size as
         // zero, so a host fills the column for a profile whose guest reads
         // those.
-        match facts.feed() {
+        with_counts!(facts, |counts| match facts.feed() {
             feed if feed.is_empty() => {
                 let nothing = AffinityFacts::default();
                 for (c, row) in candidates.iter().zip(rows) {
-                    Self::fill_row(row, c, nothing);
+                    Self::fill_row(row, c, nothing, counts(c));
                 }
             }
             Feed::Column(column) => {
                 let column = &column[..candidates.len()];
                 for ((c, held), row) in candidates.iter().zip(column).zip(rows) {
-                    Self::fill_row(row, c, *held);
+                    Self::fill_row(row, c, *held, counts(c));
                 }
             }
             Feed::Named(named) => {
                 let mut walk = named.walk();
                 for ((index, c), row) in (0u32..).zip(candidates).zip(rows) {
-                    Self::fill_row(row, c, walk.entry(index));
+                    Self::fill_row(row, c, walk.entry(index), counts(c));
                 }
             }
-        }
+        });
     }
 
-    /// One candidate's row of the table, its affinity facts in it.
-    fn fill_row(row: &mut [u8; layout::ROW], c: &Candidate, held: AffinityFacts) {
+    /// One candidate's row of the table, its affinity facts and the
+    /// requests in flight the request's facts read for it in the row.
+    fn fill_row(row: &mut [u8; layout::ROW], c: &Candidate, held: AffinityFacts, in_flight: u32) {
         use layout::*;
         put(row, ROW_ID, &c.id.0.to_le_bytes());
-        put(row, ROW_IN_FLIGHT, &c.in_flight.to_le_bytes());
+        put(row, ROW_IN_FLIGHT, &in_flight.to_le_bytes());
         let load = c.load.unwrap_or_default();
         put(row, ROW_RUNNING, &load.running.to_le_bytes());
         put(row, ROW_QUEUED, &load.queued.to_le_bytes());
@@ -961,11 +969,20 @@ pub(crate) fn release_reason(r: ReleaseReason) -> wit::ReleaseReason {
     }
 }
 
+/// A membership word as the guest's world carries it. A snapshot's ids are
+/// written into `snapshot` and a left word's names into `names`: the word
+/// borrows them for the call.
 pub(crate) fn membership<'a>(
-    m: &Membership<'_>,
+    m: &Membership<'a>,
     snapshot: &'a mut Vec<u64>,
+    names: &'a mut Vec<&'a str>,
 ) -> wit::Membership<'a> {
-    match m {
+    match *m {
+        Membership::Left { id, models } => {
+            names.clear();
+            names.extend(models.iter().map(String::as_str));
+            wit::Membership::Left((id.0, names.as_slice()))
+        }
         Membership::Added(w) => wit::Membership::Added(w.0),
         Membership::Removed(w) => wit::Membership::Removed(w.0),
         Membership::Replaced { old, new } => wit::Membership::Replaced((old.0, new.0)),
@@ -987,6 +1004,7 @@ pub(crate) fn signal(s: &Signal, now_micros: u64) -> wit::Signal {
             worker,
             dp_rank,
             row,
+            ..
         } => wit::Signal::Load((worker.0, *dp_rank, load(row))),
         Signal::Health { worker, health: h } => wit::Signal::Health((worker.0, health(*h))),
         Signal::GatewayVeto {
@@ -1081,7 +1099,7 @@ mod tests {
     #[test]
     fn the_record_row_carries_every_field_and_the_flags_by_name() {
         let c = candidate_row();
-        let r = candidate(&c, candidate_held());
+        let r = candidate(&c, candidate_held(), c.in_flight);
         assert_eq!(r.id, c.id.0);
         assert_eq!(r.role, wit::Role::Decode);
         assert!(r
@@ -1176,6 +1194,35 @@ mod tests {
             .map(|row| le_u32(row, ROW_OVERLAP))
             .collect();
         assert_eq!(packed, vec![0, 17, 0]);
+    }
+
+    /// Both fills carry each candidate's requests in flight as the
+    /// request's facts read them: the lent count where the host lends a
+    /// table, the rows themselves reading zero.
+    #[test]
+    fn both_fills_give_a_row_the_count_its_request_reads() {
+        use crate::counts::tests::Lent;
+        let mut rows = [Candidate::default(), candidate_row(), Candidate::default()];
+        for (row, position) in rows.iter_mut().zip(0..) {
+            row.position = position;
+        }
+        rows[2].in_flight = 3;
+        let lent = Lent::take(&mut rows);
+        let facts = lent.beside(&RequestFacts::default());
+        let mut records = Records::default();
+        records.fill(&facts, &rows, &PoolFacts::default());
+        let record: Vec<u32> = records.candidates.iter().map(|r| r.in_flight).collect();
+        assert_eq!(record, vec![0, 7, 3]);
+        let mut packed = Packed::default();
+        packed.fill_candidates(&facts, &rows);
+        let packed: Vec<u32> = packed
+            .candidates
+            .as_chunks::<ROW>()
+            .0
+            .iter()
+            .map(|row| le_u32(row, ROW_IN_FLIGHT))
+            .collect();
+        assert_eq!(packed, vec![0, 7, 3]);
     }
 
     #[test]
@@ -1326,10 +1373,9 @@ mod tests {
             assert_eq!(usize::from(le_u16(b, REQ_HASH_COUNT)), carried, "{needs:?}");
             // No name, no tried id, no header: the hashes are the block's tail.
             assert_eq!(b.len(), HEADER + 8 * carried, "{needs:?}");
-            if carried > 0 {
-                assert_eq!(le_u64(b, HEADER), 0);
-                assert_eq!(le_u64(b, b.len() - 8), longer[carried - 1], "{needs:?}");
-            }
+            // Every hash at its own eight bytes, in the list's order.
+            let read: Vec<u64> = (0..carried).map(|i| le_u64(b, HEADER + 8 * i)).collect();
+            assert_eq!(read, &longer[..carried], "{needs:?}");
         }
         // A list inside the range is carried whole.
         let short = RequestFacts {
@@ -1338,6 +1384,46 @@ mod tests {
         };
         let record = request(&short, &Exposure::default(), token, &[], &[]);
         assert_eq!(record.block_hashes, &longer[..3]);
+    }
+
+    /// The two u64 sections are written a section at a time: every hash and
+    /// every tried id sits at its own eight bytes, little-endian and in
+    /// order, the tried ids after the hashes, at any length of either, in
+    /// a block that held a longer request before.
+    #[test]
+    fn the_packed_sections_hold_every_value_at_its_own_eight_bytes() {
+        let value = |i: u64| (i + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let needs = Needs {
+            token_hashes: true,
+            ..Needs::default()
+        };
+        let mut packed = Packed::default();
+        for (hash_count, tried_count) in [(257, 2), (0, 0), (1, 0), (0, 1), (3, 5)] {
+            let hashes: Vec<u64> = (0..hash_count).map(value).collect();
+            let tried: Vec<WorkerId> = (0..tried_count)
+                .map(|i| WorkerId(value(1_000 + i)))
+                .collect();
+            let facts = RequestFacts {
+                model: "m",
+                block_hashes: &hashes,
+                tried: &tried,
+                ..RequestFacts::default()
+            };
+            packed
+                .fill_request(&facts, &Exposure::default(), needs)
+                .expect("the request packs");
+            let b = &packed.request;
+            // A name of one byte: the sections start at the next multiple of 8.
+            let at = (HEADER + 1).next_multiple_of(8);
+            assert_eq!(b.len(), at + 8 * (hashes.len() + tried.len()));
+            let read: Vec<u64> = (at..b.len()).step_by(8).map(|i| le_u64(b, i)).collect();
+            let wanted: Vec<u64> = hashes
+                .iter()
+                .copied()
+                .chain(tried.iter().map(|t| t.0))
+                .collect();
+            assert_eq!(read, wanted, "{hash_count} hashes, {tried_count} tried ids");
+        }
     }
 
     #[test]
@@ -1382,6 +1468,8 @@ mod tests {
             block_size: 16,
             now_micros: 0,
             pinned_at: 0,
+            lent_in_flight: None,
+            session_counted: false,
             // Host-only: the request block carries no affinity column and
             // no rows named in its place.
             affinity: &[],
@@ -1583,6 +1671,8 @@ mod tests {
             generation: 7,
             zones: &zones,
             reach: 0,
+            reported: false,
+            ..PoolFacts::default()
         };
         let mut packed = Packed::default();
         packed.fill_pool(&pool);
@@ -1605,5 +1695,34 @@ mod tests {
         };
         assert_eq!(signal(&veto, 1_000), wit::Signal::GatewayVeto((4, 500)));
         assert_eq!(signal(&veto, 2_000), wit::Signal::GatewayVeto((4, 0)));
+    }
+
+    /// A dispatch on another target of its pick is told with a lease that
+    /// names that target's index, and the guest's lease record carries it.
+    #[test]
+    fn a_lease_record_names_the_index_of_its_lease() {
+        let told = Lease {
+            target_index: 1,
+            ..Lease::default()
+        };
+        assert_eq!(lease(&told, &Exposure::default()).target_index, 1);
+    }
+
+    /// The guest's world carries the models a worker left as the case
+    /// `left`: the mapper hands a guest the worker's id with the names, and
+    /// the write's own word as before.
+    #[test]
+    fn a_guest_is_told_the_models_a_worker_left_as_the_case_left() {
+        let (id, models) = (WorkerId(7), ["m".to_string()]);
+        let left = Membership::Left {
+            id,
+            models: &models,
+        };
+        let (mut snapshot, mut names) = (Vec::new(), Vec::new());
+        let word = membership(&left, &mut snapshot, &mut names);
+        assert!(matches!(word, wit::Membership::Left((7, ["m"]))));
+        let (mut snapshot, mut names) = (Vec::new(), Vec::new());
+        let word = membership(&Membership::Relabelled(id), &mut snapshot, &mut names);
+        assert!(matches!(word, wit::Membership::Relabelled(7)));
     }
 }
