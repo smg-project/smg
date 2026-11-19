@@ -24,16 +24,15 @@
 //! status as its probes read it, and its circuit breaker. The overload and
 //! stall vetoes are the controller's, read from its rows.
 
-use std::{
-    fmt,
-    future::{ready, Ready},
-    sync::Arc,
-    time::Instant,
-};
+use std::{fmt, sync::Arc, time::Instant};
 
+use axum::{
+    http::{header::RETRY_AFTER, HeaderValue},
+    response::Response,
+};
 use rand::RngExt;
 use smg_policy_controller::{
-    decision::{Decision, ShedReason, Targets},
+    decision::{Decision, ShedReason, Target, Targets},
     door::{Door, Refused, Request},
     handle::Handle,
     lease::{Outcome, ReleaseReason, Side, TransportClass},
@@ -42,15 +41,29 @@ use smg_policy_controller::{
 };
 use smg_worker::identity::basic::{Worker, WorkerLoadGuard};
 
-use crate::routers::common::snapshot::WorkerRegistry;
+use crate::{
+    middleware::SHED_RETRY_AFTER_SECS,
+    routers::{
+        common::{
+            overload::WORKER_OVERLOAD_PROTECTION_SHED_ERROR_CODE,
+            placement::no_available_workers_because, retry::mark_non_retryable,
+            snapshot::WorkerRegistry,
+        },
+        error,
+    },
+};
 
-/// The gateway of this process, as the controller's store names it. One
-/// gateway decides in process, so the id tells no two apart.
-const GATEWAY: GatewayId = GatewayId(1);
+/// The gateway of this process, as the controller's store names it: the
+/// crate's own name for the one gateway that decides in its own process.
+const GATEWAY: GatewayId = GatewayId::LOCAL;
 
 /// The asks of one attempt: the first, and two more that name the targets
 /// the gateway could not send to.
 const ASKS: usize = 3;
+
+/// The crate's word, in a shed's `emptied_by`, for a pool no stage emptied:
+/// it held no candidate before any stage ran.
+const NO_STAGE: &str = "none";
 
 /// What an attempt states of its request.
 #[derive(Clone, Copy, Debug)]
@@ -113,6 +126,116 @@ pub(crate) enum Unplaced {
     NoTargetHolds,
 }
 
+impl Unplaced {
+    /// The answer for a request of `model` that has no worker: the status,
+    /// the code and the retry hint, one function for every router.
+    ///
+    /// | Why | The answer |
+    /// |---|---|
+    /// | The pool is saturated, or the controller queued the request | 503 `worker_overload_protection_shed`, with a retry hint |
+    /// | No endpoint is left, or the gateway can send to no target | 503 `no_available_workers`, with a retry hint |
+    /// | A queue is at its limit | 429 `admission_queue_full`, with the admission queue's retry hint |
+    /// | The decision's budget passed | 503 `admission_queue_timeout`, with the same hint |
+    /// | The picker declined every candidate | 503 `policy_declined` |
+    /// | The door made no decision | 503 `policy_controller_unavailable`, with a retry hint |
+    ///
+    /// No answer is retried in process: a second ask a moment later reads
+    /// the same rows. A route that asks for a side of a pair refuses by name
+    /// before it asks, so that refusal of the door has no row of its own.
+    pub(crate) fn answer(&self, model: &str) -> Response {
+        let mut response = match *self {
+            Self::Shed {
+                reason: ShedReason::Saturated,
+                retry_after_secs,
+                ..
+            } => hinted(
+                error::service_unavailable(
+                    WORKER_OVERLOAD_PROTECTION_SHED_ERROR_CODE,
+                    format!("All workers for model '{model}' are overloaded"),
+                ),
+                u32::from(retry_after_secs),
+            ),
+            Self::Queued => hinted(
+                error::service_unavailable(
+                    WORKER_OVERLOAD_PROTECTION_SHED_ERROR_CODE,
+                    format!("The workers for model '{model}' take no request now"),
+                ),
+                0,
+            ),
+            Self::Shed {
+                reason: ShedReason::NoEndpoints,
+                emptied_by,
+                ..
+            } => no_available_workers_because(
+                format!("No available workers for model '{model}'"),
+                left_no_worker(emptied_by),
+            ),
+            Self::NoTargetHolds => no_available_workers_because(
+                format!("No available workers for model '{model}'"),
+                "the gateway could send to no target the policy controller picked",
+            ),
+            Self::Shed {
+                reason: ShedReason::FlowLimit,
+                ..
+            } => hinted(
+                error::too_many_requests(
+                    "admission_queue_full",
+                    "a queue of the policy controller is at its limit",
+                ),
+                SHED_RETRY_AFTER_SECS,
+            ),
+            Self::Shed {
+                reason: ShedReason::Deadline,
+                ..
+            } => hinted(
+                error::service_unavailable(
+                    "admission_queue_timeout",
+                    "the decision's budget passed before a worker was picked",
+                ),
+                SHED_RETRY_AFTER_SECS,
+            ),
+            Self::Shed {
+                reason: ShedReason::PolicyDeclined,
+                emptied_by,
+                ..
+            } => error::service_unavailable(
+                "policy_declined",
+                format!(
+                    "The policy's {emptied_by} stage declined every worker for model '{model}'"
+                ),
+            ),
+            Self::Refused(_) => hinted(
+                error::service_unavailable(
+                    "policy_controller_unavailable",
+                    "The policy controller made no decision for this request",
+                ),
+                0,
+            ),
+        };
+        mark_non_retryable(&mut response);
+        response
+    }
+}
+
+/// Why the controller left no worker, for the refusal's line: the stage
+/// that emptied the pool, or that the pool held no candidate before any
+/// stage ran.
+fn left_no_worker(emptied_by: &str) -> String {
+    if emptied_by == NO_STAGE {
+        "the policy controller holds no candidate for the model".to_owned()
+    } else {
+        format!("the policy controller's {emptied_by} stage left no worker")
+    }
+}
+
+/// `response` with a retry hint of `secs` seconds, one at the least.
+fn hinted(mut response: Response, secs: u32) -> Response {
+    response
+        .headers_mut()
+        .insert(RETRY_AFTER, HeaderValue::from(secs.max(1)));
+    response
+}
+
 /// A decision that picked: its targets, best first, and its lease, not yet
 /// committed.
 pub(crate) struct Asked {
@@ -154,35 +277,41 @@ impl Host {
     /// handle, naming the targets the gateway `missed` at this attempt's
     /// earlier commits.
     ///
-    /// The one function of the host that may wait. The door of this process
-    /// decides on the calling thread, so the answer is ready.
-    pub(crate) fn ask(
+    /// The one function of the host that may await. The door of this
+    /// process decides on the calling thread, under the store's own locks,
+    /// and awaits nothing.
+    #[expect(
+        clippy::unused_async,
+        reason = "a controller at an address is asked behind this call, over its session"
+    )]
+    pub(crate) async fn ask(
         &self,
         ask: &Ask<'_>,
         missed: &[WorkerId],
         now: Instant,
-    ) -> Ready<Result<Asked, Unplaced>> {
-        let decided = Handle::decide(Arc::clone(&self.door), GATEWAY, &ask.request(missed), now);
-        ready(decided.map_err(Unplaced::Refused).and_then(|handle| {
-            let decision = *handle.decision();
-            match decision {
-                Decision::Pick(pick) => Ok(Asked {
-                    targets: pick.targets,
-                    handle,
-                }),
-                Decision::Shed(shed) => Err(Unplaced::Shed {
-                    reason: shed.reason,
-                    emptied_by: shed.emptied_by,
-                    retry_after_secs: shed.retry_after_secs,
-                }),
-                Decision::Queue(_) => Err(Unplaced::Queued),
-            }
-        }))
+    ) -> Result<Asked, Unplaced> {
+        let handle = Handle::decide(Arc::clone(&self.door), GATEWAY, &ask.request(missed), now)
+            .map_err(Unplaced::Refused)?;
+        let decision = *handle.decision();
+        match decision {
+            Decision::Pick(pick) => Ok(Asked {
+                targets: pick.targets,
+                handle,
+            }),
+            Decision::Shed(shed) => Err(Unplaced::Shed {
+                reason: shed.reason,
+                emptied_by: shed.emptied_by,
+                retry_after_secs: shed.retry_after_secs,
+            }),
+            Decision::Queue(_) => Err(Unplaced::Queued),
+        }
     }
 
     /// The commit: walks the targets of `asked`, best first, and takes the
-    /// first the gateway can send to. It never waits, so a caller may hold
-    /// a lock of its own across it.
+    /// first the gateway can send to. It awaits nothing. It reads each
+    /// target's row under the store's membership lock, which a publication
+    /// holds through a rebuild: until the host resolves a target by its id,
+    /// a caller holds no lock of its own across it.
     ///
     /// Where no target holds, the decision's lease is given up by name at
     /// `now` and its targets join `missed`: the next ask names them.
@@ -192,19 +321,39 @@ impl Host {
         missed: &mut Vec<WorkerId>,
         now: Instant,
     ) -> Option<Placed> {
+        self.commit_where(asked, |_| true, missed, now)
+    }
+
+    /// The commit of a route with a rule of its own: as [`Host::commit`],
+    /// and a target whose worker `holds` refuses is passed over like one
+    /// the gateway cannot send to.
+    ///
+    /// The rule is the route's and the controller does not read it. Where
+    /// few workers pass it, an attempt's asks may end with no worker while
+    /// one that passes stands. A demand the controller keeps ahead of its
+    /// stages takes the rule's place once the request can state it.
+    pub(crate) fn commit_where(
+        &self,
+        asked: Asked,
+        holds: impl Fn(&dyn Worker) -> bool,
+        missed: &mut Vec<WorkerId>,
+        now: Instant,
+    ) -> Option<Placed> {
         let Asked {
             targets,
             mut handle,
         } = asked;
         for (index, target) in targets.iter().enumerate() {
-            let sendable = self
-                .worker(target.id)
-                .filter(|worker| worker.is_healthy() && worker.circuit_breaker_can_execute());
+            let sendable = self.worker(target.id).filter(|worker| {
+                worker.is_healthy()
+                    && worker.circuit_breaker_can_execute()
+                    && holds(worker.as_ref())
+            });
             if let Some(worker) = sendable {
                 handle.take(index);
                 return Some(Placed {
                     worker,
-                    id: target.id,
+                    target: *target,
                     handle,
                 });
             }
@@ -217,10 +366,21 @@ impl Host {
     /// A regular attempt's worker at `now`: the ask and the commit, three
     /// asks at most. After the third the attempt has no worker.
     pub(crate) async fn place(&self, ask: &Ask<'_>, now: Instant) -> Result<Placed, Unplaced> {
+        self.place_where(ask, |_| true, now).await
+    }
+
+    /// A regular attempt's worker at `now` on a route with a rule of its
+    /// own: as [`Host::place`], over [`Host::commit_where`].
+    pub(crate) async fn place_where(
+        &self,
+        ask: &Ask<'_>,
+        holds: impl Fn(&dyn Worker) -> bool + Send + Sync,
+        now: Instant,
+    ) -> Result<Placed, Unplaced> {
         let mut missed: Vec<WorkerId> = Vec::new();
         for _ in 0..ASKS {
             let asked = self.ask(ask, &missed, now).await?;
-            if let Some(placed) = self.commit(asked, &mut missed, now) {
+            if let Some(placed) = self.commit_where(asked, &holds, &mut missed, now) {
                 return Ok(placed);
             }
         }
@@ -249,7 +409,7 @@ pub(crate) struct End {
 /// end.
 pub(crate) struct Placed {
     worker: Arc<dyn Worker>,
-    id: WorkerId,
+    target: Target,
     handle: Handle<Arc<Door>>,
 }
 
@@ -261,7 +421,13 @@ impl Placed {
 
     /// The store's row of that worker: what a retry names as tried.
     pub(crate) fn id(&self) -> WorkerId {
-        self.id
+        self.target.id
+    }
+
+    /// The data-parallel rank the decision named for the worker: what a
+    /// dispatch that pins a rank sends.
+    pub(crate) fn rank(&self) -> u16 {
+        self.target.dp_rank
     }
 
     /// The request was sent to the worker at `now`. Said once.
@@ -274,7 +440,7 @@ impl Placed {
     pub(crate) fn completed(&mut self, end: End, now: Instant) {
         let outcome = Outcome {
             side: Side::Single,
-            served: self.id,
+            served: self.target.id,
             status: end.status,
             class: end.class,
             ttft_micros: end.ttft_micros,
@@ -296,7 +462,7 @@ impl fmt::Debug for Placed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Placed")
             .field("worker", &self.worker.url())
-            .field("id", &self.id)
+            .field("target", &self.target)
             .field("handle", &self.handle)
             .finish()
     }
@@ -307,11 +473,31 @@ impl fmt::Debug for Placed {
 /// no field: the worker crate does not name the policy crate.
 pub(crate) struct Held {
     /// Dropped first: a report still owed is said while the load stands.
-    pub placed: Placed,
-    /// The worker's load, given back at the drop.
+    placed: Placed,
+    /// The load of the placement's worker, given back at the drop.
     #[expect(dead_code, reason = "held for its drop alone")]
-    pub guard: WorkerLoadGuard,
+    guard: WorkerLoadGuard,
 }
 
+impl Held {
+    /// The placement beside the load guard `guard` makes of its worker. The
+    /// guard is asked of the placement's own worker, so the two do not name
+    /// two workers, and neither is dropped ahead of its turn.
+    pub(crate) fn new(
+        placed: Placed,
+        guard: impl FnOnce(&Arc<dyn Worker>) -> WorkerLoadGuard,
+    ) -> Self {
+        let guard = guard(placed.worker());
+        Self { placed, guard }
+    }
+
+    /// The placement, for the reports its router says.
+    pub(crate) fn placed(&mut self) -> &mut Placed {
+        &mut self.placed
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod testing;
 #[cfg(test)]
 mod tests;
