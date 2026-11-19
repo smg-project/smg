@@ -5,13 +5,14 @@ use std::{borrow::Cow, collections::HashMap, sync::mpsc};
 
 use super::*;
 use crate::{
+    common_proto as common,
     health::{manager::WorkerManager, overload::OverloadThresholds},
     identity::basic::{ConnectionMode, WorkerType},
     model_card::ModelCard,
     runtime::StallReason,
     test_support::{
-        ready_worker, render_with_recorder, BasicWorkerBuilder, LoadReaders, ScriptedAnswers,
-        WorkerMonitor, WorkerRegistry,
+        assert_metric, ready_worker, render_with_recorder, BasicWorkerBuilder, LoadReaders,
+        ScriptedAnswers, WorkerMonitor, WorkerRegistry,
     },
     worker::{
         EngineMemoryMetricsSnapshot, EngineQueueMetricsSnapshot, HealthCheckConfig, NamedValue,
@@ -881,6 +882,138 @@ async fn a_record_replaces_the_memory_or_queues_section_it_carries() {
     let rank0 = published_rank0(&monitor, "grpc://w1:9000");
     assert_eq!(rank0.memory.map(|m| m.token_capacity), Some(4_096));
     assert_eq!(rank0.queues.map(|q| q.waiting), Some(6));
+}
+
+/// A record's named values are that record's alone. The next record's list
+/// takes their place in the rank's entry, where the fixed telemetry a record
+/// leaves out stays: a reader that wants a value across records keeps it
+/// itself.
+#[tokio::test]
+async fn a_records_named_values_take_the_place_of_the_ranks_last() {
+    let (registry, monitor) = build_monitor();
+    let worker = ready_worker("grpc://w1:9000", "llama-3");
+    registry.register(Arc::clone(&worker)).unwrap();
+    let named = |name: &'static str, value: f64| NamedValue {
+        name: Cow::Borrowed(name),
+        unit: Cow::Borrowed("items"),
+        value,
+        age_ms: None,
+    };
+    let mut heartbeat = pushed(7).used_tokens(2_048);
+    heartbeat.snapshot.values = vec![named("queue_depth", 4.0), named("ready", 1.0)];
+    monitor.apply_pushed_load(&worker, 0, &heartbeat, Instant::now());
+    let rank0 = published_rank0(&monitor, "grpc://w1:9000");
+    assert_eq!(rank0.values, heartbeat.snapshot.values);
+
+    // A record that names one of the two: its list stands whole.
+    let mut other = pushed(8);
+    other.snapshot.values = vec![named("ready", 0.0)];
+    monitor.apply_pushed_load(&worker, 0, &other, Instant::now());
+    let rank0 = published_rank0(&monitor, "grpc://w1:9000");
+    assert_eq!(rank0.values, other.snapshot.values);
+    assert_eq!(rank0.num_used_tokens, 2_048);
+
+    // A core-only record names none: the entry holds none, and the fixed
+    // telemetry of the heartbeat stays.
+    monitor.apply_pushed_load(&worker, 0, &pushed(9), Instant::now());
+    let rank0 = published_rank0(&monitor, "grpc://w1:9000");
+    assert!(rank0.values.is_empty());
+    assert_eq!(rank0.num_used_tokens, 2_048);
+    assert_eq!(rank0.num_running_reqs, 9);
+}
+
+/// The named values a pushed record's snapshot drops at a bound are counted
+/// by the worker: the record's list less the snapshot's. A record whose
+/// values all stand writes no series.
+#[tokio::test]
+async fn a_pushed_record_counts_the_named_values_its_snapshot_drops() {
+    let (registry, monitor) = build_monitor();
+    let worker = ready_worker("grpc://w1:9000", "llama-3");
+    registry.register(Arc::clone(&worker)).unwrap();
+    let value = |name: &str, value: f64| common::NamedValue {
+        name: name.to_string(),
+        unit: "items".to_string(),
+        value,
+        age_ms: None,
+    };
+    let whole = common::EngineLoad {
+        running_requests: 7,
+        values: vec![value("queue_depth", 4.0)],
+        ..Default::default()
+    };
+    let rendered = render_with_recorder(|| {
+        monitor.apply_pushed_load(&worker, 0, &whole, Instant::now());
+    });
+    assert!(
+        !rendered.contains("smg_engine_load_values_dropped_total{"),
+        "{rendered}"
+    );
+
+    // One stands. An empty name, a value that is not finite and a name the
+    // record states again are dropped: three of each record's four.
+    let dropping = common::EngineLoad {
+        running_requests: 8,
+        values: vec![
+            value("queue_depth", 5.0),
+            value("", 1.0),
+            value("ready", f64::NAN),
+            value("queue_depth", 6.0),
+        ],
+        ..Default::default()
+    };
+    let rendered = render_with_recorder(|| {
+        monitor.apply_pushed_load(&worker, 0, &dropping, Instant::now());
+        monitor.apply_pushed_load(&worker, 0, &dropping, Instant::now());
+    });
+    assert_metric(
+        &rendered,
+        "smg_engine_load_values_dropped_total",
+        &["worker=\"grpc://w1:9000\""],
+        "6",
+    );
+    let rank0 = published_rank0(&monitor, "grpc://w1:9000");
+    assert_eq!(rank0.values.len(), 1);
+    assert_eq!(
+        (rank0.values[0].name.as_ref(), rank0.values[0].value),
+        ("queue_depth", 5.0)
+    );
+}
+
+/// What a rank's entry offers by name is its own record's. A count the entry
+/// keeps from a heartbeat is not offered under a later record that did not
+/// carry it, and the entry still holds it.
+#[tokio::test]
+async fn a_core_record_offers_no_fixed_count_the_entry_kept() {
+    let (registry, monitor) = build_monitor();
+    let worker = ready_worker("grpc://w1:9000", "llama-3");
+    registry.register(Arc::clone(&worker)).unwrap();
+    let names = |rank: &SchedulerLoadSnapshot| -> Vec<String> {
+        rank.named_values()
+            .map(|value| value.name.into_owned())
+            .collect()
+    };
+    let heartbeat = pushed(7).used_tokens(2_048).total_tokens(8_192);
+    monitor.apply_pushed_load(&worker, 0, &heartbeat, Instant::now());
+    let rank0 = published_rank0(&monitor, "grpc://w1:9000");
+    assert_eq!(names(&rank0), ["kv_tokens_used", "kv_tokens_capacity"]);
+
+    monitor.apply_pushed_load(&worker, 0, &pushed(8), Instant::now());
+    let rank0 = published_rank0(&monitor, "grpc://w1:9000");
+    assert!(names(&rank0).is_empty());
+    assert_eq!(
+        (rank0.num_used_tokens, rank0.max_total_num_tokens),
+        (2_048, 8_192)
+    );
+
+    // A record that carries one of the two offers that one.
+    let capacity = pushed(9).total_tokens(4_096);
+    monitor.apply_pushed_load(&worker, 0, &capacity, Instant::now());
+    let rank0 = published_rank0(&monitor, "grpc://w1:9000");
+    assert_eq!(names(&rank0), ["kv_tokens_capacity"]);
+    assert_eq!(
+        (rank0.num_used_tokens, rank0.max_total_num_tokens),
+        (2_048, 4_096)
+    );
 }
 
 /// The poll decision reads the receipt of the worker's pushed records

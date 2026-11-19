@@ -127,8 +127,10 @@ message EngineLoad {
   // holds. Part of the routing core: sent on every record when reported.
   optional uint64 num_resident_tokens = 23;
   // Values the engine reports by name. A servicer sends a value on the
-  // records where it has it. An omitted name says nothing about that
-  // value and carries no instruction to remove it.
+  // records where it has it and need not repeat one. A record's list is
+  // that record's alone: a name it leaves out says nothing about that
+  // value, and a reader that wants a value across records keeps the last
+  // one it read. A name is not empty, and a record states a name once.
   repeated NamedValue values = 24;
 }
 

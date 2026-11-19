@@ -5,11 +5,7 @@
 //! engine's `GetLoads` shape into the record, and the cases that hold the two
 //! together.
 
-use std::{
-    borrow::Cow,
-    sync::atomic::{AtomicU64, Ordering},
-    time::Duration,
-};
+use std::{borrow::Cow, time::Duration};
 
 use crate::{
     common_proto as common,
@@ -23,16 +19,20 @@ const MAX_VALUES: usize = 64;
 const MAX_NAME_BYTES: usize = 63;
 const MAX_UNIT_BYTES: usize = 31;
 
-static DROPPED_NAMED_VALUES: AtomicU64 = AtomicU64::new(0);
-
-/// Read at most the first `MAX_VALUES` entries. Count each rejected entry
-/// once, including entries past that limit.
-fn read_values(values: &[common::NamedValue], dropped: &AtomicU64) -> Vec<NamedValue> {
-    let mut named = Vec::new();
+/// The record's named values under the snapshot's bounds: of the first
+/// `MAX_VALUES` entries, each but one with an empty name, a name or a unit
+/// over its bound, a value that is not finite, or a name an entry kept
+/// ahead of it states. The first of a name stands. What is left out here
+/// is counted where the record is taken: the record's list less this one
+/// ([`LoadRecord::values_sent`]).
+fn read_values(values: &[common::NamedValue]) -> Vec<NamedValue> {
+    let mut named: Vec<NamedValue> = Vec::new();
     for sample in values.iter().take(MAX_VALUES) {
-        if sample.name.len() > MAX_NAME_BYTES
+        if sample.name.is_empty()
+            || sample.name.len() > MAX_NAME_BYTES
             || sample.unit.len() > MAX_UNIT_BYTES
             || !sample.value.is_finite()
+            || named.iter().any(|kept| kept.name == sample.name.as_str())
         {
             continue;
         }
@@ -42,10 +42,6 @@ fn read_values(values: &[common::NamedValue], dropped: &AtomicU64) -> Vec<NamedV
             value: sample.value,
             age_ms: sample.age_ms,
         });
-    }
-    let rejected = values.len() - named.len();
-    if rejected != 0 {
-        dropped.fetch_add(rejected as u64, Ordering::Relaxed);
     }
     named
 }
@@ -111,7 +107,7 @@ impl From<&common::EngineLoad> for SchedulerLoadSnapshot {
                     .saturating_add(d.decode_retracted_queue_reqs)
             }),
             disagg_mode: disagg.map(|d| d.mode.clone()),
-            values: read_values(&record.values, &DROPPED_NAMED_VALUES),
+            values: read_values(&record.values),
             ..Default::default()
         }
     }
@@ -146,6 +142,11 @@ impl LoadRecord for common::EngineLoad {
     #[inline]
     fn snapshot(&self) -> SchedulerLoadSnapshot {
         SchedulerLoadSnapshot::from(self)
+    }
+
+    #[inline]
+    fn values_sent(&self) -> usize {
+        self.values.len()
     }
 
     #[inline]
@@ -231,13 +232,12 @@ mod tests {
 
     #[test]
     fn a_pushed_record_drops_and_counts_each_nonfinite_value() {
-        let dropped = AtomicU64::new(0);
         for nonfinite in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             let values = [
                 sample("invalid", "items", nonfinite),
                 sample("finite", "items", -3.25),
             ];
-            let kept = read_values(&values, &dropped);
+            let kept = read_values(&values);
             assert_eq!(kept.len(), 1);
             assert_eq!((kept[0].name.as_ref(), kept[0].value), ("finite", -3.25));
             let record = common::EngineLoad {
@@ -245,23 +245,24 @@ mod tests {
                 ..Default::default()
             };
             assert_eq!(record.snapshot().values, kept);
+            assert_eq!(record.values_sent() - kept.len(), 1);
         }
-        assert_eq!(dropped.load(Ordering::Relaxed), 3);
     }
 
     #[test]
     fn a_pushed_record_drops_and_counts_values_past_each_bound() {
-        let dropped = AtomicU64::new(0);
+        let dropped = |values: &[common::NamedValue]| values.len() - read_values(values).len();
         let mut values: Vec<_> = (0..=64)
-            .map(|index| sample("ready", "items", f64::from(index)))
+            .map(|index| sample(&format!("ready_{index}"), "items", f64::from(index)))
             .collect();
-        let kept = read_values(&values, &dropped);
+        let kept = read_values(&values);
         assert_eq!(kept.len(), 64);
         assert_eq!(kept.last().unwrap().value, 63.0);
-        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(dropped(&values), 1);
+        // An entry dropped among the first 64 gives no later one its place.
         values[0].value = f64::NAN;
-        assert_eq!(read_values(&values, &dropped).len(), 63);
-        assert_eq!(dropped.load(Ordering::Relaxed), 3);
+        assert_eq!(read_values(&values).len(), 63);
+        assert_eq!(dropped(&values), 2);
 
         let name = "é".repeat(31) + "e";
         let unit = "ø".repeat(15) + "o";
@@ -270,21 +271,45 @@ mod tests {
             sample("ready", &"ø".repeat(16), 23.0),
             sample(&name, &unit, 27.0),
         ];
-        let kept = read_values(&values, &dropped);
+        let kept = read_values(&values);
         assert_eq!(kept.len(), 1);
         assert_eq!(
             (kept[0].name.as_ref(), kept[0].unit.as_ref()),
             (name.as_str(), unit.as_str())
         );
-        assert_eq!(dropped.load(Ordering::Relaxed), 5);
+        assert_eq!(dropped(&values), 2);
 
-        let snapshot = common::EngineLoad {
+        let record = common::EngineLoad {
             running_requests: 17,
             values: values.to_vec(),
             ..Default::default()
-        }
-        .snapshot();
+        };
+        let snapshot = record.snapshot();
         assert_eq!(snapshot.num_running_reqs, 17);
         assert_eq!(snapshot.values, kept);
+        assert_eq!(record.values_sent() - snapshot.values.len(), 2);
+    }
+
+    #[test]
+    fn a_pushed_record_drops_an_empty_name_and_a_name_it_states_again() {
+        let values = [
+            sample("", "items", 1.0),
+            sample("depth", "items", 2.0),
+            sample("depth", "items", 3.0),
+            sample("rate", "items/s", 4.0),
+        ];
+        let kept = read_values(&values);
+        let read: Vec<_> = kept
+            .iter()
+            .map(|value| (value.name.as_ref(), value.value))
+            .collect();
+        assert_eq!(read, [("depth", 2.0), ("rate", 4.0)]);
+        // An entry dropped at a bound keeps no name: the next of its name stands.
+        let values = [
+            sample("depth", "items", f64::NAN),
+            sample("depth", "items", 5.0),
+        ];
+        let kept = read_values(&values);
+        assert_eq!((kept.len(), kept[0].value), (1, 5.0));
     }
 }

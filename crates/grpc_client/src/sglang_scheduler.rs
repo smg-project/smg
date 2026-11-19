@@ -762,6 +762,9 @@ impl From<proto::SchedulerLoad> for openai_protocol::worker::SchedulerLoadSnapsh
             }),
             disagg_mode: disagg.map(|d| d.mode),
             values: Vec::new(),
+            // A polled answer states its own figures: none is kept from an
+            // older record.
+            kept: Default::default(),
         }
     }
 }

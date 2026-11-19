@@ -161,7 +161,7 @@
       ]
     },
     "values": {
-      "description": "Values the engine reports by name. An omitted name says nothing\nabout that value and carries no instruction to remove it.",
+      "description": "Values the engine reports by name, as the one record or answer this\nsnapshot was read from states them. A pushed record's list takes\nthe place of the rank's last: a name the record leaves out is not\nin its snapshot, and that says nothing about the value. A reader\nthat wants a value across records keeps the last one it read; the\nload sink hears every record.",
       "type": "array",
       "items": {
         "$ref": "#/$defs/NamedValue"

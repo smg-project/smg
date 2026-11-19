@@ -1637,31 +1637,54 @@ pub struct SchedulerLoadSnapshot {
     /// "prefill", "decode", or "null" as reported by the backend.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disagg_mode: Option<String>,
-    /// Values the engine reports by name. An omitted name says nothing
-    /// about that value and carries no instruction to remove it.
+    /// Values the engine reports by name, as the one record or answer this
+    /// snapshot was read from states them. A pushed record's list takes
+    /// the place of the rank's last: a name the record leaves out is not
+    /// in its snapshot, and that says nothing about the value. A reader
+    /// that wants a value across records keeps the last one it read; the
+    /// load sink hears every record.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub values: Vec<NamedValue>,
+    /// The parts of this entry that its own record did not carry: the load
+    /// monitor kept them from an older record of the rank. Empty for a
+    /// polled answer and for a rank's first record. Never serialized: an
+    /// answer on the wire states its figures and no mark.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub kept: LoadTelemetry,
 }
 
 impl SchedulerLoadSnapshot {
-    /// Values the engine reports by name, followed by nonzero fixed token
-    /// counts whose names are absent from the list. Missing fixed counts
+    /// Values the engine reports by name, followed by the two fixed token
+    /// counts, each where it is nonzero, its name is absent from the list
+    /// and this snapshot's own record carried it. A count the entry kept
+    /// from an older record ([`Self::kept`]) is not offered: what a
+    /// snapshot offers by name is its own record's. Missing fixed counts
     /// are stored as zero.
     pub fn named_values(&self) -> impl Iterator<Item = NamedValue> + '_ {
         let fixed = [
-            (KV_TOKENS_USED, self.num_used_tokens),
-            (KV_TOKENS_CAPACITY, self.max_total_num_tokens),
+            (
+                KV_TOKENS_USED,
+                self.num_used_tokens,
+                LoadTelemetry::USED_TOKENS,
+            ),
+            (
+                KV_TOKENS_CAPACITY,
+                self.max_total_num_tokens,
+                LoadTelemetry::TOTAL_TOKENS,
+            ),
         ]
         .into_iter()
-        .filter_map(|(name, count)| {
-            (count != 0 && !self.values.iter().any(|value| value.name == name)).then_some(
-                NamedValue {
-                    name: Cow::Borrowed(name),
-                    unit: Cow::Borrowed("tokens"),
-                    value: f64::from(count),
-                    age_ms: None,
-                },
-            )
+        .filter_map(|(name, count, part)| {
+            (count != 0
+                && !self.kept.contains(part)
+                && !self.values.iter().any(|value| value.name == name))
+            .then_some(NamedValue {
+                name: Cow::Borrowed(name),
+                unit: Cow::Borrowed("tokens"),
+                value: f64::from(count),
+                age_ms: None,
+            })
         });
         self.values.iter().cloned().chain(fixed)
     }
@@ -1672,7 +1695,7 @@ bitflags! {
     /// flag for each part of [`SchedulerLoadSnapshot`] whose figure a report
     /// keeps from the last record that carried it. An optional figure
     /// outside these six is published as the record sends it.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
     pub struct LoadTelemetry: u8 {
         /// `cache_hit_rate`.
         const CACHE_HIT_RATE = 1 << 0;
@@ -1705,6 +1728,13 @@ pub trait LoadRecord {
     /// The rank's entry from the record, with omitted telemetry at the
     /// type's default. The rank is the caller's to set.
     fn snapshot(&self) -> SchedulerLoadSnapshot;
+
+    /// How many values the record names, ahead of the bounds its snapshot
+    /// keeps them under: what the snapshot's list holds fewer was dropped
+    /// at a bound. Zero for a record that names none.
+    fn values_sent(&self) -> usize {
+        0
+    }
 
     /// How long the engine has produced no output while it held requests
     /// it reports on every step. `None` while it holds none, or when the
@@ -2287,6 +2317,32 @@ mod load_snapshot_tests {
     }
 
     #[test]
+    fn named_values_offer_no_count_the_entry_kept_from_an_older_record() {
+        let mut snapshot = SchedulerLoadSnapshot {
+            num_used_tokens: 211,
+            max_total_num_tokens: 1_373,
+            ..Default::default()
+        };
+        let names = |snapshot: &SchedulerLoadSnapshot| -> Vec<String> {
+            snapshot
+                .named_values()
+                .map(|value| value.name.into_owned())
+                .collect()
+        };
+        assert_eq!(names(&snapshot), [KV_TOKENS_USED, KV_TOKENS_CAPACITY]);
+        snapshot.kept = LoadTelemetry::USED_TOKENS;
+        assert_eq!(names(&snapshot), [KV_TOKENS_CAPACITY]);
+        snapshot.kept = LoadTelemetry::USED_TOKENS | LoadTelemetry::TOTAL_TOKENS;
+        assert!(names(&snapshot).is_empty());
+        // The mark is the process's own: the answer on the wire states both
+        // counts and no mark.
+        let json = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(json["num_used_tokens"], 211);
+        assert_eq!(json["max_total_num_tokens"], 1_373);
+        assert!(json.get("kept").is_none());
+    }
+
+    #[test]
     fn explicit_token_values_take_precedence_over_fixed_counts() {
         for (name, other) in [
             ("kv_tokens_used", "kv_tokens_capacity"),
@@ -2319,7 +2375,13 @@ mod load_snapshot_tests {
         if std::env::var_os("WRITE_SCHEDULER_LOAD_SCHEMA").is_some() {
             fs::write(path, generated).unwrap();
         } else {
-            assert_eq!(fs::read_to_string(path).unwrap(), generated);
+            assert_eq!(
+                fs::read_to_string(path).unwrap(),
+                generated,
+                "scheduler-load.schema.json is stale; write it again with \
+                 WRITE_SCHEDULER_LOAD_SCHEMA=1 cargo test -p smg-worker --all-features \
+                 the_snapshot_schema_matches_the_snapshot_type",
+            );
         }
     }
 }
