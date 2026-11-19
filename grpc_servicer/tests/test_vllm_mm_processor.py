@@ -147,8 +147,9 @@ class TestItemBytes:
                 "media_refs\\[1\\].*6 bytes, above the 5-byte cap "
                 "\\(the worker's --mm-max-item-bytes, SMG_VLLM_MM_MAX_ITEM_BYTES\\)"
             ),
-        ):
+        ) as raised:
             mm_processor.enforce_item_bytes(items, 5)
+        assert mm_processor.client_media_code(raised.value) == "media_too_large"
 
 
 class TestItemCount:
@@ -869,13 +870,31 @@ class TestFetchErrorClassification:
         with pytest.raises(
             mm_processor.MmProcessorUnavailable,
             match="media_refs\\[3\\]: fetch failed: image fetch timed out",
-        ):
+        ) as raised:
             run(p._fetch(3, _Item("image", "https://a/1.png")))
+        assert mm_processor.client_media_code(raised.value) is None
 
     def test_caller_errors_pass_through(self):
         p = self.processor(self._CallerError("415 Unsupported Media Type"))
-        with pytest.raises(self._CallerError, match="^415 Unsupported Media Type$"):
+        with pytest.raises(self._CallerError, match="^415 Unsupported Media Type$") as raised:
             run(p._fetch(0, _Item("image", "https://a/1.png")))
+        assert mm_processor.client_media_code(raised.value) == "media_fetch_failed"
+
+    def test_an_undecodable_image_is_the_requests_media(self):
+        p = self.processor(ValueError("Failed to load image: cannot identify image file"))
+        with pytest.raises(ValueError) as raised:
+            run(p._fetch(0, _Item("image", "https://a/1.png")))
+        assert mm_processor.client_media_code(raised.value) == "media_fetch_failed"
+
+    def test_a_host_the_policy_refuses_is_refused_as_the_request_sent_it(self):
+        """The host guard's refusal answers as the router answers a host its
+        policy refuses: `invalid_multimodal_request`, not a failed fetch."""
+        p = self.processor(
+            mm_processor.MediaHostRefused("media host '127.0.0.1' is a loopback address")
+        )
+        with pytest.raises(mm_processor.MediaHostRefused) as raised:
+            run(p._fetch(0, _Item("image", "http://127.0.0.1/a.png")))
+        assert mm_processor.client_media_code(raised.value) == "invalid_multimodal_request"
 
     def test_a_reference_form_the_fetcher_does_not_take_is_the_callers_fault(self):
         """A data URL that is not base64: the fetcher refuses it as not
@@ -884,8 +903,9 @@ class TestFetchErrorClassification:
         p = self.processor(NotImplementedError("Only base64 data URLs are supported for now."))
         with pytest.raises(
             ValueError, match="^media_refs\\[0\\]: Only base64 data URLs are supported for now\\.$"
-        ):
+        ) as raised:
             run(p._fetch(0, _Item("image", "data:image/jpeg,%FF%D8%FF%E0garbage")))
+        assert mm_processor.client_media_code(raised.value) == "invalid_multimodal_request"
 
     def test_a_not_implemented_failure_on_a_remote_reference_stays_retryable(self):
         """Only a data URL turns the fetcher's "not implemented" into the caller's

@@ -47,7 +47,7 @@ from smg_grpc_servicer.mm_sidecar_protocol import (
     resolve_namespace,
 )
 from smg_grpc_servicer.vllm import config_view
-from smg_grpc_servicer.vllm.media_host_guard import media_connector_kwargs
+from smg_grpc_servicer.vllm.media_host_guard import MediaHostRefused, media_connector_kwargs
 from smg_grpc_servicer.vllm.media_refs import (
     BASE_SCHEMES,
     FETCHABLE_MODALITIES,
@@ -92,6 +92,27 @@ MIN_VLLM_VERSION = "0.20.0"
 
 class MmProcessorUnavailable(Exception):
     """Retryable backend failure (sidecar down, overloaded, timed out)."""
+
+
+# The public codes a failure of the request's own media answers under, as the
+# router names them: media refused as the request sent it, a fetch or read
+# that failed, and a size cap.
+INVALID_MULTIMODAL_REQUEST = "invalid_multimodal_request"
+MEDIA_FETCH_FAILED = "media_fetch_failed"
+MEDIA_TOO_LARGE = "media_too_large"
+_CLIENT_MEDIA_CODE_ATTR = "smg_client_media_code"
+
+
+def mark_client_media(exc: BaseException, code: str = MEDIA_FETCH_FAILED) -> BaseException:
+    """`exc`, marked as the request's own media failing under the public `code`."""
+    setattr(exc, _CLIENT_MEDIA_CODE_ATTR, code)
+    return exc
+
+
+def client_media_code(exc: BaseException) -> str | None:
+    """The public code `mark_client_media` put on `exc`, if any."""
+    code = getattr(exc, _CLIENT_MEDIA_CODE_ATTR, None)
+    return code if isinstance(code, str) else None
 
 
 def resolve_mm_processor_mode(env: Mapping[str, str] = os.environ) -> str:
@@ -148,9 +169,12 @@ def enforce_item_bytes(items: Sequence[Any], max_bytes: int) -> None:
     for index, item in enumerate(items):
         size = data_url_payload_bytes(item.url)
         if size is not None and size > max_bytes:
-            raise ValueError(
-                f"media_refs[{index}]: inline payload is {size} bytes, above the "
-                f"{max_bytes}-byte cap (the worker's --mm-max-item-bytes, {ENV_MAX_ITEM_BYTES})"
+            raise mark_client_media(
+                ValueError(
+                    f"media_refs[{index}]: inline payload is {size} bytes, above the "
+                    f"{max_bytes}-byte cap (the worker's --mm-max-item-bytes, {ENV_MAX_ITEM_BYTES})"
+                ),
+                MEDIA_TOO_LARGE,
             )
 
 
@@ -398,10 +422,14 @@ class InProcessMediaProcessor:
         A bad URL or unusable media is the caller's and terminal, and so is a
         data URL in a form the fetcher does not take (one that is not base64,
         which it refuses as not implemented): no other worker takes it either.
-        A timeout, a refused connection, an origin 5xx or a loader the worker
-        lacks (whatever the reference, a base64 data URL included) is not: the
-        same request can succeed elsewhere or later, so it leaves here as
-        retryable.
+        Each leaves marked as the request's own media (`mark_client_media`)
+        under the code the router answers it with: a host the policy refuses
+        and a data URL the fetcher does not take are refused as sent
+        (`invalid_multimodal_request`), the rest failed to fetch or read
+        (`media_fetch_failed`). A timeout, a refused connection, an origin 5xx
+        or a loader the worker lacks (whatever the reference, a base64 data
+        URL included) is not: the same request can succeed elsewhere or
+        later, so it leaves here as retryable.
         """
         try:
             if item.modality == "image":
@@ -413,7 +441,11 @@ class InProcessMediaProcessor:
                 return await self._connector.fetch_video_async(
                     item.url, video_processor=self._video_processor
                 )
-        except (self._caller_error, ValueError):
+        except MediaHostRefused as e:
+            mark_client_media(e, INVALID_MULTIMODAL_REQUEST)
+            raise
+        except (self._caller_error, ValueError) as e:
+            mark_client_media(e)
             raise
         except Exception as e:
             # The fetcher refuses a non-base64 data URL as not implemented: no
@@ -424,7 +456,9 @@ class InProcessMediaProcessor:
             if isinstance(e, NotImplementedError) and _is_unencoded_data_url(
                 item.url, first_semicolon=self._data_url_first_semicolon
             ):
-                raise ValueError(f"media_refs[{index}]: {e}") from e
+                raise mark_client_media(
+                    ValueError(f"media_refs[{index}]: {e}"), INVALID_MULTIMODAL_REQUEST
+                ) from e
             logger.warning("media_refs[%d]: fetch failed for %s: %s", index, item.modality, e)
             raise MmProcessorUnavailable(f"media_refs[{index}]: fetch failed: {e}") from e
         raise ValueError(f"unsupported media modality {item.modality!r}")

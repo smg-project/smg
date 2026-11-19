@@ -28,7 +28,8 @@ an HTTP connection whose session:
   unchecked. A hop sent directly is resolved and pinned as above.
 
 A refusal is a :class:`MediaHostRefused` (a ``ValueError``): the request's
-media, terminal, answered as ``media_fetch_failed``.
+media, terminal, answered as ``invalid_multimodal_request``, as the router
+answers a host its policy refuses.
 """
 
 from __future__ import annotations
