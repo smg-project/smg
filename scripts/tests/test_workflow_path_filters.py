@@ -21,7 +21,6 @@ WORKFLOWS = sorted(
     for suffix in ("yml", "yaml")
     for path in (ROOT / ".github" / "workflows").glob(f"*.{suffix}")
 )
-DISCOVERY_WORKFLOW = ROOT / ".github" / "workflows" / "e2e-discovery.yml"
 GLOB = re.compile(r"[*?\[]")
 
 
@@ -83,5 +82,10 @@ def test_discovery_runs_when_the_command_line_changes():
 
 
 def test_discovery_runs_when_the_workflow_crate_changes():
-    entries = set(filter_entries(DISCOVERY_WORKFLOW))
-    assert ("pull_request", "paths", "crates/workflow/**") in entries
+    workflow = ROOT / ".github" / "workflows" / "e2e-discovery.yml"
+    assert ("pull_request", "paths", "crates/workflow/**") in filter_entries(workflow)
+
+
+def test_discovery_runs_when_the_worker_workflow_steps_change():
+    workflow = ROOT / ".github" / "workflows" / "e2e-discovery.yml"
+    assert ("pull_request", "paths", "crates/worker/src/workflow/**") in filter_entries(workflow)
