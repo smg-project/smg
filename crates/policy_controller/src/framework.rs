@@ -4450,6 +4450,27 @@ impl Engine {
     }
 }
 
+impl Engine {
+    /// Tells `report`, a rank's report as its host shows it to decisions,
+    /// to each stage that keeps a number of the reports
+    /// ([`Lifecycle::keeps_loads`]), and to no other stage. A publication
+    /// sends no signal to a stage that keeps none: a plugin that watches
+    /// signals hears of a world's reports no more than it did before a
+    /// stage kept any.
+    pub(crate) fn tell_load(&self, report: &Signal) {
+        for profile in &self.profiles {
+            for w in &profile.scorers {
+                if w.scorer.keeps_loads() {
+                    w.scorer.on_signal(report);
+                }
+            }
+            if profile.picker.keeps_loads() {
+                profile.picker.on_signal(report);
+            }
+        }
+    }
+}
+
 impl Lifecycle for Engine {
     fn on_decision_issued(&self, lease: &Lease, decision: &Decision) {
         for profile in &self.profiles {

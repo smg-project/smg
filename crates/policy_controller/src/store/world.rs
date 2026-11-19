@@ -925,15 +925,16 @@ impl World {
         }
     }
 
-    /// Tells `engine` each rank's report as this world shows it to a
-    /// decision, with the rank's slot and the report's sample instant
-    /// ([`Signal::Load`]): what a stage that keeps a number a member is
-    /// told. A member of several pools is told once a pool, the same word.
+    /// Tells each stage of `engine` that keeps a number of the reports
+    /// each rank's report as this world shows it to a decision, with the
+    /// rank's slot and the report's sample instant ([`Signal::Load`]). A
+    /// stage that keeps none is sent nothing. A member of several pools is
+    /// told once a pool, the same word.
     pub fn tell_loads(&self, engine: &Engine) {
         for (rows, shape) in self.rows.iter().zip(self.derived.pools.iter()) {
             for (row, &slot) in rows.iter().zip(shape.booked.iter()) {
                 if let Some(load) = row.load {
-                    engine.on_signal(&Signal::Load {
+                    engine.tell_load(&Signal::Load {
                         worker: row.id,
                         dp_rank: row.dp_rank,
                         row: load,

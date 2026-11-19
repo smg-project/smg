@@ -37,6 +37,7 @@ mod held {
     /// is told.
     #[derive(Debug)]
     struct Keeper {
+        name: &'static str,
         keeps: bool,
         told: Told,
         store: Weak<MemoryStore>,
@@ -72,7 +73,7 @@ mod held {
 
     impl Scorer for Keeper {
         fn name(&self) -> &'static str {
-            "keeper"
+            self.name
         }
 
         fn score(
@@ -105,20 +106,36 @@ mod held {
     /// Generation `number` of one profile for every model, scored by a
     /// keeper that says `keeps` of the reports.
     fn generation(number: u64, store: &Arc<MemoryStore>, told: &Told, keeps: bool) -> AppliedSpec {
-        let (told, store) = (Arc::clone(told), Arc::downgrade(store));
+        generation_of(number, store, &[("keeper", told, keeps)])
+    }
+
+    /// Generation `number` of one profile for every model, scored by one
+    /// keeper a name: each writes down what it is told and says of the
+    /// reports what its entry says.
+    fn generation_of(
+        number: u64,
+        store: &Arc<MemoryStore>,
+        stages: &[(&'static str, &Told, bool)],
+    ) -> AppliedSpec {
         let mut catalog = Catalog::builtin();
-        catalog
-            .scorer("keeper", move || {
-                Box::new(Keeper {
-                    keeps,
-                    told: Arc::clone(&told),
-                    store: Weak::clone(&store),
+        for &(name, told, keeps) in stages {
+            let (told, store) = (Arc::clone(told), Arc::downgrade(store));
+            catalog
+                .scorer(name, move || {
+                    Box::new(Keeper {
+                        name,
+                        keeps,
+                        told: Arc::clone(&told),
+                        store: Weak::clone(&store),
+                    })
                 })
-            })
-            .expect("a free name");
-        let mut document: PolicySpec = serde_json::from_str(
-            r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"score":["keeper"],"pick":"best"}}}"#,
-        )
+                .expect("a free name");
+        }
+        let names: Vec<&str> = stages.iter().map(|&(name, ..)| name).collect();
+        let score = serde_json::to_string(&names).expect("the names");
+        let mut document: PolicySpec = serde_json::from_str(&format!(
+            r#"{{"apiVersion":"smg.policy/v1","profiles":{{"p":{{"score":{score},"pick":"best"}}}}}}"#
+        ))
         .expect("a document");
         document.generation = number;
         document.bindings = vec![BindingSpec {
@@ -218,5 +235,22 @@ mod held {
             [(id, 3, true, restored, 0)],
             "told once, while the world before the restore's stood"
         );
+    }
+
+    /// A world's reports go to the stage that keeps them and to no other
+    /// stage of its engine: one that watches signals and keeps no report
+    /// hears nothing of a publication, as before any stage kept one.
+    #[test]
+    fn a_stage_that_keeps_no_report_is_told_none_beside_one_that_does() {
+        let store = Arc::new(MemoryStore::new());
+        let (told, heard) = (Told::default(), Told::default());
+        let stages = [("keeper", &told, true), ("watcher", &heard, false)];
+        store
+            .apply(generation_of(1, &store, &stages))
+            .expect("applied");
+        let id = member(&store, "http://a:8000");
+        store.record(id, 0, load(3, 0), Instant::now(), LoadSource::Stream);
+        assert_eq!(told.lock().len(), 1, "the keeper's one word");
+        assert!(heard.lock().is_empty(), "a stage that keeps none heard");
     }
 }
