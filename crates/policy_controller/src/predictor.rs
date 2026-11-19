@@ -5,6 +5,9 @@
 //! deepest block of its request that a worker was sent, and the workers
 //! sent it.
 //!
+//! This is the `tree` kind of the document's index settings
+//! ([`IndexKind`](crate::spec::IndexKind)). The `hash` kind is not built.
+//!
 //! One model has one decider, and the model's predictor is that decider's
 //! own state: one thread reads it and writes it, under the decider's turn.
 //! Nothing here is shared, locked or ordered against another thread.
@@ -29,14 +32,19 @@
 //! leading part of it. A block leaves with every worker sent it.
 //!
 //! A worker that left is skipped by the next read. Its placements are
-//! taken out by the sweep, a bounded count a call, and its place is given
-//! to another worker once a whole pass has run since it left.
+//! taken out by the sweep, and a path no worker is left of leaves with
+//! them from its deep end, a block a step: a call takes out as many
+//! blocks as its budget and no more. Its place is given to another
+//! worker once a whole pass has run since it left.
 //!
 //! Memory: 32 bytes a block and its entry in a map, about 60 bytes
 //! together. A block that more than one worker was sent keeps their
-//! places in a list of its own, two bytes a worker. The blocks stand in
-//! pieces of 4,096 that never move, and the keys in 256 maps by their top
-//! byte, so a growth moves one map's entries.
+//! places in a list of its own: two bytes a worker, room for eight
+//! places or for twice its workers at most, whichever is more, and the
+//! list's own 24 bytes. A block left with one worker holds it in itself
+//! again, and a list no block uses keeps room for eight places at most.
+//! The blocks stand in pieces of 4,096 that never move, and the keys in
+//! 256 maps by their top byte, so a growth moves one map's entries.
 
 use std::{mem, slice};
 
@@ -57,6 +65,8 @@ const NOBODY: u16 = u16::MAX;
 const CHUNK: usize = 1 << 12;
 /// The maps a key is found through, one for each value of its top byte.
 const MAPS: usize = 1 << 8;
+/// The places of room a list of workers keeps while no block uses it.
+const POOLED: usize = 8;
 
 /// The key of a prefix one block longer: the key before it folded with the
 /// block's hash. The key's top bits take every bit of both.
@@ -293,6 +303,11 @@ impl Predictor {
     /// or passes over one that others follow. Where that makes no room
     /// for all of it, the request's leading blocks are written as far as
     /// the room goes and the rest is counted ([`Predictor::dropped`]).
+    ///
+    /// Call it only for a worker of the pool. A write gives its worker a
+    /// place, and only [`Predictor::forget`] takes the place back: a write
+    /// for a worker told gone gives it a place again, and nothing takes
+    /// that one back until the worker is told gone once more.
     pub fn sent(&mut self, seed: u64, hashes: &[u64], worker: WorkerId) {
         let blocks = hashes.len();
         if blocks == 0 {
@@ -317,9 +332,9 @@ impl Predictor {
             self.touch(end);
         }
         self.make_room(need, end);
-        let take = need.min(self.bound.saturating_sub(self.placements));
-        self.dropped += (need - take) as u64;
-        for at in held..held + take {
+        let room = need.min(self.bound.saturating_sub(self.placements));
+        self.dropped += (need - room) as u64;
+        for at in held..held + room {
             let key = self.keys[at];
             before = match self.find(key) {
                 Some(block) => {
@@ -330,7 +345,7 @@ impl Predictor {
                 }
                 None => {
                     let Some(block) = self.take(key, before, place) else {
-                        self.dropped += (held + take - at) as u64;
+                        self.dropped += (held + room - at) as u64;
                         break;
                     };
                     self.placements += 1;
@@ -340,6 +355,15 @@ impl Predictor {
         }
         if before != NONE {
             self.touch(before);
+        }
+        // A block no worker is left of that the write stood on and gave
+        // nothing waits at the old end again: the next step takes it.
+        if end != NONE {
+            let block = self.block(end);
+            if block.after == 0 && block.lone == NOBODY && block.group == NONE {
+                self.unlink(end);
+                self.link_oldest(end);
+            }
         }
     }
 
@@ -358,14 +382,18 @@ impl Predictor {
     }
 
     /// The work that waits, `budget` steps of it at most, on the decider's
-    /// thread as it leaves a turn: the oldest blocks leave while more
-    /// placements are held than the bound, then the placements of the
-    /// workers that left are taken out, an entry a step. Returns the steps
-    /// taken: fewer than `budget` where nothing waits.
+    /// thread as it leaves a turn. The oldest blocks leave while more
+    /// placements are held than the bound. The placements of the workers
+    /// that left are taken out, and a path no worker is left of leaves
+    /// from its deep end. A step visits one entry, takes one block out or
+    /// passes over one that others follow, so a call takes out `budget`
+    /// blocks at most. Returns the steps taken: fewer than `budget` where
+    /// nothing waits.
     pub fn sweep(&mut self, budget: usize) -> usize {
         let mut steps = 0;
         while steps < budget {
-            if self.placements > self.bound && self.forget_oldest(NONE) {
+            if (self.placements > self.bound || self.unheld_end_waits()) && self.forget_oldest(NONE)
+            {
                 steps += 1;
                 continue;
             }
@@ -630,6 +658,15 @@ impl Predictor {
         true
     }
 
+    /// Whether the oldest block of the list is one that none follows and
+    /// no worker is left of: it waits there for the next step.
+    fn unheld_end_waits(&self) -> bool {
+        self.oldest != NONE && {
+            let block = self.block(self.oldest);
+            block.after == 0 && block.lone == NOBODY && block.group == NONE
+        }
+    }
+
     /// Room for `need` placements of a write that stands on `keep`: at
     /// most two steps at the old end for each, and eight more.
     fn make_room(&mut self, need: usize, keep: u32) {
@@ -641,47 +678,51 @@ impl Predictor {
 
     /// Takes out a block that none follows, with every worker sent it.
     /// The block before it, where this leaves it with no follower, takes
-    /// its place at the old end unless a later request ended there; where
-    /// no worker is left of that block, it goes too, and so on up the
-    /// path, never past `keep`.
-    fn drop_block(&mut self, mut at: u32, keep: u32) {
-        loop {
-            let block = *self.block(at);
-            debug_assert_eq!(block.after, 0, "a block that others follow stays");
-            if block.older != UNLISTED {
-                self.unlink(at);
-            }
-            self.maps[map_of(block.key)].remove(&block.key);
-            if block.group == NONE {
-                self.placements -= usize::from(block.lone != NOBODY);
+    /// its place at the old end unless a later request ended there. Where
+    /// no worker is left of that block it waits at the old end whatever
+    /// ended there, and the next step takes it: a path no worker is left
+    /// of leaves a block a step. A block a write stands on (`keep`) stays
+    /// where it is.
+    fn drop_block(&mut self, at: u32, keep: u32) {
+        let block = *self.block(at);
+        debug_assert_eq!(block.after, 0, "a block that others follow stays");
+        if block.older != UNLISTED {
+            self.unlink(at);
+        }
+        self.maps[map_of(block.key)].remove(&block.key);
+        if block.group == NONE {
+            self.placements -= usize::from(block.lone != NOBODY);
+        } else {
+            let group = &mut self.groups[block.group as usize];
+            self.placements -= group.len();
+            if group.capacity() > POOLED {
+                *group = Vec::new();
             } else {
-                let group = &mut self.groups[block.group as usize];
-                self.placements -= group.len();
                 group.clear();
-                self.free_groups.push(block.group);
             }
-            *self.block_mut(at) = Block {
-                before: self.free,
-                ..Block::BLANK
-            };
-            self.free = at;
-            self.blocks -= 1;
-            if block.before == NONE {
-                return;
-            }
-            let before = self.block_mut(block.before);
-            before.after -= 1;
-            if before.after != 0 || block.before == keep {
-                return;
-            }
-            if before.lone == NOBODY && before.group == NONE {
-                at = block.before;
-                continue;
-            }
-            if before.older == UNLISTED {
-                self.link_oldest(block.before);
-            }
+            self.free_groups.push(block.group);
+        }
+        *self.block_mut(at) = Block {
+            before: self.free,
+            ..Block::BLANK
+        };
+        self.free = at;
+        self.blocks -= 1;
+        if block.before == NONE {
             return;
+        }
+        let before = self.block_mut(block.before);
+        before.after -= 1;
+        if before.after != 0 || block.before == keep {
+            return;
+        }
+        let unheld = before.lone == NOBODY && before.group == NONE;
+        let listed = before.older != UNLISTED;
+        if unheld && listed {
+            self.unlink(block.before);
+        }
+        if unheld || !listed {
+            self.link_oldest(block.before);
         }
     }
 
@@ -725,11 +766,19 @@ impl Predictor {
                 let held = group.len();
                 group.retain(|&place| self.is_live(place));
                 self.placements -= held - group.len();
-                if group.is_empty() {
+                if group.len() < 2 {
+                    // A block left with one worker holds it in itself
+                    // again, and the list's room goes back.
                     self.free_groups.push(block.group);
-                    self.block_mut(at).group = NONE;
+                    let lone = group.first().copied().unwrap_or(NOBODY);
+                    let block = self.block_mut(at);
+                    (block.lone, block.group) = (lone, NONE);
+                } else {
+                    if group.capacity() > 2 * group.len() {
+                        group.shrink_to_fit();
+                    }
+                    self.groups[block.group as usize] = group;
                 }
-                self.groups[block.group as usize] = group;
             }
             let block = self.block(at);
             if block.after == 0 && block.lone == NOBODY && block.group == NONE {
