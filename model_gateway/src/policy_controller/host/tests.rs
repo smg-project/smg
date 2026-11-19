@@ -33,7 +33,7 @@ use smg_worker::identity::basic::WorkerLoadGuard;
 use super::{
     left_no_worker, mark, profile_of,
     testing::{bed, bed_under, cache_bed, store_blocks, MODEL},
-    Ask, End, Hashes, Held, Prompt, Unplaced, GATEWAY,
+    Ask, End, Hashes, Held, Prompt, Unplaced, GATEWAY, NO_STAGE,
 };
 use crate::{
     config::{ManualAssignmentMode, PolicyConfig, RouterConfig},
@@ -551,6 +551,7 @@ async fn a_store_with_no_row_sheds_by_the_controllers_reason() {
             unplaced,
             Unplaced::Shed {
                 reason: ShedReason::NoEndpoints,
+                emptied_by: NO_STAGE,
                 ..
             }
         ),
@@ -716,10 +717,30 @@ async fn a_placement_names_the_rank_its_decision_named() {
     assert_eq!((placed.id(), placed.rank()), (id, 1));
 }
 
+#[tokio::test]
+async fn a_declined_request_reads_one_message_whatever_declined_it() {
+    for emptied_by in ["binding", "affinity-column", "random"] {
+        let declined = Unplaced::Shed {
+            reason: ShedReason::PolicyDeclined,
+            emptied_by,
+            retry_after_secs: 0,
+        };
+        let body = to_bytes(declined.answer(MODEL).into_body(), usize::MAX)
+            .await
+            .expect("the answer's body");
+        let error: Value = serde_json::from_slice(&body).expect("a JSON error object");
+        assert_eq!(
+            error["error"]["message"],
+            format!("The policy declined the request for model '{MODEL}'"),
+            "{emptied_by}"
+        );
+    }
+}
+
 #[test]
 fn a_pool_no_stage_emptied_reads_its_own_reason() {
     assert_eq!(
-        left_no_worker("none"),
+        left_no_worker(NO_STAGE),
         "the policy controller holds no candidate for the model"
     );
     assert_eq!(

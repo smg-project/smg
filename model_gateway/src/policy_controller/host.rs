@@ -245,7 +245,8 @@ pub(crate) enum Unplaced {
     Shed {
         /// Why.
         reason: ShedReason,
-        /// The stage that left no candidate.
+        /// The stage that left no candidate, or what of the policy
+        /// declined.
         emptied_by: &'static str,
         /// The seconds after which a retry may find room.
         retry_after_secs: u16,
@@ -269,8 +270,12 @@ impl Unplaced {
     /// | No endpoint is left, or the gateway can send to no target | 503 `no_available_workers`, with a retry hint |
     /// | A queue is at its limit | 429 `admission_queue_full`, with the admission queue's retry hint |
     /// | The decision's budget passed | 503 `admission_queue_timeout`, with the same hint |
-    /// | The picker declined every candidate | 503 `policy_declined` |
+    /// | The policy declined the request | 503 `policy_declined` |
     /// | The door made no decision | 503 `policy_controller_unavailable`, with a retry hint |
+    ///
+    /// A declined request's message names no stage. The policy declines at
+    /// its picker, and also where no binding covers the model, so one text
+    /// must be true of each.
     ///
     /// No answer is retried in process: a second ask a moment later reads
     /// the same rows. A route that asks for a side of a pair refuses by name
@@ -329,13 +334,10 @@ impl Unplaced {
             ),
             Self::Shed {
                 reason: ShedReason::PolicyDeclined,
-                emptied_by,
                 ..
             } => error::service_unavailable(
                 "policy_declined",
-                format!(
-                    "The policy's {emptied_by} stage declined every worker for model '{model}'"
-                ),
+                format!("The policy declined the request for model '{model}'"),
             ),
             Self::Refused(_) => hinted(
                 error::service_unavailable(
