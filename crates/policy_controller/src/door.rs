@@ -4777,37 +4777,23 @@ pub(crate) mod tests {
         }
     }
 
-    /// A stage is asked what it needs at each decision, and that call can
-    /// panic as any other. The seat's question calls no stage, so the
-    /// panic is the decision's own, at the first request under the
-    /// stage's generation and at a later one: each is refused as faulted,
-    /// nothing unwinds into the host, and the seat the caller left is at
-    /// rest.
+    /// A stage is asked what it needs once, where its generation is built:
+    /// the engine keeps the answer and a decision calls no stage for it.
+    /// So a stage whose answer would panic later costs no request.
     #[test]
-    fn a_stage_that_panics_at_its_needs_costs_its_request_alone() {
-        // The model's seat is not the first, where the calling thread
-        // sits.
-        let files = (2..=8).find(|&files| decider_of(MODEL, files) != 0);
-        let files = files.expect("the model names a later file under some count");
-        let store = fleet(files);
+    fn a_stage_is_asked_what_it_needs_at_the_build_alone() {
+        let store = fleet(2);
         let door = Door::new(Arc::clone(&store));
-        seated(0);
-        let (own, _) = leased(&door, b"r-0", 7);
         let armed = Arc::new(AtomicBool::new(false));
         let stage = Arc::clone(&armed);
         picking(&store, 2, "needy", move || {
             Box::new(Needy(Arc::clone(&stage)))
         });
         armed.store(true, Ordering::Relaxed);
-        // The first request under the generation leaves the caller's own
-        // seat for the model's. The next reads the door's word.
         for id in [b"r-1", b"r-2"] {
-            let refused = door.decide(GATEWAY, &request(id, 7), Instant::now());
-            assert_eq!(refused.err(), Some(Refused::Faulted));
+            let decided = door.decide(GATEWAY, &request(id, 7), Instant::now());
+            assert!(decided.is_ok(), "{:?}", decided.err());
         }
-        assert_eq!(door.faults(), 2);
-        // What is said of the lease on file at the caller's own seat is
-        // applied at once: no thread is left at work there.
-        assert_eq!(report(&door, own, gone()), 0, "applied at once");
+        assert_eq!(door.faults(), 0);
     }
 }

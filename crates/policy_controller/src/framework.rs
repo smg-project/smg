@@ -2466,6 +2466,9 @@ pub struct Engine {
     /// Per profile, what its stages ask of a decision beyond the profile's
     /// own run ([`Marks`]).
     marks: Vec<Marks>,
+    /// Per profile, what its stages ask of a host ([`Profile::needs`]),
+    /// asked of them once at the build: a decision reads its answer here.
+    profile_needs: Vec<Needs>,
     /// Per profile, the cap of the rows a host names for its decisions
     /// ([`Self::named_for`]), said once at the build.
     named: Vec<u32>,
@@ -3472,6 +3475,7 @@ impl Engine {
             sessions,
             assignment: AssignmentStages::default(),
             marks,
+            profile_needs,
             named,
             row_tests,
             orders,
@@ -3551,10 +3555,9 @@ impl Engine {
     pub fn reads_for(&self, model: &str, phase: Phase) -> (Needs, bool, bool) {
         let (own, marks) = self
             .resolve(model, phase)
-            .map(|(entry, index, profile)| {
+            .map(|(entry, index, _)| {
                 (
-                    profile
-                        .needs()
+                    self.profile_needs[usize::from(index)]
                         .or(self.shadow_needs(&entry.binding))
                         .or(session_needs(&entry.binding)),
                     self.marks[usize::from(index)],
@@ -3615,8 +3618,9 @@ impl Engine {
     /// decode side, whose sample may be the larger. A cap's safe side is
     /// the smaller.
     pub fn sample_for(&self, model: &str, phase: Phase) -> u32 {
-        self.resolve(model, phase)
-            .map_or(0, |(_, _, profile)| profile.needs().sample)
+        self.resolve(model, phase).map_or(0, |(_, index, _)| {
+            self.profile_needs[usize::from(index)].sample
+        })
     }
 
     /// The marks of the decode profile of `model`'s pair binding, none
@@ -3634,8 +3638,8 @@ impl Engine {
     fn pair_decode_needs(&self, model: &str) -> Needs {
         self.pair_binding(model)
             .and_then(|b| profile_index(b, Phase::Decode))
-            .and_then(|i| self.profiles.get(usize::from(i)))
-            .map(Profile::needs)
+            .and_then(|i| self.profile_needs.get(usize::from(i)))
+            .copied()
             .unwrap_or_default()
     }
 
@@ -3688,23 +3692,23 @@ impl Engine {
         for entry in &self.bindings {
             let binding = &entry.binding;
             let covers = |phase| binding.phases.is_empty() || binding.phases.contains(&phase);
-            let profile = |phase| {
+            let own = |phase| {
                 profile_index(binding, phase)
-                    .and_then(|index| self.profiles.get(usize::from(index)))
+                    .and_then(|index| self.profile_needs.get(usize::from(index)))
+                    .copied()
             };
             let pairs = matches!(binding.plan, Plan::PdPair | Plan::Epd { .. });
             for phase in PHASES {
                 let mut needs = Needs::default();
-                if let Some(profile) = profile(phase).filter(|_| covers(phase)) {
-                    needs = profile
-                        .needs()
+                if let Some(own) = own(phase).filter(|_| covers(phase)) {
+                    needs = own
                         .or(self.shadow_needs(binding))
                         .or(session_needs(binding));
                 }
                 // The decode side of every pair this binding's prefill
                 // lookup starts.
                 if phase == Phase::Decode && pairs && covers(Phase::Prefill) {
-                    needs = needs.or(profile(phase).map(Profile::needs).unwrap_or_default());
+                    needs = needs.or(own(phase).unwrap_or_default());
                 }
                 if needs == Needs::default() {
                     continue;
@@ -3724,8 +3728,8 @@ impl Engine {
     fn shadow_needs(&self, binding: &Binding) -> Needs {
         binding
             .single_shadow()
-            .and_then(|index| self.profiles.get(usize::from(index)))
-            .map(Profile::needs)
+            .and_then(|index| self.profile_needs.get(usize::from(index)))
+            .copied()
             .unwrap_or_default()
     }
 
