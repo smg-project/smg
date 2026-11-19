@@ -267,14 +267,28 @@ const PIECE_CACHE_CAPACITY: usize = 262_144;
 const PIECE_CACHE_TOTAL_CAPACITY: usize = 16 * PIECE_CACHE_CAPACITY;
 /// Bytes of long pieces (each piece, its ids and their slot) a thread holds
 /// for one encoder before its long entries are cleared, at most; see
-/// `LONG_PIECE_BYTES_TOTAL`.
-const LONG_PIECE_BYTES_CAPACITY: usize = 2 << 20;
+/// `LONG_PIECE_BYTES_TOTAL`. This is the cliff of a repeated document for
+/// its long pieces, as `PIECE_CACHE_CAPACITY` is for the others: a text
+/// whose long pieces fit is encoded again at the cost of their lookups, one
+/// with more merges them again on every pass, since the clear takes the
+/// pieces that recur with the rest. By this count documents of 4 million
+/// tokens in all hold 2.8 to 3.0 MiB of long pieces and documents of 16
+/// million tokens 5.6 to 6.0 MiB (three byte-level vocabularies, some
+/// 14,000 and 29,000 entries of about 220 bytes), so the bound holds
+/// either set whole; at 2 MiB the tier was cleared once or twice in a pass
+/// over the first set and five to seven times in a pass over the second,
+/// and a second pass merged most of the long pieces again (measured).
+/// Memory: a thread holds what the long pieces it met take, so one that
+/// meets few holds little; the count leaves out what the allocator rounds
+/// each box up by and the empty slots of the map.
+const LONG_PIECE_BYTES_CAPACITY: usize = 8 << 20;
 /// Bytes of long pieces all threads together hold for one encoder, shared
-/// the way `PIECE_CACHE_TOTAL_CAPACITY` is. The long pieces of a prompt (its
-/// clauses, in a script without word spaces) are few in number and large,
-/// and each one that misses goes through the model's merges, so they are
-/// bounded by what they take rather than counted.
-const LONG_PIECE_BYTES_TOTAL: usize = 32 << 20;
+/// the way `PIECE_CACHE_TOTAL_CAPACITY` is: sixteen threads hold the full
+/// bound each, more threads a smaller share. The long pieces of a prompt
+/// (its clauses, in a script without word spaces) are few in number and
+/// large, and each one that misses goes through the model's merges, so
+/// they are bounded by what they take rather than counted.
+const LONG_PIECE_BYTES_TOTAL: usize = 128 << 20;
 /// What an entry of the long tier takes beyond its piece and ids.
 const LONG_PIECE_ENTRY_BYTES: usize = size_of::<(Box<[u8]>, Box<[u32]>)>();
 
