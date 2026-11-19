@@ -4992,8 +4992,9 @@ fn long_pieces_stay_within_their_byte_share() {
     // Distinct long pieces worth more than the share of a thread that
     // encodes alone, which is the whole bound of a thread.
     let words = long_pieces_past(LONG_PIECE_BYTES_CAPACITY);
+    // On this thread, not the pool: the test reads this thread's cache.
     native
-        .encode(Some(model), &long_lines(words), false)
+        .encode_with(Some(model), &long_lines(words), false, false)
         .expect("ids");
     let share = native.long_piece_bytes_share();
     assert_eq!(share, LONG_PIECE_BYTES_CAPACITY);
@@ -5011,6 +5012,46 @@ fn long_pieces_stay_within_their_byte_share() {
     assert!(cache.long_bytes <= share, "{} > {share}", cache.long_bytes);
     assert!(cache.long.len() < words as usize, "{}", cache.long.len());
     assert!(!cache.long.is_empty());
+}
+
+/// A thread's long tier holds a text whose long pieces take more than
+/// 2 MiB, the bound before `LONG_PIECE_BYTES_CAPACITY` grew, and less than
+/// the 8 MiB it is now: one pass keeps every piece, and a second pass
+/// finds each in the cache, so it adds nothing (a long piece that misses
+/// is added to `long_bytes` when it is kept). The sizes are written out
+/// here, where the other tests of the tier take theirs from the constants.
+#[test]
+fn a_text_of_two_to_eight_mebibytes_of_long_pieces_is_cached_whole() {
+    let mut state = 0x6B6B_8A8A_A9A9_C8C8u64;
+    let shape = &shapes()[0];
+    let tokenizer = tokenizer_of(shape, &mut state);
+    let native = seeded(&tokenizer);
+    let model = tokenizer.get_model();
+    // More than 2 MiB whatever the ids are, and under 8 MiB even were
+    // every byte of a piece an id (432 bytes an entry then).
+    let words = long_pieces_past(2 << 20);
+    let text = long_lines(words);
+    let long = |native: &NativeEncoder| -> (usize, usize) {
+        let cache = native
+            .piece_cache
+            .get()
+            .expect("this thread's cache")
+            .borrow();
+        (cache.long.len(), cache.long_bytes)
+    };
+    // On this thread, not the pool: the test reads this thread's cache.
+    let first = native
+        .encode_with(Some(model), &text, false, false)
+        .expect("ids");
+    let (entries, bytes) = long(&native);
+    assert_eq!(entries, words as usize, "the tier was cleared");
+    assert!(bytes > 2 << 20, "{bytes}");
+    assert!(bytes < 8 << 20, "{bytes}");
+    let again = native
+        .encode_with(Some(model), &text, false, false)
+        .expect("ids");
+    assert!(again == first, "the ids of the second pass differ");
+    assert_eq!(long(&native), (entries, bytes), "a long piece missed");
 }
 
 /// The two bounds of the long tier, by their constants: a thread's share is
@@ -5059,8 +5100,9 @@ fn long_pieces_stay_within_a_share_of_the_total() {
     let counted = 64 * (LONG_PIECE_BYTES_TOTAL / LONG_PIECE_BYTES_CAPACITY);
     native.threads.store(counted, Ordering::Relaxed);
     let words = long_pieces_past(native.long_piece_bytes_share());
+    // On this thread, not the pool: the test reads this thread's cache.
     native
-        .encode(Some(model), &long_lines(words), false)
+        .encode_with(Some(model), &long_lines(words), false, false)
         .expect("ids");
     // This thread counts from its first encode on: the share it kept to
     // is the total among one thread more.
@@ -5111,7 +5153,10 @@ fn a_thread_whose_long_tier_outgrew_its_share_makes_it_anew_at_its_next_encode()
     let head: String = (0..20).map(|i| format!("{}\n", letters(80, i))).collect();
     let text = long_lines(long_pieces_past(LONG_PIECE_BYTES_CAPACITY));
     let before = native.encode(Some(model), &head, false).expect("ids");
-    native.encode(Some(model), &text, false).expect("ids");
+    // On this thread, not the pool: the test reads this thread's cache.
+    native
+        .encode_with(Some(model), &text, false, false)
+        .expect("ids");
     let share = native.long_piece_bytes_share();
     let grown = held(&native);
     assert!(grown <= 4 * share, "{grown} for a share of {share}");
@@ -5159,7 +5204,10 @@ fn a_long_tier_made_anew_for_a_smaller_share_keeps_what_the_next_calls_add() {
     let text: String = (0..64).map(|i| format!("{}\n", letters(80, i))).collect();
     let before = native.encode(Some(model), &text, false).expect("ids");
     let fill = long_lines(long_pieces_past(LONG_PIECE_BYTES_CAPACITY));
-    native.encode(Some(model), &fill, false).expect("ids");
+    // On this thread, not the pool: the test reads this thread's cache.
+    native
+        .encode_with(Some(model), &fill, false, false)
+        .expect("ids");
     let (_, slots, grown) = long(&native);
     // Threads join until four times the share is just above the map's
     // slots: the tier holds more than that, and a clear in place would keep
