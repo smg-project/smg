@@ -5796,9 +5796,13 @@ dependencies = [
 name = "policy-controller-example"
 version = "0.1.0"
 dependencies = [
+ "mock-worker",
  "serde_yaml",
+ "smg-grpc-client",
  "smg-policy-controller",
+ "tikv-jemallocator",
  "tokio",
+ "tonic",
 ]
 
 [[package]]
@@ -7814,7 +7818,6 @@ dependencies = [
  "openai-harmony",
  "openai-protocol",
  "openapi-gen",
- "openmetrics-parser",
  "openssl",
  "opentelemetry 0.32.0",
  "opentelemetry-otlp",
@@ -7825,7 +7828,6 @@ dependencies = [
  "portpicker",
  "prost",
  "prost-types",
- "quanta",
  "rand 0.10.2",
  "rayon",
  "reasoning-parser",
@@ -7854,6 +7856,7 @@ dependencies = [
  "smg-symphony",
  "smg-test-harness",
  "smg-wasm",
+ "smg-worker",
  "tempfile",
  "thiserror 2.0.21",
  "tikv-jemalloc-ctl",
@@ -7956,6 +7959,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smg-mcp",
+ "smg-worker",
  "str0m",
  "thiserror 2.0.21",
  "tokio",
@@ -8007,6 +8011,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "smg-worker",
  "tempfile",
  "tokio",
  "tokio-stream",
@@ -8119,6 +8124,7 @@ dependencies = [
  "serde_yaml",
  "sha2 0.11.0",
  "smg-grpc-client",
+ "smg-policy-controller",
  "tempfile",
  "thiserror 2.0.21",
  "thread_local",
@@ -8291,13 +8297,41 @@ dependencies = [
 name = "smg-worker"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "arc-swap",
+ "async-trait",
  "axum",
+ "base64 0.23.1",
  "bitflags 2.13.2",
+ "chrono",
+ "dashmap",
+ "futures",
+ "http",
+ "metrics",
+ "metrics-exporter-prometheus",
+ "metrics-util",
+ "once_cell",
+ "openmetrics-parser",
+ "openssl",
+ "parking_lot 0.13.0",
+ "prost",
+ "prost-build",
+ "quanta",
+ "reqwest 0.13.4",
+ "rustc-hash 2.1.3",
+ "rustls",
  "schemars 1.2.2",
  "serde",
  "serde_json",
  "serde_with",
+ "thiserror 2.0.21",
+ "tokio",
+ "tonic",
+ "tonic-prost",
+ "tracing",
+ "tracing-test",
  "url",
+ "uuid",
 ]
 
 [[package]]

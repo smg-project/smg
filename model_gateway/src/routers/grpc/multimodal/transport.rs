@@ -24,9 +24,11 @@ use tracing::{error, info, warn};
 use super::{encoder_budget::WIRE_MESSAGE_CAP, serialize::wire_dtype, settings::mm_settings};
 use crate::{
     routers::grpc::{
-        backend_client::BackendClient, context::WorkerSelection, proto_wrapper::mm_shm_dev_writable,
+        backend_client::{connected_backend_client, BackendClient},
+        context::WorkerSelection,
+        proto_wrapper::mm_shm_dev_writable,
     },
-    worker::{RoutingPool, Worker, WorkerRegistry},
+    worker::{RoutingPool, Worker, WorkerRegistry, WorkerRegistryExt},
 };
 
 const DEFAULT_SHM_MIN_BYTES: usize = 64 * 1024;
@@ -523,7 +525,7 @@ fn with_worker_encoder_dtype<T>(
     let Some(worker) = primary_worker(workers) else {
         return read(None);
     };
-    let backend = worker.backend_client_if_initialized();
+    let backend = connected_backend_client(worker.as_ref());
     read(encoder_dtype_label_with_backend(
         worker.as_ref(),
         backend.as_deref(),
@@ -624,7 +626,7 @@ fn agree_on_image_wire_dtype<'a>(
     overrides: &DtypeOverrides,
 ) -> Option<()> {
     for worker in workers {
-        let backend = worker.backend_client_if_initialized();
+        let backend = connected_backend_client(worker.as_ref());
         let dtype = image_wire_dtype_with_backend(worker.as_ref(), overrides, backend.as_deref())?;
         match agreed {
             None => *agreed = Some(dtype),
@@ -1079,7 +1081,7 @@ mod tests {
                 .build(),
         );
         let policy = DtypeOverrides::default();
-        let pending_backend = pending.backend_client_if_initialized();
+        let pending_backend = connected_backend_client(pending.as_ref());
         assert_eq!(shared_image_wire_dtype(&[pending], &policy), None);
 
         for (advertised, explicit, expected) in [
@@ -1137,7 +1139,7 @@ mod tests {
                 .runtime_type(RuntimeType::Sglang)
                 .connection_mode(ConnectionMode::Zmq)
                 .health_config(no_health_check())
-                .backend_client(BackendClient::Zmq(client.unwrap()));
+                .engine_connection(BackendClient::Zmq(client.unwrap()));
             if let Some(dtype) = explicit {
                 builder = builder.label("multimodal_encoder_dtype", dtype);
             }
@@ -1148,7 +1150,7 @@ mod tests {
             assert_eq!(mm_sglang_encoder_input_dtype(Some(&workers)), expected);
             // Retain the snapshot from before initialization while the worker
             // now has a live backend. The planner must not resample that backend.
-            assert!(worker.backend_client_if_initialized().is_some());
+            assert!(worker.engine_connection_if_initialized().is_some());
             assert_eq!(
                 image_wire_dtype_with_backend(worker.as_ref(), &policy, pending_backend.as_deref()),
                 explicit.map(|_| expected),

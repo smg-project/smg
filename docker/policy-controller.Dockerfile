@@ -6,7 +6,13 @@
 #
 # From the repository root:
 #   docker build --file docker/policy-controller.Dockerfile --tag smg-policy-controller .
-#   docker run --rm --publish 30103:30103 smg-policy-controller
+#   docker run --rm --publish 30103:30103 \
+#     --tmpfs /var/lib/smg/spec:uid=65532,gid=65532,mode=0700 \
+#     smg-policy-controller --spec-store /var/lib/smg/spec
+#
+# A start names the source of its policy spec. The directory above is one the
+# controller keeps, empty until the first apply and gone with the container:
+# mount a volume there to keep it, or pass a document's file as --spec-file.
 #
 # An image for another architecture than the builder's (`--platform`) is
 # cross-compiled: the build stage runs on the builder's own architecture, and
@@ -111,6 +117,20 @@ USER 65532
 # The binary loads and runs in this stage, as this user, on the platform
 # being built.
 RUN ["/usr/local/bin/smg-policy-controller", "--version"]
+
+# The allocator of an arm64 binary is built for 64 KiB pages, the largest an
+# arm64 kernel runs with: a binary built for a smaller page ends at its start
+# on such a kernel. The repository's cargo configuration sets the page for
+# the target, and the allocator's statistics say the page it was built for.
+# A controller of your own that registers no such allocator prints no
+# statistics, and nothing is asked of it.
+ARG TARGETARCH
+RUN if [ "${TARGETARCH}" = "arm64" ]; then \
+        stats="$(_RJEM_MALLOC_CONF=stats_print:true /usr/local/bin/smg-policy-controller --version 2>&1)" \
+        && if printf '%s\n' "${stats}" | grep -qF "Begin jemalloc statistics"; then \
+            printf '%s\n' "${stats}" | grep -F "Page size: 65536"; \
+        fi; \
+    fi
 
 # The listeners' default ports: the gateways and the relays (30100), the
 # operators (30101), the standbys (30102) and the HTTP admin listener with

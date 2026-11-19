@@ -4,15 +4,9 @@
 //! the vLLM engine, TensorRT-LLM engine, MLX engine, TokenSpeed scheduler,
 //! and SGLang scheduler backends.
 
-pub mod common_proto {
-    #![allow(
-        clippy::all,
-        clippy::absolute_paths,
-        clippy::trivially_copy_pass_by_ref,
-        unused_qualifications
-    )]
-    tonic::include_proto!("smg.grpc.common");
-}
+/// The messages every engine's service shares (`common.proto`). The worker
+/// crate generates them; this is its module, at the path it had here.
+pub use smg_worker::common_proto;
 pub mod abort_on_drop;
 pub mod channel;
 pub mod codec;
@@ -36,8 +30,8 @@ use std::sync::Arc;
 
 pub use abort_on_drop::{AbortOnDropClient, AbortOnDropStream};
 pub use channel::{
-    connect_channel, connect_channel_with_timeout, is_transport_failure, normalize_grpc_endpoint,
-    Channel, DEFAULT_CONNECT_TIMEOUT,
+    connect_channel, connect_channel_with_timeout, dial_failure_without_peer, is_transport_failure,
+    normalize_grpc_endpoint, Channel, DEFAULT_CONNECT_TIMEOUT,
 };
 pub use constraint_failure::{
     constraint_failed_status, is_constraint_failure, CONSTRAINT_FAILED_METADATA_KEY,

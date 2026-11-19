@@ -550,9 +550,8 @@ impl ConversationItemStorage for MemoryConversationItemStorage {
         params: ListParams,
     ) -> ConversationItemResult<Vec<ConversationItem>> {
         let store = self.inner.read();
-        let map = match store.links.get(conversation_id) {
-            Some(m) => m,
-            None => return Ok(Vec::new()),
+        let Some(map) = store.links.get(conversation_id) else {
+            return Ok(Vec::new());
         };
 
         let after_key: Option<LinkKey> = if let Some(after_id) = &params.after {

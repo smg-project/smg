@@ -13,7 +13,6 @@ import time
 from collections.abc import AsyncIterator
 from contextlib import aclosing
 from datetime import datetime, timezone
-from pathlib import Path
 from traceback import format_exc as get_exception_traceback
 
 import grpc
@@ -60,6 +59,7 @@ from smg_grpc_servicer.sglang.loads import (
     ranks_with_a_window,
 )
 from smg_grpc_servicer.sglang.lora import PreloadedLoras
+from smg_grpc_servicer.sglang.model_artifacts import tokenizer_dir_for
 from smg_grpc_servicer.sglang.request_manager import (
     GrpcRequestManager,
     _validate_token_ids_logprobs,
@@ -879,13 +879,16 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         """
         logger.info("Receive GetTokenizer request")
 
-        tokenizer_path = self.server_args.tokenizer_path
-        if not tokenizer_path:
+        try:
+            tokenizer_dir = await asyncio.to_thread(tokenizer_dir_for, self.server_args)
+        except Exception as e:
+            logger.exception("Failed to resolve tokenizer metadata")
+            await context.abort(grpc.StatusCode.INTERNAL, str(e))
+        if tokenizer_dir is None:
             await context.abort(
                 grpc.StatusCode.FAILED_PRECONDITION,
-                "Tokenizer path is not configured on this server.",
+                "No local tokenizer metadata is available on this server.",
             )
-        tokenizer_dir = Path(tokenizer_path)
 
         # Reading and compressing the tokenizer directory is file I/O and CPU
         # measured in hundreds of milliseconds: the shared bundle builds it in

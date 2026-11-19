@@ -28,18 +28,22 @@ use smg_policy_controller::{
     elector::{ElectionSettings, FileLease, LeaseBackend},
     lease::{Lease, LeaseId},
     proto::{
-        controller_frame, gateway_frame, policy_controller_client::PolicyControllerClient,
-        GatewayFrame, GetPolicySpecRequest, Hello, LeaderRequest, WatchWorkersRequest,
+        busy, controller_frame, decide_answer, decision, gateway_frame,
+        policy_controller_client::PolicyControllerClient, Credit, DecideRequest, Decision,
+        GatewayFrame, GetPolicySpecRequest, Hello, LeaderRequest, RequestFacts,
+        WatchWorkersRequest,
     },
     store::{
-        GatewayId, LeaseRecord, LeaseState, LeasesStore, LoadSink, LoadSource, WorkerFacts,
-        WorkersStore,
+        GatewayId, LeaseRecord, LeaseState, LeasesStore, LoadSink, LoadSource, Picked, WorkerFacts,
+        WorkerStatus, WorkersStore,
     },
     view::{fingerprint, LoadRow, Role, WorkerId},
+    AppliedSpec, PolicySpec,
 };
 use tokio::{
     net::TcpStream,
     sync::{mpsc, oneshot},
+    time::timeout,
 };
 use tonic::{
     codegen::tokio_stream::wrappers::ReceiverStream,
@@ -343,9 +347,9 @@ async fn a_gateway_gone_past_its_grace_period_is_let_go_by_the_run_loop() {
             })
             .await
             .expect("the stream takes the Hello");
-        let answer = answers
-            .message()
+        let answer = timeout(Duration::from_secs(20), answers.message())
             .await
+            .expect("a Welcome within the case's patience")
             .expect("a frame, not a status")
             .expect("a frame, not the stream's end");
         assert_eq!(answer.term, 1, "the first take's term: {answer:?}");
@@ -367,11 +371,13 @@ async fn a_gateway_gone_past_its_grace_period_is_let_go_by_the_run_loop() {
                 gateway,
                 request: 1,
                 target: WorkerId(7),
+                picked: Picked::default(),
                 decode: None,
                 term: 1,
                 issued_at: now,
                 dispatch_deadline: now + Duration::from_secs(600),
                 state: LeaseState::Issued,
+                session_ttl_micros: None,
             })
             .expect("a lease under the leader's term");
         assert_eq!(store.live(gateway), 1);
@@ -399,6 +405,651 @@ async fn a_gateway_gone_past_its_grace_period_is_let_go_by_the_run_loop() {
     };
     let (served, ()) = tokio::join!(serve, probe);
     served.expect("a clean stop");
+}
+
+/// A gateway's term floor above the leader's term, through the bound
+/// controller with the election's default: one replica alone over its own
+/// lease. The `Hello` is refused as before, and the floor reaches the
+/// election: the replica gives the lease up and, alone, takes it again at
+/// its next step above the floor. The gateway's next `Hello` under the same
+/// floor is welcomed under that term.
+#[tokio::test]
+async fn a_gateways_term_floor_above_the_term_moves_the_lone_replica_above_it() {
+    const GATEWAY: &str = "gateway-a";
+    const FLOOR: u64 = 7;
+    let mut controller = Controller::bind(config()).await.expect("bind");
+    controller
+        .identity_as_told("gateway")
+        .expect("a listener of the configuration");
+    let addresses = controller.addresses();
+    let mut readiness = controller.readiness();
+
+    let (stop, stopped) = oneshot::channel::<()>();
+    let serve = controller.serve(async {
+        let _ = stopped.await;
+    });
+    let probe = async {
+        assert_eq!(readiness.wait_for(State::Leader).await, Some(State::Leader));
+        let addr = addresses
+            .of(Scope::Gateway)
+            .expect("every scope is mounted");
+        let client = PolicyControllerClient::connect(format!("http://{addr}"))
+            .await
+            .expect("the listener accepts");
+        // One `Hello` under the floor on a stream of its own: the term of
+        // the Welcome that answers it, `None` for another frame or the
+        // stream's end, or the status that ended the stream.
+        let hello = || {
+            let mut client = client.clone();
+            async move {
+                let (frames, sent) = mpsc::channel(4);
+                let mut answers = client
+                    .session(stating(Some(GATEWAY), ReceiverStream::new(sent)))
+                    .await?
+                    .into_inner();
+                frames
+                    .send(GatewayFrame {
+                        seq: 0,
+                        term_floor: FLOOR,
+                        frame: Some(gateway_frame::Frame::Hello(Hello {
+                            gateway_id: GATEWAY.to_owned(),
+                            protocol_min: 1,
+                            protocol_max: 1,
+                            ..Hello::default()
+                        })),
+                    })
+                    .await
+                    .expect("the stream takes the Hello");
+                let answer = answers.message().await?;
+                Ok::<_, tonic::Status>(answer.and_then(|answer| match answer.frame {
+                    Some(controller_frame::Frame::Welcome(_)) => Some(answer.term),
+                    _ => None,
+                }))
+            }
+        };
+
+        let refused = hello()
+            .await
+            .expect_err("a floor above the first take's term");
+        assert_eq!(refused.code(), Code::FailedPrecondition, "{refused:?}");
+        assert_eq!(
+            refused.message(),
+            "the gateway's term floor 7 is above this controller's term 1"
+        );
+
+        // Until the retake a Hello is refused again or told NotLeader.
+        let said = Instant::now();
+        let term = loop {
+            if let Ok(Some(term)) = hello().await {
+                break term;
+            }
+            assert!(
+                said.elapsed() < Duration::from_secs(30),
+                "no Welcome under the floor {:?} after it was said",
+                said.elapsed()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert_eq!(term, FLOOR + 1, "the take after the floor's word");
+
+        stop.send(()).expect("the serve is listening for the stop");
+    };
+    let (served, ()) = tokio::join!(serve, probe);
+    served.expect("a clean stop");
+}
+
+/// A host cancels a served controller by dropping it. A gateway's session
+/// that is still open keeps its task, and the task keeps the service's
+/// shared state with the election's door. The door holds the election's
+/// words weakly: the election hears its handle go and closes the fence at
+/// the drop, not at the session's close.
+#[tokio::test]
+async fn a_serve_dropped_under_an_open_session_closes_the_fence_at_the_drop() {
+    const GATEWAY: &str = "gateway-a";
+    let mut controller = Controller::bind(config()).await.expect("bind");
+    controller
+        .identity_as_told("gateway")
+        .expect("a listener of the configuration");
+    let addresses = controller.addresses();
+    let mut readiness = controller.readiness();
+    let fence = controller.fence();
+
+    let mut serve = Box::pin(controller.serve(std::future::pending::<()>()));
+    let opened = async {
+        assert_eq!(readiness.wait_for(State::Leader).await, Some(State::Leader));
+        let addr = addresses
+            .of(Scope::Gateway)
+            .expect("every scope is mounted");
+        let mut client = PolicyControllerClient::connect(format!("http://{addr}"))
+            .await
+            .expect("the listener accepts");
+        let (frames, sent) = mpsc::channel(4);
+        let mut answers = client
+            .session(stating(Some(GATEWAY), ReceiverStream::new(sent)))
+            .await
+            .expect("a stream")
+            .into_inner();
+        frames
+            .send(GatewayFrame {
+                seq: 0,
+                term_floor: 0,
+                frame: Some(gateway_frame::Frame::Hello(Hello {
+                    gateway_id: GATEWAY.to_owned(),
+                    protocol_min: 1,
+                    protocol_max: 1,
+                    ..Hello::default()
+                })),
+            })
+            .await
+            .expect("the stream takes the Hello");
+        let welcome = answers
+            .message()
+            .await
+            .expect("an answer")
+            .expect("a frame");
+        assert!(
+            matches!(welcome.frame, Some(controller_frame::Frame::Welcome(_))),
+            "{welcome:?}"
+        );
+        (client, frames, answers)
+    };
+    let held = tokio::select! {
+        ended = &mut serve => Err(ended),
+        held = opened => Ok(held),
+    };
+    // The session stays open to the end of the case.
+    let _session = held.expect("the session opens while the controller serves");
+    assert!(
+        fence.leader_term(Instant::now()).is_some(),
+        "the replica leads"
+    );
+
+    drop(serve);
+    let dropped = Instant::now();
+    while fence.leader_term(Instant::now()).is_some() {
+        assert!(
+            dropped.elapsed() < Duration::from_secs(5),
+            "the fence is open {:?} after the drop, under the open session",
+            dropped.elapsed()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// A gateway's whole way to "which worker": no decide stream before its
+/// `Hello`, the `Welcome`'s window and cap, then a window's burst of
+/// requests on one decide stream, each answered with a registered worker
+/// under the leader's term, and the credit the answers give back. A
+/// request the controller answers `Busy` is on its scrape, at its reason.
+#[tokio::test]
+async fn a_present_gateway_is_answered_which_worker_on_its_decide_stream() {
+    const GATEWAY: &str = "gateway-a";
+    const MODEL: &str = "model-a";
+    let mut controller = Controller::bind(config()).await.expect("bind");
+    controller
+        .identity_as_told("gateway")
+        .expect("a listener of the configuration");
+    let addresses = controller.addresses();
+    let mut readiness = controller.readiness();
+    let store = controller.store();
+    // Three ready members serving the model, under a preset of this build.
+    let mut workers = Vec::new();
+    for name in ["w0", "w1", "w2"] {
+        let key = format!("http://{name}.fleet:8000");
+        let id = store
+            .upsert(WorkerFacts {
+                key: key.clone(),
+                engine: key,
+                incarnation: 1,
+                role: Role::Single,
+                models: vec![MODEL.to_owned()],
+                dp_size: 1,
+                max_running: Some(256),
+                ..WorkerFacts::default()
+            })
+            .id();
+        let revision = WorkersStore::get(&*store, id).expect("the row").revision;
+        store.set_status(id, WorkerStatus::Ready, revision);
+        workers.push(id.0);
+    }
+    let mut document = PolicySpec::preset("random").expect("a preset of this build");
+    document.generation = 1;
+    let spec = AppliedSpec::validate(&document).expect("the preset validates");
+    store.apply(spec).expect("above the unbound start");
+
+    let (stop, stopped) = oneshot::channel::<()>();
+    let serve = controller.serve(async {
+        let _ = stopped.await;
+    });
+    let probe = async {
+        assert_eq!(readiness.wait_for(State::Leader).await, Some(State::Leader));
+        let addr = addresses
+            .of(Scope::Gateway)
+            .expect("every scope is mounted");
+        let mut client = PolicyControllerClient::connect(format!("http://{addr}"))
+            .await
+            .expect("the listener accepts");
+
+        // Before its Hello the gateway is not present.
+        let (_unsent, sent) = mpsc::channel::<DecideRequest>(1);
+        let refused = client
+            .decide(stating(Some(GATEWAY), ReceiverStream::new(sent)))
+            .await
+            .expect_err("no session of the gateway stands");
+        assert_eq!(refused.code(), Code::FailedPrecondition);
+        assert_eq!(
+            refused.message(),
+            "no session of this gateway stands on this controller: a decide stream is a present gateway's (say Hello on a Session stream first)"
+        );
+
+        let (frames, sent) = mpsc::channel(4);
+        let mut session = client
+            .session(stating(Some(GATEWAY), ReceiverStream::new(sent)))
+            .await
+            .expect("the stream opens")
+            .into_inner();
+        let hello = Hello {
+            gateway_id: GATEWAY.to_owned(),
+            protocol_min: 1,
+            protocol_max: 1,
+            ..Hello::default()
+        };
+        frames
+            .send(GatewayFrame {
+                seq: 0,
+                term_floor: 0,
+                frame: Some(gateway_frame::Frame::Hello(hello)),
+            })
+            .await
+            .expect("the stream takes the Hello");
+        let answer = timeout(Duration::from_secs(20), session.message())
+            .await
+            .expect("a Welcome within the case's patience")
+            .expect("a frame, not a status")
+            .expect("a frame, not the stream's end");
+        let window = match answer.frame {
+            Some(controller_frame::Frame::Welcome(welcome)) => {
+                assert_eq!(welcome.max_decide_streams, 256);
+                welcome.decide_window
+            }
+            other => panic!("a Welcome answers a Hello: {other:?}"),
+        };
+        assert_eq!(window, 128);
+
+        // The whole window at once: the controller's queues hold a
+        // stream's window, so none comes back for their depth.
+        let (requests, sent) = mpsc::channel(256);
+        let mut answers = client
+            .decide(stating(Some(GATEWAY), ReceiverStream::new(sent)))
+            .await
+            .expect("a present gateway's stream opens")
+            .into_inner();
+        for id in 0..window {
+            requests
+                .send(DecideRequest {
+                    request_id: id.to_be_bytes().to_vec(),
+                    facts: Some(RequestFacts {
+                        model: MODEL.to_owned(),
+                        seed: u64::from(id),
+                        budget_micros: 5_000_000,
+                        ..RequestFacts::default()
+                    }),
+                    constraints: None,
+                })
+                .await
+                .expect("the stream takes the request");
+        }
+        // The answers in the requests' order, a Credit frame of half the
+        // window behind each half of them.
+        let (mut decided, mut credit) = (0u32, 0u32);
+        while credit < window {
+            let answer = timeout(Duration::from_secs(20), answers.message())
+                .await
+                .expect("an answer within the case's patience")
+                .expect("an answer, not a status")
+                .expect("an answer, not the stream's end");
+            assert_eq!(answer.term, 1, "the first take's term: {answer:?}");
+            match answer.answer {
+                Some(decide_answer::Answer::Decision(Decision {
+                    outcome: Some(decision::Outcome::Pick(pick)),
+                    ..
+                })) => {
+                    assert_eq!(answer.request_id, decided.to_be_bytes());
+                    let target = pick.targets.first().expect("a target").id;
+                    assert!(workers.contains(&target), "{target}");
+                    decided += 1;
+                }
+                Some(decide_answer::Answer::Credit(Credit { window: grant })) => {
+                    assert!(answer.request_id.is_empty());
+                    assert_eq!((grant, decided % grant), (window / 2, 0));
+                    credit += grant;
+                }
+                other => panic!("a pick or a credit: {other:?}"),
+            }
+        }
+        assert_eq!(decided, window);
+
+        // A request that brings no budget has none left: the gateway's to
+        // decide, and counted at its reason on the controller's scrape.
+        requests
+            .send(DecideRequest {
+                request_id: vec![0xff],
+                facts: Some(RequestFacts {
+                    model: MODEL.to_owned(),
+                    ..RequestFacts::default()
+                }),
+                constraints: None,
+            })
+            .await
+            .expect("the stream takes the request");
+        let answer = timeout(Duration::from_secs(20), answers.message())
+            .await
+            .expect("an answer within the case's patience")
+            .expect("an answer, not a status")
+            .expect("an answer, not the stream's end");
+        match answer.answer {
+            Some(decide_answer::Answer::Busy(told)) => {
+                assert_eq!(told.reason(), busy::Reason::BudgetGoneOnArrival);
+            }
+            other => panic!("a Busy: {other:?}"),
+        }
+        let (status, scrape) = http_get(addresses.admin, "/metrics").await.expect("GET");
+        assert_eq!(status, 200);
+        for line in [
+            "smg_policy_controller_decide_busy_total{reason=\"budget_gone_on_arrival\"} 1",
+            "smg_policy_controller_decide_busy_total{reason=\"queue_depth\"} 0",
+            "smg_policy_controller_decide_no_decision_total{cause=\"fault\"} 0",
+            "smg_policy_controller_decide_answers_dropped_total{cause=\"queue_full\"} 0",
+        ] {
+            assert!(scrape.contains(line), "{line}\n{scrape}");
+        }
+
+        stop.send(()).expect("the serve is listening for the stop");
+    };
+    let (served, ()) = tokio::join!(serve, probe);
+    served.expect("a clean stop");
+}
+
+/// A worker added through the control listener is decided for a present
+/// gateway with no ask for a build anywhere: the served controller's own
+/// loop pays the build the registration owes. Its tick alone pays inside
+/// this case's bound, so the wake that pays at the window's end is held by
+/// the loop's own case, under paused time.
+#[tokio::test]
+async fn a_worker_added_over_the_wire_is_decided_with_no_ask_for_a_build() {
+    use smg_policy_controller::proto::{
+        register_worker_request::Mode, worker_event::Event, RegisterWorkerRequest, WireMode,
+        WorkerSpec,
+    };
+    const GATEWAY: &str = "gateway-w";
+    const MODEL: &str = "model-w";
+    let mut controller = Controller::bind(config()).await.expect("bind");
+    for name in ["gateway", "control"] {
+        controller
+            .identity_as_told(name)
+            .expect("a listener of the configuration");
+    }
+    let addresses = controller.addresses();
+    let mut readiness = controller.readiness();
+    let store = controller.store();
+    let mut document = PolicySpec::preset("random").expect("a preset of this build");
+    document.generation = 1;
+    let spec = AppliedSpec::validate(&document).expect("the preset validates");
+    store.apply(spec).expect("above the unbound start");
+
+    let (stop, stopped) = oneshot::channel::<()>();
+    let serve = controller.serve(async {
+        let _ = stopped.await;
+    });
+    let probe = async {
+        assert_eq!(readiness.wait_for(State::Leader).await, Some(State::Leader));
+        let gateway = addresses
+            .of(Scope::Gateway)
+            .expect("every scope is mounted");
+        let control = addresses
+            .of(Scope::Control)
+            .expect("every scope is mounted");
+        let mut client = PolicyControllerClient::connect(format!("http://{gateway}"))
+            .await
+            .expect("the listener accepts");
+        let mut operator = PolicyControllerClient::connect(format!("http://{control}"))
+            .await
+            .expect("the listener accepts");
+        let (frames, sent) = mpsc::channel(4);
+        let mut session = client
+            .session(stating(Some(GATEWAY), ReceiverStream::new(sent)))
+            .await
+            .expect("the stream opens")
+            .into_inner();
+        let hello = Hello {
+            gateway_id: GATEWAY.to_owned(),
+            protocol_min: 1,
+            protocol_max: 1,
+            ..Hello::default()
+        };
+        frames
+            .send(GatewayFrame {
+                seq: 0,
+                term_floor: 0,
+                frame: Some(gateway_frame::Frame::Hello(hello)),
+            })
+            .await
+            .expect("the stream takes the Hello");
+        let answer = timeout(Duration::from_secs(20), session.message())
+            .await
+            .expect("a Welcome within the case's patience")
+            .expect("a frame, not a status")
+            .expect("a frame, not the stream's end");
+        assert!(
+            matches!(answer.frame, Some(controller_frame::Frame::Welcome(_))),
+            "a Welcome answers a Hello: {answer:?}"
+        );
+        let (requests, sent) = mpsc::channel(4);
+        let mut answers = client
+            .decide(stating(Some(GATEWAY), ReceiverStream::new(sent)))
+            .await
+            .expect("a present gateway's stream opens")
+            .into_inner();
+
+        // The add, then its status at the store's door. No call asks for a
+        // build: the served loop pays it.
+        let builds = store.membership_builds();
+        let request = RegisterWorkerRequest {
+            spec: Some(WorkerSpec {
+                url: "http://w.fleet:8000".to_owned(),
+                wire: WireMode::Grpc as i32,
+                role: smg_policy_controller::proto::Role::Single as i32,
+                models: vec![MODEL.to_owned()],
+                ..WorkerSpec::default()
+            }),
+            mode: Mode::Add as i32,
+            wait_ready: false,
+        };
+        let added = operator
+            .register_worker(stating(Some("operator-w"), request))
+            .await
+            .expect("the add is taken")
+            .into_inner();
+        let id = match added.event {
+            Some(Event::Registered(row)) => WorkerId(row.id),
+            other => panic!("a registration's answer: {other:?}"),
+        };
+        let answered = Instant::now();
+        let revision = WorkersStore::get(&*store, id).expect("the row").revision;
+        store.set_status(id, WorkerStatus::Ready, revision);
+
+        // One request at a time, until a pick names the worker.
+        let mut asked = 0u32;
+        loop {
+            asked += 1;
+            requests
+                .send(DecideRequest {
+                    request_id: asked.to_be_bytes().to_vec(),
+                    facts: Some(RequestFacts {
+                        model: MODEL.to_owned(),
+                        seed: u64::from(asked),
+                        budget_micros: 5_000_000,
+                        ..RequestFacts::default()
+                    }),
+                    constraints: None,
+                })
+                .await
+                .expect("the stream takes the request");
+            let picked = loop {
+                let answer = timeout(Duration::from_secs(20), answers.message())
+                    .await
+                    .expect("an answer within the case's patience")
+                    .expect("an answer, not a status")
+                    .expect("an answer, not the stream's end");
+                match answer.answer {
+                    Some(decide_answer::Answer::Credit(_)) => {}
+                    Some(decide_answer::Answer::Decision(Decision {
+                        outcome: Some(decision::Outcome::Pick(pick)),
+                        ..
+                    })) => break pick.targets.first().map(|target| target.id),
+                    _ => break None,
+                }
+            };
+            // The bound holds for the pick too: one that comes late is no
+            // pass.
+            assert!(
+                answered.elapsed() < Config::DEFAULT_LOAD_POLL_INTERVAL / 4,
+                "not decided {:?} after its answer, over {asked} requests",
+                answered.elapsed()
+            );
+            if picked == Some(id.0) {
+                break;
+            }
+        }
+        assert_eq!(store.membership_builds(), builds + 1);
+
+        stop.send(()).expect("the serve is listening for the stop");
+    };
+    let (served, ()) = tokio::join!(serve, probe);
+    served.expect("a clean stop");
+}
+
+/// A drain under a gateway's open decide streams, one that asked and one
+/// that never did. Each ends `UNAVAILABLE` when the listeners stop
+/// accepting, and the serve returns then: a gateway that closes none of its
+/// sides does not hold the drain to the end of its grace period.
+#[tokio::test]
+async fn a_drain_ends_the_open_decide_streams_and_returns_inside_its_grace_period() {
+    const GATEWAY: &str = "gateway-a";
+    const SETTLE: Duration = Duration::from_millis(500);
+    let mut config = config();
+    config.shutdown_settle = SETTLE;
+    config.shutdown_grace = Duration::from_secs(60);
+    let mut controller = Controller::bind(config).await.expect("bind");
+    controller
+        .identity_as_told("gateway")
+        .expect("a listener of the configuration");
+    let addresses = controller.addresses();
+    let mut readiness = controller.readiness();
+
+    let (stop, stopped) = oneshot::channel::<()>();
+    let serve = controller.serve(async {
+        let _ = stopped.await;
+    });
+    let probe = async {
+        assert_eq!(readiness.wait_for(State::Leader).await, Some(State::Leader));
+        let addr = addresses
+            .of(Scope::Gateway)
+            .expect("every scope is mounted");
+        let mut client = PolicyControllerClient::connect(format!("http://{addr}"))
+            .await
+            .expect("the listener accepts");
+        let (frames, sent) = mpsc::channel(4);
+        let mut session = client
+            .session(stating(Some(GATEWAY), ReceiverStream::new(sent)))
+            .await
+            .expect("the stream opens")
+            .into_inner();
+        let hello = Hello {
+            gateway_id: GATEWAY.to_owned(),
+            protocol_min: 1,
+            protocol_max: 1,
+            ..Hello::default()
+        };
+        frames
+            .send(GatewayFrame {
+                seq: 0,
+                term_floor: 0,
+                frame: Some(gateway_frame::Frame::Hello(hello)),
+            })
+            .await
+            .expect("the stream takes the Hello");
+        let welcome = timeout(Duration::from_secs(20), session.message())
+            .await
+            .expect("a Welcome within the case's patience")
+            .expect("a frame, not a status")
+            .expect("a frame, not the stream's end");
+        assert!(
+            matches!(welcome.frame, Some(controller_frame::Frame::Welcome(_))),
+            "a Welcome answers a Hello: {welcome:?}"
+        );
+
+        // The stream that asked: a request with no budget, answered here.
+        let (requests, sent) = mpsc::channel(1);
+        let mut asked = client
+            .decide(stating(Some(GATEWAY), ReceiverStream::new(sent)))
+            .await
+            .expect("a present gateway's stream opens")
+            .into_inner();
+        requests
+            .send(DecideRequest {
+                request_id: vec![1],
+                facts: Some(RequestFacts {
+                    model: "model-a".to_owned(),
+                    ..RequestFacts::default()
+                }),
+                constraints: None,
+            })
+            .await
+            .expect("the stream takes the request");
+        let answer = timeout(Duration::from_secs(20), asked.message())
+            .await
+            .expect("an answer within the case's patience")
+            .expect("an answer, not a status")
+            .expect("an answer, not the stream's end");
+        assert!(
+            matches!(answer.answer, Some(decide_answer::Answer::Busy(_))),
+            "a Busy: {answer:?}"
+        );
+        let (silent, sent) = mpsc::channel::<DecideRequest>(1);
+        let mut idle = client
+            .decide(stating(Some(GATEWAY), ReceiverStream::new(sent)))
+            .await
+            .expect("a present gateway's stream opens")
+            .into_inner();
+
+        let signalled = Instant::now();
+        stop.send(()).expect("the serve is listening for the stop");
+        for stream in [&mut asked, &mut idle] {
+            let ended = timeout(Duration::from_secs(20), stream.message())
+                .await
+                .expect("the stream's end within the case's patience")
+                .expect_err("a status ends the stream");
+            assert_eq!(
+                (ended.code(), ended.message()),
+                (
+                    Code::Unavailable,
+                    "this controller closes its listeners: open the decide stream on the leader (ask Leader)"
+                )
+            );
+        }
+        // What the gateway holds stays open past the serve's end.
+        let held = (client, frames, session, requests, asked, silent, idle);
+        (signalled, held)
+    };
+    let (served, (signalled, _held)) = tokio::join!(serve, probe);
+    served.expect("a clean stop");
+    let took = signalled.elapsed();
+    assert!(took >= SETTLE, "the settle window held: {took:?}");
+    assert!(
+        took < Duration::from_secs(20),
+        "the drain did not wait for the grace: {took:?}"
+    );
 }
 
 #[tokio::test]
@@ -819,6 +1470,9 @@ async fn rss_idle_and_with_a_thousand_workers_in_the_store() {
                 LoadSource::Stream,
             );
         }
+        // The fleet arrived inside one window: its one build, asked here so
+        // the figure holds the world a decision reads.
+        store.publish_now();
         let (_, rows) = store.snapshot();
         assert_eq!(rows.len(), 1_000);
         let fed = vm_rss_kib();

@@ -16,6 +16,9 @@
     reason = "a bench's setup has no caller to answer"
 )]
 
+#[path = "common/filled.rs"]
+mod filled;
+
 use std::{
     hint::black_box,
     sync::Arc,
@@ -26,7 +29,7 @@ use std::{
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use smg_policy_controller::{
     store::{
-        Ask, GatewayId, LoadSink, LoadSource, MemoryStore, ViewBuffers, WorkerFacts, WorkerStatus,
+        Ask, GatewayId, LoadSink, LoadSource, MemoryStore, PairBuffers, WorkerFacts, WorkerStatus,
         WorkersStore, PUBLISH_WINDOW,
     },
     LoadRow, Role, SignalSource,
@@ -70,6 +73,7 @@ fn pair_pool(n: usize) -> (Arc<MemoryStore>, Instant) {
                     ..WorkerFacts::default()
                 })
                 .id();
+            store.publish_now();
             let revision = WorkersStore::get(&*store, id).expect("the row").revision;
             store
                 .set_status(id, WorkerStatus::Ready, revision)
@@ -80,6 +84,9 @@ fn pair_pool(n: usize) -> (Arc<MemoryStore>, Instant) {
     let opened = opened + PUBLISH_WINDOW;
     store.publish(opened);
     assert_eq!(store.publish_due(), None);
+    for role in [Role::Prefill, Role::Decode] {
+        filled::filled(&store, MODEL, role, n);
+    }
     (store, opened)
 }
 
@@ -87,28 +94,23 @@ fn pair_pool(n: usize) -> (Arc<MemoryStore>, Instant) {
 /// after one untimed build held to both pools' sizes; the wall time they
 /// took.
 fn pair_builds(store: &MemoryStore, ask: &Ask, owned: bool, n: usize, iters: u64) -> Duration {
-    let mut prefill = ViewBuffers::default();
-    let mut decode = ViewBuffers::default();
-    let one = |prefill: &mut ViewBuffers, decode: &mut ViewBuffers| {
+    let mut out = PairBuffers::default();
+    let one = |out: &mut PairBuffers| {
         if owned {
-            let world = store.world();
-            world
-                .build(MODEL, Role::Prefill, black_box(ask), prefill)
-                .zip(world.build(MODEL, Role::Decode, black_box(ask), decode))
+            store.world().build_pair(MODEL, black_box(ask), out)
         } else {
-            store.build_pair(MODEL, black_box(ask), prefill, decode)
+            store.build_pair(MODEL, black_box(ask), out)
         }
     };
-    let (first, second) = one(&mut prefill, &mut decode).expect("both pools");
+    let (first, second) = one(&mut out).expect("both pools");
     assert_eq!(
         (first.pool_size as usize, second.pool_size as usize),
         (n, n)
     );
     let start = Instant::now();
     for _ in 0..iters {
-        black_box(one(&mut prefill, &mut decode));
-        black_box(&prefill.candidates);
-        black_box(&decode.candidates);
+        black_box(one(&mut out));
+        black_box(out.pools());
     }
     start.elapsed()
 }

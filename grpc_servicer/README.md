@@ -181,6 +181,17 @@ breaks the transfer is a 502, so a client knows whether to retry. None of
 these counts against the worker's circuit breaker, and the Router replays
 none of them on another worker, which would meet the same media.
 
+For `nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B`, the router can preprocess
+audio from `/v1/chat/completions` with `--mm-processing router`. Use a vLLM
+engine with native `Nemotron3_5TranscribeForConditionalGeneration` support;
+the worker's `--mm-processor off` accepts the router's prepared tensors.
+SMG downmixes and resamples to 16 kHz, expands each `<|audio|>` placeholder,
+and sends padded `audio_signal` rows with their true CPU `audio_signal_length`
+values. Mel extraction stays in the model's audio tower. This path supports
+`input_audio` and `audio_url` content parts, including multiple clips; it does
+not add an `/v1/audio/transcriptions` endpoint. The Rust worker's `smg` mode
+still has the audio-reference limitation described below.
+
 On the router side, `--mm-processing` selects `auto` (default: forward when
 every registered worker of the model advertises `mm_processor` and the model's
 spec opts in, or every one of those workers runs the router's own pipeline,
@@ -1023,6 +1034,16 @@ disaggregation role; under attention data parallelism the servicer routes a
 request by load, not by rank, so each prefill shape, the chunk remainders
 included, warms one rank and the log says so: there the remainder hazard
 stays open on the ranks a count did not reach until the wire can pin a rank),
+`SMG_TOKENSPEED_SERVICER_WARMUP_REMAINDERS` (whether the `full` level plans
+those remainders: `auto`, the default, on an engine of more than one process
+or of an unknown layout, as above; `on` whatever the layout; `off` never, for
+an engine that loads those kernels itself before it reports ready, with a
+WARNING at start on an engine of more than one process or of an unknown
+layout; any other value refuses to start, on either servicer and whatever
+the warm-up level or the role: one ERROR line and exit code 2 before the
+engine starts; the engine's prefill graphs do not cover the remainders,
+since those library GEMMs run eagerly, in the attention graph break or the
+eager narrowing layer, at each forward's real token count),
 `SMG_TOKENSPEED_SERVICER_STARTUP_TIMEOUT_SECS` (default 1800) and
 `SMG_TOKENSPEED_SERVICER_STARTUP_CEILING_SECS` (default 14400; the two startup
 bounds as for vLLM above: the launcher reports the scheduler process alive each
@@ -1145,6 +1166,16 @@ livenessProbe:
 ```bash
 sglang serve --model-path meta-llama/Llama-2-7b-hf --grpc-mode
 ```
+
+With an object storage source (`s3://`, `gs://`, or `az://`), the frontend
+prepares SGLang's metadata cache before reading model configuration. Weights
+keep streaming from the original URI; only metadata is downloaded to disk.
+Both servicers use that local cache for `GetTokenizer`, so the gateway can
+fetch the tokenizer, chat templates, generation and processor configs from
+the worker without object storage credentials or a shared filesystem.
+The checkpoint must include those files. An explicit `--tokenizer-path`
+selects its own tokenizer source, including a local directory or Hub ID.
+Metadata download errors stop startup before the gRPC server binds.
 
 Without `--kv-events-config`, the servicer turns SGLang's ZMQ KV-event
 publisher on by itself, under either implementation, before the schedulers are
@@ -1585,6 +1616,17 @@ them) under `guided_decoding_backend: xgrammar`, read off the distribution's
 metadata at start-up; absent otherwise. A router spells such a worker's
 structural tags without `optional`, `plus` and `star` (a `token` node stays as
 derived). The engine's own servicer does not report the field.
+
+The Rust servicer also says where the engine starts a request's grammar on a
+prompt that ends inside the model's thinking block
+(`GetServerInfo.constrained_decoding_start`, the `constrained_decoding_start`
+label): `first_token` under `guided_decoding_backend: xgrammar` or
+`llguidance`, since the engine's guided decoder builds a request's matcher
+before the first generated token and no reasoning parser gates it; absent
+under `none` (the engine refuses a guided request) and when the launcher could
+not name the backend. A router shapes a forced tool call's grammar by it: the
+thought and then the calls, so the call is not forced into the thought. The
+engine's own servicer does not report the field.
 
 ## Architecture
 

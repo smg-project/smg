@@ -10,21 +10,34 @@ use std::{
 };
 
 use super::{
-    run_of, seek, Ask, Built, GatewayRun, PoolVeto, PoolVetoes, StaleGeneration, ViewBuffers,
-    World, Writer, PUBLISH_WINDOW, WALKED_RUNS,
+    run_of, seek, Ask, Built, Classes, GatewayRun, OutsideLists, PairBuffers, PoolVeto, PoolVetoes,
+    StaleGeneration, ViewBuffers, World, Writer, PUBLISH_WINDOW, WALKED_RUNS,
 };
 use crate::{
-    spec::{BindingSpec, Match, OverloadSpec},
+    spec::{BindingSpec, Match, OverloadSpec, Pairing},
     store::{
-        GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore, Overload, Reachability,
-        WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
+        pairing::Refusal, GatewayId, HealthSink, LeasesStore, LoadSink, LoadSource, MembershipTail,
+        MemoryStore, Overload, PairingDescriptor, Reachability, VetoWrite, WorkerFacts,
+        WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
     },
     view::{
         fingerprint, AffinityFacts, Candidate, Constraints, LoadRow, Phase, RequestFacts, Role,
         WireModes, WorkerId,
     },
-    AppliedSpec, PolicySpec, Scratch,
+    AppliedSpec, PairPools, PairTable, PolicySpec, Scratch,
 };
+
+mod encode_classes;
+mod encode_door;
+mod engines;
+mod list_room;
+mod membership_call;
+mod mode_and_overload;
+mod owed;
+mod pool_binding;
+mod repeated_models;
+mod unnamed_rank;
+mod written;
 
 const MODEL: &str = "m";
 const ASKER: GatewayId = GatewayId(1);
@@ -41,9 +54,17 @@ fn facts(key: &str, role: Role, models: &[&str]) -> WorkerFacts {
     }
 }
 
+/// The tests' way to a row a decision reads: registered, and the build its
+/// write owes asked at once.
+fn admit(store: &MemoryStore, facts: WorkerFacts) -> WorkerId {
+    let id = store.upsert(facts).id();
+    store.publish_now();
+    id
+}
+
 /// A worker of the model, registered and not yet ready.
 fn member(store: &MemoryStore, key: &str) -> WorkerId {
-    store.upsert(facts(key, Role::Single, &[MODEL])).id()
+    admit(store, facts(key, Role::Single, &[MODEL]))
 }
 
 fn status(store: &MemoryStore, id: WorkerId, status: WorkerStatus) {
@@ -74,7 +95,45 @@ fn view(store: &MemoryStore, ask: &Ask) -> (Vec<Candidate>, Vec<AffinityFacts>, 
     let built = store
         .build_view(MODEL, Role::Single, ask, &mut out)
         .expect("the pool");
+    lent_agrees(store, ask);
     (out.candidates, out.affinity, built)
+}
+
+/// Holds the lent view to the build's, under one load of the world: the
+/// rows [`World::view`] hands, with what it hands beside them written in,
+/// are the rows [`World::build`] writes, field for field. Every case that
+/// builds its view through [`view`] holds the lent one to it here.
+fn lent_agrees(store: &MemoryStore, ask: &Ask) {
+    let (mut built, mut lent) = (ViewBuffers::default(), ViewBuffers::default());
+    store.with_world(|world| {
+        let read = world
+            .build(MODEL, Role::Single, ask, &mut built)
+            .expect("the pool");
+        let view = world
+            .view(MODEL, Role::Single, ask, false, &mut lent)
+            .expect("the pool");
+        let mut rows = view.candidates.to_vec();
+        for (index, row) in rows.iter_mut().enumerate() {
+            assert_eq!(row.position as usize, index);
+            // The age at the decision: its instant less the sample's.
+            let sampled_at = row.load_sampled_at_micros;
+            if let Some(load) = &mut row.load {
+                load.report_age_ms = super::age_ms(view.built.now_micros, sampled_at);
+            }
+        }
+        assert!(view.stalled.is_sorted(), "the mask is in the rows' order");
+        for &position in view.stalled {
+            rows[position as usize].health.stalled = true;
+        }
+        if let Some(at) = view.pinned_at.checked_sub(1) {
+            rows[at as usize].session_hit = true;
+        }
+        // A row is compared by its printed form: every field of it.
+        assert_eq!(format!("{rows:?}"), format!("{:?}", built.candidates));
+        let column = format!("{:?}", view.affinity);
+        assert_eq!(column, format!("{:?}", built.affinity));
+        assert_eq!(view.built, read);
+    });
 }
 
 /// What the pool's first row reads as running, when it has a record.
@@ -106,7 +165,9 @@ fn a_pool_holds_every_member_of_its_model_and_role_by_id_whatever_its_status() {
     let prefill = store
         .upsert(facts("http://p:8000", Role::Prefill, &[MODEL]))
         .id();
+    store.publish_now();
     store.upsert(facts("http://o:8000", Role::Single, &["other"]));
+    store.publish_now();
     status(&store, ready, WorkerStatus::Ready);
     status(&store, draining, WorkerStatus::Draining);
 
@@ -153,12 +214,13 @@ fn another_gateways_host_local_row_is_not_written_and_the_slice_is_its_own_index
     let now = Instant::now();
     let open = member(&store, "http://a:8000");
     let local = |key: &str, gateway: u64| {
-        store
-            .upsert(WorkerFacts {
+        admit(
+            &store,
+            WorkerFacts {
                 reachable_from: Reachability::Gateway(GatewayId(gateway)),
                 ..facts(key, Role::Single, &[MODEL])
-            })
-            .id()
+            },
+        )
     };
     let theirs = local("unix:///b", 2);
     let ours = local("unix:///c", 1);
@@ -247,6 +309,7 @@ fn a_build_names_the_asking_gateways_list_where_the_pool_holds_a_host_local_row(
             ..facts("unix:///b", Role::Single, &[MODEL])
         })
         .id();
+    store.publish_now();
     let mut both = vec![open, local];
     both.sort_unstable();
     // One host-local row, and the pool's lists are two under one epoch:
@@ -289,6 +352,7 @@ fn two_gateways_lists_of_one_size_each_turn_their_own_rotation() {
     let now = Instant::now();
     let ready = |facts: WorkerFacts| {
         let id = store.upsert(facts).id();
+        store.publish_now();
         status(&store, id, WorkerStatus::Ready);
     };
     for row in 0..12 {
@@ -362,6 +426,7 @@ fn two_gateways_in_strict_turn_leave_each_others_vetoed_rows_their_share() {
                 &[MODEL],
             ))
             .id();
+        store.publish_now();
         status(&store, id, WorkerStatus::Ready);
     }
     let (rows, _, _) = view(&store, &ask(now));
@@ -444,6 +509,7 @@ fn a_decision_reads_one_world_and_a_membership_write_builds_the_next() {
     for id in [first, second] {
         let revision = WorkersStore::get(&store, id).expect("the row").revision;
         store.remove(id, revision).expect("removed");
+        store.publish_now();
     }
     assert_eq!(store.world().members(MODEL, Role::Single), None);
     assert_eq!(
@@ -476,7 +542,9 @@ fn two_publications_of_one_membership_are_two_worlds_of_one_epoch_sharing_what_i
     let one = store
         .upsert(facts("http://a:8000", Role::Single, &["one"]))
         .id();
+    store.publish_now();
     store.upsert(facts("http://b:8000", Role::Single, &["two"]));
+    store.publish_now();
     let before = store.world();
     // A load publication between two membership writes.
     store.record(one, 0, load(3, 0), t0, LoadSource::Stream);
@@ -572,9 +640,11 @@ fn a_pool_written_once_keeps_its_rows_while_another_pool_publishes() {
     let one = store
         .upsert(facts("http://a:8000", Role::Single, &["one"]))
         .id();
+    store.publish_now();
     let two = store
         .upsert(facts("http://b:8000", Role::Single, &["two"]))
         .id();
+    store.publish_now();
     // One record into the first pool, published by itself.
     store.record(one, 0, load(1, 0), t0, LoadSource::Stream);
     let listed = |model: &str| rows_of(&store.world(), model).as_ptr();
@@ -626,12 +696,13 @@ fn rows_a_reader_still_holds_are_left_whole_and_that_publication_allocates() {
     assert_eq!(counts(), (2, 1));
     assert_eq!(format!("{:?}", rows_of(&kept, MODEL)), read);
 
-    // The writer kept its own reference to the rows it left, so the
-    // reader dropping the last world that lists them frees no rows: two
-    // counts stay, the writer's and this case's.
+    // The writer kept its own reference to the rows it left and its own
+    // hold on the world that lists them, so the reader dropping its hold
+    // frees nothing: three counts stay, the writer's, that world's and
+    // this case's. The next publication lets the world go.
     let rows = rows_of(&kept, MODEL);
     drop(kept);
-    assert_eq!(Arc::strong_count(&rows), 2);
+    assert_eq!(Arc::strong_count(&rows), 3);
     publish(6);
     assert_eq!((counts(), Arc::strong_count(&rows)), ((2, 1), 2));
     // The publication that finds them alone frees them.
@@ -649,7 +720,7 @@ fn rows_a_reader_still_holds_are_left_whole_and_that_publication_allocates() {
     assert_eq!(counts(), (2, 2));
     let rows = rows_of(&kept, MODEL);
     drop(kept);
-    assert_eq!(Arc::strong_count(&rows), 2);
+    assert_eq!(Arc::strong_count(&rows), 3);
     drop(rows);
     publish(9);
     assert_eq!(counts(), (3, 0));
@@ -689,6 +760,7 @@ fn a_pool_with_no_spare_to_write_over_takes_rows_the_writer_holds_alone() {
     // A membership write that leaves the pool its length: the pool's next
     // publication takes the rows the write retired.
     store.upsert(facts("http://z:8000", Role::Single, &["other"]));
+    store.publish_now();
     assert_eq!(counts(), (2, 1));
     publish(11);
     assert_eq!(counts(), (2, 0));
@@ -701,9 +773,11 @@ fn one_publication_holds_every_pools_folds_whichever_write_made_it() {
     let one = store
         .upsert(facts("http://a:8000", Role::Single, &["one"]))
         .id();
+    store.publish_now();
     let two = store
         .upsert(facts("http://b:8000", Role::Single, &["two"]))
         .id();
+    store.publish_now();
     let shown = |model: &str| running_in(&store.world(), model, t0);
     // The first record opens the window; one more for each pool waits.
     store.record(one, 0, load(1, 0), t0, LoadSource::Stream);
@@ -739,9 +813,11 @@ fn a_decision_racing_the_publications_reads_both_sides_of_one_publication() {
     let prefill = store
         .upsert(facts("http://p:8000", Role::Prefill, &[MODEL]))
         .id();
+    store.publish_now();
     let decode = store
         .upsert(facts("http://d:8000", Role::Decode, &[MODEL]))
         .id();
+    store.publish_now();
     // Both sides hold turn 0 before a decision looks: the first record
     // opens the window, the second waits for its end.
     store.record(prefill, 0, load(0, 0), t0, LoadSource::Stream);
@@ -993,6 +1069,7 @@ fn an_eviction_of_a_record_a_membership_write_carried_is_shown_at_once_when_no_w
         ..facts("http://a:8000", Role::Single, &[MODEL])
     };
     let id = store.upsert(registered.clone()).id();
+    store.publish_now();
     // A record of a rank the row is not: on file, in no row, so no window
     // opens for it.
     store.record(id, 1, load(9, 0), t0, LoadSource::Stream);
@@ -1004,6 +1081,7 @@ fn an_eviction_of_a_record_a_membership_write_carried_is_shown_at_once_when_no_w
         dp_rank: 1,
         ..registered
     });
+    store.publish_now();
     assert_eq!(running(&store, t0), Some(9));
     // No window ever opened, so the eviction has none to wait for.
     store.evict(id);
@@ -1108,9 +1186,36 @@ fn a_gateways_veto_masks_the_worker_for_that_gateway_until_its_end_or_its_clear(
     // without it.
     let revision = WorkersStore::get(&store, other).expect("the row").revision;
     store.remove(other, revision).expect("removed");
+    store.publish_now();
     let again = member(&store, "http://b:8000");
     assert_eq!(again, other, "the same key and incarnation is the same id");
     assert_eq!(stalled(ASKER, t0), []);
+}
+
+/// The noted write shows the world what the plain one shows: a veto set
+/// with no note behind it masks the worker for its gateway alone, a later
+/// end behind a note that stands is the end shown, and a noted clear lifts
+/// the mask.
+#[test]
+fn a_noted_veto_is_shown_and_lifted_in_the_published_world() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let vetoed = member(&store, "http://a:8000");
+    let until = t0 + Duration::from_secs(1);
+    let written = store.gateway_veto_noted(ASKER, vetoed, Some(until), false, t0);
+    assert_eq!(written, VetoWrite::Written);
+    assert_eq!(stalled(&store, ASKER, t0), [vetoed]);
+    assert_eq!(stalled(&store, GatewayId(2), t0), []);
+    assert_eq!(stalled(&store, ASKER, until), []);
+
+    let later = until + Duration::from_secs(1);
+    let written = store.gateway_veto_noted(ASKER, vetoed, Some(later), true, t0);
+    assert_eq!(written, VetoWrite::Written);
+    assert_eq!(stalled(&store, ASKER, until), [vetoed]);
+
+    let written = store.gateway_veto_noted(ASKER, vetoed, None, true, t0);
+    assert_eq!(written, VetoWrite::Written);
+    assert_eq!(stalled(&store, ASKER, t0), []);
 }
 
 #[test]
@@ -1205,9 +1310,11 @@ fn a_worker_serving_two_models_has_a_row_in_each_pool_and_one_record_reaches_bot
     let shared = store
         .upsert(facts("http://a:8000", Role::Single, &["one", "two", "one"]))
         .id();
+    store.publish_now();
     let single = store
         .upsert(facts("http://b:8000", Role::Single, &["two"]))
         .id();
+    store.publish_now();
     let world = store.world();
     // A model listed twice is one row.
     assert_eq!(world.members("one", Role::Single), Some(1));
@@ -1266,6 +1373,7 @@ fn a_new_world_carries_the_records_on_file_and_a_replaced_incarnation_starts_wit
             ..facts("http://a:8000", Role::Single, &[MODEL])
         })
         .id();
+    store.publish_now();
     assert_ne!(next, id);
     assert_eq!(of(id), None);
     assert_eq!(of(next), Some((true, None)));
@@ -1291,11 +1399,11 @@ fn a_row_carries_its_registrations_fixed_facts_and_reads_its_own_rank() {
         dp_rank: 3,
         dp_size: 4,
         wire_modes: WireModes::GRPC.union(WireModes::HTTP),
-        pair_class: 9,
         reachable_from: Reachability::Gateway(ASKER),
         ..facts(key, Role::Decode, &[MODEL])
     };
     let id = store.upsert(registered.clone()).id();
+    store.publish_now();
     let row_of = || {
         let mut out = ViewBuffers::default();
         store
@@ -1309,7 +1417,8 @@ fn a_row_carries_its_registrations_fixed_facts_and_reads_its_own_rank() {
     assert_eq!(row.role, Role::Decode);
     assert_eq!((row.dp_rank, row.dp_size), (3, 4));
     assert_eq!(row.wire_modes, WireModes::GRPC.union(WireModes::HTTP));
-    assert_eq!(row.pair_class, 9);
+    // A decode with no prefill of its model is outside any pairing.
+    assert_eq!(row.pair_class, 0);
     assert!(row.host_local);
     // The low 32 bits of the registration key's fingerprint.
     assert_eq!(row.key, fingerprint(key.as_bytes()) as u32);
@@ -1319,10 +1428,9 @@ fn a_row_carries_its_registrations_fixed_facts_and_reads_its_own_rank() {
         (0, 0, 0)
     );
     assert!(!row.has_capacity && !row.has_room && !row.health.overloaded);
-    assert_eq!(
-        (row.zone, row.labels, row.engine_kind, row.connector),
-        (0, 0, 0, 0)
-    );
+    assert_eq!(row.connector, 0);
+    // Under a generation that declares no list the listed fields read 0.
+    assert_eq!((row.zone, row.labels, row.engine_kind), (0, 0, 0));
     assert!(!row.vision && !row.ec_compatible && !row.session_hit);
 
     // The row reads the record of its own rank, never another rank's.
@@ -1336,6 +1444,7 @@ fn a_row_carries_its_registrations_fixed_facts_and_reads_its_own_rank() {
         dp_size: 8,
         ..registered
     });
+    store.publish_now();
     assert_eq!(row_of().dp_size, 8);
     assert_eq!(row_of().load.map(|load| load.running), Some(6));
     assert_eq!(store.world().epoch(), store.epoch());
@@ -1350,6 +1459,7 @@ fn a_row_carries_its_registrations_fixed_facts_and_reads_its_own_rank() {
             revision,
         )
         .expect("patched");
+    store.publish_now();
     assert_eq!(store.world().epoch(), store.epoch());
 }
 
@@ -1392,7 +1502,7 @@ fn a_probes_verdict_and_a_connect_signal_are_read_at_once() {
     assert!(!healthy());
 
     // The connect signal of a handshake-promoted worker.
-    assert!(store.connected(id, revision()).is_some());
+    assert!(store.connected(id, revision()).moved().is_some());
     assert!(healthy());
 
     // The prober takes a ready worker out after its failure threshold.
@@ -1427,6 +1537,7 @@ fn one_models_members_stand_in_the_pool_of_their_own_role() {
                 role,
                 &[MODEL],
             ));
+            store.publish_now();
         }
     }
     for (role, count) in roles {
@@ -1450,10 +1561,13 @@ fn a_veto_masks_its_workers_row_in_every_pool_it_serves() {
     let both = store
         .upsert(facts("http://a:8000", Role::Single, &["one", "two"]))
         .id();
+    store.publish_now();
     store.upsert(facts("http://b:8000", Role::Single, &["one"]));
+    store.publish_now();
     let two = store
         .upsert(facts("http://c:8000", Role::Single, &["two"]))
         .id();
+    store.publish_now();
     let masked = |model: &str| {
         let mut out = ViewBuffers::default();
         store
@@ -1486,12 +1600,13 @@ fn a_veto_beside_host_local_rows_masks_its_own_row_in_each_gateways_slice() {
     let until = t0 + Duration::from_secs(1);
     let other = GatewayId(2);
     let register = |key: &str, reachable_from: Reachability| {
-        store
-            .upsert(WorkerFacts {
+        admit(
+            &store,
+            WorkerFacts {
                 reachable_from,
                 ..facts(key, Role::Single, &[MODEL])
-            })
-            .id()
+            },
+        )
     };
     register("http://a:8000", Reachability::Any);
     let theirs = register("http://b:8000", Reachability::Gateway(other));
@@ -1518,48 +1633,62 @@ fn the_pair_door_builds_both_sides_of_one_publication() {
     let prefill = store
         .upsert(facts("http://p:8000", Role::Prefill, &[MODEL]))
         .id();
+    store.publish_now();
     let decode = store
         .upsert(facts("http://d:8000", Role::Decode, &[MODEL]))
         .id();
-    let (mut first, mut second) = (ViewBuffers::default(), ViewBuffers::default());
+    store.publish_now();
+    let mut out = PairBuffers::default();
     let (left, right) = store
-        .build_pair(MODEL, &ask(t0), &mut first, &mut second)
+        .build_pair(MODEL, &ask(t0), &mut out)
         .expect("both pools");
     assert_eq!((left.pool_size, right.pool_size), (1, 1));
     assert_eq!(left.membership_epoch, right.membership_epoch);
     assert_eq!(
-        (first.candidates[0].id, second.candidates[0].id),
+        (out.pools().prefills[0].id, out.pools().decodes[0].id),
         (prefill, decode)
     );
-    // A model served on one side alone has no pair, and neither buffer
-    // keeps a view: not the side that has members, not the last pair's;
-    // neither its rows nor, under an ask that declares it, its column.
+    assert!(!out.pools().table.is_empty());
+    // A model served on one side alone has no pair, and no buffer keeps a
+    // view: not the side that has members, not the last pair's; neither
+    // its rows, nor its table, nor, under an ask that declares it, its
+    // column.
     let with_column = Ask {
         affinity: true,
         ..ask(t0)
     };
-    let empty = |first: &ViewBuffers, second: &ViewBuffers| {
-        first.candidates.is_empty()
-            && first.affinity.is_empty()
-            && second.candidates.is_empty()
-            && second.affinity.is_empty()
+    let empty = |out: &PairBuffers| {
+        let pools = out.pools();
+        pools.prefills.is_empty()
+            && pools.prefill_affinity.is_empty()
+            && pools.decodes.is_empty()
+            && pools.decode_affinity.is_empty()
+            && pools.table.is_empty()
     };
     store.upsert(facts("http://s:8000", Role::Prefill, &["prefill-alone"]));
+    store.publish_now();
     assert_eq!(
-        store.build_pair("prefill-alone", &with_column, &mut first, &mut second),
+        store.build_pair("prefill-alone", &with_column, &mut out),
         None
     );
-    assert!(empty(&first, &second));
+    assert!(empty(&out));
     store
-        .build_pair(MODEL, &with_column, &mut first, &mut second)
+        .build_pair(MODEL, &with_column, &mut out)
         .expect("both pools");
-    assert_eq!((first.affinity.len(), second.affinity.len()), (1, 1));
-    store.upsert(facts("http://t:8000", Role::Decode, &["decode-alone"]));
     assert_eq!(
-        store.build_pair("decode-alone", &with_column, &mut first, &mut second),
+        (
+            out.pools().prefill_affinity.len(),
+            out.pools().decode_affinity.len()
+        ),
+        (1, 1)
+    );
+    store.upsert(facts("http://t:8000", Role::Decode, &["decode-alone"]));
+    store.publish_now();
+    assert_eq!(
+        store.build_pair("decode-alone", &with_column, &mut out),
         None
     );
-    assert!(empty(&first, &second));
+    assert!(empty(&out));
 }
 
 #[test]
@@ -1571,9 +1700,11 @@ fn the_pair_door_racing_the_publications_builds_both_sides_from_one_load() {
     let prefill = store
         .upsert(facts("http://p:8000", Role::Prefill, &[MODEL]))
         .id();
+    store.publish_now();
     let decode = store
         .upsert(facts("http://d:8000", Role::Decode, &[MODEL]))
         .id();
+    store.publish_now();
     // Both sides hold turn 0 before the door is asked.
     store.record(prefill, 0, load(0, 0), t0, LoadSource::Stream);
     store.record(decode, 0, load(0, 0), t0, LoadSource::Stream);
@@ -1596,13 +1727,13 @@ fn the_pair_door_racing_the_publications_builds_both_sides_from_one_load() {
             turn
         })
     };
-    let (mut first, mut second) = (ViewBuffers::default(), ViewBuffers::default());
+    let mut out = PairBuffers::default();
     let mut sides = || {
         store
-            .build_pair(MODEL, &ask(t0), &mut first, &mut second)
+            .build_pair(MODEL, &ask(t0), &mut out)
             .expect("both pools");
-        let running = |side: &ViewBuffers| side.candidates[0].load.map(|load| load.running);
-        (running(&first), running(&second))
+        let running = |side: &[Candidate]| side[0].load.map(|load| load.running);
+        (running(out.pools().prefills), running(out.pools().decodes))
     };
     // The case ends at an event, the door read across `SEEN` publications,
     // and holds the door's rule at every read: one load of the world feeds
@@ -1639,14 +1770,15 @@ fn two_ranks_that_push_at_two_instants_are_each_aged_from_their_own() {
     let store = MemoryStore::new();
     let t0 = Instant::now();
     let rank = |rank: u16| {
-        store
-            .upsert(WorkerFacts {
+        admit(
+            &store,
+            WorkerFacts {
                 engine: "grpc://e:9000".to_string(),
                 dp_rank: rank,
                 dp_size: 2,
                 ..facts(&format!("grpc://e:9000@{rank}"), Role::Single, &[MODEL])
-            })
-            .id()
+            },
+        )
     };
     let (first, second) = (rank(0), rank(1));
     let ages = |now: Instant| {
@@ -1699,7 +1831,7 @@ fn a_publication_before_a_departing_workers_row_leaves_still_shows_its_veto() {
     };
     let leaving = WorkerId(1);
     let mut writer = Writer::new(PUBLISH_WINDOW, origin);
-    writer.rebuild(1, members.iter(), |_, _| None);
+    writer.rebuild(1, members.iter(), |_, _| None, Classes::Derive);
     let vetoed = writer
         .veto(ASKER, leaving, Some(t0 + Duration::from_secs(60)))
         .expect("a new veto");
@@ -1709,11 +1841,11 @@ fn a_publication_before_a_departing_workers_row_leaves_still_shows_its_veto() {
     let between = writer.publish_window(t0);
     assert_eq!(masked(&between), [leaving]);
     // The membership write takes the row and its vetoes out together,
-    let after = writer.rebuild(2, members[1..].iter(), |_, _| None);
+    let after = writer.rebuild(2, members[1..].iter(), |_, _| None, Classes::Derive);
     assert_eq!(after.members(MODEL, Role::Single), Some(1));
     assert_eq!(masked(&after), []);
     // and the same id registered again starts without them.
-    let again = writer.rebuild(3, members.iter(), |_, _| None);
+    let again = writer.rebuild(3, members.iter(), |_, _| None, Classes::Derive);
     assert_eq!(again.members(MODEL, Role::Single), Some(2));
     assert_eq!(masked(&again), []);
 }
@@ -1739,6 +1871,7 @@ fn a_departing_workers_vetoes_leave_alone_and_every_other_veto_stands() {
         .expect("the row")
         .revision;
     store.remove(leaving, revision).expect("removed");
+    store.publish_now();
     // The membership write drops the vetoes on the worker that left and no
     // other: the rest of that gateway's list stands, and so does the list
     // that named members alone.
@@ -1950,7 +2083,7 @@ fn a_spare_of_another_length_is_left_and_the_publication_allocates() {
         row_serving(2, &[MODEL], origin),
     ];
     let mut writer = Writer::new(PUBLISH_WINDOW, origin);
-    writer.rebuild(1, members.iter(), |_, _| None);
+    writer.rebuild(1, members.iter(), |_, _| None, Classes::Derive);
     // No write leaves a pool a spare of another length: one is planted,
     // the rows of a pool of one, held by the pool alone.
     writer.spares[0] = Some(Arc::from(&writer.working[0].rows[..1]));
@@ -1977,7 +2110,7 @@ fn a_membership_write_leaves_the_writers_lists_at_one_slot_a_pool() {
     ];
     let mut writer = Writer::new(PUBLISH_WINDOW, origin);
     for epoch in 1..=4 {
-        writer.rebuild(epoch, members.iter(), |_, _| None);
+        writer.rebuild(epoch, members.iter(), |_, _| None, Classes::Derive);
         // Two models, a pool each: one slot a pool in each list, however
         // many membership writes came before.
         assert_eq!(
@@ -2013,7 +2146,7 @@ fn a_vetos_write_builds_its_own_gateways_run_and_shares_every_other() {
         })
         .collect();
     let mut writer = Writer::new(PUBLISH_WINDOW, origin);
-    writer.rebuild(1, members.iter(), |_, _| None);
+    writer.rebuild(1, members.iter(), |_, _| None, Classes::Derive);
     let (writing, other) = (GatewayId(3), GatewayId(7));
     for (gateway, id) in [(other, 2), (other, 6), (writing, 3)] {
         writer
@@ -2090,7 +2223,7 @@ fn the_runs_each_write_leaves_are_the_runs_a_derive_builds_again() {
         .collect();
     let mut present = [true; 12];
     let mut writer = Writer::new(PUBLISH_WINDOW, origin);
-    writer.rebuild(1, all.iter(), |_, _| None);
+    writer.rebuild(1, all.iter(), |_, _| None, Classes::Derive);
     // A fixed sequence: the case makes the same writes at every run.
     let mut state = 0x9E37_79B9_7F4A_7C15_u64;
     let mut next = |bound: u64| {
@@ -2112,7 +2245,7 @@ fn the_runs_each_write_leaves_are_the_runs_a_derive_builds_again() {
                     .iter()
                     .zip(present)
                     .filter_map(|(row, here)| here.then_some(row));
-                writer.rebuild(step + 2, members, |_, _| None);
+                writer.rebuild(step + 2, members, |_, _| None, Classes::Derive);
             }
             // A window's publication, which drops what its instant ended.
             1 => {
@@ -2177,9 +2310,26 @@ fn a_seek_from_any_place_finds_what_a_search_of_the_whole_list_finds() {
 
 /// A document that validates, under the generation `number`.
 fn generation(number: u64) -> AppliedSpec {
+    generation_pairing(number, Pairing::default())
+}
+
+/// A document that validates, under the generation `number`, whose pair
+/// plan names the pairing `mode`.
+fn generation_pairing(number: u64, mode: Pairing) -> AppliedSpec {
     let mut document = PolicySpec::preset("round_robin").expect("a preset of this build");
     document.generation = number;
+    document.plans.pd_pair.pairing = mode;
     AppliedSpec::validate(&document).expect("a preset validates")
+}
+
+/// A store under a first generation whose document names the pairing
+/// `mode`: the one way a store takes a mode.
+fn store_pairing(mode: Pairing) -> MemoryStore {
+    let store = MemoryStore::new();
+    store
+        .apply(generation_pairing(1, mode))
+        .expect("the first generation");
+    store
 }
 
 #[test]
@@ -2251,26 +2401,60 @@ fn a_generation_outlives_its_last_world_until_the_next_apply_hands_it_back() {
     let mut writer = Writer::new(PUBLISH_WINDOW, Instant::now());
     let first = Arc::new(generation(1));
     let held = Arc::downgrade(&first);
-    let (world, before) = writer.apply(first).expect("above the unbound start");
+    let (world, before) = writer
+        .apply(first, 0, std::iter::empty(), |_, _| None)
+        .expect("above the unbound start");
     assert!(before.is_none(), "nothing was kept before the first apply");
     // A reader still holds a world of generation 1 when the next is
-    // applied; the unbound start, kept since the first apply, is handed
-    // back.
+    // applied and the cell lets that world go; the unbound start, kept
+    // since the first apply, is handed back.
+    let reader = Arc::clone(&world);
     let (_, before) = writer
-        .apply(Arc::new(generation(2)))
+        .apply(Arc::new(generation(2)), 0, std::iter::empty(), |_, _| None)
         .expect("above the standing one");
     assert_eq!(before.map(|spec| spec.generation()), Some(0));
-    // The reader lets its world go: the writer keeps the generation, so
-    // the reader frees no engine.
-    drop(world);
-    assert_eq!(held.strong_count(), 1, "kept by the writer alone");
-    // The next apply hands it back, and the caller's drop is its end.
+    writer.replaced(world);
+    // The reader lets its world go: the writer keeps the generation, and
+    // the world too until a publication lets it go, so the reader frees
+    // no engine. Both holds are the writer's.
+    drop(reader);
+    assert_eq!(held.strong_count(), 2, "kept by the writer alone");
+    // The next apply lets the world go and hands the generation back, and
+    // the caller's drop is its end.
     let (_, before) = writer
-        .apply(Arc::new(generation(3)))
+        .apply(Arc::new(generation(3)), 0, std::iter::empty(), |_, _| None)
         .expect("above the standing one");
     let before = before.expect("the generation before the last");
     assert_eq!((before.generation(), held.strong_count()), (1, 1));
     drop(before);
+    assert_eq!(held.strong_count(), 0);
+}
+
+#[test]
+fn a_world_held_across_two_applies_takes_its_generation_to_a_publication() {
+    let mut writer = Writer::new(PUBLISH_WINDOW, Instant::now());
+    let first = Arc::new(generation(1));
+    let held = Arc::downgrade(&first);
+    let (world, _) = writer
+        .apply(first, 0, std::iter::empty(), |_, _| None)
+        .expect("above the unbound start");
+    // A reader holds the world the cell lets go at the next apply.
+    let reader = Arc::clone(&world);
+    let applied = writer.apply(Arc::new(generation(2)), 0, std::iter::empty(), |_, _| None);
+    drop(applied.expect("above the standing one"));
+    writer.replaced(world);
+    let applied = writer.apply(Arc::new(generation(3)), 0, std::iter::empty(), |_, _| None);
+    drop(applied.expect("above the standing one"));
+    // The second apply handed the generation back and its caller let it
+    // go: the reader's world alone holds it now.
+    assert_eq!(held.strong_count(), 1);
+    // The reader frees no engine all the same: the writer lists its world,
+    // and the engine goes with it at the publication that finds no reader
+    // holding it, here the next apply's.
+    drop(reader);
+    assert_eq!(held.strong_count(), 1);
+    let applied = writer.apply(Arc::new(generation(4)), 0, std::iter::empty(), |_, _| None);
+    drop(applied.expect("above the standing one"));
     assert_eq!(held.strong_count(), 0);
 }
 
@@ -2306,19 +2490,895 @@ fn the_pair_door_builds_no_decode_side_beside_an_empty_prefill_pool() {
     let store = MemoryStore::new();
     let t0 = Instant::now();
     let _decode = store.upsert(facts("http://d:8000", Role::Decode, &[MODEL]));
-    let (mut prefill, mut decode) = (ViewBuffers::default(), ViewBuffers::default());
-    assert_eq!(
-        store.build_pair(MODEL, &ask(t0), &mut prefill, &mut decode),
-        None
-    );
+    store.publish_now();
+    let mut out = PairBuffers::default();
+    assert_eq!(store.build_pair(MODEL, &ask(t0), &mut out), None);
     // The decode pool has a member and its buffer never grew: the door
     // stopped at the prefill pool it did not find.
-    assert_eq!(decode.candidates.capacity(), 0);
+    assert_eq!(out.decode.candidates.capacity(), 0);
     let _prefill = store.upsert(facts("http://p:8000", Role::Prefill, &[MODEL]));
-    assert!(store
-        .build_pair(MODEL, &ask(t0), &mut prefill, &mut decode)
-        .is_some());
-    assert_eq!((prefill.candidates.len(), decode.candidates.len()), (1, 1));
+    store.publish_now();
+    assert!(store.build_pair(MODEL, &ask(t0), &mut out).is_some());
+    assert_eq!(
+        (out.prefill.candidates.len(), out.decode.candidates.len()),
+        (1, 1)
+    );
+}
+
+/// One decision's view of one side of the model's pair.
+fn side(store: &MemoryStore, role: Role, ask: &Ask) -> (Vec<Candidate>, Vec<AffinityFacts>, Built) {
+    let mut out = ViewBuffers::default();
+    let built = store
+        .build_view(MODEL, role, ask, &mut out)
+        .expect("the pool");
+    (out.candidates, out.affinity, built)
+}
+
+/// A prefill or decode of the model on the runtime-specific side, of one
+/// known runtime, that names its KV transport or none.
+fn pair_facts(key: &str, role: Role, transport: Option<&str>) -> WorkerFacts {
+    WorkerFacts {
+        wire_modes: WireModes::GRPC,
+        engine_kind: "rt-a".to_string(),
+        pairing: transport.map(|transport| {
+            Arc::new(PairingDescriptor {
+                transport: Some(transport.to_string()),
+                ..PairingDescriptor::default()
+            })
+        }),
+        ..facts(key, role, &[MODEL])
+    }
+}
+
+/// The id and the class of each row, in the rows' order.
+fn classes(rows: &[Candidate]) -> Vec<(WorkerId, u32)> {
+    rows.iter().map(|row| (row.id, row.pair_class)).collect()
+}
+
+/// The class on the row of worker `id`.
+fn class_of(rows: &[Candidate], id: WorkerId) -> u32 {
+    let row = rows.iter().find(|row| row.id == id);
+    row.expect("the worker's row").pair_class
+}
+
+fn sorted(mut ids: Vec<WorkerId>) -> Vec<WorkerId> {
+    ids.sort_unstable();
+    ids
+}
+
+/// Two prefills of two transports and three decodes, one of each transport
+/// and one that names none: leniently the silent decode pairs with both
+/// prefills, one row of one class that both prefill classes list. The
+/// prefills, then the decodes of the first transport, of the second and the
+/// silent one.
+fn two_classes(store: &MemoryStore) -> ([WorkerId; 2], [WorkerId; 3]) {
+    let member = |key: &str, role: Role, transport: Option<&str>| {
+        admit(store, pair_facts(key, role, transport))
+    };
+    let prefills = [
+        member("grpc://pa:9000", Role::Prefill, Some("tx-a")),
+        member("grpc://pb:9000", Role::Prefill, Some("tx-b")),
+    ];
+    let decodes = [
+        member("grpc://da:9000", Role::Decode, Some("tx-a")),
+        member("grpc://db:9000", Role::Decode, Some("tx-b")),
+        member("grpc://dn:9000", Role::Decode, None),
+    ];
+    (prefills, decodes)
+}
+
+/// A pair plan whose stages read nothing of a row but its class and whether
+/// the host excluded it.
+const PAIR_PLAN: &str = r#"{
+  "apiVersion": "smg.policy/v1",
+  "profiles": { "p": { "filter": ["not-tried"], "pick": "best" } },
+  "bindings": [
+    { "match": { "phase": ["prefill", "decode"] }, "plan": "pd-pair", "profiles": { "prefill": "p", "decode": "p" } }
+  ]
+}"#;
+
+/// How a pair decision is handed which classes pair.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pairs {
+    /// As the door hands them: the rows and the table.
+    ByTable,
+    /// The door's rows with no table: a class pairs with its own number.
+    ByNumber,
+}
+
+/// The decodes the engine's pair entry pairs `prefill` with over what the
+/// store's pair door builds for `ask`, sorted by id: one decision after
+/// another, every other prefill excluded and each decode already drawn
+/// excluded from the next. The exclusion is soft, so the draws end when the
+/// entry has nobody new to pair: it pairs another prefill, or a decode
+/// again, or nobody.
+fn partners_drawn(
+    store: &MemoryStore,
+    ask: &Ask,
+    prefill: WorkerId,
+    pairs: Pairs,
+) -> Vec<WorkerId> {
+    let spec: PolicySpec = serde_json::from_str(PAIR_PLAN).expect("a well-formed document");
+    let engine = spec.validate().expect("the engine");
+    let (mut out, mut scratch) = (PairBuffers::default(), Scratch::new());
+    let mut drawn = Vec::new();
+    loop {
+        let (built, _) = store.build_pair(MODEL, ask, &mut out).expect("both pools");
+        let others: Vec<WorkerId> = classes(out.pools().prefills)
+            .into_iter()
+            .map(|(id, _)| id)
+            .filter(|&id| id != prefill)
+            .collect();
+        let request = RequestFacts {
+            model: MODEL,
+            phase: Phase::Prefill,
+            now_micros: built.now_micros,
+            ..RequestFacts::default()
+        };
+        let pools = match pairs {
+            Pairs::ByTable => out.pools(),
+            Pairs::ByNumber => PairPools {
+                table: PairTable::default(),
+                ..out.pools()
+            },
+        };
+        let decision = engine.decide_pair(
+            &request,
+            &built.pool_facts(),
+            pools,
+            &Constraints {
+                excluded: &others,
+                ..Constraints::default()
+            },
+            &Constraints {
+                excluded: &drawn,
+                ..Constraints::default()
+            },
+            &mut scratch,
+        );
+        let target = decision
+            .pick()
+            .and_then(|pick| pick.targets.first().copied());
+        let decode = target
+            .filter(|target| target.id == prefill)
+            .and_then(|target| target.pair)
+            .map(|pair| pair.decode_id)
+            .filter(|decode| !drawn.contains(decode));
+        match decode {
+            Some(decode) => drawn.push(decode),
+            None => return sorted(drawn),
+        }
+    }
+}
+
+/// The step's one sentence: a pair built from the store pairs through the
+/// engine's pair entry. Before, no row carried a class and the entry paired
+/// nobody.
+#[test]
+fn a_pair_built_from_the_store_pairs_through_the_engines_pair_entry() {
+    let store = MemoryStore::new();
+    let now = Instant::now();
+    two_classes(&store);
+    let spec: PolicySpec = serde_json::from_str(PAIR_PLAN).expect("a well-formed document");
+    let engine = spec.validate().expect("the engine");
+    let (mut out, mut scratch) = (PairBuffers::default(), Scratch::new());
+    let (built, _) = store
+        .build_pair(MODEL, &ask(now), &mut out)
+        .expect("both pools");
+    let request = RequestFacts {
+        model: MODEL,
+        phase: Phase::Prefill,
+        now_micros: built.now_micros,
+        ..RequestFacts::default()
+    };
+    let decision = engine.decide_pair(
+        &request,
+        &built.pool_facts(),
+        out.pools(),
+        &Constraints::default(),
+        &Constraints::default(),
+        &mut scratch,
+    );
+    assert!(decision.pick().is_some(), "the pair routes: {decision:?}");
+}
+
+#[test]
+fn the_pair_door_hands_the_table_its_rows_classes_are_numbered_for() {
+    let store = MemoryStore::new();
+    let now = Instant::now();
+    let ([pa, pb], [da, db, dn]) = two_classes(&store);
+    // A prefill of another runtime: no decode pairs with it, so the entry
+    // pairs another prefill before it.
+    let apart = store
+        .upsert(WorkerFacts {
+            engine_kind: "rt-b".to_string(),
+            ..pair_facts("grpc://px:9000", Role::Prefill, None)
+        })
+        .id();
+    store.publish_now();
+
+    // Through the door a prefill pairs with the decode of its transport and
+    // with the silent one, and with no other.
+    let drawn = |prefill: WorkerId, pairs: Pairs| partners_drawn(&store, &ask(now), prefill, pairs);
+    assert_eq!(drawn(pa, Pairs::ByTable), sorted(vec![da, dn]));
+    assert_eq!(drawn(pb, Pairs::ByTable), sorted(vec![db, dn]));
+    assert_eq!(drawn(apart, Pairs::ByTable), []);
+    // The table is what says so. Each side's classes are numbered by
+    // themselves, so by its number alone a prefill class meets one decode
+    // class, never its two.
+    assert_eq!(drawn(pa, Pairs::ByNumber).len(), 1);
+    assert_eq!(drawn(pb, Pairs::ByNumber).len(), 1);
+}
+
+#[test]
+fn a_worker_has_one_row_of_one_class_and_the_world_holds_which_classes_pair() {
+    let store = MemoryStore::new();
+    let now = Instant::now();
+    let ([pa, pb], [da, db, dn]) = two_classes(&store);
+    // A decode of another runtime: no prefill pairs with it.
+    let apart = store
+        .upsert(WorkerFacts {
+            engine_kind: "rt-b".to_string(),
+            ..pair_facts("grpc://dx:9000", Role::Decode, None)
+        })
+        .id();
+    store.publish_now();
+
+    // One row a worker on each side: the silent decode pairs with both
+    // prefills and is still one row, with one position and one column entry.
+    let (prefills, _, built) = side(&store, Role::Prefill, &ask(now));
+    assert_eq!(built.pool_size, 2);
+    let with_column = Ask {
+        affinity: true,
+        ..ask(now)
+    };
+    let (decodes, column, built) = side(&store, Role::Decode, &with_column);
+    assert_eq!((built.pool_size, column.len()), (4, 4));
+    assert_eq!(
+        decodes.iter().map(|row| row.position).collect::<Vec<_>>(),
+        [0, 1, 2, 3]
+    );
+
+    // Each side's classes are numbered as their first worker comes in id
+    // order; the decode no prefill pairs with is class 0 and takes no number.
+    let numbered = |ids: &[WorkerId]| -> Vec<(WorkerId, u32)> {
+        sorted(ids.to_vec()).into_iter().zip(1..).collect()
+    };
+    assert_eq!(classes(&prefills), numbered(&[pa, pb]));
+    let mut expected = numbered(&[da, db, dn]);
+    expected.push((apart, 0));
+    expected.sort_unstable();
+    assert_eq!(classes(&decodes), expected);
+
+    // The world holds what the rows were written from: a prefill class
+    // lists the class of its transport's decode and the silent decode's.
+    let world = store.world();
+    let pairs = world.pairs(MODEL).expect("the model's classes");
+    assert_eq!((pairs.classes(), pairs.pairs()), (2, 4));
+    for (prefill, partners) in [(pa, [da, dn]), (pb, [db, dn])] {
+        let mut listed = partners.map(|id| class_of(&decodes, id));
+        listed.sort_unstable();
+        assert_eq!(pairs.table().of(&class_of(&prefills, prefill)), listed);
+    }
+    assert_eq!(pairs.refusal(WireModes::GRPC), None);
+    assert!(world.pairs("other").is_none());
+}
+
+#[test]
+fn a_pool_less_another_gateways_host_local_rows_pairs_by_the_same_table() {
+    let store = MemoryStore::new();
+    let now = Instant::now();
+    let other = GatewayId(2);
+    let prefill =
+        |key: &str, transport: &str| admit(&store, pair_facts(key, Role::Prefill, Some(transport)));
+    let (pa, pb) = (
+        prefill("grpc://pa:9000", "tx-a"),
+        prefill("grpc://pb:9000", "tx-b"),
+    );
+    // Host-local decodes of each gateway on the first transport, and a
+    // silent decode every gateway dials.
+    let local = |key: String, gateway: GatewayId| {
+        let registered = WorkerFacts {
+            reachable_from: Reachability::Gateway(gateway),
+            ..pair_facts(&key, Role::Decode, Some("tx-a"))
+        };
+        admit(&store, registered)
+    };
+    let of_other: Vec<WorkerId> = (0..4)
+        .map(|index| local(format!("ipc://o{index}"), other))
+        .collect();
+    let of_asker: Vec<WorkerId> = (0..4)
+        .map(|index| local(format!("ipc://a{index}"), ASKER))
+        .collect();
+    let dn = store
+        .upsert(pair_facts("grpc://dn:9000", Role::Decode, None))
+        .id();
+    store.publish_now();
+
+    let world = store.world();
+    let held = world.pairs(MODEL).expect("the model's classes");
+    let lists = |table: PairTable<'_>| -> Vec<Vec<u32>> {
+        (1..=held.classes())
+            .map(|class| table.of(&class).to_vec())
+            .collect()
+    };
+    for (gateway, own) in [(ASKER, &of_asker), (other, &of_other)] {
+        let asked = Ask {
+            gateway,
+            ..ask(now)
+        };
+        // The gateway's decode pool is its own host-local rows and the
+        // shared one. A row's position is the gateway's own; its class and
+        // the table are the world's.
+        let mut out = PairBuffers::default();
+        store
+            .build_pair(MODEL, &asked, &mut out)
+            .expect("both pools");
+        let mut reached = own.clone();
+        reached.push(dn);
+        let rows = classes(out.pools().decodes);
+        assert_eq!(
+            rows.iter().map(|&(id, _)| id).collect::<Vec<_>>(),
+            sorted(reached.clone()),
+            "{gateway:?}"
+        );
+        assert!(
+            rows.iter().all(|row| held.decodes().contains(row)),
+            "{gateway:?}"
+        );
+        assert_eq!(lists(out.pools().table), lists(held.table()), "{gateway:?}");
+
+        // The first transport's prefill pairs with every decode the gateway
+        // reaches, the second's with the silent one alone.
+        let drawn = |prefill: WorkerId| partners_drawn(&store, &asked, prefill, Pairs::ByTable);
+        assert_eq!(drawn(pa), sorted(reached), "{gateway:?}");
+        assert_eq!(drawn(pb), [dn], "{gateway:?}");
+    }
+}
+
+#[test]
+fn the_classes_follow_the_membership_and_are_each_models_own() {
+    let store = MemoryStore::new();
+    let now = Instant::now();
+    let class_in = |model: &str, role: Role, id: WorkerId| {
+        let mut out = ViewBuffers::default();
+        store.build_view(model, role, &ask(now), &mut out)?;
+        let row = out.candidates.iter().find(|row| row.id == id)?;
+        Some(row.pair_class)
+    };
+    // A prefill of two models and no decode: outside any pairing in both.
+    let prefill = store
+        .upsert(facts("grpc://p:9000", Role::Prefill, &[MODEL, "other"]))
+        .id();
+    store.publish_now();
+    assert_eq!(class_in(MODEL, Role::Prefill, prefill), Some(0));
+    assert!(store.world().pairs(MODEL).is_none());
+
+    // A decode of one of the two models arrives: a class in that model.
+    let decode = store
+        .upsert(facts("grpc://d:9000", Role::Decode, &[MODEL]))
+        .id();
+    store.publish_now();
+    assert_eq!(class_in(MODEL, Role::Prefill, prefill), Some(1));
+    assert_eq!(class_in(MODEL, Role::Decode, decode), Some(1));
+    assert_eq!(class_in("other", Role::Prefill, prefill), Some(0));
+    let world = store.world();
+    assert_eq!(world.pairs(MODEL).map(|pairs| pairs.classes()), Some(1));
+    assert!(world.pairs("other").is_none());
+
+    // It leaves: the prefill is outside any pairing again.
+    let revision = WorkersStore::get(&store, decode).expect("the row").revision;
+    store.remove(decode, revision).expect("removed");
+    store.publish_now();
+    assert_eq!(class_in(MODEL, Role::Prefill, prefill), Some(0));
+    assert!(store.world().pairs(MODEL).is_none());
+
+    // A decode no prefill pairs with: no class, and the world says why.
+    let apart = store
+        .upsert(WorkerFacts {
+            engine_kind: "rt-b".to_string(),
+            ..facts("grpc://e:9000", Role::Decode, &[MODEL])
+        })
+        .id();
+    store.publish_now();
+    store.upsert(WorkerFacts {
+        engine_kind: "rt-a".to_string(),
+        ..facts("grpc://p:9000", Role::Prefill, &[MODEL, "other"])
+    });
+    store.publish_now();
+    assert_eq!(class_in(MODEL, Role::Prefill, prefill), Some(0));
+    assert_eq!(class_in(MODEL, Role::Decode, apart), Some(0));
+    let world = store.world();
+    let pairs = world.pairs(MODEL).expect("both pools hold a worker");
+    assert_eq!(pairs.classes(), 0);
+    assert_eq!(
+        pairs.refusal(WireModes::NONE),
+        Some(&Refusal {
+            prefill: vec!["rt-a/?/?".to_string()],
+            decode: vec!["rt-b/?/?".to_string()],
+            mismatches: vec!["runtime".to_string()],
+        })
+    );
+}
+
+#[test]
+fn two_stores_fed_one_membership_in_two_orders_number_its_classes_alike_under_each_mode() {
+    // Three prefills of three transports; a decode of each of two of them
+    // and one that names none.
+    let fleet = [
+        ("grpc://pa:9000", Role::Prefill, Some("tx-a")),
+        ("grpc://pb:9000", Role::Prefill, Some("tx-b")),
+        ("grpc://pc:9000", Role::Prefill, Some("tx-c")),
+        ("grpc://da:9000", Role::Decode, Some("tx-a")),
+        ("grpc://db:9000", Role::Decode, Some("tx-b")),
+        ("grpc://dn:9000", Role::Decode, None),
+    ];
+    let now = Instant::now();
+    // The prefill classes, the decode classes and the prefills outside any
+    // pairing.
+    let expected = [
+        (Pairing::Off, 1, 1, 0),
+        (Pairing::Lenient, 3, 3, 0),
+        (Pairing::Strict, 2, 2, 1),
+    ];
+    for (mode, prefill_classes, decode_classes, unpaired) in expected {
+        let fed = |order: &mut dyn Iterator<Item = &(&str, Role, Option<&str>)>| {
+            let store = store_pairing(mode);
+            for &(key, role, transport) in order {
+                store.upsert(pair_facts(key, role, transport));
+                store.publish_now();
+            }
+            store
+        };
+        let (one, other) = (fed(&mut fleet.iter()), fed(&mut fleet.iter().rev()));
+        let (prefills, _, _) = side(&one, Role::Prefill, &ask(now));
+        let (decodes, _, _) = side(&one, Role::Decode, &ask(now));
+        // One row a worker, whatever the mode pairs.
+        assert_eq!((prefills.len(), decodes.len()), (3, 3), "{mode:?}");
+        let largest = |rows: &[Candidate]| rows.iter().map(|row| row.pair_class).max();
+        assert_eq!(largest(&decodes), Some(decode_classes), "{mode:?}");
+        assert_eq!(
+            prefills.iter().filter(|row| row.pair_class == 0).count(),
+            unpaired,
+            "{mode:?}"
+        );
+        let world = one.world();
+        let pairs = world.pairs(MODEL).expect("the model's classes");
+        assert_eq!(pairs.classes(), prefill_classes, "{mode:?}");
+
+        // The other store numbers every class alike, row for row, and holds
+        // the same table.
+        assert_eq!(
+            classes(&side(&other, Role::Prefill, &ask(now)).0),
+            classes(&prefills),
+            "{mode:?}"
+        );
+        assert_eq!(
+            classes(&side(&other, Role::Decode, &ask(now)).0),
+            classes(&decodes),
+            "{mode:?}"
+        );
+        assert_eq!(other.world().pairs(MODEL), Some(pairs), "{mode:?}");
+    }
+}
+
+#[test]
+fn a_generation_of_another_pairing_mode_derives_the_classes_again_at_the_same_epoch() {
+    let store = MemoryStore::new();
+    let now = Instant::now();
+    // A prefill and a decode of two known runtimes on the plain wire: a
+    // comparing mode refuses the pair, off compares nothing of the handoff.
+    for (key, role, runtime) in [
+        ("w://p:1", Role::Prefill, "rt-a"),
+        ("w://d:1", Role::Decode, "rt-b"),
+    ] {
+        store.upsert(WorkerFacts {
+            wire_modes: WireModes::HTTP,
+            engine_kind: runtime.to_string(),
+            ..facts(key, role, &[MODEL])
+        });
+        store.publish_now();
+    }
+    let class = || side(&store, Role::Prefill, &ask(now)).0[0].pair_class;
+    // The prefill's load record on file, as its row carries it.
+    let record = || {
+        let row = side(&store, Role::Prefill, &ask(now)).0[0];
+        (
+            row.load_sampled_at_micros,
+            row.load.map(|load| load.running),
+        )
+    };
+    let prefill = side(&store, Role::Prefill, &ask(now)).0[0].id;
+    store.record(prefill, 0, load(3, 0), now, LoadSource::Stream);
+    let on_file = record();
+    assert_eq!(on_file.1, Some(3));
+    let epoch = store.epoch();
+    let unbound = store.world();
+    assert_eq!(class(), 0, "the unbound generation holds the default mode");
+
+    // A generation of the standing mode publishes the rows as they are:
+    // what the membership derived is shared, by pointer.
+    store.apply(generation(1)).expect("the first generation");
+    let first = store.world();
+    assert!(Arc::ptr_eq(&unbound.derived, &first.derived));
+    assert_eq!((first.epoch(), first.spec().generation()), (epoch, 1));
+    assert_eq!(class(), 0);
+
+    // A generation of another mode, with no member moved: the classes are
+    // derived again and published once under the new generation.
+    store
+        .apply(generation_pairing(2, Pairing::Off))
+        .expect("above the first");
+    let second = store.world();
+    assert!(!Arc::ptr_eq(&first.derived, &second.derived));
+    assert_eq!(class(), 1);
+    assert_eq!(second.pairs(MODEL).map(|pairs| pairs.classes()), Some(1));
+    assert_eq!(second.spec().generation(), 2);
+    // Each row is derived with its load record on file.
+    assert_eq!(record(), on_file);
+    // The epoch is the membership's: it reads the same in the store and on
+    // the world, and a watcher that saw it is told nothing.
+    assert_eq!((store.epoch(), second.epoch()), (epoch, epoch));
+    assert_eq!(
+        store.changes_since(epoch),
+        MembershipTail::Changes(Vec::new())
+    );
+    // The world a decision took before the apply keeps its own classes.
+    assert_eq!(first.pairs(MODEL).map(|pairs| pairs.classes()), Some(0));
+
+    // A membership write under the new mode derives under it,
+    store.upsert(WorkerFacts {
+        wire_modes: WireModes::HTTP,
+        engine_kind: "rt-b".to_string(),
+        ..facts("w://d:2", Role::Decode, &[MODEL])
+    });
+    store.publish_now();
+    assert_eq!(class(), 1);
+    assert_eq!(store.epoch(), epoch + 1);
+    // and a refused generation changes no class.
+    assert!(store.apply(generation_pairing(2, Pairing::Strict)).is_err());
+    assert_eq!(class(), 1);
+    store
+        .apply(generation_pairing(3, Pairing::Lenient))
+        .expect("above the second");
+    assert_eq!(class(), 0);
+    assert_eq!(store.epoch(), epoch + 1);
+}
+
+#[test]
+fn the_store_hands_the_rule_each_workers_wires_and_its_own_mode() {
+    let now = Instant::now();
+    // A prefill and a decode of two known runtimes, both on `wires`, in a
+    // store of `mode`: the class of the prefill's row.
+    let class = |mode: Pairing, wires: WireModes| {
+        let store = store_pairing(mode);
+        for (key, role, runtime) in [
+            ("w://p:1", Role::Prefill, "rt-a"),
+            ("w://d:1", Role::Decode, "rt-b"),
+        ] {
+            store.upsert(WorkerFacts {
+                wire_modes: wires,
+                engine_kind: runtime.to_string(),
+                ..facts(key, role, &[MODEL])
+            });
+            store.publish_now();
+        }
+        side(&store, Role::Prefill, &ask(now)).0[0].pair_class
+    };
+    // Off compares nothing of the handoff: the two pair on the plain wire.
+    assert_eq!(class(Pairing::Off, WireModes::HTTP), 1);
+    // A comparing mode refuses them there, and no mode pairs them where a
+    // pair shares a runtime.
+    assert_eq!(class(Pairing::Lenient, WireModes::HTTP), 0);
+    assert_eq!(class(Pairing::Off, WireModes::GRPC), 0);
+
+    // A prefill and a decode on two sides of the wire's fact never pair,
+    // and nothing is refused: neither side holds both pools.
+    let store = store_pairing(Pairing::Off);
+    for (key, role, wires) in [
+        ("http://p:1", Role::Prefill, WireModes::HTTP),
+        ("grpc://d:1", Role::Decode, WireModes::GRPC),
+    ] {
+        store.upsert(WorkerFacts {
+            wire_modes: wires,
+            ..facts(key, role, &[MODEL])
+        });
+        store.publish_now();
+    }
+    assert_eq!(side(&store, Role::Prefill, &ask(now)).0[0].pair_class, 0);
+    assert_eq!(side(&store, Role::Decode, &ask(now)).0[0].pair_class, 0);
+    let world = store.world();
+    let pairs = world.pairs(MODEL).expect("both pools hold a worker");
+    assert_eq!(pairs.classes(), 0);
+    assert_eq!(
+        (
+            pairs.refusal(WireModes::HTTP),
+            pairs.refusal(WireModes::GRPC)
+        ),
+        (None, None)
+    );
+}
+
+/// The id and the class of every prefill row and then every decode row of
+/// the model, as views built from the store's world of this instant read
+/// them.
+fn pair_rows(store: &MemoryStore) -> Vec<(WorkerId, u32)> {
+    let mut out = ViewBuffers::default();
+    let mut rows = Vec::new();
+    for role in [Role::Prefill, Role::Decode] {
+        let built = store.build_view(MODEL, role, &ask(Instant::now()), &mut out);
+        if built.is_some() {
+            rows.extend(classes(&out.candidates));
+        }
+    }
+    rows
+}
+
+#[test]
+fn a_membership_write_that_moves_no_offer_carries_the_classes() {
+    let store = MemoryStore::new();
+    let (prefills, _) = two_classes(&store);
+    // The world is kept, so its classes stand where they are: one address
+    // in a later world is those classes carried, never others in their
+    // place.
+    let before = store.world();
+    let derived = before.pairs(MODEL).expect("the model's classes");
+    let rows = pair_rows(&store);
+    let carried = |what: &str| {
+        let world = store.world();
+        let pairs = world.pairs(MODEL).expect("the model's classes");
+        assert!(std::ptr::eq(derived, pairs), "{what}: derived again");
+        assert_eq!(pair_rows(&store), rows, "{what}");
+        world.epoch()
+    };
+    // The same registration again: a membership write all the same.
+    store.upsert(pair_facts("grpc://pa:9000", Role::Prefill, Some("tx-a")));
+    store.publish_now();
+    assert!(carried("the same facts") > before.epoch());
+    // Facts no pair reads.
+    store.upsert(WorkerFacts {
+        zone: Some("z".to_string()),
+        max_running: Some(9),
+        priority: 2,
+        ..pair_facts("grpc://pa:9000", Role::Prefill, Some("tx-a"))
+    });
+    store.publish_now();
+    carried("facts no pair reads");
+    // A patch moves labels, a priority and an overload alone.
+    let revision = WorkersStore::get(&store, prefills[0])
+        .expect("the row")
+        .revision;
+    let patch = WorkerPatch {
+        labels: None,
+        priority: Some(3),
+        overload: None,
+    };
+    store.patch(prefills[0], patch, revision).expect("patched");
+    store.publish_now();
+    carried("a patch");
+}
+
+#[test]
+fn a_membership_write_that_moves_an_offer_derives_the_classes_again() {
+    // Each fact that places a worker in its pools or makes its offer, moved
+    // on one prefill by its registration refreshed.
+    let first = || pair_facts("grpc://pa:9000", Role::Prefill, Some("tx-a"));
+    let moved = [
+        (
+            "the descriptor",
+            pair_facts("grpc://pa:9000", Role::Prefill, Some("tx-b")),
+        ),
+        (
+            "the runtime",
+            WorkerFacts {
+                engine_kind: "rt-b".to_string(),
+                ..first()
+            },
+        ),
+        (
+            "the wires",
+            WorkerFacts {
+                wire_modes: WireModes::HTTP,
+                ..first()
+            },
+        ),
+        (
+            "the role",
+            WorkerFacts {
+                role: Role::Decode,
+                ..first()
+            },
+        ),
+        (
+            "the models",
+            WorkerFacts {
+                models: vec!["other".to_string()],
+                ..first()
+            },
+        ),
+    ];
+    for (what, facts) in moved {
+        let store = MemoryStore::new();
+        two_classes(&store);
+        let before = pair_rows(&store);
+        store.upsert(facts.clone());
+        store.publish_now();
+        // A store that never held the first version: every write of it
+        // registers a worker, and derives.
+        let fresh = MemoryStore::new();
+        fresh.upsert(facts);
+        fresh.publish_now();
+        for (key, role, transport) in [
+            ("grpc://pb:9000", Role::Prefill, Some("tx-b")),
+            ("grpc://da:9000", Role::Decode, Some("tx-a")),
+            ("grpc://db:9000", Role::Decode, Some("tx-b")),
+            ("grpc://dn:9000", Role::Decode, None),
+        ] {
+            fresh.upsert(pair_facts(key, role, transport));
+            fresh.publish_now();
+        }
+        let after = pair_rows(&store);
+        assert_eq!(after, pair_rows(&fresh), "{what}");
+        assert_eq!(
+            store.world().pairs(MODEL),
+            fresh.world().pairs(MODEL),
+            "{what}"
+        );
+        assert_ne!(after, before, "{what}: the classes moved");
+    }
+}
+
+/// The five workers of [`two_classes`], by key, role and transport.
+const PAIR_FLEET: [(&str, Role, Option<&str>); 5] = [
+    ("grpc://pa:9000", Role::Prefill, Some("tx-a")),
+    ("grpc://pb:9000", Role::Prefill, Some("tx-b")),
+    ("grpc://da:9000", Role::Decode, Some("tx-a")),
+    ("grpc://db:9000", Role::Decode, Some("tx-b")),
+    ("grpc://dn:9000", Role::Decode, None),
+];
+
+#[test]
+fn a_member_that_leaves_a_model_of_two_sides_derives_its_classes_again() {
+    let store = MemoryStore::new();
+    let (_, decodes) = two_classes(&store);
+    let before = pair_rows(&store);
+    // The decode of the first transport leaves: both sides keep a member.
+    let revision = WorkersStore::get(&store, decodes[0])
+        .expect("the row")
+        .revision;
+    store.remove(decodes[0], revision).expect("removed");
+    store.publish_now();
+    // A store that never held it.
+    let fresh = MemoryStore::new();
+    for (key, role, transport) in PAIR_FLEET {
+        if key != "grpc://da:9000" {
+            fresh.upsert(pair_facts(key, role, transport));
+            fresh.publish_now();
+        }
+    }
+    let after = pair_rows(&store);
+    assert_eq!(after, pair_rows(&fresh));
+    assert_eq!(store.world().pairs(MODEL), fresh.world().pairs(MODEL));
+    assert_ne!(after, before);
+}
+
+#[test]
+fn a_new_incarnation_under_a_key_derives_the_classes_again() {
+    let store = MemoryStore::new();
+    let (prefills, _) = two_classes(&store);
+    // The first prefill comes again under its key: a new id in its pool.
+    let again = WorkerFacts {
+        incarnation: 2,
+        ..pair_facts("grpc://pa:9000", Role::Prefill, Some("tx-a"))
+    };
+    store.upsert(again.clone());
+    store.publish_now();
+    // A store that never held the first incarnation.
+    let fresh = MemoryStore::new();
+    fresh.upsert(again);
+    fresh.publish_now();
+    for &(key, role, transport) in &PAIR_FLEET[1..] {
+        fresh.upsert(pair_facts(key, role, transport));
+        fresh.publish_now();
+    }
+    let after = pair_rows(&store);
+    assert_eq!(after, pair_rows(&fresh));
+    assert_eq!(store.world().pairs(MODEL), fresh.world().pairs(MODEL));
+    assert!(
+        after.iter().all(|&(id, _)| id != prefills[0]),
+        "the first incarnation left"
+    );
+    assert!(after.iter().all(|&(_, class)| class != 0), "{after:?}");
+}
+
+#[test]
+fn a_write_that_moves_no_offer_carries_each_models_own_classes() {
+    let store = MemoryStore::new();
+    two_classes(&store);
+    // A second model, of one prefill and one decode: classes of its own.
+    store.upsert(facts("grpc://op:9000", Role::Prefill, &["other"]));
+    store.publish_now();
+    store.upsert(facts("grpc://od:9000", Role::Decode, &["other"]));
+    store.publish_now();
+    let classes_of = |world: &World, model: &str| {
+        std::ptr::from_ref(world.pairs(model).expect("the model's classes"))
+    };
+    // The world is kept, so each model's classes stand where they are.
+    let before = store.world();
+    let (first, second) = (classes_of(&before, MODEL), classes_of(&before, "other"));
+    assert_ne!(first, second);
+    // A worker of each model writes its registration again.
+    store.upsert(pair_facts("grpc://pa:9000", Role::Prefill, Some("tx-a")));
+    store.publish_now();
+    store.upsert(facts("grpc://od:9000", Role::Decode, &["other"]));
+    store.publish_now();
+    let after = store.world();
+    assert_eq!(classes_of(&after, MODEL), first);
+    assert_eq!(classes_of(&after, "other"), second);
+}
+
+#[test]
+fn a_blank_value_of_a_descriptor_is_dropped_at_the_door() {
+    // The fleet of `two_classes` written with blanks: a blank protocol and
+    // version on every worker, each transport between blanks, and a blank
+    // one where the fleet names none.
+    let blanked = MemoryStore::new();
+    let ids: Vec<WorkerId> = PAIR_FLEET
+        .iter()
+        .map(|&(key, role, transport)| {
+            let transport = transport.map_or_else(|| " ".to_string(), |name| format!(" {name} "));
+            let facts = WorkerFacts {
+                pairing: Some(Arc::new(PairingDescriptor {
+                    protocol: Some(String::new()),
+                    transport: Some(transport),
+                    version: Some(String::new()),
+                    kv_layout: [Some(" ".to_string()), None, None, None],
+                })),
+                ..pair_facts(key, role, None)
+            };
+            admit(&blanked, facts)
+        })
+        .collect();
+    let plain = MemoryStore::new();
+    two_classes(&plain);
+    // Two blank protocols settle no pair: the transports decide, as where no
+    // worker sets a protocol.
+    assert_eq!(pair_rows(&blanked), pair_rows(&plain));
+    assert_eq!(blanked.world().pairs(MODEL), plain.world().pairs(MODEL));
+    // The row of record holds each value as the rule reads it.
+    let first = ids.first().copied().expect("a worker");
+    let row = WorkersStore::get(&blanked, first).expect("the row");
+    assert_eq!(
+        row.facts.pairing,
+        Some(Arc::new(PairingDescriptor {
+            transport: Some("tx-a".to_string()),
+            ..PairingDescriptor::default()
+        }))
+    );
+}
+
+#[test]
+fn a_descriptor_the_rule_reads_is_shared_by_every_copy_of_its_row() {
+    let store = MemoryStore::new();
+    // Handed in as the rule reads it, and kept by the caller too.
+    let handed = Arc::new(PairingDescriptor {
+        transport: Some("tx-a".to_string()),
+        ..PairingDescriptor::default()
+    });
+    let id = admit(
+        &store,
+        WorkerFacts {
+            pairing: Some(Arc::clone(&handed)),
+            ..pair_facts("grpc://pa:9000", Role::Prefill, None)
+        },
+    );
+    // The door kept the descriptor where it stood, and each read by value
+    // copies the row with it: one descriptor behind them all.
+    for _ in 0..2 {
+        let row = WorkersStore::get(&store, id).expect("the row");
+        let held = row.facts.pairing.as_ref().expect("the descriptor");
+        assert!(Arc::ptr_eq(held, &handed));
+    }
 }
 
 // ------------------------------------------------------ the overload verdict
@@ -2371,14 +3431,20 @@ fn overloaded(store: &MemoryStore, now: Instant) -> Vec<WorkerId> {
 
 /// One rank of the two-rank engine `engine`.
 fn rank_of(store: &MemoryStore, engine: &str, rank: u16) -> WorkerId {
-    store
-        .upsert(WorkerFacts {
+    rank_among(store, engine, rank, 2)
+}
+
+/// One rank of the engine `engine`, which says it has `size` ranks.
+fn rank_among(store: &MemoryStore, engine: &str, rank: u16, size: u16) -> WorkerId {
+    admit(
+        store,
+        WorkerFacts {
             engine: engine.to_string(),
             dp_rank: rank,
-            dp_size: 2,
+            dp_size: size,
             ..facts(&format!("{engine}#{rank}"), Role::Single, &[MODEL])
-        })
-        .id()
+        },
+    )
 }
 
 #[test]
@@ -2416,6 +3482,7 @@ fn a_row_is_judged_at_and_above_its_pool_s_thresholds_and_its_own_stand_over_the
             ..facts("http://c:8000", Role::Single, &[MODEL])
         })
         .id();
+    store.publish_now();
     store
         .apply(generation_with(1, block(4, 0.5)))
         .expect("applied");
@@ -2611,15 +3678,16 @@ fn a_registration_s_own_usage_stands_over_its_pool_s() {
     let store = MemoryStore::with_publish_window(Duration::ZERO);
     let t0 = Instant::now();
     let own = |key: &str, permille: u16| {
-        store
-            .upsert(WorkerFacts {
+        admit(
+            &store,
+            WorkerFacts {
                 overload: Overload {
                     waiting_requests: None,
                     kv_usage_permille: Some(permille),
                 },
                 ..facts(key, Role::Single, &[MODEL])
-            })
-            .id()
+            },
+        )
     };
     let low = own("http://low:8000", 300);
     let high = own("http://high:8000", 900);
@@ -2652,9 +3720,11 @@ fn a_pool_takes_the_thresholds_of_the_binding_that_covers_its_phase() {
     let prefill = store
         .upsert(facts("http://p:8000", Role::Prefill, &[MODEL]))
         .id();
+    store.publish_now();
     let decode = store
         .upsert(facts("http://d:8000", Role::Decode, &[MODEL]))
         .id();
+    store.publish_now();
     let mut document = PolicySpec::preset("round_robin").expect("a preset of this build");
     document.generation = 1;
     let profile = document
@@ -2887,12 +3957,13 @@ fn a_single_rank_worker_is_an_engine_alone_and_ranks_share_their_engine_s_key() 
     // Two single-rank rows that name one engine. The facts' rule is that
     // a single-rank worker's engine is its own key: each is judged alone.
     let alone = |key: &str| {
-        store
-            .upsert(WorkerFacts {
+        admit(
+            &store,
+            WorkerFacts {
                 engine: "http://shared:8000".to_string(),
                 ..facts(key, Role::Single, &[MODEL])
-            })
-            .id()
+            },
+        )
     };
     let (x, y) = (alone("http://x:8000"), alone("http://y:8000"));
     let zero = rank_of(&store, "grpc://e:9000", 0);
@@ -2907,6 +3978,298 @@ fn a_single_rank_worker_is_an_engine_alone_and_ranks_share_their_engine_s_key() 
     }
     // Five and five: at the count as one engine's ranks, under it alone.
     assert_eq!(overloaded(&store, t0), ranks);
+}
+
+/// The report period the age cases tell.
+const REPORT_PERIOD: Duration = Duration::from_secs(10);
+
+#[test]
+fn a_stale_low_usage_masks_a_hot_rank_only_until_its_sample_ends() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let at = |secs: u64| t0 + Duration::from_secs(secs);
+    let zero = rank_of(&store, "grpc://e:9000", 0);
+    let one = rank_of(&store, "grpc://e:9000", 1);
+    store
+        .apply(generation_with(1, block(8, 0.6)))
+        .expect("applied");
+    assert!(store.heard_every(REPORT_PERIOD));
+    // A hot rank beside a cool one: their mean is under the threshold.
+    store.record(one, 1, pressure(0, 100), at(0), LoadSource::Stream);
+    store.record(zero, 0, pressure(0, 900), at(0), LoadSource::Stream);
+    assert_eq!(overloaded(&store, at(0)), []);
+    // The cool rank falls silent. Three periods behind the engine's
+    // newest receipt its sample is still the engine's word.
+    store.record(zero, 0, pressure(0, 900), at(30), LoadSource::Stream);
+    assert_eq!(overloaded(&store, at(30)), []);
+    // Past them it ends, and the hot rank is judged alone.
+    store.record(zero, 0, pressure(0, 900), at(31), LoadSource::Stream);
+    assert_eq!(
+        (overloaded(&store, at(31)), store.overload_flips()),
+        (vec![zero, one], 1)
+    );
+    // Heard again, the rank's sample counts again.
+    store.record(one, 1, pressure(0, 100), at(40), LoadSource::Stream);
+    assert_eq!(
+        (overloaded(&store, at(40)), store.overload_flips()),
+        (vec![], 2)
+    );
+}
+
+#[test]
+fn a_stale_high_count_holds_its_veto_only_until_its_sample_ends() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let at = |secs: u64| t0 + Duration::from_secs(secs);
+    let zero = rank_of(&store, "grpc://e:9000", 0);
+    let one = rank_of(&store, "grpc://e:9000", 1);
+    store
+        .apply(generation_with(1, block(8, 1.0)))
+        .expect("applied");
+    assert!(store.heard_every(REPORT_PERIOD));
+    store.record(one, 1, pressure(9, 0), at(0), LoadSource::Stream);
+    store.record(zero, 0, pressure(0, 0), at(0), LoadSource::Stream);
+    assert_eq!(overloaded(&store, at(0)), [zero, one]);
+    // The rank with the queue falls silent: inside the bound its count
+    // holds the veto, past it the engine's silence takes it back.
+    store.record(zero, 0, pressure(0, 0), at(30), LoadSource::Stream);
+    assert_eq!(overloaded(&store, at(30)), [zero, one]);
+    store.record(zero, 0, pressure(0, 0), at(31), LoadSource::Stream);
+    assert_eq!(
+        (overloaded(&store, at(31)), store.overload_flips()),
+        (vec![], 2)
+    );
+}
+
+#[test]
+fn no_sample_ends_by_its_age_until_a_report_period_is_told() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let at = |secs: u64| t0 + Duration::from_secs(secs);
+    let zero = rank_of(&store, "grpc://e:9000", 0);
+    let one = rank_of(&store, "grpc://e:9000", 1);
+    store
+        .apply(generation_with(1, block(8, 1.0)))
+        .expect("applied");
+    store.record(one, 1, pressure(9, 0), at(0), LoadSource::Stream);
+    store.record(zero, 0, pressure(0, 0), at(1_000), LoadSource::Stream);
+    // No period was told: the silent rank's count stands, however old.
+    assert_eq!(overloaded(&store, at(1_000)), [zero, one]);
+    // The telling judges every engine again under the period, and is
+    // shown as a write with no instant of its own is: at the window's
+    // end.
+    assert!(store.heard_every(REPORT_PERIOD));
+    store.publish(at(1_000));
+    assert_eq!(overloaded(&store, at(1_000)), []);
+    // A period is told once: the same one stands, another changes
+    // nothing, and the next judgment reads the first.
+    assert!(store.heard_every(REPORT_PERIOD));
+    assert!(!store.heard_every(Duration::from_secs(1_000)));
+    store.record(zero, 0, pressure(0, 0), at(1_001), LoadSource::Stream);
+    assert_eq!(overloaded(&store, at(1_001)), []);
+}
+
+#[test]
+fn an_engine_none_of_whose_ranks_is_heard_keeps_its_verdict() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let at = |secs: u64| t0 + Duration::from_secs(secs);
+    let zero = rank_of(&store, "grpc://e:9000", 0);
+    let one = rank_of(&store, "grpc://e:9000", 1);
+    store
+        .apply(generation_with(1, block(8, 1.0)))
+        .expect("applied");
+    assert!(store.heard_every(REPORT_PERIOD));
+    store.record(one, 1, pressure(9, 0), at(0), LoadSource::Stream);
+    store.record(zero, 0, pressure(0, 0), at(0), LoadSource::Stream);
+    // No rank is heard again: no write judges the engine, and a
+    // membership write judges it from samples as old as each other.
+    assert_eq!(overloaded(&store, at(1_000)), [zero, one]);
+    member(&store, "http://b:8000");
+    assert_eq!(overloaded(&store, at(1_000)), [zero, one]);
+}
+
+#[test]
+fn a_membership_write_ages_each_sample_from_its_own_receipt() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let at = |secs: u64| t0 + Duration::from_secs(secs);
+    let zero = rank_of(&store, "grpc://e:9000", 0);
+    let one = rank_of(&store, "grpc://e:9000", 1);
+    store
+        .apply(generation_with(1, block(8, 1.0)))
+        .expect("applied");
+    assert!(store.heard_every(REPORT_PERIOD));
+    store.record(one, 1, pressure(9, 0), at(0), LoadSource::Stream);
+    store.record(zero, 0, pressure(0, 0), at(31), LoadSource::Stream);
+    assert_eq!(overloaded(&store, at(31)), []);
+    // Every row is made again and every engine judged again: the ended
+    // sample stays ended, by the receipts of the samples on file.
+    member(&store, "http://b:8000");
+    assert_eq!(overloaded(&store, at(31)), []);
+}
+
+/// The bound is the third period whole: a rank exactly three periods
+/// behind its engine's newest is still counted, and one a microsecond
+/// further is not.
+#[test]
+fn a_rank_exactly_three_periods_behind_is_counted_and_a_microsecond_past_it_ends() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let zero = rank_of(&store, "grpc://e:9000", 0);
+    let one = rank_of(&store, "grpc://e:9000", 1);
+    store
+        .apply(generation_with(1, block(8, 1.0)))
+        .expect("applied");
+    assert!(store.heard_every(REPORT_PERIOD));
+    let bound = REPORT_PERIOD * 3;
+    // Rank one holds the queue that vetoes. Rank zero is heard at the
+    // bound: rank one's sample still counts.
+    store.record(one, 1, pressure(9, 0), t0, LoadSource::Stream);
+    store.record(zero, 0, pressure(0, 0), t0 + bound, LoadSource::Stream);
+    assert_eq!(overloaded(&store, t0 + bound), [zero, one]);
+    // A microsecond further, and it has ended.
+    let past = t0 + bound + Duration::from_micros(1);
+    store.record(zero, 0, pressure(0, 0), past, LoadSource::Stream);
+    assert_eq!(overloaded(&store, past), []);
+}
+
+/// Beside a rank past the bound, a rank exactly at it is still counted: the
+/// walk that leaves the ended rank out keeps the one three periods behind.
+#[test]
+fn a_rank_at_the_bound_is_counted_beside_one_past_it() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let zero = rank_among(&store, "grpc://e:9000", 0, 3);
+    let one = rank_among(&store, "grpc://e:9000", 1, 3);
+    let two = rank_among(&store, "grpc://e:9000", 2, 3);
+    store
+        .apply(generation_with(1, block(8, 1.0)))
+        .expect("applied");
+    assert!(store.heard_every(REPORT_PERIOD));
+    let bound = REPORT_PERIOD * 3;
+    let tick = Duration::from_micros(1);
+    // Rank two is heard a microsecond before rank one, which holds the queue
+    // that vetoes. Rank zero is heard three periods after rank one: rank two
+    // has ended, and rank one, exactly at the bound, still counts.
+    store.record(two, 2, pressure(0, 0), t0, LoadSource::Stream);
+    store.record(one, 1, pressure(9, 0), t0 + tick, LoadSource::Stream);
+    let now = t0 + tick + bound;
+    store.record(zero, 0, pressure(0, 0), now, LoadSource::Stream);
+    // The verdict is the engine's: every rank's row reads it, in the pool's
+    // order, the ended rank's too.
+    let mut ranks = [zero, one, two];
+    ranks.sort_unstable();
+    assert_eq!(overloaded(&store, now), ranks);
+}
+
+/// A membership write finds each rank's receipt among single-rank
+/// members: an engine's ranks do not stand together in the id order the
+/// write walks, and a single-rank member has no receipt.
+#[test]
+fn a_membership_write_finds_each_rank_s_receipt_among_single_rank_members() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let at = |secs: u64| t0 + Duration::from_secs(secs);
+    member(&store, "http://a:8000");
+    let zero = rank_of(&store, "grpc://e:9000", 0);
+    member(&store, "http://b:8000");
+    let one = rank_of(&store, "grpc://e:9000", 1);
+    store
+        .apply(generation_with(1, block(8, 1.0)))
+        .expect("applied");
+    assert!(store.heard_every(REPORT_PERIOD));
+    store.record(one, 1, pressure(9, 0), at(0), LoadSource::Stream);
+    store.record(zero, 0, pressure(0, 0), at(31), LoadSource::Stream);
+    // The write makes every row again: rank one's sample stays ended.
+    member(&store, "http://c:8000");
+    assert_eq!(overloaded(&store, at(31)), []);
+    // Heard again, rank one is counted beside rank zero's sample, which
+    // the next write still reads nine seconds behind it.
+    store.record(one, 1, pressure(9, 0), at(40), LoadSource::Stream);
+    member(&store, "http://d:8000");
+    assert_eq!(overloaded(&store, at(40)), [zero, one]);
+}
+
+#[test]
+fn a_generation_applied_over_standing_rows_ages_each_sample_from_its_own_receipt() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let at = |secs: u64| t0 + Duration::from_secs(secs);
+    let zero = rank_of(&store, "grpc://e:9000", 0);
+    let one = rank_of(&store, "grpc://e:9000", 1);
+    assert!(store.heard_every(REPORT_PERIOD));
+    // No threshold stands yet. One rank falls silent with a queue on
+    // file, the other is heard long after it, and no membership write
+    // comes between.
+    store.record(one, 1, pressure(9, 0), at(0), LoadSource::Stream);
+    store.record(zero, 0, pressure(0, 0), at(0), LoadSource::Stream);
+    member(&store, "http://b:8000");
+    store.record(zero, 0, pressure(0, 0), at(100), LoadSource::Stream);
+    assert_eq!(overloaded(&store, at(100)), []);
+    // The generation's first judgment reads the receipts of the samples
+    // on file: the silent rank's count ended long ago.
+    store
+        .apply(generation_with(1, block(8, 1.0)))
+        .expect("applied");
+    assert_eq!(overloaded(&store, at(100)), []);
+    // Heard again, the rank's count is its engine's word.
+    store.record(one, 1, pressure(9, 0), at(101), LoadSource::Stream);
+    assert_eq!(overloaded(&store, at(101)), [zero, one]);
+}
+
+#[test]
+fn a_poll_s_rows_are_heard_at_the_instant_their_poll_began() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let at = |secs: u64| t0 + Duration::from_secs(secs);
+    let zero = rank_of(&store, "grpc://e:9000", 0);
+    let one = rank_of(&store, "grpc://e:9000", 1);
+    store
+        .apply(generation_with(1, block(8, 1.0)))
+        .expect("applied");
+    assert!(store.heard_every(REPORT_PERIOD));
+    store.report(
+        &[
+            (zero, 0, Some(pressure(0, 0))),
+            (one, 1, Some(pressure(9, 0))),
+        ],
+        at(0),
+        LoadSource::Poll,
+    );
+    assert_eq!(overloaded(&store, at(0)), [zero, one]);
+    // Later answers omit rank 1, which keeps its sample: it ends three
+    // periods behind the poll that last brought its engine a row.
+    let omitting = [(zero, 0, Some(pressure(0, 0))), (one, 1, None)];
+    store.report(&omitting, at(30), LoadSource::Poll);
+    assert_eq!(overloaded(&store, at(30)), [zero, one]);
+    store.report(&omitting, at(31), LoadSource::Poll);
+    // The engine's verdict ends with the sample. The rank its answers
+    // leave out beside rank 0 stays avoided.
+    assert_eq!(overloaded(&store, at(31)), [one]);
+}
+
+#[test]
+fn a_single_rank_worker_s_sample_is_its_engine_s_newest_at_any_age() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let at = |secs: u64| t0 + Duration::from_secs(secs);
+    let a = member(&store, "http://a:8000");
+    let zero = rank_of(&store, "grpc://e:9000", 0);
+    let one = rank_of(&store, "grpc://e:9000", 1);
+    store
+        .apply(generation_with(1, block(8, 1.0)))
+        .expect("applied");
+    assert!(store.heard_every(REPORT_PERIOD));
+    // Beside a data-parallel engine that is heard long after it, a
+    // single-rank worker's one sample stands: no other engine's receipt
+    // ages it, at a record's write or at a membership write.
+    store.record(a, 0, pressure(9, 0), at(0), LoadSource::Stream);
+    store.record(zero, 0, pressure(0, 0), at(1_000), LoadSource::Stream);
+    store.record(one, 1, pressure(0, 0), at(1_000), LoadSource::Stream);
+    assert_eq!(overloaded(&store, at(1_000)), [a]);
+    member(&store, "http://b:8000");
+    assert_eq!(overloaded(&store, at(1_000)), [a]);
 }
 
 #[test]
@@ -2973,4 +4336,813 @@ fn the_deciding_door_hands_the_rows_and_the_engine_of_one_publication() {
         )
     });
     assert_eq!(next, (2, Some(2)));
+}
+
+/// How many rows of a pool hold no report ([`Built::unreported`]), kept by
+/// the writes and shown where the rows are published: a member before its
+/// first report and a member whose report was dropped each count, and a
+/// report without a rate does not. The build and the lent view read one
+/// number, and the pool facts say that every row holds a report where it
+/// is 0 ([`PoolFacts::reported`]).
+#[test]
+fn a_publication_counts_the_rows_of_a_pool_that_hold_no_report() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let at = |turn: u32| t0 + PUBLISH_WINDOW * turn;
+    let rated = |live_rate: u32| LoadRow {
+        live_rate,
+        ..load(1, 0)
+    };
+    let unreported = |now: Instant| {
+        let (asked, mut out) = (ask(now), ViewBuffers::default());
+        let built = store
+            .build_view(MODEL, Role::Single, &asked, &mut out)
+            .expect("the pool");
+        let lent = store.with_world(|world| {
+            let view = world.view(MODEL, Role::Single, &asked, false, &mut out);
+            view.expect("the pool").built.unreported
+        });
+        assert_eq!(built.unreported, lent);
+        assert_eq!(built.pool_facts().reported, lent == 0);
+        lent
+    };
+    let first = member(&store, "http://a:8000");
+    let second = member(&store, "http://b:8000");
+    // A membership write counts its rows: two members, no report yet.
+    assert_eq!(unreported(t0), 2);
+    store.record(first, 0, rated(1_900), at(1), LoadSource::Stream);
+    assert_eq!(unreported(at(1)), 1);
+    // A report without a rate is a report: the pool's last row holds one,
+    // and the next with a rate changes nothing.
+    store.record(second, 0, rated(0), at(2), LoadSource::Stream);
+    assert_eq!(unreported(at(2)), 0);
+    store.record(second, 0, rated(1_900), at(3), LoadSource::Stream);
+    assert_eq!(unreported(at(3)), 0);
+    assert_eq!(unreported(at(4)), 0);
+    // A member whose report is dropped holds none from the next window on.
+    store.evict(first);
+    store.publish(at(5));
+    assert_eq!(unreported(at(5)), 1);
+    // A member that joins is counted beside the rows that were there.
+    member(&store, "http://c:8000");
+    assert_eq!(unreported(at(5)), 2);
+}
+
+/// The count is each pool's own, moved by the row a write folds and taken
+/// again where a membership write builds the rows. A member of two models
+/// moves both pools by its one report; a report on a row that holds one and
+/// a drop on a row that holds none move nothing; a membership write counts
+/// the reports its rows carry. No publication takes a pass for it: a debug
+/// build holds each publication's count to a pass over its rows.
+#[test]
+fn a_report_moves_the_count_of_each_pool_its_row_stands_in() {
+    const OTHER: &str = "n";
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let at = |turn: u32| t0 + PUBLISH_WINDOW * turn;
+    let counts = |now: Instant| {
+        let count = |model: &str| {
+            let (asked, mut out) = (ask(now), ViewBuffers::default());
+            let built = store.build_view(model, Role::Single, &asked, &mut out);
+            built.expect("the pool").unreported
+        };
+        (count(MODEL), count(OTHER))
+    };
+    let both = admit(
+        &store,
+        facts("http://a:8000", Role::Single, &[MODEL, OTHER]),
+    );
+    let one = member(&store, "http://b:8000");
+    assert_eq!(counts(t0), (2, 1));
+    store.record(both, 0, load(1, 0), at(1), LoadSource::Stream);
+    assert_eq!(counts(at(1)), (1, 0));
+    // A report on a row that holds one moves nothing.
+    store.record(both, 0, load(2, 0), at(2), LoadSource::Stream);
+    assert_eq!(counts(at(2)), (1, 0));
+    store.record(one, 0, load(1, 0), at(3), LoadSource::Stream);
+    assert_eq!(counts(at(3)), (0, 0));
+    // A dropped report leaves both pools, once.
+    store.evict(both);
+    store.publish(at(4));
+    assert_eq!(counts(at(4)), (1, 1));
+    store.evict(both);
+    store.publish(at(5));
+    assert_eq!(counts(at(5)), (1, 1));
+    // A membership write builds every pool's rows again and counts the
+    // reports they carry: the member that joins the second model holds
+    // none, and the first model's one report stands.
+    admit(&store, facts("http://c:8000", Role::Single, &[OTHER]));
+    assert_eq!(counts(at(5)), (1, 2));
+    store.record(both, 0, load(1, 0), at(6), LoadSource::Stream);
+    assert_eq!(counts(at(6)), (0, 1));
+}
+
+/// Where the published rows of the model's single pool stand.
+fn published(world: &World) -> *const Candidate {
+    rows_of(world, MODEL).as_ptr()
+}
+
+#[test]
+fn a_pool_every_gateway_reaches_whole_is_lent_where_it_stands_and_copied_when_asked() {
+    let store = MemoryStore::new();
+    let now = Instant::now();
+    let first = member(&store, "http://a:8000");
+    let second = member(&store, "http://b:8000");
+    store.gateway_veto(ASKER, second, Some(now + Duration::from_secs(1)));
+    let asked = Ask {
+        pinned: Some(first),
+        ..ask(now)
+    };
+    let mut out = ViewBuffers::default();
+    store.with_world(|world| {
+        let view = world
+            .view(MODEL, Role::Single, &asked, false, &mut out)
+            .expect("the pool");
+        // The rows are the publication's own, and nothing of the decision
+        // is in them: the veto and the pin stand beside them.
+        assert_eq!(view.candidates.as_ptr(), published(world));
+        let own = |row: &Candidate| !row.health.stalled && !row.session_hit;
+        assert!(view.candidates.iter().all(own));
+        let at = |id: WorkerId| {
+            let found = view.candidates.iter().position(|row| row.id == id);
+            found.expect("a member") as u32
+        };
+        assert_eq!(view.stalled, [at(second)]);
+        assert_eq!(view.pinned_at, at(first) + 1);
+        assert_eq!(view.built.pool_size, 2);
+    });
+    assert!(out.candidates.is_empty(), "a lent view copies no row");
+
+    // A decision that asks for written rows is handed the build's copy:
+    // the bits are in the rows and nothing stands beside them.
+    store.with_world(|world| {
+        let view = world
+            .view(MODEL, Role::Single, &asked, true, &mut out)
+            .expect("the pool");
+        assert_ne!(view.candidates.as_ptr(), published(world));
+        assert!(view.stalled.is_empty());
+        assert_eq!(view.pinned_at, 0);
+        let bits = |id: WorkerId| {
+            let found = view.candidates.iter().find(|row| row.id == id);
+            let row = found.expect("a member");
+            (row.health.stalled, row.session_hit)
+        };
+        assert_eq!((bits(first), bits(second)), ((false, true), (true, false)));
+    });
+
+    // No member, no view, and the buffers are cleared.
+    store.with_world(|world| {
+        let none = world.view("another", Role::Single, &asked, false, &mut out);
+        assert!(none.is_none());
+    });
+    assert!(out.candidates.is_empty() && out.stalled.is_empty());
+    // A build that finds no pool clears the mask a lent view left too.
+    out.stalled.push(7);
+    store.with_world(|world| {
+        let none = world.build("another", Role::Single, &asked, &mut out);
+        assert!(none.is_none());
+    });
+    assert!(out.candidates.is_empty() && out.stalled.is_empty());
+}
+
+#[test]
+fn a_pin_that_names_no_member_of_the_pool_pins_no_lent_row() {
+    // Workers of another model stand among this pool's members in the
+    // store's order: the search for one of them over the pool's rows ends
+    // between two rows, and not past the last.
+    let store = MemoryStore::new();
+    let now = Instant::now();
+    let (mut members, mut others) = (Vec::new(), Vec::new());
+    for index in 0..4 {
+        members.push(member(&store, &format!("http://m{index}:8000")));
+        let other = facts(&format!("http://o{index}:8000"), Role::Single, &["another"]);
+        others.push(admit(&store, other));
+    }
+    let last = members.iter().copied().max().expect("four members");
+    assert!(
+        others.iter().any(|&id| id < last),
+        "a worker of the other model sorts among the members"
+    );
+    let mut out = ViewBuffers::default();
+    for outsider in others {
+        let asked = Ask {
+            pinned: Some(outsider),
+            ..ask(now)
+        };
+        // The lent rows with what stands beside them are the build's rows
+        // (the helper holds them to it), and the build wrote no session bit.
+        let (rows, _, _) = view(&store, &asked);
+        assert_eq!(rows.len(), 4);
+        assert!(rows.iter().all(|row| !row.session_hit));
+        store.with_world(|world| {
+            let view = world
+                .view(MODEL, Role::Single, &asked, false, &mut out)
+                .expect("the pool");
+            assert_eq!(view.candidates.as_ptr(), published(world));
+            assert_eq!(view.pinned_at, 0);
+        });
+    }
+}
+
+#[test]
+fn a_pool_that_holds_a_host_local_row_is_copied_for_every_gateway() {
+    let store = MemoryStore::new();
+    let now = Instant::now();
+    member(&store, "http://a:8000");
+    let local = admit(
+        &store,
+        WorkerFacts {
+            reachable_from: Reachability::Gateway(GatewayId(2)),
+            ..facts("unix:///b", Role::Single, &[MODEL])
+        },
+    );
+    let mut out = ViewBuffers::default();
+    for (gateway, rows) in [(ASKER, 1), (GatewayId(2), 2)] {
+        let asked = Ask {
+            gateway,
+            ..ask(now)
+        };
+        store.with_world(|world| {
+            let view = world
+                .view(MODEL, Role::Single, &asked, false, &mut out)
+                .expect("the pool");
+            // The asking gateway's positions are its own here: its copy.
+            assert_ne!(view.candidates.as_ptr(), published(world));
+            assert_eq!(view.candidates.len(), rows);
+            let holds = view.candidates.iter().any(|row| row.id == local);
+            assert_eq!(holds, gateway == GatewayId(2));
+            assert!(view.stalled.is_empty() && view.pinned_at == 0);
+        });
+    }
+}
+
+#[test]
+fn a_lent_view_hands_its_own_gateways_standing_vetoes_in_the_rows_order() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let mut ids: Vec<WorkerId> = (0..6)
+        .map(|n| member(&store, &format!("http://w{n}:8000")))
+        .collect();
+    // The pool's order: a row's position is its worker's place by id.
+    ids.sort_unstable();
+    let end = t0 + Duration::from_secs(10);
+    let early = t0 + Duration::from_secs(1);
+    // Set in falling order, one that ends early, one of another gateway.
+    store.gateway_veto(ASKER, ids[4], Some(end));
+    store.gateway_veto(ASKER, ids[1], Some(end));
+    store.gateway_veto(ASKER, ids[2], Some(early));
+    store.gateway_veto(GatewayId(2), ids[0], Some(end));
+    let masked = |gateway: GatewayId, now: Instant| {
+        let mut out = ViewBuffers::default();
+        let asked = Ask {
+            gateway,
+            ..ask(now)
+        };
+        store.with_world(|world| {
+            let view = world.view(MODEL, Role::Single, &asked, false, &mut out);
+            view.expect("the pool").stalled.to_vec()
+        })
+    };
+    assert_eq!(masked(ASKER, t0), [1, 2, 4]);
+    // A veto past its end masks nothing, from its own instant on.
+    assert_eq!(masked(ASKER, early), [1, 4]);
+    assert!(masked(ASKER, end).is_empty());
+    // No other gateway's run is read.
+    assert_eq!(masked(GatewayId(2), t0), [0]);
+    assert!(masked(GatewayId(3), t0).is_empty());
+}
+
+#[test]
+fn a_dropped_gateways_vetoes_leave_in_one_publication_and_every_other_stands() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let until = t0 + Duration::from_secs(60);
+    let one = member(&store, "http://a:8000");
+    let two = member(&store, "http://b:8000");
+    let other = GatewayId(2);
+    store.gateway_veto(ASKER, one, Some(until));
+    store.gateway_veto(ASKER, two, Some(until));
+    store.gateway_veto(other, two, Some(until));
+    let mut both = [one, two];
+    both.sort_unstable();
+    assert_eq!(stalled(&store, ASKER, t0), both);
+
+    let before = store.world();
+    store.drop_gateways(&[ASKER]);
+    assert_eq!(stalled(&store, ASKER, t0), []);
+    assert_eq!(
+        stalled(&store, other, t0),
+        [two],
+        "another gateway's stands"
+    );
+    // Dropped again, and a gateway that never vetoed: no world is made.
+    let lifted = store.world();
+    assert!(
+        !Arc::ptr_eq(&before, &lifted),
+        "the lifting is a publication"
+    );
+    store.drop_gateways(&[ASKER]);
+    store.drop_gateways(&[GatewayId(3)]);
+    assert!(Arc::ptr_eq(&lifted, &store.world()));
+}
+
+#[test]
+fn gateways_dropped_together_leave_in_one_publication() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let until = t0 + Duration::from_secs(60);
+    let one = member(&store, "http://a:8000");
+    let two = member(&store, "http://b:8000");
+    let (second, other) = (GatewayId(7), GatewayId(8));
+    store.gateway_veto(ASKER, one, Some(until));
+    store.gateway_veto(second, two, Some(until));
+    store.gateway_veto(other, two, Some(until));
+
+    let published = store.publications();
+    store.drop_gateways(&[second, ASKER]);
+    assert_eq!(store.publications(), published + 1, "one world for the two");
+    assert_eq!(stalled(&store, ASKER, t0), []);
+    assert_eq!(stalled(&store, second, t0), []);
+    assert_eq!(
+        stalled(&store, other, t0),
+        [two],
+        "another gateway's stands"
+    );
+    // Gateways that hold no veto, and no gateway at all: no world is made.
+    store.drop_gateways(&[second, ASKER, GatewayId(9)]);
+    store.drop_gateways(&[]);
+    assert_eq!(store.publications(), published + 1);
+    // A gateway that holds no veto, listed ahead of one that does, hides
+    // nothing: the holder's veto leaves in a world.
+    store.drop_gateways(&[GatewayId(2), other]);
+    assert_eq!(store.publications(), published + 2);
+    assert_eq!(stalled(&store, other, t0), []);
+}
+
+/// A generation that declares the view's three lists.
+fn generation_listing(
+    number: u64,
+    labels: &[&str],
+    zones: &[&str],
+    engines: &[&str],
+) -> AppliedSpec {
+    let mut document = PolicySpec::preset("round_robin").expect("a preset of this build");
+    document.generation = number;
+    let owned = |list: &[&str]| list.iter().map(|name| (*name).to_string()).collect();
+    document.view.labels = owned(labels);
+    document.view.zones = owned(zones);
+    document.view.engines = owned(engines);
+    AppliedSpec::validate(&document).expect("the document validates")
+}
+
+/// A worker of the model that names an engine family, a zone and labels.
+fn listed_member(
+    store: &MemoryStore,
+    key: &str,
+    engine: &str,
+    zone: Option<&str>,
+    labels: &[(&str, &str)],
+) -> WorkerId {
+    let labels = labels.iter();
+    let facts = WorkerFacts {
+        engine_kind: engine.to_string(),
+        zone: zone.map(str::to_string),
+        labels: labels
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect(),
+        ..facts(key, Role::Single, &[MODEL])
+    };
+    admit(store, facts)
+}
+
+/// What a member's row reads in the three listed fields: its engine family,
+/// its zone, its labels.
+fn listed(world: &World, id: WorkerId) -> (u16, u16, u64) {
+    let rows = rows_of(world, MODEL);
+    let row = rows.iter().find(|row| row.id == id);
+    let row = row.expect("the member's row");
+    (row.engine_kind, row.zone, row.labels)
+}
+
+#[test]
+fn a_row_names_its_engine_family_and_zone_by_position_and_holds_a_bit_a_label() {
+    let store = MemoryStore::new();
+    let lists = generation_listing(
+        1,
+        &["tier", "tier=gold", "pool=a"],
+        &["east", "west"],
+        &["alpha", "beta"],
+    );
+    store.apply(lists).expect("applied");
+    let gold = listed_member(&store, "gold", "beta", Some("west"), &[("tier", "gold")]);
+    let labels = [("tier", "silver"), ("pool", "a")];
+    let silver = listed_member(&store, "silver", "alpha", None, &labels);
+    // A position counts from 1 in the list's order. A bit a selector, in
+    // the list's order: a key alone is met by any value of it.
+    let world = store.world();
+    assert_eq!(listed(&world, gold), (2, 2, 0b011));
+    assert_eq!(listed(&world, silver), (1, 0, 0b101));
+    assert_eq!(store.outside_lists(), OutsideLists::default());
+    // A family or a zone the lists do not name is admitted, reads 0 and is
+    // counted under its list. A worker that names neither is not counted.
+    let stray = listed_member(&store, "stray", "gamma", Some("north"), &[("pool", "b")]);
+    let bare = listed_member(&store, "bare", "", None, &[]);
+    let world = store.world();
+    assert_eq!(listed(&world, stray), (0, 0, 0));
+    assert_eq!(listed(&world, bare), (0, 0, 0));
+    assert_eq!(listed(&world, gold), (2, 2, 0b011));
+    let outside = OutsideLists {
+        engines: 1,
+        zones: 1,
+    };
+    assert_eq!(store.outside_lists(), outside);
+}
+
+#[test]
+fn a_worker_of_two_models_reads_the_lists_in_each_of_its_rows() {
+    let store = MemoryStore::new();
+    let zones = ["east", "west"];
+    let engines = ["alpha", "beta"];
+    store
+        .apply(generation_listing(1, &["tier=gold"], &zones, &engines))
+        .expect("applied");
+    let both = WorkerFacts {
+        engine_kind: "beta".to_string(),
+        zone: Some("west".to_string()),
+        labels: [("tier".to_string(), "gold".to_string())].into(),
+        ..facts("both", Role::Single, &[MODEL, "second"])
+    };
+    let id = admit(&store, both);
+    // One row a model, and each row reads the member's three fields.
+    let read = |world: &World, model: &str| {
+        let rows = rows_of(world, model);
+        let row = rows.iter().find(|row| row.id == id);
+        let row = row.expect("the member's row");
+        (row.engine_kind, row.zone, row.labels)
+    };
+    let world = store.world();
+    assert_eq!(read(&world, MODEL), (2, 2, 0b1));
+    assert_eq!(read(&world, "second"), (2, 2, 0b1));
+    // An apply whose lists differ reads both rows again.
+    store
+        .apply(generation_listing(2, &["tier=gold"], &["west"], &["beta"]))
+        .expect("applied");
+    let world = store.world();
+    assert_eq!(read(&world, MODEL), (1, 1, 0b1));
+    assert_eq!(read(&world, "second"), (1, 1, 0b1));
+    assert_eq!(store.outside_lists(), OutsideLists::default());
+    // An apply whose lists name neither of its fields counts the member once
+    // a list, not once a row.
+    store
+        .apply(generation_listing(3, &["tier=gold"], &["east"], &["alpha"]))
+        .expect("applied");
+    let world = store.world();
+    assert_eq!(read(&world, MODEL), (0, 0, 0b1));
+    assert_eq!(read(&world, "second"), (0, 0, 0b1));
+    let outside = OutsideLists {
+        engines: 1,
+        zones: 1,
+    };
+    assert_eq!(store.outside_lists(), outside);
+    // A membership write counts at its own read of the members, at the build
+    // it leaves owed: the worker is counted once there too, beside a worker
+    // both lists name.
+    let inside = WorkerFacts {
+        engine_kind: "alpha".to_string(),
+        zone: Some("east".to_string()),
+        ..facts("inside", Role::Single, &[MODEL])
+    };
+    admit(&store, inside);
+    assert_eq!(store.outside_lists(), outside);
+}
+
+/// The one door's pair is of one moment. Each member joins outside the
+/// engines' list and then reports over its bound, so at every moment the
+/// flips trail the members outside by one at most, and a second thread reads
+/// the pair while the walk runs. Two holds of the lock would hand a reader a
+/// pair no moment held.
+#[test]
+fn a_pair_read_beside_a_walk_of_joins_and_reports_is_of_one_moment() {
+    const MEMBERS: u64 = 1_500;
+    let store = Arc::new(MemoryStore::new());
+    let mut document = PolicySpec::preset("round_robin").expect("a preset of this build");
+    document.generation = 1;
+    document.view.engines = vec!["alpha".to_string()];
+    let profile = document
+        .profiles
+        .keys()
+        .next()
+        .expect("the preset's profile");
+    document.bindings = vec![BindingSpec {
+        profile: Some(profile.clone()),
+        overload: Some(block(8, 1.0)),
+        ..BindingSpec::default()
+    }];
+    let listing = AppliedSpec::validate(&document).expect("the document validates");
+    store.apply(listing).expect("applied");
+    let walk = {
+        let store = Arc::clone(&store);
+        std::thread::spawn(move || {
+            for at in 0..MEMBERS {
+                let joins = WorkerFacts {
+                    engine_kind: "beta".to_string(),
+                    ..facts(&format!("w{at}"), Role::Single, &[MODEL])
+                };
+                let id = admit(&store, joins);
+                let over = [(id, 0, Some(pressure(9, 0)))];
+                store.report(&over, Instant::now(), LoadSource::Poll);
+            }
+        })
+    };
+    while !walk.is_finished() {
+        let counts = store.counts();
+        let (outside, flips) = (u64::from(counts.outside.engines), counts.overload_flips);
+        assert!(
+            flips <= outside && outside <= flips + 1,
+            "a pair of no moment: {outside} outside beside {flips} flips"
+        );
+    }
+    walk.join().expect("the walk");
+    let end = store.counts();
+    assert_eq!(
+        (u64::from(end.outside.engines), end.overload_flips),
+        (MEMBERS, MEMBERS)
+    );
+}
+
+#[test]
+fn an_apply_whose_lists_differ_reads_every_member_again_in_its_first_world() {
+    let store = MemoryStore::new();
+    let west = listed_member(&store, "w", "beta", Some("west"), &[("tier", "gold")]);
+    let north = listed_member(&store, "n", "beta", Some("north"), &[]);
+    // No generation, no list: every field reads 0 and nothing is outside.
+    assert_eq!(listed(&store.world(), west), (0, 0, 0));
+    assert_eq!(store.outside_lists(), OutsideLists::default());
+    let zones = ["east", "west"];
+    let engines = ["alpha", "beta"];
+    store
+        .apply(generation_listing(1, &["tier=gold"], &zones, &engines))
+        .expect("applied");
+    // The apply's own world holds the rows of its own lists.
+    let first = store.world();
+    assert_eq!(first.spec().generation(), 1);
+    assert_eq!(listed(&first, west), (2, 2, 0b1));
+    assert_eq!(listed(&first, north), (2, 0, 0));
+    let outside = OutsideLists {
+        engines: 0,
+        zones: 1,
+    };
+    assert_eq!(store.outside_lists(), outside);
+    // The same lists under the next number: no member is read again, and
+    // the pool's rows are the ones the last world listed.
+    store
+        .apply(generation_listing(2, &["tier=gold"], &zones, &engines))
+        .expect("applied");
+    let second = store.world();
+    assert_eq!(second.spec().generation(), 2);
+    assert!(Arc::ptr_eq(
+        &rows_of(&first, MODEL),
+        &rows_of(&second, MODEL)
+    ));
+    assert_eq!(store.outside_lists(), outside);
+    // Other lists: the positions and the bits move with them.
+    store
+        .apply(generation_listing(
+            3,
+            &["zone", "tier=gold"],
+            &["north", "west"],
+            &["beta"],
+        ))
+        .expect("applied");
+    let third = store.world();
+    assert_eq!(listed(&third, west), (1, 2, 0b10));
+    assert_eq!(listed(&third, north), (1, 1, 0));
+    assert_eq!(store.outside_lists(), OutsideLists::default());
+    // A generation that declares none: every field reads 0 again.
+    store.apply(generation(4)).expect("applied");
+    let fourth = store.world();
+    assert_eq!(listed(&fourth, west), (0, 0, 0));
+    assert_eq!(listed(&fourth, north), (0, 0, 0));
+    assert_eq!(store.outside_lists(), OutsideLists::default());
+}
+
+/// A generation that declares zones and engine families under the pairing
+/// `mode`.
+fn generation_listing_pairing(
+    number: u64,
+    mode: Pairing,
+    zones: &[&str],
+    engines: &[&str],
+) -> AppliedSpec {
+    let mut document = PolicySpec::preset("round_robin").expect("a preset of this build");
+    document.generation = number;
+    document.plans.pd_pair.pairing = mode;
+    let owned = |list: &[&str]| list.iter().map(|name| (*name).to_string()).collect();
+    document.view.zones = owned(zones);
+    document.view.engines = owned(engines);
+    AppliedSpec::validate(&document).expect("the document validates")
+}
+
+#[test]
+fn an_apply_that_derives_the_classes_again_reads_every_member_under_its_own_lists() {
+    let store = MemoryStore::new();
+    let west = listed_member(&store, "w", "beta", Some("west"), &[]);
+    let north = listed_member(&store, "n", "gamma", Some("north"), &[]);
+    let lenient = Pairing::default();
+    store
+        .apply(generation_listing_pairing(1, lenient, &["west"], &["beta"]))
+        .expect("applied");
+    assert_eq!(listed(&store.world(), west), (1, 1, 0));
+    let outside = OutsideLists {
+        engines: 1,
+        zones: 1,
+    };
+    assert_eq!(store.outside_lists(), outside);
+    // Another mode and other lists in one generation: the classes are
+    // derived by the membership write's door, whose rows are new, and its
+    // one world holds them under the generation's own lists.
+    let zones = ["north", "west"];
+    store
+        .apply(generation_listing_pairing(
+            2,
+            Pairing::Off,
+            &zones,
+            &["gamma"],
+        ))
+        .expect("applied");
+    let second = store.world();
+    assert_eq!(second.spec().generation(), 2);
+    assert_eq!(listed(&second, north), (1, 1, 0));
+    assert_eq!(listed(&second, west), (0, 2, 0));
+    let outside = OutsideLists {
+        engines: 1,
+        zones: 0,
+    };
+    assert_eq!(store.outside_lists(), outside);
+    // Another mode and no list: every field reads 0, and the member the
+    // last generation counted outside a list is counted no more.
+    store
+        .apply(generation_pairing(3, Pairing::Strict))
+        .expect("applied");
+    let third = store.world();
+    assert_eq!(listed(&third, north), (0, 0, 0));
+    assert_eq!(listed(&third, west), (0, 0, 0));
+    assert_eq!(store.outside_lists(), OutsideLists::default());
+}
+
+#[test]
+fn a_membership_write_reads_the_member_it_writes_and_carries_every_others_fields() {
+    let store = MemoryStore::new();
+    // A document of zones and families alone lists a member too.
+    let zones = ["east", "west"];
+    let engines = ["alpha", "beta"];
+    store
+        .apply(generation_listing(1, &[], &zones, &engines))
+        .expect("applied");
+    let west = listed_member(&store, "w", "beta", Some("west"), &[("tier", "gold")]);
+    let east = listed_member(&store, "e", "alpha", Some("east"), &[]);
+    let world = store.world();
+    assert_eq!(listed(&world, west), (2, 2, 0));
+    assert_eq!(listed(&world, east), (1, 1, 0));
+    // A refresh that states another zone and family moves the member's
+    // positions and its count: the write reads the member it writes.
+    let again = listed_member(&store, "w", "alpha", Some("north"), &[("tier", "gold")]);
+    assert_eq!(again, west);
+    let world = store.world();
+    assert_eq!(listed(&world, west), (1, 0, 0));
+    assert_eq!(listed(&world, east), (1, 1, 0));
+    let outside = OutsideLists {
+        engines: 0,
+        zones: 1,
+    };
+    assert_eq!(store.outside_lists(), outside);
+    // A patch of one member's labels moves its bits and no other's.
+    store
+        .apply(generation_listing(
+            2,
+            &["tier=gold", "lane"],
+            &zones,
+            &engines,
+        ))
+        .expect("applied");
+    assert_eq!(listed(&store.world(), west), (1, 0, 0b01));
+    let row = WorkersStore::get(&store, east).expect("the row");
+    let lane = [("lane".to_string(), "a".to_string())];
+    let patch = WorkerPatch {
+        labels: Some(lane.into_iter().collect()),
+        priority: None,
+        overload: None,
+    };
+    store.patch(east, patch, row.revision).expect("patched");
+    store.publish_now();
+    let world = store.world();
+    assert_eq!(listed(&world, east), (1, 1, 0b10));
+    assert_eq!(listed(&world, west), (1, 0, 0b01));
+    // A member that leaves takes its count with it, and the member that
+    // stays reads as before.
+    let row = WorkersStore::get(&store, west).expect("the row");
+    store.remove(west, row.revision).expect("removed");
+    store.publish_now();
+    assert_eq!(listed(&store.world(), east), (1, 1, 0b10));
+    assert_eq!(store.outside_lists(), OutsideLists::default());
+    // It joins again under other facts, and reads as those say.
+    let back = listed_member(&store, "w", "beta", Some("west"), &[]);
+    assert_eq!(listed(&store.world(), back), (2, 2, 0));
+}
+
+#[test]
+fn a_member_back_under_its_id_is_read_under_the_lists_again() {
+    let store = MemoryStore::new();
+    store
+        .apply(generation_listing(1, &[], &["east", "west"], &["alpha"]))
+        .expect("applied");
+    let stays = listed_member(&store, "e", "alpha", Some("east"), &[]);
+    let leaves = listed_member(&store, "w", "alpha", Some("west"), &[]);
+    assert_eq!(listed(&store.world(), leaves), (1, 2, 0));
+    let row = WorkersStore::get(&store, leaves).expect("the row");
+    store.remove(leaves, row.revision).expect("removed");
+    // The same key and incarnation, stating a zone the list does not name,
+    // registered after the leave: the same id, and its row stands at the
+    // revision the one that left was read at.
+    let north = WorkerFacts {
+        engine_kind: "alpha".to_string(),
+        zone: Some("north".to_string()),
+        ..facts("w", Role::Single, &[MODEL])
+    };
+    let back = store.upsert(north).id();
+    let again = WorkersStore::get(&store, back).expect("the row");
+    assert_eq!((back, again.revision), (leaves, row.revision));
+    store.publish_now();
+    // The build reads the registration that stands: no field of the one
+    // that left is carried, and the count outside the list follows.
+    let world = store.world();
+    assert_eq!(listed(&world, back), (1, 0, 0));
+    assert_eq!(listed(&world, stays), (1, 1, 0));
+    let outside = OutsideLists {
+        engines: 0,
+        zones: 1,
+    };
+    assert_eq!(store.outside_lists(), outside);
+}
+
+#[test]
+fn a_member_whose_rows_revision_stands_is_carried_and_one_whose_revision_moved_is_read() {
+    let origin = Instant::now();
+    let row = |id: u64, zone: &str, revision: u64| WorkerRow {
+        id: WorkerId(id),
+        facts: WorkerFacts {
+            zone: Some(zone.to_string()),
+            ..facts(&format!("http://w{id}:8000"), Role::Single, &[MODEL])
+        },
+        status: WorkerStatus::Ready,
+        revision,
+        admitted_at: origin,
+    };
+    let zones = |world: &World| (listed(world, WorkerId(3)).1, listed(world, WorkerId(7)).1);
+    let mut writer = Writer::new(PUBLISH_WINDOW, origin);
+    let lists = Arc::new(generation_listing(1, &[], &["east", "west"], &[]));
+    writer
+        .apply(lists, 0, std::iter::empty(), |_, _| None)
+        .expect("applied");
+    let members = [row(3, "east", 1), row(7, "west", 1)];
+    let first = writer.rebuild(1, members.iter(), |_, _| None, Classes::Derive);
+    assert_eq!(zones(&first), (1, 2));
+    // The revision is what says a row's facts moved. At a standing revision
+    // a member's fields are the last read's, whatever the row states: a
+    // store hands no such row, and the case does, to tell a carry from a
+    // read.
+    let members = [row(3, "west", 1), row(7, "east", 1)];
+    let carried = writer.rebuild(2, members.iter(), |_, _| None, Classes::Derive);
+    assert_eq!(zones(&carried), (1, 2));
+    // At another revision a member is read, and the other is carried.
+    let members = [row(3, "west", 1), row(7, "east", 2)];
+    let read = writer.rebuild(3, members.iter(), |_, _| None, Classes::Derive);
+    assert_eq!(zones(&read), (1, 1));
+    // An apply whose lists differ reads every member, at any revision and
+    // in whatever order the store's table hands them,
+    let other = Arc::new(generation_listing(2, &[], &["west", "east"], &[]));
+    let members = [row(7, "east", 2), row(3, "east", 1)];
+    let (relisted, _) = writer
+        .apply(other, 3, members.iter(), |_, _| None)
+        .expect("applied");
+    assert_eq!(zones(&relisted), (2, 2));
+    // and the write after it carries that reading.
+    let members = [row(3, "west", 1), row(7, "west", 2)];
+    let after = writer.rebuild(4, members.iter(), |_, _| None, Classes::Derive);
+    assert_eq!(zones(&after), (2, 2));
+    // A member that leaves takes its entry with it, on either side of a
+    // member that stays. One that joins again at the id and the revision
+    // it left at is read: no field of its last life is carried.
+    let members = [row(7, "west", 2)];
+    let left = writer.rebuild(5, members.iter(), |_, _| None, Classes::Derive);
+    assert_eq!(listed(&left, WorkerId(7)).1, 2);
+    let members = [row(3, "west", 1), row(7, "west", 2)];
+    let back = writer.rebuild(6, members.iter(), |_, _| None, Classes::Derive);
+    assert_eq!(zones(&back), (1, 2));
+    let members = [row(3, "west", 1)];
+    let left = writer.rebuild(7, members.iter(), |_, _| None, Classes::Derive);
+    assert_eq!(listed(&left, WorkerId(3)).1, 1);
+    let members = [row(3, "west", 1), row(7, "west", 2)];
+    let back = writer.rebuild(8, members.iter(), |_, _| None, Classes::Derive);
+    assert_eq!(zones(&back), (1, 1));
 }

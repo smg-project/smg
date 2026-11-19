@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use futures::{channel::mpsc::channel as monitor_channel, SinkExt, StreamExt};
+use futures::{channel::mpsc::channel as monitor_channel, FutureExt, SinkExt, StreamExt};
 use zeromq::{util::PeerIdentity, Endpoint, SocketEvent};
 
 use super::*;
@@ -2659,9 +2659,8 @@ async fn a_blocked_input_refuses_add_requests_past_the_frame_bound() {
         client.submit(request_for("req-behind-2", 0)),
         async {
             tokio::time::sleep(SEND_WINDOW / 3).await;
-            let started = std::time::Instant::now();
-            let result = client.submit(request_for("req-refused", 0)).await;
-            (result, started.elapsed())
+            // One poll: admission refuses before the submit first waits.
+            client.submit(request_for("req-refused", 0)).now_or_never()
         },
     );
     for behind in [behind_1, behind_2] {
@@ -2673,15 +2672,13 @@ async fn a_blocked_input_refuses_add_requests_past_the_frame_bound() {
             "{error:?}"
         );
     }
-    let (refused, waited) = refused;
-    let error = refused.err().expect("the queue is at its bound");
+    let error = refused
+        .expect("refused at once, not after a window")
+        .err()
+        .expect("the queue is at its bound");
     assert!(
         matches!(error, Error::EngineInputFull { frames: 3, .. }),
         "{error:?}"
-    );
-    assert!(
-        waited < SEND_WINDOW / 2,
-        "refused at once, not after a window: {waited:?}"
     );
     assert!(client.is_alive());
     // The engine reads again.
@@ -2733,7 +2730,7 @@ async fn a_blocked_input_refuses_typed_frames_past_the_byte_bound() {
     // The writer has been stuck for its window: the input counts as blocked.
     tokio::time::sleep(SEND_WINDOW).await;
     let engine_id = client.engines()[0].engine_id.clone();
-    let started = std::time::Instant::now();
+    // One poll: admission refuses before the call first waits.
     let error = client
         .send_typed(
             &engine_id,
@@ -2741,10 +2738,10 @@ async fn a_blocked_input_refuses_typed_frames_past_the_byte_bound() {
             vec![0u8; 8],
             vec![Bytes::from(vec![0u8; 2 << 20])],
         )
-        .await
+        .now_or_never()
+        .expect("refused at once")
         .expect_err("the waiting payload would pass the bound");
     assert!(matches!(error, Error::EngineInputFull { .. }), "{error:?}");
-    assert!(started.elapsed() < SEND_WINDOW / 2, "refused at once");
     assert!(client.is_alive());
     drop(engine);
 }
@@ -2782,17 +2779,17 @@ async fn a_blocked_input_refuses_add_requests_past_the_byte_bound() {
         started.elapsed() >= SEND_WINDOW,
         "a frame within the bound waits its window"
     );
-    let started = std::time::Instant::now();
+    // One poll: admission refuses before the submit first waits.
     let error = client
         .submit_with_aux(
             request_for("req-big", 0),
             vec![Bytes::from(vec![0u8; 2 << 20])],
         )
-        .await
+        .now_or_never()
+        .expect("refused at once")
         .err()
         .expect("the waiting payload would pass the bound");
     assert!(matches!(error, Error::EngineInputFull { .. }), "{error:?}");
-    assert!(started.elapsed() < SEND_WINDOW / 2, "refused at once");
     assert!(client.is_alive());
     let seen = drain_until_aborted(&mut engine, "req-small").await;
     let adds: Vec<&str> = seen
@@ -2984,16 +2981,16 @@ async fn a_request_past_the_byte_bound_on_its_own_is_refused_with_its_size_named
     client.set_input_queue_limit(usize::MAX, 1 << 20);
     saturate_input(&client).await;
     tokio::time::sleep(SEND_WINDOW).await;
-    let started = std::time::Instant::now();
+    // One poll: admission refuses before the submit first waits.
     let error = client
         .submit_with_aux(
             request_for("req-big", 0),
             vec![Bytes::from(vec![0u8; 2 << 20])],
         )
-        .await
+        .now_or_never()
+        .expect("refused at once")
         .err()
         .expect("the request alone passes the bound");
-    assert!(started.elapsed() < SEND_WINDOW / 2, "refused at once");
     match &error {
         Error::EngineInputFull {
             frames: 0,

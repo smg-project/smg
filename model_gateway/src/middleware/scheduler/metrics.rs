@@ -162,7 +162,9 @@ mod tests {
     use smg_external_router::metrics::BoundedLabels;
 
     use super::*;
-    use crate::observability::metrics::{interner_size, test_support::render_with_recorder};
+    use crate::{
+        observability::metrics::test_support::render_with_recorder, worker::metrics::interner_size,
+    };
 
     /// Forty distinct tenant keys at a cap of 32 render 32 tenant series of
     /// their own and one `other` series carrying the rest; the process-wide

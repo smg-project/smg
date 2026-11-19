@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use super::pairing::{PairingMismatch, PdPairing, PdPairingMode};
-use crate::worker::{registry::RoutingPool, Worker};
+use crate::worker::{snapshot::RoutingPool, Worker};
 
 /// A shared, immutable list of workers, as the routing snapshot holds them.
 type Workers = Arc<[Arc<dyn Worker>]>;
@@ -458,3 +458,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[expect(clippy::print_stdout, reason = "a recorder says where its sheet went")]
+mod classic_pair_rows;

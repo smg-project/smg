@@ -4,7 +4,7 @@
 
 use llm_multimodal::{TransparencyPolicy, VisionPreProcessor};
 
-use crate::worker::{RoutingPool, RuntimeType, WorkerRegistry};
+use crate::worker::{RoutingPool, RuntimeType, WorkerRegistry, WorkerRegistryExt};
 
 /// The policy for the frames of a request to `model_id` served from the
 /// routing pools `pools`: the pools of the pipeline's mode, read as the

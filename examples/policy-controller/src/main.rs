@@ -11,11 +11,45 @@ use smg_policy_controller::{
     controller, Candidate, Catalog, CatalogError, Lifecycle, Needs, RequestFacts, Scorer, TieBand,
 };
 
+/// The process's allocator, the one the stock controller's binary registers,
+/// on the targets where the settings below hold. An Apple target is left out:
+/// the allocator compiles no background thread there. The library registers
+/// none: a controller built on it chooses its own. A burst of registrations
+/// builds the store's world again at every write, and the system allocator
+/// keeps resident what those builds free.
+#[cfg(all(
+    not(target_env = "msvc"),
+    not(target_env = "musl"),
+    not(target_vendor = "apple")
+))]
+#[global_allocator]
+static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// The allocator's settings, the stock binary's: a background thread hands
+/// freed pages back to the system ten seconds after their last use, the
+/// threads share sixteen arenas at most, and an allocation up to 32 MiB takes
+/// the room the last one freed. The allocator reads them from this symbol as
+/// it starts, and the `_RJEM_MALLOC_CONF` environment variable after it,
+/// entry by entry.
+#[cfg(all(
+    not(target_env = "msvc"),
+    not(target_env = "musl"),
+    not(target_vendor = "apple")
+))]
+#[expect(
+    unsafe_code,
+    reason = "the allocator reads its settings from this exported symbol; a NUL-terminated byte string nothing in Rust dereferences"
+)]
+#[export_name = "_rjem_malloc_conf"]
+pub static MALLOC_CONF: &[u8; 100] =
+    b"background_thread:true,dirty_decay_ms:10000,muzzy_decay_ms:0,narenas:16,oversize_threshold:33554432\0";
+
 /// Fills a worker before it opens the next: the worker with the most
 /// requests running, by its engine's own load report, scores highest, so a
 /// fleet under light traffic keeps whole workers idle. A worker with no
-/// report yet counts as idle. The profile's filter still drops a worker the
-/// prober takes out of rotation.
+/// report yet counts as idle. The profile's filters say where a fill ends:
+/// they drop a worker the prober takes out of rotation, and one whose
+/// engine reports at or over an overload threshold.
 #[derive(Debug)]
 struct Pack;
 
@@ -82,13 +116,15 @@ fn main() -> Result<ExitCode, CatalogError> {
 mod tests {
     use std::{
         net::{Ipv4Addr, SocketAddr},
+        sync::Arc,
         time::{Duration, Instant},
     };
 
     use smg_policy_controller::{
-        controller::{Config, Controller, Election, Listener, Scope},
+        controller::{Config, Controller, Election, Error, Listener, Scope, SpecRejected},
+        spec::OVERLOAD_WAITING_REQUESTS,
         store::{
-            Ask, GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore, ViewBuffers,
+            Ask, GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore, Overload, ViewBuffers,
             WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
         },
         Constraints, Engine, LoadRow, PolicySpec, RequestFacts, Role, Scorer, Scratch, SpecError,
@@ -100,7 +136,14 @@ mod tests {
     /// The document the example ships.
     const POLICY: &str = include_str!("../policy.yaml");
 
+    /// The same document on disk, as `--spec-file` names it.
+    const POLICY_FILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/policy.yaml");
+
     const MODEL: &str = "a-model";
+
+    /// The queue at which a worker of a fleet of its own names itself
+    /// overloaded, at its registration.
+    const QUEUE: u32 = 4;
 
     fn read(document: &str) -> PolicySpec {
         serde_yaml::from_str(document).expect("a well-formed document")
@@ -119,23 +162,37 @@ mod tests {
     /// and each with a load report on file. One runs three requests, one is
     /// idle. No row a decision reads is written by hand.
     struct Fleet {
-        store: MemoryStore,
+        store: Arc<MemoryStore>,
         busy: WorkerId,
         idle: WorkerId,
+        /// The overload thresholds each worker names at its registration.
+        own: Overload,
         /// The instant the store's last publication window opened.
         window: Instant,
     }
 
     impl Fleet {
+        /// A store of its own, whose workers each name a queue of [`QUEUE`]
+        /// requests as their threshold.
         fn new() -> Self {
-            let store = MemoryStore::new();
+            let own = Overload {
+                waiting_requests: Some(QUEUE),
+                ..Overload::default()
+            };
+            Self::over(Arc::new(MemoryStore::new()), own)
+        }
+
+        /// The two workers on `store`, each naming `own` at its
+        /// registration.
+        fn over(store: Arc<MemoryStore>, own: Overload) -> Self {
             let window = Instant::now();
-            let busy = Self::join(&store, window, "busy", Some(3));
-            let idle = Self::join(&store, window, "idle", Some(0));
+            let busy = Self::join(&store, window, "busy", Some(3), own);
+            let idle = Self::join(&store, window, "idle", Some(0), own);
             let mut fleet = Self {
                 store,
                 busy,
                 idle,
+                own,
                 window,
             };
             fleet.publish();
@@ -149,6 +206,7 @@ mod tests {
             window: Instant,
             name: &str,
             running: Option<u32>,
+            own: Overload,
         ) -> WorkerId {
             let key = format!("http://{name}:8000");
             let id = store
@@ -158,9 +216,14 @@ mod tests {
                     incarnation: 1,
                     models: vec![MODEL.to_owned()],
                     dp_size: 1,
+                    overload: own,
                     ..WorkerFacts::default()
                 })
                 .id();
+            // The store dates the build a registration owes by its own
+            // clock, and the fleet's windows are counted, not timed: the
+            // build is asked for here, as a host with no loop asks.
+            store.publish_now();
             let revision = WorkersStore::get(store, id).expect("the row").revision;
             store
                 .set_status(id, WorkerStatus::Ready, revision)
@@ -177,7 +240,7 @@ mod tests {
 
         /// Adds a ready worker whose engine has sent no load report yet.
         fn join_unreported(&mut self, name: &str) -> WorkerId {
-            let id = Self::join(&self.store, self.window, name, None);
+            let id = Self::join(&self.store, self.window, name, None, self.own);
             self.publish();
             id
         }
@@ -191,7 +254,7 @@ mod tests {
 
         /// Moves a worker's status as the prober does.
         fn set(&mut self, id: WorkerId, status: WorkerStatus) {
-            let revision = WorkersStore::get(&self.store, id)
+            let revision = WorkersStore::get(&*self.store, id)
                 .expect("the row")
                 .revision;
             self.store
@@ -200,10 +263,12 @@ mod tests {
             self.publish();
         }
 
-        /// Records a load report as an engine's stream delivers one.
-        fn report(&mut self, id: WorkerId, running: u32) {
+        /// Records a load report as an engine's stream delivers one: its
+        /// requests running and queued.
+        fn report(&mut self, id: WorkerId, running: u32, queued: u32) {
             let report = LoadRow {
                 running,
+                queued,
                 ..LoadRow::default()
             };
             self.store
@@ -253,6 +318,13 @@ mod tests {
             self.pick_at(engine, 0)
         }
 
+        /// The first target of one decision by the engine the store stands
+        /// under: the generation a controller applied to it.
+        fn pick_standing(&self) -> Option<WorkerId> {
+            let world = self.store.world();
+            self.pick(world.spec().engine())
+        }
+
         /// The same under a seed of the caller's: the picker draws among
         /// equal scores from it.
         fn pick_at(&self, engine: &Engine, seed: u64) -> Option<WorkerId> {
@@ -295,6 +367,18 @@ mod tests {
     }
 
     #[test]
+    fn a_join_is_in_force_however_far_the_real_clock_ran() {
+        let mut fleet = Fleet::new();
+        // The fleet's windows are counted from its start, and real time
+        // passes four of them before the join: its build is not left to a
+        // window the store's clock is already past.
+        std::thread::sleep(PUBLISH_WINDOW * 4);
+        fleet.join_unreported("late");
+        fleet.report(fleet.busy, 0, 0);
+        assert_eq!(fleet.scores(), [1.0; 3]);
+    }
+
+    #[test]
     fn a_worker_with_no_report_counts_as_idle_and_an_idle_fleet_ties() {
         let mut fleet = Fleet::new();
         let engine = engine(POLICY);
@@ -307,7 +391,7 @@ mod tests {
         // The busy worker drains and nothing runs. An idle fleet ties: every
         // worker takes the same whole score, and the picker draws among
         // equals, so each of them takes picks.
-        fleet.report(fleet.busy, 0);
+        fleet.report(fleet.busy, 0, 0);
         assert_eq!(fleet.scores(), [1.0; 3]);
         let picks: Vec<_> = (0..64).map(|seed| fleet.pick_at(&engine, seed)).collect();
         for worker in [fleet.busy, fleet.idle, unreported] {
@@ -329,6 +413,22 @@ mod tests {
         assert_eq!(fleet.pick(&engine), Some(fleet.idle));
         // The veto cleared, the busy worker fills again.
         fleet.veto(GatewayId::LOCAL, fleet.busy, false);
+        assert_eq!(fleet.pick(&engine), Some(fleet.busy));
+    }
+
+    #[test]
+    fn a_worker_at_its_overload_threshold_is_passed_over_and_the_next_opens() {
+        let mut fleet = Fleet::new();
+        let engine = engine(POLICY);
+        // A queue under the worker's threshold: `pack` still fills it.
+        fleet.report(fleet.busy, 3, QUEUE - 1);
+        assert_eq!(fleet.pick(&engine), Some(fleet.busy));
+        // At the threshold the store judges the worker's engine overloaded
+        // and the document's `not-overloaded` drops it: the next opens.
+        fleet.report(fleet.busy, 3, QUEUE);
+        assert_eq!(fleet.pick(&engine), Some(fleet.idle));
+        // The queue drains and the worker fills again.
+        fleet.report(fleet.busy, 3, 0);
         assert_eq!(fleet.pick(&engine), Some(fleet.busy));
     }
 
@@ -369,6 +469,37 @@ mod tests {
             shutdown_grace: Config::DEFAULT_SHUTDOWN_GRACE,
             load_poll_interval: Config::DEFAULT_LOAD_POLL_INTERVAL,
             election: Election::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_controller_handed_the_document_decides_by_it_over_its_store() {
+        let stages = stages().expect("the scorer's name is free");
+        let mut own = Controller::bind_with(config(), stages)
+            .await
+            .expect("binds");
+        // The start's own door: the document is judged over the stages the
+        // bind was handed and applied to the controller's store.
+        own.spec_file(POLICY_FILE).await.expect("the document runs");
+        assert_eq!(own.store().world().spec().generation(), 1);
+        // The controller's store, fed as its ingestion feeds it. Its workers
+        // name no threshold of their own: the document's defaults stand.
+        let mut fleet = Fleet::over(own.store(), Overload::default());
+        assert_eq!(fleet.pick_standing(), Some(fleet.busy));
+        // At the document's default queue the store judges the busy
+        // worker's engine overloaded, and `not-overloaded` drops it.
+        fleet.report(fleet.busy, 3, OVERLOAD_WAITING_REQUESTS);
+        assert_eq!(fleet.pick_standing(), Some(fleet.idle));
+        fleet.report(fleet.busy, 3, OVERLOAD_WAITING_REQUESTS - 1);
+        assert_eq!(fleet.pick_standing(), Some(fleet.busy));
+        // The stock controller refuses the same file by the scorer's name.
+        let mut stock = Controller::bind(config()).await.expect("binds");
+        match stock.spec_file(POLICY_FILE).await {
+            Err(Error::SpecFile {
+                source: SpecRejected::Invalid(SpecError::UnknownScorer { name, .. }),
+                ..
+            }) => assert_eq!(name, "pack"),
+            other => panic!("the stock controller read the file as {other:?}"),
         }
     }
 

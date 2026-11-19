@@ -14,7 +14,7 @@ use wfaas::{
     WorkflowContext, WorkflowDefinition, WorkflowError, WorkflowResult,
 };
 
-use super::data::WasmRegistrationWorkflowData;
+use super::data::{require_app_context, WasmRegistrationWorkflowData};
 use crate::{
     app_context::AppContext,
     wasm::{
@@ -322,11 +322,7 @@ impl StepExecutor<WasmRegistrationWorkflowData> for CheckDuplicateStep {
         &self,
         context: &mut WorkflowContext<WasmRegistrationWorkflowData>,
     ) -> WorkflowResult<StepResult> {
-        let app_context = context
-            .data
-            .app_context
-            .as_ref()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
+        let app_context = require_app_context(context.data.app_context.as_ref())?;
         let sha256_hash = context
             .data
             .sha256_hash
@@ -466,11 +462,7 @@ impl StepExecutor<WasmRegistrationWorkflowData> for RegisterModuleStep {
         &self,
         context: &mut WorkflowContext<WasmRegistrationWorkflowData>,
     ) -> WorkflowResult<StepResult> {
-        let app_context = context
-            .data
-            .app_context
-            .as_ref()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
+        let app_context = require_app_context(context.data.app_context.as_ref())?;
         let sha256_hash = context
             .data
             .sha256_hash

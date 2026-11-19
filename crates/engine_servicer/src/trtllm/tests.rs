@@ -740,6 +740,9 @@ async fn info_rpcs_report_the_launcher_facts_and_the_handshake() {
     // The vocabulary of structural-tag nodes the launcher read off the
     // engine's xgrammar rides along for the router's label.
     assert_eq!(info.structural_tag_vocabulary, "older");
+    // Under a backend that compiles grammars the servicer also says where
+    // the engine starts one.
+    assert_eq!(info.constrained_decoding_start, "first_token");
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 
     // A launcher that reported no bounds and no sizes: the handshake's; one
@@ -1125,6 +1128,24 @@ fn structured_outputs_support_follows_the_launcher_facts() {
     );
     assert_eq!(support(""), StructuredOutputsBackendConfig::Other.into());
     let _ = Arc::new(());
+}
+
+/// Where a grammar starts follows the same fact: the first generated token
+/// under the two backends that compile one, nothing under `none` or under a
+/// backend the launcher could not name.
+#[test]
+fn constrained_decoding_start_follows_the_launcher_facts() {
+    let start = |backend: &str| {
+        constrained_decoding_start(&TrtllmModelInfo {
+            guided_decoding_backend: backend.to_string(),
+            ..model_info()
+        })
+    };
+    assert_eq!(start("xgrammar"), "first_token");
+    assert_eq!(start("llguidance"), "first_token");
+    assert_eq!(start("none"), "");
+    assert_eq!(start(""), "");
+    assert_eq!(start("another"), "");
 }
 
 /// After the shim's first output for a request (one of its three prompt

@@ -90,7 +90,7 @@ fn a_single_scan_file_ending_in_a_comment_is_served_as_the_reference_serves_it()
         if turbojpeg_reads_warnings() {
             let served = decoded.expect("served with the library").to_rgb8();
             assert!(
-                served.as_raw() == clean.as_raw(),
+                served == clean,
                 "the clean file's pixels for the tail {tail:02X?}"
             );
         } else {
@@ -219,7 +219,7 @@ fn segments_libjpeg_parses_behind_a_single_scan_are_refused_as_the_reference_ref
             .expect("served through the library")
             .to_rgb8();
         assert!(
-            served.as_raw() == clean.as_raw(),
+            served == clean,
             "the clean file's pixels for the tail {tail:02X?}"
         );
     }
@@ -234,10 +234,15 @@ fn segments_libjpeg_parses_behind_a_single_scan_are_refused_as_the_reference_ref
 /// each behind a warned or a cut scan and before the end marker, and loads the
 /// file's own Huffman table copied there, an empty table of length 2 and a
 /// restart interval of length 4: those are the documented residual, refused
-/// here where the loader serves them. A clean scan followed by a valid table
-/// and the marker warns the library of nothing, so with the library it is
-/// served as the loader serves it, without the reading; without the library the
-/// reading refuses it.
+/// here where the loader serves them. Behind the warned scan that residual
+/// depends on the library, which gives one answer for the three files: one
+/// that reports the stray bytes before the scan header as a warning sends
+/// the file to the reading, which refuses it; one that returns such a file
+/// clean (libjpeg-turbo 3.2.1 does, measured) serves it with the clean
+/// file's pixels, as the loader serves it. A clean scan followed by a valid
+/// table and the marker warns the library of nothing, so with the library it
+/// is served as the loader serves it, without the reading; without the
+/// library the reading refuses it.
 #[test]
 fn a_table_behind_a_single_scan_frames_scan_is_refused_before_the_fallback_decoder() {
     let jpeg = ramp_jpeg();
@@ -257,37 +262,70 @@ fn a_table_behind_a_single_scan_frames_scan_is_refused_before_the_fallback_decod
     let marker: &[u8] = &[0xFF, 0xD9];
     let mut index_five = vec![0xFF, 0xC4, 0x00, 0x13, 0x05];
     index_five.extend([0; 16]);
-    let tables: [&[u8]; 7] = [
+    let malformed: [&[u8]; 4] = [
         &[0xFF, 0xC4, 0x00, 0x03, 0x00],
         &[0xFF, 0xC4, 0x00, 0x04, 0x00, 0x00],
         &index_five,
         &[0xFF, 0xDB, 0x00, 0x03, 0x05],
+    ];
+    let loaded: [&[u8]; 3] = [
         own_table,
         &[0xFF, 0xC4, 0x00, 0x02],
         &[0xFF, 0xDD, 0x00, 0x04, 0x00, 0x10],
     ];
-    for table in tables {
+    let clean = decode_image_bytes(&jpeg, None, TransparencyPolicy::KeepAlpha)
+        .expect("decode")
+        .to_rgb8();
+    let decode = |scan: &[u8], table: &[u8]| {
+        let file = [scan, table, marker].concat();
+        decode_image_bytes(&file, None, TransparencyPolicy::KeepAlpha)
+    };
+    let refused = |answer: Result<image::DynamicImage, MediaConnectorError>, table: &[u8]| {
+        let error = answer.expect_err("refused before the fallback decoder");
+        assert!(
+            error
+                .to_string()
+                .contains("ends in a form this decoder refuses"),
+            "{error} for the table {table:02X?}"
+        );
+    };
+    for table in malformed {
         for scan in [warned, half] {
-            let file = [scan, table, marker].concat();
-            let error = decode_image_bytes(&file, None, TransparencyPolicy::KeepAlpha)
-                .expect_err("refused before the fallback decoder");
-            assert!(
-                error
-                    .to_string()
-                    .contains("ends in a form this decoder refuses"),
-                "{error} for the table {table:02X?}"
-            );
+            refused(decode(scan, table), table);
         }
     }
+    let answers: Vec<bool> = loaded
+        .into_iter()
+        .map(|table| {
+            refused(decode(half, table), table);
+            match decode(warned, table) {
+                // The library returned the warned scan clean: the loader's answer.
+                Ok(served) if turbojpeg_available() => {
+                    assert!(
+                        served.to_rgb8() == clean,
+                        "the clean file's pixels behind the table {table:02X?}"
+                    );
+                    true
+                }
+                answer => {
+                    refused(answer, table);
+                    false
+                }
+            }
+        })
+        .collect();
+    // Whether the warned scan reads clean is the library's answer, not the
+    // table's: the three valid tables get one answer.
+    assert!(
+        answers.windows(2).all(|pair| pair[0] == pair[1]),
+        "one answer for the three valid tables behind the warned scan: {answers:?}"
+    );
     let complete = [&jpeg[..jpeg.len() - 2], own_table, marker].concat();
     let decoded = decode_image_bytes(&complete, None, TransparencyPolicy::KeepAlpha);
     if turbojpeg_available() {
-        let clean = decode_image_bytes(&jpeg, None, TransparencyPolicy::KeepAlpha)
-            .expect("decode")
-            .to_rgb8();
         let served = decoded.expect("served with the library").to_rgb8();
         assert!(
-            served.as_raw() == clean.as_raw(),
+            served == clean,
             "the clean file's pixels behind a clean scan"
         );
     } else {

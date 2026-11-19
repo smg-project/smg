@@ -1,18 +1,20 @@
 //! The engine's cost per decision: the view build and the decision at 8, 64
 //! and 512 candidates, per preset, the least-load decision with a credit
-//! held per row, a keyed decision on its pin and off it, and the spec's
-//! parse-and-validate time at apply. Ids: `policy_engine/view_build/<n>`,
+//! held per row, the steer of a pool over its thresholds on every row, a
+//! keyed decision on its pin and off it, and the spec's parse-and-validate
+//! time at apply. Ids: `policy_engine/view_build/<n>`,
 //! `policy_engine/decide/<preset>/<n>`,
 //! `policy_engine/decide/least_load_credited/<n>`,
+//! `policy_engine/decide/all_vetoed/<n>`,
 //! `policy_engine/decide/manual_keyed_hit/8`,
-//! `policy_engine/decide/manual_keyed_miss/8`,
-//! `policy_engine/spec/parse_validate` and
-//! `policy_engine/spec/validate_index/<keys>`. The view is built from the synthetic
+//! `policy_engine/decide/manual_keyed_miss/8` and
+//! `policy_engine/spec/parse_validate`. The view is built from the synthetic
 //! per-worker state of `common` the way a host reads its routing state; the
 //! decision runs with a fresh seed per iteration so the drawing pickers draw.
 //! This file is the pull-request gate's (`.github/bench-gates/policy-engine.toml`
 //! runs the whole binary three times a side): the `epd` plan's encode
-//! decisions and the ring's membership costs are the `epd` bench target.
+//! decisions and the ring's membership costs are the `epd` bench target, and
+//! the `bucket` preset's rows the `bucket` bench target.
 #![expect(
     clippy::expect_used,
     reason = "a bench's setup has no caller to answer; a preset that fails to validate is a bug the unit tests catch"
@@ -21,6 +23,8 @@
 mod common;
 #[path = "common/placed.rs"]
 mod placed;
+#[path = "common/preset.rs"]
+mod preset;
 
 use std::hint::black_box;
 
@@ -30,12 +34,11 @@ use criterion::{
     Throughput,
 };
 use placed::page_start_buffer;
+use preset::SIZES;
 use smg_policy_controller::{
-    Constraints, Identity, Lease, Lifecycle, ModelFingerprint, PolicySpec, PoolFacts, RequestFacts,
-    Scratch, Side, Target, PRESETS,
+    Constraints, Decision, Identity, Lease, Lifecycle, Lifted, ModelFingerprint, PolicySpec,
+    PoolFacts, RequestFacts, Scratch, Side, Target, PRESETS,
 };
-
-const SIZES: [usize; 3] = [8, 64, 512];
 
 fn view_build(c: &mut Criterion) {
     let mut group = c.benchmark_group("policy_engine/view_build");
@@ -59,34 +62,12 @@ fn view_build(c: &mut Criterion) {
 
 fn decide(c: &mut Criterion) {
     let mut group = c.benchmark_group("policy_engine/decide");
-    for preset in PRESETS {
-        let engine = engine_of(preset);
-        for &n in &SIZES {
-            let fleet = fleet(n);
-            let mut view = Vec::with_capacity(n);
-            build_view(&fleet, &mut view);
-            let mut scratch = Scratch::new();
-            let pool = PoolFacts {
-                pool_size: n as u32,
-                generation: 1,
-                ..PoolFacts::default()
-            };
-            let cx = Constraints::default();
-            group.bench_with_input(BenchmarkId::new(preset, n), &n, |b, _| {
-                let mut seed = 0u64;
-                b.iter(|| {
-                    seed += 1;
-                    let facts = RequestFacts {
-                        model: "m",
-                        prompt_tokens: 512,
-                        seed,
-                        now_micros: 1_000_000,
-                        ..RequestFacts::default()
-                    };
-                    engine.decide(&facts, &pool, black_box(&view), &cx, &mut scratch)
-                });
-            });
-        }
+    // The `bucket` preset's rows stand in the `bucket` bench target with the
+    // rest of its cells. This binary runs at its gate's bound, and a preset
+    // more here is three rows more in every pull request's gate. The two
+    // binaries build a preset's rows by one body (`common/preset.rs`).
+    for &name in PRESETS.iter().filter(|&&name| name != "bucket") {
+        preset::rows(&mut group, name);
     }
     // The least-load decision with one dispatch credit per row in the tally,
     // as between two reports under load: every decision reads and ages each
@@ -129,6 +110,52 @@ fn decide(c: &mut Criterion) {
                     now_micros: 1_000_000,
                     ..RequestFacts::default()
                 };
+                engine.decide(&facts, &pool, black_box(&view), &cx, &mut scratch)
+            });
+        });
+    }
+    // The all-vetoed rule's own path: every row over its thresholds, so the
+    // profile's filters leave nobody, run once more with the overload veto
+    // lifted, and the decision steers to the fewest requests in flight.
+    //
+    // The ids stand only on an engine that steers such a pool. The bench
+    // gate builds its base side from the base's engine and these sources;
+    // an engine without the rule sheds the pool, and a shed is no base to
+    // time a steer against. That side lists no such id, and the gate reads
+    // an id with no base as new.
+    let engine = engine_of("least_load");
+    for &n in &SIZES {
+        let fleet = fleet(n);
+        let mut view = Vec::with_capacity(n);
+        build_view(&fleet, &mut view);
+        for row in &mut view {
+            row.health.overloaded = true;
+        }
+        let mut scratch = Scratch::new();
+        let pool = PoolFacts {
+            pool_size: n as u32,
+            generation: 1,
+            ..PoolFacts::default()
+        };
+        let cx = Constraints::default();
+        let asked = RequestFacts {
+            model: "m",
+            prompt_tokens: 512,
+            now_micros: 1_000_000,
+            ..RequestFacts::default()
+        };
+        let steers = matches!(
+            engine.decide(&asked, &pool, &view, &cx, &mut scratch),
+            Decision::Pick(pick) if pick.trace.lifted == Lifted::Overload
+        );
+        if !steers {
+            continue;
+        }
+        group.bench_with_input(BenchmarkId::new("all_vetoed", n), &n, |b, _| {
+            let mut seed = 0u64;
+            b.iter(|| {
+                seed += 1;
+                let facts = RequestFacts { seed, ..asked };
                 engine.decide(&facts, &pool, black_box(&view), &cx, &mut scratch)
             });
         });
@@ -256,49 +283,5 @@ fn spec_parse_validate(c: &mut Criterion) {
     group.finish();
 }
 
-/// A document of `entries` index keys, a `prefix*` and a `*suffix` by turns
-/// of two literal lengths: no two overlap.
-fn indexed(entries: usize) -> PolicySpec {
-    let keys: Vec<String> = (0..entries)
-        .map(|n| {
-            if n % 2 == 0 {
-                format!(r#""p{n:05}*":{{}}"#)
-            } else {
-                format!(r#""*{n:05}ss":{{}}"#)
-            }
-        })
-        .collect();
-    let document = format!(
-        r#"{{"apiVersion":"smg.policy/v1","index":{{{}}},"profiles":{{"p":{{"pick":"round-robin"}}}}}}"#,
-        keys.join(",")
-    );
-    serde_json::from_str(&document).expect("the document parses")
-}
-
-/// One validation by the document's index keys: a thousand, eight thousand,
-/// and the thirteen thousand a document of 128 KiB holds at ten bytes a key.
-fn spec_validate_index(c: &mut Criterion) {
-    let mut group = c.benchmark_group("policy_engine/spec");
-    // Ten samples: a row is one loop over the keys, the same at every run.
-    group.sample_size(10);
-    for entries in [1_000, 8_000, 13_000] {
-        let spec = indexed(entries);
-        group.bench_with_input(
-            BenchmarkId::new("validate_index", entries),
-            &entries,
-            |b, _| {
-                b.iter(|| black_box(&spec).validate().expect("the document validates"));
-            },
-        );
-    }
-    group.finish();
-}
-
-criterion_group!(
-    benches,
-    view_build,
-    decide,
-    spec_parse_validate,
-    spec_validate_index
-);
+criterion_group!(benches, view_build, decide, spec_parse_validate);
 criterion_main!(benches);

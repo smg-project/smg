@@ -28,10 +28,58 @@ impl tracing::Subscriber for Said {
         }
         let mut fields = Fields(event.metadata().level().to_string());
         event.record(&mut fields);
-        self.0.lock().expect("the kept lines").push(fields.0);
+        let line = fields.0;
+        let trapped = {
+            let mut hit = None;
+            TRAPS
+                .lock()
+                .expect("the traps")
+                .retain_mut(|(named, text, left)| {
+                    if !(line.contains(named.as_str()) && line.contains(text.as_str())) {
+                        return true;
+                    }
+                    hit = Some(named.clone());
+                    *left -= 1;
+                    *left > 0
+                });
+            hit
+        };
+        self.0.lock().expect("the kept lines").push(line);
+        assert!(
+            trapped.is_none(),
+            "the subscriber panics at a line a case armed: {trapped:?}"
+        );
     }
     fn enter(&self, _: &tracing::span::Id) {}
     fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// The lines the subscriber panics at, one entry a plugin: what names the
+/// plugin, a text, and how many times more. A case arms and reads its own
+/// plugin's entry, so two cases of one binary do not take each other's
+/// panics.
+static TRAPS: std::sync::Mutex<Vec<(String, String, u32)>> = std::sync::Mutex::new(Vec::new());
+
+/// Arms the subscriber to panic, on the thread that says it, at each of the
+/// next `times` lines that name `plugin` and hold `text`: a case's way to
+/// make the host's own telling of a failure panic where it is told.
+pub fn panic_at(plugin: &str, text: &str, times: u32) {
+    assert!(times > 0, "a trap is armed for one panic at least");
+    said();
+    let named = format!("plugin=\"{plugin}\"");
+    let mut traps = TRAPS.lock().expect("the traps");
+    traps.retain(|(armed, _, _)| *armed != named);
+    traps.push((named, text.to_owned(), times));
+}
+
+/// Whether every panic a case armed for `plugin` has been made.
+pub fn trap_spent(plugin: &str) -> bool {
+    let named = format!("plugin=\"{plugin}\"");
+    !TRAPS
+        .lock()
+        .expect("the traps")
+        .iter()
+        .any(|(armed, _, _)| *armed == named)
 }
 
 /// The warnings this test process logs, for the cases that read a line of

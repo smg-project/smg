@@ -15,7 +15,7 @@ use axum::response::Response;
 use llm_tokenizer::traits::Tokenizer;
 use openai_protocol::{common::Tool, profile::ProviderProfile};
 use tool_parser::ToolConstraint;
-use tracing::error;
+use tracing::{debug, error};
 
 use crate::{
     config::ParserChoice,
@@ -30,7 +30,7 @@ use crate::{
             utils::{self, Names},
         },
     },
-    worker::{ModelLabels, Worker},
+    worker::{ModelLabels, Worker, WorkerRegistryExt},
 };
 
 /// What preparation found for the response.
@@ -78,14 +78,21 @@ pub(crate) struct Prepared {
 /// reader is assigned by; the answer's tag derives for the selected worker at
 /// request building); the older registry decides for every other request
 /// (`generate_tool_constraint`, over `tools`, the ones the request's choice
-/// lets the model call, and the legacy tool parser's name). On a thinking
+/// lets the model call, and the legacy tool parser's name). A table's tag
+/// for a forced call that opens with free text gives way to that registry's
+/// JSON schema, asked with no parser named, and stands where the schema
+/// cannot be built or loses what a reference in the tools' parameters
+/// points at (`regular::symphony::keeps_references`). On a thinking
 /// prompt a parser with a reasoning prefix gets its tag wrapped so a forced
 /// call follows the reasoning instead of preempting it: `switch` is the API's
 /// tokenizer-driven answer, and where a table reads the response its replay
-/// of the rendered prompt decides beside it (a turn the prompt leaves
-/// unopened starts inside the thought whatever the switch says:
-/// `regular::symphony::reasoning_open`), so the tag reads the prompt as the
-/// engine will. The table's refusal waits for request building, which decides
+/// of the rendered prompt decides by the rule request building asks
+/// (`PromptThought::or_switch` over `regular::symphony::reasoning_open`): a
+/// turn the prompt leaves unopened starts inside the thought whatever the
+/// switch says, a prompt that closed the thought is past it whatever the
+/// switch says, and where the family's rule sets the switch aside the replay
+/// decides alone; so the tag reads the prompt as the engine will. The
+/// table's refusal waits for request building, which decides
 /// on the selected worker; the registry's refuses the request here (a 400,
 /// logged under `stage`). A table whose markers the decoder would drop as
 /// special tokens needs them kept whatever the request asks of the channels:
@@ -137,8 +144,10 @@ pub(crate) fn prepare(
     // after it (thinking switched off): the calls' tag owes none of it, and
     // no thought stands in front of the calls.
     let thought_closed = prompt_thought.is_some_and(|thought| thought.closed);
-    let reasoning =
-        !thought_closed && (switch || prompt_thought.is_some_and(|thought| thought.open));
+    // The one rule request building asks (`reasoning_decision`): the replay's
+    // answer, with the switch only where the replay does not decide alone; the
+    // switch itself where no table replays the prompt.
+    let reasoning = prompt_thought.map_or(switch, |thought| thought.or_switch(|| switch));
     let from_the_table = reading.as_ref().map_err(Clone::clone).and_then(|read| {
         symphony::constraint_for(
             read,
@@ -151,6 +160,40 @@ pub(crate) fn prepare(
         )
     });
     let choice = asks.choice();
+    // A table's tag that opens with free text does not hold the model to the
+    // call, so the older registry's JSON schema goes out in its place. No
+    // parser is named for it: a parser's own tag opens the same way and is
+    // not spelled for the workers' vocabulary. A request that schema cannot
+    // spell keeps the table's tag: one the registry cannot build, or one
+    // that loses what a reference in the tools' parameters points at.
+    let from_the_table = from_the_table.map(|found| {
+        found.held_by(|| {
+            let schema = ctx
+                .components
+                .tool_parser_factory
+                .registry()
+                .generate_tool_constraint(None, tools, choice.as_deref()?, reasoning)
+                .inspect_err(|e| {
+                    debug!(
+                        function = stage,
+                        error = %e,
+                        "No JSON schema for the forced call; the table's tag stands"
+                    );
+                })
+                .ok()
+                .flatten()?;
+            if symphony::keeps_references(&schema, tools) {
+                Some(schema)
+            } else {
+                debug!(
+                    function = stage,
+                    "The JSON schema for the forced call loses a reference's target; the \
+                     table's tag stands"
+                );
+                None
+            }
+        })
+    });
     let constraint = match (from_the_table, choice.as_deref()) {
         (Ok(symphony::Prepared::None), Some(tool_choice)) if !tools.is_empty() => {
             let constraint = ctx
@@ -931,12 +974,21 @@ mod tests {
     /// tool-call parser. With no tool-call name the older registry has no tag of its own for a
     /// forced call, so the call takes its JSON schema where the table has no tag either.
     fn pool(table: &str, start: Option<&str>) -> Arc<SharedComponents> {
+        let start = start.map(|start| (tool_parser::GrammarStart::LABEL, start));
+        pool_of(
+            ModelCard::new(SERVED).with_reasoning_parser(table),
+            start.as_slice(),
+        )
+    }
+
+    /// The gateway's components over one worker that serves `card` and carries `labels`.
+    fn pool_of(card: ModelCard, labels: &[(&str, &str)]) -> Arc<SharedComponents> {
         let registry = Arc::new(WorkerRegistry::new());
         let mut worker = BasicWorkerBuilder::new("grpc://engine:50051")
-            .model(ModelCard::new(SERVED).with_reasoning_parser(table))
+            .model(card)
             .worker_type(WorkerType::Regular);
-        if let Some(start) = start {
-            worker = worker.label(tool_parser::GrammarStart::LABEL, start);
+        for (label, value) in labels {
+            worker = worker.label(*label, *value);
         }
         registry.register(Arc::new(worker.build()));
         let mut components = components_over(
@@ -968,6 +1020,253 @@ mod tests {
     const SERVED: &str = "acme/thinker-1";
     /// The prompt's tail with the thought open, as the table whose name the card carries reads it.
     const THINKING: &str = "<|message_model|><|content_thinking|>";
+
+    /// A forced call from a thought the prompt left open: workers that name where they start a
+    /// grammar get the table's tag; where they name no start the table's tag would open with
+    /// free text, which owes the call nothing, so the older registry's schema goes out, as on a
+    /// table with no tag.
+    #[test]
+    fn a_forced_call_from_an_open_thought_takes_the_schema_where_the_workers_name_no_start() {
+        let tokenizer = hiding(&["<think>", "</think>"]);
+        for (start, schema) in [
+            (Some("first_token"), false),
+            (Some("after_reasoning"), false),
+            (None, true),
+        ] {
+            let chat = forced(true);
+            let mut ctx = RequestContext::for_chat(
+                Arc::clone(&chat),
+                None,
+                SERVED.into(),
+                pool("qwen3", start),
+            );
+            ctx.state.parser = Some(ParserChoice::Symphony);
+            let tools = chat.tools.clone().unwrap_or_default();
+            let prepared = prepare(
+                &ctx,
+                Asks::Chat(&chat),
+                &tools,
+                PROMPT,
+                true,
+                &tokenizer,
+                "test",
+            )
+            .map_err(|response| response.status())
+            .expect("nothing refused");
+            assert_eq!(
+                prepared.json_schema, schema,
+                "workers that start at {start:?}: {:?}",
+                prepared.constraint
+            );
+        }
+    }
+
+    /// A forced call from an open thought on workers that name no start takes the JSON schema
+    /// whatever tool-call parser the card names. Each name here is one a table answers to and
+    /// one the older registry builds a tag of its own for. No parser is named for the schema,
+    /// so that tag does not go out in the table's place: it may open with free text as the
+    /// table's does, and it is not spelled for workers that take the older tag vocabulary.
+    #[test]
+    fn a_forced_call_takes_the_schema_whatever_tool_call_parser_the_card_names() {
+        let tokenizer = hiding(&["<think>", "</think>"]);
+        let older = [(utils::TagVocabulary::LABEL, utils::TagVocabulary::OLDER)];
+        for parser in ["glm47_moe", "minimax_m3", "hy_v4", "deepseek_v41"] {
+            for (vocabulary, labels) in [
+                (utils::TagVocabulary::Current, &[][..]),
+                (utils::TagVocabulary::Older, &older[..]),
+            ] {
+                let cell = format!("{parser}, the {vocabulary:?} tag vocabulary");
+                let chat = forced(true);
+                let mut ctx = RequestContext::for_chat(
+                    Arc::clone(&chat),
+                    None,
+                    SERVED.into(),
+                    pool_of(ModelCard::new(SERVED).with_tool_parser(parser), labels),
+                );
+                ctx.state.parser = Some(ParserChoice::Symphony);
+                assert!(
+                    ctx.components
+                        .tool_parser_factory
+                        .registry()
+                        .has_structural_tag(parser),
+                    "{cell}: the older registry builds a tag of its own"
+                );
+                let workers = ctx
+                    .components
+                    .worker_registry
+                    .get_by_model(&ctx.input.model_id);
+                assert_eq!(symphony::vocabulary_of(&workers), vocabulary, "{cell}");
+                let tools = chat.tools.clone().unwrap_or_default();
+                let prepared = prepare(
+                    &ctx,
+                    Asks::Chat(&chat),
+                    &tools,
+                    PROMPT,
+                    true,
+                    &tokenizer,
+                    "test",
+                )
+                .map_err(|response| response.status())
+                .expect("nothing refused");
+                assert!(
+                    matches!(prepared.reading, Some(Reading::Table(..))),
+                    "{cell}: a table reads the response"
+                );
+                assert!(
+                    prepared.json_schema,
+                    "{cell}: the schema, not a tag: {:?}",
+                    prepared.constraint
+                );
+            }
+        }
+    }
+
+    /// A `required` call the older registry's one schema cannot spell keeps the table's tag,
+    /// from an open thought on workers that name no start, and is served: two tools that
+    /// define one name differently, which that schema refuses to build; a reference to an entry
+    /// of `definitions`, which it builds and leaves pointing nowhere, since it lifts the tools'
+    /// `$defs` and nothing else. The table's tag reads each tool's parameters apart. Where every
+    /// reference keeps its target the schema goes out: one definition under the name, and a
+    /// named function, whose parameters are the schema as they are. A member named like a
+    /// reference inside the data of `examples` is none, and the schema goes out.
+    #[test]
+    fn a_required_call_the_schema_cannot_spell_keeps_the_tables_tag() {
+        let tokenizer = hiding(&["<think>", "</think>"]);
+        let tool = |name: &str, definitions: &str, place: &str| {
+            json!({"type": "function", "function": {"name": name, "parameters": {
+                "type": "object",
+                "properties": {"place": {"$ref": format!("#/{definitions}/place")}},
+                definitions: {"place": {"type": place}},
+            }}})
+        };
+        let required = json!("required");
+        let named = json!({"type": "function", "function": {"name": "lookup"}});
+        for (case, choice, tools, schema) in [
+            (
+                "one definition under the name",
+                &required,
+                vec![
+                    tool("lookup", "$defs", "string"),
+                    tool("route", "$defs", "string"),
+                ],
+                true,
+            ),
+            (
+                "two definitions under one name",
+                &required,
+                vec![
+                    tool("lookup", "$defs", "string"),
+                    tool("route", "$defs", "integer"),
+                ],
+                false,
+            ),
+            (
+                "a reference to an entry of `definitions`",
+                &required,
+                vec![tool("lookup", "definitions", "string")],
+                false,
+            ),
+            (
+                "a named function, the same reference",
+                &named,
+                vec![tool("lookup", "definitions", "string")],
+                true,
+            ),
+            (
+                "a member named like a reference inside `examples`",
+                &required,
+                vec![
+                    json!({"type": "function", "function": {"name": "lookup", "parameters": {
+                        "type": "object",
+                        "examples": [{"$ref": "literal"}],
+                    }}}),
+                ],
+                true,
+            ),
+        ] {
+            let chat: Arc<ChatCompletionRequest> = Arc::new(
+                serde_json::from_value(json!({
+                    "model": SERVED, "messages": [{"role": "user", "content": "hi"}],
+                    "tool_choice": choice,
+                    "tools": tools,
+                }))
+                .expect("chat request"),
+            );
+            let mut ctx = RequestContext::for_chat(
+                Arc::clone(&chat),
+                None,
+                SERVED.into(),
+                pool("qwen3", None),
+            );
+            ctx.state.parser = Some(ParserChoice::Symphony);
+            let tools = chat.tools.clone().unwrap_or_default();
+            let prepared = prepare(
+                &ctx,
+                Asks::Chat(&chat),
+                &tools,
+                PROMPT,
+                true,
+                &tokenizer,
+                "test",
+            )
+            .map_err(|response| response.status())
+            .expect("nothing refused");
+            assert_eq!(
+                prepared.json_schema, schema,
+                "{case}: {:?}",
+                prepared.constraint
+            );
+            assert_eq!(
+                matches!(
+                    prepared.constraint,
+                    Ok(symphony::Prepared::Constraint { table: true, .. })
+                ),
+                !schema,
+                "{case}: the table's own tag where the schema cannot spell the request"
+            );
+        }
+    }
+
+    /// The reader of a forced call under the schema starts the same on a table that has a tag
+    /// of its own: in the call on workers that start at the first token, with the prompt's
+    /// replay on workers that start once the thought is over, and on workers that do not say
+    /// with the replay kept and the JSON's opener named.
+    #[test]
+    fn a_forced_calls_reader_starts_the_same_on_a_table_that_has_a_tag() {
+        const OBJECT: &str = r#"{"type":"object","properties":{}}"#;
+        // The replay the reader keeps is the turn the model answers in.
+        const TURN: &str = "<|im_start|>assistant\n<think>\n";
+        for (start, replayed, opener) in [
+            (Some("first_token"), "", None),
+            (Some("after_reasoning"), TURN, None),
+            (None, TURN, Some(b'{')),
+        ] {
+            let chat = forced(true);
+            let mut ctx = RequestContext::for_chat(
+                Arc::clone(&chat),
+                None,
+                SERVED.into(),
+                pool("qwen3", start),
+            );
+            ctx.state.parser = Some(ParserChoice::Symphony);
+            let schema = ToolConstraint::JsonSchema(OBJECT.to_string());
+            let decided = decide(
+                &mut ctx,
+                Asks::Chat(&chat),
+                &[],
+                PROMPT,
+                Ok(symphony::Prepared::from(Some(schema))),
+                |_| panic!("the policy is requested: no auto tag"),
+            )
+            .map_err(|response| response.status())
+            .expect("nothing refused");
+            let assignment = decided.assignment.expect("the table reads the forced call");
+            assert_eq!(assignment.table(), "qwen3", "{start:?}");
+            assert_eq!(assignment.forcing.as_deref(), Some("lookup"), "{start:?}");
+            assert_eq!(assignment.prompt, replayed, "{start:?}");
+            assert_eq!(assignment.opener, opener, "{start:?}");
+        }
+    }
 
     /// A forced call the table has no tag for takes the older registry's JSON schema, and the
     /// table still reads the response. Where the table's markers are special tokens of the
@@ -1014,6 +1313,88 @@ mod tests {
                 prepared.keeps_special_tokens,
                 "separate_reasoning {separate_reasoning}"
             );
+        }
+    }
+
+    /// Preparation reads the thought by the rule request building asks. On the table whose
+    /// replay decides alone, a new turn the prompt leaves outside the thought is not reasoning
+    /// whatever the thinking switch says: the forced call's tag is the same with the switch on
+    /// and off, wherever the model's workers start a grammar, and request building says the
+    /// same of the turn from the replay preparation stored. A channel the prompt opened is
+    /// still read as open with the switch off.
+    #[test]
+    fn preparation_reads_the_thought_by_request_buildings_rule() {
+        const NEW_TURN: &str = "<|turn>user\nhi<turn|>\n<|turn>model\n";
+        const OPENED: &str = "<|turn>user\nhi<turn|>\n<|turn>model\n<|channel>thought\n";
+        let tokenizer = hiding(&["<|channel>", "<channel|>"]);
+        for start in [Some("first_token"), Some("after_reasoning"), None] {
+            let chat = forced(true);
+            let mut ctx = RequestContext::for_chat(
+                Arc::clone(&chat),
+                None,
+                SERVED.into(),
+                pool("gemma4", start),
+            );
+            ctx.state.parser = Some(ParserChoice::Symphony);
+            ctx.state.tokenizer = Some(Arc::clone(&tokenizer));
+            let tools = chat.tools.clone().unwrap_or_default();
+            let prepared_for = |ctx: &RequestContext, prompt: &str, switch: bool| {
+                prepare(
+                    ctx,
+                    Asks::Chat(&chat),
+                    &tools,
+                    prompt,
+                    switch,
+                    &tokenizer,
+                    "test",
+                )
+                .map_err(|response| response.status())
+                .expect("nothing refused")
+            };
+            let tag = |prompt: &str, switch: bool| {
+                format!("{:?}", prepared_for(&ctx, prompt, switch).constraint)
+            };
+            let new_turn = tag(NEW_TURN, false);
+            assert!(
+                new_turn.contains("lookup"),
+                "a tag over the forced tool: {new_turn}"
+            );
+            assert_eq!(
+                tag(NEW_TURN, true),
+                new_turn,
+                "a new turn, workers that start at {start:?}"
+            );
+            let opened = tag(OPENED, false);
+            assert_eq!(
+                tag(OPENED, true),
+                opened,
+                "an opened channel, workers that start at {start:?}"
+            );
+            if start == Some("first_token") {
+                assert_ne!(
+                    opened, new_turn,
+                    "the open channel's close stands before the call"
+                );
+            }
+            // Request building reads what preparation stored for the request, as the chat and
+            // Messages stages store it: the table's replay of the prompt, not one built again.
+            for (prompt, open) in [(NEW_TURN, false), (OPENED, true)] {
+                for switch in [true, false] {
+                    let prepared = prepared_for(&ctx, prompt, switch);
+                    let table = match &prepared.reading {
+                        Some(Reading::Table(format, _)) => Some(format.name()),
+                        _ => None,
+                    };
+                    assert_eq!(table, Some("gemma4"), "the table the card names reads");
+                    ctx.state.parser_names = Some(prepared.names);
+                    ctx.state.prompt_thought = Some(prepared.prompt_thought);
+                    assert_eq!(
+                        reasoning_decision(&ctx, SERVED, prompt, |_| switch),
+                        (open, false),
+                        "request building over {prompt:?}, the switch {switch}"
+                    );
+                }
+            }
         }
     }
 

@@ -31,7 +31,7 @@ use crate::{
     framework::DecisionScope,
     lease::{Lease, Membership, Outcome, ReleaseReason, Side, Signal},
     plugins::{
-        config::{Exposure, Failure, FrameBudget},
+        config::{EventSet, Exposure, Failure, FrameBudget},
         intern, own_bound, BoundPlugin, Counters, Fallback, HalfOpen, OpenDecision, Stage,
     },
     proto,
@@ -159,8 +159,7 @@ struct Tally {
     failed_streams: AtomicU64,
     late_answers: AtomicU64,
     observed: AtomicU64,
-    /// Shared with the `Observe` stream's task, which numbers an event by it.
-    observe_dropped: Arc<AtomicU64>,
+    observe_dropped: AtomicU64,
 }
 
 fn bump(counter: &AtomicU64) {
@@ -179,6 +178,7 @@ struct Inner {
     frame: FrameBudget,
     exposure: Exposure,
     needs: Needs,
+    observes: EventSet,
     failure: Failure,
     max_candidates: u32,
     counters: Counters,
@@ -187,7 +187,8 @@ struct Inner {
     peer: Arc<Peer>,
     observe_tx: mpsc::Sender<proto::ObserveRequest>,
     /// The `Observe` stream's queue until the first `Decide` stream
-    /// settles, which opens it.
+    /// settles, which opens it. None from the load on where the row lists no
+    /// kind of event: no stream is opened, and nothing is told.
     observe_rx: Mutex<Option<mpsc::Receiver<proto::ObserveRequest>>>,
     /// How many counters the row declares: an answer holds no more
     /// increments.
@@ -218,11 +219,15 @@ impl Inner {
         // The number is the stream's: the I/O thread writes it where the
         // event enters the stream, so threads that raise events at once
         // cannot send a later number first. A refused event is counted
-        // here, and the number of every later event counts it too.
+        // here, and an event carries that count as it enters the queue: the
+        // stream's task adds the highest it has seen, so a gap sits behind
+        // every event that entered the queue before the loss. An event whose
+        // thread stood between this read and its entry when the loss fell
+        // can arrive on either side.
         let request = proto::ObserveRequest {
             request: Some(proto::observe_request::Request::Event(
                 proto::LifecycleEvent {
-                    seq: 0,
+                    seq: self.tally.observe_dropped.load(Ordering::Relaxed),
                     event: Some(event),
                 },
             )),
@@ -238,12 +243,7 @@ impl LaneEvents for Inner {
     fn connected(&self) {
         bump(&self.tally.connects);
         if let Some(queue) = self.observe_rx.lock().take() {
-            let lane = ObserveLane::new(
-                Arc::clone(&self.peer),
-                self.events(),
-                queue,
-                Arc::clone(&self.tally.observe_dropped),
-            );
+            let lane = ObserveLane::new(Arc::clone(&self.peer), self.events(), queue);
             self.runtime.send(Command::Observe(Arc::new(lane)));
         }
     }
@@ -335,6 +335,7 @@ impl Plugin {
             frame,
             exposure: spec.view,
             needs: spec.needs,
+            observes: spec.observes,
             failure: spec.failure,
             max_candidates: spec.max_candidates,
             declared: spec.metrics.len(),
@@ -343,7 +344,7 @@ impl Plugin {
             tally: Tally::default(),
             peer,
             observe_tx,
-            observe_rx: Mutex::new(Some(observe_rx)),
+            observe_rx: Mutex::new((!spec.observes.is_empty()).then_some(observe_rx)),
         });
         let plugin = Arc::new(Self {
             inner,
@@ -401,6 +402,12 @@ impl Plugin {
 
     pub fn needs(&self) -> Needs {
         self.inner.needs
+    }
+
+    /// The kinds of lifecycle event the plugin hears, as its row lists
+    /// them.
+    pub fn observes(&self) -> EventSet {
+        self.inner.observes
     }
 
     /// The counters the plugin adds to.
@@ -932,7 +939,14 @@ impl Bound {
             return;
         }
         open.decision_id = lane.next_id();
-        let frame = view::decide(open.decision_id, facts, candidates, pool, &inner.exposure);
+        let frame = view::decide(
+            open.decision_id,
+            facts,
+            candidates,
+            pool,
+            &inner.exposure,
+            inner.needs,
+        );
         if bound & (FILTER | SCORE) == 0 {
             // The pick alone: the frame waits for the combined scores.
             open.pending = Some(frame);
@@ -1099,15 +1113,19 @@ impl DecisionScope for Bound {
 /// kind's answers, named by the plugin.
 impl BoundPlugin for Bound {
     fn name(&self) -> &'static str {
-        self.plugin.inner.name
+        self.plugin.name()
     }
 
     fn failure(&self) -> Failure {
-        self.plugin.inner.failure
+        self.plugin.failure()
     }
 
     fn needs(&self) -> Needs {
-        self.plugin.inner.needs
+        self.plugin.needs()
+    }
+
+    fn observes(&self) -> EventSet {
+        self.plugin.observes()
     }
 
     fn take_observer(&self) -> bool {
@@ -1175,7 +1193,9 @@ impl BoundPlugin for Bound {
     }
 
     fn observe_membership(&self, change: &Membership<'_>) {
-        self.plugin.inner.observe(view::membership(change));
+        if let Some(event) = view::membership(change) {
+            self.plugin.inner.observe(event);
+        }
     }
 
     fn observe_signal(&self, signal: &Signal) {

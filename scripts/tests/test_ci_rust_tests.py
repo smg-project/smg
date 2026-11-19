@@ -12,6 +12,7 @@ matched filters to the shards.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -40,6 +41,7 @@ INFRA_FILES = (
     "scripts/ci_rust_tests.sh",
     "scripts/ci_install_rust.sh",
     "scripts/ci_apt_mirror.sh",
+    "scripts/ci_apt_install.sh",
     "scripts/ci_apt_update.sh",
     "scripts/ci_retry.sh",
     "scripts/ci_install_build_deps.sh",
@@ -220,6 +222,18 @@ class ShardTableTests(unittest.TestCase):
         self.assertFalse(filter_matches(filters["rust-multimodal"], "crates/tokenizer/src/lib.rs"))
         self.assertFalse(filter_matches(filters["rust-gateway"], "docs/README.md"))
 
+    def test_the_kv_filter_covers_the_source_the_policy_crates_test_reads(self):
+        # The policy controller's binary test holds its allocator settings to
+        # the gateway's constant, read from this file by path: a change there
+        # can change its result, so it runs the kv shard.
+        path = "model_gateway/src/observability/metrics.rs"
+        test = REPO / "crates" / "policy_controller" / "tests" / "binary.rs"
+        self.assertIn(f'"/../../{path}"', test.read_text())
+        filters = path_filters()
+        self.assertTrue(filter_matches(filters["rust-kv"], path), path)
+        # Only that file: the rest of the gateway changes no test of the shard.
+        self.assertFalse(filter_matches(filters["rust-kv"], "model_gateway/src/lib.rs"))
+
     def test_the_gateway_filter_covers_the_sources_its_integration_tests_read(self):
         # The metrics catalogue test walks these roots for recorder and family
         # names, and the dashboard test reads the chart: a change there can
@@ -249,7 +263,7 @@ class ShardTableTests(unittest.TestCase):
         # line wrote it: the shard that runs them builds it first, requires
         # it, and runs on a change to the example or to the tool's installer.
         row = next(r for r in shard_table() if r["shard"] == "kv")
-        self.assertEqual(row["needs"], "policy-guest")
+        self.assertEqual(row["needs"], "policy-guest,policy-import")
         workflow = WORKFLOW.read_text()
         # The step: the pinned tool, the line a user runs, then, inside the
         # guest's directory, the repository's formatter (nightly) and the
@@ -312,6 +326,160 @@ class ShardTableTests(unittest.TestCase):
         for target in manifest.get("test", []):
             for need in target.get("required-features", []):
                 self.assertIn(need, on, f"the kv shard would skip tests/{target['name']}.rs")
+
+    def test_the_kv_shard_builds_the_example_controller_outside_the_workspace(self):
+        # The example controller is also built where a user stands: its own
+        # script writes it outside the workspace with the crate named by
+        # git from a snapshot of the checkout, and its cases run there.
+        row = next(r for r in shard_table() if r["shard"] == "kv")
+        self.assertIn("policy-import", row["needs"].split(","))
+        workflow = WORKFLOW.read_text()
+        step = workflow.split("- name: Build the example controller outside the workspace", 1)[1]
+        step = step.split("\n      - name:", 1)[0]
+        for line in (
+            "if: contains(matrix.needs, 'policy-import')",
+            "bash examples/policy-controller/own-repository.sh "
+            '"${RUNNER_TEMP}/own-controller" --snapshot',
+            'cd "${RUNNER_TEMP}/own-controller"',
+            "cargo test",
+        ):
+            self.assertIn(line, step)
+        filters = path_filters()
+        for path in (
+            "examples/policy-controller/own-repository.sh",
+            "examples/policy-controller/src/main.rs",
+            "crates/policy_controller/build.rs",
+        ):
+            self.assertTrue(filter_matches(filters["rust-kv"], path), path)
+
+    def test_the_example_controllers_script_writes_a_repository_of_its_own(self):
+        example = REPO / "examples" / "policy-controller"
+        own = example / "own-repository.sh"
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "own"
+            subprocess.run(
+                ["bash", str(own), str(dest), "file:///a/checkout"], check=True, capture_output=True
+            )
+            text = (dest / "Cargo.toml").read_text()
+            manifest = tomllib.loads(text)
+            # The crate by git from the source it is handed, and no key the
+            # workspace alone resolves.
+            self.assertEqual(
+                manifest["dependencies"]["smg-policy-controller"],
+                {"git": "file:///a/checkout", "features": ["controller"]},
+            )
+            self.assertNotIn("workspace", text)
+            # The test-only dependencies at the versions the workspace names.
+            workspace = tomllib.loads((REPO / "Cargo.toml").read_text())["workspace"][
+                "dependencies"
+            ]
+            dev = manifest["dev-dependencies"]
+            self.assertEqual(dev["serde_yaml"], workspace["serde_yaml"])
+            # The allocator the example registers, as the workspace names it
+            # and under the target rule the example's own manifest names.
+            own_manifest = tomllib.loads((example / "Cargo.toml").read_text())
+            (rule,) = own_manifest["target"]
+            self.assertEqual(
+                manifest["target"][rule]["dependencies"]["tikv-jemallocator"],
+                workspace["tikv-jemallocator"],
+            )
+            self.assertEqual(dev["tokio"]["version"], workspace["tokio"]["version"])
+            # The door case's dependencies: the mock engine by git from the
+            # crate's own source, the client's transport as the workspace
+            # names it, and the runtime features the example's manifest asks.
+            self.assertEqual(dev["mock-worker"], {"git": "file:///a/checkout"})
+            self.assertEqual(dev["tonic"], workspace["tonic"])
+            self.assertEqual(
+                dev["tokio"]["features"],
+                own_manifest["dev-dependencies"]["tokio"]["features"],
+            )
+            # The decide case's dependency: the engine's client by git from
+            # the crate's own source, which holds requests on the mock engine.
+            self.assertEqual(dev["smg-grpc-client"], {"git": "file:///a/checkout"})
+            # The crate's reference client, which asks the started binary its
+            # decisions: a feature the tests alone turn on, in the example's
+            # manifest and in the copy's.
+            client = {"git": "file:///a/checkout", "features": ["client"]}
+            self.assertEqual(dev["smg-policy-controller"], client)
+            ours = own_manifest["dev-dependencies"]["smg-policy-controller"]
+            self.assertEqual(ours["features"], ["client"])
+            # The release profile the stock controller is built with, without
+            # its per-package entries: a copy with none builds on cargo's
+            # default profile, not the stock build's full LTO in one unit.
+            release = tomllib.loads((REPO / "Cargo.toml").read_text())["profile"]["release"]
+            release.pop("package", None)
+            self.assertEqual(manifest["profile"], {"release": release})
+            # The allocator's page setting, as the workspace's cargo
+            # configuration holds it: without it an aarch64 build of the
+            # copy runs on its build host's page size alone.
+            key = "AARCH64_UNKNOWN_LINUX_GNU_JEMALLOC_SYS_WITH_LG_PAGE"
+            ours = tomllib.loads((REPO / ".cargo" / "config.toml").read_text())["env"][key]
+            written = tomllib.loads((dest / ".cargo" / "config.toml").read_text())
+            self.assertEqual(written, {"env": {key: ours}})
+            for name in (
+                "src/main.rs",
+                "tests/serve.rs",
+                "policy.yaml",
+                "Cargo.lock",
+                "rust-toolchain.toml",
+            ):
+                self.assertTrue((dest / name).is_file(), name)
+            # A directory that exists is refused.
+            again = subprocess.run(["bash", str(own), str(dest)], capture_output=True, text=True)
+            self.assertEqual(again.returncode, 2, again.stderr)
+            self.assertIn("exists", again.stderr)
+            # With no source named, the line is the guide's own.
+            plain = Path(tmp) / "plain"
+            subprocess.run(["bash", str(own), str(plain)], check=True, capture_output=True)
+            line = next(
+                entry
+                for entry in (plain / "Cargo.toml").read_text().splitlines()
+                if entry.startswith("smg-policy-controller")
+            )
+            self.assertIn(line, (example / "README.md").read_text())
+            # With --snapshot the source is a repository of one revision
+            # beside the copy, made from this checkout's tracked files. The
+            # revision is the script's own: a host whose configuration signs
+            # every revision (here with a program that fails) signs none.
+            snap = Path(tmp) / "snap"
+            count = int(os.environ.get("GIT_CONFIG_COUNT") or 0)
+            signing = {
+                **os.environ,
+                "GIT_CONFIG_COUNT": str(count + 2),
+                f"GIT_CONFIG_KEY_{count}": "commit.gpgsign",
+                f"GIT_CONFIG_VALUE_{count}": "true",
+                f"GIT_CONFIG_KEY_{count + 1}": "gpg.program",
+                f"GIT_CONFIG_VALUE_{count + 1}": "false",
+            }
+            subprocess.run(
+                ["bash", str(own), str(snap), "--snapshot"],
+                check=True,
+                capture_output=True,
+                env=signing,
+            )
+            source = Path(tmp) / "snap-source"
+            named = tomllib.loads((snap / "Cargo.toml").read_text())["dependencies"]
+            self.assertEqual(named["smg-policy-controller"]["git"], f"file://{source}")
+            for args, expected in (
+                (("rev-list", "--count", "HEAD"), "1"),
+                (("status", "--short"), ""),
+            ):
+                read = subprocess.run(
+                    ["git", "-C", str(source), *args], check=True, capture_output=True, text=True
+                )
+                self.assertEqual(read.stdout.strip(), expected, args)
+            for name in (
+                "crates/policy_controller/Cargo.toml",
+                "crates/worker/proto/common.proto",
+            ):
+                self.assertTrue((source / name).is_file(), name)
+        # A directory inside the checkout is refused and never made: the
+        # workspace would claim the package.
+        inside = example / "own-repository-refused"
+        refused = subprocess.run(["bash", str(own), str(inside)], capture_output=True, text=True)
+        self.assertEqual(refused.returncode, 2, refused.stderr)
+        self.assertIn("inside this checkout", refused.stderr)
+        self.assertFalse(inside.exists())
 
     def test_every_shard_has_a_filter_and_setup_flags_the_workflow_knows(self):
         filters = path_filters()

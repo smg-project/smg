@@ -69,8 +69,19 @@ pub struct LoadSample {
 /// worker stays polled until its records resume.
 ///
 /// Every write that changes what is on file for an engine judges the
-/// engine's overload verdict once, when the write is whole: a record, a
-/// report, the word that no report came, an eviction.
+/// engine's overload verdict when the write is whole: a record, a
+/// report, the word that no report came, an eviction. Once the caller
+/// told how often it hears a rank ([`LoadSink::heard_every`]), a judgment
+/// counts a rank's sample only while its engine still says it.
+///
+/// A rank its engine stops naming is avoided at once. Where an answer
+/// brings a row for one rank of an engine and none for another, the rank it
+/// left out carries the overload bit on its rows while a rank the answer
+/// named has a record on file, whether or not a threshold stands. The mark
+/// ends when an answer or a record names the rank again. It goes with the
+/// member's rows, and with the build that follows the member's
+/// registration under another rank number. A rank alone is never avoided:
+/// with no named rank on file it reads as its engine does.
 ///
 /// A worker's rows live exactly as long as its membership row: the write
 /// that removes or replaces the worker deletes them, and a record or a
@@ -91,17 +102,24 @@ pub trait LoadSink: Send + Sync {
     /// One engine's answer to the poll asked at `polled_at`, whole: for
     /// each rank the poll was for, under the rank's own id, the row the
     /// answer brought, or `None` where it brought none. The rows are
-    /// written and the engine is judged once, so two ranks that trade
+    /// written whole before the engine is judged, so two ranks that trade
     /// their load in one answer are never read as one new rank beside one
-    /// old. A rank the answer omits keeps what is on file. An answer with
-    /// no row for any rank of an engine is the word that no report came:
-    /// nothing on file changes, and the engine's overload verdict reads
+    /// old. A rank the answer omits keeps what is on file, and beside a
+    /// rank the answer names it is avoided from this write on. An answer
+    /// with no row for any rank of an engine is the word that no report
+    /// came: nothing on file changes, no rank is marked or named again,
+    /// and the engine's overload verdict reads
     /// clear until its next record or report. The word stands over no
     /// engine a rank of which pushed since the poll began, whether the
     /// answer names that rank or not. Whether a stream still serves a
     /// rank the poll was not for is the caller's to know, by the
     /// freshness it chose the poll's ranks with: it says the word only
-    /// for a poll that left out no such rank.
+    /// for a poll that left out no such rank. The crate's store pays the
+    /// build a rank the answer names still waits for before it writes the
+    /// answer, so an answer is read over the rows of every rank it names.
+    /// A row the answer brings for a rank that pushed since the poll began
+    /// is passed over, and names its engine all the same: a rank left out
+    /// beside it is avoided.
     fn report(
         &self,
         answer: &[(WorkerId, u16, Option<LoadRow>)],
@@ -111,6 +129,21 @@ pub trait LoadSink: Send + Sync {
 
     /// The poll decision for the worker at `now` under the poll `interval`.
     fn poll_mode(&self, id: WorkerId, now: Instant, interval: Duration) -> PollMode;
+
+    /// The caller hears every ready rank once a `period`: by its stream's
+    /// records, or by the poll it falls back to. From this call on a
+    /// sample is a fact while its engine still says it: a judgment counts
+    /// the row of a data-parallel engine's rank only where its receipt
+    /// lies no further behind the engine's newest than three periods,
+    /// which keep a rank through one lost report at the least. Both
+    /// instants are the sink's own receipts (a record's arrival, a poll's
+    /// start), so no clock crosses, and no timer runs: the age is read at
+    /// the write that judges, and an engine none of whose ranks is heard
+    /// keeps its verdict until the word that no report came. Every engine
+    /// is judged again at the call. Until a period is told no sample ends
+    /// by its age. A period is told once: a call with another period
+    /// changes nothing and answers `false`.
+    fn heard_every(&self, period: Duration) -> bool;
 
     /// The row of one rank, when one is on file.
     fn load(&self, id: WorkerId, rank: u16) -> Option<LoadSample>;
@@ -128,6 +161,12 @@ pub trait LoadSink: Send + Sync {
     /// after a write and calls [`LoadSink::publish`] at it. A host that
     /// does neither shows a waiting write with its next one, and the row's
     /// age says so meanwhile.
+    ///
+    /// The crate's store names the instant for one thing more: the build
+    /// its membership writes owe. The store pays that build ahead of the
+    /// instant for one load write alone, a poll's answer for a rank that
+    /// has no row yet, and no load write is shown before it, so a host with
+    /// no loop asks for it ([`crate::store::MemoryStore::publish_now`]).
     fn publish_due(&self) -> Option<Instant> {
         None
     }
@@ -137,4 +176,19 @@ pub trait LoadSink: Send + Sync {
     fn publish(&self, now: Instant) {
         let _ = now;
     }
+
+    /// Hand the sink the host's wake. The sink calls it, on the writing
+    /// thread, where a write that is no load call leaves an instant for
+    /// [`LoadSink::publish_due`] to name and none stood: in the crate's
+    /// store, the build a membership write owes. The host's loop reads the
+    /// instant again at each call. The last wake handed stands. A sink
+    /// that never names an instant drops it.
+    fn wake_with(&self, wake: Wake) {
+        drop(wake);
+    }
 }
+
+/// The host's wake: what a sink calls to have its host read
+/// [`LoadSink::publish_due`] again. It is called under the writer's locks:
+/// it sets a flag or a notification and returns.
+pub type Wake = Box<dyn Fn() + Send + Sync>;

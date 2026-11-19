@@ -26,8 +26,8 @@ use smg::{
         BucketPolicy, CacheAwarePolicy, LoadBalancingPolicy, PowerOfTwoPolicy, RandomPolicy,
         RoundRobinPolicy, SelectWorkerInfo,
     },
-    routers::grpc::backend_client::BackendClient,
     worker::{
+        connection::engine::EngineConnection,
         health::{
             circuit_breaker::{CircuitBreaker, CircuitState},
             resilience::ResolvedResilience,
@@ -239,7 +239,7 @@ impl Worker for GrpcWorker {
         Some(Arc::clone(&self.http_client))
     }
 
-    async fn get_backend_client(&self) -> WorkerResult<Option<Arc<BackendClient>>> {
+    async fn engine_connection(&self) -> WorkerResult<Option<Arc<dyn EngineConnection>>> {
         // Not used by policies — the FFI layer handles the backend directly.
         Ok(None)
     }
@@ -375,7 +375,7 @@ pub unsafe extern "C" fn sgl_multi_client_create(
     // These require SelectWorkerInfo.headers and/or SelectWorkerInfo.hash_ring
     // which are not available in the SDK. To support them we would need to:
     // - Forward HTTP headers from the Go HTTP server through the FFI boundary
-    // - Build and cache a HashRing from the worker list (like WorkerRegistry does)
+    // - Build and cache a HashRing from the worker list (as the gateway does for each membership generation)
     let policy: Arc<dyn LoadBalancingPolicy> = match policy_name_str {
         "round_robin" | "roundrobin" => Arc::new(RoundRobinPolicy::new()),
         "random" => Arc::new(RandomPolicy::new()),

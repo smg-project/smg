@@ -8,8 +8,12 @@ name: PR Policy Controller Image
 # under the security context the Helm chart gives it, its probes read, a
 # clean stop and a log with no escape byte. The chart's controller cases then
 # run on the binary copied out of the image: every argument the chart renders
-# is parsed by the binary the image ships. Nothing is pushed and no cache is
-# saved.
+# is parsed by the binary the image ships. The example controller's image
+# (examples/policy-controller) is then built by the same file, as its guide
+# builds it, and started: its log names the scorer the example adds. The same
+# image is then built for arm64 by the file's own cross build, so a step of
+# the file that holds for the stock package alone, or for the runner's
+# platform alone, fails here. Nothing is pushed and no cache is saved.
 on:
   pull_request:
     paths:
@@ -22,8 +26,13 @@ on:
       # The contracts: the binary's protocol and plugin bindings are compiled
       # from them, the protocol's with the engine wire's messages it imports.
       - 'crates/policy_controller/contracts/**'
-      - 'crates/grpc_client/proto/common.proto'
+      - 'crates/worker/proto/common.proto'
       - 'rust-toolchain.toml'
+      # The cargo configuration the build reads: the allocator of an arm64
+      # binary takes its page size from it.
+      - '.cargo/config.toml'
+      # The example controller, whose image the last steps build.
+      - 'examples/policy-controller/**'
       # What the chart's controller cases read: the cases, what configures
       # their run and what a render reads. The chart's alert rule tests are
       # read by no case and start nothing here. Its README is read by one
@@ -54,6 +63,7 @@ jobs:
     timeout-minutes: 45
     env:
       IMAGE: smg-policy-controller:pr
+      EXAMPLE_IMAGE: policy-controller-example:pr
     steps:
       - uses: actions/checkout@v7
         with:
@@ -71,11 +81,16 @@ jobs:
       # controller (deploy/helm/smg/values.yaml): a read-only root
       # filesystem, no capability, no privilege escalation, UID 65532. The
       # controller's id is the container's host name, as under Kubernetes.
+      # A start names the source of its spec: here a store, an empty
+      # directory of that user's on a memory file system, since the root is
+      # read-only.
       - name: Start the controller, read its probes and stop it
         run: |
           docker run --detach --name controller \
             --read-only --cap-drop ALL --security-opt no-new-privileges \
-            --publish 127.0.0.1:30103:30103 "$IMAGE"
+            --tmpfs /var/lib/smg/spec:rw,uid=65532,gid=65532,mode=0700 \
+            --publish 127.0.0.1:30103:30103 "$IMAGE" \
+            --spec-store /var/lib/smg/spec
           # The admin listener answers within a second of the start. A
           # controller that refused to start has exited: the wait ends at
           # once and the reads below fail the step.
@@ -151,6 +166,65 @@ jobs:
             exit 1
           fi
 
+      # The example controller's image, by its guide's own line: the same
+      # file with PACKAGE naming the example's package. The layers up to the
+      # source are the stock build's, and the example is compiled. It starts
+      # under the same security context on its own policy document, mounted
+      # where the chart mounts one, and its start-up line names the scorer
+      # the example adds, which the stock binary does not hold.
+      - name: Build the example controller's image
+        run: >-
+          docker build --progress plain --file docker/policy-controller.Dockerfile
+          --build-arg PACKAGE=policy-controller-example --tag "$EXAMPLE_IMAGE" .
+
+      - name: Start the example controller, read its stages and stop it
+        run: |
+          docker run --detach --name example \
+            --read-only --cap-drop ALL --security-opt no-new-privileges \
+            --volume "${PWD}/examples/policy-controller/policy.yaml:/etc/smg/policy-spec/spec.yaml:ro" \
+            --publish 127.0.0.1:30113:30103 "$EXAMPLE_IMAGE" \
+            --spec-file /etc/smg/policy-spec/spec.yaml
+          for _ in $(seq 1 30); do
+            if curl -fs --max-time 2 -o /dev/null http://127.0.0.1:30113/liveness; then
+              break
+            fi
+            [ "$(docker inspect --format '{{.State.Running}}' example)" = "true" ] || break
+            sleep 1
+          done
+          for path in liveness readiness; do
+            curl -fsS --max-time 5 "http://127.0.0.1:30113/${path}"
+            echo
+          done
+          docker stop -t 60 example
+          code="$(docker inspect --format '{{.State.ExitCode}}' example)"
+          if [ "$code" != "0" ]; then
+            echo "::error::the example controller exited ${code} after SIGTERM"
+            exit 1
+          fi
+          docker logs example > "${RUNNER_TEMP}/example.log" 2>&1
+          if ! grep -q 'stages held.*"pack"' "${RUNNER_TEMP}/example.log"; then
+            echo "::error::the example controller's start-up line names no pack scorer"
+            exit 1
+          fi
+
+      # The example controller's image for arm64, by the file's own cross
+      # build: the build stage runs on the runner, and the final stage, which
+      # runs the binary, under emulation. What the file asks of an arm64
+      # binary it asks of this one too: the example registers the stock
+      # binary's allocator. The image is built and not started.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Build the example controller's image for arm64
+        run: >-
+          docker build --progress plain --platform linux/arm64
+          --file docker/policy-controller.Dockerfile
+          --build-arg PACKAGE=policy-controller-example --tag "$EXAMPLE_IMAGE-arm64" .
+
       - name: The controller's log
         if: always()
         run: docker logs controller || true
+
+      - name: The example controller's log
+        if: always()
+        run: docker logs example || true

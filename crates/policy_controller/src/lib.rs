@@ -61,7 +61,7 @@
 //!
 //! - Section 9, the WebAssembly plugin host (the `wasm` module, behind the `wasm`
 //!   feature): user policies as components of the committed `smg:policy`
-//!   package, one kept instance per deciding thread, every call under fuel,
+//!   package, one kept instance per decider, every call under fuel,
 //!   bound to a profile as the framework's own stages. What every plugin
 //!   kind shares (the breaker, the counters, the stage adapters) is the
 //!   `plugins` module.
@@ -90,12 +90,15 @@
 //! report's sample instant); the wire carries durations only.
 
 pub mod affinity;
+pub mod bucket;
 pub mod builtins;
 pub mod catalog;
 #[cfg(feature = "client")]
 pub mod client;
 #[cfg(feature = "controller")]
 pub mod controller;
+pub mod counts;
+pub mod decider;
 pub mod decision;
 pub mod elector;
 pub mod framework;
@@ -119,27 +122,32 @@ pub mod wasm;
 pub mod wit;
 
 pub use catalog::{Catalog, CatalogError, StageKind};
+pub use counts::{KeptCounts, LentCounts};
 pub use decision::{
-    Decision, Pair, Pick, Queue, Shed, ShedReason, Survivors, Target, Targets, Trace, MAX_TARGETS,
-    TRACE_TOP,
+    Decision, Lifted, Pair, Pick, Queue, Shed, ShedReason, Survivors, Target, Targets, Trace,
+    MAX_TARGETS, TRACE_TOP,
 };
 pub use framework::{
-    Binding, DecisionScope, Engine, Filter, Narrowed, PairPools, PairTable, PairTableError, Picker,
-    Plan, Profile, Scorer, Scratch, TieBand, Weighted, DRAW_BOUND, DRAW_FROM,
+    Binding, DecisionScope, EncodeItems, EncodePlaced, EncodePool, EncoderFacts, Engine, Filter,
+    Front, Narrowed, PairPools, PairTable, PairTableError, Picker, Plan, Profile, Scorer, Scratch,
+    Spread, TieBand, Unit, Weighted, DRAW_BOUND, DRAW_FROM, RANK_FROM,
 };
 pub use lease::{
-    Lease, LeaseId, LeaseKind, Lifecycle, Membership, Outcome, ReleaseReason, Side, Signal,
-    TransportClass,
+    EventKind, EventSet, Lease, LeaseId, LeaseKind, Lifecycle, Membership, Outcome, ReleaseReason,
+    Side, Signal, TransportClass,
 };
 pub use ring::{ConsistentHash, Ring};
-pub use sessions::{Assignment, Pins, Recovery, SessionRule, SessionTable, SessionVerdict};
+pub use sessions::{
+    Assignment, Forgets, Pins, Recovery, SessionRule, SessionTable, SessionVerdict,
+};
 pub use spec::{
     AppliedSpec, Needs, PolicySpec, PowerOfTwoMetric, SessionsSpec, SpecError, API_VERSION, PRESETS,
 };
 pub use view::{
-    fingerprint, AffinityFacts, Candidate, Constraints, HashKind, Header, Health, Identity,
-    LoadRow, MediaCounts, ModelFingerprint, NamedAffinity, NamedHolder, OverloadRegime, Phase,
-    PoolFacts, RequestFacts, Role, Session, SignalSource, WireModes, WorkerId, ZoneCapacity,
+    fingerprint, AffinityFacts, Candidate, Constraints, Engines, HashKind, Header, Health,
+    Identity, LoadRow, MediaCounts, ModelFingerprint, NamedAffinity, NamedHolder, OverloadRegime,
+    Phase, PinSource, PoolFacts, RequestFacts, Role, Session, SignalSource, WireModes, WorkerId,
+    ZoneCapacity,
 };
 
 /// SplitMix64 over a decision's seed: the only randomness a stage gets, so a
@@ -152,11 +160,19 @@ pub use view::{
 ///   picker that draws first reads it too, and whatever follows that draw
 ///   (the order of the rows drawn, or the whole pass behind a draw that kept
 ///   nobody) reads it past those values;
+/// - one value of the seed's stream, read behind the draw of a picker whose
+///   unit is the engine: the seed of the stream that draws between equal
+///   rows of the engine taken;
 /// - the seed under the `warmup-slice` scorer's mask: that scorer's draws;
 /// - the seed under the alternates' mask: the order of equal counts among
 ///   the workers the count-first picker passed over;
 /// - the first value of the seed's stream: the seed a pair plan hands its
-///   decode side, whose stages derive their streams from it as above.
+///   decode side, whose stages derive their streams from it as above;
+/// - the seed under the store's two naming masks: where the store names a
+///   decision's rows and cuts a list at the profile's sample, the holders'
+///   draw and the warming rows' draw;
+/// - the first value of the holders' stream, and of each stream so seeded:
+///   the seed of each lookup a naming makes again, a stream a round.
 #[derive(Clone, Copy, Debug)]
 pub struct Draw(u64);
 
