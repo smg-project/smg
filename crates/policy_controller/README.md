@@ -2,6 +2,8 @@
 
 The policy controller decides which worker serves a request. It is this crate: a library that a host process embeds, and a binary, `smg-policy-controller`, that runs the same code as a service of its own. Every decision follows one **policy document**, a short YAML or JSON file that names the stages a decision runs through. The code calls the document a spec (`PolicySpec`), so "spec file" and "policy document" mean the same thing. The gateway does not route through the controller yet; that integration is in work.
 
+**Do I have to write one?** Not for the gateway: nothing in this crate changes its routing flags. The stock controller does need a document. Its start names a file or a store, and each classic policy name is a [preset](#the-ten-presets) to copy as that file.
+
 This page explains the document.
 
 1. [The smallest document](#the-smallest-document)
@@ -87,7 +89,7 @@ Filters take no settings.
 | Name | Kind | Keeps a worker when |
 |---|---|---|
 | `healthy` | hard | It is ready, its circuit breaker is closed, and it is not stalled or draining. |
-| `not-overloaded` | hard | It is under the overload thresholds: 8 queued requests and a KV-cache usage of 0.8. The binding's `overload` block changes the two numbers, and a worker's own registration overrides them. |
+| `not-overloaded` | hard | It is under the overload thresholds: 8 queued requests and a KV-cache usage of 0.8. The binding's `overload` block changes the two numbers with `waiting_requests` and `token_usage`, and a worker's own registration overrides them. |
 | `has-capacity` | hard | Its prefill capacity window has a free slot. |
 | `has-room` | soft | Its decode running window has a free room. |
 | `not-tried` | soft | No earlier attempt of this request tried it, and the host has not excluded it. |
@@ -128,7 +130,7 @@ Every scorer takes `weight`, 1 by default. The table lists the other settings, e
 | `best-with-temperature` | Not in this build. A document that names it is refused. | `temperature` |
 <!-- pickers: end -->
 
-`sample` is for a host that names the workers holding the request's prefix and the workers warming up. `best` then decides a large pool from those workers plus a random sample of that many more. A pool is large when it holds at least 16 workers and more than twice the sample. Any other pool is read whole.
+`sample` is for a host that names the workers holding the request's prefix and the workers warming up. `best` then decides a large pool from those workers plus a random sample of that many more. A pool is large when it holds at least 16 workers and more than twice the sample. Any other pool is read whole. The stock controller's store names those workers itself.
 
 ## The ten presets
 
@@ -136,6 +138,7 @@ A **preset** is a ready-made document inside the crate, one for each classic pol
 
 - Each preset is one profile, bound to every model.
 - All ten start with the same three filters.
+- A preset's name is written with underscores, as the classic policy names are. A stage's name is written with hyphens. So the preset `round_robin` picks with `round-robin`.
 - A preset also writes `generation: 1`. The documents below leave that line out; [loading](#loading-and-changing-a-document) says why.
 
 ### `random`
@@ -303,7 +306,7 @@ bindings:
     profile: cache_aware
 ```
 
-Workers whose cache already holds the request's prefix come first, and the shortest expected wait decides among them. Use it when the engines publish cache events.
+Workers whose cache already holds the request's prefix come first, and the shortest expected wait decides among them. Use it when the engines publish cache events. The stock controller does not take cache events yet: there no worker is seen as holding a prefix, and this preset places by warm-up and load. See [what is not built yet](#what-is-not-built-yet).
 
 ### `bucket`
 
@@ -357,6 +360,8 @@ A **plan** says how many workers one request needs.
 | `single` (the default) | One worker. | `profile` |
 | `pd-pair` | A prefill worker, then a decode worker that can pair with it. | `profiles.prefill`, `profiles.decode` |
 | `epd` | An encode worker for each encode item, then the pair. | `profiles.encode`, `profiles.prefill`, `profiles.decode` |
+
+The library decides all three plans. The stock controller applies a document of any plan, and its `Decide` call answers for `single` alone today. See [what is not built yet](#what-is-not-built-yet).
 
 A prefill and decode pair:
 
@@ -418,7 +423,7 @@ bindings:
 
 | Mode | It refuses a pair when |
 |---|---|
-| `off` | No fact of the KV handoff is compared. |
+| `off` | Never for a fact of the KV handoff: none is compared. |
 | `lenient` (the default) | Both workers report a fact and the two differ: the runtime, the transport, a KV layout fact or the protocol name. A fact that only one of them reports refuses nothing. |
 | `strict` | As `lenient`. Also when only one of the two reports a fact, when neither names its runtime or its transport, and when both report a version and the two differ. |
 
@@ -462,6 +467,12 @@ One more rule for the hash ring. Under `consistent_hashing`, a key stays on its 
 ## Loading and changing a document
 
 The stock controller takes its document from one of two sources. A start names exactly one.
+
+The binary needs the crate's `controller` feature. Without it the binary is not built.
+
+```sh
+cargo build --release -p smg-policy-controller --features controller
+```
 
 **A file.**
 
@@ -555,6 +566,9 @@ A stage is a Rust type that implements `Filter`, `Scorer` or `Picker`. You add i
 - A sessions rule under `pd-pair` or `epd`.
 - The `best-with-temperature` picker, and three settings of `prefix-affinity`: `decay`, `accounting_ttl_ms` and `spill.uncached_credit`.
 - The `bucket` scorer in the stock controller. The library runs it. The stock controller refuses a document that names it, because it does not yet report every request's end to a stage.
+- Cache events in the stock controller. Its `PushKvEvents` call is not served, and nothing else feeds its cache index. So `prefix-affinity` sees no worker as holding a prefix there. The library places by cache for a host that feeds the index.
+- Two more inputs in the stock controller. The circuit breaker is not fed, so `healthy` reads it as closed. A key's count of requests in flight is not fed, so `inflight_cap` passes no worker over.
 - A plugin named in the document. The format has no field for one.
+- Six calls of the contract: `Explain`, `GetSnapshot`, `PushLoad`, `PushKvEvents`, `StepDown` and `WatchRegime`. The stock controller answers each as not served.
 - The audit mode of the apply call.
 - The gateway's use of the controller.
