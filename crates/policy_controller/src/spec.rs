@@ -3721,7 +3721,21 @@ impl AppliedSpec {
         document: &PolicySpec,
         denied_headers: &[&str],
     ) -> Result<Self, SpecError> {
-        let built = document.built(&STOCK, denied_headers)?;
+        Self::validate_in(document, &STOCK, denied_headers)
+    }
+
+    /// [`AppliedSpec::validate_with`] over the stages `catalog` holds,
+    /// including stages the host registers.
+    ///
+    /// The caller assigns the document's generation number.
+    /// [`MemoryStore::apply`](crate::store::MemoryStore::apply) accepts a
+    /// generation whose number is above the standing one.
+    pub fn validate_in(
+        document: &PolicySpec,
+        catalog: &Catalog,
+        denied_headers: &[&str],
+    ) -> Result<Self, SpecError> {
+        let built = document.built(catalog, denied_headers)?;
         Ok(Self::of(document, document.digest()?, built))
     }
 
@@ -6954,6 +6968,150 @@ mod tests {
         let applied = AppliedSpec::validate(&document).expect("a preset validates");
         assert_eq!(applied.digest(), Some(document.digest().expect("a digest")));
         assert_eq!(AppliedSpec::unbound().digest(), None);
+    }
+
+    #[test]
+    fn validate_in_builds_the_registered_scorer_for_a_store_decision() {
+        use crate::{store::MemoryStore, Health, PoolFacts, Scratch, WorkerId};
+
+        const SCORER: &str = "prefer-idle";
+
+        #[derive(Debug)]
+        struct PreferIdle;
+
+        impl Lifecycle for PreferIdle {}
+
+        impl Scorer for PreferIdle {
+            fn name(&self) -> &'static str {
+                SCORER
+            }
+
+            fn score(
+                &self,
+                _: &RequestFacts<'_>,
+                candidates: &[Candidate],
+                kept: &[u32],
+                out: &mut [f32],
+            ) -> TieBand {
+                for (&index, score) in kept.iter().zip(out) {
+                    *score = if candidates[index as usize].in_flight == 0 {
+                        1.0
+                    } else {
+                        0.0
+                    };
+                }
+                TieBand::NORMALIZED
+            }
+        }
+
+        let mut catalog = Catalog::builtin();
+        catalog
+            .scorer(SCORER, || Box::new(PreferIdle))
+            .expect("a free scorer name");
+        let mut document = spec_with_score(&format!(r#""{SCORER}""#));
+        document.generation = 43;
+        let applied = AppliedSpec::validate_in(&document, &catalog, &[])
+            .expect("the registered scorer validates");
+        let store = MemoryStore::new();
+        store.apply(applied).expect("a newer generation");
+
+        store.deciding(|world| {
+            let spec = world.spec();
+            let pool = PoolFacts {
+                pool_size: 2,
+                generation: spec.generation(),
+                ..PoolFacts::default()
+            };
+            let mut scratch = Scratch::new();
+            for idle in [0, 1] {
+                let row = |position| Candidate {
+                    position,
+                    id: WorkerId(137 + u64::from(position)),
+                    health: Health {
+                        healthy: true,
+                        ..Health::default()
+                    },
+                    in_flight: u32::from(position != idle),
+                    ..Candidate::default()
+                };
+                let decision = spec.engine().decide(
+                    &RequestFacts::default(),
+                    &pool,
+                    &[row(0), row(1)],
+                    &Constraints::default(),
+                    &mut scratch,
+                );
+                let targets = &decision.pick().expect("a pick").targets;
+                assert_eq!(targets.first().expect("a target").position, idle);
+            }
+        });
+    }
+
+    #[test]
+    fn validate_in_refuses_headers_the_host_denies() {
+        let document = spec_with_view(r#"{"headers":["x-private-context"]}"#);
+        let catalog = Catalog::builtin();
+        let denied = ["X-Private-Context"];
+        let expected = SpecError::DeniedHeader {
+            path: "view.headers[0]".into(),
+            name: "x-private-context".into(),
+        };
+        assert!(AppliedSpec::validate_in(&document, &catalog, &[]).is_ok());
+        assert_eq!(
+            AppliedSpec::validate_in(&document, &catalog, &denied).expect_err("a denied header"),
+            expected
+        );
+        assert_eq!(
+            AppliedSpec::validate_with(&document, &denied).expect_err("a denied header"),
+            expected
+        );
+    }
+
+    #[test]
+    fn validate_in_preserves_the_stock_generation_digest_and_depth() {
+        let mut document = spec_with_score(r#"{"consistent-hash":{"prefix_tokens":143}}"#);
+        document.generation = 47;
+        let catalog = Catalog::builtin();
+        let applied = AppliedSpec::validate_in(&document, &catalog, &[])
+            .expect("a stock scorer validates in the stock catalog");
+        let stock = AppliedSpec::validate_with(&document, &[]).expect("a stock scorer validates");
+        let depth = |spec: &AppliedSpec| spec.block_hashes_read(HashKind::Token, 11);
+        assert_eq!(applied.generation(), 47);
+        assert_eq!(applied.generation(), stock.generation());
+        assert_eq!(applied.digest(), Some(document.digest().expect("a digest")));
+        assert_eq!(applied.digest(), stock.digest());
+        assert_eq!(depth(&applied), 13);
+        assert_eq!(depth(&applied), depth(&stock));
+    }
+
+    #[test]
+    fn validate_in_leaves_an_unnumbered_document_at_generation_zero() {
+        use crate::store::{MemoryStore, StaleGeneration};
+
+        let document = spec_with_view("{}");
+        let catalog = Catalog::builtin();
+        let validate = |document: &PolicySpec| {
+            AppliedSpec::validate_in(document, &catalog, &[]).expect("the document validates")
+        };
+        let store = MemoryStore::new();
+        let standing = 71;
+        store
+            .apply(validate(&PolicySpec {
+                generation: standing,
+                ..document.clone()
+            }))
+            .expect("a newer generation");
+
+        let unnumbered = validate(&document);
+        assert_eq!(unnumbered.generation(), 0);
+        assert_eq!(
+            store.apply(unnumbered),
+            Err(StaleGeneration {
+                standing,
+                offered: 0,
+            })
+        );
+        assert_eq!(store.world().spec().generation(), standing);
     }
 
     /// A digest handed on is the generation's, as given: the door's apply
