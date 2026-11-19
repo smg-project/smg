@@ -125,20 +125,24 @@ fn python_bool(value: bool) -> &'static str {
 /// can never sample them, so they could never stop anything (a string stop is
 /// still matched on the decoded text), and keeping them would make the
 /// engine client's vocabulary check refuse the request over ids the caller
-/// never sent. The caller's own `caller_stop_ids` are kept for that check to
-/// judge. A `vocab_size` of 0 (unknown) keeps everything.
+/// never sent. The derivations only append, so the first `caller_stop_count`
+/// ids are the caller's own, kept for that check to judge. A `vocab_size` of
+/// 0 (unknown) keeps everything.
 fn drop_unsampleable_derived_stops(
     req: &mut vllm::GenerateRequest,
-    caller_stop_ids: &[u32],
+    caller_stop_count: usize,
     vocab_size: u32,
 ) {
     if vocab_size == 0 {
         return;
     }
     if let Some(params) = req.sampling_params.as_mut() {
-        params
-            .stop_token_ids
-            .retain(|id| *id < vocab_size || caller_stop_ids.contains(id));
+        let mut position = 0;
+        params.stop_token_ids.retain(|id| {
+            let callers = position < caller_stop_count;
+            position += 1;
+            callers || *id < vocab_size
+        });
     }
 }
 
@@ -342,11 +346,10 @@ async fn submit(
     // stop ids) and come back as this servicer's own obligation; the
     // tokenizer's EOS set backstops a config without ids.
     let tokenizer = state.tokenizer();
-    let caller_stop_ids = req
+    let caller_stop_count = req
         .sampling_params
         .as_ref()
-        .map(|params| params.stop_token_ids.clone())
-        .unwrap_or_default();
+        .map_or(0, |params| params.stop_token_ids.len());
     let stops = req
         .sampling_params
         .as_mut()
@@ -354,7 +357,7 @@ async fn submit(
         .unwrap_or_default();
     client.adopt_tokenizer_eos(tokenizer);
     fold_tokenizer_eos_backstop(&mut req, tokenizer);
-    drop_unsampleable_derived_stops(&mut req, &caller_stop_ids, state.model.vocab_size);
+    drop_unsampleable_derived_stops(&mut req, caller_stop_count, state.model.vocab_size);
     let decoder = stop_decoder(state.tokenizer(), &stops, skip_special_tokens)?;
 
     // Admission ends here: the add is on the wire before `submit_with_aux`
@@ -513,11 +516,19 @@ mod tests {
     fn unsampleable_derived_stop_ids_are_dropped() {
         // Caller sent [5, 2000]; the servicer derived 7 and 1500.
         let mut req = with_stops(vec![5, 2000, 7, 1500]);
-        drop_unsampleable_derived_stops(&mut req, &[5, 2000], 1000);
+        drop_unsampleable_derived_stops(&mut req, 2, 1000);
         assert_eq!(stops_of(&req), [5, 2000, 7]);
 
         let mut req = with_stops(vec![5, 1500]);
-        drop_unsampleable_derived_stops(&mut req, &[], 0);
+        drop_unsampleable_derived_stops(&mut req, 0, 0);
         assert_eq!(stops_of(&req), [5, 1500]);
+
+        // Linear in the list: a long caller list of out-of-vocab ids is kept
+        // whole (for the client to refuse) without a scan per id.
+        let callers: Vec<u32> = (1000..201_000).collect();
+        let mut req = with_stops(callers.iter().copied().chain([1500, 3]).collect());
+        drop_unsampleable_derived_stops(&mut req, callers.len(), 1000);
+        assert_eq!(stops_of(&req).len(), callers.len() + 1);
+        assert_eq!(stops_of(&req).last(), Some(&3));
     }
 }
