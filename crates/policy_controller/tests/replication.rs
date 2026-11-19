@@ -16,12 +16,16 @@
 )]
 #[path = "common/net.rs"]
 mod net;
+#[path = "common/pair.rs"]
+mod pair;
 
 use std::{
     collections::BTreeMap,
+    convert::Infallible,
     future::Future,
-    io::Write as _,
+    io::{ErrorKind, Write as _},
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -33,7 +37,9 @@ use std::{
 use net::{http_get, loopback};
 use prost::Message as _;
 use smg_policy_controller::{
-    controller::{Config, Controller, Election, LeasePlace, Listener, Readiness, Scope, State},
+    controller::{
+        Config, Controller, Election, Error, LeasePlace, Listener, Readiness, Scope, State,
+    },
     elector::{ElectionSettings, Elector, FileLease, Tick},
     proto::{
         self, policy_controller_client::PolicyControllerClient, replica_frame::Frame,
@@ -81,18 +87,49 @@ struct Leader {
     store: Arc<MemoryStore>,
 }
 
+/// Binds the controller `config` makes of a replication port, at a number
+/// of the pairs' own ([`pair::ports`]): the next one free on `ip`, and on
+/// `standby` too where the replica leads a pair ([`pair::free`]).
+async fn bind_drawn(
+    ip: IpAddr,
+    standby: Option<IpAddr>,
+    config: impl Fn(u16) -> Config,
+) -> Controller {
+    let mut bound = None;
+    for drawn in pair::ports(ip) {
+        match Controller::bind(config(drawn)).await {
+            // In use on this address: the next number.
+            Err(Error::Bind { source, .. }) if source.kind() == ErrorKind::AddrInUse => {}
+            // Held on the standby's address by a standby that outlived its
+            // leader: the next number, and this bind is let go.
+            Ok(_) if standby.is_some_and(|ip| !pair::free(ip, drawn).expect("the look's bind")) => {
+            }
+            other => {
+                bound = Some(other.expect("bind"));
+                break;
+            }
+        }
+    }
+    bound.expect("a free port among the pairs' own")
+}
+
 /// Serves a controller over a lease at `place` in the case's process, and
 /// runs `case` against it once it leads.
 async fn with_leader<Run>(place: LeasePlace, case: impl FnOnce(Leader) -> Run)
 where
     Run: Future<Output = ()>,
 {
-    let mut controller = Controller::bind(Config {
+    // A replica under a shared lease follows, and one that follows names
+    // its replication port: a number of the pairs' own.
+    let config = |port| Config {
         controller_id: "replication-0".to_owned(),
         listeners: vec![
             listener("gateway", &[Scope::Gateway, Scope::Ingestion]),
             listener("control", &[Scope::Control]),
-            listener("replication", &[Scope::Replication]),
+            Listener {
+                addr: SocketAddr::new(LEADER, port),
+                ..listener("replication", &[Scope::Replication])
+            },
         ],
         admin: loopback(),
         shutdown_settle: Duration::from_millis(50),
@@ -100,13 +137,12 @@ where
         load_poll_interval: Config::DEFAULT_LOAD_POLL_INTERVAL,
         decide_shards: 2,
         election: Election {
-            lease: place,
+            lease: place.clone(),
             settings: settings(),
             advertise: None,
         },
-    })
-    .await
-    .expect("bind");
+    };
+    let mut controller = bind_drawn(LEADER, None, config).await;
     // The control and the replication listeners take an identity as told.
     for name in ["control", "replication"] {
         controller
@@ -192,6 +228,11 @@ async fn client(addr: SocketAddr) -> PolicyControllerClient<Channel> {
     PolicyControllerClient::new(channel)
 }
 
+/// How long a stream that should end may stand before its case fails:
+/// far past any stall of a loaded host, so the wait is for the end
+/// itself.
+const STANDING: Duration = Duration::from_secs(120);
+
 /// The standby every case is: the name its calls state and its hello's id.
 const STANDBY: &str = "replication-1";
 
@@ -262,11 +303,14 @@ impl Standby {
 
     /// The next batch that carries events or the word to re-sync: a
     /// heartbeat is passed over, five of them at most (a case waits for a
-    /// batch that is on its way, never through five silent seconds).
+    /// batch that is on its way, never through five silent seconds). A
+    /// part of a snapshot fails the case here: a leader sends parts behind
+    /// the word alone, and [`Standby::snapshot`] reads them.
     async fn batch(&mut self) -> proto::ReplicationBatch {
         let mut found = None;
         for _ in 0..5 {
             let batch = self.frame().await;
+            assert!(batch.snapshot.is_none(), "a part no word announced");
             if batch.resync_required || !batch.events.is_empty() {
                 found = Some(batch);
                 break;
@@ -275,13 +319,14 @@ impl Standby {
         found.expect("a batch within five heartbeats")
     }
 
-    /// The next heartbeat, past at most 64 batches.
+    /// The next heartbeat, past at most 64 batches. A part of a snapshot
+    /// fails the case here, as in [`Standby::batch`].
     async fn beat(&mut self) -> proto::ReplicationBatch {
         let mut found = None;
         for _ in 0..64 {
             let batch = self.frame().await;
-            let part = batch.snapshot.is_some();
-            if !batch.resync_required && batch.events.is_empty() && !part {
+            assert!(batch.snapshot.is_none(), "a part no word announced");
+            if !batch.resync_required && batch.events.is_empty() {
                 found = Some(batch);
                 break;
             }
@@ -290,20 +335,18 @@ impl Standby {
     }
 
     /// The stream's status, past the batches still on their way; `None`
-    /// when it ends with none. A stream that goes on fails here, at its
-    /// eighth heartbeat or its 4,096th batch.
+    /// when it ends with none. A leader ends a stream at a look of its own
+    /// (at its lease, at its log), and a loaded host stretches the time to
+    /// that look past any count of heartbeats: the batches before the end
+    /// are read past, however many. A stream that goes on fails here
+    /// [`STANDING`] on, or at its 4,096th batch.
     async fn ended(&mut self) -> Option<Code> {
+        let started = Instant::now();
         let mut end = None;
-        let mut beats = 0;
         for _ in 0..4_096 {
             match self.next().await {
-                Ok(Some(batch)) => {
-                    let said = batch.resync_required || batch.snapshot.is_some();
-                    beats += u32::from(!said && batch.events.is_empty());
-                    if beats == 8 {
-                        break;
-                    }
-                }
+                Ok(Some(_)) if started.elapsed() < STANDING => {}
+                Ok(Some(_)) => break,
                 Ok(None) => {
                     end = Some(None);
                     break;
@@ -314,7 +357,7 @@ impl Standby {
                 }
             }
         }
-        end.expect("the stream's end before its eighth heartbeat")
+        end.expect("the stream's end within two minutes")
     }
 
     /// Reads on up to position `seq`: every event after the stream's
@@ -1303,11 +1346,26 @@ async fn a_standby_that_closes_its_half_ends_the_stream() {
     .await;
 }
 
+/// Removes the lease file at `lease` again and again. A holder's renewal
+/// reads the file, then renames a new one over its path: a removal that
+/// lands between the two is undone, and the holder never sees its lease
+/// gone. A removal that lands outside a renewal stands, and the holder's
+/// next look finds no lease.
+async fn removed_again(lease: &Path) -> Infallible {
+    loop {
+        // Gone already, where the holder has not written since.
+        let _ = std::fs::remove_file(lease);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// The fence at the wire. A leader whose lease is gone ends an open stream
-/// `ABORTED` at its next look of the lease. A hello it still waited for is
-/// refused the same way, though it names a place the log does not hold: a
-/// replica that lost the lead tells no standby to re-sync. Both calls are
-/// refused after it.
+/// `ABORTED` at its next look of the lease. A call that still waited for
+/// its hello is refused too, though the hello names a place the log does
+/// not hold: a replica that lost the lead tells no standby to re-sync.
+/// That call ends `ABORTED` where it was admitted under the lead, as the
+/// feed's own case holds by construction, and at the door otherwise. Both
+/// calls are refused after it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_leader_that_loses_its_lease_ends_its_stream_and_joins_no_other() {
     let dir = tempfile::tempdir().expect("a temp dir");
@@ -1319,14 +1377,15 @@ async fn a_leader_that_loses_its_lease_ends_its_stream_and_joins_no_other() {
         let mut open = replicate(leader.replication, held.clone())
             .await
             .expect("a stream");
-        // A second call says no hello yet, from a task of its own. Nothing
-        // orders it ahead of the call made here: it has that round
-        // trip, and the leader's wait for its next look at the lease, to
-        // be admitted while the leader leads.
+        // A second call says no hello yet. The case polls it once before
+        // it asks the leader's word below, so its request stands on the
+        // connection ahead of that call's: the leader's transport holds
+        // the stream before the word is answered. The call's own first
+        // step, at the door, is a task of the leader's runtime, and
+        // nothing on the wire shows it done.
         let mut waits = client(leader.replication).await;
         let (late, sent) = mpsc::channel(1);
-        let mut waiting = JoinSet::new();
-        waiting.spawn({
+        let mut call = Box::pin({
             let mut waits = waits.clone();
             async move {
                 waits
@@ -1335,12 +1394,25 @@ async fn a_leader_that_loses_its_lease_ends_its_stream_and_joins_no_other() {
                     .map(|_| ())
             }
         });
+        tokio::select! {
+            biased;
+            early = &mut call => panic!("the call waits for its hello, not {early:?}"),
+            () = std::future::ready(()) => {}
+        }
+        let mut waiting = JoinSet::new();
+        waiting.spawn(call);
         waits
             .leader(proto::LeaderRequest::default())
             .await
             .expect("the leader's word while it leads");
         std::fs::remove_file(&lease).expect("the lease file");
-        assert_eq!(open.ended().await, Some(Code::Aborted));
+        // One removal can be undone by the holder's renewal: the file is
+        // removed again until the stream ends.
+        let ended = tokio::select! {
+            ended = open.ended() => ended,
+            never = removed_again(&lease) => match never {},
+        };
+        assert_eq!(ended, Some(Code::Aborted));
         // The fence is closed, and the hello names a place past the head.
         let lost = place(base.replication_seq + 1_000, base.replication_term);
         late.send(proto::ReplicaFrame {
@@ -1354,7 +1426,13 @@ async fn a_leader_that_loses_its_lease_ends_its_stream_and_joins_no_other() {
             .expect("the one call")
             .expect("the call's task")
             .expect_err("a replica that lost the lead joins no feed");
-        assert_eq!(refused.code(), Code::Aborted);
+        // Admitted under the lead, the call read the fence again at its
+        // hello. Where its first step came after the loss, the door
+        // refused it, as it refuses the two calls below.
+        assert!(
+            matches!(refused.code(), Code::Aborted | Code::FailedPrecondition),
+            "{refused:?}"
+        );
         for after in [
             replicate(leader.replication, held).await.map(|_| ()),
             snapshot(leader.replication).await.map(|_| ()),
@@ -1600,12 +1678,17 @@ struct Replica {
 
 /// The leader's address and the standby's: one host, two addresses, so
 /// both listen on one replication port as replicas configured alike do.
+/// Linux routes the second with no alias. Another host refuses its bind:
+/// a case that binds it is ignored there, with that reason.
 const LEADER: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
 const FOLLOWER: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
 
 impl Replica {
     /// Binds a replica of the lease at `place` on `ip`, its replication
-    /// listener at `port` (`0` takes one), and serves it.
+    /// listener at `port`, and serves it. `0` takes a number of the pairs'
+    /// own ([`pair::ports`]), the next one free on `ip` and, for a pair's
+    /// leader, on its standby's address too ([`pair::free`]): the number a
+    /// standby of this replica then binds on its own address.
     async fn serve(id: &str, ip: IpAddr, port: u16, place: LeasePlace) -> Self {
         let listener = |name: &str, scopes: &[Scope], port| Listener {
             name: name.to_owned(),
@@ -1613,7 +1696,7 @@ impl Replica {
             scopes: scopes.to_vec(),
             tls: None,
         };
-        let mut controller = Controller::bind(Config {
+        let config = |port| Config {
             controller_id: id.to_owned(),
             listeners: vec![
                 listener("gateway", &[Scope::Gateway, Scope::Ingestion], 0),
@@ -1626,13 +1709,16 @@ impl Replica {
             load_poll_interval: Config::DEFAULT_LOAD_POLL_INTERVAL,
             decide_shards: 2,
             election: Election {
-                lease: place,
+                lease: place.clone(),
                 settings: settings(),
                 advertise: None,
             },
-        })
-        .await
-        .expect("bind");
+        };
+        let mut controller = if port == 0 {
+            bind_drawn(ip, (ip == LEADER).then_some(FOLLOWER), config).await
+        } else {
+            Controller::bind(config(port)).await.expect("bind")
+        };
         for name in ["control", "replication"] {
             controller
                 .identity_as_told(name)
@@ -1766,6 +1852,10 @@ async fn promoted(addr: SocketAddr) -> proto::Snapshot {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the follower binds 127.0.0.2: off Linux that takes a loopback alias"
+)]
 async fn a_promoted_standby_holds_every_row_and_load_row_of_its_leader() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let mut leader = Replica::serve("replication-0", LEADER, 0, shared(&dir)).await;
@@ -1842,6 +1932,10 @@ async fn a_promoted_standby_holds_every_row_and_load_row_of_its_leader() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the follower binds 127.0.0.2: off Linux that takes a loopback alias"
+)]
 async fn a_standby_that_joins_late_is_restored_whole_from_a_snapshot_past_one_message() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let mut leader = Replica::serve("replication-0", LEADER, 0, shared(&dir)).await;
@@ -1890,6 +1984,10 @@ async fn a_standby_that_joins_late_is_restored_whole_from_a_snapshot_past_one_me
 /// reader that holds nothing is fed it whole, then the new term's start. A
 /// standby restored from a snapshot tells such a reader to start again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the follower binds 127.0.0.2: off Linux that takes a loopback alias"
+)]
 async fn a_promoted_standby_feeds_a_reader_that_holds_nothing_from_its_leaders_first_write() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let mut leader = Replica::serve("replication-0", LEADER, 0, shared(&dir)).await;
@@ -2038,6 +2136,10 @@ async fn sample(admin: SocketAddr, series: &str) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the follower binds 127.0.0.2: off Linux that takes a loopback alias"
+)]
 async fn a_standby_passes_its_probes_only_while_it_is_synced_with_its_leader() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let mut leader = Replica::serve("replication-0", LEADER, 0, shared(&dir)).await;

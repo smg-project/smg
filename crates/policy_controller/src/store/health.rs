@@ -24,6 +24,48 @@ pub enum VetoWrite {
     NoRow,
 }
 
+/// What a health write found ([`HealthSink::probe_outcome`],
+/// [`HealthSink::connected`]): what happened to the write, and the status
+/// that stands where the write was judged.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HealthWrite {
+    /// The status moved: `from` is the one the row left, `to` the one that
+    /// stands.
+    Moved {
+        from: WorkerStatus,
+        to: WorkerStatus,
+    },
+    /// The write was judged and the status stands.
+    Stood(WorkerStatus),
+    /// The row left the revision the write was read under: the write is
+    /// dropped, never applied to a successor. It was judged against
+    /// nothing, so it says no status; the row's revision is the membership
+    /// door's to say.
+    Stale,
+    /// A write for a worker without a row: nothing is written.
+    NoRow,
+}
+
+impl HealthWrite {
+    /// The transition, where the status moved: the status the row left,
+    /// then the one that stands.
+    pub fn moved(self) -> Option<(WorkerStatus, WorkerStatus)> {
+        match self {
+            Self::Moved { from, to } => Some((from, to)),
+            Self::Stood(_) | Self::Stale | Self::NoRow => None,
+        }
+    }
+
+    /// The status that stands where the write was judged: none for a stale
+    /// write and for a worker without a row.
+    pub fn stands(self) -> Option<WorkerStatus> {
+        match self {
+            Self::Moved { to: status, .. } | Self::Stood(status) => Some(status),
+            Self::Stale | Self::NoRow => None,
+        }
+    }
+}
+
 /// Where health is written. The pool's view is the prober's and the reports';
 /// a gateway's breaker and liveness vetoes are its own and mask the worker
 /// for that gateway alone.
@@ -38,20 +80,17 @@ pub trait HealthSink: Send + Sync {
     /// after `failure_threshold` consecutive failures (ready to not ready),
     /// three times as many (to failed), `success_threshold` consecutive
     /// passes (back to ready), and a pending worker that flaps past ten times
-    /// the failure threshold fails. `Some` with the transition when the status
-    /// moved; `None` when it stood, the row is gone or `revision` moved (a
-    /// stale outcome is dropped, never applied to a successor).
-    fn probe_outcome(
-        &self,
-        id: WorkerId,
-        ok: bool,
-        revision: u64,
-    ) -> Option<(WorkerStatus, WorkerStatus)>;
+    /// the failure threshold fails. The answer says what happened to the
+    /// write: the status moved; it stood, and the probe is counted;
+    /// `revision` moved (a stale outcome is dropped, never applied to a
+    /// successor, and not counted); or the worker has no row.
+    fn probe_outcome(&self, id: WorkerId, ok: bool, revision: u64) -> HealthWrite;
 
     /// The connect signal of a handshake-promoted worker (a worker whose
     /// checks are off, a host-local wire): ready at once, under the same
-    /// revision guard.
-    fn connected(&self, id: WorkerId, revision: u64) -> Option<(WorkerStatus, WorkerStatus)>;
+    /// revision guard. A ready or a draining row stands, and its counters
+    /// with it.
+    fn connected(&self, id: WorkerId, revision: u64) -> HealthWrite;
 
     /// A gateway's standing veto on a worker until `until`; `None` clears
     /// it. The breaker's open window and the liveness veto travel this way,

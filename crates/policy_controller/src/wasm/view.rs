@@ -969,11 +969,15 @@ pub(crate) fn release_reason(r: ReleaseReason) -> wit::ReleaseReason {
     }
 }
 
+/// A membership word as the guest's world carries it. `None` for
+/// [`Membership::Left`]: the world has no case for it, and a guest hears
+/// the write's own word, said beside it.
 pub(crate) fn membership<'a>(
     m: &Membership<'_>,
     snapshot: &'a mut Vec<u64>,
-) -> wit::Membership<'a> {
-    match m {
+) -> Option<wit::Membership<'a>> {
+    Some(match m {
+        Membership::Left { .. } => return None,
         Membership::Added(w) => wit::Membership::Added(w.0),
         Membership::Removed(w) => wit::Membership::Removed(w.0),
         Membership::Replaced { old, new } => wit::Membership::Replaced((old.0, new.0)),
@@ -984,7 +988,7 @@ pub(crate) fn membership<'a>(
             snapshot.extend(workers.iter().map(|w| w.0));
             wit::Membership::Snapshot(snapshot)
         }
-    }
+    })
 }
 
 /// A signal; a veto's instant on the host's clock becomes the microseconds
@@ -1661,7 +1665,8 @@ mod tests {
             generation: 7,
             zones: &zones,
             reach: 0,
-            rated: false,
+            reported: false,
+            ..PoolFacts::default()
         };
         let mut packed = Packed::default();
         packed.fill_pool(&pool);
@@ -1695,5 +1700,20 @@ mod tests {
             ..Lease::default()
         };
         assert_eq!(lease(&told, &Exposure::default()).target_index, 1);
+    }
+
+    /// The guest's world has no case for the models a worker left: the
+    /// mapper hands a guest nothing for that word, and the write's own word
+    /// as before.
+    #[test]
+    fn a_guest_is_told_nothing_of_the_models_a_worker_left() {
+        let (id, models) = (WorkerId(7), ["m".to_string()]);
+        let left = Membership::Left {
+            id,
+            models: &models,
+        };
+        let mut snapshot = Vec::new();
+        assert!(membership(&left, &mut snapshot).is_none());
+        assert!(membership(&Membership::Relabelled(id), &mut snapshot).is_some());
     }
 }

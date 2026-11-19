@@ -19,6 +19,12 @@
 //! holds the thresholds past which a load report marks a worker overloaded.
 //! The gateway re-exports each module at the path it had there.
 //!
+//! [`kv_events`] holds the port between the collector of the KV cache events
+//! an engine pushes and a host's sink: the sink's calls and the facts that
+//! cross them. The collector itself comes with the `runtime` feature: it
+//! keeps one subscription task a worker, over the engine handle's two stream
+//! calls, for a host that says what an events subscription feeds.
+//!
 //! The `metrics` feature adds `metrics`, the mechanism those writers share
 //! with a host's: the bounded label set, the model labels' one set and the
 //! handles a record keeps.
@@ -37,8 +43,16 @@
 //! of its own, and the merge of the metrics scraped from the workers. The
 //! gateway re-exports each module at the path it had there. `test-util` adds
 //! `test_support`, what a test builds its workers with, and opens the test
-//! readers and hooks the registry, the series store and the label interner
-//! keep for their own cases.
+//! readers and hooks the registry, the series store, the label interner and
+//! the KV event collector keep for their own cases.
+//!
+//! The `workflow` feature adds `workflow`, the worker side of the workflows
+//! a host runs over its workers on the workflow engine: the steps of a
+//! worker's removal, the data they pass along and the host trait they read.
+//!
+//! The `proto` feature adds `common_proto`, the messages every engine's gRPC
+//! service shares, and the conversion of the engine load record into the
+//! per-rank snapshot of a load report.
 
 /// Default model identifier used when no model is specified.
 ///
@@ -50,9 +64,14 @@ pub const UNKNOWN_MODEL_ID: &str = "unknown";
 pub mod connection;
 pub mod health;
 pub mod identity;
+#[cfg(feature = "runtime")]
+pub mod jobs;
+pub mod kv_events;
 pub mod labels;
 #[cfg(feature = "runtime")]
 pub mod load;
+#[cfg(feature = "proto")]
+mod load_record;
 #[cfg(feature = "metrics")]
 pub mod metrics;
 pub mod metrics_labels;
@@ -71,3 +90,27 @@ pub mod settings;
 #[cfg(all(feature = "runtime", any(test, feature = "test-util")))]
 pub mod test_support;
 pub mod worker;
+#[cfg(feature = "workflow")]
+pub mod workflow;
+
+/// The messages every engine's gRPC service shares (`proto/common.proto`,
+/// package `smg.grpc.common`): the tokenizer's chunks, the KV cache events,
+/// the engine load record, the cache flush, the profiling calls and the
+/// tensor handles. `smg-grpc-client` re-exports the module at the path it had
+/// there.
+#[cfg(feature = "proto")]
+pub mod common_proto {
+    #![allow(
+        clippy::all,
+        clippy::absolute_paths,
+        clippy::trivially_copy_pass_by_ref,
+        unused_qualifications
+    )]
+    include!(concat!(env!("OUT_DIR"), "/smg.grpc.common.rs"));
+}
+
+// The README's Rust blocks, run as doc tests. Its host blocks name the
+// runtime, so the page is read where the runtime is built.
+#[cfg(all(doctest, feature = "runtime"))]
+#[doc = include_str!("../README.md")]
+mod readme {}

@@ -21,8 +21,8 @@ use crate::{
     proto::{self, worker_event::Event},
     replication::{Entry, Event as Written},
     store::{
-        GatewayId, HealthPolicy, LoadSample, LoadSource, MembershipChange, Overload, Position,
-        Reachability, Signals, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus,
+        GatewayId, HealthPolicy, LoadSample, LoadSource, Maker, MembershipChange, Overload,
+        Position, Reachability, Signals, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus,
     },
     view::{LoadRow, Role, SignalSource, WireModes, WorkerId},
 };
@@ -142,7 +142,22 @@ fn reachable(from: Reachability) -> proto::Reachability {
 /// bootstrap port, the one field of it the store holds: the rest arrives
 /// with the store's typed descriptor.
 pub(crate) fn row(row: &WorkerRow) -> proto::WorkerRow {
-    told(row.id, &row.facts, row.status, row.revision)
+    proto::WorkerRow {
+        maker: maker(&row.maker),
+        ..told(row.id, &row.facts, row.status, row.revision)
+    }
+}
+
+/// The wire's maker of a row's: none for a control call's row, so a row
+/// that crosses with no field reads as one.
+fn maker(maker: &Maker) -> Option<proto::Maker> {
+    match maker {
+        Maker::Control => None,
+        Maker::Provider(found) => Some(proto::Maker {
+            provider: found.provider().to_owned(),
+            key: found.key().to_owned(),
+        }),
+    }
 }
 
 /// The wire's row of a row's parts: its numbers ([`numbers`]) with its text
@@ -334,6 +349,39 @@ fn fits(
     path: &'static str,
 ) -> Result<(), Refused> {
     if weight(facts, labels) > ROW_BYTES {
+        return Err(refused(path, "a row is at most 16384 bytes on the wire"));
+    }
+    Ok(())
+}
+
+/// The bytes a row's maker takes on the wire, under the contract's field
+/// numbers: none for a control call's row.
+fn made(maker: &Maker) -> usize {
+    use prost::encoding::{encoded_len_varint, key_len};
+    let Maker::Provider(found) = maker else {
+        return 0;
+    };
+    // A length's own bytes, and a text under its tag: neither of a maker's
+    // two is empty.
+    let length = |bytes: usize| encoded_len_varint(u64::try_from(bytes).unwrap_or(u64::MAX));
+    let text = |tag: u32, text: &str| key_len(tag) + length(text.len()) + text.len();
+    let inner = text(1, found.provider()) + text(2, found.key());
+    key_len(27) + length(inner) + inner
+}
+
+/// Refuses, by `path`, a row of these facts under `labels` that passes
+/// [`ROW_BYTES`] with its maker: the facts' own bound ([`fits`]) is told
+/// where they are read, and a provider's row holds its maker inside the
+/// same bound. A control call's row has no maker on the wire: the facts'
+/// bound spoke for it where they were read, and it is not weighed again.
+pub(crate) fn room(
+    facts: &WorkerFacts,
+    labels: &BTreeMap<String, String>,
+    maker: &Maker,
+    path: &'static str,
+) -> Result<(), Refused> {
+    let made = made(maker);
+    if made > 0 && weight(facts, labels) + made > ROW_BYTES {
         return Err(refused(path, "a row is at most 16384 bytes on the wire"));
     }
     Ok(())
@@ -591,6 +639,24 @@ pub(crate) fn told_row(told: &proto::WorkerRow, now: Instant) -> Result<WorkerRo
         },
         ..WorkerFacts::default()
     };
+    let maker = match &told.maker {
+        None => Maker::Control,
+        Some(by) => match Maker::provider(by.provider.clone(), by.key.clone()) {
+            Some(maker) => maker,
+            None if by.provider.is_empty() => {
+                return Err(refused(
+                    "row.maker.provider",
+                    "a provider's row names its provider",
+                ));
+            }
+            None => {
+                return Err(refused(
+                    "row.maker.key",
+                    "a provider's row names its key for the worker",
+                ));
+            }
+        },
+    };
     let age = Duration::from_millis(told.admitted_age_ms);
     Ok(WorkerRow {
         id: WorkerId(told.id),
@@ -598,6 +664,7 @@ pub(crate) fn told_row(told: &proto::WorkerRow, now: Instant) -> Result<WorkerRo
         status,
         revision: told.revision,
         admitted_at: now.checked_sub(age).unwrap_or(now),
+        maker,
     })
 }
 
@@ -1202,6 +1269,7 @@ mod tests {
             status: WorkerStatus::Draining,
             revision: 11,
             admitted_at: Instant::now(),
+            maker: Default::default(),
         }
     }
 
@@ -1237,6 +1305,7 @@ mod tests {
                 ..Default::default()
             }),
             admitted_age_ms: 0,
+            maker: None,
             overload: Some(proto::OverloadThresholds {
                 queue_limit: None,
                 kv_usage_permille: Some(875),
@@ -1277,6 +1346,7 @@ mod tests {
             status: WorkerStatus::Ready,
             revision: 1,
             admitted_at: Instant::now(),
+            maker: Default::default(),
         };
         let told = row(&stored);
         // Two wires read as the sum of their numbers.
@@ -2521,6 +2591,80 @@ mod tests {
     }
 
     #[test]
+    fn a_row_crosses_with_its_maker() {
+        use super::{made, room};
+        use crate::store::Maker;
+
+        let now = Instant::now();
+        // A control call's row says no maker, and a row that says none
+        // reads as a control call's.
+        let by_hand = full();
+        let told = row(&by_hand);
+        assert_eq!(told.maker, None);
+        let back = told_row(&told, now).expect("the row");
+        assert_eq!(back.maker, Maker::Control);
+        // A provider's row crosses whole: its name and its key for the
+        // worker.
+        let found = WorkerRow {
+            maker: Maker::provider("cluster", "pods/a").expect("a whole maker"),
+            ..full()
+        };
+        let told = row(&found);
+        let shown = proto::Maker {
+            provider: "cluster".to_owned(),
+            key: "pods/a".to_owned(),
+        };
+        assert_eq!(told.maker, Some(shown));
+        let back = told_row(&told, now).expect("the row");
+        assert_eq!(back.maker, found.maker);
+        // The maker's bytes are the wire's, at a key's length on each
+        // side of a length's second byte, and a row holds them inside its
+        // bound.
+        for bytes in [1, 110, 127, 128, 300] {
+            let maker = Maker::provider("cluster", "k".repeat(bytes)).expect("a whole maker");
+            let with = WorkerRow {
+                maker: maker.clone(),
+                ..full()
+            };
+            let grown = row(&with).encoded_len() - row(&by_hand).encoded_len();
+            assert_eq!(made(&maker), grown, "a key of {bytes}");
+        }
+        assert_eq!(made(&Maker::Control), 0);
+        let brim = facts(&weighing(ROW_BYTES), None).expect("a row at its bound");
+        assert!(room(&brim, &brim.labels, &Maker::Control, "spec").is_ok());
+        assert_eq!(
+            room(&brim, &brim.labels, &found.maker, "spec").map_err(|refused| refused.path),
+            Err("spec")
+        );
+        let needs = made(&found.maker);
+        let under = facts(&weighing(ROW_BYTES - needs), None).expect("a row under its bound");
+        assert!(room(&under, &under.labels, &found.maker, "spec").is_ok());
+        let widest = WorkerRow {
+            facts: under,
+            ..found.clone()
+        };
+        assert!(row(&widest).encoded_len() <= ROW_BYTES);
+        // A maker that lacks its provider or its key is refused by the
+        // part's path, and no leader makes one.
+        for (provider, key, path) in [
+            ("", "pods/a", "row.maker.provider"),
+            ("cluster", "", "row.maker.key"),
+            ("", "", "row.maker.provider"),
+        ] {
+            let lacking = proto::WorkerRow {
+                maker: Some(proto::Maker {
+                    provider: provider.to_owned(),
+                    key: key.to_owned(),
+                }),
+                ..told.clone()
+            };
+            let refusal = told_row(&lacking, now).expect_err("refused");
+            assert_eq!(refusal.path, path);
+            assert_eq!(Maker::provider(provider, key), None);
+        }
+    }
+
+    #[test]
     fn the_stores_row_comes_back_from_the_wire_fact_by_fact() {
         let stored = full();
         let now = stored.admitted_at + Duration::from_millis(1_500);
@@ -2539,6 +2683,7 @@ mod tests {
             status: WorkerStatus::Pending,
             revision: 1,
             admitted_at: now,
+            maker: Default::default(),
         };
         assert_eq!(told_row(&row(&plain), now), Ok(plain.clone()));
         // Each status and each role comes back as itself.

@@ -412,7 +412,7 @@ message Lease {
   // the request's session key carries in its hash form (see Identity); 0
   // when none.
   fixed64 session_key = 6;
-  // Token-work booked on the target.
+  // The prompt size the request stated, in tokens; 0 where it stated none.
   uint32 tokens = 7;
   // The leader's term that minted the lease.
   uint64 term = 8;
@@ -460,8 +460,10 @@ message Trace {
   // `top` is of the rows drawn.
   bool drew_first = 12;
   // The soft veto lifted to make this pick; none unless that veto left the
-  // pool nobody. The all-vetoed rule's pick sets it, and so does the pick of
-  // a session key kept on its worker. A host counts both from this field.
+  // pool nobody, or left a session key handed on at its sessions rule's
+  // in-flight cap nobody under the cap. The all-vetoed rule's pick sets it,
+  // and so does the pick of a session key kept on its worker. A host counts
+  // both from this field.
   LiftedVeto lifted = 13;
 }
 
@@ -507,8 +509,9 @@ message Busy {
 }
 
 // The leases it books, one outcome, the trace. The record is the outcome
-// enum with the trace inside each variant and no leases (the host mints the
-// lease at commit); the wire hoists the trace and carries the leases.
+// enum with the trace inside each variant and no leases (its door files the
+// lease at the issue and hands it beside the record); the wire hoists the
+// trace and carries the leases.
 message Decision {
   repeated Lease leases = 1;
   oneof outcome {

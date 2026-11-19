@@ -601,7 +601,8 @@ impl Service {
             is_leader,
         } = shared.leader(shared.fence.leader_term(now));
         // A replica that follows says how far behind it is, by the age of
-        // its stream's last applied frame; a leader follows nobody.
+        // the last frame that left it at its leader's head; a leader follows
+        // nobody.
         // `synced` is the same read of that lag, and reads it alone: the
         // live ranks and the generation narrow the same bit with their
         // steps.
@@ -1018,7 +1019,7 @@ mod tests {
         catalog::Catalog,
         controller::{
             config::Scope,
-            deciders::{tests as bed, TERM_MARK},
+            deciders::tests as bed,
             election::{self, LeasePlace, Standing},
             gateways::tests::PATIENT,
             generations::{tests::LEAST_LOAD, Format, Unanswered},
@@ -1026,10 +1027,11 @@ mod tests {
                 tests::{stating, told, NO_PRINCIPAL},
                 Layer,
             },
-            replication::journaled_from,
+            replication::{journaled_for, journaled_from},
             spec_store::{tests::names, SpecStore},
             PROTOCOL_VERSION,
         },
+        door::TERM_MARK,
         elector::{
             ElectError, ElectionSettings, Elector, FileLease, LeaseBackend, LeaseRecord,
             MemoryLease, Tick, Written,
@@ -1072,7 +1074,7 @@ mod tests {
                 ADDRESS.to_owned(),
                 &elector,
                 stood,
-                journaled_from(&LeasePlace::Process, 0),
+                journaled_for(&LeasePlace::Process, 0, 2),
                 Arc::new(Catalog::builtin()),
                 2,
             )
@@ -1397,7 +1399,7 @@ mod tests {
         let elector = Elector::new(Box::new(FileLease::new(&path)), IDENTITY, settings)
             .expect("the settings are in order");
         let (standing, stood) = watch::channel(Standing::default());
-        let (store, feed) = journaled_from(&LeasePlace::Process, 0);
+        let (store, feed) = journaled_for(&LeasePlace::Process, 0, 2);
         let shared = Arc::new(
             Shared::new(
                 ID.to_owned(),
@@ -1967,7 +1969,7 @@ mod tests {
         )
         .expect("the settings are in order");
         let (standing, stood) = watch::channel(Standing::default());
-        let (store, feed) = journaled_from(&LeasePlace::Process, 0);
+        let (store, feed) = journaled_for(&LeasePlace::Process, 0, 2);
         let service = Service::new(
             vec![Scope::Gateway],
             Arc::new(

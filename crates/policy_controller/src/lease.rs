@@ -50,6 +50,12 @@ pub struct Lease {
     /// Which target of the pick this lease books (a reservation on a pair
     /// side names its own).
     pub target_index: u8,
+    /// The worker the lease books at its issue, as the host that issues it
+    /// names it; `WorkerId(0)` where the host names none. A stage that
+    /// books at the issue reads it at the dispatch
+    /// ([`Lifecycle::on_dispatched`]), where `target_index` names the
+    /// target the dispatch took. In-process only: no contract carries it.
+    pub booked: WorkerId,
     pub generation: u64,
     /// The request's session ([`crate::RequestFacts::session`]: its key
     /// within its model and phase), which the host fills for every keyed
@@ -66,8 +72,10 @@ pub struct Lease {
     /// The host's clock at issue, microseconds since its origin. In-process
     /// only; the wire carries the dispatch deadline as a duration.
     pub issued_micros: u64,
-    /// Token-work the decision books on its target: the prompt, or the
-    /// host's mean estimate when the prompt's size is unknown.
+    /// The prompt size the request stated, in tokens: 0 where it stated
+    /// none. The `least-load` and `resident-work` stages credit a dispatch
+    /// of no stated size at their own mean prefill; every other reader
+    /// takes the 0 as stated.
     pub tokens: u32,
 }
 
@@ -137,6 +145,18 @@ pub enum Membership<'a> {
     /// Every worker of every pool the engine decides over, after a resync;
     /// a host with a prefill and a decode pool sends one snapshot of both.
     Snapshot(&'a [WorkerId]),
+    /// The worker left its pool of each of `models`: its role moved, or it
+    /// serves them no longer. `id` stands when the word is said. A
+    /// registration that keeps its id says it ahead of its own word, the
+    /// [`Membership::Relabelled`] or [`Membership::Resized`]. A new
+    /// incarnation says its [`Membership::Replaced`] first and this word
+    /// behind it, for the new id. A stage that lists workers by model
+    /// unlists the worker under these alone. The plugin contracts carry
+    /// no such kind: a plugin is told nothing of it.
+    Left {
+        id: WorkerId,
+        models: &'a [String],
+    },
 }
 
 /// A signal about one worker.
@@ -240,20 +260,27 @@ impl fmt::Debug for EventSet {
 /// no-op, so a stateless stage implements nothing.
 ///
 /// A served controller tells a lease's issue, its dispatch, its completion
-/// and its release while it holds the turn of its leases' file, and the
+/// and its release while it holds the turn of the lease's file, and the
 /// release of a lease its decision gives up right after that turn: those
-/// hooks are bounded, and call no door of the leases' store.
+/// hooks are bounded, and call no door of the leases' store. A hook that
+/// panics at a dispatch, a completion or a release that a frame brings,
+/// or at a dispatch deadline's end, is held there: the lease's
+/// event stands as applied. One that panics at the issue, or at the
+/// release of a lease its decision gives up, costs that request its
+/// decision.
 pub trait Lifecycle: Send + Sync {
-    /// The engine issued `decision` under `lease`. In the embedded mode the
-    /// commit follows at once and the accounting happens at dispatch; a
-    /// remote controller books here.
+    /// The engine issued `decision` under `lease`. Its host filed the
+    /// lease as it issued it, in process as behind a served controller:
+    /// the lease books its first target from here.
     fn on_decision_issued(&self, _lease: &Lease, _decision: &Decision) {}
 
     /// The host dispatched to `target` (one of the decision's targets), on
     /// `side`, `since_decision_micros` after the decision on the host's clock
     /// (the wire's own field): a credit dates from the dispatch, not from a
     /// decision a queue may have held. The untaken targets are released by
-    /// the host's commit.
+    /// the host's commit. The lease told names the target the dispatch
+    /// took: its `target_index` is that target's index in the pick, and its
+    /// [`Lease::booked`] is still the worker its issue booked.
     fn on_dispatched(
         &self,
         _lease: &Lease,

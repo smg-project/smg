@@ -26,7 +26,7 @@ on:
       # The contracts: the binary's protocol and plugin bindings are compiled
       # from them, the protocol's with the engine wire's messages it imports.
       - 'crates/policy_controller/contracts/**'
-      - 'crates/grpc_client/proto/common.proto'
+      - 'crates/worker/proto/common.proto'
       - 'rust-toolchain.toml'
       # The cargo configuration the build reads: the allocator of an arm64
       # binary takes its page size from it.

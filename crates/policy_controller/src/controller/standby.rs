@@ -42,7 +42,7 @@ use crate::{
         replication_event::Event as Sent,
     },
     replication::{Log, Lost},
-    store::{Cut, Kinds, LeasesStore, LoadSample, LoadSink, MemoryStore, Position, WorkerRow},
+    store::{Cut, Kinds, LeasesStore, LoadSample, MemoryStore, Position, WorkerRow},
     view::{fingerprint, WorkerId},
 };
 
@@ -103,7 +103,9 @@ impl Follower {
     }
 
     /// One batch applied at `now`: each event at its position under the
-    /// batch's term, by the store's one write for its kind. A load row
+    /// batch's term, by the store's door for a followed write of its kind,
+    /// which alone lands there: a write of the store's own that comes
+    /// between takes no part in it, and the event does not land. A load row
     /// stands with the instant of its apply. The first event that does not
     /// land stops the batch; the events before it stand, each at its place.
     /// A standby that applied nothing takes its leader's first position, a
@@ -134,7 +136,7 @@ impl Follower {
                 // at, it would start a lead of the store's own.
                 Err(Lost) if matches!(event.event, Some(Sent::TermStart(_))) => {
                     self.log.join(at).map_err(|Lost| Halt::Lost(at))?;
-                    self.store.set_term(at.term);
+                    self.store.follow_term(at);
                     continue;
                 }
                 Err(Lost) => return Err(Halt::Lost(at)),
@@ -143,14 +145,14 @@ impl Follower {
                 Some(Sent::Membership(told)) => {
                     let (epoch, change, row) =
                         worker_wire::told_change(told, now).map_err(Halt::Unread)?;
-                    self.store.follow(epoch, change, row);
+                    self.store.follow(at, epoch, change, row);
                 }
                 Some(Sent::Load(told)) => {
                     let (id, rank, row, source) =
                         worker_wire::told_load(told).map_err(Halt::Unread)?;
-                    self.store.record(id, rank, row, now, source);
+                    self.store.follow_load(at, id, rank, row, now, source);
                 }
-                Some(Sent::TermStart(_)) => self.store.set_term(at.term),
+                Some(Sent::TermStart(_)) => self.store.follow_term(at),
                 // A kind this build does not apply, and one it does not know.
                 Some(_) | None => {
                     return Err(Halt::Unread(Refused {
@@ -232,15 +234,18 @@ impl Staged {
     }
 }
 
-/// How far behind its leader a standby is, as its last applied frame says
-/// it: the loop writes it, and `Leader` and the readiness read it.
+/// How far behind its leader a standby is, as its last frame at the head
+/// says it: a frame that left it at the head its leader stated there, or
+/// any applied frame of a leader that states none. The loop writes it, and
+/// `Leader` and the readiness read it.
 #[derive(Debug)]
 pub(crate) struct Lag {
     origin: Instant,
     /// The lag this replica reads synced under ([`synced_within`]).
     within: Duration,
-    /// The last applied frame, in microseconds past the origin plus one;
-    /// `0` before any, and once this replica has led since.
+    /// The last frame at the head, in microseconds past the origin plus one;
+    /// `0` before any, and once this replica has led since or its lease
+    /// has named another leader's term.
     frame: AtomicU64,
     /// Whether the serve runs a standby that writes this lag.
     follows: AtomicBool,
@@ -264,8 +269,8 @@ impl Lag {
         }
     }
 
-    /// A frame of the leader's stream, or its snapshot, was applied at
-    /// `at`.
+    /// A frame of the leader's stream, or the last part of its snapshot,
+    /// left this replica at the head at `at`.
     pub(crate) fn applied(&self, at: Instant) {
         let before = self.store(at);
         // The clock is read after the write: whoever read the frame before
@@ -273,10 +278,10 @@ impl Lag {
         self.turn(before, Instant::now());
     }
 
-    /// Forgets the last applied frame, and tells a turn where there was
-    /// one. The standby loop's call once this replica has held the lease:
-    /// a frame it applied before its own lead says nothing of the leader
-    /// it follows next.
+    /// Forgets the last frame at the head, and tells a turn where there was
+    /// one. The standby loop's call once this replica has held the lease,
+    /// and once its lease names another leader's term: a frame it applied
+    /// before says nothing of the leader it follows next.
     pub(crate) fn forget(&self) {
         if self.frame.swap(0, Ordering::Relaxed) != 0 {
             self.turns.send_modify(|turns| *turns += 1);
@@ -305,9 +310,9 @@ impl Lag {
         }
     }
 
-    /// The last applied frame at `now`, by one read of it: its age, and the
-    /// instant the sync lapses with no further frame, none where the frame
-    /// is as old as the bound already. `None` where the lag holds no
+    /// The last frame at the head at `now`, by one read of it: its age, and
+    /// the instant the sync lapses with no further such frame, none where the
+    /// frame is as old as the bound already. `None` where the lag holds no
     /// frame. This replica is synced while there is such an instant: the
     /// `Leader` call's `synced` and a follower's readiness are this read.
     pub(crate) fn read(&self, now: Instant) -> Option<(Duration, Option<Instant>)> {
@@ -318,15 +323,15 @@ impl Lag {
         Some((age, (now < lapse).then_some(lapse)))
     }
 
-    /// The age at `now` of the last applied frame; `None` where the lag
+    /// The age at `now` of the last frame at the head; `None` where the lag
     /// holds none.
     #[cfg(test)]
     pub(crate) fn age(&self, now: Instant) -> Option<Duration> {
         self.read(now).map(|(age, _)| age)
     }
 
-    /// Whether this replica is synced at `now`: its last applied frame is
-    /// younger than the bound.
+    /// Whether this replica is synced at `now`: its last frame at the head
+    /// is younger than the bound.
     #[cfg(test)]
     pub(crate) fn synced(&self, now: Instant) -> bool {
         self.read(now).is_some_and(|(_, lapse)| lapse.is_some())
@@ -555,11 +560,15 @@ impl Standby {
     /// stream ([`backoff`]); the lease naming another holder ends the wait,
     /// and the stream wherever it stands, the leader's answer not waited
     /// for. A replica that has held the lease is synced again at the first
-    /// frame of the leader it follows next ([`Lag::forget`]).
+    /// frame of the leader it follows next, and so is one whose lease
+    /// names another leader, or the same one under another term: the sync
+    /// is with one leader's term ([`Lag::forget`]).
     pub(crate) async fn run(self, mut stop: watch::Receiver<bool>) {
         let mut steps = self.shared.standing.clone();
         let mut streak = Streak::default();
         let mut led = self.shared.fence.term();
+        // The term of the leader the last stream was opened against.
+        let mut followed = None;
         loop {
             let leading = self.shared.fence.leader_term(Instant::now());
             let leader = self.shared.leader(leading);
@@ -573,6 +582,12 @@ impl Standby {
             let next = if leader.is_leader || leader.address.is_empty() {
                 Next::Lease
             } else {
+                // A term names one leader. A frame applied under another
+                // says nothing of the one the lease names now: this
+                // replica reads not synced until that leader's first.
+                if followed.replace(leader.term) != Some(leader.term) {
+                    self.shared.lag.forget();
+                }
                 let applied = AtomicBool::new(false);
                 let ended = tokio::select! {
                     ended = self.stream(&leader, &applied) => ended,
@@ -806,7 +821,16 @@ impl Standby {
             } else {
                 match self.follower.apply(&batch, now) {
                     Ok(()) => {}
-                    Err(Halt::Lost(at)) => return self.lost(leader, at, landed),
+                    Err(Halt::Lost(at)) => {
+                        // The events of the batch ahead of that one landed
+                        // and stand, as a whole batch's would: an event
+                        // followed the last restore.
+                        let partly = at.seq > batch.first_seq;
+                        if partly {
+                            self.fresh.store(false, Ordering::Relaxed);
+                        }
+                        return self.lost(leader, at, landed || partly);
+                    }
                     Err(Halt::Unread(refused)) => return Ended::waits(landed, unread(refused)),
                 }
                 if !landed {
@@ -828,7 +852,17 @@ impl Standby {
                 }
             }
             applied.store(true, Ordering::Relaxed);
-            self.shared.lag.applied(now);
+            // The lag's instant is the last frame that left this replica at
+            // the head its leader stated: a frame inside a replay, or in
+            // the tail a restore leaves, moves nothing. A frame that states
+            // no head, a leader of a build before the field, moves it as
+            // every applied frame did. A place is the leader's under a
+            // term alone: a row of the standby's own stands under none,
+            // and a head stated at its number is another event's.
+            let place = self.follower.place();
+            if batch.head_seq == 0 || (place.term != 0 && batch.head_seq == place.seq) {
+                self.shared.lag.applied(now);
+            }
         }
     }
 
@@ -839,10 +873,14 @@ impl Standby {
     /// under no term. The next stream opens at once, unless this event
     /// follows a restore with no event landed between: two in a row are
     /// two restores a streak's wait apart, never a loop at the stream's
-    /// speed.
+    /// speed. The sync is forgotten here: a standby an event did not land
+    /// on holds less than its leader does, whatever its last frame said.
+    /// The restore's last part sets it again, or the frame that brings the
+    /// restore's tail.
     fn lost(&self, leader: &Leader, at: Position, landed: bool) -> Ended {
         self.asks.store(true, Ordering::Relaxed);
         self.shared.lag.asked();
+        self.shared.lag.forget();
         warn!(
             controller_id = %self.shared.controller_id,
             leader = %leader.controller_id,
@@ -891,7 +929,7 @@ mod tests {
         elector::{ElectionSettings, Elector, Tick},
         proto::policy_controller_server::{PolicyController, PolicyControllerServer},
         replication::{Entry, Event},
-        store::{LoadSource, WorkerFacts, WorkerStatus, WorkersStore},
+        store::{LoadSink, LoadSource, WorkerFacts, WorkerStatus, WorkersStore},
         view::{LoadRow, WireModes},
     };
 
@@ -900,7 +938,7 @@ mod tests {
     /// A replica's store and the log it journals to under a shared lease:
     /// the log's places start where this replica's run drew.
     fn replica() -> Replica {
-        let (store, feed) = journaled(&LeasePlace::File("shared".into()));
+        let (store, feed) = journaled(&LeasePlace::File("shared".into()), 1);
         (store, feed.log)
     }
 
@@ -953,14 +991,25 @@ mod tests {
         }
     }
 
-    /// One entry as the batch a leader sends it in at `now`.
+    /// One entry as the batch a leader sends it in at `now`, the last its
+    /// log holds.
     fn batch(entry: &Entry, now: Instant) -> proto::ReplicationBatch {
+        batch_of(std::slice::from_ref(entry), entry.at.seq, now)
+    }
+
+    /// `entries`, written under one term, as the batch a leader sends them
+    /// in at `now` while its log's head stands at `head`.
+    fn batch_of(entries: &[Entry], head: u64, now: Instant) -> proto::ReplicationBatch {
         proto::ReplicationBatch {
-            first_seq: entry.at.seq,
-            term: entry.at.term,
-            events: vec![worker_wire::replication(entry, now)],
+            first_seq: entries[0].at.seq,
+            term: entries[0].at.term,
+            events: entries
+                .iter()
+                .map(|entry| worker_wire::replication(entry, now))
+                .collect(),
             resync_required: false,
             snapshot: None,
+            head_seq: head,
         }
     }
 
@@ -1571,6 +1620,7 @@ mod tests {
                             .collect(),
                         resync_required: false,
                         snapshot: None,
+                        head_seq: 0,
                     })
                     .collect();
                 let began = Instant::now();
@@ -1756,7 +1806,7 @@ mod tests {
         let elector = Elector::alone(OWN, ElectionSettings::default())
             .expect("the default settings are in order");
         let (standing, stood) = watch::channel(Standing::default());
-        let journal = journaled(&LeasePlace::File("shared".into()));
+        let journal = journaled(&LeasePlace::File("shared".into()), 1);
         let (id, address) = ("standby-0".to_owned(), "127.0.0.1:1".to_owned());
         let catalog = Arc::new(crate::Catalog::builtin());
         let shared = Shared::new(id, address, &elector, stood, journal, catalog, 1)
@@ -1826,6 +1876,146 @@ mod tests {
         assert_eq!(ended.why.as_deref(), Some("Aborted: deposed"));
         assert_eq!(standby.follower.place(), leader.1.head(Kinds::All));
         assert_eq!(*bed.names.lock(), ["standby-0"]);
+    }
+
+    #[tokio::test]
+    async fn a_standby_reads_synced_at_the_frame_that_leaves_it_at_its_leaders_head() {
+        // A leader that states its head, and one of a build before the
+        // field, which states none.
+        for stated in [true, false] {
+            let mut bed = Bed::new().await;
+            let (_elector, standing, standby) = standing_by(&bed, FIVE);
+            // The standby stands past a leader's first writes, and the
+            // leader wrote three rows since: a replay of two frames.
+            let leader = led();
+            let now = Instant::now();
+            follow(&standby.follower, &leader.1, now);
+            let place = standby.follower.place();
+            for key in ["http://b:8000", "http://c:8000", "http://d:8000"] {
+                leader.0.upsert(facts(key, 1));
+            }
+            let tail = entries(&leader.1, place);
+            let head = if stated {
+                leader.1.head(Kinds::All).seq
+            } else {
+                0
+            };
+            standing.send_replace(bed.holds("leader-1", 1));
+            let named = standby.shared.leader(None);
+            let applied = AtomicBool::new(false);
+            let synced = || standby.shared.lag.age(Instant::now()).is_some();
+            let script = async {
+                let mut opened = bed.opened().await;
+                assert!(matches!(opened.frame().await, Some(Frame::Hello(_))));
+                assert!(!synced(), "before any frame");
+                let ack = |entry: &Entry| {
+                    let seq = entry.at.seq;
+                    Some(Frame::Ack(proto::ReplicationAck { seq }))
+                };
+                // The replay's first frame ends short of the head it
+                // states: the standby applied it and stands behind.
+                opened.says(batch_of(&tail[..1], head, now)).await;
+                assert_eq!(opened.frame().await, ack(&tail[0]));
+                assert_eq!(synced(), !stated, "a frame short of the head");
+                // The frame that ends there leaves it at the head.
+                opened.says(batch_of(&tail[1..], head, now)).await;
+                assert_eq!(opened.frame().await, ack(&tail[2]));
+                assert!(synced(), "the frame that reached the head");
+                opened.refuses(Status::aborted("deposed")).await;
+            };
+            let (ended, ()) = tokio::join!(standby.stream(&named, &applied), script);
+            assert_eq!((ended.next, ended.applied), (Next::Lease, true));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_head_stated_at_the_number_of_the_standbys_own_row_moves_no_sync() {
+        let mut bed = Bed::new().await;
+        let (_elector, standing, standby) = standing_by(&bed, FIVE);
+        // A log's places start where its run drew, and a row of the
+        // store's own stands past every place its log drew: it takes the
+        // next number where the leader's places lie above the standby's
+        // own. This leader's start there.
+        let drawn = standby.follower.log.head(Kinds::All);
+        let above = journaled_from(&LeasePlace::File("shared".into()), drawn.seq + 1);
+        let leader: Replica = (above.0, above.1.log);
+        leader.0.set_term(1);
+        leader.0.upsert(facts("http://a:8000", 1));
+        let now = Instant::now();
+        let id = leader.0.upsert(facts("http://b:8000", 1)).id();
+        follow(&standby.follower, &leader.1, now);
+        let followed = standby.follower.place();
+        // A poll's late answer lands as a row of the standby's own: at the
+        // next number, under no term.
+        standby
+            .follower
+            .store
+            .record(id, 0, running(1), now, LoadSource::Stream);
+        let own = standby.follower.place();
+        assert_eq!((own.seq, own.term), (followed.seq + 1, 0));
+        standing.send_replace(bed.holds("leader-1", 1));
+        let named = standby.shared.leader(None);
+        let applied = AtomicBool::new(false);
+        let script = async {
+            let mut opened = bed.opened().await;
+            assert!(matches!(opened.frame().await, Some(Frame::Hello(_))));
+            // The leader wrote one event since, and its heartbeat states
+            // that head: the number of the standby's own row.
+            let beat = proto::ReplicationBatch {
+                first_seq: followed.seq + 1,
+                term: followed.term,
+                head_seq: own.seq,
+                ..proto::ReplicationBatch::default()
+            };
+            opened.says(beat).await;
+            opened.refuses(Status::aborted("deposed")).await;
+        };
+        let (ended, ()) = tokio::join!(standby.stream(&named, &applied), script);
+        assert_eq!((ended.next, ended.applied), (Next::Lease, true));
+        let age = standby.shared.lag.age(Instant::now());
+        assert!(age.is_none(), "synced by a head at an own row's number");
+    }
+
+    #[tokio::test]
+    async fn a_restored_standby_reads_synced_once_it_applied_what_was_written_during_the_send() {
+        for tail in [false, true] {
+            let mut bed = Bed::new().await;
+            let (_elector, standing, standby) = standing_by(&bed, FIVE);
+            let leader = led();
+            let now = Instant::now();
+            let parts = snapshot(&leader, now);
+            let place = leader.1.head(Kinds::All);
+            // A row written while the snapshot was sent: the last part
+            // states a head one past the snapshot's place.
+            leader.0.upsert(facts("http://b:8000", 1));
+            let written = entries(&leader.1, place);
+            let head = leader.1.head(Kinds::All).seq;
+            standing.send_replace(bed.holds("leader-1", 1));
+            let named = standby.shared.leader(None);
+            let applied = AtomicBool::new(false);
+            let script = async {
+                let mut opened = bed.opened().await;
+                assert!(matches!(opened.frame().await, Some(Frame::Hello(_))));
+                opened.says(resync()).await;
+                for part in &parts {
+                    let mut part = part.clone();
+                    part.head_seq = head;
+                    opened.says(part).await;
+                }
+                if tail {
+                    opened.says(batch_of(&written, head, now)).await;
+                    let ack = Frame::Ack(proto::ReplicationAck { seq: head });
+                    assert_eq!(opened.frame().await, Some(ack));
+                }
+                opened.refuses(Status::aborted("deposed")).await;
+            };
+            let (ended, ()) = tokio::join!(standby.stream(&named, &applied), script);
+            assert_eq!((ended.next, ended.applied), (Next::Lease, true));
+            // Restored and behind what was written since, it is not synced:
+            // the frame that brings that tail leaves it at the head.
+            let synced = standby.shared.lag.age(Instant::now()).is_some();
+            assert_eq!(synced, tail, "the tail applied: {tail}");
+        }
     }
 
     #[tokio::test]
@@ -1974,6 +2164,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_standby_whose_event_did_not_land_reads_not_synced() {
+        let mut bed = Bed::new().await;
+        let (_elector, standing, standby) = standing_by(&bed, FIVE);
+        let leader = led();
+        let now = Instant::now();
+        follow(&standby.follower, &leader.1, now);
+        let place = standby.follower.place();
+        // The leader's event after the next: past a gap, it does not land.
+        leader.0.upsert(facts("http://b:8000", 1));
+        leader.0.upsert(facts("http://c:8000", 1));
+        let past = entries(&leader.1, place).pop().expect("the leader wrote");
+        standing.send_replace(bed.holds("leader-1", 1));
+        let named = standby.shared.leader(None);
+        let applied = AtomicBool::new(false);
+        let mut turns = standby.shared.lag.turns();
+        let synced = || standby.shared.lag.age(Instant::now()).is_some();
+        let script = async {
+            let mut opened = bed.opened().await;
+            assert!(matches!(opened.frame().await, Some(Frame::Hello(_))));
+            // A heartbeat that states no head: the standby reads synced.
+            let _ = turns.borrow_and_update();
+            opened.says(proto::ReplicationBatch::default()).await;
+            let turned = timeout(FIVE, turns.changed()).await;
+            assert!(matches!(turned, Ok(Ok(()))), "the heartbeat's turn");
+            assert!(synced(), "at the heartbeat");
+            opened.says(batch(&past, now)).await;
+            opened
+        };
+        let (ended, _opened) = tokio::join!(standby.stream(&named, &applied), script);
+        assert_eq!(ended.next, Next::Join);
+        assert!(!synced(), "the sync outlived an event that did not land");
+    }
+
+    #[tokio::test]
     async fn an_event_that_does_not_land_asks_a_restore_and_two_in_a_row_wait_a_streak_apart() {
         let mut bed = Bed::new().await;
         let (_elector, standing, standby) = standing_by(&bed, FIVE);
@@ -2079,6 +2303,69 @@ mod tests {
         assert_eq!(standby.follower.place(), lands.at);
         assert_eq!(standby.shared.lag.asks(), 3);
         assert_eq!(*bed.names.lock(), ["standby-0"; 4]);
+        // A restore, then one batch whose first event lands and whose
+        // second does not: an event landed since the restore all the same.
+        let parts = snapshot(&leader, now);
+        let restored = leader.1.head(Kinds::All);
+        leader.0.upsert(facts("http://halved:8000", 1));
+        let lands = entries(&leader.1, restored).remove(0);
+        let halved = proto::ReplicationBatch {
+            events: vec![worker_wire::replication(&lands, now); 2],
+            ..batch(&lands, now)
+        };
+        let applied = AtomicBool::new(false);
+        let script = async {
+            let mut opened = bed.opened().await;
+            assert!(matches!(opened.frame().await, Some(Frame::Hello(_))));
+            opened.says(resync()).await;
+            for part in &parts {
+                opened.says(part.clone()).await;
+            }
+            opened.says(halved).await;
+            opened
+        };
+        let (ended, _opened) = tokio::join!(standby.stream(&named, &applied), script);
+        assert_eq!((ended.next, ended.applied), (Next::Join, true));
+        assert!(ended.why.is_none(), "{:?}", ended.why);
+        assert_eq!(standby.follower.place(), lands.at);
+        assert_eq!(standby.shared.lag.asks(), 4);
+        assert_eq!(*bed.names.lock(), ["standby-0"; 5]);
+    }
+
+    /// A stream's first batch that lands in part: the event that landed is
+    /// the stream's first, and the stream ends as one that applied, so the
+    /// next opens at once and a streak of empty streams ends there.
+    #[tokio::test]
+    async fn a_first_batch_that_lands_in_part_ends_its_stream_as_one_that_applied() {
+        let mut bed = Bed::new().await;
+        let (_elector, standing, standby) = standing_by(&bed, FIVE);
+        let leader = led();
+        let now = Instant::now();
+        follow(&standby.follower, &leader.1, now);
+        let place = standby.follower.place();
+        standing.send_replace(bed.holds("leader-1", 7));
+        let named = standby.shared.leader(None);
+        // One batch of the leader's next event twice: the first lands and
+        // the second, at a number the log has passed, does not.
+        leader.0.upsert(facts("http://halved:8000", 1));
+        let lands = entries(&leader.1, place).remove(0);
+        let halved = proto::ReplicationBatch {
+            events: vec![worker_wire::replication(&lands, now); 2],
+            ..batch(&lands, now)
+        };
+        let applied = AtomicBool::new(false);
+        let script = async {
+            let mut opened = bed.opened().await;
+            assert!(matches!(opened.frame().await, Some(Frame::Hello(_))));
+            opened.says(halved).await;
+            opened
+        };
+        let (ended, _opened) = tokio::join!(standby.stream(&named, &applied), script);
+        assert_eq!((ended.next, ended.applied), (Next::Join, true));
+        assert!(ended.why.is_none(), "{:?}", ended.why);
+        assert!(!applied.load(Ordering::Relaxed), "no whole frame landed");
+        assert_eq!(standby.follower.place(), lands.at);
+        assert_eq!(standby.shared.lag.asks(), 1);
     }
 
     #[tokio::test]
@@ -2255,6 +2542,77 @@ mod tests {
         assert!(matches!(ended, Ok(Some(Ok(())))), "the stop ends the loop");
     }
 
+    /// The sync is with one leader's term: once the lease names another
+    /// leader, or the same one's next term, the frame applied before is
+    /// forgotten, and the replica is synced again at that leader's first.
+    #[tokio::test]
+    async fn a_standby_forgets_its_sync_once_its_lease_names_another_leaders_term() {
+        let far = Duration::from_secs(60);
+        let mut bed = Bed::new().await;
+        let (_elector, standing, standby) = standing_by(&bed, FIVE);
+        let shared = Arc::clone(&standby.shared);
+        let mut turns = shared.lag.turns();
+        let holds = || shared.lag.age(Instant::now()).is_some();
+        let (stop, stopped) = watch::channel(false);
+        let mut running = JoinSet::new();
+        running.spawn(standby.run(stopped));
+        for (leader, term) in [("leader-1", 1), ("leader-2", 2), ("leader-2", 3)] {
+            standing.send_replace(bed.holds(leader, term));
+            let mut opened = bed.opened().await;
+            assert!(matches!(opened.frame().await, Some(Frame::Hello(_))));
+            // The stream stands and no frame of it came: what the last
+            // leader's left is forgotten before the dial.
+            assert!(!holds(), "{leader} under term {term}, before its frame");
+            // A heartbeat that states no head: the frame is at the head.
+            let _ = turns.borrow_and_update();
+            opened.says(proto::ReplicationBatch::default()).await;
+            let turned = timeout(far, turns.changed()).await;
+            assert!(matches!(turned, Ok(Ok(()))), "{leader} under term {term}");
+            assert!(holds(), "{leader} under term {term}, at its frame");
+        }
+        stop.send_replace(true);
+        let ended = timeout(FIVE, running.join_next()).await;
+        assert!(matches!(ended, Ok(Some(Ok(())))), "the stop ends the loop");
+    }
+
+    /// The sync is with one leader's term: a stream that ends and is dialed
+    /// again under that term keeps the instant its last frame left.
+    #[tokio::test]
+    async fn a_standby_keeps_its_sync_across_a_dial_under_one_term() {
+        let far = Duration::from_secs(60);
+        let mut bed = Bed::new().await;
+        let (_elector, standing, standby) = standing_by(&bed, FIVE);
+        let shared = Arc::clone(&standby.shared);
+        let mut turns = shared.lag.turns();
+        let (stop, stopped) = watch::channel(false);
+        let mut running = JoinSet::new();
+        running.spawn(standby.run(stopped));
+        standing.send_replace(bed.holds("leader-1", 1));
+        let mut first = bed.opened().await;
+        assert!(matches!(first.frame().await, Some(Frame::Hello(_))));
+        // A heartbeat that states no head: the frame is at the head.
+        let _ = turns.borrow_and_update();
+        first.says(proto::ReplicationBatch::default()).await;
+        let turned = timeout(far, turns.changed()).await;
+        assert!(matches!(turned, Ok(Ok(()))), "the first stream's frame");
+        let held = shared.lag.age(Instant::now());
+        assert!(held.is_some(), "synced at the first stream's frame");
+        // The leader ends the stream, and the lease names it still: the
+        // standby dials it again under the same term.
+        first.refuses(Status::unavailable("not yet")).await;
+        let mut second = bed.opened().await;
+        assert!(matches!(second.frame().await, Some(Frame::Hello(_))));
+        // No frame of the second stream came, and the first's still stands.
+        let kept = shared.lag.age(Instant::now());
+        assert!(
+            kept >= held,
+            "the dial forgot the sync: {kept:?} after {held:?}"
+        );
+        stop.send_replace(true);
+        let ended = timeout(FIVE, running.join_next()).await;
+        assert!(matches!(ended, Ok(Some(Ok(())))), "the stop ends the loop");
+    }
+
     #[tokio::test]
     async fn a_replica_that_led_is_not_synced_before_a_frame_of_its_present_leader() {
         let mut bed = Bed::new().await;
@@ -2279,13 +2637,22 @@ mod tests {
         }
         assert!(held());
 
-        // The lease names another leader: the replica held no lease
-        // between the two, and its frame stands.
+        // The lease names another leader: the last one's frame says
+        // nothing of it, though this replica held no lease between the
+        // two. It is synced again at a frame of the leader named.
         standing.send_replace(bed.holds("leader-2", 2));
         let mut second = bed.opened().await;
         assert!(hello(second.frame().await));
         assert_eq!(first.frame().await, None, "the first stream is left");
-        assert!(held(), "a follower's frame outlives a change of leader");
+        assert!(!held(), "no frame of its present leader yet");
+        leader.0.upsert(facts("http://b:8000", 1));
+        for entry in entries(&leader.1, place) {
+            second.says(batch(&entry, Instant::now())).await;
+            place = entry.at;
+            let ack = Frame::Ack(proto::ReplicationAck { seq: place.seq });
+            assert_eq!(second.frame().await, Some(ack));
+        }
+        assert!(held());
 
         // This replica takes the lease: the frame it applied before its
         // lead is forgotten.
@@ -2306,7 +2673,7 @@ mod tests {
         let mut third = bed.opened().await;
         assert!(hello(third.frame().await));
         assert!(!held(), "no frame of its present leader yet");
-        leader.0.upsert(facts("http://b:8000", 1));
+        leader.0.upsert(facts("http://c:8000", 1));
         for entry in entries(&leader.1, place) {
             third.says(batch(&entry, Instant::now())).await;
             let ack = Frame::Ack(proto::ReplicationAck { seq: entry.at.seq });
@@ -2318,46 +2685,95 @@ mod tests {
         assert!(matches!(ended, Ok(Some(Ok(())))), "the stop ends the loop");
     }
 
+    /// One stream of a standby driven to its end, while the scripted
+    /// leader says `first` on every stream it sees open. A stream the host
+    /// held past the standby's bound reaches the leader late, or never: a
+    /// late one is said the same frame, which nobody reads, and none is
+    /// waited for. The streams are returned held, so none ends from the
+    /// leader's side first.
+    async fn leaving<T>(
+        bed: &mut Bed,
+        stream: impl std::future::Future<Output = T>,
+        first: &proto::ReplicationBatch,
+    ) -> (T, Vec<Opened>) {
+        tokio::pin!(stream);
+        let mut opened = Vec::new();
+        loop {
+            tokio::select! {
+                ended = &mut stream => return (ended, opened),
+                Some(next) = bed.streams.recv() => {
+                    // The standby may have left this stream already.
+                    let _ = next.batches.send(Ok(first.clone())).await;
+                    opened.push(next);
+                }
+            }
+        }
+    }
+
+    /// The bound past which a step of the quiet case is not taken again:
+    /// far past any stall of a loaded host.
+    const WIDEST: Duration = Duration::from_secs(10);
+
     #[tokio::test]
     async fn a_leader_that_says_nothing_is_left_at_the_quiet_bound() {
         let mut bed = Bed::new().await;
-        let (_elector, standing, standby) = standing_by(&bed, Duration::from_millis(100));
+        let (_elector, standing, mut standby) = standing_by(&bed, Duration::from_millis(100));
         standing.send_replace(bed.holds("leader-1", 1));
         let named = standby.shared.leader(None);
-        // A stream that stands and brings no frame after its first.
-        let applied = AtomicBool::new(false);
-        let script = async {
-            let opened = bed.opened().await;
-            opened.says(proto::ReplicationBatch::default()).await;
-            opened
-        };
-        let left = async { tokio::join!(standby.stream(&named, &applied), script) };
-        let (ended, opened) = timeout(FIVE, left).await.expect("the stream is left");
-        assert_eq!((ended.next, ended.applied), (Next::Wait, true));
-        let why = "the leader sent no frame for 100ms";
-        assert_eq!(ended.why.as_deref(), Some(why));
-        drop(opened);
-        // A snapshot whose next part does not arrive: the same bound.
-        let applied = AtomicBool::new(false);
-        let script = async {
-            let opened = bed.opened().await;
-            opened.says(resync()).await;
-            opened
-        };
-        let left = async { tokio::join!(standby.stream(&named, &applied), script) };
-        let (ended, held) = timeout(FIVE, left).await.expect("the stream is left");
-        assert_eq!((ended.next, ended.applied), (Next::Wait, false));
-        let why = "the leader sent no frame for 100ms";
-        assert_eq!(ended.why.as_deref(), Some(why));
-        drop(held);
+        // A stream that stands and brings no frame after its first. The
+        // bound runs on the host's clock, from the dial to the stream's
+        // opening and from there to the first frame, and a held host runs
+        // either past it: the stream is then left with nothing applied.
+        // The step is taken again under twice the bound until a first
+        // frame was applied inside it.
+        let first = proto::ReplicationBatch::default();
+        loop {
+            let quiet = standby.quiet;
+            let applied = AtomicBool::new(false);
+            let left = leaving(&mut bed, standby.stream(&named, &applied), &first);
+            let left = timeout(FIVE + 3 * quiet, left).await;
+            let (ended, opened) = left.expect("the stream is left");
+            drop(opened);
+            assert_eq!(ended.next, Next::Wait);
+            if ended.applied {
+                let why = format!("the leader sent no frame for {quiet:?}");
+                assert_eq!(ended.why.as_deref(), Some(why.as_str()));
+                break;
+            }
+            assert!(quiet < WIDEST, "no first frame inside {quiet:?}");
+            standby.quiet = 2 * quiet;
+        }
+        // A snapshot whose next part does not arrive: the same bound. A
+        // stream the host held unopened past the bound is taken again the
+        // same way.
+        let word = resync();
+        loop {
+            let quiet = standby.quiet;
+            let applied = AtomicBool::new(false);
+            let left = leaving(&mut bed, standby.stream(&named, &applied), &word);
+            let left = timeout(FIVE + 3 * quiet, left).await;
+            let (ended, held) = left.expect("the stream is left");
+            drop(held);
+            assert_eq!((ended.next, ended.applied), (Next::Wait, false));
+            let unopened = format!("the leader opened no stream for {quiet:?}");
+            if ended.why.as_deref() != Some(unopened.as_str()) {
+                let why = format!("the leader sent no frame for {quiet:?}");
+                assert_eq!(ended.why.as_deref(), Some(why.as_str()));
+                break;
+            }
+            assert!(quiet < WIDEST, "no stream opened inside {quiet:?}");
+            standby.quiet = 2 * quiet;
+        }
         // A leader that opens no stream.
         bed.mute.store(true, Ordering::Relaxed);
+        let quiet = standby.quiet;
         let applied = AtomicBool::new(false);
         let left = standby.stream(&named, &applied);
-        let ended = timeout(FIVE, left).await.expect("the stream is left");
+        let ended = timeout(FIVE + quiet, left).await;
+        let ended = ended.expect("the stream is left");
         assert_eq!((ended.next, ended.applied), (Next::Wait, false));
-        let why = "the leader opened no stream for 100ms";
-        assert_eq!(ended.why.as_deref(), Some(why));
+        let why = format!("the leader opened no stream for {quiet:?}");
+        assert_eq!(ended.why.as_deref(), Some(why.as_str()));
     }
 
     /// The lines a case's subscriber kept.

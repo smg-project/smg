@@ -4,6 +4,7 @@ A policy controller of your own: the stock controller with one scorer added
 in Rust. The command line, the listeners, the election, the store and the
 policy documents are the crate's (`crates/policy_controller`). The scorer is
 this package's. This page is the guide: write a stage, register it, run.
+The crate's [README](../../crates/policy_controller/README.md) explains the policy document.
 
 Write a stage in code when a routing rule cannot be written as a policy
 document over the built-in stages and you want it compiled into the

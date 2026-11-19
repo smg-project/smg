@@ -19,6 +19,12 @@ use axum::{
     response::Response,
 };
 use rand::RngExt;
+use smg_worker::{
+    health::overload::{
+        BRANCH_ALL_OVERLOADED_FALLBACK, BRANCH_ALL_STALLED_FALLBACK, STAGE_SELECTION,
+    },
+    identity::basic::{ConnectionMode, ConnectionModeExt, RuntimeType, Worker, WorkerType},
+};
 use tracing::{debug, warn};
 
 use crate::{
@@ -34,18 +40,14 @@ use crate::{
     },
     routers::{
         common::{
-            header_utils, overload, pd_admission,
+            header_utils, overload,
+            pair_index::PdPairIndex,
+            pd_admission,
             prefill_admission::{PrefillCandidateError, PrefillSelectionContext},
             retry::mark_non_retryable,
+            snapshot::{RoutingPool, WorkerRegistry, WorkerRegistryExt},
         },
         error,
-    },
-    worker::{
-        health::overload::{
-            BRANCH_ALL_OVERLOADED_FALLBACK, BRANCH_ALL_STALLED_FALLBACK, STAGE_SELECTION,
-        },
-        ConnectionMode, ConnectionModeExt, PdPairIndex, RoutingPool, RuntimeType, Worker,
-        WorkerRegistry, WorkerRegistryExt, WorkerType,
     },
 };
 
@@ -496,7 +498,7 @@ fn select_pass(
         // it: no other placement pays the registry's keyed read and the
         // ring's shared count.
         hash_ring: policy_reads_hash_ring(policy.as_ref())
-            .then(|| registry.get_hash_ring(model_id))
+            .then(|| policies.hash_ring(registry, model_id))
             .flatten(),
         role: WorkerRole::Single,
         overload_lifted: false,
@@ -1352,7 +1354,13 @@ pub(crate) fn select_pair(
     // told the list, so what it keeps for the pool does not move with the
     // workers that are open for this request.
     let prefill = Narrowed::at(&pairs.prefill, open);
-    let hash_ring = registry.get_hash_ring(model_id);
+    // As for a single placement: the ring is read for the policies that walk
+    // it alone. No other pair pays the registry's keyed read and the ring's
+    // shared count, or fills the ring of a generation it never reads.
+    let hash_ring = (policy_reads_hash_ring(prefill_policy.as_ref())
+        || policy_reads_hash_ring(decode_policy.as_ref()))
+    .then(|| policies.hash_ring(registry, model_id))
+    .flatten();
     let mut info = SelectWorkerInfo {
         request_text: inputs.text,
         tokens: inputs.tokens,
@@ -1509,7 +1517,20 @@ mod tests {
     };
 
     use axum::http::StatusCode;
-    use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
+    use openai_protocol::{
+        model_card::ModelCard,
+        worker::{HealthCheckConfig, WorkerStatus},
+    };
+    use smg_worker::{
+        connection::engine::EngineConnection,
+        health::{circuit_breaker::CircuitState, resilience::ResolvedResilience},
+        identity::{
+            basic::{BasicWorker, WorkerMetadata, WorkerType},
+            error::WorkerResult,
+        },
+        load::state::{one_rank_load, TestFeed},
+        runtime::{RoutingState, StallReason},
+    };
     use tracing_subscriber::Layer;
 
     use super::*;
@@ -1522,14 +1543,7 @@ mod tests {
             hash_ring::HashRing, CacheAwareConfig, CacheAwarePolicy, ConsistentHashingPolicy,
             LeastLoadPolicy, PowerOfTwoPolicy, RoundRobinPolicy,
         },
-        worker::{
-            connection::engine::EngineConnection,
-            health::circuit_breaker::CircuitState,
-            identity::basic::WorkerMetadata,
-            load::state::{one_rank_load, TestFeed},
-            runtime::{RoutingState, StallReason},
-            BasicWorkerBuilder, ModelCard, PdWire, WorkerType,
-        },
+        routers::{common::pair_index::PdWire, grpc::backend_client::BasicWorkerBuilder},
     };
 
     const MODEL: &str = "m";
@@ -1983,6 +1997,49 @@ mod tests {
             .expect("the targeted pair is open");
             assert_eq!(pair.decode.url(), expected, "target {index}");
         }
+    }
+
+    /// A pair's ring read is the single placement's: for the policies that
+    /// walk the ring alone. A pair of other policies reads none, and so
+    /// fills the ring of no generation.
+    #[test]
+    fn a_pair_reads_the_hash_ring_for_a_policy_that_walks_it_alone() {
+        // A pair is placed under `prefill` and `decode`: whether the
+        // generation's ring was filled for it.
+        type Policy = Arc<dyn LoadBalancingPolicy>;
+        let fills_the_ring = |prefill: Policy, decode: Policy| {
+            let registry = gated_pd_registry(2);
+            let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+            policies.set_prefill_policy(prefill);
+            policies.set_decode_policy(decode);
+            let pairs = pairs_of(&registry, &policies);
+            select_pair(
+                &registry,
+                &policies,
+                MODEL,
+                &pairs,
+                None,
+                None,
+                PlacementInputs::default(),
+            )
+            .expect("a pair is open");
+            registry.get_routing_snapshot(MODEL).hash_ring_is_filled()
+        };
+
+        let walks_none = || -> Policy { Arc::new(RoundRobinPolicy::new()) };
+        let walks_the_ring = || -> Policy { Arc::new(ConsistentHashingPolicy::new()) };
+        assert!(
+            !fills_the_ring(walks_none(), walks_none()),
+            "no policy of the pair walks the ring"
+        );
+        assert!(
+            fills_the_ring(walks_none(), walks_the_ring()),
+            "the decode policy walks the ring"
+        );
+        assert!(
+            fills_the_ring(walks_the_ring(), walks_none()),
+            "the prefill policy walks the ring"
+        );
     }
 
     /// The load-scoring decode policies price a side by its report and
@@ -2992,7 +3049,7 @@ mod tests {
     /// worker's.
     #[derive(Debug)]
     struct VetoLiftsAfterARead {
-        worker: crate::worker::BasicWorker,
+        worker: BasicWorker,
         lifted: std::sync::OnceLock<()>,
     }
 
@@ -3012,7 +3069,7 @@ mod tests {
         }
 
         /// What `read` sees of the worker; the veto lifts behind the first read.
-        fn read<T>(&self, read: impl FnOnce(&crate::worker::BasicWorker) -> T) -> T {
+        fn read<T>(&self, read: impl FnOnce(&BasicWorker) -> T) -> T {
             let seen = read(&self.worker);
             if self.lifted.set(()).is_ok() {
                 self.worker.set_overloaded(false);
@@ -3083,7 +3140,7 @@ mod tests {
         fn record_circuit_breaker_outcome(&self, success: bool) {
             self.worker.record_circuit_breaker_outcome(success);
         }
-        fn resilience(&self) -> &crate::worker::ResolvedResilience {
+        fn resilience(&self) -> &ResolvedResilience {
             self.worker.resilience()
         }
         fn http_client(&self) -> &reqwest::Client {
@@ -3092,12 +3149,10 @@ mod tests {
         fn http_client_handle_if_initialized(&self) -> Option<Arc<reqwest::Client>> {
             self.worker.http_client_handle_if_initialized()
         }
-        async fn check_health_async(&self) -> crate::worker::WorkerResult<()> {
+        async fn check_health_async(&self) -> WorkerResult<()> {
             self.worker.check_health_async().await
         }
-        async fn engine_connection(
-            &self,
-        ) -> crate::worker::WorkerResult<Option<Arc<dyn EngineConnection>>> {
+        async fn engine_connection(&self) -> WorkerResult<Option<Arc<dyn EngineConnection>>> {
             self.worker.engine_connection().await
         }
         fn is_available(&self) -> bool {
@@ -3302,7 +3357,9 @@ mod tests {
         let urls: Vec<String> = (1..=8).map(|n| format!("http://h:{n}")).collect();
         let urls: Vec<&str> = urls.iter().map(String::as_str).collect();
         let registry = http_registry(&urls);
-        let ring = registry.get_hash_ring(MODEL).expect("the model's ring");
+        let ring = PolicyRegistry::new(PolicyConfig::ConsistentHashing)
+            .hash_ring(&registry, MODEL)
+            .expect("the model's ring");
         let pool = candidates(&registry, MODEL, RoutingPool::HttpRegular, None);
         let pool = pool.as_slice();
         let prefix_hash = PolicyConfig::PrefixHash {

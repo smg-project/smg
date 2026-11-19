@@ -1193,7 +1193,9 @@ impl BoundPlugin for Bound {
     }
 
     fn observe_membership(&self, change: &Membership<'_>) {
-        self.plugin.inner.observe(view::membership(change));
+        if let Some(event) = view::membership(change) {
+            self.plugin.inner.observe(event);
+        }
     }
 
     fn observe_signal(&self, signal: &Signal) {

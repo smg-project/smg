@@ -5,7 +5,10 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    sync::{atomic::Ordering, Arc},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -22,8 +25,9 @@ use super::{
 use crate::{
     spec::{BindingSpec, OverloadSpec},
     store::{
-        Ask, GatewayId, Kinds, LoadSink, LoadSource, MembershipChange, MemoryStore, Reachability,
-        Signals, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
+        Ask, GatewayId, Kinds, LoadSink, LoadSource, MembershipChange, MemoryStore, Position,
+        Reachability, Signals, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
+        PUBLISH_WINDOW,
     },
     view::{LoadRow, Role, SignalSource, WireModes, WorkerId},
     AppliedSpec, PolicySpec,
@@ -1073,8 +1077,11 @@ async fn run_pays_the_build_another_tasks_registration_owes_before_any_tick() {
     register("http://c:1");
     after(store.publish_due().expect("a build is owed")).await;
     assert_eq!((store.membership_builds(), store.publish_due()), (2, None));
-    // Both were paid before the loop's next tick.
-    assert!(now() < started + Duration::from_millis(50));
+    // Both were paid well before the loop's next tick, a period after its
+    // first. The store stamps a write by the system clock, so the time this
+    // thread loses ahead of a registration moves the instants the case
+    // sleeps to: a bound of milliseconds would count that time.
+    assert!(now() < started + TEN / 2);
 
     stop.send_replace(true);
     tasks
@@ -1301,6 +1308,7 @@ fn a_failure_counts_under_its_own_label() {
         ReadError::Deadline(Duration::ZERO),
         ReadError::NoLoad(String::new()),
         ReadError::Unsupported(String::new()),
+        ReadError::Client(String::new()),
     ];
     assert_eq!(
         errors.len(),
@@ -1820,7 +1828,7 @@ async fn the_polls_group_the_membership_anew_at_a_take_after_a_restore_to_the_sa
     let (leads, polls) = watch::channel(true);
     let mut tasks = JoinSet::new();
     let running = Arc::clone(&driver);
-    tasks.spawn(async move { running.run_while(stopped, polls).await });
+    tasks.spawn(async move { running.run_while(stopped, polls, || 1).await });
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert!(row(&store, own, 0).is_some());
     leads.send_replace(false);
@@ -1854,6 +1862,63 @@ async fn the_polls_group_the_membership_anew_at_a_take_after_a_restore_to_the_sa
     assert_eq!(probe.connections(), 1);
 }
 
+/// A loss and the take after it, both told before the loop looked, leave
+/// the watch one word, `true` as it read before. The term beside it moved:
+/// the run of polls ends and the next starts over the membership a restore
+/// between the two left, at the epoch the last run grouped at.
+#[tokio::test(start_paused = true)]
+async fn a_take_whose_word_folded_over_a_loss_starts_the_polls_anew() {
+    let store = Arc::new(MemoryStore::new());
+    let probe = Arc::new(FakeProbe::default());
+    let own = ready(&store, "grpc://w:1", "grpc://w:1", 0, 1, WireModes::GRPC, 0);
+    let figures = Figures {
+        running: 4,
+        waiting: 2,
+        usage: 0.5,
+    };
+    probe.answers("grpc://w:1", &[figures]);
+    probe.answers("grpc://x:1", &[figures]);
+    let driver = Arc::new(driver(&store, &probe, TEN));
+    let (_stop, stopped) = watch::channel(false);
+    let (leads, polls) = watch::channel(true);
+    let term = Arc::new(AtomicU64::new(1));
+    let mut tasks = JoinSet::new();
+    let (running, led) = (Arc::clone(&driver), Arc::clone(&term));
+    tasks.spawn(async move {
+        let led = move || led.load(Ordering::Relaxed);
+        running.run_while(stopped, polls, led).await;
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(row(&store, own, 0).is_some());
+    // The loss, a leader's cut of as many writes of another engine, and
+    // the take under the next term: nothing is awaited between them, so
+    // the loop reads one word.
+    leads.send_replace(false);
+    let leader = MemoryStore::new();
+    let theirs = ready(
+        &leader,
+        "grpc://x:1",
+        "grpc://x:1",
+        0,
+        1,
+        WireModes::GRPC,
+        0,
+    );
+    assert_eq!(leader.epoch(), store.epoch());
+    assert!(store.restore_from(leader.cut(Kinds::All)));
+    term.store(2, Ordering::Relaxed);
+    leads.send_replace(true);
+    let before = probe.polls().len();
+    tokio::time::sleep(TEN + TEN).await;
+    let polled = probe.polls().split_off(before);
+    assert!(
+        !polled.is_empty() && polled.iter().all(|engine| engine == "grpc://x:1"),
+        "{polled:?}"
+    );
+    assert!(row(&store, theirs, 0).is_some());
+    assert_eq!(*probe.forgotten.lock(), ["grpc://w:1"]);
+}
+
 /// On a replica that follows, the loop polls no engine and pays the store's
 /// publications all the same: a followed registration and a followed load
 /// row reach the published world with no decision asked and no poll made,
@@ -1867,7 +1932,7 @@ async fn a_followers_loop_pays_the_stores_publications_and_polls_no_engine() {
     let (leads, polls) = watch::channel(false);
     let mut tasks = JoinSet::new();
     let running = Arc::clone(&driver);
-    tasks.spawn(async move { running.run_while(stopped, polls).await });
+    tasks.spawn(async move { running.run_while(stopped, polls, || 1).await });
     // What a decision reads of the worker's load; `None` while the worker
     // is no member of the published world.
     let seen = |id: WorkerId| {
@@ -1895,8 +1960,14 @@ async fn a_followers_loop_pays_the_stores_publications_and_polls_no_engine() {
         from: told.status,
         to: WorkerStatus::Ready,
     };
-    store.follow(1, MembershipChange::Registered { id }, Some(told));
-    store.follow(2, ready, None);
+    let unjournaled = Position::default();
+    store.follow(
+        unjournaled,
+        1,
+        MembershipChange::Registered { id },
+        Some(told),
+    );
+    store.follow(unjournaled, 2, ready, None);
     // The followed registration left its build owed: the loop pays it at
     // the instant the store names, with no decision asked.
     let due = store.publish_due().expect("a build is owed");

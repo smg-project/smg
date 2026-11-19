@@ -1,9 +1,9 @@
 //! Level-triggered worker reconciliation, shared by every discovery provider.
 //!
 //! Takes the workers a provider published, diffs them against the registry
-//! entries this reconciler owns, and submits the gap as `AddWorker`/
-//! `RemoveWorker` jobs. Failed or missed work is retried on the next pass by
-//! construction.
+//! entries this reconciler owns, and hands the gap to the host's job queue as
+//! registrations and removals. Failed or missed work is retried on the next
+//! pass by construction.
 //!
 //! Nothing here is specific to a provider. A provider hands over
 //! [`DiscoveredWorker`]s and its [`DiscoveryKind`], and ownership and matching
@@ -17,22 +17,21 @@
 //!   registered with. A worker whose configuration no longer matches what is
 //!   published is updated in place.
 
-use std::{
-    collections::{BTreeMap, HashMap, HashSet},
-    sync::Arc,
-};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use openai_protocol::worker::WorkerSpec;
+use smg_worker::{
+    identity::endpoint::{Endpoint, EndpointKey},
+    jobs::WorkerRegistrationMode,
+    registry::{WorkerId, WorkerOrigin},
+};
 use tokio::time;
 use tracing::{error, info, warn};
 
-use super::provider::{DiscoveredWorker, DiscoveryKind};
-use crate::{
-    app_context::AppContext,
-    config::RouterConfig,
-    observability::metrics::{metrics_labels, Metrics},
-    worker::{identity::endpoint::Endpoint, registry::WorkerId, EndpointKey, WorkerOrigin},
-    workflow::{Job, WorkerRegistrationMode},
+use super::{
+    host::DiscoveryHost,
+    provider::{DiscoveredWorker, DiscoveryKind},
+    series,
 };
 
 /// Prefix reserved for discovery provenance. Only this module writes labels
@@ -125,13 +124,11 @@ pub(super) struct RemovalTarget {
 /// mesh-imported) and stamped with this provider's label. Manually added and
 /// statically configured workers carry no provider label and are never
 /// touched, and neither are workers another provider owns.
-fn owned_workers(app_context: &AppContext, kind: DiscoveryKind) -> Vec<OwnedWorker> {
-    app_context
-        .worker_registry
-        .get_all_with_ids()
+fn owned_workers(host: &dyn DiscoveryHost, kind: DiscoveryKind) -> Vec<OwnedWorker> {
+    host.workers()
         .into_iter()
         .filter_map(|(worker_id, worker)| {
-            if app_context.worker_registry.origin_of(&worker_id) != Some(WorkerOrigin::Local) {
+            if host.origin_of(&worker_id) != Some(WorkerOrigin::Local) {
                 return None;
             }
             let labels = &worker.metadata().spec.labels;
@@ -286,7 +283,7 @@ pub(super) fn compute_actions(
 fn build_worker_spec(
     worker: &DiscoveredWorker,
     kind: DiscoveryKind,
-    app_context: &AppContext,
+    host: &dyn DiscoveryHost,
 ) -> WorkerSpec {
     let mut spec = WorkerSpec::new(worker.endpoint.render());
     spec.worker_type = worker.worker_type;
@@ -322,10 +319,7 @@ fn build_worker_spec(
     spec.kv_connector.clone_from(&worker.kv_connector);
     spec.kv_role.clone_from(&worker.kv_role);
     spec.kv_engine_id.clone_from(&worker.kv_engine_id);
-    spec.api_key.clone_from(&app_context.router_config.api_key);
-    spec.max_connection_attempts = app_context
-        .router_config
-        .connection_attempt_budget(RouterConfig::DISCOVERED_WORKER_ATTEMPTS_PER_SUCCESS);
+    host.stamp(&mut spec);
     spec
 }
 
@@ -338,19 +332,19 @@ fn build_worker_spec(
 pub(super) async fn reconcile(
     desired: &DesiredState,
     kind: DiscoveryKind,
-    app_context: &Arc<AppContext>,
+    host: &dyn DiscoveryHost,
     started_at: time::Instant,
 ) {
-    let registered = owned_workers(app_context, kind);
+    let registered = owned_workers(host, kind);
     let actions = compute_actions(desired, &registered);
 
     let desired_count = desired.workers.len();
     if actions.add.is_empty() && actions.remove.is_empty() {
-        Metrics::set_discovery_workers_discovered(kind.metric_label(), desired_count);
+        series::set_workers_discovered(kind.metric_label(), desired_count);
         return;
     }
 
-    let Some(job_queue) = app_context.worker_job_queue.get() else {
+    let Some(jobs) = host.jobs() else {
         warn!(
             "JobQueue not initialized; deferring {} addition(s), {} removal(s)",
             actions.add.len(),
@@ -363,11 +357,7 @@ pub(super) async fn reconcile(
     // transition (a duplicate removal would find it already Draining, skip
     // the settle sleep, and collapse the drain window). Completed/failed
     // statuses do not block, so failures retry on the next pass.
-    let in_flight = |url: &str| {
-        job_queue
-            .get_status(url)
-            .is_some_and(|status| status.status == "pending" || status.status == "processing")
-    };
+    let in_flight = |url: &str| jobs.job_in_flight(url);
     let removals: Vec<&RemovalTarget> = actions
         .remove
         .iter()
@@ -380,7 +370,7 @@ pub(super) async fn reconcile(
         .collect();
 
     if removals.is_empty() && additions.is_empty() {
-        Metrics::set_discovery_workers_discovered(kind.metric_label(), desired_count);
+        series::set_workers_discovered(kind.metric_label(), desired_count);
         return;
     }
 
@@ -404,20 +394,11 @@ pub(super) async fn reconcile(
         // every spelling the group was registered under. An IPC endpoint keeps
         // its scheme, because its key is a bare socket path that would not
         // parse back.
-        let job = Job::RemoveWorker {
-            url: target.endpoint.lookup_form(),
-            expected_revisions: Some(
-                target
-                    .guards
-                    .iter()
-                    .map(|(id, revision)| (id.as_str().to_string(), Some(*revision)))
-                    .collect(),
-            ),
-        };
-        match job_queue.submit(job).await {
-            Ok(()) => Metrics::record_discovery_deregistration(
+        let removal = jobs.remove_workers_at(target.endpoint.lookup_form(), target.guards.clone());
+        match removal.await {
+            Ok(()) => series::record_deregistration(
                 kind.metric_label(),
-                metrics_labels::DEREGISTRATION_RECONCILED,
+                series::DEREGISTRATION_RECONCILED,
             ),
             Err(e) => error!(
                 "Failed to submit worker removal for {}: {}",
@@ -432,19 +413,15 @@ pub(super) async fn reconcile(
             "Registering worker {} ({:?}) as {}",
             worker.endpoint, worker.worker_type, worker.discovery_id
         );
-        let job = Job::AddWorker {
-            config: Box::new(build_worker_spec(worker, kind, app_context)),
-            registration_mode: WorkerRegistrationMode::Upsert,
-        };
+        let spec = build_worker_spec(worker, kind, host);
         // The status read above and this submission are two steps, and the
         // pass can wait for a queue slot between them: the claim is taken
         // with the check, so a registration that took the URL since (a
         // `POST`'s) keeps it, and the next pass adds what is still missing.
-        match job_queue.submit_unless_registering(job).await {
-            Ok(true) => Metrics::record_discovery_registration(
-                kind.metric_label(),
-                metrics_labels::REGISTRATION_SUCCESS,
-            ),
+        match jobs.add_worker(spec, WorkerRegistrationMode::Upsert).await {
+            Ok(true) => {
+                series::record_registration(kind.metric_label(), series::REGISTRATION_SUCCESS);
+            }
             Ok(false) => info!(
                 "Worker {} has a registration in flight; its addition is left to the next pass",
                 worker.endpoint
@@ -454,16 +431,13 @@ pub(super) async fn reconcile(
                     "Failed to submit worker addition for {}: {}",
                     worker.endpoint, e
                 );
-                Metrics::record_discovery_registration(
-                    kind.metric_label(),
-                    metrics_labels::REGISTRATION_FAILED,
-                );
+                series::record_registration(kind.metric_label(), series::REGISTRATION_FAILED);
             }
         }
     }
 
-    Metrics::set_discovery_workers_discovered(kind.metric_label(), desired_count);
-    Metrics::record_discovery_sync_duration(kind.metric_label(), started_at.elapsed());
+    series::set_workers_discovered(kind.metric_label(), desired_count);
+    series::record_sync_duration(kind.metric_label(), started_at.elapsed());
 }
 
 #[cfg(test)]

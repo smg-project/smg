@@ -88,8 +88,9 @@ use std::{
     any::Any,
     cell::Cell,
     fmt,
+    fs::File,
     panic::{self, AssertUnwindSafe},
-    path::{Path, PathBuf},
+    path::Path,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, OnceLock,
@@ -949,10 +950,10 @@ pub(crate) struct Generations {
     /// store's directory is written under it alone. No reader takes it. It
     /// holds the spec store, once one is bound.
     applying: Mutex<Option<SpecStore>>,
-    /// The spec store's directory, once one is bound: the source takes
-    /// writes, and the read call reads a generation on file by this path,
-    /// under no lock of the door.
-    dir: OnceLock<PathBuf>,
+    /// The spec store's directory itself, open, once one is bound: the
+    /// source takes writes, and the read call reads a generation on file
+    /// through it, under no lock of the door.
+    dir: OnceLock<Arc<File>>,
     /// The generations on file under a spec store, ascending, as the read
     /// call answers them. Written under the door's lock, at the bind and at
     /// each write; a reader copies one entry out.
@@ -1198,7 +1199,7 @@ impl Generations {
         }
         *self.on_file.lock() = on_file;
         // Set once: a second bind is refused above, under the door's lock.
-        let _ = self.dir.set(dir.dir().to_owned());
+        let _ = self.dir.set(dir.root());
         *applying = Some(dir);
         Ok(())
     }
@@ -1540,7 +1541,7 @@ impl Generations {
             return Err(Unanswered::NotHeld(not_held));
         };
         let read =
-            tokio::task::spawn_blocking(move || spec_store::read_in(&dir, retained.persisted));
+            tokio::task::spawn_blocking(move || spec_store::read_at(&dir, retained.persisted));
         let unread = |why: String| Unanswered::Unread { generation, why };
         match read.await {
             Ok(Ok(document)) => Ok(proto::PolicySpecDocument {
@@ -4934,6 +4935,30 @@ pub(crate) mod tests {
         let again = Arc::new(again);
         assert_eq!(again.read(1).await.expect("on file"), old);
         assert_eq!(again.read(2).await.expect("on file"), stands);
+    }
+
+    /// The read call reads a generation on file through the directory the
+    /// store opened. Where the path leads to another directory before the
+    /// door takes the store, the answer is still the held file's bytes,
+    /// not the other's under that name.
+    #[tokio::test]
+    async fn the_read_call_reads_the_directory_held_where_the_path_leads_elsewhere() {
+        let base = tempfile::tempdir().expect("a temp dir");
+        let (dir, moved) = (base.path().join("store"), base.path().join("moved"));
+        std::fs::create_dir(&dir).expect("the directory");
+        std::fs::write(dir.join(name_of(1, "yaml")), LEAST_LOAD).expect("the first");
+        std::fs::write(dir.join(name_of(2, "yaml")), RANDOM).expect("the second");
+        let opened = SpecStore::open(dir.clone()).expect("the directory opens");
+        std::fs::rename(&dir, &moved).expect("the directory moves");
+        std::fs::create_dir(&dir).expect("another stands at its path");
+        std::fs::write(dir.join(name_of(1, "yaml")), "other").expect("the other's own");
+        let (_store, generations) = generations();
+        generations.bind_store(opened).expect("the store binds");
+        let old = generations.read(1).await.expect("on file");
+        assert_eq!(
+            (old.generation, old.document.as_slice()),
+            (1, LEAST_LOAD.as_bytes())
+        );
     }
 
     /// An older file that is no document of this build stays on file and is

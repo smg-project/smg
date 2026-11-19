@@ -417,10 +417,10 @@ policyController:
   #    global.image.repository, and tag "" takes the router's tag with
   #    -policy-controller appended, the tag a release publishes the
   #    controller under (a release publishes one controller image, so the
-  #    router's -slurm suffix is cut first). A repository of your own needs
-  #    its tag, and so does a router image named by a digest or by a release
-  #    older than the first with a controller image. The pull policy and
-  #    the pull secrets are the global ones.
+  #    router's -slurm or -ol9 suffix is cut first). A repository of your own
+  #    needs its tag, and so does a router image named by a digest or by a
+  #    release older than the first with a controller image. The pull policy
+  #    and the pull secrets are the global ones.
   image:
     registry: ""
     repository: ""
@@ -451,7 +451,9 @@ policyController:
   #    restarts the term once no running controller remembers the last one,
   #    and turning the election off deletes the Lease. Turning it on beside
   #    a running controller starts an elected pod while the lone one still
-  #    leads: scale the controller to zero first.
+  #    leads: scale the controller to zero first, by hand or with
+  #    enabled: false (the schema refuses replicas: 0), and wait until no
+  #    controller pod remains: the pods end in the background.
   #    A changed leaseName on a running release is such a change as well: a
   #    pod elected over the new Lease may lead while the old Lease's leader
   #    still leads, until its renew deadline, and the term starts again.
@@ -465,13 +467,16 @@ policyController:
   #    none of that holds: a standby follows nobody, reads ready at once and
   #    takes over with no worker and no load. A standbys' listener that
   #    serves TLS follows nobody yet.
-  #    Naming replication there on a running elected release does not roll
-  #    out: the old leader's listener takes no stated name and refuses the
-  #    new pod, which stays not ready while the old pods serve as before.
-  #    Roll back, or scale the controller to zero and upgrade. Deleting a
-  #    pod is no way out: another old pod may take the Lease. The first
-  #    leader under the new values starts with no worker and no load either
-  #    way.
+  #    Naming replication there on a running elected release whose
+  #    listeners serve no TLS does not roll out: the old leader's listener
+  #    takes no stated name and refuses the new pod, which stays not ready
+  #    while the old pods serve as before. Roll back, or scale the
+  #    controller to zero (by hand, or with enabled: false), wait until no
+  #    controller pod remains, and upgrade with the controller on again.
+  #    Deleting a pod is no way out: another old pod may take the Lease.
+  #    The first leader under the new values starts with no worker and no
+  #    load either way, and with enabled: false the Lease goes too, so the
+  #    term starts again.
   #    A Lease deleted under standbys that follow turns every pod not ready
   #    until the release is applied again: the pods cannot make it.
   election:
@@ -599,8 +604,9 @@ policyController:
   # -- Pod disruption budget. With one replica, minAvailable: 1 lets no pod
   #    be evicted and a node drain waits on it for ever: run two replicas or
   #    more, or leave the budget off. The budget counts ready pods: a standby
-  #    is ready once it is synced where identityAsTold names replication,
-  #    and at once under the defaults, where it holds nothing.
+  #    is ready once it is synced where identityAsTold, or a flag of
+  #    extraArgs, names replication and the listeners serve no TLS, and at
+  #    once otherwise, where it holds nothing.
   podDisruptionBudget:
     enabled: false
     minAvailable: 1

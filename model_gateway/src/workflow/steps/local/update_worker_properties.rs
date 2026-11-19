@@ -4,6 +4,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
 use openai_protocol::worker::{WorkerModels, WorkerSpec, WorkerStatus};
+use smg_worker::identity::basic::{merge_labels, BasicWorker, RuntimeType, Worker};
 use tracing::{debug, info};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
@@ -15,8 +16,8 @@ use super::create_worker::{
 };
 use crate::{
     admin::worker_service::MAX_WORKER_LABELS,
+    routers::grpc::backend_client::BasicWorkerBuilder,
     service_discovery::DISCOVERY_PROVIDER_LABEL,
-    worker::{identity::basic::merge_labels, BasicWorker, BasicWorkerBuilder, RuntimeType, Worker},
     workflow::data::{require_app_context, WorkerUpdateWorkflowData},
 };
 

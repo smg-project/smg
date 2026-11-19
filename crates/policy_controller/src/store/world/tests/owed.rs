@@ -14,7 +14,7 @@ use super::{
 };
 use crate::{
     store::{
-        HealthSink, Kinds, LoadSink, LoadSource, MemoryStore, WorkerFacts, WorkerStatus,
+        HealthSink, Kinds, LoadSink, LoadSource, MemoryStore, Position, WorkerFacts, WorkerStatus,
         WorkersStore,
     },
     view::{Role, WorkerId},
@@ -220,6 +220,44 @@ fn a_replaced_incarnation_pays_its_build_before_it_answers() {
     );
 }
 
+/// A registration that takes its worker off a model is a leave from that
+/// model's pool and pays its build as one: no decision made after its
+/// answer lists the worker under the model it left, and the model it keeps
+/// lists it on. One that takes it off none leaves its build owed.
+#[test]
+fn a_registration_that_takes_its_worker_off_a_model_pays_its_build_before_it_answers() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let serves = |models: &[&str]| {
+        let facts = facts("http://a:8000", Role::Single, models);
+        store.upsert(facts).id()
+    };
+    let id = serves(&[MODEL, "other"]);
+    store.publish_now();
+    // The rows a decision for a model is handed, of any health.
+    let listed = |model: &str| {
+        let mut out = ViewBuffers::default();
+        let built = store.build_view(model, Role::Single, &ask(t0), &mut out);
+        built.map_or_else(Vec::new, |_| {
+            out.candidates.iter().map(|row| row.id).collect()
+        })
+    };
+    assert_eq!((listed(MODEL), listed("other")), (vec![id], vec![id]));
+    let builds = store.membership_builds();
+    // A refresh takes the worker off no model: its build is owed.
+    serves(&[MODEL, "other"]);
+    assert_eq!(store.membership_builds(), builds);
+    assert!(store.publish_due().is_some());
+    serves(&[MODEL]);
+    // The write built before it answered: the pool it left lists the row
+    // no more, the pool it keeps lists it on, and nothing is left owed.
+    assert_eq!((listed(MODEL), listed("other")), (vec![id], Vec::new()));
+    assert_eq!(
+        (store.membership_builds(), store.publish_due()),
+        (builds + 1, None)
+    );
+}
+
 /// A standby's follow door owes and pays as its leader's writes do: a
 /// followed registration and a followed refresh leave their build owed,
 /// the registration's row in no view before it, and a followed removal and
@@ -237,9 +275,10 @@ fn a_followed_join_owes_its_build_and_a_followed_leave_pays_its_own() {
         rows.iter().map(|row| row.id).collect()
     };
     // A followed registration: on file, owed, in no view until the build.
+    let unjournaled = Position::default();
     let joins = leader.upsert(worker(2));
     let row = WorkersStore::get(&leader, joins.id());
-    standby.follow(WorkersStore::epoch(&leader), joins, row);
+    standby.follow(unjournaled, WorkersStore::epoch(&leader), joins, row);
     assert_eq!(listed(&standby).len(), 2);
     assert!(standby.publish_due().is_some());
     standby.publish_now();
@@ -251,11 +290,11 @@ fn a_followed_join_owes_its_build_and_a_followed_leave_pays_its_own() {
         ..worker(2)
     });
     let row = WorkersStore::get(&leader, refresh.id());
-    standby.follow(WorkersStore::epoch(&leader), refresh, row);
+    standby.follow(unjournaled, WorkersStore::epoch(&leader), refresh, row);
     assert!(standby.publish_due().is_some());
     // A followed removal: the row is in no view when the door returns.
     let leaves = leader.remove(a, revision(&leader, a)).expect("removed");
-    standby.follow(WorkersStore::epoch(&leader), leaves, None);
+    standby.follow(unjournaled, WorkersStore::epoch(&leader), leaves, None);
     assert!(!listed(&standby).contains(&a));
     assert_eq!(standby.publish_due(), None);
     // A followed new life: it stands in the old one's place at once.
@@ -266,7 +305,7 @@ fn a_followed_join_owes_its_build_and_a_followed_leave_pays_its_own() {
     let replaces = leader.upsert(life);
     let new = replaces.id();
     let row = WorkersStore::get(&leader, new);
-    standby.follow(WorkersStore::epoch(&leader), replaces, row);
+    standby.follow(unjournaled, WorkersStore::epoch(&leader), replaces, row);
     let rows = listed(&standby);
     assert!(rows.contains(&new) && !rows.contains(&b));
     assert_eq!(standby.publish_due(), None);
@@ -838,6 +877,15 @@ fn a_record_at_a_rank_its_member_does_not_stand_at_takes_no_row() {
     assert_eq!(overloaded(&store, t0), []);
 }
 
+/// Raises its flag when dropped: at a thread's return and at its unwind.
+struct Raise<'a>(&'a AtomicBool);
+
+impl Drop for Raise<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
 #[test]
 fn no_decision_is_handed_a_worker_after_its_leaves_answer_under_a_storm() {
     const WORKERS: usize = 256;
@@ -858,6 +906,10 @@ fn no_decision_is_handed_a_worker_after_its_leaves_answer_under_a_storm() {
         // The storm: every other worker leaves, by its removal or by a new
         // life under its key, and a new worker registers after each removal.
         scope.spawn(|| {
+            // The flag is raised when this thread ends, by its return or by
+            // a panic: the threads that poll it stop, and the scope reports
+            // the panic where it would wait on them.
+            let _ended = Raise(&done);
             for index in (0..WORKERS).step_by(2) {
                 if index % 4 == 0 {
                     store
@@ -873,7 +925,6 @@ fn no_decision_is_handed_a_worker_after_its_leaves_answer_under_a_storm() {
                     gone[index].store(true, Ordering::SeqCst);
                 }
             }
-            done.store(true, Ordering::SeqCst);
         });
         // The host, as the driver's loop: it pays what is due.
         scope.spawn(|| {
@@ -953,7 +1004,7 @@ fn the_writes_one_build_pays_ask_the_pair_classes_once() {
 /// The contract names the window by its figure, for a caller that reads no
 /// source: the sentence and the store's constant move together.
 #[test]
-fn the_contract_names_the_window_a_registration_is_in_force_within() {
+fn the_contract_names_the_window_a_registrations_build_starts_within() {
     const CONTRACT: &str = include_str!("../../../../contracts/policy_controller.proto");
     let figure = format!(
         "publication window ({} ms) of their answer",

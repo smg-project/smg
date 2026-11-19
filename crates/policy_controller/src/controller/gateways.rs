@@ -482,7 +482,9 @@ impl Gateways {
     }
 
     /// The sweep's task: a pass every tenth of the grace period until
-    /// `stop`, on no stream's path.
+    /// `stop`, on no stream's path. The leases' due ends ride it too
+    /// ([`LeasesStore::expire`]): a file of leases whose decider waits for
+    /// a job issues nothing, so nothing else would end its due leases.
     pub(crate) async fn run(&self, mut stop: watch::Receiver<bool>) {
         let mut tick = tokio::time::interval((self.grace / 10).max(Duration::from_millis(1)));
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -494,6 +496,10 @@ impl Gateways {
                     // The pins of record ride this clock: a pass of theirs
                     // is due far less often than a tick.
                     self.store.sweep_pins(now);
+                    // So do the leases past their dispatch deadline in
+                    // a file whose decider waits for a job: one at work
+                    // ends its own file's at its issues.
+                    drop(LeasesStore::expire(&*self.store, now));
                 }
                 _ = stop.wait_for(|stop| *stop) => break,
             }
@@ -844,6 +850,7 @@ pub(crate) mod tests {
             issued_at: now,
             dispatch_deadline: now + Duration::from_secs(5),
             state: LeaseState::Issued,
+            session_ttl_micros: None,
         }
     }
 
@@ -1406,6 +1413,44 @@ pub(crate) mod tests {
             "let go {:?} after the end, inside the period of {grace:?}",
             ended.elapsed()
         );
+
+        stop.send_replace(true);
+        timeout(Duration::from_secs(20), task.join_next())
+            .await
+            .expect("the task ends within 20 s of its stop")
+            .expect("one task")
+            .expect("it ended by itself");
+    }
+
+    /// The leases' due ends ride the sweeps' task: a lease past its
+    /// dispatch deadline leaves by the task's own tick where no decider
+    /// issues, its gateway's session standing, and a lease inside its
+    /// deadline stays.
+    #[tokio::test]
+    async fn the_sweeps_task_ends_a_lease_past_its_dispatch_deadline() {
+        let (_elector, store, gateways, t0) = leading(Duration::from_millis(60));
+        let due = LeaseRecord {
+            dispatch_deadline: t0,
+            ..lease(A, 1, t0)
+        };
+        store.issue(due).expect("a lease");
+        store.issue(lease(A, 2, t0)).expect("a lease");
+        let _stands = welcomed(&gateways, A, "gateway-a", TERM, t0);
+        let (stop, stopped) = watch::channel(false);
+        let mut task = JoinSet::new();
+        let sweeper = Arc::clone(&gateways);
+        task.spawn(async move { sweeper.run(stopped).await });
+
+        let started = Instant::now();
+        while store.live(A) > 1 {
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "the sweep ended no due lease in 20 s"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(LeasesStore::get(&*store, A, LeaseId(1)).is_none());
+        assert!(LeasesStore::get(&*store, A, LeaseId(2)).is_some());
 
         stop.send_replace(true);
         timeout(Duration::from_secs(20), task.join_next())

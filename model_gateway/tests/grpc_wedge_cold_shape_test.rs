@@ -21,11 +21,15 @@ use openai_protocol::{completion::CompletionRequest, model_card::ModelCard, work
 use smg::{
     app_context::AppContext,
     middleware::TenantRequestMeta,
+    policies::kv_index::event_monitor::KvEventMonitor,
     routers::{RouterFactory, RouterTrait},
     tenant::TenantKey,
-    worker::{KvEventMonitor, RuntimeType, SubscriptionKind, Worker, WorkerType},
 };
 use smg_test_harness as common;
+use smg_worker::{
+    identity::basic::{RuntimeType, Worker, WorkerType},
+    kv_events::SubscriptionKind,
+};
 use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
 
 const MODEL: &str = "cold-shape-test-model";

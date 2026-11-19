@@ -61,6 +61,19 @@ pub enum SessionVerdict {
 /// `WorkerId(0)` is an empty slot.
 pub type Pins = [WorkerId; 2];
 
+/// When a table forgets a key it holds, on the decision clock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Forgets {
+    /// At this instant: the key's rule has a TTL.
+    At(u64),
+    /// At no instant: the key's rule has no TTL.
+    Never,
+    /// No decision has read the key since its entry was made: a dispatch
+    /// made the entry anew, behind a worker's leave or the end of the
+    /// key's TTL, and the next decision's read starts the key over.
+    Unread,
+}
+
 /// What [`SessionTable::claim`] did for a decision that found no routable
 /// pin.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -77,7 +90,7 @@ pub(crate) enum Claim {
 struct Entry {
     pins: Pins,
     /// The instant the key's pins expire on the decision clock; `u64::MAX`
-    /// under a rule without a TTL.
+    /// under a rule without a TTL, and `0` until a decision reads the key.
     expires_at_micros: u64,
     recovery: Recovery,
     /// The pin a decision's claim wrote before its commit; `WorkerId(0)`
@@ -355,13 +368,16 @@ impl SessionTable {
     }
 
     /// What a host keeps of `key` beside its own pin of record: the pins,
-    /// and the instant the table forgets the key on the decision clock,
-    /// `None` under a rule without a TTL.
-    pub fn held(&self, key: Session) -> Option<(Pins, Option<u64>)> {
+    /// and when the table forgets the key.
+    pub fn held(&self, key: Session) -> Option<(Pins, Forgets)> {
         let key = key.get();
         self.shard(key).lock().get(&key).map(|entry| {
-            let forgotten = entry.expires_at_micros;
-            (entry.pins, (forgotten != u64::MAX).then_some(forgotten))
+            let forgets = match entry.expires_at_micros {
+                0 => Forgets::Unread,
+                u64::MAX => Forgets::Never,
+                at => Forgets::At(at),
+            };
+            (entry.pins, forgets)
         })
     }
 
@@ -485,7 +501,8 @@ mod tests {
     }
 
     /// A host reads a key's pins with the instant its rule forgets it, and
-    /// no instant under a rule without a TTL.
+    /// no instant under a rule without a TTL. A key a dispatch alone wrote
+    /// is held unread.
     #[test]
     fn a_key_is_held_with_the_instant_its_rule_forgets_it() {
         let table = SessionTable::new(RULE.sweep_micros);
@@ -494,7 +511,7 @@ mod tests {
         table.dispatched(s(1), SessionVerdict::Pinned, WorkerId(1));
         assert_eq!(
             table.held(s(1)),
-            Some(([WorkerId(1), WorkerId(0)], Some(1_050)))
+            Some(([WorkerId(1), WorkerId(0)], Forgets::At(1_050)))
         );
         let for_ever = SessionRule {
             ttl_micros: None,
@@ -503,7 +520,15 @@ mod tests {
         };
         table.lookup(s(2), 50, &for_ever);
         table.dispatched(s(2), SessionVerdict::Pinned, WorkerId(2));
-        assert_eq!(table.held(s(2)), Some(([WorkerId(2), WorkerId(0)], None)));
+        assert_eq!(
+            table.held(s(2)),
+            Some(([WorkerId(2), WorkerId(0)], Forgets::Never))
+        );
+        table.dispatched(s(3), SessionVerdict::Pinned, WorkerId(3));
+        assert_eq!(
+            table.held(s(3)),
+            Some(([WorkerId(3), WorkerId(0)], Forgets::Unread))
+        );
     }
 
     /// A key whose TTL passed is forgotten at its next lookup even when no

@@ -10,15 +10,16 @@ use std::{
 };
 
 use super::{
-    run_of, seek, Ask, Built, Classes, GatewayRun, OutsideLists, PairBuffers, PoolVeto, PoolVetoes,
-    StaleGeneration, ViewBuffers, World, Writer, PUBLISH_WINDOW, WALKED_RUNS,
+    run_of, seek, side_of, Ask, Built, Classes, GatewayRun, OutsideLists, PairBuffers, PoolVeto,
+    PoolVetoes, StaleGeneration, ViewBuffers, World, Writer, PUBLISH_WINDOW, WALKED_RUNS,
 };
 use crate::{
+    counts::Slot,
     spec::{BindingSpec, Match, OverloadSpec, Pairing},
     store::{
-        pairing::Refusal, GatewayId, HealthSink, LeasesStore, LoadSink, LoadSource, MembershipTail,
-        MemoryStore, Overload, PairingDescriptor, Reachability, VetoWrite, WorkerFacts,
-        WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
+        loads::LoadSample, pairing::Refusal, GatewayId, HealthSink, LeasesStore, LoadSink,
+        LoadSource, MembershipTail, MemoryStore, Overload, PairingDescriptor, Reachability,
+        VetoWrite, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
     },
     view::{
         fingerprint, AffinityFacts, Candidate, Constraints, LoadRow, Phase, RequestFacts, Role,
@@ -29,6 +30,7 @@ use crate::{
 
 mod encode_classes;
 mod encode_door;
+mod engines;
 mod list_room;
 mod membership_call;
 mod mode_and_overload;
@@ -40,6 +42,21 @@ mod written;
 
 const MODEL: &str = "m";
 const ASKER: GatewayId = GatewayId(1);
+
+/// A store's write gives each member its slot. The cases here hand a writer
+/// rows no store filed and read no count of theirs, so a row is given the
+/// next slot of the writer's counts where it is handed.
+trait Filed {
+    fn filed(&self, writer: &Writer) -> std::vec::IntoIter<(&WorkerRow, Slot)>;
+}
+
+impl Filed for [WorkerRow] {
+    fn filed(&self, writer: &Writer) -> std::vec::IntoIter<(&WorkerRow, Slot)> {
+        let counts = writer.counts();
+        let filed: Vec<_> = self.iter().map(|row| (row, counts.claim())).collect();
+        filed.into_iter()
+    }
+}
 
 fn facts(key: &str, role: Role, models: &[&str]) -> WorkerFacts {
     WorkerFacts {
@@ -1501,7 +1518,7 @@ fn a_probes_verdict_and_a_connect_signal_are_read_at_once() {
     assert!(!healthy());
 
     // The connect signal of a handshake-promoted worker.
-    assert!(store.connected(id, revision()).is_some());
+    assert!(store.connected(id, revision()).moved().is_some());
     assert!(healthy());
 
     // The prober takes a ready worker out after its failure threshold.
@@ -1815,6 +1832,7 @@ fn a_publication_before_a_departing_workers_row_leaves_still_shows_its_veto() {
         status: WorkerStatus::Ready,
         revision: 1,
         admitted_at: origin,
+        maker: Default::default(),
     };
     let members = [row(1, "http://a:8000"), row(2, "http://b:8000")];
     let masked = |world: &World| {
@@ -1830,7 +1848,7 @@ fn a_publication_before_a_departing_workers_row_leaves_still_shows_its_veto() {
     };
     let leaving = WorkerId(1);
     let mut writer = Writer::new(PUBLISH_WINDOW, origin);
-    writer.rebuild(1, members.iter(), |_, _| None, Classes::Derive);
+    writer.rebuild(1, members.filed(&writer), |_, _| None, Classes::Derive);
     let vetoed = writer
         .veto(ASKER, leaving, Some(t0 + Duration::from_secs(60)))
         .expect("a new veto");
@@ -1840,11 +1858,11 @@ fn a_publication_before_a_departing_workers_row_leaves_still_shows_its_veto() {
     let between = writer.publish_window(t0);
     assert_eq!(masked(&between), [leaving]);
     // The membership write takes the row and its vetoes out together,
-    let after = writer.rebuild(2, members[1..].iter(), |_, _| None, Classes::Derive);
+    let after = writer.rebuild(2, members[1..].filed(&writer), |_, _| None, Classes::Derive);
     assert_eq!(after.members(MODEL, Role::Single), Some(1));
     assert_eq!(masked(&after), []);
     // and the same id registered again starts without them.
-    let again = writer.rebuild(3, members.iter(), |_, _| None, Classes::Derive);
+    let again = writer.rebuild(3, members.filed(&writer), |_, _| None, Classes::Derive);
     assert_eq!(again.members(MODEL, Role::Single), Some(2));
     assert_eq!(masked(&again), []);
 }
@@ -2071,6 +2089,7 @@ fn row_serving(id: u64, models: &[&str], admitted_at: Instant) -> WorkerRow {
         status: WorkerStatus::Ready,
         revision: 1,
         admitted_at,
+        maker: Default::default(),
     }
 }
 
@@ -2082,7 +2101,7 @@ fn a_spare_of_another_length_is_left_and_the_publication_allocates() {
         row_serving(2, &[MODEL], origin),
     ];
     let mut writer = Writer::new(PUBLISH_WINDOW, origin);
-    writer.rebuild(1, members.iter(), |_, _| None, Classes::Derive);
+    writer.rebuild(1, members.filed(&writer), |_, _| None, Classes::Derive);
     // No write leaves a pool a spare of another length: one is planted,
     // the rows of a pool of one, held by the pool alone.
     writer.spares[0] = Some(Arc::from(&writer.working[0].rows[..1]));
@@ -2109,7 +2128,7 @@ fn a_membership_write_leaves_the_writers_lists_at_one_slot_a_pool() {
     ];
     let mut writer = Writer::new(PUBLISH_WINDOW, origin);
     for epoch in 1..=4 {
-        writer.rebuild(epoch, members.iter(), |_, _| None, Classes::Derive);
+        writer.rebuild(epoch, members.filed(&writer), |_, _| None, Classes::Derive);
         // Two models, a pool each: one slot a pool in each list, however
         // many membership writes came before.
         assert_eq!(
@@ -2145,7 +2164,7 @@ fn a_vetos_write_builds_its_own_gateways_run_and_shares_every_other() {
         })
         .collect();
     let mut writer = Writer::new(PUBLISH_WINDOW, origin);
-    writer.rebuild(1, members.iter(), |_, _| None, Classes::Derive);
+    writer.rebuild(1, members.filed(&writer), |_, _| None, Classes::Derive);
     let (writing, other) = (GatewayId(3), GatewayId(7));
     for (gateway, id) in [(other, 2), (other, 6), (writing, 3)] {
         writer
@@ -2222,7 +2241,8 @@ fn the_runs_each_write_leaves_are_the_runs_a_derive_builds_again() {
         .collect();
     let mut present = [true; 12];
     let mut writer = Writer::new(PUBLISH_WINDOW, origin);
-    writer.rebuild(1, all.iter(), |_, _| None, Classes::Derive);
+    writer.rebuild(1, all.filed(&writer), |_, _| None, Classes::Derive);
+    let counts = writer.counts();
     // A fixed sequence: the case makes the same writes at every run.
     let mut state = 0x9E37_79B9_7F4A_7C15_u64;
     let mut next = |bound: u64| {
@@ -2243,7 +2263,7 @@ fn the_runs_each_write_leaves_are_the_runs_a_derive_builds_again() {
                 let members = all
                     .iter()
                     .zip(present)
-                    .filter_map(|(row, here)| here.then_some(row));
+                    .filter_map(|(row, here)| here.then_some((row, counts.claim())));
                 writer.rebuild(step + 2, members, |_, _| None, Classes::Derive);
             }
             // A window's publication, which drops what its instant ended.
@@ -2344,18 +2364,6 @@ fn a_store_starts_under_the_unbound_generation_which_binds_nothing() {
     // A build under it reads the same number with its rows.
     let built = view(&store, &ask(t0)).2;
     assert_eq!((built.generation, built.pool_facts().generation), (0, 0));
-}
-
-/// No store says yet that every row of a pool holds a rate
-/// ([`PoolFacts::rated`]): the engine asks a served decision whole, whatever
-/// its rows report.
-#[test]
-fn a_build_does_not_say_yet_that_every_row_holds_a_rate() {
-    let store = MemoryStore::new();
-    let t0 = Instant::now();
-    member(&store, "http://a:8000");
-    let built = view(&store, &ask(t0)).2;
-    assert!(!built.pool_facts().rated);
 }
 
 #[test]
@@ -3478,6 +3486,44 @@ fn a_store_with_no_threshold_writes_no_verdict() {
 }
 
 #[test]
+fn the_pass_over_every_engine_says_whether_it_moved_a_verdict() {
+    let origin = Instant::now();
+    // One member that names a count of its own, with three requests queued.
+    let member = WorkerRow {
+        facts: WorkerFacts {
+            overload: Overload {
+                waiting_requests: Some(2),
+                kv_usage_permille: None,
+            },
+            ..facts("http://w1:8000", Role::Single, &[MODEL])
+        },
+        ..row_serving(1, &[MODEL], origin)
+    };
+    let sample = |_, _| {
+        Some(LoadSample {
+            row: pressure(3, 0),
+            received_at: origin,
+            sampled_at: origin,
+            source: LoadSource::Stream,
+        })
+    };
+    let mut writer = Writer::new(PUBLISH_WINDOW, origin);
+    writer.rebuild(1, [member].filed(&writer), sample, Classes::Derive);
+    let verdict = |writer: &Writer| writer.working[0].rows[0].health.overloaded;
+    // The build judged every engine: the row carries its verdict, and a
+    // pass finds it as that write left it.
+    assert!(verdict(&writer));
+    assert!(!writer.judge_every());
+    // A verdict that stands against what is on file is one the pass moves,
+    // and the pass says so: what a door behind its own judgment holds to
+    // none.
+    writer.working[0].rows[0].health.overloaded = false;
+    assert!(writer.judge_every());
+    assert!(verdict(&writer));
+    assert!(!writer.judge_every());
+}
+
+#[test]
 fn a_row_is_judged_at_and_above_its_pool_s_thresholds_and_its_own_stand_over_them() {
     let store = MemoryStore::with_publish_window(Duration::ZERO);
     let t0 = Instant::now();
@@ -4349,6 +4395,146 @@ fn the_deciding_door_hands_the_rows_and_the_engine_of_one_publication() {
     assert_eq!(next, (2, Some(2)));
 }
 
+/// How many rows of a pool hold no report ([`Built::unreported`]), kept by
+/// the writes and shown where the rows are published: a member before its
+/// first report and a member whose report was dropped each count, and a
+/// report without a rate does not. The build and the lent view read one
+/// number, and the pool facts say that every row holds a report where it
+/// is 0 ([`PoolFacts::reported`]).
+#[test]
+fn a_publication_counts_the_rows_of_a_pool_that_hold_no_report() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let at = |turn: u32| t0 + PUBLISH_WINDOW * turn;
+    let rated = |live_rate: u32| LoadRow {
+        live_rate,
+        ..load(1, 0)
+    };
+    let unreported = |now: Instant| {
+        let (asked, mut out) = (ask(now), ViewBuffers::default());
+        let built = store
+            .build_view(MODEL, Role::Single, &asked, &mut out)
+            .expect("the pool");
+        let lent = store.with_world(|world| {
+            let view = world.view(MODEL, Role::Single, &asked, false, &mut out);
+            view.expect("the pool").built.unreported
+        });
+        assert_eq!(built.unreported, lent);
+        assert_eq!(built.pool_facts().reported, lent == 0);
+        lent
+    };
+    let first = member(&store, "http://a:8000");
+    let second = member(&store, "http://b:8000");
+    // A membership write counts its rows: two members, no report yet.
+    assert_eq!(unreported(t0), 2);
+    store.record(first, 0, rated(1_900), at(1), LoadSource::Stream);
+    assert_eq!(unreported(at(1)), 1);
+    // A report without a rate is a report: the pool's last row holds one,
+    // and the next with a rate changes nothing.
+    store.record(second, 0, rated(0), at(2), LoadSource::Stream);
+    assert_eq!(unreported(at(2)), 0);
+    store.record(second, 0, rated(1_900), at(3), LoadSource::Stream);
+    assert_eq!(unreported(at(3)), 0);
+    assert_eq!(unreported(at(4)), 0);
+    // A member whose report is dropped holds none from the next window on.
+    store.evict(first);
+    store.publish(at(5));
+    assert_eq!(unreported(at(5)), 1);
+    // A member that joins is counted beside the rows that were there.
+    member(&store, "http://c:8000");
+    assert_eq!(unreported(at(5)), 2);
+}
+
+/// The count is each pool's own, moved by the row a write folds and taken
+/// again where a membership write builds the rows. A member of two models
+/// moves both pools by its one report; a report on a row that holds one and
+/// a drop on a row that holds none move nothing; a membership write counts
+/// the reports its rows carry. No publication takes a pass for it: a debug
+/// build holds each publication's count to a pass over its rows.
+#[test]
+fn a_report_moves_the_count_of_each_pool_its_row_stands_in() {
+    const OTHER: &str = "n";
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let at = |turn: u32| t0 + PUBLISH_WINDOW * turn;
+    let counts = |now: Instant| {
+        let count = |model: &str| {
+            let (asked, mut out) = (ask(now), ViewBuffers::default());
+            let built = store.build_view(model, Role::Single, &asked, &mut out);
+            built.expect("the pool").unreported
+        };
+        (count(MODEL), count(OTHER))
+    };
+    let both = admit(
+        &store,
+        facts("http://a:8000", Role::Single, &[MODEL, OTHER]),
+    );
+    let one = member(&store, "http://b:8000");
+    assert_eq!(counts(t0), (2, 1));
+    store.record(both, 0, load(1, 0), at(1), LoadSource::Stream);
+    assert_eq!(counts(at(1)), (1, 0));
+    // A report on a row that holds one moves nothing.
+    store.record(both, 0, load(2, 0), at(2), LoadSource::Stream);
+    assert_eq!(counts(at(2)), (1, 0));
+    store.record(one, 0, load(1, 0), at(3), LoadSource::Stream);
+    assert_eq!(counts(at(3)), (0, 0));
+    // A dropped report leaves both pools, once.
+    store.evict(both);
+    store.publish(at(4));
+    assert_eq!(counts(at(4)), (1, 1));
+    store.evict(both);
+    store.publish(at(5));
+    assert_eq!(counts(at(5)), (1, 1));
+    // A membership write builds every pool's rows again and counts the
+    // reports they carry: the member that joins the second model holds
+    // none, and the first model's one report stands.
+    admit(&store, facts("http://c:8000", Role::Single, &[OTHER]));
+    assert_eq!(counts(at(5)), (1, 2));
+    store.record(both, 0, load(1, 0), at(6), LoadSource::Stream);
+    assert_eq!(counts(at(6)), (0, 1));
+}
+
+/// One publication that writes two pools takes the list of counts again
+/// where either pool's count moved. A pool whose count stands, written in
+/// the same publication as one whose count moved, does not keep the old
+/// list for both: held in both orders of the two pools.
+#[test]
+fn a_publication_of_two_pools_lists_the_count_that_moved_in_either() {
+    const OTHER: &str = "n";
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let at = |turn: u32| t0 + PUBLISH_WINDOW * turn;
+    let counts = |now: Instant| {
+        let count = |model: &str| {
+            let (asked, mut out) = (ask(now), ViewBuffers::default());
+            let built = store.build_view(model, Role::Single, &asked, &mut out);
+            built.expect("the pool").unreported
+        };
+        (count(MODEL), count(OTHER))
+    };
+    let first = member(&store, "http://a:8000");
+    let second = admit(&store, facts("http://b:8000", Role::Single, &[OTHER]));
+    assert_eq!(counts(t0), (1, 1));
+    store.record(second, 0, load(1, 0), at(1), LoadSource::Stream);
+    assert_eq!(counts(at(1)), (1, 0));
+    // One window holds a first report in the first pool and one more in
+    // the second: the first pool's count moves and the second's stands.
+    let inside = at(1) + Duration::from_millis(1);
+    store.record(first, 0, load(1, 0), inside, LoadSource::Stream);
+    store.record(second, 0, load(2, 0), inside, LoadSource::Stream);
+    store.publish(at(2));
+    assert_eq!(counts(at(2)), (0, 0));
+    // The other order. A member joins the second pool, and one window
+    // holds one more report in the first pool and a first in the second.
+    let third = admit(&store, facts("http://c:8000", Role::Single, &[OTHER]));
+    assert_eq!(counts(at(2)), (0, 1));
+    let inside = at(2) + Duration::from_millis(1);
+    store.record(first, 0, load(2, 0), inside, LoadSource::Stream);
+    store.record(third, 0, load(1, 0), inside, LoadSource::Stream);
+    store.publish(at(3));
+    assert_eq!(counts(at(3)), (0, 0));
+}
+
 /// Where the published rows of the model's single pool stand.
 fn published(world: &World) -> *const Candidate {
     rows_of(world, MODEL).as_ptr()
@@ -5009,6 +5195,7 @@ fn a_member_whose_rows_revision_stands_is_carried_and_one_whose_revision_moved_i
         status: WorkerStatus::Ready,
         revision,
         admitted_at: origin,
+        maker: Default::default(),
     };
     let zones = |world: &World| (listed(world, WorkerId(3)).1, listed(world, WorkerId(7)).1);
     let mut writer = Writer::new(PUBLISH_WINDOW, origin);
@@ -5017,44 +5204,62 @@ fn a_member_whose_rows_revision_stands_is_carried_and_one_whose_revision_moved_i
         .apply(lists, 0, std::iter::empty(), |_, _| None)
         .expect("applied");
     let members = [row(3, "east", 1), row(7, "west", 1)];
-    let first = writer.rebuild(1, members.iter(), |_, _| None, Classes::Derive);
+    let first = writer.rebuild(1, members.filed(&writer), |_, _| None, Classes::Derive);
     assert_eq!(zones(&first), (1, 2));
     // The revision is what says a row's facts moved. At a standing revision
     // a member's fields are the last read's, whatever the row states: a
     // store hands no such row, and the case does, to tell a carry from a
     // read.
     let members = [row(3, "west", 1), row(7, "east", 1)];
-    let carried = writer.rebuild(2, members.iter(), |_, _| None, Classes::Derive);
+    let carried = writer.rebuild(2, members.filed(&writer), |_, _| None, Classes::Derive);
     assert_eq!(zones(&carried), (1, 2));
     // At another revision a member is read, and the other is carried.
     let members = [row(3, "west", 1), row(7, "east", 2)];
-    let read = writer.rebuild(3, members.iter(), |_, _| None, Classes::Derive);
+    let read = writer.rebuild(3, members.filed(&writer), |_, _| None, Classes::Derive);
     assert_eq!(zones(&read), (1, 1));
     // An apply whose lists differ reads every member, at any revision and
     // in whatever order the store's table hands them,
     let other = Arc::new(generation_listing(2, &[], &["west", "east"], &[]));
     let members = [row(7, "east", 2), row(3, "east", 1)];
     let (relisted, _) = writer
-        .apply(other, 3, members.iter(), |_, _| None)
+        .apply(other, 3, members.filed(&writer), |_, _| None)
         .expect("applied");
     assert_eq!(zones(&relisted), (2, 2));
     // and the write after it carries that reading.
     let members = [row(3, "west", 1), row(7, "west", 2)];
-    let after = writer.rebuild(4, members.iter(), |_, _| None, Classes::Derive);
+    let after = writer.rebuild(4, members.filed(&writer), |_, _| None, Classes::Derive);
     assert_eq!(zones(&after), (2, 2));
     // A member that leaves takes its entry with it, on either side of a
     // member that stays. One that joins again at the id and the revision
     // it left at is read: no field of its last life is carried.
     let members = [row(7, "west", 2)];
-    let left = writer.rebuild(5, members.iter(), |_, _| None, Classes::Derive);
+    let left = writer.rebuild(5, members.filed(&writer), |_, _| None, Classes::Derive);
     assert_eq!(listed(&left, WorkerId(7)).1, 2);
     let members = [row(3, "west", 1), row(7, "west", 2)];
-    let back = writer.rebuild(6, members.iter(), |_, _| None, Classes::Derive);
+    let back = writer.rebuild(6, members.filed(&writer), |_, _| None, Classes::Derive);
     assert_eq!(zones(&back), (1, 2));
     let members = [row(3, "west", 1)];
-    let left = writer.rebuild(7, members.iter(), |_, _| None, Classes::Derive);
+    let left = writer.rebuild(7, members.filed(&writer), |_, _| None, Classes::Derive);
     assert_eq!(listed(&left, WorkerId(3)).1, 1);
     let members = [row(3, "west", 1), row(7, "west", 2)];
-    let back = writer.rebuild(8, members.iter(), |_, _| None, Classes::Derive);
+    let back = writer.rebuild(8, members.filed(&writer), |_, _| None, Classes::Derive);
     assert_eq!(zones(&back), (1, 1));
+}
+
+/// A side's whole entries are a list of its own, made once at its length.
+/// The last model's side that lists every member is the entries
+/// themselves: none is copied.
+#[test]
+fn the_last_models_side_of_every_member_takes_the_entries_whole() {
+    let mut entries: Vec<u64> = (10..14).collect();
+    let stood = entries.as_ptr();
+    // Some members of the last model, then every member of an earlier one.
+    let some = side_of(&mut entries, &[1, 3], true);
+    assert_eq!((some.as_slice(), some.capacity()), (&[11, 13][..], 2));
+    let every = side_of(&mut entries, &[0, 1, 2, 3], false);
+    assert_eq!(every, [10, 11, 12, 13]);
+    assert!(every.as_ptr() != stood && entries.len() == 4);
+    let whole = side_of(&mut entries, &[0, 1, 2, 3], true);
+    assert_eq!(whole, [10, 11, 12, 13]);
+    assert!(whole.as_ptr() == stood && entries.is_empty());
 }

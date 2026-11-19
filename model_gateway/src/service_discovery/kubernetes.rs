@@ -39,20 +39,20 @@ use kube::{
 };
 use openai_protocol::worker::WorkerType;
 use rustls::crypto::ring;
+use smg_worker::{
+    identity::{
+        basic::{MOONCAKE_CONNECTOR, NIXL_CONNECTOR},
+        endpoint::Endpoint,
+    },
+    pd::pairing::{connector_profile, KvTransferProfile},
+};
 use tokio::{sync::Notify, task, time};
 use tracing::{debug, error, info, warn};
 
 use super::{
+    host::DiscoveryHost,
     provider::{DiscoveredWorker, DiscoveryKind},
     reconciler::{self, DesiredState},
-};
-use crate::{
-    app_context::AppContext,
-    worker::{
-        identity::endpoint::Endpoint,
-        pd::pairing::{connector_profile, KvTransferProfile},
-        MOONCAKE_CONNECTOR, NIXL_CONNECTOR,
-    },
 };
 
 /// Labels Kubernetes discovery has always stamped on the workers it registers,
@@ -507,13 +507,13 @@ fn resolve_bootstrap_ports(
 
 pub(super) async fn start_kubernetes_discovery(
     config: ServiceDiscoveryConfig,
-    app_context: Arc<AppContext>,
+    host: Arc<dyn DiscoveryHost>,
 ) -> Result<task::JoinHandle<()>, kube::Error> {
     let _ = ring::default_provider().install_default();
 
     let client = Client::try_default().await?;
 
-    Ok(run_service_discovery(client, config, app_context))
+    Ok(run_service_discovery(client, config, host))
 }
 
 /// Run discovery against an injected client. Compiled only for this crate's
@@ -522,16 +522,16 @@ pub(super) async fn start_kubernetes_discovery(
 pub fn start_service_discovery_with_client(
     client: Client,
     config: ServiceDiscoveryConfig,
-    app_context: Arc<AppContext>,
+    host: Arc<dyn DiscoveryHost>,
 ) -> task::JoinHandle<()> {
     let _ = ring::default_provider().install_default();
-    run_service_discovery(client, config, app_context)
+    run_service_discovery(client, config, host)
 }
 
 fn run_service_discovery(
     client: Client,
     config: ServiceDiscoveryConfig,
-    app_context: Arc<AppContext>,
+    host: Arc<dyn DiscoveryHost>,
 ) -> task::JoinHandle<()> {
     if config.disaggregated_mode {
         info!(
@@ -578,7 +578,7 @@ fn run_service_discovery(
 
         tokio::join!(
             drive_watch(stream, &notify),
-            reconcile_on_change(&store, &notify, &config, &app_context)
+            reconcile_on_change(&store, &notify, &config, host.as_ref())
         );
     });
 
@@ -608,7 +608,7 @@ async fn reconcile_on_change(
     store: &Store<Pod>,
     notify: &Notify,
     config: &ServiceDiscoveryConfig,
-    app_context: &Arc<AppContext>,
+    host: &dyn DiscoveryHost,
 ) {
     if store.wait_until_ready().await.is_err() {
         error!("K8s worker watcher dropped before initial sync; reconciliation disabled");
@@ -628,7 +628,7 @@ async fn reconcile_on_change(
             }
             _ = interval.tick() => {}
         }
-        reconcile_once(store, config, app_context).await;
+        reconcile_once(store, config, host).await;
     }
 }
 
@@ -696,11 +696,11 @@ fn compute_desired_state(pods: &[Arc<Pod>], config: &ServiceDiscoveryConfig) -> 
 async fn reconcile_once(
     store: &Store<Pod>,
     config: &ServiceDiscoveryConfig,
-    app_context: &Arc<AppContext>,
+    host: &dyn DiscoveryHost,
 ) {
     let started_at = time::Instant::now();
     let desired = compute_desired_state(&store.state(), config);
-    reconciler::reconcile(&desired, DiscoveryKind::Kubernetes, app_context, started_at).await;
+    reconciler::reconcile(&desired, DiscoveryKind::Kubernetes, host, started_at).await;
 }
 
 #[cfg(test)]

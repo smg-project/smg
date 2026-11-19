@@ -28,13 +28,9 @@ use common::{
     },
     metrics_capture::{self, render_after},
 };
-use smg::{
-    middleware::TenantRequestMeta,
-    routers::RouterTrait,
-    tenant::TenantKey,
-    worker::{RuntimeType, WorkerType},
-};
+use smg::{middleware::TenantRequestMeta, routers::RouterTrait, tenant::TenantKey};
 use smg_test_harness as common;
+use smg_worker::identity::basic::{RuntimeType, WorkerType};
 
 const MODEL: &str = "pd-ttft-phases-test-model";
 /// Tokens every mock answers with; ids 1..=3 are in the mock tokenizer's vocabulary.

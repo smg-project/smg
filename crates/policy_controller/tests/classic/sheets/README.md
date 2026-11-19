@@ -44,7 +44,7 @@ model_gateway/src/         the gateway's recorders, each a test module beside th
   policies/classic_manual_rows.rs                                           manual.json
   policies/classic_prefix_hash_rows.rs                                      prefix_hash.json
   policies/classic_all_vetoed_rows.rs                                       all_vetoed.json
-  worker/pd/pair_index/classic_pair_rows.rs                                 pair_index.json
+  routers/common/pair_index/classic_pair_rows.rs                            pair_index.json
   routers/grpc/common/stages/worker_selection/classic_encode_pair_rows.rs   encode_pair.json
   routers/common/classic_pair_select_rows.rs                                pair_select.json
   policies/bucket/classic_bucket_rows.rs                                    bucket.json
@@ -246,7 +246,7 @@ The overload and minimum-tokens sheets' recorders are tests of the worker crate:
 | `manual.json` | `policies::classic_manual_rows` |
 | `prefix_hash.json` | `policies::classic_prefix_hash_rows` |
 | `all_vetoed.json` | `policies::classic_all_vetoed_rows` |
-| `pair_index.json` | `worker::pd::pair_index::classic_pair_rows` |
+| `pair_index.json` | `routers::common::pair_index::classic_pair_rows` |
 | `encode_pair.json` | `worker_selection::classic_encode_pair_rows` |
 | `pair_select.json` | `routers::common::classic_pair_select_rows` |
 | `overload.json` | `load::monitor::classic_overload_rows` |
@@ -263,10 +263,10 @@ own types. The overload sheet's recorder is a child of the load monitor's module
 through the monitor's own functions and the verdict is read off the worker the monitor wrote it on. The bucket
 sheet's recorder is a child of the policy's own module and stands in that policy's directory: the adjustment and
 the window are the policy's private state, and a module beside the policy's could reach neither.
-The minimum-tokens sheet's recorder is a child of the load monitor too: each step reaches the rank cache as the
-monitor's poll loop hands it over, and each request asks the cache's select, which the policy forwards to. The
-sticky rank sheet's recorder is a child of the stage that sends a request to its worker, and calls the stage's own
-pin.
+The minimum-tokens sheet's recorder is a child of the load monitor too: each step reaches the rank cache by the
+recorder's own repeat of the hand-over the monitor's poll loop makes, and each request asks the cache's select,
+which the policy forwards to. The sticky rank sheet's recorder is a child of the stage that sends a request to its
+worker, and calls the stage's own pin.
 
 A sheet is never edited by hand. A new recording replaces the whole sheet and its row in the table above, in one
 pull request that names the commit and says which rows moved: a sequence row moves only when the policy's
@@ -307,7 +307,8 @@ fails once the reason no longer holds.
   holds (`an-answer-that-names-no-rank-takes-the-ranks-that-pushed-before-it-off-the-report`). Each of these five
   rows repeats the step that leaves a rank unheard, and replays as recorded from its fourth repeat on. A rank an
   answer leaves out beside a named one carries the overload bit alone, as the store's avoidance of that rank: the
-  replay reads a worker as overloaded when every rank row of it carries the bit. The other 19 rows replay.
+  replay reads a worker's verdict off the rows of the ranks its last answer named. It fails where those rows carry
+  two verdicts, and where a rank left out carries no bit. The other 19 rows replay.
 - `manual.json`: one row is owed, `manual-one-key-pins-apart-under-the-prefill-and-the-decode-role`. The gateway
   keeps a key's pins apart under each role of a prefill and decode pair. The crate refuses a sessions rule under a
   pair plan today, so it cannot build the row; the other 13 rows replay.

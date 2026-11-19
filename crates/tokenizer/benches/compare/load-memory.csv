@@ -1,0 +1,65 @@
+family,arm,load_ms,rss_kb_before_load,rss_kb_after_load,hwm_kb_after_500k,hwm_kb_after_1m,allocs_2k_encode,growth_kb_per_thread_shared,growth_kb_per_thread_own,level_kb_per_thread_own,backend
+deepseek-v4.1-flash,smg-1.16.0,196.5,4348,73964,82008,96408,1,697,71640,72337,smg hf:native [nativex1]
+deepseek-v4.1-flash,smg-1.15.0,442.5,4420,141756,142272,148032,1,969,126026,126997,smg hf:native [nativex1]
+deepseek-v4.1-flash,v1,1041.7,4320,109048,139116,139116,1,103,130730,130834,smg hf:v1 [v1x1]
+deepseek-v4.1-flash,fastokens,678.1,3764,115512,198184,201916,4,16562,130349,144865,fastokens-stack fastokens
+deepseek-v3.2,smg-1.16.0,199.4,4292,72700,80644,95348,1,698,73945,74642,smg hf:native [nativex1]
+deepseek-v3.2,smg-1.15.0,430.6,4164,140120,140444,146864,1,969,121768,122740,smg hf:native [nativex1]
+deepseek-v3.2,v1,841.6,4500,107880,137852,137852,1,99,142478,142579,smg hf:v1 [v1x1]
+deepseek-v3.2,fastokens,669.0,3700,115500,198324,201916,4,16559,119938,134963,fastokens-stack fastokens
+llama-3.2-1b,smg-1.16.0,264.1,4388,95584,102288,116376,1,707,100391,101097,smg hf:native [nativex1]
+llama-3.2-1b,smg-1.15.0,747.7,4360,188832,256416,256416,1,996,253426,254424,smg hf:native [nativex1]
+llama-3.2-1b,v1,1109.0,4352,181260,239172,239172,1,82,171946,172029,smg hf:v1 [v1x1]
+llama-3.2-1b,fastokens,1127.4,3828,290808,341664,344760,1,16553,301599,316874,fastokens-stack fastokens
+llama-4-scout,smg-1.16.0,458.3,4268,119588,133380,135956,1,708,112012,112718,smg hf:native [nativex1]
+llama-4-scout,smg-1.15.0,1225.2,4356,291192,399844,399844,1,985,352738,353726,smg hf:native [nativex1]
+llama-4-scout,v1,1942.5,4300,187632,332760,332760,1,101,273746,273849,smg hf:v1 [v1x1]
+llama-4-scout,fastokens,2043.8,3748,450300,534628,538348,1,32950,477162,510048,fastokens-stack fastokens
+gpt-oss-20b,smg-1.16.0,460.8,4392,116648,135832,135832,1,718,122557,123274,smg hf:native [nativex1]
+gpt-oss-20b,smg-1.15.0,1263.7,4232,294032,405164,405164,1,986,362332,363318,smg hf:native [nativex1]
+gpt-oss-20b,v1,1918.3,4320,234072,333392,333392,1,115,250601,250718,smg hf:v1 [v1x1]
+gpt-oss-20b,fastokens,2094.7,3828,452680,536016,540552,1,32965,474663,507404,fastokens-stack fastokens
+qwen3.6-27b,smg-1.16.0,413.1,4228,115420,134356,136340,1,655,153034,153690,smg hf:native [nativex1]
+qwen3.6-27b,smg-1.15.0,1038.0,4188,243300,245740,248612,1,892,213861,214755,smg hf:native [nativex1]
+qwen3.6-27b,v1,1818.9,4272,204428,263332,263332,2,465,209299,209766,smg hf:v1 [v1x1]
+qwen3.6-27b,fastokens,1492.4,3760,190516,272868,276800,1,32950,180426,213184,fastokens-stack fastokens
+glm-5.3-flash,smg-1.16.0,313.4,4252,109948,118328,125388,1,717,115087,115803,smg hf:native [nativex1]
+glm-5.3-flash,smg-1.15.0,885.4,4164,216104,296240,296240,1,999,274518,275517,smg hf:native [nativex1]
+glm-5.3-flash,v1,1310.7,4380,186524,263624,263624,1,80,235722,235803,smg hf:v1 [v1x1]
+glm-5.3-flash,fastokens,1391.2,3764,333688,383140,386412,1,16568,342759,358017,fastokens-stack fastokens
+minimax-m3,smg-1.16.0,310.1,4248,89380,103052,113340,1,724,105797,106520,smg hf:native [nativex1]
+minimax-m3,smg-1.15.0,753.8,4404,176364,178752,181016,1,989,160175,161166,smg hf:native [nativex1]
+minimax-m3,v1,1293.8,4488,169872,184632,194648,1,88,131806,131896,smg hf:v1 [v1x1]
+minimax-m3,fastokens,1107.4,3828,162760,278424,282800,1,32985,196170,228676,fastokens-stack fastokens
+mimo-v2.6-flash-rl,smg-1.16.0,221.3,4200,73536,83036,97624,1,704,80936,81640,smg hf:native [nativex1]
+mimo-v2.6-flash-rl,smg-1.15.0,603.0,4336,144340,166080,166080,1,997,178108,179106,smg hf:native [nativex1]
+mimo-v2.6-flash-rl,v1,895.8,4316,144736,152420,170488,1,99,151724,151824,smg hf:v1 [v1x1]
+mimo-v2.6-flash-rl,fastokens,888.5,3764,217964,269788,272672,1,16553,234669,249688,fastokens-stack fastokens
+mistral-tekken,smg-1.16.0,317.2,4252,83164,96480,114424,1,690,73674,74366,smg tiktoken [nativex1]
+mistral-tekken,smg-1.15.0,355.4,4264,101988,115604,133044,1,926,92369,93296,smg tiktoken [nativex1]
+mistral-tekken,v1,309.5,4380,83548,96912,115604,1,690,73458,74150,smg tiktoken [nativex1]
+mistral-tekken,fastokens,183.6,3764,73840,96512,96512,5277,461,92777,93239,fastokens-stack tekken
+gemma-3-1b-it,smg-1.16.0,595.8,4240,160652,174796,180736,4,605,175741,176344,smg hf:native+bytefallback [nativex1]
+gemma-3-1b-it,smg-1.15.0,1614.2,4420,296016,476776,476776,4,695,426988,427684,smg hf:native+bytefallback [nativex1]
+gemma-3-1b-it,v1,2397.1,4460,325236,414572,414572,73,449,302470,302921,smg hf:v1+bytefallback [v1x1]
+gemma-3-1b-it,fastokens,2411.0,3828,484568,517948,517948,113,1883,472853,474715,fastokens-stack fastokens
+gemma-4-e2b-it,smg-1.16.0,571.2,4268,160600,173020,177656,1,599,177474,178071,smg hf:native+bytefallback [nativex1]
+gemma-4-e2b-it,smg-1.15.0,1627.9,4256,295508,474964,474964,1,689,426592,427282,smg hf:native+bytefallback [nativex1]
+gemma-4-e2b-it,v1,2457.9,4464,315720,404132,412064,5,686,300086,300774,smg hf:v1+bytefallback [v1x1]
+gemma-4-e2b-it,fastokens,2446.3,3824,479040,511460,511460,19,1831,473355,475167,fastokens-stack fastokens
+llama-2-bytefallback,smg-1.16.0,40.2,4348,27044,36648,53264,2,632,20362,20993,smg hf:native+bytefallback [nativex1]
+llama-2-bytefallback,smg-1.15.0,106.0,4284,41180,46692,60724,2,974,29422,30398,smg hf:native+bytefallback [nativex1]
+llama-2-bytefallback,v1,213.2,4316,45060,106232,187564,2,522,50701,51225,smg hf:v1+bytefallback [v1x1]
+llama-2-bytefallback,fastokens,133.2,3796,43736,72044,121984,21,1819,41071,42890,fastokens-stack fastokens
+kimi-k3,smg-1.16.0,363.4,4260,85284,99556,115024,1,704,77546,78252,smg tiktoken [nativex1]
+kimi-k3,smg-1.15.0,412.1,4392,104360,119436,132512,3,996,96830,97827,smg tiktoken [nativex1]
+kimi-k3,v1,370.5,4372,85668,100500,116960,1,705,77545,78252,smg tiktoken [nativex1]
+kimi-k3,fastokens,2574.7,3708,73664,74704,81384,586,179,67903,68084,fastokens-stack tiktoken(auto: riptoken first)
+bert-base-uncased,smg-1.16.0,16.6,4388,14812,18640,24980,7,49,7578,7628,smg hf:native [nativex1]
+bert-base-uncased,smg-1.15.0,22.1,4288,20588,314636,616760,24245,1882,12326,14208,smg hf:tokenizers [tokenizersx1]
+bert-base-uncased,v1,16.9,4380,14904,18656,25032,7,49,7598,7648,smg hf:native [nativex1]
+bert-base-uncased,fastokens,52.4,3764,20012,308148,610792,27670,1929,14269,16199,fastokens-stack hf-tokenizers(fastokens declined: tokenizer error: failed to load tokenizer: normalizer error:
+t5-small,smg-1.16.0,42.4,4368,36192,212236,402468,23257,1660,32149,33809,smg hf:tokenizers [tokenizersx1]
+t5-small,smg-1.15.0,51.9,4252,44076,272440,472800,24615,1658,39883,41544,smg hf:tokenizers [tokenizersx1]
+t5-small,v1,44.9,4360,36048,208300,402800,23257,1658,32164,33825,smg hf:tokenizers [tokenizersx1]
+t5-small,fastokens,89.4,3756,45584,264672,465688,26316,1665,36760,38426,fastokens-stack hf-tokenizers(fastokens declined: tokenizer error: failed to load tokenizer: normalizer error:

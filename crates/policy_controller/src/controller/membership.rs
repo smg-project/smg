@@ -28,6 +28,18 @@
 //! behind another writes under the term of its own minute, or is refused as
 //! a follower's is, and never under a term read before the wait.
 //!
+//! **A row has one maker** ([`Maker`]): the caller whose registration put
+//! it there, a control call or a provider that finds workers by itself. The
+//! door writes it at a registration and keeps it while the URL's
+//! registration stands. An upsert or a replacement over a standing row, a
+//! patch, a drain and a removal are refused where their caller is not the
+//! row's maker, whole: a control call changes nothing of a provider's row,
+//! a provider nothing of a control call's or of another's. The refusal
+//! names the maker and never the URL, and it comes ahead of the revision's
+//! test. An add changes no standing row: it is refused as already there,
+//! whoever made the row. The control scope's three calls are a control
+//! call's; a provider's step writes through the same turn.
+//!
 //! **Every life of a URL has a number of its own:** the leader's term above the
 //! store's epoch when the door numbered it, counted from a base the door
 //! draws once a run. The store's id is a function of the URL and that
@@ -50,7 +62,9 @@ use super::{
 use crate::{
     proto::{self, register_worker_request::Mode, worker_event::Event},
     replication::Log,
-    store::{HealthSink, Kinds, MemoryStore, Position, WorkerRow, WorkerStatus, WorkersStore},
+    store::{
+        HealthSink, Kinds, Maker, MemoryStore, Position, WorkerRow, WorkerStatus, WorkersStore,
+    },
     view::WorkerId,
 };
 
@@ -83,6 +97,25 @@ fn absent() -> Status {
 /// the door does that to another, so a second writer did.
 fn moved() -> Status {
     Status::aborted("the row moved under the call")
+}
+
+/// A write of a row by a caller that did not make it. The words name the
+/// row's maker, never its URL.
+fn made_by(row: &WorkerRow, caller: &Maker) -> Result<(), Status> {
+    if row.maker == *caller {
+        return Ok(());
+    }
+    Err(Status::permission_denied(match &row.maker {
+        Maker::Control => {
+            "the row was made by a control call: its maker alone changes it".to_owned()
+        }
+        Maker::Provider(found) => {
+            let provider = found.provider();
+            format!(
+                "the row is provider {provider}'s: its worker is changed at the provider's source"
+            )
+        }
+    }))
 }
 
 /// The contract's names of the door's three calls, as an audit line says
@@ -208,13 +241,16 @@ impl Door {
         leading: impl FnOnce() -> Result<u64, Status>,
         request: &proto::RegisterWorkerRequest,
     ) -> Result<proto::WorkerEvent, Status> {
-        self.call(REGISTER, by, leading, |term| self.upsert(by, term, request))
+        self.call(REGISTER, by, leading, |term| {
+            self.upsert(by, &Maker::Control, term, request)
+        })
     }
 
-    /// The write of [`Self::register`], in the door's turn.
+    /// The write of [`Self::register`], in the door's turn, from `maker`.
     fn upsert(
         &self,
         by: &Principal,
+        maker: &Maker,
         admitted: u64,
         request: &proto::RegisterWorkerRequest,
     ) -> Result<proto::WorkerEvent, Status> {
@@ -254,6 +290,8 @@ impl Door {
             }));
         }
         let old = match (mode, standing) {
+            // An add changes no standing row, so it asks no maker: its
+            // refusal is the same whoever made the row.
             (Mode::Add, Some(row)) => {
                 return Err(Status::already_exists(format!(
                     "the URL is registered as worker {:016x} at revision {}",
@@ -266,6 +304,9 @@ impl Door {
                 None
             }
             (mode, Some(row)) => {
+                // Ahead of the test of equal facts: a caller that did not
+                // make the row is told so, and never that it stands unmoved.
+                made_by(&row, maker)?;
                 if mode == Mode::Upsert && facts == row.facts {
                     let epoch = self.store.epoch();
                     let at = self.place();
@@ -285,7 +326,10 @@ impl Door {
                 Some(row)
             }
         };
-        let id = self.store.upsert(facts).id();
+        // The row's bound holds with its maker: the facts' own was told
+        // where they were read.
+        worker_wire::room(&facts, &facts.labels, maker, "spec").map_err(invalid)?;
+        let id = self.store.upsert_by(facts, maker.clone()).id();
         // The row, the epoch and the place as the registration's write left
         // them: the answer of a call that does not wait.
         let (mut now, mut epoch, mut at) = (self.read(id)?, self.store.epoch(), self.place());
@@ -315,19 +359,26 @@ impl Door {
         leading: impl FnOnce() -> Result<u64, Status>,
         request: &proto::PatchWorkerRequest,
     ) -> Result<proto::WorkerEvent, Status> {
-        self.call(PATCH, by, leading, |_| self.relabel(by, request))
+        self.call(PATCH, by, leading, |_| {
+            self.relabel(by, &Maker::Control, request)
+        })
     }
 
-    /// The write of [`Self::patch`], in the door's turn.
+    /// The write of [`Self::patch`], in the door's turn, from `maker`.
     fn relabel(
         &self,
         by: &Principal,
+        maker: &Maker,
         request: &proto::PatchWorkerRequest,
     ) -> Result<proto::WorkerEvent, Status> {
-        let standing = self.guarded(request.worker_id, request.revision)?;
+        let standing = self.guarded(maker, request.worker_id, request.revision)?;
         let (now, wrote) = match worker_wire::patch(request, &standing.facts).map_err(invalid)? {
             None => (standing, false),
             Some(patch) => {
+                if let Some(labels) = &patch.labels {
+                    worker_wire::room(&standing.facts, labels, &standing.maker, "labels")
+                        .map_err(invalid)?;
+                }
                 self.store
                     .patch(standing.id, patch, standing.revision)
                     .ok_or_else(moved)?;
@@ -356,16 +407,20 @@ impl Door {
         leading: impl FnOnce() -> Result<u64, Status>,
         request: &proto::DeregisterWorkerRequest,
     ) -> Result<proto::WorkerEvent, Status> {
-        self.call(DEREGISTER, by, leading, |_| self.remove(by, request))
+        self.call(DEREGISTER, by, leading, |_| {
+            self.remove(by, &Maker::Control, request)
+        })
     }
 
-    /// The write of [`Self::deregister`], in the door's turn.
+    /// The write of [`Self::deregister`], in the door's turn, from `maker`.
+    /// A drain is no exception: it is a write of the row.
     fn remove(
         &self,
         by: &Principal,
+        maker: &Maker,
         request: &proto::DeregisterWorkerRequest,
     ) -> Result<proto::WorkerEvent, Status> {
-        let standing = self.guarded(request.worker_id, request.revision)?;
+        let standing = self.guarded(maker, request.worker_id, request.revision)?;
         let (event, wrote) = if !request.drain {
             self.store
                 .remove(standing.id, standing.revision)
@@ -385,12 +440,15 @@ impl Door {
         Ok(told(DEREGISTER, by, event, wrote, epoch, self.place()))
     }
 
-    /// The row under `id` when `revision` is the one it stands at.
-    fn guarded(&self, id: u64, revision: u64) -> Result<WorkerRow, Status> {
+    /// The row under `id` when `maker` made it and `revision` is the one it
+    /// stands at. The maker is tested first: a caller that did not make the
+    /// row is told so whatever revision it read.
+    fn guarded(&self, maker: &Maker, id: u64, revision: u64) -> Result<WorkerRow, Status> {
         let row = self
             .store
             .get(WorkerId(id))
             .ok_or_else(|| Status::not_found("no worker has the id"))?;
+        made_by(&row, maker)?;
         if row.revision == revision {
             Ok(row)
         } else {
@@ -462,7 +520,7 @@ pub(crate) mod tests {
             replication::{journaled, journaled_from},
         },
         proto::{self, register_worker_request::Mode, worker_event::Event},
-        store::{self, identity, MemoryStore, WorkerStatus, WorkersStore},
+        store::{self, identity, Maker, MemoryStore, WorkerStatus, WorkersStore},
         view::WorkerId,
     };
 
@@ -1019,6 +1077,229 @@ pub(crate) mod tests {
             (told.seq, told.term, told.membership_epoch),
             (7, TERM + 1, 5)
         );
+    }
+
+    /// A provider's maker for one worker.
+    fn found(key: &str) -> Maker {
+        Maker::provider("cluster", key).expect("a whole maker")
+    }
+
+    #[test]
+    fn a_row_keeps_the_maker_its_registration_gave_it() {
+        let (store, door) = door();
+        // A control call's row says no maker on the wire.
+        let by_hand = row_of(
+            &door
+                .register(&operator(), under(TERM), &ask(spec(URL), Mode::Add))
+                .expect("registered"),
+        );
+        assert_eq!(by_hand.maker, None);
+        let held = store.get(WorkerId(by_hand.id)).expect("the row");
+        assert_eq!(held.maker, Maker::Control);
+        // A provider's registration makes the row its own, and the answer
+        // shows whose it is.
+        let maker = found("pods/a");
+        let other = "grpc://10.0.0.6:8000";
+        let made = row_of(
+            &door
+                .upsert(&operator(), &maker, TERM, &ask(spec(other), Mode::Upsert))
+                .expect("found"),
+        );
+        let shown = Some(proto::Maker {
+            provider: "cluster".to_owned(),
+            key: "pods/a".to_owned(),
+        });
+        assert_eq!(made.maker, shown);
+        // Its refresh in place and its new incarnation keep the maker. The
+        // refresh comes from a maker made anew: two makers are one where
+        // they agree whole, whichever copy a caller holds.
+        let relabelled = proto::WorkerSpec {
+            labels: [("tier".to_owned(), "gold".to_owned())].into(),
+            ..spec(other)
+        };
+        let anew = found("pods/a");
+        let in_place = row_of(
+            &door
+                .upsert(&operator(), &anew, TERM, &ask(relabelled, Mode::Upsert))
+                .expect("refreshed"),
+        );
+        assert_eq!((in_place.id, &in_place.maker), (made.id, &shown));
+        let again = row_of(
+            &door
+                .upsert(&operator(), &maker, TERM, &ask(spec(other), Mode::Replace))
+                .expect("replaced"),
+        );
+        assert_ne!(again.id, made.id);
+        assert_eq!(again.maker, shown);
+        let held = store.get(WorkerId(again.id)).expect("the row");
+        assert_eq!(held.maker, maker);
+    }
+
+    #[test]
+    fn a_caller_that_did_not_make_a_row_changes_nothing_of_it() {
+        use super::worker_wire;
+
+        let (store, door) = door();
+        let maker = found("pods/a");
+        let made = row_of(
+            &door
+                .upsert(&operator(), &maker, TERM, &ask(spec(URL), Mode::Upsert))
+                .expect("found"),
+        );
+        let epoch = store.epoch();
+        let refused = |answer: Result<proto::WorkerEvent, Status>, whose: &str| {
+            let status = answer.expect_err("refused");
+            assert_eq!(status.code(), Code::PermissionDenied, "{status:?}");
+            assert!(status.message().contains(whose), "{status:?}");
+            assert!(!status.message().contains("10.0.0"), "no URL: {status:?}");
+        };
+        // A control call on the provider's row: a registration over it, with
+        // other facts and with equal ones, a patch, a drain and a removal.
+        let relabelled = proto::WorkerSpec {
+            labels: [("tier".to_owned(), "gold".to_owned())].into(),
+            ..spec(URL)
+        };
+        for request in [
+            ask(spec(URL), Mode::Replace),
+            ask(relabelled, Mode::Upsert),
+            ask(spec(URL), Mode::Upsert),
+        ] {
+            let answer = door.register(&operator(), under(TERM), &request);
+            refused(answer, "provider cluster");
+        }
+        let patch = proto::PatchWorkerRequest {
+            worker_id: made.id,
+            labels: [("lane".to_owned(), "b".to_owned())].into(),
+            remove_labels: Vec::new(),
+            overload: None,
+            revision: made.revision,
+        };
+        refused(
+            door.patch(&operator(), under(TERM), &patch),
+            "provider cluster",
+        );
+        for drain in [true, false] {
+            let leave = proto::DeregisterWorkerRequest {
+                worker_id: made.id,
+                revision: made.revision,
+                drain,
+            };
+            refused(
+                door.deregister(&operator(), under(TERM), &leave),
+                "provider cluster",
+            );
+        }
+        // The maker is tested ahead of the revision: a caller that did not
+        // make the row is told so whatever revision it read.
+        let stale = proto::PatchWorkerRequest {
+            revision: made.revision + 7,
+            ..patch.clone()
+        };
+        refused(
+            door.patch(&operator(), under(TERM), &stale),
+            "provider cluster",
+        );
+        // The same provider under another key is another worker's maker.
+        let another = found("pods/b");
+        refused(
+            door.upsert(&operator(), &another, TERM, &ask(spec(URL), Mode::Upsert)),
+            "provider cluster",
+        );
+        // Nothing was written, and the maker's own call goes through.
+        assert_eq!(store.epoch(), epoch);
+        let held = store.get(WorkerId(made.id)).expect("the row");
+        assert_eq!(held.revision, made.revision);
+        door.relabel(&operator(), &maker, &patch)
+            .expect("the maker patches its row");
+
+        // A row holds its maker inside the wire's bound. The widest key a row
+        // of this spec has room for is registered; one byte more is refused
+        // by the row's name, and so is a patch of the row at its brim.
+        let wide =
+            |bytes: usize| Maker::provider("cluster", "k".repeat(bytes)).expect("a whole maker");
+        let third = "grpc://10.0.0.7:8000";
+        let (stated, _) = worker_wire::registration(&spec(third), |_| None).expect("the facts");
+        let fits =
+            |bytes: usize| worker_wire::room(&stated, &stated.labels, &wide(bytes), "spec").is_ok();
+        let widest = (0..=16_384usize)
+            .rev()
+            .find(|&bytes| fits(bytes))
+            .expect("a key the row has room for");
+        let epoch = store.epoch();
+        let past = door.upsert(
+            &operator(),
+            &wide(widest + 1),
+            TERM,
+            &ask(spec(third), Mode::Upsert),
+        );
+        let status = past.expect_err("past the bound");
+        assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+        assert!(status.message().starts_with("spec:"), "{status:?}");
+        assert_eq!(store.epoch(), epoch);
+        let brim = row_of(
+            &door
+                .upsert(
+                    &operator(),
+                    &wide(widest),
+                    TERM,
+                    &ask(spec(third), Mode::Upsert),
+                )
+                .expect("at the bound"),
+        );
+        let more = proto::PatchWorkerRequest {
+            worker_id: brim.id,
+            revision: brim.revision,
+            ..patch.clone()
+        };
+        let status = door
+            .relabel(&operator(), &wide(widest), &more)
+            .expect_err("past the bound");
+        assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+        assert!(status.message().starts_with("labels:"), "{status:?}");
+
+        // The other way round: a provider changes nothing of a control
+        // call's row.
+        let other = "grpc://10.0.0.6:8000";
+        let by_hand = row_of(
+            &door
+                .register(&operator(), under(TERM), &ask(spec(other), Mode::Add))
+                .expect("registered"),
+        );
+        refused(
+            door.upsert(&operator(), &maker, TERM, &ask(spec(other), Mode::Upsert)),
+            "a control call",
+        );
+        let leave = proto::DeregisterWorkerRequest {
+            worker_id: by_hand.id,
+            revision: by_hand.revision,
+            drain: false,
+        };
+        refused(door.remove(&operator(), &maker, &leave), "a control call");
+        door.deregister(&operator(), under(TERM), &leave)
+            .expect("the control call removes its row");
+    }
+
+    #[test]
+    fn an_add_over_a_standing_row_is_already_there_whoever_made_it() {
+        let (store, door) = door();
+        let maker = found("pods/a");
+        door.upsert(&operator(), &maker, TERM, &ask(spec(URL), Mode::Upsert))
+            .expect("found");
+        let other = "grpc://10.0.0.6:8000";
+        door.register(&operator(), under(TERM), &ask(spec(other), Mode::Add))
+            .expect("registered");
+        let epoch = store.epoch();
+        let there = |answer: Result<proto::WorkerEvent, Status>| {
+            let status = answer.expect_err("refused");
+            assert_eq!(status.code(), Code::AlreadyExists, "{status:?}");
+        };
+        // An add asks no maker: a control call's and a provider's read the
+        // same over a provider's row and over a control call's.
+        for url in [URL, other] {
+            there(door.register(&operator(), under(TERM), &ask(spec(url), Mode::Add)));
+            there(door.upsert(&operator(), &maker, TERM, &ask(spec(url), Mode::Add)));
+        }
+        assert_eq!(store.epoch(), epoch);
     }
 
     #[test]
@@ -1679,7 +1960,7 @@ pub(crate) mod tests {
     fn a_run_draws_its_base_below_the_bound_and_apart_from_another_runs() {
         let drawn: Vec<u64> = (0..64)
             .map(|_| {
-                let (store, feed) = journaled(&LeasePlace::Process);
+                let (store, feed) = journaled(&LeasePlace::Process, 1);
                 Door::new(store, feed.log).base
             })
             .collect();
@@ -1695,7 +1976,7 @@ pub(crate) mod tests {
         // A controller with no shared lease leads under term one at every
         // start: each run's door draws where its count starts.
         let run = || {
-            let (store, feed) = journaled(&LeasePlace::Process);
+            let (store, feed) = journaled(&LeasePlace::Process, 1);
             store::LeasesStore::set_term(store.as_ref(), 1);
             let door = Door::new(Arc::clone(&store), feed.log);
             let first = row_of(

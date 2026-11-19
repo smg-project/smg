@@ -16,30 +16,46 @@
 //!   out.
 //! - `provider` defines the contract every provider produces: a
 //!   `provider::DiscoveredWorker` per worker, plus the provider's kind.
-//! - `reconciler` owns ownership, the registry diff and the `JobQueue`
-//!   submissions. It sees only that contract — never a `Pod`, a Pod UID, or
-//!   which provider is running beyond its kind.
+//! - `reconciler` owns ownership, the registry diff and what is asked of the
+//!   host's job queue. It sees only that contract — never a `Pod`, a Pod UID,
+//!   or which provider is running beyond its kind.
+//! - `host` defines what the providers ask of the process that hosts them:
+//!   its registry, and its job queue.
+//! - `config` holds the settings a host reads for each provider, and the
+//!   error a provider refuses settings with.
+//! - `series` holds the metric series the providers and the reconciler
+//!   record.
 //! - `runtime` resolves configuration into the selected provider's runtime
 //!   settings, through the one conversion every input surface shares, and
 //!   starts that provider.
 //!
 //! SMG mesh-router peer discovery is a different concern — it discovers router
-//! peers, not inference workers — and lives in [`crate::mesh::discovery`].
+//! peers, not inference workers — and lives in the gateway's
+//! `mesh::discovery` module.
 
+mod config;
 mod consul;
 mod file;
+mod host;
 mod kubernetes;
 mod provider;
 mod reconciler;
 mod runtime;
+mod series;
 mod slurm;
 mod snapshot;
 #[cfg(test)]
 pub(crate) mod testing;
 
+pub use config::{
+    deserialize_discovery, ConsulDiscoveryConfig, DiscoveryConfig, DiscoveryConfigError,
+    DiscoveryConfigResult, FileDiscoveryConfig, KubernetesDiscoveryConfig, SlurmDiscoveryConfig,
+    DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS,
+};
 pub use consul::ConsulProviderConfig;
 pub(crate) use file::export_manifest;
 pub use file::FileProviderConfig;
+pub use host::DiscoveryHost;
 #[cfg(feature = "test-util")]
 pub use kubernetes::start_service_discovery_with_client;
 pub(crate) use kubernetes::{
@@ -48,8 +64,10 @@ pub(crate) use kubernetes::{
 pub use kubernetes::{
     ModelIdSource, PodInfo, PodType, ServiceDiscoveryConfig, POD_NAME_LABEL, POD_UID_LABEL,
 };
+pub use provider::Roles;
 pub use reconciler::{
     DISCOVERY_ID_LABEL, DISCOVERY_LABEL_PREFIX, DISCOVERY_PROVIDER_LABEL, DISCOVERY_SPEC_HASH_LABEL,
 };
 pub use runtime::{start_service_discovery, RuntimeDiscoveryConfig};
+pub use series::describe_series;
 pub use slurm::SlurmProviderConfig;

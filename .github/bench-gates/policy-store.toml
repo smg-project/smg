@@ -125,7 +125,8 @@
 # batch after the first, four do not count steadily (`publish/8`, `publish/64`, `view_build/8`,
 # `member_write_spread/512`) and three were not read, the bench having stopped under the counter. The two rows of
 # a fleet of pairs and the row of many models, added since, do not count steadily either. A row that does not
-# count steadily, or whose count is not read, keeps the time's verdict.
+# count steadily, or whose count is not read, keeps the time's verdict; where every count of a row is within
+# half a percent, a second measurement decides it.
 #
 # Every job uploads bench-gate/results.json with the raw per-run medians of both sides; the hosted runner's
 # own spread can be read from those and the thresholds tightened once it is known.

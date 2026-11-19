@@ -63,7 +63,7 @@ struct Cli {
     /// a shared lease a replica that does not lead follows its leader: it
     /// dials the leader's advertised host at this port, so every replica
     /// listens on the same one, and the listener takes identities as told
-    /// in the clear
+    /// in the clear. A replica that follows is refused port 0
     #[arg(long, default_value = DEFAULT_REPLICATION_LISTEN, help_heading = "Listeners")]
     replication_listen: SocketAddr,
 
@@ -645,8 +645,8 @@ mod tests {
     use crate::{
         catalog::Catalog,
         controller::{
-            membership::tests::Logged, Config, ConfigError, Election, Error, LeasePlace, Scope,
-            SpecRejected, StoreRefused,
+            membership::tests::Logged, spec_store::SpecStore, Config, ConfigError, Controller,
+            Election, Error, LeasePlace, Scope, SpecRejected, StoreRefused,
         },
         elector::ElectionSettings,
         spec::SpecError,
@@ -1190,6 +1190,51 @@ mod tests {
         }
     }
 
+    /// The controller records no prefix it sent a worker: a spec file whose
+    /// prefix affinity reads them, alone or merged with the index, refuses
+    /// the start by the source's field, and the same stage by the index
+    /// starts.
+    #[tokio::test]
+    async fn a_spec_file_whose_affinity_reads_the_prefixes_sent_refuses_the_start() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let path = dir.path().join("policy.yaml");
+        let start = |source: &str| {
+            let document = format!(
+                "apiVersion: smg.policy/v1\nprofiles:\n  default:\n    score:\n      - prefix-affinity: {{source: {source}}}\n    pick: best\n"
+            );
+            std::fs::write(&path, document).expect("the file");
+            let config = parse(&EPHEMERAL).config().expect("the flags are in order");
+            bind(
+                config,
+                Catalog::builtin(),
+                &[],
+                SpecSource::File(path.clone()),
+            )
+        };
+
+        let controller = start("index").await.expect("the index's source starts");
+        assert_eq!(controller.store().world().spec().generation(), 1);
+        drop(controller);
+
+        for reads in ["predictor", "merged"] {
+            match start(reads).await {
+                Err(Error::SpecFile {
+                    source: SpecRejected::Invalid(SpecError::NotInBuild { path: field, what }),
+                    ..
+                }) => assert_eq!(
+                    (field.as_str(), what),
+                    (
+                        "profiles.default.score[0].prefix-affinity.source",
+                        "the record of sent prefixes this source reads"
+                    ),
+                    "{reads}"
+                ),
+                Err(other) => panic!("{reads}: the start was refused as {other}"),
+                Ok(_) => panic!("{reads}: nothing here records the prefixes sent"),
+            }
+        }
+    }
+
     /// The flag's names reach the bound controller: a name the flags mount
     /// no listener under refuses the start, by that name.
     #[tokio::test]
@@ -1465,6 +1510,40 @@ mod tests {
                     .contains("no spec source is named: a start takes --spec-file or --spec-store"),
             "{said}"
         );
+    }
+
+    /// A caller that drops the spec store call while its start waits on a
+    /// held directory leaves the task to bind the store once the holder
+    /// lets go: its series are bound with it, and a second call is refused
+    /// as a second source.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_spec_store_call_that_binds_later_leaves_its_series() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let holder = SpecStore::open(dir.path().to_owned()).expect("the holder");
+        let config = parse(&EPHEMERAL).config().expect("the flags are in order");
+        let mut controller = Controller::bind_with(config, Catalog::builtin())
+            .await
+            .expect("the controller binds");
+        let call = controller.spec_store(dir.path().to_owned());
+        let dropped = tokio::time::timeout(Duration::from_millis(200), call).await;
+        assert!(dropped.is_err(), "the call waits on the held directory");
+        drop(holder);
+        let bound = async {
+            while !controller.metrics.spec_bound() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), bound)
+            .await
+            .expect("the task binds the store with its series");
+        assert!(controller.shared.generations.bound());
+        match controller.spec_store(dir.path().to_owned()).await {
+            Err(Error::SpecStore {
+                source: StoreRefused::SecondSource,
+                ..
+            }) => {}
+            other => panic!("a second source: {other:?}"),
+        }
     }
 
     /// A spec store starts the controller on the newest generation on file,

@@ -420,6 +420,10 @@ mod handles {
 
 /// Describes the series this module writes. The gateway's list calls it.
 pub fn describe_series() {
+    describe_gauge!(
+        "smg_worker_pool_size",
+        "Current worker pool size by worker_type, connection_mode, model"
+    );
     describe_counter!(
         "smg_pd_rendezvous_failures_total",
         "PD rendezvous failures by side (the worker type of the side whose rendezvous failed) and phase: a bootstrap port that refused the registration probe (probe) or the same probe run when a decode side's engine failed a request without a reason (request, on the prefill side whose port it is), and the failures the engines report on the gRPC path when the sides never met (bootstrap) or the KV handoff after they met failed (transfer)"
@@ -467,7 +471,8 @@ pub fn describe_series() {
     describe_counter!(
         "smg_kv_event_batches_total",
         "KV event batches by worker and disposition (applied, stale, snapshot, load_only, \
-         other_rank, not_indexed: a batch of events on a stream opened for load records alone)"
+         other_rank, not_indexed: a batch of events on a stream opened for load records alone, \
+         or one whose rank fits no rank)"
     );
     describe_counter!(
         "smg_engine_load_polls_total",
@@ -726,6 +731,23 @@ impl Metrics {
             "phase" => phase
         )
         .increment(1);
+    }
+
+    /// Set worker pool size
+    pub fn set_worker_pool_size(
+        worker_type: &'static str,
+        connection_mode: &'static str,
+        model_id: &str,
+        size: usize,
+    ) {
+        let model = intern_model_label(model_id);
+        gauge!(
+            "smg_worker_pool_size",
+            "worker_type" => worker_type,
+            "connection_mode" => connection_mode,
+            "model" => model
+        )
+        .set(size as f64);
     }
 
     /// Record health check result

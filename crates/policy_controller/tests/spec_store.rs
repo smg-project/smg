@@ -458,8 +458,9 @@ fn a_start_that_names_no_spec_source_is_refused_naming_both_flags() {
 
 /// A start the store refuses exits with the refusal in its log: beside a
 /// spec file, by the two flags; beside a lease another replica can take; on
-/// a path that leads to no directory; and on a newest generation that does
-/// not run, by its number and its field. Nothing is served.
+/// a path that leads to no directory, to nothing or through a file; and on
+/// a newest generation that does not run, by its number and its field.
+/// Nothing is served.
 #[test]
 fn a_start_a_spec_store_refuses_exits_naming_why() {
     let dir = tempfile::tempdir().expect("a directory");
@@ -493,9 +494,12 @@ fn a_start_a_spec_store_refuses_exits_naming_why() {
         "{log}"
     );
 
-    let (code, log) = refused(&[OsStr::new("--spec-store"), nowhere.as_os_str()]);
-    assert_eq!(code, Some(1), "{log}");
-    assert!(log.contains("the path leads to no directory"), "{log}");
+    let through = file.join("store");
+    for path in [&nowhere, &through] {
+        let (code, log) = refused(&[OsStr::new("--spec-store"), path.as_os_str()]);
+        assert_eq!(code, Some(1), "{log}");
+        assert!(log.contains("the path leads to no directory"), "{log}");
+    }
 
     fs::write(store.join(name(1)), unweighed()).expect("a generation on file");
     let (code, log) = on_store(&[]);
@@ -504,4 +508,29 @@ fn a_start_a_spec_store_refuses_exits_naming_why() {
         log.contains("generation 1") && log.contains("profiles.default.score[0]"),
         "the generation and its field are named: {log}"
     );
+}
+
+/// A start on a spec store named through a link says the directory it
+/// holds: its line names the path as resolved, the one the line of a wait
+/// names.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_start_through_a_link_names_the_directory_it_holds() {
+    use std::os::unix::fs::symlink;
+
+    let base = tempfile::tempdir().expect("a directory");
+    let (dir, link) = (base.path().join("held"), base.path().join("link"));
+    fs::create_dir(&dir).expect("the directory");
+    symlink(&dir, &link).expect("the link");
+    let replica = start("store-link", &link);
+    let said = replica.logs(|replica| replica.logged("spec store")).await;
+    let log = replica.log();
+    assert!(said, "{log}");
+    let named = log
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|entry| entry["fields"]["message"] == "spec store")
+        .and_then(|entry| entry["fields"]["path"].as_str().map(str::to_owned));
+    let held = fs::canonicalize(&dir).expect("its path");
+    assert_eq!(named.as_deref(), held.to_str(), "{log}");
 }

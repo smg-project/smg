@@ -5,12 +5,6 @@
 //! # Performance Optimizations
 //! The model index uses immutable Arc snapshots instead of RwLock for lock-free reads.
 //! This is critical for high-concurrency scenarios where many requests query the same model.
-//!
-//! # Consistent Hash Ring
-//! The registry maintains a pre-computed [`HashRing`] per model for O(log n)
-//! consistent hashing. The ring is rebuilt only when workers are added or
-//! removed, not per request. See [`hash_ring`] for the ring
-//! itself — this file only wires registry events to ring rebuilds.
 
 #[cfg(any(test, feature = "test-util"))]
 use std::sync::mpsc as test_mpsc;
@@ -39,17 +33,13 @@ use crate::{
     metrics::writers::Metrics,
     metrics_labels,
     model_card::ModelCard,
-    registry::{
-        event::{WorkerConnected, WorkerEvent},
-        hash_ring::HashRing,
-    },
+    registry::event::{WorkerConnected, WorkerEvent},
     settings::RetryConfig,
     worker::WorkerStatus,
     UNKNOWN_MODEL_ID,
 };
 
 pub mod event;
-pub mod hash_ring;
 
 /// Unique identifier for a worker
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
@@ -157,13 +147,6 @@ type ModelAliasIndex = Arc<DashMap<String, Arc<str>, FxBuildHasher>>;
 /// lock ([`WorkerRegistry::remove_if`]).
 type RemovalCondition<'a> = &'a dyn Fn(&Arc<dyn Worker>) -> bool;
 
-#[cfg(any(test, feature = "test-util"))]
-#[derive(Debug, Default)]
-struct HashRingTestHooks {
-    before_rebuild: Option<test_mpsc::Sender<()>>,
-    after_snapshot: Option<(test_mpsc::Sender<()>, test_mpsc::Receiver<()>)>,
-}
-
 /// Pauses the next status transition after whatever its caller did outside
 /// the worker's mutation lock and before the lock is taken: the transition
 /// reports in, then waits to be let go. The interleaving proofs place
@@ -224,19 +207,6 @@ pub struct WorkerRegistry<G> {
     /// `model_index` while holding its own entry, so taking them in the other
     /// order somewhere else would deadlock.
     model_alias_index: ModelAliasIndex,
-
-    /// Consistent hash rings per model for O(log n) routing.
-    /// Rebuilt on worker add/remove (copy-on-write).
-    hash_rings: Arc<DashMap<String, Arc<HashRing>, FxBuildHasher>>,
-
-    /// Orders snapshots and publication for both per-model and wildcard rings.
-    /// Membership writers release their index guards before taking this lock;
-    /// routing readers never take it. Hold it through the wildcard rebuild so
-    /// a late publication cannot restore a superseded membership snapshot.
-    hash_ring_update: parking_lot::Mutex<()>,
-
-    #[cfg(any(test, feature = "test-util"))]
-    hash_ring_test_hooks: parking_lot::Mutex<HashRingTestHooks>,
 
     #[cfg(any(test, feature = "test-util"))]
     transition_test_hooks: parking_lot::Mutex<TransitionTestHooks>,
@@ -338,10 +308,6 @@ impl<G: Generation> WorkerRegistry<G> {
             global_membership_order: parking_lot::RwLock::new(()),
             global_routing_update: parking_lot::Mutex::new(()),
             model_alias_index: Arc::new(DashMap::with_hasher(FxBuildHasher)),
-            hash_rings: Arc::new(DashMap::with_hasher(FxBuildHasher)),
-            hash_ring_update: parking_lot::Mutex::new(()),
-            #[cfg(any(test, feature = "test-util"))]
-            hash_ring_test_hooks: parking_lot::Mutex::new(HashRingTestHooks::default()),
             #[cfg(any(test, feature = "test-util"))]
             transition_test_hooks: parking_lot::Mutex::new(TransitionTestHooks::default()),
             type_workers: Arc::new(DashMap::new()),
@@ -544,24 +510,6 @@ impl<G: Generation> WorkerRegistry<G> {
         self.url_to_id
             .iter()
             .find_map(|entry| (entry.value() == worker_id).then(|| entry.key().clone()))
-    }
-
-    /// Get the consistent hash ring for a model (O(1) lookup).
-    ///
-    /// Returns `Some(ring)` if any workers are registered for this model,
-    /// `None` otherwise. The ring is pre-built and updated on worker add
-    /// or remove, so reads are allocation-free apart from the Arc clone.
-    ///
-    /// Keyed by canonical model ID only, like every other per-model map on
-    /// this registry except [`Self::get_by_model`]. A caller holding a
-    /// client-supplied name resolves it with [`Self::resolve_model_alias`]
-    /// once at request entry and passes the canonical ID from there on.
-    ///
-    /// [`UNKNOWN_MODEL_ID`] returns the wildcard ring spanning every worker,
-    /// matching the candidate set a request that names no model is routed
-    /// against.
-    pub fn get_hash_ring(&self, model_id: &str) -> Option<Arc<HashRing>> {
-        self.hash_rings.get(model_id).map(|r| Arc::clone(&r))
     }
 
     // ───────────────────────────────────────────────────────────────────
@@ -1428,13 +1376,11 @@ impl<G: Generation> WorkerRegistry<G> {
         }
         for added_model in new_models.difference(&old_models) {
             self.add_worker_to_model_index(added_model, new_worker.clone());
-            self.rebuild_hash_ring(added_model);
             self.drop_alias_shadowed_by_model(added_model);
         }
         // For models that stayed the same, update the worker reference in the index
         for kept_model in old_models.intersection(&new_models) {
             self.add_worker_to_model_index(kept_model, new_worker.clone());
-            self.rebuild_hash_ring(kept_model);
         }
 
         // Update aliases after canonical indexes so alias removal can inspect
@@ -2091,7 +2037,7 @@ impl<G: Generation> WorkerRegistry<G> {
         }
 
         // The worker's series are kept for the time its address is
-        // registered (see `worker::metrics::series`). The builder's
+        // registered (see `metrics::series`). The builder's
         // writes for health, HTTP/2 and breaker state preceded this
         // registration and were dropped if the address was retired by an
         // earlier removal, so they are repeated here.
@@ -2108,7 +2054,6 @@ impl<G: Generation> WorkerRegistry<G> {
         // Update model index for O(1) lookups using copy-on-write.
         for model_id in worker_model_ids(&worker) {
             self.add_worker_to_model_index(&model_id, worker.clone());
-            self.rebuild_hash_ring(&model_id);
             // Run after the model index so `add_model_alias` below sees the
             // model IDs this worker just contributed, and never while an index
             // entry is held (see the lock order on `model_alias_index`).
@@ -2141,112 +2086,6 @@ impl<G: Generation> WorkerRegistry<G> {
         });
 
         Some(worker_id)
-    }
-
-    /// Reconcile the hash ring for a model to the current model index.
-    ///
-    /// Diffs against the cached ring so only changed URLs are rehashed: a
-    /// full rebuild is O(workers) hashing plus a sort on every mutation,
-    /// which at fleet scale turns a registration wave quadratic and
-    /// saturates the runtime.
-    fn rebuild_hash_ring(&self, model_id: &str) {
-        #[cfg(any(test, feature = "test-util"))]
-        #[expect(
-            clippy::expect_used,
-            reason = "test support: a hook nobody observes must fail the test that set it"
-        )]
-        if let Some(started) = self.hash_ring_test_hooks.lock().before_rebuild.take() {
-            started.send(()).expect("rebuild observer is listening");
-        }
-
-        // Different worker IDs may mutate the same model concurrently. Lock
-        // before reading membership, not just before inserting the ring: an
-        // older snapshot must never publish after a newer one has completed.
-        let _update = self.hash_ring_update.lock();
-
-        // Clone the copy-on-write slice out so the ring build never runs
-        // under the index shard guard.
-        let workers = self.model_index.get(model_id).map(|entry| entry.clone());
-
-        #[cfg(any(test, feature = "test-util"))]
-        #[expect(
-            clippy::expect_used,
-            reason = "test support: a hook nobody observes must fail the test that set it"
-        )]
-        {
-            let pause = self.hash_ring_test_hooks.lock().after_snapshot.take();
-            if let Some((started, resume)) = pause {
-                started.send(()).expect("snapshot observer is listening");
-                resume
-                    .recv_timeout(std::time::Duration::from_secs(10))
-                    .expect("test releases the paused snapshot");
-            }
-        }
-
-        match workers {
-            Some(workers) => {
-                let previous = self.hash_rings.get(model_id).map(|ring| Arc::clone(&ring));
-                let urls = workers.members().iter().map(|w| w.url());
-                let ring = match previous {
-                    Some(previous) => previous.updated(urls),
-                    None => HashRing::new(urls),
-                };
-                self.hash_rings.insert(model_id.to_string(), Arc::new(ring));
-            }
-            None => {
-                // No workers for this model, remove the ring
-                self.hash_rings.remove(model_id);
-            }
-        }
-
-        self.rebuild_wildcard_hash_ring();
-    }
-
-    /// Rebuild the ring stored under [`UNKNOWN_MODEL_ID`], which requests that
-    /// name no model are routed against. Those requests may land on any worker,
-    /// so the ring spans every model's workers, deduplicated by URL.
-    /// Called only by `rebuild_hash_ring` while holding `hash_ring_update`.
-    fn rebuild_wildcard_hash_ring(&self) {
-        let model_ids: Vec<String> = self
-            .model_index
-            .iter()
-            .map(|entry| entry.key().clone())
-            .collect();
-
-        match model_ids.as_slice() {
-            [] => {
-                self.hash_rings.remove(UNKNOWN_MODEL_ID);
-            }
-            // A single model already covers every worker, so share its ring
-            // instead of hashing the same URLs a second time.
-            [only] => {
-                let ring = self.hash_rings.get(only).map(|ring| Arc::clone(&ring));
-                match ring {
-                    Some(ring) => {
-                        self.hash_rings.insert(UNKNOWN_MODEL_ID.to_string(), ring);
-                    }
-                    None => {
-                        self.hash_rings.remove(UNKNOWN_MODEL_ID);
-                    }
-                }
-            }
-            _ => {
-                let mut urls: HashSet<String> = HashSet::new();
-                for entry in self.model_index.iter() {
-                    urls.extend(entry.value().members().iter().map(|w| w.url().to_string()));
-                }
-                let previous = self
-                    .hash_rings
-                    .get(UNKNOWN_MODEL_ID)
-                    .map(|ring| Arc::clone(&ring));
-                let ring = match previous {
-                    Some(previous) => previous.updated(&urls),
-                    None => HashRing::new(&urls),
-                };
-                self.hash_rings
-                    .insert(UNKNOWN_MODEL_ID.to_string(), Arc::new(ring));
-            }
-        }
     }
 
     /// Append `worker` to the copy-on-write model index slice for `model_id`.
@@ -2345,8 +2184,8 @@ impl<G: Generation> WorkerRegistry<G> {
         fresh
     }
 
-    /// Drop `worker_url` from the copy-on-write model index slice for `model_id`
-    /// and rebuild the hash ring. Evicts the whole model entry when empty.
+    /// Drop `worker_url` from the copy-on-write model index slice for
+    /// `model_id`. Evicts the whole model entry when empty.
     fn remove_worker_from_model_index(&self, model_id: &str, worker_url: &str) {
         let mut should_remove_entry = false;
         // As in add_worker_to_model_index: the replaced snapshot drops after
@@ -2382,8 +2221,6 @@ impl<G: Generation> WorkerRegistry<G> {
             self.model_index
                 .remove_if(model_id, |_, workers| workers.members().is_empty());
         }
-
-        self.rebuild_hash_ring(model_id);
     }
 
     fn add_model_alias(&self, alias: &str, canonical_id: &str) {
@@ -2602,68 +2439,6 @@ impl<G: Generation> WorkerRegistry<G> {
                 .expect("the paused transition is waiting");
             paused.join().expect("the transition did not panic")
         })
-    }
-
-    /// Test support for the ring's interleaving proofs. Pauses one real
-    /// membership operation after its model snapshot, then lets another
-    /// operation reach the rebuild, and says whether that one waited for the
-    /// first to publish. No sleep determines the ordering.
-    #[expect(
-        clippy::expect_used,
-        reason = "test support: a hook nobody observes must fail the test that set it"
-    )]
-    pub fn overlapping_hash_ring_updates(
-        self: &Arc<Self>,
-        first: impl FnOnce(&Self) + Send + 'static,
-        second: impl FnOnce(&Self) + Send + 'static,
-    ) -> bool {
-        use std::time::Duration;
-
-        let (snapshot_tx, snapshot_rx) = test_mpsc::channel();
-        let (resume_tx, resume_rx) = test_mpsc::channel();
-        self.hash_ring_test_hooks.lock().after_snapshot = Some((snapshot_tx, resume_rx));
-
-        let (first_done_tx, first_done_rx) = test_mpsc::channel();
-        let first_registry = Arc::clone(self);
-        let first_thread = std::thread::spawn(move || {
-            first(&first_registry);
-            first_done_tx.send(()).expect("first completion receiver");
-        });
-        snapshot_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("first update reaches its snapshot");
-
-        let (started_tx, started_rx) = test_mpsc::channel();
-        self.hash_ring_test_hooks.lock().before_rebuild = Some(started_tx);
-        let (second_done_tx, second_done_rx) = test_mpsc::channel();
-        let second_registry = Arc::clone(self);
-        let second_thread = std::thread::spawn(move || {
-            second(&second_registry);
-            second_done_tx.send(()).expect("second completion receiver");
-        });
-        started_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("second update changes membership and reaches the rebuild");
-
-        // The unfixed implementation completes the second publication here,
-        // before the first overwrites it with its stale snapshot. The fixed
-        // implementation must wait for the first publication to finish.
-        let blocked = matches!(
-            second_done_rx.recv_timeout(Duration::from_secs(1)),
-            Err(test_mpsc::RecvTimeoutError::Timeout)
-        );
-        resume_tx.send(()).expect("release first update");
-        first_done_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("first membership operation completes");
-        if blocked {
-            second_done_rx
-                .recv_timeout(Duration::from_secs(5))
-                .expect("second membership operation completes");
-        }
-        first_thread.join().expect("first update did not panic");
-        second_thread.join().expect("second update did not panic");
-        blocked
     }
 }
 

@@ -65,8 +65,9 @@ as of `tokenizer/src/*`.
 - Exposes `apply_chat_template` for JSON message payloads and template parameters.
 - Tells the control tokens a template writes from the same spellings typed into a request, for two
   kinds of checkpoint: one that ships its own vocabulary file beside the conversion, and one
-  whose template builds its control spellings (it never spells a control
-  token whole: it binds each to a name out of a constant of its own and writes the names). On
+  whose template builds its control spellings (it writes no control
+  token whole by itself, in one piece or in pieces side by side: it binds each to a name, out of
+  a constant of its own or spelled whole in that one statement, and writes the names). On
   `apply_chat_template_with_encoding` the template's tokens are tokens and a spelling typed into
   a message, a tool, a document or a template argument stays text, also when it is typed in two
   parts the template joins, and so does a text that only the pipeline's normalizer makes an
@@ -75,8 +76,14 @@ as of `tokenizer/src/*`.
   `encode` reads it alone and as it stands. The second kind is recognised at load from the
   template itself, and
   only when its syntax shows that every value it builds is only written (alone, in a join, or
-  asked whether it is empty), each of those values is one control spelling or empty, and the
-  marks cover every control it writes on a few probe conversations; any other checkpoint renders
+  asked whether it is empty), each of those values is empty, one control spelling, or a string
+  that begins with a control spelling and ends with one (that last kind only where the pipeline
+  matches every added token as it is spelled), each fits in one plain string literal (it holds
+  no newline or other control character, no backslash and not both kinds of quote), and the
+  marks cover every control it writes on a few probe conversations (under a pipeline that matches
+  an added token after normalization the flat `encode` is asked what it cuts out of the text a
+  template writes: one that writes a text the normalizer turns into an added token is left as it
+  is); any other checkpoint renders
   and encodes as before. The flat `encode` of a rendered text reads a spelling as its token.
 - GLM-5.3 and GLM-5.3-Flash use native Rust chat rendering when checkpoint metadata and
   the template matches the current official one. Any other template keeps MiniJinja.
@@ -252,138 +259,203 @@ without the gate.
 
 ### Against other implementations
 
-The tables below come from a comparative harness kept outside this repository (test data and reference binaries live
-outside the crates): one shared cell module compiled behind a small adapter per implementation, so every
-implementation runs the same cells on the same texts. What a cell measures:
+The tables below come from the comparative harness in [`benches/compare`](benches/compare/README.md), which says how
+to run it (the corpus is test data and lives outside the crates): one shared cell module compiled behind a small
+adapter per implementation, so every implementation runs the same cells on the same texts. What a cell measures:
 
 - **encode**: one process per implementation, family, text size and mode, pinned to one core; 3 warm-ups and 30
   timed encodes; the p50 of nanoseconds per token. *Cold* = every encode a different text (the class's 33 texts),
   *warm* = the same text every time. Three rounds, a round being one pass over the family list with the
-  implementations interleaved in a rotating order inside each cell; a cell is the median of its rounds. A margin is
+  implementations interleaved in a rotating order inside each cell, and five more rounds on the cells where SMG stands
+  within 10 % of its best reference; a cell is the median of its rounds. A margin is
   the reference's time divided by SMG's, minus one: positive means SMG is faster.
 - **decode**: a full decode of 2,048 ids of a 32k-token text (30 repetitions); the same ids stepped through one
   `Sequence` (incremental decode and the latency of the first delta); 64 interleaved streams of 256 steps (the step
   and the first delta as wall time).
 - **batch**: the first 1,000 texts of the parity corpus through `encode_batch` on one thread.
+- **load and memory**: one process per implementation and family: the load time and the resident memory after it, the
+  high-water mark after one encode of a 1M-token text, and the resident memory per thread with 64 threads alive: its
+  growth on one shared tokenizer, and its level with a tokenizer per thread, both counted from before the first thread
+  starts. These cells were read again in a second window with the corrected memory cell, which reads the resident
+  memory while every thread still holds its tokenizer.
 
-Implementations: **SMG 1.15.0** (this crate's release build); **SMG v1.14.0** (the previous release's crate under the
+Implementations: **SMG 1.16.0** (this crate's release build); **SMG v1.15.0** (the previous release's crate under the
 same harness); **fastokens**: the open-source Rust tokenizer stack built on `fastokens` 0.3.5 (`riptoken` 0.3.0 for
 tiktoken files, `tekken` 0.2.0 for `tekken.json`, `tokenizers` 0.22.2 where those decline a file), pinned at one
 commit; **v1**: this crate built with `--features tokenizers-v1`, so the `tokenizers` 1.0.0-rc.3 pipeline encodes and
-everything else is shared, which isolates the encoder. Where the v1 pipeline declines a file (an NFC normalizer, a
-tiktoken file, `tekken.json`, WordPiece, Unigram) its build runs SMG's own path and the column reads `-`.
+everything else is shared, which isolates the encoder. Where the v1 pipeline declines a file (a
+tiktoken file, `tekken.json`, WordPiece, Unigram) its build takes its next encode path (SMG's own; the `tokenizers`
+crate's for Unigram) and the column reads `-`. The csv files hold two more reference columns that the tables leave
+out: the `tokenizers` crate 0.23.2 through its default pipeline, and `tiktoken-rs` 0.12.1 on gpt-oss and Kimi K3.
 
-Corpus: 33 texts per size class of about 256, 2,000, 32,000, 128,000 and 500,000 tokens (counted with the DeepSeek
-V4.1 vocabulary), assembled from public text: XL-Sum news articles in Arabic, Chinese, English, Hindi, Japanese,
-Korean, Russian and Thai, and open-source code in six languages; 14 to 19 % of the bytes are outside ASCII.
+Corpus: 33 texts per size class of about 256, 2,000, 32,000, 128,000, 500,000 and 1,000,000 tokens (counted with the
+DeepSeek V4.1 vocabulary; a 1M text is two 500k texts joined), assembled from public text: XL-Sum news articles in Arabic, Chinese, English, Hindi, Japanese,
+Korean, Russian and Thai, and open-source code and configuration (Rust, Python, Go, shell, C, Jinja templates, TOML and YAML,
+protobuf, JSON) with generated tool-call payloads; 17 to 39 % of the bytes of a size class are outside ASCII.
 
 Families: the tokenizer files of sixteen public checkpoints. Ten byte-level BPE vocabularies (DeepSeek V4.1 Flash,
 DeepSeek V3.2, Llama 3.2, Llama 4 Scout, gpt-oss, Qwen3.6, GLM-5.3 Flash, MiniMax M3, MiMo V2.6, and Ministral 3 through
 its `tekken.json`), three byte-fallback BPE vocabularies (Gemma 3, Gemma 4, Llama 2), a tiktoken file (Kimi K3), and
-two of the `tokenizers` crate's other model types (BERT base, WordPiece; T5 small, Unigram), which SMG and the
-reference both hand to that crate.
+two of the `tokenizers` crate's other model types (BERT base, WordPiece; T5 small, Unigram): SMG encodes
+BERT base itself since 1.16.0 and hands T5 small to that crate, and the reference hands it both.
 
-Setup: one x86-64 core per cell with its sibling idle, release builds (opt-level 3, fat LTO, one codegen unit), three
-rounds, medians. Measured on the SMG 1.15.0 release candidate: the encode tables on commit 1e34e4481 (2026-11-09), the decode and streaming table on 173a21639 (2026-11-10; the byte-level decode's buffer sizing is the only change to this crate between the two); v1.14.0 is the crate at the `v1.14.0` tag. Numbers are nanoseconds per token unless the column says otherwise. Two builds of one source differ by up to about
-20 % on a cell from code placement alone (the v1 build shares SMG's decode and streaming code, and those cells read -20 to
-+9 % between the two builds), so a margin inside that band, the placement band below, is not a difference between implementations.
+Setup: one x86-64 core per cell with its sibling idle, release builds (opt-level 3, fat LTO, one codegen unit; the
+fastokens stack under its own workspace's profile, thin LTO), three rounds and eight on the edge cells, medians. Measured
+on the SMG 1.16.0 release candidate, commit 378df2a52 (2026-11-18); v1.15.0 is the crate at the `v1.15.0` tag, built by
+the same toolchain. Other work ran on the machine's other cores during part of the run, so absolute figures may read
+high; the implementations of a cell run within the same minute, so the margins hold. Numbers are nanoseconds per token
+unless the column says otherwise. Two builds of one source differ by about 20 % on a cell from code placement alone (the
+reading list below gives this run's range), so a margin inside that band, the placement band below, is not a
+difference between implementations.
 
 #### Encode, cold (ns per token; in brackets the margin vs fastokens / vs v1, in %)
 
-| family | vocabulary | 256 | 2k | 32k | 128k | 500k |
-|---|---|---|---|---|---|---|
-| DeepSeek V4.1 | byte-level BPE | 114.7 (-52 / +5) | 105.8 (-50 / -2) | 98.3 (-46 / +36) | 85.4 (-42 / +47) | 68.6 (-46 / +79) |
-| DeepSeek V3.2 | byte-level BPE | 115.8 (-54 / -0) | 102.1 (-42 / -2) | 87.9 (-35 / +39) | 78.4 (-35 / +54) | 66.6 (-41 / +90) |
-| Llama 3.2 | byte-level BPE | 107.8 (-56 / -6) | 98.7 (-42 / +0) | 82.7 (-40 / +35) | 73.0 (-43 / +58) | 55.5 (-48 / +101) |
-| Llama 4 | byte-level BPE | 120.4 (-55 / -5) | 127.6 (-34 / +7) | 114.5 (-35 / +36) | 91.2 (-25 / +73) | 79.1 (-39 / +86) |
-| gpt-oss | byte-level BPE | 117.9 (-61 / +17) | 104.9 (-39 / +21) | 94.0 (-30 / +60) | 80.4 (-21 / +93) | 72.8 (-37 / +105) |
-| Qwen 3.6 | byte-level BPE | 120.2 (-52 / -) | 115.1 (-41 / -) | 104.3 (-29 / -) | 93.6 (-24 / -) | 85.7 (-37 / -) |
-| GLM-5.3 | byte-level BPE | 126.5 (-62 / -10) | 95.1 (-55 / -3) | 76.4 (-40 / +43) | 59.4 (-40 / +76) | 53.1 (-48 / +77) |
-| MiniMax M3 | byte-level BPE | 109.2 (-58 / +5) | 97.5 (-24 / +10) | 93.7 (-36 / +97) | 77.8 (-29 / +113) | 69.0 (-29 / +149) |
-| MiMo V2.6 | byte-level BPE | 102.2 (-50 / -0) | 97.0 (-37 / +7) | 76.3 (-35 / +114) | 72.0 (-31 / +126) | 64.2 (-38 / +146) |
-| Mistral (tekken) | byte-level BPE (tekken.json) | 114.2 (+626 / -) | 111.2 (+572 / -) | 92.2 (+716 / -) | 74.0 (+930 / -) | 64.8 (+1052 / -) |
-| Gemma 3 | byte-fallback BPE | 213.2 (+81 / +177) | 139.2 (+156 / +242) | 125.0 (+151 / +262) | 109.8 (+146 / +296) | 104.4 (+126 / +321) |
-| Gemma 4 | byte-fallback BPE | 186.5 (+92 / +189) | 135.8 (+146 / +285) | 109.9 (+174 / +448) | 105.5 (+136 / +592) | 83.6 (+151 / +871) |
-| Llama 2 (byte fallback) | byte-fallback BPE | 136.7 (+132 / +151) | 54.7 (+122 / +305) | 29.9 (+229 / +778) | 25.4 (+232 / +1399) | 21.9 (+217 / +1757) |
-| Kimi K3 | tiktoken file | 202.6 (+32 / -) | 159.9 (+38 / -) | 136.7 (+84 / -) | 129.8 (+99 / -) | 106.7 (+137 / -) |
-| BERT base | WordPiece | 1219.4 (+5 / -) | 1055.6 (+1 / -) | 1085.3 (+2 / -) | 1158.6 (+6 / -) | 1400.3 (-3 / -) |
-| T5 small | Unigram | 1867.7 (+8 / -) | 1628.3 (+7 / -) | 1829.4 (+11 / -) | 1938.7 (+5 / -) | 2017.2 (+5 / -) |
+| family | vocabulary | 256 | 2k | 32k | 128k | 500k | 1m |
+|---|---|---|---|---|---|---|---|
+| DeepSeek V4.1 | byte-level BPE | 81.5 (-40 / +43) | 81.7 (-39 / +9) | 61.8 (-22 / +65) | 61.9 (-28 / +80) | 52.7 (-34 / +115) | 39.3 (-33 / +179) |
+| DeepSeek V3.2 | byte-level BPE | 77.7 (-24 / +56) | 83.6 (-29 / +14) | 67.5 (-20 / +83) | 62.1 (-21 / +84) | 51.6 (-28 / +116) | 36.7 (-14 / +216) |
+| Llama 3.2 | byte-level BPE | 73.8 (-40 / +36) | 79.9 (-36 / +17) | 63.7 (-24 / +58) | 52.2 (-26 / +89) | 43.5 (-36 / +137) | 33.8 (-29 / +202) |
+| Llama 4 | byte-level BPE | 85.3 (-36 / +35) | 102.7 (-28 / +17) | 89.3 (-27 / +58) | 73.9 (-10 / +96) | 69.0 (-34 / +116) | 48.1 (-17 / +201) |
+| gpt-oss | byte-level BPE | 82.2 (-38 / +43) | 87.8 (-26 / +35) | 86.7 (-26 / +65) | 79.0 (-20 / +92) | 62.4 (-29 / +147) | 46.5 (-22 / +224) |
+| Qwen 3.6 | byte-level BPE | 73.6 (-18 / +261) | 75.8 (-3 / +238) | 81.3 (-8 / +299) | 70.5 (+0 / +331) | 64.0 (-13 / +386) | 47.4 (-4 / +565) |
+| GLM-5.3 | byte-level BPE | 78.1 (-39 / +37) | 74.9 (-43 / +18) | 57.6 (-20 / +84) | 44.3 (-22 / +120) | 41.8 (-35 / +135) | 32.8 (-27 / +198) |
+| MiniMax M3 | byte-level BPE | 83.8 (-39 / +33) | 93.8 (-24 / +16) | 79.9 (-23 / +123) | 65.2 (-14 / +160) | 53.1 (-10 / +215) | 42.2 (-1 / +291) |
+| MiMo V2.6 | byte-level BPE | 69.0 (-36 / +54) | 76.1 (-23 / +29) | 62.6 (-19 / +165) | 50.8 (-7 / +192) | 46.2 (-12 / +229) | 38.9 (+10 / +298) |
+| Mistral (tekken) | byte-level BPE (tekken.json) | 79.4 (+867 / -) | 99.2 (+645 / -) | 74.1 (+920 / -) | 61.5 (+1138 / -) | 52.2 (+1342 / -) | 42.0 (+1647 / -) |
+| Gemma 3 | byte-fallback BPE | 166.5 (+160 / +232) | 126.7 (+161 / +287) | 133.2 (+148 / +231) | 99.0 (+177 / +326) | 87.4 (+178 / +410) | 64.8 (+185 / +582) |
+| Gemma 4 | byte-fallback BPE | 168.5 (+104 / +231) | 130.9 (+138 / +301) | 104.7 (+171 / +458) | 95.6 (+164 / +674) | 82.8 (+166 / +855) | 60.3 (+175 / +1250) |
+| Llama 2 (byte fallback) | byte-fallback BPE | 115.9 (+136 / +168) | 46.0 (+150 / +368) | 28.0 (+232 / +914) | 20.6 (+276 / +1505) | 19.1 (+247 / +1935) | 17.7 (+299 / +2120) |
+| Kimi K3 | tiktoken file | 142.9 (+87 / -) | 132.9 (+66 / -) | 109.2 (+131 / -) | 101.3 (+144 / -) | 85.2 (+199 / -) | 81.3 (+206 / -) |
+| BERT base | WordPiece | 106.8 (+1080 / -) | 88.3 (+1085 / -) | 96.4 (+1076 / -) | 103.1 (+1078 / -) | 104.6 (+1301 / -) | 101.2 (+1368 / -) |
+| T5 small | Unigram | 1563.8 (+9 / -) | 1528.2 (+15 / -) | 1668.3 (+25 / -) | 1559.9 (+23 / -) | 1610.1 (+26 / -) | 1721.2 (+22 / -) |
 
 #### Encode, warm (ns per token; in brackets the margin vs fastokens / vs v1, in %)
 
-| family | vocabulary | 256 | 2k | 32k | 128k | 500k |
-|---|---|---|---|---|---|---|
-| DeepSeek V4.1 | byte-level BPE | 14.9 (+28 / +36) | 13.4 (+39 / +18) | 24.6 (-20 / +493) | 28.5 (-24 / +335) | 33.5 (-35 / +255) |
-| DeepSeek V3.2 | byte-level BPE | 14.7 (+38 / +37) | 13.0 (+97 / +21) | 23.7 (-2 / +557) | 28.2 (-9 / +373) | 33.7 (-27 / +266) |
-| Llama 3.2 | byte-level BPE | 11.6 (+17 / +19) | 8.7 (+96 / +28) | 22.1 (-29 / +461) | 24.1 (-28 / +382) | 29.5 (-37 / +254) |
-| Llama 4 | byte-level BPE | 17.8 (+18 / +71) | 9.9 (+103 / +74) | 22.3 (-14 / +718) | 28.1 (+18 / +463) | 32.9 (-31 / +375) |
-| gpt-oss | byte-level BPE | 15.7 (+18 / +64) | 9.2 (+73 / +72) | 22.0 (-16 / +728) | 25.6 (+9 / +531) | 30.9 (+0 / +401) |
-| Qwen 3.6 | byte-level BPE | 22.9 (+53 / -) | 11.3 (+113 / -) | 33.8 (-8 / -) | 38.5 (-24 / -) | 42.2 (-15 / -) |
-| GLM-5.3 | byte-level BPE | 14.7 (+19 / +46) | 9.7 (+95 / +42) | 20.2 (-28 / +382) | 26.3 (-30 / +312) | 29.2 (-34 / +260) |
-| MiniMax M3 | byte-level BPE | 17.6 (+48 / +178) | 12.6 (+127 / +141) | 28.2 (-8 / +524) | 38.7 (-27 / +374) | 38.5 (+17 / +372) |
-| MiMo V2.6 | byte-level BPE | 16.1 (+46 / +122) | 10.5 (+109 / +76) | 29.8 (-22 / +444) | 38.8 (-36 / +362) | 38.7 (-21 / +343) |
-| Mistral (tekken) | byte-level BPE (tekken.json) | 13.0 (+5713 / -) | 8.8 (+6692 / -) | 19.5 (+3718 / -) | 27.6 (+2547 / -) | 30.4 (+2419 / -) |
-| Gemma 3 | byte-fallback BPE | 12.0 (+396 / +30) | 8.9 (+427 / +71) | 22.7 (+381 / +1749) | 34.3 (+252 / +1173) | 36.0 (+228 / +1107) |
-| Gemma 4 | byte-fallback BPE | 11.9 (+295 / -10) | 8.2 (+300 / -9) | 15.5 (+458 / -19) | 19.8 (+414 / +3535) | 25.8 (+263 / +2833) |
-| Llama 2 (byte fallback) | byte-fallback BPE | 9.5 (+243 / -38) | 8.1 (+234 / -50) | 14.7 (+208 / -60) | 17.4 (+229 / +1796) | 18.8 (+179 / +1884) |
-| Kimi K3 | tiktoken file | 37.0 (+478 / -) | 51.1 (+158 / -) | 61.3 (+357 / -) | 77.4 (+225 / -) | 79.2 (+223 / -) |
-| BERT base | WordPiece | 694.9 (+3 / -) | 1006.0 (+2 / -) | 1016.2 (+11 / -) | 1148.5 (+5 / -) | 1432.8 (-2 / -) |
-| T5 small | Unigram | 442.9 (+7 / -) | 1161.6 (+6 / -) | 1402.9 (+23 / -) | 1684.6 (+4 / -) | 1993.3 (+7 / -) |
+| family | vocabulary | 256 | 2k | 32k | 128k | 500k | 1m |
+|---|---|---|---|---|---|---|---|
+| DeepSeek V4.1 | byte-level BPE | 11.6 (+70 / +79) | 9.4 (+106 / +68) | 12.7 (+56 / +955) | 16.2 (+27 / +735) | 20.0 (+5 / +488) | 21.5 (+1 / +441) |
+| DeepSeek V3.2 | byte-level BPE | 11.7 (+79 / +77) | 9.4 (+188 / +69) | 12.7 (+87 / +803) | 16.1 (+53 / +670) | 19.8 (+22 / +455) | 22.5 (+14 / +449) |
+| Llama 3.2 | byte-level BPE | 9.2 (+48 / +55) | 7.1 (+146 / +59) | 14.2 (+9 / +630) | 15.2 (+10 / +650) | 19.2 (-2 / +430) | 22.5 (-14 / +366) |
+| Llama 4 | byte-level BPE | 14.3 (+47 / +117) | 9.1 (+130 / +91) | 16.4 (+21 / +1054) | 19.6 (+52 / +700) | 23.0 (-4 / +530) | 25.3 (+9 / +489) |
+| gpt-oss | byte-level BPE | 12.4 (+48 / +112) | 8.2 (+93 / +90) | 15.6 (+13 / +970) | 18.1 (+53 / +779) | 23.2 (+35 / +516) | 26.9 (+21 / +483) |
+| Qwen 3.6 | byte-level BPE | 18.1 (+85 / +691) | 8.5 (+194 / +1164) | 17.0 (+84 / +1881) | 18.9 (+64 / +1593) | 25.8 (+45 / +1160) | 30.2 (+26 / +958) |
+| GLM-5.3 | byte-level BPE | 11.6 (+51 / +89) | 7.7 (+151 / +82) | 12.8 (+11 / +653) | 15.6 (+15 / +613) | 19.1 (-5 / +404) | 22.5 (-13 / +348) |
+| MiniMax M3 | byte-level BPE | 14.6 (+69 / +229) | 10.8 (+176 / +178) | 17.6 (+50 / +880) | 22.0 (+30 / +730) | 31.7 (+41 / +455) | 28.6 (+44 / +528) |
+| MiMo V2.6 | byte-level BPE | 13.2 (+68 / +161) | 7.9 (+196 / +130) | 17.0 (+40 / +861) | 18.1 (+31 / +833) | 24.8 (+29 / +553) | 26.8 (+20 / +524) |
+| Mistral (tekken) | byte-level BPE (tekken.json) | 10.7 (+6744 / -) | 7.8 (+6873 / -) | 14.3 (+5284 / -) | 16.8 (+4318 / -) | 20.3 (+3587 / -) | 22.4 (+3179 / -) |
+| Gemma 3 | byte-fallback BPE | 10.0 (+499 / +57) | 7.7 (+515 / +88) | 15.4 (+762 / +2660) | 20.4 (+508 / +2138) | 23.9 (+356 / +1697) | 26.5 (+389 / +1538) |
+| Gemma 4 | byte-fallback BPE | 9.6 (+396 / +10) | 7.0 (+368 / -2) | 13.4 (+358 / -7) | 16.4 (+520 / +4465) | 22.3 (+321 / +3397) | 22.4 (+400 / +3186) |
+| Llama 2 (byte fallback) | byte-fallback BPE | 7.7 (+309 / -40) | 7.3 (+276 / -55) | 13.3 (+183 / -63) | 14.1 (+297 / +1854) | 16.1 (+217 / +2141) | 15.6 (+290 / +2212) |
+| Kimi K3 | tiktoken file | 24.1 (+792 / -) | 35.3 (+260 / -) | 42.9 (+546 / -) | 51.9 (+413 / -) | 56.7 (+355 / -) | 60.5 (+339 / -) |
+| BERT base | WordPiece | 103.6 (+602 / -) | 69.6 (+1266 / -) | 99.0 (+1120 / -) | 99.5 (+1099 / -) | 101.9 (+1184 / -) | 102.3 (+1288 / -) |
+| T5 small | Unigram | 375.1 (+26 / -) | 1012.2 (+22 / -) | 1281.5 (+35 / -) | 1392.2 (+21 / -) | 1592.8 (+30 / -) | 1641.2 (+24 / -) |
 
-#### v1.14.0 to 1.15.0 (change in ns per token; negative = 1.15.0 faster)
+#### v1.15.0 to 1.16.0 (change in ns per token; negative = 1.16.0 faster)
 
-| family | cold: median change (range over the five sizes) | warm: median change (range) |
+| family | cold: median change (range over the six sizes) | warm: median change (range) |
 |---|---|---|
-| DeepSeek V4.1 | -82.9 % (-86.9 % .. -79.2 %) | -90.8 % (-94.4 % .. -82.3 %) |
-| DeepSeek V3.2 | -84.2 % (-87.6 % .. -80.8 %) | -91.0 % (-94.4 % .. -82.7 %) |
-| Llama 3.2 | -94.6 % (-96.7 % .. -92.1 %) | -98.5 % (-99.0 % .. -98.3 %) |
-| Llama 4 | -94.0 % (-95.7 % .. -91.0 %) | -98.4 % (-99.0 % .. -98.2 %) |
-| gpt-oss | -82.1 % (-85.7 % .. -70.7 %) | -89.1 % (-94.6 % .. -82.2 %) |
-| Qwen 3.6 | -86.5 % (-96.5 % .. -82.0 %) | -78.1 % (-98.3 % .. -76.8 %) |
-| GLM-5.3 | -76.0 % (-84.6 % .. -67.4 %) | -79.5 % (-92.7 % .. -64.8 %) |
-| MiniMax M3 | -87.6 % (-96.7 % .. -84.1 %) | -87.4 % (-98.1 % .. -82.7 %) |
-| MiMo V2.6 | -87.7 % (-97.0 % .. -80.9 %) | -79.0 % (-98.2 % .. -75.9 %) |
-| Mistral (tekken) | -77.9 % (-85.6 % .. -67.9 %) | -89.4 % (-93.7 % .. -81.2 %) |
-| Gemma 3 | -90.3 % (-92.5 % .. -86.8 %) | -98.0 % (-99.0 % .. -97.2 %) |
-| Gemma 4 | -93.7 % (-96.6 % .. -88.3 %) | -99.0 % (-99.2 % .. -98.4 %) |
-| Llama 2 (byte fallback) | -96.7 % (-98.6 % .. -85.5 %) | -98.1 % (-98.5 % .. -97.7 %) |
-| Kimi K3 | -59.6 % (-67.3 % .. -53.1 %) | -76.8 % (-85.5 % .. -76.1 %) |
-| BERT base | +1.0 % (-3.9 % .. +2.7 %) | +0.2 % (-0.1 % .. +5.2 %) |
-| T5 small | +0.6 % (-0.6 % .. +4.4 %) | -1.3 % (-2.8 % .. +1.8 %) |
+| DeepSeek V4.1 | -18.2 % (-26.1 % .. -12.9 %) | -35.2 % (-45.5 % .. -20.3 %) |
+| DeepSeek V3.2 | -21.7 % (-29.9 % .. -10.6 %) | -34.8 % (-45.4 % .. -16.8 %) |
+| Llama 3.2 | -20.1 % (-24.4 % .. -12.8 %) | -26.3 % (-33.6 % .. -14.2 %) |
+| Llama 4 | -16.2 % (-20.8 % .. -9.6 %) | -19.4 % (-25.6 % .. -5.7 %) |
+| gpt-oss | -11.8 % (-20.3 % .. -5.4 %) | -21.9 % (-27.4 % .. -8.2 %) |
+| Qwen 3.6 | -22.9 % (-29.5 % .. -14.6 %) | -33.2 % (-50.7 % .. -12.8 %) |
+| GLM-5.3 | -17.8 % (-28.7 % .. -17.1 %) | -24.3 % (-32.4 % .. -14.2 %) |
+| MiniMax M3 | -17.8 % (-21.0 % .. +2.0 %) | -22.8 % (-37.8 % .. -12.0 %) |
+| MiMo V2.6 | -23.5 % (-26.6 % .. -13.9 %) | -29.9 % (-44.3 % .. -13.8 %) |
+| Mistral (tekken) | -11.9 % (-22.8 % .. -0.2 %) | -23.1 % (-25.0 % .. -6.5 %) |
+| Gemma 3 | -14.6 % (-19.9 % .. -8.2 %) | -31.3 % (-37.9 % .. -12.1 %) |
+| Gemma 4 | -9.6 % (-13.0 % .. -4.4 %) | -13.8 % (-21.1 % .. -10.5 %) |
+| Llama 2 (byte fallback) | -10.6 % (-12.2 % .. -5.7 %) | -9.9 % (-16.9 % .. -3.3 %) |
+| Kimi K3 | -21.1 % (-24.2 % .. -17.6 %) | -29.8 % (-37.6 % .. -24.3 %) |
+| BERT base | -91.4 % (-92.9 % .. -91.0 %) | -91.9 % (-92.8 % .. -85.2 %) |
+| T5 small | -11.2 % (-15.4 % .. +1.1 %) | -12.8 % (-14.6 % .. -8.8 %) |
 
-#### Decode and streaming (read on commit 173a21639; ns per token or ns per step; in brackets the margin vs fastokens, in %; the v1 build shares SMG's decode and streaming code, so it has no margin there; the batch column, an `encode_batch`, carries the margin vs fastokens / vs v1; the v1 half reads `-` for Qwen 3.6, Mistral (tekken), Kimi K3, BERT base and T5 small, whose files the v1 pipeline declines: both builds ran the same encoder there, as in the encode tables)
+#### Decode and streaming (ns per token or ns per step; in brackets the margin vs fastokens, in %; the batch column, in Mtok/s, carries the margin vs fastokens / vs v1)
 
 | family | full decode, 2,048 ids | incremental decode, 2,048 ids | first delta of one stream | 64 streams: step | 64 streams: first delta | batch of 1,000 texts, one thread (Mtok/s) |
 |---|---|---|---|---|---|---|
-| DeepSeek V4.1 | 9.5 (+227) | 90.3 (+275) | 50.0 (+440) | 50.0 (+380) | 110.0 (+739) | 40.2 (-10 / +310) |
-| DeepSeek V3.2 | 9.8 (+222) | 89.6 (+275) | 50.0 (+442) | 50.0 (+380) | 110.0 (+720) | 41.5 (+4 / +320) |
-| Llama 3.2 | 8.7 (+243) | 90.3 (+254) | 50.0 (+440) | 41.0 (+485) | 110.0 (+291) | 35.0 (-29 / +186) |
-| Llama 4 | 9.4 (+249) | 90.1 (+282) | 50.0 (+440) | 50.0 (+382) | 110.0 (+328) | 31.3 (-14 / +332) |
-| gpt-oss | 9.5 (+222) | 90.9 (+266) | 50.0 (+440) | 50.0 (+380) | 110.0 (+492) | 29.4 (-8 / +279) |
-| Qwen 3.6 | 9.9 (+228) | 88.8 (+278) | 50.0 (+422) | 40.0 (+475) | 130.0 (+262) | 20.4 (-15 / -) |
-| GLM-5.3 | 6.9 (+263) | 88.0 (+224) | 50.0 (+442) | 50.0 (+362) | 120.0 (+250) | 45.0 (-26 / +242) |
-| MiniMax M3 | 7.1 (+241) | 94.9 (+210) | 50.0 (+422) | 50.0 (+380) | 120.0 (+325) | 22.5 (-15 / +216) |
-| MiMo V2.6 | 8.7 (+223) | 90.5 (+238) | 50.0 (+440) | 41.0 (+463) | 121.0 (+240) | 27.8 (-27 / +173) |
-| Mistral (tekken) | 8.5 (-) | 95.6 (-) | 70.0 (-) | 40.0 (+775) | 120.0 (+1052) | 32.8 (+2408 / -) |
-| Gemma 3 | 16.7 (+518) | 106.0 (+489) | 261.0 (+211) | 60.0 (+835) | 430.0 (+68) | 28.0 (+297 / +1001) |
-| Gemma 4 | 16.2 (+565) | 105.8 (+487) | 251.0 (+208) | 60.0 (+835) | 421.0 (+64) | 25.7 (+226 / +985) |
-| Llama 2 (byte fallback) | 14.2 (+648) | 122.7 (+511) | 251.0 (+283) | 60.0 (+1035) | 401.0 (+130) | 64.9 (+139 / +376) |
-| Kimi K3 | 7.5 (+19) | 94.6 (+180) | 50.0 (+340) | 40.0 (+425) | 130.0 (+224) | 14.9 (+211 / -) |
-| BERT base | 686.9 (-19) | 2168.7 (-18) | 1522.0 (-22) | 2053.0 (-20) | 1682.0 (-14) | 1.3 (+1 / -) |
-| T5 small | 110.0 (+13) | 428.9 (+4) | 380.0 (-8) | 350.0 (+12) | 531.0 (+13) | 0.7 (+9 / -) |
+| DeepSeek V4.1 | 8.6 (+268) | 90.9 (+270) | 50.0 (+460) | 41.0 (+485) | 110.0 (+619) | 48.1 (+4 / +372) |
+| DeepSeek V3.2 | 8.4 (+281) | 89.5 (+283) | 50.0 (+460) | 50.0 (+382) | 111.0 (+821) | 56.0 (+36 / +426) |
+| Llama 3.2 | 7.8 (+284) | 89.1 (+267) | 50.0 (+460) | 40.0 (+500) | 120.0 (+251) | 44.3 (-13 / +277) |
+| Llama 4 | 8.1 (+303) | 89.2 (+295) | 50.0 (+460) | 50.0 (+400) | 110.0 (+401) | 40.9 (+9 / +424) |
+| gpt-oss | 8.4 (+273) | 88.9 (+278) | 50.0 (+462) | 41.0 (+488) | 110.0 (+474) | 36.9 (+7 / +372) |
+| Qwen 3.6 | 8.3 (+296) | 88.5 (+292) | 50.0 (+460) | 40.0 (+500) | 121.0 (+298) | 31.2 (+28 / +687) |
+| GLM-5.3 | 6.5 (+290) | 87.7 (+235) | 50.0 (+460) | 41.0 (+485) | 110.0 (+274) | 53.6 (-9 / +293) |
+| MiniMax M3 | 6.6 (+268) | 94.9 (+210) | 50.0 (+460) | 40.0 (+500) | 121.0 (+305) | 31.2 (+16 / +328) |
+| MiMo V2.6 | 7.6 (+274) | 88.6 (+257) | 50.0 (+460) | 41.0 (+488) | 121.0 (+240) | 38.6 (-1 / +268) |
+| Mistral (tekken) | 7.6 (-) | 89.1 (-) | 50.0 (-) | 40.0 (+752) | 241.0 (+453) | 37.7 (+2693 / -) |
+| Gemma 3 | 15.9 (+562) | 105.6 (+498) | 260.0 (+212) | 51.0 (+1000) | 391.0 (+82) | 36.1 (+389 / +1296) |
+| Gemma 4 | 15.7 (+564) | 104.5 (+502) | 250.0 (+216) | 51.0 (+980) | 390.0 (+75) | 44.7 (+440 / +1642) |
+| Llama 2 (byte fallback) | 13.5 (+668) | 119.8 (+532) | 270.0 (+263) | 60.0 (+1070) | 401.0 (+130) | 70.5 (+150 / +403) |
+| Kimi K3 | 6.9 (+32) | 91.4 (+195) | 50.0 (+340) | 40.0 (+428) | 130.0 (+224) | 23.4 (+386 / -) |
+| BERT base | 6.6 (+8399) | 96.2 (+1765) | 211.0 (+464) | 50.0 (+3286) | 320.0 (+367) | 9.9 (+682 / -) |
+| T5 small | 6.7 (+1756) | 108.0 (+337) | 210.0 (+72) | 60.0 (+600) | 361.0 (+78) | 0.7 (+13 / -) |
 
-Ministral (`tekken.json`): the reference's single-sequence decode cell aborts in every round (its decode of a window that
-ends inside a character panics), so the full decode, incremental decode and first-delta cells have no reference value; its
-64-stream cell ran to the end on this text with every stream's text equal to the full decode, so those two margins are
-like-for-like.
+#### Decode, streaming and batch: v1.15.0 to 1.16.0 (change in time; negative = 1.16.0 faster; the batch column is the change in tokens per second, where positive = 1.16.0 faster)
+
+| family | full decode, 2,048 ids | incremental decode, 2,048 ids | first delta of one stream | 64 streams: step | 64 streams: first delta | batch of 1,000 texts, one thread |
+|---|---|---|---|---|---|---|
+| DeepSeek V4.1 | -9.9 % | +1.5 % | +0.0 % | -18.0 % | -0.9 % | +15.6 % |
+| DeepSeek V3.2 | -5.3 % | +0.3 % | +0.0 % | +0.0 % | +0.0 % | +28.3 % |
+| Llama 3.2 | -8.7 % | +0.2 % | +0.0 % | -20.0 % | +9.1 % | +14.7 % |
+| Llama 4 | -12.2 % | -1.3 % | +0.0 % | +0.0 % | -0.9 % | +19.2 % |
+| gpt-oss | -7.0 % | -0.3 % | +0.0 % | -18.0 % | -0.9 % | +14.1 % |
+| Qwen 3.6 | -7.5 % | -0.3 % | +0.0 % | +0.0 % | +0.0 % | +40.0 % |
+| GLM-5.3 | -9.2 % | +0.2 % | +0.0 % | -18.0 % | -15.4 % | +13.9 % |
+| MiniMax M3 | -4.9 % | +0.4 % | +0.0 % | -20.0 % | +0.8 % | +29.2 % |
+| MiMo V2.6 | -6.8 % | +0.3 % | +0.0 % | -18.0 % | -6.9 % | +32.6 % |
+| Mistral (tekken) | -12.9 % | +0.1 % | +0.0 % | -2.4 % | +100.8 % | +10.8 % |
+| Gemma 3 | -0.8 % | +0.9 % | +0.0 % | -15.0 % | -7.1 % | +8.9 % |
+| Gemma 4 | +2.5 % | +1.6 % | -0.4 % | -15.0 % | -5.1 % | +49.1 % |
+| Llama 2 (byte fallback) | +2.0 % | +0.7 % | -3.6 % | +0.0 % | +2.8 % | +6.6 % |
+| Kimi K3 | -9.7 % | -0.3 % | +0.0 % | +0.0 % | +0.0 % | +48.6 % |
+| BERT base | -99.0 % | -95.7 % | -86.7 % | -97.6 % | -81.5 % | +689.8 % |
+| T5 small | -93.6 % | -75.2 % | -46.3 % | -83.4 % | -33.1 % | +0.9 % |
+
+#### Load and memory (each cell: SMG 1.16.0 / SMG v1.15.0 / fastokens)
+
+| family | load, ms | resident memory after the load, MB | high-water mark after a 1m-token encode, MB | growth per thread at 64 threads, one shared tokenizer, kB | resident level per thread, a tokenizer per thread, MB |
+|---|---|---|---|---|---|
+| DeepSeek V4.1 | 196.5 / 442.5 / 678.1 | 72.2 / 138.4 / 112.8 | 94 / 145 / 197 | 697 / 969 / 16562 | 70.6 / 124.0 / 141.5 |
+| DeepSeek V3.2 | 199.4 / 430.6 / 669.0 | 71.0 / 136.8 / 112.8 | 93 / 143 / 197 | 698 / 969 / 16559 | 72.9 / 119.9 / 131.8 |
+| Llama 3.2 | 264.1 / 747.7 / 1127.4 | 93.3 / 184.4 / 284.0 | 114 / 250 / 337 | 707 / 996 / 16553 | 98.7 / 248.5 / 309.4 |
+| Llama 4 | 458.3 / 1225.2 / 2043.8 | 116.8 / 284.4 / 439.7 | 133 / 390 / 526 | 708 / 985 / 32950 | 110.1 / 345.4 / 498.1 |
+| gpt-oss | 460.8 / 1263.7 / 2094.7 | 113.9 / 287.1 / 442.1 | 133 / 396 / 528 | 718 / 986 / 32965 | 120.4 / 354.8 / 495.5 |
+| Qwen 3.6 | 413.1 / 1038.0 / 1492.4 | 112.7 / 237.6 / 186.1 | 133 / 243 / 270 | 655 / 892 / 32950 | 150.1 / 209.7 / 208.2 |
+| GLM-5.3 | 313.4 / 885.4 / 1391.2 | 107.4 / 211.0 / 325.9 | 122 / 289 / 377 | 717 / 999 / 16568 | 113.1 / 269.1 / 349.6 |
+| MiniMax M3 | 310.1 / 753.8 / 1107.4 | 87.3 / 172.2 / 158.9 | 111 / 177 / 276 | 724 / 989 / 32985 | 104.0 / 157.4 / 223.3 |
+| MiMo V2.6 | 221.3 / 603.0 / 888.5 | 71.8 / 141.0 / 212.9 | 95 / 162 / 266 | 704 / 997 / 16553 | 79.7 / 174.9 / 243.8 |
+| Mistral (tekken) | 317.2 / 355.4 / 183.6 | 81.2 / 99.6 / 72.1 | 112 / 130 / 94 | 690 / 926 / 461 | 72.6 / 91.1 / 91.1 |
+| Gemma 3 | 595.8 / 1614.2 / 2411.0 | 156.9 / 289.1 / 473.2 | 176 / 466 / 506 | 605 / 695 / 1883 | 172.2 / 417.7 / 463.6 |
+| Gemma 4 | 571.2 / 1627.9 / 2446.3 | 156.8 / 288.6 / 467.8 | 173 / 464 / 499 | 599 / 689 / 1831 | 173.9 / 417.3 / 464.0 |
+| Llama 2 (byte fallback) | 40.2 / 106.0 / 133.2 | 26.4 / 40.2 / 42.7 | 52 / 59 / 119 | 632 / 974 / 1819 | 20.5 / 29.7 / 41.9 |
+| Kimi K3 | 363.4 / 412.1 / 2574.7 | 83.3 / 101.9 / 71.9 | 112 / 129 / 79 | 704 / 996 / 179 | 76.4 / 95.5 / 66.5 |
+| BERT base | 16.6 / 22.1 / 52.4 | 14.5 / 20.1 / 19.5 | 24 / 602 / 596 | 49 / 1882 / 1929 | 7.4 / 13.9 / 15.8 |
+| T5 small | 42.4 / 51.9 / 89.4 | 35.3 / 43.0 / 44.5 | 393 / 462 / 455 | 1660 / 1658 / 1665 | 33.0 / 40.6 / 37.5 |
 
 #### Reading the tables
 
-- Against v1.14.0 every encode cell of the fourteen vocabularies whose encoder changed is faster (all 140 cells; BERT and T5, 20 cells, run the `tokenizers` crate in both builds and read within their round spreads): 86 % less time per token cold and 92 % warm on the byte-level vocabularies (medians over 50 cells each), 92 % and 98 % on the byte-fallback vocabularies, which 1.14.0 still ran through the generic pipeline, as it did the Llama 3.2 and Llama 4 files.
-- Cold text is where the fastokens stack is still ahead on the nine non-tekken byte-level vocabularies (-62 % to -21 %, every cell beyond the placement band; the first-sight merge of unseen pieces). On byte-fallback vocabularies, the tiktoken file and `tekken.json` SMG is ahead on every cold cell.
-- Warm text at 256 and 2k tokens: SMG ahead of fastokens beyond the placement band on 14 of 18 cells of the nine non-tekken byte-level vocabularies (+28 % to +127 %), the 256-token cells of Llama 3.2, gpt-oss, GLM-5.3 and Llama 4 inside it (+17 % to +19 %; on `tekken.json` the tekken crate is far behind on every cell); at 32k tokens and above fastokens is ahead beyond the band on 15 of 27 cells (-37 % to -21 %) and the other 12 read -20 % to +18 %, inside it.
-- The v1 pipeline is behind SMG by more than the placement band on all 24 cold byte-level cells at 32k tokens and above (+35 % to +149 %) and on 38 of 40 warm byte-level cells (DeepSeek V4.1 at 2k and Llama 3.2 at 256 read +18 % to +19 %, inside it); of the 16 cold cells at 256 and 2k tokens, 15 read -10 % to +17 %, inside the band, and gpt-oss at 2k reads +21 %, just beyond it. Its whole-text word cache wins the Llama 2 warm cells at 256, 2k and 32k tokens (-60 % to -38 %), a lookup rather than an encode (this crate's exact-match cache, where a deployment enables it, answers a repeated text the same way); Gemma 4's at 256, 2k and 32k tokens (-19 % to -9 %) sit inside the band.
-- On the nine non-tekken byte-level vocabularies the decode and streaming margins are wider than encode's: a full decode runs at 6.9 to 9.9 ns per token against the fastokens stack's 24.1 to 32.8, and the first delta of 64 interleaved streams arrives in 110 to 130 ns against 411 to 923; the byte-fallback vocabularies read 14.2 to 16.7 against 103.0 to 107.8 on the full decode; BERT, on the `tokenizers` crate in both, reads 687 against 554 (-19 %), inside the band.
+- Of 192 encode cells SMG 1.16.0 reads a lower time than every reference in the csv files (fastokens, tiktoken-rs, tokenizers, v1) on 127: 42 of 96 cold and 85 of 96 warm; SMG v1.15.0 in the same rounds reads 83.
+- Against v1.15.0, cold: of 96 encode cells 91 read faster and 0 slower by more than 5 %, 5 within it; the median change is -17.3 %.
+- Against v1.15.0, warm: of 96 encode cells 95 read faster and 0 slower by more than 5 %, 1 within it; the median change is -23.7 %.
+- Against v1.15.0, decode, streaming and batch: of 96 cells 47 read faster and 2 slower by more than 5 %, 47 within it. Slower: Mistral (tekken), 64 streams: first delta, 241.0 against 120.0 ns (+100.8 %); Llama 3.2, 64 streams: first delta, 120.0 against 110.0 ns (+9.1 %, one step of the clock). The step and first-delta cells read a clock that moves in steps of about 10 ns; 9 of the faster cells differ by one step or less.
+- Against fastokens, cold: of 96 encode cells SMG is ahead beyond the placement band (20 %) on 40 and behind beyond it on 36; 20 read inside the band (the margins run from -43 % to +1647 %).
+- Against fastokens, warm: of 96 encode cells SMG is ahead beyond the placement band (20 %) on 82 and behind beyond it on 0; 14 read inside the band (the margins run from -14 % to +6873 %).
+- Against v1, cold: of 72 encode cells SMG is ahead beyond the placement band (20 %) on 66 and behind beyond it on 0; 6 read inside the band (the margins run from +9 % to +2120 %).
+- Against v1, warm: of 72 encode cells SMG is ahead beyond the placement band (20 %) on 66 and behind beyond it on 3; 3 read inside the band (the margins run from -63 % to +4465 %).
+- Full decode, 2,048 ids, against fastokens: SMG is ahead beyond the band on 15 of 15 families, behind beyond it on 0, inside it on 0 (the margins run from +32 % to +8399 %). The fastokens column has no figure for Mistral (tekken), whose process failed in every round.
+- Incremental decode, 2,048 ids, against fastokens: SMG is ahead beyond the band on 15 of 15 families, behind beyond it on 0, inside it on 0 (the margins run from +195 % to +1765 %). The fastokens column has no figure for Mistral (tekken), whose process failed in every round.
+- First delta of one stream, against fastokens: SMG is ahead beyond the band on 15 of 15 families, behind beyond it on 0, inside it on 0 (the margins run from +72 % to +464 %). The fastokens column has no figure for Mistral (tekken), whose process failed in every round.
+- 64 streams: step, against fastokens: SMG is ahead beyond the band on 16 of 16 families, behind beyond it on 0, inside it on 0 (the margins run from +382 % to +3286 %).
+- 64 streams: first delta, against fastokens: SMG is ahead beyond the band on 16 of 16 families, behind beyond it on 0, inside it on 0 (the margins run from +75 % to +821 %).
+- Batch of 1,000 texts, one thread, against fastokens: SMG is ahead beyond the band on 8 of 16 families, behind beyond it on 0, inside it on 8 (the margins run from -13 % to +2693 %).
+- Batch of 1,000 texts, one thread, against v1: SMG is ahead beyond the band on 12 of 12 families, behind beyond it on 0, inside it on 0 (the margins run from +268 % to +1642 %).
+- Load and memory, against v1.15.0: SMG 1.16.0 reads lower by more than 5 % on 16 of 16 families in the load time; on 16 of 16 families in the resident memory after the load; on 16 of 16 families in the high-water mark after a 1m-token encode; on 15 of 16 families in the growth per thread on one shared tokenizer; on 16 of 16 families in the resident level per thread with a tokenizer per thread.
+- Load and memory, against fastokens: SMG 1.16.0 reads lower by more than 5 % on 15 of 16 families in the load time (higher on Mistral (tekken)); on 14 of 16 families in the resident memory after the load (higher on Mistral (tekken), Kimi K3); on 14 of 16 families in the high-water mark after a 1m-token encode (higher on Mistral (tekken), Kimi K3); on 13 of 16 families in the growth per thread on one shared tokenizer (higher on Mistral (tekken), Kimi K3); on 15 of 16 families in the resident level per thread with a tokenizer per thread (higher on Kimi K3).
+- The v1 column reads `-` for Mistral (tekken), Kimi K3, BERT base, T5 small: the v1 pipeline declines their files, and that build takes its next encode path there (SMG's own for Mistral (tekken), Kimi K3, BERT base; the `tokenizers` crate's for T5 small).
+- The placement band: the v1 build shares SMG's decode and streaming code, and between the two builds those 80 cells read -18 % to +25 %.
+- The corpus: 17 to 39 % of the bytes of a size class are outside ASCII (`corpus.json`).
 
 ## Known Limitations & Future Work
 - SentencePiece (`.model`) and GGUF tokenizers are detected but deliberately unimplemented.

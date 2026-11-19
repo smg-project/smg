@@ -23,6 +23,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -411,6 +412,20 @@ def test_a_router_on_its_slurm_variant_takes_the_releases_controller():
     assert container(inside)["image"] == router_image(inside) + "-policy-controller"
 
 
+@needs_helm
+def test_a_router_on_its_ol9_variant_takes_the_releases_controller():
+    """The Oracle Linux 9 variant is the router's alone too. Its suffix is cut
+    as the Slurm variant's is: where it ends a tag, and nowhere else."""
+    documents = render(*ON, "global.image.tag=1.16.0-ol9")
+    of_the_router = router_image(documents)
+    assert of_the_router.endswith(":1.16.0-ol9")
+    assert (
+        container(documents)["image"] == of_the_router.removesuffix("-ol9") + "-policy-controller"
+    )
+    inside = render(*ON, "global.image.tag=1.16.0-ol9-rc.1")
+    assert container(inside)["image"] == router_image(inside) + "-policy-controller"
+
+
 def published(workflow: str, environment: dict[str, str], tmp_path: Path) -> dict[str, list[str]]:
     """The lists of image references a publishing workflow's own tags step
     writes for one run, the step run under bash: each multi-line output, by
@@ -489,7 +504,15 @@ def test_a_release_older_than_the_first_with_a_controller_image_is_refused():
     render for its spelling."""
     row = r"-policy-controller`, beside every release image from (\S+) on"
     (first,) = re.findall(row, (CHART / "README.md").read_text())
-    for older in ("1.15.2", "1.15.2-slurm", "1.15.99-rc.1", "1.9.0", "0.9.0", "1.15.2-my_build"):
+    for older in (
+        "1.15.2",
+        "1.15.2-slurm",
+        "1.15.2-ol9",
+        "1.15.99-rc.1",
+        "1.9.0",
+        "0.9.0",
+        "1.15.2-my_build",
+    ):
         router = f"global.image.tag={older}"
         error = render_error(*ON, router)
         assert f"image.tag is needed: global.image.tag {older} is older than {first}" in error
@@ -675,6 +698,7 @@ def test_a_spec_store_is_refused_beside_what_the_controller_refuses(tmp_path):
     # the two flags under which it clears the document.
     assert "Set policyController.spec to null" in both
     assert "--reset-then-reuse-values or --reset-values" in both
+    assert "other overrides" in both
     document = spec_values(tmp_path, LEAST_LOAD)
     assert "names two sources of its policy spec" in render_error(*STORED, files=(document,))
     for settings in ((ELECTION,), (ELECTION, "policyController.replicas=2")):
@@ -1822,7 +1846,7 @@ def test_the_image_job_starts_on_what_these_cases_read():
         crate / "contracts" / "smg-policy.wit",
         # The engine wire's messages the controller's protocol imports: the
         # build script reads them beside the contract.
-        REPO / "crates" / "grpc_client" / "proto" / "common.proto",
+        REPO / "crates" / "worker" / "proto" / "common.proto",
         # The example controller, whose image the job builds beside the
         # stock one: its package and what the package compiles.
         REPO / "examples" / "policy-controller" / "Cargo.toml",
@@ -1848,21 +1872,52 @@ def test_the_image_job_starts_on_what_these_cases_read():
     assert not starts_the_job("deploy/helm/smg/tests/rules/run.sh", entries)
 
 
+# The sockets that keep a case's ports: ``free_ports`` binds them and
+# ``let_go`` closes them.
+HELD: list[socket.socket] = []
+
+
+def let_go() -> None:
+    """Closes every socket that keeps a port."""
+    while HELD:
+        HELD.pop().close()
+
+
+@pytest.fixture(autouse=True)
+def ports_end_with_their_case():
+    """Lets a case's ports go at its end."""
+    yield
+    let_go()
+
+
+def keep(address: str, port: int) -> int:
+    """Binds ``port`` on ``address``, any port where it is 0, by a socket
+    that shares its address and never listens, and keeps it. Returns the
+    port bound."""
+    HELD.append(socket.socket())
+    HELD[-1].setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    HELD[-1].bind((address, port))
+    return HELD[-1].getsockname()[1]
+
+
 def free_ports(count: int, *addresses: str) -> list[int]:
-    """``count`` ports free on 127.0.0.1, and on each of ``addresses`` too."""
-    sockets = [socket.socket() for _ in range(count)]
-    try:
-        for sock in sockets:
-            sock.bind(("127.0.0.1", 0))
-        ports = [sock.getsockname()[1] for sock in sockets]
-        for address in addresses:
-            for port in ports:
-                sockets.append(socket.socket())
-                sockets[-1].bind((address, port))
-        return ports
-    finally:
-        for sock in sockets:
-            sock.close()
+    """``count`` ports free on every address, bound on each of ``addresses``
+    by name too, and kept until the case ends.
+
+    A port looked up and let go is any process's to take before the
+    controller binds it. So each stays bound here. Linux then gives the
+    port to no socket that asks for any port, and refuses it to one that
+    names it and shares no address. The controller's listeners share
+    theirs: they bind and listen beside the socket here. Another system
+    reads a shared address otherwise: there the ports are let go at once,
+    as a look-up does."""
+    ports = [keep("0.0.0.0", 0) for _ in range(count)]
+    for address in addresses:
+        for port in ports:
+            keep(address, port)
+    if sys.platform != "linux":
+        let_go()
+    return ports
 
 
 def refusal(binary: str, args: list[str]) -> str:
@@ -2679,9 +2734,11 @@ def test_the_notes_of_an_elected_controller_say_that_its_standby_follows_nobody(
     standby follows no leader and takes over with no worker and no load, and
     why, as the controller tells the two apart: the standbys' listener not
     named to take identities as told, or named and serving TLS, where a
-    standby's dial has no credential yet."""
+    standby's dial has no credential yet. Either line ends by sending its
+    reader to the README's part."""
     said = [line for line in notes(*ELECTED, *settings).splitlines() if "Standby" in line]
     assert len(said) == 1 and said[0].startswith(f"{NO_STANDBY_FOLLOWS}: {why}"), said
+    assert said[0].endswith("(the chart's README, Standby)"), said
 
 
 @needs_helm
@@ -3133,3 +3190,27 @@ def test_the_image_job_builds_the_example_for_both_platforms_and_pushes_nothing(
         told = step.get("run", "") + " " + step.get("uses", "")
         for word in ("docker push", "--push", "docker login", "login-action"):
             assert word not in told, f"the step {step.get('name')!r} holds {word!r}"
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="a port is kept on Linux alone")
+def test_a_port_a_case_takes_is_refused_to_a_rival_until_it_is_let_go():
+    """A port of ``free_ports`` stays its case's, and goes at the case's
+    end: this case stands last, behind every case that keeps one, and
+    starts with none kept. A rival that names the port and shares no
+    address is refused it on every address. A listener that shares its
+    address, as the controller's do, binds it, listens and takes a
+    connection. Let go, the sockets that kept it are closed."""
+    assert not HELD, "a case before this one left its ports kept"
+    (port,) = free_ports(1)
+    for address in ("0.0.0.0", *POD_ADDRESSES):
+        with socket.socket() as rival, pytest.raises(OSError) as refused:
+            rival.bind((address, port))
+        assert refused.value.errno == errno.EADDRINUSE, address
+    with socket.socket() as listener:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("0.0.0.0", port))
+        listener.listen()
+        socket.create_connection(("127.0.0.1", port), timeout=2).close()
+    kept = list(HELD)
+    let_go()
+    assert kept and not HELD and all(sock.fileno() == -1 for sock in kept)

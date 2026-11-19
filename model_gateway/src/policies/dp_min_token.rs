@@ -5,8 +5,9 @@
 
 use std::sync::Arc;
 
+use smg_worker::{identity::basic::Worker, load::monitor::WorkerLoadManager};
+
 use super::DPRankLoadPolicy;
-use crate::worker::{Worker, WorkerLoadManager};
 
 #[derive(Debug)]
 pub struct MinimumTokensPolicy {

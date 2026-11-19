@@ -10,8 +10,8 @@ use crate::{
     spec::Pairing,
     store::{
         world::{Classes, Writer, PUBLISH_WINDOW},
-        Kinds, MembershipChange, MemoryStore, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus,
-        WorkersStore,
+        Kinds, MembershipChange, MemoryStore, Position, WorkerFacts, WorkerPatch, WorkerRow,
+        WorkerStatus, WorkersStore,
     },
     view::{Role, WireModes, WorkerId},
 };
@@ -195,18 +195,22 @@ fn the_writer_keeps_a_derivation_a_paired_model_and_none_past_it() {
         status: WorkerStatus::Ready,
         revision: 1,
         admitted_at: origin,
+        maker: Default::default(),
     };
     let moved = |id: u64| Classes::Written {
         left: Some(WorkerId(id)),
         joined: Some(WorkerId(id)),
     };
     let mut writer = Writer::new(PUBLISH_WINDOW, origin);
+    // Each member's slot, as its first write gives it.
+    let counts = writer.counts();
+    let slots = [counts.claim(), counts.claim()];
     // A model of one side keeps none, and its first pair makes one.
     let mut members = vec![row(1, Role::Prefill, "m0")];
-    writer.rebuild(1, members.iter(), |_, _| None, moved(1));
+    writer.rebuild(1, members.iter().zip(slots), |_, _| None, moved(1));
     assert_eq!(writer.derivations.len(), 0);
     members.push(row(2, Role::Decode, "m0"));
-    writer.rebuild(2, members.iter(), |_, _| None, moved(2));
+    writer.rebuild(2, members.iter().zip(slots), |_, _| None, moved(2));
     assert_eq!(writer.derivations.len(), 1);
     // The pair moves through a hundred models, the decode first: the
     // model it left keeps no derivation, and the one both stand in has
@@ -214,10 +218,10 @@ fn the_writer_keeps_a_derivation_a_paired_model_and_none_past_it() {
     for n in 1..100_u64 {
         let model = format!("m{n}");
         members[1] = row(2, Role::Decode, &model);
-        writer.rebuild(2 * n + 1, members.iter(), |_, _| None, moved(2));
+        writer.rebuild(2 * n + 1, members.iter().zip(slots), |_, _| None, moved(2));
         assert_eq!(writer.derivations.len(), 0, "{model}");
         members[0] = row(1, Role::Prefill, &model);
-        writer.rebuild(2 * n + 2, members.iter(), |_, _| None, moved(1));
+        writer.rebuild(2 * n + 2, members.iter().zip(slots), |_, _| None, moved(1));
         let kept: Vec<&str> = writer.derivations.keys().map(|model| &**model).collect();
         assert_eq!(kept, [model.as_str()]);
     }
@@ -296,7 +300,12 @@ fn a_followed_refresh_asks_the_pair_classes_what_the_leaders_refresh_asks() {
     assert_eq!(wholes(), (Some(1), Some(1)));
     let follow = |change: MembershipChange| {
         let row = WorkersStore::get(&leader, change.id());
-        standby.follow(WorkersStore::epoch(&leader), change, row);
+        standby.follow(
+            Position::default(),
+            WorkersStore::epoch(&leader),
+            change,
+            row,
+        );
     };
     // No offer moved, and another worker joins inside the window.
     follow(leader.upsert(WorkerFacts {

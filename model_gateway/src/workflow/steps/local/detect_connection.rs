@@ -8,12 +8,12 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use smg_worker::identity::{basic::ConnectionMode, endpoint::Endpoint};
 use tracing::{debug, info};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use crate::{
     app_context::AppContext,
-    worker::{identity::endpoint::Endpoint, ConnectionMode},
     workflow::{
         data::{require_app_context, WorkerKind, WorkerWorkflowData},
         steps::util::{try_grpc_reachable, try_http_reachable},
@@ -209,6 +209,7 @@ mod tests {
     use smg_data_connector::{
         MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
     };
+    use smg_worker::test_support::RefusedAddress;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use wfaas::WorkflowInstanceId;
 
@@ -216,8 +217,8 @@ mod tests {
     use crate::{
         config::RouterConfig,
         policies::PolicyRegistry,
+        routers::common::snapshot::WorkerRegistry,
         server::http_client,
-        worker::{test_support::RefusedAddress, WorkerRegistry},
         workflow::{data::WorkerRegistrationMode, steps::create_worker_workflow_data},
     };
 

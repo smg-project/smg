@@ -36,7 +36,9 @@ fn the_operators_rendezvous_wins_and_the_engines_fills_the_rest() {
 /// free room.
 #[test]
 fn a_minted_room_follows_the_prefill_rank_only_on_a_multi_rank_worker() {
-    use crate::worker::{BasicWorkerBuilder, RuntimeType, WorkerType};
+    use smg_worker::identity::basic::{RuntimeType, WorkerType};
+
+    use crate::routers::grpc::backend_client::BasicWorkerBuilder;
 
     let rooms = |runtime_type: RuntimeType, dp: Option<(usize, usize)>| -> Vec<i64> {
         let worker = |worker_type: WorkerType| -> Arc<dyn Worker> {

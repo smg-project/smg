@@ -347,9 +347,9 @@ async fn a_gateway_gone_past_its_grace_period_is_let_go_by_the_run_loop() {
             })
             .await
             .expect("the stream takes the Hello");
-        let answer = answers
-            .message()
+        let answer = timeout(Duration::from_secs(20), answers.message())
             .await
+            .expect("a Welcome within the case's patience")
             .expect("a frame, not a status")
             .expect("a frame, not the stream's end");
         assert_eq!(answer.term, 1, "the first take's term: {answer:?}");
@@ -377,6 +377,7 @@ async fn a_gateway_gone_past_its_grace_period_is_let_go_by_the_run_loop() {
                 issued_at: now,
                 dispatch_deadline: now + Duration::from_secs(600),
                 state: LeaseState::Issued,
+                session_ttl_micros: None,
             })
             .expect("a lease under the leader's term");
         assert_eq!(store.live(gateway), 1);
@@ -661,9 +662,9 @@ async fn a_present_gateway_is_answered_which_worker_on_its_decide_stream() {
             })
             .await
             .expect("the stream takes the Hello");
-        let answer = session
-            .message()
+        let answer = timeout(Duration::from_secs(20), session.message())
             .await
+            .expect("a Welcome within the case's patience")
             .expect("a frame, not a status")
             .expect("a frame, not the stream's end");
         let window = match answer.frame {
@@ -834,9 +835,9 @@ async fn a_worker_added_over_the_wire_is_decided_with_no_ask_for_a_build() {
             })
             .await
             .expect("the stream takes the Hello");
-        let answer = session
-            .message()
+        let answer = timeout(Duration::from_secs(20), session.message())
             .await
+            .expect("a Welcome within the case's patience")
             .expect("a frame, not a status")
             .expect("a frame, not the stream's end");
         assert!(
@@ -978,9 +979,9 @@ async fn a_drain_ends_the_open_decide_streams_and_returns_inside_its_grace_perio
             })
             .await
             .expect("the stream takes the Hello");
-        let welcome = session
-            .message()
+        let welcome = timeout(Duration::from_secs(20), session.message())
             .await
+            .expect("a Welcome within the case's patience")
             .expect("a frame, not a status")
             .expect("a frame, not the stream's end");
         assert!(

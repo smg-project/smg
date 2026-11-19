@@ -15,12 +15,10 @@
 use anyhow::Result;
 use axum::response::Response;
 use llm_multimodal::{EncoderInputFormat, Modality};
+use smg_worker::identity::basic::{RuntimeType, Worker};
 
 use super::{plan::MediaPlan, refs::worker_accepts_media_refs, MultimodalIntermediate};
-use crate::{
-    routers::error,
-    worker::{RuntimeType, Worker, WorkerRegistry},
-};
+use crate::routers::{common::snapshot::WorkerRegistry, error};
 
 /// Worker label carrying the engine's vision-input capability (the vLLM
 /// gRPC servicer's `GetModelInfoResponse.supports_vision`). `"false"` on a
@@ -474,11 +472,12 @@ mod tests {
 
         use llm_multimodal::MediaContentPart;
         use openai_protocol::model_card::ModelCard;
+        use smg_worker::identity::basic::{ConnectionMode, WorkerType};
 
         use super::*;
-        use crate::worker::{
-            test_support::{grpc_worker, registry_with},
-            BasicWorkerBuilder, ConnectionMode, WorkerType,
+        use crate::routers::{
+            common::snapshot::test_support::{grpc_worker, registry_with},
+            grpc::backend_client::BasicWorkerBuilder,
         };
 
         const MODEL: &str = "pool-test-model";

@@ -29,12 +29,13 @@
 //! each index id stands in the pool, and the pool's warming rows as a
 //! write last read them. The lookup itself is live, as the index is: the
 //! request's blocks are looked up once a decision, under the cap of its
-//! profile's sample, and the holders are named by their place in the
-//! decision's rows. An index id is free for the next row once its row
-//! leaves, and a decision may read a world published before that: the
-//! index counts its takes and keeps the count each id was last taken at
-//! (`Index`), and a row is named a holder only where its id was not taken
-//! since the tables the decision holds were known whole.
+//! profile (its sample, or no cap where it takes none), and the holders
+//! are named by their place in the decision's rows. An index id is free
+//! for the next row once its row leaves, and a decision may read a world
+//! published before that: the index counts its takes and keeps the count
+//! each id was last taken at (`Index`), and a row is named a holder only
+//! where its id was not taken since the tables the decision holds were
+//! known whole.
 //!
 //! Locks: the table's, taken under the workers lock by a membership write
 //! and alone by a batch, each for as long as it takes to find or to change
@@ -470,6 +471,12 @@ mod seam {
         HOOK.with(|held| *held.borrow_mut() = Some((point, Box::new(hook))));
     }
 
+    /// Whether a hook is still set. A case holds that none is behind its
+    /// naming: every step it set ran.
+    pub(super) fn pending() -> bool {
+        HOOK.with(|held| held.borrow().is_some())
+    }
+
     /// The hook set for `point` runs. It is taken out first: a naming the
     /// hook itself asks for meets none.
     pub(super) fn at(point: Point) {
@@ -768,23 +775,22 @@ impl PoolIndex {
 /// count of takes stands where its tables were known whole before it
 /// ([`Self::taken`]), and the answer must be no older than the blocks the
 /// lookup read. Where it moved, each row the lookup kept is asked whether
-/// its id was taken since ([`Self::taken_since`]). The chain writes and
-/// reads its coverage relaxed. Its reader runs an acquire fence after its
-/// reads, for its own snapshot: this file does not rest on where that fence
-/// stands. What orders the answer after a block, by who wrote it:
+/// its id was taken since ([`Self::taken_since`]). The chain reads its
+/// coverage relaxed and writes it by release, and its reader runs an
+/// acquire fence after its reads, for its own snapshot: this file rests on
+/// neither. What orders the answer after a block, by who wrote it:
 ///
 /// - the row's own lane: the take is said under the table's lock before
 ///   the row's lane exists ([`KvTables::member`]), a batch finds its lane
 ///   under that lock, and the lane passes a release fence before a batch's
 ///   blocks reach the chain ([`Held`]);
 /// - another row's lane, at a run's split, which writes the holdings of
-///   every row on the run: the chain passes a release fence of its own
-///   there, under the run's lock. A holding stands on a run by a write
-///   under that lock, or by the write of the lane that made the run,
-///   before another lane could find it;
-/// - another row's lane, where a partial table grows, which copies every
-///   row's entry: the chain passes a release fence of its own there too,
-///   under the run's lock;
+///   every row on the run, or where a partial table grows, which copies
+///   every row's entry: the chain passes a release fence of its own where
+///   a version step begins, under the run's lock, and every write of a
+///   split and the store that publishes a grown table stand behind one. A
+///   holding stands on a run by a write under that lock, or by the write
+///   of the lane that made the run, before another lane could find it;
 /// - the reader: an acquire fence in the naming, between its lookup and
 ///   its question ([`PoolIndex::name`]).
 ///

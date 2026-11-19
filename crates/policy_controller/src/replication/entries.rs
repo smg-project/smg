@@ -31,6 +31,7 @@ const GENERATION: &str =
 /// The list: `(trait or type, entry, fate)`, each in its file's own order.
 pub const ENTRIES: &[(&str, &str, Fate)] = &[
     ("WorkersStore", "upsert", Fate::Journaled),
+    ("WorkersStore", "upsert_by", Fate::Journaled),
     ("WorkersStore", "patch", Fate::Journaled),
     ("WorkersStore", "remove", Fate::Journaled),
     ("WorkersStore", "set_status", Fate::Journaled),
@@ -89,6 +90,7 @@ pub const ENTRIES: &[(&str, &str, Fate)] = &[
     ("ReservationStore", "release", Fate::NotYet(PINS)),
     ("ReservationStore", "held", Fate::Read),
     ("SessionsStore", "pin", Fate::NotYet(PINS)),
+    ("SessionsStore", "pin_no_earlier", Fate::NotYet(PINS)),
     ("SessionsStore", "lookup", Fate::Read),
     ("SessionsStore", "unpin", Fate::NotYet(PINS)),
     ("SessionsStore", "drop_worker", Fate::NotYet(PINS)),
@@ -120,7 +122,11 @@ pub const ENTRIES: &[(&str, &str, Fate)] = &[
         "restore_from",
         Fate::Rebuilt("the journal starts again: a reader re-syncs from this store's own snapshot"),
     ),
+    // The three doors for a followed write, one a kind of the leader's
+    // events: each is the standby's side of a journaled write.
     ("MemoryStore", "follow", Fate::Journaled),
+    ("MemoryStore", "follow_load", Fate::Journaled),
+    ("MemoryStore", "follow_term", Fate::Journaled),
     ("MemoryStore", "apply", Fate::NotYet(GENERATION)),
     ("MemoryStore", "world", Fate::Read),
     ("MemoryStore", "build_view", Fate::Read),

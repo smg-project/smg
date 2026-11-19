@@ -64,8 +64,9 @@
 // the first request under each term the replica leads.
 // Errors (gRPC status): UNAUTHENTICATED no principal, or Hello's id is not
 // the subject (the stream closes); PERMISSION_DENIED the scope or
-// role does not cover the RPC; FAILED_PRECONDITION a write or a Session
-// off the leader (a NotLeader in the status details, which are a
+// role does not cover the RPC, or a membership write names a row its
+// caller did not make (WorkerRow.maker); FAILED_PRECONDITION a write or a
+// Session off the leader (a NotLeader in the status details, which are a
 // google.rpc.Status that holds it as an Any, its address the leader's
 // gateway listener as Leader tells it; on Session, the NotLeader frame
 // ahead of the status), a first frame that is not Hello or a second
@@ -96,11 +97,12 @@
 // with another present gateway's, refused while that one stands, or an add
 // of a registered URL; NOT_FOUND a replace of an absent URL, or no worker
 // under the id; DEADLINE_EXCEEDED a Session stream that said no Hello within
-// 5 s of its open; UNAVAILABLE a standby not yet synced, a read a standby
+// 5 s of its open, or a Replicate stream whose standby took no part of its
+// snapshot for 60 s; UNAVAILABLE a standby not yet synced, a read a standby
 // cannot serve yet (WatchWorkers until its replica follows the leader's log,
 // a NotLeader in the status details), a leader whose store does not lead its
 // term, on a membership write, a spec write, its dry run and a rollback,
-// GetSnapshot, Replicate and the open of a WatchWorkers (the moment after
+// Replicate and the open of a WatchWorkers (the moment after
 // its take, until its store is told the term, and a call admitted under a
 // take its store has since passed: retry; or its whole lead, until a later
 // take, where its log followed a term at or above the one it took), or a
@@ -148,7 +150,8 @@ service PolicyController {
   // publication window (20 ms) of their answer, and they are in force for
   // decisions when it ends. A deregistration and a new incarnation's
   // replacing of the old are in force at their answer: no decision made
-  // after it names the worker that left.
+  // after it names the worker that left. So is a refresh that takes its
+  // worker off a model, for the pools it leaves.
   rpc RegisterWorker(RegisterWorkerRequest) returns (WorkerEvent);
   rpc PatchWorker(PatchWorkerRequest) returns (WorkerEvent);
   rpc DeregisterWorker(DeregisterWorkerRequest) returns (WorkerEvent);
@@ -165,7 +168,10 @@ service PolicyController {
   // Control scope, server stream.
   rpc WatchRegime(RegimeRequest) returns (stream Regime);
   // Replication scope, one bidirectional stream per standby: the leader's
-  // ordered log, acknowledged per batch, cut past a bounded backlog.
+  // ordered log, acknowledged per batch, cut past a bounded backlog. A
+  // leader sends 4 snapshots at once: a standby past them is told to
+  // re-sync, and told again each second, until one of them ends and its
+  // own snapshot's first part follows.
   rpc Replicate(stream ReplicaFrame) returns (stream ReplicationBatch);
   // Liveness and readiness are grpc.health.v1, not here.
 }
@@ -616,6 +622,23 @@ message WorkerRow {
   // admitted where it is applied; a row an event changes keeps the
   // admission its standby holds.
   uint64 admitted_age_ms = 26;
+  // Who made the row. Absent: a control call. The caller that made a row
+  // alone changes it: an UPSERT or a REPLACE over it, a patch, a drain and
+  // a removal from any other are refused PERMISSION_DENIED, ahead of the
+  // revision's test, and the words name the maker. An ADD over it is
+  // ALREADY_EXISTS whoever made it. A reader that knows no such field
+  // reads every row as a control call's.
+  Maker maker = 27;
+}
+
+// A provider that finds workers by itself, as a row's maker. Neither
+// field is empty: a reader refuses a row whose maker lacks one, by that
+// field.
+message Maker {
+  // The provider's name.
+  string provider = 1;
+  // The provider's own key for the worker.
+  string key = 2;
 }
 
 // A host-local wire is reachable from one gateway only.
@@ -765,17 +788,20 @@ message RegisterWorkerRequest {
   enum Mode {
     // Reads as MODE_ADD.
     MODE_UNSPECIFIED = 0;
-    // The URL must be absent: ALREADY_EXISTS otherwise.
+    // The URL must be absent: ALREADY_EXISTS otherwise, whoever made the
+    // standing row.
     MODE_ADD = 1;
     // The URL must stand: its next incarnation, NOT_FOUND otherwise, whatever
     // the registration leaves unset. A field past its own rule or bound is
-    // INVALID_ARGUMENT first, whether the URL stands or not.
+    // INVALID_ARGUMENT first, whether the URL stands or not. A caller that
+    // did not make the standing row is PERMISSION_DENIED (WorkerRow.maker).
     MODE_REPLACE = 2;
     // Registers an absent URL. Over a standing row: equal facts write nothing
     // and answer the row unmoved, a change of role, wire or models is a new
     // incarnation, any other change is made in place. The models change
     // when their set does: the same ids in another order are written in
-    // place, and the row tells the stated order.
+    // place, and the row tells the stated order. A caller that did not make
+    // the standing row is PERMISSION_DENIED, whatever the facts.
     MODE_UPSERT = 3;
   }
   Mode mode = 2;
@@ -852,6 +878,8 @@ message PatchWorkerRequest {
   repeated string remove_labels = 3;
   OverloadThresholds overload = 4;
   // The row's revision the caller read; FAILED_PRECONDITION when it moved.
+  // A caller that did not make the row is PERMISSION_DENIED first, whatever
+  // revision it read (WorkerRow.maker).
   uint64 revision = 5;
 }
 
@@ -1159,7 +1187,8 @@ message LeaderInfo {
 }
 
 message SyncState {
-  // The age of the last frame of its leader's stream a follower applied.
+  // The age of the last frame that left a follower at the head its leader
+  // stated (ReplicationBatch.head_seq).
   uint32 replication_lag_ms = 1;
   uint32 ranks_live = 2;
   uint32 ranks_total = 3;
@@ -1264,6 +1293,13 @@ message ReplicationBatch {
   // snapshot stands at `first_seq - 1`, and the next batch of events starts
   // at `first_seq`.
   ReplicationSnapshot snapshot = 5;
+  // The leader's head as the frame was made: the last position its log
+  // holds. A standby that applied through it stood at the head then, and
+  // its lag's instant moves at such a frame alone: inside a replay, or in
+  // the tail a restore leaves, it reads not synced however fast the frames
+  // come. 0 states no head (a leader of a build before the field): the
+  // frame moves the instant, as every applied frame did.
+  uint64 head_seq = 6;
 }
 
 // One part of a snapshot a standby is restored from: the leader's rows and

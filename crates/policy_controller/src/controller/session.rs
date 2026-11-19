@@ -641,7 +641,7 @@ mod tests {
             },
             lifecycle::tests::{a_completed, a_dispatched, a_released, worker},
             principal::{tests::told, Layer, ENTRY},
-            replication::journaled_from,
+            replication::journaled_for,
             service::{Service, Shared},
             PROTOCOL_VERSION,
         },
@@ -689,7 +689,7 @@ mod tests {
             ADDRESS.to_owned(),
             &elector,
             stood,
-            journaled_from(&LeasePlace::Process, 0),
+            journaled_for(&LeasePlace::Process, 0, 2),
             Arc::new(crate::Catalog::builtin()),
             2,
         )
@@ -1453,6 +1453,9 @@ mod tests {
         let store = Arc::clone(&bed.shared.store);
         let t0 = Instant::now();
         let served = worker(&store, "http://a:8000");
+        // The store's term is the led one, as a leader's is: an id made by
+        // hand is of a term before it, and names its file by its block.
+        store.set_term(1);
         for id in 1..=3 {
             store.issue(lease(gateway, id, t0)).expect("a lease");
         }
@@ -1494,6 +1497,7 @@ mod tests {
         bed.leads(1);
         let gateway = told(GATEWAY).gateway();
         let store = Arc::clone(&bed.shared.store);
+        store.set_term(1);
         store
             .issue(lease(gateway, 1, Instant::now()))
             .expect("a lease");
@@ -1603,6 +1607,7 @@ mod tests {
         bed.leads(1);
         let gateway = told(GATEWAY).gateway();
         let store = Arc::clone(&bed.shared.store);
+        store.set_term(1);
         store
             .issue(lease(gateway, 1, Instant::now()))
             .expect("a lease");

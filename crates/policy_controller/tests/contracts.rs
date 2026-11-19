@@ -218,7 +218,8 @@ fn pool_record() -> &'static [&'static str] {
             generation,
             zones,
             reach,
-            rated,
+            reported,
+            engines,
         }
     )
 }
@@ -332,6 +333,7 @@ fn lease_record() -> &'static [&'static str] {
             kind,
             side,
             target_index,
+            booked,
             generation,
             session as "session_key",
             session_verdict,
@@ -491,19 +493,28 @@ fn enum_mirrors() -> Vec<(
             "MembershipChange.Kind",
             "KIND",
             "membership",
-            cases!(
-                Membership<'_>,
-                Membership {
-                    Added,
-                    Removed,
-                    Replaced,
-                    Relabelled,
-                    Resized,
-                    Snapshot,
-                }
-            ),
+            membership_cases().0,
         ),
     ]
+}
+
+/// The membership words in declaration order: the kinds the two contracts
+/// spell out, then the words they do not carry. A plugin is told nothing of
+/// a word of the second part.
+fn membership_cases() -> (&'static [&'static str], &'static [&'static str]) {
+    cases!(
+        Membership<'_>,
+        Membership {
+            Added,
+            Removed,
+            Replaced,
+            Relabelled,
+            Resized,
+            Snapshot,
+            Left,
+        }
+    )
+    .split_at(6)
 }
 
 /// The shed reasons have a proto enum and no WIT counterpart (a guest never
@@ -687,7 +698,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "PoolFacts",
             record: pool_record(),
-            host_only: &["reach", "rated"],
+            host_only: &["reach", "reported", "engines"],
             wire_only: &[],
             wire: &[
                 ("pool_size", Type::Uint32),
@@ -796,7 +807,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "Lease",
             record: lease_record(),
-            host_only: &["session_verdict", "issued_micros"],
+            host_only: &["booked", "session_verdict", "issued_micros"],
             wire_only: &["term", "dispatch_ttl_ms", "origin"],
             wire: &[
                 ("id", Type::Fixed64),
@@ -896,14 +907,14 @@ fn wit_mirrors() -> Vec<WitMirror> {
         WitMirror {
             record: "pool",
             crate_record: pool_record(),
-            host_only: &["reach", "rated"],
+            host_only: &["reach", "reported", "engines"],
             before: &[],
             beside: &[],
         },
         WitMirror {
             record: "lease",
             crate_record: lease_record(),
-            host_only: &["session_verdict", "issued_micros"],
+            host_only: &["booked", "session_verdict", "issued_micros"],
             before: &[],
             beside: &[],
         },
@@ -1153,7 +1164,7 @@ fn contracts_dir() -> PathBuf {
 /// The engine wire's protos (`smg.grpc.common`): the controller protocol
 /// imports the load record and the event batch a relay forwards unchanged.
 fn engine_wire_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../grpc_client/proto")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../worker/proto")
 }
 
 fn compile_protocol() -> io::Result<FileDescriptorSet> {
@@ -1465,6 +1476,9 @@ fn the_protocol_compiles_and_mirrors_the_engine_record() {
             .unwrap_or_else(|| panic!("enum {proto_name} is missing from {PLUGIN_PROTO}"));
         assert_eq!(found, proto_enum(prefix, cases), "enum {proto_name}");
     }
+    // The membership word no contract carries: a plugin is told nothing of
+    // it.
+    assert_eq!(membership_cases().1, ["Left"]);
     let found = enum_values(plugin, "ShedReason").expect("ShedReason is an enum");
     assert_eq!(found, proto_enum("SHED_REASON", shed_reasons()));
     // The lifted veto: the mark's variants in order, numbered from zero.
@@ -1784,7 +1798,12 @@ const MEMBERSHIP_FIELDS: &[(&str, &[ResumeField])] = &[
             ("dp_rank", 23, Type::Uint32),
             ("engine", 24, Type::String),
             ("health_policy", 25, Type::Message),
+            ("maker", 27, Type::Message),
         ],
+    ),
+    (
+        "Maker",
+        &[("provider", 1, Type::String), ("key", 2, Type::String)],
     ),
     ("WorkerSpec", &[("health_policy", 14, Type::Message)]),
 ];

@@ -37,8 +37,16 @@ use openai_protocol::{
     responses::ResponsesRequest,
     systemone::SystemOneRequest,
     transcription::{AudioFile, TranscriptionRequest},
+    UNKNOWN_MODEL_ID,
 };
 use reqwest::multipart::{Form, Part};
+use smg_worker::{
+    identity::{
+        basic::{ConnectionMode, RuntimeType, Worker, WorkerLoadGuard, WorkerType},
+        endpoint::Endpoint,
+    },
+    metrics::writers::Metrics as WorkerMetrics,
+};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tower::{Layer, Service};
@@ -72,8 +80,8 @@ use crate::{
                 REASON_WORKER_MUTATES_BODY,
             },
             decisions::{SglangDecisionAdapter, UPSTREAM_ROUTE},
-            header_utils, overload,
-            placement::{self, CandidateFilter, PlacementFailure, PlacementInputs, RefusalSite},
+            header_utils, overload, placement,
+            placement::{CandidateFilter, PlacementFailure, PlacementInputs, RefusalSite},
             realtime::{
                 rest::forward_realtime_rest, webrtc, webrtc::handle_realtime_webrtc,
                 ws::handle_realtime_ws, RealtimeLabels, RealtimeRegistry,
@@ -82,6 +90,7 @@ use crate::{
             retry::{
                 is_request_timeout, is_retryable_response, request_timeout_response, RetryExecutor,
             },
+            snapshot::{RoutingPool, WorkerRegistry, WorkerRegistryExt},
             sse_rechunk::{NoopObserver, RechunkPolicy, SseRechunker},
             stream::GuardedStream,
             worker_selection::{SelectWorkerRequest, WorkerSelector},
@@ -108,11 +117,6 @@ use crate::{
         BodyPolicy, RouterTrait,
     },
     wasm::module::{MiddlewareAttachPoint, WasmModuleAttachPoint},
-    worker::{
-        identity::endpoint::Endpoint, metrics::Metrics as WorkerMetrics, ConnectionMode,
-        RoutingPool, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry, WorkerRegistryExt,
-        WorkerType, UNKNOWN_MODEL_ID,
-    },
 };
 
 /// Max body size for a WebRTC `/v1/realtime/calls` SDP offer (10 MiB).
@@ -2911,8 +2915,13 @@ mod tests {
     };
 
     use axum::http::header::{CONTENT_LENGTH, RETRY_AFTER};
-    use openai_protocol::{profile::ProviderProfile, rerank::RerankResult};
+    use openai_protocol::{model_card::ModelCard, profile::ProviderProfile, rerank::RerankResult};
     use serde_json::{json, Value};
+    use smg_worker::{
+        health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
+        identity::basic::BasicWorker,
+        test_support::{no_health_check, RefusedAddress},
+    };
 
     use super::*;
     use crate::{
@@ -2930,16 +2939,12 @@ mod tests {
                 request_lease::test_probe::{spawn_release_gated_stub, DropProbeRequest},
                 test_support::fast_retry_config,
             },
+            grpc::backend_client::BasicWorkerBuilder,
             http::test_support,
         },
         server::{http_client, http_client_builder},
         service_discovery::testing::create_test_app_context,
         tenant::TenantKey,
-        worker::{
-            health::circuit_breaker::CircuitState,
-            test_support::{no_health_check, RefusedAddress},
-            BasicWorker, BasicWorkerBuilder, CircuitBreakerConfig, ModelCard,
-        },
     };
 
     /// Accepts `kill_first` connections and closes them before any response

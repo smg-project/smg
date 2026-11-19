@@ -18,6 +18,7 @@ use openai_protocol::worker::{
     ConnectionMode, JobStatus, RuntimeType, WorkerSpec, WorkerType, WorkerUpdateRequest,
 };
 use smg_mcp::McpConfig;
+use smg_worker::{identity::endpoint::Endpoint, jobs::WorkerJobs, registry::WorkerId};
 use tokio::sync::{mpsc, oneshot, Semaphore};
 use tracing::{debug, error, info, warn};
 use wfaas::{StateStore, WorkflowData, WorkflowEngine, WorkflowError, WorkflowId, WorkflowStatus};
@@ -25,7 +26,7 @@ use wfaas::{StateStore, WorkflowData, WorkflowEngine, WorkflowError, WorkflowId,
 use crate::{
     app_context::AppContext,
     config::{RouterConfig, RoutingMode},
-    worker::{health::manager::WorkerJobs, identity::endpoint::Endpoint, registry::WorkerId},
+    routers::common::snapshot::WorkerRegistry,
     workflow::{
         create_mcp_workflow_data, create_tokenizer_workflow_data,
         create_wasm_registration_workflow_data, create_wasm_removal_workflow_data,
@@ -1097,7 +1098,7 @@ impl JobQueue {
     /// is a `DELETE` of a `POST`'s registration, and a job of another kind
     /// started under that reservation (a `PUT` queued before the `POST`, a
     /// discovery pass over the same URL) leaves it for the `POST`'s job.
-    fn own_mark_id(job: &Job, registry: &crate::worker::WorkerRegistry) -> Option<WorkerId> {
+    fn own_mark_id(job: &Job, registry: &WorkerRegistry) -> Option<WorkerId> {
         match job {
             Job::AddWorker {
                 config,
@@ -1750,16 +1751,34 @@ impl JobQueue {
 
 #[async_trait]
 impl WorkerJobs for JobQueue {
-    async fn remove_worker(
+    async fn refresh_worker_labels(&self, url: String) -> Result<bool, String> {
+        self.submit_or_defer(Job::RefreshWorkerLabels { url }).await
+    }
+
+    async fn add_worker(
+        &self,
+        spec: WorkerSpec,
+        mode: WorkerRegistrationMode,
+    ) -> Result<bool, String> {
+        self.submit_unless_registering(Job::AddWorker {
+            config: Box::new(spec),
+            registration_mode: mode,
+        })
+        .await
+    }
+
+    async fn remove_workers_at(
         &self,
         url: String,
-        worker_id: &WorkerId,
-        revision: u64,
+        guards: Vec<(WorkerId, u64)>,
     ) -> Result<(), String> {
-        // Guard the failed worker by its own id. The url is a DP base, so the
-        // removal step matches the whole rank group; a bare revision would take
-        // out every sibling that happens to sit at the same revision.
-        let expected_revisions = HashMap::from([(worker_id.as_str().to_string(), Some(revision))]);
+        // Each guard names a worker by its own id. The url may be a DP base, so
+        // the removal step matches the whole rank group; a bare revision would
+        // take out every sibling that happens to sit at the same revision.
+        let expected_revisions = guards
+            .into_iter()
+            .map(|(id, revision)| (id.as_str().to_string(), Some(revision)))
+            .collect();
         self.submit(Job::RemoveWorker {
             url,
             expected_revisions: Some(expected_revisions),
@@ -1767,8 +1786,9 @@ impl WorkerJobs for JobQueue {
         .await
     }
 
-    async fn refresh_worker_labels(&self, url: String) -> Result<bool, String> {
-        self.submit_or_defer(Job::RefreshWorkerLabels { url }).await
+    fn job_in_flight(&self, url: &str) -> bool {
+        self.get_status(url)
+            .is_some_and(|status| status.status == "pending" || status.status == "processing")
     }
 }
 
@@ -1861,6 +1881,8 @@ fn build_external_worker_config(
 
 #[cfg(test)]
 mod tests {
+    use smg_worker::identity::basic::Worker;
+
     use super::*;
     use crate::wasm::{WasmModuleDescriptor, WasmModuleType};
 
@@ -2088,9 +2110,9 @@ mod tests {
     #[tokio::test]
     #[tracing_test::traced_test]
     async fn a_cancelled_registrations_warning_and_status_name_its_worker_masked() {
-        use crate::{
-            service_discovery::testing::live_app_context, worker::test_support::RefusedAddress,
-        };
+        use smg_worker::test_support::RefusedAddress;
+
+        use crate::service_discovery::testing::live_app_context;
         // Held for the whole case: no other case's listener can draw the
         // port and answer a registration's probe.
         let refused = RefusedAddress::reserve();
@@ -2278,7 +2300,7 @@ mod tests {
 
         let context = app_context_for_tests(
             RouterConfig::default(),
-            Arc::new(crate::worker::WorkerRegistry::new()),
+            Arc::new(WorkerRegistry::new()),
             None,
         );
         let queue = JobQueue::new(
@@ -2390,7 +2412,9 @@ mod tests {
     /// waits, gone when the caller is, and a later caller takes the key.
     #[tokio::test]
     async fn a_wait_cancelled_under_a_full_queue_leaves_no_waiter() {
-        use crate::{app_context::testing::app_context_for_tests, worker::WorkerRegistry};
+        use crate::{
+            app_context::testing::app_context_for_tests, routers::common::snapshot::WorkerRegistry,
+        };
 
         let context = app_context_for_tests(
             RouterConfig::builder().build_unchecked(),
@@ -3117,7 +3141,7 @@ mod tests {
     /// `POST`'s own job, which takes it.
     #[test]
     fn a_put_or_discovery_job_under_a_cancelled_posts_reservation_leaves_its_mark() {
-        let registry = crate::worker::WorkerRegistry::new();
+        let registry = WorkerRegistry::new();
         let url = "http://w:8000";
         let reserved = registry.reserve_id_for_url(url);
         let marks: DashSet<WorkerId> = DashSet::new();
@@ -3157,7 +3181,9 @@ mod tests {
     /// is the first removal's own.
     #[tokio::test]
     async fn a_registrations_cleanup_removal_is_queued_once_per_url() {
-        use crate::{app_context::testing::app_context_for_tests, worker::WorkerRegistry};
+        use crate::{
+            app_context::testing::app_context_for_tests, routers::common::snapshot::WorkerRegistry,
+        };
         let registry = Arc::new(WorkerRegistry::new());
         let context = app_context_for_tests(RouterConfig::default(), Arc::clone(&registry), None);
         // A queue that accepts jobs and never runs one: no slot to run one in.
@@ -3212,7 +3238,9 @@ mod tests {
     /// removal's pins instead of displacing it.
     #[tokio::test]
     async fn a_cleanup_behind_a_removal_of_other_workers_keeps_its_own_pins() {
-        use crate::{app_context::testing::app_context_for_tests, worker::WorkerRegistry};
+        use crate::{
+            app_context::testing::app_context_for_tests, routers::common::snapshot::WorkerRegistry,
+        };
         let registry = Arc::new(WorkerRegistry::new());
         let context = app_context_for_tests(RouterConfig::default(), Arc::clone(&registry), None);
         let queue = JobQueue::new(
@@ -3517,7 +3545,7 @@ mod tests {
 
         use crate::{
             app_context::testing::app_context_for_tests,
-            worker::WorkerRegistry,
+            routers::common::snapshot::WorkerRegistry,
             workflow::{
                 steps::{local::test_support::serve_json_routes, shared::registration_hold},
                 WorkflowEngines,
@@ -3637,8 +3665,8 @@ mod tests {
     type DeleteSetting = (
         Arc<AppContext>,
         Arc<JobQueue>,
-        Arc<crate::worker::WorkerRegistry>,
-        Arc<dyn crate::worker::Worker>,
+        Arc<WorkerRegistry>,
+        Arc<dyn Worker>,
         WorkerId,
     );
 
@@ -3646,10 +3674,11 @@ mod tests {
     /// `url` with no drain window, the setting a DELETE's kept removal runs in.
     fn a_delete_setting(url: &str) -> DeleteSetting {
         use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
+        use smg_worker::identity::basic::{Worker, WorkerType};
 
         use crate::{
             app_context::testing::app_context_for_tests,
-            worker::{BasicWorkerBuilder, Worker, WorkerRegistry, WorkerType},
+            routers::{common::snapshot::WorkerRegistry, grpc::backend_client::BasicWorkerBuilder},
             workflow::WorkflowEngines,
         };
         let router_config = RouterConfig::default();
@@ -3730,8 +3759,9 @@ mod tests {
     #[tokio::test]
     async fn a_kept_delete_removal_removes_the_worker_rebuilt_under_its_id_since_the_delete() {
         use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
+        use smg_worker::identity::basic::{Worker, WorkerType};
 
-        use crate::worker::{BasicWorkerBuilder, Worker, WorkerType};
+        use crate::routers::grpc::backend_client::BasicWorkerBuilder;
         let url = "http://10.0.0.10:8000";
         let (context, queue, registry, first, id) = a_delete_setting(url);
         queue.hold_url_for_tests(url, "UpdateWorker");
@@ -3789,8 +3819,9 @@ mod tests {
     #[tokio::test]
     async fn a_kept_delete_removal_leaves_a_worker_registered_under_a_fresh_id_since_the_delete() {
         use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
+        use smg_worker::identity::basic::{Worker, WorkerType};
 
-        use crate::worker::{BasicWorkerBuilder, Worker, WorkerType};
+        use crate::routers::grpc::backend_client::BasicWorkerBuilder;
         let url = "http://10.0.0.11:8000";
         let (context, queue, registry, _first, id) = a_delete_setting(url);
         queue.hold_url_for_tests(url, "RemoveWorker");
@@ -3941,9 +3972,11 @@ mod tests {
     /// registered, and it goes once it is named at its own.
     #[tokio::test]
     async fn a_health_removal_runs_under_the_revisions_it_names() {
+        use smg_worker::identity::basic::Worker;
+
         use crate::{
+            routers::grpc::backend_client::BasicWorkerBuilder,
             service_discovery::testing::live_app_context,
-            worker::{BasicWorkerBuilder, Worker},
         };
 
         async fn ended(queue: &JobQueue, url: &str) {

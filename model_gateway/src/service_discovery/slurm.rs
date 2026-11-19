@@ -59,19 +59,17 @@ use std::{
 use async_trait::async_trait;
 use openai_protocol::worker::WorkerType;
 use serde::Deserialize;
+use smg_worker::identity::endpoint::{Endpoint, EndpointKey};
 use tokio::{process::Command, task, time};
 use tracing::info;
 
 use super::{
-    provider::{endpoint_at, DiscoveredWorker, DiscoveryKind},
+    config::{DiscoveryConfigError, DiscoveryConfigResult, SlurmDiscoveryConfig},
+    host::DiscoveryHost,
+    provider::{endpoint_at, DiscoveredWorker, DiscoveryKind, Roles},
     reconciler::DesiredState,
+    series,
     snapshot::{LastGood, Skip, SkipLog, SnapshotError},
-};
-use crate::{
-    app_context::AppContext,
-    config::{ConfigError, ConfigResult, RoutingMode, SlurmDiscoveryConfig},
-    observability::metrics::metrics_labels,
-    worker::{identity::endpoint::Endpoint, EndpointKey},
 };
 
 /// The oldest Slurm release this provider reads, as (major, minor).
@@ -101,14 +99,14 @@ pub struct SlurmProviderConfig {
 impl SlurmProviderConfig {
     /// The router's validation has checked the mapping against the routing
     /// mode; a mode with no worker pools to fill is still refused here.
-    pub fn new(config: &SlurmDiscoveryConfig, mode: &RoutingMode) -> ConfigResult<Self> {
-        if !matches!(
-            mode,
-            RoutingMode::Regular { .. }
-                | RoutingMode::PrefillDecode { .. }
-                | RoutingMode::EncodePrefillDecode { .. }
-        ) {
-            return Err(ConfigError::ValidationFailed {
+    /// `routing` is the roles the routing mode accepts: `roles` here names
+    /// the provider's own map of job names.
+    pub fn new(
+        config: &SlurmDiscoveryConfig,
+        routing: Option<Roles>,
+    ) -> DiscoveryConfigResult<Self> {
+        if routing.is_none() {
+            return Err(DiscoveryConfigError::ValidationFailed {
                 reason: "Slurm discovery needs regular, prefill-decode or encode-prefill-decode \
                          routing"
                     .to_string(),
@@ -250,8 +248,8 @@ enum SlurmError {
 impl SnapshotError for SlurmError {
     fn metric_reason(&self) -> &'static str {
         match self {
-            Self::Command { .. } => metrics_labels::SNAPSHOT_ERROR_UNREADABLE,
-            Self::Invalid { .. } => metrics_labels::SNAPSHOT_ERROR_INVALID,
+            Self::Command { .. } => series::SNAPSHOT_ERROR_UNREADABLE,
+            Self::Invalid { .. } => series::SNAPSHOT_ERROR_INVALID,
         }
     }
 }
@@ -272,7 +270,7 @@ struct PollOutcome {
 impl Skip {
     fn job(job: &Job, why: impl std::fmt::Display) -> Self {
         Self {
-            reason: metrics_labels::DISCOVERY_SKIP_INVALID,
+            reason: series::DISCOVERY_SKIP_INVALID,
             message: format!("job {} ({}): {why}", job.id, job.name),
         }
     }
@@ -413,7 +411,7 @@ async fn poll(
             continue;
         }
         skipped.push(Skip {
-            reason: metrics_labels::DISCOVERY_SKIP_CONFLICT,
+            reason: series::DISCOVERY_SKIP_CONFLICT,
             message: format!(
                 "{} places a worker at {}, where {holder} started first and holds the \
                  configured port; run worker jobs with --exclusive",
@@ -824,7 +822,7 @@ fn parse_nodes(stdout: &[u8]) -> Result<Vec<Node>, String> {
 /// naming the missing one, rather than failing every poll.
 pub(super) fn start_slurm_discovery(
     config: SlurmProviderConfig,
-    app_context: Arc<AppContext>,
+    host: Arc<dyn DiscoveryHost>,
 ) -> Result<task::JoinHandle<()>, String> {
     let client = SlurmCli::default();
     if let Some(command) = client.missing_command(std::env::var_os("PATH").as_deref()) {
@@ -846,7 +844,7 @@ pub(super) fn start_slurm_discovery(
         clippy::disallowed_methods,
         reason = "worker discovery runs for the lifetime of the server; shutdown aborts the handle"
     )]
-    let handle = task::spawn(SlurmDiscovery::new(config, app_context, Box::new(client)).run());
+    let handle = task::spawn(SlurmDiscovery::new(config, host, Box::new(client)).run());
 
     Ok(handle)
 }
@@ -854,7 +852,7 @@ pub(super) fn start_slurm_discovery(
 /// The provider's loop and its state.
 struct SlurmDiscovery {
     config: SlurmProviderConfig,
-    app_context: Arc<AppContext>,
+    host: Arc<dyn DiscoveryHost>,
     client: Box<dyn SlurmClient>,
     last_good: LastGood,
     skipped: SkipLog,
@@ -863,12 +861,12 @@ struct SlurmDiscovery {
 impl SlurmDiscovery {
     fn new(
         config: SlurmProviderConfig,
-        app_context: Arc<AppContext>,
+        host: Arc<dyn DiscoveryHost>,
         client: Box<dyn SlurmClient>,
     ) -> Self {
         Self {
             config,
-            app_context,
+            host,
             client,
             last_good: LastGood::new(DiscoveryKind::Slurm, "Slurm".to_string(), "job list"),
             skipped: SkipLog::new(DiscoveryKind::Slurm, "Slurm discovery"),
@@ -883,7 +881,7 @@ impl SlurmDiscovery {
             let started_at = time::Instant::now();
             self.repoll().await;
             self.last_good
-                .reconcile(&self.app_context, started_at)
+                .reconcile(self.host.as_ref(), started_at)
                 .await;
         }
     }

@@ -1055,8 +1055,8 @@ Policy controller image -- policyController.image, each part falling back to
 the router's image: the global registry, the global repository, and the
 router's tag with -policy-controller appended, the tag a release publishes
 the controller under. One version names both images: a release publishes one
-controller image, so the router's -slurm variant takes it too, its own
-suffix cut first. The default tag belongs to the router's repository and
+controller image, so the router's -slurm or -ol9 variant takes it too, its
+own suffix cut first. The default tag belongs to the router's repository and
 stands on the router's tag, so a repository of the operator's own is refused
 without its tag, and so is a router image named by a digest. No release
 older than the first that publishes a controller image has one, so a tag
@@ -1082,7 +1082,7 @@ comparer can hold: any other tag takes the default.
 {{- end -}}
 {{- $registry := $image.registry | default .Values.global.image.registry -}}
 {{- $repository := $image.repository | default .Values.global.image.repository -}}
-{{- $tag := $image.tag | default (printf "%s-policy-controller" (trimSuffix "-slurm" $routerTag)) -}}
+{{- $tag := $image.tag | default (printf "%s-policy-controller" ($routerTag | trimSuffix "-slurm" | trimSuffix "-ol9")) -}}
 {{- printf "%s/%s:%s" $registry $repository $tag -}}
 {{- end }}
 
@@ -1130,7 +1130,7 @@ schema's check is skipped.
 {{- end -}}
 {{- if $claim -}}
 {{- if (.Values.policyController).spec -}}
-{{- fail (printf "policyController.specStoreClaim names %s and policyController.spec holds a document: the controller refuses a start that names two sources of its policy spec. Set policyController.spec to null and upgrade with --reset-then-reuse-values or --reset-values (an empty map does not clear a reused document, and under --reuse-values a null does not either), or leave the claim unnamed" $claim) -}}
+{{- fail (printf "policyController.specStoreClaim names %s and policyController.spec holds a document: the controller refuses a start that names two sources of its policy spec. Set policyController.spec to null and upgrade with --reset-then-reuse-values or --reset-values, which drops the release's other overrides: give them again (an empty map does not clear a reused document, and under --reuse-values a null does not either), or leave the claim unnamed" $claim) -}}
 {{- end -}}
 {{- if include "smg.policyControllerElection" . -}}
 {{- fail (printf "policyController.specStoreClaim names %s with policyController.election.enabled on: another replica can take the controller's lease, and a standby does not follow an applied generation in this build. Turn the election off, or keep the spec document" $claim) -}}

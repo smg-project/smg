@@ -98,9 +98,9 @@ jobs:
 
       - name: Copy protos and build
         run: |
-          rm -f crates/grpc_client/python/smg_grpc_proto/proto
+          rm -rf crates/grpc_client/python/smg_grpc_proto/proto
           mkdir -p crates/grpc_client/python/smg_grpc_proto/proto
-          cp crates/grpc_client/proto/*.proto crates/grpc_client/python/smg_grpc_proto/proto/
+          cp crates/grpc_client/proto/*.proto crates/worker/proto/*.proto crates/grpc_client/python/smg_grpc_proto/proto/
           pip install build grpcio-tools
           rm -rf crates/grpc_client/python/dist/
           cd crates/grpc_client/python && python -m build
@@ -257,9 +257,9 @@ jobs:
 
       - name: Run grpc_servicer unit tests
         run: |
-          rm -f crates/grpc_client/python/smg_grpc_proto/proto
+          rm -rf crates/grpc_client/python/smg_grpc_proto/proto
           mkdir -p crates/grpc_client/python/smg_grpc_proto/proto
-          cp crates/grpc_client/proto/*.proto crates/grpc_client/python/smg_grpc_proto/proto/
+          cp crates/grpc_client/proto/*.proto crates/worker/proto/*.proto crates/grpc_client/python/smg_grpc_proto/proto/
           # msgspec and pydantic gate the sidecar-protocol, fake-redis and
           # limit-options tests; numpy gates the Rust servicer's media bridge
           # tests (it lends tensor buffers as numpy views). Modules gated on
@@ -951,6 +951,7 @@ jobs:
               - 'crates/tokenizer/**'
               - 'crates/protocols/**'
               - 'crates/worker/**'
+              - 'crates/workflow/**'
             rust-multimodal:
               - *rust-infra
               - 'crates/multimodal/**'
@@ -962,6 +963,7 @@ jobs:
               - 'crates/response_template/**'
               - 'crates/protocols/**'
               - 'crates/worker/**'
+              - 'crates/workflow/**'
             rust-agentic:
               - *rust-infra
               - 'crates/data_connector/**'
@@ -975,6 +977,7 @@ jobs:
               - *rust-infra
               - 'crates/protocols/**'
               - 'crates/worker/**'
+              - 'crates/workflow/**'
               - 'crates/external_router/**'
               - 'crates/auth/**'
               - 'crates/rl/**'
@@ -992,6 +995,7 @@ jobs:
               - 'crates/gateway_perf/**'
               - 'crates/protocols/**'
               - 'crates/worker/**'
+              - 'crates/workflow/**'
               - 'crates/tokenizer/**'
               - 'crates/kv_index/**'
             rust-kv:
@@ -1014,6 +1018,7 @@ jobs:
               - 'crates/mock_worker/**'
               - 'crates/protocols/**'
               - 'crates/worker/**'
+              - 'crates/workflow/**'
               - 'crates/tokenizer/**'
             rust-radix:
               - *rust-infra

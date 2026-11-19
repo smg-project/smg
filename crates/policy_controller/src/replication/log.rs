@@ -4,7 +4,7 @@
 
 use std::{
     collections::{vec_deque, VecDeque},
-    fmt,
+    fmt, mem,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -214,8 +214,9 @@ struct Ring {
     adopting: Option<Position>,
     /// How many places a standby has asked for, wrapping: a guard gives the
     /// pending place up while its own is the last asked for, and reads the
-    /// count for that alone. Its four bytes stand beside `leads`, so the
-    /// ring keeps its size, and with it the lock's place in [`Log`].
+    /// count for that alone. A guard misreads it only if it outlives 2^32
+    /// later adoptions, and a guard lives one apply. Its four bytes stand
+    /// beside `leads`: the count adds nothing to the ring's size.
     adoptions: u32,
     /// Whether the store leads the log's term: from its take until it
     /// follows another history.
@@ -315,12 +316,19 @@ impl Ring {
 ///
 /// The bound in bytes: a slot is at most 120 bytes whatever the event. A
 /// load row is its slot alone: 65,536 of them are 7.9 MB, held from the
-/// start. A membership event's rows stand apart from its slot, 320 bytes a
-/// row and its strings: about 0.51 KB an event at a row of a short URL, one
+/// start. A membership event's rows stand apart from its slot, 328 bytes a
+/// row and its strings: about 0.52 KB an event at a row of a short URL, one
 /// model, no label, no pairing descriptor and no encode connector, a second
 /// row for a replacement, so 4,096 membership events are about 2.1 MB at
 /// that row. A pairing descriptor stands apart from its row, 168 bytes and
-/// its strings, held once for every copy of that row.
+/// its strings, held once for every copy of that row, and so does a
+/// provider's key, 64 bytes and its strings.
+///
+/// The fields stand in the order written (`repr(C)`), the lock first: a
+/// read addresses the ring off the log's own pointer, whatever the ring's
+/// size. On a 64-bit target each field's size is a multiple of eight
+/// bytes, so the order costs no padding. The build holds both.
+#[repr(C)]
 pub struct Log {
     ring: Mutex<Ring>,
     /// The highest term the log has seen: the store's takes, the events it
@@ -340,6 +348,20 @@ pub struct Log {
     /// `moves` is past it, and is told under no lock.
     told_at: AtomicU64,
 }
+
+// The layout the log's doc states: the lock is the first field, and on a
+// 64-bit target the declared order leaves no padding between the fields.
+const _: () = {
+    assert!(mem::offset_of!(Log, ring) == 0);
+    #[cfg(target_pointer_width = "64")]
+    assert!(
+        size_of::<Log>()
+            == size_of::<Mutex<Ring>>()
+                + 3 * size_of::<AtomicU64>()
+                + 2 * size_of::<usize>()
+                + size_of::<Option<Box<dyn Fn() + Send + Sync>>>()
+    );
+};
 
 impl fmt::Debug for Log {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -612,9 +634,32 @@ impl Log {
         Ok(ended.then(|| self.moves.load(Ordering::Relaxed)))
     }
 
-    fn push(&self, event: Event) {
+    /// One write journaled. `by` is the place a standby's applier holds
+    /// for the write ([`Log::adopt`]), and none for a write of the store's
+    /// own. The applier's write lands at its place while its guard holds
+    /// it, and at no other place of its leader's. A write of the store's
+    /// own takes no such place: it stands where the store's own writes
+    /// stand, and the hold ends with it, so the leader's event does not
+    /// land.
+    ///
+    /// An applier's write whose hold ended is let go while the store
+    /// follows: a snapshot puts its tables right. Where the store took a
+    /// term since the place was asked for, its tables took the row under
+    /// its own lead and no snapshot follows: the row stands as a write of
+    /// the store's own under that term, so the log holds what the tables
+    /// hold. A term's start wrote no row, and is let go there too.
+    fn push(&self, by: Option<Position>, event: Event) {
         let mut ring = self.ring.lock();
-        let at = match ring.adopting.take() {
+        let held = ring.adopting.take();
+        let lands = by.filter(|at| held == Some(*at));
+        // The hold ended before the applier's write: it is let go, or it
+        // stands as the store's own.
+        if let (Some(at), None) = (by, lands) {
+            if !self.took_since(&ring, at) || matches!(event, Event::Term) {
+                return;
+            }
+        }
+        let at = match lands {
             Some(at) => {
                 self.follow(&mut ring, at);
                 at
@@ -645,6 +690,14 @@ impl Log {
         } else {
             0
         }
+    }
+
+    /// Whether the store took a term since the place `at` was asked for:
+    /// it leads a term above the place's. A guard is refused a place under
+    /// a term below the log's ([`Log::adopt`]), so the log's term rose
+    /// past it since, and by a take: the store leads.
+    fn took_since(&self, ring: &Ring, at: Position) -> bool {
+        ring.leads && at.term < self.term.load(Ordering::Relaxed)
     }
 
     /// The store follows the history `at` stands in, a leader's event that
@@ -705,9 +758,11 @@ impl Log {
     }
 
     /// A standby's application of the leader's event at `at`: while the
-    /// returned guard stands, the store's next write is journaled at that
-    /// position under that term, the leader's own, so a position and its
-    /// term name one history on every replica that holds them. Refused
+    /// returned guard stands, the write that names that place is journaled
+    /// there under that term, the leader's own, so a position and its term
+    /// name one history on every replica that holds them. The applier's
+    /// write names it, through the store's door for a followed write
+    /// ([`Journal::member`]), and no other write does. Refused
     /// unless `at` is the position after the head, under a named term not
     /// below any the log has seen, and the head is a leader's write or the
     /// start: a gap, a replay, a falling term and a write of the store's
@@ -717,9 +772,12 @@ impl Log {
     /// a leader's first position by [`Log::join`].
     ///
     /// A store that follows has one writer of journaled writes, the one
-    /// that applies the leader's batches. Once an event lands, the term the
-    /// store led is over: a write of its own stands under no term until
-    /// the store takes a term again.
+    /// that applies the leader's batches. A write of the store's own that
+    /// comes while a guard stands has no part in the guard's place: it
+    /// stands under no term, the hold ends with it, and the event does not
+    /// land ([`Adopting::landed`]). Once an event lands, the term the store
+    /// led is over: a write of its own stands under no term until the
+    /// store takes a term again.
     pub fn adopt(&self, at: Position) -> Result<Adopting<'_>, Lost> {
         let mut ring = self.ring.lock();
         let unled = ring.head.term == 0 && ring.head.seq != 0;
@@ -824,12 +882,13 @@ pub struct Adopting<'a> {
 }
 
 impl Adopting<'_> {
-    /// Whether the store wrote: the head is the adopted position. One of a
-    /// leader's events may write nothing to its twin, a term's start the
-    /// store was told before, and the standby marks its place
-    /// ([`Adopting::mark`]). A store that wrote nothing for any other event
-    /// is not the leader's twin: a worker's load rows stand between its
-    /// registration and its leaving in the leader's log, so each lands.
+    /// Whether the applier's write landed: the head is the adopted
+    /// position. A term's start writes no row, and the store's door for it
+    /// journals the place alone ([`Journal::term_followed`]). A store that
+    /// journaled nothing there is not the leader's twin: its tables did
+    /// not take the event, or a write of its own ended the hold first. A
+    /// worker's load rows stand between its registration and its leaving
+    /// in the leader's log, so each lands.
     pub fn landed(&self) -> bool {
         self.log.head(Kinds::All) == self.at
     }
@@ -870,6 +929,7 @@ impl Drop for Adopting<'_> {
 impl Journal for Log {
     fn member(
         &self,
+        at: Option<Position>,
         epoch: u64,
         change: MembershipChange,
         row: Option<&WorkerRow>,
@@ -877,36 +937,34 @@ impl Journal for Log {
     ) {
         // The rows are copied before the log's lock is taken.
         let copy = |row: &WorkerRow| Arc::new(row.clone());
-        self.push(Event::Member {
-            epoch,
-            change,
-            row: row.map(copy),
-            left: left.map(copy),
-        });
+        self.push(
+            at,
+            Event::Member {
+                epoch,
+                change,
+                row: row.map(copy),
+                left: left.map(copy),
+            },
+        );
     }
 
-    fn load(&self, id: WorkerId, rank: u16, sample: &LoadSample) {
+    fn load(&self, at: Option<Position>, id: WorkerId, rank: u16, sample: &LoadSample) {
         // A log of the watched kinds alone: the row takes no position.
         if self.loads == 0 {
             return;
         }
-        self.push(Event::Load {
-            id,
-            rank,
-            sample: *sample,
-        });
+        self.push(
+            at,
+            Event::Load {
+                id,
+                rank,
+                sample: *sample,
+            },
+        );
     }
 
     fn term_rose(&self, term: u64) {
         let mut ring = self.ring.lock();
-        // Told while that term's first position is being applied, the term
-        // is its leader's: the place is journaled and the store follows.
-        if let Some(at) = ring.adopting.filter(|at| at.term == term) {
-            ring.adopting = None;
-            self.follow(&mut ring, at);
-            self.append(&mut ring, at, Event::Term);
-            return;
-        }
         if term <= self.term.load(Ordering::Relaxed) {
             return;
         }
@@ -920,6 +978,10 @@ impl Journal for Log {
             term,
         };
         self.append(&mut ring, at, Event::Term);
+    }
+
+    fn term_followed(&self, at: Position) {
+        self.push(Some(at), Event::Term);
     }
 
     fn carries_loads(&self) -> bool {
@@ -966,26 +1028,44 @@ mod tests {
     /// The mark a membership event reads as, above its epoch.
     const MEMBER: u32 = 1_000_000;
 
+    /// A load row of the store's own, marked by its `running`.
     fn load(log: &Log, running: u32) {
-        let at = Instant::now();
-        let sample = LoadSample {
+        log.load(None, WorkerId(7), 0, &sample(running));
+    }
+
+    /// A leader's load row applied at `at`, the place a guard holds.
+    fn load_at(log: &Log, at: Position, running: u32) {
+        log.load(Some(at), WorkerId(7), 0, &sample(running));
+    }
+
+    fn sample(running: u32) -> LoadSample {
+        let now = Instant::now();
+        LoadSample {
             row: LoadRow {
                 running,
                 ..LoadRow::default()
             },
-            received_at: at,
-            sampled_at: at,
+            received_at: now,
+            sampled_at: now,
             source: LoadSource::Stream,
-        };
-        log.load(WorkerId(7), 0, &sample);
+        }
     }
 
-    /// A write of the watched kinds, marked by its epoch.
+    /// A write of the watched kinds of the store's own, marked by its epoch.
     fn member(log: &Log, epoch: u32) {
-        let change = MembershipChange::Relabelled {
+        log.member(None, u64::from(epoch), relabel(epoch), None, None);
+    }
+
+    /// A leader's write of the watched kinds applied at `at`, the place a
+    /// guard holds.
+    fn member_at(log: &Log, at: Position, epoch: u32) {
+        log.member(Some(at), u64::from(epoch), relabel(epoch), None, None);
+    }
+
+    fn relabel(epoch: u32) -> MembershipChange {
+        MembershipChange::Relabelled {
             id: WorkerId(u64::from(epoch)),
-        };
-        log.member(u64::from(epoch), change, None, None);
+        }
     }
 
     /// Each event's mark, in order: a load row's `running`, a membership
@@ -1040,25 +1120,33 @@ mod tests {
     /// Applies a leader's load row at `at`, as a standby does.
     fn apply(log: &Log, at: Position, mark: u32) {
         let adopting = log.adopt(at).expect("the next position");
-        load(log, mark);
+        load_at(log, at, mark);
         assert!(adopting.landed());
     }
 
     /// Applies a leader's entries in order, as a standby does: each by the
-    /// store's own write under the guard, a term's start by the mark.
+    /// journal's door for a followed write, at the place its guard holds.
     fn applies(follower: &Log, led: &[Entry]) {
         for entry in led {
             let adopting = follower.adopt(entry.at).expect("the next position");
             assert!(!adopting.landed());
             match &entry.event {
-                Event::Load { id, rank, sample } => follower.load(*id, *rank, sample),
-                Event::Term => adopting.mark(),
+                Event::Load { id, rank, sample } => {
+                    follower.load(Some(entry.at), *id, *rank, sample);
+                }
+                Event::Term => follower.term_followed(entry.at),
                 Event::Member {
                     epoch,
                     change,
                     row,
                     left,
-                } => follower.member(*epoch, *change, row.as_deref(), left.as_deref()),
+                } => follower.member(
+                    Some(entry.at),
+                    *epoch,
+                    *change,
+                    row.as_deref(),
+                    left.as_deref(),
+                ),
             }
             assert!(adopting.landed());
         }
@@ -1066,11 +1154,13 @@ mod tests {
 
     #[test]
     fn a_slot_is_at_most_120_bytes_and_a_membership_row_stands_apart() {
-        // The log's bound in bytes is told from these two: a ring's slots,
-        // and apart from its slot a membership event's rows (two for a
-        // replacement), each with its strings.
+        // The log's bound in bytes is told from these: a ring's slots, and
+        // apart from its slot a membership event's rows (two for a
+        // replacement), each with its strings. A provider's key stands
+        // apart from its row, behind a pointer's two counts.
         assert!(size_of::<Entry>() <= 120);
-        assert!(size_of::<WorkerRow>() <= 320);
+        assert!(size_of::<WorkerRow>() <= 328);
+        assert!(size_of::<crate::store::ProviderKey>() + 2 * size_of::<usize>() <= 64);
     }
 
     #[test]
@@ -2008,10 +2098,10 @@ mod tests {
         // An applier that keeps one binding for its guards: the second
         // guard is made before the first drops.
         let mut adopting = log.adopt(at(1, 3)).expect("the next position");
-        load(&log, 1);
+        load_at(&log, at(1, 3), 1);
         assert!(adopting.landed());
         adopting = log.adopt(at(2, 3)).expect("the next position");
-        load(&log, 2);
+        load_at(&log, at(2, 3), 2);
         assert!(adopting.landed(), "the first guard's drop took the place");
         // An event tried again while its first guard stands: neither the
         // first guard's mark nor its drop takes the second's place.
@@ -2020,7 +2110,7 @@ mod tests {
         first.mark();
         assert_eq!(log.head(All), at(2, 3), "the first guard's mark wrote");
         drop(first);
-        load(&log, 3);
+        load_at(&log, at(3, 3), 3);
         assert!(second.landed(), "the first guard's drop took the place");
         assert_eq!(marks(&all(&log)), [1, 2, 3]);
     }
@@ -2036,24 +2126,60 @@ mod tests {
         // The first guard's is not the last asked for, on either side of
         // the wrap: its drop leaves the second's place.
         drop(first);
-        load(&log, 1);
+        load_at(&log, at(1, 3), 1);
         assert!(second.landed(), "the first guard's drop took the place");
         // The last asked for gives its own place up.
         drop(log.adopt(at(2, 3)).expect("the next position"));
-        load(&log, 2);
+        load_at(&log, at(2, 3), 2);
         assert_ne!(log.head(All), at(2, 3), "a dropped guard's place was taken");
     }
 
-    /// The lock is the log's first field, as the compiler lays the log out:
-    /// a read then addresses the ring off the log's own pointer. With the
-    /// lock further in, a read keeps the lock's address in a register of
-    /// its own, and its loop runs three instructions more an entry. The
-    /// compiler orders the fields by their sizes, so the ring's size
-    /// decides it: eight bytes more move the lock behind two fields.
+    /// The lock is the log's first field, by the order the log declares
+    /// (`repr(C)`): a read addresses the ring off the log's own pointer.
+    /// With the lock further in, a read keeps the lock's address in a
+    /// register of its own, and its loop runs three instructions more an
+    /// entry. Left to the compiler, the order follows the ring's size:
+    /// eight bytes more moved the lock behind two fields.
     #[test]
-    #[cfg(target_pointer_width = "64")]
     fn the_logs_lock_is_its_first_field() {
         assert_eq!(std::mem::offset_of!(Log, ring), 0);
+    }
+
+    #[test]
+    fn a_write_of_the_stores_own_takes_no_place_a_guard_holds_and_ends_the_hold() {
+        for own in ["a load row", "a member"] {
+            for led in ["a load row", "a member", "a term's start"] {
+                let log = Log::new(8, 8);
+                apply(&log, at(1, 3), 1);
+                // The store writes of its own while a guard holds the next
+                // place for its leader's event: a poll's answer that was
+                // out when the store stopped leading.
+                let adopting = log.adopt(at(2, 4)).expect("the next position");
+                match own {
+                    "a load row" => load(&log, 9),
+                    _ => member(&log, 9),
+                }
+                // It stands where the store's own writes stand, under no
+                // term, and the hold ended with it: the leader's event
+                // lands nowhere, and the log follows no term by it.
+                match led {
+                    "a load row" => load_at(&log, at(2, 4), 2),
+                    "a member" => member_at(&log, at(2, 4), 2),
+                    _ => log.term_followed(at(2, 4)),
+                }
+                assert!(!adopting.landed(), "{own} inside {led}");
+                assert_eq!(
+                    places(&all(&log)),
+                    [at(1, 3), at(2, 0)],
+                    "{own} inside {led}"
+                );
+                assert_eq!(log.term(), 3, "{own} inside {led}");
+                // Nothing of that leader's continues the log from there:
+                // the standby starts again from a snapshot.
+                drop(adopting);
+                assert_eq!(log.adopt(at(3, 4)).err(), Some(Lost), "{own} inside {led}");
+            }
+        }
     }
 
     #[test]
@@ -2069,6 +2195,63 @@ mod tests {
         load(&log, 2);
         assert_eq!(places(&all(&log)), [at(1, 3), at(2, 4), at(3, 4)]);
         assert_eq!(marks(&all(&log)), [1, TERM, 2]);
+    }
+
+    #[test]
+    fn an_appliers_write_that_a_take_overtook_stands_as_the_stores_own() {
+        for led in ["a load row", "a member", "a term's start"] {
+            let log = Log::new(8, 8);
+            apply(&log, at(1, 3), 1);
+            // The store takes a lease between the applier's guard and its
+            // write: the tables take the row under the store's own lead,
+            // and no snapshot follows a take.
+            let adopting = log.adopt(at(2, 3)).expect("the next position");
+            log.term_rose(4);
+            match led {
+                "a load row" => load_at(&log, at(2, 3), 2),
+                "a member" => member_at(&log, at(2, 3), 2),
+                _ => log.term_followed(at(2, 3)),
+            }
+            // The event landed at no place of its leader's. A row stands
+            // as a write of the store's own under the term taken, so the
+            // log holds what the tables hold; a term's start wrote no row
+            // and takes no place.
+            assert!(!adopting.landed(), "{led}");
+            let (places_held, marks_held) = match led {
+                "a load row" => (vec![at(1, 3), at(2, 4), at(3, 4)], vec![1, TERM, 2]),
+                "a member" => (
+                    vec![at(1, 3), at(2, 4), at(3, 4)],
+                    vec![1, TERM, MEMBER + 2],
+                ),
+                _ => (vec![at(1, 3), at(2, 4)], vec![1, TERM]),
+            };
+            assert_eq!(places(&all(&log)), places_held, "{led}");
+            assert_eq!(marks(&all(&log)), marks_held, "{led}");
+            assert_eq!(log.leads(4), Ok(()), "{led}");
+        }
+        // A store that leads an earlier term than the event's took nothing
+        // since the guard: a late write of its own ends the hold, and the
+        // applier's write is let go, as on a store that follows.
+        let log = Log::new(8, 8);
+        log.term_rose(5);
+        let adopting = log.adopt(at(2, 6)).expect("the next position");
+        load(&log, 9);
+        load_at(&log, at(2, 6), 2);
+        assert!(!adopting.landed());
+        assert_eq!(places(&all(&log)), [at(1, 5), at(2, 5)]);
+        assert_eq!(marks(&all(&log)), [TERM, 9]);
+        // A store that follows took no term either. A later guard's write
+        // landed under a later term: the earlier guard's is let go.
+        let log = Log::new(8, 8);
+        apply(&log, at(1, 3), 1);
+        let earlier = log.adopt(at(2, 3)).expect("the next position");
+        let later = log.adopt(at(2, 4)).expect("the next position");
+        member_at(&log, at(2, 4), 2);
+        assert!(later.landed());
+        member_at(&log, at(2, 3), 9);
+        assert!(!earlier.landed());
+        assert_eq!(places(&all(&log)), [at(1, 3), at(2, 4)]);
+        assert_eq!(marks(&all(&log)), [1, MEMBER + 2]);
     }
 
     #[test]
@@ -2432,7 +2615,7 @@ mod tests {
                 "a restart" => log.restart(at(3, 5)).expect("a place the log takes"),
                 _ => {
                     let adopting = log.adopt(at(3, 5)).expect("the next position");
-                    log.term_rose(5);
+                    log.term_followed(at(3, 5));
                     assert!(adopting.landed());
                 }
             }
@@ -2514,10 +2697,10 @@ mod tests {
     fn a_term_told_while_its_start_is_applied_is_the_leaders_and_no_take() {
         let log = Log::new(8, 8);
         apply(&log, at(1, 3), 1);
-        // The standby's store is told the leader's term by its own entry,
-        // under the guard of that term's first position.
+        // The standby's store follows the leader's term by its own entry,
+        // at the place the guard of that term's first position holds.
         let adopting = log.adopt(at(2, 5)).expect("the next position");
-        log.term_rose(5);
+        log.term_followed(at(2, 5));
         assert!(adopting.landed());
         drop(adopting);
         assert_eq!(places(&all(&log)), [at(1, 3), at(2, 5)]);

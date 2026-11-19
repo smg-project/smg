@@ -7,8 +7,7 @@ mod response_processing;
 pub(crate) use preparation::DecisionsPreparationStage;
 pub(crate) use request_building::DecisionsRequestBuildingStage;
 pub(crate) use response_processing::DecisionsResponseProcessingStage;
-
-use crate::worker::{ConnectionMode, RuntimeType, Worker, WorkerType};
+use smg_worker::identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType};
 
 pub(crate) fn supports_worker(worker: &dyn Worker) -> bool {
     *worker.connection_mode() == ConnectionMode::Grpc

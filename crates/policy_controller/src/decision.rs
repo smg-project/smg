@@ -1,5 +1,5 @@
 //! The typed decision (design 4.2): an ordered list of targets the host walks
-//! at commit, a shed with its reason and the stage that emptied the pool, or
+//! at dispatch, a shed with its reason and the stage that emptied the pool, or
 //! a queue ticket. A busy answer is not a decision: a remote decider gives it
 //! on its stream and the host's fallback takes over at once, so the enum
 //! never carries one.
@@ -170,10 +170,11 @@ impl fmt::Debug for Survivors {
 /// the order the all-vetoed rule lifts them: the mark a host counts such
 /// picks from. The rule's own pick writes it, and so does the pick of a
 /// session key kept on its worker where the veto as it stands kept no
-/// worker. Every other pick reads `None`, the default. One mark is the
-/// decision's, since the pick and its alternates are of the one lifted
-/// pool. The mark sits in a byte the record had spare: the trace is no
-/// larger for it.
+/// worker. A key handed on at its sessions rule's in-flight cap writes it
+/// too, where the veto as it stands kept no worker under the cap. Every
+/// other pick reads `None`, the default. One mark is the decision's, since
+/// the pick and its alternates are of the one lifted pool. The mark sits in
+/// a byte the record had spare: the trace is no larger for it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Lifted {
@@ -223,7 +224,8 @@ pub struct Trace {
     pub seed: u64,
     pub generation: u64,
     /// The soft veto lifted for this pick ([`Lifted`]): `None` unless that
-    /// veto as it stands left the pool nobody.
+    /// veto as it stands left the pool nobody, or left a key handed on at
+    /// its sessions rule's in-flight cap nobody under the cap.
     pub lifted: Lifted,
 }
 

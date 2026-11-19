@@ -93,6 +93,8 @@ mod grpc_plugin;
 #[expect(dead_code, reason = "this binary reads no admin page")]
 #[path = "common/net.rs"]
 mod net;
+#[path = "common/pair.rs"]
+mod pair;
 #[cfg(feature = "wasm")]
 #[expect(
     dead_code,
@@ -274,18 +276,31 @@ fn nth(run: &str, n: u64) -> DecideRequest {
     ask
 }
 
+/// Whether the fleet's pool of `rows` rows reads overloaded on the rows of
+/// `engine` and on no other; with no engine, on no row. A view of another
+/// size is no answer, and neither is one that holds no row of `engine`: an
+/// empty or a partial pool reads false.
+fn reads_overloaded(harness: &mut Harness, rows: usize, engine: Option<usize>) -> bool {
+    harness.view(MODEL, Role::Single).is_ok_and(|pool| {
+        pool.len() == rows
+            && engine.is_none_or(|engine| pool.iter().any(|row| row.engine == engine))
+            && pool
+                .iter()
+                .all(|row| row.overloaded == (Some(row.engine) == engine))
+    })
+}
+
 /// Waits until the rows of `engine` read overloaded and no other row of the
-/// fleet's pool does; with no engine, until no row does.
-async fn overloaded(harness: &mut Harness, engine: Option<usize>) -> Result<Duration, String> {
+/// fleet's pool of `rows` rows does; with no engine, until no row does.
+async fn overloaded(
+    harness: &mut Harness,
+    rows: usize,
+    engine: Option<usize>,
+) -> Result<Duration, String> {
     within(
         "the pool reads overloaded where a patch stands, and there alone",
         POLL_INTERVAL + ROOM,
-        || {
-            harness.view(MODEL, Role::Single).is_ok_and(|pool| {
-                pool.iter()
-                    .all(|row| row.overloaded == (Some(row.engine) == engine))
-            })
-        },
+        || reads_overloaded(harness, rows, engine),
     )
     .await
 }
@@ -843,11 +858,12 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             kv_usage_permille: Some(1),
             ..OverloadThresholds::default()
         };
+        let whole = harness.view(MODEL, Role::Single).expect("the view").len();
         harness
             .patch_overload(busy, least)
             .await
             .expect("an operator's patch is taken");
-        overloaded(&mut harness, Some(busy))
+        overloaded(&mut harness, whole, Some(busy))
             .await
             .expect("an engine at its patched limit reads overloaded");
         let mut vetoed = HashSet::new();
@@ -877,11 +893,15 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             ranks,
             "the gateway's lift of the veto keeps the overloaded row: {lifted:?}"
         );
+        assert!(
+            reads_overloaded(&mut harness, whole, Some(busy)),
+            "the engine read overloaded through both rotations"
+        );
         harness
             .patch_overload(busy, OverloadThresholds::default())
             .await
             .expect("an operator's patch is taken");
-        overloaded(&mut harness, None)
+        overloaded(&mut harness, whole, None)
             .await
             .expect("the patch taken back, no row reads overloaded");
 
@@ -1356,11 +1376,12 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             }
         }
         let (key, row) = held.expect("of 256 routing keys one is the busy engine's");
+        let whole = harness.view(MODEL, Role::Single).expect("the view").len();
         harness
             .patch_overload(busy, least)
             .await
             .expect("an operator's patch is taken");
-        overloaded(&mut harness, Some(busy))
+        overloaded(&mut harness, whole, Some(busy))
             .await
             .expect("an engine at its patched limit reads overloaded");
         for n in 0..8 {
@@ -1372,11 +1393,15 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
                 "a session key keeps its ring worker over the veto"
             );
         }
+        assert!(
+            reads_overloaded(&mut harness, whole, Some(busy)),
+            "the engine read overloaded through the key's asks"
+        );
         harness
             .patch_overload(busy, OverloadThresholds::default())
             .await
             .expect("an operator's patch is taken");
-        overloaded(&mut harness, None)
+        overloaded(&mut harness, whole, None)
             .await
             .expect("the patch taken back, no row reads overloaded");
 
@@ -2149,6 +2174,189 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
         .expect("the case ends inside its outer bound");
 }
 
+/// The model the pair's engines serve.
+const PAIRED: &str = "fleet-paired-model";
+
+/// The pair's fleet: two engines prefill and two decode, each of one rank
+/// on the first wire.
+const PAIR_FLEET: [Shape; 4] = [
+    Shape {
+        model: PAIRED,
+        role: Role::Prefill,
+        ranks: 1,
+        runtime: RuntimeType::Vllm,
+    },
+    Shape {
+        model: PAIRED,
+        role: Role::Prefill,
+        ranks: 1,
+        runtime: RuntimeType::Vllm,
+    },
+    Shape {
+        model: PAIRED,
+        role: Role::Decode,
+        ranks: 1,
+        runtime: RuntimeType::Vllm,
+    },
+    Shape {
+        model: PAIRED,
+        role: Role::Decode,
+        ranks: 1,
+        runtime: RuntimeType::Vllm,
+    },
+];
+
+/// The pair plan's document, as an operator writes it: a request at either
+/// phase of a pair is decided under the plan, each side by the least load.
+const PAIR_PLAN: &str = r#"{
+  "apiVersion": "smg.policy/v1",
+  "profiles": {
+    "side": { "filter": ["healthy"], "score": ["least-load"], "pick": "best" }
+  },
+  "bindings": [
+    {
+      "match": { "phase": ["prefill", "decode"] },
+      "plan": "pd-pair",
+      "profiles": { "prefill": "side", "decode": "side" }
+    }
+  ]
+}"#;
+
+/// The `n`th ask of the pair's run: for the pair's model, at the plan's
+/// prefill.
+fn at_prefill(n: u64) -> DecideRequest {
+    let mut ask = for_model(nth("pair", n), PAIRED);
+    if let Some(facts) = &mut ask.facts {
+        facts.phase = smg_policy_controller::proto::Phase::Prefill.into();
+    }
+    ask
+}
+
+/// Asks at a pair's prefill, and reads the pick's first target as the two
+/// rows of the fleet it names: the prefill side's, then the decode side's.
+/// The answer carries a lease a side under one id, the prefill side's
+/// first. Both are given up by that id, and have left the store's file
+/// before the next ask reads the rows.
+async fn paired(harness: &mut Harness, ask: DecideRequest) -> Result<(Picked, Picked), String> {
+    let before = harness.leases(GATEWAY);
+    let answer = harness.client().decide(ask).await;
+    let Ok(Answer::Decision(Decision {
+        leases,
+        outcome: Some(Outcome::Pick(pick)),
+        ..
+    })) = &answer
+    else {
+        return Err(format!("no pick: {answer:?}"));
+    };
+    let sides: Vec<(u64, Side)> = leases
+        .iter()
+        .map(|lease| (lease.id, lease.side()))
+        .collect();
+    let &[(id, Side::Prefill), (decode, Side::Decode)] = sides.as_slice() else {
+        return Err(format!(
+            "a pair's pick carries a lease a side, the prefill side's first: {leases:?}"
+        ));
+    };
+    if id != decode {
+        return Err(format!("a pair's leases are one id's: {leases:?}"));
+    }
+    let target = pick.targets.first().ok_or("a pick with no target")?;
+    let pair = target
+        .pair
+        .as_ref()
+        .ok_or("a pair's target names no decode side")?;
+    let rows = (
+        row_of(harness, target.id, target.dp_rank)?,
+        row_of(harness, pair.decode_id, pair.decode_dp_rank)?,
+    );
+    given_up(harness, &[id], before).await?;
+    Ok(rows)
+}
+
+/// A pair plan answers a request that enters at its prefill once, for both
+/// sides, over a fleet of its own: two engines that prefill and two that
+/// decode. Each side's worker is the one whose engine reports no requests,
+/// and the answer's two leases are one id's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pair_plan_answers_its_prefill_for_both_sides_by_the_loads_their_engines_told() {
+    let case = async {
+        let mut harness = Harness::start().await.expect("the harness starts");
+        let engines = harness
+            .register(&PAIR_FLEET)
+            .await
+            .expect("the pair's fleet registers");
+        let (held_prefill, idle_prefill) = (engines[0], engines[1]);
+        let (idle_decode, held_decode) = (engines[2], engines[3]);
+        let sides = [(Role::Prefill, held_prefill), (Role::Decode, held_decode)];
+        harness.feed();
+        within(
+            "each side's rows are healthy and hold a polled load row",
+            PROBE_INTERVAL + POLL_INTERVAL + ROOM,
+            || {
+                sides.iter().all(|&(side, _)| {
+                    harness.view(PAIRED, side).is_ok_and(|pool| {
+                        pool.len() == 2 && pool.iter().all(|row| row.healthy && row.load.is_some())
+                    })
+                })
+            },
+        )
+        .await
+        .expect("the pair's fleet turns ready");
+
+        // One engine of each side holds requests: its own report says so,
+        // and no other row of its side reads them.
+        for (_, held) in sides {
+            harness
+                .hold(held, HELD as usize)
+                .await
+                .expect("the held requests");
+        }
+        within(
+            "each side's held engine reads its requests, and no other",
+            POLL_INTERVAL + POLL_INTERVAL + ROOM,
+            || {
+                sides.iter().all(|&(side, held)| {
+                    harness.view(PAIRED, side).is_ok_and(|pool| {
+                        pool.iter().all(|row| {
+                            row.load
+                                .is_some_and(|load| (load.running == HELD) == (row.engine == held))
+                        })
+                    })
+                })
+            },
+        )
+        .await
+        .expect("the loads follow on both sides");
+
+        // The pair plan's document is applied in the case's process. A
+        // request enters the plan at its prefill and is answered once, for
+        // both sides, and neither names the engine that holds requests.
+        // Unread, a side's loads leave its pick to a draw of two: 64 asks
+        // miss it less than once in 10^19 runs.
+        let document = serde_json::from_str(PAIR_PLAN).expect("a well-formed document");
+        harness
+            .apply_document(document)
+            .expect("the pair plan's document applies");
+        for n in 0..ASKS {
+            let (prefill, decode) = paired(&mut harness, at_prefill(n))
+                .await
+                .expect("a pair's pick answers a request at its prefill");
+            assert_eq!(
+                prefill.engine, idle_prefill,
+                "a pair's prefill side leaves the engine that holds requests: {prefill:?}"
+            );
+            assert_eq!(
+                decode.engine, idle_decode,
+                "a pair's decode side leaves the engine that holds requests: {decode:?}"
+            );
+        }
+        harness.stop().await.expect("a clean stop");
+    };
+    tokio::time::timeout(CASE, Box::pin(case))
+        .await
+        .expect("the case ends inside its outer bound");
+}
+
 /// The blocking form of the reference client asks the same started
 /// controller from a thread that runs no runtime, and holds the same floor.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2532,4 +2740,172 @@ mod hosted {
             .await
             .expect("the case ends inside its outer bound");
     }
+}
+
+/// A pair's case in this harness: a standby takes the fleet when its leader
+/// stops. Two controllers stand over one lease. The fleet registers at the
+/// leader, and the standby holds every rank ready with its load row, under
+/// the id the leader gave it, by the leader's log alone. The leader stops
+/// and the standby leads under a higher term. A gateway that turns to it
+/// is answered over the same rows: each routing key is back on the worker
+/// it had, a request in flight at the stop is given up at no cost and
+/// booked nowhere twice, and the promoted controller's own driver reads
+/// the engines.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the standby binds 127.0.0.2: off Linux that takes a loopback alias"
+)]
+async fn a_standby_takes_the_fleet_when_its_leader_stops() {
+    let case = async {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let (mut harness, standby) = Harness::start_pair(&dir.path().join("lease"))
+            .await
+            .expect("a leader and its standby start");
+        let led = harness.term_floor();
+
+        // The fleet registers at the leader and turns ready there.
+        let shapes = &FLEET[..3];
+        let engines = harness.register(shapes).await.expect("the fleet registers");
+        let busy = engines[1];
+        let ranks = shapes.len();
+        harness.feed();
+        within(
+            "every rank is healthy and holds a polled load row",
+            PROBE_INTERVAL + POLL_INTERVAL + ROOM,
+            || {
+                harness.view(MODEL, Role::Single).is_ok_and(|pool| {
+                    pool.len() == ranks
+                        && pool.iter().all(|row| {
+                            row.healthy
+                                && row
+                                    .load
+                                    .is_some_and(|load| load.source == SignalSource::Poll)
+                        })
+                })
+            },
+        )
+        .await
+        .expect("the fleet turns ready");
+
+        // The standby follows: the leader's log alone brings it every rank,
+        // ready, with a load row, under the id the leader gave it.
+        within("the standby holds every rank of the fleet", ROOM, || {
+            harness.followed(&standby) == Ok(ranks)
+        })
+        .await
+        .expect("the standby follows its leader");
+
+        // A routing key has its worker under the ring preset, and one
+        // request is in flight: its lease is kept and dispatched.
+        harness
+            .apply("consistent_hashing")
+            .expect("a preset of this build applies");
+        let mut homes = Vec::new();
+        for key in 1..=ASKS {
+            let home = picked(&mut harness, keyed(nth("home", key), key))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            homes.push(home);
+        }
+        let (_, in_flight) = kept(&mut harness, nth("flight", 0))
+            .await
+            .expect("a pick answers an ask over a ready fleet");
+
+        // The leader stops, the planned stop. The standby takes the lease
+        // and leads under a term of its own, and the gateway that turns to
+        // it is welcomed there.
+        harness
+            .hand_over(standby)
+            .await
+            .expect("the standby takes the lead");
+        assert_eq!(harness.welcome().controller_id, "fleet-standby");
+        assert!(
+            harness.term_floor() > led,
+            "a promoted standby answers under a term above its leader's"
+        );
+        let pool = harness.view(MODEL, Role::Single).expect("the view");
+        assert!(
+            pool.len() == ranks && pool.iter().all(|row| row.healthy),
+            "a promoted standby holds its leader's rows, each ready: {pool:?}"
+        );
+
+        // No document crossed with the log: the case applies the one its
+        // leader held, as it did there. Each routing key is back on the
+        // worker it had, named by the id the leader gave the row.
+        harness
+            .apply("consistent_hashing")
+            .expect("a preset of this build applies");
+        for (key, home) in (1..=ASKS).zip(&homes) {
+            let again = picked(&mut harness, keyed(nth("again", key), key))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            assert_eq!(
+                again, *home,
+                "a routing key keeps its worker when a standby takes the lead"
+            );
+        }
+
+        // The request in flight at the stop is booked nowhere twice. Its
+        // lease was the stopped leader's: the promoted controller holds no
+        // lease of the gateway, takes the release with no error, and by
+        // the fewest requests a round of asks, each kept, names every row
+        // once.
+        assert_eq!(
+            harness.leases(GATEWAY),
+            0,
+            "a promoted standby holds no lease its leader issued"
+        );
+        given_up(&mut harness, &[in_flight], 0)
+            .await
+            .expect("a lease of the leader that stopped is given up at no cost");
+        let fewest = PolicySpec::power_of_two(PowerOfTwoMetric::LeastRequests)
+            .expect("a form of this build's preset");
+        harness
+            .apply_document(fewest)
+            .expect("a form of this build's preset applies");
+        let mut round = HashSet::new();
+        let mut leases = Vec::new();
+        for n in (0u64..).take(ranks) {
+            let (row, lease) = kept(&mut harness, nth("round", n))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            round.insert(row);
+            leases.push(lease);
+        }
+        assert_eq!(
+            round.len(),
+            ranks,
+            "a lease of the leader that stopped books no row of the promoted one: {round:?}"
+        );
+        given_up(&mut harness, &leases, 0)
+            .await
+            .expect("the leases given up leave the file");
+
+        // The promoted controller polls the engines itself from here on:
+        // requests held on one engine reach its row, and nobody else writes
+        // a load now.
+        harness
+            .hold(busy, HELD as usize)
+            .await
+            .expect("the held requests");
+        within(
+            "the busy engine's row reads its held requests",
+            POLL_INTERVAL + POLL_INTERVAL + ROOM,
+            || {
+                harness.view(MODEL, Role::Single).is_ok_and(|pool| {
+                    pool.iter().any(|row| {
+                        row.engine == busy && row.load.is_some_and(|load| load.running == HELD)
+                    })
+                })
+            },
+        )
+        .await
+        .expect("a promoted standby's own driver reads the engines");
+
+        harness.stop().await.expect("a clean stop");
+    };
+    tokio::time::timeout(CASE, Box::pin(case))
+        .await
+        .expect("the case ends inside its outer bound");
 }

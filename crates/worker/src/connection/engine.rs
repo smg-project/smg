@@ -1,19 +1,24 @@
 //! A worker's engine connection as the worker runtime sees it.
 //!
 //! [`EngineConnection`] holds the calls the runtime makes on a connected
-//! engine: liveness, the health and load reads and the admin calls, each in
-//! the worker's own types. [`EngineConnector`] makes a connection. The host
+//! engine: liveness, the health and load reads, the labels the engine
+//! reports of its model and of itself, the admin calls and the engine's two
+//! pushed streams, each in the crate's own types. [`EngineConnector`] makes
+//! a connection, and dials a gRPC address once. The host
 //! implements both over its own client type and hands the connector to the
 //! worker builder; the request path reads its own client type back from the
 //! handle with `downcast_arc`.
 
-use std::{any::Any, fmt, sync::Arc, time::Duration};
+use std::{any::Any, collections::HashMap, fmt, sync::Arc, time::Duration};
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use tokio::sync::OnceCell;
 
-use crate::worker::{ProfileOptions, RuntimeType, WorkerLoadResponse, WorkerType};
+use crate::{
+    common_proto::KvEventBatch,
+    worker::{ProfileOptions, RuntimeType, WorkerLoadResponse, WorkerType},
+};
 
 type ConnectionCell = OnceCell<Arc<dyn EngineConnection>>;
 
@@ -64,14 +69,27 @@ pub struct AdminAnswer {
     pub message: String,
 }
 
+/// An engine's answer to a health call, in the worker's own words.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealthAnswer {
+    /// Whether the engine says it can serve.
+    pub healthy: bool,
+    /// What the engine said about it; an engine may say nothing.
+    pub message: String,
+}
+
+/// The label of [`EngineConnection::server_labels`] that carries the KV
+/// transfer engine id.
+const KV_ENGINE_ID_LABEL: &str = "kv_engine_id";
+
 /// The calls the worker runtime makes on a worker's connection to its
 /// engine, over gRPC or ZMQ. The worker holds the host's client behind this
 /// trait and shares it with the request path.
 ///
-/// The engine's two event subscriptions are no call of this trait: they
-/// answer the wire's own messages, so the host's event monitor reads them
-/// from the host's client, read back through this handle. A connection of
-/// another type feeds that monitor no KV events and no load records.
+/// The engine's two pushed streams, its KV cache events and its load
+/// records, are calls of this trait: they answer the crate's own messages.
+/// A connection whose wire carries neither refuses both as unimplemented,
+/// and feeds no KV events and no load records.
 #[async_trait]
 pub trait EngineConnection: Any + Send + Sync {
     /// Whether the engine's wire carries the admin calls: the cache flush
@@ -82,8 +100,15 @@ pub trait EngineConnection: Any + Send + Sync {
     /// reconnect in place answers `false` once its engine is gone.
     fn is_alive(&self) -> bool;
 
-    /// Ask the engine whether it is healthy.
-    async fn health_check(&self) -> Result<bool, tonic::Status>;
+    /// Ask the engine whether it is healthy: its whole answer. An answer of
+    /// either verdict says the engine speaks this connection's wire.
+    async fn health_answer(&self) -> Result<HealthAnswer, tonic::Status>;
+
+    /// Ask the engine whether it is healthy: the verdict of
+    /// [`Self::health_answer`].
+    async fn health_check(&self) -> Result<bool, tonic::Status> {
+        self.health_answer().await.map(|answer| answer.healthy)
+    }
 
     /// Read the engine's load report.
     async fn get_loads(&self) -> Result<WorkerLoadResponse, tonic::Status>;
@@ -98,9 +123,31 @@ pub trait EngineConnection: Any + Send + Sync {
     /// Stop the profiling run in flight on the engine.
     async fn stop_profile(&self) -> Result<AdminAnswer, tonic::Status>;
 
-    /// The KV transfer engine id the engine's server info reports; `None`
-    /// when it reports none.
-    async fn kv_engine_id(&self) -> Result<Option<String>, tonic::Status>;
+    /// The labels the engine reports of the model it serves.
+    async fn model_labels(&self) -> Result<HashMap<String, String>, tonic::Status>;
+
+    /// The labels the engine reports of itself, its server info. An engine
+    /// whose wire has no such read answers `Unimplemented`.
+    async fn server_labels(&self) -> Result<HashMap<String, String>, tonic::Status>;
+
+    /// The KV transfer engine id among [`Self::server_labels`]; `None` when
+    /// the engine reports none.
+    async fn kv_engine_id(&self) -> Result<Option<String>, tonic::Status> {
+        let mut labels = self.server_labels().await?;
+        Ok(labels
+            .remove(KV_ENGINE_ID_LABEL)
+            .filter(|id| !id.is_empty()))
+    }
+
+    /// Subscribe to the engine's KV cache events from `start_seq` on.
+    async fn subscribe_kv_events(
+        &self,
+        start_seq: u64,
+    ) -> Result<tonic::Streaming<KvEventBatch>, tonic::Status>;
+
+    /// Subscribe to the engine's load records alone, no events.
+    async fn subscribe_load_records(&self)
+        -> Result<tonic::Streaming<KvEventBatch>, tonic::Status>;
 }
 
 impl dyn EngineConnection {
@@ -143,9 +190,9 @@ pub struct ZmqLink {
 /// default ([`ConnectorDefault`]); a worker with neither refuses a gRPC or
 /// ZMQ connect.
 ///
-/// The host's event monitor subscribes through the host's own client alone:
-/// a connector that hands out another connection leaves its workers without
-/// KV events, and their load polled.
+/// The KV event collector subscribes through the connection's two stream
+/// calls: a connector whose connections refuse them leaves its workers
+/// without KV events, and their load polled.
 #[async_trait]
 pub trait EngineConnector: fmt::Debug + Send + Sync {
     /// Connect to the gRPC server of an engine of `runtime` at `base_url`.
@@ -160,6 +207,12 @@ pub trait EngineConnector: fmt::Debug + Send + Sync {
     /// declared against the worker's. An error is the reason as the worker
     /// reports it.
     async fn connect_zmq(&self, link: ZmqLink) -> Result<Arc<dyn EngineConnection>, String>;
+
+    /// Dial the gRPC address `base_url` once and ask the server there
+    /// nothing, with `timeout` as the bound of the connect. It says whether
+    /// anything answers at the address, before a detection asks each
+    /// runtime in turn. An error is the reason as the detection reports it.
+    async fn dial_grpc(&self, base_url: &str, timeout: Duration) -> Result<(), String>;
 }
 
 /// The connector a builder gives a worker it was handed none for. It is a
@@ -181,3 +234,6 @@ impl ConnectorDefault for NoConnector {
         None
     }
 }
+
+#[cfg(test)]
+mod tests;

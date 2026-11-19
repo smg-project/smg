@@ -127,10 +127,20 @@ and never schedules. vLLM's `--allowed-media-domains`,
 `--allowed-local-media-path`, `--media-io-kwargs`, `--limit-mm-per-prompt` and
 `VLLM_*_FETCH_TIMEOUT` govern fetching on the worker; without
 `--allowed-media-domains` the worker fetches from any public host the router
-forwards. A media URL that names or resolves to a loopback, link-local or
+forwards. The worker reads that list as the router reads its own, for vLLM's
+check of the first URL and for its own check of every redirect: entries are
+trimmed and compared case-insensitively (an entry with padding or capitals,
+which used to match no host, now matches its host), and an IPv6 address is
+listed in brackets (`[2001:db8::1]`). vLLM's check wants the first URL to spell
+an IPv6 address as the entry does; on redirects any spelling of the address
+matches. A list whose entries are all blank still refuses every host. A media
+URL whose host carries an IPv6 zone ID (`[fe80::1%25eth0]`) is refused, as on
+the router, and an entry with one is ignored with a warning. A media URL that
+names or resolves to a loopback, link-local or
 private address is refused on the worker as on the router, redirects included,
-unless `SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS=1` is set for a deployment whose media
-origin is internal.
+unless `--mm-allow-private-media-hosts` (the sidecar's
+`--allow-private-media-hosts`, or `SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS=1`) is set
+for a deployment whose media origin is internal.
 Related knobs: `--mm-max-inflight` (`SMG_VLLM_MM_MAX_INFLIGHT`, default 64)
 bounds concurrent media jobs; `--mm-max-items` (`SMG_VLLM_MM_MAX_ITEMS`, unset
 by default) overrides the model's per-modality reference limits;

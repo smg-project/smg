@@ -12,16 +12,14 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use reqwest::Client;
+use smg_worker::identity::{basic::ConnectionMode, endpoint::Endpoint};
 use tracing::{debug, warn};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use super::discover_metadata::ModelsResponse;
-use crate::{
-    worker::{identity::endpoint::Endpoint, ConnectionMode},
-    workflow::{
-        data::{require_app_context, WorkerKind, WorkerWorkflowData},
-        steps::util::{grpc_base_url, grpc_health_answer, http_base_url},
-    },
+use crate::workflow::{
+    data::{require_app_context, WorkerKind, WorkerWorkflowData},
+    steps::util::{grpc_base_url, grpc_health_answer, http_base_url},
 };
 
 // ─── gRPC backend detection ────────────────────────────────────────────────
@@ -369,13 +367,11 @@ mod tests {
         Json, Router,
     };
     use serde_json::json;
+    use smg_worker::test_support::RefusedAddress;
     use tokio::net::TcpListener;
 
     use super::{detect_grpc_backend, detect_http_backend};
-    use crate::{
-        server::http_client, worker::test_support::RefusedAddress,
-        workflow::steps::util::mock_grpc_engine,
-    };
+    use crate::{server::http_client, workflow::steps::util::mock_grpc_engine};
 
     /// A runtime that answers its health RPC with `healthy: false` (its
     /// engine still loading) is identified all the same, with and without

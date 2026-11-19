@@ -144,6 +144,11 @@ pub enum ReadError {
     /// The family has no `GetLoads`.
     #[error("no GetLoads on a {0} engine")]
     Unsupported(String),
+    /// The probe's own client was not ready: its build failed, its build's
+    /// task was lost, or its build outlasted the scrape's timeout. The
+    /// controller's failure, no engine's.
+    #[error("the probe's client was not ready: {0}")]
+    Client(String),
 }
 
 impl ReadError {
@@ -155,6 +160,7 @@ impl ReadError {
             Self::Deadline(_) => "deadline",
             Self::NoLoad(_) => "no_load",
             Self::Unsupported(_) => "unsupported",
+            Self::Client(_) => "client",
         }
     }
 }
@@ -169,7 +175,9 @@ pub trait LoadProbe: Send + Sync + 'static {
         deadline: Duration,
     ) -> impl Future<Output = Result<WorkerLoadResponse, ReadError>> + Send;
 
-    /// The text of the engine's metrics endpoint, within `timeout`.
+    /// The text of the engine's metrics endpoint, within `timeout`. A probe
+    /// whose client's build outlasts `timeout` answers that scrape at the
+    /// build's end.
     fn scrape(
         &self,
         url: &str,
@@ -211,22 +219,30 @@ pub struct Failures {
     pub deadline: AtomicU64,
     pub no_load: AtomicU64,
     pub unsupported: AtomicU64,
+    pub client: AtomicU64,
 }
 
 impl Failures {
     /// The labels of the series, in the order of [`Self::each`]: each is its
     /// variant's [`ReadError::label`].
-    pub const LABELS: [&'static str; 5] =
-        ["transport", "answer", "deadline", "no_load", "unsupported"];
+    pub const LABELS: [&'static str; 6] = [
+        "transport",
+        "answer",
+        "deadline",
+        "no_load",
+        "unsupported",
+        "client",
+    ];
 
     /// The counters, in the order of [`Self::LABELS`].
-    fn counters(&self) -> [&AtomicU64; 5] {
+    fn counters(&self) -> [&AtomicU64; 6] {
         [
             &self.transport,
             &self.answer,
             &self.deadline,
             &self.no_load,
             &self.unsupported,
+            &self.client,
         ]
     }
 
@@ -239,13 +255,14 @@ impl Failures {
             ReadError::Deadline(_) => &self.deadline,
             ReadError::NoLoad(_) => &self.no_load,
             ReadError::Unsupported(_) => &self.unsupported,
+            ReadError::Client(_) => &self.client,
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
     /// The counts, with their labels.
-    pub fn each(&self) -> [(&'static str, u64); 5] {
-        let mut out = [("", 0); 5];
+    pub fn each(&self) -> [(&'static str, u64); 6] {
+        let mut out = [("", 0); 6];
         for (slot, (counter, name)) in out
             .iter_mut()
             .zip(self.counters().into_iter().zip(Self::LABELS))
@@ -456,7 +473,7 @@ where
     pub async fn run(&self, stop: watch::Receiver<bool>) {
         // No role to read: the polls run for the loop's length.
         let (_always, polls) = watch::channel(true);
-        self.run_while(stop, polls).await;
+        self.run_while(stop, polls, || 0).await;
     }
 
     /// [`LoadDriver::run`] on a replica that may follow a leader: the loop
@@ -466,15 +483,23 @@ where
     /// store names is read again at each tick. A turn to `false` ends the
     /// run of polls, with its calls still out and its grouping of the
     /// membership; a turn to `true` starts the next with a tick at once.
+    ///
+    /// `led` says the term the replica last took, read beside each word.
+    /// The watch keeps its last word alone: a loss and the take after it,
+    /// told before the loop looked, read as one `true`. Under another
+    /// term that word ends the run of polls and starts the next all the
+    /// same, so no call of the last lead lands on a store restored since.
     pub async fn run_while(
         &self,
         mut stop: watch::Receiver<bool>,
         mut polls: watch::Receiver<bool>,
+        led: impl Fn() -> u64,
     ) {
         let mut ticker = tokio::time::interval(self.config.tick);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut schedule = Schedule::default();
-        let mut polling = *polls.borrow_and_update();
+        // The word, and the term it was read under: one run of polls.
+        let (mut polling, mut under) = (*polls.borrow_and_update(), led());
         // A write of another task can leave the store an instant this loop
         // read none of (a registration's build): the store wakes the loop,
         // which reads the instant again.
@@ -496,8 +521,11 @@ where
                 biased;
                 _ = stop.wait_for(|stop| *stop) => return,
                 word = turned(&mut polls) => {
-                    if word != polling {
-                        polling = word;
+                    // The term is read after the word: a take sets it
+                    // before its word is told.
+                    let term = led();
+                    if (word, term) != (polling, under) {
+                        (polling, under) = (word, term);
                         schedule = Schedule::default();
                         if polling {
                             self.tick(&mut schedule);

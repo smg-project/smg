@@ -168,7 +168,8 @@ pub struct Needs {
     /// `min_group` assignment and the `fewest-sessions` scorer).
     pub active_sessions: bool,
     /// The request's own key's in-flight count per worker (a sessions rule
-    /// with an in-flight cap).
+    /// with an in-flight cap). A host that writes it says so on the request
+    /// ([`RequestFacts::session_counted`](crate::RequestFacts::session_counted)).
     pub session_in_flight: bool,
     /// The affinity column
     /// ([`RequestFacts::affinity`](crate::RequestFacts::affinity)): one
@@ -1305,9 +1306,12 @@ pub struct OverloadSpec {
     /// alone places the request: under the single plan, in a profile whose
     /// only scorer is `consistent-hash` with no `prefix_tokens` and no
     /// `bounded_load`, picked by `best` with no parameters, under no
-    /// sessions rule or one that delegates. Set, the key moves to the
-    /// ring's next worker; unset, the key stays on its worker over the
-    /// veto. Everywhere else a keyed request keeps the veto.
+    /// sessions rule or one that delegates. A rule with an in-flight cap
+    /// keeps the key only under a host that counts the key's requests,
+    /// which the controller's own service does not yet. A rule with
+    /// `inflight_cap: 65535` has no cap. Set, the key moves to the ring's
+    /// next worker; unset, the key stays on its worker over the veto.
+    /// Everywhere else a keyed request keeps the veto.
     pub shed_when_all_vetoed: bool,
 }
 
@@ -2479,6 +2483,22 @@ fn check_profile(
         let stage_at = entry_at.sub(stage.name());
         check_stage(&stage, &stage_at)?;
         check_prefix_depth(&stage, gates, view, &stage_at)?;
+        // A host that records no prefix it sent holds no source that reads
+        // them: where no worker publishes its blocks, the stage would score
+        // every worker as holding nothing.
+        let reads_sent = matches!(
+            &stage,
+            ScoreStage::PrefixAffinity(p)
+                if matches!(p.source, Some(AffinitySource::Predictor | AffinitySource::Merged))
+        );
+        if reads_sent && !catalog.records_sent_prefixes() {
+            complete = false;
+            deferred.note(
+                stage_at.field("source"),
+                "the record of sent prefixes this source reads",
+            );
+            continue;
+        }
         match scorer_of(&stage, gates, &view.boundaries) {
             Resolved::Built(scorer) => {
                 let read = HashDepth::of_scorer(&stage, &view.boundaries, scorer.needs());
@@ -2506,6 +2526,21 @@ fn check_profile(
             None
         }
     };
+    // The scores combine by each weight's share of the weights' sum: a sum
+    // that is not finite, or whose reciprocal is not, gives shares that
+    // lose the order of every row. A stage this build does not carry adds
+    // no weight, so a deferred profile's sum is over part of its list. An
+    // infinite part is an infinite whole, every weight being above zero,
+    // and a part's reciprocal says nothing of the whole's.
+    let total: f32 = scorers.iter().map(|weighted| weighted.weight).sum();
+    let no_shares = !total.is_finite() || (complete && !total.recip().is_finite());
+    if !scorers.is_empty() && no_shares {
+        return Err(at.bad(
+            "score",
+            total,
+            "weights whose sum, and one over that sum, are finite numbers",
+        ));
+    }
     // The key's mark: the plain ring alone decides the profile's pick. It
     // is the only scorer, with no bound, under `best` named bare, so the
     // key's owner holds the best score and the picker takes it. The engine
@@ -3574,7 +3609,7 @@ impl AppliedSpec {
     /// digest its caller took already: the controller's door reads the
     /// document's digest against the standing one and hands it on, so an
     /// apply digests its document once.
-    #[cfg(feature = "controller")]
+    #[cfg(any(test, feature = "controller"))]
     pub(crate) fn validate_digested(
         document: &PolicySpec,
         digest: Digest,
@@ -4747,6 +4782,45 @@ mod tests {
         }
     }
 
+    /// The scores combine by each weight's share of the weights' sum. A
+    /// profile whose sum is not finite, or has no finite reciprocal, is
+    /// refused at its score list: its shares would lose the order of every
+    /// row. A weight under the normal range beside one that is not passes.
+    #[test]
+    fn weights_whose_sum_gives_no_finite_share_are_refused_at_the_score_list() {
+        for score in [
+            r#"{"least-load":{"weight":1e-40}}"#,
+            r#"{"least-load":{"weight":3e38}},{"least-requests":{"weight":3e38}}"#,
+        ] {
+            assert_eq!(
+                bad_field(&spec_with_score(score)),
+                "profiles.p.score",
+                "{score}"
+            );
+        }
+        spec_with_score(r#"{"least-load":{"weight":1e-40}},"least-requests""#)
+            .validate()
+            .expect("a sum in the normal range");
+    }
+
+    /// A profile with a stage this build does not carry is judged by the
+    /// weights the build does carry only where a part decides for the
+    /// whole. A part with no finite reciprocal defers with the profile:
+    /// the stage left out may bring the sum into range. An infinite part
+    /// is refused: no weight left out can bring it back.
+    #[test]
+    fn a_deferred_profile_is_refused_for_an_infinite_part_of_its_weights_alone() {
+        let deferred = r#"{"prefix-affinity":{"decay":0.9}}"#;
+        let small = format!(r#"{{"least-load":{{"weight":1e-40}}}},{deferred}"#);
+        let (path, what) = not_in_build(&spec_with_score(&small));
+        assert_eq!(path, "profiles.p.score[1].prefix-affinity");
+        assert!(what.contains("prefix-affinity"), "{what}");
+        let large = format!(
+            r#"{{"least-load":{{"weight":3e38}}}},{{"least-requests":{{"weight":3e38}}}},{deferred}"#
+        );
+        assert_eq!(bad_field(&spec_with_score(&large)), "profiles.p.score");
+    }
+
     #[test]
     fn a_misspelt_or_unknown_scorer_is_refused_by_name() {
         // A key that is no built-in's parses, since a catalog may add the
@@ -5135,6 +5209,39 @@ mod tests {
             .expect("a preset")
             .validate()
             .expect("the tokens alone");
+    }
+
+    /// A prefix-affinity source that reads the prefixes sent is refused by
+    /// its field where the host records none: `predictor` and `merged`
+    /// would place as with no affinity where no worker publishes its
+    /// blocks. A host that records them validates both. The event-fed
+    /// index validates on either host, named or left out.
+    #[test]
+    fn a_source_of_sent_prefixes_is_refused_where_the_host_records_none() {
+        let records_none = Catalog::builtin().without_sent_prefixes();
+        for source in ["predictor", "merged"] {
+            let score = format!(r#"{{"prefix-affinity":{{"source":"{source}"}}}}"#);
+            let spec = spec_with_score(&score);
+            let refused = spec
+                .validate_in(&records_none, &[])
+                .expect_err("a source this host cannot feed");
+            assert_eq!(
+                refused.to_string(),
+                "profiles.p.score[0].prefix-affinity.source: the record of sent prefixes this source reads is not in this build",
+                "{source}"
+            );
+            assert!(
+                spec.validate().is_ok(),
+                "{source}: a host that records them"
+            );
+        }
+        for score in [
+            r#"{"prefix-affinity":{"source":"index"}}"#,
+            r#"{"prefix-affinity":{}}"#,
+        ] {
+            let spec = spec_with_score(score);
+            assert!(spec.validate_in(&records_none, &[]).is_ok(), "{score}");
+        }
     }
 
     #[test]

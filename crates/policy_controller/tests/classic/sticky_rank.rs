@@ -2,9 +2,10 @@
 //! and the rank the gateway pins each request to by its sticky key. A row
 //! of steps holds the rank each request carried, `null` where the gateway
 //! set none; a counted row holds how many keys kept one rank, or what each
-//! rank took. The replay decides each request over the rank rows of the
-//! worker under the `consistent_hashing` preset, keyed by the request's
-//! routing key.
+//! rank took. The replay decides each request over the rows the store
+//! lends, with the worker's engine listed beside them, under the
+//! `consistent_hashing` preset, keyed by the request's routing key: the
+//! ring walks from the key and reads the rows it meets.
 //!
 //! Two hashes place no key alike. A row of steps replays when a request
 //! with no rank there has none here and the requests of one key share one
@@ -16,7 +17,7 @@ use std::time::Instant;
 use serde::Deserialize;
 use smg_policy_controller::{
     store::{Ask, GatewayId, MemoryStore, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore},
-    AppliedSpec, Constraints, Engine, Identity, PolicySpec, PoolFacts, RequestFacts, Role, Scratch,
+    AppliedSpec, Constraints, Engine, Identity, PolicySpec, RequestFacts, Role, Scratch,
 };
 
 use crate::{same_shares, shares};
@@ -156,29 +157,29 @@ impl Bed {
             pinned: None,
             affinity: false,
         };
-        let built = self
-            .store
-            .build_view(MODEL, Role::Single, &ask, &mut self.out)?;
-        let facts = RequestFacts {
-            model: MODEL,
-            session_key: key.map_or(Identity::NONE, Identity::plain),
-            seed: self.seed,
-            now_micros: self.store.micros(now),
-            ..RequestFacts::default()
-        };
-        let pool = PoolFacts {
-            pool_size: built.pool_size,
-            generation: 1,
-            ..PoolFacts::default()
-        };
-        let decision = self.engine.decide(
-            &facts,
-            &pool,
-            &self.out.candidates,
-            &Constraints::default(),
-            &mut self.scratch,
-        );
-        Some(decision.pick()?.targets.first()?.dp_rank)
+        let now_micros = self.store.micros(now);
+        let (engine, out, scratch, seed) =
+            (&self.engine, &mut self.out, &mut self.scratch, self.seed);
+        // The rows as the store lends them, with the pool's engines beside
+        // them: the door a host decides through.
+        self.store.with_world(|world| {
+            let view = world.view(MODEL, Role::Single, &ask, false, out)?;
+            let facts = RequestFacts {
+                model: MODEL,
+                session_key: key.map_or(Identity::NONE, Identity::plain),
+                seed,
+                now_micros,
+                pinned_at: view.pinned_at,
+                ..RequestFacts::default()
+            };
+            let cx = Constraints {
+                stalled: view.stalled,
+                ..Constraints::default()
+            };
+            let pool = view.pool_facts();
+            let decision = engine.decide(&facts, &pool, view.candidates, &cx, scratch);
+            Some(decision.pick()?.targets.first()?.dp_rank)
+        })
     }
 }
 

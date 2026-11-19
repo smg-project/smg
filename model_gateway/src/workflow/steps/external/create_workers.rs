@@ -4,22 +4,23 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
+use smg_worker::{
+    health::{
+        circuit_breaker::CircuitBreakerConfig,
+        resilience::{resolve_resilience, ResolvedResilience},
+    },
+    identity::{
+        basic::{BasicWorker, ConnectionMode, RuntimeType, Worker, WorkerType},
+        endpoint::Endpoint,
+    },
+    workflow::WorkerList,
+};
 use tracing::{debug, info};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use crate::{
-    worker::{
-        health::{
-            circuit_breaker::CircuitBreakerConfig,
-            resilience::{resolve_resilience, ResolvedResilience},
-        },
-        identity::{
-            basic::{RuntimeType, WorkerType},
-            endpoint::Endpoint,
-        },
-        BasicWorker, BasicWorkerBuilder, ConnectionMode, Worker,
-    },
-    workflow::data::{require_app_context, WorkerKind, WorkerList, WorkerWorkflowData},
+    routers::grpc::backend_client::BasicWorkerBuilder,
+    workflow::data::{require_app_context, WorkerKind, WorkerWorkflowData},
 };
 
 /// Normalize URL for external APIs (ensure https://).

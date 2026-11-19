@@ -22,13 +22,10 @@ use std::{collections::HashMap, fs, path::PathBuf, sync::Arc, thread, time::Dura
 
 use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
 use serde::Serialize;
+use smg_worker::{identity::basic::Worker, load::state::TestFeed};
 
 use super::{LoadBalancingPolicy, PowerOfTwoPolicy, SelectWorkerInfo};
-use crate::{
-    config::PowerOfTwoLoadMetric,
-    policies::test_support::make_worker,
-    worker::{load::state::TestFeed, Worker},
-};
+use crate::{config::PowerOfTwoLoadMetric, policies::test_support::make_worker};
 
 /// What a worker's report says: running and waiting requests, the resident
 /// context tokens when the engine counts them, the token-work of its queue,

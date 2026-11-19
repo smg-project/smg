@@ -28,17 +28,17 @@ use common::{
 use http_body_util::BodyExt;
 use llm_tokenizer::{traits::Tokenizer, MockTokenizer, TokenizerRegistry};
 use openai_protocol::{
-    generate::GenerateRequest, model_card::ModelCard, worker::HealthCheckConfig,
+    generate::GenerateRequest, model_card::ModelCard, worker::HealthCheckConfig, UNKNOWN_MODEL_ID,
 };
 use serde_json::{json, Value};
 use smg::{
     app_context::AppContext,
     config::{RouterConfig, RoutingMode},
     middleware::TenantRequestMeta,
-    routers::{RouterFactory, RouterTrait},
+    routers::{grpc::backend_client::BasicWorkerBuilder, RouterFactory, RouterTrait},
     tenant::TenantKey,
-    worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType, UNKNOWN_MODEL_ID},
 };
+use smg_worker::identity::basic::{ConnectionMode, RuntimeType, WorkerType};
 use tokio::net::TcpListener;
 use tower::ServiceExt;
 

@@ -21,7 +21,7 @@ use crate::{
     counts::with_counts,
     decision::{Target, Targets, MAX_TARGETS},
     framework::{
-        top_drawn, top_pass, Filter, Front, Narrowed, Picker, Scorer, TieBand, DRAW_BOUND,
+        top_drawn, top_pass, Filter, Front, Narrowed, Picker, Scorer, TieBand, Unit, DRAW_BOUND,
     },
     lease::{Lease, Lifecycle, Membership, Side},
     spec::Needs,
@@ -248,13 +248,32 @@ impl RowTests {
 
 // ---------------------------------------------------------------- scorers
 
+/// The rows whose least and greatest cost are found by compares
+/// ([`normalize_costs`]): the ranks of one engine, the rows of a draw.
+const FEW_COSTS: usize = 16;
+
 /// Lower raw costs become higher normalized scores; equal costs score `1.0`.
 /// Returns the span of the costs, `0.0` when they are all equal.
 fn normalize_costs(out: &mut [f32]) -> f32 {
     let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
-    for &c in out.iter() {
-        lo = lo.min(c);
-        hi = hi.max(c);
+    if out.len() <= FEW_COSTS {
+        // A few rows, compared one by one: a cost that is no number moves
+        // neither end, as the fold below leaves them.
+        for &c in out.iter() {
+            if c < lo {
+                lo = c;
+            }
+            if c > hi {
+                hi = c;
+            }
+        }
+    } else {
+        // Many rows, folded: the minimum and the maximum take any order,
+        // so a step of the loop reads several rows.
+        for &c in out.iter() {
+            lo = lo.min(c);
+            hi = hi.max(c);
+        }
     }
     let span = hi - lo;
     let spread = span > 0.0 && span.is_finite();
@@ -511,11 +530,23 @@ impl SinceReport {
         // At its instant's place: a dispatch that waited for a retirement
         // on a shared lane, or one a stepped clock dated earlier, lands
         // behind a later one, and the release and the retirement read a
-        // lane from its oldest. Instants mostly rise, so this is a push.
-        let at = dispatches.partition_point(|&(held_at, _)| held_at <= at_micros);
-        dispatches.insert(at, (at_micros, tokens));
+        // lane from its oldest. Instants mostly rise, so the lane's newest
+        // is asked first: a dispatch no older than it is a push, and the
+        // place is searched for the one that is. The lane's front moves
+        // only where the dispatch lands there.
+        let newest = dispatches.back().map(|&(held_at, _)| held_at);
+        let front = if newest.is_some_and(|newest| newest > at_micros) {
+            let at = dispatches.partition_point(|&(held_at, _)| held_at <= at_micros);
+            dispatches.insert(at, (at_micros, tokens));
+            at == 0
+        } else {
+            dispatches.push_back((at_micros, tokens));
+            newest.is_none()
+        };
         self.held.fetch_add(Self::weight(tokens), Ordering::Relaxed);
-        lane.publish_oldest(&dispatches);
+        if front {
+            lane.publish_oldest(&dispatches);
+        }
         // Under the lane's lock: a release, which holds every lane, never
         // recomputes the row's oldest past this dispatch. Dispatch instants
         // mostly rise, so this is a read.
@@ -700,8 +731,18 @@ impl Credits {
         });
     }
 
-    /// Credits the rank a dispatch landed on.
-    fn dispatched(&self, lease: &Lease, target: &Target, side: Side, since_decision_micros: u32) {
+    /// Credits the rank a dispatch landed on. A lease that states no size
+    /// is credited at `mean_prefill`, the calling stage's own mean: a
+    /// credit of no tokens would read its worker as free until that
+    /// worker's next report.
+    fn dispatched(
+        &self,
+        lease: &Lease,
+        target: &Target,
+        side: Side,
+        since_decision_micros: u32,
+        mean_prefill: u32,
+    ) {
         // The decode side of a pair target is the pair's decode rank; the
         // target itself is the prefill. The credit dates from the dispatch,
         // so a report sampled while a queue held the decision does not
@@ -713,11 +754,15 @@ impl Credits {
             Side::Single | Side::Prefill | Side::Encode => (target.id, target.dp_rank),
         };
         let dispatched_micros = lease.issued_micros + u64::from(since_decision_micros);
+        let tokens = match lease.tokens {
+            0 => mean_prefill,
+            stated => stated,
+        };
         // A rank the tally knows is credited on its own entry; the first
         // dispatch to a rank enters it (another dispatch may have entered it
         // meanwhile: the entry the map holds is the one credited).
         if let Some(since) = self.tally.load().get(&rank) {
-            since.record(dispatched_micros, lease.tokens);
+            since.record(dispatched_micros, tokens);
             return;
         }
         self.tally.rcu(|tally| {
@@ -729,7 +774,7 @@ impl Credits {
             Arc::new(next)
         });
         if let Some(since) = self.tally.load().get(&rank) {
-            since.record(dispatched_micros, lease.tokens);
+            since.record(dispatched_micros, tokens);
         }
     }
 
@@ -753,7 +798,7 @@ impl Credits {
                 sorted.sort_unstable();
                 self.forget(|(worker, _)| sorted.binary_search(&worker.0).is_err());
             }
-            Membership::Added(_) | Membership::Relabelled(_) => {}
+            Membership::Added(_) | Membership::Relabelled(_) | Membership::Left { .. } => {}
         }
     }
 }
@@ -872,111 +917,23 @@ impl LeastLoad {
         (queued + running + credit_work) / drain + self.kv_pressure_weight * k / (1.0 - k)
     }
 
-    /// The cost of a candidate without a report: the reporting peers' baseline
-    /// plus its in-flight work, or the in-flight count alone when no peer
-    /// reports.
-    fn unreported_cost(
-        &self,
-        in_flight: u32,
-        nominal: f32,
-        fleet_has_loads: bool,
-        peer_baseline: f32,
-    ) -> f32 {
-        if fleet_has_loads {
-            peer_baseline + in_flight as f32 * self.mean_prefill_tokens as f32 / nominal
-        } else {
-            in_flight as f32
-        }
-    }
-}
-
-/// A cost slot not written yet: a candidate without a report is costed
-/// after the reporting peers' baseline is known. Costs are never negative.
-const PENDING: f32 = f32::NEG_INFINITY;
-
-impl Lifecycle for LeastLoad {
-    fn on_dispatched(
-        &self,
-        lease: &Lease,
-        target: &Target,
-        side: Side,
-        since_decision_micros: u32,
-    ) {
-        self.credits
-            .dispatched(lease, target, side, since_decision_micros);
-    }
-
-    fn on_membership(&self, change: &Membership<'_>) {
-        self.credits.membership(change);
-    }
-}
-
-impl Scorer for LeastLoad {
-    fn name(&self) -> &'static str {
-        "least-load"
-    }
-
-    fn row_wise(&self) -> bool {
-        true
-    }
-
-    /// The rows a rank put in front are costed alone where each reports a
-    /// rate, and the stage says where one does not
-    /// ([`Self::score_front`]).
-    fn front_wise(&self) -> bool {
-        true
-    }
-
-    fn score(
+    /// Costs the rows the first pass left pending, those with no report:
+    /// each from the reporting peers' baseline among the rows handed
+    /// ([`Self::unreported_cost`]). Out of line: a pool whose every row
+    /// reports pays for no second pass.
+    #[cold]
+    #[inline(never)]
+    fn cost_pending(
         &self,
         facts: &RequestFacts<'_>,
         candidates: &[Candidate],
         kept: &[u32],
         out: &mut [f32],
-    ) -> TieBand {
-        let (sum, n) = kept
-            .iter()
-            .filter_map(|&i| candidates[i as usize].load)
-            .filter(|r| r.live_rate > 0)
-            .fold((0.0f32, 0u32), |(s, n), r| (s + r.live_rate as f32, n + 1));
-        let nominal = if n > 0 && sum.is_finite() {
-            sum / n as f32
-        } else {
-            self.default_throughput
-        };
-        // One load of the tally: each reporting row's held work is read
-        // (released first when its report's sample reaches a dispatch) and
-        // its credit work written; the divisions and the KV barrier run after
-        // the load is gone. A row without a report is marked and costed after
-        // the peer baseline is known. No allocation.
-        let mut reporting = 0usize;
-        {
-            let tally = self.credits.tally.load();
-            with_counts!(facts, |counts| {
-                for (slot, &i) in out.iter_mut().zip(kept) {
-                    let c = &candidates[i as usize];
-                    *slot = match c.load {
-                        Some(_) => {
-                            let (tokens, requests) =
-                                tally.get(&(c.id, c.dp_rank)).map_or((0, 0), |since| {
-                                    since.credit_through(c.load_sampled_at_micros)
-                                });
-                            reporting += 1;
-                            self.credit_work(c, counts(c), tokens, requests)
-                        }
-                        None => PENDING,
-                    };
-                }
-            });
-        }
-        for (slot, &i) in out.iter_mut().zip(kept) {
-            if let Some(r) = candidates[i as usize].load {
-                *slot = self.reported_cost(r, *slot, nominal);
-            }
-        }
-        let fleet_has_loads = reporting > 0;
+        nominal: f32,
+        fleet_has_loads: bool,
+    ) {
         let mut peer_baseline = 0.0;
-        if reporting < kept.len() && fleet_has_loads {
+        if fleet_has_loads {
             peer_baseline = out
                 .iter()
                 .copied()
@@ -998,6 +955,86 @@ impl Scorer for LeastLoad {
                 }
             }
         });
+    }
+
+    /// The cost of a candidate without a report: the reporting peers' baseline
+    /// plus its in-flight work, or the in-flight count alone when no peer
+    /// reports.
+    fn unreported_cost(
+        &self,
+        in_flight: u32,
+        nominal: f32,
+        fleet_has_loads: bool,
+        peer_baseline: f32,
+    ) -> f32 {
+        if fleet_has_loads {
+            peer_baseline + in_flight as f32 * self.mean_prefill_tokens as f32 / nominal
+        } else {
+            in_flight as f32
+        }
+    }
+
+    /// The mean rate of the kept rows that report one, which a report
+    /// without a rate drains at: the default where none reports one.
+    fn mean_rate(&self, candidates: &[Candidate], kept: &[u32]) -> f32 {
+        let (sum, n) = kept
+            .iter()
+            .filter_map(|&i| candidates[i as usize].load)
+            .filter(|r| r.live_rate > 0)
+            .fold((0.0f32, 0u32), |(s, n), r| (s + r.live_rate as f32, n + 1));
+        if n > 0 && sum.is_finite() {
+            sum / n as f32
+        } else {
+            self.default_throughput
+        }
+    }
+
+    /// The costs of `rows`, spread over their span, and their band: the one
+    /// body behind the stage's two entries, entered where each is. A row
+    /// costs what it costs among the kept rows where `nominal` is their
+    /// mean rate ([`Self::mean_rate`]).
+    #[inline(always)]
+    fn costs(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        rows: &[u32],
+        nominal: f32,
+        out: &mut [f32],
+    ) -> TieBand {
+        // One load of the tally: each reporting row's held work is read
+        // (released first when its report's sample reaches a dispatch) and
+        // its credit work written; the divisions and the KV barrier run after
+        // the load is gone. A row without a report is marked and costed after
+        // the peer baseline is known. No allocation.
+        let mut reporting = 0usize;
+        {
+            let tally = self.credits.tally.load();
+            with_counts!(facts, |counts| {
+                for (slot, &i) in out.iter_mut().zip(rows) {
+                    let c = &candidates[i as usize];
+                    *slot = match c.load {
+                        Some(_) => {
+                            let (tokens, requests) =
+                                tally.get(&(c.id, c.dp_rank)).map_or((0, 0), |since| {
+                                    since.credit_through(c.load_sampled_at_micros)
+                                });
+                            reporting += 1;
+                            self.credit_work(c, counts(c), tokens, requests)
+                        }
+                        None => PENDING,
+                    };
+                }
+            });
+        }
+        for (slot, &i) in out.iter_mut().zip(rows) {
+            if let Some(r) = candidates[i as usize].load {
+                *slot = self.reported_cost(r, *slot, nominal);
+            }
+        }
+        if reporting < rows.len() {
+            self.cost_pending(facts, candidates, rows, out, nominal, reporting > 0);
+        }
         // The band of a microsecond of expected wait on the normalized scale:
         // exact for one scorer, additive under several.
         let span = normalize_costs(out);
@@ -1007,14 +1044,75 @@ impl Scorer for LeastLoad {
             TieBand::NORMALIZED
         }
     }
+}
 
-    /// As [`Self::score`], with one word more. A row without a report is
-    /// costed from its reporting peers' baseline, and a report without a
-    /// rate drains at the rows' mean rate: either reads rows the stage may
-    /// not have been handed. So where one stands among the rows handed, the
-    /// stage says it must be asked whole ([`Front::Whole`]) before it costs
-    /// any: the rows a rank put in front are costed alone only where each
-    /// reports a rate, and then as they are among every row. Their costs
+/// A cost slot not written yet: a candidate without a report is costed
+/// after the reporting peers' baseline is known. Costs are never negative.
+const PENDING: f32 = f32::NEG_INFINITY;
+
+impl Lifecycle for LeastLoad {
+    fn on_dispatched(
+        &self,
+        lease: &Lease,
+        target: &Target,
+        side: Side,
+        since_decision_micros: u32,
+    ) {
+        self.credits.dispatched(
+            lease,
+            target,
+            side,
+            since_decision_micros,
+            self.mean_prefill_tokens,
+        );
+    }
+
+    fn on_membership(&self, change: &Membership<'_>) {
+        self.credits.membership(change);
+    }
+}
+
+impl Scorer for LeastLoad {
+    fn name(&self) -> &'static str {
+        "least-load"
+    }
+
+    fn row_wise(&self) -> bool {
+        true
+    }
+
+    /// The rows a rank put in front are costed alone where each holds a
+    /// report, and the stage says where one does not
+    /// ([`Self::score_front`]).
+    fn front_wise(&self) -> bool {
+        true
+    }
+
+    fn score(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        out: &mut [f32],
+    ) -> TieBand {
+        self.costs(
+            facts,
+            candidates,
+            kept,
+            self.mean_rate(candidates, kept),
+            out,
+        )
+    }
+
+    /// As [`Self::score`], with one word more, of the rows asked. A row
+    /// without a report is costed from its reporting peers' baseline, the
+    /// least cost among them, which is a pass over every kept row: where
+    /// one is asked the stage says that it must be asked whole
+    /// ([`Front::Whole`]), before it costs any. A report without a rate
+    /// drains at the kept rows' mean rate: where one is asked that mean is
+    /// folded over the kept rows as the plain entry folds it, and where
+    /// each row asked reports a rate no other row is read. Either way a
+    /// row asked costs what it costs among every kept row. Their costs
     /// are spread over their own span and not the pool's, so the front can
     /// tell two of its rows apart where the whole pass cannot, whatever
     /// the rows behind them cost: a difference past the tie's microsecond
@@ -1028,17 +1126,27 @@ impl Scorer for LeastLoad {
         facts: &RequestFacts<'_>,
         candidates: &[Candidate],
         kept: &[u32],
+        asked: &[u32],
         out: &mut [f32],
     ) -> (TieBand, Front) {
-        let alone = kept.iter().all(|&i| {
-            candidates[i as usize]
-                .load
-                .is_some_and(|report| report.live_rate > 0)
-        });
-        if !alone {
-            return (TieBand::NORMALIZED, Front::Whole);
+        let mut rated = true;
+        for &i in asked {
+            let Some(report) = candidates[i as usize].load else {
+                return (TieBand::NORMALIZED, Front::Whole);
+            };
+            rated &= report.live_rate > 0;
         }
-        (self.score(facts, candidates, kept, out), Front::Unsaid)
+        // The mean is read by a report without a rate alone: where each row
+        // asked holds a rate none is folded, and no cost reads the default.
+        let nominal = if rated {
+            self.default_throughput
+        } else {
+            self.mean_rate(candidates, kept)
+        };
+        (
+            self.costs(facts, candidates, asked, nominal, out),
+            Front::Unsaid,
+        )
     }
 
     fn needs(&self) -> Needs {
@@ -1054,12 +1162,13 @@ impl Scorer for LeastLoad {
 /// that report (the credit the least-load scorer books too), and
 /// `request_tokens` for every request it holds: the reported ones, the
 /// credited ones, and the ones the host holds beyond both, those priced at
-/// the worker's mean context as well. Every survivor is scored. A worker
+/// the worker's mean context as well. Every row handed is scored: every
+/// survivor of a whole pass, or the rows a picker drew. A worker
 /// whose report does not count resident tokens (the row's
 /// `resident_counted`), or that has no report, scores as the best reporting
-/// peer plus its in-flight requests, each at the mean prefill and
-/// `request_tokens`; with no survivor counting them, the in-flight count
-/// decides.
+/// peer among the rows handed plus its in-flight requests, each at the mean
+/// prefill and `request_tokens`; with no row handed counting them, the
+/// in-flight count decides.
 #[derive(Debug)]
 pub struct ResidentWork {
     pub request_tokens: u32,
@@ -1106,6 +1215,46 @@ impl ResidentWork {
     }
 }
 
+impl ResidentWork {
+    /// Costs the rows the first pass left pending, those with no report
+    /// that counts resident tokens: the best reporting peer among the rows
+    /// handed plus the row's requests in flight, or the requests alone
+    /// where no row reports. Out of line: a pool whose every row reports
+    /// pays for no second pass.
+    #[cold]
+    #[inline(never)]
+    fn cost_pending(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        out: &mut [f32],
+        fleet_reports: bool,
+    ) {
+        let peer_baseline = if fleet_reports {
+            out.iter()
+                .copied()
+                .filter(|cost| *cost != PENDING)
+                .fold(f32::INFINITY, f32::min)
+        } else {
+            0.0
+        };
+        let in_flight_work = self.mean_prefill_tokens as f32 + self.request_tokens as f32;
+        with_counts!(facts, |counts| {
+            for (slot, &i) in out.iter_mut().zip(kept) {
+                if *slot == PENDING {
+                    let in_flight = counts(&candidates[i as usize]) as f32;
+                    *slot = if fleet_reports {
+                        peer_baseline + in_flight * in_flight_work
+                    } else {
+                        in_flight
+                    };
+                }
+            }
+        });
+    }
+}
+
 impl Lifecycle for ResidentWork {
     fn on_dispatched(
         &self,
@@ -1114,8 +1263,13 @@ impl Lifecycle for ResidentWork {
         side: Side,
         since_decision_micros: u32,
     ) {
-        self.credits
-            .dispatched(lease, target, side, since_decision_micros);
+        self.credits.dispatched(
+            lease,
+            target,
+            side,
+            since_decision_micros,
+            self.mean_prefill_tokens,
+        );
     }
 
     fn on_membership(&self, change: &Membership<'_>) {
@@ -1126,6 +1280,13 @@ impl Lifecycle for ResidentWork {
 impl Scorer for ResidentWork {
     fn name(&self) -> &'static str {
         "resident-work"
+    }
+
+    /// The rows a picker drew are costed among themselves, as the
+    /// least-load scorer costs them: a row with no report, or whose report
+    /// counts no resident tokens, is costed against the rows handed.
+    fn row_wise(&self) -> bool {
+        true
     }
 
     fn score(
@@ -1163,28 +1324,9 @@ impl Scorer for ResidentWork {
                 }
             });
         }
-        let fleet_reports = reporting > 0;
-        let peer_baseline = if fleet_reports && reporting < kept.len() {
-            out.iter()
-                .copied()
-                .filter(|cost| *cost != PENDING)
-                .fold(f32::INFINITY, f32::min)
-        } else {
-            0.0
-        };
-        let in_flight_work = self.mean_prefill_tokens as f32 + self.request_tokens as f32;
-        with_counts!(facts, |counts| {
-            for (slot, &i) in out.iter_mut().zip(kept) {
-                if *slot == PENDING {
-                    let in_flight = counts(&candidates[i as usize]) as f32;
-                    *slot = if fleet_reports {
-                        peer_baseline + in_flight * in_flight_work
-                    } else {
-                        in_flight
-                    };
-                }
-            }
-        });
+        if reporting < kept.len() {
+            self.cost_pending(facts, candidates, kept, out, reporting > 0);
+        }
         // The least-load scorer's band, on a score in tokens: equal work is
         // a tie, drawn by the picker.
         let span = normalize_costs(out);
@@ -1478,6 +1620,90 @@ fn push_ranked<const DRAWN: bool>(
     });
 }
 
+/// The best rows of `scores` into `out`, best first: as many as `out`
+/// holds or the scores number. The order is the ranked push's, by its own
+/// rule a slot ([`draw_in_band`]): the best score left is found, the rows
+/// within the band of it stand equal, and one of them is drawn, by one
+/// value of `draw` where they are several. Returns the slots filled.
+///
+/// For the rows of the engine a picker took ([`Unit::Engine`]): a few rows
+/// in no order of their scores, of which the answer carries fewer than a
+/// ranked push fills. A slot's tie is marked in one word by two passes
+/// over the rows. Where a later slot follows, a third pass notes the rows
+/// that score the best itself, and the tie stands for that slot too while
+/// one of them is left: the level ranks of one engine are read once. More
+/// rows than a word marks are drawn by [`draw_in_band`] itself.
+pub(crate) fn draw_best(mut draw: Draw, scores: &[f32], band: TieBand, out: &mut [usize]) -> usize {
+    let slots = out.len().min(scores.len());
+    // A bit a row, set while the row is not taken.
+    let word = u32::try_from(scores.len())
+        .ok()
+        .and_then(|rows| u64::BITS.checked_sub(rows))
+        .and_then(|spare| u64::MAX.checked_shr(spare));
+    let Some(mut open) = word else {
+        for slot in 0..slots {
+            let (taken, _) = out.split_at(slot);
+            let Some(row) = draw_in_band(scores, band, &mut draw, |i| !taken.contains(&i)) else {
+                return slot;
+            };
+            out[slot] = row;
+        }
+        return slots;
+    };
+    // The rows within the band of the best score left, and those of them
+    // that score it.
+    let (mut tied, mut at_best) = (0u64, 0u64);
+    let mut filled = 0;
+    let all = open;
+    for (n, slot) in out[..slots].iter_mut().enumerate() {
+        if at_best & open == 0 {
+            // The best score left: over every row while none is taken.
+            let mut top = f32::NEG_INFINITY;
+            if open == all {
+                for &score in scores {
+                    if score > top {
+                        top = score;
+                    }
+                }
+            } else {
+                for (row, &score) in scores.iter().enumerate() {
+                    if (open >> row) & 1 != 0 && score > top {
+                        top = score;
+                    }
+                }
+            }
+            (tied, at_best) = (0, 0);
+            for (row, &score) in scores.iter().enumerate() {
+                tied |= u64::from(!below_band(score, top, band)) << row;
+            }
+            // The rows that score the best itself spare a later slot its
+            // passes: the last slot notes none.
+            if n + 1 < slots {
+                for (row, &score) in scores.iter().enumerate() {
+                    at_best |= u64::from(score == top) << row;
+                }
+            }
+        }
+        tied &= open;
+        // Counted from the tie's last row, as a slot of the ranked push
+        // counts: of two tied rows a zero takes the later one.
+        let rows = tied.count_ones() as usize;
+        let back = if rows > 1 { draw.below(rows) } else { 0 };
+        let Some(at) = rows.checked_sub(1 + back) else {
+            return filled;
+        };
+        let mut from = tied;
+        for _ in 0..at {
+            from &= from - 1;
+        }
+        let row = from.trailing_zeros() as usize;
+        open &= !(1 << row);
+        *slot = row;
+        filled += 1;
+    }
+    filled
+}
+
 /// The target that names `c`, on no pair.
 pub(crate) fn target_of(c: &Candidate) -> Target {
     Target {
@@ -1553,6 +1779,12 @@ impl Picker for Best {
     /// The targets are the best of the rows handed: a rank may put rows in
     /// front of this picker.
     fn front_wise(&self) -> bool {
+        true
+    }
+
+    /// Every row handed is compared and the best scores are taken in
+    /// their order: a scorer that places a request by itself is followed.
+    fn takes_best(&self) -> bool {
         true
     }
 
@@ -1781,17 +2013,7 @@ impl Picker for Random {
         // rows left names one of them by stepping over these.
         let mut drawn = [pick; MAX_TARGETS];
         for len in 1..MAX_TARGETS.min(candidates.len()) {
-            let mut row = draw.below(candidates.len() - len);
-            let mut at = len;
-            for (i, &taken) in drawn[..len].iter().enumerate() {
-                if row < taken {
-                    at = i;
-                    break;
-                }
-                row += 1;
-            }
-            drawn.copy_within(at..len, at + 1);
-            drawn[at] = row;
+            let row = step_over(&mut drawn, len, draw.below(candidates.len() - len));
             if keep(&candidates[row]) {
                 kept.push(row as u32);
             }
@@ -1822,27 +2044,37 @@ impl Picker for Random {
     ) {
         let mut draw = Draw::new(facts.seed);
         let n = kept.len();
+        // The positions taken so far, ascending.
         let mut taken = [usize::MAX; MAX_TARGETS];
         for slot in 0..MAX_TARGETS.min(n) {
             // The j-th position among those not taken yet: a partial
             // Fisher-Yates without the copy of the survivor list.
-            let j = draw.below(n - slot);
-            let mut seen = 0usize;
-            let mut chosen = 0usize;
-            for i in 0..n {
-                if taken[..slot].contains(&i) {
-                    continue;
-                }
-                if seen == j {
-                    chosen = i;
-                    break;
-                }
-                seen += 1;
-            }
-            taken[slot] = chosen;
+            let chosen = step_over(&mut taken, slot, draw.below(n - slot));
             out.push(target_of(&candidates[kept[chosen] as usize]));
         }
     }
+}
+
+/// The `j`-th position not among `taken[..len]`, which stand ascending,
+/// entered among them in its place. Neither the step over a position
+/// taken nor the entry branches on `j`: a drawn value is no pattern a
+/// branch can learn, and a branch missed costs more than every step here.
+#[inline]
+fn step_over(taken: &mut [usize; MAX_TARGETS], len: usize, j: usize) -> usize {
+    let mut row = j;
+    for &at in &taken[..len] {
+        row += usize::from(row >= at);
+    }
+    // Entered by least and greatest: each position above the row moves up
+    // one place.
+    let mut held = row;
+    for at in &mut taken[..len] {
+        let (least, greatest) = ((*at).min(held), (*at).max(held));
+        *at = least;
+        held = greatest;
+    }
+    taken[len] = held;
+    row
 }
 
 /// The picker of a profile that leaves the placement to its binding's
@@ -1990,6 +2222,12 @@ impl Picker for PowerOfTwo {
 
     fn draws_first(&self) -> bool {
         true
+    }
+
+    /// Two engines, where the host lists them: the two rows that stand for
+    /// them are compared as two rows drawn are.
+    fn unit(&self) -> Unit {
+        Unit::Engine
     }
 
     fn draw_first(
@@ -2518,6 +2756,28 @@ mod tests {
         (0..n).collect()
     }
 
+    /// The costs find the same ends by either way: a few rows are compared
+    /// one by one, many are folded, and a cost that is no number moves
+    /// neither end. So the same costs score the same bits among a few
+    /// rows and among many.
+    #[test]
+    fn a_few_costs_and_many_find_the_same_ends() {
+        // The cost that is no number stands last: no cost behind it could
+        // take an end back from it.
+        let few = [4.0, 2.0, 3.0, f32::NAN];
+        let mut some = few;
+        let span = normalize_costs(&mut some);
+        assert_eq!(span, 2.0);
+        assert_eq!(some[0].to_bits(), 0.0f32.to_bits());
+        assert_eq!((some[1], some[2]), (1.0, 0.5));
+        assert!(some[3].is_nan());
+        let mut many: Vec<f32> = few.iter().copied().chain([3.0; FEW_COSTS]).collect();
+        assert!(many.len() > FEW_COSTS);
+        assert_eq!(normalize_costs(&mut many), span);
+        let bits = |scores: &[f32]| scores.iter().map(|s| s.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&many[..few.len()]), bits(&some));
+    }
+
     /// The engine's order around a picker: the set it compares, that set's
     /// scores from `scores_of`, the pick, then the survivors it passed over
     /// as alternates. The positions of the targets come back, in order.
@@ -2864,6 +3124,44 @@ mod tests {
         );
     }
 
+    /// A dispatch whose lease states no size is credited at the mean of
+    /// the stage that credits it, whether it enters its rank or finds it,
+    /// and so costs what its request cost in flight. A stated size is
+    /// credited as stated.
+    #[test]
+    fn a_dispatch_that_states_no_size_is_credited_at_the_stages_own_mean() {
+        let mut pool = [candidate(0, 2), candidate(1, 2)];
+        pool[0].load = Some(report(0, 0));
+        pool[1].load = Some(report(0, 0));
+        let unstated = Lease {
+            issued_micros: 2_000,
+            ..Lease::default()
+        };
+        let stated = Lease {
+            tokens: 48,
+            ..unstated
+        };
+        for mean in [512, 2_048] {
+            let ll = LeastLoad::new(0.15, mean, 2000.0);
+            // Two requests in flight that no report and no credit account
+            // for cost the stage's mean each.
+            let in_flight = ll.credit_work(&pool[0], 2, 0, 0);
+            assert_eq!(in_flight, 2.0 * mean as f32);
+            // The first dispatch to a rank enters it and the second finds
+            // it: each is credited at that mean, so the two cost dispatched
+            // what they cost in flight.
+            for _ in 0..2 {
+                ll.on_dispatched(&unstated, &target_of(&pool[0]), Side::Single, 0);
+                ll.on_dispatched(&stated, &target_of(&pool[1]), Side::Single, 0);
+            }
+            let (tokens, requests) = ll.held_word_at(pool[0].id, 0);
+            assert_eq!((tokens, requests), (2 * u64::from(mean), 2));
+            assert_eq!(ll.credit_work(&pool[0], 2, tokens, requests), in_flight);
+            // A stated size is credited as stated.
+            assert_eq!(ll.held_word_at(pool[1].id, 0), (96, 2));
+        }
+    }
+
     #[test]
     fn a_membership_snapshot_keeps_only_the_tallies_of_its_ids() {
         let ll = LeastLoad::new(0.15, 1024, 2000.0);
@@ -2969,40 +3267,55 @@ mod tests {
         assert!(scores[0] > scores[1], "{scores:?}");
     }
 
-    /// What the load stage says of the rows it is handed
-    /// ([`Scorer::score_front`]): its scores and no word where each reports
-    /// a rate, and that it must be asked whole where one has no rate or no
-    /// report, before it costs any.
+    /// What the load stage says of the rows it is asked of
+    /// ([`Scorer::score_front`]). Where each holds a report it scores them
+    /// and says no word: a report without a rate drains at the mean rate
+    /// of the kept rows, not of the rows asked and not of the pool. Where
+    /// one holds no report it says that it must be asked whole, before it
+    /// costs any.
     #[test]
-    fn least_load_must_be_asked_whole_of_a_row_without_a_rate_or_a_report() {
+    fn least_load_answers_for_the_rows_asked_unless_one_holds_no_report() {
         let ll = LeastLoad::new(0.15, 1024, 2000.0);
-        let mut pool = [candidate(0, 0), candidate(1, 0), candidate(2, 0)];
-        for (row, running) in pool.iter_mut().zip([1, 3, 2]) {
-            row.load = Some(report(running, 0));
-        }
         let facts = RequestFacts::default();
+        // Five rows, the last two dropped by a filter. The second reports
+        // no rate: it drains at 10,000 tokens a second, the mean of the
+        // first's 2,000 and the third's 18,000, and waits 0.31 s where the
+        // first waits 0.51 s. At the first's rate alone, or at the pool's
+        // mean of 5,050, it would wait longer than the first.
+        let reports = [(1, 2_000), (3, 0), (2, 18_000), (1, 100), (1, 100)];
+        let mut pool: Vec<Candidate> = (0..5).map(|at| candidate(at, 0)).collect();
+        for (row, (running, live_rate)) in pool.iter_mut().zip(reports) {
+            row.load = Some(LoadRow {
+                live_rate,
+                ..report(running, 0)
+            });
+        }
         let (mut said, mut plain) = ([0.0f32; 3], [0.0f32; 3]);
         let band = ll.score(&facts, &pool, &kept(3), &mut plain);
+        // Asked of every kept row, it answers as the plain entry.
         assert_eq!(
-            ll.score_front(&facts, &pool, &kept(3), &mut said),
+            ll.score_front(&facts, &pool, &kept(3), &kept(3), &mut said),
             (band, Front::Unsaid)
         );
         assert_eq!(said, plain);
-        // A report without a rate drains at the rows' mean rate.
-        pool[1].load = Some(LoadRow {
-            live_rate: 0,
-            ..report(3, 0)
-        });
-        let mut untouched = [-1.0f32; 3];
-        let word = ll.score_front(&facts, &pool, &kept(3), &mut untouched).1;
-        assert_eq!(word, Front::Whole);
-        assert_eq!(untouched, [-1.0; 3], "nothing is costed");
+        // Asked of the first two, it orders them as among the three.
+        assert!(plain[1] > plain[0], "{plain:?}");
+        let word = ll
+            .score_front(&facts, &pool, &kept(3), &[0, 1], &mut said[..2])
+            .1;
+        assert_eq!((word, &said[..2]), (Front::Unsaid, &[0.0, 1.0][..]));
         // A row without a report is costed from its reporting peers.
         pool[1].load = None;
-        let word = ll.score_front(&facts, &pool, &kept(3), &mut untouched).1;
+        let mut untouched = [-1.0f32; 2];
+        let word = ll
+            .score_front(&facts, &pool, &kept(3), &[0, 1], &mut untouched)
+            .1;
         assert_eq!(word, Front::Whole);
-        // Handed the rows that report a rate alone, it answers for them.
-        let word = ll.score_front(&facts, &pool, &[0, 2], &mut said[..2]).1;
+        assert_eq!(untouched, [-1.0; 2], "nothing is costed");
+        // Asked of the rows that hold a report alone, it answers for them.
+        let word = ll
+            .score_front(&facts, &pool, &kept(3), &[0, 2], &mut said[..2])
+            .1;
         assert_eq!(word, Front::Unsaid);
     }
 
@@ -3186,6 +3499,31 @@ mod tests {
         rw.on_dispatched(&lease, &target_of(&pool[1]), Side::Single, 0);
         rw.on_membership(&Membership::Removed(pool[1].id));
         assert_eq!(rw.held_at(pool[1].id, 0), 0);
+    }
+
+    /// The resident-work stage credits a dispatch of no stated size at its
+    /// mean prefill, the crate's default: credited at no tokens, the worker
+    /// would still read cheaper than its peer.
+    #[test]
+    fn resident_work_credits_a_dispatch_of_no_stated_size_at_its_mean_prefill() {
+        let rw = ResidentWork::new(1_000);
+        let mut pool = [candidate(0, 0), candidate(1, 0)];
+        pool[0].load = Some(resident(1, 2_000));
+        pool[0].load_sampled_at_micros = 1_000;
+        pool[1].load = Some(resident(1, 4_000));
+        pool[1].load_sampled_at_micros = 1_000;
+        assert_eq!(resident_scores(&rw, &pool), [1.0, 0.0]);
+
+        let unstated = Lease {
+            issued_micros: 2_000,
+            ..Lease::default()
+        };
+        rw.on_dispatched(&unstated, &target_of(&pool[0]), Side::Single, 0);
+        assert_eq!(
+            resident_scores(&rw, &pool),
+            [0.0, 1.0],
+            "2,000 + the crate's default 1,024 + 1,000 for each of two requests, against 5,000"
+        );
     }
 
     /// A report releases the dispatches it reflects whether or not the score
@@ -3885,6 +4223,61 @@ mod tests {
             MAX_TARGETS + 1,
             |_| {},
         );
+    }
+
+    /// The best rows of an engine are the slots of the ranked push drawn
+    /// one by one, seed for seed and for every count of slots asked: among
+    /// few rows and many, where rows tie and where each stands alone in
+    /// its band, under a narrow band and a wide one.
+    #[test]
+    fn the_best_rows_of_an_engine_are_the_ranked_slots_one_by_one() {
+        let one_by_one = |scores: &[f32], band: TieBand, seed: u64, slots: usize| {
+            let (mut draw, mut taken) = (Draw::new(seed), Vec::new());
+            while taken.len() < slots.min(scores.len()) {
+                let open = |i: usize| !taken.contains(&i);
+                let Some(row) = draw_in_band(scores, band, &mut draw, open) else {
+                    break;
+                };
+                taken.push(row);
+            }
+            taken
+        };
+        let mut levels = Draw::new(7);
+        let mut tied = 0;
+        for rows in [0usize, 1, 2, 3, 4, 5, 8, 13, 63, 64, 65, 90] {
+            // Scores on a few levels, where rows tie, and on many, where
+            // few do; and on the last turn one score that is no number,
+            // which stands in every tie.
+            for spread in [1usize, 2, 3, 40, 41] {
+                let mut scores: Vec<f32> = (0..rows)
+                    .map(|_| levels.below(spread) as f32 / spread as f32)
+                    .collect();
+                if let (41, Some(score)) = (spread, scores.get_mut(rows / 2)) {
+                    *score = f32::NAN;
+                }
+                for band in [TieBand::NORMALIZED, TieBand(0.3)] {
+                    for seed in 0..40u64 {
+                        for slots in 0..=MAX_TARGETS {
+                            let mut out = [usize::MAX; MAX_TARGETS];
+                            let filled =
+                                draw_best(Draw::new(seed), &scores, band, &mut out[..slots]);
+                            let ruled = one_by_one(&scores, band, seed, slots);
+                            assert_eq!(
+                                &out[..filled],
+                                &ruled[..],
+                                "{rows} rows on {spread} levels, seed {seed}, {slots} slots"
+                            );
+                            assert_eq!(filled, slots.min(rows));
+                        }
+                        // The draw decides somewhere: the slots of one seed
+                        // are not the slots of every seed.
+                        let first = |seed| one_by_one(&scores, band, seed, 1);
+                        tied += usize::from(first(seed) != first(seed + 1));
+                    }
+                }
+            }
+        }
+        assert!(tied > 500, "{tied}");
     }
 
     /// Count-first orders no more of the workers it passed over than the
@@ -5028,6 +5421,43 @@ mod tests {
                 let written = picked(picker, &own, &pool, &flat);
                 let read = picked(picker, &beside, &bare, &flat);
                 assert_eq!(written, read, "{} at seed {seed}", picker.name());
+            }
+        }
+    }
+
+    /// Random's pick and its draw name the row the loops they replace
+    /// named: the j-th position not taken yet, found by stepping over the
+    /// positions taken, which stand ascending behind each step. Every
+    /// pool size the whole pass and the draw meet, over many seeds.
+    #[test]
+    fn a_random_draw_steps_over_the_positions_taken_as_the_loop_did() {
+        for n in 1..=40usize {
+            for seed in 0..400u64 {
+                let mut draw = Draw::new(seed);
+                let mut taken = [usize::MAX; MAX_TARGETS];
+                let mut looped = [usize::MAX; MAX_TARGETS];
+                for slot in 0..MAX_TARGETS.min(n) {
+                    let j = draw.below(n - slot);
+                    let stepped = step_over(&mut taken, slot, j);
+                    // The loop as it stood: the j-th position not taken.
+                    let (mut seen, mut chosen) = (0usize, 0usize);
+                    for i in 0..n {
+                        if looped[..slot].contains(&i) {
+                            continue;
+                        }
+                        if seen == j {
+                            chosen = i;
+                            break;
+                        }
+                        seen += 1;
+                    }
+                    looped[slot] = chosen;
+                    assert_eq!(stepped, chosen, "{n} rows, seed {seed}, slot {slot}");
+                    assert!(taken[..=slot].is_sorted(), "{n} rows, seed {seed}");
+                    let mut ascending = looped;
+                    ascending[..=slot].sort_unstable();
+                    assert_eq!(taken, ascending, "{n} rows, seed {seed}");
+                }
             }
         }
     }

@@ -14,6 +14,14 @@ use smg_data_connector::{
 };
 use smg_external_router::realtime::webrtc::default_bind_addr;
 use smg_mcp::McpOrchestrator;
+use smg_worker::{
+    connection::http_client::{
+        build_client, connect_timeout_secs_below, WorkerHttpClientCache,
+        DEFAULT_CONNECT_TIMEOUT_SECS,
+    },
+    health::liveness,
+    workflow::WorkflowHost,
+};
 use tokio::sync::broadcast::error::RecvError;
 use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::{debug, info};
@@ -23,13 +31,16 @@ use crate::{
     config::{ParserChoice, RouterConfig},
     middleware::{AuthConfig, TokenBucket},
     observability::inflight_tracker::InFlightRequestTracker,
-    policies::PolicyRegistry,
+    policies::{kv_index::event_monitor::KvEventMonitor, PolicyRegistry},
     rate_limit::RateLimitManager,
     rl_adapter,
     routers::{
         common::{
-            openai_bridge::FormatRegistry, overload, pd_admission,
-            prefill_admission::PrefillAdmission, realtime::RealtimeRegistry,
+            openai_bridge::FormatRegistry,
+            overload, pd_admission,
+            prefill_admission::PrefillAdmission,
+            realtime::RealtimeRegistry,
+            snapshot::{ModelWorkerSnapshot, WorkerMonitor, WorkerRegistry},
         },
         gateway::Gateway,
         grpc::{
@@ -41,13 +52,6 @@ use crate::{
     },
     server::http_client_builder,
     wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
-    worker::{
-        connection::http_client::{
-            build_client, connect_timeout_secs_below, DEFAULT_CONNECT_TIMEOUT_SECS,
-        },
-        health::liveness,
-        KvEventMonitor, WorkerHttpClientCache, WorkerMonitor, WorkerRegistry,
-    },
     workflow::{JobQueue, TokenizerLoadFailures, WorkflowEngines},
 };
 
@@ -214,6 +218,16 @@ pub struct AppContextBuilder {
     kv_event_monitor: Option<Arc<KvEventMonitor>>,
     webrtc_bind_addr: Option<std::net::IpAddr>,
     webrtc_stun_server: Option<String>,
+}
+
+/// The context hosts the worker crate's workflow steps: they read the
+/// registry through this and nothing else of the gateway.
+impl WorkflowHost for AppContext {
+    type Generation = ModelWorkerSnapshot;
+
+    fn worker_registry(&self) -> &Arc<WorkerRegistry> {
+        &self.worker_registry
+    }
 }
 
 impl AppContext {
@@ -446,7 +460,7 @@ impl AppContextBuilder {
             .router_config
             .ok_or(AppContextBuildError::MissingField("router_config"))?;
         // The configuration's liveness budgets (the stall, wedge and stale
-        // thresholds and the warm-up slice, see `worker::health::liveness`) take
+        // thresholds and the warm-up slice, see `smg_worker::health::liveness`) take
         // effect for every context built from it, the server's and a test's
         // alike. They are process-wide and the first call wins, so a
         // constructor that builds the policy registry itself configures them
@@ -540,6 +554,12 @@ impl AppContextBuilder {
             .filter(|_| router_config.effective_prefill_queue_size() > 0)
         {
             start_prefill_admission_notifier(&worker_registry, admission)?;
+        }
+        // The hash rings are filled where a membership change is heard, off
+        // the request path. Where no runtime is entered nothing warms them,
+        // and the first reader of a generation fills its ring.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            policy_registry.keep_rings_warm(&worker_registry, &runtime);
         }
 
         // Create WorkerService from the already-built components
@@ -714,7 +734,7 @@ impl AppContextBuilder {
                 .pool_max_idle_per_host(500)
                 .timeout(Duration::from_secs(timeout_secs))
                 // Below the request timeout, as the worker clients keep it
-                // (`worker::connection::http_client::connect_timeout_secs_below`): a dark
+                // (`smg_worker::connection::http_client::connect_timeout_secs_below`): a dark
                 // external host fails as a connect timeout, not as the
                 // request's own (except under a 1 s request timeout, where the
                 // two timers race).
@@ -1017,18 +1037,23 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use openai_protocol::worker::{HealthCheckConfig, WorkerSpec, WorkerStatus};
+    use smg_worker::{
+        connection::engine::NO_ENGINE_CONNECTOR,
+        identity::basic::{ConnectionMode, Worker, WorkerType},
+        kv_events::SubscriptionKind,
+        test_support::RefusedAddress,
+    };
     use tracing_test::traced_test;
 
     use super::*;
     use crate::{
         config::types::PolicyConfig,
-        routers::common::prefill_admission::{
-            test_support::select_worker, PrefillAdmissionAttempt,
-        },
-        worker::{
-            connection::engine::NO_ENGINE_CONNECTOR,
-            test_support::{worker_of, RefusedAddress},
-            BasicWorkerBuilder, ConnectionMode, SubscriptionKind, Worker, WorkerType,
+        routers::{
+            common::{
+                prefill_admission::{test_support::select_worker, PrefillAdmissionAttempt},
+                snapshot::test_support::worker_of,
+            },
+            grpc::backend_client::BasicWorkerBuilder,
         },
     };
 
@@ -1051,11 +1076,11 @@ mod tests {
     }
 
     /// Child-process body of the root-store test below (see
-    /// `worker::connection::http_client::no_root_store`); a no-op unless the case
+    /// `smg_worker::connection::http_client::no_root_store`); a no-op unless the case
     /// variable is set.
     #[test]
     fn child_with_client_without_native_roots() {
-        use crate::worker::connection::http_client::no_root_store;
+        use smg_worker::connection::http_client::no_root_store;
 
         if std::env::var(no_root_store::CASE).is_err() {
             return;
@@ -1071,7 +1096,7 @@ mod tests {
         ignore = "the native verifier does not use SSL_CERT_FILE/SSL_CERT_DIR"
     )]
     fn the_gateway_client_builds_without_a_native_root_store() {
-        use crate::worker::connection::http_client::no_root_store;
+        use smg_worker::connection::http_client::no_root_store;
 
         no_root_store::run(
             &no_root_store::test_name(module_path!(), "child_with_client_without_native_roots"),
@@ -1322,6 +1347,45 @@ mod tests {
         );
     }
 
+    /// A context built on a runtime starts the task that fills the hash
+    /// rings: the ring of a generation is filled with no request to read it.
+    #[tokio::test]
+    async fn a_context_built_on_a_runtime_fills_the_hash_rings_itself() {
+        use openai_protocol::UNKNOWN_MODEL_ID;
+
+        use crate::routers::common::snapshot::WorkerRegistryExt as _;
+
+        let mut config = RouterConfig::builder()
+            .round_robin_policy()
+            .build_unchecked();
+        config.health_check.disable_health_check = true;
+        let context = AppContext::from_config(config, 30, None, None)
+            .await
+            .expect("a context");
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://ring:8080")
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        context.worker_registry.register(worker).expect("a worker");
+
+        let bound = std::time::Instant::now() + Duration::from_secs(30);
+        while !context
+            .worker_registry
+            .get_routing_snapshot(UNKNOWN_MODEL_ID)
+            .hash_ring_is_filled()
+        {
+            assert!(
+                std::time::Instant::now() < bound,
+                "no task filled the ring of the generation"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
     #[test]
     fn maybe_rate_limit_manager_disabled_is_ok_none() {
         let config = RouterConfig::default();
@@ -1425,7 +1489,7 @@ policy:
             .expect("the registry");
         let mut spec = WorkerSpec::new(format!("grpc://{}", refused.addr()));
         spec.connection_mode = ConnectionMode::Grpc;
-        registry.on_remote_worker_state(&crate::worker::RemoteWorkerState {
+        registry.on_remote_worker_state(&smg_worker::registry::RemoteWorkerState {
             worker_id: "peer-w1".to_string(),
             model_id: "m".to_string(),
             url: spec.url.clone(),
@@ -1591,6 +1655,8 @@ mod effective_max_concurrent_requests_tests {
 pub(crate) mod testing {
     use std::sync::Arc;
 
+    use smg_worker::connection::http_client::WorkerHttpClientCache;
+
     use super::{AppContext, ToolParserFactory};
     use crate::{
         admin::worker_service::WorkerService,
@@ -1599,11 +1665,10 @@ pub(crate) mod testing {
         observability::inflight_tracker::InFlightRequestTracker,
         policies::PolicyRegistry,
         routers::{
-            common::{openai_bridge, realtime::RealtimeRegistry},
+            common::{openai_bridge, realtime::RealtimeRegistry, snapshot::WorkerRegistry},
             grpc::multimodal::MultimodalConfigRegistry,
         },
         server::http_client,
-        worker::{WorkerHttpClientCache, WorkerRegistry},
     };
 
     /// An `AppContext` over `router_config` and `worker_registry`: in-memory

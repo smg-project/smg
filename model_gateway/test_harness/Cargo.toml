@@ -13,6 +13,7 @@ provider-openai = []
 [dependencies]
 smg = { path = "..", default-features = false, features = ["test-util"] }
 mock-worker = { path = "../../crates/mock_worker" }
+smg-worker.workspace = true
 smg-grpc-client.workspace = true
 smg-data-connector.workspace = true
 smg-mcp.workspace = true

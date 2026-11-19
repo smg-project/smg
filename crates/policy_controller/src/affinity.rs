@@ -563,18 +563,19 @@ impl Scorer for PrefixAffinity {
         &self,
         facts: &RequestFacts<'_>,
         candidates: &[Candidate],
-        kept: &[u32],
+        _: &[u32],
+        asked: &[u32],
         out: &mut [f32],
     ) -> (TieBand, Front) {
         if facts.named_alone().is_some() {
-            return (self.score(facts, candidates, kept, out), Front::Unsaid);
+            return (self.score(facts, candidates, asked, out), Front::Unsaid);
         }
-        if self.gates.kv_imbalanced(candidates, kept) {
+        if self.gates.kv_imbalanced(candidates, asked) {
             return (neutral(out), Front::Alike);
         }
         let column = facts.affinity;
         let (band, ceilings) =
-            self.rank(facts, candidates, kept, out, Feed::Column(column), || {
+            self.rank(facts, candidates, asked, out, Feed::Column(column), || {
                 |i: u32| column[i as usize]
             });
         // The values are the ceiling, a half and nothing: every row not
@@ -1118,7 +1119,7 @@ impl Lifecycle for WarmupSlice {
                     .lock()
                     .retain(|worker, _| ids.contains(worker));
             }
-            Membership::Added(_) | Membership::Relabelled(_) => {}
+            Membership::Added(_) | Membership::Relabelled(_) | Membership::Left { .. } => {}
         }
     }
 }
@@ -1149,10 +1150,11 @@ impl Scorer for WarmupSlice {
         &self,
         facts: &RequestFacts<'_>,
         candidates: &[Candidate],
-        kept: &[u32],
+        _: &[u32],
+        asked: &[u32],
         out: &mut [f32],
     ) -> (TieBand, Front) {
-        let band = self.score(facts, candidates, kept, out);
+        let band = self.score(facts, candidates, asked, out);
         if facts.named_alone().is_some() {
             return (band, Front::Unsaid);
         }
@@ -1984,6 +1986,55 @@ mod tests {
         out
     }
 
+    /// Under no cap the two feeds are still one reading: a profile that
+    /// takes no sample is named every holder and every warming row. Over a
+    /// pool where thirty-three of forty rows hold the request, more than
+    /// any sample names, and two rows are thin, each stage scores the rows
+    /// named as the column they were derived from, turn by turn.
+    #[test]
+    fn every_holder_named_scores_as_the_column_past_any_cap() {
+        // Rows 0 to 23 hold the deepest match and rows 24 to 31 a shallower
+        // one; rows 38 and 39 are thin, and row 38 holds the deepest too.
+        let pool: Vec<Held> = (0..40u32)
+            .map(|row| match row {
+                0..=23 => sized(row, row % 3, 12, 64),
+                24..=31 => sized(row, row % 3, 4, 64),
+                38 => sized(row, 1, 12, 12),
+                39 => sized(row, 0, 0, 12),
+                _ => sized(row, row % 3, 0, 64),
+            })
+            .collect();
+        let each: Vec<NamedHolder> = pool
+            .iter()
+            .filter(|(_, held)| held.overlap_blocks > 0)
+            .map(|(row, held)| holder(row.position, held.overlap_blocks))
+            .collect();
+        assert_eq!(each.len(), 33);
+        let stage = affinity(None);
+        assert_eq!(
+            scores_named(
+                &stage,
+                &facts(16),
+                &rows(&pool),
+                named(&each, &[38, 39], true)
+            ),
+            scores(&stage, &facts(16), &pool)
+        );
+        let (by_column, by_named) = (warmup(0.25, 1), warmup(0.25, 1));
+        for turn in 0..8 {
+            assert_eq!(
+                scores_named(
+                    &by_named,
+                    &facts(16),
+                    &rows(&pool),
+                    named(&each, &[38, 39], true)
+                ),
+                scores(&by_column, &facts(16), &pool),
+                "turn {turn}"
+            );
+        }
+    }
+
     /// The two feeds are one reading: over one pool, the rows a host named
     /// (each holder with what it holds, the warming rows) score as the
     /// column they were derived from, turn by turn and whichever rows a
@@ -2610,7 +2661,8 @@ mod tests {
                 let mut by_score = vec![0.0; kept.len()];
                 let mut by_front = vec![0.0; kept.len()];
                 let band = plain.score(&facts, &rows, &kept, &mut by_score);
-                let (front_band, word) = said.score_front(&facts, &rows, &kept, &mut by_front);
+                let (front_band, word) =
+                    said.score_front(&facts, &rows, &kept, &kept, &mut by_front);
                 let name = plain.name();
                 assert_eq!(by_front, by_score, "{name}, round {round}");
                 assert_eq!(front_band, band, "{name}, round {round}");
@@ -2642,15 +2694,16 @@ mod tests {
             ..facts(16)
         };
         let mut lone = [0.0];
-        let (_, word) = warmup(0.25, 0).score_front(&fed, &three, &[2], &mut lone);
+        let (_, word) = warmup(0.25, 0).score_front(&fed, &three, &[2], &[2], &mut lone);
         assert_eq!((lone, word), ([1.0], Front::Alike));
         // A decision fed no column: the slice stands alike, and no row
         // holds the request.
         let unfed = facts(16);
         let (mut slices, mut holds) = ([0.0; 3], [0.0; 3]);
-        let (_, word) = warmup(0.25, 0).score_front(&unfed, &three, &kept(3), &mut slices);
+        let (_, word) =
+            warmup(0.25, 0).score_front(&unfed, &three, &kept(3), &kept(3), &mut slices);
         assert_eq!((slices, word), ([1.0; 3], Front::Alike));
-        let (_, word) = affinity(None).score_front(&unfed, &three, &kept(3), &mut holds);
+        let (_, word) = affinity(None).score_front(&unfed, &three, &kept(3), &kept(3), &mut holds);
         assert_eq!((holds, word), ([0.5; 3], Front::At(0)));
         // The rows a host named say nothing, and score as by the plain
         // entry: the second row holds the request and the third warms.
@@ -2667,7 +2720,7 @@ mod tests {
             let (mut by_score, mut by_front) = ([0.0; 3], [0.0; 3]);
             let band = plain.score(&naming, &three, &kept(3), &mut by_score);
             assert_eq!(
-                said.score_front(&naming, &three, &kept(3), &mut by_front),
+                said.score_front(&naming, &three, &kept(3), &kept(3), &mut by_front),
                 (band, Front::Unsaid),
                 "{}",
                 plain.name()
@@ -2698,7 +2751,7 @@ mod tests {
         };
         for stage in &gated {
             let mut out = [0.0; 2];
-            let (_, word) = stage.score_front(&pressed, &two, &kept(2), &mut out);
+            let (_, word) = stage.score_front(&pressed, &two, &kept(2), &kept(2), &mut out);
             assert_eq!((out, word), ([1.0, 1.0], Front::Alike), "{}", stage.name());
         }
     }

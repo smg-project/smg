@@ -78,7 +78,9 @@ pub struct Listener {
     /// after its flag (`gateway`, `control`, `replication`, `ingestion`).
     pub name: String,
     /// The address it binds. Port `0` takes an ephemeral port, reported by
-    /// [`Controller::addresses`](super::Controller::addresses).
+    /// [`Controller::addresses`](super::Controller::addresses). A replica
+    /// that follows a leader names its replication listener's port
+    /// ([`ConfigError::ReplicationPortUnnamed`]).
     pub addr: SocketAddr,
     /// The scopes it serves; every scope is mounted once across the
     /// listeners.
@@ -290,6 +292,13 @@ pub enum ConfigError {
     /// and a listener has one credential rule.
     #[error("listener {0} verifies its callers against a client CA: it takes no identity as told")]
     AsToldBesideClientCa(String),
+    /// The replication listener of a replica that follows a leader, on
+    /// port `0`. Replicas are configured alike, and a standby dials its
+    /// leader at the port of its own replication listener: a number the
+    /// host drew for one replica is no other's. Refused at the serve's
+    /// start.
+    #[error("listener {0} serves the replication scope on port 0, and this replica follows a leader: a standby dials its leader at its own replication port, so name this listener's port")]
+    ReplicationPortUnnamed(String),
     /// A grace period of zero: a drain needs a bound above zero.
     #[error("the shutdown grace period is zero")]
     ZeroShutdownGrace,
