@@ -12,6 +12,7 @@ use clap::Parser;
 use smg::config::{PolicyDocumentError, RouterConfig};
 use smg_policy_controller::{PolicySpec, SpecError, PRESETS};
 
+use super::PolicySpecPrint;
 use crate::{cli::url_port::CommandLine, Cli, CliArgs, Commands};
 
 /// The urls of a side that the binary reads ahead of clap, each with its
@@ -36,6 +37,29 @@ fn router_config(argv: &[String]) -> Result<RouterConfig, String> {
     let (args, prefill_urls, encode_urls) = parsed(argv)?;
     args.to_router_config(prefill_urls, encode_urls)
         .map_err(|err| err.to_string())
+}
+
+/// The document of a command line's routing part alone, as
+/// `--print-policy-spec` reads it.
+fn routed(argv: &[String]) -> Result<Converted, String> {
+    let (args, prefill_urls, encode_urls) = parsed(argv)?;
+    let config = args
+        .routing_config(prefill_urls, encode_urls)
+        .map_err(|refused| format!("the routing part of {argv:?} is refused: {refused}"))?;
+    Ok(config.policy_document())
+}
+
+/// Holds the routing part of a command line to the document its whole
+/// configuration means. A field the document reads and the routing part
+/// does not carry fails here.
+fn one_routing_part(argv: &[String], whole: &Converted) -> Result<(), String> {
+    if routed(argv)? == *whole {
+        Ok(())
+    } else {
+        Err(format!(
+            "the routing part of {argv:?} means another document than the whole configuration"
+        ))
+    }
 }
 
 /// The corpus's items by file name, in order.
@@ -161,7 +185,9 @@ fn verdict(name: &str, item: &str) -> Result<Verdict, String> {
             };
         }
     };
-    let document = match config.policy_document() {
+    let whole = config.policy_document();
+    one_routing_part(&argv, &whole)?;
+    let document = match whole {
         Ok(document) => document,
         Err(PolicyDocumentError::Unsaid { setting, .. }) => return Ok(Verdict::Refused(setting)),
         Err(other) => return Err(format!("no document: {other}")),
@@ -443,6 +469,12 @@ const ROUTING_FLAGS: &[Row] = &[
     lands("worker-warmup-blocks", &[], &["2048"]),
     lands("worker-warmup-thin-ratio", &[], &["0.25"]),
     lands("worker-warmup-divert-every", &[], &["4"]),
+    kept(
+        "print-policy-spec",
+        &[],
+        &[],
+        "it prints the document and moves none of it",
+    ),
     lands("pd-disaggregation", &[], &[]),
     lands("epd-disaggregation", &[], &[]),
     kept("decode", PAIR, &["http://decode-b:8000"], POOLS),
@@ -469,7 +501,9 @@ fn document(context: &[&str], given: &[String]) -> Result<Converted, String> {
         .collect();
     let config = router_config(&argv)
         .map_err(|refused| format!("the binary refuses {argv:?}: {refused}"))?;
-    Ok(config.policy_document())
+    let whole = config.policy_document();
+    one_routing_part(&argv, &whole)?;
+    Ok(whole)
 }
 
 /// A command line's document, or the setting of it that no document says.
@@ -550,4 +584,137 @@ fn every_routing_flag_lands_is_refused_by_name_or_is_kept_with_its_reason() {
         ROUTING_FLAGS.len(),
         defects.join("\n")
     );
+}
+
+/// What `--print-policy-spec` answers to a command line.
+fn printed(line: &[&str]) -> PolicySpecPrint {
+    let argv: Vec<String> = line.iter().map(|word| (*word).to_string()).collect();
+    let (args, prefill_urls, encode_urls) = parsed(&argv).expect("the binary takes the line");
+    assert!(
+        args.routing.print_policy_spec,
+        "the line asks for the print"
+    );
+    args.policy_spec_print(prefill_urls, encode_urls)
+}
+
+/// The document of an answer, read back.
+fn read_back(answer: &PolicySpecPrint) -> PolicySpec {
+    let yaml = answer.document().expect("a document");
+    serde_yaml::from_str(yaml).expect("the print is a document")
+}
+
+#[test]
+fn the_print_option_answers_with_the_document_a_command_line_means() {
+    let answer = printed(&[
+        "smg",
+        "launch",
+        "--worker-urls",
+        "http://worker-a:8000",
+        "http://worker-b:8000",
+        "--policy",
+        "cache_aware",
+        "--print-policy-spec",
+    ]);
+    assert_eq!(answer.refusal(), None);
+    assert_eq!(
+        read_back(&answer),
+        PolicySpec::preset("cache_aware").expect("a preset")
+    );
+}
+
+#[test]
+fn the_print_option_says_a_refusal_in_one_sentence() {
+    // A setting no document says: no document, and the setting by its name.
+    let sticky = "routing_key_override.enabled = true: the controller holds no recorded form of \
+                  the sticky sessions' rule yet";
+    assert_eq!(
+        printed(&["smg", "--routing-key-override", "--print-policy-spec"]),
+        PolicySpecPrint::Refused(sticky.to_string())
+    );
+
+    // A line the binary itself refuses: the configuration's own sentence.
+    let alone = printed(&["smg", "--policy", "power_of_two", "--print-policy-spec"]);
+    assert_eq!(alone.document(), None);
+    assert!(
+        alone
+            .refusal()
+            .is_some_and(|sentence| sentence.contains("at least 2 workers")),
+        "{alone:?}"
+    );
+
+    // A document this build's controller does not run yet: it prints, with
+    // the controller's word for the part.
+    let decayed = printed(&["smg", "--overlap-decay", "0.5", "--print-policy-spec"]);
+    assert_ne!(
+        read_back(&decayed),
+        PolicySpec::preset("cache_aware").expect("a preset")
+    );
+    assert_eq!(
+        decayed.refusal(),
+        Some(
+            "profiles.cache_aware.score[1].prefix-affinity: the prefix-affinity decay is not in \
+             this build"
+        )
+    );
+}
+
+#[test]
+fn the_print_checks_its_document_as_the_gateway_checks_one_it_hosts() {
+    // The tenant header is the gateway's own: it is denied to the view.
+    let tenant = printed(&[
+        "smg",
+        "--policy",
+        "manual",
+        "--routing-key-headers",
+        "x-tenant-id",
+        "--tenant-header-name",
+        "x-tenant-id",
+        "--print-policy-spec",
+    ]);
+    assert!(tenant.document().is_some(), "{tenant:?}");
+    assert_eq!(
+        tenant.refusal(),
+        Some("view.headers[0]: header \"x-tenant-id\" is on the deny-list")
+    );
+}
+
+#[test]
+fn the_print_does_not_read_the_stores_flags() {
+    // A start refuses this line for its store, which has no address. The
+    // print does not read the store's flags.
+    let answer = printed(&[
+        "smg",
+        "--history-backend",
+        "postgres",
+        "--print-policy-spec",
+    ]);
+    assert_eq!(answer.refusal(), None);
+    assert!(answer.document().is_some());
+}
+
+#[test]
+fn the_print_refuses_its_part_of_a_line_as_a_start_refuses_it() {
+    // A start refuses each line for a field of the routing part: a discovery
+    // setting, or the tenant header's name. The print reads those fields, so
+    // its refusal is the start's own sentence.
+    let lines: [&[&str]; 4] = [
+        &["smg", "--service-discovery"],
+        &[
+            "smg",
+            "--service-discovery",
+            "--selector",
+            "app=w",
+            "--service-discovery-port",
+            "0",
+        ],
+        &["smg", "--tenant-header-name", ""],
+        &["smg", "--tenant-header-name", "not a header"],
+    ];
+    for line in lines {
+        let argv: Vec<String> = line.iter().map(|word| (*word).to_string()).collect();
+        let start = router_config(&argv).expect_err("a start refuses the line");
+        let mut asked = line.to_vec();
+        asked.push("--print-policy-spec");
+        assert_eq!(printed(&asked), PolicySpecPrint::Refused(start), "{line:?}");
+    }
 }
