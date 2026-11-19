@@ -74,3 +74,8 @@ def test_every_path_filter_entry_has_a_root_on_the_tree(workflow):
         if filter_root(entry) and not (ROOT / filter_root(entry)).exists()
     ]
     assert not stale, f"{workflow.name} starts on paths that do not exist: {stale}"
+
+
+def test_discovery_runs_when_the_command_line_changes():
+    workflow = ROOT / ".github" / "workflows" / "e2e-discovery.yml"
+    assert ("pull_request", "paths", "model_gateway/src/cli/mod.rs") in filter_entries(workflow)

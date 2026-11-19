@@ -53,7 +53,7 @@ path = "src/main.rs"
 [[bin]]
 name = "amg"
 path = "src/main.rs"
-# The same source as `smg`: its unit tests run in the `smg` binary's test harness, so this one builds none.
+# Both binaries use the library's command line. Its unit tests run with the library.
 test = false
 
 [dependencies]
