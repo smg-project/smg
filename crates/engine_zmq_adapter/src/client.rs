@@ -1923,19 +1923,53 @@ pub(crate) fn zmq_status(error: engine_zmq_client::Error) -> tonic::Status {
 /// failure of its engine out to every request in flight as the one error
 /// shared (`Error::Shared`), and a shared error answers as the bare one.
 fn zmq_status_of(error: &engine_zmq_client::Error) -> tonic::Status {
+    if let engine_zmq_client::Error::Shared(inner) = error {
+        return zmq_status_of(inner);
+    }
+    // Everything not better served elsewhere is INTERNAL, including the
+    // dispatcher's terminal `Shared(Decode)` after a run of undecodable
+    // output frames. A later submit on that same dead client reads as
+    // `ClientClosed` and so UNAVAILABLE; the asymmetry is intentional. The
+    // requests in flight when decoding failed saw the protocol mismatch
+    // itself, which replaying on another worker of the same build will not
+    // cure, while the later submit only finds a closed link.
+    if is_served_elsewhere(error) {
+        tonic::Status::unavailable(error.to_string())
+    } else {
+        tonic::Status::internal(error.to_string())
+    }
+}
+
+/// Whether `error` says the engine, or the link to it, is gone or not
+/// taking input, rather than anything about the request: such a request is
+/// better served elsewhere.
+///
+/// A failure of the engine link itself (its socket's I/O, the ZMQ
+/// transport, a client closed under the call) says the same as a dead
+/// engine: an engine killed under the servicer surfaces as `Broken pipe` on
+/// the next send. Reporting it as INTERNAL would tell the router the worker
+/// failed on this payload, a definitive answer it does not replay. In-flight
+/// requests see the dispatcher's terminal error wrapped in `Shared`, so the
+/// check looks through it.
+///
+/// A request stream closed without a terminal output is also not served
+/// here, though the engine behind it is healthy: the dispatcher always
+/// delivers a terminal error before it drops the senders on an engine
+/// death, so a bare close only arises when it retires a request vLLM listed
+/// as finished out of band, or when the client itself is dropped.
+fn is_served_elsewhere(error: &engine_zmq_client::Error) -> bool {
+    use engine_zmq_client::Error;
     match error {
-        engine_zmq_client::Error::Shared(inner) => zmq_status_of(inner),
-        // The engine is gone, is not taking input right now, or the
-        // connector to it is shutting down (its engine died, or the servicer
-        // drains): either way this request is better served elsewhere.
-        engine_zmq_client::Error::EngineCoreDead
-        | engine_zmq_client::Error::EngineInputBlocked { .. }
-        | engine_zmq_client::Error::EngineInputFull { .. }
-        | engine_zmq_client::Error::EngineInputBytesFull { .. }
-        | engine_zmq_client::Error::ClientClosed { .. } => {
-            tonic::Status::unavailable(error.to_string())
-        }
-        other => tonic::Status::internal(other.to_string()),
+        Error::EngineCoreDead
+        | Error::Io(_)
+        | Error::Transport(_)
+        | Error::ClientClosed { .. }
+        | Error::EngineInputBlocked { .. }
+        | Error::EngineInputFull { .. }
+        | Error::EngineInputBytesFull { .. }
+        | Error::RequestStreamClosed { .. } => true,
+        Error::Shared(inner) => is_served_elsewhere(inner),
+        _ => false,
     }
 }
 
@@ -2110,8 +2144,9 @@ mod tests {
             zmq_status(engine_zmq_client::Error::EngineCoreDead).code(),
             Code::Unavailable
         );
-        let engine_failure = zmq_status(engine_zmq_client::Error::RequestStreamClosed {
-            request_id: "req-1".to_string(),
+        let engine_failure = zmq_status(engine_zmq_client::Error::Decode {
+            target_type: "EngineCoreOutputs",
+            message: "bad frame".to_string(),
         });
         assert_eq!(engine_failure.code(), Code::Internal, "{engine_failure:?}");
     }
@@ -2152,13 +2187,52 @@ mod tests {
             "{ended:?}"
         );
         let nested = zmq_status(engine_zmq_client::Error::Shared(Arc::new(
-            engine_zmq_client::Error::Shared(Arc::new(
-                engine_zmq_client::Error::RequestStreamClosed {
-                    request_id: "req-2".to_string(),
-                },
-            )),
+            engine_zmq_client::Error::Shared(Arc::new(engine_zmq_client::Error::Decode {
+                target_type: "EngineCoreOutputs",
+                message: "bad frame".to_string(),
+            })),
         )));
         assert_eq!(nested.code(), Code::Internal, "{nested:?}");
+    }
+
+    /// A lost engine link is "not served now", as a dead engine is, never
+    /// the worker's own failure on the payload: the router does not replay
+    /// an INTERNAL on the worker, so a killed engine must not read as one.
+    /// In-flight requests receive the dispatcher's error wrapped in `Shared`.
+    #[test]
+    fn a_lost_engine_link_is_unavailable_not_internal() {
+        use engine_zmq_client::Error;
+
+        let broken_pipe = Error::Io(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+        assert_eq!(zmq_status(broken_pipe).code(), Code::Unavailable);
+        let closed = || Error::ClientClosed {
+            message: "engine output reader exited".to_string(),
+        };
+        assert_eq!(zmq_status(closed()).code(), Code::Unavailable);
+        assert_eq!(zmq_status(Error::EngineCoreDead).code(), Code::Unavailable);
+        let transport = Error::Transport(zeromq::ZmqError::NoMessage);
+        assert_eq!(zmq_status(transport).code(), Code::Unavailable);
+        // A stream closed without a terminal output is not served here,
+        // but the engine behind it is healthy: see `is_served_elsewhere`.
+        let stream_closed = || Error::RequestStreamClosed {
+            request_id: "r".to_string(),
+        };
+        assert_eq!(zmq_status(stream_closed()).code(), Code::Unavailable);
+        let shared_dead = Error::Shared(Arc::new(Error::EngineCoreDead));
+        assert_eq!(zmq_status(shared_dead).code(), Code::Unavailable);
+        let shared_closed = Error::Shared(Arc::new(closed()));
+        assert_eq!(zmq_status(shared_closed).code(), Code::Unavailable);
+        let decode = || Error::Decode {
+            target_type: "EngineCoreOutputs",
+            message: "bad frame".to_string(),
+        };
+        assert_eq!(zmq_status(decode()).code(), Code::Internal);
+        // The dispatcher's terminal decode failure stays INTERNAL even though
+        // a later submit on the same dead client is UNAVAILABLE: the requests
+        // in flight saw a protocol mismatch, which a replay elsewhere will
+        // not cure (see `zmq_status`).
+        let shared_decode = Error::Shared(Arc::new(decode()));
+        assert_eq!(zmq_status(shared_decode).code(), Code::Internal);
     }
 
     /// A connected client over a throwaway ipc endpoint. The mock engine is
