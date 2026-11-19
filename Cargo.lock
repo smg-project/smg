@@ -8100,6 +8100,7 @@ dependencies = [
  "axum",
  "clap",
  "criterion",
+ "crossbeam-queue",
  "http",
  "hyper-util",
  "k8s-openapi",

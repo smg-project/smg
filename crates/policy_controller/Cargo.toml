@@ -16,6 +16,13 @@ categories = ["algorithms"]
 # the rare write (a rank's first dispatch, a membership change): a load
 # costs no shared write.
 arc-swap = "1.9.1"
+# The ring a file's hands write into: a bounded queue written in place
+# that wakes no thread, where a channel pays for a waker at every frame
+# and nothing sleeps on it. The KV index below already builds it. The
+# hand-over's argument in src/store/memory/turn.rs stands on two facts
+# of its push and its pop as read at 0.3.14, the version the lock file
+# holds: a version that moves reads them again.
+crossbeam-queue = "0.3"
 # The KV index the store holds one of per model: the chain index, the map
 # each of its writers keeps and its block types. It names no workspace crate.
 kv-index = { workspace = true }
