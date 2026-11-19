@@ -495,6 +495,50 @@ fn a_token_two_pieces_spell_around_an_empty_expression_leaves_the_template_as_it
     assert!(!marked(" T{{ note }}AG ", " TAG "));
 }
 
+/// A render writes the pieces of a template in an order of its own: it
+/// leaves a piece out, takes one arm of a branch and not the other, writes
+/// the body of a loop again, or writes a macro's text where the macro is
+/// called. Two pieces that stand apart in the source then spell together,
+/// with whole pieces between them or none, a text an added token matches,
+/// and the template is left as it is: the token it writes there is read as
+/// the flat encode reads it, whether its entry is special or not. A
+/// template whose pieces spell no token in any order is marked.
+#[test]
+fn a_token_pieces_spell_in_an_order_of_the_render_leaves_the_template_as_it_was() {
+    let plain = with_added_token("<a>");
+    let special = plain.replace(
+        r#""normalized": false, "special": false}"#,
+        r#""normalized": false, "special": true}"#,
+    );
+    assert!(special != plain);
+    for conversion in [&plain, &special] {
+        let marked =
+            |written: &str, text: &str| marked_with_a_tagged_write(conversion, written, text, 19);
+        // A piece between the two is left out.
+        assert!(marked("<{% if extra %}x{% endif %}b>", "<b>"));
+        assert!(!marked("<{% if extra %}x{% endif %}a>", "<a>"));
+        // One arm of a branch is taken, and the piece of the other is not
+        // written.
+        assert!(!marked(
+            "{% if not extra %}<{% else %}x{% endif %}a>",
+            "<a>"
+        ));
+        // A whole piece stands between the two.
+        assert!(!marked(
+            "<{% if extra %}x{% endif %}{{ 'a' }}{% if extra %}y{% endif %}>",
+            "<a>"
+        ));
+        // The body of a loop is written again: its end, then its start.
+        assert!(marked("{% for n in [1, 2] %}b>a<{% endfor %}", "b>a<b>a<"));
+        assert!(!marked("{% for n in [1, 2] %}a>b<{% endfor %}", "a>b<a>b<"));
+        // A macro's text is written where the macro is called.
+        assert!(!marked(
+            "{% macro tail() %}a>{% endmacro %}<{{ tail() }}",
+            "<a>"
+        ));
+    }
+}
+
 /// Under a normalizer that strips the edges of a text, an added token
 /// whose spelling begins with a blank is matched after normalization. A
 /// template that writes, behind a block tag, a text the normalizer turns
