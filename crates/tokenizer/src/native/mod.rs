@@ -280,12 +280,46 @@ const LONG_PIECE_ENTRY_BYTES: usize = size_of::<(Box<[u8]>, Box<[u32]>)>();
 
 /// Inputs at least this long are encoded unit by unit on the thread pool (a
 /// text between added tokens, or a chunk of one cut at a stable boundary)
-/// when the pool has more than one thread (see `worth_the_pool`); shorter
-/// inputs would spend more on the hand-offs than they save.
+/// when no other text is in flight and the pool has more than one thread
+/// (see `worth_the_pool`); shorter inputs would spend more on the hand-offs
+/// than they save.
 const PARALLEL_MIN_BYTES: usize = 64 << 10;
 /// The size a long text unit is cut into for the pool, at the first stable
 /// boundary past each multiple of it.
 const PARALLEL_CHUNK_BYTES: usize = 32 << 10;
+/// The shortest text counted among the encodes in flight
+/// ([`ENCODES_IN_FLIGHT`]): the two atomic steps of a counted call are
+/// nothing beside an encode of this size, and a shorter text is out again
+/// before it could stand in a long one's way.
+const COUNTED_MIN_BYTES: usize = 4 << 10;
+/// Texts of [`COUNTED_MIN_BYTES`] or more that are being encoded now, by
+/// every encoder of the process: the thread pool is one for the process, so
+/// two encoders have to see each other. A long text takes the pool only
+/// when it is the one text counted (see `worth_the_pool`).
+static ENCODES_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+/// One text counted among the encodes in flight until it drops.
+struct InFlight<'a> {
+    count: &'a AtomicUsize,
+    /// Whether no other text was counted when this one came in.
+    alone: bool,
+}
+
+impl<'a> InFlight<'a> {
+    /// Counts one text into `count`.
+    fn enter(count: &'a AtomicUsize) -> Self {
+        Self {
+            count,
+            alone: count.fetch_add(1, Ordering::Relaxed) == 0,
+        }
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 /// Threads of the pool the vocabulary seed is read on at load. The pool is
 /// built for that read and joined before the load returns: on rayon's
 /// global pool the first load would build that pool at the machine's
@@ -2420,8 +2454,9 @@ impl NativeEncoder {
     /// declines, found after the pieces before it were tokenized, so that
     /// the error surfaces from the `tokenizers` encode. A long input is
     /// encoded on the thread pool, unit by unit (see [`Self::units`]), with
-    /// the same code per unit, when the pool has more than one thread (see
-    /// [`Self::worth_the_pool`]). `model` is the model behind the vocabulary,
+    /// the same code per unit, when no other text is in flight and the pool
+    /// has more than one thread (see [`Self::worth_the_pool`]); otherwise on
+    /// the caller's thread. `model` is the model behind the vocabulary,
     /// read for the whole-piece lookup of `ignore_merges` and for the
     /// pieces of a model whose merge table declined; `None` for a
     /// vocabulary read from ranks ([`Self::from_ranks`]), whose table is
@@ -2432,17 +2467,34 @@ impl NativeEncoder {
         text: &str,
         add_special_tokens: bool,
     ) -> Result<Vec<u32>, Fallback> {
-        self.encode_with(model, text, Self::worth_the_pool(text), add_special_tokens)
+        let in_flight = Self::in_flight(text);
+        let parallel = Self::worth_the_pool(text, in_flight.as_ref());
+        self.encode_with(model, text, parallel, add_special_tokens)
+    }
+
+    /// `text` counted among the encodes in flight ([`ENCODES_IN_FLIGHT`])
+    /// until the value drops, when it is long enough to count
+    /// (`COUNTED_MIN_BYTES`).
+    fn in_flight(text: &str) -> Option<InFlight<'static>> {
+        (text.len() >= COUNTED_MIN_BYTES).then(|| InFlight::enter(&ENCODES_IN_FLIGHT))
     }
 
     /// Whether `text` is encoded through the thread pool: long enough
-    /// (`PARALLEL_MIN_BYTES`) and a pool with more than one thread to cut
-    /// it for. A pool of one thread (a process pinned to one core, a
-    /// container with one CPU) encodes the units one after the other and
-    /// pays the cut, the Vec per unit and the join for nothing: 5 % of the
-    /// cycles and 140 allocations per encode of 2 MB on one core, measured.
-    fn worth_the_pool(text: &str) -> bool {
-        text.len() >= PARALLEL_MIN_BYTES && rayon::current_num_threads() > 1
+    /// (`PARALLEL_MIN_BYTES`), the one text in flight (`in_flight`) and a
+    /// pool with more than one thread to cut it for. The pool buys a long
+    /// text's wall time with idle cores, and callers that already fill the
+    /// cores leave it none: sixteen callers under a quota of four CPUs
+    /// encode 19 to 34 % more tokens a second when each long text stays on
+    /// its caller's thread, measured, while a text that finds no other in
+    /// flight keeps the pool and its wall time. A pool of one thread (a
+    /// process pinned to one core, a container with one CPU) encodes the
+    /// units one after the other and pays the cut, the Vec per unit and the
+    /// join for nothing: 5 % of the cycles and 140 allocations per encode of
+    /// 2 MB on one core, measured.
+    fn worth_the_pool(text: &str, in_flight: Option<&InFlight<'_>>) -> bool {
+        text.len() >= PARALLEL_MIN_BYTES
+            && in_flight.is_some_and(|counted| counted.alone)
+            && rayon::current_num_threads() > 1
     }
 
     /// The ids of `text` with no added token cut out of it and no frame:
@@ -2458,14 +2510,9 @@ impl NativeEncoder {
         text: &str,
         at_start: bool,
     ) -> Result<Vec<u32>, Fallback> {
-        self.encode_units(
-            model,
-            text,
-            Self::worth_the_pool(text),
-            false,
-            false,
-            at_start,
-        )
+        let in_flight = Self::in_flight(text);
+        let parallel = Self::worth_the_pool(text, in_flight.as_ref());
+        self.encode_units(model, text, parallel, false, false, at_start)
     }
 
     /// [`Self::encode`] with the thread pool used or not; the ids are the

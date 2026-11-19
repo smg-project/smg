@@ -7387,3 +7387,70 @@ fn a_piece_without_an_opening_byte_is_final_before_its_image() {
         }
     }
 }
+
+#[test]
+fn a_long_text_takes_the_pool_only_when_it_is_alone() {
+    // On a count of its own: the process's is shared with every test that
+    // encodes while this one runs.
+    let count = AtomicUsize::new(0);
+    let long = "a".repeat(PARALLEL_MIN_BYTES);
+    let pool = rayon::current_num_threads() > 1;
+    let first = InFlight::enter(&count);
+    assert!(first.alone);
+    assert_eq!(NativeEncoder::worth_the_pool(&long, Some(&first)), pool);
+    assert!(
+        !NativeEncoder::worth_the_pool(&long[1..], Some(&first)),
+        "a shorter text"
+    );
+    // A text that comes in while another is in flight stays on its caller's
+    // thread, and so does the next one while that one is.
+    let second = InFlight::enter(&count);
+    assert!(!second.alone);
+    assert!(!NativeEncoder::worth_the_pool(&long, Some(&second)));
+    drop(first);
+    let third = InFlight::enter(&count);
+    assert!(!third.alone);
+    drop((second, third));
+    // Every text is out again: nothing is counted and the next is alone.
+    assert_eq!(count.load(Ordering::Relaxed), 0);
+    let next = InFlight::enter(&count);
+    assert!(next.alone);
+    assert_eq!(NativeEncoder::worth_the_pool(&long, Some(&next)), pool);
+    // The entry counts a text from `COUNTED_MIN_BYTES` up and no shorter
+    // one, which so never takes the pool.
+    assert!(NativeEncoder::in_flight(&long[..COUNTED_MIN_BYTES - 1]).is_none());
+    assert!(NativeEncoder::in_flight(&long[..COUNTED_MIN_BYTES]).is_some());
+    assert!(!NativeEncoder::worth_the_pool(&long, None));
+}
+
+#[test]
+fn callers_at_once_keep_the_ids_of_a_lone_one() {
+    // Long texts through the entry from several threads at once: the text
+    // that finds itself alone takes the pool and the others encode on their
+    // callers' threads (see `worth_the_pool`); the ids are those of the
+    // serial encode either way.
+    let mut state = 0x900D_C0DE_0000_0013u64;
+    let shape = &shapes()[0];
+    let tokenizer = tokenizer_of(shape, &mut state);
+    let native = seeded(&tokenizer);
+    let model = tokenizer.get_model();
+    let texts: Vec<String> = (0..4)
+        .map(|_| long_text(&mut state, &[], 2 * PARALLEL_MIN_BYTES))
+        .collect();
+    let serial: Vec<_> = texts
+        .iter()
+        .map(|text| native.encode_with(Some(model), text, false, false))
+        .collect();
+    let barrier = std::sync::Barrier::new(texts.len());
+    std::thread::scope(|scope| {
+        for (text, serial) in texts.iter().zip(&serial) {
+            let (native, barrier) = (&native, &barrier);
+            scope.spawn(move || {
+                barrier.wait();
+                for _ in 0..4 {
+                    assert_eq!(&native.encode(Some(model), text, false), serial);
+                }
+            });
+        }
+    });
+}
