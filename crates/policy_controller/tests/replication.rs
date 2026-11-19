@@ -1264,9 +1264,11 @@ async fn snapshots_numbers(workers: u32) {
 /// the store's cut takes alone: what a membership write waits behind a
 /// snapshot that copies every row, as a call with no limit and no models
 /// does, and a call let in beside another. A lone call under a limit
-/// copies its limit's worth alone. A last line, with a watch open: one row
-/// asked eleven times, where each call shares the cut the feed keeps and
-/// copies nothing.
+/// copies its limit's worth alone, and a third line asks one row of the
+/// widest list of models a call may state: each row's model is searched
+/// in that list under the membership lock. A last line, with a watch
+/// open: one row asked eleven times, where each call shares the cut the
+/// feed keeps and copies nothing.
 async fn operators_snapshot_numbers(workers: u32) {
     let dir = tempfile::tempdir().expect("a temp dir");
     with_leader(shared(&dir), |leader| async move {
@@ -1283,13 +1285,21 @@ async fn operators_snapshot_numbers(workers: u32) {
         cuts.sort_unstable();
         let mut out = std::io::stdout();
         let mut operator = client(leader.control).await;
-        for limit in [0u32, 1] {
+        // The widest list a call may state: 127 models no row serves, then
+        // the one every row serves.
+        let widest: Vec<String> = (0..127)
+            .map(|n| format!("organization/model-name-{n:03}-instruct"))
+            .chain(["organization/model-name-70b-instruct".to_owned()])
+            .collect();
+        for (limit, models) in [(0u32, Vec::new()), (1, Vec::new()), (1, widest)] {
+            let asked = models.len();
             let mut micros = Vec::new();
             let mut told = (0, false, 0);
             for _ in 0..11 {
                 let request = stated(proto::SnapshotRequest {
                     slices: vec![proto::snapshot_request::Slice::Workers.into()],
                     limit,
+                    models: models.clone(),
                     ..proto::SnapshotRequest::default()
                 });
                 let began = Instant::now();
@@ -1308,7 +1318,7 @@ async fn operators_snapshot_numbers(workers: u32) {
             micros.sort_unstable();
             writeln!(
                 out,
-                "OPERATORS_SNAPSHOT workers={workers} limit={limit} rows={} truncated={} bytes={} median_us={} store_cut_median_us={}",
+                "OPERATORS_SNAPSHOT workers={workers} limit={limit} models={asked} rows={} truncated={} bytes={} median_us={} store_cut_median_us={}",
                 told.0, told.1, told.2, micros[5], cuts[5]
             )
             .expect("stdout");

@@ -3727,13 +3727,14 @@ mod tests {
 
         let (_elector, _standing, control) = electing(true);
         let feed = control.shared.feed.clone();
-        for worker in 0..3 {
+        let models = ["model-a", "model-a", "model-a", "model-b"];
+        for (worker, model) in models.into_iter().enumerate() {
             let request = proto::RegisterWorkerRequest {
                 spec: Some(proto::WorkerSpec {
                     url: format!("grpc://10.0.0.{worker}:8000"),
                     wire: proto::WireMode::Grpc as i32,
                     role: proto::Role::Single as i32,
-                    models: vec!["model-a".to_owned()],
+                    models: vec![model.to_owned()],
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -3755,14 +3756,26 @@ mod tests {
         };
         assert_eq!(told(1).await, (1, true));
         assert_eq!(feed.cuts(), 0, "a lone call for one row copied every row");
-        assert_eq!(told(0).await, (3, false));
+        assert_eq!(told(0).await, (4, false));
         assert_eq!(feed.cuts(), 1, "a call for every row takes the cut");
         assert!(feed.kept().is_none(), "no reader can share the cut");
+
+        // A lone call for one model with no limit reads that model's rows
+        // alone, and takes no cut.
+        let mut request = snapshot(&[Slice::Workers]);
+        request.get_mut().models = vec!["model-a".to_owned()];
+        let answer = control
+            .get_snapshot(request)
+            .await
+            .expect("the rows")
+            .into_inner();
+        assert_eq!((answer.workers.len(), answer.truncated), (3, false));
+        assert_eq!(feed.cuts(), 1, "a lone call for its models took the cut");
 
         // Another call is let in beside it: one cut, and both calls share it.
         let beside = control.shared.snapshots.place();
         assert_eq!(told(1).await, (1, true));
-        assert_eq!(told(0).await, (3, false));
+        assert_eq!(told(0).await, (4, false));
         assert_eq!(feed.cuts(), 2, "one copy for the calls let in");
         drop(beside);
     }

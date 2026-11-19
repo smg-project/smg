@@ -333,8 +333,7 @@ pub(crate) fn read(
     if every || turn.let_in() > 1 || watchers.open() {
         return Rows::Shared(feed.rows_at_head(store));
     }
-    let (rows, serving) =
-        store.rows_serving(|row| watch_workers::serves(&asked.models, row), asked.limit);
+    let (rows, serving) = store.rows_serving(&asked.models, asked.limit);
     Rows::Told(rows, serving)
 }
 
@@ -832,6 +831,12 @@ mod tests {
         let (page, truncated) = rows(&cut.rows, &ROWS, Instant::now());
         assert_eq!((page.len(), truncated), (1, true));
         assert!(page[0].url.starts_with("grpc://0."));
+        // A lone call's own read is held to the same bytes.
+        let asked = Asked { limit: 3, ..ROWS };
+        let (read, serving) = store.rows_serving(&asked.models, asked.limit);
+        let (page, truncated) = read_rows(&read, serving, &asked, Instant::now());
+        assert_eq!((page.len(), truncated), (1, true));
+        assert!(page[0].url.starts_with("grpc://0."));
     }
 
     /// The count of a watch's page is no bound of a snapshot. A watch pages
@@ -875,9 +880,10 @@ mod tests {
     }
 
     /// The rows a lone call reads for itself are the rows a shared cut
-    /// tells, with the same word on what was left out: limit by limit, with
-    /// a models filter and with none. No more rows are copied than the
-    /// limit tells.
+    /// tells, with the same word on what was left out: limit by limit, a
+    /// limit of zero among them, with a models filter and with none, and
+    /// with a list of models out of order. No more rows are copied than
+    /// the limit tells.
     #[test]
     fn the_rows_read_for_one_call_are_the_cuts_rows() {
         let store = MemoryStore::new();
@@ -890,19 +896,21 @@ mod tests {
             Vec::new(),
             vec!["model-b".to_owned()],
             vec!["model-c".to_owned()],
+            vec![
+                "model-d".to_owned(),
+                "model-c".to_owned(),
+                "model-b".to_owned(),
+            ],
         ];
         for models in filters {
-            for limit in [1, 2, 3, 5, 6, usize::MAX] {
+            for limit in [0, 1, 2, 3, 5, 6, usize::MAX] {
                 let asked = Asked {
                     models: models.clone(),
                     limit,
                     ..ROWS
                 };
                 let now = Instant::now();
-                let (read, serving) = store.rows_serving(
-                    |row| super::watch_workers::serves(&asked.models, row),
-                    asked.limit,
-                );
+                let (read, serving) = store.rows_serving(&asked.models, asked.limit);
                 assert!(read.len() <= limit, "models {models:?}, limit {limit}");
                 assert_eq!(
                     read_rows(&read, serving, &asked, now),

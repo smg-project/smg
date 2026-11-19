@@ -304,18 +304,28 @@ impl MemoryStore {
         }
     }
 
-    /// The first `limit` rows in key order of the ones `serves` admits,
-    /// with the count it admits: what a read that tells a few rows copies,
-    /// where [`MemoryStore::cut`] copies every row. The rows are visited
-    /// under the membership lock and the ones told are cloned there, so a
-    /// writer waits for those alone: a selection puts the limit's worth in
-    /// front, and they are sorted after the lock. The rows name no write of
+    /// The first `limit` rows in key order of the ones that serve one of
+    /// `models`, with the count that serve one; no model asked is every
+    /// row. What a read that tells a few rows copies, where
+    /// [`MemoryStore::cut`] copies every row. The rows are visited under
+    /// the membership lock and the ones told are cloned there, so a writer
+    /// waits for those alone: a selection puts the limit's worth in front,
+    /// and they are sorted after the lock. The models are put in order
+    /// ahead of the lock, and under it each model of a row is searched in
+    /// that list, so the count asked adds little to a writer's wait. No
+    /// code of the caller runs under the lock. The rows name no write of
     /// the journal: no reader starts a tail from them.
-    pub fn rows_serving(
-        &self,
-        serves: impl Fn(&WorkerRow) -> bool,
-        limit: usize,
-    ) -> (Vec<WorkerRow>, usize) {
+    pub fn rows_serving(&self, models: &[String], limit: usize) -> (Vec<WorkerRow>, usize) {
+        let mut asked: Vec<&str> = models.iter().map(String::as_str).collect();
+        asked.sort_unstable();
+        let serves = |row: &WorkerRow| {
+            asked.is_empty()
+                || row
+                    .facts
+                    .models
+                    .iter()
+                    .any(|model| asked.binary_search(&model.as_str()).is_ok())
+        };
         let (mut rows, serving) = {
             let workers = self.workers.lock();
             let mut serving: Vec<&WorkerRow> = workers
