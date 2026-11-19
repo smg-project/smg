@@ -388,18 +388,7 @@ fn a_whole_word_token_in_one_of_two_joined_pieces_leaves_the_template_as_it_was(
 /// a run of two pieces stands before it, or a piece follows it.
 #[test]
 fn a_whole_word_token_at_the_end_of_a_piece_leaves_the_template_as_it_was() {
-    let conversion = with_added_token("<a>")
-        .replace(
-            r#""special": false}],"#,
-            r#""special": false},
-        {"id": 20, "content": "tag", "single_word": true, "lstrip": false, "rstrip": false, "normalized": true, "special": true}],"#,
-        )
-        .replace(r#""<a>": 19}"#, r#""<a>": 19, "tag": 20}"#)
-        .replace(
-            r#""normalizer": null"#,
-            r#""normalizer": {"type": "BertNormalizer", "clean_text": true, "handle_chinese_chars": false, "strip_accents": null, "lowercase": true}"#,
-        );
-    assert!(conversion.contains(r#""id": 20"#) && conversion.contains("BertNormalizer"));
+    let conversion = with_a_whole_word_entry();
     let marked = |before: &str, after: &str| {
         let template = [before, &builds(), after].concat();
         let temp = TempDir::new().unwrap();
@@ -412,6 +401,138 @@ fn a_whole_word_token_at_the_end_of_a_piece_leaves_the_template_as_it_was() {
     assert!(!marked("", last));
     assert!(!marked("{{ 'x' ~ 'y' }}", last));
     assert!(!marked("", &[last, "{{ 'x' }}"].concat()));
+}
+
+/// [`TOKENIZER_JSON`] with `<a>` and one more added token, `tag`, special,
+/// matched after normalization and only as a whole word, under a
+/// normalizer that lowercases.
+fn with_a_whole_word_entry() -> String {
+    let conversion = with_added_token("<a>")
+        .replace(
+            r#""special": false}],"#,
+            r#""special": false},
+        {"id": 20, "content": "tag", "single_word": true, "lstrip": false, "rstrip": false, "normalized": true, "special": true}],"#,
+        )
+        .replace(r#""<a>": 19}"#, r#""<a>": 19, "tag": 20}"#)
+        .replace(
+            r#""normalizer": null"#,
+            r#""normalizer": {"type": "BertNormalizer", "clean_text": true, "handle_chinese_chars": false, "strip_accents": null, "lowercase": true}"#,
+        );
+    assert!(conversion.contains(r#""id": 20"#) && conversion.contains("BertNormalizer"));
+    conversion
+}
+
+/// Whether the loader marks [`builds`] with `written` behind it under the
+/// argument `tagged`, which no probe conversation passes, over
+/// `conversion`. A template that is left as it is reads what it writes
+/// there as the flat encode does: with the argument its prompt ends with
+/// `text`, is encoded from its text and holds the added token `id`.
+fn marked_with_a_tagged_write(conversion: &str, written: &str, text: &str, id: u32) -> bool {
+    let template = format!("{}{{% if tagged %}}{written}{{% endif %}}", builds());
+    let temp = TempDir::new().unwrap();
+    let tok = checkpoint_of(temp.path(), conversion, &template);
+    let marked = tok.chat_template.marked();
+    if !marked {
+        let kwargs = HashMap::from([("tagged".to_owned(), json!(true))]);
+        let tagged = ChatTemplateParams {
+            template_kwargs: Some(&kwargs),
+            ..ChatTemplateParams::default()
+        };
+        let (prompt, ids, from_text) = render_under(&tok, json!("a"), tagged);
+        assert!(from_text, "{written}");
+        assert!(prompt.ends_with(text), "{written}: {prompt}");
+        assert!(ids.contains(&id), "{written}: {ids:?}");
+    }
+    marked
+}
+
+/// Every piece a template writes is asked once more glued to the others,
+/// in the order of the source with nothing between. Two pieces, each in
+/// parentheses of its own, are no run, and they spell together a text an
+/// added token matches: the template is left as it is, and one whose
+/// pieces spell no token there is marked.
+#[test]
+fn a_token_two_pieces_spell_across_parentheses_leaves_the_template_as_it_was() {
+    let conversion = with_a_whole_word_entry();
+    let marked =
+        |written: &str, text: &str| marked_with_a_tagged_write(&conversion, written, text, 20);
+    assert!(marked("{{ (' T') ~ ('OP ') }}", " TOP "));
+    assert!(!marked("{{ (' T') ~ ('AG ') }}", " TAG "));
+}
+
+/// A block tag stands between two pieces, and a render that takes the
+/// block writes the second right after the first: glued, they hold the
+/// token they spell together, an added token matched as it is spelled as
+/// one matched after normalization, and the template is left as it is.
+#[test]
+fn a_token_two_pieces_spell_across_a_block_tag_leaves_the_template_as_it_was() {
+    let conversion = with_a_whole_word_entry();
+    let marked =
+        |written: &str, text: &str| marked_with_a_tagged_write(&conversion, written, text, 20);
+    assert!(marked(" T{% if tagged %}OP {% endif %}", " TOP "));
+    assert!(!marked(" T{% if tagged %}AG {% endif %}", " TAG "));
+    let as_spelled = with_added_token("<a>");
+    let marked =
+        |written: &str, text: &str| marked_with_a_tagged_write(&as_spelled, written, text, 19);
+    assert!(marked("<{% if tagged %}b>{% endif %}", "<b>"));
+    assert!(!marked("<{% if tagged %}a>{% endif %}", "<a>"));
+}
+
+/// An expression that comes out empty stands between two pieces, and the
+/// render writes the second right after the first: glued, they hold the
+/// token they spell together, and the template is left as it is.
+#[test]
+fn a_token_two_pieces_spell_around_an_empty_expression_leaves_the_template_as_it_was() {
+    let as_spelled = with_added_token("<a>");
+    let marked =
+        |written: &str, text: &str| marked_with_a_tagged_write(&as_spelled, written, text, 19);
+    assert!(marked("<{{ note }}b>", "<b>"));
+    assert!(!marked("<{{ note }}a>", "<a>"));
+    let conversion = with_a_whole_word_entry();
+    let marked =
+        |written: &str, text: &str| marked_with_a_tagged_write(&conversion, written, text, 20);
+    assert!(marked(" T{{ note }}OP ", " TOP "));
+    assert!(!marked(" T{{ note }}AG ", " TAG "));
+}
+
+/// Under a normalizer that strips the edges of a text, an added token
+/// whose spelling begins with a blank is matched after normalization. A
+/// template that writes, behind a block tag, a text the normalizer turns
+/// into that spelling is left as it is: with the argument its prompt is
+/// encoded from its text, and the text is the entry's token.
+#[test]
+fn a_token_with_a_blank_edge_under_a_normalizer_that_strips_leaves_the_template_as_it_was() {
+    let conversion = with_added_token("<a>")
+        .replace(
+            r#""special": false}],"#,
+            r#""special": false},
+        {"id": 20, "content": " tag", "single_word": false, "lstrip": false, "rstrip": false, "normalized": true, "special": true}],"#,
+        )
+        .replace(r#""<a>": 19}"#, r#""<a>": 19, " tag": 20}"#)
+        .replace(
+            r#""normalizer": null"#,
+            r#""normalizer": {"type": "Sequence", "normalizers": [{"type": "Strip", "strip_left": true, "strip_right": true}, {"type": "Lowercase"}]}"#,
+        );
+    assert!(conversion.contains(r#""id": 20"#) && conversion.contains("Strip"));
+    let load = |before: &str, after: &str| {
+        let template = [before, &builds(), after].concat();
+        let temp = TempDir::new().unwrap();
+        let tok = checkpoint_of(temp.path(), &conversion, &template);
+        (temp, tok)
+    };
+    let (_temp, tok) = load("{{ 'x' ~ 'y' }}", "");
+    assert!(tok.chat_template.marked());
+    let (_temp, tok) = load("", "x{% if tagged %} TAG{% endif %}");
+    assert!(!tok.chat_template.marked());
+    let kwargs = HashMap::from([("tagged".to_owned(), json!(true))]);
+    let tagged = ChatTemplateParams {
+        template_kwargs: Some(&kwargs),
+        ..ChatTemplateParams::default()
+    };
+    let (prompt, ids, from_text) = render_under(&tok, json!("a"), tagged);
+    assert!(from_text);
+    assert!(prompt.ends_with("x TAG"), "{prompt}");
+    assert!(ids.contains(&20), "{ids:?}");
 }
 
 /// A replaced template makes the kept tokens anew: a token that kept its id

@@ -2638,14 +2638,21 @@ fn contested<'a>(spellings: &[&str], mut added: impl Iterator<Item = (&'a str, b
 }
 
 /// What `source`, a chat template, writes by itself: its raw text and its
-/// string literals, each piece a text of its own, and then each run of two
-/// or more pieces that stand side by side, joined. Between two pieces of a
-/// run nothing lies but a comment, the marks of an expression or a join, so
-/// a render that writes one writes the next right after it, and a token the
-/// pieces spell together is written whole. Each text is asked by itself: a
-/// token that matches only as a whole word, or after normalization, is
-/// found in the piece that holds it. The lexer reads under the whitespace
-/// rules of the render ([`build_environment`]).
+/// string literals, each piece a text of its own, then each run of two or
+/// more pieces that stand side by side, joined, and last every piece in
+/// the order of the source, glued with nothing between. Between two pieces
+/// of a run nothing lies but a comment, the marks of an expression or a
+/// join, so a render that writes one writes the next right after it, and
+/// a token the pieces spell together is written whole. Between two pieces
+/// that follow each other in the source a render may write nothing (a
+/// parenthesis, a block tag, an expression that comes out empty): the
+/// glued text holds a token such pieces spell together, and in it a piece
+/// stands between the pieces before and after it in the source. Each text
+/// is asked by itself: a token that matches only as a whole word, or
+/// after normalization, is found in the piece that holds it. The glued
+/// text is left out where it would repeat a text: after one piece alone,
+/// or one run of every piece. The lexer reads under the whitespace rules
+/// of the render ([`build_environment`]).
 /// A comment is not in the texts, and neither is a literal that `built`
 /// names by its byte offset: one inside an expression the template builds a
 /// value from, the pattern of that value, which it writes only as the
@@ -2656,6 +2663,8 @@ fn written_text(source: &str, built: impl Fn(usize) -> bool) -> Vec<String> {
     // open run holds so far.
     let mut runs: Vec<String> = Vec::new();
     let mut pieces = 0_usize;
+    // Every piece in the order of the source, with nothing between.
+    let mut glued = String::with_capacity(source.len());
     // A newline after a block or a comment that ends a line is not written,
     // nor the blanks before a block that begins one.
     let whitespace = WhitespaceConfig {
@@ -2682,6 +2691,7 @@ fn written_text(source: &str, built: impl Fn(usize) -> bool) -> Vec<String> {
             continue;
         };
         written.push(text.to_owned());
+        glued.push_str(text);
         if pieces == 0 {
             runs.push(String::new());
         }
@@ -2693,7 +2703,12 @@ fn written_text(source: &str, built: impl Fn(usize) -> bool) -> Vec<String> {
     if pieces == 1 {
         runs.pop();
     }
+    // One piece alone is the glued text, and so is a run of every piece.
+    let repeats = written.len() < 2 || runs.iter().any(|run| run.len() == glued.len());
     written.extend(runs);
+    if !repeats {
+        written.push(glued);
+    }
     written
 }
 
@@ -4853,7 +4868,9 @@ impl ChatTemplateState {
         // its source: in a comment, or in the pattern a bound spelling is
         // built from, the template writes none, and pieces that stand side
         // by side write one whole, so they are asked joined and each by
-        // itself. Where the flat encode matches an added token after
+        // itself, and every piece once more glued in the order of the
+        // source: a render may write nothing between two that follow each
+        // other. Where the flat encode matches an added token after
         // normalization it is asked too: the normalizer may make one of a
         // text.
         let bound = |at| {
