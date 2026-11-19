@@ -620,9 +620,10 @@ Use `Explain` on the control listener with `gateway_id` and `request_id`. Use th
 
 The embedded host counts each ask and times its call to the controller. Each ask counts as
 `pick`, `shed`, `queue`, or `refused`. The `mode` is `embedded`. The `model` is the
-resolved model, and `profile` is empty on a refusal or when the host needs a name after that
-generation has been replaced. When a commit finds no sendable target, each subsequent ask
-counts on its own.
+resolved model. The `profile` is empty on a refusal, and for a request that is shed ahead of
+every profile, as when no binding matches its model. It is also empty when the host needs a
+name after that generation has been replaced. When a commit finds no sendable target, each
+subsequent ask counts on its own.
 
 The embedded column gives the gateway family to query. `Same` carries the classic names over.
 The contract column also records families whose embedded writers are pending. The shipped

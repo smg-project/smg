@@ -105,6 +105,8 @@ pub(crate) struct Decided {
     pub survivors: Option<u32>,
     /// Three at most, each with its score and the worker if still registered.
     pub top: Vec<(Option<Arc<dyn Worker>>, f32)>,
+    /// Written as a decimal string: a reader that holds numbers as floats
+    /// would round it.
     pub seed: u64,
     pub lifted: &'static str,
     /// A shed's reason and the stage that left no candidate.
@@ -127,7 +129,7 @@ impl Serialize for Decided {
             .collect();
         let mut decision = json!({
             "outcome": self.outcome, "profile": profile, "generation": self.generation,
-            "top": top, "seed": self.seed, "lifted": self.lifted,
+            "top": top, "seed": self.seed.to_string(), "lifted": self.lifted,
         });
         if let Some(survivors) = self.survivors {
             decision["survivors"] = json!(survivors);
@@ -614,7 +616,7 @@ mod tests {
                         {"worker": "http://alternate:8000/v1", "score": 0.5},
                         {"worker": null, "score": 0.25}
                     ],
-                    "seed": 9,
+                    "seed": "9",
                     "lifted": "overload"
                 }
             });

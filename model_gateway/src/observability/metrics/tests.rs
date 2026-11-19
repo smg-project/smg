@@ -1243,7 +1243,7 @@ fn the_per_request_records_render_the_same_through_kept_handles() {
             Metrics::record_policy_decision(
                 model,
                 PolicyDecision {
-                    profile,
+                    profile: Some(profile),
                     ..decision(1, outcome)
                 },
                 || Some(name.into()),
@@ -1317,7 +1317,7 @@ fn the_per_request_records_render_the_same_through_kept_handles() {
 fn decision(generation: u64, outcome: &'static str) -> PolicyDecision {
     PolicyDecision {
         generation,
-        profile: 0,
+        profile: Some(0),
         outcome,
         mode: "embedded",
     }
@@ -1383,6 +1383,39 @@ fn policy_decisions_drop_old_handles_and_keep_their_counts() {
             rendered.lines().any(|line| line == sample),
             "{sample}\n{rendered}"
         );
+    }
+}
+
+#[test]
+fn a_decision_no_profile_made_keeps_its_handle_and_asks_no_name() {
+    let rendered = render_with_recorder(|| {
+        handles::force_on_this_thread(Some(true));
+        let mut reads = 0;
+        // Two refused asks, then a shed ahead of every profile under a
+        // document's generation: one handle each, and no name asked.
+        for (generation, outcome) in [(0, "refused"), (0, "refused"), (3, "shed"), (4, "shed")] {
+            Metrics::record_policy_decision(
+                "m1",
+                PolicyDecision {
+                    profile: None,
+                    ..decision(generation, outcome)
+                },
+                || {
+                    reads += 1;
+                    None
+                },
+                0.0,
+            );
+        }
+        assert_eq!(reads, 0, "no profile decided, so no name is read");
+        handles::POLICY_DECISIONS.with_borrow(|(_, by_labels)| assert_eq!(by_labels.len(), 2));
+        handles::reset();
+    });
+    for line in [
+        "smg_policy_decisions_total{model=\"m1\",profile=\"\",outcome=\"refused\",mode=\"embedded\"} 2",
+        "smg_policy_decisions_total{model=\"m1\",profile=\"\",outcome=\"shed\",mode=\"embedded\"} 2",
+    ] {
+        assert!(rendered.lines().any(|sample| sample == line), "{line}\n{rendered}");
     }
 }
 

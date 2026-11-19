@@ -86,6 +86,31 @@ fn outcome(decision: &Decision) -> &'static str {
     }
 }
 
+/// The controller's sheds made ahead of every profile, each by its reason
+/// and the stage it names: a request no binding matches, an affinity column
+/// that does not fit the rows, rows not written for a profile's scope, a
+/// gateway that shares a wire with no row of the pool, and a subset hint of
+/// none.
+const AHEAD_OF_A_PROFILE: [(ShedReason, &str); 5] = [
+    (ShedReason::PolicyDeclined, "binding"),
+    (ShedReason::PolicyDeclined, "affinity-column"),
+    (ShedReason::PolicyDeclined, "written-rows"),
+    (ShedReason::NoEndpoints, "wires"),
+    (ShedReason::NoEndpoints, "subset-hint"),
+];
+
+/// The profile that made `decision`, `None` where none did. A shed made
+/// ahead of every profile carries the default trace, whose profile index is
+/// the first profile's: it is counted and traced under none.
+fn profile_of(decision: &Decision) -> Option<u16> {
+    match decision {
+        Decision::Shed(shed) if AHEAD_OF_A_PROFILE.contains(&(shed.reason, shed.emptied_by)) => {
+            None
+        }
+        _ => Some(decision.trace().profile),
+    }
+}
+
 /// What an attempt states of its request.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Ask<'a> {
@@ -334,7 +359,7 @@ impl Host {
                 Decision::Pick(_) | Decision::Queue(_) => None,
             };
             cache_trace::Decided {
-                profile: self.profile_name(trace),
+                profile: profile_of(decision).and_then(|_| self.profile_name(trace)),
                 outcome: outcome(decision),
                 generation: trace.generation,
                 survivors: trace.survivors.get(),
@@ -379,7 +404,8 @@ impl Host {
         let seconds = started.elapsed().as_secs_f64();
         let decision = decided.as_ref().ok().map(Handle::decision);
         let trace = decision.map(Decision::trace);
-        let (generation, profile) = trace.map_or((0, 0), |trace| (trace.generation, trace.profile));
+        let generation = trace.map_or(0, |trace| trace.generation);
+        let profile = decision.and_then(profile_of);
         Metrics::record_policy_decision(
             ask.model,
             PolicyDecision {

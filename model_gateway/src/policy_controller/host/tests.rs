@@ -17,7 +17,7 @@ use kv_index::compute_request_content_hashes;
 use openai_protocol::worker::WorkerStatus;
 use serde_json::{json, Value};
 use smg_policy_controller::{
-    decision::{ShedReason, Trace},
+    decision::{Decision, Shed, ShedReason, Trace},
     door::Refused,
     lease::{ReleaseReason, TransportClass},
     store::{
@@ -30,7 +30,7 @@ use smg_policy_controller::{
 use smg_worker::identity::basic::WorkerLoadGuard;
 
 use super::{
-    left_no_worker,
+    left_no_worker, profile_of,
     testing::{bed, cache_bed, store_blocks, MODEL},
     Ask, End, Hashes, Held, Prompt, Unplaced, GATEWAY,
 };
@@ -177,6 +177,78 @@ fn a_shed_and_each_attempt_to_take_a_target_are_counted() {
     });
     assert_decisions(&rendered, "random", "shed", 1);
     assert_decisions(&rendered, "random", "pick", 3);
+}
+
+#[test]
+fn a_request_no_binding_covers_is_shed_under_no_profile() {
+    let (host, store, _) = bed(&["http://w0:8000"]);
+    let document: PolicySpec = serde_yaml::from_str(
+        "apiVersion: smg.policy/v1
+generation: 2
+profiles:
+  batch: { pick: random }
+bindings:
+  - match: { model: 'batch-*' }
+    profile: batch",
+    )
+    .unwrap();
+    store
+        .apply(AppliedSpec::validate(&document).unwrap())
+        .unwrap();
+    let rendered = render_with_recorder(|| {
+        cache_trace::scope(true, async {
+            let unplaced = host.place(&first(b"r1"), Instant::now()).await.err();
+            assert!(
+                matches!(
+                    unplaced,
+                    Some(Unplaced::Shed {
+                        reason: ShedReason::PolicyDeclined,
+                        ..
+                    })
+                ),
+                "{unplaced:?}"
+            );
+            let rows = cache_trace::captured_selections();
+            assert_eq!(rows.len(), 1);
+            // The one profile of the document never ran: the row names none.
+            assert_eq!(rows[0]["policy"], json!(null));
+            assert_eq!(rows[0]["decision"]["profile"], json!(null));
+            assert_eq!(rows[0]["decision"]["emptied_by"], "binding");
+        })
+        .now_or_never()
+        .unwrap();
+    });
+    assert_decisions(&rendered, "", "shed", 1);
+}
+
+#[test]
+fn only_a_shed_ahead_of_every_profile_names_no_profile() {
+    let shed = |reason, emptied_by| {
+        Decision::Shed(Shed {
+            reason,
+            emptied_by,
+            retry_after_secs: 1,
+            wait_allowed: false,
+            trace: Trace {
+                profile: 3,
+                ..Trace::default()
+            },
+        })
+    };
+    for (reason, stage) in [
+        (ShedReason::PolicyDeclined, "binding"),
+        (ShedReason::PolicyDeclined, "affinity-column"),
+        (ShedReason::PolicyDeclined, "written-rows"),
+        (ShedReason::NoEndpoints, "wires"),
+        (ShedReason::NoEndpoints, "subset-hint"),
+    ] {
+        assert_eq!(profile_of(&shed(reason, stage)), None, "{stage}");
+    }
+    // A profile's own stage that declines, and a pool a filter emptied.
+    let by_a_picker = shed(ShedReason::PolicyDeclined, "random");
+    assert_eq!(profile_of(&by_a_picker), Some(3));
+    let emptied = shed(ShedReason::NoEndpoints, "healthy");
+    assert_eq!(profile_of(&emptied), Some(3));
 }
 
 #[test]

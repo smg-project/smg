@@ -84,7 +84,7 @@ mod handles {
     #[derive(Clone, Copy, PartialEq, Eq, Hash)]
     pub(super) struct DecisionLabels {
         pub(super) generation: u64,
-        pub(super) profile: u16,
+        pub(super) profile: Option<u16>,
         pub(super) outcome: &'static str,
         pub(super) mode: &'static str,
     }
@@ -1358,7 +1358,9 @@ pub struct Metrics;
 #[derive(Clone, Copy, Debug)]
 pub struct PolicyDecision {
     pub generation: u64,
-    pub profile: u16,
+    /// The profile that decided, `None` where none did: a refused ask, and
+    /// a request the engine declined ahead of every profile.
+    pub profile: Option<u16>,
     /// `pick`, `shed`, `queue`, or `refused` where the controller made no decision.
     pub outcome: &'static str,
     /// `embedded` for decisions made in this process.
@@ -2256,9 +2258,10 @@ impl Metrics {
     }
 
     /// Count and time one policy decision for `model_id`. The counter asks
-    /// `profile_name` only when it needs a handle. If the profile's generation
-    /// is gone or the controller refused the ask, use an empty `profile`
-    /// label and discard that handle after counting.
+    /// `profile_name` only when it needs a handle for a profile. A decision
+    /// no profile made counts under an empty `profile` label and keeps its
+    /// handle under no generation. Where a profile's generation is gone, the
+    /// empty label is used and that handle is discarded after counting.
     pub fn record_policy_decision(
         model_id: &str,
         decision: PolicyDecision,
@@ -2282,24 +2285,30 @@ impl Metrics {
             )
         };
         if handles::keep_handles() {
+            // A decision no profile made names nothing a new document can
+            // rename: its handle is kept under no generation.
             let labels = handles::DecisionLabels {
-                generation,
+                generation: if profile.is_some() { generation } else { 0 },
                 profile,
                 outcome,
                 mode,
             };
             handles::POLICY_DECISIONS.with_borrow_mut(|(newest, by_labels)| {
-                if generation > *newest {
+                if profile.is_some() && generation > *newest {
                     by_labels.clear();
                     *newest = generation;
                 }
-                let models = (generation == *newest).then(|| by_labels.entry(labels).or_default());
+                let models = (profile.is_none() || generation == *newest)
+                    .then(|| by_labels.entry(labels).or_default());
                 if let Some(count) = models.as_ref().and_then(|models| models.get(model_id)) {
                     count.increment(1);
                     return;
                 }
                 let model = intern_model_label(model_id);
-                let name = profile_name();
+                let name = match profile {
+                    Some(_) => profile_name(),
+                    None => Some(Arc::from("")),
+                };
                 let models =
                     models.filter(|map| name.is_some() && handles::kept(map.len(), &model));
                 let count = build(Arc::clone(&model), name);
@@ -2309,7 +2318,8 @@ impl Metrics {
                 }
             });
         } else {
-            build(intern_model_label(model_id), profile_name()).increment(1);
+            let name = profile.and_then(|_| profile_name());
+            build(intern_model_label(model_id), name).increment(1);
         }
         handles::with_static(
             &handles::POLICY_DECISION_SECONDS,
