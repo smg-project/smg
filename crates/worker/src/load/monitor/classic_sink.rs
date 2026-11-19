@@ -323,7 +323,7 @@ impl<G: Generation> LoadSink for ClassicLoadSink<G> {
         self.report(answer, polled_at).leaving
     }
 
-    fn fetch_failed(&self, members: &[Arc<dyn Worker>]) {
+    fn fetch_failed(&self, members: &[Arc<dyn Worker>], _polled_at: Instant) {
         for worker in members {
             self.apply_overload_verdict(worker, None, "poll");
         }

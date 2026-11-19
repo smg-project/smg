@@ -1,11 +1,11 @@
 //! The worker load sink over the store.
 //!
-//! The collector holds its reports lock at a record or poll answer. The
-//! adapter takes its member map lock inside it, then reads the registry.
-//! On a miss it also reads the holder, under the map's write lock. It
-//! releases the map before calling the store, which takes its own locks
-//! and may pay for a membership build on a poll answer. The adapter calls
-//! no collector.
+//! The collector holds its reports lock at a record, a poll answer or a
+//! forget. The adapter takes its member map lock inside it, then reads the
+//! registry. On a miss it also reads the holder, under the map's write
+//! lock. It releases the map before calling the store, which takes its own
+//! locks and may pay for a membership build on a poll answer. The adapter
+//! calls no collector.
 
 use std::{
     sync::Arc,
@@ -45,9 +45,16 @@ struct KeptMember {
 ///
 /// The overload verdict lives on the store's rows. The adapter leaves the
 /// object's overload flag alone. A rank worker's row uses its own rank.
-/// For any other worker the row covers the whole report.
+/// For any other worker the row covers the whole report, and a record is
+/// written at the rank it came from. The store reads a worker that is no
+/// rank at its own rank alone: where such a worker stands over an engine
+/// of several ranks, the records of its other ranks are written and not
+/// read, so its load under-reads until its registration states the width.
 /// An unready rank counts as served when checking an empty
 /// answer, so the engine's verdict stands until its next record or report.
+/// Loads are a row's, not an object's: a forgotten object's row keeps them
+/// while an object stands under it, the same or its replacement, and its
+/// engine is judged again at its next record or report.
 /// The host publishes the store's pending writes.
 pub struct LoadAdapter<G, S: ?Sized> {
     objects: Arc<Objects<G>>,
@@ -57,11 +64,14 @@ pub struct LoadAdapter<G, S: ?Sized> {
     /// One entry per URL heard or polled. Forget drops the object's entry
     /// and reset clears the map when registry events were lost.
     members: RwLock<FxHashMap<String, KeptMember>>,
+    period_taken: bool,
 }
 
 impl<G: Generation, S: StoreLoadSink + ?Sized> LoadAdapter<G, S> {
     /// For the lead under `term`. Tells the store once how often the
-    /// collector hears each ready rank, by its stream or a poll.
+    /// collector hears each ready rank, by its stream or a poll. The store
+    /// keeps the first period it is told: [`Self::period_taken`] says
+    /// whether this one stands.
     pub fn new(
         objects: Arc<Objects<G>>,
         store: Arc<S>,
@@ -69,14 +79,22 @@ impl<G: Generation, S: StoreLoadSink + ?Sized> LoadAdapter<G, S> {
         term: u64,
         heard_every: Duration,
     ) -> Self {
-        store.heard_every(heard_every);
+        let period_taken = store.heard_every(heard_every);
         Self {
             objects,
             store,
             lead,
             term,
             members: RwLock::default(),
+            period_taken,
         }
+    }
+
+    /// Whether the store took this adapter's period. `false` where another
+    /// period stood first: the store keeps that one and ages a rank's
+    /// sample by it.
+    pub fn period_taken(&self) -> bool {
+        self.period_taken
     }
 
     fn leads(&self) -> bool {
@@ -229,32 +247,44 @@ impl<G: Generation, S: StoreLoadSink + ?Sized + 'static> LoadSink for LoadAdapte
         Vec::new()
     }
 
-    fn fetch_failed(&self, members: &[Arc<dyn Worker>]) {
-        let now = Instant::now();
-        self.write_report(members.iter().map(|worker| (worker, None)), now, now);
+    fn fetch_failed(&self, members: &[Arc<dyn Worker>], polled_at: Instant) {
+        self.write_report(
+            members.iter().map(|worker| (worker, None)),
+            polled_at,
+            polled_at,
+        );
     }
 
     fn forget(&self, worker: &Arc<dyn Worker>) {
-        if !self.leads() {
-            return;
-        }
-        let member = {
+        // The entry goes whatever the term: it holds the worker object, and
+        // with it the object's engine connection.
+        let kept = {
             let mut members = self.members.write();
             if members
                 .get(worker.url())
                 .is_some_and(|kept| Arc::ptr_eq(&kept.worker, worker))
             {
-                members.remove(worker.url()).map(|kept| kept.member)
+                members.remove(worker.url())
             } else {
-                self.read_member(worker).map(|kept| kept.member)
+                None
             }
         };
-        if let Some(member) = member {
-            self.store.evict(member.row);
+        let Some(kept) = kept else {
+            return;
+        };
+        // Loads are a row's. While an object stands under the row, the same
+        // or its replacement, nothing is evicted: an eviction here could
+        // wipe a replacement's first record. A row that went has no object.
+        if self.leads() && self.objects.registry().get(&kept.id).is_none() {
+            self.store.evict(kept.member.row);
         }
     }
 
     fn reset(&self) {
+        // The store's rows stay. Each ends with the write that removes its
+        // worker, so no row of a worker the collector lost stands there,
+        // and a reset at a term's start would wipe the loads a standby
+        // followed.
         self.members.write().clear();
     }
 }
@@ -615,7 +645,7 @@ mod tests {
         assert!(adapter
             .report_empty(&[polled(&unpaired, None)], now)
             .is_empty());
-        adapter.fetch_failed(slice::from_ref(&unpaired));
+        adapter.fetch_failed(slice::from_ref(&unpaired), now);
         adapter.forget(&unpaired);
         assert_eq!(*replica.store.calls.lock(), before);
         assert_eq!(replica.store.ranks(id), 0);
@@ -747,10 +777,11 @@ mod tests {
         let now = Instant::now() - PERIOD;
         let [(zero, first), (one, second)] = busy_pair(&replica, &adapter, now);
         let rows = [replica.store.load(zero, 0), replica.store.load(one, 1)];
-        adapter.fetch_failed(slice::from_ref(&second));
+        let asked = now + Duration::from_millis(1);
+        adapter.fetch_failed(slice::from_ref(&second), asked);
         assert_eq!(replica.store.calls.lock().reports, 0);
         assert!(replica.overloaded(one, Instant::now()));
-        adapter.fetch_failed(&[first, second]);
+        adapter.fetch_failed(&[first, second], asked);
         assert_eq!(replica.store.calls.lock().reports, 1);
         assert_eq!(
             [replica.store.load(zero, 0), replica.store.load(one, 1)],
@@ -759,29 +790,72 @@ mod tests {
         assert!(!replica.overloaded(one, Instant::now()));
     }
 
+    /// Loads are a row's, not an object's. A worker whose status left
+    /// `Ready` is forgotten and its row stands: the adapter drops its entry
+    /// and the row keeps its loads.
     #[test]
-    fn a_forgotten_worker_has_nothing_on_file() {
+    fn a_failed_fetch_leaves_the_verdict_of_a_push_during_its_poll() {
+        let replica = Replica::new();
+        let adapter = replica.lead();
+        let asked = Instant::now() - PERIOD;
+        let pushed = asked + Duration::from_millis(1);
+        let [(zero, first), (one, second)] = busy_pair(&replica, &adapter, pushed);
+        adapter.fetch_failed(&[first, second], asked);
+        assert_eq!(replica.store.calls.lock().reports, 1);
+        assert!(replica.overloaded(zero, pushed));
+        assert!(replica.overloaded(one, pushed));
+    }
+
+    #[test]
+    fn a_forgotten_worker_whose_object_stands_keeps_its_rows_loads() {
         let replica = Replica::new();
         let (id, worker) = replica.add(facts(URL));
         let adapter = replica.lead();
         let now = Instant::now();
         adapter.record(&worker, 0, &report(0, 2), now, now);
-        assert_eq!(replica.store.ranks(id), 1);
         worker.set_status(ObjectStatus::NotReady);
         adapter.forget(&worker);
-        assert_eq!(replica.store.ranks(id), 0);
-        assert_eq!(
-            replica.store.poll_mode(id, now, PERIOD),
-            StorePollMode::Poll
-        );
-        assert!(adapter.members.read().is_empty());
-
-        worker.set_status(ObjectStatus::Ready);
-        adapter.record(&worker, 0, &report(0, 3), now, now);
+        assert_eq!(replica.store.calls.lock().evicts, 0);
         assert_eq!(replica.store.ranks(id), 1);
-        let _replacement = replica.replace(id);
+        assert!(adapter.members.read().is_empty());
+    }
+
+    /// A worker whose row went leaves the registry. Its forget evicts the
+    /// row: nothing of it is on file.
+    #[test]
+    fn a_forgotten_worker_whose_row_went_has_nothing_on_file() {
+        let replica = Replica::new();
+        let (id, worker) = replica.add(facts(URL));
+        let adapter = replica.lead();
+        let now = Instant::now();
+        adapter.record(&worker, 0, &report(0, 2), now, now);
+        let row = WorkersStore::get(&replica.store.memory, id).expect("a row");
+        assert!(replica.store.memory.remove(id, row.revision).is_some());
+        replica.objects.follow(&replica.store.memory);
         adapter.forget(&worker);
+        assert_eq!(replica.store.calls.lock().evicts, 1);
         assert_eq!(replica.store.ranks(id), 0);
+        assert!(adapter.members.read().is_empty());
+    }
+
+    /// The holder replaced the object under a row that stands. The row's
+    /// loads are the replacement's now: the old object's forget drops its
+    /// entry and evicts nothing, so no order of the two can wipe a record
+    /// of the replacement.
+    #[test]
+    fn a_forget_of_a_replaced_object_leaves_the_rows_loads_to_its_replacement() {
+        let replica = Replica::new();
+        let (id, old) = replica.add(facts(URL));
+        let adapter = replica.lead();
+        let now = Instant::now();
+        adapter.record(&old, 0, &report(0, 3), now, now);
+        let _replacement = replica.replace(id);
+        adapter.forget(&old);
+        assert_eq!(replica.store.calls.lock().evicts, 0);
+        assert_eq!(
+            replica.store.load(id, 0).map(|sample| sample.row.running),
+            Some(3)
+        );
         assert!(adapter.members.read().is_empty());
     }
 
@@ -873,9 +947,9 @@ mod tests {
         assert!(adapter
             .report_empty(&[polled(&worker, None)], later)
             .is_empty());
-        adapter.fetch_failed(slice::from_ref(&worker));
+        adapter.fetch_failed(slice::from_ref(&worker), later);
         adapter.forget(&worker);
-        assert_eq!(adapter.members.read().len(), 1);
+        assert!(adapter.members.read().is_empty());
         adapter.reset();
         assert!(adapter.members.read().is_empty());
         assert!(adapter.needs_loads());
@@ -913,6 +987,44 @@ mod tests {
         assert_eq!(replica.store.calls.lock().records, 1);
     }
 
+    /// An adapter whose term ended still drops a forgotten worker's entry:
+    /// the entry holds the worker object, and with it the object's engine
+    /// connection. It evicts nothing, since it writes nothing.
+    #[test]
+    fn a_forget_drops_the_entry_whatever_the_term() {
+        let replica = Replica::new();
+        let (id, worker) = replica.add(facts(URL));
+        let lead = Arc::new(TestLead(Mutex::new(Some(1))));
+        let adapter = replica.adapter(lead.clone(), 1);
+        let now = Instant::now();
+        adapter.record(&worker, 0, &report(0, 1), now, now);
+        let held = Arc::strong_count(&worker);
+        *lead.0.lock() = Some(2);
+
+        adapter.forget(&worker);
+        assert!(adapter.members.read().is_empty());
+        assert_eq!(Arc::strong_count(&worker), held - 1);
+        assert_eq!(replica.store.calls.lock().evicts, 0);
+        assert_eq!(replica.store.ranks(id), 1);
+    }
+
+    /// The store keeps the first period it is told. An adapter built with
+    /// another one reads that its period did not stand.
+    #[test]
+    fn an_adapter_says_whether_the_store_took_its_period() {
+        let replica = Replica::new();
+        assert!(replica.lead().period_taken());
+        let other = LoadAdapter::new(
+            Arc::clone(&replica.objects),
+            replica.store.clone(),
+            Arc::new(SoleLead),
+            SoleLead::TERM,
+            PERIOD * 2,
+        );
+        assert!(!other.period_taken());
+        assert!(replica.lead().period_taken(), "the first period again");
+    }
+
     #[test]
     fn the_store_is_told_once_how_often_a_rank_is_heard() {
         let replica = Replica::new();
@@ -924,7 +1036,7 @@ mod tests {
         adapter.poll_mode(&worker, now, PERIOD);
         adapter.report(&[polled(&worker, Some(&report(0, 3)))], now + PERIOD);
         adapter.report_empty(&[polled(&worker, None)], now + PERIOD);
-        adapter.fetch_failed(slice::from_ref(&worker));
+        adapter.fetch_failed(slice::from_ref(&worker), now + PERIOD);
         adapter.forget(&worker);
         adapter.reset();
         assert_eq!(replica.store.calls.lock().periods, 1);

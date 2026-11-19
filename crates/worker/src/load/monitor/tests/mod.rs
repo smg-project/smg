@@ -1458,6 +1458,8 @@ struct RecordingLoadSink {
     /// The workers the sink was told to forget, in order.
     forgotten: Mutex<Vec<Arc<dyn Worker>>>,
     polled_values: Mutex<Vec<NamedValue>>,
+    /// The instant the last failed fetch was said with.
+    failed_at: Mutex<Option<Instant>>,
     mode: PollMode,
     ranks: PolledRanks,
     needs: bool,
@@ -1537,7 +1539,8 @@ impl LoadSink for RecordingLoadSink {
         self.ranks.leaving.clone()
     }
 
-    fn fetch_failed(&self, members: &[Arc<dyn Worker>]) {
+    fn fetch_failed(&self, members: &[Arc<dyn Worker>], polled_at: Instant) {
+        *self.failed_at.lock() = Some(polled_at);
         let locked = self.locked();
         let urls = members
             .iter()
@@ -1596,6 +1599,7 @@ fn build_recording(
         said: Mutex::new(Vec::new()),
         forgotten: Mutex::new(Vec::new()),
         polled_values: Mutex::new(Vec::new()),
+        failed_at: Mutex::new(None),
         mode,
         ranks,
         needs,
@@ -1786,7 +1790,13 @@ async fn an_answer_with_no_row_and_a_failed_fetch_are_said_apart() {
     sink.said.lock().clear();
 
     let mut failed = vec![(Arc::clone(&worker), None)];
-    monitor.reconcile_engine(&mut failed, Instant::now());
+    let asked = Instant::now();
+    monitor.reconcile_engine(&mut failed, asked);
+    assert_eq!(
+        *sink.failed_at.lock(),
+        Some(asked),
+        "a failed fetch is said with the instant its poll was asked"
+    );
     assert_eq!(
         rows(&monitor.pushed_reports.lock()["http://w:1"].report),
         vec![(0, 1), (1, 2)],
@@ -1871,7 +1881,7 @@ impl LoadSink for BareSink {
         Vec::new()
     }
 
-    fn fetch_failed(&self, _: &[Arc<dyn Worker>]) {}
+    fn fetch_failed(&self, _: &[Arc<dyn Worker>], _: Instant) {}
 
     fn forget(&self, _: &Arc<dyn Worker>) {}
 
@@ -2419,8 +2429,8 @@ impl LoadSink for StoppedAtForget {
         self.classic.report_empty(answer, polled_at)
     }
 
-    fn fetch_failed(&self, members: &[Arc<dyn Worker>]) {
-        self.classic.fetch_failed(members);
+    fn fetch_failed(&self, members: &[Arc<dyn Worker>], polled_at: Instant) {
+        self.classic.fetch_failed(members, polled_at);
     }
 
     fn forget(&self, worker: &Arc<dyn Worker>) {

@@ -1005,7 +1005,7 @@ impl<G: Generation> WorkerMonitor<G> {
                 .iter()
                 .map(|(worker, _)| Arc::clone(worker))
                 .collect();
-            self.sink.fetch_failed(&members);
+            self.sink.fetch_failed(&members, polled_at);
             return carries_rank_capacity;
         }
         let with_rows = engine
