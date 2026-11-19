@@ -390,6 +390,10 @@ workers:
 
 Size the budget past the longest load you expect: a startup probe that fails for its whole budget restarts the worker, and the load starts over. The worker Deployment's rollout deadline follows the budget (`initialDelaySeconds + failureThreshold * periodSeconds`, plus 600 s for what runs on the rollout's clock before the probe's starts: the node's provisioning, the image pull, the container start), so `kubectl rollout status`, Argo CD, Flux and `helm --wait` do not report a worker still loading within its budget as a failed rollout. On an autoscaled GPU pool or with a cold image cache, where the node and a multi-GB pull can take longer than that margin, set `progressDeadlineSeconds` on the worker entry past them; it overrides the default.
 
+#### Worker Shutdown
+
+A gRPC worker on the Rust servicer drains in-flight streams on SIGTERM for up to `SMG_*_SERVICER_DRAIN_SECS` (default 30 s; set it through `extraEnv`), then stops its server (5 s) and terminates the engine (on vLLM, vLLM's own process manager first gives the engine cores its `--shutdown-timeout`, 5 s when it is 0, the default; then up to 30 s): 70 s, past Kubernetes' default grace of 30 s. Each worker's pod therefore gets `terminationGracePeriodSeconds: 90` (a 20 s margin) unless `workers[].terminationGracePeriodSeconds` says otherwise; raise it with the drain bound and with a vLLM `--shutdown-timeout N` (N in place of the default 5 s).
+
 #### Policy Controller
 
 `policyController.enabled` deploys the standalone policy controller (`smg-policy-controller`) beside the router: a Deployment and one Service, `<fullname>-policy-controller`. The controller runs on its own today: it serves its probes and its metrics and runs the load path, with a spec document it runs that document, with the election on its replicas elect a leader and a standby can follow it (Standby, below), and nothing in the chart points the router at it.

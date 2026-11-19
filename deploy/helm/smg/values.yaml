@@ -899,6 +899,15 @@ workers: []
 #       periodSeconds: 10
 #       failureThreshold: 30
 #     progressDeadlineSeconds: 960      # rollout deadline; default: the startup probe's budget + 600 s
+#     # How long the kubelet waits between SIGTERM and SIGKILL (default 90).
+#     # A gRPC worker on the Rust servicer drains in-flight streams first:
+#     # SMG_*_SERVICER_DRAIN_SECS (default 30; the PD linger counts within it)
+#     # + the server stop (5 s) + on vLLM, its process manager's shutdown
+#     # (vLLM's --shutdown-timeout N, 5 s when it is 0) + the engine's
+#     # termination (up to 30 s) = 70 s, plus a margin; Kubernetes' own
+#     # default of 30 s would cut the drain. Raise it with the drain bound and
+#     # with a vLLM --shutdown-timeout above 5.
+#     terminationGracePeriodSeconds: 90
 
 # Engine default ports (used when worker.port is not set)
 engineDefaults:
