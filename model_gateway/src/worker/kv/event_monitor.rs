@@ -519,7 +519,8 @@ impl KvEventMonitor {
             // index silently frozen for this worker until then.
             let result = std::panic::AssertUnwindSafe(async move {
                 // An events subscription opens its row in the sink first. The
-                // row is the task's for its whole life and goes with it.
+                // row is the collector's from here on: it goes with the loop,
+                // or with the job that says the worker left.
                 let row = match indexer {
                     Some(index) => {
                         match sink.open(index, &loop_model_id, &worker_url, worker.dp_rank()) {
@@ -544,7 +545,7 @@ impl KvEventMonitor {
                 Self::subscription_loop(
                     worker,
                     worker_url,
-                    row.as_ref().map(OpenRow::feed),
+                    row.map(OpenRow::into_feed),
                     loop_model_id,
                     shutdown_rx,
                     load_sink,
