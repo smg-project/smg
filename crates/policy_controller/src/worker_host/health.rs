@@ -1,7 +1,8 @@
 //! The worker health sink over the store.
 //!
-//! With the object's mutation lock held, the adapter reads the holder's map,
-//! releases the read lock, and writes the store. The holder writes its map
+//! The adapter reads the lead before it takes the object's mutation lock and
+//! again under it. With the lock held, it reads the holder's map, releases
+//! the read lock, and writes the store. The holder writes its map
 //! and the registry under separate locks and reads the store with neither
 //! held.
 
@@ -27,7 +28,7 @@ pub struct HealthAdapter<G, S: ?Sized> {
 
 impl<G: Generation, S: StoreHealthSink + ?Sized> HealthAdapter<G, S> {
     /// An adapter for `term`. Each call checks that `lead` still names it
-    /// before taking the object's lock.
+    /// before taking the object's lock, and again under the lock.
     pub fn new(objects: Arc<Objects<G>>, store: Arc<S>, lead: Arc<dyn Lead>, term: u64) -> Self {
         Self {
             objects,
@@ -37,16 +38,25 @@ impl<G: Generation, S: StoreHealthSink + ?Sized> HealthAdapter<G, S> {
         }
     }
 
+    fn leads(&self) -> bool {
+        self.lead.term() == Some(self.term)
+    }
+
     fn write(
         &self,
         worker_id: &ObjectId,
         revision: u64,
         write_row: impl FnOnce(&S, Standing) -> HealthWrite,
     ) -> HealthWrite {
-        if self.lead.term() != Some(self.term) {
+        if !self.leads() {
             return HealthWrite::Stale;
         }
         let apply = |object: &Arc<dyn Worker>| {
+            // A call can wait here for the object's lock through the end of
+            // its term: it writes nothing.
+            if !self.leads() {
+                return (HealthWrite::Stale, None);
+            }
             let Some(standing) = self.objects.standing_of(worker_id, object) else {
                 return (HealthWrite::Stale, None);
             };
@@ -170,6 +180,17 @@ mod tests {
     impl Lead for TestLead {
         fn term(&self) -> Option<u64> {
             *self.0.lock()
+        }
+    }
+
+    /// A lead whose term ends between its first reading and its second.
+    struct TurningLead(Mutex<u32>);
+
+    impl Lead for TurningLead {
+        fn term(&self) -> Option<u64> {
+            let mut readings = self.0.lock();
+            *readings += 1;
+            Some(if *readings == 1 { 1 } else { 2 })
         }
     }
 
@@ -365,6 +386,33 @@ mod tests {
             ProbeAnswer::Stale
         );
         assert_eq!(adapter.connected(&replica.id, replica.revision), None);
+        replica.assert_statuses(Some(RowStatus::Pending), ObjectStatus::Pending);
+    }
+
+    #[test]
+    fn a_call_whose_term_ended_while_it_waited_for_the_object_writes_nothing() {
+        let replica = Replica::new(1, true).expect("a laid worker");
+        let under_term_one = || {
+            HealthAdapter::new(
+                Arc::clone(&replica.objects),
+                Arc::clone(&replica.store),
+                Arc::new(TurningLead(Mutex::new(0))),
+                1,
+            )
+        };
+        assert_eq!(
+            under_term_one().probe_outcome(
+                &replica.id,
+                true,
+                replica.revision,
+                ObjectStatus::Pending
+            ),
+            ProbeAnswer::Stale
+        );
+        assert_eq!(
+            under_term_one().connected(&replica.id, replica.revision),
+            None
+        );
         replica.assert_statuses(Some(RowStatus::Pending), ObjectStatus::Pending);
     }
 
