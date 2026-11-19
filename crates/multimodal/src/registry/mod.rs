@@ -12,6 +12,7 @@ mod minimax_m3;
 mod muse_spark;
 mod nemotron_omni;
 mod nemotron_transcribe;
+mod nemotron_vl;
 mod phi3_v;
 pub mod qwen3_asr;
 mod qwen3_omni;
@@ -35,6 +36,7 @@ use minimax_m3::MiniMaxM3VisionSpec;
 use muse_spark::MuseSparkSpec;
 use nemotron_omni::NemotronOmniSpec;
 use nemotron_transcribe::NemotronTranscribeSpec;
+use nemotron_vl::NemotronVLSpec;
 use once_cell::sync::Lazy;
 use phi3_v::Phi3VisionSpec;
 use qwen3_asr::Qwen3AsrSpec;
@@ -88,6 +90,37 @@ impl ModelRegistry {
                 LazySpec::new(|| Box::new(Step3VLVisionSpec)),
             ],
         }
+    }
+
+    /// A registry for an engine that reads only `format`: the specs of
+    /// [`new`](Self::new) that emit it. For `Reference` it also holds the
+    /// Nemotron VL / Omni specs, which `new` leaves out because it serves
+    /// that family through the Packed Nemotron-H Omni spec.
+    pub fn for_format(format: EncoderInputFormat) -> Self {
+        let mut registry = Self::new();
+        registry
+            .specs
+            .retain(|spec| spec.get().encoder_input_format() == format);
+        if format == EncoderInputFormat::Reference {
+            // One spec per image layout. Both match the family's
+            // architectures only, so they can lead.
+            registry.specs.splice(
+                0..0,
+                [
+                    LazySpec::new(|| {
+                        Box::new(NemotronVLSpec {
+                            dynamic_images: false,
+                        })
+                    }),
+                    LazySpec::new(|| {
+                        Box::new(NemotronVLSpec {
+                            dynamic_images: true,
+                        })
+                    }),
+                ],
+            );
+        }
+        registry
     }
 
     pub fn lookup<'a>(&'a self, metadata: &ModelMetadata) -> Option<&'a dyn ModelProcessorSpec> {

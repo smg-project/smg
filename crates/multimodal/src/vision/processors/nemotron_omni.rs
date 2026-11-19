@@ -55,10 +55,10 @@ pub(crate) const VIDEO_TEMPORAL_PATCH_SIZE: usize = 2;
 const GRID_DIVISOR: usize = 2;
 /// Tokens the engine keeps back from a request's image budget
 /// (`max_num_tokens_available`).
-const BUDGET_RESERVED_TOKENS: usize = 4;
+pub(super) const BUDGET_RESERVED_TOKENS: usize = 4;
 /// Rounds the engine's `compute_params` takes to fit a request's images in
 /// their budget before it gives up.
-const MAX_BUDGET_ROUNDS: usize = 10;
+pub(super) const MAX_BUDGET_ROUNDS: usize = 10;
 
 /// Embeddings of a `rows x cols` patch grid after the 2x2 pixel shuffle.
 pub(crate) fn grid_tokens(rows: usize, cols: usize) -> usize {
@@ -253,7 +253,7 @@ impl NemotronOmniProcessor {
 
     /// The image's RGB bytes with any transparency composited onto white the
     /// way the engine's loader does it: PIL's `paste` with the alpha as mask.
-    fn rgb_on_white(image: &DynamicImage) -> (usize, usize, Cow<'_, [u8]>) {
+    pub(super) fn rgb_on_white(image: &DynamicImage) -> (usize, usize, Cow<'_, [u8]>) {
         if !image.color().has_alpha() {
             return rgb_bytes(image);
         }
