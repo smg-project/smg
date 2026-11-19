@@ -1990,11 +1990,15 @@ impl NativeEncoder {
         };
         // One slot per id of the window, written in place (the read keeps
         // its index, so the collect is one list and no concatenation); one
-        // scratch per rayon job. A job is 2048 entries on the seed's own
-        // pool, a window being eight of them for its four threads; on a
-        // caller's pool with more threads than that it is the window's
-        // share of a thread, 256 entries or more, so that every thread
-        // of the pool reads, as it did when the pass was one list.
+        // scratch per rayon job. Rayon halves a window into jobs, none of
+        // fewer than `job` entries: the window's share of a thread of the
+        // pool the read runs on, held between 256 and 2048. On the seed's
+        // own pool a full window is eight jobs of 2048 for its four
+        // threads. On a caller's pool of eight threads or more it is as
+        // many jobs as the largest power of two that is not above the
+        // pool's threads, sixty-four at the most, and a thread reads a
+        // job: no more threads than there are jobs read a window, however
+        // wide the pool (its width is the `threads` of the debug line).
         let read_window = |window: Range<u32>, slots: &mut Vec<Option<Option<Seeded>>>| {
             let job = (SEED_WINDOW / rayon::current_num_threads().max(1)).clamp(256, 2048);
             window
