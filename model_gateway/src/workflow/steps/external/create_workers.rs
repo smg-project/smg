@@ -13,14 +13,14 @@ use smg_worker::{
         basic::{BasicWorker, ConnectionMode, RuntimeType, Worker, WorkerType},
         endpoint::Endpoint,
     },
-    workflow::WorkerList,
+    workflow::{WorkerKind, WorkerList},
 };
 use tracing::{debug, info};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use crate::{
     routers::grpc::backend_client::BasicWorkerBuilder,
-    workflow::data::{require_app_context, WorkerKind, WorkerWorkflowData},
+    workflow::data::{require_app_context, WorkerWorkflowData},
 };
 
 /// Normalize URL for external APIs (ensure https://).
@@ -96,7 +96,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateExternalWorkersStep {
         }
 
         let config = &context.data.config;
-        let app_context = require_app_context(context.data.app_context.as_ref())?;
+        let app_context = require_app_context(context.data.host.as_ref())?;
         let model_cards = &context.data.model_cards;
 
         // Build configs from router settings — resolve per-worker resilience

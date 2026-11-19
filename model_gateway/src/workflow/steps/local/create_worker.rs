@@ -19,11 +19,11 @@ use smg_worker::{
         metadata::join_base,
     },
     labels::SUPPORTS_VISION_LABEL,
+    workflow::{DpInfo, WorkerKind},
 };
 use tracing::{debug, warn};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
-use super::discover_dp::DpInfo;
 use crate::{
     admin::worker_service::{control_character_refusal, logged_strings},
     config::ParserChoice,
@@ -41,7 +41,7 @@ use crate::{
             zmq_client::zmq_handshake_address,
         },
     },
-    workflow::data::{WorkerKind, WorkerRegistrationMode, WorkerWorkflowData},
+    workflow::data::{WorkerRegistrationMode, WorkerWorkflowData},
 };
 
 /// Step 3: Create worker object(s) with merged configuration + metadata.
@@ -60,7 +60,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
         let config = &context.data.config;
         let app_context = context
             .data
-            .app_context
+            .host
             .as_ref()
             .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
         let connection_mode =
@@ -281,7 +281,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
         // names are, and published by the registration step once the worker
         // is in the registry, so a registration refused there leaves no
         // series behind.
-        context.data.symphony_table = symphony_table_of(
+        context.data.host_notes.symphony_table = symphony_table_of(
             &model_card,
             app_context.router_config.parser,
             *connection_mode,
@@ -1124,7 +1124,7 @@ fn attention_dp_width(labels: &HashMap<String, String>, size: usize) -> Option<u
 /// one dp-annotated worker per rank. A width-1 advertisement (older
 /// servicers emit it as a capability signal) and a missing one both
 /// register a plain worker: there is no placement to choose, and pinning
-/// rank 0 anyway still alters engine-side scheduling. discover_dp already
+/// rank 0 anyway still alters engine-side scheduling. The DP read already
 /// logged the degradation for the missing-label case.
 fn dp_rank_expansion(
     dp_info: Option<&DpInfo>,
@@ -1268,7 +1268,7 @@ mod tests {
             CreateLocalWorkerStep.execute(&mut ctx).await.unwrap(),
             StepResult::Success
         );
-        assert_eq!(ctx.data.symphony_table, Some("qwen3"));
+        assert_eq!(ctx.data.host_notes.symphony_table, Some("qwen3"));
         assert!(RegisterWorkersStep.execute(&mut ctx).await.is_err());
         assert!(
             !handle.render().contains("smg_symphony_"),
@@ -1282,7 +1282,7 @@ mod tests {
             CreateLocalWorkerStep.execute(&mut ctx).await.unwrap(),
             StepResult::Success
         );
-        assert_eq!(ctx.data.symphony_table, Some("qwen3"));
+        assert_eq!(ctx.data.host_notes.symphony_table, Some("qwen3"));
         assert_eq!(
             RegisterWorkersStep.execute(&mut ctx).await.unwrap(),
             StepResult::Success
@@ -2714,12 +2714,15 @@ mod rank_window_tests {
     use std::collections::HashMap;
 
     use smg_grpc_client::{engine_labels::ServerInfo, tokenspeed_proto};
-    use smg_worker::identity::basic::{merge_labels, ConnectionMode, Worker};
+    use smg_worker::{
+        identity::basic::{merge_labels, ConnectionMode, Worker},
+        workflow::dp_info_from_labels,
+    };
 
     use super::{dp_rank_expansion, labels_for_rank};
     use crate::{
         routers::grpc::backend_client::BasicWorkerBuilder,
-        workflow::steps::local::{discover_dp::dp_info_from_labels, test_support::labels_of},
+        workflow::steps::local::test_support::labels_of,
     };
 
     #[test]

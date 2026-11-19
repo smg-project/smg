@@ -4749,7 +4749,7 @@ mod tests {
     /// The runtime pin only disambiguates the ZMQ wire protocol: gRPC (and
     /// HTTP) workers keep backend auto-detection even when `--backend` names an
     /// engine, and a ZMQ deployment without `--backend` stays unpinned
-    /// (detect_backend's vLLM default applies).
+    /// (the registration's ZMQ label step applies its vLLM default).
     #[test]
     fn startup_worker_runtime_stays_unpinned_off_the_zmq_path() {
         let grpc = cli_args_from(&[

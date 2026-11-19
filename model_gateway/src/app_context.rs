@@ -16,11 +16,15 @@ use smg_external_router::realtime::webrtc::default_bind_addr;
 use smg_mcp::McpOrchestrator;
 use smg_policy_controller::store::MemoryStore;
 use smg_worker::{
-    connection::http_client::{
-        build_client, connect_timeout_secs_below, WorkerHttpClientCache,
-        DEFAULT_CONNECT_TIMEOUT_SECS,
+    connection::{
+        engine::EngineConnector,
+        http_client::{
+            build_client, connect_timeout_secs_below, WorkerHttpClientCache,
+            DEFAULT_CONNECT_TIMEOUT_SECS,
+        },
     },
     health::liveness,
+    settings::RegistrationSettings,
     workflow::WorkflowHost,
 };
 use tokio::sync::broadcast::error::RecvError;
@@ -54,7 +58,7 @@ use crate::{
     },
     server::http_client_builder,
     wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
-    workflow::{JobQueue, TokenizerLoadFailures, WorkflowEngines},
+    workflow::{data::RegistrationNotes, JobQueue, TokenizerLoadFailures, WorkflowEngines},
 };
 
 /// Error type for AppContext builder
@@ -125,6 +129,8 @@ pub struct AppContext {
     /// Worker-directed HTTP clients, shared across workers with the same
     /// effective connection config.
     pub worker_client_cache: Arc<WorkerHttpClientCache>,
+    /// What the worker crate's registration steps read of the configuration.
+    pub registration_settings: RegistrationSettings,
     pub inflight_tracker: Arc<InFlightRequestTracker>,
     pub kv_event_monitor: Option<Arc<KvEventMonitor>>,
     /// The policy controller's store, where the controller was picked to
@@ -227,12 +233,26 @@ pub struct AppContextBuilder {
 }
 
 /// The context hosts the worker crate's workflow steps: they read the
-/// registry through this and nothing else of the gateway.
+/// registry, the worker clients, the registration's settings and the engine
+/// connector through this and nothing else of the gateway.
 impl WorkflowHost for AppContext {
     type Generation = ModelWorkerSnapshot;
+    type RegistrationNotes = RegistrationNotes;
 
     fn worker_registry(&self) -> &Arc<WorkerRegistry> {
         &self.worker_registry
+    }
+
+    fn worker_client_cache(&self) -> &WorkerHttpClientCache {
+        &self.worker_client_cache
+    }
+
+    fn registration_settings(&self) -> &RegistrationSettings {
+        &self.registration_settings
+    }
+
+    fn engine_connector(&self) -> Arc<dyn EngineConnector> {
+        BackendConnector::shared()
     }
 }
 
@@ -579,6 +599,7 @@ impl AppContextBuilder {
         let worker_client_cache = Arc::new(WorkerHttpClientCache::new(
             router_config.worker_http_client_settings(),
         ));
+        let registration_settings = router_config.registration_settings();
         let gateway_auth = AuthConfig::with_tenant_keys(
             router_config.api_key.clone(),
             &router_config.tenant_api_keys,
@@ -629,6 +650,7 @@ impl AppContextBuilder {
             wasm_manager: self.wasm_manager,
             worker_service,
             worker_client_cache,
+            registration_settings,
             inflight_tracker: InFlightRequestTracker::new(),
             kv_event_monitor: self.kv_event_monitor,
             policy_store: self.policy_store,
@@ -1742,6 +1764,7 @@ pub(crate) mod testing {
             worker_client_cache: Arc::new(WorkerHttpClientCache::new(
                 router_config.worker_http_client_settings(),
             )),
+            registration_settings: router_config.registration_settings(),
             worker_service: Arc::new(WorkerService::new(
                 worker_registry,
                 job_queue,
