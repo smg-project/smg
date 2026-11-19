@@ -6,9 +6,13 @@ use std::{sync::Arc, time::Duration};
 use wfaas::{BackoffStrategy, FailureAction, RetryPolicy, StepDefinition, WorkflowDefinition};
 
 use super::{
-    data::WorkerRegistrationWorkflowData, detect_connection::DetectConnectionModeStep,
-    detect_runtime::DetectRuntimeStep, discover_dp::DiscoverDpInfoStep,
-    discover_metadata::DiscoverMetadataStep, host::WorkflowHost,
+    create_worker::{CreateLocalWorkerStep, CREATE_LOCAL_WORKER_STEP},
+    data::WorkerRegistrationWorkflowData,
+    detect_connection::DetectConnectionModeStep,
+    detect_runtime::DetectRuntimeStep,
+    discover_dp::DiscoverDpInfoStep,
+    discover_metadata::DiscoverMetadataStep,
+    host::WorkflowHost,
 };
 use crate::settings::RegistrationSettings;
 
@@ -34,6 +38,11 @@ pub struct RegistrationGates {
     /// a host that settles something about the worker first. With none, the
     /// detection opens the workflow.
     pub detection: Option<&'static str>,
+    /// The host's step that ends before creation starts. With none, creation
+    /// waits on the DP read. The named step must itself wait on the DP read,
+    /// directly or through a chain of the host's own steps: creation reads
+    /// the DP shape, and a step beside the DP read races it for the run's data.
+    pub creation: Option<&'static str>,
 }
 
 /// How many times a step that polls a starting worker tries.
@@ -55,9 +64,10 @@ pub fn startup_attempts(settings: &RegistrationSettings) -> u32 {
 
 /// The worker side of a registration: the connection detection, polled at
 /// the startup cadence of `settings`, the runtime detection behind it with
-/// the same budget of attempts, the metadata read behind that, and the DP
-/// read last. A DP read that fails fails the workflow; where the settings
-/// leave that read off, its step reads nothing.
+/// the same budget of attempts, the metadata read, the DP read, and then
+/// creation. A DP read that fails fails the workflow. It reads nothing when
+/// the settings turn it off. Creation waits on the DP read or the host's
+/// creation gate.
 ///
 /// The startup delay, the time a worker is left alone before its first
 /// probe, stands on the step that opens the workflow. With
@@ -68,9 +78,9 @@ pub fn startup_attempts(settings: &RegistrationSettings) -> u32 {
 /// The engine runs a step on a copy of the run's data and writes the whole
 /// copy back, unless the step skipped. Two steps that wait on one step can
 /// run at once, and the copy written last then replaces what the other
-/// step wrote. So a host hangs a step of its own that writes the data
-/// behind the last step here, the DP read, or behind another step of its
-/// own, never beside one.
+/// step wrote. So a host hangs each step of its own that writes the data
+/// in this one chain, never beside a step of it: ahead of creation as its
+/// gate, behind creation, or behind another step of its own.
 pub fn worker_registration_workflow<H: WorkflowHost>(
     settings: &RegistrationSettings,
     gates: RegistrationGates,
@@ -143,6 +153,16 @@ pub fn worker_registration_workflow<H: WorkflowHost>(
             .with_timeout(Duration::from_secs(10))
             .with_failure_action(FailureAction::FailWorkflow)
             .depends_on(&[DISCOVER_METADATA_STEP]),
+        )
+        .add_step(
+            StepDefinition::new(
+                CREATE_LOCAL_WORKER_STEP,
+                "Create Local Worker",
+                Arc::new(CreateLocalWorkerStep),
+            )
+            .with_timeout(Duration::from_secs(5))
+            .with_failure_action(FailureAction::FailWorkflow)
+            .depends_on(&[gates.creation.unwrap_or(DISCOVER_DP_STEP)]),
         )
 }
 

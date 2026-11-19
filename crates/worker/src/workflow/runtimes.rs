@@ -2,6 +2,40 @@
 
 use crate::identity::basic::RuntimeType;
 
+/// What a runtime can serve over a ZMQ link.
+pub(super) struct ZmqRuntime {
+    runtime: RuntimeType,
+    /// Whether the wire also carries disaggregated requests.
+    pub(super) supports_disaggregation: bool,
+}
+
+/// The runtimes that speak ZMQ. Each can serve a regular worker.
+const ZMQ_RUNTIMES: [ZmqRuntime; 3] = [
+    ZmqRuntime {
+        runtime: RuntimeType::Vllm,
+        supports_disaggregation: false,
+    },
+    ZmqRuntime {
+        runtime: RuntimeType::TokenSpeed,
+        supports_disaggregation: true,
+    },
+    ZmqRuntime {
+        runtime: RuntimeType::Sglang,
+        supports_disaggregation: false,
+    },
+];
+
+/// The runtime's ZMQ row, if its wire can serve a ZMQ worker.
+pub(super) fn zmq_runtime(runtime: RuntimeType) -> Option<&'static ZmqRuntime> {
+    ZMQ_RUNTIMES.iter().find(|row| row.runtime == runtime)
+}
+
+/// The ZMQ runtime names in the order a refusal lists them.
+pub(super) fn zmq_runtime_names() -> String {
+    let [first, second, last] = ZMQ_RUNTIMES.map(|row| row.runtime.as_str());
+    format!("{first}, {second} and {last}")
+}
+
 /// One runtime as a registration tells it apart over HTTP.
 pub(super) struct HttpRuntime {
     /// The runtime.
@@ -68,9 +102,9 @@ pub(super) const GRPC_DETECTION_ORDER: [RuntimeType; 5] = [
     RuntimeType::Mlx,
 ];
 
-/// The runtime a metadata read takes for an HTTP worker whose runtime no
-/// detection settled.
-pub(super) const METADATA_DEFAULT: RuntimeType = RuntimeType::Sglang;
+/// The runtime used to read HTTP metadata or create a worker when detection
+/// leaves the runtime unspecified.
+pub(super) const DEFAULT_RUNTIME: RuntimeType = RuntimeType::Sglang;
 
 /// The row of the runtime that `runtime_type` names by its id, if it has one.
 pub(super) fn http_runtime(runtime_type: &str) -> Option<&'static HttpRuntime> {
@@ -152,7 +186,7 @@ mod tests {
             assert!(http_runtime(&row.runtime.as_str().to_uppercase()).is_none());
         }
         assert!(http_runtime("a-runtime-with-no-row").is_none());
-        let default = http_runtime(METADATA_DEFAULT.as_str()).map(|row| row.metadata);
+        let default = http_runtime(DEFAULT_RUNTIME.as_str()).map(|row| row.metadata);
         assert_eq!(default, Some(MetadataRead::InfoRoutes));
     }
 

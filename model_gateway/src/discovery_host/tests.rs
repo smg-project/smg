@@ -16,7 +16,7 @@ use smg_worker::{
     identity::basic::{ConnectionMode, DEFAULT_BOOTSTRAP_PORT},
     jobs::{WorkerJobAsker, WorkerRegistrationMode},
     registry::{RemoteWorkerState, WorkerId, WorkerOrigin},
-    workflow::WorkerKind,
+    workflow::{CreateLocalWorkerStep, WorkerKind},
 };
 use tokio::time;
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowInstanceId};
@@ -27,7 +27,7 @@ use crate::{
     routers::{common::snapshot::WorkerRegistry, grpc::backend_client::BasicWorkerBuilder},
     server::http_client,
     workflow::{
-        steps::{create_worker_workflow_data, CreateLocalWorkerStep, RegisterWorkersStep},
+        steps::{create_worker_workflow_data, RegisterWorkersStep},
         Job, JobQueue, JobQueueConfig,
     },
 };

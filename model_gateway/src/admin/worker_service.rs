@@ -25,6 +25,7 @@ use smg_worker::{
         endpoint::Endpoint,
     },
     jobs::WorkerJobAsker,
+    labels::has_control_character,
     registry::WorkerId,
     workflow::find_workers_by_url,
 };
@@ -32,7 +33,6 @@ use tracing::warn;
 
 use crate::{
     config::{unused_credentials_warning, validate_worker_url, RouterConfig},
-    observability::log_format::has_control_character,
     routers::{common::snapshot::WorkerRegistry, provider_support},
     workflow::{Job, JobQueue, WorkerRegistrationMode},
 };

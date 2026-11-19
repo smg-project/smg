@@ -66,7 +66,7 @@ The default feature set is empty, so every other layer is asked for by name.
 | `proto` | `common_proto`: the Rust types of `proto/common.proto`. The build then runs `protoc`. | | `prost`, `prost-build` | A crate that speaks gRPC to an engine. `smg-grpc-client` is one. |
 | `runtime` | The worker runtime: the worker and its builder, the registry, health, the load monitor, the metric writers, the engine handle and the collector of the KV cache events. | `metrics`, `proto` | `anyhow`, `arc-swap`, `async-trait`, `chrono`, `futures`, `metrics`, `metrics-exporter-prometheus`, `metrics-util`, `once_cell`, `openmetrics-parser`, `parking_lot`, `quanta`, `reqwest`, `rustls`, `thiserror`, `tokio`, `tonic`, `tracing`, `uuid` | The process that hosts the workers. The gateway is one. |
 | `test-util` | `test_support`: what a test builds its workers with, a scripted engine among it. It also opens the test readers and hooks of the registry, the series store, the label interner and the KV event collector. | `runtime` | `tonic-prost` | The tests of a crate that hosts the runtime. |
-| `workflow` | `workflow`: the worker side of the workflows a host runs over its workers. A removal in registry order selects and drains workers, then removes them from the registry. In door order it selects workers and waits for them to settle between the host's drain and removal. It also holds the start of registration (connection and runtime detection, metadata and data-parallel reads), the data the steps pass along, and the host trait they read. | `runtime` | `wfaas` | A host that registers or removes workers by a workflow. The gateway is one. |
+| `workflow` | `workflow`: the worker side of the workflows a host runs over its workers. A removal in registry order selects and drains workers, then removes them from the registry. In door order it selects workers and waits for them to settle between the host's drain and removal. It also holds a local worker's detection and creation at registration (connection and runtime detection, metadata and data-parallel reads, then the worker objects), the data the steps pass along, and the host trait they read. | `runtime` | `wfaas` | A host that registers or removes workers by a workflow. The gateway is one. |
 
 "Turns on" names other features of this crate. "Pulls in" names the crates a
 feature adds to the build. `runtime` turns on `proto`, so the build of a host
@@ -342,7 +342,7 @@ is always there.
 | `health` | | The overload thresholds. With `runtime`: the health manager, liveness, the circuit breaker, the resilience settings and the probe of a bootstrap port. |
 | `identity` | | A worker's address, parsed once and keyed, and the sampling defaults a worker reports. With `runtime`: the `Worker` trait, `BasicWorker`, its builder, its metadata, the worker errors and the door a worker's address passes. |
 | `kv_events` | | The port between the collector of the KV cache events an engine pushes and a host's sink. With `runtime`: the collector, which keeps one task a worker, and the port of its host. |
-| `labels` | | The labels of a worker's spec that the worker's own code and its hosts read, and the flat map an engine's answer becomes. |
+| `labels` | | The labels of a worker's spec that the worker's own code and its hosts read, and `flat_labels`, which turns an engine's answer into a flat map of labels. |
 | `metrics_labels` | | The metric label values the worker's writers share with a host's. |
 | `model_card` | | The model card a worker serves. |
 | `model_type` | | The endpoints a model supports. |
@@ -359,7 +359,7 @@ is always there.
 | `registry` | `runtime` | The registry and its events. |
 | `runtime` | `runtime` | A worker's shared runtime state: what a replacement at the same address inherits. |
 | `test_support` | `runtime`, `test-util` | What a test builds its workers with. |
-| `workflow` | `workflow` | A removal in registry order selects and drains workers, then removes them from the registry. In door order it selects workers and waits for them to settle between the host's drain and removal. The module also holds the start of registration, the workflow data and the host trait. |
+| `workflow` | `workflow` | A removal in registry order selects and drains workers, then removes them from the registry. In door order it selects workers and waits for them to settle between the host's drain and removal. The module also holds a registration's detection and creation, the workflow data and the host trait. |
 
 ## How this page stays true
 

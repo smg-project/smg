@@ -43,8 +43,6 @@ pub use steps::{
     ClassifyWorkerTypeStep,
     // External registration steps
     CreateExternalWorkersStep,
-    // Local registration steps
-    CreateLocalWorkerStep,
     DiscoverModelsStep,
     // Update steps
     FindWorkerToUpdateStep,

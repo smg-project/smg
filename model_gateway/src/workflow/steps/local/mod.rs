@@ -1,4 +1,4 @@
-mod create_worker;
+mod check_local_worker;
 mod ensure_harmony_encoding;
 mod find_worker_to_update;
 mod rediscover_labels;
@@ -14,7 +14,7 @@ mod zmq_labels;
 
 use std::{sync::Arc, time::Duration};
 
-pub use create_worker::CreateLocalWorkerStep;
+pub(crate) use check_local_worker::{CheckLocalWorkerStep, CHECK_LOCAL_WORKER_STEP};
 pub use ensure_harmony_encoding::EnsureHarmonyEncodingStep;
 pub use find_worker_to_update::FindWorkerToUpdateStep;
 use openai_protocol::worker::WorkerUpdateRequest;

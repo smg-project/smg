@@ -18,15 +18,17 @@
 //! of how the worker is spoken to ([`DetectConnectionModeStep`]) and of
 //! the runtime it runs ([`DetectRuntimeStep`]), and the reads of what its
 //! engine reports about itself ([`DiscoverMetadataStep`]) and of its
-//! data-parallel shape ([`DiscoverDpInfoStep`]), in the order of
-//! [`worker_registration_workflow`]. A host names in
-//! [`RegistrationGates`] the steps of its own that this crate's steps wait
-//! on.
+//! data-parallel shape ([`DiscoverDpInfoStep`]). [`CreateLocalWorkerStep`]
+//! builds workers from the spec and what detection found. These steps run
+//! in the order of [`worker_registration_workflow`]. A host uses
+//! [`RegistrationGates`] to name the steps of its own that detection or
+//! creation waits on.
 //!
 //! A workflow's order is this crate's: its step ids, timeouts and retries
 //! are written once, here. A host adds its own steps to a workflow by the
 //! engine's `depends_on`, on a step id this crate names.
 
+mod create_worker;
 mod data;
 mod detect_connection;
 mod detect_runtime;
@@ -46,6 +48,11 @@ mod retry;
 mod runtimes;
 mod select;
 
+pub use create_worker::{
+    build_model_card, kv_transfer_value, labels_for_rank, model_card_for_labels, report_for_rank,
+    resolve_model_id, validate_constrained_decoding_label, CreateLocalWorkerStep,
+    CREATE_LOCAL_WORKER_STEP, DP_WIDTH_LABELS,
+};
 pub use data::{
     DpInfo, WorkerKind, WorkerList, WorkerRegistrationWorkflowData, WorkerRemovalWorkflowData,
 };
