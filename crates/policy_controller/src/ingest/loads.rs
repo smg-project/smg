@@ -144,6 +144,10 @@ pub enum ReadError {
     /// The family has no `GetLoads`.
     #[error("no GetLoads on a {0} engine")]
     Unsupported(String),
+    /// The probe's own client was not built, or not within the scrape's
+    /// timeout: the controller's failure, no engine's.
+    #[error("the probe's client is not built: {0}")]
+    Client(String),
 }
 
 impl ReadError {
@@ -155,6 +159,7 @@ impl ReadError {
             Self::Deadline(_) => "deadline",
             Self::NoLoad(_) => "no_load",
             Self::Unsupported(_) => "unsupported",
+            Self::Client(_) => "client",
         }
     }
 }
@@ -169,7 +174,9 @@ pub trait LoadProbe: Send + Sync + 'static {
         deadline: Duration,
     ) -> impl Future<Output = Result<WorkerLoadResponse, ReadError>> + Send;
 
-    /// The text of the engine's metrics endpoint, within `timeout`.
+    /// The text of the engine's metrics endpoint, within `timeout`. A probe
+    /// whose client's build outlasts `timeout` answers that scrape at the
+    /// build's end.
     fn scrape(
         &self,
         url: &str,
@@ -211,22 +218,30 @@ pub struct Failures {
     pub deadline: AtomicU64,
     pub no_load: AtomicU64,
     pub unsupported: AtomicU64,
+    pub client: AtomicU64,
 }
 
 impl Failures {
     /// The labels of the series, in the order of [`Self::each`]: each is its
     /// variant's [`ReadError::label`].
-    pub const LABELS: [&'static str; 5] =
-        ["transport", "answer", "deadline", "no_load", "unsupported"];
+    pub const LABELS: [&'static str; 6] = [
+        "transport",
+        "answer",
+        "deadline",
+        "no_load",
+        "unsupported",
+        "client",
+    ];
 
     /// The counters, in the order of [`Self::LABELS`].
-    fn counters(&self) -> [&AtomicU64; 5] {
+    fn counters(&self) -> [&AtomicU64; 6] {
         [
             &self.transport,
             &self.answer,
             &self.deadline,
             &self.no_load,
             &self.unsupported,
+            &self.client,
         ]
     }
 
@@ -239,13 +254,14 @@ impl Failures {
             ReadError::Deadline(_) => &self.deadline,
             ReadError::NoLoad(_) => &self.no_load,
             ReadError::Unsupported(_) => &self.unsupported,
+            ReadError::Client(_) => &self.client,
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
     /// The counts, with their labels.
-    pub fn each(&self) -> [(&'static str, u64); 5] {
-        let mut out = [("", 0); 5];
+    pub fn each(&self) -> [(&'static str, u64); 6] {
+        let mut out = [("", 0); 6];
         for (slot, (counter, name)) in out
             .iter_mut()
             .zip(self.counters().into_iter().zip(Self::LABELS))

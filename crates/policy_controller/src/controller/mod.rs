@@ -1238,16 +1238,21 @@ mod tests {
         deciders::{tests as bed, TERM_MARK},
         election::{self, Standing},
         following,
+        membership::tests::Logged,
         principal::Layer,
         readiness::{self, tests::fenced, Phase},
         standby::Lag,
-        tell_readiness, tell_role, unnamed_port, Bound, ConfigError, Controller, Error, NoFollow,
-        Scope,
+        tell_readiness, tell_role, unnamed_port, Bound, ConfigError, Controller, EngineProbe,
+        Error, NoFollow, Scope,
     };
     use crate::{
         elector::{
             ElectError, ElectionSettings, Elector, LeaseBackend, LeaseRecord, MemoryLease, Tick,
             Written,
+        },
+        ingest::{
+            loads::{LoadProbe, ReadError},
+            probe::unbuildable,
         },
         store::Kinds,
     };
@@ -1285,6 +1290,31 @@ mod tests {
     async fn a_start_with_no_engine_to_scrape_builds_no_http_client() {
         let controller = Controller::bind(valid()).await.expect("the listeners bind");
         assert!(!controller.probe.http_built());
+    }
+
+    /// A probe whose client cannot be built says so once, as a warning
+    /// that names the controller's own client and no engine.
+    #[tokio::test]
+    async fn a_client_that_cannot_be_built_is_said_once_as_the_controllers_own() {
+        let lines = Logged::default();
+        let writer = lines.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _beside = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let _kept = tracing::subscriber::set_default(subscriber);
+        let probe = EngineProbe::building(unbuildable);
+        for _ in 0..3 {
+            let read = probe
+                .scrape("http://127.0.0.1:9", Duration::from_secs(1))
+                .await;
+            assert!(matches!(read, Err(ReadError::Client(_))), "{read:?}");
+        }
+        let said = String::from_utf8(lines.0.lock().clone()).expect("the lines");
+        assert_eq!(said.matches("could not be built").count(), 1, "{said}");
+        assert!(said.contains("WARN"), "{said}");
+        assert!(!said.contains("127.0.0.1"), "no engine is named: {said}");
     }
 
     /// Every socket the controller accepts sends at once, read from the
