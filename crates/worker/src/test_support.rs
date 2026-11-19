@@ -15,11 +15,13 @@
 //! [`sorted_series`].
 
 use std::{
+    collections::HashMap,
     net::{Ipv4Addr, SocketAddr},
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Weak,
     },
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -28,7 +30,7 @@ use tokio::net::{TcpListener, TcpSocket};
 
 use crate::{
     common_proto::KvEventBatch,
-    connection::engine::{AdminAnswer, EngineConnection, EngineConnector, ZmqLink},
+    connection::engine::{AdminAnswer, EngineConnection, EngineConnector, HealthAnswer, ZmqLink},
     identity::{
         basic::{ConnectionMode, Worker},
         builder,
@@ -438,7 +440,7 @@ impl EngineConnection for NoEngine {
         true
     }
 
-    async fn health_check(&self) -> Result<bool, tonic::Status> {
+    async fn health_answer(&self) -> Result<HealthAnswer, tonic::Status> {
         no_engine()
     }
 
@@ -458,7 +460,11 @@ impl EngineConnection for NoEngine {
         no_engine()
     }
 
-    async fn kv_engine_id(&self) -> Result<Option<String>, tonic::Status> {
+    async fn model_labels(&self) -> Result<HashMap<String, String>, tonic::Status> {
+        no_engine()
+    }
+
+    async fn server_labels(&self) -> Result<HashMap<String, String>, tonic::Status> {
         no_engine()
     }
 
@@ -504,5 +510,10 @@ impl EngineConnector for CountingConnector {
     async fn connect_zmq(&self, _link: ZmqLink) -> Result<Arc<dyn EngineConnection>, String> {
         self.connects.fetch_add(1, Ordering::SeqCst);
         Ok(Arc::new(NoEngine))
+    }
+
+    /// A dial makes no connection, so it is not counted.
+    async fn dial_grpc(&self, _base_url: &str, _timeout: Duration) -> Result<(), String> {
+        Ok(())
     }
 }

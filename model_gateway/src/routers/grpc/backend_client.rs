@@ -8,7 +8,11 @@
 //! pipeline (which works against `ProtoStream`/`ProtoGenerateRequest`) is
 //! shared unchanged.
 
-use std::sync::{Arc, LazyLock};
+use std::{
+    collections::HashMap,
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use engine_zmq_adapter::admin::{flush_reply_wait, PROFILE_WAIT};
@@ -20,7 +24,7 @@ use openai_protocol::{
     worker::{ProfileOptions, WorkerLoadResponse},
 };
 use smg_grpc_client::{
-    common_proto, sglang_proto,
+    common_proto, connect_channel_with_timeout, sglang_proto,
     tokenizer_bundle::StreamBundle,
     tokenspeed_encoder::{tokenspeed_encoder_proto as tokenspeed_encoder, TokenSpeedEncoderClient},
     tokenspeed_proto, vllm_proto, OutputConstraint, SglangGenerateRequestOptions,
@@ -28,7 +32,7 @@ use smg_grpc_client::{
 };
 use smg_worker::{
     connection::engine::{
-        AdminAnswer, ConnectorDefault, EngineConnection, EngineConnector, ZmqLink,
+        AdminAnswer, ConnectorDefault, EngineConnection, EngineConnector, HealthAnswer, ZmqLink,
     },
     identity::{
         basic::{RuntimeType, Worker},
@@ -390,13 +394,12 @@ impl EngineConnection for BackendClient {
         }
     }
 
-    /// The client's own health read, narrowed to its verdict. The inherent
-    /// method answers the whole reply, so this path cannot come back here:
-    /// without that method `healthy` names no field.
-    async fn health_check(&self) -> Result<bool, tonic::Status> {
-        BackendClient::health_check(self)
-            .await
-            .map(|response| response.healthy)
+    /// The client's own health read, whole, in the worker's words. The
+    /// inherent method answers the client's reply, so this path cannot come
+    /// back here: without that method the reply has no fields to take.
+    async fn health_answer(&self) -> Result<HealthAnswer, tonic::Status> {
+        let HealthCheckResponse { healthy, message } = BackendClient::health_check(self).await?;
+        Ok(HealthAnswer { healthy, message })
     }
 
     async fn get_loads(&self) -> Result<WorkerLoadResponse, tonic::Status> {
@@ -457,9 +460,12 @@ impl EngineConnection for BackendClient {
         Ok(AdminAnswer { success, message })
     }
 
-    async fn kv_engine_id(&self) -> Result<Option<String>, tonic::Status> {
-        let mut labels = BackendClient::get_server_info(self).await?.to_labels();
-        Ok(labels.remove("kv_engine_id").filter(|id| !id.is_empty()))
+    async fn model_labels(&self) -> Result<HashMap<String, String>, tonic::Status> {
+        Ok(BackendClient::get_model_info(self).await?.to_labels())
+    }
+
+    async fn server_labels(&self) -> Result<HashMap<String, String>, tonic::Status> {
+        Ok(BackendClient::get_server_info(self).await?.to_labels())
     }
 
     async fn subscribe_kv_events(
@@ -545,6 +551,15 @@ impl EngineConnector for BackendConnector {
         .await?;
         client.check_declared_role(link.worker_type)?;
         Ok(Arc::new(BackendClient::Zmq(client)))
+    }
+
+    /// The client crate's own dial: the channel every runtime's client
+    /// connects through, so the dial answers as a connect would.
+    async fn dial_grpc(&self, base_url: &str, timeout: Duration) -> Result<(), String> {
+        connect_channel_with_timeout(base_url, timeout)
+            .await
+            .map(drop)
+            .map_err(|e| e.to_string())
     }
 }
 
