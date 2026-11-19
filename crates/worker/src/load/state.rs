@@ -289,8 +289,9 @@ impl<G: Generation> LoadState<G> {
     }
 
     /// Whether `worker` is the `Ready` worker the registry holds at its URL
-    /// now, by pointer. One test at two places: the publish fence and the
-    /// pushers a reset keeps.
+    /// now, by pointer. One test at four places: the publish fence, the
+    /// pushers a reset keeps, the sentinel of an eviction and the leave a
+    /// status event tells.
     pub(crate) fn is_current_incarnation(&self, worker: &Arc<dyn Worker>) -> bool {
         self.registry
             .get_by_url(worker.url())

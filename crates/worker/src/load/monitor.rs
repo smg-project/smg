@@ -998,6 +998,8 @@ impl<G: Generation> WorkerMonitor<G> {
     /// poll's wire shape is built here, once per window per worker, from the
     /// report its records updated in place. A report a poll's empty answer
     /// emptied has nothing to publish (that poll's publish pruned the entry).
+    /// A report the fence refuses publishes nothing and prunes nothing: the
+    /// row its worker published before is the eviction's to remove.
     pub(crate) fn flush_pushed(&self) {
         let reports = self.pushed_reports.lock();
         let changed: Vec<(String, Arc<dyn Worker>)> = self.pending_pushed.lock().drain().collect();
@@ -1005,7 +1007,6 @@ impl<G: Generation> WorkerMonitor<G> {
             return;
         }
         let timestamp = chrono::Utc::now().to_rfc3339();
-        let mut urls = Vec::with_capacity(changed.len());
         let mut fresh: Vec<PushedReport> = Vec::with_capacity(changed.len());
         for (url, worker) in changed {
             let Some(report) = reports
@@ -1026,10 +1027,12 @@ impl<G: Generation> WorkerMonitor<G> {
                     sampled_at: report.sampled_at,
                 }),
             ));
-            urls.push(url);
         }
         if !fresh.is_empty() {
-            self.load_state.publish_group(&urls, fresh);
+            // No URL is pruned. A report the fence admits overwrites its
+            // worker's row. A refused one leaves the row to the eviction,
+            // which writes the sentinel of the series with it.
+            self.load_state.publish_group(&[], fresh);
         }
     }
 
@@ -1331,8 +1334,16 @@ impl<G: Generation> WorkerMonitor<G> {
     /// registration. A same-URL replacement that already republished keeps
     /// its entry, and its series continues uninterrupted. So does a worker
     /// that left `Ready`, came back and published again ahead of the flush.
+    /// One that came back and has yet to publish loses its old entry and
+    /// gets no sentinel: its feed is live again.
     pub(crate) fn flush_pending_evictions(&self) {
         for worker in self.load_state.apply_pending_evictions() {
+            // A worker that is the registry's `Ready` worker again may have
+            // written its series since its return: a sentinel would land
+            // over that record.
+            if self.load_state.is_current_incarnation(&worker) {
+                continue;
+            }
             // A worker can serve multiple models (one load group per model),
             // so sentinel every model's series — not just the primary.
             let dp_size = worker.dp_size().unwrap_or(1);
@@ -1825,7 +1836,12 @@ async fn run_event_loop<G: Generation>(
             Ok(WorkerEvent::StatusChanged {
                 worker, new_status, ..
             }) => {
-                if new_status != WorkerStatus::Ready {
+                // The event can be handled behind the worker's return. A
+                // worker that is the registry's `Ready` worker again keeps
+                // its loads: its feed has carried on since.
+                if new_status != WorkerStatus::Ready
+                    && !monitor.load_state.is_current_incarnation(&worker)
+                {
                     monitor.evict_worker_loads(&worker);
                 }
                 // No action needed when transitioning *into* Ready: the

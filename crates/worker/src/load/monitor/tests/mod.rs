@@ -2498,6 +2498,69 @@ async fn a_record_of_a_worker_that_is_not_ready_leaves_the_sentinel_on_its_serie
     assert!(running_series(&rendered).ends_with(" -1"), "{rendered}");
 }
 
+/// A worker that left `Ready` and still pushes starts its report again,
+/// and the fence refuses its publish. That publish prunes nothing: the row
+/// from before the leave is the eviction's to remove, and the eviction
+/// writes the sentinel of the series with it.
+#[tokio::test]
+async fn a_refused_publish_leaves_the_old_row_to_the_eviction() {
+    let rendered = render_with_recorder(|| {
+        let (registry, monitor) = build_monitor();
+        let worker = ready_worker("http://w:1", "m");
+        let id = registry.register(Arc::clone(&worker)).unwrap();
+        monitor.apply_pushed_load(&worker, 0, &pushed(7), Instant::now());
+        monitor.flush_pushed();
+        registry.transition_status(&id, WorkerStatus::NotReady);
+        monitor.evict_worker_loads(&worker);
+        monitor.apply_pushed_load(&worker, 0, &pushed(9), Instant::now());
+
+        assert_eq!(published_rows(&monitor), vec![(0, 7)], "the old row");
+        monitor.flush_pending_evictions();
+
+        assert!(monitor.load_state.snapshot().get("http://w:1").is_none());
+    });
+    assert!(running_series(&rendered).ends_with(" -1"), "{rendered}");
+}
+
+/// A queued eviction can be applied between a returned worker's first
+/// record and its publish. It removes the row from before the leave and
+/// writes no sentinel: the worker is the registry's `Ready` worker again,
+/// and its series reads the record made since.
+#[tokio::test]
+async fn a_batch_ahead_of_a_returned_workers_publish_writes_no_sentinel() {
+    let rendered = render_with_recorder(|| {
+        let (registry, monitor) = build_monitor();
+        let worker = ready_worker("http://w:1", "m");
+        let id = registry.register(Arc::clone(&worker)).unwrap();
+        monitor.apply_pushed_load(&worker, 0, &pushed(7), Instant::now());
+        monitor.flush_pushed();
+        registry.transition_status(&id, WorkerStatus::NotReady);
+        monitor.evict_worker_loads(&worker);
+        registry.transition_status(&id, WorkerStatus::Ready);
+        monitor.apply_pushed_load(&worker, 0, &pushed(9), Instant::now());
+
+        monitor.flush_pending_evictions();
+
+        assert_eq!(published_rows(&monitor), vec![(0, 9)]);
+    });
+    assert!(running_series(&rendered).ends_with(" 9"), "{rendered}");
+}
+
+/// A leave can be handled behind the worker's return. A worker that is the
+/// registry's `Ready` worker again keeps its loads: the sink hears no
+/// `forget`.
+#[tokio::test]
+async fn a_leave_handled_behind_the_workers_return_forgets_nothing() {
+    let (registry, _monitor, sink, id) = recording_with_a_worker();
+    settle().await;
+    registry.transition_status(&id, WorkerStatus::NotReady);
+    registry.transition_status(&id, WorkerStatus::Ready);
+
+    settle().await;
+
+    assert!(!told_to_forget(&sink, "http://w:1"));
+}
+
 /// A pusher that left `Ready` while registry events were lost stays
 /// registered, so its engine series would read its last load as live. The
 /// reset's eviction writes the series' sentinel, as its event's would.
