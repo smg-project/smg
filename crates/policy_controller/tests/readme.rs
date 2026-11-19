@@ -1,5 +1,5 @@
 //! The README, checked against the crate, so the page says what this build
-//! holds. Four things are read off `README.md`:
+//! holds. Five things are read off `README.md`:
 //!
 //! - every fenced `yaml` block is a whole policy document: it parses, and
 //!   the stock catalog validates it (a fragment is fenced as text);
@@ -11,7 +11,10 @@
 //!   the catalog's order;
 //! - a `yaml` block under `<!-- preset: <name> -->` is the crate's preset of
 //!   that name but for its `generation` line, which the page leaves out, and
-//!   the page shows every preset.
+//!   the page shows every preset;
+//! - the page names, each in a code span, every flag of the standalone
+//!   binary, every call of the controller's contract and every series the
+//!   controller exports: each list is read off the file that declares it.
 
 use std::{
     fs,
@@ -32,6 +35,17 @@ const DOCUMENTS: usize = 16;
 
 /// The documents the page shows refused.
 const REFUSALS: usize = 2;
+
+/// The flags the standalone binary declares, at the least: a walk that
+/// finds fewer has lost the shape of its source file, and a change that
+/// takes a flag away lowers the count.
+const FLAGS: usize = 29;
+
+/// The calls the controller's contract holds, at the least.
+const CALLS: usize = 17;
+
+/// The series the standalone controller exports, at the least.
+const SERIES: usize = 22;
 
 fn readme() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md")
@@ -218,4 +232,104 @@ fn each_preset_document_is_the_crates_preset() {
             "the README's `{name}` document is the crate's preset"
         );
     }
+}
+
+/// The field a line of the command line's declaration names, where it
+/// names one: `load_monitor_interval: u64,` names `load_monitor_interval`.
+fn field(line: &str) -> Option<&str> {
+    let (name, _) = line.split_once(": ")?;
+    (!name.is_empty() && name.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')).then_some(name)
+}
+
+/// The standalone binary's flags, off the declaration of its command line:
+/// the field under an `arg` attribute is one flag, spelled with dashes.
+fn flags() -> Vec<String> {
+    let mut under_arg = false;
+    include_str!("../src/controller/run.rs")
+        .lines()
+        .map(str::trim)
+        .filter_map(|line| {
+            if line.starts_with("#[arg(") {
+                under_arg = true;
+                return None;
+            }
+            let name = field(line).filter(|_| under_arg)?;
+            under_arg = false;
+            Some(format!("--{}", name.replace('_', "-")))
+        })
+        .collect()
+}
+
+/// The calls of the controller's contract: each `rpc` of its service.
+fn calls() -> Vec<&'static str> {
+    include_str!("../contracts/policy_controller.proto")
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("rpc ")?.split('(').next())
+        .collect()
+}
+
+/// The series the standalone controller exports: each name its metrics
+/// module declares.
+fn series() -> Vec<&'static str> {
+    include_str!("../src/controller/metrics.rs")
+        .split("&str =")
+        .skip(1)
+        .filter_map(|rest| rest.trim_start().strip_prefix('"')?.split('"').next())
+        .collect()
+}
+
+/// The declared names the page holds in no code span.
+fn left_out<'a>(page: &str, declared: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
+    declared
+        .into_iter()
+        .filter(|name| !page.contains(&format!("`{name}`")))
+        .collect()
+}
+
+#[test]
+fn the_page_names_every_flag_of_the_standalone_binary() {
+    let page = fs::read_to_string(readme()).expect("the README is readable");
+    let flags = flags();
+    assert!(
+        flags.len() >= FLAGS,
+        "the command line declares {} flags by this walk",
+        flags.len()
+    );
+    let left_out = left_out(&page, flags.iter().map(String::as_str));
+    assert!(
+        left_out.is_empty(),
+        "the README's flag table leaves out {left_out:?}"
+    );
+}
+
+#[test]
+fn the_page_names_every_call_of_the_contract() {
+    let page = fs::read_to_string(readme()).expect("the README is readable");
+    let calls = calls();
+    assert!(
+        calls.len() >= CALLS,
+        "the contract holds {} calls by this walk",
+        calls.len()
+    );
+    let left_out = left_out(&page, calls);
+    assert!(
+        left_out.is_empty(),
+        "the README's call table leaves out {left_out:?}"
+    );
+}
+
+#[test]
+fn the_page_names_every_series_the_controller_exports() {
+    let page = fs::read_to_string(readme()).expect("the README is readable");
+    let series = series();
+    assert!(
+        series.len() >= SERIES,
+        "the metrics module declares {} series by this walk",
+        series.len()
+    );
+    let left_out = left_out(&page, series);
+    assert!(
+        left_out.is_empty(),
+        "the README's metrics table leaves out {left_out:?}"
+    );
 }
