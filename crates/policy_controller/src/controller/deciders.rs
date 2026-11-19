@@ -4754,7 +4754,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_request_ahead_of_the_starts_document_is_no_decision() {
         let mut bed = bed(None, true, (2, 8), []);
-        bed.store.world().spec().await_document();
+        bed.store.world().spec().mark_document_awaited();
         let answer = bed.ask(frame(1, 1)).await;
         assert_eq!(
             (busy(&answer), answer.request_id.as_slice(), answer.term),

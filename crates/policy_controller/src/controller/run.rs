@@ -121,8 +121,14 @@ struct Cli {
 
     // ==================== Election ====================
     /// The lease as a file on this host: the replicas of one host elect
-    /// their leader over it; its directory must exist. With no lease flag
-    /// the controller runs alone and leads itself
+    /// their leader over it; its directory must exist. Each renewal is a
+    /// durable write: on a volume whose sync can take over a second the
+    /// leader answers Busy for that time, ends its gateways' sessions
+    /// where a renewal takes two, and can lose its lease where one takes
+    /// three; keep the file on a quiet local volume or run a slower
+    /// timing (15000, 10000 and 2000 for --lease-duration-ms,
+    /// --lease-renew-deadline-ms and --lease-renew-period-ms). With no
+    /// lease flag the controller runs alone and leads itself
     #[arg(long, help_heading = "Election")]
     lease_file: Option<PathBuf>,
 
@@ -174,12 +180,16 @@ struct Cli {
     /// The policy spec as a file, in YAML (JSON under a `.json` name): read
     /// and applied at the start, as generation 1 or under the number its
     /// `generation` line writes. Under `--lease-file` or `--lease-name` it
-    /// is read at the start and applied when this replica first leads. A
-    /// file that cannot be read, or a document that is invalid, refuses the
-    /// start. The file is then watched: a
-    /// changed one is applied as the next generation, or under the number
-    /// it writes, and one that does not run is rejected whole and the
-    /// running generation stays. A start names one source of the spec, this
+    /// is read and checked at the start, and applied when this replica
+    /// leads: while it follows a leader it runs the leader's document, and
+    /// once it leads it applies its own file's, unless that document ran
+    /// on it since the file last changed. A file that cannot be read, or a
+    /// document that is invalid, refuses the start. The file is watched
+    /// from then on. While the replica leads, a changed one is applied as
+    /// the next generation, or under the number it writes, and one that
+    /// does not run is rejected whole and the running generation stays.
+    /// While the replica follows, nothing of the file is applied and
+    /// nothing is said of it. A start names one source of the spec, this
     /// file or `--spec-store`: with neither it is refused.
     ///
     /// YAML reads as JSON does: text that looks like a number or a boolean

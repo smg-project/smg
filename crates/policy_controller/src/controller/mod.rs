@@ -558,22 +558,28 @@ impl Controller {
     }
 
     /// Takes the controller's policy spec from the file at `path` (design
-    /// 4.6): the document is read and applied now, as generation 1 or under
-    /// the number its `generation` line writes, and the control scope
-    /// answers `GetPolicySpec` with it. [`Self::serve`] then watches the
-    /// file: a changed one is applied as the next generation, or under the
-    /// number it writes, and one that does not run is rejected whole, with
-    /// the running generation kept.
+    /// 4.6). A replica alone over its lease reads and applies the document
+    /// now, as generation 1 or under the number its `generation` line
+    /// writes, and the control scope answers `GetPolicySpec` with it.
+    /// [`Self::serve`] then watches the file: a changed one is applied as
+    /// the next generation, or under the number it writes, and one that
+    /// does not run is rejected whole, with the running generation kept.
     ///
     /// A replica under a lease another replica can take applies nothing
     /// here: its document is passed, and applied under the replica's first
     /// lead where the replica runs nothing by then, at its first take or by
-    /// its watch once that lead opens. Until it lands the replica has no
-    /// decision for a request. Until it leads, a replica that follows a
-    /// leader runs what its leader's log gives it, under the leader's
-    /// number. Behind each take its watch reads the file as a start does:
-    /// a leader runs what its file says. The lease alone decides this,
-    /// whatever the order the listeners are configured in.
+    /// its watch once that lead opens. It holds no document until it
+    /// follows or leads, and `GetPolicySpec` says so. Until its document
+    /// lands, a replica that leads has no decision for a request. Until it
+    /// leads, a replica that follows a leader runs what its leader's log
+    /// gives it, under the leader's number. Its watch looks at the file
+    /// all the while and applies nothing: it shows the door what the file
+    /// holds, and says nothing of a file it cannot read. Once the replica
+    /// leads, the watch reads the file again unless its document stood on
+    /// the replica since the file took it: a rollout's new file is
+    /// applied, and a mount that lags brings nothing older back. The lease
+    /// alone decides which of the two starts this is, whatever the order
+    /// the listeners are configured in.
     ///
     /// A file that cannot be read, or a document the validator refuses, is
     /// refused here, before anything serves. The document names the stages

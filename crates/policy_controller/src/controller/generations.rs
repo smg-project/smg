@@ -91,8 +91,14 @@
 //! ([`Generations::deferred_now`]). So a replica that starts runs no number
 //! of its own, and follows its leader's generation whatever its number.
 //! A leader runs what its file says: the door counts the takes, and behind
-//! each the file's watch reads its file as a start does, though it never
-//! moved ([`Generations::takes`]).
+//! one the file's watch reads its file as a start does, though it never
+//! moved ([`Generations::takes`]), while the file's document has not stood
+//! on this replica since the file took it. The watch of a replica that
+//! follows shows the door what its file holds, by a digest, and applies
+//! nothing ([`Generations::shown`]): so the door knows a document that
+//! was applied here, or told by a leader, since the file took it. Such a
+//! file is a mount that lags: it is left for its next move, and brings
+//! nothing older back ([`Generations::source_stood`]).
 //!
 //! Limits. Under a file, a replica that starts remembers nothing. A number
 //! only rises in a process, so a replica that led, and comes back behind a
@@ -534,6 +540,22 @@ pub(crate) enum Leading {
     Alone,
     /// A replica under a shared lease, whose fence showed this term.
     Term(u64),
+}
+
+/// What became of the document a door's source handed last: its file at
+/// the start, at a leader's look, or at the look of a replica that follows
+/// ([`Generations::shown`]).
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Handed {
+    /// It stood on this replica since it was handed: applied here, or told
+    /// by a leader while the replica followed. So too where the source
+    /// handed none.
+    Stood,
+    /// It has not stood here since, by this build's digest of it.
+    Unstood(Digest),
+    /// The file held no document that could stand: one a look could not
+    /// read or parse, or one a leader's pass refused.
+    Undigested,
 }
 
 /// Why a policy spec document was not applied. The running generation
@@ -1031,20 +1053,26 @@ pub(crate) struct Generations {
     held: Mutex<Option<Held>>,
     /// The start's document of a replica under a shared lease, in its
     /// source's form, from the start that passed it until the replica's
-    /// first lead applies it or a followed generation stands
-    /// ([`Generations::defer`], [`Generations::deferred_now`]).
+    /// first lead applies it or refuses it, or a followed generation
+    /// stands ([`Generations::defer`], [`Generations::deferred_now`]).
     deferred: Mutex<Option<(Vec<u8>, Format)>>,
     /// A file is this door's source: a start passed its document
     /// ([`Generations::defer`]). Never unset.
-    filed: AtomicBool,
+    file_sourced: AtomicBool,
     /// The fence of a replica under a shared lease
     /// ([`Generations::under`]): the source's entry is admitted while it
     /// shows the term the entry's bytes were read under. None for a
     /// replica alone over its lease, whose source writes always.
     fence: OnceLock<Arc<Fence>>,
-    /// The takes this replica made ([`Generations::at_take`]): behind each
-    /// the file's watch reads its file as a start does.
+    /// The takes this replica made ([`Generations::at_take`]): behind one
+    /// the file's watch reads its file as a start does, while the file's
+    /// document has not stood here since the file took it.
     takes: AtomicU64,
+    /// What became of the document the source handed last
+    /// ([`Generations::source_stood`]). A replica that follows writes it
+    /// under the lock of `held`, which a generation enters under: the
+    /// file's hand and an entry stand in one order.
+    handed: Mutex<Handed>,
     /// The leader's generation this door refused last. The same event sent
     /// again at a retry is refused from here: no second pass and no second
     /// warning.
@@ -1078,9 +1106,10 @@ impl Generations {
             dry_runs: Arc::new(Semaphore::new(DRY_RUNS_WAITING + 1)),
             held: Mutex::new(None),
             deferred: Mutex::new(None),
-            filed: AtomicBool::new(false),
+            file_sourced: AtomicBool::new(false),
             fence: OnceLock::new(),
             takes: AtomicU64::new(0),
+            handed: Mutex::new(Handed::Stood),
             unfollowed: Mutex::new(None),
             applied: AtomicU64::new(0),
             rejected: AtomicU64::new(0),
@@ -1107,21 +1136,27 @@ impl Generations {
         document: Vec<u8>,
         format: Format,
     ) -> Result<Applied, SpecRejected> {
-        self.apply_where(lead, document, format, |_| None)
+        self.apply_where(lead, document, format, true, |_| None)
     }
 
     /// [`Generations::apply_under`] where `unread` may say first, by the
     /// standing number, that the document is not applied, and that is the
     /// outcome. The lead is asked three times, under the door's lock: ahead
     /// of the document's pass, which it saves; behind it, since a pass
-    /// takes its time; and last where the store publishes, under the lock
-    /// it publishes under, since the entry waits for that lock. Where the
-    /// replica no longer leads as it did at the read, nothing is published.
+    /// takes its time; and last where the store publishes, behind the locks
+    /// its entry waits for. Where the replica no longer leads as it did at
+    /// the read, nothing is published.
+    ///
+    /// `news` says the bytes are the file as a read just found it: they
+    /// are the source's hand ([`Generations::source_stood`]). The start's
+    /// deferred bytes were handed at the start, and are no news of the
+    /// file: their entry leaves what a look showed since.
     fn apply_where(
         &self,
         lead: Option<Leading>,
         document: Vec<u8>,
         format: Format,
+        news: bool,
         unread: impl Fn(u64) -> Option<Applied>,
     ) -> Result<Applied, SpecRejected> {
         let applying = self.applying.lock();
@@ -1135,7 +1170,16 @@ impl Generations {
         if let Some(outcome) = unread(standing.0) {
             return Ok(outcome);
         }
-        let Checked { digest, next } = self.pass(standing, &document, format, Line::Claim)?;
+        let checked = self.pass(standing, &document, format, Line::Claim);
+        if news {
+            // The file as it stands now. A document the pass refuses is
+            // none that stood.
+            *self.handed.lock() = match &checked {
+                Ok(checked) => Handed::Unstood(checked.digest),
+                Err(_) => Handed::Undigested,
+            };
+        }
+        let Checked { digest, next } = checked?;
         let (standing, _) = standing;
         if let Some(outcome) = unread(standing) {
             return Ok(outcome);
@@ -1154,6 +1198,7 @@ impl Generations {
             if held.as_ref().is_none_or(|held| held.generation != standing) {
                 *held = Some(hold(standing));
             }
+            self.stands(digest);
             return Ok(Applied::Unchanged(standing));
         };
         let generation = next.generation();
@@ -1210,6 +1255,10 @@ impl Generations {
                 return Ok(false);
             }
             *held = Some(kept);
+            // Under this lock, which the hand of a replica that follows
+            // takes as well ([`Generations::shown`]): an entry and a hand
+            // stand in one order.
+            self.stands(digest);
         }
         self.applied.fetch_add(1, Ordering::Relaxed);
         info!(
@@ -1640,7 +1689,7 @@ impl Generations {
     /// store is bound. The spec calls are served and the spec's series
     /// rendered from then on.
     pub(crate) fn bound(&self) -> bool {
-        self.writable() || self.filed.load(Ordering::Relaxed) || self.held.lock().is_some()
+        self.writable() || self.file_sourced.load(Ordering::Relaxed) || self.held.lock().is_some()
     }
 
     /// Whether the spec's source takes writes: a spec store is bound.
@@ -1876,16 +1925,18 @@ impl Generations {
             return Err(SpecRejected::SecondSource);
         }
         let standing = self.standing();
-        if let Some(next) = self.pass(standing, &document, format, Line::Claim)?.next {
+        let Checked { digest, next } = self.pass(standing, &document, format, Line::Claim)?;
+        if let Some(next) = next {
             above(standing.0, next.generation())?;
         }
+        self.sourced(digest);
         *self.deferred.lock() = Some((document, format));
-        self.filed.store(true, Ordering::Relaxed);
+        self.file_sourced.store(true, Ordering::Relaxed);
         // Until the document lands a request is no decision: the unbound
         // start says so, where the start of a store with no source sheds
         // by the binding.
         if standing.0 == 0 {
-            self.store.world().spec().await_document();
+            self.store.world().spec().mark_document_awaited();
         }
         drop(applying);
         Ok(())
@@ -1904,9 +1955,9 @@ impl Generations {
 
     /// Whether the source writes now: always for a replica alone over its
     /// lease, and while the fence shows a term for one under a shared lease
-    /// ([`Generations::under`]). The file's watch asks ahead of a look, to
-    /// save the look, and the source's entry asks again under the door's
-    /// lock ([`Applied::Waits`]).
+    /// ([`Generations::under`]). A case's question: the source takes its
+    /// lead ahead of a read ([`Generations::lead`]).
+    #[cfg(test)]
     pub(crate) fn source_writes(&self) -> bool {
         self.lead().is_some()
     }
@@ -1927,11 +1978,14 @@ impl Generations {
     /// ([`Elector::at_take`](crate::elector::Elector::at_take)).
     ///
     /// The take is counted, and the file's watch reads the file behind it
-    /// as a start does, though it never moved
-    /// ([`SpecFile`](super::spec_file::SpecFile)): a leader runs what its
-    /// file says. The standing document again is no change, another one is
-    /// the next generation. The start's deferred document goes through the
-    /// source's entry here ([`Generations::deferred_now`]).
+    /// as a start does, though it never moved, while the file's document
+    /// has not stood on this replica since the file took it
+    /// ([`SpecFile`](super::spec_file::SpecFile),
+    /// [`Generations::source_stood`]): a leader runs what its file says,
+    /// and a mount that lags brings nothing older back. The standing
+    /// document again is no change, another one is the next generation.
+    /// The start's deferred document goes through the source's entry here
+    /// ([`Generations::deferred_now`]).
     pub(crate) fn at_take(&self) {
         self.takes.fetch_add(1, Ordering::Relaxed);
         self.deferred_now();
@@ -1947,18 +2001,22 @@ impl Generations {
     /// once the fence is open ([`Generations::nap`]). A replica that leads
     /// decides under no unbound generation all the same: until its first
     /// document lands a request is no decision, answered `Busy` with no
-    /// reason ([`AppliedSpec::await_document`]). A refusal is counted: the
-    /// same bytes passed at the start.
+    /// reason ([`AppliedSpec::mark_document_awaited`]).
     ///
     /// Behind a generation the replica followed, nothing is applied: the
     /// start's bytes are as old as the start, and the watch reads the file
-    /// as it stands. The bytes are let go once a generation stands.
+    /// as it stands.
+    ///
+    /// The bytes are let go once a generation stands, or once the door
+    /// refuses them. A refusal is counted, though the same bytes passed at
+    /// the start. A refused document is not handed again at the next
+    /// opening: the watch's next look reads the file as it stands.
     pub(crate) fn deferred_now(&self) {
         let Some((document, format)) = self.deferred.lock().clone() else {
             return;
         };
         let followed = |standing| (standing != 0).then_some(Applied::Unchanged(standing));
-        match self.apply_where(self.lead(), document, format, followed) {
+        match self.apply_where(self.lead(), document, format, false, followed) {
             // No term shows, or the lead ended under the pass: it waits on.
             Ok(Applied::Waits(_)) => return,
             Ok(Applied::Generation(_) | Applied::Unchanged(_)) => {}
@@ -1991,10 +2049,71 @@ impl Generations {
     }
 
     /// The takes this replica made so far. The file's watch reads its file
-    /// behind each, as a start does, though the file never moved: a leader
-    /// runs what its file says.
+    /// behind one, as a start does, though the file never moved, while its
+    /// document has not stood on this replica since the file took it
+    /// ([`Generations::source_stood`]).
     pub(crate) fn takes(&self) -> u64 {
         self.takes.load(Ordering::Relaxed)
+    }
+
+    /// Whether the document the source handed last stood on this replica
+    /// since it was handed: applied here, or told by a leader while the
+    /// replica followed, at its join or later. A door whose source handed
+    /// none has none that waits.
+    ///
+    /// The source hands a document at its start, at a leader's look, and
+    /// at the look of a replica that follows, which hands the digest alone
+    /// ([`Generations::shown`]). So the door holds the order of the file's
+    /// moves and of the generations. A document that has not stood since
+    /// its file took it is the newer word, a rollout's new file or a
+    /// rollback: the watch reads the file behind a take though it never
+    /// moved. One that stood since is the standing document or an older
+    /// one, a mount that lags: the file is left for its next move, and a
+    /// take brings nothing older back.
+    pub(crate) fn source_stood(&self) -> bool {
+        *self.handed.lock() == Handed::Stood
+    }
+
+    /// The file as a replica that follows found it at a look: the door is
+    /// told what the file holds, by the digest of its document, and
+    /// applies nothing. None of the bytes are kept: a take reads the file
+    /// again, under its own term, through the source's entry. `None` is a
+    /// file the look could not read, and a document that does not parse
+    /// has no digest either: both count as a document that never stood,
+    /// and the take tells them. A replica that follows says nothing of its
+    /// file. A leader's look that could read no file says so here as well,
+    /// behind its own telling of it.
+    ///
+    /// The digest is compared with the standing generation's under the
+    /// lock of the bytes held, which a generation enters under: the hand
+    /// and an entry stand in one order, whichever thread runs first.
+    pub(crate) fn shown(&self, document: Option<&[u8]>, format: Format) {
+        let digest = document
+            .and_then(|document| holding(|| digested(document, format)).ok())
+            .map(|(_, digest)| digest);
+        let _entry = self.held.lock();
+        let standing = self.standing().1;
+        *self.handed.lock() = match digest {
+            Some(digest) if standing == Some(digest) => Handed::Stood,
+            Some(digest) => Handed::Unstood(digest),
+            None => Handed::Undigested,
+        };
+    }
+
+    /// The source handed a document that passed, by its digest: it has
+    /// not stood here since.
+    fn sourced(&self, digest: Digest) {
+        *self.handed.lock() = Handed::Unstood(digest);
+    }
+
+    /// A document stands on this replica, by its digest: the source's last
+    /// one stood, where it is that one. The caller holds the lock of the
+    /// bytes held.
+    fn stands(&self, digest: Digest) {
+        let mut handed = self.handed.lock();
+        if *handed == Handed::Unstood(digest) {
+            *handed = Handed::Stood;
+        }
     }
 
     /// A leader's generation as the replication stream tells it, passed
@@ -5946,6 +6065,137 @@ pub(crate) mod tests {
         );
     }
 
+    /// Held bytes of another generation are not the standing one's. Where
+    /// another writer's generation runs, an event at the standing number
+    /// over the bytes this door holds is no word of what stands: it is
+    /// refused as a number that is not above.
+    #[test]
+    fn an_event_over_the_held_bytes_of_another_generation_is_not_the_standing_one() {
+        let (store, door) = generations();
+        assert_eq!(yaml(&door, RANDOM), Ok(Applied::Generation(1)));
+        let mut next: PolicySpec = serde_yaml::from_str(LEAST_LOAD).expect("a document");
+        next.generation = 2;
+        store
+            .apply(AppliedSpec::validate(&next).expect("a valid document"))
+            .expect("above the standing one");
+        // A leader whose generation 2 runs the bytes this door holds under 1.
+        let (_, leader) = generations();
+        yaml(&leader, LEAST_LOAD).expect("a valid document");
+        yaml(&leader, RANDOM).expect("a changed document");
+        followed(&door, &sent(&leader)).expect_err("not above the standing one");
+        assert_eq!(standing(&store).0, 2);
+    }
+
+    /// The document the source handed last stood on its replica once it was
+    /// applied here or told by a leader, and at no other time: not while
+    /// it only passed, and not while a leader told another one.
+    #[test]
+    fn the_sources_document_stood_once_it_was_applied_or_told() {
+        let (_, alone) = generations();
+        assert!(alone.source_stood(), "no source handed one");
+        yaml(&alone, RANDOM).expect("a valid document");
+        assert!(alone.source_stood(), "applied here");
+
+        let (_, door) = generations();
+        door.defer(RANDOM.into(), Format::Yaml)
+            .expect("a valid document");
+        assert!(!door.source_stood(), "passed, never applied");
+        // A leader tells another document, then the source's own.
+        let (_, leader) = generations();
+        yaml(&leader, LEAST_LOAD).expect("a valid document");
+        followed(&door, &sent(&leader)).expect("above no generation");
+        assert!(!door.source_stood(), "another document than the source's");
+        yaml(&leader, RANDOM).expect("a changed document");
+        followed(&door, &sent(&leader)).expect("above its own");
+        assert!(door.source_stood(), "told while it followed");
+
+        let (_, taken) = generations();
+        taken
+            .defer(RANDOM.into(), Format::Yaml)
+            .expect("a valid document");
+        taken.at_take();
+        assert!(taken.source_stood(), "applied at its first take");
+
+        // The source's later word replaces its start's: a file that moves
+        // to the document its replica follows holds what stands.
+        let (_, moved) = generations();
+        moved
+            .defer(LEAST_LOAD.into(), Format::Yaml)
+            .expect("a valid document");
+        followed(&moved, &sent(&leader)).expect("above no generation");
+        assert!(!moved.source_stood(), "another document than the source's");
+        assert!(matches!(yaml(&moved, RANDOM), Ok(Applied::Unchanged(2))));
+        assert!(moved.source_stood(), "the source handed what stands");
+    }
+
+    /// What the door knows of a file that a replica that follows shows it,
+    /// by the order of the hand and of the generations. Shown ahead of the
+    /// generation that brings its document, the document stands once that
+    /// generation enters, and stays stood when its leader replaces it: a
+    /// mount that lags. Shown behind the generation that replaced it, it
+    /// has not stood since: a rollback. A file with no document never
+    /// stood. The door applies nothing of a hand and keeps no byte of it.
+    #[test]
+    fn a_shown_document_stood_by_the_order_of_its_hand_and_the_generations() {
+        let (store, door) = generations();
+        let (_, leader) = generations();
+        door.shown(Some(RANDOM.as_bytes()), Format::Yaml);
+        assert!(!door.source_stood(), "ahead of its generation");
+        yaml(&leader, RANDOM).expect("a valid document");
+        followed(&door, &sent(&leader)).expect("above no generation");
+        assert!(door.source_stood(), "its generation entered");
+        yaml(&leader, LEAST_LOAD).expect("a changed document");
+        followed(&door, &sent(&leader)).expect("above its own");
+        assert!(
+            door.source_stood(),
+            "replaced by its leader: a mount that lags"
+        );
+        door.shown(Some(RANDOM.as_bytes()), Format::Yaml);
+        assert!(
+            !door.source_stood(),
+            "behind the generation that replaced it"
+        );
+        door.shown(Some(LEAST_LOAD.as_bytes()), Format::Yaml);
+        assert!(door.source_stood(), "the document that stands");
+        door.shown(None, Format::Yaml);
+        assert!(!door.source_stood(), "a file no look could read");
+        door.shown(Some(LEAST_LOAD.as_bytes()), Format::Yaml);
+        assert!(door.source_stood());
+        door.shown(Some(b"{ no policy"), Format::Yaml);
+        assert!(!door.source_stood(), "a file that does not parse");
+        assert_eq!(standing(&store).0, 2, "a hand applies nothing");
+        assert_eq!(door.counts(), applied(2, 0));
+        assert_eq!(
+            door.document(0).expect("held").document,
+            LEAST_LOAD.as_bytes()
+        );
+    }
+
+    /// The hand of a replica that follows waits for the lock a generation
+    /// enters under, the one of the bytes held: a hand and an entry stand
+    /// in one order, whichever thread runs first.
+    #[test]
+    fn a_hand_waits_for_the_lock_a_generation_enters_under() {
+        let (_, door) = generations();
+        let entry = door.held.lock();
+        thread::scope(|scope| {
+            let (done, lands) = mpsc::channel();
+            let door = &door;
+            scope.spawn(move || {
+                door.shown(Some(RANDOM.as_bytes()), Format::Yaml);
+                done.send(()).expect("the case waits");
+            });
+            let early = lands.recv_timeout(Duration::from_millis(200));
+            assert!(early.is_err(), "the hand waits for the lock");
+            assert!(door.source_stood(), "nothing is written ahead of it");
+            drop(entry);
+            lands
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the hand lands behind the entry");
+        });
+        assert!(!door.source_stood());
+    }
+
     /// A door with a spec store bound follows no document: no standby
     /// follows beside a store, and the refusal names the document.
     #[test]
@@ -5965,9 +6215,9 @@ pub(crate) mod tests {
 
     /// Under a shared lease the door holds who writes: its source, while
     /// the replica's fence shows a term. A document the source hands while
-    /// the replica does not lead is not read, whatever its watch saw ahead
-    /// of a look, and nothing is counted. The log writes there all the
-    /// same.
+    /// the replica does not lead is not read, whether it runs or not and
+    /// whatever its watch saw ahead of a look, and nothing is counted. The
+    /// log writes there all the same.
     #[test]
     fn under_a_shared_lease_the_source_writes_while_its_replica_leads() {
         let (store, door) = generations();
@@ -5983,6 +6233,11 @@ pub(crate) mod tests {
         assert!(elector.release().expect("a release"), "it held the lease");
         assert_eq!(yaml(&door, LEAST_LOAD), Ok(Applied::Waits(1)));
         assert_eq!(standing(&store).0, 1);
+        assert_eq!(door.counts(), applied(1, 0));
+        // One that does not run waits all the same: it is not read, so it
+        // is not refused.
+        let unrun = LEAST_LOAD.replace("healthy", "no-such-stage");
+        assert_eq!(yaml(&door, unrun), Ok(Applied::Waits(1)));
         assert_eq!(door.counts(), applied(1, 0));
         let (_, leader) = generations();
         yaml(&leader, LEAST_LOAD).expect("a valid document");
@@ -6161,11 +6416,21 @@ pub(crate) mod tests {
         assert!(door.bound(), "a source all the same");
     }
 
-    /// A fence that closes while the entry waits for a lock publishes
-    /// nothing: the store asks the last word under the lock it publishes
-    /// under, and the standing generation stays.
-    #[test]
-    fn a_fence_that_closes_while_the_entry_waits_for_a_lock_publishes_nothing() {
+    /// The lock a case holds while an entry of the door's own source waits
+    /// behind it.
+    enum Locked {
+        /// The door's, of the held bytes: the entry has passed both of the
+        /// door's reads of the fence and waits in the door.
+        Held,
+        /// The store's last, of the loads, as a load's write holds it: the
+        /// entry waits inside the store.
+        Loads,
+    }
+
+    /// An entry under a lead whose fence closes by the clock while the
+    /// entry waits behind `locked`: nothing is published, the standing
+    /// generation stays and no bytes are kept.
+    fn a_fence_closes_behind(locked: Locked) {
         let deadline = Duration::from_millis(800);
         let store = Arc::new(MemoryStore::new());
         let door = Generations::new(Arc::clone(&store), stock());
@@ -6173,14 +6438,15 @@ pub(crate) mod tests {
         door.under(elector.fence());
         elector.tick(Instant::now()).expect("a take");
         assert!(door.source_writes());
-        // The case holds the lock of the held bytes: the entry passes both
-        // reads of the fence under the door's lock and waits behind it.
-        let gate = door.held.lock();
+        let (held, loads) = match locked {
+            Locked::Held => (Some(door.held.lock()), None),
+            Locked::Loads => (None, Some(store.holding_loads())),
+        };
         let outcome = thread::scope(|scope| {
             let entering = scope.spawn(|| yaml(&door, RANDOM));
             thread::sleep(deadline + Duration::from_millis(400));
             assert!(!door.source_writes(), "the fence closed by the clock");
-            drop(gate);
+            drop((held, loads));
             entering.join().expect("the entry's thread")
         });
         assert_eq!(outcome, Ok(Applied::Waits(0)));
@@ -6189,32 +6455,20 @@ pub(crate) mod tests {
         assert!(door.held.lock().is_none(), "no bytes are kept");
     }
 
+    /// A fence that closes while the entry waits for the door's lock of
+    /// the held bytes publishes nothing: the store asks its last word
+    /// behind the locks its entry waits for.
+    #[test]
+    fn a_fence_that_closes_while_the_entry_waits_for_a_lock_publishes_nothing() {
+        a_fence_closes_behind(Locked::Held);
+    }
+
     /// The store asks its last word behind every lock its entry waits for.
     /// An entry that waits for the loads' lock, the last one, while the
-    /// fence closes publishes nothing, and the standing generation stays.
+    /// fence closes publishes nothing.
     #[test]
     fn a_fence_that_closes_while_the_store_waits_for_its_last_lock_publishes_nothing() {
-        let deadline = Duration::from_millis(800);
-        let store = Arc::new(MemoryStore::new());
-        let door = Generations::new(Arc::clone(&store), stock());
-        let mut elector = election_under(deadline);
-        door.under(elector.fence());
-        elector.tick(Instant::now()).expect("a take");
-        assert!(door.source_writes());
-        // The case holds the loads' lock, as a load's write does: the entry
-        // passes the door's reads of the fence and waits inside the store.
-        let gate = store.holding_loads();
-        let outcome = thread::scope(|scope| {
-            let entering = scope.spawn(|| yaml(&door, RANDOM));
-            thread::sleep(deadline + Duration::from_millis(400));
-            assert!(!door.source_writes(), "the fence closed by the clock");
-            drop(gate);
-            entering.join().expect("the entry's thread")
-        });
-        assert_eq!(outcome, Ok(Applied::Waits(0)));
-        assert_eq!(standing(&store), (0, None));
-        assert_eq!(door.counts(), applied(0, 0));
-        assert!(door.held.lock().is_none(), "no bytes are kept");
+        a_fence_closes_behind(Locked::Loads);
     }
 
     /// The standing document passed again under a lead that ends changes

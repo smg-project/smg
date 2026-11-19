@@ -3590,7 +3590,7 @@ pub struct AppliedSpec {
     pairing: Pairing,
     lists: ViewLists,
     /// A start's document waits for the first lead of this store's
-    /// replica ([`AppliedSpec::await_document`]): set on the unbound start
+    /// replica ([`AppliedSpec::mark_document_awaited`]): set on the unbound start
     /// alone, and gone with it at the first publication.
     #[cfg(feature = "controller")]
     awaited: AtomicBool,
@@ -3669,12 +3669,12 @@ impl AppliedSpec {
     /// generation: it takes no number and is told to no standby, and it
     /// goes with the unbound start at the first publication.
     #[cfg(feature = "controller")]
-    pub(crate) fn await_document(&self) {
+    pub(crate) fn mark_document_awaited(&self) {
         self.awaited.store(true, atomic::Ordering::Relaxed);
     }
 
     /// Whether a start's document waits for this generation's place
-    /// ([`AppliedSpec::await_document`]).
+    /// ([`AppliedSpec::mark_document_awaited`]).
     #[cfg(feature = "controller")]
     pub(crate) fn awaits_document(&self) -> bool {
         self.awaited.load(atomic::Ordering::Relaxed)
