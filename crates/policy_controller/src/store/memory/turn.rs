@@ -37,7 +37,7 @@
 //! work by an unwind: what it left is the next take's.
 //!
 //! A door in process has no deciding thread ([`crate::door::Door`]): each
-//! caller is at work at its model's file for its one decision, and leaves
+//! caller is at work at its seat's file for its one decision, and leaves
 //! that work as a decider that waits for a job does. A report said
 //! through the door does not wait at a full ring: the door keeps it
 //! beside the ring, and the caller at work hands it on as it leaves.

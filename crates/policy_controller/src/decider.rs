@@ -1,8 +1,12 @@
 //! A decider's name: how a stage kind that keeps state a decider finds it.
 //!
-//! A host decides a model's requests one at a time on one of its deciders,
-//! and whoever decides for a decider holds its turn: the decider's own
-//! thread, or another thread the host lets take the turn. What a stage kind
+//! A host decides on its deciders, one decision at a time on each. The
+//! served controller gives a model's requests one decider. A door in
+//! process gives a calling thread one, and a model's requests one where
+//! their profile holds a stage that keeps state a decider
+//! ([`crate::door::Door`]). Whoever decides for a decider holds its turn:
+//! the decider's own thread, or another thread the host lets take the
+//! turn. What a stage kind
 //! keeps a decider (a WebAssembly plugin's instance) is that decider's,
 //! behind its turn, whichever thread holds it. A stage's calls and the
 //! lifecycle's carry no handle of the host, so the holder of a turn says

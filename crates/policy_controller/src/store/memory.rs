@@ -13,7 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, Guard};
 use parking_lot::{Mutex, MutexGuard};
 use rustc_hash::FxHashMap;
 
@@ -842,6 +842,13 @@ impl MemoryStore {
     /// handed here stays whole until `decide` returns.
     pub fn deciding<R>(&self, decide: impl FnOnce(&World) -> R) -> R {
         decide(&self.world.load())
+    }
+
+    /// The load of [`MemoryStore::deciding`], held by a decision that asks
+    /// a question of the world before it decides under it: the same world
+    /// for both, whole until the hold is dropped.
+    pub(crate) fn loaded(&self) -> Guard<Arc<World>> {
+        self.world.load()
     }
 
     /// `at` in the rows' clock: microseconds since the store's origin.
