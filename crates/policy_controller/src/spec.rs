@@ -6883,7 +6883,10 @@ mod tests {
     /// profile of each stock stage decides alike over rows that carry their
     /// requests in flight and over rows that read otherwise with the counts
     /// in a table lent beside them. A stage that reads a row's own field
-    /// reads another count beside lent rows, and parts here.
+    /// reads another count beside lent rows, and parts here. The same
+    /// lists hold each stock stage to its word on what the gateways
+    /// report of leases
+    /// ([`Filter::refuses_by_reports`](crate::Filter::refuses_by_reports)).
     #[test]
     fn every_catalog_stage_reads_a_lent_count_as_a_rows_own() {
         use crate::{counts::tests::Lent, view::Identity, Health, PoolFacts, Scratch, WorkerId};
@@ -6989,6 +6992,11 @@ mod tests {
             // The counts part the rows: the fewest requests answer by them.
             let moved = written != run(forms, &bare, false);
             assert!(moved || !forms[0].contains("least-requests"), "{forms:?}");
+            // No stock stage takes a silent stage's side: each says it
+            // refuses by nothing a gateway reports of leases, so a decision
+            // under it applies nothing first.
+            let (_, _, applies_first) = build(forms).reads_for("m", Phase::Single);
+            assert!(!applies_first, "a stock stage says no line: {forms:?}");
         }
     }
 }

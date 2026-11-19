@@ -147,6 +147,11 @@ pub(crate) struct Taken<'a, A> {
     /// The pins of record lent to the decision, where its host keeps them:
     /// its engine asks them for a key its own table holds no pin of.
     pub(crate) pins: Option<&'a dyn PinSource>,
+    /// The place of the decider that decides, at its file of leases: a
+    /// decision whose profile holds a stage that may refuse by a report
+    /// of leases applies what waits at the files of leases through it.
+    /// None in process, where no file's frames wait for a look.
+    pub(crate) place: Option<&'a AtWork>,
 }
 
 impl<'a, A> Taken<'a, A> {
@@ -325,6 +330,10 @@ pub(crate) fn decide_in<A: Asked>(
 /// sides. A side with rows that the gateway's own word leaves none is shed
 /// under that constraint's name, as a single's pool is. A pick's booking
 /// holds both sides, each worker's count beside its own pool's row.
+///
+/// A pair whose profile on either side holds a stage that may refuse on a
+/// count it is shown is decided behind an apply of what waits at the files
+/// of leases, as a single is ([`hand`]), where its decider lent its place.
 #[cfg(feature = "controller")]
 pub(crate) fn pair_in<A: Asked>(
     world: &World,
@@ -338,6 +347,7 @@ pub(crate) fn pair_in<A: Asked>(
         now,
         left,
         pins,
+        place,
     } = *taken;
     let spec = world.spec();
     let engine = spec.engine();
@@ -349,8 +359,13 @@ pub(crate) fn pair_in<A: Asked>(
     // prefill's profile alone and the decode lookup carries the pair's
     // decode profile: both sides are built by one ask, so it takes the
     // column where either reads it.
-    let (prefill, _) = engine.reads_for(model, Phase::Prefill);
-    let (decode, _) = engine.reads_for(model, Phase::Decode);
+    let (prefill, _, prefill_by_reports) = engine.reads_for(model, Phase::Prefill);
+    let (decode, _, decode_by_reports) = engine.reads_for(model, Phase::Decode);
+    // A stage of either side that may refuse by a report of leases reads
+    // what a hand would have applied in place, ahead of both sides' rows.
+    if let Some(place) = place.filter(|_| prefill_by_reports || decode_by_reports) {
+        place.apply_waiting();
+    }
     let ask = Ask {
         gateway,
         now,
@@ -674,6 +689,11 @@ type Read<'a> = (
 /// ([`Engine::named_for`](crate::framework::Engine::named_for)). The
 /// naming is the store's one reader of its index: the column it builds
 /// holds a row's age and no holder.
+///
+/// A request whose profile holds a stage that may refuse by a report of
+/// leases ([`Filter::refuses_by_reports`](crate::framework::Filter::refuses_by_reports))
+/// is handed its rows behind an apply of what waits at the files of leases
+/// ([`AtWork::apply_waiting`]), where its decider lent its place.
 pub(crate) fn hand<A: Asked, R>(
     world: &World,
     taken: &Taken<'_, A>,
@@ -693,13 +713,21 @@ pub(crate) fn hand<A: Asked, R>(
         now,
         left,
         pins,
+        place,
     } = *taken;
     let spec = world.spec();
     let (model, phase) = (request.model(), request.phase());
     let engine = spec.engine();
-    // What the decision's profile reads, and whether it shows its rows to
-    // a plugin.
-    let (needs, shown) = engine.reads_for(model, phase);
+    // What the decision's profile reads, whether it shows its rows to a
+    // plugin, and whether a stage of it may refuse by a report of leases.
+    let (needs, shown, by_reports) = engine.reads_for(model, phase);
+    // Such a stage reads what a hand would have applied in place: what
+    // the gateways reported is applied first, at this decider's own file
+    // and at each other file that shows a watch. A decision under no such
+    // stage reads no place.
+    if let Some(place) = place.filter(|_| by_reports) {
+        place.apply_waiting();
+    }
     // A profile whose own stages read the column is handed the rows the
     // store names in the column's place, and no column: a stage that
     // reads holders is fed them. The sample caps the rows named, and a
@@ -1642,6 +1670,12 @@ impl Door {
                     micros => Duration::from_micros(micros.into()),
                 },
                 pins: Some(&pins),
+                // No place is lent in process: no file's frames wait
+                // for a look. What is said of a lease is applied at once
+                // where no caller decides at its file, and a file whose
+                // caller decides is that caller's, as a decider's at
+                // work is.
+                place: None,
             };
             let order = || self.order(&world, at, term, &taken, buffers);
             let decided = catch_unwind(AssertUnwindSafe(order));
@@ -2602,6 +2636,31 @@ pub(crate) mod tests {
         assert_eq!(on_file, more, "a report is the deciding thread's to apply");
         assert!(lease.is_some(), "the held request has its lease");
         assert_eq!(LeasesStore::live(&*store, GATEWAY), 1, "its lease alone");
+    }
+
+    /// A door's caller keeps no watch over its file. No thread of a door
+    /// looks at a file again, so no report is left for a look: with a
+    /// lease on file the file shows no watch while a decision stands and
+    /// none behind it, and what is said of a lease then is applied before
+    /// its report returns.
+    #[test]
+    fn a_doors_file_shows_no_watch_while_a_decision_stands_or_behind_it() {
+        let store = fleet(1);
+        let door = Arc::new(Door::new(Arc::clone(&store)));
+        let (first, _) = leased(&door, b"r-1", 7);
+        let ends = Ends::over(&store);
+        let held = held(&door);
+        ends.stands("pick");
+        let deciding = store.watches();
+        ends.go();
+        ends.stands("issue");
+        ends.go();
+        let second = held.join().expect("the held decision's thread");
+        assert!(second.is_some(), "the held request has its lease");
+        assert_eq!(deciding, 0, "a lease is on file and a caller decides");
+        assert_eq!(store.watches(), 0, "two leases are on file, no caller");
+        door.report(GATEWAY, first, gone());
+        assert_eq!(LeasesStore::live(&*store, GATEWAY), 1, "applied as said");
     }
 
     /// What is said of one lease reaches its file in the order said, past

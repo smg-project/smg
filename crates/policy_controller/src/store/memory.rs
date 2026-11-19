@@ -49,7 +49,7 @@ mod blocks;
 mod turn;
 
 use blocks::{Blocks, Minted};
-pub use turn::{AtWork, Hand};
+pub use turn::{AtWork, Hand, Watch};
 
 /// Membership changes kept for watchers; a watcher further behind snapshots
 /// again (the registry's broadcast is sized the same today).

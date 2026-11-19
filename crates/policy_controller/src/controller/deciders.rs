@@ -65,8 +65,11 @@
 //! decision reads, at its issue, and once more before the decider
 //! waits on an empty queue. So a decision reads its own file
 //! behind everything handed to it, and a row another file books lags by
-//! that file's next take. Where a file's decider waits for a job the
-//! session applies what it hands. A lease leaves its file where its
+//! that file's next take. Where a file's decider waits for a job and
+//! its file holds no lease, the session applies what it hands. While a
+//! lease stands there the decider keeps its watch and applies what is
+//! handed at its next look ([`Deciding::wait`]). A controller's only
+//! decider keeps none. A lease leaves its file where its
 //! answer does not leave (step 7), at its gateway's word (a `Session`'s
 //! `Completed` or `Released` frame, the gateway's own end) or at its
 //! dispatch deadline: each issue ends the leases at the head of its
@@ -151,7 +154,7 @@ use std::{
     panic::{catch_unwind, AssertUnwindSafe},
     sync::{
         atomic::{AtomicU64, Ordering},
-        mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError},
+        mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError},
         Arc, OnceLock,
     },
     thread,
@@ -178,7 +181,9 @@ use crate::{
     framework::{release, Engine},
     lease::{Lease, Lifecycle, ReleaseReason},
     proto::{self, busy::Reason},
-    store::{leases::DISPATCH_TTL, AtWork, GatewayId, LeaseRefused, MemoryStore, Said, World},
+    store::{
+        leases::DISPATCH_TTL, AtWork, GatewayId, LeaseRefused, MemoryStore, Said, Watch, World,
+    },
     view::{fingerprint, PinSource},
 };
 
@@ -267,6 +272,25 @@ impl Counts {
 /// design's cost of a decision a full queue is one cross-node budget of
 /// waiting, and a request behind it is told at once to decide locally.
 pub(crate) const QUEUE_DEPTH: usize = 128;
+
+/// The shortest wait of a decider with no job at hand before it looks at
+/// its file of leases again, while a lease stands on the file
+/// ([`Deciding::wait`]): its wait behind a job and behind a look that
+/// applied a frame. The lag it buys: while a file's frames flow, a frame
+/// a session hands while the file's decider waits for a job is applied
+/// within one such wait and its thread's wake, and another decider's
+/// decision reads what its apply writes that much later.
+const LOOK_FLOOR: Duration = Duration::from_millis(1);
+
+/// The longest such wait: the wait doubles behind each look that applied
+/// no frame, up to this. The lag it buys: the first frame a session hands
+/// to a file that was quiet is applied within this wait and its thread's
+/// wake, and another decider's decision reads what its apply writes that
+/// much later. For that a decider with a lease on a quiet file and no
+/// job wakes some sixty times a second, where the floor alone would wake
+/// it a thousand times; one whose file holds no lease wakes for a job
+/// alone.
+const LOOK_CAP: Duration = Duration::from_millis(16);
 
 /// The clock a decider reads, twice a decision.
 pub(crate) type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
@@ -549,7 +573,8 @@ struct Deciding {
     marked: Option<u64>,
     shared: Arc<Shared>,
     /// Its seat at its own file of leases, taken at its first job
-    /// ([`MemoryStore::at_work`]): at work while it has a job at hand.
+    /// ([`MemoryStore::at_work`]): at work while it has a job at hand, and
+    /// on its watch while a lease stands on the file.
     working: Option<AtWork>,
     /// Its name among the host's deciders, which its thread acts as while
     /// it decides ([`Decider::enter`]): none past the names a host gives.
@@ -563,16 +588,17 @@ impl Deciding {
     /// its work, by each request it takes, refused or decided, where the
     /// file's turn is free, at each issue, and behind the give-up of an
     /// answer its stream refused. It leaves that work before it waits on
-    /// an empty queue: what is handed meanwhile is applied by the session
-    /// that hands it.
+    /// an empty queue, and keeps its watch over the file while a lease
+    /// stands on it ([`Self::wait`]): what is handed meanwhile is still
+    /// its own to apply. A controller's only decider keeps no watch: what
+    /// is handed while it waits is applied by its hand.
     fn run(mut self, jobs: &Receiver<Job>) {
         loop {
             let job = match jobs.try_recv() {
                 Ok(job) => job,
                 Err(TryRecvError::Disconnected) => break,
                 Err(TryRecvError::Empty) => {
-                    self.rest();
-                    let Ok(job) = jobs.recv() else { break };
+                    let Some(job) = self.wait(jobs) else { break };
                     job
                 }
             };
@@ -615,11 +641,74 @@ impl Deciding {
         self.rest();
     }
 
-    /// Leaves the decider's work at the leases' file. What was handed
-    /// behind its last take is applied here, and the engine's lifecycle
-    /// calls run with it, outside any decision. A call that panics is
-    /// held where it is made ([`lifecycle::tells`]'s word to the engine):
-    /// it costs no request and ends no decider.
+    /// Waits for the next job on an empty queue; `None` once the queue's
+    /// last handle is dropped. The decider leaves its work at its file
+    /// first ([`Self::look`]). While a lease stands on the file it keeps
+    /// its watch: it waits a period at most and looks again, so a frame
+    /// handed on a lull is applied on this thread, and the session that
+    /// hands it passes it on unapplied. The period is [`LOOK_FLOOR`]
+    /// behind a job and behind a look that applied a frame, since a file
+    /// whose frames flow is not quiet, and twice the last behind a look
+    /// that applied none, up to [`LOOK_CAP`]: a quiet file costs its
+    /// decider few wakes. With no lease on file it waits with no bound: a
+    /// frame handed there is applied by its hand.
+    ///
+    /// A controller's only decider keeps no watch: it rests and waits
+    /// with no bound. A session applies in place only while a decider
+    /// has no job. With one decider the watch would move no apply off a
+    /// thread that has work, and a wait under a period costs a decision
+    /// more than a wait with no bound. The count read here does not
+    /// change under a decider: a store's files are laid where it is
+    /// built ([`MemoryStore::with_deciders`]), before a thread shares it.
+    fn wait(&mut self, jobs: &Receiver<Job>) -> Option<Job> {
+        if self.reads.store.deciders() == 1 {
+            self.rest();
+            return jobs.recv().ok();
+        }
+        self.wait_by(|within| match within {
+            Some(period) => jobs.recv_timeout(period),
+            None => jobs.recv().map_err(RecvTimeoutError::from),
+        })
+    }
+
+    /// [`Self::wait`] over `receive`, its queue's receive: within the
+    /// period it is handed, and with no bound where it is handed none.
+    fn wait_by(
+        &mut self,
+        mut receive: impl FnMut(Option<Duration>) -> Result<Job, RecvTimeoutError>,
+    ) -> Option<Job> {
+        let mut found = self.look();
+        let mut period = LOOK_FLOOR;
+        loop {
+            let within = (found != Watch::Ended).then_some(period);
+            match receive(within) {
+                Ok(job) => return Some(job),
+                Err(RecvTimeoutError::Disconnected) => return None,
+                Err(RecvTimeoutError::Timeout) => {
+                    found = self.look();
+                    period = match found {
+                        Watch::Fed => LOOK_FLOOR,
+                        Watch::Quiet | Watch::Ended => (2 * period).min(LOOK_CAP),
+                    };
+                }
+            }
+        }
+    }
+
+    /// A look at the decider's file with no job at hand
+    /// ([`AtWork::look`]): it leaves its work there and says what stands
+    /// of its watch, none before its first job. What was handed behind
+    /// its last take is applied here, and the engine's lifecycle calls
+    /// run with it, outside any decision. A call that panics is held
+    /// where it is made ([`lifecycle::tells`]'s word to the engine): it
+    /// costs no request and ends no decider.
+    fn look(&mut self) -> Watch {
+        self.working.as_mut().map_or(Watch::Ended, AtWork::look)
+    }
+
+    /// Leaves the decider's work at the leases' file and ends its watch:
+    /// the thread owes the file no further look. What was handed behind
+    /// its last take is applied here, as at a look.
     fn rest(&mut self) {
         if let Some(seat) = &mut self.working {
             seat.rest();
@@ -794,7 +883,7 @@ impl Deciding {
         // a key its own table holds no pin of, as after an apply of a new
         // generation.
         let pins = StorePins { store, now };
-        let taken = taken.lent(&pins);
+        let taken = taken.lent(&pins).placed(self.working.as_ref());
         let (buffers, own) = (&mut self.buffers, counts.part(self.index));
         // One load of the world for the decision and for its lease: the
         // lease books the count that load laid beside its target's row,
@@ -957,6 +1046,7 @@ impl<'a> Taken<'a, Checked> {
             now,
             left,
             pins: None,
+            place: None,
         })
     }
 
@@ -966,6 +1056,11 @@ impl<'a> Taken<'a, Checked> {
             pins: Some(pins),
             ..self
         }
+    }
+
+    /// The request with its decider's place at the leases' files.
+    fn placed(self, place: Option<&'a AtWork>) -> Self {
+        Self { place, ..self }
     }
 
     /// The time since the request was taken at `later`, a read of the
@@ -1027,7 +1122,7 @@ pub(crate) mod tests {
 
     use super::{
         watched, Buffers, Clock, Counts, Deciders, Deciding, Job, Part, Reads, Refused, Taken,
-        PARTS,
+        LOOK_CAP, LOOK_FLOOR, PARTS,
     };
     use crate::{
         builtins::Random,
@@ -1067,15 +1162,17 @@ pub(crate) mod tests {
     const FENCED: Duration = Duration::from_secs(1_801);
 
     /// Waits until what a handed frame changes shows, [`PATIENCE`] at
-    /// most. The frame's file applies it by its decider as that leaves
-    /// its work, or by the hand: a case that reads at once reads ahead of
-    /// a decider still at work.
+    /// most. The frame's file applies it by its decider, as that leaves
+    /// its work or at its next look, or by the hand: a case that reads at
+    /// once reads ahead of a decider still at work, or of its look. A
+    /// case waits by it too for what a decider shows behind its answer:
+    /// its watch, or that it left its work.
     pub(crate) async fn settled(mut shows: impl FnMut() -> bool) {
         let since = Instant::now();
         while !shows() {
             assert!(
                 since.elapsed() < PATIENCE,
-                "a handed frame waits on no lull"
+                "what the case waits for shows within a decider's look"
             );
             tokio::task::yield_now().await;
         }
@@ -1163,12 +1260,39 @@ pub(crate) mod tests {
         applied(&document)
     }
 
+    /// The `random` preset as generation 1 with the case's picker, laid
+    /// under `name`, in its profile's pick.
+    fn picking(
+        name: &'static str,
+        picker: impl Fn() -> Box<dyn Picker> + Send + Sync + 'static,
+    ) -> AppliedSpec {
+        let mut catalog = Catalog::builtin();
+        catalog.picker(name, picker).expect("a free name");
+        let mut document = PolicySpec::preset("random").expect("a preset of this build");
+        let profile = document.profiles.get_mut("random");
+        profile.expect("the preset's profile").pick = name.into();
+        let digest = document.digest().expect("the document digests");
+        AppliedSpec::validate_digested(&document, digest, &catalog)
+            .expect("the catalog holds the stage")
+    }
+
     /// The member `name`, serving `model` in `role` and stating `wires`,
     /// ready: written again where it stood, with its status as it was.
     fn ready(
         store: &MemoryStore,
         name: &str,
         model: &str,
+        role: Role,
+        wires: WireModes,
+    ) -> WorkerId {
+        serving(store, name, &[model], role, wires)
+    }
+
+    /// [`ready`] for a member that serves each of `models`.
+    fn serving(
+        store: &MemoryStore,
+        name: &str,
+        models: &[&str],
         role: Role,
         wires: WireModes,
     ) -> WorkerId {
@@ -1179,7 +1303,7 @@ pub(crate) mod tests {
             incarnation: 1,
             role,
             wire_modes: wires,
-            models: vec![model.to_owned()],
+            models: models.iter().map(|&model| model.to_owned()).collect(),
             dp_size: 1,
             max_running: Some(4),
             ..WorkerFacts::default()
@@ -2660,6 +2784,628 @@ pub(crate) mod tests {
         assert_eq!(Decider::acting(), None);
     }
 
+    /// The `random` picker, keeping the name of the thread each release of
+    /// a lease is told on.
+    #[derive(Debug)]
+    struct Threads(Arc<Mutex<Vec<Option<String>>>>);
+
+    impl Lifecycle for Threads {
+        fn on_released(&self, _: &Lease, _: ReleaseReason) {
+            let name = thread::current().name().map(str::to_owned);
+            self.0.lock().push(name);
+        }
+    }
+
+    impl Picker for Threads {
+        fn name(&self) -> &'static str {
+            "threads"
+        }
+
+        fn pick(
+            &self,
+            facts: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            scores: &[f32],
+            band: TieBand,
+            out: &mut Targets,
+        ) {
+            Random.pick(facts, candidates, kept, scores, band, out);
+        }
+    }
+
+    /// A decider that waits for a job with a lease on its file keeps its
+    /// watch: a frame handed on the lull is left in the ring, and the
+    /// decider's own thread applies it within its look. The hand's thread
+    /// applies none. Once no lease stands on the file the watch ends, and
+    /// the decider wakes for a job alone.
+    #[tokio::test]
+    async fn a_frame_handed_on_a_lull_is_applied_by_its_leases_decider() {
+        let threads = Arc::new(Mutex::new(Vec::new()));
+        let kept = Arc::clone(&threads);
+        let spec = picking("threads", move || Box::new(Threads(Arc::clone(&kept))));
+        let mut bed = bed(Some(spec), true, (2, 8), []);
+        let taker = bed.deciders.of(MODEL);
+        let answers = [bed.ask(frame(1, 1)).await, bed.ask(frame(2, 1)).await];
+        // Two leases stand on its file: its look behind the answers
+        // starts its watch, and it waits for a job from there.
+        watching(&bed, 1).await;
+        let hand = lifecycle::open(&bed.store, GATEWAY);
+        let gone = Said::Released(None, ReleaseReason::ClientGone);
+        for answer in &answers {
+            bed.store.hand(&hand, LeaseId(lease_of(answer).id), gone);
+        }
+        settled(|| threads.lock().len() >= 2).await;
+        let decider = || Some(format!("decide-{taker}"));
+        assert_eq!(*threads.lock(), [decider(), decider()]);
+        // No lease stands on the file: the decider's next look ends its
+        // watch.
+        watching(&bed, 0).await;
+    }
+
+    /// A controller's only decider keeps no watch. With leases on its
+    /// file and no job it rests, so a frame handed on the lull is applied
+    /// before its hand returns: by the hand in place, or by the decider's
+    /// last take where the hand meets its rest.
+    #[tokio::test]
+    async fn a_controllers_only_decider_keeps_no_watch() {
+        let threads = Arc::new(Mutex::new(Vec::new()));
+        let kept = Arc::clone(&threads);
+        let spec = picking("threads", move || Box::new(Threads(Arc::clone(&kept))));
+        let mut bed = bed(Some(spec), true, (1, 8), []);
+        let answers = [bed.ask(frame(1, 1)).await, bed.ask(frame(2, 1)).await];
+        // The decider leaves its work behind its last answer: the case
+        // waits until the store shows no thread at work.
+        settled(|| bed.store.working() == 0).await;
+        assert_eq!(bed.store.watches(), 0, "two leases stand on its file");
+        let hand = lifecycle::open(&bed.store, GATEWAY);
+        let gone = Said::Released(None, ReleaseReason::ClientGone);
+        for (applied, answer) in answers.iter().enumerate() {
+            bed.store.hand(&hand, LeaseId(lease_of(answer).id), gone);
+            let told = threads.lock().len();
+            assert_eq!(told, applied + 1, "applied before its hand returned");
+        }
+        assert_eq!(bed.store.watches(), 0, "no look is owed");
+    }
+
+    /// Waits until `files` of the bed's files show a watch. A decider
+    /// starts its watch at its look, behind its answer, and ends it at a
+    /// look: a read right behind an answer may come first.
+    async fn watching(bed: &Bed, files: usize) {
+        settled(|| bed.store.watches() == files).await;
+    }
+
+    /// A decider that waits with a lease on file waits its floor behind a
+    /// job, twice as long behind each look that applied no frame, up to
+    /// its cap, and its floor again behind a look that applied one: a
+    /// file whose frames flow is not quiet. Once no lease stands on the
+    /// file it waits with no bound. The decider is the case's own, and
+    /// the case's receive answers each wait as a queue with no job would.
+    #[test]
+    fn a_watching_deciders_wait_doubles_over_a_quiet_file_and_falls_at_a_frame() {
+        let bed = bed(Some(preset("random", 1)), true, (1, 8), []);
+        let mut decider = deciding(&bed);
+        decider.working = Some(bed.store.at_work());
+        let answer = decider.answer(checked(frame(1, 1)), GATEWAY, bed.script.taken);
+        let lease = LeaseId(lease_of(&answer.frame()).id);
+        let hand = lifecycle::open(&bed.store, GATEWAY);
+        let mut waits = Vec::new();
+        let job = decider.wait_by(|within| {
+            waits.push(within.map(|period| period.as_millis()));
+            match waits.len() {
+                // Handed in the seventh wait: the look behind it applies
+                // a frame.
+                7 => {
+                    let dispatch = Said::Dispatched(Dispatch::default(), bed.script.taken);
+                    bed.store.hand(&hand, lease, dispatch);
+                }
+                // Handed in the ninth: the look behind it applies the
+                // release of the file's last lease.
+                9 => {
+                    let gone = Said::Released(None, ReleaseReason::ClientGone);
+                    bed.store.hand(&hand, lease, gone);
+                }
+                10 => return Err(std_mpsc::RecvTimeoutError::Disconnected),
+                _ => {}
+            }
+            Err(std_mpsc::RecvTimeoutError::Timeout)
+        });
+        assert!(job.is_none(), "the case's queue ends with no job");
+        // Seven waits over the quiet file, two behind the frame, and no
+        // bound behind the release.
+        let mut wanted: Vec<_> = [1, 2, 4, 8, 16, 16, 16, 1, 2].map(Some).into();
+        wanted.push(None);
+        assert_eq!(waits, wanted);
+        assert_eq!((LOOK_FLOOR.as_millis(), LOOK_CAP.as_millis()), (1, 16));
+    }
+
+    /// A decider with no place yet keeps no watch: before its first job
+    /// its wait is handed no period, as over a file that holds no lease.
+    #[test]
+    fn a_decider_with_no_place_yet_waits_with_no_bound() {
+        let bed = bed(Some(preset("random", 1)), true, (1, 8), []);
+        let mut decider = deciding(&bed);
+        let mut waits = Vec::new();
+        let job = decider.wait_by(|within| {
+            waits.push(within);
+            Err(std_mpsc::RecvTimeoutError::Disconnected)
+        });
+        assert!(job.is_none(), "the case's queue ends with no job");
+        assert_eq!(waits, [None], "no place, so no watch and no period");
+        assert_eq!(bed.store.watches(), 0);
+    }
+
+    /// The `random` picker, keeping the instant each release of a lease is
+    /// told at.
+    #[derive(Debug)]
+    struct Heard(Arc<Mutex<Vec<Instant>>>);
+
+    impl Lifecycle for Heard {
+        fn on_released(&self, _: &Lease, _: ReleaseReason) {
+            self.0.lock().push(Instant::now());
+        }
+    }
+
+    impl Picker for Heard {
+        fn name(&self) -> &'static str {
+            "heard"
+        }
+
+        fn pick(
+            &self,
+            facts: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            scores: &[f32],
+            band: TieBand,
+            out: &mut Targets,
+        ) {
+            Random.pick(facts, candidates, kept, scores, band, out);
+        }
+    }
+
+    /// [`Seen`], as a stage that says it may refuse by a report of
+    /// leases.
+    #[derive(Debug)]
+    struct Counted(Seen);
+
+    impl Lifecycle for Counted {}
+
+    impl Picker for Counted {
+        fn name(&self) -> &'static str {
+            self.0.name()
+        }
+
+        fn pick(
+            &self,
+            facts: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            scores: &[f32],
+            band: TieBand,
+            out: &mut Targets,
+        ) {
+            self.0.pick(facts, candidates, kept, scores, band, out);
+        }
+
+        fn refuses_by_reports(&self) -> bool {
+            true
+        }
+    }
+
+    /// The `random` preset as generation 1 with the case's picker in its
+    /// profile's pick: a picker that keeps what each decision reads in
+    /// `rows`, made by `stage`.
+    fn seeing<P: Picker + 'static>(
+        rows: &Arc<Mutex<Vec<SeenRows>>>,
+        stage: impl Fn(Seen) -> P + Send + Sync + 'static,
+    ) -> AppliedSpec {
+        let kept = Arc::clone(rows);
+        picking("seen", move || {
+            let rows = Arc::clone(&kept);
+            Box::new(stage(Seen { rows }))
+        })
+    }
+
+    /// A decision under a stage that may refuse by a report of leases
+    /// reads a completion its gateway reported of a lease on another
+    /// decider's file. That decider waits for a job with its watch over
+    /// the file, so the frames were left in its ring; the deciding thread
+    /// applies them before it reads its rows. The two models are taken by
+    /// two deciders and served by the same members.
+    #[tokio::test]
+    async fn a_decision_whose_stage_may_refuse_by_reports_applies_what_waits_at_the_other_files() {
+        use crate::controller::lifecycle::tests::{a_completed, a_dispatched};
+
+        let rows = Arc::new(Mutex::new(Vec::new()));
+        let mut bed = bed(Some(seeing(&rows, Counted)), true, (2, 8), []);
+        let models = a_model_each(&bed.deciders, 2);
+        let served: Vec<&str> = models.iter().map(String::as_str).collect();
+        for name in ["s0", "s1", "s2"] {
+            serving(&bed.store, name, &served, Role::Single, WireModes::NONE);
+        }
+        let hand = lifecycle::open(&bed.store, GATEWAY);
+        let answer = bed.ask(frame_for(&models[0], 1, 1)).await;
+        let lease = lease_of(&answer).id;
+        // The first model's decider waits for a job on its watch over the
+        // lease.
+        watching(&bed, 1).await;
+        let at = Instant::now();
+        lifecycle::dispatched(&bed.store, &hand, &a_dispatched(lease), at)
+            .expect("the frame reads");
+        lifecycle::completed(&bed.store, &hand, &a_completed(lease, picked(&answer)), at)
+            .expect("the frame reads");
+        // The other model's decision, at the other file, right behind the
+        // completion: it reads no request in flight.
+        bed.ask(frame_for(&models[1], 2, 1)).await;
+        let rows = rows.lock();
+        let read: u32 = rows[1].iter().map(|(count, _)| count).sum();
+        assert_eq!(read, 0, "{rows:?}");
+    }
+
+    /// Two leases on the second file of `store`, booked on `member`, under
+    /// the watch of that file's place, and the release of the first handed
+    /// and left in the file's ring. The place is the case's own, so no
+    /// decider's look applies the frame: its next look says whether the
+    /// frame still waited ([`Watch::Fed`]) or was applied meanwhile
+    /// ([`Watch::Quiet`]).
+    fn a_frame_under_the_second_files_watch(
+        store: &Arc<MemoryStore>,
+        member: WorkerId,
+    ) -> crate::store::AtWork {
+        use crate::{
+            decider::Decider,
+            lease::ReleaseReason,
+            store::{Hand, Said, Watch},
+        };
+
+        let now = Instant::now();
+        let _acting = Decider::new(1).enter();
+        let mut place = store.at_work();
+        let issue = |request| {
+            let record = crate::store::LeaseRecord {
+                lease: Lease::default(),
+                gateway: GATEWAY,
+                request,
+                target: member,
+                picked: crate::store::Picked::default(),
+                decode: None,
+                term: 1,
+                issued_at: now,
+                dispatch_deadline: now + DISPATCH_TTL,
+                state: LeaseState::ISSUED,
+            };
+            let booked = store.world().booked_of(member);
+            let issued = store.issue_decided(record, booked, |_| ());
+            issued.expect("minted under the store's term").id
+        };
+        let first = issue(1);
+        issue(2);
+        assert_eq!(place.look(), Watch::Quiet, "two leases stand on its file");
+        let gone = Said::Released(None, ReleaseReason::ClientGone);
+        store.hand(&Hand::new(GATEWAY), first, gone);
+        place
+    }
+
+    /// A decision whose stages refuse by no report reads no place, though
+    /// its decider lent one: a frame left under another file's watch
+    /// stays there for that file's thread, and the decision takes no
+    /// turn at it.
+    #[test]
+    fn a_decision_whose_stages_refuse_by_no_report_applies_nothing_at_the_other_files() {
+        use crate::{decider::Decider, store::Watch};
+
+        const SPOKEN: &str = "model-http";
+        let store = Arc::new(MemoryStore::new().with_deciders(2));
+        store
+            .apply(preset("random", 1))
+            .expect("above the unbound start");
+        let member = ready(&store, "h0", SPOKEN, Role::Single, WireModes::HTTP);
+        LeasesStore::set_term(&*store, 1);
+        let mut watch = a_frame_under_the_second_files_watch(&store, member);
+        // The first file's decision, its place lent, under the preset's
+        // stages: each says it refuses by no report.
+        let _acting = Decider::new(0).enter();
+        let place = store.at_work();
+        let request = checked(frame_for(SPOKEN, 1, 1));
+        let now = Instant::now();
+        let taken = Taken::at(&request, GATEWAY, now, now).expect("budget is left");
+        let taken = taken.placed(Some(&place));
+        let mut buffers = Buffers::default();
+        let handed = store.deciding(|world| {
+            hand(
+                world,
+                &taken,
+                &mut buffers,
+                &AtomicU64::new(0),
+                |_, _, rows, _, _| rows.len(),
+            )
+            .0
+        });
+        assert_eq!(handed, 1, "the decision was handed its row");
+        assert_eq!(
+            watch.look(),
+            Watch::Fed,
+            "the frame waited for its file's look"
+        );
+    }
+
+    /// A pair's one decision applies what waits at the other files where
+    /// a stage of either side may refuse by a report, as a single's does:
+    /// the pair builds its own rows, so the apply is its own. Under the
+    /// same plan with stages that refuse by no report it reads no place,
+    /// and the frame waits for its file's look.
+    #[test]
+    fn a_pairs_decision_applies_what_waits_where_a_stage_of_either_side_may_refuse() {
+        use crate::{decider::Decider, store::Watch};
+
+        let waited = |prefill: &str, decode: &str| {
+            let rows = Arc::new(Mutex::new(Vec::new()));
+            let mut catalog = Catalog::builtin();
+            let counted = move || -> Box<dyn Picker> {
+                let rows = Arc::clone(&rows);
+                Box::new(Counted(Seen { rows }))
+            };
+            catalog.picker("seen", counted).expect("a free name");
+            let document = r#"{
+              "apiVersion": "smg.policy/v1",
+              "generation": 1,
+              "profiles": {
+                "p": { "pick": "PREFILL" },
+                "d": { "pick": "DECODE" }
+              },
+              "bindings": [
+                { "match": { "phase": ["prefill", "decode"] }, "plan": "pd-pair",
+                  "profiles": { "prefill": "p", "decode": "d" } },
+                { "profile": "p" }
+              ]
+            }"#;
+            let document = document
+                .replace("PREFILL", prefill)
+                .replace("DECODE", decode);
+            let document: PolicySpec =
+                serde_json::from_str(&document).expect("a document of this build");
+            let digest = document.digest().expect("the document digests");
+            let spec = AppliedSpec::validate_digested(&document, digest, &catalog);
+            let store = Arc::new(MemoryStore::new().with_deciders(2));
+            let (singles, _) = fleet(&store);
+            store
+                .apply(spec.expect("the catalog holds the stage"))
+                .expect("above the unbound start");
+            LeasesStore::set_term(&*store, 1);
+            let mut watch = a_frame_under_the_second_files_watch(&store, singles[0]);
+            let _acting = Decider::new(0).enter();
+            let place = store.at_work();
+            let request = checked(phased(frame(1, 7), proto::Phase::Prefill));
+            let now = Instant::now() + Duration::from_secs(3);
+            let taken = Taken::at(&request, GATEWAY, now, now).expect("budget is left");
+            let taken = taken.placed(Some(&place));
+            let mut buffers = Buffers::default();
+            let own = Part::default();
+            let decision = store.deciding(|world| pair_in(world, &taken, &mut buffers, &own).0);
+            assert!(matches!(decision, Decision::Pick(_)), "{decision:?}");
+            watch.look()
+        };
+        assert_eq!(waited("random", "random"), Watch::Fed, "no such stage");
+        assert_eq!(waited("random", "seen"), Watch::Quiet, "the decode side's");
+        assert_eq!(waited("seen", "random"), Watch::Quiet, "the prefill side's");
+    }
+
+    /// One model a decider, in the deciders' order: the first names of an
+    /// endless run whose requests each of `count` deciders takes.
+    fn a_model_each(deciders: &Deciders, count: usize) -> Vec<String> {
+        let mut models: Vec<Option<String>> = vec![None; count];
+        for name in (0_u32..).map(|at| format!("model-{at}")) {
+            if models.iter().all(Option::is_some) {
+                break;
+            }
+            let taker = &mut models[deciders.of(&name)];
+            if taker.is_none() {
+                *taker = Some(name);
+            }
+        }
+        models.into_iter().flatten().collect()
+    }
+
+    /// The idle cost of a watch, for its measurement at `deciders`
+    /// deciders: one dispatched lease on each decider's file and no job,
+    /// for five seconds between two printed lines. A reader of the
+    /// threads named `decide-*` counts their wakes and their time on a
+    /// core over the pause. The tenth of a second before the first line
+    /// is not counted: each decider's wait grows to its cap in it.
+    async fn idle(deciders: usize) {
+        use std::io::Write as _;
+
+        use crate::controller::lifecycle::tests::a_dispatched;
+
+        let mut out = io::stdout();
+        let mut bed = bed(Some(preset("random", 1)), true, (deciders, 8), []);
+        let models = a_model_each(&bed.deciders, deciders);
+        let served: Vec<&str> = models.iter().map(String::as_str).collect();
+        for name in ["s0", "s1", "s2"] {
+            serving(&bed.store, name, &served, Role::Single, WireModes::NONE);
+        }
+        let hand = lifecycle::open(&bed.store, GATEWAY);
+        for model in &models {
+            let answer = bed.ask(frame_for(model, 1, 1)).await;
+            let dispatched = a_dispatched(lease_of(&answer).id);
+            lifecycle::dispatched(&bed.store, &hand, &dispatched, Instant::now())
+                .expect("the frame reads");
+        }
+        thread::sleep(Duration::from_millis(100));
+        writeln!(
+            out,
+            "the idle pause begins: a lease on each of {deciders} files, no job"
+        )
+        .expect("stdout");
+        thread::sleep(Duration::from_secs(5));
+        writeln!(out, "the idle pause ends").expect("stdout");
+    }
+
+    /// The idle cost of one decider's watch ([`idle`]).
+    #[tokio::test]
+    #[ignore = "a measurement for the Numbers table, run by name"]
+    async fn one_idle_decider_measured() {
+        idle(1).await;
+    }
+
+    /// The idle cost of eight deciders' watches ([`idle`]).
+    #[tokio::test]
+    #[ignore = "a measurement for the Numbers table, run by name"]
+    async fn eight_idle_deciders_measured() {
+        idle(8).await;
+    }
+
+    /// The lag of a frame handed on a lull, measured at one of two
+    /// deciders: from its hand to the decider's tell, over `FRAMES`
+    /// frames a cell. At
+    /// the floor each frame is handed within one shortest wait of its
+    /// decision. At the cap it is handed three longest waits behind its
+    /// decision and within one more: the decider's wait has grown to its
+    /// cap by then. Each is handed at a phase that sweeps that wait, so
+    /// no frame's instant is locked to a look.
+    #[tokio::test]
+    #[ignore = "a measurement for the Numbers table, run by name"]
+    async fn a_lulls_lag_measured() {
+        use std::io::Write as _;
+
+        const FRAMES: usize = 500;
+        let mut out = io::stdout();
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let kept = Arc::clone(&heard);
+        let spec = picking("heard", move || Box::new(Heard(Arc::clone(&kept))));
+        let mut bed = bed(Some(spec), true, (2, 8), []);
+        let hand = lifecycle::open(&bed.store, GATEWAY);
+        let gone = Said::Released(None, ReleaseReason::ClientGone);
+        let parts = u32::try_from(FRAMES).expect("five hundred");
+        let cells = [
+            ("at the floor", Duration::ZERO, LOOK_FLOOR),
+            ("at the cap", 3 * LOOK_CAP, LOOK_CAP),
+        ];
+        let mut told = 0;
+        for (cell, quiet, wait) in cells {
+            let mut lags = Vec::with_capacity(FRAMES);
+            for sent in 0..FRAMES {
+                let answer = bed.ask(frame(1, 1)).await;
+                // A step coprime to the sweep: each part of the wait once.
+                let part = u32::try_from(sent * 7_919 % FRAMES).expect("under five hundred");
+                thread::sleep(quiet + wait * part / parts);
+                let handed = Instant::now();
+                bed.store.hand(&hand, LeaseId(lease_of(&answer).id), gone);
+                let at = loop {
+                    if let Some(at) = heard.lock().get(told) {
+                        break *at;
+                    }
+                    assert!(
+                        handed.elapsed() < PATIENCE,
+                        "a handed frame waits one look at most"
+                    );
+                    std::hint::spin_loop();
+                };
+                told += 1;
+                lags.push(at.saturating_duration_since(handed));
+            }
+            lags.sort_unstable();
+            let at = |part: usize| lags[(FRAMES * part / 100).min(FRAMES - 1)].as_micros();
+            writeln!(
+                out,
+                "the lag of a frame handed on a lull {cell}, {FRAMES} frames: p50 {} us, p99 {} us, the longest {} us",
+                at(50),
+                at(99),
+                at(100)
+            )
+            .expect("stdout");
+        }
+    }
+
+    /// One closed-loop client, measured: the share of its decisions that
+    /// read a count from before its last completion. The client asks,
+    /// names its dispatch, reports the completion `served` later and asks
+    /// again `think` later, so no lease of its own stands at a decision:
+    /// one that reads a request in flight read a count from before the
+    /// completion. Its requests are for one model, or for two in turn
+    /// that two deciders take and the same members serve: each decision
+    /// of the second form is made at another file than the completion
+    /// before it.
+    /// The stage that reads the counts is made by `stage`, and `under`
+    /// names it in the cell's lines.
+    async fn closed_loop<P: Picker + 'static>(
+        stage: impl Fn(Seen) -> P + Send + Sync + 'static,
+        under: &str,
+    ) {
+        use std::io::Write as _;
+
+        use crate::controller::lifecycle::tests::{a_completed, a_dispatched};
+
+        const ASKED: usize = 200;
+        let mut out = io::stdout();
+        let rows = Arc::new(Mutex::new(Vec::new()));
+        let mut bed = bed(Some(seeing(&rows, stage)), true, (2, 8), []);
+        let models = a_model_each(&bed.deciders, 2);
+        let served: Vec<&str> = models.iter().map(String::as_str).collect();
+        for name in ["s0", "s1", "s2"] {
+            serving(&bed.store, name, &served, Role::Single, WireModes::NONE);
+        }
+        let hand = lifecycle::open(&bed.store, GATEWAY);
+        let pause = |long: Duration| {
+            if !long.is_zero() {
+                thread::sleep(long);
+            }
+        };
+        let millis = Duration::from_millis;
+        let paces = [
+            (millis(0), millis(0)),
+            (millis(0), millis(2)),
+            (millis(48), millis(0)),
+            (millis(48), millis(20)),
+        ];
+        for (form, turn) in [("one model", [0, 0]), ("two models in turn", [0, 1])] {
+            for (served, think) in paces {
+                rows.lock().clear();
+                for asked in 0..ASKED {
+                    let answer = bed.ask(frame_for(&models[turn[asked % 2]], 1, 1)).await;
+                    let lease = lease_of(&answer).id;
+                    lifecycle::dispatched(&bed.store, &hand, &a_dispatched(lease), Instant::now())
+                        .expect("the frame reads");
+                    pause(served);
+                    let completed = a_completed(lease, picked(&answer));
+                    lifecycle::completed(&bed.store, &hand, &completed, Instant::now())
+                        .expect("the frame reads");
+                    pause(think);
+                }
+                // The first decision of a cell stands behind the cell
+                // before it: it is not counted.
+                let rows = rows.lock();
+                let behind = rows.iter().skip(1);
+                let late = behind.filter(|read| read.iter().any(|(count, _)| *count > 0));
+                writeln!(
+                    out,
+                    "a closed loop of {form}{under}, served {} ms, think {} ms: {} of {} decisions read a count from before the last completion",
+                    served.as_millis(),
+                    think.as_millis(),
+                    late.count(),
+                    ASKED - 1
+                )
+                .expect("stdout");
+            }
+        }
+    }
+
+    /// [`closed_loop`] under a stage that only picks by its counts.
+    #[tokio::test]
+    #[ignore = "a measurement for the Numbers table, run by name"]
+    async fn a_closed_loop_measured() {
+        closed_loop(|seen| seen, "").await;
+    }
+
+    /// [`closed_loop`] under a stage that says it may refuse by a report
+    /// of leases.
+    #[tokio::test]
+    #[ignore = "a measurement for the Numbers table, run by name"]
+    async fn a_closed_loop_under_a_counting_stage_measured() {
+        closed_loop(Counted, " under a stage that may refuse by a report").await;
+    }
+
     /// An abandoned lease is told to the engine whose generation issued it
     /// and to no later one: a later generation's stages never saw the
     /// issue. The lease is ended all the same.
@@ -2698,6 +3444,11 @@ pub(crate) mod tests {
     impl Picker for Seen {
         fn name(&self) -> &'static str {
             "seen"
+        }
+
+        // Keeps what a decision reads and picks as the random picker.
+        fn refuses_by_reports(&self) -> bool {
+            false
         }
 
         fn pick(

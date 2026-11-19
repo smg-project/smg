@@ -125,6 +125,7 @@ mod tests {
             now: Instant::now(),
             left: std::time::Duration::MAX,
             pins: None,
+            place: None,
         };
         let ticket = Decision::Queue(Queue {
             ticket: 1,

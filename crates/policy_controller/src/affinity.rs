@@ -575,6 +575,11 @@ impl Scorer for PrefixAffinity {
         "prefix-affinity"
     }
 
+    // Scores by the affinity column. Its spill gate reads the mean count and places elsewhere.
+    fn refuses_by_reports(&self) -> bool {
+        false
+    }
+
     /// Row by row, unless the fleet's KV gate is configured: that gate
     /// reads every row.
     fn row_wise(&self) -> bool {
@@ -702,6 +707,11 @@ impl Lifecycle for KvPressure {}
 impl Scorer for KvPressure {
     fn name(&self) -> &'static str {
         "kv-pressure"
+    }
+
+    // Scores by the pressure its feed reports.
+    fn refuses_by_reports(&self) -> bool {
+        false
     }
 
     /// The stage orders nothing: the gate it configures is read by the
@@ -1191,6 +1201,11 @@ impl Lifecycle for WarmupSlice {
 impl Scorer for WarmupSlice {
     fn name(&self) -> &'static str {
         "warmup-slice"
+    }
+
+    // Scores by the warm-up state. Its divert reads a holder's count and places elsewhere.
+    fn refuses_by_reports(&self) -> bool {
+        false
     }
 
     /// Row by row, unless the fleet's KV gate is configured: that gate
