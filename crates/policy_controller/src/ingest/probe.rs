@@ -185,9 +185,9 @@ impl EngineProbe {
     /// The scrape's HTTP client, built at the first call and kept. The
     /// build reads files, so it runs off the runtime's workers, and its
     /// time is the first scrape's own. A build that fails is that
-    /// scrape's transport failure, and the next scrape builds again. The
-    /// first such failure is said once, as a warning: it is the
-    /// controller's own, where the driver's count reads it as an engine's.
+    /// scrape's failure under a reason of its own, the controller's and
+    /// no engine's, and the next scrape builds again. The first such
+    /// failure is said once, as a warning.
     async fn http(&self) -> Result<&reqwest::Client, ReadError> {
         let built = || async {
             match tokio::task::spawn_blocking(self.build).await {
@@ -200,9 +200,9 @@ impl EngineProbe {
                             "the engine probe's HTTP client could not be built: no engine is scraped until a later scrape builds it"
                         );
                     }
-                    Err(ReadError::Transport(failed))
+                    Err(ReadError::Client(failed))
                 }
-                Err(join) => Err(ReadError::Transport(join.to_string())),
+                Err(join) => Err(ReadError::Client(join.to_string())),
             }
         };
         self.http.get_or_try_init(built).await
@@ -385,7 +385,7 @@ mod tests {
         assert!(probe.http_built(), "the first scrape builds it");
     }
 
-    /// A client that cannot be built fails its scrape as the transport's
+    /// A client that cannot be built fails its scrape under its own reason
     /// and holds none, and the next scrape builds again: a controller
     /// whose platform gains its certificates later scrapes from then on.
     #[tokio::test]
@@ -402,7 +402,7 @@ mod tests {
         let probe = EngineProbe::building(broken_once);
 
         let first = probe.scrape(&url, Duration::from_millis(50)).await;
-        assert!(matches!(first, Err(ReadError::Transport(_))), "{first:?}");
+        assert!(matches!(first, Err(ReadError::Client(_))), "{first:?}");
         assert!(!probe.http_built(), "a build that fails holds no client");
 
         let second = probe.scrape(&url, Duration::from_millis(50)).await;

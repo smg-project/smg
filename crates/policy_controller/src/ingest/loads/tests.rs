@@ -1308,6 +1308,7 @@ fn a_failure_counts_under_its_own_label() {
         ReadError::Deadline(Duration::ZERO),
         ReadError::NoLoad(String::new()),
         ReadError::Unsupported(String::new()),
+        ReadError::Client(String::new()),
     ];
     assert_eq!(
         errors.len(),
