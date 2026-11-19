@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	smg "github.com/lightseek/smg/go-grpc-sdk"
+	smg "github.com/smg-project/smg/bindings/golang"
 	"github.com/valyala/fasthttp"
 	"go.uber.org/zap"
 
@@ -401,6 +401,9 @@ func (h *ChatHandler) handleNonStreamingCompletion(ctx *fasthttp.RequestCtx, req
 				"content": choice.Message.Content,
 			},
 			"finish_reason": choice.FinishReason,
+		}
+		if choice.Message.ReasoningContent != "" {
+			choiceMap["message"].(map[string]interface{})["reasoning_content"] = choice.Message.ReasoningContent
 		}
 		if len(choice.Message.ToolCalls) > 0 {
 			toolCalls := make([]map[string]interface{}, len(choice.Message.ToolCalls))

@@ -5,6 +5,7 @@
 //! per-item encoder inputs and per-item content hashes used for encode routing.
 
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     time::Instant,
 };
@@ -25,8 +26,8 @@ use super::{
         serialize_tokenspeed_encoder_input, serialize_tokenspeed_encoder_input_owned, wire_dtype,
     },
     transport::{
-        mm_encoder_input_dtype, mm_vllm_device_normalizes, mm_vllm_encoder_input_dtype,
-        resolve_mm_shm_enabled, resolve_mm_shm_min_bytes,
+        mm_encoder_input_dtype, mm_sglang_encoder_input_dtype, mm_vllm_device_normalizes,
+        mm_vllm_encoder_input_dtype, resolve_mm_shm_enabled, resolve_mm_shm_min_bytes,
     },
     MediaBatch, MultimodalIntermediate, PrecomputedMultimodalIntermediate, PromptBinding,
 };
@@ -66,6 +67,7 @@ pub(crate) async fn assemble_multimodal_data_after_encode(
     assemble_multimodal_data_impl(intermediate, client, workers, true).await
 }
 
+/// Dispatch assembly using the selected backend and worker metadata.
 async fn assemble_multimodal_data_impl(
     intermediate: MultimodalIntermediate,
     client: &BackendClient,
@@ -76,9 +78,9 @@ async fn assemble_multimodal_data_impl(
     // Defense in depth: worker selection already rejected unsupported (backend,
     // modality) combinations. Re-assert here against the same capability matrix
     // so assembly can never silently mishandle a modality the backend lacks.
-    ensure_client_supports_intermediate(client, &intermediate)?;
+    ensure_backend_supports_modalities(client.runtime_type(), &intermediate)?;
     match client {
-        BackendClient::Grpc(GrpcClient::Sglang(_)) => assemble_sglang_data(intermediate),
+        BackendClient::Grpc(GrpcClient::Sglang(_)) => assemble_sglang_data(intermediate, workers),
         BackendClient::Grpc(GrpcClient::Vllm(_)) => Ok(MultimodalData::Vllm(
             assemble_vllm_batches(intermediate, workers)?,
         )),
@@ -145,7 +147,7 @@ async fn assemble_multimodal_data_impl(
             }
             // The same modality batches the gRPC arm sends the servicer: the
             // adapter frames it as the scheduler's processor output.
-            RuntimeType::Sglang => assemble_sglang_data(intermediate),
+            RuntimeType::Sglang => assemble_sglang_data(intermediate, workers),
             runtime => anyhow::bail!(
                 "multimodal inputs are not supported over the {runtime} ZMQ backend yet"
             ),
@@ -154,10 +156,14 @@ async fn assemble_multimodal_data_impl(
 }
 
 /// Both transports share the same per-modality assembly.
-fn assemble_sglang_data(intermediate: MultimodalIntermediate) -> Result<MultimodalData> {
+/// Write every SGLang batch in the selected worker's declared floating dtype.
+fn assemble_sglang_data(
+    intermediate: MultimodalIntermediate,
+    workers: Option<&WorkerSelection>,
+) -> Result<MultimodalData> {
     Ok(MultimodalData::Sglang(assemble_sglang_batches(
         intermediate,
-        "float32",
+        mm_sglang_encoder_input_dtype(workers).as_str(),
     )?))
 }
 
@@ -240,8 +246,9 @@ fn assemble_vllm_batches(
 #[derive(Debug, Clone)]
 pub(super) struct VllmAssembly {
     /// The float dtype the primary tensor is written in (`float32`,
-    /// `bfloat16`, `float16`).
-    pub encoder_dtype: String,
+    /// `bfloat16`, `float16`): the process's own name borrowed, or the one
+    /// copy of the worker's label.
+    pub encoder_dtype: Cow<'static, str>,
     /// The engine rescales and normalizes pixels on device: it takes the
     /// pixels' own `uint8` bytes and would normalize floats twice.
     pub device_normalizes: bool,
@@ -289,7 +296,7 @@ pub(super) fn assemble_vllm_batches_with(
 
 /// TRT-LLM takes a single preprocessed batch (one modality). The
 /// per-modality capability is enforced by
-/// [`ensure_client_supports_intermediate`]; this only enforces the structural
+/// [`ensure_backend_supports_modalities`]; this only enforces the structural
 /// single-batch constraint.
 pub(super) fn into_single_batch(
     intermediate: MultimodalIntermediate,
@@ -304,16 +311,6 @@ pub(super) fn into_single_batch(
         .into_batches()
         .pop()
         .context("multimodal intermediate is missing its sole batch")
-}
-
-/// Defense-in-depth capability assertion mirroring the early worker-selection
-/// check, keyed on the concrete backend client. See
-/// [`crate::routers::grpc::multimodal::capability::ensure_backend_supports_modalities`].
-fn ensure_client_supports_intermediate(
-    client: &BackendClient,
-    intermediate: &MultimodalIntermediate,
-) -> Result<()> {
-    ensure_backend_supports_modalities(client.runtime_type(), intermediate)
 }
 
 /// Serialize worker pixels in the configured vision dtype, preserving integer metadata.
@@ -402,7 +399,13 @@ fn assemble_vllm(
     intermediate: PrecomputedMultimodalIntermediate,
     assembly: &VllmAssembly,
 ) -> Result<VllmMultimodalData> {
-    let dtype = vllm_pixel_dtype(&intermediate.preprocessed, assembly)?;
+    // Audio follows vLLM's floating-point model dtype, independently of
+    // the worker's image-only device-normalization setting.
+    let dtype = if intermediate.media.modality() == Modality::Audio {
+        assembly.encoder_dtype.as_ref()
+    } else {
+        vllm_pixel_dtype(&intermediate.preprocessed, assembly)?
+    };
     let (pixel_values, pixel_values_shape, pixel_values_dtype) =
         serialize_encoder_input_owned(intermediate.preprocessed.encoder_input, dtype)?;
     let model_specific_tensors = serialize_model_specific(intermediate.preprocessed.model_specific);
@@ -415,9 +418,10 @@ fn assemble_vllm(
             common::Modality::Video,
             videos.iter().map(|video| video.hash.clone()).collect(),
         ),
-        MediaBatch::Audios(_) => {
-            anyhow::bail!("vLLM assembly requires an image or video batch")
-        }
+        MediaBatch::Audios(audios) => (
+            common::Modality::Audio,
+            audios.iter().map(|audio| audio.hash.clone()).collect(),
+        ),
     };
     let mm_placeholders = placeholders_for_bindings(&intermediate.bindings, false)?;
     // The primary tensor travels in the proto's `pixel_values` field but is
@@ -516,7 +520,7 @@ pub(crate) fn assemble_tokenspeed_for_encode(
 struct TokenSpeedAssemblyOptions {
     shm_enabled: bool,
     shm_min_bytes: usize,
-    encoder_input_dtype: String,
+    encoder_input_dtype: Cow<'static, str>,
     skip_pixel_values: bool,
 }
 
@@ -559,7 +563,7 @@ fn assemble_tokenspeed_with_options(
     let item_count = intermediate.media.len();
     // Build items imperatively so that if any step fails partway we can unlink
     // the /dev/shm segments already created for prior items' encoder inputs
-    // (and this item's, once created). `?`/`collect` would drop those
+    // (and this item's, once created). A plain `?` or `collect` would drop those
     // `TokenSpeedTensor::Shm` handles without ever reaching the send-path
     // cleanup, leaking files until the next sweep.
     let mut ordered_bindings = intermediate.bindings.iter().collect::<Vec<_>>();
@@ -572,79 +576,49 @@ fn assemble_tokenspeed_with_options(
     let mut items: Vec<TokenSpeedMultimodalItem> = Vec::with_capacity(item_count);
     for binding in ordered_bindings {
         let item_index = binding.item_index;
-        let mm_placeholders = match placeholders_for_binding(binding, true) {
-            Ok(value) => value,
-            Err(error) => {
-                cleanup_tokenspeed_items_encoder_shm(&items, None);
-                return Err(error);
-            }
-        };
-        let content_hash = match content_hash_for_item(intermediate, item_index) {
-            Ok(value) => value,
-            Err(error) => {
-                cleanup_tokenspeed_items_encoder_shm(&items, None);
-                return Err(error);
-            }
-        };
+        let mm_placeholders = placeholders_for_binding(binding, true)
+            .inspect_err(|_| cleanup_tokenspeed_items_encoder_shm(&items, None))?;
+        let content_hash = content_hash_for_item(intermediate, item_index)
+            .inspect_err(|_| cleanup_tokenspeed_items_encoder_shm(&items, None))?;
         let encoder_input_started = Instant::now();
         // EPD prefill: the embedding arrives over Mooncake and this item's
         // encoder_input is stripped downstream (clear_mm_pixel_values), so skip
         // the per-item slice + serialize entirely when skip_pixel_values is set.
         let encoder_input = if skip_pixel_values {
-            TokenSpeedTensor::inline(Vec::new(), Vec::new(), encoder_input_dtype.clone())
+            TokenSpeedTensor::inline(Vec::new(), Vec::new(), encoder_input_dtype.to_string())
         } else if let Some(input) = owned_input.take() {
-            match serialize_tokenspeed_encoder_input_owned(
+            serialize_tokenspeed_encoder_input_owned(
                 input,
                 &encoder_input_dtype,
                 shm_enabled,
                 shm_min_bytes,
-            ) {
-                Ok(value) => value,
-                Err(error) => {
-                    cleanup_tokenspeed_items_encoder_shm(&items, None);
-                    return Err(error);
-                }
-            }
+            )
+            .inspect_err(|_| cleanup_tokenspeed_items_encoder_shm(&items, None))?
         } else {
-            let item_encoder_input = match encoder_input_for_item(
+            let item_encoder_input = encoder_input_for_item(
                 &intermediate.preprocessed,
                 &intermediate.field_layouts.encoder_input,
                 item_index,
-            ) {
-                Ok(value) => value,
-                Err(error) => {
-                    cleanup_tokenspeed_items_encoder_shm(&items, None);
-                    return Err(error);
-                }
-            };
-            match serialize_tokenspeed_encoder_input(
+            )
+            .inspect_err(|_| cleanup_tokenspeed_items_encoder_shm(&items, None))?;
+            serialize_tokenspeed_encoder_input(
                 &item_encoder_input,
                 &encoder_input_dtype,
                 shm_enabled,
                 shm_min_bytes,
-            ) {
-                Ok(value) => value,
-                Err(error) => {
-                    cleanup_tokenspeed_items_encoder_shm(&items, None);
-                    return Err(error);
-                }
-            }
+            )
+            .inspect_err(|_| cleanup_tokenspeed_items_encoder_shm(&items, None))?
         };
         let encoder_input_serialize_ms = encoder_input_started.elapsed().as_secs_f64() * 1000.0;
         let model_specific_started = Instant::now();
-        let model_specific_tensors = match serialize_model_specific_for_item(
+        // On an error here `encoder_input` (possibly SHM) was created for this item
+        // but the item isn't built; clean it plus all prior items.
+        let model_specific_tensors = serialize_model_specific_for_item(
             &intermediate.preprocessed.model_specific,
             &intermediate.field_layouts.model_specific,
             item_index,
-        ) {
-            Ok(value) => value,
-            Err(error) => {
-                // `encoder_input` (possibly SHM) was created for this item but the
-                // item isn't built; clean it plus all prior items.
-                cleanup_tokenspeed_items_encoder_shm(&items, Some(&encoder_input));
-                return Err(error);
-            }
-        };
+        )
+        .inspect_err(|_| cleanup_tokenspeed_items_encoder_shm(&items, Some(&encoder_input)))?;
         let model_specific_serialize_ms = model_specific_started.elapsed().as_secs_f64() * 1000.0;
         if log_timing {
             info!(

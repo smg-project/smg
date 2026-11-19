@@ -101,9 +101,11 @@ def require_brave_server():
 def gateway_with_mcp_config(require_brave_server, mcp_config_file):
     """Launch gateway with MCP config that routes web_search_preview to Brave."""
     from infra import launch_cloud_gateway
+    from infra.cloud_credentials import resolve_cloud_credentials
 
-    api_key_env = "OPENAI_API_KEY"
-    if not os.environ.get(api_key_env):
+    credentials = resolve_cloud_credentials("openai", require_key=False)
+    api_key_env = credentials.api_key_env
+    if not credentials.api_key:
         pytest.skip(f"{api_key_env} not set")
 
     logger.info("Launching gateway with MCP config: %s", mcp_config_file)
@@ -119,7 +121,7 @@ def gateway_with_mcp_config(require_brave_server, mcp_config_file):
     try:
         client = openai.OpenAI(
             base_url=f"{gateway.base_url}/v1",
-            api_key=os.environ.get(api_key_env),
+            api_key=credentials.api_key,
         )
         yield gateway, client
     finally:

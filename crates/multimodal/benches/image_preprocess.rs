@@ -25,8 +25,8 @@ use llm_multimodal::{
     vision::{
         preprocessor_config::PreProcessorConfig,
         processors::{
-            DeepseekV41Processor, KimiK3Processor, Llama4VisionProcessor, Qwen2VLProcessor,
-            Qwen3VLProcessor, Step3VLProcessor,
+            DeepseekV41Processor, Gemma4Processor, KimiK3Processor, Llama4VisionProcessor,
+            Qwen2VLProcessor, Qwen3VLProcessor, Step3VLProcessor,
         },
         transforms, VideoClipOptions, VisionPreProcessor,
     },
@@ -45,6 +45,7 @@ fn returned(inputs: PreprocessedEncoderInputs) {
             buffer_pool::recycle(patches.into_raw_vec_and_offset().0);
         }
         EncoderInput::Wire { bytes, .. } => buffer_pool::recycle(bytes),
+        EncoderInput::SharedWire { bytes, .. } => bytes.recycle(),
         EncoderInput::F32(_) => {}
     }
 }
@@ -349,7 +350,7 @@ criterion_group!(
 criterion_group!(
     name = wire_benches;
     config = Criterion::default().with_measurement(CpuTime);
-    targets = bench_wire_write, bench_deepseek_v41, bench_step3_vl, bench_decode_preprocess, bench_qwen3_vl_video
+    targets = bench_wire_write, bench_deepseek_v41, bench_step3_vl, bench_gemma4, bench_decode_preprocess, bench_qwen3_vl_video
 );
 criterion_main!(benches, wire_benches);
 
@@ -721,9 +722,16 @@ fn decode_and_preprocess<P: VisionPreProcessor>(processor: &P, encoded: &Bytes, 
         None,
     );
     let images = [frame.image().unwrap()];
+    wire_request(processor, &images);
+}
+
+/// One request's share of a processor: the one-pass bfloat16 wire where the
+/// processor writes it, else the patch tensor and the wire write; the wire
+/// bytes go back to the pool as a sent payload returns them.
+fn wire_request<P: VisionPreProcessor>(processor: &P, images: &[&DynamicImage]) {
     let inputs = processor
-        .preprocess_wire(&images, EncoderDtype::BFloat16)
-        .unwrap_or_else(|| processor.preprocess(&images))
+        .preprocess_wire(images, EncoderDtype::BFloat16)
+        .unwrap_or_else(|| processor.preprocess(images))
         .unwrap();
     buffer_pool::recycle(
         inputs
@@ -731,6 +739,45 @@ fn decode_and_preprocess<P: VisionPreProcessor>(processor: &P, encoded: &Bytes, 
             .into_bytes_as(EncoderDtype::BFloat16)
             .unwrap(),
     );
+}
+
+/// The Gemma 4 processor on the request's path per image class, in CPU time
+/// at one thread: the plain sizes, the budget's own square (768x768 maps to
+/// itself under the resize rule, so that row is the one-pass write alone), a
+/// square over the budget (896x896 is 3136 patches against 2520: a downscale
+/// to 768x768 plus the write) and a batch of ten; every other image resizes
+/// to the fixed patch budget, so those rows read the resample and the patch
+/// write of about 1.9 M elements each.
+fn bench_gemma4(c: &mut Criterion<CpuTime>) {
+    let processor = Gemma4Processor::new();
+    let mut group = c.benchmark_group("gemma4_preprocess");
+    group
+        .sample_size(20)
+        .warm_up_time(Duration::from_millis(500))
+        .measurement_time(Duration::from_secs(2));
+    for (w, h) in [
+        (256, 256),
+        (1024, 768),
+        (1920, 1080),
+        (768, 768),
+        (896, 896),
+    ] {
+        let image = make_test_image(w, h);
+        let images = [&image];
+        group.bench_with_input(
+            BenchmarkId::new("one_image", format!("{w}x{h}")),
+            &images,
+            |b, imgs| b.iter(|| wire_request(&processor, imgs)),
+        );
+    }
+    let image = make_test_image(1024, 768);
+    let batch: Vec<&DynamicImage> = (0..10).map(|_| &image).collect();
+    group.bench_with_input(
+        BenchmarkId::new("batch", "10x1024x768"),
+        &batch,
+        |b, imgs| b.iter(|| wire_request(&processor, imgs)),
+    );
+    group.finish();
 }
 
 /// One 1024x768 image through decode and preprocess per family, as a colour
@@ -767,6 +814,7 @@ fn bench_decode_preprocess(c: &mut Criterion<CpuTime>) {
         .unwrap(),
     );
     let kimi = KimiK3Processor::from_preprocessor_config(&PreProcessorConfig::default());
+    let gemma4 = Gemma4Processor::new();
     let mut group = c.benchmark_group("decode_preprocess");
     group
         .sample_size(20)
@@ -782,6 +830,11 @@ fn bench_decode_preprocess(c: &mut Criterion<CpuTime>) {
             BenchmarkId::new(format!("kimi_k3_{class}"), format!("{w}x{h}")),
             encoded,
             |b, encoded| b.iter(|| decode_and_preprocess(&kimi, encoded, size)),
+        );
+        group.bench_with_input(
+            BenchmarkId::new(format!("gemma4_{class}"), format!("{w}x{h}")),
+            encoded,
+            |b, encoded| b.iter(|| decode_and_preprocess(&gemma4, encoded, size)),
         );
     }
     group.finish();

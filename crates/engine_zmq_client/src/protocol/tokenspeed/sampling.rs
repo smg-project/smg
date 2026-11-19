@@ -14,8 +14,10 @@ use crate::codec::OpaqueValue;
 /// downstream kernels always see a positive cutoff.
 pub const TOP_K_DISABLED: i32 = 1 << 30;
 
-/// TokenSpeed's greedy-sampling threshold: a temperature below this collapses
-/// to greedy (`temperature = 1.0`, `top_k = 1`) during normalization.
+/// TokenSpeed's greedy-sampling threshold: a non-negative temperature below
+/// this collapses to greedy (`temperature = 1.0`, `top_k = 1`) during
+/// normalization. A negative one is not greedy: the engine's range check
+/// refuses it.
 const SAMPLING_EPS: f64 = 1e-6;
 
 /// Engine-facing sampling parameters for TokenSpeed text generation.
@@ -35,7 +37,8 @@ pub struct SamplingParams {
     /// Token IDs that stop generation (a Python set; encoded as an array).
     /// The normalized form uses `None` rather than an empty collection.
     pub stop_token_ids: Option<Vec<u32>>,
-    /// Controls randomness. Below `SAMPLING_EPS` normalizes to greedy.
+    /// Controls randomness. From zero up to `SAMPLING_EPS` normalizes to
+    /// greedy; a negative value rides as sent, for the engine to refuse.
     pub temperature: f64,
     /// Cumulative probability threshold for nucleus sampling.
     pub top_p: f64,
@@ -149,7 +152,10 @@ impl SamplingParams {
         if self.stop_token_ids.as_ref().is_some_and(Vec::is_empty) {
             self.stop_token_ids = None;
         }
-        if self.temperature < SAMPLING_EPS {
+        // The engine's bound has a floor too: a negative temperature is not
+        // greedy, it fails the engine's range check ("temperature must be
+        // non-negative") as it does on the in-process path.
+        if (0.0..SAMPLING_EPS).contains(&self.temperature) {
             self.temperature = 1.0;
             self.top_k = 1;
         }
@@ -286,5 +292,32 @@ mod tests {
         params.normalize();
         params.normalize();
         assert_eq!(params.top_k, 40);
+    }
+
+    /// The engine collapses `0 <= temperature < eps` only: a negative one is
+    /// not greedy, it fails the engine's range check. The wire leaves it as
+    /// sent, with the request's seed, so the engine refuses it as it refuses
+    /// the in-process path's.
+    #[test]
+    fn a_negative_temperature_is_left_for_the_engine_to_refuse() {
+        let mut params = SamplingParams {
+            temperature: -0.5,
+            seed: Some(7),
+            ..SamplingParams::default()
+        };
+        params.normalize();
+        assert_eq!(
+            (params.temperature, params.top_k, params.seed),
+            (-0.5, TOP_K_DISABLED, Some(7))
+        );
+        assert!(params.is_normalized);
+
+        // Zero itself is greedy.
+        let mut params = SamplingParams {
+            temperature: 0.0,
+            ..SamplingParams::default()
+        };
+        params.normalize();
+        assert_eq!((params.temperature, params.top_k), (1.0, 1));
     }
 }

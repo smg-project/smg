@@ -48,6 +48,7 @@ import yaml
 # fixture argument sites as F811 (redefinition); both are ignored
 # intentionally — pytest needs the name to be bound at module scope.
 from infra import MockMcpServer, launch_cloud_gateway
+from infra.cloud_credentials import resolve_cloud_credentials
 from infra.mock_mcp import mock_mcp_server as mock_mcp_server  # noqa: F401
 
 logger = logging.getLogger(__name__)
@@ -186,10 +187,11 @@ def gateway_with_mock_mcp_cloud(
     """Launch an OpenAI cloud gateway wired to the mock MCP server.
 
     Yields ``(gateway, client, mock_mcp_server, model)``. Skips when
-    ``OPENAI_API_KEY`` is absent.
+    direct-mode ``OPENAI_API_KEY`` is absent; explicit proxy mode uses a placeholder.
     """
-    api_key_env = "OPENAI_API_KEY"
-    if not os.environ.get(api_key_env):
+    credentials = resolve_cloud_credentials("openai", require_key=False)
+    api_key_env = credentials.api_key_env
+    if not credentials.api_key:
         pytest.skip(f"{api_key_env} not set — image_generation cloud lane needs OpenAI")
 
     logger.info(
@@ -206,7 +208,7 @@ def gateway_with_mock_mcp_cloud(
     try:
         client = openai.OpenAI(
             base_url=f"{gateway.base_url}/v1",
-            api_key=os.environ[api_key_env],
+            api_key=credentials.api_key,
         )
     except Exception:
         gateway.shutdown()
@@ -237,10 +239,11 @@ def gateway_with_mock_mcp_regular_cloud(
     MCP server (no ``builtin_type`` tag). Yields the same
     ``(gateway, client, mock_mcp_server, model)`` tuple shape as
     ``gateway_with_mock_mcp_cloud`` so existing helpers compose.
-    Skips when ``OPENAI_API_KEY`` is absent.
+    Skips when direct-mode ``OPENAI_API_KEY`` is absent; proxy mode needs no runner key.
     """
-    api_key_env = "OPENAI_API_KEY"
-    if not os.environ.get(api_key_env):
+    credentials = resolve_cloud_credentials("openai", require_key=False)
+    api_key_env = credentials.api_key_env
+    if not credentials.api_key:
         pytest.skip(f"{api_key_env} not set — regular-MCP cloud lane needs OpenAI")
 
     logger.info(
@@ -257,7 +260,7 @@ def gateway_with_mock_mcp_regular_cloud(
     try:
         client = openai.OpenAI(
             base_url=f"{gateway.base_url}/v1",
-            api_key=os.environ[api_key_env],
+            api_key=credentials.api_key,
         )
     except Exception:
         gateway.shutdown()

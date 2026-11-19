@@ -365,7 +365,6 @@ mod tests {
     use crate::{
         app_context::AppContext,
         config::RouterConfig,
-        health::ProbeState,
         middleware::{
             edge_body::at_the_edge,
             test_support::{echo_request, echo_route, ECHO_PATH},
@@ -374,6 +373,7 @@ mod tests {
         observability::inflight_tracker::InFlightRequestTracker,
         policies::PolicyRegistry,
         routers::gateway::Gateway,
+        server::{health::ProbeState, http_client},
         worker::WorkerRegistry,
     };
 
@@ -384,7 +384,7 @@ mod tests {
         let router_config = RouterConfig::default();
         let context = Arc::new(
             AppContext::builder()
-                .client(crate::server::http_client())
+                .client(http_client())
                 .rate_limiter(Some(bucket))
                 .tokenizer_registry(Arc::new(TokenizerRegistry::new()))
                 .reasoning_parser_factory(None)

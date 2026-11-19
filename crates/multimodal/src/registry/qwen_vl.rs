@@ -5,8 +5,11 @@ use serde_json::Value;
 use crate::{
     encoder_inputs::PreprocessedEncoderInputs,
     media::FrameSampling,
-    registry::{ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult},
-    types::{EncoderFieldLayouts, FieldLayout, Modality, PromptReplacement, TokenId},
+    registry::{
+        layouts::grid_patch_layouts_for, ModelMetadata, ModelProcessorSpec, ModelRegistryError,
+        RegistryResult,
+    },
+    types::{EncoderFieldLayouts, Modality, PromptReplacement, TokenId},
     vision::{PreProcessorConfig, Qwen2VLProcessor, VisionPreProcessor},
 };
 
@@ -45,12 +48,7 @@ pub(super) struct QwenVLVisionSpec;
 
 impl QwenVLVisionSpec {
     fn pad_token_id(metadata: &ModelMetadata) -> RegistryResult<TokenId> {
-        metadata
-            .config_u32(&["image_token_id"])
-            .map(|v| v as TokenId)
-            .ok_or_else(|| ModelRegistryError::MissingConfigField {
-                field: "image_token_id".to_string(),
-            })
+        metadata.config_token_id("image_token_id")
     }
 
     /// A checkpoint serves video when its config names the video placeholder's
@@ -63,12 +61,7 @@ impl QwenVLVisionSpec {
     }
 
     fn video_pad_token_id(metadata: &ModelMetadata) -> RegistryResult<TokenId> {
-        metadata
-            .config_u32(&["video_token_id"])
-            .map(|v| v as TokenId)
-            .ok_or_else(|| ModelRegistryError::MissingConfigField {
-                field: "video_token_id".to_string(),
-            })
+        metadata.config_token_id("video_token_id")
     }
 }
 
@@ -106,10 +99,7 @@ impl ModelProcessorSpec for QwenVLVisionSpec {
             Modality::Video if Self::names_a_video_token(metadata.config) => {
                 Ok(VIDEO_PAD_TOKEN.to_string())
             }
-            _ => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            _ => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
 
@@ -123,10 +113,7 @@ impl ModelProcessorSpec for QwenVLVisionSpec {
             Modality::Video if Self::names_a_video_token(metadata.config) => {
                 Self::video_pad_token_id(metadata)
             }
-            _ => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            _ => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
 
@@ -177,10 +164,7 @@ impl ModelProcessorSpec for QwenVLVisionSpec {
             Modality::Video if Self::names_a_video_token(model_config) => Ok(Box::new(
                 Qwen2VLProcessor::from_config_for(preprocessor_config, modality),
             )),
-            _ => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            _ => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
 
@@ -222,10 +206,7 @@ impl ModelProcessorSpec for QwenVLVisionSpec {
                     &preprocessed.feature_token_counts,
                 ))
             }
-            _ => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            _ => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
 
@@ -238,44 +219,10 @@ impl ModelProcessorSpec for QwenVLVisionSpec {
     /// One layout per modality for the gateway's assembly: a video batch
     /// carries `patches_per_video` and `video_grid_thw` and no image tensor,
     /// so its patches are sliced by its own sizes key; the image batch keeps
-    /// the image layout. The legacy map below answers every modality with the
-    /// image layout, which fails assembly for every video.
+    /// the image layout. The entry declares no legacy field map: the trait's
+    /// default reads one, and this override replaces that default.
     fn encoder_field_layouts_for(&self, modality: Modality) -> EncoderFieldLayouts {
-        match modality {
-            Modality::Video => EncoderFieldLayouts::new(
-                FieldLayout::flat("patches_per_video"),
-                HashMap::from([
-                    ("video_grid_thw".to_string(), FieldLayout::Batched),
-                    ("patches_per_video".to_string(), FieldLayout::Batched),
-                    ("video_second_per_grid".to_string(), FieldLayout::Batched),
-                ]),
-            ),
-            _ => EncoderFieldLayouts::new(
-                FieldLayout::flat("patches_per_image"),
-                HashMap::from([
-                    ("image_grid_thw".to_string(), FieldLayout::Batched),
-                    ("patches_per_image".to_string(), FieldLayout::Batched),
-                ]),
-            ),
-        }
-    }
-
-    fn field_layouts(&self) -> HashMap<String, FieldLayout> {
-        // encoder_input is patchified: [total_patches, patch_features].
-        // patches_per_image tells how many patches belong to each image.
-        // image_grid_thw is [num_images, 3]; the video fields follow the same
-        // shapes per clip, and video_second_per_grid is one value per clip.
-        HashMap::from([
-            (
-                "pixel_values".to_string(),
-                FieldLayout::flat("patches_per_image"),
-            ),
-            ("image_grid_thw".to_string(), FieldLayout::Batched),
-            ("patches_per_image".to_string(), FieldLayout::Batched),
-            ("video_grid_thw".to_string(), FieldLayout::Batched),
-            ("patches_per_video".to_string(), FieldLayout::Batched),
-            ("video_second_per_grid".to_string(), FieldLayout::Batched),
-        ])
+        grid_patch_layouts_for(modality)
     }
 
     fn keep_on_cpu_keys(&self) -> Vec<String> {
@@ -493,13 +440,13 @@ mod tests {
                 .encoder_input,
             FieldLayout::flat("patches_per_image")
         );
-        let layouts = spec.field_layouts();
+        let video_layouts = spec.encoder_field_layouts_for(Modality::Video);
         for key in [
             "video_grid_thw",
             "patches_per_video",
             "video_second_per_grid",
         ] {
-            assert!(layouts.contains_key(key), "{key}");
+            assert!(video_layouts.model_specific.contains_key(key), "{key}");
         }
         assert!(spec
             .keep_on_cpu_keys()

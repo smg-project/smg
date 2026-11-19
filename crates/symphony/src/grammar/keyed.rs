@@ -2,9 +2,11 @@
 //! style does not write: Ling's, with the template's newline after the call's name, after each
 //! `</arg_key>` and before `</tool_call>`; GLM 4.5 and 4.6's, with it after the name, after each
 //! `</arg_key>` and after each `</arg_value>`; K2-Horizon's, the same under `ifm|`-prefixed tags
-//! with the block's newline before each call and before its close; and Hy4's, every tag suffixed
-//! `:opensource` and the calls in a block. GLM 4.7's and IQuest's compact spelling keeps the
-//! `glm_xml` style, the shape the gateway writes for it today.
+//! with the block's newline before each call and before its close; LongCat's, the same under
+//! `longcat_`-prefixed tags with no block; Hy4's, every tag suffixed `:opensource` and the calls
+//! in a block; and Hy V3's, K2-Horizon's newlines under the plain tags with `<tool_sep>` after
+//! the name. GLM 4.7's and IQuest's compact spelling keeps the `glm_xml` style, the shape the
+//! gateway writes for it today.
 //!
 //! A call is the call's opener and the tool's name, then one `<arg_key>` and `<arg_value>` pair per
 //! property of the tool's schema, in the schema's order, each optional unless the schema requires
@@ -15,6 +17,8 @@
 //! block, the block's ways in frame one or more calls, as Kimi K3's do.
 //!
 //! [`shape`]: crate::shape
+
+use std::sync::Arc;
 
 use openai_protocol::common::Tool;
 use serde_json::Value;
@@ -63,22 +67,31 @@ pub(super) fn calls(
 /// Keyed arguments in the compact spelling (GLM 4.7 and later, IQuest): each call is the call
 /// opener and the tool's name, the schema written in the engines' `glm_xml` style (`<arg_key>`
 /// and `<arg_value>` pairs with nothing between them), and the call's close; the shape
-/// xgrammar's built-in GLM tag has and the gateway writes today. Ling's and Hy4's spellings
-/// are not this one, and are written from their own tags instead ([`calls()`]).
+/// xgrammar's built-in GLM tag has and the gateway's older parser writes. The style ends a value
+/// at `</arg_value>` alone, so the schema excludes what else ends one ([`Ends`]): the terminals
+/// the table has a row for out of the arguments state, which the engine takes inside a value too.
+/// Without them a value the tag let hold `</tool_call>` was read as a call cut there, and a quoted
+/// `<tool_call>` after it as a call the tag never allowed. Ling's and Hy4's spellings are not this
+/// one, and are written from their own tags instead ([`calls()`]).
 pub(super) fn compact_calls(
     markers: &CallMarkers<'_>,
     tools: &[&Tool],
     count: Count<'_>,
 ) -> Grammar {
+    let excludes: Vec<String> = markers
+        .call_exits
+        .iter()
+        .map(|exit| exit.to_string())
+        .collect();
     let tags = tools
         .iter()
         .map(|tool| {
             Tag::new(
                 format!("{}{}", markers.call_open, tool.function.name),
                 Grammar::JsonSchema {
-                    schema: tool.function.parameters_schema().clone(),
+                    schema: Arc::new(tool.function.parameters_schema().clone()),
                     style: Some("glm_xml".to_string()),
-                    excludes: Vec::new(),
+                    excludes: excludes.clone(),
                     whitespace: Whitespace::Free,
                 },
                 markers.call_close,
@@ -106,8 +119,9 @@ impl Ends<'_> {
     }
 }
 
-/// One call as its three parts: the opener with the name and the newline the spelling writes after
-/// it, the arguments, and the newline the spelling writes before the close with the close.
+/// One call as its three parts: the opener with the name, the text the spelling writes after the
+/// name (Hy V3's `<tool_sep>`) and its newline, the arguments, and the newline the spelling writes
+/// before the close with the close.
 fn call(
     markers: &CallMarkers<'_>,
     tags: &Tags,
@@ -116,7 +130,10 @@ fn call(
     parameters: &Value,
 ) -> (String, Grammar, String) {
     (
-        format!("{}{name}{}", markers.call_open, tags.newlines.after_name),
+        format!(
+            "{}{name}{}{}",
+            markers.call_open, tags.name_end, tags.newlines.after_name
+        ),
         arguments(tags, ends, parameters),
         format!("{}{}", tags.newlines.before_close, markers.call_close),
     )
@@ -290,6 +307,35 @@ mod tests {
     }
 
     #[test]
+    fn longcat_writes_glm4s_newlines_under_its_prefixed_tags_with_no_block() {
+        // LongCat's template writes GLM 4.6's newlines under `longcat_`-prefixed tags, each call
+        // bare: in longcat-2.5's recorded parse sets, 18 of 18 calls read
+        // `<longcat_tool_call>NAME\n`, 28 of 28 pairs `</longcat_arg_key>\n<longcat_arg_value>`
+        // and `</longcat_arg_value>\n`, and the one without arguments
+        // `<longcat_tool_call>NAME\n</longcat_tool_call>`.
+        let payload = formats::longcat()
+            .grammar(&weather_tools(), true, false)
+            .expect("a grammar")
+            .payload();
+        let tags = payload["format"]["tags"].as_array().expect("two tags");
+        assert_eq!(tags[0]["begin"], "<longcat_tool_call>get_weather\n");
+        assert_eq!(tags[0]["end"], "</longcat_tool_call>");
+        let pairs = tags[0]["content"]["elements"]
+            .as_array()
+            .expect("three pairs");
+        let city = pairs[0]["elements"].as_array().expect("a pair's parts");
+        assert_eq!(city[2]["value"], "</longcat_arg_key>\n<longcat_arg_value>");
+        assert_eq!(city[4]["value"], "</longcat_arg_value>\n");
+        // A call without arguments: the name's newline, then the close; no block around it.
+        let written = format!(
+            "{}{}",
+            tags[1]["begin"].as_str().expect("begin"),
+            tags[1]["end"].as_str().expect("end")
+        );
+        assert_eq!(written, "<longcat_tool_call>ping\n</longcat_tool_call>");
+    }
+
+    #[test]
     fn k2_horizon_writes_its_block_with_a_newline_before_each_call_and_before_the_close() {
         // K2-Horizon's template writes `<ifm|tool_calls>`, then each call after a newline, then a
         // newline and `</ifm|tool_calls>`; every one of the recorded sets' 1,935 block openings,
@@ -392,6 +438,63 @@ mod tests {
     }
 
     #[test]
+    fn hy_v3_writes_the_separator_after_the_name_and_k2_horizons_newlines() {
+        // Hy V3's template writes `<tool_calls>`, each call after a newline as `<tool_call>`, the
+        // name, `<tool_sep>` and a newline, GLM 4.6's pairs and `</tool_call>`, then a newline and
+        // `</tool_calls>` (every call of hy-memory-30b-a3b's recorded parse sets); a zero-argument
+        // call is its name, the separator and the newline.
+        let payload = formats::hy_v3()
+            .grammar(&weather_tools(), true, false)
+            .expect("a grammar")
+            .payload();
+        let block = &payload["format"]["tags"][0];
+        assert_eq!(block["begin"], "<tool_calls>");
+        assert_eq!(block["end"], "</tool_calls>");
+        let inside = block["content"]["elements"]
+            .as_array()
+            .expect("calls, then the newline");
+        assert_eq!(inside[1], value!({"type": "const_string", "value": "\n"}));
+        let each = inside[0]["content"]["elements"]
+            .as_array()
+            .expect("the newline, then one of the calls");
+        assert_eq!(each[0], value!({"type": "const_string", "value": "\n"}));
+        let calls = each[1]["elements"].as_array().expect("two tools");
+        let weather = calls[0]["elements"].as_array().expect("a call's parts");
+        assert_eq!(weather[0]["value"], "<tool_call>get_weather<tool_sep>\n");
+        assert_eq!(weather[2]["value"], "</tool_call>");
+        let city = weather[1]["elements"][0]["elements"]
+            .as_array()
+            .expect("the first pair's parts");
+        assert_eq!(city[2]["value"], "</arg_key>\n<arg_value>");
+        assert_eq!(city[4]["value"], "</arg_value>\n");
+        let ping = calls[1]["elements"]
+            .as_array()
+            .expect("the zero-argument call's parts");
+        assert_eq!(ping[0]["value"], "<tool_call>ping<tool_sep>\n");
+        assert_eq!(ping[1]["type"], "star");
+        assert_eq!(ping[2]["value"], "</tool_call>");
+        // The separator is no tag: the prefix before the block excludes the block's markers and
+        // the four tags, and nothing else.
+        let with_prefix = formats::hy_v3()
+            .grammar(&weather_tools(), true, true)
+            .expect("a grammar")
+            .payload();
+        assert_eq!(
+            with_prefix["format"]["elements"][0]["excludes"],
+            value!([
+                "<tool_calls>",
+                "</tool_calls>",
+                "<tool_call>",
+                "</tool_call>",
+                "<arg_key>",
+                "</arg_key>",
+                "<arg_value>",
+                "</arg_value>",
+            ])
+        );
+    }
+
+    #[test]
     fn ling_with_the_reasoning_open_takes_the_prefix_as_glm_does() {
         let payload = formats::ling()
             .grammar(&weather_tools(), false, true)
@@ -470,6 +573,38 @@ mod tests {
                 "{}",
                 format.name()
             );
+        }
+    }
+
+    #[test]
+    fn a_compact_value_holds_nothing_that_ends_the_call() {
+        // The engine ends a call at the table's call terminals wherever they stand, a value
+        // included (`docs/engine.md`), so every value's text excludes them, as the tags written
+        // from the table's own tags exclude them (`Ends`): the call's close, and its opener, which
+        // ends the call open and starts the next. A value the tag let hold `</tool_call>` was read
+        // as the call cut there, and a quoted `<tool_call>` after it as a second call.
+        let tools = weather_tools();
+        for (format, exits) in [
+            (formats::glm(), ["</tool_call>", "<tool_call>"]),
+            (
+                formats::iquest(),
+                ["</iquest_tool_call>", "<iquest_tool_call>"],
+            ),
+        ] {
+            let payload = format
+                .grammar(&tools, true, false)
+                .expect("a grammar")
+                .payload();
+            let tags = payload["format"]["tags"].as_array().expect("the tags");
+            assert!(!tags.is_empty(), "{}", format.name());
+            for tag in tags {
+                assert_eq!(
+                    tag["content"]["excludes"],
+                    value!(exits),
+                    "{}",
+                    format.name()
+                );
+            }
         }
     }
 }

@@ -3,12 +3,12 @@ mod detect_backend;
 mod detect_connection;
 mod discover_dp;
 mod discover_metadata;
-pub(crate) use discover_metadata::discover_grpc_kv_engine_id;
 mod drain_workers;
 mod ensure_harmony_encoding;
 mod find_worker_to_update;
 mod find_workers_to_remove;
 mod rediscover_labels;
+mod release_tokenizer;
 mod remove_from_policy_registry;
 mod remove_from_worker_registry;
 mod submit_tokenizer_job;
@@ -31,6 +31,7 @@ pub use find_worker_to_update::FindWorkerToUpdateStep;
 pub use find_workers_to_remove::{FindWorkersToRemoveStep, WorkerRemovalRequest};
 use openai_protocol::worker::WorkerUpdateRequest;
 pub use rediscover_labels::RediscoverLabelsStep;
+pub use release_tokenizer::ReleaseTokenizerStep;
 pub use remove_from_policy_registry::RemoveFromPolicyRegistryStep;
 pub use remove_from_worker_registry::RemoveFromWorkerRegistryStep;
 pub use submit_tokenizer_job::SubmitTokenizerJobStep;
@@ -41,7 +42,7 @@ use wfaas::{BackoffStrategy, RetryPolicy, StepDefinition, WorkflowDefinition};
 
 use crate::{
     app_context::AppContext,
-    worker::{endpoint::Endpoint, Worker, WorkerRegistry},
+    worker::{identity::endpoint::Endpoint, Worker, WorkerRegistry},
     workflow::data::{WorkerRemovalWorkflowData, WorkerUpdateWorkflowData},
 };
 
@@ -57,6 +58,13 @@ use crate::{
 /// - A query carrying a `@rank` suffix selects only that rank. Without one, a
 ///   base address selects its plain registration and every expanded rank.
 ///
+/// On a network address a trailing `@digits` is always a rank: the URL check
+/// refuses the suffix on a posted address. A socket path may end the same way
+/// by itself. There a query that writes a suffix names one path and selects
+/// only the worker whose URL writes it the same way: `w@0` and `w@00` are two
+/// sockets. A query without a suffix selects the worker at that path and the
+/// workers that carry the data-parallel rank their URL ends in.
+///
 /// The group is read from what is registered, never from the gateway's global
 /// DP setting: a rank exists in the registry or it does not, and a removal
 /// must find the same set either way.
@@ -64,6 +72,12 @@ use crate::{
 /// An address neither side can parse selects nothing rather than falling back
 /// to a string comparison that could match the wrong backend.
 pub(crate) fn find_workers_by_url(registry: &WorkerRegistry, url: &str) -> Vec<Arc<dyn Worker>> {
+    /// What follows an address's last `@`, as it is written: a rank reads
+    /// `@0` and `@00` alike, a socket path does not.
+    fn suffix_as_written(url: &str) -> Option<&str> {
+        url.trim().rsplit_once('@').map(|(_, suffix)| suffix)
+    }
+
     let Ok((query, query_rank)) = Endpoint::parse_with_rank(url) else {
         return Vec::new();
     };
@@ -81,6 +95,12 @@ pub(crate) fn find_workers_by_url(registry: &WorkerRegistry, url: &str) -> Vec<A
             if query.scheme().is_some() && query.scheme() != registered.scheme() {
                 return false;
             }
+            if registered.is_ipc() {
+                return match query_rank {
+                    Some(_) => suffix_as_written(url) == suffix_as_written(worker.url()),
+                    None => registered_rank.is_none() || registered_rank == worker.dp_rank(),
+                };
+            }
             query_rank.is_none() || query_rank == registered_rank
         })
         .collect()
@@ -95,11 +115,18 @@ pub(crate) fn find_workers_by_url(registry: &WorkerRegistry, url: &str) -> Vec<A
 ///         drain_workers
 ///              │
 ///     remove_from_worker_registry
-///              │
-///     remove_from_policy_registry
+///                  │
+///       +----------+----------+
+///       │                     │
+///       v                     v
+///  remove_from_policy_registry   release_tokenizer
 /// ```
 /// Cache cleanup removes only departed tenants, so surviving workers do not
-/// need the previous full-policy reinitialization pass.
+/// need the previous full-policy reinitialization pass. The tokenizer release
+/// waits on the registry step alone: it reads the worker registry and the
+/// record of worker-loaded entries, both settled there, and a policy cleanup
+/// that fails or times out must not keep a departed model's tokenizer
+/// resident (a failed step's dependents are never scheduled).
 pub fn create_worker_removal_workflow() -> WorkflowDefinition<WorkerRemovalWorkflowData> {
     WorkflowDefinition::new("worker_removal", "Remove worker from router")
         .add_step(
@@ -109,10 +136,7 @@ pub fn create_worker_removal_workflow() -> WorkflowDefinition<WorkerRemovalWorkf
                 Arc::new(FindWorkersToRemoveStep),
             )
             .with_timeout(Duration::from_secs(10))
-            .with_retry(RetryPolicy {
-                max_attempts: 1,
-                backoff: BackoffStrategy::Fixed(Duration::from_secs(0)),
-            }),
+            .with_retry(single_attempt()),
         )
         .add_step(
             StepDefinition::new(
@@ -127,10 +151,7 @@ pub fn create_worker_removal_workflow() -> WorkflowDefinition<WorkerRemovalWorkf
             // without visibility into runtime config and would
             // preemptively fail the workflow for legitimately long
             // drain windows, leaving workers stuck in `Draining`.
-            .with_retry(RetryPolicy {
-                max_attempts: 1,
-                backoff: BackoffStrategy::Fixed(Duration::from_secs(0)),
-            })
+            .with_retry(single_attempt())
             .depends_on(&["find_workers_to_remove"]),
         )
         .add_step(
@@ -140,10 +161,7 @@ pub fn create_worker_removal_workflow() -> WorkflowDefinition<WorkerRemovalWorkf
                 Arc::new(RemoveFromWorkerRegistryStep),
             )
             .with_timeout(Duration::from_secs(10))
-            .with_retry(RetryPolicy {
-                max_attempts: 1,
-                backoff: BackoffStrategy::Fixed(Duration::from_secs(0)),
-            })
+            .with_retry(single_attempt())
             .depends_on(&["drain_workers"]),
         )
         .add_step(
@@ -154,10 +172,20 @@ pub fn create_worker_removal_workflow() -> WorkflowDefinition<WorkerRemovalWorkf
             )
             // The old 10s override was too short for large cache cleanup.
             // Inherit the workflow default after the worker is deregistered.
-            .with_retry(RetryPolicy {
-                max_attempts: 1,
-                backoff: BackoffStrategy::Fixed(Duration::from_secs(0)),
-            })
+            .with_retry(single_attempt())
+            .depends_on(&["remove_from_worker_registry"]),
+        )
+        .add_step(
+            StepDefinition::new(
+                "release_tokenizer",
+                "Release the tokenizers of the models no worker serves any more",
+                Arc::new(ReleaseTokenizerStep),
+            )
+            .with_timeout(Duration::from_secs(10))
+            .with_retry(single_attempt())
+            // On the registry step, not the policy cleanup: the release reads
+            // what that step settled, and a cleanup that fails or times out
+            // must not hold it back (a failed step's dependents never run).
             .depends_on(&["remove_from_worker_registry"]),
         )
 }
@@ -181,10 +209,7 @@ pub fn create_worker_update_workflow() -> WorkflowDefinition<WorkerUpdateWorkflo
                 Arc::new(FindWorkerToUpdateStep),
             )
             .with_timeout(Duration::from_secs(10))
-            .with_retry(RetryPolicy {
-                max_attempts: 1,
-                backoff: BackoffStrategy::Fixed(Duration::from_secs(0)),
-            }),
+            .with_retry(single_attempt()),
         )
         .add_step(
             StepDefinition::new(
@@ -208,10 +233,7 @@ pub fn create_worker_update_workflow() -> WorkflowDefinition<WorkerUpdateWorkflo
                 Arc::new(UpdateWorkerPropertiesStep),
             )
             .with_timeout(Duration::from_secs(10))
-            .with_retry(RetryPolicy {
-                max_attempts: 1,
-                backoff: BackoffStrategy::Fixed(Duration::from_secs(0)),
-            })
+            .with_retry(single_attempt())
             .depends_on(&["rediscover_labels"]),
         )
         .add_step(
@@ -221,10 +243,7 @@ pub fn create_worker_update_workflow() -> WorkflowDefinition<WorkerUpdateWorkflo
                 Arc::new(UpdatePoliciesForWorkerStep),
             )
             .with_timeout(Duration::from_secs(10))
-            .with_retry(RetryPolicy {
-                max_attempts: 1,
-                backoff: BackoffStrategy::Fixed(Duration::from_secs(0)),
-            })
+            .with_retry(single_attempt())
             .depends_on(&["update_worker_properties"]),
         )
 }
@@ -232,7 +251,7 @@ pub fn create_worker_update_workflow() -> WorkflowDefinition<WorkerUpdateWorkflo
 /// Helper to create initial workflow data for worker removal
 pub fn create_worker_removal_workflow_data(
     url: String,
-    expected_revisions: Option<std::collections::HashMap<String, u64>>,
+    expected_revisions: Option<std::collections::HashMap<String, Option<u64>>>,
     app_context: Arc<AppContext>,
 ) -> WorkerRemovalWorkflowData {
     WorkerRemovalWorkflowData {
@@ -245,6 +264,7 @@ pub fn create_worker_removal_workflow_data(
         affected_models: std::collections::HashSet::new(),
         app_context: Some(app_context),
         actual_workers_to_remove: None,
+        removed_workers: Vec::new(),
     }
 }
 
@@ -263,6 +283,14 @@ pub fn create_worker_update_workflow_data(
         refresh_discovered_labels: false,
         fresh_engine_labels: None,
         snapshot: None,
+    }
+}
+
+/// One attempt and no wait: a step given this policy is not run again.
+fn single_attempt() -> RetryPolicy {
+    RetryPolicy {
+        max_attempts: 1,
+        backoff: BackoffStrategy::Fixed(Duration::from_secs(0)),
     }
 }
 
@@ -403,6 +431,38 @@ mod dp_removal_tests {
         );
     }
 
+    /// A socket path may itself end in `@` and digits. On a worker that
+    /// carries no data-parallel rank those characters are the path's own:
+    /// the path without them is another socket, a path that writes the
+    /// digits another way is a third, and none of them selects another
+    /// worker, a real rank included. A real rank still leaves with its base.
+    #[test]
+    fn a_socket_path_that_ends_like_a_rank_is_its_own_address() {
+        let registry = WorkerRegistry::new();
+        register(&registry, "ipc:///tmp/w", None);
+        register(&registry, "ipc:///tmp/w@0", None);
+        register(&registry, "ipc:///tmp/w@00", None);
+        register(&registry, "ipc:///tmp/g", Some(0));
+        register(&registry, "ipc:///tmp/g", Some(1));
+        register(&registry, "ipc:///tmp/g@00", None);
+        // A rank on a network address is selected by its base with or
+        // without its data-parallel metadata.
+        register(&registry, "grpc://10.0.0.7:8000@1", None);
+
+        for (query, selected) in [
+            ("ipc:///tmp/w", vec!["ipc:///tmp/w"]),
+            ("ipc:///tmp/w@0", vec!["ipc:///tmp/w@0"]),
+            ("ipc:///tmp/w@00", vec!["ipc:///tmp/w@00"]),
+            ("ipc:///tmp/g", vec!["ipc:///tmp/g@0", "ipc:///tmp/g@1"]),
+            ("ipc:///tmp/g@1", vec!["ipc:///tmp/g@1"]),
+            ("ipc:///tmp/g@0", vec!["ipc:///tmp/g@0"]),
+            ("ipc:///tmp/g@00", vec!["ipc:///tmp/g@00"]),
+            ("grpc://10.0.0.7:8000", vec!["grpc://10.0.0.7:8000@1"]),
+        ] {
+            assert_eq!(urls(&registry, query), selected, "{query}");
+        }
+    }
+
     #[test]
     fn rank_matching_uses_metadata_not_an_at_sign_prefix() {
         let registry = WorkerRegistry::new();
@@ -423,9 +483,90 @@ mod dp_removal_tests {
 
 #[cfg(test)]
 mod tests {
-    use wfaas::StepId;
+    use llm_tokenizer::TokenizerRegistry;
+    use wfaas::{
+        StepExecutor, StepId, StepResult, StepStatus, WorkflowContext, WorkflowEngine,
+        WorkflowError, WorkflowId, WorkflowInstanceId, WorkflowResult, WorkflowState,
+        WorkflowStatus,
+    };
 
     use super::*;
+    use crate::{
+        app_context::testing::app_context_for_tests,
+        config::RouterConfig,
+        worker::{BasicWorkerBuilder, ConnectionMode, ModelCard},
+        workflow::tokenizer_registration::{
+            create_tokenizer_workflow_data, test_support::tokenizer_dir, LoadTokenizerStep,
+            TokenizerConfigRequest,
+        },
+    };
+
+    /// The removal workflow as a whole, its steps run in the definition's
+    /// order, on a tokenizer the registration step loaded for a worker: it
+    /// stays while a worker of the model remains and leaves the registry
+    /// with the model's last worker.
+    #[tokio::test(start_paused = true)]
+    async fn removing_a_models_last_worker_releases_its_tokenizer() {
+        let app_context = app_context_for_tests(
+            RouterConfig::builder()
+                .round_robin_policy()
+                .build_unchecked(),
+            Arc::new(WorkerRegistry::new()),
+            None,
+        );
+        for url in ["http://w1:8000", "http://w2:8000"] {
+            let worker: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .model(ModelCard::new("m"))
+                    .label("tokenizer_path", "/tok/m")
+                    .connection_mode(ConnectionMode::Grpc)
+                    .build(),
+            );
+            app_context.worker_registry.register(worker);
+        }
+        let dir = tokenizer_dir();
+        let mut registration = WorkflowContext::new(
+            WorkflowInstanceId::new(),
+            create_tokenizer_workflow_data(
+                TokenizerConfigRequest {
+                    id: TokenizerRegistry::generate_id(),
+                    name: "m".to_string(),
+                    source: dir.path().to_str().unwrap().to_string(),
+                    chat_template_path: None,
+                    cache_config: None,
+                    fail_on_duplicate: false,
+                    for_worker: true,
+                },
+                Arc::clone(&app_context),
+            ),
+        );
+        LoadTokenizerStep.execute(&mut registration).await.unwrap();
+
+        for (url, remaining) in [("http://w1:8000", true), ("http://w2:8000", false)] {
+            let workflow = create_worker_removal_workflow();
+            let mut context = WorkflowContext::new(
+                WorkflowInstanceId::new(),
+                create_worker_removal_workflow_data(
+                    url.to_string(),
+                    None,
+                    Arc::clone(&app_context),
+                ),
+            );
+            for step in &workflow.steps {
+                step.executor.execute(&mut context).await.unwrap();
+            }
+            assert_eq!(
+                app_context.worker_registry.contains_model("m"),
+                remaining,
+                "a worker of the model after removing {url}"
+            );
+            assert_eq!(
+                app_context.tokenizer_registry.contains("m"),
+                remaining,
+                "the model's tokenizer after removing {url}"
+            );
+        }
+    }
 
     #[test]
     fn worker_removal_deregisters_before_policy_cleanup() {
@@ -451,5 +592,150 @@ mod tests {
             .steps
             .iter()
             .all(|step| step.id != StepId::new("update_remaining_policies")));
+    }
+
+    #[test]
+    fn the_tokenizer_release_waits_on_the_registry_step_alone() {
+        let workflow = create_worker_removal_workflow();
+        let release_step = workflow
+            .steps
+            .iter()
+            .find(|step| step.id == StepId::new("release_tokenizer"))
+            .unwrap();
+
+        assert_eq!(
+            release_step.depends_on,
+            vec![StepId::new("remove_from_worker_registry")]
+        );
+    }
+
+    /// A policy cleanup that fails, in the step's place.
+    struct FailingPolicyCleanup;
+
+    #[async_trait::async_trait]
+    impl StepExecutor<WorkerRemovalWorkflowData> for FailingPolicyCleanup {
+        async fn execute(
+            &self,
+            _context: &mut WorkflowContext<WorkerRemovalWorkflowData>,
+        ) -> WorkflowResult<StepResult> {
+            Err(WorkflowError::StepFailed {
+                step_id: StepId::new("remove_from_policy_registry"),
+                message: "the cleanup timed out".to_string(),
+            })
+        }
+
+        fn is_retryable(&self, _error: &WorkflowError) -> bool {
+            false
+        }
+    }
+
+    /// The state once the engine has no step pending or running, read
+    /// without the engine's own waiter (which cleans a terminal state up).
+    async fn settled(
+        engine: &WorkflowEngine<WorkerRemovalWorkflowData>,
+        instance_id: WorkflowInstanceId,
+    ) -> WorkflowState<WorkerRemovalWorkflowData> {
+        let mut state = engine.get_status(instance_id).await.unwrap();
+        for _ in 0..600 {
+            if state.status != WorkflowStatus::Running && state.status != WorkflowStatus::Pending {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            state = engine.get_status(instance_id).await.unwrap();
+        }
+        state
+    }
+
+    /// The removal workflow through the engine with a policy cleanup that
+    /// fails: the workflow ends failed, and the departed model's tokenizer
+    /// leaves the registry all the same, since the release depends on the
+    /// registry step and not on the cleanup (a failed step's dependents are
+    /// never scheduled).
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_policy_cleanup_does_not_keep_the_departed_models_tokenizer() {
+        let app_context = app_context_for_tests(
+            RouterConfig::builder()
+                .round_robin_policy()
+                .build_unchecked(),
+            Arc::new(WorkerRegistry::new()),
+            None,
+        );
+        for url in ["http://w1:8000", "http://w2:8000"] {
+            let worker: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .model(ModelCard::new("m"))
+                    .label("tokenizer_path", "/tok/m")
+                    .connection_mode(ConnectionMode::Grpc)
+                    .build(),
+            );
+            app_context.worker_registry.register(worker);
+        }
+        let dir = tokenizer_dir();
+        let mut registration = WorkflowContext::new(
+            WorkflowInstanceId::new(),
+            create_tokenizer_workflow_data(
+                TokenizerConfigRequest {
+                    id: TokenizerRegistry::generate_id(),
+                    name: "m".to_string(),
+                    source: dir.path().to_str().unwrap().to_string(),
+                    chat_template_path: None,
+                    cache_config: None,
+                    fail_on_duplicate: false,
+                    for_worker: true,
+                },
+                Arc::clone(&app_context),
+            ),
+        );
+        LoadTokenizerStep.execute(&mut registration).await.unwrap();
+
+        let mut workflow = create_worker_removal_workflow();
+        workflow
+            .steps
+            .iter_mut()
+            .find(|step| step.id == StepId::new("remove_from_policy_registry"))
+            .unwrap()
+            .executor = Arc::new(FailingPolicyCleanup);
+        let engine: WorkflowEngine<WorkerRemovalWorkflowData> = WorkflowEngine::new();
+        engine.register_workflow(workflow).unwrap();
+
+        for (url, remaining) in [("http://w1:8000", true), ("http://w2:8000", false)] {
+            let instance_id = engine
+                .start_workflow(
+                    WorkflowId::new("worker_removal"),
+                    create_worker_removal_workflow_data(
+                        url.to_string(),
+                        None,
+                        Arc::clone(&app_context),
+                    ),
+                )
+                .await
+                .unwrap();
+            let state = settled(&engine, instance_id).await;
+            assert_eq!(
+                state.status,
+                WorkflowStatus::Failed,
+                "the workflow after removing {url}"
+            );
+            assert_eq!(
+                state.step_states[&StepId::new("remove_from_policy_registry")].status,
+                StepStatus::Failed,
+                "the policy cleanup after removing {url}"
+            );
+            assert_eq!(
+                state.step_states[&StepId::new("release_tokenizer")].status,
+                StepStatus::Succeeded,
+                "the release after removing {url}"
+            );
+            assert_eq!(
+                app_context.worker_registry.contains_model("m"),
+                remaining,
+                "a worker of the model after removing {url}"
+            );
+            assert_eq!(
+                app_context.tokenizer_registry.contains("m"),
+                remaining,
+                "the model's tokenizer after removing {url}"
+            );
+        }
     }
 }

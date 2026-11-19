@@ -16,6 +16,34 @@ fn try_harmony_encoding() -> Result<&'static HarmonyEncoding, String> {
     super::builder::try_harmony_encoding()
 }
 
+fn call_id() -> String {
+    format!("call_{}", Uuid::now_v7())
+}
+
+fn function_call(name: &str, arguments: String) -> ToolCall {
+    ToolCall {
+        id: call_id(),
+        tool_type: "function".to_string(),
+        function: FunctionCallResponse {
+            name: name.to_string(),
+            arguments: Some(arguments),
+        },
+    }
+}
+
+fn append_reasoning(analysis: &mut Option<String>, text: String) {
+    if text.is_empty() {
+        return;
+    }
+    match analysis.as_mut() {
+        Some(existing) => {
+            existing.push('\n');
+            existing.push_str(&text);
+        }
+        None => *analysis = Some(text),
+    }
+}
+
 /// Harmony parser adapter
 ///
 /// Wraps openai_harmony::StreamableParser and provides methods for parsing
@@ -132,20 +160,9 @@ impl HarmonyParserAdapter {
                     // Process each content item separately
                     for content in &msg.content {
                         if let openai_harmony::chat::Content::Text(tc) = content {
-                            let call_id = format!("call_{}", Uuid::now_v7());
-                            let tool_call = ToolCall {
-                                id: call_id,
-                                tool_type: "function".to_string(),
-                                function: FunctionCallResponse {
-                                    name: function_name.to_string(),
-                                    arguments: Some(tc.text.clone()),
-                                },
-                            };
-
-                            match commentary.as_mut() {
-                                Some(calls) => calls.push(tool_call),
-                                None => commentary = Some(vec![tool_call]),
-                            }
+                            commentary
+                                .get_or_insert_with(Vec::new)
+                                .push(function_call(function_name, tc.text.clone()));
                         }
                     }
                     // Skip further channel processing for this message
@@ -157,17 +174,7 @@ impl HarmonyParserAdapter {
                     // Built-in tools → treat as reasoning
                     // For Chat API, we add to analysis content
                     let text = Self::extract_text_from_content(&msg.content);
-
-                    if !text.is_empty() {
-                        // Append to analysis (built-in tools are reasoning)
-                        match analysis.as_mut() {
-                            Some(existing) => {
-                                existing.push('\n');
-                                existing.push_str(&text);
-                            }
-                            None => analysis = Some(text),
-                        }
-                    }
+                    append_reasoning(&mut analysis, text);
                     // Skip further channel processing
                     continue;
                 }
@@ -195,16 +202,7 @@ impl HarmonyParserAdapter {
                     );
 
                     let text = Self::extract_text_from_content(&msg.content);
-
-                    if !text.is_empty() {
-                        match analysis.as_mut() {
-                            Some(existing) => {
-                                existing.push('\n');
-                                existing.push_str(&text);
-                            }
-                            None => analysis = Some(text),
-                        }
-                    }
+                    append_reasoning(&mut analysis, text);
                 }
                 "final" => {
                     // Process final channel content
@@ -239,37 +237,36 @@ impl HarmonyParserAdapter {
                 .process(token_id)
                 .map_err(|e| format!("Failed to process token {token_id}: {e}"))?;
 
-            // Count reasoning tokens (analysis + commentary channels)
-            if let Some(channel) = self.parser.current_channel() {
-                if channel == "analysis" || channel == "commentary" {
-                    reasoning_token_count += 1;
-                }
+            if self.in_reasoning_channel() {
+                reasoning_token_count += 1;
             }
         }
+        Ok(self.output(finish_reason, reasoning_token_count))
+    }
 
-        // Extract all completed messages from the parser
+    fn in_reasoning_channel(&self) -> bool {
+        matches!(
+            self.parser.current_channel().as_deref(),
+            Some("analysis" | "commentary")
+        )
+    }
+
+    fn output(&self, finish_reason: String, reasoning_token_count: u32) -> HarmonyChannelOutput {
         let messages = self.parser.messages();
-
-        // Parse messages into channel outputs using shared helper
         let (mut analysis, commentary, mut final_text) = Self::parse_messages(messages);
-
-        // Check for incomplete content in parser state
         Self::handle_incomplete_content(&self.parser, &mut analysis, &mut final_text);
-
-        // Determine finish reason: override to "tool_calls" if commentary has tool calls
-        let final_finish_reason = if commentary.is_some() {
+        let finish_reason = if commentary.is_some() {
             "tool_calls".to_string()
         } else {
-            finish_reason.clone()
+            finish_reason
         };
-
-        Ok(HarmonyChannelOutput {
+        HarmonyChannelOutput {
             analysis,
             commentary,
             final_text,
-            finish_reason: final_finish_reason,
+            finish_reason,
             reasoning_token_count,
-        })
+        }
     }
 
     /// Get all messages from the parser
@@ -314,18 +311,7 @@ impl HarmonyParserAdapter {
             return None;
         };
 
-        // Create tool call from incomplete content
-        let call_id = format!("call_{}", Uuid::now_v7());
-        let tool_call = ToolCall {
-            id: call_id,
-            tool_type: "function".to_string(),
-            function: FunctionCallResponse {
-                name: function_name.to_string(),
-                arguments: Some(content),
-            },
-        };
-
-        Some(vec![tool_call])
+        Some(vec![function_call(function_name, content)])
     }
 
     /// Parse streaming chunk
@@ -357,11 +343,8 @@ impl HarmonyParserAdapter {
                 .process(token_id)
                 .map_err(|e| format!("Failed to process token {token_id}: {e}"))?;
 
-            // Count reasoning tokens (analysis + commentary channels)
-            if let Some(channel) = self.parser.current_channel() {
-                if channel == "analysis" || channel == "commentary" {
-                    self.reasoning_token_count += 1;
-                }
+            if self.in_reasoning_channel() {
+                self.reasoning_token_count += 1;
             }
 
             // Check for content delta
@@ -411,11 +394,9 @@ impl HarmonyParserAdapter {
 
                     if recipient_changed {
                         // NEW tool call: emit name + id
-                        let call_id = format!("call_{}", Uuid::now_v7());
-
                         commentary_delta = Some(super::types::ToolCallDelta {
                             index: base_index,
-                            id: Some(call_id),
+                            id: Some(call_id()),
                             function: Some(super::types::FunctionDelta {
                                 name: Some(tool_name.to_string()),
                                 arguments: Some(String::new()),
@@ -466,28 +447,6 @@ impl HarmonyParserAdapter {
     ///
     /// Final HarmonyChannelOutput with complete parsed content
     pub fn finalize(&mut self, finish_reason: String) -> HarmonyChannelOutput {
-        // Extract all completed messages
-        let messages = self.parser.messages();
-
-        // Parse messages into channel outputs using shared helper
-        let (mut analysis, commentary, mut final_text) = Self::parse_messages(messages);
-
-        // Check for remaining incomplete content
-        Self::handle_incomplete_content(&self.parser, &mut analysis, &mut final_text);
-
-        // Determine finish reason: override to "tool_calls" if commentary has tool calls
-        let final_finish_reason = if commentary.is_some() {
-            "tool_calls".to_string()
-        } else {
-            finish_reason
-        };
-
-        HarmonyChannelOutput {
-            analysis,
-            commentary,
-            final_text,
-            finish_reason: final_finish_reason,
-            reasoning_token_count: self.reasoning_token_count,
-        }
+        self.output(finish_reason, self.reasoning_token_count)
     }
 }

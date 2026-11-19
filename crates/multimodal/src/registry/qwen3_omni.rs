@@ -7,6 +7,7 @@ use crate::{
     encoder_inputs::PreprocessedEncoderInputs,
     media::FrameSampling,
     registry::{
+        layouts::grid_patch_layouts_for,
         qwen_vl::{loader_frame_sampling, IMAGE_PAD_TOKEN},
         ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult,
     },
@@ -102,10 +103,7 @@ impl ModelProcessorSpec for Qwen3OmniSpec {
             Modality::Image => Self::token(metadata, "image_token_id", IMAGE_PAD_TOKEN),
             Modality::Video => Self::token(metadata, "video_token_id", VIDEO_PAD_TOKEN),
             Modality::Audio => Self::token(metadata, "audio_token_id", AUDIO_PAD_TOKEN),
-            Modality::ImageEmbeds => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            Modality::ImageEmbeds => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
 
@@ -118,10 +116,7 @@ impl ModelProcessorSpec for Qwen3OmniSpec {
             Modality::Image => Self::token_id(metadata, "image_token_id"),
             Modality::Video => Self::token_id(metadata, "video_token_id"),
             Modality::Audio => Self::token_id(metadata, "audio_token_id"),
-            Modality::ImageEmbeds => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            Modality::ImageEmbeds => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
 
@@ -168,10 +163,7 @@ impl ModelProcessorSpec for Qwen3OmniSpec {
             Modality::Image | Modality::Video => Ok(Box::new(
                 Qwen3OmniVisionProcessor::from_config_for(preprocessor_config, modality),
             )),
-            _ => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            _ => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
 
@@ -231,30 +223,13 @@ impl ModelProcessorSpec for Qwen3OmniSpec {
                 "audio_token_id",
                 AUDIO_PAD_TOKEN,
             ),
-            Modality::ImageEmbeds => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            Modality::ImageEmbeds => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
 
     fn encoder_field_layouts_for(&self, modality: Modality) -> EncoderFieldLayouts {
         match modality {
-            Modality::Image => EncoderFieldLayouts::new(
-                FieldLayout::flat("patches_per_image"),
-                HashMap::from([
-                    ("image_grid_thw".to_string(), FieldLayout::Batched),
-                    ("patches_per_image".to_string(), FieldLayout::Batched),
-                ]),
-            ),
-            Modality::Video => EncoderFieldLayouts::new(
-                FieldLayout::flat("patches_per_video"),
-                HashMap::from([
-                    ("video_grid_thw".to_string(), FieldLayout::Batched),
-                    ("patches_per_video".to_string(), FieldLayout::Batched),
-                    ("video_second_per_grid".to_string(), FieldLayout::Batched),
-                ]),
-            ),
+            Modality::Image | Modality::Video => grid_patch_layouts_for(modality),
             Modality::Audio => EncoderFieldLayouts::new(
                 FieldLayout::Batched,
                 HashMap::from([

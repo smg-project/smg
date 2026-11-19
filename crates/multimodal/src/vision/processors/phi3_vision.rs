@@ -21,13 +21,19 @@
 //! - CLIP normalization: mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711]
 //! - Token count formula: `((h//336)*(w//336)+1)*144 + 1 + (h//336+1)*12`
 
-use image::{DynamicImage, GenericImageView, Rgb, RgbImage};
-use ndarray::{s, Array3, Array4, IxDyn};
+use std::borrow::Cow;
 
-use crate::vision::{
-    preprocessor_config::PreProcessorConfig,
-    processor::{ModelSpecificValue, PreprocessedEncoderInputs, VisionPreProcessor},
-    transforms::{self, TransformError},
+use image::{DynamicImage, GenericImageView, RgbImage};
+use ndarray::{Array3, IxDyn};
+
+use crate::{
+    buffer_pool,
+    vision::{
+        preprocessor_config::PreProcessorConfig,
+        processor::{ModelSpecificValue, PreprocessedEncoderInputs, VisionPreProcessor},
+        scratch,
+        transforms::{self, TransformError},
+    },
 };
 
 /// CLIP normalization mean values.
@@ -201,12 +207,19 @@ impl Phi3VisionProcessor {
     pub fn hd_transform(&self, image: &DynamicImage) -> DynamicImage {
         let (width, height) = image.dimensions();
 
-        let (img, transposed) = if width < height {
-            // Transpose (PIL's Image.TRANSPOSE): equivalent to fliph + rotate270 (ccw 90°)
-            // This swaps x and y coordinates: pixel at (x, y) goes to (y, x)
-            (image.fliph().rotate270(), true)
+        let transposed = width < height;
+        let img = if transposed {
+            // Transpose (PIL's Image.TRANSPOSE): the pixel at (x, y) goes to
+            // (y, x). An RGB8 image in one pass, any other through the flip and
+            // the quarter turn that make the same image.
+            Cow::Owned(match image {
+                DynamicImage::ImageRgb8(rgb) => {
+                    DynamicImage::ImageRgb8(transforms::transpose_rgb(rgb))
+                }
+                other => other.fliph().rotate270(),
+            })
         } else {
-            (image.clone(), false)
+            Cow::Borrowed(image)
         };
 
         let (width, height) = img.dimensions();
@@ -219,39 +232,58 @@ impl Phi3VisionProcessor {
         let resized = transforms::resize_bilinear_pil(&img, new_w, new_h);
 
         // Pad height to multiple of 336
-        let padded = self.padding_336(&resized);
+        let padded = self.padding_336(resized.into_rgb8());
 
-        // Transpose back if needed (transpose is self-inverse)
-        if transposed {
-            padded.fliph().rotate270()
+        // Transpose back if needed (transpose is self-inverse). The image has
+        // then been read for the last time and its buffer is offered to the
+        // pool. A padded canvas came from the pool; an image that needed no
+        // padding still has the resize's buffer, which the pool frees unless
+        // it is of one of its classes.
+        DynamicImage::ImageRgb8(if transposed {
+            let turned = transforms::transpose_rgb(&padded);
+            buffer_pool::recycle(padded.into_raw());
+            turned
         } else {
             padded
-        }
+        })
     }
 
-    /// Pad image height to multiple of 336 (centered, white padding).
+    /// Pad image height to multiple of 336 (centered, white padding). An image
+    /// already whole tiles high comes back as given. A padded one has its
+    /// pixels in a buffer from the pool's `take` (a plain allocation outside
+    /// the pooled range), which its last reader offers back to the pool:
+    /// `process_single_image`, or the transpose back.
     #[expect(
         clippy::unused_self,
         reason = "method logically belongs to the processor; keeps API consistent"
     )]
-    fn padding_336(&self, image: &DynamicImage) -> DynamicImage {
+    fn padding_336(&self, image: RgbImage) -> RgbImage {
         let (width, height) = image.dimensions();
         let target_h = ((height as f64 / TILE_SIZE as f64).ceil() * TILE_SIZE as f64) as u32;
 
         if height == target_h {
-            return image.clone();
+            return image;
         }
 
         let top_padding = (target_h - height) / 2;
 
-        // Create white-padded image
-        let mut new_image =
-            DynamicImage::from(RgbImage::from_pixel(width, target_h, Rgb([255, 255, 255])));
-
-        // Copy original image to center
-        image::imageops::overlay(&mut new_image, image, 0, top_padding as i64);
-
-        new_image
+        // The canvas is a buffer of the pool, so its bytes are a previous
+        // request's and every one of them is written here: the image's rows
+        // are one block in its middle (the two have one width), and the band
+        // above them and the band below are white.
+        let rows = image.as_raw();
+        let top = top_padding as usize * width as usize * 3;
+        let mut canvas = buffer_pool::take(width as usize * target_h as usize * 3);
+        let (above, rest) = canvas.split_at_mut(top);
+        let (middle, below) = rest.split_at_mut(rows.len());
+        above.fill(255);
+        middle.copy_from_slice(rows);
+        below.fill(255);
+        #[expect(
+            clippy::expect_used,
+            reason = "the canvas holds exactly width * target_h * 3 bytes by construction"
+        )]
+        RgbImage::from_raw(width, target_h, canvas).expect("padded canvas size")
     }
 
     /// Create global image by bicubic interpolation to 336x336.
@@ -266,36 +298,6 @@ impl Phi3VisionProcessor {
     )]
     fn create_global_image(&self, tensor: &Array3<f32>) -> Array3<f32> {
         transforms::resize_bicubic_torch_f32(tensor, TILE_SIZE as usize, TILE_SIZE as usize)
-    }
-
-    /// Reshape HD image into tiles.
-    ///
-    /// Transforms [3, H, W] -> [num_tiles, 3, 336, 336]
-    /// where H and W are multiples of 336.
-    #[expect(
-        clippy::unused_self,
-        reason = "method logically belongs to the processor; keeps API consistent"
-    )]
-    fn reshape_to_tiles(&self, tensor: &Array3<f32>) -> Vec<Array3<f32>> {
-        let (_c, h, w) = (tensor.shape()[0], tensor.shape()[1], tensor.shape()[2]);
-        let grid_h = h / TILE_SIZE as usize;
-        let grid_w = w / TILE_SIZE as usize;
-
-        let mut tiles = Vec::with_capacity(grid_h * grid_w);
-
-        for gh in 0..grid_h {
-            for gw in 0..grid_w {
-                let y_start = gh * TILE_SIZE as usize;
-                let x_start = gw * TILE_SIZE as usize;
-                let y_end = y_start + TILE_SIZE as usize;
-                let x_end = x_start + TILE_SIZE as usize;
-
-                let tile_view = tensor.slice(s![.., y_start..y_end, x_start..x_end]);
-                tiles.push(tile_view.to_owned());
-            }
-        }
-
-        tiles
     }
 
     /// Calculate number of image tokens for given HD size.
@@ -313,10 +315,20 @@ impl Phi3VisionProcessor {
         (grid_h * grid_w + 1) * 144 + 1 + (grid_h + 1) * 12
     }
 
-    /// Process a single image through the full pipeline.
-    fn process_single_image(&self, image: &DynamicImage) -> (Array4<f32>, (usize, usize), usize) {
+    /// Process a single image through the full pipeline and append its
+    /// `[num_crops + 1, 3, 336, 336]` values to `values`: the global image,
+    /// the HD image's tiles in row-major order, zeros for the crops the image
+    /// does not fill.
+    fn process_single_image(
+        &self,
+        image: &DynamicImage,
+        values: &mut Vec<f32>,
+    ) -> ((usize, usize), usize) {
         // 1. Convert to RGB
-        let image = DynamicImage::ImageRgb8(image.to_rgb8());
+        let image = match image {
+            DynamicImage::ImageRgb8(_) => Cow::Borrowed(image),
+            other => Cow::Owned(DynamicImage::ImageRgb8(other.to_rgb8())),
+        };
 
         // 2. HD transform
         let hd_image = self.hd_transform(&image);
@@ -325,35 +337,42 @@ impl Phi3VisionProcessor {
         // 3. To tensor [0, 1] and normalize, in torchvision's steps (the
         //    reference composes `ToTensor` and `Normalize`: three roundings)
         let tensor = transforms::to_tensor_then_normalize(&hd_image, &self.mean, &self.std);
+        // The HD image has been read for the last time: its buffer is offered
+        // to the pool, which keeps a padding's canvas for the next request
+        // (`padding_336` says what the buffer of an unpadded image is).
+        buffer_pool::recycle_image(hd_image);
 
-        // 4. Create global image (336x336)
-        let global_image = self.create_global_image(&tensor);
+        // 4. The global image (336x336) comes first
+        let tile = TILE_SIZE as usize;
+        let end = values.len() + (self.num_crops + 1) * 3 * tile * tile;
+        let (global, _) = self.create_global_image(&tensor).into_raw_vec_and_offset();
+        values.extend_from_slice(&global);
 
-        // 5. Reshape HD image into tiles
-        let tiles = self.reshape_to_tiles(&tensor);
-
-        // 6. Concatenate global + tiles
-        let max_crops = self.num_crops + 1; // num_crops + 1 for global
-
-        // Create output tensor [max_crops, 3, 336, 336]
-        let mut output =
-            Array4::<f32>::zeros((max_crops, 3, TILE_SIZE as usize, TILE_SIZE as usize));
-
-        // Copy global image (first position)
-        output.slice_mut(s![0, .., .., ..]).assign(&global_image);
-
-        // Copy tiles (positions 1..num_actual_crops)
-        for (i, tile) in tiles.iter().enumerate() {
-            if i + 1 < max_crops {
-                output.slice_mut(s![i + 1, .., .., ..]).assign(tile);
+        // 5. The HD image's tiles, row-major, as far as the crops go
+        let (h, w) = (hd_h as usize, hd_w as usize);
+        let (planes, _) = tensor.into_raw_vec_and_offset();
+        'tiles: for grid_y in 0..h / tile {
+            for grid_x in 0..w / tile {
+                if values.len() + 3 * tile * tile > end {
+                    break 'tiles;
+                }
+                for plane in planes.chunks_exact(h * w) {
+                    for row in plane.chunks_exact(w).skip(grid_y * tile).take(tile) {
+                        values.extend_from_slice(&row[grid_x * tile..(grid_x + 1) * tile]);
+                    }
+                }
             }
         }
+        scratch::give_f32(planes);
+
+        // 6. Zeros for the crops the image does not fill
+        values.resize(end, 0.0);
 
         // Calculate token count
-        let num_tokens = self.calculate_num_tokens(hd_h as usize, hd_w as usize);
+        let num_tokens = self.calculate_num_tokens(h, w);
 
         // The returned size is the HD-transformed image size.
-        (output, (hd_h as usize, hd_w as usize), num_tokens)
+        ((h, w), num_tokens)
     }
 }
 
@@ -370,41 +389,29 @@ impl VisionPreProcessor for Phi3VisionProcessor {
         &self,
         images: &[&DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        if images.is_empty() {
-            return Err(TransformError::EmptyBatch);
-        }
-
-        let mut all_pixel_values = Vec::with_capacity(images.len());
-        let mut all_image_sizes = Vec::with_capacity(images.len());
-        let mut all_num_tokens = Vec::with_capacity(images.len());
+        TransformError::if_empty(images)?;
 
         for image in images {
             let (width, height) = image.dimensions();
             self.hd_target_or_refuse(width, height)?;
-            let (encoder_input, image_size, num_tokens) = self.process_single_image(image);
-            all_pixel_values.push(encoder_input);
+        }
+
+        // The batch [B, num_crops+1, 3, 336, 336], written once per image.
+        // Pooled: it is the encoder input's storage, which returns to the
+        // pool when the input is written out.
+        let max_crops = self.num_crops + 1;
+        let batch_size = images.len();
+        let tile = TILE_SIZE as usize;
+        let shape = vec![batch_size, max_crops, 3, tile, tile];
+        let mut flat_data = scratch::take_f32_cap(shape.iter().product());
+        let mut all_image_sizes = Vec::with_capacity(images.len());
+        let mut all_num_tokens = Vec::with_capacity(images.len());
+
+        for image in images {
+            let (image_size, num_tokens) = self.process_single_image(image, &mut flat_data);
             all_image_sizes.push((image_size.1 as u32, image_size.0 as u32)); // (width, height)
             all_num_tokens.push(num_tokens);
         }
-
-        // Stack into batch [B, num_crops+1, 3, 336, 336]
-        let max_crops = self.num_crops + 1;
-        let batch_size = images.len();
-        let mut batch_tensor = ndarray::Array5::<f32>::zeros((
-            batch_size,
-            max_crops,
-            3,
-            TILE_SIZE as usize,
-            TILE_SIZE as usize,
-        ));
-
-        for (i, pv) in all_pixel_values.iter().enumerate() {
-            batch_tensor.slice_mut(s![i, .., .., .., ..]).assign(pv);
-        }
-
-        // Convert to dynamic array for storage
-        let shape = batch_tensor.shape().to_vec();
-        let (flat_data, _offset) = batch_tensor.into_raw_vec_and_offset();
 
         // Store model-specific image_sizes data.
         let mut model_specific = std::collections::HashMap::new();
@@ -461,8 +468,10 @@ impl VisionPreProcessor for Phi3VisionProcessor {
 
 #[cfg(test)]
 mod tests {
+    use image::Rgb;
+
     use super::*;
-    use crate::test_support::create_test_image;
+    use crate::test_support::{create_test_image, lcg_bytes};
 
     #[test]
     fn test_phi3_vision_processor_default() {
@@ -573,6 +582,43 @@ mod tests {
         assert_eq!(result.feature_token_counts.len(), 2);
     }
 
+    /// A batch is its images' own outputs in turn, and the crops an image
+    /// does not fill are zeros: an image's slot starts where the slot before
+    /// it ends, whatever that image filled.
+    #[test]
+    fn a_batch_is_its_images_in_turn_and_unfilled_crops_are_zero() {
+        use crate::test_support::lcg_rgb_image;
+
+        let processor = Phi3VisionProcessor::new();
+        let images = [
+            lcg_rgb_image(300, 200, 1),
+            lcg_rgb_image(90, 700, 2),
+            lcg_rgb_image(700, 400, 3),
+        ];
+        let crop = 3 * (TILE_SIZE * TILE_SIZE) as usize;
+        let mut joined = Vec::new();
+        let mut filled_crops = Vec::new();
+        for image in &images {
+            let single = processor.preprocess(&[image]).unwrap();
+            let (width, height) = single.item_sizes[0];
+            let filled = 1 + ((width / TILE_SIZE) * (height / TILE_SIZE)) as usize;
+            let values = single.encoder_input.as_f32();
+            let values = values.as_slice().unwrap();
+            assert!(values[filled * crop..]
+                .iter()
+                .all(|value| value.to_bits() == 0));
+            joined.extend_from_slice(values);
+            filled_crops.push(filled);
+        }
+        // Two of the three leave crops unfilled; the tall one fills them all.
+        assert_eq!(filled_crops, [13, 17, 16]);
+
+        let batch = processor
+            .preprocess(&images.iter().collect::<Vec<_>>())
+            .unwrap();
+        assert_eq!(batch.encoder_input.as_f32().as_slice().unwrap(), joined);
+    }
+
     #[test]
     fn test_model_name() {
         let processor = Phi3VisionProcessor::new();
@@ -624,7 +670,10 @@ mod tests {
     fn pixel_values_match_the_checkpoint_processor() {
         use sha2::{Digest, Sha256};
 
-        use crate::{encoder_inputs::EncoderDtype, test_support::lcg_rgb_image};
+        use crate::{
+            encoder_inputs::EncoderDtype,
+            test_support::{hex, lcg_rgb_image},
+        };
 
         let processor = Phi3VisionProcessor::with_config(4);
         for (width, height, seed, size, tokens, f32_digest, bf16_digest) in [
@@ -682,12 +731,7 @@ mod tests {
                 vec![tokens],
                 "{width}x{height}"
             );
-            let digest = |dtype| {
-                Sha256::digest(result.encoder_input.write_as(dtype))
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>()
-            };
+            let digest = |dtype| hex(&Sha256::digest(result.encoder_input.write_as(dtype)));
             assert_eq!(
                 digest(EncoderDtype::Float32),
                 f32_digest,
@@ -806,5 +850,47 @@ mod tests {
         let processor = Phi3VisionProcessor::new();
         let result = processor.preprocess(&[]);
         assert!(matches!(result, Err(TransformError::EmptyBatch)));
+    }
+
+    /// The padded canvas is a buffer of the pool. Its bytes are a previous
+    /// request's (the sentinel in a debug build), so the image's rows and
+    /// the two white bands must cover every one of them; and a request
+    /// returns the buffer, for a wide image (the canvas is the HD image) and
+    /// for a tall one (the canvas is transposed back, then returned).
+    #[test]
+    fn the_padded_canvas_is_taken_from_the_pool_and_returned_to_it() {
+        static POOL: buffer_pool::BufferPool = buffer_pool::BufferPool::new();
+        buffer_pool::with_pool(&POOL, || {
+            let processor = Phi3VisionProcessor::with_config(4);
+            // 672x378 pads to 672x672: 147 white rows above and 147 below.
+            let rows = RgbImage::from_raw(672, 378, lcg_bytes(672 * 378 * 3, 7)).expect("672x378");
+            let mut expected = RgbImage::from_pixel(672, 672, Rgb([255, 255, 255]));
+            image::imageops::replace(&mut expected, &rows, 0, 147);
+            let class = buffer_pool::allocation_capacity(expected.as_raw().len());
+            for round in 0..2 {
+                let canvas = processor.padding_336(rows.clone());
+                assert!(canvas == expected, "round {round}: pixels differ");
+                assert_eq!(
+                    POOL.held(),
+                    0,
+                    "round {round}: the canvas is out of the pool"
+                );
+                buffer_pool::recycle(canvas.into_raw());
+                assert_eq!(
+                    POOL.held(),
+                    class,
+                    "round {round}: the canvas is idle in the pool"
+                );
+            }
+            for (width, height) in [(1920, 1080), (1080, 1920)] {
+                let image = create_test_image(width, height, Rgb([90, 120, 150]));
+                processor.preprocess(&[&image]).expect("a photo");
+                assert_eq!(
+                    POOL.held(),
+                    class,
+                    "{width}x{height}: the request returned the canvas"
+                );
+            }
+        });
     }
 }

@@ -242,17 +242,19 @@ impl Sequence {
 
     /// Finish incremental decoding without inventing an extra token: the
     /// text the decoder still holds (a replacement character waiting for
-    /// text after it, a complete character held with the bytes after it),
-    /// rendered as the full decode renders the end of the same ids; a
-    /// character the end cut short (its first bytes, with no token to finish
-    /// it) is released as nothing, not as the replacement character the full
-    /// decode renders for it. That holds whatever ended the stream, a length
-    /// limit or a stop token the stop decoder matched (the stop token never
-    /// goes through the decoder, and a visible stop's own text follows the
-    /// held text); a token the decoder does see after those bytes closes the
-    /// character at its step, as the reference stream does. A seeded sequence
-    /// that generated nothing releases nothing: what the decoder holds is the
-    /// seed's, and the seed is prompt text.
+    /// text after it, a complete character held with the bytes after it, a
+    /// character the end cut short, its first bytes with no token to finish
+    /// it, as the replacement character), rendered as the full decode
+    /// renders the end of the same ids; the one exception is a ByteFallback
+    /// vocabulary's window, which keeps a cut character's byte tokens off
+    /// its end and releases nothing for them (see
+    /// [`IncrementalDecoder::finish_into`]). That holds whatever ended the
+    /// stream, a length limit or a stop token the stop decoder matched (the
+    /// stop token never goes through the decoder, and a visible stop's own
+    /// text follows the held text); a token the decoder does see after those
+    /// bytes closes the character at its step, as the reference stream does.
+    /// A seeded sequence that generated nothing releases nothing: what the
+    /// decoder holds is the seed's, and the seed is prompt text.
     pub fn finish(&mut self) -> Result<String> {
         if let Some(decoder) = self.incremental.as_mut() {
             let mut text = String::new();

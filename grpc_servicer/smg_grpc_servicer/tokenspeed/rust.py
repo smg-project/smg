@@ -54,9 +54,10 @@ import importlib
 import json
 import logging
 import multiprocessing
+import os
 import signal
 import threading
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from smg_grpc_servicer.constrained_decoding import (
@@ -87,6 +88,7 @@ from smg_grpc_servicer.rust_lifecycle import (  # noqa: F401
     ServicerConfigError,
     apply_kv_events_default,
     ensure_spawn_start_method,
+    kv_events_left_off,
     on_fault_signal,
     resolve_tokenizer_dir,
     servicer_switch,
@@ -107,7 +109,10 @@ from smg_grpc_servicer.tokenspeed.loads import running_window
 from smg_grpc_servicer.tokenspeed.redact import redact_secrets
 from smg_grpc_servicer.tokenspeed.warmup import (
     DEFAULT_BUDGET_SECS,
+    DEFAULT_REMAINDERS,
+    REMAINDERS_ENV,
     WARMUP_ENV,
+    parse_remainders,
     warmup_inputs,
     warmup_wire,
 )
@@ -124,6 +129,21 @@ PREFILL_TOKENS_PER_SEC_ENV = "SMG_TOKENSPEED_SERVICER_PREFILL_TOKENS_PER_SEC"
 # Set to 0/false/no/off to keep TokenSpeed's KV event publisher off when the
 # launcher was given no --kv-events-config (see `default_kv_events_config`).
 KV_EVENTS_ENV = "SMG_TOKENSPEED_SERVICER_KV_EVENTS"
+
+
+def read_remainders_setting(environ: Mapping[str, str] | None = None) -> str:
+    """The chunk-remainders knob's setting from ``environ[REMAINDERS_ENV]``
+    (:func:`~smg_grpc_servicer.tokenspeed.warmup.parse_remainders`; the
+    process environment by default). A value the knob does not take is a
+    :class:`ServicerConfigError` naming the variable: both launchers read it
+    before any engine work (the Rust launcher with its other knobs, the
+    Python servicer beside its KV-events default), so a typo refuses the
+    start whatever the warm-up level and the engine's role."""
+    source = os.environ if environ is None else environ
+    try:
+        return parse_remainders(source.get(REMAINDERS_ENV))
+    except ValueError as error:
+        raise ServicerConfigError(str(error)) from None
 
 
 def default_kv_events_json(endpoint: str) -> str:
@@ -213,19 +233,35 @@ def _config_section(config: Any, name: str) -> Any:
     return getattr(config, name, None)
 
 
-def mrope_positions(hf_config: Any) -> bool | None:
-    """Whether the language model's rotary positions are MRoPE, read off the
-    checkpoint's text rope config: ``rope_scaling`` / ``rope_parameters`` (on the
-    text config when the checkpoint nests one, and the top level) with an
-    ``mrope_section``, or a rope type named ``mrope``. A checkpoint whose rope
-    config is plain (``rope_type: default`` with no section) uses 1-D positions,
-    so its vision grid tensors only lay out the patches. ``None`` when the
-    config carries no rope section at all."""
+def _rope_declares_mrope(rope: Any) -> bool:
+    """Whether a rope config declares MRoPE: an ``mrope_section``, or a rope
+    type named ``mrope``."""
+    if _config_section(rope, "mrope_section") is not None:
+        return True
+    kind = _config_section(rope, "rope_type") or _config_section(rope, "type")
+    return isinstance(kind, str) and "mrope" in kind
+
+
+def mrope_positions(hf_config: Any, hf_text_config: Any = None) -> bool | None:
+    """Whether the language model's rotary positions are MRoPE.
+
+    With the engine's own text config (``ModelConfig.hf_text_config``, which
+    looks below a Qwen Omni wrapper's ``thinker_config`` as the engine does),
+    the reading is the engine executor's, exactly: ``"mrope_section" in
+    get_rope_parameters(hf_text_config)``, the ``rope_parameters`` mapping or
+    an empty one, so ``rope_scaling`` and a rope type's name do not count, and
+    a text model without the section, or without any rope config (a recurrent
+    hybrid), runs 1-D positions. Without it the
+    checkpoint's own sections are read, ``text_config`` and the top level,
+    either declaration meaning MRoPE (a config class may fill a plain rope
+    default on one while the checkpoint declares its section on the other);
+    ``None`` then says the config carries no rope section at all, which the
+    servicer reads conservatively."""
+    if hf_text_config is not None:
+        rope = _config_section(hf_text_config, "rope_parameters")
+        return rope is not None and _config_section(rope, "mrope_section") is not None
     if hf_config is None:
         return None
-    # Both the nested text config and the top level are read: a config class
-    # may fill a plain rope default on one while the checkpoint declares its
-    # MRoPE section on the other, and either declaration means MRoPE.
     sections = [hf_config]
     text = _config_section(hf_config, "text_config")
     if text is not None:
@@ -237,10 +273,7 @@ def mrope_positions(hf_config: Any) -> bool | None:
             if rope is None:
                 continue
             found = True
-            if _config_section(rope, "mrope_section") is not None:
-                return True
-            kind = _config_section(rope, "rope_type") or _config_section(rope, "type")
-            if isinstance(kind, str) and "mrope" in kind:
+            if _rope_declares_mrope(rope):
                 return True
     return False if found else None
 
@@ -252,24 +285,59 @@ def _optional_int(value: Any) -> int | None:
     return int(value)
 
 
-def mrope_layout(hf_config: Any) -> dict[str, int | None]:
-    """The checkpoint facts the Rust servicer's MRoPE position rule reads
-    besides the request, as the engine's own input processor reads them:
-    ``vision_config.spatial_merge_size`` (patches per position along each
-    axis) and the top-level ``image_token_id`` / ``video_token_id`` every
-    placeholder span is checked against. Each is ``None`` when the checkpoint
-    has none; the rule needs all three and refuses the item otherwise."""
-    vision = _config_section(hf_config, "vision_config") if hf_config is not None else None
+def _optional_number(value: Any) -> float | None:
+    """``float(value)`` for an integer or float config scalar, ``None`` when
+    absent or neither."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _facts_root(hf_config: Any) -> Any:
+    """The config that carries a multimodal checkpoint's placeholder ids,
+    vision config and clock: a Qwen Omni wrapper keeps them below
+    ``thinker_config`` (where the engine's own position rule reads them),
+    every other checkpoint at the top level."""
+    if hf_config is None:
+        return None
+    thinker = _config_section(hf_config, "thinker_config")
+    return hf_config if thinker is None else thinker
+
+
+def mrope_layout(hf_config: Any) -> dict[str, int | float | None]:
+    """The checkpoint facts the Rust servicer's MRoPE position rules read
+    besides the request, as the engine's own input processor reads them, off
+    the facts root (:func:`_facts_root`): ``vision_config.spatial_merge_size``
+    (patches per position along each axis), the ``image_token_id`` /
+    ``video_token_id`` the Qwen3.5 rule checks each placeholder span against,
+    and the Qwen3-Omni rule's clock, ``position_id_per_seconds`` and
+    ``seconds_per_chunk``, read as the engine reads them,
+    ``getattr(thinker_config, name, default)``: the engine's defaults (13, 2.0)
+    for a thinker that leaves them unsaid, ``None`` for a checkpoint without a
+    thinker. The root is the only root: a thinker's missing fact is never taken
+    from the wrapper's top level, which the engine does not read. Each other
+    fact is ``None`` when the checkpoint has none; a rule refuses the item
+    without the facts it needs."""
+    root = _facts_root(hf_config)
+    vision = _config_section(root, "vision_config") if root is not None else None
+
+    def fact(name: str) -> Any:
+        return _config_section(root, name) if root is not None else None
+
+    def clock(name: str, default: float) -> float | None:
+        if root is None or root is hf_config:
+            return None
+        value = fact(name)
+        return default if value is None else _optional_number(value)
+
     return {
         "spatial_merge_size": _optional_int(
             _config_section(vision, "spatial_merge_size") if vision is not None else None
         ),
-        "image_token_id": _optional_int(
-            _config_section(hf_config, "image_token_id") if hf_config is not None else None
-        ),
-        "video_token_id": _optional_int(
-            _config_section(hf_config, "video_token_id") if hf_config is not None else None
-        ),
+        "image_token_id": _optional_int(fact("image_token_id")),
+        "video_token_id": _optional_int(fact("video_token_id")),
+        "position_id_per_seconds": clock("position_id_per_seconds", 13.0),
+        "seconds_per_chunk": clock("seconds_per_chunk", 2.0),
     }
 
 
@@ -303,7 +371,7 @@ def model_facts(server_args: Any, model_config: Any | None = None) -> dict[str, 
         "supports_vision": any(modality in (1, 3) for modality in supported_modalities),
         "supports_multimodal": bool(supported_modalities),
         "supported_modalities": [int(modality) for modality in supported_modalities],
-        "mrope_positions": mrope_positions(model.hf_config),
+        "mrope_positions": mrope_positions(model.hf_config, model.hf_text_config),
         **mrope_layout(model.hf_config),
         "model_dtype": dtype,
         "multimodal_encoder_dtype": dtype,
@@ -445,7 +513,10 @@ def kv_events_unpublishable(server_args: Any, model_config: Any = None) -> str |
 
 
 def default_kv_events_config(
-    server_args: Any, environ: Mapping[str, str] | None = None, model_config: Any = None
+    server_args: Any,
+    environ: Mapping[str, str] | None = None,
+    model_config: Any = None,
+    unless: Callable[[], str | None] | None = None,
 ) -> str | None:
     """Turn TokenSpeed's KV event publisher on when the launcher was given no
     ``--kv-events-config``; returns the configuration applied, or None: the
@@ -456,14 +527,15 @@ def default_kv_events_config(
     from them, unless the engine cannot serve the publisher for this model
     (:func:`kv_events_unpublishable`, on ``model_config`` when the caller has
     TokenSpeed's ``ModelConfig`` already): then the publisher stays off and
-    the reason is logged once."""
+    the reason is logged once. ``unless`` is that question as the caller asks
+    it (the launcher keeps the answer for its facts)."""
     return apply_kv_events_default(
         server_args,
         default_kv_events_json,
         env_name=KV_EVENTS_ENV,
         environ=environ,
         ranks=EngineConfigView(server_args).server_args.attention_dp_size or 1,
-        unless=lambda: kv_events_unpublishable(server_args, model_config),
+        unless=unless or (lambda: kv_events_unpublishable(server_args, model_config)),
     )
 
 
@@ -791,6 +863,18 @@ class TokenSpeedLauncher(RustLauncher):
     # for the other roles and on an engine whose headless launcher hosts its
     # own.
     _bootstrap_server: Any = None
+    # The line the KV-events default logged when the engine's own word kept
+    # the publisher off; the facts hand it to the servicer.
+    _kv_events_left_off: str | None = None
+    # The chunk-remainders knob's setting (:func:`read_remainders_setting`),
+    # read in ``prepare`` with the launcher's other knobs.
+    _remainders: str = DEFAULT_REMAINDERS
+
+    def prepare(self, args: Any) -> None:
+        # Read before any engine work, whether or not the warm-up runs and
+        # whatever the role: a bad value is the same named exit as a bad
+        # warm-up level, not a start that ignores it.
+        self._remainders = read_remainders_setting()
 
     def metrics_bind_address(
         self, args: Any, environ: Mapping[str, str] | None = None
@@ -809,16 +893,28 @@ class TokenSpeedLauncher(RustLauncher):
     def kv_events_default(self, args: Any) -> str | None:
         # An encode worker runs the vision tower only, with no KV cache to
         # publish from: its server args are left as given (the Python server's
-        # rule). Otherwise the config is built here rather than in the facts:
-        # the facts need it a hook later in any case, so an explicit
-        # configuration or the opt-out, which do not read it, cost nothing
-        # extra.
+        # rule). The engine's word is asked on the model config the facts read
+        # a hook later, and a reason is kept for them.
         if EngineConfigView(args).server_args.disaggregation_mode == "encode":
             return None
-        return default_kv_events_config(args, model_config=self.model_config(args))
+
+        def unpublishable() -> str | None:
+            reason = kv_events_unpublishable(args, self.model_config(args))
+            self._kv_events_left_off = kv_events_left_off(reason) if reason else None
+            return reason
+
+        return default_kv_events_config(args, unless=unpublishable)
 
     def facts(self, args: Any) -> dict[str, Any]:
-        return {**model_facts(args, self.model_config(args)), **server_facts(args)}
+        facts = {**model_facts(args, self.model_config(args)), **server_facts(args)}
+        if self._kv_events_left_off:
+            # One more launcher-derived entry of the server args: the Rust
+            # servicer refuses SubscribeKvEvents with it in place of its
+            # standing text, which names the flag and no reason.
+            server_args = json.loads(facts["server_args_json"])
+            server_args["kv_events_left_off"] = self._kv_events_left_off
+            facts["server_args_json"] = json.dumps(server_args, sort_keys=True)
+        return facts
 
     def tokenizer_dir(self, args: Any) -> str | None:
         return tokenizer_dir_for(args)
@@ -849,7 +945,7 @@ class TokenSpeedLauncher(RustLauncher):
             self._bootstrap_server = None
 
     def warmup_inputs(self, args: Any, facts: Mapping[str, Any]) -> Any:
-        return warmup_inputs(args, facts)
+        return warmup_inputs(args, facts, remainders=self._remainders)
 
     def warmup_wire(self, target: str) -> Any:
         return warmup_wire(target)

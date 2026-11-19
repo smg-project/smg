@@ -62,6 +62,17 @@ pub struct WorkerOverrides {
 }
 
 impl WorkerOverrides {
+    /// Serving, with no info, both info RPCs served and no load poll yet.
+    fn fresh() -> Self {
+        Self {
+            serving: AtomicBool::new(true),
+            info: Mutex::new(BTreeMap::new()),
+            loads_polls: AtomicUsize::new(0),
+            model_info: AtomicU8::new(InfoAnswer::Served as u8),
+            server_info: AtomicU8::new(InfoAnswer::Served as u8),
+        }
+    }
+
     /// Whether the health check answers `healthy` (the default).
     pub fn serving(&self) -> bool {
         self.serving.load(Ordering::Relaxed)
@@ -136,15 +147,25 @@ static OVERRIDES: OnceLock<Mutex<BTreeMap<u16, Arc<WorkerOverrides>>>> = OnceLoc
 pub fn for_port(port: u16) -> Arc<WorkerOverrides> {
     let map = OVERRIDES.get_or_init(|| Mutex::new(BTreeMap::new()));
     let mut map = map.lock().unwrap_or_else(PoisonError::into_inner);
-    Arc::clone(map.entry(port).or_insert_with(|| {
-        Arc::new(WorkerOverrides {
-            serving: AtomicBool::new(true),
-            info: Mutex::new(BTreeMap::new()),
-            loads_polls: AtomicUsize::new(0),
-            model_info: AtomicU8::new(InfoAnswer::Served as u8),
-            server_info: AtomicU8::new(InfoAnswer::Served as u8),
-        })
-    }))
+    Arc::clone(
+        map.entry(port)
+            .or_insert_with(|| Arc::new(WorkerOverrides::fresh())),
+    )
+}
+
+/// Fresh overrides for a worker about to serve on `port`, in place of any
+/// that a finished worker on the same port left. A test that binds port 0
+/// can be handed a port an earlier test's worker served on, and would
+/// otherwise inherit that worker's answers (a failing model info, a patched
+/// info, a health check answering not serving). Take them after binding and
+/// before the worker serves, so the worker and its caller hold the same
+/// overrides.
+pub fn fresh_for_port(port: u16) -> Arc<WorkerOverrides> {
+    let map = OVERRIDES.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut map = map.lock().unwrap_or_else(PoisonError::into_inner);
+    let fresh = Arc::new(WorkerOverrides::fresh());
+    map.insert(port, Arc::clone(&fresh));
+    fresh
 }
 
 /// The reported info as the `server_args` struct of a server-info answer.
@@ -194,6 +215,46 @@ mod tests {
         assert!(
             !overrides.info().contains_key("weight_version"),
             "a null removes the key"
+        );
+    }
+
+    /// A worker on a port that an earlier worker served on starts from fresh
+    /// overrides, not from the answers that worker was left with, and shares
+    /// them with whoever asks for the port's overrides after it.
+    #[test]
+    fn a_reused_port_starts_from_fresh_overrides() {
+        let stale = for_port(65_002);
+        stale.set_serving(false);
+        stale.set_model_info(InfoAnswer::Failing);
+        stale.set_server_info(InfoAnswer::Unimplemented);
+        stale.patch_info(
+            json!({"kv_connector": "MooncakeConnector"})
+                .as_object()
+                .unwrap(),
+        );
+        stale.note_loads_poll();
+
+        let fresh = fresh_for_port(65_002);
+        assert!(fresh.serving(), "a fresh worker answers serving");
+        assert_eq!(
+            fresh.model_info(),
+            InfoAnswer::Served,
+            "a fresh worker serves its model info"
+        );
+        assert_eq!(
+            fresh.server_info(),
+            InfoAnswer::Served,
+            "a fresh worker serves its server info"
+        );
+        assert!(fresh.info().is_empty(), "a fresh worker reports no info");
+        assert_eq!(
+            fresh.loads_polls(),
+            0,
+            "a fresh worker has answered no load poll"
+        );
+        assert!(
+            Arc::ptr_eq(&fresh, &for_port(65_002)),
+            "the worker and its caller hold the same overrides"
         );
     }
 }

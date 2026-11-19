@@ -6,10 +6,15 @@
 //! future drops) and keeps its own words for the three answers; this module
 //! holds the wait, so every wire answers the same case the same way.
 
-use std::{future::Future, time::Duration};
+use std::{
+    future::Future,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use tokio::time::{Instant, MissedTickBehavior};
 use tonic::Status;
+
+use crate::kv_events::env_usize;
 
 /// Seconds the probe waits with neither a push nor an answer before the
 /// RPC answers unhealthy, unless the wire's knob says otherwise.
@@ -20,6 +25,16 @@ pub(crate) const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20);
 pub(crate) const STEP: Duration = Duration::from_millis(500);
 /// The resolution of the connector's output stamp (`last_output_at`).
 const STAMP_RESOLUTION: Duration = Duration::from_millis(1);
+
+/// The probe request's id: the `HEALTH_CHECK_` prefix the registry and the
+/// tests read, then nanoseconds since the epoch (the Python servicers stamp
+/// their probes the same way).
+pub(crate) fn probe_request_id() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos());
+    format!("HEALTH_CHECK_{nanos}")
+}
 
 /// What `HealthCheck` says of a disaggregated role, which the probe skips:
 /// a prefill or decode worker pairs each request with a peer and an encode
@@ -52,9 +67,7 @@ impl Verdict {
 /// when unset.
 pub(crate) fn timeout_from_env(knob: &str) -> Duration {
     let default = usize::try_from(DEFAULT_TIMEOUT.as_secs()).unwrap_or(usize::MAX);
-    Duration::from_secs(
-        u64::try_from(crate::kv_events::env_usize(knob, default)).unwrap_or(u64::MAX),
-    )
+    Duration::from_secs(u64::try_from(env_usize(knob, default)).unwrap_or(u64::MAX))
 }
 
 /// Whether the launch's server args name a disaggregation role (any

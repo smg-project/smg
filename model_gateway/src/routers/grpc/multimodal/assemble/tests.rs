@@ -237,10 +237,15 @@ fn a_single_whole_wire_item_moves_its_own_bytes_into_the_payload() {
     match (&a.storage, &b.storage) {
         (TokenSpeedTensorStorage::Inline(x), TokenSpeedTensorStorage::Inline(y)) => {
             assert_eq!(
-                x, &wire_bytes,
+                x.as_slice(),
+                wire_bytes.as_slice(),
                 "the view-written item carries the wire's bytes"
             );
-            assert_eq!(y, &wire_bytes, "the moved item carries the wire's bytes");
+            assert_eq!(
+                y.as_slice(),
+                wire_bytes.as_slice(),
+                "the moved item carries the wire's bytes"
+            );
         }
         other => panic!("inline payloads expected, got {other:?}"),
     }
@@ -418,6 +423,62 @@ fn a_patched_item_may_span_a_wider_structural_range() {
     assert_eq!(assembled.items[0].mm_placeholders, vec![(11, 2)]);
 }
 
+/// One image in a layout with structural tokens around its feature runs:
+/// four crops of 81 image tokens between their start and end tokens, a
+/// newline after the first row, then the view's 169 between its own. The
+/// runs are the reservation (493 of the 504 positions); `features` is the
+/// count the item claims for them.
+fn one_image_in_a_structural_layout(features: usize) -> PrecomputedMultimodalIntermediate {
+    let mut offset = 10;
+    let mut patches = Vec::new();
+    for crop in 0..4 {
+        patches.push(PlaceholderRange {
+            offset: offset + 1,
+            length: 81,
+        });
+        offset += 83 + usize::from(crop == 1);
+    }
+    patches.push(PlaceholderRange {
+        offset: offset + 1,
+        length: 169,
+    });
+    let mut intermediate = one_image_intermediate(504, patches);
+    intermediate.preprocessed.feature_token_counts = vec![features];
+    intermediate
+}
+
+/// The structural tokens of a layout are prompt text, not reserved
+/// positions: an item fits when its feature count is the runs' length, and a
+/// count that took the structural tokens for features never fits.
+#[test]
+fn a_layouts_structural_tokens_are_not_reserved_positions() {
+    let fits = one_image_in_a_structural_layout(493);
+    assert!(validate_precomputed_batch(&fits).is_ok());
+    // The wire that picks the feature positions out of the structural range
+    // is sent the whole range; the wires that take the runs as they are get
+    // exactly as many positions as the item has features.
+    assert_eq!(
+        placeholders_for_bindings(&fits.bindings, false).unwrap(),
+        vec![(10, 504)]
+    );
+    let runs = placeholders_for_bindings(&fits.bindings, true).unwrap();
+    assert_eq!(runs.len(), 5);
+    assert_eq!(
+        runs.iter()
+            .map(|&(_, length)| length as usize)
+            .sum::<usize>(),
+        493
+    );
+
+    let error = validate_precomputed_batch(&one_image_in_a_structural_layout(504))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("reserves 493 prompt positions for 504 encoder features"),
+        "{error}"
+    );
+}
+
 #[test]
 fn assemble_tokenspeed_v41_layouts_stay_inline_when_shm_disabled() {
     use crate::routers::grpc::proto_wrapper::TokenSpeedTensorStorage;
@@ -503,7 +564,7 @@ fn assemble_tokenspeed_v41_layouts_stay_inline_when_shm_disabled() {
         TokenSpeedAssemblyOptions {
             shm_enabled: false,
             shm_min_bytes: 0,
-            encoder_input_dtype: "bfloat16".to_string(),
+            encoder_input_dtype: "bfloat16".into(),
             skip_pixel_values: false,
         },
         None,
@@ -625,7 +686,7 @@ fn a_qwen3_vl_video_batch_assembles_with_its_own_sizes_key() {
     let assembled = assemble_vllm(
         intermediate,
         &VllmAssembly {
-            encoder_dtype: "bfloat16".to_string(),
+            encoder_dtype: "bfloat16".into(),
             device_normalizes: false,
             shm_enabled: false,
             shm_min_bytes: 0,
@@ -865,6 +926,125 @@ fn media_the_engine_would_not_read_in_full_is_refused() {
         .unwrap_err()
         .to_string();
     assert!(error.contains("cover 1 of 2 encoder rows"), "{error}");
+}
+
+#[test]
+fn nemotron_audio_reaches_vllm_with_native_lengths_and_prompt_bindings() {
+    use llm_multimodal::{ModelMetadata, ModelRegistry, PreProcessorConfig, Tokenizer};
+
+    struct AudioTokenizer;
+    impl Tokenizer for AudioTokenizer {
+        fn token_to_id(&self, token: &str) -> Option<u32> {
+            (token == "<|audio|>").then_some(131072)
+        }
+        fn id_to_token(&self, _id: u32) -> Option<String> {
+            None
+        }
+        fn encode_text(&self, _text: &str) -> Option<Vec<u32>> {
+            None
+        }
+    }
+
+    let config = serde_json::json!({
+        "model_type": "nemotron3_5_transcribe",
+        "audio_config": {
+            "preprocessor": {"sample_rate": 16000, "hop_length": 160, "n_fft": 512},
+            "asr_encoder": {"subsampling_factor": 8}
+        }
+    });
+    let registry = ModelRegistry::new();
+    let metadata = ModelMetadata {
+        model_id: "nemotron-transcribe",
+        tokenizer: &AudioTokenizer,
+        config: &config,
+    };
+    let spec = registry.lookup(&metadata).unwrap();
+    let processor = spec
+        .audio_processor(&config, &PreProcessorConfig::default())
+        .unwrap()
+        .unwrap();
+    let audios: Vec<_> = [(1, "short"), (1440, "long")]
+        .into_iter()
+        .map(|(length, hash)| {
+            Arc::new(AudioClip::new(
+                bytes::Bytes::new(),
+                DecodedAudio {
+                    samples: vec![0.25; length],
+                    sample_rate: 16000,
+                },
+                AudioSource::InlineBytes,
+                hash.to_string(),
+            ))
+        })
+        .collect();
+
+    // A vision worker's pixel-normalization setting must not reinterpret audio.
+    for device_normalizes in [false, true] {
+        let preprocessed = processor.preprocess(&audios).unwrap();
+        let bindings = preprocessed
+            .feature_token_counts
+            .iter()
+            .enumerate()
+            .map(|(item, &length)| PromptBinding {
+                item_index: item,
+                prompt_ordinal: item,
+                structural: PlaceholderRange {
+                    offset: 10 + item,
+                    length,
+                },
+                patches: vec![],
+            })
+            .collect();
+        let intermediate = PrecomputedMultimodalIntermediate {
+            preprocessed,
+            media: MediaBatch::Audios(audios.clone()),
+            bindings,
+            placeholder_token_id: Some(
+                spec.placeholder_token_id(&metadata)
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+            ),
+            field_layouts: spec.encoder_field_layouts_for(Modality::Audio),
+            keep_on_cpu_keys: spec.keep_on_cpu_keys_for(Modality::Audio),
+            encoder_input_key: spec.encoder_input_key_for(Modality::Audio),
+        };
+        validate_precomputed_batch(&intermediate).unwrap();
+        let assembled = assemble_vllm(
+            intermediate,
+            &VllmAssembly {
+                encoder_dtype: "bfloat16".into(),
+                device_normalizes,
+                shm_enabled: false,
+                shm_min_bytes: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(assembled.modality, common::Modality::Audio);
+        assert_eq!(assembled.encoder_input_key.as_deref(), Some("audio_signal"));
+        assert_eq!(assembled.pixel_values_shape, [2, 1440]);
+        assert_eq!(assembled.pixel_values_dtype, "bfloat16");
+        assert_eq!(assembled.pixel_values.len(), 2 * 1440 * size_of::<u16>());
+        assert_eq!(assembled.mm_hashes, ["short", "long"]);
+        assert_eq!(assembled.mm_placeholders, [(10, 1), (11, 2)]);
+        assert_eq!(assembled.im_token_id, Some(131072));
+        assert_eq!(assembled.keep_on_cpu_keys, ["audio_signal_length"]);
+        assert!(assembled
+            .batched_keys
+            .iter()
+            .any(|key| key == "audio_signal"));
+        assert!(assembled
+            .batched_keys
+            .iter()
+            .any(|key| key == "audio_signal_length"));
+        let lengths = &assembled.model_specific_tensors["audio_signal_length"];
+        assert_eq!(lengths.dtype, "int64");
+        assert_eq!(lengths.shape, [2]);
+        assert_eq!(
+            lengths.data,
+            [160i64.to_le_bytes(), 1440i64.to_le_bytes()].concat()
+        );
+    }
 }
 
 #[test]
@@ -1355,7 +1535,7 @@ fn a_mixed_size_batch_is_refused_by_a_worker_that_normalizes_on_device() {
         }
     };
     let normalizes_on_device = VllmAssembly {
-        encoder_dtype: "bfloat16".to_string(),
+        encoder_dtype: "bfloat16".into(),
         device_normalizes: true,
         shm_enabled: false,
         shm_min_bytes: 0,
@@ -1385,4 +1565,56 @@ fn a_mixed_size_batch_is_refused_by_a_worker_that_normalizes_on_device() {
     let floats = assemble_vllm(intermediate([(32, 32), (48, 32)]), &normalizes_on_host)
         .expect("a worker that normalizes on host takes the floats");
     assert_eq!(floats.pixel_values_dtype, "bfloat16");
+}
+
+/// Selected SGLang workers receive their declared precision in every batch;
+/// unknown or absent labels retain float32 and integer metadata stays intact.
+#[test]
+fn sglang_assembly_honors_worker_dtype_for_all_batches() {
+    use crate::worker::BasicWorkerBuilder;
+
+    for (label, expected, width) in [
+        (None, "float32", 4),
+        (Some("bfloat16"), "bfloat16", 2),
+        (Some("float16"), "float16", 2),
+        (Some("float32"), "float32", 4),
+        (Some("uint8"), "float32", 4),
+        (Some("float64"), "float32", 4),
+        (Some(""), "float32", 4),
+    ] {
+        let mut builder =
+            BasicWorkerBuilder::new("http://sglang").runtime_type(RuntimeType::Sglang);
+        if let Some(dtype) = label {
+            builder = builder.label("multimodal_encoder_dtype", dtype);
+        }
+        let workers = WorkerSelection::Single {
+            worker: Arc::new(builder.build()),
+        };
+        let expected_image =
+            assemble_sglang_with_dtype(single_image_intermediate(), expected).unwrap();
+        let expected_video =
+            assemble_sglang_with_dtype(one_video_intermediate(2, 2), expected).unwrap();
+        let intermediate = MultimodalIntermediate::try_new(vec![
+            single_image_intermediate(),
+            one_video_intermediate(2, 2),
+        ])
+        .unwrap();
+        let MultimodalData::Sglang(data) =
+            assemble_sglang_data(intermediate, Some(&workers)).unwrap()
+        else {
+            panic!("SGLang data expected");
+        };
+        let (first, extra) = data.into_protos();
+        assert_eq!(extra.len(), 1);
+        for (batch, (reference, elements, grid)) in std::iter::once(first).chain(extra).zip([
+            (expected_image, 8, "patches_per_image"),
+            (expected_video, 4, "patches_per_video"),
+        ]) {
+            let pixels = batch.pixel_values.unwrap();
+            assert_eq!(pixels.dtype, expected);
+            assert_eq!(pixels.data.len(), elements * width);
+            assert_eq!(pixels.data.as_ref(), reference.pixel_values.as_slice());
+            assert_eq!(batch.model_specific_tensors[grid].dtype, "uint32");
+        }
+    }
 }

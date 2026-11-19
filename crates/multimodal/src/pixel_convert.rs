@@ -27,7 +27,7 @@ use formula::{Bf16Formula, F32Formula};
 use self::avx2 as vector;
 #[cfg(target_arch = "aarch64")]
 use self::neon as vector;
-use crate::encoder_inputs::{EncoderDtype, PixelNorm};
+use crate::encoder_inputs::{f32_to_bf16_bits, f32_to_f16_bits, EncoderDtype, PixelNorm};
 
 /// Writes `tables[channel][byte]` as a little-endian `u16` for every byte of
 /// `src` (`dst` holds two bytes per source byte). Consecutive runs of `block`
@@ -127,7 +127,7 @@ impl WireWriter {
             EncoderDtype::BFloat16 => {
                 let tables = Box::new(
                     norm.table_f32()
-                        .map(|channel| channel.map(crate::encoder_inputs::f32_to_bf16_bits)),
+                        .map(|channel| channel.map(f32_to_bf16_bits)),
                 );
                 Some(Self::Half {
                     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
@@ -136,10 +136,7 @@ impl WireWriter {
                 })
             }
             EncoderDtype::Float16 => Some(Self::Half {
-                tables: Box::new(
-                    norm.table_f32()
-                        .map(|channel| channel.map(crate::encoder_inputs::f32_to_f16_bits)),
-                ),
+                tables: Box::new(norm.table_f32().map(|channel| channel.map(f32_to_f16_bits))),
                 // The half-up rounding of the vector formula is the
                 // bfloat16's; float16 takes the tables.
                 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
@@ -189,6 +186,27 @@ impl WireWriter {
                 let table = &tables[channel];
                 for (d, &v) in dst.as_chunks_mut::<4>().0.iter_mut().zip(src) {
                     *d = table[v as usize].to_le_bytes();
+                }
+            }
+        }
+    }
+
+    /// [`Self::write_run`] for one channel of interleaved RGB pixels: the
+    /// `channel` byte of every pixel as `dst`, through the tables (a strided
+    /// source has no vector formula).
+    pub(crate) fn write_channel(&self, dst: &mut [u8], pixels: &[[u8; 3]], channel: usize) {
+        debug_assert_eq!(dst.len(), pixels.len() * self.element_size());
+        match self {
+            Self::Half { tables, .. } => {
+                let table = &tables[channel];
+                for (d, pixel) in dst.as_chunks_mut::<2>().0.iter_mut().zip(pixels) {
+                    *d = table[usize::from(pixel[channel])].to_le_bytes();
+                }
+            }
+            Self::Single { tables, .. } => {
+                let table = &tables[channel];
+                for (d, pixel) in dst.as_chunks_mut::<4>().0.iter_mut().zip(pixels) {
+                    *d = table[usize::from(pixel[channel])].to_le_bytes();
                 }
             }
         }
@@ -678,6 +696,37 @@ mod tests {
         }
     }
 
+    /// One channel of interleaved pixels takes the values its bytes take as
+    /// a run: every byte of every channel, in every float dtype, into a
+    /// buffer that held other bytes.
+    #[test]
+    fn a_channel_of_interleaved_pixels_is_written_as_its_run() {
+        let norm = PixelNorm {
+            scale: 1.0,
+            offset: [123.675, 116.28, 103.53],
+            divisor: [58.395, 57.12, 57.375],
+            channel_block: 16,
+        };
+        let pixels: Vec<[u8; 3]> = (0..=255u8)
+            .map(|value| [value, value.wrapping_mul(7), 255 - value])
+            .collect();
+        for dtype in [
+            EncoderDtype::BFloat16,
+            EncoderDtype::Float16,
+            EncoderDtype::Float32,
+        ] {
+            let writer = WireWriter::new(&norm, dtype).unwrap();
+            for channel in 0..3 {
+                let run: Vec<u8> = pixels.iter().map(|pixel| pixel[channel]).collect();
+                let mut expected = vec![0u8; run.len() * writer.element_size()];
+                writer.write_run(&mut expected, &run, channel);
+                let mut written = vec![0xAAu8; expected.len()];
+                writer.write_channel(&mut written, &pixels, channel);
+                assert_eq!(written, expected, "{dtype}, channel {channel}");
+            }
+        }
+    }
+
     /// Tables no formula reproduces (arbitrary words) still come out as the
     /// tables: the formula paths decline them.
     #[test]
@@ -722,8 +771,6 @@ mod tests {
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     #[test]
     fn the_vector_formula_reproduces_the_tables_of_the_pipelines_normalizations() {
-        use crate::encoder_inputs::f32_to_bf16_bits;
-
         if !vector::detected() {
             return;
         }
@@ -774,8 +821,6 @@ mod tests {
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     #[test]
     fn every_run_length_takes_the_tables_values_on_the_vector_path() {
-        use crate::encoder_inputs::f32_to_bf16_bits;
-
         if !vector::detected() {
             return;
         }

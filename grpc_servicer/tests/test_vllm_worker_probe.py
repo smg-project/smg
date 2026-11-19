@@ -3,6 +3,9 @@ command line (the shared verdict is tested in ``test_worker_probe.py``)."""
 
 from __future__ import annotations
 
+import dataclasses
+import socket
+
 from smg_grpc_servicer.vllm import worker_probe
 
 
@@ -29,7 +32,7 @@ def test_master_from_cmdline_reads_both_spellings():
     assert worker_probe.master_from_cmdline(wrapped) == ("fd00::3", 29600)
 
 
-def test_main_takes_the_leader_from_the_engines_command_line(tmp_path, capsys):
+def test_main_takes_the_leader_from_the_engines_command_line(tmp_path, capsys, monkeypatch):
     cmdline = tmp_path / "cmdline"
     cmdline.write_bytes(
         _cmdline("vllm", "serve", "m", "--headless", "--master-addr", "127.0.0.1")
@@ -40,10 +43,20 @@ def test_main_takes_the_leader_from_the_engines_command_line(tmp_path, capsys):
     assert worker_probe.main(["--cmdline", str(cmdline)]) == 1
     out = capsys.readouterr().out
     assert "127.0.0.1:1" in out and "store port 1 from --master-port" in out
-    # Without the flag the default port is used, and the verdict says so.
+    # Without the flag the engine's default port is used, and the verdict says
+    # so. The default itself is pinned by value; the probe then reads it as a
+    # port this test holds (a listener nothing is attached to), so the verdict
+    # never depends on what the host has attached to the engine's own 29501.
+    assert worker_probe.RENDEZVOUS.default_port == worker_probe.DEFAULT_MASTER_PORT == 29501
     (tmp_path / "noport").write_bytes(_cmdline("vllm", "serve", "m", "--master-addr", "127.0.0.1"))
-    assert worker_probe.main(["--cmdline", str(tmp_path / "noport")]) == 1
-    assert "from the default; no --master-port" in capsys.readouterr().out
+    with socket.create_server(("127.0.0.1", 0)) as store:
+        port = store.getsockname()[1]
+        rendezvous = dataclasses.replace(worker_probe.RENDEZVOUS, default_port=port)
+        monkeypatch.setattr(worker_probe, "RENDEZVOUS", rendezvous)
+        assert worker_probe.main(["--cmdline", str(tmp_path / "noport")]) == 1
+    out = capsys.readouterr().out
+    assert f"127.0.0.1:{port}" in out
+    assert f"store port {port} from the default; no --master-port" in out
     # No leader anywhere: the probe says what it needs.
     (tmp_path / "bare").write_bytes(_cmdline("vllm", "serve", "m"))
     assert worker_probe.main(["--cmdline", str(tmp_path / "bare")]) == 1

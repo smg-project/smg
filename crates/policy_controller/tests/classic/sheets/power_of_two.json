@@ -1,0 +1,2054 @@
+{
+  "recorded_from": "1b141d03b5ca9097f54f0ebc4b95d72e810a62c3",
+  "policy": "power_of_two",
+  "rows": [
+    {
+      "name": "resident-tokens-alone-the-fewest-tokens-win",
+      "metric": "resident_tokens:0",
+      "workers": [
+        {
+          "in_flight": 4,
+          "report": {
+            "running": 4,
+            "queued": 0,
+            "resident_tokens": 900000,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        },
+        {
+          "in_flight": 12,
+          "report": {
+            "running": 12,
+            "queued": 0,
+            "resident_tokens": 130000,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        },
+        {
+          "in_flight": 5,
+          "report": {
+            "running": 5,
+            "queued": 0,
+            "resident_tokens": 810000,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        },
+        {
+          "in_flight": 2,
+          "report": {
+            "running": 2,
+            "queued": 0,
+            "resident_tokens": 950000,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        }
+      ],
+      "prompt_tokens": 20000,
+      "steps": [
+        "pick",
+        "pick",
+        "pick",
+        "pick",
+        "pick",
+        "pick",
+        "pick",
+        "pick",
+        "pick",
+        "pick",
+        "pick",
+        "pick"
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "name": "resident-tokens-each-request-priced-at-100k",
+      "metric": "resident_tokens:100000",
+      "workers": [
+        {
+          "in_flight": 4,
+          "report": {
+            "running": 4,
+            "queued": 0,
+            "resident_tokens": 900000,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        },
+        {
+          "in_flight": 12,
+          "report": {
+            "running": 12,
+            "queued": 0,
+            "resident_tokens": 130000,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        },
+        {
+          "in_flight": 5,
+          "report": {
+            "running": 5,
+            "queued": 0,
+            "resident_tokens": 810000,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        },
+        {
+          "in_flight": 2,
+          "report": {
+            "running": 2,
+            "queued": 0,
+            "resident_tokens": 950000,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        }
+      ],
+      "prompt_tokens": 20000,
+      "steps": [
+        "pick",
+        "pick",
+        "pick",
+        "pick",
+        "pick",
+        "pick",
+        "pick",
+        "pick",
+        "pick",
+        "pick",
+        "pick",
+        "pick"
+      ],
+      "outcome": {
+        "sequence": [
+          3,
+          3,
+          0,
+          2,
+          1,
+          3,
+          0,
+          2,
+          1,
+          3,
+          0,
+          2
+        ]
+      }
+    },
+    {
+      "name": "resident-tokens-a-request-of-unknown-size-is-credited-at-the-mean-prefill",
+      "metric": "resident_tokens:500",
+      "workers": [
+        {
+          "in_flight": 1,
+          "report": {
+            "running": 1,
+            "queued": 0,
+            "resident_tokens": 3000,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        },
+        {
+          "in_flight": 1,
+          "report": {
+            "running": 1,
+            "queued": 0,
+            "resident_tokens": 3600,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        },
+        {
+          "in_flight": 1,
+          "report": {
+            "running": 1,
+            "queued": 0,
+            "resident_tokens": 4500,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        }
+      ],
+      "prompt_tokens": null,
+      "steps": [
+        "pick",
+        "pick",
+        "pick",
+        "pick",
+        "pick",
+        "pick",
+        "pick",
+        "pick",
+        "pick"
+      ],
+      "outcome": {
+        "sequence": [
+          0,
+          1,
+          2,
+          0,
+          1,
+          2,
+          0,
+          1,
+          2
+        ]
+      }
+    },
+    {
+      "name": "resident-tokens-a-new-report-releases-the-credit",
+      "metric": "resident_tokens:1000",
+      "workers": [
+        {
+          "in_flight": 1,
+          "report": {
+            "running": 1,
+            "queued": 0,
+            "resident_tokens": 2000,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        },
+        {
+          "in_flight": 1,
+          "report": {
+            "running": 1,
+            "queued": 0,
+            "resident_tokens": 4000,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        }
+      ],
+      "prompt_tokens": 1500,
+      "steps": [
+        "pick",
+        "pick",
+        "pick",
+        {
+          "report": [
+            {
+              "running": 1,
+              "queued": 0,
+              "resident_tokens": 2000,
+              "waiting_tokens": 0,
+              "throughput": 0,
+              "kv_usage_permille": 0
+            },
+            {
+              "running": 1,
+              "queued": 0,
+              "resident_tokens": 4000,
+              "waiting_tokens": 0,
+              "throughput": 0,
+              "kv_usage_permille": 0
+            }
+          ]
+        },
+        "pick",
+        "pick",
+        "pick"
+      ],
+      "outcome": {
+        "sequence": [
+          0,
+          1,
+          0,
+          0,
+          1,
+          0
+        ]
+      }
+    },
+    {
+      "name": "resident-tokens-requests-in-transit-are-priced-at-the-mean-context",
+      "metric": "resident_tokens:1000",
+      "workers": [
+        {
+          "in_flight": 5,
+          "report": {
+            "running": 2,
+            "queued": 0,
+            "resident_tokens": 8000,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        },
+        {
+          "in_flight": 3,
+          "report": {
+            "running": 3,
+            "queued": 0,
+            "resident_tokens": 21500,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        },
+        {
+          "in_flight": 1,
+          "report": {
+            "running": 1,
+            "queued": 0,
+            "resident_tokens": 26500,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        }
+      ],
+      "prompt_tokens": 1000,
+      "steps": [
+        "pick",
+        "pick",
+        "pick",
+        "pick",
+        "pick",
+        "pick"
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          0,
+          1,
+          0,
+          2,
+          1
+        ]
+      }
+    },
+    {
+      "name": "resident-tokens-the-mean-context-counts-the-queued-requests-with-the-running",
+      "metric": "resident_tokens:1000",
+      "workers": [
+        {
+          "in_flight": 5,
+          "report": {
+            "running": 2,
+            "queued": 2,
+            "resident_tokens": 8000,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        },
+        {
+          "in_flight": 1,
+          "report": {
+            "running": 1,
+            "queued": 0,
+            "resident_tokens": 15000,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        }
+      ],
+      "prompt_tokens": 1000,
+      "steps": [
+        "pick"
+      ],
+      "outcome": {
+        "sequence": [
+          0
+        ]
+      }
+    },
+    {
+      "name": "resident-tokens-a-worker-that-does-not-count-them-scores-from-its-best-peer",
+      "metric": "resident_tokens:0",
+      "workers": [
+        {
+          "in_flight": 2,
+          "report": {
+            "running": 2,
+            "queued": 0,
+            "resident_tokens": 500000,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        },
+        {
+          "in_flight": 2,
+          "report": {
+            "running": 1,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        }
+      ],
+      "prompt_tokens": 1000,
+      "steps": [
+        "pick",
+        "pick",
+        "pick",
+        "pick",
+        "pick"
+      ],
+      "outcome": {
+        "sequence": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      }
+    },
+    {
+      "name": "resident-tokens-a-worker-with-no-report-scores-from-its-best-peer",
+      "metric": "resident_tokens:1000",
+      "workers": [
+        {
+          "in_flight": 1,
+          "report": {
+            "running": 1,
+            "queued": 0,
+            "resident_tokens": 5000,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        },
+        {
+          "in_flight": 2,
+          "report": null
+        },
+        {
+          "in_flight": 3,
+          "report": {
+            "running": 3,
+            "queued": 0,
+            "resident_tokens": 30000,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        }
+      ],
+      "prompt_tokens": 1000,
+      "steps": [
+        "pick",
+        "pick",
+        "pick",
+        "pick"
+      ],
+      "outcome": {
+        "sequence": [
+          0,
+          0,
+          0,
+          0
+        ]
+      }
+    },
+    {
+      "name": "resident-tokens-nobody-counts-them-the-in-flight-count-decides",
+      "metric": "resident_tokens:1000",
+      "workers": [
+        {
+          "in_flight": 5,
+          "report": {
+            "running": 5,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        },
+        {
+          "in_flight": 1,
+          "report": null
+        },
+        {
+          "in_flight": 4,
+          "report": {
+            "running": 4,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        }
+      ],
+      "prompt_tokens": 1000,
+      "steps": [
+        "pick",
+        "pick",
+        "pick"
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "name": "resident-tokens-equal-work-is-drawn",
+      "metric": "resident_tokens:1000",
+      "workers": [
+        {
+          "in_flight": 2,
+          "report": {
+            "running": 2,
+            "queued": 0,
+            "resident_tokens": 6000,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        },
+        {
+          "in_flight": 2,
+          "report": {
+            "running": 2,
+            "queued": 0,
+            "resident_tokens": 6000,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        },
+        {
+          "in_flight": 2,
+          "report": {
+            "running": 2,
+            "queued": 0,
+            "resident_tokens": 6001,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        }
+      ],
+      "prompt_tokens": 1000,
+      "steps": [],
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "counts": [
+            3011,
+            2989,
+            0
+          ]
+        }
+      }
+    },
+    {
+      "name": "resident-tokens-an-idle-worker-with-no-report-ties-with-its-best-peer",
+      "metric": "resident_tokens:1000",
+      "workers": [
+        {
+          "in_flight": 2,
+          "report": {
+            "running": 2,
+            "queued": 0,
+            "resident_tokens": 6000,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        },
+        {
+          "in_flight": 0,
+          "report": null
+        }
+      ],
+      "prompt_tokens": 1000,
+      "steps": [],
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "counts": [
+            3083,
+            2917
+          ]
+        }
+      }
+    },
+    {
+      "name": "resident-tokens-an-idle-worker-with-no-report-ties-with-the-best-of-two-peers",
+      "metric": "resident_tokens:1000",
+      "workers": [
+        {
+          "in_flight": 2,
+          "report": {
+            "running": 2,
+            "queued": 0,
+            "resident_tokens": 6000,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        },
+        {
+          "in_flight": 2,
+          "report": {
+            "running": 2,
+            "queued": 0,
+            "resident_tokens": 9000,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        },
+        {
+          "in_flight": 0,
+          "report": null
+        }
+      ],
+      "prompt_tokens": 1000,
+      "steps": [],
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "counts": [
+            2968,
+            0,
+            3032
+          ]
+        }
+      }
+    },
+    {
+      "name": "resident-tokens-an-idle-worker-that-does-not-count-them-ties-with-its-best-peer",
+      "metric": "resident_tokens:1000",
+      "workers": [
+        {
+          "in_flight": 2,
+          "report": {
+            "running": 2,
+            "queued": 0,
+            "resident_tokens": 6000,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        },
+        {
+          "in_flight": 0,
+          "report": {
+            "running": 0,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        }
+      ],
+      "prompt_tokens": 1000,
+      "steps": [],
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "counts": [
+            2983,
+            3017
+          ]
+        }
+      }
+    },
+    {
+      "name": "resident-tokens-a-running-worker-that-reports-zero-of-them-takes-the-request",
+      "metric": "resident_tokens:1000",
+      "workers": [
+        {
+          "in_flight": 2,
+          "report": {
+            "running": 2,
+            "queued": 0,
+            "resident_tokens": 6000,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        },
+        {
+          "in_flight": 1,
+          "report": {
+            "running": 1,
+            "queued": 0,
+            "resident_tokens": 0,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        }
+      ],
+      "prompt_tokens": 1000,
+      "steps": [],
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "counts": [
+            0,
+            6000
+          ]
+        }
+      }
+    },
+    {
+      "name": "resident-tokens-every-worker-counts-them-and-the-idle-one-takes-the-request",
+      "metric": "resident_tokens:1000",
+      "workers": [
+        {
+          "in_flight": 2,
+          "report": {
+            "running": 2,
+            "queued": 0,
+            "resident_tokens": 6000,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        },
+        {
+          "in_flight": 0,
+          "report": {
+            "running": 0,
+            "queued": 0,
+            "resident_tokens": 0,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        }
+      ],
+      "prompt_tokens": 1000,
+      "steps": [],
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "counts": [
+            0,
+            6000
+          ]
+        }
+      }
+    },
+    {
+      "name": "resident-tokens-every-worker-counts-them-and-the-worker-idle-at-its-report-holds-three-in-transit",
+      "metric": "resident_tokens:1000",
+      "workers": [
+        {
+          "in_flight": 2,
+          "report": {
+            "running": 2,
+            "queued": 0,
+            "resident_tokens": 6000,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        },
+        {
+          "in_flight": 3,
+          "report": {
+            "running": 0,
+            "queued": 0,
+            "resident_tokens": 0,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        }
+      ],
+      "prompt_tokens": 1000,
+      "steps": [
+        "pick",
+        "pick",
+        "pick",
+        "pick"
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          0,
+          1,
+          0
+        ]
+      }
+    },
+    {
+      "name": "resident-tokens-nobody-counts-them-and-the-worker-idle-at-its-report-holds-four-in-transit",
+      "metric": "resident_tokens:1000",
+      "workers": [
+        {
+          "in_flight": 4,
+          "report": {
+            "running": 0,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        },
+        {
+          "in_flight": 1,
+          "report": {
+            "running": 1,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        }
+      ],
+      "prompt_tokens": 1000,
+      "steps": [
+        "pick",
+        "pick"
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "name": "resident-tokens-nobody-counts-them-and-the-worker-idle-at-its-report-holds-the-most-of-four",
+      "metric": "resident_tokens:1000",
+      "workers": [
+        {
+          "in_flight": 9,
+          "report": {
+            "running": 0,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        },
+        {
+          "in_flight": 1,
+          "report": {
+            "running": 1,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        },
+        {
+          "in_flight": 3,
+          "report": {
+            "running": 3,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        },
+        {
+          "in_flight": 5,
+          "report": {
+            "running": 5,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        }
+      ],
+      "prompt_tokens": 1000,
+      "steps": [
+        "pick",
+        "pick"
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "name": "resident-tokens-nobody-counts-them-and-the-worker-idle-at-its-report-holds-thirty-over-twenty-picks",
+      "metric": "resident_tokens:1000",
+      "workers": [
+        {
+          "in_flight": 30,
+          "report": {
+            "running": 0,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        },
+        {
+          "in_flight": 1,
+          "report": {
+            "running": 1,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        }
+      ],
+      "prompt_tokens": 1000,
+      "steps": [
+        "pick",
+        "pick",
+        "pick",
+        "pick",
+        "pick",
+        "pick",
+        "pick",
+        "pick",
+        "pick",
+        "pick",
+        "pick",
+        "pick",
+        "pick",
+        "pick",
+        "pick",
+        "pick",
+        "pick",
+        "pick",
+        "pick",
+        "pick"
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "name": "resident-tokens-nobody-counts-them-the-tokens-alone-and-the-worker-idle-at-its-report-holds-four",
+      "metric": "resident_tokens:0",
+      "workers": [
+        {
+          "in_flight": 4,
+          "report": {
+            "running": 0,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        },
+        {
+          "in_flight": 1,
+          "report": {
+            "running": 1,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        }
+      ],
+      "prompt_tokens": 1000,
+      "steps": [
+        "pick",
+        "pick"
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "name": "resident-tokens-nobody-counts-them-a-peer-the-router-holds-nothing-on-beside-the-idle-report-that-holds-five",
+      "metric": "resident_tokens:1000",
+      "workers": [
+        {
+          "in_flight": 5,
+          "report": {
+            "running": 0,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        },
+        {
+          "in_flight": 0,
+          "report": {
+            "running": 1,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        }
+      ],
+      "prompt_tokens": 1000,
+      "steps": [],
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "counts": [
+            0,
+            6000
+          ]
+        }
+      }
+    },
+    {
+      "name": "resident-tokens-nobody-counts-them-every-report-busy-the-in-flight-count-decides",
+      "metric": "resident_tokens:1000",
+      "workers": [
+        {
+          "in_flight": 4,
+          "report": {
+            "running": 4,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        },
+        {
+          "in_flight": 1,
+          "report": {
+            "running": 1,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        }
+      ],
+      "prompt_tokens": 1000,
+      "steps": [
+        "pick",
+        "pick"
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "name": "resident-tokens-nobody-counts-them-a-peer-with-no-report-beside-the-idle-report-that-holds-four",
+      "metric": "resident_tokens:1000",
+      "workers": [
+        {
+          "in_flight": 4,
+          "report": {
+            "running": 0,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        },
+        {
+          "in_flight": 1,
+          "report": null
+        }
+      ],
+      "prompt_tokens": 1000,
+      "steps": [
+        "pick",
+        "pick"
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "name": "resident-tokens-nobody-counts-them-a-queueing-peer-beside-the-idle-report-that-holds-three",
+      "metric": "resident_tokens:1000",
+      "workers": [
+        {
+          "in_flight": 3,
+          "report": {
+            "running": 0,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        },
+        {
+          "in_flight": 1,
+          "report": {
+            "running": 1,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 50000,
+            "throughput": 100,
+            "kv_usage_permille": 100
+          }
+        }
+      ],
+      "prompt_tokens": 1000,
+      "steps": [
+        "pick"
+      ],
+      "outcome": {
+        "sequence": [
+          1
+        ]
+      }
+    },
+    {
+      "name": "resident-tokens-one-worker-counts-them-and-of-the-two-that-do-not-the-idle-report-holds-six",
+      "metric": "resident_tokens:1000",
+      "workers": [
+        {
+          "in_flight": 40,
+          "report": {
+            "running": 40,
+            "queued": 0,
+            "resident_tokens": 900000,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        },
+        {
+          "in_flight": 6,
+          "report": {
+            "running": 0,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        },
+        {
+          "in_flight": 1,
+          "report": {
+            "running": 1,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        }
+      ],
+      "prompt_tokens": 1000,
+      "steps": [
+        "pick",
+        "pick",
+        "pick"
+      ],
+      "outcome": {
+        "sequence": [
+          0,
+          0,
+          0
+        ]
+      }
+    },
+    {
+      "name": "least-requests-the-fewest-in-flight-over-every-worker",
+      "metric": "least_requests",
+      "workers": [
+        {
+          "in_flight": 6,
+          "report": null
+        },
+        {
+          "in_flight": 7,
+          "report": null
+        },
+        {
+          "in_flight": 1,
+          "report": null
+        },
+        {
+          "in_flight": 5,
+          "report": null
+        }
+      ],
+      "prompt_tokens": null,
+      "steps": [
+        "pick",
+        "pick",
+        "pick",
+        "pick"
+      ],
+      "outcome": {
+        "sequence": [
+          2,
+          2,
+          2,
+          2
+        ]
+      }
+    },
+    {
+      "name": "least-requests-the-fewest-tie-and-are-drawn",
+      "metric": "least_requests",
+      "workers": [
+        {
+          "in_flight": 2,
+          "report": null
+        },
+        {
+          "in_flight": 2,
+          "report": null
+        },
+        {
+          "in_flight": 5,
+          "report": null
+        },
+        {
+          "in_flight": 2,
+          "report": null
+        }
+      ],
+      "prompt_tokens": null,
+      "steps": [],
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "counts": [
+            2038,
+            1960,
+            0,
+            2002
+          ]
+        }
+      }
+    },
+    {
+      "name": "requests-the-fewer-in-flight-of-two-drawn-workers",
+      "metric": "requests",
+      "workers": [
+        {
+          "in_flight": 0,
+          "report": null
+        },
+        {
+          "in_flight": 1,
+          "report": null
+        },
+        {
+          "in_flight": 2,
+          "report": null
+        },
+        {
+          "in_flight": 3,
+          "report": null
+        }
+      ],
+      "prompt_tokens": null,
+      "steps": [],
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "counts": [
+            2972,
+            2027,
+            1001,
+            0
+          ]
+        }
+      }
+    },
+    {
+      "name": "expected-wait-the-better-of-two-drawn-workers",
+      "metric": "expected_wait",
+      "workers": [
+        {
+          "in_flight": 0,
+          "report": null
+        },
+        {
+          "in_flight": 1,
+          "report": null
+        },
+        {
+          "in_flight": 2,
+          "report": null
+        },
+        {
+          "in_flight": 3,
+          "report": null
+        }
+      ],
+      "prompt_tokens": null,
+      "steps": [],
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "counts": [
+            3016,
+            2002,
+            982,
+            0
+          ]
+        }
+      }
+    },
+    {
+      "name": "expected-wait-a-pool-of-equals-is-drawn-evenly",
+      "metric": "expected_wait",
+      "workers": [
+        {
+          "in_flight": 1,
+          "report": null
+        },
+        {
+          "in_flight": 1,
+          "report": null
+        },
+        {
+          "in_flight": 1,
+          "report": null
+        },
+        {
+          "in_flight": 1,
+          "report": null
+        },
+        {
+          "in_flight": 1,
+          "report": null
+        }
+      ],
+      "prompt_tokens": null,
+      "steps": [],
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "counts": [
+            1165,
+            1255,
+            1217,
+            1234,
+            1129
+          ]
+        }
+      }
+    },
+    {
+      "name": "expected-wait-the-shorter-queue-beats-fewer-in-flight",
+      "metric": "expected_wait",
+      "workers": [
+        {
+          "in_flight": 5,
+          "report": {
+            "running": 1,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 100,
+            "kv_usage_permille": 100
+          }
+        },
+        {
+          "in_flight": 2,
+          "report": {
+            "running": 1,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 50000,
+            "throughput": 100,
+            "kv_usage_permille": 100
+          }
+        }
+      ],
+      "prompt_tokens": null,
+      "steps": [
+        "pick",
+        "pick"
+      ],
+      "outcome": {
+        "sequence": [
+          0,
+          0
+        ]
+      }
+    },
+    {
+      "name": "requests-fewer-in-flight-beats-the-shorter-queue",
+      "metric": "requests",
+      "workers": [
+        {
+          "in_flight": 5,
+          "report": {
+            "running": 1,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 100,
+            "kv_usage_permille": 100
+          }
+        },
+        {
+          "in_flight": 2,
+          "report": {
+            "running": 1,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 50000,
+            "throughput": 100,
+            "kv_usage_permille": 100
+          }
+        }
+      ],
+      "prompt_tokens": null,
+      "steps": [
+        "pick",
+        "pick"
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "name": "requests-equal-counts-go-to-the-shorter-queue",
+      "metric": "requests",
+      "workers": [
+        {
+          "in_flight": 3,
+          "report": {
+            "running": 1,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 50000,
+            "throughput": 100,
+            "kv_usage_permille": 100
+          }
+        },
+        {
+          "in_flight": 3,
+          "report": {
+            "running": 1,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 100,
+            "kv_usage_permille": 100
+          }
+        }
+      ],
+      "prompt_tokens": null,
+      "steps": [
+        "pick"
+      ],
+      "outcome": {
+        "sequence": [
+          1
+        ]
+      }
+    },
+    {
+      "name": "least-requests-the-fewest-in-flight-beats-the-shorter-queue",
+      "metric": "least_requests",
+      "workers": [
+        {
+          "in_flight": 4,
+          "report": {
+            "running": 1,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 100,
+            "kv_usage_permille": 100
+          }
+        },
+        {
+          "in_flight": 5,
+          "report": {
+            "running": 1,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 100,
+            "kv_usage_permille": 100
+          }
+        },
+        {
+          "in_flight": 1,
+          "report": {
+            "running": 1,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 50000,
+            "throughput": 100,
+            "kv_usage_permille": 100
+          }
+        },
+        {
+          "in_flight": 3,
+          "report": {
+            "running": 1,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 100,
+            "kv_usage_permille": 100
+          }
+        }
+      ],
+      "prompt_tokens": null,
+      "steps": [
+        "pick",
+        "pick"
+      ],
+      "outcome": {
+        "sequence": [
+          2,
+          2
+        ]
+      }
+    },
+    {
+      "name": "least-requests-equal-counts-go-to-the-shorter-queue",
+      "metric": "least_requests",
+      "workers": [
+        {
+          "in_flight": 2,
+          "report": {
+            "running": 1,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 50000,
+            "throughput": 100,
+            "kv_usage_permille": 100
+          }
+        },
+        {
+          "in_flight": 2,
+          "report": {
+            "running": 1,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 100,
+            "kv_usage_permille": 100
+          }
+        },
+        {
+          "in_flight": 5,
+          "report": {
+            "running": 1,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 100,
+            "kv_usage_permille": 100
+          }
+        }
+      ],
+      "prompt_tokens": null,
+      "steps": [
+        "pick"
+      ],
+      "outcome": {
+        "sequence": [
+          1
+        ]
+      }
+    },
+    {
+      "name": "least-requests-two-fewest-and-a-fast-peer-of-a-higher-count",
+      "metric": "least_requests",
+      "workers": [
+        {
+          "in_flight": 1,
+          "report": {
+            "running": 1,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 100,
+            "kv_usage_permille": 0
+          }
+        },
+        {
+          "in_flight": 1,
+          "report": null
+        },
+        {
+          "in_flight": 5,
+          "report": {
+            "running": 5,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 100000,
+            "kv_usage_permille": 0
+          }
+        }
+      ],
+      "prompt_tokens": null,
+      "steps": [],
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "counts": [
+            6000,
+            0,
+            0
+          ]
+        }
+      }
+    },
+    {
+      "name": "requests-two-fewest-and-a-fast-peer-of-a-higher-count",
+      "metric": "requests",
+      "workers": [
+        {
+          "in_flight": 1,
+          "report": {
+            "running": 1,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 100,
+            "kv_usage_permille": 0
+          }
+        },
+        {
+          "in_flight": 1,
+          "report": null
+        },
+        {
+          "in_flight": 5,
+          "report": {
+            "running": 5,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 100000,
+            "kv_usage_permille": 0
+          }
+        }
+      ],
+      "prompt_tokens": null,
+      "steps": [],
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "counts": [
+            4016,
+            1984,
+            0
+          ]
+        }
+      }
+    },
+    {
+      "name": "expected-wait-two-fewest-and-a-fast-peer-of-a-higher-count",
+      "metric": "expected_wait",
+      "workers": [
+        {
+          "in_flight": 1,
+          "report": {
+            "running": 1,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 100,
+            "kv_usage_permille": 0
+          }
+        },
+        {
+          "in_flight": 1,
+          "report": null
+        },
+        {
+          "in_flight": 5,
+          "report": {
+            "running": 5,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 100000,
+            "kv_usage_permille": 0
+          }
+        }
+      ],
+      "prompt_tokens": null,
+      "steps": [],
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "counts": [
+            2053,
+            0,
+            3947
+          ]
+        }
+      }
+    },
+    {
+      "name": "least-requests-two-fewest-and-a-slow-peer-of-a-higher-count",
+      "metric": "least_requests",
+      "workers": [
+        {
+          "in_flight": 1,
+          "report": {
+            "running": 1,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 100,
+            "kv_usage_permille": 0
+          }
+        },
+        {
+          "in_flight": 1,
+          "report": null
+        },
+        {
+          "in_flight": 5,
+          "report": {
+            "running": 5,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 100,
+            "kv_usage_permille": 0
+          }
+        }
+      ],
+      "prompt_tokens": null,
+      "steps": [],
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "counts": [
+            6000,
+            0,
+            0
+          ]
+        }
+      }
+    },
+    {
+      "name": "requests-two-fewest-and-a-slow-peer-of-a-higher-count",
+      "metric": "requests",
+      "workers": [
+        {
+          "in_flight": 1,
+          "report": {
+            "running": 1,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 100,
+            "kv_usage_permille": 0
+          }
+        },
+        {
+          "in_flight": 1,
+          "report": null
+        },
+        {
+          "in_flight": 5,
+          "report": {
+            "running": 5,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 100,
+            "kv_usage_permille": 0
+          }
+        }
+      ],
+      "prompt_tokens": null,
+      "steps": [],
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "counts": [
+            4006,
+            1994,
+            0
+          ]
+        }
+      }
+    },
+    {
+      "name": "expected-wait-two-fewest-and-a-slow-peer-of-a-higher-count",
+      "metric": "expected_wait",
+      "workers": [
+        {
+          "in_flight": 1,
+          "report": {
+            "running": 1,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 100,
+            "kv_usage_permille": 0
+          }
+        },
+        {
+          "in_flight": 1,
+          "report": null
+        },
+        {
+          "in_flight": 5,
+          "report": {
+            "running": 5,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 100,
+            "kv_usage_permille": 0
+          }
+        }
+      ],
+      "prompt_tokens": null,
+      "steps": [],
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "counts": [
+            4015,
+            0,
+            1985
+          ]
+        }
+      }
+    },
+    {
+      "name": "least-requests-a-worker-with-no-rate-beside-a-rated-one-and-a-fast-peer",
+      "metric": "least_requests",
+      "workers": [
+        {
+          "in_flight": 1,
+          "report": {
+            "running": 1,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        },
+        {
+          "in_flight": 1,
+          "report": {
+            "running": 1,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 100,
+            "kv_usage_permille": 0
+          }
+        },
+        {
+          "in_flight": 5,
+          "report": {
+            "running": 5,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 100000,
+            "kv_usage_permille": 0
+          }
+        }
+      ],
+      "prompt_tokens": null,
+      "steps": [],
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "counts": [
+            3052,
+            2948,
+            0
+          ]
+        }
+      }
+    },
+    {
+      "name": "requests-a-worker-with-no-rate-beside-a-rated-one-and-a-fast-peer",
+      "metric": "requests",
+      "workers": [
+        {
+          "in_flight": 1,
+          "report": {
+            "running": 1,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        },
+        {
+          "in_flight": 1,
+          "report": {
+            "running": 1,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 100,
+            "kv_usage_permille": 0
+          }
+        },
+        {
+          "in_flight": 5,
+          "report": {
+            "running": 5,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 100000,
+            "kv_usage_permille": 0
+          }
+        }
+      ],
+      "prompt_tokens": null,
+      "steps": [],
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "counts": [
+            2986,
+            3014,
+            0
+          ]
+        }
+      }
+    },
+    {
+      "name": "expected-wait-a-worker-with-no-rate-beside-a-rated-one-and-a-fast-peer",
+      "metric": "expected_wait",
+      "workers": [
+        {
+          "in_flight": 1,
+          "report": {
+            "running": 1,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 0,
+            "kv_usage_permille": 0
+          }
+        },
+        {
+          "in_flight": 1,
+          "report": {
+            "running": 1,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 100,
+            "kv_usage_permille": 0
+          }
+        },
+        {
+          "in_flight": 5,
+          "report": {
+            "running": 5,
+            "queued": 0,
+            "resident_tokens": null,
+            "waiting_tokens": 0,
+            "throughput": 100000,
+            "kv_usage_permille": 0
+          }
+        }
+      ],
+      "prompt_tokens": null,
+      "steps": [],
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "counts": [
+            2984,
+            1048,
+            1968
+          ]
+        }
+      }
+    }
+  ]
+}

@@ -25,8 +25,9 @@
 //! never finished, or a closing terminal given back to the call, as over any text no parameter
 //! takes. When the stream cuts the region, it closes the same way at the end of what arrived, as
 //! the template's reader closes a region at the end of its text: what is undecided is decided,
-//! the bytes no parameter took (a parameter the cut left unfinished) are dropped as wrapping, and
-//! the arguments' object is closed over the parameters that finished.
+//! the bytes the search passed over are dropped as wrapping, the arguments' object is closed over
+//! the parameters that finished, and the bytes of a parameter the cut left open go to the call,
+//! which says the cut once before the call's end.
 
 use crate::{
     event::{DropReason, Event, Events, MalformedReason, Text},
@@ -167,19 +168,24 @@ impl Params {
         // The trailer starts at `at` counted from the floor; the held bytes start at `dropped`.
         let split = at.saturating_sub(self.dropped).min(held.len());
         let (text, trailer) = held.split_at(split);
-        self.settle(text, declared, out);
+        let open = self.settle(text, declared, out);
+        self.skip(open, out);
         self.close_object(out);
         trailer.to_string()
     }
 
     /// The stream cut the region: it closes as the template's reader closes a region at the end
-    /// of its text. What is undecided is decided as at the end of the text, the bytes no
-    /// parameter took are dropped as wrapping, and the arguments' object is closed over the
-    /// parameters that finished, `{}` where none did.
-    pub(crate) fn finish(mut self, declared: &Declared, out: &mut Events) {
+    /// of its text. What is undecided is decided as at the end of the text, the bytes the search
+    /// passed over are dropped as wrapping, and the arguments' object is closed over the
+    /// parameters that finished, `{}` where none did. Returns the bytes of a parameter the cut
+    /// left open (a tag the text ended inside, or a start of the trigger), neither written nor
+    /// dropped here: the call reports them with the cut. Empty when the cut fell between
+    /// parameters.
+    pub(crate) fn finish(mut self, declared: &Declared, out: &mut Events) -> String {
         let held = self.take_held();
-        self.settle(&held, declared, out);
+        let open = self.settle(&held, declared, out).to_owned();
         self.close_object(out);
+        open
     }
 
     /// Closes the arguments' object: `{}` where no parameter was written.
@@ -261,15 +267,18 @@ impl Params {
     }
 
     /// Decides `text`, the call's last undecided bytes, as `finditer` does at the end of the text:
-    /// each parameter that matches is written, and what lies between is dropped.
-    fn settle(&mut self, text: &str, declared: &Declared, out: &mut Events) {
+    /// each parameter that matches is written, and what lies between is dropped. Returns the bytes
+    /// of a parameter still open at the end of the text (a tag the text ended inside, or a start
+    /// of the trigger), undecided and not dropped: where the region closed they are wrapping,
+    /// where the stream cut they are the cut's.
+    fn settle<'t>(&mut self, text: &'t str, declared: &Declared, out: &mut Events) -> &'t str {
         let mut rest = text;
         while let Some(at) = rest.find(self.trigger) {
             self.skip(&rest[..at], out);
             rest = &rest[at..];
             let mut matcher =
                 Matcher::new(self.tag, self.ends, &self.shape.word, self.before).hold_cap(None);
-            matcher.feed(rest);
+            let open = matcher.feed(rest) == Verdict::Pending;
             match matcher.finish() {
                 Verdict::Matched(found) => {
                     let (parameter, after) = rest.split_at(found.end());
@@ -277,6 +286,7 @@ impl Params {
                     self.before = parameter.chars().next_back();
                     rest = after;
                 }
+                Verdict::NoMatch | Verdict::Pending if open => return rest,
                 Verdict::NoMatch | Verdict::Pending => {
                     let first = rest.chars().next().map_or(0, char::len_utf8);
                     self.skip(&rest[..first], out);
@@ -284,7 +294,10 @@ impl Params {
                 }
             }
         }
-        self.skip(rest, out);
+        let keep = longest_start_of(rest, self.trigger);
+        let (passed, open) = rest.split_at(rest.len() - keep);
+        self.skip(passed, out);
+        open
     }
 
     /// Writes the parameter `found` matched in `parameter`, its bytes: its key and its value as

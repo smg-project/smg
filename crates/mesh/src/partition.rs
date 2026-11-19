@@ -3,7 +3,7 @@
 //! Detects network partitions and handles state isolation and recovery
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::BTreeMap,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -73,35 +73,23 @@ impl PartitionDetector {
         let now = Instant::now();
         let last_seen = self.last_seen.read();
 
-        // Count alive nodes and unreachable nodes
+        // Count the alive nodes, the reachable among them and the unreachable
         let mut alive_count = 0;
+        let mut reachable_count = 0;
         let mut unreachable_count = 0;
-        let mut reachable_nodes = HashSet::new();
 
         for (name, node) in cluster_state {
             if node.status == NodeStatus::Alive as i32 {
                 alive_count += 1;
-
-                // Check if we've seen this node recently
-                if let Some(last_seen_time) = last_seen.get(name) {
-                    if now.duration_since(*last_seen_time) < self.config.unreachable_timeout {
-                        reachable_nodes.insert(name.clone());
-                    } else {
+                match self.unreachable_for(&last_seen, name, now) {
+                    None => reachable_count += 1,
+                    Some(unseen) => {
                         unreachable_count += 1;
-                        warn!(
-                            "Node {} unreachable for {:?}",
-                            name,
-                            now.duration_since(*last_seen_time)
-                        );
+                        warn!("Node {} unreachable for {:?}", name, unseen);
                     }
-                } else {
-                    // New node, consider it reachable for now
-                    reachable_nodes.insert(name.clone());
                 }
             }
         }
-
-        let reachable_count = reachable_nodes.len();
 
         // Determine partition state
         let state = if unreachable_count == 0 {
@@ -142,19 +130,27 @@ impl PartitionDetector {
     ) -> Vec<String> {
         let now = Instant::now();
         let last_seen = self.last_seen.read();
-        let mut unreachable = Vec::new();
+        cluster_state
+            .iter()
+            .filter(|(name, node)| {
+                node.status == NodeStatus::Alive as i32
+                    && self.unreachable_for(&last_seen, name, now).is_some()
+            })
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
 
-        for (name, node) in cluster_state {
-            if node.status == NodeStatus::Alive as i32 {
-                if let Some(last_seen_time) = last_seen.get(name) {
-                    if now.duration_since(*last_seen_time) >= self.config.unreachable_timeout {
-                        unreachable.push(name.clone());
-                    }
-                }
-            }
-        }
-
-        unreachable
+    /// How long an alive node has gone unseen past the timeout: `None` while
+    /// it is reachable, that is seen within the timeout or not seen yet (a
+    /// new node).
+    fn unreachable_for(
+        &self,
+        last_seen: &BTreeMap<String, Instant>,
+        name: &str,
+        now: Instant,
+    ) -> Option<Duration> {
+        let unseen = now.duration_since(*last_seen.get(name)?);
+        (unseen >= self.config.unreachable_timeout).then_some(unseen)
     }
 
     /// Check if we should continue serving (have quorum)
@@ -199,6 +195,24 @@ mod tests {
         }
     }
 
+    /// Three alive nodes, `node1` to `node3`, on consecutive local ports.
+    fn three_alive_nodes() -> BTreeMap<String, NodeState> {
+        let mut cluster_state = BTreeMap::new();
+        cluster_state.insert(
+            "node1".to_string(),
+            create_node_state("node1", "127.0.0.1:8080", NodeStatus::Alive),
+        );
+        cluster_state.insert(
+            "node2".to_string(),
+            create_node_state("node2", "127.0.0.1:8081", NodeStatus::Alive),
+        );
+        cluster_state.insert(
+            "node3".to_string(),
+            create_node_state("node3", "127.0.0.1:8082", NodeStatus::Alive),
+        );
+        cluster_state
+    }
+
     #[test]
     fn test_partition_config_default() {
         let config = PartitionConfig::default();
@@ -235,19 +249,7 @@ mod tests {
         let config = create_test_config();
         let detector = PartitionDetector::new(config);
 
-        let mut cluster_state = BTreeMap::new();
-        cluster_state.insert(
-            "node1".to_string(),
-            create_node_state("node1", "127.0.0.1:8080", NodeStatus::Alive),
-        );
-        cluster_state.insert(
-            "node2".to_string(),
-            create_node_state("node2", "127.0.0.1:8081", NodeStatus::Alive),
-        );
-        cluster_state.insert(
-            "node3".to_string(),
-            create_node_state("node3", "127.0.0.1:8082", NodeStatus::Alive),
-        );
+        let cluster_state = three_alive_nodes();
 
         // Update last seen for all nodes
         detector.update_last_seen("node1");
@@ -264,19 +266,7 @@ mod tests {
         let config = create_test_config();
         let detector = PartitionDetector::new(config);
 
-        let mut cluster_state = BTreeMap::new();
-        cluster_state.insert(
-            "node1".to_string(),
-            create_node_state("node1", "127.0.0.1:8080", NodeStatus::Alive),
-        );
-        cluster_state.insert(
-            "node2".to_string(),
-            create_node_state("node2", "127.0.0.1:8081", NodeStatus::Alive),
-        );
-        cluster_state.insert(
-            "node3".to_string(),
-            create_node_state("node3", "127.0.0.1:8082", NodeStatus::Alive),
-        );
+        let cluster_state = three_alive_nodes();
 
         // Update last seen for node1 and node2 (quorum)
         detector.update_last_seen("node1");
@@ -304,19 +294,7 @@ mod tests {
         config.quorum_threshold = 2;
         let detector = PartitionDetector::new(config);
 
-        let mut cluster_state = BTreeMap::new();
-        cluster_state.insert(
-            "node1".to_string(),
-            create_node_state("node1", "127.0.0.1:8080", NodeStatus::Alive),
-        );
-        cluster_state.insert(
-            "node2".to_string(),
-            create_node_state("node2", "127.0.0.1:8081", NodeStatus::Alive),
-        );
-        cluster_state.insert(
-            "node3".to_string(),
-            create_node_state("node3", "127.0.0.1:8082", NodeStatus::Alive),
-        );
+        let cluster_state = three_alive_nodes();
 
         // Update last seen for all nodes first
         detector.update_last_seen("node1");
@@ -351,19 +329,7 @@ mod tests {
         let config = create_test_config();
         let detector = PartitionDetector::new(config);
 
-        let mut cluster_state = BTreeMap::new();
-        cluster_state.insert(
-            "node1".to_string(),
-            create_node_state("node1", "127.0.0.1:8080", NodeStatus::Alive),
-        );
-        cluster_state.insert(
-            "node2".to_string(),
-            create_node_state("node2", "127.0.0.1:8081", NodeStatus::Alive),
-        );
-        cluster_state.insert(
-            "node3".to_string(),
-            create_node_state("node3", "127.0.0.1:8082", NodeStatus::Alive),
-        );
+        let cluster_state = three_alive_nodes();
 
         // Update last seen for all nodes
         detector.update_last_seen("node1");

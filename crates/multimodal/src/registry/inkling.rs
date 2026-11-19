@@ -68,10 +68,7 @@ impl ModelProcessorSpec for InklingSpec {
         match modality {
             Modality::Image => Ok(Self::IMAGE_PLACEHOLDER.to_string()),
             Modality::Audio => Ok(Self::AUDIO_PLACEHOLDER.to_string()),
-            _ => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            _ => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
 
@@ -83,10 +80,7 @@ impl ModelProcessorSpec for InklingSpec {
         match modality {
             Modality::Image => Self::image_placeholder_id(metadata),
             Modality::Audio => Self::audio_placeholder_id(metadata),
-            _ => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            _ => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
 
@@ -142,10 +136,7 @@ impl ModelProcessorSpec for InklingSpec {
                     },
                 )?,
             )),
-            _ => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            _ => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
 
@@ -214,10 +205,7 @@ impl ModelProcessorSpec for InklingSpec {
                     })
                     .collect())
             }
-            _ => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            _ => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
 
@@ -241,7 +229,7 @@ mod tests {
     use super::InklingSpec;
     use crate::{
         registry::{test_helpers::*, ModelMetadata, ModelProcessorSpec, ModelRegistry},
-        types::ImageSize,
+        types::{ImageSize, Modality, PlaceholderRange},
     };
 
     fn tokenizer() -> TestTokenizer {
@@ -335,7 +323,7 @@ mod tests {
     /// video stays unsupported.
     #[test]
     fn inkling_declares_images_without_a_count_of_its_own() {
-        use crate::{registry::ModelRegistryError, types::Modality};
+        use crate::registry::ModelRegistryError;
 
         let tokenizer = tokenizer();
         let config = config();
@@ -382,7 +370,7 @@ mod tests {
     /// or the engine's advertised limit is the only router-side bound.
     #[test]
     fn inkling_declares_audio_without_a_count_of_its_own() {
-        use crate::{registry::ModelRegistryError, types::Modality};
+        use crate::registry::ModelRegistryError;
 
         let tokenizer = tokenizer();
         let config = config();
@@ -424,24 +412,21 @@ mod tests {
                     "vision_config": {"decoder_dmodel": 6144},
                     "audio_config": {"decoder_dmodel": 6144}
                 }),
-                HashMap::from([
-                    (crate::types::Modality::Image, usize::MAX),
-                    (crate::types::Modality::Audio, usize::MAX),
-                ]),
+                HashMap::from([(Modality::Image, usize::MAX), (Modality::Audio, usize::MAX)]),
             ),
             (
                 json!({
                     "vision_config": {"decoder_dmodel": null},
                     "audio_config": {"decoder_dmodel": 6144}
                 }),
-                HashMap::from([(crate::types::Modality::Audio, usize::MAX)]),
+                HashMap::from([(Modality::Audio, usize::MAX)]),
             ),
             (
                 json!({
                     "vision_config": {"decoder_dmodel": 6144},
                     "audio_config": {}
                 }),
-                HashMap::from([(crate::types::Modality::Image, usize::MAX)]),
+                HashMap::from([(Modality::Image, usize::MAX)]),
             ),
             (json!({}), HashMap::new()),
         ] {
@@ -470,26 +455,26 @@ mod tests {
             .prompt_replacements_for(
                 &metadata,
                 &test_preprocessed_with_tokens(&[ImageSize::new(80, 40)], &[3]),
-                crate::types::Modality::Image,
+                Modality::Image,
             )
             .unwrap();
         assert_eq!(replacements[0].placeholder_token, "<|unused_200054|>");
         assert_eq!(replacements[0].tokens, vec![200054, 200054, 200054]);
         assert_eq!(
             replacements[0].feature_ranges,
-            Some(vec![crate::types::PlaceholderRange {
+            Some(vec![PlaceholderRange {
                 offset: 0,
                 length: 3
             }])
         );
         assert_eq!(replacements[0].structural_prefix, 1);
         assert_eq!(
-            spec.placeholder_token_for(&metadata, crate::types::Modality::Image)
+            spec.placeholder_token_for(&metadata, Modality::Image)
                 .unwrap(),
             "<|unused_200054|>"
         );
         assert_eq!(
-            spec.placeholder_token_id_for(&metadata, crate::types::Modality::Image)
+            spec.placeholder_token_id_for(&metadata, Modality::Image)
                 .unwrap(),
             200054
         );
@@ -511,26 +496,26 @@ mod tests {
             .prompt_replacements_for(
                 &metadata,
                 &test_preprocessed_with_tokens(&[ImageSize::new(80, 2)], &[2]),
-                crate::types::Modality::Audio,
+                Modality::Audio,
             )
             .unwrap();
         assert_eq!(replacements[0].placeholder_token, "<|unused_200053|>");
         assert_eq!(replacements[0].tokens, vec![200053, 200053]);
         assert_eq!(
             replacements[0].feature_ranges,
-            Some(vec![crate::types::PlaceholderRange {
+            Some(vec![PlaceholderRange {
                 offset: 0,
                 length: 2
             }])
         );
         assert_eq!(replacements[0].structural_prefix, 1);
         assert_eq!(
-            spec.placeholder_token_for(&metadata, crate::types::Modality::Audio)
+            spec.placeholder_token_for(&metadata, Modality::Audio)
                 .unwrap(),
             "<|unused_200053|>"
         );
         assert_eq!(
-            spec.placeholder_token_id_for(&metadata, crate::types::Modality::Audio)
+            spec.placeholder_token_id_for(&metadata, Modality::Audio)
                 .unwrap(),
             200053
         );

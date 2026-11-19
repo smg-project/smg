@@ -18,16 +18,19 @@
 //! over a background before patchify — see [`MoonVitParams`] and the
 //! `transparent_bg` argument to [`preprocess`].
 
-use std::borrow::Cow;
+use std::{borrow::Cow, cell::Cell, iter::repeat_n};
 
 use image::{DynamicImage, GenericImageView};
-use ndarray::Array3;
 
-use crate::vision::{
-    preprocessor_config::PreProcessorConfig,
-    processor::{ModelSpecificValue, PreprocessedEncoderInputs},
-    scratch,
-    transforms::{self, TransformError, TransparentBg, TransparentBgFillStage},
+use crate::{
+    buffer_pool,
+    encoder_inputs::{f32_to_bf16_bits, f32_to_f16_bits, EncoderDtype, EncoderInput, PixelNorm},
+    vision::{
+        preprocessor_config::PreProcessorConfig,
+        processor::{ModelSpecificValue, PreprocessedEncoderInputs},
+        scratch,
+        transforms::{self, TransformError, TransparentBg, TransparentBgFillStage},
+    },
 };
 
 /// MoonViT resize/patchify/normalize parameters for a single model.
@@ -140,14 +143,13 @@ fn normalized_levels(mean: &[f64; 3], std: &[f64; 3]) -> [[f32; 256]; 3] {
     })
 }
 
-/// Fused resize + zero-pad + normalize into a single [C, H_padded, W_padded] tensor.
-///
-/// Avoids intermediate allocations by:
-/// 1. Allocating the final padded canvas directly
-/// 2. Pre-filling with normalized black (the table's entry for a zero byte,
-///    as the reference zero-pads the bytes before it normalizes)
-/// 3. Deinterleaving + normalizing the image region in one pass, every byte
-///    through its channel's table of [`normalized_levels`]
+/// Fused resize + zero-pad + normalize + patchify: hands `write` the image's
+/// RGB bytes after the resize, their size and the padded grid, and `write`
+/// appends the image's `[3, patch_size, patch_size]` patches, row-major over
+/// that grid. Every byte of the resized image maps through its channel's table of
+/// [`normalized_levels`] straight into its patch, and the cells of the padding
+/// take the table's entry for a zero byte, as the reference zero-pads the
+/// bytes before it normalizes.
 ///
 /// The resize is the reference's `PIL.Image.resize(.., BICUBIC)`: Pillow's
 /// separable bicubic in 22-bit fixed point (`transforms::resize_bicubic_pil_rgb`)
@@ -166,15 +168,13 @@ fn normalized_levels(mean: &[f64; 3], std: &[f64; 3]) -> [[f32; 256]; 3] {
 /// carries an alpha channel here only when the gateway decoded it under
 /// `TransparencyPolicy::KeepAlpha` (K3 asks for that through `keeps_alpha`;
 /// otherwise the destination engine's loader rule was applied at the decode).
-fn resize_pad_and_normalize(
+fn append_patches(
     image: &DynamicImage,
     cfg: &ResizeConfig,
-    levels: &[[f32; 256]; 3],
+    patch_size: usize,
     transparent_bg: Option<TransparentBg>,
-) -> Result<Array3<f32>, TransformError> {
-    let canvas_h = cfg.new_height + cfg.pad_height;
-    let canvas_w = cfg.new_width + cfg.pad_width;
-
+    write: impl FnOnce(&[u8], (usize, usize), (usize, usize)),
+) -> Result<(), TransformError> {
     // Nothing to composite over if the image has no alpha to begin with.
     let bg = transparent_bg.filter(|_| image.color().has_alpha());
 
@@ -221,60 +221,73 @@ fn resize_pad_and_normalize(
         ),
         None => transforms::rgb_bytes(resized),
     };
-    let canvas_pixels = canvas_h * canvas_w;
-
-    // Pooled: this per-image CHW buffer (tens of MB) is recycled by the
-    // caller after patch extraction, keeping its pages mapped and hot.
-    let mut data = scratch::take_f32(3 * canvas_pixels);
-    transforms::paint_rgb_onto_planes_by_table(
-        &raw,
-        (img_w, img_h),
-        (canvas_w, canvas_h),
-        levels,
-        &mut data,
+    let grid = (
+        (cfg.new_width + cfg.pad_width) / patch_size,
+        (cfg.new_height + cfg.pad_height) / patch_size,
     );
-
-    #[expect(
-        clippy::expect_used,
-        reason = "data has exactly 3*canvas_h*canvas_w elements by construction"
-    )]
-    Ok(Array3::from_shape_vec((3, canvas_h, canvas_w), data)
-        .expect("shape matches pre-allocated buffer"))
+    write(&raw, (img_w, img_h), grid);
+    Ok(())
 }
 
-/// Extract [C, patch_size, patch_size] patches from a contiguous [C, H, W] tensor.
-///
-/// Uses row-based `copy_from_slice` instead of per-element indexing so the
-/// compiler can auto-vectorize the inner copy.
-/// Append this image's patches directly into `out` (no per-image intermediate
-/// Vec): `out` is the pooled batch buffer pre-sized for the whole request.
-fn extract_patches_into(tensor: &Array3<f32>, patch_size: usize, out: &mut Vec<f32>) {
-    let channels = tensor.shape()[0];
-    let height = tensor.shape()[1];
-    let width = tensor.shape()[2];
+/// Append the `[3, patch, patch]` patches of a `grid_w` x `grid_h` grid laid
+/// over interleaved RGB bytes: a byte maps through its channel's table, a
+/// cell beyond the image through the table's entry for a zero byte.
+fn write_patches(
+    rgb: &[u8],
+    (image_w, image_h): (usize, usize),
+    (grid_w, grid_h): (usize, usize),
+    patch: usize,
+    levels: &[[f32; 256]; 3],
+    out: &mut Vec<f32>,
+) {
+    let (pixels, _) = rgb.as_chunks::<3>();
+    for top in (0..grid_h * patch).step_by(patch) {
+        for left in (0..grid_w * patch).step_by(patch) {
+            let inside = image_w.saturating_sub(left).min(patch);
+            for (channel, table) in levels.iter().enumerate() {
+                for y in top..top + patch {
+                    let row = if y < image_h && inside > 0 {
+                        &pixels[y * image_w + left..][..inside]
+                    } else {
+                        &[]
+                    };
+                    out.extend(row.iter().map(|pixel| table[usize::from(pixel[channel])]));
+                    out.extend(repeat_n(table[0], patch - row.len()));
+                }
+            }
+        }
+    }
+}
 
-    let grid_h = height / patch_size;
-    let grid_w = width / patch_size;
-
-    // Get contiguous slice for direct row addressing
-    let flat = tensor.as_standard_layout();
-    #[expect(
-        clippy::expect_used,
-        reason = "as_standard_layout guarantees contiguous C-order memory"
-    )]
-    let data = flat
-        .as_slice()
-        .expect("as_standard_layout guarantees contiguous memory");
-
-    for gh in 0..grid_h {
-        for gw in 0..grid_w {
-            let h_start = gh * patch_size;
-            let w_start = gw * patch_size;
-            for c in 0..channels {
-                let plane_offset = c * height * width;
-                for ph in 0..patch_size {
-                    let row_start = plane_offset + (h_start + ph) * width + w_start;
-                    out.extend_from_slice(&data[row_start..row_start + patch_size]);
+/// [`write_patches`] for a wire of two-byte elements: the same walk, and
+/// `cells` takes the grid's elements in the same order, each as the bytes of
+/// its level on the wire.
+fn write_wire_patches(
+    rgb: &[u8],
+    (image_w, image_h): (usize, usize),
+    (grid_w, grid_h): (usize, usize),
+    patch: usize,
+    levels: &[[[u8; 2]; 256]; 3],
+    cells: &mut [[u8; 2]],
+) {
+    let (image, _) = rgb.as_chunks::<3>();
+    let mut written = 0;
+    for top in (0..grid_h * patch).step_by(patch) {
+        for left in (0..grid_w * patch).step_by(patch) {
+            let inside = image_w.saturating_sub(left).min(patch);
+            for (channel, table) in levels.iter().enumerate() {
+                for y in top..top + patch {
+                    let pixels = if y < image_h && inside > 0 {
+                        &image[y * image_w + left..][..inside]
+                    } else {
+                        &[]
+                    };
+                    let row = &mut cells[written..written + patch];
+                    for (cell, pixel) in row.iter_mut().zip(pixels) {
+                        *cell = table[usize::from(pixel[channel])];
+                    }
+                    row[pixels.len()..].fill(table[0]);
+                    written += patch;
                 }
             }
         }
@@ -287,12 +300,124 @@ pub fn preprocess(
     images: &[&DynamicImage],
     transparent_bg: Option<TransparentBg>,
 ) -> Result<PreprocessedEncoderInputs, TransformError> {
-    if images.is_empty() {
-        return Err(TransformError::EmptyBatch);
+    let levels = normalized_levels(&params.mean, &params.std);
+    batch(
+        params,
+        images,
+        transparent_bg,
+        scratch::take_f32_cap,
+        |out, rgb, size, grid| write_patches(rgb, size, grid, params.patch_size, &levels, out),
+        |patches, total_patches| {
+            ndarray::Array4::from_shape_vec(
+                (total_patches, 3, params.patch_size, params.patch_size),
+                patches,
+            )
+            .map(EncoderInput::from)
+            .map_err(|e| {
+                TransformError::ShapeError(format!(
+                    "Failed to create encoder_input [{total_patches}, 3, {}, {}]: {e}",
+                    params.patch_size, params.patch_size
+                ))
+            })
+        },
+    )
+}
+
+/// The normalization of [`normalized_levels`] in the form a wire names: the
+/// byte less the mean, over the std, both in byte units.
+fn wire_norm(params: &MoonVitParams) -> PixelNorm {
+    PixelNorm {
+        scale: 1.0,
+        offset: params.mean.map(|mean| mean as f32 * 255.0),
+        divisor: params.std.map(|std| std as f32 * 255.0),
+        channel_block: params.patch_size * params.patch_size,
     }
+}
+
+/// The pipeline of [`preprocess`] written once in `dtype`, the wire's dtype,
+/// into a buffer of the pool: a byte maps through its channel's table to the
+/// bytes of its level on the wire, so neither the float tensor nor the pass
+/// that narrows it is made.
+///
+/// A wire names the normalization its values were written with. The levels
+/// are the reference's, which rounds three times with double-precision
+/// operands (`normalized_levels`), and a [`PixelNorm`] rounds as its `f32`
+/// arithmetic does. Under the family's mean and std of 0.5 the two give the
+/// same value for every byte once narrowed to `bfloat16` or `float16`, and
+/// differ in `float32`. So the wire is written in the two narrow dtypes, and
+/// only when every level of every channel is its norm's; `None` otherwise,
+/// which leaves the caller the float tensor and its write.
+pub(crate) fn preprocess_wire(
+    params: MoonVitParams,
+    images: &[&DynamicImage],
+    transparent_bg: Option<TransparentBg>,
+    dtype: EncoderDtype,
+) -> Option<Result<PreprocessedEncoderInputs, TransformError>> {
+    let narrow: fn(f32) -> u16 = match dtype {
+        EncoderDtype::BFloat16 => f32_to_bf16_bits,
+        EncoderDtype::Float16 => f32_to_f16_bits,
+        EncoderDtype::Float32 | EncoderDtype::Uint8 => return None,
+    };
+    let on_wire = |levels: [[f32; 256]; 3]| {
+        levels.map(|channel| channel.map(|level| narrow(level).to_le_bytes()))
+    };
+    let norm = wire_norm(&params);
+    let levels = on_wire(normalized_levels(&params.mean, &params.std));
+    if levels != on_wire(norm.table_f32()) {
+        return None;
+    }
+    let patch = params.patch_size;
+    let written = Cell::new(0);
+    Some(batch(
+        params,
+        images,
+        transparent_bg,
+        // A buffer of the pool: its bytes are a previous request's until the
+        // patches cover it, and `covered` refuses it otherwise.
+        |elements| buffer_pool::take(2 * elements),
+        |wire: &mut Vec<u8>, rgb, size, grid: (usize, usize)| {
+            let elements = grid.0 * grid.1 * 3 * patch * patch;
+            let (cells, _) = wire[2 * written.get()..][..2 * elements].as_chunks_mut::<2>();
+            write_wire_patches(rgb, size, grid, patch, &levels, cells);
+            written.set(written.get() + elements);
+        },
+        |wire, total_patches| {
+            let wire = covered(wire, 2 * written.get())?;
+            EncoderInput::wire(wire, dtype, vec![total_patches, 3, patch, patch], norm)
+                .map_err(TransformError::ShapeError)
+        },
+    ))
+}
+
+/// A buffer of the pool goes out as a wire only when the patches covered
+/// every byte of it: until then its bytes are a previous request's.
+fn covered(wire: Vec<u8>, written: usize) -> Result<Vec<u8>, TransformError> {
+    if written == wire.len() {
+        Ok(wire)
+    } else {
+        Err(TransformError::ShapeError(format!(
+            "MoonViT wire: {written} of {} bytes written",
+            wire.len()
+        )))
+    }
+}
+
+/// The pipeline over a batch of images, for either form of the encoder input:
+/// `take` hands out the batch's buffer for a count of elements, `write` puts
+/// one image's patches into it (from the image's RGB bytes after the resize,
+/// their size and the padded grid), and `wrap` makes the encoder input of the
+/// buffer and the count of patches.
+fn batch<B>(
+    params: MoonVitParams,
+    images: &[&DynamicImage],
+    transparent_bg: Option<TransparentBg>,
+    take: impl FnOnce(usize) -> B,
+    mut write: impl FnMut(&mut B, &[u8], (usize, usize), (usize, usize)),
+    wrap: impl FnOnce(B, usize) -> Result<EncoderInput, TransformError>,
+) -> Result<PreprocessedEncoderInputs, TransformError> {
+    TransformError::if_empty(images)?;
 
     let item_sizes: Vec<(u32, u32)> = images.iter().map(|img| img.dimensions()).collect();
-    let levels = normalized_levels(&params.mean, &params.std);
 
     // Pre-size the pooled batch buffer exactly (patch_features per patch =
     // 3 * patch_size^2; this is the data plane's hottest allocation).
@@ -305,7 +430,7 @@ pub fn preprocess(
         let grid_w = (cfg.new_width + cfg.pad_width) / params.patch_size;
         estimated_total += grid_h * grid_w * patch_features;
     }
-    let mut all_patches: Vec<f32> = scratch::take_f32_cap(estimated_total);
+    let mut all_patches = take(estimated_total);
     let mut patches_per_image: Vec<i64> = Vec::with_capacity(images.len());
     let mut grid_thw_data = Vec::with_capacity(images.len() * 3);
     let mut feature_token_counts = Vec::with_capacity(images.len());
@@ -314,8 +439,13 @@ pub fn preprocess(
         let (w, h) = image.dimensions();
         let cfg = params.compute_resize_config(w as usize, h as usize);
 
-        // Fused resize + pad + normalize in one pass (avoids 2 extra allocations)
-        let tensor = resize_pad_and_normalize(image, &cfg, &levels, transparent_bg)?;
+        append_patches(
+            image,
+            &cfg,
+            params.patch_size,
+            transparent_bg,
+            |rgb, size, grid| write(&mut all_patches, rgb, size, grid),
+        )?;
 
         let padded_h = cfg.new_height + cfg.pad_height;
         let padded_w = cfg.new_width + cfg.pad_width;
@@ -330,25 +460,11 @@ pub fn preprocess(
         let num_patches = grid_h * grid_w;
         feature_token_counts.push(cfg.num_tokens);
 
-        // Patchify directly into the pooled batch buffer, then recycle the
-        // CHW tensor's storage (standard layout, offset 0) for the next image.
-        extract_patches_into(&tensor, params.patch_size, &mut all_patches);
-        let (storage, _offset) = tensor.into_raw_vec_and_offset();
-        scratch::give_f32(storage);
         patches_per_image.push(num_patches as i64);
     }
 
     let total_patches: usize = patches_per_image.iter().map(|&n| n as usize).sum();
-    let encoder_input = ndarray::Array4::from_shape_vec(
-        (total_patches, 3, params.patch_size, params.patch_size),
-        all_patches,
-    )
-    .map_err(|e| {
-        TransformError::ShapeError(format!(
-            "Failed to create encoder_input [{total_patches}, 3, {}, {}]: {e}",
-            params.patch_size, params.patch_size
-        ))
-    })?;
+    let encoder_input = wrap(all_patches, total_patches)?;
 
     Ok(
         PreprocessedEncoderInputs::new(encoder_input, feature_token_counts, item_sizes)
@@ -368,6 +484,7 @@ mod tests {
     use image::{Rgb, RgbImage};
 
     use super::*;
+    use crate::test_support::hex;
 
     /// The reference's three steps, each stored as `f32`.
     fn reference_level(level: u8, mean: f64, std: f64) -> f32 {
@@ -508,10 +625,7 @@ mod tests {
             .iter()
             .flat_map(|value| value.to_le_bytes())
             .collect();
-        Sha256::digest(&bytes)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect()
+        hex(&Sha256::digest(&bytes))
     }
 
     /// A budget of three patches: a 60x40 image is resized to 36x24 (a ratio
@@ -613,5 +727,280 @@ mod tests {
             digest_of(&got[..]),
             "47e02f6a5305085afa077da8ab756e1380052bea0a4433ce584c1f1f7e972a50"
         );
+    }
+
+    /// A 20x16 image on a 2x2 grid of 14-pixel patches: the right patch
+    /// column holds 6 image columns then 8 of padding, the bottom patch row 2
+    /// image rows then 12 of padding. The tables tell the channels and the
+    /// levels apart.
+    #[test]
+    fn write_patches_maps_each_channel_through_its_own_table_and_pads_with_its_zero() {
+        let (image_w, image_h, patch) = (20, 16, 14);
+        let rgb = generated_bytes(image_w * image_h * 3, 3);
+        let levels: [[f32; 256]; 3] =
+            std::array::from_fn(|c| std::array::from_fn(|level| (c * 1000 + level) as f32));
+        let mut out = Vec::new();
+        write_patches(&rgb, (image_w, image_h), (2, 2), patch, &levels, &mut out);
+        assert_eq!(out.len(), 4 * 3 * patch * patch);
+        let mut index = 0;
+        for gh in 0..2 {
+            for gw in 0..2 {
+                for c in 0..3 {
+                    for py in 0..patch {
+                        for px in 0..patch {
+                            let (x, y) = (gw * patch + px, gh * patch + py);
+                            let level = if x < image_w && y < image_h {
+                                rgb[(y * image_w + x) * 3 + c]
+                            } else {
+                                0
+                            };
+                            assert_eq!(
+                                out[index].to_bits(),
+                                levels[c][usize::from(level)].to_bits(),
+                                "patch ({gh}, {gw}) channel {c} at ({px}, {py})"
+                            );
+                            index += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The one-pass wire holds the bytes the float tensor writes, in both narrow
+    /// dtypes: for an image under the patch budget, for one above it (resized
+    /// and zero padded), for the two as a batch, and for a batch whose first
+    /// image has its background painted after the resize. The shape, the
+    /// counts, the sizes and the grids are the float tensor's, and the wire
+    /// names its norm. `float32` and a byte wire are not offered, so their
+    /// caller takes the float tensor.
+    #[test]
+    fn the_one_pass_wire_is_the_float_tensors_write_in_both_narrow_dtypes() {
+        use crate::vision::transforms::{TransparentBgConfig, TransparentBgPattern};
+
+        let small = DynamicImage::ImageRgb8(
+            RgbImage::from_raw(28, 14, generated_bytes(28 * 14 * 3, 3)).unwrap(),
+        );
+        let large = DynamicImage::ImageRgb8(
+            RgbImage::from_raw(60, 40, generated_bytes(60 * 40 * 3, 7)).unwrap(),
+        );
+        let alpha = DynamicImage::ImageRgba8(
+            image::RgbaImage::from_raw(60, 40, generated_bytes(60 * 40 * 4, 11)).unwrap(),
+        );
+        let painted = TransparentBg {
+            config: TransparentBgConfig {
+                pattern: TransparentBgPattern::Chessboard,
+                chessboard_square_size: 8,
+                chessboard_square_on_top_left: true,
+                chessboard_white_value: 255,
+                chessboard_gray_value: 180,
+            },
+            stage: TransparentBgFillStage::AfterResize,
+        };
+        let params = params_with_a_budget_of_three_patches();
+        let cases: [(Vec<&DynamicImage>, Option<TransparentBg>); 4] = [
+            (vec![&small], None),
+            (vec![&large], None),
+            (vec![&small, &large], None),
+            (vec![&alpha, &small], Some(painted)),
+        ];
+        for (images, background) in cases {
+            let floats = preprocess(params, &images, background).unwrap();
+            for dtype in [EncoderDtype::BFloat16, EncoderDtype::Float16] {
+                let wire = preprocess_wire(params, &images, background, dtype)
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    matches!(
+                        &wire.encoder_input,
+                        EncoderInput::Wire { dtype: stored, norm, .. }
+                            if *stored == dtype && *norm == wire_norm(&params)
+                    ),
+                    "{dtype}"
+                );
+                assert_eq!(
+                    wire.encoder_input.write_as(dtype),
+                    floats.encoder_input.write_as(dtype),
+                    "{dtype}"
+                );
+                assert_eq!(wire.encoder_input.shape(), floats.encoder_input.shape());
+                assert_eq!(wire.feature_token_counts, floats.feature_token_counts);
+                assert_eq!(wire.item_sizes, floats.item_sizes);
+                assert_eq!(wire.model_specific.len(), floats.model_specific.len());
+                for (name, value) in &floats.model_specific {
+                    assert_eq!(
+                        format!("{:?}", wire.model_specific.get(name)),
+                        format!("{:?}", Some(value)),
+                        "{name}"
+                    );
+                }
+            }
+            for dtype in [EncoderDtype::Float32, EncoderDtype::Uint8] {
+                assert!(
+                    preprocess_wire(params, &images, background, dtype).is_none(),
+                    "{dtype}"
+                );
+            }
+        }
+    }
+
+    /// The norm the wire names gives every level it carries: narrowed to
+    /// `bfloat16` or to `float16`, each of the 256 levels of each channel is
+    /// the reference's level narrowed, under the family's mean and std of 0.5.
+    /// In `float32` half of the levels differ, which is why that wire is not
+    /// written in one pass.
+    #[test]
+    fn the_wires_norm_gives_every_narrow_level_and_not_the_float32_ones() {
+        let params = params_with_a_budget_of_three_patches();
+        let reference = normalized_levels(&params.mean, &params.std);
+        let named = wire_norm(&params).table_f32();
+        let narrow: [fn(f32) -> u16; 2] = [f32_to_bf16_bits, f32_to_f16_bits];
+        for (channel, (reference, named)) in reference.iter().zip(&named).enumerate() {
+            for (level, (reference, named)) in reference.iter().zip(named).enumerate() {
+                for narrow in narrow {
+                    assert_eq!(
+                        narrow(*reference),
+                        narrow(*named),
+                        "channel {channel}, level {level}"
+                    );
+                }
+            }
+            let differing = reference
+                .iter()
+                .zip(named)
+                .filter(|(reference, named)| reference.to_bits() != named.to_bits())
+                .count();
+            assert_eq!(differing, 128, "channel {channel}");
+        }
+    }
+
+    /// The wire is written in one pass exactly where its norm gives every
+    /// level. Over a grid of means and stds, a pair is offered in a narrow
+    /// dtype when its 256 levels agree there, and then its bytes are the float
+    /// tensor's write; a pair with one level the norm does not give keeps the
+    /// float tensor. The grid holds pairs of both kinds in each dtype, and its
+    /// mixed cases take one channel from a pair of the other kind: one channel
+    /// that misses a level keeps the float tensor too. A last case gives each
+    /// channel an offered pair of its own: the wire is the float tensor's
+    /// write through three different tables.
+    #[test]
+    fn the_wire_is_offered_exactly_where_its_norm_gives_every_level() {
+        let image = DynamicImage::ImageRgb8(
+            RgbImage::from_raw(28, 14, generated_bytes(28 * 14 * 3, 3)).unwrap(),
+        );
+        for (dtype, narrow) in [
+            (EncoderDtype::BFloat16, f32_to_bf16_bits as fn(f32) -> u16),
+            (EncoderDtype::Float16, f32_to_f16_bits),
+        ] {
+            let (mut offered, mut kept) = (0, 0);
+            let (mut offered_pairs, mut kept_pair) = (Vec::new(), None);
+            // Every level of every channel, narrowed, is its norm's.
+            let agree = |params: &MoonVitParams| {
+                let reference = normalized_levels(&params.mean, &params.std);
+                let named = wire_norm(params).table_f32();
+                reference.iter().zip(&named).all(|(reference, named)| {
+                    reference
+                        .iter()
+                        .zip(named)
+                        .all(|(reference, named)| narrow(*reference) == narrow(*named))
+                })
+            };
+            for mean in [0.2, 0.4, 0.5, 0.48145466] {
+                for std in [0.1, 0.25, 0.5, 0.26862954] {
+                    let params = MoonVitParams {
+                        mean: [mean; 3],
+                        std: [std; 3],
+                        ..params_with_a_budget_of_three_patches()
+                    };
+                    let wire = preprocess_wire(params, &[&image], None, dtype);
+                    assert_eq!(
+                        wire.is_some(),
+                        agree(&params),
+                        "{dtype}, mean {mean}, std {std}"
+                    );
+                    if let Some(wire) = wire {
+                        let floats = preprocess(params, &[&image], None).unwrap();
+                        assert_eq!(
+                            wire.unwrap().encoder_input.write_as(dtype),
+                            floats.encoder_input.write_as(dtype),
+                            "{dtype}, mean {mean}, std {std}"
+                        );
+                        offered += 1;
+                        offered_pairs.push((mean, std));
+                    } else {
+                        kept += 1;
+                        kept_pair = Some((mean, std));
+                    }
+                }
+            }
+            assert!(
+                offered > 0 && kept > 0,
+                "{dtype}: {offered} pairs offered, {kept} kept"
+            );
+            // A mixed case: one channel from a pair the wire is not offered
+            // for among two from a pair it is offered for, in each position.
+            let (offered_pair, kept_pair) = (
+                *offered_pairs.last().expect("an offered pair"),
+                kept_pair.expect("a kept pair"),
+            );
+            for odd in 0..3 {
+                let (mut mean, mut std) = ([offered_pair.0; 3], [offered_pair.1; 3]);
+                mean[odd] = kept_pair.0;
+                std[odd] = kept_pair.1;
+                let params = MoonVitParams {
+                    mean,
+                    std,
+                    ..params_with_a_budget_of_three_patches()
+                };
+                assert!(!agree(&params), "{dtype}: channel {odd} misses a level");
+                assert!(
+                    preprocess_wire(params, &[&image], None, dtype).is_none(),
+                    "{dtype}: no wire with channel {odd} of mean {mean:?}, std {std:?}"
+                );
+            }
+            // A mixed case of the other kind: three pairs the wire is offered
+            // for, one a channel. The wire is offered, and its bytes are the
+            // float tensor's write through three different tables.
+            let pairs = offered_pairs.len();
+            assert!(pairs >= 3, "{dtype}: {pairs} offered pairs");
+            let [a, b, c] = [
+                offered_pairs[0],
+                offered_pairs[pairs / 2],
+                offered_pairs[pairs - 1],
+            ];
+            let params = MoonVitParams {
+                mean: [a.0, b.0, c.0],
+                std: [a.1, b.1, c.1],
+                ..params_with_a_budget_of_three_patches()
+            };
+            assert!(agree(&params), "{dtype}: three offered channels");
+            let wire = preprocess_wire(params, &[&image], None, dtype)
+                .expect("offered with three tables")
+                .unwrap();
+            let floats = preprocess(params, &[&image], None).unwrap();
+            assert_eq!(
+                wire.encoder_input.write_as(dtype),
+                floats.encoder_input.write_as(dtype),
+                "{dtype}: mean {:?}, std {:?}",
+                params.mean,
+                params.std
+            );
+        }
+    }
+
+    /// A buffer of the pool that the patches did not cover is refused: its
+    /// other bytes are a previous request's.
+    #[test]
+    fn a_wire_buffer_the_patches_did_not_cover_is_refused() {
+        assert_eq!(covered(vec![7; 8], 8).expect("covered"), vec![7; 8]);
+        for written in [0, 6, 10] {
+            let error = covered(vec![7; 8], written).expect_err("not covered");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("{written} of 8 bytes written")),
+                "{error}"
+            );
+        }
     }
 }

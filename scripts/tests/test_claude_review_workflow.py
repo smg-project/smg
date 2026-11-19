@@ -78,3 +78,15 @@ def test_claude_tracks_progress_in_a_comment_and_requests_changes_on_important_f
     prompt = action["with"]["prompt"]
     assert "event=REQUEST_CHANGES" in prompt and "event=APPROVE" in prompt
     assert "dismissals" in prompt  # a later push that settles the findings lifts the request
+
+
+def test_only_a_review_trigger_shares_the_cancelling_group(workflow):
+    # The action's tracking comment and the other bots' notes are issue_comment events on the
+    # same pull request. A run they start must never claim the review's concurrency group, or
+    # it cancels the review in progress (seen on #5564, 2026-11-09).
+    group = workflow["jobs"]["review"]["concurrency"]["group"]
+    assert workflow["jobs"]["review"]["concurrency"]["cancel-in-progress"] is True
+    assert "github.event_name == 'pull_request'" in group
+    assert "github.event.comment.user.type != 'Bot'" in group
+    assert "contains(github.event.comment.body, '@claude review')" in group
+    assert "format('noop-{0}', github.run_id)" in group

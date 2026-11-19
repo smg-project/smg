@@ -11,10 +11,13 @@
 use image::DynamicImage;
 
 use super::moonvit::{self, MoonVitParams};
-use crate::vision::{
-    preprocessor_config::PreProcessorConfig,
-    processor::{PreprocessedEncoderInputs, VisionPreProcessor},
-    transforms::TransformError,
+use crate::{
+    encoder_inputs::EncoderDtype,
+    vision::{
+        preprocessor_config::PreProcessorConfig,
+        processor::{PreprocessedEncoderInputs, VisionPreProcessor},
+        transforms::TransformError,
+    },
 };
 
 pub const KIMI_K25_MEAN: [f64; 3] = [0.5, 0.5, 0.5];
@@ -82,6 +85,14 @@ impl VisionPreProcessor for KimiK25Processor {
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         // K2.5 ships no `transparent_bg_config`, so alpha is dropped.
         moonvit::preprocess(self.params, images, None)
+    }
+
+    fn preprocess_wire(
+        &self,
+        images: &[&DynamicImage],
+        dtype: EncoderDtype,
+    ) -> Option<Result<PreprocessedEncoderInputs, TransformError>> {
+        moonvit::preprocess_wire(self.params, images, None, dtype)
     }
 
     fn calculate_num_tokens(&self, width: u32, height: u32) -> Result<usize, TransformError> {

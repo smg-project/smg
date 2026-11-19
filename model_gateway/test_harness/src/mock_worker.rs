@@ -300,6 +300,41 @@ pub struct StreamScript {
 
 static STREAM_SCRIPTS: OnceLock<Mutex<HashMap<u16, StreamScript>>> = OnceLock::new();
 
+/// The names (ports) of the workers live in this process. A name keys the
+/// scheduler controls, the request recorder and the stream script above, and
+/// a worker's drop clears them, so two live workers of one name would wipe
+/// each other's state mid-test: a second start under a live name is refused.
+static LIVE_NAMED_PORTS: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
+
+fn live_named_ports() -> &'static Mutex<HashSet<u16>> {
+    LIVE_NAMED_PORTS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Claim `port` as a live worker's name, or say which rule a second claim
+/// breaks (the tests of one binary run in one process, in parallel).
+fn claim_named_port(port: u16) -> Result<(), String> {
+    let mut live = live_named_ports()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if live.insert(port) {
+        Ok(())
+    } else {
+        Err(format!(
+            "mock worker port {port} is the name of a worker still live in this process: the \
+             harness keys its stream script, request recorder and scheduler controls by that \
+             name and clears them when the worker drops, so name a port no other test of this \
+             binary uses"
+        ))
+    }
+}
+
+fn release_named_port(port: u16) {
+    live_named_ports()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&port);
+}
+
 fn stream_scripts_table() -> &'static Mutex<HashMap<u16, StreamScript>> {
     STREAM_SCRIPTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -418,14 +453,8 @@ impl MockWorker {
     /// configured port stays the worker's *name*: the per-port test tables
     /// are keyed by it, and the app test context rewrites URLs a test spells
     /// out with it to the bound address.
-    #[expect(
-        clippy::disallowed_methods,
-        clippy::print_stderr,
-        reason = "test infrastructure"
-    )]
     pub async fn start(&mut self) -> Result<String, Box<dyn std::error::Error>> {
-        let config = self.config.clone();
-        let named_port = config.read().await.port;
+        let named_port = self.config.read().await.port;
         let listener = match named_port {
             0 => tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?,
             named => match tokio::net::TcpListener::bind(("127.0.0.1", named)).await {
@@ -433,11 +462,36 @@ impl MockWorker {
                 Err(_) => tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?,
             },
         };
+        self.start_on(listener).await
+    }
+
+    /// Start the mock worker server on a listener the caller holds and
+    /// return the URL it answers on.
+    ///
+    /// For a test whose engine comes up on a port it announced while the
+    /// engine was down: the test holds the port from the moment it learns the
+    /// number and hands its socket over here, so no other test of the binary
+    /// can be given the port in between. The worker's name is found as in
+    /// [`MockWorker::start`]: the configured port, or the listener's own
+    /// when the config left it 0.
+    #[expect(
+        clippy::disallowed_methods,
+        clippy::print_stderr,
+        reason = "test infrastructure"
+    )]
+    pub async fn start_on(
+        &mut self,
+        listener: tokio::net::TcpListener,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let config = self.config.clone();
+        let named_port = config.read().await.port;
         let port = listener.local_addr()?.port();
         if named_port == 0 {
             config.write().await.port = port;
         }
-        self.named_port = Some(if named_port == 0 { port } else { named_port });
+        let name = if named_port == 0 { port } else { named_port };
+        claim_named_port(name)?;
+        self.named_port = Some(name);
 
         let app = Router::new()
             .route("/health", get(health_handler))
@@ -451,6 +505,8 @@ impl MockWorker {
             .route("/v1/messages", post(messages_handler))
             .route("/v1/completions", post(completions_handler))
             .route("/v1/rerank", post(rerank_handler))
+            .route("/v1/embeddings", post(embeddings_handler))
+            .route("/v1/classify", post(classify_handler))
             .route(
                 "/v1/audio/transcriptions",
                 post(audio_transcriptions_handler),
@@ -523,6 +579,7 @@ impl Drop for MockWorker {
             clear_scheduler_controls(port);
             clear_request_recorder(port);
             clear_stream_script(port);
+            release_named_port(port);
         }
     }
 }
@@ -916,9 +973,11 @@ async fn realtime_rest_handler(
 
 async fn messages_handler(
     State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    version: Version,
     Json(payload): Json<serde_json::Value>,
 ) -> Response {
     let config = config.read().await;
+    record_request(config.port, version, &payload);
 
     if should_fail(&config) {
         return (
@@ -1031,9 +1090,11 @@ async fn messages_handler(
 )]
 async fn completions_handler(
     State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    version: Version,
     Json(payload): Json<serde_json::Value>,
 ) -> Response {
     let config = config.read().await;
+    record_request(config.port, version, &payload);
 
     if should_fail(&config) {
         return (
@@ -1939,6 +2000,95 @@ async fn rerank_handler(
     (StatusCode::OK, Json(mock_results)).into_response()
 }
 
+/// The inputs of an embeddings or classify body: a string is one, an array
+/// of strings or of token id arrays one per member, a flat array of token ids
+/// one.
+fn input_count(payload: &serde_json::Value) -> usize {
+    match payload.get("input") {
+        Some(serde_json::Value::Array(members))
+            if members.first().is_some_and(|member| !member.is_number()) =>
+        {
+            members.len()
+        }
+        _ => 1,
+    }
+}
+
+/// `/v1/embeddings`: one vector per input; the request is recorded for the
+/// tests that read what the gateway relayed.
+async fn embeddings_handler(
+    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    version: Version,
+    Json(payload): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let config = config.read().await;
+    record_request(config.port, version, &payload);
+
+    if config.response_delay_ms > 0 {
+        tokio::time::sleep(tokio::time::Duration::from_millis(config.response_delay_ms)).await;
+    }
+    if rand::random::<f32>() < config.fail_rate {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "Simulated failure").into_response();
+    }
+
+    let inputs = input_count(&payload);
+    let data: Vec<serde_json::Value> = (0..inputs)
+        .map(|index| json!({"object": "embedding", "index": index, "embedding": [0.1, 0.2, 0.3]}))
+        .collect();
+    let model = payload
+        .get("model")
+        .cloned()
+        .unwrap_or_else(|| json!("mock-model"));
+    (
+        StatusCode::OK,
+        Json(json!({
+            "object": "list",
+            "data": data,
+            "model": model,
+            "usage": {"prompt_tokens": 3 * inputs, "total_tokens": 3 * inputs}
+        })),
+    )
+        .into_response()
+}
+
+/// `/v1/classify`: one label per input; the request is recorded as above.
+async fn classify_handler(
+    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    version: Version,
+    Json(payload): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let config = config.read().await;
+    record_request(config.port, version, &payload);
+
+    if config.response_delay_ms > 0 {
+        tokio::time::sleep(tokio::time::Duration::from_millis(config.response_delay_ms)).await;
+    }
+    if rand::random::<f32>() < config.fail_rate {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "Simulated failure").into_response();
+    }
+
+    let inputs = input_count(&payload);
+    let data: Vec<serde_json::Value> = (0..inputs)
+        .map(|index| json!({"index": index, "label": "positive", "probs": [0.9, 0.1], "num_classes": 2}))
+        .collect();
+    let model = payload
+        .get("model")
+        .cloned()
+        .unwrap_or_else(|| json!("mock-model"));
+    (
+        StatusCode::OK,
+        Json(json!({
+            "id": format!("classify-{}", config.port),
+            "object": "list",
+            "created": 0,
+            "model": model,
+            "data": data,
+            "usage": {"prompt_tokens": 2 * inputs, "total_tokens": 2 * inputs, "completion_tokens": 0}
+        })),
+    )
+        .into_response()
+}
+
 impl Default for MockWorkerConfig {
     fn default() -> Self {
         Self {
@@ -1948,5 +2098,80 @@ impl Default for MockWorkerConfig {
             response_delay_ms: 0,
             fail_rate: 0.0,
         }
+    }
+}
+
+#[cfg(test)]
+mod named_port_tests {
+    use super::*;
+
+    fn named(port: u16) -> MockWorkerConfig {
+        MockWorkerConfig {
+            port,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }
+    }
+
+    /// A second worker under a live name is refused with the rule, and the
+    /// name is free again once the first worker drops.
+    #[tokio::test]
+    async fn a_live_name_refuses_a_second_worker_until_the_first_drops() {
+        let mut first = MockWorker::new(named(18_990));
+        first.start().await.expect("the first worker starts");
+        let mut second = MockWorker::new(named(18_990));
+        let refusal = second
+            .start()
+            .await
+            .expect_err("a second worker under a live name is refused")
+            .to_string();
+        assert!(
+            refusal.contains("18990 is the name of a worker still live"),
+            "{refusal}"
+        );
+        drop(first);
+        let mut again = MockWorker::new(named(18_990));
+        again
+            .start()
+            .await
+            .expect("the name is free once the first worker dropped");
+    }
+
+    /// A worker started on a listener its test holds serves on that very
+    /// socket: the URL names the listener's port and the health route
+    /// answers there.
+    #[tokio::test]
+    async fn a_worker_started_on_a_held_listener_serves_on_it() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("a listener the test holds");
+        let port = listener
+            .local_addr()
+            .expect("the listener's address")
+            .port();
+        let mut worker = MockWorker::new(named(port));
+        let url = worker
+            .start_on(listener)
+            .await
+            .expect("the worker starts on the held listener");
+        assert_eq!(url, format!("http://127.0.0.1:{port}"));
+
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("the held port answers");
+        stream
+            .write_all(b"GET /health HTTP/1.1\r\nHost: worker\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("the request is written");
+        let mut answer = String::new();
+        stream
+            .read_to_string(&mut answer)
+            .await
+            .expect("the answer is read");
+        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
     }
 }

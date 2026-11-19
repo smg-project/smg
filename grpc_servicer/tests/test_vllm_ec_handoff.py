@@ -221,3 +221,53 @@ async def test_encoder_only_validates_connector_specific_handles(consumer, conne
     else:
         assert [reply async for reply in method(servicer, request, context)] == ["complete"]
         assert complete.call_args.kwargs["media_identity"] == identity
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode", [None, "enabled", "disabled", "adaptive", "", "{", "[]", "null", "true"]
+)
+async def test_reasoning_template_kwargs_reach_engine_or_fail_before_submission(mode):
+    """The Python handler preserves parser state and rejects non-object kwargs."""
+    request = pb.GenerateRequest(
+        request_id="thinking-test", tokenized=pb.TokenizedInput(input_ids=[1, 2])
+    )
+    invalid = mode in ("", "{", "[]", "null", "true")
+    if mode is not None:
+        request.chat_template_kwargs_json = mode if invalid else json.dumps({"thinking_mode": mode})
+    seen = []
+
+    async def generate(**kwargs):
+        """Record arguments accepted by the real handler without running a model."""
+        seen.append(kwargs)
+        if False:
+            yield
+
+    async def abort(code, message):
+        """Make gRPC validation failures observable to the test."""
+        raise _Aborted(code, message)
+
+    servicer = SimpleNamespace(
+        engine=SimpleNamespace(
+            generate=generate,
+            renderer=SimpleNamespace(process_for_engine=lambda prompt, **kwargs: prompt),
+            vllm_config=SimpleNamespace(ec_transfer_config=None),
+        ),
+        _sampling_params_from_proto=lambda *args, **kwargs: SimpleNamespace(
+            extra_args=None, logprobs=None, prompt_logprobs=None
+        ),
+        _tokenization_kwargs_from_proto=lambda _: {},
+        _loads=Mock(),
+        _notify_kv_transfer_rejected=AsyncMock(),
+    )
+    context = SimpleNamespace(abort=abort, invocation_metadata=lambda: ())
+    if invalid:
+        with pytest.raises(_Aborted) as exc:
+            _ = [reply async for reply in _generate()(servicer, request, context)]
+        assert exc.value.args[0] is grpc.StatusCode.INVALID_ARGUMENT
+        assert not seen
+    else:
+        assert [reply async for reply in _generate()(servicer, request, context)] == []
+        assert len(seen) == 1
+        expected = {"chat_template_kwargs": {"thinking_mode": mode}} if mode else None
+        assert seen[0].get("reasoning_parser_kwargs") == expected

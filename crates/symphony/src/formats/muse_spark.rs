@@ -191,6 +191,8 @@ fn word() -> Class {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use openai_protocol::common::Tool;
     use serde_json::{json as value, Value};
 
@@ -200,7 +202,7 @@ mod tests {
         event::{DropReason, Event, Text},
         grammar::{GrammarStart, Options},
         input::EngineFinish,
-        testing::{bytes, content, drive_to, reasoning, tool},
+        testing::{bytes, content, drive_to, malformed_texts, reasoning, tool},
         Declared,
     };
 
@@ -300,16 +302,6 @@ mod tests {
             .collect()
     }
 
-    fn malformed<'a>(events: &'a [Event<'_>]) -> Vec<&'a str> {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Malformed { text, .. } => Some(&*text.text),
-                _ => None,
-            })
-            .collect()
-    }
-
     fn tool_calls_finished(events: &[Event]) -> u32 {
         match events.last() {
             Some(Event::Finish { tool_calls, .. }) => *tool_calls,
@@ -336,7 +328,7 @@ mod tests {
         assert_eq!(tool_calls_finished(&events), 2);
         // The headers, the block around each call and the next message's opener are the
         // template's framing, dropped; nothing is malformed.
-        assert_eq!(malformed(&events), Vec::<&str>::new());
+        assert_eq!(malformed_texts(&events), Vec::<&str>::new());
         let framing = dropped_bytes(&events);
         for piece in [
             " to=self<|message|>",
@@ -545,7 +537,7 @@ mod tests {
         let events = run(PROMPT, &[output]);
         assert_eq!(bytes(&events), output);
         assert_eq!(content(&events), "Hi");
-        assert_eq!(malformed(&events), Vec::<&str>::new());
+        assert_eq!(malformed_texts(&events), Vec::<&str>::new());
         assert!(dropped_bytes(&events).contains(" junk "));
 
         // An output with no message at all is dropped whole: nothing reaches the client.
@@ -660,7 +652,7 @@ mod tests {
     #[test]
     fn a_json_answer_is_the_answers_message_with_the_schema_in_it() {
         let grammar = muse_spark()
-            .answer_grammar(&value!({"type": "object"}), false)
+            .answer_grammar(&Arc::new(value!({"type": "object"})), false)
             .expect("an answer tag");
         let payload = grammar.payload();
         assert_eq!(payload["format"]["type"], "tag");

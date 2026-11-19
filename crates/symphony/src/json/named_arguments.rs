@@ -9,6 +9,11 @@
 //! for through the judge the JSON assembler uses ([`Fragments`]), so that the two readers say the
 //! same of the same bytes.
 //!
+//! The object's close ends the call for the named reader ([`Object::feed`], [`Object::finish`]).
+//! A syntax whose call ends at a marker of its own after the object (DSML's invoke close, read by
+//! the attributed assembler, `tagged::attributed`) reads the object alone ([`Object::read`],
+//! [`Object::cut`]) and ends the call itself, with that marker's bytes.
+//!
 //! What the reader leaves open: a value that is not an object is streamed for as long as it is a
 //! JSON prefix and ends with the region, since the outline finds no close for it, a word among
 //! them held until it is spelled or refused, so that the pieces say of it what the whole says. The
@@ -24,7 +29,7 @@ use crate::{
 
 /// The arguments object as it arrives.
 #[derive(Clone, Debug)]
-pub(super) struct Object {
+pub(crate) struct Object {
     index: u32,
     text: String,
     /// The outline of `text`, read as it grows: its close is the object's.
@@ -36,7 +41,7 @@ pub(super) struct Object {
 
 impl Object {
     /// The reader of the arguments of the call at `index`, positioned at the object's first byte.
-    pub(super) fn new(index: u32) -> Self {
+    pub(crate) fn new(index: u32) -> Self {
         Self {
             index,
             text: String::new(),
@@ -49,6 +54,49 @@ impl Object {
     /// Append the next bytes of the object and push the fragments and the end they complete; how
     /// many of the bytes the object took.
     pub(super) fn feed<'d>(&mut self, bytes: &'d str, out: &mut Events<'d>) -> usize {
+        let open = !self.done;
+        let taken = self.read(bytes, out);
+        if open && self.done {
+            out.push(Event::ToolCallEnd {
+                index: self.index,
+                source: Text::default(),
+            });
+        }
+        taken
+    }
+
+    /// Whether the object's closing brace arrived.
+    pub(crate) fn closed(&self) -> bool {
+        self.done
+    }
+
+    /// Whether the object closed as one whole JSON value a strict reader takes.
+    pub(crate) fn whole(&self) -> bool {
+        self.done && !self.fragments.refused() && self.fragments.whole()
+    }
+
+    /// Give back what was read of an object that closed, its text and the scanner, which keeps a
+    /// decoded copy of a top-level name: nothing reads either after the closing brace, so a
+    /// reader kept to the call's end ([`Self::cut`]) holds none of the call's bytes meanwhile.
+    /// What the close decided stays: that the object closed, and what the fragments said of it.
+    pub(crate) fn give_back(&mut self) {
+        debug_assert!(self.done, "only a closed object gives its text back");
+        self.text = String::new();
+        self.scanner = Scanner::default();
+    }
+
+    /// How many bytes the reader holds of the object: its text, and the decoded copy the scanner
+    /// keeps of a top-level name.
+    #[cfg(test)]
+    pub(crate) fn held(&self) -> usize {
+        let name = self.scanner.found().name.as_ref();
+        self.text.capacity() + name.map_or(0, String::capacity)
+    }
+
+    /// [`Self::feed`] without the call's end: the fragments the bytes complete, and at the
+    /// object's close the word that says it is no whole value where it is none; how many of the
+    /// bytes the object took, up to its closing brace.
+    pub(crate) fn read<'d>(&mut self, bytes: &'d str, out: &mut Events<'d>) -> usize {
         if self.done {
             return 0;
         }
@@ -79,10 +127,6 @@ impl Object {
                     why: MalformedReason::InvalidArguments,
                 });
             }
-            out.push(Event::ToolCallEnd {
-                index: self.index,
-                source: Text::default(),
-            });
             self.done = true;
         }
         taken
@@ -93,7 +137,21 @@ impl Object {
     /// goes first, as the prefix it is, and a `Malformed` event of no bytes
     /// before the end says that the arguments are no whole value, unless the bytes happen to be
     /// one (a value that is no object, which the template never writes).
-    pub(super) fn finish(mut self, out: &mut Events) {
+    pub(super) fn finish(self, out: &mut Events) {
+        if self.done {
+            return;
+        }
+        let index = self.index;
+        self.cut(out);
+        out.push(Event::ToolCallEnd {
+            index,
+            source: Text::default(),
+        });
+    }
+
+    /// [`Self::finish`] without the call's end: the word still held, and the `Malformed` event
+    /// of no bytes that says the arguments are no whole value; nothing for an object that closed.
+    pub(crate) fn cut(mut self, out: &mut Events) {
         if self.done {
             return;
         }
@@ -104,10 +162,6 @@ impl Object {
                 why: MalformedReason::UnterminatedRegion,
             });
         }
-        out.push(Event::ToolCallEnd {
-            index: self.index,
-            source: Text::default(),
-        });
     }
 
     /// The bytes that arrived since the last call: a fragment for the part that keeps the

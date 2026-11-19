@@ -18,8 +18,8 @@ import (
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	"github.com/lightseek/smg/go-grpc-sdk/internal/ffi"
-	"github.com/lightseek/smg/go-grpc-sdk/internal/proto"
+	"github.com/smg-project/smg/bindings/golang/internal/ffi"
+	"github.com/smg-project/smg/bindings/golang/internal/proto"
 )
 
 type grpcClientStream interface {
@@ -733,9 +733,11 @@ type StreamChoice struct {
 
 // MessageDelta represents incremental message updates
 type MessageDelta struct {
-	Role      string     `json:"role,omitempty"`
-	Content   string     `json:"content,omitempty"`
-	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
+	Role    string `json:"role,omitempty"`
+	Content string `json:"content,omitempty"`
+	// A piece of the thought, apart from the content.
+	ReasoningContent string     `json:"reasoning_content,omitempty"`
+	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
 }
 
 // ToolCall represents a tool call in the response

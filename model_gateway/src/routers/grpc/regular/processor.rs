@@ -144,6 +144,7 @@ impl ResponseProcessor {
             ReasoningSource {
                 wanted: original_request.separate_reasoning && reasoning_parser_available,
                 in_prefill: original_request.reasoning_in_prefill,
+                json_mode: original_request.json_mode,
                 parser_name: reasoning_parser_name,
                 model,
             },
@@ -159,6 +160,7 @@ impl ResponseProcessor {
                     parser_available: tool_parser_available,
                     history_tool_calls_count,
                     first_call_only: original_request.first_tool_call_only,
+                    json_mode: original_request.json_mode,
                 },
             )
             .await;
@@ -282,7 +284,9 @@ impl ResponseProcessor {
     /// thinking tokens are the engine's, or the reasoning text's, when the request asked for
     /// thinking. A call whose arguments no `tool_use` input holds refuses the message
     /// (`SymphonyError::InputRefused`, the call named), rather than leave as `{}` without a word;
-    /// the caller counts the refusal under the table ([`telemetry::record_refused`]).
+    /// the caller counts the refusal under the table ([`telemetry::record_refused`]). A call whose
+    /// arguments are a whole value of another kind than an object (a double-encoded or bare string,
+    /// an array) carries `{}` with a word in the log ([`object_input`]), as on the older path.
     fn read_messages_with_symphony(
         dispatch: &DispatchMetadata,
         assignment: &Assignment,
@@ -316,13 +320,18 @@ impl ResponseProcessor {
         let mut output = adapt::messages::output(&events);
         // A `tool_use` block carries `{}` only where the parser said the arguments are none;
         // arguments that are JSON no `input` value holds would leave as `{}` with no word, so the
-        // message is refused, naming the call (the stream carries such arguments as written).
+        // message is refused, naming the call (the stream carries such arguments as written
+        // where they open an object, and withholds them where they do not).
         if let Some(refused) = output.refused.first() {
             return Err(SymphonyError::InputRefused(format!(
                 "the tool_use input of call {} ({}) cannot carry the arguments the model wrote: {}",
                 refused.index, refused.name, refused.why
             )));
         }
+        // Arguments that are a whole value of another kind (a double-encoded or
+        // bare string, an array) become `{}` with a word in the log, as on the
+        // older path: the request side takes no other `input`.
+        object_inputs(&mut output.content, "read_messages_with_symphony");
         if !request.thinking_text_returned {
             utils::message_utils::omit_thinking_text(&mut output.content);
         }
@@ -331,6 +340,11 @@ impl ResponseProcessor {
             Some(messages::StopReason::EndTurn) if stop_sequence.is_some() => {
                 Some(messages::StopReason::StopSequence)
             }
+            // The reader's `max_tokens` is the engine's `length`: the budget
+            // or the window, told apart from the counts.
+            Some(messages::StopReason::MaxTokens) => Some(
+                request.length_stop_reason(complete.prompt_tokens(), complete.completion_tokens()),
+            ),
             stop_reason => stop_reason,
         };
         let stop_sequence = stop_sequence
@@ -475,12 +489,16 @@ impl ResponseProcessor {
         // answer builds its usage chunk: with the reasoning tokens the
         // gateway's parser split off when it ran (zero included) and every
         // detail counter present as the OpenAI API sends it.
-        let counts = response_formatting::TokenCounts::of(&all_responses);
+        let counts = response_formatting::TokenCounts::of_collected(
+            &all_responses,
+            chat_request.expected_choices,
+        );
         let usage = response_formatting::chat_usage(
             counts.usage(),
             (reasoning_parser_available || chat_request.symphony.is_some())
                 .then_some(parsed_reasoning_tokens),
             chat_request.unbilled_prompt_tokens,
+            chat_request.image_tokens,
         );
 
         // Build final ChatCompletionResponse
@@ -532,6 +550,7 @@ impl ResponseProcessor {
         ) else {
             return split;
         };
+        parser.set_json_mode(source.json_mode);
         if source.in_prefill {
             parser.mark_reasoning_started();
         }
@@ -591,6 +610,7 @@ impl ResponseProcessor {
                         source.parser_name,
                         tools,
                         source.history_tool_calls_count,
+                        source.json_mode,
                     )
                     .await;
             }
@@ -610,6 +630,7 @@ impl ResponseProcessor {
         tool_parser_name: Option<&str>,
         tools: &[Tool],
         history_tool_calls_count: usize,
+        json_mode: bool,
     ) -> (Option<Vec<ToolCall>>, String) {
         // Get pooled parser for this model
         let pooled_parser =
@@ -619,7 +640,9 @@ impl ResponseProcessor {
         // tool schemas so schema-aware parsers coerce argument types by their
         // declared type instead of guessing from the raw text.
         let result = {
-            let parser = pooled_parser.lock().await;
+            let mut parser = pooled_parser.lock().await;
+            // The parser is pooled across requests, so every use sets the mode.
+            parser.set_json_mode(json_mode);
             parser
                 .parse_complete_with_tools(processed_text, tools)
                 .await
@@ -981,6 +1004,7 @@ impl ResponseProcessor {
             ReasoningSource {
                 wanted: reasoning_parser_available,
                 in_prefill: messages_request.reasoning_in_prefill,
+                json_mode: false,
                 parser_name: reasoning_parser_name,
                 model,
             },
@@ -999,6 +1023,7 @@ impl ResponseProcessor {
                     parser_available: tool_parser_available,
                     history_tool_calls_count: messages_request.history_tool_calls_count,
                     first_call_only: messages_request.first_tool_call_only,
+                    json_mode: false,
                 },
             )
             .await;
@@ -1025,19 +1050,7 @@ impl ResponseProcessor {
         // Tool use blocks (convert from OpenAI ToolCall format)
         if let Some(calls) = &tool_calls {
             for tc in calls {
-                let input = if let Some(args) = tc.function.arguments.as_deref() {
-                    serde_json::from_str(args).unwrap_or_else(|e| {
-                        warn!(
-                            function = "process_non_streaming_messages_response",
-                            tool_call_id = %tc.id,
-                            error = %e,
-                            "Failed to parse tool call arguments, defaulting to empty object"
-                        );
-                        serde_json::Value::Object(serde_json::Map::new())
-                    })
-                } else {
-                    serde_json::Value::Object(serde_json::Map::new())
-                };
+                let input = tool_use_input(tc.function.arguments.as_deref(), &tc.id);
 
                 content_blocks.push(messages::ContentBlock::ToolUse {
                     id: utils::message_utils::anthropic_tool_use_id(&tc.id),
@@ -1057,9 +1070,14 @@ impl ResponseProcessor {
         let finish_reason_str = finish_after_local_stop(stopped, complete);
         let stop_sequence = matched_stop_string(stop_decoder, complete);
 
-        // Parsed calls do not override a truncation, as in Chat.
+        // Parsed calls do not override a truncation, as in Chat. The engines
+        // report the request's budget and the model's window alike as
+        // `length`; the spec tells them apart from the counts.
         let stop_reason = if finish_reason_str == "length" {
-            Some(messages::StopReason::MaxTokens)
+            Some(
+                messages_request
+                    .length_stop_reason(complete.prompt_tokens(), complete.completion_tokens()),
+            )
         } else if tool_calls.is_some() || finish_reason_str == "tool_calls" {
             Some(messages::StopReason::ToolUse)
         } else if stop_sequence.is_some() {
@@ -1140,7 +1158,21 @@ impl ResponseProcessor {
         let mut total_cached = 0u32;
         let mut total_reasoning = 0u32;
         let mut total_spec_accepted = 0u32;
-        let mut total_spec_drafted = 0u32;
+        // Membership is per prompt: another prompt's choice cannot stand in
+        // for a missing terminal here. Borrow the collected frames so the
+        // shared proposal rule needs no intermediate allocation.
+        let spec_drafted =
+            response_formatting::known_spec_drafted(collected.iter().flatten().map(|complete| {
+                (
+                    complete.spec_accepted_tokens(),
+                    complete.spec_draft_tokens(),
+                )
+            }))
+            .filter(|_| {
+                collected.iter().all(|responses| {
+                    response_formatting::all_choices_completed(responses, choices_per_prompt)
+                })
+            });
         let mut choices = Vec::new();
 
         for (prompt_index, all_responses) in collected.into_iter().enumerate() {
@@ -1171,7 +1203,6 @@ impl ResponseProcessor {
                 total_completion += complete.completion_tokens();
                 total_reasoning += complete.reasoning_tokens();
                 total_spec_accepted += complete.spec_accepted_tokens();
-                total_spec_drafted += complete.spec_draft_tokens();
 
                 let finish_reason =
                     utils::completion_finish_reason(stopped, complete.finish_reason());
@@ -1253,7 +1284,7 @@ impl ResponseProcessor {
                     cached: total_cached,
                     reasoning: total_reasoning,
                     spec_accepted: total_spec_accepted,
-                    spec_drafted: total_spec_drafted,
+                    spec_drafted,
                 }
                 .usage(),
             ),
@@ -1293,10 +1324,13 @@ struct ReasoningSplit {
 /// What the reasoning split reads from the request: whether the request
 /// wants the split at all (its separate-reasoning switch, with a parser
 /// available), whether the rendered prompt ends inside the thinking block,
-/// the parser the request resolved to, and the model.
+/// whether the response is structured JSON (a typed parser then keeps its
+/// framing spellings inside JSON strings), the parser the request resolved
+/// to, and the model.
 struct ReasoningSource<'a> {
     wanted: bool,
     in_prefill: bool,
+    json_mode: bool,
     parser_name: Option<&'a str>,
     model: &'a str,
 }
@@ -1304,7 +1338,8 @@ struct ReasoningSource<'a> {
 /// What a tool-call parse reads from the request: the tools it offered (none
 /// when it offered none), its tool choice in the chat form, the model, the
 /// parser the request resolved to and whether it is available, how many
-/// calls the history already holds, and whether the first call alone is kept.
+/// calls the history already holds, whether the first call alone is kept,
+/// and whether the response format is JSON.
 struct ToolCallSource<'a> {
     tools: Option<&'a [Tool]>,
     tool_choice: Option<&'a ToolChoice>,
@@ -1313,6 +1348,9 @@ struct ToolCallSource<'a> {
     parser_available: bool,
     history_tool_calls_count: usize,
     first_call_only: bool,
+    /// A structured JSON response: a typed parser keeps its framing
+    /// spellings inside JSON strings.
+    json_mode: bool,
 }
 
 /// The 500 a whole response whose reading panicked is answered with: under
@@ -1588,6 +1626,160 @@ fn messages_usage_from_counts(
     }
 }
 
+/// The `input` of a `tool_use` block from the arguments a tool call carries:
+/// the parsed object as it is, or an empty object when the arguments are
+/// missing, are not valid JSON, or are valid JSON that is not an object
+/// ([`object_input`]); the fallback is named once in the log, as the parse
+/// failure always was.
+fn tool_use_input(arguments: Option<&str>, tool_call_id: &str) -> serde_json::Value {
+    let Some(args) = arguments else {
+        return serde_json::Value::Object(serde_json::Map::new());
+    };
+    match serde_json::from_str::<serde_json::Value>(args) {
+        Ok(value) => object_input(
+            value,
+            "process_non_streaming_messages_response",
+            tool_call_id,
+        ),
+        Err(e) => {
+            warn!(
+                function = "process_non_streaming_messages_response",
+                tool_call_id = %tool_call_id,
+                error = %e,
+                "Failed to parse tool call arguments, defaulting to empty object"
+            );
+            serde_json::Value::Object(serde_json::Map::new())
+        }
+    }
+}
+
+/// A `tool_use` block's `input` as the Messages contract has it: the object
+/// itself, or an empty object for a whole value of another kind (a
+/// double-encoded or bare string, an array, a number, null), named once in the
+/// log under `function`. The request side refuses anything but an object, so an
+/// answer of either collected reader never carries a value a client could not
+/// send back as history. The stream keeps its block an object too: a call
+/// whose arguments open with anything but an object streams none of them
+/// (`streaming::ToolInput`), and its block keeps the `{}` it started with.
+fn object_input(
+    value: serde_json::Value,
+    function: &'static str,
+    tool_call_id: &str,
+) -> serde_json::Value {
+    if value.is_object() {
+        return value;
+    }
+    let kind = match value {
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::Bool(_) => "boolean",
+        _ => "null",
+    };
+    warn!(
+        function = function,
+        tool_call_id = %tool_call_id,
+        error = %format!("the arguments are valid JSON but not an object ({kind})"),
+        "Failed to parse tool call arguments, defaulting to empty object"
+    );
+    serde_json::Value::Object(serde_json::Map::new())
+}
+
+/// Every `tool_use` block of a collected answer with its `input` an object
+/// ([`object_input`]), in place.
+fn object_inputs(content: &mut [messages::ContentBlock], function: &'static str) {
+    for block in content {
+        if let messages::ContentBlock::ToolUse { id, input, .. } = block {
+            if !input.is_object() {
+                *input = object_input(std::mem::take(input), function, id);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tool_use_input_tests {
+    use serde_json::json;
+    use symphony::{adapt, Event, Events, FinishReason, Text};
+
+    use super::{messages, object_inputs, tool_use_input};
+
+    /// An answer's `tool_use.input` is always an object, as the request side
+    /// requires it: the parsed object as it is; an empty object for missing
+    /// arguments, arguments that are not JSON, and arguments that are JSON
+    /// but not an object (a double-encoded string, a bare string, an array, a
+    /// number, null).
+    #[test]
+    fn a_tool_use_input_is_always_an_object() {
+        assert_eq!(
+            tool_use_input(Some(r#"{"city":"Paris"}"#), "call_1"),
+            json!({"city": "Paris"})
+        );
+        assert_eq!(tool_use_input(Some("{}"), "call_1"), json!({}));
+        for arguments in [
+            None,
+            Some("not json"),
+            Some(r#""{\"city\":\"Paris\"}""#),
+            Some(r#""Paris""#),
+            Some(r#"["Paris"]"#),
+            Some("1"),
+            Some("null"),
+        ] {
+            assert_eq!(
+                tool_use_input(arguments, "call_1"),
+                json!({}),
+                "{arguments:?}"
+            );
+        }
+    }
+
+    /// The Symphony reader's collected answer keeps the same contract: the
+    /// adapter holds a whole value of any kind as the block's `input` (an
+    /// object as it is, `"Paris"` or `[1, 2]` as written, none of them
+    /// refused), and the reader leaves every non-object as `{}`.
+    #[test]
+    fn a_symphony_tool_use_input_is_an_object() {
+        for (arguments, expected) in [
+            (r#"{"city":"Paris"}"#, json!({"city": "Paris"})),
+            (r#""Paris""#, json!({})),
+            (r#""{\"city\":\"Paris\"}""#, json!({})),
+            ("[1, 2]", json!({})),
+        ] {
+            let mut events = Events::new();
+            events.push(Event::ToolCallStart {
+                index: 0,
+                id: "call_1".into(),
+                name: "f".into(),
+                source: Text::new("", 0),
+            });
+            events.push(Event::ToolCallArguments {
+                index: 0,
+                json: arguments.into(),
+                source: Text::new("", 0),
+            });
+            events.push(Event::ToolCallEnd {
+                index: 0,
+                source: Text::new("", 0),
+            });
+            events.push(Event::Finish {
+                reason: FinishReason::ToolCalls,
+                tool_calls: 1,
+                reasoning_tokens: 0,
+            });
+            let mut output = adapt::messages::output(&events);
+            assert!(
+                output.refused.is_empty(),
+                "{arguments}: the adapter holds the value"
+            );
+            object_inputs(&mut output.content, "read_messages_with_symphony");
+            let messages::ContentBlock::ToolUse { input, .. } = &output.content[0] else {
+                panic!("{arguments}: no tool_use block");
+            };
+            assert_eq!(input, &expected, "{arguments}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod content_normalization_tests {
     use super::normalize_assistant_content;
@@ -1767,6 +1959,7 @@ mod responses_finish_reason_tests {
             ReasoningSource {
                 wanted: true,
                 in_prefill: false,
+                json_mode: false,
                 parser_name: None,
                 model: "no-such-model",
             },

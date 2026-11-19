@@ -8,8 +8,24 @@
 //! for the three) that stays in the first cache levels, and ASCII is skipped
 //! eight bytes at a time. Nearly every character is Yes with combining class
 //! 0, so the third bitmap holds those and the walk reads that one bit per
-//! such character after a lead-byte decode (the two bitmaps and a character
-//! decode per character were a third of a short Cyrillic encode: measured).
+//! such character (the two bitmaps and a character decode per character
+//! were a third of a short Cyrillic encode: measured). Characters beyond
+//! ASCII come in runs (a word of Cyrillic or Arabic letters, a line of
+//! ideographs or syllables), and in a run the bit is found from the
+//! character's bytes as they stand, the bitmap's word from the first two
+//! and the bit from the last, with no code point put together (a decode
+//! and the bit read were twenty to thirty instructions a character, and
+//! the walk a sixth of a warm encode of a text whose bytes are half beyond
+//! ASCII: counted). The run is one loop, and its step is a constant of the
+//! character's length: a step whose length is looked up for each character
+//! chains two reads into every step (a table by lead byte took fewer
+//! instructions and more time: measured). A character that stands alone
+//! between ASCII ones (an accented letter, a quotation mark, a dash) is
+//! decoded and takes the same bit by its code point: a run's set-up and
+//! end cost such a character more than the decode, and natural
+//! Latin-script texts read more instructions when every character started
+//! a run (counted). So the first character after an ASCII one is decoded,
+//! and a run starts at a character that follows another beyond ASCII.
 //! The answers are the library's own,
 //! read from its functions once when the tables are built, and what the
 //! tables cannot settle (a Maybe, a character outside the plane) is handed
@@ -32,20 +48,29 @@ const NON_ASCII: u64 = 0x8080_8080_8080_8080;
 pub(super) struct NfcQuick {
     /// Characters the quick check calls Yes whose canonical combining class
     /// is zero: the one bit the walk reads for nearly every character.
-    plain: Box<[u64]>,
+    plain: Box<[u64; WORDS]>,
     /// Characters the quick check calls Yes.
-    yes: Box<[u64]>,
+    yes: Box<[u64; WORDS]>,
     /// Characters whose canonical combining class is not zero.
-    marked: Box<[u64]>,
+    marked: Box<[u64; WORDS]>,
+}
+
+/// Where the quick check stopped: `at`, the start of the character its
+/// tables could not place, and `cut`, the start of the last ASCII character
+/// before it or 0 (see [`NfcQuick::check`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Unplaced {
+    pub(super) cut: usize,
+    pub(super) at: usize,
 }
 
 impl NfcQuick {
     /// The tables, read from the library's functions for every character of
     /// the plane.
     pub(super) fn read() -> Self {
-        let mut plain = vec![0u64; WORDS];
-        let mut yes = vec![0u64; WORDS];
-        let mut marked = vec![0u64; WORDS];
+        let mut plain = Box::new([0u64; WORDS]);
+        let mut yes = Box::new([0u64; WORDS]);
+        let mut marked = Box::new([0u64; WORDS]);
         for code in 0..PLANE as u32 {
             let Some(ch) = char::from_u32(code) else {
                 continue;
@@ -63,35 +88,56 @@ impl NfcQuick {
                 plain[word] |= bit;
             }
         }
-        Self {
-            plain: plain.into_boxed_slice(),
-            yes: yes.into_boxed_slice(),
-            marked: marked.into_boxed_slice(),
-        }
+        Self { plain, yes, marked }
     }
 
-    /// Whether `text` is in NFC: the quick check, and the library's own
-    /// stretch-wise check from the cut before the character the quick check
-    /// could not place.
+    /// Whether `text` is in NFC: the quick check's walk, the library's
+    /// check on the one stretch that holds a character the walk cannot
+    /// place, and the walk again after that stretch.
     pub(super) fn is_nfc(&self, text: &str) -> bool {
-        match self.check(text) {
-            Ok(in_nfc) => in_nfc,
-            Err(cut) => super::is_nfc(&text[cut..]),
+        let mut from = 0;
+        loop {
+            match self.check(&text[from..]) {
+                Ok(in_nfc) => return in_nfc,
+                Err(Unplaced { cut, at }) => {
+                    // The library reads the stretch that holds the character
+                    // (`super::stretches` from the cut: the ASCII character
+                    // there with the run after it, or the run the text
+                    // starts with; a stretch before it, settled or walked by
+                    // the quick check, is placed already), then the walk
+                    // resumes where the next stretch starts, an ASCII
+                    // character or an ideograph, where the library's own
+                    // walk starts afresh too: no composition or mark order
+                    // crosses such a boundary. Each step walks the text once
+                    // and the library reads each such stretch once.
+                    let rest = &text[from + cut..];
+                    let held = at - cut;
+                    let Some((start, stretch, settled)) = super::stretches(rest)
+                        .find(|(start, stretch, _)| start + stretch.len() > held)
+                    else {
+                        return true;
+                    };
+                    if !settled && !unicode_normalization_alignments::is_nfc(stretch) {
+                        return false;
+                    }
+                    from += cut + start + stretch.len();
+                }
+            }
         }
     }
 
     /// The quick check of `text`: `Ok(true)` when it is in NFC, `Ok(false)`
-    /// when it is not, `Err(cut)` when it cannot tell, as the library's
+    /// when it is not, `Err(Unplaced)` when it cannot tell, as the library's
     /// answers Yes, No and Maybe. The walk is the library's: a character
     /// whose combining class is below the one before it and not zero makes
     /// the text not NFC; the first character that is not Yes stops the walk
     /// (a Maybe, which the library settles by normalizing; its No would be
-    /// No here too). `cut` is the start of the last ASCII character before
-    /// it, or 0: the text before the cut is Yes with combining class 0
-    /// throughout, an ASCII character is the second element of no
-    /// composition and reorders with nothing, so the text is in NFC exactly
-    /// when the text from the cut on is, and the library reads that alone.
-    pub(super) fn check(&self, text: &str) -> Result<bool, usize> {
+    /// No here too) and is reported with its start, `at`, and `cut`, the
+    /// start of the last ASCII character before it, or 0: the text before
+    /// the cut is Yes with combining class 0 throughout, an ASCII character
+    /// is the second element of no composition and reorders with nothing,
+    /// so the text is in NFC exactly when the text from the cut on is.
+    pub(super) fn check(&self, text: &str) -> Result<bool, Unplaced> {
         let bytes = text.as_bytes();
         let mut at = 0;
         let mut cut = 0;
@@ -102,7 +148,8 @@ impl NfcQuick {
                 // it: a byte, then whole words of it.
                 at += 1;
                 while let Some(word) = bytes.get(at..at + 8) {
-                    if u64::from_ne_bytes(word.try_into().map_err(|_| cut)?) & NON_ASCII != 0 {
+                    let word = word.try_into().map_err(|_| Unplaced { cut, at })?;
+                    if u64::from_ne_bytes(word) & NON_ASCII != 0 {
                         break;
                     }
                     at += 8;
@@ -112,21 +159,68 @@ impl NfcQuick {
                 }
                 cut = at - 1;
                 last = 0;
-                continue;
+                if at == bytes.len() {
+                    break;
+                }
+                // The character after the ASCII ones is decoded below, in
+                // this pass. In Latin-script text it stands alone between
+                // ASCII characters (an accented letter, a quotation mark, a
+                // dash), and a run's set-up and end cost such a character
+                // more than its decode: natural texts read more
+                // instructions when every character started a run
+                // (counted). Taking it here adds no test: where the walk
+                // stands in its own control flow says what came before.
+            } else {
+                // `at` is on the lead byte of a character right after
+                // another character beyond ASCII, or at the start of the
+                // text (a continuation byte follows a lead byte only, and
+                // the steps here are whole characters): a run. A character
+                // that is Yes with combining class 0, nearly every one, is
+                // one bit read from its bytes as they stand, and the step
+                // to the next is a constant of its arm: no length is looked
+                // up, so no character waits for a read before it. The
+                // three-byte arm is first, the long runs being ideographs
+                // and syllables; a character of the other length does not
+                // end the run, so a text that mixes the two stays in the
+                // loop.
+                let mut rest = &bytes[at..];
+                loop {
+                    match rest {
+                        [lead @ 0xE0..=0xEF, second, third, tail @ ..] => {
+                            let word = (usize::from(lead & 0x0F) << 6) | usize::from(second & 0x3F);
+                            if !self.plain_bit(word, *third) {
+                                break;
+                            }
+                            rest = tail;
+                        }
+                        [lead @ 0xC2..=0xDF, second, tail @ ..] => {
+                            if !self.plain_bit(usize::from(lead & 0x1F), *second) {
+                                break;
+                            }
+                            rest = tail;
+                        }
+                        _ => break,
+                    }
+                }
+                let run = bytes.len() - rest.len();
+                if run != at {
+                    at = run;
+                    last = 0;
+                    continue;
+                }
             }
-            // `at` is on the lead byte of a character (a continuation byte
-            // follows a lead byte only, and the steps here are whole
-            // characters), which gives its length. A character that is Yes
-            // with combining class 0, nearly every one, is one bit read; the
-            // rest take both tables and the class.
-            let (code, len) = char_beyond_ascii(bytes, at, bytes[at]);
+            // One character by its code point: the first after an ASCII
+            // character, and one a run did not take. A plain one is one bit
+            // of the same table; the others take both tables and the class.
+            let lead = bytes[at];
+            let (code, len) = char_beyond_ascii(bytes, at, lead);
             at += len;
             let code = code as usize;
             if code < PLANE && Self::bit(&self.plain, code) {
                 last = 0;
                 continue;
             }
-            let ch = char::from_u32(code as u32).ok_or(cut)?;
+            let ch = char::from_u32(code as u32).ok_or(Unplaced { cut, at: at - len })?;
             let (yes, marked) = if code < PLANE {
                 (Self::bit(&self.yes, code), Self::bit(&self.marked, code))
             } else {
@@ -144,15 +238,26 @@ impl NfcQuick {
                 return Ok(false);
             }
             if !yes {
-                return Err(cut);
+                return Err(Unplaced { cut, at: at - len });
             }
             last = class;
         }
         Ok(true)
     }
 
+    /// Whether the bit that the continuation byte `last` names in the word
+    /// `word` of `plain` is set. A word of the bitmap holds 64 characters,
+    /// the six bits of a continuation byte: the lead byte and the first
+    /// continuation byte of three name the word (the lead byte alone of
+    /// two) and the last byte names the bit, so no code point is put
+    /// together.
     #[inline(always)]
-    fn bit(table: &[u64], code: usize) -> bool {
+    fn plain_bit(&self, word: usize, last: u8) -> bool {
+        (self.plain[word & (WORDS - 1)] >> (last & 0x3F)) & 1 != 0
+    }
+
+    #[inline(always)]
+    fn bit(table: &[u64; WORDS], code: usize) -> bool {
         (table[(code / 64) & (WORDS - 1)] >> (code % 64)) & 1 != 0
     }
 }
@@ -163,7 +268,7 @@ mod tests {
         char::canonical_combining_class, is_nfc as library_is_nfc, is_nfc_quick, IsNormalized,
     };
 
-    use super::NfcQuick;
+    use super::{NfcQuick, Unplaced};
 
     #[test]
     fn the_tables_are_the_librarys_answers_for_every_character_of_the_plane() {
@@ -200,6 +305,123 @@ mod tests {
     }
 
     #[test]
+    fn the_walk_agrees_with_the_library_on_every_character_of_the_plane() {
+        let quick = NfcQuick::read();
+        for code in 0x80..0x1_0000u32 {
+            let Some(ch) = char::from_u32(code) else {
+                continue;
+            };
+            // Alone, the character is placed when it is the check's Yes and
+            // handed back at its start when it is not.
+            let alone = if is_nfc_quick(std::iter::once(ch)) == IsNormalized::Yes {
+                Ok(true)
+            } else {
+                Err(Unplaced { cut: 0, at: 0 })
+            };
+            assert_eq!(
+                quick.check(ch.encode_utf8(&mut [0; 4])),
+                alone,
+                "U+{code:04X}"
+            );
+            // Alone, after a letter, before one, twice over, and twice over
+            // between letters (the first is decoded, the second starts a
+            // run); then inside a run, after a two-byte letter and after a
+            // three-byte one (of two letters behind an ASCII one the first
+            // is decoded and the second starts the run), and in the middle
+            // of a run that mixes the two lengths.
+            for text in [
+                format!("{ch}"),
+                format!("a{ch}"),
+                format!("{ch}a"),
+                format!("{ch}{ch}"),
+                format!("a{ch}{ch}a"),
+                format!("a\u{436}\u{436}{ch}\u{3042}"),
+                format!("a\u{3042}\u{3042}{ch}\u{436}"),
+                format!("\u{436}\u{3042}{ch}\u{436}\u{3042}a"),
+            ] {
+                assert_eq!(quick.is_nfc(&text), library_is_nfc(&text), "{text:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_walk_resumes_after_each_stretch_the_library_settles() {
+        let quick = NfcQuick::read();
+        let plain = "plain ascii, eight bytes and more of it ".repeat(40);
+        for text in [
+            format!("x\u{301}{plain}x\u{301}{plain}x\u{301}"),
+            format!("x\u{301}{plain}e\u{301}{plain}"),
+            format!("e\u{301}{plain}x\u{301}"),
+            format!("{plain}x\u{301}{plain}"),
+            "漢字x\u{301}漢字x\u{301}".to_string(),
+            "\u{1100}\u{1161} abc \u{1100}\u{1161}".to_string(),
+            format!("ก\u{E38}\u{E48}{plain}ก\u{E48}\u{E38}"),
+            format!("{plain}x\u{301}"),
+            // No ASCII at all: ideographs and kana by turns (settled and
+            // unsettled stretches), the one character the tables cannot
+            // place at the end; the library reads that stretch alone.
+            format!("{}か\u{3099}", "漢字かな".repeat(300)),
+            format!("{}\u{301}", "かな漢字".repeat(300)),
+            format!(
+                "{}\u{1100}\u{1161}{}",
+                "漢字".repeat(200),
+                "かな".repeat(200)
+            ),
+        ] {
+            assert_eq!(quick.is_nfc(&text), library_is_nfc(&text), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn the_walk_agrees_with_the_library_on_random_mixes_of_marks_and_starters() {
+        const PIECES: [&str; 26] = [
+            "a",
+            " ",
+            "x",
+            "e",
+            "\u{E9}",
+            "\u{301}",
+            "\u{300}",
+            "\u{323}",
+            "\u{338}",
+            "\u{344}",
+            "\u{E38}",
+            "\u{E48}",
+            "\u{E01}",
+            "\u{1100}",
+            "\u{1161}",
+            "\u{11A8}",
+            "\u{AC00}",
+            "\u{F73}",
+            "\u{41F}",
+            "\u{6F22}",
+            "\u{5B57}",
+            "\u{4E2D}",
+            "\u{1F642}",
+            "\u{3B1}",
+            "plain ascii, eight bytes and more of it ",
+            "\u{6F22}\u{5B57}\u{6F22}",
+        ];
+        let quick = NfcQuick::read();
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut text = String::new();
+        for _ in 0..20_000 {
+            text.clear();
+            let pieces = 1 + (next() % 24) as usize;
+            for _ in 0..pieces {
+                text.push_str(PIECES[(next() % PIECES.len() as u64) as usize]);
+            }
+            assert_eq!(quick.is_nfc(&text), library_is_nfc(&text), "{text:?}");
+        }
+    }
+
+    #[test]
     fn the_check_answers_what_the_library_answers_and_tells_when_it_cannot() {
         let quick = NfcQuick::read();
         for (text, expected) in [
@@ -213,16 +435,40 @@ mod tests {
             ("🙂 and 🇫🇷", Ok(true)),
             // A mark after a letter: the library's Maybe, read from the last
             // ASCII character before it.
-            ("x\u{301}", Err(0)),
-            ("e\u{301}", Err(0)),
-            ("abc d\u{301}", Err(4)),
-            ("漢字 e\u{301}", Err(7)),
-            ("\u{1100}\u{1161}", Err(0)),
-            ("中文\u{1100}\u{1161}", Err(0)),
-            ("a\u{301}\u{323}", Err(0)),
+            ("x\u{301}", Err(Unplaced { cut: 0, at: 1 })),
+            ("e\u{301}", Err(Unplaced { cut: 0, at: 1 })),
+            ("abc d\u{301}", Err(Unplaced { cut: 4, at: 5 })),
+            ("漢字 e\u{301}", Err(Unplaced { cut: 7, at: 8 })),
+            ("\u{1100}\u{1161}", Err(Unplaced { cut: 0, at: 3 })),
+            ("中文\u{1100}\u{1161}", Err(Unplaced { cut: 0, at: 9 })),
+            ("a\u{301}\u{323}", Err(Unplaced { cut: 0, at: 1 })),
+            // A mark, an ideograph placed by its bit, a mark of a lower
+            // class: the ideograph starts the order anew.
+            ("ก\u{E48}漢\u{E38}", Ok(true)),
+            // A word of Arabic letters, two bytes each, is a run the walk
+            // places a bit a letter: the run ends at a blank, at marks in
+            // canonical order, at marks out of it (the library's No) and
+            // at a mark the library calls Maybe.
+            (
+                "\u{633}\u{644}\u{627}\u{645} \u{639}\u{644}\u{64A}\u{643}\u{645}",
+                Ok(true),
+            ),
+            ("\u{633}\u{644}\u{64E}\u{650}\u{627}\u{645}", Ok(true)),
+            ("\u{633}\u{644}\u{650}\u{64E}\u{627}\u{645}", Ok(false)),
+            ("\u{644}\u{627}\u{653}", Err(Unplaced { cut: 0, at: 4 })),
             // Marks out of canonical order: the library's No.
             ("ก\u{E48}\u{E38}", Ok(false)),
             ("1234567ก\u{E48}\u{E38}", Ok(false)),
+            ("漢字ก\u{E48}\u{E38}", Ok(false)),
+            // Single characters between ASCII ones, each decoded: an
+            // accented letter, a dash.
+            ("caf\u{E9} \u{2014} na\u{EF}ve", Ok(true)),
+            // A run that mixes two-byte and three-byte letters is one run;
+            // marks out of order after it are the library's No, and a mark
+            // after an ASCII letter behind it is reported from that letter.
+            ("\u{436}\u{3042}\u{436}\u{3042}", Ok(true)),
+            ("\u{436}\u{3042}\u{E48}\u{E38}", Ok(false)),
+            ("a\u{436}\u{3042}x\u{301}", Err(Unplaced { cut: 6, at: 7 })),
         ] {
             assert_eq!(quick.check(text), expected, "{text:?}");
             assert_eq!(quick.is_nfc(text), library_is_nfc(text), "{text:?}");

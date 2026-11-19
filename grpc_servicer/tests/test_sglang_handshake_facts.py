@@ -36,6 +36,9 @@ def request_structs(monkeypatch):
     """The engine's request structs the ready response reads its field order
     off, as small as the shape allows: tagged, positional, base class first."""
 
+    # Keep preloaded modern engine types out of this legacy-layout fixture.
+    monkeypatch.setitem(sys.modules, "sglang.srt.managers.req_types", None)
+
     class BaseReq(msgspec.Struct, tag=True, kw_only=True, array_like=True):
         rid: str | None = None
         http_worker_ipc: str | None = None
@@ -77,6 +80,7 @@ def request_structs(monkeypatch):
         "sglang.srt.managers.schedule_batch",
         MultimodalProcessorOutput=MultimodalProcessorOutput,
         MultimodalDataItem=MultimodalDataItem,
+        Modality=object,
     )
     _install(monkeypatch, "sglang.srt.sampling.sampling_params", SamplingParams=SamplingParams)
     _install(
@@ -84,6 +88,7 @@ def request_structs(monkeypatch):
         "sglang.srt.managers.schedule_batch",
         MultimodalProcessorOutput=MultimodalProcessorOutput,
         MultimodalDataItem=MultimodalDataItem,
+        Modality=object,
     )
 
 
@@ -193,3 +198,13 @@ def test_each_scheduler_reports_its_own_rank_on_either_release():
     unresolved = _scheduler(dp_size=8, enable_dp_attention=True)
     unresolved.ps = SimpleNamespace(dp_rank=5, attn_dp_rank=5)
     assert wire.scheduler_dp_rank(unresolved) == 5
+
+
+@pytest.mark.parametrize("dtype", ["float32", "float16", "bfloat16"])
+def test_handshake_publishes_resolved_encoder_dtype(dtype):
+    """A direct gateway receives the same effective dtype as the gRPC servicer."""
+    scheduler = _scheduler()
+    scheduler.model_config.dtype = "torch." + dtype
+    ready = wire.ready_response_for_scheduler(scheduler)
+    decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(ready))
+    assert decoded["multimodal_encoder_dtype"] == dtype

@@ -2,7 +2,7 @@
 """The multimodal baseline of record, from one command.
 
 Runs SMG's media pipeline (the ``mm_baseline`` example of the multimodal crate: decode,
-the gateway's frame clone, the processor's one-pass wire write, the move of the wire
+the processor's one-pass wire write over the borrowed frames, the move of the wire
 bytes) and the serving engine's own media path (``reference.py``: the engine's loader
 rules and the pinned ``transformers`` processors) over the same files, class by class,
 one item at a time and under load, and writes one table naming the box's architecture,
@@ -365,7 +365,7 @@ def write_table(run: Path, manifest: dict, threads: int, arms: set[str], started
         f"medians over the iterations.\n"
     )
     lines.append(
-        "| class | items | SMG single ms (decode / clone / preprocess / serialize) | SMG single, pool=1 ms "
+        "| class | items | SMG single ms (decode / preprocess / serialize) | SMG single, pool=1 ms "
         "| SMG CPU ms/item | SMG load req/s | SMG load CPU ms/item "
         "| reference single ms (decode / preprocess) | reference CPU ms/item | reference load req/s "
         "| SMG / reference | parity |"
@@ -392,7 +392,7 @@ def write_table(run: Path, manifest: dict, threads: int, arms: set[str], started
 
         lines.append(
             f"| {name} | {cls.get('files') and len(cls['files'])} "
-            f"| {stages(c1, ['decode', 'clone', 'preprocess', 'serialize'])} "
+            f"| {stages(c1, ['decode', 'preprocess', 'serialize'])} "
             f"| {fmt_ms(cp1)} "
             f"| {fmt_num(c1 and c1.get('cpu_ms_per_item'), 2) if c1 and 'error' not in c1 else '-'} "
             f"| {fmt_num(cn and cn.get('requests_per_s'), 1) if cn and 'error' not in cn else '-'} "

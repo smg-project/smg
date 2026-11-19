@@ -121,6 +121,16 @@ impl RateLimitCell {
         }
     }
 
+    /// [`Self::take_for_streaming_handoff`] on the request's cell, if it has
+    /// one (only a unit test's context has none). A handle comes back only
+    /// when tenant rate limiting admitted the request: the gRPC streaming
+    /// processor settles it with real usage on success, and the safety net
+    /// it hands the response body (`ReservationAttachment`'s `Drop`)
+    /// abandons it on an early disconnect or error.
+    pub(crate) fn stream_reservation(cell: Option<&Self>) -> Option<Arc<SharedReservationHandle>> {
+        cell.and_then(Self::take_for_streaming_handoff)
+    }
+
     /// Settle a buffered success's reservation with the engine's counts, if
     /// this logical request reserved one. No-op if nothing was reserved
     /// (feature disabled) or the request was never admitted (preparation

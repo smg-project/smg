@@ -25,7 +25,7 @@ pub(crate) use response_processing::TranscriptionResponseProcessingStage;
 use serde_json::json;
 
 use crate::{
-    routers::{error, grpc::spec::TranscriptionResponseFormat},
+    routers::{common::json_response, error, grpc::spec::TranscriptionResponseFormat},
     worker::WorkerRegistry,
 };
 
@@ -92,7 +92,7 @@ pub(crate) fn parse_response_format(
 /// Render the final transcript in the chosen wire format.
 pub(crate) fn render(format: TranscriptionResponseFormat, text: String) -> Response {
     match format {
-        TranscriptionResponseFormat::Json => axum::Json(json!({ "text": text })).into_response(),
+        TranscriptionResponseFormat::Json => json_response(&json!({ "text": text })),
         TranscriptionResponseFormat::Text => {
             ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], text).into_response()
         }

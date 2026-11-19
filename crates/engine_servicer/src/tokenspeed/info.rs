@@ -3,10 +3,7 @@
 //! Metadata comes from the launcher's config (what the Python servicer reads
 //! off TokenSpeed's `ModelConfig` and `ServerArgs`) and from the handshake.
 
-use std::{
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{sync::Arc, time::Duration};
 
 use engine_zmq_adapter::ZmqEngineClient;
 use futures::StreamExt;
@@ -18,7 +15,7 @@ use tonic::Status;
 use super::{generate, State};
 use crate::{
     health_probe::{self, Verdict},
-    load_report::{mean, rank_entries, rank_entry, RankFigures},
+    load_report::{mean, rank_entries, rank_entry, Capacity, RankFigures},
     proto_json::{insert_capacity, struct_from_json},
     servicer::{proto_token_ids, RequestOrigin},
 };
@@ -84,7 +81,7 @@ pub(super) async fn health_check_with(
 /// does.
 async fn probe(state: &Arc<State>) -> Result<(), Status> {
     let request = ts::GenerateRequest {
-        request_id: format!("HEALTH_CHECK_{}", probe_nanos()),
+        request_id: health_probe::probe_request_id(),
         tokenized: Some(ts::TokenizedInput {
             input_ids: vec![0],
             original_text: String::new(),
@@ -105,14 +102,6 @@ async fn probe(state: &Arc<State>) -> Result<(), Status> {
             "the probe's stream ended without an output",
         )),
     }
-}
-
-/// The probe id's suffix: nanoseconds since the epoch (the Python servicer
-/// stamps its clock the same way).
-fn probe_nanos() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |since| since.as_nanos())
 }
 
 /// `GetModelInfo`: the launcher's config, with the handshake's context length
@@ -203,10 +192,9 @@ pub(super) fn server_info(state: &State) -> ts::GetServerInfoResponse {
 
 /// `GetLoads`: the per-rank load piggybacked on engine output, in the gRPC
 /// response shape the Python servicer derives from the scheduler's load
-/// replies (pages in use become tokens, running is total minus waiting), with
-/// the servicer's own bookkeeping ([`crate::load_tracker`]) for the queued
-/// token-work, the prefill and generation throughput and the hit rate this
-/// wire's load tail does not carry, each rank's own.
+/// replies, including resident and pending uncached tokens when reported.
+/// The servicer estimates queued work only when the engine omits it, and
+/// supplies the throughput and hit rate from its own bookkeeping.
 pub(super) fn loads(state: &State, dp_rank: Option<i32>) -> Result<ts::GetLoadsResponse, Status> {
     let client = state.shared.engine()?;
     if state.encode_role.is_some() {
@@ -224,14 +212,14 @@ pub(super) fn loads(state: &State, dp_rank: Option<i32>) -> Result<ts::GetLoadsR
             aggregate: Some(ts::AggregateMetrics::default()),
         });
     }
-    let capacity = Capacity::of(state);
+    let capacity = Capacity::of(&state.shared, state.model.max_running_requests);
     let ranks = state.shared.rank_count(state.model.data_parallel_size);
     let (loads, aggregate) = rank_entries(
         client.get_loads().loads,
         capacity.max_total_num_tokens,
         ranks,
         dp_rank,
-        |load, figures| reported_entry(state, load, figures, &capacity),
+        |load, figures| reported_entry(state, load, figures, &capacity, client),
         |dp_rank| unreported_entry(state, dp_rank, &capacity),
     );
     let aggregate = ts::AggregateMetrics {
@@ -262,44 +250,25 @@ pub(super) fn rank_load(state: &State, dp_rank: Option<i32>) -> Option<ts::Sched
     if state.encode_role.is_some() {
         return None;
     }
-    let capacity = Capacity::of(state);
+    let capacity = Capacity::of(&state.shared, state.model.max_running_requests);
     rank_entry(
         |index| client.rank_load(index),
         capacity.max_total_num_tokens,
         state.shared.rank_count(state.model.data_parallel_size),
         dp_rank,
-        |load, figures| reported_entry(state, load, figures, &capacity),
+        |load, figures| reported_entry(state, load, figures, &capacity, client),
         |rank| unreported_entry(state, rank, &capacity),
     )
 }
 
-/// The capacity figures every rank's entry carries: the running window and
-/// the KV capacity the servicer knows.
-struct Capacity {
-    max_running_requests: i32,
-    max_total_num_tokens: i32,
-}
-
-impl Capacity {
-    fn of(state: &State) -> Self {
-        Self {
-            max_running_requests: state
-                .shared
-                .running_window(state.model.max_running_requests),
-            max_total_num_tokens: state.shared.kv_capacity_tokens(),
-        }
-    }
-}
-
-/// A reported rank's entry: the snapshot's figures with, from this
-/// servicer's own bookkeeping ([`crate::load_tracker`]), the queued
-/// token-work, prefill/generation throughput and hit rate this wire's load
-/// tail does not carry, the rank's own.
+/// Engine-reported queued work takes precedence over the servicer's
+/// estimate, including a reported zero.
 fn reported_entry(
     state: &State,
     load: &SchedulerLoadSnapshot,
     figures: &RankFigures,
     capacity: &Capacity,
+    client: &ZmqEngineClient,
 ) -> ts::SchedulerLoad {
     let estimate = state
         .shared
@@ -318,7 +287,14 @@ fn reported_entry(
         // The direct TokenSpeed wire reports active pages, excluding
         // retained cache (unlike the Python legacy GetLoad projection).
         active_token_usage: Some(figures.usage),
-        num_waiting_uncached_tokens: estimate.queued_token_work,
+        num_resident_tokens: load.num_resident_tokens,
+        // The shared snapshot maps absence to zero; read the wire's presence here.
+        num_waiting_uncached_tokens: client
+            .engine_load(load.dp_rank as u32)
+            .and_then(|load| load.num_waiting_uncached_tokens)
+            .map_or(estimate.queued_token_work, |tokens| {
+                i32::try_from(tokens).unwrap_or(i32::MAX)
+            }),
         gen_throughput: estimate.gen_throughput,
         prefill_throughput: estimate.prefill_throughput,
         cache_hit_rate: estimate.cache_hit_rate,

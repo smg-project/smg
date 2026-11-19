@@ -6,11 +6,13 @@
 //! is this binary's, installed once for all its tests (see `recorder()` in
 //! the group's `mod.rs`).
 
-use smg::observability::{metrics::Metrics, metrics_server::start_metrics_server};
+use smg::{observability::metrics_server::start_metrics_server, worker::metrics::Metrics};
+
+use crate::metrics::recorder;
 
 #[tokio::test]
 async fn kv_event_lag_renders_histogram_buckets() {
-    let handle = crate::metrics::recorder();
+    let handle = recorder();
     let (addr, _server) = start_metrics_server(handle, "127.0.0.1".to_string(), 0)
         .await
         .expect("metrics server binds an ephemeral port");

@@ -60,8 +60,8 @@ use openai_protocol::worker::{HealthCheckConfig, WorkerLoadResponse};
 use smg::{
     policies::{cost, CacheAwareConfig, CacheAwarePolicy, LoadBalancingPolicy, SelectWorkerInfo},
     worker::{
-        kv_event_monitor::bench_support::IndexFeed,
-        load_state::{one_rank_load, TestFeed},
+        kv::event_monitor::bench_support::IndexFeed,
+        load::state::{one_rank_load, TestFeed},
         BasicWorkerBuilder, KvEventMonitor, KvIndex, Worker, WorkerType,
     },
 };
@@ -71,7 +71,7 @@ use smg_grpc_client::common_proto::{
 
 /// The exactness tests' stream generator, by path: the mock engine's streams
 /// through the relay's decoder and normalizer.
-#[path = "../src/worker/kv_index_backend/mock_streams.rs"]
+#[path = "../src/worker/kv/index_backend/mock_streams.rs"]
 #[expect(
     dead_code,
     reason = "the bench takes the payloads; the exactness tests the checkpoints and prompts too"
@@ -367,7 +367,7 @@ struct Setup {
 /// pressure, a live rate on three of four) and up to three requests in flight
 /// on each, as `policy_selection`'s fed pool has them.
 fn feed_loads(policy: &CacheAwarePolicy, workers: &[Arc<dyn Worker>], rng: &mut Rng) -> TestFeed {
-    let feed = TestFeed::attached_to(policy);
+    let feed = TestFeed::attached_to(|rx| policy.set_load_receiver(rx));
     let reports: HashMap<String, WorkerLoadResponse> = workers
         .iter()
         .map(|worker| {

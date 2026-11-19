@@ -24,10 +24,7 @@ use std::{
     future::Future,
     marker::PhantomData,
     pin::Pin,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
+    sync::atomic::{AtomicBool, Ordering},
     task::{Context, Poll},
     time::Duration,
 };
@@ -38,10 +35,12 @@ use tracing::{debug, warn};
 
 use crate::request_deadline::RequestDeadline;
 
-/// Upper bound on how long a deferred abort waits for the stream's first
-/// item before aborting anyway. Bounds the detached drain task when the
-/// backend never produces output (e.g. its upstream handoff peer died).
-const DEFERRED_ABORT_MAX_WAIT: Duration = Duration::from_secs(30);
+/// The longest a deferred abort waits for the stream's first item before
+/// aborting anyway; bounds the detached drain task when the backend never
+/// produces output (e.g. its upstream handoff peer died). A bound a caller
+/// gives the deferral ([`AbortOnDropStream::defer_abort_within`]) shortens
+/// the wait, never lengthens it.
+pub const DEFERRED_ABORT_MAX_WAIT: Duration = Duration::from_secs(30);
 
 /// Upper bound on how long a dropped stream is read for the worker's own end
 /// of it, after the abort RPC, before it is released by a reset. A worker
@@ -68,28 +67,43 @@ pub trait AbortOnDropClient: Clone + Send + Sync + 'static {
 ///
 /// `T` is the engine-specific stream item (typically `proto::GenerateResponse`).
 /// `C` is the engine client implementing [`AbortOnDropClient`].
+///
+/// The wrapper is one pointer wide. Its state is one allocation, so a layer
+/// that hands the stream on (a result, an enum over engines, a request's
+/// context) moves that pointer, not the transport stream and the client
+/// behind it.
 pub struct AbortOnDropStream<T: Send + 'static, C: AbortOnDropClient> {
+    state: Box<StreamState<T, C>>,
+}
+
+/// What an [`AbortOnDropStream`] holds behind its pointer.
+struct StreamState<T: Send + 'static, C: AbortOnDropClient> {
     /// `Some` while the wrapper owns the stream; `Drop` may `take()` it into
     /// a detached drain task when the abort is deferred.
     inner: Option<Streaming<T>>,
     request_id: String,
     client: C,
-    aborted: Arc<AtomicBool>,
+    /// Set by `mark_completed`, or by the release that claims the abort.
+    aborted: AtomicBool,
     /// When set, a drop that happens before the stream yielded its first
     /// item drains the stream in the background until that first item (or a
-    /// terminal event / [`DEFERRED_ABORT_MAX_WAIT`]) before sending the
+    /// terminal event / `deferred_abort_bound`) before sending the
     /// abort. For workers whose request must not be torn down mid-handoff —
     /// e.g. a disaggregated decode side receiving KV state from its prefill
     /// peer — an early abort can kill the transfer while the peer is still
     /// writing; the first generated item is the proof the handoff completed.
     defer_abort_until_first_item: bool,
+    /// How long a deferred abort waits for that first item:
+    /// [`DEFERRED_ABORT_MAX_WAIT`], or the shorter bound the caller holds for
+    /// the item (see [`AbortOnDropStream::defer_abort_within`]).
+    deferred_abort_bound: Duration,
     /// Whether `poll_next` has yielded at least one item (data or error).
     saw_item: bool,
     /// How long a drop waits for the worker to end the stream after the
     /// abort before releasing it with a reset (see `Drop`).
     release_drain_bound: Duration,
     /// The request's deadline and its timer, when the stream is bounded by
-    /// one (see [`Self::with_deadline`]).
+    /// one (see [`AbortOnDropStream::with_deadline`]).
     deadline: Option<(RequestDeadline, Pin<Box<Sleep>>)>,
     _marker: PhantomData<fn() -> T>,
 }
@@ -99,15 +113,18 @@ impl<T: Send + 'static, C: AbortOnDropClient> AbortOnDropStream<T, C> {
     pub fn new(stream: Streaming<T>, request_id: String, client: C) -> Self {
         debug!("Created AbortOnDropStream for request {}", request_id);
         Self {
-            inner: Some(stream),
-            request_id,
-            client,
-            aborted: Arc::new(AtomicBool::new(false)),
-            defer_abort_until_first_item: false,
-            saw_item: false,
-            release_drain_bound: RELEASE_DRAIN_MAX_WAIT,
-            deadline: None,
-            _marker: PhantomData,
+            state: Box::new(StreamState {
+                inner: Some(stream),
+                request_id,
+                client,
+                aborted: AtomicBool::new(false),
+                defer_abort_until_first_item: false,
+                deferred_abort_bound: DEFERRED_ABORT_MAX_WAIT,
+                saw_item: false,
+                release_drain_bound: RELEASE_DRAIN_MAX_WAIT,
+                deadline: None,
+                _marker: PhantomData,
+            }),
         }
     }
 
@@ -127,14 +144,14 @@ impl<T: Send + 'static, C: AbortOnDropClient> AbortOnDropStream<T, C> {
     /// transport stream apply a deadline through their boxes without
     /// rebuilding them; see `ProtoStream::apply_deadline` in the gateway).
     pub fn set_deadline(&mut self, deadline: RequestDeadline) {
-        self.deadline = Some((deadline, Box::pin(tokio::time::sleep_until(deadline.at()))));
+        self.state.deadline = Some((deadline, Box::pin(tokio::time::sleep_until(deadline.at()))));
     }
 
     /// Bound the wait for the worker's own end of a dropped stream (default
     /// `RELEASE_DRAIN_MAX_WAIT`, 30 s) before it is released with a reset.
     #[must_use]
     pub fn with_release_drain_bound(mut self, bound: Duration) -> Self {
-        self.release_drain_bound = bound;
+        self.state.release_drain_bound = bound;
         self
     }
 
@@ -145,7 +162,24 @@ impl<T: Send + 'static, C: AbortOnDropClient> AbortOnDropStream<T, C> {
     /// abort entirely in either mode.
     #[must_use]
     pub fn defer_abort_until_first_item(mut self) -> Self {
-        self.defer_abort_until_first_item = true;
+        self.state.defer_abort_until_first_item = true;
+        self
+    }
+
+    /// [`Self::defer_abort_until_first_item`] with the wait for the first
+    /// item bounded by `bound` where that is shorter than
+    /// [`DEFERRED_ABORT_MAX_WAIT`]. The caller trades protection for
+    /// release: a stream whose first item is its whole answer (a
+    /// non-streaming generation) would otherwise hold its worker for the
+    /// answer's length after a drop, the cap at most, so the caller gives
+    /// the deferral its own estimate of the handoff's length (a
+    /// disaggregated pair's decode bound) and accepts the shorter window.
+    /// Nothing gives such a stream up at that bound; a stream with a first
+    /// token to wait for keeps the cap.
+    #[must_use]
+    pub fn defer_abort_within(mut self, bound: Duration) -> Self {
+        self.state.defer_abort_until_first_item = true;
+        self.state.deferred_abort_bound = bound.min(DEFERRED_ABORT_MAX_WAIT);
         self
     }
 
@@ -155,18 +189,18 @@ impl<T: Send + 'static, C: AbortOnDropClient> AbortOnDropStream<T, C> {
     pub fn mark_completed(&self) {
         // Release pairs with AcqRel in `Drop::drop` so the cleanup task
         // observes this write.
-        self.aborted.store(true, Ordering::Release);
-        debug!("Request {} marked as completed", self.request_id);
+        self.state.aborted.store(true, Ordering::Release);
+        debug!("Request {} marked as completed", self.state.request_id);
     }
 }
 
 impl<T: Send + 'static, C: AbortOnDropClient> Drop for AbortOnDropStream<T, C> {
     fn drop(&mut self) {
-        self.release();
+        self.state.release();
     }
 }
 
-impl<T: Send + 'static, C: AbortOnDropClient> AbortOnDropStream<T, C> {
+impl<T: Send + 'static, C: AbortOnDropClient> StreamState<T, C> {
     /// Let go of the stream before its end: the abort goes to the worker
     /// (deferred past the first item when so configured) and the stream is
     /// read up to the worker's own end of it, both detached. What a drop
@@ -187,6 +221,7 @@ impl<T: Send + 'static, C: AbortOnDropClient> AbortOnDropStream<T, C> {
         let request_id = self.request_id.clone();
         let client = self.client.clone();
         let defer = self.defer_abort_until_first_item && !self.saw_item;
+        let defer_bound = self.deferred_abort_bound;
         let release_bound = self.release_drain_bound;
         // The stream goes to the cleanup task whole: it is released there by
         // the worker's own end of it (see below), not by the reset that
@@ -210,7 +245,7 @@ impl<T: Send + 'static, C: AbortOnDropClient> AbortOnDropStream<T, C> {
                         "Stream dropped before first item for request {}, draining before abort",
                         request_id
                     );
-                    let first_item = tokio::time::timeout(DEFERRED_ABORT_MAX_WAIT, async {
+                    let first_item = tokio::time::timeout(defer_bound, async {
                         // `Streaming::message` resolves on the next message,
                         // stream end, or transport error — any of which ends the
                         // protected window.
@@ -218,10 +253,19 @@ impl<T: Send + 'static, C: AbortOnDropClient> AbortOnDropStream<T, C> {
                     })
                     .await;
                     if first_item.is_err() {
-                        warn!(
-                            "Deferred abort for request {} timed out waiting for the first item",
-                            request_id
-                        );
+                        if defer_bound < DEFERRED_ABORT_MAX_WAIT {
+                            // The caller's bound: the expected end of the
+                            // wait for an answer that outlives its client.
+                            debug!(
+                                "Deferred abort for request {} reached its bound ({:?}) before the first item",
+                                request_id, defer_bound
+                            );
+                        } else {
+                            warn!(
+                                "Deferred abort for request {} timed out waiting for the first item",
+                                request_id
+                            );
+                        }
                     }
                 }
             }
@@ -293,17 +337,14 @@ async fn abort_within<C: AbortOnDropClient>(deadline: Duration, client: C, reque
     }
 }
 
-// `Streaming<T>` is `Unpin` regardless of `T`, and we never project a
-// pinned reference to any field. Marking the wrapper `Unpin` lets us
-// use `Pin<&mut Self>::deref_mut` to reach `inner` without needing
-// `pin-project` machinery.
-impl<T: Send + 'static, C: AbortOnDropClient> Unpin for AbortOnDropStream<T, C> {}
-
 impl<T: Send + 'static, C: AbortOnDropClient> futures::Stream for AbortOnDropStream<T, C> {
     type Item = Result<T, tonic::Status>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = &mut *self;
+        // The wrapper is a `Box`, so it is `Unpin` whatever it holds, and
+        // `Streaming<T>` is `Unpin` regardless of `T`: the state is reached
+        // through the pin without `pin-project` machinery.
+        let this = &mut *self.state;
         // The stream went with the deadline's cut (or, unreachably for an
         // owned value, with Drop): end-of-stream rather than a panic keeps
         // the impl total.
@@ -368,6 +409,14 @@ mod tests {
         // `Send + Sync` regardless of `T`.
         fn assert_send_sync<X: Send + Sync>() {}
         assert_send_sync::<AbortOnDropStream<(), DummyClient>>();
+
+        // Handing a stream on moves one pointer: its state lives in one
+        // allocation. A field added to the wrapper itself would bring the
+        // inline moves back in every layer that passes a stream on.
+        assert_eq!(
+            size_of::<AbortOnDropStream<(), DummyClient>>(),
+            size_of::<usize>()
+        );
     }
 
     /// A backend whose abort handler is wedged (answers the transport but never

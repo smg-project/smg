@@ -45,15 +45,31 @@ The runner container of every scale set carries no API key, and none may be adde
 every workflow runs in that container, so a key in its environment is readable by any pull request
 that reaches a runner. The keys the automated reviews and the scheduled Claude workflows use stay in
 the Kubernetes secrets (`openai-api-key`, `anthropic-api-key`) and are mounted only into the
-`ai-key-proxy` sidecar of `runner-values-cpu.yaml`: an nginx container that listens on
+`ai-key-proxy` sidecar of `runner-values-cpu.yaml` and `runner-values-review.yaml`: an nginx container that listens on
 `127.0.0.1:8787`, pod-local, and puts the real key on each request it forwards to
-`api.anthropic.com` or `api.openai.com`. The workflows point Claude (`ANTHROPIC_BASE_URL`) and the
+`api.anthropic.com`, `api.openai.com`, or `api.x.ai`. The workflows point Claude (`ANTHROPIC_BASE_URL`) and the
 Codex action (`responses-api-endpoint`) at it with placeholder keys. A separate container's
 environment and memory are unreadable from the runner container, so nothing a job runs can print a
 key; what a job can do is spend through the proxy, which the keys' spend caps bound. Rotating a key is
 `kubectl create secret ... --dry-run=client -o yaml | kubectl apply -f -` on the secret and a roll of the
 runner pods. A live set whose runner container carries a key, or runs privileged (only the `dind`
 sidecar may), has drifted from these values; `helm upgrade` from the files here removes both.
+
+Vendor E2E uses the same pod-local proxy with public placeholder keys. Its gateway worker roots are
+`http://127.0.0.1:8787/openai`, `/anthropic`, or `/xai` without a trailing slash or `/v1`;
+an OpenAI SDK that calls the provider directly uses `/openai/v1` (or `/xai/v1`). The OpenAI
+location forwards WebSocket Upgrade/Connection for Realtime as well as HTTP and SSE. These URLs
+apply only inside a CPU runner pod with this sidecar; bare-metal/GPU Docker jobs do not acquire
+access to this loopback endpoint by setting an environment variable.
+
+The proposed xAI route reads only `XAI_API_KEY` from the optional sidecar Secret reference
+`xai-api-key`. This does not assert that the Secret exists in a cluster. If it is unavailable, the
+proxy still starts for the existing providers and `/xai/` returns 503 without contacting xAI;
+the required xAI tests remain failing. An authorized deployment must confirm or bind the approved
+credential in `actions-runner-system`, apply the reviewed CPU values, roll affected runner pods in
+an approved window, and verify HTTP/SSE and a Realtime WebSocket handshake through the deployed
+sidecar. Source changes or `/healthz` alone do not prove that rollout, credential availability,
+provider quality, or successful paid tests. No raw key belongs in workflow/job environment values.
 
 The same sidecar holds the private key of the **SMG Codex Review** GitHub App (secret
 `codex-github-app` with `app-id`, `installation-id` and `private-key`, the key in PKCS#8 form:
@@ -184,6 +200,27 @@ helm upgrade --install 4-gpu-h100 \
   -f scripts/k8s-runner-resources/runner-values-gpu-base.yaml \
   -f scripts/k8s-runner-resources/runner-values-4-gpu-h100.yaml \
   oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set
+```
+
+`k8s-runner-review` runs the automated code reviews, apart from the test jobs: on the shared CPU
+set a review job waited 52 minutes for a runner and then worked for three, and the next push
+cancelled the reviews that never got one (2026-11-12). The review workflows select the set through
+the repository variable `SMG_RUNNER_REVIEW` and fall back to `k8s-runner-cpu` while it is unset, so
+install the set first and set the variable second; deleting the variable sends the reviews back.
+Its pods request 2 CPU and 4 GiB, carry no docker and so no privileged container, and four stay
+warm so a review's status note appears within seconds. They run the key proxy of the CPU set
+without the xAI key; change the proxy in both values files together, which
+`scripts/tests/test_runner_values_policy.py` enforces.
+
+```bash
+helm upgrade --install k8s-runner-review \
+  --namespace actions-runner-system \
+  --create-namespace \
+  --version 0.14.2 \
+  -f scripts/k8s-runner-resources/runner-values-review.yaml \
+  oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set
+
+gh variable set SMG_RUNNER_REVIEW --repo smg-project/smg --body k8s-runner-review
 ```
 
 `bellwether-record` runs bellwether's `record` workflow, one job per checkpoint group. It is registered to the

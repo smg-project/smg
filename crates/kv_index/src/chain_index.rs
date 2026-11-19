@@ -95,9 +95,12 @@ use dashmap::{mapref::entry::Entry, DashMap};
 use parking_lot::{Mutex, MutexGuard};
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
-use crate::block::{
-    chain_prefix_hash, ApplyError, ContentHash, OverlapScores, SequenceHash, StoredBlock,
-    WorkerIdExhausted,
+use crate::{
+    block::{
+        chain_prefix_hash, ApplyError, ContentHash, OverlapScores, SequenceHash, StoredBlock,
+        WorkerIdExhausted,
+    },
+    prefetch::prefetch_read,
 };
 
 mod arena;
@@ -942,7 +945,7 @@ impl ChainIndex {
         !coverage_is_empty(self.slab.coverage(run_id))
             || self
                 .arena
-                .partials_live(self.slab.run(run_id).partials.load(Ordering::Relaxed))
+                .table_live(self.slab.run(run_id).partials.load(Ordering::Relaxed))
                 > 0
     }
 
@@ -1053,7 +1056,7 @@ impl ChainIndex {
     fn cap_prefix_holders(&self, run_id: u32, meta: &mut RunMeta) {
         let run = self.slab.run(run_id);
         let table = run.partials.load(Ordering::Relaxed);
-        if table == NONE || self.arena.partials_live(table) <= PARTIAL_CAP {
+        if table == NONE || self.arena.table_live(table) <= PARTIAL_CAP {
             return;
         }
         let mut cutoffs: Vec<u32> = self
@@ -1635,7 +1638,7 @@ impl ChainIndex {
             Some((child, generation)) => {
                 // The child's header is the next line the walk reads: ask for it while the
                 // version is confirmed.
-                crate::prefetch::prefetch_read(std::ptr::from_ref(self.slab.run(child)));
+                prefetch_read(std::ptr::from_ref(self.slab.run(child)));
                 Plan::Descend(child, generation)
             }
             None if window.children != NONE => Plan::InsertAt(offset),
@@ -1833,13 +1836,17 @@ impl ChainIndex {
                 )
                 .is_ok();
         if claimed {
+            // Release stores: this thread did not take the array, and a reader may still hold it
+            // from the life before. One that reads a word stored here and then passes its
+            // acquire fence reads, in its check of its run's version, the step that ended that
+            // life.
             let slots = self.arena.words(block + end as u32, contents.len());
             for (slot, &hash) in slots.iter().zip(contents) {
-                slot.store(hash, Ordering::Relaxed);
+                slot.store(hash, Ordering::Release);
             }
             let slots = self.arena.words(engine + end as u32, engines.len());
             for (slot, &hash) in slots.iter().zip(engines) {
-                slot.store(hash, Ordering::Relaxed);
+                slot.store(hash, Ordering::Release);
             }
             run.len
                 .store((len + contents.len()) as u32, Ordering::Release);
@@ -1893,7 +1900,7 @@ impl ChainIndex {
         // so their misses overlap instead of serialising one run after another.
         for removal in &work {
             if removal.run != GONE {
-                crate::prefetch::prefetch_read(std::ptr::from_ref(self.slab.run(removal.run)));
+                prefetch_read(std::ptr::from_ref(self.slab.run(removal.run)));
             }
         }
         let mut freed = Vec::new();

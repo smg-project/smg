@@ -28,8 +28,9 @@ use crate::{
         preprocessor_config::PreProcessorConfig,
         processor::VisionPreProcessor,
         processors::qwen_vl_base::pixel_norm,
+        rgb_runs::RgbSplitter,
         scratch,
-        transforms::{resize_bicubic_torch_aa_rgb, rgb_bytes, TransformError},
+        transforms::{plain_buffer, resize_bicubic_torch_aa_rgb, rgb_bytes, TransformError},
     },
 };
 
@@ -163,21 +164,10 @@ impl PixtralProcessor {
             )
         };
         let pixels = target_h as usize * target_w as usize;
-        let mut planes = vec![0u8; 3 * pixels];
+        let mut planes = plain_buffer(3 * pixels);
         let (r_plane, rest) = planes.split_at_mut(pixels);
         let (g_plane, b_plane) = rest.split_at_mut(pixels);
-        for (((rgb, r), g), b) in resized
-            .as_chunks::<3>()
-            .0
-            .iter()
-            .zip(r_plane.iter_mut())
-            .zip(g_plane.iter_mut())
-            .zip(b_plane.iter_mut())
-        {
-            *r = rgb[0];
-            *g = rgb[1];
-            *b = rgb[2];
-        }
+        RgbSplitter::detect().split(&resized, r_plane, g_plane, b_plane);
         Ok((planes, (target_h as usize, target_w as usize)))
     }
 }
@@ -205,9 +195,7 @@ impl VisionPreProcessor for PixtralProcessor {
         &self,
         images: &[&DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        if images.is_empty() {
-            return Err(TransformError::EmptyBatch);
-        }
+        TransformError::if_empty(images)?;
 
         let mut planes = Vec::with_capacity(images.len());
         let mut original_sizes = Vec::with_capacity(images.len());
@@ -319,7 +307,11 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::*;
-    use crate::{encoder_inputs::EncoderDtype, vision::preprocessor_config::PatchSize};
+    use crate::{
+        encoder_inputs::EncoderDtype,
+        test_support::{hex, lcg_rgb_image},
+        vision::preprocessor_config::PatchSize,
+    };
 
     fn create_test_image(width: u32, height: u32) -> DynamicImage {
         let mut img = RgbImage::new(width, height);
@@ -346,26 +338,6 @@ mod tests {
                 "do_normalize":true,"do_convert_rgb":true}"#,
         )
         .unwrap()
-    }
-
-    /// Interleaved RGB bytes from a linear congruential generator: the same
-    /// pixels the reference run that pinned the digests below was given.
-    fn lcg_image(width: u32, height: u32, seed: u32) -> DynamicImage {
-        let mut state = seed;
-        let bytes = (0..width * height * 3)
-            .map(|_| {
-                state = state.wrapping_mul(1_103_515_245).wrapping_add(12345) & 0x7fff_ffff;
-                ((state >> 16) & 0xff) as u8
-            })
-            .collect();
-        DynamicImage::ImageRgb8(RgbImage::from_raw(width, height, bytes).unwrap())
-    }
-
-    fn sha256_hex(bytes: &[u8]) -> String {
-        Sha256::digest(bytes)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect()
     }
 
     #[test]
@@ -488,7 +460,7 @@ mod tests {
     #[test]
     fn a_same_size_batch_stays_bytes() {
         let processor = PixtralProcessor::new();
-        let images = [create_test_image(200, 150), lcg_image(200, 150, 9)];
+        let images = [create_test_image(200, 150), lcg_rgb_image(200, 150, 9)];
 
         let result = processor
             .preprocess(&images.iter().collect::<Vec<_>>())
@@ -510,6 +482,39 @@ mod tests {
                 planes
             );
         }
+    }
+
+    /// A container may be longer than its image: `ImageBuffer::from_raw` takes
+    /// any that is long enough.
+    #[test]
+    fn a_longer_container_gives_the_planes_of_its_image() {
+        let processor = PixtralProcessor::new();
+        let exact = lcg_rgb_image(64, 48, 5);
+        let mut container = exact.to_rgb8().into_raw();
+        container.extend_from_slice(&[0xAB; 7]);
+        let longer = RgbImage::from_raw(64, 48, container).unwrap();
+        let longer = DynamicImage::ImageRgb8(longer);
+
+        assert_eq!(
+            processor.planes_of(&longer).unwrap(),
+            processor.planes_of(&exact).unwrap()
+        );
+    }
+
+    /// The same through the resize: 65x48 is not a target size.
+    #[test]
+    fn a_longer_container_resizes_as_its_image() {
+        let processor = PixtralProcessor::new();
+        let exact = lcg_rgb_image(65, 48, 5);
+        let mut container = exact.to_rgb8().into_raw();
+        container.extend_from_slice(&[0xAB; 7]);
+        let longer = RgbImage::from_raw(65, 48, container).unwrap();
+        let longer = DynamicImage::ImageRgb8(longer);
+
+        assert_eq!(
+            processor.planes_of(&longer).unwrap(),
+            processor.planes_of(&exact).unwrap()
+        );
     }
 
     /// The reference's rule on a mixed-size batch of solid images, written
@@ -679,16 +684,20 @@ mod tests {
                 "fe2efb3ca17a4f269e87df85834b550e9bfc5f96968b24470617a1215c764c4c",
             ),
         ] {
-            let image = lcg_image(width, height, seed);
+            let image = lcg_rgb_image(width, height, seed);
             let result = processor.preprocess(&[&image]).unwrap();
             assert_eq!(result.encoder_input.shape(), &shape, "{width}x{height}");
             assert_eq!(
-                sha256_hex(&result.encoder_input.write_as(EncoderDtype::Float32)),
+                hex(&Sha256::digest(
+                    result.encoder_input.write_as(EncoderDtype::Float32)
+                )),
                 f32_digest,
                 "{width}x{height} f32"
             );
             assert_eq!(
-                sha256_hex(&result.encoder_input.write_as(EncoderDtype::BFloat16)),
+                hex(&Sha256::digest(
+                    result.encoder_input.write_as(EncoderDtype::BFloat16)
+                )),
                 bf16_digest,
                 "{width}x{height} bf16"
             );

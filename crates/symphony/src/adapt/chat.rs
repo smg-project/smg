@@ -303,6 +303,7 @@ mod tests {
         event::{DropReason, MalformedReason, Text},
         formats::qwen3,
         ids::is_minted,
+        testing::events::{arguments, call, end, finish},
         CallSyntax, Declared, Engine, EngineFinish, Events, Input, Parser,
     };
 
@@ -486,16 +487,9 @@ mod tests {
     #[test]
     fn stop_after_a_tool_call_is_reported_as_tool_calls() {
         let reason = |reason: FinishReason, tool_calls: u32| {
-            delta(
-                0,
-                &Event::Finish {
-                    reason,
-                    tool_calls,
-                    reasoning_tokens: 0,
-                },
-            )
-            .expect("a choice")
-            .finish_reason
+            delta(0, &finish(reason, tool_calls))
+                .expect("a choice")
+                .finish_reason
         };
         assert_eq!(reason(FinishReason::Stop, 0).as_deref(), Some("stop"));
         assert_eq!(reason(FinishReason::Stop, 2).as_deref(), Some("tool_calls"));
@@ -527,49 +521,17 @@ mod tests {
         let silent = [
             Event::ReasoningStart,
             Event::ReasoningEnd,
-            Event::ToolCallEnd {
-                index: 0,
-                source: Text::default(),
-            },
+            end(0),
             Event::Dropped {
                 text: Text::uncounted("<think>"),
                 why: DropReason::Wrapper,
             },
             Event::Content(Text::uncounted("")),
             Event::Reasoning(Text::uncounted("")),
-            Event::ToolCallArguments {
-                index: 0,
-                json: "".into(),
-                source: Text::default(),
-            },
+            arguments(0, ""),
         ];
         for event in &silent {
             assert!(delta(0, event).is_none(), "{event:?}");
-        }
-    }
-
-    fn call(index: u32, name: &str) -> Event<'static> {
-        Event::ToolCallStart {
-            index,
-            id: format!("call_{index}"),
-            name: name.into(),
-            source: Text::default(),
-        }
-    }
-
-    fn arguments(index: u32, json: &str) -> Event<'static> {
-        Event::ToolCallArguments {
-            index,
-            json: json.to_owned().into(),
-            source: Text::default(),
-        }
-    }
-
-    fn finish(reason: FinishReason, tool_calls: u32) -> Event<'static> {
-        Event::Finish {
-            reason,
-            tool_calls,
-            reasoning_tokens: 0,
         }
     }
 
@@ -632,10 +594,7 @@ mod tests {
             call(0, "get_weather"),
             arguments(0, r#"{"city":"#),
             arguments(0, r#""Paris"}"#),
-            Event::ToolCallEnd {
-                index: 0,
-                source: Text::default(),
-            },
+            end(0),
             finish(FinishReason::Stop, 1),
         ];
         assert_eq!(
@@ -754,21 +713,9 @@ mod tests {
             Event::ReasoningStart,
             Event::Reasoning(Text::uncounted("plan")),
             Event::ReasoningEnd,
-            Event::ToolCallStart {
-                index: 0,
-                id: "call_0".into(),
-                name: "get_weather".into(),
-                source: Text::default(),
-            },
-            Event::ToolCallArguments {
-                index: 0,
-                json: r#"{"city":"Paris"}"#.into(),
-                source: Text::default(),
-            },
-            Event::ToolCallEnd {
-                index: 0,
-                source: Text::default(),
-            },
+            call(0, "get_weather"),
+            arguments(0, r#"{"city":"Paris"}"#),
+            end(0),
             Event::Finish {
                 reason: FinishReason::Stop,
                 tool_calls: 1,

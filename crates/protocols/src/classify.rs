@@ -8,16 +8,26 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use validator::Validate;
 
-use super::common::{GenerationRequest, UsageInfo};
+use super::{
+    common::{routing_text_of_input, GenerationRequest, UsageInfo},
+    embedding::validate_input,
+    validated::Normalizable,
+};
 
 // ============================================================================
 // Classify API
 // ============================================================================
 
-/// Classification request - compatible with the serving engine's /v1/classify API
+/// Classification request - compatible with the serving engine's /v1/classify API.
+/// Its one rule is the public API's shape rule on `input` (`validate_input`; the
+/// embeddings route's array of objects is not among its shapes, as no engine
+/// takes one here):
+/// the validated extractor answers a body outside it in the gateway's error
+/// envelope before any worker sees it.
 #[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, Validate, schemars::JsonSchema)]
 pub struct ClassifyRequest {
     /// ID of the model to use
     pub model: String,
@@ -26,6 +36,9 @@ pub struct ClassifyRequest {
     /// - Single string: "text to classify"
     /// - Array of strings: ["text1", "text2"]
     /// - Token IDs: [1, 2, 3] (advanced usage)
+    ///
+    /// Nothing empty: the public API's shape rule, shared with the embeddings route.
+    #[validate(custom(function = "validate_input"))]
     pub input: Value,
 
     /// Optional user identifier
@@ -36,7 +49,13 @@ pub struct ClassifyRequest {
 
     /// Engine extension: request priority
     pub priority: Option<i32>,
+
+    /// Additional fields not explicitly defined above (e.g. engine-specific parameters)
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, Value>,
 }
+
+impl Normalizable for ClassifyRequest {}
 
 impl GenerationRequest for ClassifyRequest {
     fn rid(&self) -> Option<&str> {
@@ -52,15 +71,7 @@ impl GenerationRequest for ClassifyRequest {
     }
 
     fn extract_text_for_routing(&self) -> String {
-        match &self.input {
-            Value::String(s) => s.clone(),
-            Value::Array(arr) => arr
-                .iter()
-                .filter_map(|v| v.as_str())
-                .collect::<Vec<_>>()
-                .join(" "),
-            _ => String::new(),
-        }
+        routing_text_of_input(&self.input)
     }
 }
 

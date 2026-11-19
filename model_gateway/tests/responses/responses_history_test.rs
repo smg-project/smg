@@ -294,6 +294,86 @@ async fn a_conversation_turn_reaches_the_engine_with_the_stored_call_before_its_
     engine.abort();
 }
 
+/// The input items of a response the route stored page by the query: one to
+/// a page with `limit=1` and `has_more` while items follow, the newest first
+/// by default and the request's order under `order=asc`, the page after the
+/// cursor under `after`; the ids are the ones minted when the response was
+/// stored, so a page read twice is the same page.
+#[tokio::test]
+async fn the_input_items_of_a_stored_response_page_by_the_query() {
+    let (app, _requests, engine) = app().await;
+
+    let (status, response) = call(
+        &app,
+        Method::POST,
+        "/v1/responses",
+        json!({
+            "model": MODEL,
+            "input": [
+                {"role": "user", "content": "q0"},
+                {"role": "user", "content": "q1"},
+                {"role": "user", "content": "q2"}
+            ],
+            "max_output_tokens": 2,
+            "store": true
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let response_id = response["id"].as_str().expect("a response id");
+    let items = format!("/v1/responses/{response_id}/input_items");
+    let text_of = |list: &Value, at: usize| list["data"][at]["content"][0]["text"].clone();
+
+    let (status, page) = call(&app, Method::GET, &format!("{items}?limit=1"), json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(page["data"].as_array().map(Vec::len), Some(1), "{page}");
+    assert_eq!(page["has_more"], true, "{page}");
+    assert_eq!(text_of(&page, 0), "q2", "the newest first: {page}");
+    let cursor = page["last_id"]
+        .as_str()
+        .expect("the page's last id")
+        .to_owned();
+
+    let (status, again) = call(&app, Method::GET, &format!("{items}?limit=1"), json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!(
+        again["last_id"], cursor,
+        "the ids are the stored ones: {again}"
+    );
+
+    let (status, next) = call(
+        &app,
+        Method::GET,
+        &format!("{items}?limit=1&after={cursor}"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{next}");
+    assert_eq!(text_of(&next, 0), "q1", "the page after the cursor: {next}");
+    assert_eq!(next["has_more"], true, "{next}");
+
+    let (status, ascending) =
+        call(&app, Method::GET, &format!("{items}?order=asc"), json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{ascending}");
+    assert_eq!(text_of(&ascending, 0), "q0", "{ascending}");
+    assert_eq!(text_of(&ascending, 2), "q2", "{ascending}");
+    assert_eq!(ascending["has_more"], false, "{ascending}");
+
+    let (status, refused) = call(
+        &app,
+        Method::GET,
+        &format!("/v1/responses/{response_id}?stream=true"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    assert_eq!(
+        refused["error"]["code"], "invalid_query_parameter",
+        "{refused}"
+    );
+    engine.abort();
+}
+
 /// A stored response whose input carried a call and its output replays
 /// both, in order, in front of the next request's input.
 #[tokio::test]

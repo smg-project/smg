@@ -7,7 +7,7 @@ use std::{
 
 use axum::response::Response;
 use openai_protocol::{
-    common::{ToolCall, Usage},
+    common::ToolCall,
     responses::{
         ResponseContentPart, ResponseOutputItem, ResponseReasoningContent, ResponseStatus,
         ResponseUsage, ResponsesRequest, ResponsesResponse, ResponsesUsage,
@@ -19,8 +19,8 @@ use tracing::{debug, error, warn};
 
 use super::{
     common::{
-        build_next_request_with_tools, inject_mcp_metadata, open_mcp_session,
-        strip_image_generation_from_request_tools, McpCallTracking,
+        build_next_request_with_tools, inject_mcp_metadata, open_mcp_session, owned_request,
+        strip_image_generation_from_request_tools, withhold_server_tools, McpCallTracking,
     },
     execution::{execute_mcp_tools, ToolResult},
 };
@@ -33,16 +33,20 @@ use crate::{
         grpc::{
             common::responses::{
                 collect_user_function_names, ensure_mcp_connection, load_history,
-                persist_response_if_needed, tool_call_limit,
+                persist_response_if_needed,
+                streaming::OutputItemKind,
+                tool_call_limit,
                 utils::{
-                    function_call_status, generation_failure_error, resolve_function_identity,
-                    response_status,
+                    add_model_call_usage, function_call_status, generation_failure_error,
+                    iteration_exceeds_safety_limit, resolve_function_identity, response_status,
+                    tool_call_overflow, McpToolCallLimit,
                 },
-                NotStored, ResponsesContext,
+                NotStored, ReplayInto, ResponsesContext,
             },
             harmony::processor::ResponsesIterationResult,
         },
     },
+    tenant::storage_tenant,
 };
 
 /// Execute Harmony Responses API request with multi-turn MCP tool support
@@ -66,8 +70,14 @@ pub(crate) async fn serve_harmony_responses(
 ) -> Result<ResponsesResponse, Response> {
     // Load the history the request continues, as the caller's tenant may see
     // it; `request` itself stays as it came, for the persist.
-    let tenant = crate::tenant::storage_tenant(&tenant_request_meta);
-    let current_request = load_history(ctx.history_stores(), &request, tenant.as_deref()).await?;
+    let tenant = storage_tenant(&tenant_request_meta);
+    let current_request = load_history(
+        ctx.history_stores(),
+        &request,
+        tenant.as_deref(),
+        ReplayInto::Harmony,
+    )
+    .await?;
 
     // Check MCP connection and get whether MCP tools are present
     let (has_mcp_tools, mcp_servers) = ensure_mcp_connection(
@@ -122,6 +132,10 @@ async fn execute_with_mcp_loop(
     let mut iteration_count = 0;
 
     let mut mcp_tracking = McpCallTracking::new();
+    // The request's `max_tool_calls` is spent: the generation under way is the
+    // response's final turn, made with the server tools withheld, and its
+    // answer ends the loop whatever it holds.
+    let mut final_turn = false;
 
     // Extract user's max_tool_calls limit (if set)
     let max_tool_calls = current_request.max_tool_calls.map(|n| n as usize);
@@ -144,6 +158,13 @@ async fn execute_with_mcp_loop(
         &ctx.mcp_format_registry,
     );
 
+    // Shared with each iteration's pipeline context by reference count; the
+    // loop takes it back (`owned_request`) when it appends the tool outputs.
+    let mut current_request = Arc::new(current_request);
+
+    // Every model call of the loop adds to it; every answering exit reports it.
+    let mut usage_total: Option<ResponseUsage> = None;
+
     loop {
         iteration_count += 1;
 
@@ -151,7 +172,7 @@ async fn execute_with_mcp_loop(
         Metrics::record_mcp_tool_iteration(&current_request.model);
 
         // Safety check: prevent infinite loops
-        if iteration_count > DEFAULT_MAX_ITERATIONS {
+        if iteration_exceeds_safety_limit(iteration_count, final_turn) {
             error!(
                 function = "execute_with_mcp_loop",
                 iteration_count = iteration_count,
@@ -191,10 +212,12 @@ async fn execute_with_mcp_loop(
                     "Tool calls found - separating MCP and function tools"
                 );
 
+                add_model_call_usage(&mut usage_total, Some(&usage));
+
                 // Separate MCP and function tool calls based on session exposure.
                 // MCP tools are exposed to the model as function tools, so the only reliable
                 // discriminator is whether the name belongs to the MCP session.
-                let (mcp_tool_calls, function_tool_calls): (Vec<_>, Vec<_>) = tool_calls
+                let (mut mcp_tool_calls, function_tool_calls): (Vec<_>, Vec<_>) = tool_calls
                     .into_iter()
                     .partition(|tc| session.has_exposed_tool(tc.function.name.as_str()));
 
@@ -204,19 +227,37 @@ async fn execute_with_mcp_loop(
                     "Tool calls separated by type"
                 );
 
-                // Check combined limit (user's max_tool_calls vs safety limit)
-                let effective_limit = tool_call_limit(max_tool_calls);
-
-                // Check if we would exceed the limit with these new MCP tool calls
-                let total_calls_after = mcp_tracking.total_calls() + mcp_tool_calls.len();
-                if total_calls_after > effective_limit {
+                // The cap the batch overflows, if any, and the batch's
+                // permitted prefix (the regular loop's rule): the request's own
+                // cap runs the prefix and gives the model one final turn on the
+                // results, the server tools withheld (the public contract at
+                // `max_tool_calls`); the internal safety cap ends the response
+                // as failed with nothing of the batch executed. The final
+                // turn's own server calls, made with the tools withheld, do
+                // not run.
+                let overflow = if final_turn {
+                    mcp_tool_calls.clear();
+                    None
+                } else {
+                    tool_call_overflow(
+                        max_tool_calls,
+                        mcp_tracking.total_calls(),
+                        mcp_tool_calls.len(),
+                    )
+                };
+                if let Some((McpToolCallLimit::User, remaining)) = overflow {
+                    mcp_tool_calls.truncate(remaining);
+                }
+                if let Some((McpToolCallLimit::Safety, _)) = overflow {
+                    let effective_limit = tool_call_limit(max_tool_calls);
+                    let total_calls_after = mcp_tracking.total_calls() + mcp_tool_calls.len();
                     warn!(
                         current_calls = mcp_tracking.total_calls(),
                         new_calls = mcp_tool_calls.len() + function_tool_calls.len(),
                         total_after = total_calls_after,
                         effective_limit = effective_limit,
                         user_max = ?max_tool_calls,
-                        "Reached tool call limit - returning incomplete response"
+                        "Reached the tool call safety limit - returning a failed response"
                     );
 
                     // Combine back for response
@@ -227,7 +268,7 @@ async fn execute_with_mcp_loop(
 
                     // Build response with incomplete status - no tools executed due to limit
                     // Use original_tools for response (hide internal MCP tools)
-                    let mut response_request = current_request.clone();
+                    let mut response_request = owned_request(current_request);
                     response_request.tools.clone_from(&original_tools);
                     let mut response = build_tool_response(
                         vec![],         // No MCP tools executed
@@ -236,7 +277,7 @@ async fn execute_with_mcp_loop(
                         finish_reason.as_deref(),
                         analysis,
                         partial_text,
-                        usage,
+                        usage_total.take(),
                         request_id,
                         Arc::new(response_request),
                     );
@@ -290,10 +331,12 @@ async fn execute_with_mcp_loop(
                     .await?
                 };
 
-                // If there are function tools, exit MCP loop and return response
-                if !function_tool_calls.is_empty() {
+                // A client call, or the final turn's answer, exits the MCP
+                // loop and returns the response
+                if !function_tool_calls.is_empty() || final_turn {
                     debug!(
-                        "Function tool calls present - exiting MCP loop and returning to caller"
+                        final_turn,
+                        "Function tool calls present or the final turn answered - exiting MCP loop and returning to caller"
                     );
 
                     // Build response that includes:
@@ -301,7 +344,7 @@ async fn execute_with_mcp_loop(
                     // 2. MCP tools as completed (with output) - these were executed
                     // 3. Function tools as completed (without output) - need caller execution
                     // Use original_tools for response (hide internal MCP tools)
-                    let mut response_request = current_request.clone();
+                    let mut response_request = owned_request(current_request);
                     response_request.tools.clone_from(&original_tools);
                     let mut response = build_tool_response(
                         mcp_tool_calls,
@@ -310,7 +353,7 @@ async fn execute_with_mcp_loop(
                         finish_reason.as_deref(),
                         analysis,
                         partial_text,
-                        usage,
+                        usage_total.take(),
                         request_id,
                         Arc::new(response_request),
                     );
@@ -332,13 +375,18 @@ async fn execute_with_mcp_loop(
                 debug!("Only MCP tools - continuing loop with results");
 
                 // Build next request with appended history
-                current_request = build_next_request_with_tools(
-                    current_request,
+                let mut next_request = build_next_request_with_tools(
+                    owned_request(current_request),
                     mcp_tool_calls,
                     mcp_results,
                     analysis,
                     partial_text,
                 );
+                if matches!(overflow, Some((McpToolCallLimit::User, _))) {
+                    final_turn = true;
+                    withhold_server_tools(&mut next_request, |name| session.has_exposed_tool(name));
+                }
+                current_request = Arc::new(next_request);
 
                 // Continue loop - next iteration will select workers and execute
             }
@@ -352,6 +400,10 @@ async fn execute_with_mcp_loop(
                     output_tokens = usage.completion_tokens,
                     "MCP loop completed - no more tool calls"
                 );
+
+                // The pipeline's response carries this generation's usage alone.
+                add_model_call_usage(&mut usage_total, Some(&usage));
+                response.usage = usage_total.take().map(ResponsesUsage::Modern);
 
                 // Inject MCP metadata into final response
                 inject_mcp_metadata(&mut response, &mcp_tracking, &session, &user_function_names);
@@ -382,7 +434,9 @@ async fn execute_without_mcp_loop(
 ) -> Result<ResponsesResponse, Response> {
     debug!("Executing Harmony Responses without MCP loop");
 
-    // Execute pipeline once
+    // Execute pipeline once; the response built from a tool call below reads
+    // the same request, so it is shared, not copied.
+    let current_request = Arc::new(current_request);
     let iteration_result = ctx
         .pipeline
         .execute_harmony_responses(&current_request, ctx, Some(tenant_request_meta))
@@ -410,9 +464,9 @@ async fn execute_without_mcp_loop(
                 finish_reason.as_deref(),
                 analysis,
                 partial_text,
-                usage,
+                Some(ResponseUsage::from(&usage)),
                 request_id,
-                Arc::new(current_request),
+                current_request,
             ))
         }
         ResponsesIterationResult::Completed { response, usage: _ } => {
@@ -434,7 +488,7 @@ fn build_tool_response(
     finish_reason: Option<&str>,
     analysis: Option<String>, // Analysis channel content (reasoning)
     partial_text: String,     // Final channel content (message)
-    usage: Usage,
+    usage: Option<ResponseUsage>,
     request_id: String,
     responses_request: Arc<ResponsesRequest>,
 ) -> ResponsesResponse {
@@ -443,7 +497,7 @@ fn build_tool_response(
     // Add reasoning output item if analysis exists
     if let Some(analysis_text) = analysis {
         output.push(ResponseOutputItem::new_reasoning(
-            format!("reasoning_{request_id}"),
+            OutputItemKind::Reasoning.new_id(),
             vec![],
             vec![ResponseReasoningContent::ReasoningText {
                 text: analysis_text,
@@ -455,7 +509,7 @@ fn build_tool_response(
     // Add message output item if partial text exists
     if !partial_text.is_empty() {
         output.push(ResponseOutputItem::Message {
-            id: format!("msg_{request_id}"),
+            id: OutputItemKind::Message.new_id(),
             role: "assistant".to_string(),
             content: vec![ResponseContentPart::OutputText {
                 text: partial_text,
@@ -475,7 +529,7 @@ fn build_tool_response(
         let (name, namespace) =
             resolve_function_identity(responses_request.tools.as_deref(), &tool_call.function.name);
         output.push(ResponseOutputItem::FunctionToolCall {
-            id: Some(tool_call.id.clone()),
+            id: Some(OutputItemKind::FunctionCall.new_id()),
             call_id: tool_call.id.clone(),
             name,
             namespace,
@@ -502,7 +556,7 @@ fn build_tool_response(
         let status = function_call_status(finish_reason, &arguments);
         cut_call |= status == "incomplete";
         output.push(ResponseOutputItem::FunctionToolCall {
-            id: Some(tool_call.id),
+            id: Some(OutputItemKind::FunctionCall.new_id()),
             call_id,
             name,
             namespace,
@@ -526,7 +580,7 @@ fn build_tool_response(
         .created_at(created_at)
         .status(status)
         .output(output)
-        .usage(ResponsesUsage::Modern(ResponseUsage::from(&usage)));
+        .maybe_usage(usage.map(ResponsesUsage::Modern));
     if let Some(details) = incomplete_details {
         builder = builder.incomplete_details(details);
     }
@@ -556,7 +610,7 @@ mod namespace_tests {
             Some("tool_calls"),
             None,
             String::new(),
-            Usage::from_counts(1, 1),
+            None,
             "resp_test".into(),
             Arc::new(request),
         );
@@ -593,7 +647,7 @@ mod status_tests {
             finish_reason,
             None,
             String::new(),
-            Usage::from_counts(1, 1),
+            None,
             "resp_test".into(),
             Arc::new(ResponsesRequest::default()),
         );

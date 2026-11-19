@@ -3,10 +3,19 @@
 
 For every component (a workspace crate or a Python package), since the given tag:
 whether its files changed, whether its version was bumped, and, for a crate, whether
-the workspace root's dependency entry agrees. A version is bumped when no release tag
+the workspace root's dependency entry agrees. A component's files include what the
+symlinks under its path point at: a package that ships another directory's files through
+a link (the proto package ships both proto directories' files that way) ships their changes
+too, so they move its version. A version is bumped when no release tag
 ``v<x.y.z>`` (the given tag, or one another release line made) carries it with other
-code: the registries take a version once. Then the files that must mirror the gateway's
-version. Issues are listed with the bump conventional commits ask for (``feat!:`` or
+code: the registries take a version once. A crate held at its published version is
+republished when a workspace dependency's new version leaves a requirement its published
+copy carries (cargo's caret): at a patch step, or at its own breaking step when the crate's
+public API carries the dependency. A crate whose wire files changed (the proto files a
+dependent builds messages from) steps past its own caret whatever its commits ask: a field
+more breaks a dependent's published copy, which would resolve to a patch of it. Then the
+files that must mirror the gateway's version. Issues are listed with the bump conventional
+commits ask for (``feat!:`` or
 ``BREAKING CHANGE``: major; ``feat:``: minor; otherwise patch), stepped past the
 versions release tags carry, and, on request, applied.
 
@@ -38,6 +47,7 @@ import os
 import re
 import subprocess
 import sys
+import tomllib
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -54,10 +64,13 @@ class Component:
     path: str  # its directory, relative to the repository root
     version_file: str  # the file carrying its version, relative to the root
     dep_key: str | None = None  # its key under [workspace.dependencies]; None = no entry
+    # the wire files a dependent builds messages from, relative to the root: their change breaks
+    # a dependent's published copy, so it steps the crate past its own caret
+    wire: tuple[str, ...] = ()
 
 
-def crate(name: str, path: str, dep_key: str | None = None) -> Component:
-    return Component("crate", name, path, f"{path}/Cargo.toml", dep_key)
+def crate(name: str, path: str, dep_key: str | None = None, wire: Sequence[str] = ()) -> Component:
+    return Component("crate", name, path, f"{path}/Cargo.toml", dep_key, tuple(wire))
 
 
 def package(name: str, path: str, version_file: str) -> Component:
@@ -77,6 +90,7 @@ GATEWAY = "smg"
 
 CRATES = (
     crate("openai-protocol", "crates/protocols", "openai-protocol"),
+    crate("smg-worker", "crates/worker", "smg-worker", wire=("crates/worker/proto/",)),
     crate("smg-mm-rdma", "crates/mm_rdma", "smg-mm-rdma"),
     crate("engine-zmq-client", "crates/engine_zmq_client", "engine-zmq-client"),
     crate("reasoning-parser", "crates/reasoning_parser", "reasoning-parser"),
@@ -88,7 +102,7 @@ CRATES = (
     crate("smg-auth", "crates/auth", "smg-auth"),
     crate("smg-mcp", "crates/mcp", "smg-mcp"),
     crate("kv-index", "crates/kv_index", "kv-index"),
-    crate("smg-radix-tree", "crates/radix_tree", "smg-radix-tree"),
+    crate("smg-radix-tree", "crates/radix_tree"),
     crate("data-connector", "crates/data_connector", "smg-data-connector"),
     crate("llm-multimodal", "crates/multimodal", "llm-multimodal"),
     crate("smg-wasm", "crates/wasm", "smg-wasm"),
@@ -350,6 +364,67 @@ class Repo:
             position += size + 1
         return texts
 
+    def resolve_path(self, path: str) -> tuple[str | None, list[str]]:
+        """``path`` at HEAD with every symlink along it resolved, one component at a time: a
+        prefix that is a link has its pointee spliced in where it sits, ``..`` is collapsed only
+        once the component before it is resolved, and the links crossed come back beside the
+        result. None when the path leaves the repository, reaches an absolute pointee or crosses
+        more links than the OS follows (a loop; a link crossed twice on one path is not one)."""
+        resolved: list[str] = []
+        crossed: list[str] = []
+        remaining = path.split("/")
+        while remaining:
+            part = remaining.pop(0)
+            if part in ("", "."):
+                continue
+            if part == "..":
+                if not resolved:
+                    return None, crossed
+                resolved.pop()
+                continue
+            candidate = "/".join([*resolved, part])
+            if not self.git("ls-tree", "HEAD", "--", candidate).startswith("120000 "):
+                resolved.append(part)
+                continue
+            if len(crossed) >= 40:
+                return None, crossed
+            crossed.append(candidate)
+            pointee = self.show("HEAD", candidate) or ""
+            if not pointee or os.path.isabs(pointee):
+                return None, crossed
+            remaining = [*pointee.split("/"), *remaining]
+        return "/".join(resolved), crossed
+
+    def symlink_targets(self, path: str) -> list[str]:
+        """What the symlinks under ``path`` at HEAD point at, as repository paths, followed to
+        the end of every chain: a target that is a link, a directory holding one, or a path
+        running through a directory link adds what that points at, each read once. The links
+        crossed on the way count as targets too (a retarget changes what ships) but are not
+        read further: what lies behind a directory link beyond the path through it is not the
+        component's. A link into ``path`` itself, outside the repository or absolute is left
+        out."""
+        here, inside = path.rstrip("/"), path.rstrip("/") + "/"
+        targets: list[str] = []
+        pending = [path]
+        while pending:
+            entries = self.git("ls-tree", "-r", "-z", "HEAD", "--", pending.pop(0)).split("\0")
+            for entry in entries:
+                if not entry.startswith("120000 "):
+                    continue
+                link = entry.split("\t", 1)[1]
+                pointee = self.show("HEAD", link) or ""
+                if not pointee or os.path.isabs(pointee):
+                    continue
+                target, crossed = self.resolve_path(os.path.join(os.path.dirname(link), pointee))
+                for found in [*crossed, target]:
+                    if found is None or found == here or found.startswith(inside):
+                        continue
+                    if found not in targets:
+                        targets.append(found)
+                        if found == target:
+                            pending.append(found)
+        return targets
+
     def changed_since(self, tag: str, paths: Sequence[str]) -> list[str]:
         """``git diff --name-status`` lines since the tag, renames detected."""
         return self.git("diff", "--name-status", "-M", f"{tag}..HEAD", "--", *paths).splitlines()
@@ -386,7 +461,15 @@ class Verdict:
     carried_by: str | None = None  # the release tag, not the given one, that carries the version
     unbumped: bool = False  # the version is a release tag's, carried there with other code
     level: str | None = None  # the bump asked for when the version was not bumped
+    wire: bool = False  # its wire files changed: the step asked leaves the version's own caret
+    # the tagged version whose caret a bump by hand stays inside, the wire files changed
+    inside: str | None = None
     workspace_version: str | None = None  # the root's entry when it disagrees
+    # why a held crate moves: the published requirement a dependency's new version leaves
+    dependency: str | None = None
+    # the manifest's own requirements on path dependencies that the versions written leave (cargo
+    # refuses the tree over them): the entry's key, its requirement, the version to write
+    requirements: list[tuple[str, str, str]] = field(default_factory=list)
 
 
 def version_file_has_other_changes(repo: Repo, tag: str, file: str) -> bool:
@@ -404,14 +487,21 @@ def version_file_has_other_changes(repo: Repo, tag: str, file: str) -> bool:
     return False
 
 
+def component_paths(repo: Repo, component: Component) -> list[str]:
+    """The paths whose changes are the component's: its directory (and the place a crate moved
+    under crates/ had before), then what the symlinks under it point at."""
+    return [f"{p}/" for p in with_legacy(component.path)] + repo.symlink_targets(component.path)
+
+
 def files_changed(repo: Repo, tag: str, component: Component) -> int:
-    """The component's files changed since the tag; pure renames and a version-only edit do not count."""
-    dirs = [f"{p}/" for p in with_legacy(component.path)]
-    version_name = os.path.basename(component.version_file)
+    """The component's files changed since the tag, the targets of its symlinks among them; pure
+    renames and a version-only edit of the component's own version file do not count (a manifest
+    of the same name a link reaches is content)."""
+    version_files = with_legacy(component.version_file)
     count = sum(
         1
-        for line in repo.changed_since(tag, dirs)
-        if not line.startswith("R100") and not line.endswith(version_name)
+        for line in repo.changed_since(tag, component_paths(repo, component))
+        if not line.startswith("R100") and line.rsplit("\t", 1)[-1] not in version_files
     )
     if version_file_has_other_changes(repo, tag, component.version_file):
         count += 1
@@ -481,10 +571,22 @@ def check(
                 verdict.workspace_version = pinned or ""
         return verdict
     verdict.unbumped = carrier is not None
+    verdict.wire = bool(component.wire) and bool(repo.changed_since(tag, component.wire))
     if verdict.unbumped:
-        verdict.level = bump_level(
-            repo.commits_since(tag, [f"{p}/" for p in with_legacy(component.path)])
-        )
+        verdict.level = bump_level(repo.commits_since(tag, component_paths(repo, component)))
+        if verdict.wire:
+            verdict.level = LEVELS[
+                max(LEVELS.index(verdict.level), LEVELS.index(breaking_level(verdict.version)))
+            ]
+    elif (
+        verdict.wire
+        and verdict.tag_version is not None
+        and caret_accepts(verdict.tag_version, verdict.version)
+    ):
+        # Bumped, to a version the tagged one's caret accepts: a dependent's published copy
+        # resolves to it and builds messages that gained a field.
+        verdict.unbumped, verdict.inside = True, verdict.tag_version
+        verdict.level = breaking_level(verdict.version)
     elif component.dep_key:
         pinned = workspace_dep_version(root_toml, component.dep_key)
         if pinned != verdict.version:
@@ -546,6 +648,7 @@ class Plan:
         return (
             sum(1 for v in self.verdicts if v.unbumped)
             + sum(1 for v in self.verdicts if v.workspace_version is not None)
+            + sum(len(v.requirements) for v in self.verdicts)
             + len(self.mirrors)
         )
 
@@ -567,12 +670,27 @@ def report(verdict: Verdict, out: Out) -> None:
     c, name = verdict.component, out.paint("bold", verdict.component.name)
     where, n = f"({c.path}/)", f"{verdict.files_changed} file(s) changed"
     ok, warn, bad = out.paint("green", "✓"), out.paint("yellow", "!"), out.paint("red", "✗")
-    if verdict.unbumped:
+    plural = "s" if "; " in (verdict.dependency or "") else ""
+    if verdict.dependency and not verdict.files_changed:
+        out.line(
+            f"  {warn} {name} {where} — unchanged, but its published requirement{plural}"
+            f" {verdict.dependency} [{out.level(verdict.level)}]"
+        )
+    elif verdict.inside:
+        out.line(
+            f"  {warn} {name} {where} — {n}, its wire files among them, but v{verdict.version}"
+            f" is inside ^{verdict.inside} [{out.level(verdict.level)}]"
+        )
+    elif verdict.unbumped:
         carried = f", {verdict.carried_by}'s" if verdict.carried_by else ""
         out.line(
             f"  {warn} {name} {where} — {n} but version not bumped (v{verdict.version}{carried})"
             f" [{out.level(verdict.level)}]"
         )
+        if verdict.wire:
+            out.line(f"    {warn} and its wire files changed: the step leaves ^{verdict.version}")
+        if verdict.dependency:
+            out.line(f"    {warn} and its published requirement{plural} {verdict.dependency}")
     elif verdict.tag_version is None:
         out.line(f"  {ok} {name} {where} — new {c.kind} (v{verdict.version}), {n}")
     elif verdict.carried_by and not verdict.files_changed:
@@ -585,6 +703,358 @@ def report(verdict: Verdict, out: Out) -> None:
         out.line(
             f"    {bad} workspace Cargo.toml has {c.dep_key} v{verdict.workspace_version}, expected v{verdict.version}"
         )
+    for key, requirement, new in verdict.requirements:
+        out.line(f"    {bad} {c.version_file} has {key} v{requirement}, expected v{new}")
+
+
+def caret_accepts(requirement: str, version: str) -> bool:
+    """Whether cargo's default requirement on ``requirement`` (a caret) accepts ``version``: not
+    older, and the same major; the same minor below 1.0; the same patch below 0.1."""
+    old = tuple(int(n) for n in requirement.split("-")[0].split("."))
+    new = tuple(int(n) for n in version.split("-")[0].split("."))
+    if new < old:
+        return False
+    if old[0] > 0:
+        return new[0] == old[0]
+    if old[1] > 0:
+        return new[:2] == old[:2]
+    return new == old
+
+
+LEVELS = ("patch", "minor", "major")
+
+
+def breaking_level(version: str) -> str:
+    """The step that leaves a version's own caret: major from 1.0 on, minor at 0.y, patch at 0.0.z.
+    A candidate steps as its line does (the suffix carries no level), so a plan from one candidate
+    to the next reads a carried dependency crossing its caret as a final would."""
+    if not CUT_VERSION.match(version):
+        raise Fatal(
+            f"the dependency rule only steps X.Y.Z versions and their candidates, got: {version}"
+        )
+    major, minor, _ = (int(part) for part in version.split("-")[0].split("."))
+    return "major" if major else "minor" if minor else "patch"
+
+
+def manifest_at(repo: Repo, ref: str, component: Component) -> dict:
+    """The component's manifest at the ref, parsed; empty when it is not there."""
+    text = next(
+        (text for path in with_legacy(component.version_file) if (text := repo.show(ref, path))),
+        None,
+    )
+    if text is None:
+        return {}
+    try:
+        return tomllib.loads(text)
+    except tomllib.TOMLDecodeError as error:
+        raise Fatal(f"{component.version_file} at {ref} is not TOML: {error}") from None
+
+
+def dependency_entries(manifest: dict) -> list[tuple[str, object]]:
+    """The entries of a manifest's published dependency tables: ``[dependencies]`` and
+    ``[build-dependencies]``, at the top and under every ``[target.<cfg>]``; dev-dependencies
+    are not published requirements."""
+    tables = [manifest, *(t for t in manifest.get("target", {}).values() if isinstance(t, dict))]
+    return [
+        (key, spec)
+        for table in tables
+        for section in ("dependencies", "build-dependencies")
+        for key, spec in table.get(section, {}).items()
+    ]
+
+
+def published_requirements(
+    repo: Repo, ref: str, component: Component, crates: Sequence[Component]
+) -> dict[str, str]:
+    """A crate's requirements on the workspace crates as its copy at the ref (the release tag
+    that carries its version) carries them, per crate name: the root's pin for a
+    ``workspace = true`` entry (keyed as the root keys it), the entry's own version otherwise
+    (a direct entry names the package: its ``package =``, else its key)."""
+    root = repo.show(ref, "Cargo.toml") or ""
+    by_key = {c.dep_key or c.name: c.name for c in crates}
+    packages = {c.name for c in crates}
+    requirements: dict[str, str] = {}
+    for key, spec in dependency_entries(manifest_at(repo, ref, component)):
+        if isinstance(spec, dict) and spec.get("workspace"):
+            # a workspace entry is keyed as the root keys it
+            name, pinned = by_key.get(key), workspace_dep_version(root, key)
+        else:
+            # a direct entry names the package: its `package =`, else its key
+            package = spec.get("package", key) if isinstance(spec, dict) else key
+            name = package if package in packages else None
+            pinned = spec.get("version") if isinstance(spec, dict) else spec
+        if name is None or name == component.name:
+            continue
+        if isinstance(pinned, str) and SEMVER.match(pinned):
+            requirements[name] = pinned
+    return requirements
+
+
+def direct_requirements(
+    repo: Repo, component: Component, crates: Sequence[Component]
+) -> list[tuple[str, str, str]]:
+    """The requirements the component's manifest writes itself on the workspace crates it reaches
+    by path (a ``version`` beside the ``path``; the root pins a ``workspace = true`` entry), in
+    every dependency table cargo resolves, dev-dependencies too: the entry's key, the crate's name,
+    the requirement. A direct entry names the package (its ``package =``, else its key), not the
+    root's workspace key. Read from the working tree, as cargo reads it and as the fix leaves it."""
+    try:
+        manifest = tomllib.loads(repo.read(component.version_file))
+    except FileNotFoundError:
+        return []
+    except tomllib.TOMLDecodeError as error:
+        raise Fatal(f"{component.version_file} is not TOML: {error}") from None
+    packages = {
+        c.name for c in crates
+    }  # a direct entry names the package: its `package =`, else its key
+    tables = [manifest, *(t for t in manifest.get("target", {}).values() if isinstance(t, dict))]
+    found: list[tuple[str, str, str]] = []
+    for table in tables:
+        for section in ("dependencies", "build-dependencies", "dev-dependencies"):
+            for key, spec in table.get(section, {}).items():
+                if not isinstance(spec, dict) or spec.get("workspace") or not spec.get("path"):
+                    continue
+                name, requirement = spec.get("package", key), spec.get("version")
+                if name not in packages or name == component.name:
+                    continue
+                if isinstance(requirement, str) and SEMVER.match(requirement):
+                    found.append((key, name, requirement))
+    return found
+
+
+def write_dep_version(manifest: str, key: str, old: str, new: str) -> str | None:
+    """The member manifest with the inline entry ``key``'s version moved from ``old`` to ``new``;
+    None when no such line is there (an entry written as its own table is left to the operator)."""
+    line = rf'^(\s*{re.escape(key)}\s*=\s*\{{[^\n]*?\bversion\s*=\s*"){re.escape(old)}(")'
+    text, moved = re.subn(line, rf"\g<1>{new}\g<2>", manifest, count=1, flags=re.M)
+    return text if moved else None
+
+
+def source_name(repo: Repo, dependent: Component, dep: Component) -> str:
+    """The name the dependent's sources use for the dependency: the key it declares the
+    dependency under when that key renames the package (its own ``package =``, or the
+    workspace entry's), else the dependency's library name (``[lib] name``, by default the
+    package name). Both manifests are read at HEAD, with the sources."""
+    key = root_key = dep.dep_key or dep.name
+    for own_key, spec in dependency_entries(manifest_at(repo, "HEAD", dependent)):
+        package = spec.get("package") if isinstance(spec, dict) else None
+        # a rename, the root's key (a workspace entry) or a direct entry under the package name
+        if package == dep.name or (package is None and own_key in (root_key, dep.name)):
+            key = own_key
+    if key != dep.name:
+        return key.replace("-", "_")
+    lib = manifest_at(repo, "HEAD", dep).get("lib", {})
+    return lib.get("name") or dep.name.replace("-", "_")
+
+
+COMMENTS = re.compile(r"//[^\n]*|/\*.*?\*/", re.S)
+USE_TREE = re.compile(r"\buse\s+(?:::)?([A-Za-z_][A-Za-z0-9_]*)\s*(?:::\s*([^;]*?))?\s*;", re.S)
+NAME = r"[A-Za-z_][A-Za-z0-9_]*"
+CONSTANT = re.compile(r"\s*(?:const|static)\b(?!\s+(?:fn|unsafe|async|extern)\b)")
+
+
+def use_leaves(tree: str, prefix: tuple[str, ...] = ()) -> list[tuple[tuple[str, ...], str | None]]:
+    """The leaves of a ``use`` tree below the crate, each as its path segments and its ``as``
+    alias: ``a::{b, c::{d, self}}`` gives a::b, a::c::d and a::c::self."""
+    items: list[str] = []
+    depth = start = 0
+    for i, char in enumerate(tree):
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+        elif char == "," and depth == 0:
+            items.append(tree[start:i])
+            start = i + 1
+    items.append(tree[start:])
+    leaves: list[tuple[tuple[str, ...], str | None]] = []
+    for item in items:
+        item = item.strip()
+        if not item:
+            continue
+        if item.endswith("}"):
+            head, _, inner = item.partition("{")
+            segments = tuple(s.strip() for s in head.strip().rstrip(":").split("::") if s.strip())
+            leaves += use_leaves(inner[:-1], prefix + segments)
+            continue
+        alias = None
+        if re.search(r"\s+as\s+", item):
+            item, alias = (part.strip() for part in re.split(r"\s+as\s+", item, maxsplit=1))
+        leaves.append((prefix + tuple(s.strip() for s in item.split("::") if s.strip()), alias))
+    return leaves
+
+
+def imported_names(text: str, ident: str) -> set[str] | None:
+    """The names the ``use`` statements of a source bring in from the crate ``ident``: the leaf
+    of each path or its ``as`` alias, the segment before a ``self``; ``_`` (a trait imported
+    for its methods) brings in none. None when a glob import leaves them unknown."""
+    names: set[str] = set()
+    for match in USE_TREE.finditer(text):
+        if match[1] != ident:
+            continue
+        for segments, alias in use_leaves(match[2] or ""):
+            if "*" in segments:
+                return None
+            if segments and segments[-1] == "self":
+                segments = segments[:-1]
+            name = alias or (segments[-1] if segments else ident)
+            if name not in ("_", ident) and re.fullmatch(NAME, name):
+                names.add(name)
+    return names
+
+
+def public_spans(text: str) -> list[str]:
+    """The heads of a source's public items: from a bare ``pub`` (``pub(crate)`` and its kin are
+    not public) or an ``impl`` that begins an item (an ``impl Trait`` inside a signature opens no
+    head of its own: in a public one it lies inside the ``pub`` span, in a private one it is no
+    API) to the ``{``, ``;``, ``,`` or ``}`` that ends the head outside
+    every bracket, across wrapped lines (``<=``, ``->``, ``=>`` and ``>=`` are operators, not
+    brackets, and ``<<`` is a shift when whitespace follows it, as rustfmt writes one, else two
+    brackets as in ``Vec<<T as Tr>::A>``). A ``const`` or ``static`` head ends at its ``=``: the
+    initializer is not API. A ``pub enum`` or ``pub trait`` keeps its body, whose variants and
+    methods are public without the word; a trait ``impl`` keeps the ``type … = …;`` lines of its
+    body."""
+    spans: list[str] = []
+    for match in re.finditer(r"\bpub\b(?!\s*\()|^[ \t]*(?:unsafe[ \t]+)?(impl)\b", text, re.M):
+        start = i = match.end()
+        depth = 0
+        constant = CONSTANT.match(text, start) is not None
+        while i < len(text):
+            char, before, after = text[i], text[i - 1 : i], text[i + 1 : i + 2]
+            if char == "<":
+                if after == "=" or (after == "<" and text[i + 2 : i + 3].isspace()):
+                    i += 2
+                    continue
+                depth += 1
+            elif char == ">":
+                if before in ("-", "=") or after == "=":
+                    i += 1
+                    continue
+                depth = max(depth - 1, 0)
+            elif char in "([":
+                depth += 1
+            elif char in ")]":
+                depth = max(depth - 1, 0)
+            elif depth == 0 and (char in "{;,}" or (char == "=" and constant)):
+                break
+            i += 1
+        head = text[start:i]
+        if i < len(text) and text[i] == "{":
+            end, depth = i, 0
+            while end < len(text):
+                depth += {"{": 1, "}": -1}.get(text[end], 0)
+                end += 1
+                if depth == 0:
+                    break
+            if re.match(r"\s*(enum|trait)\b", head):
+                head = text[start:end]
+            elif match[1] and re.search(r"\bfor\b", head):
+                head += " ".join(re.findall(r"\btype\s+[^;]*;", text[i:end]))
+        spans.append(head)
+    return spans
+
+
+def carries_in_public_api(repo: Repo, component: Component, dep: Component) -> bool:
+    """Whether the crate's sources at HEAD carry the dependency in a public position: its path
+    or the whole crate under the name the sources use for it (``source_name``), or a name a
+    ``use`` of it brought into the file, in the head of a public item or an ``impl`` (the body
+    of a public enum or trait, the associated types of a trait impl). A read of the text; a
+    glob import of the dependency leaves it blind and reads as carried."""
+    ident = source_name(repo, component, dep)
+    by_path = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(ident)}::")
+    whole = re.compile(rf"\s*use\s+(?:::)?{re.escape(ident)}\b")
+    files = repo.git("ls-tree", "-r", "--name-only", "HEAD", "--", f"{component.path}/src")
+    for path in files.splitlines():
+        if not path.endswith(".rs"):
+            continue
+        text = COMMENTS.sub(" ", repo.show("HEAD", path) or "")
+        names = imported_names(text, ident)
+        if names is None:
+            return True
+        alternatives = "|".join(map(re.escape, sorted(names)))
+        by_name = (
+            re.compile(rf"(?<![A-Za-z0-9_:])(?:{alternatives})(?![A-Za-z0-9_])") if names else None
+        )
+        for span in public_spans(text):
+            if whole.match(span) or by_path.search(span):
+                return True
+            if by_name is not None and by_name.search(span):
+                return True
+    return False
+
+
+def dependency_moves(repo: Repo, tag: str, plan: Plan, crates: Sequence[Component]) -> None:
+    """The dependency rule, repeated until no crate moves or rises: a crate held at a published
+    version (the given tag's, or another line's tag that carries it) is republished when a
+    workspace dependency's new version (the plan's, where the dependency moves here) leaves a
+    requirement its published copy carries, and a crate already moving for its own changes
+    takes at least the step such a requirement asks. Every requirement is judged, and the step
+    is the highest they ask: the crate's own breaking step where its public API carries the
+    dependency, patch otherwise. The move's own pin write supersedes a stale-pin sync."""
+    by_name = {v.component.name: v for v in plan.verdicts if v.component.kind == "crate"}
+    held = {
+        v.component.name
+        for v in by_name.values()
+        if v.files_changed == 0
+        and (v.carried_by or (v.tag_version is not None and v.version == v.tag_version))
+    }
+    moving = {v.component.name for v in by_name.values() if v.unbumped and v.files_changed}
+    judged = [v for v in by_name.values() if v.component.name in held | moving]
+    requirements = {
+        v.component.name: published_requirements(repo, v.carried_by or tag, v.component, crates)
+        for v in judged
+    }
+    levels = {v.component.name: LEVELS.index(v.level or "patch") for v in judged if v.unbumped}
+    carried: dict[tuple[str, str], bool] = {}
+    changed = True
+    while changed:
+        changed = False
+        for verdict in judged:
+            name, level = verdict.component.name, -1
+            left: list[str] = []
+            for dep, requirement in requirements[name].items():
+                target = by_name.get(dep)
+                if target is None:
+                    continue
+                new = plan.new_version(target) if target.unbumped else target.version
+                if caret_accepts(requirement, new):
+                    continue
+                if (name, dep) not in carried:
+                    carried[name, dep] = carries_in_public_api(
+                        repo, verdict.component, target.component
+                    )
+                step = breaking_level(verdict.version) if carried[name, dep] else "patch"
+                level = max(level, LEVELS.index(step))
+                why = ", carried in its public API" if carried[name, dep] else ""
+                left.append(f"{dep} ^{requirement} does not accept v{new}{why}")
+            if not left:
+                continue
+            rises = level > levels.get(name, -1)
+            if name in held or rises:
+                verdict.dependency = "; ".join(left)
+            if rises:
+                levels[name] = level
+                verdict.unbumped = True
+                verdict.workspace_version = None
+                verdict.level = LEVELS[level]
+                changed = True
+
+
+def requirement_moves(repo: Repo, plan: Plan, crates: Sequence[Component]) -> None:
+    """The requirements the fix carries along: a member manifest's own ``version`` on a path
+    dependency, when the version the plan writes for that crate (or the one it has) leaves the
+    requirement's caret. Cargo refuses the tree over such an entry, which a read of the versions
+    alone passes; the entry is an issue until it holds, and the fix writes the new version to it
+    as it writes the root's pin."""
+    by_name = {v.component.name: v for v in plan.verdicts if v.component.kind == "crate"}
+    for verdict in by_name.values():
+        for key, name, requirement in direct_requirements(repo, verdict.component, crates):
+            target = by_name.get(name)
+            if target is None:
+                continue
+            new = plan.new_version(target) if target.unbumped else target.version
+            if not caret_accepts(requirement, new):
+                verdict.requirements.append((key, requirement, new))
 
 
 def examine(
@@ -608,8 +1078,6 @@ def examine(
     for component in (*crates, *packages):
         verdict = check(repo, tag, component, root_toml, tagged.get(component.name, {}))
         verdicts.append(verdict)
-        if verdict.files_changed or verdict.workspace_version is not None:
-            report(verdict, out)
 
     gateway = next((v for v in verdicts if v.component.name == GATEWAY), None)
     gateway_component = next(c for c in crates if c.name == GATEWAY)
@@ -617,6 +1085,13 @@ def examine(
         "cargo", repo.read(gateway_component.version_file), gateway_component.version_file
     )
     plan = Plan(verdicts, [], target, override, gateway_version=target, cut_version=cut_version)
+    dependency_moves(repo, tag, plan, crates)
+    requirement_moves(repo, plan, crates)
+    for verdict in verdicts:
+        if verdict.files_changed or verdict.workspace_version is not None or verdict.dependency:
+            report(verdict, out)
+        elif verdict.requirements:
+            report(verdict, out)
     if cut_version is not None:
         plan.gateway_target = cut_version
     elif gateway is not None and gateway.unbumped:
@@ -640,7 +1115,10 @@ def examine(
             1
             for v in verdicts
             if v.component.kind == kind
-            and bool(v.files_changed or v.workspace_version is not None) == changed
+            and bool(
+                v.files_changed or v.workspace_version is not None or v.dependency or v.requirements
+            )
+            == changed
         )
 
     out.line()
@@ -671,6 +1149,9 @@ def propose(plan: Plan, out: Out, title: str = "Proposed fixes:") -> None:
             out.line(
                 f"  {sync} workspace Cargo.toml {v.component.dep_key} v{v.workspace_version} → v{v.version}"
             )
+    for v in plan.verdicts:
+        for key, requirement, new in v.requirements:
+            out.line(f"  {sync} {v.component.version_file} {key} v{requirement} → v{new}")
     for v in plan.verdicts:
         c = v.component
         if v.unbumped and c.kind == "package":
@@ -790,6 +1271,16 @@ def apply(plan: Plan, repo: Repo, out: Out) -> int:
     for v in plan.verdicts:
         if v.workspace_version is not None:
             failed += not pin(v.component.dep_key or "", v.version)
+    for v in plan.verdicts:
+        for key, old, new in v.requirements:
+            path = v.component.version_file
+            text = write_dep_version(repo.read(path), key, old, new)
+            if text is None:
+                out.line(f"    {out.paint('red', f'FAILED to update {key} in {path} to v{new}')}")
+                failed += 1
+                continue
+            repo.write(path, text)
+            out.line(f"  {ok} {path} {key} → v{new}")
     for mirror, carried in plan.mirrors:
         failed += not rewrite(mirror.file, mirror.kind, carried, plan.gateway_target)
     return failed

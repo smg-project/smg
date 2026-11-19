@@ -257,53 +257,72 @@ impl NemotronOmniProcessor {
         if !image.color().has_alpha() {
             return rgb_bytes(image);
         }
-        let rgba = image.to_rgba8();
-        let mut out = Vec::with_capacity(rgba.as_raw().len() / 4 * 3);
-        for px in rgba.as_raw().as_chunks::<4>().0 {
-            let alpha = u32::from(px[3]);
-            for &c in &px[..3] {
+        // An RGBA8 input is read where it stands; another layout with alpha
+        // is converted first.
+        let rgba = image
+            .as_rgba8()
+            .map_or_else(|| Cow::Owned(image.to_rgba8()), Cow::Borrowed);
+        let (width, height) = (rgba.width() as usize, rgba.height() as usize);
+        // The container may be longer than its pixels.
+        let (pixels, _) = rgba.as_raw()[..4 * width * height].as_chunks::<4>();
+        // Whole pixels are collected and the vector is flattened: one exact
+        // allocation, and no capacity check per byte in the loop.
+        let out = pixels
+            .iter()
+            .map(|px| {
+                let alpha = u32::from(px[3]);
                 // PIL's BLEND: (255 * (255 - a) + c * a) / 255, rounded with its DIV255.
-                let v = 255 * (255 - alpha) + u32::from(c) * alpha + 128;
-                out.push(((v + (v >> 8)) >> 8) as u8);
-            }
-        }
-        (
-            rgba.width() as usize,
-            rgba.height() as usize,
-            Cow::Owned(out),
-        )
+                [px[0], px[1], px[2]].map(|c| {
+                    let v = 255 * (255 - alpha) + u32::from(c) * alpha + 128;
+                    ((v + (v >> 8)) >> 8) as u8
+                })
+            })
+            .collect::<Vec<[u8; 3]>>()
+            .into_flattened();
+        (width, height, Cow::Owned(out))
     }
 
-    /// Resize, normalize and patchify one RGB image: `rows * cols * 3 * p * p` values.
+    /// Resize, normalize and patchify one RGB image: appends its
+    /// `rows * cols * 3 * p * p` values to `out`.
     fn patches(
         raw: &[u8],
         width: u32,
         height: u32,
         rows: usize,
         cols: usize,
-    ) -> Result<Vec<f32>, TransformError> {
+        out: &mut Vec<f32>,
+    ) -> Result<(), TransformError> {
         let p = PATCH_SIZE;
         let (out_w, out_h) = (cols * p, rows * p);
         let resized = resize_bicubic_torch_aa_f32(raw, width, height, out_w as u32, out_h as u32)?;
         let scale = CLIP_STD.map(|s| s as f32);
         let mean = CLIP_MEAN.map(|m| m as f32);
-        let patch_len = 3 * p * p;
-        let mut out = vec![0.0_f32; rows * cols * patch_len];
+        let (pixels, _) = resized.as_chunks::<3>();
         for i in 0..rows {
             for j in 0..cols {
-                let patch = &mut out[(i * cols + j) * patch_len..][..patch_len];
                 for c in 0..3 {
+                    let (mean, scale) = (mean[c], scale[c]);
                     for dy in 0..p {
-                        for dx in 0..p {
-                            let v = resized[((i * p + dy) * out_w + j * p + dx) * 3 + c];
-                            // f32 op order matches the reference: x / 255, - mean, / std.
-                            patch[(c * p + dy) * p + dx] = (v / 255.0 - mean[c]) / scale[c];
+                        let row = &pixels[(i * p + dy) * out_w + j * p..][..p];
+                        // One channel of a patch row is gathered into a fixed array,
+                        // then normalized there with that channel's mean and scale:
+                        // the resized image is read once, and the sixteen divisions
+                        // run as one vector block. Normalizing inside the gather
+                        // divides one value at a time and is slower.
+                        let mut values = [0.0_f32; PATCH_SIZE];
+                        for (value, pixel) in values.iter_mut().zip(row) {
+                            *value = pixel[c];
                         }
+                        // f32 op order matches the reference: x / 255, - mean, / std.
+                        for value in &mut values {
+                            *value = (*value / 255.0 - mean) / scale;
+                        }
+                        out.extend_from_slice(&values);
                     }
                 }
             }
         }
-        Ok(out)
+        Ok(())
     }
 
     /// One clip's frames as patches plus its `video_grid_thw`.
@@ -325,13 +344,14 @@ impl NemotronOmniProcessor {
                     first.width, first.height, frame.width, frame.height
                 )));
             }
-            encoder_input.extend(Self::patches(
+            Self::patches(
                 frame.data,
                 frame.width,
                 frame.height,
                 rows,
                 cols,
-            )?);
+                &mut encoder_input,
+            )?;
         }
         let tubelets = frames.len().div_ceil(VIDEO_TEMPORAL_PATCH_SIZE);
         let encoder_input =
@@ -379,36 +399,40 @@ impl VisionPreProcessor for NemotronOmniProcessor {
 
     #[expect(
         clippy::expect_used,
-        reason = "per-image patch arrays are standard-layout and the concatenation is sized by construction"
+        reason = "the patch buffer is filled from the planned grids it is reshaped by"
     )]
     fn preprocess_with_context(
         &self,
         images: &[&DynamicImage],
         context: &VisionPreprocessingContext,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        if images.is_empty() {
-            return Err(TransformError::EmptyBatch);
-        }
+        TransformError::if_empty(images)?;
         let sizes: Vec<_> = images
             .iter()
             .map(|image| (image.width(), image.height()))
             .collect();
         let planned = Self::plan_grids(&sizes, context.token_budget)?;
         let patch_len = 3 * PATCH_SIZE * PATCH_SIZE;
-        let mut encoder_input = Vec::new();
+        let mut encoder_input = Vec::with_capacity(
+            planned
+                .iter()
+                .map(|(rows, cols)| rows * cols * patch_len)
+                .sum(),
+        );
         let mut feature_token_counts = Vec::with_capacity(images.len());
         let mut item_sizes = Vec::with_capacity(images.len());
         let mut grids = Vec::with_capacity(images.len() * 2);
         let mut patches_per_image = Vec::with_capacity(images.len());
-        for (image, (rows, cols)) in images.iter().zip(planned) {
+        for (image, &(rows, cols)) in images.iter().zip(&planned) {
             let (width, height, raw) = Self::rgb_on_white(image);
-            encoder_input.extend(Self::patches(
+            Self::patches(
                 &raw,
                 width as u32,
                 height as u32,
                 rows,
                 cols,
-            )?);
+                &mut encoder_input,
+            )?;
             feature_token_counts.push(grid_tokens(rows, cols));
             item_sizes.push((image.width(), image.height()));
             grids.extend([rows as i64, cols as i64]);
@@ -566,6 +590,40 @@ mod tests {
         assert_eq!(grids(&exhausted), [28, 36]);
     }
 
+    /// Every value of a patch is its resized pixel's, normalized in the
+    /// reference's `f32` operation order, at its place: patches row-major,
+    /// then channel, row, column.
+    #[test]
+    fn a_patch_value_is_its_resized_pixel_normalized_at_its_place() {
+        let (width, height, rows, cols) = (37_u32, 29_u32, 2_usize, 4_usize);
+        let raw: Vec<u8> = (0..width * height * 3)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8)
+            .collect();
+        let mut patches = Vec::new();
+        NemotronOmniProcessor::patches(&raw, width, height, rows, cols, &mut patches).unwrap();
+
+        let p = PATCH_SIZE;
+        let resized =
+            resize_bicubic_torch_aa_f32(&raw, width, height, (cols * p) as u32, (rows * p) as u32)
+                .unwrap();
+        let mut expected = Vec::with_capacity(patches.len());
+        for i in 0..rows {
+            for j in 0..cols {
+                for c in 0..3 {
+                    for dy in 0..p {
+                        for dx in 0..p {
+                            let value = resized[((i * p + dy) * cols * p + j * p + dx) * 3 + c];
+                            expected
+                                .push((value / 255.0 - CLIP_MEAN[c] as f32) / CLIP_STD[c] as f32);
+                        }
+                    }
+                }
+            }
+        }
+        let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&patches), bits(&expected));
+    }
+
     /// Frame grids the engine's `_compute_aspect_preserving_size` gives these sizes.
     #[test]
     fn plans_the_reference_video_grids() {
@@ -596,6 +654,33 @@ mod tests {
         assert_eq!(
             rgb.as_ref(),
             [255, 255, 255, 227, 132, 177, 254, 255, 254, 9, 8, 7]
+        );
+    }
+
+    /// An RGBA8 image in a container longer than its pixels composites as
+    /// the exact image does.
+    #[test]
+    fn a_longer_container_composites_as_its_image() {
+        let pixels = vec![0, 0, 0, 0, 200, 10, 99, 128, 37, 250, 1, 1, 9, 8, 7, 255];
+        let mut container = pixels.clone();
+        container.extend_from_slice(&[0xAB; 7]);
+        let exact = DynamicImage::from(image::RgbaImage::from_raw(4, 1, pixels).unwrap());
+        let longer = DynamicImage::from(image::RgbaImage::from_raw(4, 1, container).unwrap());
+        assert_eq!(
+            NemotronOmniProcessor::rgb_on_white(&longer),
+            NemotronOmniProcessor::rgb_on_white(&exact)
+        );
+    }
+
+    /// An input of another layout with alpha is converted to RGBA8 first and
+    /// composites as that image does.
+    #[test]
+    fn another_alpha_layout_composites_as_its_rgba8_image() {
+        let gray = image::GrayAlphaImage::from_raw(2, 1, vec![200, 128, 9, 0]).unwrap();
+        let rgba = image::RgbaImage::from_raw(2, 1, vec![200, 200, 200, 128, 9, 9, 9, 0]).unwrap();
+        assert_eq!(
+            NemotronOmniProcessor::rgb_on_white(&DynamicImage::from(gray)),
+            NemotronOmniProcessor::rgb_on_white(&DynamicImage::from(rgba))
         );
     }
 

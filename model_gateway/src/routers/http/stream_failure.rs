@@ -19,6 +19,7 @@ use std::{error::Error as _, sync::Arc};
 use axum::{http::StatusCode, response::Response};
 use bytes::Bytes;
 use serde_json::json;
+use smg_external_router::retry::{is_request_timeout, REQUEST_TIMEOUT_CODE};
 use tracing::warn;
 
 use crate::{
@@ -60,6 +61,10 @@ pub(crate) fn head_success_recorded(response: &Response) -> bool {
 pub(crate) struct UpstreamCut {
     status: StatusCode,
     cause: String,
+    /// The code the event that ends an OpenAI-style stream names the cut
+    /// with, when the cut has one of its own: the request timeout's, the
+    /// code of the 504 the same request gets unary.
+    code: Option<&'static str>,
 }
 
 impl UpstreamCut {
@@ -73,6 +78,7 @@ impl UpstreamCut {
         Self {
             status,
             cause: cause(error),
+            code: is_request_timeout(error).then_some(REQUEST_TIMEOUT_CODE),
         }
     }
 }
@@ -211,8 +217,9 @@ impl RelaySource {
     /// The SSE event that ends a response `cut` by the worker, in the shape
     /// of the route's API. An OpenAI-style stream (Chat Completions,
     /// Completions, generate, Responses) gets the error event the gRPC path
-    /// writes for a stream the worker failed, typed `stream_error`, then
-    /// `[DONE]`; a Messages stream gets the API's own `error` event, typed
+    /// writes for a stream the worker failed, typed `stream_error`, under the
+    /// request timeout's code when that is what cut the body, then `[DONE]`;
+    /// a Messages stream gets the API's own `error` event, typed
     /// `api_error` as the gRPC path types a worker's failure there, and no
     /// `[DONE]`, which the protocol does not have.
     pub(crate) fn error_event(&self, cut: &UpstreamCut) -> Bytes {
@@ -226,7 +233,11 @@ impl RelaySource {
             });
             Bytes::from(format!("event: error\ndata: {event}\n\n"))
         } else {
-            let event = json!({"error": {"message": message, "type": STREAM_ERROR_TYPE}});
+            let mut error = json!({"message": message, "type": STREAM_ERROR_TYPE});
+            if let Some(code) = cut.code {
+                error["code"] = json!(code);
+            }
+            let event = json!({"error": error});
             Bytes::from(format!("data: {event}\n\ndata: [DONE]\n\n"))
         }
     }
@@ -262,14 +273,30 @@ pub(crate) fn on_frame_boundary(tail: &[u8]) -> bool {
     tail.is_empty() || tail.ends_with(b"\n\n") || tail.ends_with(b"\r\n\r\n")
 }
 
-/// Keep the last four bytes of what was sent: enough to recognise a blank
-/// line whatever chunking the bytes arrived in.
-pub(crate) fn note_sent(tail: &mut Vec<u8>, bytes: &[u8]) {
-    tail.extend_from_slice(&bytes[bytes.len().saturating_sub(4)..]);
-    if tail.len() > 4 {
-        let excess = tail.len() - 4;
-        tail.drain(..excess);
+/// The last four bytes of what was sent: enough to recognise a blank line
+/// whatever chunking the bytes arrived in, kept in place (a `Vec` for them
+/// was one allocation per streamed response).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct SentTail {
+    bytes: [u8; 4],
+    len: usize,
+}
+
+impl SentTail {
+    /// The bytes, oldest first, for [`on_frame_boundary`].
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.len]
     }
+}
+
+/// Keep the last four bytes of what was sent.
+pub(crate) fn note_sent(tail: &mut SentTail, bytes: &[u8]) {
+    let fresh = &bytes[bytes.len().saturating_sub(4)..];
+    let keep = (4 - fresh.len()).min(tail.len);
+    let kept_from = tail.len - keep;
+    tail.bytes.copy_within(kept_from..tail.len, 0);
+    tail.bytes[keep..keep + fresh.len()].copy_from_slice(fresh);
+    tail.len = keep + fresh.len();
 }
 
 #[cfg(test)]
@@ -279,10 +306,13 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
-    use crate::worker::{
-        circuit_breaker::CircuitBreakerConfig,
-        test_support::{no_health_check, RefusedAddress},
-        BasicWorkerBuilder,
+    use crate::{
+        server::http_client_builder,
+        worker::{
+            health::circuit_breaker::CircuitBreakerConfig,
+            test_support::{no_health_check, RefusedAddress},
+            BasicWorkerBuilder,
+        },
     };
 
     const CAUSE: &str = "error decoding response body: error reading a body from connection: \
@@ -305,7 +335,24 @@ mod tests {
         UpstreamCut {
             status,
             cause: CAUSE.to_string(),
+            code: None,
         }
+    }
+
+    /// A call the client's own timeout ends: the listener's backlog takes
+    /// the connect and nobody answers the request.
+    async fn timed_out_call() -> reqwest::Error {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        http_client_builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_millis(50))
+            .build()
+            .unwrap()
+            .get(format!("http://{addr}/v1/chat/completions"))
+            .send()
+            .await
+            .unwrap_err()
     }
 
     /// The source of a response to `route`, read from a fresh worker.
@@ -332,7 +379,8 @@ mod tests {
     async fn refused_call() -> (std::net::SocketAddr, reqwest::Error) {
         let refused = RefusedAddress::reserve();
         let addr = refused.addr();
-        let error = crate::server::http_client_builder()
+        let error = http_client_builder()
+            .no_proxy()
             .build()
             .unwrap()
             .get(format!("http://{addr}/v1/chat/completions"))
@@ -505,6 +553,44 @@ mod tests {
         assert_eq!(done, "data: [DONE]\n\n");
     }
 
+    /// The request's own timeout names itself in the event of an
+    /// OpenAI-style stream, as its 504 does on a unary answer; a refused
+    /// connect and a cut of any other kind have no code.
+    #[tokio::test]
+    async fn the_event_of_a_stream_the_request_timeout_cut_names_the_timeouts_code() {
+        let (source, _worker) = source("/v1/chat/completions");
+        let error_of = |cut: &UpstreamCut| -> Value {
+            let event = source.error_event(cut);
+            let text = std::str::from_utf8(&event).unwrap();
+            let (error, done) = text.split_once("\n\n").unwrap();
+            assert_eq!(done, "data: [DONE]\n\n");
+            serde_json::from_str(error.strip_prefix("data: ").unwrap()).unwrap()
+        };
+
+        let timed_out = error_of(&UpstreamCut::of(&timed_out_call().await));
+        assert_eq!(timed_out["error"]["type"], STREAM_ERROR_TYPE);
+        assert_eq!(timed_out["error"]["code"], "call_upstream_timeout");
+
+        let (_addr, refused) = refused_call().await;
+        for other in [UpstreamCut::of(&refused), cut(StatusCode::BAD_GATEWAY)] {
+            let error = error_of(&other);
+            assert!(error["error"].get("code").is_none(), "{error}");
+        }
+    }
+
+    /// The Messages API's error event has no code field: the request
+    /// timeout ends its stream with the event of any other cut.
+    #[tokio::test]
+    async fn the_event_of_a_messages_stream_the_request_timeout_cut_has_no_code() {
+        let (source, _worker) = source("/v1/messages");
+
+        let event = source.error_event(&UpstreamCut::of(&timed_out_call().await));
+
+        let text = std::str::from_utf8(&event).unwrap();
+        assert!(text.starts_with("event: error\ndata: "), "{text:?}");
+        assert!(!text.contains("call_upstream_timeout"), "{text:?}");
+    }
+
     #[test]
     fn the_event_of_a_messages_stream_is_the_api_s_error_event_without_done() {
         let (source, _worker) = source("/v1/messages");
@@ -545,21 +631,36 @@ mod tests {
     /// The boundary is read from the last bytes sent, across chunks.
     #[test]
     fn the_frame_boundary_is_read_from_the_last_bytes_sent() {
-        let mut tail = Vec::new();
-        assert!(on_frame_boundary(&tail), "nothing sent yet");
+        let mut tail = SentTail::default();
+        assert!(on_frame_boundary(tail.as_slice()), "nothing sent yet");
         note_sent(&mut tail, b"data: {\"choices\":[]}\n\n");
-        assert!(on_frame_boundary(&tail));
+        assert!(on_frame_boundary(tail.as_slice()));
         note_sent(&mut tail, b"data: {\"cho");
-        assert!(!on_frame_boundary(&tail), "a frame cut mid-line");
+        assert!(!on_frame_boundary(tail.as_slice()), "a frame cut mid-line");
         note_sent(&mut tail, b"ices\":[]}\n");
-        assert!(!on_frame_boundary(&tail), "one newline is not a blank line");
+        assert!(
+            !on_frame_boundary(tail.as_slice()),
+            "one newline is not a blank line"
+        );
         note_sent(&mut tail, b"\n");
         assert!(
-            on_frame_boundary(&tail),
+            on_frame_boundary(tail.as_slice()),
             "the blank line split across two chunks"
         );
         note_sent(&mut tail, b"event: x\r\ndata: 1\r\n\r\n");
-        assert!(on_frame_boundary(&tail));
-        assert!(tail.len() <= 4);
+        assert!(on_frame_boundary(tail.as_slice()));
+        assert_eq!(
+            tail.as_slice(),
+            b"\r\n\r\n",
+            "the last four bytes, oldest first"
+        );
+        note_sent(&mut tail, b"ab");
+        assert_eq!(
+            tail.as_slice(),
+            b"\r\nab",
+            "two new bytes keep two old ones"
+        );
+        note_sent(&mut tail, b"");
+        assert_eq!(tail.as_slice(), b"\r\nab", "an empty chunk changes nothing");
     }
 }

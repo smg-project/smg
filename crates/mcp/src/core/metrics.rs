@@ -169,33 +169,9 @@ impl LatencyStats {
         self.count.fetch_add(1, Ordering::Relaxed);
         self.total_ms.fetch_add(ms, Ordering::Relaxed);
 
-        // Update min (relaxed ordering is fine for approximate stats)
-        let mut current_min = self.min_ms.load(Ordering::Relaxed);
-        while ms < current_min {
-            match self.min_ms.compare_exchange_weak(
-                current_min,
-                ms,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(actual) => current_min = actual,
-            }
-        }
-
-        // Update max
-        let mut current_max = self.max_ms.load(Ordering::Relaxed);
-        while ms > current_max {
-            match self.max_ms.compare_exchange_weak(
-                current_max,
-                ms,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(actual) => current_max = actual,
-            }
-        }
+        // The extremes: relaxed ordering is fine for approximate stats.
+        self.min_ms.fetch_min(ms, Ordering::Relaxed);
+        self.max_ms.fetch_max(ms, Ordering::Relaxed);
     }
 
     fn snapshot(&self) -> LatencySnapshot {

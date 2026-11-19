@@ -68,7 +68,9 @@ async fn chat_as(router: &dyn RouterTrait, model: &str) -> axum::response::Respo
         "model": model,
         "messages": [{"role": "user", "content": PROMPT_TEXT}],
     }));
-    router.route_chat(None, &tenant(), body, model).await
+    router
+        .route_chat(None, &tenant(), Arc::new(body), model)
+        .await
 }
 
 // ---------------------------------------------------------------------------
@@ -129,7 +131,7 @@ async fn an_impossible_request_is_denied_on_every_provider_route() {
             (
                 "messages",
                 anthropic
-                    .route_messages(None, &tenant, messages, MODEL)
+                    .route_messages(None, &tenant, Arc::new(messages), MODEL)
                     .await,
             ),
             (

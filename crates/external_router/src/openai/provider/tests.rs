@@ -2,7 +2,9 @@
 //! content-part variants (`input_image`, `input_file`, `refusal`) to the
 //! upstream provider untouched. These tests lock that contract for both
 //! the default `OpenAIProvider` (pure pass-through) and the `XAIProvider`
-//! (which otherwise rewrites `output_text -> input_text`).
+//! (which otherwise rewrites `output_text -> input_text`). The `rid` tests at
+//! the end pin the other half of a transform: the gateway-only fields leave
+//! the payload before a third-party API reads it.
 
 use openai_protocol::{
     common::Detail,
@@ -14,7 +16,7 @@ use openai_protocol::{
 };
 use serde_json::{json, to_value, Value};
 
-use super::{OpenAIProvider, Provider, XAIProvider};
+use super::{GeminiProvider, OpenAIProvider, Provider, SGLangProvider, XAIProvider};
 
 /// Build a `ResponsesRequest` whose single input message carries every
 /// variant `ResponseContentPart` exposes after P1, including a `refusal`
@@ -184,4 +186,53 @@ fn xai_provider_is_noop_for_chat_endpoint() {
     // only fires for `Endpoint::Responses`.
     let content = transformed_content(XAIProvider, Endpoint::Chat);
     assert_eq!(content[4]["type"], json!("output_text"));
+}
+
+/// A chat request carrying the gateway's own `rid`, the field a client sets
+/// to name its request and no third-party API accepts.
+fn chat_request_with_rid() -> Value {
+    json!({
+        "model": "m",
+        "rid": "conv_1",
+        "messages": [{"role": "user", "content": "hi"}]
+    })
+}
+
+/// `chat_request_with_rid` after `provider` transformed it for the chat
+/// endpoint.
+fn transformed_chat(provider: impl Provider) -> Value {
+    let mut payload = chat_request_with_rid();
+    provider
+        .transform_request(&mut payload, Endpoint::Chat)
+        .expect("the provider transform succeeds");
+    payload
+}
+
+#[test]
+fn openai_provider_drops_the_gateway_rid() {
+    let payload = transformed_chat(OpenAIProvider);
+    assert!(payload.get("rid").is_none(), "{payload}");
+    assert_eq!(payload["messages"][0]["content"], json!("hi"));
+}
+
+#[test]
+fn gemini_provider_drops_the_gateway_rid() {
+    let payload = transformed_chat(GeminiProvider);
+    assert!(payload.get("rid").is_none(), "{payload}");
+    assert_eq!(payload["messages"][0]["content"], json!("hi"));
+}
+
+#[test]
+fn xai_provider_drops_the_gateway_rid() {
+    let payload = transformed_chat(XAIProvider);
+    assert!(payload.get("rid").is_none(), "{payload}");
+    assert_eq!(payload["messages"][0]["content"], json!("hi"));
+}
+
+/// The engine-shaped provider forwards the payload as sent: an engine reads
+/// `rid` for log correlation.
+#[test]
+fn sglang_provider_keeps_the_gateway_rid() {
+    let payload = transformed_chat(SGLangProvider);
+    assert_eq!(payload["rid"], json!("conv_1"));
 }

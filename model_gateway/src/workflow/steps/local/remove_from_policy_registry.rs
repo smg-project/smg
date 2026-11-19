@@ -11,7 +11,9 @@ use tracing::{debug, error};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use crate::{
-    policies::PolicyRegistry, worker::WorkerRegistry, workflow::data::WorkerRemovalWorkflowData,
+    policies::PolicyRegistry,
+    worker::WorkerRegistry,
+    workflow::data::{require_app_context, WorkerRemovalWorkflowData},
 };
 
 /// Bound CPU-heavy radix-tree purges during a fleet-wide scale-down. The
@@ -21,8 +23,8 @@ static CACHE_REMOVAL_PERMITS: Semaphore = Semaphore::const_new(MAX_CONCURRENT_CA
 
 /// Step to remove workers from the policy registry.
 ///
-/// Removes each worker from cache-aware policies and notifies
-/// the policy registry of worker removal.
+/// Removes each worker from cache-aware policies and drops the policy of a
+/// model that no worker of this node serves any more.
 pub struct RemoveFromPolicyRegistryStep;
 
 impl RemoveFromPolicyRegistryStep {
@@ -57,11 +59,7 @@ impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromPolicyRegistryStep {
         &self,
         context: &mut WorkflowContext<WorkerRemovalWorkflowData>,
     ) -> WorkflowResult<StepResult> {
-        let app_context = context
-            .data
-            .app_context
-            .as_ref()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
+        let app_context = require_app_context(context.data.app_context.as_ref())?;
         let workers_to_remove = context
             .data
             .actual_workers_to_remove
@@ -86,9 +84,16 @@ impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromPolicyRegistryStep {
                 .remove_worker_from_policies(worker.url());
         }
 
+        // The removed workers' URLs leave their models' trees too, those of
+        // the models they were registered with as well as the ones they list
+        // now: a same-URL replacement during the drain is the one removed,
+        // and its models can differ from the found worker's.
         let mut cache_removals: HashMap<String, HashSet<String>> = HashMap::new();
-        for worker in workers_to_remove {
-            for model_id in WorkerRegistry::worker_model_ids(worker) {
+        for worker in workers_to_remove
+            .iter()
+            .chain(&context.data.removed_workers)
+        {
+            for model_id in WorkerRegistry::policy_model_ids(worker) {
                 cache_removals
                     .entry(model_id)
                     .or_default()
@@ -97,10 +102,25 @@ impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromPolicyRegistryStep {
         }
         Self::remove_cache_state(Arc::clone(&app_context.policy_registry), cache_removals).await;
 
-        for worker in workers_to_remove {
-            app_context
-                .policy_registry
-                .on_worker_removed(worker.model_id());
+        // The workers have left the worker registry: a model none of this
+        // node's workers serves any more loses its policy. Asked of the
+        // registry rather than counted, so a worker registered again, or a
+        // mesh import removed here, cannot keep a policy alive or end it
+        // early. Every model a worker was registered with or lists now is
+        // asked after, not its primary alone: a worker listing several
+        // models can be the last to serve one whose own workers left first.
+        // The workers the registry step removed count as well as the ones
+        // found, since a same-URL replacement during the drain is the one
+        // removed.
+        let models: HashSet<String> = workers_to_remove
+            .iter()
+            .chain(&context.data.removed_workers)
+            .flat_map(WorkerRegistry::policy_model_ids)
+            .collect();
+        for model_id in &models {
+            if !app_context.worker_registry.serves_model_locally(model_id) {
+                app_context.policy_registry.on_model_unserved(model_id);
+            }
         }
 
         debug!(

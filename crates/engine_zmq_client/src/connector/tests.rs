@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use futures::{channel::mpsc::channel as monitor_channel, SinkExt, StreamExt};
+use futures::{channel::mpsc::channel as monitor_channel, FutureExt, SinkExt, StreamExt};
 use zeromq::{util::PeerIdentity, Endpoint, SocketEvent};
 
 use super::*;
@@ -130,6 +130,34 @@ fn request_for(request_id: &str, rank: u32) -> EngineCoreRequest {
         data_parallel_rank: Some(rank),
         ..EngineCoreRequest::default()
     }
+}
+
+/// The unpinned add-request `request_id` submitted through `client` and read
+/// as its Add on `engine`, the rank the client's routing must choose for it;
+/// the request's stream comes back so the test keeps it in flight as long as
+/// it needs to.
+async fn unpinned_request_lands_on(
+    client: &EngineCoreClient,
+    engine: &mut MockEngine,
+    request_id: &str,
+) -> EngineCoreStream {
+    let next = client
+        .submit(EngineCoreRequest {
+            request_id: request_id.into(),
+            prompt_token_ids: Some(vec![1, 2, 3]),
+            ..EngineCoreRequest::default()
+        })
+        .await
+        .unwrap();
+    match tokio::time::timeout(TIMEOUT, engine.recv())
+        .await
+        .expect("the unpinned request should reach this engine")
+        .unwrap()
+    {
+        EngineInbound::Add(request) => assert_eq!(request.request_id, request_id),
+        other => panic!("expected the unpinned request's Add, got {other:?}"),
+    }
+    next
 }
 
 fn wave_control(engine_index: u32, control: DpControlMessage) -> Vec<Bytes> {
@@ -494,22 +522,7 @@ async fn unpinned_requests_prefer_the_least_loaded_engine() {
 
     // An unpinned request must now land on the idle engine 1, not
     // engines.first().
-    let _stream = client
-        .submit(EngineCoreRequest {
-            request_id: "cold".into(),
-            prompt_token_ids: Some(vec![1, 2, 3]),
-            ..EngineCoreRequest::default()
-        })
-        .await
-        .unwrap();
-    let inbound = tokio::time::timeout(TIMEOUT, engines[1].recv())
-        .await
-        .expect("unpinned request should route to the least-loaded engine")
-        .unwrap();
-    match inbound {
-        EngineInbound::Add(request) => assert_eq!(request.request_id, "cold"),
-        other => panic!("expected Add on engine 1, got {other:?}"),
-    }
+    let _stream = unpinned_request_lands_on(&client, &mut engines[1], "cold").await;
 }
 
 #[tokio::test]
@@ -560,15 +573,7 @@ async fn failed_submit_releases_its_reservation() {
     // With counts (1, 0) the next request must land on engine 1. If the
     // failed attempt leaked its reservation the counts would read (1, 1)
     // and rotation could send this to engine 0.
-    let _next = client.submit(unpinned("after")).await.unwrap();
-    match tokio::time::timeout(TIMEOUT, engines[1].recv())
-        .await
-        .expect("request should route to the unloaded engine")
-        .unwrap()
-    {
-        EngineInbound::Add(request) => assert_eq!(request.request_id, "after"),
-        other => panic!("expected Add on engine 1, got {other:?}"),
-    }
+    let _next = unpinned_request_lands_on(&client, &mut engines[1], "after").await;
 }
 
 #[tokio::test]
@@ -607,22 +612,7 @@ async fn retiring_one_request_twice_frees_only_its_own_slot() {
     // Engine 0 still holds "held". An unpinned request must therefore go
     // to the idle engine 1 — it would go to 0 if the second retirement had
     // freed "held"'s slot too.
-    let _next = client
-        .submit(EngineCoreRequest {
-            request_id: "next".into(),
-            prompt_token_ids: Some(vec![1, 2, 3]),
-            ..EngineCoreRequest::default()
-        })
-        .await
-        .unwrap();
-    match tokio::time::timeout(TIMEOUT, engines[1].recv())
-        .await
-        .expect("request should route to the idle engine")
-        .unwrap()
-    {
-        EngineInbound::Add(request) => assert_eq!(request.request_id, "next"),
-        other => panic!("expected Add on engine 1, got {other:?}"),
-    }
+    let _next = unpinned_request_lands_on(&client, &mut engines[1], "next").await;
 }
 
 #[tokio::test]
@@ -667,22 +657,7 @@ async fn an_emptied_rank_sheds_its_stale_queue_counts() {
     // it behind rank 1's real work.
     let _held = client.submit(request_for("held", 1)).await.unwrap();
     engines[1].recv().await.unwrap();
-    let _next = client
-        .submit(EngineCoreRequest {
-            request_id: "next".into(),
-            prompt_token_ids: Some(vec![1, 2, 3]),
-            ..EngineCoreRequest::default()
-        })
-        .await
-        .unwrap();
-    match tokio::time::timeout(TIMEOUT, engines[0].recv())
-        .await
-        .expect("request should route to the emptied rank")
-        .unwrap()
-    {
-        EngineInbound::Add(request) => assert_eq!(request.request_id, "next"),
-        other => panic!("expected Add on engine 0, got {other:?}"),
-    }
+    let _next = unpinned_request_lands_on(&client, &mut engines[0], "next").await;
 }
 
 /// The step's finished set is the union of the out-of-band finished list
@@ -813,22 +788,7 @@ async fn a_finish_named_twice_or_for_a_stranger_retires_at_most_once() {
     // Engine 0 still holds "held": an unpinned request goes to the idle
     // engine 1. It would go to 0 if the second retirement, or the
     // stranger's, had freed a slot the step never finished.
-    let _next = client
-        .submit(EngineCoreRequest {
-            request_id: "next".into(),
-            prompt_token_ids: Some(vec![1, 2, 3]),
-            ..EngineCoreRequest::default()
-        })
-        .await
-        .unwrap();
-    match tokio::time::timeout(TIMEOUT, engines[1].recv())
-        .await
-        .expect("request should route to the idle engine")
-        .unwrap()
-    {
-        EngineInbound::Add(request) => assert_eq!(request.request_id, "next"),
-        other => panic!("expected Add on engine 1, got {other:?}"),
-    }
+    let _next = unpinned_request_lands_on(&client, &mut engines[1], "next").await;
     let routing = client.inner.routing.lock();
     assert!(!routing.inflight.values().any(|ids| ids.contains("twice")));
     assert!(routing.inflight.values().any(|ids| ids.contains("held")));
@@ -2267,9 +2227,20 @@ async fn a_previous_generations_disconnect_does_not_end_the_next_link() {
     round_trip(&client, &mut engine, "generation-one").await;
 
     // The frontend restarts: its sockets go with the client, and it binds
-    // again (the dropped listeners' socket files go on their own tasks).
+    // again once the dropped listeners' socket files are gone (they go on
+    // the listeners' own tasks).
     drop(client);
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::timeout(TIMEOUT, async {
+        while [&handshake, &input, &output].into_iter().any(|endpoint| {
+            endpoint
+                .strip_prefix("ipc://")
+                .is_some_and(|path| std::path::Path::new(path).exists())
+        }) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the dropped listeners' socket files go");
     let (transport, next) = tokio::join!(
         connect_handshake(&handshake, 1, &input, &output, TIMEOUT),
         async {
@@ -2688,9 +2659,8 @@ async fn a_blocked_input_refuses_add_requests_past_the_frame_bound() {
         client.submit(request_for("req-behind-2", 0)),
         async {
             tokio::time::sleep(SEND_WINDOW / 3).await;
-            let started = std::time::Instant::now();
-            let result = client.submit(request_for("req-refused", 0)).await;
-            (result, started.elapsed())
+            // One poll: admission refuses before the submit first waits.
+            client.submit(request_for("req-refused", 0)).now_or_never()
         },
     );
     for behind in [behind_1, behind_2] {
@@ -2702,15 +2672,13 @@ async fn a_blocked_input_refuses_add_requests_past_the_frame_bound() {
             "{error:?}"
         );
     }
-    let (refused, waited) = refused;
-    let error = refused.err().expect("the queue is at its bound");
+    let error = refused
+        .expect("refused at once, not after a window")
+        .err()
+        .expect("the queue is at its bound");
     assert!(
         matches!(error, Error::EngineInputFull { frames: 3, .. }),
         "{error:?}"
-    );
-    assert!(
-        waited < SEND_WINDOW / 2,
-        "refused at once, not after a window: {waited:?}"
     );
     assert!(client.is_alive());
     // The engine reads again.
@@ -2762,7 +2730,7 @@ async fn a_blocked_input_refuses_typed_frames_past_the_byte_bound() {
     // The writer has been stuck for its window: the input counts as blocked.
     tokio::time::sleep(SEND_WINDOW).await;
     let engine_id = client.engines()[0].engine_id.clone();
-    let started = std::time::Instant::now();
+    // One poll: admission refuses before the call first waits.
     let error = client
         .send_typed(
             &engine_id,
@@ -2770,10 +2738,10 @@ async fn a_blocked_input_refuses_typed_frames_past_the_byte_bound() {
             vec![0u8; 8],
             vec![Bytes::from(vec![0u8; 2 << 20])],
         )
-        .await
+        .now_or_never()
+        .expect("refused at once")
         .expect_err("the waiting payload would pass the bound");
     assert!(matches!(error, Error::EngineInputFull { .. }), "{error:?}");
-    assert!(started.elapsed() < SEND_WINDOW / 2, "refused at once");
     assert!(client.is_alive());
     drop(engine);
 }
@@ -2811,17 +2779,17 @@ async fn a_blocked_input_refuses_add_requests_past_the_byte_bound() {
         started.elapsed() >= SEND_WINDOW,
         "a frame within the bound waits its window"
     );
-    let started = std::time::Instant::now();
+    // One poll: admission refuses before the submit first waits.
     let error = client
         .submit_with_aux(
             request_for("req-big", 0),
             vec![Bytes::from(vec![0u8; 2 << 20])],
         )
-        .await
+        .now_or_never()
+        .expect("refused at once")
         .err()
         .expect("the waiting payload would pass the bound");
     assert!(matches!(error, Error::EngineInputFull { .. }), "{error:?}");
-    assert!(started.elapsed() < SEND_WINDOW / 2, "refused at once");
     assert!(client.is_alive());
     let seen = drain_until_aborted(&mut engine, "req-small").await;
     let adds: Vec<&str> = seen
@@ -3013,16 +2981,16 @@ async fn a_request_past_the_byte_bound_on_its_own_is_refused_with_its_size_named
     client.set_input_queue_limit(usize::MAX, 1 << 20);
     saturate_input(&client).await;
     tokio::time::sleep(SEND_WINDOW).await;
-    let started = std::time::Instant::now();
+    // One poll: admission refuses before the submit first waits.
     let error = client
         .submit_with_aux(
             request_for("req-big", 0),
             vec![Bytes::from(vec![0u8; 2 << 20])],
         )
-        .await
+        .now_or_never()
+        .expect("refused at once")
         .err()
         .expect("the request alone passes the bound");
-    assert!(started.elapsed() < SEND_WINDOW / 2, "refused at once");
     match &error {
         Error::EngineInputFull {
             frames: 0,
@@ -3714,21 +3682,26 @@ async fn prompts_withdrawn_before_their_allowance_passes_explain_the_silence_unt
 /// rank) or is refused at a blocked input's bound never reached the
 /// engine, so it explains no silence, and the request the engine did
 /// read is answered for at the window, not the refused prompts'
-/// allowance later.
+/// allowance later. The window is set once the refused adds are in and
+/// counts from the engine's one output after them: a starved host
+/// cannot spend it on the setup. That output works the end of the work
+/// in hand out again from the prompts still pending, so that deadline
+/// is read around each refused add, where a queued allowance moves it.
 #[tokio::test]
 async fn an_add_the_engine_never_received_queues_no_allowance_on_the_wire() {
     let (client, mut engine, _ns) = connect().await;
-    let window = Duration::from_secs(2);
-    client.set_silence_death_timeout(window);
     client.set_prefill_tokens_per_sec(10_000);
     client.set_send_timeout(SEND_WINDOW);
     client.set_input_queue_limit(0, usize::MAX);
-    // The engine reads one short request and answers nothing.
-    let started = std::time::Instant::now();
+    // The engine reads one short request.
     let mut stream = client.submit(request_for("req-short", 0)).await.unwrap();
     engine.recv().await.unwrap();
+    // The end of the engine's prefill work in hand: the deadline a queued
+    // allowance moves.
+    let work_end = || client.inner.registry.lock().work_end;
     // A 50k-token prompt (five seconds of allowance) for a rank that does
     // not exist fails before any frame is built.
+    let in_hand = work_end();
     let error = client
         .submit(EngineCoreRequest {
             prompt_token_ids: Some(vec![1; 50_000]),
@@ -3741,10 +3714,16 @@ async fn an_add_the_engine_never_received_queues_no_allowance_on_the_wire() {
         matches!(error, Error::InvalidDataParallelRank { rank: 7, .. }),
         "{error:?}"
     );
+    assert_eq!(
+        work_end(),
+        in_hand,
+        "no allowance for a prompt that has no engine"
+    );
     // The engine stops reading: once the transport's payload budget is
     // full, the next frame waits behind it for a send window and fails,
     // and the 50k-token prompt after it is refused at the bound on the
-    // spot.
+    // spot: its error kind says so, a frame that waited answers as
+    // blocked.
     saturate_input(&client).await;
     let (request, aux) = (request_for("req-blocked", 0), Vec::new());
     let error = client
@@ -3757,31 +3736,51 @@ async fn an_add_the_engine_never_received_queues_no_allowance_on_the_wire() {
         "{error:?}"
     );
     tokio::time::sleep(SEND_WINDOW / 10).await;
-    let refused_at = std::time::Instant::now();
+    let in_hand = work_end();
     let error = client
         .submit(long_request("req-refused", 50_000))
         .await
         .err()
         .expect("the input is blocked and its queue at the bound");
     assert!(matches!(error, Error::EngineInputFull { .. }), "{error:?}");
-    assert!(refused_at.elapsed() < SEND_WINDOW / 2, "refused at once");
+    assert_eq!(
+        work_end(),
+        in_hand,
+        "no allowance for a prompt refused at the bound"
+    );
     assert_eq!(
         client.prefill_pending_tokens(),
         3,
         "only the prompt the engine read is in hand"
     );
-    // The verdict on the request the engine read comes at the window from
-    // its dispatch, not ten seconds of never-handed allowance later.
+    // The engine answers the request it read once, then nothing. The
+    // output re-arms the watchdog under the window set here, so the
+    // verdict comes a window after it.
+    let window = Duration::from_secs(2);
+    client.set_silence_death_timeout(window);
+    let answered = std::time::Instant::now();
+    engine
+        .send_output(batch(
+            0,
+            EngineCoreOutput {
+                request_id: "req-short".into(),
+                new_token_ids: vec![10],
+                ..Default::default()
+            },
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(stream.next().await, Some(Ok(_))), "the one output");
     let error = match stream.next().await {
         Some(Err(error)) => error,
-        Some(Ok(_)) => panic!("the engine answers nothing"),
+        Some(Ok(_)) => panic!("the engine answers once"),
         None => panic!("the stream ended without the engine's death"),
     };
     assert!(is_engine_dead(&error), "{error:?}");
-    let elapsed = started.elapsed();
+    let elapsed = answered.elapsed();
     assert!(
         elapsed >= window && elapsed < window + Duration::from_secs(2),
-        "at the window, nothing queued for the prompts the engine never got: {elapsed:?}"
+        "a window after the engine's last output: {elapsed:?}"
     );
     assert!(!client.is_alive());
 }

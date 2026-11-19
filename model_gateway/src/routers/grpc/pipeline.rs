@@ -17,7 +17,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatCompletionResponse},
     classify::ClassifyRequest,
@@ -69,12 +69,12 @@ use super::{
         },
         streaming, symphony,
     },
-    spec::ResponseSpec,
+    spec::{MessagesTools, ResponseSpec},
     utils,
     utils::{error_reason_for_response, error_type_for_response},
 };
 use crate::{
-    config::{types::RetryConfig, ParserChoice},
+    config::{types::RetryConfig, GroupedDpSticky, ParserChoice},
     middleware::{ReportedRefusal, TenantRequestMeta},
     observability::{
         cache_trace,
@@ -84,12 +84,14 @@ use crate::{
     rate_limit::{RateLimitManager, UsageSettlement},
     routers::{
         common::{
+            json_response,
             placement::{self, Candidates, WireConstraint},
+            prefill_admission::PrefillAdmission,
             retry::{is_retryable_response, BackoffCalculator},
         },
         error,
     },
-    worker::{PrefillAdmission, RoutingPool, WorkerRegistry},
+    worker::{RoutingPool, WorkerRegistry},
 };
 
 /// Which endpoint a pipeline serves. Selects the endpoint-specific stage set
@@ -131,6 +133,9 @@ pub(crate) struct PipelineDeps {
     /// its workers and of the streams they open, counted from the dispatch;
     /// `None` leaves them unbounded.
     request_timeout: Option<Duration>,
+    /// `--grouped-dp-sticky`: whether, and how, an attempt pins a sticky
+    /// request to one engine of a grouped data-parallel worker.
+    grouped_dp_sticky: GroupedDpSticky,
 }
 
 impl PipelineDeps {
@@ -162,6 +167,7 @@ impl PipelineDeps {
             rate_limit_manager,
             queue_timeout,
             request_timeout: None,
+            grouped_dp_sticky: GroupedDpSticky::Off,
         }
     }
 
@@ -185,6 +191,7 @@ impl PipelineDeps {
             rate_limit_manager,
             queue_timeout,
             request_timeout: None,
+            grouped_dp_sticky: GroupedDpSticky::Off,
         }
     }
 
@@ -194,6 +201,14 @@ impl PipelineDeps {
     #[must_use]
     pub(crate) fn with_request_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = (!timeout.is_zero()).then_some(timeout);
+        self
+    }
+
+    /// Pin each attempt's sticky request to one engine of a grouped
+    /// data-parallel worker as `sticky` says (`--grouped-dp-sticky`).
+    #[must_use]
+    pub(crate) fn with_grouped_dp_sticky(mut self, sticky: GroupedDpSticky) -> Self {
+        self.grouped_dp_sticky = sticky;
         self
     }
 
@@ -265,6 +280,7 @@ impl PipelineDeps {
             rate_limit_manager: None,
             queue_timeout: Duration::from_secs(60),
             request_timeout: None,
+            grouped_dp_sticky: GroupedDpSticky::Off,
         }
     }
 }
@@ -298,6 +314,9 @@ pub(crate) struct RequestPipeline {
     tool_parser_factory: ToolParserFactory,
     /// The deadline of each attempt's dispatch and streams, when set.
     request_timeout: Option<Duration>,
+    /// How each attempt pins a sticky request to an engine of a grouped
+    /// data-parallel worker.
+    grouped_dp_sticky: GroupedDpSticky,
 }
 
 /// Outcome of one full pipeline run.
@@ -310,8 +329,8 @@ enum RunOutcome {
     Final(Box<DispatchContext>, Instant),
 }
 
-/// One full pipeline run: the one box of a run, allocated where the request
-/// context moves in (see [`RequestPipeline::run`]).
+/// One full pipeline run, boxed once in [`RequestPipeline::run`]; the request
+/// context reaches it in a box of its own.
 type RunFuture<'a> = Pin<Box<dyn Future<Output = Result<RunOutcome, Response>> + Send + 'a>>;
 
 impl RequestPipeline {
@@ -334,8 +353,7 @@ impl RequestPipeline {
             deps.prefill_admission.clone(),
         )
         .with_queue_timeout(deps.queue_timeout);
-        let plan_kind = mode.plan_kind();
-        let inject_pd_metadata = mode.inject_pd_metadata();
+        let plan_settings = mode.plan_settings();
         let encode = matches!(mode, Mode::EncodePrefillDecode).then(EncodeStage::new);
         let rate_limit = RateLimitReserveStage::new(deps.rate_limit_manager.clone());
 
@@ -363,8 +381,7 @@ impl RequestPipeline {
                     worker_selection,
                     encode,
                     request_building: Box::new(ChatGenerateRequestBuildingStage::new(
-                        inject_pd_metadata,
-                        plan_kind,
+                        plan_settings,
                     )),
                     response_processing: Box::new(ChatGenerateResponseProcessingStage::new(
                         processor,
@@ -381,10 +398,7 @@ impl RequestPipeline {
                     rate_limit,
                     worker_selection,
                     encode,
-                    request_building: Box::new(MessageRequestBuildingStage::new(
-                        inject_pd_metadata,
-                        plan_kind,
-                    )),
+                    request_building: Box::new(MessageRequestBuildingStage::new(plan_settings)),
                     response_processing: Box::new(MessageResponseProcessingStage::new(
                         processor,
                         streaming_processor,
@@ -399,10 +413,7 @@ impl RequestPipeline {
                     rate_limit,
                     worker_selection,
                     encode,
-                    request_building: Box::new(CompletionRequestBuildingStage::new(
-                        inject_pd_metadata,
-                        plan_kind,
-                    )),
+                    request_building: Box::new(CompletionRequestBuildingStage::new(plan_settings)),
                     response_processing: Box::new(CompletionResponseProcessingStage::new(
                         processor,
                         streaming_processor,
@@ -420,8 +431,7 @@ impl RequestPipeline {
                     worker_selection,
                     encode: None,
                     request_building: Box::new(harmony::stages::HarmonyRequestBuildingStage::new(
-                        inject_pd_metadata,
-                        plan_kind,
+                        plan_settings,
                     )),
                     response_processing: Box::new(
                         harmony::stages::HarmonyResponseProcessingStage::new(),
@@ -484,6 +494,7 @@ impl RequestPipeline {
             worker_registry: deps.worker_registry.clone(),
             tool_parser_factory: deps.tool_parser_factory.clone(),
             request_timeout: deps.request_timeout,
+            grouped_dp_sticky: deps.grouped_dp_sticky,
         })
     }
 
@@ -491,6 +502,13 @@ impl RequestPipeline {
     #[cfg(test)]
     pub(crate) fn request_timeout(&self) -> Option<Duration> {
         self.request_timeout
+    }
+
+    /// How each attempt pins a sticky request to an engine of a grouped
+    /// data-parallel worker.
+    #[cfg(test)]
+    pub(crate) fn grouped_dp_sticky(&self) -> GroupedDpSticky {
+        self.grouped_dp_sticky
     }
 
     /// Ingress phase: run the request-owning stages through request building.
@@ -508,9 +526,13 @@ impl RequestPipeline {
                         &ctx.input.model_id,
                         response,
                     );
-                    if response.extensions().get::<ReportedRefusal>().is_some() {
-                        // The one line this refusal gets was written
-                        // (rate-limited, with the pool's state).
+                    if response.extensions().get::<ReportedRefusal>().is_some()
+                        || response.status().is_client_error()
+                    {
+                        // A refusal is the gateway's answer, not a failure of
+                        // its own: a reported one has its line from the stage
+                        // that refused, any other 4xx the access log's WARN
+                        // line.
                         debug!(
                             "Stage {} refused the request with status {}",
                             $stage,
@@ -529,12 +551,9 @@ impl RequestPipeline {
             stages.preparation.name(),
             stages.preparation.execute(ctx).await
         )?;
+        step!("RateLimitReserve", stages.rate_limit.execute(ctx).await)?;
         step!(
-            stages.rate_limit.name(),
-            stages.rate_limit.execute(ctx).await
-        )?;
-        step!(
-            stages.worker_selection.name(),
+            "WorkerSelection",
             stages.worker_selection.execute(ctx).await
         )?;
         let workers = stage_output(ctx.state.workers.as_ref(), "run_ingress")?;
@@ -548,12 +567,7 @@ impl RequestPipeline {
         )?;
         step!(
             "OutputBudget",
-            enforce_output_budget(
-                &ctx.input.request_type,
-                workers,
-                &ctx.input.model_id,
-                ctx.state.provider,
-            )
+            enforce_output_budget(&ctx.input.request_type, workers, &ctx.input.model_id)
         )?;
         ctx.state.clients = Some(step!(
             "ClientAcquisition",
@@ -609,6 +623,10 @@ impl RequestPipeline {
             );
             let retained = plan.as_mut().ok_or_else(consumed)?;
             helpers::restamp_plan_for_attempt(retained, stamp, workers, &self.tool_parser_factory)?;
+            // The new workers' window, for the stop reason of a `length` finish.
+            if let Some(ResponseSpec::Messages(messages)) = spec.as_mut() {
+                messages.context_window = selection_context_length(workers, &dctx.model_id);
+            }
             if let Some(decoder) = dctx.response.stop_decoder.as_mut() {
                 decoder.reset();
             }
@@ -637,7 +655,14 @@ impl RequestPipeline {
             dctx.created,
         ));
 
-        execute_plan(dctx, attempt_plan, last_attempt, self.request_timeout).await?;
+        execute_plan(
+            dctx,
+            attempt_plan,
+            last_attempt,
+            self.request_timeout,
+            self.grouped_dp_sticky,
+        )
+        .await?;
         self.stages
             .response_processing
             .process(dctx, attempt_spec)
@@ -658,14 +683,13 @@ impl RequestPipeline {
     /// iteration, so the pipeline is not where that turn is counted);
     /// `retry_config` enables the dispatch-phase retry loop.
     ///
-    /// The run is boxed once, here, and the context moves straight into that
-    /// box: it holds ingress + per-attempt state across awaits, and an
-    /// `async fn` hop in between would keep its own copy of the 2.6 KiB
-    /// context in every caller's state machine (an argument lives in the
-    /// future as the upvar and as the rebound local).
+    /// The run is boxed once, here: it holds ingress + per-attempt state
+    /// across awaits. The 2.5 KiB context comes in a box of its own, so every
+    /// hop from the entry point into this future moves a pointer; by value,
+    /// each hop copied the context whole.
     fn run<'a>(
         &'a self,
-        ctx: RequestContext,
+        ctx: Box<RequestContext>,
         metrics_endpoint: Option<&'static str>,
         retry_config: Option<&'a RetryConfig>,
     ) -> RunFuture<'a> {
@@ -685,15 +709,15 @@ impl RequestPipeline {
     }
 
     /// The run itself, as the future [`Self::run`] boxes: an `async move`
-    /// block over the context it was handed, so the context has one place in
-    /// that future (an `async fn` would rebind the argument into a second).
+    /// block over the arguments it was handed, so each has one place in that
+    /// future (an `async fn` would rebind every argument into a second).
     #[expect(
         clippy::manual_async_fn,
-        reason = "an async fn keeps a by-value argument twice in its state machine (the captured argument and the rebound local); the async move block holds the 2.6 KiB context once"
+        reason = "an async fn keeps a by-value argument twice in its state machine (the captured argument and the rebound local); the async move block holds each once"
     )]
     fn run_inner<'a>(
         &'a self,
-        mut ctx: RequestContext,
+        mut ctx: Box<RequestContext>,
         metrics_endpoint: Option<&'static str>,
         retry_config: Option<&'a RetryConfig>,
     ) -> impl Future<Output = Result<RunOutcome, Response>> + Send + 'a {
@@ -717,7 +741,7 @@ impl RequestPipeline {
             // plan's wire size stands in for the released buffers.
             let model_id = ctx.input.model_id.clone();
             let mut dctx = match ctx.into_dispatch() {
-                Ok(dctx) => Box::new(dctx),
+                Ok(dctx) => dctx,
                 Err(response) => {
                     self.record_error(metrics_endpoint, &model_id, &response);
                     return Err(response);
@@ -1088,7 +1112,7 @@ impl RequestPipeline {
     /// Responses stream never forwards.
     fn run_signalling<'a>(
         &'a self,
-        ctx: RequestContext,
+        ctx: Box<RequestContext>,
         metrics_endpoint: Option<&'static str>,
         retry_config: Option<&'a RetryConfig>,
         stream_start: Option<StreamStartupSender>,
@@ -1143,7 +1167,9 @@ impl RequestPipeline {
     ) -> Response {
         const ENDPOINT: &str = metrics_labels::ENDPOINT_CHAT;
         let run = {
-            let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
+            let mut ctx = Box::new(RequestContext::for_chat(
+                request, headers, model_id, components,
+            ));
             ctx.input.tenant_request_meta = tenant_request_meta;
             ctx.input.rate_limit_cell = rate_limit_cell;
             self.run_signalling(ctx, Some(ENDPOINT), retry_config, stream_start)
@@ -1160,7 +1186,7 @@ impl RequestPipeline {
                     )
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
-                    Self::routed_response(&dctx, axum::Json(response).into_response())
+                    Self::routed_response(&dctx, json_response(&response))
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_chat",
@@ -1205,7 +1231,9 @@ impl RequestPipeline {
             .unwrap_or(1);
         const ENDPOINT: &str = metrics_labels::ENDPOINT_GENERATE;
         let run = {
-            let mut ctx = RequestContext::for_generate(request, headers, model_id, components);
+            let mut ctx = Box::new(RequestContext::for_generate(
+                request, headers, model_id, components,
+            ));
             ctx.input.tenant_request_meta = tenant_request_meta;
             ctx.input.rate_limit_cell = rate_limit_cell;
             self.run(ctx, Some(ENDPOINT), retry_config)
@@ -1221,7 +1249,7 @@ impl RequestPipeline {
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
                     let body = generate_response_body(single_prompt, n, response);
-                    Self::routed_response(&dctx, axum::Json(body).into_response())
+                    Self::routed_response(&dctx, json_response(&body))
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_generate",
@@ -1250,7 +1278,9 @@ impl RequestPipeline {
     ) -> Response {
         const ENDPOINT: &str = metrics_labels::ENDPOINT_COMPLETIONS;
         let run = {
-            let mut ctx = RequestContext::for_completion(request, headers, model_id, components);
+            let mut ctx = Box::new(RequestContext::for_completion(
+                request, headers, model_id, components,
+            ));
             ctx.input.tenant_request_meta = tenant_request_meta;
             ctx.input.rate_limit_cell = rate_limit_cell;
             self.run(ctx, Some(ENDPOINT), retry_config)
@@ -1265,7 +1295,7 @@ impl RequestPipeline {
                     )
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
-                    Self::routed_response(&dctx, axum::Json(response).into_response())
+                    Self::routed_response(&dctx, json_response(&response))
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_completion",
@@ -1285,6 +1315,7 @@ impl RequestPipeline {
     pub async fn execute_messages(
         &self,
         request: Arc<CreateMessageRequest>,
+        tools: MessagesTools,
         headers: Option<http::HeaderMap>,
         model_id: String,
         components: Arc<SharedComponents>,
@@ -1294,7 +1325,9 @@ impl RequestPipeline {
     ) -> Response {
         const ENDPOINT: &str = metrics_labels::ENDPOINT_MESSAGES;
         let run = {
-            let mut ctx = RequestContext::for_messages(request, headers, model_id, components);
+            let mut ctx = Box::new(RequestContext::for_messages(
+                request, tools, headers, model_id, components,
+            ));
             ctx.input.tenant_request_meta = tenant_request_meta;
             ctx.input.rate_limit_cell = rate_limit_cell;
             self.run(ctx, Some(ENDPOINT), retry_config)
@@ -1312,7 +1345,7 @@ impl RequestPipeline {
                     )
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
-                    Self::routed_response(&dctx, axum::Json(response).into_response())
+                    Self::routed_response(&dctx, json_response(&response))
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_messages",
@@ -1344,7 +1377,9 @@ impl RequestPipeline {
     ) -> Response {
         const ENDPOINT: &str = metrics_labels::ENDPOINT_DECISIONS;
         let run = {
-            let mut ctx = RequestContext::for_decisions(request, headers, model_id, components);
+            let mut ctx = Box::new(RequestContext::for_decisions(
+                request, headers, model_id, components,
+            ));
             ctx.input.tenant_request_meta = tenant_request_meta;
             ctx.input.rate_limit_cell = rate_limit_cell;
             self.run(ctx, Some(ENDPOINT), retry_config)
@@ -1359,7 +1394,7 @@ impl RequestPipeline {
                     )
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
-                    Self::routed_response(&dctx, axum::Json(response).into_response())
+                    Self::routed_response(&dctx, json_response(&response))
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_decisions",
@@ -1386,7 +1421,9 @@ impl RequestPipeline {
     ) -> Response {
         const ENDPOINT: &str = metrics_labels::ENDPOINT_EMBEDDINGS;
         let run = {
-            let mut ctx = RequestContext::for_embedding(request, headers, model_id, components);
+            let mut ctx = Box::new(RequestContext::for_embedding(
+                request, headers, model_id, components,
+            ));
             ctx.input.tenant_request_meta = tenant_request_meta;
             ctx.input.rate_limit_cell = rate_limit_cell;
             self.run(ctx, Some(ENDPOINT), None)
@@ -1403,7 +1440,7 @@ impl RequestPipeline {
                     )
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
-                    Self::routed_response(&dctx, axum::Json(response).into_response())
+                    Self::routed_response(&dctx, json_response(&response))
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_embeddings",
@@ -1437,8 +1474,9 @@ impl RequestPipeline {
         // the endpoint's metrics don't split across backends.
         const ENDPOINT: &str = metrics_labels::ENDPOINT_AUDIO_TRANSCRIPTIONS;
         let run = {
-            let mut ctx =
-                RequestContext::for_transcription(request, audio, headers, model_id, components);
+            let mut ctx = Box::new(RequestContext::for_transcription(
+                request, audio, headers, model_id, components,
+            ));
             ctx.input.tenant_request_meta = tenant_request_meta;
             ctx.input.rate_limit_cell = rate_limit_cell;
             self.run(ctx, Some(ENDPOINT), None)
@@ -1487,7 +1525,9 @@ impl RequestPipeline {
     ) -> Response {
         const ENDPOINT: &str = metrics_labels::ENDPOINT_CLASSIFY;
         let run = {
-            let mut ctx = RequestContext::for_classify(request, headers, model_id, components);
+            let mut ctx = Box::new(RequestContext::for_classify(
+                request, headers, model_id, components,
+            ));
             ctx.input.tenant_request_meta = tenant_request_meta;
             ctx.input.rate_limit_cell = rate_limit_cell;
             self.run(ctx, Some(ENDPOINT), None)
@@ -1504,7 +1544,7 @@ impl RequestPipeline {
                     )
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
-                    Self::routed_response(&dctx, axum::Json(response).into_response())
+                    Self::routed_response(&dctx, json_response(&response))
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_classify",
@@ -1540,7 +1580,9 @@ impl RequestPipeline {
     ) -> Result<(ChatCompletionResponse, Option<ParserChoice>), Response> {
         let rate_limit_cell = Arc::new(RateLimitCell::new());
         let run = {
-            let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
+            let mut ctx = Box::new(RequestContext::for_chat(
+                request, headers, model_id, components,
+            ));
             ctx.input.tenant_request_meta = tenant_request_meta.as_ref().map(iteration_charge);
             ctx.input.rate_limit_cell = Some(rate_limit_cell.clone());
             self.run(ctx, None, None)
@@ -1604,21 +1646,22 @@ impl RequestPipeline {
     /// per iteration. Each iteration takes the tenant rate-limit reservation
     /// a chat request takes: reserved at ingress under a charge id of its own,
     /// settled with the engine's counts the response stage recorded, closed
-    /// unsettled when the iteration fails.
+    /// unsettled when the iteration fails. The request is the loop's shared
+    /// one: the iteration's context takes a reference to it, not a copy.
     pub async fn execute_harmony_responses(
         &self,
-        request: &openai_protocol::responses::ResponsesRequest,
+        request: &Arc<openai_protocol::responses::ResponsesRequest>,
         harmony_ctx: &ResponsesContext,
         tenant_request_meta: Option<TenantRequestMeta>,
     ) -> Result<harmony::ResponsesIterationResult, Response> {
         let rate_limit_cell = Arc::new(RateLimitCell::new());
         let run = {
-            let mut ctx = RequestContext::for_responses(
-                Arc::new(request.clone()),
+            let mut ctx = Box::new(RequestContext::for_responses(
+                Arc::clone(request),
                 None,                  // No headers needed for internal pipeline execution
                 request.model.clone(), // Model ID from request
                 harmony_ctx.components.clone(),
-            );
+            ));
             ctx.input.tenant_request_meta = tenant_request_meta.as_ref().map(iteration_charge);
             ctx.input.rate_limit_cell = Some(rate_limit_cell.clone());
             self.run(ctx, None, None)
@@ -1637,7 +1680,7 @@ impl RequestPipeline {
                         rate_limit_cell
                             .settle(Self::recorded_settlement(&dctx.response))
                             .await;
-                        Ok(iteration_result)
+                        Ok(*iteration_result)
                     }
                     None => {
                         error!(
@@ -1670,10 +1713,12 @@ impl RequestPipeline {
     /// reservation with the counts the stream brought
     /// ([`RateLimitCell::settle`]) or closes it when the stream broke
     /// ([`RateLimitCell::close_unsettled`]); a cell dropped before either
-    /// (the client left) abandons the reservation, its debit kept.
+    /// (the client left) abandons the reservation, its debit kept. The
+    /// request is the loop's shared one: the iteration's context takes a
+    /// reference to it, not a copy.
     pub async fn execute_harmony_responses_streaming(
         &self,
-        request: &openai_protocol::responses::ResponsesRequest,
+        request: &Arc<openai_protocol::responses::ResponsesRequest>,
         harmony_ctx: &ResponsesContext,
         tenant_request_meta: Option<TenantRequestMeta>,
         stream_start: Option<StreamStartupSender>,
@@ -1688,12 +1733,12 @@ impl RequestPipeline {
     > {
         let rate_limit_cell = Arc::new(RateLimitCell::new());
         let run = {
-            let mut ctx = RequestContext::for_responses(
-                Arc::new(request.clone()),
+            let mut ctx = Box::new(RequestContext::for_responses(
+                Arc::clone(request),
                 None,
                 request.model.clone(),
                 harmony_ctx.components.clone(),
-            );
+            ));
             ctx.input.tenant_request_meta = tenant_request_meta.as_ref().map(iteration_charge);
             ctx.input.rate_limit_cell = Some(rate_limit_cell.clone());
             self.run_signalling(ctx, None, None, stream_start)

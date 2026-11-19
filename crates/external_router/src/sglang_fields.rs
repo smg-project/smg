@@ -1,5 +1,6 @@
-//! SGLang-specific request fields that the gateway strips before forwarding
-//! a request to a backend that does not understand them.
+//! SGLang-specific request fields, and the gateway's own `rid`, that the
+//! gateway strips before forwarding a request to a backend that does not
+//! understand them.
 //!
 //! Shared by the HTTP proxy, which drops a field only when it carries the
 //! value the engine applies without it, and by the external-provider
@@ -10,6 +11,10 @@ use serde_json::Value;
 
 pub const SGLANG_FIELDS: &[&str] = &[
     "request_id",
+    // the gateway's own request id: an engine reads it for log correlation
+    // (a string is no default, so the proxy keeps it); a third-party API
+    // refuses it as an unknown argument
+    "rid",
     "priority",
     "top_k",
     "min_p",
@@ -226,5 +231,24 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A client's `rid` never reaches a third-party API and always reaches
+    /// an engine: the provider strip drops it, the proxy strip keeps a string
+    /// and drops only a null.
+    #[test]
+    fn rid_is_dropped_for_providers_and_kept_for_an_engine() {
+        let mut provider = json!({"model": "m", "rid": "conv_1", "messages": []});
+        strip_sglang_fields(&mut provider);
+        assert!(provider.get("rid").is_none(), "{provider}");
+
+        let mut engine = json!({"model": "m", "rid": "conv_1", "messages": []});
+        strip_default_sglang_fields(&mut engine);
+        assert_eq!(engine["rid"], json!("conv_1"));
+
+        let mut unset = json!({"model": "m", "rid": null});
+        strip_default_sglang_fields(&mut unset);
+        assert!(unset.get("rid").is_none(), "{unset}");
+        assert!(!is_stripped_sglang_default("rid", "\"conv_1\""));
     }
 }

@@ -15,12 +15,12 @@ import threading
 import uuid
 from collections.abc import AsyncGenerator
 from contextlib import aclosing
+from traceback import format_exc as get_exception_traceback
 from typing import Any
 
 import grpc
 import zmq
 import zmq.asyncio
-from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOutput,
@@ -41,9 +41,11 @@ from sglang.srt.observability.req_time_stats import (
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import get_or_create_event_loop, kill_process_tree
 from sglang.srt.utils.network import get_zmq_socket
-from sglang.utils import get_exception_traceback
 
+from smg_grpc_servicer.sglang.compat import SchedulerOutputAdapter, get_disaggregation_types
 from smg_grpc_servicer.trace_context import trace_headers
+
+DisaggregationMode, _ = get_disaggregation_types()
 
 logger = logging.getLogger(__name__)
 
@@ -243,6 +245,7 @@ class GrpcRequestManager:
 
         # State Management (from TokenizerManager)
         self.rid_to_state: dict[str, GrpcReqState] = {}
+        self.output_adapter = SchedulerOutputAdapter(allow_empty_rows=True)
         self.asyncio_tasks: set = set()
         self.gracefully_exit = False
         self.no_create_loop = False
@@ -567,6 +570,7 @@ class GrpcRequestManager:
         trace span and the slices still open under it, as the terminal output
         would have; a span left open never reaches the collector and keeps the
         request's trace context alive."""
+        self.output_adapter.forget(request_id)
         state = self.rid_to_state.pop(request_id, None)
         if state is not None and not state.time_stats.finished_time:
             state.time_stats.set_finished_time()
@@ -616,30 +620,21 @@ class GrpcRequestManager:
         asyncio.create_task(wait_for_result())
         return future
 
-    async def abort_request(self, request_id: str) -> bool:
+    async def abort_request(self, request_id: str, finished_reason: dict | None = None) -> bool:
         """Abort a running request.
 
-        Sends abort request to scheduler and marks local state as finished
-        to stop processing any further outputs from the scheduler.
+        Wake local consumers and dispatch an abort to the scheduler.
+
+        The return value reports dispatch success, not engine termination.
         """
         # Skip aborting health check requests (they clean themselves up)
         if request_id.startswith("HEALTH_CHECK"):
             return False
 
-        # Mark state as finished immediately to stop processing scheduler outputs
-        state = self.rid_to_state.get(request_id)
-        if state:
-            # Preserve both trace cleanup and abort metric accounting.
-            if not state.finished:
-                if self.enable_trace:
-                    state.time_stats.set_finished_time()
-                self._collect_aborted_metrics(state)
-            state.finished = True
-            state.stream_finished = True
-            logger.debug(f"Marked request {request_id} as aborted locally")
+        # A running scheduler request need not return AbortReq. Finish locally
+        # before dispatch, even if dispatch fails; the consumer owns cleanup.
+        await self._handle_abort_req(AbortReq(rid=request_id, finished_reason=finished_reason))
 
-        # Send abort to scheduler - the scheduler will send AbortReq back
-        # which will be handled by _handle_abort_req
         abort_req = AbortReq(rid=request_id)
         try:
             await self._send_to_scheduler(abort_req)
@@ -798,7 +793,21 @@ class GrpcRequestManager:
                 getattr(state, name).extend(column[batch_index])
 
     async def _handle_batch_output(self, batch_out: BatchTokenIDOutput):
-        """Handle batch generation output from scheduler."""
+        """Deliver generation output, terminating affected requests on invalid batches."""
+        try:
+            rows, prompts, cached = self.output_adapter.read(batch_out)
+        except Exception as exc:
+            # Dropping a rejected terminal batch would leave consumers waiting
+            # forever. The batch cannot be split reliably after normalization
+            # fails, so terminate every active member and stop remaining decode.
+            logger.exception("Failed to normalize scheduler generation output")
+            reason = {"type": "abort", "message": str(exc), "status_code": 500}
+            for rid in batch_out.rids:
+                self.output_adapter.forget(rid)
+                state = self.rid_to_state.get(rid)
+                if state is not None and not state.finished:
+                    await self.abort_request(rid, finished_reason=reason)
+            return
         # Collect all queue.put() tasks for parallel execution
         put_tasks = []
         cleanup_tasks = []
@@ -806,22 +815,24 @@ class GrpcRequestManager:
         # Process each request in the batch
         for i, rid in enumerate(batch_out.rids):
             if rid not in self.rid_to_state:
+                self.output_adapter.forget(rid)
                 continue
 
             state = self.rid_to_state[rid]
 
             # Skip if already aborted/finished locally (client cancelled)
             if state.finished:
+                self.output_adapter.forget(rid)
                 logger.debug(f"Skipping output for aborted request {rid}")
                 continue
 
             # Extract output for this request
-            prompt_tokens = batch_out.prompt_tokens[i] if batch_out.prompt_tokens else 0
+            prompt_tokens = prompts[i]
             completion_tokens = batch_out.completion_tokens[i] if batch_out.completion_tokens else 0
-            cached_tokens = batch_out.cached_tokens[i] if batch_out.cached_tokens else 0
+            cached_tokens = cached[i]
             reasoning_tokens_list = getattr(batch_out, "reasoning_tokens", None)
             reasoning_tokens = reasoning_tokens_list[i] if reasoning_tokens_list else 0
-            token_ids = batch_out.output_ids[i] if batch_out.output_ids else []
+            token_ids = rows[i]
 
             # A retracted prefill can emit a nonterminal zero-token output.
             # Preserve the previous output timestamp until ITL has been observed,
@@ -847,6 +858,21 @@ class GrpcRequestManager:
                 },
             }
 
+            # Scheduler counters are cumulative snapshots, not per-chunk deltas.
+            # Only forward actual engine counters; verify counts cannot determine
+            # proposal totals when speculative decoding uses adaptive draft sizes.
+            for key in ("spec_num_correct_drafts", "spec_num_proposed_drafts"):
+                counters = getattr(batch_out, key, None)
+                if counters is not None and i < len(counters) and counters[i] is not None:
+                    # Proto scalar defaults cannot distinguish unknown accepted from
+                    # measured zero. Proposals alone would falsely imply all rejected.
+                    if (
+                        key == "spec_num_proposed_drafts"
+                        and "spec_num_correct_drafts" not in output_data["meta_info"]
+                    ):
+                        continue
+                    output_data["meta_info"][key] = counters[i]
+
             # Accumulate logprobs (following tokenizer_manager pattern)
             # Use getattr for safe access - not all request types have return_logprob
             # (e.g., TokenizedEmbeddingReqInput)
@@ -856,15 +882,12 @@ class GrpcRequestManager:
                 except ValueError as exc:
                     # Raising out of this loop would strand the waiting client.
                     # Finish with an engine error and stop any remaining decode.
-                    output_data["error"] = str(exc)
-                    output_data["finished"] = True
-                    output_data["meta_info"]["finish_reason"] = {
-                        "type": "abort",
-                        "message": str(exc),
-                        "status_code": 500,
-                    }
+                    reason = {"type": "abort", "message": str(exc), "status_code": 500}
                     if not finished:
-                        await self.abort_request(rid)
+                        await self.abort_request(rid, finished_reason=reason)
+                    else:
+                        await self._handle_abort_req(AbortReq(rid=rid, finished_reason=reason))
+                    continue
 
             # Send input logprobs based if available
             if (
@@ -1037,6 +1060,8 @@ class GrpcRequestManager:
                 for name in ("json_schema", "regex", "ebnf", "structural_tag")
             )
             cache_details = getattr(batch_out, "cached_tokens_details", None)
+            stats = getattr(batch_out, "request_stats", None)
+            request_stats = stats[index] if stats and index < len(stats) else None
             finished_kwargs = {}
             if "is_streaming" in self._finished_metric_parameters:
                 finished_kwargs["is_streaming"] = bool(state.obj.stream)
@@ -1064,23 +1089,41 @@ class GrpcRequestManager:
                 cached_tokens=meta["cached_tokens"],
                 e2e_latency=state.time_stats.get_e2e_latency(),
                 has_grammar=has_grammar,
-                cached_tokens_details=cache_details[index] if cache_details else None,
+                cached_tokens_details=(
+                    request_stats.cached_tokens_details
+                    if request_stats is not None
+                    else cache_details[index]
+                    if cache_details
+                    else None
+                ),
                 **finished_kwargs,
             )
 
     async def _handle_embedding_output(self, batch_out: BatchEmbeddingOutput):
         """Handle batch embedding output from scheduler."""
+        # Embedding outputs are terminal: no request counts survive this batch.
+        try:
+            prompts, _ = SchedulerOutputAdapter().read_usage(batch_out)
+        except Exception as exc:
+            # Embeddings are terminal, so no scheduler abort is needed.
+            logger.exception("Failed to normalize scheduler embedding output")
+            reason = {"type": "abort", "message": str(exc), "status_code": 500}
+            for rid in batch_out.rids:
+                await self._handle_abort_req(AbortReq(rid=rid, finished_reason=reason))
+            return
         for i, rid in enumerate(batch_out.rids):
             if rid not in self.rid_to_state:
                 continue
 
             state = self.rid_to_state[rid]
+            if state.finished:
+                continue
 
             # Create result
             result = {
                 "request_id": rid,
                 "embedding": batch_out.embeddings[i],
-                "prompt_tokens": (batch_out.prompt_tokens[i] if batch_out.prompt_tokens else 0),
+                "prompt_tokens": prompts[i],
                 "finish_reason": (
                     batch_out.finished_reasons[i] if batch_out.finished_reasons else None
                 ),
@@ -1134,6 +1177,7 @@ class GrpcRequestManager:
             return
 
         # Check if request still exists
+        self.output_adapter.forget(recv_obj.rid)
         if recv_obj.rid not in self.rid_to_state:
             logger.debug(
                 f"Abort request for {recv_obj.rid} not in local state (may have already finished or not started yet)"
@@ -1141,8 +1185,9 @@ class GrpcRequestManager:
             return
 
         state = self.rid_to_state[recv_obj.rid]
-        if not state.finished:
-            self._collect_aborted_metrics(state)
+        if state.finished:
+            return
+        self._collect_aborted_metrics(state)
 
         # Mark as finished; a scheduler-initiated abort ends the request's
         # root span here, once (a client cancel ended it in abort_request).

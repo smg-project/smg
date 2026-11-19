@@ -1,6 +1,6 @@
 //! Router implementations
 
-use std::fmt::Debug;
+use std::{fmt::Debug, sync::Arc};
 
 use async_trait::async_trait;
 use axum::{body::Body, extract::Request, http::HeaderMap, response::Response};
@@ -32,6 +32,7 @@ pub mod factory;
 pub mod gateway;
 pub mod grpc;
 pub mod http;
+pub(crate) mod message_threads;
 pub(crate) mod provider_support;
 
 pub use common::body_policy::BodyPolicy;
@@ -110,12 +111,14 @@ pub trait RouterTrait: Send + Sync + Debug {
         )
     }
 
-    /// Route a chat completion request
+    /// Route a chat completion request. The request comes in the `Arc` its
+    /// handler built: a router that shares the request with its pipeline
+    /// moves the pointer, and one that forwards the body takes it out once.
     async fn route_chat(
         &self,
         _headers: Option<&HeaderMap>,
         _tenant_meta: &TenantRequestMeta,
-        _body: ChatCompletionRequest,
+        _body: Arc<ChatCompletionRequest>,
         _model_id: &str,
     ) -> Response {
         error::not_implemented(
@@ -236,7 +239,9 @@ pub trait RouterTrait: Send + Sync + Debug {
         )
     }
 
-    /// Route rerank requests
+    /// Route rerank requests. Regular HTTP workers serve them at their own
+    /// `/v1/rerank`; the default names that contract for the router kinds
+    /// that have no rerank path.
     async fn route_rerank(
         &self,
         _headers: Option<&HeaderMap>,
@@ -244,15 +249,20 @@ pub trait RouterTrait: Send + Sync + Debug {
         _body: RerankRequest,
         _model_id: &str,
     ) -> Response {
-        error::not_implemented("rerank_not_implemented", "Rerank not implemented")
+        error::not_implemented(
+            "rerank_not_implemented",
+            "Rerank is served by regular HTTP workers that answer POST /v1/rerank with ranked \
+             results; this router kind has no rerank path",
+        )
     }
 
-    /// Route Anthropic Messages API requests (/v1/messages)
+    /// Route Anthropic Messages API requests (/v1/messages). The request
+    /// comes in the `Arc` its handler built, as a chat request does.
     async fn route_messages(
         &self,
         _headers: Option<&HeaderMap>,
         _tenant_meta: &TenantRequestMeta,
-        _body: CreateMessageRequest,
+        _body: Arc<CreateMessageRequest>,
         _model_id: &str,
     ) -> Response {
         error::not_implemented(
@@ -434,7 +444,7 @@ mod tests {
                 "Generate endpoint not implemented",
             ),
             (
-                router.route_chat(None, &meta, body(chat.clone()), "m").await,
+                router.route_chat(None, &meta, Arc::new(body(chat.clone())), "m").await,
                 "chat_completions_not_implemented",
                 "Chat completions not implemented",
             ),
@@ -494,14 +504,15 @@ mod tests {
                     )
                     .await,
                 "rerank_not_implemented",
-                "Rerank not implemented",
+                "Rerank is served by regular HTTP workers that answer POST /v1/rerank with \
+                 ranked results; this router kind has no rerank path",
             ),
             (
                 router
                     .route_messages(
                         None,
                         &meta,
-                        body(json!({"model": "m", "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]})),
+                        Arc::new(body(json!({"model": "m", "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}))),
                         "m",
                     )
                     .await,

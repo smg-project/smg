@@ -3,21 +3,18 @@
 //! Metadata comes from the launcher's config (what the Python servicer reads
 //! off SGLang's `ModelConfig` and `ServerArgs`) and from the handshake.
 
-use std::{
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{sync::Arc, time::Duration};
 
 use futures::StreamExt;
 use openai_protocol::worker::SchedulerLoadSnapshot;
 use prost_types::Timestamp;
-use smg_grpc_client::sglang_proto as sg;
+use smg_grpc_client::{media_identity::sglang as contract, sglang_proto as sg};
 use tonic::Status;
 
 use super::{embed, generate, State};
 use crate::{
     health_probe::{self, Verdict},
-    load_report::{mean, rank_entries, rank_entry, RankFigures},
+    load_report::{mean, rank_entries, rank_entry, Capacity, RankFigures},
     proto_json::{insert_capacity, struct_from_json},
     servicer::{proto_token_ids, RequestOrigin},
 };
@@ -83,7 +80,7 @@ pub(super) async fn health_check_with(
 /// it before the output aborts the request on the scheduler, as a client's
 /// stream does.
 async fn probe(state: &Arc<State>) -> Result<(), Status> {
-    let request_id = format!("HEALTH_CHECK_{}", probe_nanos());
+    let request_id = health_probe::probe_request_id();
     let tokenized = Some(sg::TokenizedInput {
         input_ids: vec![0],
         original_text: String::new(),
@@ -116,14 +113,6 @@ async fn probe(state: &Arc<State>) -> Result<(), Status> {
             "the probe's stream ended without an output",
         )),
     }
-}
-
-/// The probe id's suffix: nanoseconds since the epoch (the Python servicer
-/// stamps its clock the same way).
-fn probe_nanos() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |since| since.as_nanos())
 }
 
 /// `GetModelInfo`: the launcher's config, with the handshake's context length
@@ -181,7 +170,7 @@ pub(super) fn server_info(state: &State) -> sg::GetServerInfoResponse {
     }
     if let Some(key) = super::media_identity::key(state) {
         server_args.fields.insert(
-            smg_grpc_client::sglang_media_identity::LABEL.to_string(),
+            contract::LABEL.to_string(),
             prost_types::Value {
                 kind: Some(prost_types::value::Kind::StringValue(key.to_string())),
             },
@@ -222,7 +211,7 @@ pub(super) fn server_info(state: &State) -> sg::GetServerInfoResponse {
 /// `include` sections have no source on this wire.
 pub(super) fn loads(state: &State, dp_rank: Option<i32>) -> Result<sg::GetLoadsResponse, Status> {
     let client = state.shared.engine()?;
-    let capacity = Capacity::of(state);
+    let capacity = Capacity::of(&state.shared, state.model.max_running_requests);
     let ranks = state.shared.rank_count(state.model.data_parallel_size);
     let (loads, aggregate) = rank_entries(
         client.get_loads().loads,
@@ -258,7 +247,7 @@ pub(super) fn loads(state: &State, dp_rank: Option<i32>) -> Result<sg::GetLoadsR
 /// engine makes it a rank); a rank past the connected ones has no entry.
 pub(super) fn rank_load(state: &State, dp_rank: Option<i32>) -> Option<sg::SchedulerLoad> {
     let client = state.shared.engine().ok()?;
-    let capacity = Capacity::of(state);
+    let capacity = Capacity::of(&state.shared, state.model.max_running_requests);
     rank_entry(
         |index| client.rank_load(index),
         capacity.max_total_num_tokens,
@@ -267,24 +256,6 @@ pub(super) fn rank_load(state: &State, dp_rank: Option<i32>) -> Option<sg::Sched
         |load, figures| reported_entry(state, load, figures, &capacity),
         |rank| unreported_entry(state, rank, &capacity),
     )
-}
-
-/// The capacity figures every rank's entry carries: the running window and
-/// the KV capacity the servicer knows.
-struct Capacity {
-    max_running_requests: i32,
-    max_total_num_tokens: i32,
-}
-
-impl Capacity {
-    fn of(state: &State) -> Self {
-        Self {
-            max_running_requests: state
-                .shared
-                .running_window(state.model.max_running_requests),
-            max_total_num_tokens: state.shared.kv_capacity_tokens(),
-        }
-    }
 }
 
 /// A reported rank's entry: the snapshot's figures with, from this

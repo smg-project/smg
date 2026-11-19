@@ -1,6 +1,6 @@
 [package]
 name = "llm-tokenizer"
-version = "1.11.0"
+version = "2.0.0"
 edition = "2021"
 description = "LLM tokenizer library with caching and chat template support"
 license = "Apache-2.0"
@@ -25,7 +25,9 @@ anyhow.workspace = true
 blake3.workspace = true
 dashmap.workspace = true
 serde = { workspace = true, features = ["derive"] }
-serde_json.workspace = true
+# Native tool arguments must preserve the reference's parsed f64 values (`float_roundtrip`). The Unigram
+# loader takes a score as its text (`raw_value`) and reads it by the parser's plain rule.
+serde_json = { workspace = true, features = ["float_roundtrip", "raw_value"] }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync", "rt-multi-thread", "macros"] }
 tracing.workspace = true
@@ -42,7 +44,9 @@ hf-hub = { version = "0.5.0", default-features = false, features = ["tokio", "ru
 # to the newest release, so an unpinned minor bump broke every PR's
 # unit-tests lane. Bump deliberately, revalidating template output.
 minijinja = { version = "=2.24.0", features = ["unstable_machinery", "json", "builtins", "loader", "loop_controls", "preserve_order"] }
-minijinja-contrib = { version = "=2.24.0", features = ["pycompat"] }
+# The contrib crate's `rand` feature declares no dependency (its manifest reads `rand = []`;
+# the draws come from its own generator), so enabling it leaves Cargo.lock unchanged.
+minijinja-contrib = { version = "=2.24.0", features = ["pycompat", "rand"] }
 chrono.workspace = true
 rayon = "1.12"
 thread_local = "1.1"
@@ -119,4 +123,8 @@ harness = false
 
 [[bench]]
 name = "parallel_encode"
+harness = false
+
+[[bench]]
+name = "encode_blocks"
 harness = false

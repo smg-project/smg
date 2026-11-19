@@ -5,10 +5,11 @@ use std::sync::Arc;
 use axum::response::Response;
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use openai_protocol::{
-    common::Tool,
+    common::{Tool, Usage},
     responses::{
-        CustomTool, IncompleteDetails, IncompleteReason, NamespaceTool, ResponseStatus,
-        ResponseTool, ResponsesRequest, ResponsesResponse,
+        CustomTool, IncompleteDetails, IncompleteReason, InputTokensDetails, NamespaceTool,
+        OutputTokensDetails, ResponseStatus, ResponseTool, ResponseUsage, ResponsesRequest,
+        ResponsesResponse,
     },
 };
 use serde_json::{json, to_value, Value};
@@ -25,7 +26,7 @@ use crate::{
     observability::metrics::Metrics,
     routers::{
         common::{
-            mcp_utils::{ensure_request_mcp_client, DEFAULT_MAX_ITERATIONS},
+            mcp_utils::{ensure_request_mcp_routing, DEFAULT_MAX_ITERATIONS},
             openai_bridge,
             persistence_utils::{
                 persist_conversation_items, persist_conversation_items_if_open, PersistError,
@@ -53,10 +54,10 @@ pub(crate) fn generation_failure_error(finish_reason: Option<&str>) -> Option<Va
 /// whole one: cut by the token limit or an abort, or ended by the model and not read whole (a
 /// tagged syntax that refused bytes inside the call writes no close for it; a JSON syntax carries
 /// the bytes as written from where they stopped being JSON), the turn ending on the call
-/// (`tool_calls`) all the same; a failed generation stays `in_progress`.
+/// (`tool_calls`) all the same; a failed or cancelled generation stays `in_progress`.
 pub(crate) fn function_call_status(finish_reason: Option<&str>, arguments: &str) -> &'static str {
     match finish_reason {
-        Some("failed" | "error") => "in_progress",
+        Some("failed" | "error" | "cancelled") => "in_progress",
         _ if serde_json::from_str::<Value>(arguments).is_err() => "incomplete",
         _ => "completed",
     }
@@ -78,7 +79,8 @@ pub(crate) fn cut_call<'a>(
 /// The response's status for the Chat finish reason, with why it is incomplete: a `length`
 /// finish is the token limit; a call that is no whole call under any other finish (`cut_call`,
 /// read on the calls' function-shaped arguments) leaves the response incomplete with no stated
-/// reason. Every
+/// reason; `cancelled` is the gateway's own finish for a stream stopped before its end (the
+/// client left a stored stream), `cancelled` with no reason. Every
 /// builder of a Responses object reads its status here: the non-streaming conversions,
 /// regular and Harmony, the stored object of a regular streamed turn, and the emitter for its
 /// terminal event and stored object under the finish it holds, whether chat chunks or a
@@ -89,6 +91,7 @@ pub(crate) fn response_status(
 ) -> (ResponseStatus, Option<IncompleteDetails>) {
     match finish_reason {
         Some("failed" | "error") => (ResponseStatus::Failed, None),
+        Some("cancelled") => (ResponseStatus::Cancelled, None),
         Some("length") => (
             ResponseStatus::Incomplete,
             Some(IncompleteDetails {
@@ -106,6 +109,87 @@ pub(crate) fn tool_call_limit(max_tool_calls: Option<usize>) -> usize {
     max_tool_calls.map_or(DEFAULT_MAX_ITERATIONS, |user_max| {
         user_max.min(DEFAULT_MAX_ITERATIONS)
     })
+}
+
+/// The server calls a request may still run once `executed` ran: its cap (see
+/// `tool_call_limit`) less them.
+pub(crate) fn tool_call_allowance(max_tool_calls: Option<usize>, executed: usize) -> usize {
+    tool_call_limit(max_tool_calls).saturating_sub(executed)
+}
+
+/// Whether a Harmony loop generation is past the loop's safety net. The call
+/// limit (see `tool_call_limit`) already bounds the loop, since every turn
+/// that continues it runs at least one server call, so the net allows that
+/// many generations plus the one that answers on the last result; the final
+/// turn after the request's cap is always the last generation and is exempt.
+pub(crate) fn iteration_exceeds_safety_limit(iteration_count: usize, final_turn: bool) -> bool {
+    iteration_count > DEFAULT_MAX_ITERATIONS + 1 && !final_turn
+}
+
+/// Adds one model call's usage to a response's total. Usage is per model
+/// request, so a tool loop reports the sum of its calls; a call that reported
+/// none leaves the total as it is.
+pub(crate) fn add_model_call_usage(total: &mut Option<ResponseUsage>, usage: Option<&Usage>) {
+    let Some(usage) = usage else {
+        return;
+    };
+    let total = total.get_or_insert_with(|| ResponseUsage {
+        input_tokens: 0,
+        output_tokens: 0,
+        total_tokens: 0,
+        input_tokens_details: InputTokensDetails::default(),
+        output_tokens_details: OutputTokensDetails::default(),
+    });
+    total.input_tokens = total.input_tokens.saturating_add(usage.prompt_tokens);
+    total.output_tokens = total.output_tokens.saturating_add(usage.completion_tokens);
+    total.total_tokens = total.total_tokens.saturating_add(usage.total_tokens);
+    if let Some(details) = &usage.prompt_tokens_details {
+        total.input_tokens_details.cached_tokens = total
+            .input_tokens_details
+            .cached_tokens
+            .saturating_add(details.cached_tokens);
+    }
+    if let Some(tokens) = usage
+        .completion_tokens_details
+        .as_ref()
+        .and_then(|details| details.reasoning_tokens)
+    {
+        total.output_tokens_details.reasoning_tokens = total
+            .output_tokens_details
+            .reasoning_tokens
+            .saturating_add(tokens);
+    }
+}
+
+/// Why a generated batch of server calls must stop after its permitted prefix
+/// executes: the request's own `max_tool_calls`, or the loop's internal safety
+/// limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum McpToolCallLimit {
+    User,
+    Safety,
+}
+
+/// The cap a batch of `batch` server calls overflows once `executed` calls
+/// ran: `None` when the batch fits the remaining allowance, else the cap and
+/// the length of the batch's permitted prefix. The cap is the request's own
+/// when it names one at or under the safety limit (a user cap wins when both
+/// are equal), else the safety limit.
+pub(crate) fn tool_call_overflow(
+    max_tool_calls: Option<usize>,
+    executed: usize,
+    batch: usize,
+) -> Option<(McpToolCallLimit, usize)> {
+    let remaining = tool_call_allowance(max_tool_calls, executed);
+    if batch <= remaining {
+        return None;
+    }
+    let limit = if max_tool_calls.is_some_and(|limit| limit <= DEFAULT_MAX_ITERATIONS) {
+        McpToolCallLimit::User
+    } else {
+        McpToolCallLimit::Safety
+    };
+    Some((limit, remaining))
 }
 
 /// Ensure MCP connection succeeds if MCP tools or builtin tools are declared.
@@ -150,34 +234,58 @@ pub(crate) async fn ensure_mcp_connection(
     if let Some(tools) = tools {
         // TODO: Thread real request headers through the gRPC responses path if/when
         // gRPC MCP flows need the same forwarded-header preservation contract.
-        match ensure_request_mcp_client(mcp_orchestrator, format_registry, tools).await {
-            Some(mcp_servers) => {
-                return Ok((true, mcp_servers));
-            }
-            None => {
-                // No MCP servers available
-                if has_explicit_mcp_tools {
-                    // Explicit MCP tools MUST have working connections
-                    error!(
-                        function = "ensure_mcp_connection",
-                        "Failed to connect to MCP servers"
-                    );
-                    return Err(error::failed_dependency(
-                        "connect_mcp_server_failed",
-                        "Failed to connect to MCP servers. Check server_url and authorization.",
-                    ));
-                }
-                // Builtin tools without MCP routing - pass through to model
-                debug!(
-                    function = "ensure_mcp_connection",
-                    "No MCP routing configured for builtin tools, passing through to model"
-                );
-                return Ok((false, Vec::new()));
-            }
+        if let Some(mcp_servers) =
+            ensure_request_mcp_routing(mcp_orchestrator, format_registry, tools).await?
+        {
+            return Ok((true, mcp_servers));
         }
+        // Builtin tools without MCP routing - pass through to model
+        debug!(
+            function = "ensure_mcp_connection",
+            "No MCP routing configured for builtin tools, passing through to model"
+        );
     }
 
     Ok((false, Vec::new()))
+}
+
+/// Refuse a Responses request with a function or custom tool, alone or in a
+/// namespace, that only code may call (`allowed_callers` without `direct`).
+/// This router runs no programmatic tool calls, and its chat template offers
+/// the model every function tool it is handed, so it could serve such a tool
+/// only as one the model calls directly, which the request forbids.
+pub(crate) fn refuse_tools_without_a_direct_caller(
+    tools: Option<&[ResponseTool]>,
+) -> Option<Response> {
+    let refused_at = |idx: usize, tool: &ResponseTool| match tool {
+        ResponseTool::Function(ft) => (!ft.allows_direct_calls()).then(|| format!("tools[{idx}]")),
+        ResponseTool::Custom(ct) => (!ct.allows_direct_calls()).then(|| format!("tools[{idx}]")),
+        ResponseTool::Namespace(namespace) => {
+            namespace
+                .tools
+                .iter()
+                .enumerate()
+                .find_map(|(member_idx, member)| {
+                    let direct = match member {
+                        NamespaceTool::Function(ft) => ft.allows_direct_calls(),
+                        NamespaceTool::Custom(ct) => ct.allows_direct_calls(),
+                    };
+                    (!direct).then(|| format!("tools[{idx}].tools[{member_idx}]"))
+                })
+        }
+        _ => None,
+    };
+    let at = tools
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+        .find_map(|(idx, tool)| refused_at(idx, tool))?;
+    Some(error::bad_request(
+        "tool_not_supported",
+        format!(
+            "Invalid '{at}.allowed_callers': this backend runs no programmatic tool calls, so a tool must allow the 'direct' caller."
+        ),
+    ))
 }
 
 /// Validate that workers are available for the requested model.
@@ -223,7 +331,7 @@ pub(crate) fn extract_tools_from_response_tools(
         .flat_map(|tool| match tool {
             ResponseTool::Function(ft) => vec![Tool {
                 tool_type: "function".to_string(),
-                function: ft.function.clone(),
+                function: ft.chat_function(),
             }],
             ResponseTool::Custom(ct) => vec![Tool {
                 tool_type: "function".to_string(),
@@ -234,7 +342,7 @@ pub(crate) fn extract_tools_from_response_tools(
                 .iter()
                 .map(|member| {
                     let mut function = match member {
-                        NamespaceTool::Function(ft) => ft.function.clone(),
+                        NamespaceTool::Function(ft) => ft.chat_function(),
                         NamespaceTool::Custom(ct) => custom_tool_as_function(ct),
                     };
                     function.name = format!("{}.{}", namespace.name, function.name);
@@ -324,6 +432,14 @@ pub(crate) fn decode_reasoning_content(blob: &str) -> Option<String> {
     String::from_utf8(BASE64_STANDARD.decode(payload).ok()?).ok()
 }
 
+/// Whether `name` is `namespace` and `member` joined by a dot, read at the
+/// dot without building the joined text.
+fn is_namespaced(name: &str, namespace: &str, member: &str) -> bool {
+    name.strip_prefix(namespace)
+        .and_then(|rest| rest.strip_prefix('.'))
+        .is_some_and(|rest| rest == member)
+}
+
 /// Recover structured identity only for a declared namespace member.
 /// Literal top-level names (including dots) take precedence over namespace matches.
 pub(crate) fn resolve_function_identity(
@@ -339,7 +455,7 @@ pub(crate) fn resolve_function_identity(
             if let ResponseTool::Namespace(namespace) = tool {
                 for member in &namespace.tools {
                     if let NamespaceTool::Function(ft) = member {
-                        if name == format!("{}.{}", namespace.name, ft.function.name) {
+                        if is_namespaced(name, &namespace.name, &ft.function.name) {
                             return (ft.function.name.clone(), Some(namespace.name.clone()));
                         }
                     }
@@ -371,8 +487,7 @@ pub(crate) fn namespace_test_request() -> ResponsesRequest {
 /// tokens, 3 of them cached and 2 reasoning; `assert_responses_api_usage`
 /// reads it back off the wire.
 #[cfg(test)]
-pub(crate) fn responses_api_test_usage() -> openai_protocol::common::Usage {
-    use openai_protocol::common::Usage;
+pub(crate) fn responses_api_test_usage() -> Usage {
     Usage::from_counts(12, 7)
         .with_cached_tokens(3)
         .with_reasoning_tokens(2)
@@ -472,14 +587,14 @@ pub(crate) async fn previous_response_chain(
         {
             let responses = visible_chain(chain.responses, tenant);
             if responses.is_empty() {
-                return Err(error::bad_request(
+                return Err(error::not_found(
                     "previous_response_not_found",
                     format!("Previous response with id '{prev_id_str}' not found."),
                 ));
             }
             Ok(responses)
         }
-        Ok(_) | Err(ResponseStorageError::ResponseNotFound(_)) => Err(error::bad_request(
+        Ok(_) | Err(ResponseStorageError::ResponseNotFound(_)) => Err(error::not_found(
             "previous_response_not_found",
             format!("Previous response with id '{prev_id_str}' not found."),
         )),
@@ -686,7 +801,8 @@ mod tests {
     /// A chain ending in a record its client asked not to store is no
     /// previous response (the loaders of both model families call this; the
     /// item-reference resolver shares its predicate); a stored chain is
-    /// returned, an unknown id refused the same way.
+    /// returned, an unknown id refused the same way: 404, the resource the
+    /// request names is absent.
     #[tokio::test]
     async fn an_unstored_record_is_no_previous_response() {
         let storage: Arc<dyn ResponseStorage> = Arc::new(MemoryResponseStorage::new());
@@ -701,7 +817,7 @@ mod tests {
         let refused = previous_response_chain(&storage, "resp_unstored", None)
             .await
             .expect_err("an unstored record is no previous response");
-        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(refused.status(), StatusCode::NOT_FOUND);
         let chain = previous_response_chain(&storage, "resp_stored", None)
             .await
             .expect("a stored record is a previous response");
@@ -709,7 +825,7 @@ mod tests {
         let unknown = previous_response_chain(&storage, "resp_unknown", None)
             .await
             .expect_err("an unknown id is refused");
-        assert_eq!(unknown.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
     }
 
     /// `background: true` with `store: false`, the public API's probe: the
@@ -1143,6 +1259,89 @@ mod tests {
             .expect("alias must stop resolving with no workers behind it");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
+
+    /// The public API's function-tool keys say how the API calls a tool, not
+    /// what the model calls, so the chat template's copy of a function tool,
+    /// alone or in a namespace, carries none of them.
+    #[test]
+    fn the_chat_templates_function_tools_leave_out_the_apis_tool_keys() {
+        let function = serde_json::json!({
+            "type": "function", "name": "lookup", "parameters": {},
+            "async": true, "defer_loading": true,
+            "output_schema": {"type": "object"}, "allowed_callers": ["direct"]
+        });
+        let request: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "input": "hi",
+            "tools": [
+                function.clone(),
+                {"type": "namespace", "name": "weather", "description": "Weather tools",
+                 "tools": [function]}
+            ]
+        }))
+        .unwrap();
+        let tools = extract_tools_from_response_tools(request.tools.as_deref());
+        assert_eq!(
+            tools
+                .iter()
+                .map(|t| t.function.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["lookup", "weather.lookup"]
+        );
+        for tool in &tools {
+            assert!(
+                tool.function.extra.is_empty(),
+                "{}: {:?}",
+                tool.function.name,
+                tool.function.extra
+            );
+        }
+    }
+
+    /// A tool only code may call (`allowed_callers` without `direct`) is
+    /// refused, whether a function or custom tool, alone or in a namespace,
+    /// and a tool the model may call directly is served.
+    #[test]
+    fn a_tool_without_a_direct_caller_is_refused() {
+        let request = |tools: Value| -> ResponsesRequest {
+            serde_json::from_value(json!({"model": "m", "input": "hi", "tools": tools})).unwrap()
+        };
+        let function = |callers: Value| json!({"type": "function", "name": "lookup", "parameters": {}, "allowed_callers": callers});
+        let custom =
+            |callers: Value| json!({"type": "custom", "name": "run", "allowed_callers": callers});
+        for (tools, at) in [
+            (json!([function(json!(["programmatic"]))]), "tools[0]"),
+            (json!([function(json!([]))]), "tools[0]"),
+            (
+                json!([{"type": "function", "name": "a", "parameters": {}}, custom(json!(["programmatic"]))]),
+                "tools[1]",
+            ),
+            (
+                json!([{"type": "namespace", "name": "weather", "description": "Weather tools",
+                        "tools": [function(json!(["direct"])), custom(json!(["programmatic"]))]}]),
+                "tools[0].tools[1]",
+            ),
+        ] {
+            let request = request(tools);
+            let response = refuse_tools_without_a_direct_caller(request.tools.as_deref())
+                .unwrap_or_else(|| panic!("{at} has no direct caller"));
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{at}");
+        }
+        for tools in [
+            json!([function(json!(["direct"]))]),
+            json!([function(json!(["direct", "programmatic"]))]),
+            json!([function(Value::Null), custom(json!(["direct"]))]),
+            json!([{"type": "function", "name": "a", "parameters": {}}, {"type": "custom", "name": "b"}]),
+        ] {
+            let request = request(tools.clone());
+            assert!(
+                refuse_tools_without_a_direct_caller(request.tools.as_deref()).is_none(),
+                "{tools}"
+            );
+        }
+        assert!(refuse_tools_without_a_direct_caller(None).is_none());
+    }
+
     #[test]
     fn namespace_function_identity_roundtrips_and_preserves_literal_names() {
         let mut request: ResponsesRequest = namespace_test_request();
@@ -1176,6 +1375,20 @@ mod tests {
             resolve_function_identity(request.tools.as_deref(), "weather.lookup"),
             ("weather.lookup".into(), None)
         );
+    }
+
+    #[test]
+    fn a_namespaced_name_is_read_at_the_dot() {
+        assert!(is_namespaced("weather.lookup", "weather", "lookup"));
+        for (name, namespace, member) in [
+            ("weatherx.lookup", "weather", "lookup"),
+            ("weather.lookups", "weather", "lookup"),
+            ("weather.lookup.now", "weather", "lookup"),
+            ("weather", "weather", ""),
+            ("lookup", "", "lookup"),
+        ] {
+            assert!(!is_namespaced(name, namespace, member), "{name}");
+        }
     }
 
     #[test]
@@ -1225,6 +1438,53 @@ mod tests {
     }
 
     #[test]
+    fn the_safety_net_allows_the_limits_generations_and_the_answer_on_the_last_result() {
+        assert!(!iteration_exceeds_safety_limit(
+            DEFAULT_MAX_ITERATIONS,
+            false
+        ));
+        assert!(!iteration_exceeds_safety_limit(
+            DEFAULT_MAX_ITERATIONS + 1,
+            false
+        ));
+        assert!(iteration_exceeds_safety_limit(
+            DEFAULT_MAX_ITERATIONS + 2,
+            false
+        ));
+        assert!(!iteration_exceeds_safety_limit(
+            DEFAULT_MAX_ITERATIONS + 2,
+            true
+        ));
+    }
+
+    #[test]
+    fn a_responses_usage_is_the_sum_of_its_model_calls() {
+        let counts = |usage: &ResponseUsage| {
+            (
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.total_tokens,
+                usage.input_tokens_details.cached_tokens,
+                usage.output_tokens_details.reasoning_tokens,
+            )
+        };
+        let mut total = None;
+        add_model_call_usage(&mut total, None);
+        assert!(total.is_none());
+        // One call: what a response served by a single call reports.
+        let first = Usage::from_counts(11, 5).with_cached_tokens(4);
+        add_model_call_usage(&mut total, Some(&first));
+        assert_eq!(
+            total.as_ref().map(counts),
+            Some(counts(&ResponseUsage::from(&first)))
+        );
+        let second = Usage::from_counts(23, 7).with_reasoning_tokens(3);
+        add_model_call_usage(&mut total, Some(&second));
+        add_model_call_usage(&mut total, None);
+        assert_eq!(total.as_ref().map(counts), Some((34, 12, 46, 4, 3)));
+    }
+
+    #[test]
     fn the_tool_call_limit_is_the_users_figure_under_the_safety_limit() {
         assert_eq!(tool_call_limit(None), DEFAULT_MAX_ITERATIONS);
         assert_eq!(tool_call_limit(Some(3)), 3);
@@ -1232,6 +1492,35 @@ mod tests {
         assert_eq!(
             tool_call_limit(Some(DEFAULT_MAX_ITERATIONS + 5)),
             DEFAULT_MAX_ITERATIONS
+        );
+        assert_eq!(tool_call_allowance(Some(3), 1), 2);
+        assert_eq!(tool_call_allowance(Some(3), 5), 0);
+        assert_eq!(tool_call_allowance(None, 4), DEFAULT_MAX_ITERATIONS - 4);
+    }
+
+    #[test]
+    fn a_batch_past_the_cap_keeps_its_permitted_prefix_and_names_the_cap() {
+        assert_eq!(tool_call_overflow(Some(3), 1, 2), None);
+        assert_eq!(tool_call_overflow(None, 0, DEFAULT_MAX_ITERATIONS), None);
+        assert_eq!(
+            tool_call_overflow(Some(3), 1, 4),
+            Some((McpToolCallLimit::User, 2))
+        );
+        assert_eq!(
+            tool_call_overflow(Some(1), 1, 1),
+            Some((McpToolCallLimit::User, 0))
+        );
+        assert_eq!(
+            tool_call_overflow(Some(DEFAULT_MAX_ITERATIONS), DEFAULT_MAX_ITERATIONS, 1),
+            Some((McpToolCallLimit::User, 0))
+        );
+        assert_eq!(
+            tool_call_overflow(None, DEFAULT_MAX_ITERATIONS - 1, 2),
+            Some((McpToolCallLimit::Safety, 1))
+        );
+        assert_eq!(
+            tool_call_overflow(Some(DEFAULT_MAX_ITERATIONS + 5), DEFAULT_MAX_ITERATIONS, 1),
+            Some((McpToolCallLimit::Safety, 0))
         );
     }
 }

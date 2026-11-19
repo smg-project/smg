@@ -122,6 +122,67 @@ fn chat_request(choices: u32, stream: bool) -> ChatCompletionRequest {
     serde_json::from_value(request).expect("chat request")
 }
 
+#[tokio::test]
+async fn harmony_chat_reports_the_dispatch_adapter_in_every_response_frame() {
+    let tokens = harmony_tokens(None, "Hello!");
+    let counters = Counters {
+        prompt: 10,
+        cached: 0,
+        spec_accepted: 0,
+        spec_drafted: 0,
+    };
+    for streaming in [false, true] {
+        let (stream, server) = scripted_stream(frames(&tokens, 1, counters), "0").await;
+        let execution = context::ExecutionResult::Single {
+            stream,
+            dispatch_start: std::time::Instant::now(),
+        };
+        let mut dispatch = dispatch();
+        dispatch.model.push_str(":adapter");
+        let mut request = chat_request(1, streaming);
+        request.lora_path = Some("adapter".to_string());
+        let request = Arc::new(request);
+        if streaming {
+            let source = utils::StreamSource::new(None, &dispatch, metrics_labels::ENDPOINT_CHAT);
+            let response = Arc::new(HarmonyStreamingProcessor::new())
+                .process_streaming_chat_response(
+                    execution,
+                    request,
+                    dispatch,
+                    Vec::new(),
+                    None,
+                    None,
+                    source,
+                )
+                .await;
+            let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            let events: Vec<Value> = std::str::from_utf8(&body)
+                .unwrap()
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .filter(|data| *data != "[DONE]")
+                .map(|data| serde_json::from_str(data).unwrap())
+                .collect();
+            assert!(!events.is_empty());
+            for event in events {
+                assert_eq!(event["model"], "harmony-test:adapter", "{event}");
+            }
+        } else {
+            let (response, _) = HarmonyResponseProcessor::new()
+                .process_non_streaming_chat_response(execution, request, dispatch, &[])
+                .await
+                .unwrap_or_else(|response| panic!("{}", response.status()));
+            assert_eq!(
+                serde_json::to_value(response).unwrap()["model"],
+                "harmony-test:adapter"
+            );
+        }
+        server.abort();
+    }
+}
+
 /// The events of a Harmony chat stream with `stream_options.include_usage`,
 /// `[DONE]` left out.
 async fn streamed_chat_events(
@@ -339,6 +400,7 @@ async fn streamed_responses_iteration(
             None,
             None,
             &[],
+            None,
         )
         .await;
         drop(tx);
@@ -516,4 +578,150 @@ async fn harmony_chat_settlement_carries_the_engines_counts_streamed_and_not() {
     let (whole, settlement) = non_streamed_chat(frames(&tokens, choices, counters), choices).await;
     assert_eq!(whole, streamed);
     assert_eq!(settlement, expected);
+}
+
+#[tokio::test]
+async fn spec_usage_regression_harmony_streamed_and_nonstreamed_formatting() {
+    let tokens = tokio::task::spawn_blocking(|| harmony_tokens(Some("I think."), "Hello!"))
+        .await
+        .expect("initialize Harmony outside the async runtime");
+    for (first, second, rejected) in [
+        ((2, 0), (1, 10), None),
+        ((0, 0), (0, 10), None),
+        ((0, 7), (0, 0), None),
+        ((0, 7), (0, 10), Some(17)),
+        ((4, 2), (1, 10), None),
+        ((0, 0), (1, 10), None),
+        ((2, 3), (1, 10), Some(10)),
+        ((2, 2), (1, 1), Some(0)),
+        ((0, 0), (0, 0), Some(0)),
+    ] {
+        let counters = |(a, d)| Counters {
+            prompt: 10,
+            cached: 4,
+            spec_accepted: a,
+            spec_drafted: d,
+        };
+        let mut data = choice_frames(0, &tokens, counters(first));
+        data.extend(choice_frames(1, &tokens, counters(second)));
+        let streamed = streamed_chat_usage(data.clone(), 2, None).await;
+        let whole = non_streamed_chat_usage(data, 2).await;
+        assert_eq!(streamed, whole);
+        let details = &streamed["completion_tokens_details"];
+        assert_eq!(details["accepted_prediction_tokens"], first.0 + second.0);
+        assert!(details["reasoning_tokens"].as_u64().unwrap() > 0);
+        match rejected {
+            Some(n) => assert_eq!(details["rejected_prediction_tokens"], n),
+            None => assert!(
+                details.get("rejected_prediction_tokens").is_none(),
+                "{streamed}"
+            ),
+        }
+    }
+}
+
+#[tokio::test]
+async fn spec_usage_regression_harmony_missing_choice_is_unknown() {
+    let tokens = tokio::task::spawn_blocking(|| harmony_tokens(None, "Hello!"))
+        .await
+        .expect("initialize Harmony outside the async runtime");
+    for chunk_only in [false, true] {
+        let mut data = choice_frames(
+            0,
+            &tokens,
+            Counters {
+                prompt: 10,
+                cached: 4,
+                spec_accepted: 0,
+                spec_drafted: 10,
+            },
+        );
+        if chunk_only {
+            let mut partial = choice_frames(
+                1,
+                &tokens,
+                Counters {
+                    prompt: 10,
+                    cached: 4,
+                    spec_accepted: 0,
+                    spec_drafted: 0,
+                },
+            );
+            partial.pop(); // The second choice never supplies its terminal counters.
+            data.extend(partial);
+        }
+        let usage = streamed_chat_usage(data, 2, None).await;
+        let details = &usage["completion_tokens_details"];
+        assert_eq!(details["accepted_prediction_tokens"], 0);
+        assert!(
+            details.get("rejected_prediction_tokens").is_none(),
+            "{usage}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn collected_harmony_missing_choice_keeps_rejections_unknown() {
+    let counters = Counters {
+        prompt: 10,
+        cached: 4,
+        spec_accepted: 2,
+        spec_drafted: 2,
+    };
+    let tokens = harmony_tokens(None, "ok");
+    let (usage, settlement) = non_streamed_chat(choice_frames(0, &tokens, counters), 2).await;
+    assert_eq!(settlement.actual_input_tokens, 10);
+    assert_eq!(settlement.cached_input_tokens, 4);
+    assert_eq!(
+        usage["completion_tokens_details"]["accepted_prediction_tokens"],
+        2
+    );
+    assert!(
+        usage["completion_tokens_details"]
+            .get("rejected_prediction_tokens")
+            .is_none(),
+        "{usage}"
+    );
+}
+
+#[tokio::test]
+async fn collected_harmony_membership_and_proposal_controls() {
+    let tokens = harmony_tokens(None, "ok");
+    for (n, entries, rejected) in [
+        (2, &[(0, 2, 2), (0, 2, 2)][..], None),
+        (2, &[(1, 2, 2), (0, 2, 2)][..], Some(0)),
+        (2, &[(0, 0, 0), (1, 0, 0)][..], Some(0)),
+        (2, &[(0, 0, 0), (1, 0, 10)][..], None),
+        (1, &[(0, 0, 5)][..], Some(5)),
+        (0, &[(0, 2, 2)][..], Some(0)),
+    ] {
+        let frames = entries
+            .iter()
+            .flat_map(|&(index, accepted, drafted)| {
+                choice_frames(
+                    index,
+                    &tokens,
+                    Counters {
+                        prompt: 10,
+                        cached: 4,
+                        spec_accepted: accepted,
+                        spec_drafted: drafted,
+                    },
+                )
+            })
+            .collect();
+        let usage = non_streamed_chat_usage(frames, n).await;
+        assert_eq!(usage["prompt_tokens"], 10);
+        assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 4);
+        let details = &usage["completion_tokens_details"];
+        assert_eq!(
+            details["accepted_prediction_tokens"],
+            entries.iter().map(|e| e.1).sum::<u32>()
+        );
+        assert_eq!(
+            details.get("rejected_prediction_tokens"),
+            rejected.map(|v| json!(v)).as_ref(),
+            "n={n}, {entries:?}: {usage}"
+        );
+    }
 }

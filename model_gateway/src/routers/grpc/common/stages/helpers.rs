@@ -9,6 +9,7 @@ use std::{
 use axum::response::Response;
 use engine_zmq_adapter::stops::encode_single_token_stops;
 use llm_tokenizer::traits::Tokenizer;
+use openai_protocol::common::ResponseFormat;
 use rand::RngExt;
 use smg_grpc_client::{
     mlx_proto,
@@ -24,7 +25,7 @@ use crate::{
     routers::{
         error,
         grpc::{
-            backend_client::BackendClient,
+            backend_client::{connected_backend_client, BackendClient},
             context::{
                 stage_output, AttemptStamp, ClientSelection, EncodeOutputs, ExecutionPlan,
                 RequestContext, RequestType, WorkerSelection,
@@ -39,7 +40,7 @@ use crate::{
         },
     },
     worker::{
-        sampling_defaults::SamplingDefaults, Worker, DEFAULT_BOOTSTRAP_PORT,
+        identity::sampling_defaults::SamplingDefaults, Worker, DEFAULT_BOOTSTRAP_PORT,
         DEFAULT_SAMPLING_PARAMS_LABEL,
     },
 };
@@ -165,8 +166,9 @@ pub(crate) enum IdStamp {
     /// Bare client `rid` outside PD: stable across attempts.
     Exact,
     /// `{base}-{uuid}` minted fresh per attempt (rid under PD,
-    /// middleware-derived ids).
-    Suffixed { base: String },
+    /// middleware-derived ids). The base is the first `base_len` bytes of
+    /// the id each attempt leaves on the plan, so the stamp keeps no copy.
+    Suffixed { base_len: usize },
     /// `{prefix}{uuid}` minted fresh per attempt.
     Minted { prefix: &'static str },
     /// Batched completion fan-out: shared id plus per-sub engine ids.
@@ -197,25 +199,62 @@ pub(crate) fn resolve_request_id_stamp(
     if let Some(rid) = request_type.rid() {
         return if disaggregated {
             let stamp = IdStamp::Suffixed {
-                base: rid.to_string(),
+                base_len: rid.len(),
             };
-            (format!("{rid}-{}", request_stamp_uuid(tenant_meta)), stamp)
+            (suffixed_id(rid, request_stamp_uuid(tenant_meta)), stamp)
         } else {
             (rid.to_string(), IdStamp::Exact)
         };
     }
     match middleware_request_id(tenant_meta) {
         Some(request_id) => (
-            format!("{request_id}-{}", request_stamp_uuid(tenant_meta)),
+            suffixed_id(request_id, request_stamp_uuid(tenant_meta)),
             IdStamp::Suffixed {
-                base: request_id.to_string(),
+                base_len: request_id.len(),
             },
         ),
         None => (
-            format!("{prefix}{}", request_stamp_uuid(tenant_meta)),
+            minted_id(prefix, request_stamp_uuid(tenant_meta)),
             IdStamp::Minted { prefix },
         ),
     }
+}
+
+/// `{base}-{uuid}`, written into one `String` of its exact size: a `format!`
+/// of these pieces starts its buffer empty and grows it twice on the way
+/// (three allocations per id on every gRPC request, measured on the mock
+/// bed), where the length is known before the first byte is written.
+fn suffixed_id(base: &str, uuid: uuid::Uuid) -> String {
+    let mut id = String::with_capacity(base.len() + 1 + uuid::fmt::Hyphenated::LENGTH);
+    id.push_str(base);
+    id.push('-');
+    push_hyphenated(&mut id, uuid);
+    id
+}
+
+/// The base of a `{base}-{uuid}` id whose base is `base_len` bytes long, or
+/// `None` for any other text (see [`IdStamp::Suffixed`]).
+fn suffixed_base(id: &str, base_len: usize) -> Option<&str> {
+    let (base, suffix) = id.split_at_checked(base_len)?;
+    let is_uuid_suffix = suffix.len() == 1 + uuid::fmt::Hyphenated::LENGTH
+        && suffix
+            .strip_prefix('-')
+            .is_some_and(|uuid| uuid::Uuid::try_parse(uuid).is_ok());
+    is_uuid_suffix.then_some(base)
+}
+
+/// `{prefix}{uuid}`, written into one `String` of its exact size (see
+/// `suffixed_id`).
+fn minted_id(prefix: &str, uuid: uuid::Uuid) -> String {
+    let mut id = String::with_capacity(prefix.len() + uuid::fmt::Hyphenated::LENGTH);
+    id.push_str(prefix);
+    push_hyphenated(&mut id, uuid);
+    id
+}
+
+fn push_hyphenated(id: &mut String, uuid: uuid::Uuid) {
+    let mut text = [0u8; uuid::fmt::Hyphenated::LENGTH];
+    id.push_str(uuid.hyphenated().encode_lower(&mut text));
 }
 
 /// Shared id + stamp for the batched completion fan-out. The shared id
@@ -232,11 +271,7 @@ pub(crate) fn resolve_batch_id_stamp(
         Some(rid) => (rid.to_string(), Some(rid.to_string()), disaggregated),
         None => match middleware_request_id(tenant_meta) {
             Some(request_id) => (request_id.to_string(), Some(request_id.to_string()), true),
-            None => (
-                format!("{prefix}{}", uuid::Uuid::now_v7()),
-                None,
-                disaggregated,
-            ),
+            None => (minted_id(prefix, uuid::Uuid::now_v7()), None, disaggregated),
         },
     };
     (
@@ -274,6 +309,16 @@ pub(crate) fn wire_prompt_text(rendered_prompt: String, carries_media: bool) -> 
     }
 }
 
+/// The error of a stamp over a plan it was not built for: a build-stage
+/// wiring bug, named in the log.
+fn plan_mismatch(what: &'static str) -> Response {
+    error!(function = "IdStamp::restamp", "{what}");
+    error::internal_error(
+        "id_stamp_plan_mismatch",
+        "Id stamp does not match the plan shape",
+    )
+}
+
 impl IdStamp {
     /// Re-mint the retained plan's engine id(s) for a retry attempt. A plan
     /// shape that doesn't match the stamp is a build-stage wiring bug: fail
@@ -281,37 +326,49 @@ impl IdStamp {
     pub(crate) fn restamp(&self, plan: &mut ExecutionPlan) -> Result<(), Response> {
         match self {
             Self::Exact => Ok(()),
-            Self::Suffixed { base } => {
-                plan.set_request_id(format!("{base}-{}", uuid::Uuid::now_v7()))
-            }
-            Self::Minted { prefix } => {
-                plan.set_request_id(format!("{prefix}{}", uuid::Uuid::now_v7()))
-            }
+            Self::Suffixed { base_len } => match suffixed_base(plan.request_id(), *base_len) {
+                Some(base) => {
+                    let id = suffixed_id(base, uuid::Uuid::now_v7());
+                    plan.set_request_id(id)
+                }
+                None => Err(plan_mismatch(
+                    "Suffixed id stamp on a plan whose id is not its base and a uuid",
+                )),
+            },
+            Self::Minted { prefix } => plan.set_request_id(minted_id(prefix, uuid::Uuid::now_v7())),
             Self::Batch(batch) => {
-                let ExecutionPlan::Batch {
-                    shared_request_id,
-                    requests,
-                    ..
-                } = plan
-                else {
-                    error!(
-                        function = "IdStamp::restamp",
-                        "Batch id stamp on a non-batch plan"
-                    );
-                    return Err(error::internal_error(
-                        "id_stamp_plan_mismatch",
-                        "Id stamp does not match the plan shape",
-                    ));
-                };
                 let shared = batch
                     .stable_shared
                     .clone()
-                    .unwrap_or_else(|| format!("{}{}", batch.prefix, uuid::Uuid::now_v7()));
-                for (i, request) in requests.iter_mut().enumerate() {
-                    request.set_request_id(batch_sub_id(&shared, i, batch.unique_subs));
+                    .unwrap_or_else(|| minted_id(batch.prefix, uuid::Uuid::now_v7()));
+                match plan {
+                    ExecutionPlan::Batch {
+                        shared_request_id,
+                        requests,
+                        ..
+                    } => {
+                        for (i, request) in requests.iter_mut().enumerate() {
+                            request.set_request_id(batch_sub_id(&shared, i, batch.unique_subs));
+                        }
+                        *shared_request_id = shared;
+                        Ok(())
+                    }
+                    ExecutionPlan::EmbedBatch {
+                        shared_request_id,
+                        requests,
+                    } => {
+                        for (i, request) in requests.iter_mut().enumerate() {
+                            request.set_request_id(batch_sub_id(&shared, i, batch.unique_subs));
+                        }
+                        *shared_request_id = shared;
+                        Ok(())
+                    }
+                    ExecutionPlan::Single(_)
+                    | ExecutionPlan::PrefillDecode(_)
+                    | ExecutionPlan::EncodePrefillDecode { .. } => {
+                        Err(plan_mismatch("Batch id stamp on a non-batch plan"))
+                    }
                 }
-                *shared_request_id = shared;
-                Ok(())
             }
         }
     }
@@ -469,18 +526,30 @@ impl ToolConstraintStamp {
     /// Capture the stamp for a built request that carries the forced call's
     /// structural tag. Nothing is captured for a JSON-schema constraint (no
     /// shape to follow) or when the backend's builder let the request's
-    /// `response_format` outrank the tool constraint (the request then
-    /// carries a schema, grammar or regex, never a structural tag).
-    /// `first_token` says the table built the tag for an engine that starts
-    /// the grammar at the first token.
+    /// `response_format` outrank the tool constraint: the request then
+    /// carries the body's own constraint, a schema, a grammar, a regex, or
+    /// the body's own structural tag, told from the forced call's by
+    /// `own_format`, the `response_format` as the builder read it (`None`
+    /// where the constraint set it aside). `first_token` says the table
+    /// built the tag for an engine that starts the grammar at the first
+    /// token.
     pub(crate) fn capture(
         unshaped: Option<(String, String)>,
         parser: Option<&str>,
         first_token: bool,
         request: &ProtoGenerateRequest,
+        own_format: Option<&ResponseFormat>,
     ) -> Option<Self> {
         let constraint = unshaped.filter(|(kind, _)| kind == "structural_tag")?;
-        request.structural_tag()?;
+        let carried = request.structural_tag()?;
+        // The body's own tag rides as its builder wrote it
+        // (`response_format_constraint`): a request that carries it keeps it
+        // on every retry.
+        if let Some(own @ ResponseFormat::StructuralTag { .. }) = own_format {
+            if serde_json::to_string(own).is_ok_and(|tag| tag == carried) {
+                return None;
+            }
+        }
         Some(Self::Registry {
             constraint,
             parser: parser.map(str::to_string),
@@ -823,7 +892,7 @@ pub(crate) fn resolve_string_stops(
         ProtoGenerateRequest::Sglang(req) => {
             if let Some(params) = req.sampling_params.as_mut() {
                 let stops = std::mem::take(&mut params.stop);
-                encode_single_token_stops(stops.clone(), &mut params.stop_token_ids, tokenizer);
+                encode_single_token_stops(&stops, &mut params.stop_token_ids, tokenizer);
                 return stops;
             }
         }
@@ -833,7 +902,7 @@ pub(crate) fn resolve_string_stops(
             // not part of shared stop resolution.
             if let Some(params) = req.sampling_params.as_mut() {
                 let stops = std::mem::take(&mut params.stop);
-                encode_single_token_stops(stops.clone(), &mut params.stop_token_ids, tokenizer);
+                encode_single_token_stops(&stops, &mut params.stop_token_ids, tokenizer);
                 return stops;
             }
         }
@@ -846,7 +915,7 @@ pub(crate) fn resolve_string_stops(
             // stops at EOS itself, so its translation carries no frontend ids.
             if let Some(params) = req.sampling_params.as_mut() {
                 let stops = std::mem::take(&mut params.stop);
-                encode_single_token_stops(stops.clone(), &mut params.stop_token_ids, tokenizer);
+                encode_single_token_stops(&stops, &mut params.stop_token_ids, tokenizer);
                 return stops;
             }
         }
@@ -870,9 +939,10 @@ pub(crate) fn maybe_inject_pd_metadata(
         ..
     } = workers
     {
-        let rendezvous = PdProtocol::for_runtime(*runtime_type).map(|p| p.rendezvous);
-        if rendezvous == Some(PdRendezvous::SglangBootstrap) {
-            inject_sglang_bootstrap_metadata(request, prefill);
+        let protocol = PdProtocol::for_runtime(*runtime_type)
+            .filter(|protocol| protocol.rendezvous == PdRendezvous::SglangBootstrap);
+        if let Some(protocol) = protocol {
+            inject_sglang_bootstrap_metadata(request, prefill, protocol.dp_placement);
         }
     }
 }
@@ -881,11 +951,13 @@ pub(crate) fn maybe_inject_pd_metadata(
 fn inject_sglang_bootstrap_metadata(
     request: &mut ProtoGenerateRequest,
     prefill_worker: &Arc<dyn Worker>,
+    dp_placement: DpPlacement,
 ) {
     let metadata = prefill_worker.metadata();
     let hostname = metadata.bootstrap_host();
     let bootstrap_port = metadata.bootstrap_port().unwrap_or(DEFAULT_BOOTSTRAP_PORT);
-    let room_id = rand::rng().random_range(0..i32::MAX);
+    // This wire's room is an `int32`: minted under that bound, the cast is exact.
+    let room_id = mint_room(dp_placement, prefill_worker, i64::from(i32::MAX)) as i32;
 
     let disagg_params = DisaggregatedParams {
         bootstrap_host: hostname.to_string(),
@@ -1032,7 +1104,7 @@ pub(crate) fn finish_generate_request(
             ));
         }
         let refs =
-            assemble_media_refs(plan).map_err(|e| error::bad_request(e.code(), e.to_string()))?;
+            assemble_media_refs(&plan).map_err(|e| error::bad_request(e.code(), e.to_string()))?;
         proto_request
             .set_media_refs(refs)
             .map_err(|e| error::bad_request("multimodal_not_supported", e))?;
@@ -1069,7 +1141,7 @@ fn inject_kv_bootstrap_room(
     dp_placement: DpPlacement,
 ) {
     let metadata = prefill_worker.metadata();
-    let backend = prefill_worker.backend_client_if_initialized();
+    let backend = connected_backend_client(prefill_worker.as_ref());
     let (hostname, bootstrap_port) = bootstrap_rendezvous(
         metadata.bootstrap_host(),
         metadata.bootstrap_port(),
@@ -1087,18 +1159,7 @@ fn inject_kv_bootstrap_room(
     // round_robin the decode side follows the same residue and deliberately
     // inherits the prefill placement (decode prefix reuse shrinks the KV
     // transfer).
-    let room_id = match (
-        dp_placement,
-        prefill_worker.dp_rank(),
-        prefill_worker.dp_size(),
-    ) {
-        (DpPlacement::RoomResidue, Some(rank), Some(dp)) if dp > 1 && rank < dp => {
-            let dp = dp as i64;
-            let base = rand::rng().random_range(0..i64::MAX - dp);
-            base - (base % dp) + rank as i64
-        }
-        _ => rand::rng().random_range(0..i64::MAX),
-    };
+    let room_id = mint_room(dp_placement, prefill_worker, i64::MAX);
 
     request.set_kv_bootstrap_info(hostname.to_string(), bootstrap_port as i32, room_id);
 
@@ -1106,6 +1167,31 @@ fn inject_kv_bootstrap_room(
         "Injected PD rendezvous: host={}, port={}, room={}",
         hostname, bootstrap_port, room_id
     );
+}
+
+/// A fresh rendezvous room in `0..bound`. Under `DpPlacement::RoomResidue`
+/// a dp-aware prefill worker's room is congruent to its rank, the residue
+/// the engine places by (`room % dp_size`): the room's low bits carry that
+/// structure, so do not shard on them elsewhere. A `dp_size` the room
+/// cannot carry (at or above `bound`) gets a free room, like a worker of
+/// one rank.
+fn mint_room(dp_placement: DpPlacement, prefill_worker: &Arc<dyn Worker>, bound: i64) -> i64 {
+    match (
+        dp_placement,
+        prefill_worker.dp_rank(),
+        prefill_worker.dp_size(),
+    ) {
+        (DpPlacement::RoomResidue, Some(rank), Some(dp))
+            if dp > 1 && rank < dp && i64::try_from(dp).is_ok_and(|dp| dp < bound) =>
+        {
+            // The guard holds `dp` below `bound`: both casts are exact, and
+            // the draw's range, `0..bound - dp`, is not empty.
+            let dp = dp as i64;
+            let base = rand::rng().random_range(0..bound - dp);
+            base - (base % dp) + rank as i64
+        }
+        _ => rand::rng().random_range(0..bound),
+    }
 }
 
 #[cfg(test)]

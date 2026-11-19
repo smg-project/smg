@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use axum::{body::Body, http::StatusCode};
 use http_body_util::BodyExt;
-use openai_protocol::chat::ChatCompletionRequest;
+use openai_protocol::{chat::ChatCompletionRequest, profile::ProviderProfile};
 use tokio::{sync::oneshot, time::timeout};
 
 use super::{

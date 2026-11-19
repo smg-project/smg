@@ -4,12 +4,15 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use serde_with::skip_serializing_none;
 use validator::{Validate, ValidationError};
 
 use super::{
-    common::{default_true, deserialize_null_as_false, invalid, Function, GenerationRequest},
+    common::{
+        default_true, deserialize_null_as_false, empty_tool_name, invalid, Function,
+        GenerationRequest,
+    },
     sampling_params::validate_top_p_value,
     validated::Normalizable,
 };
@@ -35,6 +38,7 @@ pub struct InteractionsRequest {
     pub input: InteractionsInput,
 
     /// System instruction for the model
+    #[serde(alias = "systemInstruction")]
     pub system_instruction: Option<String>,
 
     /// Available tools
@@ -42,9 +46,11 @@ pub struct InteractionsRequest {
     pub tools: Option<Vec<InteractionsTool>>,
 
     /// Response format for structured outputs
+    #[serde(alias = "responseFormat")]
     pub response_format: Option<Value>,
 
     /// MIME type for the response (required if response_format is set)
+    #[serde(alias = "responseMimeType")]
     pub response_mime_type: Option<String>,
 
     /// Whether to stream the response
@@ -60,17 +66,30 @@ pub struct InteractionsRequest {
     pub background: bool,
 
     /// Generation configuration
+    #[serde(alias = "generationConfig")]
     #[validate(nested)]
     pub generation_config: Option<GenerationConfig>,
 
     /// Agent configuration (only applicable when agent is specified)
+    #[serde(alias = "agentConfig")]
     pub agent_config: Option<AgentConfig>,
 
     /// Response modalities (text, image, audio)
+    #[serde(alias = "responseModalities")]
     pub response_modalities: Option<Vec<ResponseModality>>,
 
     /// Link to prior interaction for stateful conversations
+    #[serde(alias = "previousInteractionId")]
     pub previous_interaction_id: Option<String>,
+
+    /// The request's other fields (`continuation_token`, `safety_settings`,
+    /// `service_tier`, `webhook_config`, `environment`, `labels`,
+    /// `cached_content`, and any the API adds), forwarded to the upstream as
+    /// written, as the Messages request's `other` is. A modeled field takes its
+    /// camelCase spelling as an alias, so that spelling fills the typed field,
+    /// where the gateway's checks read it, and never rides here.
+    #[serde(flatten)]
+    pub other: Map<String, Value>,
 }
 
 impl Default for InteractionsRequest {
@@ -90,6 +109,7 @@ impl Default for InteractionsRequest {
             stream: false,
             background: false,
             store: true,
+            other: Map::new(),
         }
     }
 }
@@ -108,40 +128,48 @@ impl GenerationRequest for InteractionsRequest {
     }
 
     fn extract_text_for_routing(&self) -> String {
-        fn extract_from_content(content: &Content) -> Option<String> {
+        fn text_of(content: &Content) -> Option<&str> {
             match content {
-                Content::Text { text, .. } => text.clone(),
+                Content::Text { text, .. } => text.as_deref(),
                 _ => None,
             }
         }
 
-        fn extract_from_turn(turn: &Turn) -> String {
-            match &turn.content {
-                Some(TurnContent::Text(text)) => text.clone(),
-                Some(TurnContent::Contents(contents)) => contents
-                    .iter()
-                    .filter_map(extract_from_content)
-                    .collect::<Vec<String>>()
-                    .join(" "),
-                None => String::new(),
+        /// `texts` into `buffer`, a space between each: the shape `join(" ")`
+        /// gives, empty pieces included.
+        fn push_joined<'a>(buffer: &mut String, texts: impl Iterator<Item = &'a str>) {
+            for (index, text) in texts.enumerate() {
+                if index > 0 {
+                    buffer.push(' ');
+                }
+                buffer.push_str(text);
             }
         }
 
         match &self.input {
             InteractionsInput::Text(text) => text.clone(),
-            InteractionsInput::Content(content) => {
-                extract_from_content(content).unwrap_or_default()
+            InteractionsInput::Content(content) => text_of(content).unwrap_or_default().to_owned(),
+            InteractionsInput::Contents(contents) => {
+                let mut buffer = String::new();
+                push_joined(&mut buffer, contents.iter().filter_map(text_of));
+                buffer
             }
-            InteractionsInput::Contents(contents) => contents
-                .iter()
-                .filter_map(extract_from_content)
-                .collect::<Vec<String>>()
-                .join(" "),
-            InteractionsInput::Turns(turns) => turns
-                .iter()
-                .map(extract_from_turn)
-                .collect::<Vec<String>>()
-                .join(" "),
+            InteractionsInput::Turns(turns) => {
+                let mut buffer = String::new();
+                for (index, turn) in turns.iter().enumerate() {
+                    if index > 0 {
+                        buffer.push(' ');
+                    }
+                    match &turn.content {
+                        Some(TurnContent::Text(text)) => buffer.push_str(text),
+                        Some(TurnContent::Contents(contents)) => {
+                            push_joined(&mut buffer, contents.iter().filter_map(text_of));
+                        }
+                        None => {}
+                    }
+                }
+                buffer
+            }
         }
     }
 }
@@ -458,7 +486,10 @@ pub enum InteractionsTool {
     /// Function tool with function declaration
     Function(Function),
     /// Google Search built-in tool
-    GoogleSearch {},
+    GoogleSearch {
+        /// The kinds of search to run (`web_search`, `image_search`, ...)
+        search_types: Option<Vec<String>>,
+    },
     /// Code Execution built-in tool
     CodeExecution {},
     /// URL Context built-in tool
@@ -468,7 +499,8 @@ pub enum InteractionsTool {
         name: Option<String>,
         url: Option<String>,
         headers: Option<HashMap<String, String>>,
-        allowed_tools: Option<AllowedTools>,
+        /// The server's tools the model may call, a list of configurations
+        allowed_tools: Option<Vec<AllowedTools>>,
     },
     /// File Search built-in tool
     FileSearch {
@@ -478,6 +510,29 @@ pub enum InteractionsTool {
         top_k: Option<u32>,
         /// Metadata filter for search
         metadata_filter: Option<String>,
+    },
+    /// Computer Use built-in tool. The open sets of values (the
+    /// environment, the safety policies) are kept as strings.
+    ComputerUse {
+        environment: Option<String>,
+        excluded_predefined_functions: Option<Vec<String>>,
+        disabled_safety_policies: Option<Vec<String>>,
+        enable_prompt_injection_detection: Option<bool>,
+    },
+    /// Google Maps built-in tool
+    GoogleMaps {
+        enable_widget: Option<bool>,
+        latitude: Option<f64>,
+        longitude: Option<f64>,
+    },
+    /// Retrieval built-in tool. Each source's configuration is kept as
+    /// written, as the gateway reads none of them.
+    Retrieval {
+        retrieval_types: Option<Vec<String>>,
+        vertex_ai_search_config: Option<Value>,
+        rag_store_config: Option<Value>,
+        exa_ai_search_config: Option<Value>,
+        parallel_ai_search_config: Option<Value>,
     },
 }
 
@@ -491,44 +546,61 @@ pub struct AllowedTools {
     pub tools: Option<Vec<String>>,
 }
 
+/// A tool choice mode. The SDK keeps the set open, so a mode this build does
+/// not name is kept as written (`Other`), as the tools' other open sets are.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ToolChoiceType {
     Auto,
     Any,
     None,
     Validated,
+    /// A mode this build does not name, kept as the client wrote it
+    #[serde(untagged)]
+    Other(String),
 }
 
 // ============================================================================
 // Generation Config (Gemini-specific)
 // ============================================================================
 
+/// A field with an underscore also reads its camelCase spelling, which the
+/// public API accepts too, as the request's top-level fields do. So that key
+/// fills the typed field, is checked there and goes upstream in snake_case.
 #[skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 pub struct GenerationConfig {
     #[validate(range(min = 0.0, max = 2.0))]
     pub temperature: Option<f32>,
 
+    #[serde(alias = "topP")]
     #[validate(custom(function = "validate_top_p_value"))]
     pub top_p: Option<f32>,
 
     pub seed: Option<i64>,
 
+    #[serde(alias = "stopSequences")]
     #[validate(custom(function = "validate_stop_sequences"))]
     pub stop_sequences: Option<Vec<String>>,
 
+    #[serde(alias = "toolChoice")]
     pub tool_choice: Option<ToolChoice>,
 
+    #[serde(alias = "thinkingLevel")]
     pub thinking_level: Option<ThinkingLevel>,
 
+    #[serde(alias = "thinkingSummaries")]
     pub thinking_summaries: Option<ThinkingSummaries>,
 
+    #[serde(alias = "maxOutputTokens")]
     #[validate(range(min = 1))]
     pub max_output_tokens: Option<u32>,
 
+    #[serde(alias = "speechConfig")]
     pub speech_config: Option<Vec<SpeechConfig>>,
 
+    #[serde(alias = "imageConfig")]
     pub image_config: Option<ImageConfig>,
 }
 
@@ -559,6 +631,7 @@ pub enum ToolChoice {
 #[skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct ToolChoiceConfig {
+    #[serde(alias = "allowedTools")]
     pub allowed_tools: Option<AllowedTools>,
 }
 
@@ -573,7 +646,9 @@ pub struct SpeechConfig {
 #[skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ImageConfig {
+    #[serde(alias = "aspectRatio")]
     pub aspect_ratio: Option<AspectRatio>,
+    #[serde(alias = "imageSize")]
     pub image_size: Option<ImageSize>,
 }
 
@@ -622,7 +697,7 @@ pub enum AgentConfig {
     #[serde(rename = "deep-research")]
     DeepResearch {
         /// Whether to include thought summaries ("auto" or "none")
-        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(alias = "thinkingSummaries", skip_serializing_if = "Option::is_none")]
         thinking_summaries: Option<ThinkingSummaries>,
     },
 }
@@ -1127,6 +1202,12 @@ fn validate_tools(tools: &[InteractionsTool]) -> Result<(), ValidationError> {
     {
         return Err(ValidationError::new("file_search_tool_not_supported"));
     }
+    // A function has a name
+    for (index, tool) in tools.iter().enumerate() {
+        if matches!(tool, InteractionsTool::Function(function) if function.name.is_empty()) {
+            return Err(empty_tool_name(&format!("tools[{index}].name")));
+        }
+    }
     Ok(())
 }
 
@@ -1236,12 +1317,227 @@ fn validate_stop_sequences(seqs: &[String]) -> Result<(), ValidationError> {
 mod tests {
     use super::*;
 
+    /// The tools the public API declares beside the ones the gateway knew
+    /// read, validate and are written back as sent: computer use, Google
+    /// Maps, retrieval, an MCP server's list of allowed tools, and Google
+    /// Search's search types.
+    #[test]
+    fn a_request_declaring_each_public_tool_writes_it_back_as_sent() {
+        let tools = serde_json::json!([
+            {
+                "type": "computer_use",
+                "environment": "browser",
+                "excluded_predefined_functions": ["drag_and_drop"],
+                "disabled_safety_policies": ["financial_transactions"],
+                "enable_prompt_injection_detection": true
+            },
+            {"type": "google_maps", "enable_widget": true, "latitude": 37.7749, "longitude": -122.4194},
+            {
+                "type": "retrieval",
+                "retrieval_types": ["vertex_ai_search"],
+                "vertex_ai_search_config": {"datastores": ["projects/p/locations/global/dataStores/d"]}
+            },
+            {
+                "type": "mcp_server",
+                "name": "weather",
+                "url": "https://mcp.example.com/mcp",
+                "allowed_tools": [{"mode": "validated", "tools": ["get_forecast"]}]
+            },
+            {"type": "google_search", "search_types": ["web_search", "image_search"]}
+        ]);
+        let request: InteractionsRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "input": "Find a cafe near the office.", "store": false, "tools": tools
+        }))
+        .unwrap();
+        assert!(request.validate().is_ok(), "{:?}", request.validate());
+        let written = crate::common::to_value_exact(&request).unwrap();
+        assert_eq!(written["tools"], tools);
+
+        let open_mode: InteractionsRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "input": "Find a cafe near the office.",
+            "store": false,
+            "tools": [{
+                "type": "mcp_server",
+                "name": "maps",
+                "allowed_tools": [{"mode": "a_mode_of_no_api", "tools": ["find_place"]}]
+            }],
+            "generation_config": {"tool_choice": "a_mode_of_no_api"}
+        }))
+        .unwrap();
+        let written = crate::common::to_value_exact(&open_mode).unwrap();
+        assert_eq!(
+            written["tools"][0]["allowed_tools"][0]["mode"],
+            "a_mode_of_no_api"
+        );
+        assert_eq!(
+            written["generation_config"]["tool_choice"],
+            "a_mode_of_no_api"
+        );
+    }
+
+    /// A modeled field's camelCase spelling fills the typed field, where the
+    /// gateway's checks read it, and leaves `other` empty; it is written back
+    /// for the upstream in snake_case. A body with both spellings of one field
+    /// is refused.
+    #[test]
+    fn a_modeled_fields_camel_case_spelling_fills_the_typed_field() {
+        let request: InteractionsRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "input": "hi", "store": false,
+            "systemInstruction": "be brief",
+            "responseFormat": {"type": "object"},
+            "responseMimeType": "application/json",
+            "generationConfig": {"temperature": 0.5},
+            "responseModalities": ["text"],
+            "previousInteractionId": "int_1"
+        }))
+        .unwrap();
+        assert!(request.other.is_empty(), "{:?}", request.other);
+        assert_eq!(request.system_instruction.as_deref(), Some("be brief"));
+        assert_eq!(
+            request.response_mime_type.as_deref(),
+            Some("application/json")
+        );
+        assert!(request.response_format.is_some());
+        assert!(request.generation_config.is_some());
+        assert!(request.response_modalities.is_some());
+        assert_eq!(request.previous_interaction_id.as_deref(), Some("int_1"));
+        let written = crate::common::to_value_exact(&request).unwrap();
+        assert_eq!(written["previous_interaction_id"], "int_1");
+        assert!(written.get("previousInteractionId").is_none(), "{written}");
+
+        let agent: InteractionsRequest = serde_json::from_value(serde_json::json!({
+            "agent": "deep-research", "input": "hi",
+            "agentConfig": {"type": "deep-research"}
+        }))
+        .unwrap();
+        assert!(agent.agent_config.is_some() && agent.other.is_empty());
+
+        let both = serde_json::from_value::<InteractionsRequest>(serde_json::json!({
+            "model": "m", "input": "hi",
+            "previous_interaction_id": "int_1", "previousInteractionId": "int_2"
+        }));
+        let error = both.expect_err("both spellings of one field").to_string();
+        assert!(error.contains("duplicate field"), "{error}");
+    }
+
+    /// A generation or agent config key's camelCase spelling fills its typed
+    /// field, as a top-level key's does, so it is checked there and written
+    /// back for the upstream in snake_case rather than dropped.
+    #[test]
+    fn a_config_keys_camel_case_spelling_fills_the_typed_field() {
+        let request: InteractionsRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "input": "hi",
+            "generationConfig": {
+                "topP": 0.5,
+                "stopSequences": ["END"],
+                "toolChoice": {"allowedTools": {"mode": "validated", "tools": ["f"]}},
+                "thinkingLevel": "low",
+                "thinkingSummaries": "auto",
+                "maxOutputTokens": 1,
+                "speechConfig": [{"voice": "Kore"}],
+                "imageConfig": {"aspectRatio": "16:9", "imageSize": "2K"}
+            }
+        }))
+        .unwrap();
+        let written = crate::common::to_value_exact(&request).unwrap();
+        assert_eq!(
+            written["generation_config"],
+            serde_json::json!({
+                "top_p": 0.5,
+                "stop_sequences": ["END"],
+                "tool_choice": {"allowed_tools": {"mode": "validated", "tools": ["f"]}},
+                "thinking_level": "low",
+                "thinking_summaries": "auto",
+                "max_output_tokens": 1,
+                "speech_config": [{"voice": "Kore"}],
+                "image_config": {"aspect_ratio": "16:9", "image_size": "2K"}
+            })
+        );
+
+        let agent: InteractionsRequest = serde_json::from_value(serde_json::json!({
+            "agent": "deep-research", "input": "hi",
+            "agentConfig": {"type": "deep-research", "thinkingSummaries": "auto"}
+        }))
+        .unwrap();
+        let written = crate::common::to_value_exact(&agent).unwrap();
+        assert_eq!(
+            written["agent_config"],
+            serde_json::json!({"type": "deep-research", "thinking_summaries": "auto"})
+        );
+
+        let zero: InteractionsRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "input": "hi",
+            "generationConfig": {"maxOutputTokens": 0}
+        }))
+        .unwrap();
+        let error = zero
+            .validate()
+            .expect_err("a zero token budget")
+            .to_string();
+        assert!(error.contains("max_output_tokens"), "{error}");
+    }
+
+    /// The request's fields the gateway does not model are written back for
+    /// the upstream as the client sent them: the continuation token of a
+    /// `store: false` client's next hop, the safety settings, the service
+    /// tier and the rest.
+    #[test]
+    fn a_request_keeps_the_fields_the_gateway_does_not_model() {
+        let fields = serde_json::json!({
+            "continuation_token": "tok_1",
+            "safety_settings": [{"type": "harassment", "threshold": "block_none"}],
+            "service_tier": "flex",
+            "webhook_config": {"uris": ["https://example.com/hook"]},
+            "environment": "remote",
+            "labels": {"team": "a"},
+            "cached_content": "cachedContents/1"
+        });
+        let mut body = serde_json::json!({"model": "m", "input": "hi", "store": false});
+        body.as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        let request: InteractionsRequest = serde_json::from_value(body).unwrap();
+        let written = crate::common::to_value_exact(&request).unwrap();
+        for (key, value) in fields.as_object().unwrap() {
+            assert_eq!(&written[key], value, "{key}");
+        }
+    }
+
     fn refusal(result: Result<(), ValidationError>) -> (String, String) {
         let err = result.expect_err("a refusal");
         (
             err.code.to_string(),
             err.message.as_deref().unwrap_or("").to_string(),
         )
+    }
+
+    /// A function declared with an empty name is refused with its place in
+    /// `tools`: no client can dispatch a call that names nothing. The place
+    /// counts every tool, the built-in one ahead of the functions too. A
+    /// named function and a built-in tool, which has no name, pass.
+    #[test]
+    fn a_function_tool_has_a_name() {
+        let tools = |names: &[&str]| -> Vec<InteractionsTool> {
+            let mut tools = vec![InteractionsTool::GoogleSearch { search_types: None }];
+            tools.extend(names.iter().map(|name| {
+                serde_json::from_value::<InteractionsTool>(
+                    serde_json::json!({"type": "function", "name": name}),
+                )
+                .expect("a function tool")
+            }));
+            tools
+        };
+        assert_eq!(
+            refusal(validate_tools(&tools(&["f", ""]))),
+            (
+                "empty_string".to_string(),
+                "Invalid 'tools[2].name': empty string. Expected a string with minimum length 1, \
+                 but got an empty string instead."
+                    .to_string()
+            )
+        );
+        assert!(validate_tools(&tools(&["f", "g"])).is_ok());
     }
 
     /// Each cross-field refusal keeps its code and its message.
@@ -1327,5 +1623,43 @@ mod tests {
                 "Stop sequences cannot contain empty strings".to_string()
             )
         );
+    }
+
+    /// The routing text joins every text piece with one space, empty pieces
+    /// and content-less turns included, and drops non-text content: the
+    /// shape `join(" ")` gave, which a request's prefix-cache hash depends on.
+    #[test]
+    fn the_routing_text_joins_each_text_with_one_space() {
+        let cases = [
+            (serde_json::json!("plain"), "plain"),
+            (serde_json::json!({"type": "text", "text": "one"}), "one"),
+            (serde_json::json!({"type": "image", "uri": "u"}), ""),
+            (
+                serde_json::json!([
+                    {"type": "text", "text": "a"},
+                    {"type": "image", "uri": "u"},
+                    {"type": "text"},
+                    {"type": "text", "text": ""},
+                    {"type": "text", "text": "b"}
+                ]),
+                "a  b",
+            ),
+            (
+                serde_json::json!([
+                    {"role": "user", "content": "first"},
+                    {"role": "model"},
+                    {"role": "user", "content": [{"type": "image", "uri": "u"}]},
+                    {"role": "user", "content": [{"type": "text", "text": "x"}, {"type": "text", "text": "y"}]}
+                ]),
+                "first   x y",
+            ),
+        ];
+        for (input, expected) in cases {
+            let request = InteractionsRequest {
+                input: serde_json::from_value(input.clone()).expect("an input"),
+                ..Default::default()
+            };
+            assert_eq!(request.extract_text_for_routing(), expected, "{input}");
+        }
     }
 }

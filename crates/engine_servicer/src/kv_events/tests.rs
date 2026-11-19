@@ -3,13 +3,14 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use engine_zmq_client::mock_engine::MOCK_DEADLINE;
 use futures::StreamExt;
 use smg_grpc_client::common_proto::{kv_cache_event, KvCacheLocality, KvCacheTier};
 use tokio::time::timeout;
 use zeromq::{PubSocket, RouterSocket, SocketEvent};
 
 use super::{golden, *};
-use crate::kv_wire::WireBatch;
+use crate::{kv_state::CHUNK_BLOCKS, kv_wire::WireBatch};
 
 /// A state the relay reads loads from: one rank's fixed record and a
 /// fresh engine link (nothing reported yet).
@@ -901,7 +902,7 @@ impl Lab {
     /// `replies` and the end marker; the request must ask from `start`.
     async fn answer_replay(&mut self, start: u64, replies: &[(u64, Vec<u8>)]) {
         let router = self.router.as_mut().expect("a replay socket");
-        let request = timeout(Duration::from_secs(5), router.recv())
+        let request = timeout(MOCK_DEADLINE, router.recv())
             .await
             .expect("a replay request in time")
             .expect("request");
@@ -968,8 +969,11 @@ fn refused(result: Result<BoxStream<common::KvEventBatch>, Status>) -> Status {
     }
 }
 
+// The stream reads wait under the suite's standing deadline, not a shorter
+// one of their own: a loaded host holds a single read of a busy case for
+// seconds.
 async fn read(stream: &mut BoxStream<common::KvEventBatch>) -> common::KvEventBatch {
-    timeout(Duration::from_secs(5), stream.next())
+    timeout(MOCK_DEADLINE, stream.next())
         .await
         .expect("a batch in time")
         .expect("stream open")
@@ -977,7 +981,7 @@ async fn read(stream: &mut BoxStream<common::KvEventBatch>) -> common::KvEventBa
 }
 
 async fn read_error(stream: &mut BoxStream<common::KvEventBatch>) -> Status {
-    timeout(Duration::from_secs(5), stream.next())
+    timeout(MOCK_DEADLINE, stream.next())
         .await
         .expect("an item in time")
         .expect("stream open")
@@ -985,7 +989,7 @@ async fn read_error(stream: &mut BoxStream<common::KvEventBatch>) -> Status {
 }
 
 async fn read_end(stream: &mut BoxStream<common::KvEventBatch>) {
-    assert!(timeout(Duration::from_secs(5), stream.next())
+    assert!(timeout(MOCK_DEADLINE, stream.next())
         .await
         .expect("the end in time")
         .is_none());
@@ -1766,7 +1770,7 @@ async fn dropping_the_relay_closes_the_publisher_subscription() {
     assert_eq!(read(&mut stream).await.sequence_number, 0);
     drop(lab.relay);
     read_end(&mut stream).await;
-    let disconnected = timeout(Duration::from_secs(5), async {
+    let disconnected = timeout(MOCK_DEADLINE, async {
         while let Some(event) = monitor.next().await {
             if matches!(event, SocketEvent::Disconnected(_)) {
                 return true;
@@ -1786,6 +1790,27 @@ struct RankLab {
 }
 
 async fn start_rank_lab(ranks: i32, history_batches: usize) -> RankLab {
+    let lab = rank_lab(
+        ranks,
+        history_batches,
+        [
+            DEFAULT_LOAD_TICK,
+            DEFAULT_HEARTBEAT_INTERVAL,
+            DEFAULT_HEARTBEAT_BACKOFF,
+        ],
+    )
+    .await;
+    lab.relay.start();
+    lab
+}
+
+/// The publishers of `ranks` ranks and a relay over them at the record
+/// intervals `[tick, heartbeat, backoff]`, not started.
+async fn rank_lab(
+    ranks: i32,
+    history_batches: usize,
+    [load_tick, heartbeat_interval, heartbeat_backoff]: [Duration; 3],
+) -> RankLab {
     let mut publishers = Vec::new();
     let mut sources = Vec::new();
     for rank in 0..ranks {
@@ -1808,11 +1833,10 @@ async fn start_rank_lab(ranks: i32, history_batches: usize) -> RankLab {
         history_batches,
         history_bytes: 64 << 20,
         replay_timeout: Duration::from_secs(2),
-        load_tick: DEFAULT_LOAD_TICK,
-        heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
-        heartbeat_backoff: DEFAULT_HEARTBEAT_BACKOFF,
+        load_tick,
+        heartbeat_interval,
+        heartbeat_backoff,
     });
-    relay.start();
     RankLab { publishers, relay }
 }
 
@@ -1898,6 +1922,146 @@ async fn every_rank_of_a_data_parallel_publisher_is_relayed_under_its_own_sequen
     live.sort_unstable();
     assert_eq!(live, vec![(Some(0), 3), (Some(1), 2)]);
     assert_eq!(lab.relay.counts().served_from_history, 1);
+}
+
+/// A load source whose record names its rank: `running_requests` is the
+/// rank plus one.
+struct RankedLoads;
+
+impl LoadSource for RankedLoads {
+    fn load(&self, dp_rank: Option<i32>) -> Option<common::EngineLoad> {
+        Some(common::EngineLoad {
+            running_requests: u32::try_from(dp_rank?).ok()? + 1,
+            ..Default::default()
+        })
+    }
+}
+
+/// A quiet rank keeps reporting. On a relay over two ranks each rank's
+/// `load_only` batches come on the rank's own clock, repeat the rank's own
+/// last sequence and carry the rank's own record, whichever rank published
+/// last: a gateway that takes the pushed records counts a rank whose
+/// records stop as unreachable.
+#[tokio::test]
+async fn every_rank_of_a_quiet_publisher_keeps_its_own_heartbeat() {
+    let mut lab = rank_lab(
+        2,
+        100,
+        [
+            Duration::from_millis(20),
+            Duration::from_millis(100),
+            Duration::from_millis(300),
+        ],
+    )
+    .await;
+    lab.relay.set_load_source(Arc::new(RankedLoads));
+    lab.relay.start();
+    lab.prime().await;
+    // Rank 1 publishes last, then nobody does.
+    lab.publish(0, 1, &store_payload(1.0, &[2], Some(1))).await;
+    wait_relayed(&lab.relay, 3).await;
+    lab.publish(1, 1, &store_payload(1.0, &[12], Some(1))).await;
+    wait_relayed(&lab.relay, 4).await;
+    let mut stream = lab.subscribe(0).expect("both windows");
+    assert_eq!(
+        tagged(&mut stream, 4).await,
+        vec![(Some(0), 0), (Some(0), 1), (Some(1), 0), (Some(1), 1)]
+    );
+    let mut beats: BTreeMap<Option<i32>, Vec<(u64, u32)>> = BTreeMap::new();
+    for _ in 0..8 {
+        let beat = read(&mut stream).await;
+        assert!(
+            load_only_marker(&beat) && beat.events.is_empty(),
+            "{beat:?}"
+        );
+        beats
+            .entry(beat.dp_rank)
+            .or_default()
+            .push((beat.sequence_number, record_of(&beat).running_requests));
+    }
+    for (rank, running) in [(0, 1), (1, 2)] {
+        let own = beats.get(&Some(rank)).map_or(&[][..], Vec::as_slice);
+        assert!(own.len() >= 3, "rank {rank}'s heartbeats: {beats:?}");
+        assert!(
+            own.iter().all(|&beat| beat == (1, running)),
+            "rank {rank}'s heartbeats: {beats:?}"
+        );
+    }
+}
+
+/// A quiet rank keeps reporting while the other rank publishes faster than
+/// the tick: the tick is a deadline that stands across batches, so rank 1's
+/// `load_only` batches keep coming between rank 0's batches, with rank 1's
+/// own last sequence and record.
+#[tokio::test]
+async fn a_quiet_rank_keeps_its_own_heartbeat_while_another_publishes() {
+    let mut lab = rank_lab(
+        2,
+        200,
+        [
+            Duration::from_millis(20),
+            Duration::from_millis(100),
+            Duration::from_millis(300),
+        ],
+    )
+    .await;
+    lab.relay.set_load_source(Arc::new(RankedLoads));
+    lab.relay.start();
+    lab.prime().await;
+    let mut stream = lab.subscribe(0).expect("both windows");
+    assert_eq!(
+        tagged(&mut stream, 2).await,
+        vec![(Some(0), 0), (Some(1), 0)]
+    );
+    // Rank 0 publishes about every 10 ms, under the 20 ms tick, for 0.8 s.
+    let mut quiet_ranks_beats = Vec::new();
+    for sequence in 1..=80u64 {
+        let block = i64::try_from(sequence).expect("a small sequence");
+        lab.publish(0, sequence, &store_payload(1.0, &[block + 1], Some(block)))
+            .await;
+        while let Ok(batch) = timeout(Duration::from_millis(10), read(&mut stream)).await {
+            if batch.dp_rank == Some(1) {
+                assert!(load_only_marker(&batch), "{batch:?}");
+                quiet_ranks_beats.push((batch.sequence_number, record_of(&batch).running_requests));
+            }
+        }
+    }
+    assert!(
+        quiet_ranks_beats.len() >= 3,
+        "rank 1's heartbeats beside rank 0's traffic: {quiet_ranks_beats:?}"
+    );
+    assert!(
+        quiet_ranks_beats.iter().all(|&beat| beat == (0, 2)),
+        "{quiet_ranks_beats:?}"
+    );
+}
+
+/// A stream resumed at the publisher's newest sequence is owed nothing from
+/// the history, and while the publisher stays quiet its `load_only` batches
+/// repeat the cursor it came with: the rank's entry in `sent` starts at the
+/// cursor, before the stream's first batch.
+#[tokio::test]
+async fn a_resumed_quiet_stream_repeats_its_cursor_in_its_heartbeats() {
+    let mut lab = start_lab_with_loads(
+        StubLoads::new(2, 0),
+        Duration::from_millis(20),
+        Duration::from_millis(100),
+        Duration::from_millis(300),
+    )
+    .await;
+    let batch2 = golden::bytes(golden::BATCH2);
+    for sequence in 1..=3 {
+        lab.publish(sequence, &batch2).await;
+    }
+    wait_relayed(&lab.relay, 4).await;
+    let mut stream = lab.subscribe(3).expect("at the newest");
+    for _ in 0..2 {
+        let beat = timeout(Duration::from_secs(2), read(&mut stream))
+            .await
+            .expect("a resumed stream's heartbeat while its publisher is quiet");
+        assert!(load_only_marker(&beat), "{beat:?}");
+        assert_eq!((beat.sequence_number, beat.events.len()), (3, 0));
+    }
 }
 
 /// The request carries one cursor and a relay over several ranks cannot
@@ -2297,7 +2461,7 @@ async fn a_676k_block_snapshot_is_cut_atomically_and_does_not_stall_the_live_str
     let count = u32::try_from(chunks.len()).unwrap();
     assert_eq!(
         count as usize,
-        (blocks_at_cut as usize).div_ceil(crate::kv_state::CHUNK_BLOCKS)
+        (blocks_at_cut as usize).div_ceil(CHUNK_BLOCKS)
     );
     for (index, chunk) in chunks.iter().enumerate() {
         assert_eq!(
@@ -2475,14 +2639,25 @@ fn prefill_capacity_changes_use_the_throughput_tolerance() {
     }
 }
 
-/// A running-count change alone must publish load in either direction.
 #[test]
-fn running_requests_alone_change_the_load_record() {
+fn request_and_resident_token_counts_alone_change_the_load_record() {
     let idle = common::EngineLoad::default();
-    let running = common::EngineLoad {
-        running_requests: 1,
-        ..idle.clone()
-    };
-    assert!(load_changed(&idle, &running));
-    assert!(load_changed(&running, &idle));
+    for changed in [
+        common::EngineLoad {
+            running_requests: 1,
+            ..idle.clone()
+        },
+        common::EngineLoad {
+            num_resident_tokens: Some(0),
+            ..idle.clone()
+        },
+        common::EngineLoad {
+            num_resident_tokens: Some(100),
+            ..idle.clone()
+        },
+    ] {
+        assert!(load_changed(&idle, &changed));
+        assert!(load_changed(&changed, &idle));
+        assert!(!load_changed(&changed, &changed));
+    }
 }

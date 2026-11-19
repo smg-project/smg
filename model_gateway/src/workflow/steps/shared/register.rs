@@ -1,18 +1,26 @@
 //! Unified worker registration step.
 
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use tracing::debug;
 use wfaas::{
-    StepExecutor, StepId, StepResult, WorkflowContext, WorkflowData, WorkflowError, WorkflowResult,
+    StepExecutor, StepId, StepResult, StepStatus, WorkflowContext, WorkflowData, WorkflowError,
+    WorkflowResult, WorkflowState,
 };
 
 use super::{pool_group, refresh_worker_pool_sizes, PoolGroups};
 use crate::{
     routers::{common::pd_admission, grpc::regular::symphony::telemetry},
-    worker::{bootstrap_probe, registry::WorkerId, Worker, WorkerRegistry},
-    workflow::data::{WorkerRegistrationData, WorkerRegistrationMode},
+    worker::{
+        health::bootstrap_probe,
+        registry::{worker_model_ids, WorkerId},
+        Worker, WorkerRegistry,
+    },
+    workflow::data::{require_app_context, WorkerRegistrationData, WorkerRegistrationMode},
 };
 
 /// Unified step to register workers in the registry.
@@ -22,9 +30,46 @@ use crate::{
 /// Works with any workflow data type that implements `WorkerRegistrationData`.
 pub struct RegisterWorkersStep;
 
+/// The step's id in the registration DAGs.
+pub(crate) const REGISTER_WORKERS_STEP: &str = "register_workers";
+
+/// Whether the registry step of `state` completed: the registration's workers
+/// are in the registry, whatever the workflow did after it (a cancellation or
+/// a later step's failure leaves them there).
+pub fn registered_in<D: WorkflowData>(state: &WorkflowState<D>) -> bool {
+    state
+        .step_states
+        .get(&StepId::new(REGISTER_WORKERS_STEP))
+        .is_some_and(|step| step.status == StepStatus::Succeeded)
+}
+
+/// The registration's workers that are the registry's entries under their
+/// URLs now, by id and revision: what a removal queued for this registration
+/// may take. A worker registered or replaced since is not among them, and a
+/// registration whose registry step the state does not record as succeeded
+/// (a cancellation written while the step ran) is still read from the
+/// registry itself.
+pub fn registered_entries<D: WorkerRegistrationData>(
+    registry: &WorkerRegistry,
+    state: &WorkflowState<D>,
+) -> HashMap<String, u64> {
+    state
+        .context
+        .data
+        .get_actual_workers()
+        .into_iter()
+        .flatten()
+        .filter_map(|worker| {
+            let id = registry.get_id_by_url(worker.url())?;
+            let entry = registry.get(&id)?;
+            Arc::ptr_eq(&entry, worker).then(|| (id.as_str().to_string(), entry.revision()))
+        })
+        .collect()
+}
+
 fn step_failed(message: String) -> WorkflowError {
     WorkflowError::StepFailed {
-        step_id: StepId::new("register_workers"),
+        step_id: StepId::new(REGISTER_WORKERS_STEP),
         message,
     }
 }
@@ -46,7 +91,7 @@ fn check_batch(
                 if registry.get_by_url(worker.url()).is_some() {
                     return Err(step_failed(format!(
                         "Worker {} already exists",
-                        worker.url()
+                        worker.redacted_url()
                     )));
                 }
                 // The registry is keyed by URL, so a batch that repeats one
@@ -54,7 +99,7 @@ fn check_batch(
                 if !batch_urls.insert(worker.url()) {
                     return Err(step_failed(format!(
                         "Worker {} appears twice in the same registration",
-                        worker.url()
+                        worker.redacted_url()
                     )));
                 }
             }
@@ -89,14 +134,14 @@ fn register_worker(
             expected_revision,
         } => {
             let worker_id = WorkerId::from_string(worker_id.clone());
-            let url = worker.url().to_string();
+            let address = worker.redacted_url().to_string();
             // Fails when the ID is gone or the worker moved on, which covers
             // the concurrent DELETE, DELETE + POST, and second-PUT cases.
             if registry.replace_claiming_local(&worker_id, worker, *expected_revision) {
                 Ok(worker_id)
             } else {
                 Err(step_failed(format!(
-                    "Worker {} at {url} is no longer at revision {expected_revision}, \
+                    "Worker {} at {address} is no longer at revision {expected_revision}, \
                      so the replacement was dropped",
                     worker_id.as_str()
                 )))
@@ -119,19 +164,77 @@ fn pool_groups_touched(registry: &WorkerRegistry, workers: &[Arc<dyn Worker>]) -
     groups
 }
 
+/// The models a registration of `workers` may move workers off: every model
+/// whose policy a worker it replaces at the same URL keeps
+/// ([`WorkerRegistry::policy_model_ids`]). Whether a worker of this node, the
+/// replacement included, still serves each one is asked once the
+/// registration is written.
+fn models_left(registry: &WorkerRegistry, workers: &[Arc<dyn Worker>]) -> HashSet<String> {
+    workers
+        .iter()
+        .filter_map(|worker| registry.get_by_url(worker.url()))
+        .flat_map(|replaced| WorkerRegistry::policy_model_ids(&replaced))
+        .collect()
+}
+
+/// A test's hold on the registry step, between the engine's cancel read for
+/// the step and the step's registry write: the window a `DELETE`'s cancel
+/// lands in while the step runs, whose worker the job's end then reads from
+/// the registry. Placed by URL for its next registration, taken once.
+#[cfg(test)]
+pub(crate) mod registration_hold {
+    use std::sync::{Arc, LazyLock};
+
+    use dashmap::DashMap;
+    use tokio::sync::Notify;
+
+    /// The hold on one URL's registry step: `reached` fires when the step is
+    /// in its window, `release` lets it write.
+    pub(crate) struct RegistrationHold {
+        pub(crate) reached: Notify,
+        pub(crate) release: Notify,
+    }
+
+    static HOLDS: LazyLock<DashMap<String, Arc<RegistrationHold>>> = LazyLock::new(DashMap::new);
+
+    /// Places a hold on the next registry step for `url`.
+    pub(crate) fn place(url: &str) -> Arc<RegistrationHold> {
+        let hold = Arc::new(RegistrationHold {
+            reached: Notify::new(),
+            release: Notify::new(),
+        });
+        HOLDS.insert(url.to_string(), Arc::clone(&hold));
+        hold
+    }
+
+    /// The step's side: under a hold placed for `url`, says the window is
+    /// reached and waits for the release; without one, returns at once.
+    pub(crate) async fn honour(url: &str) {
+        let Some((_, hold)) = HOLDS.remove(url) else {
+            return;
+        };
+        hold.reached.notify_one();
+        hold.release.notified().await;
+    }
+}
+
 #[async_trait]
 impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorkersStep {
     async fn execute(&self, context: &mut WorkflowContext<D>) -> WorkflowResult<StepResult> {
-        let app_context = context
-            .data
-            .get_app_context()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?
-            .clone();
+        let app_context = require_app_context(context.data.get_app_context())?.clone();
 
         let workers = context
             .data
             .get_actual_workers()
             .ok_or_else(|| WorkflowError::ContextValueNotFound("workers".to_string()))?;
+
+        // A test's hold on this step's window (`registration_hold`).
+        #[cfg(test)]
+        {
+            if let Some(worker) = workers.first() {
+                registration_hold::honour(worker.url()).await;
+            }
+        }
 
         let mut worker_ids = Vec::with_capacity(workers.len());
         let registration_mode = context.data.registration_mode();
@@ -142,6 +245,7 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorke
         // worker's group must refresh the group it leaves as well as the one
         // it joins, and only the registry as it is now knows the former.
         let touched_groups = pool_groups_touched(&app_context.worker_registry, workers);
+        let left_models = models_left(&app_context.worker_registry, workers);
 
         for worker in workers {
             let worker_id = register_worker(
@@ -195,7 +299,7 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorke
             if has_retry_overrides {
                 let resolved = worker.resilience();
                 let retry_config = resolved.retry.clone();
-                for model_id in WorkerRegistry::worker_model_ids(worker) {
+                for model_id in worker_model_ids(worker) {
                     app_context.worker_registry.set_model_retry_config(
                         &model_id,
                         retry_config.clone(),
@@ -209,8 +313,17 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorke
         // `(worker_type, connection_mode, model_id)` the registration touched.
         refresh_worker_pool_sizes(&app_context.worker_registry, &touched_groups);
 
+        // A replacement that moved a worker to another model, or that lists
+        // a model fewer, takes the policy of each model no worker of this
+        // node serves any more, as the worker's removal would.
+        for model_id in &left_models {
+            if !app_context.worker_registry.serves_model_locally(model_id) {
+                app_context.policy_registry.on_model_unserved(model_id);
+            }
+        }
+
         // WorkerMonitor subscribes to registry events directly (see
-        // `worker::monitor::WorkerMonitor::start_event_loop`), so this
+        // `worker::load::monitor::WorkerMonitor::start_event_loop`), so this
         // step no longer has to push group-add notifications. The
         // monitor's event loop reconciles the impacted groups as soon as the
         // registry emits `WorkerEvent::Registered` or `WorkerEvent::Replaced`.
@@ -248,6 +361,113 @@ mod tests {
 
     fn worker(model_id: &str) -> Arc<dyn Worker> {
         worker_at("http://worker:8080", model_id)
+    }
+
+    /// The registry names what a registration left in it: its own workers
+    /// while they are the entries under their URLs, by id and revision, and
+    /// nothing once a worker under the URL is another one.
+    #[test]
+    fn the_registry_names_what_a_registration_left_in_it() {
+        use openai_protocol::worker::WorkerSpec;
+        use wfaas::{WorkflowId, WorkflowInstanceId};
+
+        use crate::{
+            app_context::testing::app_context_for_tests, config::RouterConfig,
+            worker::WorkerRegistry, workflow::steps::create_worker_workflow_data,
+        };
+        let url = "http://worker:8080";
+        let registry = Arc::new(WorkerRegistry::new());
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new(url).build());
+        let id = registry
+            .register(Arc::clone(&worker))
+            .expect("the worker registers");
+        let mut data = create_worker_workflow_data(
+            WorkerSpec::new(url),
+            WorkerRegistrationMode::CreateOnly,
+            app_context_for_tests(RouterConfig::default(), Arc::clone(&registry), None),
+        );
+        data.actual_workers = Some(vec![Arc::clone(&worker)]);
+        let state = WorkflowState::new(
+            WorkflowInstanceId::new(),
+            WorkflowId::new("worker_registration"),
+            data,
+        );
+        assert_eq!(
+            registered_entries(&registry, &state),
+            HashMap::from([(id.as_str().to_string(), worker.revision())]),
+            "the registration's worker is the entry under its URL"
+        );
+        registry.remove(&id);
+        let other: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new(url).build());
+        registry.register(other).expect("another worker registers");
+        assert!(
+            registered_entries(&registry, &state).is_empty(),
+            "the worker under the URL is not this registration's"
+        );
+    }
+
+    /// A terminal state says whether its registry step landed: the step's
+    /// record reads `Succeeded` once the workers are in the registry, whatever
+    /// the workflow's own status became after it; no record, or a step that
+    /// did not run through, means nothing landed.
+    #[test]
+    fn a_terminal_state_says_whether_its_registry_step_landed() {
+        use openai_protocol::worker::WorkerSpec;
+        use wfaas::{StepState, WorkflowId, WorkflowInstanceId, WorkflowStatus};
+
+        use crate::{
+            app_context::testing::app_context_for_tests, config::RouterConfig,
+            worker::WorkerRegistry, workflow::steps::create_worker_workflow_data,
+        };
+        let data = create_worker_workflow_data(
+            WorkerSpec::new("http://worker:8080"),
+            WorkerRegistrationMode::CreateOnly,
+            app_context_for_tests(
+                RouterConfig::default(),
+                Arc::new(WorkerRegistry::new()),
+                None,
+            ),
+        );
+        let mut state = WorkflowState::new(
+            WorkflowInstanceId::new(),
+            WorkflowId::new("worker_registration"),
+            data,
+        );
+        state.status = WorkflowStatus::Cancelled;
+        assert!(
+            !registered_in(&state),
+            "no record of the step, nothing landed"
+        );
+        let step = StepId::new(REGISTER_WORKERS_STEP);
+        for status in [
+            StepStatus::Pending,
+            StepStatus::Running,
+            StepStatus::Failed,
+            StepStatus::Skipped,
+        ] {
+            state.step_states.insert(
+                step.clone(),
+                StepState {
+                    status,
+                    ..StepState::default()
+                },
+            );
+            assert!(
+                !registered_in(&state),
+                "a {status:?} registry step landed nothing"
+            );
+        }
+        state.step_states.insert(
+            step,
+            StepState {
+                status: StepStatus::Succeeded,
+                ..StepState::default()
+            },
+        );
+        assert!(
+            registered_in(&state),
+            "a cancelled workflow whose registry step succeeded left its workers"
+        );
     }
 
     fn replace_by_id(worker_id: &WorkerId, expected_revision: u64) -> WorkerRegistrationMode {

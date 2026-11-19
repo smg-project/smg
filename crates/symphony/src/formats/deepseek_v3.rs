@@ -95,7 +95,7 @@ mod tests {
         grammar::{GrammarStart, Options},
         input::{EngineFinish, Input},
         parser::Parser,
-        testing::{bytes, calls, content, finish, reasoning},
+        testing::{bytes, calls, content, finish, malformed_texts, reasoning},
         Declared,
     };
 
@@ -140,16 +140,6 @@ mod tests {
             )
             .expect("end");
         out.into_owned().drain()
-    }
-
-    fn malformed<'a>(events: &'a [Event<'_>]) -> Vec<&'a str> {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Malformed { text, .. } => Some(&*text.text),
-                _ => None,
-            })
-            .collect()
     }
 
     /// A turn as the checkpoint's chat template renders it (`chat_template` of
@@ -272,7 +262,7 @@ mod tests {
             .collect();
         assert_eq!(calls(events), expected, "{how}: {:?}", turn.output);
         assert_eq!(
-            malformed(events),
+            malformed_texts(events),
             Vec::<&str>::new(),
             "{how}: {:?}",
             turn.output
@@ -667,14 +657,14 @@ mod tests {
         assert_eq!(bytes(&whole), output);
         assert_eq!(calls(&whole), expected);
         assert_eq!(content(&whole), "");
-        assert_eq!(malformed(&whole), Vec::<&str>::new());
+        assert_eq!(malformed_texts(&whole), Vec::<&str>::new());
         assert_eq!(finish(&whole), (FinishReason::Stop, 1));
         for (at, _) in output.char_indices().skip(1) {
             let (head, rest) = output.split_at(at);
             let events = run(PROMPT, &[head, rest]);
             assert_eq!(calls(&events), expected, "cut at {at}");
             assert_eq!(content(&events), "", "cut at {at}");
-            assert_eq!(malformed(&events), Vec::<&str>::new(), "cut at {at}");
+            assert_eq!(malformed_texts(&events), Vec::<&str>::new(), "cut at {at}");
             assert_eq!(finish(&events), (FinishReason::Stop, 1), "cut at {at}");
         }
     }

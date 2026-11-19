@@ -1,6 +1,6 @@
 [package]
 name = "smg-mcp"
-version = "2.3.6"
+version = "2.3.7"
 edition = "2021"
 description = "Model Context Protocol (MCP) client implementation"
 license = "Apache-2.0"
@@ -25,7 +25,7 @@ reqwest = { workspace = true, features = ["rustls-no-provider", "json"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
-serde_yaml = "0.9"
+serde_yaml.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync", "rt-multi-thread", "macros", "time"] }
 tracing.workspace = true

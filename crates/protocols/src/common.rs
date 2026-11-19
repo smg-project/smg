@@ -1,19 +1,21 @@
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
-    sync::LazyLock,
+    sync::{Arc, LazyLock},
 };
 
 use serde::{
     de::{
         self,
         value::{MapDeserializer, SeqAccessDeserializer},
-        SeqAccess, Visitor,
+        DeserializeSeed, SeqAccess, Visitor,
     },
     Deserialize, Deserializer, Serialize,
 };
 use serde_json::{Map, Value};
 use validator;
+
+use crate::strict_value::StrictValue;
 
 // ============================================================================
 // Default value helpers
@@ -30,6 +32,20 @@ use validator;
 /// (`1e2` is `100.0`, `-0` is `-0.0`).
 pub fn to_value_exact<T: Serialize>(value: &T) -> serde_json::Result<Value> {
     serde_json::from_slice(&serde_json::to_vec(value)?)
+}
+
+/// The routing text of a JSON `input`: the string itself, an array's string
+/// members joined on spaces, nothing for any other shape.
+pub(crate) fn routing_text_of_input(input: &Value) -> String {
+    match input {
+        Value::String(s) => s.clone(),
+        Value::Array(arr) => arr
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => String::new(),
+    }
 }
 
 /// Default model for endpoints where model is optional (e.g., /generate).
@@ -92,6 +108,21 @@ where
     T: Deserialize<'de>,
 {
     Option::<Vec<T>>::deserialize(deserializer).map(Option::unwrap_or_default)
+}
+
+/// Deserialize a map that also accepts JSON `null` (mapped to the empty map).
+///
+/// Use with `#[serde(default, deserialize_with = "deserialize_null_as_empty_map")]`
+/// on always-present maps an upstream may write as `null`.
+pub fn deserialize_null_as_empty_map<'de, D, K, V>(
+    deserializer: D,
+) -> Result<HashMap<K, V>, D::Error>
+where
+    D: Deserializer<'de>,
+    K: Deserialize<'de> + Eq + std::hash::Hash,
+    V: Deserialize<'de>,
+{
+    Option::<HashMap<K, V>>::deserialize(deserializer).map(Option::unwrap_or_default)
 }
 
 /// Deserialize an `Option<bool>` where JSON `null` means the default `true`.
@@ -271,6 +302,10 @@ impl<'a> Iterator for StringOrArrayIter<'a> {
 
 impl<'a> ExactSizeIterator for StringOrArrayIter<'a> {}
 
+// ============================================================================
+// Validation helpers
+// ============================================================================
+
 /// A validation error with the public API's `code` and message.
 pub(crate) fn invalid(
     code: &'static str,
@@ -305,6 +340,32 @@ pub(crate) fn on_field(
 ) -> validator::ValidationError {
     error.add_param(Cow::Borrowed(FIELD_PARAM), &field.into());
     error
+}
+
+/// The refusal of a tool the model calls by name (a function, a custom tool,
+/// a namespace or one of its members) declared with an empty name at `field`,
+/// in the public API's words: the model can be made to call such a tool, and
+/// the client cannot dispatch a call that names nothing.
+pub(crate) fn empty_tool_name(field: &str) -> validator::ValidationError {
+    invalid(
+        "empty_string",
+        format!(
+            "Invalid '{field}': empty string. Expected a string with minimum length 1, but got \
+             an empty string instead."
+        ),
+    )
+}
+
+/// The JSON type of a value, for validation messages (`a string`, `an array`, ...).
+pub fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
 }
 
 /// Validates `logit_bias` as the public API bounds it: every key a
@@ -393,7 +454,7 @@ pub fn validate_stop(stop: &StringOrArray) -> Result<(), validator::ValidationEr
 // Content Parts (for multimodal messages)
 // ============================================================================
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
+#[derive(Debug, Clone, Serialize, PartialEq, schemars::JsonSchema)]
 #[serde(tag = "type")]
 pub enum ContentPart {
     #[serde(rename = "text")]
@@ -410,13 +471,94 @@ pub enum ContentPart {
     /// replays it in the history; the renderers read it as the turn's text.
     #[serde(rename = "refusal")]
     Refusal { refusal: String },
-    /// Pass through unknown content objects to HTTP backends.
-    /// Also matches malformed known types; gRPC backends reject this variant.
+    /// Pass through unknown content objects to HTTP backends; gRPC backends
+    /// reject this variant. A known `type` whose body does not fit it is no
+    /// unknown part: it refuses with serde's reason for the field.
     #[serde(untagged)]
     Unknown(Map<String, Value>),
 }
 
+/// The parts the gateway knows, read by their `type` as serde reads a tagged
+/// enum, so a malformed one carries serde's reason for the field.
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+enum KnownContentPart {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "image_url")]
+    ImageUrl { image_url: ImageUrl },
+    #[serde(rename = "audio_url")]
+    AudioUrl { audio_url: AudioUrl },
+    #[serde(rename = "input_audio")]
+    InputAudio { input_audio: InputAudio },
+    #[serde(rename = "video_url")]
+    VideoUrl { video_url: VideoUrl },
+    #[serde(rename = "refusal")]
+    Refusal { refusal: String },
+}
+
+impl KnownContentPart {
+    /// The `type` names a kind the gateway knows.
+    fn names(kind: &str) -> bool {
+        matches!(
+            kind,
+            "text" | "image_url" | "audio_url" | "input_audio" | "video_url" | "refusal"
+        )
+    }
+}
+
+impl From<KnownContentPart> for ContentPart {
+    fn from(part: KnownContentPart) -> Self {
+        match part {
+            KnownContentPart::Text { text } => Self::Text { text },
+            KnownContentPart::ImageUrl { image_url } => Self::ImageUrl { image_url },
+            KnownContentPart::AudioUrl { audio_url } => Self::AudioUrl { audio_url },
+            KnownContentPart::InputAudio { input_audio } => Self::InputAudio { input_audio },
+            KnownContentPart::VideoUrl { video_url } => Self::VideoUrl { video_url },
+            KnownContentPart::Refusal { refusal } => Self::Refusal { refusal },
+        }
+    }
+}
+
+/// A part is an object; one whose `type` the gateway knows must fit that
+/// kind (its refusal is serde's, naming the field's reason), any other is
+/// kept whole for the backends that read it.
+impl<'de> Deserialize<'de> for ContentPart {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let fields = Map::<String, Value>::deserialize(deserializer)?;
+        Self::from_fields(fields).map_err(de::Error::custom)
+    }
+}
+
+/// Serde's reason for a known part's refusal, opening with serde's words so
+/// a reader keeps its code: a field missing from the kind's body is named
+/// under the kind (`missing field `image_url.url``), any other reason names
+/// the body after itself (`..., in `image_url``), since serde's own path
+/// stops at the message a tagged enum buffers.
+fn known_part_reason(kind: &str, error: &serde_json::Error) -> String {
+    let reason = error.to_string();
+    let missing = reason
+        .strip_prefix("missing field `")
+        .and_then(|rest| rest.strip_suffix('`'));
+    match missing {
+        Some(field) if field != kind => format!("missing field `{kind}.{field}`"),
+        Some(_) => reason,
+        None => format!("{reason}, in `{kind}`"),
+    }
+}
+
 impl ContentPart {
+    /// The part an object's fields make, for a reader that holds them already.
+    pub(crate) fn from_fields(fields: Map<String, Value>) -> Result<Self, serde_json::Error> {
+        let kind = match fields.get("type").and_then(Value::as_str) {
+            Some(kind) if KnownContentPart::names(kind) => kind.to_string(),
+            _ => return Ok(Self::Unknown(fields)),
+        };
+        serde_json::from_value::<KnownContentPart>(Value::Object(fields))
+            .map(Self::from)
+            .map_err(|error| de::Error::custom(known_part_reason(&kind, &error)))
+    }
+
     /// The text a renderer reads from the part: a text part's text, a
     /// refusal's text (the engines' own servers render a refusal part as the
     /// turn's text); none for a media or an unknown part.
@@ -430,7 +572,9 @@ impl ContentPart {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
 pub struct ImageUrl {
-    pub url: String,
+    /// The image's URL or `data:` URL, shared with every reader of the
+    /// request (the media plan among them) instead of copied.
+    pub url: Arc<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>, // "auto", "low", or "high"
     /// MiniMax-M3 extension: cap the image's long side before preprocessing.
@@ -448,20 +592,22 @@ pub struct ImageUrl {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
 pub struct AudioUrl {
-    pub url: String,
+    /// The clip's URL or `data:` URL, shared with its readers.
+    pub url: Arc<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
 pub struct InputAudio {
-    /// Base64-encoded audio bytes.
-    pub data: String,
+    /// Base64-encoded audio bytes, shared with the readers that decode them.
+    pub data: Arc<String>,
     /// Encoded audio format. The OpenAI Chat API supports `wav` and `mp3`.
     pub format: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
 pub struct VideoUrl {
-    pub url: String,
+    /// The clip's URL or `data:` URL, shared with its readers.
+    pub url: Arc<String>,
     /// MiniMax-M3 extension: frames per second to sample the clip at.
     ///
     /// Valid range is 0.2 to 5.0 inclusive.
@@ -485,24 +631,45 @@ pub enum ResponseFormat {
     Text,
     #[serde(rename = "json_object")]
     JsonObject,
+    // The schema rides behind a pointer, as the tag's object below does: a
+    // format is then two words wherever a request or a route task holds one.
+    // Inline, the schema's 128 bytes had put the Gateway's chat route task,
+    // which holds a request's format three times over its awaits, over the
+    // allocator's 3,584-byte class edge on every chat request. A text or
+    // json_object format allocates nothing. No `///` here: the variant's doc
+    // would become its description in the generated OpenAPI document.
     #[serde(rename = "json_schema")]
-    JsonSchema { json_schema: JsonSchemaFormat },
+    JsonSchema { json_schema: Box<JsonSchemaFormat> },
+    /// A structural tag: JSON held to a schema between the tags it names, free
+    /// text around them. The engines' grammar compilers read the object itself,
+    /// in more than one spelling (`structures` with `triggers`, or a `format`),
+    /// so it is carried as it arrived and nothing in it is judged here.
+    #[serde(rename = "structural_tag")]
+    StructuralTag {
+        /// Every key but `type`, in the order they arrived; written back the
+        /// same.
+        // Behind a pointer, as the schema above is.
+        #[serde(flatten)]
+        spec: Box<Map<String, Value>>,
+    },
 }
 
 /// The kind a `response_format` object names under `type`, read with the
-/// words serde uses for a tag: an unknown name lists the three.
+/// words serde uses for a tag: an unknown name lists the four.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResponseFormatKind {
     Text,
     JsonObject,
     JsonSchema,
+    StructuralTag,
 }
 
 impl ResponseFormatKind {
-    const ALL: [ResponseFormatKind; 3] = [
+    const ALL: [ResponseFormatKind; 4] = [
         ResponseFormatKind::Text,
         ResponseFormatKind::JsonObject,
         ResponseFormatKind::JsonSchema,
+        ResponseFormatKind::StructuralTag,
     ];
 
     /// The name under `type`: the variant's rename on [`ResponseFormat`].
@@ -511,6 +678,7 @@ impl ResponseFormatKind {
             ResponseFormatKind::Text => "text",
             ResponseFormatKind::JsonObject => "json_object",
             ResponseFormatKind::JsonSchema => "json_schema",
+            ResponseFormatKind::StructuralTag => "structural_tag",
         }
     }
 }
@@ -520,6 +688,7 @@ const RESPONSE_FORMAT_KINDS: &[&str] = &[
     ResponseFormatKind::Text.name(),
     ResponseFormatKind::JsonObject.name(),
     ResponseFormatKind::JsonSchema.name(),
+    ResponseFormatKind::StructuralTag.name(),
 ];
 
 impl<'de> Deserialize<'de> for ResponseFormatKind {
@@ -554,11 +723,16 @@ impl<'de> Deserialize<'de> for ResponseFormatKind {
 /// when it arrives before the kind (a `KeptSchema`: an object as its entries
 /// in order, any other shape as a `Value`, for the schema's own derive to
 /// read at the end, so a repeated or malformed field is the derive's error
-/// in either order and ignored by the two kinds that carry no schema). The
+/// in either order and ignored by the two kinds that carry no schema). A
+/// structural tag is every other key, so those are kept as `Value`s while
+/// the kind is unknown, dropped once it is known not to be a tag, and read
+/// into the tag's object once it is (a `json_schema` kept before the kind
+/// joins the object as the value it was). The
 /// accepted shapes and the errors are the derive's: a missing `type`, an
 /// unknown kind, a missing or malformed `json_schema` for the kind that
 /// wants it, a duplicate key; a kind that carries no schema ignores a
-/// `json_schema` field of any shape, and every other key is ignored. One
+/// `json_schema` field of any shape, and every other key is ignored by the
+/// three kinds that are not a tag. One
 /// corner differs in text alone: with `type` first, a malformed schema
 /// followed by a repeated `type` reads the schema's error here, because the
 /// schema is read the moment the kind is known (the point of this reader),
@@ -569,7 +743,8 @@ impl<'de> Deserialize<'de> for ResponseFormat {
         enum Field {
             Kind,
             JsonSchema,
-            Other,
+            /// A key no kind of the three reads, which a structural tag keeps.
+            Other(String),
         }
 
         impl<'de> Deserialize<'de> for Field {
@@ -587,7 +762,7 @@ impl<'de> Deserialize<'de> for ResponseFormat {
                         Ok(match name {
                             "type" => Field::Kind,
                             "json_schema" => Field::JsonSchema,
-                            _ => Field::Other,
+                            other => Field::Other(other.to_owned()),
                         })
                     }
                 }
@@ -633,6 +808,15 @@ impl<'de> Deserialize<'de> for ResponseFormat {
                         })?;
                         (ResponseFormat::JsonSchema { json_schema }, 1)
                     }
+                    ResponseFormatKind::StructuralTag => {
+                        let spec = seq.next_element()?.ok_or_else(|| {
+                            de::Error::invalid_length(
+                                0,
+                                &"struct variant ResponseFormat::StructuralTag with 1 element",
+                            )
+                        })?;
+                        (ResponseFormat::StructuralTag { spec }, 1)
+                    }
                 };
                 let mut extra = 0;
                 while seq.next_element::<de::IgnoredAny>()?.is_some() {
@@ -653,6 +837,9 @@ impl<'de> Deserialize<'de> for ResponseFormat {
                 let mut kind: Option<ResponseFormatKind> = None;
                 let mut schema: Option<Schema> = None;
                 let mut schema_twice = false;
+                // the other keys, a structural tag's object: kept while the
+                // kind may still be one
+                let mut spec = Map::new();
                 while let Some(field) = map.next_key::<Field>()? {
                     match field {
                         Field::Kind => {
@@ -660,13 +847,27 @@ impl<'de> Deserialize<'de> for ResponseFormat {
                                 return Err(de::Error::duplicate_field("type"));
                             }
                             kind = Some(map.next_value()?);
+                            if kind != Some(ResponseFormatKind::StructuralTag) {
+                                spec.clear();
+                            }
+                        }
+                        Field::JsonSchema if kind == Some(ResponseFormatKind::StructuralTag) => {
+                            // a repeat of one read before the kind: the last
+                            // value, in the first one's place
+                            schema_twice |= schema.is_some();
+                            spec.insert("json_schema".to_owned(), map.next_value()?);
                         }
                         Field::JsonSchema => {
                             if schema.is_some() {
                                 // the derive reports the duplicate once the
-                                // object is read, whatever the second value
+                                // object is read, whatever the second value;
+                                // a tag keeps the last, in the first one's place
                                 schema_twice = true;
-                                map.next_value::<de::IgnoredAny>()?;
+                                if kind.is_none() {
+                                    spec.insert("json_schema".to_owned(), map.next_value()?);
+                                } else {
+                                    map.next_value::<de::IgnoredAny>()?;
+                                }
                                 continue;
                             }
                             schema = Some(match kind {
@@ -677,18 +878,38 @@ impl<'de> Deserialize<'de> for ResponseFormat {
                                     map.next_value::<de::IgnoredAny>()?;
                                     Schema::Skipped
                                 }
-                                None => Schema::Kept(map.next_value()?),
+                                None => {
+                                    // the key's place, kept for a tag; the
+                                    // value fills it once the kind is read
+                                    spec.insert("json_schema".to_owned(), Value::Null);
+                                    Schema::Kept(map.next_value()?)
+                                }
                             });
                         }
-                        Field::Other => {
-                            map.next_value::<de::IgnoredAny>()?;
-                        }
+                        Field::Other(name) => match kind {
+                            None | Some(ResponseFormatKind::StructuralTag) => {
+                                spec.insert(name, map.next_value()?);
+                            }
+                            Some(_) => {
+                                map.next_value::<de::IgnoredAny>()?;
+                            }
+                        },
                     }
                 }
                 let kind = kind.ok_or_else(|| de::Error::missing_field("type"))?;
                 Ok(match kind {
                     ResponseFormatKind::Text => ResponseFormat::Text,
                     ResponseFormatKind::JsonObject => ResponseFormat::JsonObject,
+                    ResponseFormatKind::StructuralTag => {
+                        // the place kept before the kind takes its value; a
+                        // repeat of the key already took it
+                        if let Some(Schema::Kept(kept)) = schema.filter(|_| !schema_twice) {
+                            spec.insert("json_schema".to_owned(), Value::from(kept));
+                        }
+                        ResponseFormat::StructuralTag {
+                            spec: Box::new(spec),
+                        }
+                    }
                     ResponseFormatKind::JsonSchema => {
                         let json_schema = match schema {
                             Some(Schema::Read(json_schema)) => json_schema,
@@ -714,7 +935,9 @@ impl<'de> Deserialize<'de> for ResponseFormat {
                             // second key: the value's own error comes first
                             return Err(de::Error::duplicate_field("json_schema"));
                         }
-                        ResponseFormat::JsonSchema { json_schema }
+                        ResponseFormat::JsonSchema {
+                            json_schema: Box::new(json_schema),
+                        }
                     }
                 })
             }
@@ -730,6 +953,11 @@ pub struct JsonSchemaFormat {
     pub schema: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub strict: Option<bool>,
+    /// What the format is for, as the client describes it to the model.
+    // Declared last and defaulted, so the derive's positional form keeps
+    // reading `[name, schema, strict]` as it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// A `json_schema` object that arrived before the kind, kept for the end of
@@ -741,6 +969,16 @@ pub struct JsonSchemaFormat {
 enum KeptSchema {
     Object(Vec<(String, Value)>),
     Other(Value),
+}
+
+/// The kept schema as the value it was, for a structural tag's object.
+impl From<KeptSchema> for Value {
+    fn from(kept: KeptSchema) -> Self {
+        match kept {
+            KeptSchema::Object(entries) => Value::Object(entries.into_iter().collect()),
+            KeptSchema::Other(value) => value,
+        }
+    }
 }
 
 impl<'de> Deserialize<'de> for KeptSchema {
@@ -809,8 +1047,13 @@ impl<'de> Deserialize<'de> for KeptSchema {
 /// Walks `properties`, `items`, `prefixItems`, `anyOf`/`oneOf`/`allOf`,
 /// `$defs`/`definitions` and `not`; returns the JSON-pointer-like path of the
 /// first object node that lacks the pin.
+///
+/// A schema that holds the rule is walked without an allocation: the path is
+/// put together on the way back from a miss, a segment a level.
 pub fn strict_schema_missing_additional_properties(schema: &Value) -> Option<String> {
-    fn walk(node: &Value, path: &str) -> Option<String> {
+    // The path from `node` to the first unpinned object node under it, empty
+    // when `node` is that node.
+    fn walk(node: &Value) -> Option<String> {
         let obj = node.as_object()?;
         let is_object_node = obj.get("type").and_then(Value::as_str) == Some("object")
             || obj
@@ -819,17 +1062,13 @@ pub fn strict_schema_missing_additional_properties(schema: &Value) -> Option<Str
                 .is_some_and(|types| types.iter().any(|t| t.as_str() == Some("object")))
             || (obj.get("type").is_none() && obj.contains_key("properties"));
         if is_object_node && obj.get("additionalProperties") != Some(&Value::Bool(false)) {
-            return Some(if path.is_empty() {
-                "()".to_string()
-            } else {
-                path.to_string()
-            });
+            return Some(String::new());
         }
         for key in ["properties", "$defs", "definitions"] {
             if let Some(children) = obj.get(key).and_then(Value::as_object) {
                 for (name, child) in children {
-                    if let Some(found) = walk(child, &format!("{path}/{key}/{name}")) {
-                        return Some(found);
+                    if let Some(rest) = walk(child) {
+                        return Some(format!("/{key}/{name}{rest}"));
                     }
                 }
             }
@@ -837,22 +1076,27 @@ pub fn strict_schema_missing_additional_properties(schema: &Value) -> Option<Str
         for key in ["anyOf", "oneOf", "allOf", "prefixItems"] {
             if let Some(children) = obj.get(key).and_then(Value::as_array) {
                 for (index, child) in children.iter().enumerate() {
-                    if let Some(found) = walk(child, &format!("{path}/{key}/{index}")) {
-                        return Some(found);
+                    if let Some(rest) = walk(child) {
+                        return Some(format!("/{key}/{index}{rest}"));
                     }
                 }
             }
         }
         for key in ["items", "not"] {
             if let Some(child) = obj.get(key) {
-                if let Some(found) = walk(child, &format!("{path}/{key}")) {
-                    return Some(found);
+                if let Some(rest) = walk(child) {
+                    return Some(format!("/{key}{rest}"));
                 }
             }
         }
         None
     }
-    walk(schema, "")
+    let path = walk(schema)?;
+    Some(if path.is_empty() {
+        "()".to_string()
+    } else {
+        path
+    })
 }
 
 /// Shared shape rules for a json_schema format: name non-empty, schema a JSON object.
@@ -1387,7 +1631,8 @@ impl Serialize for FunctionCall {
 
 impl<'de> Deserialize<'de> for FunctionCall {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let value = Value::deserialize(deserializer)?;
+        // Buffered strictly: the plain value reader keeps the last of a repeated `name`.
+        let value = StrictValue.deserialize(deserializer)?;
         match &value {
             Value::String(s) => match s.as_str() {
                 "none" => Ok(FunctionCall::None),
@@ -1506,6 +1751,9 @@ impl Usage {
         self.prompt_tokens_details = Some(PromptTokenUsageInfo {
             cached_tokens,
             audio_tokens: None,
+            text_tokens: None,
+            image_tokens: None,
+            cache_write_tokens: None,
         });
         self
     }
@@ -1522,10 +1770,12 @@ impl Usage {
 
     /// Add speculative decoding details to this Usage.
     pub fn with_speculative_tokens(mut self, accepted: u32, drafted: u32) -> Self {
-        if drafted > 0 {
+        if accepted > 0 || drafted > 0 {
             let details = self.completion_tokens_details.get_or_insert_default();
             details.accepted_prediction_tokens = Some(accepted);
-            details.rejected_prediction_tokens = Some(drafted.saturating_sub(accepted));
+            // A zero draft count can mean unavailable, not zero proposals.
+            details.rejected_prediction_tokens =
+                (drafted > 0 && drafted >= accepted).then(|| drafted - accepted);
         }
         self
     }
@@ -1540,7 +1790,31 @@ impl Usage {
         self
     }
 
-    /// Every detail counter present, zero where nothing was counted: the
+    /// Report the prompt's image tokens: the tokens the gateway's multimodal
+    /// expansion wrote into the prompt for the request's images, as
+    /// `prompt_tokens_details.image_tokens`. `None` leaves the details as they
+    /// are: a request without an image the gateway expanded reports no image
+    /// count, as before. The count is kept within `prompt_tokens`, the total
+    /// the details break down.
+    pub fn with_image_tokens(mut self, image_tokens: Option<u32>) -> Self {
+        if let Some(image_tokens) = image_tokens {
+            self.prompt_tokens_details
+                .get_or_insert(PromptTokenUsageInfo {
+                    cached_tokens: 0,
+                    audio_tokens: None,
+                    text_tokens: None,
+                    image_tokens: None,
+                    cache_write_tokens: None,
+                })
+                .image_tokens = Some(image_tokens.min(self.prompt_tokens));
+        }
+        self
+    }
+
+    /// Default detail counters to zero, except unknown speculative rejections.
+    /// With explicit accepted tokens, unavailable/inconsistent drafts leave rejected
+    /// absent. Default zeros for non-speculative usage are schema defaults, not
+    /// measurements of speculative rejection. Otherwise this preserves the
     /// shape the OpenAI API sends on every chat completion
     /// (`prompt_tokens_details.{cached_tokens,audio_tokens}` and
     /// `completion_tokens_details.{reasoning_tokens,audio_tokens,
@@ -1552,13 +1826,22 @@ impl Usage {
             .get_or_insert(PromptTokenUsageInfo {
                 cached_tokens: 0,
                 audio_tokens: None,
+                text_tokens: None,
+                image_tokens: None,
+                cache_write_tokens: None,
             });
         prompt.audio_tokens.get_or_insert(0);
         let completion = self.completion_tokens_details.get_or_insert_default();
         completion.reasoning_tokens.get_or_insert(0);
         completion.audio_tokens.get_or_insert(0);
+        // Explicit accepted (including measured zero) with absent rejected marks
+        // unavailable proposals. Preserve it before inserting legacy schema defaults.
+        let unknown_rejected = completion.accepted_prediction_tokens.is_some()
+            && completion.rejected_prediction_tokens.is_none();
         completion.accepted_prediction_tokens.get_or_insert(0);
-        completion.rejected_prediction_tokens.get_or_insert(0);
+        if !unknown_rejected {
+            completion.rejected_prediction_tokens.get_or_insert(0);
+        }
         self
     }
 }
@@ -1570,6 +1853,7 @@ pub struct CompletionTokensDetails {
     pub audio_tokens: Option<u32>,
     pub accepted_prediction_tokens: Option<u32>,
     pub rejected_prediction_tokens: Option<u32>,
+    pub text_tokens: Option<u32>,
 }
 
 /// Usage information (used by rerank and other endpoints)
@@ -1577,6 +1861,10 @@ pub struct CompletionTokensDetails {
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct UsageInfo {
     pub prompt_tokens: u32,
+    /// Generated tokens. The public API's embeddings usage has no such key
+    /// (only `prompt_tokens` and `total_tokens`), so a usage written without
+    /// it reads as none generated.
+    #[serde(default)]
     pub completion_tokens: u32,
     pub total_tokens: u32,
     pub reasoning_tokens: Option<u32>,
@@ -1586,9 +1874,15 @@ pub struct UsageInfo {
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct PromptTokenUsageInfo {
+    /// Prompt tokens read from the cache. The public API defaults the key to
+    /// zero, so details an upstream writes without it read as none cached.
+    #[serde(default)]
     pub cached_tokens: u32,
     #[serde(default)]
     pub audio_tokens: Option<u32>,
+    pub text_tokens: Option<u32>,
+    pub image_tokens: Option<u32>,
+    pub cache_write_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -1827,6 +2121,8 @@ pub enum PromptVariableTyped {
     },
     #[serde(rename = "input_file")]
     ResponseInputFile {
+        /// The file's detail level, as an input file part takes it.
+        detail: Option<crate::responses::FileDetail>,
         file_data: Option<String>,
         file_id: Option<String>,
         file_url: Option<String>,
@@ -1853,10 +2149,11 @@ pub enum Detail {
 
 /// Retention policy for prompt-cache entries on the Responses API.
 ///
-/// Spec: `prompt_cache_retention: "in-memory" | "24h"`.
+/// Spec: `prompt_cache_retention: "in_memory" | "24h"` (`PromptCacheRetentionEnum`).
+/// `in-memory`, the spelling this crate wrote before, still reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum PromptCacheRetention {
-    #[serde(rename = "in-memory")]
+    #[serde(rename = "in_memory", alias = "in-memory")]
     InMemory,
     #[serde(rename = "24h")]
     Duration24h,
@@ -2094,6 +2391,9 @@ mod tests {
             Some(PromptTokenUsageInfo {
                 cached_tokens: 0,
                 audio_tokens: None,
+                text_tokens: None,
+                image_tokens: None,
+                cache_write_tokens: None,
             })
         ));
     }
@@ -2129,6 +2429,55 @@ mod tests {
     }
 
     #[test]
+    fn image_tokens_are_reported_within_the_prompt_or_not_at_all() {
+        let none = Usage::from_counts(10, 4).with_image_tokens(None);
+        assert!(
+            none.prompt_tokens_details.is_none(),
+            "no image count opens no details"
+        );
+        let kept = Usage::from_counts(10, 4)
+            .with_cached_tokens(2)
+            .with_image_tokens(None);
+        assert_eq!(
+            kept.prompt_tokens_details
+                .as_ref()
+                .map(|d| (d.cached_tokens, d.image_tokens)),
+            Some((2, None)),
+            "no image count leaves the cache details as they are"
+        );
+
+        let reported = Usage::from_counts(535, 4).with_image_tokens(Some(324));
+        assert_eq!(
+            reported
+                .prompt_tokens_details
+                .as_ref()
+                .map(|d| (d.cached_tokens, d.image_tokens)),
+            Some((0, Some(324))),
+            "the details the count opens default the cache to zero"
+        );
+        let beside_cache = Usage::from_counts(535, 4)
+            .with_cached_tokens(100)
+            .with_image_tokens(Some(324));
+        assert_eq!(
+            beside_cache
+                .prompt_tokens_details
+                .as_ref()
+                .map(|d| (d.cached_tokens, d.image_tokens)),
+            Some((100, Some(324)))
+        );
+
+        let clamped = Usage::from_counts(10, 4).with_image_tokens(Some(12));
+        assert_eq!(
+            clamped
+                .prompt_tokens_details
+                .as_ref()
+                .and_then(|d| d.image_tokens),
+            Some(10),
+            "the count stays within the prompt"
+        );
+    }
+
+    #[test]
     fn content_part_deserializes_audio_url() {
         let value = json!({
             "type": "audio_url",
@@ -2141,10 +2490,97 @@ mod tests {
             part,
             ContentPart::AudioUrl {
                 audio_url: AudioUrl {
-                    url: "https://example.com/audio.wav".to_string(),
+                    url: "https://example.com/audio.wav".to_string().into(),
                 },
             }
         );
+    }
+
+    /// A known `type` whose body does not fit it is refused with serde's
+    /// reason for the field, not read as an unknown part.
+    #[test]
+    fn content_part_refuses_a_malformed_known_type_with_the_fields_reason() {
+        for (value, reason) in [
+            (
+                json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,AA==", "max_long_side_pixel": -1}}),
+                "invalid value: integer `-1`, expected u32, in `image_url`",
+            ),
+            (
+                json!({"type": "video_url", "video_url": {"url": "data:video/mp4;base64,AA==", "fps": "1"}}),
+                "invalid type: string \"1\", expected f64, in `video_url`",
+            ),
+            (
+                json!({"type": "image_url", "image_url": {"detail": "high"}}),
+                "missing field `image_url.url`",
+            ),
+            (json!({"type": "image_url"}), "missing field `image_url`"),
+            (
+                json!({"type": "text", "text": 5}),
+                "invalid type: integer `5`, expected a string, in `text`",
+            ),
+            (
+                json!({"type": "refusal", "refusal": null}),
+                "invalid type: null, expected a string, in `refusal`",
+            ),
+        ] {
+            let error = serde_json::from_value::<ContentPart>(value.clone()).unwrap_err();
+            assert_eq!(error.to_string(), reason, "{value}");
+        }
+    }
+
+    /// Every typed kind reads back typed: the `ContentPart` variants, the
+    /// `KnownContentPart` mirror and `KnownContentPart::names` name the same
+    /// set, and the match below has no wildcard, so a new variant does not
+    /// compile until it has a sample here (a kind missing from the mirror or
+    /// the names would read back as an unknown part and fail the round trip).
+    #[test]
+    fn every_typed_content_part_reads_back_typed() {
+        let samples = [
+            ContentPart::Text {
+                text: "t".to_string(),
+            },
+            ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: "u".to_string().into(),
+                    detail: None,
+                    max_long_side_pixel: None,
+                },
+            },
+            ContentPart::AudioUrl {
+                audio_url: AudioUrl {
+                    url: "u".to_string().into(),
+                },
+            },
+            ContentPart::InputAudio {
+                input_audio: InputAudio {
+                    data: "d".to_string().into(),
+                    format: "wav".to_string(),
+                },
+            },
+            ContentPart::VideoUrl {
+                video_url: VideoUrl {
+                    url: "u".to_string().into(),
+                    fps: None,
+                    max_long_side_pixel: None,
+                },
+            },
+            ContentPart::Refusal {
+                refusal: "r".to_string(),
+            },
+        ];
+        for part in samples {
+            match &part {
+                ContentPart::Text { .. }
+                | ContentPart::ImageUrl { .. }
+                | ContentPart::AudioUrl { .. }
+                | ContentPart::InputAudio { .. }
+                | ContentPart::VideoUrl { .. }
+                | ContentPart::Refusal { .. } => {}
+                ContentPart::Unknown(_) => panic!("a typed sample"),
+            }
+            let value = serde_json::to_value(&part).unwrap();
+            assert_eq!(serde_json::from_value::<ContentPart>(value).unwrap(), part);
+        }
     }
 
     #[test]
@@ -2205,7 +2641,7 @@ mod tests {
             part,
             ContentPart::InputAudio {
                 input_audio: InputAudio {
-                    data: "UklGRg==".to_string(),
+                    data: "UklGRg==".to_string().into(),
                     format: "wav".to_string(),
                 },
             }
@@ -2350,6 +2786,60 @@ mod tests {
         assert!(usage.completion_tokens_details.is_none());
     }
 
+    /// The public API defaults `cached_tokens` to zero: prompt details an
+    /// upstream writes without the key read as none cached, where the usage,
+    /// and the completion around it, failed to parse.
+    #[test]
+    fn prompt_details_without_cached_tokens_read_as_none_cached() {
+        let usage: Usage = serde_json::from_value(json!({
+            "prompt_tokens": 9, "completion_tokens": 3, "total_tokens": 12,
+            "prompt_tokens_details": {"audio_tokens": 0}
+        }))
+        .expect("a usage without cached_tokens parses");
+        let details = usage.prompt_tokens_details.expect("details");
+        assert_eq!(details.cached_tokens, 0);
+        assert_eq!(details.audio_tokens, Some(0));
+    }
+
+    /// The newer counters an upstream reports, on the prompt and on the
+    /// completion, are written back as they arrived.
+    #[test]
+    fn the_newer_token_counters_of_an_upstream_usage_are_kept() {
+        let sent = json!({
+            "prompt_tokens": 9, "completion_tokens": 3, "total_tokens": 12,
+            "prompt_tokens_details": {
+                "cached_tokens": 4, "audio_tokens": 0, "text_tokens": 7,
+                "image_tokens": 2, "cache_write_tokens": 5
+            },
+            "completion_tokens_details": {
+                "reasoning_tokens": 0, "audio_tokens": 0, "accepted_prediction_tokens": 0,
+                "rejected_prediction_tokens": 0, "text_tokens": 3
+            }
+        });
+        let usage: Usage = serde_json::from_value(sent.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&usage).unwrap(), sent);
+    }
+
+    /// A usage the gateway builds is written as before: the newer counters stay
+    /// off the wire unless an upstream reported them.
+    #[test]
+    fn a_built_usage_is_written_without_the_newer_counters() {
+        let usage = Usage::from_counts(3, 4)
+            .with_cached_tokens(0)
+            .with_complete_details();
+        assert_eq!(
+            serde_json::to_value(&usage).unwrap(),
+            json!({
+                "prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7,
+                "prompt_tokens_details": {"cached_tokens": 0, "audio_tokens": 0},
+                "completion_tokens_details": {
+                    "reasoning_tokens": 0, "audio_tokens": 0,
+                    "accepted_prediction_tokens": 0, "rejected_prediction_tokens": 0
+                }
+            })
+        );
+    }
+
     #[test]
     fn json_schema_shape_requires_name_and_object_schema() {
         let cases = [
@@ -2376,6 +2866,147 @@ mod tests {
                 }
                 None => assert!(result.is_ok(), "{name:?}/{schema} should pass"),
             }
+        }
+    }
+
+    /// The strict walk names the first object node that lacks the pin by its
+    /// path from the root, a segment a step, and the root itself as `()`; a
+    /// schema that pins every object node names none.
+    #[test]
+    fn the_strict_walk_names_the_first_unpinned_node_by_its_path() {
+        let open = || json!({"type": "object", "properties": {"x": {"type": "string"}}});
+        let pinned = |key: &str, child: Value| {
+            let mut node = json!({"type": "object", "additionalProperties": false});
+            node[key] = child;
+            node
+        };
+        let text = json!({"type": "string"});
+        let cases = [
+            (open(), Some("()")),
+            (json!({"type": ["object", "null"]}), Some("()")),
+            (json!({"properties": {}}), Some("()")),
+            (
+                pinned("properties", json!({"a": open()})),
+                Some("/properties/a"),
+            ),
+            (
+                pinned("properties", json!({"": open()})),
+                Some("/properties/"),
+            ),
+            (pinned("$defs", json!({"a": open()})), Some("/$defs/a")),
+            (
+                pinned("definitions", json!({"a": open()})),
+                Some("/definitions/a"),
+            ),
+            (pinned("anyOf", json!([text, open()])), Some("/anyOf/1")),
+            (pinned("oneOf", json!([open()])), Some("/oneOf/0")),
+            (
+                pinned("allOf", json!([text, text, open()])),
+                Some("/allOf/2"),
+            ),
+            (
+                pinned("prefixItems", json!([text, open()])),
+                Some("/prefixItems/1"),
+            ),
+            (pinned("items", open()), Some("/items")),
+            (pinned("not", open()), Some("/not")),
+            (
+                pinned(
+                    "properties",
+                    json!({"a": {"type": "array", "items": {"anyOf": [
+                        text,
+                        pinned("properties", json!({"b": open()}))
+                    ]}}}),
+                ),
+                Some("/properties/a/items/anyOf/1/properties/b"),
+            ),
+            // First is depth first: the node under the first name, not its nearer sibling.
+            (
+                pinned(
+                    "properties",
+                    json!({"a": pinned("properties", json!({"deep": open()})), "b": open()}),
+                ),
+                Some("/properties/a/properties/deep"),
+            ),
+            // First is by kind: named children, then the lists, then `items` and `not`.
+            (
+                json!({
+                    "type": "object", "additionalProperties": false,
+                    "not": open(), "items": open(), "anyOf": [open()], "properties": {"p": open()}
+                }),
+                Some("/properties/p"),
+            ),
+            (
+                json!({
+                    "type": "object", "additionalProperties": false,
+                    "not": open(), "items": open(), "anyOf": [open()]
+                }),
+                Some("/anyOf/0"),
+            ),
+            (
+                json!({
+                    "type": "object", "additionalProperties": false,
+                    "not": open(), "items": open()
+                }),
+                Some("/items"),
+            ),
+            // First within a kind is by key: `properties`, `$defs`, `definitions`,
+            // and `anyOf`, `oneOf`, `allOf`, `prefixItems`.
+            (
+                json!({
+                    "type": "object", "additionalProperties": false,
+                    "definitions": {"d": open()}, "$defs": {"d": open()},
+                    "properties": {"p": open()}
+                }),
+                Some("/properties/p"),
+            ),
+            (
+                json!({
+                    "type": "object", "additionalProperties": false,
+                    "definitions": {"d": open()}, "$defs": {"d": open()}
+                }),
+                Some("/$defs/d"),
+            ),
+            (
+                json!({
+                    "type": "object", "additionalProperties": false,
+                    "prefixItems": [open()], "allOf": [open()],
+                    "oneOf": [open()], "anyOf": [open()]
+                }),
+                Some("/anyOf/0"),
+            ),
+            (
+                json!({
+                    "type": "object", "additionalProperties": false,
+                    "prefixItems": [open()], "allOf": [open()], "oneOf": [open()]
+                }),
+                Some("/oneOf/0"),
+            ),
+            (
+                json!({
+                    "type": "object", "additionalProperties": false,
+                    "prefixItems": [open()], "allOf": [open()]
+                }),
+                Some("/allOf/0"),
+            ),
+            // First in a list is its first element.
+            (pinned("anyOf", json!([open(), open()])), Some("/anyOf/0")),
+            (
+                pinned(
+                    "properties",
+                    json!({"a": text, "b": pinned("items", text.clone())}),
+                ),
+                None,
+            ),
+            (text.clone(), None),
+            (json!(true), None),
+        ];
+        for (schema, path) in cases {
+            assert_eq!(
+                strict_schema_missing_additional_properties(&schema).as_deref(),
+                path,
+                "{schema}"
+            );
         }
     }
 
@@ -2588,7 +3219,7 @@ mod tests {
             ("{}", "missing field `type` at line 1 column 2"),
             (
                 r#"{"type":"xml"}"#,
-                "unknown variant `xml`, expected one of `text`, `json_object`, `json_schema` at line 1 column 13",
+                "unknown variant `xml`, expected one of `text`, `json_object`, `json_schema`, `structural_tag` at line 1 column 13",
             ),
             (
                 r#"{"type":1}"#,
@@ -2633,7 +3264,7 @@ mod tests {
             ("[]", "missing field `type` at line 1 column 2"),
             (
                 r#"["xml"]"#,
-                "unknown variant `xml`, expected one of `text`, `json_object`, `json_schema` at line 1 column 6",
+                "unknown variant `xml`, expected one of `text`, `json_object`, `json_schema`, `structural_tag` at line 1 column 6",
             ),
             (
                 "[1]",
@@ -2689,11 +3320,140 @@ mod tests {
         };
         assert_eq!(
             request_err(r#"{"json_schema":{"name":"a","schema":{}},"type":"xml"}"#),
-            "unknown variant `xml`, expected one of `text`, `json_object`, `json_schema` at line 1 column 127"
+            "unknown variant `xml`, expected one of `text`, `json_object`, `json_schema`, `structural_tag` at line 1 column 127"
         );
         assert_eq!(
             request_err(r#"{"type":"json_schema","json_schema":"text"}"#),
             "invalid type: string \"text\", expected struct JsonSchemaFormat at line 1 column 117"
+        );
+    }
+
+    /// The two kinds that carry a value carry it behind a pointer: a format is
+    /// two words wherever one is held (the Gateway's chat route task holds a
+    /// request's format three times over its awaits, and the schema's 128
+    /// bytes inline had put that task's box over the allocator's 3,584-byte
+    /// class edge on every chat request), and the text written back is the
+    /// text read.
+    #[test]
+    fn a_response_formats_schema_and_tag_ride_behind_a_pointer_each() {
+        assert_eq!(size_of::<ResponseFormat>(), 2 * size_of::<usize>());
+        assert_eq!(
+            size_of::<Option<ResponseFormat>>(),
+            size_of::<ResponseFormat>()
+        );
+        let schema_text = concat!(
+            r#"{"type":"json_schema","json_schema":{"name":"a","schema":{"type":"object"},"#,
+            r#""strict":true,"description":"d"}}"#
+        );
+        let tag_text = r#"{"type":"structural_tag","structures":[],"triggers":["<w>"]}"#;
+        let read = |text: &str| serde_json::from_str::<ResponseFormat>(text).expect(text);
+        let schema = read(schema_text);
+        let ResponseFormat::JsonSchema { json_schema } = &schema else {
+            panic!("{schema:?}");
+        };
+        assert_eq!(size_of_val(json_schema), size_of::<usize>());
+        assert_eq!(json_schema.description.as_deref(), Some("d"));
+        let tag = read(tag_text);
+        let ResponseFormat::StructuralTag { spec } = &tag else {
+            panic!("{tag:?}");
+        };
+        assert_eq!(size_of_val(spec), size_of::<usize>());
+        assert_eq!(spec.keys().collect::<Vec<_>>(), ["structures", "triggers"]);
+        for (format, text) in [(&schema, schema_text), (&tag, tag_text)] {
+            assert_eq!(serde_json::to_string(format).expect("writes"), text);
+        }
+    }
+
+    /// A structural tag is carried as it arrived: every key but `type`, in
+    /// the order they came, in whichever spelling the engine's grammar
+    /// compiler takes (`structures` with `triggers`, or a `format`), unknown
+    /// keys included, so the text written back is the text read. With `type`
+    /// last the keys before it are kept the same, in their places, a
+    /// `json_schema` among them as the value it was (the last one where the
+    /// key repeats, in the first one's place, before the kind as after it, as
+    /// the derive's flattened map keeps it); the sequence form reads the
+    /// kind, then the object.
+    #[test]
+    fn a_structural_tag_response_format_is_kept_as_it_arrived() {
+        let read = |text: &str| serde_json::from_str::<ResponseFormat>(text).expect(text);
+        let spec_of = |format: &ResponseFormat| match format {
+            ResponseFormat::StructuralTag { spec } => (**spec).clone(),
+            other => panic!("{other:?}"),
+        };
+        let structures = concat!(
+            r#"{"type":"structural_tag","structures":[{"begin":"<w>","schema":{"type":"object","#,
+            r#""properties":{"city":{"type":"string"},"temp_c":{"type":"integer"}},"#,
+            r#""required":["city","temp_c"],"additionalProperties":false},"end":"</w>"}],"#,
+            r#""triggers":["<w>"]}"#
+        );
+        let triggered = concat!(
+            r#"{"type":"structural_tag","format":{"type":"triggered_tags","triggers":["<w>"],"#,
+            r#""tags":[{"begin":"<w>","content":{"type":"json_schema","json_schema":"#,
+            r#"{"type":"object"}},"end":"</w>"}]},"note":"kept"}"#
+        );
+        for text in [structures, triggered] {
+            let format = read(text);
+            assert_eq!(serde_json::to_string(&format).expect("writes"), text);
+            assert_eq!(
+                serde_json::to_value(&format).expect("writes"),
+                serde_json::from_str::<Value>(text).expect("json")
+            );
+        }
+        assert_eq!(
+            spec_of(&read(structures)).keys().collect::<Vec<_>>(),
+            ["structures", "triggers"]
+        );
+        // `type` last: the keys before it are kept, a `json_schema` among them
+        let late = read(
+            r#"{"triggers":["<w>"],"json_schema":{"name":"n","name":"m"},"structures":[],"type":"structural_tag"}"#,
+        );
+        let spec = spec_of(&late);
+        assert_eq!(spec["triggers"], json!(["<w>"]));
+        assert_eq!(spec["structures"], json!([]));
+        assert_eq!(spec["json_schema"], json!({"name": "m"}));
+        assert_eq!(spec.len(), 3);
+        assert_eq!(
+            spec.keys().collect::<Vec<_>>(),
+            ["triggers", "json_schema", "structures"],
+            "the keys keep their places"
+        );
+        let ordered = r#"{"triggers":["<w>"],"json_schema":{"name":"m"},"structures":[],"type":"structural_tag"}"#;
+        assert_eq!(
+            serde_json::to_string(&read(ordered)).expect("writes"),
+            r#"{"type":"structural_tag","triggers":["<w>"],"json_schema":{"name":"m"},"structures":[]}"#
+        );
+        // a repeated `json_schema`: the last value, in the first one's place
+        for text in [
+            r#"{"json_schema":1,"triggers":[],"json_schema":2,"type":"structural_tag"}"#,
+            r#"{"type":"structural_tag","json_schema":1,"triggers":[],"json_schema":2}"#,
+            r#"{"json_schema":1,"type":"structural_tag","triggers":[],"json_schema":2}"#,
+        ] {
+            assert_eq!(
+                serde_json::to_string(&read(text)).expect("writes"),
+                r#"{"type":"structural_tag","json_schema":2,"triggers":[]}"#,
+                "{text}"
+            );
+        }
+        // inside a request: the field reads and writes back as sent
+        let body = format!(
+            r#"{{"model":"m","messages":[{{"role":"user","content":"hi"}}],"response_format":{structures}}}"#
+        );
+        let request: crate::chat::ChatCompletionRequest =
+            serde_json::from_str(&body).expect("a request");
+        assert_eq!(
+            serde_json::to_value(&request).expect("writes")["response_format"],
+            serde_json::from_str::<Value>(structures).expect("json")
+        );
+        // the sequence form: the kind, then the object
+        assert_eq!(
+            spec_of(&read(r#"["structural_tag",{"triggers":[]}]"#)),
+            serde_json::from_str::<Map<String, Value>>(r#"{"triggers":[]}"#).expect("an object")
+        );
+        assert_eq!(
+            serde_json::from_str::<ResponseFormat>(r#"["structural_tag"]"#)
+                .expect_err("no object")
+                .to_string(),
+            "invalid length 0, expected struct variant ResponseFormat::StructuralTag with 1 element at line 1 column 18"
         );
     }
 
@@ -2708,17 +3468,22 @@ mod tests {
                 ResponseFormat::Text => ResponseFormatKind::Text,
                 ResponseFormat::JsonObject => ResponseFormatKind::JsonObject,
                 ResponseFormat::JsonSchema { .. } => ResponseFormatKind::JsonSchema,
+                ResponseFormat::StructuralTag { .. } => ResponseFormatKind::StructuralTag,
             }
         }
         let formats = [
             ResponseFormat::Text,
             ResponseFormat::JsonObject,
             ResponseFormat::JsonSchema {
-                json_schema: JsonSchemaFormat {
+                json_schema: Box::new(JsonSchemaFormat {
+                    description: None,
                     name: "answer".to_owned(),
                     schema: json!({"type": "object"}),
                     strict: None,
-                },
+                }),
+            },
+            ResponseFormat::StructuralTag {
+                spec: Box::default(),
             },
         ];
         assert_eq!(formats.len(), ResponseFormatKind::ALL.len());
@@ -2829,5 +3594,127 @@ mod tests {
             .expect("an unknown key twice is ignored"),
             ResponseFormat::JsonSchema { .. }
         ));
+    }
+
+    #[cfg(test)]
+    mod speculative_usage_regression {
+        use super::Usage;
+
+        #[test]
+        fn accepted_survives_unknown_drafted_count() {
+            let usage = Usage::from_counts(10, 5).with_speculative_tokens(2, 0);
+            let details = usage
+                .completion_tokens_details
+                .expect("accepted must not be discarded");
+            assert_eq!(details.accepted_prediction_tokens, Some(2));
+            assert_eq!(
+                details.rejected_prediction_tokens, None,
+                "unknown drafted is not measured rejection"
+            );
+        }
+    }
+
+    #[cfg(test)]
+    mod speculative_complete_details_regression {
+        use super::Usage;
+
+        #[test]
+        fn complete_details_preserves_unknown_rejected() {
+            for drafted in [0, 1] {
+                let usage = Usage::from_counts(10, 5)
+                    .with_reasoning_tokens(3)
+                    .with_speculative_tokens(2, drafted)
+                    .with_complete_details();
+                let json = serde_json::to_value(&usage).unwrap();
+                let details = &json["completion_tokens_details"];
+                assert_eq!(details["accepted_prediction_tokens"], 2);
+                assert_eq!(details["reasoning_tokens"], 3);
+                assert!(
+                    details.get("rejected_prediction_tokens").is_none(),
+                    "unknown or inconsistent drafts must not be zero-filled: {json}"
+                );
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod speculative_usage_controls {
+        use super::Usage;
+        #[test]
+        fn known_drafts_keep_measured_rejected_including_zero() {
+            for (accepted, drafted, rejected) in [(2, 3, 1), (2, 2, 0), (0, 3, 3)] {
+                let usage = Usage::from_counts(10, 5)
+                    .with_speculative_tokens(accepted, drafted)
+                    .with_reasoning_tokens(3)
+                    .with_complete_details();
+                let details = usage.completion_tokens_details.unwrap();
+                assert_eq!(details.accepted_prediction_tokens, Some(accepted));
+                assert_eq!(details.rejected_prediction_tokens, Some(rejected));
+                assert_eq!(details.reasoning_tokens, Some(3));
+            }
+        }
+        #[test]
+        fn no_speculation_keeps_zero_schema_defaults() {
+            assert!(Usage::from_counts(10, 5)
+                .with_speculative_tokens(0, 0)
+                .completion_tokens_details
+                .is_none());
+            for usage in [
+                Usage::from_counts(10, 5),
+                Usage::from_counts(10, 5).with_speculative_tokens(0, 0),
+            ] {
+                let json = serde_json::to_value(usage.with_complete_details()).unwrap();
+                assert_eq!(
+                    json["completion_tokens_details"]["accepted_prediction_tokens"],
+                    0
+                );
+                assert_eq!(
+                    json["completion_tokens_details"]["rejected_prediction_tokens"],
+                    0
+                );
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod zero_accepted_unknown_rejections {
+        use super::Usage;
+
+        #[test]
+        fn complete_details_keeps_explicit_zero_accepted_unknown_rejected() {
+            let mut usage = Usage::from_counts(10, 5);
+            usage
+                .completion_tokens_details
+                .get_or_insert_default()
+                .accepted_prediction_tokens = Some(0);
+            let details = usage
+                .with_complete_details()
+                .completion_tokens_details
+                .unwrap();
+            assert_eq!(details.accepted_prediction_tokens, Some(0));
+            assert_eq!(details.rejected_prediction_tokens, None);
+        }
+    }
+
+    /// The routing text of a JSON input: the string itself, an array's string
+    /// members joined on spaces, nothing for any other shape.
+    #[test]
+    fn a_json_inputs_routing_text_is_its_strings_joined() {
+        assert_eq!(routing_text_of_input(&json!("hello world")), "hello world");
+        assert_eq!(routing_text_of_input(&json!(["a", 1, "b", null])), "a b");
+        assert_eq!(routing_text_of_input(&json!([[1, 2], [3]])), "");
+        assert_eq!(routing_text_of_input(&json!({"text": "x"})), "");
+        assert_eq!(routing_text_of_input(&json!(7)), "");
+    }
+
+    /// The type names the validation messages print, one per JSON shape.
+    #[test]
+    fn a_json_values_type_name_is_the_word_a_validation_message_prints() {
+        assert_eq!(json_type_name(&Value::Null), "null");
+        assert_eq!(json_type_name(&json!(true)), "a boolean");
+        assert_eq!(json_type_name(&json!(1)), "a number");
+        assert_eq!(json_type_name(&json!("x")), "a string");
+        assert_eq!(json_type_name(&json!([])), "an array");
+        assert_eq!(json_type_name(&json!({})), "an object");
     }
 }

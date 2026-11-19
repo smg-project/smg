@@ -20,6 +20,42 @@ def _module(name, **attrs):
     return module
 
 
+def test_object_storage_metadata_is_prepared_before_native_publish(server_mod, monkeypatch):
+    calls = []
+
+    class Published(Exception):
+        pass
+
+    monkeypatch.setattr(server_mod, "default_kv_events_config", lambda _args: None)
+    monkeypatch.setattr(
+        server_mod, "prepare_model_metadata", lambda args: calls.append(args.model_path)
+    )
+
+    def publish(args, *, role):
+        assert calls == [args.model_path]
+        assert role == "tokenizer"
+        raise Published
+
+    monkeypatch.setattr(server_mod, "publish", publish)
+    args = SimpleNamespace(model_path="s3://bucket/checkpoint", disaggregation_mode="null")
+    with pytest.raises(Published):
+        asyncio.run(server_mod.serve_grpc(args))
+
+
+def test_object_storage_download_failure_is_a_startup_configuration_error(server_mod, monkeypatch):
+    from smg_grpc_servicer.rust_lifecycle import ServicerConfigError
+
+    def denied(_args):
+        raise ServicerConfigError("object storage access denied")
+
+    monkeypatch.setattr(server_mod, "default_kv_events_config", lambda _args: None)
+    monkeypatch.setattr(server_mod, "prepare_model_metadata", denied)
+    args = SimpleNamespace(model_path="s3://bucket/checkpoint", disaggregation_mode="null")
+    with pytest.raises(SystemExit) as error:
+        asyncio.run(server_mod.serve_grpc(args))
+    assert error.value.code == 2
+
+
 @pytest.fixture(autouse=True)
 def python_servicer(monkeypatch):
     """These tests drive the Python servicer's start-up: since the Rust servicer
@@ -290,18 +326,18 @@ def test_generation_warmup_sends_valid_sampling_defaults(monkeypatch, server_mod
 
 def test_the_planned_warm_up_stays_off_on_a_disaggregation_role(monkeypatch, server_mod, caplog):
     """This servicer's own warm-up request carried the stand-in bootstrap
-    already; the planned pass on a prefill or decode leg is the Rust
+    already; the planned pass on a prefill or decode side is the Rust
     launcher's, so the planner is never asked here, and a single engine still
     plans."""
     caplog.set_level(logging.INFO)
     monkeypatch.setattr(
         server_mod, "DisaggregationMode", SimpleNamespace(NULL=SimpleNamespace(value="null"))
     )
-    never = Mock(side_effect=AssertionError("the planner must not be asked on a leg"))
+    never = Mock(side_effect=AssertionError("the planner must not be asked on a side"))
     monkeypatch.setattr(server_mod, "warmup_inputs", never)
     for mode in ("prefill", "decode"):
-        leg = SimpleNamespace(disaggregation_mode=mode)
-        assert server_mod._planned_warmup(leg, SimpleNamespace(), channel=None) is None
+        side = SimpleNamespace(disaggregation_mode=mode)
+        assert server_mod._planned_warmup(side, SimpleNamespace(), channel=None) is None
     never.assert_not_called()
     assert any(
         "Planned warm-up: none on a disaggregation role on this servicer" in r.getMessage()

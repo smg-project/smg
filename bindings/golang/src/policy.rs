@@ -26,13 +26,17 @@ use smg::{
         BucketPolicy, CacheAwarePolicy, LoadBalancingPolicy, PowerOfTwoPolicy, RandomPolicy,
         RoundRobinPolicy, SelectWorkerInfo,
     },
-    routers::grpc::backend_client::BackendClient,
     worker::{
-        basic::{RuntimeType, WorkerMetadata, WorkerRoutingKeyLoad},
-        circuit_breaker::{CircuitBreaker, CircuitState},
-        endpoint::Endpoint,
-        metadata::DecodingLabels,
-        resilience::ResolvedResilience,
+        connection::engine::EngineConnection,
+        health::{
+            circuit_breaker::{CircuitBreaker, CircuitState},
+            resilience::ResolvedResilience,
+        },
+        identity::{
+            basic::{RuntimeType, WorkerMetadata, WorkerRoutingKeyLoad},
+            endpoint::Endpoint,
+            metadata::DecodingLabels,
+        },
         ConnectionMode, OverloadThresholds, PdPairing, Worker, WorkerResult, WorkerType,
     },
 };
@@ -158,24 +162,10 @@ impl Worker for GrpcWorker {
         Ok(())
     }
 
-    // FFI workers don't run the state machine — these counters are unused.
+    // FFI workers don't run the health state machine: this worker keeps the
+    // trait's default `runtime_state` (`None`) and so has no probe counts.
     // The Go SDK manages worker health via direct set_status() calls
     // through the `sgl_multi_client_set_worker_health` FFI entry point.
-    fn consecutive_failures_increment(&self) -> usize {
-        0
-    }
-    fn consecutive_failures_reset(&self) {}
-    fn consecutive_successes_increment(&self) -> usize {
-        0
-    }
-    fn consecutive_successes_reset(&self) {}
-    fn total_pending_probes(&self) -> usize {
-        0
-    }
-    fn total_pending_probes_increment(&self) -> usize {
-        0
-    }
-    fn total_pending_probes_reset(&self) {}
 
     fn load(&self) -> usize {
         self.load.load(Ordering::Relaxed)
@@ -187,7 +177,7 @@ impl Worker for GrpcWorker {
 
     fn try_increment_load(&self, max: usize) -> bool {
         self.load
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_add(1).filter(|next| *next <= max)
             })
             .is_ok()
@@ -249,21 +239,9 @@ impl Worker for GrpcWorker {
         Some(Arc::clone(&self.http_client))
     }
 
-    async fn get_backend_client(&self) -> WorkerResult<Option<Arc<BackendClient>>> {
+    async fn engine_connection(&self) -> WorkerResult<Option<Arc<dyn EngineConnection>>> {
         // Not used by policies — the FFI layer handles the backend directly.
         Ok(None)
-    }
-
-    async fn grpc_health_check(&self) -> WorkerResult<bool> {
-        Ok(self.is_healthy())
-    }
-
-    async fn zmq_health_check(&self) -> WorkerResult<bool> {
-        Ok(self.is_healthy())
-    }
-
-    async fn http_health_check(&self) -> WorkerResult<bool> {
-        Ok(self.is_healthy())
     }
 }
 
@@ -397,7 +375,7 @@ pub unsafe extern "C" fn sgl_multi_client_create(
     // These require SelectWorkerInfo.headers and/or SelectWorkerInfo.hash_ring
     // which are not available in the SDK. To support them we would need to:
     // - Forward HTTP headers from the Go HTTP server through the FFI boundary
-    // - Build and cache a HashRing from the worker list (like WorkerRegistry does)
+    // - Build and cache a HashRing from the worker list (as the gateway does for each membership generation)
     let policy: Arc<dyn LoadBalancingPolicy> = match policy_name_str {
         "round_robin" | "roundrobin" => Arc::new(RoundRobinPolicy::new()),
         "random" => Arc::new(RandomPolicy::new()),

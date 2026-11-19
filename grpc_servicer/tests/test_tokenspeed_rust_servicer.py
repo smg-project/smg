@@ -379,6 +379,8 @@ def test_model_facts_mirror_the_python_servicer(monkeypatch):
         "spatial_merge_size": None,
         "image_token_id": None,
         "video_token_id": None,
+        "position_id_per_seconds": None,
+        "seconds_per_chunk": None,
         "model_dtype": "bfloat16",
         "multimodal_encoder_dtype": "bfloat16",
         "constrained_decoding": "",
@@ -749,6 +751,39 @@ def test_the_launcher_builds_the_model_config_once_for_the_default_and_the_facts
     assert (
         launcher.facts(args)["kv_events_endpoint"] == json.loads(args.kv_events_config)["endpoint"]
     )
+
+
+def test_the_facts_say_why_the_default_left_the_publisher_off(monkeypatch, caplog):
+    """A launcher whose engine cannot serve the publisher for the model writes
+    the line it logged into the server args (``kv_events_left_off``), where
+    the Rust servicer reads what it refuses ``SubscribeKvEvents`` with. A
+    publisher that is on, or off by an explicit configuration or the opt-out,
+    writes none."""
+    _install_cache_vocabulary(monkeypatch)
+    _stub_servicer_module(monkeypatch)
+    hybrid = _model_config_of("linear_attention", "full_attention")
+    monkeypatch.setattr(rust, "_model_config", lambda args: hybrid)
+
+    def server_args_of(args):
+        launcher = rust.TokenSpeedLauncher()
+        launcher.kv_events_default(args)
+        return json.loads(launcher.facts(args)["server_args_json"])
+
+    with caplog.at_level(logging.INFO, logger=rust_lifecycle.logger.name):
+        left_off = server_args_of(FakeServerArgs())["kv_events_left_off"]
+    assert left_off.startswith(
+        "KV event publishing left off: org/m keeps recurrent state in 1 of its 2 layers "
+    )
+    assert left_off.endswith("; pass --kv-events-config to turn the publisher on anyway")
+    assert left_off in caplog.text
+
+    given = '{"enable_kv_cache_events": true, "publisher": "zmq", "endpoint": "tcp://*:5600"}'
+    assert "kv_events_left_off" not in server_args_of(FakeServerArgs(kv_events_config=given))
+    monkeypatch.setenv(rust.KV_EVENTS_ENV, "0")
+    assert "kv_events_left_off" not in server_args_of(FakeServerArgs())
+    monkeypatch.delenv(rust.KV_EVENTS_ENV)
+    monkeypatch.setattr(rust, "_model_config", lambda args: _model_config_of("full_attention"))
+    assert "kv_events_left_off" not in server_args_of(FakeServerArgs())
 
 
 @pytest.fixture
@@ -1543,6 +1578,71 @@ def test_serve_rust_refuses_a_warm_up_knob_it_cannot_read_before_the_server_bind
     assert created == {}
 
 
+def test_the_remainders_knob_is_a_named_configuration_error_where_the_launchers_read_it():
+    assert rust.read_remainders_setting({}) == "auto"
+    assert rust.read_remainders_setting({rust.REMAINDERS_ENV: " Off "}) == "off"
+    assert rust.read_remainders_setting({rust.REMAINDERS_ENV: "1"}) == "on"
+    with pytest.raises(
+        rust_lifecycle.ServicerConfigError,
+        match="SMG_TOKENSPEED_SERVICER_WARMUP_REMAINDERS='sometimes'",
+    ):
+        rust.read_remainders_setting({rust.REMAINDERS_ENV: "sometimes"})
+
+
+@pytest.mark.parametrize(
+    ("warmup", "role"),
+    [(None, "null"), ("off", "null"), (None, "decode")],
+    ids=["warm-up on", "warm-up off", "decode role"],
+)
+def test_serve_rust_refuses_a_remainders_knob_it_cannot_read_before_any_engine_work(
+    monkeypatch, tmp_path, warmup, role
+):
+    """The chunk-remainders knob is read with the launcher's other knobs, so a
+    value it does not take refuses the start before the model config is read
+    and the server binds, whether or not the warm-up runs and on a
+    disaggregation role, which plans none."""
+    created: dict = {}
+    configs_read: list = []
+
+    class FakeServer:
+        def __init__(self, **kwargs):
+            created.update(kwargs)
+
+    _install_fake_servicer(monkeypatch, FakeServer)
+    _stub_servicer_module(monkeypatch)
+    monkeypatch.setattr(rust, "_model_config", lambda args: configs_read.append(args))
+    monkeypatch.setattr(rust_lifecycle, "default_socket_dir", lambda: str(tmp_path / "sockets"))
+    if warmup is not None:
+        monkeypatch.setenv(rust.WARMUP_ENV, warmup)
+    monkeypatch.setenv(rust.REMAINDERS_ENV, "sometimes")
+    with pytest.raises(
+        rust_lifecycle.ServicerConfigError,
+        match="SMG_TOKENSPEED_SERVICER_WARMUP_REMAINDERS='sometimes'",
+    ):
+        asyncio.run(rust.serve_rust(FakeServerArgs(port=50123, disaggregation_mode=role)))
+    assert created == {} and configs_read == []
+
+
+def test_serve_rust_plans_the_chunk_remainders_the_knob_asks_for(monkeypatch, tmp_path, caplog):
+    """The setting read with the launcher's knobs reaches the plan: on the
+    fake engine's unstated layout, auto keeps the chunk remainders, and off
+    plans the rest without them and says the hazard is open."""
+    _run_serve_rust(monkeypatch, tmp_path)
+    plan = _run_serve_rust.recorded["supervise_kwargs"]["warmup"].args[0]
+    assert any(step.kind == "remainder" for step in plan.steps)
+
+    monkeypatch.setenv(rust.REMAINDERS_ENV, "off")
+    caplog.set_level(logging.WARNING, logger="smg_grpc_servicer")
+    _run_serve_rust(monkeypatch, tmp_path)
+    plan = _run_serve_rust.recorded["supervise_kwargs"]["warmup"].args[0]
+    assert plan.steps and not any(step.kind == "remainder" for step in plan.steps)
+    assert any(
+        "no chunk remainders" in r.getMessage()
+        and "an unknown number of processes" in r.getMessage()
+        for r in caplog.records
+    )
+
+
 def test_serve_rust_defaults_both_startup_bounds(monkeypatch, tmp_path):
     """Without the environment variables the server gets the lifecycle's
     defaults for the silence bound and the ceiling."""
@@ -1811,7 +1911,15 @@ def test_mrope_layout_facts_are_read_as_the_engines_input_processor_reads_them()
         image_token_id=248056,
         video_token_id=248057,
     )
+    none = {
+        "spatial_merge_size": None,
+        "image_token_id": None,
+        "video_token_id": None,
+        "position_id_per_seconds": None,
+        "seconds_per_chunk": None,
+    }
     assert rust.mrope_layout(qwen35) == {
+        **none,
         "spatial_merge_size": 2,
         "image_token_id": 248056,
         "video_token_id": 248057,
@@ -1820,20 +1928,83 @@ def test_mrope_layout_facts_are_read_as_the_engines_input_processor_reads_them()
     # config or the ids ships None for each (the Rust rule then refuses the
     # item instead of guessing).
     assert rust.mrope_layout({"vision_config": {"spatial_merge_size": 2}, "image_token_id": 5}) == {
+        **none,
         "spatial_merge_size": 2,
         "image_token_id": 5,
-        "video_token_id": None,
     }
-    assert rust.mrope_layout(SimpleNamespace(image_token_id="x")) == {
-        "spatial_merge_size": None,
-        "image_token_id": None,
-        "video_token_id": None,
+    assert rust.mrope_layout(SimpleNamespace(image_token_id="x")) == none
+    assert rust.mrope_layout(None) == none
+    # A Qwen Omni wrapper keeps the facts below thinker_config, where the
+    # engine's own Omni rule reads them, with the rule's clock beside them
+    # (an integer in the checkpoint, a number to the rule).
+    omni = SimpleNamespace(
+        thinker_config=SimpleNamespace(
+            vision_config=SimpleNamespace(spatial_merge_size=2),
+            image_token_id=151655,
+            video_token_id=151656,
+            position_id_per_seconds=13,
+            seconds_per_chunk=2,
+        ),
+    )
+    assert rust.mrope_layout(omni) == {
+        "spatial_merge_size": 2,
+        "image_token_id": 151655,
+        "video_token_id": 151656,
+        "position_id_per_seconds": 13.0,
+        "seconds_per_chunk": 2.0,
     }
-    assert rust.mrope_layout(None) == {
-        "spatial_merge_size": None,
-        "image_token_id": None,
-        "video_token_id": None,
+    # A clock the thinker leaves unsaid is the engine's default, read as the
+    # engine reads it (getattr(thinker_config, name, default)), never the
+    # wrapper's top-level value, which the engine does not read; a value that
+    # is not a number is None (the rule then refuses by name). The top-level
+    # placeholder ids do not leak into the thinker's facts either.
+    assert rust.mrope_layout(
+        {
+            "thinker_config": {
+                "vision_config": {"spatial_merge_size": 2},
+                "seconds_per_chunk": "2",
+            },
+            "position_id_per_seconds": 25,
+            "image_token_id": 7,
+        }
+    ) == {**none, "spatial_merge_size": 2, "position_id_per_seconds": 13.0}
+    assert rust.mrope_layout({"thinker_config": {"vision_config": {"spatial_merge_size": 2}}}) == {
+        **none,
+        "spatial_merge_size": 2,
+        "position_id_per_seconds": 13.0,
+        "seconds_per_chunk": 2.0,
     }
+
+
+def test_mrope_positions_are_read_as_the_engines_executor_reads_them():
+    # With the engine's own text config (ModelConfig.hf_text_config, the
+    # nested text config below a Qwen Omni wrapper's thinker_config as the
+    # engine resolves it), the reading is the executor's: an mrope_section in
+    # its rope parameters.
+    omni_text = SimpleNamespace(
+        rope_parameters={"rope_type": "default", "mrope_section": [24, 20, 20]},
+    )
+    assert rust.mrope_positions(SimpleNamespace(thinker_config=object()), omni_text) is True
+    # A text model with a plain rope, or without any rope config (a recurrent
+    # hybrid), runs 1-D positions: False, not the conservative None.
+    plain_text = SimpleNamespace(rope_parameters={"rope_type": "default", "rope_theta": 1e6})
+    assert rust.mrope_positions(SimpleNamespace(), plain_text) is False
+    assert rust.mrope_positions(SimpleNamespace(), SimpleNamespace(hidden_size=8)) is False
+    # The executor reads rope_parameters only: a rope_scaling spelling, or a
+    # rope type named mrope without a section, is 1-D to it (the engine's
+    # config class fills rope_parameters at load for a checkpoint that spells
+    # it the old way).
+    assert (
+        rust.mrope_positions(SimpleNamespace(), {"rope_scaling": {"mrope_section": [1, 1, 1]}})
+        is False
+    )
+    assert (
+        rust.mrope_positions(SimpleNamespace(), {"rope_parameters": {"rope_type": "mrope"}})
+        is False
+    )
+    # Without the engine's text config the Omni wrapper's nesting is out of
+    # reach and the reading is None: the launcher passes the engine's.
+    assert rust.mrope_positions(SimpleNamespace(thinker_config=object())) is None
 
 
 def test_mrope_positions_are_read_off_the_text_rope_config():

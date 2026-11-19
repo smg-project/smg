@@ -9,13 +9,17 @@ use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, Wo
 
 use crate::{
     worker::{
-        basic::{RuntimeType, WorkerType},
-        circuit_breaker::CircuitBreakerConfig,
-        endpoint::Endpoint,
-        resilience::{resolve_resilience, ResolvedResilience},
+        health::{
+            circuit_breaker::CircuitBreakerConfig,
+            resilience::{resolve_resilience, ResolvedResilience},
+        },
+        identity::{
+            basic::{RuntimeType, WorkerType},
+            endpoint::Endpoint,
+        },
         BasicWorker, BasicWorkerBuilder, ConnectionMode, Worker,
     },
-    workflow::data::{WorkerKind, WorkerList, WorkerWorkflowData},
+    workflow::data::{require_app_context, WorkerKind, WorkerList, WorkerWorkflowData},
 };
 
 /// Normalize URL for external APIs (ensure https://).
@@ -91,11 +95,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateExternalWorkersStep {
         }
 
         let config = &context.data.config;
-        let app_context = context
-            .data
-            .app_context
-            .as_ref()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
+        let app_context = require_app_context(context.data.app_context.as_ref())?;
         let model_cards = &context.data.model_cards;
 
         // Build configs from router settings — resolve per-worker resilience
@@ -208,6 +208,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateExternalWorkersStep {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::http_client;
 
     fn parts<'a>(
         cards: &'a [ModelCard],
@@ -234,7 +235,7 @@ mod tests {
     /// worker but for the models: one build, one set of settings.
     #[test]
     fn the_worker_is_built_the_same_way_with_and_without_model_cards() {
-        let client = Arc::new(crate::server::http_client());
+        let client = Arc::new(http_client());
         let labels = HashMap::from([("tier".to_string(), "gold".to_string())]);
         let cards = [ModelCard::new("m1"), ModelCard::new("m2")];
         let wildcard = build_external_worker(parts(&[], &labels, &client));

@@ -14,6 +14,7 @@ from typing import IO, TYPE_CHECKING, Any
 
 import httpx
 
+from .cloud_credentials import PROXY_ENV, cloud_environment, resolve_cloud_credentials
 from .constants import (
     CLOUD_REQUEST_TIMEOUT_SECS,
     DEFAULT_HOST,
@@ -179,7 +180,11 @@ class Gateway:
         if self._started:
             raise RuntimeError("Gateway already started")
         if env:
-            self._env = {**os.environ, **env}
+            proxy = bool(cloud_backend and env.get(PROXY_ENV, os.environ.get(PROXY_ENV, "")))
+            self._env = {
+                **cloud_environment(os.environ, proxy=proxy),
+                **cloud_environment(env, proxy=proxy),
+            }
 
         is_epd_mode = encode_workers is not None
         is_pd_mode = (prefill_workers is not None or decode_workers is not None) and not is_epd_mode
@@ -227,15 +232,26 @@ class Gateway:
             self.prefill_workers = list(prefills)
             self.decode_workers = list(decodes)
             mode_args = build_epd_mode_args(encodes, prefills, decodes, encode_policy)
+            # A disaggregated gateway autoloads each worker's tokenizer after
+            # the worker reports healthy and holds `/readiness` until every one
+            # is registered. The worker count puts this launch on the
+            # readiness-aware wait of the regular branch, so a class's first
+            # request does not race that load (a 503 `tokenizer_not_ready`).
+            # A launch that names no worker (a fleet registered through the
+            # API afterwards) keeps the health wait: readiness needs each role.
+            fleet = [*encodes, *prefills, *decodes]
             self._launch(
                 mode_args=mode_args,
                 timeout=timeout,
                 show_output=show_output,
                 extra_args=extra_args,
+                num_workers=len(fleet) or None,
                 log_msg=(
                     f"EPD gateway ({len(encodes)} encode, "
                     f"{len(prefills)} prefill, {len(decodes)} decode)"
                 ),
+                worker_urls=self._fleet_urls(mode_args),
+                workers=fleet,
             )
         elif is_pd_mode:
             self.pd_mode = True
@@ -254,12 +270,18 @@ class Gateway:
             for dc in decodes:
                 mode_args += ["--decode", dc.worker_url]
 
+            # The readiness-aware wait, as for the EPD gateway above; an empty
+            # launch keeps the health wait the same way.
+            fleet = [*prefills, *decodes]
             self._launch(
                 mode_args=mode_args,
                 timeout=timeout,
                 show_output=show_output,
                 extra_args=extra_args,
+                num_workers=len(fleet) or None,
                 log_msg=f"PD gateway ({len(prefills)} prefill, {len(decodes)} decode)",
+                worker_urls=self._fleet_urls(mode_args),
+                workers=fleet,
             )
         elif is_cloud_mode:
             assert cloud_backend is not None
@@ -397,6 +419,17 @@ class Gateway:
             return f"its output file {self.log_path} is empty"
         return f"last {len(tail)} lines of {self.log_path}:\n" + "\n".join(tail)
 
+    @staticmethod
+    def _fleet_urls(mode_args: list[str]) -> list[str]:
+        """The worker URLs a disaggregated launch names: the token after each
+        ``--encode``, ``--prefill`` and ``--decode`` flag, which the readiness
+        wait takes as its registration gate."""
+        return [
+            mode_args[i + 1]
+            for i, arg in enumerate(mode_args[:-1])
+            if arg in ("--encode", "--prefill", "--decode")
+        ]
+
     def _launch(
         self,
         mode_args: list[str],
@@ -531,21 +564,16 @@ class Gateway:
 
     def _build_cloud_args(self, cloud_backend: str, history_backend: str) -> list[str]:
         """Build CLI args and env for cloud mode."""
-        cloud_configs = {
-            "openai": ("https://api.openai.com", "OPENAI_API_KEY", "openai"),
-            "xai": ("https://api.x.ai", "XAI_API_KEY", "openai"),
-            "anthropic": ("https://api.anthropic.com", "ANTHROPIC_API_KEY", "anthropic"),
-        }
-        if cloud_backend not in cloud_configs:
-            raise ValueError(f"Unsupported cloud backend: {cloud_backend}")
-
-        worker_url, api_key_env, backend_type = cloud_configs[cloud_backend]
-        api_key = os.environ.get(api_key_env)
-        if not api_key:
-            raise ValueError(f"{api_key_env} environment variable required")
-
-        self._env = dict(self._env or os.environ)
-        self._env[api_key_env] = api_key
+        credentials = resolve_cloud_credentials(cloud_backend, environ=self._env)
+        worker_url, api_key_env, backend_type = (
+            credentials.worker_root,
+            credentials.api_key_env,
+            credentials.backend_type,
+        )
+        self._env = cloud_environment(
+            self._env if self._env is not None else os.environ, proxy=credentials.is_proxy
+        )
+        self._env[api_key_env] = credentials.api_key
 
         actual_history_backend = history_backend
         if history_backend == "oracle-custom":

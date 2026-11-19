@@ -9,16 +9,26 @@
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
-use tokio::{net::TcpListener, task::JoinHandle};
+use mock_worker::config::SchedulerWire;
+use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
 use tonic::transport::server::{Router, TcpIncoming};
 
 /// A mock engine serving `model_id` on a loopback port, as its URL and its
 /// server task.
+pub(crate) async fn mock_engine(model_id: &str) -> (String, JoinHandle<()>) {
+    mock_engine_on_wire(model_id, SchedulerWire::default()).await
+}
+
+/// A mock engine as [`mock_engine`] makes it, on the gRPC wire the test
+/// names.
 #[expect(
     clippy::disallowed_methods,
     reason = "bounded test fixture; server task is explicitly aborted"
 )]
-pub(crate) async fn mock_engine(model_id: &str) -> (String, JoinHandle<()>) {
+pub(crate) async fn mock_engine_on_wire(
+    model_id: &str,
+    wire: SchedulerWire,
+) -> (String, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind mock worker");
@@ -31,6 +41,7 @@ pub(crate) async fn mock_engine(model_id: &str) -> (String, JoinHandle<()>) {
         http_count: 0,
         grpc_base_port: port,
         grpc_count: 1,
+        grpc_wire: wire,
         zmq_handshake: None,
         zmq_count: 0,
         zmq_start_index: 0,
@@ -42,6 +53,9 @@ pub(crate) async fn mock_engine(model_id: &str) -> (String, JoinHandle<()>) {
         engine: mock_worker::engine::EngineParams::default(),
         ..mock_worker::config::Config::default()
     });
+    // A port an earlier test's engine served on keeps that engine's
+    // overrides; this engine starts from fresh ones.
+    mock_worker::overrides::fresh_for_port(port);
     let server = tokio::spawn(mock_worker::grpc::serve_with_listener(config, listener));
     (format!("http://127.0.0.1:{port}"), server)
 }
@@ -68,4 +82,31 @@ pub(crate) async fn serve_on_loopback(router: Router) -> (SocketAddr, JoinHandle
             .expect("the test's engine server");
     });
     (addr, server)
+}
+
+/// `router` served on `listener`, a socket the caller bound, until `stopped`
+/// resolves (its sender sends or is dropped), as the server task: a worker
+/// that goes away in the case. The task then stops listening, closes every
+/// connection it serves with a GOAWAY and ends once they are closed, so on a
+/// port that stays reserved after it the next dial is refused.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "bounded test fixture; the task ends at the caller's signal or with the test"
+)]
+pub(crate) fn serve_until(
+    router: Router,
+    listener: TcpListener,
+    stopped: oneshot::Receiver<()>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        router
+            .serve_with_incoming_shutdown(
+                TcpIncoming::from(listener).with_nodelay(Some(true)),
+                async {
+                    let _ = stopped.await;
+                },
+            )
+            .await
+            .expect("the test's engine server");
+    })
 }

@@ -61,6 +61,14 @@ async fn generate_e2e_translates_and_streams_vllm_proto() {
             other => panic!("expected Add, got {other:?}"),
         };
         assert_eq!(request.request_id, "r1");
+        assert_eq!(
+            request
+                .reasoning_parser_kwargs
+                .as_ref()
+                .unwrap()
+                .chat_template_kwargs["thinking_mode"],
+            "enabled"
+        );
         assert_eq!(request.prompt_token_ids, Some(vec![1, 2, 3]));
         assert_eq!(request.sampling_params.as_ref().unwrap().max_tokens, 2);
         output
@@ -93,6 +101,7 @@ async fn generate_e2e_translates_and_streams_vllm_proto() {
             logprobs: Some(1),
             ..Default::default()
         }),
+        chat_template_kwargs_json: Some(r#"{"thinking_mode":"enabled"}"#.into()),
         stream: true,
         ..Default::default()
     };
@@ -1150,6 +1159,35 @@ fn fan_out_splits_n_into_single_sample_requests() {
     assert_eq!(single[0].request_id, "r1");
 }
 
+/// The engine reads a seed of `-1` as "no seed", and a derived per-sub seed
+/// can land there (`-2 + 1`): the wire carries each seed word in its
+/// unsigned form, so a base `-2` (the public seed 4294967294 folded) with
+/// n=2 reaches the engine as `[4294967294, 4294967295]`, distinct and both
+/// seeded; a request seed of `-1` itself reaches it as `4294967295`.
+#[test]
+fn fan_out_seeds_reach_the_engine_unsigned() {
+    let engine_seed = |req| {
+        translate_request(req, 4096, ModelDtype::BFloat16, &EosTokenIds::default())
+            .expect("translated")
+            .sampling_params
+            .expect("sampling params")
+            .seed
+    };
+    let subs = fan_out_requests(tokenized_req(vllm::SamplingParams {
+        n: 2,
+        seed: Some(-2),
+        ..Default::default()
+    }));
+    let seeds: Vec<Option<i64>> = subs.into_iter().map(engine_seed).collect();
+    assert_eq!(seeds, vec![Some(4_294_967_294), Some(4_294_967_295)]);
+
+    let single = tokenized_req(vllm::SamplingParams {
+        seed: Some(-1),
+        ..Default::default()
+    });
+    assert_eq!(engine_seed(single), Some(4_294_967_295));
+}
+
 /// n=2 over a vLLM EngineCore: two engine-side requests with distinct
 /// sub-rids, and the merged stream yields two `Complete`s tagged with the
 /// proto `index` (0 and 1) the pipeline demuxes choices by.
@@ -1289,6 +1327,38 @@ fn translate_normalizes_unset_top_p_and_repetition_penalty() {
     assert_eq!(sampling.temperature, 1.0);
     // Unset max_tokens defaults to the remaining context.
     assert_eq!(sampling.max_tokens, 1024 - 3);
+}
+
+/// A chat request's `min_tokens` survives the whole path to the engine: the
+/// gateway's chat builder writes it to the proto, the translation copies it,
+/// and the request decoded from the wire's bytes carries it.
+#[test]
+fn a_chat_requests_min_tokens_survive_the_wire() {
+    use engine_zmq_client::codec::{decode_msgpack, encode_msgpack};
+    use openai_protocol::chat::ChatCompletionRequest;
+    use smg_grpc_client::VllmEngineClient;
+
+    let chat: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+        "model": "m", "messages": [{"role": "user", "content": "hi"}],
+        "min_tokens": 30, "max_tokens": 40
+    }))
+    .expect("a chat request");
+    let proto = VllmEngineClient::build_generate_request_from_chat(
+        "r1".to_string(),
+        &chat,
+        "hi".to_string(),
+        vec![1, 2, 3],
+        None,
+        Default::default(),
+    )
+    .expect("the chat builder");
+    let request = translate_request(proto, 1024, ModelDtype::Float32, &EosTokenIds::default())
+        .expect("the translation");
+    let back: EngineCoreRequest = decode_msgpack(&encode_msgpack(&request).unwrap()).unwrap();
+    assert_eq!(
+        back.sampling_params.expect("sampling params").min_tokens,
+        30
+    );
 }
 
 /// vLLM's parameter checks run before submit: a request the engine would
@@ -1563,5 +1633,112 @@ async fn prefill_samples_require_timing_and_skip_preemption_and_errors() {
             })
             .unwrap();
         assert_eq!(stream.take_prefill_sample(), None);
+    }
+}
+
+/// Parser kwargs survive translation without changing the grammar-start override.
+#[test]
+fn thinking_mode_reaches_engine_reasoning_parser_with_a_constraint() {
+    for mode in [None, Some("enabled"), Some("disabled"), Some("adaptive")] {
+        for first_token in [false, true] {
+            let mut req = tokenized_req(vllm::SamplingParams {
+                constraint: Some(vllm::sampling_params::Constraint::JsonObject(true)),
+                grammar_from_first_token: first_token,
+                ..Default::default()
+            });
+            req.chat_template_kwargs_json =
+                mode.map(|mode| serde_json::json!({"thinking_mode": mode}).to_string());
+            let translated =
+                translate_request(req, 4096, ModelDtype::BFloat16, &EosTokenIds::default())
+                    .unwrap();
+            assert_eq!(translated.reasoning_ended, first_token.then_some(true));
+            assert_eq!(
+                translated
+                    .reasoning_parser_kwargs
+                    .map(|kwargs| kwargs.chat_template_kwargs),
+                mode.map(|mode| HashMap::from([(
+                    "thinking_mode".to_string(),
+                    serde_json::json!(mode)
+                )]))
+            );
+        }
+    }
+}
+
+/// Refuse malformed or non-object parser kwargs before submitting engine work.
+#[test]
+fn malformed_reasoning_template_kwargs_are_rejected() {
+    for json in ["{", "[]", "null", "true"] {
+        let mut req = tokenized_req(vllm::SamplingParams::default());
+        req.chat_template_kwargs_json = Some(json.to_string());
+        let error = translate_request(req, 4096, ModelDtype::BFloat16, &EosTokenIds::default())
+            .unwrap_err();
+        assert!(
+            error.starts_with("invalid chat_template_kwargs_json:"),
+            "{error}"
+        );
+    }
+}
+
+/// The prompt count the usage reports is the request's own until the engine's
+/// prefill stats report one: an engine whose first output carries none bills
+/// the prompt the gateway sent, not zero; one that reports a count has the
+/// last word, on the chunk and on the terminal `Complete` alike.
+#[tokio::test]
+async fn usage_prompt_count_is_the_requests_until_the_engine_reports_one() {
+    use engine_zmq_client::protocol::vllm::stats::PrefillStats;
+    fn prompt_tokens_of(response: &vllm::GenerateResponse) -> u32 {
+        match &response.response {
+            Some(vllm::generate_response::Response::Chunk(chunk)) => chunk.prompt_tokens,
+            Some(vllm::generate_response::Response::Complete(complete)) => complete.prompt_tokens,
+            None => panic!("expected a chunk or a complete, got an empty response"),
+        }
+    }
+    let (client, _engine, _dir) = connected_pair(RuntimeType::Vllm).await;
+    for (index, reported, expected) in [(0, None, 3), (1, Some(7), 7)] {
+        let request = vllm::GenerateRequest {
+            request_id: format!("usage-{index}"),
+            input: Some(vllm::generate_request::Input::Tokenized(
+                vllm::TokenizedInput {
+                    input_ids: vec![1, 2, 3],
+                    ..Default::default()
+                },
+            )),
+            sampling_params: Some(vllm::SamplingParams {
+                max_tokens: Some(2),
+                ..Default::default()
+            }),
+            stream: true,
+            ..Default::default()
+        };
+        let mut streams = client.generate_vllm_streams(request).await.unwrap();
+        let stream = &mut streams[0];
+        let chunk = stream
+            .map_output(EngineCoreOutput {
+                new_token_ids: vec![10],
+                prefill_stats: reported.map(|num_prompt_tokens| PrefillStats {
+                    num_prompt_tokens,
+                    num_computed_tokens: num_prompt_tokens,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            prompt_tokens_of(&chunk),
+            expected,
+            "the first chunk with prefill stats {reported:?}"
+        );
+        let complete = stream
+            .map_output(EngineCoreOutput {
+                finish_reason: Some(EngineCoreFinishReason::Stop),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            prompt_tokens_of(&complete),
+            expected,
+            "the complete with prefill stats {reported:?}"
+        );
     }
 }

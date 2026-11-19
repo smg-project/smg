@@ -117,12 +117,16 @@ The stores report their record counts through `stored_record_count()` (the
 gateway samples them into `smg_history_memory_records{kind}`); the other
 backends answer `None`.
 
+The gateway's Messages route keeps its message threads in a store of this
+kind under every backend: at most `max_responses` turns, each kept for
+`retention_secs`.
+
 ### `PostgresConfig`
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `db_url` | `String` | Connection URL (`postgres://user:pass@host:port/dbname`). Validated for scheme, host, and database name. |
-| `pool_max` | `usize` | Maximum connections in the deadpool pool (default helper: 16). Must be > 0. |
+| `pool_max` | `usize` | Maximum connections in the deadpool pool (default 16). Must be > 0. |
 | `op_timeout_secs` | `u64` | Bound in seconds on one call to the store (pool wait, connect and the statement; default 5, must be > 0). A call past it fails as a `Timeout` error, which the gateway answers `503 storage_unavailable`. |
 | `schema` | `Option<SchemaConfig>` | Optional schema customization. See [Schema Configuration](#schema-configuration). |
 
@@ -151,7 +155,8 @@ Call `validate()` to check the URL before use.
 | `password` | `String` | -- | Database password (redacted in `Debug` output). |
 | `pool_min` | `usize` | 1 | Minimum pool connections. |
 | `pool_max` | `usize` | 16 | Maximum pool connections. |
-| `pool_timeout_secs` | `u64` | 30 | Connection acquisition timeout in seconds. |
+| `pool_timeout_secs` | `u64` | 30 | Connection acquisition timeout in seconds, and the bound on the start-up connection: a store that accepts the connection and never answers is refused at start-up within it (0 = no bound). |
+| `op_timeout_secs` | `u64` | 5 | Bound in seconds on one call to the store (the pool wait, the connect and the statement; must be > 0), the same key as the Postgres and Redis configs carry. `pool_timeout_secs` applies within it: a pool wait longer than the bound ends as the bound (a bound above the wait keeps the pool's own verdict), so a queued call that used to wait up to the pool wait now ends at the bound. A call past it fails as a `Timeout` error, which the gateway answers `503 storage_unavailable`. The driver runs each call on a blocking thread: the bound ends the wait, the statement runs on and is applied if it completes, and its connection returns to the pool when the driver returns: each round trip of a pooled connection ends within the driver's own call timeout of twice the bound, set on every pooled connection (a statement with several round trips takes longer in total; a client library too old to bound its calls refuses it, logged once, and then the thread returns when the socket ends). The connect itself has the connect descriptor's own bounds (`CONNECT_TIMEOUT`, `TRANSPORT_CONNECT_TIMEOUT`); at most `pool_max` connects run at a time, a connect the bound gave up on included, so a store frozen at connect holds at most that many connect threads and the next call fails at the bound without starting one. |
 | `schema` | `Option<SchemaConfig>` | `None` | Optional schema customization. See [Schema Configuration](#schema-configuration). |
 
 ### Schema Configuration

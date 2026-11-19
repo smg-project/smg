@@ -1,3 +1,18 @@
+//! The names the Responses and Realtime streams give their events and items, one enum per family.
+//!
+//! Each family ([`ResponseEvent`], [`OutputItemEvent`], [`FunctionCallEvent`],
+//! [`ContentPartEvent`], [`OutputTextEvent`], [`McpEvent`], [`WebSearchCallEvent`],
+//! [`CodeInterpreterCallEvent`], [`FileSearchCallEvent`], [`ImageGenerationCallEvent`],
+//! [`RealtimeClientEvent`], [`RealtimeServerEvent`]) lists its events as variants and spells each
+//! one's wire name once, as an associated `const` ([`ResponseEvent::CREATED`] is
+//! `"response.created"`); `as_str` maps a variant to its name and `Display` prints it. [`ItemType`]
+//! holds the `type` discriminators of output items the same way.
+//! The writers of a Responses stream put these constants in an event's `type` field and its readers
+//! match an incoming `type` against the same constants. A serde-tagged enum spells its names again
+//! in `#[serde(rename)]`, which cannot take a `const` ([`crate::realtime_events`] does so for the
+//! Realtime events), and some Realtime relays match raw literals, so these constants are the shared
+//! spelling of a name, not its only one.
+
 use std::fmt;
 
 /// Response lifecycle events
@@ -157,6 +172,7 @@ pub enum McpEvent {
     CallFailed,
     ListToolsInProgress,
     ListToolsCompleted,
+    ListToolsFailed,
 }
 
 impl McpEvent {
@@ -167,6 +183,7 @@ impl McpEvent {
     pub const CALL_FAILED: &'static str = "response.mcp_call.failed";
     pub const LIST_TOOLS_IN_PROGRESS: &'static str = "response.mcp_list_tools.in_progress";
     pub const LIST_TOOLS_COMPLETED: &'static str = "response.mcp_list_tools.completed";
+    pub const LIST_TOOLS_FAILED: &'static str = "response.mcp_list_tools.failed";
 
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -177,6 +194,7 @@ impl McpEvent {
             Self::CallFailed => Self::CALL_FAILED,
             Self::ListToolsInProgress => Self::LIST_TOOLS_IN_PROGRESS,
             Self::ListToolsCompleted => Self::LIST_TOOLS_COMPLETED,
+            Self::ListToolsFailed => Self::LIST_TOOLS_FAILED,
         }
     }
 }

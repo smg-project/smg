@@ -1,38 +1,38 @@
 [workspace]
-members = ["model_gateway", "model_gateway/test_harness", "crates/protocols", "crates/reasoning_parser", "crates/response_template", "crates/tool_parser", "crates/symphony", "crates/workflow", "crates/tokenizer", "crates/auth", "crates/mcp",
-    "crates/external_router", "crates/kv_index", "crates/data_connector", "crates/multimodal", "crates/mm_rdma", "crates/wasm", "crates/mesh", "crates/grpc_client", "crates/engine_zmq_client", "crates/engine_zmq_adapter", "crates/engine_servicer", "bindings/python", "bindings/golang", "clients/rust", "clients/openapi-gen", "crates/mock_worker", "crates/gateway_perf", "crates/rl", "crates/radix_tree"]
+members = ["model_gateway", "model_gateway/test_harness", "crates/protocols", "crates/worker", "crates/reasoning_parser", "crates/response_template", "crates/tool_parser", "crates/symphony", "crates/workflow", "crates/tokenizer", "crates/auth", "crates/mcp",
+    "crates/external_router", "crates/kv_index", "crates/data_connector", "crates/multimodal", "crates/mm_rdma", "crates/wasm", "crates/mesh", "crates/grpc_client", "crates/engine_zmq_client", "crates/engine_zmq_adapter", "crates/engine_servicer", "bindings/python", "bindings/golang", "clients/rust", "clients/openapi-gen", "crates/mock_worker", "crates/gateway_perf", "crates/rl", "crates/radix_tree", "crates/policy_controller", "examples/policy-controller"]
 resolver = "2"
 
 [workspace.package]
 # The oldest toolchain the workspace builds with; rust-toolchain.toml pins the same release.
-rust-version = "1.98"
+rust-version = "1.100"
 
 [workspace.dependencies]
 # Internal workspace crates
-openai-protocol = { version = "1.17.0", path = "crates/protocols" }
+openai-protocol = { version = "1.18.0", path = "crates/protocols" }
+smg-worker = { version = "0.1.0", path = "crates/worker" }
 smg-mm-rdma = { version = "0.1.1", path = "crates/mm_rdma" }
-reasoning-parser = { version = "1.10.1", path = "crates/reasoning_parser" }
-smg-response-template = { version = "0.2.0", path = "crates/response_template" }
-tool-parser = { version = "1.10.1", path = "crates/tool_parser" }
-smg-symphony = { version = "0.2.0", path = "crates/symphony" }
+reasoning-parser = { version = "1.11.0", path = "crates/reasoning_parser" }
+smg-response-template = { version = "0.3.0", path = "crates/response_template" }
+tool-parser = { version = "1.11.0", path = "crates/tool_parser" }
+smg-symphony = { version = "0.3.0", path = "crates/symphony" }
 wfaas = { version = "1.1.1", path = "crates/workflow" }
-llm-tokenizer = { version = "1.11.0", path = "crates/tokenizer" }
-smg-auth = { version = "1.2.5", path = "crates/auth" }
-smg-mcp = { version = "2.3.6", path = "crates/mcp" }
+llm-tokenizer = { version = "2.0.0", path = "crates/tokenizer" }
+smg-auth = { version = "1.3.0", path = "crates/auth" }
+smg-mcp = { version = "2.3.7", path = "crates/mcp" }
 # Members build it with its default features (none); a member-side `default-features = false` is ignored for an entry without one.
-smg-external-router = { version = "0.4.0", path = "crates/external_router" }
-kv-index = { version = "2.0.1", path = "crates/kv_index" }
-smg-radix-tree = { version = "0.1.1", path = "crates/radix_tree" }
-smg-data-connector = { version = "2.4.1", path = "crates/data_connector", package = "data-connector" }
+smg-external-router = { version = "0.4.1", path = "crates/external_router" }
+kv-index = { version = "2.1.0", path = "crates/kv_index" }
+smg-data-connector = { version = "2.5.0", path = "crates/data_connector", package = "data-connector" }
 # Members build it with its default features (`hf-hub`): the gateway asks for `hf-hub` itself and the Python binding depends on the crate directly, taking the default.
-llm-multimodal = { version = "1.15.0", path = "crates/multimodal" }
+llm-multimodal = { version = "1.16.0", path = "crates/multimodal" }
 smg-wasm = { version = "1.1.5", path = "crates/wasm", package = "smg-wasm" }
-smg-mesh = { version = "1.4.5", path = "crates/mesh", package = "smg-mesh" }
-smg-grpc-client = { version = "1.16.0", path = "crates/grpc_client" }
-engine-zmq-client = { version = "0.4.0", path = "crates/engine_zmq_client" }
-engine-zmq-adapter = { version = "0.2.0", path = "crates/engine_zmq_adapter" }
-engine-servicer = { version = "0.3.0", path = "crates/engine_servicer" }
-smg-rl = { version = "0.3.0", path = "crates/rl" }
+smg-mesh = { version = "1.4.6", path = "crates/mesh", package = "smg-mesh" }
+smg-grpc-client = { version = "1.17.0", path = "crates/grpc_client" }
+engine-zmq-client = { version = "0.5.0", path = "crates/engine_zmq_client" }
+engine-zmq-adapter = { version = "0.3.0", path = "crates/engine_zmq_adapter" }
+engine-servicer = { version = "0.4.0", path = "crates/engine_servicer" }
+smg-rl = { version = "0.3.1", path = "crates/rl" }
 
 # Shared dependencies
 anyhow = "1.0"
@@ -49,6 +49,7 @@ notify = "8.2"
 bytemuck = { version = "1.25" }
 byteorder = "1.5.0"
 bytes = "1.12.0"
+http-body-util = "0.1"
 half = { version = "2.7.1", features = ["bytemuck"] }
 rmp-serde = "1.3.1"
 rmpv = { version = "1.3.1", features = ["with-serde"] }
@@ -64,22 +65,31 @@ http = "1.4.2"
 lru = "0.18.0"
 memchr = "2"
 num-traits = "0.2"
-parking_lot = "0.12.5"
+parking_lot = "0.13.0"
 rand = "0.10.1"
 reqwest = { version = "0.13.4", default-features = false }
 serde = { version = "1.0" }
 serde_json = { version = "1.0", features = ["preserve_order"] }
+serde_path_to_error = "0.1"
 serde_with = { version = "3", features = ["macros"] }
+# serde_yaml is archived upstream (0.9 is its last line); every YAML reader inherits this one pin.
+serde_yaml = "0.9"
 subtle = "2.6"
 thiserror = "2.0.18"
 tokio = { version = "1.54.1" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "chrono"] }
 uuid = { version = "1.23", features = ["v7", "serde"] }
-# The wasm runtime's default feature set as of wasmtime 49, named explicitly and without `cache`:
-# nothing configures wasmtime's compilation cache (no `Config::cache` call anywhere), and that
-# cache crate was the only path by which zstd 0.13 reached the lockfile. A wasmtime bump re-reads
-# the `default` list in its Cargo.toml and adds a new default here on purpose, not by inheritance.
+# The wasm runtime's default feature set as of wasmtime 49, named explicitly, without `cache` and
+# without `component-model-async`. Nothing configures wasmtime's compilation cache (no
+# `Config::cache` call anywhere), and that cache crate was the only path by which zstd 0.13
+# reached the lockfile. No crate here makes an async component call (a concurrent call, or a
+# stream or a future across the component boundary), and a runtime built with
+# `component-model-async` charges every component call that feature's task bookkeeping.
+# `wasmtime-wasi` turns the feature on for each build that links it (its `p3` default), so this
+# list decides for the builds that do not: the policy controller's. A crate that comes to make
+# such a call names the feature on its own dependency line. A wasmtime bump re-reads the
+# `default` list in its Cargo.toml and adds a new default here on purpose, not by inheritance.
 wasmtime = { version = "49.0", default-features = false, features = [
     "anyhow",
     "async",
@@ -99,7 +109,6 @@ wasmtime = { version = "49.0", default-features = false, features = [
     "debug-builtins",
     "runtime",
     "component-model",
-    "component-model-async",
     "threads",
     "stack-switching",
     "std",

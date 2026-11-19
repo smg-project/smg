@@ -1,9 +1,10 @@
-//! The torchvision `uint8` antialiased resample over interleaved RGB bytes:
-//! the separable kernel of [`transforms`](super::transforms) with its
-//! `TorchUint8` taps (16-bit, at the finest scale that keeps the largest tap
-//! below 2^15), accumulated in 32 bits, on the vector unit where there is one
-//! (AArch64 NEON, x86-64 AVX2) and in plain loops elsewhere. Every path
-//! computes the same integer arithmetic, so the bytes are identical.
+//! The torchvision `uint8` antialiased resample over interleaved RGB bytes on
+//! the targets without the Pillow-exact vector passes (x86-64 routes the torch
+//! taps through those passes in [`transforms`](super::transforms)): the
+//! separable kernel of `transforms` with its `TorchUint8` taps (16-bit, at the
+//! finest scale that keeps the largest tap below 2^15), accumulated in 32
+//! bits, on AArch64 NEON and in plain loops elsewhere. Every path computes the
+//! same integer arithmetic, so the bytes are identical.
 //!
 //! Each output sample is `clip8((half + Σ pixel · tap) >> precision)`. A tap
 //! is below 2^15 in magnitude, a product below 255 · 2^15, and the taps of
@@ -13,14 +14,11 @@
 //! the torch kernel inherits. The earlier loops accumulated in `i64` and
 //! produced the same values; the tests keep that computation as the oracle.
 //!
-//! The AArch64 and x86-64 paths are the module's only uses of `core::arch`
-//! vector loads and stores, hence the local override of the workspace-wide
-//! `unsafe_code = "deny"`; every pointer they form is bounded by an exact-size
+//! The AArch64 path is the module's only use of `core::arch` vector loads and
+//! stores, hence the local override of the workspace-wide
+//! `unsafe_code = "deny"`; every pointer it forms is bounded by an exact-size
 //! chunk of a slice or by a scratch row padded for the widest read.
-#![cfg_attr(
-    any(target_arch = "aarch64", target_arch = "x86_64"),
-    allow(unsafe_code)
-)]
+#![cfg_attr(target_arch = "aarch64", allow(unsafe_code))]
 
 use super::{
     execution,
@@ -39,7 +37,7 @@ struct Axis {
     /// The taps of the width axis in the vector width pass's layout (sixteen
     /// lanes per group of four taps), read by that pass only; empty for the
     /// height axis and for a width axis the scalar loops read.
-    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
     taps_wide: Vec<i16>,
     precision: u32,
 }
@@ -63,9 +61,9 @@ enum Rows {
     Scalar,
 }
 
-/// On a vector architecture only: every caller sits behind the same `cfg`,
-/// and a build for another target has no vector rows to ask about.
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+/// On AArch64 only: every caller sits behind the same `cfg`, and a build for
+/// another target has no vector rows to ask about.
+#[cfg(target_arch = "aarch64")]
 impl Rows {
     /// Whether the passes run the vector rows: the detected rows on a host
     /// whose unit is present. The width axis builds its wide taps and the
@@ -73,14 +71,7 @@ impl Rows {
     /// allocates a table it does not read.
     #[inline]
     fn vector(self) -> bool {
-        #[cfg(target_arch = "x86_64")]
-        {
-            self == Rows::Detected && std::arch::is_x86_feature_detected!("avx2")
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            self == Rows::Detected && std::arch::is_aarch64_feature_detected!("neon")
-        }
+        self == Rows::Detected && std::arch::is_aarch64_feature_detected!("neon")
     }
 }
 
@@ -115,7 +106,7 @@ impl Axis {
                 taps[index * stride + k] = tap as i16;
             }
         }
-        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+        #[cfg(target_arch = "aarch64")]
         let taps_wide = match pass {
             Pass::Width if rows.vector() => taps
                 .as_chunks::<4>()
@@ -126,13 +117,13 @@ impl Axis {
                 .collect(),
             Pass::Width | Pass::Height => Vec::new(),
         };
-        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        #[cfg(not(target_arch = "aarch64"))]
         let _ = (pass, rows);
         Self {
             bounds: kernel.bounds,
             stride,
             taps,
-            #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+            #[cfg(target_arch = "aarch64")]
             taps_wide,
             precision: kernel.precision,
         }
@@ -154,14 +145,6 @@ impl Axis {
 #[cfg(target_arch = "aarch64")]
 fn wide_taps(group: [i16; 4]) -> [i16; 16] {
     std::array::from_fn(|lane| group[lane / 4])
-}
-
-/// Four taps of the width axis as the AVX2 width pass reads them: the pair
-/// `(t0, t1)` four times, then `(t2, t3)` four times, so that one multiply-add
-/// of adjacent 16-bit lanes sums two source pixels of one channel.
-#[cfg(target_arch = "x86_64")]
-fn wide_taps(group: [i16; 4]) -> [i16; 16] {
-    std::array::from_fn(|lane| group[(lane / 8) * 2 + lane % 2])
 }
 
 /// `data` (`in_w` x `in_h` interleaved RGB) resampled to `out_w` x `out_h`
@@ -265,20 +248,8 @@ fn horizontal_rows(
     path: Rows,
 ) {
     let row_in = in_w * 3;
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    #[cfg(not(target_arch = "aarch64"))]
     let _ = path;
-    #[cfg(target_arch = "x86_64")]
-    if path.vector() {
-        // Scratch for the input row as four bytes per pixel, padded by the
-        // widest read of a tap group (three pixels past the row's end).
-        let mut rgbx = vec![0u8; (in_w + 4) * 4];
-        for (i, out_row) in band.chunks_exact_mut(out_w * 3).enumerate() {
-            let row = &src[(y0 + i) * row_in..(y0 + i + 1) * row_in];
-            // SAFETY: `vector` holds only when AVX2 was detected.
-            unsafe { avx2::horizontal_row(row, &mut rgbx, axis, out_row) };
-        }
-        return;
-    }
     #[cfg(target_arch = "aarch64")]
     if path.vector() {
         // Scratch for the input row as four bytes per pixel, padded by the
@@ -347,19 +318,8 @@ fn vertical_pass(src: &[u8], width: usize, out_h: usize, axis: &Axis, path: Rows
 
 /// Output rows `[y0, y0 + band.len() / row_len)` of the height pass.
 fn vertical_rows(src: &[u8], row_len: usize, axis: &Axis, y0: usize, band: &mut [u8], path: Rows) {
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    #[cfg(not(target_arch = "aarch64"))]
     let _ = path;
-    #[cfg(target_arch = "x86_64")]
-    if path.vector() {
-        for (i, out_row) in band.chunks_exact_mut(row_len).enumerate() {
-            let (start, n) = axis.bounds[y0 + i];
-            let taps = &axis.taps[(y0 + i) * axis.stride..(y0 + i) * axis.stride + n];
-            let rows = &src[start * row_len..(start + n) * row_len];
-            // SAFETY: `vector` holds only when AVX2 was detected.
-            unsafe { avx2::vertical_row(rows, taps, axis, out_row) };
-        }
-        return;
-    }
     #[cfg(target_arch = "aarch64")]
     if path.vector() {
         for (i, out_row) in band.chunks_exact_mut(row_len).enumerate() {
@@ -530,194 +490,12 @@ mod neon {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
-mod avx2 {
-    use core::arch::x86_64::{
-        __m128i, __m256i, _mm256_add_epi32, _mm256_broadcastsi128_si256, _mm256_castsi256_si128,
-        _mm256_cvtepu8_epi16, _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_madd_epi16,
-        _mm256_max_epi32, _mm256_min_epi32, _mm256_packus_epi16, _mm256_packus_epi32,
-        _mm256_permute4x64_epi64, _mm256_set1_epi32, _mm256_setr_epi16, _mm256_setr_epi8,
-        _mm256_setzero_si256, _mm256_shuffle_epi8, _mm256_sra_epi32, _mm256_storeu_si256,
-        _mm256_unpackhi_epi32, _mm256_unpacklo_epi32, _mm_add_epi32, _mm_cvtsi128_si32,
-        _mm_cvtsi32_si128, _mm_loadu_si128, _mm_max_epi32, _mm_min_epi32, _mm_packus_epi16,
-        _mm_packus_epi32, _mm_set1_epi32, _mm_setr_epi8, _mm_setzero_si128, _mm_shuffle_epi8,
-        _mm_sra_epi32, _mm_storeu_si128,
-    };
-
-    use super::Axis;
-
-    /// One row of the width pass: the row is spread to four bytes per pixel
-    /// in `rgbx` (zero padded), then every output pixel sums its taps four
-    /// source pixels at a time: the pixels' bytes interleaved in pairs
-    /// (`r0 r1 g0 g1 b0 b1 x0 x1 | r2 r3 ...`), so that the multiply-add of
-    /// adjacent 16-bit lanes sums two pixels of one channel, the taps in the
-    /// same pairs ([`super::wide_taps`]).
-    #[target_feature(enable = "avx2")]
-    pub(super) fn horizontal_row(row: &[u8], rgbx: &mut [u8], axis: &Axis, out_row: &mut [u8]) {
-        let pixels = row.len() / 3;
-        debug_assert!(rgbx.len() >= (pixels + 4) * 4);
-        // Four pixels (12 bytes) spread to 16 per step; the step reads 16
-        // bytes, so every group whose read ends inside the row is done here
-        // (`12 * groups + 4 <= row.len()`) and the last pixels one by one.
-        let spread = _mm_setr_epi8(0, 1, 2, -1, 3, 4, 5, -1, 6, 7, 8, -1, 9, 10, 11, -1);
-        let groups = row.len().saturating_sub(4) / 12;
-        for group in 0..groups {
-            // SAFETY: `group * 12 + 16 <= 12 * groups + 4 <= row.len()` by the
-            // count above, and `16 * groups <= 4 * pixels - 5 < rgbx.len()`
-            // (`rgbx` holds `4 * pixels + 16` bytes).
-            unsafe {
-                let bytes = _mm_loadu_si128(row.as_ptr().add(group * 12).cast::<__m128i>());
-                _mm_storeu_si128(
-                    rgbx.as_mut_ptr().add(group * 16).cast::<__m128i>(),
-                    _mm_shuffle_epi8(bytes, spread),
-                );
-            }
-        }
-        for (pixel, wide) in row[groups * 12..]
-            .as_chunks::<3>()
-            .0
-            .iter()
-            .zip(rgbx[groups * 16..].as_chunks_mut::<4>().0.iter_mut())
-        {
-            wide[..3].copy_from_slice(pixel);
-            wide[3] = 0;
-        }
-        // Pixels 0 and 1 of a 16-byte group as pairs in the low lane, pixels
-        // 2 and 3 in the high lane; `-1` zero-fills the high byte of a lane.
-        let pairs = _mm256_setr_epi8(
-            0, -1, 4, -1, 1, -1, 5, -1, 2, -1, 6, -1, 3, -1, 7, -1, 8, -1, 12, -1, 9, -1, 13, -1,
-            10, -1, 14, -1, 11, -1, 15, -1,
-        );
-        let out_w = out_row.len() / 3;
-        let half = _mm_set1_epi32(axis.half());
-        let shift = _mm_cvtsi32_si128(axis.precision as i32);
-        let zero = _mm_setzero_si128();
-        let top = _mm_set1_epi32(255);
-        for index in 0..out_w {
-            let (x0, n) = axis.bounds[index];
-            let groups = n.div_ceil(4);
-            let taps =
-                &axis.taps_wide[index * axis.stride * 4..(index * axis.stride + groups * 4) * 4];
-            let source = &rgbx[x0 * 4..(x0 + groups * 4) * 4];
-            let mut sums = _mm256_setzero_si256();
-            for (pixels, taps) in source
-                .as_chunks::<16>()
-                .0
-                .iter()
-                .zip(taps.as_chunks::<16>().0)
-            {
-                // SAFETY: `pixels` is 16 bytes (four pixels), `taps` 16
-                // `i16`s (two pairs of taps, each four times).
-                let (pixels, taps) = unsafe {
-                    (
-                        _mm_loadu_si128(pixels.as_ptr().cast::<__m128i>()),
-                        _mm256_loadu_si256(taps.as_ptr().cast::<__m256i>()),
-                    )
-                };
-                let pixels = _mm256_shuffle_epi8(_mm256_broadcastsi128_si256(pixels), pairs);
-                sums = _mm256_add_epi32(sums, _mm256_madd_epi16(pixels, taps));
-            }
-            // The two lanes hold pixels (0, 1) and (2, 3) of every group.
-            let sum = _mm_add_epi32(
-                _mm_add_epi32(
-                    _mm256_castsi256_si128(sums),
-                    _mm256_extracti128_si256::<1>(sums),
-                ),
-                half,
-            );
-            let clipped = _mm_min_epi32(_mm_max_epi32(_mm_sra_epi32(sum, shift), zero), top);
-            let bytes = _mm_packus_epi16(_mm_packus_epi32(clipped, clipped), zero);
-            // The pixel's three bytes and the padding lane's zero as a word,
-            // written through the slice: a 3-byte stride is 4-byte aligned
-            // for one pixel in four only, so no typed `u32` store.
-            let word = _mm_cvtsi128_si32(bytes).to_ne_bytes();
-            if index + 1 < out_w {
-                // The fourth byte is the next pixel's first, written again by
-                // the next iteration.
-                out_row[index * 3..index * 3 + 4].copy_from_slice(&word);
-            } else {
-                out_row[index * 3..index * 3 + 3].copy_from_slice(&word[..3]);
-            }
-        }
-    }
-
-    /// `sums >> precision` clamped to a byte, for eight sums.
-    #[inline]
-    #[target_feature(enable = "avx2")]
-    fn clip8x8(sums: __m256i, shift: __m128i, zero: __m256i, top: __m256i) -> __m256i {
-        _mm256_min_epi32(_mm256_max_epi32(_mm256_sra_epi32(sums, shift), zero), top)
-    }
-
-    /// One row of the height pass: thirty-two output bytes at a time across
-    /// the taps. Each source row's bytes widen to sixteen 16-bit lanes per
-    /// half, and two multiply-adds against `(tap, 0)` and `(0, tap)` pairs
-    /// give the even and the odd bytes' products in 32 bits; the row's last
-    /// bytes in scalar.
-    #[target_feature(enable = "avx2")]
-    pub(super) fn vertical_row(rows: &[u8], taps: &[i16], axis: &Axis, out_row: &mut [u8]) {
-        let row_len = out_row.len();
-        let half = _mm256_set1_epi32(axis.half());
-        let shift = _mm_cvtsi32_si128(axis.precision as i32);
-        let zero = _mm256_setzero_si256();
-        let top = _mm256_set1_epi32(255);
-        let (chunks, rest) = out_row.as_chunks_mut::<32>();
-        for (x, out) in chunks.iter_mut().enumerate() {
-            // Even and odd bytes of the first and of the second sixteen.
-            let (mut e0, mut o0, mut e1, mut o1) = (half, half, half, half);
-            for (k, &tap) in taps.iter().enumerate() {
-                let even = _mm256_setr_epi16(
-                    tap, 0, tap, 0, tap, 0, tap, 0, tap, 0, tap, 0, tap, 0, tap, 0,
-                );
-                let odd = _mm256_setr_epi16(
-                    0, tap, 0, tap, 0, tap, 0, tap, 0, tap, 0, tap, 0, tap, 0, tap,
-                );
-                let offset = k * row_len + x * 32;
-                // SAFETY: `rows` holds `taps.len()` rows of `row_len` bytes
-                // and `offset + 32 <= (k + 1) * row_len`.
-                let pixels =
-                    unsafe { _mm256_loadu_si256(rows.as_ptr().add(offset).cast::<__m256i>()) };
-                let low = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(pixels));
-                let high = _mm256_cvtepu8_epi16(_mm256_extracti128_si256::<1>(pixels));
-                e0 = _mm256_add_epi32(e0, _mm256_madd_epi16(low, even));
-                o0 = _mm256_add_epi32(o0, _mm256_madd_epi16(low, odd));
-                e1 = _mm256_add_epi32(e1, _mm256_madd_epi16(high, even));
-                o1 = _mm256_add_epi32(o1, _mm256_madd_epi16(high, odd));
-            }
-            let (e0, o0, e1, o1) = (
-                clip8x8(e0, shift, zero, top),
-                clip8x8(o0, shift, zero, top),
-                clip8x8(e1, shift, zero, top),
-                clip8x8(o1, shift, zero, top),
-            );
-            // Interleave the even and the odd bytes back into order within
-            // each lane, then put the four eight-byte quarters in order.
-            let first =
-                _mm256_packus_epi32(_mm256_unpacklo_epi32(e0, o0), _mm256_unpackhi_epi32(e0, o0));
-            let second =
-                _mm256_packus_epi32(_mm256_unpacklo_epi32(e1, o1), _mm256_unpackhi_epi32(e1, o1));
-            let bytes =
-                _mm256_permute4x64_epi64::<0b11_01_10_00>(_mm256_packus_epi16(first, second));
-            // SAFETY: `out` is exactly 32 bytes.
-            unsafe { _mm256_storeu_si256(out.as_mut_ptr().cast::<__m256i>(), bytes) };
-        }
-        let done = chunks.len() * 32;
-        for (i, out) in rest.iter_mut().enumerate() {
-            let x = done + i;
-            let mut sum = axis.half();
-            for (k, &tap) in taps.iter().enumerate() {
-                sum += i32::from(rows[k * row_len + x]) * i32::from(tap);
-            }
-            *out = axis.clip8(sum);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
         test_support::{assert_same_bytes, gradient_rgb},
-        vision::transforms::per_sample_reference,
+        vision::transforms::per_sample_reference_channels,
     };
 
     /// Up- and downscales, extreme aspect ratios, identity axes, widths that
@@ -744,7 +522,7 @@ mod tests {
         ];
         for (seed, &(in_w, in_h, out_w, out_h)) in cases.iter().enumerate() {
             let data = gradient_rgb(in_w, in_h, seed * 13);
-            let expected = per_sample_reference(
+            let expected = per_sample_reference_channels::<3>(
                 &data,
                 in_w,
                 in_h,
@@ -794,7 +572,7 @@ mod tests {
     /// the vector unit (or the scalar arm above) builds no table it never
     /// reads. A height axis never has them; the vector width axis holds four
     /// lanes per tap.
-    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
     #[test]
     fn a_width_axis_the_scalar_loops_read_carries_no_wide_taps() {
         let axis = |pass, rows| Axis::new(640, 320, PilResizeFilter::Bicubic, pass, rows);

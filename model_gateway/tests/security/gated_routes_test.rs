@@ -56,7 +56,9 @@ async fn without_control_plane_authentication_the_gated_routes_are_not_mounted_o
 {
     let ctx = AppTestContext::new_with_config(
         shared_key_config(4354),
-        vec![TestWorkerConfig::healthy(20354)],
+        // A name of this test's own: the harness refuses a second live worker
+        // under a name another test of the binary holds.
+        vec![TestWorkerConfig::healthy(20358)],
     )
     .await;
     let apps = ctx.create_apps(true);

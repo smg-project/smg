@@ -5,6 +5,12 @@
 //! permutations of the pixels, so every path writes the same bytes; images of
 //! other types take the `image` crate's own transform.
 //!
+//! The turned pixels go into a buffer of the pool the decoders take theirs
+//! from (`buffer_pool`): a permutation writes every byte of its output, so the
+//! buffer need not arrive zeroed, and a zeroed allocation of a photo's size
+//! is fresh pages on every request. The source's buffer returns to the pool
+//! here, because the frame only ever holds the turned image.
+//!
 //! The AArch64 path is the module's only use of `core::arch` vector loads and
 //! stores, hence the local override of the workspace-wide
 //! `unsafe_code = "deny"`; every pointer it forms comes from an exact-size
@@ -17,6 +23,8 @@
 
 use image::{metadata::Orientation, DynamicImage, RgbImage};
 
+use crate::buffer_pool;
+
 /// `image` with `orientation` applied: the pixels `DynamicImage::apply_orientation`
 /// produces, by the fast paths for RGB8 and the `image` crate for the rest.
 pub(crate) fn oriented(image: DynamicImage, orientation: Orientation) -> DynamicImage {
@@ -24,9 +32,29 @@ pub(crate) fn oriented(image: DynamicImage, orientation: Orientation) -> Dynamic
         return image;
     }
     match image {
-        DynamicImage::ImageRgb8(rgb) => DynamicImage::ImageRgb8(oriented_rgb8(&rgb, orientation)),
+        DynamicImage::ImageRgb8(rgb) => {
+            let turned = oriented_rgb8(&rgb, orientation);
+            buffer_pool::recycle(rgb.into_raw());
+            DynamicImage::ImageRgb8(turned)
+        }
         mut other => {
-            other.apply_orientation(orientation);
+            // A quarter turn builds a new image where `apply_orientation`
+            // would free the one it replaces: it is taken here, so that the
+            // decoder's buffer goes back to the pool. The rest of the
+            // orientation moves the pixels where they are.
+            let (quarter, rest) = match orientation {
+                Orientation::Rotate90 => (Some(other.rotate90()), Orientation::NoTransforms),
+                Orientation::Rotate270 => (Some(other.rotate270()), Orientation::NoTransforms),
+                Orientation::Rotate90FlipH => (Some(other.rotate90()), Orientation::FlipHorizontal),
+                Orientation::Rotate270FlipH => {
+                    (Some(other.rotate270()), Orientation::FlipHorizontal)
+                }
+                in_place => (None, in_place),
+            };
+            if let Some(turned) = quarter {
+                buffer_pool::recycle_image(std::mem::replace(&mut other, turned));
+            }
+            other.apply_orientation(rest);
             other
         }
     }
@@ -139,7 +167,7 @@ fn oriented_rgb8(image: &RgbImage, orientation: Orientation) -> RgbImage {
 /// order (`pixels`).
 fn flipped(src: &[u8], w: usize, h: usize, rows: bool, pixels: bool) -> Vec<u8> {
     let row_len = w * 3;
-    let mut out = vec![0u8; src.len()];
+    let mut out = buffer_pool::take(src.len());
     for (y, row) in src.chunks_exact(row_len).enumerate() {
         let target = if rows { h - 1 - y } else { y };
         let out_row = &mut out[target * row_len..(target + 1) * row_len];
@@ -183,7 +211,7 @@ fn reverse_pixels_scalar(row: &[u8], out_row: &mut [u8]) {
 /// columns of the result reversed as `layout` says: 16 x 16 pixel tiles on
 /// the vector unit, the border tiles pixel by pixel.
 fn transposed(src: &[u8], w: usize, h: usize, layout: Transpose) -> Vec<u8> {
-    let mut out = vec![0u8; src.len()];
+    let mut out = buffer_pool::take(src.len());
     let (out_w, out_h) = (h, w);
     // Destination row of source column x, destination column of source row y.
     let row_of = |x: usize| layout.row_of(out_h, x);
@@ -397,11 +425,7 @@ mod neon {
         };
         for j in 0..16 {
             let x = x0 + j;
-            let row = if layout.reverse_rows {
-                out_h - 1 - x
-            } else {
-                x
-            };
+            let row = layout.row_of(out_h, x);
             // The destination run, a 48-byte slice as above.
             let start = (row * out_w + col0) * 3;
             let run = &mut out[start..start + 48];
@@ -431,6 +455,7 @@ mod avx2 {
     use multiversion::{multiversion, target::match_target};
 
     use super::Transpose;
+    use crate::vision::rgb_runs::avx2::place;
 
     /// The pixels of `row` in reverse order into `out_row` (cut to `row`'s
     /// length).
@@ -471,51 +496,26 @@ mod avx2 {
         }
     }
 
-    // The reverse of sixteen pixels: output byte `g` of the 48 is source
-    // byte `45 - 3 (g / 3) + g % 3`; each output word gathers from the three
-    // source words, zero (`0x80`) where a word holds none of its bytes.
-    const REVERSE_0: [[u8; 16]; 3] = [
-        [
-            0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
-            0x80, 0x80,
-        ],
-        [
-            0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
-            0x80, 0x0e,
-        ],
-        [
-            0x0d, 0x0e, 0x0f, 0x0a, 0x0b, 0x0c, 0x07, 0x08, 0x09, 0x04, 0x05, 0x06, 0x01, 0x02,
-            0x03, 0x80,
-        ],
-    ];
-    const REVERSE_1: [[u8; 16]; 3] = [
-        [
-            0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
-            0x0f, 0x80,
-        ],
-        [
-            0x0f, 0x80, 0x0b, 0x0c, 0x0d, 0x08, 0x09, 0x0a, 0x05, 0x06, 0x07, 0x02, 0x03, 0x04,
-            0x80, 0x00,
-        ],
-        [
-            0x80, 0x00, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
-            0x80, 0x80,
-        ],
-    ];
-    const REVERSE_2: [[u8; 16]; 3] = [
-        [
-            0x80, 0x0c, 0x0d, 0x0e, 0x09, 0x0a, 0x0b, 0x06, 0x07, 0x08, 0x03, 0x04, 0x05, 0x00,
-            0x01, 0x02,
-        ],
-        [
-            0x01, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
-            0x80, 0x80,
-        ],
-        [
-            0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
-            0x80, 0x80,
-        ],
-    ];
+    /// The reverse of sixteen pixels: the masks of output word `out_word`,
+    /// whose byte `i` is output byte `g = 16 out_word + i` of the 48, source
+    /// byte `45 - 3 (g / 3) + g % 3`, gathered from the three source words.
+    const fn reverse_masks(out_word: usize) -> [[u8; 16]; 3] {
+        let mut masks = [[0x80; 16]; 3];
+        let mut word = 0;
+        while word < 3 {
+            let mut i = 0;
+            while i < 16 {
+                let g = 16 * out_word + i;
+                masks[word][i] = place(45 - 3 * (g / 3) + g % 3, word);
+                i += 1;
+            }
+            word += 1;
+        }
+        masks
+    }
+    const REVERSE_0: [[u8; 16]; 3] = reverse_masks(0);
+    const REVERSE_1: [[u8; 16]; 3] = reverse_masks(1);
+    const REVERSE_2: [[u8; 16]; 3] = reverse_masks(2);
 
     /// Forty-eight bytes (sixteen pixels) with the pixels in reverse order.
     #[inline]
@@ -548,71 +548,54 @@ mod avx2 {
         super::reverse_pixels_scalar(rest, out_rest);
     }
 
-    // Sixteen pixels of a row as four words of four-byte pixels (`r g b 0`),
-    // so the tile transposes as 32-bit lanes: word `q` holds pixels `4 q`
-    // to `4 q + 3`, gathered from the one or two 16-byte words of the run
-    // that hold them.
-    const WIDEN_0: [[u8; 16]; 1] = [[
-        0x00, 0x01, 0x02, 0x80, 0x03, 0x04, 0x05, 0x80, 0x06, 0x07, 0x08, 0x80, 0x09, 0x0a, 0x0b,
-        0x80,
-    ]];
-    const WIDEN_1: [[u8; 16]; 2] = [
-        [
-            0x0c, 0x0d, 0x0e, 0x80, 0x0f, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
-            0x80, 0x80,
-        ],
-        [
-            0x80, 0x80, 0x80, 0x80, 0x80, 0x00, 0x01, 0x80, 0x02, 0x03, 0x04, 0x80, 0x05, 0x06,
-            0x07, 0x80,
-        ],
-    ];
-    const WIDEN_2: [[u8; 16]; 2] = [
-        [
-            0x08, 0x09, 0x0a, 0x80, 0x0b, 0x0c, 0x0d, 0x80, 0x0e, 0x0f, 0x80, 0x80, 0x80, 0x80,
-            0x80, 0x80,
-        ],
-        [
-            0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00, 0x80, 0x01, 0x02,
-            0x03, 0x80,
-        ],
-    ];
-    const WIDEN_3: [[u8; 16]; 1] = [[
-        0x04, 0x05, 0x06, 0x80, 0x07, 0x08, 0x09, 0x80, 0x0a, 0x0b, 0x0c, 0x80, 0x0d, 0x0e, 0x0f,
-        0x80,
-    ]];
+    /// Sixteen pixels of a row as four words of four-byte pixels (`r g b 0`),
+    /// so the tile transposes as 32-bit lanes: the masks of word `q`, which
+    /// holds pixels `4 q` to `4 q + 3`, byte `i` of it source byte
+    /// `3 (4 q + i / 4) + i % 4` for a channel and zero for the pad, gathered
+    /// from the `WORDS` source words from `first` on.
+    const fn widen_masks<const WORDS: usize>(q: usize, first: usize) -> [[u8; 16]; WORDS] {
+        // The words from `first` hold all twelve channel bytes of the four pixels.
+        assert!(16 * first <= 12 * q && 12 * q + 12 <= 16 * (first + WORDS));
+        let mut masks = [[0x80; 16]; WORDS];
+        let mut word = 0;
+        while word < WORDS {
+            let mut i = 0;
+            while i < 16 {
+                if i % 4 != 3 {
+                    masks[word][i] = place(3 * (4 * q + i / 4) + i % 4, first + word);
+                }
+                i += 1;
+            }
+            word += 1;
+        }
+        masks
+    }
+    const WIDEN_0: [[u8; 16]; 1] = widen_masks(0, 0);
+    const WIDEN_1: [[u8; 16]; 2] = widen_masks(1, 0);
+    const WIDEN_2: [[u8; 16]; 2] = widen_masks(2, 1);
+    const WIDEN_3: [[u8; 16]; 1] = widen_masks(3, 2);
 
-    // Back to 48 packed bytes: output word `o` gathers from the two
-    // four-byte-pixel words that hold its pixels.
-    const NARROW_0: [[u8; 16]; 2] = [
-        [
-            0x00, 0x01, 0x02, 0x04, 0x05, 0x06, 0x08, 0x09, 0x0a, 0x0c, 0x0d, 0x0e, 0x80, 0x80,
-            0x80, 0x80,
-        ],
-        [
-            0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00, 0x01,
-            0x02, 0x04,
-        ],
-    ];
-    const NARROW_1: [[u8; 16]; 2] = [
-        [
-            0x05, 0x06, 0x08, 0x09, 0x0a, 0x0c, 0x0d, 0x0e, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
-            0x80, 0x80,
-        ],
-        [
-            0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00, 0x01, 0x02, 0x04, 0x05, 0x06,
-            0x08, 0x09,
-        ],
-    ];
-    const NARROW_2: [[u8; 16]; 2] = [
-        [
-            0x0a, 0x0c, 0x0d, 0x0e, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
-            0x80, 0x80,
-        ],
-        [
-            0x80, 0x80, 0x80, 0x80, 0x00, 0x01, 0x02, 0x04, 0x05, 0x06, 0x08, 0x09, 0x0a, 0x0c,
-            0x0d, 0x0e,
-        ],
-    ];
+    /// Back to 48 packed bytes: the masks of output word `o`, whose byte `i`
+    /// is packed byte `g = 16 o + i`, channel `g % 3` of pixel `g / 3`, at
+    /// `4 (g / 3) + g % 3` of the four-byte-pixel words, gathered from words
+    /// `o` and `o + 1`.
+    const fn narrow_masks(o: usize) -> [[u8; 16]; 2] {
+        let mut masks = [[0x80; 16]; 2];
+        let mut word = 0;
+        while word < 2 {
+            let mut i = 0;
+            while i < 16 {
+                let g = 16 * o + i;
+                masks[word][i] = place(4 * (g / 3) + g % 3, o + word);
+                i += 1;
+            }
+            word += 1;
+        }
+        masks
+    }
+    const NARROW_0: [[u8; 16]; 2] = narrow_masks(0);
+    const NARROW_1: [[u8; 16]; 2] = narrow_masks(1);
+    const NARROW_2: [[u8; 16]; 2] = narrow_masks(2);
 
     /// A run of sixteen pixels as four words of four-byte pixels.
     #[inline]
@@ -718,11 +701,7 @@ mod avx2 {
             };
             for (c, words) in (0..4).map(row_words).enumerate() {
                 let x = x0 + 4 * q + c;
-                let row = if layout.reverse_rows {
-                    out_h - 1 - x
-                } else {
-                    x
-                };
+                let row = layout.row_of(out_h, x);
                 let start = (row * out_w + col0) * 3;
                 out[start..start + 48].copy_from_slice(&words);
             }
@@ -817,5 +796,65 @@ mod tests {
         expected.apply_orientation(Orientation::Rotate90);
         let actual = oriented(DynamicImage::ImageRgba8(rgba), Orientation::Rotate90);
         assert!(actual.as_bytes() == expected.as_bytes());
+    }
+
+    /// A quarter turn of a layout other than RGB builds a new image: the
+    /// pixels are `apply_orientation`'s and the source's buffer is idle in
+    /// the pool again. A turn that moves the pixels in place keeps its
+    /// buffer.
+    #[test]
+    fn a_quarter_turn_of_another_layout_returns_the_decoders_buffer() {
+        static POOL: buffer_pool::BufferPool = buffer_pool::BufferPool::new();
+        buffer_pool::with_pool(&POOL, || {
+            let (w, h) = (320, 240);
+            let rgba = image::RgbaImage::from_fn(w, h, |x, y| {
+                image::Rgba([x as u8, y as u8, (x ^ y) as u8, (x + y) as u8])
+            });
+            for orientation in ORIENTATIONS.into_iter().skip(1) {
+                let mut expected = DynamicImage::ImageRgba8(rgba.clone());
+                expected.apply_orientation(orientation);
+                let mut pixels = buffer_pool::take(rgba.as_raw().len());
+                pixels.copy_from_slice(rgba.as_raw());
+                let source = image::RgbaImage::from_raw(w, h, pixels).expect("a 320x240 frame");
+                let actual = oriented(DynamicImage::ImageRgba8(source), orientation);
+                assert!(actual.as_bytes() == expected.as_bytes(), "{orientation:?}");
+                let returned = if actual.width() == h { 512 << 10 } else { 0 };
+                assert_eq!(POOL.held(), returned, "{orientation:?}");
+            }
+        });
+    }
+
+    /// A frame the size of a decoded photo, above the pool's floor, where a
+    /// taken buffer arrives holding the debug sentinel, and one pixel past a
+    /// whole tile on each axis, so the tiles, the border blocks and the row
+    /// tails all write into it: every turn still writes the pixels
+    /// `apply_orientation` produces, its output is a pool buffer and the
+    /// source's buffer is idle in the pool again.
+    #[test]
+    fn a_photo_sized_frame_turns_inside_the_pool() {
+        static POOL: buffer_pool::BufferPool = buffer_pool::BufferPool::new();
+        buffer_pool::with_pool(&POOL, || {
+            let (w, h) = (641, 481);
+            let image = gradient(w, h, 5);
+            let len = image.as_raw().len();
+            for orientation in ORIENTATIONS.into_iter().skip(1) {
+                let mut expected = DynamicImage::ImageRgb8(image.clone());
+                expected.apply_orientation(orientation);
+                let mut pixels = buffer_pool::take(len);
+                pixels.copy_from_slice(image.as_raw());
+                let source = RgbImage::from_raw(w, h, pixels).expect("a 641x481 frame");
+                let actual = oriented(DynamicImage::ImageRgb8(source), orientation);
+                assert!(
+                    actual.as_bytes() == expected.as_bytes(),
+                    "{orientation:?}: pixels differ"
+                );
+                buffer_pool::recycle_image(actual);
+                assert_eq!(
+                    POOL.held(),
+                    2 * buffer_pool::allocation_capacity(len),
+                    "{orientation:?}: the source's buffer and the turned one are both idle in the pool"
+                );
+            }
+        });
     }
 }

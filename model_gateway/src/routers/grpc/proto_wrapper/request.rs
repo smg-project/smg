@@ -55,17 +55,7 @@ pub enum ProtoGenerateRequest {
     TokenSpeed(Box<tokenspeed::GenerateRequest>),
 }
 
-/// Per-item grid metadata the engine reads to compute M-RoPE positions
-/// (`_get_mrope_input_positions` in vLLM); a few ints per item. The video
-/// timing has two spellings: `second_per_grid_ts` from the Qwen-VL
-/// processors, `video_second_per_grid` from the Qwen-Omni family and this
-/// gateway's own processors. The servicer's `GRID_KEYS` mirrors this list.
-pub(crate) const VLLM_MROPE_GRID_KEYS: [&str; 4] = [
-    "image_grid_thw",
-    "video_grid_thw",
-    "second_per_grid_ts",
-    "video_second_per_grid",
-];
+pub(crate) use smg_grpc_client::media_identity::GRID_KEYS as VLLM_MROPE_GRID_KEYS;
 
 /// A JSON answer's constraint as the worker of an attempt takes it: the table's
 /// structural tag, or the request's own schema where the table gives that
@@ -110,7 +100,7 @@ impl ProtoGenerateRequest {
     /// Get SGLang variant (panics if not SGLang)
     #[expect(
         clippy::panic,
-        reason = "typed accessor: caller guarantees variant via is_sglang() check"
+        reason = "typed accessor: the caller guarantees the variant"
     )]
     pub fn as_sglang(&self) -> &sglang::GenerateRequest {
         match self {
@@ -119,72 +109,21 @@ impl ProtoGenerateRequest {
         }
     }
 
-    /// Get mutable SGLang variant (panics if not SGLang)
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via is_sglang() check"
-    )]
-    pub fn as_sglang_mut(&mut self) -> &mut sglang::GenerateRequest {
-        match self {
-            Self::Sglang(req) => req,
-            _ => panic!("Expected SGLang GenerateRequest"),
-        }
-    }
-
-    /// Get vLLM variant (panics if not vLLM)
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via is_vllm() check"
-    )]
-    pub fn as_vllm(&self) -> &vllm::GenerateRequest {
-        match self {
-            Self::Vllm(req) => req,
-            _ => panic!("Expected vLLM GenerateRequest"),
-        }
-    }
-
-    /// Get TensorRT-LLM variant (panics if not TensorRT-LLM)
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via is_trtllm() check"
-    )]
-    pub fn as_trtllm(&self) -> &trtllm::GenerateRequest {
-        match self {
-            Self::Trtllm(req) => req,
-            _ => panic!("Expected TensorRT-LLM GenerateRequest"),
-        }
-    }
-
-    /// Get TokenSpeed variant (panics if not TokenSpeed)
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via is_tokenspeed() check"
-    )]
-    pub fn as_tokenspeed(&self) -> &tokenspeed::GenerateRequest {
-        match self {
-            Self::TokenSpeed(req) => req,
-            _ => panic!("Expected TokenSpeed GenerateRequest"),
-        }
-    }
-
-    /// Check if this is SGLang
-    pub fn is_sglang(&self) -> bool {
-        matches!(self, Self::Sglang(_))
-    }
-
     /// Check if this is vLLM
     pub fn is_vllm(&self) -> bool {
         matches!(self, Self::Vllm(_))
     }
 
-    /// Check if this is TensorRT-LLM
-    pub fn is_trtllm(&self) -> bool {
-        matches!(self, Self::Trtllm(_))
-    }
-
-    /// Check if this is TokenSpeed
-    pub fn is_tokenspeed(&self) -> bool {
-        matches!(self, Self::TokenSpeed(_))
+    /// The runtime whose message type this request is.
+    pub fn runtime_type(&self) -> crate::worker::RuntimeType {
+        use crate::worker::RuntimeType;
+        match self {
+            Self::Sglang(_) => RuntimeType::Sglang,
+            Self::Vllm(_) => RuntimeType::Vllm,
+            Self::Trtllm(_) => RuntimeType::Trtllm,
+            Self::Mlx(_) => RuntimeType::Mlx,
+            Self::TokenSpeed(_) => RuntimeType::TokenSpeed,
+        }
     }
 
     /// Sanitize sampling params for the prefill-only side (vLLM PD mode).
@@ -928,6 +867,19 @@ impl ProtoGenerateRequest {
         }
     }
 
+    /// Whether the prefill side's embeddings come from an encode worker: the
+    /// request carries the encode rendezvous rooms the prefill worker waits
+    /// on before its own forward (see [`Self::set_encode_bootstrap_info`]).
+    pub(crate) fn awaits_encode(&self) -> bool {
+        match self {
+            Self::TokenSpeed(req) => req
+                .encode_bootstrap_info
+                .as_ref()
+                .is_some_and(|info| !info.items.is_empty()),
+            Self::Sglang(_) | Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) => false,
+        }
+    }
+
     /// Set the PD prefill->decode KV rendezvous params (TokenSpeed only).
     ///
     /// The gateway sends identical params to both the prefill and decode worker:
@@ -952,5 +904,80 @@ impl ProtoGenerateRequest {
                 tracing::warn!("set_kv_bootstrap_info called on non-TokenSpeed request, ignoring");
             }
         }
+    }
+
+    /// Move the PD KV bootstrap room into the residue class of `rank` modulo
+    /// `ranks`, its other bits kept as minted: a TokenSpeed prefill of
+    /// `ranks` engines runs a disaggregated request on the rank its room's
+    /// residue names, and its decode side reads the KV from there. The room
+    /// stays in `[0, i64::MAX)`. False, and nothing changed, for a request
+    /// without a room (not TokenSpeed, or not disaggregated) or a rank
+    /// outside `0..ranks`.
+    pub fn set_kv_bootstrap_room_residue(&mut self, rank: usize, ranks: usize) -> bool {
+        let Self::TokenSpeed(req) = self else {
+            return false;
+        };
+        let Some(info) = req.kv_bootstrap_info.as_mut() else {
+            return false;
+        };
+        let (Ok(rank), Ok(ranks)) = (i64::try_from(rank), i64::try_from(ranks)) else {
+            return false;
+        };
+        if rank >= ranks || ranks == i64::MAX {
+            return false;
+        }
+        // Below `i64::MAX - ranks`, so adding back up to `ranks - 1` cannot
+        // overflow.
+        let minted = info.bootstrap_room;
+        let base = minted.rem_euclid(i64::MAX - ranks);
+        info.bootstrap_room = base - base % ranks + rank;
+        // The minted room was logged when it was injected; name the room that
+        // is dispatched, which engines report in their KV-transfer errors.
+        tracing::debug!(
+            request_id = %req.request_id,
+            minted_room = minted,
+            room = info.bootstrap_room,
+            rank,
+            ranks,
+            "PD bootstrap room moved into the sticky key's prefill rank"
+        );
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The prefill side's request says its embeddings come from an encode
+    /// worker while it carries encode rendezvous rooms; its pixel-free decode
+    /// clone, whose rooms are cleared, waits on the prefill's handoff instead,
+    /// and a request with no rooms never did.
+    #[test]
+    fn a_request_awaits_encode_only_while_it_carries_encode_rooms() {
+        let mut request = ProtoGenerateRequest::TokenSpeed(Box::default());
+        assert!(!request.awaits_encode(), "no rooms, no encode wait");
+        request.set_encode_bootstrap_info(Vec::new());
+        assert!(
+            !request.awaits_encode(),
+            "an empty room list is no encode wait"
+        );
+        request.set_encode_bootstrap_info(vec![EncodeItemBootstrapInfo {
+            item_index: 0,
+            bootstrap_host: "encode-worker".to_string(),
+            bootstrap_port: 9000,
+            bootstrap_room: 41,
+        }]);
+        assert!(
+            request.awaits_encode(),
+            "the prefill side waits on the encoder"
+        );
+        let mut decode = request.clone_without_mm_pixels();
+        decode.clear_encode_bootstrap_info();
+        assert!(
+            !decode.awaits_encode(),
+            "the decode side waits on the prefill's handoff, not on the encoder"
+        );
+        assert!(request.awaits_encode(), "the prefill side still does");
     }
 }

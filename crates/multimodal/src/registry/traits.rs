@@ -65,6 +65,13 @@ pub enum ModelRegistryError {
     },
 }
 
+impl ModelRegistryError {
+    /// The error for a modality that the spec named `spec` does not serve.
+    pub(crate) fn unsupported(spec: &'static str, modality: Modality) -> Self {
+        Self::UnsupportedModality { spec, modality }
+    }
+}
+
 pub type RegistryResult<T> = Result<T, ModelRegistryError>;
 
 static IMAGE_MAX_COUNT_OVERRIDE: OnceLock<Option<usize>> = OnceLock::new();
@@ -197,6 +204,36 @@ impl<'a> ModelMetadata<'a> {
         Self::find_value(self.config, path).and_then(|value| value.as_u64().map(|v| v as u32))
     }
 
+    /// The token id a config field names: the placeholder and delimiter ids a
+    /// registry entry reads from its model config. An absent field is
+    /// `MissingConfigField`, and so is a field set to `null`, which is how a
+    /// hub config writes an attribute the checkpoint never set; a present
+    /// value that is not a token id (negative, fractional, quoted, or above
+    /// the id range) is `InvalidConfigField` naming what was found, so the
+    /// operator reads the fault that is there.
+    pub fn config_token_id(&self, field: &str) -> RegistryResult<TokenId> {
+        let value = Self::find_value(self.config, &[field])
+            .filter(|value| !value.is_null())
+            .ok_or_else(|| ModelRegistryError::MissingConfigField {
+                field: field.to_string(),
+            })?;
+        let invalid = |reason: String| ModelRegistryError::InvalidConfigField {
+            field: field.to_string(),
+            reason,
+        };
+        let id = value.as_u64().ok_or_else(|| {
+            invalid(format!(
+                "expected a non-negative integer token id, found {value}"
+            ))
+        })?;
+        TokenId::try_from(id).map_err(|_| {
+            invalid(format!(
+                "token id {id} is above the id range (at most {})",
+                TokenId::MAX
+            ))
+        })
+    }
+
     pub fn config_model_type(&self) -> Option<&str> {
         Self::find_value(self.config, &["model_type"]).and_then(Value::as_str)
     }
@@ -286,6 +323,18 @@ pub trait ModelProcessorSpec: Send + Sync {
         EncoderInputFormat::Reference
     }
 
+    /// Whether the family sizes its source images itself before the processor
+    /// runs. `true` opts the family into the MiniMax rule of
+    /// [`crate::minimax_resize`]: the gateway then plans the geometry when it
+    /// fetches and marks the frame as sized for the processor. On an SGLang
+    /// worker it also opts into that rule's day-0 image and video preprocessor
+    /// overrides, applied when the worker loads the model's configs. A family
+    /// with a different source rule needs its own answer, not this one. `false`
+    /// for a family whose processor takes the source as decoded.
+    fn resizes_source_images(&self) -> bool {
+        false
+    }
+
     fn placeholder_token(&self, metadata: &ModelMetadata) -> RegistryResult<String>;
     fn placeholder_token_id(&self, metadata: &ModelMetadata) -> RegistryResult<TokenId>;
     fn placeholder_token_for(
@@ -296,10 +345,7 @@ pub trait ModelProcessorSpec: Send + Sync {
         match (self.hooks(modality), modality) {
             (Some(hooks), _) => (hooks.placeholder)(metadata),
             (None, Modality::Image) => self.placeholder_token(metadata),
-            (None, _) => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            (None, _) => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
     fn placeholder_token_id_for(
@@ -310,10 +356,7 @@ pub trait ModelProcessorSpec: Send + Sync {
         match (self.hooks(modality), modality) {
             (Some(hooks), _) => (hooks.placeholder_id)(metadata),
             (None, Modality::Image) => self.placeholder_token_id(metadata),
-            (None, _) => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            (None, _) => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
     /// The text the model's chat template writes for one item of `modality`
@@ -375,10 +418,7 @@ pub trait ModelProcessorSpec: Send + Sync {
         _preprocessor_config: &PreProcessorConfig,
         modality: Modality,
     ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
-        Err(ModelRegistryError::UnsupportedModality {
-            spec: self.name(),
-            modality,
-        })
+        Err(ModelRegistryError::unsupported(self.name(), modality))
     }
 
     /// Build the audio preprocessor for this model, if it supports audio.
@@ -424,10 +464,7 @@ pub trait ModelProcessorSpec: Send + Sync {
                 (hooks.replacements)(metadata, preprocessed, &[], &PreProcessorConfig::default())
             }
             (None, Modality::Image) => self.prompt_replacements(metadata, preprocessed),
-            (None, _) => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            (None, _) => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
 
@@ -453,6 +490,10 @@ pub trait ModelProcessorSpec: Send + Sync {
     /// Keys not listed are treated as shared (replicated across all media items).
     /// The `"pixel_values"` key mirrors the reference processors' vision kwargs and should be
     /// included when the primary encoder input differs from batched layout.
+    ///
+    /// This is the legacy map, read only by the default of [`Self::encoder_field_layouts_for`]:
+    /// an entry that overrides that method, or declares hooks for every modality, need not
+    /// declare this map and keeps the default here, so a caller asks that method.
     fn field_layouts(&self) -> HashMap<String, FieldLayout> {
         // Default: encoder_input is batched (most models).
         HashMap::from([("pixel_values".to_string(), FieldLayout::Batched)])
@@ -1019,5 +1060,89 @@ mod tests {
                 Err(ModelRegistryError::UnsupportedModality { spec: "hooked", .. })
             ));
         }
+    }
+
+    #[test]
+    fn config_token_id_reads_the_field_or_names_it_in_the_error() {
+        let config = json!({ "image_token_id": 151655 });
+        let encoding = TestTokenizer::new(&[]);
+        let metadata = ModelMetadata {
+            model_id: "m",
+            tokenizer: &encoding,
+            config: &config,
+        };
+        assert_eq!(metadata.config_token_id("image_token_id").unwrap(), 151655);
+        assert_eq!(
+            metadata.config_token_id("video_token_id").unwrap_err(),
+            ModelRegistryError::MissingConfigField {
+                field: "video_token_id".to_string(),
+            }
+        );
+    }
+
+    /// `image_token_id` read from `config` through the registry helper.
+    fn image_token_id_of(config: &Value) -> RegistryResult<TokenId> {
+        let encoding = TestTokenizer::new(&[]);
+        ModelMetadata {
+            model_id: "m",
+            tokenizer: &encoding,
+            config,
+        }
+        .config_token_id("image_token_id")
+    }
+
+    /// The error a present but unusable `image_token_id` produces, its reason
+    /// returned for the caller's assertion on the value it names.
+    fn invalid_image_token_id_reason(config: &Value) -> String {
+        match image_token_id_of(config).unwrap_err() {
+            ModelRegistryError::InvalidConfigField { field, reason } => {
+                assert_eq!(field, "image_token_id");
+                reason
+            }
+            other => panic!("expected InvalidConfigField, got {other:?}"),
+        }
+    }
+
+    /// A null id is an attribute the checkpoint never set, as a hub config
+    /// writes it: the error an absent field gives, naming the field to add.
+    #[test]
+    fn a_null_token_id_is_missing_not_invalid() {
+        assert_eq!(
+            image_token_id_of(&json!({ "image_token_id": null })).unwrap_err(),
+            image_token_id_of(&json!({})).unwrap_err()
+        );
+    }
+
+    #[test]
+    fn a_negative_token_id_is_invalid_not_missing() {
+        let reason = invalid_image_token_id_reason(&json!({ "image_token_id": -1 }));
+        assert!(reason.contains("found -1"), "{reason}");
+    }
+
+    #[test]
+    fn a_fractional_token_id_is_invalid_not_missing() {
+        let reason = invalid_image_token_id_reason(&json!({ "image_token_id": 151655.0 }));
+        assert!(reason.contains("found 151655.0"), "{reason}");
+    }
+
+    #[test]
+    fn a_quoted_token_id_is_invalid_not_missing() {
+        let reason = invalid_image_token_id_reason(&json!({ "image_token_id": "151655" }));
+        assert!(reason.contains("found \"151655\""), "{reason}");
+    }
+
+    #[test]
+    fn a_token_id_above_the_id_range_is_invalid() {
+        let above = i64::from(TokenId::MAX) + 1;
+        let reason = invalid_image_token_id_reason(&json!({ "image_token_id": above }));
+        assert!(reason.contains("2147483648"), "{reason}");
+        assert!(reason.contains("(at most 2147483647)"), "{reason}");
+        let reason =
+            invalid_image_token_id_reason(&json!({ "image_token_id": u64::from(u32::MAX) + 1 }));
+        assert!(reason.contains("4294967296"), "{reason}");
+        assert_eq!(
+            image_token_id_of(&json!({ "image_token_id": TokenId::MAX })).unwrap(),
+            TokenId::MAX
+        );
     }
 }

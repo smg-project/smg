@@ -20,7 +20,7 @@ use wasmtime_wasi::WasiCtx;
 const EPOCH_INTERVAL_MS: u64 = 100;
 
 use crate::{
-    config::WasmRuntimeConfig,
+    config::{available_cpus, WasmRuntimeConfig},
     errors::{Result, WasmError, WasmRuntimeError},
     module::{MiddlewareAttachPoint, WasmModuleAttachPoint},
     spec::Smg,
@@ -72,9 +72,7 @@ impl WasmRuntime {
 
     /// get available cpu count and max recommended cpu count
     pub fn get_cpu_info() -> (usize, usize) {
-        let cpu_count = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
+        let cpu_count = available_cpus();
         let max_recommended = cpu_count.max(1);
         (cpu_count, max_recommended)
     }
@@ -126,10 +124,7 @@ impl WasmThreadPool {
 
         let mut workers = Vec::new();
         // set thread pool size based on cpu count
-        let max_workers = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-            .max(1);
+        let max_workers = available_cpus().max(1);
         let num_workers = config.thread_pool_size.clamp(1, max_workers);
 
         debug!(
@@ -256,17 +251,14 @@ impl WasmThreadPool {
         );
 
         loop {
-            let task = match receiver.recv().await {
-                Ok(task) => task,
-                Err(_) => {
-                    debug!(
-                        target: "smg::wasm::runtime",
-                        worker_id = worker_id,
-                        "Worker shutting down"
-                    );
-                    epoch_handle.abort(); // Stop the epoch incrementer
-                    break; // channel closed, exit loop
-                }
+            let Ok(task) = receiver.recv().await else {
+                debug!(
+                    target: "smg::wasm::runtime",
+                    worker_id = worker_id,
+                    "Worker shutting down"
+                );
+                epoch_handle.abort(); // Stop the epoch incrementer
+                break; // channel closed, exit loop
             };
 
             match task {
@@ -364,70 +356,54 @@ impl WasmThreadPool {
             Err(wasmtime::Error::msg("execution time limit exceeded"))
         });
 
-        let output = match attach_point {
-            WasmModuleAttachPoint::Middleware(MiddlewareAttachPoint::OnRequest) => {
-                let request = match input {
-                    WasmComponentInput::MiddlewareRequest(req) => req,
-                    WasmComponentInput::MiddlewareResponse(_) => {
-                        return Err(WasmError::from(WasmRuntimeError::CallFailed(
-                            "Expected MiddlewareRequest input for OnRequest attach point"
-                                .to_string(),
-                        )));
-                    }
-                };
-
-                // Instantiate component (must use async instantiation when async support is enabled)
-                let bindings = Smg::instantiate_async(&mut store, &component, linker)
-                    .await
-                    .map_err(|e| {
-                        WasmError::from(WasmRuntimeError::InstanceCreateFailed(e.to_string()))
-                    })?;
-
-                // Call on-request (async call when async support is enabled)
-                let action_result = bindings
-                    .smg_gateway_middleware_on_request()
-                    .call_on_request(&mut store, &request)
-                    .await
-                    .map_err(|e| map_wasm_error(e, config.max_execution_time_ms))?;
-
-                WasmComponentOutput::MiddlewareAction(action_result)
+        // The input must be the attach point's kind before anything is instantiated.
+        match (attach_point, &input) {
+            (
+                WasmModuleAttachPoint::Middleware(MiddlewareAttachPoint::OnRequest),
+                WasmComponentInput::MiddlewareRequest(_),
+            )
+            | (
+                WasmModuleAttachPoint::Middleware(MiddlewareAttachPoint::OnResponse),
+                WasmComponentInput::MiddlewareResponse(_),
+            ) => {}
+            (WasmModuleAttachPoint::Middleware(MiddlewareAttachPoint::OnRequest), _) => {
+                return Err(WasmError::from(WasmRuntimeError::CallFailed(
+                    "Expected MiddlewareRequest input for OnRequest attach point".to_string(),
+                )));
             }
-            WasmModuleAttachPoint::Middleware(MiddlewareAttachPoint::OnResponse) => {
-                // Extract Response input
-                let response = match input {
-                    WasmComponentInput::MiddlewareResponse(resp) => resp,
-                    WasmComponentInput::MiddlewareRequest(_) => {
-                        return Err(WasmError::from(WasmRuntimeError::CallFailed(
-                            "Expected MiddlewareResponse input for OnResponse attach point"
-                                .to_string(),
-                        )));
-                    }
-                };
-
-                // Instantiate component (must use async instantiation when async support is enabled)
-                let bindings = Smg::instantiate_async(&mut store, &component, linker)
-                    .await
-                    .map_err(|e| {
-                        WasmError::from(WasmRuntimeError::InstanceCreateFailed(e.to_string()))
-                    })?;
-
-                // Call on-response (async call when async support is enabled)
-                let action_result = bindings
-                    .smg_gateway_middleware_on_response()
-                    .call_on_response(&mut store, &response)
-                    .await
-                    .map_err(|e| map_wasm_error(e, config.max_execution_time_ms))?;
-
-                WasmComponentOutput::MiddlewareAction(action_result)
+            (WasmModuleAttachPoint::Middleware(MiddlewareAttachPoint::OnResponse), _) => {
+                return Err(WasmError::from(WasmRuntimeError::CallFailed(
+                    "Expected MiddlewareResponse input for OnResponse attach point".to_string(),
+                )));
             }
-            WasmModuleAttachPoint::Middleware(MiddlewareAttachPoint::OnError) => {
+            (WasmModuleAttachPoint::Middleware(MiddlewareAttachPoint::OnError), _) => {
                 return Err(WasmError::from(WasmRuntimeError::CallFailed(
                     "OnError attach point not yet implemented".to_string(),
                 )));
             }
-        };
+        }
 
-        Ok(output)
+        // Instantiate component (must use async instantiation when async support is enabled)
+        let bindings = Smg::instantiate_async(&mut store, &component, linker)
+            .await
+            .map_err(|e| WasmError::from(WasmRuntimeError::InstanceCreateFailed(e.to_string())))?;
+        let action = match input {
+            WasmComponentInput::MiddlewareRequest(request) => {
+                bindings
+                    .smg_gateway_middleware_on_request()
+                    .call_on_request(&mut store, &request)
+                    .await
+            }
+            WasmComponentInput::MiddlewareResponse(response) => {
+                bindings
+                    .smg_gateway_middleware_on_response()
+                    .call_on_response(&mut store, &response)
+                    .await
+            }
+        }
+        .map_err(|e| map_wasm_error(e, config.max_execution_time_ms))?;
+
+        Ok(WasmComponentOutput::MiddlewareAction(action))
     }
 }
 

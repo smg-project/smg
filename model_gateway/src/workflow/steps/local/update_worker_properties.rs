@@ -10,16 +10,14 @@ use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, Wo
 #[cfg(test)]
 use super::create_worker::labels_for_rank;
 use super::create_worker::{
-    model_card_for_labels, report_for_rank, validate_parser_overrides,
+    kv_transfer_value, model_card_for_labels, report_for_rank, validate_parser_overrides,
     warn_on_conflicting_parser_overrides, DP_WIDTH_LABELS,
 };
 use crate::{
+    admin::worker_service::MAX_WORKER_LABELS,
     service_discovery::DISCOVERY_PROVIDER_LABEL,
-    worker::{
-        basic::merge_labels, overload::OverloadThresholds, service::MAX_WORKER_LABELS, BasicWorker,
-        BasicWorkerBuilder, RuntimeType, Worker,
-    },
-    workflow::data::WorkerUpdateWorkflowData,
+    worker::{identity::basic::merge_labels, BasicWorker, BasicWorkerBuilder, RuntimeType, Worker},
+    workflow::data::{require_app_context, WorkerUpdateWorkflowData},
 };
 
 /// Step to update worker properties.
@@ -59,12 +57,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
             context.data.updated_workers = Some(Vec::new());
             return Ok(StepResult::Skip);
         }
-        let app_context = context
-            .data
-            .app_context
-            .as_ref()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?
-            .clone();
+        let app_context = require_app_context(context.data.app_context.as_ref())?.clone();
         let workers_to_update = context
             .data
             .workers_to_update
@@ -127,7 +120,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                                         "worker {} is owned by the '{provider}' discovery provider \
                                          since this update was accepted; its labels come from its \
                                          discovery source",
-                                        worker.url()
+                                        worker.redacted_url()
                                     ),
                                 });
                             }
@@ -151,7 +144,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                             message: format!(
                                 "{} labels on worker {} after this update ({} now, {} new); at most {MAX_WORKER_LABELS} are accepted",
                                 updated_labels.len(),
-                                worker.url(),
+                                worker.redacted_url(),
                                 existing.len(),
                                 updated_labels.len() - existing.len()
                             ),
@@ -206,14 +199,14 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                 && !fresh_kv.fills_a_field_of(&worker.metadata().spec)
             {
                 debug!(
-                    worker_url = %worker.url(),
+                    worker_url = %worker.redacted_url(),
                     "Engine labels unchanged; the worker is kept as it is"
                 );
                 continue;
             }
             if !card_fields.is_empty() {
                 info!(
-                    worker_url = %worker.url(),
+                    worker_url = %worker.redacted_url(),
                     fields = ?card_fields,
                     "The worker's model card follows its labels"
                 );
@@ -258,7 +251,6 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                 Some(update) => update.apply_to(existing_health),
                 None => existing_health.clone(),
             };
-            let health_endpoint = worker.metadata().health_endpoint.clone();
 
             // Determine API key: use new one if provided, otherwise keep existing
             let updated_api_key = request
@@ -281,47 +273,17 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
             } else {
                 worker.status()
             };
-            // `from_spec` starts the rebuilt worker on the built-in breaker
-            // config. Carry the one resolved at registration (gateway defaults
-            // plus this worker's overrides) so an update neither loosens nor
-            // tightens the breaker; with matching configs the registry
-            // replacement adopts the live breaker as well, so its state
-            // (open, half-open, failure counts) survives the update.
-            let circuit_breaker_config = worker
-                .as_any()
-                .downcast_ref::<BasicWorker>()
-                .map(BasicWorker::circuit_breaker_config);
-            let mut builder = BasicWorkerBuilder::from_spec((*worker.metadata().spec).clone())
-                .http2(worker.http2())
+            let mut builder = BasicWorkerBuilder::carrying(worker)
                 .labels(updated_labels)
                 .models(models)
                 .discovered_labels(discovered_labels)
                 .health_config(updated_health_config.clone())
-                .health_endpoint(&health_endpoint)
-                .resilience(worker.resilience().clone())
                 .priority(updated_priority)
                 .cost(updated_cost)
-                // The overload block is not updatable here, but it must survive
-                // the rebuild; effective thresholds re-resolve against the same
-                // gateway defaults registration used.
-                .overload(worker.metadata().spec.overload)
-                .overload_defaults(OverloadThresholds::from_gateway_config(
-                    &app_context.router_config,
-                ))
-                // The ZMQ handshake bound is the router config's, set at registration;
-                // the rebuilt worker keeps the live value rather than the builder's
-                // default, so the bound an operator set stays in force across an update.
-                .zmq_startup_timeout(worker.metadata().zmq_startup_timeout)
+                // The effective overload thresholds re-resolve against the
+                // same gateway defaults registration used.
+                .overload_defaults(app_context.router_config.worker_overload_thresholds())
                 .status(next_status);
-            if let Some(config) = circuit_breaker_config {
-                builder = builder.circuit_breaker_config(config);
-            }
-            // The ZMQ link's request bound, resolved at registration (the
-            // worker's own pool timeout, else the router's), is kept across the
-            // rebuild as the handshake bound is.
-            if let Some(timeout) = worker.metadata().zmq_request_timeout {
-                builder = builder.zmq_request_timeout(timeout);
-            }
             if refresh {
                 // A connector or role the operator configured none of follows
                 // the engine's report; a configured one stands, as at
@@ -374,7 +336,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                 }
                 _ if refresh => {
                     debug!(
-                        worker_url = %worker.url(),
+                        worker_url = %worker.redacted_url(),
                         "Worker changed or left during the label refresh; not rebuilt"
                     );
                     continue;
@@ -385,7 +347,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                         message: format!(
                             "worker {} was replaced or removed since this update found it, so \
                              the update was dropped",
-                            worker.url()
+                            worker.redacted_url()
                         ),
                     });
                 }
@@ -406,7 +368,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
 
         // Log result
         if updated_workers.len() == 1 {
-            info!("Updated worker {}", updated_workers[0].url());
+            info!("Updated worker {}", updated_workers[0].redacted_url());
         } else {
             info!("Updated {} workers", updated_workers.len());
         }
@@ -454,9 +416,10 @@ struct EngineKvMetadata {
 }
 
 impl EngineKvMetadata {
-    /// Takes the three keys out of the report; an empty value is none.
+    /// Takes the three keys out of the report, an empty value being none
+    /// (`kv_transfer_value`, the registration's reading of the same keys).
     fn take(report: &mut HashMap<String, String>) -> Self {
-        let mut take = |key: &str| report.remove(key).filter(|value| !value.is_empty());
+        let mut take = |key: &str| kv_transfer_value(report.remove(key));
         Self {
             connector: take("kv_connector"),
             role: take("kv_role"),
@@ -493,7 +456,7 @@ impl EngineKvMetadata {
         let previous = worker.kv_engine_id();
         if worker.refresh_kv_engine_id(Some(engine_id.clone())) {
             info!(
-                worker_url = %worker.url(),
+                worker_url = %worker.redacted_url(),
                 ?previous,
                 engine_id,
                 "The worker's KV engine id follows its engine's report"

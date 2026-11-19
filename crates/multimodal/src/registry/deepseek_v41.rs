@@ -30,12 +30,7 @@ pub(super) struct DeepseekV41VisionSpec;
 
 impl DeepseekV41VisionSpec {
     fn image_token_id(metadata: &ModelMetadata) -> RegistryResult<TokenId> {
-        metadata
-            .config_u32(&["image_token_id"])
-            .map(|id| id as TokenId)
-            .ok_or_else(|| ModelRegistryError::MissingConfigField {
-                field: "image_token_id".to_string(),
-            })
+        metadata.config_token_id("image_token_id")
     }
 }
 
@@ -119,10 +114,7 @@ impl ModelProcessorSpec for DeepseekV41VisionSpec {
             Modality::Image => Ok(Box::new(DeepseekV41Processor::from_preprocessor_config(
                 preprocessor_config,
             ))),
-            _ => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            _ => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
 

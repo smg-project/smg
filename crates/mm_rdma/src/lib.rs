@@ -24,6 +24,12 @@ pub const GEN_BYTES: usize = 8;
 /// Header + trailer generation stamps bracketing the payload.
 pub const FRAME_OVERHEAD: usize = 2 * GEN_BYTES;
 
+/// Whether this build stages pixels over RDMA at all: `true` under the `nixl`
+/// feature, `false` for the no-op [`RdmaExporter`] of the default build, which
+/// constructs but exports nothing, so every caller ships its bytes inline. A
+/// reader that plans around the lane asks this before it asks for an exporter.
+pub const STAGES_OVER_RDMA: bool = cfg!(feature = "nixl");
+
 /// Everything the exporter needs, injected by the gateway. The crate reads no
 /// environment and no globals: the gateway parses env / flags and fills this in.
 #[derive(Debug, Clone)]

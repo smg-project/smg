@@ -5,7 +5,7 @@
 //! later, and nothing was sent in between. An idle-timeout proxy in front of
 //! the gateway cuts a connection that carries no byte for its idle window
 //! (sixty seconds is a common setting), and the client sees a stream that
-//! ends before it began. [`sse_keepalive_middleware`] gives every SSE
+//! ends before it began. [`SseKeepAlive::layer`] gives every SSE
 //! response a `KeepAlive`, carried by the edge's one body wrapper (the
 //! metrics layer's `EdgeBody`), so an interval
 //! of silence is broken by a frame the client ignores: an SSE comment on the
@@ -23,9 +23,8 @@ use std::{
 
 use axum::{
     body::Body,
-    extract::{Request, State},
+    extract::Request,
     http::header::{CONTENT_LENGTH, CONTENT_TYPE},
-    middleware::Next,
     response::Response,
 };
 use bytes::Bytes;
@@ -37,7 +36,7 @@ use tower::{Layer, Service};
 use super::edge_body::BodyDuties;
 use crate::{
     config::types::RouterConfig,
-    routers::http::stream_failure::{note_sent, on_frame_boundary},
+    routers::http::stream_failure::{note_sent, on_frame_boundary, SentTail},
 };
 
 /// The keep-alive of an OpenAI-shaped stream: an SSE comment, which every
@@ -70,10 +69,12 @@ impl SseKeepAlive {
 
     /// Gives an SSE `response` whose length is not known up front (a
     /// complete SSE answer has nothing to wait for, and a body sent under a
-    /// `Content-Length` header must not grow past it: the relays copy an
-    /// upstream's header onto a streamed body) its keep-alive, handed to the
-    /// edge's body wrapper; `messages` selects the Messages API's ping over
-    /// the comment. Anything else is returned as it came.
+    /// `Content-Length` header must not grow past it: the relay drops an
+    /// upstream's header from a streamed SSE body, so the header that remains
+    /// is a non-SSE upstream body the PD router relabels as SSE) its
+    /// keep-alive, handed to the edge's body wrapper; `messages` selects the
+    /// Messages API's ping over the comment. Anything else is returned as it
+    /// came.
     pub(crate) fn apply(self, mut response: Response, messages: bool) -> Response {
         let Some(interval) = self.interval else {
             return response;
@@ -103,8 +104,7 @@ fn is_event_stream(response: &Response) -> bool {
 
 impl SseKeepAlive {
     /// This keep-alive as a route layer: the service's own future maps the
-    /// response, nothing is cloned or boxed per request (the `from_fn` form
-    /// did both, on every request of the routes, streamed or not).
+    /// response, nothing is cloned or boxed per request.
     pub fn layer(self) -> SseKeepAliveLayer {
         SseKeepAliveLayer { keep_alive: self }
     }
@@ -179,18 +179,6 @@ where
     }
 }
 
-/// Route-layer middleware: the keep-alive on every SSE response of the
-/// routes it wraps ([`SseKeepAlive::layer`] is the same without the per-request
-/// clone and boxes of `from_fn`).
-pub async fn sse_keepalive_middleware(
-    State(keep_alive): State<SseKeepAlive>,
-    request: Request<Body>,
-    next: Next,
-) -> Response {
-    let messages = request.uri().path() == MESSAGES_ROUTE;
-    keep_alive.apply(next.run(request).await, messages)
-}
-
 /// The keep-alive of one SSE body: `frame` after `interval` of silence, on a
 /// frame boundary. The edge's body wrapper tells it of every frame sent and
 /// polls it while the body is quiet. The clock is read when the body turns
@@ -211,20 +199,22 @@ pub(crate) struct KeepAlive {
     sent_since: bool,
     /// The last bytes sent, to tell a frame boundary from the inside of a
     /// frame.
-    tail: Vec<u8>,
-    timer: Pin<Box<Sleep>>,
+    tail: SentTail,
+    /// Built on the first wait for silence, due one interval after the last
+    /// frame, which is when a timer built with the stream would have been
+    /// reset to anyway; a stream that is never quiet never builds it.
+    timer: Option<Pin<Box<Sleep>>>,
 }
 
 impl KeepAlive {
     fn new(interval: Duration, frame: Bytes) -> Self {
-        let now = Instant::now();
         Self {
             interval,
             frame,
-            last_sent: now,
+            last_sent: Instant::now(),
             sent_since: false,
-            tail: Vec::with_capacity(4),
-            timer: Box::pin(tokio::time::sleep_until(now + interval)),
+            tail: SentTail::default(),
+            timer: None,
         }
     }
 
@@ -245,20 +235,24 @@ impl KeepAlive {
             // The first quiet poll after a burst: its last frame just left.
             self.last_sent = Instant::now();
         }
+        let first_due = self.last_sent + self.interval;
+        let timer = self
+            .timer
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep_until(first_due)));
         loop {
-            if self.timer.as_mut().poll(cx).is_pending() {
+            if timer.as_mut().poll(cx).is_pending() {
                 return Poll::Pending;
             }
             let now = Instant::now();
             let due = self.last_sent + self.interval;
             if now < due {
-                self.timer.as_mut().reset(due);
-            } else if on_frame_boundary(&self.tail) {
+                timer.as_mut().reset(due);
+            } else if on_frame_boundary(self.tail.as_slice()) {
                 self.last_sent = now;
-                self.timer.as_mut().reset(now + self.interval);
+                timer.as_mut().reset(now + self.interval);
                 return Poll::Ready(self.frame.clone());
             } else {
-                self.timer.as_mut().reset(now + self.interval);
+                timer.as_mut().reset(now + self.interval);
             }
         }
     }
@@ -473,8 +467,10 @@ mod tests {
         assert_eq!(next_within(&mut body, 10 * SECS).await, Read::Silence);
     }
 
-    /// A streamed body under an upstream's `Content-Length` (the relays copy
-    /// the header) is left alone: a keep-alive would push it past the length.
+    /// A streamed body under an upstream's `Content-Length` (a non-SSE
+    /// upstream body relabelled as SSE keeps the header; the relay drops it
+    /// from a streamed SSE body) is left alone: a keep-alive would push it
+    /// past the length.
     #[tokio::test(start_paused = true)]
     async fn an_sse_answer_under_a_content_length_header_passes_untouched() {
         let declared = || {

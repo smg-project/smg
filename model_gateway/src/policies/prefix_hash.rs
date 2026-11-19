@@ -415,8 +415,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        policies::test_support::make_workers,
-        worker::{HashRing, WorkerLoadGuard},
+        policies::{hash_ring::HashRing, test_support::make_workers},
+        worker::WorkerLoadGuard,
     };
 
     #[test]
@@ -695,7 +695,7 @@ mod tests {
         let policy = PrefixHashPolicy::with_defaults();
         let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
         let ring = Arc::new(HashRing::new(workers.iter().map(|w| w.url())));
-        let _busy = WorkerLoadGuard::new(workers[0].clone(), None);
+        let _busy = WorkerLoadGuard::with_key(workers[0].clone(), None);
 
         // Empty tokens, empty text
         let tokens: Vec<u32> = vec![];
@@ -941,8 +941,8 @@ mod tests {
 
         // Overloaded level-32 target: retry lands on the level-16 target.
         let _deep_busy = [
-            WorkerLoadGuard::new(workers[deep_idx].clone(), None),
-            WorkerLoadGuard::new(workers[deep_idx].clone(), None),
+            WorkerLoadGuard::with_key(workers[deep_idx].clone(), None),
+            WorkerLoadGuard::with_key(workers[deep_idx].clone(), None),
         ];
         let (result, branch, level) = policy.select_worker_impl(&workers, &info);
         assert_eq!(result, Some(shallow_idx));
@@ -951,8 +951,8 @@ mod tests {
 
         // Both targets overloaded: the load-balance walk takes over.
         let _shallow_busy = [
-            WorkerLoadGuard::new(workers[shallow_idx].clone(), None),
-            WorkerLoadGuard::new(workers[shallow_idx].clone(), None),
+            WorkerLoadGuard::with_key(workers[shallow_idx].clone(), None),
+            WorkerLoadGuard::with_key(workers[shallow_idx].clone(), None),
         ];
         let (result, branch, level) = policy.select_worker_impl(&workers, &info);
         let spare = (0..3)

@@ -6,10 +6,11 @@ use crate::{
     encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs},
     media::FrameSampling,
     registry::{
-        MediaItemInfo, ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult,
+        layouts::grid_patch_layouts_for, MediaItemInfo, ModelMetadata, ModelProcessorSpec,
+        ModelRegistryError, RegistryResult,
     },
     types::{
-        EncoderFieldLayouts, FieldLayout, Modality, PlaceholderRange, PromptReplacement, TokenId,
+        EncoderFieldLayouts, Modality, PlaceholderRange, PromptReplacement, TokenId,
         VideoSamplingInfo,
     },
     vision::{MiniMaxM3VisionProcessor, PreProcessorConfig, VisionPreProcessor},
@@ -70,10 +71,7 @@ impl MiniMaxM3VisionSpec {
             Modality::Image | Modality::Video => {
                 Ok((Self::IMAGE_START_TOKEN, Self::IMAGE_END_TOKEN))
             }
-            _ => Err(ModelRegistryError::UnsupportedModality {
-                spec: "minimax_m3",
-                modality,
-            }),
+            _ => Err(ModelRegistryError::unsupported("minimax_m3", modality)),
         }
     }
 
@@ -334,6 +332,12 @@ impl ModelProcessorSpec for MiniMaxM3VisionSpec {
         matches!(modality, Modality::Image | Modality::Video)
     }
 
+    /// The source image is sized by the family's long-side rule
+    /// (`crate::minimax_resize`) before its processor runs.
+    fn resizes_source_images(&self) -> bool {
+        true
+    }
+
     fn placeholder_token_for(
         &self,
         metadata: &ModelMetadata,
@@ -342,10 +346,7 @@ impl ModelProcessorSpec for MiniMaxM3VisionSpec {
         match modality {
             Modality::Image => self.placeholder_token(metadata),
             Modality::Video => Ok(Self::VIDEO_TOKEN.to_string()),
-            _ => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            _ => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
 
@@ -357,10 +358,7 @@ impl ModelProcessorSpec for MiniMaxM3VisionSpec {
         match modality {
             Modality::Image => Self::image_token_id(metadata),
             Modality::Video => Self::video_token_id(metadata),
-            _ => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            _ => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
 
@@ -405,10 +403,7 @@ impl ModelProcessorSpec for MiniMaxM3VisionSpec {
                     },
                 )?,
             )),
-            _ => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            _ => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
 
@@ -440,10 +435,7 @@ impl ModelProcessorSpec for MiniMaxM3VisionSpec {
                 let placeholder_token = self.placeholder_token_for(metadata, Modality::Video)?;
                 Self::video_replacements(metadata, preprocessed, &placeholder_token, &[])
             }
-            _ => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            _ => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
 
@@ -479,52 +471,15 @@ impl ModelProcessorSpec for MiniMaxM3VisionSpec {
         }
     }
 
-    fn field_layouts(&self) -> HashMap<String, FieldLayout> {
-        // Mirrors the engine's `_get_mm_fields_config` for M3: the pixel tensors are
-        // flat over patches and sliced per item by the grid product, while the
-        // grid triples are batched one row per item. The frame spacing the
-        // shared video processor emits is listed too: M3 reads the timing off
-        // its text stamps and never looks at it, but a value with no layout is
-        // one every clip has to agree on, and clips sampled at different rates
-        // do not.
-        HashMap::from([
-            (
-                "pixel_values".to_string(),
-                FieldLayout::flat("patches_per_image"),
-            ),
-            ("image_grid_thw".to_string(), FieldLayout::Batched),
-            ("patches_per_image".to_string(), FieldLayout::Batched),
-            (
-                "pixel_values_videos".to_string(),
-                FieldLayout::flat("patches_per_video"),
-            ),
-            ("video_grid_thw".to_string(), FieldLayout::Batched),
-            ("patches_per_video".to_string(), FieldLayout::Batched),
-            ("video_second_per_grid".to_string(), FieldLayout::Batched),
-        ])
-    }
-
     fn encoder_field_layouts_for(&self, modality: Modality) -> EncoderFieldLayouts {
         // One map per modality: a video batch must not advertise the image
         // sizes key (or the other way round), or a request carrying both is
-        // sliced by a tensor the batch does not have.
-        match modality {
-            Modality::Video => EncoderFieldLayouts::new(
-                FieldLayout::flat("patches_per_video"),
-                HashMap::from([
-                    ("video_grid_thw".to_string(), FieldLayout::Batched),
-                    ("patches_per_video".to_string(), FieldLayout::Batched),
-                    ("video_second_per_grid".to_string(), FieldLayout::Batched),
-                ]),
-            ),
-            _ => EncoderFieldLayouts::new(
-                FieldLayout::flat("patches_per_image"),
-                HashMap::from([
-                    ("image_grid_thw".to_string(), FieldLayout::Batched),
-                    ("patches_per_image".to_string(), FieldLayout::Batched),
-                ]),
-            ),
-        }
+        // sliced by a tensor the batch does not have. The frame spacing the
+        // shared video processor emits is batched here, so clips sampled at
+        // different rates join one batch (M3 reads the timing off its text
+        // stamps). The entry declares no legacy field map: the trait's
+        // default reads one, and this override replaces that default.
+        grid_patch_layouts_for(modality)
     }
 
     fn keep_on_cpu_keys(&self) -> Vec<String> {
@@ -541,7 +496,10 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::*;
-    use crate::registry::{test_helpers::TestTokenizer, ModelMetadata, Tokenizer};
+    use crate::{
+        registry::{test_helpers::TestTokenizer, ModelMetadata, Tokenizer},
+        types::FieldLayout,
+    };
 
     /// Vocabulary ids for M3's media markers, as the checkpoint declares them.
     const IMAGE_ID: TokenId = 200_025;

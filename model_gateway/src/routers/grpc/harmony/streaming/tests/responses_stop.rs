@@ -159,6 +159,7 @@ async fn streamed(execution: context::ExecutionResult, router_stops: &[String]) 
             None,
             None,
             router_stops,
+            None,
         )
         .await;
         drop(tx);
@@ -331,7 +332,7 @@ async fn a_router_stop_inside_the_analysis_channel_streams_no_message() {
     let counts = streamed.counts.expect("the turn's counts");
     assert_eq!(
         (counts.prompt, counts.spec_accepted, counts.spec_drafted),
-        (3, 2, 3)
+        (3, 2, Some(3))
     );
 }
 
@@ -385,7 +386,7 @@ async fn the_engine_s_complete_right_after_the_stop_chunk_adds_only_the_counts_t
             counts.spec_accepted,
             counts.spec_drafted
         ),
-        (3, ids.len(), 2, 3)
+        (3, ids.len(), 2, Some(3))
     );
 }
 

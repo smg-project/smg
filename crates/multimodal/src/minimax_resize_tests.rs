@@ -1,7 +1,7 @@
 //! Source geometry, pixel identity and lazy decode regressions.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use super::*;
-use crate::{ImageDetail, ImageSource};
+use crate::{test_support::http_client_builder, ImageDetail, ImageSource};
 /// Exercise mutually exclusive branches, exact-cap equality and unaligned caps.
 #[test]
 fn branches_on_source_geometry_then_aligns_like_the_model() {
@@ -27,7 +27,7 @@ fn branches_on_source_geometry_then_aligns_like_the_model() {
         error.to_string(),
         "image max_long_side_pixel must be positive, got 0"
     );
-    assert_eq!(error.code(), crate::MediaErrorCode::FetchFailed);
+    assert_eq!(error.code(), crate::MediaErrorCode::InvalidRequest);
 }
 
 /// Ensure planned grids bypass legacy short-side staging and area shrinking.
@@ -157,11 +157,8 @@ async fn encoded_pixels_match_direct_resize_after_transparency() {
     use crate::{
         ImageFetchConfig, MediaConnector, MediaConnectorConfig, MediaSource, TransparencyPolicy,
     };
-    let connector = MediaConnector::new(
-        crate::test_support::http_client_builder(),
-        MediaConnectorConfig::default(),
-    )
-    .unwrap();
+    let connector =
+        MediaConnector::new(http_client_builder(), MediaConnectorConfig::default()).unwrap();
     for format in [ImageFormat::Png, ImageFormat::WebP, ImageFormat::Jpeg] {
         let pixels = DynamicImage::ImageRgba8(RgbaImage::from_fn(400, 50, |x, y| {
             Rgba([x as u8, y as u8, 70, (x + y) as u8])
@@ -219,11 +216,7 @@ async fn tracker_deduplicates_without_confusing_effective_sizes() {
         TrackedMedia,
     };
     let connector = Arc::new(
-        MediaConnector::new(
-            crate::test_support::http_client_builder(),
-            MediaConnectorConfig::default(),
-        )
-        .unwrap(),
+        MediaConnector::new(http_client_builder(), MediaConnectorConfig::default()).unwrap(),
     );
     let source = encoded(2000, 100);
     let url = format!(
@@ -234,7 +227,7 @@ async fn tracker_deduplicates_without_confusing_effective_sizes() {
     for cap in [1000, 1000, 1009, 2016] {
         tracker
             .push_part(MediaContentPart::ImageUrl {
-                url: url.clone(),
+                url: url.clone().into(),
                 detail: None,
                 uuid: None,
                 max_long_side_pixel: Some(cap),
@@ -327,4 +320,45 @@ fn vllm_source_contract_is_unchanged_by_sglang_opt_in() {
     assert!(error
         .to_string()
         .contains("multiple of 28 within 112..=3584"));
+}
+
+/// The frame holds the resized image, so the decoder's buffer is back in the
+/// pool when the resize returns, with or without an alpha channel; the pixels
+/// are the same as from a buffer the pool does not keep. A frame already at
+/// its planned size keeps its buffer.
+#[test]
+fn a_resized_frame_returns_the_decoders_buffer() {
+    static MINE: buffer_pool::BufferPool = buffer_pool::BufferPool::new();
+    buffer_pool::with_pool(&MINE, || {
+        let pooled = |pixels: &[u8]| {
+            let mut buffer = buffer_pool::take(pixels.len());
+            buffer.copy_from_slice(pixels);
+            buffer
+        };
+        let rgb = DynamicImage::ImageRgb8(image::RgbImage::from_fn(320, 320, |x, y| {
+            image::Rgb([x as u8, y as u8, (x ^ y) as u8])
+        }));
+        let rgba = DynamicImage::ImageRgba8(image::RgbaImage::from_fn(320, 320, |x, y| {
+            image::Rgba([x as u8, y as u8, (x ^ y) as u8, (x + y) as u8])
+        }));
+        let expected_rgb = resize_image(rgb.clone(), 160, 160);
+        let expected_rgba = resize_image(rgba.clone(), 160, 160);
+        assert_eq!(MINE.held(), 0);
+
+        let frame = image::RgbImage::from_raw(320, 320, pooled(rgb.as_bytes())).unwrap();
+        let resized = resize_image(DynamicImage::ImageRgb8(frame), 160, 160);
+        assert!(resized.as_bytes() == expected_rgb.as_bytes());
+        assert_eq!(MINE.held(), 512 << 10);
+
+        let frame = image::RgbaImage::from_raw(320, 320, pooled(rgba.as_bytes())).unwrap();
+        let resized = resize_image(DynamicImage::ImageRgba8(frame), 160, 160);
+        assert!(resized.color().has_alpha());
+        assert!(resized.as_bytes() == expected_rgba.as_bytes());
+        assert_eq!(MINE.held(), 512 << 10);
+
+        let frame = image::RgbImage::from_raw(320, 320, pooled(rgb.as_bytes())).unwrap();
+        let same = resize_image(DynamicImage::ImageRgb8(frame), 320, 320);
+        assert!(same.as_bytes() == rgb.as_bytes());
+        assert_eq!(MINE.held(), 0);
+    });
 }

@@ -1,0 +1,214 @@
+{{- if (.Values.policyController).enabled }}
+{{- /* The standalone policy controller, a Deployment of its own: nothing here
+     points the router at it. With the election on the pod runs under the
+     controller's own service account and mounts its token, for the one
+     Lease; with it off the pod mounts none: the controller then calls no
+     Kubernetes API. The pod mounts the spec document's ConfigMap,
+     read-only, or the spec store's claim where one is named: the one
+     volume the controller writes. */}}
+{{- $controller := .Values.policyController }}
+{{- $elected := include "smg.policyControllerElection" . }}
+{{- $store := include "smg.policyControllerSpecStore" . }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "smg.policyControllerName" . }}
+  labels:
+    {{- include "smg.labels" . | nindent 4 }}
+    app.kubernetes.io/component: policy-controller
+spec:
+  replicas: {{ include "smg.policyControllerReplicas" . }}
+  {{- if $elected }}
+  {{- /* With the election on, one pod more at a time and none unavailable:
+       the new pod stands by, and the old leader's stop hands the Lease
+       over. */}}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  {{- else if $store }}
+  {{- /* On a spec store an upgrade makes the new pod once the old one is
+       gone. One pod holds the store, under the controller's lock: a pod
+       made beside one that stops waits for it, and exits where it is
+       still held at the end of its grace period. A rolling update makes
+       the new pod at the old one's stop signal, so the store's form
+       recreates. A rollback begun while the old pod still stops makes its
+       pod beside it all the same, as an eviction does: that pod waits.
+       The rolling update's fields are named as nothing: the API refuses
+       them beside Recreate, and the document's form names them itself, so
+       an upgrade from it takes them off the live object. */}}
+  strategy:
+    type: Recreate
+    rollingUpdate: null
+  {{- else }}
+  {{- /* Off, on the document's form, every pod leads alone: no pod more at
+       a time, so an upgrade tells the old pod to stop before it makes the
+       new one, and the old one decides nothing from its stop signal on. A
+       preStop hook would delay that signal and let the old pod lead
+       through it: the container names none. This form writes nothing, so
+       the type stays the rolling update's, as with the election on and as
+       the server's own for a Deployment that named no strategy: the API
+       refuses the rolling update's fields beside Recreate, and a
+       server-side apply takes off a live object only what it put there. */}}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "smg.policyControllerSelectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- with $controller.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "smg.policyControllerSelectorLabels" . | nindent 8 }}
+        {{- with $controller.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if $elected }}
+      {{- /* The account by its field and by the field's deprecated alias.
+           The server fills the alias on the live object and reads the name
+           back from it, and an upgrade deletes only what a manifest named:
+           with both named here, turning the election off, or a rollback
+           past it, removes both. */}}
+      serviceAccountName: {{ include "smg.policyControllerName" . }}
+      serviceAccount: {{ include "smg.policyControllerName" . }}
+      automountServiceAccountToken: true
+      {{- else }}
+      automountServiceAccountToken: false
+      {{- end }}
+      {{- if $store }}
+      {{- $user := ($controller.securityContext).runAsUser }}
+      {{- if not (kindIs "invalid" $user) }}
+      {{- /* The store's volume belongs to this group and the container's
+           user is in it, so the user the image runs as writes the claim.
+           The number is written as the container's context writes it: a
+           number of a values file is a float, and printed plainly a large
+           one would read as an exponent. A user of 0 is a user: a null or
+           an absent one alone names no group. */}}
+      securityContext:
+        fsGroup: {{ toJson $user }}
+      {{- end }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ add (int $controller.shutdownGracePeriodSeconds) (int $controller.terminationGraceMarginSeconds) }}
+      containers:
+        - name: policy-controller
+          image: "{{ include "smg.policyControllerImage" . }}"
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          args:
+            {{- include "smg.policyControllerArgs" . | nindent 12 }}
+          ports:
+            - name: gateway
+              containerPort: {{ $controller.ports.gateway }}
+              protocol: TCP
+            - name: control
+              containerPort: {{ $controller.ports.control }}
+              protocol: TCP
+            - name: replication
+              containerPort: {{ $controller.ports.replication }}
+              protocol: TCP
+            - name: admin
+              containerPort: {{ $controller.ports.admin }}
+              protocol: TCP
+          {{- with $controller.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          livenessProbe:
+            httpGet:
+              path: {{ $controller.livenessProbe.path }}
+              port: admin
+            initialDelaySeconds: {{ $controller.livenessProbe.initialDelaySeconds }}
+            periodSeconds: {{ $controller.livenessProbe.periodSeconds }}
+          readinessProbe:
+            httpGet:
+              path: {{ $controller.readinessProbe.path }}
+              port: admin
+            initialDelaySeconds: {{ $controller.readinessProbe.initialDelaySeconds }}
+            periodSeconds: {{ $controller.readinessProbe.periodSeconds }}
+          {{- with $controller.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- if or $elected $controller.extraEnv }}
+          env:
+            {{- if $elected }}
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            {{- end }}
+            {{- with $controller.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- end }}
+          volumeMounts:
+            {{- if $store }}
+            {{- /* The directory --spec-store names: the claim, which the
+                 controller writes. */}}
+            - name: policy-spec-store
+              mountPath: /var/lib/smg/spec
+            {{- else }}
+            {{- /* The directory of the file --spec-file names. */}}
+            - name: policy-spec
+              mountPath: /etc/smg/policy-spec
+              readOnly: true
+            {{- end }}
+      {{- with $controller.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if $controller.affinity }}
+      affinity:
+        {{- toYaml $controller.affinity | nindent 8 }}
+      {{- else if gt (int (include "smg.policyControllerReplicaCount" $)) 1 }}
+      {{- /* No affinity of the operator's and more than one replica: prefer
+           one replica a node. */}}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    {{- include "smg.policyControllerSelectorLabels" . | nindent 20 }}
+      {{- end }}
+      {{- with $controller.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      volumes:
+        {{- if $store }}
+        {{- /* The spec store's claim, the operator's own and not the
+             release's: the generations on file are the only copy of an
+             applied document, and a claim the release owned would go with
+             the release. The pod waits for its claim. */}}
+        - name: policy-spec-store
+          persistentVolumeClaim:
+            claimName: {{ $store | quote }}
+        {{- else }}
+        {{- /* The spec document's ConfigMap, whole: when the document changes
+             the kubelet turns a link under the mount, which the controller's
+             watch follows; a file mounted by subPath is never turned. No
+             checksum of the document stands on the pod, so a changed document
+             moves no pod: the running controller applies it in place, or
+             rejects one that does not run and keeps the generation it runs,
+             where a pod started on such a document refuses to start. Not
+             optional: the pod waits for its ConfigMap. */}}
+        - name: policy-spec
+          configMap:
+            name: {{ include "smg.policyControllerName" . }}
+        {{- end }}
+{{- end }}

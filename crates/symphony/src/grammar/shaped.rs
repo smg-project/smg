@@ -60,12 +60,12 @@ use openai_protocol::common::Tool;
 use serde_json::Value;
 
 use super::{
-    calls,
+    calls, json,
     schema::{self, shape as typed, Definitions},
     CallMarkers, Count, Grammar, Tag, WayIn,
 };
 use crate::{
-    format::{Emits, Format, Whitespace},
+    format::{Emits, Format},
     shape::{Arguments, Atom, CallShape, End, Layout, Nested, Segment, Slot, Spellings, Words},
 };
 
@@ -296,12 +296,7 @@ impl<'l> Writing<'l> {
             Self::Parameters { parameters, values } => {
                 parameters.of_tool(shape, layout, values, tool, limited)
             }
-            Self::Json => Some(Grammar::JsonSchema {
-                schema: tool.function.parameters_schema().clone(),
-                style: None,
-                excludes: Vec::new(),
-                whitespace: Whitespace::Free,
-            }),
+            Self::Json => Some(json::arguments(tool)),
         }
     }
 }
@@ -524,6 +519,8 @@ fn sequence(parts: Vec<Grammar>) -> Grammar {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use serde_json::json as value;
 
     use super::*;
@@ -1248,7 +1245,7 @@ mod tests {
             value!({"content": null, "calls": [call, call]})
         );
         let answer = named
-            .answer_grammar(&value!({"type": "object"}), false)
+            .answer_grammar(&Arc::new(value!({"type": "object"})), false)
             .expect("an answer");
         assert_eq!(
             answer.payload(),

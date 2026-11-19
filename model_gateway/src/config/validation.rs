@@ -8,7 +8,32 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 
 use super::*;
-use crate::{middleware::scheduler, policies::cost as selection_cost, worker::endpoint::Endpoint};
+use crate::{
+    middleware::scheduler,
+    policies::cost as selection_cost,
+    tenant::MAX_TENANT_ID_LEN,
+    worker::{
+        identity::{
+            endpoint::{Endpoint, EndpointError, Host as EndpointHost, Scheme},
+            metadata::join_base,
+        },
+        ConnectionMode,
+    },
+};
+
+/// The credential header names `routing_key_override.headers` may not carry
+/// (see [`ConfigValidator::validate_routing_key_headers`]). The policy
+/// controller crate refuses the same names in a specification's header
+/// lists.
+const DENIED_HEADERS: [&str; 7] = [
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "set-cookie",
+    "x-api-key",
+    "api-key",
+    "x-goog-api-key",
+];
 
 /// Each listener needs its own port. `listeners` are `(field, flag, port)`
 /// in configuration order; the first two on one port are refused under the
@@ -70,13 +95,13 @@ fn names_a_local_path(source: &str) -> bool {
 /// register); or a start-up URL names a gRPC worker itself. The connection
 /// mode alone misses the middle two: it follows the start-up URLs only.
 fn a_grpc_worker_may_register(config: &RouterConfig) -> bool {
-    if config.connection_mode == crate::worker::ConnectionMode::Grpc
+    if config.connection_mode == ConnectionMode::Grpc
         || config.enable_igw
         || config.discovery.is_some()
     {
         return true;
     }
-    let grpc = |url: &str| url.starts_with("grpc://") || url.starts_with("grpcs://");
+    let grpc = |url: &str| url.starts_with("grpc://");
     match &config.mode {
         RoutingMode::Regular { worker_urls } => worker_urls.iter().any(|url| grpc(url)),
         RoutingMode::PrefillDecode {
@@ -189,8 +214,39 @@ pub fn validate_mesh_server_name(name: &str) -> ConfigResult<()> {
     Ok(())
 }
 
-/// Validate a single worker URL: non-empty, an allowed scheme, and a
-/// parseable host. Shared by `ConfigValidator::validate_urls` (startup
+/// Refuse a zero or a negative for a setting that must be positive.
+fn require_positive<T: Default + Ord + std::fmt::Display>(
+    field: &str,
+    value: T,
+) -> ConfigResult<()> {
+    if value <= T::default() {
+        return Err(ConfigError::invalid_value(field, value, "Must be > 0"));
+    }
+    Ok(())
+}
+
+/// Refuse a NaN, an infinity or a value under 1.0 for a factor that starts
+/// at 1.0.
+fn require_at_least_one<T: Copy + Into<f64> + std::fmt::Display>(
+    field: &str,
+    value: T,
+) -> ConfigResult<()> {
+    let factor: f64 = value.into();
+    if !factor.is_finite() || factor < 1.0 {
+        return Err(ConfigError::invalid_value(
+            field,
+            value,
+            "Must be finite and >= 1.0",
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a single worker URL: non-empty, an allowed scheme, a parseable
+/// host, and one address to both of its readers (`read_two_ways`: the URL
+/// library a client dials by and the gateway's own type every line names
+/// by), as written and in the form routes are joined to. Shared by
+/// `ConfigValidator::validate_urls` (startup
 /// config) and the worker-management API so both reject schemeless or
 /// unparsable URLs identically. Rejecting at the API boundary prevents
 /// the orphaned `url_to_id` reservation from #1533: the AddWorker
@@ -211,22 +267,37 @@ pub fn validate_worker_url(url: &str) -> ConfigResult<()> {
     // matches schemes case-sensitively, so a mixed-case scheme would be
     // rewritten downstream and diverge from the reservation key — the
     // same orphan failure as a schemeless URL.
-    const ALLOWED_SCHEMES: &[&str] = &["http", "https", "grpc", "grpcs", "ipc", "tcp"];
+    const ALLOWED_SCHEMES: &[&str] = &["http", "https", "grpc", "ipc", "tcp"];
     let scheme = url.split_once("://").map_or("", |(s, _)| s);
+    // A gRPC worker over TLS is refused by name, with the reason: the
+    // gateway's gRPC channel speaks plain HTTP/2 over TCP, and no build of
+    // the gateway holds a root store to validate an engine's certificate
+    // against, so no `grpcs://` worker ever completed a handshake the
+    // gateway could trust; the refusal belongs here, at start-up, not at
+    // the first call.
+    if scheme == "grpcs" {
+        return Err(ConfigError::invalid_value(
+            "worker_url",
+            named_in_a_refusal(url),
+            "grpcs:// workers are not supported: the gateway's gRPC channel speaks plain \
+             HTTP/2 and holds no certificate store to validate an engine's; use grpc://"
+                .to_string(),
+        ));
+    }
     // A refusal names the address through the gateway's masking: it is
     // written to stderr at start-up and answered to the API caller, and
     // the URL may carry credentials. What the address parser accepts (a
     // schemeless address, a known scheme in upper case) is written with
     // its userinfo masked and its scheme lowercase; what it refuses (an
     // unknown scheme, no host, a parse failure) reads `<unparsable
-    // address>`. The scheme is what this refusal is about and the masked
-    // address no longer shows it as written, so the reason names it when
-    // it is one (RFC 3986 scheme characters): the prefix before a `://`
-    // further into a URL could be a userinfo, and is left out.
+    // address>`; what it reads with a rank shows its scheme alone
+    // (`named_in_a_refusal`). The scheme is what this refusal is about and
+    // the masked address no longer shows it as written, so the reason names
+    // it when it is one (RFC 3986 scheme characters): the prefix before a
+    // `://` further into a URL could be a userinfo, and is left out.
     if !ALLOWED_SCHEMES.contains(&scheme) {
         let rule =
-            "URL must start with a lowercase http://, https://, grpc://, grpcs://, ipc://, or \
-             tcp:// scheme";
+            "URL must start with a lowercase http://, https://, grpc://, ipc://, or tcp:// scheme";
         let is_a_scheme = !scheme.is_empty()
             && scheme
                 .chars()
@@ -238,7 +309,7 @@ pub fn validate_worker_url(url: &str) -> ConfigResult<()> {
         };
         return Err(ConfigError::invalid_value(
             "worker_url",
-            Endpoint::redacted_str(url),
+            named_in_a_refusal(url),
             reason,
         ));
     }
@@ -250,32 +321,284 @@ pub fn validate_worker_url(url: &str) -> ConfigResult<()> {
         if path.is_empty() {
             return Err(ConfigError::invalid_value(
                 "worker_url",
-                Endpoint::redacted_str(url),
+                named_in_a_refusal(url),
                 "ipc:// worker URL must include a socket path",
             ));
         }
         return Ok(());
     }
 
-    match ::url::Url::parse(url) {
-        Ok(parsed) => {
-            if parsed.host_str().is_none() {
-                return Err(ConfigError::invalid_value(
-                    "worker_url",
-                    Endpoint::redacted_str(url),
-                    "URL must have a valid host",
-                ));
-            }
+    let dialled = match ::url::Url::parse(url) {
+        Ok(parsed) if parsed.host_str().is_some() => parsed,
+        Ok(_) => {
+            return Err(ConfigError::invalid_value(
+                "worker_url",
+                named_in_a_refusal(url),
+                "URL must have a valid host",
+            ));
         }
         Err(e) => {
             return Err(ConfigError::invalid_value(
                 "worker_url",
-                Endpoint::redacted_str(url),
+                named_in_a_refusal(url),
                 format!("Invalid URL format: {e}"),
             ));
         }
+    };
+    // A tcp:// worker URL is what the ZMQ sockets bind, where a userinfo
+    // (`user:secret@`) has no meaning at all: refused, by the adapter's own
+    // reading (an `@` anywhere after the scheme), so that nothing the
+    // validator passes is refused at registration instead, whatever the
+    // `Endpoint` grammar makes of the rest of the string. (A gRPC worker
+    // URL's userinfo is accepted and named by [`unused_credentials_warning`],
+    // at start-up and at registration, where a log line is seen.)
+    if url
+        .strip_prefix("tcp://")
+        .is_some_and(|authority| authority.contains('@'))
+    {
+        return Err(ConfigError::invalid_value(
+            "worker_url",
+            named_in_a_refusal(url),
+            "a tcp:// worker URL takes no userinfo: the gateway binds its ZMQ sockets at the \
+             host and port",
+        ));
+    }
+    // Routes join to the address less its trailing slashes (`join_base`),
+    // and a line may name the worker by that form, so both readers find one
+    // host and one port there too. A client reads one authority in both
+    // forms. The gateway's type reads a rank in the second that the first
+    // does not show: `http://token@8080/` is a userinfo and a host as
+    // written, and its base is a host and its rank.
+    let base = join_base(url);
+    let read_apart = read_two_ways(url, &dialled).or_else(|| {
+        (base.len() != url.len())
+            .then(|| read_two_ways(base, &dialled))
+            .flatten()
+    });
+    if let Some(reason) = read_apart {
+        // No part of the address is shown. What one reading takes for a
+        // host the other may take for a credential, and the gateway's own
+        // rendering trusts its own reading: `http://token@8080` is a host
+        // and its rank to it, written whole.
+        return Err(ConfigError::invalid_value(
+            "worker_url",
+            format!("{scheme}://***"),
+            reason,
+        ));
     }
     Ok(())
+}
+
+/// Why the worker URL door refuses `url`, `None` when it takes it: the
+/// reason of [`validate_worker_url`] alone, without the door's naming of the
+/// address. A reason names no part of the address behind its scheme: the
+/// door refuses what its two readers read apart, and there one reader's
+/// host or port is the other's credential. A scheme the door does not know
+/// is named as written, and no reader takes a scheme for a credential.
+fn worker_url_refusal(url: &str) -> Option<String> {
+    validate_worker_url(url).err().map(|error| match error {
+        ConfigError::InvalidValue { reason, .. } => reason,
+        other => other.to_string(),
+    })
+}
+
+/// Why the worker URL door refuses an address a discovery manifest lists,
+/// `None` when the door takes it: the door's reason alone, so a manifest's
+/// refusal names no part of the address behind its scheme.
+///
+/// A scheme is a known one at the start of the address, as the address type
+/// reads it ([`Scheme::split_from`]) and the registration keeps it, and it
+/// is stored lowercase however the manifest spells it. An address with none
+/// may hold a `://` further in, in a path or a query, and the registration
+/// writes `http://` or `grpc://` before it, by what the engine answers.
+/// Such an address is asked under `http://`: what the door refuses under
+/// `grpc://` it refuses under `http://`, where a client reads a host in
+/// more forms and ends an authority at one character more. One the URL
+/// library cannot read under `http://` is asked under `grpc://`: no HTTP
+/// client builds it, so the registration stores it there or not at all.
+/// What stands behind the scheme is asked as given: the manifest's reader
+/// asks of the address as written, and again as it is kept.
+pub(crate) fn listed_worker_url_refusal(url: &str) -> Option<String> {
+    match Scheme::split_from(url) {
+        Some((scheme, rest)) => worker_url_refusal(&format!("{}{rest}", scheme.as_prefix())),
+        None => {
+            let http = format!("http://{url}");
+            if ::url::Url::parse(&http).is_ok() {
+                worker_url_refusal(&http)
+            } else {
+                worker_url_refusal(&format!("grpc://{url}"))
+            }
+        }
+    }
+}
+
+/// How a refusal of the worker URL door names the address: by the gateway's
+/// masked rendering, and by its scheme alone when that rendering reads a
+/// rank. No caller's address carries a rank, and what stands before the `@`
+/// may be a credential the rendering takes for a host: `tcp://token@8080`
+/// is a host and its rank to it, written whole.
+fn named_in_a_refusal(url: &str) -> String {
+    match Endpoint::parse_with_rank(url) {
+        Ok((ranked, Some(_))) => {
+            format!("{}***", ranked.scheme().map_or("", Scheme::as_prefix))
+        }
+        _ => Endpoint::redacted_str(url),
+    }
+}
+
+/// Why a worker URL the URL library took is refused all the same, `None`
+/// when the gateway's own address type reads it as the library does.
+///
+/// The address is read twice after this door. The health probe and the gRPC
+/// channel dial what a URL client reads, `dialled` here. Every log line,
+/// masked name and identity key follows [`Endpoint`]. Where the two part, a
+/// line names one host and the gateway dials another:
+/// `http://10.0.0.5:8000@2130706433` is rank 2130706433 of `10.0.0.5:8000`
+/// to the gateway's type, and the host 127.0.0.1 behind a userinfo to a
+/// client. So the door takes an address only when both read one host and
+/// one port in it, and the userinfo the gateway's type reads holds no
+/// character at which a client ends the authority. A rank suffix is the
+/// registration's own, appended to a data-parallel worker's address after
+/// this door, never a caller's.
+///
+/// Neither the refusal nor its reason names a part of the address: what
+/// one reading takes for a host the other may take for a credential.
+fn read_two_ways(url: &str, dialled: &::url::Url) -> Option<&'static str> {
+    let named = match Endpoint::parse(url) {
+        Ok(named) => named,
+        Err(EndpointError::UnexpectedRank { .. }) => {
+            return Some(
+                "a worker URL cannot end in '@' and digits, trailing slashes aside: the gateway \
+                 reads them as a rank suffix, which only its own registration appends",
+            );
+        }
+        Err(_) => {
+            return Some(
+                "the gateway cannot read this address as a host and a port, though a URL \
+                 client can: write it as scheme://host:port, with a port from 1 to 65535",
+            );
+        }
+    };
+    let same_host = match (dialled.host(), named.host()) {
+        (Some(::url::Host::Ipv4(dialled)), EndpointHost::Ip(IpAddr::V4(named))) => {
+            dialled == *named
+        }
+        (Some(::url::Host::Ipv6(dialled)), EndpointHost::Ip(IpAddr::V6(named))) => {
+            dialled == *named
+        }
+        // A client reads an IPv4 address in more notations than the
+        // gateway's type does (`2130706433`, `0x7f.1`): one host, when the
+        // name is that address to the library.
+        (Some(::url::Host::Ipv4(dialled)), EndpointHost::Name(named)) => {
+            matches!(::url::Host::parse(named), Ok(::url::Host::Ipv4(same)) if same == dialled)
+        }
+        // The library keeps the host of a `grpc://` or `tcp://` URL as
+        // text, an address literal included.
+        (Some(::url::Host::Domain(dialled)), EndpointHost::Ip(named)) => {
+            dialled.parse::<IpAddr>().is_ok_and(|ip| ip == *named)
+        }
+        // One name, whatever its case; or the form the library gives the
+        // name: an internationalized or a percent-encoded one under `http`
+        // and `https`, one kept as text with its bytes outside ASCII
+        // percent-encoded under `grpc` and `tcp`. The library keeps the
+        // ASCII case of that text and the gateway's type lowers it, so the
+        // third compare takes no account of it either.
+        (Some(::url::Host::Domain(dialled)), EndpointHost::Name(named)) => {
+            dialled.eq_ignore_ascii_case(named)
+                || matches!(
+                    ::url::Host::parse(named),
+                    Ok(::url::Host::Domain(same)) if same == dialled
+                )
+                || matches!(
+                    ::url::Host::parse_opaque(named),
+                    Ok(::url::Host::Domain(same)) if same.eq_ignore_ascii_case(dialled)
+                )
+        }
+        _ => false,
+    };
+    // A client fills a missing port from the scheme and drops one that
+    // equals the scheme's own.
+    let same_port = match (dialled.port(), named.port()) {
+        (dialled, named) if dialled == named => true,
+        (None, Some(named)) => dialled.port_or_known_default() == Some(named),
+        _ => false,
+    };
+    if !(same_host && same_port) {
+        return Some(
+            "the address reads two ways: a client would dial one host and port and the gateway \
+             would name another; percent-encode an '@' or a '\\' inside a userinfo",
+        );
+    }
+    // The two also end the authority apart. A client ends it at the first
+    // `/`, `?` or `#`, and under `http` and `https` at a backslash too. The
+    // gateway's type ends it at the first `/`, `?` or `#` behind a
+    // bracketed host: it reads on past a backslash, and past all four
+    // before the first `]` of an authority that opens with a bracket. With
+    // one host and port on both sides (`http://w:1\@w:1`,
+    // `http://[u@w:1/]@w:1`) the two still part: a client joins every route
+    // under the rest as a path, and the gateway's type reads a userinfo
+    // that is not there. So the userinfo it reads holds none of them.
+    let ends_a_clients_authority = |c: char| {
+        matches!(c, '/' | '?' | '#') || (c == '\\' && matches!(dialled.scheme(), "http" | "https"))
+    };
+    named.userinfo_holds(ends_a_clients_authority).then_some(
+        "the address reads two ways: a client ends the authority inside what the gateway \
+         reads as a userinfo, and joins its routes under the rest as a path; percent-encode \
+         a '/', a '?', a '#' or a '\\' inside a userinfo",
+    )
+}
+
+/// The warning for a `grpc://` worker URL that carries userinfo
+/// (`user:secret@`), `None` for every other URL. An HTTP worker's userinfo
+/// is sent as basic auth; a gRPC worker never receives it, since the channel
+/// names the host and port alone, so a credential written there is named
+/// once, masked, instead of dropped in silence. The URL stays accepted: it is
+/// otherwise valid and deployments may carry one. Pure, so that start-up can
+/// log it after the subscriber exists (the validator runs before) and the
+/// add-worker route can log it at registration.
+pub fn unused_credentials_warning(url: &str) -> Option<String> {
+    let endpoint = Endpoint::parse(url).ok()?;
+    (url.starts_with("grpc://") && endpoint.has_credentials()).then(|| {
+        format!(
+            "worker URL {} carries userinfo, which is not sent to a gRPC worker: the gateway's \
+             channel names the host and port alone",
+            endpoint.redacted()
+        )
+    })
+}
+
+/// [`unused_credentials_warning`] over every worker URL the configuration
+/// lists for a mode, in the order they are listed.
+pub fn unused_credentials_warnings(mode: &RoutingMode) -> Vec<String> {
+    let urls: Vec<&str> = match mode {
+        RoutingMode::Regular { worker_urls }
+        | RoutingMode::OpenAI { worker_urls }
+        | RoutingMode::Anthropic { worker_urls }
+        | RoutingMode::Gemini { worker_urls } => worker_urls.iter().map(String::as_str).collect(),
+        RoutingMode::PrefillDecode {
+            prefill_urls,
+            decode_urls,
+            ..
+        } => prefill_urls
+            .iter()
+            .map(|(url, _)| url.as_str())
+            .chain(decode_urls.iter().map(String::as_str))
+            .collect(),
+        RoutingMode::EncodePrefillDecode {
+            encode_urls,
+            prefill_urls,
+            decode_urls,
+            ..
+        } => encode_urls
+            .iter()
+            .chain(prefill_urls.iter())
+            .map(|(url, _)| url.as_str())
+            .chain(decode_urls.iter().map(String::as_str))
+            .collect(),
+    };
+    urls.into_iter()
+        .filter_map(unused_credentials_warning)
+        .collect()
 }
 
 /// The encode side takes three policies. This is the one list: the mode walk
@@ -401,6 +724,7 @@ impl ConfigValidator {
         Self::validate_mode(&config.mode)?;
         bounds::validate(config)?;
         Self::validate_policy(&config.policy)?;
+        Self::validate_routing_key_headers(config)?;
         Self::validate_cache_boundaries(&config.cache_boundaries)?;
         Self::validate_server_settings(config)?;
         Self::validate_cors_allowed_origins(config)?;
@@ -408,7 +732,6 @@ impl ConfigValidator {
         Self::validate_log_dir(config)?;
         Self::validate_access_log_fields(config)?;
         Self::validate_storage_context_headers(config)?;
-        Self::validate_routing_key_headers(config)?;
         Self::validate_tenant_resolution(config)?;
         Self::validate_tenant_api_keys(config)?;
         Self::validate_memory_history(config)?;
@@ -626,6 +949,12 @@ impl ConfigValidator {
         Ok(())
     }
 
+    /// `routing_key_override.headers` names routing keys, never credentials:
+    /// a thread turn's client lineage goes out under the first configured
+    /// name, and the provider paths forward a request's `Authorization` over
+    /// the worker's own key, so a credential name there sends a lineage as a
+    /// credential and the upstream refuses the turn. The names of
+    /// [`DENIED_HEADERS`] are refused at load by name.
     fn validate_routing_key_headers(config: &RouterConfig) -> ConfigResult<()> {
         for name in &config.routing_key_override.headers {
             HeaderName::try_from(name.as_str()).map_err(|e| ConfigError::ValidationFailed {
@@ -633,6 +962,16 @@ impl ConfigValidator {
                     "routing_key_override.headers contains an invalid HTTP header name '{name}': {e}"
                 ),
             })?;
+            if DENIED_HEADERS
+                .iter()
+                .any(|denied| denied.eq_ignore_ascii_case(name))
+            {
+                return Err(ConfigError::ValidationFailed {
+                    reason: format!(
+                        "routing_key_override.headers contains the credential header name '{name}': a routing key is never a credential"
+                    ),
+                });
+            }
         }
         Ok(())
     }
@@ -735,12 +1074,11 @@ impl ConfigValidator {
             }
             // The canonical key is stored with every response and
             // conversation, in a 255-byte column on the SQL backends.
-            if entry.tenant_id.len() > crate::tenant::MAX_TENANT_ID_LEN {
+            if entry.tenant_id.len() > MAX_TENANT_ID_LEN {
                 return Err(ConfigError::ValidationFailed {
                     reason: format!(
                         "tenant_api_keys tenant_id '{}' is longer than {} bytes",
-                        entry.tenant_id,
-                        crate::tenant::MAX_TENANT_ID_LEN
+                        entry.tenant_id, MAX_TENANT_ID_LEN
                     ),
                 });
             }
@@ -824,24 +1162,24 @@ impl ConfigValidator {
             ));
         }
 
-        if oracle.pool_timeout_secs == 0 {
-            return Err(ConfigError::invalid_value(
-                "oracle.pool_timeout_secs",
-                oracle.pool_timeout_secs,
-                "Must be > 0",
-            ));
-        }
+        require_positive("oracle.pool_timeout_secs", oracle.pool_timeout_secs)?;
+
+        require_positive("oracle.op_timeout_secs", oracle.op_timeout_secs)?;
 
         Ok(())
     }
 
     fn validate_mode(mode: &RoutingMode) -> ConfigResult<()> {
         match mode {
-            RoutingMode::Regular { worker_urls } => {
+            // Allow empty URLs to support dynamic worker addition
+            // URLs will be validated if provided
+            RoutingMode::Regular { worker_urls }
+            | RoutingMode::OpenAI { worker_urls }
+            | RoutingMode::Anthropic { worker_urls }
+            | RoutingMode::Gemini { worker_urls } => {
                 if !worker_urls.is_empty() {
                     Self::validate_urls(worker_urls)?;
                 }
-                // Allow empty URLs without service discovery to match legacy behavior
             }
             RoutingMode::PrefillDecode {
                 prefill_urls,
@@ -851,26 +1189,11 @@ impl ConfigValidator {
             } => {
                 // Allow empty URLs even without service discovery to support dynamic worker addition
                 // URLs will be validated if provided
-                if !prefill_urls.is_empty() {
-                    let prefill_url_strings: Vec<String> =
-                        prefill_urls.iter().map(|(url, _)| url.clone()).collect();
-                    Self::validate_urls(&prefill_url_strings)?;
-                }
+                Self::validate_url_port_urls(prefill_urls)?;
                 if !decode_urls.is_empty() {
                     Self::validate_urls(decode_urls)?;
                 }
-
-                for (_url, port) in prefill_urls {
-                    if let Some(port) = port {
-                        if *port == 0 {
-                            return Err(ConfigError::invalid_value(
-                                "bootstrap_port",
-                                port,
-                                "Port must be between 1 and 65535",
-                            ));
-                        }
-                    }
-                }
+                Self::validate_bootstrap_ports(prefill_urls)?;
 
                 if let Some(p_policy) = prefill_policy {
                     Self::validate_policy(p_policy)?;
@@ -888,22 +1211,8 @@ impl ConfigValidator {
                 decode_policy,
             } => {
                 for urls in [encode_urls, prefill_urls] {
-                    if !urls.is_empty() {
-                        let url_strings: Vec<String> =
-                            urls.iter().map(|(url, _)| url.clone()).collect();
-                        Self::validate_urls(&url_strings)?;
-                    }
-                    for (_url, port) in urls {
-                        if let Some(port) = port {
-                            if *port == 0 {
-                                return Err(ConfigError::invalid_value(
-                                    "bootstrap_port",
-                                    port,
-                                    "Port must be between 1 and 65535",
-                                ));
-                            }
-                        }
-                    }
+                    Self::validate_url_port_urls(urls)?;
+                    Self::validate_bootstrap_ports(urls)?;
                 }
                 if !decode_urls.is_empty() {
                     Self::validate_urls(decode_urls)?;
@@ -919,24 +1228,24 @@ impl ConfigValidator {
                     Self::validate_policy(policy)?;
                 }
             }
-            RoutingMode::OpenAI { worker_urls } => {
-                // Allow empty URLs to support dynamic worker addition
-                // URLs will be validated if provided
-                if !worker_urls.is_empty() {
-                    Self::validate_urls(worker_urls)?;
-                }
-            }
-            RoutingMode::Anthropic { worker_urls } => {
-                // Allow empty URLs to support dynamic worker addition
-                // URLs will be validated if provided
-                if !worker_urls.is_empty() {
-                    Self::validate_urls(worker_urls)?;
-                }
-            }
-            RoutingMode::Gemini { worker_urls } => {
-                // Allow empty URLs to support dynamic worker addition
-                if !worker_urls.is_empty() {
-                    Self::validate_urls(worker_urls)?;
+        }
+        Ok(())
+    }
+
+    fn validate_url_port_urls(urls: &[(String, Option<u16>)]) -> ConfigResult<()> {
+        urls.iter()
+            .try_for_each(|(url, _)| validate_worker_url(url))
+    }
+
+    fn validate_bootstrap_ports(urls: &[(String, Option<u16>)]) -> ConfigResult<()> {
+        for (_url, port) in urls {
+            if let Some(port) = port {
+                if *port == 0 {
+                    return Err(ConfigError::invalid_value(
+                        "bootstrap_port",
+                        port,
+                        "Port must be between 1 and 65535",
+                    ));
                 }
             }
         }
@@ -986,13 +1295,7 @@ impl ConfigValidator {
                     ));
                 }
 
-                if *cache_ttl_secs == 0 {
-                    return Err(ConfigError::invalid_value(
-                        "cache_ttl_secs",
-                        cache_ttl_secs,
-                        "Must be > 0",
-                    ));
-                }
+                require_positive("cache_ttl_secs", *cache_ttl_secs)?;
 
                 if *cache_index == CacheIndexKind::Hash && cache_boundaries.is_empty() {
                     return Err(ConfigError::invalid_value(
@@ -1018,13 +1321,7 @@ impl ConfigValidator {
                     ));
                 }
 
-                if *block_size == 0 {
-                    return Err(ConfigError::invalid_value(
-                        "block_size",
-                        block_size,
-                        "Must be > 0",
-                    ));
-                }
+                require_positive("block_size", *block_size)?;
 
                 // NaN passes every comparison and an infinite threshold is a typo
                 // for "disabled": both are refused with the sign errors.
@@ -1056,29 +1353,11 @@ impl ConfigValidator {
                     ));
                 }
 
-                if !balance_rel_threshold.is_finite() || *balance_rel_threshold < 1.0 {
-                    return Err(ConfigError::invalid_value(
-                        "balance_rel_threshold",
-                        balance_rel_threshold,
-                        "Must be finite and >= 1.0",
-                    ));
-                }
+                require_at_least_one("balance_rel_threshold", *balance_rel_threshold)?;
 
-                if *eviction_interval_secs == 0 {
-                    return Err(ConfigError::invalid_value(
-                        "eviction_interval_secs",
-                        eviction_interval_secs,
-                        "Must be > 0",
-                    ));
-                }
+                require_positive("eviction_interval_secs", *eviction_interval_secs)?;
 
-                if *max_tree_size == 0 {
-                    return Err(ConfigError::invalid_value(
-                        "max_tree_size",
-                        max_tree_size,
-                        "Must be > 0",
-                    ));
-                }
+                require_positive("max_tree_size", *max_tree_size)?;
             }
             PolicyConfig::PowerOfTwo { .. } => {}
             PolicyConfig::LeastLoad {
@@ -1094,13 +1373,7 @@ impl ConfigValidator {
                     ));
                 }
 
-                if *mean_prefill_tokens == 0 {
-                    return Err(ConfigError::invalid_value(
-                        "mean_prefill_tokens",
-                        mean_prefill_tokens,
-                        "Must be > 0",
-                    ));
-                }
+                require_positive("mean_prefill_tokens", *mean_prefill_tokens)?;
 
                 if !default_throughput.is_finite() || *default_throughput <= 0.0 {
                     return Err(ConfigError::invalid_value(
@@ -1115,13 +1388,7 @@ impl ConfigValidator {
                 balance_rel_threshold,
                 bucket_adjust_interval_secs,
             } => {
-                if !balance_rel_threshold.is_finite() || *balance_rel_threshold < 1.0 {
-                    return Err(ConfigError::invalid_value(
-                        "balance_rel_threshold",
-                        balance_rel_threshold,
-                        "Must be finite and >= 1.0",
-                    ));
-                }
+                require_at_least_one("balance_rel_threshold", *balance_rel_threshold)?;
 
                 if *bucket_adjust_interval_secs < 1 {
                     return Err(ConfigError::invalid_value(
@@ -1144,21 +1411,9 @@ impl ConfigValidator {
                 balance_abs_threshold: _,
                 cache_boundaries,
             } => {
-                if *prefix_token_count == 0 {
-                    return Err(ConfigError::invalid_value(
-                        "prefix_token_count",
-                        prefix_token_count,
-                        "Must be > 0",
-                    ));
-                }
+                require_positive("prefix_token_count", *prefix_token_count)?;
 
-                if !load_factor.is_finite() || *load_factor < 1.0 {
-                    return Err(ConfigError::invalid_value(
-                        "load_factor",
-                        load_factor,
-                        "Must be finite and >= 1.0",
-                    ));
-                }
+                require_at_least_one("load_factor", *load_factor)?;
 
                 Self::validate_cache_boundaries(cache_boundaries)?;
             }
@@ -1261,6 +1516,16 @@ impl ConfigValidator {
                 return Err(ConfigError::invalid_value("admin_host", admin_host, reason));
             }
         }
+        // The bound is the admin listener's own: without a port there is no
+        // listener for it to bound, and nothing would say so.
+        if config.admin_max_connections > 0 && config.admin_port.is_none() {
+            return Err(ConfigError::invalid_value(
+                "admin_max_connections",
+                config.admin_max_connections,
+                "--admin-max-connections needs --admin-port: the admin listener exists only \
+                 with a port",
+            ));
+        }
 
         // Each listener needs its own port. Two of them on one port used to
         // bind the first, answer, and die at the second bind with a raw
@@ -1282,13 +1547,7 @@ impl ConfigValidator {
         let listeners: Vec<_> = listeners.into_iter().flatten().collect();
         validate_distinct_listener_ports(&listeners)?;
 
-        if config.max_payload_size == 0 {
-            return Err(ConfigError::invalid_value(
-                "max_payload_size",
-                config.max_payload_size,
-                "Must be > 0",
-            ));
-        }
+        require_positive("max_payload_size", config.max_payload_size)?;
 
         if config.mm_per_request_image_limit == Some(0) {
             return Err(ConfigError::invalid_value(
@@ -1371,13 +1630,7 @@ impl ConfigValidator {
             }
         }
 
-        if config.request_timeout_secs == 0 {
-            return Err(ConfigError::invalid_value(
-                "request_timeout_secs",
-                config.request_timeout_secs,
-                "Must be > 0",
-            ));
-        }
+        require_positive("request_timeout_secs", config.request_timeout_secs)?;
 
         // The connection limit is a semaphore's permit count, and the
         // runtime refuses more than its maximum at construction (a panic):
@@ -1417,37 +1670,19 @@ impl ConfigValidator {
             }
         }
 
-        if config.worker_startup_timeout_secs == 0 {
-            return Err(ConfigError::invalid_value(
-                "worker_startup_timeout_secs",
-                config.worker_startup_timeout_secs,
-                "Must be > 0",
-            ));
-        }
-
-        if config.worker_startup_check_interval_secs == 0 {
-            return Err(ConfigError::invalid_value(
-                "worker_startup_check_interval_secs",
-                config.worker_startup_check_interval_secs,
-                "Must be > 0",
-            ));
-        }
-
-        if config.zmq_startup_timeout_secs == 0 {
-            return Err(ConfigError::invalid_value(
-                "zmq_startup_timeout_secs",
-                config.zmq_startup_timeout_secs,
-                "Must be > 0",
-            ));
-        }
-
-        if config.load_monitor_interval_secs == 0 {
-            return Err(ConfigError::invalid_value(
-                "load_monitor_interval_secs",
-                config.load_monitor_interval_secs,
-                "Must be > 0",
-            ));
-        }
+        require_positive(
+            "worker_startup_timeout_secs",
+            config.worker_startup_timeout_secs,
+        )?;
+        require_positive(
+            "worker_startup_check_interval_secs",
+            config.worker_startup_check_interval_secs,
+        )?;
+        require_positive("zmq_startup_timeout_secs", config.zmq_startup_timeout_secs)?;
+        require_positive(
+            "load_monitor_interval_secs",
+            config.load_monitor_interval_secs,
+        )?;
 
         Ok(())
     }
@@ -1680,13 +1915,10 @@ impl ConfigValidator {
                 "Port must be > 0",
             ));
         }
-        if discovery.check_interval_secs == 0 {
-            return Err(invalid(
-                "discovery.check_interval_secs",
-                "0".to_string(),
-                "Must be > 0",
-            ));
-        }
+        require_positive(
+            "discovery.check_interval_secs",
+            discovery.check_interval_secs,
+        )?;
 
         let roles = [
             ("discovery.job_names", "regular", &discovery.job_names),
@@ -1842,13 +2074,7 @@ impl ConfigValidator {
     /// What the file and Consul providers share: their records name their own
     /// worker types, so any mode with worker pools can use them.
     fn validate_record_discovery(check_interval_secs: u64, mode: &RoutingMode) -> ConfigResult<()> {
-        if check_interval_secs == 0 {
-            return Err(ConfigError::invalid_value(
-                "discovery.check_interval_secs",
-                check_interval_secs,
-                "Must be > 0",
-            ));
-        }
+        require_positive("discovery.check_interval_secs", check_interval_secs)?;
 
         let unsupported = match mode {
             RoutingMode::Regular { .. }
@@ -1875,13 +2101,10 @@ impl ConfigValidator {
             ));
         }
 
-        if discovery.check_interval_secs == 0 {
-            return Err(ConfigError::invalid_value(
-                "discovery.check_interval_secs",
-                discovery.check_interval_secs,
-                "Must be > 0",
-            ));
-        }
+        require_positive(
+            "discovery.check_interval_secs",
+            discovery.check_interval_secs,
+        )?;
 
         for (field, value) in [
             (
@@ -2047,13 +2270,7 @@ impl ConfigValidator {
                 "Must be >= 1 (set to 1 to effectively disable retries)",
             ));
         }
-        if retry.initial_backoff_ms == 0 {
-            return Err(ConfigError::invalid_value(
-                "retry.initial_backoff_ms",
-                retry.initial_backoff_ms,
-                "Must be > 0",
-            ));
-        }
+        require_positive("retry.initial_backoff_ms", retry.initial_backoff_ms)?;
         if retry.max_backoff_ms < retry.initial_backoff_ms {
             return Err(ConfigError::invalid_value(
                 "retry.max_backoff_ms",
@@ -2061,13 +2278,7 @@ impl ConfigValidator {
                 "Must be >= initial_backoff_ms",
             ));
         }
-        if !retry.backoff_multiplier.is_finite() || retry.backoff_multiplier < 1.0 {
-            return Err(ConfigError::invalid_value(
-                "retry.backoff_multiplier",
-                retry.backoff_multiplier,
-                "Must be finite and >= 1.0",
-            ));
-        }
+        require_at_least_one("retry.backoff_multiplier", retry.backoff_multiplier)?;
         if !(0.0..=1.0).contains(&retry.jitter_factor) {
             return Err(ConfigError::invalid_value(
                 "retry.jitter_factor",
@@ -2093,20 +2304,14 @@ impl ConfigValidator {
                 "Must be >= 1",
             ));
         }
-        if cb.timeout_duration_secs == 0 {
-            return Err(ConfigError::invalid_value(
-                "circuit_breaker.timeout_duration_secs",
-                cb.timeout_duration_secs,
-                "Must be > 0",
-            ));
-        }
-        if cb.window_duration_secs == 0 {
-            return Err(ConfigError::invalid_value(
-                "circuit_breaker.window_duration_secs",
-                cb.window_duration_secs,
-                "Must be > 0",
-            ));
-        }
+        require_positive(
+            "circuit_breaker.timeout_duration_secs",
+            cb.timeout_duration_secs,
+        )?;
+        require_positive(
+            "circuit_breaker.window_duration_secs",
+            cb.window_duration_secs,
+        )?;
         Ok(())
     }
 
@@ -2360,8 +2565,36 @@ impl ConfigValidator {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
-    use crate::worker::ConnectionMode;
+
+    /// The reason reads "Must be > 0", so a signed zero and a negative are refused alike.
+    #[test]
+    fn require_positive_refuses_zero_and_negative() {
+        assert!(require_positive("field", 1_i64).is_ok());
+        for value in [0_i64, -1] {
+            assert!(matches!(
+                require_positive("field", value),
+                Err(ConfigError::InvalidValue { reason, .. }) if reason == "Must be > 0"
+            ));
+        }
+    }
+
+    /// A factor is refused when it is not a number, not finite or under 1.0,
+    /// whichever float type holds it, and the error names it as it was written.
+    #[test]
+    fn require_at_least_one_refuses_nan_infinity_and_under_one() {
+        assert!(require_at_least_one("field", 1.0_f32).is_ok());
+        assert!(require_at_least_one("field", 1.25_f64).is_ok());
+        assert!(require_at_least_one("field", f64::NAN).is_err());
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.1] {
+            assert!(matches!(
+                require_at_least_one("field", value),
+                Err(ConfigError::InvalidValue { value: named, reason, .. })
+                    if named == value.to_string() && reason == "Must be finite and >= 1.0"
+            ));
+        }
+    }
 
     /// Serialized thresholds survive round trips and reject invalid values for either role.
     #[test]
@@ -3307,7 +3540,6 @@ mod tests {
             "http://10.0.0.5:8000",
             "https://worker.example.com",
             "grpc://10.0.0.5:50051",
-            "grpcs://worker.example.com:443",
             "ipc:///tmp/smg-zmq/ts0.ipc",
             "tcp://10.0.0.5:31000",
         ] {
@@ -3363,6 +3595,12 @@ mod tests {
             "{masked}"
         );
         assert!(!masked.contains("secret"), "{masked}");
+        let tls = validate_worker_url("grpcs://user:secret@worker:50051")
+            .expect_err("refused")
+            .to_string();
+        assert!(tls.contains("grpcs://***@worker:50051"), "{tls}");
+        assert!(tls.contains("grpcs:// workers are not supported"), "{tls}");
+        assert!(!tls.contains("secret"), "{tls}");
         let echoed = validate_worker_url("10.0.0.5:8000")
             .expect_err("refused")
             .to_string();
@@ -3392,6 +3630,94 @@ mod tests {
         }
     }
 
+    /// A userinfo is refused on a `tcp://` worker URL (the sockets bind the
+    /// host and port; nothing reads it), masked in the refusal.
+    #[test]
+    fn a_tcp_worker_url_with_userinfo_is_refused_masked() {
+        for url in [
+            "tcp://user:secret@10.0.0.5:31000",
+            "tcp://secret@10.0.0.5:31000",
+        ] {
+            let text = validate_worker_url(url).expect_err("refused").to_string();
+            assert!(text.contains("tcp://***@10.0.0.5:31000"), "{text}");
+            assert!(text.contains("takes no userinfo"), "{text}");
+            assert!(!text.contains("secret"), "{text}");
+        }
+        assert!(validate_worker_url("tcp://10.0.0.5:31000").is_ok());
+    }
+
+    /// What the ZMQ adapter refuses for a userinfo, the validator refuses
+    /// first: a `tcp://` URL with an `@` that the endpoint grammar reads as
+    /// something else (a rank suffix after it, an empty userinfo) is refused
+    /// here, masked, instead of passing to a refusal at registration. The
+    /// one the grammar reads with a rank shows its scheme alone: that
+    /// reading is not a caller's, so its rendering is not trusted with what
+    /// stands before the `@`.
+    #[test]
+    fn a_tcp_worker_url_the_adapter_refuses_is_refused_by_the_validator() {
+        for url in ["tcp://user:secret@host:1@2", "tcp://@host:31000"] {
+            let text = validate_worker_url(url).expect_err("refused").to_string();
+            assert!(text.contains("takes no userinfo"), "{url}: {text}");
+            assert!(!text.contains("secret"), "{url}: {text}");
+        }
+        let text = validate_worker_url("tcp://user:secret@host:1@2")
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            text.starts_with("Invalid value for field 'worker_url': tcp://*** - "),
+            "{text}"
+        );
+    }
+
+    /// A `grpc://` worker URL with userinfo stays accepted and earns the one
+    /// warning, which names the address masked and never the secret; an
+    /// `http://` URL's userinfo is basic auth and earns none, nor does a URL
+    /// without one. Over a mode, every listed URL is read once, in order.
+    #[test]
+    fn a_grpc_worker_url_with_userinfo_is_accepted_and_named_once_masked() {
+        validate_worker_url("grpc://user:secret@worker:50051").expect("accepted");
+        let warning = unused_credentials_warning("grpc://user:secret@worker:50051").unwrap();
+        assert!(warning.contains("grpc://***@worker:50051"), "{warning}");
+        assert!(warning.contains("not sent to a gRPC worker"), "{warning}");
+        assert!(!warning.contains("secret"), "{warning}");
+        // An `@` inside a query or fragment is no userinfo: no warning.
+        for url in [
+            "http://user:secret@worker:8000",
+            "grpc://worker:50051",
+            "grpc://worker:50051?token=a@b",
+            "grpc://worker:50051#a@b",
+        ] {
+            assert_eq!(unused_credentials_warning(url), None, "{url}");
+        }
+
+        let mode = RoutingMode::PrefillDecode {
+            prefill_urls: vec![
+                ("grpc://user:secret@prefill:50051".to_string(), Some(8998)),
+                ("http://user:secret@prefill-http:8000".to_string(), None),
+            ],
+            decode_urls: vec![
+                "grpc://decode:50051".to_string(),
+                "grpc://token@decode-2:50051".to_string(),
+            ],
+            prefill_policy: None,
+            decode_policy: None,
+        };
+        let warnings = unused_credentials_warnings(&mode);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings[0].contains("grpc://***@prefill:50051"),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings[1].contains("grpc://***@decode-2:50051"),
+            "{warnings:?}"
+        );
+        assert!(unused_credentials_warnings(&RoutingMode::Regular {
+            worker_urls: vec!["http://user:secret@worker:8000".to_string()],
+        })
+        .is_empty());
+    }
+
     #[test]
     fn worker_url_rejects_disallowed_scheme() {
         assert!(validate_worker_url("ftp://example.com:21").is_err());
@@ -3400,6 +3726,297 @@ mod tests {
     #[test]
     fn worker_url_rejects_unparsable() {
         assert!(validate_worker_url("http://").is_err());
+    }
+
+    /// An address the URL library and the gateway's own type read apart is
+    /// refused: a client would dial one host while every line named another,
+    /// or join its routes under a path the gateway's type takes for a
+    /// userinfo. The refusal names the address by its scheme alone and its
+    /// reason names no part of it.
+    #[test]
+    fn a_worker_url_read_two_ways_is_refused() {
+        // The refusal of `url`: the scheme and no other part of the address,
+        // then the reason, whose text is the same for every address.
+        let refused = |url: &str, reason: &str| {
+            let text = validate_worker_url(url).expect_err(url).to_string();
+            let scheme = url.split_once("://").map_or("", |(scheme, _)| scheme);
+            let shown = format!("Invalid value for field 'worker_url': {scheme}://*** - {reason}");
+            assert!(text.starts_with(&shown), "{url}: {text}");
+            assert!(!text.contains("s3cret"), "{url}: {text}");
+        };
+        // A caller's rank suffix. A client dials the digits as the host, or
+        // reads them as the end of the path or the query (the fifth and the
+        // sixth). The last two have no userinfo to the gateway's type, which
+        // reads a host and its rank: a token alone, a user and a password of
+        // digits.
+        for url in [
+            "http://127.0.0.1:35099@2130706433",
+            "http://user:s3cret@127.0.0.1:52605@2130706433",
+            "grpc://127.0.0.1:61845@2130706433",
+            "http://user:s3cret@127.0.0.1:57697@3",
+            "http://10.0.0.1:30000/v1@2",
+            "grpc://worker:50051?token=s3cret@3",
+            "http://s3cret-token@8080",
+            "http://s3cret-user:8080@2130706433",
+        ] {
+            refused(url, "a worker URL cannot end in '@' and digits");
+        }
+        // What a client reads and the gateway's type does not: an empty
+        // port, port 0, a tab a client drops, a userinfo before a host of
+        // digits alone.
+        for url in [
+            "http://user:s3cret@worker:/v1",
+            "http://user:s3cret@worker:0",
+            "http://user:s3cret@wor\tker:8000",
+            "http://user:s3cret@8080",
+        ] {
+            refused(
+                url,
+                "the gateway cannot read this address as a host and a port",
+            );
+        }
+        // Two addresses in one: a backslash ends the authority for an HTTP
+        // client and not for the gateway's type. The hosts part in the
+        // first, the ports alone in the second. In the third a bracket
+        // parts two names under `grpc` that differ beyond their ASCII
+        // case.
+        for url in [
+            "http://s3cret-dialled\\@named.example",
+            "http://worker\\@worker:8000",
+            "grpc://[u@W\u{f6}rker.example:50051/]@w\u{f6}rk\u{e9}r.example:50051",
+        ] {
+            refused(
+                url,
+                "the address reads two ways: a client would dial one host and port",
+            );
+        }
+        // One host and port to both readers, which end the authority
+        // apart: a client joins every route under the rest as a path, and
+        // the gateway's type reads a userinfo that is not there. At a
+        // backslash under `http` and `https`: alone, with a path behind it,
+        // with a userinfo before it, under `https`. At a slash, a question
+        // mark or a hash before the first `]` of an authority that opens
+        // with a bracket: with a backslash behind the bracket, without one,
+        // with a path behind it, under `grpc`.
+        for url in [
+            "http://worker:8000\\@worker:8000",
+            "http://worker:8000\\@worker:8000/v1",
+            "http://user:s3cret@worker:8000\\@worker:8000",
+            "https://worker.example.com\\@worker.example.com",
+            "http://[u@worker:8000/]\\@worker:8000",
+            "http://[u@worker:8000/]@worker:8000",
+            "http://[u@worker:8000/]@worker:8000/v1",
+            "http://[u@worker:8000?x]@worker:8000",
+            "http://[u@worker:8000#x]@worker:8000",
+            "grpc://[u@worker:50051/]@worker:50051",
+        ] {
+            refused(
+                url,
+                "the address reads two ways: a client ends the authority inside what the gateway",
+            );
+        }
+    }
+
+    /// An earlier rule of the door names the address it refuses by the
+    /// gateway's masked rendering, which reads a token before an `@` and
+    /// digits as a host and its rank: such an address shows its scheme alone
+    /// in the refusal, whichever rule refuses it.
+    #[test]
+    fn a_refusal_shows_the_scheme_alone_of_an_address_read_with_a_rank() {
+        for (url, shown, reason) in [
+            (
+                "tcp://s3cret-token@8080",
+                "tcp://***",
+                "a tcp:// worker URL takes no userinfo",
+            ),
+            (
+                "grpcs://s3cret-token@8080",
+                "grpcs://***",
+                "grpcs:// workers are not supported",
+            ),
+            (
+                "HTTP://s3cret-token@8080",
+                "http://***",
+                "scheme 'HTTP://' is not allowed",
+            ),
+            (
+                "s3cret-token@8080",
+                "***",
+                "URL must start with a lowercase",
+            ),
+            (
+                "http://s3cret-token@99999999999",
+                "http://***",
+                "Invalid URL format",
+            ),
+        ] {
+            let text = validate_worker_url(url).expect_err(url).to_string();
+            let named = format!("Invalid value for field 'worker_url': {shown} - {reason}");
+            assert!(text.starts_with(&named), "{url}: {text}");
+            assert!(!text.contains("s3cret"), "{url}: {text}");
+        }
+        // No rank, no change: the masked rendering, as before.
+        let text = validate_worker_url("tcp://user:s3cret@10.0.0.5:31000")
+            .expect_err("a tcp userinfo")
+            .to_string();
+        assert!(
+            text.starts_with("Invalid value for field 'worker_url': tcp://***@10.0.0.5:31000 - "),
+            "{text}"
+        );
+    }
+
+    /// The door as a discovery manifest's reader asks it: an address with no
+    /// scheme is asked under `http://`, or under `grpc://` where the URL
+    /// library cannot read it under `http://`, a known scheme in any case
+    /// under its lowercase form, and the answer is the door's reason alone,
+    /// which names no part of the address behind its scheme.
+    #[test]
+    fn a_listed_worker_url_is_asked_of_the_door_in_the_forms_it_is_stored_in() {
+        for url in [
+            "10.0.0.11:8000",
+            "user:pass@10.0.0.11:8000",
+            "[2001:db8::1]:8000",
+            "HTTP://10.0.0.11:8000",
+            "grpc://decode.internal:9000",
+            "ipc:///tmp/engine.sock",
+            // The URL library cannot read it under `http://`: asked under
+            // `grpc://`, the one scheme it can be stored with, and taken.
+            "256.1.1.1:8000",
+        ] {
+            assert_eq!(listed_worker_url_refusal(url), None, "{url}");
+        }
+        for (url, reason) in [
+            (
+                "http://adm1n:s3cret@2130706433/",
+                "the gateway cannot read this address as a host and a port",
+            ),
+            (
+                "adm1n:s3cret@2130706433",
+                "the gateway cannot read this address as a host and a port",
+            ),
+            ("Http://s3cret@2130706433", "reads them as a rank suffix"),
+            ("http://adm1n:s3cret@99999999999", "Invalid URL format"),
+            (
+                "grpcs://adm1n:s3cret@w:9000",
+                "grpcs:// workers are not supported",
+            ),
+            // The library reads it under `http://` and the door refuses it
+            // there alone: under `grpc://` the door takes it.
+            ("user\\@worker:50051", "the address reads two ways"),
+        ] {
+            let refusal = listed_worker_url_refusal(url).unwrap_or_default();
+            assert!(refusal.contains(reason), "{url}: {refusal}");
+            for part in ["adm1n", "s3cret", "2130706433", "99999999999"] {
+                assert!(
+                    !refusal.contains(part),
+                    "{url}: the refusal names '{part}': {refusal}"
+                );
+            }
+        }
+    }
+
+    /// What the two readings agree on stays accepted, however it is
+    /// written: a userinfo (an `@` inside it too), the scheme's own port
+    /// written out or left out, a name in upper case or percent-encoded,
+    /// an IPv4 address as one number, an IPv6 literal, a query that holds
+    /// an `@`, a name outside ASCII under `tcp` or `grpc` in either case, a
+    /// backslash behind the authority or under `grpc`.
+    #[test]
+    fn a_worker_url_both_readings_agree_on_is_accepted() {
+        for url in [
+            "http://user:pass@worker:3000",
+            "http://a@b:pass@worker:3000",
+            "http://worker:3000/v1",
+            "http://10.0.0.5:8000",
+            "http://worker:80",
+            "https://worker.example.com:443/v1",
+            "http://Worker.Example:8000",
+            "http://w%6frker:8000",
+            "http://2130706433:8000",
+            "https://[::1]:8443",
+            "grpc://10.0.0.5:50051",
+            "grpc://Worker:50051",
+            "grpc://[fd00::1]:50051",
+            "grpc://worker:50051?token=a@b",
+            "http://worker:8000?x=a\\@b",
+            "grpc://user\\@worker:50051",
+            "tcp://10.0.0.5:31000",
+            "tcp://w\u{f6}rker.example:31000",
+            "tcp://W\u{f6}rker.example:31000",
+            "grpc://W\u{f6}rker.example:50051",
+        ] {
+            validate_worker_url(url).expect(url);
+        }
+    }
+
+    /// Routes join to the address less its trailing slashes, and a line may
+    /// name a worker by that form: the door reads it both ways too. An
+    /// address that is one host to both readers as written, and a rank or
+    /// no address at all to the gateway's type without its trailing slashes,
+    /// is refused and named by its scheme alone.
+    #[test]
+    fn a_worker_url_read_two_ways_without_its_trailing_slashes_is_refused() {
+        for (url, reason) in [
+            (
+                "http://s3cret-token@2130706433/",
+                "a worker URL cannot end in '@' and digits",
+            ),
+            (
+                "http://s3cret-token@2130706433//",
+                "a worker URL cannot end in '@' and digits",
+            ),
+            (
+                "https://10.0.0.5:8000@2130706433/",
+                "a worker URL cannot end in '@' and digits",
+            ),
+            (
+                "http://127.0.0.1:8000/?token=s3cret@123456/",
+                "a worker URL cannot end in '@' and digits",
+            ),
+            (
+                "http://127.0.0.1:8000?token=s3cret@42/",
+                "a worker URL cannot end in '@' and digits",
+            ),
+            (
+                "http://s3cret-user:s3cret@2130706433/",
+                "the gateway cannot read this address as a host and a port",
+            ),
+        ] {
+            let text = validate_worker_url(url).expect_err(url).to_string();
+            let scheme = url.split_once("://").map_or("", |(scheme, _)| scheme);
+            let shown = format!("Invalid value for field 'worker_url': {scheme}://*** - {reason}");
+            assert!(text.starts_with(&shown), "{url}: {text}");
+            assert!(!text.contains("s3cret"), "{url}: {text}");
+        }
+        // A trailing slash alone changes nothing: what both read as one in
+        // both forms stays accepted.
+        for url in [
+            "http://worker:3000/",
+            "http://worker:3000//",
+            "http://user:pass@worker:3000/",
+            "https://worker.example.com/v1/",
+            "http://worker:3000/?token=a@b/",
+            "http://2130706433:8000/",
+        ] {
+            validate_worker_url(url).expect(url);
+        }
+    }
+
+    /// The refusal ends a start too: the configuration's worker URLs go
+    /// through the one door.
+    #[test]
+    fn a_start_refuses_a_worker_url_read_two_ways() {
+        let config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://user:s3cret@127.0.0.1:52605@2130706433".to_string()],
+            },
+            PolicyConfig::Random,
+        );
+        let text = ConfigValidator::validate(&config)
+            .expect_err("refused")
+            .to_string();
+        assert!(text.contains("cannot end in '@' and digits"), "{text}");
+        assert!(!text.contains("s3cret"), "{text}");
     }
 
     #[test]
@@ -3444,6 +4061,51 @@ mod tests {
             },
             PolicyConfig::Random,
         )
+    }
+
+    /// A routing-key header is never a credential: every name on the shared
+    /// header deny-list is refused at load by name, in any letter case and in
+    /// any position of the list, where a plain name beside it is taken.
+    #[test]
+    fn routing_key_headers_refuse_credential_names() {
+        let mut config = regular_mode_config();
+        config.routing_key_override.enabled = true;
+        config.routing_key_override.headers = vec!["x-routing-key".to_string()];
+        assert!(ConfigValidator::validate(&config).is_ok());
+        for denied in DENIED_HEADERS {
+            for name in [denied.to_string(), denied.to_ascii_uppercase()] {
+                config.routing_key_override.headers =
+                    vec!["x-routing-key".to_string(), name.clone()];
+                assert!(
+                    matches!(
+                        ConfigValidator::validate(&config),
+                        Err(ConfigError::ValidationFailed { ref reason })
+                            if reason.contains("routing_key_override.headers")
+                                && reason.contains(&name)
+                                && reason.contains("credential")
+                    ),
+                    "{name}"
+                );
+            }
+        }
+    }
+
+    /// The deny-list by name: a name dropped from it would be taken as a
+    /// routing-key header with no case above turning red.
+    #[test]
+    fn the_denied_routing_key_headers_are_the_seven_credential_names() {
+        assert_eq!(
+            DENIED_HEADERS,
+            [
+                "authorization",
+                "proxy-authorization",
+                "cookie",
+                "set-cookie",
+                "x-api-key",
+                "api-key",
+                "x-goog-api-key",
+            ]
+        );
     }
 
     #[test]
@@ -4594,8 +5256,10 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    /// A gRPC worker over TLS is refused at start-up, by name and with the
+    /// reason, rather than at its first call.
     #[test]
-    fn test_validate_grpcs_worker_url() {
+    fn test_validate_grpcs_worker_url_is_refused() {
         let mut config = RouterConfig::new(
             RoutingMode::Regular {
                 worker_urls: vec!["grpcs://worker:50051".to_string()],
@@ -4606,8 +5270,13 @@ mod tests {
         config.connection_mode = ConnectionMode::Grpc;
         config.model_path = Some("meta-llama/Llama-3-8B".to_string());
 
-        let result = ConfigValidator::validate(&config);
-        assert!(result.is_ok());
+        let error = ConfigValidator::validate(&config).expect_err("grpcs:// is refused");
+        let text = error.to_string();
+        assert!(
+            text.contains("grpcs:// workers are not supported"),
+            "{text}"
+        );
+        assert!(text.contains("use grpc://"), "{text}");
     }
 
     #[test]
@@ -4775,8 +5444,8 @@ mod tests {
             ("igw", with(regular(&[]), true, None)),
             ("discovery", with(regular(&[]), false, Some(discovery))),
             (
-                "a grpcs url",
-                with(regular(&["grpcs://b:50051"]), false, None),
+                "a grpc url alone",
+                with(regular(&["grpc://b:50051"]), false, None),
             ),
             (
                 "a grpc url beside an http one",
@@ -5127,6 +5796,7 @@ mod tests {
     fn an_admin_connection_limit_above_the_permit_maximum_is_rejected() {
         let config = |admin_max_connections: usize| RouterConfig {
             admin_max_connections,
+            admin_port: Some(30004),
             mode: RoutingMode::Regular {
                 worker_urls: vec!["http://worker:8000".to_string()],
             },
@@ -5145,6 +5815,38 @@ mod tests {
                 assert_eq!(field, "admin_max_connections");
                 assert_eq!(value, (Semaphore::MAX_PERMITS + 1).to_string());
                 assert!(reason.contains("0 = no bound"), "{reason}");
+            }
+            other => panic!("expected an invalid admin_max_connections, got {other:?}"),
+        }
+    }
+
+    /// The bound is the admin listener's own: without `admin_port` there is
+    /// no listener to bound, so a bound without the port is refused by name
+    /// (as a host without the port is); with the port, or without a bound,
+    /// the settings pass.
+    #[test]
+    fn an_admin_connection_bound_without_an_admin_port_is_rejected() {
+        let config = |admin_max_connections: usize, admin_port: Option<u16>| RouterConfig {
+            admin_max_connections,
+            admin_port,
+            mode: RoutingMode::Regular {
+                worker_urls: vec!["http://worker:8000".to_string()],
+            },
+            ..Default::default()
+        };
+        for (bound, port) in [(0, None), (16, Some(30004))] {
+            ConfigValidator::validate(&config(bound, port))
+                .unwrap_or_else(|e| panic!("bound {bound} with port {port:?}: {e}"));
+        }
+        match ConfigValidator::validate(&config(16, None)) {
+            Err(ConfigError::InvalidValue {
+                field,
+                value,
+                reason,
+            }) => {
+                assert_eq!(field, "admin_max_connections");
+                assert_eq!(value, "16");
+                assert!(reason.contains("--admin-port"), "{reason}");
             }
             other => panic!("expected an invalid admin_max_connections, got {other:?}"),
         }

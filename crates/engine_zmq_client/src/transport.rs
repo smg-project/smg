@@ -586,6 +586,7 @@ mod tests {
         codec::encode_msgpack,
         mock_engine::{
             connect_to_frontend, default_ready_response, hello, hello_in_group, IpcNamespace,
+            MockEngine,
         },
         protocol::vllm::{
             output::{
@@ -597,6 +598,30 @@ mod tests {
     };
 
     const TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// A frontend whose handshake with one mock engine (index 0) is done, that
+    /// engine, and the namespace whose paths the sockets live on.
+    async fn connected_frontend() -> (ConnectedTransport, MockEngine, IpcNamespace) {
+        let ns = IpcNamespace::new().unwrap();
+        let (handshake, input, output) = (
+            ns.handshake_endpoint(),
+            ns.input_endpoint(),
+            ns.output_endpoint(),
+        );
+        let (transport, engine) = tokio::join!(
+            connect_handshake(&handshake, 1, &input, &output, TIMEOUT),
+            connect_to_frontend(
+                &handshake,
+                EngineId::from_engine_index(0),
+                default_ready_response()
+            ),
+        );
+        (
+            transport.expect("frontend handshake"),
+            engine.expect("mock engine connect"),
+            ns,
+        )
+    }
 
     #[tokio::test]
     async fn bind_local_sockets_supports_ipc() {
@@ -611,24 +636,7 @@ mod tests {
 
     #[tokio::test]
     async fn handshake_then_request_and_output_roundtrip() {
-        let ns = IpcNamespace::new().unwrap();
-        let (handshake, input, output) = (
-            ns.handshake_endpoint(),
-            ns.input_endpoint(),
-            ns.output_endpoint(),
-        );
-
-        // Frontend binds + drives handshake; mock engine (index 0) connects in.
-        let (transport, engine) = tokio::join!(
-            connect_handshake(&handshake, 1, &input, &output, TIMEOUT),
-            connect_to_frontend(
-                &handshake,
-                EngineId::from_engine_index(0),
-                default_ready_response()
-            ),
-        );
-        let transport = transport.expect("frontend handshake");
-        let mut engine = engine.expect("mock engine connect");
+        let (transport, mut engine, _ns) = connected_frontend().await;
 
         // Registration surfaced the engine + its post-init config.
         assert_eq!(transport.engines.len(), 1);
@@ -710,23 +718,7 @@ mod tests {
 
     #[tokio::test]
     async fn dead_sentinel_surfaces_engine_core_dead() {
-        let ns = IpcNamespace::new().unwrap();
-        let (handshake, input, output) = (
-            ns.handshake_endpoint(),
-            ns.input_endpoint(),
-            ns.output_endpoint(),
-        );
-
-        let (transport, engine) = tokio::join!(
-            connect_handshake(&handshake, 1, &input, &output, TIMEOUT),
-            connect_to_frontend(
-                &handshake,
-                EngineId::from_engine_index(0),
-                default_ready_response()
-            ),
-        );
-        let transport = transport.expect("frontend handshake");
-        let mut engine = engine.expect("mock engine connect");
+        let (transport, mut engine, _ns) = connected_frontend().await;
 
         let (out_tx, mut out_rx) = mpsc::channel(4);
         #[expect(
@@ -981,10 +973,25 @@ mod tests {
             ns.output_endpoint(),
         );
         // The first handshake greets the engine and gives up its READY wait
-        // while the engine is still loading.
-        let (gave_up, engine) = tokio::join!(
-            connect_handshake(&handshake, 1, &input, &output, Duration::from_millis(300)),
-            hello(&handshake, EngineId::from_engine_index(0)),
+        // while the engine is still loading. Its 300 ms of silence run out in
+        // that wait alone: until its HELLO is answered the engine counts as
+        // alive, with a sign of life on every poll and the engine polled
+        // first, so a starved host cannot spend them on the greeting.
+        let alive = crate::EngineLiveness::new();
+        let first_startup = StartupBudget {
+            silence: Duration::from_millis(300),
+            ceiling: None,
+            liveness: Some(alive.clone()),
+        };
+        let greeted = hello(&handshake, EngineId::from_engine_index(0));
+        tokio::pin!(greeted);
+        let (engine, gave_up) = tokio::join!(
+            biased;
+            std::future::poll_fn(|cx| {
+                alive.touch();
+                std::future::Future::poll(greeted.as_mut(), cx)
+            }),
+            connect_handshake(&handshake, 1, &input, &output, first_startup),
         );
         let Err(error) = gave_up else {
             panic!("the first handshake must give up its READY wait");
@@ -995,8 +1002,19 @@ mod tests {
         );
         let engine = engine.expect("HELLO/INIT with the first handshake");
         // The dropped listeners' socket files go on their own tasks; a real
-        // frontend binds again a health probe later.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // frontend binds again a health probe later, the test once they are
+        // gone.
+        tokio::time::timeout(TIMEOUT, async {
+            while [&handshake, &input, &output].into_iter().any(|endpoint| {
+                endpoint
+                    .strip_prefix("ipc://")
+                    .is_some_and(|path| std::path::Path::new(path).exists())
+            }) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the dropped listeners' socket files go");
 
         // The frontend binds again; the engine's handshake socket reconnects,
         // and its READY, then its registration, arrive at the new handshake.

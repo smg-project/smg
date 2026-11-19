@@ -1,0 +1,82 @@
+# Regression gate for `cargo bench -p smg-policy-controller --bench affinity`, the third row of the matrix
+# in .github/workflows/benchmark-policy-engine.yml, run on pull requests through scripts/bench_gate.py. The
+# first row gates the `decision` binary with policy-engine.toml, which records the placement every row is
+# built with (every function on a 64-byte boundary) and why.
+#
+# The gate runs the whole file: the cost of the affinity column a host feeds beside the candidate rows, at
+# 8, 64 and 512 candidates: the view build that writes each row and its entry of the column
+# (`policy_affinity/view_build/<n>`), and one decision of the `cache_aware` preset, whose stages read the
+# column (`policy_affinity/decide/cache_aware/<n>`). 6 single-threaded rows, about a minute a run, so three
+# interleaved runs a side take about six minutes. Five rows are gated and one is reported.
+#
+# Threshold (the method is described in tokenizer.toml). The identical-build spread, (max - min) / median of
+# the per-run criterion medians of one build, was read three times:
+#
+#   rows                                  build host, twice   hosted runner   threshold
+#   view_build/512 (2.2 - 2.5 us)         2.9 and 4.5 %       1.6 %           10 %
+#   decide/cache_aware/512 (8.7 - 8.9 us) 1.4 and 3.0 %       0.1 %           10 %
+#   view_build/64 (240 - 300 ns)          1.2 and 5.4 %       0.9 %           10 %
+#   decide/cache_aware/64 (1.3 us)        3.1 and 2.6 %       0.4 %           10 %
+#   view_build/8 (30 - 40 ns)             7.7 and 3.6 %       21.5 %          reported
+#   decide/cache_aware/8 (250 - 300 ns)   2.0 and 7.4 %       1.6 %           10 %
+#
+# The build host's readings: six pinned runs of one build, read through the gate script itself: one build as
+# both sides (the second side the same binary with one byte appended past its image), three interleaved runs
+# a side, each from a fresh copy of the binary with a fresh criterion home, on a reserved core of a shared
+# many-core build host. The script held each run until the host's one-minute load was at most 40
+# (`--busy-above 40`); the loads before the runs were 34 to 39 and 33 to 39. The wide row is another one in
+# each reading, so that width is the host's and not a row's.
+#
+# The hosted runner's reading: the first job that ran both sides, three interleaved runs a side at a load
+# of 1.0 to 3.1. A side's three runs are one build, and the table holds each row's wider side. The two
+# builds of that job differed in the measured crate, by a picker this binary does not run: all 6 ids
+# passed, the changes -1.5 to +0.2 %.
+#
+# The threshold is the smallest multiple of 5 % that is at least twice the identical-build spread, never
+# under 10 % and never over 15 %. The gate runs on the hosted runner, so its reading decides: the five rows
+# that read 1.6 % or less there take 10 %. The 8-candidate view build, the shortest row, read 21.5 %: one
+# of its six runs took 36.5 ns where the other five took 30.0 to 30.1 ns. It asked 20 % on the build host
+# once and asks more here, so no gate below matches it: the job reports the row and never fails on it. Both
+# of its timed buffers stand on a page's start (benches/common/placed.rs), so the slow run is not the
+# placement policy-engine.toml records; what moves it is not known.
+#
+# The gate fails an id only when every pull-request run is slower than every base run, so one slow run
+# cannot fail the job. Read as three base and three head runs, both of the build host's null cases pass
+# these gates: 0 failed, 0 suspect of the 5 gated ids.
+#
+# A pull request that moves no file of this binary builds two binaries of the same bytes, which the gate
+# passes without a run. Every job that runs both sides uploads bench-gate/results.json with the raw per-run
+# medians; a gated row whose spread on the hosted runner reads above 5 % takes 15 % by the rule above.
+
+# Count: `count = true`, as policy-engine.toml records it. Read on this file's 6 ids, the same work with cold
+# code ahead of the decision (never committed): all 6 count the same in every batch after the first.
+# The three `decide/` ids time a whole decision and carry `whole_pass = true`, as policy-engine.toml
+# records it: two of them are the ids its note names, 15.2 and 11.9 % slower on 2 and 6 instructions more.
+repeats = 3
+count = true
+# The count ends 2,280 s into the run. The gate step's bound is 60 minutes, which the `decision` row needs,
+# and this binary's runs and its report end long before it. No count starts in the budget's last 30 s.
+run_budget = 2280
+filter = "^policy_affinity/"
+
+# The files that feed this binary beyond the measured crate: the base side is built with them as the pull
+# request has them (bench_gate.py build --sources-from), so the two binaries differ in the measured code alone.
+sources = [
+    "crates/policy_controller/benches/affinity.rs",
+    "crates/policy_controller/benches/common/mod.rs",
+    "crates/policy_controller/benches/common/column.rs",
+    "crates/policy_controller/benches/common/placed.rs",
+]
+
+# The first gate whose pattern matches an id decides its threshold. `policy_affinity/view_build/8` matches
+# none: it is reported, never failed.
+[[gate]]
+pattern = "^policy_affinity/decide/"
+threshold = 0.10
+whole_pass = true
+note = "identical build 0.1 - 1.6 % on the hosted runner, 1.4 - 7.4 % on the build host"
+
+[[gate]]
+pattern = "^policy_affinity/view_build/(64|512)$"
+threshold = 0.10
+note = "identical build 0.9 - 1.6 % on the hosted runner, 1.2 - 5.4 % on the build host"

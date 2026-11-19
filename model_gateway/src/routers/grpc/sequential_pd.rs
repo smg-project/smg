@@ -26,6 +26,7 @@ use crate::{
                 mooncake_prefill_params, KvConnectorMode, NIXL_PREFILL_KV_PARAMS,
             },
             pd_failure::{PdSide, SidePhase},
+            prefill_admission::PrefillLoadGuard,
             retry::mark_non_retryable,
         },
         error,
@@ -33,8 +34,8 @@ use crate::{
             backend_client::BackendClient,
             common::stages::request_execution::{
                 decode_silence_response, dispatch_prefill_within, first_prefill_response_within,
-                is_prefill_silence, prefill_silence_response, retire_pd_side,
-                start_failure_response, PdSides, PrefillBound, Retirement, SideDispatch,
+                is_prefill_silence, pd_start_failure_response, prefill_silence_response,
+                retire_pd_side, PdSides, PrefillBound, PrefillWait, Retirement, SideDispatch,
                 StreamResult,
             },
             context::{ClientSelection, ExecutionResult, PdTiming, WorkerSelection},
@@ -49,7 +50,7 @@ use crate::{
             },
         },
     },
-    worker::{liveness, PrefillLoadGuard, Worker},
+    worker::{health::liveness, metrics::Metrics as WorkerMetrics, Worker},
 };
 
 /// The message a sequential decode side's silence verdict starts with (see
@@ -276,11 +277,11 @@ fn sequential_decode_failure(
     }
     UpstreamClass::account_dispatch_failure(metrics_labels::WORKER_DECODE, connection, e);
     account_pd_side_failure(metrics_labels::WORKER_DECODE, e);
-    start_failure_response(
+    pd_start_failure_response(
+        PdSide::Decode,
+        workers.decode_worker(),
         e,
         "execute_sequential_pd",
-        PdSide::Decode.description(SidePhase::Start),
-        PdSide::Decode.code(SidePhase::Start),
     )
 }
 
@@ -303,11 +304,11 @@ fn sequential_prefill_failure(
     }
     UpstreamClass::account_dispatch_failure(metrics_labels::WORKER_PREFILL, connection, e);
     account_pd_side_failure(metrics_labels::WORKER_PREFILL, e);
-    start_failure_response(
+    pd_start_failure_response(
+        PdSide::Prefill,
+        workers.prefill_worker(),
         e,
         "execute_sequential_pd",
-        PdSide::Prefill.description(SidePhase::Start),
-        PdSide::Prefill.code(SidePhase::Start),
     )
 }
 
@@ -606,7 +607,7 @@ pub(crate) async fn execute_sequential_pd(
     // requests don't pollute success metrics; captured here before use of mode.
     let kv_connector_label = plan.mode.metrics_label();
     let (prefill_request, mut decode_request) = plan.requests(proto_request, workers);
-    let sides = PdSides::of(workers, ledger, &prefill_request);
+    let sides = PdSides::of(workers, ledger, &prefill_request, plan.streaming);
 
     let PrefillHarvest {
         stream: prefill_stream,
@@ -709,7 +710,7 @@ async fn sequential_prefill_side(
     let bound = prefill_worker
         .and_then(|worker| PrefillBound::at(worker, sides.prompt_tokens, prefill_start));
     if let Some(prefill) = prefill_worker {
-        Metrics::record_worker_request(prefill.url(), prefill.model_id());
+        WorkerMetrics::record_worker_request(prefill.url(), prefill.model_id());
     }
     // Booked before the call is polled, for the servicers that send their
     // headers with the first message (see `PrefillTicket::book`); the bound
@@ -717,7 +718,10 @@ async fn sequential_prefill_side(
     let prefill_ticket =
         prefill_worker.and_then(|worker| PrefillTicket::book(worker, sides.prompt_tokens));
     let prefill_stream = dispatch_prefill_within(
-        bound.clone(),
+        PrefillWait {
+            bound: bound.clone(),
+            encode: None,
+        },
         Box::pin(async move { prefill_client.generate(prefill_request).await }),
         prefill_worker.cloned(),
         None,
@@ -738,7 +742,12 @@ async fn sequential_prefill_side(
     };
     if let Err(e) = first_prefill_response_within(
         &mut prefill_stream,
-        bound,
+        // The sequential protocol takes no encode watch: its request's
+        // encode, if any, is the parallel shape's rendezvous.
+        PrefillWait {
+            bound,
+            encode: None,
+        },
         prefill_worker,
         None,
         sides.prefill_label,
@@ -937,7 +946,7 @@ async fn sequential_decode_side(
     let workers = sides.workers;
     // Send request to decode
     if let Some(decode) = workers.decode_worker() {
-        Metrics::record_worker_request(decode.url(), decode.model_id());
+        WorkerMetrics::record_worker_request(decode.url(), decode.model_id());
     }
     // The relay phase ends at the decode dispatch. Everything after this
     // instant, including the engines' KV transfer and the decode scheduling,
@@ -979,17 +988,33 @@ async fn sequential_decode_side(
     // transfer; aborting decode mid-transfer on a client disconnect can
     // crash or leak on the engine side. Defer the abort until the first
     // decode response proves the handoff finished (see the parallel PD
-    // path for the same invariant). The side is tracked on its worker here,
+    // path for the same invariant). A non-streaming request's first decode
+    // response is its whole answer, so a client that left would hold the
+    // decode engine for the answer's length (the house cap at most); its
+    // wait is bounded instead by the pair's decode bound
+    // (`liveness::decode_side_bound`, the bound a streaming side's first
+    // token is judged by), taken as the estimate of the handoff's length
+    // and counted from the drop: a shorter protection window than the cap,
+    // by design. A plain side has no silence verdict of its own, and a
+    // streaming side keeps the cap. The side is tracked on its worker here,
     // before its first item is waited for: its responses are the worker's
     // progress, it joins no pile (its silence is bounded per request), and
     // the worker's breaker success is sampled at the side's first response
     // (`ProtoStream::tracked_decode_side`), never at the dispatch; the
     // attribution stage leaves a side tracked here as it is.
-    let mut decode_stream = match &decode_worker {
-        Some(worker) => decode_stream
-            .defer_abort_until_first_item()
-            .tracked_decode_side(Arc::clone(worker)),
+    let plain_decode_bound = if plan.streaming {
+        None
+    } else {
+        worker_prefilling_before_decode(workers, handed_off, plan.relay_kv_params)
+            .and_then(|worker| liveness::decode_side_bound(worker, sides.prompt_tokens))
+    };
+    let decode_stream = match plain_decode_bound {
+        Some(bound) => decode_stream.defer_abort_within(bound),
         None => decode_stream.defer_abort_until_first_item(),
+    };
+    let mut decode_stream = match &decode_worker {
+        Some(worker) => decode_stream.tracked_decode_side(Arc::clone(worker)),
+        None => decode_stream,
     };
     // Without a bound nothing is pulled ahead and the side counts as answered,
     // as before; a first item that is a failure, or an end with nothing on

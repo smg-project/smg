@@ -14,7 +14,7 @@ use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowRe
 use crate::{
     worker::ConnectionMode,
     workflow::{
-        data::{WorkerKind, WorkerWorkflowData},
+        data::{require_app_context, WorkerKind, WorkerWorkflowData},
         Job, TokenizerConfigRequest, TokenizerLoadFailure,
     },
 };
@@ -42,11 +42,7 @@ impl StepExecutor<WorkerWorkflowData> for SubmitTokenizerJobStep {
         }
 
         let labels = &context.data.final_labels;
-        let app_context = context
-            .data
-            .app_context
-            .as_ref()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
+        let app_context = require_app_context(context.data.app_context.as_ref())?;
         let workers = context
             .data
             .actual_workers
@@ -128,6 +124,7 @@ impl StepExecutor<WorkerWorkflowData> for SubmitTokenizerJobStep {
                 chat_template_path: chat_template.clone(),
                 cache_config: cache_config.clone(),
                 fail_on_duplicate: false,
+                for_worker: true,
             };
 
             // Submit job (fire-and-forget, don't wait for completion); the

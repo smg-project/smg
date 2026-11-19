@@ -6,8 +6,8 @@ use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, Wo
 
 use super::find_workers_by_url;
 use crate::{
-    worker::{endpoint::Endpoint, registry::WorkerId},
-    workflow::data::WorkerUpdateWorkflowData,
+    worker::{identity::endpoint::Endpoint, registry::WorkerId},
+    workflow::data::{require_app_context, WorkerUpdateWorkflowData},
 };
 
 /// Step to find workers to update based on URL.
@@ -23,11 +23,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for FindWorkerToUpdateStep {
         context: &mut WorkflowContext<WorkerUpdateWorkflowData>,
     ) -> WorkflowResult<StepResult> {
         let worker_url = &context.data.worker_url;
-        let app_context = context
-            .data
-            .app_context
-            .as_ref()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
+        let app_context = require_app_context(context.data.app_context.as_ref())?;
 
         // Whether this address has expanded ranks is read from the registry,
         // not guessed from the URL, so an update selects the same group a
@@ -37,7 +33,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for FindWorkerToUpdateStep {
         if workers_to_update.is_empty() {
             return Err(WorkflowError::StepFailed {
                 step_id: StepId::new("find_worker_to_update"),
-                message: format!("Worker {worker_url} not found"),
+                message: format!("Worker {} not found", Endpoint::redacted_str(worker_url)),
             });
         }
 

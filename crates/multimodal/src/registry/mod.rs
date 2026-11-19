@@ -2,13 +2,16 @@ mod deepseek_v41;
 mod gemma4;
 mod glm53_flash;
 mod inkling;
+mod inkling2;
 mod kimi_k25;
 mod kimi_k3;
+mod layouts;
 mod llama4;
 mod llava;
 mod minimax_m3;
 mod muse_spark;
 mod nemotron_omni;
+mod nemotron_transcribe;
 mod phi3_v;
 pub mod qwen3_asr;
 mod qwen3_omni;
@@ -23,6 +26,7 @@ pub use deepseek_v41::DEEPSEEK_V41_IMAGE_PLACEHOLDER;
 use gemma4::Gemma4Spec;
 use glm53_flash::Glm53FlashSpec;
 use inkling::InklingSpec;
+use inkling2::Inkling2Spec;
 use kimi_k25::KimiK25VisionSpec;
 use kimi_k3::KimiK3VisionSpec;
 use llama4::Llama4Spec;
@@ -30,6 +34,7 @@ use llava::{LlavaNextSpec, LlavaSpec};
 use minimax_m3::MiniMaxM3VisionSpec;
 use muse_spark::MuseSparkSpec;
 use nemotron_omni::NemotronOmniSpec;
+use nemotron_transcribe::NemotronTranscribeSpec;
 use once_cell::sync::Lazy;
 use phi3_v::Phi3VisionSpec;
 use qwen3_asr::Qwen3AsrSpec;
@@ -57,6 +62,7 @@ impl ModelRegistry {
                 // Gemma 4 matches its own model_type / id only.
                 LazySpec::new(|| Box::new(Gemma4Spec)),
                 LazySpec::new(|| Box::new(Glm53FlashSpec)),
+                LazySpec::new(|| Box::new(Inkling2Spec)),
                 LazySpec::new(|| Box::new(InklingSpec)),
                 // Kimi-K3 must be registered before Kimi-K2.5: the two families
                 // share a transport layout but not a prompt shape.
@@ -68,6 +74,7 @@ impl ModelRegistry {
                 LazySpec::new(|| Box::new(MuseSparkSpec)),
                 // Nemotron-H Omni matches its own model_type only.
                 LazySpec::new(|| Box::new(NemotronOmniSpec)),
+                LazySpec::new(|| Box::new(NemotronTranscribeSpec)),
                 // LlavaNext must be registered before Llava so "llava_next" model_type matches first.
                 LazySpec::new(|| Box::new(LlavaNextSpec)),
                 LazySpec::new(|| Box::new(LlavaSpec)),
@@ -128,6 +135,7 @@ pub(super) mod test_helpers {
 
     use crate::{
         encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs},
+        registry::Tokenizer,
         types::ImageSize,
     };
 
@@ -159,7 +167,7 @@ pub(super) mod test_helpers {
         }
     }
 
-    impl crate::registry::Tokenizer for TestTokenizer {
+    impl Tokenizer for TestTokenizer {
         fn token_to_id(&self, token: &str) -> Option<u32> {
             self.vocab.get(token).copied()
         }
@@ -233,7 +241,7 @@ mod tests {
             processors::llava::{CLIP_MEAN, CLIP_STD},
             transforms::mean_to_rgb,
         },
-        Modality, ModelSpecificValue, PreProcessorConfig, VideoClipOptions,
+        EncoderFieldLayouts, Modality, ModelSpecificValue, PreProcessorConfig, VideoClipOptions,
     };
 
     /// A checkpoint of this family resolves to a spec by its `model_type`
@@ -258,6 +266,52 @@ mod tests {
             .lookup(&metadata)
             .expect("the gemma4 family has a spec");
         assert_eq!(spec.name(), "gemma4");
+    }
+
+    /// One family sizes its source images itself. The gateway sites that
+    /// plan that geometry read the spec's answer, never the family's name,
+    /// so a rename of the entry keeps the rule where it is.
+    #[test]
+    fn one_family_resizes_its_source_images() {
+        let registry = ModelRegistry::new();
+        let resizing: Vec<&str> = registry
+            .specs
+            .iter()
+            .map(|spec| spec.get())
+            .filter(|spec| spec.resizes_source_images())
+            .map(|spec| spec.name())
+            .collect();
+        assert_eq!(resizing, ["minimax_m3"]);
+    }
+
+    /// The trait's default hands an entry's legacy field map to the request
+    /// path. An entry that declares such a map and lays out every modality
+    /// another way keeps a table no request reads; the registry holds no
+    /// such entry.
+    #[test]
+    fn no_entry_declares_a_legacy_field_map_that_no_modality_reads() {
+        let registry = ModelRegistry::new();
+        let unread: Vec<&str> = registry
+            .specs
+            .iter()
+            .map(|spec| spec.get())
+            .filter(|spec| {
+                let converted = EncoderFieldLayouts::from_legacy_fields(spec.field_layouts());
+                // The trait's own map converts to the default layouts: the
+                // entry declares none.
+                converted != EncoderFieldLayouts::default()
+                    && ![
+                        Modality::Image,
+                        Modality::ImageEmbeds,
+                        Modality::Audio,
+                        Modality::Video,
+                    ]
+                    .into_iter()
+                    .any(|modality| spec.encoder_field_layouts_for(modality) == converted)
+            })
+            .map(|spec| spec.name())
+            .collect();
+        assert_eq!(unread, Vec::<&str>::new());
     }
 
     /// The vision processors come from the spec a model resolves to, so they

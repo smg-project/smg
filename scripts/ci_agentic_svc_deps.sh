@@ -36,6 +36,44 @@ check_port() {
     return 1
 }
 
+# An MCP server whose process is up but whose tool list is empty passes the
+# port check and then fails every MCP case of the e2e rows twenty minutes
+# later, with no line that names the service. So the Brave check also does
+# the MCP handshake (initialize, notifications/initialized, tools/list) and
+# fails here, naming the tool count, when the expected tool is not listed.
+# Same retry shape as check_port: a pod mid-restart gets its chances, a
+# server that stays empty-handed fails the step.
+check_mcp_tools() {
+    local name="$1" url="$2" expected="$3"
+    local attempts="${CHECK_PORT_RETRIES:-6}" delay="${CHECK_PORT_RETRY_DELAY:-5}"
+    local probe
+    probe="$(dirname "${BASH_SOURCE[0]}")/ci_mcp_list_tools.py"
+    local i
+    for ((i = 1; i <= attempts; i++)); do
+        echo "Listing $name tools at $url (attempt $i/$attempts)..."
+        # The probe bounds the whole handshake itself (--deadline 30 s, a
+        # process timer that interrupts whatever call is blocking, since a
+        # socket timeout alone never trips on a peer that keeps sending).
+        # The outer timeout sits well beyond it as the backstop for anything
+        # else that could hang an attempt; its exit 124 is a failed attempt
+        # like any other.
+        if timeout 60 python3 "$probe" "$url" --expect "$expected" --timeout 10 --deadline 30; then
+            return 0
+        fi
+        if [ "$i" -lt "$attempts" ]; then
+            sleep "$delay"
+        fi
+    done
+    echo "FAILED: $name at $url does not list '$expected' after $attempts attempts (the service's own tool registration, not the tests)"
+    return 1
+}
+
+check_brave() {
+    local host="$1"
+    check_port "Brave Search MCP" "$host" 8080 || return 1
+    check_mcp_tools "Brave Search MCP" "http://$host:8080/mcp" "brave_web_search"
+}
+
 ci_oracle_username() {
     local prefix="$1"
     local random="${CI_ORACLE_NAME_RANDOM:-$(openssl rand -hex 3)}"
@@ -105,9 +143,9 @@ cmd_check() {
                 fi ;;
             --brave)
                 if [[ -n "${2:-}" && "$2" != --* ]]; then
-                    check_port "Brave Search MCP" "$2" 8080 || failed=1; shift 2
+                    check_brave "$2" || failed=1; shift 2
                 else
-                    check_port "Brave Search MCP" "brave-search" 8080 || failed=1; shift
+                    check_brave "brave-search" || failed=1; shift
                 fi ;;
             *)  echo "Unknown service: $1"; exit 1 ;;
         esac
@@ -120,9 +158,7 @@ cmd_create_postgres_db() {
     local postgres_host="${1:-postgres-db}"
     local admin_url="postgresql://postgres:postgres@${postgres_host}:5432/postgres"
 
-    bash "$(dirname "${BASH_SOURCE[0]}")/ci_apt_mirror.sh"
-    sudo apt-get update -qq
-    sudo apt-get install -y -qq postgresql-client
+    bash "$(dirname "${BASH_SOURCE[0]}")/ci_apt_install.sh" sudo -y -qq postgresql-client
 
     TEST_DB="$(ci_postgres_dbname)"
     echo "Creating Postgres test database: $TEST_DB"
@@ -147,12 +183,26 @@ cmd_cleanup_postgres_db() {
         || echo "Warning: failed to drop Postgres test database $CI_POSTGRES_TEST_DB"
 }
 
+# The package of the asynchronous I/O library on this release: libaio1t64 from
+# Ubuntu 24.04 on, libaio1 before. CI_OS_RELEASE names the release file, as it
+# does for ci_apt_mirror.sh (default /etc/os-release).
+ci_libaio_package() {
+    local major
+    major="$(sed -n 's/^VERSION_ID="\{0,1\}\([0-9]*\).*/\1/p' "${CI_OS_RELEASE:-/etc/os-release}")"
+    if [ "${major:-0}" -ge 24 ]; then
+        echo libaio1t64
+    else
+        echo libaio1
+    fi
+}
+
 cmd_setup_oracle_client() {
     set -e
-    bash "$(dirname "${BASH_SOURCE[0]}")/ci_apt_mirror.sh"
-    sudo apt-get update
-    sudo apt-get install -y unzip wget
-    sudo apt-get install -y libaio1t64 || sudo apt-get install -y libaio1
+    local libaio
+    libaio="$(ci_libaio_package)"
+    # The name is settled before the install: a fallback from one name to the
+    # other would retry, three times, a package the release does not have.
+    bash "$(dirname "${BASH_SOURCE[0]}")/ci_apt_install.sh" sudo -y unzip wget "${libaio}"
 
     LIBAIO_PATH=$(find /usr/lib -name "libaio.so*" -type f 2>/dev/null | head -1)
     INSTANT_CLIENT_DIR="$HOME/instant-client"

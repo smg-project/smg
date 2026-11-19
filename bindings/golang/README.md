@@ -36,8 +36,22 @@ A high-level Go SDK for interacting with Shepherd Model Gateway (SMG) gRPC API, 
 
 ## Installation
 
+The module lives in a subdirectory of the repository, so each release publishes it as the tag
+`bindings/golang/v<version>` at the release commit (from 1.16.0 on); name that version:
+
 ```bash
-go get github.com/lightseek/smg/go-grpc-sdk
+go get github.com/smg-project/smg/bindings/golang@v<version>
+```
+
+The package links `libsmg_go`, the FFI library built from the same checkout, and its cgo
+directives name no library directory, so `go get` alone does not give a program that builds.
+Build the library at the tag you import, then point cgo (and the loader) at it:
+
+```bash
+git clone --branch bindings/golang/v<version> https://github.com/smg-project/smg
+cd smg/bindings/golang && make build
+export CGO_LDFLAGS="-L$(pwd)/target/release"
+export LD_LIBRARY_PATH="$(pwd)/target/release:$LD_LIBRARY_PATH"   # DYLD_LIBRARY_PATH on macOS
 ```
 
 ### Sync Dependencies
@@ -105,7 +119,7 @@ import (
     "fmt"
     "log"
 
-    "github.com/lightseek/smg/go-grpc-sdk"
+    smg "github.com/smg-project/smg/bindings/golang"
 )
 
 func main() {
@@ -150,7 +164,7 @@ import (
     "io"
     "log"
 
-    "github.com/lightseek/smg/go-grpc-sdk"
+    smg "github.com/smg-project/smg/bindings/golang"
 )
 
 func main() {
@@ -376,7 +390,7 @@ All public types and functions include comprehensive documentation with usage ex
 
 ```bash
 godoc -http=:6060
-# Visit: http://localhost:6060/pkg/github.com/lightseek/smg/go-grpc-sdk/
+# Visit: http://localhost:6060/pkg/github.com/smg-project/smg/bindings/golang/
 ```
 
 ## Development
@@ -410,13 +424,34 @@ bindings/golang/
 │   ├── preprocessor.rs    # Request preprocessing
 │   ├── postprocessor.rs   # Response postprocessing
 │   ├── tokenizer.rs       # Tokenizer FFI
-│   ├── tool_parser.rs     # Tool call parsing
+│   ├── reader.rs          # Tool calls and reasoning read through Symphony
 │   ├── runtime.rs         # Shared runtime
 │   ├── stream_state.rs    # Stream state management
 │   └── proto_parse.rs     # Proto parsing utilities
 └── internal/               # Internal packages
     └── ffi/               # FFI bindings
 ```
+
+### Response parsing
+
+The converter reads every choice of a model's output through the Symphony crate
+(`crates/symphony`), as the gateway reads every chat response: the model's own table for its
+tool-call and reasoning syntax (a thinking model's thought arrives as `reasoning_content`),
+without its calls when the request declares no tools; the `forced` and `json` tables for a
+request whose `tool_choice` names a function or requires a call (the engine is held to the JSON
+schema those tables read); under `tool_choice: none` a call the model writes anyway is withheld.
+The readers replay the rendered prompt, so a thought the template opens inside the prompt reads as
+reasoning on the Rust chat path, and the converter keeps the part of the prompt they replay (from
+the table's last turn opener), as the gateway's readers keep it; the C entry point does not receive
+the prompt yet, so on the Go path such a thought reads as content. A forced call on a model whose table keeps the call's header
+as its id (the Kimi K2 line) carries that shape, `functions.NAME:INDEX`.
+The registry lists a checkpoint by its exact stem, so a renamed or quantized checkpoint
+(`Qwen3-8B-FP8`) reads as plain content, as the gateway reads it without an operator's parser name;
+the binding takes no such name yet. `Message` and `MessageDelta` carry the thought in
+`ReasoningContent`, and the non-streaming `CreateChatCompletion` adds it up as it adds up the
+content. A `tool_choice` that needs a tool on a request without tools is refused before the
+request leaves, with the gateway's own words. The older C entry points `sgl_tool_parser_*`, which
+no Go code called, are gone.
 
 ## Troubleshooting
 

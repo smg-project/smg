@@ -51,8 +51,8 @@ use super::*;
 use crate::{
     kv_events,
     testing::{
-        assert_bucket_edges, assert_golden, bound_port, captured_logs, http_get, servicer_config,
-        Bounded,
+        assert_bucket_edges, assert_golden, bound_port, captured_logs, handshake_address, http_get,
+        next_batch, reported_alive, servicer_config, Bounded,
     },
     tokenizer_bundle, ServicerError,
 };
@@ -98,7 +98,7 @@ fn ec_cpu_model_info(role: &str) -> VllmModelInfo {
     }
 }
 
-/// A pixel-less batch naming its media by hash alone: a consumer's leg.
+/// A pixel-less batch naming its media by hash alone: a consumer's request.
 fn pixel_less_batch(hashes: &[&str]) -> vllm::MultimodalInputs {
     vllm::MultimodalInputs {
         mm_hashes: hashes.iter().map(|hash| hash.to_string()).collect(),
@@ -236,14 +236,6 @@ fn config(dir: &std::path::Path, handshake: &str, model: VllmModelInfo) -> VllmS
     }
 }
 
-/// The handshake endpoint of one test: an IPC socket under its own
-/// directory. A probed TCP port is not reserved, so two tests running in
-/// parallel could pick the same one and a mock engine would handshake with
-/// the other test's servicer and wait forever for its INIT.
-fn handshake_address(dir: &std::path::Path) -> String {
-    format!("ipc://{}", dir.join("handshake").display())
-}
-
 /// The handshake endpoint is free again: ZMQ unlinks the ipc socket file once
 /// the bound socket is dropped, so a fresh listener can take the path.
 async fn assert_handshake_released(handshake: &str) {
@@ -299,6 +291,19 @@ async fn harness_with(
     let handshake = handshake_address(dir.path());
     let mut config = config(dir.path(), &handshake, model);
     config.media_processor = media_processor;
+    started(dir, handshake, config, tokenizer).await
+}
+
+/// The servicer started on `config` (with `tokenizer` when a test brings
+/// its own), one mock engine handshaken on `handshake` and waited for, the
+/// client connected: the single-engine harness [`harness_with`] and
+/// [`metrics_harness_with`] hand back.
+async fn started(
+    dir: tempfile::TempDir,
+    handshake: String,
+    config: VllmServicerConfig,
+    tokenizer: Option<Arc<dyn Tokenizer>>,
+) -> Harness {
     let server = match tokenizer {
         Some(tokenizer) => VllmServicerServer::start_with_tokenizer(config, tokenizer),
         None => VllmServicerServer::start(config),
@@ -906,6 +911,85 @@ async fn string_stops_are_matched_by_the_servicer() {
     assert_eq!(recv_abort(&mut h.engine_in).await, vec!["r3".to_string()]);
 }
 
+/// The servicer's own matched-stop terminal for a fan-out's second choice
+/// carries that choice's index, as the engine's completes do: the stop string
+/// matches on choice 1 while choice 0 is still open, and choice 0 then ends on
+/// the engine's own complete with index 0.
+#[tokio::test]
+async fn a_matched_stop_ends_the_second_choice_with_its_own_index() {
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
+    let mut h = harness(model_info(), Some(tokenizer)).await;
+    let mut request = generate_request("r8", true, vec!["Hello world".to_string()]);
+    request.sampling_params.as_mut().unwrap().n = 2;
+    let mut stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    recv_add(&mut h.engine_in).await;
+    h.engine_out
+        .send_outputs(&batch("r8-1", vec![1], None, None))
+        .await
+        .unwrap();
+    h.engine_out
+        .send_outputs(&batch("r8-1", vec![2], None, None))
+        .await
+        .unwrap();
+    assert_eq!(
+        chunk_tokens(stream.message().bounded().await.unwrap().unwrap()),
+        vec![1]
+    );
+    assert_eq!(
+        chunk_tokens(stream.message().bounded().await.unwrap().unwrap()),
+        vec![2]
+    );
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
+    assert_eq!(
+        (
+            done.index,
+            done.finish_reason.as_str(),
+            done.output_ids.clone()
+        ),
+        (1, "stop", vec![1, 2])
+    );
+    assert_eq!(
+        done.matched_stop,
+        Some(vllm::generate_complete::MatchedStop::MatchedStopStr(
+            "Hello world".to_string()
+        ))
+    );
+
+    h.engine_out
+        .send_outputs(&batch(
+            "r8-0",
+            vec![30],
+            Some(EngineCoreFinishReason::Length),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        chunk_tokens(stream.message().bounded().await.unwrap().unwrap()),
+        vec![30]
+    );
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
+    assert_eq!(
+        (
+            done.index,
+            done.finish_reason.as_str(),
+            done.output_ids.clone()
+        ),
+        (0, "length", vec![30])
+    );
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    // The engine gets the abort for the choice the servicer ended, and only
+    // that one: nothing follows it.
+    assert_eq!(recv_abort(&mut h.engine_in).await, vec!["r8-1".to_string()]);
+    assert_engine_idle(&mut h.engine_in).await;
+}
+
 /// A stop string that is one token (`world` is mock token 2) also reaches
 /// the engine as a stop id, so the engine finishes on the tick the string
 /// matches. The choice must end with the engine's own `Complete`, carrying
@@ -1020,6 +1104,68 @@ async fn abort_rpc_cancels_an_in_flight_stream() {
         })
         .await
         .expect("abort of unknown ids");
+}
+
+/// A fan-out's open choices end on an `Abort` RPC with their own indexes: the
+/// terminal the servicer builds for the second choice carries index 1, as the
+/// engine's own completes do.
+#[tokio::test]
+async fn an_abort_ends_each_choice_of_a_fan_out_with_its_own_index() {
+    let mut h = harness(model_info(), None).await;
+    let mut request = generate_request("r7", true, Vec::new());
+    request.sampling_params.as_mut().unwrap().n = 2;
+    let mut stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    recv_add(&mut h.engine_in).await;
+    h.engine_out
+        .send_outputs(&batch("r7-1", vec![21], None, None))
+        .await
+        .unwrap();
+    assert_eq!(
+        chunk_tokens(stream.message().bounded().await.unwrap().unwrap()),
+        vec![21]
+    );
+
+    h.client
+        .abort(vllm::AbortRequest {
+            request_ids: vec!["r7".to_string()],
+        })
+        .await
+        .expect("abort");
+    let mut terminals = [
+        complete(stream.message().bounded().await.unwrap().unwrap()),
+        complete(stream.message().bounded().await.unwrap().unwrap()),
+    ];
+    terminals.sort_by_key(|done| done.index);
+    let seen: Vec<_> = terminals
+        .iter()
+        .map(|done| {
+            (
+                done.index,
+                done.finish_reason.clone(),
+                done.output_ids.clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        vec![
+            (0, "abort".to_string(), vec![]),
+            (1, "abort".to_string(), vec![21])
+        ]
+    );
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    let mut aborted = recv_abort(&mut h.engine_in).await;
+    while aborted.len() < 2 {
+        aborted.extend(recv_abort(&mut h.engine_in).await);
+    }
+    aborted.sort();
+    assert_eq!(aborted, vec!["r7-0".to_string(), "r7-1".to_string()]);
 }
 
 /// PD disaggregation rides through as on the Python servicer: the request's
@@ -1300,7 +1446,7 @@ async fn media_refs_are_refused_and_extra_batches_translated() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
-/// An encode-prefill-decode leg carries encoder-cache transfer parameters:
+/// An encode-prefill-decode request carries encoder-cache transfer parameters:
 /// the encoder's request (a pull connector's empty object, or a push
 /// connector's consumer destination and transfer ids), or the prefill side's
 /// with the encoder's handles. This servicer runs no encoder-cache connector
@@ -1332,7 +1478,7 @@ async fn encoder_cache_transfer_parameters_are_refused_before_the_engine() {
             "ec-prefill",
             r#"{"h1":{"peer_host":"10.0.0.1","peer_port":5600,"size_bytes":128}}"#,
         ),
-        // The encoder leg of a pull connector: an empty object, the payload
+        // The encoder's request of a pull connector: an empty object, the payload
         // the Router sends most often, is parameters all the same.
         ("ec-encode-pull", "{}"),
     ] {
@@ -1362,7 +1508,7 @@ async fn encoder_cache_transfer_parameters_are_refused_before_the_engine() {
 }
 
 /// With an encoder-cache connector in the engine, the four info fields are
-/// advertised as the launcher reports them, a leg's transfer parameters go
+/// advertised as the launcher reports them, a request's transfer parameters go
 /// to the engine as the connector's extra argument (a pull connector's empty
 /// object included, beside no KV params) and the connector's answer comes
 /// back on the `Complete`, as the Python servicer carries them.
@@ -1430,9 +1576,9 @@ async fn encoder_cache_transfer_parameters_pass_through_both_ways() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
-/// A consumer's leg (the prefill side of an encode-prefill-decode fleet)
+/// A consumer's request (the prefill side of an encode-prefill-decode fleet)
 /// brings pixel-less batches: the engine fetches their encodings by the
-/// handles in the transfer parameters, so a leg whose handles do not cover
+/// handles in the transfer parameters, so a request whose handles do not cover
 /// every item is refused before the engine, in the Python servicer's words
 /// (an empty object, a CPU handle without an address, a Mooncake transfer
 /// id short of one occurrence); one whose handles cover them goes through.
@@ -1481,7 +1627,7 @@ async fn encoder_cache_consumer_needs_a_handle_for_every_pixel_less_item() {
     assert_eq!(engine_request.request_id, "ec-c-ok");
     assert!(
         engine_request.mm_features.is_none(),
-        "a pixel-less leg carries no features"
+        "a pixel-less request carries no features"
     );
 
     // The prefill side's realistic payload, grid tensors and hashes without
@@ -1504,7 +1650,7 @@ async fn encoder_cache_consumer_needs_a_handle_for_every_pixel_less_item() {
         .client
         .generate(request)
         .await
-        .expect("a grid-only batch on an encoder-cache leg goes through")
+        .expect("a grid-only batch on an encoder-cache request goes through")
         .into_inner();
     let engine_request = recv_add(&mut h.engine_in).await;
     assert_eq!(engine_request.request_id, "ec-c-grid");
@@ -1542,7 +1688,7 @@ async fn encoder_cache_consumer_needs_a_handle_for_every_pixel_less_item() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
-/// An encoder's leg with router-preprocessed pixels: its `Complete` carries
+/// An encoder's request with router-preprocessed pixels: its `Complete` carries
 /// the media identity (the prompt's ids, the batch without its pixels) beside
 /// the connector's handles, and on a CPU connector a completion short of a
 /// handle for one of the items is refused instead of becoming a handoff.
@@ -1595,7 +1741,7 @@ async fn encoder_cache_producer_completion_carries_the_identity_and_the_cpu_hand
             .client
             .generate(request)
             .await
-            .expect("an encoder's leg is admitted")
+            .expect("an encoder's request is admitted")
             .into_inner();
         let engine_request = recv_add(&mut h.engine_in).await;
         assert_eq!(engine_request.request_id, id);
@@ -2124,11 +2270,7 @@ async fn the_relay_subscribes_to_the_publisher_at_boot_before_any_gateway() {
         .expect("subscribe")
         .into_inner();
     for expected in [0, 1] {
-        let batch = tokio::time::timeout(Duration::from_secs(5), stream.message())
-            .await
-            .expect("a batch in time")
-            .expect("stream open")
-            .expect("a batch");
+        let batch = next_batch(&mut stream).await;
         assert_eq!(batch.sequence_number, expected);
     }
     assert_eq!(relay.counts().served_from_history, 1);
@@ -2644,11 +2786,7 @@ async fn a_publisher_already_counting_when_the_servicer_starts_is_replayed_from_
         .expect("subscribe")
         .into_inner();
     for expected in 0..=3 {
-        let batch = tokio::time::timeout(Duration::from_secs(5), stream.message())
-            .await
-            .expect("a batch in time")
-            .expect("stream open")
-            .expect("a batch");
+        let batch = next_batch(&mut stream).await;
         assert_eq!(batch.sequence_number, expected);
     }
     assert_eq!(relay.counts().served_from_history, 1);
@@ -2890,8 +3028,6 @@ async fn loads_only_streams_each_ranks_record_without_a_relay() {
 /// rank past the connected ones.
 #[tokio::test]
 async fn the_relays_rank_record_is_the_get_loads_entry_of_the_rank() {
-    use crate::kv_events::RankLoads;
-
     let (mut h, _rank1_in, mut rank1_out) = two_rank_harness(model_info()).await;
     rank1_out
         .send_outputs(&EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
@@ -3019,11 +3155,7 @@ async fn subscribe_kv_events_relays_a_publisher_or_is_unimplemented() {
         .await
         .expect("publish");
     let second = loop {
-        let batch = tokio::time::timeout(Duration::from_secs(5), stream.message())
-            .await
-            .expect("a batch in time")
-            .expect("stream open")
-            .expect("a batch");
+        let batch = next_batch(&mut stream).await;
         if batch.sequence_number != 0 {
             break batch;
         }
@@ -4454,6 +4586,61 @@ async fn an_engine_that_never_dials_in_fails_the_link_at_the_startup_bound() {
     assert_handshake_released(&handshake).await;
 }
 
+/// A stop while the link is still waiting for its engine releases the
+/// handshake endpoint too: the connect that was waiting ends with the server,
+/// and its endpoint file does not outlive `stop`.
+#[tokio::test]
+async fn a_stop_during_the_handshake_wait_releases_the_handshake_endpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address(dir.path());
+    let config = config(dir.path(), &handshake, model_info());
+    let server = VllmServicerServer::start(config).unwrap();
+    let endpoint = handshake.trim_start_matches("ipc://").to_string();
+    wait_until(|| fs::metadata(&endpoint).is_ok()).await;
+    assert!(
+        server.last_error().unwrap().is_none(),
+        "the link is still waiting for the engine"
+    );
+
+    server.stop(Duration::from_secs(5)).unwrap();
+    assert!(
+        fs::metadata(&endpoint).is_err(),
+        "the handshake endpoint file outlived stop"
+    );
+    assert_handshake_released(&handshake).await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_leftover_handshake_endpoint_does_not_fail_the_link() {
+    use std::os::unix::net::{UnixListener, UnixStream};
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address(dir.path());
+    let endpoint = handshake.trim_start_matches("ipc://").to_string();
+    // A bound-then-dropped listener leaves its socket file behind, as a
+    // process that died without cleanup does.
+    drop(UnixListener::bind(&endpoint).unwrap());
+    let config = config(dir.path(), &handshake, model_info());
+    let server = VllmServicerServer::start(config).unwrap();
+
+    // Only the link's own bind answers a connect: the leftover refuses it.
+    wait_until(|| {
+        assert_eq!(
+            server.last_error().unwrap(),
+            None,
+            "the link failed on the leftover"
+        );
+        UnixStream::connect(&endpoint).is_ok()
+    })
+    .await;
+
+    server.stop(Duration::from_secs(5)).unwrap();
+    assert!(
+        fs::metadata(&endpoint).is_err(),
+        "the handshake endpoint file outlived stop"
+    );
+}
+
 /// Between HELLO and READY a real engine loads its model, and nothing crosses
 /// the wire meanwhile. The lifecycle owner's reports that the engine process
 /// is alive keep the link waiting well past the silence bound, and the start
@@ -4465,17 +4652,17 @@ async fn a_slow_engine_stays_linked_while_the_launcher_reports_it_alive() {
     let silence = Duration::from_millis(300);
     let mut config = config(dir.path(), &handshake, model_info());
     config.servicer.engine_startup_timeout = silence;
-    let server = VllmServicerServer::start(config).unwrap();
+    let server = Arc::new(VllmServicerServer::start(config).unwrap());
+    // The launcher reports through the whole start, as it polls the process
+    // it launched: the silence bound then meets the engine's quiet load
+    // alone, not the time this host takes over the dial-in or over READY.
+    let _alive = reported_alive(server.clone(), VllmServicerServer::note_engine_alive);
     // The engine dials in at once, then "loads" for four silences.
     let loading = hello(&handshake, EngineId::from_engine_index(0))
         .bounded()
         .await
         .expect("HELLO answered with INIT");
-    let load_time = Instant::now() + 4 * silence;
-    while Instant::now() < load_time {
-        server.note_engine_alive();
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    tokio::time::sleep(4 * silence).await;
     assert_eq!(
         server.last_error().unwrap(),
         None,
@@ -4503,13 +4690,18 @@ async fn an_engine_that_falls_silent_after_hello_fails_the_link_at_the_bound() {
     let silence = Duration::from_millis(300);
     let mut config = config(dir.path(), &handshake, model_info());
     config.servicer.engine_startup_timeout = silence;
-    let server = VllmServicerServer::start(config).unwrap();
+    let server = Arc::new(VllmServicerServer::start(config).unwrap());
+    // Reported alive until HELLO is answered: the silence under test starts
+    // there, whatever time this host takes over the dial-in, and counts
+    // from a sign of life no earlier than `before_hello`.
+    let alive = reported_alive(server.clone(), VllmServicerServer::note_engine_alive);
+    let before_hello = Instant::now();
     let _loading = hello(&handshake, EngineId::from_engine_index(0))
         .bounded()
         .await
         .expect("HELLO answered with INIT");
-    let since_hello = Instant::now();
-    let deadline = since_hello + Duration::from_secs(10);
+    drop(alive);
+    let deadline = Instant::now() + Duration::from_secs(10);
     let error = loop {
         if let Some(error) = server.last_error().unwrap() {
             break error;
@@ -4517,7 +4709,7 @@ async fn an_engine_that_falls_silent_after_hello_fails_the_link_at_the_bound() {
         assert!(Instant::now() < deadline, "no link failure reported");
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
-    assert!(since_hello.elapsed() >= silence);
+    assert!(before_hello.elapsed() >= silence);
     assert!(
         error.contains("timed out while waiting for READY"),
         "{error}"
@@ -4537,15 +4729,14 @@ async fn the_startup_ceiling_bounds_a_start_the_launcher_keeps_reporting_alive()
     let mut config = config(dir.path(), &handshake, model_info());
     config.servicer.engine_startup_timeout = silence;
     config.servicer.engine_startup_ceiling = Some(ceiling);
-    let server = VllmServicerServer::start(config).unwrap();
+    // Read before the start, which the ceiling counts from.
     let started = Instant::now();
-    let _loading = hello(&handshake, EngineId::from_engine_index(0))
-        .bounded()
-        .await
-        .expect("HELLO answered with INIT");
+    let server = Arc::new(VllmServicerServer::start(config).unwrap());
+    // The engine does not dial in: a dial-in would race the ceiling at this
+    // host's pace, and the ceiling bounds every wait of the handshake alike.
+    let _alive = reported_alive(server.clone(), VllmServicerServer::note_engine_alive);
     let deadline = started + Duration::from_secs(10);
     let error = loop {
-        server.note_engine_alive();
         if let Some(error) = server.last_error().unwrap() {
             break error;
         }
@@ -4766,7 +4957,7 @@ async fn a_shutdown_after_the_engines_completion_ends_the_stream_cleanly() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
-/// Expanded media must be refused before normal engine admission; a PD leg
+/// Expanded media must be refused before normal engine admission; a PD request
 /// still releases its remote prefill through the abort-only notice.
 #[tokio::test]
 async fn expanded_context_rejection_preserves_pd_cleanup() {
@@ -5078,28 +5269,7 @@ async fn metrics_harness_with(
     let mut config = config(dir.path(), &handshake, model);
     config.servicer.metrics_bind_address = Some("127.0.0.1:0".to_string());
     config.media_processor = media_processor;
-    let server = match tokenizer {
-        Some(tokenizer) => VllmServicerServer::start_with_tokenizer(config, tokenizer),
-        None => VllmServicerServer::start(config),
-    }
-    .expect("servicer starts");
-    let engine = connect_to_frontend(
-        &handshake,
-        EngineId::from_engine_index(0),
-        default_ready_response(),
-    )
-    .await
-    .expect("mock engine handshake");
-    wait_until(|| server.engine_ready()).await;
-    let client = VllmEngineClient::new(grpc_channel(server.address()).await);
-    let (engine_in, engine_out) = engine.split();
-    Harness {
-        server,
-        engine_in,
-        engine_out,
-        client,
-        _dir: dir,
-    }
+    started(dir, handshake, config, tokenizer).await
 }
 
 /// One scrape of the servicer's metrics listener.
@@ -5265,7 +5435,7 @@ smg_servicer_metrics_scrape_seconds{model="served",wire="vllm"} <v>
 smg_servicer_metrics_scrapes_total{model="served",wire="vllm",code="200"} 0
 smg_servicer_metrics_scrapes_total{model="served",wire="vllm",code="500"} 0
 smg_servicer_prompt_tokens_cached_total{model="served",wire="vllm",rank="0"} 1
-smg_servicer_prompt_tokens_total{model="served",wire="vllm",rank="0"} 6
+smg_servicer_prompt_tokens_total{model="served",wire="vllm",rank="0"} 15
 smg_servicer_request_errors_total{model="served",wire="vllm",code="unavailable"} 1
 smg_servicer_request_generation_tokens_count{model="served",wire="vllm",rank="0"} 5
 smg_servicer_request_generation_tokens_sum{model="served",wire="vllm",rank="0"} 8
@@ -5324,7 +5494,9 @@ smg_servicer_media_requests_total{model="served",wire="vllm",outcome="unavailabl
 /// One streamed request (three chunks, the engine's stop), one non-streamed
 /// (the budget), one the caller aborts, one duplicate id refused, one a
 /// shutdown cuts: the scrape's families, types, label sets and values are
-/// exactly these.
+/// exactly these. Every request that produced an output counts a prompt:
+/// the engine's figure where its output reported one, the request's own
+/// three ids otherwise.
 #[tokio::test]
 async fn the_scrape_pins_the_families_after_a_scripted_sequence() {
     let mut h = metrics_harness(model_info(), None).await;

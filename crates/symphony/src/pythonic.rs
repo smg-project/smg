@@ -1002,7 +1002,7 @@ mod tests {
     use super::*;
     use crate::{
         json::PartialJson,
-        testing::{arguments, bytes, content, tool},
+        testing::{arguments, bytes, content, indexed_calls as calls, malformed_texts, tool},
     };
 
     fn ids() -> CallIds {
@@ -1352,39 +1352,9 @@ mod tests {
         out.drain()
     }
 
-    fn calls(events: &[Event]) -> Vec<(u32, String, String)> {
-        let mut calls: Vec<(u32, String, String)> = Vec::new();
-        for event in events {
-            match event {
-                Event::ToolCallStart { index, name, .. } => {
-                    calls.push((*index, name.clone(), String::new()));
-                }
-                Event::ToolCallArguments { json, .. } => {
-                    if let Some(last) = calls.last_mut() {
-                        last.2.push_str(json);
-                    }
-                }
-                _ => {}
-            }
-        }
-        calls
-    }
-
-    /// The text of every `Malformed` event, one entry per event, whatever its reason: an event of
-    /// no bytes counts here, where the joined text of [`malformed`] does not show it.
-    fn words<'a>(events: &'a [Event<'_>]) -> Vec<&'a str> {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Malformed { text, .. } => Some(&*text.text),
-                _ => None,
-            })
-            .collect()
-    }
-
     /// The malformed text, whole: the events that carry it depend on the cuts, the text does not.
     fn malformed(events: &[Event]) -> String {
-        words(events).concat()
+        malformed_texts(events).concat()
     }
 
     /// What a chat client reads as content once a call started: the text of every `Content` and
@@ -1757,7 +1727,7 @@ mod tests {
                     shown_after_the_start(&events).is_empty(),
                     "{place}: nothing of the call is content: {events:?}"
                 );
-                assert_eq!(words(&events), [""], "{place}: {events:?}");
+                assert_eq!(malformed_texts(&events), [""], "{place}: {events:?}");
                 assert!(
                     matches!(
                         &events[events.len() - 2..],
@@ -1797,7 +1767,7 @@ mod tests {
             ]
         );
         assert!(shown_after_the_start(&events).is_empty(), "{events:?}");
-        assert_eq!(words(&events), [""]);
+        assert_eq!(malformed_texts(&events), [""]);
     }
 
     #[test]
@@ -2105,7 +2075,7 @@ mod tests {
             calls(&events),
             [(0, "get_weather".to_string(), r#"{"city": "Par"#.to_string())]
         );
-        assert_eq!(words(&events), [""]);
+        assert_eq!(malformed_texts(&events), [""]);
         assert!(events.iter().any(|event| matches!(
             event,
             Event::Malformed { text, why: MalformedReason::UnterminatedRegion }
@@ -2133,7 +2103,7 @@ mod tests {
         );
         assert_eq!(malformed(&whole), prose);
         assert_eq!(
-            words(&whole),
+            malformed_texts(&whole),
             [" would", " give", " you", " the", " answer."]
         );
         assert_eq!(dropped(&whole), ["[", "]"]);
@@ -2162,7 +2132,10 @@ mod tests {
         let text = "[get_weather(city=\"Paris\")]\n\nDone, see above.\n";
         let whole = run_bare(&tools(), &[text]);
         assert_eq!(malformed(&whole), "\n\nDone, see above.\n");
-        assert_eq!(words(&whole), ["\n\nDone,", " see", " above.", "\n"]);
+        assert_eq!(
+            malformed_texts(&whole),
+            ["\n\nDone,", " see", " above.", "\n"]
+        );
         let events = run_bare(
             &tools(),
             &[
@@ -2172,7 +2145,10 @@ mod tests {
             ],
         );
         assert_eq!(malformed(&events), malformed(&whole));
-        assert_eq!(words(&events), ["\n\nDo", "ne,", " see", " above.", "\n"]);
+        assert_eq!(
+            malformed_texts(&events),
+            ["\n\nDo", "ne,", " see", " above.", "\n"]
+        );
         assert_eq!(dropped(&events), ["[", "]"]);
     }
 
@@ -2386,12 +2362,12 @@ mod tests {
                             );
                         }
                         (Found::Whole, _) => {
-                            assert!(words(&events).is_empty(), "{place}: no word");
+                            assert!(malformed_texts(&events).is_empty(), "{place}: no word");
                         }
                         // The wrapping after a whole call is the template's at the close and a
                         // cut region's bytes at the stream's end.
                         (Found::Wrapping, Ending::Close) => {
-                            assert!(words(&events).is_empty(), "{place}: no word");
+                            assert!(malformed_texts(&events).is_empty(), "{place}: no word");
                             assert!(dropped(&events).contains(held), "{place}: wrapping dropped");
                         }
                         (Found::Wrapping, Ending::Stream) => {
@@ -2400,7 +2376,7 @@ mod tests {
                         // A name that never got its `(` is no call either way, and the close
                         // names its reason.
                         (Found::Name, Ending::Close) => {
-                            assert_eq!(words(&events), [*held], "{place}: the name");
+                            assert_eq!(malformed_texts(&events), [*held], "{place}: the name");
                             assert!(said(&events).is_empty(), "{place}: the close's own reason");
                         }
                         (Found::Name, Ending::Stream) => {

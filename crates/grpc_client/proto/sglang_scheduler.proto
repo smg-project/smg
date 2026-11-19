@@ -153,7 +153,7 @@ message GenerateRequest {
   // Input embeddings (alternative to text/tokens)
   repeated float input_embeds = 14;
 
-  // LoRA adapter ID (if pre-loaded)
+  // Preloaded LoRA adapter ID or name (resolved to an ID by the worker).
   string lora_id = 15;
 
   // Data parallel routing: the rank the request is pinned to, when it is
@@ -177,6 +177,8 @@ message GenerateRequest {
   repeated MultimodalInputs extra_mm_inputs = 21;
 }
 
+// The gateway codec writes this message by hand around its field numbers and
+// GenerateRequest.tokenized = 2: change them together with crates/grpc_client/src/codec.rs.
 message TokenizedInput {
   string original_text = 1;  // For reference
   repeated uint32 input_ids = 2;

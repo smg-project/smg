@@ -103,8 +103,8 @@ def test_request_tracing_initializes_as_sglangs_own_frontend_does():
 def test_the_abort_paths_end_the_requests_root_span_under_the_switch():
     tree = ast.parse(SOURCE.read_text())
     manager = _class(tree, "GrpcRequestManager")
-    for name in ("abort_request", "_handle_abort_req"):
-        assert _guarded_by_enable_trace(_function(manager, name), "set_finished_time"), name
+    assert "_handle_abort_req" in _calls(_function(manager, "abort_request"))
+    assert _guarded_by_enable_trace(_function(manager, "_handle_abort_req"), "set_finished_time")
 
 
 def test_request_tracing_survives_an_sglang_without_it_or_a_failing_setup():

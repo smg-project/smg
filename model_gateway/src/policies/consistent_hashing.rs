@@ -11,12 +11,14 @@
 //!
 //! ## Consistent Hashing
 //!
-//! Uses a pre-computed hash ring from WorkerRegistry where:
+//! Uses the hash ring of the membership generation, which placement hands
+//! with the request, where:
 //! 1. Each worker is placed at a fixed position based on hash(worker_url)
 //! 2. Keys are hashed to the ring, then walk clockwise to find first healthy worker
 //! 3. When workers scale up/down, only keys in the affected range redistribute (~1/N keys move)
 //!
-//! The ring is built once when workers are added/removed, not per-request.
+//! The ring is filled once for a generation, not per request, and off the
+//! request path where the gateway's warm task reaches the generation first.
 //! This ensures O(log n) lookup performance.
 //!
 //! Complexity per request: O(log n) binary search + O(k) walk where k =
@@ -31,6 +33,7 @@ use rand::RngExt as _;
 use super::{LoadBalancingPolicy, SelectWorkerInfo};
 use crate::{
     observability::metrics::Metrics,
+    policies::hash_ring::HashRing,
     routers::common::header_utils::{extract_routing_key_hint, extract_target_worker},
     worker::Worker,
 };
@@ -121,18 +124,9 @@ impl ConsistentHashingPolicy {
             return None;
         }
 
-        // Use blake3 for consistent hashing in fallback too
-        let hash = blake3::hash(key.as_bytes());
-        #[expect(
-            clippy::expect_used,
-            reason = "blake3 hash is always 32 bytes; slicing first 8 is infallible"
-        )]
-        let hash_val = u64::from_le_bytes(
-            hash.as_bytes()[..8]
-                .try_into()
-                .expect("blake3 hash is always 32 bytes, slicing first 8 is infallible"),
-        );
-        let idx = (hash_val as usize) % healthy_indices.len();
+        // The ring's position hash, so the fallback spells a key's position
+        // as the ring does.
+        let idx = (HashRing::hash_position(key) as usize) % healthy_indices.len();
         Some(healthy_indices[idx])
     }
 
@@ -251,23 +245,12 @@ mod tests {
     use openai_protocol::worker::WorkerStatus;
 
     use super::*;
-    use crate::{
-        policies::test_support::{headers_with_routing_key, make_workers},
-        worker::HashRing,
-    };
+    use crate::policies::test_support::{headers_with_routing_key, make_workers, with_headers};
 
     fn headers_with_target_worker(idx: usize) -> http::HeaderMap {
         let mut headers = http::HeaderMap::new();
         headers.insert("x-smg-target-worker", idx.to_string().parse().unwrap());
         headers
-    }
-
-    /// The selection info of a request carrying `headers` and nothing else.
-    fn with_headers(headers: &http::HeaderMap) -> SelectWorkerInfo<'_> {
-        SelectWorkerInfo {
-            headers: Some(headers),
-            ..Default::default()
-        }
     }
 
     /// The selection info of a request carrying `headers`, routed over `ring`.
@@ -279,6 +262,34 @@ mod tests {
             hash_ring: Some(Arc::clone(ring)),
             ..with_headers(headers)
         }
+    }
+
+    /// The policy over four workers and their hash ring, the bed of the routing-key-hint tests.
+    fn ring_of_four() -> (ConsistentHashingPolicy, Vec<Arc<dyn Worker>>, Arc<HashRing>) {
+        let policy = ConsistentHashingPolicy::new();
+        let workers = make_workers(&[
+            "http://w1:8000",
+            "http://w2:8000",
+            "http://w3:8000",
+            "http://w4:8000",
+        ]);
+        let ring = Arc::new(HashRing::new(workers.iter().map(|w| w.url())));
+        (policy, workers, ring)
+    }
+
+    /// The worker `key` lands on as the request's routing-key hint, with no other key present.
+    fn placed_by_hint(
+        policy: &ConsistentHashingPolicy,
+        workers: &[Arc<dyn Worker>],
+        ring: &Arc<HashRing>,
+        key: &str,
+    ) -> usize {
+        let info = SelectWorkerInfo {
+            routing_key: Some(key),
+            hash_ring: Some(Arc::clone(ring)),
+            ..Default::default()
+        };
+        policy.select_worker_impl(workers, &info).0.unwrap()
     }
 
     /// Every consistent-hashing entry point gathers on
@@ -693,23 +704,8 @@ mod tests {
 
     #[test]
     fn test_routing_key_hint_wins_over_raw_header() {
-        let policy = ConsistentHashingPolicy::new();
-        let workers = make_workers(&[
-            "http://w1:8000",
-            "http://w2:8000",
-            "http://w3:8000",
-            "http://w4:8000",
-        ]);
-        let ring = Arc::new(HashRing::new(workers.iter().map(|w| w.url())));
-
-        let select_by_key = |key: &str| {
-            let info = SelectWorkerInfo {
-                routing_key: Some(key),
-                hash_ring: Some(ring.clone()),
-                ..Default::default()
-            };
-            policy.select_worker_impl(&workers, &info).0.unwrap()
-        };
+        let (policy, workers, ring) = ring_of_four();
+        let select_by_key = |key: &str| placed_by_hint(&policy, &workers, &ring, key);
 
         // Find two keys that land on different workers.
         let base_idx = select_by_key("key-0");
@@ -732,23 +728,8 @@ mod tests {
 
     #[test]
     fn test_routing_key_hint_outranks_rid_key() {
-        let policy = ConsistentHashingPolicy::new();
-        let workers = make_workers(&[
-            "http://w1:8000",
-            "http://w2:8000",
-            "http://w3:8000",
-            "http://w4:8000",
-        ]);
-        let ring = Arc::new(HashRing::new(workers.iter().map(|w| w.url())));
-
-        let select_by_key = |key: &str| {
-            let info = SelectWorkerInfo {
-                routing_key: Some(key),
-                hash_ring: Some(ring.clone()),
-                ..Default::default()
-            };
-            policy.select_worker_impl(&workers, &info).0.unwrap()
-        };
+        let (policy, workers, ring) = ring_of_four();
+        let select_by_key = |key: &str| placed_by_hint(&policy, &workers, &ring, key);
 
         // Find a header key that lands on a different worker than the rid.
         let rid_idx = select_by_key("conv");

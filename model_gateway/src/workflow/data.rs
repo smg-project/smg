@@ -41,8 +41,16 @@ use super::{
 };
 use crate::{
     app_context::AppContext,
-    worker::{registry::WorkerId, Worker},
+    worker::{registry::WorkerId, ConnectionMode, Worker},
 };
+
+/// The application context a workflow's data was given, or the workflow's
+/// error for a run that was started without one.
+pub(crate) fn require_app_context(
+    app_context: Option<&Arc<AppContext>>,
+) -> WorkflowResult<&Arc<AppContext>> {
+    app_context.ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))
+}
 
 // ============================================================================
 // Shared trait for worker registration workflows
@@ -140,7 +148,7 @@ pub struct WorkerWorkflowData {
     /// Determined by ClassifyWorkerTypeStep (Local or External).
     pub worker_kind: Option<WorkerKind>,
     // -- Local-only fields --
-    pub connection_mode: Option<crate::worker::ConnectionMode>,
+    pub connection_mode: Option<ConnectionMode>,
     /// HTTP workers: whether the router speaks HTTP/2 prior knowledge,
     /// resolved by DetectConnectionModeStep.
     #[serde(default)]
@@ -184,10 +192,7 @@ impl WorkerWorkflowData {
         if let Some(client) = &self.http_client_handle {
             return Ok(Arc::clone(client));
         }
-        let app_context = self
-            .app_context
-            .as_ref()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
+        let app_context = require_app_context(self.app_context.as_ref())?;
         app_context
             .worker_client_cache
             .get(&self.config.http_pool, self.http2.unwrap_or(false))
@@ -255,6 +260,28 @@ pub struct WorkerRemovalWorkflowData {
     /// Actual worker objects to remove (transient, not serialized)
     #[serde(skip, default)]
     pub actual_workers_to_remove: Option<Vec<Arc<dyn Worker>>>,
+    /// The workers the registry step removed at those URLs, a same-URL
+    /// replacement that landed during the drain rather than the worker found
+    /// (transient, not serialized)
+    #[serde(skip, default)]
+    pub removed_workers: Vec<Arc<dyn Worker>>,
+}
+
+impl WorkerRemovalWorkflowData {
+    /// Narrows the job to `kept`, the workers it still holds: the selection's
+    /// result, or what a step left after it found some of them standing on
+    /// their own (a pin that moved, a registration under the URL since the
+    /// selection). The worker list, the URLs and the affected models move
+    /// together, so the steps after it touch nothing of the others.
+    pub fn keep_only(&mut self, kept: Vec<Arc<dyn Worker>>) {
+        self.worker_urls = kept.iter().map(|worker| worker.url().to_string()).collect();
+        self.affected_models = kept
+            .iter()
+            .map(|worker| worker.model_id().to_string())
+            .collect();
+        self.workers_to_remove = Some(WorkerList::from_workers(&kept));
+        self.actual_workers_to_remove = Some(kept);
+    }
 }
 
 impl WorkflowData for WorkerRemovalWorkflowData {

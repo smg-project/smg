@@ -6,7 +6,7 @@ use std::sync::Arc;
 use openai_protocol::chat::ChatCompletionRequest;
 
 use super::*;
-use crate::tenant::TenantKey;
+use crate::{routers::error::extract_error_code_from_response, tenant::TenantKey};
 
 fn chat_request_type(rid: Option<&str>) -> RequestType {
     RequestType::Chat(Arc::new(ChatCompletionRequest {
@@ -110,6 +110,82 @@ fn middleware_id_is_base_with_per_execution_suffix() {
     let second = plan.request_id().to_string();
     assert!(second.starts_with("chatcmpl-mw-"));
     assert_ne!(first, second);
+}
+
+/// A suffixed stamp keeps the base's length, not its text: each attempt
+/// reads the base from the id the attempt before it left on the plan,
+/// whatever bytes the base holds.
+#[test]
+fn a_suffixed_stamp_reads_its_base_from_each_attempts_id() {
+    let request_type = chat_request_type(Some("rid-é"));
+    let (first, stamp) = resolve_request_id_stamp(&request_type, None, "chatcmpl-", true);
+
+    let mut plan = single_plan(&first);
+    let mut seen = vec![first];
+    for _ in 0..3 {
+        stamp.restamp(&mut plan).unwrap();
+        let id = plan.request_id().to_string();
+        let suffix = id.strip_prefix("rid-é-").expect("the base and a suffix");
+        uuid::Uuid::parse_str(suffix).expect("a uuid suffix");
+        assert!(!seen.contains(&id), "each attempt gets a fresh engine id");
+        seen.push(id);
+    }
+}
+
+/// A suffixed stamp over a plan whose id is not its base and one uuid is a
+/// build-stage wiring bug: an error that leaves the plan's id alone, not an
+/// id minted from other text.
+#[test]
+fn a_suffixed_stamp_over_another_id_is_an_error() {
+    let request_type = chat_request_type(None);
+    let meta = meta_with_request_id("chatcmpl-mw");
+    let (id, stamp) = resolve_request_id_stamp(&request_type, Some(&meta), "chatcmpl-", false);
+    let uuid = id
+        .strip_prefix("chatcmpl-mw-")
+        .expect("the base and a suffix");
+
+    let prefixed = format!("x{id}");
+    let other_separator = format!("chatcmpl-mw+{uuid}");
+    // The base's length falls inside this id's two-byte letter.
+    let split_letter = format!("chatcmpl-mé{uuid}");
+    // A tail of a uuid's length that is not a uuid.
+    let not_a_uuid = format!("chatcmpl-mw-{}", "x".repeat(uuid.len()));
+    for other in [
+        "",
+        "chatcmpl-mw",
+        prefixed.as_str(),
+        other_separator.as_str(),
+        split_letter.as_str(),
+        not_a_uuid.as_str(),
+    ] {
+        let mut plan = single_plan(other);
+        let response = stamp
+            .restamp(&mut plan)
+            .expect_err("an id of another shape must fail");
+        assert_eq!(
+            extract_error_code_from_response(&response),
+            "id_stamp_plan_mismatch"
+        );
+        assert_eq!(plan.request_id(), other, "the plan's id stays as it was");
+    }
+}
+
+/// An engine id is written once, into a buffer of its exact size: the text
+/// reads `{base}-{uuid}` or `{prefix}{uuid}` as before, with no growth on
+/// the way.
+#[test]
+fn an_engine_id_is_written_once_at_its_exact_size() {
+    let uuid = uuid::Uuid::now_v7();
+    let suffixed = suffixed_id("chatcmpl-mw", uuid);
+    assert_eq!(suffixed, format!("chatcmpl-mw-{uuid}"));
+    assert_eq!(
+        suffixed.capacity(),
+        suffixed.len(),
+        "one buffer of the id's size, no growth"
+    );
+    let minted = minted_id("chatcmpl-", uuid);
+    assert_eq!(minted, format!("chatcmpl-{uuid}"));
+    assert_eq!(minted.capacity(), minted.len());
 }
 
 /// The suffix a request's engine id gets is stamped at the request's own

@@ -1,24 +1,27 @@
 use std::{
     cell::RefCell,
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     sync::{Arc, Mutex, RwLock},
     time::Instant,
 };
 
 use openai_protocol::worker::WorkerLoadResponse;
-use rand::{rngs::StdRng, RngExt, SeedableRng};
+#[cfg(test)]
+use rand::SeedableRng;
+use rand::{rngs::StdRng, RngExt};
+use rustc_hash::FxHashMap;
 use tracing::debug;
 
 use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
 // Retain the public paths used by existing callers and configuration defaults.
-pub use crate::worker::expected_wait::{
+pub use crate::policies::expected_wait::{
     DEFAULT_KV_PRESSURE_WEIGHT, DEFAULT_MEAN_PREFILL_TOKENS, DEFAULT_THROUGHPUT,
 };
 use crate::{
     observability::cache_trace,
+    policies::expected_wait::ExpectedWait,
     worker::{
-        expected_wait::ExpectedWait,
-        load_state::{LoadReceiver, LoadSnapshot},
+        load::state::{LoadReceiver, LoadSnapshot},
         Worker, WorkerType,
     },
 };
@@ -237,8 +240,10 @@ pub struct LeastLoadPolicy {
     /// other threads read meanwhile. Token-work feeds the score's in-flight
     /// term; the request count its floor on the router's own in-flight
     /// count. The picks whose request has not ended feed the in-flight count
-    /// of a worker without a report.
-    tally: RwLock<HashMap<String, SincePollDispatch>>,
+    /// of a worker without a report. The key is the gateway's own string (a
+    /// registered worker's URL), never request input, so the map hashes with
+    /// FxHash.
+    tally: RwLock<FxHashMap<String, SincePollDispatch>>,
     /// KV-pressure weight `λ_t` (seconds).
     kv_pressure_weight: f64,
     /// Mean prefill length (tokens) for estimating in-flight token-work when a
@@ -271,14 +276,16 @@ struct Candidate {
     idx: usize,
     /// `None` without a fresh report: the feed is not wired, or it holds
     /// none for this worker (a report the monitor pruned after a failed
-    /// fetch or a replacement is gone from the snapshot too).
+    /// fetch or a replacement is gone from the snapshot too), or the one it
+    /// holds has no reading (`LeastLoadPolicy::report_facts`).
     report: Option<ReportFacts>,
     /// Token-work and requests dispatched since the report's sample.
     since_poll_tokens: u64,
     since_poll_requests: u64,
     /// The report's sample instant, and whether the tally still holds
     /// dispatches made at or before it for the decision's write phase to
-    /// release (a read under the held guard released them as it read).
+    /// release (a read under the held guard released them as it read). A
+    /// report without a reading keeps its instant.
     sampled_at: Option<Instant>,
     release: bool,
     /// This policy's picks there whose request has not ended (see
@@ -292,7 +299,7 @@ struct Candidate {
 /// tally for the decision's write phase to release
 /// ([`SincePollDispatch::credit_after`]). The worker's picks come with it.
 fn credit_read(
-    tally: &HashMap<String, SincePollDispatch>,
+    tally: &FxHashMap<String, SincePollDispatch>,
     url: &str,
     sampled_at: Option<Instant>,
 ) -> (u64, u64, bool, u64) {
@@ -307,7 +314,7 @@ fn credit_read(
 /// read ([`SincePollDispatch::release_through`]), one lookup per candidate,
 /// and nothing is left for the write phase. The worker's picks come with it.
 fn credit_released(
-    tally: &mut HashMap<String, SincePollDispatch>,
+    tally: &mut FxHashMap<String, SincePollDispatch>,
     url: &str,
     sampled_at: Option<Instant>,
 ) -> (u64, u64, bool, u64) {
@@ -399,14 +406,6 @@ impl LeastLoadPolicy {
         )
     }
 
-    pub fn with_kv_pressure_weight(kv_pressure_weight: f64) -> Self {
-        Self::with_params(
-            kv_pressure_weight,
-            DEFAULT_MEAN_PREFILL_TOKENS,
-            DEFAULT_THROUGHPUT,
-        )
-    }
-
     pub fn with_params(
         kv_pressure_weight: f64,
         mean_prefill_tokens: u32,
@@ -414,7 +413,7 @@ impl LeastLoadPolicy {
     ) -> Self {
         Self {
             loads: RwLock::new(None),
-            tally: RwLock::new(HashMap::new()),
+            tally: RwLock::new(FxHashMap::default()),
             kv_pressure_weight: if kv_pressure_weight.is_finite() && kv_pressure_weight >= 0.0 {
                 kv_pressure_weight
             } else {
@@ -430,8 +429,10 @@ impl LeastLoadPolicy {
         }
     }
 
-    /// Draw ties from a seeded generator instead of the thread's.
-    pub fn with_tie_break_seed(mut self, seed: u64) -> Self {
+    /// Draw ties from a seeded generator instead of the thread's: the tests'
+    /// determinism. Production draws from the thread's generator.
+    #[cfg(test)]
+    pub(crate) fn with_tie_break_seed(mut self, seed: u64) -> Self {
         self.tie_rng = Some(Mutex::new(StdRng::seed_from_u64(seed)));
         self
     }
@@ -482,13 +483,16 @@ impl LeastLoadPolicy {
     /// release, picked)` for the worker's url and its report's sample instant: the
     /// dispatches made at or before the sample are the engine's by now and
     /// leave the credit, the later ones stay. The two guard shapes answer it
-    /// differently ([`credit_read`], [`credit_released`]).
+    /// differently ([`credit_read`], [`credit_released`]). `pressure_scored`
+    /// says whether the decision's score reads a report's KV pressure
+    /// ([`Self::report_facts`]).
     fn resolve(
         &self,
         idx: usize,
         worker: &Arc<dyn Worker>,
         snapshot: Option<&LoadSnapshot>,
         read_credit: &mut impl FnMut(&str, Option<Instant>) -> (u64, u64, bool, u64),
+        pressure_scored: bool,
     ) -> Candidate {
         let url = worker.url();
         let report = snapshot.and_then(|snapshot| snapshot.report(url));
@@ -497,7 +501,10 @@ impl LeastLoadPolicy {
             read_credit(url, sampled_at);
         Candidate {
             idx,
-            report: report.map(|(load, _)| self.report_facts(worker, load)),
+            // A report without a reading gives no facts and keeps its sample
+            // instant: the dispatches made at or before it are the engine's
+            // by then, whatever the report says of its pressure.
+            report: report.and_then(|(load, _)| self.report_facts(worker, load, pressure_scored)),
             since_poll_tokens,
             since_poll_requests,
             sampled_at,
@@ -506,9 +513,38 @@ impl LeastLoadPolicy {
         }
     }
 
-    /// What the score reads of `worker`'s report.
-    fn report_facts(&self, worker: &Arc<dyn Worker>, load: &WorkerLoadResponse) -> ReportFacts {
-        ReportFacts {
+    /// What the score reads of `worker`'s report. `None` when the score reads
+    /// the KV pressure (`pressure_scored`) and the report's is NaN: the
+    /// report has no reading, and its worker is scored as one without a
+    /// report. Scored, such a worker's wait is NaN too, no comparison holds
+    /// against it, and the argmin keeps it or skips it by its position alone.
+    ///
+    /// Nothing else is dropped. An infinite pressure is a number: the wait
+    /// clamps it into its range, a full cache or an empty one, as it does
+    /// any ratio outside it. The resident-work score does not read the
+    /// pressure, so under it every report keeps its facts.
+    ///
+    /// The pressure is the one ratio the score reads: a rank's active usage,
+    /// or its usage where the rank states none. Beside a stated active usage
+    /// a usage that is NaN is no input of the score, and the report reads
+    /// on: the resident usage mean is a fact of the trace record alone.
+    ///
+    /// The test reads a figure the facts already hold, so a decision pays one
+    /// comparison a candidate for it and the credit read does not wait on the
+    /// report.
+    ///
+    /// Inlined into `Self::resolve` explicitly: left to the inliner it stays
+    /// a call, and the facts it returns are copied into the candidate by
+    /// loads wider than the stores that just wrote them, which wait for
+    /// those stores to retire (measured on the selection bench).
+    #[inline(always)]
+    fn report_facts(
+        &self,
+        worker: &Arc<dyn Worker>,
+        load: &WorkerLoadResponse,
+        pressure_scored: bool,
+    ) -> Option<ReportFacts> {
+        let facts = ReportFacts {
             queued_tokens: self.queued_tokens(load),
             running_estimated_tokens: self.running_estimated_tokens(load),
             reported_requests: u64::try_from(load.total_running_reqs() + load.total_waiting_reqs())
@@ -519,11 +555,12 @@ impl LeastLoadPolicy {
                 .total_resident_tokens()
                 .map(|tokens| tokens.max(0) as f64),
             live_rate: Self::live_drain_rate(worker, load),
-        }
+        };
+        (!(pressure_scored && facts.kv_pressure.is_nan())).then_some(facts)
     }
 
-    /// Test-only: the candidates of a decision over `indices`, as the scorer
-    /// resolves them against the feed's current snapshot.
+    /// Test-only: the candidates of an expected-wait decision over `indices`,
+    /// as the scorer resolves them against the feed's current snapshot.
     #[cfg(test)]
     fn resolve_for_test(&self, workers: &[Arc<dyn Worker>], indices: &[usize]) -> Vec<Candidate> {
         let snapshot = self.snapshot();
@@ -535,7 +572,7 @@ impl LeastLoadPolicy {
         let mut read_credit = |url: &str, sampled_at| credit_read(&tally, url, sampled_at);
         indices
             .iter()
-            .map(|&idx| self.resolve(idx, &workers[idx], snapshot, &mut read_credit))
+            .map(|&idx| self.resolve(idx, &workers[idx], snapshot, &mut read_credit, true))
             .collect()
     }
 
@@ -629,6 +666,8 @@ impl LeastLoadPolicy {
     /// workers, and only from ranks with requests running (see
     /// [`live_throughput`]). Prefill consumes input tokens, which the output
     /// rate cannot price; use complete, valid computed input capacity instead.
+    /// A rate that is not a finite number is no live rate for either: an
+    /// infinite one would price the worker's whole queue at zero.
     fn live_drain_rate(worker: &Arc<dyn Worker>, load: &WorkerLoadResponse) -> Option<f64> {
         if worker.worker_type() == &WorkerType::Prefill {
             // Partial DP reports cannot represent aggregate engine capacity.
@@ -643,7 +682,7 @@ impl LeastLoadPolicy {
             return (rate.is_finite() && rate > 0.0).then_some(rate);
         }
         let live = live_throughput(load);
-        (live > 0.0).then_some(live)
+        (live.is_finite() && live > 0.0).then_some(live)
     }
 
     /// The rate a worker's queued work drains at: its live rate when it has
@@ -971,16 +1010,23 @@ impl LeastLoadPolicy {
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
         });
+        // The expected wait reads a report's KV pressure. The resident-work
+        // score does not, and keeps every report's facts.
+        let pressure_scored = matches!(objective, Objective::ExpectedWait);
         resolved.clear();
         match held.as_deref_mut() {
             Some(tally) => {
                 let mut read_credit =
                     |url: &str, sampled_at| credit_released(tally, url, sampled_at);
-                resolved.extend(
-                    candidates
-                        .iter()
-                        .map(|&idx| self.resolve(idx, &workers[idx], snapshot, &mut read_credit)),
-                );
+                resolved.extend(candidates.iter().map(|&idx| {
+                    self.resolve(
+                        idx,
+                        &workers[idx],
+                        snapshot,
+                        &mut read_credit,
+                        pressure_scored,
+                    )
+                }));
             }
             None => {
                 let tally = self
@@ -988,11 +1034,15 @@ impl LeastLoadPolicy {
                     .read()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 let mut read_credit = |url: &str, sampled_at| credit_read(&tally, url, sampled_at);
-                resolved.extend(
-                    candidates
-                        .iter()
-                        .map(|&idx| self.resolve(idx, &workers[idx], snapshot, &mut read_credit)),
-                );
+                resolved.extend(candidates.iter().map(|&idx| {
+                    self.resolve(
+                        idx,
+                        &workers[idx],
+                        snapshot,
+                        &mut read_credit,
+                        pressure_scored,
+                    )
+                }));
             }
         }
 
@@ -1013,14 +1063,20 @@ impl LeastLoadPolicy {
         // Argmin with reservoir tie-breaking: workers within
         // `TIE_EPSILON_SECS` of the minimum (the common idle/homogeneous case
         // scores equal to the digit) are sampled uniformly instead of
-        // first-index-wins, which herded ties onto one worker.
+        // first-index-wins, which herded ties onto one worker. Every score
+        // here is a number: under the expected wait a report whose pressure
+        // is NaN gives no facts (`Self::report_facts`), the wait clamps the
+        // pressure into its range, and a rate is read only when it is
+        // finite (`Self::live_drain_rate`). A comparison with a NaN is false
+        // both ways, so a score that is NaN would keep or skip its worker by
+        // position.
         let observe_score = |candidate: &Candidate, score: f64| {
             if cache_trace::enabled() {
                 let worker = &workers[candidate.idx];
                 let report = candidate.report;
                 if let Some(resident) = &resident {
                     cache_trace::score(serde_json::json!({
-                        "source": "resident_work", "worker": worker.url(), "score": score,
+                        "source": "resident_work", "worker": worker.redacted_url(), "score": score,
                         "score_unit": if resident.fleet_has_resident { "tokens" } else { "requests" },
                         "resident_tokens": report.and_then(|report| report.resident_tokens),
                         "reported_requests": report.map(|report| report.reported_requests),
@@ -1038,7 +1094,7 @@ impl LeastLoadPolicy {
                     return;
                 }
                 cache_trace::score(serde_json::json!({
-                    "source": "expected_wait", "worker": worker.url(), "score": score,
+                    "source": "expected_wait", "worker": worker.redacted_url(), "score": score,
                     "score_unit": if inputs.fleet_has_loads { "seconds" } else { "requests" },
                     "queued_tokens": report.map(|report| report.queued_tokens),
                     "running_estimated_tokens": report.map(|report| report.running_estimated_tokens),
@@ -1055,7 +1111,10 @@ impl LeastLoadPolicy {
                             candidate.since_poll_requests,
                         )
                     }),
-                    "fresh_load": report.is_some(),
+                    // A fresh report the score did not read (its pressure
+                    // is NaN) is fresh all the same: the record says both.
+                    "fresh_load": candidate.sampled_at.is_some(),
+                    "load_read": report.is_some(),
                 }));
             }
         };
@@ -1141,7 +1200,7 @@ impl LeastLoadPolicy {
 
         debug!(
             "{policy} selected {} (score {:.4}, in_flight {})",
-            workers[best].url(),
+            workers[best].redacted_url(),
             best_score,
             workers[best].load()
         );
@@ -1243,17 +1302,37 @@ impl Default for LeastLoadPolicy {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use openai_protocol::worker::SchedulerLoadSnapshot;
 
     use super::*;
     use crate::{
         policies::test_support::{fed_pair, make_worker, make_workers},
         worker::{
-            load_state::{one_rank_load, one_rank_load_reqs_only, TestFeed},
+            load::state::{one_rank_load, one_rank_load_reqs_only, TestFeed},
             test_support::{no_health_check, worker_of},
             BasicWorkerBuilder, WorkerType,
         },
     };
+
+    /// The selection's debug line names the worker it selected masked.
+    #[test]
+    #[tracing_test::traced_test]
+    fn the_selection_line_names_the_worker_masked() {
+        let workers = [
+            make_worker("http://user:s3cret@a:8000/v1?token=s3cret"),
+            make_worker("http://user:s3cret@b:8000/v1?token=s3cret"),
+        ];
+        let selected = LeastLoadPolicy::new()
+            .select_worker(&workers, &SelectWorkerInfo::default())
+            .expect("one of two healthy workers");
+        let host = ["a", "b"][selected];
+        assert!(logs_contain(&format!(
+            "least_load selected http://***@{host}:8000/v1 (score"
+        )));
+        assert!(!logs_contain("s3cret"));
+    }
 
     /// Invalid or incomplete rank capacity falls back to the fleet input rate.
     #[test]
@@ -1303,7 +1382,7 @@ mod tests {
     #[test]
     fn prefill_fleet_rate_overflow_uses_configured_capacity() {
         let policy = LeastLoadPolicy::with_params(0.15, 1024, 4_000.0);
-        let feed = TestFeed::attached_to(&policy);
+        let feed = TestFeed::attached_to(|rx| policy.set_load_receiver(rx));
         let workers: Vec<Arc<dyn Worker>> = ["http://p1:1", "http://p2:2", "http://p3:3"]
             .into_iter()
             .map(|url| {
@@ -1375,7 +1454,7 @@ mod tests {
             (unmeasured, 3_024.0 / 40_000.0, 1),
         ] {
             let policy = LeastLoadPolicy::with_params(0.15, 1024, 1_000.0);
-            let feed = TestFeed::attached_to(&policy);
+            let feed = TestFeed::attached_to(|rx| policy.set_load_receiver(rx));
             let workers: Vec<Arc<dyn Worker>> = ["http://p1:1", "http://p2:2"]
                 .into_iter()
                 .map(|url| worker_of(url, WorkerType::Prefill))
@@ -1405,7 +1484,7 @@ mod tests {
     #[test]
     fn prefill_ignores_generation_rate() {
         let policy = LeastLoadPolicy::with_params(0.15, 1024, 4_000.0);
-        let feed = TestFeed::attached_to(&policy);
+        let feed = TestFeed::attached_to(|rx| policy.set_load_receiver(rx));
         let workers: Vec<Arc<dyn Worker>> = ["http://prefill:1", "http://missing:2"]
             .into_iter()
             .map(|url| worker_of(url, WorkerType::Prefill))
@@ -1433,7 +1512,7 @@ mod tests {
     #[test]
     fn generation_rate_still_prices_decode_and_regular() {
         let policy = LeastLoadPolicy::new();
-        let feed = TestFeed::attached_to(&policy);
+        let feed = TestFeed::attached_to(|rx| policy.set_load_receiver(rx));
         for role in [WorkerType::Decode, WorkerType::Regular] {
             let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(
                 BasicWorkerBuilder::new("http://worker:1")
@@ -1786,7 +1865,7 @@ mod tests {
         // Four idle workers whose reports differ by a KV digit far below the
         // epsilon; an exact-equality tie handed everything to the first.
         let policy = LeastLoadPolicy::new().with_tie_break_seed(7);
-        let feed = TestFeed::attached_to(&policy);
+        let feed = TestFeed::attached_to(|rx| policy.set_load_receiver(rx));
         let workers: Vec<Arc<dyn Worker>> = (0..4)
             .map(|i| make_worker(&format!("http://w{i}:8000")))
             .collect();
@@ -1818,7 +1897,7 @@ mod tests {
         let mut seen = [false; 3];
         for _ in 0..150 {
             let policy = LeastLoadPolicy::new();
-            let feed = TestFeed::attached_to(&policy);
+            let feed = TestFeed::attached_to(|rx| policy.set_load_receiver(rx));
             let workers: Vec<Arc<dyn Worker>> = urls.iter().map(|u| make_worker(u)).collect();
             let mut loads = HashMap::new();
             for url in urls {
@@ -1852,7 +1931,7 @@ mod tests {
         let mut seen = [0usize; 3];
         for _ in 0..150 {
             let policy = LeastLoadPolicy::new();
-            let feed = TestFeed::attached_to(&policy);
+            let feed = TestFeed::attached_to(|rx| policy.set_load_receiver(rx));
             let workers: Vec<Arc<dyn Worker>> = urls.iter().map(|u| make_worker(u)).collect();
             let mut loads = HashMap::new();
             loads.insert(
@@ -1907,7 +1986,8 @@ mod tests {
         load.loads[0].num_running_reqs = 5;
         load.loads[0].num_waiting_reqs = 2;
         let reported = LeastLoadPolicy::new()
-            .report_facts(&w, &load)
+            .report_facts(&w, &load, true)
+            .expect("a usage that is a number is a reading")
             .reported_requests;
         assert_eq!(reported, 7, "running plus waiting");
         assert_eq!(
@@ -1930,7 +2010,7 @@ mod tests {
         // `a` must read as 40 requests of work, not as an idle peer of `b`:
         // every pick goes to `b` until its own credit has grown to the same.
         let policy = LeastLoadPolicy::with_params(0.0, 1024, 2000.0).with_tie_break_seed(1);
-        let feed = TestFeed::attached_to(&policy);
+        let feed = TestFeed::attached_to(|rx| policy.set_load_receiver(rx));
         let a = make_worker("http://a:8000");
         let b = make_worker("http://b:8000");
         for _ in 0..40 {
@@ -1962,7 +2042,7 @@ mod tests {
         // running rather than queued, ties with `b` on the estimate, and a
         // third worker that holds nothing wins outright.
         let policy = LeastLoadPolicy::with_params(0.0, 1024, 2000.0);
-        let feed = TestFeed::attached_to(&policy);
+        let feed = TestFeed::attached_to(|rx| policy.set_load_receiver(rx));
         let a = make_worker("http://a:8000");
         let b = make_worker("http://b:8000");
         let c = make_worker("http://c:8000");
@@ -2009,7 +2089,7 @@ mod tests {
         // and the six water-fill evenly: the floor steers off the hidden
         // backlogs, not onto a favourite.
         let policy = LeastLoadPolicy::with_params(0.0, 1024, 2000.0);
-        let feed = TestFeed::attached_to(&policy);
+        let feed = TestFeed::attached_to(|rx| policy.set_load_receiver(rx));
         let workers: Vec<Arc<dyn Worker>> = (0..8)
             .map(|i| make_worker(&format!("http://w{i}:8000")))
             .collect();
@@ -2041,7 +2121,7 @@ mod tests {
     #[test]
     fn a_report_releases_the_dispatches_made_up_to_its_sample_and_keeps_the_rest() {
         let policy = LeastLoadPolicy::new();
-        let feed = TestFeed::attached_to(&policy);
+        let feed = TestFeed::attached_to(|rx| policy.set_load_receiver(rx));
         let workers = vec![make_worker("http://a:8000")];
         let info = SelectWorkerInfo::default();
         let mut loads = HashMap::new();
@@ -2120,7 +2200,7 @@ mod tests {
         // rate of the CANDIDATES (b's 100 tok/s -> 20.48s > b's 10.04s), not
         // a fleet-wide mean that c's 100k tok/s would dominate (0.04s < b).
         let policy = LeastLoadPolicy::new();
-        let feed = TestFeed::attached_to(&policy);
+        let feed = TestFeed::attached_to(|rx| policy.set_load_receiver(rx));
         let a = make_worker("http://a:8000");
         for _ in 0..2 {
             a.increment_load();
@@ -2234,7 +2314,11 @@ mod tests {
     fn empty_queue_is_not_penalized() {
         // Neither backend has a queue; the estimate must not manufacture one,
         // leaving the KV barrier to decide.
-        let (policy, feed, workers) = fed_pair(LeastLoadPolicy::with_kv_pressure_weight(2.0));
+        let (policy, feed, workers) = fed_pair(LeastLoadPolicy::with_params(
+            2.0,
+            DEFAULT_MEAN_PREFILL_TOKENS,
+            DEFAULT_THROUGHPUT,
+        ));
         let mut loads = HashMap::new();
         loads.insert(
             "http://a:8000".to_string(),
@@ -2358,7 +2442,7 @@ mod tests {
         // live in-flight. Scoring b on raw count (5) would wrongly beat a's 40s;
         // scoring it as drain time (5 * p̄ / nominal ≈ 51s) keeps the lighter a.
         let policy = LeastLoadPolicy::new(); // p̄ = 1024
-        let feed = TestFeed::attached_to(&policy);
+        let feed = TestFeed::attached_to(|rx| policy.set_load_receiver(rx));
         let a = make_worker("http://a:8000");
         let b = make_worker("http://b:8000");
         for _ in 0..5 {
@@ -2378,7 +2462,11 @@ mod tests {
     #[test]
     fn kv_barrier_avoids_full_worker() {
         // No queued work; the convex KV barrier steers off the near-full worker.
-        let (policy, feed, workers) = fed_pair(LeastLoadPolicy::with_kv_pressure_weight(2.0));
+        let (policy, feed, workers) = fed_pair(LeastLoadPolicy::with_params(
+            2.0,
+            DEFAULT_MEAN_PREFILL_TOKENS,
+            DEFAULT_THROUGHPUT,
+        ));
         let mut loads = HashMap::new();
         loads.insert("http://a:8000".to_string(), one_rank_load(0, 0.98, 100.0));
         loads.insert("http://b:8000".to_string(), one_rank_load(0, 0.0, 100.0));
@@ -2388,6 +2476,293 @@ mod tests {
             policy.select_worker(&workers, &SelectWorkerInfo::default()),
             Some(1)
         );
+    }
+
+    /// Twenty picks over the pair, the reports published again after each so
+    /// every pick reads the same two.
+    fn twenty_picks(
+        policy: &LeastLoadPolicy,
+        feed: &TestFeed,
+        workers: &[Arc<dyn Worker>],
+        loads: &HashMap<String, WorkerLoadResponse>,
+    ) -> [usize; 2] {
+        let mut picks = [0usize; 2];
+        feed.publish(loads);
+        for _ in 0..20 {
+            picks[policy
+                .select_worker(workers, &SelectWorkerInfo::default())
+                .unwrap()] += 1;
+            feed.publish(loads);
+        }
+        picks
+    }
+
+    /// A report whose KV usage is not a number has no reading. Scored, its
+    /// wait is not a number either and no comparison holds against it: the
+    /// first worker of the order kept every request, whatever its queue and
+    /// whatever its peer reported.
+    #[test]
+    fn a_usage_that_is_not_a_number_in_first_position_does_not_keep_every_request() {
+        let (policy, feed, workers) = fed_pair(LeastLoadPolicy::new().with_tie_break_seed(7));
+        let mut loads = HashMap::new();
+        // The first: eight requests waiting and a usage nobody can read.
+        // The second: idle.
+        loads.insert(
+            "http://a:8000".to_string(),
+            one_rank_load_reqs_only(8, f64::NAN, 100.0),
+        );
+        loads.insert("http://b:8000".to_string(), one_rank_load(0, 0.1, 100.0));
+
+        let picks = twenty_picks(&policy, &feed, &workers, &loads);
+
+        assert!(
+            picks[1] > 0,
+            "the idle worker is taken, not shut out by its peer's position: {picks:?}"
+        );
+    }
+
+    /// The same report in a later position lost every comparison instead: a
+    /// worker with an empty queue was never taken.
+    #[test]
+    fn a_usage_that_is_not_a_number_in_a_later_position_is_not_shut_out() {
+        let (policy, feed, workers) = fed_pair(LeastLoadPolicy::new().with_tie_break_seed(7));
+        let mut loads = HashMap::new();
+        loads.insert(
+            "http://a:8000".to_string(),
+            one_rank_load_reqs_only(3, 0.1, 100.0),
+        );
+        loads.insert(
+            "http://b:8000".to_string(),
+            one_rank_load(0, f64::NAN, 100.0),
+        );
+
+        let picks = twenty_picks(&policy, &feed, &workers, &loads);
+
+        assert!(
+            picks[1] > 0,
+            "scored as a worker without a report: it shares with its best-known peer: {picks:?}"
+        );
+    }
+
+    /// The rule of the two cases above, at the report: under the expected
+    /// wait a pressure that is NaN is no reading, on the only rank as on one
+    /// rank of several. A rank's usage is its pressure where it states no
+    /// active usage; beside a stated one it is no input of the score, and the
+    /// report reads on. Nothing else is dropped: an infinite pressure is a
+    /// number, and the resident-work score keeps every report.
+    #[test]
+    fn a_report_whose_pressure_is_nan_has_no_reading_for_the_expected_wait() {
+        let policy = LeastLoadPolicy::new();
+        let worker = make_worker("http://a:8000");
+        let facts = |load: &WorkerLoadResponse| policy.report_facts(&worker, load, true);
+        // A rank that states no active usage: its usage is its pressure.
+        let usage = one_rank_load(0, f64::NAN, 100.0);
+        assert!(facts(&usage).is_none(), "the usage");
+        // The active usage a rank states, beside a usage that is a number.
+        let mut active = one_rank_load(0, 0.5, 100.0);
+        active.loads[0].active_token_usage = Some(f64::NAN);
+        assert!(facts(&active).is_none(), "the active usage");
+        let mut two = one_rank_load(0, 0.5, 100.0);
+        let mut second = two.loads[0].clone();
+        second.dp_rank = 1;
+        second.token_usage = f64::NAN;
+        two.loads.push(second);
+        two.dp_rank_count = 2;
+        assert!(facts(&two).is_none(), "one rank of two");
+        // A usage that is NaN beside a stated active usage that is a number:
+        // the pressure is the stated one.
+        let mut stated = one_rank_load(0, f64::NAN, 100.0);
+        stated.loads[0].active_token_usage = Some(0.2);
+        let read = facts(&stated).expect("the pressure is the stated active usage");
+        assert_eq!(read.kv_pressure, 0.2, "the usage beside an active usage");
+
+        // An infinite pressure is a number: the report reads on.
+        for value in [f64::NEG_INFINITY, f64::INFINITY, 0.5] {
+            let plain = one_rank_load(0, value, 100.0);
+            let read = facts(&plain).expect("a pressure that is a number is a reading");
+            assert_eq!(read.kv_pressure, value);
+        }
+        // The resident-work score does not read the pressure.
+        assert!(
+            policy.report_facts(&worker, &usage, false).is_some(),
+            "a NaN pressure under the resident-work score keeps its report"
+        );
+    }
+
+    /// Twenty picks for one cell of the table below. The first worker
+    /// reports `usage` as its KV usage and a tenth of its peer's resident
+    /// tokens; each worker holds the one request its report counts.
+    fn picks_of_cell(usage: f64, resident_work: bool) -> [usize; 2] {
+        let (policy, feed, workers) = fed_pair(LeastLoadPolicy::new().with_tie_break_seed(7));
+        let report = |usage: f64, resident: i64| {
+            let mut load = one_rank_load(0, usage, 100.0);
+            load.loads[0].num_resident_tokens = Some(resident);
+            load
+        };
+        let mut loads = HashMap::new();
+        loads.insert("http://a:8000".to_string(), report(usage, 100_000));
+        loads.insert("http://b:8000".to_string(), report(0.1, 1_000_000));
+        for worker in &workers {
+            worker.increment_load();
+        }
+        let info = SelectWorkerInfo::default();
+        let mut picks = [0usize; 2];
+        feed.publish(&loads);
+        for _ in 0..20 {
+            let pick = if resident_work {
+                policy.select_min_resident_work(&workers, &[0, 1], &info, "test", 0)
+            } else {
+                policy.select_worker(&workers, &info)
+            };
+            picks[pick.unwrap()] += 1;
+            feed.publish(&loads);
+        }
+        picks
+    }
+
+    /// The fix changes the answer only where the answer was the defect: a
+    /// NaN pressure under the expected wait, where the first worker of the
+    /// order kept every request. Every other cell of objective by value
+    /// reads as it did: the wait clamps an infinite pressure into its range,
+    /// and the resident-work score never reads the pressure, so the worker
+    /// holding a tenth of its peer's tokens takes every request.
+    #[test]
+    fn only_a_nan_pressure_under_the_expected_wait_changes_its_answer() {
+        let table = [f64::NAN, f64::INFINITY, f64::NEG_INFINITY]
+            .map(|usage| (picks_of_cell(usage, false), picks_of_cell(usage, true)));
+        assert_eq!(
+            table,
+            [
+                // No reading: the best-known peer's wait plus its own request.
+                ([0, 20], [20, 0]),
+                // A full cache.
+                ([0, 20], [20, 0]),
+                // An empty cache.
+                ([20, 0], [20, 0]),
+            ],
+            "the expected wait, then the resident work; NaN, +inf, -inf"
+        );
+    }
+
+    /// A generation rate that is infinite is no live rate. Read as one, it
+    /// priced its worker's whole queue at zero, and the worker with the
+    /// deepest queue took every request.
+    #[test]
+    fn an_infinite_generation_rate_does_not_empty_its_workers_queue() {
+        let (policy, feed, workers) = fed_pair(LeastLoadPolicy::new().with_tie_break_seed(7));
+        let mut loads = HashMap::new();
+        // The first: four thousand tokens waiting and a rate nobody can
+        // use. The second: four hundred waiting at a hundred a second.
+        loads.insert(
+            "http://a:8000".to_string(),
+            one_rank_load(4000, 0.1, f64::INFINITY),
+        );
+        loads.insert("http://b:8000".to_string(), one_rank_load(400, 0.1, 100.0));
+
+        let picks = twenty_picks(&policy, &feed, &workers, &loads);
+
+        assert_eq!(picks, [0, 20], "the shorter queue is taken");
+    }
+
+    /// A usage that is not a number beside an active usage its rank states
+    /// is no input of the score: the report reads on, its score is a number,
+    /// and the queue decides in either position.
+    #[test]
+    fn a_usage_that_is_not_a_number_beside_a_stated_active_usage_is_scored_by_its_queue() {
+        for busy_first in [true, false] {
+            let (policy, feed, workers) = fed_pair(LeastLoadPolicy::new().with_tie_break_seed(7));
+            // The busy worker: eight requests waiting, a usage nobody can
+            // read, an active usage of one tenth. The other: idle.
+            let mut busy = one_rank_load_reqs_only(8, f64::NAN, 100.0);
+            busy.loads[0].active_token_usage = Some(0.1);
+            let idle = one_rank_load(0, 0.1, 100.0);
+            let (first, second) = if busy_first {
+                (busy, idle)
+            } else {
+                (idle, busy)
+            };
+            let mut loads = HashMap::new();
+            loads.insert("http://a:8000".to_string(), first);
+            loads.insert("http://b:8000".to_string(), second);
+
+            let picks = twenty_picks(&policy, &feed, &workers, &loads);
+
+            // Scored as a worker without a report, the busy one would tie
+            // with its idle peer and share the picks.
+            let idle_at = usize::from(busy_first);
+            assert_eq!(
+                picks[idle_at], 20,
+                "the busy worker's queue keeps it out, whichever comes first: {picks:?}"
+            );
+        }
+    }
+
+    /// A report without a reading gives its worker no facts and keeps its
+    /// sample instant: the dispatches made before it are the engine's by
+    /// then, and leave the credit as they do for any report.
+    #[test]
+    fn a_report_without_a_reading_gives_no_facts_and_keeps_its_sample_instant() {
+        let (policy, feed, workers) = fed_pair(LeastLoadPolicy::new());
+        let mut loads = HashMap::new();
+        loads.insert("http://a:8000".to_string(), one_rank_load(0, 0.1, 100.0));
+        loads.insert("http://b:8000".to_string(), one_rank_load(0, 0.1, 100.0));
+        feed.publish(&loads);
+        let info = SelectWorkerInfo::default();
+        for _ in 0..4 {
+            policy.select_worker(&workers, &info);
+        }
+        let held = policy.resolve_for_test(&workers, &[0, 1]);
+        assert!(
+            held[0].since_poll_requests > 0,
+            "the first worker holds dispatches made since its report"
+        );
+
+        // The first worker's next report has a usage nobody can read. Both
+        // reports are sampled after the four dispatches.
+        loads.insert(
+            "http://a:8000".to_string(),
+            one_rank_load(0, f64::NAN, 100.0),
+        );
+        feed.publish(&loads);
+        let resolved = policy.resolve_for_test(&workers, &[0, 1]);
+
+        assert!(resolved[0].report.is_none() && resolved[0].sampled_at.is_some());
+        assert!(resolved[1].report.is_some() && resolved[1].sampled_at.is_some());
+        assert_eq!(
+            (
+                resolved[0].since_poll_tokens,
+                resolved[0].since_poll_requests
+            ),
+            (0, 0),
+            "the dispatches made before the sample leave the credit"
+        );
+    }
+
+    /// The decision record of a worker whose report has no reading says
+    /// both: the report is fresh, and the score did not read it. Its peer's
+    /// record reads fresh and read.
+    #[tokio::test]
+    async fn the_decision_record_names_a_fresh_report_without_a_reading() {
+        let (policy, feed, workers) = fed_pair(LeastLoadPolicy::new());
+        let mut loads = HashMap::new();
+        loads.insert(
+            "http://a:8000".to_string(),
+            one_rank_load(0, f64::NAN, 100.0),
+        );
+        loads.insert("http://b:8000".to_string(), one_rank_load(0, 0.1, 100.0));
+        feed.publish(&loads);
+
+        let rows = cache_trace::scope(true, async {
+            let picked = policy.select_worker(&workers, &SelectWorkerInfo::default());
+            cache_trace::selection("least_load", "test", &workers, picked);
+            cache_trace::captured_selections()
+        })
+        .await;
+
+        let scores = rows[0]["scores"].as_array().expect("a score a candidate");
+        let flags = |row: &serde_json::Value| (row["fresh_load"] == true, row["load_read"] == true);
+        assert_eq!(flags(&scores[0]), (true, false), "{}", scores[0]);
+        assert_eq!(flags(&scores[1]), (true, true), "{}", scores[1]);
     }
 
     #[test]
@@ -2584,7 +2959,7 @@ mod tests {
             3, 7, 4, 0, 0, 0, 0, 8, 2, 6, 8, 2, 6, 0, 2,
         ];
         let policy = LeastLoadPolicy::with_params(0.15, 1024, 2_000.0).with_tie_break_seed(11);
-        let feed = TestFeed::attached_to(&policy);
+        let feed = TestFeed::attached_to(|rx| policy.set_load_receiver(rx));
         let workers: Vec<Arc<dyn Worker>> = (0..WORKERS)
             .map(|i| {
                 let role = if i == PREFILL {
@@ -2662,7 +3037,7 @@ mod tests {
     #[test]
     fn a_decision_releases_what_its_reports_reflect_and_a_read_does_not() {
         let policy = LeastLoadPolicy::new();
-        let feed = TestFeed::attached_to(&policy);
+        let feed = TestFeed::attached_to(|rx| policy.set_load_receiver(rx));
         let workers = vec![make_worker("http://a:8000"), make_worker("http://b:8000")];
         let info = SelectWorkerInfo::default();
         let mut loads = HashMap::new();
@@ -2713,7 +3088,7 @@ mod tests {
 
     fn threads_land_their_credit(fleet: usize) {
         let policy = Arc::new(LeastLoadPolicy::new());
-        let feed = TestFeed::attached_to(policy.as_ref());
+        let feed = TestFeed::attached_to(|rx| policy.as_ref().set_load_receiver(rx));
         let workers: Arc<Vec<Arc<dyn Worker>>> = Arc::new(
             (0..fleet)
                 .map(|i| make_worker(&format!("http://w{i}:8000")))
@@ -2756,7 +3131,7 @@ mod tests {
         assert_eq!(HELD_GUARD_CANDIDATES, 7);
         let decide_twice = |candidates: usize| {
             let policy = LeastLoadPolicy::new();
-            let feed = TestFeed::attached_to(&policy);
+            let feed = TestFeed::attached_to(|rx| policy.set_load_receiver(rx));
             let workers: Vec<Arc<dyn Worker>> = (0..9)
                 .map(|i| make_worker(&format!("http://w{i}:8000")))
                 .collect();

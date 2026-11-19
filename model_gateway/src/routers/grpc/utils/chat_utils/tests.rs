@@ -1,9 +1,14 @@
 use std::{future::Future, sync::mpsc};
 
-use llm_tokenizer::{chat_template::ChatTemplateContentFormat, traits::RendererCapabilities};
+use llm_tokenizer::{
+    chat_template::{ChatTemplateContentFormat, ThinkingKeyName},
+    traits::RendererCapabilities,
+};
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatMessage, MessageContent},
-    common::{AudioUrl, ContentPart, ImageUrl, InputAudio, VideoUrl},
+    common::{
+        AudioUrl, ContentPart, ImageUrl, InputAudio, JsonSchemaFormat, ResponseFormat, VideoUrl,
+    },
     profile::ProviderProfile,
 };
 use serde_json::json;
@@ -91,6 +96,55 @@ fn a_refusal_part_outside_an_assistant_turn_is_refused() {
     assert!(validate_chat_content_parts(&messages).is_ok());
 }
 
+/// A media part is taken in a user message (and in a tool result): in a
+/// system, developer, assistant or root message it is refused at the door in
+/// this door's own sentence (with the role's article), before any fetch, not
+/// after the pipeline ran it and the rendered prompt's anchors did not match
+/// it (none for the first three, one too many for an assistant part).
+#[test]
+fn a_media_part_in_a_text_only_role_message_is_refused_at_the_door() {
+    let parts = [
+        json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,AQ=="}}),
+        json!({"type": "audio_url", "audio_url": {"url": "https://example.com/audio.wav"}}),
+        json!({"type": "input_audio", "input_audio": {"data": "UklGRg==", "format": "wav"}}),
+        json!({"type": "video_url", "video_url": {"url": "https://example.com/video.mp4"}}),
+    ];
+    for (role, phrase) in [
+        ("system", "a system"),
+        ("developer", "a developer"),
+        ("assistant", "an assistant"),
+        ("root", "a root"),
+    ] {
+        for part in &parts {
+            let kind = part["type"].as_str().unwrap();
+            let messages: Vec<ChatMessage> = serde_json::from_value(json!([
+                {"role": role, "content": [{"type": "text", "text": "you see"}, part]},
+                {"role": "user", "content": "describe"}
+            ]))
+            .unwrap();
+            let error = validate_chat_content_parts(&messages).unwrap_err();
+            assert_eq!(
+                error,
+                format!(
+                    "Unsupported chat content part type {kind:?} in {phrase} message for gRPC \
+                     backends: media parts are taken in user and tool messages"
+                )
+            );
+        }
+    }
+    let messages: Vec<ChatMessage> = serde_json::from_value(json!([
+        {"role": "system", "content": [{"type": "text", "text": "you see"}]},
+        {"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AQ=="}}
+        ]},
+        {"role": "tool", "tool_call_id": "call_1", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AQ=="}}
+        ]}
+    ]))
+    .unwrap();
+    assert!(validate_chat_content_parts(&messages).is_ok());
+}
+
 #[test]
 fn known_chat_content_parts_are_accepted() {
     let messages: Vec<ChatMessage> = serde_json::from_value(json!([
@@ -166,6 +220,40 @@ fn a_refusal_part_reaches_the_template_as_the_turns_text() {
     );
 }
 
+/// A replayed turn's refusal, audio reference and deprecated function call stay
+/// out of the template's messages, as the engines' own chat utils leave them
+/// out: the template gets the same turn as it would without them.
+#[test]
+fn a_replayed_refusal_audio_and_function_call_stay_out_of_the_template() {
+    let with: Vec<ChatMessage> = serde_json::from_value(json!([
+        {"role": "user", "content": "What is the weather in Paris?"},
+        {"role": "assistant", "content": "Let me look.",
+         "refusal": "I can't share that.",
+         "audio": {"id": "audio_abc123"},
+         "function_call": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}},
+        {"role": "assistant", "content": null, "refusal": "I can't help with that."},
+        {"role": "function", "name": "get_weather", "content": "18C"}
+    ]))
+    .unwrap();
+    let without: Vec<ChatMessage> = serde_json::from_value(json!([
+        {"role": "user", "content": "What is the weather in Paris?"},
+        {"role": "assistant", "content": "Let me look."},
+        {"role": "assistant", "content": null},
+        {"role": "function", "name": "get_weather", "content": "18C"}
+    ]))
+    .unwrap();
+    for format in [
+        ChatTemplateContentFormat::String,
+        ChatTemplateContentFormat::OpenAI,
+    ] {
+        assert_eq!(
+            process_content_format(&with, format, None).unwrap(),
+            process_content_format(&without, format, None).unwrap(),
+            "{format:?}"
+        );
+    }
+}
+
 #[test]
 fn test_transform_messages_string_format() {
     let messages = vec![ChatMessage::User {
@@ -176,7 +264,7 @@ fn test_transform_messages_string_format() {
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "https://example.com/image.jpg".to_string(),
+                    url: "https://example.com/image.jpg".to_string().into(),
                     detail: None,
                     max_long_side_pixel: None,
                 },
@@ -214,7 +302,7 @@ fn test_transform_messages_string_format_without_placeholders_omits_media() {
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "https://example.com/image.png".to_string(),
+                    url: "https://example.com/image.png".to_string().into(),
                     detail: None,
                     max_long_side_pixel: None,
                 },
@@ -239,7 +327,7 @@ fn test_transform_messages_string_format_with_video_placeholder() {
             },
             ContentPart::VideoUrl {
                 video_url: VideoUrl {
-                    url: "https://example.com/video.mp4".to_string(),
+                    url: "https://example.com/video.mp4".to_string().into(),
                     fps: None,
                     max_long_side_pixel: None,
                 },
@@ -270,14 +358,14 @@ fn test_transform_messages_string_format_uses_per_modality_placeholders() {
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "image".to_string(),
+                    url: "image".to_string().into(),
                     detail: None,
                     max_long_side_pixel: None,
                 },
             },
             ContentPart::AudioUrl {
                 audio_url: AudioUrl {
-                    url: "audio".to_string(),
+                    url: "audio".to_string().into(),
                 },
             },
         ]),
@@ -317,7 +405,7 @@ fn test_transform_messages_input_audio_uses_audio_placeholder() {
             },
             ContentPart::InputAudio {
                 input_audio: InputAudio {
-                    data: "UklGRg==".to_string(),
+                    data: "UklGRg==".to_string().into(),
                     format: "wav".to_string(),
                 },
             },
@@ -349,7 +437,7 @@ fn test_transform_messages_string_format_rejects_missing_modality_placeholder() 
         ext: Default::default(),
         content: MessageContent::Parts(vec![ContentPart::AudioUrl {
             audio_url: AudioUrl {
-                url: "audio".to_string(),
+                url: "audio".to_string().into(),
             },
         }]),
         name: None,
@@ -359,7 +447,11 @@ fn test_transform_messages_string_format_rejects_missing_modality_placeholder() 
     let error = process_content_format(&messages, ChatTemplateContentFormat::String, Some(&tokens))
         .unwrap_err();
 
-    assert!(error.contains("missing audio placeholder"));
+    // The request's own: media for a template with no placeholder for it.
+    assert!(
+        matches!(&error, PromptError::Refused(cause) if cause.contains("missing audio placeholder")),
+        "{error:?}"
+    );
 }
 
 #[test]
@@ -372,7 +464,7 @@ fn test_transform_messages_openai_format() {
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "https://example.com/image.jpg".to_string(),
+                    url: "https://example.com/image.jpg".to_string().into(),
                     detail: Some("high".to_string()),
                     max_long_side_pixel: None,
                 },
@@ -435,7 +527,7 @@ fn test_transform_messages_multiple_messages() {
                 },
                 ContentPart::ImageUrl {
                     image_url: ImageUrl {
-                        url: "https://example.com/image.jpg".to_string(),
+                        url: "https://example.com/image.jpg".to_string().into(),
                         detail: None,
                         max_long_side_pixel: None,
                     },
@@ -470,7 +562,7 @@ fn test_transform_messages_empty_text_parts() {
         ext: Default::default(),
         content: MessageContent::Parts(vec![ContentPart::ImageUrl {
             image_url: ImageUrl {
-                url: "https://example.com/image.jpg".to_string(),
+                url: "https://example.com/image.jpg".to_string().into(),
                 detail: None,
                 max_long_side_pixel: None,
             },
@@ -505,7 +597,7 @@ fn test_transform_messages_mixed_content_types() {
                 },
                 ContentPart::ImageUrl {
                     image_url: ImageUrl {
-                        url: "https://example.com/image.jpg".to_string(),
+                        url: "https://example.com/image.jpg".to_string().into(),
                         detail: Some("low".to_string()),
                         max_long_side_pixel: None,
                     },
@@ -553,7 +645,7 @@ fn parts_reach_a_parts_template_in_the_requests_order_whatever_the_media_order()
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "data:image/jpeg;base64,XXX".to_string(),
+                    url: "data:image/jpeg;base64,XXX".to_string().into(),
                     detail: None,
                     max_long_side_pixel: None,
                 },
@@ -580,7 +672,7 @@ fn test_media_hoisted_before_text_string() {
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "data:image/jpeg;base64,XXX".to_string(),
+                    url: "data:image/jpeg;base64,XXX".to_string().into(),
                     detail: None,
                     max_long_side_pixel: None,
                 },
@@ -612,7 +704,7 @@ fn test_media_first_stable_and_multi() {
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "i1".to_string(),
+                    url: "i1".to_string().into(),
                     detail: None,
                     max_long_side_pixel: None,
                 },
@@ -622,7 +714,7 @@ fn test_media_first_stable_and_multi() {
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "i2".to_string(),
+                    url: "i2".to_string().into(),
                     detail: None,
                     max_long_side_pixel: None,
                 },
@@ -742,7 +834,7 @@ fn test_tml_preserves_authored_multipart_order_openai() {
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "image".to_string(),
+                    url: "image".to_string().into(),
                     detail: None,
                     max_long_side_pixel: None,
                 },
@@ -966,7 +1058,7 @@ fn test_tml_preserves_authored_multipart_order_string() {
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "image".to_string(),
+                    url: "image".to_string().into(),
                     detail: None,
                     max_long_side_pixel: None,
                 },
@@ -1076,10 +1168,28 @@ fn tool_choice_none_renders_the_tools_as_auto_does() {
         serde_json::to_value(&rendered.tools).expect("tools"),
         "the same tools render under none and under auto"
     );
-    assert_eq!(
-        build_chat_template_kwargs(&request)[TOOL_CHOICE_KEY],
-        json!("none")
-    );
+    assert_eq!(kwargs_for(&request)[TOOL_CHOICE_KEY], json!("none"));
+}
+
+/// `build_chat_template_kwargs` with the profile the request's model
+/// derives, as the preparation stage carries it.
+fn kwargs_for(request: &ChatCompletionRequest) -> HashMap<String, Value> {
+    build_chat_template_kwargs(
+        request,
+        ProviderProfile::for_model(&request.model),
+        None,
+        |_| true,
+    )
+}
+
+/// `kwargs_for` under a template that reads the `thinking_mode` switch.
+fn kwargs_for_switch(request: &ChatCompletionRequest) -> HashMap<String, Value> {
+    build_chat_template_kwargs(
+        request,
+        ProviderProfile::for_model(&request.model),
+        Some(ThinkingKeyName::ThinkingMode),
+        |_| true,
+    )
 }
 
 fn effort_request(reasoning_effort: Option<&str>) -> ChatCompletionRequest {
@@ -1100,10 +1210,10 @@ fn reasoning_effort_is_forwarded_verbatim() {
     // The chat template owns level->value mapping, defaulting, and validation;
     // the router forwards the string and omits it when absent so the template
     // applies its own default.
-    let kwargs = build_chat_template_kwargs(&effort_request(Some("high")));
+    let kwargs = kwargs_for(&effort_request(Some("high")));
     assert_eq!(kwargs.get(REASONING_EFFORT_KEY), Some(&json!("high")));
 
-    let kwargs = build_chat_template_kwargs(&effort_request(None));
+    let kwargs = kwargs_for(&effort_request(None));
     assert!(!kwargs.contains_key(REASONING_EFFORT_KEY));
 }
 
@@ -1118,7 +1228,7 @@ fn top_level_effort_overrides_a_chat_template_kwargs_entry() {
         (REASONING_EFFORT_KEY.to_string(), json!("low")),
         ("custom".to_string(), json!(true)),
     ]));
-    let kwargs = build_chat_template_kwargs(&request);
+    let kwargs = kwargs_for(&request);
     assert_eq!(kwargs.get(REASONING_EFFORT_KEY), Some(&json!("high")));
     assert_eq!(kwargs.get("custom"), Some(&Value::Bool(true)));
 
@@ -1127,8 +1237,75 @@ fn top_level_effort_overrides_a_chat_template_kwargs_entry() {
         REASONING_EFFORT_KEY.to_string(),
         json!("low"),
     )]));
-    let kwargs = build_chat_template_kwargs(&request);
+    let kwargs = kwargs_for(&request);
     assert_eq!(kwargs.get(REASONING_EFFORT_KEY), Some(&json!("low")));
+}
+
+/// A control the template never reads is not handed to it: a `response_format`
+/// (its schema copied node by node into the kwarg) or a `tool_choice` the
+/// template has no name for could not reach the prompt. The client's own
+/// entries and the effort pass as before, and a request whose controls are
+/// all unread renders with no kwargs at all.
+#[test]
+fn a_control_the_template_never_reads_is_not_handed_to_it() {
+    let mut request = effort_request(None);
+    request.tool_choice = Some(ToolChoice::Value(ToolChoiceValue::Auto));
+    request.response_format = Some(ResponseFormat::JsonSchema {
+        json_schema: Box::new(JsonSchemaFormat {
+            name: "answer".to_string(),
+            schema: json!({"type": "object", "properties": {"city": {"type": "string"}}}),
+            strict: Some(true),
+            description: None,
+        }),
+    });
+    let read_all = build_chat_template_kwargs(
+        &request,
+        ProviderProfile::for_model(&request.model),
+        None,
+        |_| true,
+    );
+    assert_eq!(read_all[TOOL_CHOICE_KEY], json!("auto"));
+    assert_eq!(
+        read_all[RESPONSE_FORMAT_KEY],
+        serde_json::to_value(request.response_format.as_ref().unwrap()).unwrap()
+    );
+
+    let unread = build_chat_template_kwargs(
+        &request,
+        ProviderProfile::for_model(&request.model),
+        None,
+        |_| false,
+    );
+    assert!(unread.is_empty(), "{unread:?}");
+    assert_eq!(
+        unread.capacity(),
+        0,
+        "no map for controls the template never reads"
+    );
+    let only_format = build_chat_template_kwargs(
+        &request,
+        ProviderProfile::for_model(&request.model),
+        None,
+        |name| name == RESPONSE_FORMAT_KEY,
+    );
+    assert!(!only_format.contains_key(TOOL_CHOICE_KEY));
+    assert_eq!(
+        only_format[RESPONSE_FORMAT_KEY],
+        read_all[RESPONSE_FORMAT_KEY]
+    );
+
+    request.reasoning_effort = Some("high".to_string());
+    request.chat_template_kwargs = Some(HashMap::from([("custom".to_string(), json!(true))]));
+    let unread = build_chat_template_kwargs(
+        &request,
+        ProviderProfile::for_model(&request.model),
+        None,
+        |_| false,
+    );
+    assert_eq!(unread.get(REASONING_EFFORT_KEY), Some(&json!("high")));
+    assert_eq!(unread.get("custom"), Some(&json!(true)));
+    assert!(!unread.contains_key(TOOL_CHOICE_KEY));
+    assert!(!unread.contains_key(RESPONSE_FORMAT_KEY));
 }
 
 fn thinking_request(thinking: Value, reasoning_effort: Option<&str>) -> ChatCompletionRequest {
@@ -1141,12 +1318,12 @@ fn thinking_request(thinking: Value, reasoning_effort: Option<&str>) -> ChatComp
 fn thinking_effort_overrides_top_level_effort_in_kwargs() {
     // KVV test_reasoning_effort_ignored_when_effort_present: effort=low beats max.
     let request = thinking_request(json!({"type": "enabled", "effort": "low"}), Some("max"));
-    let kwargs = build_chat_template_kwargs(&request);
+    let kwargs = kwargs_for(&request);
     assert_eq!(kwargs.get(REASONING_EFFORT_KEY), Some(&json!("low")));
 
     // Absent `thinking.effort`, the top-level field still applies.
     let request = thinking_request(json!({"type": "enabled"}), Some("max"));
-    let kwargs = build_chat_template_kwargs(&request);
+    let kwargs = kwargs_for(&request);
     assert_eq!(kwargs.get(REASONING_EFFORT_KEY), Some(&json!("max")));
 
     // The request-level effort outranks an explicit chat_template_kwargs entry too.
@@ -1155,7 +1332,7 @@ fn thinking_effort_overrides_top_level_effort_in_kwargs() {
         REASONING_EFFORT_KEY.to_string(),
         json!("high"),
     )]));
-    let kwargs = build_chat_template_kwargs(&request);
+    let kwargs = kwargs_for(&request);
     assert_eq!(kwargs.get(REASONING_EFFORT_KEY), Some(&json!("low")));
 }
 
@@ -1177,36 +1354,121 @@ fn thinking_disabled_projects_params_thinking_false() {
     );
 }
 
-/// Under the MiniMax profile no effort value switches thinking off: the
-/// request renders the template's default (thinking on, the model's own
-/// depth). An explicit `thinking.disabled` wins over the effort there too.
+/// Under the MiniMax profile `none` switches thinking off, as
+/// `thinking.type: disabled` does, and renders no effort; `minimal` renders
+/// as the contract's `low`, thinking on; a level the contract names (`low`
+/// to `max`) renders as sent; a value outside the contract renders nothing
+/// and leaves the template's default; no effort renders while thinking is
+/// off. An explicit `thinking.type` wins over the effort.
 #[test]
-fn minimax_effort_keeps_thinking_on() {
+fn minimax_effort_none_switches_thinking_off_and_renders_no_effort() {
     let minimax = |thinking: Option<Value>, reasoning_effort: Option<&str>| {
         let mut request = effort_request(reasoning_effort);
         request.model = "MiniMax-M3".to_string();
         request.thinking = thinking.map(|value| serde_json::from_value(value).unwrap());
         request
     };
-    for effort in ["none", "minimal", "high"] {
+    let effort_kwarg =
+        |request: &ChatCompletionRequest| kwargs_for(request).get(REASONING_EFFORT_KEY).cloned();
+    let request = minimax(None, Some("none"));
+    assert_eq!(resolved_template_thinking(&request), Some(false), "none");
+    assert_eq!(effort_kwarg(&request), None, "none: no effort tag");
+    let request = minimax(Some(json!({"type": "enabled"})), Some("none"));
+    assert_eq!(
+        resolved_template_thinking(&request),
+        Some(true),
+        "none: thinking.enabled wins"
+    );
+    assert_eq!(effort_kwarg(&request), None, "none: not a level");
+    let request = minimax(None, Some("minimal"));
+    assert_eq!(
+        resolved_template_thinking(&request),
+        None,
+        "minimal: thinking on"
+    );
+    assert_eq!(
+        effort_kwarg(&request),
+        Some(json!("low")),
+        "minimal renders as low"
+    );
+    let request = minimax(Some(json!({"type": "disabled"})), Some("minimal"));
+    assert_eq!(resolved_template_thinking(&request), Some(false));
+    assert_eq!(
+        effort_kwarg(&request),
+        None,
+        "minimal: no effort while thinking is off"
+    );
+    for effort in ["low", "medium", "high", "xhigh", "max"] {
+        let request = minimax(None, Some(effort));
+        assert_eq!(resolved_template_thinking(&request), None, "{effort}");
+        assert_eq!(effort_kwarg(&request), Some(json!(effort)), "{effort}");
+        let request = minimax(Some(json!({"type": "disabled"})), Some(effort));
         assert_eq!(
-            resolved_template_thinking(&minimax(None, Some(effort))),
-            None,
-            "{effort}"
-        );
-        assert_eq!(
-            resolved_template_thinking(&minimax(Some(json!({"type": "disabled"})), Some(effort))),
+            resolved_template_thinking(&request),
             Some(false),
             "{effort}: thinking.disabled wins"
         );
+        assert_eq!(
+            effort_kwarg(&request),
+            None,
+            "{effort}: no effort while thinking is off"
+        );
     }
+    let request = minimax(None, Some("ultra_super_max_xyz"));
+    assert_eq!(resolved_template_thinking(&request), None);
+    assert_eq!(effort_kwarg(&request), None);
     assert_eq!(
         resolved_template_thinking(&minimax(Some(json!({"type": "disabled"})), None)),
         Some(false)
     );
+
+    // The request-level effort owns the key: an explicit entry the profile
+    // renders nothing for goes too; one stands when the request carries no
+    // field.
+    let mut request = minimax(None, Some("none"));
+    request.chat_template_kwargs = Some(HashMap::from([
+        (REASONING_EFFORT_KEY.to_string(), json!("high")),
+        ("custom".to_string(), json!(true)),
+    ]));
+    let kwargs = kwargs_for(&request);
+    assert!(!kwargs.contains_key(REASONING_EFFORT_KEY));
+    assert_eq!(kwargs.get("custom"), Some(&Value::Bool(true)));
+    let mut request = minimax(None, None);
+    request.chat_template_kwargs = Some(HashMap::from([(
+        REASONING_EFFORT_KEY.to_string(),
+        json!("high"),
+    )]));
     assert_eq!(
-        resolved_template_thinking(&minimax(Some(json!({"type": "enabled"})), Some("none"))),
-        Some(true)
+        kwargs_for(&request).get(REASONING_EFFORT_KEY),
+        Some(&json!("high"))
+    );
+
+    // The template's own switch sent as a kwarg counts where the template
+    // reads that key, ranking above the typed toggle and the effort as the
+    // template renders it: no effort tag beside its disabled branch, the
+    // level beside its enabled one. A template without the switch (the key
+    // undetected) keeps the effort: the kwarg is inert there.
+    let mut request = minimax(None, Some("high"));
+    request.chat_template_kwargs = Some(HashMap::from([(
+        "thinking_mode".to_string(),
+        json!("disabled"),
+    )]));
+    let kwargs = kwargs_for_switch(&request);
+    assert!(!kwargs.contains_key(REASONING_EFFORT_KEY));
+    assert_eq!(kwargs.get("thinking_mode"), Some(&json!("disabled")));
+    assert_eq!(
+        kwargs_for(&request).get(REASONING_EFFORT_KEY),
+        Some(&json!("high")),
+        "a template without the switch keeps the effort"
+    );
+    let mut request = minimax(Some(json!({"type": "disabled"})), Some("minimal"));
+    request.chat_template_kwargs = Some(HashMap::from([(
+        "thinking_mode".to_string(),
+        json!("enabled"),
+    )]));
+    assert_eq!(
+        kwargs_for_switch(&request).get(REASONING_EFFORT_KEY),
+        Some(&json!("low"))
     );
 }
 
@@ -1228,7 +1490,7 @@ fn tool_and_output_controls_are_forwarded_to_renderer() {
         "response_format": {"type": "json_object"}
     }))
     .unwrap();
-    let kwargs = build_chat_template_kwargs(&request);
+    let kwargs = kwargs_for(&request);
     assert_eq!(kwargs.get(TOOL_CHOICE_KEY), Some(&json!("required")));
     assert_eq!(
         kwargs.get(RESPONSE_FORMAT_KEY),
@@ -1241,7 +1503,7 @@ fn tool_and_output_controls_are_forwarded_to_renderer() {
         "messages": [{"role": "user", "content": "hello"}]
     }))
     .unwrap();
-    let kwargs = build_chat_template_kwargs(&bare);
+    let kwargs = kwargs_for(&bare);
     assert!(!kwargs.contains_key(TOOL_CHOICE_KEY));
     assert!(!kwargs.contains_key(RESPONSE_FORMAT_KEY));
 }
@@ -1276,7 +1538,7 @@ fn test_render_image_before_question_real_template() {
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "data:image/jpeg;base64,XXX".to_string(),
+                    url: "data:image/jpeg;base64,XXX".to_string().into(),
                     detail: None,
                     max_long_side_pixel: None,
                 },
@@ -1422,6 +1684,98 @@ fn flat_renderer_joins_the_prefill_and_reports_from_text() {
 
 // --- renderer-capability gates on the render path ------------------------
 
+fn json_renderer() -> llm_tokenizer::MockTokenizer {
+    llm_tokenizer::MockTokenizer::new()
+        .with_renderer_capabilities(RendererCapabilities {
+            native_assistant_continuation: true,
+            json_requires_separate_reasoning: true,
+            json_requires_empty_assistant_prefix: true,
+            ..Default::default()
+        })
+        .with_json_chat_template()
+}
+
+#[test]
+fn json_reasoning_separation_follows_the_renderer_contract() {
+    for format in [
+        json!({"type":"json_object"}),
+        json!({"type":"json_schema","json_schema":{"name":"answer","schema":{"type":"object"}}}),
+    ] {
+        let mut request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model":"m", "messages":[{"role":"user","content":"Hi"}],
+            "response_format":format, "separate_reasoning":false
+        }))
+        .unwrap();
+        let render = |request: &ChatCompletionRequest, tokenizer: &dyn Tokenizer| {
+            process_with_derived_profile(request, tokenizer, None, MediaPartOrder::MediaFirst)
+        };
+        assert!(render(&request, &json_renderer())
+            .unwrap_err()
+            .contains("separate_reasoning=true"));
+        assert!(render(&request, &llm_tokenizer::MockTokenizer::new()).is_ok());
+        request.separate_reasoning = true;
+        assert!(render(&request, &json_renderer()).is_ok());
+    }
+}
+
+#[test]
+fn json_continuation_checks_the_effective_flag_and_actual_response_format() {
+    for top_level in [false, true] {
+        for prefix in ["", "{\"answer\":"] {
+            let request: ChatCompletionRequest = serde_json::from_value(json!({
+                "model":"m", "messages":[{"role":"assistant","content":prefix}],
+                "response_format":{"type":"json_object"},
+                "continue_final_message":top_level,
+                "chat_template_kwargs":{
+                    "continue_final_message":true,
+                    "response_format":{"type":"text"}
+                }
+            }))
+            .unwrap();
+            let result = process_with_derived_profile(
+                &request,
+                &json_renderer(),
+                None,
+                MediaPartOrder::MediaFirst,
+            );
+            if prefix.is_empty() {
+                assert!(result.is_ok());
+            } else {
+                assert!(result.unwrap_err().contains("nonempty assistant"));
+            }
+        }
+    }
+}
+
+#[test]
+fn json_contract_does_not_restrict_text_responses_or_closed_history() {
+    for format in [Value::Null, json!({"type":"text"})] {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model":"m", "messages":[{"role":"assistant","content":"Partial"}],
+            "response_format":format, "continue_final_message":true,
+            "separate_reasoning":false
+        }))
+        .unwrap();
+        assert!(process_with_derived_profile(
+            &request,
+            &json_renderer(),
+            None,
+            MediaPartOrder::MediaFirst,
+        )
+        .is_ok());
+    }
+    let mut request = prefill_request();
+    request.continue_final_message = false;
+    request.response_format = Some(ResponseFormat::JsonObject);
+    assert!(process_with_derived_profile(
+        &request,
+        &json_renderer(),
+        None,
+        MediaPartOrder::MediaFirst,
+    )
+    .is_ok());
+}
+
 /// Render `request` through a mock that declares `capabilities` and
 /// hands back the message list it received as JSON, so both gates are
 /// observable without a checkpoint: which messages reach the template,
@@ -1450,6 +1804,8 @@ const NATIVE_CONTINUATION: RendererCapabilities = RendererCapabilities {
     native_assistant_continuation: true,
     raw_tool_call_arguments: false,
     leading_system_only: false,
+    json_requires_separate_reasoning: false,
+    json_requires_empty_assistant_prefix: false,
 };
 const RAW_ARGUMENTS: RendererCapabilities = RendererCapabilities {
     media_handling: llm_tokenizer::traits::MediaHandling::Preprocess,
@@ -1457,6 +1813,8 @@ const RAW_ARGUMENTS: RendererCapabilities = RendererCapabilities {
     native_assistant_continuation: false,
     raw_tool_call_arguments: true,
     leading_system_only: false,
+    json_requires_separate_reasoning: false,
+    json_requires_empty_assistant_prefix: false,
 };
 
 /// Without the capability the trailing assistant message is popped and its
@@ -2351,21 +2709,31 @@ fn resolved_template_thinking(request: &ChatCompletionRequest) -> Option<bool> {
 }
 
 /// The render reads the profile the stage carries, not one derived again
-/// from the model: a profile that reads an effort differently from the
-/// default one decides the toggle whatever the model id says, and a typed
-/// toggle wins under either.
+/// from the model: a profile that hands the template an effort differently
+/// from the default one decides the kwarg whatever the model id says, and a
+/// typed toggle wins under either.
 #[test]
 fn the_render_reads_the_carried_profile_not_the_model() {
-    // `none` switches thinking off under the default profile and leaves the
-    // template's default under MiniMax's.
+    let effort_kwarg = |request: &ChatCompletionRequest, provider: ProviderProfile| {
+        build_chat_template_kwargs(request, provider, None, |_| true)
+            .get(REASONING_EFFORT_KEY)
+            .cloned()
+    };
+    // `none` renders as sent under the default profile and renders no effort
+    // under MiniMax's; it switches thinking off under both.
     let request = effort_request(Some("none"));
+    assert_eq!(
+        effort_kwarg(&request, ProviderProfile::Generic),
+        Some(json!("none"))
+    );
+    assert_eq!(effort_kwarg(&request, ProviderProfile::Minimax), None);
     assert_eq!(
         resolve_template_thinking(&request, ProviderProfile::Generic),
         Some(false)
     );
     assert_eq!(
         resolve_template_thinking(&request, ProviderProfile::Minimax),
-        None
+        Some(false)
     );
 
     // A MiniMax model id with the default profile carried: the carried
@@ -2377,15 +2745,13 @@ fn the_render_reads_the_carried_profile_not_the_model() {
         ProviderProfile::Minimax
     );
     assert_eq!(
-        resolve_template_thinking(&named, ProviderProfile::Generic),
-        Some(false)
+        effort_kwarg(&named, ProviderProfile::Generic),
+        Some(json!("none"))
     );
-    assert_eq!(
-        resolve_template_thinking(&named, ProviderProfile::Minimax),
-        None
-    );
+    assert_eq!(effort_kwarg(&named, ProviderProfile::Minimax), None);
 
-    // A typed toggle wins over either profile's reading of the effort.
+    // A typed toggle wins over either profile's reading of the effort, and
+    // under MiniMax no effort renders while thinking is off.
     let toggled = thinking_request(json!({"type": "disabled"}), Some("high"));
     assert_eq!(
         resolve_template_thinking(&toggled, ProviderProfile::Generic),
@@ -2395,6 +2761,11 @@ fn the_render_reads_the_carried_profile_not_the_model() {
         resolve_template_thinking(&toggled, ProviderProfile::Minimax),
         Some(false)
     );
+    assert_eq!(
+        effort_kwarg(&toggled, ProviderProfile::Generic),
+        Some(json!("high"))
+    );
+    assert_eq!(effort_kwarg(&toggled, ProviderProfile::Minimax), None);
 }
 
 /// `process_chat_messages_with_placeholders` with the profile the request's
@@ -2412,6 +2783,7 @@ fn process_with_derived_profile(
         media_order,
         ProviderProfile::for_model(&request.model),
     )
+    .map_err(String::from)
 }
 
 /// A tool declared without a parameter schema reaches the template with

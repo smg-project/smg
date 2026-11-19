@@ -1,0 +1,193 @@
+# Regression gate for `cargo bench -p smg-policy-controller --bench decision`, run by
+# .github/workflows/benchmark-policy-engine.yml on pull requests through scripts/bench_gate.py. It is the
+# first row of that workflow's matrix; policy-engine-power-of-two.toml, policy-engine-affinity.toml,
+# policy-engine-prefix-hash.toml and policy-engine-bucket.toml gate the second, the third, the fourth and the
+# fifth row's binaries.
+#
+# The gate runs the whole file: the view build at 8, 64 and 512 workers (`policy_engine/view_build/<n>`),
+# the decision per preset at the same sizes (`policy_engine/decide/<preset>/<n>`; the `bucket` preset's rows
+# are the fifth row's), the least-load decision
+# with a credit held per row (`policy_engine/decide/least_load_credited/<n>`), the steer of a pool over its
+# thresholds on every row (`policy_engine/decide/all_vetoed/<n>`), a keyed decision under the
+# manual preset on its pin and off it at 8 workers (`policy_engine/decide/manual_keyed_hit/8`,
+# `policy_engine/decide/manual_keyed_miss/8`) and the spec's parse-and-validate time
+# (`policy_engine/spec/parse_validate`): 39 single-threaded rows, deterministic by construction (a fresh
+# seed per iteration), about six minutes a run: three interleaved runs a side take about 37 of the gate
+# step's 60 minutes, and the count of an id that fails by the clock has the room behind them.
+#
+# From sixteen workers on, a decision under `passthrough`, `random`, `round_robin` or `power_of_two` is made by
+# the rows its picker draws and no pass over the pool: those presets' rows at 64 and 512 workers hold the draw
+# over this file's fleet (about one worker in seventeen not ready), and their rows at 8 workers the whole pass.
+# The `draw` bench target holds the same presets over fleets of its own, one with every second worker not ready
+# among them; no gate reads it yet.
+#
+# Threshold (the method is described in tokenizer.toml). The identical-build spread, (max - min) / median
+# of the per-run criterion medians over six pinned runs of one build of main, each from a fresh copy of the
+# binary with a fresh criterion home, on a shared many-core build host at a load of 25 to 45:
+#
+#   rows                                                  identical build   asks
+#   view_build/{8,64,512}                                 0.8 - 1.1 %       10 %
+#   decide/<preset>/{64,512}, least_load_credited/{64,512} 0.6 - 4.1 %      10 %
+#   spec/parse_validate                                   3.7 %             10 %
+#   decide/<preset>/8, least_load_credited/8 (160-380 ns) 2.4 - 6.2 %       15 %
+#   decide/manual_keyed_{hit,miss}/8 (78 and 179 ns)      1.6 - 4.0 %       10 %
+#
+# The threshold is the smallest multiple of 5 % that is at least twice the identical-build spread, never
+# under 10 %. By this reading the eight-worker rows, the shortest and the widest, asked 15 %; the hosted
+# runner's own readings below decide what a row takes. On top of the threshold the gate
+# fails an id only when every pull-request run is slower than every base run (scripts/bench_gate.py), so
+# one slow run cannot fail the job. Read as three base and three head runs, the null case passed at every
+# threshold from 10 % up: 0 failed, 0 suspect of the 22 ids the file held at that reading.
+#
+# The two keyed rows were read later by the same measure, through the gate script itself: one build as both
+# sides (the second side the same binary with one byte appended past its image), three interleaved runs a
+# side on a reserved core of that build host at a load of 28 to 41. That second reading held all 33 ids
+# and passes at the gates below: 0 failed, 0 suspect. Four eight-worker rows read 7.1 to 9.3 % in it, above
+# the table's 6.2 %. Where two readings of a row differ on that host, the lower stands: its wide rows sit
+# inside single runs.
+#
+# The hosted runner's own spread was read from three jobs that ran both sides, three interleaved runs a
+# side, at a load of 1.0 to 3.5 before the runs. A side's three runs are one build, and a row's spread is
+# its wider side. Every row read 4.6 % or less in each job but two. view_build/64 read 6.9 %, 8.2 % and
+# 0.9 %, where the build host read 0.8 to 1.8 %. decide/least_load_credited/8 read 5.1 % in the third job.
+# The other eight-worker rows read 0.3 to 4.3 %. The gate runs on the hosted runner, so its readings
+# decide: a row that a job read above 5 % takes 15 %, and every other row takes 10 %.
+#
+# Placement. The workflow builds its binaries, the gate's pair and the summary run's, with every function on
+# a 64-byte boundary (RUSTFLAGS: `-C llvm-args=-align-all-functions=6`, beside the outliner flag of
+# .cargo/config.toml). symphony.toml records why: identical code sits in one of two speed states chosen by
+# where its unchanged hot functions land modulo 64, and a pull request's code size alone moved them. An
+# inserted regression on the decision path (100 dependent multiply-adds plus 12 per candidate before the
+# profile runs, never committed) is caught: 18 of 22 ids failed
+# and 0 were suspect, every decision row at +32 to +85 % (the eight-worker rows +34 to +75 %, the 64- and
+# 512-worker rows +37 to +85 %), confirmed by the re-measure round; the view build and the spec row, which the
+# mutant does not touch, read within 0.5 %.
+#
+# The view build's buffer has a placement of its own (benches/common/placed.rs): the three view_build rows
+# write into a buffer that starts on a page's start. A row is written field by field, and a page boundary
+# inside the buffer can split one of its stores, at 6.5 to 7.5 ns a split store: 20 to 26 % of the row at 8
+# workers, in 16 of the 256 places an allocator hands a buffer. The place follows what the process
+# allocated before (the length of the binary's path moved it), so each side sat in one state for a whole
+# job and the row could fail or pass a change that did not touch it. The identical-build spread of the
+# table above was read in one placement; the placed buffer makes it the only one.
+#
+# Count. The 64-byte boundary keeps a function's start on a cache line and no more: code that grows ahead of
+# a function still moves it inside its page, and the same machine code then reads slower by time alone. A
+# pull request grew a cold function ahead of the engine's decision by 109 bytes, and the decision sat 384
+# bytes further (0x0c0 to 0x240 of its page). The hosted job failed `decide/cache_aware/8` at +10.4 % with
+# every run apart, and six more rows of four presets read +3.9 to +8.7 %, every run apart (2026-11-15). Each
+# of the seven runs the same instruction count on both sides, 3,234 to 16,657 an iteration. So
+# `count = true`: an id that still fails after its re-measurement is counted on both binaries under
+# valgrind's callgrind (scripts/bench_gate.py) until the run's budget ends (`run_budget` below). It is a
+# placement, reported with the count and the two places and not failed, on three facts: the same count in
+# every batch after the first, a measured function that starts at another address in the pull request's
+# binary, and a change within twice the id's threshold. The same count with the function where it was
+# places nothing, and no count places an id beyond twice its threshold. An id that still fails on a count
+# that reads level is measured again from a fresh copy of each binary, and fails where that measurement
+# fails it too. An id whose base median is zero and one whose turn the budget cuts are not counted: each
+# keeps the time's verdict, and its line says why. Two counts that differ are each taken once more, and
+# neither places the id. That job's own results read PASS under it with one placement:
+# `decide/cache_aware/8`, +10.4 % against 10 %, 4,001 instructions an iteration on both sides, the decision
+# at 0x0c0 of its page in one binary and at 0x240 in the other.
+#
+# A whole pass. The `decide/` ids that score the pool time a whole decision: about 150 code lines of 64
+# bytes over 16 to 20 pages, where a set of the processor's op cache holds four or five. Every build
+# leaves some sets over, and each change to the binary draws again which. A change to the decision itself
+# moves its count by a few instructions, so the same count is not there to read and the three facts never
+# hold. A pull request read the affinity gate's `decide/cache_aware/8` and `/64` 15.2 and 11.9 % slower on
+# 2 and 6 instructions more an iteration, 0.04 and 0.03 % of their counts; their op-cache misses a
+# decision went from 58 to 78 and from 115 to 343, and the same two sources built without the alignment
+# read them 5.1 and 3.8 % faster (2026-11-16). So the `decide/` entries below carry `whole_pass = true`,
+# all but the nine that make no pass over the pool: such an id is a placement on a level count, the two
+# counts within half a percent of each other with each binary's own two the same, and a change within
+# twice its threshold. No function's address is asked, since any line of the pass can move. A count that
+# moved further leaves the failure: work inserted into the decision (16 dependent multiply-adds and 2 more
+# a candidate, never committed) read the same two ids 11.3 and 16.2 % slower on counts 3.4 and 3.1 %
+# higher, 159 and 663 instructions an iteration, and both failed; the id at 512 rows read 20.1 % slower,
+# beyond twice its threshold, and was not counted.
+#
+# Read on this file's 33 ids, both binaries from paths of one length as the gate runs them, 2 to 3 s a count:
+#
+#   pair                                                          same   moved   not steady
+#   one build against its own copy                                31     1       1
+#   cold code of that size ahead of the decision, no other line   31     1       1
+#   the job's pair                                                31     0       2
+#   planted work, 10 multiply-adds plus one a candidate           3      25      5
+#
+# The planted work (dependent steps at the start of the decision, never committed) moves the count on 25 of
+# the 30 decision rows, +1.9 to +14.8 %, the same in two counts of each side; the three view rows count the
+# same. The gate fails it as before: 11 rows failed by time, +10.0 to +44.4 %, and none read as a placement.
+# The cold code alone (384 bytes, never committed) puts the decision where the pull request put it. By time,
+# fifteen interleaved runs a side at a host load of 65 to 137, `decide/cache_aware/8` read +3.3 % under it
+# and the other six of the seven rows within 1.4 %.
+#
+# The ids that are not the same in a pair of the same work do not count steadily. A 512-worker row reads 12
+# instructions an iteration more or fewer from one process to the next (0.01 to 0.03 %): it reads as moved
+# when each side happens to repeat itself, as not steady otherwise. `decide/manual_keyed_miss/8` and
+# `spec/parse_validate` differ between two counts of one binary by 0.03 to 3.3 %. Each keeps the time's
+# verdict, which a second measurement decides where every count is within half a percent. The count does
+# not see a change that runs the same instructions slower (a load that misses, a branch that stops
+# predicting): where its measured function moved too, or for a marked id on any level count, such a row
+# reads as a placement up to twice its threshold, by name, in the summary. A placement is still a row to
+# read.
+#
+# A build that starts every function on a page of its own was read on the same pairs and not taken. The pull
+# request's head against its parent reads level under it (-2.2 to +4.1 % on the seven rows, fifteen runs a
+# side), but each of the seven runs 21 to 44 % slower than under the 64-byte boundary, and the binary is
+# 26.0 MB against 8.6 MB.
+#
+# Every job uploads bench-gate/results.json with the raw per-run medians of both sides; the hosted runner's
+# own spread is read from those.
+
+repeats = 3
+count = true
+# The count ends 3,480 s into the run: the gate step's bound is 60 minutes, and the report is written
+# in the two minutes behind the count. No count starts in the budget's last 30 s.
+run_budget = 3480
+filter = "^policy_engine/"
+
+# The files that feed this binary beyond the measured crate: the base side is built with them as the
+# pull request has them (bench_gate.py build --sources-from), so a row added here cannot move the
+# gated rows through the binary's inlining (symphony.toml records the case). A row joins this binary, in
+# the pull request whose change it measures, only when it calls nothing the base branch's crate lacks. A
+# row that times an answer only the change gives is listed only where the engine gives it, so in the
+# pull request that brings the answer the base side lists none. The `all_vetoed` rows came so; on a
+# later base both sides list them. Any other row goes to a bench target of its own.
+sources = [
+    "crates/policy_controller/benches/decision.rs",
+    "crates/policy_controller/benches/common/mod.rs",
+    "crates/policy_controller/benches/common/placed.rs",
+    "crates/policy_controller/benches/common/preset.rs",
+]
+
+# The first gate whose pattern matches an id decides its threshold.
+[[gate]]
+pattern = "^policy_engine/decide/least_load_credited/8$"
+threshold = 0.15
+whole_pass = true
+note = "5.1 % in one of three jobs on the hosted runner"
+
+[[gate]]
+pattern = "^policy_engine/view_build/64$"
+threshold = 0.15
+note = "6.9 and 8.2 % in two of three jobs on the hosted runner"
+
+# Nine decide ids make no pass over the pool and carry no mark: under `passthrough`, `power_of_two`,
+# `random` and `round_robin` at 64 and 512 workers the decision is made by the rows its picker draws, and
+# the keyed hit decides on its pin. The mark's evidence was read on decisions that score the pool, so
+# these keep the rule of one function until a reading of their own.
+[[gate]]
+pattern = "^policy_engine/decide/((passthrough|power_of_two|random|round_robin)/(64|512)|manual_keyed_hit/8)$"
+threshold = 0.10
+note = "identical build 4.6 % or less on the hosted runner; no pass over the pool"
+
+[[gate]]
+pattern = "^policy_engine/decide/"
+threshold = 0.10
+whole_pass = true
+note = "identical build 4.6 % or less on the hosted runner; a whole decision"
+
+[[gate]]
+pattern = "^policy_engine/"
+threshold = 0.10
+note = "identical build 4.6 % or less on the hosted runner"

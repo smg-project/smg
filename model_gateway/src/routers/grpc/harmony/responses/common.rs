@@ -1,6 +1,6 @@
 //! Shared helpers and state tracking for Harmony Responses
 
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::Arc};
 
 use openai_protocol::{
     common::ToolCall,
@@ -18,7 +18,9 @@ use uuid::Uuid;
 use super::execution::{convert_mcp_tools_to_response_tools, ToolResult};
 use crate::routers::{
     common::openai_bridge::{self, FormatRegistry, ResponseFormat},
-    grpc::common::responses::{utils::resolve_function_identity, ResponsesContext},
+    grpc::common::responses::{
+        streaming::OutputItemKind, utils::resolve_function_identity, ResponsesContext,
+    },
 };
 
 /// Record of a single MCP tool call execution
@@ -82,6 +84,29 @@ pub(super) fn open_mcp_session<'a>(
     session
 }
 
+/// The loop's request back as an owned value once an iteration has run with
+/// it: the iteration's context let go of its share when the run returned, so
+/// this is a move; a copy only while something still shares it.
+pub(super) fn owned_request(request: Arc<ResponsesRequest>) -> ResponsesRequest {
+    Arc::try_unwrap(request).unwrap_or_else(|shared| (*shared).clone())
+}
+
+/// The request's tool list without the server tools (the function tools
+/// `is_server_tool` names, the session's): the final turn after the request's
+/// `max_tool_calls` offers the model the caller's own tools only, so it
+/// answers on the results it has.
+pub(super) fn withhold_server_tools(
+    request: &mut ResponsesRequest,
+    is_server_tool: impl Fn(&str) -> bool,
+) {
+    if let Some(tools) = request.tools.as_mut() {
+        tools.retain(|tool| {
+            !matches!(tool, ResponseTool::Function(function)
+                if is_server_tool(&function.function.name))
+        });
+    }
+}
+
 /// Build next request with tool results appended to history
 ///
 /// Constructs a new ResponsesRequest with:
@@ -116,7 +141,7 @@ pub(super) fn build_next_request_with_tools(
     // Add reasoning if present (from analysis channel)
     if let Some(analysis_text) = analysis {
         items.push(ResponseInputOutputItem::new_reasoning(
-            format!("reasoning_{assistant_id}"),
+            OutputItemKind::Reasoning.new_id(),
             vec![],
             vec![ResponseReasoningContent::ReasoningText {
                 text: analysis_text,
@@ -293,5 +318,35 @@ mod namespace_tests {
         assert_eq!(wire["name"], "lookup");
         assert_eq!(wire["namespace"], "weather");
         assert_eq!(wire["call_id"], "call_test");
+    }
+
+    #[test]
+    fn the_final_turn_withholds_the_servers_functions_and_keeps_the_callers_tools() {
+        let mut request: ResponsesRequest = namespace_test_request();
+        request.tools = from_value(serde_json::json!([
+            {"type": "function", "name": "lookup", "parameters": {"type": "object"}},
+            {"type": "function", "name": "echo", "parameters": {"type": "object"}},
+            {"type": "mcp", "server_label": "tools", "server_url": "http://127.0.0.1:1/mcp"},
+        ]))
+        .unwrap();
+
+        withhold_server_tools(&mut request, |name| name == "echo");
+
+        let kept: Vec<serde_json::Value> = request
+            .tools
+            .unwrap_or_default()
+            .iter()
+            .map(|tool| {
+                let wire = serde_json::to_value(tool).unwrap();
+                serde_json::json!([wire["type"], wire["name"]])
+            })
+            .collect();
+        assert_eq!(
+            kept,
+            vec![
+                serde_json::json!(["function", "lookup"]),
+                serde_json::json!(["mcp", serde_json::Value::Null]),
+            ]
+        );
     }
 }

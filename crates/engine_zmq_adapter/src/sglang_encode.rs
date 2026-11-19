@@ -5,7 +5,7 @@
 //! supplies.
 //!
 //! The scheduler never fetches media on that side. The frontend hands the
-//! request's image references to the encoders (SGLang's own receiver object:
+//! request's media references to the encoders (SGLang's own receiver object:
 //! it splits the items across the encoder list, posts each encoder its
 //! share over SGLang's encoder protocol, and keeps the URL snapshot), and
 //! marks the scheduler's request with the three slots the scheduler's
@@ -41,13 +41,60 @@ pub type EncodeFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 /// request went out, or for a request that never did, is logged and dropped.
 pub type EncodeDispatchErrorSink = Arc<dyn Fn(EncoderDispatchErrorReq) + Send + Sync>;
 
+/// The media references one request names for the encoders, by modality,
+/// each list in prompt order: what the engine's own frontend reads off its
+/// request (`image_data`, `video_data`, `audio_data`) before it assigns the
+/// items across the encoders, modality by modality.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EncodeMediaRefs {
+    pub image_urls: Vec<String>,
+    pub video_urls: Vec<String>,
+    pub audio_urls: Vec<String>,
+}
+
+impl EncodeMediaRefs {
+    /// Whether no reference is named at all.
+    pub fn is_empty(&self) -> bool {
+        self.image_urls.is_empty() && self.video_urls.is_empty() && self.audio_urls.is_empty()
+    }
+
+    /// Whether a video or an audio reference is named: what the encoders'
+    /// gRPC transport does not take.
+    pub fn names_video_or_audio(&self) -> bool {
+        !self.video_urls.is_empty() || !self.audio_urls.is_empty()
+    }
+}
+
+/// The transport the language side's receiver dispatches over, the engine's
+/// receiver mode: over HTTP encoders every modality the engine's encoder
+/// runtime runs (image, video, audio) is assigned and posted modality by
+/// modality; the encoders' gRPC service takes images only (the engine's own
+/// receiver fails the rest on its dispatch thread, after the request went
+/// out, so the caller refuses them by name before the dispatch).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EncodeTransport {
+    Http,
+    Grpc,
+}
+
+impl EncodeTransport {
+    /// Whether this transport takes `media` as named: images on either,
+    /// video and audio over HTTP only.
+    pub fn takes(self, media: &EncodeMediaRefs) -> bool {
+        match self {
+            Self::Http => true,
+            Self::Grpc => !media.names_video_or_audio(),
+        }
+    }
+}
+
 /// One request's media, handed to the dispatcher: the scheduler-side request
 /// id (the fan-out's `{rid}-{i}` for `n > 1`: every choice is its own
-/// scheduler request and needs its own embeddings), its image references in
-/// prompt order, and where a later failure of the dispatch is to be reported.
+/// scheduler request and needs its own embeddings), its media references by
+/// modality, and where a later failure of the dispatch is to be reported.
 pub struct EncodeDispatchRequest {
     pub rid: String,
-    pub image_urls: Vec<String>,
+    pub media: EncodeMediaRefs,
     pub on_error: EncodeDispatchErrorSink,
 }
 
@@ -106,9 +153,13 @@ impl Drop for EncodeRelease {
 }
 
 /// The dispatcher the lifecycle owner supplies for a language-side worker:
-/// one call per scheduler request carrying image references, before the
-/// request is submitted.
+/// one call per scheduler request carrying media references, before the
+/// request is submitted. Its transport is the receiver mode it was started
+/// in; the caller refuses what that transport does not take before it calls.
 pub trait SglangEncodeDispatcher: Send + Sync + 'static {
+    /// The transport the dispatcher's receiver runs, fixed at its start.
+    fn transport(&self) -> EncodeTransport;
+
     fn dispatch(
         &self,
         request: EncodeDispatchRequest,

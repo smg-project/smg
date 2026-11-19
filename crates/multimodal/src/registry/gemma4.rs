@@ -41,17 +41,8 @@ const FALLBACK_FPS: f64 = 24.0;
 pub(super) struct Gemma4Spec;
 
 impl Gemma4Spec {
-    fn config_token_id(metadata: &ModelMetadata, field: &str) -> RegistryResult<TokenId> {
-        metadata
-            .config_u32(&[field])
-            .map(|id| id as TokenId)
-            .ok_or_else(|| ModelRegistryError::MissingConfigField {
-                field: field.to_string(),
-            })
-    }
-
     fn token_for(metadata: &ModelMetadata, field: &str) -> RegistryResult<String> {
-        let id = Self::config_token_id(metadata, field)?;
+        let id = metadata.config_token_id(field)?;
         metadata
             .tokenizer
             .id_to_token(id as u32)
@@ -61,10 +52,7 @@ impl Gemma4Spec {
     }
 
     fn unsupported(modality: Modality) -> ModelRegistryError {
-        ModelRegistryError::UnsupportedModality {
-            spec: "gemma4",
-            modality,
-        }
+        ModelRegistryError::unsupported("gemma4", modality)
     }
 
     /// One replacement per image: `[begin] + n x <|image|> + [end]`.
@@ -73,9 +61,9 @@ impl Gemma4Spec {
         preprocessed: &PreprocessedEncoderInputs,
     ) -> RegistryResult<Vec<PromptReplacement>> {
         let placeholder = Self::token_for(metadata, "image_token_id")?;
-        let image = Self::config_token_id(metadata, "image_token_id")?;
-        let begin = Self::config_token_id(metadata, "boi_token_id")?;
-        let end = Self::config_token_id(metadata, "eoi_token_id")?;
+        let image = metadata.config_token_id("image_token_id")?;
+        let begin = metadata.config_token_id("boi_token_id")?;
+        let end = metadata.config_token_id("eoi_token_id")?;
         Ok(preprocessed
             .feature_token_counts
             .iter()
@@ -163,9 +151,9 @@ impl Gemma4Spec {
         sampling: &[Option<&VideoSamplingInfo>],
     ) -> RegistryResult<Vec<PromptReplacement>> {
         let placeholder = Self::token_for(metadata, "video_token_id")?;
-        let video = Self::config_token_id(metadata, "video_token_id")?;
-        let begin = Self::config_token_id(metadata, "boi_token_id")?;
-        let end = Self::config_token_id(metadata, "eoi_token_id")?;
+        let video = metadata.config_token_id("video_token_id")?;
+        let begin = metadata.config_token_id("boi_token_id")?;
+        let end = metadata.config_token_id("eoi_token_id")?;
         let frame_counts = Self::frame_counts(preprocessed)?;
         preprocessed
             .feature_token_counts
@@ -243,7 +231,7 @@ impl ModelProcessorSpec for Gemma4Spec {
         Some(match modality {
             Modality::Image => ModalityHooks {
                 placeholder: |metadata| Self::token_for(metadata, "image_token_id"),
-                placeholder_id: |metadata| Self::config_token_id(metadata, "image_token_id"),
+                placeholder_id: |metadata| metadata.config_token_id("image_token_id"),
                 replacements: |metadata, preprocessed, _, _| {
                     Self::image_replacements(metadata, preprocessed)
                 },
@@ -254,7 +242,7 @@ impl ModelProcessorSpec for Gemma4Spec {
             },
             Modality::Video => ModalityHooks {
                 placeholder: |metadata| Self::token_for(metadata, "video_token_id"),
-                placeholder_id: |metadata| Self::config_token_id(metadata, "video_token_id"),
+                placeholder_id: |metadata| metadata.config_token_id("video_token_id"),
                 replacements: |metadata, preprocessed, media, _| {
                     Self::video_replacements(metadata, preprocessed, &Self::usable_sampling(media))
                 },
@@ -276,7 +264,7 @@ impl ModelProcessorSpec for Gemma4Spec {
             },
             Modality::Audio => ModalityHooks {
                 placeholder: |metadata| Self::token_for(metadata, "audio_token_id"),
-                placeholder_id: |metadata| Self::config_token_id(metadata, "audio_token_id"),
+                placeholder_id: |metadata| metadata.config_token_id("audio_token_id"),
                 replacements: |_, _, _, _| Err(Self::unsupported(Modality::Audio)),
                 layouts: image_layouts,
                 keep_on_cpu: &[],
@@ -292,7 +280,7 @@ impl ModelProcessorSpec for Gemma4Spec {
     }
 
     fn placeholder_token_id(&self, metadata: &ModelMetadata) -> RegistryResult<TokenId> {
-        Self::config_token_id(metadata, "image_token_id")
+        metadata.config_token_id("image_token_id")
     }
 
     /// The family sets no per-request media count of its own for any of its
@@ -361,10 +349,7 @@ impl ModelProcessorSpec for Gemma4Spec {
                     },
                 )?,
             )),
-            _ => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            _ => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
 

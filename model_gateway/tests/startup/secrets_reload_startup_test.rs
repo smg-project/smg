@@ -19,6 +19,7 @@ use gateway_launch::{
     base_args, free_ports, log_with_line, request, serial, serving_accepts, Gateway, EXIT_TIMEOUT,
     IP,
 };
+use smg::middleware::key_fingerprint;
 
 use crate::gateway_launch;
 
@@ -97,6 +98,18 @@ fn a_reload_puts_the_rotated_files_keys_in_force_without_a_restart() {
     assert!(
         !serving_accepts(addr, Some(SERVING_KEY)),
         "the old key is out"
+    );
+    // The configuration view names the key in force, the rotated one.
+    let (code, view) =
+        request(addr, "GET", "/config", Some(ADMIN_KEY), None).expect("the gateway answers");
+    assert_eq!(code, 200, "{view}");
+    assert!(
+        view.contains(&key_fingerprint(ROTATED_SERVING_KEY)),
+        "the view names the rotated key: {view}"
+    );
+    assert!(
+        !view.contains(&key_fingerprint(SERVING_KEY)),
+        "the start's key is gone from the view: {view}"
     );
 
     // A file that cannot be used (an unknown role): 422 naming the field,

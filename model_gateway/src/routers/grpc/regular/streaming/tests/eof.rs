@@ -1,19 +1,22 @@
 //! Test gateway parsers and SSE events with exact gRPC frames.
 
-use std::{sync::atomic::Ordering, time::Duration};
+use std::{pin::Pin, sync::atomic::Ordering, task::Poll, time::Duration};
 
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use bytes::BufMut;
-use futures::{stream, StreamExt as _};
+use futures::{stream, Stream, StreamExt as _};
 use http_body::Frame;
 use http_body_util::StreamBody;
 use openai_protocol::{
     chat::ChatCompletionRequest, model_card::ModelCard, worker::HealthCheckConfig,
 };
 use prost::Message as ProstMessage;
-use smg_grpc_client::vllm_engine::{
-    proto, proto::generate_response::Response as GenerationEvent, AbortOnDropStream,
-    VllmEngineClient,
+use smg_grpc_client::{
+    codec::SizedProstCodec,
+    vllm_engine::{
+        proto, proto::generate_response::Response as GenerationEvent, AbortOnDropStream,
+        VllmEngineClient,
+    },
 };
 use tokio::{sync::oneshot, task::JoinHandle, time::timeout};
 use tonic::codec::Codec;
@@ -27,7 +30,7 @@ use crate::{
         grpc::{regular::processor::ResponseProcessor, test_engine::mock_engine},
     },
     worker::{
-        circuit_breaker::{CircuitBreakerConfig, CircuitState},
+        health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
         BasicWorkerBuilder, Worker, WorkerRegistry,
     },
 };
@@ -40,6 +43,11 @@ pub(super) fn runtime() -> tokio::runtime::Runtime {
         .enable_all()
         .build()
         .expect("a current-thread runtime")
+}
+
+/// The next pull on `body`, polled once.
+pub(super) async fn pull(body: &mut DrivenBody) -> Poll<Option<Result<Bytes, std::io::Error>>> {
+    std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut *body).poll_next(cx))).await
 }
 
 pub(crate) fn chunk(index: u32, text: &str) -> proto::GenerateResponse {
@@ -172,9 +180,9 @@ pub(super) fn trailers_frame(grpc_status: &'static str) -> Frame<Bytes> {
 pub(super) fn decoded_stream<M, S>(body: S) -> tonic::Streaming<M>
 where
     M: ProstMessage + Default + Send + 'static,
-    S: futures::Stream<Item = Result<Frame<Bytes>, tonic::Status>> + Send + 'static,
+    S: Stream<Item = Result<Frame<Bytes>, tonic::Status>> + Send + 'static,
 {
-    let mut codec = tonic_prost::ProstCodec::<M, M>::default();
+    let mut codec = SizedProstCodec::<M, M>::default();
     tonic::Streaming::new_response(
         codec.decoder(),
         StreamBody::new(body),
@@ -188,7 +196,7 @@ where
 /// stream that was never dispatched (nothing to cancel on drop).
 fn response_stream<S>(body: S, client: VllmEngineClient) -> ProtoStream
 where
-    S: futures::Stream<Item = Result<Frame<Bytes>, tonic::Status>> + Send + 'static,
+    S: Stream<Item = Result<Frame<Bytes>, tonic::Status>> + Send + 'static,
 {
     let stream = AbortOnDropStream::new(decoded_stream(body), "eof-test".to_string(), client);
     // No generation was sent to the mock, so there is nothing to cancel.
@@ -924,6 +932,8 @@ pub(crate) fn response_processor() -> ResponseProcessor {
 pub(crate) fn messages_spec(thinking: bool) -> MessagesResponseSpec {
     MessagesResponseSpec {
         prompt_tokens: 0,
+        max_tokens: 4096,
+        context_window: None,
         thinking_requested: thinking,
         thinking_text_returned: true,
         reasoning_in_prefill: false,
@@ -2273,11 +2283,13 @@ async fn messages_eof_emits_thinking_tail_before_block_stop() {
             .iter()
             .filter_map(|event| event["type"].as_str())
             .collect();
+        // The tail, then the block's signature, then the stop.
         assert_eq!(
             types,
             [
                 "message_start",
                 "content_block_start",
+                "content_block_delta",
                 "content_block_delta",
                 "content_block_delta",
                 "content_block_stop",
@@ -2286,10 +2298,13 @@ async fn messages_eof_emits_thinking_tail_before_block_stop() {
             ]
         );
         assert_eq!(events[1]["content_block"]["type"], "thinking");
+        assert_eq!(events[4]["delta"]["type"], "signature_delta");
+        // The engine's `length` after 17 tokens of a 4096-token budget is the
+        // window's; an EOF without a Complete ends the turn.
         assert_eq!(
-            events[5]["delta"]["stop_reason"],
+            events[6]["delta"]["stop_reason"],
             if send_complete {
-                "max_tokens"
+                "model_context_window_exceeded"
             } else {
                 "end_turn"
             }
@@ -2325,6 +2340,8 @@ async fn messages_stream_stop_reason_follows_what_the_engine_matched() {
         let (tx, rx) = sse_channel();
         let spec = MessagesResponseSpec {
             prompt_tokens: 0,
+            max_tokens: 4096,
+            context_window: None,
             thinking_requested: false,
             thinking_text_returned: true,
             reasoning_in_prefill: false,
@@ -2385,6 +2402,9 @@ async fn qwen_xml_messages(text: &str, finish: &str, stream: bool) -> (Vec<Strin
     let mut last = complete(0, finish);
     if let Some(GenerationEvent::Complete(complete)) = &mut last.response {
         complete.output_ids = text.chars().map(u32::from).collect();
+        // The engine's count is the output's: a `length` finish past the
+        // request's budget of 16 is the budget's, not the window's.
+        complete.completion_tokens = complete.output_ids.len() as u32;
     }
     let (grpc_stream, server) = scripted_stream(vec![chunk(0, text), last], "0").await;
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
@@ -2694,6 +2714,8 @@ async fn messages_blocks_and_inputs(
 ) -> (Vec<String>, Vec<Value>) {
     let spec = MessagesResponseSpec {
         prompt_tokens: 0,
+        max_tokens: 4096,
+        context_window: None,
         thinking_requested: true,
         thinking_text_returned: true,
         reasoning_in_prefill: false,
@@ -2815,7 +2837,7 @@ async fn messages_blocks_do_not_overlap_when_reasoning_calls_and_text_alternate(
 }
 
 /// A processor with the registered parsers `tool` and `reasoning`.
-fn named_processor(tool: &str, reasoning: &str) -> StreamingProcessor {
+pub(super) fn named_processor(tool: &str, reasoning: &str) -> StreamingProcessor {
     streaming_processor(utils::ParserResolver::with_flags(
         Arc::new(WorkerRegistry::new()),
         Some(tool.to_string()),
@@ -4054,4 +4076,279 @@ async fn the_response_reads_the_parser_names_the_spec_carries() {
             assert_eq!(text, content);
         }
     }
+}
+
+/// A `logprobs` completion under the stop `zz` whose second chunk is the one
+/// token `z`: the stop decoder holds its text, and the chunk goes out all the
+/// same with an empty text and its one scored position (the held text is
+/// flushed later without logprobs, so a dropped chunk loses that position).
+#[tokio::test]
+async fn completion_logprobs_go_out_with_a_chunk_whose_text_is_held() {
+    let (wire, events) = completion_events(
+        vec![
+            chunk_with_logprobs(0, "ab"),
+            chunk_with_logprobs(0, "z"),
+            complete(0, "stop"),
+        ],
+        serde_json::json!({"model":"eof-test", "prompt":"test", "stream":true,
+            "max_tokens":4, "logprobs":2, "stop":"zz"}),
+    )
+    .await;
+    assert!(
+        !events.iter().any(|event| event.get("error").is_some()),
+        "{wire}"
+    );
+    let scored: Vec<&Value> = events
+        .iter()
+        .filter(|event| event["choices"][0]["logprobs"].is_object())
+        .collect();
+    assert_eq!(scored.len(), 2, "{wire}");
+    assert_eq!(scored[1]["choices"][0]["text"], "", "{wire}");
+    assert_eq!(
+        scored[1]["choices"][0]["logprobs"]["tokens"],
+        serde_json::json!(["z"]),
+        "{wire}"
+    );
+    assert_eq!(
+        scored[1]["choices"][0]["logprobs"]["text_offset"],
+        serde_json::json!([2]),
+        "{wire}"
+    );
+    let text: String = events
+        .iter()
+        .filter_map(|event| event["choices"][0]["text"].as_str())
+        .collect();
+    assert_eq!(text, "abz", "the held character arrives at the end: {wire}");
+}
+
+/// A `logprobs` completion whose second chunk carries a logprobs message of
+/// zero positions and no token (a wire may send it empty): the chunk that
+/// scored two positions goes out with them, and no event carries empty lists.
+#[tokio::test]
+async fn completion_logprobs_go_out_with_the_chunks_that_scored_a_position() {
+    let mut unscored = chunk_of_ids(0, Vec::new());
+    if let Some(GenerationEvent::Chunk(chunk)) = &mut unscored.response {
+        chunk.output_logprobs = Some(proto::OutputLogProbs::default());
+    }
+    let (wire, events) = completion_events(
+        vec![chunk_with_logprobs(0, "ab"), unscored, complete(0, "stop")],
+        serde_json::json!({"model":"eof-test", "prompt":"test", "stream":true,
+            "max_tokens":4, "logprobs":2}),
+    )
+    .await;
+    assert!(
+        !events.iter().any(|event| event.get("error").is_some()),
+        "{wire}"
+    );
+    let scored: Vec<&Value> = events
+        .iter()
+        .filter(|event| event["choices"][0]["logprobs"].is_object())
+        .collect();
+    assert!(
+        !events.iter().any(|event| {
+            event["choices"][0]["logprobs"]["tokens"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+        }),
+        "an event carried empty logprobs lists: {wire}"
+    );
+    assert_eq!(scored.len(), 1, "{wire}");
+    assert_eq!(
+        scored[0]["choices"][0]["logprobs"]["tokens"],
+        serde_json::json!(["a", "b"]),
+        "{wire}"
+    );
+}
+
+/// A structured JSON response keeps the Inkling framing spellings inside its
+/// strings, streamed (split inside a quoted spelling) and complete, while the
+/// framing outside the strings still separates reasoning from content.
+#[tokio::test]
+async fn chat_json_mode_preserves_literals_in_streaming_and_complete_responses() {
+    let payload = r#"{"value":"α<|content_thinking|>quoted<|end_message|>"}"#;
+    let framed = format!(
+        "<|message_model|><|content_thinking|>check<|end_message|>\
+         <|message_model|><|content_text|>{payload}<|end_message|>"
+    );
+    for response_format in [
+        serde_json::json!({"type": "json_object"}),
+        serde_json::json!({"type": "json_schema", "json_schema": {
+            "name": "answer", "schema": {"type": "object"}
+        }}),
+    ] {
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "eof-test", "messages": [], "response_format": response_format,
+            "separate_reasoning": true, "stream": true, "n": 2
+        }))
+        .unwrap();
+        let spec = ChatResponseSpec::from(&request);
+        assert!(spec.json_mode);
+        let resolver = || {
+            utils::ParserResolver::with_flags(
+                Arc::new(WorkerRegistry::new()),
+                None,
+                Some("inkling".to_string()),
+            )
+        };
+        let (stream, server) = scripted_stream(
+            vec![
+                chunk(
+                    0,
+                    "<|message_model|><|content_text|>{\"value\":\"α<|content_thi",
+                ),
+                chunk(1, &framed),
+                chunk(0, "nking|>quoted<|end_message|>\"}<|end_message|>"),
+                complete(1, "stop"),
+                complete(0, "stop"),
+            ],
+            "0",
+        )
+        .await;
+        let (tx, rx) = sse_channel();
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
+        let result = streaming_processor(resolver())
+            .process_streaming_chunks(
+                stream,
+                dispatch(),
+                tokenizer.clone(),
+                (None, None, false, false, false),
+                spec.clone(),
+                &tx,
+                None,
+            )
+            .await;
+        drop(tx);
+        let events = collect_events(rx).await;
+        server.abort();
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(chat_text(&events, 0, "content"), payload);
+        assert_eq!(chat_text(&events, 1, "content"), payload);
+        assert_eq!(chat_text(&events, 0, "reasoning_content"), "");
+        assert_eq!(chat_text(&events, 1, "reasoning_content"), "check");
+
+        let complete = ProtoGenerateComplete::Vllm(Box::new(proto::GenerateComplete {
+            output_ids: framed.chars().map(u32::from).collect(),
+            finish_reason: "stop".to_string(),
+            ..Default::default()
+        }));
+        let mut decoder = StopSequenceDecoder::new(
+            tokenizer.clone(),
+            llm_tokenizer::StopSequenceConfig::default(),
+            false,
+        );
+        let (choice, _) = unary_processor(resolver())
+            .process_single_choice(
+                "test-request",
+                &complete,
+                0,
+                &spec,
+                "eof-test",
+                &tokenizer,
+                &mut decoder,
+                0,
+                true,
+                false,
+                Some("inkling"),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(choice.message.content.as_deref(), Some(payload));
+        assert_eq!(choice.message.reasoning_content.as_deref(), Some("check"));
+    }
+}
+
+/// With tools offered, a structured JSON response keeps a quoted tool-call
+/// spelling as content, streamed (split inside the spelling) and complete:
+/// the tool parser does not read it as a call or drop framing spellings.
+#[tokio::test]
+async fn chat_json_mode_with_tools_keeps_quoted_tool_markers_as_content() {
+    let payload = concat!(
+        r#"{"value":"<|content_invoke_tool_json|>{\"name\":\"lookup\",\"args\":{}}"#,
+        r#"<|end_message|> and <|content_thinking|>x"}"#
+    );
+    let framed = format!("<|message_model|><|content_text|>{payload}<|end_message|>");
+    let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+        "model": "eof-test", "messages": [],
+        "response_format": {"type": "json_object"},
+        "tools": [{"type": "function", "function": {
+            "name": "lookup", "parameters": {"type": "object"}
+        }}],
+        "separate_reasoning": true, "stream": true
+    }))
+    .unwrap();
+    let spec = ChatResponseSpec::from(&request);
+    assert!(spec.json_mode && spec.tools.is_some());
+    let resolver = || {
+        utils::ParserResolver::with_flags(
+            Arc::new(WorkerRegistry::new()),
+            Some("inkling".to_string()),
+            Some("inkling".to_string()),
+        )
+    };
+    let split = framed.find("tool_json").unwrap();
+    let (stream, server) = scripted_stream(
+        vec![
+            chunk(0, &framed[..split]),
+            chunk(0, &framed[split..]),
+            complete(0, "stop"),
+        ],
+        "0",
+    )
+    .await;
+    let (tx, rx) = sse_channel();
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
+    let result = streaming_processor(resolver())
+        .process_streaming_chunks(
+            stream,
+            dispatch(),
+            tokenizer.clone(),
+            (None, None, false, false, false),
+            spec.clone(),
+            &tx,
+            None,
+        )
+        .await;
+    drop(tx);
+    let events = collect_events(rx).await;
+    server.abort();
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(chat_text(&events, 0, "content"), payload, "{events:?}");
+    assert!(
+        events.iter().all(|event| {
+            let choice = &event["choices"][0];
+            choice["delta"]["tool_calls"].is_null() && choice["finish_reason"] != "tool_calls"
+        }),
+        "{events:?}"
+    );
+
+    let complete = ProtoGenerateComplete::Vllm(Box::new(proto::GenerateComplete {
+        output_ids: framed.chars().map(u32::from).collect(),
+        finish_reason: "stop".to_string(),
+        ..Default::default()
+    }));
+    let mut decoder = StopSequenceDecoder::new(
+        tokenizer.clone(),
+        llm_tokenizer::StopSequenceConfig::default(),
+        false,
+    );
+    let (choice, _) = unary_processor(resolver())
+        .process_single_choice(
+            "test-request",
+            &complete,
+            0,
+            &spec,
+            "eof-test",
+            &tokenizer,
+            &mut decoder,
+            0,
+            true,
+            true,
+            Some("inkling"),
+            Some("inkling"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(choice.message.content.as_deref(), Some(payload));
+    assert!(choice.message.tool_calls.is_none());
 }
