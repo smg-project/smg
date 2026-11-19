@@ -82,7 +82,7 @@ use crate::{
             body_policy::{
                 decide_body_path, BodyPath, BodyPathInputs, BODY_PATH_BUFFERED, BODY_PATH_STREAMED,
                 REASON_MODEL_AMBIGUOUS, REASON_MODEL_SELECTION, REASON_NO_AVAILABLE_WORKER,
-                REASON_WORKER_MUTATES_BODY,
+                REASON_PLACED_BY_CONTROLLER, REASON_WORKER_MUTATES_BODY,
             },
             decisions::{SglangDecisionAdapter, UPSTREAM_ROUTE},
             header_utils, overload, placement,
@@ -161,8 +161,7 @@ struct TypedAttempt<'a, T> {
     /// lease's release point.
     lease: &'a RequestLease<T>,
     route: &'static str,
-    /// The canonical model id every registry, policy and metrics lookup is
-    /// keyed by.
+    /// The request's model after alias resolution, or the no-model id.
     model_id: &'a str,
     /// The alias the client named, resolved, for the upstream body.
     canonical_model: Option<&'a str>,
@@ -497,10 +496,8 @@ impl Router {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
         let routing = self.routing_derivatives(headers, &typed_req);
-        // Resolve once, here, so every registry, policy and metrics lookup
-        // below is keyed by the canonical model ID. Only `get_by_model`
-        // understands aliases; retry configs, hash rings and policies do not,
-        // and an alias would silently fall back to router defaults.
+        // Resolve aliases before reading retry settings, selecting a worker,
+        // or labelling the request's metrics.
         let canonical_model = self.worker_registry.resolve_model_alias(model_id);
         let estimate = tenant_rate_limit::estimate(
             self.rate_limit_manager.as_deref(),
@@ -793,6 +790,21 @@ impl Router {
         }
     }
 
+    /// Resolve an unnamed request to the one model this router's workers
+    /// serve. Use the no-model id when no worker has a model, and return
+    /// `None` when the workers serve several distinct models.
+    fn model_of_an_unnamed_request(&self) -> Option<String> {
+        let pool = self
+            .worker_registry
+            .get_routing_pool(UNKNOWN_MODEL_ID, RoutingPool::HttpRegular);
+        let mut models = pool
+            .iter()
+            .map(|worker| worker.model_id())
+            .filter(|&model| model != UNKNOWN_MODEL_ID);
+        let model = models.next().unwrap_or(UNKNOWN_MODEL_ID);
+        models.all(|other| other == model).then(|| model.to_owned())
+    }
+
     /// The attempt's placement by the policy controller, or the answer of a
     /// request it did not place. The commit keeps to this router's own pool
     /// ([`regular_http`]).
@@ -801,14 +813,34 @@ impl Router {
         host: &Host,
         attempt: &TypedAttempt<'_, T>,
     ) -> Result<Placed, Response> {
-        if attempt.model_id == UNKNOWN_MODEL_ID {
-            return Err(policy_controller::refused("a request that names no model"));
+        let model = if attempt.model_id == UNKNOWN_MODEL_ID {
+            let Some(model) = self.model_of_an_unnamed_request() else {
+                return Err(self.report_refusal(
+                    "Router::route_typed_request",
+                    attempt.model_id,
+                    error::model_not_found(UNKNOWN_MODEL_ID),
+                ));
+            };
+            Cow::Owned(model)
+        } else {
+            Cow::Borrowed(attempt.model_id)
+        };
+        if self
+            .worker_registry
+            .get_routing_pool(&model, RoutingPool::HttpRegular)
+            .is_empty()
+        {
+            return Err(self.report_refusal(
+                "Router::route_typed_request",
+                attempt.model_id,
+                error::model_not_found(&model),
+            ));
         }
         let id = host::mark();
         let tried = attempt.tried_rows.lock().clone();
         let ask = Ask {
             id: &id,
-            model: attempt.model_id,
+            model: &model,
             streaming: attempt.is_stream,
             headers: None,
             rid: None,
@@ -820,7 +852,7 @@ impl Router {
             self.report_refusal(
                 "Router::route_typed_request",
                 attempt.model_id,
-                unplaced.answer(attempt.model_id),
+                unplaced.answer(&model),
             )
         })
     }
@@ -2352,6 +2384,10 @@ impl Router {
         route: &'static str,
         wasm_request_hooks: bool,
     ) -> Result<Response, Request<Body>> {
+        if self.host.is_some() {
+            Metrics::record_request_body_path(BODY_PATH_BUFFERED, REASON_PLACED_BY_CONTROLLER);
+            return Err(req);
+        }
         let stream_reason = match self.request_body_path(req.headers(), wasm_request_hooks) {
             BodyPath::Buffer(reason) => {
                 Metrics::record_request_body_path(BODY_PATH_BUFFERED, reason);
@@ -2367,11 +2403,6 @@ impl Router {
             if let Err(refused) = MessagesHeaders::check_version(req.headers()) {
                 return Ok(refused);
             }
-        }
-        if self.host.is_some() {
-            return Ok(policy_controller::refused(
-                "a request whose body is streamed to its worker",
-            ));
         }
         let model_id = UNKNOWN_MODEL_ID;
         // Buffered-path parity: a valid tokens hint is exactly what selection

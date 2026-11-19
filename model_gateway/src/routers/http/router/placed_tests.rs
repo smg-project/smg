@@ -9,6 +9,7 @@ use axum::{
     body::BodyDataStream,
     routing::{post, MethodRouter},
 };
+use metrics_exporter_prometheus::PrometheusBuilder;
 use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
 use serde_json::{json, Value};
 use smg_policy_controller::{
@@ -25,7 +26,7 @@ use super::{
 use crate::{
     config::PolicyConfig,
     middleware::ReportedRefusal,
-    policy_controller::host::testing::{bed_over, MODEL},
+    policy_controller::host::testing::{bed_over, bed_over_models, MODEL},
     routers::{
         common::{
             request_lease::test_probe::{spawn_release_gated_stub, DropProbeRequest},
@@ -42,6 +43,7 @@ type Case<T = ()> = Result<T, Box<dyn Error>>;
 const GATEWAY: GatewayId = GatewayId::LOCAL;
 const CHAT: &str = "/v1/chat/completions";
 const GENERATE: &str = "/generate";
+const GENERATE_BODY: &[u8] = br#"{"text":"hi"}"#;
 const TRANSCRIBE: &str = "/v1/audio/transcriptions";
 
 fn router(worker_registry: Arc<WorkerRegistry>, host: Option<Host>) -> Router {
@@ -524,7 +526,7 @@ async fn transcription(router: &Router) -> Response {
 
 async fn streamed_body(router: &Router) -> Case<Response> {
     router
-        .route_streaming_request(streamed_request(&[br#"{"text":"hi"}"#]), GENERATE, false)
+        .route_streaming_request(streamed_request(&[GENERATE_BODY]), GENERATE, false)
         .await
         .map_err(|_| "the router buffered the request".into())
 }
@@ -544,13 +546,120 @@ async fn assert_refused(response: Response, shape: &str) -> Case {
 }
 
 #[tokio::test]
-async fn a_request_with_no_model_under_the_host_is_refused_by_name() -> Case {
+async fn a_request_that_names_no_model_is_asked_under_the_one_model_served() -> Case {
+    assert_unnamed_model([Some(MODEL); 2], Some(MODEL));
     let (url, hits) = fixed_status_upstream(&[GENERATE], StatusCode::OK).await;
     let registry = Arc::new(WorkerRegistry::new());
     let (host, store, _) = bed_over(Arc::clone(&registry), &[&url]);
+    let mut doc = PolicySpec::preset("round_robin")?;
+    doc.generation += 1;
+    doc.bindings[0].matcher.model = MODEL.into();
+    store.apply(AppliedSpec::validate(&doc)?)?;
     let router = router(registry, Some(host));
-    assert_refused(no_model(&router).await?, "a request that names no model").await?;
-    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    assert_eq!(no_model(&router).await?.status(), StatusCode::OK);
+
+    let row = store.by_key(&url).ok_or("the worker has no row")?;
+    store.remove(row.id, row.revision).ok_or("the row stands")?;
+    store.publish_now();
+    let response = no_model(&router).await?;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = to_bytes(response.into_body(), 1024).await?;
+    let value: Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        value["error"]["message"],
+        format!("No available workers for model '{MODEL}'")
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+fn assert_unnamed_model(models: [Option<&str>; 2], expected: Option<&str>) {
+    let registry = Arc::new(WorkerRegistry::new());
+    let urls = ["http://127.0.0.1:1", "http://127.0.0.1:2"];
+    let (host, _, _) = bed_over_models(Arc::clone(&registry), urls.into_iter().zip(models));
+    let router = router(registry, Some(host));
+    assert_eq!(router.model_of_an_unnamed_request().as_deref(), expected);
+}
+
+async fn assert_model_not_found(response: Response, model: &str) -> Case {
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert!(response.extensions().get::<ReportedRefusal>().is_some());
+    let body = to_bytes(response.into_body(), 1024).await?;
+    let value: Value = serde_json::from_slice(&body)?;
+    assert_eq!(value["error"]["code"], "model_not_found");
+    assert_eq!(
+        value["error"]["message"],
+        format!("No worker available for model '{model}'")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_request_that_names_no_model_is_not_found_where_several_are_served() -> Case {
+    let models = [Some(MODEL), Some("model-b")];
+    assert_unnamed_model(models, None);
+    let (a, hits_a) = fixed_status_upstream(&[GENERATE], StatusCode::OK).await;
+    let (b, hits_b) = fixed_status_upstream(&[GENERATE], StatusCode::OK).await;
+    let registry = Arc::new(WorkerRegistry::new());
+    let (host, store, _) = bed_over_models(
+        Arc::clone(&registry),
+        [a.as_str(), b.as_str()].into_iter().zip(models),
+    );
+    let router = router(registry, Some(host));
+    assert_model_not_found(no_model(&router).await?, UNKNOWN_MODEL_ID).await?;
+    assert_eq!(hits_a.load(Ordering::SeqCst), 0);
+    assert_eq!(hits_b.load(Ordering::SeqCst), 0);
+    assert_eq!(LeasesStore::live(&*store, GATEWAY), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn one_model_beside_a_worker_with_none_takes_the_unnamed_request_alone() -> Case {
+    let models = [Some(MODEL), None];
+    assert_unnamed_model(models, Some(MODEL));
+    let (a, hits_a) = fixed_status_upstream(&[GENERATE], StatusCode::OK).await;
+    let (b, hits_b) = fixed_status_upstream(&[GENERATE], StatusCode::OK).await;
+    let registry = Arc::new(WorkerRegistry::new());
+    let (host, _, _) = bed_over_models(
+        Arc::clone(&registry),
+        [a.as_str(), b.as_str()].into_iter().zip(models),
+    );
+    let router = router(registry, Some(host));
+    for _ in 0..6 {
+        assert_eq!(no_model(&router).await?.status(), StatusCode::OK);
+    }
+    assert_eq!(hits_a.load(Ordering::SeqCst), 6);
+    assert_eq!(hits_b.load(Ordering::SeqCst), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn workers_with_no_model_are_asked_under_the_no_model_id() -> Case {
+    assert_unnamed_model([None; 2], Some(UNKNOWN_MODEL_ID));
+    let (url, hits) = fixed_status_upstream(&[GENERATE], StatusCode::OK).await;
+    let registry = Arc::new(WorkerRegistry::new());
+    let (host, _, _) = bed_over_models(Arc::clone(&registry), [(url.as_str(), None)]);
+    let router = router(registry, Some(host));
+    assert_eq!(no_model(&router).await?.status(), StatusCode::OK);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_named_model_no_worker_serves_is_not_found_and_asks_nothing() -> Case {
+    let registry = Arc::new(WorkerRegistry::new());
+    let (host, store, _) = bed_over(Arc::clone(&registry), &["http://127.0.0.1:1"]);
+    let router = router(registry, Some(host));
+    let meta = TenantRequestMeta::new(TenantKey::from("test-tenant"));
+    let model = "unserved-model";
+    let request = serde_json::from_value(json!({
+        "model": model,
+        "messages": [{"role": "user", "content": "hi"}]
+    }))?;
+    let response = router
+        .route_chat(None, &meta, Arc::new(request), model)
+        .await;
+    assert_model_not_found(response, model).await?;
     assert_eq!(LeasesStore::live(&*store, GATEWAY), 0);
     Ok(())
 }
@@ -568,33 +677,43 @@ async fn a_transcription_under_the_host_is_refused_by_name() -> Case {
 }
 
 #[tokio::test]
-async fn a_streamed_body_under_the_host_is_refused_by_name() -> Case {
+async fn a_body_that_would_stream_takes_the_buffered_path_under_the_host() -> Case {
+    let registry = Arc::new(WorkerRegistry::new());
+    let (host, _, _) = bed_over(Arc::clone(&registry), &["http://127.0.0.1:1"]);
+    let hosted = router(registry, Some(host));
+    let mut request = streamed_request(&[GENERATE_BODY]);
+    request.extensions_mut().insert(1_u8);
+    let headers = request.headers().clone();
+    let uri = request.uri().clone();
+    let version = request.version();
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let request = {
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        hosted
+            .route_streaming_request(request, GENERATE, false)
+            .await
+    }
+    .err()
+    .ok_or("the router did not hand back the request")?;
+    assert_eq!(request.method(), Method::POST);
+    assert_eq!(request.uri(), &uri);
+    assert_eq!(request.version(), version);
+    assert_eq!(request.headers(), &headers);
+    assert_eq!(request.extensions().get::<u8>(), Some(&1));
+    assert_eq!(
+        to_bytes(request.into_body(), 1024).await?.as_ref(),
+        GENERATE_BODY
+    );
+    assert!(recorder.handle().render().lines().any(|line| {
+        line == r#"smg_router_request_body_path_total{path="buffered",reason="placed_by_controller"} 1"#
+    }));
+
     let (url, hits) = fixed_status_upstream(&[GENERATE], StatusCode::OK).await;
     let registry = Arc::new(WorkerRegistry::new());
-    let (host, store, _) = bed_over(Arc::clone(&registry), &[&url]);
-    let router = router(registry, Some(host));
-
-    let mut invalid = streamed_request(&[br#"{"text":"hi"}"#]);
-    invalid
-        .headers_mut()
-        .insert("anthropic-version", HeaderValue::from_static("invalid"));
-    let answer = router
-        .route_streaming_request(invalid, "/v1/messages", false)
-        .await
-        .map_err(|_| "the router buffered the request")?;
-    assert_eq!(answer.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(
-        extract_error_code_from_response(&answer),
-        "invalid_anthropic_version"
-    );
-
-    assert_refused(
-        streamed_body(&router).await?,
-        "a request whose body is streamed to its worker",
-    )
-    .await?;
-    assert_eq!(hits.load(Ordering::SeqCst), 0);
-    assert_eq!(LeasesStore::live(&*store, GATEWAY), 0);
+    let _ = bed_over(Arc::clone(&registry), &[&url]);
+    let classic = router(registry, None);
+    assert_eq!(streamed_body(&classic).await?.status(), StatusCode::OK);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
     Ok(())
 }
 
