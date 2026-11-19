@@ -15,10 +15,9 @@
 //! What a probe's outcome or a connect signal does to a worker's status
 //! crosses the port of [`super::port`]: this loop is the port's collector.
 //! It says the fact to a [`HealthSink`], and what the fact did to the status
-//! is the sink's answer.
-//! The schedule still reads the status on the worker object (the places are
-//! on the trait). The registry's impl of the port, further down, is the
-//! state machine.
+//! is the sink's answer. The schedule still reads the status on the worker
+//! object (the places are on the trait). The registry's impl of the port,
+//! further down, is the state machine.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -269,8 +268,8 @@ impl WorkerManager {
     /// (the places are on [`HealthSink`]): a sink that keeps the status
     /// elsewhere writes it on the worker object before it answers, by the
     /// registry's guarded transition. [`Self::start`] hands the registry as
-    /// the sink too, since it runs
-    /// this crate's status state machine over those objects.
+    /// the sink too, since it runs this crate's status state machine over
+    /// those objects.
     pub fn start_with_sink<G: Generation>(
         registry: Arc<WorkerRegistry<G>>,
         sink: Arc<dyn HealthSink>,

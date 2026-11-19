@@ -3227,3 +3227,87 @@ async fn the_loop_reads_a_stood_status_in_the_sinks_answer_not_on_the_worker_obj
 
     manager.shutdown().await;
 }
+
+/// The registry answers the status that stands, not the status the probe
+/// was launched at. A probe launched at ready completes after another hand
+/// demoted the worker. Its pass is one short of the success threshold, so
+/// nothing moves, and the answer names the demoted status: the loop lays
+/// the worker's next read by it.
+#[test]
+fn the_registry_answers_the_status_that_stands_not_the_one_at_the_launch() {
+    let registry = Arc::new(WorkerRegistry::new());
+    let worker = make_worker("http://w:1", 2, 3);
+    let worker_id = registry.register(worker.clone()).unwrap();
+    worker.set_status(WorkerStatus::Ready);
+    let launched = worker.status();
+    registry.transition_status(&worker_id, WorkerStatus::NotReady);
+
+    let answer = registry.probe_outcome(&worker_id, true, worker.revision(), launched);
+
+    assert_eq!(answer, ProbeAnswer::Stood(WorkerStatus::NotReady));
+}
+
+/// A sink that answers every connect signal with one transition and writes
+/// no worker object.
+struct PromotingSink {
+    old: WorkerStatus,
+    new: WorkerStatus,
+}
+
+impl HealthSink for PromotingSink {
+    fn probe_outcome(
+        &self,
+        _worker_id: &WorkerId,
+        _passed: bool,
+        _revision: u64,
+        launched: WorkerStatus,
+    ) -> ProbeAnswer {
+        ProbeAnswer::Stood(launched)
+    }
+
+    fn connected(
+        &self,
+        _worker_id: &WorkerId,
+        _revision: u64,
+    ) -> Option<(WorkerStatus, WorkerStatus)> {
+        Some((self.old, self.new))
+    }
+}
+
+/// After a connect signal promotes a worker, its next check sits where the
+/// status it took puts it, not where the status it left would. The sink
+/// answers that a draining worker became ready: a draining worker holds no
+/// deadline, and a ready one is read an interval out.
+#[test]
+fn a_promoted_workers_next_check_follows_the_status_it_took() {
+    let registry = Arc::new(WorkerRegistry::new());
+    let sink = PromotingSink {
+        old: WorkerStatus::Draining,
+        new: WorkerStatus::Ready,
+    };
+    let worker = probed_worker("ipc:///tmp/promoted.ipc", ConnectionMode::Zmq);
+    let worker_id = registry.register(worker.clone()).unwrap();
+    let mut next_check = HashMap::new();
+    let before = tokio::time::Instant::now();
+
+    let (promoted_id, _) = apply_connect_signal(
+        &registry,
+        &sink,
+        WorkerConnected {
+            url: worker.url().to_string(),
+            revision: worker.revision(),
+        },
+        &mut next_check,
+        &test_config(),
+    )
+    .expect("the sink answered a promotion");
+
+    assert!(promoted_id == worker_id);
+    let due = next_check
+        .get(&worker_id)
+        .expect("a ready worker holds a deadline");
+    assert!(
+        *due >= before + Duration::from_secs(3600),
+        "an interval out, not at once"
+    );
+}
