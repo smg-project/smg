@@ -100,10 +100,12 @@ pub const ENTRIES: &[(&str, &str, Fate)] = &[
     // The term is told to the journal: every later position is under it.
     ("LeasesStore", "set_term", Fate::Journaled),
     ("LeasesStore", "issue", Fate::NotYet(PINS)),
+    ("LeasesStore", "issue_pair", Fate::NotYet(PINS)),
     ("LeasesStore", "dispatched", Fate::Rebuilt(DISPATCHED)),
     ("LeasesStore", "completed", Fate::NotYet(PINS)),
     ("LeasesStore", "released", Fate::NotYet(PINS)),
     ("LeasesStore", "get", Fate::Read),
+    ("LeasesStore", "sides", Fate::Read),
     ("LeasesStore", "expire", Fate::NotYet(PINS)),
     ("LeasesStore", "restore", Fate::Rebuilt(HELLO)),
     ("LeasesStore", "drop_gateways", Fate::NotYet(PINS)),

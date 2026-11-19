@@ -119,17 +119,17 @@ use crate::{
     decider::Decider,
     lease::LeaseId,
     store::{
-        leases::{LeaseRecord, Said},
+        leases::{Said, Sides},
         world::World,
         GatewayId,
     },
 };
 
 /// What tells the engine of a frame applied to a lease on file: the world
-/// the frame is told under, the record as it stood before the frame, what
-/// the frame said, and the decider whose file the lease is on, where the
-/// store's host named its deciders.
-type Teller = fn(&MemoryStore, &World, &LeaseRecord, Said, Option<Decider>);
+/// the frame is told under, the lease as it stood before the frame, both
+/// its parts, what the frame said, and the decider whose file the lease is
+/// on, where the store's host named its deciders.
+type Teller = fn(&MemoryStore, &World, &Sides, Said, Option<Decider>);
 
 /// One load of the world for a run of words to the engine: the store's
 /// world, loaded at the run's first word and held to its last. A run is
@@ -544,11 +544,11 @@ impl MemoryStore {
         self.files.faults.load(Relaxed) & !STREAK
     }
 
-    /// Tells the engine what `said` did to the lease `record` stood as,
-    /// on the file at `at`: under `world` and its decider's name.
-    pub(super) fn tell(&self, at: usize, world: &World, record: &LeaseRecord, said: Said) {
+    /// Tells the engine what `said` did to the lease `found` stood as, on
+    /// the file at `at`: under `world` and its decider's name.
+    pub(super) fn tell(&self, at: usize, world: &World, found: &Sides, said: Said) {
         if let Some(tell) = self.files.teller.get() {
-            tell(self, world, record, said, self.files[at].name);
+            tell(self, world, found, said, self.files[at].name);
         }
     }
 
@@ -733,21 +733,21 @@ impl MemoryStore {
     fn apply_frame(&self, at: usize, leases: &mut Leases, key: Key, said: Said, one: &mut OneLoad) {
         let found = match said {
             Said::Dispatched(dispatch, when) => {
-                let found = leases.records.get(&key).map(|held| held.record);
+                let found = leases.found(&key);
                 leases.dispatched(self.slots(), &key, dispatch, when);
                 // The side the frame names is told where it waited for
                 // this dispatch.
-                found.filter(|record| waits(record, dispatch.side))
+                found.filter(|found| waits(found, dispatch.side))
             }
             Said::Completed(outcome) => {
-                let found = leases.records.get(&key).map(|held| held.record);
+                let found = leases.found(&key);
                 leases.completed(&key, &outcome);
                 found
             }
             Said::Released(side, reason) => leases.released(&key, side, reason),
         };
-        if let Some(record) = found {
-            self.tell(at, one.world(self), &record, said);
+        if let Some(found) = found {
+            self.tell(at, one.world(self), &found, said);
         }
     }
 }
