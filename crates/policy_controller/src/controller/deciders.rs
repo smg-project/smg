@@ -1449,6 +1449,37 @@ pub(crate) mod tests {
         }
     }
 
+    /// A decision reads its rows behind what was handed while its decider
+    /// worked: a release handed while the decider is held at a request is
+    /// applied by that request ahead of its reads. Under the fewest
+    /// requests the request then picks as the first one did under its
+    /// seed: that worker stands at no request again.
+    #[tokio::test]
+    async fn a_decision_reads_its_rows_behind_what_was_handed_ahead_of_it() {
+        let mut document = PolicySpec::power_of_two(PowerOfTwoMetric::LeastRequests)
+            .expect("a form of this build's preset");
+        document.generation = 1;
+        let mut bed = bed(Some(applied(&document)), true, (1, 8), []);
+        let first = bed.ask(frame(1, 7)).await;
+        // The second request is held at its read of the clock: its decider
+        // is at work, and what is handed is left to it.
+        let (reached, held) = std_mpsc::sync_channel(1);
+        let (go, word) = std_mpsc::sync_channel(1);
+        let hold = Step::Hold { reached, go: word };
+        bed.script.steps.lock().push_back(hold);
+        assert_eq!(bed.submit(frame(2, 7)), None);
+        held.recv_timeout(PATIENCE)
+            .expect("the decider reads the clock");
+        let gone = Said::Released(None, ReleaseReason::ClientGone);
+        let hand = lifecycle::open(&bed.store, GATEWAY);
+        bed.store.hand(&hand, LeaseId(lease_of(&first).id), gone);
+        let live = LeasesStore::live(&*bed.store, GATEWAY);
+        assert_eq!(live, 1, "the hand leaves the release to the decider");
+        go.send(()).expect("the decider holds the other end");
+        let second = bed.answer().await;
+        assert_eq!(picked(&second), picked(&first), "no request stands there");
+    }
+
     #[tokio::test]
     async fn a_picks_answer_carries_the_lease_the_store_filed_under_the_fences_term() {
         let mut bed = leading([]);
