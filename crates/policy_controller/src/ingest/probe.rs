@@ -5,7 +5,11 @@
 //! the next poll redials, and one HTTP client for the scrape, built by
 //! the first scrape: a controller that scrapes no engine builds none.
 
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
+};
 
 use openai_protocol::worker::{RuntimeType, WorkerLoadResponse};
 use parking_lot::Mutex;
@@ -19,6 +23,7 @@ use tokio::{
     time::{timeout, Instant},
 };
 use tonic::Code;
+use tracing::warn;
 
 use super::loads::{LoadProbe, ReadError, Target};
 
@@ -32,6 +37,8 @@ pub struct EngineProbe {
     http: OnceCell<reqwest::Client>,
     /// What builds that client: the crate's factory.
     build: fn() -> Result<reqwest::Client, reqwest::Error>,
+    /// Whether a build that failed was said: the first one is, once.
+    said: AtomicBool,
 }
 
 impl Default for EngineProbe {
@@ -134,6 +141,17 @@ pub fn http_client() -> Result<reqwest::Client, reqwest::Error> {
     reqwest::Client::builder().build()
 }
 
+/// A client's build that fails, for the cases of a probe whose client
+/// cannot be built: a user agent no header takes.
+#[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a build that fails stands in for the crate's client factory"
+)]
+pub(crate) fn unbuildable() -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder().user_agent("\n").build()
+}
+
 /// The HTTP client's error as a failed read. A timeout is the deadline's,
 /// whether the headers never came or the body stalled past it. Anything else
 /// is the transport's and carries the error with the request's URL off (the
@@ -160,19 +178,30 @@ impl EngineProbe {
             clients: Mutex::default(),
             http: OnceCell::new(),
             build,
+            said: AtomicBool::new(false),
         }
     }
 
     /// The scrape's HTTP client, built at the first call and kept. The
     /// build reads files, so it runs off the runtime's workers, and its
-    /// time is the first scrape's own. One that fails is the
-    /// transport's failure of that scrape, and the next scrape builds
-    /// again.
+    /// time is the first scrape's own. A build that fails is that
+    /// scrape's transport failure, and the next scrape builds again. The
+    /// first such failure is said once, as a warning: it is the
+    /// controller's own, where the driver's count reads it as an engine's.
     async fn http(&self) -> Result<&reqwest::Client, ReadError> {
         let built = || async {
             match tokio::task::spawn_blocking(self.build).await {
                 Ok(Ok(client)) => Ok(client),
-                Ok(Err(error)) => Err(ReadError::Transport(format!("{error:?}"))),
+                Ok(Err(error)) => {
+                    let failed = format!("{error:?}");
+                    if !self.said.swap(true, Ordering::Relaxed) {
+                        warn!(
+                            error = %failed,
+                            "the engine probe's HTTP client could not be built: no engine is scraped until a later scrape builds it"
+                        );
+                    }
+                    Err(ReadError::Transport(failed))
+                }
                 Err(join) => Err(ReadError::Transport(join.to_string())),
             }
         };
@@ -279,7 +308,7 @@ impl LoadProbe for EngineProbe {
 
 #[cfg(test)]
 mod tests {
-    use std::{io::ErrorKind, net, thread};
+    use std::{io::ErrorKind, net, sync::atomic::AtomicUsize, thread};
 
     use tokio::{net::TcpListener, task::JoinSet};
 
@@ -354,6 +383,31 @@ mod tests {
 
         assert!(matches!(read, Err(ReadError::Deadline(_))), "{read:?}");
         assert!(probe.http_built(), "the first scrape builds it");
+    }
+
+    /// A client that cannot be built fails its scrape as the transport's
+    /// and holds none, and the next scrape builds again: a controller
+    /// whose platform gains its certificates later scrapes from then on.
+    #[tokio::test]
+    async fn a_client_that_cannot_be_built_is_built_again_by_the_next_scrape() {
+        static BUILDS: AtomicUsize = AtomicUsize::new(0);
+        fn broken_once() -> Result<reqwest::Client, reqwest::Error> {
+            if BUILDS.fetch_add(1, Ordering::Relaxed) == 0 {
+                unbuildable()
+            } else {
+                http_client()
+            }
+        }
+        let (url, _held) = stalled_body().await;
+        let probe = EngineProbe::building(broken_once);
+
+        let first = probe.scrape(&url, Duration::from_millis(50)).await;
+        assert!(matches!(first, Err(ReadError::Transport(_))), "{first:?}");
+        assert!(!probe.http_built(), "a build that fails holds no client");
+
+        let second = probe.scrape(&url, Duration::from_millis(50)).await;
+        assert!(matches!(second, Err(ReadError::Deadline(_))), "{second:?}");
+        assert!(probe.http_built(), "the next scrape builds it");
     }
 
     /// The build's time is the first scrape's own: a build that outlasts
