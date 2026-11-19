@@ -87,11 +87,11 @@ fn spec(name: &str, component: Vec<u8>, mode: u8) -> PluginSpec {
 const INIT_FRAME: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// How many times a case makes what a hold of the runner can have moved: a
-/// load, a close's rebuild, a lazy `init`, a destructor's time, a window of
-/// short holds. A try whose witness says a hold reached it says so and is
-/// made again. No witness passes a run: the last try asserts whatever its
-/// witness says, so a host that fails by itself fails each try, and the
-/// case.
+/// load, a close's rebuild, a lazy `init`, a destructor's time. A try whose
+/// witness says a hold reached it says so and is made again. No witness
+/// passes a run: the last try asserts whatever its witness says, so a host
+/// that fails by itself fails each try, and the case. A window of short
+/// holds has a count of its own (`WINDOWS`).
 const TRIES: u32 = 3;
 
 /// Loads `spec` and returns what the load said. Its `init` ends at a
@@ -4952,6 +4952,14 @@ fn one_window_of_short_holds(name: &str, arm: bool) -> (Arc<Plugin>, bool, bool)
     (plugin, cheap, by_the_runner > 0 && by_the_host == 0)
 }
 
+/// How many windows of short holds a case makes at most. A window is
+/// sixty-four decisions, each with its budget on the wall clock: on a host
+/// loaded past its cores the runner spends a budget in one window of a few,
+/// and three such windows in a row are not rare there. Twelve are, and a
+/// host that spends a budget in every window still fails the case.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const WINDOWS: u32 = 12;
+
 /// What a window of short holds says when its faults are the runner's: it
 /// is made again.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -4959,7 +4967,7 @@ const A_HOLD_REACHED_A_PICK: &str =
     "a call ran out in a decision whose thread was off the CPU for its short hold and half of what the hold leaves of the budget, or a decision's budget ran out with no call failed";
 
 /// [`one_window_of_short_holds`], made again while its faults are the
-/// runner's, [`TRIES`] windows at most, each under a plugin name of its own
+/// runner's, [`WINDOWS`] windows at most, each under a plugin name of its own
 /// (a hold is kept by name). Returns the last window's plugin and its
 /// witness on the CPU: a case asserts that window's counts, whatever its
 /// faults were.
@@ -4970,7 +4978,7 @@ fn a_window_of_short_holds(case: &str, name: &str, arm: bool) -> (Arc<Plugin>, b
         made += 1;
         let (plugin, cheap, by_the_runner) =
             one_window_of_short_holds(&format!("{name}-{made}"), arm);
-        if !by_the_runner || made == TRIES {
+        if !by_the_runner || made == WINDOWS {
             return (plugin, cheap);
         }
         made_again(case, A_HOLD_REACHED_A_PICK);
@@ -4995,7 +5003,7 @@ fn a_window_of_short_holds(case: &str, name: &str, arm: bool) -> (Arc<Plugin>, b
 /// the budget: a hold of the runner's own past that reaches the remainder
 /// the later calls run under. A decision's budget spent with no call failed
 /// is the runner's too. A window whose faults are all the runner's says so
-/// and is made again, [`TRIES`] windows at most.
+/// and is made again, [`WINDOWS`] windows at most.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn a_hold_short_of_late_on_an_armed_thread_is_no_slow_sample() {
