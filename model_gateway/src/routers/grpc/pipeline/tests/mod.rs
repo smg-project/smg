@@ -34,7 +34,8 @@ use smg_data_connector::{
     MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage, ResponseId,
 };
 use smg_grpc_client::{
-    common_proto as common, constraint_failed_status, tokenspeed_proto as ts, vllm_proto,
+    common_proto as common, constraint_failed_status, engine_labels::ModelInfo,
+    tokenspeed_proto as ts, vllm_proto,
 };
 use smg_mcp::{McpConfig, McpOrchestrator};
 use smg_worker::{
@@ -58,7 +59,6 @@ use crate::{
         },
         grpc::{
             backend_client::BasicWorkerBuilder,
-            client::ModelInfo,
             common::responses::{
                 background::{queued_response, store_record},
                 BackgroundResponses, BackgroundStream,
@@ -653,9 +653,7 @@ async fn image_to_a_worker_without_a_vision_verdict_is_not_refused() {
 async fn image_to_an_sglang_worker_that_carries_no_media_is_refused_before_dispatch() {
     use std::collections::BTreeMap;
 
-    use smg_grpc_client::sglang_proto;
-
-    use crate::routers::grpc::client::ServerInfo;
+    use smg_grpc_client::{engine_labels::ServerInfo, sglang_proto};
 
     let mut merged = ModelInfo::Sglang(Box::default()).to_labels();
     merged.extend(

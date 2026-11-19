@@ -35,7 +35,8 @@ use crate::routers::{common::snapshot::WorkerRegistry, error};
 /// a refusal. An SGLang servicer that carries no media to its engine writes
 /// a deliberate `false` into its `server_args`, which is kept
 /// (`ServerInfo::to_labels`).
-pub(crate) const SUPPORTS_VISION_LABEL: &str = "supports_vision";
+pub(crate) const SUPPORTS_VISION_LABEL: &str =
+    smg_grpc_client::engine_labels::SUPPORTS_VISION_LABEL;
 
 /// Whether the worker's engine runs without a vision encoder (a vLLM
 /// `--language-model-only` worker), so no pixel payload may reach it. Absent

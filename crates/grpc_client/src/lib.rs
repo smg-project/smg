@@ -11,6 +11,7 @@ pub mod abort_on_drop;
 pub mod channel;
 pub mod codec;
 pub mod constraint_failure;
+pub mod engine_labels;
 pub mod engine_load;
 mod framed;
 pub mod media_fault;
