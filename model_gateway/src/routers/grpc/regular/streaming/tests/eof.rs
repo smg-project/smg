@@ -11,9 +11,12 @@ use openai_protocol::{
     chat::ChatCompletionRequest, model_card::ModelCard, worker::HealthCheckConfig,
 };
 use prost::Message as ProstMessage;
-use smg_grpc_client::vllm_engine::{
-    proto, proto::generate_response::Response as GenerationEvent, AbortOnDropStream,
-    VllmEngineClient,
+use smg_grpc_client::{
+    codec::SizedProstCodec,
+    vllm_engine::{
+        proto, proto::generate_response::Response as GenerationEvent, AbortOnDropStream,
+        VllmEngineClient,
+    },
 };
 use tokio::{sync::oneshot, task::JoinHandle, time::timeout};
 use tonic::codec::Codec;
@@ -27,7 +30,7 @@ use crate::{
         grpc::{regular::processor::ResponseProcessor, test_engine::mock_engine},
     },
     worker::{
-        circuit_breaker::{CircuitBreakerConfig, CircuitState},
+        health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
         BasicWorkerBuilder, Worker, WorkerRegistry,
     },
 };
@@ -179,7 +182,7 @@ where
     M: ProstMessage + Default + Send + 'static,
     S: Stream<Item = Result<Frame<Bytes>, tonic::Status>> + Send + 'static,
 {
-    let mut codec = tonic_prost::ProstCodec::<M, M>::default();
+    let mut codec = SizedProstCodec::<M, M>::default();
     tonic::Streaming::new_response(
         codec.decoder(),
         StreamBody::new(body),
@@ -2834,7 +2837,7 @@ async fn messages_blocks_do_not_overlap_when_reasoning_calls_and_text_alternate(
 }
 
 /// A processor with the registered parsers `tool` and `reasoning`.
-fn named_processor(tool: &str, reasoning: &str) -> StreamingProcessor {
+pub(super) fn named_processor(tool: &str, reasoning: &str) -> StreamingProcessor {
     streaming_processor(utils::ParserResolver::with_flags(
         Arc::new(WorkerRegistry::new()),
         Some(tool.to_string()),

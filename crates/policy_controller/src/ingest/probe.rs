@@ -2,7 +2,8 @@
 //! engine family (the client crate's public clients, the same `GetLoads`
 //! the gateway asks, answers normalised by the same conversions), kept per
 //! endpoint and family across polls and dropped on a transport failure so
-//! the next poll redials, and one HTTP client for the scrape.
+//! the next poll redials, and one HTTP client for the scrape, built by
+//! the first scrape: a controller that scrapes no engine builds none.
 
 use std::{collections::HashMap, time::Duration};
 
@@ -13,15 +14,20 @@ use smg_grpc_client::{
     engine_load::LOAD_SECTIONS, is_transport_failure, SglangSchedulerClient,
     TokenSpeedSchedulerClient, TrtllmServiceClient, VllmEngineClient,
 };
-use tokio::time::timeout;
+use tokio::{sync::OnceCell, time::timeout};
 use tonic::Code;
 
 use super::loads::{LoadProbe, ReadError, Target};
 
 /// The engines' probe.
+#[derive(Default)]
 pub struct EngineProbe {
     clients: Mutex<HashMap<String, Family>>,
-    http: reqwest::Client,
+    /// The scrape's HTTP client, built by the first scrape and kept. Its
+    /// build reads the platform's root certificates from file: a start
+    /// does not pay for them, and a controller that scrapes no engine
+    /// never does.
+    http: OnceCell<reqwest::Client>,
 }
 
 /// One connected client, by family.
@@ -132,12 +138,26 @@ fn failed(error: reqwest::Error, timeout: Duration) -> ReadError {
 }
 
 impl EngineProbe {
-    /// A probe with no connection yet.
-    pub fn new() -> Result<Self, reqwest::Error> {
-        Ok(Self {
-            clients: Mutex::new(HashMap::new()),
-            http: http_client()?,
-        })
+    /// A probe with no connection yet, and no HTTP client: the first
+    /// scrape builds it.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The scrape's HTTP client, built at the first call and kept. The
+    /// build reads files, so it runs off the runtime's workers, and the
+    /// first scrape's timeout starts behind it. One that fails is the
+    /// transport's failure of that scrape, and the next scrape builds
+    /// again.
+    async fn http(&self) -> Result<&reqwest::Client, ReadError> {
+        let built = || async {
+            match tokio::task::spawn_blocking(http_client).await {
+                Ok(Ok(client)) => Ok(client),
+                Ok(Err(error)) => Err(ReadError::Transport(format!("{error:?}"))),
+                Err(join) => Err(ReadError::Transport(join.to_string())),
+            }
+        };
+        self.http.get_or_try_init(built).await
     }
 
     /// The client of the target's endpoint, dialed on the first poll and
@@ -164,6 +184,12 @@ impl EngineProbe {
     /// How many endpoints hold a connection.
     pub fn connections(&self) -> usize {
         self.clients.lock().len()
+    }
+
+    /// Whether the scrape's HTTP client is built: the first scrape builds
+    /// it.
+    pub fn http_built(&self) -> bool {
+        self.http.initialized()
     }
 }
 
@@ -203,7 +229,8 @@ impl LoadProbe for EngineProbe {
 
     async fn scrape(&self, url: &str, timeout: Duration) -> Result<String, ReadError> {
         let response = self
-            .http
+            .http()
+            .await?
             .get(format!("{}/metrics", url.trim_end_matches('/')))
             .timeout(timeout)
             .send()
@@ -277,7 +304,7 @@ mod tests {
     #[tokio::test]
     async fn a_body_that_stalls_past_the_timeout_is_a_deadline_like_headers_that_never_came() {
         let (url, _held) = stalled_body().await;
-        let probe = EngineProbe::new().expect("an HTTP client");
+        let probe = EngineProbe::new();
         let timeout = Duration::from_millis(300);
 
         let read = probe.scrape(&url, timeout).await;
@@ -286,5 +313,20 @@ mod tests {
             matches!(read, Err(ReadError::Deadline(bound)) if bound == timeout),
             "{read:?}"
         );
+    }
+
+    /// The scrape's HTTP client is built by the first scrape and kept: a
+    /// probe that has scraped nothing holds none, so a controller with no
+    /// engine to scrape reads no root certificate of the platform.
+    #[tokio::test]
+    async fn the_http_client_is_built_by_the_first_scrape() {
+        let (url, _held) = stalled_body().await;
+        let probe = EngineProbe::new();
+        assert!(!probe.http_built(), "no scrape yet");
+
+        let read = probe.scrape(&url, Duration::from_millis(50)).await;
+
+        assert!(matches!(read, Err(ReadError::Deadline(_))), "{read:?}");
+        assert!(probe.http_built(), "the first scrape builds it");
     }
 }

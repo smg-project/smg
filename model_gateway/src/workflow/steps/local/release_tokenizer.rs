@@ -7,7 +7,11 @@ use llm_tokenizer::{registry::TokenizerEntry, LoadOutcome};
 use tracing::{debug, info, warn};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
-use crate::{app_context::AppContext, worker::Worker, workflow::data::WorkerRemovalWorkflowData};
+use crate::{
+    app_context::AppContext,
+    worker::Worker,
+    workflow::data::{require_app_context, WorkerRemovalWorkflowData},
+};
 
 /// Step to release the tokenizer of a model no worker serves any more.
 ///
@@ -38,11 +42,7 @@ impl StepExecutor<WorkerRemovalWorkflowData> for ReleaseTokenizerStep {
         &self,
         context: &mut WorkflowContext<WorkerRemovalWorkflowData>,
     ) -> WorkflowResult<StepResult> {
-        let app_context = context
-            .data
-            .app_context
-            .as_ref()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
+        let app_context = require_app_context(context.data.app_context.as_ref())?;
         // The gateway manages no tokenizer when autoload is off: every entry
         // is the operator's, as the registration step leaves them.
         if app_context.router_config.disable_tokenizer_autoload {
@@ -117,13 +117,13 @@ impl ReleaseTokenizerStep {
     /// same entry and the first's release took it), and the multimodal
     /// config keyed by it, unless a worker of the model appeared since the
     /// candidates were read (its registration's tokenizer job read the entry
-    /// as already loaded): then
-    /// the entry goes back as it was, under its own id, and the config stays
-    /// (see [`Self::put_back`] for the job that loaded afresh instead). The
-    /// put-back runs on its own task: its wait on the registry's per-name
-    /// lock, which a registration's load of the same name may hold for its
-    /// whole load, is not the step's budget to cut, and a step cut with the
-    /// removed entry in hand would lose it. Whether the entry left.
+    /// as already loaded): then the entry goes back as it was, under its own
+    /// id, and the config stays (see [`Self::put_back`] for the job that
+    /// loaded afresh instead). The put-back runs on its own task: its wait
+    /// on the registry's per-name lock, which a registration's load of the
+    /// same name may hold for its whole load, is not the step's budget to
+    /// cut, and a step cut with the removed entry in hand would lose it.
+    /// Whether the entry left.
     fn release(app_context: &Arc<AppContext>, model_id: &str, entry_id: &str) -> bool {
         let Some(entry) = app_context
             .tokenizer_registry

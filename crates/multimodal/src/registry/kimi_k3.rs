@@ -91,10 +91,7 @@ impl ModelProcessorSpec for KimiK3VisionSpec {
             Modality::Image => Ok(Box::new(KimiK3Processor::from_preprocessor_config(
                 preprocessor_config,
             ))),
-            _ => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            _ => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
 

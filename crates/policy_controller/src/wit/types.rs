@@ -98,7 +98,13 @@ pub(crate) const TYPES: &[Item] = &[
         name: "identity",
         doc: &[
             " A tenant or a session key under the plugin's exposure: `hash` unless the",
-            " spec says `plain`, `none` when withheld.",
+            " spec says `plain`, `none` when withheld. A tenant's hash is its key's",
+            " fingerprint; a session key's hash is the session's value, the number",
+            " `lease.session-key` carries. Both are stated with the packed request",
+            " block below. A `plain` session key is the key's string and no number:",
+            " a plugin that matches such a request to its leases computes the",
+            " session's value itself, from the model, the phase and the key, by the",
+            " formula stated there.",
         ],
         cases: &["none", "hash(u64)", "plain(string)"],
         inline: true,
@@ -108,7 +114,9 @@ pub(crate) const TYPES: &[Item] = &[
         name: "load",
         doc: &[
             " The engine load record's routing core, rounded to narrow fields by the",
-            " host; permille fields are the record's ratios times 1000.",
+            " host; permille fields are the record's ratios times 1000. A",
+            " `resident-tokens` of 0 is an engine that holds none or one that does",
+            " not count them: this version does not tell the two apart.",
         ],
         fields: &[
             Field {
@@ -311,6 +319,8 @@ pub(crate) const TYPES: &[Item] = &[
             " into the spec's `view.headers` list with the value (unlike the one-based",
             " `zone`, `engine-kind` and `connector`); `budget-micros` is relative to",
             " the host's receipt; `seed` is the only randomness (see `host`).",
+            " `block-hashes` is empty unless the plugin's row declares `token_hashes` or",
+            " `text_hashes` among its needs.",
         ],
         fields: &[
             Field {

@@ -47,8 +47,9 @@ pub mod mode {
     pub const DRAW_IN_PICK: u8 = 12;
     /// `filter` grows the table past the host's cap first.
     pub const GROW_TABLE: u8 = 13;
-    /// `score` fills the whole memory (grown to the cap) in a loop: cheap in
-    /// fuel, long on the clock.
+    /// `score` fills the whole memory (grown to the cap) in a loop: fuel
+    /// prices each fill by its size, so the loop is long on the clock and
+    /// cheap in fuel only under a calibration that underprices it.
     pub const FILL_IN_SCORE: u8 = 14;
     /// `filter` traps when the decision has four candidates: the decode side
     /// of a pair of three prefills and four decodes.
@@ -64,7 +65,8 @@ pub mod mode {
     pub const SLOW_DESTRUCTOR: u8 = 18;
     /// The lifecycle export traps.
     pub const TRAP_IN_OBSERVE: u8 = 19;
-    /// The destructor fills its memory without end: wall, little fuel.
+    /// The destructor fills its memory without end: the clock ends it where
+    /// the calibration underprices a fill, its fuel elsewhere.
     pub const FILL_IN_DESTRUCTOR: u8 = 20;
     /// `init` burns eight fixed loops: heavier than a small decision budget.
     pub const BURN_IN_INIT: u8 = 21;
@@ -74,6 +76,42 @@ pub mod mode {
     pub const SPIN_IN_PICK: u8 = 23;
     /// The decision's constructor traps.
     pub const TRAP_IN_CONSTRUCTOR: u8 = 24;
+    /// `score` writes a log line first: a host call a test can hold the
+    /// thread in. On three candidates it traps after the line: a call a test
+    /// can hold that then fails by itself.
+    pub const LOG_IN_SCORE: u8 = 26;
+    /// The destructor writes a log line, then loops once: a host call a test
+    /// can hold the thread in, and a check of the clock after it.
+    pub const LOG_IN_DESTRUCTOR: u8 = 27;
+    /// `score` writes a log line first and `pick` burns a fixed loop first:
+    /// a call a test can hold the thread in, then one that needs a burn's
+    /// fuel.
+    pub const LOG_THEN_BURN: u8 = 28;
+    /// `score` writes a log line, then declines as not applicable: a call a
+    /// test can hold that then declines.
+    pub const LOG_THEN_DECLINE: u8 = 29;
+    /// `filter` fills the whole memory eight times and returns, then `score`
+    /// fills it in a loop: a call of milliseconds that answers, then an
+    /// endless one.
+    pub const FILL_BRIEFLY_THEN_FILL: u8 = 30;
+    /// `observe` counts the dispatches told to its instance and `pick`
+    /// names the row at that count: what one instance heard, read from a
+    /// decision made on it.
+    pub const COUNT_DISPATCHES: u8 = 31;
+    /// `observe` counts the members the feed told its instance (a snapshot's
+    /// length, one up an addition, one down a removal) and `pick` names the
+    /// row at that count.
+    pub const COUNT_MEMBERS: u8 = 32;
+    /// As `COUNT_MEMBERS`, and `observe` traps on a snapshot of five
+    /// members: a telling that faults one instance and not the next.
+    pub const TRAP_ON_FIVE_MEMBERS: u8 = 33;
+    /// `observe` counts members as `COUNT_MEMBERS` does and, at a dispatch,
+    /// keeps the count as it stood then; `pick` names the row at that count:
+    /// whether a change told ahead of a dispatch was heard ahead of it.
+    pub const MEMBERS_AT_A_DISPATCH: u8 = 34;
+    /// `observe` counts one up a relabelling and two up a resize, and `pick`
+    /// names the row at that count: the kinds one instance heard.
+    pub const COUNT_KINDS: u8 = 35;
     /// A second config byte: `init` asks the host's live clock once. An
     /// answer of zero lets it go on, of one makes it refuse, of two spin
     /// without end, of three trap at once.
@@ -97,6 +135,9 @@ pub mod counter {
     pub const OBSERVE_SESSION: u32 = 4;
     /// `random-u64` as drawn in `pick` under `DRAW_IN_PICK`.
     pub const PICK_RANDOM: u32 = 5;
+    /// The block hashes each request handed a guest of
+    /// [`hash_counting_guests`](super::hash_counting_guests), summed.
+    pub const HASHES: u32 = 6;
 }
 
 /// The canonical ABI layout the record guest reads: the constructor's
@@ -106,6 +147,9 @@ pub mod canonical {
     pub const ARGS_CANDIDATES_PTR: usize = 136;
     /// Offset of the candidate list's length in the arguments.
     pub const ARGS_CANDIDATES_LEN: usize = 140;
+    /// Offset of the length of the request's `block-hashes` list in the
+    /// arguments: the request is their first field.
+    pub const ARGS_HASHES_LEN: usize = 52;
     /// Size of one `candidate` record in guest memory.
     pub const CANDIDATE_SIZE: usize = 120;
     /// Offset of `in-flight` within a `candidate`.
@@ -163,6 +207,14 @@ pub fn check_canonical_layout() {
     let list_at = request_size.size_wasm32().next_multiple_of(4);
     assert_eq!(list_at, canonical::ARGS_CANDIDATES_PTR);
     assert_eq!(list_at + 4, canonical::ARGS_CANDIDATES_LEN);
+    let request = record_offsets("request");
+    let hashes = request
+        .iter()
+        .find(|(n, _)| n == "block-hashes")
+        .map(|(_, o)| *o)
+        .expect("request has block-hashes");
+    // A list is a pointer, then its length.
+    assert_eq!(hashes + 4, canonical::ARGS_HASHES_LEN, "{request:?}");
 }
 
 /// Assembles `wat_text` and wraps it as a component of `world`.
@@ -190,6 +242,43 @@ pub fn record_guest() -> Vec<u8> {
 /// A guest of the packed world.
 pub fn packed_guest() -> Vec<u8> {
     component("policy-packed", &guest_wat(Guest::Packed))
+}
+
+/// Both guests with a constructor that first tells the host, through the
+/// counter [`counter::HASHES`], how many block hashes the request handed
+/// it: the record guest reads the list's length in its arguments, the
+/// packed guest its request block's hash-count. Each by its world's name.
+pub fn hash_counting_guests() -> [(&'static str, Vec<u8>); 2] {
+    let counting = |guest: Guest, read: &str| {
+        let constructed = "    (call $on_construct)\n";
+        let counted = format!(
+            "    (call $counter (i32.const {}) (i64.extend_i32_u {read}))\n{constructed}",
+            counter::HASHES
+        );
+        let text = guest_wat(guest);
+        assert_eq!(
+            text.matches(constructed).count(),
+            1,
+            "the constructor tells the host once"
+        );
+        text.replacen(constructed, &counted, 1)
+    };
+    let record = format!(
+        "(i32.load offset={} (local.get $args))",
+        canonical::ARGS_HASHES_LEN
+    );
+    // The packed request block holds its hash-count at 48, a u16.
+    let packed = "(i32.load16_u offset=48 (local.get $rptr))";
+    [
+        (
+            "record",
+            component("policy", &counting(Guest::Record, &record)),
+        ),
+        (
+            "packed",
+            component("policy-packed", &counting(Guest::Packed, packed)),
+        ),
+    ]
 }
 
 /// A guest that imports a WASI interface: refused at load.
@@ -280,6 +369,8 @@ fn guest_wat(guest: Guest) -> String {
   (table $t 1 funcref)
   (global $heap (mut i32) (i32.const 1024))
   (global $mode (mut i32) (i32.const 0))
+  (global $heard (mut i32) (i32.const 0))
+  (global $members (mut i32) (i32.const 0))
   (data (i32.const 16) "refused")
   (data (i32.const 32) "observed")
 
@@ -378,10 +469,12 @@ fn guest_wat(guest: Guest) -> String {
     (if (i32.eq (global.get $mode) (i32.const {trap_in_filter})) (then unreachable))
     (if (i32.and (i32.eq (global.get $mode) (i32.const {trap_on_four})) (i32.eq (local.get $len) (i32.const 4)))
       (then unreachable))
-    (if (i32.eq (global.get $mode) (i32.const {fill_then_fill}))
+    (if (i32.or (i32.eq (global.get $mode) (i32.const {fill_then_fill})) (i32.eq (global.get $mode) (i32.const {fill_briefly})))
       (then
-        (drop (memory.grow (i32.const 252)))
-        (local.set $i (i32.const 800))
+        ;; Grown once: on an instance a decision kept, a second grow
+        ;; past the cap would trap.
+        (if (i32.lt_u (memory.size) (i32.const 256)) (then (drop (memory.grow (i32.const 252)))))
+        (local.set $i (select (i32.const 8) (i32.const 800) (i32.eq (global.get $mode) (i32.const {fill_briefly}))))
         (loop $some
           (memory.fill (i32.const 0) (i32.const 0) (i32.mul (memory.size) (i32.const 65536)))
           (local.set $i (i32.sub (local.get $i) (i32.const 1)))
@@ -427,7 +520,13 @@ fn guest_wat(guest: Guest) -> String {
     (local.set $len (i32.load offset=4 (local.get $rep)))
     (if (i32.eq (global.get $mode) (i32.const {spin})) (then (loop $spin (br $spin))))
     (if (i32.eq (global.get $mode) (i32.const {burn})) (then (call $burn)))
-    (if (i32.or (i32.eq (global.get $mode) (i32.const {fill})) (i32.eq (global.get $mode) (i32.const {fill_then_fill})))
+    (if (i32.eq (global.get $mode) (i32.const {log_in_score}))
+      (then
+        (call $log (i32.const 2) (i32.const 32) (i32.const 8))
+        (if (i32.eq (local.get $len) (i32.const 3)) (then unreachable))))
+    (if (i32.or (i32.eq (global.get $mode) (i32.const {log_then_burn})) (i32.eq (global.get $mode) (i32.const {log_then_decline})))
+      (then (call $log (i32.const 2) (i32.const 32) (i32.const 8))))
+    (if (i32.or (i32.or (i32.eq (global.get $mode) (i32.const {fill})) (i32.eq (global.get $mode) (i32.const {fill_then_fill}))) (i32.eq (global.get $mode) (i32.const {fill_briefly})))
       (then
         ;; The filter of the second mode grew the memory already: a second
         ;; grow past the cap would trap.
@@ -436,7 +535,7 @@ fn guest_wat(guest: Guest) -> String {
           (memory.fill (i32.const 0) (i32.const 0) (i32.mul (memory.size) (i32.const 65536)))
           (br $fill))))
     (local.set $r (call $alloc (i32.const 16) (i32.const 4)))
-    (if (i32.eq (global.get $mode) (i32.const {decline_score}))
+    (if (i32.or (i32.eq (global.get $mode) (i32.const {decline_score})) (i32.eq (global.get $mode) (i32.const {log_then_decline})))
       (then
         (i32.store8 (local.get $r) (i32.const 1))
         (i32.store8 offset=4 (local.get $r) (i32.const 0))
@@ -467,12 +566,22 @@ fn guest_wat(guest: Guest) -> String {
     (if (i32.eq (global.get $mode) (i32.const {spin_pick})) (then (loop $spin (br $spin))))
     (local.set $r (call $alloc (i32.const 16) (i32.const 4)))
     (i32.store8 (local.get $r) (i32.const 0))
-    (if (i32.eq (global.get $mode) (i32.const {burn})) (then (call $burn)))
+    (if (i32.or (i32.eq (global.get $mode) (i32.const {burn})) (i32.eq (global.get $mode) (i32.const {log_then_burn}))) (then (call $burn)))
     (if (i32.eq (global.get $mode) (i32.const {draw_in_pick}))
       (then (call $counter (i32.const 5) (call $random))))
     (if (i32.eq (global.get $mode) (i32.const {decline_pick}))
       (then
         (i32.store8 offset=4 (local.get $r) (i32.const 0))
+        (return (local.get $r))))
+    (if (i32.or (i32.eq (global.get $mode) (i32.const {count_dispatches})) (i32.or (i32.eq (global.get $mode) (i32.const {members_at_a_dispatch})) (i32.eq (global.get $mode) (i32.const {count_kinds}))))
+      (then
+        (i32.store8 offset=4 (local.get $r) (i32.const 1))
+        (i32.store offset=8 (local.get $r) (global.get $heard))
+        (return (local.get $r))))
+    (if (i32.or (i32.eq (global.get $mode) (i32.const {count_members})) (i32.eq (global.get $mode) (i32.const {trap_on_five_members})))
+      (then
+        (i32.store8 offset=4 (local.get $r) (i32.const 1))
+        (i32.store offset=8 (local.get $r) (global.get $members))
         (return (local.get $r))))
     (local.set $i (i32.const 0))
     (local.set $found (i32.const 0))
@@ -508,6 +617,32 @@ fn guest_wat(guest: Guest) -> String {
   ;; sixth value is the lease's session key on every lease-bearing case.
   (func (export "{iface}#observe") (param i32 i64 i64 i64 i32 i64 i64 i32 i64 i64 i32 i64 i32 i32 i32 i32)
     (if (i32.eq (global.get $mode) (i32.const {trap_in_observe})) (then unreachable))
+    ;; A membership event is the outer case 4. Its inner case is the second
+    ;; value (an addition 0, a removal 1, a snapshot 5) and a snapshot's
+    ;; length the fourth: the members told to this instance, counted.
+    (if (i32.eq (local.get 0) (i32.const 4))
+      (then
+        (if (i64.eq (local.get 1) (i64.const 5))
+          (then
+            (if (i32.and (i32.eq (global.get $mode) (i32.const {trap_on_five_members})) (i64.eq (local.get 3) (i64.const 5)))
+              (then unreachable))
+            (global.set $members (i32.wrap_i64 (local.get 3)))))
+        (if (i64.eq (local.get 1) (i64.const 0))
+          (then (global.set $members (i32.add (global.get $members) (i32.const 1)))))
+        (if (i64.eq (local.get 1) (i64.const 1))
+          (then (global.set $members (i32.sub (global.get $members) (i32.const 1)))))
+        (if (i32.eq (global.get $mode) (i32.const {count_kinds}))
+          (then
+            (if (i64.eq (local.get 1) (i64.const 3))
+              (then (global.set $heard (i32.add (global.get $heard) (i32.const 1)))))
+            (if (i64.eq (local.get 1) (i64.const 4))
+              (then (global.set $heard (i32.add (global.get $heard) (i32.const 2)))))))))
+    ;; A dispatch is the outer case 1 of the event: counted on this instance.
+    (if (i32.eq (local.get 0) (i32.const 1))
+      (then
+        (if (i32.eq (global.get $mode) (i32.const {members_at_a_dispatch}))
+          (then (global.set $heard (global.get $members)))
+          (else (global.set $heard (i32.add (global.get $heard) (i32.const 1)))))))
     (call $counter (i32.const 0) (i64.const 1))
     (call $counter (i32.const 3) (call $now))
     (call $counter (i32.const 4) (local.get 6))
@@ -527,6 +662,10 @@ fn guest_wat(guest: Guest) -> String {
           (drop (call $now))
           (local.set $i (i32.sub (local.get $i) (i32.const 1)))
           (br_if $calls (local.get $i)))))
+    (if (i32.eq (global.get $mode) (i32.const {log_dtor}))
+      (then
+        (call $log (i32.const 2) (i32.const 32) (i32.const 8))
+        (loop $once (br_if $once (i32.const 0)))))
     (global.set $heap (i32.const 1024)))
 )"#,
         iface = iface,
@@ -558,6 +697,16 @@ fn guest_wat(guest: Guest) -> String {
         fill_dtor = mode::FILL_IN_DESTRUCTOR,
         burn_init = mode::BURN_IN_INIT,
         trap_ctor = mode::TRAP_IN_CONSTRUCTOR,
+        log_in_score = mode::LOG_IN_SCORE,
+        log_dtor = mode::LOG_IN_DESTRUCTOR,
+        log_then_burn = mode::LOG_THEN_BURN,
+        log_then_decline = mode::LOG_THEN_DECLINE,
+        fill_briefly = mode::FILL_BRIEFLY_THEN_FILL,
+        count_dispatches = mode::COUNT_DISPATCHES,
+        count_members = mode::COUNT_MEMBERS,
+        trap_on_five_members = mode::TRAP_ON_FIVE_MEMBERS,
+        members_at_a_dispatch = mode::MEMBERS_AT_A_DISPATCH,
+        count_kinds = mode::COUNT_KINDS,
     )
 }
 

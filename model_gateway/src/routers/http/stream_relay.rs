@@ -30,8 +30,9 @@ use crate::{
     routers::common::{
         sse::SSE_CHANNEL_BUFFER,
         sse_rechunk::{NoopObserver, SseRechunker},
+        stream::GuardedStream,
     },
-    worker::{GuardedStream, WorkerLoadGuard},
+    worker::WorkerLoadGuard,
 };
 
 /// What a chunk became through the relay's hook, and whether it ends the
@@ -347,7 +348,7 @@ mod tests {
                 status: StatusCode::OK,
                 upstream_sse: true,
                 source: RelaySource::new("m", "/v1/chat/completions", Arc::clone(&worker)),
-                guard: WorkerLoadGuard::new(worker, None),
+                guard: WorkerLoadGuard::with_key(worker, None),
                 headers: HeaderMap::new(),
                 mode,
             },
@@ -665,7 +666,7 @@ mod tests {
                     status: StatusCode::OK,
                     upstream_sse,
                     source: RelaySource::new("m", "/v1/chat/completions", Arc::clone(&worker)),
-                    guard: WorkerLoadGuard::new(worker, None),
+                    guard: WorkerLoadGuard::with_key(worker, None),
                     headers,
                     mode: ChunkMode::Plain,
                 },

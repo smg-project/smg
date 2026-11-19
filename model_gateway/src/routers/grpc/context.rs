@@ -34,6 +34,7 @@ use super::{
             encode::EncodeDispatchPlan,
             helpers::{IdStamp, SamplingBaseline, SamplingDefaultsMask, ToolConstraintStamp},
             pd_protocol::{EncodeHandoff, PdProtocol},
+            request_execution::EncodeWatch,
             RateLimitCell,
         },
     },
@@ -58,11 +59,14 @@ use crate::{
     observability::{cache_trace, metrics::Metrics},
     policies::CacheNamespace,
     routers::{
-        common::{attempt_ledger::AttemptLedger, pd_admission::PdAdmissionGuard, sse::SseSender},
+        common::{
+            attempt_ledger::AttemptLedger, pd_admission::PdAdmissionGuard,
+            prefill_admission::PrefillLoadGuard, sse::SseSender,
+        },
         error::internal_error,
         grpc::regular::symphony::{template::Templates, PreparedConstraint},
     },
-    worker::{PrefillLoadGuard, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry},
+    worker::{RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry},
     workflow::TokenizerLoadFailures,
 };
 
@@ -274,9 +278,8 @@ pub(crate) struct ProcessingState {
     pub provider: Option<ProviderProfile>,
     /// The table's replay of the rendered prompt, as preparation read it for the forced call's
     /// tag (`reading::prepare`): request building's reasoning decision takes it in place of a
-    /// second replay of the same prompt (`reading::reasoning_decision`). `None` when preparation
-    /// did not replay (the request's thinking switch armed the reasoning, or the endpoint's
-    /// preparation reads no prompt); a decision then replays itself.
+    /// second replay of the same prompt (`reading::reasoning_decision`). `None` where the
+    /// endpoint's preparation reads no prompt; a decision then replays itself.
     pub prompt_thought: Option<PromptReplay>,
     /// The table decision for the request's model under its parser (`regular::symphony::reading`:
     /// the table that reads the response, or why the legacy parsers do), as the chat and Messages
@@ -468,7 +471,16 @@ pub(crate) struct DispatchContext {
     /// prefill/decode sides against the already-running encode jobs (a push plan
     /// carrying media is not retried).
     pub encode_outputs: Option<EncodeOutputs>,
+    /// The watch on a rendezvous plan's encode dispatch, made when the first
+    /// attempt launched the encode jobs beside its pair (see
+    /// `request_execution::launch_encode_dispatch`); a replay's prefill side
+    /// waits at the same rooms on the same jobs, so it races the same watch
+    /// and a failed send ends its wait too. `None` for a push plan, a
+    /// text-only request, or a plan with nothing to encode.
+    pub encode_watch: Option<EncodeWatch>,
     pub multimodal_inflight: Option<InflightPermit>,
+    /// Set for each attempt before it dispatches. Response processing is
+    /// its last reader and takes it.
     pub dispatch: Option<DispatchMetadata>,
     pub load_guards: Option<LoadGuards>,
     /// Prefill admission slot for the next PD/EPD dispatch; a retry's
@@ -511,6 +523,30 @@ impl StageOutput for ClientSelection {
     );
 }
 
+impl StageOutput for ExecutionResult {
+    const NOT_COMPLETED: (&'static str, &'static str) =
+        ("no_execution_result", "No execution result");
+}
+
+impl StageOutput for DispatchMetadata {
+    const NOT_COMPLETED: (&'static str, &'static str) =
+        ("dispatch_metadata_not_set", "Dispatch metadata not set");
+}
+
+impl StageOutput for Arc<dyn Tokenizer> {
+    const NOT_COMPLETED: (&'static str, &'static str) = (
+        "tokenizer_not_cached",
+        "Tokenizer not cached in context - preparation stage may have been skipped",
+    );
+}
+
+impl StageOutput for StopSequenceDecoder {
+    const NOT_COMPLETED: (&'static str, &'static str) = (
+        "stop_decoder_not_initialized",
+        "Stop decoder not initialized",
+    );
+}
+
 impl<T: StageOutput> StageOutput for &T {
     const NOT_COMPLETED: (&'static str, &'static str) = T::NOT_COMPLETED;
 }
@@ -531,6 +567,14 @@ pub(crate) fn stage_output<T: StageOutput>(
         error!(function = function, "{message}");
         internal_error(code, message)
     })
+}
+
+/// The failure a response-processing stage `function` reports when the
+/// dispatch handed it another request kind's [`ResponseSpec`]: logged once
+/// under the stage that noticed, one code for every stage.
+pub(crate) fn wrong_response_spec(function: &'static str) -> axum::response::Response {
+    error!(function = function, "Wrong response spec");
+    internal_error("wrong_response_spec", "Wrong response spec")
 }
 
 /// Everything request building hands the dispatch phase.
@@ -1186,12 +1230,15 @@ impl RequestContext {
     /// Fails loudly when worker selection's outputs (routing snapshot, wire)
     /// are absent: a retry context with defaulted routing inputs could
     /// re-select a worker the retained plan cannot be dispatched to.
-    pub fn into_dispatch(self) -> Result<DispatchContext, axum::response::Response> {
-        let RequestContext {
-            input,
-            components,
-            state,
-        } = self;
+    ///
+    /// Both contexts are a few KiB wide, so both travel boxed: this one
+    /// comes in its box, and the dispatch context leaves in the box the run
+    /// keeps it in.
+    pub fn into_dispatch(
+        self: Box<Self>,
+    ) -> Result<Box<DispatchContext>, axum::response::Response> {
+        // Fields leave the box one at a time: a local that bound `state`
+        // whole would copy all of it to the stack first.
         let RequestInput {
             request_type,
             headers,
@@ -1199,7 +1246,7 @@ impl RequestContext {
             streaming,
             tenant_request_meta,
             rate_limit_cell,
-        } = input;
+        } = self.input;
         // The model the response reports. `RequestContext::new` already
         // canonicalized both the request's `model` field and `model_id`, so a
         // request that arrived under an alias is answered under the canonical
@@ -1219,9 +1266,9 @@ impl RequestContext {
             RequestType::Transcription { request, .. } => request.model.clone(),
         };
         drop(request_type);
-        let parser = state.parser;
-        drop(components);
-        let routing = state.routing_snapshot.ok_or_else(|| {
+        let parser = self.state.parser;
+        drop(self.components);
+        let routing = self.state.routing_snapshot.ok_or_else(|| {
             error!(
                 function = "RequestContext::into_dispatch",
                 "Routing snapshot not captured by worker selection"
@@ -1232,10 +1279,10 @@ impl RequestContext {
             )
         })?;
         let wire = WireConstraint::of(
-            stage_output(state.workers.as_ref(), "RequestContext::into_dispatch")?,
-            state.media_refs_forwarded,
-            if state.media_refs_forwarded {
-                state.media_refs_pipeline
+            stage_output(self.state.workers.as_ref(), "RequestContext::into_dispatch")?,
+            self.state.media_refs_forwarded,
+            if self.state.media_refs_forwarded {
+                self.state.media_refs_pipeline
             } else {
                 PipelinePin::Any
             },
@@ -1245,7 +1292,7 @@ impl RequestContext {
                 .map(str::to_owned);
         let (created, _) =
             super::common::stages::helpers::request_wall_clock(tenant_request_meta.as_ref());
-        Ok(DispatchContext {
+        Ok(Box::new(DispatchContext {
             root_request_id: if cache_trace::enabled() {
                 request_id.clone()
             } else {
@@ -1265,18 +1312,19 @@ impl RequestContext {
             rate_limit_cell,
             routing,
             wire,
-            constraint_decided_on: state.constraint_decided_on,
-            tokenizer: state.tokenizer,
-            workers: state.workers,
-            sticky_key: state.sticky_key,
-            clients: state.clients,
-            encode_outputs: state.encode_outputs,
-            multimodal_inflight: state.multimodal_inflight,
+            constraint_decided_on: self.state.constraint_decided_on,
+            tokenizer: self.state.tokenizer,
+            workers: self.state.workers,
+            sticky_key: self.state.sticky_key,
+            clients: self.state.clients,
+            encode_outputs: self.state.encode_outputs,
+            encode_watch: None,
+            multimodal_inflight: self.state.multimodal_inflight,
             dispatch: None,
             load_guards: None,
-            pd_prefill_guard: state.pd_prefill_guard,
-            response: state.response,
-        })
+            pd_prefill_guard: self.state.pd_prefill_guard,
+            response: self.state.response,
+        }))
     }
 
     /// Create context for chat completion request
@@ -1430,78 +1478,52 @@ impl RequestContext {
     }
 
     /// Get Arc clone of chat request (panics if not chat)
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via RequestType construction"
-    )]
     pub fn chat_request_arc(&self) -> Arc<ChatCompletionRequest> {
-        match &self.input.request_type {
-            RequestType::Chat(req) => Arc::clone(req),
-            _ => panic!("Expected chat request"),
-        }
+        let RequestType::Chat(req) = &self.input.request_type else {
+            expected_shape("chat")
+        };
+        Arc::clone(req)
     }
 
     /// Get Arc clones of the transcription request and its audio (panics if
     /// not a transcription request).
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via RequestType construction"
-    )]
     pub fn transcription_input_arc(&self) -> (Arc<TranscriptionRequest>, Arc<AudioFile>) {
-        match &self.input.request_type {
-            RequestType::Transcription { request, audio } => {
-                (Arc::clone(request), Arc::clone(audio))
-            }
-            _ => panic!("Expected transcription request"),
-        }
+        let RequestType::Transcription { request, audio } = &self.input.request_type else {
+            expected_shape("transcription")
+        };
+        (Arc::clone(request), Arc::clone(audio))
     }
 
     /// Get Arc clone of generate request (panics if not generate)
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via RequestType construction"
-    )]
     pub fn generate_request_arc(&self) -> Arc<GenerateRequest> {
-        match &self.input.request_type {
-            RequestType::Generate(req) => Arc::clone(req),
-            _ => panic!("Expected generate request"),
-        }
+        let RequestType::Generate(req) = &self.input.request_type else {
+            expected_shape("generate")
+        };
+        Arc::clone(req)
     }
 
     /// Get Arc clone of completion request (panics if not completion)
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via RequestType construction"
-    )]
     pub fn completion_request_arc(&self) -> Arc<CompletionRequest> {
-        match &self.input.request_type {
-            RequestType::Completion(req) => Arc::clone(req),
-            _ => panic!("Expected completion request"),
-        }
+        let RequestType::Completion(req) = &self.input.request_type else {
+            expected_shape("completion")
+        };
+        Arc::clone(req)
     }
 
     /// Get Arc clone of responses request (panics if not responses)
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via RequestType construction"
-    )]
     pub fn responses_request_arc(&self) -> Arc<ResponsesRequest> {
-        match &self.input.request_type {
-            RequestType::Responses(req) => Arc::clone(req),
-            _ => panic!("Expected responses request"),
-        }
+        let RequestType::Responses(req) = &self.input.request_type else {
+            expected_shape("responses")
+        };
+        Arc::clone(req)
     }
 
     /// Get Arc clone of messages request (panics if not messages)
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via RequestType construction"
-    )]
     pub fn messages_request_arc(&self) -> Arc<CreateMessageRequest> {
-        match &self.input.request_type {
-            RequestType::Messages(req) => Arc::clone(req),
-            _ => panic!("Expected messages request"),
-        }
+        let RequestType::Messages(req) = &self.input.request_type else {
+            expected_shape("messages")
+        };
+        Arc::clone(req)
     }
 
     /// Check if request is streaming (captured at construction).
@@ -1516,6 +1538,18 @@ impl RequestContext {
     pub fn tokenizer_arc(&self) -> Option<Arc<dyn Tokenizer>> {
         self.state.tokenizer.clone()
     }
+}
+
+/// The typed accessors' refusal: the caller read a request shape the context
+/// does not hold. The shape is fixed at construction, so a wrong read is a
+/// programming error, never a request's. The panic names the accessor's line.
+#[expect(
+    clippy::panic,
+    reason = "typed accessor: caller guarantees variant via RequestType construction"
+)]
+#[track_caller]
+fn expected_shape(shape: &str) -> ! {
+    panic!("Expected {shape} request")
 }
 
 impl WorkerSelection {
@@ -1881,9 +1915,9 @@ mod tests {
     use smg_grpc_client::VllmEngineClient;
 
     use super::*;
-    use crate::{
-        routers::grpc::{client::GrpcClient, test_engine::mock_engine},
-        worker::test_support::select_worker,
+    use crate::routers::{
+        common::prefill_admission::test_support::select_worker,
+        grpc::{client::GrpcClient, test_engine::mock_engine},
     };
 
     /// Only multimodal vLLM EPD owns EC state absent from its retained plan.
@@ -2086,6 +2120,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_dispatch_phase_outputs_keep_their_codes() {
+        assert_eq!(
+            <ExecutionResult as StageOutput>::NOT_COMPLETED.0,
+            "no_execution_result"
+        );
+        assert_eq!(
+            <DispatchMetadata as StageOutput>::NOT_COMPLETED.0,
+            "dispatch_metadata_not_set"
+        );
+        assert_eq!(
+            <Arc<dyn Tokenizer> as StageOutput>::NOT_COMPLETED.0,
+            "tokenizer_not_cached"
+        );
+        assert_eq!(
+            <StopSequenceDecoder as StageOutput>::NOT_COMPLETED.0,
+            "stop_decoder_not_initialized"
+        );
+    }
+
     fn completion_prep(texts: &[&str], joined: Option<&str>) -> PreparationOutput {
         PreparationOutput::Completion {
             items: texts
@@ -2125,7 +2179,7 @@ mod tests {
         );
 
         let prefill_guard = PrefillLoadGuard::Unbounded {
-            _guard: WorkerLoadGuard::new(Arc::clone(&prefill), None),
+            _guard: WorkerLoadGuard::with_key(Arc::clone(&prefill), None),
         };
         assert_eq!(prefill.load(), 1);
         drop(prefill_guard);
@@ -2139,7 +2193,10 @@ mod tests {
 
     #[tokio::test]
     async fn batch_prompts_preserve_phase_load_semantics() {
-        use crate::worker::{BasicWorkerBuilder, PrefillAdmission, WorkerType};
+        use crate::{
+            routers::common::prefill_admission::PrefillAdmission,
+            worker::{BasicWorkerBuilder, WorkerType},
+        };
 
         let prefill: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("grpc://prefill:30000")
@@ -2447,7 +2504,7 @@ mod tests {
         // the prefill side with its own guard when the prefill phase ends.
         let guards = LoadGuards::new(&pd_selection(&prefill, &decode), None);
         let prefill_guard = PrefillLoadGuard::Unbounded {
-            _guard: WorkerLoadGuard::new(Arc::clone(&prefill), None),
+            _guard: WorkerLoadGuard::with_key(Arc::clone(&prefill), None),
         };
         drop(prefill_guard);
         assert_eq!(

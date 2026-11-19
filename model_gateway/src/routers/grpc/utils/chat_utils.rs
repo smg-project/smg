@@ -16,7 +16,8 @@ use bytes::Bytes;
 use llm_multimodal::{MediaPartOrder, Modality};
 use llm_tokenizer::{
     chat_template::{
-        ChatTemplateContentFormat, ChatTemplateParams, PreparedTools, ThinkingKeyName,
+        ChatTemplateContentFormat, ChatTemplateParams, PreparedTools, TemplateRefusal,
+        ThinkingKeyName,
     },
     traits::{Encoding, PromptEncoding, Tokenizer},
     StopRules, StopSequenceConfig, StopSequenceDecoder,
@@ -670,7 +671,7 @@ pub(crate) fn process_content_format(
     messages: &[ChatMessage],
     content_format: ChatTemplateContentFormat,
     placeholder_tokens: Option<&PlaceholderTokens>,
-) -> Result<Vec<Value>, String> {
+) -> Result<Vec<Value>, PromptError> {
     process_content_format_with_order(
         messages,
         content_format,
@@ -818,6 +819,22 @@ fn validate_chat_parts(
             ChatMessage::Function { .. } => None,
         };
         let assistant = matches!(message, ChatMessage::Assistant { .. });
+        // The roles whose content the public contract keeps to text: a media
+        // part there is refused here, before any fetch, in this door's own
+        // sentence, not after the pipeline processed it and the rendered
+        // prompt's anchors did not match it (none for a system, developer or
+        // root part; one too many for an assistant part on a template that
+        // renders assistant media). The binding carries the role's article
+        // for the sentence.
+        let text_only_role = match message {
+            ChatMessage::System { .. } => Some("a system"),
+            ChatMessage::Developer { .. } => Some("a developer"),
+            ChatMessage::Assistant { .. } => Some("an assistant"),
+            ChatMessage::Root { .. } => Some("a root"),
+            ChatMessage::User { .. } | ChatMessage::Tool { .. } | ChatMessage::Function { .. } => {
+                None
+            }
+        };
         if let Some(MessageContent::Parts(parts)) = content {
             for part in parts {
                 match part {
@@ -849,12 +866,30 @@ fn validate_chat_parts(
                                 .to_string(),
                         );
                     }
-                    _ => {}
+                    _ => {
+                        if let (Some(kind), Some(role)) = (media_part_type(part), text_only_role) {
+                            return Err(format!(
+                                "Unsupported chat content part type {kind:?} in {role} message \
+                                 for gRPC backends: media parts are taken in user and tool messages"
+                            ));
+                        }
+                    }
                 }
             }
         }
     }
     Ok(())
+}
+
+/// The wire name (`type`) of a media content part; `None` for any other part.
+fn media_part_type(part: &ContentPart) -> Option<&'static str> {
+    match part {
+        ContentPart::ImageUrl { .. } => Some("image_url"),
+        ContentPart::AudioUrl { .. } => Some("audio_url"),
+        ContentPart::InputAudio { .. } => Some("input_audio"),
+        ContentPart::VideoUrl { .. } => Some("video_url"),
+        ContentPart::Text { .. } | ContentPart::Refusal { .. } | ContentPart::Unknown(_) => None,
+    }
 }
 
 /// The template selects the reference path by the first block and emits only
@@ -902,7 +937,7 @@ fn process_content_format_with_order(
     content_format: ChatTemplateContentFormat,
     placeholder_tokens: Option<&PlaceholderTokens>,
     media_order: MediaPartOrder,
-) -> Result<Vec<Value>, String> {
+) -> Result<Vec<Value>, PromptError> {
     messages
         .iter()
         .map(|message| {
@@ -972,7 +1007,7 @@ fn transform_content_field(
     content_format: ChatTemplateContentFormat,
     placeholder_tokens: Option<&PlaceholderTokens>,
     media_order: MediaPartOrder,
-) -> Result<(), String> {
+) -> Result<(), PromptError> {
     let Some(content_array) = content_value.as_array() else {
         return Ok(()); // Not multimodal, keep as-is
     };
@@ -1009,10 +1044,14 @@ fn transform_content_field(
                         let Some(tokens) = placeholder_tokens else {
                             continue;
                         };
+                        // Media for a model whose template takes one
+                        // string per message and has no placeholder for
+                        // it: the request asks what the model does not
+                        // take.
                         let placeholder = tokens.get(modality).ok_or_else(|| {
-                            format!(
+                            PromptError::Refused(format!(
                                 "missing {modality} placeholder for string-format chat template"
-                            )
+                            ))
                         })?;
                         match media_order {
                             MediaPartOrder::MediaFirst => {
@@ -1151,6 +1190,61 @@ pub fn request_as_rendered(
     }
 }
 
+/// Why a conversation did not become a prompt.
+///
+/// [`Self::Refused`] is a cause the request itself brings and its client can
+/// fix: media for a template with no placeholder for it, a block or a document
+/// source the route does not take, a response format the renderer does not
+/// take with the request's other fields, a conversation the model's template
+/// rejects through its own `raise_exception`. A stage writes one WARN for it
+/// and marks its answer reported. Every other cause is [`Self::Failed`], which
+/// is also what a bare message converts into: a failure nobody typed as the
+/// request's is the deployment's, and the stage keeps its ERROR line for it.
+#[derive(Debug)]
+pub enum PromptError {
+    Refused(String),
+    Failed(String),
+}
+
+impl PromptError {
+    /// Whether the request itself is at fault.
+    pub fn is_refusal(&self) -> bool {
+        matches!(self, Self::Refused(_))
+    }
+
+    /// A template render's failure: the template's own refusal of the
+    /// conversation is the request's; any other (no template set, an
+    /// operation the template could not run) is not.
+    pub(crate) fn of_render(error: &anyhow::Error) -> Self {
+        let message = format!("Failed to apply chat template: {error}");
+        if TemplateRefusal::is(error) {
+            Self::Refused(message)
+        } else {
+            Self::Failed(message)
+        }
+    }
+}
+
+impl fmt::Display for PromptError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (Self::Refused(message) | Self::Failed(message)) = self;
+        f.write_str(message)
+    }
+}
+
+impl From<String> for PromptError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
+impl From<PromptError> for String {
+    fn from(error: PromptError) -> Self {
+        let (PromptError::Refused(message) | PromptError::Failed(message)) = error;
+        message
+    }
+}
+
 /// Process chat messages and apply template (shared by both routers)
 /// Requires HuggingFace tokenizer with chat template support
 ///
@@ -1202,6 +1296,7 @@ pub fn process_chat_messages_with_encoding(
         MediaPartOrder::MediaFirst,
         ProviderProfile::for_model(&request.model),
     )
+    .map_err(String::from)
 }
 
 /// Render the chat prompt. The second element says how the tokenize step must
@@ -1213,7 +1308,7 @@ pub(crate) fn process_chat_messages_with_placeholders(
     placeholder_tokens: Option<&PlaceholderTokens>,
     media_order: MediaPartOrder,
     provider: ProviderProfile,
-) -> Result<(ProcessedMessages, PromptEncoding), String> {
+) -> Result<(ProcessedMessages, PromptEncoding), PromptError> {
     let rendered = {
         // Get content format and transform messages accordingly: the format
         // of the template this request renders through, which a checkpoint
@@ -1263,7 +1358,7 @@ pub(crate) fn process_chat_messages_with_placeholders(
             tokenizer
                 .renderer_capabilities()
                 .validate_json_response(request.separate_reasoning, assistant_prefix)
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| PromptError::Refused(error.to_string()))?;
         }
 
         let final_template_kwargs = if combined_template_kwargs.is_empty() {
@@ -1335,7 +1430,7 @@ pub(crate) fn process_chat_messages_with_placeholders(
                 params,
                 assistant_prefix.as_deref(),
             )
-            .map_err(|e| format!("Failed to apply chat template: {e}"))?
+            .map_err(|e| PromptError::of_render(&e))?
     };
 
     let text = anchor_rendered_markers(placeholder_tokens, &rendered.encoding, rendered.text);
@@ -1535,28 +1630,51 @@ pub(crate) fn generate_tool_call_id(
     tool_index: usize,
     history_count: usize,
 ) -> String {
-    // Case-insensitive substring checks without allocation.
-    let is_kimi = model
-        .as_bytes()
-        .windows(4) // "kimi".len()
-        .any(|window| window.eq_ignore_ascii_case(b"kimi"));
-
-    if !is_kimi {
+    match CallIdFamily::of(model) {
+        Some(family) => family.id(tool_name, tool_index, history_count),
         // Standard OpenAI format: call_{24-char-uuid}
-        return format!("call_{}", &Uuid::now_v7().simple().to_string()[..24]);
+        None => format!("call_{}", &Uuid::now_v7().simple().to_string()[..24]),
+    }
+}
+
+/// A model family whose call ids are numbered by the call's place in the
+/// conversation ([`generate_tool_call_id`] has the forms); every other
+/// model's ids are minted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CallIdFamily {
+    KimiK2,
+    KimiK3,
+}
+
+impl CallIdFamily {
+    /// The family `model` names, read from the name.
+    pub(crate) fn of(model: &str) -> Option<Self> {
+        // Case-insensitive substring checks without allocation.
+        let names = |word: &[u8]| {
+            model
+                .as_bytes()
+                .windows(word.len())
+                .any(|window| window.eq_ignore_ascii_case(word))
+        };
+        if !names(b"kimi") {
+            return None;
+        }
+        Some(if names(b"k3") {
+            Self::KimiK3
+        } else {
+            Self::KimiK2
+        })
     }
 
-    let is_k3 = model
-        .as_bytes()
-        .windows(2) // "k3".len()
-        .any(|window| window.eq_ignore_ascii_case(b"k3"));
-
-    if is_k3 {
-        // Kimi-K3 (XTML) opaque format: {name}_{global_index}.
-        format!("{tool_name}_{}", history_count + tool_index)
-    } else {
-        // Kimi-K2 format: functions.{name}:{global_index}.
-        format!("functions.{}:{}", tool_name, history_count + tool_index)
+    /// The id of the call to `tool_name`, the `tool_index`-th of its message,
+    /// after `history_count` calls in the conversation's earlier messages.
+    pub(crate) fn id(self, tool_name: &str, tool_index: usize, history_count: usize) -> String {
+        match self {
+            // Kimi-K3 (XTML) opaque format: {name}_{global_index}.
+            Self::KimiK3 => format!("{tool_name}_{}", history_count + tool_index),
+            // Kimi-K2 format: functions.{name}:{global_index}.
+            Self::KimiK2 => format!("functions.{}:{}", tool_name, history_count + tool_index),
+        }
     }
 }
 

@@ -1,9 +1,11 @@
 //! The HTTP admin listener: the probes, the version and the metrics. The
 //! probes keep the gateway's paths and bodies (`/liveness`, `/readiness`,
-//! `/health`; `OK`, `{"status": "ready"}`, `503 {"status": "not ready",
+//! `/health`; `OK`, `{"status": "ready", ...}`, `503 {"status": "not ready",
 //! "reason": ...}`) and the scrape keeps its path (`/metrics`), so one probe
-//! set and one scrape configuration serve both processes; `/version` names
-//! the binary, its version and the protocol package it speaks.
+//! set and one scrape configuration serve both processes; a ready controller
+//! adds its role (`"role": "leader"` or `"follower"`), read from the fence at
+//! the probe; `/version` names the binary, its version and the protocol
+//! package it speaks.
 
 use std::sync::Arc;
 
@@ -17,8 +19,8 @@ use axum::{
 use serde::Serialize;
 use serde_json::json;
 
-use super::{metrics::Metrics, readiness::Readiness, PROTOCOL_PACKAGE};
-use crate::ingest::loads::Stats;
+use super::{deciders::Counts, metrics::Metrics, readiness::Readiness, PROTOCOL_PACKAGE};
+use crate::{ingest::loads::Stats, store::MemoryStore};
 
 /// What `/version` answers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -45,6 +47,10 @@ pub(crate) struct Admin {
     pub(crate) metrics: Arc<Metrics>,
     /// The load driver's counts, rendered with the metrics.
     pub(crate) loads: Arc<Stats>,
+    /// The decide call's counts, rendered with the metrics.
+    pub(crate) decides: Arc<Counts>,
+    /// The store, whose counts the metrics render reads.
+    pub(crate) store: Arc<MemoryStore>,
 }
 
 /// The admin routes over their state.
@@ -67,7 +73,11 @@ async fn liveness() -> Response {
 async fn readiness(AxumState(admin): AxumState<Admin>) -> Response {
     let state = admin.readiness.state();
     if state.is_ready() {
-        (StatusCode::OK, Json(json!({ "status": "ready" }))).into_response()
+        (
+            StatusCode::OK,
+            Json(json!({ "status": "ready", "role": state.as_str() })),
+        )
+            .into_response()
     } else {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -87,14 +97,19 @@ async fn metrics(AxumState(admin): AxumState<Admin>) -> Response {
             header::CONTENT_TYPE,
             "text/plain; version=0.0.4; charset=utf-8",
         )],
-        admin.metrics.render(&admin.loads),
+        admin.metrics.render(
+            || admin.readiness.sample(),
+            &admin.loads,
+            &admin.decides,
+            || admin.store.counts(),
+        ),
     )
         .into_response()
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Instant};
 
     use axum::{
         body::{to_bytes, Body},
@@ -104,8 +119,15 @@ mod tests {
 
     use super::{router, Admin, VERSION};
     use crate::{
-        controller::{metrics::Metrics, readiness, readiness::State},
+        controller::{
+            metrics::Metrics,
+            readiness::{tests::fenced, Phase},
+        },
         ingest::loads::Stats,
+        spec::{BindingSpec, OverloadSpec},
+        store::{LoadSink, LoadSource, MemoryStore, WorkerFacts, WorkersStore},
+        view::{LoadRow, Role},
+        AppliedSpec, PolicySpec,
     };
 
     async fn get(app: axum::Router, path: &str) -> (StatusCode, String, String) {
@@ -132,25 +154,42 @@ mod tests {
 
     #[tokio::test]
     async fn the_probes_follow_the_state_and_liveness_never_fails() {
-        let (writer, reader) = readiness::channel();
+        let (mut elector, phase, _steps, reader) = fenced();
         let metrics = Metrics::new();
         let app = router(Admin {
             readiness: reader,
             metrics: Arc::new(metrics),
             loads: Arc::new(Stats::default()),
+            decides: Arc::default(),
+            store: Arc::new(MemoryStore::new()),
         });
 
         let (status, _, body) = get(app.clone(), "/readiness").await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body, r#"{"status":"not ready","reason":"starting"}"#);
 
-        writer.send_replace(State::Ready);
+        // Serving behind a closed fence: ready, and a follower.
+        phase.send_replace(Phase::Serving);
         let (status, content_type, body) = get(app.clone(), "/readiness").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(content_type, "application/json");
-        assert_eq!(body, r#"{"status":"ready"}"#);
+        assert_eq!(body, r#"{"status":"ready","role":"follower"}"#);
+        let (_, _, scrape) = get(app.clone(), "/metrics").await;
+        assert!(scrape.contains("smg_policy_controller_state{state=\"follower\"} 1"));
+        assert!(scrape.contains("smg_policy_controller_state{state=\"leader\"} 0"));
 
-        writer.send_replace(State::Draining);
+        // The candidate, alone over its own lease, takes it and leads: the
+        // probe and the gauge say leader with no message between the
+        // election and the admin listener.
+        elector.lead_at(Instant::now());
+        let (status, _, body) = get(app.clone(), "/readiness").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, r#"{"status":"ready","role":"leader"}"#);
+        let (_, _, scrape) = get(app.clone(), "/metrics").await;
+        assert!(scrape.contains("smg_policy_controller_state{state=\"leader\"} 1"));
+        assert!(scrape.contains("smg_policy_controller_state{state=\"follower\"} 0"));
+
+        phase.send_replace(Phase::Draining);
         let (status, _, body) = get(app.clone(), "/readiness").await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body, r#"{"status":"not ready","reason":"draining"}"#);
@@ -163,12 +202,14 @@ mod tests {
 
     #[tokio::test]
     async fn version_and_metrics_render_the_controllers_own() {
-        let (_writer, reader) = readiness::channel();
+        let (_elector, _phase, _steps, reader) = fenced();
         let metrics = Metrics::new();
         let app = router(Admin {
             readiness: reader,
             metrics: Arc::new(metrics),
             loads: Arc::new(Stats::default()),
+            decides: Arc::default(),
+            store: Arc::new(MemoryStore::new()),
         });
 
         let (status, content_type, body) = get(app.clone(), "/version").await;
@@ -188,5 +229,79 @@ mod tests {
 
         let (status, _, _) = get(app, "/nowhere").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn the_scrape_reads_the_stores_counts_at_each_render() {
+        let (_elector, _phase, _steps, reader) = fenced();
+        let store = Arc::new(MemoryStore::new());
+        let app = router(Admin {
+            readiness: reader,
+            metrics: Arc::new(Metrics::new()),
+            loads: Arc::new(Stats::default()),
+            decides: Arc::default(),
+            store: Arc::clone(&store),
+        });
+        let mut document = PolicySpec::preset("round_robin").expect("a preset of this build");
+        document.generation = 1;
+        document.view.engines = vec!["alpha".to_owned()];
+        document.view.zones = vec!["east".to_owned()];
+        let profile = document
+            .profiles
+            .keys()
+            .next()
+            .expect("the preset's profile");
+        document.bindings = vec![BindingSpec {
+            profile: Some(profile.clone()),
+            overload: Some(OverloadSpec {
+                waiting_requests: Some(8),
+                token_usage: Some(1.0),
+                ..OverloadSpec::default()
+            }),
+            ..BindingSpec::default()
+        }];
+        let lists = AppliedSpec::validate(&document).expect("the document validates");
+        store.apply(lists).expect("applied");
+        let member = |key: &str, engine: &str, zone: &str| WorkerFacts {
+            key: key.to_owned(),
+            engine: key.to_owned(),
+            incarnation: 1,
+            role: Role::Single,
+            models: ["m".to_owned()].into_iter().collect(),
+            dp_size: 1,
+            engine_kind: engine.to_owned(),
+            zone: Some(zone.to_owned()),
+            ..WorkerFacts::default()
+        };
+
+        let listed = store.upsert(member("listed", "alpha", "east")).id();
+        store.publish_now();
+        let (_, _, body) = get(app.clone(), "/metrics").await;
+        assert!(body.contains("smg_policy_controller_members_outside_list{list=\"engines\"} 0"));
+        assert!(body.contains("smg_policy_controller_members_outside_list{list=\"zones\"} 0"));
+        assert!(body.contains("smg_policy_controller_overload_flips_total 0"));
+
+        // A member the lists do not name is counted at the scrape after the
+        // build its registration owes.
+        store.upsert(member("stray", "beta", "west"));
+        store.upsert(member("far", "alpha", "north"));
+        store.publish_now();
+        let (_, _, body) = get(app.clone(), "/metrics").await;
+        assert!(body.contains("smg_policy_controller_members_outside_list{list=\"engines\"} 1"));
+        assert!(body.contains("smg_policy_controller_members_outside_list{list=\"zones\"} 2"));
+        assert!(body.contains("smg_policy_controller_overload_flips_total 0"));
+
+        // A load write that moves a verdict is counted at the scrape after it.
+        let queue = LoadRow {
+            queued: 9,
+            ..LoadRow::default()
+        };
+        store.report(
+            &[(listed, 0, Some(queue))],
+            Instant::now(),
+            LoadSource::Poll,
+        );
+        let (_, _, body) = get(app, "/metrics").await;
+        assert!(body.contains("smg_policy_controller_overload_flips_total 1"));
     }
 }

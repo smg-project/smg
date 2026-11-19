@@ -3,7 +3,9 @@ name: Release Docker Image
 # A push builds the images to validate the Dockerfile and pushes nothing; the images are published
 # only on a maintainer's dispatch against a release tag or branch (scripts/release/README.md).
 # Two images come out of docker/Dockerfile: the router image and its `-slurm` variant, the
-# router image with the Slurm client commands the Slurm discovery provider runs.
+# router image with the Slurm client commands the Slurm discovery provider runs. A third, the
+# policy controller's, comes out of docker/policy-controller.Dockerfile. The amd64
+# Oracle Linux 9 router comes from docker/ol9.Dockerfile and takes the `-ol9` tags.
 on:
   push:
     branches:
@@ -11,7 +13,10 @@ on:
       - release/**
     paths:
       - .cargo/config.toml
+      - .github/workflows/release-docker.yml
       - docker/Dockerfile
+      - docker/ol9.Dockerfile
+      - docker/policy-controller.Dockerfile
   workflow_dispatch:
     inputs:
       tag:
@@ -77,7 +82,9 @@ jobs:
           OWNER: ${{ github.repository_owner }}
         run: |
           # A candidate (a pre-release suffix such as 1.14.0-rc.1) never moves `latest`.
-          # The `-slurm` variant takes every tag of the router image with `-slurm` appended.
+          # The `-slurm` variant takes every tag of the router image with `-slurm` appended,
+          # the policy controller's image every tag with `-policy-controller` appended,
+          # and the Oracle Linux 9 router every tag with `-ol9` appended.
           TAGS="lightseekorg/smg:${VERSION}"$'\n'"ghcr.io/${OWNER}/smg:${VERSION}"
           LATEST="false"
           if [[ "${VERSION}" != *-* ]]; then
@@ -85,8 +92,12 @@ jobs:
             LATEST="true"
           fi
           SLURM_TAGS=""
+          CONTROLLER_TAGS=""
+          OL9_TAGS=""
           while IFS= read -r tag; do
             SLURM_TAGS+="${SLURM_TAGS:+$'\n'}${tag}-slurm"
+            CONTROLLER_TAGS+="${CONTROLLER_TAGS:+$'\n'}${tag}-policy-controller"
+            OL9_TAGS+="${OL9_TAGS:+$'\n'}${tag}-ol9"
           done <<< "${TAGS}"
           {
             echo "tags<<EOF"
@@ -95,9 +106,15 @@ jobs:
             echo "slurm_tags<<EOF"
             echo "${SLURM_TAGS}"
             echo "EOF"
+            echo "controller_tags<<EOF"
+            echo "${CONTROLLER_TAGS}"
+            echo "EOF"
+            echo "ol9_tags<<EOF"
+            echo "${OL9_TAGS}"
+            echo "EOF"
             echo "latest=${LATEST}"
           } >> "$GITHUB_OUTPUT"
-          echo "Tags: ${TAGS//$'\n'/ } and ${SLURM_TAGS//$'\n'/ } (latest moves: ${LATEST})"
+          echo "Tags: ${TAGS//$'\n'/ }, ${SLURM_TAGS//$'\n'/ }, ${CONTROLLER_TAGS//$'\n'/ } and ${OL9_TAGS//$'\n'/ } (latest moves: ${LATEST})"
 
       - name: Set up QEMU
         if: env.MIRROR_EXISTING != 'true'
@@ -150,6 +167,39 @@ jobs:
           cache-to: type=gha,mode=max
           platforms: linux/amd64,linux/arm64
 
+      # The policy controller's image, from its own Dockerfile. It reads and saves no build
+      # cache: the steps above share one cache scope, which this build's export would replace.
+      # It runs when the router's build succeeded, whatever the variant's step did: what that
+      # build pushed is out by then, and each of its tags wants its twin. A mirror run skips
+      # the router's build, and this one with it.
+      - name: Build and push the policy controller image
+        id: build-controller
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/policy-controller.Dockerfile
+          target: policy-controller-image
+          push: ${{ steps.should-push.outputs.push }}
+          tags: ${{ steps.tags.outputs.controller_tags }}
+          platforms: linux/amd64,linux/arm64
+
+      # OL9 has been validated on amd64. Its cache is separate from the Ubuntu
+      # images, and an optional variant's failure does not skip this build.
+      - name: Build and push the Oracle Linux 9 router
+        id: build-ol9
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/ol9.Dockerfile
+          target: router-image
+          push: ${{ steps.should-push.outputs.push }}
+          tags: ${{ steps.tags.outputs.ol9_tags }}
+          cache-from: type=gha,scope=smg-ol9-amd64
+          cache-to: type=gha,scope=smg-ol9-amd64,mode=max
+          platforms: linux/amd64
+
       - name: Mirror existing release image
         id: mirror
         if: env.MIRROR_EXISTING == 'true'
@@ -162,10 +212,11 @@ jobs:
             echo "::error::Mirror mode only supports the current release (${CURRENT_VERSION})."
             exit 1
           fi
-          # The router image and its -slurm variant, each from its Docker Hub tag. The router
-          # image must be there; a variant that is not (its build failed after the router
-          # image was pushed) is reported and skipped, so the mirror of the rest stands.
-          for VARIANT in "" "-slurm"; do
+          # The router image and its -slurm, -policy-controller and -ol9 variants, each from
+          # its Docker Hub tag. The router image must be there; another that is not (its build
+          # failed after the router image was pushed, or the release is older than the image)
+          # is reported and skipped, so the mirror of the rest stands.
+          for VARIANT in "" "-slurm" "-policy-controller" "-ol9"; do
             SOURCE="lightseekorg/smg:${VERSION}${VARIANT}"
             if [[ -n "${VARIANT}" ]] && ! docker buildx imagetools inspect "${SOURCE}" > /dev/null 2>&1; then
               echo "::warning::${SOURCE} is not on Docker Hub; the ${VARIANT} variant was not mirrored."
@@ -192,6 +243,8 @@ jobs:
           LATEST: ${{ steps.tags.outputs.latest }}
           DIGEST: ${{ env.MIRROR_EXISTING == 'true' && steps.mirror.outputs.digest || steps.build.outputs.digest }}
           SLURM_DIGEST: ${{ env.MIRROR_EXISTING == 'true' && steps.mirror.outputs.digest_slurm || steps.build-slurm.outputs.digest }}
+          CONTROLLER_OUTCOME: ${{ env.MIRROR_EXISTING == 'true' && steps.mirror.outcome || steps.build-controller.outcome }}
+          CONTROLLER_DIGEST: ${{ env.MIRROR_EXISTING == 'true' && steps.mirror.outputs.digest_policy_controller || steps.build-controller.outputs.digest }}
         run: |
           IMAGE="lightseekorg/smg:${VERSION}"
           LATEST_IMAGE="lightseekorg/smg:latest"
@@ -199,9 +252,14 @@ jobs:
           GHCR_LATEST="ghcr.io/${GITHUB_REPOSITORY_OWNER}/smg:latest"
           # The variant counts as published only with a digest: in mirror mode a variant missing
           # from Docker Hub is skipped with a warning and leaves the step's outcome at success.
+          # The policy controller's image the same.
           SLURM_PUBLISHED="false"
           if [[ "${SLURM_OUTCOME}" == "success" && -n "${SLURM_DIGEST}" ]]; then
             SLURM_PUBLISHED="true"
+          fi
+          CONTROLLER_PUBLISHED="false"
+          if [[ "${CONTROLLER_OUTCOME}" == "success" && -n "${CONTROLLER_DIGEST}" ]]; then
+            CONTROLLER_PUBLISHED="true"
           fi
           if [[ "${PUBLISH_OUTCOME}" == "success" && "${PUSH}" == "true" ]]; then
             {
@@ -223,6 +281,14 @@ jobs:
                   echo "| GHCR | \`latest-slurm\` | \`${GHCR_LATEST}-slurm\` |"
                 fi
               fi
+              if [[ "${CONTROLLER_PUBLISHED}" == "true" ]]; then
+                echo "| Docker Hub | \`${VERSION}-policy-controller\` | \`${IMAGE}-policy-controller\` |"
+                echo "| GHCR | \`${VERSION}-policy-controller\` | \`${GHCR_IMAGE}-policy-controller\` |"
+                if [[ "${LATEST}" == "true" ]]; then
+                  echo "| Docker Hub | \`latest-policy-controller\` | \`${LATEST_IMAGE}-policy-controller\` |"
+                  echo "| GHCR | \`latest-policy-controller\` | \`${GHCR_LATEST}-policy-controller\` |"
+                fi
+              fi
               if [[ -n "${DIGEST}" ]]; then
                 echo ""
                 echo "Digest: \`${DIGEST}\`"
@@ -234,15 +300,25 @@ jobs:
                 echo ""
                 echo "The \`-slurm\` variant was **not** published (outcome: \`${SLURM_OUTCOME}\`, digest: \`${SLURM_DIGEST:-none}\`)."
               fi
+              if [[ "${CONTROLLER_PUBLISHED}" == "true" ]]; then
+                echo ""
+                echo "Digest of the policy controller image: \`${CONTROLLER_DIGEST}\`"
+              else
+                echo ""
+                echo "The policy controller image was **not** published (outcome: \`${CONTROLLER_OUTCOME}\`, digest: \`${CONTROLLER_DIGEST:-none}\`)."
+              fi
             } >> "$GITHUB_STEP_SUMMARY"
             if [[ "${SLURM_PUBLISHED}" != "true" ]]; then
               echo "::warning::The -slurm variant of ${IMAGE} was not published (outcome: ${SLURM_OUTCOME}, digest: ${SLURM_DIGEST:-none})."
+            fi
+            if [[ "${CONTROLLER_PUBLISHED}" != "true" ]]; then
+              echo "::warning::The policy controller image ${IMAGE}-policy-controller was not published (outcome: ${CONTROLLER_OUTCOME}, digest: ${CONTROLLER_DIGEST:-none})."
             fi
           elif [[ "${PUBLISH_OUTCOME}" == "success" ]]; then
             {
               echo "### ⚠️ Docker images built but NOT pushed"
               echo ""
-              echo "\`${IMAGE}\` was built and validated (its \`-slurm\` variant: \`${SLURM_OUTCOME}\`), but not published — the images are published on a manual dispatch only."
+              echo "\`${IMAGE}\` was built and validated (its \`-slurm\` variant: \`${SLURM_OUTCOME}\`, the policy controller image: \`${CONTROLLER_OUTCOME}\`), but not published — the images are published on a manual dispatch only."
             } >> "$GITHUB_STEP_SUMMARY"
             echo "::warning::Docker image ${IMAGE} was built but not pushed."
           else
@@ -262,3 +338,36 @@ jobs:
               echo "::warning::Release images were not published (outcome: ${PUBLISH_OUTCOME})."
             fi
           fi
+
+      - name: Oracle Linux 9 summary
+        if: always()
+        env:
+          PUSH: ${{ steps.should-push.outputs.push }}
+          OL9_OUTCOME: ${{ env.MIRROR_EXISTING == 'true' && steps.mirror.outcome || steps.build-ol9.outcome }}
+          OL9_DIGEST: ${{ env.MIRROR_EXISTING == 'true' && steps.mirror.outputs.digest_ol9 || steps.build-ol9.outputs.digest }}
+          VERSION: ${{ steps.version.outputs.version }}
+          LATEST: ${{ steps.tags.outputs.latest }}
+        run: |
+          IMAGE="lightseekorg/smg:${VERSION}-ol9"
+          GHCR_IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER}/smg:${VERSION}-ol9"
+          {
+            echo "### Oracle Linux 9 router (linux/amd64)"
+            echo ""
+            if [[ "${OL9_OUTCOME}" == "success" && "${PUSH}" == "true" && -n "${OL9_DIGEST}" ]]; then
+              echo "| Registry | Reference |"
+              echo "| --- | --- |"
+              echo "| Docker Hub | \`${IMAGE}\` |"
+              echo "| GHCR | \`${GHCR_IMAGE}\` |"
+              if [[ "${LATEST}" == "true" ]]; then
+                echo "| Docker Hub | \`lightseekorg/smg:latest-ol9\` |"
+                echo "| GHCR | \`ghcr.io/${GITHUB_REPOSITORY_OWNER}/smg:latest-ol9\` |"
+              fi
+              echo ""
+              echo "Digest: \`${OL9_DIGEST}\`"
+            elif [[ "${OL9_OUTCOME}" == "success" && "${PUSH}" != "true" ]]; then
+              echo "\`${IMAGE}\` was built and validated. A maintainer's manual dispatch publishes it."
+            else
+              echo "The OL9 image was **not** published (outcome: \`${OL9_OUTCOME}\`, digest: \`${OL9_DIGEST:-none}\`)."
+              echo "::warning::The OL9 image was not published (outcome: ${OL9_OUTCOME}, digest: ${OL9_DIGEST:-none})." >&2
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

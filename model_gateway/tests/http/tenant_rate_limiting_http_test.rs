@@ -127,7 +127,7 @@ async fn answer(State(state): State<WorkerState>, body: Bytes) -> Response {
     state.requests.fetch_add(1, Ordering::SeqCst);
     if state
         .failures
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
         .is_ok()
     {
         return (StatusCode::SERVICE_UNAVAILABLE, "overloaded").into_response();
@@ -431,7 +431,9 @@ impl Endpoint {
                     "messages": [{"role": "user", "content": PROMPT_TEXT}],
                     "stream": stream,
                 }));
-                router.route_chat(None, &tenant, body, MODEL).await
+                router
+                    .route_chat(None, &tenant, Arc::new(body), MODEL)
+                    .await
             }
             Self::Completion => {
                 let body = request::<CompletionRequest>(json!({
@@ -446,7 +448,9 @@ impl Endpoint {
                     "max_tokens": 32,
                     "stream": stream,
                 }));
-                router.route_messages(None, &tenant, body, MODEL).await
+                router
+                    .route_messages(None, &tenant, Arc::new(body), MODEL)
+                    .await
             }
             Self::Embeddings => {
                 let body = request::<EmbeddingRequest>(json!({
@@ -620,7 +624,9 @@ async fn every_input_the_request_carries_is_reserved() {
             }]},
         ],
     }));
-    router.route_chat(None, &tenant, tool_call, MODEL).await;
+    router
+        .route_chat(None, &tenant, Arc::new(tool_call), MODEL)
+        .await;
 
     worker.answer(Endpoint::Messages.usage_body(1, 1));
     let tool_result = request::<CreateMessageRequest>(json!({
@@ -632,7 +638,7 @@ async fn every_input_the_request_carries_is_reserved() {
         ]}],
     }));
     router
-        .route_messages(None, &tenant, tool_result, MODEL)
+        .route_messages(None, &tenant, Arc::new(tool_result), MODEL)
         .await;
 
     // Ten words of instructions and two of input: ceil(12 * 1.3). Two words

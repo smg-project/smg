@@ -1666,6 +1666,7 @@ def test_an_engine_that_runs_prefill_alone_keeps_the_media_step(level, ranks):
 
 
 def test_the_sglang_inputs_come_from_the_server_arguments_and_the_facts(monkeypatch, caplog):
+    """Warmup preserves resolved server limits and the engine bootstrap sentinel."""
     args = SimpleNamespace(max_running_requests=64, chunked_prefill_size=8192, context_length=None)
     facts = {"is_generation": True, "max_context_length": 32768, "vocab_size": 151936}
     inputs = sglang_warmup.warmup_inputs(args, facts)
@@ -1690,11 +1691,9 @@ def test_the_sglang_inputs_come_from_the_server_arguments_and_the_facts(monkeypa
     assert sglang_warmup.warmup_inputs(args, {**facts, "is_generation": False}) is None
     # A prefill or decode side plans as a single engine does, its requests
     # bound for nobody: the engine's own stand-in bootstrap host rides along.
-    monkeypatch.setitem(
-        sys.modules,
-        "sglang.srt.disaggregation.utils",
-        SimpleNamespace(FAKE_BOOTSTRAP_HOST="2.2.2.2"),
-    )
+    from smg_grpc_servicer.sglang import compat
+
+    monkeypatch.setattr(compat, "get_disaggregation_types", lambda: (object, "2.2.2.2"))
     for role in ("prefill", "decode"):
         side = sglang_warmup.warmup_inputs(SimpleNamespace(disaggregation_mode=role), facts)
         assert side.lone_leg_bootstrap == "2.2.2.2"
@@ -1864,6 +1863,84 @@ def test_a_one_process_engine_plans_the_ladder_and_a_wider_layout_the_remainders
         facts,
     )
     assert len(plan_warmup(chunk).steps) == 4117
+
+
+def test_the_remainders_knob_reads_auto_on_or_off_and_names_itself_on_anything_else():
+    parse = tokenspeed_warmup.parse_remainders
+    for text in (None, "", "  ", "auto", "AUTO"):
+        assert parse(text) == "auto"
+    for text in ("on", "ON", "1", "true", "yes"):
+        assert parse(text) == "on"
+    for text in ("off", "Off", "0", "false", "no", "none"):
+        assert parse(text) == "off"
+    with pytest.raises(
+        ValueError,
+        match=re.escape(
+            "SMG_TOKENSPEED_SERVICER_WARMUP_REMAINDERS='sometimes': expected auto, on or off "
+            "(the default is auto)"
+        ),
+    ):
+        parse("sometimes")
+    # The setting the parser hands back is the planner's whole vocabulary: a
+    # value that skipped the parser is refused, not read as off.
+    with pytest.raises(ValueError, match="SMG_TOKENSPEED_SERVICER_WARMUP_REMAINDERS"):
+        tokenspeed_warmup.chunk_remainders(4, "On")
+
+
+def test_the_remainders_setting_overrides_the_layout_rule_and_warns_when_it_opens_the_hazard(
+    caplog,
+):
+    facts = {"is_generation": True, "max_context_length": 1 << 20, "vocab_size": 129280}
+
+    def tokenspeed(world_size, remainders):
+        mapping = SimpleNamespace(world_size=world_size, attn=SimpleNamespace(dp_size=1))
+        return tokenspeed_warmup.warmup_inputs(
+            SimpleNamespace(
+                max_num_seqs=8, chunked_prefill_size=4096, max_model_len=1 << 20, mapping=mapping
+            ),
+            facts,
+            remainders=remainders,
+        )
+
+    def remainders(inputs):
+        return sum(1 for s in plan_warmup(inputs).steps if s.kind == "remainder")
+
+    # auto, the default, keeps the layout rule.
+    assert remainders(tokenspeed(4, "auto")) == 4042 and remainders(tokenspeed(1, "auto")) == 0
+    # on: every count, on one process as on four.
+    assert remainders(tokenspeed(1, "on")) == 4042 and remainders(tokenspeed(4, "on")) == 4042
+    # off: the rest of the full plan unchanged, step for step, and a WARNING
+    # on an engine of more than one process (none on one process).
+    caplog.set_level(logging.WARNING, logger="smg_grpc_servicer")
+    auto = plan_warmup(tokenspeed(4, "auto"))
+    caplog.clear()
+    off = plan_warmup(tokenspeed(4, "off"))
+    assert [s.name for s in off.steps] == [s.name for s in auto.steps if s.kind != "remainder"]
+    assert len(off.steps) == 4117 - 4042
+    assert [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING] == [
+        "Planned warm-up plans no chunk remainders "
+        "(SMG_TOKENSPEED_SERVICER_WARMUP_REMAINDERS=off) on an engine of 4 processes: a prompt "
+        "length's first use during serving stays a hazard unless the engine loads those kernels "
+        "itself before it reports ready"
+    ]
+    caplog.clear()
+    tokenspeed(1, "off")
+    assert not caplog.records
+    # An unknown layout keeps the remainders under auto, so off warns there too.
+    unknown = SimpleNamespace(max_num_seqs=8, chunked_prefill_size=4096, max_model_len=1 << 20)
+    assert tokenspeed_warmup.warmup_inputs(unknown, facts).every_prefill_length is True
+    assert (
+        tokenspeed_warmup.warmup_inputs(unknown, facts, remainders="on").every_prefill_length
+        is True
+    )
+    caplog.clear()
+    assert (
+        tokenspeed_warmup.warmup_inputs(unknown, facts, remainders="off").every_prefill_length
+        is False
+    )
+    assert any(
+        "on an engine of an unknown number of processes" in r.getMessage() for r in caplog.records
+    )
 
 
 def test_the_sglang_inputs_leave_the_engine_its_six_positions():

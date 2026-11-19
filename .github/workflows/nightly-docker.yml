@@ -61,7 +61,9 @@ jobs:
         run: |
           SUFFIX="$(date -u +%Y%m%d)-${GITHUB_SHA::7}"
           # The `-slurm` variant (the router image with the Slurm clients) takes
-          # every tag with `-slurm` appended.
+          # every tag with `-slurm` appended, the policy controller's image every
+          # tag with `-policy-controller` appended, and the OL9 router every tag
+          # with `-ol9` appended.
           if [ "$EXPRESS" = "true" ]; then
             # amd64-only: the floating :nightly stays multi-arch by not
             # retagging it here; consumers pin the suffixed tag.
@@ -72,6 +74,12 @@ jobs:
               echo "EOF"
               echo "slurm_list<<EOF"
               echo "ghcr.io/${OWNER}/smg:nightly-${SUFFIX}-slurm"
+              echo "EOF"
+              echo "controller_list<<EOF"
+              echo "ghcr.io/${OWNER}/smg:nightly-${SUFFIX}-policy-controller"
+              echo "EOF"
+              echo "ol9_list<<EOF"
+              echo "ghcr.io/${OWNER}/smg:nightly-${SUFFIX}-ol9"
               echo "EOF"
             } >> "$GITHUB_OUTPUT"
           else
@@ -85,10 +93,19 @@ jobs:
               echo "ghcr.io/${OWNER}/smg:nightly-slurm"
               echo "ghcr.io/${OWNER}/smg:nightly-${SUFFIX}-slurm"
               echo "EOF"
+              echo "controller_list<<EOF"
+              echo "ghcr.io/${OWNER}/smg:nightly-policy-controller"
+              echo "ghcr.io/${OWNER}/smg:nightly-${SUFFIX}-policy-controller"
+              echo "EOF"
+              echo "ol9_list<<EOF"
+              echo "ghcr.io/${OWNER}/smg:nightly-ol9"
+              echo "ghcr.io/${OWNER}/smg:nightly-${SUFFIX}-ol9"
+              echo "EOF"
             } >> "$GITHUB_OUTPUT"
           fi
 
       - name: Build and push
+        id: build
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -112,3 +129,32 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           platforms: ${{ steps.tags.outputs.platforms }}
+
+      # The policy controller's image, from its own Dockerfile. It reads and saves no build
+      # cache: the steps above share one cache scope, which this build's export would replace.
+      # It runs when the router's build succeeded, whatever the variant's step did: the router's
+      # tags are pushed by then, and each wants its twin.
+      - name: Build and push the policy controller image
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/policy-controller.Dockerfile
+          target: policy-controller-image
+          push: true
+          tags: ${{ steps.tags.outputs.controller_list }}
+          platforms: ${{ steps.tags.outputs.platforms }}
+
+      # Publish the validated amd64 OL9 router beside the nightly Ubuntu image.
+      - name: Build and push the Oracle Linux 9 router
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/ol9.Dockerfile
+          target: router-image
+          push: true
+          tags: ${{ steps.tags.outputs.ol9_list }}
+          cache-from: type=gha,scope=smg-ol9-amd64
+          cache-to: type=gha,scope=smg-ol9-amd64,mode=max
+          platforms: linux/amd64

@@ -25,10 +25,10 @@ use prost_types::{
     DescriptorProto, FileDescriptorProto, FileDescriptorSet, ServiceDescriptorProto,
 };
 use smg_policy_controller::{
-    spec::DENIED_HEADERS, Candidate, Constraints, HashKind, Health, Lease, LeaseKind, LoadRow,
-    MediaCounts, Membership, Outcome, OverloadRegime, Pair, Phase, PoolFacts, Queue, ReleaseReason,
-    RequestFacts, Role, Shed, ShedReason, Side, Signal, SignalSource, Target, Trace,
-    TransportClass, ZoneCapacity,
+    fingerprint, spec::DENIED_HEADERS, AffinityFacts, Candidate, Constraints, HashKind, Health,
+    Identity, Lease, LeaseKind, Lifted, LoadRow, MediaCounts, Membership, Outcome, OverloadRegime,
+    Pair, Phase, PoolFacts, Queue, ReleaseReason, RequestFacts, Role, Shed, ShedReason, Side,
+    Signal, SignalSource, Target, Trace, TransportClass, ZoneCapacity,
 };
 use wit_parser::{InterfaceId, PackageId, Resolve, TypeDefKind, WorldId, WorldItem, WorldKey};
 
@@ -65,15 +65,19 @@ fn the_header_deny_list_holds_its_seven_names() {
 /// A record's field names in declaration order. The pattern names every
 /// field without `..`, so the crate's type cannot gain, lose or rename one
 /// without this file failing to compile: the wire tables below cannot drift
-/// from the record silently.
+/// from the record silently. A field written `name as "spelled"` is listed
+/// under the name the contracts spell, the pattern still naming the
+/// struct's own: a pair, both sides checked.
 macro_rules! record {
-    ($ty:ty, $name:ident { $($field:ident),+ $(,)? }) => {{
+    (@spelled $field:ident) => { stringify!($field) };
+    (@spelled $field:ident $spelled:literal) => { $spelled };
+    ($ty:ty, $name:ident { $($field:ident $(as $spelled:literal)?),+ $(,)? }) => {{
         // Never called: its pattern is the exhaustiveness proof.
         fn exhaustive(value: $ty) {
             let $name { $($field: _),+ } = value;
         }
         let _: fn($ty) = exhaustive;
-        &[$(stringify!($field)),+][..]
+        &[$(record!(@spelled $field $($spelled)?)),+][..]
     }};
 }
 
@@ -105,15 +109,11 @@ fn candidate_record() -> &'static [&'static str] {
             in_flight,
             load,
             load_sampled_at_micros,
-            overlap_blocks,
-            predicted_blocks,
             session_hit,
             session_in_flight,
             pair_class,
             has_capacity,
             has_room,
-            admitted_age_ms,
-            indexed_growth,
             zone,
             labels,
             ec_compatible,
@@ -121,6 +121,21 @@ fn candidate_record() -> &'static [&'static str] {
             host_local,
             active_sessions,
             key,
+        }
+    )
+}
+
+/// A candidate's affinity facts: a column beside the rows in the crate, five
+/// fields of the candidate's own record on both wires, at the numbers they
+/// were given as fields of the row.
+fn affinity_record() -> &'static [&'static str] {
+    record!(
+        AffinityFacts,
+        AffinityFacts {
+            overlap_blocks,
+            predicted_blocks,
+            admitted_age_ms,
+            indexed_growth,
             indexed_blocks,
         }
     )
@@ -149,6 +164,12 @@ fn request_record() -> &'static [&'static str] {
             seed,
             block_size,
             now_micros,
+            pinned_at,
+            lent_in_flight,
+            session_counted,
+            affinity,
+            named,
+            model_fingerprint,
         }
     )
 }
@@ -164,6 +185,7 @@ fn load_row_record() -> &'static [&'static str] {
             active_kv_permille,
             live_rate,
             resident_tokens,
+            resident_counted,
             report_age_ms,
             source,
             max_running,
@@ -178,7 +200,9 @@ fn constraints_record() -> &'static [&'static str] {
             excluded,
             wire_modes,
             overload_lifted,
-            subset_hint
+            subset_hint,
+            stalled,
+            pins
         }
     )
 }
@@ -193,6 +217,9 @@ fn pool_record() -> &'static [&'static str] {
             regime,
             generation,
             zones,
+            reach,
+            reported,
+            engines,
         }
     )
 }
@@ -289,11 +316,15 @@ fn trace_record() -> &'static [&'static str] {
             top,
             top_len,
             seed,
-            generation
+            generation,
+            lifted
         }
     )
 }
 
+/// The lease's session crosses under the name both contracts still spell,
+/// `session_key`: the change that first reads a lease from the wire renames
+/// the field in both and takes this pair out.
 fn lease_record() -> &'static [&'static str] {
     record!(
         Lease,
@@ -302,9 +333,10 @@ fn lease_record() -> &'static [&'static str] {
             kind,
             side,
             target_index,
+            booked,
             generation,
-            session_key,
-            session,
+            session as "session_key",
+            session_verdict,
             issued_micros,
             tokens,
         }
@@ -461,19 +493,28 @@ fn enum_mirrors() -> Vec<(
             "MembershipChange.Kind",
             "KIND",
             "membership",
-            cases!(
-                Membership<'_>,
-                Membership {
-                    Added,
-                    Removed,
-                    Replaced,
-                    Relabelled,
-                    Resized,
-                    Snapshot,
-                }
-            ),
+            membership_cases().0,
         ),
     ]
+}
+
+/// The membership words in declaration order: the kinds the two contracts
+/// spell out, then the words they do not carry. A plugin is told nothing of
+/// a word of the second part.
+fn membership_cases() -> (&'static [&'static str], &'static [&'static str]) {
+    cases!(
+        Membership<'_>,
+        Membership {
+            Added,
+            Removed,
+            Replaced,
+            Relabelled,
+            Resized,
+            Snapshot,
+            Left,
+        }
+    )
+    .split_at(6)
 }
 
 /// The shed reasons have a proto enum and no WIT counterpart (a guest never
@@ -511,11 +552,13 @@ struct ProtoMirror {
     record: &'static [&'static str],
     /// Record fields the wire does not carry: a host instant, a host-local
     /// position, the in-process length of a fixed array, the trace the wire
-    /// hoists into `Decision`.
+    /// hoists into `Decision`, whether a report counts resident tokens, a
+    /// fingerprint the host carries of a name the wire carries.
     host_only: &'static [&'static str],
-    /// Wire fields outside the record: an event's key before it, controller
-    /// facts, a wire-only input and the observability record's fields after
-    /// it.
+    /// Wire fields outside the record, in the wire's order: an event's key
+    /// before it, controller facts, a wire-only input, the observability
+    /// record's fields after it, and the fields of a record the crate keeps
+    /// beside this one (a candidate's affinity facts).
     wire_only: &'static [&'static str],
     /// Every wire field in number order with its scalar kind.
     wire: &'static [(&'static str, Type)],
@@ -531,7 +574,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "LoadRow",
             record: load_row_record(),
-            host_only: &[],
+            host_only: &["resident_counted"],
             wire_only: &[],
             wire: &[
                 ("running", Type::Uint32),
@@ -566,7 +609,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
             message: "Candidate",
             record: candidate_record(),
             host_only: &["position", "load_sampled_at_micros"],
-            wire_only: &[],
+            wire_only: affinity_record(),
             wire: &[
                 ("id", Type::Fixed64),
                 ("role", Type::Enum),
@@ -602,7 +645,17 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "RequestFacts",
             record: request_record(),
-            host_only: &["now_micros"],
+            // The affinity column rides the request in the crate; the wire
+            // carries each entry in its candidate.
+            host_only: &[
+                "now_micros",
+                "pinned_at",
+                "lent_in_flight",
+                "session_counted",
+                "affinity",
+                "named",
+                "model_fingerprint",
+            ],
             wire_only: &["prompt_text"],
             wire: &[
                 ("model", Type::String),
@@ -631,7 +684,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "Constraints",
             record: constraints_record(),
-            host_only: &[],
+            host_only: &["stalled", "pins"],
             wire_only: &[],
             wire: &[
                 ("excluded", Type::Fixed64),
@@ -645,7 +698,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "PoolFacts",
             record: pool_record(),
-            host_only: &[],
+            host_only: &["reach", "reported", "engines"],
             wire_only: &[],
             wire: &[
                 ("pool_size", Type::Uint32),
@@ -730,6 +783,8 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 "shadow_pick",
                 "fallback",
                 "affinity_source",
+                // The record reads it from its count ([`Trace::drew_first`]).
+                "drew_first",
             ],
             wire: &[
                 ("profile", Type::Uint32),
@@ -743,14 +798,16 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 ("shadow_pick", Type::Fixed64),
                 ("fallback", Type::Bool),
                 ("affinity_source", Type::Enum),
+                ("drew_first", Type::Bool),
+                ("lifted", Type::Enum),
             ],
             repeated: &["top", "drops"],
-            optional: &[],
+            optional: &["survivors"],
         },
         ProtoMirror {
             message: "Lease",
             record: lease_record(),
-            host_only: &["session", "issued_micros"],
+            host_only: &["booked", "session_verdict", "issued_micros"],
             wire_only: &["term", "dispatch_ttl_ms", "origin"],
             wire: &[
                 ("id", Type::Fixed64),
@@ -796,6 +853,10 @@ struct WitMirror {
     host_only: &'static [&'static str],
     /// Fields the WIT record carries before the crate's (an event's lease).
     before: &'static [&'static str],
+    /// The fields of a record the crate keeps beside this one and the WIT
+    /// record carries inside it, in that record's order (a candidate's
+    /// affinity facts).
+    beside: &'static [&'static str],
 }
 
 fn wit_mirrors() -> Vec<WitMirror> {
@@ -803,62 +864,80 @@ fn wit_mirrors() -> Vec<WitMirror> {
         WitMirror {
             record: "load",
             crate_record: load_row_record(),
-            host_only: &[],
+            host_only: &["resident_counted"],
             before: &[],
+            beside: &[],
         },
         WitMirror {
             record: "candidate",
             crate_record: candidate_record(),
             host_only: &["position", "load_sampled_at_micros"],
             before: &[],
+            beside: affinity_record(),
         },
         WitMirror {
             record: "media",
             crate_record: media_record(),
             host_only: &[],
             before: &[],
+            beside: &[],
         },
         WitMirror {
             record: "request",
             crate_record: request_record(),
-            host_only: &["now_micros"],
+            host_only: &[
+                "now_micros",
+                "pinned_at",
+                "lent_in_flight",
+                "session_counted",
+                "affinity",
+                "named",
+                "model_fingerprint",
+            ],
             before: &[],
+            beside: &[],
         },
         WitMirror {
             record: "zone-capacity",
             crate_record: zone_record(),
             host_only: &[],
             before: &[],
+            beside: &[],
         },
         WitMirror {
             record: "pool",
             crate_record: pool_record(),
-            host_only: &[],
+            host_only: &["reach", "reported", "engines"],
             before: &[],
+            beside: &[],
         },
         WitMirror {
             record: "lease",
             crate_record: lease_record(),
-            host_only: &["session", "issued_micros"],
+            host_only: &["booked", "session_verdict", "issued_micros"],
             before: &[],
+            beside: &[],
         },
         WitMirror {
             record: "pair",
             crate_record: pair_record(),
             host_only: &["decode_position"],
             before: &[],
+            beside: &[],
         },
         WitMirror {
             record: "target",
             crate_record: target_record(),
             host_only: &["position"],
             before: &[],
+            beside: &[],
         },
         WitMirror {
             record: "completed",
             crate_record: outcome_record(),
             host_only: &[],
             before: &["lease"],
+            beside: &[],
         },
     ]
 }
@@ -1043,6 +1122,7 @@ const ONEOFS: &[(&str, &str, &str, &[&str])] = &[
             "generation",
             "ids",
             "lease_end",
+            "term_start",
         ],
     ),
     (
@@ -1084,7 +1164,7 @@ fn contracts_dir() -> PathBuf {
 /// The engine wire's protos (`smg.grpc.common`): the controller protocol
 /// imports the load record and the event batch a relay forwards unchanged.
 fn engine_wire_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../grpc_client/proto")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../worker/proto")
 }
 
 fn compile_protocol() -> io::Result<FileDescriptorSet> {
@@ -1354,6 +1434,18 @@ fn the_protocol_compiles_and_mirrors_the_engine_record() {
             table, record,
             "{message_name}: the wire table is not the crate's record"
         );
+        // The wire's own fields are in the table, in the order listed: a
+        // record the wire carries inside this one keeps its field order.
+        let outside: Vec<&str> = mirror
+            .wire
+            .iter()
+            .map(|(name, _)| *name)
+            .filter(|name| mirror.wire_only.contains(name))
+            .collect();
+        assert_eq!(
+            outside, mirror.wire_only,
+            "{message_name}: the wire's own fields are not in the table in their order"
+        );
         // The compiled message is the wire table, numbered 1..=n in order.
         let compiled = message(plugin, message_name)
             .unwrap_or_else(|| panic!("{message_name} is missing from {PLUGIN_PROTO}"));
@@ -1384,8 +1476,26 @@ fn the_protocol_compiles_and_mirrors_the_engine_record() {
             .unwrap_or_else(|| panic!("enum {proto_name} is missing from {PLUGIN_PROTO}"));
         assert_eq!(found, proto_enum(prefix, cases), "enum {proto_name}");
     }
+    // The membership word no contract carries: a plugin is told nothing of
+    // it.
+    assert_eq!(membership_cases().1, ["Left"]);
     let found = enum_values(plugin, "ShedReason").expect("ShedReason is an enum");
     assert_eq!(found, proto_enum("SHED_REASON", shed_reasons()));
+    // The lifted veto: the mark's variants in order, numbered from zero.
+    // Its zero is none, a case, on purpose: the enum's comment says why.
+    let found = enum_values(plugin, "LiftedVeto").expect("LiftedVeto is an enum");
+    let expected: Vec<(String, i32)> = cases!(Lifted, Lifted { None, Overload })
+        .iter()
+        .enumerate()
+        .map(|(i, case)| {
+            let number = i32::try_from(i).unwrap_or(i32::MAX);
+            (format!("LIFTED_VETO_{}", screaming_case(case)), number)
+        })
+        .collect();
+    assert_eq!(
+        found, expected,
+        "the lifted vetoes are the mark's, from none"
+    );
     // The health bits: the record's flags in order, one bit each.
     let found = enum_values(plugin, "HealthFlag").expect("HealthFlag is an enum");
     let mut expected = vec![("HEALTH_FLAG_UNSPECIFIED".to_owned(), 0)];
@@ -1435,7 +1545,16 @@ fn the_wasm_world_resolves_and_mirrors_the_engine_record() {
         let found = world
             .record_fields(record_name)
             .unwrap_or_else(|| panic!("record {record_name} is missing from types"));
+        // The fields of a record the crate keeps beside this one are in the
+        // world's record in their own order; the rest is the crate's record.
+        let beside: Vec<String> = mirror.beside.iter().map(|name| kebab_field(name)).collect();
+        let (inside, found): (Vec<String>, Vec<String>) =
+            found.into_iter().partition(|name| beside.contains(name));
         assert_eq!(found, expected, "record {record_name} is not the crate's");
+        assert_eq!(
+            inside, beside,
+            "record {record_name}: the record beside it is not in the world's in its order"
+        );
     }
     assert_eq!(
         world
@@ -1650,6 +1769,91 @@ fn the_watch_workers_resume_fields_are_pinned() {
             .collect();
         assert_eq!(found, expected, "{message_name}: a resume field moved");
     }
+}
+
+/// What a registration states and its answer tells, by name and number: the
+/// prober's settings (one message for the registration and the row), the
+/// row's rank and engine, and the two thresholds a row is judged by.
+const MEMBERSHIP_FIELDS: &[(&str, &[ResumeField])] = &[
+    (
+        "HealthPolicy",
+        &[
+            ("failure_threshold", 1, Type::Uint32),
+            ("success_threshold", 2, Type::Uint32),
+            ("check_interval_ms", 3, Type::Uint32),
+            ("timeout_ms", 4, Type::Uint32),
+            ("disabled", 5, Type::Bool),
+        ],
+    ),
+    (
+        "OverloadThresholds",
+        &[
+            ("queue_limit", 1, Type::Uint32),
+            ("kv_usage_permille", 2, Type::Uint32),
+        ],
+    ),
+    (
+        "WorkerRow",
+        &[
+            ("dp_rank", 23, Type::Uint32),
+            ("engine", 24, Type::String),
+            ("health_policy", 25, Type::Message),
+        ],
+    ),
+    ("WorkerSpec", &[("health_policy", 14, Type::Message)]),
+];
+
+#[test]
+fn the_membership_fields_are_pinned() {
+    let set = compile_protocol().expect("protoc compiles the two protocol files");
+    let controller =
+        file(&set, CONTROLLER_PROTO).expect("the controller file is in the descriptor set");
+    for (message_name, expected) in MEMBERSHIP_FIELDS {
+        let compiled = message(controller, message_name)
+            .unwrap_or_else(|| panic!("{message_name} is missing from {CONTROLLER_PROTO}"));
+        // The two small messages are pinned whole, the two rows by the
+        // fields named here.
+        let whole = matches!(*message_name, "HealthPolicy" | "OverloadThresholds");
+        let found: Vec<(String, i32, Type)> = fields(compiled)
+            .into_iter()
+            .filter(|(name, _, _, _, _)| {
+                whole
+                    || expected
+                        .iter()
+                        .any(|(pinned, _, _)| *pinned == name.as_str())
+            })
+            .map(|(name, number, kind, _, _)| (name, number, kind))
+            .collect();
+        let expected: Vec<(String, i32, Type)> = expected
+            .iter()
+            .map(|(name, number, kind)| ((*name).to_owned(), *number, *kind))
+            .collect();
+        assert_eq!(found, expected, "{message_name}: a membership field moved");
+    }
+
+    // The two thresholds no judge read left the message: their numbers and
+    // names stay reserved, so a reader brings one back under a new number.
+    let overload = message(controller, "OverloadThresholds")
+        .expect("OverloadThresholds is in the controller file");
+    let reserved: Vec<i32> = overload
+        .reserved_range
+        .iter()
+        .flat_map(|range| range.start()..range.end())
+        .collect();
+    assert_eq!(reserved, [3, 4], "the reserved numbers");
+    assert_eq!(
+        overload.reserved_name,
+        strings(&["in_flight_limit", "waiting_tokens_limit"])
+    );
+
+    // A status keeps its number; the failed one is the last.
+    assert_eq!(
+        enum_values(controller, "WorkerStatus"),
+        Some(proto_enum(
+            "WORKER_STATUS",
+            &["Pending", "Ready", "NotReady", "Draining", "Failed"]
+        ))
+    );
 }
 
 /// The packed request block's layout as the world's comment states it: an
@@ -1932,5 +2136,47 @@ fn the_replica_rejoin_fields_are_pinned() {
             .map(|(name, number, kind)| ((*name).to_owned(), *number, *kind))
             .collect();
         assert_eq!(found, expected, "{message_name}: a rejoin field moved");
+    }
+}
+
+/// The session's value is stated once, beside `Identity` in the plugin
+/// protocol, with a worked example: its numbers are what this crate makes,
+/// so the published formula and the one function cannot part unseen.
+#[test]
+fn the_published_session_example_is_what_the_crate_makes() {
+    let text = std::fs::read_to_string(contracts_dir().join(PLUGIN_PROTO))
+        .expect("the plugin protocol is readable");
+    let mut stated = vec![("the key's fingerprint", fingerprint(b"conversation-7"))];
+    for (name, phase) in [
+        ("single", Phase::Single),
+        ("prefill", Phase::Prefill),
+        ("decode", Phase::Decode),
+        ("encode", Phase::Encode),
+    ] {
+        let session = RequestFacts {
+            model: "model-a",
+            session_key: Identity::plain("conversation-7"),
+            phase,
+            ..RequestFacts::default()
+        }
+        .session();
+        stated.push((name, session.get()));
+    }
+    for (what, value) in stated {
+        let literal = format!("{value:#018x}");
+        assert!(
+            text.contains(&literal),
+            "{PLUGIN_PROTO} does not state {literal} ({what})"
+        );
+    }
+    // The formula's own constants and the example's inputs are in the text.
+    for part in [
+        "0x9e3779b97f4a7c15",
+        "0xbf58476d1ce4e5b9",
+        "0x94d049bb133111eb",
+        "\"conversation-7\"",
+        "\"model-a\"",
+    ] {
+        assert!(text.contains(part), "{PLUGIN_PROTO} does not state {part}");
     }
 }

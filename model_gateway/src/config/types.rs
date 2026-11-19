@@ -9,14 +9,18 @@ use serde::{de, Deserialize, Deserializer, Serialize};
 pub use smg_data_connector::{
     HistoryBackend, MemoryConfig, OracleConfig, PostgresConfig, RedisConfig, SchemaConfig,
 };
+// The worker's settings vocabulary lives in the worker crate.
+pub use smg_worker::settings::{
+    PdPairingMode, RetryConfig, UnhealthyRemovalScope, DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS,
+};
 
 use super::{validation::ConfigValidator, ConfigResult};
 use crate::{
     routers::common::pd_admission::DEFAULT_PD_ADMISSION_WAIT_SECS,
     tenant::DEFAULT_TENANT_HEADER_NAME,
     worker::{
-        endpoint::Endpoint,
-        overload::{DEFAULT_TOKEN_USAGE_CEILING, DEFAULT_WAITING_REQUESTS},
+        health::overload::{DEFAULT_TOKEN_USAGE_CEILING, DEFAULT_WAITING_REQUESTS},
+        identity::endpoint::Endpoint,
         ConnectionMode, RuntimeType,
     },
 };
@@ -872,10 +876,6 @@ fn default_worker_stall_secs() -> u64 {
     2
 }
 
-/// The default per-stage silence bound of a ZMQ engine's startup handshake:
-/// an hour, since it alone covers the engine's init between HELLO and READY.
-pub const DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS: u64 = 3600;
-
 fn default_zmq_startup_timeout_secs() -> u64 {
     DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS
 }
@@ -1217,56 +1217,6 @@ pub enum ManualAssignmentMode {
     Delegate,
 }
 
-/// How strictly PD placement pairs a prefill with a decode on their KV
-/// transfer protocol (#2483). A descriptor component an engine does not report
-/// is "unknown".
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum PdPairingMode {
-    /// Pair on nothing: placement behaves as if no descriptor existed.
-    Off,
-    /// A known difference in runtime, transport or KV layout refuses the
-    /// pair; unknown components and engine versions pair with anything.
-    #[default]
-    Lenient,
-    /// Runtime, transport and KV layout must be known on both sides and
-    /// agree, and reported engine versions must match.
-    Strict,
-}
-
-impl PdPairingMode {
-    /// Number of modes, for per-mode caches.
-    pub const COUNT: usize = 3;
-
-    /// A dense index for per-mode caches.
-    pub const fn index(self) -> usize {
-        match self {
-            Self::Off => 0,
-            Self::Lenient => 1,
-            Self::Strict => 2,
-        }
-    }
-
-    /// Parse the CLI spelling (`off` / `lenient` / `strict`).
-    pub fn parse(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "off" => Some(Self::Off),
-            "lenient" => Some(Self::Lenient),
-            "strict" => Some(Self::Strict),
-            _ => None,
-        }
-    }
-
-    /// The CLI spelling.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Off => "off",
-            Self::Lenient => "lenient",
-            Self::Strict => "strict",
-        }
-    }
-}
-
 /// Per-request sticky-routing override: when a sticky key is present, any
 /// eligible policy routes via manual sticky-map semantics. Reuses the manual
 /// policy knobs for the sticky map; eviction defaults match the manual policy so
@@ -1341,8 +1291,10 @@ impl Default for RoutingKeyOverrideConfig {
 /// class of the key's rank, and the decode side takes the same room. A
 /// batched or EPD request, or one on another runtime, keeps its random room.
 ///
-/// The flag and the configuration file take one spelling: the flag's values
-/// are this enum's clap [`ValueEnum`] names, and serde writes the same ones.
+/// The flag and the configuration file take one spelling, and so does a
+/// caller that parses the setting from a string: the flag's values are this
+/// enum's clap [`ValueEnum`] names, serde writes the same ones, and
+/// [`FromStr`](std::str::FromStr) reads them as clap does.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum GroupedDpSticky {
@@ -1364,6 +1316,22 @@ impl GroupedDpSticky {
             Self::Off => "off",
             Self::Hash => "hash",
         }
+    }
+}
+
+impl std::str::FromStr for GroupedDpSticky {
+    type Err = String;
+
+    /// The flag's spelling, matched exactly as clap matches it, so a caller
+    /// outside clap refuses what the CLI refuses.
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        <Self as ValueEnum>::from_str(value, false).map_err(|_| {
+            let known: Vec<&str> = Self::value_variants()
+                .iter()
+                .map(|sticky| sticky.as_str())
+                .collect();
+            format!("expected one of {}", known.join(", "))
+        })
     }
 }
 
@@ -2043,8 +2011,6 @@ pub struct ConsulDiscoveryConfig {
     pub check_interval_secs: u64,
 }
 
-pub use smg_external_router::RetryConfig;
-
 /// Health check configuration for worker monitoring. The four counts and
 /// periods are at least 1 (checked at configuration validation): none of
 /// them has a meaning at 0, and a zero interval would make the checker a
@@ -2079,21 +2045,6 @@ pub struct HealthCheckConfig {
 
 fn default_drain_settle_secs() -> u64 {
     5
-}
-
-/// Which Failed workers the health checker removes. Mesh-imported workers
-/// are never removed under any scope: their owner manages them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UnhealthyRemovalScope {
-    /// None: a Failed worker stays registered and probed, and rejoins in
-    /// place when its engine answers again.
-    Disabled,
-    /// The workers a discovery provider registered, which it registers again
-    /// once their engine returns. Static and API-added workers stay.
-    DiscoveryOwned,
-    /// Every local worker, static and API-added ones included, though
-    /// nothing re-adds those.
-    AllLocal,
 }
 
 /// Resolve `--worker-auto-recovery` into the removal scope. An explicit
@@ -3081,7 +3032,8 @@ mod tests {
         let read: RouterConfig = serde_json::from_value(json).unwrap();
         assert_eq!(read.grouped_dp_sticky, GroupedDpSticky::Off);
 
-        // One spelling everywhere: the flag's values are the file's.
+        // One spelling everywhere: the flag's values are the file's, and a
+        // parse outside clap takes them as the flag does, exactly.
         let flag_values: Vec<String> = GroupedDpSticky::value_variants()
             .iter()
             .filter_map(GroupedDpSticky::to_possible_value)
@@ -3095,6 +3047,10 @@ mod tests {
                 serde_json::from_value::<GroupedDpSticky>(json).unwrap(),
                 sticky
             );
+            assert_eq!(sticky.as_str().parse::<GroupedDpSticky>(), Ok(sticky));
+        }
+        for refused in ["least_load", "HASH", " hash", ""] {
+            assert!(refused.parse::<GroupedDpSticky>().is_err(), "{refused:?}");
         }
         assert!(serde_json::from_value::<GroupedDpSticky>(serde_json::json!("sticky")).is_err());
     }

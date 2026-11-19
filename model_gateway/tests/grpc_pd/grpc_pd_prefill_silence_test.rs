@@ -83,7 +83,7 @@ use smg::{
     routers::RouterTrait,
     tenant::TenantKey,
     worker::{
-        circuit_breaker::{CircuitBreakerConfig, CircuitState},
+        health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
         RuntimeType, Worker, WorkerType,
     },
 };
@@ -556,12 +556,12 @@ async fn one_chat(
     }))
     .unwrap();
     let started = Instant::now();
-    let response =
-        tokio::time::timeout(CASE_CAP, router.route_chat(None, &tenant(), request, MODEL))
-            .await
-            .expect(
-                "the request must be answered within the case cap, not held to the request timeout",
-            );
+    let response = tokio::time::timeout(
+        CASE_CAP,
+        router.route_chat(None, &tenant(), Arc::new(request), MODEL),
+    )
+    .await
+    .expect("the request must be answered within the case cap, not held to the request timeout");
     let status = response.status();
     let bytes = tokio::time::timeout(
         CASE_CAP,
@@ -590,12 +590,12 @@ async fn one_long_streaming_chat(router: &dyn RouterTrait) -> (http::StatusCode,
     }))
     .unwrap();
     let started = Instant::now();
-    let response =
-        tokio::time::timeout(CASE_CAP, router.route_chat(None, &tenant(), request, MODEL))
-            .await
-            .expect(
-                "the request must be answered within the case cap, not held to the request timeout",
-            );
+    let response = tokio::time::timeout(
+        CASE_CAP,
+        router.route_chat(None, &tenant(), Arc::new(request), MODEL),
+    )
+    .await
+    .expect("the request must be answered within the case cap, not held to the request timeout");
     let status = response.status();
     let bytes = tokio::time::timeout(
         CASE_CAP,
@@ -1353,7 +1353,7 @@ fn a_sequential_prefill_whose_calls_queue_is_not_given_up_on() {
             async move {
                 let mut largest = Duration::ZERO;
                 while !done.load(Ordering::Acquire) {
-                    largest = largest.max(prefill.prefill_backlog());
+                    largest = largest.max(prefill.runtime_state().unwrap().prefill_backlog());
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
                 largest

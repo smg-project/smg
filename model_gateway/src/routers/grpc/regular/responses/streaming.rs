@@ -11,6 +11,8 @@ use std::{
     borrow::Cow,
     collections::HashMap,
     fmt,
+    marker::PhantomData,
+    ops::Deref,
     sync::{Arc, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -28,7 +30,12 @@ use openai_protocol::{
         ChatCompletionStreamResponse,
     },
     common::{FunctionCallResponse, ToolCall, ToolCallDelta, Usage},
+    event_types::McpEvent,
     responses::{ResponseStatus, ResponseUsage, ResponsesRequest, ResponsesUsage},
+};
+use serde::{
+    de::{Deserializer, IgnoredAny, SeqAccess, Visitor},
+    Deserialize,
 };
 use serde_json::{json, Value};
 use smg_data_connector::{
@@ -64,7 +71,8 @@ use crate::{
                     persist_response_if_needed, signal_stream_startup, stored_foreground,
                     stream_startup_channel,
                     streaming::{
-                        attach_mcp_server_label, ResponseStreamEventEmitter, StreamStartupSender,
+                        attach_mcp_server_label, ChatChunkParts, ResponseStreamEventEmitter,
+                        StreamStartupSender, ToolCallParts,
                     },
                     BackgroundStream, ResponsesContext,
                 },
@@ -239,12 +247,14 @@ fn sse_events(frame: &str) -> impl Iterator<Item = &str> {
 }
 
 /// One `data:` event of the chat stream's body, as the Responses conversions
-/// read it: the chat chunk it carries, the chat stream's error event as the
-/// error object a Responses terminal carries, the `[DONE]` terminator, or any
-/// other data event, left to the reader. Lines that are not data events (a
-/// comment, a keep-alive) are nobody's and are not yielded.
-enum ChatSseEvent<'a> {
-    Chunk(ChatCompletionStreamResponse),
+/// read it: the chat chunk it carries (read as `C`: the owned chunk where the
+/// reader keeps it, [`ChatChunkView`] where it only reads it), the chat
+/// stream's error event as the error object a Responses terminal carries, the
+/// `[DONE]` terminator, or any other data event, left to the reader. Lines
+/// that are not data events (a comment, a keep-alive) are nobody's and are
+/// not yielded.
+enum ChatSseEvent<'a, C> {
+    Chunk(C),
     UpstreamError(Value),
     Done,
     Other(&'a str),
@@ -252,13 +262,15 @@ enum ChatSseEvent<'a> {
 
 /// The data events of one frame of the chat stream's body, in order; the
 /// reader stops at [`ChatSseEvent::Done`].
-fn chat_sse_events(frame: &str) -> impl Iterator<Item = ChatSseEvent<'_>> {
+fn chat_sse_events<'a, C: Deserialize<'a>>(
+    frame: &'a str,
+) -> impl Iterator<Item = ChatSseEvent<'a, C>> {
     sse_events(frame).filter_map(|event| {
         if event == "data: [DONE]" {
             return Some(ChatSseEvent::Done);
         }
         let data = event.strip_prefix("data: ")?.trim();
-        if let Ok(chunk) = serde_json::from_str::<ChatCompletionStreamResponse>(data) {
+        if let Ok(chunk) = serde_json::from_str::<C>(data) {
             return Some(ChatSseEvent::Chunk(chunk));
         }
         let error = serde_json::from_str::<Value>(data)
@@ -269,6 +281,135 @@ fn chat_sse_events(frame: &str) -> impl Iterator<Item = ChatSseEvent<'_>> {
             None => ChatSseEvent::Other(event),
         })
     })
+}
+
+/// A JSON string of a [`ChatChunkView`]: borrowed from the event's text where
+/// it holds no escape, copied where it holds one.
+#[derive(Deserialize)]
+struct JsonText<'a>(#[serde(borrow)] Cow<'a, str>);
+
+impl Deref for JsonText<'_> {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The first element of a JSON array, the others read past: a chat chunk's
+/// choices, of which the Responses events read the first.
+struct FirstElement<T>(Option<T>);
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for FirstElement<T> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct FirstVisitor<T>(PhantomData<T>);
+
+        impl<'de, T: Deserialize<'de>> Visitor<'de> for FirstVisitor<T> {
+            type Value = FirstElement<T>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("an array")
+            }
+
+            fn visit_seq<S: SeqAccess<'de>>(self, mut seq: S) -> Result<FirstElement<T>, S::Error> {
+                let first = seq.next_element()?;
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(FirstElement(first))
+            }
+        }
+
+        deserializer.deserialize_seq(FirstVisitor(PhantomData))
+    }
+}
+
+/// One chat chunk as the stream transform reads it, borrowed from its data
+/// event: the first choice's delta texts, tool-call deltas and finish
+/// reason, and the usage. The keys the owned chunk requires are required
+/// here with their types, so the chat stream's error event, or any other
+/// data event, fails this read as it fails the owned one and takes its own
+/// branch; every other key is read past.
+#[derive(Deserialize)]
+struct ChatChunkView<'a> {
+    #[serde(borrow, rename = "id")]
+    _id: JsonText<'a>,
+    #[serde(borrow, rename = "object")]
+    _object: JsonText<'a>,
+    #[serde(rename = "created")]
+    _created: u64,
+    #[serde(borrow, rename = "model")]
+    _model: JsonText<'a>,
+    #[serde(borrow)]
+    choices: FirstElement<ChoiceView<'a>>,
+    usage: Option<Usage>,
+}
+
+#[derive(Deserialize)]
+struct ChoiceView<'a> {
+    #[serde(rename = "index")]
+    _index: u32,
+    #[serde(borrow)]
+    delta: DeltaView<'a>,
+    #[serde(borrow)]
+    finish_reason: Option<JsonText<'a>>,
+}
+
+#[derive(Deserialize)]
+struct DeltaView<'a> {
+    #[serde(borrow)]
+    content: Option<JsonText<'a>>,
+    #[serde(borrow)]
+    reasoning_content: Option<JsonText<'a>>,
+    #[serde(borrow)]
+    tool_calls: Option<Vec<ToolCallView<'a>>>,
+}
+
+#[derive(Deserialize)]
+struct ToolCallView<'a> {
+    index: u32,
+    #[serde(borrow)]
+    id: Option<JsonText<'a>>,
+    #[serde(borrow)]
+    function: Option<FunctionView<'a>>,
+}
+
+#[derive(Deserialize)]
+struct FunctionView<'a> {
+    #[serde(borrow)]
+    name: Option<JsonText<'a>>,
+    #[serde(borrow)]
+    arguments: Option<JsonText<'a>>,
+}
+
+impl ChatChunkParts for ChatChunkView<'_> {
+    fn reasoning(&self) -> Option<&str> {
+        self.choices.0.as_ref()?.delta.reasoning_content.as_deref()
+    }
+
+    fn content(&self) -> Option<&str> {
+        self.choices.0.as_ref()?.delta.content.as_deref()
+    }
+
+    fn tool_call(&self, at: usize) -> Option<ToolCallParts<'_>> {
+        let call = self
+            .choices
+            .0
+            .as_ref()?
+            .delta
+            .tool_calls
+            .as_ref()?
+            .get(at)?;
+        let function = call.function.as_ref();
+        Some(ToolCallParts {
+            index: call.index,
+            id: call.id.as_deref(),
+            name: function.and_then(|f| f.name.as_deref()),
+            arguments: function.and_then(|f| f.arguments.as_deref()),
+        })
+    }
+
+    fn finish_reason(&self) -> Option<&str> {
+        self.choices.0.as_ref()?.finish_reason.as_deref()
+    }
 }
 
 /// The error object of a Responses terminal for the chat stream's error
@@ -447,7 +588,7 @@ async fn process_and_transform_sse_stream(
         };
 
         let frame = frame_text(&chunk);
-        for event in chat_sse_events(&frame) {
+        for event in chat_sse_events::<ChatChunkView<'_>>(&frame) {
             match event {
                 ChatSseEvent::Done => break 'frames,
                 ChatSseEvent::Chunk(chat_chunk) => {
@@ -534,15 +675,13 @@ async fn process_and_transform_sse_stream(
         // can be neither retrieved nor continued.
         let not_stored = persist.await.err().map(|e| e.error_object());
         let error = terminal_error.as_ref().or(not_stored.as_ref());
-        event_emitter
-            .emit_terminal(usage_json.as_ref(), error, &tx)
-            .await?;
+        event_emitter.emit_terminal(usage_json, error, &tx).await?;
     } else {
         // A background response's terminal write is retried behind the event
         // (its client polls the record); an unstored response stores
         // nothing. Neither fails the stream.
         event_emitter
-            .emit_terminal(usage_json.as_ref(), terminal_error.as_ref(), &tx)
+            .emit_terminal(usage_json, terminal_error.as_ref(), &tx)
             .await?;
         if let Err(e) = persist.await {
             debug!(response_id = %final_response.id, error = %e.message, "Response not stored");
@@ -690,9 +829,15 @@ async fn stream_mcp_call(
     // Emit arguments events for mcp_call only (skip for builtin tools)
     if matches!(response_format, ResponseFormat::Passthrough) {
         // Emit mcp_call_arguments.delta (simulate streaming by sending full arguments)
-        let event =
-            emitter.emit_mcp_call_arguments_delta(output_index, &item_id, &tool_call.arguments);
-        emitter.send_event(&event, tx).await?;
+        emitter
+            .send_arguments_delta(
+                McpEvent::CALL_ARGUMENTS_DELTA,
+                &tool_call.arguments,
+                output_index,
+                &item_id,
+                tx,
+            )
+            .await?;
 
         // Emit mcp_call_arguments.done
         let event =
@@ -875,10 +1020,16 @@ async fn execute_tool_loop_streaming_internal(
         // Emit mcp_list_tools as first output item (only once, on first iteration)
         if !mcp_list_tools_emitted {
             for binding in session.mcp_servers() {
-                let tools_for_server = session.list_tools_for_server(&binding.server_key);
+                let tools_for_server = session.list_tools_for_binding(binding);
+                let list_error = binding.list_error.as_deref();
 
                 if let Err(message) = emitter
-                    .emit_mcp_list_tools_sequence(&binding.label, &tools_for_server, &tx)
+                    .emit_mcp_list_tools_sequence(
+                        &binding.label,
+                        &tools_for_server,
+                        list_error,
+                        &tx,
+                    )
                     .await
                 {
                     break 'turns Turns::left_or(&tx, message)?;
@@ -894,7 +1045,7 @@ async fn execute_tool_loop_streaming_internal(
         ) {
             Ok(request) => request,
             Err(e) => {
-                let message = format!("Failed to convert request: {e}");
+                let message = e.to_string();
                 if startup.is_some() {
                     let response = error::bad_request(e.code(), message.clone());
                     let _ = signal_stream_startup(&mut startup, Err(response));
@@ -905,7 +1056,9 @@ async fn execute_tool_loop_streaming_internal(
         };
 
         // Prepare tool_choice for this iteration (same logic as non-streaming)
-        prepare_tool_choice(&mut chat_request, state.iteration);
+        prepare_tool_choice(&mut chat_request, &state, |name| {
+            session.has_exposed_tool(name)
+        });
         state.iteration += 1;
         Metrics::record_mcp_tool_iteration(&current_request.model);
 
@@ -982,7 +1135,9 @@ async fn execute_tool_loop_streaming_internal(
             break Turns::Done;
         }
 
-        if !tool_calls.is_empty() {
+        // The final turn's answer ends the stream whatever it holds: a server
+        // call made anyway was hidden by the converter and does not run.
+        if !tool_calls.is_empty() && !state.final_turn {
             let (mcp_tool_calls, function_tool_calls, tool_call_limit) =
                 partition_tool_calls(tool_calls, &session, &state, max_tool_calls, true);
 
@@ -1001,14 +1156,11 @@ async fn execute_tool_loop_streaming_internal(
                 }
             }
 
-            if let Some(limit) = tool_call_limit {
-                break match limit {
-                    McpToolCallLimit::User => Turns::Done,
-                    McpToolCallLimit::Safety => Turns::Failed(json!({
-                        "code": "max_tool_calls_exceeded",
-                        "message": format!("Internal tool call safety limit ({DEFAULT_MAX_ITERATIONS}) reached"),
-                    })),
-                };
+            if tool_call_limit == Some(McpToolCallLimit::Safety) {
+                break Turns::Failed(json!({
+                    "code": "max_tool_calls_exceeded",
+                    "message": format!("Internal tool call safety limit ({DEFAULT_MAX_ITERATIONS}) reached"),
+                }));
             }
 
             // process_chunk already emitted these function-call items.
@@ -1016,6 +1168,8 @@ async fn execute_tool_loop_streaming_internal(
             if !function_tool_calls.is_empty() {
                 break Turns::Done;
             }
+
+            state.final_turn = tool_call_limit == Some(McpToolCallLimit::User);
 
             // Build next request with conversation history
             current_request = build_next_request(&mut state, current_request);
@@ -1103,12 +1257,10 @@ async fn execute_tool_loop_streaming_internal(
         // written ends the stream with response.failed.
         let not_stored = persist.await.err().map(|e| e.error_object());
         let error = terminal_error.as_ref().or(not_stored.as_ref());
-        emitter
-            .emit_terminal(terminal_usage.as_ref(), error, &tx)
-            .await?;
+        emitter.emit_terminal(terminal_usage, error, &tx).await?;
     } else {
         emitter
-            .emit_terminal(terminal_usage.as_ref(), terminal_error.as_ref(), &tx)
+            .emit_terminal(terminal_usage, terminal_error.as_ref(), &tx)
             .await?;
         if let Err(e) = persist.await {
             debug!(response_id = %final_response.id, error = %e.message, "Response not stored");
@@ -1144,7 +1296,7 @@ async fn convert_and_accumulate_stream(
             }
         };
         let frame = frame_text(&chunk);
-        for event in chat_sse_events(&frame) {
+        for event in chat_sse_events::<ChatCompletionStreamResponse>(&frame) {
             let mut chat_chunk = match event {
                 ChatSseEvent::Done => break 'frames,
                 ChatSseEvent::Chunk(chunk) => chunk,
@@ -1316,6 +1468,7 @@ impl ChatResponseAccumulator {
 
 #[cfg(test)]
 mod tests {
+    use smg_external_router::retry::REQUEST_TIMEOUT_CODE;
     use tokio::sync::mpsc;
     use tokio_stream::wrappers::ReceiverStream;
 
@@ -1428,6 +1581,31 @@ mod tests {
             "engine unavailable"
         );
         assert!(!events.iter().any(|e| e["type"] == "response.completed"));
+    }
+
+    /// The terminal of a Responses stream reports the code of the chat
+    /// stream's error event: the timeout's code for a stream the gateway's
+    /// request timeout cut, and the event's type for an event without a code.
+    #[tokio::test]
+    async fn a_stream_cut_by_the_request_timeout_fails_the_response_with_the_timeouts_code() {
+        for (error, code) in [
+            (
+                json!({"message": "the request timed out", "type": "stream_error", "code": REQUEST_TIMEOUT_CODE}),
+                REQUEST_TIMEOUT_CODE,
+            ),
+            (
+                json!({"message": "the worker went away", "type": "stream_error"}),
+                "stream_error",
+            ),
+        ] {
+            let cut = json!({"error": error});
+            let frames = vec![format!("data: {cut}\n\n"), "data: [DONE]\n\n".into()];
+            let mut rx = transformed_chat_stream(frames).await;
+            let events = drained_events(&mut rx).await;
+            let terminal = events.last().expect("a terminal event");
+            assert_eq!(terminal["type"], "response.failed", "{cut}");
+            assert_eq!(terminal["response"]["error"]["code"], code, "{cut}");
+        }
     }
 
     /// The `data:` payloads the client read, in order, once the transform has
@@ -2263,7 +2441,7 @@ mod tests {
             "data: [DONE]\n\n",
             "data: {\"after\":\"done\"}\n\n",
         );
-        let read: Vec<String> = chat_sse_events(frame)
+        let read: Vec<String> = chat_sse_events::<ChatCompletionStreamResponse>(frame)
             .map(|event| match event {
                 ChatSseEvent::Chunk(chunk) => format!(
                     "chunk:{}",
@@ -2285,6 +2463,106 @@ mod tests {
                 "other:data: {\"after\":\"done\"}",
             ]
         );
+    }
+
+    /// What the stream transform reads of each data event of `body` with the
+    /// chunks read as `C`: the parts `process_chunk` asks a chunk for and the
+    /// chunk's usage, or the event's kind.
+    fn chunk_reads<'a, C: Deserialize<'a> + ChatChunkParts>(
+        body: &'a str,
+        usage: impl Fn(&C) -> Option<&Usage>,
+    ) -> Vec<String> {
+        chat_sse_events::<C>(body)
+            .map(|event| match event {
+                ChatSseEvent::Chunk(chunk) => {
+                    let calls: Vec<_> = (0..)
+                        .map_while(|at| chunk.tool_call(at))
+                        .map(|call| (call.index, call.id, call.name, call.arguments))
+                        .collect();
+                    format!(
+                        "chunk: {:?} {:?} {calls:?} {:?} {:?}",
+                        chunk.reasoning(),
+                        chunk.content(),
+                        chunk.finish_reason(),
+                        usage(&chunk).map(|usage| json!(usage))
+                    )
+                }
+                ChatSseEvent::UpstreamError(error) => format!("error: {error}"),
+                ChatSseEvent::Done => "done".to_string(),
+                ChatSseEvent::Other(event) => format!("other: {event}"),
+            })
+            .collect()
+    }
+
+    /// The borrowed view reads every data event of a chat body as the owned
+    /// chunk reads it: the same events are chunks, each chunk hands
+    /// `process_chunk` the same parts and the loop the same usage, a chunk
+    /// with two choices the parts of its first; a text with no escape is
+    /// borrowed from the event, one with an escape copied.
+    #[test]
+    fn the_borrowed_chunk_view_reads_what_the_owned_chunk_reads() {
+        let body = [
+            ": keep-alive\n\n".to_string(),
+            chat_event(json!({"role": "assistant", "content": ""}), None),
+            chat_event(json!({"reasoning_content": "th\u{e9} \"why\"\n"}), None),
+            chat_event(json!({"content": "Hello"}), None),
+            chat_event(json!({"content": " \"quoted\"\n\ttab \u{1F600}"}), None),
+            "data: {\"id\":\"chat_test\",\"object\":\"chat.completion.chunk\",\"created\":0,\
+             \"model\":\"test-model\",\"choices\":[\
+             {\"index\":0,\"delta\":{\"content\":\"first\"},\"finish_reason\":null},\
+             {\"index\":1,\"delta\":{\"content\":\"second\"},\"logprobs\":null,\
+             \"finish_reason\":null}]}\n\n"
+                .to_string(),
+            chat_event(
+                json!({"tool_calls": [{"index": 0, "id": "call_1", "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{\"city\":"}}]}),
+                None,
+            ),
+            chat_event(
+                json!({"tool_calls": [{"index": 0, "function": {"arguments": "\"Paris\"}"}},
+                    {"index": 1, "id": "call_2", "function": {"name": "get_time"}}]}),
+                None,
+            ),
+            "data: {\"unexpected\":true}\n\n".to_string(),
+            chat_event(json!({}), Some("tool_calls")),
+            "data: {\"id\":\"chat_test\",\"object\":\"chat.completion.chunk\",\"created\":0,\
+             \"model\":\"test-model\",\"choices\":[],\
+             \"usage\":{\"prompt_tokens\":3,\"completion_tokens\":5,\"total_tokens\":8}}\n\n"
+                .to_string(),
+            "data: {\"error\":{\"type\":\"internal_error\",\"message\":\"engine unavailable\"}}\n\n"
+                .to_string(),
+            "data: [DONE]\n\n".to_string(),
+            "data: {\"after\":\"done\"}\n\n".to_string(),
+        ]
+        .concat();
+        let owned =
+            chunk_reads::<ChatCompletionStreamResponse>(&body, |chunk| chunk.usage.as_ref());
+        let view = chunk_reads::<ChatChunkView<'_>>(&body, |chunk| chunk.usage.as_ref());
+        assert_eq!(view, owned);
+        assert_eq!(owned.len(), 13);
+        let chunks = owned.iter().filter(|read| read.starts_with("chunk: "));
+        assert_eq!(chunks.count(), 9);
+        assert!(owned[4].contains("first") && !owned[4].contains("second"));
+        assert_eq!(owned[7], "other: data: {\"unexpected\":true}");
+        assert_eq!(
+            owned[10],
+            "error: {\"code\":\"internal_error\",\"message\":\"engine unavailable\"}"
+        );
+        assert_eq!(owned[11], "done");
+        assert_eq!(owned[12], "other: data: {\"after\":\"done\"}");
+
+        let read = |event: &str| -> bool {
+            let data = event.trim().strip_prefix("data: ").unwrap();
+            let view: ChatChunkView<'_> = serde_json::from_str(data).unwrap();
+            let content = view
+                .choices
+                .0
+                .as_ref()
+                .and_then(|choice| choice.delta.content.as_ref());
+            matches!(content, Some(JsonText(Cow::Borrowed(_))))
+        };
+        assert!(read(&chat_event(json!({"content": "Hello"}), None)));
+        assert!(!read(&chat_event(json!({"content": "a\"b"}), None)));
     }
 
     /// One chat chunk as the SSE event the chat stream writes for it.

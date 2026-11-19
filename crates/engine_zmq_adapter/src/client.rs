@@ -34,7 +34,7 @@ use smg_grpc_client::{sglang_proto, tokenspeed_proto, trtllm_proto, vllm_proto a
 use tokio::time::Instant;
 
 #[cfg(unix)]
-use crate::sockets::unlink_stale_socket;
+use crate::sockets::{is_leftover_handshake_socket, unlink_stale_socket};
 use crate::{
     abort_status::engine_abort_status,
     eos::EosTokenIds,
@@ -191,6 +191,8 @@ pub(crate) struct ZmqConnectionMeta {
     /// disagrees yielding to it
     /// (see [`ZmqEngineClient::note_engine_places_by_rendezvous_room`]).
     engine_places_by_rendezvous_room: OnceLock<()>,
+    /// See [`ZmqEngineClient::note_engine_ranks_are_replicas`].
+    engine_ranks_are_replicas: OnceLock<()>,
     /// A pin's yield to the room on this connection: the first is logged at
     /// WARN, the rest at DEBUG (`PinYieldNote`).
     pin_yield: PinYieldNote,
@@ -303,6 +305,13 @@ pub async fn connect_with_eos(
     {
         unlink_stale_socket(&input).await?;
         unlink_stale_socket(&output).await?;
+        // The handshake's directory is the caller's choice and is not
+        // verified above, and nothing keeps its address to one process: its
+        // leftover is swept only where the directory and the socket are this
+        // user's own and no listener answers.
+        if is_leftover_handshake_socket(&handshake).await {
+            unlink_stale_socket(&handshake).await?;
+        }
     }
     tracing::info!(
         "Binding ZMQ client for worker {base_url} (handshake={handshake}, engines={engine_count:?})"
@@ -428,6 +437,7 @@ impl ZmqEngineClient {
                 supported_tasks: tokio::sync::OnceCell::new(),
                 engine_truncates_long_prompts: OnceLock::new(),
                 engine_places_by_rendezvous_room: OnceLock::new(),
+                engine_ranks_are_replicas: OnceLock::new(),
                 pin_yield: PinYieldNote::default(),
                 request_timeout: OnceLock::new(),
             }),
@@ -531,6 +541,15 @@ impl ZmqEngineClient {
     /// nothing.
     pub fn note_engine_places_by_rendezvous_room(&self) {
         let _ = self.meta.engine_places_by_rendezvous_room.set(());
+    }
+
+    /// The ranks of an engine that places by the room
+    /// ([`Self::note_engine_places_by_rendezvous_room`]) are plain
+    /// data-parallel replicas, as the launcher that started it knows: from
+    /// now a room-placed request names its rank to the engine, whose KV
+    /// sender fails an unnamed one on every replica but the first.
+    pub fn note_engine_ranks_are_replicas(&self) {
+        let _ = self.meta.engine_ranks_are_replicas.set(());
     }
 
     /// The window the prompt admission applies on this connection: the
@@ -1187,10 +1206,12 @@ impl ZmqEngineClient {
         // pin, or on a prefill side that follows the room by its room's
         // residue ([`Self::note_engine_places_by_rendezvous_room`]).
         let ranks = client.engines().len();
-        let placement = if self.meta.engine_places_by_rendezvous_room.get().is_some() {
-            RankPlacement::RoomResidue
-        } else {
+        let placement = if self.meta.engine_places_by_rendezvous_room.get().is_none() {
             RankPlacement::Pin
+        } else if self.meta.engine_ranks_are_replicas.get().is_some() {
+            RankPlacement::ReplicaRoomResidue
+        } else {
+            RankPlacement::RoomResidue
         };
         let mut streams = Vec::new();
         // Fan-out clones share identical media; cache only within this request.
@@ -1721,6 +1742,12 @@ impl ZmqEngineClient {
                 num_running_reqs: i32::try_from(load.num_running).unwrap_or(i32::MAX),
                 num_waiting_reqs: i32::try_from(load.num_waiting).unwrap_or(i32::MAX),
                 token_usage: load.kv_cache_usage,
+                num_resident_tokens: load
+                    .num_resident_tokens
+                    .map(|tokens| i64::try_from(tokens).unwrap_or(i64::MAX)),
+                num_waiting_uncached_tokens: load
+                    .num_waiting_uncached_tokens
+                    .map_or(0, |tokens| i32::try_from(tokens).unwrap_or(i32::MAX)),
                 ..Default::default()
             })
     }
@@ -1870,8 +1897,10 @@ impl ZmqEngineClient {
                     world_size: ready
                         .map_or(1, |r| i32::try_from(r.world_size).unwrap_or(i32::MAX)),
                     // The handshake does not say which structural-tag
-                    // vocabulary the engine's grammar compiler takes.
+                    // vocabulary the engine's grammar compiler takes, nor
+                    // where the engine starts a grammar.
                     structural_tag_vocabulary: String::new(),
+                    constrained_decoding_start: String::new(),
                 }))
             }
         }
@@ -1996,7 +2025,7 @@ mod tests {
             connect_to_frontend, default_ready_response, hello, EngineInbound, MockEngine,
         },
         protocol::vllm::request::UtilityCall,
-        EngineId,
+        EngineId, EngineLiveness,
     };
     use llm_tokenizer::{mock::MockTokenizer, traits::Tokenizer};
     use openai_protocol::worker::RuntimeType;
@@ -2200,6 +2229,36 @@ mod tests {
         assert_eq!(client.effective_eos(), &resolved);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_live_handshake_listener_is_not_swept() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base_url = format!("ipc://{}", dir.path().join("w").display());
+        let path = dir.path().join("hs.sock");
+        let handshake = format!("ipc://{}", path.display());
+        let _listener = UnixListener::bind(&path).unwrap();
+
+        let Err(reason) = connect_with_eos(
+            &base_url,
+            "m".to_string(),
+            RuntimeType::Vllm,
+            Handshake::TcpOrIpc(&handshake),
+            1,
+            EosTokenIds::default(),
+            Duration::from_secs(1),
+        )
+        .await
+        else {
+            panic!("a bind over a live listener's socket must fail");
+        };
+        assert!(reason.contains("in use"), "{reason}");
+        crate::sockets::knock_ipc_socket(&path)
+            .await
+            .expect("the listener still answers at its path");
+    }
+
     /// The gateway's connect path across a retry: the first handshake greets
     /// the engine and gives up its READY wait while the engine is still
     /// loading (the startup bound is shorter than the engine's init); the
@@ -2212,7 +2271,24 @@ mod tests {
         let base_url = format!("ipc://{}", dir.path().join("w").display());
         let handshake = format!("ipc://{}", dir.path().join("hs.sock").display());
 
-        let (gave_up, engine) = tokio::join!(
+        // The first connect gives up after one second of silence. Until its
+        // HELLO is answered the engine counts as alive, with a sign of life on
+        // every poll and the engine polled first, so a starved host cannot
+        // spend that second on the greeting: it runs out in the READY wait.
+        let alive = EngineLiveness::new();
+        let first_startup = StartupBudget {
+            silence: Duration::from_secs(1),
+            ceiling: None,
+            liveness: Some(alive.clone()),
+        };
+        let greeted = hello(&handshake, EngineId::from_engine_index(0));
+        tokio::pin!(greeted);
+        let (engine, gave_up) = tokio::join!(
+            biased;
+            std::future::poll_fn(|cx| {
+                alive.touch();
+                std::future::Future::poll(greeted.as_mut(), cx)
+            }),
             connect_with_eos(
                 &base_url,
                 "m".to_string(),
@@ -2220,9 +2296,8 @@ mod tests {
                 Handshake::TcpOrIpc(&handshake),
                 1,
                 EosTokenIds::default(),
-                Duration::from_secs(1),
+                first_startup,
             ),
-            hello(&handshake, EngineId::from_engine_index(0)),
         );
         let Err(reason) = gave_up else {
             panic!("the first connect must give up its READY wait");
@@ -2230,8 +2305,20 @@ mod tests {
         assert!(reason.contains("waiting for READY"), "{reason}");
         let engine = engine.expect("HELLO/INIT with the first connect");
         // The dropped listeners' socket files go on their own tasks; the
-        // gateway retries a health probe later.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // gateway retries a health probe later, the test once they are gone.
+        let (greeting, input, output) =
+            zmq_socket_addresses(&base_url, Handshake::TcpOrIpc(&handshake)).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while [&greeting, &input, &output].into_iter().any(|endpoint| {
+                endpoint
+                    .strip_prefix("ipc://")
+                    .is_some_and(|path| Path::new(path).exists())
+            }) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the dropped listeners' socket files go");
 
         let (client, engine) = tokio::join!(
             connect_with_eos(

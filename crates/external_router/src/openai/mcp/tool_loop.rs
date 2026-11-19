@@ -614,10 +614,11 @@ pub(crate) fn resume_payload_in_place(
 }
 
 /// Send the `mcp_list_tools` events of one item to the client at the start of
-/// streaming: the item added empty, the listing in progress and completed,
-/// the item done with its tools. The item is written to the wire where it
-/// stands (the loop keeps it for the final response), not copied into the
-/// events. Returns false if the client disconnected.
+/// streaming: the item added empty, the listing in progress and completed
+/// (or failed, when the item carries the listing's `error`), the item done
+/// with its tools. The item is written to the wire where it stands (the loop
+/// keeps it for the final response), not copied into the events. Returns
+/// false if the client disconnected.
 pub(crate) async fn send_mcp_list_tools_events(
     tx: &SseSender,
     enc: &mut SseEncoder,
@@ -670,19 +671,22 @@ pub(crate) async fn send_mcp_list_tools_events(
         return false;
     }
 
-    // Event 3: response.mcp_list_tools.completed
+    // Event 3: response.mcp_list_tools.completed, or .failed when the item
+    // carries the listing's error (the done item below carries it to the
+    // client; the event itself names only the outcome)
+    let event3_type = if item.get("error").is_some_and(|error| !error.is_null()) {
+        McpEvent::LIST_TOOLS_FAILED
+    } else {
+        McpEvent::LIST_TOOLS_COMPLETED
+    };
     let event3_payload = json!({
-        "type": McpEvent::LIST_TOOLS_COMPLETED,
+        "type": event3_type,
         "sequence_number": *sequence_number,
         "output_index": output_index,
         "item_id": item_id
     });
     *sequence_number += 1;
-    let event3 = format!(
-        "event: {}\ndata: {}\n\n",
-        McpEvent::LIST_TOOLS_COMPLETED,
-        event3_payload
-    );
+    let event3 = format!("event: {event3_type}\ndata: {event3_payload}\n\n");
     if tx.send(Ok(Bytes::from(event3))).await.is_err() {
         return false;
     }
@@ -872,22 +876,10 @@ pub(crate) fn mcp_list_tools_bindings_to_emit(
         .collect()
 }
 
-/// Inject MCP metadata into a streaming response: the loop's output prefix
-/// in front of the response's output, the kept `mcp_list_tools` items copied
-/// (the `response.completed` event, which is not the last render; see
-/// [`inject_mcp_metadata_last`]).
-pub(crate) fn inject_mcp_metadata_streaming(
-    response: &mut Value,
-    state: &mut ToolLoopState,
-    session: &McpToolSession<'_>,
-) {
-    let prefix = mcp_output_prefix(state, session, 0);
-    inject_mcp_output_prefix(response, prefix);
-}
-
-/// Inject MCP metadata into a response's last render: the stored record on
-/// the streaming path, the answered response on the non-streaming path. The
-/// kept `mcp_list_tools` items move into it; nothing reads them afterwards.
+/// Inject MCP metadata into a response's last render: the streamed loop's
+/// final response (the wire and the record share it), the answered response
+/// on the non-streaming path. The kept `mcp_list_tools` items move into it;
+/// nothing reads them afterwards.
 pub(crate) fn inject_mcp_metadata_last(
     response: &mut Value,
     state: &mut ToolLoopState,
@@ -908,24 +900,13 @@ fn inject_mcp_output_prefix(response: &mut Value, prefix: Vec<Value>) {
     }
 }
 
-/// The items the loop renders in front of a response's output: its
-/// `mcp_list_tools` items (copied: the `response.completed` render, which is
-/// not the last reader; see [`mcp_output_prefix_last`]), then the calls it
-/// executed (the stored transformed items, no reconstruction), the internal
-/// servers' left out; with room for `extra` items the caller appends.
-fn mcp_output_prefix(
-    state: &mut ToolLoopState,
-    session: &McpToolSession<'_>,
-    extra: usize,
-) -> Vec<Value> {
-    let list_tools_items = state.mcp_list_tools_items(session).to_vec();
-    mcp_output_prefix_with(list_tools_items, state, session, extra)
-}
-
 /// The prefix of a response's last render: the kept `mcp_list_tools` items
 /// moved, not copied (the answered, the approval and the tool-call-limit
-/// responses of the non-streaming path, the stored record of the streaming
-/// one); nothing reads them afterwards.
+/// responses of the non-streaming path, the streamed loop's final response
+/// that the wire and the record share), then the calls the loop executed
+/// (the stored transformed items, no reconstruction), the internal servers'
+/// left out; with room for `extra` items the caller appends. Nothing reads
+/// the moved items afterwards.
 fn mcp_output_prefix_last(
     state: &mut ToolLoopState,
     session: &McpToolSession<'_>,
@@ -935,8 +916,8 @@ fn mcp_output_prefix_last(
     mcp_output_prefix_with(list_tools_items, state, session, extra)
 }
 
-/// The prefix around `mcp_list_tools` items the caller already owns (copied
-/// or taken), then the executed calls.
+/// The prefix around the `mcp_list_tools` items the caller took, then the
+/// executed calls.
 fn mcp_output_prefix_with(
     list_tools_items: Vec<Value>,
     state: &ToolLoopState,
@@ -1218,7 +1199,7 @@ async fn upstream_round(
     let response = request_builder
         .send()
         .await
-        .map_err(|e| format!("upstream request failed: {e}"))?;
+        .map_err(|e| format!("upstream request failed: {}", e.without_url()))?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -1230,7 +1211,7 @@ async fn upstream_round(
     let response_json = response
         .json::<Value>()
         .await
-        .map_err(|e| format!("parse response: {e}"))?;
+        .map_err(|e| format!("parse response: {}", e.without_url()))?;
 
     let function_calls = extract_function_calls(&response_json);
     if function_calls.is_empty() {
@@ -1663,12 +1644,14 @@ mod tests {
     use super::{
         build_transformed_mcp_call_item, extract_openai_response_output_items,
         is_internal_mcp_response_item, mcp_list_tools_bindings_to_emit,
-        not_executed_tool_call_item, ToolLoopState, NOT_EXECUTED_AT_TOOL_CALL_LIMIT,
+        not_executed_tool_call_item, upstream_round, ItemType, McpEvent, OutputItemEvent,
+        SseEncoder, ToolLoopState, NOT_EXECUTED_AT_TOOL_CALL_LIMIT,
     };
     use crate::{
+        header_utils::ApiProvider,
         openai::mcp::test_support,
         openai_bridge::{FormatRegistry, ResponseFormat},
-        test_support::counting_alloc,
+        test_support::{answering, counting_alloc, http_client, RefusedAddress},
     };
 
     fn test_tool(name: &str) -> Tool {
@@ -1795,11 +1778,13 @@ mod tests {
                 label: "deepwiki_ask".to_string(),
                 server_key: "server-ask".to_string(),
                 allowed_tools: Some(vec!["ask_question".to_string()]),
+                list_error: None,
             },
             McpServerBinding {
                 label: "deepwiki_read".to_string(),
                 server_key: "server-read".to_string(),
                 allowed_tools: Some(vec!["read_wiki_structure".to_string()]),
+                list_error: None,
             },
         ];
 
@@ -1818,6 +1803,7 @@ mod tests {
             label: "deepwiki_ask".to_string(),
             server_key: "server-ask".to_string(),
             allowed_tools: Some(vec!["ask_question".to_string()]),
+            list_error: None,
         }];
 
         let bindings_to_emit = mcp_list_tools_bindings_to_emit(&existing_labels, &bindings);
@@ -2276,6 +2262,7 @@ mod tests {
             label: "wiki".to_string(),
             server_key: "wiki-server".to_string(),
             allowed_tools: None,
+            list_error: None,
         }];
         (orchestrator, bindings)
     }
@@ -2652,6 +2639,67 @@ mod tests {
         );
     }
 
+    /// The list item's third event names the listing's outcome as the gRPC
+    /// stream does: `response.mcp_list_tools.failed` for an item carrying
+    /// the listing's `error`, `completed` for one without; the event's `type`
+    /// and its SSE `event:` line are one kind, the payload carries the
+    /// item's id and no error (the done item does).
+    #[tokio::test]
+    async fn a_failed_listings_item_is_announced_as_failed() {
+        for (error, kind) in [
+            (None, McpEvent::LIST_TOOLS_COMPLETED),
+            (
+                Some("tools/list refused by the server"),
+                McpEvent::LIST_TOOLS_FAILED,
+            ),
+        ] {
+            let mut item = json!({
+                "type": ItemType::MCP_LIST_TOOLS,
+                "id": "mcpl_test",
+                "server_label": "conf",
+                "tools": []
+            });
+            if let Some(error) = error {
+                item["error"] = json!(error);
+            }
+            let (tx, mut rx) = mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(8);
+            let mut enc = SseEncoder::new();
+            let mut sequence_number: u64 = 0;
+
+            let ok =
+                super::send_mcp_list_tools_events(&tx, &mut enc, &item, 0, &mut sequence_number)
+                    .await;
+            assert!(ok, "the client is connected");
+            drop(tx);
+
+            let events = drain_channel(&mut rx);
+            let types: Vec<String> = events
+                .iter()
+                .map(|block| event_type_from_sse_block(block))
+                .collect();
+            assert_eq!(
+                types,
+                [
+                    OutputItemEvent::ADDED,
+                    McpEvent::LIST_TOOLS_IN_PROGRESS,
+                    kind,
+                    OutputItemEvent::DONE,
+                ],
+                "the event lines for error {error:?}"
+            );
+            let data = events[2]
+                .split("data: ")
+                .nth(1)
+                .expect("the third event's data line")
+                .trim();
+            let payload: serde_json::Value = serde_json::from_str(data).expect("json");
+            assert_eq!(payload["type"], kind);
+            assert_eq!(payload["item_id"], "mcpl_test");
+            assert_eq!(payload["output_index"], 0);
+            assert_eq!(payload.get("error"), None, "the failure is on the item");
+        }
+    }
+
     /// The loop announces only what a client may see: an internal server's
     /// `mcp_list_tools` item is left out of the kept items, so the stream's
     /// start, the completed event and the stored record agree; a visible
@@ -2703,6 +2751,7 @@ mod tests {
             label: label.to_string(),
             server_key: server_key.to_string(),
             allowed_tools: None,
+            list_error: None,
         };
         let session = McpToolSession::new(
             &orchestrator,
@@ -2898,6 +2947,9 @@ mod tests {
             "tools": [{"type": "mcp", "server_label": "wiki"}]
         });
 
+        // UUID's fast-rng feature can warm rand's thread-local generator during
+        // session setup. Exclude that one-time setup under either feature set.
+        let _ = rand::rng();
         let before = counting_alloc::calls();
         super::prepare_mcp_tools_as_functions(&mut payload, &session);
         let item = crate::openai_bridge::mcp_list_tools_json(&session, "wiki", "wiki-server");
@@ -2914,8 +2966,105 @@ mod tests {
         );
     }
 
-    /// Allocation calls of the tool descriptors above, today.
-    const PINNED_DESCRIPTOR_CALLS: usize = 4643;
+    /// A session reads the orchestrator's maps by key. A walk of one of them
+    /// allocates once per shard, four times at the least and more with every
+    /// core of the host. No read here has room for one: the tool listing of a
+    /// server without tools allocates nothing, and a session makes only its
+    /// own calls, 4 when the request binds no server and 12 when it binds
+    /// one.
+    #[tokio::test]
+    async fn a_session_walks_no_sharded_map() {
+        let orchestrator = McpOrchestrator::new(McpConfig::default())
+            .await
+            .expect("an orchestrator with no servers");
+
+        let before = counting_alloc::calls();
+        let session = McpToolSession::new(&orchestrator, Vec::new(), "test-request");
+        let unbound = counting_alloc::calls() - before;
+
+        let bindings = vec![McpServerBinding {
+            label: "a-label".to_string(),
+            server_key: "a-server".to_string(),
+            allowed_tools: None,
+            list_error: None,
+        }];
+        let before = counting_alloc::calls();
+        let bound_session = McpToolSession::new(&orchestrator, bindings, "test-request");
+        let bound = counting_alloc::calls() - before;
+
+        let keys = ["a-server".to_string()];
+        let before = counting_alloc::calls();
+        let listed = orchestrator.list_tools_for_servers(&keys);
+        let listing = counting_alloc::calls() - before;
+
+        assert!(session.mcp_tools().is_empty() && listed.is_empty());
+        assert!(bound_session.mcp_tools().is_empty() && bound_session.mcp_servers().len() == 1);
+        assert!(
+            unbound < 8 && bound < 16 && listing < 4,
+            "allocation calls: {unbound} for a session without a server, {bound} for a session that binds one, {listing} for a server's tool listing"
+        );
+    }
+
+    /// A session that may route a builtin tool asks for the server of each builtin type, four
+    /// lookups. The servers here are configured and not connected (the SSE transport is refused
+    /// at connect), so each lookup reads the index, finds nothing and answers from the
+    /// configured list. None walks the server map, where even an empty walk allocates once per
+    /// shard, so the session's allocation calls are the same on a host of any width.
+    #[tokio::test]
+    async fn a_session_that_routes_a_builtin_tool_walks_no_sharded_map() {
+        let server = |name: &str, port: u16| McpServerConfig {
+            name: name.to_string(),
+            transport: McpTransport::Sse {
+                url: format!("http://localhost:{port}/sse"),
+                token: None,
+                headers: Default::default(),
+            },
+            proxy: None,
+            required: false,
+            tools: None,
+            builtin_type: None,
+            builtin_tool_name: None,
+            internal: false,
+        };
+        let orchestrator = McpOrchestrator::new(McpConfig {
+            servers: vec![
+                server("wiki-server", 3000),
+                McpServerConfig {
+                    builtin_type: Some(BuiltinToolType::WebSearchPreview),
+                    builtin_tool_name: Some("brave_web_search".to_string()),
+                    ..server("search-server", 3002)
+                },
+            ],
+            ..Default::default()
+        })
+        .await
+        .expect("orchestrator");
+        orchestrator
+            .tool_inventory()
+            .insert_entry(ToolEntry::from_server_tool(
+                "search-server",
+                test_tool("brave_web_search"),
+            ));
+        let bindings = vec![McpServerBinding {
+            label: "search".to_string(),
+            server_key: "search-server".to_string(),
+            allowed_tools: None,
+            list_error: None,
+        }];
+
+        let before = counting_alloc::calls();
+        let session = McpToolSession::new(&orchestrator, bindings, "test-request");
+        let calls = counting_alloc::calls() - before;
+
+        assert_eq!(session.mcp_tools().len(), 1);
+        assert!(
+            calls < 40,
+            "allocation calls: {calls} for a session that binds a builtin server"
+        );
+    }
+
+    /// Steady-state allocation calls of the tool descriptors, excluding RNG setup.
+    const PINNED_DESCRIPTOR_CALLS: usize = 4642;
 
     /// The JSON list-tools item is the typed item serialised, byte for byte
     /// (its id aside: each build draws one).
@@ -2937,5 +3086,52 @@ mod tests {
             serde_json::to_string(&built).expect("JSON"),
             serde_json::to_string(&typed).expect("JSON")
         );
+    }
+
+    /// A round nothing answers fails without the request URL in its text. The
+    /// HTTP client's own error text ends with it, its query kept.
+    #[tokio::test]
+    async fn a_round_nothing_answers_goes_without_the_clients_url() {
+        let refused = RefusedAddress::reserve();
+        let url = format!("http://{}/v1/responses?key=s3cret", refused.addr());
+
+        let Err(text) = upstream_round(
+            &http_client(),
+            &url,
+            &ApiProvider::Generic,
+            None,
+            &json!({}),
+        )
+        .await
+        else {
+            panic!("a failed send");
+        };
+
+        assert!(!text.contains("s3cret"), "{text}");
+        assert!(!text.contains(&refused.addr().to_string()), "{text}");
+    }
+
+    /// A round answered with no JSON fails without the request URL in its
+    /// text. The HTTP client's text of a failed body read ends with it, its
+    /// query kept.
+    #[tokio::test]
+    async fn a_round_answered_with_no_json_goes_without_the_clients_url() {
+        let addr = answering(200, "not json", false).await;
+        let url = format!("http://{addr}/v1/responses?key=s3cret");
+
+        let Err(text) = upstream_round(
+            &http_client(),
+            &url,
+            &ApiProvider::Generic,
+            None,
+            &json!({}),
+        )
+        .await
+        else {
+            panic!("an answer that is no JSON");
+        };
+
+        assert!(text.starts_with("parse response"), "{text}");
+        assert!(!text.contains("s3cret"), "{text}");
     }
 }

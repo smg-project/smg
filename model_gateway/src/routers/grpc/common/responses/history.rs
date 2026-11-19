@@ -204,15 +204,16 @@ fn replays(item: &ResponseInputOutputItem) -> bool {
 
 /// The pipeline a loaded history is replayed into. A stored message replays
 /// the content parts that pipeline carried when the turn was answered: the
-/// chat conversion never carried an `input_file` or an `input_image` without
-/// an `image_url` (a `file_id` is not resolvable here), the Harmony builder
-/// no `input_image` at all. Such parts are left out when the history loads,
-/// as an unreplayed item is ([`unreplayed_kind`]): the turn was answered
-/// without them, and a continuation refused on them until the client edits a
-/// chain it cannot edit is a conversation the client cannot carry on. A
-/// request's own input is not filtered and keeps its refusal, and so does a
-/// conversation item the client added itself (no response wrote it, so no
-/// pipeline ever answered without its parts).
+/// chat conversion never carried an `input_file`, an `input_image` without
+/// an `image_url` (a `file_id` is not resolvable here) or a media part of a
+/// `developer` message (the developer turn folds into the system text), the
+/// Harmony builder no `input_image` at all. Such parts are left out when the
+/// history loads, as an unreplayed item is ([`unreplayed_kind`]): the turn
+/// was answered without them, and a continuation refused on them until the
+/// client edits a chain it cannot edit is a conversation the client cannot
+/// carry on. A request's own input is not filtered and keeps its refusal, and
+/// so does a conversation item the client added itself (no response wrote
+/// it, so no pipeline ever answered without its parts).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReplayInto {
     /// The chat conversion (`responses_to_chat`).
@@ -222,12 +223,13 @@ pub(crate) enum ReplayInto {
 }
 
 impl ReplayInto {
-    /// Whether the pipeline carried `part` when a stored turn was answered.
-    fn carried(self, part: &ResponseContentPart) -> bool {
+    /// Whether the pipeline carried `part` of a message with `role` when a
+    /// stored turn was answered.
+    fn carried(self, role: &str, part: &ResponseContentPart) -> bool {
         match part {
             ResponseContentPart::InputFile { .. } => false,
             ResponseContentPart::InputImage { image_url, .. } => match self {
-                Self::Chat => image_url.is_some(),
+                Self::Chat => image_url.is_some() && role != "developer",
                 Self::Harmony => false,
             },
             ResponseContentPart::OutputText { .. }
@@ -240,9 +242,9 @@ impl ReplayInto {
 /// `item` with the content parts `into` never carried left out (see
 /// [`ReplayInto`]); an item that is not a message is returned as it is.
 fn replayed_parts(mut item: ResponseInputOutputItem, into: ReplayInto) -> ResponseInputOutputItem {
-    fn keep_carried(parts: &mut Vec<ResponseContentPart>, into: ReplayInto) {
+    fn keep_carried(role: &str, parts: &mut Vec<ResponseContentPart>, into: ReplayInto) {
         parts.retain(|part| {
-            let carried = into.carried(part);
+            let carried = into.carried(role, part);
             if !carried {
                 let part_type = match part {
                     ResponseContentPart::InputFile { .. } => "input_file",
@@ -257,11 +259,12 @@ fn replayed_parts(mut item: ResponseInputOutputItem, into: ReplayInto) -> Respon
         });
     }
     match &mut item {
-        ResponseInputOutputItem::Message { content, .. } => keep_carried(content, into),
+        ResponseInputOutputItem::Message { role, content, .. } => keep_carried(role, content, into),
         ResponseInputOutputItem::SimpleInputMessage {
+            role,
             content: StringOrContentParts::Array(parts),
             ..
-        } => keep_carried(parts, into),
+        } => keep_carried(role, parts, into),
         _ => {}
     }
     item
@@ -549,7 +552,7 @@ async fn resolve_item_references(
         };
         // a stored item that has no input form (a built-in tool call, an older
         // schema) exists but cannot be re-injected: say so, not "not found"
-        match serde_json::from_value::<ResponseInputOutputItem>(candidate.clone()) {
+        match ResponseInputOutputItem::deserialize(candidate) {
             Ok(found) => resolved.push(found),
             Err(e) => {
                 let item_type = candidate
@@ -734,6 +737,77 @@ pub(crate) mod tests {
                     .to_string()
             })
             .collect()
+    }
+
+    /// A stored `developer` turn whose message carried an `input_image` with
+    /// a URL replays without it on the chat path too: the developer turn
+    /// folded into the system text when it was answered, and the fold refuses
+    /// such a part now, so a continuation refused on a turn the client cannot
+    /// edit would end the conversation. The request's own developer item keeps
+    /// its parts and meets the refusal itself.
+    #[tokio::test]
+    async fn a_stored_developer_image_is_left_out_of_the_replay() {
+        let stores = Stores::with_conversation().await;
+        let developer_turn: ResponseInputOutputItem = serde_json::from_value(json!({
+            "type": "message", "id": "msg_d1", "role": "developer", "content": [
+                {"type": "input_text", "text": "Describe what you see."},
+                {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="}
+            ]
+        }))
+        .expect("a developer message item");
+        let turn_1 = ResponsesRequest {
+            input: ResponseInput::Items(vec![developer_turn.clone()]),
+            conversation: Some(ConversationRef::Id("conv_1".to_string())),
+            ..Default::default()
+        };
+        stores
+            .store_turn(
+                "resp_1",
+                &turn_1,
+                json!([{"type": "message", "id": "msg_1", "role": "assistant",
+                        "content": [{"type": "output_text", "text": "Nothing to see.", "annotations": []}]}]),
+            )
+            .await;
+
+        for into in [ReplayInto::Chat, ReplayInto::Harmony] {
+            for continuation in [
+                ResponsesRequest {
+                    input: ResponseInput::Items(vec![developer_turn.clone()]),
+                    previous_response_id: Some("resp_1".to_string()),
+                    ..Default::default()
+                },
+                ResponsesRequest {
+                    input: ResponseInput::Items(vec![developer_turn.clone()]),
+                    conversation: Some(ConversationRef::Id("conv_1".to_string())),
+                    ..Default::default()
+                },
+            ] {
+                let loaded = load_history(stores.history(), &continuation, None, into)
+                    .await
+                    .expect("the history loads");
+                let ResponseInput::Items(items) = &loaded.input else {
+                    panic!("the loaded input is an item list");
+                };
+                assert_eq!(
+                    shape(items),
+                    [
+                        "message:developer",
+                        "message:assistant",
+                        "message:developer"
+                    ]
+                );
+                assert_eq!(
+                    part_types(&items[0]),
+                    ["input_text"],
+                    "{into:?}: the stored developer turn replays its text alone"
+                );
+                assert_eq!(
+                    part_types(&items[2]),
+                    ["input_text", "input_image"],
+                    "{into:?}: the request's own input keeps every part"
+                );
+            }
+        }
     }
 
     /// A stored turn whose message carried a part the pipeline never took

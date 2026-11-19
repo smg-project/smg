@@ -34,7 +34,6 @@ def cli_source() -> str:
 # Flags of the Rust CLI the launcher does not take, with the reason.
 CLI_ONLY = {
     "--disable-audit-logging": "the launcher's switch is --control-plane-audit-enabled",
-    "--grouped-dp-sticky": "the launcher and the binding's Router take it in a follow-up change",
 }
 
 # Options of the launcher with no Rust CLI flag of that spelling, with the reason.
@@ -67,9 +66,14 @@ class RustCli:
 
 # Where a named CLI default is declared when the CLI sources do not declare it
 # themselves: the config types and server modules main.rs imports its constants
-# from. The ``rust`` fixture hands their texts to the reader; a synthetic source
-# hands its own.
-CONST_SOURCES = (MAIN_RS.parent / "config" / "types.rs", MAIN_RS.parent / "server.rs")
+# from, and the worker crate's settings, whose constants the config types
+# re-export. The ``rust`` fixture hands their texts to the reader; a synthetic
+# source hands its own.
+CONST_SOURCES = (
+    MAIN_RS.parent / "config" / "types.rs",
+    MAIN_RS.parent / "server.rs",
+    MAIN_RS.parents[2] / "crates" / "worker" / "src" / "settings.rs",
+)
 
 
 @dataclass(frozen=True)

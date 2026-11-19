@@ -45,9 +45,9 @@ use crate::vision::{
     preprocessor_config::PreProcessorConfig,
     processor::{ModelSpecificValue, PreprocessedEncoderInputs, VisionPreProcessor},
     transforms::{
-        center_crop, crop_rgb, expand_to_square, mean_to_rgb, paste_rgb, pil_to_filter, resize,
-        resize_bicubic_torch_aa, resize_bicubic_torch_aa_cropped, stack_batch, to_tensor_by_table,
-        TransformError,
+        center_crop, crop_rgb, expand_to_square, extend_planes_by_table, mean_to_rgb, paste_rgb,
+        pil_to_filter, resize, resize_bicubic_torch_aa, resize_bicubic_torch_aa_cropped, rgb_bytes,
+        stack_batch, to_tensor_by_table, TransformError,
     },
 };
 
@@ -338,9 +338,7 @@ impl VisionPreProcessor for LlavaProcessor {
         &self,
         images: &[&DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        if images.is_empty() {
-            return Err(TransformError::EmptyBatch);
-        }
+        TransformError::if_empty(images)?;
 
         // Store original sizes
         let item_sizes: Vec<(u32, u32)> = images.iter().map(|img| img.dimensions()).collect();
@@ -525,8 +523,9 @@ impl LlavaNextProcessor {
         divide_to_samples(image, crop_size)
     }
 
-    /// Process a single patch/crop.
-    fn process_patch(&self, image: &DynamicImage) -> Array3<f32> {
+    /// A patch's pixels as the model takes them: resized to the target size
+    /// and center-cropped as configured (a crop of that size stays as it is).
+    fn patch_pixels<'a>(&self, image: &'a DynamicImage) -> Cow<'a, DynamicImage> {
         let transforms = &self.base.transforms;
         let filter = transforms.filter;
 
@@ -544,7 +543,7 @@ impl LlavaNextProcessor {
         };
 
         // Center crop if configured (skip if image already fits)
-        let cropped = if transforms.do_center_crop {
+        if transforms.do_center_crop {
             if let Some((crop_h, crop_w)) = transforms.crop_size {
                 let (rw, rh) = resized.dimensions();
                 if crop_w >= rw && crop_h >= rh {
@@ -557,9 +556,7 @@ impl LlavaNextProcessor {
             }
         } else {
             resized
-        };
-
-        to_tensor_by_table(&cropped, &transforms.table)
+        }
     }
 }
 
@@ -576,11 +573,9 @@ impl VisionPreProcessor for LlavaNextProcessor {
         &self,
         images: &[&DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        if images.is_empty() {
-            return Err(TransformError::EmptyBatch);
-        }
+        TransformError::if_empty(images)?;
 
-        let mut patches_per_image: Vec<Vec<Array3<f32>>> = Vec::with_capacity(images.len());
+        let mut samples_per_image: Vec<Vec<DynamicImage>> = Vec::with_capacity(images.len());
         let mut feature_token_counts = Vec::with_capacity(images.len());
         let mut item_sizes = Vec::with_capacity(images.len());
 
@@ -609,23 +604,18 @@ impl VisionPreProcessor for LlavaNextProcessor {
             let mut samples = vec![image_original_resize];
             samples.extend(self.divide_to_samples(&image_padded, crop_size));
 
-            let patches: Vec<Array3<f32>> = samples.iter().map(|s| self.process_patch(s)).collect();
-            patches_per_image.push(patches);
+            samples_per_image.push(samples);
 
             feature_token_counts.push(self.calculate_num_tokens(original_size.0, original_size.1)?);
         }
 
         // Build 5D encoder_input [num_images, max_patches, C, H, W] matching the
         // HF LlavaNextImageProcessor output the engine expects with Batched layout.
-        let (c, h, w) = if let Some(first) = patches_per_image.iter().find_map(|p| p.first()) {
-            let s = first.shape();
-            (s[0], s[1], s[2])
-        } else {
-            return Err(TransformError::EmptyBatch);
-        };
-
         let num_images = images.len();
-        let encoder_input = stack_patches(&patches_per_image, (c, h, w))?;
+        let table = &self.base.transforms.table;
+        let encoder_input = batch_patches(&samples_per_image, table, |sample| {
+            self.patch_pixels(sample)
+        })?;
 
         // Build model-specific image_sizes tensor as [num_images, 2] in (height, width) order
         // to match the HF LlavaNextImageProcessor output format the engine expects.
@@ -897,41 +887,52 @@ fn divide_to_samples(image: &DynamicImage, crop_size: (u32, u32)) -> Vec<Dynamic
     samples
 }
 
-/// The batch tensor `[num_images, max_patches, c, h, w]`, `max_patches` the
+/// The batch tensor `[num_images, max_patches, 3, h, w]`, `max_patches` the
 /// widest image's patch count: every image's patches in order, then zero
-/// patches up to that width, every element written once (a zeroed tensor
-/// assigned patch by patch paid the allocator's page faults for a zero fill
-/// the copies then overwrote). A patch of another shape is refused rather
-/// than broadcast into its slot.
-fn stack_patches(
-    patches_per_image: &[Vec<Array3<f32>>],
-    (c, h, w): (usize, usize, usize),
+/// patches up to that width. `pixels` gives a sample's pixels as the model
+/// takes them, and their floats go through `table` straight into the batch's
+/// buffer, every element written once (a tensor per patch was zero-filled,
+/// written and then copied here: three passes over floats that take one). A
+/// patch of another shape than the first is refused rather than broadcast
+/// into its slot.
+fn batch_patches<'a>(
+    samples_per_image: &'a [Vec<DynamicImage>],
+    table: &[[f32; 256]; 3],
+    mut pixels: impl FnMut(&'a DynamicImage) -> Cow<'a, DynamicImage>,
 ) -> Result<ndarray::Array5<f32>, TransformError> {
-    let num_images = patches_per_image.len();
-    let max_patches = patches_per_image.iter().map(Vec::len).max().unwrap_or(0);
-    let patch_len = c * h * w;
+    let num_images = samples_per_image.len();
+    let max_patches = samples_per_image.iter().map(Vec::len).max().unwrap_or(0);
+    // The batch's patch shape is the first patch's, read before any float is
+    // written so that the buffer is allocated once at its size.
+    let mut first = samples_per_image.iter().flatten().next().map(&mut pixels);
+    let Some((w, h)) = first.as_ref().map(|patch| patch.dimensions()) else {
+        return Err(TransformError::EmptyBatch);
+    };
+    let patch_len = 3 * h as usize * w as usize;
     let mut data = Vec::with_capacity(num_images * max_patches * patch_len);
-    for patches in patches_per_image {
-        for patch in patches {
-            if patch.shape() != [c, h, w] {
+    for samples in samples_per_image {
+        for sample in samples {
+            // The first patch's pixels are the ones its shape was read from.
+            let patch = first.take().unwrap_or_else(|| pixels(sample));
+            let (patch_w, patch_h) = patch.dimensions();
+            if (patch_w, patch_h) != (w, h) {
                 return Err(TransformError::InvalidShape {
-                    expected: format!("[{c}, {h}, {w}]"),
-                    actual: patch.shape().to_vec(),
+                    expected: format!("[3, {h}, {w}]"),
+                    actual: vec![3, patch_h as usize, patch_w as usize],
                 });
             }
-            match patch.as_slice() {
-                Some(values) => data.extend_from_slice(values),
-                None => data.extend(patch.iter()),
-            }
+            let (_, _, raw) = rgb_bytes(&patch);
+            extend_planes_by_table(&mut data, &raw, table);
         }
-        data.resize(data.len() + (max_patches - patches.len()) * patch_len, 0.0);
+        data.resize(data.len() + (max_patches - samples.len()) * patch_len, 0.0);
     }
+    let shape = (num_images, max_patches, 3, h as usize, w as usize);
     #[expect(
         clippy::expect_used,
-        reason = "data holds num_images * max_patches * c * h * w elements by construction"
+        reason = "data holds num_images * max_patches * 3 * h * w elements by construction"
     )]
-    let tensor = ndarray::Array5::from_shape_vec((num_images, max_patches, c, h, w), data)
-        .expect("patch tensor matches its shape");
+    let tensor =
+        ndarray::Array5::from_shape_vec(shape, data).expect("patch tensor matches its shape");
     Ok(tensor)
 }
 
@@ -1199,11 +1200,15 @@ mod tests {
 
     #[test]
     fn a_patch_of_another_shape_is_refused_not_broadcast() {
-        // A degenerate `[3, 336, 1]` patch: a zeroed tensor's assign would
-        // have broadcast it across its slot; the copy refuses it.
-        let patches = vec![vec![Array3::<f32>::zeros((3, 336, 1))]];
+        // A one-pixel-wide patch after a full one: a zeroed tensor's assign
+        // would have broadcast it across its slot; the batch refuses it.
+        let samples = vec![vec![
+            DynamicImage::ImageRgb8(gradient(336, 336, 3)),
+            DynamicImage::ImageRgb8(gradient(1, 336, 5)),
+        ]];
+        let processor = LlavaNextProcessor::new();
         assert!(matches!(
-            stack_patches(&patches, (3, 336, 336)),
+            batch_patches(&samples, &processor.base.transforms.table, Cow::Borrowed),
             Err(TransformError::InvalidShape { .. })
         ));
     }
@@ -1237,7 +1242,10 @@ mod tests {
             for (j, sample) in samples.iter().enumerate() {
                 expected
                     .slice_mut(ndarray::s![i, j, .., .., ..])
-                    .assign(&processor.process_patch(sample));
+                    .assign(&to_tensor_by_table(
+                        &processor.patch_pixels(sample),
+                        &processor.base.transforms.table,
+                    ));
             }
         }
         assert_eq!(tensor.as_slice().unwrap(), expected.as_slice().unwrap());

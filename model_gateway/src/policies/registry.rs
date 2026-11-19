@@ -20,6 +20,8 @@ use tracing::{debug, info, warn};
 /// When the last worker of a model is removed, the policy mapping is cleaned up.
 use super::{
     as_bucket, as_cache_aware, get_healthy_worker_indices,
+    hash_ring::HashRing,
+    kept_rings::KeptRings,
     manual::{ExecutionBranch, PinState},
     normalize_model_key, DPRankLoadPolicy, LoadBalancingPolicy, ManualConfig, ManualPolicy,
     PolicyFactory, SelectWorkerInfo, WorkerRole,
@@ -33,7 +35,11 @@ use crate::{
     routers::common::header_utils::{
         extract_routing_key_hint_named, parse_routing_tokens_hint, ROUTING_KEY_HINT_MAX_BYTES,
     },
-    worker::{load_state::LoadReceiver, KvEventMonitor, RequestCompletionSink, Worker, WorkerType},
+    worker::{
+        identity::endpoint::Endpoint, load::state::LoadReceiver, KvEventMonitor, LoadConsumer,
+        ModelWorkerSnapshot, RequestCompletionSink, Worker, WorkerRegistry, WorkerRegistryExt,
+        WorkerType,
+    },
 };
 
 /// Routes a request completion to the policy that placed the request: the
@@ -183,6 +189,8 @@ pub struct PolicyRegistry {
     routing_key_headers: Arc<Vec<HeaderName>>,
     /// How strictly PD placement pairs prefill and decode descriptors.
     pd_pairing_mode: PdPairingMode,
+    /// The hash rings kept between membership generations ([`KeptRings`]).
+    rings: Arc<KeptRings>,
 }
 
 /// A sticky key with this many of its own requests already in flight on its
@@ -263,7 +271,43 @@ impl PolicyRegistry {
             routing_key_sticky,
             routing_key_headers: Arc::new(routing_key_headers),
             pd_pairing_mode: PdPairingMode::default(),
+            rings: Arc::new(KeptRings::default()),
         }
+    }
+
+    /// The consistent-hash ring `model_id`'s requests are placed on: the
+    /// ring of the generation the registry holds for the model, `None` for a
+    /// model nobody serves. The model-less id reads the ring over every
+    /// worker, the candidates of a request that names no model. A caller
+    /// holding a client's name for the model resolves it at request entry,
+    /// as for the registry's other reads by model.
+    pub(crate) fn hash_ring(
+        &self,
+        registry: &WorkerRegistry,
+        model_id: &str,
+    ) -> Option<Arc<HashRing>> {
+        self.rings
+            .of(model_id, &registry.get_routing_snapshot(model_id))
+    }
+
+    /// [`Self::hash_ring`] of a generation the caller holds, so the ring and
+    /// what else it reads of the generation are of one membership.
+    pub(crate) fn hash_ring_of(
+        &self,
+        model_id: &str,
+        generation: &ModelWorkerSnapshot,
+    ) -> Option<Arc<HashRing>> {
+        self.rings.of(model_id, generation)
+    }
+
+    /// Starts the task that fills the hash rings off the request path
+    /// ([`KeptRings::keep_warm`]).
+    pub(crate) fn keep_rings_warm(
+        &self,
+        registry: &Arc<WorkerRegistry>,
+        runtime: &tokio::runtime::Handle,
+    ) {
+        self.rings.keep_warm(registry, runtime);
     }
 
     /// Set how strictly PD placement pairs prefill and decode descriptors.
@@ -453,7 +497,7 @@ impl PolicyRegistry {
                 source,
                 key,
                 branch = branch.as_str(),
-                worker = result.map_or("none", |idx| workers[idx].url()),
+                worker = result.map_or("none", |idx| workers[idx].redacted_url()),
                 model_id = result.map_or("none", |idx| workers[idx].model_id()),
                 "Sticky routing decision"
             );
@@ -1031,7 +1075,8 @@ impl PolicyRegistry {
                 cache_aware.remove_worker_by_url(worker_url);
                 debug!(
                     "Removed worker {} from cache-aware policy for model {}",
-                    worker_url, model_id
+                    Endpoint::redacted_url(worker_url),
+                    model_id
                 );
             }
         }
@@ -1050,7 +1095,8 @@ impl PolicyRegistry {
                     cache_aware.remove_worker_by_url(worker_url);
                     debug!(
                         "Removed worker {} from {} cache-aware policy",
-                        worker_url, worker_type
+                        Endpoint::redacted_url(worker_url),
+                        worker_type
                     );
                 }
             }
@@ -1150,6 +1196,16 @@ impl std::fmt::Debug for PolicyRegistry {
     }
 }
 
+impl LoadConsumer for PolicyRegistry {
+    fn needs_loads(&self) -> bool {
+        self.needs_backend_loads() || self.get_dp_rank_policy().is_some()
+    }
+
+    fn reconcile_in_flight(&self, worker: &dyn Worker) {
+        PolicyRegistry::reconcile_in_flight(self, worker);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
@@ -1159,13 +1215,13 @@ mod tests {
     use super::*;
     use crate::{
         policies::{
-            test_support::headers_with_routing_key, BucketConfig, BucketPolicy, CacheAwareConfig,
-            CacheAwarePolicy, LeastLoadPolicy, SelectWorkerInfo,
+            hash_ring::HashRing, test_support::headers_with_routing_key, BucketConfig,
+            BucketPolicy, CacheAwareConfig, CacheAwarePolicy, LeastLoadPolicy, SelectWorkerInfo,
         },
         worker::{
-            load_state::LoadSnapshot,
+            load::state::LoadSnapshot,
             test_support::{ready_worker, worker_of},
-            HashRing, Worker, WorkerLoadGuard, WorkerType,
+            Worker, WorkerLoadGuard, WorkerType,
         },
     };
 
@@ -1996,6 +2052,82 @@ mod tests {
         assert!(logs_contain("occupied_hit"));
     }
 
+    /// The sticky decision line and the two removal lines name a worker
+    /// registered with a password and a query token by its masked address.
+    #[test]
+    #[traced_test]
+    fn the_debug_lines_name_a_worker_masked() {
+        // What tells each line among the test's lines.
+        const LINES: [(&str, &str); 3] = [
+            ("the sticky decision", "Sticky routing decision"),
+            (
+                "the removal from a model's policy",
+                "from cache-aware policy for model",
+            ),
+            (
+                "the removal from a role's policy",
+                "from prefill cache-aware policy",
+            ),
+        ];
+        let address = |host: &str| format!("http://user:s3cret@{host}:8000/v1?token=s3cret");
+
+        let registry = PolicyRegistry::with_override(
+            PolicyConfig::RoundRobin,
+            rid_override(ManualAssignmentMode::Delegate),
+        );
+        let workers = vec![
+            worker_of(&address("w1"), WorkerType::Regular),
+            worker_of(&address("w2"), WorkerType::Regular),
+        ];
+        let info = SelectWorkerInfo {
+            rid_key: Some("conv1"),
+            ..Default::default()
+        };
+        registry
+            .select_worker(&registry.get_default_policy(), &workers, &info)
+            .unwrap();
+
+        let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        registry.on_worker_added("llama-3", Some("cache_aware"));
+        registry.remove_worker_from_cache_aware("llama-3", &address("w3"));
+        registry.set_prefill_policy(cache_aware_policy());
+        registry.remove_worker_from_pd_cache_aware(&address("w4"));
+
+        logs_assert(|lines: &[&str]| {
+            let written = |told_by: &str| -> Vec<&str> {
+                lines
+                    .iter()
+                    .copied()
+                    .filter(|line| line.contains(told_by))
+                    .collect()
+            };
+            let unwritten: Vec<&str> = LINES
+                .iter()
+                .filter(|(_, told_by)| written(told_by).is_empty())
+                .map(|(line, _)| *line)
+                .collect();
+            if !unwritten.is_empty() {
+                return Err(format!("lines nothing wrote: {unwritten:#?}"));
+            }
+            let whole: Vec<&str> = LINES
+                .iter()
+                .filter(|(_, told_by)| {
+                    written(told_by)
+                        .iter()
+                        .any(|line| !line.contains("http://***@") || line.contains("s3cret"))
+                })
+                .map(|(line, _)| *line)
+                .collect();
+            if whole.is_empty() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "lines that do not name their worker masked: {whole:#?}"
+                ))
+            }
+        });
+    }
+
     /// An overloaded pin must respill through the existing reassignment path.
     ///
     /// Every router hands `select_worker` a slice already filtered by
@@ -2163,8 +2295,8 @@ mod tests {
         let _unrelated = [
             WorkerLoadGuard::with_key(workers[pinned].clone(), Some("convZ")),
             WorkerLoadGuard::with_key(workers[pinned].clone(), Some("convZ")),
-            WorkerLoadGuard::new(workers[pinned].clone(), None),
-            WorkerLoadGuard::new(workers[pinned].clone(), None),
+            WorkerLoadGuard::with_key(workers[pinned].clone(), None),
+            WorkerLoadGuard::with_key(workers[pinned].clone(), None),
         ];
         assert_eq!(reg.select_worker(&policy, &workers, &info), Some(pinned));
         assert!(logs_contain("occupied_hit"));
@@ -2275,6 +2407,23 @@ mod tests {
         );
         let default = Arc::as_ptr(&registry.default_policy) as *const ();
         assert_eq!(visits.iter().filter(|p| **p == default).count(), 1);
+    }
+
+    /// What the load monitor is told through `LoadConsumer`: loads are wanted
+    /// when a policy reads them, and when a DP-rank policy is set though no
+    /// policy reads them.
+    #[test]
+    fn loads_are_wanted_for_a_policy_that_reads_them_or_a_dp_rank_policy() {
+        let plain = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        assert!(!LoadConsumer::needs_loads(&plain));
+
+        let reading = PolicyRegistry::new(PolicyConfig::cache_aware(0.5, 32, 1.1, 0, 4096));
+        assert!(LoadConsumer::needs_loads(&reading));
+
+        let ranked = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        ranked.set_dp_rank_policy(Arc::new(crate::policies::MinimumTokensPolicy::new(None)));
+        assert!(!ranked.needs_backend_loads());
+        assert!(LoadConsumer::needs_loads(&ranked));
     }
 
     #[test]
@@ -2728,10 +2877,10 @@ mod tests {
             worker.set_completion_sink(Some(Arc::clone(&sink)));
         }
 
-        drop(WorkerLoadGuard::new(Arc::clone(&prefill), None));
-        drop(WorkerLoadGuard::new(Arc::clone(&decode), None));
+        drop(WorkerLoadGuard::with_key(Arc::clone(&prefill), None));
+        drop(WorkerLoadGuard::with_key(Arc::clone(&decode), None));
         // The regular worker's model policy (random) accepts the completion silently.
-        drop(WorkerLoadGuard::new(Arc::clone(&regular), None));
+        drop(WorkerLoadGuard::with_key(Arc::clone(&regular), None));
 
         assert_eq!(
             prefill_policy.completed.lock().unwrap().as_slice(),
@@ -2744,7 +2893,7 @@ mod tests {
 
         // A worker that outlives its registry reports to nobody.
         drop(registry);
-        drop(WorkerLoadGuard::new(Arc::clone(&prefill), None));
+        drop(WorkerLoadGuard::with_key(Arc::clone(&prefill), None));
         assert_eq!(prefill_policy.completed.lock().unwrap().len(), 1);
     }
 
@@ -2764,12 +2913,14 @@ mod tests {
         // The count handed over is the router's live one: two guards held,
         // then none.
         let held = [
-            WorkerLoadGuard::new(Arc::clone(&decode), None),
-            WorkerLoadGuard::new(Arc::clone(&decode), None),
+            WorkerLoadGuard::with_key(Arc::clone(&decode), None),
+            WorkerLoadGuard::with_key(Arc::clone(&decode), None),
         ];
         registry.reconcile_in_flight(decode.as_ref());
         drop(held);
-        registry.reconcile_in_flight(decode.as_ref());
+        // The second time as the worker's monitor asks it: through the trait.
+        let consumer: &dyn LoadConsumer = registry.as_ref();
+        consumer.reconcile_in_flight(decode.as_ref());
         assert_eq!(
             decode_policy.reconciled.lock().unwrap().as_slice(),
             [

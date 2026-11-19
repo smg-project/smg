@@ -160,9 +160,9 @@ def render(*settings: str, files: tuple[Path, ...] = ()) -> tuple[str, list[dict
     return completed.stdout, documents
 
 
-def render_error(*settings: str) -> str:
+def render_error(*settings: str, files: tuple[Path, ...] = ()) -> str:
     """Renders the chart with ``--set`` pairs that must fail: helm's error."""
-    completed = helm_template(settings)
+    completed = helm_template(settings, files)
     assert completed.returncode != 0, "the chart rendered values it should refuse"
     return completed.stderr
 
@@ -890,6 +890,75 @@ def test_a_prefill_only_policy_is_refused_by_the_schema():
     """``bucket`` is a ``--prefill-policy`` choice, not a ``--policy`` one; the
     schema refuses it where the launcher would, at render time."""
     assert "router.policy must be one of the following" in render_error("router.policy=bucket")
+
+
+# Tags of digits alone, two workers whose tags are filled in as written, and
+# the policy controller's switch with the spec document the chart refuses it
+# without.
+DIGIT_TAGS = ("1.16", "1.10", "20261115")
+WORKERS = (
+    "workers:\n"
+    "  - name: one\n    engine: vllm\n    model: m\n    image:\n      tag: {}\n"
+    "  - name: two\n    engine: vllm\n    model: m\n    image:\n      tag: {}\n"
+)
+CONTROLLER_ON = ("policyController.enabled=true", "policyController.spec.apiVersion=smg.policy/v1")
+
+
+def images(documents: list[dict]) -> set[str]:
+    """Every image the render's pod templates name."""
+    return {
+        container["image"]
+        for document in documents
+        if document["kind"] in ("Deployment", "StatefulSet")
+        for container in document["spec"]["template"]["spec"]["containers"]
+    }
+
+
+@needs_helm
+def test_an_image_tag_written_as_a_number_is_refused_under_its_name(tmp_path):
+    """A tag is text. YAML reads an unquoted tag of digits as a number, and no
+    template prints a number as written: 1.10 is read as 1.1. The image name
+    was rendered with a formatting error in the tag's place, and helm exited
+    0. The schema refuses such a tag under the value's name: the router's and
+    a worker's, with the policy controller on or off, from a values file or
+    from ``--set``."""
+    values = tmp_path / "values.yaml"
+    for written in DIGIT_TAGS:
+        values.write_text(f"global:\n  image:\n    tag: {written}\n")
+        for switch in ((), CONTROLLER_ON):
+            assert "global.image.tag: Invalid type" in render_error(*switch, files=(values,))
+        # Every worker's tag, not the first alone.
+        for at, tags in enumerate(((written, '"0.31"'), ('"0.31"', written))):
+            values.write_text(WORKERS.format(*tags))
+            assert f"workers.{at}.image.tag: Invalid type" in render_error(files=(values,))
+    assert "global.image.tag: Invalid type" in render_error("global.image.tag=20261115")
+
+
+@needs_helm
+def test_a_tag_of_digits_quoted_names_the_image(tmp_path):
+    """Quoted, a tag of digits alone is the text written: the router's image
+    and the version label carry it, a worker's image carries its own, and a
+    worker that names none takes the router's. A ``null`` tag is the default:
+    the chart's own version."""
+    values = tmp_path / "values.yaml"
+    workers = WORKERS.format('"0.31"', "null")
+    for written in DIGIT_TAGS:
+        values.write_text(f'global:\n  image:\n    tag: "{written}"\n{workers}')
+        for switch in ((), CONTROLLER_ON):
+            _, documents = render(*switch, files=(values,))
+            assert router_container(documents)["image"] == f"docker.io/lightseekorg/smg:{written}"
+            engines = {image for image in images(documents) if image.startswith("ghcr.io/")}
+            assert engines == {"ghcr.io/smg-project/smg:0.31", f"ghcr.io/smg-project/smg:{written}"}
+            labels = [document["metadata"].get("labels", {}) for document in documents]
+            versions = {found.get("app.kubernetes.io/version") for found in labels}
+            assert versions - {None} == {written}
+    values.write_text(f"global:\n  image:\n    tag: null\n{WORKERS.format('null', 'null')}")
+    _, documents = render(files=(values,))
+    version = yaml.safe_load((CHART / "Chart.yaml").read_text())["appVersion"]
+    assert images(documents) == {
+        f"docker.io/lightseekorg/smg:{version}",
+        f"ghcr.io/smg-project/smg:{version}",
+    }
 
 
 @needs_helm

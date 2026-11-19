@@ -4,7 +4,8 @@ use axum::response::Response;
 use http::StatusCode;
 use llm_multimodal::MediaErrorCode;
 use smg_grpc_client::{
-    is_constraint_failure, is_request_timeout, is_transport_failure, WorkerMediaFault,
+    dial_failure_without_peer, is_constraint_failure, is_request_timeout, is_transport_failure,
+    WorkerMediaFault,
 };
 use tonic::Code;
 
@@ -48,6 +49,12 @@ pub(crate) trait TonicStatusExt {
     /// counts it reads the cause the status named (see
     /// `error_reason_for_response`).
     fn to_http_error(&self, code: &str, msg: String) -> Response;
+
+    /// This status's message as an answer to a client carries it: the
+    /// message itself, except for a dial that failed. That status names the
+    /// worker's address, for the gateway's own log line, and a client reads
+    /// the same failure without it.
+    fn client_message(&self) -> &str;
 
     /// The `reason` label of a router error this status ends a request with:
     /// the cause behind the class [`http_status`](TonicStatusExt::http_status)
@@ -205,6 +212,10 @@ impl TonicStatusExt for tonic::Status {
         response
     }
 
+    fn client_message(&self) -> &str {
+        dial_failure_without_peer(self).unwrap_or_else(|| self.message())
+    }
+
     fn error_reason(&self) -> &'static str {
         use metrics_labels::*;
         if is_constraint_failure(self) {
@@ -296,7 +307,7 @@ impl<T> TonicResultExt for Result<T, tonic::Status> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::worker::resilience::{
+    use crate::worker::health::resilience::{
         DEFAULT_CAPACITY_STATUS_CODES, DEFAULT_RETRYABLE_STATUS_CODES,
     };
 

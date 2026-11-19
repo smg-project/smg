@@ -1,18 +1,22 @@
 //! The view and the lifecycle as a guest sees them: the record form through
 //! the generated types, the packed form as the little-endian blocks the
 //! WIT's layout table names, and the lifecycle as the versioned variant. The
-//! exposure decides what of the identities and headers crosses.
+//! exposure decides what of the identities and headers crosses, and the
+//! plugin's declared needs whether the request's block hashes do.
 
 use super::{
     bindings::wit,
     config::{Exposure, Reveal},
 };
 use crate::{
+    counts::with_counts,
     decision::{Decision, Target, MAX_TARGETS},
     lease::{Lease, LeaseKind, Membership, Outcome, ReleaseReason, Side, Signal, TransportClass},
+    plugins::shown_hashes,
+    spec::Needs,
     view::{
-        Candidate, HashKind, Health, Identity, LoadRow, OverloadRegime, Phase, PoolFacts,
-        RequestFacts, Role, SignalSource, WireModes, ZoneCapacity,
+        AffinityFacts, Candidate, Feed, HashKind, Health, Identity, LoadRow, OverloadRegime, Phase,
+        PoolFacts, RequestFacts, Role, SignalSource, WireModes, ZoneCapacity,
     },
 };
 
@@ -65,7 +69,7 @@ pub(crate) fn health(h: Health) -> wit::Health {
 }
 
 /// The health bits of the packed row: the same table as the flags.
-pub(crate) fn health_bits(h: Health) -> u8 {
+fn health_bits(h: Health) -> u8 {
     health_flags(h)
         .into_iter()
         .filter(|f| f.on)
@@ -153,7 +157,11 @@ pub(crate) fn load(row: &LoadRow) -> wit::Load {
     }
 }
 
-pub(crate) fn candidate(c: &Candidate) -> wit::Candidate {
+/// One candidate as the record form carries it: the row, and the affinity
+/// facts the host holds for it beside the row (`held`), which the record
+/// keeps as fields of its own. Its requests in flight are what the
+/// request's facts read for it (`in_flight`).
+pub(crate) fn candidate(c: &Candidate, held: AffinityFacts, in_flight: u32) -> wit::Candidate {
     wit::Candidate {
         id: c.id.0,
         role: role(c.role),
@@ -163,17 +171,17 @@ pub(crate) fn candidate(c: &Candidate) -> wit::Candidate {
         wire_modes: wire_modes(c.wire_modes),
         engine_kind: c.engine_kind,
         connector: c.connector,
-        in_flight: c.in_flight,
+        in_flight,
         load: c.load.as_ref().map(load),
-        overlap_blocks: c.overlap_blocks,
-        predicted_blocks: c.predicted_blocks,
+        overlap_blocks: held.overlap_blocks,
+        predicted_blocks: held.predicted_blocks,
         session_hit: c.session_hit,
         session_in_flight: c.session_in_flight,
         pair_class: c.pair_class,
         has_capacity: c.has_capacity,
         has_room: c.has_room,
-        admitted_age_ms: c.admitted_age_ms,
-        indexed_growth: c.indexed_growth,
+        admitted_age_ms: held.admitted_age_ms,
+        indexed_growth: held.indexed_growth,
         zone: c.zone,
         labels: c.labels,
         ec_compatible: c.ec_compatible,
@@ -181,21 +189,35 @@ pub(crate) fn candidate(c: &Candidate) -> wit::Candidate {
         host_local: c.host_local,
         active_sessions: c.active_sessions,
         key: c.key,
-        indexed_blocks: c.indexed_blocks,
+        indexed_blocks: held.indexed_blocks,
     }
 }
 
 /// An identity under the plugin's exposure: withheld, its fingerprint, or
 /// the plain form when the host holds it (its fingerprint otherwise).
 pub(crate) fn identity<'a>(id: &Identity<'a>, reveal: Reveal) -> wit::Identity<'a> {
+    exposed(id, reveal, || id.hash)
+}
+
+/// [`identity`] with the hash form's value made on demand: the exposure is
+/// asked first, and `hash` runs only where that form crosses.
+fn exposed<'a>(id: &Identity<'a>, reveal: Reveal, hash: impl FnOnce() -> u64) -> wit::Identity<'a> {
     if id.is_none() {
         return wit::Identity::None;
     }
     match (reveal, id.plain) {
         (Reveal::None, _) => wit::Identity::None,
         (Reveal::Plain, Some(plain)) => wit::Identity::Plain(plain),
-        (Reveal::Hash | Reveal::Plain, _) => wit::Identity::Hash(id.hash),
+        (Reveal::Hash | Reveal::Plain, _) => wit::Identity::Hash(hash()),
     }
+}
+
+/// The request's session key as a plugin sees it under its exposure: the
+/// session's value in the hash form, which is what a lease carries, so a
+/// plugin matches the two; the key itself in the plain form. A value the
+/// plugin is not shown is never made.
+fn session_identity<'a>(facts: &RequestFacts<'a>, reveal: Reveal) -> wit::Identity<'a> {
+    exposed(&facts.session_key, reveal, || facts.session().get())
 }
 
 /// The allow-listed headers the exposure lets through, as the record form
@@ -209,9 +231,11 @@ pub(crate) fn headers<'a>(facts: &RequestFacts<'a>, exposure: &Exposure) -> Vec<
         .collect()
 }
 
+/// The request under the plugin's exposure and its declared needs.
 pub(crate) fn request<'a>(
     facts: &RequestFacts<'a>,
     exposure: &Exposure,
+    needs: Needs,
     tried: &'a [u64],
     headers: &'a [(u8, &'a str)],
 ) -> wit::Request<'a> {
@@ -223,9 +247,9 @@ pub(crate) fn request<'a>(
         streaming: facts.streaming,
         max_output_tokens: facts.max_output_tokens,
         prompt_tokens: facts.prompt_tokens,
-        block_hashes: facts.block_hashes,
+        block_hashes: shown_hashes(facts, needs),
         hash_kind: hash_kind(facts.hash_kind),
-        session_key: identity(&facts.session_key, exposure.session_key),
+        session_key: session_identity(facts, exposure.session_key),
         phase: phase(facts.phase),
         attempt: facts.attempt,
         tried,
@@ -278,7 +302,17 @@ impl Records {
         pool: &PoolFacts<'_>,
     ) {
         self.candidates.clear();
-        self.candidates.extend(candidates.iter().map(candidate));
+        // A candidate's affinity facts ride the request's column, or the
+        // rows the host names in the column's place, by its index: the same
+        // index reads the row and what it holds. The packed fill walks
+        // either feed instead; this one keeps the read by index, whose
+        // tests are lost in what a record a candidate costs.
+        with_counts!(facts, |counts| {
+            let records = (0u32..)
+                .zip(candidates)
+                .map(|(index, c)| candidate(c, facts.affinity_at(index), counts(c)));
+            self.candidates.extend(records);
+        });
         self.zones.clear();
         self.zones.extend(pool.zones.iter().map(zone));
         self.tried.clear();
@@ -289,7 +323,10 @@ impl Records {
 /// The packed form's layout: the committed WIT's table, byte for byte. A
 /// change to the table changes these numbers and the test that pins them.
 pub mod layout {
-    /// One candidate row.
+    /// One candidate row, with the five affinity facts in it. The fields of
+    /// the engine's own row take 103 bytes WITHOUT them: the two numbers
+    /// are near by accident, each pinned in its own file, and nothing ties
+    /// one to the other.
     pub const ROW: usize = 104;
     /// The request block's fixed header; the variable sections follow.
     pub const HEADER: usize = 80;
@@ -611,6 +648,14 @@ fn put(buf: &mut [u8], at: usize, bytes: &[u8]) {
     buf[at..at + bytes.len()].copy_from_slice(bytes);
 }
 
+/// Appends a section of u64 values, eight little-endian bytes each: the
+/// block grows once, by the section's length, and one pass extends it from
+/// the values' bytes.
+fn put_u64s(buf: &mut Vec<u8>, values: impl ExactSizeIterator<Item = u64>) {
+    buf.reserve(8 * values.len());
+    buf.extend(values.flat_map(u64::to_le_bytes));
+}
+
 /// The bits whose flag is set.
 fn bits<const N: usize>(flags: [(bool, u8); N]) -> u8 {
     flags
@@ -630,9 +675,10 @@ impl Packed {
         candidates: &[Candidate],
         pool: &PoolFacts<'_>,
         exposure: &Exposure,
+        needs: Needs,
     ) -> Result<(), TooLong> {
-        self.fill_request(facts, exposure)?;
-        self.fill_candidates(candidates);
+        self.fill_request(facts, exposure, needs)?;
+        self.fill_candidates(facts, candidates);
         self.fill_pool(pool);
         Ok(())
     }
@@ -641,22 +687,24 @@ impl Packed {
         &mut self,
         facts: &RequestFacts<'_>,
         exposure: &Exposure,
+        needs: Needs,
     ) -> Result<(), TooLong> {
         use layout::*;
         let buf = &mut self.request;
         buf.clear();
         buf.resize(HEADER, 0);
         let tenant = identity(&facts.tenant, exposure.tenant);
-        let session = identity(&facts.session_key, exposure.session_key);
-        let (tenant_hash, tenant_plain) = packed_identity(&tenant, facts.tenant.hash);
-        let (session_hash, session_plain) = packed_identity(&session, facts.session_key.hash);
+        let session = session_identity(facts, exposure.session_key);
+        let (tenant_hash, tenant_plain) = packed_identity(&tenant, || facts.tenant.hash);
+        let (session_hash, session_plain) = packed_identity(&session, || facts.session().get());
         let model_len = section_len(facts.model)?;
         let exposed = facts
             .headers
             .iter()
             .filter(|h| exposure.headers.contains(h.name));
         let header_count = u16::try_from(exposed.clone().count()).map_err(|_| TooLong)?;
-        let hash_count = u16::try_from(facts.block_hashes.len()).map_err(|_| TooLong)?;
+        let hashes = shown_hashes(facts, needs);
+        let hash_count = u16::try_from(hashes.len()).map_err(|_| TooLong)?;
         let tried_count = u16::try_from(facts.tried.len()).map_err(|_| TooLong)?;
         put(buf, REQ_NAMESPACE_SEED, &facts.namespace_seed.to_le_bytes());
         put(buf, REQ_SEED, &facts.seed.to_le_bytes());
@@ -685,12 +733,8 @@ impl Packed {
         put(buf, REQ_BLOCK_SIZE, &facts.block_size.to_le_bytes());
         buf.extend_from_slice(facts.model.as_bytes());
         buf.resize(buf.len().next_multiple_of(8), 0);
-        for h in facts.block_hashes {
-            buf.extend_from_slice(&h.to_le_bytes());
-        }
-        for t in facts.tried {
-            buf.extend_from_slice(&t.0.to_le_bytes());
-        }
+        put_u64s(buf, hashes.iter().copied());
+        put_u64s(buf, facts.tried.iter().map(|t| t.0));
         for h in exposed {
             let len = section_len(h.value)?;
             buf.push(h.name);
@@ -705,61 +749,98 @@ impl Packed {
         Ok(())
     }
 
-    fn fill_candidates(&mut self, candidates: &[Candidate]) {
-        use layout::*;
+    fn fill_candidates(&mut self, facts: &RequestFacts<'_>, candidates: &[Candidate]) {
+        use layout::ROW;
         let buf = &mut self.candidates;
         buf.clear();
         buf.resize(candidates.len() * ROW, 0);
-        for (c, row) in candidates.iter().zip(buf.as_chunks_mut::<ROW>().0) {
-            put(row, ROW_ID, &c.id.0.to_le_bytes());
-            put(row, ROW_IN_FLIGHT, &c.in_flight.to_le_bytes());
-            let load = c.load.unwrap_or_default();
-            put(row, ROW_RUNNING, &load.running.to_le_bytes());
-            put(row, ROW_QUEUED, &load.queued.to_le_bytes());
-            put(
-                row,
-                ROW_WAITING_UNCACHED,
-                &load.waiting_uncached_tokens.to_le_bytes(),
-            );
-            put(row, ROW_OVERLAP, &c.overlap_blocks.to_le_bytes());
-            put(row, ROW_PREDICTED, &c.predicted_blocks.to_le_bytes());
-            put(row, ROW_RESIDENT, &load.resident_tokens.to_le_bytes());
-            put(row, ROW_PAIR_CLASS, &c.pair_class.to_le_bytes());
-            put(row, ROW_ADMITTED_AGE, &c.admitted_age_ms.to_le_bytes());
-            put(row, ROW_REPORT_AGE, &load.report_age_ms.to_le_bytes());
-            put(row, ROW_INDEXED_GROWTH, &c.indexed_growth.to_le_bytes());
-            put(row, ROW_LIVE_RATE, &load.live_rate.to_le_bytes());
-            put(row, ROW_MAX_RUNNING, &load.max_running.to_le_bytes());
-            put(row, ROW_KV_USAGE, &load.kv_usage_permille.to_le_bytes());
-            put(row, ROW_ACTIVE_KV, &load.active_kv_permille.to_le_bytes());
-            put(row, ROW_DP_RANK, &c.dp_rank.to_le_bytes());
-            put(row, ROW_DP_SIZE, &c.dp_size.to_le_bytes());
-            put(row, ROW_ZONE, &c.zone.to_le_bytes());
-            put(row, ROW_ENGINE_KIND, &c.engine_kind.to_le_bytes());
-            put(row, ROW_CONNECTOR, &c.connector.to_le_bytes());
-            put(
-                row,
-                ROW_SESSION_IN_FLIGHT,
-                &c.session_in_flight.to_le_bytes(),
-            );
-            row[ROW_HEALTH] = health_bits(c.health);
-            row[ROW_WIRE_MODES] = c.wire_modes.bits();
-            row[ROW_ROLE] = c.role as u8;
-            row[ROW_SOURCE] = load.source as u8;
-            row[ROW_BITS] = bits([
-                (c.session_hit, BIT_SESSION_HIT),
-                (c.has_capacity, BIT_HAS_CAPACITY),
-                (c.has_room, BIT_HAS_ROOM),
-                (c.ec_compatible, BIT_EC_COMPATIBLE),
-                (c.vision, BIT_VISION),
-                (c.host_local, BIT_HOST_LOCAL),
-                (c.load.is_some(), BIT_LOAD_PRESENT),
-            ]);
-            put(row, ROW_ACTIVE_SESSIONS, &c.active_sessions.to_le_bytes());
-            put(row, ROW_KEY, &c.key.to_le_bytes());
-            put(row, ROW_LABELS, &c.labels.to_le_bytes());
-            put(row, ROW_INDEXED_BLOCKS, &c.indexed_blocks.to_le_bytes());
-        }
+        let rows = buf.as_chunks_mut::<ROW>().0;
+        // The candidates' affinity facts ride the request's column; the
+        // table keeps them in the row. The column is walked beside the
+        // candidates and its emptiness decided once: read by index, the
+        // emptiness and the bound are tested for every row, which cost the
+        // fill 2.5 ns a row at 512 candidates. An empty column is nothing
+        // held by any candidate. Any other holds one entry a candidate, and
+        // one that ends before the candidates fails here, as an index past
+        // its end does. Rows the host named in the column's place are
+        // walked beside the candidates: a holder's row carries its two
+        // depths, and every row reads its age, growth and index size as
+        // zero, so a host fills the column for a profile whose guest reads
+        // those.
+        with_counts!(facts, |counts| match facts.feed() {
+            feed if feed.is_empty() => {
+                let nothing = AffinityFacts::default();
+                for (c, row) in candidates.iter().zip(rows) {
+                    Self::fill_row(row, c, nothing, counts(c));
+                }
+            }
+            Feed::Column(column) => {
+                let column = &column[..candidates.len()];
+                for ((c, held), row) in candidates.iter().zip(column).zip(rows) {
+                    Self::fill_row(row, c, *held, counts(c));
+                }
+            }
+            Feed::Named(named) => {
+                let mut walk = named.walk();
+                for ((index, c), row) in (0u32..).zip(candidates).zip(rows) {
+                    Self::fill_row(row, c, walk.entry(index), counts(c));
+                }
+            }
+        });
+    }
+
+    /// One candidate's row of the table, its affinity facts and the
+    /// requests in flight the request's facts read for it in the row.
+    fn fill_row(row: &mut [u8; layout::ROW], c: &Candidate, held: AffinityFacts, in_flight: u32) {
+        use layout::*;
+        put(row, ROW_ID, &c.id.0.to_le_bytes());
+        put(row, ROW_IN_FLIGHT, &in_flight.to_le_bytes());
+        let load = c.load.unwrap_or_default();
+        put(row, ROW_RUNNING, &load.running.to_le_bytes());
+        put(row, ROW_QUEUED, &load.queued.to_le_bytes());
+        put(
+            row,
+            ROW_WAITING_UNCACHED,
+            &load.waiting_uncached_tokens.to_le_bytes(),
+        );
+        put(row, ROW_OVERLAP, &held.overlap_blocks.to_le_bytes());
+        put(row, ROW_PREDICTED, &held.predicted_blocks.to_le_bytes());
+        put(row, ROW_RESIDENT, &load.resident_tokens.to_le_bytes());
+        put(row, ROW_PAIR_CLASS, &c.pair_class.to_le_bytes());
+        put(row, ROW_ADMITTED_AGE, &held.admitted_age_ms.to_le_bytes());
+        put(row, ROW_REPORT_AGE, &load.report_age_ms.to_le_bytes());
+        put(row, ROW_INDEXED_GROWTH, &held.indexed_growth.to_le_bytes());
+        put(row, ROW_LIVE_RATE, &load.live_rate.to_le_bytes());
+        put(row, ROW_MAX_RUNNING, &load.max_running.to_le_bytes());
+        put(row, ROW_KV_USAGE, &load.kv_usage_permille.to_le_bytes());
+        put(row, ROW_ACTIVE_KV, &load.active_kv_permille.to_le_bytes());
+        put(row, ROW_DP_RANK, &c.dp_rank.to_le_bytes());
+        put(row, ROW_DP_SIZE, &c.dp_size.to_le_bytes());
+        put(row, ROW_ZONE, &c.zone.to_le_bytes());
+        put(row, ROW_ENGINE_KIND, &c.engine_kind.to_le_bytes());
+        put(row, ROW_CONNECTOR, &c.connector.to_le_bytes());
+        put(
+            row,
+            ROW_SESSION_IN_FLIGHT,
+            &c.session_in_flight.to_le_bytes(),
+        );
+        row[ROW_HEALTH] = health_bits(c.health);
+        row[ROW_WIRE_MODES] = c.wire_modes.bits();
+        row[ROW_ROLE] = c.role as u8;
+        row[ROW_SOURCE] = load.source as u8;
+        row[ROW_BITS] = bits([
+            (c.session_hit, BIT_SESSION_HIT),
+            (c.has_capacity, BIT_HAS_CAPACITY),
+            (c.has_room, BIT_HAS_ROOM),
+            (c.ec_compatible, BIT_EC_COMPATIBLE),
+            (c.vision, BIT_VISION),
+            (c.host_local, BIT_HOST_LOCAL),
+            (c.load.is_some(), BIT_LOAD_PRESENT),
+        ]);
+        put(row, ROW_ACTIVE_SESSIONS, &c.active_sessions.to_le_bytes());
+        put(row, ROW_KEY, &c.key.to_le_bytes());
+        put(row, ROW_LABELS, &c.labels.to_le_bytes());
+        put(row, ROW_INDEXED_BLOCKS, &held.indexed_blocks.to_le_bytes());
     }
 
     fn fill_pool(&mut self, pool: &PoolFacts<'_>) {
@@ -791,12 +872,16 @@ impl Packed {
 }
 
 /// The packed block's identity fields: the fingerprint under both the hash
-/// and the plain form (`0` withheld), and the plain string when it crosses.
-fn packed_identity<'a>(id: &wit::Identity<'a>, hash: u64) -> (u64, Option<&'a str>) {
+/// and the plain form (`0` withheld), and the plain string when it crosses;
+/// `hash` makes the fingerprint the plain form carries beside its string.
+fn packed_identity<'a>(
+    id: &wit::Identity<'a>,
+    hash: impl FnOnce() -> u64,
+) -> (u64, Option<&'a str>) {
     match id {
         wit::Identity::None => (0, None),
         wit::Identity::Hash(h) => (*h, None),
-        wit::Identity::Plain(plain) => (hash, Some(plain)),
+        wit::Identity::Plain(plain) => (hash(), Some(plain)),
     }
 }
 
@@ -814,7 +899,7 @@ pub(crate) fn lease(l: &Lease, exposure: &Exposure) -> wit::Lease {
         generation: l.generation,
         session_key: match exposure.session_key {
             Reveal::None => 0,
-            Reveal::Hash | Reveal::Plain => l.session_key,
+            Reveal::Hash | Reveal::Plain => l.session.get(),
         },
         tokens: l.tokens,
     }
@@ -846,7 +931,7 @@ pub(crate) fn targets(decision: &Decision, out: &mut [wit::Target; MAX_TARGETS])
     }
 }
 
-pub(crate) fn transport_class(c: TransportClass) -> wit::TransportClass {
+fn transport_class(c: TransportClass) -> wit::TransportClass {
     match c {
         TransportClass::Ok => wit::TransportClass::Ok,
         TransportClass::ClientError => wit::TransportClass::ClientError,
@@ -884,11 +969,15 @@ pub(crate) fn release_reason(r: ReleaseReason) -> wit::ReleaseReason {
     }
 }
 
+/// A membership word as the guest's world carries it. `None` for
+/// [`Membership::Left`]: the world has no case for it, and a guest hears
+/// the write's own word, said beside it.
 pub(crate) fn membership<'a>(
     m: &Membership<'_>,
     snapshot: &'a mut Vec<u64>,
-) -> wit::Membership<'a> {
-    match m {
+) -> Option<wit::Membership<'a>> {
+    Some(match m {
+        Membership::Left { .. } => return None,
         Membership::Added(w) => wit::Membership::Added(w.0),
         Membership::Removed(w) => wit::Membership::Removed(w.0),
         Membership::Replaced { old, new } => wit::Membership::Replaced((old.0, new.0)),
@@ -899,7 +988,7 @@ pub(crate) fn membership<'a>(
             snapshot.extend(workers.iter().map(|w| w.0));
             wit::Membership::Snapshot(snapshot)
         }
-    }
+    })
 }
 
 /// A signal; a veto's instant on the host's clock becomes the microseconds
@@ -926,7 +1015,8 @@ pub(crate) fn signal(s: &Signal, now_micros: u64) -> wit::Signal {
 mod tests {
     use super::{layout::*, *};
     use crate::{
-        view::{Header, MediaCounts, WorkerId},
+        spec::MAX_BLOCK_HASHES,
+        view::{Header, MediaCounts, NamedAffinity, NamedHolder, WorkerId},
         wasm::config::HeaderSet,
     };
 
@@ -954,20 +1044,17 @@ mod tests {
                 active_kv_permille: 12,
                 live_rate: 13,
                 resident_tokens: 14,
+                resident_counted: true,
                 report_age_ms: 15,
                 source: SignalSource::Relay,
                 max_running: 16,
             }),
             load_sampled_at_micros: 99,
-            overlap_blocks: 17,
-            predicted_blocks: 18,
             session_hit: true,
             session_in_flight: 19,
             pair_class: 20,
             has_capacity: false,
             has_room: true,
-            admitted_age_ms: 21,
-            indexed_growth: 22,
             zone: 23,
             labels: 0xff00,
             ec_compatible: true,
@@ -975,6 +1062,16 @@ mod tests {
             host_local: true,
             active_sessions: 24,
             key: 25,
+        }
+    }
+
+    /// The affinity facts the host holds for [`candidate_row`], beside it.
+    fn candidate_held() -> AffinityFacts {
+        AffinityFacts {
+            overlap_blocks: 17,
+            predicted_blocks: 18,
+            admitted_age_ms: 21,
+            indexed_growth: 22,
             indexed_blocks: 26,
         }
     }
@@ -996,7 +1093,7 @@ mod tests {
     #[test]
     fn the_record_row_carries_every_field_and_the_flags_by_name() {
         let c = candidate_row();
-        let r = candidate(&c);
+        let r = candidate(&c, candidate_held(), c.in_flight);
         assert_eq!(r.id, c.id.0);
         assert_eq!(r.role, wit::Role::Decode);
         assert!(r
@@ -1016,14 +1113,124 @@ mod tests {
             (r.labels, r.key, r.active_sessions, r.indexed_blocks),
             (0xff00, 25, 24, 26)
         );
+        assert_eq!(
+            (
+                r.overlap_blocks,
+                r.predicted_blocks,
+                r.admitted_age_ms,
+                r.indexed_growth
+            ),
+            (17, 18, 21, 22)
+        );
         assert_eq!(health_bits(c.health), 0b1_0001);
+    }
+
+    /// The record fill reads each row's entry of the request's column by the
+    /// row's index, as the packed fill does.
+    #[test]
+    fn the_record_fill_gives_each_row_its_own_entry_of_the_column() {
+        let column = [AffinityFacts::default(), candidate_held()];
+        let facts = RequestFacts {
+            affinity: &column,
+            ..RequestFacts::default()
+        };
+        let mut records = Records::default();
+        records.fill(
+            &facts,
+            &[Candidate::default(), candidate_row()],
+            &PoolFacts::default(),
+        );
+        let held = |r: &wit::Candidate| {
+            (
+                r.overlap_blocks,
+                r.predicted_blocks,
+                r.admitted_age_ms,
+                r.indexed_growth,
+                r.indexed_blocks,
+            )
+        };
+        assert_eq!(held(&records.candidates[0]), (0, 0, 0, 0, 0));
+        assert_eq!(held(&records.candidates[1]), (17, 18, 21, 22, 26));
+    }
+
+    /// Rows a host named in the column's place reach a guest as a column
+    /// would, on the record form and the packed one: a holder's row carries
+    /// its depth and every other row nothing.
+    #[test]
+    fn both_fills_give_a_named_holder_its_depth_and_every_other_row_nothing() {
+        let facts = RequestFacts {
+            named: Some(NamedAffinity {
+                holders: &[NamedHolder {
+                    row: 1,
+                    overlap_blocks: 17,
+                    predicted_blocks: 0,
+                }],
+                ..NamedAffinity::default()
+            }),
+            ..RequestFacts::default()
+        };
+        let rows = [Candidate::default(), candidate_row(), Candidate::default()];
+        let mut records = Records::default();
+        records.fill(&facts, &rows, &PoolFacts::default());
+        let record: Vec<u32> = records
+            .candidates
+            .iter()
+            .map(|r| r.overlap_blocks)
+            .collect();
+        assert_eq!(record, vec![0, 17, 0]);
+        let mut packed = Packed::default();
+        packed.fill_candidates(&facts, &rows);
+        let packed: Vec<u32> = packed
+            .candidates
+            .as_chunks::<ROW>()
+            .0
+            .iter()
+            .map(|row| le_u32(row, ROW_OVERLAP))
+            .collect();
+        assert_eq!(packed, vec![0, 17, 0]);
+    }
+
+    /// Both fills carry each candidate's requests in flight as the
+    /// request's facts read them: the lent count where the host lends a
+    /// table, the rows themselves reading zero.
+    #[test]
+    fn both_fills_give_a_row_the_count_its_request_reads() {
+        use crate::counts::tests::Lent;
+        let mut rows = [Candidate::default(), candidate_row(), Candidate::default()];
+        for (row, position) in rows.iter_mut().zip(0..) {
+            row.position = position;
+        }
+        rows[2].in_flight = 3;
+        let lent = Lent::take(&mut rows);
+        let facts = lent.beside(&RequestFacts::default());
+        let mut records = Records::default();
+        records.fill(&facts, &rows, &PoolFacts::default());
+        let record: Vec<u32> = records.candidates.iter().map(|r| r.in_flight).collect();
+        assert_eq!(record, vec![0, 7, 3]);
+        let mut packed = Packed::default();
+        packed.fill_candidates(&facts, &rows);
+        let packed: Vec<u32> = packed
+            .candidates
+            .as_chunks::<ROW>()
+            .0
+            .iter()
+            .map(|row| le_u32(row, ROW_IN_FLIGHT))
+            .collect();
+        assert_eq!(packed, vec![0, 7, 3]);
     }
 
     #[test]
     fn the_packed_row_puts_every_field_at_the_tables_offset() {
         let c = candidate_row();
         let mut packed = Packed::default();
-        packed.fill_candidates(&[Candidate::default(), c]);
+        // The second row's affinity facts are the second entry of the
+        // request's column: one index reads the row and its entry.
+        let column = [AffinityFacts::default(), candidate_held()];
+        let facts = RequestFacts {
+            affinity: &column,
+            ..RequestFacts::default()
+        };
+        packed.fill_candidates(&facts, &[Candidate::default(), c]);
         assert_eq!(packed.candidates.len(), 2 * ROW);
         let row = &packed.candidates[ROW..];
         assert_eq!(le_u64(row, ROW_ID), c.id.0);
@@ -1067,6 +1274,150 @@ mod tests {
             0,
             "no load row: the bit is clear"
         );
+        // The first row reads the column's first entry, which holds nothing:
+        // a fill that gave every row one entry would write the second's here.
+        let held = [
+            ROW_OVERLAP,
+            ROW_PREDICTED,
+            ROW_ADMITTED_AGE,
+            ROW_INDEXED_GROWTH,
+            ROW_INDEXED_BLOCKS,
+        ]
+        .map(|at| le_u32(empty, at));
+        assert_eq!(held, [0; 5]);
+    }
+
+    /// An empty column is nothing held by any candidate: the five read zero
+    /// in every row, and the rest of each row is written.
+    #[test]
+    fn the_packed_fill_reads_an_empty_column_as_nothing_held() {
+        let c = candidate_row();
+        let mut packed = Packed::default();
+        packed.fill_candidates(&RequestFacts::default(), &[c, c]);
+        assert_eq!(packed.candidates.len(), 2 * ROW);
+        for row in packed.candidates.as_chunks::<ROW>().0 {
+            assert_eq!(le_u64(row, ROW_ID), c.id.0);
+            let held = [
+                ROW_OVERLAP,
+                ROW_PREDICTED,
+                ROW_ADMITTED_AGE,
+                ROW_INDEXED_GROWTH,
+                ROW_INDEXED_BLOCKS,
+            ]
+            .map(|at| le_u32(row, at));
+            assert_eq!(held, [0; 5]);
+        }
+    }
+
+    /// A column that holds an entry holds one a candidate. One that ends
+    /// before the candidates is a host's mistake and fails the fill, as an
+    /// index past its end does: a fill that stopped where the column ends
+    /// would hand the guest rows of zeros for the candidates left.
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn the_packed_fill_fails_on_a_column_that_ends_before_the_candidates() {
+        let column = [candidate_held()];
+        let facts = RequestFacts {
+            affinity: &column,
+            ..RequestFacts::default()
+        };
+        Packed::default().fill_candidates(&facts, &[Candidate::default(), candidate_row()]);
+    }
+
+    /// Both forms carry the request's block hashes for a row that declares
+    /// them, in the token form or the text form, the first
+    /// [`MAX_BLOCK_HASHES`] of a longer list, and none for a row that
+    /// declares neither, whatever else it declares.
+    #[test]
+    fn a_view_carries_the_block_hashes_its_row_declares() {
+        let most = usize::try_from(MAX_BLOCK_HASHES).expect("the range fits a length");
+        let longer: Vec<u64> = (0..=u64::from(MAX_BLOCK_HASHES)).collect();
+        let facts = RequestFacts {
+            block_hashes: &longer,
+            ..RequestFacts::default()
+        };
+        let token = Needs {
+            token_hashes: true,
+            ..Needs::default()
+        };
+        let text = Needs {
+            text_hashes: true,
+            ..Needs::default()
+        };
+        let neither = Needs {
+            text: true,
+            loads: true,
+            events: true,
+            affinity: true,
+            ..Needs::default()
+        };
+        for (needs, carried) in [
+            (Needs::default(), 0),
+            (neither, 0),
+            (token, most),
+            (text, most),
+        ] {
+            let record = request(&facts, &Exposure::default(), needs, &[], &[]);
+            assert_eq!(record.block_hashes, &longer[..carried], "{needs:?}");
+            let mut packed = Packed::default();
+            packed
+                .fill_request(&facts, &Exposure::default(), needs)
+                .expect("the request packs");
+            let b = &packed.request;
+            assert_eq!(usize::from(le_u16(b, REQ_HASH_COUNT)), carried, "{needs:?}");
+            // No name, no tried id, no header: the hashes are the block's tail.
+            assert_eq!(b.len(), HEADER + 8 * carried, "{needs:?}");
+            // Every hash at its own eight bytes, in the list's order.
+            let read: Vec<u64> = (0..carried).map(|i| le_u64(b, HEADER + 8 * i)).collect();
+            assert_eq!(read, &longer[..carried], "{needs:?}");
+        }
+        // A list inside the range is carried whole.
+        let short = RequestFacts {
+            block_hashes: &longer[..3],
+            ..RequestFacts::default()
+        };
+        let record = request(&short, &Exposure::default(), token, &[], &[]);
+        assert_eq!(record.block_hashes, &longer[..3]);
+    }
+
+    /// The two u64 sections are written a section at a time: every hash and
+    /// every tried id sits at its own eight bytes, little-endian and in
+    /// order, the tried ids after the hashes, at any length of either, in
+    /// a block that held a longer request before.
+    #[test]
+    fn the_packed_sections_hold_every_value_at_its_own_eight_bytes() {
+        let value = |i: u64| (i + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let needs = Needs {
+            token_hashes: true,
+            ..Needs::default()
+        };
+        let mut packed = Packed::default();
+        for (hash_count, tried_count) in [(257, 2), (0, 0), (1, 0), (0, 1), (3, 5)] {
+            let hashes: Vec<u64> = (0..hash_count).map(value).collect();
+            let tried: Vec<WorkerId> = (0..tried_count)
+                .map(|i| WorkerId(value(1_000 + i)))
+                .collect();
+            let facts = RequestFacts {
+                model: "m",
+                block_hashes: &hashes,
+                tried: &tried,
+                ..RequestFacts::default()
+            };
+            packed
+                .fill_request(&facts, &Exposure::default(), needs)
+                .expect("the request packs");
+            let b = &packed.request;
+            // A name of one byte: the sections start at the next multiple of 8.
+            let at = (HEADER + 1).next_multiple_of(8);
+            assert_eq!(b.len(), at + 8 * (hashes.len() + tried.len()));
+            let read: Vec<u64> = (at..b.len()).step_by(8).map(|i| le_u64(b, i)).collect();
+            let wanted: Vec<u64> = hashes
+                .iter()
+                .copied()
+                .chain(tried.iter().map(|t| t.0))
+                .collect();
+            assert_eq!(read, wanted, "{hash_count} hashes, {tried_count} tried ids");
+        }
     }
 
     #[test]
@@ -1086,6 +1437,7 @@ mod tests {
         ];
         let facts = RequestFacts {
             model: "twelve-bytes",
+            model_fingerprint: crate::ModelFingerprint::NONE,
             namespace_seed: 1,
             tenant: Identity::plain("acme"),
             priority: -7,
@@ -1109,15 +1461,27 @@ mod tests {
             seed: 9,
             block_size: 16,
             now_micros: 0,
+            pinned_at: 0,
+            lent_in_flight: None,
+            session_counted: false,
+            // Host-only: the request block carries no affinity column and
+            // no rows named in its place.
+            affinity: &[],
+            named: None,
         };
         let exposure = Exposure {
             tenant: Reveal::Plain,
             session_key: Reveal::Hash,
             headers: HeaderSet::of([2]),
         };
+        // The row declares the hashes this request carries.
+        let text_hashes = Needs {
+            text_hashes: true,
+            ..Needs::default()
+        };
         let mut packed = Packed::default();
         packed
-            .fill_request(&facts, &exposure)
+            .fill_request(&facts, &exposure, text_hashes)
             .expect("the request packs");
         let b = &packed.request;
         assert_eq!(le_u16(b, REQ_MODEL_LEN), 12);
@@ -1135,7 +1499,11 @@ mod tests {
         assert_eq!(&b[132..136], b"acme");
         assert_eq!(b.len(), 136);
         assert_eq!(le_u64(b, REQ_TENANT), facts.tenant.hash);
-        assert_eq!(le_u64(b, REQ_SESSION_KEY), facts.session_key.hash);
+        assert_eq!(
+            le_u64(b, REQ_SESSION_KEY),
+            facts.session().get(),
+            "the session's value, as a lease of the request carries it"
+        );
         assert_eq!(
             b[REQ_BITS],
             REQ_BIT_STREAMING | REQ_BIT_TENANT_PLAIN,
@@ -1157,7 +1525,7 @@ mod tests {
             block_size: 16,
             ..RequestFacts::default()
         };
-        let record = request(&facts, &Exposure::default(), &[], &[]);
+        let record = request(&facts, &Exposure::default(), Needs::default(), &[], &[]);
         assert_eq!((record.seed, record.block_size), (9, 16));
     }
 
@@ -1176,19 +1544,19 @@ mod tests {
         };
         let mut packed = Packed::default();
         packed
-            .fill_request(&facts, &exposure)
+            .fill_request(&facts, &exposure, Needs::default())
             .expect("the request packs");
         assert_eq!(le_u64(&packed.request, REQ_TENANT), 0);
         assert_eq!(
             le_u64(&packed.request, REQ_SESSION_KEY),
-            77,
-            "plain asked, hash held: the fingerprint crosses"
+            facts.session().get(),
+            "plain asked, hash held: the session's value crosses"
         );
         assert_eq!(packed.request[REQ_BITS], 0);
         assert_eq!(identity(&facts.tenant, Reveal::None), wit::Identity::None);
         assert_eq!(
-            identity(&facts.session_key, Reveal::Plain),
-            wit::Identity::Hash(77)
+            session_identity(&facts, Reveal::Plain),
+            wit::Identity::Hash(facts.session().get())
         );
         assert_eq!(
             identity(&facts.tenant, Reveal::Plain),
@@ -1200,6 +1568,67 @@ mod tests {
         );
     }
 
+    /// The exposure is asked before the session is made: a plugin that is
+    /// not shown the session key costs the request no session, and neither
+    /// does a plain key in the record form. The carried fingerprint here is
+    /// another name's, which stops a debug build wherever the session is
+    /// made, so no form below made one.
+    #[test]
+    fn a_session_key_the_plugin_is_not_shown_makes_no_session() {
+        let facts = RequestFacts {
+            model: "model-a",
+            model_fingerprint: crate::ModelFingerprint::of("model-b"),
+            session_key: Identity::plain("conversation-7"),
+            ..RequestFacts::default()
+        };
+        let withheld = Exposure {
+            session_key: Reveal::None,
+            ..Exposure::default()
+        };
+        let record = request(&facts, &withheld, Needs::default(), &[], &[]);
+        assert_eq!(record.session_key, wit::Identity::None);
+        let mut packed = Packed::default();
+        packed
+            .fill_request(&facts, &withheld, Needs::default())
+            .expect("the request packs");
+        assert_eq!(le_u64(&packed.request, REQ_SESSION_KEY), 0);
+        let plain = Exposure {
+            session_key: Reveal::Plain,
+            ..Exposure::default()
+        };
+        let record = request(&facts, &plain, Needs::default(), &[], &[]);
+        assert_eq!(record.session_key, wit::Identity::Plain("conversation-7"));
+    }
+
+    /// A plain session key under the plain exposure packs the session's
+    /// value beside its string: the number a lease of the request carries,
+    /// so a plugin shown the key matches the two. The key's own fingerprint
+    /// is another number, and the case tells them apart.
+    #[test]
+    fn a_plain_session_key_packs_the_sessions_value_beside_its_string() {
+        let facts = RequestFacts {
+            model: "m",
+            session_key: Identity::plain("conversation-7"),
+            ..RequestFacts::default()
+        };
+        let exposure = Exposure {
+            session_key: Reveal::Plain,
+            ..Exposure::default()
+        };
+        let mut packed = Packed::default();
+        packed
+            .fill_request(&facts, &exposure, Needs::default())
+            .expect("the request packs");
+        let b = &packed.request;
+        let session = facts.session().get();
+        assert_ne!(session, facts.session_key.hash);
+        assert_eq!(le_u64(b, REQ_SESSION_KEY), session);
+        assert_eq!(b[REQ_BITS], REQ_BIT_SESSION_PLAIN);
+        // The string follows the model's padded section: (len u16, bytes).
+        assert_eq!(le_u16(b, HEADER + 8), 14);
+        assert_eq!(&b[HEADER + 10..], b"conversation-7");
+    }
+
     #[test]
     fn a_name_past_the_u16_bound_is_too_long_for_the_packed_form() {
         let long = "x".repeat(usize::from(u16::MAX) + 1);
@@ -1209,7 +1638,7 @@ mod tests {
         };
         let mut packed = Packed::default();
         assert_eq!(
-            packed.fill_request(&facts, &Exposure::default()),
+            packed.fill_request(&facts, &Exposure::default(), Needs::default()),
             Err(TooLong)
         );
     }
@@ -1235,6 +1664,9 @@ mod tests {
             regime: OverloadRegime::Partial,
             generation: 7,
             zones: &zones,
+            reach: 0,
+            reported: false,
+            ..PoolFacts::default()
         };
         let mut packed = Packed::default();
         packed.fill_pool(&pool);
@@ -1257,5 +1689,31 @@ mod tests {
         };
         assert_eq!(signal(&veto, 1_000), wit::Signal::GatewayVeto((4, 500)));
         assert_eq!(signal(&veto, 2_000), wit::Signal::GatewayVeto((4, 0)));
+    }
+
+    /// A dispatch on another target of its pick is told with a lease that
+    /// names that target's index, and the guest's lease record carries it.
+    #[test]
+    fn a_lease_record_names_the_index_of_its_lease() {
+        let told = Lease {
+            target_index: 1,
+            ..Lease::default()
+        };
+        assert_eq!(lease(&told, &Exposure::default()).target_index, 1);
+    }
+
+    /// The guest's world has no case for the models a worker left: the
+    /// mapper hands a guest nothing for that word, and the write's own word
+    /// as before.
+    #[test]
+    fn a_guest_is_told_nothing_of_the_models_a_worker_left() {
+        let (id, models) = (WorkerId(7), ["m".to_string()]);
+        let left = Membership::Left {
+            id,
+            models: &models,
+        };
+        let mut snapshot = Vec::new();
+        assert!(membership(&left, &mut snapshot).is_none());
+        assert!(membership(&Membership::Relabelled(id), &mut snapshot).is_some());
     }
 }

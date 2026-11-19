@@ -24,7 +24,8 @@ pub mod proto {
 
 /// Streaming `generate()` response that auto-aborts on drop. Concrete
 /// alias for the generic `crate::AbortOnDropStream`.
-pub type AbortOnDropStream = crate::AbortOnDropStream<proto::GenerateResponse, MlxEngineClient>;
+pub type AbortOnDropStream =
+    crate::AbortOnDropStream<Box<proto::GenerateResponse>, MlxEngineClient>;
 
 /// gRPC client for MLX engine
 #[derive(Clone)]
@@ -41,7 +42,9 @@ impl MlxEngineClient {
     crate::impl_engine_client_basics!(
         proto,
         proto::mlx_engine_client::MlxEngineClient<Channel>,
-        "MLX"
+        "MLX",
+        "mlx.grpc.engine.MlxEngine",
+        proto::mlx_engine_server::SERVICE_NAME
     );
 
     crate::impl_abort_without_reason!(proto);
@@ -302,7 +305,10 @@ impl MlxEngineClient {
             logprobs,
             logit_bias: logit_bias_by_token_id(request.logit_bias.as_ref()),
             // The engine behind this wire seeds an unsigned word: never a negative value.
-            seed: request.seed.map(non_negative_seed_i32),
+            seed: request
+                .sampling_seed
+                .map(non_negative_folded_i32)
+                .or_else(|| request.seed.map(non_negative_seed_i32)),
         }
     }
 
@@ -322,7 +328,10 @@ impl MlxEngineClient {
             ignore_eos: request.ignore_eos,
             logprobs,
             logit_bias: logit_bias_by_token_id(request.logit_bias.as_ref()),
-            seed: request.seed.map(non_negative_seed_i32),
+            seed: request
+                .sampling_seed
+                .map(non_negative_folded_i32)
+                .or_else(|| request.seed.map(non_negative_seed_i32)),
         }
     }
 
@@ -445,6 +454,34 @@ mod tests {
         assert_eq!(chat(Some(i64::MAX)), Some(0));
         assert_eq!(chat(Some(1 << 31)), Some(0));
         assert_eq!(chat(None), None);
+    }
+
+    /// A chat or completion request's `sampling_seed` reaches the wire non-negative, as on the
+    /// plain route, and wins over `seed` when a request sets both; `seed` alone still arrives.
+    #[test]
+    fn chat_and_completion_sampling_seed_reaches_the_engine_request() {
+        let chat = |sampling_seed: Option<u64>, seed: Option<i64>| {
+            let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                "model": "m", "messages": [{"role": "user", "content": "hi"}],
+                "sampling_seed": sampling_seed, "seed": seed
+            }))
+            .expect("a chat request");
+            MlxEngineClient::build_sampling_params_from_chat(&request).seed
+        };
+        let completion = |sampling_seed: Option<u64>, seed: Option<i64>| {
+            let request: CompletionRequest = serde_json::from_value(serde_json::json!({
+                "model": "m", "prompt": "hi", "sampling_seed": sampling_seed, "seed": seed
+            }))
+            .expect("a completion request");
+            MlxEngineClient::build_sampling_params_from_completion(&request).seed
+        };
+        let both =
+            |sampling_seed, seed| (chat(sampling_seed, seed), completion(sampling_seed, seed));
+        assert_eq!(both(Some(7), None), (Some(7), Some(7)));
+        assert_eq!(both(Some(7), Some(42)), (Some(7), Some(7)));
+        assert_eq!(both(Some(u64::MAX), None), (Some(0), Some(0)));
+        assert_eq!(both(None, Some(42)), (Some(42), Some(42)));
+        assert_eq!(both(None, None), (None, None));
     }
 
     #[tokio::test]

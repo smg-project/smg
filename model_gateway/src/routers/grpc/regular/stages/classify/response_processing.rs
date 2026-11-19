@@ -21,7 +21,9 @@ use crate::routers::{
     error,
     grpc::{
         common::stages::ProcessStage,
-        context::{DispatchContext, ExecutionResult, FinalResponse, WorkerSelection},
+        context::{
+            wrong_response_spec, DispatchContext, ExecutionResult, FinalResponse, WorkerSelection,
+        },
         spec::ResponseSpec,
     },
 };
@@ -107,12 +109,6 @@ impl ClassifyResponseProcessingStage {
     }
 }
 
-impl Default for ClassifyResponseProcessingStage {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[async_trait]
 impl ProcessStage for ClassifyResponseProcessingStage {
     async fn process(
@@ -121,13 +117,8 @@ impl ProcessStage for ClassifyResponseProcessingStage {
         spec: ResponseSpec,
     ) -> Result<Option<Response>, Response> {
         if !matches!(spec, ResponseSpec::Classify) {
-            error!(
-                function = "ClassifyResponseProcessingStage::process",
-                "Wrong response spec"
-            );
-            return Err(error::internal_error(
-                "wrong_response_spec",
-                "Wrong response spec",
+            return Err(wrong_response_spec(
+                "ClassifyResponseProcessingStage::process",
             ));
         }
 
@@ -185,7 +176,7 @@ impl ProcessStage for ClassifyResponseProcessingStage {
         }
 
         // Get dispatch metadata
-        let dispatch = ctx.dispatch.as_ref().ok_or_else(|| {
+        let dispatch = ctx.dispatch.take().ok_or_else(|| {
             error!(
                 function = "ClassifyResponseProcessingStage::process",
                 "Dispatch metadata missing"
@@ -204,8 +195,8 @@ impl ProcessStage for ClassifyResponseProcessingStage {
 
         // Build response
         let response = ClassifyResponse::new(
-            dispatch.request_id.clone(),
-            dispatch.model.clone(),
+            dispatch.request_id,
+            dispatch.model,
             dispatch.created,
             data,
             usage,

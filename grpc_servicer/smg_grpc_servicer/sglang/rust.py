@@ -86,12 +86,16 @@ from smg_grpc_servicer.rust_lifecycle import (  # noqa: F401
     apply_kv_events_default,
     ensure_spawn_start_method,
     on_fault_signal,
-    resolve_tokenizer_dir,
     servicer_switch,
 )
 from smg_grpc_servicer.sglang import METRICS_HOST_ENV, METRICS_PORT_ENV
 from smg_grpc_servicer.sglang.config_view import EngineConfigView
 from smg_grpc_servicer.sglang.lora import PreloadedLoras
+from smg_grpc_servicer.sglang.model_artifacts import (
+    local_metadata_source,
+    prepare_model_metadata,
+    tokenizer_dir_for,
+)
 from smg_grpc_servicer.sglang.warmup import WARMUP_ENV, media_warmup, warmup_inputs, warmup_wire
 
 logger = logging.getLogger(__name__)
@@ -391,7 +395,7 @@ def launch_scheduler_ranks(
     from sglang.srt.plugins import load_plugins
     from sglang.srt.runtime_context import publish
     from sglang.srt.server_args import PortArgs
-    from sglang.srt.utils import configure_logger
+    from sglang.srt.utils import common, configure_logger
 
     from smg_grpc_servicer.sglang.zmq_plugin import ENGINE_INDEX_ENV, HANDSHAKE_ENV
 
@@ -400,6 +404,9 @@ def launch_scheduler_ranks(
     os.environ[ENGINE_INDEX_ENV] = "0"
     configure_logger(server_args)
     server_args.resolve_once()
+    # The gRPC entrypoint may already own the metrics directory. Native setup
+    # replaces that owner; keep its root alive while the scheduler uses it.
+    metrics_dir_owner = getattr(common, "prometheus_multiproc_dir", None)
     _set_envs_and_config(server_args)
     ensure_spawn_start_method("SGLang scheduler")
     load_plugins()
@@ -415,7 +422,11 @@ def launch_scheduler_ranks(
     # context they read, before the ranks; held the same way.
     if encode_bridge is not None:
         encode_bridge.start()
-    held = [server for server in (bootstrap_server, encode_bridge) if server is not None]
+    held = [
+        resource
+        for resource in (metrics_dir_owner, bootstrap_server, encode_bridge)
+        if resource is not None
+    ]
     port_args = PortArgs.init_new(server_args)
     # The fault handler goes in before the spawner starts a rank: a rank that
     # fails during its start signals its parent at once.
@@ -439,15 +450,14 @@ def launch_scheduler_ranks(
     return engine
 
 
-def tokenizer_dir_for(server_args: Any) -> str | None:
-    """The local tokenizer directory for the served model, or ``None``."""
-    args = EngineConfigView(server_args).server_args
-    return resolve_tokenizer_dir(str(args.tokenizer_path or args.model_path), args.revision)
-
-
 # ---------------------------------------------------------------------------
 # Lifecycle
 # ---------------------------------------------------------------------------
+
+
+# The engine's switch under which a decode side asks the bootstrap server for
+# a request's prefill rank instead of deriving it from the room.
+FORCE_QUERY_PREFILL_DP_RANK_ENV = "SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK"
 
 
 def refuse_epd_disaggregation(server_args: Any) -> None:
@@ -465,15 +475,16 @@ def refuse_epd_disaggregation(server_args: Any) -> None:
     fields; :func:`start_bootstrap_server`) on a side of any number of
     scheduler ranks: the Rust servicer places a prefill side's request on the
     rank of its room (``bootstrap_room % dp_size``, where the decode side looks
-    for the KV) and a decode side's on its pinned rank. One prefill shape is
-    refused whatever its load-balance method and environment: several plain
-    data-parallel replicas (``--dp-size N`` without attention DP), where every
-    replica reports attention-DP rank 0 to the engine's KV sender; following
-    the room, the sender fails each request whose room's residue is not 0, and
-    under any other method or the engine's force-query switch it registers
-    rank 0, so the decode side bootstraps against replica 0 for every request
-    that ran elsewhere; attention DP (``--tp-size N --attn-dp-size N``) is the
-    multi-rank prefill shape."""
+    for the KV) and a decode side's on its pinned rank. Plain data-parallel
+    replicas (``--dp-size N`` without attention DP) are such a prefill side
+    only when they follow the room (``auto`` is that on a prefill side): each
+    request then names its replica to the engine's KV sender (to which every
+    replica is attention-DP rank 0) and the decode side derives the replica
+    from the room. Under any other load-balance method the decode side waits
+    for a rank the sender never registers for a named request, so that launch
+    is refused. So is one with the engine's force-query switch on: the value
+    that breaks the shape is the decode side's, which this process cannot
+    see, and its own, read as the engine reads it, stands in for it."""
     args = EngineConfigView(server_args).server_args
     if args.encoder_only:
         raise ServicerConfigError(
@@ -498,13 +509,20 @@ def refuse_epd_disaggregation(server_args: Any) -> None:
         args.disaggregation_mode == "prefill"
         and args.scheduler_count > 1
         and args.attention_dp_width == 1
+        and (
+            args.load_balance_method not in ("auto", "follow_bootstrap_room")
+            or os.environ.get(FORCE_QUERY_PREFILL_DP_RANK_ENV, "").strip().lower()
+            in ("true", "1", "yes", "y")
+        )
     ):
         raise ServicerConfigError(
-            f"a prefill side of {args.scheduler_count} plain data-parallel replicas is not served: "
-            "each replica reports attention-DP rank 0 to the engine's KV sender, which fails every "
-            "request whose bootstrap_room % dp_size is not 0 when it follows the room, and "
-            "registers rank 0 for the decode side's bootstrap under any other load-balance "
-            "method; run attention DP (--tp-size N --attn-dp-size N) or one rank per side"
+            f"a prefill side of {args.scheduler_count} plain data-parallel replicas is served only "
+            "when it follows the room (load_balance_method 'auto' or 'follow_bootstrap_room', here "
+            f"{args.load_balance_method!r}) with {FORCE_QUERY_PREFILL_DP_RANK_ENV} off (read here "
+            "in place of the decode side's, which is the one that matters): otherwise the decode "
+            "side waits for a prefill rank the engine's KV sender never registers for a request "
+            "that names its rank; run attention DP (--tp-size N --attn-dp-size N) or one rank "
+            "per side"
         )
 
 
@@ -556,6 +574,9 @@ class SglangLauncher(RustLauncher):
     without_tokenizer = "GetTokenizer will be unavailable"
     warmup_env = WARMUP_ENV
 
+    def prepare(self, args: Any) -> None:
+        prepare_model_metadata(args)
+
     def kv_events_default(self, args: Any) -> str | None:
         return default_kv_events_config(args)
 
@@ -605,7 +626,7 @@ class SglangLauncher(RustLauncher):
             configure_threads()
             return {
                 "smg_media_processor": {
-                    "model_dir": str(args.model_path),
+                    "model_dir": local_metadata_source(str(args.model_path)),
                     "model_id": str(args.model_path),
                     "encoder_dtype": dtype,
                     "source": "env",

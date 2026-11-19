@@ -22,13 +22,15 @@ pub type Result<T> = std::result::Result<T, TransformError>;
 
 /// Extract RGB pixel data from a DynamicImage, avoiding a copy when already RGB8.
 /// Returns (width, height, raw_bytes) where raw_bytes is interleaved R,G,B,R,G,B,...
+/// and exactly `3 * width * height` long: an RGB8 image's container may be
+/// longer than its pixels (`ImageBuffer::from_raw` takes any that is long
+/// enough), and the bytes behind them are not the image.
 pub fn rgb_bytes(image: &DynamicImage) -> (usize, usize, std::borrow::Cow<'_, [u8]>) {
     match image {
-        DynamicImage::ImageRgb8(rgb) => (
-            rgb.width() as usize,
-            rgb.height() as usize,
-            std::borrow::Cow::Borrowed(rgb.as_raw()),
-        ),
+        DynamicImage::ImageRgb8(rgb) => {
+            let (w, h) = (rgb.width() as usize, rgb.height() as usize);
+            (w, h, std::borrow::Cow::Borrowed(&rgb.as_raw()[..3 * w * h]))
+        }
         _ => {
             let rgb = image.to_rgb8();
             let w = rgb.width() as usize;
@@ -77,23 +79,14 @@ impl Default for TransparentBgConfig {
 }
 
 impl TransparentBgConfig {
-    /// Background grey level for pixel `(x, y)`.
-    fn background_at(self, x: u32, y: u32) -> u8 {
+    /// The grey level of a flat background; `None` for the chessboard, whose
+    /// level depends on the pixel.
+    fn flat_level(self) -> Option<u8> {
         match self.pattern {
-            TransparentBgPattern::White => 255,
-            TransparentBgPattern::Black => 0,
-            TransparentBgPattern::Gray => 128,
-            TransparentBgPattern::Chessboard => {
-                // A square size of 0 would divide by zero here; the reference
-                // raises on the same input, so clamp instead of panicking.
-                let size = self.chessboard_square_size.max(1);
-                let gray_cell = u32::from(self.chessboard_square_on_top_left);
-                if (y / size + x / size) % 2 == gray_cell {
-                    self.chessboard_gray_value
-                } else {
-                    self.chessboard_white_value
-                }
-            }
+            TransparentBgPattern::White => Some(255),
+            TransparentBgPattern::Black => Some(0),
+            TransparentBgPattern::Gray => Some(128),
+            TransparentBgPattern::Chessboard => None,
         }
     }
 }
@@ -126,33 +119,80 @@ pub struct TransparentBg {
 /// reference's early return. Note that dropping alpha (what `to_rgb8` does on
 /// its own) is *not* equivalent: a fully transparent pixel usually stores RGB
 /// `(0,0,0)`, so it would read as solid black instead of as background.
+///
+/// The reference computes `a * img + (1 - a) * bg` in float32 with
+/// `a = alpha / 255`, then truncates. `a` depends on the pixel's alpha alone
+/// and `(1 - a) * bg` on the alpha and the background's level, so each is
+/// computed once per level, 256 values, and a pixel reads the two it needs.
 pub fn fill_transparent_bg(image: &DynamicImage, config: TransparentBgConfig) -> RgbImage {
     if !image.color().has_alpha() {
         return image.to_rgb8();
     }
 
-    let rgba = image.to_rgba8();
+    // An RGBA8 image is read where it is; another layout with alpha converts.
+    let converted;
+    let rgba = match image {
+        DynamicImage::ImageRgba8(rgba) => rgba,
+        other => {
+            converted = other.to_rgba8();
+            &converted
+        }
+    };
     let (width, height) = rgba.dimensions();
-    let mut out = Vec::with_capacity(width as usize * height as usize * 3);
+    let (w, h) = (width as usize, height as usize);
+    // A container may be longer than the image: the fill ends at the image's
+    // own pixels.
+    let pixels = &rgba.as_raw()[..4 * w * h];
+    // Filled run by run in the image's order; nothing is zeroed first.
+    let mut out: Vec<[u8; 3]> = Vec::with_capacity(w * h);
 
-    for (y, row) in rgba.as_raw().chunks_exact(width as usize * 4).enumerate() {
-        for (x, px) in row.as_chunks::<4>().0.iter().enumerate() {
-            let bg = f32::from(config.background_at(x as u32, y as u32));
-            let alpha = f32::from(px[3]) / 255.0;
-            let inv = 1.0 - alpha;
-            // numpy's `.astype(np.uint8)` truncates rather than rounds, and so
-            // does an `as` cast; keep them consistent.
-            out.push((alpha * f32::from(px[0]) + inv * bg) as u8);
-            out.push((alpha * f32::from(px[1]) + inv * bg) as u8);
-            out.push((alpha * f32::from(px[2]) + inv * bg) as u8);
+    let mut alpha = [0f32; 256];
+    for (a, level) in alpha.iter_mut().zip(0u8..=255) {
+        *a = f32::from(level) / 255.0;
+    }
+    let background_share = |level: u8| alpha.map(|a| (1.0 - a) * f32::from(level));
+    // numpy's `.astype(np.uint8)` truncates rather than rounds, and so does an
+    // `as` cast; keep them consistent.
+    let blend = |px: &[u8; 4], share: &[f32; 256]| {
+        let a = usize::from(px[3]);
+        [px[0], px[1], px[2]].map(|value| (alpha[a] * f32::from(value) + share[a]) as u8)
+    };
+
+    match config.flat_level() {
+        Some(level) => {
+            let share = background_share(level);
+            out.extend(pixels.as_chunks::<4>().0.iter().map(|px| blend(px, &share)));
+        }
+        None => {
+            // `bg[y, x] = gray if (y // size + x // size) % 2 == gray_cell
+            // else white`. A square size of 0 would divide by zero; the
+            // reference raises on the same input, so clamp instead of
+            // panicking. A row changes level only at a square's edge, so the
+            // level is found once per run of a square's width.
+            let size = config.chessboard_square_size.max(1) as usize;
+            let gray_cell = usize::from(config.chessboard_square_on_top_left);
+            let shares = [
+                background_share(config.chessboard_white_value),
+                background_share(config.chessboard_gray_value),
+            ];
+            // An image with no width has no rows, and a chunk of no bytes
+            // panics.
+            let stride = w.max(1);
+            for (y, row) in pixels.chunks_exact(4 * stride).enumerate() {
+                for (square, run) in row.chunks(4 * size).enumerate() {
+                    let share = &shares[usize::from((y / size + square) % 2 == gray_cell)];
+                    out.extend(run.as_chunks::<4>().0.iter().map(|px| blend(px, share)));
+                }
+            }
         }
     }
 
     #[expect(
         clippy::expect_used,
-        reason = "out holds exactly width*height*3 bytes by construction"
+        reason = "out holds exactly width*height pixels by construction"
     )]
-    RgbImage::from_raw(width, height, out).expect("buffer matches image dimensions")
+    RgbImage::from_raw(width, height, out.into_flattened())
+        .expect("buffer matches image dimensions")
 }
 
 /// Deinterleave interleaved RGB bytes into separate R, G, B f32 planes with
@@ -286,6 +326,21 @@ fn deinterleave_contiguous_by_table(
     }
 }
 
+/// [`deinterleave_rgb_to_planes_by_table`] appended to `out`, on the caller's
+/// thread: the red, green and blue planes of `rgb` in that order, each plane
+/// taken from the bytes in a pass of its own. For a batch buffer that holds
+/// several images' planes one after another: every float is written once,
+/// with no tensor of the image's own, zero fill or copy in between. It stays
+/// on the caller's thread on purpose: banding a patch across the
+/// preprocessing pool measured more CPU a request under concurrent requests.
+pub(crate) fn extend_planes_by_table(out: &mut Vec<f32>, rgb: &[u8], table: &[[f32; 256]; 3]) {
+    let [red, green, blue] = table;
+    let (pixels, _) = rgb.as_chunks::<3>();
+    out.extend(pixels.iter().map(|pixel| red[usize::from(pixel[0])]));
+    out.extend(pixels.iter().map(|pixel| green[usize::from(pixel[1])]));
+    out.extend(pixels.iter().map(|pixel| blue[usize::from(pixel[2])]));
+}
+
 /// Build a [C, H, W] f32 tensor from interleaved RGB bytes with per-channel
 /// `scale` and `bias`: `output[c][i] = raw[i*3 + c] * scale[c] + bias[c]`.
 fn build_planar_tensor(
@@ -340,46 +395,57 @@ fn build_planar_tensor_by_table(
 /// the canvas is cropped at its right and bottom edges.
 pub fn paint_rgb_onto_planes(
     rgb: &[u8],
-    image: (usize, usize),
-    canvas: (usize, usize),
+    image_size: (usize, usize),
+    canvas_size: (usize, usize),
     scale: [f32; 3],
     bias: [f32; 3],
     planes: &mut [f32],
 ) {
-    paint_rows(rgb, image, canvas, bias, planes, |row, r, g, b| {
-        deinterleave_rgb_to_planes(row, r, g, b, scale, bias);
-    });
+    paint_onto_planes(
+        rgb,
+        image_size,
+        canvas_size,
+        bias,
+        planes,
+        |row, r, g, b| {
+            deinterleave_rgb_to_planes(row, r, g, b, scale, bias);
+        },
+    );
 }
 
-/// [`paint_rgb_onto_planes`] through a per-channel table: every painted byte
-/// maps through `table[c][byte]` and the canvas outside the image holds
-/// `table[c][0]`, what a zero byte of padding maps to under the same
-/// arithmetic.
-pub(crate) fn paint_rgb_onto_planes_by_table(
+/// [`paint_rgb_onto_planes`] through a per-channel table instead of a scale
+/// and a bias: every painted byte maps to `table[c][byte]`, and the margin
+/// holds the mapped black, `table[c][0]`.
+pub fn paint_rgb_onto_planes_by_table(
     rgb: &[u8],
-    image: (usize, usize),
-    canvas: (usize, usize),
+    image_size: (usize, usize),
+    canvas_size: (usize, usize),
     table: &[[f32; 256]; 3],
     planes: &mut [f32],
 ) {
-    let black = [table[0][0], table[1][0], table[2][0]];
-    paint_rows(rgb, image, canvas, black, planes, |row, r, g, b| {
-        deinterleave_rgb_to_planes_by_table(row, r, g, b, table);
-    });
+    let black = std::array::from_fn(|c| table[c][0]);
+    paint_onto_planes(
+        rgb,
+        image_size,
+        canvas_size,
+        black,
+        planes,
+        |row, r, g, b| {
+            deinterleave_rgb_to_planes_by_table(row, r, g, b, table);
+        },
+    );
 }
 
-/// The canvas fill and the row walk of the paints: `black` fills the canvas,
-/// then `paint_row` maps each image row's bytes onto its three plane slices.
-fn paint_rows<K>(
+/// The canvas of [`paint_rgb_onto_planes`]: `planes` filled with `black` per
+/// channel, then each painted row of `rgb` written by `deinterleave`.
+fn paint_onto_planes(
     rgb: &[u8],
     (image_w, image_h): (usize, usize),
     (canvas_w, canvas_h): (usize, usize),
     black: [f32; 3],
     planes: &mut [f32],
-    paint_row: K,
-) where
-    K: Fn(&[u8], &mut [f32], &mut [f32], &mut [f32]),
-{
+    deinterleave: impl Fn(&[u8], &mut [f32], &mut [f32], &mut [f32]),
+) {
     let canvas_pixels = canvas_w * canvas_h;
     debug_assert_eq!(planes.len(), 3 * canvas_pixels);
     debug_assert!(rgb.len() >= image_w * image_h * 3);
@@ -395,7 +461,7 @@ fn paint_rows<K>(
     for y in 0..painted_h {
         let src_row = &rgb[y * image_w * 3..(y * image_w + painted_w) * 3];
         let dst = y * canvas_w;
-        paint_row(
+        deinterleave(
             src_row,
             &mut r_plane[dst..dst + painted_w],
             &mut g_plane[dst..dst + painted_w],
@@ -464,20 +530,30 @@ pub fn normalize(tensor: &mut Array3<f32>, mean: &[f64; 3], std: &[f64; 3]) {
     }
 }
 
-/// Convert image to tensor and normalize in a single pass.
+/// Convert image to tensor and normalize in a single pass, in the fused
+/// arithmetic of the reference image processors (`BaseImageProcessorFast`
+/// with `do_rescale` and `do_normalize`): the mean and std scaled into byte
+/// units, then one subtraction and one division in `f32`, as [`PixelNorm`]
+/// does. A multiply-add by `1 / (255 * std)` differs in the last bit, which
+/// can move the value across a rounding tie when the engine casts to bf16.
 ///
-/// Fuses `to_tensor` (u8→f32 with /255) and `normalize` ((x-mean)/std)
-/// into one loop to avoid an extra pass over the data.
+/// [`PixelNorm`]: crate::encoder_inputs::PixelNorm
 pub fn to_tensor_and_normalize(
     image: &DynamicImage,
     mean: &[f64; 3],
     std: &[f64; 3],
 ) -> Array3<f32> {
     let (w, h, raw) = rgb_bytes(image);
-    // Fused: (pixel/255 - mean) / std = pixel * (1/(255*std)) - mean/std
-    let scale: [f32; 3] = std::array::from_fn(|c| 1.0 / (255.0 * std[c] as f32));
-    let bias: [f32; 3] = std::array::from_fn(|c| -(mean[c] as f32) / (std[c] as f32));
-    build_planar_tensor(&raw, w, h, scale, bias)
+    build_planar_tensor_by_table(&raw, w, h, &to_tensor_and_normalize_table(mean, std))
+}
+
+/// The per-channel table of [`to_tensor_and_normalize`]:
+/// `(byte - 255 * mean[c]) / (255 * std[c])` in `f32` for every byte.
+pub(crate) fn to_tensor_and_normalize_table(mean: &[f64; 3], std: &[f64; 3]) -> [[f32; 256]; 3] {
+    std::array::from_fn(|c| {
+        let (offset, divisor) = (mean[c] as f32 * 255.0, std[c] as f32 * 255.0);
+        std::array::from_fn(|byte| (byte as f32 - offset) / divisor)
+    })
 }
 
 /// Convert image to tensor and normalize in the steps of torchvision's
@@ -553,7 +629,7 @@ fn to_fir_algorithm(filter: FilterType) -> ResizeAlg {
     clippy::slow_vector_initialization,
     reason = "the zero-filled `vec!` is the calloc this helper exists to avoid; see its doc comment"
 )]
-fn plain_buffer(len: usize) -> Vec<u8> {
+pub(crate) fn plain_buffer(len: usize) -> Vec<u8> {
     let mut buffer = Vec::with_capacity(len);
     buffer.resize(len, 0);
     buffer
@@ -2679,12 +2755,11 @@ pub fn resize_lanczos_pil(image: &DynamicImage, out_w: u32, out_h: u32) -> Dynam
 /// interpolation, and so what an image processor that resizes the decoded
 /// image before converting it to a tensor runs.
 pub fn resize_bilinear_pil(image: &DynamicImage, out_w: u32, out_h: u32) -> DynamicImage {
-    let rgb = image.to_rgb8();
-    let (in_w, in_h) = rgb.dimensions();
+    let (in_w, in_h, rgb) = rgb_bytes(image);
     let output = resize_pil_bytes::<3>(
-        rgb.as_raw(),
-        in_w,
-        in_h,
+        &rgb,
+        in_w as u32,
+        in_h as u32,
         out_w,
         out_h,
         PilResizeFilter::Bilinear,
@@ -3397,6 +3472,14 @@ pub fn center_crop(image: &DynamicImage, crop_w: u32, crop_h: u32) -> DynamicIma
     }
 }
 
+/// The pixel bytes of `image`, exactly `3 * width * height` of them: a
+/// container may be longer than its image (`ImageBuffer::from_raw` takes any
+/// that is long enough), and the bytes behind the pixels are not the image.
+pub(crate) fn rgb_pixels(image: &RgbImage) -> &[u8] {
+    let (width, height) = (image.width() as usize, image.height() as usize);
+    &image.as_raw()[..3 * width * height]
+}
+
 /// The `width` x `height` crop of `image` at (`x`, `y`), clipped to the
 /// image as the generic crop clips it, as row copies out of the image's own
 /// bytes. The generic crop builds a zeroed image and copies pixel by pixel;
@@ -3423,6 +3506,40 @@ pub(crate) fn crop_rgb(image: &RgbImage, x: u32, y: u32, width: u32, height: u32
         reason = "data holds exactly width * height * 3 bytes by construction"
     )]
     RgbImage::from_raw(width, height, data).expect("crop buffer size")
+}
+
+/// The columns of the image that one pass of [`transpose_rgb`] moves: their
+/// pixels of an image row and the output rows they go to stay in the cache.
+const TRANSPOSE_BLOCK: usize = 32;
+
+/// `image` flipped over its main diagonal (PIL's `Image.TRANSPOSE`): the
+/// pixel at (`x`, `y`) goes to (`y`, `x`), so the result is `height` wide and
+/// `width` high. The generic way, a horizontal flip and then a quarter turn,
+/// copies the image twice, pixel by pixel. Here a block of columns at a time
+/// is gathered in a scratch block that stays in the cache, each image row
+/// giving one pixel to each of its output rows, and joins the output whole.
+pub(crate) fn transpose_rgb(image: &RgbImage) -> RgbImage {
+    let (width, height) = (image.width() as usize, image.height() as usize);
+    // A zero-sized image has no rows; a chunk size of 0 would panic.
+    let (stride, out_stride) = ((width * 3).max(1), (height * 3).max(1));
+    let mut data = Vec::with_capacity(width * height * 3);
+    let mut block = vec![0_u8; TRANSPOSE_BLOCK.min(width) * height * 3];
+    for first in (0..width).step_by(TRANSPOSE_BLOCK) {
+        let columns = TRANSPOSE_BLOCK.min(width - first);
+        let block = &mut block[..columns * height * 3];
+        for (y, row) in rgb_pixels(image).chunks_exact(stride).enumerate() {
+            let (pixels, _) = row[first * 3..(first + columns) * 3].as_chunks::<3>();
+            for (out_row, pixel) in block.chunks_exact_mut(out_stride).zip(pixels) {
+                out_row[y * 3..y * 3 + 3].copy_from_slice(pixel);
+            }
+        }
+        data.extend_from_slice(block);
+    }
+    #[expect(
+        clippy::expect_used,
+        reason = "data holds exactly height * width * 3 bytes by construction"
+    )]
+    RgbImage::from_raw(image.height(), image.width(), data).expect("transpose buffer size")
 }
 
 /// `image` pasted at (`x`, `y`) on a `width` x `height` canvas of
@@ -3604,9 +3721,7 @@ pub fn pad_to_size_pil_rgb(
 ///
 /// All tensors must have the same shape.
 pub fn stack_batch(tensors: &[Array3<f32>]) -> Result<Array4<f32>> {
-    if tensors.is_empty() {
-        return Err(TransformError::EmptyBatch);
-    }
+    TransformError::if_empty(tensors)?;
 
     let shape = tensors[0].shape();
     let (c, h, w) = (shape[0], shape[1], shape[2]);
@@ -3975,6 +4090,33 @@ mod tests {
                 expected,
                 &format!("{w}x{h} -> {out_w}x{out_h}"),
             );
+        }
+    }
+
+    /// Golden bits from HF's fused rescale-and-normalize (transformers 5.10.1,
+    /// torch 2.12). With mean = std = 0.5, byte 127 sits next to a bf16
+    /// rounding tie, so any other f32 formula can cast to a different bf16.
+    #[test]
+    fn to_tensor_and_normalize_is_bit_exact_with_hf() {
+        let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(3, 2, Rgb([127, 128, 1])));
+        let clip_mean = [0.48145466, 0.4578275, 0.40821073];
+        let clip_std = [0.26862954, 0.26130258, 0.27577711];
+        for (mean, std, golden) in [
+            (
+                [0.5; 3],
+                [0.5; 3],
+                [0xbb80_8081_u32, 0x3b80_8081, 0xbf7d_fdfe],
+            ),
+            (clip_mean, clip_std, [0x3d7c_e08c, 0x3e2c_f360, 0xbfbb_a5e2]),
+        ] {
+            let tensor = to_tensor_and_normalize(&image, &mean, &std);
+            for (c, bits) in golden.into_iter().enumerate() {
+                assert_eq!(
+                    tensor[[c, 1, 2]].to_bits(),
+                    bits,
+                    "mean {mean:?}, channel {c}"
+                );
+            }
         }
     }
 
@@ -5341,6 +5483,48 @@ mod tests {
         );
     }
 
+    /// The one-pass transpose makes the image that the flip and the quarter
+    /// turn make, on sizes around its block of columns and over a container
+    /// longer than the pixels.
+    #[test]
+    fn transpose_rgb_is_the_flip_and_the_quarter_turn() {
+        let sizes = [
+            (1, 1),
+            (1, 7),
+            (7, 1),
+            (31, 5),
+            (32, 33),
+            (33, 32),
+            (65, 97),
+            (200, 130),
+        ];
+        for (width, height) in sizes {
+            let image = lcg_rgb_image(width, height, 11);
+            let rgb = image.to_rgb8();
+            let generic = image.fliph().rotate270().to_rgb8();
+            let fast = transpose_rgb(&rgb);
+            assert_eq!(fast.dimensions(), (height, width), "{width}x{height}");
+            assert_eq!(fast.as_raw(), generic.as_raw(), "{width}x{height}");
+
+            let mut container = rgb.into_raw();
+            container.extend_from_slice(&[0xAB; 7]);
+            let longer = RgbImage::from_raw(width, height, container).expect("longer container");
+            let fast_of_longer = transpose_rgb(&longer);
+            assert_eq!(fast_of_longer.as_raw(), fast.as_raw(), "{width}x{height}");
+        }
+    }
+
+    #[test]
+    fn transpose_rgb_stays_total_on_an_empty_image() {
+        // No row to chunk and no block to fill: the result is the empty
+        // image with its two sides swapped.
+        for (width, height) in [(0, 7), (7, 0), (0, 0)] {
+            let transposed = transpose_rgb(&RgbImage::new(width, height));
+            assert_eq!(transposed.dimensions(), (height, width), "{width}x{height}");
+            assert!(transposed.as_raw().is_empty(), "{width}x{height}");
+        }
+    }
+
     #[test]
     fn test_expand_to_square_horizontal() {
         let img = create_test_image(100, 50, Rgb([255, 0, 0]));
@@ -5533,6 +5717,90 @@ mod tests {
         assert_eq!(out.dimensions(), (4, 4));
     }
 
+    /// The reference's blend of one pixel over a background level: float32,
+    /// truncated.
+    fn reference_blend(px: [u8; 4], bg: u8) -> [u8; 3] {
+        let a = f32::from(px[3]) / 255.0;
+        [px[0], px[1], px[2]].map(|c| (a * f32::from(c) + (1.0 - a) * f32::from(bg)) as u8)
+    }
+
+    /// Every channel value at every alpha, 65,536 pixels, over each flat
+    /// level and over three chessboards, one whose squares divide the width
+    /// and two whose squares do not: the fill is the reference's blend over
+    /// the reference's board.
+    #[test]
+    fn fill_transparent_bg_blends_every_value_at_every_alpha() {
+        let rgba = image::RgbaImage::from_fn(256, 256, |value, alpha| {
+            Rgba([value as u8, !(value as u8), value as u8 ^ 0x5a, alpha as u8])
+        });
+        let flat = |pattern| TransparentBgConfig {
+            pattern,
+            ..Default::default()
+        };
+        let patterns = [
+            (flat(TransparentBgPattern::Black), Some(0)),
+            (flat(TransparentBgPattern::Gray), Some(128)),
+            (flat(TransparentBgPattern::White), Some(255)),
+            (chessboard(16, true), None),
+            (chessboard(17, true), None),
+            (chessboard(3, false), None),
+        ];
+        let image = DynamicImage::from(rgba.clone());
+        for (config, level) in patterns {
+            let out = fill_transparent_bg(&image, config);
+            assert_eq!(out.dimensions(), (256, 256));
+            for (x, y, px) in rgba.enumerate_pixels() {
+                let bg = level.unwrap_or_else(|| reference_board(config, x, y));
+                assert_eq!(
+                    out.get_pixel(x, y).0,
+                    reference_blend(px.0, bg),
+                    "{config:?} at ({x},{y})"
+                );
+            }
+        }
+    }
+
+    /// Two pixels in a container two rows and three bytes longer than the
+    /// image: the fill ends at the image's own pixels.
+    #[test]
+    fn fill_transparent_bg_ends_at_the_images_pixels() {
+        let mut container = vec![200, 100, 50, 64, 200, 100, 50, 192];
+        container.extend_from_slice(&[9; 19]);
+        let rgba = image::RgbaImage::from_raw(2, 1, container).expect("2x1 RGBA");
+        let image = DynamicImage::from(rgba.clone());
+        for config in [TransparentBgConfig::default(), chessboard(1, true)] {
+            let out = fill_transparent_bg(&image, config);
+            assert_eq!(out.as_raw().len(), 6, "{config:?}");
+            for (x, y, px) in rgba.enumerate_pixels() {
+                let bg = match config.pattern {
+                    TransparentBgPattern::Chessboard => reference_board(config, x, y),
+                    _ => 0,
+                };
+                assert_eq!(
+                    out.get_pixel(x, y).0,
+                    reference_blend(px.0, bg),
+                    "{config:?}"
+                );
+            }
+        }
+    }
+
+    /// A layout with alpha other than RGBA8 converts first: a grey pixel with
+    /// alpha blends as that grey in three channels.
+    #[test]
+    fn fill_transparent_bg_converts_another_layout_with_alpha() {
+        let grey = image::GrayAlphaImage::from_raw(2, 1, vec![200, 64, 50, 192]).expect("2x1 LA");
+        let config = chessboard(1, false);
+        let out = fill_transparent_bg(&DynamicImage::ImageLumaA8(grey), config);
+        for (x, [luma, alpha]) in [(0u32, [200u8, 64]), (1, [50, 192])] {
+            let bg = reference_board(config, x, 0);
+            assert_eq!(
+                out.get_pixel(x, 0).0,
+                reference_blend([luma, luma, luma, alpha], bg)
+            );
+        }
+    }
+
     #[test]
     fn transparent_bg_config_fills_missing_fields() {
         // A model may ship only `pattern`; the rest must fall back rather than
@@ -5573,26 +5841,22 @@ mod tests {
     }
 
     #[test]
-    fn paint_rgb_onto_planes_by_table_maps_through_the_table_and_fills_the_margin_with_its_zero() {
-        // A 2x2 image on a 3x2 canvas: the right column is margin. The table
-        // tells the channels and the levels apart, and no multiply-add
-        // produces it.
-        let rgb: [u8; 12] = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120];
-        let table: [[f32; 256]; 3] = std::array::from_fn(|c| {
-            std::array::from_fn(|level| {
-                let sign = if level % 2 == 0 { 1.0 } else { -1.0 };
-                (level as f32 * 0.5 + 1.0) * sign + (c as f32 + 1.0) * 1000.0
-            })
-        });
+    fn paint_rgb_onto_planes_by_table_matches_to_tensor_and_normalize() {
+        // A 2x2 image on a 3x2 canvas: the right column is normalized black.
+        let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(2, 2, Rgb([127, 128, 1])));
+        let (mean, std) = ([0.5; 3], [0.5; 3]);
+        let expected = to_tensor_and_normalize(&image, &mean, &std);
+        let (w, h, raw) = rgb_bytes(&image);
         let mut planes = vec![f32::NAN; 3 * 3 * 2];
-        paint_rgb_onto_planes_by_table(&rgb, (2, 2), (3, 2), &table, &mut planes);
+        let table = to_tensor_and_normalize_table(&mean, &std);
+        paint_rgb_onto_planes_by_table(&raw, (w, h), (3, 2), &table, &mut planes);
         for c in 0..3 {
             for y in 0..2 {
                 for x in 0..3 {
-                    let level = if x < 2 { rgb[(y * 2 + x) * 3 + c] } else { 0 };
+                    let value = if x < 2 { expected[[c, y, x]] } else { -1.0 };
                     assert_eq!(
                         planes[c * 6 + y * 3 + x].to_bits(),
-                        table[c][usize::from(level)].to_bits(),
+                        value.to_bits(),
                         "channel {c} at ({x}, {y})"
                     );
                 }
@@ -5626,6 +5890,34 @@ mod tests {
             .all(|(s, b)| s.to_bits() == b.to_bits()));
         assert_eq!(serial[0].to_bits(), table[0][0].to_bits());
         assert_eq!(serial[pixels].to_bits(), table[1][1].to_bits());
+    }
+
+    #[test]
+    fn extend_planes_by_table_appends_each_image_after_the_last() {
+        // Two images of odd pixel counts appended to one buffer; the serial
+        // kernel is the oracle for each one's planes.
+        let table: [[f32; 256]; 3] =
+            std::array::from_fn(|c| std::array::from_fn(|level| (level * 3 + c) as f32 / 7.0));
+        let mut appended = Vec::new();
+        let mut expected = Vec::new();
+        for (pixels, offset) in [(1027_usize, 0_usize), (333, 97)] {
+            let rgb: Vec<u8> = (0..pixels * 3)
+                .map(|i| ((i + offset) % 251) as u8)
+                .collect();
+            let mut planes = vec![0.0_f32; 3 * pixels];
+            {
+                let (r, rest) = planes.split_at_mut(pixels);
+                let (g, b) = rest.split_at_mut(pixels);
+                deinterleave_contiguous_by_table(&rgb, r, g, b, &table);
+            }
+            expected.extend(planes);
+            extend_planes_by_table(&mut appended, &rgb, &table);
+        }
+        assert_eq!(appended.len(), expected.len());
+        assert!(appended
+            .iter()
+            .zip(&expected)
+            .all(|(a, e)| a.to_bits() == e.to_bits()));
     }
 
     #[test]

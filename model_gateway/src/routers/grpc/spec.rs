@@ -34,12 +34,23 @@ pub(crate) enum ResponseSpec {
     Generate(GenerateResponseSpec),
     Completion(CompletionResponseSpec),
     Messages(Box<MessagesResponseSpec>),
-    /// Embedding/classify response processing needs only dispatch metadata.
-    Embedding,
+    /// Embedding response processing: the encoding the request asked for;
+    /// the rest is dispatch metadata.
+    Embedding(EmbeddingResponseSpec),
+    /// Classify response processing needs only dispatch metadata.
     Classify,
     Decisions(DecisionsResponseSpec),
     Harmony(HarmonyResponseSpec),
     Transcription(TranscriptionResponseSpec),
+}
+
+/// Response-phase contract for an embeddings request: whether the answer's
+/// vectors leave as the base64 of their little-endian f32 bytes
+/// (`encoding_format: "base64"`) or as float arrays, as read by request
+/// building where the request is at hand.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct EmbeddingResponseSpec {
+    pub base64: bool,
 }
 
 #[derive(Clone)]
@@ -145,6 +156,17 @@ impl From<&ChatCompletionRequest> for ChatResponseSpec {
 }
 
 impl ChatResponseSpec {
+    /// The spec's `json_mode` of `request`: a `json_object` or `json_schema`
+    /// response format holds the answer to JSON; a structural tag is free text
+    /// around its tags. The one rule the legacy chat path and the Symphony
+    /// path read (its `Asks::json_answer`).
+    pub(crate) fn json_mode_of(request: &ChatCompletionRequest) -> bool {
+        matches!(
+            request.response_format,
+            Some(ResponseFormat::JsonObject | ResponseFormat::JsonSchema { .. })
+        )
+    }
+
     /// The spec of `request` under `provider`, its model's profile as the
     /// request's preparation derived it once; `From` derives the profile for
     /// a request that carries none.
@@ -152,10 +174,7 @@ impl ChatResponseSpec {
         Self {
             wire: Wire::of(provider),
             separate_reasoning: request.separate_reasoning,
-            json_mode: matches!(
-                request.response_format,
-                Some(ResponseFormat::JsonObject | ResponseFormat::JsonSchema { .. })
-            ),
+            json_mode: Self::json_mode_of(request),
             tool_choice: request.tool_choice.clone(),
             // Every tool the model may call, dynamic tools declared on messages
             // included: the request's own list shared, not copied (a new list

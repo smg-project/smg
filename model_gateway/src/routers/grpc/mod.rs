@@ -14,6 +14,10 @@ pub(crate) mod mode;
 pub(crate) mod multimodal;
 pub(crate) mod pipeline;
 pub(crate) mod proto_wrapper;
+/// The dispatch tickets' benchmark seam: what `benches/dispatch_tickets.rs` drives,
+/// compiled for the crate's test targets only.
+#[cfg(any(test, feature = "test-util"))]
+pub use proto_wrapper::dispatch_ticket_life;
 pub(crate) mod regular;
 pub(crate) mod router; // Used by routers/factory
 pub(crate) mod sequential_pd;
@@ -25,11 +29,17 @@ pub(crate) mod testing;
 #[cfg(any(test, feature = "test-util"))]
 pub mod tokenizer_cache;
 pub mod utils; // Used by routers/http and bindings/golang
-/// The stream state machines' benchmark seams: what `benches/stream_state_machines.rs`
-/// drives, compiled for the crate's test targets only.
+/// The stream state machines' benchmark seams: what `benches/stream_state_machines.rs`,
+/// `benches/forced_call_stream.rs` and `benches/symphony_messages_stream.rs` drive, compiled
+/// for the crate's test targets only.
 #[cfg(any(test, feature = "test-util"))]
-pub use regular::streaming::bench::{EngineScript, StreamBench};
+pub use regular::streaming::bench::{EngineScript, ForcedChat, StreamBench};
 pub(crate) mod wire;
+/// The worker selection stage's benchmark seam: what
+/// `benches/policy_selection.rs` drives for the stage's own placements,
+/// compiled for the crate's test targets only.
+#[cfg(any(test, feature = "test-util"))]
+pub use common::stages::SelectionBench;
 pub mod zmq_client; // ZMQ backend adapter behind the vLLM client surface
 
 // Re-export for convenience

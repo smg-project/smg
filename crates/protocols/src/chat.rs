@@ -7,11 +7,11 @@ use validator::Validate;
 use super::{
     common::{
         default_true, deserialize_null_as_empty_vec, deserialize_null_as_false,
-        deserialize_null_as_true, invalid, invalid_at, is_false, is_true, json_type_name, on_field,
-        validate_json_schema_shape, validate_logit_bias, validate_stop, CachePartition,
-        ChatLogProbs, ContentPart, Function, FunctionCall, FunctionCallResponse, FunctionChoice,
-        GenerationRequest, ResponseFormat, StreamOptions, StringOrArray, Tool, ToolCall,
-        ToolCallDelta, ToolChoice, ToolChoiceValue, ToolReference, Usage,
+        deserialize_null_as_true, empty_tool_name, invalid, invalid_at, is_false, is_true,
+        json_type_name, on_field, validate_json_schema_shape, validate_logit_bias, validate_stop,
+        CachePartition, ChatLogProbs, ContentPart, Function, FunctionCall, FunctionCallResponse,
+        FunctionChoice, GenerationRequest, ResponseFormat, StreamOptions, StringOrArray, Tool,
+        ToolCall, ToolCallDelta, ToolChoice, ToolChoiceValue, ToolReference, Usage,
     },
     sampling_params::{validate_top_k_value, validate_top_p_value},
 };
@@ -19,6 +19,7 @@ use crate::{
     builders::{ChatCompletionResponseBuilder, ChatCompletionStreamResponseBuilder},
     ext::kimi::{KimiAssistantExt, KimiDeveloperExt, KimiSystemExt, KimiUserExt},
     profile::ProviderProfile,
+    strict_value::StrictValue,
     validated::Normalizable,
 };
 
@@ -213,7 +214,9 @@ pub enum MessageContent {
 /// A string is the text, a list is the parts. A part's refusal is kept as
 /// the refusal, under the part's place in the list (`content[1]`): a derived
 /// untagged read would replace it with its own generic words, and serde's
-/// path stops at the message a tagged enum buffers.
+/// path stops at the message a tagged enum buffers. Each part is buffered by
+/// the strict value reader: the plain one keeps the last of a repeated key,
+/// and the typed read after it would never see the repeat.
 impl<'de> Deserialize<'de> for MessageContent {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct ContentVisitor;
@@ -235,8 +238,25 @@ impl<'de> Deserialize<'de> for MessageContent {
 
             fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
                 let mut parts = Vec::new();
-                while let Some(value) = seq.next_element::<Value>()? {
-                    let part = serde_json::from_value::<ContentPart>(value).map_err(|error| {
+                loop {
+                    // Only a repeated key's refusal takes the part's place (any other error is
+                    // the deserializer's own), and as it is: the key is the client's and may
+                    // hold the separator `part_reason_at` splits on.
+                    let next = seq.next_element_seed(StrictValue).map_err(|error| {
+                        let reason = error.to_string();
+                        if reason.starts_with("duplicate field `") {
+                            de::Error::custom(format!("{reason}, in `content[{}]`", parts.len()))
+                        } else {
+                            error
+                        }
+                    })?;
+                    let Some(value) = next else { break };
+                    // The buffer's map is the part's fields: read by kind, not built a second time.
+                    let part = match value {
+                        Value::Object(fields) => ContentPart::from_fields(fields),
+                        other => serde_json::from_value(other),
+                    }
+                    .map_err(|error| {
                         <A::Error as de::Error>::custom(part_reason_at(parts.len(), &error))
                     })?;
                     parts.push(part);
@@ -879,16 +899,25 @@ fn validate_chat_cross_parameters(
             .map_err(|error| on_field(error, "response_format"))?;
     }
 
-    // The provider profile, derived once here for the tool-choice rule (7)
-    // and the contract rules (10).
+    // 7. A function has a name. The rule stands ahead of the choice's, so
+    //    the unnamed tool is the one refused whatever `tool_choice` says
+    for (index, tool) in req.tools.as_deref().into_iter().flatten().enumerate() {
+        if tool.function.name.is_empty() {
+            let field = format!("tools[{index}].function.name");
+            return Err(on_field(empty_tool_name(&field), field));
+        }
+    }
+
+    // The provider profile, derived once here for the tool-choice rule (8)
+    // and the contract rules (11).
     let provider = ProviderProfile::for_model(&req.model);
 
-    // 7. A tool_choice against the tools the model will see
+    // 8. A tool_choice against the tools the model will see
     if let Some(tool_choice) = &req.tool_choice {
         validate_tool_choice(req, provider, tool_choice)?;
     }
 
-    // 8. A function's `parameters`, when given, is a JSON Schema object (an
+    // 9. A function's `parameters`, when given, is a JSON Schema object (an
     //    absent or null schema was read as none and passes)
     for (index, tool) in req.tools.as_deref().into_iter().flatten().enumerate() {
         let Some(schema) = &tool.function.parameters else {
@@ -907,7 +936,7 @@ fn validate_chat_cross_parameters(
         }
     }
 
-    // 9. A continued final message and the generation header exclude each
+    // 10. A continued final message and the generation header exclude each
     //     other: the pair set together is refused, as the engine that has
     //     the field refuses it; `continue_final_message` alone continues.
     if req.continue_final_message && req.add_generation_prompt == Some(true) {
@@ -918,7 +947,7 @@ fn validate_chat_cross_parameters(
         ));
     }
 
-    // 10. Provider-profile contract rules, selected from the model id. Both
+    // 11. Provider-profile contract rules, selected from the model id. Both
     //     token limits at once are judged there: the request keeps whichever
     //     the client wrote and `output_token_cap` reads `max_completion_tokens`
     //     first, the precedence the serving engines apply themselves; only
@@ -2375,6 +2404,54 @@ mod request_contract_tests {
         assert_eq!(rejection(&empty), None);
     }
 
+    /// A function declared with an empty name is refused with its place in
+    /// `tools`: the model can be made to call it, and no client can dispatch
+    /// a call that names nothing. The first such tool is the one named, under
+    /// every `tool_choice`: a choice that names the empty function, and the
+    /// choices their own rule refuses (a function not declared, a mode not
+    /// known), which the name's rule stands ahead of.
+    #[test]
+    fn a_function_has_a_name() {
+        use crate::common::FIELD_PARAM;
+
+        let parameters = json!({"type": "object", "properties": {}});
+        let tool = |name: &str| json!({"type": "function", "function": {"name": name, "parameters": parameters}});
+        for (tools, at) in [
+            (json!([tool("")]), 0),
+            (json!([tool("f"), tool(""), tool("")]), 1),
+        ] {
+            for choice in [
+                json!("auto"),
+                json!("required"),
+                json!("none"),
+                json!({"type": "function", "function": {"name": ""}}),
+                json!({"type": "function", "function": {"name": "not declared"}}),
+                json!({"type": "allowed_tools", "mode": "sometimes",
+                       "tools": [{"type": "function", "name": "f"}]}),
+            ] {
+                let unnamed = request(json!({"tools": tools, "tool_choice": choice}));
+                let errors = unnamed.validate().expect_err("an empty name");
+                let error = &errors.field_errors()["__all__"][0];
+                assert_eq!(error.code, "empty_string", "{choice}");
+                let field = format!("tools[{at}].function.name");
+                assert_eq!(error.params[FIELD_PARAM], field.as_str(), "{choice}");
+                assert_eq!(
+                    error.message.as_deref(),
+                    Some(
+                        format!(
+                            "Invalid '{field}': empty string. Expected a string with minimum \
+                             length 1, but got an empty string instead."
+                        )
+                        .as_str()
+                    ),
+                    "{choice}"
+                );
+            }
+        }
+        let named = request(json!({"tools": [tool("f")], "tool_choice": "required"}));
+        assert_eq!(rejection(&named), None);
+    }
+
     /// `logit_bias` is keyed by token ids, no two of them spelling one id,
     /// and its biases stay within the public API's -100..=100; a refusal
     /// names the field. A single key with a leading zero names its id.
@@ -2535,7 +2612,7 @@ mod tool_choice_tests {
 mod content_tests {
     use serde_json::json;
 
-    use super::{ChatMessage, MessageContent};
+    use super::{ChatCompletionRequest, ChatMessage, MessageContent};
 
     fn content_of(message: ChatMessage) -> MessageContent {
         match message {
@@ -2608,6 +2685,79 @@ mod content_tests {
                 serde_json::from_value::<ChatMessage>(json!({"role": "user", "content": content}))
                     .unwrap_err();
             assert_eq!(error.to_string(), reason, "{content}");
+        }
+    }
+
+    /// A key repeated inside a content part is refused with serde's words
+    /// under the part's place, at any depth of the part and for any kind,
+    /// where a plain value read keeps the last value. A key that holds the
+    /// place's own separator does not move the place.
+    #[test]
+    fn a_content_part_with_a_repeated_key_is_refused() {
+        for (message, reason) in [
+            (
+                r#"{"role":"user","content":[{"type":"text","text":"a","text":"b"}]}"#,
+                "duplicate field `text`, in `content[0]`",
+            ),
+            (
+                r#"{"role":"user","content":[{"type":"image_url","type":"text","text":"a"}]}"#,
+                "duplicate field `type`, in `content[0]`",
+            ),
+            (
+                r#"{"role":"user","content":[{"type":"text","text":"a"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AA==","url":"data:image/png;base64,AB=="}}]}"#,
+                "duplicate field `url`, in `content[1]`",
+            ),
+            (
+                r#"{"role":"system","content":[{"type":"text","text":"a","text":"b"}]}"#,
+                "duplicate field `text`, in `content[0]`",
+            ),
+            (
+                r#"{"role":"tool","tool_call_id":"call_1","content":[{"type":"text","text":"a","text":"b"}]}"#,
+                "duplicate field `text`, in `content[0]`",
+            ),
+            (
+                r#"{"role":"user","content":[{"type":"vendor_media","payload":{"a":1,"a":2}}]}"#,
+                "duplicate field `a`, in `content[0]`",
+            ),
+            (
+                r#"{"role":"user","content":[{"type":"text","text":"a","x, in `y":1,"x, in `y":2}]}"#,
+                "duplicate field `x, in `y`, in `content[0]`",
+            ),
+        ] {
+            let error = serde_json::from_str::<ChatMessage>(message).unwrap_err();
+            assert_eq!(error.to_string(), reason, "{message}");
+        }
+    }
+
+    /// A twelve-turn conversation (part turns with an image, text turns, a
+    /// tool call and its result in parts), read two hundred times: the
+    /// content readers' cost on a representative request, for the
+    /// measurement of a change to them. Nothing is asserted beyond the read.
+    #[test]
+    #[ignore = "a read-cost measurement for perf stat, not a check"]
+    fn a_conversation_with_parts_reads_two_hundred_times() {
+        let text = "the previous turn's text, long enough to carry some weight ".repeat(4);
+        let mut messages = Vec::new();
+        for _ in 0..5 {
+            messages.push(json!({"role": "user", "content": [
+                {"type": "text", "text": text},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==", "detail": "low"}},
+            ]}));
+            messages.push(json!({"role": "assistant", "content": text}));
+        }
+        messages.push(json!({"role": "assistant", "content": null, "tool_calls": [
+            {"id": "call_1", "type": "function", "function": {"name": "lookup", "arguments": "{\"q\":\"x\"}"}},
+        ]}));
+        messages.push(
+            json!({"role": "tool", "tool_call_id": "call_1", "content": [
+                {"type": "text", "text": text},
+            ]}),
+        );
+        let body = json!({"model": "m", "messages": messages, "max_tokens": 8}).to_string();
+        for _ in 0..200 {
+            let request: ChatCompletionRequest =
+                serde_json::from_str(&body).expect("the body reads");
+            assert_eq!(request.messages.len(), 12);
         }
     }
 }

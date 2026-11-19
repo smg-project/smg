@@ -7,7 +7,7 @@ global:
   image:
     registry: docker.io
     repository: lightseekorg/smg
-    tag: ""  # defaults to Chart.appVersion
+    tag: ""  # defaults to Chart.appVersion; text: quote a tag of digits alone ("1.16")
     pullPolicy: IfNotPresent
   imagePullSecrets: []
 
@@ -403,27 +403,134 @@ router:
 # The standalone policy controller (smg-policy-controller): a Deployment of its
 # own beside the router, with its Service. Off by default. The controller
 # runs on its own today: nothing in this chart points the router at it.
-# A null removes a value's default. With the controller on, the templates
-# need the ports, the log level, the probes' paths, the grace period and the
-# budget's number, and the schema refuses a null for each, as it does for the
-# security context. Off, the block is not read and needs none of them. An
-# empty probe path is refused either way.
+# A null removes a value's default. With the controller on, the schema
+# refuses a null for every value below whose default is not empty, so none
+# is left to the cluster's or the controller's own default. The security
+# context's members are apart: a null drops one, by design. Off, the block
+# is not read and needs none of them. An empty probe path is refused either
+# way.
 policyController:
   enabled: false
 
-  # -- The controller's image. No image is published yet, so repository and
-  #    tag have no default, and a release that turns the controller on
-  #    without them is refused at render. registry "" takes
-  #    global.image.registry; the pull policy and the pull secrets are the
-  #    global ones.
+  # -- The controller's image. Each part left empty is the router's: registry
+  #    "" takes global.image.registry, repository "" takes
+  #    global.image.repository, and tag "" takes the router's tag with
+  #    -policy-controller appended, the tag a release publishes the
+  #    controller under (a release publishes one controller image, so the
+  #    router's -slurm suffix is cut first). A repository of your own needs
+  #    its tag, and so does a router image named by a digest or by a release
+  #    older than the first with a controller image. The pull policy and
+  #    the pull secrets are the global ones.
   image:
     registry: ""
     repository: ""
     tag: ""
 
-  # -- Replicas. The controller does not elect a leader yet: every replica is
-  #    a controller of its own. Keep one.
+  # -- Replicas. With the election off every replica is a controller of its
+  #    own and two would each lead alone: the chart refuses more than one,
+  #    and an upgrade tells the old pod to stop before it makes the new one.
+  #    With it on, one leads and the others stand by. One replica is a shape
+  #    of its own there: a rollout's surge pod is its standby, and the old
+  #    pod's stop hands over to it. Two or more keep a standby between
+  #    rollouts too: for a pod that is lost, and for a node drain, where no
+  #    surge comes. What a standby holds when it takes over is the
+  #    election's word, below.
   replicas: 1
+
+  # -- Leader election among the replicas, over one coordination.k8s.io Lease
+  #    in the release's namespace. On renders that Lease, a ServiceAccount of
+  #    the controller's own with its token mounted in the controller's pods
+  #    alone, and a Role and RoleBinding that grant get and update on that one
+  #    Lease; the controller is passed --lease-name, and its pod's address as
+  #    --advertise-address. The Deployment then rolls one pod more at a time
+  #    with none unavailable. Off, none of this is rendered.
+  #    leaseName "" is the controller's full name. A name of your own is
+  #    unique to one controller: two controllers handed one name in one
+  #    namespace elect one leader between two stores.
+  #    The Lease carries the election's term: a deleted or replaced Lease
+  #    restarts the term once no running controller remembers the last one,
+  #    and turning the election off deletes the Lease. Turning it on beside
+  #    a running controller starts an elected pod while the lone one still
+  #    leads: scale the controller to zero first, by hand or with
+  #    enabled: false (the schema refuses replicas: 0), and wait until no
+  #    controller pod remains: the pods end in the background.
+  #    A changed leaseName on a running release is such a change as well: a
+  #    pod elected over the new Lease may lead while the old Lease's leader
+  #    still leads, until its renew deadline, and the term starts again.
+  #    A standby follows its leader only where the standbys' listener takes
+  #    identities as told: identityAsTold names replication. It then dials
+  #    the Lease holder's pod at ports.replication, takes the leader's
+  #    workers and their loads and follows each write of them. Its readiness
+  #    probe fails until it is synced with its leader and passes only while
+  #    it is: a rollout waits for the new pod's sync by itself, and a
+  #    disruption budget counts a synced standby alone. Under the defaults
+  #    none of that holds: a standby follows nobody, reads ready at once and
+  #    takes over with no worker and no load. A standbys' listener that
+  #    serves TLS follows nobody yet.
+  #    Naming replication there on a running elected release whose
+  #    listeners serve no TLS does not roll out: the old leader's listener
+  #    takes no stated name and refuses the new pod, which stays not ready
+  #    while the old pods serve as before. Roll back, or scale the
+  #    controller to zero (by hand, or with enabled: false), wait until no
+  #    controller pod remains, and upgrade with the controller on again.
+  #    Deleting a pod is no way out: another old pod may take the Lease.
+  #    The first leader under the new values starts with no worker and no
+  #    load either way, and with enabled: false the Lease goes too, so the
+  #    term starts again.
+  #    A Lease deleted under standbys that follow turns every pod not ready
+  #    until the release is applied again: the pods cannot make it.
+  election:
+    enabled: false
+    leaseName: ""
+
+  # -- The policy spec document the controller runs, as a map: a document of
+  #    apiVersion smg.policy/v1. With the controller on it is required,
+  #    unless specStoreClaim names a spec store: the controller refuses a
+  #    start that names no source of its spec, and the chart refuses an
+  #    empty document at render. The chart writes it as the one key
+  #    spec.yaml of a ConfigMap under the controller's name, mounts that
+  #    whole and read-only at /etc/smg/policy-spec and passes --spec-file
+  #    /etc/smg/policy-spec/spec.yaml: the controller reads the file at its
+  #    start and watches it from then on. The chart reads no line of the
+  #    document and writes none: whether a document runs is the controller's
+  #    word.
+  #    A changed document moves no pod. The kubelet turns the mounted file,
+  #    and the running controller applies the document in place, or rejects
+  #    one that does not run and keeps the generation it runs. A document
+  #    that writes a generation line raises it at every change, a rollback's
+  #    too: the running controller refuses a line at or under the one it
+  #    runs, and a pod that starts takes it. A pod that starts on a document
+  #    that does not run refuses to start: dry-run a document before an
+  #    upgrade that moves the pods for another reason. With the election on
+  #    each pod watches its own mount: until the kubelets have turned both,
+  #    two pods hold two documents.
+  spec: {}
+
+  # -- A spec store in place of the document: the name of a
+  #    PersistentVolumeClaim of yours in the release's namespace, or empty,
+  #    the default, for the document above. Named, the chart renders no
+  #    ConfigMap, mounts the claim at /var/lib/smg/spec and passes
+  #    --spec-store on it: the controller starts on the newest generation on
+  #    file, and ApplyPolicySpec on the operators' listener writes each
+  #    applied generation there before it runs, the last eight kept. A store
+  #    with nothing on file starts ready and sheds every decision until its
+  #    first apply: smg_policy_spec_generation reads 0 until then.
+  #    The claim is yours and the chart renders none: a claim a release owns
+  #    goes with the release, and the generations on file are the only copy
+  #    of an applied document. It is ReadWriteOncePod where the cluster
+  #    offers that mode, else ReadWriteOnce, on a file system that links a
+  #    file under a second name and locks one, as the store does, and it
+  #    holds eight documents. One pod at a time holds the store, under a
+  #    lock on a file the controller keeps there: an upgrade recreates the
+  #    pod, the old one gone before the new one is made, and a pod replaced
+  #    otherwise, after an eviction, waits for the old one to stop, for its
+  #    grace period at most, before it reads the store: see the README.
+  #    The chart refuses at render what the controller refuses at start
+  #    beside a store: a document in spec, since a start names one source of
+  #    its spec, and the election, since a standby does not follow an
+  #    applied generation yet. More than one replica is refused by the
+  #    chart's own rule: each would lead alone.
+  specStoreClaim: ""
 
   # -- The listeners' container ports, each passed as its --*-listen flag: the
   #    gateways and the relays (gateway), the operators (control), the standbys
@@ -435,6 +542,24 @@ policyController:
     control: 30101
     replication: 30102
     admin: 30103
+
+  # -- Nothing is verified on a listener named here: whoever reaches its
+  #    port acts as any principal of its scopes. The listeners that take a
+  #    caller's stated name as its identity, passed as --identity-as-told:
+  #    any of gateway, control and replication, each once, in any order.
+  #    None by default: each listener then refuses every call of its scopes
+  #    but Leader as unauthenticated. Name one only behind a mesh that
+  #    verifies its callers, or a network policy that admits them alone: the
+  #    Service carries the gateways' and the operators' ports, and a pod's
+  #    address reaches all three listeners.
+  #    The standbys' listener is called by the controller's own pods and by
+  #    nobody else. What fences it admits, to ports.replication, the pods
+  #    under the controller's selector labels: app.kubernetes.io/name,
+  #    app.kubernetes.io/instance and app.kubernetes.io/component:
+  #    policy-controller. A fence that keeps them out leaves every standby
+  #    not ready. The chart renders no such policy: one that selects the
+  #    controller's pods isolates their other listeners too.
+  identityAsTold: []
 
   # -- The Service <fullname>-policy-controller, three ports on the listeners'
   #    own numbers: `grpc` for the gateways' listener, `control` for the
@@ -458,7 +583,7 @@ policyController:
   #    4096). The controller's own default is one for every CPU it may use,
   #    which with no CPU limit is every core of the node. 2 is the smallest
   #    count that leaves a worker for the probes while a task holds the
-  #    other. Raise it with the CPU limit; null leaves the flag out, so the
+  #    other. Raise it with the CPU limit; 0 leaves the flag out, so the
   #    count follows the CPU limit.
   runtimeWorkerThreads: 2
 
@@ -478,16 +603,26 @@ policyController:
 
   # -- Pod disruption budget. With one replica, minAvailable: 1 lets no pod
   #    be evicted and a node drain waits on it for ever: run two replicas or
-  #    more, or leave the budget off.
+  #    more, or leave the budget off. The budget counts ready pods: a standby
+  #    is ready once it is synced where identityAsTold, or a flag of
+  #    extraArgs, names replication and the listeners serve no TLS, and at
+  #    once otherwise, where it holds nothing.
   podDisruptionBudget:
     enabled: false
     minAvailable: 1
 
-  # -- Security context of the controller container: the router's. Your image
-  #    runs as UID 65532 under it; for an image built with another user set
-  #    runAsUser as for the router. The controller writes no file, so the
-  #    read-only root filesystem needs no volume. With the controller on the
-  #    schema refuses a null here: to run with none, set each member to null.
+  # -- Security context of the controller container: the router's. The image
+  #    built from docker/policy-controller.Dockerfile runs as UID 65532 and
+  #    names it by number; for an image built with another user set
+  #    runAsUser as for the router. The controller writes no file but a spec
+  #    store's, on the store's own volume, so the read-only root filesystem
+  #    needs no volume. Beside a store the pod's fsGroup is this runAsUser:
+  #    the user the image runs as writes the claim. With runAsUser null no
+  #    group is named, and the claim must then be writable by the user the
+  #    container runs as. With the controller on the schema refuses a null
+  #    here: to run with none, set each member to null. Reused values hold
+  #    no default under it: the map given there is the whole context, and
+  #    an empty one runs the container with none.
   securityContext:
     readOnlyRootFilesystem: true
     runAsNonRoot: true
@@ -507,7 +642,8 @@ policyController:
     periodSeconds: 30
 
   # -- Readiness probe tuning. `/readiness` on the admin listener answers 200
-  #    once every listener serves and 503 from SIGTERM on.
+  #    once every listener serves and 503 from SIGTERM on. A standby that
+  #    follows its leader answers 503 while it is not synced with it.
   readinessProbe:
     path: /readiness
     initialDelaySeconds: 2
@@ -516,7 +652,9 @@ policyController:
   # -- Graceful shutdown: how long a shutdown may take in all after SIGTERM
   #    (passed as --shutdown-grace-period-secs; 30 is the controller's own
   #    default). The pod's terminationGracePeriodSeconds is this plus
-  #    terminationGraceMarginSeconds.
+  #    terminationGraceMarginSeconds. On a spec store a pod started beside
+  #    one that still holds the store waits this long for it, and answers
+  #    no probe meanwhile.
   shutdownGracePeriodSeconds: 30
   # -- The window the listeners keep accepting after readiness fails; null
   #    keeps the controller's default of 5 seconds. More than half the grace

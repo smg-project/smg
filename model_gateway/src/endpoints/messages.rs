@@ -4,7 +4,10 @@
 //! own 400 before the body is read; the betas feed the request rules that
 //! read a header beside the body ([`validate_with_betas`]). The handlers keep
 //! the raw [`HeaderMap`] they forward: nothing here changes what the backend
-//! receives.
+//! receives. The extractor runs where the handlers run, on the buffered body
+//! path. A request the stream layer forwards whole reaches no handler: the
+//! layer makes the version check itself (`MessagesHeaders::check_version`),
+//! and the rules that read the body stay with the handler.
 
 use std::borrow::Cow;
 
@@ -14,7 +17,10 @@ use axum::{
     response::Response,
 };
 use chrono::{Datelike, NaiveDate};
-use openai_protocol::messages::{validate_with_betas, CreateMessageRequest, MessagesBetas};
+use openai_protocol::{
+    messages::{validate_with_betas, CreateMessageRequest, MessagesBetas},
+    validated::header_echo,
+};
 
 use crate::routers::error as route_error;
 
@@ -33,18 +39,29 @@ pub(crate) struct MessagesHeaders {
 }
 
 impl MessagesHeaders {
-    /// The typed headers of `headers`, or the public API's 400 for an
-    /// `anthropic-version` that is not a calendar date of 2023 or later.
-    pub(crate) fn parse(headers: &HeaderMap) -> Result<Self, Response> {
+    /// The public API's 400 for an `anthropic-version` that is not a calendar
+    /// date of 2023 or later. The stream layer makes this check on a request
+    /// it forwards whole, which reaches no handler. The message echoes the
+    /// client's value as text (a byte outside ASCII is shown, not dropped),
+    /// cut at the header echo bound.
+    pub(crate) fn check_version(headers: &HeaderMap) -> Result<(), Response> {
         if let Some(value) = headers.get("anthropic-version") {
-            let version = value.to_str().unwrap_or_default();
-            if parse_version(version).is_none() {
+            let version = String::from_utf8_lossy(value.as_bytes());
+            if parse_version(&version).is_none() {
+                let echo = header_echo(&version);
                 return Err(route_error::bad_request(
                     "invalid_anthropic_version",
-                    format!("anthropic-version: \"{version}\" is not a valid version"),
+                    format!("anthropic-version: \"{echo}\" is not a valid version"),
                 ));
             }
         }
+        Ok(())
+    }
+
+    /// The typed headers of `headers`, or the refusal of
+    /// [`Self::check_version`].
+    pub(crate) fn parse(headers: &HeaderMap) -> Result<Self, Response> {
+        Self::check_version(headers)?;
         let betas = MessagesBetas::from_header_values(
             headers
                 .get_all("anthropic-beta")
@@ -57,7 +74,7 @@ impl MessagesHeaders {
     /// The request rules that read the betas beside the body, refused with
     /// the public API's own 400 (the code and the message of the rule).
     pub(crate) fn validate(&self, body: &CreateMessageRequest) -> Result<(), Response> {
-        validate_with_betas(body, &self.betas).map_err(|refusal| {
+        validate_with_betas(body, self.betas).map_err(|refusal| {
             route_error::bad_request(
                 refusal.code.into_owned(),
                 refusal.message.map(Cow::into_owned).unwrap_or_default(),
@@ -98,7 +115,10 @@ fn parse_version(version: &str) -> Option<NaiveDate> {
 
 #[cfg(test)]
 mod tests {
-    use axum::http::{HeaderValue, StatusCode};
+    use axum::{
+        body::to_bytes,
+        http::{HeaderValue, StatusCode},
+    };
 
     use super::*;
 
@@ -145,6 +165,73 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    /// The message of the 400 that refuses `value` as a version, read from
+    /// the refusal's body.
+    async fn refusal_message(value: HeaderValue) -> String {
+        let mut headers = HeaderMap::new();
+        headers.insert("anthropic-version", value);
+        let refused = MessagesHeaders::parse(&headers).expect_err("a refused version");
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(refused.into_body(), usize::MAX)
+            .await
+            .expect("the refusal's body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("a JSON body");
+        body["error"]["message"]
+            .as_str()
+            .expect("a message")
+            .to_string()
+    }
+
+    /// The refusal echoes the client's value only up to the header echo
+    /// bound and marks the cut (the value is the client's text, and only the
+    /// server's header limit bounds it), and a value that is not ASCII is
+    /// echoed as text, not as an empty value.
+    #[tokio::test]
+    async fn the_version_refusal_echoes_a_bounded_value() {
+        let long = "9".repeat(8000);
+        let rows = [
+            (
+                "a short value",
+                HeaderValue::from_static("latest"),
+                "latest".to_string(),
+            ),
+            (
+                "a value of 8000 characters",
+                HeaderValue::from_str(&long).expect("a header value"),
+                format!("{}...", "9".repeat(64)),
+            ),
+            (
+                "a value with a byte outside ASCII",
+                HeaderValue::from_bytes(b"2023-06-01\xe9").expect("a header value"),
+                "2023-06-01\u{fffd}".to_string(),
+            ),
+        ];
+        // Counts can agree while a character is wrong, so a failure line shows each text's end.
+        let tail = |text: &str| -> String {
+            let skip = text.chars().count().saturating_sub(16);
+            text.chars().skip(skip).collect()
+        };
+        let mut misread = Vec::new();
+        for (row, value, echo) in rows {
+            let message = refusal_message(value).await;
+            let due = format!("anthropic-version: \"{echo}\" is not a valid version");
+            if message != due {
+                let echoed = message
+                    .strip_prefix("anthropic-version: \"")
+                    .and_then(|rest| rest.strip_suffix("\" is not a valid version"))
+                    .unwrap_or(&message);
+                let (shown, wanted) = (echoed.chars().count(), echo.chars().count());
+                misread.push(format!(
+                    "{row}: the message echoes {shown} characters of the value, due {wanted}; \
+                     it ends {:?}, due {:?}",
+                    tail(echoed),
+                    tail(&echo)
+                ));
+            }
+        }
+        assert!(misread.is_empty(), "{}", misread.join("\n"));
     }
 
     /// A thinking budget at or above `max_tokens` is refused as the public

@@ -93,7 +93,7 @@ pub(crate) use inflight::{
 pub(crate) use item_limits::engine_item_limits;
 pub(crate) use plan::{
     anchor_rendered_markers, prepare_placeholder_tokens, resolve_media_part_order,
-    validate_rendered_media_anchors, MediaPlan, PlaceholderTokens,
+    validate_rendered_media_anchors, MediaPlan, PlaceholderTokens, RequestRefusal,
 };
 pub(crate) use process::process_multimodal_plan;
 pub(crate) use refs::{
@@ -123,11 +123,29 @@ pub(crate) fn assembly_error_response(error: &anyhow::Error) -> Response {
     }
 }
 
-/// The client-facing message for a media pipeline failure: the whole error
-/// chain, so the cause (the URL whose fetch ran out of its budget, the clip
-/// the decoder refused) reaches the caller, not only the outermost context.
+/// The client-facing message for a media pipeline failure: the route's
+/// sentence and the pipeline's verdict on the request (the connector's own
+/// words for the URL whose fetch ran out of its budget, the clip the decoder
+/// refused, the cap a payload met), without the gateway's stage frames between
+/// them: "failed to finalize the tracker" names a structure the client never
+/// sees. The stage frames sit above the tracker's own typed error, so a
+/// failure with no connector verdict reads that error's own text when the
+/// chain carries one, and the whole chain otherwise: the frames that say what
+/// failed (the config read, the replacement index, the panic) stay in the
+/// client's sentence. The whole chain, stage frames included, is the log
+/// line's at the call site.
 pub(crate) fn processing_failed_message(error: &anyhow::Error) -> String {
-    format!("Multimodal processing failed: {error:#}")
+    let cause = if let Some(media) = media_verdict(error) {
+        media.to_string()
+    } else if let Some(tracker) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<MultiModalError>())
+    {
+        tracker.to_string()
+    } else {
+        format!("{error:#}")
+    };
+    format!("Multimodal processing failed: {cause}")
 }
 
 /// The media connector's own error in a pipeline failure's chain, if any:
@@ -201,6 +219,19 @@ pub(crate) fn processing_failed_response(error: &anyhow::Error) -> Response {
     } else {
         error::bad_request(PIPELINE_CODE, message)
     }
+}
+
+/// Whether `error` carries an explicit verdict that the request's own media
+/// is at fault: the connector's client verdict, an item over the encoder's
+/// budget, or a video part on a process that cannot decode video. A failure
+/// with no verdict in its chain does not, though [`processing_failed_response`]
+/// answers it 400 too: that class also holds a model configuration this host
+/// could not load and a processor's own fault, which the client cannot fix.
+pub(crate) fn is_request_media_fault(error: &anyhow::Error) -> bool {
+    encoder_budget::ItemOverEncoderBudget::is(error)
+        || process::VideoDecoderUnavailable::is(error)
+        || (!HubFetchError::is(error)
+            && media_verdict(error).is_some_and(|media| media.fault() == MediaFault::Client))
 }
 
 /// The client's answer when the model's hub failed to serve a configuration
@@ -557,7 +588,8 @@ mod tests {
     }
 
     /// A fetch that ran out of its budget is reported with its URL and the
-    /// budget, not as the bare "failed to finalize" context around it.
+    /// budget, under the route's sentence, without the "failed to finalize"
+    /// context frame around it.
     #[test]
     fn a_processing_failure_names_its_cause() {
         let error = anyhow::Error::new(MultiModalError::Media(MediaConnectorError::Timeout {
@@ -567,8 +599,61 @@ mod tests {
         .context("Failed to finalize multimodal tracker");
         assert_eq!(
             processing_failed_message(&error),
-            "Multimodal processing failed: Failed to finalize multimodal tracker: media fetch of \
-             https://media.example/clip.mp4 timed out after 30s"
+            "Multimodal processing failed: media fetch of https://media.example/clip.mp4 timed \
+             out after 30s"
+        );
+    }
+
+    /// The message is the route's sentence and the pipeline's verdict on the
+    /// request: the gateway's stage frames around the verdict are the log's
+    /// (the chain keeps them), and the verdict's own source is not repeated
+    /// after it. The tracker's own typed error under the frames reads its text
+    /// alone; a failure with neither keeps its whole chain, whose frames say
+    /// what failed.
+    #[test]
+    fn a_processing_failures_message_leaves_the_stage_frames_to_the_log() {
+        let undecodable =
+            image::ImageError::Unsupported(image::error::UnsupportedError::from_format_and_kind(
+                image::error::ImageFormatHint::Unknown,
+                image::error::UnsupportedErrorKind::Format(image::error::ImageFormatHint::Unknown),
+            ));
+        let decoder_said = undecodable.to_string();
+        let error = anyhow::Error::new(MultiModalError::Media(MediaConnectorError::Image(
+            undecodable,
+        )))
+        .context("Failed to finalize multimodal tracker")
+        .context("Failed to process the plan");
+        assert_eq!(
+            processing_failed_message(&error),
+            format!("Multimodal processing failed: image decode error: {decoder_said}")
+        );
+        assert!(
+            format!("{error:#}").contains("Failed to finalize multimodal tracker: "),
+            "the chain keeps the frames for the log: {error:#}"
+        );
+
+        let validation = anyhow::Error::new(MultiModalError::Validation(
+            "placeholder 3 has no part".to_string(),
+        ))
+        .context("Failed to finalize multimodal tracker");
+        assert_eq!(
+            processing_failed_message(&validation),
+            "Multimodal processing failed: tracker validation error: placeholder 3 has no part"
+        );
+
+        let config_read = anyhow::anyhow!("No such file or directory (os error 2)")
+            .context("Failed to read config.json at /models/m/config.json");
+        assert_eq!(
+            processing_failed_message(&config_read),
+            "Multimodal processing failed: Failed to read config.json at /models/m/config.json: \
+             No such file or directory (os error 2)"
+        );
+        let ranges = anyhow::anyhow!("feature range 0 has zero length")
+            .context("Invalid explicit feature ranges in image replacement 2");
+        assert_eq!(
+            processing_failed_message(&ranges),
+            "Multimodal processing failed: Invalid explicit feature ranges in image replacement 2: \
+             feature range 0 has zero length"
         );
     }
 
@@ -599,7 +684,7 @@ mod tests {
     /// under `media_too_large`; a scratch file that failed on this side and
     /// a preprocessing task that died are 500 `server_error`s; a failure with
     /// no connector verdict keeps the pipeline's own 400 code. The message is
-    /// the whole chain in every case.
+    /// the route's sentence and the cause in every case.
     #[tokio::test]
     async fn a_pipeline_failure_is_answered_by_the_connectors_verdict() {
         let finalize = |media: MediaConnectorError| {
@@ -835,5 +920,32 @@ mod tests {
                 "{gauge} is set by the second report:\n{rendered}"
             );
         }
+    }
+
+    /// The verdict the processing arm writes its WARN on: the connector's
+    /// client verdict (also under a context), an item over the encoder's
+    /// budget and a video part without a decoder are the request's own
+    /// media; a failure with no verdict in its chain is not.
+    #[test]
+    fn only_an_explicit_verdict_makes_a_failure_the_requests_media() {
+        let refused = anyhow::Error::new(MediaConnectorError::InvalidUrl("x".to_string()))
+            .context("Failed to finalize multimodal tracker");
+        assert!(super::is_request_media_fault(&refused));
+        assert!(super::is_request_media_fault(&anyhow::Error::new(
+            super::process::VideoDecoderUnavailable { why: "no decoder" }
+        )));
+        assert!(super::is_request_media_fault(&anyhow::Error::new(
+            ItemOverEncoderBudget {
+                modality: Modality::Image,
+                position: 1,
+                count: 1,
+                feature_tokens: 2,
+                sampled_frames: None,
+                budget: 1,
+            }
+        )));
+        assert!(!super::is_request_media_fault(&anyhow::anyhow!(
+            "Image preprocessing failed"
+        )));
     }
 }

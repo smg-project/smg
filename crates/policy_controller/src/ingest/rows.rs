@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use openai_protocol::worker::WorkerLoadResponse;
 
-use crate::view::{LoadRow, Role, SignalSource};
+use crate::view::{permille, LoadRow, Role, SignalSource};
 
 /// One worker's load row from its report, in one pass over the ranks: the
 /// request and token counts summed, the KV ratios averaged, the drain rate
@@ -73,6 +73,8 @@ pub fn load_row(
             0
         },
         resident_tokens: resident.map_or(0, narrow),
+        // Counted when the report has ranks and every one of them sends it.
+        resident_counted: resident.is_some() && !report.loads.is_empty(),
         report_age_ms: u32::try_from(now.saturating_duration_since(sampled_at).as_millis())
             .unwrap_or(u32::MAX),
         source,
@@ -83,11 +85,6 @@ pub fn load_row(
 /// A summed engine count as the row's field: negative reads as none.
 fn narrow(count: i64) -> u32 {
     u32::try_from(count.max(0)).unwrap_or(u32::MAX)
-}
-
-/// A ratio as the row's permille field.
-fn permille(ratio: f64) -> u16 {
-    (ratio * 1000.0).round().clamp(0.0, 1000.0) as u16
 }
 
 #[cfg(test)]
@@ -138,9 +135,27 @@ mod tests {
         assert_eq!(row.active_kv_permille, 400);
         assert_eq!(row.live_rate, 150);
         assert_eq!(row.resident_tokens, 2_000);
+        assert!(row.resident_counted);
         assert_eq!(row.max_running, 512);
         assert_eq!(row.source, SignalSource::Poll);
         assert_eq!(row.report_age_ms, 0);
+    }
+
+    /// One rank without the count, or a report with no rank, is a report
+    /// that does not count resident tokens, not a count of zero.
+    #[test]
+    fn resident_tokens_are_counted_only_when_every_rank_sends_them() {
+        let now = Instant::now();
+        let mut silent = rank(1, 0, 0.1, 40.0, None);
+        silent.num_resident_tokens = None;
+        let one_silent = report(vec![rank(1, 0, 0.1, 40.0, None), silent]);
+        let row = load_row(&one_silent, Role::Single, now, now, SignalSource::Poll);
+        assert_eq!((row.resident_tokens, row.resident_counted), (0, false));
+        let no_rank = load_row(&report(vec![]), Role::Single, now, now, SignalSource::Poll);
+        assert_eq!(
+            (no_rank.resident_tokens, no_rank.resident_counted),
+            (0, false)
+        );
     }
 
     #[test]

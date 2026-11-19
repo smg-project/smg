@@ -29,7 +29,8 @@ pub mod proto {
 
 /// Streaming `generate()` response that auto-aborts on drop. Concrete
 /// alias for the generic `crate::AbortOnDropStream`.
-pub type AbortOnDropStream = crate::AbortOnDropStream<proto::GenerateResponse, VllmEngineClient>;
+pub type AbortOnDropStream =
+    crate::AbortOnDropStream<Box<proto::GenerateResponse>, VllmEngineClient>;
 
 /// gRPC client for vLLM scheduler
 #[derive(Clone)]
@@ -46,7 +47,9 @@ impl VllmEngineClient {
     crate::impl_engine_client_basics!(
         proto,
         proto::vllm_engine_client::VllmEngineClient<Channel>,
-        "vLLM"
+        "vLLM",
+        "vllm.grpc.engine.VllmEngine",
+        proto::vllm_engine_server::SERVICE_NAME
     );
 
     /// The request every builder of this client sends: the tokenized input, the
@@ -203,6 +206,7 @@ impl VllmEngineClient {
             presence_penalty: request.presence_penalty.unwrap_or(0.0),
             repetition_penalty: request.repetition_penalty.unwrap_or(1.0),
             max_tokens,
+            min_tokens: request.min_tokens.unwrap_or(0),
             stop: stop_sequences,
             stop_token_ids: request.stop_token_ids.clone().unwrap_or_default(),
             skip_special_tokens,
@@ -212,10 +216,14 @@ impl VllmEngineClient {
             n: request.n.unwrap_or(1),
             logprobs,
             logit_bias: logit_bias_by_token_id(request.logit_bias.as_ref()),
-            // The proto seed is a signed 32-bit word, the OpenAI-compatible seed an int64: itself
-            // when it fits, else its bits folded, and never -1, which the engine reads as "no seed";
-            // None stays None and the engine picks its own.
-            seed: request.seed.map(seeded_i32),
+            // The proto seed is a signed 32-bit word. `sampling_seed` (a u64) wins when a request
+            // sets it, with its bits folded; else the OpenAI-compatible `seed` (an int64) is
+            // itself when it fits, else its bits folded. Never -1, which the engine reads as
+            // "no seed"; None stays None and the engine picks its own.
+            seed: request
+                .sampling_seed
+                .map(seeded_folded_i32)
+                .or_else(|| request.seed.map(seeded_i32)),
             constraint: Self::build_constraint_for_chat(request, constraint)?,
             ..Default::default()
         })
@@ -450,7 +458,10 @@ impl VllmEngineClient {
             n: request.n.unwrap_or(1),
             logprobs,
             logit_bias: logit_bias_by_token_id(request.logit_bias.as_ref()),
-            seed: request.seed.map(seeded_i32),
+            seed: request
+                .sampling_seed
+                .map(seeded_folded_i32)
+                .or_else(|| request.seed.map(seeded_i32)),
             constraint,
             ..Default::default()
         })
@@ -530,7 +541,7 @@ impl VllmEngineClient {
                 warn!("Failed to inject trace context: {}", e);
             }
             let (metadata, _extensions, ()) = carrier.into_parts();
-            let stream = call_with_frames::<proto::GenerateResponse>(
+            let stream = call_with_frames::<Box<proto::GenerateResponse>>(
                 self.channel(),
                 "/vllm.grpc.engine.VllmEngine/Generate",
                 metadata.into_headers(),
@@ -660,6 +671,41 @@ mod tests {
         // word's minimum instead.
         assert_eq!(seed(seeded(Some(u64::from(u32::MAX)))), Some(i32::MIN));
         assert_eq!(seed(seeded(None)), None);
+    }
+
+    /// A chat or completion request's `sampling_seed` reaches the proto seed folded, as on the
+    /// plain route, and wins over `seed` when a request sets both; `seed` alone still arrives.
+    #[test]
+    fn chat_and_completion_sampling_seed_reaches_the_engine_request() {
+        let chat = |sampling_seed: Option<u64>, seed: Option<i64>| {
+            let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                "model": "m", "messages": [{"role": "user", "content": "hi"}],
+                "sampling_seed": sampling_seed, "seed": seed
+            }))
+            .expect("a chat request");
+            VllmEngineClient::build_grpc_sampling_params_from_chat(
+                &request,
+                OutputConstraint::default(),
+            )
+            .expect("build sampling params")
+            .seed
+        };
+        let completion = |sampling_seed: Option<u64>, seed: Option<i64>| {
+            let request: CompletionRequest = serde_json::from_value(serde_json::json!({
+                "model": "m", "prompt": "hi", "sampling_seed": sampling_seed, "seed": seed
+            }))
+            .expect("a completion request");
+            VllmEngineClient::build_grpc_sampling_params_from_completion(&request)
+                .expect("build sampling params")
+                .seed
+        };
+        let both =
+            |sampling_seed, seed| (chat(sampling_seed, seed), completion(sampling_seed, seed));
+        assert_eq!(both(Some(7), None), (Some(7), Some(7)));
+        assert_eq!(both(Some(7), Some(42)), (Some(7), Some(7)));
+        assert_eq!(both(Some(1 << 32), None), (Some(1), Some(1)));
+        assert_eq!(both(None, Some(42)), (Some(42), Some(42)));
+        assert_eq!(both(None, None), (None, None));
     }
 
     #[test]
@@ -902,6 +948,36 @@ mod tests {
         )
         .expect("build sampling params");
         assert!(params.logit_bias.is_empty());
+    }
+
+    /// A chat request's `min_tokens` reaches the proto, as a completion
+    /// request's does; a request without one sends the proto's zero, which the
+    /// engine reads as no minimum.
+    #[test]
+    fn chat_and_completion_sampling_params_carry_min_tokens() {
+        let chat: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}], "min_tokens": 30
+        }))
+        .expect("a chat request");
+        let params = VllmEngineClient::build_grpc_sampling_params_from_chat(
+            &chat,
+            OutputConstraint::default(),
+        )
+        .expect("build sampling params");
+        assert_eq!(params.min_tokens, 30);
+        let completion: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "prompt": "hi", "min_tokens": 30
+        }))
+        .expect("a completion request");
+        let params = VllmEngineClient::build_grpc_sampling_params_from_completion(&completion)
+            .expect("build sampling params");
+        assert_eq!(params.min_tokens, 30);
+        let params = VllmEngineClient::build_grpc_sampling_params_from_chat(
+            &ChatCompletionRequest::default(),
+            OutputConstraint::default(),
+        )
+        .expect("build sampling params");
+        assert_eq!(params.min_tokens, 0);
     }
 
     #[test]

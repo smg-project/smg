@@ -196,10 +196,10 @@ fn push_item(
                 StringOrContentParts::String(s) => MessageContent::Text(s.clone()),
                 StringOrContentParts::Array(parts) => response_parts_to_message_content(parts)?,
             };
-            push_role_message(messages, role, content);
+            push_role_message(messages, role, content)?;
         }
         ResponseInputOutputItem::Message { role, content, .. } => {
-            push_role_message(messages, role, response_parts_to_message_content(content)?);
+            push_role_message(messages, role, response_parts_to_message_content(content)?)?;
         }
         ResponseInputOutputItem::FunctionToolCall {
             call_id,
@@ -555,11 +555,25 @@ fn response_parts_to_message_content(
 /// Append a role-tagged input message. A `developer` turn folds into the
 /// leading system message: OpenAI ranks it with `system`, above `user`, and
 /// appended unlabelled it reads as one more conversational turn that the
-/// latest user message is free to override.
-fn push_role_message(messages: &mut Vec<ChatMessage>, role: &str, content: MessageContent) {
+/// latest user message is free to override. The fold carries text only, so a
+/// media part in a developer item is refused here instead of being dropped on
+/// the way: media parts are taken in user messages.
+fn push_role_message(
+    messages: &mut Vec<ChatMessage>,
+    role: &str,
+    content: MessageContent,
+) -> Result<(), ConversionError> {
     if role != "developer" {
         push_chat_message(messages, role_to_chat_message(role, content));
-        return;
+        return Ok(());
+    }
+    if let MessageContent::Parts(parts) = &content {
+        if let Some(part) = parts.iter().find_map(unfoldable_part_name) {
+            return Err(ConversionError::UnsupportedContentPart {
+                part,
+                why: "a developer message folds into the system text, and media parts are taken in user messages",
+            });
+        }
     }
     let text = content.to_simple_string();
     match messages.first_mut() {
@@ -578,6 +592,22 @@ fn push_role_message(messages: &mut Vec<ChatMessage>, role: &str, content: Messa
                 ext: Default::default(),
             },
         ),
+    }
+    Ok(())
+}
+
+/// The name of a part the developer fold would drop (`ContentPart::text` has
+/// no text for it). The Responses conversion produces `image_url` parts from
+/// `input_image` and no other media part, so that is the name a client sees;
+/// the chat kinds this conversion never produces keep their own tag.
+fn unfoldable_part_name(part: &ContentPart) -> Option<&'static str> {
+    match part {
+        ContentPart::Text { .. } | ContentPart::Refusal { .. } => None,
+        ContentPart::ImageUrl { .. } => Some("input_image"),
+        ContentPart::AudioUrl { .. } => Some("audio_url"),
+        ContentPart::InputAudio { .. } => Some("input_audio"),
+        ContentPart::VideoUrl { .. } => Some("video_url"),
+        ContentPart::Unknown(_) => Some("unknown"),
     }
 }
 
@@ -1278,6 +1308,9 @@ mod tests {
             reasoning: Some(ResponseReasoningParam {
                 effort: Some(ReasoningEffort::High),
                 summary: None,
+                mode: None,
+                context: None,
+                generate_summary: None,
             }),
             ..Default::default()
         };
@@ -1302,6 +1335,9 @@ mod tests {
                 reasoning: Some(ResponseReasoningParam {
                     effort: Some(effort),
                     summary: None,
+                    mode: None,
+                    context: None,
+                    generate_summary: None,
                 }),
                 ..Default::default()
             };
@@ -1790,6 +1826,58 @@ mod tests {
             ConversionError::UnsupportedToolOutput("image".to_string()).code(),
             "unsupported_content_part"
         );
+    }
+
+    /// A `developer` item folds into the leading system message as text, so a
+    /// media part in it has nowhere to go: the conversion refuses the request
+    /// under `unsupported_content_part`, naming the part, instead of folding
+    /// the text and dropping the image (the request used to answer 200 as if
+    /// the part had not been sent). A text-only developer item folds as
+    /// before, in the message form and in the simple-input form.
+    #[test]
+    fn a_media_part_in_a_developer_item_is_refused_not_folded_away() {
+        let developer = |parts: serde_json::Value| serde_json::json!([{"type": "message", "role": "developer", "content": parts}]);
+        let image = responses_to_chat(&items_request(
+            "local-model",
+            developer(serde_json::json!([
+                {"type": "input_text", "text": "Describe what you see."},
+                {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="}
+            ])),
+        ))
+        .expect_err("a developer item's image has no place in the fold");
+        assert_eq!(image.code(), "unsupported_content_part");
+        assert!(image.to_string().contains("\"input_image\""), "{image}");
+        assert!(image.to_string().contains("developer message"), "{image}");
+
+        let simple = responses_to_chat(&items_request(
+            "local-model",
+            serde_json::json!([{"role": "developer", "content": [
+                {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="}
+            ]}]),
+        ))
+        .expect_err("a simple developer message is read the same way");
+        assert_eq!(simple.code(), "unsupported_content_part");
+
+        let chat = responses_to_chat(&items_request(
+            "local-model",
+            serde_json::json!([
+                {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "Answer in French."}]},
+                {"role": "developer", "content": "Keep it short."},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Hello"}]}
+            ]),
+        ))
+        .expect("text-only developer items fold");
+        assert_eq!(chat.messages.len(), 2, "{:?}", chat.messages);
+        match &chat.messages[0] {
+            ChatMessage::System {
+                content: MessageContent::Text(text),
+                ..
+            } => assert_eq!(
+                text,
+                "Developer instructions:\nAnswer in French.\n\nDeveloper instructions:\nKeep it short."
+            ),
+            other => panic!("the developer turns fold into the leading system message: {other:?}"),
+        }
     }
 
     /// A function output with a part that has no text (an image, a file, a

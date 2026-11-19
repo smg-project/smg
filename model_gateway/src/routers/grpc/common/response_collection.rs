@@ -10,7 +10,10 @@ use tracing::error as trace_error;
 use crate::{
     observability::metrics::metrics_labels,
     routers::{
-        common::pd_failure::{PdSide, SidePhase},
+        common::{
+            pd_failure::{PdSide, SidePhase},
+            prefill_admission::PrefillLoadGuard,
+        },
         error,
         grpc::{
             context::ExecutionResult,
@@ -24,7 +27,7 @@ use crate::{
             },
         },
     },
-    worker::{PrefillLoadGuard, Worker},
+    worker::Worker,
 };
 
 /// Drain each Prefill sample through its terminal response, releasing only that
@@ -349,10 +352,6 @@ mod tests {
 
         fn mark_completed(&mut self) {}
 
-        fn defer_abort_until_first_item(self) -> Self {
-            self
-        }
-
         fn defer_abort_within(self, _bound: Duration) -> Self {
             self
         }
@@ -367,10 +366,6 @@ mod tests {
         }
 
         fn mark_completed(&mut self) {}
-
-        fn defer_abort_until_first_item(self) -> Self {
-            self
-        }
 
         fn defer_abort_within(self, _bound: Duration) -> Self {
             self
@@ -399,10 +394,6 @@ mod tests {
 
         fn mark_completed(&mut self) {}
 
-        fn defer_abort_until_first_item(self) -> Self {
-            self
-        }
-
         fn defer_abort_within(self, _bound: Duration) -> Self {
             self
         }
@@ -428,10 +419,6 @@ mod tests {
         }
 
         fn mark_completed(&mut self) {}
-
-        fn defer_abort_until_first_item(self) -> Self {
-            self
-        }
 
         fn defer_abort_within(self, _bound: Duration) -> Self {
             self

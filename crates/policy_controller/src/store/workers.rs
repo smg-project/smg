@@ -2,11 +2,11 @@
 //! that change it and the watch the gateways' pools derive from (design 5.1,
 //! the workers row; 5.2, `WatchWorkers`).
 
-use std::{collections::BTreeMap, time::Instant};
+use std::{collections::BTreeMap, sync::Arc, time::Instant};
 
 use crate::{
     lease::Membership,
-    store::GatewayId,
+    store::{encoding::EncodeOffer, pairing::PairingDescriptor, GatewayId},
     view::{fingerprint, Role, WireModes, WorkerId},
 };
 
@@ -71,23 +71,19 @@ impl Default for HealthPolicy {
     }
 }
 
-/// The overload thresholds a worker's reports are judged against, resolved
-/// at registration; a field left `None` is off.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The overload thresholds a worker's registration names for itself. A
+/// field it names stands over the value of the binding that matches the
+/// worker's pool, whether that binding's block is switched on or off; a
+/// field left `None` takes the binding's. The store holds no default of
+/// its own: the spec's is the only one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Overload {
-    /// KV usage at or above which the worker is overloaded, in permille.
+    /// KV usage in permille, the mean over the engine's ranks, at or above
+    /// which the worker's rows are vetoed.
     pub kv_usage_permille: Option<u16>,
-    /// Queued requests at or above which the worker is overloaded.
+    /// Queued requests, summed over the engine's ranks, at or above which
+    /// the worker's rows are vetoed.
     pub waiting_requests: Option<u32>,
-}
-
-impl Default for Overload {
-    fn default() -> Self {
-        Self {
-            kv_usage_permille: Some(800),
-            waiting_requests: Some(8),
-        }
-    }
 }
 
 /// How a worker's signals reach the store (the row's `signals`).
@@ -137,11 +133,25 @@ pub struct WorkerFacts {
     /// descriptor's fields).
     pub labels: BTreeMap<String, String>,
     pub zone: Option<String>,
-    /// The prefill-decode pairing descriptor, when the worker has one.
-    pub pairing: Option<String>,
-    /// The pairing class, derived by the store at each membership change;
-    /// `0` outside any pairing.
-    pub pair_class: u32,
+    /// What the worker offers a prefill-decode partner, when the handshake
+    /// learned any of it. The store derives the pair classes from it, with
+    /// the engine kind as the runtime, where a membership write moves a
+    /// member or an offer and where a generation moves the pairing mode
+    /// ([`pairing`](super::pairing)): a registration hands no class in. The
+    /// door drops a blank value and reads a name past its blanks. Behind a
+    /// shared pointer: a worker that reports none holds one word for it,
+    /// and every copy of a row shares the one its worker reported.
+    pub pairing: Option<Arc<PairingDescriptor>>,
+    /// The worker's end of the encode handoff, as the handshake learned it;
+    /// the default states none. The store derives the encode classes from
+    /// it, with the engine kind as the runtime, where a membership write
+    /// moves a member or an offer and where a generation moves the pairing
+    /// mode ([`encoding`](super::encoding)). The door drops a blank
+    /// connector and reads its name past its blanks.
+    pub encode: EncodeOffer,
+    /// The worker takes images, as its registration states: an encoder
+    /// encodes them and a decode attends to them.
+    pub vision: bool,
     /// The engine's admission window (maximum running requests); `None`
     /// when it reports none.
     pub max_running: Option<u32>,
@@ -154,13 +164,33 @@ pub struct WorkerFacts {
     pub overload: Overload,
 }
 
+impl WorkerFacts {
+    /// Whether these facts name the models `other` names, in any order and
+    /// however often. The order is a fact of its own (a row's events are
+    /// indexed under its first model), and a reorder alone is no other
+    /// worker.
+    pub(crate) fn same_models(&self, other: &Self) -> bool {
+        fn named(models: &[String]) -> Vec<&str> {
+            let mut ids: Vec<&str> = models.iter().map(String::as_str).collect();
+            ids.sort_unstable();
+            ids.dedup();
+            ids
+        }
+        self.models == other.models || named(&self.models) == named(&other.models)
+    }
+}
+
 /// One worker as the store holds it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WorkerRow {
     pub id: WorkerId,
     pub facts: WorkerFacts,
     pub status: WorkerStatus,
-    /// Moves on every write to the row; the guard a racing write names.
+    /// Counts the row's stated facts: it moves on every write of them (a
+    /// registration's refresh, a patch) and on no status change. The guard
+    /// a racing write names. The world's writer carries a member's fields
+    /// under the view's lists while it stands, so a write of the facts must
+    /// move it.
     pub revision: u64,
     /// When the row was created on the host's clock.
     pub admitted_at: Instant,
@@ -247,11 +277,27 @@ pub enum MembershipTail {
 
 /// The membership store's write side and its watch.
 ///
-/// Every write moves the store's epoch and the row's revision. A watcher
+/// Every write moves the store's epoch; a write of a row's facts moves the
+/// row's revision, a status change does not. A watcher
 /// reads a snapshot with its epoch, then the changes since it; past the
 /// store's buffer it is told to snapshot again. The snapshot carries the
 /// facts the gateways' pools derive from (role, wire modes, engine kind,
 /// reachability), never a pool list.
+///
+/// A write is answered once its row is written, told to the journal and
+/// counted in the epoch. What a decision reads follows it. The crate's
+/// store builds its pools from the membership once a publication window
+/// ([`crate::store::PUBLISH_WINDOW`]), however many writes the window
+/// took. The build of a registration, its refresh and a patch starts
+/// within one window of their answer, where the store's host pays the due
+/// instant ([`crate::store::LoadSink::publish_due`]), and they are in force
+/// for decisions when it ends. A caller that needs its own write in force
+/// at once, or whose host runs no loop, asks for the build
+/// ([`crate::store::MemoryStore::publish_now`]). A removal and a replaced
+/// incarnation pay the build before they answer, and so does a
+/// registration that takes its worker off a model, for the pools it
+/// leaves. A status change is published with its answer: no decision made
+/// after it is handed the worker.
 pub trait WorkersStore: Send + Sync {
     /// A registration or its refresh. A new key is `Registered`; the same key
     /// with another incarnation is `Replaced` (the old id leaves with its

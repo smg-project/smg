@@ -8,12 +8,14 @@ use serde::{
     de::{
         self,
         value::{MapDeserializer, SeqAccessDeserializer},
-        SeqAccess, Visitor,
+        DeserializeSeed, SeqAccess, Visitor,
     },
     Deserialize, Deserializer, Serialize,
 };
 use serde_json::{Map, Value};
 use validator;
+
+use crate::strict_value::StrictValue;
 
 // ============================================================================
 // Default value helpers
@@ -106,6 +108,21 @@ where
     T: Deserialize<'de>,
 {
     Option::<Vec<T>>::deserialize(deserializer).map(Option::unwrap_or_default)
+}
+
+/// Deserialize a map that also accepts JSON `null` (mapped to the empty map).
+///
+/// Use with `#[serde(default, deserialize_with = "deserialize_null_as_empty_map")]`
+/// on always-present maps an upstream may write as `null`.
+pub fn deserialize_null_as_empty_map<'de, D, K, V>(
+    deserializer: D,
+) -> Result<HashMap<K, V>, D::Error>
+where
+    D: Deserializer<'de>,
+    K: Deserialize<'de> + Eq + std::hash::Hash,
+    V: Deserialize<'de>,
+{
+    Option::<HashMap<K, V>>::deserialize(deserializer).map(Option::unwrap_or_default)
 }
 
 /// Deserialize an `Option<bool>` where JSON `null` means the default `true`.
@@ -325,8 +342,22 @@ pub(crate) fn on_field(
     error
 }
 
+/// The refusal of a tool the model calls by name (a function, a custom tool,
+/// a namespace or one of its members) declared with an empty name at `field`,
+/// in the public API's words: the model can be made to call such a tool, and
+/// the client cannot dispatch a call that names nothing.
+pub(crate) fn empty_tool_name(field: &str) -> validator::ValidationError {
+    invalid(
+        "empty_string",
+        format!(
+            "Invalid '{field}': empty string. Expected a string with minimum length 1, but got \
+             an empty string instead."
+        ),
+    )
+}
+
 /// The JSON type of a value, for validation messages (`a string`, `an array`, ...).
-pub(crate) fn json_type_name(value: &Value) -> &'static str {
+pub fn json_type_name(value: &Value) -> &'static str {
     match value {
         Value::Null => "null",
         Value::Bool(_) => "a boolean",
@@ -495,13 +526,7 @@ impl From<KnownContentPart> for ContentPart {
 impl<'de> Deserialize<'de> for ContentPart {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let fields = Map::<String, Value>::deserialize(deserializer)?;
-        let kind = match fields.get("type").and_then(Value::as_str) {
-            Some(kind) if KnownContentPart::names(kind) => kind.to_string(),
-            _ => return Ok(Self::Unknown(fields)),
-        };
-        serde_json::from_value::<KnownContentPart>(Value::Object(fields))
-            .map(Self::from)
-            .map_err(|error| de::Error::custom(known_part_reason(&kind, &error)))
+        Self::from_fields(fields).map_err(de::Error::custom)
     }
 }
 
@@ -523,6 +548,17 @@ fn known_part_reason(kind: &str, error: &serde_json::Error) -> String {
 }
 
 impl ContentPart {
+    /// The part an object's fields make, for a reader that holds them already.
+    pub(crate) fn from_fields(fields: Map<String, Value>) -> Result<Self, serde_json::Error> {
+        let kind = match fields.get("type").and_then(Value::as_str) {
+            Some(kind) if KnownContentPart::names(kind) => kind.to_string(),
+            _ => return Ok(Self::Unknown(fields)),
+        };
+        serde_json::from_value::<KnownContentPart>(Value::Object(fields))
+            .map(Self::from)
+            .map_err(|error| de::Error::custom(known_part_reason(&kind, &error)))
+    }
+
     /// The text a renderer reads from the part: a text part's text, a
     /// refusal's text (the engines' own servers render a refusal part as the
     /// turn's text); none for a media or an unknown part.
@@ -1011,8 +1047,13 @@ impl<'de> Deserialize<'de> for KeptSchema {
 /// Walks `properties`, `items`, `prefixItems`, `anyOf`/`oneOf`/`allOf`,
 /// `$defs`/`definitions` and `not`; returns the JSON-pointer-like path of the
 /// first object node that lacks the pin.
+///
+/// A schema that holds the rule is walked without an allocation: the path is
+/// put together on the way back from a miss, a segment a level.
 pub fn strict_schema_missing_additional_properties(schema: &Value) -> Option<String> {
-    fn walk(node: &Value, path: &str) -> Option<String> {
+    // The path from `node` to the first unpinned object node under it, empty
+    // when `node` is that node.
+    fn walk(node: &Value) -> Option<String> {
         let obj = node.as_object()?;
         let is_object_node = obj.get("type").and_then(Value::as_str) == Some("object")
             || obj
@@ -1021,17 +1062,13 @@ pub fn strict_schema_missing_additional_properties(schema: &Value) -> Option<Str
                 .is_some_and(|types| types.iter().any(|t| t.as_str() == Some("object")))
             || (obj.get("type").is_none() && obj.contains_key("properties"));
         if is_object_node && obj.get("additionalProperties") != Some(&Value::Bool(false)) {
-            return Some(if path.is_empty() {
-                "()".to_string()
-            } else {
-                path.to_string()
-            });
+            return Some(String::new());
         }
         for key in ["properties", "$defs", "definitions"] {
             if let Some(children) = obj.get(key).and_then(Value::as_object) {
                 for (name, child) in children {
-                    if let Some(found) = walk(child, &format!("{path}/{key}/{name}")) {
-                        return Some(found);
+                    if let Some(rest) = walk(child) {
+                        return Some(format!("/{key}/{name}{rest}"));
                     }
                 }
             }
@@ -1039,22 +1076,27 @@ pub fn strict_schema_missing_additional_properties(schema: &Value) -> Option<Str
         for key in ["anyOf", "oneOf", "allOf", "prefixItems"] {
             if let Some(children) = obj.get(key).and_then(Value::as_array) {
                 for (index, child) in children.iter().enumerate() {
-                    if let Some(found) = walk(child, &format!("{path}/{key}/{index}")) {
-                        return Some(found);
+                    if let Some(rest) = walk(child) {
+                        return Some(format!("/{key}/{index}{rest}"));
                     }
                 }
             }
         }
         for key in ["items", "not"] {
             if let Some(child) = obj.get(key) {
-                if let Some(found) = walk(child, &format!("{path}/{key}")) {
-                    return Some(found);
+                if let Some(rest) = walk(child) {
+                    return Some(format!("/{key}{rest}"));
                 }
             }
         }
         None
     }
-    walk(schema, "")
+    let path = walk(schema)?;
+    Some(if path.is_empty() {
+        "()".to_string()
+    } else {
+        path
+    })
 }
 
 /// Shared shape rules for a json_schema format: name non-empty, schema a JSON object.
@@ -1589,7 +1631,8 @@ impl Serialize for FunctionCall {
 
 impl<'de> Deserialize<'de> for FunctionCall {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let value = Value::deserialize(deserializer)?;
+        // Buffered strictly: the plain value reader keeps the last of a repeated `name`.
+        let value = StrictValue.deserialize(deserializer)?;
         match &value {
             Value::String(s) => match s.as_str() {
                 "none" => Ok(FunctionCall::None),
@@ -2078,6 +2121,8 @@ pub enum PromptVariableTyped {
     },
     #[serde(rename = "input_file")]
     ResponseInputFile {
+        /// The file's detail level, as an input file part takes it.
+        detail: Option<crate::responses::FileDetail>,
         file_data: Option<String>,
         file_id: Option<String>,
         file_url: Option<String>,
@@ -2104,10 +2149,11 @@ pub enum Detail {
 
 /// Retention policy for prompt-cache entries on the Responses API.
 ///
-/// Spec: `prompt_cache_retention: "in-memory" | "24h"`.
+/// Spec: `prompt_cache_retention: "in_memory" | "24h"` (`PromptCacheRetentionEnum`).
+/// `in-memory`, the spelling this crate wrote before, still reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum PromptCacheRetention {
-    #[serde(rename = "in-memory")]
+    #[serde(rename = "in_memory", alias = "in-memory")]
     InMemory,
     #[serde(rename = "24h")]
     Duration24h,
@@ -2820,6 +2866,147 @@ mod tests {
                 }
                 None => assert!(result.is_ok(), "{name:?}/{schema} should pass"),
             }
+        }
+    }
+
+    /// The strict walk names the first object node that lacks the pin by its
+    /// path from the root, a segment a step, and the root itself as `()`; a
+    /// schema that pins every object node names none.
+    #[test]
+    fn the_strict_walk_names_the_first_unpinned_node_by_its_path() {
+        let open = || json!({"type": "object", "properties": {"x": {"type": "string"}}});
+        let pinned = |key: &str, child: Value| {
+            let mut node = json!({"type": "object", "additionalProperties": false});
+            node[key] = child;
+            node
+        };
+        let text = json!({"type": "string"});
+        let cases = [
+            (open(), Some("()")),
+            (json!({"type": ["object", "null"]}), Some("()")),
+            (json!({"properties": {}}), Some("()")),
+            (
+                pinned("properties", json!({"a": open()})),
+                Some("/properties/a"),
+            ),
+            (
+                pinned("properties", json!({"": open()})),
+                Some("/properties/"),
+            ),
+            (pinned("$defs", json!({"a": open()})), Some("/$defs/a")),
+            (
+                pinned("definitions", json!({"a": open()})),
+                Some("/definitions/a"),
+            ),
+            (pinned("anyOf", json!([text, open()])), Some("/anyOf/1")),
+            (pinned("oneOf", json!([open()])), Some("/oneOf/0")),
+            (
+                pinned("allOf", json!([text, text, open()])),
+                Some("/allOf/2"),
+            ),
+            (
+                pinned("prefixItems", json!([text, open()])),
+                Some("/prefixItems/1"),
+            ),
+            (pinned("items", open()), Some("/items")),
+            (pinned("not", open()), Some("/not")),
+            (
+                pinned(
+                    "properties",
+                    json!({"a": {"type": "array", "items": {"anyOf": [
+                        text,
+                        pinned("properties", json!({"b": open()}))
+                    ]}}}),
+                ),
+                Some("/properties/a/items/anyOf/1/properties/b"),
+            ),
+            // First is depth first: the node under the first name, not its nearer sibling.
+            (
+                pinned(
+                    "properties",
+                    json!({"a": pinned("properties", json!({"deep": open()})), "b": open()}),
+                ),
+                Some("/properties/a/properties/deep"),
+            ),
+            // First is by kind: named children, then the lists, then `items` and `not`.
+            (
+                json!({
+                    "type": "object", "additionalProperties": false,
+                    "not": open(), "items": open(), "anyOf": [open()], "properties": {"p": open()}
+                }),
+                Some("/properties/p"),
+            ),
+            (
+                json!({
+                    "type": "object", "additionalProperties": false,
+                    "not": open(), "items": open(), "anyOf": [open()]
+                }),
+                Some("/anyOf/0"),
+            ),
+            (
+                json!({
+                    "type": "object", "additionalProperties": false,
+                    "not": open(), "items": open()
+                }),
+                Some("/items"),
+            ),
+            // First within a kind is by key: `properties`, `$defs`, `definitions`,
+            // and `anyOf`, `oneOf`, `allOf`, `prefixItems`.
+            (
+                json!({
+                    "type": "object", "additionalProperties": false,
+                    "definitions": {"d": open()}, "$defs": {"d": open()},
+                    "properties": {"p": open()}
+                }),
+                Some("/properties/p"),
+            ),
+            (
+                json!({
+                    "type": "object", "additionalProperties": false,
+                    "definitions": {"d": open()}, "$defs": {"d": open()}
+                }),
+                Some("/$defs/d"),
+            ),
+            (
+                json!({
+                    "type": "object", "additionalProperties": false,
+                    "prefixItems": [open()], "allOf": [open()],
+                    "oneOf": [open()], "anyOf": [open()]
+                }),
+                Some("/anyOf/0"),
+            ),
+            (
+                json!({
+                    "type": "object", "additionalProperties": false,
+                    "prefixItems": [open()], "allOf": [open()], "oneOf": [open()]
+                }),
+                Some("/oneOf/0"),
+            ),
+            (
+                json!({
+                    "type": "object", "additionalProperties": false,
+                    "prefixItems": [open()], "allOf": [open()]
+                }),
+                Some("/allOf/0"),
+            ),
+            // First in a list is its first element.
+            (pinned("anyOf", json!([open(), open()])), Some("/anyOf/0")),
+            (
+                pinned(
+                    "properties",
+                    json!({"a": text, "b": pinned("items", text.clone())}),
+                ),
+                None,
+            ),
+            (text.clone(), None),
+            (json!(true), None),
+        ];
+        for (schema, path) in cases {
+            assert_eq!(
+                strict_schema_missing_additional_properties(&schema).as_deref(),
+                path,
+                "{schema}"
+            );
         }
     }
 

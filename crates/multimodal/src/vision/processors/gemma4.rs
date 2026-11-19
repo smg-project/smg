@@ -638,9 +638,7 @@ impl Gemma4Processor {
         dtype: EncoderDtype,
         writer: &WireWriter,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        if images.is_empty() {
-            return Err(TransformError::EmptyBatch);
-        }
+        TransformError::if_empty(images)?;
         let params = self.params_for(Modality::Image)?;
         let (max_patches, patch_pixels) = (params.max_patches(), params.patch_pixels());
         let band_bytes = max_patches * patch_pixels * writer.element_size();
@@ -719,9 +717,7 @@ impl VisionPreProcessor for Gemma4Processor {
         &self,
         images: &[&DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        if images.is_empty() {
-            return Err(TransformError::EmptyBatch);
-        }
+        TransformError::if_empty(images)?;
         let params = self.params_for(Modality::Image)?;
         let encoded = images
             .iter()
@@ -942,14 +938,14 @@ mod tests {
             for patch_x in 0..grid_w {
                 for dy in 0..patch {
                     for dx in 0..patch {
-                        for channel in 0..CHANNELS {
+                        for (channel, lut) in pipeline.lut.iter().enumerate() {
                             let source = ((patch_y * patch + dy) * width + patch_x * patch + dx)
                                 * CHANNELS
                                 + channel;
                             let index = (patch_y * grid_w + patch_x) * patch_pixels
                                 + (dy * patch + dx) * CHANNELS
                                 + channel;
-                            expected[index] = pipeline.lut[channel][pixels[source] as usize];
+                            expected[index] = lut[pixels[source] as usize];
                         }
                     }
                 }

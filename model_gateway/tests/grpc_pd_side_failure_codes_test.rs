@@ -352,10 +352,12 @@ async fn one_chat(router: &dyn RouterTrait, streamed: bool) -> (http::StatusCode
         "stream": streamed,
     }))
     .unwrap();
-    let response =
-        tokio::time::timeout(CASE_CAP, router.route_chat(None, &tenant(), request, MODEL))
-            .await
-            .expect("the request must be answered within the case cap");
+    let response = tokio::time::timeout(
+        CASE_CAP,
+        router.route_chat(None, &tenant(), Arc::new(request), MODEL),
+    )
+    .await
+    .expect("the request must be answered within the case cap");
     let status = response.status();
     let bytes = tokio::time::timeout(
         CASE_CAP,

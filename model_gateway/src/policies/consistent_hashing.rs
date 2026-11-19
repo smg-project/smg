@@ -11,12 +11,14 @@
 //!
 //! ## Consistent Hashing
 //!
-//! Uses a pre-computed hash ring from WorkerRegistry where:
+//! Uses the hash ring of the membership generation, which placement hands
+//! with the request, where:
 //! 1. Each worker is placed at a fixed position based on hash(worker_url)
 //! 2. Keys are hashed to the ring, then walk clockwise to find first healthy worker
 //! 3. When workers scale up/down, only keys in the affected range redistribute (~1/N keys move)
 //!
-//! The ring is built once when workers are added/removed, not per-request.
+//! The ring is filled once for a generation, not per request, and off the
+//! request path where the gateway's warm task reaches the generation first.
 //! This ensures O(log n) lookup performance.
 //!
 //! Complexity per request: O(log n) binary search + O(k) walk where k =
@@ -31,8 +33,9 @@ use rand::RngExt as _;
 use super::{LoadBalancingPolicy, SelectWorkerInfo};
 use crate::{
     observability::metrics::Metrics,
+    policies::hash_ring::HashRing,
     routers::common::header_utils::{extract_routing_key_hint, extract_target_worker},
-    worker::{HashRing, Worker},
+    worker::Worker,
 };
 
 /// Execution branch for metrics

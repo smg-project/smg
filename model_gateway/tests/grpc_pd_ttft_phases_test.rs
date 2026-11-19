@@ -17,7 +17,7 @@
 //! Each case runs on a current-thread runtime under a thread-local Prometheus
 //! recorder, so the request path's emissions land in the rendered text.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use common::{
     decode_stream::HeldHeadersEngine,
@@ -126,7 +126,9 @@ async fn one_streaming_request(router: &dyn RouterTrait, route: Route) -> String
                 "stream_options": {"include_usage": true},
             }))
             .unwrap();
-            router.route_chat(None, &tenant(), request, MODEL).await
+            router
+                .route_chat(None, &tenant(), Arc::new(request), MODEL)
+                .await
         }
         Route::Messages => {
             let request = serde_json::from_value(serde_json::json!({
@@ -136,7 +138,9 @@ async fn one_streaming_request(router: &dyn RouterTrait, route: Route) -> String
                 "stream": true,
             }))
             .unwrap();
-            router.route_messages(None, &tenant(), request, MODEL).await
+            router
+                .route_messages(None, &tenant(), Arc::new(request), MODEL)
+                .await
         }
         Route::Completions => {
             let request = serde_json::from_value(serde_json::json!({
@@ -491,7 +495,9 @@ fn a_collected_chat_answer_anchors_its_generation_at_the_prefill_dispatch() {
             "max_tokens": 8,
         }))
         .unwrap();
-        let response = router.route_chat(None, &tenant(), request, MODEL).await;
+        let response = router
+            .route_chat(None, &tenant(), Arc::new(request), MODEL)
+            .await;
         let status = response.status();
         let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
             .await

@@ -26,6 +26,7 @@ use crate::{
                 mooncake_prefill_params, KvConnectorMode, NIXL_PREFILL_KV_PARAMS,
             },
             pd_failure::{PdSide, SidePhase},
+            prefill_admission::PrefillLoadGuard,
             retry::mark_non_retryable,
         },
         error,
@@ -34,7 +35,8 @@ use crate::{
             common::stages::request_execution::{
                 decode_silence_response, dispatch_prefill_within, first_prefill_response_within,
                 is_prefill_silence, pd_start_failure_response, prefill_silence_response,
-                retire_pd_side, PdSides, PrefillBound, Retirement, SideDispatch, StreamResult,
+                retire_pd_side, PdSides, PrefillBound, PrefillWait, Retirement, SideDispatch,
+                StreamResult,
             },
             context::{ClientSelection, ExecutionResult, PdTiming, WorkerSelection},
             multimodal::worker_language_model_only,
@@ -48,7 +50,7 @@ use crate::{
             },
         },
     },
-    worker::{liveness, PrefillLoadGuard, Worker},
+    worker::{health::liveness, metrics::Metrics as WorkerMetrics, Worker},
 };
 
 /// The message a sequential decode side's silence verdict starts with (see
@@ -708,7 +710,7 @@ async fn sequential_prefill_side(
     let bound = prefill_worker
         .and_then(|worker| PrefillBound::at(worker, sides.prompt_tokens, prefill_start));
     if let Some(prefill) = prefill_worker {
-        Metrics::record_worker_request(prefill.url(), prefill.model_id());
+        WorkerMetrics::record_worker_request(prefill.url(), prefill.model_id());
     }
     // Booked before the call is polled, for the servicers that send their
     // headers with the first message (see `PrefillTicket::book`); the bound
@@ -716,7 +718,10 @@ async fn sequential_prefill_side(
     let prefill_ticket =
         prefill_worker.and_then(|worker| PrefillTicket::book(worker, sides.prompt_tokens));
     let prefill_stream = dispatch_prefill_within(
-        bound.clone(),
+        PrefillWait {
+            bound: bound.clone(),
+            encode: None,
+        },
         Box::pin(async move { prefill_client.generate(prefill_request).await }),
         prefill_worker.cloned(),
         None,
@@ -737,7 +742,12 @@ async fn sequential_prefill_side(
     };
     if let Err(e) = first_prefill_response_within(
         &mut prefill_stream,
-        bound,
+        // The sequential protocol takes no encode watch: its request's
+        // encode, if any, is the parallel shape's rendezvous.
+        PrefillWait {
+            bound,
+            encode: None,
+        },
         prefill_worker,
         None,
         sides.prefill_label,
@@ -936,7 +946,7 @@ async fn sequential_decode_side(
     let workers = sides.workers;
     // Send request to decode
     if let Some(decode) = workers.decode_worker() {
-        Metrics::record_worker_request(decode.url(), decode.model_id());
+        WorkerMetrics::record_worker_request(decode.url(), decode.model_id());
     }
     // The relay phase ends at the decode dispatch. Everything after this
     // instant, including the engines' KV transfer and the decode scheduling,

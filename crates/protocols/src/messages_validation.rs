@@ -29,7 +29,7 @@ use std::collections::HashSet;
 use validator::ValidationError;
 
 use crate::{
-    common::invalid,
+    common::{invalid, json_type_name},
     messages::{
         CreateMessageRequest, InputContent, InputContentBlock, InputMessage, MessageThread,
         MessagesBetas, Role, ThinkingConfig, Tool,
@@ -62,7 +62,7 @@ pub(crate) fn validate(req: &CreateMessageRequest) -> Result<(), ValidationError
 /// with the public API's own codes.
 pub fn validate_with_betas(
     req: &CreateMessageRequest,
-    betas: &MessagesBetas,
+    betas: MessagesBetas,
 ) -> Result<(), ValidationError> {
     validate_thinking_budget(req, betas)?;
     validate_thread_beta(req, betas)
@@ -74,7 +74,7 @@ pub fn validate_with_betas(
 /// above `max_tokens`.
 fn validate_thinking_budget(
     req: &CreateMessageRequest,
-    betas: &MessagesBetas,
+    betas: MessagesBetas,
 ) -> Result<(), ValidationError> {
     let Some(ThinkingConfig::Enabled { budget_tokens, .. }) = &req.thinking else {
         return Ok(());
@@ -97,7 +97,7 @@ fn validate_thinking_budget(
 /// never reaches this rule: it is forwarded unparsed, `thread` and all.
 fn validate_thread_beta(
     req: &CreateMessageRequest,
-    betas: &MessagesBetas,
+    betas: MessagesBetas,
 ) -> Result<(), ValidationError> {
     if req.thread.is_none() || betas.message_threads() {
         Ok(())
@@ -223,15 +223,25 @@ fn validate_message_contents(messages: &[InputMessage]) -> Result<(), Validation
             // with: the public API refuses any other JSON value, and so does
             // this gateway, before a string would be rendered as the call's
             // arguments and answered as if the history were well-formed.
-            let not_an_object = blocks.iter().position(|block| {
-                matches!(block, InputContentBlock::ToolUse(tool_use) if !tool_use.input.is_object())
-            });
-            if let Some(position) = not_an_object {
+            let not_an_object =
+                blocks
+                    .iter()
+                    .enumerate()
+                    .find_map(|(position, block)| match block {
+                        InputContentBlock::ToolUse(tool_use) if !tool_use.input.is_object() => {
+                            Some((position, tool_use))
+                        }
+                        _ => None,
+                    });
+            if let Some((position, tool_use)) = not_an_object {
                 return Err(invalid(
                     "tool_use_input_not_an_object",
                     format!(
                         "messages.{index}.content.{position}.tool_use.input: Input should be a \
-                         valid dictionary"
+                         valid dictionary (the tool_use block {} for {} carries {})",
+                        tool_use.id,
+                        tool_use.name,
+                        json_type_name(&tool_use.input)
                     ),
                 ));
             }
@@ -765,14 +775,22 @@ mod tests {
         let string = rejection(with_input(json!("Paris")));
         assert!(
             string.contains(
-                "messages.1.content.1.tool_use.input: Input should be a valid dictionary"
+                "messages.1.content.1.tool_use.input: Input should be a valid dictionary \
+                 (the tool_use block toolu_a for get_weather carries a string)"
             ),
             "{string}"
         );
-        for other in [json!(["Paris"]), json!(1), json!(null)] {
+        for (other, kind) in [
+            (json!(["Paris"]), "an array"),
+            (json!(1), "a number"),
+            (json!(null), "null"),
+        ] {
             let refused = rejection(with_input(other.clone()));
             assert!(
-                refused.contains("messages.1.content.1.tool_use.input"),
+                refused.contains(&format!(
+                    "messages.1.content.1.tool_use.input: Input should be a valid dictionary \
+                     (the tool_use block toolu_a for get_weather carries {kind})"
+                )),
                 "{other}: {refused}"
             );
         }
@@ -873,13 +891,18 @@ mod tests {
     fn betas_are_the_headers_dated_names() {
         let none = MessagesBetas::from_header_values([]);
         assert!(!none.message_threads() && !none.interleaved_thinking());
-        let listed = MessagesBetas::from_header_values([
+        let values = [
             "fine-grained-tool-streaming-2025-05-14, interleaved-thinking-2025-05-14",
             "message-threads-2026-08-12",
-        ]);
+        ];
+        let listed = MessagesBetas::from_header_values(values);
         assert!(listed.interleaved_thinking() && listed.message_threads());
-        assert!(listed.names("fine-grained-tool-streaming"));
-        assert!(!listed.names("fine-grained") && !listed.names("threads"));
+        assert!(MessagesBetas::values_name(
+            values,
+            "fine-grained-tool-streaming"
+        ));
+        assert!(!MessagesBetas::values_name(values, "fine-grained"));
+        assert!(!MessagesBetas::values_name(values, "threads"));
         for undated in [
             "message-threads",
             "message-threads-2026-8-12",
@@ -914,8 +937,8 @@ mod tests {
             }))
         };
         let plain = MessagesBetas::default();
-        assert!(validate_with_betas(&with_budget(4096, 1024), &plain).is_ok());
-        let refused = validate_with_betas(&with_budget(1024, 1024), &plain).expect_err("refused");
+        assert!(validate_with_betas(&with_budget(4096, 1024), plain).is_ok());
+        let refused = validate_with_betas(&with_budget(1024, 1024), plain).expect_err("refused");
         assert_eq!(refused.code, "thinking_budget_exceeds_max_tokens");
         assert_eq!(
             refused.message.as_deref(),
@@ -924,8 +947,8 @@ mod tests {
         let interleaved = MessagesBetas::from_header_values([
             "fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14",
         ]);
-        assert!(validate_with_betas(&with_budget(1024, 1024), &interleaved).is_ok());
-        assert!(validate_with_betas(&with_budget(1024, 8192), &interleaved).is_ok());
+        assert!(validate_with_betas(&with_budget(1024, 1024), interleaved).is_ok());
+        assert!(validate_with_betas(&with_budget(1024, 8192), interleaved).is_ok());
     }
 
     /// A `thread` field needs the message-threads beta, as the public API
@@ -934,8 +957,8 @@ mod tests {
     fn a_thread_field_needs_the_message_threads_beta() {
         let thread = request(json!({"thread": {"type": "create"}}));
         let plain = MessagesBetas::default();
-        assert!(validate_with_betas(&request(json!({})), &plain).is_ok());
-        let refused = validate_with_betas(&thread, &plain).expect_err("refused");
+        assert!(validate_with_betas(&request(json!({})), plain).is_ok());
+        let refused = validate_with_betas(&thread, plain).expect_err("refused");
         assert_eq!(refused.code, "thread_beta_required");
         assert_eq!(
             refused.message.as_deref(),
@@ -944,7 +967,7 @@ mod tests {
         let named = MessagesBetas::from_header_values([
             "interleaved-thinking-2025-05-14, message-threads-2026-08-12",
         ]);
-        assert!(validate_with_betas(&thread, &named).is_ok());
+        assert!(validate_with_betas(&thread, named).is_ok());
     }
 
     #[test]

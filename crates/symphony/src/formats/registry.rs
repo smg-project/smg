@@ -32,9 +32,9 @@ use rustc_hash::FxBuildHasher;
 
 use super::{
     deepseek_v3, deepseek_v3_1, deepseek_v3_2, deepseek_v4, deepseek_v4_1, dots3, function_gemma,
-    gemma4, glm, glm4, hy4, hy_v3, inkling, iquest, json, k2_horizon, kimi_k2, kimi_k3, lfm2_5,
-    ling, llama4, llama_nemotron, longcat, minicpm5, minimax_m2, minimax_m3, mistral, mistral_v13,
-    muse_spark, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
+    gemma4, glm, glm4, hy4, hy_v3, inkling, inkling2, iquest, json, k2_horizon, kimi_k2, kimi_k3,
+    lfm2_5, ling, llama4, llama_nemotron, longcat, minicpm5, minimax_m2, minimax_m3, mistral,
+    mistral_v13, muse_spark, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
 };
 use crate::{
     format::{CallSyntax, Format},
@@ -114,6 +114,8 @@ tables! {
     KimiK3 => "kimi_k3", kimi_k3;
     /// [`inkling()`].
     Inkling => "inkling", inkling;
+    /// [`inkling2()`].
+    Inkling2 => "inkling2", inkling2;
     /// [`minicpm5()`].
     MiniCpm5 => "minicpm5", minicpm5;
     /// [`dots3()`].
@@ -518,6 +520,14 @@ mod tests {
             Some(Table::Inkling)
         );
         assert_eq!(
+            table_for("thinkingmachines/Inkling-2-Small"),
+            Some(Table::Inkling2)
+        );
+        assert_eq!(
+            table_for("thinkingmachines/Inkling-2-Small-MXFP8"),
+            Some(Table::Inkling2)
+        );
+        assert_eq!(
             table_for("deepseek-ai/DeepSeek-V4.1-Flash-1017"),
             Some(Table::DeepSeekV4_1)
         );
@@ -593,6 +603,22 @@ mod tests {
                 "nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-NVFP4",
                 Table::Qwen3Tagged,
             ),
+            ("inclusionAI/Ling-3.1-flash-1019", Table::Ling),
+            ("inclusionAI/Ling-3.0-flash-Sante", Table::Ling),
+            ("ibm-granite/granite-switch-4.1-30b", Table::Qwen2_5),
+            ("h2oai/h2o-lightning-4b-nemotron-nano", Table::Qwen3Tagged),
+            ("inclusionAI/ZoomGain-4B", Table::Qwen3Tagged),
+            ("inclusionAI/ZwZ2-4B", Table::Qwen3Tagged),
+            (
+                "nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB",
+                Table::Qwen3Tagged,
+            ),
+            ("openbmb/MiniCPM-V-4.7-1B-GPTQ", Table::Qwen3Tagged),
+            ("openbmb/MiniCPM-OCR-Jev-AWQ", Table::Qwen3Tagged),
+            ("openbmb/MiniCPM-OCR-Jev-GPTQ", Table::Qwen3Tagged),
+            ("openbmb/MiniCPM-OCR-1.0-AWQ", Table::Qwen3Tagged),
+            ("openbmb/MiniCPM-OCR-1.0-GPTQ", Table::Qwen3Tagged),
+            ("XHToken/Spark-X2.6-1.7B", Table::Glm),
         ] {
             assert_eq!(table_for(model), Some(table), "{model}");
             assert!(for_model(model).is_some(), "{model}");
@@ -674,6 +700,125 @@ mod tests {
         assert_eq!(
             granite.turn_opener(),
             Some("<|start_of_role|>assistant<|end_of_role|>")
+        );
+    }
+
+    /// A checkpoint whose own template is not its family's. It opens every turn with an open
+    /// mark, the role, a separator, a two-character id it draws on each render and a close mark,
+    /// and it writes a call as tagged JSON. Its group names the table that reads what that
+    /// template writes, and the close mark as the turn opener: the last fixed text before the
+    /// model's own, so the id is the template's framing and no text the answer goes on with.
+    /// The first turn below is an assistant turn of that template's recorded render, fed as the
+    /// prompt up to its close mark; the second answer is one such a checkpoint gave a request
+    /// with tools.
+    /// The ends of two more recorded renders pin where the replay starts: a generation prompt
+    /// at its last close mark, a continued final message at the one before its prefill.
+    #[test]
+    fn a_checkpoint_with_its_own_template_reads_with_the_table_that_template_writes() {
+        use crate::{
+            engine::Engine,
+            event::{Event, Events},
+            format::Replay,
+            input::{EngineFinish, Input},
+            parser::Parser,
+            testing::arguments_of,
+            Declared,
+        };
+        let format = for_model("ibm-granite/granite-4.1-3b-llmon-preview").expect("a table");
+        let opened = "<|open|>assistant<|:|>°ü<|close|>";
+        let turns = [
+            (
+                concat!(
+                    r#"<tool_call>{"name": "get_weather", "arguments": "#,
+                    r#"{"city": "Paris", "unit": "celsius"}}</tool_call>"#
+                ),
+                "get_weather",
+                r#"{"city": "Paris", "unit": "celsius"}"#,
+            ),
+            (
+                concat!(
+                    r#"<tool_call>{"name": "get_stock_info", "arguments": "#,
+                    r#"{"company_name": "Apple Inc.", "detail_level": "detailed"}}</tool_call>"#
+                ),
+                "get_stock_info",
+                r#"{"company_name": "Apple Inc.", "detail_level": "detailed"}"#,
+            ),
+        ];
+        for (answer, name, arguments) in turns {
+            let mut parser = Engine::new(format.clone(), Declared::default());
+            let mut out = Events::new();
+            parser
+                .feed(
+                    Input::Prompt {
+                        token_ids: &[],
+                        text: opened,
+                    },
+                    &mut out,
+                )
+                .expect("prompt");
+            parser
+                .feed(
+                    Input::Delta {
+                        token_ids: &[],
+                        text: answer,
+                        spans: &[],
+                    },
+                    &mut out,
+                )
+                .expect("delta");
+            parser
+                .feed(
+                    Input::End {
+                        finish: EngineFinish::Stop,
+                    },
+                    &mut out,
+                )
+                .expect("end");
+            let events = out.into_owned().drain();
+            let names: Vec<&str> = events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::ToolCallStart { name, .. } => Some(name.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(names, [name]);
+            assert_eq!(arguments_of(&events, 0), arguments);
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, Event::Content(_))),
+                "{name}"
+            );
+            assert!(
+                matches!(events.last(), Some(Event::Finish { tool_calls: 1, .. })),
+                "{name}"
+            );
+        }
+        assert_eq!(format.name(), "qwen2.5");
+        assert_eq!(format.turn_opener(), Some("<|close|>"));
+        assert_eq!(format.replayed(opened), Replay::default());
+        // The end of a recorded generation prompt: the frame that names the answer's id holds
+        // the close mark too, as every frame's header does. The replay starts at the last one.
+        let generation = concat!(
+            "<|open|>exec<|.|>output<|close|>assistant<|:|>¶³<|open_end|><|open_end|>",
+            "<|open|>assistant<|:|>¶³<|close|>",
+        );
+        assert_eq!(format.replay(generation), "<|close|>");
+        assert_eq!(format.replayed(generation), Replay::default());
+        // The end of a recorded continued final message: the prefill after the last close mark
+        // is the text the answer goes on with.
+        let prefilled = concat!(
+            "<|open|>exec<|.|>output<|close|>assistant<|:|>¡°<|open_end|><|open_end|>",
+            "<|open|>assistant<|:|>¡°<|close|>The quick brown fox",
+        );
+        assert_eq!(format.replay(prefilled), "<|close|>The quick brown fox");
+        assert_eq!(
+            format.replayed(prefilled),
+            Replay {
+                begun: true,
+                ..Replay::default()
+            }
         );
     }
 

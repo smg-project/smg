@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    fmt,
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -13,7 +14,7 @@ use super::{
     get_healthy_worker_indices, normalize_model_key, utils::PeriodicTask, BucketConfig,
     LoadBalancingPolicy, SelectWorkerInfo,
 };
-use crate::worker::{endpoint::Endpoint, Worker};
+use crate::worker::{identity::endpoint::Endpoint, Worker};
 
 #[derive(Debug)]
 pub struct BucketPolicy {
@@ -258,7 +259,7 @@ pub struct SequencerRequest {
     pub prefill_worker_url: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Boundary {
     pub url: String,
     pub range: [usize; 2],
@@ -267,6 +268,18 @@ pub struct Boundary {
 impl Boundary {
     pub fn new(url: String, range: [usize; 2]) -> Self {
         Boundary { url, range }
+    }
+}
+
+/// A boundary's debug form names its worker's address masked: the boundary
+/// table is written whole at info, when the prefill workers are listed and
+/// around every adjustment, and an address may carry a credential.
+impl fmt::Debug for Boundary {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Boundary")
+            .field("url", &Endpoint::redacted_str(&self.url))
+            .field("range", &self.range)
+            .finish()
     }
 }
 
@@ -646,11 +659,60 @@ impl Bucket {
 }
 
 #[cfg(test)]
+#[expect(clippy::print_stdout, reason = "a recorder says where its sheet went")]
+mod classic_bucket_rows;
+
+#[cfg(test)]
 mod tests {
     use tracing_test::traced_test;
 
     use super::*;
     use crate::worker::{test_support::worker_of, WorkerType};
+
+    /// The boundary lines name each worker's address masked. The table is
+    /// written whole at info, when the prefill workers are listed and around
+    /// every adjustment, and an address may carry a credential.
+    #[test]
+    #[traced_test]
+    fn the_boundary_lines_name_each_address_masked() {
+        let mut bucket = Bucket::new(1000);
+        let credentialed = "http://user:s3cret@10.0.0.7:8000".to_string();
+        bucket.init_prefill_worker_urls(vec![
+            credentialed.clone(),
+            "http://10.0.0.8:8000".to_string(),
+        ]);
+        bucket.post_process_request(64, credentialed);
+        bucket.adjust_boundary();
+
+        logs_assert(|lines: &[&str]| {
+            for line in [
+                "Init boundary",
+                "Before adjusting boundary",
+                "After adjusting boundary",
+            ] {
+                let written: Vec<&&str> = lines.iter().filter(|text| text.contains(line)).collect();
+                if written.is_empty() {
+                    return Err(format!("no `{line}` line was written"));
+                }
+                for text in written {
+                    if text.contains("s3cret") {
+                        return Err(format!("a boundary line carries the credential: {text}"));
+                    }
+                    if !text.contains("http://***@10.0.0.7:8000") {
+                        return Err(format!(
+                            "a boundary line does not name the address masked: {text}"
+                        ));
+                    }
+                    if !text.contains("\"http://10.0.0.8:8000\"") {
+                        return Err(format!(
+                            "a boundary line does not name a plain address as it is: {text}"
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        });
+    }
 
     #[test]
     fn test_drop_stops_adjustment_thread() {

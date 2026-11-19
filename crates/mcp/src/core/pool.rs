@@ -44,8 +44,8 @@ impl PoolKey {
                 url,
                 token,
                 headers,
-            } => (url.clone(), Self::hash_auth(token.as_ref(), headers)),
-            McpTransport::Sse {
+            }
+            | McpTransport::Sse {
                 url,
                 token,
                 headers,
@@ -91,15 +91,30 @@ impl PoolKey {
     }
 }
 
+/// Where a pooled connection's tool listing stands: not returned yet (the
+/// connection is pooled before its opener lists, so a hit meanwhile lists
+/// for itself), made, or failed with the server's message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Listing {
+    Pending,
+    Listed,
+    Failed(String),
+}
+
 /// Cached MCP connection.
 #[derive(Clone)]
 pub(crate) struct CachedConnection {
     pub client: Arc<McpClient>,
+    /// The connection's tool listing. It leaves the pool with the connection.
+    pub listing: Listing,
 }
 
 impl CachedConnection {
     pub fn new(client: Arc<McpClient>) -> Self {
-        Self { client }
+        Self {
+            client,
+            listing: Listing::Pending,
+        }
     }
 }
 
@@ -179,6 +194,11 @@ impl McpConnectionPool {
         }
     }
 
+    /// Sets the callback that is run with the key of an evicted connection.
+    ///
+    /// The callback runs only when the eviction leaves no earlier pooled
+    /// connection to that key's URL. The connection whose arrival caused the
+    /// eviction does not count as one.
     pub fn set_eviction_callback<F>(&mut self, callback: F)
     where
         F: Fn(&PoolKey) + Send + Sync + 'static,
@@ -210,11 +230,25 @@ impl McpConnectionPool {
         let cached = CachedConnection::new(Arc::clone(&client_arc));
         {
             let mut connections = self.connections.lock();
+            // Another connect may have pooled this key while this one was
+            // connecting: its connection stands, and this one is dropped.
+            if let Some(pooled) = connections.get(&key) {
+                return Ok(Arc::clone(&pooled.client));
+            }
             match connections.push(key, cached) {
                 Some((evicted_key, _)) => {
                     // Eviction: count stays the same (replaced one entry).
+                    // The callback clears what stands under the URL, so it runs
+                    // only once no connection pooled before this one holds that
+                    // URL. The connection just added does not count: it has
+                    // listed nothing yet.
                     if let Some(callback) = &self.eviction_callback {
-                        callback(&evicted_key);
+                        let url_still_held = connections.iter().any(|(pooled, held)| {
+                            !Arc::ptr_eq(&held.client, &client_arc) && pooled.url == evicted_key.url
+                        });
+                        if !url_still_held {
+                            callback(&evicted_key);
+                        }
                     }
                 }
                 None => {
@@ -246,6 +280,30 @@ impl McpConnectionPool {
             total_connections: self.connection_count.load(Ordering::Relaxed),
             capacity: self.max_connections,
         }
+    }
+
+    /// Record where `client`'s tool listing stands. The record is the listing
+    /// connection's: a key the pool no longer holds, or holds for a connection
+    /// pooled since (the lister evicted during its listing), is left alone.
+    pub(crate) fn set_listing(&self, key: &PoolKey, client: &Arc<McpClient>, listing: Listing) {
+        if let Some(cached) = self
+            .connections
+            .lock()
+            .peek_mut(key)
+            .filter(|cached| Arc::ptr_eq(&cached.client, client))
+        {
+            cached.listing = listing;
+        }
+    }
+
+    /// Whether the connection under `key` is pooled with its tools listed
+    /// (a plain hit); false for a pending or failed listing and for a key the
+    /// pool does not hold. No promotion.
+    pub(crate) fn is_listed(&self, key: &PoolKey) -> bool {
+        matches!(
+            self.connections.lock().peek(key),
+            Some(cached) if cached.listing == Listing::Listed
+        )
     }
 
     pub fn list_keys(&self) -> Vec<PoolKey> {

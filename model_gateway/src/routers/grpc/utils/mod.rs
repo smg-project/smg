@@ -21,7 +21,7 @@ pub(crate) use chat_utils::{
     keep_first_tool_call_items, missing_tokenizer_response, parse_finish_reason,
     parse_json_schema_response, process_chat_messages_with_placeholders, resolve_tokenizer,
     send_error_sse, validate_chat_content_parts, validate_chat_template_content_parts,
-    InPlaceBudget,
+    CallIdFamily, InPlaceBudget,
 };
 pub use chat_utils::{
     create_stop_decoder, process_chat_messages, process_chat_messages_with_encoding,
@@ -30,7 +30,7 @@ pub use chat_utils::{
 pub(crate) use logprobs::{
     convert_generate_input_logprobs, convert_generate_output_logprobs, convert_proto_logprobs,
     convert_proto_to_completion_logprobs, convert_proto_to_openai_logprobs, has_entries,
-    requested_alternatives,
+    requested_alternatives, token_decoder,
 };
 pub use message_utils::{process_messages_with_encoding, template_tools};
 pub(crate) use message_utils::{resolve_media, MediaContext};
@@ -74,4 +74,16 @@ pub(crate) fn warn_detokenize_recoveries(
             "the decoder rewrote text already streamed; the stream kept its text and sent the remainder"
         );
     }
+}
+
+/// `refusal` marked [`ReportedRefusal`](crate::middleware::ReportedRefusal),
+/// for the stage that wrote the refusal's line itself: one WARN with the
+/// cause, for an answer in the client's class, so the pipeline's stage line
+/// and the access log's response line for it stay at DEBUG. A failure in the
+/// server's class is not marked and keeps its ERROR lines.
+pub(crate) fn reported(mut refusal: axum::response::Response) -> axum::response::Response {
+    refusal
+        .extensions_mut()
+        .insert(crate::middleware::ReportedRefusal);
+    refusal
 }

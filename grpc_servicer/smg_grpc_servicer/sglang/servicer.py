@@ -13,7 +13,7 @@ import time
 from collections.abc import AsyncIterator
 from contextlib import aclosing
 from datetime import datetime, timezone
-from pathlib import Path
+from traceback import format_exc as get_exception_traceback
 
 import grpc
 import msgspec
@@ -25,7 +25,6 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.kv_events import (
     KVEventsConfig,
 )
-from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.managers.io_struct import (
     FlushCacheReqInput,
     ProfileReq,
@@ -33,21 +32,19 @@ from sglang.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalProcessorOutput,
-)
 from sglang.srt.sampling.sampling_params import SamplingParams as SGLSamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var
-from sglang.srt.utils.hf_transformers_utils import get_tokenizer
-from sglang.utils import get_exception_traceback
 from smg_grpc_proto import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
 from smg_grpc_proto.generated import common_pb2
 
 from smg_grpc_servicer.engine_status import abort_for_constraint_failure
 from smg_grpc_servicer.health_probe import await_probe
+from smg_grpc_servicer.sglang.compat import (
+    get_disaggregation_types,
+    get_multimodal_types,
+    get_tokenizer,
+)
 from smg_grpc_servicer.sglang.config_view import EngineConfigView
 from smg_grpc_servicer.sglang.health_servicer import SGLangHealthServicer
 from smg_grpc_servicer.sglang.hidden_states import (
@@ -62,6 +59,7 @@ from smg_grpc_servicer.sglang.loads import (
     ranks_with_a_window,
 )
 from smg_grpc_servicer.sglang.lora import PreloadedLoras
+from smg_grpc_servicer.sglang.model_artifacts import tokenizer_dir_for
 from smg_grpc_servicer.sglang.request_manager import (
     GrpcRequestManager,
     _validate_token_ids_logprobs,
@@ -83,6 +81,10 @@ from ..constrained_decoding import (
 )
 from ..mm_item_limits import MM_ITEM_LIMITS_KEY, sglang_item_limits
 from ..pd_pairing import pairing_protocol_from_env
+
+DisaggregationMode, FAKE_BOOTSTRAP_HOST = get_disaggregation_types()
+
+Modality, MultimodalDataItem, MultimodalProcessorOutput = get_multimodal_types()
 
 logger = logging.getLogger(__name__)
 HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
@@ -877,13 +879,16 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         """
         logger.info("Receive GetTokenizer request")
 
-        tokenizer_path = self.server_args.tokenizer_path
-        if not tokenizer_path:
+        try:
+            tokenizer_dir = await asyncio.to_thread(tokenizer_dir_for, self.server_args)
+        except Exception as e:
+            logger.exception("Failed to resolve tokenizer metadata")
+            await context.abort(grpc.StatusCode.INTERNAL, str(e))
+        if tokenizer_dir is None:
             await context.abort(
                 grpc.StatusCode.FAILED_PRECONDITION,
-                "Tokenizer path is not configured on this server.",
+                "No local tokenizer metadata is available on this server.",
             )
-        tokenizer_dir = Path(tokenizer_path)
 
         # Reading and compressing the tokenizer directory is file I/O and CPU
         # measured in hundreds of milliseconds: the shared bundle builds it in

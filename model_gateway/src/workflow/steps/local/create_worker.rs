@@ -13,6 +13,7 @@ use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, Wo
 
 use super::discover_dp::DpInfo;
 use crate::{
+    admin::worker_service::{control_character_refusal, logged_strings},
     config::ParserChoice,
     routers::grpc::{
         multimodal::{
@@ -26,12 +27,12 @@ use crate::{
         zmq_client::zmq_handshake_address,
     },
     worker::{
-        basic::{merge_labels, RuntimeType, CONTEXT_WINDOW_LABELS, WINDOW_LABELS},
-        circuit_breaker::CircuitBreakerConfig,
-        endpoint::Endpoint,
-        metadata::join_base,
-        overload::OverloadThresholds,
-        resilience::resolve_resilience,
+        health::{circuit_breaker::CircuitBreakerConfig, resilience::resolve_resilience},
+        identity::{
+            basic::{merge_labels, RuntimeType, CONTEXT_WINDOW_LABELS, WINDOW_LABELS},
+            endpoint::Endpoint,
+            metadata::join_base,
+        },
         BasicWorkerBuilder, ConnectionMode, Worker, WorkerRegistry, UNKNOWN_MODEL_ID,
     },
     workflow::data::{WorkerKind, WorkerRegistrationMode, WorkerWorkflowData},
@@ -254,7 +255,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
         let http_client = context.data.http_client("create_worker")?;
         let http2 = context.data.http2.unwrap_or(false);
 
-        let overload_defaults = OverloadThresholds::from_gateway_config(&app_context.router_config);
+        let overload_defaults = app_context.router_config.worker_overload_thresholds();
 
         let health_base = app_context.router_config.health_check.to_protocol_config();
         let health_config =
@@ -355,7 +356,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
                 // Promotion can be event-driven: a ZMQ worker signals the
                 // manager the instant its handshake completes, and any worker
                 // demoted by health is signalled on its first successful
-                // contact (see `worker::liveness`), so every worker gets the
+                // contact (see `worker::health::liveness`), so every worker gets the
                 // registry's connect signal.
                 builder =
                     builder.connect_signal_tx(app_context.worker_registry.connect_signal_sender());
@@ -437,8 +438,13 @@ pub(super) fn validate_constrained_decoding_label(
 ) -> WorkflowResult<()> {
     match labels.get(ConstrainedDecoding::LABEL) {
         Some(value) => {
-            ConstrainedDecoding::parse(value)
-                .map(drop)
+            // The value may be the worker's own report, and the refusal of an
+            // unknown policy repeats it: a control character is refused first,
+            // in a sentence that names the label and not the value.
+            let field = (ConstrainedDecoding::LABEL, Some(value.as_str()));
+            control_character_refusal([field])
+                .map_or(Ok(()), Err)
+                .and_then(|()| ConstrainedDecoding::parse(value).map(drop))
                 .map_err(|why| WorkflowError::StepFailed {
                     step_id: StepId::new(step),
                     message: format!("Worker {}: {why}", Endpoint::redacted_str(url)),
@@ -521,7 +527,7 @@ pub(super) fn warn_on_conflicting_parser_overrides(
         ] {
             if let (Some(new_name), Some(existing_name)) = (new_name, existing_name) {
                 if new_name != existing_name {
-                    tracing::warn!(
+                    warn!(
                         model = %card.id,
                         new_worker = %Endpoint::redacted_str(worker_url),
                         existing_worker = existing.redacted_url(),
@@ -538,9 +544,12 @@ pub(super) fn warn_on_conflicting_parser_overrides(
     }
 }
 
-/// Reject parser-override names the registries don't know: the legacy parsers', and, under
-/// `--parser symphony`, Symphony's tables (`regular::symphony::check_names`). A name whose
-/// factory is absent is not checked (parsers unused in that configuration).
+/// Reject a card the registry cannot take as it came. First a control character in its id or
+/// parser names, with the door's sentence (`control_character_refusal`): the door checked the
+/// strings a request carried, and these may be the worker's own report. Then parser-override
+/// names the registries don't know: the legacy parsers', and, under `--parser symphony`,
+/// Symphony's tables (`regular::symphony::check_names`). A name whose factory is absent is not
+/// checked against a registry (parsers unused in that configuration).
 pub(super) fn validate_parser_overrides(
     card: &ModelCard,
     worker_url: &str,
@@ -548,13 +557,12 @@ pub(super) fn validate_parser_overrides(
     tool_parser_factory: Option<&tool_parser::ParserFactory>,
     reasoning_parser_factory: Option<&reasoning_parser::ParserFactory>,
 ) -> Result<(), String> {
-    let names = Names {
-        tool: card.tool_parser.clone(),
-        reasoning: card.reasoning_parser.clone(),
-    };
+    if let Some(refusal) = control_character_refusal(logged_strings(card)) {
+        return Err(refusal);
+    }
     check_names(
         parser,
-        &names,
+        &card_names(card),
         tool_parser_factory,
         reasoning_parser_factory,
     )
@@ -566,6 +574,17 @@ pub(super) fn validate_parser_overrides(
             card.id
         )
     })
+}
+
+/// The parser names a worker's card sets for its model: `tool_parser` and
+/// `reasoning_parser`, from the operator's card or the worker's labels
+/// (`card_from_labels`), as the override check and the two Symphony reads
+/// below take them.
+fn card_names(card: &ModelCard) -> Names {
+    Names {
+        tool: card.tool_parser.clone(),
+        reasoning: card.reasoning_parser.clone(),
+    }
 }
 
 /// Under `--parser symphony`, the table whose failure classes the registration step publishes at
@@ -586,10 +605,7 @@ fn symphony_table_of(
     if parser != ParserChoice::Symphony || connection_mode == ConnectionMode::Http {
         return None;
     }
-    let labels = Names {
-        tool: card.tool_parser.clone(),
-        reasoning: card.reasoning_parser.clone(),
-    };
+    let labels = card_names(card);
     table_label_read(&ModelNames { labels, flags }, &card.id)
 }
 
@@ -609,12 +625,8 @@ fn registry_reads_over_the_flags(
     flags: &Names,
     registry: &WorkerRegistry,
 ) -> Option<String> {
-    let labels = Names {
-        tool: card.tool_parser.clone(),
-        reasoning: card.reasoning_parser.clone(),
-    };
     if parser != ParserChoice::Symphony
-        || !labels_select_nothing(&labels)
+        || !labels_select_nothing(&card_names(card))
         || !registry.get_by_model(&card.id).is_empty()
     {
         return None;
@@ -776,16 +788,15 @@ fn card_from_labels(
         .map(|s| s == "true")
         .unwrap_or(false);
 
-    if !user_provided {
-        let is_embedding = labels.get("is_embedding").is_some_and(|s| s == "true");
-        let is_non_generation = labels.get("is_generation").is_some_and(|s| s == "false");
-
-        if is_embedding || is_non_generation {
-            card.model_type = infer_non_generation_type(labels);
-        } else if has_vision && !card.model_type.supports_vision() {
-            card.model_type |= ModelType::VISION;
-        }
-    } else if has_vision && !card.model_type.supports_vision() {
+    // A card built from the labels follows an embedding or non-generation
+    // signal (which wins over vision); otherwise, the operator's card or a
+    // generation card from the labels gains vision.
+    let non_generation = !user_provided
+        && (labels.get("is_embedding").is_some_and(|s| s == "true")
+            || labels.get("is_generation").is_some_and(|s| s == "false"));
+    if non_generation {
+        card.model_type = infer_non_generation_type(labels);
+    } else if has_vision {
         card.model_type |= ModelType::VISION;
     }
 
@@ -1950,6 +1961,91 @@ mod tests {
         );
     }
 
+    /// The text the registration of a worker that reports `labels` fails
+    /// with.
+    async fn failure_of_a_worker_reporting(labels: &[(&str, &str)]) -> String {
+        use wfaas::WorkflowInstanceId;
+
+        use crate::workflow::steps::{create_worker_workflow_data, local::test_support::labels_of};
+
+        let spec = WorkerSpec::new("http://worker:8000");
+        let mut data =
+            create_worker_workflow_data(spec, WorkerRegistrationMode::Upsert, make_app_context());
+        data.worker_kind = Some(WorkerKind::Local);
+        data.connection_mode = Some(ConnectionMode::Http);
+        data.http_client_handle = Some(Arc::new(http_client()));
+        data.discovered_labels = labels_of(labels);
+        let mut ctx = WorkflowContext::new(WorkflowInstanceId::new(), data);
+        CreateLocalWorkerStep
+            .execute(&mut ctx)
+            .await
+            .expect_err("the registration fails")
+            .to_string()
+    }
+
+    /// A model id the worker itself reports is refused like one a request
+    /// carries: the registration fails with the door's sentence, which does
+    /// not repeat the id.
+    #[tokio::test]
+    async fn a_reported_model_id_with_a_control_character_fails_the_registration() {
+        assert_eq!(
+            failure_of_a_worker_reporting(&[("served_model_name", "m\nINJECTED")]).await,
+            "Step failed: create_worker - models[].id must not contain control characters"
+        );
+    }
+
+    /// A tool parser name the worker reports is refused the same way.
+    #[tokio::test]
+    async fn a_reported_tool_parser_with_a_control_character_fails_the_registration() {
+        assert_eq!(
+            failure_of_a_worker_reporting(&[
+                ("served_model_name", "m"),
+                ("tool_parser", "p\nINJECTED"),
+            ])
+            .await,
+            "Step failed: create_worker - models[].tool_parser must not contain control characters"
+        );
+    }
+
+    /// A reasoning parser name the worker reports is refused the same way.
+    #[tokio::test]
+    async fn a_reported_reasoning_parser_with_a_control_character_fails_the_registration() {
+        assert_eq!(
+            failure_of_a_worker_reporting(&[
+                ("served_model_name", "m"),
+                ("reasoning_parser", "p\nINJECTED"),
+            ])
+            .await,
+            "Step failed: create_worker - models[].reasoning_parser must not contain control characters"
+        );
+    }
+
+    /// A `constrained_decoding` value the worker reports with a control
+    /// character in it is refused in a sentence that names the label and
+    /// does not repeat the value. A value on one line that names no policy
+    /// is refused by name, as before.
+    #[tokio::test]
+    async fn a_reported_decoding_policy_with_a_control_character_fails_the_registration() {
+        assert_eq!(
+            failure_of_a_worker_reporting(&[
+                ("served_model_name", "m"),
+                ("constrained_decoding", "sometimes\nINJECTED"),
+            ])
+            .await,
+            "Step failed: create_worker - Worker http://worker:8000: \
+             constrained_decoding must not contain control characters"
+        );
+        assert_eq!(
+            failure_of_a_worker_reporting(&[
+                ("served_model_name", "m"),
+                ("constrained_decoding", "sometimes"),
+            ])
+            .await,
+            "Step failed: create_worker - Worker http://worker:8000: constrained_decoding must be \
+             'requested' or 'always', not 'sometimes'"
+        );
+    }
+
     /// An empty label value is no KV field, as an empty spec value is: a
     /// registration carrying `kv_connector: ""` or `kv_role: ""` leaves the
     /// field unset for a later report to fill, instead of holding `Some("")`
@@ -2621,7 +2717,7 @@ mod rank_window_tests {
     use super::{dp_rank_expansion, labels_for_rank};
     use crate::{
         routers::grpc::client::ServerInfo,
-        worker::{basic::merge_labels, BasicWorkerBuilder, ConnectionMode, Worker},
+        worker::{identity::basic::merge_labels, BasicWorkerBuilder, ConnectionMode, Worker},
         workflow::steps::local::{discover_dp::dp_info_from_labels, test_support::labels_of},
     };
 

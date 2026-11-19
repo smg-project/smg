@@ -25,7 +25,7 @@ use openai_protocol::{
     },
 };
 use serde_json::json;
-use tracing::{debug, trace, warn};
+use tracing::{debug, enabled, trace, warn, Level};
 
 use super::types::HarmonyBuildOutput;
 use crate::routers::grpc::{
@@ -456,8 +456,10 @@ impl HarmonyBuilder {
         &self,
         request: &ChatCompletionRequest,
     ) -> Result<HarmonyBuildOutput, String> {
-        utils::validate_chat_content_parts(&request.messages)?;
+        // Harmony takes media in no role: its own whole-request refusal speaks before
+        // the shared door names a role's rule.
         reject_chat_media(&request.messages)?;
+        utils::validate_chat_content_parts(&request.messages)?;
         let encoding = try_harmony_encoding()?;
 
         let mut all_messages = Vec::new();
@@ -470,32 +472,14 @@ impl HarmonyBuilder {
         let (instructions, messages) = split_instructions(&request.messages);
         let tools = chat_tools(request).filter(|tools| !tools.is_empty());
         if instructions.is_some() || tools.is_some() {
-            let dev_msg =
-                self.build_developer_message_from_chat(instructions.as_deref(), tools.as_ref());
+            let dev_msg = self.build_developer_message(tools.as_ref(), instructions.as_deref());
             all_messages.push(dev_msg);
         }
 
         let mut user_messages = self.convert_chat_messages(messages);
         all_messages.append(&mut user_messages);
 
-        let selection_text = self.extract_selection_text(&all_messages);
-        let conversation = Conversation::from_messages(all_messages);
-        let token_ids = encoding
-            .render_conversation_for_completion(&conversation, Role::Assistant, None)
-            .map_err(|e| format!("Failed to encode Harmony conversation: {e}"))?;
-
-        // Get stop tokens for Harmony assistant actions (<|return|> and <|call|>)
-        let stop_token_ids: Vec<u32> = encoding
-            .stop_tokens_for_assistant_actions()
-            .into_iter()
-            .flat_map(|set| set.into_iter())
-            .collect();
-
-        Ok(HarmonyBuildOutput {
-            input_ids: token_ids,
-            stop_token_ids,
-            selection_text,
-        })
+        self.encode_prompt(encoding, all_messages)
     }
 
     /// Build Harmony request from Responses request
@@ -513,35 +497,48 @@ impl HarmonyBuilder {
     ) -> Result<HarmonyBuildOutput, String> {
         let encoding = try_harmony_encoding()?;
         let all_messages = self.construct_input_messages_with_harmony(request)?;
+        let output = self.encode_prompt(encoding, all_messages)?;
 
+        // What the model receives, decoded back for the trace lines alone:
+        // a pass over every prompt token, so it runs only when they print.
+        if enabled!(Level::TRACE) {
+            let token_ids = &output.input_ids;
+            let decoded_text = encoding
+                .tokenizer()
+                .decode_utf8(token_ids)
+                .unwrap_or_else(|_| "<decode error>".to_string());
+            trace!(
+                token_count = token_ids.len(),
+                token_preview = ?&token_ids[..token_ids.len().min(20)],
+                decoded_length = decoded_text.len(),
+                "Encoded conversation to tokens - decoded text follows:"
+            );
+            trace!("DECODED_TEXT_START\n{}\nDECODED_TEXT_END", decoded_text);
+        }
+
+        Ok(output)
+    }
+
+    /// The prompt of the assistant's next turn over `all_messages`, with the
+    /// stop tokens of the assistant's actions (`<|return|>` and `<|call|>`)
+    /// and the messages' selection text.
+    fn encode_prompt(
+        &self,
+        encoding: &HarmonyEncoding,
+        all_messages: Vec<HarmonyMessage>,
+    ) -> Result<HarmonyBuildOutput, String> {
         let selection_text = self.extract_selection_text(&all_messages);
         let conversation = Conversation::from_messages(all_messages);
-        let token_ids = encoding
+        let input_ids = encoding
             .render_conversation_for_completion(&conversation, Role::Assistant, None)
             .map_err(|e| format!("Failed to encode Harmony conversation: {e}"))?;
-
-        // Get stop tokens for Harmony assistant actions (<|return|> and <|call|>)
-        let stop_token_ids: Vec<u32> = encoding
+        let stop_token_ids = encoding
             .stop_tokens_for_assistant_actions()
             .into_iter()
             .flat_map(|set| set.into_iter())
             .collect();
-
-        // Decode tokens to see what the model actually receives
-        let decoded_text = encoding
-            .tokenizer()
-            .decode_utf8(&token_ids)
-            .unwrap_or_else(|_| "<decode error>".to_string());
-        trace!(
-            token_count = token_ids.len(),
-            token_preview = ?&token_ids[..token_ids.len().min(20)],
-            decoded_length = decoded_text.len(),
-            "Encoded conversation to tokens - decoded text follows:"
-        );
-        trace!("DECODED_TEXT_START\n{}\nDECODED_TEXT_END", decoded_text);
-
         Ok(HarmonyBuildOutput {
-            input_ids: token_ids,
+            input_ids,
             stop_token_ids,
             selection_text,
         })
@@ -679,27 +676,6 @@ impl HarmonyBuilder {
         HarmonyMessage::from_role_and_content(Role::Developer, dev_content)
     }
 
-    fn build_developer_message_from_chat(
-        &self,
-        instructions: Option<&str>,
-        tools: Option<&Vec<Tool>>,
-    ) -> HarmonyMessage {
-        self.build_developer_message(tools, instructions)
-    }
-
-    /// Build developer message from Responses request
-    ///
-    /// # Arguments
-    /// * `instructions` - Optional instructions (Responses API specific)
-    /// * `tools` - Optional list of tools
-    fn build_developer_message_from_responses(
-        &self,
-        instructions: Option<&str>,
-        tools: Option<&Vec<ResponseTool>>,
-    ) -> HarmonyMessage {
-        self.build_developer_message(tools, instructions)
-    }
-
     /// Construct input messages for Responses API with Harmony
     ///
     /// Handles both new conversations and continuations of previous responses.
@@ -737,9 +713,9 @@ impl HarmonyBuilder {
 
             // Add developer message if we have custom tools or instructions
             if with_custom_tools || request.instructions.is_some() {
-                let dev_msg = self.build_developer_message_from_responses(
-                    request.instructions.as_deref(),
+                let dev_msg = self.build_developer_message(
                     request.tools.as_ref(),
+                    request.instructions.as_deref(),
                 );
                 all_messages.push(dev_msg);
             }
@@ -1361,6 +1337,7 @@ mod tests {
         responses::{ImageGenerationTool, ResponseInput, ResponseTool, ResponsesRequest},
     };
     use smg_grpc_client::vllm_proto as vllm;
+    use tracing_test::traced_test;
 
     use super::*;
     use crate::routers::grpc::common::responses::utils::namespace_test_request;
@@ -1482,6 +1459,30 @@ mod tests {
         let error = HarmonyBuilder::new().build_from_chat(&request).unwrap_err();
         assert!(error.contains("vendor_media"));
         assert!(error.contains("gRPC"));
+    }
+
+    /// Harmony takes media in no role, so its own whole-request refusal
+    /// speaks before the shared door names a role's rule: a system image is
+    /// refused by name and pointed at the regular multimodal path, not told
+    /// to move to a user message.
+    #[test]
+    fn build_from_chat_refuses_a_system_image_in_harmonys_own_words() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "gpt-oss-120b",
+            "messages": [
+                {"role": "system", "content": [
+                    {"type": "text", "text": "You see the attached image."},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AQ=="}}
+                ]},
+                {"role": "user", "content": "Describe it."}
+            ]
+        }))
+        .unwrap();
+        let error = HarmonyBuilder::new().build_from_chat(&request).unwrap_err();
+        assert_eq!(
+            error,
+            "Harmony does not support image content parts; use the regular multimodal path"
+        );
     }
 
     /// A Responses message item's `input_image` or `input_file` part has no
@@ -1914,7 +1915,7 @@ mod tests {
             });
             assert_eq!(commentary, !expected.is_empty(), "{case}");
             // The developer message describes the same tools.
-            let developer = builder.build_developer_message_from_chat(None, tools.as_ref());
+            let developer = builder.build_developer_message(tools.as_ref(), None);
             assert_eq!(developer.content.len(), 1, "{case}");
             let described: Vec<String> = developer
                 .content
@@ -2228,5 +2229,29 @@ mod tests {
             "messages": [{"role": "user", "content": "Check Hangzhou weather."}]
         }));
         assert_eq!(prompt, REQUEST_TOOLS);
+    }
+
+    /// With trace logging on, a Responses build still writes its two trace
+    /// lines from the prompt decoded back: the decoded length on the first,
+    /// the text under the marker of the second.
+    #[test]
+    #[traced_test]
+    fn build_from_responses_traces_the_decoded_prompt() {
+        let request = ResponsesRequest {
+            model: "gpt-oss-120b".to_string(),
+            input: ResponseInput::Text("draw a cat".to_string()),
+            ..Default::default()
+        };
+        let output = HarmonyBuilder::new()
+            .build_from_responses(&request)
+            .expect("harmony build must succeed");
+        let decoded = try_harmony_encoding()
+            .expect("harmony encoding must load")
+            .tokenizer()
+            .decode_utf8(&output.input_ids)
+            .expect("decode harmony tokens back to UTF-8");
+
+        assert!(logs_contain(&format!("decoded_length={}", decoded.len())));
+        assert!(logs_contain("DECODED_TEXT_START"));
     }
 }

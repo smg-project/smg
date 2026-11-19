@@ -476,14 +476,17 @@ async fn build_test_app_context(
     // The configuration's liveness budgets before the policy registry is
     // built, as `AppContextBuilder::from_config` orders them: the first call
     // in a process wins.
-    smg::worker::configure_liveness(&config);
+    smg::worker::configure_liveness(config.worker_liveness_budgets());
 
-    // Initialize registries
+    // Initialize registries. The policy registry takes the configuration's
+    // pairing mode, as `AppContextBuilder::from_config` gives it: without it
+    // a test router pairs under the default mode whatever its configuration
+    // says.
     let worker_registry = Arc::new(WorkerRegistry::new());
-    let policy_registry = Arc::new(PolicyRegistry::with_override(
-        config.policy.clone(),
-        config.routing_key_override.clone(),
-    ));
+    let policy_registry = Arc::new(
+        PolicyRegistry::with_override(config.policy.clone(), config.routing_key_override.clone())
+            .with_pd_pairing_mode(config.pd_pairing_mode),
+    );
 
     // Initialize storage backends (Memory for tests, unless the caller brought
     // its own: a history store that is down, for one).

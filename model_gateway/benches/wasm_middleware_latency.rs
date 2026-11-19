@@ -13,10 +13,9 @@ use openai_protocol::chat::ChatCompletionRequest;
 use smg::{
     app_context::AppContext,
     config::RouterConfig,
-    health::ProbeState,
     middleware::{wasm_middleware, TenantRequestMeta},
     routers::RouterTrait,
-    server::AppState,
+    server::{health::ProbeState, AppState},
 };
 use tokio::{runtime::Runtime, sync::mpsc};
 use tower::{Layer, Service};
@@ -33,7 +32,7 @@ impl RouterTrait for MockRouter {
         &self,
         _headers: Option<&HeaderMap>,
         _tenant_meta: &TenantRequestMeta,
-        _body: ChatCompletionRequest,
+        _body: Arc<ChatCompletionRequest>,
         _model_id: &str,
     ) -> Response<Body> {
         StatusCode::OK.into_response()

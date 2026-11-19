@@ -19,6 +19,7 @@ use std::{error::Error as _, sync::Arc};
 use axum::{http::StatusCode, response::Response};
 use bytes::Bytes;
 use serde_json::json;
+use smg_external_router::retry::{is_request_timeout, REQUEST_TIMEOUT_CODE};
 use tracing::warn;
 
 use crate::{
@@ -60,6 +61,10 @@ pub(crate) fn head_success_recorded(response: &Response) -> bool {
 pub(crate) struct UpstreamCut {
     status: StatusCode,
     cause: String,
+    /// The code the event that ends an OpenAI-style stream names the cut
+    /// with, when the cut has one of its own: the request timeout's, the
+    /// code of the 504 the same request gets unary.
+    code: Option<&'static str>,
 }
 
 impl UpstreamCut {
@@ -73,6 +78,7 @@ impl UpstreamCut {
         Self {
             status,
             cause: cause(error),
+            code: is_request_timeout(error).then_some(REQUEST_TIMEOUT_CODE),
         }
     }
 }
@@ -211,8 +217,9 @@ impl RelaySource {
     /// The SSE event that ends a response `cut` by the worker, in the shape
     /// of the route's API. An OpenAI-style stream (Chat Completions,
     /// Completions, generate, Responses) gets the error event the gRPC path
-    /// writes for a stream the worker failed, typed `stream_error`, then
-    /// `[DONE]`; a Messages stream gets the API's own `error` event, typed
+    /// writes for a stream the worker failed, typed `stream_error`, under the
+    /// request timeout's code when that is what cut the body, then `[DONE]`;
+    /// a Messages stream gets the API's own `error` event, typed
     /// `api_error` as the gRPC path types a worker's failure there, and no
     /// `[DONE]`, which the protocol does not have.
     pub(crate) fn error_event(&self, cut: &UpstreamCut) -> Bytes {
@@ -226,7 +233,11 @@ impl RelaySource {
             });
             Bytes::from(format!("event: error\ndata: {event}\n\n"))
         } else {
-            let event = json!({"error": {"message": message, "type": STREAM_ERROR_TYPE}});
+            let mut error = json!({"message": message, "type": STREAM_ERROR_TYPE});
+            if let Some(code) = cut.code {
+                error["code"] = json!(code);
+            }
+            let event = json!({"error": error});
             Bytes::from(format!("data: {event}\n\ndata: [DONE]\n\n"))
         }
     }
@@ -298,7 +309,7 @@ mod tests {
     use crate::{
         server::http_client_builder,
         worker::{
-            circuit_breaker::CircuitBreakerConfig,
+            health::circuit_breaker::CircuitBreakerConfig,
             test_support::{no_health_check, RefusedAddress},
             BasicWorkerBuilder,
         },
@@ -324,7 +335,24 @@ mod tests {
         UpstreamCut {
             status,
             cause: CAUSE.to_string(),
+            code: None,
         }
+    }
+
+    /// A call the client's own timeout ends: the listener's backlog takes
+    /// the connect and nobody answers the request.
+    async fn timed_out_call() -> reqwest::Error {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        http_client_builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_millis(50))
+            .build()
+            .unwrap()
+            .get(format!("http://{addr}/v1/chat/completions"))
+            .send()
+            .await
+            .unwrap_err()
     }
 
     /// The source of a response to `route`, read from a fresh worker.
@@ -523,6 +551,44 @@ mod tests {
         assert_eq!(error["error"]["type"], STREAM_ERROR_TYPE);
         assert_eq!(error["error"]["message"], format!("Stream error: {CAUSE}"));
         assert_eq!(done, "data: [DONE]\n\n");
+    }
+
+    /// The request's own timeout names itself in the event of an
+    /// OpenAI-style stream, as its 504 does on a unary answer; a refused
+    /// connect and a cut of any other kind have no code.
+    #[tokio::test]
+    async fn the_event_of_a_stream_the_request_timeout_cut_names_the_timeouts_code() {
+        let (source, _worker) = source("/v1/chat/completions");
+        let error_of = |cut: &UpstreamCut| -> Value {
+            let event = source.error_event(cut);
+            let text = std::str::from_utf8(&event).unwrap();
+            let (error, done) = text.split_once("\n\n").unwrap();
+            assert_eq!(done, "data: [DONE]\n\n");
+            serde_json::from_str(error.strip_prefix("data: ").unwrap()).unwrap()
+        };
+
+        let timed_out = error_of(&UpstreamCut::of(&timed_out_call().await));
+        assert_eq!(timed_out["error"]["type"], STREAM_ERROR_TYPE);
+        assert_eq!(timed_out["error"]["code"], "call_upstream_timeout");
+
+        let (_addr, refused) = refused_call().await;
+        for other in [UpstreamCut::of(&refused), cut(StatusCode::BAD_GATEWAY)] {
+            let error = error_of(&other);
+            assert!(error["error"].get("code").is_none(), "{error}");
+        }
+    }
+
+    /// The Messages API's error event has no code field: the request
+    /// timeout ends its stream with the event of any other cut.
+    #[tokio::test]
+    async fn the_event_of_a_messages_stream_the_request_timeout_cut_has_no_code() {
+        let (source, _worker) = source("/v1/messages");
+
+        let event = source.error_event(&UpstreamCut::of(&timed_out_call().await));
+
+        let text = std::str::from_utf8(&event).unwrap();
+        assert!(text.starts_with("event: error\ndata: "), "{text:?}");
+        assert!(!text.contains("call_upstream_timeout"), "{text:?}");
     }
 
     #[test]

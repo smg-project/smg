@@ -65,6 +65,13 @@ pub enum ModelRegistryError {
     },
 }
 
+impl ModelRegistryError {
+    /// The error for a modality that the spec named `spec` does not serve.
+    pub(crate) fn unsupported(spec: &'static str, modality: Modality) -> Self {
+        Self::UnsupportedModality { spec, modality }
+    }
+}
+
 pub type RegistryResult<T> = Result<T, ModelRegistryError>;
 
 static IMAGE_MAX_COUNT_OVERRIDE: OnceLock<Option<usize>> = OnceLock::new();
@@ -338,10 +345,7 @@ pub trait ModelProcessorSpec: Send + Sync {
         match (self.hooks(modality), modality) {
             (Some(hooks), _) => (hooks.placeholder)(metadata),
             (None, Modality::Image) => self.placeholder_token(metadata),
-            (None, _) => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            (None, _) => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
     fn placeholder_token_id_for(
@@ -352,10 +356,7 @@ pub trait ModelProcessorSpec: Send + Sync {
         match (self.hooks(modality), modality) {
             (Some(hooks), _) => (hooks.placeholder_id)(metadata),
             (None, Modality::Image) => self.placeholder_token_id(metadata),
-            (None, _) => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            (None, _) => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
     /// The text the model's chat template writes for one item of `modality`
@@ -417,10 +418,7 @@ pub trait ModelProcessorSpec: Send + Sync {
         _preprocessor_config: &PreProcessorConfig,
         modality: Modality,
     ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
-        Err(ModelRegistryError::UnsupportedModality {
-            spec: self.name(),
-            modality,
-        })
+        Err(ModelRegistryError::unsupported(self.name(), modality))
     }
 
     /// Build the audio preprocessor for this model, if it supports audio.
@@ -466,10 +464,7 @@ pub trait ModelProcessorSpec: Send + Sync {
                 (hooks.replacements)(metadata, preprocessed, &[], &PreProcessorConfig::default())
             }
             (None, Modality::Image) => self.prompt_replacements(metadata, preprocessed),
-            (None, _) => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            (None, _) => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
 
@@ -495,6 +490,10 @@ pub trait ModelProcessorSpec: Send + Sync {
     /// Keys not listed are treated as shared (replicated across all media items).
     /// The `"pixel_values"` key mirrors the reference processors' vision kwargs and should be
     /// included when the primary encoder input differs from batched layout.
+    ///
+    /// This is the legacy map, read only by the default of [`Self::encoder_field_layouts_for`]:
+    /// an entry that overrides that method, or declares hooks for every modality, need not
+    /// declare this map and keeps the default here, so a caller asks that method.
     fn field_layouts(&self) -> HashMap<String, FieldLayout> {
         // Default: encoder_input is batched (most models).
         HashMap::from([("pixel_values".to_string(), FieldLayout::Batched)])

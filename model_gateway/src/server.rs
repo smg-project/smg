@@ -54,18 +54,28 @@ use wfaas::LoggingSubscriber;
 
 pub mod connection_limit;
 pub mod connection_timeouts;
+pub mod health;
 pub mod posture;
 mod rate_limit_document;
 pub(crate) mod tls;
 
 // The HTTP client constructors and the process crypto provider they install
-// first live beside the private-key-file check in `tls`; callers read them as
-// `server::http_client()` and its siblings.
-pub use tls::{blocking_http_client, http_client, http_client_builder, install_crypto_provider};
-
+// first live in the worker tree, which builds the worker-directed clients
+// with them; callers read them as `server::http_client()` and its siblings.
+pub use crate::worker::connection::client_factory::{
+    blocking_http_client, http_client, http_client_builder, install_crypto_provider,
+};
 use crate::{
-    app_context::AppContext,
-    config::{redacted, ParserChoice, RouterConfig},
+    admin::{
+        json::AdminJson,
+        params::{AdminPath, AdminQuery},
+    },
+    app_context::{effective_max_concurrent_requests, AppContext},
+    config::{
+        available_cpus, bind_socket_addr, dp_minimum_tokens_scheduler_scope_warning, redacted,
+        runtime_worker_threads_oversubscription, unused_credentials_warnings,
+        validate_mesh_listener_port, ParserChoice, RouterConfig,
+    },
     endpoints::{
         conversations, messages::MessagesHeaders, models, parse, responses as response_handlers,
         tokenize,
@@ -90,18 +100,18 @@ use crate::{
         http::router::StreamBodyState,
         RouterTrait,
     },
+    secrets::{reload_logged, start_auto_reload, BadFile, KeySets, SecretFiles, SecretReloader},
     server::{
         connection_limit::{BoundedListener, ConnectionLimitAcceptor},
         connection_timeouts::{ConnectionTimeoutAcceptor, ConnectionTimeouts},
+        health::{liveness_response, spawn_readiness_maintainer, start_probe_listener, ProbeState},
     },
     service_discovery::{export_manifest, start_service_discovery, RuntimeDiscoveryConfig},
     tenant,
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
     worker::{
-        admin_json::AdminJson,
-        admin_params::{AdminPath, AdminQuery},
-        endpoint::Endpoint,
-        manager::{WorkerManager, WorkerManagerConfig},
+        health::manager::{WorkerJobs, WorkerManager, WorkerManagerConfig},
+        identity::endpoint::Endpoint,
         ConnectionMode,
     },
     workflow::{
@@ -119,14 +129,14 @@ pub struct AppState {
     pub mesh_adapters: Option<Arc<MeshAdapters>>,
     /// Cached O(1) readiness state shared with the optional dedicated
     /// probe listener. Maintained event-driven by
-    /// [`crate::health::spawn_readiness_maintainer`].
-    pub probe_state: Arc<crate::health::ProbeState>,
+    /// [`crate::server::health::spawn_readiness_maintainer`].
+    pub probe_state: Arc<ProbeState>,
     /// Where this start read its secrets (the command line, the environment
     /// or a file), for the configuration view; the values are not here.
     pub secret_sources: posture::SecretSources,
     /// The reload of the keys from their files, when a key came from one;
     /// without it `POST /secrets/reload` answers 409.
-    pub secrets: Option<Arc<crate::secrets::SecretReloader>>,
+    pub secrets: Option<Arc<SecretReloader>>,
 }
 
 async fn parse_function_call(
@@ -174,13 +184,13 @@ async fn unknown_route(status: StatusCode, code: &str, request: Request) -> Resp
 }
 
 async fn liveness() -> Response {
-    crate::health::liveness_response()
+    liveness_response()
 }
 
 /// O(1) readiness: reads the event-maintained snapshot (see
-/// [`crate::health::spawn_readiness_maintainer`]) and the drain flag — no registry
+/// [`crate::server::health::spawn_readiness_maintainer`]) and the drain flag — no registry
 /// scan per probe. The decision logic lives in
-/// [`crate::health::ProbeState::recompute`] and is unchanged from the previous
+/// [`crate::server::health::ProbeState::recompute`] and is unchanged from the previous
 /// inline implementation, plus the drain gate (not-ready while draining).
 async fn readiness(State(state): State<Arc<AppState>>) -> Response {
     state.probe_state.readiness_response()
@@ -247,6 +257,9 @@ async fn v1_chat_completions(
     ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
 ) -> Response {
     let model = body.model.clone();
+    // One allocation holds the parsed request from here on: the router
+    // layers below move its pointer, not the 1 KiB request.
+    let body = Arc::new(body);
     cancel
         .guard(
             state
@@ -421,6 +434,9 @@ async fn v1_messages(
         return refused;
     }
     let model = body.model.clone();
+    // As for chat: the router layers below move this pointer, not the
+    // parsed request.
+    let body = Arc::new(body);
     cancel
         .guard(
             state
@@ -808,6 +824,7 @@ async fn get_loads(
         &state.context.worker_registry,
         &snapshot,
         query.model.as_deref(),
+        concat!("smg-", env!("CARGO_PKG_VERSION")),
     ))
     .into_response()
 }
@@ -868,9 +885,9 @@ async fn reload_secrets(State(state): State<Arc<AppState>>) -> Response {
         )
             .into_response();
     };
-    match crate::secrets::reload_logged(reloader, "route").await {
+    match reload_logged(reloader, "route").await {
         Some(Ok(report)) => smg_auth::AuditResource::name(Json(report).into_response(), "secrets"),
-        Some(Err(crate::secrets::BadFile(error))) => (
+        Some(Err(BadFile(error))) => (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(serde_json::json!({ "error": error.to_string() })),
         )
@@ -1076,7 +1093,7 @@ pub struct ServerConfig {
     /// The files the keys were read from, where a file was the source: the
     /// targets of `POST /secrets/reload`; a caller that did not track them
     /// leaves the default, and the route answers 409.
-    pub secret_files: crate::secrets::SecretFiles,
+    pub secret_files: SecretFiles,
     /// `--secrets-auto-reload`: the key files watched, a change reloading
     /// them as the route does. Nothing to watch without a file source; the
     /// start says so.
@@ -1691,9 +1708,9 @@ async fn start_observability(
     config: &ServerConfig,
     app_context: &Arc<AppContext>,
     metrics_handle: Option<PrometheusHandle>,
-) -> Result<Arc<crate::health::ProbeState>, Box<dyn std::error::Error>> {
-    let probe_state = crate::health::ProbeState::new(app_context.inflight_tracker.clone());
-    let _readiness_maintainer = crate::health::spawn_readiness_maintainer(
+) -> Result<Arc<ProbeState>, Box<dyn std::error::Error>> {
+    let probe_state = ProbeState::new(app_context.inflight_tracker.clone());
+    let _readiness_maintainer = spawn_readiness_maintainer(
         probe_state.clone(),
         app_context.worker_registry.clone(),
         app_context.tokenizer_registry.clone(),
@@ -1716,11 +1733,8 @@ async fn start_observability(
     );
 
     if let Some(probe_port) = config.router_config.health_check_port {
-        let probe_addr = crate::health::start_probe_listener(
-            &config.router_config.host,
-            probe_port,
-            probe_state.clone(),
-        )?;
+        let probe_addr =
+            start_probe_listener(&config.router_config.host, probe_port, probe_state.clone())?;
         info!("Probe listener started on {probe_addr} (--health-check-port {probe_port})");
     }
     Ok(probe_state)
@@ -2083,9 +2097,7 @@ fn serve_listeners(
     // The admission limit the bound is compared with is the effective one
     // (the one resolution of `max_concurrent_requests`, shared with the
     // admission bucket).
-    let admission_limit = crate::app_context::effective_max_concurrent_requests(
-        router_config.max_concurrent_requests,
-    );
+    let admission_limit = effective_max_concurrent_requests(router_config.max_concurrent_requests);
     if let Some(admission_limit) =
         admission_limit.filter(|limit| max_connections > 0 && max_connections < *limit)
     {
@@ -2193,7 +2205,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // not part of `RouterConfig`, so the validator cannot see it, and this is
     // the one place the CLI, the Python binding and a library caller all pass.
     if let Some(mesh_server_config) = &config.mesh_server_config {
-        crate::config::validate_mesh_listener_port(
+        validate_mesh_listener_port(
             mesh_server_config.bind_addr.port(),
             config.router_config.port,
             config
@@ -2271,12 +2283,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     if let Some(warning) = config
         .router_config
         .runtime_worker_threads
-        .and_then(|threads| {
-            crate::config::runtime_worker_threads_oversubscription(
-                threads,
-                crate::config::available_cpus(),
-            )
-        })
+        .and_then(|threads| runtime_worker_threads_oversubscription(threads, available_cpus()))
     {
         tracing::warn!("{warning}");
     }
@@ -2284,12 +2291,12 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // once per listed URL, where the line reaches the log (the validator runs
     // before the subscriber exists); the add-worker route says it at
     // registration.
-    for warning in crate::config::unused_credentials_warnings(&config.router_config.mode) {
+    for warning in unused_credentials_warnings(&config.router_config.mode) {
         tracing::warn!("{warning}");
     }
     // A rank scheduler under rank expansion chooses nothing: the operator's
     // configuration runs, with the word that one of its flags does nothing.
-    if let Some(warning) = crate::config::dp_minimum_tokens_scheduler_scope_warning(
+    if let Some(warning) = dp_minimum_tokens_scheduler_scope_warning(
         config.router_config.dp_aware,
         config.router_config.dp_minimum_tokens_scheduler,
     ) {
@@ -2444,7 +2451,10 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             default_check_interval_secs: config.router_config.health_check.check_interval_secs,
             remove_unhealthy: config.router_config.unhealthy_removal_scope(),
         },
-        app_context.worker_job_queue.get().cloned(),
+        app_context
+            .worker_job_queue
+            .get()
+            .map(|queue| Arc::clone(queue) as Arc<dyn WorkerJobs>),
         !config.router_config.health_check.disable_health_check,
         config.router_config.connection_mode == ConnectionMode::Zmq,
     );
@@ -2513,12 +2523,12 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // the serving set, the control-plane set, and the admin routes' fallback
     // when no control-plane keys are configured, so a rotated shared key
     // leaves the admin routes too.
-    let secrets = crate::secrets::SecretReloader::new(
+    let secrets = SecretReloader::new(
         config.secret_files.clone(),
         &config.secret_sources,
         config.router_config.api_key.as_deref(),
         &config.router_config.tenant_api_keys,
-        crate::secrets::KeySets {
+        KeySets {
             serving: app_context.gateway_auth.clone(),
             control_plane: control_plane_auth_state
                 .as_ref()
@@ -2536,7 +2546,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let secrets_auto_reload = match (config.secrets_auto_reload, &secrets) {
         (false, _) => "off".to_string(),
         (true, Some(reloader)) => {
-            crate::secrets::start_auto_reload(Arc::clone(reloader))?;
+            start_auto_reload(Arc::clone(reloader))?;
             let names: Vec<&str> = reloader.files().names().collect();
             format!("on ({})", names.join(", "))
         }
@@ -2599,7 +2609,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // (port, host, distinct ports), whichever way the caller built it.
     let admin_addr = match config.router_config.admin_port {
         Some(admin_port) => Some(
-            crate::config::bind_socket_addr(
+            bind_socket_addr(
                 config
                     .router_config
                     .admin_host
@@ -2642,9 +2652,8 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     )?;
 
     // One bind-host rule for every listener: IPv6 with or without brackets.
-    let addr =
-        crate::config::bind_socket_addr(&config.router_config.host, config.router_config.port)
-            .map_err(|e| format!("Invalid address: {e}"))?;
+    let addr = bind_socket_addr(&config.router_config.host, config.router_config.port)
+        .map_err(|e| format!("Invalid address: {e}"))?;
     // The mesh listener binds and the mesh server prepares now, eagerly,
     // before the admin and HTTP listeners bind (see `prepare_mesh_server`).
     let mesh_server = prepare_mesh_server(mesh_server, config.mesh_server_config.as_ref()).await?;
@@ -2840,8 +2849,10 @@ async fn graceful_shutdown(
         "Beginning graceful shutdown: readiness draining"
     );
     // Everything below shares the grace: the drain takes what the settle
-    // window and the leave of the mesh leave of it.
-    let deadline = tokio::time::Instant::now() + budget.grace;
+    // window and the leave of the mesh leave of it. A grace the clock cannot
+    // hold ends at the far future: the plain sum would panic here, in the
+    // signal's task, before readiness drains.
+    let deadline = middleware::body_timeout::deadline_from_now(budget.grace);
     inflight_tracker.begin_drain();
     let left_in_time = if budget.settle.is_zero() {
         tokio::time::timeout(budget.grace, leave_mesh).await.is_ok()
@@ -3252,6 +3263,71 @@ mod graceful_shutdown_tests {
             1,
             "the stuck request is reported, not waited for"
         );
+    }
+
+    /// A grace the clock cannot hold (an operator's "never", written as the
+    /// largest number) still drains: its end is the far future, thirty years
+    /// on. Readiness drains at once, the listeners are gated after the settle
+    /// window with what is left to that end, and a request in flight is
+    /// waited for. The plain sum of such a grace and the clock panics before
+    /// readiness drains. A grace the clock holds ends where it always did,
+    /// one past the far future too.
+    #[tokio::test(start_paused = true)]
+    async fn a_grace_past_the_clocks_range_still_drains() {
+        const YEAR: u64 = 86400 * 365;
+        let far_future = Duration::from_secs(30 * YEAR);
+        for (grace_secs, end) in [
+            (u64::MAX, far_future),
+            // The clock counts seconds in a signed 64-bit number: 2^63 does
+            // not fit, and neither does one second less once added to now.
+            (1 << 63, far_future),
+            ((1 << 63) - 1, far_future),
+            (10 * YEAR, Duration::from_secs(10 * YEAR)),
+            (40 * YEAR, Duration::from_secs(40 * YEAR)),
+        ] {
+            let tracker = InFlightRequestTracker::new();
+            let request = tracker.track();
+            let start = tokio::time::Instant::now();
+            let gated = Arc::new(Mutex::new(None));
+            let stop_listeners = {
+                let gated = Arc::clone(&gated);
+                let tracker = Arc::clone(&tracker);
+                move |drain_timeout| {
+                    *gated.lock().expect("no poison") =
+                        Some((start.elapsed(), drain_timeout, tracker.is_draining()));
+                }
+            };
+            // The request ends an hour in, during the drain.
+            let release = async {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+                drop(request);
+            };
+            let shutdown = graceful_shutdown(
+                &tracker,
+                ShutdownBudget::from_grace_secs(grace_secs, None),
+                async {},
+                || panic!("a completed mesh leave must not be stopped again"),
+                stop_listeners,
+            );
+            let (deadline, ()) = tokio::join!(shutdown, release);
+            assert_eq!(
+                gated.lock().expect("no poison").take(),
+                Some((Duration::from_secs(5), end - Duration::from_secs(5), true)),
+                "{grace_secs}: gated after the settle window, with what is left of the grace, \
+                 while draining"
+            );
+            assert_eq!(
+                start.elapsed(),
+                Duration::from_secs(3600),
+                "{grace_secs}: the drain ended with the request"
+            );
+            assert_eq!(
+                deadline,
+                Some(start + end),
+                "{grace_secs}: the end of the grace the caller waits to"
+            );
+            assert!(tracker.is_empty());
+        }
     }
 
     /// With no grace there is no settle window: the leave gets no time (a

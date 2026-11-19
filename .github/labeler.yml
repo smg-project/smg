@@ -32,6 +32,7 @@ grpc:
   - changed-files:
       - any-glob-to-any-file:
           - 'crates/grpc_client/**/*'
+          - 'crates/worker/proto/**/*'
           - 'grpc_servicer/**/*'
           - 'model_gateway/src/routers/grpc/**/*'
 
@@ -79,7 +80,9 @@ multimodal:
 
 protocols:
   - changed-files:
-      - any-glob-to-any-file: 'crates/protocols/**/*'
+      - any-glob-to-any-file:
+          - 'crates/protocols/**/*'
+          - 'crates/worker/**/*'
 
 workflow:
   - changed-files:

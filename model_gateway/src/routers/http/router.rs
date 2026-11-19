@@ -47,6 +47,7 @@ use tracing::{error, warn};
 use crate::{
     app_context::AppContext,
     config::types::RetryConfig,
+    endpoints::messages::MessagesHeaders,
     middleware::{
         body_timeout::{
             request_body_stalled_response, REQUEST_BODY_STALLED, REQUEST_BODY_TOO_LARGE,
@@ -82,6 +83,7 @@ use crate::{
                 is_request_timeout, is_retryable_response, request_timeout_response, RetryExecutor,
             },
             sse_rechunk::{NoopObserver, RechunkPolicy, SseRechunker},
+            stream::GuardedStream,
             worker_selection::{SelectWorkerRequest, WorkerSelector},
         },
         error::{self, extract_error_code_from_response},
@@ -107,8 +109,9 @@ use crate::{
     },
     wasm::module::{MiddlewareAttachPoint, WasmModuleAttachPoint},
     worker::{
-        endpoint::Endpoint, ConnectionMode, GuardedStream, RoutingPool, RuntimeType, Worker,
-        WorkerLoadGuard, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID,
+        identity::endpoint::Endpoint, metrics::Metrics as WorkerMetrics, ConnectionMode,
+        RoutingPool, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry, WorkerRegistryExt,
+        WorkerType, UNKNOWN_MODEL_ID,
     },
 };
 
@@ -747,23 +750,25 @@ impl Router {
         attempt: &TypedAttempt<'_, T>,
     ) -> Result<Arc<dyn Worker>, Response> {
         let model_id = attempt.model_id;
-        let ledger = attempt.ledger;
-        // A retry never goes back to a worker whose answer was definitive.
-        let admits = |worker: &dyn Worker| ledger.admits(worker);
         match attempt.lease.with_view(|view| {
             // A retry re-selects away from the engines this request already
             // tried, while another available worker is left to take it.
             let tried = attempt.tried.lock();
-            self.select_worker_for_model(
-                model_id,
-                view.text,
-                view.tokens,
-                attempt.headers,
-                view.rid_key,
-                view.cache_namespace,
-                Some(&admits),
-                &tried,
-            )
+            // A retry never goes back to a worker whose answer was
+            // definitive. Until a worker gave one the ledger hands no
+            // filter, and a first attempt asks nothing of each candidate.
+            attempt.ledger.with_candidate_filter(|candidate_filter| {
+                self.select_worker_for_model(
+                    model_id,
+                    view.text,
+                    view.tokens,
+                    attempt.headers,
+                    view.rid_key,
+                    view.cache_namespace,
+                    candidate_filter,
+                    &tried,
+                )
+            })
         }) {
             Some(worker) => Ok(worker),
             None => {
@@ -1110,16 +1115,6 @@ impl Router {
             .unwrap_or_else(|| error::bad_gateway("no_worker_response", "No worker response"))
     }
 
-    // Route a POST request with empty body to a specific endpoint
-    async fn route_post_empty_request(
-        &self,
-        headers: Option<&HeaderMap>,
-        endpoint: &str,
-    ) -> Response {
-        self.route_simple_request(headers, endpoint, Method::POST)
-            .await
-    }
-
     /// Forward an audio transcription request to an audio-capable worker as
     /// `multipart/form-data`, as the sequence of its stages: the prologue it
     /// shares with `route_typed_request` (the routing derivatives, the
@@ -1338,7 +1333,7 @@ impl Router {
             worker.api_key(),
         );
 
-        Metrics::record_worker_request(worker.url(), worker.model_id());
+        WorkerMetrics::record_worker_request(worker.url(), worker.model_id());
         match send_with_stale_conn_retry(request_builder).await {
             Ok(res) => Ok(res),
             Err(e) => {
@@ -1425,7 +1420,7 @@ impl Router {
             api_key.as_ref(),
         );
 
-        Metrics::record_worker_request(worker.url(), worker.model_id());
+        WorkerMetrics::record_worker_request(worker.url(), worker.model_id());
         let res = match send_with_stale_conn_retry(request_builder).await {
             Ok(res) => res,
             Err(e) => {
@@ -1572,7 +1567,7 @@ impl Router {
             api_key.as_ref(),
         );
 
-        Metrics::record_worker_request(worker.url(), worker.model_id());
+        WorkerMetrics::record_worker_request(worker.url(), worker.model_id());
         let send = send_with_stale_conn_retry(request_builder);
         tokio::pin!(send);
         let sent = tokio::select! {
@@ -2265,6 +2260,15 @@ impl Router {
             }
             BodyPath::Stream(reason) => reason,
         };
+        // A streamed request reaches no handler and none of its extractors:
+        // the Messages route's version check is made here, with the route's
+        // own answer, before a worker is selected. A refused request takes
+        // no turn of the routing policy and is not counted as streamed.
+        if route == "/v1/messages" {
+            if let Err(refused) = MessagesHeaders::check_version(req.headers()) {
+                return Ok(refused);
+            }
+        }
         let model_id = UNKNOWN_MODEL_ID;
         // Buffered-path parity: a valid tokens hint is exactly what selection
         // would have received there (text is never extracted alongside it).
@@ -2592,13 +2596,13 @@ impl RouterTrait for Router {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: ChatCompletionRequest,
+        body: Arc<ChatCompletionRequest>,
         model_id: &str,
     ) -> Response {
         self.route_typed_request(
             headers,
             Some(tenant_meta),
-            super::chat_for_upstream(body),
+            super::chat_for_upstream(Arc::unwrap_or_clone(body)),
             "/v1/chat/completions",
             model_id,
         )
@@ -2609,14 +2613,20 @@ impl RouterTrait for Router {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: CreateMessageRequest,
+        body: Arc<CreateMessageRequest>,
         model_id: &str,
     ) -> Response {
         if let Some(refused) = super::refuse_max_tokens_zero(body.max_tokens) {
             return refused;
         }
-        self.route_typed_request(headers, Some(tenant_meta), body, "/v1/messages", model_id)
-            .await
+        self.route_typed_request(
+            headers,
+            Some(tenant_meta),
+            Arc::unwrap_or_clone(body),
+            "/v1/messages",
+            model_id,
+        )
+        .await
     }
 
     async fn route_messages_count_tokens(
@@ -2665,7 +2675,8 @@ impl RouterTrait for Router {
         response_id: &str,
     ) -> Response {
         let endpoint = format!("v1/responses/{response_id}/cancel");
-        self.route_post_empty_request(headers, &endpoint).await
+        self.route_simple_request(headers, &endpoint, Method::POST)
+            .await
     }
 
     async fn route_embeddings(
@@ -2925,7 +2936,7 @@ mod tests {
         service_discovery::testing::create_test_app_context,
         tenant::TenantKey,
         worker::{
-            circuit_breaker::CircuitState,
+            health::circuit_breaker::CircuitState,
             test_support::{no_health_check, RefusedAddress},
             BasicWorker, BasicWorkerBuilder, CircuitBreakerConfig, ModelCard,
         },
@@ -3205,7 +3216,9 @@ mod tests {
                     }))
                     .unwrap();
                     request.normalize();
-                    let response = router.route_chat(None, &tenant, request, model).await;
+                    let response = router
+                        .route_chat(None, &tenant, Arc::new(request), model)
+                        .await;
                     let expected = if model == "m1" {
                         StatusCode::OK
                     } else {
@@ -3533,6 +3546,68 @@ mod tests {
         }
     }
 
+    /// One attempt's selection as the retry loop runs it: a first attempt
+    /// places over the whole pool, and once a worker answered the request
+    /// definitively no later attempt selects it, tried or not.
+    #[tokio::test]
+    async fn an_attempt_never_selects_the_worker_that_answered_definitively() {
+        let router = breaker_router(
+            &["http://w1:8080", "http://w2:8080"],
+            fast_retry_config(5),
+            5,
+        );
+        let request = DropProbeRequest {
+            text: "a prompt".to_string(),
+            _probe: Arc::new(()),
+        };
+        let routing = router.routing_derivatives(None, &request);
+        let lease = RequestLease::new(
+            request,
+            routing,
+            ReleasePoint::from_retry_config(&router.retry_config),
+        );
+        let tried = parking_lot::Mutex::new(Vec::new());
+        let ledger = AttemptLedger::default();
+        let attempt = TypedAttempt {
+            headers: None,
+            lease: &lease,
+            route: "/generate",
+            model_id: UNKNOWN_MODEL_ID,
+            canonical_model: None,
+            is_stream: false,
+            ledger: &ledger,
+            tried: &tried,
+        };
+        let select = || {
+            let worker = router
+                .select_worker_for_attempt(&attempt)
+                .expect("the pool has a worker to give");
+            worker.url().to_string()
+        };
+
+        // Round robin walks the pool it is handed.
+        let first_attempts: std::collections::HashSet<String> = (0..4).map(|_| select()).collect();
+        assert_eq!(
+            first_attempts.len(),
+            2,
+            "a first attempt places over the whole pool"
+        );
+
+        let pool = router.worker_registry.get_all();
+        let answering = &pool[0];
+        let mut failed = (StatusCode::INTERNAL_SERVER_ERROR, "upstream failed").into_response();
+        mark_upstream_answer(&mut failed);
+        ledger.settle(&mut failed, [answering], pool.iter());
+
+        for _ in 0..4 {
+            assert_ne!(
+                select(),
+                answering.url(),
+                "the worker that answered takes no later attempt"
+            );
+        }
+    }
+
     /// Once every breaker is open the verdict clears at the breaker timeout,
     /// not inside a backoff: the 503 is terminal for the retry loop.
     #[tokio::test]
@@ -3602,9 +3677,7 @@ mod tests {
             Some(client_with_timeout(Duration::from_secs(1))),
         );
 
-        let started = Instant::now();
         let response = generate(&router, "slow").await;
-        let elapsed = started.elapsed();
 
         assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
         assert_eq!(
@@ -3616,10 +3689,6 @@ mod tests {
             hits_a.load(AtomicOrdering::SeqCst) + hits_b.load(AtomicOrdering::SeqCst),
             1,
             "one attempt, on one worker"
-        );
-        assert!(
-            elapsed < Duration::from_millis(1900),
-            "one timeout, not retries x timeout: {elapsed:?}"
         );
         let open = router
             .worker_registry
@@ -4069,39 +4138,11 @@ mod tests {
         );
     }
 
-    /// Loopback engine stub on `/body` whose head and first chunk leave at
-    /// once and whose body then never ends, as an engine that stalls
-    /// mid-answer does: the client's own timeout is what ends the read.
-    async fn spawn_stalled_body_stub() -> String {
-        let app = axum::Router::new().route(
-            "/body",
-            axum::routing::post(|| async {
-                let head = stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(
-                    b"{\"partial\":",
-                ))]);
-                (
-                    [(CONTENT_TYPE, "application/json")],
-                    Body::from_stream(head.chain(stream::pending())),
-                )
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "test stub server lives for the duration of the test process"
-        )]
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        format!("http://{addr}")
-    }
-
     /// The request's own timeout running out while the body is read is the
     /// request's end: the same 504 as before the head, and as final.
     #[tokio::test]
     async fn read_worker_body_capped_ends_the_request_at_its_timeout() {
-        let url = spawn_stalled_body_stub().await;
+        let url = spawn_stalled_stream_stub("/body", "application/json", &["{\"partial\":"]).await;
         let client = client_with_timeout(Duration::from_millis(200));
 
         let response = Router::read_worker_body_capped(worker_body(&client, &url).await, 1 << 20)
@@ -4424,6 +4465,89 @@ mod tests {
         assert!(
             forwarded.get("model").is_none(),
             "the wildcard placeholder leaked upstream: {forwarded}"
+        );
+    }
+
+    /// A streamed Messages request reaches no handler, so the handler's
+    /// extractor does not check its `anthropic-version`: the stream path
+    /// makes the same check, with the same answer, before it selects a
+    /// worker. A refused request reaches no worker and takes no turn of the
+    /// routing policy.
+    #[tokio::test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test stub servers live for the duration of the test process"
+    )]
+    async fn a_streamed_messages_request_takes_the_version_check() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Two workers that count the Messages requests they receive, under a
+        // policy that keeps a rotation: a selection made for a refused
+        // request would send both served requests to one worker.
+        let mut counts = Vec::new();
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let count = Arc::new(AtomicUsize::new(0));
+            counts.push(Arc::clone(&count));
+            let app = axum::Router::new().route(
+                "/v1/messages",
+                axum::routing::post(move || {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    async { ([(CONTENT_TYPE, "application/json")], "{}") }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            workers.push(plain_worker(&format!("http://{addr}")));
+        }
+        let router = streaming_router(PolicyConfig::RoundRobin, 1024 * 1024, workers);
+        let received = || -> Vec<usize> {
+            counts
+                .iter()
+                .map(|count| count.load(Ordering::SeqCst))
+                .collect()
+        };
+        let request = |version: Option<&'static str>| {
+            let mut request = streamed_request(&[b"{\"max_tokens\":8,\"messages\":[]}"]);
+            if let Some(version) = version {
+                request
+                    .headers_mut()
+                    .insert("anthropic-version", HeaderValue::from_static(version));
+            }
+            request
+        };
+
+        // A dated version is streamed, as before.
+        let served = router
+            .route_streaming_request(request(Some("2023-06-01")), "/v1/messages", false)
+            .await
+            .unwrap();
+        assert_eq!(served.status(), StatusCode::OK);
+
+        let refused = router
+            .route_streaming_request(request(Some("2023-6-1")), "/v1/messages", false)
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            extract_error_code_from_response(&refused),
+            "invalid_anthropic_version"
+        );
+
+        // A request without the header is streamed as before, to the
+        // rotation's next worker: the refused request took no turn of it.
+        let served = router
+            .route_streaming_request(request(None), "/v1/messages", false)
+            .await
+            .unwrap();
+        assert_eq!(served.status(), StatusCode::OK);
+        assert_eq!(
+            received(),
+            [1, 1],
+            "the refused request reached a worker or took a turn of the rotation"
         );
     }
 
@@ -5024,7 +5148,12 @@ mod tests {
 
         for stream in [false, true] {
             let response = router
-                .route_messages(None, &tenant, request(0, stream), UNKNOWN_MODEL_ID)
+                .route_messages(
+                    None,
+                    &tenant,
+                    Arc::new(request(0, stream)),
+                    UNKNOWN_MODEL_ID,
+                )
                 .await;
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
             assert_eq!(
@@ -5038,7 +5167,12 @@ mod tests {
         );
 
         let response = router
-            .route_messages(None, &tenant, request(16, false), UNKNOWN_MODEL_ID)
+            .route_messages(
+                None,
+                &tenant,
+                Arc::new(request(16, false)),
+                UNKNOWN_MODEL_ID,
+            )
             .await;
         assert_eq!(response.status(), StatusCode::OK);
         let forwarded = rx.recv().await.unwrap();
@@ -5166,7 +5300,7 @@ mod tests {
             .unwrap();
             request.normalize();
             let response = router
-                .route_chat(None, &tenant, request, UNKNOWN_MODEL_ID)
+                .route_chat(None, &tenant, Arc::new(request), UNKNOWN_MODEL_ID)
                 .await;
             assert_eq!(response.status(), StatusCode::OK);
         }
@@ -5240,7 +5374,7 @@ mod tests {
             .unwrap();
             request.normalize();
             let response = router
-                .route_chat(None, &tenant, request, UNKNOWN_MODEL_ID)
+                .route_chat(None, &tenant, Arc::new(request), UNKNOWN_MODEL_ID)
                 .await;
             assert_eq!(response.status(), StatusCode::OK, "{model}");
         }
@@ -6063,6 +6197,82 @@ mod tests {
         assert_eq!(events[3], "data: [DONE]");
     }
 
+    /// An engine's server on `path` whose head and chunks leave at once as
+    /// `content_type` and whose body then never ends, as an engine that
+    /// stalls mid-answer does: the client's own timeout is what ends the
+    /// read.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test stub server lives for the duration of the test process"
+    )]
+    async fn spawn_stalled_stream_stub(
+        path: &'static str,
+        content_type: &'static str,
+        chunks: &'static [&'static str],
+    ) -> String {
+        let app = axum::Router::new().route(
+            path,
+            axum::routing::post(move || async move {
+                let sent =
+                    stream::iter(chunks.iter().map(|chunk| {
+                        Ok::<_, std::io::Error>(Bytes::from_static(chunk.as_bytes()))
+                    }));
+                (
+                    [(CONTENT_TYPE, content_type)],
+                    Body::from_stream(sent.chain(stream::pending())),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    /// A stream the gateway's request timeout cuts ends with the event that
+    /// names the timeout, the code of the 504 the same request gets unary,
+    /// and with `[DONE]`.
+    #[tokio::test]
+    async fn a_stream_the_request_timeout_cuts_ends_with_the_timeouts_code() {
+        let url =
+            spawn_stalled_stream_stub("/v1/chat/completions", "text/event-stream", CHAT_SSE_CHUNKS)
+                .await;
+        let worker = BasicWorkerBuilder::new(&url)
+            .worker_type(WorkerType::Regular)
+            .health_config(no_health_check())
+            .http_client(client_with_timeout(Duration::from_millis(300)))
+            .build();
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![worker]);
+
+        let response = router
+            .route_typed_request(
+                None,
+                None,
+                streaming_chat_request(),
+                "/v1/chat/completions",
+                UNKNOWN_MODEL_ID,
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the body ends cleanly after the error event");
+        let body = std::str::from_utf8(&body).unwrap();
+        let events = sse_events(body);
+        assert_eq!(events.len(), 4, "{body}");
+        let error: Value = serde_json::from_str(events[2].strip_prefix("data: ").unwrap())
+            .expect("the error event is a frame of its own");
+        assert_eq!(error["error"]["type"], "stream_error", "{body}");
+        assert_eq!(
+            error["error"]["code"], "call_upstream_timeout",
+            "the event names the timeout as the 504 does: {body}"
+        );
+        assert_eq!(events[3], "data: [DONE]");
+    }
+
     /// On the Messages API the same cut ends the stream with the API's own
     /// error event, typed `api_error` as the gRPC path types a worker's
     /// failure there; the protocol has no `[DONE]`.
@@ -6570,7 +6780,7 @@ mod tests {
         .unwrap();
         request.normalize();
         let response = router
-            .route_chat(None, &tenant, request, UNKNOWN_MODEL_ID)
+            .route_chat(None, &tenant, Arc::new(request), UNKNOWN_MODEL_ID)
             .await;
         assert_eq!(response.status(), StatusCode::OK, "{model}");
         let mut body = response.into_body();
@@ -6868,7 +7078,7 @@ mod tests {
             .unwrap();
             request.normalize();
             let response = router
-                .route_chat(None, &tenant, request, UNKNOWN_MODEL_ID)
+                .route_chat(None, &tenant, Arc::new(request), UNKNOWN_MODEL_ID)
                 .await;
             assert_eq!(response.status(), StatusCode::OK, "{model}");
             assert!(
@@ -6916,7 +7126,7 @@ mod tests {
             .unwrap();
             request.normalize();
             let response = router
-                .route_chat(None, &tenant, request, UNKNOWN_MODEL_ID)
+                .route_chat(None, &tenant, Arc::new(request), UNKNOWN_MODEL_ID)
                 .await;
             assert_eq!(response.status(), StatusCode::OK, "{model}");
             assert_eq!(

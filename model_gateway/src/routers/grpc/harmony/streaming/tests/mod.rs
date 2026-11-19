@@ -4,6 +4,7 @@ mod local_stop;
 mod logprobs;
 mod lone_complete;
 mod responses_stop;
+mod server_call_allowance;
 mod status;
 mod usage;
 

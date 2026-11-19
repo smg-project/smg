@@ -52,7 +52,7 @@ use crate::{
     kv_events,
     testing::{
         assert_bucket_edges, assert_golden, bound_port, captured_logs, handshake_address, http_get,
-        next_batch, servicer_config, Bounded,
+        next_batch, reported_alive, servicer_config, Bounded,
     },
     tokenizer_bundle, ServicerError,
 };
@@ -4586,6 +4586,61 @@ async fn an_engine_that_never_dials_in_fails_the_link_at_the_startup_bound() {
     assert_handshake_released(&handshake).await;
 }
 
+/// A stop while the link is still waiting for its engine releases the
+/// handshake endpoint too: the connect that was waiting ends with the server,
+/// and its endpoint file does not outlive `stop`.
+#[tokio::test]
+async fn a_stop_during_the_handshake_wait_releases_the_handshake_endpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address(dir.path());
+    let config = config(dir.path(), &handshake, model_info());
+    let server = VllmServicerServer::start(config).unwrap();
+    let endpoint = handshake.trim_start_matches("ipc://").to_string();
+    wait_until(|| fs::metadata(&endpoint).is_ok()).await;
+    assert!(
+        server.last_error().unwrap().is_none(),
+        "the link is still waiting for the engine"
+    );
+
+    server.stop(Duration::from_secs(5)).unwrap();
+    assert!(
+        fs::metadata(&endpoint).is_err(),
+        "the handshake endpoint file outlived stop"
+    );
+    assert_handshake_released(&handshake).await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_leftover_handshake_endpoint_does_not_fail_the_link() {
+    use std::os::unix::net::{UnixListener, UnixStream};
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address(dir.path());
+    let endpoint = handshake.trim_start_matches("ipc://").to_string();
+    // A bound-then-dropped listener leaves its socket file behind, as a
+    // process that died without cleanup does.
+    drop(UnixListener::bind(&endpoint).unwrap());
+    let config = config(dir.path(), &handshake, model_info());
+    let server = VllmServicerServer::start(config).unwrap();
+
+    // Only the link's own bind answers a connect: the leftover refuses it.
+    wait_until(|| {
+        assert_eq!(
+            server.last_error().unwrap(),
+            None,
+            "the link failed on the leftover"
+        );
+        UnixStream::connect(&endpoint).is_ok()
+    })
+    .await;
+
+    server.stop(Duration::from_secs(5)).unwrap();
+    assert!(
+        fs::metadata(&endpoint).is_err(),
+        "the handshake endpoint file outlived stop"
+    );
+}
+
 /// Between HELLO and READY a real engine loads its model, and nothing crosses
 /// the wire meanwhile. The lifecycle owner's reports that the engine process
 /// is alive keep the link waiting well past the silence bound, and the start
@@ -4597,17 +4652,17 @@ async fn a_slow_engine_stays_linked_while_the_launcher_reports_it_alive() {
     let silence = Duration::from_millis(300);
     let mut config = config(dir.path(), &handshake, model_info());
     config.servicer.engine_startup_timeout = silence;
-    let server = VllmServicerServer::start(config).unwrap();
+    let server = Arc::new(VllmServicerServer::start(config).unwrap());
+    // The launcher reports through the whole start, as it polls the process
+    // it launched: the silence bound then meets the engine's quiet load
+    // alone, not the time this host takes over the dial-in or over READY.
+    let _alive = reported_alive(server.clone(), VllmServicerServer::note_engine_alive);
     // The engine dials in at once, then "loads" for four silences.
     let loading = hello(&handshake, EngineId::from_engine_index(0))
         .bounded()
         .await
         .expect("HELLO answered with INIT");
-    let load_time = Instant::now() + 4 * silence;
-    while Instant::now() < load_time {
-        server.note_engine_alive();
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    tokio::time::sleep(4 * silence).await;
     assert_eq!(
         server.last_error().unwrap(),
         None,
@@ -4635,13 +4690,18 @@ async fn an_engine_that_falls_silent_after_hello_fails_the_link_at_the_bound() {
     let silence = Duration::from_millis(300);
     let mut config = config(dir.path(), &handshake, model_info());
     config.servicer.engine_startup_timeout = silence;
-    let server = VllmServicerServer::start(config).unwrap();
+    let server = Arc::new(VllmServicerServer::start(config).unwrap());
+    // Reported alive until HELLO is answered: the silence under test starts
+    // there, whatever time this host takes over the dial-in, and counts
+    // from a sign of life no earlier than `before_hello`.
+    let alive = reported_alive(server.clone(), VllmServicerServer::note_engine_alive);
+    let before_hello = Instant::now();
     let _loading = hello(&handshake, EngineId::from_engine_index(0))
         .bounded()
         .await
         .expect("HELLO answered with INIT");
-    let since_hello = Instant::now();
-    let deadline = since_hello + Duration::from_secs(10);
+    drop(alive);
+    let deadline = Instant::now() + Duration::from_secs(10);
     let error = loop {
         if let Some(error) = server.last_error().unwrap() {
             break error;
@@ -4649,7 +4709,7 @@ async fn an_engine_that_falls_silent_after_hello_fails_the_link_at_the_bound() {
         assert!(Instant::now() < deadline, "no link failure reported");
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
-    assert!(since_hello.elapsed() >= silence);
+    assert!(before_hello.elapsed() >= silence);
     assert!(
         error.contains("timed out while waiting for READY"),
         "{error}"
@@ -4669,15 +4729,14 @@ async fn the_startup_ceiling_bounds_a_start_the_launcher_keeps_reporting_alive()
     let mut config = config(dir.path(), &handshake, model_info());
     config.servicer.engine_startup_timeout = silence;
     config.servicer.engine_startup_ceiling = Some(ceiling);
-    let server = VllmServicerServer::start(config).unwrap();
+    // Read before the start, which the ceiling counts from.
     let started = Instant::now();
-    let _loading = hello(&handshake, EngineId::from_engine_index(0))
-        .bounded()
-        .await
-        .expect("HELLO answered with INIT");
+    let server = Arc::new(VllmServicerServer::start(config).unwrap());
+    // The engine does not dial in: a dial-in would race the ceiling at this
+    // host's pace, and the ceiling bounds every wait of the handshake alike.
+    let _alive = reported_alive(server.clone(), VllmServicerServer::note_engine_alive);
     let deadline = started + Duration::from_secs(10);
     let error = loop {
-        server.note_engine_alive();
         if let Some(error) = server.last_error().unwrap() {
             break error;
         }

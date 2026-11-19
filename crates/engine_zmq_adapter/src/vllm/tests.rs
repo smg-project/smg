@@ -1329,6 +1329,38 @@ fn translate_normalizes_unset_top_p_and_repetition_penalty() {
     assert_eq!(sampling.max_tokens, 1024 - 3);
 }
 
+/// A chat request's `min_tokens` survives the whole path to the engine: the
+/// gateway's chat builder writes it to the proto, the translation copies it,
+/// and the request decoded from the wire's bytes carries it.
+#[test]
+fn a_chat_requests_min_tokens_survive_the_wire() {
+    use engine_zmq_client::codec::{decode_msgpack, encode_msgpack};
+    use openai_protocol::chat::ChatCompletionRequest;
+    use smg_grpc_client::VllmEngineClient;
+
+    let chat: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+        "model": "m", "messages": [{"role": "user", "content": "hi"}],
+        "min_tokens": 30, "max_tokens": 40
+    }))
+    .expect("a chat request");
+    let proto = VllmEngineClient::build_generate_request_from_chat(
+        "r1".to_string(),
+        &chat,
+        "hi".to_string(),
+        vec![1, 2, 3],
+        None,
+        Default::default(),
+    )
+    .expect("the chat builder");
+    let request = translate_request(proto, 1024, ModelDtype::Float32, &EosTokenIds::default())
+        .expect("the translation");
+    let back: EngineCoreRequest = decode_msgpack(&encode_msgpack(&request).unwrap()).unwrap();
+    assert_eq!(
+        back.sampling_params.expect("sampling params").min_tokens,
+        30
+    );
+}
+
 /// vLLM's parameter checks run before submit: a request the engine would
 /// reject on its input thread (killing it) is an invalid-argument error.
 #[test]

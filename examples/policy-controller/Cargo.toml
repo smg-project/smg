@@ -1,0 +1,37 @@
+[package]
+name = "policy-controller-example"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "A policy controller of your own: the smg-policy-controller crate with one scorer added in code"
+license = "Apache-2.0"
+
+# The one dependency a controller of your own needs: the crate with the
+# listeners and the binary's run loop (`controller`). By path here, because
+# the example lives in the crate's repository; `kubernetes` adds the Lease
+# elector the Helm chart's election uses.
+[dependencies]
+smg-policy-controller = { path = "../../crates/policy_controller", features = ["controller"] }
+
+# The allocator this binary registers: the one the stock controller's binary
+# registers, on the targets where its settings hold (an Apple target is left
+# out). The library registers none.
+[target.'cfg(all(not(target_env = "msvc"), not(target_env = "musl"), not(target_vendor = "apple")))'.dependencies]
+tikv-jemallocator = { workspace = true }
+
+# The tests read the example's document as the controller reads one, and
+# bind a controller as the run loop does. The started binary's cases serve
+# mock engines in their own process and hold requests on one through the
+# engine's client. They register workers through the generated client and
+# ask decisions through the crate's reference client, a feature the tests
+# alone turn on.
+[dev-dependencies]
+mock-worker = { path = "../../crates/mock_worker" }
+serde_yaml = { workspace = true }
+smg-grpc-client = { workspace = true }
+smg-policy-controller = { path = "../../crates/policy_controller", features = ["client"] }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tonic = { workspace = true }
+
+[lints]
+workspace = true

@@ -29,7 +29,7 @@ pub mod proto {
 /// Streaming `generate()` response that auto-aborts on drop. Concrete
 /// alias for the generic `crate::AbortOnDropStream`.
 pub type AbortOnDropStream =
-    crate::AbortOnDropStream<proto::GenerateResponse, SglangSchedulerClient>;
+    crate::AbortOnDropStream<Box<proto::GenerateResponse>, SglangSchedulerClient>;
 
 /// gRPC client for SGLang scheduler
 #[derive(Clone)]
@@ -71,7 +71,9 @@ impl SglangSchedulerClient {
     crate::impl_engine_client_basics!(
         proto,
         proto::sglang_scheduler_client::SglangSchedulerClient<Channel>,
-        "SGLang scheduler"
+        "SGLang scheduler",
+        "sglang.grpc.scheduler.SglangScheduler",
+        proto::sglang_scheduler_server::SERVICE_NAME
     );
 
     crate::impl_embed!(proto);
@@ -367,6 +369,7 @@ impl SglangSchedulerClient {
             presence_penalty: request.presence_penalty.unwrap_or(0.0),
             repetition_penalty: request.repetition_penalty.unwrap_or(1.0),
             max_new_tokens,
+            min_new_tokens: request.min_tokens.unwrap_or(0),
             stop: stop_sequences,
             stop_token_ids: request.stop_token_ids.clone().unwrap_or_default(),
             skip_special_tokens,
@@ -806,7 +809,7 @@ impl SglangSchedulerClient {
                 warn!("Failed to inject trace context: {}", e);
             }
             let (metadata, _extensions, ()) = carrier.into_parts();
-            let stream = call_with_frames::<proto::GenerateResponse>(
+            let stream = call_with_frames::<Box<proto::GenerateResponse>>(
                 self.channel(),
                 "/sglang.grpc.scheduler.SglangScheduler/Generate",
                 metadata.into_headers(),
@@ -955,6 +958,40 @@ mod tests {
         let params = SglangSchedulerClient::build_grpc_sampling_params_from_completion(&plain)
             .expect("build sampling params");
         assert!(params.logit_bias.is_empty());
+    }
+
+    /// A chat request's `min_tokens` reaches the proto as `min_new_tokens`, as
+    /// a completion request's does; a request without one sends the proto's
+    /// zero, which the engine reads as no minimum.
+    #[test]
+    fn chat_and_completion_sampling_params_carry_min_tokens() {
+        let chat: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}], "min_tokens": 30
+        }))
+        .expect("a chat request");
+        let params = SglangSchedulerClient::build_grpc_sampling_params_from_chat(
+            &chat,
+            OutputConstraint::default(),
+        )
+        .expect("build sampling params");
+        assert_eq!(params.min_new_tokens, 30);
+        let completion: CompletionRequest = serde_json::from_value(json!({
+            "model": "m", "prompt": "hi", "min_tokens": 30
+        }))
+        .expect("a completion request");
+        let params = SglangSchedulerClient::build_grpc_sampling_params_from_completion(&completion)
+            .expect("build sampling params");
+        assert_eq!(params.min_new_tokens, 30);
+        let unset: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .expect("a chat request");
+        let params = SglangSchedulerClient::build_grpc_sampling_params_from_chat(
+            &unset,
+            OutputConstraint::default(),
+        )
+        .expect("build sampling params");
+        assert_eq!(params.min_new_tokens, 0);
     }
 
     /// A completions `max_tokens` of zero reaches the proto as `Some(0)`, a

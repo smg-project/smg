@@ -957,9 +957,7 @@ impl QwenVLProcessorBase {
         grid_w: usize,
         output: &mut Vec<f32>,
     ) -> Result<(), TransformError> {
-        if tensors.is_empty() {
-            return Err(TransformError::EmptyBatch);
-        }
+        TransformError::if_empty(tensors)?;
 
         let channel = tensors[0].shape()[0];
         let height = tensors[0].shape()[1];
@@ -1322,9 +1320,7 @@ impl QwenVLProcessorBase {
     /// (checked against overflow), the batch totals, the filter and the
     /// normalization the patch bytes carry.
     fn plan_image_batch(&self, images: &[&DynamicImage]) -> Result<ImageBatchPlan, TransformError> {
-        if images.is_empty() {
-            return Err(TransformError::EmptyBatch);
-        }
+        TransformError::if_empty(images)?;
 
         let QwenTransforms {
             filter,
@@ -1766,9 +1762,7 @@ impl VisionPreProcessor for QwenVLProcessorBase {
         frames: &[DynamicImage],
         clip: &VideoClipOptions,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        if frames.is_empty() {
-            return Err(TransformError::EmptyBatch);
-        }
+        TransformError::if_empty(frames)?;
 
         let (width, height) = frames[0].dimensions();
         let plan = self.plan_video(frames.len(), width, height, clip)?;
@@ -1828,9 +1822,7 @@ impl VisionPreProcessor for QwenVLProcessorBase {
         frames: &[RgbFrameRef<'_>],
         clip: &VideoClipOptions,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        if frames.is_empty() {
-            return Err(TransformError::EmptyBatch);
-        }
+        TransformError::if_empty(frames)?;
 
         let plan = self.plan_video(frames.len(), frames[0].width, frames[0].height, clip)?;
         let temporal_patch_size = self.config.temporal_patch_size;

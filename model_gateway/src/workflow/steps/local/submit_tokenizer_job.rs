@@ -14,7 +14,7 @@ use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowRe
 use crate::{
     worker::ConnectionMode,
     workflow::{
-        data::{WorkerKind, WorkerWorkflowData},
+        data::{require_app_context, WorkerKind, WorkerWorkflowData},
         Job, TokenizerConfigRequest, TokenizerLoadFailure,
     },
 };
@@ -42,11 +42,7 @@ impl StepExecutor<WorkerWorkflowData> for SubmitTokenizerJobStep {
         }
 
         let labels = &context.data.final_labels;
-        let app_context = context
-            .data
-            .app_context
-            .as_ref()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
+        let app_context = require_app_context(context.data.app_context.as_ref())?;
         let workers = context
             .data
             .actual_workers
@@ -169,7 +165,7 @@ impl StepExecutor<WorkerWorkflowData> for SubmitTokenizerJobStep {
 /// worker's own bundle (`fetch_tokenizer_from_worker`); a ZMQ worker's id has
 /// to be a path or hub id the gateway itself can load. Coming last, the id
 /// never displaces an operator's flag.
-pub(super) fn tokenizer_source<'a>(
+fn tokenizer_source<'a>(
     labels: &'a HashMap<String, String>,
     router_tokenizer_path: Option<&'a str>,
     router_model_path: Option<&'a str>,

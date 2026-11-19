@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 
 pub use self::{
     output::{Output, OutputAnswer, OutputChoice, OutputPosition, OutputSpelling, Turn},
-    spelling::{GrammarBackend, Spelling, Unspelled},
+    spelling::{AddedTokens, GrammarBackend, Inexpressible, Lark, Spelling, Unspelled},
 };
 use crate::{
     format::{CallSyntax, Emits, Format, Whitespace},
@@ -904,8 +904,9 @@ impl Format {
                 )
             }
             // The forced call's constraint is the request's own schema, which the gateway writes
-            // for the function `tool_choice` names; the format derives nothing of its own.
-            CallSyntax::ForcedArguments => return None,
+            // for the function `tool_choice` names or for a required call's list; the format
+            // derives nothing of its own.
+            CallSyntax::ForcedArguments | CallSyntax::ForcedList => return None,
         };
         // The calls' tag takes what the template writes after the thought's close where it starts
         // there; an answer's keeps the schema alone, the engine's own constraint
@@ -943,7 +944,10 @@ impl Format {
     /// the prompt opens no thought, the tag admits the thought first, closed and the next message
     /// opened, with the way into the answer owed after it, and leaves the way in optional without
     /// the thought unless the engine starts the grammar at the first token
-    /// (`Self::thought_message`).
+    /// (`Self::thought_message`). A table whose template opens no turn for the model (Inkling 2's)
+    /// writes the rows from where the unopened turn starts to the turn's own state before the
+    /// thought and the marker ([`Format::unopened_turn_starts_in`]): owed outright where the
+    /// engine starts at the first token, inside the optional way in otherwise.
     pub fn answer_grammar(&self, schema: &Arc<Value>, reasoning_open: bool) -> Option<Grammar> {
         self.answer_grammar_for(schema, reasoning_open, GrammarStart::Unknown)
     }
@@ -1061,17 +1065,25 @@ impl Format {
         // and nothing has consumed it, at the gate included, where the tag's thought is open to
         // the model once more past its own marker (the table reads the kind said again there as
         // the kind). The thought comes first either way, so an engine that starts before it does
-        // not force the answer into the model's first message.
+        // not force the answer into the model's first message. Where the table's template opens
+        // no turn for the model (Inkling 2's), the turn starts between the messages, and the rows
+        // from there to the turn's own state lead the tag: owed before the thought where the
+        // engine starts at the first token, and inside the optional way in otherwise, since an
+        // engine that gates on its reasoning parser has consumed them with the kind's marker
+        // (`Self::unopened_lead`).
         if !reasoning_open {
             if let Some(thought) = self.thought_message() {
                 let opener = (!begin.is_empty()).then(|| Grammar::ConstString(begin));
+                let lead = self.unopened_lead().map(Grammar::ConstString);
                 let mut parts = Vec::new();
                 if self.writes_thought_first() {
+                    parts.extend(lead);
                     parts.push(thought);
                     parts.extend(opener);
                 } else {
                     match (opener, start) {
                         (Some(opener), GrammarStart::FirstToken) => {
+                            parts.extend(lead);
                             parts.push(Grammar::Optional(Box::new(thought)));
                             parts.push(opener);
                         }
@@ -1081,12 +1093,20 @@ impl Format {
                             | GrammarStart::Unknown
                             | GrammarStart::Either,
                         ) => {
-                            parts.push(Grammar::Optional(Box::new(Grammar::Or(vec![
+                            let way = Grammar::Or(vec![
                                 Grammar::Sequence(vec![thought, opener.clone()]),
                                 opener,
-                            ]))));
+                            ]);
+                            let way = match lead {
+                                Some(lead) => Grammar::Sequence(vec![lead, way]),
+                                None => way,
+                            };
+                            parts.push(Grammar::Optional(Box::new(way)));
                         }
-                        (None, _) => parts.push(Grammar::Optional(Box::new(thought))),
+                        (None, _) => {
+                            parts.extend(lead);
+                            parts.push(Grammar::Optional(Box::new(thought)));
+                        }
                     }
                 }
                 parts.push(answer);
@@ -1736,6 +1756,22 @@ impl Format {
         None
     }
 
+    /// The rows from the state an unopened turn starts in to the turn's own state, for a table
+    /// whose unopened row names a state between the template's messages (Inkling 2's: the
+    /// template opens no turn for the model, so every generation prompt leaves the turn
+    /// unopened and the model writes the message's opener itself). The answer's tag leads with
+    /// them. `None` for a table without the row, with no rows from its state to the turn's own,
+    /// or whose unopened turn starts in a body (DeepSeek V4's thought, which `reasoning_open`
+    /// carries).
+    fn unopened_lead(&self) -> Option<String> {
+        let state = self.unopened_start()?;
+        if !self.between_messages(state) {
+            return None;
+        }
+        let rows = self.path(state, 0)?;
+        (!rows.is_empty()).then(|| rows.concat())
+    }
+
     /// Whether `state` lies between the template's messages: its wrapping (a wrapper state), or
     /// text the template discards (a framing row: the text outside a response template's
     /// fields). The model writes only the markers around its messages and calls there, so a way
@@ -1840,10 +1876,11 @@ mod tests {
     }
 
     #[test]
-    fn glm_derives_the_tag_the_gateway_hand_writes_today() {
+    fn glm_derives_the_gateways_tag_with_the_call_markers_out_of_its_values() {
         // The old crate's `Glm4MoeParser::build_structural_tag`, which mirrors xgrammar's built-in
         // `glm_4_7` tag: one trigger, a `glm_xml`-styled schema per named tool as written (a
-        // no-argument tool's `{}` included), `at_least_one` as asked.
+        // no-argument tool's `{}` included), `at_least_one` as asked. Its values exclude the two
+        // markers the table ends a call on inside a value too, which the old tag left writable.
         let schema = value!({"type": "object", "properties": {"city": {"type": "string"}}});
         let grammar = formats::glm()
             .grammar(&weather_tools(), true, false)
@@ -1852,7 +1889,12 @@ mod tests {
             value!({
                 "type": "tag",
                 "begin": format!("<tool_call>{name}"),
-                "content": {"type": "json_schema", "json_schema": schema, "style": "glm_xml"},
+                "content": {
+                    "type": "json_schema",
+                    "json_schema": schema,
+                    "style": "glm_xml",
+                    "excludes": ["</tool_call>", "<tool_call>"],
+                },
                 "end": "</tool_call>",
             })
         };

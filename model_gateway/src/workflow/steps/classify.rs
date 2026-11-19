@@ -17,8 +17,8 @@ use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, Wo
 use super::util::{http_base_url, try_grpc_reachable, try_http_reachable};
 use crate::{
     routers::provider_support,
-    worker::{basic::RuntimeType, endpoint::Endpoint},
-    workflow::data::{WorkerKind, WorkerWorkflowData},
+    worker::identity::{basic::RuntimeType, endpoint::Endpoint},
+    workflow::data::{require_app_context, WorkerKind, WorkerWorkflowData},
 };
 
 /// Quick-probe timeout for classification. Deliberately short — the full
@@ -133,11 +133,7 @@ impl StepExecutor<WorkerWorkflowData> for ClassifyWorkerTypeStep {
         }
 
         // Unspecified + unknown URL — probe the endpoint
-        let app_context = context
-            .data
-            .app_context
-            .as_ref()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
+        let app_context = require_app_context(context.data.app_context.as_ref())?;
         let timeout = CLASSIFY_PROBE_TIMEOUT_SECS;
         let client = &app_context.client;
 

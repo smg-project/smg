@@ -256,6 +256,7 @@ mod tests {
                 num_running: 2,
                 num_waiting: 3,
                 kv_cache_usage: 0.1,
+                ..EngineLoad::default()
             })
         );
         assert_eq!(

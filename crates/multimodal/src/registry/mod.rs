@@ -11,6 +11,7 @@ mod llava;
 mod minimax_m3;
 mod muse_spark;
 mod nemotron_omni;
+mod nemotron_transcribe;
 mod phi3_v;
 pub mod qwen3_asr;
 mod qwen3_omni;
@@ -33,6 +34,7 @@ use llava::{LlavaNextSpec, LlavaSpec};
 use minimax_m3::MiniMaxM3VisionSpec;
 use muse_spark::MuseSparkSpec;
 use nemotron_omni::NemotronOmniSpec;
+use nemotron_transcribe::NemotronTranscribeSpec;
 use once_cell::sync::Lazy;
 use phi3_v::Phi3VisionSpec;
 use qwen3_asr::Qwen3AsrSpec;
@@ -72,6 +74,7 @@ impl ModelRegistry {
                 LazySpec::new(|| Box::new(MuseSparkSpec)),
                 // Nemotron-H Omni matches its own model_type only.
                 LazySpec::new(|| Box::new(NemotronOmniSpec)),
+                LazySpec::new(|| Box::new(NemotronTranscribeSpec)),
                 // LlavaNext must be registered before Llava so "llava_next" model_type matches first.
                 LazySpec::new(|| Box::new(LlavaNextSpec)),
                 LazySpec::new(|| Box::new(LlavaSpec)),
@@ -238,7 +241,7 @@ mod tests {
             processors::llava::{CLIP_MEAN, CLIP_STD},
             transforms::mean_to_rgb,
         },
-        Modality, ModelSpecificValue, PreProcessorConfig, VideoClipOptions,
+        EncoderFieldLayouts, Modality, ModelSpecificValue, PreProcessorConfig, VideoClipOptions,
     };
 
     /// A checkpoint of this family resolves to a spec by its `model_type`
@@ -279,6 +282,36 @@ mod tests {
             .map(|spec| spec.name())
             .collect();
         assert_eq!(resizing, ["minimax_m3"]);
+    }
+
+    /// The trait's default hands an entry's legacy field map to the request
+    /// path. An entry that declares such a map and lays out every modality
+    /// another way keeps a table no request reads; the registry holds no
+    /// such entry.
+    #[test]
+    fn no_entry_declares_a_legacy_field_map_that_no_modality_reads() {
+        let registry = ModelRegistry::new();
+        let unread: Vec<&str> = registry
+            .specs
+            .iter()
+            .map(|spec| spec.get())
+            .filter(|spec| {
+                let converted = EncoderFieldLayouts::from_legacy_fields(spec.field_layouts());
+                // The trait's own map converts to the default layouts: the
+                // entry declares none.
+                converted != EncoderFieldLayouts::default()
+                    && ![
+                        Modality::Image,
+                        Modality::ImageEmbeds,
+                        Modality::Audio,
+                        Modality::Video,
+                    ]
+                    .into_iter()
+                    .any(|modality| spec.encoder_field_layouts_for(modality) == converted)
+            })
+            .map(|spec| spec.name())
+            .collect();
+        assert_eq!(unread, Vec::<&str>::new());
     }
 
     /// The vision processors come from the spec a model resolves to, so they

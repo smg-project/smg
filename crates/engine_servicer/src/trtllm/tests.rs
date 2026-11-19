@@ -740,6 +740,9 @@ async fn info_rpcs_report_the_launcher_facts_and_the_handshake() {
     // The vocabulary of structural-tag nodes the launcher read off the
     // engine's xgrammar rides along for the router's label.
     assert_eq!(info.structural_tag_vocabulary, "older");
+    // Under a backend that compiles grammars the servicer also says where
+    // the engine starts one.
+    assert_eq!(info.constrained_decoding_start, "first_token");
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 
     // A launcher that reported no bounds and no sizes: the handshake's; one
@@ -967,8 +970,8 @@ async fn an_idle_shims_record_stays_zero_filled_once_a_sibling_reports() {
     );
     // The record the relay pushes for a rank is the poll's entry for it: one
     // field set on both wires, the token counts and the KV capacity included,
-    // so a gateway's DP-rank token cache reads the same from a push as from
-    // a poll.
+    // so a gateway's load report for the worker reads the same from a push as
+    // from a poll.
     for load in &loads.loads {
         let pushed = kv_events::LoadSource::load(&source, Some(load.dp_rank))
             .expect("the rank's pushed record");
@@ -1125,6 +1128,24 @@ fn structured_outputs_support_follows_the_launcher_facts() {
     );
     assert_eq!(support(""), StructuredOutputsBackendConfig::Other.into());
     let _ = Arc::new(());
+}
+
+/// Where a grammar starts follows the same fact: the first generated token
+/// under the two backends that compile one, nothing under `none` or under a
+/// backend the launcher could not name.
+#[test]
+fn constrained_decoding_start_follows_the_launcher_facts() {
+    let start = |backend: &str| {
+        constrained_decoding_start(&TrtllmModelInfo {
+            guided_decoding_backend: backend.to_string(),
+            ..model_info()
+        })
+    };
+    assert_eq!(start("xgrammar"), "first_token");
+    assert_eq!(start("llguidance"), "first_token");
+    assert_eq!(start("none"), "");
+    assert_eq!(start(""), "");
+    assert_eq!(start("another"), "");
 }
 
 /// After the shim's first output for a request (one of its three prompt
@@ -1398,4 +1419,35 @@ async fn the_relays_rank_record_is_the_get_loads_entry_of_the_rank() {
     assert_eq!(state.rank_load(None), state.rank_load(Some(0)));
     assert!(state.rank_load(Some(1)).is_none());
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_leftover_handshake_endpoint_does_not_fail_the_link() {
+    use std::os::unix::net::{UnixListener, UnixStream};
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address(dir.path());
+    let endpoint = handshake.trim_start_matches("ipc://").to_string();
+    // A bound-then-dropped listener leaves its socket file behind, as a
+    // process that died without cleanup does.
+    drop(UnixListener::bind(&endpoint).unwrap());
+    let config = config(dir.path(), &handshake, model_info());
+    let server = TrtllmServicerServer::start(config).unwrap();
+
+    // Only the link's own bind answers a connect: the leftover refuses it.
+    wait_until(|| {
+        assert_eq!(
+            server.last_error().unwrap(),
+            None,
+            "the link failed on the leftover"
+        );
+        UnixStream::connect(&endpoint).is_ok()
+    })
+    .await;
+
+    server.stop(Duration::from_secs(5)).unwrap();
+    assert!(
+        std::fs::metadata(&endpoint).is_err(),
+        "the handshake endpoint file outlived stop"
+    );
 }

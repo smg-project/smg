@@ -261,6 +261,9 @@ pub enum ServerEvent {
         transcript: String,
         usage: TranscriptionUsage,
         logprobs: Option<Vec<LogProbProperties>>,
+        /// The languages detected in the audio; an empty list means none
+        /// could be detected reliably.
+        languages: Option<Vec<TranscriptionLanguage>>,
     },
 
     /// Emitted with incremental transcription results.
@@ -288,11 +291,14 @@ pub enum ServerEvent {
     InputAudioTranscriptionSegment {
         id: String,
         content_index: u32,
-        end: f32,
+        /// The segment's end, in seconds, kept at the precision the
+        /// upstream wrote it
+        end: f64,
         event_id: String,
         item_id: String,
         speaker: String,
-        start: f32,
+        /// The segment's start, in seconds
+        start: f64,
         text: String,
     },
 
@@ -767,22 +773,57 @@ impl ServerEvent {
 // Session Config Union
 // ============================================================================
 
-/// Union of realtime and transcription session configurations.
+/// Union of realtime and transcription session configurations, as the
+/// `session.update`, `session.created` and `session.updated` events carry
+/// it.
 ///
-/// Discriminated by the `type` field: `"realtime"` or `"transcription"`.
-/// Used by `session.update`, `session.created`, and `session.updated` events.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
+/// The session's own `type`, `"realtime"` or `"transcription"`, picks the
+/// variant, and the variant reads the whole object, `type` included, as its
+/// struct requires it. It is written the same way, so `type` appears once.
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
 pub enum SessionConfig {
-    #[serde(rename = "realtime")]
     Realtime(Box<RealtimeSessionCreateRequest>),
-    #[serde(rename = "transcription")]
     Transcription(Box<RealtimeTranscriptionSessionCreateRequest>),
+}
+
+impl<'de> Deserialize<'de> for SessionConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+
+        let session = serde_json::Value::deserialize(deserializer)?;
+        match session.get("type").and_then(serde_json::Value::as_str) {
+            Some("realtime") => serde_json::from_value(session)
+                .map(|config| Self::Realtime(Box::new(config)))
+                .map_err(D::Error::custom),
+            Some("transcription") => serde_json::from_value(session)
+                .map(|config| Self::Transcription(Box::new(config)))
+                .map_err(D::Error::custom),
+            Some(other) => Err(D::Error::unknown_variant(
+                other,
+                &["realtime", "transcription"],
+            )),
+            // A `type` that is there but no string is the wrong type, not a
+            // missing field.
+            None if session.get("type").is_some() => Err(D::Error::invalid_type(
+                serde::de::Unexpected::Other("a non-string `type`"),
+                &"`realtime` or `transcription`",
+            )),
+            None => Err(D::Error::missing_field("type")),
+        }
+    }
 }
 
 // ============================================================================
 // Supporting Types
 // ============================================================================
+
+/// A language detected in transcribed audio.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TranscriptionLanguage {
+    /// The language's code
+    pub code: String,
+}
 
 /// Conversation metadata returned in `conversation.created` events.
 #[serde_with::skip_serializing_none]
@@ -872,4 +913,137 @@ pub struct RealtimeError {
     pub code: Option<String>,
     pub event_id: Option<String>,
     pub param: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    /// A `session.update`, `session.created` or `session.updated` event reads
+    /// its session into the variant its `type` names, as the public API
+    /// writes them, and is written back with that `type` once. A `type` no
+    /// API names is refused, naming it.
+    #[test]
+    fn a_session_event_reads_its_session_and_writes_its_type_once() {
+        let update = json!({
+            "type": "session.update",
+            "session": {
+                "type": "realtime",
+                "instructions": "You are a creative assistant that helps with design tasks.",
+                "tool_choice": "auto"
+            }
+        });
+        let event: ClientEvent = serde_json::from_value(update).unwrap();
+        let ClientEvent::SessionUpdate { session, .. } = &event else {
+            panic!("a session.update, got {event:?}");
+        };
+        assert!(matches!(session.as_ref(), SessionConfig::Realtime(_)));
+        let written = serde_json::to_string(&event).unwrap();
+        assert_eq!(
+            written.matches(r#""type":"realtime""#).count(),
+            1,
+            "{written}"
+        );
+
+        let transcription = json!({
+            "type": "session.update",
+            "session": {
+                "type": "transcription",
+                "audio": {"input": {"transcription": {"model": "gpt-4o-transcribe"}}}
+            }
+        });
+        let event: ClientEvent = serde_json::from_value(transcription).unwrap();
+        let ClientEvent::SessionUpdate { session, .. } = &event else {
+            panic!("a session.update, got {event:?}");
+        };
+        assert!(matches!(session.as_ref(), SessionConfig::Transcription(_)));
+
+        let created = json!({
+            "type": "session.created",
+            "event_id": "event_C9G5RJeJ2gF77mV7f2B1j",
+            "session": {"type": "realtime", "object": "realtime.session", "model": "gpt-realtime"}
+        });
+        let event: ServerEvent = serde_json::from_value(created).unwrap();
+        assert_eq!(event.event_type(), "session.created");
+
+        let bogus = serde_json::from_value::<ClientEvent>(json!({
+            "type": "session.update",
+            "session": {"type": "a_session_of_no_api"}
+        }))
+        .expect_err("a session type no API names")
+        .to_string();
+        assert!(bogus.contains("a_session_of_no_api"), "{bogus}");
+
+        for (session, expected) in [
+            (json!({"type": null}), "a non-string `type`"),
+            (json!({"type": 5}), "a non-string `type`"),
+            (json!({"model": "gpt-realtime"}), "missing field `type`"),
+        ] {
+            let refused = serde_json::from_value::<ClientEvent>(
+                json!({"type": "session.update", "session": session}),
+            )
+            .expect_err("a session without a string type")
+            .to_string();
+            assert!(refused.contains(expected), "{refused}");
+        }
+    }
+
+    /// A transcription event keeps its detected languages, an empty list
+    /// included, and its segment times at full precision; a failed
+    /// response keeps its error's message. Each is written back as sent.
+    #[test]
+    fn server_events_keep_languages_segment_times_and_an_error_message() {
+        let completed = json!({
+            "type": "conversation.item.input_audio_transcription.completed",
+            "event_id": "event_1",
+            "item_id": "item_1",
+            "content_index": 0,
+            "transcript": "Bonjour",
+            "usage": {"type": "duration", "seconds": 2},
+            "languages": []
+        });
+        let event: ServerEvent = serde_json::from_value(completed.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&event).unwrap()["languages"],
+            json!([])
+        );
+
+        let segment = json!({
+            "type": "conversation.item.input_audio_transcription.segment",
+            "event_id": "event_2",
+            "item_id": "item_1",
+            "content_index": 0,
+            "id": "seg_1",
+            "speaker": "A",
+            "text": "Hello",
+            "start": 3600.123456,
+            "end": 3601.654321
+        });
+        let event: ServerEvent = serde_json::from_value(segment.clone()).unwrap();
+        let written = serde_json::to_value(&event).unwrap();
+        assert_eq!(written["start"], json!(3600.123456));
+        assert_eq!(written["end"], json!(3601.654321));
+
+        let failed = json!({
+            "type": "response.done",
+            "event_id": "event_3",
+            "response": {
+                "object": "realtime.response",
+                "id": "resp_1",
+                "status": "failed",
+                "status_details": {
+                    "type": "failed",
+                    "error": {"type": "server_error", "code": "internal", "message": "The server had an error."}
+                }
+            }
+        });
+        let event: ServerEvent = serde_json::from_value(failed).unwrap();
+        let written = serde_json::to_value(&event).unwrap();
+        assert_eq!(
+            written["response"]["status_details"]["error"]["message"],
+            "The server had an error."
+        );
+    }
 }

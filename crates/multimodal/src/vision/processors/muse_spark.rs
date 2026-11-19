@@ -263,7 +263,8 @@ fn pil_rgb_bytes(image: &DynamicImage) -> (usize, usize, std::borrow::Cow<'_, [u
         DynamicImage::ImageLuma16(wide) => {
             let (width, height) = wide.dimensions();
             let mut out = Vec::with_capacity(width as usize * height as usize * CHANNELS);
-            for &sample in wide.as_raw() {
+            // The container may be longer than the image's samples.
+            for &sample in &wide.as_raw()[..width as usize * height as usize] {
                 let value = sample.min(255) as u8;
                 out.extend_from_slice(&[value, value, value]);
             }
@@ -590,9 +591,7 @@ impl VisionPreProcessor for MuseSparkVisionProcessor {
         &self,
         images: &[&DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        if images.is_empty() {
-            return Err(TransformError::EmptyBatch);
-        }
+        TransformError::if_empty(images)?;
         let settings = self.image;
         let do_resize = self.do_resize;
         let features = settings.patch_features();
@@ -967,6 +966,18 @@ mod tests {
                 assert!(r < 0.0 && b > 0.0, "row {index}");
             }
         }
+    }
+
+    /// A 16-bit grey image in a container longer than its samples gives the
+    /// bytes of the exact image.
+    #[test]
+    fn a_longer_container_gives_the_bytes_of_its_sixteen_bit_image() {
+        let grey = |samples: Vec<u16>| {
+            DynamicImage::ImageLuma16(image::ImageBuffer::from_raw(2, 2, samples).unwrap())
+        };
+        let exact = grey(vec![0, 100, 255, 300]);
+        let longer = grey(vec![0, 100, 255, 300, 7, 7, 7]);
+        assert_eq!(pil_rgb_bytes(&longer), pil_rgb_bytes(&exact));
     }
 
     #[test]

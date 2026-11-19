@@ -1,68 +1,61 @@
 //! Worker domain — identity, registry, health, resilience, monitoring, service.
 
-pub(crate) mod admin_json;
-pub(crate) mod admin_params;
-pub mod basic;
-pub(crate) mod bootstrap_probe;
-pub mod builder;
-pub mod capacity;
-pub mod circuit_breaker;
-pub mod endpoint;
-mod engine_admin;
-pub mod error;
-pub mod event;
-pub mod expected_wait;
-pub mod hash_ring;
-pub mod http_client;
-pub mod kv_event_monitor;
-mod kv_event_recovery;
-pub mod kv_index_backend;
-pub(crate) mod liveness;
+pub mod connection;
+pub mod health;
+pub mod identity;
+pub mod kv;
 pub mod load;
-pub mod load_state;
-pub mod manager;
-pub mod metadata;
-pub mod metrics_aggregator;
-pub mod monitor;
-pub mod overload;
-pub mod pd_pair_index;
-pub mod pd_pairing;
-pub mod prefill_admission;
-pub mod registry;
-pub mod resilience;
-pub mod rl_adapter;
-pub mod runtime;
-pub mod sampling_defaults;
-pub mod service;
-pub mod stream;
+/// The worker crate's metric writers and their series store, at the paths
+/// they had here.
+pub mod metrics {
+    pub use smg_worker::metrics::{series, writers::*};
+
+    #[cfg(test)]
+    mod gateway_tests;
+}
+pub mod pd;
+// The worker crate's, at the path it had here.
+pub(crate) use smg_worker::periodic_task;
+// The worker crate's, at the paths they had here.
+pub use smg_worker::{registry, runtime};
+pub(crate) mod snapshot;
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_support;
 
 // Re-export commonly used types for convenience
-pub(crate) use basic::ConnectionModeExt;
-pub use basic::{
-    BasicWorker, ConnectionMode, RequestCompletionSink, RuntimeType, Worker, WorkerLoadGuard,
-    WorkerType, DEFAULT_BOOTSTRAP_PORT, MOONCAKE_CONNECTOR, MORIIO_CONNECTOR, MORIIO_MODE_LABEL,
-    NIXL_CONNECTOR,
-};
-pub use builder::BasicWorkerBuilder;
-pub use capacity::{CapacitySource, CapacityTrackerSettings, WorkerCapacity};
-pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
-// `endpoint::Endpoint` is deliberately not re-exported here: `model_type::Endpoint`
-// already occupies that name at this level and means an API route, not an address.
-pub use endpoint::{endpoint_key, EndpointError, EndpointKey};
-pub use error::{WorkerError, WorkerResult};
-pub use hash_ring::HashRing;
-pub use http_client::WorkerHttpClientCache;
-pub use kv_event_monitor::{KvEventMonitor, SubscriptionKind};
-pub use kv_index_backend::{KvIndex, WorkerBlocks};
+pub use connection::http_client::WorkerHttpClientCache;
 /// The liveness budgets' setter for a host that builds the context without
 /// the builder, the test harness today; the first call in a process wins.
-pub use liveness::configure_from as configure_liveness;
-pub use liveness::{budgets as liveness_budgets, Budgets as LivenessBudgets};
-pub use manager::WorkerManager;
-pub use metadata::DecodingLabels;
-pub use monitor::{WorkerLoadManager, WorkerMonitor};
+pub use health::liveness::configure_from as configure_liveness;
+pub use health::{
+    circuit_breaker::{CircuitBreaker, CircuitBreakerConfig},
+    liveness::{budgets as liveness_budgets, Budgets as LivenessBudgets},
+    manager::{WorkerJobs, WorkerManager},
+    overload::OverloadThresholds,
+    resilience::{resolve_resilience, ResolvedResilience, DEFAULT_RETRYABLE_STATUS_CODES},
+};
+pub(crate) use identity::basic::ConnectionModeExt;
+// `endpoint::Endpoint` is deliberately not re-exported here: `model_type::Endpoint`
+// already occupies that name at this level and means an API route, not an address.
+pub use identity::endpoint::{endpoint_key, EndpointError, EndpointKey};
+pub use identity::{
+    basic::{
+        BasicWorker, ConnectionMode, RequestCompletionSink, RuntimeType, Worker, WorkerLoadGuard,
+        WorkerType, DEFAULT_BOOTSTRAP_PORT, MOONCAKE_CONNECTOR, MORIIO_CONNECTOR,
+        MORIIO_MODE_LABEL, NIXL_CONNECTOR,
+    },
+    error::{WorkerError, WorkerResult},
+    metadata::DecodingLabels,
+    sampling_defaults::DEFAULT_SAMPLING_PARAMS_LABEL,
+};
+pub use kv::{
+    event_monitor::{KvEventMonitor, SubscriptionKind},
+    index_backend::{KvIndex, WorkerBlocks},
+};
+pub use load::{
+    capacity::{CapacitySource, CapacityTrackerSettings, WorkerCapacity},
+    monitor::{LoadConsumer, WorkerLoadManager},
+};
 // Re-export UNKNOWN_MODEL_ID from protocols
 pub use openai_protocol::UNKNOWN_MODEL_ID;
 pub use openai_protocol::{
@@ -70,17 +63,26 @@ pub use openai_protocol::{
     model_type::{Endpoint, ModelType},
     worker::{ProviderType, WorkerGroupKey},
 };
-pub use overload::OverloadThresholds;
-pub(crate) use pd_pair_index::{PdPairIndex, PdWire};
-pub use pd_pairing::{PairingMismatch, PdPairing, PdPairingMode};
-pub use prefill_admission::{
-    acquire_prefill, AdmittedPrefill, PrefillAcquireError, PrefillAdmission,
-    PrefillAdmissionAttempt, PrefillAdmissionRejection, PrefillCandidateError, PrefillLoadGuard,
-    PrefillReservation, PrefillSelection, PrefillSelectionContext,
+pub(crate) use pd::pair_index::{PdPairIndex, PdWire};
+pub use pd::pairing::{PairingMismatch, PdPairing, PdPairingMode};
+pub use registry::{RemoteWorkerState, WorkerOrigin};
+pub(crate) use snapshot::{
+    ModelLabels, ModelWorkerSnapshot, RoutingPool, WindowFloor, WorkerRegistryExt,
 };
-pub(crate) use registry::{ModelWorkerSnapshot, RoutingPool};
-pub use registry::{WorkerOrigin, WorkerRegistry};
-pub use resilience::{resolve_resilience, ResolvedResilience, DEFAULT_RETRYABLE_STATUS_CODES};
-pub use sampling_defaults::DEFAULT_SAMPLING_PARAMS_LABEL;
-pub use service::WorkerService;
-pub use stream::GuardedStream;
+
+// The gateway's connector, for the gateway's name for the builder below.
+use crate::routers::grpc::backend_client::BackendConnector;
+
+/// The worker builder as the gateway names it: a worker it builds connects
+/// through the gateway's client unless the builder is handed another
+/// connector. The builder is the worker crate's; this name for it is the
+/// gateway's.
+pub type BasicWorkerBuilder = identity::builder::BasicWorkerBuilder<BackendConnector>;
+
+/// The registry as the gateway names it: its value of a membership
+/// generation is the model snapshot that keeps the routers' projections.
+/// The load monitor holds that registry. The registry is the worker crate's;
+/// this name for it is the gateway's.
+pub type WorkerRegistry = registry::WorkerRegistry<ModelWorkerSnapshot>;
+/// The load monitor over that registry.
+pub type WorkerMonitor = load::monitor::WorkerMonitor<ModelWorkerSnapshot>;

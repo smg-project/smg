@@ -4,27 +4,31 @@
 //! listener's counters are read back. The Numbers cell at the end drives
 //! the driver against a fleet of mock engines and prints its cost.
 
+#[path = "common/engines.rs"]
+mod engines;
 #[path = "common/net.rs"]
 mod net;
 
 use std::{
     io::Write,
-    net::SocketAddr,
     sync::{atomic::Ordering, Arc},
     time::{Duration, Instant},
 };
 
 use axum::{routing::get, Router};
+use engines::{cpu_seconds, eventually, mock_engine};
 use net::{http_get, loopback, vm_rss_kib};
 use openai_protocol::worker::RuntimeType;
 use smg_policy_controller::{
-    controller::{Config, Controller, Listener, Scope},
+    controller::{Config, Controller, Election, Listener, Scope},
     ingest::{
         loads::{LoadDriver, LoadDriverConfig, LoadProbe, ReadError, Target},
         probe::EngineProbe,
     },
+    spec::{BindingSpec, OverloadSpec},
     store::{LoadSink, LoadSource, MemoryStore, Signals, WorkerFacts, WorkerStatus, WorkersStore},
     view::{Role, SignalSource, WireModes, WorkerId},
+    AppliedSpec, PolicySpec,
 };
 use tokio::{
     net::TcpListener,
@@ -38,33 +42,6 @@ const METRICS_TEXT: &str = "# HELP vllm:num_requests_running Requests running.\n
                             vllm:num_requests_running{model_name=\"m\"} 3\n\
                             vllm:num_requests_waiting{model_name=\"m\"} 5\n\
                             vllm:kv_cache_usage_perc{model_name=\"m\"} 0.75\n";
-
-/// A mock gRPC engine of the vLLM wire with `ranks` data-parallel ranks,
-/// served until the returned sender drops. Returns its address.
-async fn mock_engine(ranks: u16) -> Result<(SocketAddr, oneshot::Sender<()>), std::io::Error> {
-    let listener = TcpListener::bind(loopback()).await?;
-    let addr = listener.local_addr()?;
-    let cfg = Arc::new(mock_worker::config::Config {
-        grpc_base_port: addr.port(),
-        grpc_count: 1,
-        grpc_dp_size: ranks,
-        grpc_wire: mock_worker::config::SchedulerWire::Vllm,
-        loads_like: mock_worker::engine::LoadsLike::Vllm,
-        realistic: true,
-        ..mock_worker::config::Config::default()
-    });
-    let (stop, stopped) = oneshot::channel();
-    let mut served = JoinSet::new();
-    served.spawn(mock_worker::grpc::serve_with_listener_until(
-        cfg,
-        listener,
-        async move {
-            let _ = stopped.await;
-        },
-    ));
-    served.detach_all();
-    Ok((addr, stop))
-}
 
 /// An HTTP server answering `/metrics` with `body`, served until the
 /// returned sender drops. Returns its base URL.
@@ -116,21 +93,10 @@ fn ready(
             ..WorkerFacts::default()
         })
         .id();
+    store.publish_now();
     let revision = store.get(id)?.revision;
     store.set_status(id, WorkerStatus::Ready, revision);
     Some(id)
-}
-
-/// Waits until `check` passes or `within` runs out.
-async fn eventually(within: Duration, mut check: impl FnMut() -> bool) -> bool {
-    let deadline = Instant::now() + within;
-    while Instant::now() < deadline {
-        if check() {
-            return true;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    check()
 }
 
 #[tokio::test]
@@ -158,7 +124,7 @@ async fn the_probe_polls_a_mock_engine_and_every_rank_gets_its_row() {
         0,
     )
     .expect("rank 1");
-    let probe = Arc::new(EngineProbe::new().expect("an HTTP client"));
+    let probe = Arc::new(EngineProbe::new());
     let driver = Arc::new(LoadDriver::new(
         Arc::clone(&store),
         Arc::clone(&probe),
@@ -208,7 +174,7 @@ async fn the_probe_polls_a_mock_engine_and_every_rank_gets_its_row() {
 #[tokio::test]
 async fn an_engine_that_goes_away_fails_on_the_transport_and_its_connection_is_dropped() {
     let (addr, engine) = mock_engine(1).await.expect("a mock engine");
-    let probe = EngineProbe::new().expect("an HTTP client");
+    let probe = EngineProbe::new();
     let target = Target {
         endpoint: format!("http://{addr}"),
         kind: RuntimeType::Vllm,
@@ -277,7 +243,7 @@ async fn an_engine_re_registered_under_another_kind_at_one_address_is_asked_thro
     // another family: the engine refuses that family's call, an answer,
     // which keeps the connection.
     let (addr, _engine) = mock_engine(1).await.expect("a mock engine");
-    let probe = EngineProbe::new().expect("an HTTP client");
+    let probe = EngineProbe::new();
     let endpoint = format!("http://{addr}");
     let wrong = Target {
         endpoint: endpoint.clone(),
@@ -321,7 +287,7 @@ async fn the_scrape_reads_the_metrics_endpoint_and_a_closed_port_fails() {
     let (url, _server) = metrics_server(METRICS_TEXT)
         .await
         .expect("a metrics server");
-    let probe = EngineProbe::new().expect("an HTTP client");
+    let probe = EngineProbe::new();
     let text = probe
         .scrape(&url, Duration::from_secs(3))
         .await
@@ -363,11 +329,32 @@ async fn the_controller_runs_the_driver_and_renders_its_counters() {
         // Long enough that the counter below reads the first poll alone,
         // however slow the host; the first tick polls at once.
         load_poll_interval: Duration::from_secs(10),
+        decide_shards: 2,
+        election: Election::default(),
     })
     .await
     .expect("the controller binds");
     let admin = controller.addresses().admin;
     let store = controller.store();
+    // The standing generation names a queue bound the scraped engine's page
+    // is over: that engine's first row moves its verdict.
+    let mut document = PolicySpec::preset("round_robin").expect("a preset of this build");
+    document.generation = 1;
+    let profile = document
+        .profiles
+        .keys()
+        .next()
+        .expect("the preset's profile");
+    document.bindings = vec![BindingSpec {
+        profile: Some(profile.clone()),
+        overload: Some(OverloadSpec {
+            waiting_requests: Some(4),
+            ..OverloadSpec::default()
+        }),
+        ..BindingSpec::default()
+    }];
+    let bound = AppliedSpec::validate(&document).expect("the document validates");
+    store.apply(bound).expect("applied");
     let endpoint = format!("http://{addr}");
     let polled =
         ready(&store, &endpoint, &endpoint, 0, 1, WireModes::GRPC, 0).expect("the polled row");
@@ -416,6 +403,12 @@ async fn the_controller_runs_the_driver_and_renders_its_counters() {
         body.contains("smg_policy_controller_load_rows_total "),
         "{body}"
     );
+    // The verdict the scraped row moved is counted at the controller's own
+    // scrape.
+    assert!(
+        body.contains("smg_policy_controller_overload_flips_total 1"),
+        "{body}"
+    );
 
     stop.send(()).expect("the serve is listening for the stop");
     serving
@@ -424,21 +417,6 @@ async fn the_controller_runs_the_driver_and_renders_its_counters() {
         .expect("the serve task")
         .expect("no panic")
         .expect("the serve ends clean");
-}
-
-/// CPU seconds of this process (user + system), from `/proc/self/stat`.
-fn cpu_seconds() -> f64 {
-    let ticks = std::fs::read_to_string("/proc/self/stat")
-        .ok()
-        .and_then(|stat| {
-            let after = stat.rsplit_once(')')?.1;
-            let fields: Vec<&str> = after.split_whitespace().collect();
-            let utime: f64 = fields.get(11)?.parse().ok()?;
-            let stime: f64 = fields.get(12)?.parse().ok()?;
-            Some(utime + stime)
-        })
-        .unwrap_or(0.0);
-    ticks / 100.0
 }
 
 /// The Numbers cell: the driver alone against `SMG_LOAD_BED_ENGINES` mock
@@ -463,7 +441,7 @@ async fn cpu_and_rss_of_the_driver_against_a_fleet_of_mock_engines() {
         ready(&store, &endpoint, &endpoint, 0, 1, WireModes::GRPC, 0).expect("the row");
         stops.push(stop);
     }
-    let probe = Arc::new(EngineProbe::new().expect("an HTTP client"));
+    let probe = Arc::new(EngineProbe::new());
     let driver = Arc::new(LoadDriver::new(
         Arc::clone(&store),
         probe,

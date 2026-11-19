@@ -6,14 +6,20 @@
 //! without the lock (an operator, a candidate's `read`) sees the old record
 //! or the new one, never a torn or empty file, and a host crash leaves one
 //! of the two as well, so the term survives the host. A deleted or emptied
-//! file restarts the term at one; the gateways' term floors then refuse the
-//! controller until they restart, so the file is not something to clean up.
+//! file is waited out by a replica that saw its record held, for that
+//! record's duration, and taken above the highest term that replica saw. A
+//! take of a file that holds no record leads one renew deadline later: a
+//! holder still alive has fenced itself by then. A replica started after the
+//! loss takes it at term one. A gateway's term floor above that term then
+//! moves the lease above it, one hand-over a rising floor, while the floor
+//! is believed (up to 65,536 above the term); past that the floors refuse
+//! the controller until the gateways restart: keep the file.
 //! Local filesystems only: the lock is the standard library's advisory lock,
 //! which a network filesystem need not honour between hosts.
 
 use std::{
     ffi::OsStr,
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
 };
@@ -87,7 +93,15 @@ impl LeaseBackend for FileLease {
         expected: Option<&LeaseRecord>,
         record: &LeaseRecord,
     ) -> Result<Written, ElectError> {
-        let lock = File::create(&self.lock).map_err(|err| self.io(err))?;
+        // Opened, never truncated: a truncate rewrites the lock file's inode
+        // at every write of the lease, and on a disk under load that waits
+        // for the filesystem where an open of a file that exists does not.
+        let lock = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&self.lock)
+            .map_err(|err| self.io(err))?;
         // Released when `lock` drops, on every path out of here.
         lock.lock().map_err(|err| self.io(err))?;
         if self.read_record()?.as_ref() != expected {
@@ -142,6 +156,12 @@ mod tests {
     use crate::elector::{ElectionSettings, Elector, Tick};
 
     const S: Duration = Duration::from_secs(1);
+
+    /// How far ahead of the clock a case that steps through a wait starts its
+    /// instants: the elector dates a first sight at the later of the caller's
+    /// instant and its own clock, and an instant the real clock overtakes
+    /// moves the wait.
+    const AHEAD: Duration = S.saturating_mul(3_600);
 
     fn record(holder: &str, term: u64, renewed_at_micros: u64) -> LeaseRecord {
         LeaseRecord {
@@ -198,6 +218,37 @@ mod tests {
         assert_eq!(lease.place(), path.display().to_string());
     }
 
+    /// The lock file is opened at every write and never rewritten: a write
+    /// of the lease leaves its bytes as they stand, whether the write lands
+    /// or finds the record moved. A truncate would change the file at every
+    /// renewal, and on a disk under load that waits for the filesystem.
+    #[test]
+    fn a_write_of_the_lease_leaves_the_lock_file_as_it_stands() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("policy.lease");
+        let lock = dir.path().join("policy.lease.lock");
+        let mut lease = FileLease::new(&path);
+        let first = record("a@host:1", 1, 5);
+        assert_eq!(lease.write(None, &first).expect("write"), Written::Done);
+        assert_eq!(fs::read(&lock).expect("the lock file"), b"", "made empty");
+        // What stands in the lock file is no part of the lease: the mark
+        // shows a write that rewrites it.
+        fs::write(&lock, b"kept").expect("the mark");
+        let second = record("a@host:1", 1, 6);
+        assert_eq!(
+            lease.write(Some(&first), &second).expect("write"),
+            Written::Done
+        );
+        assert_eq!(fs::read(&lock).expect("the lock file"), b"kept");
+        let theirs = record("b@host:2", 2, 7);
+        assert_eq!(
+            lease.write(Some(&first), &theirs).expect("write"),
+            Written::Moved
+        );
+        assert_eq!(fs::read(&lock).expect("the lock file"), b"kept");
+        assert_eq!(lease.read().expect("read"), Some(second));
+    }
+
     #[test]
     fn an_empty_file_is_no_lease_and_a_malformed_one_is_an_error() {
         let dir = tempfile::tempdir().expect("a temp dir");
@@ -244,7 +295,7 @@ mod tests {
         let path = dir.path().join("lease");
         let mut a = candidate(&path, "a@host:1");
         let mut b = candidate(&path, "b@host:2");
-        let t0 = Instant::now();
+        let t0 = Instant::now() + AHEAD;
         assert_eq!(a.tick(t0).expect("tick"), Tick::Acquired { term: 1 });
         assert_eq!(
             b.tick(t0).expect("tick"),

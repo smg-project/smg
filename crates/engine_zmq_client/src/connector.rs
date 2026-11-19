@@ -536,7 +536,7 @@ impl RetainedInput {
     /// Reserve atomically, rejecting both budget exhaustion and integer overflow.
     fn reserve(total: &Arc<AtomicUsize>, bytes: usize, limit: usize) -> Result<Self> {
         total
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
                 used.checked_add(bytes).filter(|next| *next <= limit)
             })
             .map_err(|retained_bytes| Error::EngineInputBytesFull {
@@ -820,6 +820,8 @@ impl<P: EngineProtocol> ClientInner<P> {
             if let Some(load) = routing.load.get_mut(&engine_index) {
                 load.num_running = 0;
                 load.num_waiting = 0;
+                load.num_resident_tokens = load.num_resident_tokens.map(|_| 0);
+                load.num_waiting_uncached_tokens = load.num_waiting_uncached_tokens.map(|_| 0);
             }
         }
     }

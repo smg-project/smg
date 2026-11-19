@@ -9,16 +9,32 @@ use rand::RngExt as _;
 
 use crate::{
     config::CacheIndexKind,
-    worker::{load_state::LoadReceiver, runtime::RoutingState, HashRing, Worker, UNKNOWN_MODEL_ID},
+    policies::hash_ring::HashRing,
+    worker::{load::state::LoadReceiver, runtime::RoutingState, Worker, UNKNOWN_MODEL_ID},
 };
 
 mod bucket;
 mod cache_aware;
 mod cache_namespace;
+#[cfg(test)]
+#[expect(clippy::print_stdout, reason = "a recorder says where its sheet went")]
+mod classic_all_vetoed_rows;
+#[cfg(test)]
+#[expect(clippy::print_stdout, reason = "a recorder says where its sheet went")]
+mod classic_manual_rows;
+#[cfg(test)]
+#[expect(clippy::print_stdout, reason = "a recorder says where its sheet went")]
+mod classic_prefix_hash_rows;
+#[cfg(test)]
+#[expect(clippy::print_stdout, reason = "a recorder says where its sheet went")]
+mod classic_rows;
 mod consistent_hashing;
 pub mod cost;
 mod dp_min_token;
+pub mod expected_wait;
 mod factory;
+pub mod hash_ring;
+mod kept_rings;
 mod least_load;
 mod manual;
 mod passthrough;
@@ -29,7 +45,6 @@ mod registry;
 mod round_robin;
 #[cfg(test)]
 pub(crate) mod test_support;
-pub(crate) mod utils;
 
 pub use bucket::BucketPolicy;
 pub use cache_aware::{CacheAwarePolicy, TreeHandle, TreeKind};
@@ -47,6 +62,10 @@ pub use prefix_hash::{PrefixHashConfig, PrefixHashPolicy};
 pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;
 pub use round_robin::RoundRobinPolicy;
+
+// The periodic task lives beside the worker runtime. The path it had here is
+// kept: the policies name it.
+pub(crate) use crate::worker::periodic_task as utils;
 
 /// Core trait for load balancing policies
 ///
@@ -202,6 +221,17 @@ pub(crate) fn policy_filters_unavailable_workers(policy: &dyn LoadBalancingPolic
         || policy.is::<CacheAwarePolicy>()
         || policy.is::<ManualPolicy>()
         || policy.is::<PassthroughPolicy>()
+}
+
+/// Whether a built-in policy reads the model's hash ring
+/// ([`SelectWorkerInfo::hash_ring`]). Single-worker placement fetches the
+/// ring for these alone: the fetch is a keyed read of the registry and a
+/// shared count, up and down, on every request. A policy that starts to read
+/// the ring joins this list; left out, it is handed none and places by its
+/// ring-less fallback.
+pub(crate) fn policy_reads_hash_ring(policy: &dyn LoadBalancingPolicy) -> bool {
+    let policy = policy.as_any();
+    policy.is::<ConsistentHashingPolicy>() || policy.is::<PrefixHashPolicy>()
 }
 
 pub trait DPRankLoadPolicy: Send + Sync + Debug {
@@ -459,8 +489,10 @@ pub struct SelectWorkerInfo<'a> {
     /// body access populate it); used when no valid routing-key header is
     /// present under the routing-key override.
     pub rid_key: Option<&'a str>,
-    /// Pre-computed hash ring for O(log n) consistent hashing
-    /// Built and cached by WorkerRegistry, passed through to avoid per-request rebuilds
+    /// The hash ring of the model's membership generation, for O(log n)
+    /// consistent hashing: filled once a generation and passed through, so
+    /// no request rebuilds it. A placement hands it to a policy that reads
+    /// it (`policy_reads_hash_ring`) and `None` to any other.
     pub hash_ring: Option<Arc<HashRing>>,
     /// Which PD role this selection is for (default `Single`); namespaces
     /// header-based sticky routing so prefill and decode stick independently.
@@ -476,6 +508,44 @@ pub struct SelectWorkerInfo<'a> {
     /// placement over regular workers also sets it for a request its policy
     /// places by session key ([`LoadBalancingPolicy::routes_by_session_key`]).
     pub overload_lifted: bool,
+    /// The list of the routing snapshot the candidates are cut from, when
+    /// the caller names it ([`NamedList`]). A policy that keeps state per
+    /// list finds it by the list's own address, whatever part of the list
+    /// this request may use; without a name the policy reads which workers
+    /// it was handed.
+    pub named: Option<NamedList<'a>>,
+}
+
+/// The candidates of a selection as a part of a list the routing snapshot
+/// owns. The list never changes while it lives (a membership change makes a
+/// new one), so its address names it, and a candidate is a position in it.
+#[derive(Clone, Copy)]
+pub struct NamedList<'a> {
+    /// The snapshot's own list.
+    pub list: &'a Arc<[Arc<dyn Worker>]>,
+    /// Candidate `k` is `list[positions[k]]`, ascending; `None` when the
+    /// candidates are the whole list in its order.
+    pub positions: Option<&'a [usize]>,
+}
+
+impl NamedList<'_> {
+    /// The candidate that is the list's worker at `row`, when the request
+    /// may use that worker.
+    pub(crate) fn candidate(&self, row: usize) -> Option<usize> {
+        match self.positions {
+            None => Some(row),
+            Some(positions) => positions.binary_search(&row).ok(),
+        }
+    }
+}
+
+impl Debug for NamedList<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NamedList")
+            .field("list", &self.list.len())
+            .field("positions", &self.positions.map(<[usize]>::len))
+            .finish()
+    }
 }
 
 impl SelectWorkerInfo<'_> {
@@ -596,7 +666,7 @@ mod tests {
         );
 
         // A busy worker is still eligible: load alone is not the veto.
-        let _guard = WorkerLoadGuard::new(Arc::clone(&workers[1]), None);
+        let _guard = WorkerLoadGuard::with_key(Arc::clone(&workers[1]), None);
         assert_eq!(
             get_healthy_worker_indices(&workers, &SelectWorkerInfo::default()),
             vec![0, 1, 2]
@@ -675,7 +745,9 @@ mod tests {
 
         use openai_protocol::worker::WorkerStatus;
 
-        use crate::worker::{circuit_breaker::CircuitBreakerConfig, BasicWorkerBuilder, Worker};
+        use crate::worker::{
+            health::circuit_breaker::CircuitBreakerConfig, BasicWorkerBuilder, Worker,
+        };
 
         fn worker(url: &str) -> Arc<dyn Worker> {
             let worker: Arc<dyn Worker> = Arc::new(

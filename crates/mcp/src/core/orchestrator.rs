@@ -38,6 +38,7 @@ use std::{
 };
 
 use dashmap::DashMap;
+use parking_lot::RwLock;
 use rmcp::{
     model::{CallToolRequestParams, CallToolResult},
     service::{RunningService, ServiceError},
@@ -54,11 +55,12 @@ use tracing::{debug, error, info, warn};
 
 use super::{
     config::{
-        BuiltinToolType, McpConfig, McpProxyConfig, McpServerConfig, McpTransport, Prompt, Resource,
+        ArgMappingConfig, BuiltinToolType, McpConfig, McpProxyConfig, McpServerConfig,
+        McpTransport, Prompt, Resource,
     },
     handler::{HandlerRequestContext, RefreshRequest, SmgClientHandler},
     metrics::McpMetrics,
-    pool::{McpConnectionPool, PoolKey, UrlLookup},
+    pool::{Listing, McpConnectionPool, PoolKey, UrlLookup},
     reconnect::ReconnectionManager,
 };
 use crate::{
@@ -75,27 +77,30 @@ use crate::{
 };
 
 /// A server's tools as inventory entries under `category`: the listing and
-/// the entries; `None`, after one warning, when the server cannot be listed.
+/// the entries; the failure's message, after one warning, when the server
+/// cannot be listed (the caller keeps it as the server's listing error: a
+/// static server's entry, a pooled connection and the request's binding).
 async fn tools_of<S: rmcp::service::Service<RoleClient>>(
     client: &RunningService<RoleClient, S>,
     server_key: &str,
     category: ToolCategory,
-) -> Option<Vec<ToolEntry>> {
+) -> Result<Vec<ToolEntry>, String> {
     match client.peer().list_all_tools().await {
         Ok(tools) => {
             info!("Discovered {} tools from '{}'", tools.len(), server_key);
-            Some(
-                tools
-                    .into_iter()
-                    .map(|tool| {
-                        ToolEntry::from_server_tool(server_key, tool).with_category(category)
-                    })
-                    .collect(),
-            )
+            Ok(tools
+                .into_iter()
+                .enumerate()
+                .map(|(position, tool)| {
+                    ToolEntry::from_server_tool(server_key, tool)
+                        .with_category(category)
+                        .with_position(position)
+                })
+                .collect())
         }
         Err(e) => {
             warn!("Failed to list tools from '{}': {}", server_key, e);
-            None
+            Err(e.to_string())
         }
     }
 }
@@ -148,6 +153,48 @@ async fn resources_of<S: rmcp::service::Service<RoleClient>>(
             None
         }
     }
+}
+
+/// The argument mapping a tool config sets.
+fn arg_mapping_of(config: &ArgMappingConfig) -> ArgMapping {
+    let mut mapping = ArgMapping::new();
+    for (from, to) in &config.renames {
+        mapping = mapping.with_rename(from, to);
+    }
+    for (key, value) in &config.defaults {
+        mapping = mapping.with_default(key, value.clone());
+    }
+    for (key, value) in &config.overrides {
+        mapping = mapping.with_override(key, value.clone());
+    }
+    mapping
+}
+
+/// Puts a server's tool listing into the inventory in place: the listing
+/// goes in (a tool of the same name is overwritten), then what the server no
+/// longer lists goes out with the aliases that target it. A reader finds
+/// every tool both listings hold at every moment; an empty listing leaves
+/// the server without tools. A tool goes in with the argument mapping
+/// `config` sets on the tool itself, so a call never finds it without; a
+/// tool with an alias carries its mapping on the alias.
+fn swap_server_tools(inventory: &ToolInventory, config: &McpServerConfig, tools: Vec<ToolEntry>) {
+    let listed: HashSet<String> = tools
+        .iter()
+        .map(|entry| entry.tool_name().to_string())
+        .collect();
+    for mut entry in tools {
+        let direct = config
+            .tools
+            .as_ref()
+            .and_then(|configs| configs.get(entry.tool_name()))
+            .filter(|tool_config| tool_config.alias.is_none())
+            .and_then(|tool_config| tool_config.arg_mapping.as_ref());
+        if let Some(mapping) = direct {
+            entry.arg_mapping = Some(arg_mapping_of(mapping));
+        }
+        inventory.insert_entry(entry);
+    }
+    inventory.retain_server_tool_entries(&config.name, &listed);
 }
 
 /// Puts a server's prompts into the inventory.
@@ -209,8 +256,9 @@ fn register_alias(
     Ok(())
 }
 
-/// Applies a server config's tool settings (aliases and argument mappings) to
-/// the server's entries in the inventory.
+/// Applies a server config's aliases, each with its argument mapping, to the
+/// server's entries in the inventory. A tool without an alias took its
+/// mapping when its listing went in (`swap_server_tools`).
 fn apply_tool_configs(inventory: &ToolInventory, config: &McpServerConfig) {
     let Some(tools) = &config.tools else {
         return;
@@ -224,21 +272,9 @@ fn apply_tool_configs(inventory: &ToolInventory, config: &McpServerConfig) {
             );
             continue;
         }
-        let arg_mapping = tool_config.arg_mapping.as_ref().map(|cfg| {
-            let mut mapping = ArgMapping::new();
-            for (from, to) in &cfg.renames {
-                mapping = mapping.with_rename(from, to);
-            }
-            for (key, value) in &cfg.defaults {
-                mapping = mapping.with_default(key, value.clone());
-            }
-            for (key, value) in &cfg.overrides {
-                mapping = mapping.with_override(key, value.clone());
-            }
-            mapping
-        });
         // If there's an alias, register it
         if let Some(alias_name) = &tool_config.alias {
+            let arg_mapping = tool_config.arg_mapping.as_ref().map(arg_mapping_of);
             if let Err(e) =
                 register_alias(inventory, alias_name, &config.name, tool_name, arg_mapping)
             {
@@ -251,12 +287,6 @@ fn apply_tool_configs(inventory: &ToolInventory, config: &McpServerConfig) {
                     "Registered alias '{}' → '{}:{}'",
                     alias_name, config.name, tool_name
                 );
-            }
-        } else if let Some(mapping) = arg_mapping {
-            // No alias but has arg_mapping - update entry directly
-            if let Some(mut entry) = inventory.get_entry(&config.name, tool_name) {
-                entry.arg_mapping = Some(mapping);
-                inventory.insert_entry(entry);
             }
         }
     }
@@ -304,15 +334,30 @@ fn install_crypto_provider() {
     }
 }
 
-/// A client builder with the process-level TLS crypto provider installed:
-/// every HTTP client of this crate comes from here.
+/// A client builder with the process-level TLS crypto provider installed and
+/// the crate's request headers: every HTTP client of this crate comes from
+/// here.
 #[expect(
     clippy::disallowed_methods,
     reason = "the crate's one direct client construction; the process TLS crypto provider is installed first"
 )]
 pub(crate) fn http_client_builder() -> reqwest::ClientBuilder {
     install_crypto_provider();
-    reqwest::Client::builder()
+    reqwest::Client::builder().default_headers(default_request_headers())
+}
+
+/// The headers every client of this crate sends with every request: the
+/// client names `identity` as the one content coding it accepts. It is built
+/// without decoders, so a coded body would fail to parse as a protocol
+/// message; a server that honours the header never sends one (RFC 9110,
+/// section 12.5.3).
+fn default_request_headers() -> reqwest::header::HeaderMap {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::ACCEPT_ENCODING,
+        reqwest::header::HeaderValue::from_static("identity"),
+    );
+    headers
 }
 
 /// Build HTTP client with default headers.
@@ -356,6 +401,19 @@ struct ServerEntry {
     client: Arc<McpClientWithHandler>,
     handler: Arc<SmgClientHandler>,
     config: McpServerConfig,
+    /// Why the server's tool listing failed; `None` once a listing succeeded
+    /// (the first load, a refresh).
+    list_error: Option<String>,
+}
+
+/// A dynamic server as its connect leaves it: the key (its URL) that names
+/// the connection, and why its tools could not be listed (`None` when they
+/// were). The caller keeps the outcome with its binding; the pool keeps it
+/// with the connection for a later hit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectedServer {
+    pub server_key: String,
+    pub list_error: Option<String>,
 }
 
 /// Internal result type for approval-checked execution.
@@ -500,6 +558,11 @@ pub struct McpOrchestrator {
     /// handler, which must see a server's current client after a recovery
     /// re-inserts it.
     static_servers: Arc<DashMap<String, ServerEntry>>,
+    /// The connected server that answers each builtin tool type, with the tool it names: what
+    /// a walk of `static_servers` would find, kept by type so a lookup takes no walk (a walk
+    /// allocates once per shard). Written where an entry goes into `static_servers`, emptied
+    /// where that map is; the first server registered for a type keeps it.
+    builtin_servers: RwLock<Vec<(BuiltinToolType, String, String)>>,
     /// Tool inventory with qualified names.
     tool_inventory: Arc<ToolInventory>,
     /// Approval manager for interactive and policy-only modes.
@@ -561,6 +624,7 @@ impl McpOrchestrator {
 
         let orchestrator = Self {
             static_servers: Arc::new(DashMap::new()),
+            builtin_servers: RwLock::new(Vec::new()),
             tool_inventory,
             approval_manager,
             connection_pool,
@@ -615,6 +679,7 @@ impl McpOrchestrator {
 
         Self {
             static_servers: Arc::new(DashMap::new()),
+            builtin_servers: RwLock::new(Vec::new()),
             tool_inventory: Arc::new(ToolInventory::new()),
             approval_manager,
             connection_pool: Arc::new(McpConnectionPool::new()),
@@ -659,12 +724,19 @@ impl McpOrchestrator {
     }
 
     /// Connect a static server and put its entry in place: the connection,
-    /// the inventory load, the tool configurations, then the entry under the
-    /// server's name, replacing whatever entry the name held. A recovery runs
-    /// this beside the dropped entry, which stays in the map, settings and
-    /// visibility flags included, until the new connection replaces it (a
-    /// server registered after start-up has no other copy of them); an
-    /// attempt that fails changes nothing.
+    /// its three listings, then one write-back under the name's guard: the
+    /// tools swapped in place, the prompts and the resources replaced, the
+    /// tool configurations, and the entry, replacing whatever entry the name
+    /// held. Nothing of the server's changes while the listings are on their
+    /// way, so through a recovery a reader finds the tools both listings
+    /// hold; a tool listing that failed leaves the server without tools and
+    /// the failure on its entry. A refresh writes back under the same guard,
+    /// after checking the connection there, so a refresh that listed on the
+    /// dropped connection lands before this write-back or not at all. A
+    /// recovery runs this beside the dropped entry, which stays in the map,
+    /// settings and visibility flags included, until the new connection
+    /// replaces it (a server registered after start-up has no other copy of
+    /// them); an attempt that fails changes nothing.
     async fn establish_static_server(&self, config: &McpServerConfig) -> McpResult<()> {
         info!("Connecting to static server '{}'", config.name);
 
@@ -675,29 +747,42 @@ impl McpOrchestrator {
 
         let client = self.connect_server_impl(config, (*handler).clone()).await?;
         let client = Arc::new(client);
-        self.tool_inventory.clear_server_tools(&config.name);
 
-        // Load tools from server
-        self.load_server_inventory(&config.name, &client).await;
+        let key = config.name.as_str();
+        let (tools, list_error) = match tools_of(client.as_ref(), key, ToolCategory::Static).await {
+            Ok(tools) => (tools, None),
+            Err(message) => (Vec::new(), Some(message)),
+        };
+        let prompts = prompts_of(client.as_ref(), key).await;
+        let resources = resources_of(client.as_ref(), key).await;
 
+        // The write-back: nothing awaits between the guard and the entry.
+        let slot = self.static_servers.entry(config.name.clone());
+        swap_server_tools(&self.tool_inventory, config, tools);
+        self.tool_inventory.clear_server_prompts(key);
+        if let Some(prompts) = prompts {
+            install_prompts(&self.tool_inventory, key, prompts);
+        }
+        self.tool_inventory.clear_server_resources(key);
+        if let Some(resources) = resources {
+            install_resources(&self.tool_inventory, key, resources);
+        }
         self.apply_tool_configs(config);
-
         // Store server entry with config for builtin lookups
-        self.static_servers.insert(
-            config.name.clone(),
-            ServerEntry {
-                client,
-                handler,
-                config: config.clone(),
-            },
-        );
+        slot.insert(ServerEntry {
+            client,
+            handler,
+            config: config.clone(),
+            list_error,
+        });
 
         self.metrics.record_connection_opened();
+        self.index_builtin_server(config);
         info!("Connected to static server '{}'", config.name);
         Ok(())
     }
 
-    /// Apply tool configurations from server config (aliases and arg mappings).
+    /// Apply tool configurations from server config (aliases with their arg mappings).
     fn apply_tool_configs(&self, config: &McpServerConfig) {
         apply_tool_configs(&self.tool_inventory, config);
     }
@@ -758,22 +843,6 @@ impl McpOrchestrator {
         }
     }
 
-    /// Load tools, prompts, and resources from a server into the inventory.
-    async fn load_server_inventory(&self, server_key: &str, client: &Arc<McpClientWithHandler>) {
-        for entry in tools_of(client.as_ref(), server_key, ToolCategory::Static)
-            .await
-            .unwrap_or_default()
-        {
-            self.tool_inventory.insert_entry(entry);
-        }
-        if let Some(prompts) = prompts_of(client.as_ref(), server_key).await {
-            install_prompts(&self.tool_inventory, server_key, prompts);
-        }
-        if let Some(resources) = resources_of(client.as_ref(), server_key).await {
-            install_resources(&self.tool_inventory, server_key, resources);
-        }
-    }
-
     /// Spawn background handler for inventory refresh requests.
     fn spawn_refresh_handler(&self, mut rx: mpsc::Receiver<RefreshRequest>) {
         let token = self.shutdown_token.clone();
@@ -805,25 +874,36 @@ impl McpOrchestrator {
                         if let Some((client, config)) = found {
                             // The tool listing first: when it fails nothing
                             // changes and the other two listings are not
-                            // made. Each kind is cleared only when its own
-                            // listing succeeded, so a prompt or resource
-                            // listing that fails keeps what the server had.
-                            // The tool clear drops the aliases that targeted
-                            // the server, so the rebuild is what a connect
-                            // does: the tools, then the config's aliases and
-                            // argument mappings.
+                            // made. Prompts and resources are cleared only
+                            // when their own listing succeeded, so one that
+                            // fails keeps what the server had. The tools are
+                            // swapped in place, each with the argument
+                            // mapping its config sets, so a reader finds
+                            // every tool both listings hold, whole. The
+                            // config's aliases go over the result, as at a
+                            // connect.
                             let key = request.server_key.as_str();
-                            let Some(tools) =
+                            let Ok(tools) =
                                 tools_of(client.as_ref(), key, ToolCategory::Static).await
                             else {
                                 continue;
                             };
                             let prompts = prompts_of(client.as_ref(), key).await;
                             let resources = resources_of(client.as_ref(), key).await;
-                            tool_inventory.clear_server_tool_entries(key);
-                            for entry in tools {
-                                tool_inventory.insert_entry(entry);
-                            }
+                            // The write-back is this connection's: a recovery
+                            // during the listings replaced the entry (or a
+                            // removal dropped it), and its own load's tools
+                            // and outcome stand, not a stale listing's. A
+                            // recovery writes back under this guard too, so
+                            // the check holds until this listing is in. The
+                            // entry stays held while the listing goes in and
+                            // its error is cleared last: a reader that finds
+                            // no listing error finds the tools.
+                            let mut server = match static_servers.get_mut(key) {
+                                Some(entry) if Arc::ptr_eq(&entry.client, &client) => entry,
+                                _ => continue,
+                            };
+                            swap_server_tools(&tool_inventory, &config, tools);
                             if let Some(prompts) = prompts {
                                 tool_inventory.clear_server_prompts(key);
                                 install_prompts(&tool_inventory, key, prompts);
@@ -833,6 +913,8 @@ impl McpOrchestrator {
                                 install_resources(&tool_inventory, key, resources);
                             }
                             apply_tool_configs(&tool_inventory, &config);
+                            server.list_error = None;
+                            drop(server);
                             info!(
                                 "Refreshed '{}'; the inventory now holds {} tools",
                                 key,
@@ -869,12 +951,16 @@ impl McpOrchestrator {
             None
         };
 
-        // First, search connected static servers (dynamically registered via connect_static_server).
-        // This handles servers registered after orchestrator initialization.
-        for entry in self.static_servers.iter() {
-            if let Some(result) = extract_builtin(&entry.config) {
-                return Some(result);
-            }
+        // A connected server first, one registered after start-up included: read by type from
+        // the index its registration wrote, with no walk of the server map.
+        let connected = self
+            .builtin_servers
+            .read()
+            .iter()
+            .find(|(held, ..)| *held == builtin_type)
+            .map(|(_, server, tool)| (server.clone(), tool.clone()));
+        if connected.is_some() {
+            return connected;
         }
 
         // Fallback to initial config servers (handles edge cases where servers
@@ -886,6 +972,20 @@ impl McpOrchestrator {
         }
 
         None
+    }
+
+    /// Record a connected server as the answer for its builtin type, unless an earlier server
+    /// holds the type. A recovery puts a server's own settings back, so it changes nothing here.
+    fn index_builtin_server(&self, config: &McpServerConfig) {
+        let (Some(builtin_type), Some(tool_name)) =
+            (config.builtin_type, &config.builtin_tool_name)
+        else {
+            return;
+        };
+        let mut index = self.builtin_servers.write();
+        if !index.iter().any(|(held, ..)| *held == builtin_type) {
+            index.push((builtin_type, config.name.clone(), tool_name.clone()));
+        }
     }
 
     /// Returns the set of server names that have `builtin_type` configured.
@@ -926,6 +1026,32 @@ impl McpOrchestrator {
         }
 
         names
+    }
+
+    /// Whether a server of this name is configured as internal: the answer
+    /// [`Self::internal_server_names`] holds for the name, read by key.
+    pub(crate) fn is_internal_server(&self, name: &str) -> bool {
+        self.static_servers
+            .get(name)
+            .is_some_and(|entry| entry.config.internal)
+            || self
+                .config
+                .servers
+                .iter()
+                .any(|server| server.internal && server.name == name)
+    }
+
+    /// Whether a server of this name has `builtin_type` configured: the
+    /// answer [`Self::builtin_server_names`] holds for the name, read by key.
+    pub(crate) fn is_builtin_server(&self, name: &str) -> bool {
+        self.static_servers
+            .get(name)
+            .is_some_and(|entry| entry.config.builtin_type.is_some())
+            || self
+                .config
+                .servers
+                .iter()
+                .any(|server| server.builtin_type.is_some() && server.name == name)
     }
 
     /// Execute a single tool using an already-resolved qualified binding.
@@ -1613,8 +1739,7 @@ impl McpOrchestrator {
     /// The key is based on the transport URL, making it suitable for connection pooling.
     pub fn server_key(config: &McpServerConfig) -> String {
         match &config.transport {
-            McpTransport::Streamable { url, .. } => url.clone(),
-            McpTransport::Sse { url, .. } => url.clone(),
+            McpTransport::Streamable { url, .. } | McpTransport::Sse { url, .. } => url.clone(),
             McpTransport::Stdio { command, args, .. } => {
                 format!("{}:{}", command, args.join(" "))
             }
@@ -1624,12 +1749,16 @@ impl McpOrchestrator {
     /// Connect to a dynamic server and add it to the connection pool.
     ///
     /// This is used for per-request MCP servers specified in tool configurations.
-    /// Returns the server key (URL) that can be used to reference the connection.
+    /// Returns the server key (URL) that references the connection and the
+    /// outcome of its tool listing.
     ///
     /// The connection is keyed by (url, auth_hash, tenant_id) to ensure:
     /// - Different auth tokens get different connections
     /// - Different tenants are isolated
-    pub async fn connect_dynamic_server(&self, config: McpServerConfig) -> McpResult<String> {
+    pub async fn connect_dynamic_server(
+        &self,
+        config: McpServerConfig,
+    ) -> McpResult<ConnectedServer> {
         self.connect_dynamic_server_with_tenant(config, None).await
     }
 
@@ -1641,7 +1770,7 @@ impl McpOrchestrator {
         &self,
         config: McpServerConfig,
         tenant_id: Option<String>,
-    ) -> McpResult<String> {
+    ) -> McpResult<ConnectedServer> {
         use rmcp::{
             transport::{
                 streamable_http_client::StreamableHttpClientTransportConfig,
@@ -1651,59 +1780,94 @@ impl McpOrchestrator {
         };
 
         let pool_key = PoolKey::from_config(&config, tenant_id);
-
-        // Check if already connected with same auth/tenant
-        if self.connection_pool.contains(&pool_key) {
-            return Ok(pool_key.url.clone());
-        }
-
-        // Extract server_key from pool_key to avoid double URL extraction
         let server_key = pool_key.url.clone();
+
+        // A connection with the same auth and tenant whose tools are listed
+        // is a pool hit. One whose listing failed, or has not returned yet
+        // (its opener is still listing), lists again for this caller: a
+        // transient refusal does not stand until eviction, and a caller
+        // arriving during another's listing takes no pending listing for a
+        // success.
+        let pooled = self.connection_pool.get(&pool_key);
+        if pooled.is_some() && self.connection_pool.is_listed(&pool_key) {
+            return Ok(ConnectedServer {
+                server_key,
+                list_error: None,
+            });
+        }
+        let opened = pooled.is_none();
 
         // Connect via the pool
         let inventory_clone = Arc::clone(&self.tool_inventory);
         let global_proxy = self.config.proxy.clone();
 
-        let client = self
-            .connection_pool
-            .get_or_create(pool_key, config.clone(), |cfg, _proxy| async move {
-                match &cfg.transport {
-                    McpTransport::Streamable {
-                        url,
-                        token,
-                        headers: custom_headers,
-                    } => {
-                        let proxy_config =
-                            super::proxy::resolve_proxy_config(&cfg, global_proxy.as_ref());
-                        let http_client =
-                            build_http_client(proxy_config, token.as_deref(), custom_headers)?;
-                        let cfg_http = StreamableHttpClientTransportConfig::with_uri(url.as_str());
+        let client = match pooled {
+            Some(client) => client,
+            None => {
+                self.connection_pool
+                    .get_or_create(pool_key.clone(), config.clone(), |cfg, _proxy| async move {
+                        match &cfg.transport {
+                            McpTransport::Streamable {
+                                url,
+                                token,
+                                headers: custom_headers,
+                            } => {
+                                let proxy_config =
+                                    super::proxy::resolve_proxy_config(&cfg, global_proxy.as_ref());
+                                let http_client = build_http_client(
+                                    proxy_config,
+                                    token.as_deref(),
+                                    custom_headers,
+                                )?;
+                                let cfg_http =
+                                    StreamableHttpClientTransportConfig::with_uri(url.as_str());
 
-                        let transport =
-                            StreamableHttpClientTransport::with_client(http_client, cfg_http);
+                                let transport = StreamableHttpClientTransport::with_client(
+                                    http_client,
+                                    cfg_http,
+                                );
 
-                        Box::pin(().serve(transport))
-                            .await
-                            .map_err(|e| McpError::ConnectionFailed(format!("streamable: {e}")))
-                    }
-                    McpTransport::Sse { .. } => Err(sse_unsupported(&cfg.name)),
-                    McpTransport::Stdio { .. } => Err(McpError::Transport(
-                        "Stdio not supported for dynamic connections".to_string(),
-                    )),
+                                Box::pin(().serve(transport)).await.map_err(|e| {
+                                    McpError::ConnectionFailed(format!("streamable: {e}"))
+                                })
+                            }
+                            McpTransport::Sse { .. } => Err(sse_unsupported(&cfg.name)),
+                            McpTransport::Stdio { .. } => Err(McpError::Transport(
+                                "Stdio not supported for dynamic connections".to_string(),
+                            )),
+                        }
+                    })
+                    .await?
+            }
+        };
+
+        // The tools go to the inventory by URL; the listing's outcome stays
+        // with this connection (its pool key) and goes to the caller's binding.
+        let list_error = match tools_of(client.as_ref(), &server_key, ToolCategory::Dynamic).await {
+            Ok(entries) => {
+                for entry in entries {
+                    inventory_clone.insert_entry(entry);
                 }
-            })
-            .await?;
+                None
+            }
+            Err(message) => Some(message),
+        };
+        self.connection_pool.set_listing(
+            &pool_key,
+            &client,
+            match &list_error {
+                Some(message) => Listing::Failed(message.clone()),
+                None => Listing::Listed,
+            },
+        );
 
-        // Pooled connections are keyed by URL.
-        for entry in tools_of(client.as_ref(), &server_key, ToolCategory::Dynamic)
-            .await
-            .unwrap_or_default()
-        {
-            inventory_clone.insert_entry(entry);
+        if opened {
+            self.metrics.record_connection_opened();
         }
-
-        self.metrics.record_connection_opened();
-        Ok(server_key)
+        Ok(ConnectedServer {
+            server_key,
+            list_error,
+        })
     }
 
     // ========================================================================
@@ -1721,22 +1885,21 @@ impl McpOrchestrator {
             .collect()
     }
 
-    /// List tools for specific servers.
+    /// List tools for specific servers: the servers in the order given, each
+    /// server's tools in its listing order (the inventory's maps keep neither),
+    /// an entry without a position after the listed ones, the name settling
+    /// ties. Read by server key, cloning only these servers' entries.
     pub fn list_tools_for_servers(&self, server_keys: &[String]) -> Vec<ToolEntry> {
-        // For small server lists (typical case: 1-5), linear scan is faster than HashSet
-        let is_allowed = |server_key: &str| -> bool { server_keys.iter().any(|s| s == server_key) };
-
-        self.tool_inventory
-            .list_tools()
-            .into_iter()
-            .filter_map(|(tool_name, server_key, _)| {
-                if is_allowed(&server_key) {
-                    self.tool_inventory.get_entry(&server_key, &tool_name)
-                } else {
-                    None
-                }
-            })
-            .collect()
+        let mut ranked = self.tool_inventory.entries_of_servers(server_keys);
+        ranked.sort_by(|(rank_a, a), (rank_b, b)| {
+            (rank_a, a.position.is_none(), a.position, a.tool_name()).cmp(&(
+                rank_b,
+                b.position.is_none(),
+                b.position,
+                b.tool_name(),
+            ))
+        });
+        ranked.into_iter().map(|(_, entry)| entry).collect()
     }
 
     /// Get a tool by qualified name.
@@ -1767,6 +1930,23 @@ impl McpOrchestrator {
     /// Get the tool inventory.
     pub fn tool_inventory(&self) -> Arc<ToolInventory> {
         Arc::clone(&self.tool_inventory)
+    }
+
+    /// Why a static server's tools could not be listed, when its last listing
+    /// failed; a dynamic server answers that at its connect
+    /// (`ConnectedServer::list_error`) and the request's binding keeps it.
+    pub fn list_error_for_server(&self, server_key: &str) -> Option<String> {
+        self.static_servers
+            .get(server_key)
+            .and_then(|entry| entry.list_error.clone())
+    }
+
+    /// Whether a configured server is held under `server_key`: one that
+    /// connected, at construction or by a later registration, and is held
+    /// until shutdown, a dropped transport included (a server whose first
+    /// connect failed, or whose registration is still retrying, is not held).
+    pub fn has_static_server(&self, server_key: &str) -> bool {
+        self.static_servers.contains_key(server_key)
     }
 
     /// Get the approval manager.
@@ -1860,6 +2040,7 @@ impl McpOrchestrator {
             self.metrics.record_connection_closed();
         }
         self.static_servers.clear();
+        self.builtin_servers.write().clear();
         self.connection_pool.clear();
 
         self.tool_inventory.clear_all();
@@ -2125,6 +2306,55 @@ mod tests {
             Arc::new(serde_json::Map::new()),
         )
     }
+    /// The tools of the request's servers come in the request's server order,
+    /// then each server's listing order (the position the listing recorded),
+    /// an entry without a position last, however the inventory's maps hash
+    /// them.
+    #[test]
+    fn tools_are_listed_in_the_servers_listing_order() {
+        let orchestrator = McpOrchestrator::new_test();
+        let listed = [
+            "echo",
+            "sleep",
+            "fail",
+            "big",
+            "nested",
+            "multi",
+            "rpc_error",
+            "zeta",
+        ];
+        for (position, name) in listed.iter().enumerate() {
+            orchestrator.tool_inventory().insert_entry(
+                ToolEntry::from_server_tool("s1", create_test_tool(name)).with_position(position),
+            );
+        }
+        // made otherwise than by the listing (no position): last, whatever its name
+        orchestrator
+            .tool_inventory()
+            .insert_entry(ToolEntry::from_server_tool("s1", create_test_tool("aaa")));
+        for (position, name) in ["second", "first"].iter().enumerate() {
+            orchestrator.tool_inventory().insert_entry(
+                ToolEntry::from_server_tool("s2", create_test_tool(name)).with_position(position),
+            );
+        }
+        let names = |keys: &[&str]| -> Vec<String> {
+            let keys: Vec<String> = keys.iter().map(ToString::to_string).collect();
+            orchestrator
+                .list_tools_for_servers(&keys)
+                .iter()
+                .map(|entry| format!("{}/{}", entry.server_key(), entry.tool_name()))
+                .collect()
+        };
+
+        let mut s1: Vec<String> = listed.iter().map(|name| format!("s1/{name}")).collect();
+        s1.push("s1/aaa".to_string());
+        let s2 = ["s2/second".to_string(), "s2/first".to_string()];
+        assert_eq!(names(&["s1"]), s1);
+        assert_eq!(names(&["s2", "s1"]), [&s2[..], &s1[..]].concat());
+        assert_eq!(names(&["s1", "s2"]), [&s1[..], &s2[..]].concat());
+        assert!(names(&["s3"]).is_empty());
+    }
+
     #[test]
     fn approval_elicitation_id_is_keyed_by_call_id() {
         assert_eq!(
@@ -2467,14 +2697,8 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_tool_configs_sets_direct_arg_mapping() {
+    fn a_listed_tool_goes_in_with_its_direct_arg_mapping() {
         let orchestrator = McpOrchestrator::new_test();
-        orchestrator
-            .tool_inventory
-            .insert_entry(ToolEntry::from_server_tool(
-                "web-search",
-                create_test_tool("search_web"),
-            ));
 
         let mut tools = HashMap::new();
         tools.insert(
@@ -2501,7 +2725,14 @@ mod tests {
             ..sse_server("web-search", "http://localhost:8080/sse")
         };
 
-        orchestrator.apply_tool_configs(&config);
+        swap_server_tools(
+            &orchestrator.tool_inventory,
+            &config,
+            vec![ToolEntry::from_server_tool(
+                "web-search",
+                create_test_tool("search_web"),
+            )],
+        );
 
         let entry = orchestrator
             .tool_inventory
@@ -2512,6 +2743,64 @@ mod tests {
             mapping.defaults,
             vec![("enable_source".to_string(), serde_json::json!(true))]
         );
+        assert_eq!(
+            mapping.overrides,
+            vec![("enable_brave".to_string(), serde_json::json!(false))]
+        );
+    }
+
+    #[test]
+    fn an_aliased_tool_keeps_its_arg_mapping_on_the_alias() {
+        let orchestrator = McpOrchestrator::new_test();
+
+        let mut tools = HashMap::new();
+        tools.insert(
+            "search_web".to_string(),
+            ToolConfig {
+                alias: Some("web_search".to_string()),
+                response_format: None,
+                arg_mapping: Some(ArgMappingConfig {
+                    renames: HashMap::new(),
+                    defaults: HashMap::new(),
+                    overrides: HashMap::from([(
+                        "enable_brave".to_string(),
+                        serde_json::json!(false),
+                    )]),
+                }),
+            },
+        );
+
+        let config = McpServerConfig {
+            tools: Some(tools),
+            ..sse_server("web-search", "http://localhost:8080/sse")
+        };
+
+        swap_server_tools(
+            &orchestrator.tool_inventory,
+            &config,
+            vec![ToolEntry::from_server_tool(
+                "web-search",
+                create_test_tool("search_web"),
+            )],
+        );
+        orchestrator.apply_tool_configs(&config);
+
+        let own = orchestrator
+            .tool_inventory
+            .get_entry("web-search", "search_web")
+            .expect("tool entry should exist");
+        assert!(
+            own.arg_mapping.is_none(),
+            "the tool's own entry takes no mapping: the alias carries it"
+        );
+        let alias = orchestrator
+            .tool_inventory
+            .get_entry(ALIAS_SERVER_KEY, "web_search")
+            .expect("alias entry should exist");
+        let mapping = alias
+            .alias_target
+            .and_then(|target| target.arg_mapping)
+            .expect("the alias carries the arg mapping");
         assert_eq!(
             mapping.overrides,
             vec![("enable_brave".to_string(), serde_json::json!(false))]
@@ -2783,6 +3072,37 @@ mod tests {
         assert_eq!(matching.len(), 0);
     }
 
+    /// The index of connected builtin servers: the first server registered for a type keeps it,
+    /// the same settings put back (what a recovery does) change nothing, a connected server
+    /// answers before a configured one, and a shutdown leaves the configured one.
+    #[tokio::test]
+    async fn the_first_connected_server_of_a_builtin_type_answers_until_shutdown() {
+        let search = |name: &str, tool: &str| McpServerConfig {
+            builtin_type: Some(BuiltinToolType::WebSearchPreview),
+            builtin_tool_name: Some(tool.to_string()),
+            ..sse_server(name, "http://localhost:1/sse")
+        };
+        let orchestrator = McpOrchestrator::new_test_with_config(McpConfig {
+            servers: vec![search("configured", "configured_search")],
+            ..Default::default()
+        });
+        let found = || orchestrator.find_builtin_server(BuiltinToolType::WebSearchPreview);
+        let answer = |server: &str, tool: &str| Some((server.to_string(), tool.to_string()));
+        assert_eq!(found(), answer("configured", "configured_search"));
+
+        orchestrator.index_builtin_server(&search("first", "search"));
+        orchestrator.index_builtin_server(&search("second", "other_search"));
+        orchestrator.index_builtin_server(&search("first", "search"));
+        assert_eq!(found(), answer("first", "search"));
+        assert_eq!(
+            orchestrator.find_builtin_server(BuiltinToolType::CodeInterpreter),
+            None
+        );
+
+        orchestrator.shutdown().await;
+        assert_eq!(found(), answer("configured", "configured_search"));
+    }
+
     #[test]
     fn test_find_builtin_server_web_search() {
         // Create config with a server configured for web_search_preview
@@ -2857,5 +3177,74 @@ mod tests {
         assert!(orchestrator
             .find_builtin_server(BuiltinToolType::FileSearch)
             .is_none());
+    }
+
+    /// Every client of the crate names `identity` as the content coding it
+    /// accepts, so a server that compresses every request naming no coding
+    /// answers this one in the clear and the body parses. Without the header
+    /// the server sends a gzip body, which the client, built without decoders,
+    /// cannot read.
+    #[tokio::test]
+    async fn every_client_names_identity_so_a_server_compressing_unasked_answers_in_the_clear() {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+            sync::mpsc,
+            thread,
+        };
+        // `{"ok":true}` under gzip: what the server sends a request that names no coding.
+        const GZIPPED_BODY: &[u8] = &[
+            0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x03, 0xab, 0x56, 0xca, 0xcf,
+            0x56, 0xb2, 0x2a, 0x29, 0x2a, 0x4d, 0xad, 0x05, 0x00, 0x90, 0x5f, 0xd4, 0xa7, 0x0b,
+            0x00, 0x00, 0x00,
+        ];
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = mpsc::channel::<String>();
+        thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut head = Vec::new();
+            let mut buf = [0u8; 1024];
+            loop {
+                let n = socket.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                head.extend_from_slice(&buf[..n]);
+                if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let head = String::from_utf8_lossy(&head).into_owned();
+            let names_identity = head
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("accept-encoding: identity"));
+            let _ = tx.send(head);
+            let response_head: &[u8] = if names_identity {
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n"
+            } else {
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: 31\r\nConnection: close\r\n\r\n"
+            };
+            let body: &[u8] = if names_identity {
+                b"{\"ok\":true}"
+            } else {
+                GZIPPED_BODY
+            };
+            let _ = socket
+                .write_all(response_head)
+                .and_then(|()| socket.write_all(body));
+        });
+
+        let client = build_http_client(None, Some("token"), &HashMap::new()).unwrap();
+        let response = client.get(format!("http://{addr}/")).send().await.unwrap();
+        assert_eq!(response.status(), 200);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body, serde_json::json!({ "ok": true }));
+        let head = rx.recv().unwrap();
+        assert!(
+            head.lines()
+                .any(|line| line.eq_ignore_ascii_case("accept-encoding: identity")),
+            "the request head names no identity coding:\n{head}"
+        );
     }
 }
