@@ -13,6 +13,8 @@
 //! schema validates the day its stage lands. [`PolicySpec::schema`] is that
 //! schema; the field documentation of this module is its descriptions.
 
+#[cfg(feature = "controller")]
+use std::sync::atomic::{self, AtomicBool};
 use std::{
     borrow::Cow,
     cmp::Ordering,
@@ -3587,6 +3589,11 @@ pub struct AppliedSpec {
     block_size: u32,
     pairing: Pairing,
     lists: ViewLists,
+    /// A start's document waits for the first lead of this store's
+    /// replica ([`AppliedSpec::await_document`]): set on the unbound start
+    /// alone, and gone with it at the first publication.
+    #[cfg(feature = "controller")]
+    awaited: AtomicBool,
 }
 
 impl AppliedSpec {
@@ -3630,6 +3637,8 @@ impl AppliedSpec {
             block_size: Gates::of(None, None, document.view.block_size).block_size,
             pairing: document.plans.pd_pair.pairing,
             lists: ViewLists::of(&document.view),
+            #[cfg(feature = "controller")]
+            awaited: AtomicBool::new(false),
         }
     }
 
@@ -3647,7 +3656,28 @@ impl AppliedSpec {
             block_size: Gates::default().block_size,
             pairing: Pairing::default(),
             lists: ViewLists::default(),
+            #[cfg(feature = "controller")]
+            awaited: AtomicBool::new(false),
         }
+    }
+
+    /// Marks the unbound start of a replica whose start's document waits
+    /// for its first lead. Under the mark a request is no decision, and
+    /// its answer is `Busy` with no reason: the unbound start of a store
+    /// with no document sheds it by the binding, which would say here that
+    /// a document refuses what no document has read. The mark is no
+    /// generation: it takes no number and is told to no standby, and it
+    /// goes with the unbound start at the first publication.
+    #[cfg(feature = "controller")]
+    pub(crate) fn await_document(&self) {
+        self.awaited.store(true, atomic::Ordering::Relaxed);
+    }
+
+    /// Whether a start's document waits for this generation's place
+    /// ([`AppliedSpec::await_document`]).
+    #[cfg(feature = "controller")]
+    pub(crate) fn awaits_document(&self) -> bool {
+        self.awaited.load(atomic::Ordering::Relaxed)
     }
 
     /// The generation's number: the engine's own.

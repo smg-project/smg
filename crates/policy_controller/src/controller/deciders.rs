@@ -214,6 +214,10 @@ pub(crate) struct Counts {
     /// the term past the width an id carries. Each leaves as `Busy` with
     /// no reason: a pick with no lease is no answer.
     pub(crate) unleased: AtomicU64,
+    /// Requests no pick was made of while the start's document of a
+    /// replica under a shared lease waited for its first lead. Each leaves
+    /// as `Busy` with no reason: no decision is made under no document.
+    pub(crate) awaited: AtomicU64,
 }
 
 /// The parts a made decision's counts are kept in. A decider adds to the
@@ -744,6 +748,15 @@ impl Deciding {
                 counts.pair_sides.fetch_add(1, Ordering::Relaxed);
                 return Err(Reason::Unspecified);
             };
+            // No pick, while the start's document of a replica under a
+            // shared lease waits for its first lead: a shed would say that
+            // a document refuses the request, and no document has landed.
+            // That is no decision. The mark is read behind a decision that
+            // booked nothing, and there alone: a pick pays nothing for it.
+            if booking.is_none() && world.spec().awaits_document() {
+                counts.awaited.fetch_add(1, Ordering::Relaxed);
+                return Err(Reason::Unspecified);
+            }
             // The lease, for a pick: filed under the first read's term and
             // at its instant, and the engine told, before the read that
             // lets the answer leave. That read judges the store's write
@@ -4725,12 +4738,43 @@ pub(crate) mod tests {
             declined(proto::ShedReason::PolicyDeclined, "binding")
         );
         assert_eq!(answer, unbound.engines(&frame, 1));
+        assert_eq!(unbound.counts.awaited.load(Ordering::Relaxed), 0);
         // A model no member serves: the engine's answer over no candidate.
         let mut bed = leading([]);
         let frame = frame_for("model-nobody-serves", 2, 2);
         let answer = bed.ask(frame.clone()).await;
         assert!(matches!(outcome(&answer), Outcome::Shed(_)), "{answer:?}");
         assert_eq!(answer, bed.engines(&frame, 1));
+    }
+
+    /// While the start's document of a replica under a shared lease waits
+    /// for its first lead, a request is no decision: `Busy` with no
+    /// reason, so with no lease and no trace, under a count of its own. The
+    /// first request behind the document's landing is decided under it.
+    #[tokio::test]
+    async fn a_request_ahead_of_the_starts_document_is_no_decision() {
+        let mut bed = bed(None, true, (2, 8), []);
+        bed.store.world().spec().await_document();
+        let answer = bed.ask(frame(1, 1)).await;
+        assert_eq!(
+            (busy(&answer), answer.request_id.as_slice(), answer.term),
+            (Reason::Unspecified, &[1][..], 1)
+        );
+        let counted = |count: &AtomicU64| count.load(Ordering::Relaxed);
+        assert_eq!(
+            (
+                counted(&bed.counts.awaited),
+                counted(&bed.counts.pair_sides)
+            ),
+            (1, 0)
+        );
+        // The document lands, and the mark goes with the unbound start.
+        bed.store
+            .apply(preset("random", 1))
+            .expect("above the unbound start");
+        let answer = bed.ask(frame(2, 1)).await;
+        assert!(matches!(outcome(&answer), Outcome::Pick(_)), "{answer:?}");
+        assert_eq!(counted(&bed.counts.awaited), 1);
     }
 
     /// Every worker a pick names, its alternates with it.

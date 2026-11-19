@@ -566,13 +566,14 @@ impl Controller {
     /// the running generation kept.
     ///
     /// A replica under a lease another replica can take applies nothing
-    /// here: its document is passed, and applied at the replica's first
-    /// take where the replica runs nothing by then. Until it leads, a
-    /// replica that follows a leader runs what its leader's log gives it,
-    /// under the leader's number. Behind each take its watch reads the
-    /// file as a start does: a leader runs what its file says. The lease
-    /// alone decides this, whatever the order the listeners are configured
-    /// in.
+    /// here: its document is passed, and applied under the replica's first
+    /// lead where the replica runs nothing by then, at its first take or by
+    /// its watch once that lead opens. Until it lands the replica has no
+    /// decision for a request. Until it leads, a replica that follows a
+    /// leader runs what its leader's log gives it, under the leader's
+    /// number. Behind each take its watch reads the file as a start does:
+    /// a leader runs what its file says. The lease alone decides this,
+    /// whatever the order the listeners are configured in.
     ///
     /// A file that cannot be read, or a document the validator refuses, is
     /// refused here, before anything serves. The document names the stages
@@ -585,8 +586,9 @@ impl Controller {
         let generations = Arc::clone(&self.shared.generations);
         // Under a shared lease a replica may follow a leader, and then
         // runs its leader's generations: its own file is passed here and
-        // applied at its first take, and its source writes while the
-        // replica leads, by the fence.
+        // applied under its first lead, and its source writes while the
+        // replica leads under the term its bytes were read under, by the
+        // fence.
         let deferred = self.config.election.lease.is_shared();
         if deferred {
             generations.under(Arc::clone(&self.shared.fence));

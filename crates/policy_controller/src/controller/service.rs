@@ -290,9 +290,9 @@ impl Shared {
         standing: watch::Sender<Standing>,
     ) -> io::Result<Running> {
         // At a take the door is its source's again, and a replica that
-        // deferred its start's document applies it at its first one, ahead
-        // of the fence: a session and a decision read the fence alone, and
-        // none is admitted before the document stands.
+        // deferred its start's document applies it at its first one, behind
+        // the stamp and under the fence: a take that never leads publishes
+        // nothing.
         let documents = Arc::clone(&self.generations);
         elector.at_take(move || documents.at_take());
         let election = election::start(elector, Arc::clone(&self.store), standing)?;
@@ -1284,11 +1284,11 @@ mod tests {
         assert!(looks.borrow().holder.is_empty(), "the lease is given up");
     }
 
-    /// A replica that deferred its start's document runs it once its fence
-    /// shows its first term: the take applies it ahead of the fence, so no
-    /// decision is admitted under a term with no generation.
+    /// A replica that deferred its start's document runs it a moment
+    /// behind its first term: the take applies it behind the stamp, under
+    /// the fence, so a take that never leads publishes nothing.
     #[tokio::test]
-    async fn a_deferred_document_stands_when_the_fence_shows_the_first_term() {
+    async fn a_deferred_document_stands_a_moment_behind_the_first_term() {
         let settings = ElectionSettings {
             duration: Duration::from_millis(600),
             renew_period: Duration::from_millis(20),
@@ -1307,6 +1307,7 @@ mod tests {
             1,
         )
         .expect("the decider starts");
+        shared.generations.under(Arc::clone(&shared.fence));
         shared
             .generations
             .defer(LEAST_LOAD.into(), Format::Yaml)
@@ -1314,15 +1315,16 @@ mod tests {
         assert_eq!(shared.store.world().spec().generation(), 0);
 
         let mut running = shared.elect(elector, standing).expect("a thread");
-        let shown = async {
-            while shared.fence.leader_term(Instant::now()).is_none() {
+        let stands = async {
+            while shared.store.world().spec().generation() == 0 {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         };
-        tokio::time::timeout(Duration::from_secs(20), shown)
+        tokio::time::timeout(Duration::from_secs(20), stands)
             .await
-            .expect("the first take opens its fence within 20 s");
+            .expect("the first take applies the start's document within 20 s");
         assert_eq!(shared.store.world().spec().generation(), 1);
+        assert_eq!(shared.fence.term(), 1, "under its first term");
 
         running.stop();
         tokio::time::timeout(Duration::from_secs(20), running.ended())
