@@ -1195,19 +1195,20 @@ pub enum Refused {
 /// deciding thread. The door keeps a seat a file, and the seat follows
 /// who owns what the decision reads.
 ///
-/// A request whose profile holds no stage that keeps state a decider
-/// decides at its caller's seat: the one the thread took last, where no
-/// other thread holds it. A thread's first seat is its number among the
-/// threads that have called a door, so threads start at seats of their
-/// own. Where its seat is held the caller takes the next free one, and
-/// keeps that. Where every seat is held it waits at its own, behind the
-/// one decision that stands there. A host that lays as many files as it
-/// has threads that decide parks none of them.
+/// Under a generation that holds no stage keeping state a decider, a
+/// request decides at its caller's seat: the one the thread took last,
+/// where no other thread holds it. A thread's first seat is its number
+/// among the threads that have called a door, so threads start at seats
+/// of their own. Where its seat is held the caller takes the next free
+/// one, and keeps that. Where every seat is held it waits at its own,
+/// behind the one decision that stands there. A host that lays as many
+/// files as it has threads that decide parks none of them.
 ///
-/// A request whose profile holds such a stage, a plugin's, decides at its
-/// model's seat, by the rule the served controller keeps
-/// ([`Engine::keeps_a_decider`]): the stage's state has one writer a
-/// model, and such a model's requests decide one at a time.
+/// Under a generation that holds such a stage, a plugin's, every request
+/// decides at its model's seat, by the rule the served controller keeps
+/// ([`Engine::keeps_deciders`]). Every profile's stages hear every lease,
+/// so the stage's state has one writer a model and hears a model's
+/// leases whole, and a model's requests decide one at a time.
 ///
 /// At its seat a caller acts as that seat's decider ([`Decider::enter`])
 /// and works at its file for the one decision, so the lease is filed
@@ -1255,7 +1256,7 @@ pub struct Door {
     seats: Box<[Seat]>,
     /// Whether the generation the door last decided under holds a stage
     /// that keeps state a decider ([`Engine::keeps_deciders`]): where it
-    /// does, a caller asks ahead which seat its request decides at.
+    /// does, a caller sits at its request's model's seat.
     keeping: AtomicBool,
     /// What the decisions count, a part a decider.
     parts: Box<[Part]>,
@@ -1482,10 +1483,10 @@ impl Door {
         now: Instant,
     ) -> Result<Decided, Refused> {
         let term = self.term.load(Ordering::Relaxed);
-        // The seat follows who owns what the decision reads. Under a
-        // generation that holds a stage keeping state a decider, the
-        // caller asks ahead whether its request's profile holds one.
-        let at_models = self.keeping.load(Ordering::Relaxed) && self.keeps_a_decider(request);
+        // The seat follows who owns what the decision reads and what
+        // hears its lease: the generation's word as the door last read
+        // it, asked again under the decision's own load.
+        let at_models = self.keeping.load(Ordering::Relaxed);
         let outcome = self.at_a_seat(at_models, term, gateway, request, now);
         match &outcome {
             // An id at or past the term's mark: the door raises the term,
@@ -1504,8 +1505,8 @@ impl Door {
     /// thread's otherwise. The caller takes the seat, works at its file
     /// and loads the world, and the seat's question is asked under that
     /// load. Where the caller sat at its thread's seat and the generation
-    /// loaded holds a stage keeping state a decider for the request, it
-    /// leaves with nothing decided and sits at the model's seat. The
+    /// loaded holds a stage keeping state a decider, it leaves with
+    /// nothing decided and sits at its request's model's seat. The
     /// decision is made under the load its seat was asked under.
     fn at_a_seat(
         &self,
@@ -1530,7 +1531,7 @@ impl Door {
             // One load of the world, for the seat's question and the
             // decision.
             let world = store.loaded();
-            if self.sits(&world, at_models, request) {
+            if self.sits(&world, at_models) {
                 break (at, slot, acting, world);
             }
             drop(world);
@@ -1577,31 +1578,21 @@ impl Door {
         }
     }
 
-    /// Whether the caller sits where `request` decides under `world`'s
-    /// generation: at its model's seat where its profile holds a stage
+    /// Whether the caller sits where a request decides under `world`'s
+    /// generation: at its model's seat where the generation holds a stage
     /// that keeps state a decider, at any seat otherwise. The door keeps
-    /// what the generation says of such stages for the callers behind.
-    fn sits(&self, world: &World, at_models: bool, request: &Request<'_>) -> bool {
-        let engine = world.spec().engine();
-        let keeping = engine.keeps_deciders();
+    /// the generation's word for the callers behind. It is one read, and
+    /// it calls no stage.
+    fn sits(&self, world: &World, at_models: bool) -> bool {
+        let keeping = world.spec().engine().keeps_deciders();
         if keeping != self.keeping.load(Ordering::Relaxed) {
             self.keeping.store(keeping, Ordering::Relaxed);
         }
-        at_models || !engine.keeps_a_decider(request.facts.model, request.facts.phase)
+        at_models || !keeping
     }
 
-    /// Whether `request`'s profile holds a stage that keeps state a
-    /// decider, under the generation that stands: asked ahead of a seat.
-    #[cold]
-    fn keeps_a_decider(&self, request: &Request<'_>) -> bool {
-        let (model, phase) = (request.facts.model, request.facts.phase);
-        let keeps = |world: &World| world.spec().engine().keeps_a_decider(model, phase);
-        self.store.deciding(keeps)
-    }
-
-    /// Takes the seat of `model`'s decider and waits for it: such a
-    /// model's requests decide one at a time.
-    #[cold]
+    /// Takes the seat of `model`'s decider and waits for it: a model's
+    /// requests there decide one at a time.
     fn models(&self, model: &str) -> (usize, MutexGuard<'_, DeciderSlot>) {
         let at = decider_of(model, self.seats.len());
         (at, self.seats[at].0.lock())
@@ -1760,7 +1751,7 @@ pub(crate) mod tests {
         framework::{DecisionScope, Picker, TieBand},
         lease::{Lease, LeaseId, Lifecycle, Outcome, ReleaseReason, Side, TransportClass},
         sessions::SessionVerdict,
-        spec::{AppliedSpec, PolicySpec},
+        spec::{AppliedSpec, Needs, PolicySpec},
         store::{
             Ask, Dispatch, GatewayId, LeaseRecord, LeaseState, LeasesStore, MemoryStore, Picked,
             Said, SessionsStore, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
@@ -2826,13 +2817,14 @@ pub(crate) mod tests {
         }
     }
 
-    /// The seat follows who owns what a decision reads. A request whose
-    /// profile holds a stage that keeps state a decider decides at its
-    /// model's seat, wherever its caller's thread sits, from the first
-    /// decision under that generation on. Under a generation with no such
-    /// stage the thread decides at its own seat again.
+    /// The seat follows who owns what a decision reads and what hears its
+    /// lease. Under a generation that holds a stage keeping state a
+    /// decider a request decides at its model's seat, wherever its
+    /// caller's thread sits, from the first decision under that
+    /// generation on. Under a generation with no such stage the thread
+    /// decides at its own seat again.
     #[test]
-    fn a_request_whose_profile_keeps_state_a_decider_decides_at_its_models_seat() {
+    fn a_generation_that_keeps_state_a_decider_seats_each_request_at_its_model() {
         // A count of files under which the model's seat is not the first,
         // where the calling thread sits.
         let files = (2..=8).find(|&files| decider_of(MODEL, files) != 0);
@@ -2846,7 +2838,7 @@ pub(crate) mod tests {
         picking(&store, 2, "scoped", || Box::new(Scoped));
         // The first decision under the generation finds the stage where
         // it stands: the caller leaves its own seat with nothing decided
-        // and sits at the model's. The next asks ahead.
+        // and sits at the model's. The next reads the door's word.
         let kept = [b"r-2", b"r-3"].map(|id| leased(&door, id, 8).0);
         assert_eq!(kept.map(|lease| store.file_of(lease)), [home, home]);
         assert_eq!(SEAT.get(), 0, "the thread's seat is still its own");
@@ -2855,8 +2847,75 @@ pub(crate) mod tests {
         assert_eq!(report(&door, own, gone()), 2, "applied at once");
         let plain = store.apply(preset("random", 3));
         plain.expect("a later generation");
-        let (again, _) = leased(&door, b"r-4", 9);
+        // The first decision under it sits by the door's word of the
+        // generation before, and the next by its own.
+        let _ = leased(&door, b"r-4", 9);
+        let (again, _) = leased(&door, b"r-5", 9);
         assert_eq!(store.file_of(again), 0, "the thread's seat again");
         assert_eq!(door.faults(), 0);
+    }
+
+    /// A picker that holds a decision's scope and panics where it is
+    /// asked what it needs, once armed.
+    #[derive(Debug)]
+    struct Needy(Arc<AtomicBool>);
+
+    impl Lifecycle for Needy {}
+
+    impl DecisionScope for Needy {
+        fn open(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &PoolFacts<'_>) {}
+
+        fn close(&self) {}
+    }
+
+    impl Picker for Needy {
+        fn name(&self) -> &'static str {
+            "needy"
+        }
+
+        fn needs(&self) -> Needs {
+            assert!(!self.0.load(Ordering::Relaxed), "the case's own panic");
+            Needs::default()
+        }
+
+        fn pick(
+            &self,
+            facts: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            scores: &[f32],
+            band: TieBand,
+            out: &mut Targets,
+        ) {
+            Random.pick(facts, candidates, kept, scores, band, out);
+        }
+
+        fn scope(&self) -> Option<&dyn DecisionScope> {
+            Some(self)
+        }
+    }
+
+    /// A stage is asked what it needs at each decision, and that call can
+    /// panic as any other. The seat's question calls no stage, so the
+    /// panic is the decision's own: the request is refused as faulted,
+    /// nothing unwinds into the host, and no thread is left at work at
+    /// the seat's file.
+    #[test]
+    fn a_stage_that_panics_at_its_needs_costs_its_request_alone() {
+        let store = fleet(1);
+        let door = Door::new(Arc::clone(&store));
+        let (before, _) = leased(&door, b"r-0", 7);
+        let armed = Arc::new(AtomicBool::new(false));
+        let stage = Arc::clone(&armed);
+        picking(&store, 2, "needy", move || {
+            Box::new(Needy(Arc::clone(&stage)))
+        });
+        // The door has read the generation's word by this decision.
+        let _ = leased(&door, b"r-1", 7);
+        armed.store(true, Ordering::Relaxed);
+        let refused = door.decide(GATEWAY, &request(b"r-2", 7), Instant::now());
+        assert_eq!(refused.err(), Some(Refused::Faulted));
+        assert_eq!(door.faults(), 1);
+        assert_eq!(report(&door, before, gone()), 1, "no thread is at work");
     }
 }

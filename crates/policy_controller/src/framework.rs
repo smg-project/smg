@@ -2257,7 +2257,7 @@ pub struct Engine {
     /// decision does.
     orders: Vec<Order>,
     /// Whether any profile holds a stage that keeps state a decider
-    /// ([`Self::keeps_a_decider`]), said once at the build.
+    /// ([`Self::keeps_deciders`]), said once at the build.
     keeping: bool,
 }
 
@@ -3196,19 +3196,19 @@ impl Engine {
     }
 
     /// Whether any profile of this generation holds a stage that keeps
-    /// state a decider: one read, so under a generation with none a host
-    /// looks nothing up ([`Self::keeps_a_decider`]).
+    /// state a decider ([`crate::decider`]): a plugin's kept instance is
+    /// its decider's, and every profile's stages hear every lease. Under
+    /// such a generation a host that seats its callers by thread decides
+    /// each request at its model's decider, so that state has one writer
+    /// a model and hears a model's leases whole. It is one read: under a
+    /// generation with none a host looks nothing up.
+    ///
+    /// The fact is read from the mark of a stage that opens a decision's
+    /// scope. A stage kind that keeps state a decider and opens none
+    /// joins this fact: without it such a host would split that state by
+    /// thread, with no error.
     pub fn keeps_deciders(&self) -> bool {
         self.keeping
-    }
-
-    /// Whether a decision of `phase` for `model` runs a stage that keeps
-    /// state a decider ([`crate::decider`]): its profile shows its rows to
-    /// a plugin, whose kept instance is its decider's. A host that seats
-    /// its callers by thread decides such a request at its model's
-    /// decider, so that state has one writer a model.
-    pub fn keeps_a_decider(&self, model: &str, phase: Phase) -> bool {
-        self.keeping && self.reads_for(model, phase).1
     }
 
     /// The sample of the profile that decides a request of `phase` for
