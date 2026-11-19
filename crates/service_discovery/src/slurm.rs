@@ -97,12 +97,8 @@ pub struct SlurmProviderConfig {
 }
 
 impl SlurmProviderConfig {
-    /// The host's validation has checked the mapping against the routing
-    /// mode; a mode with no worker pools to fill is still refused here. So
-    /// is a job name under two roles: the map holds one role a name, and
-    /// the later role would replace the earlier with no word.
-    /// `routing` is the roles the routing mode accepts: `roles` here names
-    /// the provider's own map of job names.
+    /// Resolve Slurm settings that have passed [`crate::DiscoveryConfig::validate`].
+    /// `routing` supplies the required worker roles the host accepts.
     pub fn new(
         config: &SlurmDiscoveryConfig,
         routing: Option<Roles>,
@@ -114,25 +110,15 @@ impl SlurmProviderConfig {
                     .to_string(),
             });
         }
-        let mut roles = BTreeMap::new();
-        for (names, worker_type) in [
+        let roles = [
             (&config.job_names, WorkerType::Regular),
             (&config.encode_job_names, WorkerType::Encode),
             (&config.prefill_job_names, WorkerType::Prefill),
             (&config.decode_job_names, WorkerType::Decode),
-        ] {
-            for name in names {
-                if let Some(other) = roles.insert(name.clone(), worker_type) {
-                    if other != worker_type {
-                        return Err(DiscoveryConfigError::ValidationFailed {
-                            reason: format!(
-                                "Slurm job name '{name}' maps to both {other} and {worker_type} workers"
-                            ),
-                        });
-                    }
-                }
-            }
-        }
+        ]
+        .into_iter()
+        .flat_map(|(names, worker_type)| names.iter().map(move |name| (name.clone(), worker_type)))
+        .collect();
         Ok(Self {
             roles,
             port: config.port,

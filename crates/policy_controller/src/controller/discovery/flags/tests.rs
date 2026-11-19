@@ -150,6 +150,176 @@ fn a_provider_is_refused_without_what_it_requires() -> Result<(), Box<dyn Error>
 }
 
 #[test]
+fn a_setting_the_gateway_refuses_is_refused_here_by_its_flag() -> Result<(), Box<dyn Error>> {
+    for (args, expected_flag, expected_reason) in [
+        (
+            &["--discovery-provider", "kubernetes"][..],
+            "--discovery-provider",
+            "Validation failed: Regular mode with service discovery requires a non-empty selector",
+        ),
+        (
+            &["--service-discovery", "--selector", "app=worker", "--service-discovery-port", "0"],
+            "--service-discovery-port",
+            "Invalid value for field 'discovery.port': 0 - Port must be > 0",
+        ),
+        (
+            &["--discovery-provider", "slurm", "--slurm-job-name", "worker", "--slurm-port", "0"],
+            "--slurm-port",
+            "Invalid value for field 'discovery.port': 0 - Port must be > 0",
+        ),
+        (
+            &["--discovery-provider", "slurm", "--slurm-job-name", "worker", "--slurm-port", "8000", "--slurm-user", "one,two"],
+            "--slurm-user",
+            "Invalid value for field 'discovery.user': one,two - Must be non-empty and contain no comma",
+        ),
+        (
+            &["--discovery-provider", "slurm", "--slurm-prefill-job-name", "shared", "--slurm-decode-job-name", "shared", "--slurm-port", "8000"],
+            "--discovery-provider",
+            "Validation failed: Slurm job name 'shared' maps to both prefill and decode workers",
+        ),
+        (
+            &["--discovery-provider", "consul", "--consul-service", "workers", "--consul-address", ""],
+            "--consul-address",
+            "Invalid value for field 'discovery.address':  - Must not be empty when given",
+        ),
+    ] {
+        let result = parse(args)?.configured(|_| None);
+        assert!(
+            matches!(&result, Err(ConfigError::DiscoveryFlag { flag, reason })
+                if *flag == expected_flag && reason == expected_reason),
+            "{args:?}: {result:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn the_valid_settings_of_every_provider_still_pass() -> Result<(), Box<dyn Error>> {
+    for args in [
+        &[
+            "--discovery-provider",
+            "kubernetes",
+            "--encode-selector",
+            "role=e",
+            "--prefill-selector",
+            "role=p",
+            "--decode-selector",
+            "role=d",
+        ][..],
+        &[
+            "--discovery-provider",
+            "file",
+            "--discovery-file",
+            "workers.json",
+        ],
+        &[
+            "--discovery-provider",
+            "slurm",
+            "--slurm-decode-job-name",
+            "decode",
+            "--slurm-port",
+            "8000",
+        ],
+        &[
+            "--discovery-provider",
+            "consul",
+            "--consul-service",
+            "workers",
+            "--consul-address",
+            "http://127.0.0.1:8500",
+        ],
+    ] {
+        assert!(parse(args)?.configured(|_| None)?.is_some(), "{args:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn a_refused_field_uses_the_flag_that_sets_it_for_the_selected_provider(
+) -> Result<(), Box<dyn Error>> {
+    let cases = [
+        (
+            &["--service-discovery", "--selector", "app=worker"][..],
+            &[
+                ("discovery.port", "--service-discovery-port"),
+                (
+                    "discovery.kv_connector_annotation",
+                    "--kv-connector-annotation",
+                ),
+                (
+                    "discovery.kv_engine_id_annotation",
+                    "--kv-engine-id-annotation",
+                ),
+                ("discovery.model_id_source", "--model-id-from"),
+            ][..],
+        ),
+        (
+            &[
+                "--discovery-provider",
+                "file",
+                "--discovery-file",
+                "workers.json",
+            ],
+            &[("discovery.path", "--discovery-file")],
+        ),
+        (
+            &[
+                "--discovery-provider",
+                "slurm",
+                "--slurm-job-name",
+                "worker",
+                "--slurm-port",
+                "8000",
+            ],
+            &[
+                ("discovery.port", "--slurm-port"),
+                ("discovery.bootstrap_port", "--slurm-bootstrap-port"),
+                ("discovery.job_names", "--slurm-job-name"),
+                ("discovery.encode_job_names", "--slurm-encode-job-name"),
+                ("discovery.prefill_job_names", "--slurm-prefill-job-name"),
+                ("discovery.decode_job_names", "--slurm-decode-job-name"),
+                ("discovery.user", "--slurm-user"),
+                ("discovery.account", "--slurm-account"),
+                ("discovery.partition", "--slurm-partition"),
+            ],
+        ),
+        (
+            &[
+                "--discovery-provider",
+                "consul",
+                "--consul-service",
+                "workers",
+            ],
+            &[
+                ("discovery.service", "--consul-service"),
+                ("discovery.address", "--consul-address"),
+                ("discovery.datacenter", "--consul-datacenter"),
+                ("CONSUL_HTTP_SSL_VERIFY", "--discovery-provider"),
+            ],
+        ),
+    ];
+    for (args, fields) in cases {
+        let config = parse(args)?.settings()?.expect("selected provider");
+        for &(field, flag) in fields.iter().chain(&[(
+            "discovery.check_interval_secs",
+            "--discovery-check-interval-secs",
+        )]) {
+            let error = DiscoveryConfigError::InvalidValue {
+                field: field.to_owned(),
+                value: "bad-value".to_owned(),
+                reason: "This value was refused".to_owned(),
+            };
+            let displayed = error.to_string();
+            assert_eq!(
+                refuse_settings(&config, error).to_string(),
+                format!("{flag}: {displayed}")
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn flags_without_their_providers_are_refused() -> Result<(), Box<dyn Error>> {
     for args in [
         ["--discovery-file", "workers.json"],
@@ -179,20 +349,27 @@ fn flags_without_their_providers_are_refused() -> Result<(), Box<dyn Error>> {
             .settings()
             .is_err()
     );
-    assert!(parse(&[
+    let error = parse(&[
         "--service-discovery",
         "--discovery-check-interval-secs",
-        "0"
+        "0",
     ])?
     .settings()
-    .is_err());
+    .expect_err("a zero interval is refused before the provider's settings");
+    assert!(matches!(
+        error,
+        ConfigError::DiscoveryFlag {
+            flag: "--discovery-check-interval-secs",
+            ..
+        }
+    ));
     Ok(())
 }
 
 #[test]
 fn the_check_interval_reaches_every_provider() -> Result<(), Box<dyn Error>> {
     for args in [
-        &["--service-discovery"][..],
+        &["--service-discovery", "--selector", "app=worker"][..],
         &[
             "--discovery-provider",
             "file",
@@ -202,10 +379,6 @@ fn the_check_interval_reaches_every_provider() -> Result<(), Box<dyn Error>> {
         &[
             "--discovery-provider",
             "slurm",
-            "--slurm-job-name",
-            "worker",
-            "--slurm-job-name",
-            "another",
             "--slurm-encode-job-name",
             "encode",
             "--slurm-prefill-job-name",
@@ -242,7 +415,7 @@ fn the_check_interval_reaches_every_provider() -> Result<(), Box<dyn Error>> {
                 config.check_interval_secs
             }
             DiscoveryConfig::Slurm(config) => {
-                assert_eq!(config.job_names, ["worker", "another"]);
+                assert!(config.job_names.is_empty());
                 assert_eq!(config.encode_job_names, ["encode"]);
                 assert_eq!(config.prefill_job_names, ["prefill"]);
                 assert_eq!(config.decode_job_names, ["decode"]);
@@ -262,6 +435,23 @@ fn the_check_interval_reaches_every_provider() -> Result<(), Box<dyn Error>> {
         };
         assert_eq!(interval, 13, "{args:?}");
     }
+    let flags = parse(&[
+        "--discovery-provider",
+        "slurm",
+        "--slurm-port",
+        "8000",
+        "--slurm-job-name",
+        "worker",
+        "--slurm-job-name",
+        "another",
+        "--discovery-check-interval-secs",
+        "13",
+    ])?;
+    let Some(DiscoveryConfig::Slurm(config)) = flags.settings()? else {
+        panic!("expected Slurm settings");
+    };
+    assert_eq!(config.job_names, ["worker", "another"]);
+    assert_eq!(config.check_interval_secs, 13);
     Ok(())
 }
 
@@ -312,7 +502,8 @@ fn the_roles_follow_the_selectors_and_job_names_given() -> Result<(), Box<dyn Er
 
 #[test]
 fn the_defaults_are_the_gateways() -> Result<(), Box<dyn Error>> {
-    let Some(DiscoveryConfig::Kubernetes(config)) = parse(&["--service-discovery"])?.settings()?
+    let Some(DiscoveryConfig::Kubernetes(config)) =
+        parse(&["--service-discovery", "--selector", "app=worker"])?.settings()?
     else {
         panic!("expected Kubernetes settings");
     };

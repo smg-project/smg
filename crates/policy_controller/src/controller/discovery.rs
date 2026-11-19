@@ -20,7 +20,7 @@ use smg_service_discovery::{
 use tokio::{sync::watch, task::JoinHandle, time};
 use tracing::error;
 
-use self::flags::Credential;
+use self::flags::{refuse_settings, Credential};
 pub(super) use self::{flags::DiscoveryFlags, host::Host};
 use super::{election::Standing, readiness::reached, ConfigError};
 use crate::elector::Fence;
@@ -45,13 +45,8 @@ impl DiscoverySettings {
     ) -> Result<Self, ConfigError> {
         // Providers that need roles take regular workers by default.
         let roles = roles.unwrap_or(Roles::Regular);
-        let runtime =
-            RuntimeDiscoveryConfig::from_config(&config, Some(roles)).map_err(|error| {
-                ConfigError::DiscoveryFlag {
-                    flag: "--discovery-provider",
-                    reason: error.to_string(),
-                }
-            })?;
+        let runtime = RuntimeDiscoveryConfig::from_config(&config, Some(roles))
+            .map_err(|error| refuse_settings(&config, error))?;
         Ok(Self(Box::new(Settings {
             config,
             roles,
