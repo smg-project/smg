@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import math
 import multiprocessing
 import os
 import signal
@@ -1188,6 +1189,14 @@ def test_drain_finishes_when_requests_reach_zero(counts):
     assert not counts
 
 
+def _elapsed(loop, started):
+    """Seconds since ``started`` on the loop's clock, plus one float step of
+    the clock: its readings are rounded floats, so a wait that ends on the
+    tick of a millisecond clock (uvloop's) reads up to a step short."""
+    now = loop.time()
+    return now - started + math.ulp(now)
+
+
 @pytest.mark.parametrize("count", [None, 1])
 def test_drain_deadline_bounds_active_requests_and_older_bindings(count):
     """Pending work and old bindings retain the bounded grace period."""
@@ -1200,7 +1209,7 @@ def test_drain_deadline_bounds_active_requests_and_older_bindings(count):
         """Measure that pending requests receive their full grace period."""
         start = asyncio.get_running_loop().time()
         assert await rust_lifecycle.drain_server(server, engine, 0.01, 0.002)
-        assert asyncio.get_running_loop().time() - start >= 0.01
+        assert _elapsed(asyncio.get_running_loop(), start) >= 0.01
 
     asyncio.run(run())
 

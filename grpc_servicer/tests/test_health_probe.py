@@ -56,17 +56,17 @@ def test_the_threshold_is_the_report_s_own():
 def _awaited(scenario, *, timeout=5.0, step=0.01):
     """``await_probe`` over ``scenario(started, probe)``, which sets the
     probe's state and returns the time of the scheduler's last push; with the
-    wall time the wait took and the probe as the wait left it."""
+    wall time from ``started`` to the wait's end, as ``await_probe`` counts
+    it, and the probe as the wait left it."""
 
     async def run():
         started = time.time()
         probe = asyncio.get_running_loop().create_future()
         pushed_at = scenario(started, probe)
-        t0 = time.monotonic()
         verdict = await await_probe(
             probe, started=started, last_receive=lambda: pushed_at, timeout=timeout, step=step
         )
-        return verdict, time.monotonic() - t0, probe
+        return verdict, time.time() - started, probe
 
     return asyncio.run(run())
 

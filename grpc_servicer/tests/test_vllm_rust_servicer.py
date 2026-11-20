@@ -27,6 +27,7 @@ import pytest
 from smg_grpc_servicer import constrained_decoding as cd
 from smg_grpc_servicer import rust_lifecycle
 from smg_grpc_servicer.vllm import rust
+from test_rust_lifecycle import _elapsed
 
 
 def _install(monkeypatch, name: str, **attrs) -> types.ModuleType:
@@ -1645,7 +1646,7 @@ def _drain_time(server, engine, drain_secs, linger_secs=0.0):
         loop = asyncio.get_running_loop()
         started = loop.time()
         await rust_lifecycle.drain_server(server, engine, drain_secs, 0.01, linger_secs=linger_secs)
-        return loop.time() - started
+        return _elapsed(loop, started)
 
     return asyncio.run(run())
 
@@ -1681,7 +1682,7 @@ def test_the_linger_ends_when_the_engine_exits(caplog):
         failed = not await rust_lifecycle.drain_server(
             CountingServer([0]), engine, 30.0, 0.01, linger_secs=30.0
         )
-        return failed, loop.time() - started
+        return failed, _elapsed(loop, started)
 
     with caplog.at_level(logging.WARNING, logger=rust_lifecycle.logger.name):
         failed, elapsed = asyncio.run(run())
@@ -1826,9 +1827,12 @@ def test_supervise_passes_its_linger_to_the_drain():
         )
         await asyncio.sleep(0.02)
         stop.set()
-        started = time.monotonic()
+        # On the loop's clock, which keeps the linger: a millisecond loop clock
+        # ends it up to a tick early by ``time.monotonic()``.
+        loop = asyncio.get_running_loop()
+        started = loop.time()
         await task
-        return time.monotonic() - started
+        return _elapsed(loop, started)
 
     assert 0.3 <= asyncio.run(run()) < 1.0
 
