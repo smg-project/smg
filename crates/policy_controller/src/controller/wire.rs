@@ -429,6 +429,10 @@ impl Asked for Checked {
         Self::block_hashes(self)
     }
 
+    fn cache_namespace(&self) -> (u64, HashKind) {
+        (self.facts.namespace_seed, self.hash_kind)
+    }
+
     fn seed(&self) -> u64 {
         Self::seed(self)
     }

@@ -44,6 +44,89 @@ mod repeated_models;
 mod unnamed_rank;
 mod written;
 
+mod sent_prefixes {
+    use super::*;
+    use crate::{
+        door::tests::sent_prefixes::{applied, merged},
+        spec::{IndexKind, IndexSpec},
+        store::{index::Predicted, KvEventSink},
+    };
+
+    type Case = Result<(), Box<dyn std::error::Error>>;
+
+    fn record(store: &MemoryStore) -> Option<Arc<Predicted>> {
+        store.deciding(|world| world.standing(MODEL, Role::Single)?.predicted())
+    }
+
+    #[test]
+    fn a_generation_that_reads_no_sent_prefix_drops_the_record() -> Case {
+        let store = MemoryStore::new();
+        member(&store, "a");
+        store.apply(applied(&merged(1)?)?)?;
+        assert_eq!(record(&store).map(|record| record.bound()), Some(4_194_304));
+        let mut idle = PolicySpec::preset("least_load")?;
+        idle.generation = 2;
+        store.apply(applied(&idle)?)?;
+        assert!(record(&store).is_none());
+        store.apply(applied(&merged(3)?)?)?;
+        assert!(record(&store).is_some());
+        let mut hash = merged(4)?;
+        hash.view.boundaries = vec![16];
+        hash.index.insert(
+            MODEL.into(),
+            IndexSpec {
+                kind: IndexKind::Hash,
+                ..IndexSpec::default()
+            },
+        );
+        hash.plans.pd_pair.pairing = Pairing::Off;
+        store.apply(applied(&hash)?)?;
+        assert!(record(&store).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn a_changed_bound_applies_in_place() -> Case {
+        let store = MemoryStore::new();
+        member(&store, "a");
+        let mut document = merged(1)?;
+        document.view.block_size = Some(8);
+        document.index.insert(
+            "*".into(),
+            IndexSpec {
+                max_size: 1024,
+                ..IndexSpec::default()
+            },
+        );
+        store.apply(applied(&document)?)?;
+        let first = record(&store).ok_or("the model's record")?;
+        assert_eq!(first.bound(), 128, "the generation's block size");
+
+        store.set_block_size(MODEL, 32);
+        // A refresh carries the classes, but the model's block size moved.
+        member(&store, "a");
+        assert_eq!(first.bound(), 32, "the model's block size of record");
+
+        document.generation = 2;
+        document.index.insert(
+            MODEL.into(),
+            IndexSpec {
+                max_size: 16,
+                ..IndexSpec::default()
+            },
+        );
+        store.apply(applied(&document)?)?;
+        let next = record(&store).ok_or("the model's record")?;
+        assert!(Arc::ptr_eq(&first, &next));
+        assert_eq!(
+            next.bound(),
+            1,
+            "the exact key wins and the bound stays positive"
+        );
+        Ok(())
+    }
+}
+
 const MODEL: &str = "m";
 const ASKER: GatewayId = GatewayId(1);
 

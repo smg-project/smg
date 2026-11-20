@@ -37,6 +37,11 @@
 //! where its id was not taken since the tables the decision holds were
 //! known whole.
 //!
+//! A pool whose profile reads sent prefixes can also hold its model's
+//! record of sends. Naming adds holders without lanes to the room left
+//! under the index's cap. Issuing a lease writes the token blocks sent to
+//! its first target when that target has no lane.
+//!
 //! Locks: the table's, taken under the workers lock by a membership write
 //! and alone by a batch, each for as long as it takes to find or to change
 //! an entry; then the lane's own, so two rows apply at once. No product
@@ -48,25 +53,26 @@
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{fence, AtomicU64, Ordering},
-        Arc,
+        atomic::{fence, AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        Arc, Weak,
     },
 };
 
 use kv_index::{ApplyError, ChainBlockMap, ChainIndex};
 pub use kv_index::{ContentHash, SequenceHash, StoredBlock};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock, RwLockWriteGuard};
 use rustc_hash::FxHashMap;
 
 use crate::{
     affinity::{WarmRule, Warming},
+    predictor::Predictor,
     store::{
         kv_events::{Admission, BatchFacts, BatchOutcome, KvCursor, RankCursor, ResyncReason},
         workers::WorkerRow,
         world::Naming,
         GatewayId,
     },
-    view::{Candidate, NamedAffinity, NamedHolder, Role, WorkerId},
+    view::{Candidate, HashKind, NamedAffinity, NamedHolder, Role, WorkerId},
     Draw,
 };
 
@@ -282,6 +288,32 @@ pub struct Named {
     kept: Vec<(u32, u32)>,
     picked: Vec<u32>,
     live: Vec<(u32, u64)>,
+    // One key per block read and one id per worker at the deepest block.
+    // Both buffers keep their room for the next naming.
+    keys: Vec<u64>,
+    deepest: Vec<WorkerId>,
+    sent: RecordRead,
+}
+
+/// What a naming read of the record its issue may write.
+#[derive(Debug)]
+struct RecordRead {
+    /// The pool's place in the world. `NONE` if no record was read.
+    pool: u32,
+    tick: u16,
+    whole: bool,
+    fresh: bool,
+}
+
+impl Default for RecordRead {
+    fn default() -> Self {
+        Self {
+            pool: NONE,
+            tick: 0,
+            whole: false,
+            fresh: false,
+        }
+    }
 }
 
 impl Named {
@@ -301,6 +333,94 @@ impl Named {
         self.holders.clear();
         self.warming.clear();
         self.thin = false;
+        self.clear_sent();
+    }
+
+    /// The next issue has no record to write. The buffers stay in place.
+    #[inline]
+    pub(crate) fn clear_sent(&mut self) {
+        self.sent.pool = NONE;
+    }
+
+    #[inline]
+    pub(super) fn sent_pool(&self) -> Option<usize> {
+        (self.sent.pool != NONE).then_some(self.sent.pool as usize)
+    }
+}
+
+/// One model's record of the prefixes sent to its workers that publish no
+/// cache events, shared by every deciding thread.
+///
+/// A membership write takes the workers lock, then the table's lock, then
+/// a record's guard when it needs all three. A decision takes a record's
+/// guard alone.
+pub(super) struct Predicted {
+    record: RwLock<Predictor>,
+    /// The record's bound as the last pool set it: a pool's build takes
+    /// the record's guard, which the deciders hold, only where it moved.
+    bound: AtomicUsize,
+    /// Work waits for the sweep: a worker left, or the bound came down.
+    sweeping: AtomicBool,
+    #[cfg(test)]
+    slices: AtomicUsize,
+}
+
+/// What a pool's generation asks of its model's record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Predict {
+    /// The record's bound, in placements.
+    pub(super) bound: usize,
+    /// Whether the record's holders are named ahead of the index's: where
+    /// a stage of the pool's profile reads sent prefixes and no cache
+    /// events, so the index's holders must not take its room.
+    pub(super) ahead: bool,
+}
+
+impl Predicted {
+    /// The write and sweep each give the guard back after bounded work.
+    const SLICE: usize = 16;
+    const SWEEP: usize = 64;
+
+    fn sent(&self, named: &Named, target: WorkerId, allowed: &AtomicBool) {
+        if named.sent.whole && named.sent.fresh && named.deepest.contains(&target) {
+            // A fresh hit need not wait for a writer to sweep.
+            if self.sweeping.load(Ordering::Relaxed) {
+                if let Some(mut record) = self.record.try_write() {
+                    self.sweep(&mut record);
+                }
+            }
+            return;
+        }
+        let keys = &named.keys;
+        let ends = (Self::SLICE..keys.len())
+            .step_by(Self::SLICE)
+            .chain(std::iter::once(keys.len()));
+        for end in ends {
+            let mut record = self.record.write();
+            // A worker may leave between slices. Its removal clears this
+            // word before forgetting under the same guard.
+            if !allowed.load(Ordering::Relaxed) {
+                return;
+            }
+            record.sent(&keys[..end], target, named.sent.tick);
+            #[cfg(test)]
+            self.slices.fetch_add(1, Ordering::Relaxed);
+            if end == keys.len() {
+                self.sweep(&mut record);
+            }
+            RwLockWriteGuard::unlock_fair(record);
+        }
+    }
+
+    fn sweep(&self, record: &mut Predictor) {
+        if self.sweeping.load(Ordering::Relaxed) && record.sweep(Self::SWEEP) < Self::SWEEP {
+            self.sweeping.store(false, Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn bound(&self) -> usize {
+        self.record.read().bound()
     }
 }
 
@@ -312,6 +432,12 @@ struct Tables {
     role: Option<Role>,
     /// The model's index; `None` while no row of the model is indexed.
     index: Option<Arc<Index>>,
+    /// The model's record of sent prefixes, where a row can read it.
+    predicted: Option<Arc<Predicted>>,
+    /// Whether an issue over this pool may still record for each row.
+    /// The store clears the word when the worker leaves or takes a lane.
+    /// Empty where the pool has no record.
+    allowed: Box<[Arc<AtomicBool>]>,
     /// Index id -> row of the pool; [`NONE`] for an id no row of it holds.
     row_of: Box<[u32]>,
     /// Row -> index id; [`NONE`] for a row the index does not hold.
@@ -537,6 +663,8 @@ pub(super) struct PoolIndex {
     tables: Arc<Tables>,
     /// The ruling the warming rows were read under.
     rule: Option<WarmRule>,
+    /// The generation's settings for the sent-prefix record.
+    predict: Option<Predict>,
     /// The pool's warming rows, ascending, each with the instant its naming
     /// ends on the store's clock, in microseconds.
     warming: Box<[(u32, u64)]>,
@@ -590,6 +718,10 @@ impl PoolIndex {
         self.rule
     }
 
+    pub(super) fn predict(&self) -> Option<Predict> {
+        self.predict
+    }
+
     /// Whether the standing is of the pool of `rows` serving `model`: a
     /// pool is its model's in one role.
     pub(super) fn is_of(&self, model: &str, rows: &[Candidate]) -> bool {
@@ -606,6 +738,10 @@ impl PoolIndex {
         let tables = &*self.tables;
         rows.len() == tables.id_of.len()
             && *admitted == *tables.admitted
+            && tables
+                .allowed
+                .iter()
+                .all(|allowed| allowed.load(Ordering::Relaxed))
             && rows.iter().zip(tables.id_of.iter()).all(|(row, &id)| {
                 let (word, bit) = ((id / 64) as usize, 1u64 << (id % 64));
                 id == NONE
@@ -627,13 +763,22 @@ impl PoolIndex {
     ) -> Option<Self> {
         let ruled = Self::warming(&self.tables, rule, at, reading);
         let stands = rule == self.rule && ruled == self.ruled && *reading.rows == *self.warming;
-        (!stands).then(|| Self::read(Arc::clone(&self.tables), rule, ruled, &reading.rows))
+        (!stands).then(|| {
+            Self::read(
+                Arc::clone(&self.tables),
+                rule,
+                self.predict,
+                ruled,
+                &reading.rows,
+            )
+        })
     }
 
     /// A pool's standing from a reading of its warming rows.
     fn read(
         tables: Arc<Tables>,
         rule: Option<WarmRule>,
+        predict: Option<Predict>,
         ruled: Warming,
         rows: &[(u32, u64)],
     ) -> Self {
@@ -641,6 +786,7 @@ impl PoolIndex {
         Self {
             tables,
             rule,
+            predict,
             warming: rows.into(),
             ruled,
             first_end: ends.min().unwrap_or(u64::MAX),
@@ -687,27 +833,30 @@ impl PoolIndex {
     pub(super) fn name(
         &self,
         naming: &Naming<'_>,
-        pool: &[Candidate],
+        pool: (u32, &[Candidate]),
         locals: &[(u32, GatewayId)],
         view: &[Candidate],
+        hash_kind: HashKind,
         named: &mut Named,
     ) {
-        self.name_in::<false>(naming, pool, locals, view, named);
+        self.name_in::<false>(naming, pool, locals, view, hash_kind, named);
     }
 
     /// [`Self::name`] for a view its caller cut by more than its gateway's
     /// wires since the build, as a request's hard demands cut it: the
     /// holders' lookup is kept within the view's own rows, so a row the
-    /// cut took is named by nobody and takes no place of the cap.
+    /// cut took is named by nobody and takes no place of the cap. The
+    /// record names a row where the view holds it, under either naming.
     pub(super) fn name_cut(
         &self,
         naming: &Naming<'_>,
-        pool: &[Candidate],
+        pool: (u32, &[Candidate]),
         locals: &[(u32, GatewayId)],
         view: &[Candidate],
+        hash_kind: HashKind,
         named: &mut Named,
     ) {
-        self.name_in::<true>(naming, pool, locals, view, named);
+        self.name_in::<true>(naming, pool, locals, view, hash_kind, named);
     }
 
     /// The one naming, built once for each of its two callers. `CUT` says
@@ -716,12 +865,12 @@ impl PoolIndex {
     fn name_in<const CUT: bool>(
         &self,
         naming: &Naming<'_>,
-        pool: &[Candidate],
+        (pool_at, pool): (u32, &[Candidate]),
         locals: &[(u32, GatewayId)],
         view: &[Candidate],
+        hash_kind: HashKind,
         named: &mut Named,
     ) {
-        named.clear();
         named.thin = self.ruled.thin;
         let tables = &*self.tables;
         let whole = view.len() == pool.len();
@@ -740,8 +889,44 @@ impl PoolIndex {
             let at = view.binary_search_by_key(&id, |candidate| candidate.id);
             at.ok().map(|at| at as u32)
         };
+        let mut draw = Draw::new(naming.seed ^ HOLDERS_STREAM);
+        let hashed = !naming.block_hashes.is_empty();
+        let record = tables.predicted.as_ref();
+        let record = record.filter(|_| hashed && hash_kind == HashKind::Token);
+        // The record's holders, in the room the cap leaves where this runs.
+        let name_record = |named: &mut Named, draw: &mut Draw| {
+            let Some(predicted) = record else {
+                return;
+            };
+            // The row of the view a recorded worker stands at, where the
+            // record may name it: a row of the pool with no lane that is
+            // not another gateway's host-local row.
+            let row_of = |id: WorkerId| -> Option<u32> {
+                let row = pool.binary_search_by_key(&id, |row| row.id).ok()?;
+                if tables.id_of[row] != NONE {
+                    return None;
+                }
+                let row = row as u32;
+                let local = locals.binary_search_by_key(&row, |&(row, _)| row);
+                if local.is_ok_and(|at| locals[at].1 != naming.gateway) {
+                    return None;
+                }
+                place(row)
+            };
+            let usable = |id| row_of(id).is_some();
+            let blocks = predicted.name(naming, pool_at, &usable, named);
+            name_predicted(row_of, (blocks, cap), named, draw);
+        };
+        // A profile whose prefix stage reads the record alone takes the
+        // record's holders first: that stage reads no overlap, so the
+        // index's holders must not take its room under the cap.
+        let ahead = self.predict.is_some_and(|predict| predict.ahead);
+        if ahead {
+            name_record(named, &mut draw);
+        }
+        let room = cap.saturating_sub(named.holders.len());
         let index = tables.index.as_ref();
-        if let Some(index) = index.filter(|_| !naming.block_hashes.is_empty()) {
+        if let Some(index) = index.filter(|_| hashed && room > 0) {
             let mut mask = [0u64; MASK_WORDS];
             let within = if CUT {
                 tables.within_view(pool, view, &mut mask)
@@ -755,12 +940,11 @@ impl PoolIndex {
             // The naming's own lookup, in its own frame: one instantiation
             // with a second caller goes out of line for every decision
             // ([`Index::deepest_again`]).
-            let mut draw = Draw::new(naming.seed ^ HOLDERS_STREAM);
             index.chain.deepest_into(
                 naming.block_hashes,
                 |hash| *hash,
                 within,
-                cap,
+                room,
                 |under| below(&mut draw, under),
                 &mut named.kept,
             );
@@ -770,7 +954,7 @@ impl PoolIndex {
             // question of what was taken since after it ([`Index`]).
             fence(Ordering::Acquire);
             if index.taken() != whole_at {
-                tables.look_again(naming, within, cap, whole_at, &mut named.kept);
+                tables.look_again(naming, within, room, whole_at, &mut named.kept);
             }
             for &(id, blocks) in &named.kept {
                 let row = tables.row_of.get(id as usize).copied().unwrap_or(NONE);
@@ -788,8 +972,11 @@ impl PoolIndex {
                     });
                 }
             }
-            named.holders.sort_unstable_by_key(|holder| holder.row);
         }
+        if !ahead {
+            name_record(named, &mut draw);
+        }
+        named.holders.sort_unstable_by_key(|holder| holder.row);
         // The warming rows of the decision's instant: nobody before the
         // ruling names them, and each row until its own end.
         let now = naming.now_micros;
@@ -829,6 +1016,100 @@ impl PoolIndex {
             .filter_map(|&at| warming.get(at as usize));
         named.warming.extend(rows.map(|&(row, _)| row));
         named.warming.sort_unstable();
+    }
+
+    /// Writes the naming's keys for the leased worker, if it has no lane.
+    pub(super) fn sent(&self, rows: &[Candidate], named: &Named, target: WorkerId) {
+        let Some(predicted) = &self.tables.predicted else {
+            return;
+        };
+        let Ok(row) = rows.binary_search_by_key(&target, |row| row.id) else {
+            return;
+        };
+        if self.tables.id_of[row] == NONE {
+            predicted.sent(named, target, &self.tables.allowed[row]);
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn sent_slices(&self) -> Option<usize> {
+        Some(
+            self.tables
+                .predicted
+                .as_ref()?
+                .slices
+                .load(Ordering::Relaxed),
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn predicted(&self) -> Option<Arc<Predicted>> {
+        self.tables.predicted.clone()
+    }
+}
+
+impl Predicted {
+    /// Folds the request once and copies out its deepest group under the
+    /// shared guard: the deepest that a worker `usable` passes was sent, so
+    /// a worker outside the view hides no row inside it. Choosing and
+    /// sorting the rows runs after the guard.
+    fn name(
+        &self,
+        naming: &Naming<'_>,
+        pool: u32,
+        usable: &dyn Fn(WorkerId) -> bool,
+        named: &mut Named,
+    ) -> u32 {
+        Predictor::fold_into(&mut named.keys, naming.namespace_seed, naming.block_hashes);
+        let tick = (naming.now_micros >> 20) as u16;
+        let record = self.record.read();
+        let deepest = record.deepest_among(&named.keys, usable);
+        let blocks = deepest.blocks();
+        named.deepest.clear();
+        named.deepest.extend(deepest.holders());
+        named.sent = RecordRead {
+            pool,
+            tick,
+            whole: blocks as usize == named.keys.len(),
+            fresh: deepest.fresh(tick),
+        };
+        blocks
+    }
+}
+
+/// The deepest group's workers that stand at a row of the view (`row_of`),
+/// behind the holders the index gave: the index's first, then a draw from
+/// this group where it would fill more than the room the cap leaves.
+fn name_predicted(
+    row_of: impl Fn(WorkerId) -> Option<u32>,
+    (blocks, cap): (u32, usize),
+    named: &mut Named,
+    draw: &mut Draw,
+) {
+    let base = named.holders.len();
+    let room = cap.saturating_sub(base);
+    if room == 0 {
+        return;
+    }
+    let mut seen = 0;
+    for &id in &named.deepest {
+        let Some(row) = row_of(id) else {
+            continue;
+        };
+        let holder = NamedHolder {
+            row,
+            overlap_blocks: 0,
+            predicted_blocks: blocks,
+        };
+        seen += 1;
+        if seen <= room {
+            named.holders.push(holder);
+        } else {
+            let drawn = below(draw, seen as u32) as usize;
+            if drawn < room {
+                named.holders[base + drawn] = holder;
+            }
+        }
     }
 }
 
@@ -969,10 +1250,61 @@ struct ModelIndex {
 struct Table {
     lanes: FxHashMap<WorkerId, Entry>,
     indexes: FxHashMap<Box<str>, ModelIndex>,
+    /// A record stays alive only while a pool holds it.
+    predicted: FxHashMap<Box<str>, Weak<Predicted>>,
+    /// The same word in every pool that can record for this worker.
+    allowed: FxHashMap<WorkerId, Weak<AtomicBool>>,
     block_sizes: HashMap<String, u32>,
     /// How many times a lane was made or retired: a pool's place in an
     /// index moves with one of the two and with no other write.
     moves: u64,
+}
+
+impl Table {
+    fn predicted(&mut self, model: &str, bound: usize) -> Arc<Predicted> {
+        if let Some(predicted) = self.predicted.get(model).and_then(Weak::upgrade) {
+            // Every pool's build passes here under the table's lock. The
+            // record's guard is taken only where the bound moved: a
+            // generation's apply, or a block size of record.
+            let was = predicted.bound.swap(bound, Ordering::Relaxed);
+            if was != bound {
+                let mut record = predicted.record.write();
+                record.set_bound(bound);
+                // Under the guard, behind the bound: a sweep that reads
+                // this word reads the lower bound with it.
+                if bound < was {
+                    predicted.sweeping.store(true, Ordering::Relaxed);
+                }
+            }
+            return predicted;
+        }
+        // Drop names of models whose last pool let its record go.
+        self.predicted
+            .retain(|_, predicted| predicted.strong_count() != 0);
+        let predicted = Arc::new(Predicted {
+            record: RwLock::new(Predictor::new(bound)),
+            bound: AtomicUsize::new(bound),
+            sweeping: AtomicBool::new(false),
+            #[cfg(test)]
+            slices: AtomicUsize::new(0),
+        });
+        self.predicted
+            .insert(model.into(), Arc::downgrade(&predicted));
+        predicted
+    }
+
+    fn allows(&mut self, rows: &[Candidate]) -> Box<[Arc<AtomicBool>]> {
+        rows.iter()
+            .map(|row| {
+                let held = self.allowed.entry(row.id).or_default();
+                held.upgrade().unwrap_or_else(|| {
+                    let allowed = Arc::new(AtomicBool::new(true));
+                    *held = Arc::downgrade(&allowed);
+                    allowed
+                })
+            })
+            .collect()
+    }
 }
 
 /// The resync reasons, counted apart.
@@ -1005,8 +1337,8 @@ pub(crate) fn indexed_under(row: &WorkerRow) -> Option<&String> {
     facts.models.first().filter(|_| facts.signals.events)
 }
 
-/// The store's KV tables: the lanes, the indexes they write and the block
-/// sizes of record.
+/// The store's KV tables: the lanes, the indexes they write, the records
+/// of sent prefixes and the block sizes of record.
 #[derive(Default)]
 pub(super) struct KvTables {
     table: Mutex<Table>,
@@ -1068,6 +1400,8 @@ impl KvTables {
                 lane: Arc::new(Mutex::new(lane)),
             },
         );
+        drop(table);
+        self.forget_sent(row.id);
         Some(worker)
     }
 
@@ -1079,17 +1413,22 @@ impl KvTables {
     /// each row's admission and `at` the write's instant, both in the rows'
     /// clock. Called under the workers lock, once a pool a membership
     /// write.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "publishes the pool's reading and both of its settings"
+    )]
     pub(super) fn pool(
         &self,
         model: &str,
         rows: &[Candidate],
         admitted: &[u64],
         rule: Option<WarmRule>,
+        predict: Option<Predict>,
         at: u64,
         reading: &mut Reading,
     ) -> PoolIndex {
-        let (index, id_of, taken) = {
-            let table = self.table.lock();
+        let (index, predicted, allowed, id_of, taken) = {
+            let mut table = self.table.lock();
             let index = table.indexes.get(model).map(|held| Arc::clone(&held.index));
             let taken = index.as_ref().map_or(0, |index| index.taken());
             let id_of: Box<[u32]> = rows
@@ -1099,7 +1438,15 @@ impl KvTables {
                     _ => NONE,
                 })
                 .collect();
-            (index, id_of, taken)
+            let predicted = predict
+                .filter(|_| id_of.contains(&NONE))
+                .map(|predict| table.predicted(model, predict.bound));
+            let allowed = if predicted.is_some() {
+                table.allows(rows)
+            } else {
+                Box::default()
+            };
+            (index, predicted, allowed, id_of, taken)
         };
         let ids = id_of
             .iter()
@@ -1134,6 +1481,8 @@ impl KvTables {
             model: model.into(),
             role: rows.first().map(|row| row.role),
             index,
+            predicted,
+            allowed,
             row_of: row_of.into(),
             id_of,
             members: members.into(),
@@ -1142,7 +1491,7 @@ impl KvTables {
             taken: AtomicU64::new(taken),
         });
         let ruled = PoolIndex::warming(&tables, rule, at, reading);
-        PoolIndex::read(tables, rule, ruled, &reading.rows)
+        PoolIndex::read(tables, rule, predict, ruled, &reading.rows)
     }
 
     /// How many times a lane was made or retired ([`Self::member`],
@@ -1207,6 +1556,31 @@ impl KvTables {
         });
         if last {
             table.indexes.remove(&entry.model);
+        }
+    }
+
+    /// A worker left, took a lane, or stays under another offer or rank.
+    /// Skip its predictions at once and take its placements out over later
+    /// sweeps. A record that holds no place for it is read under its
+    /// shared guard and left: a model's deciders wait on no removal from
+    /// another model. Called under the workers lock.
+    pub(super) fn forget_sent(&self, id: WorkerId) {
+        let records: Vec<_> = {
+            let mut table = self.table.lock();
+            if let Some(allowed) = table.allowed.remove(&id).and_then(|held| held.upgrade()) {
+                allowed.store(false, Ordering::Relaxed);
+            }
+            table.predicted.values().filter_map(Weak::upgrade).collect()
+        };
+        for predicted in records {
+            // The word above is cleared: no write gives the worker a place
+            // behind this read.
+            if !predicted.record.read().holds(id) {
+                continue;
+            }
+            let mut record = predicted.record.write();
+            record.forget(id);
+            predicted.sweeping.store(true, Ordering::Relaxed);
         }
     }
 

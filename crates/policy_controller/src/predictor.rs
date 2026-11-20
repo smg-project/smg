@@ -148,11 +148,13 @@ impl Block {
 
 /// What a probe asks of a block it finds.
 #[derive(Clone, Copy)]
-enum Ask {
+enum Ask<'a> {
     /// That it is there.
     Any,
     /// That a worker of the pool was sent it.
     Live,
+    /// That a worker of the pool that the reader may use was sent it.
+    Among(&'a dyn Fn(WorkerId) -> bool),
     /// That the worker of this place was sent it.
     Holds(u16),
 }
@@ -346,15 +348,32 @@ impl Predictor {
         }
     }
 
+    /// [`Self::deepest`] for a reader that may use only some of the pool's
+    /// workers: the deepest of the request's blocks that a worker `usable`
+    /// passes was sent. A worker the reader cannot use, sent more of the
+    /// request, hides no worker it can. [`Deepest::holders`] lists every
+    /// worker sent that block, so the reader passes over the others once
+    /// more. A block's workers are asked only where the read probes it.
+    pub fn deepest_among(&self, keys: &[u64], usable: &dyn Fn(WorkerId) -> bool) -> Deepest<'_> {
+        let (blocks, at) = self.depth(keys, keys.len(), Ask::Among(usable));
+        Deepest {
+            predictor: self,
+            at,
+            blocks: blocks as u32,
+        }
+    }
+
     /// Records a request, by its keys ([`Self::fold_into`]), as sent to
     /// `worker` at the caller's `tick`: the blocks past what the worker
     /// was already sent of it, and the request as the newest use of its
     /// path. A request the worker was sent before adds nothing. A block
     /// the write makes takes the tick, and so does the block it ends at.
     ///
-    /// A write of a longer leading part of a request behind a write of a
-    /// shorter one leaves what one write of the longer leaves, so an owner
-    /// may write a long request in parts.
+    /// Below the bound, a write of a longer leading part of a request at
+    /// one tick, behind a write of a shorter one at that tick, leaves what
+    /// one write of the longer leaves, so an owner may write a long request
+    /// in parts. At the bound each part makes its own room, so the parts
+    /// may forget other blocks than one write would.
     ///
     /// At the bound the blocks that wait leave first, then the oldest that
     /// none follows, never a block of the request itself. The write takes
@@ -428,6 +447,12 @@ impl Predictor {
         }
     }
 
+    /// Whether the record holds a place for the worker: it was sent a
+    /// block and was not forgotten since.
+    pub fn holds(&self, worker: WorkerId) -> bool {
+        self.places.contains_key(&worker)
+    }
+
     /// A worker left the pool, or was replaced: the next read skips it.
     /// Its placements are taken out by [`Predictor::sweep`]. A worker told
     /// gone that comes back under the same id starts with nothing.
@@ -492,11 +517,14 @@ impl Predictor {
         }
     }
 
-    fn passes(&self, block: &Block, ask: Ask) -> bool {
+    fn passes(&self, block: &Block, ask: Ask<'_>) -> bool {
         let holders = self.holders(block);
         match ask {
             Ask::Any => true,
             Ask::Holds(place) => holders.contains(&place),
+            Ask::Among(usable) => holders.iter().any(|&place| {
+                place != NOBODY && self.is_live(place) && usable(self.workers[place as usize])
+            }),
             // Between two sweeps of leavers every holder is of the pool.
             Ask::Live if self.clearing.is_empty() && self.gone.is_empty() => {
                 holders.first().is_some_and(|&place| place != NOBODY)
@@ -508,7 +536,7 @@ impl Predictor {
     }
 
     /// The block of the request's key at place `at`, where it passes.
-    fn probe(&self, keys: &[u64], at: usize, ask: Ask) -> Option<u32> {
+    fn probe(&self, keys: &[u64], at: usize, ask: Ask<'_>) -> Option<u32> {
         let block = self.find(keys[at])?;
         self.passes(self.block(block), ask).then_some(block)
     }
@@ -516,7 +544,7 @@ impl Predictor {
     /// How many of the request's first `within` blocks pass, and the last
     /// of them. The blocks that pass are a leading part of the request, so
     /// the last one first, then by halves.
-    fn depth(&self, keys: &[u64], within: usize, ask: Ask) -> (usize, u32) {
+    fn depth(&self, keys: &[u64], within: usize, ask: Ask<'_>) -> (usize, u32) {
         let Some(last) = within.checked_sub(1) else {
             return (0, NONE);
         };
