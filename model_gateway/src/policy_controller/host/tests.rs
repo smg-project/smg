@@ -2262,8 +2262,8 @@ async fn each_side_of_a_placed_pair_reports_its_own_dispatch_and_end() {
 /// A fleet whose pools hold workers and no prefill pairs with a decode. The
 /// store's pair classes judge it from membership alone, as the classic pair
 /// index does, and the host answers by them: each pool's keys and what the
-/// pools disagree on. An ask that states the wire of another side reads the
-/// controller's own shed.
+/// pools disagree on. An ask that states no wire, or the wire of another
+/// side, reads the controller's own shed.
 #[tokio::test]
 async fn a_fleet_that_pairs_nothing_is_refused_by_the_pair_classes() {
     // The bed's two protocols pair under off. Under the lenient rule two
@@ -2283,21 +2283,22 @@ async fn a_fleet_that_pairs_nothing_is_refused_by_the_pair_classes() {
         wires: WireModes::HTTP,
         ..pair_ask()
     };
-    for ask in [pair_ask(), on_http] {
-        let refused = bed.host.place_pair(&ask, None, None).await.err();
-        assert_eq!(refused.as_ref(), Some(&unpaired));
-    }
-    // No row serves gRPC, so that side holds no refusal.
+    let refused = bed.host.place_pair(&on_http, None, None).await.err();
+    assert_eq!(refused, Some(unpaired));
+    // An ask that states no wire does not say which side it draws from, and
+    // no row serves gRPC: that side holds no refusal.
     let on_grpc = Ask {
         wires: WireModes::GRPC,
         ..pair_ask()
     };
-    let shed = bed.host.place_pair(&on_grpc, None, None).await.err();
     let no_endpoint = ShedReason::NoEndpoints;
-    assert!(
-        matches!(shed, Some(Unplaced::Shed { reason, .. }) if reason == no_endpoint),
-        "{shed:?}"
-    );
+    for ask in [pair_ask(), on_grpc] {
+        let shed = bed.host.place_pair(&ask, None, None).await.err();
+        assert!(
+            matches!(shed, Some(Unplaced::Shed { reason, .. }) if reason == no_endpoint),
+            "{shed:?}"
+        );
+    }
     assert_eq!(live(&bed.store, 0), 0);
 }
 

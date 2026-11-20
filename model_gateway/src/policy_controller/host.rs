@@ -595,28 +595,20 @@ impl Host {
         );
     }
 
-    /// Why no pair can be made for `ask`, where it asks for one and the
-    /// store's pair classes refuse its fleet. The classes judge from
-    /// membership alone, as the classic pair index does, so a fleet that
-    /// pairs nothing reads the classic's answer and not a missing endpoint.
+    /// Why no pair can be made for `ask`, where it asks for one on the wires
+    /// it states and the store's pair classes refuse that side of its
+    /// fleet. The classes judge from membership alone, as the classic pair
+    /// index does, so a fleet that pairs nothing reads the classic's answer
+    /// and not a missing endpoint.
     ///
-    /// An ask that states its wires reads the refusal of their side. An ask
-    /// that states none is refused where no side pairs, by the first side
-    /// that holds a refusal.
+    /// An ask that states no wire does not say which side it draws from. It
+    /// keeps the controller's shed.
     fn unpaired(&self, ask: &Ask<'_>) -> Option<Unplaced> {
-        if ask.phase == Phase::Single {
+        if ask.phase == Phase::Single || ask.wires.is_empty() {
             return None;
         }
         self.door.store().with_world(|world| {
-            let classes = world.pairs(ask.model)?;
-            let refusal = if ask.wires.is_empty() {
-                let sides = [WireModes::HTTP, WireModes::GRPC];
-                (classes.pairs() == 0)
-                    .then(|| sides.into_iter().find_map(|side| classes.refusal(side)))
-                    .flatten()
-            } else {
-                classes.refusal(ask.wires)
-            }?;
+            let refusal = world.pairs(ask.model)?.refusal(ask.wires)?;
             Some(Unplaced::NoCompatiblePair {
                 prefill: refusal.prefill.clone(),
                 decode: refusal.decode.clone(),
