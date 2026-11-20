@@ -93,10 +93,11 @@ fn narrow(count: i64) -> u32 {
 }
 
 /// One row's values of the declared signals from its report, each handed
-/// to `each` by its name, with the unit the report states, the value and
-/// its sample instant: what every source of a report writes to the signal
-/// sink behind the report's row ([`load_row`]), so each makes the same
-/// values of the same report.
+/// to `each` under its column, with the unit the report states, the value
+/// and its sample instant: what every source of a report writes to the
+/// signal sink behind the report's row ([`load_row`]), so each makes the
+/// same values of the same report. The column is the one of `columns` the
+/// value was made under, and the sink's write names it.
 ///
 /// `columns` are the declared signals in name order
 /// ([`SignalSink::signal_columns`](crate::store::SignalSink::signal_columns)):
@@ -119,7 +120,7 @@ pub fn signal_values(
     report: &WorkerLoadResponse,
     columns: &[SignalColumn],
     sampled_at: Instant,
-    mut each: impl FnMut(&str, &str, f64, Instant),
+    mut each: impl FnMut(&SignalColumn, &str, f64, Instant),
 ) {
     if columns.is_empty() {
         return;
@@ -147,7 +148,7 @@ pub fn signal_values(
                 let bit = 1u64 << at;
                 if read & bit == 0 {
                     read |= bit;
-                    each(&stated.name, &stated.unit, stated.value, sampled(&stated));
+                    each(&columns[at], &stated.unit, stated.value, sampled(&stated));
                 }
             }
             return;
@@ -199,7 +200,7 @@ pub fn signal_values(
             AcrossRanks::Mean => made.value / f64::from(count),
             AcrossRanks::Sum | AcrossRanks::Max | AcrossRanks::Min => made.value,
         };
-        each(column.name(), &made.unit, value, made.oldest);
+        each(column, &made.unit, value, made.oldest);
     }
 }
 
@@ -407,9 +408,9 @@ mod tests {
     ) -> Vec<(String, String, f64, u128)> {
         let sampled_at = received - Duration::from_millis(50);
         let mut made = Vec::new();
-        signal_values(report, columns, sampled_at, |name, unit, value, at| {
+        signal_values(report, columns, sampled_at, |column, unit, value, at| {
             let age = received.duration_since(at).as_millis();
-            made.push((name.to_owned(), unit.to_owned(), value, age));
+            made.push((column.name().to_owned(), unit.to_owned(), value, age));
         });
         made
     }

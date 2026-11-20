@@ -7766,7 +7766,8 @@ pub(crate) mod tests {
         applied.expect("a later generation");
         let now = Instant::now();
         for (id, value) in ids.iter().zip([10.0, 11.0, 12.0, 13.0]) {
-            let taken = store.signal_value(*id, 0, "held", "tokens", value, now);
+            let held = store.signal_column("held");
+            let taken = store.signal_value(*id, 0, &held, "tokens", value, now);
             assert_eq!(taken, Taken::Written);
         }
         store.publish_now();
@@ -7819,9 +7820,10 @@ pub(crate) mod tests {
         let spec = AppliedSpec::validate_digested(&document, digest, &catalog, &[])?;
         door.store().apply(spec)?;
         let now = Instant::now();
+        let held = door.store().signal_column("held");
         let taken = door
             .store()
-            .signal_value(encoder, 0, "held", "tokens", 7.0, now);
+            .signal_value(encoder, 0, &held, "tokens", 7.0, now);
         assert_eq!(taken, Taken::Written);
         door.store().publish_now();
         let mut placed = EncodePlaced::new();

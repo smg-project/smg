@@ -212,7 +212,17 @@ fn fleet(stages: &Stages) -> (Arc<MemoryStore>, [WorkerId; 3]) {
 }
 
 fn write(store: &MemoryStore, id: WorkerId, value: f64, at: Instant) -> Taken {
-    store.signal_value(id, 0, QUEUE, REQUESTS, value, at)
+    store.signal_value(id, 0, &store.signal_column(QUEUE), REQUESTS, value, at)
+}
+
+/// A column of `name` under `unit` that the store under test never
+/// declared: one read under another store's document.
+fn foreign(stages: &Stages, name: &str, unit: &str) -> SignalColumn {
+    let other = MemoryStore::new();
+    let signals = json!({ name: { "unit": unit } });
+    let score = json!({ "by-value": { "signal": name } });
+    stages.apply(&other, &document(1, signals, score));
+    other.signal_column(name)
 }
 
 /// Each row's cells in the block the standing publication lends for
@@ -464,23 +474,27 @@ fn a_write_that_is_not_taken_says_what_became_of_it_and_is_counted() {
     let stages = stages();
     let (store, [a, b, c]) = fleet(&stages);
     let at = Instant::now();
-    let write = |id, name, unit, value, at| store.signal_value(id, 0, name, unit, value, at);
-    assert_eq!(write(a, QUEUE, REQUESTS, 5.0, at), Taken::Written);
-    assert_eq!(write(a, "depth", REQUESTS, 5.0, at), Taken::Undeclared);
-    assert_eq!(write(a, QUEUE, "tokens", 5.0, at), Taken::WrongUnit);
-    assert_eq!(write(a, QUEUE, REQUESTS, f64::NAN, at), Taken::OutOfRange);
+    let (queue, depth) = (
+        store.signal_column(QUEUE),
+        foreign(&stages, "depth", REQUESTS),
+    );
+    let write = |id, column, unit, value, at| store.signal_value(id, 0, column, unit, value, at);
+    assert_eq!(write(a, &queue, REQUESTS, 5.0, at), Taken::Written);
+    assert_eq!(write(a, &depth, REQUESTS, 5.0, at), Taken::Undeclared);
+    assert_eq!(write(a, &queue, "tokens", 5.0, at), Taken::WrongUnit);
+    assert_eq!(write(a, &queue, REQUESTS, f64::NAN, at), Taken::OutOfRange);
     assert_eq!(
-        write(a, QUEUE, REQUESTS, f64::INFINITY, at),
+        write(a, &queue, REQUESTS, f64::INFINITY, at),
         Taken::OutOfRange
     );
     assert_eq!(
-        write(WorkerId(u64::MAX), QUEUE, REQUESTS, 5.0, at),
+        write(WorkerId(u64::MAX), &queue, REQUESTS, 5.0, at),
         Taken::NotAMember
     );
     let before = at
         .checked_sub(Duration::from_millis(1))
         .expect("a millisecond");
-    assert_eq!(write(a, QUEUE, REQUESTS, 9.0, before), Taken::Older);
+    assert_eq!(write(a, &queue, REQUESTS, 9.0, before), Taken::Older);
     // One count a kind, in the outcomes' order, and the value taken stands.
     assert_eq!(Taken::EACH.map(Taken::label)[1], "undeclared");
     assert_eq!(store.counts().signal_writes, [1, 1, 1, 2, 1, 1]);
@@ -519,7 +533,8 @@ fn a_value_stated_for_another_rank_reaches_no_row() {
     let (store, [a, b, c]) = fleet(&stages);
     // The worker's row stands at rank 0. A value for its rank 1 is on file
     // for that rank, as a load record would be, and on no row.
-    let taken = store.signal_value(a, 1, QUEUE, REQUESTS, 7.0, Instant::now());
+    let queue = store.signal_column(QUEUE);
+    let taken = store.signal_value(a, 1, &queue, REQUESTS, 7.0, Instant::now());
     assert_eq!(taken, Taken::Written);
     assert_eq!(values(&store), by_id([(a, None), (b, None), (c, None)]));
 }
@@ -641,7 +656,8 @@ fn a_new_document_keeps_a_name_it_declares_again_and_starts_a_changed_unit_empty
     let before = json!({ "depth": { "unit": "items" }, "heat": { "unit": "celsius" } });
     stages.apply(&store, &document(4, before, score.clone()));
     let at = Instant::now();
-    let write = |name, unit, value| store.signal_value(a, 0, name, unit, value, at);
+    let write =
+        |name, unit, value| store.signal_value(a, 0, &store.signal_column(name), unit, value, at);
     assert_eq!(write("depth", "items", 3.0), Taken::Written);
     assert_eq!(write("heat", "celsius", 71.0), Taken::Written);
 
@@ -683,7 +699,8 @@ fn a_new_document_that_changes_a_signals_reduction_starts_the_name_empty() {
     let before = json!({ "depth": { "unit": "items" }, "heat": { "unit": "celsius" } });
     stages.apply(&store, &document(4, before, score.clone()));
     let at = Instant::now();
-    let write = |name, unit, value| store.signal_value(a, 0, name, unit, value, at);
+    let write =
+        |name, unit, value| store.signal_value(a, 0, &store.signal_column(name), unit, value, at);
     assert_eq!(write("depth", "items", 3.0), Taken::Written);
     assert_eq!(write("heat", "celsius", 71.0), Taken::Written);
 
@@ -706,9 +723,50 @@ fn a_new_document_that_changes_a_signals_reduction_starts_the_name_empty() {
     assert_eq!(cells[0], Some((4.0, store.micros(at))));
 }
 
-/// A write reads its column with no lock held, so a document can be
-/// applied between that read and the write. The value was made under the
-/// column the write read.
+/// A source reads its columns, then writes: a document can be applied
+/// between the two. A value was made under the column its source read, so
+/// it lands only where the document in force continues that column, at the
+/// column's place there, and is refused and counted where it does not.
+#[test]
+fn a_write_under_a_column_read_before_a_document_lands_only_where_it_is_continued() {
+    let stages = stages();
+    let store = Arc::new(MemoryStore::new());
+    let a = join(&store, facts("first", Role::Single));
+    let score = json!({ "by-value": { "signal": "heat" } });
+    let before = json!({ "depth": { "unit": "items" }, "heat": { "unit": "celsius" } });
+    stages.apply(&store, &document(4, before, score.clone()));
+    let at = Instant::now();
+    // The source's read.
+    let (depth, heat) = (store.signal_column("depth"), store.signal_column("heat"));
+
+    // A name before both moves the columns, and one reduction changes.
+    let after = json!({
+        "age": { "unit": "ms" },
+        "depth": { "unit": "items", "across_ranks": "max" },
+        "heat": { "unit": "celsius" }
+    });
+    stages.apply(&store, &document(5, after, score));
+    let write = |column, unit, value| store.signal_value(a, 0, column, unit, value, at);
+    // Made as a sum, under a column that is now a maximum: refused.
+    assert_eq!(write(&depth, "items", 3.0), Taken::Undeclared);
+    // Continued: taken, at the column's new place.
+    assert_eq!(write(&heat, "celsius", 71.0), Taken::Written);
+    let counts = store.counts().signal_writes;
+    assert_eq!(
+        (
+            counts[Taken::Written.place()],
+            counts[Taken::Undeclared.place()]
+        ),
+        (1, 1)
+    );
+    let held = lent(&store, Role::Single);
+    let cells = &held.iter().find(|(row, _)| *row == a).expect("the row").1;
+    assert_eq!(**cells, [None, None, Some((71.0, store.micros(at)))]);
+}
+
+/// A write reads where its column is continued with no lock held, so a
+/// document can be applied between that read and the write under the
+/// lock. The write asks again under the generation it finds there.
 #[test]
 fn a_write_read_under_the_generation_before_lands_only_where_its_column_is_continued() {
     let stages = stages();
@@ -718,8 +776,9 @@ fn a_write_read_under_the_generation_before_lands_only_where_its_column_is_conti
     let before = json!({ "depth": { "unit": "items" }, "heat": { "unit": "celsius" } });
     stages.apply(&store, &document(4, before, score.clone()));
     let at = Instant::now();
-    let depth = store.signal_read("depth", "items");
-    let heat = store.signal_read("heat", "celsius");
+    let (depth, heat) = (store.signal_column("depth"), store.signal_column("heat"));
+    let depth_read = store.signal_read(&depth, "items");
+    let heat_read = store.signal_read(&heat, "celsius");
 
     // A name before both moves the columns, and one reduction changes.
     let after = json!({
@@ -728,11 +787,11 @@ fn a_write_read_under_the_generation_before_lands_only_where_its_column_is_conti
         "heat": { "unit": "celsius" }
     });
     stages.apply(&store, &document(5, after, score));
-    let write = |names, value, read| store.signal_write(a, 0, names, value, at, read);
+    let write = |column, value, read| store.signal_write(a, 0, column, value, at, read);
     // Made as a sum, under a column that is now a maximum: not taken.
-    assert_eq!(write(("depth", "items"), 3.0, depth), Taken::Undeclared);
+    assert_eq!(write(&depth, 3.0, depth_read), Taken::Undeclared);
     // Continued: taken, at the column's new place.
-    assert_eq!(write(("heat", "celsius"), 71.0, heat), Taken::Written);
+    assert_eq!(write(&heat, 71.0, heat_read), Taken::Written);
     let held = lent(&store, Role::Single);
     let cells = &held.iter().find(|(row, _)| *row == a).expect("the row").1;
     assert_eq!(**cells, [None, None, Some((71.0, store.micros(at)))]);
@@ -856,10 +915,11 @@ fn a_document_with_no_signal_publishes_no_block_and_drops_a_value_with_no_lock_t
     });
     // The write answers while the load lock is held: it takes none.
     let writer = Arc::clone(&store);
+    let queue = foreign(&stages, QUEUE, REQUESTS);
     let (tell, told) = mpsc::channel();
     let answered = store.with_loads_held(|| {
         thread::spawn(move || {
-            let taken = writer.signal_value(a, 0, QUEUE, REQUESTS, 5.0, Instant::now());
+            let taken = writer.signal_value(a, 0, &queue, REQUESTS, 5.0, Instant::now());
             tell.send(taken)
         });
         told.recv_timeout(Duration::from_secs(10))

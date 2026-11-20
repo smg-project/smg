@@ -12,6 +12,13 @@
 //! more: a value may ride one record in ten. A row the load sink passed
 //! over takes its values with it: its source writes none of them.
 //!
+//! A source reads the declared columns once a report
+//! ([`SignalSink::signal_columns`]) and writes each value under the column
+//! it read. A value means its column's name, unit and reduction across
+//! ranks, so the store takes it only where the document in force
+//! continues that column. A document applied between the read and the
+//! write moves no value to a column that is not its own.
+//!
 //! A report that leaves a name out removes nothing. The value on file
 //! stands until the signal's maximum age ends it, until its rank's load
 //! sample goes, or until a new document declares the name under another
@@ -38,26 +45,32 @@ mod tests;
 /// of the document in force.
 pub trait SignalSink: Send + Sync {
     /// The declared signals of the document in force, in column order:
-    /// what a report's conversion walks, so it offers declared names alone.
+    /// what a report's conversion walks, so it offers declared names alone,
+    /// and what a host's own feeder reads ahead of its writes.
     fn signal_columns(&self) -> Arc<[SignalColumn]>;
 
-    /// One value by its name, for one rank's row, sampled at `sampled_at`
-    /// on the host's clock: the value's own age where its report states
-    /// one, else the age of the record that carried it, else its receipt.
+    /// One value under `column`, a column its source read from
+    /// [`Self::signal_columns`], for one rank's row, sampled at
+    /// `sampled_at` on the host's clock: the value's own age where its
+    /// report states one, else the age of the record that carried it, else
+    /// its receipt.
     ///
-    /// The value is taken where the document in force declares the name,
-    /// `unit` is the declared one, the value is finite and of magnitude at
-    /// most 1e15, the worker is a member and no newer sample of the name
-    /// is on file for the rank. Of two sources of one signal the newer
-    /// sample stands, whichever arrives last. Every other write is dropped
-    /// and counted by what became of it.
-    /// The name, the unit and the value are read before any lock is taken:
-    /// a value under a name no document declares costs one lookup.
+    /// `unit` is the unit the value is in: the one its report states, or
+    /// the one a host's feeder holds in its code. The value is taken where
+    /// `unit` is the column's, the document in force continues the column
+    /// (the same name, unit and reduction across ranks), the value is
+    /// finite and of magnitude at most 1e15, the worker is a member and no
+    /// newer sample of the name is on file for the rank. Of two sources of
+    /// one signal the newer sample stands, whichever arrives last. Every
+    /// other write is dropped and counted by what became of it.
+    /// The column, the unit and the value are read before any lock is
+    /// taken: a value under a column no document continues costs one
+    /// lookup.
     fn signal_value(
         &self,
         id: WorkerId,
         rank: u16,
-        name: &str,
+        column: &SignalColumn,
         unit: &str,
         value: f64,
         sampled_at: Instant,
@@ -76,11 +89,11 @@ pub(crate) const VALUE_MAGNITUDE_LIMIT: f64 = crate::spec::COST_PARAMETER_LIMIT;
 pub enum Taken {
     /// The value is on file and is shown with the next publication.
     Written,
-    /// The document in force declares no signal of the name. Or one
-    /// applied under the write declares the name with another reduction
-    /// across ranks than the one the value was made under.
+    /// The document in force does not continue the column the value was
+    /// written under: it declares no signal of the name, or declares it
+    /// under another unit or another reduction across ranks.
     Undeclared,
-    /// The stated unit is not the one the document declares.
+    /// The unit the value is in is not the column's.
     WrongUnit,
     /// The value is not a finite number, or its magnitude is above 1e15:
     /// the bound a cost rule's own parameters are held to.

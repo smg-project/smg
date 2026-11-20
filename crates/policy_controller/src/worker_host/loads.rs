@@ -211,8 +211,8 @@ impl<G: Generation, S: StoreLoadSink + SignalSink + ?Sized> LoadAdapter<G, S> {
             let Some(report) = report else {
                 continue;
             };
-            signal_values(report, &columns, polled_at, |name, unit, value, at| {
-                self.store.signal_value(row, rank, name, unit, value, at);
+            signal_values(report, &columns, polled_at, |column, unit, value, at| {
+                self.store.signal_value(row, rank, column, unit, value, at);
             });
         }
         passed
@@ -262,9 +262,9 @@ where
             .record(member.row, rank, row, received_at, LoadSource::Stream);
         // The row first, then its values.
         let columns = self.store.signal_columns();
-        signal_values(report, &columns, sampled_at, |name, unit, value, at| {
+        signal_values(report, &columns, sampled_at, |column, unit, value, at| {
             self.store
-                .signal_value(member.row, rank, name, unit, value, at);
+                .signal_value(member.row, rank, column, unit, value, at);
         });
     }
 
@@ -461,13 +461,13 @@ mod tests {
             &self,
             id: WorkerId,
             rank: u16,
-            name: &str,
+            column: &crate::SignalColumn,
             unit: &str,
             value: f64,
             sampled_at: Instant,
         ) -> Taken {
             self.memory
-                .signal_value(id, rank, name, unit, value, sampled_at)
+                .signal_value(id, rank, column, unit, value, sampled_at)
         }
     }
 

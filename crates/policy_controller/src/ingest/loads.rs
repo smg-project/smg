@@ -827,8 +827,8 @@ where
                             scoped,
                             &columns,
                             sampled_at.unwrap_or(polled_at),
-                            |name, unit, value, at| {
-                                self.store.signal_value(id, rank, name, unit, value, at);
+                            |column, unit, value, at| {
+                                self.store.signal_value(id, rank, column, unit, value, at);
                             },
                         );
                     }

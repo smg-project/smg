@@ -85,10 +85,12 @@ fn record_of(index: usize) -> LoadRow {
 
 /// One rank's four values behind its record, each taken.
 fn state(store: &MemoryStore, id: WorkerId, index: usize, at: Instant) {
-    for (nth, name) in NAMES.into_iter().enumerate() {
+    // A source reads the columns once a report and writes under each.
+    let columns = store.signal_columns();
+    for (nth, column) in columns.iter().enumerate() {
         let value = ((index * 7 + nth * 3) % 23) as f64;
-        let taken = store.signal_value(id, 0, name, UNIT, value, at);
-        assert_eq!(taken, Taken::Written, "{name}");
+        let taken = store.signal_value(id, 0, column, UNIT, value, at);
+        assert_eq!(taken, Taken::Written, "{}", column.name());
     }
 }
 

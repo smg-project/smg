@@ -121,8 +121,9 @@ pub const OVERLOAD_FLIPS_TOTAL: &str = "smg_policy_controller_overload_flips_tot
 pub const LIFECYCLE_FAULTS_TOTAL: &str = "smg_policy_controller_lifecycle_faults_total";
 
 /// Writes to the store's signal sink, by `outcome`: what became of each
-/// ([`Taken`]). A value under a name the document does not declare counts
-/// `undeclared`, and one that states another unit `wrong_unit`.
+/// ([`Taken`]). A value under a column the document in force does not
+/// continue counts `undeclared`, and one in another unit than its column's
+/// `wrong_unit`.
 pub const SIGNAL_WRITES_TOTAL: &str = "smg_policy_controller_signal_writes_total";
 
 /// The controller's series and the handle that renders them.

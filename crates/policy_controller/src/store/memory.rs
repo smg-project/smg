@@ -23,7 +23,7 @@ use rustc_hash::FxHashMap;
 use crate::{
     lease::{LeaseId, Lifecycle, Membership, Outcome, ReleaseReason, Side, TransportClass},
     signals::{SignalCell, SignalColumn},
-    spec::{AcrossRanks, AppliedSpec},
+    spec::AppliedSpec,
     store::{
         health::{HealthSink, HealthWrite, LeaderBits, VetoWrite},
         index::{indexed_under, KvEvent, KvTables, LaneCounts},
@@ -150,8 +150,8 @@ pub struct MemoryStore {
     /// the last taken and held for the call alone.
     wake: Mutex<Option<Wake>>,
     /// The writes to the signal sink by what became of each. Counted with
-    /// no lock: a write under a name the document does not declare takes
-    /// none.
+    /// no lock: a write under a column the document in force does not
+    /// continue takes none.
     signal_writes: Writes,
 }
 
@@ -1301,6 +1301,15 @@ impl MemoryStore {
         held()
     }
 
+    /// The column the document in force declares under `name`, as a source
+    /// reads it ahead of its write.
+    #[cfg(test)]
+    pub(crate) fn signal_column(&self, name: &str) -> SignalColumn {
+        let columns = self.signal_columns();
+        let found = columns.iter().find(|column| column.name() == name);
+        found.cloned().expect("the document declares the name")
+    }
+
     /// How many workers the load table holds an entry for.
     #[cfg(test)]
     pub(super) fn load_entries(&self) -> usize {
@@ -2432,41 +2441,26 @@ impl OnFile for OnTable<'_> {
 
 /// What a write read before it took the load lock
 /// ([`MemoryStore::signal_read`]): the generation it read under, and the
-/// column with its reduction, or what the write comes to.
+/// place of the column that continues the write's own there, or what the
+/// write comes to.
 pub(crate) struct SignalRead {
     generation: u64,
-    found: Result<(usize, AcrossRanks), Taken>,
+    found: Result<usize, Taken>,
 }
 
-/// The column `name` stands at among `columns`, which are in name order,
-/// where `unit` is its declared one; else what a write under them comes
-/// to.
-fn column_of(columns: &[SignalColumn], name: &str, unit: &str) -> Result<usize, Taken> {
+/// The place among `columns`, which are in name order, of the column that
+/// continues `made`; else what a write under `made` comes to. A stored
+/// value means all three of its column: its name, its unit and how its
+/// row's ranks were made one. A column that changed one of them is
+/// another signal, and the value is none of its own. Read wherever a
+/// value passes from one generation's columns to another's: at the carry,
+/// and at a write, whose source read `made` under a generation of its own.
+fn continued(columns: &[SignalColumn], made: &SignalColumn) -> Result<usize, Taken> {
     let at = columns
-        .binary_search_by(|column| column.name().cmp(name))
+        .binary_search_by(|column| column.name().cmp(made.name()))
         .map_err(|_| Taken::Undeclared)?;
-    if columns[at].unit() == unit {
-        Ok(at)
-    } else {
-        Err(Taken::WrongUnit)
-    }
-}
-
-/// The column among `columns` that continues a value made for `name`
-/// under `unit` and `across`; else what a write of that value comes to. A
-/// stored value means all three: its name, its unit and how its row's
-/// ranks were made one. A column that changed one of them is another
-/// signal, and the value is none of its own. Read wherever a value passes
-/// from one generation's columns to the next: at the carry, and at a
-/// write that was read under the generation before.
-fn continued(
-    columns: &[SignalColumn],
-    name: &str,
-    unit: &str,
-    across: AcrossRanks,
-) -> Result<usize, Taken> {
-    let at = column_of(columns, name, unit)?;
-    if columns[at].across_ranks() == across {
+    let column = &columns[at];
+    if column.unit() == made.unit() && column.across_ranks() == made.across_ranks() {
         Ok(at)
     } else {
         Err(Taken::Undeclared)
@@ -2484,7 +2478,7 @@ fn carry_cells(table: &mut FxHashMap<WorkerId, Ranks>, old: &[SignalColumn], new
     // Each new column's place among the old ones.
     let from: Vec<Option<usize>> = new
         .iter()
-        .map(|column| continued(old, column.name(), column.unit(), column.across_ranks()).ok())
+        .map(|column| continued(old, column).ok())
         .collect();
     let stands =
         old.len() == new.len() && from.iter().enumerate().all(|(at, from)| *from == Some(at));
@@ -2971,12 +2965,12 @@ impl SignalSink for MemoryStore {
         &self,
         id: WorkerId,
         rank: u16,
-        name: &str,
+        column: &SignalColumn,
         unit: &str,
         value: f64,
         sampled_at: Instant,
     ) -> Taken {
-        let taken = self.write_signal(id, rank, name, unit, value, sampled_at);
+        let taken = self.write_signal(id, rank, column, unit, value, sampled_at);
         self.signal_writes.count(taken);
         taken
     }
@@ -2988,25 +2982,29 @@ impl MemoryStore {
         &self,
         id: WorkerId,
         rank: u16,
-        name: &str,
+        made: &SignalColumn,
         unit: &str,
         value: f64,
         sampled_at: Instant,
     ) -> Taken {
-        let read = self.signal_read(name, unit);
-        self.signal_write(id, rank, (name, unit), value, sampled_at, read)
+        let read = self.signal_read(made, unit);
+        self.signal_write(id, rank, made, value, sampled_at, read)
     }
 
-    /// The first step of a write: the column `name` stands at under
-    /// `unit`, with its reduction, read with no lock held under the
-    /// generation of the last publication.
-    pub(crate) fn signal_read(&self, name: &str, unit: &str) -> SignalRead {
+    /// The first step of a write: where the generation of the last
+    /// publication continues `made`, the column the value's source read,
+    /// read with no lock held. `unit` is the unit the value is in.
+    pub(crate) fn signal_read(&self, made: &SignalColumn, unit: &str) -> SignalRead {
         let world = self.world.load();
         let spec = world.spec();
-        let columns = spec.signal_columns();
+        let found = if made.unit() == unit {
+            continued(spec.signal_columns(), made)
+        } else {
+            Err(Taken::WrongUnit)
+        };
         SignalRead {
             generation: spec.generation(),
-            found: column_of(columns, name, unit).map(|at| (at, columns[at].across_ranks())),
+            found,
         }
     }
 
@@ -3016,14 +3014,14 @@ impl MemoryStore {
         &self,
         id: WorkerId,
         rank: u16,
-        (name, unit): (&str, &str),
+        made: &SignalColumn,
         value: f64,
         sampled_at: Instant,
         read: SignalRead,
     ) -> Taken {
         let SignalRead { generation, found } = read;
-        let (column, across) = match found {
-            Ok(found) => found,
+        let column = match found {
+            Ok(column) => column,
             Err(taken) => return taken,
         };
         if !value.is_finite() || value.abs() > VALUE_MAGNITUDE_LIMIT {
@@ -3035,15 +3033,13 @@ impl MemoryStore {
             writer,
         } = &mut *loads;
         // A generation applied since that read has columns of its own: the
-        // value is taken where one of them continues the column it was
-        // read under, whose reduction its source is taken to have used. A
-        // document applied between the source's own read of the columns
-        // and this write's read is not seen here.
+        // value is taken where one of them continues the column its source
+        // read.
         let spec = writer.spec();
         let column = if spec.generation() == generation {
             column
         } else {
-            match continued(spec.signal_columns(), name, unit, across) {
+            match continued(spec.signal_columns(), made) {
                 Ok(column) => column,
                 Err(taken) => return taken,
             }

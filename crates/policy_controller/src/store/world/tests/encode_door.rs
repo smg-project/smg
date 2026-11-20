@@ -570,7 +570,8 @@ fn the_encode_door_hands_each_pool_the_cells_of_its_own_rows() {
     }
     store.publish_now();
     for (value, &(id, ..)) in (1u32..).zip(&stated) {
-        let taken = store.signal_value(id, 0, "depth", "items", f64::from(value), now);
+        let depth = store.signal_column("depth");
+        let taken = store.signal_value(id, 0, &depth, "items", f64::from(value), now);
         assert_eq!(taken, Taken::Written);
     }
     // What each pool's rows should read: every worker of the role, and
