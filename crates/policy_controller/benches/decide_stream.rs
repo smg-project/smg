@@ -78,7 +78,9 @@
 //!   decision), `door` (a decision asked at a host's door on this thread and
 //!   its lease reported released at once, `Door::decide` and `Door::report`),
 //!   `handle` (a request served through a handle on this thread, from
-//!   `Handle::decide` to `Handle::completed`), `named` (a `door` decision
+//!   `Handle::decide` to `Handle::completed`), `window` (a `door` decision
+//!   of a request that states a context window, over a fleet whose every
+//!   member states one that holds it), `named` (a `door` decision
 //!   under the `cache_aware` preset of a request whose leading blocks three
 //!   members in four hold: the door names its sixteen deepest holders and
 //!   asks the pass's test up to the first that passes), `retry` (the same
@@ -252,8 +254,8 @@ use smg_policy_controller::{
         LeaseState, LeasesStore, LoadSink, LoadSource, MemoryStore, Picked, Said, Signals,
         StoredBlock, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
     },
-    AppliedSpec, Constraints, Lease, LeaseId, LoadRow, PolicySpec, PoolFacts, ReleaseReason,
-    RequestFacts, Role, Scratch, WorkerId,
+    AppliedSpec, Constraints, DemandFacts, Demands, Lease, LeaseId, LoadRow, PolicySpec, PoolFacts,
+    ReleaseReason, RequestFacts, Role, Scratch, WorkerId,
 };
 use tokio::{
     runtime,
@@ -2259,6 +2261,35 @@ fn door_over(members: u32, files: usize, told: bool) -> Door {
     Door::new(Arc::new(store))
 }
 
+/// The context window each member of a `window` count's fleet states, in
+/// tokens.
+const STATED_WINDOW: u32 = 131_072;
+
+/// The bounds a `window` count's request states, its input's and its
+/// completion's: each under [`STATED_WINDOW`].
+const ASKED: (u32, u32) = (4_096, 1_024);
+
+/// [`door_over`] for a `window` count: one file, a door row's bands, and
+/// every member states [`STATED_WINDOW`], laid in place over its row.
+fn windowed_door(members: u32) -> Door {
+    let store = MemoryStore::new().with_deciders(1);
+    fill(&store, Shape::bar(members, 1, Fleet::Shared, false, 0, 0));
+    for index in 0..members {
+        let key = format!("http://worker-{index}.fleet:8000");
+        let row = store.by_key(&key).expect("a member of the fleet");
+        let demand_facts = DemandFacts {
+            window: STATED_WINDOW,
+            ..row.facts.demand_facts
+        };
+        store.upsert(WorkerFacts {
+            demand_facts,
+            ..row.facts
+        });
+    }
+    store.publish_now();
+    Door::new(Arc::new(store))
+}
+
 /// The deepest holders a naming can refuse before its bound: the cap of
 /// sixteen at its first lookup and at each of the four it makes again.
 const REFUSED: usize = 80;
@@ -2451,6 +2482,38 @@ fn ask_door(door: &Door, name: &str, seed: u64) {
             ..RequestFacts::default()
         },
         constraints: Constraints::default(),
+    };
+    let decided = door
+        .decide(HOST, &request, Instant::now())
+        .expect("the door decides");
+    let leased = decided
+        .lease
+        .expect("a pick over the fleet, with its lease");
+    let gone = Said::Released(None, ReleaseReason::ClientGone);
+    door.report(HOST, leased.lease.id, gone);
+    black_box(&decided.decision);
+}
+
+/// [`ask_door`] for a request that states a context window ([`ASKED`]).
+fn ask_window(door: &Door, name: &str, seed: u64) {
+    let id = seed.to_le_bytes();
+    let (input_window, output_window) = ASKED;
+    let request = door::Request {
+        id: &id,
+        facts: RequestFacts {
+            model: name,
+            seed,
+            budget_micros: BUDGET_MICROS,
+            ..RequestFacts::default()
+        },
+        constraints: Constraints {
+            demands: Demands {
+                input_window,
+                output_window,
+                ..Demands::default()
+            },
+            ..Constraints::default()
+        },
     };
     let decided = door
         .decide(HOST, &request, Instant::now())
@@ -2768,6 +2831,10 @@ fn count(cell: &str, out: &mut impl Write) -> io::Result<()> {
             at_door(&door_over(shape.members, 1, true), ask_handle, decisions),
             0,
         ),
+        "window" => (
+            at_door(&windowed_door(shape.members), ask_window, decisions),
+            0,
+        ),
         "named" | "retry" | "blocked" | "refused" => (named(shape.members, mode, decisions), 0),
         "stream" | "pair" => {
             let row = wire(shape);
@@ -2776,7 +2843,7 @@ fn count(cell: &str, out: &mut impl Write) -> io::Result<()> {
         _ => {
             return writeln!(
                 out,
-                "a count row's mode is in_process, commit, door, handle, named, retry, blocked, refused, stream or pair"
+                "a count row's mode is in_process, commit, door, handle, window, named, retry, blocked, refused, stream or pair"
             )
         }
     };
