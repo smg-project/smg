@@ -3446,6 +3446,37 @@ async fn a_pushing_successor_of_another_role_keeps_no_sentinel_from_its_predeces
     assert!(running_series(&rendered).ends_with(" 9"), "{rendered}");
 }
 
+/// A row can name a rank more than once: a rollup's entries keep their
+/// downstream workers' ranks, and a poll writes every one. The guard
+/// reads each entry of the rank: a successor's prefill entry and its
+/// decode entry both keep their series, and the capacity that only the
+/// second carries stands.
+#[tokio::test]
+async fn an_eviction_leaves_every_series_of_a_rank_its_successors_row_names_twice() {
+    let rendered = render_with_recorder(|| {
+        let (registry, monitor) = build_monitor();
+        let first = ready_worker("http://w:1", "m");
+        let id = registry.register(Arc::clone(&first)).unwrap();
+        polled(&monitor, &first, answer_of(0, 7));
+        let next = ready_worker("http://w:1", "m");
+        assert!(registry.replace(&id, Arc::clone(&next)));
+        let mut answer = a_pair_answer(9, 4);
+        answer.loads.extend(a_decode_answer(8, 5).loads);
+        answer.loads[1].max_total_num_tokens = 1000;
+        polled(&monitor, &next, answer);
+
+        monitor.evict_worker_loads(&first);
+        monitor.flush_pending_evictions();
+    });
+    assert!(
+        prefill_queue_series(&rendered).ends_with(" 4"),
+        "{rendered}"
+    );
+    assert!(decode_queue_series(&rendered).ends_with(" 5"), "{rendered}");
+    let capacity = series_with(&rendered, "smg_engine_kv_capacity_tokens", "model=\"m\"");
+    assert!(capacity.ends_with(" 1000"), "{rendered}");
+}
+
 /// A poll's series and its rows go out under one hold of the lock of the
 /// reports, where a record and the sentinel write theirs: nothing runs
 /// between a tick's series and its row.

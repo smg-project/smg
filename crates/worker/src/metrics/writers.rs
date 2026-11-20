@@ -1550,31 +1550,31 @@ impl Metrics {
     /// series with the registration ([`Self::remove_worker_metrics`]) and
     /// no-ops the writes that follow, this one included.
     ///
-    /// A series a live writer writes is left. `live` gives the loads that
-    /// live writers hold of this rank, under a model for the load gauges
-    /// and under any (`None`) for the pair gauges. A series is theirs
-    /// where [`Self::record_engine_rank_load`] writes it from such a load:
-    /// the five core gauges from any, the capacity gauge from one that
-    /// carries the capacity, a pair gauge from one that reports the role
-    /// and carries the figure. The label sets must match that writer's
-    /// exactly, or a fresh series is created instead of overwriting the
-    /// live one. One call a rank: no rank between two is written, and the
-    /// rank's label is built once.
-    pub(crate) fn remove_engine_rank_metrics<'l>(
+    /// A series a live writer writes is left. The writer asks `live`,
+    /// series by series: does a live writer at the URL hold an entry of
+    /// this rank that passes the series' test, under a model for the load
+    /// gauges and under any (`None`) for the pair gauges? The tests are
+    /// [`Self::record_engine_rank_load`]'s own conditions: any entry for
+    /// the five core gauges, one that carries the capacity for the
+    /// capacity gauge, one that reports the role and carries the figure
+    /// for a pair gauge. The collector answers over every entry of the
+    /// rank its live writers hold: a rollup's row names a rank once a
+    /// downstream worker, and a poll writes each. The label sets must
+    /// match that writer's exactly, or a fresh series is created instead
+    /// of overwriting the live one. One call a rank: no rank between two
+    /// is written, and the rank's label is built once.
+    pub(crate) fn remove_engine_rank_metrics(
         worker_url: &str,
         models: &[String],
         dp_rank: i32,
-        live: impl Fn(Option<&str>) -> LiveLoads<'l>,
+        live: impl Fn(Option<&str>, &LoadTest<'_>) -> bool,
     ) {
         let worker = intern_string(worker_url);
         let dp_rank = rank_label(dp_rank);
         for model_id in models {
-            let held = live(Some(model_id.as_str()));
-            let core = held.iter().any(Option::is_some);
-            let capacity = held
-                .iter()
-                .flatten()
-                .any(|load| load.max_total_num_tokens > 0);
+            let model_id = model_id.as_str();
+            let core = live(Some(model_id), &|_| true);
+            let capacity = live(Some(model_id), &|load| load.max_total_num_tokens > 0);
             if core && capacity {
                 continue;
             }
@@ -1598,12 +1598,11 @@ impl Metrics {
                 }
             }
         }
-        let held = live(None);
         for role in ["prefill", "decode", "null"] {
             let carries = |figure: fn(&crate::worker::SchedulerLoadSnapshot) -> bool| {
-                held.iter()
-                    .flatten()
-                    .any(|load| load.disagg_mode.as_deref() == Some(role) && figure(load))
+                live(None, &|load| {
+                    load.disagg_mode.as_deref() == Some(role) && figure(load)
+                })
             };
             for (name, written) in [
                 (
@@ -1637,10 +1636,10 @@ impl Metrics {
     }
 }
 
-/// The loads live writers hold of one rank at a worker's URL, for the
-/// sentinel's guard ([`Metrics::remove_engine_rank_metrics`]): at most a
-/// published row's and a pushed report's.
-pub(crate) type LiveLoads<'l> = [Option<&'l crate::worker::SchedulerLoadSnapshot>; 2];
+/// A test of one entry of a load, for the sentinel's guard
+/// ([`Metrics::remove_engine_rank_metrics`]): whether the entry carries
+/// the figure of the series in question.
+pub(crate) type LoadTest<'t> = dyn Fn(&crate::worker::SchedulerLoadSnapshot) -> bool + 't;
 
 #[cfg(test)]
 mod tests;
