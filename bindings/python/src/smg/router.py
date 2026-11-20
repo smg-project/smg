@@ -490,10 +490,12 @@ class Router:
 
         replaced = args.options_a_document_replaces()
         if replaced:
-            flags = ", ".join(f"--{name.replace('_', '-')}" for name in replaced)
+            # The settings by their names and values: a flag's spelling is
+            # the parser's, and one setting can have several.
+            settings = ", ".join(f"{name}={getattr(args, name)!r}" for name in replaced)
             raise ValueError(
-                "A policy document replaces the routing options, and these are set"
-                f" beside it: {flags}"
+                "A policy document replaces the routing settings, and these are set"
+                f" beside it: {settings}"
             )
         args_dict = vars(args).copy()
         provider = args.selected_discovery_provider()

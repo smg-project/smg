@@ -675,10 +675,10 @@ class TestPolicyDocument:
     @pytest.mark.parametrize(
         ("flags", "named"),
         [
-            (["--policy", "round_robin"], "--policy"),
-            (["--cache-threshold", "0.7"], "--cache-threshold"),
-            (["--pd-disaggregation", "--prefill-policy", "random"], "--prefill-policy"),
-            (["--disable-worker-overload-protection"], "--worker-overload-protection"),
+            (["--policy", "round_robin"], "policy='round_robin'"),
+            (["--cache-threshold", "0.7"], "cache_threshold=0.7"),
+            (["--pd-disaggregation", "--prefill-policy", "random"], "prefill_policy='random'"),
+            (["--disable-worker-overload-protection"], "worker_overload_protection=False"),
         ],
     )
     def test_a_routing_option_set_beside_a_document_is_refused_by_name(
@@ -689,8 +689,18 @@ class TestPolicyDocument:
         with pytest.raises(ValueError) as refusal:
             Router.from_args(args)
         assert str(refusal.value) == (
-            f"A policy document replaces the routing options, and these are set beside it: {named}"
+            f"A policy document replaces the routing settings, and these are set beside it: {named}"
         )
+
+    def test_a_policy_name_beside_a_document_is_refused_by_the_constructor(self, tmp_path):
+        with pytest.raises(ValueError, match="these are set beside it: policy, prefill_policy"):
+            _Router(
+                worker_urls=[],
+                policy_controller="on",
+                policy_spec=str(tmp_path / "routing.yaml"),
+                policy=PolicyType.Random,
+                prefill_policy=PolicyType.Random,
+            ).start()
 
     def test_the_routing_options_at_their_defaults_stand_beside_a_document(self, policy_document):
         # The chart's line carries these six at their defaults on every render.

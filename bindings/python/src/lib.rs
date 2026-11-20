@@ -1118,6 +1118,29 @@ impl Router {
             PolicyConfig as ConfigPolicyConfig, RoutingMode,
         };
 
+        // A policy document replaces the routing settings, and the launcher
+        // refuses each that is set beside one. A policy name left at none
+        // was not set, so this constructor refuses the four names itself.
+        if self.policy_spec.is_some() {
+            let named: Vec<&str> = [
+                ("policy", self.policy.is_some()),
+                ("prefill_policy", self.prefill_policy.is_some()),
+                ("decode_policy", self.decode_policy.is_some()),
+                ("encode_policy", self.encode_policy.is_some()),
+            ]
+            .into_iter()
+            .filter_map(|(name, set)| set.then_some(name))
+            .collect();
+            if !named.is_empty() {
+                return Err(config::ConfigError::ValidationFailed {
+                    reason: format!(
+                        "a policy document replaces the routing settings, and these are set beside it: {}",
+                        named.join(", ")
+                    ),
+                });
+            }
+        }
+
         // Validate the transport mode up front. The CLI (value_parser) and the
         // argparse path (choices) already reject bad values; this covers direct
         // programmatic `RouterArgs` use, matching the CLI/Rust parsing contract.
