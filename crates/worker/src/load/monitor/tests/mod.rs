@@ -46,8 +46,8 @@ impl LoadRecord for Unread {
         panic!("the telemetry of an ignored record was read")
     }
 
-    fn snapshot(&self) -> SchedulerLoadSnapshot {
-        panic!("the snapshot of an ignored record was built")
+    fn fields(&self) -> SchedulerLoadSnapshot {
+        panic!("the fields of an ignored record were read")
     }
 
     fn values_sent(&self) -> usize {
@@ -185,11 +185,8 @@ impl LoadRecord for PushedRecord {
         self.telemetry
     }
 
-    fn snapshot(&self) -> SchedulerLoadSnapshot {
-        // Marked as the wire's record marks its own.
-        let mut snapshot = self.snapshot.clone();
-        snapshot.mark_stated(self.telemetry);
-        snapshot
+    fn fields(&self) -> SchedulerLoadSnapshot {
+        self.snapshot.clone()
     }
 
     fn values_sent(&self) -> usize {
@@ -1113,11 +1110,11 @@ async fn a_pushed_heartbeat_with_no_capacity_offers_neither_fixed_count() {
         ]
     );
 
-    // A record that carries a held count and leaves its capacity out
-    // states neither: the entry keeps the capacity of the record before,
-    // and the rule reads the record's own.
+    // A record that carries a held count and leaves its capacity out: the
+    // entry keeps the capacity of the record before, so the rank has one,
+    // and the count the record carried is offered.
     monitor.apply_pushed_load(&worker, 0, &pushed(10).used_tokens(211), Instant::now());
-    assert!(offered(&monitor).is_empty());
+    assert_eq!(offered(&monitor), [("kv_tokens_used".to_owned(), 211.0)]);
     assert_eq!(figures(&monitor), (211, 8_192));
 }
 
