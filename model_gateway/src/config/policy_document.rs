@@ -727,27 +727,39 @@ impl Shared<'_> {
 }
 
 /// The one list of sources the keyed sides read, or the two policies whose
-/// lists differ: a binding names one list for every side.
+/// lists differ: a binding names one list for every side. The sides are held
+/// to the same session sources. Client sources are the hash ring's alone, and
+/// no other side's stage reads their key, so the binding takes them from the
+/// side that names them.
 fn one_list(
     keys: Vec<(&'static str, RoutingKeySpec)>,
 ) -> Result<Option<RoutingKeySpec>, PolicyDocumentError> {
+    let of_session = |source: &&KeySourceSpec| !source.client;
     let mut keys = keys.into_iter();
-    let Some((first, key)) = keys.next() else {
+    let Some((first, mut key)) = keys.next() else {
         return Ok(None);
     };
-    match keys.find(|(_, other)| *other != key) {
-        Some((second, _)) => Err(unsaid(
-            "policy",
-            format!("{first} and {second}"),
-            "the two sides read two lists of key sources and a binding names one",
-        )),
-        None => Ok(Some(key)),
+    for (second, other) in keys {
+        let same = other.strip_lineage == key.strip_lineage
+            && (other.sources.iter().filter(of_session)).eq(key.sources.iter().filter(of_session));
+        if !same {
+            return Err(unsaid(
+                "policy",
+                format!("{first} and {second}"),
+                "the two sides read two lists of key sources and a binding names one",
+            ));
+        }
+        if other.sources.len() > key.sources.len() {
+            key = other;
+        }
     }
+    Ok(Some(key))
 }
 
-/// A `routing_key` block holds eight sources at most.
+/// A `routing_key` block holds eight sources at most, its client sources
+/// not counted.
 fn within_a_block(key: &RoutingKeySpec, config: &RouterConfig) -> Result<(), PolicyDocumentError> {
-    if key.sources.len() > MAX_KEY_SOURCES {
+    if key.sources.iter().filter(|source| !source.client).count() > MAX_KEY_SOURCES {
         return Err(unsaid(
             "routing_key_override.headers",
             spelled(&config.routing_key_override.headers),
@@ -756,6 +768,9 @@ fn within_a_block(key: &RoutingKeySpec, config: &RouterConfig) -> Result<(), Pol
     }
     Ok(())
 }
+
+/// The two headers the hash ring reads as a client's key, in its order.
+const CLIENT_HEADERS: [&str; 2] = ["x-forwarded-for", "cookie"];
 
 /// The sources a keyed policy reads a request's routing key from, in the
 /// order it reads them, as a binding's `routing_key` block names them: an
@@ -775,9 +790,11 @@ fn within_a_block(key: &RoutingKeySpec, config: &RouterConfig) -> Result<(), Pol
 /// key header as sent where no configured header names it, while a block
 /// strips every source or none.
 ///
-/// The hash ring's two client headers, `x-forwarded-for` and `cookie`, are
-/// in no document yet: a key from them lifts no overload veto in the
-/// gateway, and a block's key does.
+/// `consistent_hashing` also names its two client headers as client
+/// sources: a key from them places a request that carries no session key,
+/// and lifts no overload veto. A configured `x-forwarded-for` is named both
+/// ways, as the gateway reads it: within the cap as a session's key, and
+/// whole as a client's.
 fn key_sources(
     policy: &PolicyConfig,
     config: &RouterConfig,
@@ -786,34 +803,44 @@ fn key_sources(
     let hint = match policy {
         PolicyConfig::Manual { .. } | PolicyConfig::ConsistentHashing => true,
         PolicyConfig::PrefixHash { .. } if !overridden => false,
-        _ if overridden => {
-            return Err(unsaid(
-                "routing_key_override.enabled",
-                true,
-                "the controller holds no recorded form of the sticky sessions' rule yet",
-            ));
+        // Each kind is named: a new one builds once its answer is written.
+        PolicyConfig::PrefixHash { .. }
+        | PolicyConfig::Random
+        | PolicyConfig::RoundRobin
+        | PolicyConfig::Passthrough
+        | PolicyConfig::CacheAware { .. }
+        | PolicyConfig::PowerOfTwo { .. }
+        | PolicyConfig::LeastLoad { .. }
+        | PolicyConfig::Bucket { .. } => {
+            return if overridden {
+                Err(unsaid(
+                    "routing_key_override.enabled",
+                    true,
+                    "the controller holds no recorded form of the sticky sessions' rule yet",
+                ))
+            } else {
+                Ok(None)
+            };
         }
-        _ => return Ok(None),
     };
-    let header = |name: &str| KeySourceSpec {
+    let header = |name: &str, client| KeySourceSpec {
         header: Some(name.to_string()),
-        rid: false,
-        max_bytes: None,
+        client,
+        ..KeySourceSpec::default()
+    };
+    let reads = |sources: &[KeySourceSpec], name: &str| {
+        sources
+            .iter()
+            .any(|source| source.header.as_deref() == Some(name))
     };
     let mut sources: Vec<KeySourceSpec> = Vec::new();
     for name in &config.routing_key_override.headers {
         let name = name.to_ascii_lowercase();
-        if !sources
-            .iter()
-            .any(|source| source.header.as_deref() == Some(name.as_str()))
-        {
-            sources.push(header(&name));
+        if !reads(&sources, &name) {
+            sources.push(header(&name, false));
         }
     }
-    let configured = sources
-        .iter()
-        .any(|source| source.header.as_deref() == Some(MANUAL_SESSION_HEADER));
-    if hint && !configured {
+    if hint && !reads(&sources, MANUAL_SESSION_HEADER) {
         if overridden {
             return Err(unsaid(
                 "routing_key_override.headers",
@@ -821,14 +848,16 @@ fn key_sources(
                 "under the override the routing key header is read as sent behind these headers, and a binding strips every source or none",
             ));
         }
-        sources.push(header(MANUAL_SESSION_HEADER));
+        sources.push(header(MANUAL_SESSION_HEADER, false));
     }
     if overridden {
         sources.push(KeySourceSpec {
-            header: None,
             rid: true,
-            max_bytes: None,
+            ..KeySourceSpec::default()
         });
+    }
+    if matches!(policy, PolicyConfig::ConsistentHashing) {
+        sources.extend(CLIENT_HEADERS.map(|name| header(name, true)));
     }
     Ok(Some(RoutingKeySpec {
         sources,
@@ -1333,7 +1362,9 @@ mod tests {
                 "consistent_hashing",
                 json!([
                     { "header": "x-session-id" },
-                    { "header": "x-smg-routing-key" }
+                    { "header": "x-smg-routing-key" },
+                    { "header": "x-forwarded-for", "client": true },
+                    { "header": "cookie", "client": true }
                 ])
             ))
         );
@@ -1347,6 +1378,27 @@ mod tests {
             "routing_key_override.headers"
         );
         assert!(keyed("manual", &eight).policy_document().is_ok());
+        // The hash ring's two client sources are counted apart: seven
+        // configured headers and the routing key header are its eight.
+        let seven = keyed("consistent_hashing", &eight[..7]);
+        let written = seven.policy_document().expect("eight sources");
+        assert!(seven.hosted_policy(&written).is_ok());
+
+        // The hash ring reads a configured `x-forwarded-for` both ways,
+        // within the cap as a session's key and whole as a client's. The
+        // document names it twice, and the controller's check takes it.
+        let both_ways = keyed("consistent_hashing", &["x-forwarded-for"]);
+        let document = sources(
+            "consistent_hashing",
+            json!([
+                { "header": "x-forwarded-for" },
+                { "header": "x-smg-routing-key" },
+                { "header": "x-forwarded-for", "client": true },
+                { "header": "cookie", "client": true }
+            ]),
+        );
+        assert_eq!(both_ways.policy_document().as_ref(), Ok(&document));
+        assert!(both_ways.hosted_policy(&document).is_ok());
 
         // No other policy reads a key, so its document names no source.
         let keyed_policies = ["manual", "prefix_hash", "consistent_hashing"];
@@ -1377,7 +1429,12 @@ mod tests {
             overridden("consistent_hashing").policy_document(),
             Ok(edited(preset("consistent_hashing"), |document| {
                 document["bindings"][0]["routing_key"] = json!({
-                    "sources": [{ "header": "x-smg-routing-key" }, { "rid": true }],
+                    "sources": [
+                        { "header": "x-smg-routing-key" },
+                        { "rid": true },
+                        { "header": "x-forwarded-for", "client": true },
+                        { "header": "cookie", "client": true }
+                    ],
                     "strip_lineage": true
                 });
             }))
@@ -1438,7 +1495,7 @@ mod tests {
                 .and_then(|binding| binding.routing_key.as_ref())
                 .map(|key| key.sources.len())
         });
-        assert_eq!(sources, Ok(Some(2)));
+        assert_eq!(sources, Ok(Some(4)));
     }
 
     #[test]

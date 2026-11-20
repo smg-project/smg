@@ -6,6 +6,14 @@
 //! one function, [`KeySources::derive`], for a host in process and for a
 //! gateway that asks a controller under an address.
 //!
+//! A source can also tell one client from another: a header a proxy or a
+//! browser sets. Its key is a second fact, read by
+//! [`KeySources::derive_client`]: a ring places by it where the request
+//! carries no session key, and nothing else reads it
+//! ([`RequestFacts::client_key`]).
+//!
+//! [`RequestFacts::client_key`]: crate::RequestFacts::client_key
+//!
 //! [`RequestFacts::session_key`]: crate::RequestFacts::session_key
 
 use crate::{
@@ -33,6 +41,9 @@ struct Source {
     /// Whether the key leaves in the clear: the document lets a stage read
     /// the header, or the source is the request's own id.
     plain: bool,
+    /// Whether the source tells one client from another: it hands the
+    /// client's key and never the session's.
+    client: bool,
 }
 
 /// Where a derived key came from.
@@ -79,6 +90,7 @@ impl KeySources {
                     .is_none_or(|name| view.headers.contains(name)),
                 header: source.header.as_deref().map(Box::from),
                 max_bytes: bytes(source.max_bytes.unwrap_or(KEY_BYTES)),
+                client: source.client,
             })
             .collect();
         Self {
@@ -101,6 +113,7 @@ impl KeySources {
                 header: Some(name.as_str().into()),
                 max_bytes: bytes(KEY_BYTES),
                 plain: true,
+                client: false,
             })
             .collect();
         Self {
@@ -145,7 +158,8 @@ impl KeySources {
                 key
             }
         };
-        self.sources.iter().find_map(|source| {
+        let mut session = self.sources.iter().filter(|source| !source.client);
+        session.find_map(|source| {
             let (key, from) = match &source.header {
                 Some(name) => {
                     let value = header(name)?;
@@ -174,6 +188,26 @@ impl KeySources {
                 source: from,
             })
         })
+    }
+
+    /// The request's client key: the fingerprint of the value under the
+    /// first client source's header the request carries, `0` where it
+    /// carries none of them or that value cannot be handed. A value is
+    /// handed where it is not empty and is visible ASCII, as a header's
+    /// text is. It is read whole, with any suffix, and no source behind it
+    /// is read. Its text leaves in no form.
+    pub fn derive_client<'a>(&self, header: impl Fn(&str) -> Option<&'a [u8]>) -> u64 {
+        self.sources
+            .iter()
+            .filter(|source| source.client)
+            .find_map(|source| header(source.header.as_deref()?))
+            .filter(|value| {
+                !value.is_empty()
+                    && value
+                        .iter()
+                        .all(|&byte| matches!(byte, b'\t' | b' '..=b'~'))
+            })
+            .map_or(0, fingerprint)
     }
 }
 
@@ -354,6 +388,42 @@ mod tests {
         assert_eq!(keeps.derive(request(&[]), Some(&suffixed)), None);
         let over = format!("{base}k_t2");
         assert_eq!(strips.derive(request(&[]), Some(&over)), None);
+    }
+
+    /// A client source hands the client's key and never the session's. The
+    /// first of them the request carries is the one read: a value it cannot
+    /// hand ends the read, and the value is read whole.
+    #[test]
+    fn a_client_source_hands_the_clients_key_alone() {
+        let sources = sources(
+            r#"{"sources":[{"header":"x-smg-routing-key"},{"header":"x-forwarded-for","client":true},{"header":"cookie","client":true}],"strip_lineage":true}"#,
+        );
+        let cookie = "c".repeat(10_000);
+        let both: [(&str, &[u8]); 2] = [
+            ("cookie", cookie.as_bytes()),
+            ("x-forwarded-for", b"10.0.0.1_t2"),
+        ];
+        assert_eq!(sources.derive(request(&both), None), None, "no session key");
+        assert_eq!(
+            sources.derive_client(request(&both)),
+            fingerprint(b"10.0.0.1_t2"),
+            "the first client header, whole"
+        );
+        assert_eq!(
+            sources.derive_client(request(&both[..1])),
+            fingerprint(cookie.as_bytes()),
+            "the next one where the first is absent, at any length"
+        );
+        for unusable in [&b""[..], &[0xc3, 0xa9][..]] {
+            let present: [(&str, &[u8]); 2] =
+                [("cookie", b"session=abc"), ("x-forwarded-for", unusable)];
+            assert_eq!(sources.derive_client(request(&present)), 0, "{unusable:?}");
+        }
+        assert_eq!(sources.derive_client(request(&[])), 0);
+        assert_eq!(
+            sources.headers().collect::<Vec<_>>(),
+            ["x-smg-routing-key", "x-forwarded-for", "cookie"]
+        );
     }
 
     /// A key from a header the view does not list leaves as its fingerprint

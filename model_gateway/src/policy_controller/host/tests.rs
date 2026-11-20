@@ -694,7 +694,7 @@ async fn a_returning_prefix_lands_on_the_worker_that_holds_it() {
             ..first(b"returning")
         };
         assert_eq!(
-            returning.request(Identity::NONE, &[]).facts.block_size,
+            returning.request(Identity::NONE, 0, &[]).facts.block_size,
             block_size
         );
     }
@@ -976,17 +976,46 @@ async fn an_ask_states_the_key_its_bindings_sources_hold() {
     };
     let (_, store, _) = bed_under(manual(), &URLS[..1]);
     store.deciding(|world| {
-        let derived = ask.key(world.spec()).expect("the header's key");
+        let (derived, client) = ask.keys(world.spec());
+        let derived = derived.expect("the header's key");
         assert_eq!(derived.key, Identity::plain("conv-1"));
         assert_eq!(derived.source, KeySource::Header(KEY_HEADER));
-        let stated = ask.request(derived.key, &[]).facts.session_key;
+        assert_eq!(client, 0);
+        let stated = ask.request(derived.key, client, &[]).facts.session_key;
         assert_eq!(stated, derived.key);
         let bare = first(b"request");
-        assert_eq!(bare.key(world.spec()), None, "no header");
+        assert_eq!(bare.keys(world.spec()), (None, 0), "no header");
     });
     // A binding that names no source gives its requests no key.
     let (_, store, _) = bed(&URLS[..1]);
-    store.deciding(|world| assert_eq!(ask.key(world.spec()), None));
+    store.deciding(|world| assert_eq!(ask.keys(world.spec()), (None, 0)));
+}
+
+#[tokio::test]
+async fn an_ask_with_no_routing_key_states_its_clients_key() {
+    // The hash ring's document names the two client headers behind the
+    // routing key header.
+    let (_, store, _) = bed_under(PolicyConfig::ConsistentHashing, &URLS[..1]);
+    let keys_of = |headers: &HeaderMap| {
+        let ask = Ask {
+            headers: Some(headers),
+            ..first(b"request")
+        };
+        store.deciding(|world| {
+            let (derived, client) = ask.keys(world.spec());
+            let stated = ask.request(Identity::NONE, client, &[]).facts.client_key;
+            assert_eq!(stated, client);
+            (derived.is_none(), client)
+        })
+    };
+    let mut headers = keyed("cookie", "session=abc");
+    assert_eq!(keys_of(&headers), (true, fingerprint(b"session=abc")));
+    headers.insert("x-forwarded-for", HeaderValue::from_static("10.0.0.1"));
+    assert_eq!(keys_of(&headers), (true, fingerprint(b"10.0.0.1")));
+    // A routing key leaves the client's unread.
+    headers.insert(KEY_HEADER, HeaderValue::from_static("conv-1"));
+    assert_eq!(keys_of(&headers), (false, 0));
+    assert_eq!(keys_of(&HeaderMap::new()), (true, 0));
 }
 
 #[tokio::test]
@@ -1014,7 +1043,8 @@ async fn a_key_is_read_by_the_documents_sources_in_their_order() {
         };
         let key = |derived: DerivedKey<'_>| owned(derived.key);
         store.deciding(|world| {
-            ask.key(world.spec())
+            ask.keys(world.spec())
+                .0
                 .map_or_else(|| owned(Identity::NONE), key)
         })
     };
@@ -1109,15 +1139,7 @@ async fn a_key_keeps_its_worker_across_requests_under_the_manual_policy() {
 
 #[tokio::test]
 async fn a_key_keeps_its_worker_under_consistent_hashing() {
-    let ring = PolicyConfig::ConsistentHashing;
-    let (host, store, _) = bed_under(ring.clone(), &URLS);
-    // The converter names no source for the ring yet: the document names
-    // the header here, as an operator's would.
-    let block = RoutingKeySpec {
-        sources: vec![header(KEY_HEADER)],
-        strip_lineage: false,
-    };
-    name_sources(&store, ring, block);
+    let (host, store, _) = bed_under(PolicyConfig::ConsistentHashing, &URLS);
     let now = Instant::now();
     let headers = keyed(KEY_HEADER, "conv-1");
     let ask = Ask {
@@ -1147,6 +1169,33 @@ async fn a_key_keeps_its_worker_under_consistent_hashing() {
         placed.released(ReleaseReason::ClientGone, now);
     }
     assert!(owners.len() >= 2, "ring owners: {owners:?}");
+    assert!(SessionsStore::is_empty(&*store));
+}
+
+#[tokio::test]
+async fn a_clients_key_keeps_its_worker_under_consistent_hashing() {
+    let (host, store, _) = bed_under(PolicyConfig::ConsistentHashing, &URLS);
+    let now = Instant::now();
+    // No routing key: the ring places each client's requests by its cookie.
+    let mut owners = BTreeSet::new();
+    for client in 0..20u8 {
+        let headers = keyed("cookie", &format!("session={client}"));
+        let mut placed_at = BTreeSet::new();
+        for turn in 0..4u8 {
+            let id = [client, turn];
+            let ask = Ask {
+                headers: Some(&headers),
+                ..first(&id)
+            };
+            let mut placed = host.place(&ask, now).await.expect("a worker");
+            placed_at.insert(placed.id());
+            placed.released(ReleaseReason::ClientGone, now);
+        }
+        assert_eq!(placed_at.len(), 1, "client {client}");
+        owners.extend(placed_at);
+    }
+    assert!(owners.len() >= 2, "ring owners: {owners:?}");
+    // A client's key pins no session.
     assert!(SessionsStore::is_empty(&*store));
 }
 

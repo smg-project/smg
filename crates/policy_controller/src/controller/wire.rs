@@ -360,6 +360,9 @@ impl Checked {
                 // whose rule has an in-flight cap.
                 lent_session_in_flight: None,
                 session_counted: false,
+                // The wire carries no client key yet: a request with no
+                // session key is placed as one with no key.
+                client_key: 0,
             },
             &Constraints {
                 excluded: &lists.excluded,

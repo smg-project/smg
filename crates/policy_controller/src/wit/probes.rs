@@ -212,10 +212,10 @@ pub(crate) fn all() -> Vec<Probe> {
             prompt_tokens, block_hashes, hash_kind, session_key, phase, attempt, tried,
             budget_micros, headers, media, seed, block_size, now_micros, pinned_at,
             lent_in_flight, lent_session_in_flight, session_counted, affinity, named,
-            model_fingerprint,
+            model_fingerprint, client_key,
         } host [
             now_micros, pinned_at, lent_in_flight, lent_session_in_flight, session_counted,
-            affinity, named, model_fingerprint
+            affinity, named, model_fingerprint, client_key
         ],
         &request),
         probe!("zone-capacity", before [], ZoneCapacity { zone, healthy, total } host [], &zone),

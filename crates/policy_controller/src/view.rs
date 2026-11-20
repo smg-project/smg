@@ -954,6 +954,12 @@ pub struct RequestFacts<'a> {
     /// that hands a decision its facts from the host's own store makes
     /// them so. In-process only: the wire carries the name.
     pub model_fingerprint: ModelFingerprint,
+    /// The fingerprint of the request's client key, `0` where it has none
+    /// ([`KeySources::derive_client`](crate::KeySources::derive_client)):
+    /// what a ring places by where the request carries no session key. It
+    /// lifts no overload veto, pins no session and is counted under no key.
+    /// In-process only: the wire carries no client key yet.
+    pub client_key: u64,
 }
 
 /// The multiplier that spreads a session's model and phase over its key.
@@ -1073,6 +1079,17 @@ impl<'a> RequestFacts<'a> {
             AffinityFacts::default()
         } else {
             feed.entry(index)
+        }
+    }
+
+    /// The key a ring places the request by: its session key's fingerprint,
+    /// else its client's ([`RequestFacts::client_key`]), `0` where it has
+    /// neither.
+    #[must_use]
+    pub fn ring_key(&self) -> u64 {
+        match self.session_key.hash {
+            0 => self.client_key,
+            session => session,
         }
     }
 
