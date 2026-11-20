@@ -32,6 +32,7 @@ on:
       - model_gateway/src/workflow/**
       - crates/workflow/**
       - crates/worker/src/workflow/**
+      - crates/worker/src/workflow.rs
       - crates/worker/src/worker.rs
       - crates/mock_worker/**
       - model_gateway/tests/discovery/k8s_discovery_test.rs

@@ -89,3 +89,8 @@ def test_discovery_runs_when_the_workflow_crate_changes():
 def test_discovery_runs_when_the_worker_workflow_steps_change():
     workflow = ROOT / ".github" / "workflows" / "e2e-discovery.yml"
     assert ("pull_request", "paths", "crates/worker/src/workflow/**") in filter_entries(workflow)
+
+
+def test_discovery_runs_when_the_worker_workflow_root_changes():
+    workflow = ROOT / ".github" / "workflows" / "e2e-discovery.yml"
+    assert ("pull_request", "paths", "crates/worker/src/workflow.rs") in filter_entries(workflow)
