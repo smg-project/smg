@@ -18,6 +18,12 @@
 //!
 //! A request that demands nothing reads no column and pays one test.
 //!
+//! A request's context window is two bounds: what its input takes, and
+//! what its completion may ([`Demands::input_window`],
+//! [`Demands::output_window`]). Each is held against a worker's window
+//! alone ([`DemandFacts::window`]), and the two are not added. A worker
+//! that states no window holds a request of any size.
+//!
 //! A pool the demands leave nobody is shed with no endpoint, under the
 //! stage of one demand ([`Unmet::stage`]). A row is judged by the demand it
 //! fails first, in the order a host answers for them ([`Unmet`]), and the
@@ -42,7 +48,8 @@ pub enum References {
 }
 
 /// What a request demands of the worker that takes it. The default demands
-/// nothing.
+/// nothing. Further demands add their fields: a host writes the rest of the
+/// type as `..Demands::default()`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Demands {
     /// The runtime the request stays on: a retry states the number its
@@ -57,13 +64,27 @@ pub struct Demands {
     pub vision: bool,
     /// Where the request's media by reference may be processed.
     pub references: References,
+    /// The context window the request's input needs, in tokens: the count
+    /// of its prompt, and one more where the request scores the position
+    /// behind it. Only a worker whose window is as wide
+    /// ([`DemandFacts::window`]), or that states none, takes the request.
+    /// `0` demands none.
+    pub input_window: u32,
+    /// The context window the request's completion needs, in tokens: its
+    /// budget. It is held against a worker's window alone, as the input
+    /// is. `0` demands none.
+    pub output_window: u32,
 }
 
 impl Demands {
     /// Whether the request demands nothing: its door reads no fact then.
     #[must_use]
     pub const fn is_none(self) -> bool {
-        self.runtime == 0 && !self.vision && matches!(self.references, References::None)
+        self.runtime == 0
+            && !self.vision
+            && matches!(self.references, References::None)
+            && self.input_window == 0
+            && self.output_window == 0
     }
 
     /// The demand a worker fails first, in the order of [`Unmet`]: `vision`
@@ -78,17 +99,26 @@ impl Demands {
             return Some(Unmet::Vision);
         }
         let host = match self.references {
-            References::None => return None,
-            References::Any => facts.host_pipeline,
-            References::Host => true,
-            References::Worker => false,
+            References::None => None,
+            References::Any => Some(facts.host_pipeline),
+            References::Host => Some(true),
+            References::Worker => Some(false),
         };
-        if !facts.references {
-            Some(Unmet::References)
-        } else if facts.host_pipeline != host {
-            Some(Unmet::Pipeline)
-        } else {
+        if let Some(host) = host {
+            if !facts.references {
+                return Some(Unmet::References);
+            }
+            if facts.host_pipeline != host {
+                return Some(Unmet::Pipeline);
+            }
+        }
+        // A window that is stated holds each bound alone.
+        let held = facts.window == 0
+            || (self.input_window <= facts.window && self.output_window <= facts.window);
+        if held {
             None
+        } else {
+            Some(Unmet::Window)
         }
     }
 
@@ -101,9 +131,12 @@ impl Demands {
 
 /// What a worker states for the hard demands of a request beside its row,
 /// by its registration: one entry a row, in a column beside the rows. The
-/// default states nothing, and meets no demand that reads it. Whether the
-/// worker takes images is no entry of the column: its row carries that bit
-/// ([`WorkerFacts::vision`](crate::store::WorkerFacts::vision)).
+/// default states nothing: it meets no demand for a runtime or for media by
+/// reference, and it holds a request of any size. Whether the worker takes
+/// images is no entry of the column: its row carries that bit
+/// ([`WorkerFacts::vision`](crate::store::WorkerFacts::vision)). Further
+/// demands add their fields: a host writes the rest of the type as
+/// `..DemandFacts::default()`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DemandFacts {
     /// The worker's runtime as a number its registering host names: equal
@@ -116,6 +149,10 @@ pub struct DemandFacts {
     /// pipeline, and not by one of its own. Read only beside
     /// [`Self::references`].
     pub host_pipeline: bool,
+    /// The worker's context window in tokens, where its registering host
+    /// holds a request to it. `0` states none, and the worker takes a
+    /// request of any size.
+    pub window: u32,
 }
 
 /// The stage a pool is shed under when none of its rows processes media by
@@ -127,11 +164,16 @@ pub(crate) const REFERENCES: &str = "references";
 /// ([`Unmet::Pipeline`]).
 pub(crate) const PIPELINE: &str = "pipeline";
 
+/// The stage a pool is shed under when each of its rows states a context
+/// window that holds less than the request needs ([`Unmet::Window`]).
+pub(crate) const CONTEXT_WINDOW: &str = "context-window";
+
 /// The demand a worker fails first. The order is the order a host answers
 /// for them: a pool is cut to its request's runtime, then to the workers
 /// that take images, then to those that process media by reference, then
-/// to the pipeline the request names. Further demands add their cases: a
-/// host's match keeps an arm for the rest.
+/// to the pipeline the request names, then to the windows that hold the
+/// request. Further demands add their cases: a host's match keeps an arm
+/// for the rest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[non_exhaustive]
 pub enum Unmet {
@@ -143,6 +185,9 @@ pub enum Unmet {
     References,
     /// The worker processes media by reference by the other pipeline.
     Pipeline,
+    /// The worker's context window holds less than the request's input or
+    /// its completion needs.
+    Window,
 }
 
 impl Unmet {
@@ -158,6 +203,7 @@ impl Unmet {
             Self::Vision => crate::framework::VISION,
             Self::References => REFERENCES,
             Self::Pipeline => PIPELINE,
+            Self::Window => CONTEXT_WINDOW,
         }
     }
 }
@@ -203,6 +249,7 @@ mod tests {
                 runtime: 7,
                 references,
                 host_pipeline,
+                ..DemandFacts::default()
             };
             (vision, facts)
         };
@@ -210,6 +257,7 @@ mod tests {
             runtime: 7,
             vision,
             references,
+            ..Demands::default()
         };
         for demands in [
             asks(true, References::None),
@@ -257,6 +305,56 @@ mod tests {
         assert_eq!(every.unmet_by(true, elsewhere), Some(Unmet::Runtime));
     }
 
+    /// A window demand is two bounds, the input's and the completion's, and
+    /// a worker's window holds each alone: the two are not added. A worker
+    /// that states no window holds a request of any size. The window is
+    /// judged last, behind the pipeline of media by reference.
+    #[test]
+    fn a_window_holds_each_bound_alone_and_none_stated_holds_any_request() {
+        let window = |window: u32| DemandFacts {
+            window,
+            ..DemandFacts::default()
+        };
+        let asks = |input_window: u32, output_window: u32| Demands {
+            input_window,
+            output_window,
+            ..Demands::default()
+        };
+        assert!(asks(0, 0).is_none());
+        assert!(!asks(1, 0).is_none() && !asks(0, 1).is_none());
+        // The request's two bounds, the worker's window, whether it holds.
+        let table = [
+            ((100, 0), 100, true),
+            ((101, 0), 100, false),
+            ((0, 100), 100, true),
+            ((0, 101), 100, false),
+            ((100, 100), 100, true),
+            ((60, 60), 100, true),
+            ((150, 150), 200, true),
+            ((150, 150), 100, false),
+            ((u32::MAX, u32::MAX), 0, true),
+        ];
+        for ((input, output), stated, held) in table {
+            let unmet = asks(input, output).unmet_by(false, window(stated));
+            let judged = if held { None } else { Some(Unmet::Window) };
+            assert_eq!(unmet, judged, "{input} {output} {stated}");
+        }
+        let both = Demands {
+            references: References::Host,
+            ..asks(101, 0)
+        };
+        let own = DemandFacts {
+            references: true,
+            ..window(100)
+        };
+        assert_eq!(both.unmet_by(false, own), Some(Unmet::Pipeline));
+        let host = DemandFacts {
+            host_pipeline: true,
+            ..own
+        };
+        assert_eq!(both.unmet_by(false, host), Some(Unmet::Window));
+    }
+
     /// The demands stand in the order a host answers for them, and each has
     /// the stage its pool is shed under.
     #[test]
@@ -266,11 +364,18 @@ mod tests {
             Unmet::Vision,
             Unmet::References,
             Unmet::Pipeline,
+            Unmet::Window,
         ];
         assert!(order.is_sorted());
         assert_eq!(
             order.map(Unmet::stage),
-            ["wires", "vision", "references", "pipeline"]
+            [
+                "wires",
+                "vision",
+                "references",
+                "pipeline",
+                "context-window"
+            ]
         );
     }
 }

@@ -6621,6 +6621,7 @@ pub(crate) mod tests {
                 runtime: 7,
                 references,
                 host_pipeline,
+                ..DemandFacts::default()
             };
             (vision, stated)
         };
