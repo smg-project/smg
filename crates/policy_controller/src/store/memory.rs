@@ -36,7 +36,7 @@ use crate::{
         loads::{LoadSample, LoadSink, LoadSource, PollMode, Wake},
         reservations::{ReservationKind, ReservationStore},
         sessions::{Pin, SessionTables, SessionsStore},
-        signals::{SignalSink, Taken, Writes},
+        signals::{SignalSink, Taken, Writes, VALUE_MAGNITUDE_LIMIT},
         workers::{
             identity, Maker, MembershipChange, MembershipTail, WorkerFacts, WorkerPatch, WorkerRow,
             WorkerStatus, WorkersStore,
@@ -3026,8 +3026,8 @@ impl MemoryStore {
             Ok(found) => found,
             Err(taken) => return taken,
         };
-        if !value.is_finite() {
-            return Taken::NotFinite;
+        if !value.is_finite() || value.abs() > VALUE_MAGNITUDE_LIMIT {
+            return Taken::OutOfRange;
         }
         let mut loads = self.loads.lock();
         let Loads {

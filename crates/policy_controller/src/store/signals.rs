@@ -46,10 +46,11 @@ pub trait SignalSink: Send + Sync {
     /// one, else the age of the record that carried it, else its receipt.
     ///
     /// The value is taken where the document in force declares the name,
-    /// `unit` is the declared one, the value is finite, the worker is a
-    /// member and no newer sample of the name is on file for the rank. Of
-    /// two sources of one signal the newer sample stands, whichever arrives
-    /// last. Every other write is dropped and counted by what became of it.
+    /// `unit` is the declared one, the value is finite and of magnitude at
+    /// most 1e15, the worker is a member and no newer sample of the name
+    /// is on file for the rank. Of two sources of one signal the newer
+    /// sample stands, whichever arrives last. Every other write is dropped
+    /// and counted by what became of it.
     /// The name, the unit and the value are read before any lock is taken:
     /// a value under a name no document declares costs one lookup.
     fn signal_value(
@@ -63,6 +64,12 @@ pub trait SignalSink: Send + Sync {
     ) -> Taken;
 }
 
+/// The largest magnitude of a value the sink takes: the bound a cost
+/// rule's own parameters are held to. A value times a coefficient then
+/// stays far inside the finite range, and so does a sum of such terms. A
+/// cost that left the range would level the score of every other row.
+pub(crate) const VALUE_MAGNITUDE_LIMIT: f64 = crate::spec::COST_PARAMETER_LIMIT;
+
 /// What became of a write to the signal sink.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -75,8 +82,9 @@ pub enum Taken {
     Undeclared,
     /// The stated unit is not the one the document declares.
     WrongUnit,
-    /// The value is not a finite number.
-    NotFinite,
+    /// The value is not a finite number, or its magnitude is above 1e15:
+    /// the bound a cost rule's own parameters are held to.
+    OutOfRange,
     /// The worker is no member.
     NotAMember,
     /// A newer sample of the name is on file for the rank.
@@ -90,7 +98,7 @@ impl Taken {
         Self::Written,
         Self::Undeclared,
         Self::WrongUnit,
-        Self::NotFinite,
+        Self::OutOfRange,
         Self::NotAMember,
         Self::Older,
     ];
@@ -101,7 +109,7 @@ impl Taken {
             Self::Written => "written",
             Self::Undeclared => "undeclared",
             Self::WrongUnit => "wrong_unit",
-            Self::NotFinite => "not_finite",
+            Self::OutOfRange => "out_of_range",
             Self::NotAMember => "not_a_member",
             Self::Older => "older",
         }
@@ -113,7 +121,7 @@ impl Taken {
             Self::Written => 0,
             Self::Undeclared => 1,
             Self::WrongUnit => 2,
-            Self::NotFinite => 3,
+            Self::OutOfRange => 3,
             Self::NotAMember => 4,
             Self::Older => 5,
         }

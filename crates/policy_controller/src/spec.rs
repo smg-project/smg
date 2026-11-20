@@ -775,7 +775,9 @@ pub struct ResidentWorkParams {
     pub request_tokens: u32,
 }
 
-const COST_PARAMETER_LIMIT: f64 = 1e15;
+/// The largest magnitude of a cost rule's parameter. The signal sink holds
+/// a value it takes to the same bound.
+pub(crate) const COST_PARAMETER_LIMIT: f64 = 1e15;
 const RELATIVE_MARGIN_LIMIT: f64 = 1e6;
 
 /// The least-cost scorer: a sum of a row's fields times their coefficients,

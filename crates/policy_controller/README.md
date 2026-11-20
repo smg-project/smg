@@ -828,7 +828,7 @@ The admin `/metrics` endpoint exports the following series. A spec source adds t
 | `smg_policy_controller_members_outside_list` | Members not classified by a configured list, by `list` (`engines` or `zones`). |
 | `smg_policy_controller_overload_flips_total` | Load writes that changed an overload verdict. |
 | `smg_policy_controller_lifecycle_faults_total` | Panics contained while applying dispatch, completion, release or dispatch expiry. |
-| `smg_policy_controller_signal_writes_total` | Named values written to the store, by `outcome` (`written`, `undeclared`, `wrong_unit`, `not_finite`, `not_a_member` or `older`). |
+| `smg_policy_controller_signal_writes_total` | Named values written to the store, by `outcome` (`written`, `undeclared`, `wrong_unit`, `out_of_range`, `not_a_member` or `older`). |
 
 Plugin stats are available through the host APIs. Both kinds count answers, declines, exhausted decision budgets, breaker bypass and openings, stalls and observed events. WebAssembly also reports traps, fuel use and exhaustion, invalid replies, overlong calls, instantiations, lost events and unread timing. gRPC reports plugin Busy, invalid replies, overlarge pools, cold or refused frames, misses and their attribution, connections, stream failures, late answers and dropped observe events. Declared counters are separate from these host stats. [WebAssembly stats](src/wasm/plugin.rs) · [gRPC stats](src/grpc/plugin.rs)
 

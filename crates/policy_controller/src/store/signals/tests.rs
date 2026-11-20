@@ -468,10 +468,10 @@ fn a_write_that_is_not_taken_says_what_became_of_it_and_is_counted() {
     assert_eq!(write(a, QUEUE, REQUESTS, 5.0, at), Taken::Written);
     assert_eq!(write(a, "depth", REQUESTS, 5.0, at), Taken::Undeclared);
     assert_eq!(write(a, QUEUE, "tokens", 5.0, at), Taken::WrongUnit);
-    assert_eq!(write(a, QUEUE, REQUESTS, f64::NAN, at), Taken::NotFinite);
+    assert_eq!(write(a, QUEUE, REQUESTS, f64::NAN, at), Taken::OutOfRange);
     assert_eq!(
         write(a, QUEUE, REQUESTS, f64::INFINITY, at),
-        Taken::NotFinite
+        Taken::OutOfRange
     );
     assert_eq!(
         write(WorkerId(u64::MAX), QUEUE, REQUESTS, 5.0, at),
@@ -487,6 +487,29 @@ fn a_write_that_is_not_taken_says_what_became_of_it_and_is_counted() {
     assert_eq!(
         values(&store),
         by_id([(a, Some(5.0)), (b, None), (c, None)])
+    );
+}
+
+/// The sink holds a value's magnitude to the bound a cost rule's own
+/// parameters are held to. Past it a value times a coefficient can leave
+/// the finite range, and one row's infinite cost levels the score of every
+/// other row. The bound itself is taken, under either sign.
+#[test]
+fn a_value_past_the_magnitude_bound_is_refused_and_counted() {
+    let stages = stages();
+    let (store, [a, b, c]) = fleet(&stages);
+    let at = Instant::now();
+    let past = f64::from_bits(1e15_f64.to_bits() + 1);
+    assert!(past > 1e15 && past.is_finite());
+    assert_eq!(write(&store, a, 1e15, at), Taken::Written);
+    assert_eq!(write(&store, b, -1e15, at), Taken::Written);
+    for value in [past, -past, f64::MAX, f64::NEG_INFINITY] {
+        assert_eq!(write(&store, c, value, at), Taken::OutOfRange, "{value}");
+    }
+    assert_eq!(store.counts().signal_writes[Taken::OutOfRange.place()], 4);
+    assert_eq!(
+        values(&store),
+        by_id([(a, Some(1e15)), (b, Some(-1e15)), (c, None)])
     );
 }
 

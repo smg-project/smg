@@ -902,7 +902,7 @@ mod tests {
             ("written", 7),
             ("undeclared", 1),
             ("wrong_unit", 2),
-            ("not_finite", 3),
+            ("out_of_range", 3),
             ("not_a_member", 4),
             ("older", 5),
         ];
