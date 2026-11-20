@@ -282,7 +282,8 @@ impl fmt::Debug for EventSet {
 /// hooks are bounded, and call no door of the leases' store. A hook that
 /// panics at a dispatch, a completion or a release that a frame brings,
 /// or at a dispatch deadline's end, is held there: the lease's
-/// event stands as applied. One that panics at the issue, or at the
+/// event stands as applied, and so does one that panics at the issue a
+/// dispatch brings. One that panics at a decision's issue, or at the
 /// release of a lease its decision gives up, costs that request its
 /// decision.
 pub trait Lifecycle: Send + Sync {
@@ -293,7 +294,22 @@ pub trait Lifecycle: Send + Sync {
     /// A pair's decode side whose request asked for it later is not issued
     /// with the pair, and no call here names it then. A decode call issues
     /// it and is told here, where the lease's generation still stands. A
-    /// side no call issued is first heard at its dispatch.
+    /// side no call issued goes out as the first pick's, and its dispatch
+    /// is its issue: a store that files leases tells it here just ahead of
+    /// that dispatch's own word. The decision told then is the pair's pick
+    /// as the lease's record keeps it: every target's workers and ranks,
+    /// with no trace. The record keeps no position, and each target bears
+    /// the default one, 0, as the target of a dispatch's word does: a
+    /// stage reads the worker by its id. The lease names the target the
+    /// dispatch took.
+    ///
+    /// A lease told here bears the instant its side was filed, on the
+    /// clock of every `issued_micros`. A later decode's is the instant of
+    /// its decode call, or the instant its dispatch was told: never the
+    /// pair's first decision, and never the date a gateway gives the
+    /// dispatch. In process the host states that instant with its call.
+    /// The lease's later words keep the instant of the pair's first
+    /// decision.
     fn on_decision_issued(&self, _lease: &Lease, _decision: &Decision) {}
 
     /// The host dispatched to `target` (one of the decision's targets), on
@@ -303,8 +319,11 @@ pub trait Lifecycle: Send + Sync {
     /// the host's commit. The lease told names the target the dispatch
     /// took: its `target_index` is that target's index in the pick, and its
     /// [`Lease::booked`] is still the worker its issue booked. A decode
-    /// side no call issued booked no worker before: this dispatch books the
-    /// target it names.
+    /// side no call issued was told issued just ahead of this word, on the
+    /// target it names ([`Self::on_decision_issued`]). That word was dated
+    /// at its telling. This one, and every later word of the lease, keeps
+    /// the decision's `issued_micros`, so `issued_micros +
+    /// since_decision_micros` still dates the dispatch.
     fn on_dispatched(
         &self,
         _lease: &Lease,
