@@ -2415,6 +2415,77 @@ impl Router {
             })?;
         }
 
+        // A policy document replaces the routing settings. The four policy
+        // names are refused where one is given (`to_router_config`). Every
+        // other setting has a default, so a keyword does not say whether it
+        // was given: one that is not at the constructor's own default is
+        // refused by name here, as the launcher refuses it. The configuration
+        // would drop most of them in silence.
+        if self.policy_spec.is_some() {
+            let plain: Self = py
+                .get_type::<Self>()
+                .call1((Vec::<String>::new(),))?
+                .extract()?;
+            macro_rules! moved {
+                ($($setting:ident),* $(,)?) => {
+                    [$((stringify!($setting), self.$setting != plain.$setting)),*]
+                };
+            }
+            // The launcher's list of the settings a document replaces, less
+            // the four policy names.
+            let moved: Vec<&str> = moved![
+                cache_threshold,
+                balance_abs_threshold,
+                balance_rel_threshold,
+                balance_prefix_margin_tokens,
+                balance_uncached_credit,
+                bucket_adjust_interval_secs,
+                balance_token_usage_threshold,
+                overload_token_usage_threshold,
+                worker_overload_protection,
+                worker_overload_waiting_requests,
+                worker_overload_token_usage,
+                worker_overload_shed,
+                overlap_decay,
+                selection_temperature,
+                selection_policy,
+                selection_accounting_ttl_ms,
+                eviction_interval_secs,
+                max_tree_size,
+                block_size,
+                cache_boundaries,
+                cache_index,
+                cache_ttl_secs,
+                max_idle_secs,
+                assignment_mode,
+                prefix_token_count,
+                prefix_hash_load_factor,
+                prefix_hash_balance_abs_threshold,
+                least_load_kv_pressure_weight,
+                least_load_default_throughput,
+                least_load_mean_prefill_tokens,
+                power_of_two_load_metric,
+                routing_key_override,
+                pd_pairing_mode,
+                grouped_dp_sticky,
+                dp_minimum_tokens_scheduler,
+                worker_warmup_secs,
+                worker_warmup_share,
+                worker_warmup_blocks,
+                worker_warmup_thin_ratio,
+                worker_warmup_divert_every,
+            ]
+            .into_iter()
+            .filter_map(|(name, moved)| moved.then_some(name))
+            .collect();
+            if !moved.is_empty() {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "Configuration error: a policy document replaces the routing settings, and these are set beside it: {}",
+                    moved.join(", ")
+                )));
+            }
+        }
+
         // Validated once, by the builder's `build()` inside `to_router_config`;
         // `startup` validates once more for a library caller that never went
         // through the builder.

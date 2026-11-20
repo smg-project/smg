@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from smg.launch_router import RouterArgs, launch_router, parse_router_args
 from smg.router import Router, build_control_plane_auth_config, policy_from_str
+from smg.router_args import DOCUMENT_REPLACES
 from smg.smg_rs import PolicyType
 from smg.smg_rs import Router as _Router
 
@@ -701,6 +702,35 @@ class TestPolicyDocument:
                 policy=PolicyType.Random,
                 prefill_policy=PolicyType.Random,
             ).start()
+
+    @staticmethod
+    def moved(name):
+        """A value of ``name`` that is not the launcher's default."""
+        default = getattr(RouterArgs(), name)
+        if name in ("policy", "prefill_policy", "decode_policy", "encode_policy"):
+            return PolicyType.Random
+        if isinstance(default, bool):
+            return not default
+        if isinstance(default, (int, float)):
+            return default + 1
+        if isinstance(default, str):
+            return default + "-moved"
+        if isinstance(default, (list, tuple)):
+            return [*default, 1]
+        return "moved" if "str" in str(RouterArgs.__annotations__[name]) else 1
+
+    @pytest.mark.parametrize("name", DOCUMENT_REPLACES)
+    def test_the_constructor_refuses_each_setting_a_document_replaces(self, tmp_path, name):
+        # The launcher refuses these by its own defaults. A host that builds
+        # the router itself meets the same refusal, before anything starts.
+        router = _Router(
+            worker_urls=[],
+            policy_controller="on",
+            policy_spec=str(tmp_path / "routing.yaml"),
+            **{name: self.moved(name)},
+        )
+        with pytest.raises(ValueError, match=f"these are set beside it: {name}$"):
+            router.start()
 
     def test_the_routing_options_at_their_defaults_stand_beside_a_document(self, policy_document):
         # The chart's line carries these six at their defaults on every render.
