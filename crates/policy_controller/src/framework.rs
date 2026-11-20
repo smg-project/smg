@@ -4521,26 +4521,42 @@ impl Engine {
             .map_or(0, |by| by.cap)
     }
 
-    /// The binding a request of `phase` for `model` resolves to, where
-    /// its shadow is asked ([`Self::shadow`], and [`Self::shadow_side`]
-    /// for a pair's): its position in this generation, and how that
-    /// shadow reads the rows a host handed the live decision
-    /// ([`ShadowRows`]). `None` where the binding names no shadow: one
-    /// lookup says so, and a host orders such a request as it does under
-    /// a generation that shadows nowhere.
-    pub(crate) fn shadow_for(&self, model: &str, phase: Phase) -> Option<(u32, ShadowRows)> {
-        let at = self
-            .bindings
-            .iter()
-            .position(|entry| entry.binding.matches(model, phase))?;
-        let rows = *self.shadow_rows.get(at)?;
+    /// The position of the binding a decode decided after its prefill
+    /// runs under ([`Self::decide_decode`]): the pair binding its model's
+    /// prefill lookup resolves to ([`Self::pair_binding`]), whatever
+    /// phase the call states. A binding of the decode phase listed ahead
+    /// of the pair's decides a decode asked alone, and no pair's. A host
+    /// reads that call's shadow word ([`Self::shadow_at`]) and names its
+    /// sampled record by this position. `None` where the prefill lookup
+    /// finds no pair.
+    pub(crate) fn pair_position(&self, model: &str) -> Option<u32> {
+        let at = self.binding_position(model, Phase::Prefill)?;
+        let pairs = matches!(self.binding_at(at)?.plan, Plan::PdPair | Plan::Epd { .. });
+        pairs.then_some(at)
+    }
+
+    /// The shadow word of the binding at `at`, where its shadow is asked
+    /// ([`Self::shadow`], and [`Self::shadow_side`] for a pair's): the
+    /// binding's position in this generation, and how that shadow reads
+    /// the rows a host handed the live decision ([`ShadowRows`]). `None`
+    /// where the binding names no shadow: one read says so, and a host
+    /// orders such a request as it does under a generation that shadows
+    /// nowhere.
+    pub(crate) fn shadow_at(&self, at: u32) -> Option<(u32, ShadowRows)> {
+        let rows = *self.shadow_rows.get(at as usize)?;
         // A single's placing stands where the build found the shadow
         // profile free to run beside the live one. A pair's word says
         // the same of a side of it.
         if rows != ShadowRows::Sides {
-            self.shadow_placing.get(at).copied().flatten()?;
+            self.shadow_placing.get(at as usize).copied().flatten()?;
         }
-        Some((u32::try_from(at).ok()?, rows))
+        Some((at, rows))
+    }
+
+    /// [`Self::shadow_at`] for the binding a request of `phase` for
+    /// `model` resolves to.
+    pub(crate) fn shadow_for(&self, model: &str, phase: Phase) -> Option<(u32, ShadowRows)> {
+        self.shadow_at(self.binding_position(model, phase)?)
     }
 
     /// The profile a request resolves to for its phase; `None` when no
@@ -6128,6 +6144,51 @@ impl Engine {
                 )
             }
         })
+    }
+
+    /// The decode side of a decode decided after its prefill
+    /// ([`Self::decide_decode`]), made once more with the side's shadow
+    /// profile over the rows that call decided over: the decodes that
+    /// pair with the held `prefill`, on the call's own draw sequence.
+    /// `at` is the pair binding's position ([`Self::shadow_for`]). The
+    /// run writes the scratch and the shadow profile's stages, and
+    /// nothing a commit reads.
+    ///
+    /// `None` where [`Self::shadow_side`] says none for the decode side,
+    /// and where the held prefill left the rows.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the decode entry and its inputs, beside the binding"
+    )]
+    pub(crate) fn shadow_decode_later(
+        &self,
+        at: u32,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        pools: PairPools<'_>,
+        prefill: WorkerId,
+        decode_cx: &Constraints<'_>,
+        scratch: &mut Scratch,
+    ) -> Option<Decision> {
+        let side = PairSide::Decode;
+        let index = self.shadow_sides.get(at as usize)?[side.index()]?;
+        if self.side_apart(at, side) {
+            return None;
+        }
+        let profile = self.profiles.get(usize::from(index))?;
+        let (decodes, mut decode_facts) = pools.side(side, facts)?;
+        let prefill = pools.prefills.iter().find(|row| row.id == prefill)?;
+        // The call's own draw sequence, as its live decode's.
+        decode_facts.seed = facts.seed;
+        Some(run_profile(
+            profile,
+            index,
+            &decode_facts,
+            pool,
+            Set::side(decodes, Some(pools.table.of(&prefill.pair_class)), None),
+            decode_cx,
+            &mut scratch.decode,
+        ))
     }
 
     /// Decides the decode side for a held prefill. The model's pair binding
@@ -12064,6 +12125,23 @@ mod tests {
         assert_eq!(side(&decode_alone, PairSide::Decode), Some(Some(1)));
         assert!(decode_alone.shadows_side(0, PairSide::Decode));
         assert!(!decode_alone.shadows_side(0, PairSide::Prefill));
+        // A decode decided after its prefill: its shadow reads the
+        // partners of the prefill that is held, whichever the first
+        // decision's shadow took.
+        let call = RequestFacts {
+            phase: Phase::Decode,
+            ..facts
+        };
+        let mut later = |engine: &Engine, held: WorkerId| {
+            let shadow =
+                engine.shadow_decode_later(0, &call, &pool, pools, held, &cx, &mut scratch);
+            shadow.map(|shadow| lead(&shadow))
+        };
+        assert_eq!(later(&both, prefills[0].id), Some(Some(1)));
+        assert_eq!(later(&both, prefills[1].id), Some(Some(2)));
+        assert_eq!(later(&both, WorkerId::default()), None, "the prefill left");
+        let prefill_alone = engine(Some(1), None);
+        assert_eq!(later(&prefill_alone, prefills[0].id), None, "not named");
         assert_eq!(engine(None, None).shadow_for("m", Phase::Prefill), None);
     }
 

@@ -43,7 +43,7 @@ use crate::{
     decision::{Decision, Pair, Pick, ShadowKind, Shed, ShedReason, Target, Targets, Trace},
     demands::{DemandFacts, Demands},
     framework::{
-        release, EncodeItems, EncodePlaced, Engine, PairPools, PairSide, Plan, Scratch, ShadowRows,
+        release, EncodeItems, EncodePlaced, Engine, PairSide, Plan, Scratch, ShadowRows,
         KEEPS_DECIDERS, SAMPLES_DECISIONS, SHADOWS,
     },
     lease::{Lease, LeaseId, LeaseKind, Lifecycle, Outcome, Side},
@@ -149,47 +149,53 @@ pub(crate) struct Part {
 }
 
 /// One decider's counts of its shadows, on lines of their own: a row a
-/// binding by its position in its generation, a count a kind. A table a
-/// side: a single's shadows, then a pair's by its prefill side and by
-/// its decode side.
+/// binding by its position in its generation, a count a kind. A table
+/// for each place a shadow is asked ([`Counted`]).
 #[derive(Debug, Default)]
 #[repr(align(128))]
-struct ShadowCounts([[[AtomicU64; ShadowKind::COUNT]; SHADOW_ROWS]; 3]);
+struct ShadowCounts([[[AtomicU64; ShadowKind::COUNT]; SHADOW_ROWS]; 4]);
 
 impl ShadowCounts {
-    fn of(&self, binding: u32, side: Option<PairSide>, kind: ShadowKind) -> &AtomicU64 {
-        let table = side.map_or(0, |side| 1 + side.index());
+    fn of(&self, binding: u32, table: Counted, kind: ShadowKind) -> &AtomicU64 {
+        let table = match table {
+            Counted::Single => 0,
+            Counted::Side(side) => 1 + side.index(),
+            Counted::Later => 3,
+        };
         let row = (binding as usize).min(SHADOW_ROWS - 1);
         &self.0[table][row][kind.index()]
     }
 }
 
+/// Where a shadow was asked: the table it is counted in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Counted {
+    /// Beside a single's decision.
+    Single,
+    /// Beside this side of a pair, at the pair's decision.
+    Side(PairSide),
+    /// Beside a decode decided after its prefill, at that second
+    /// decision. The pair's first decision counted its decode side
+    /// beside the decode it named first: the two are never one count.
+    Later,
+}
+
 impl Part {
     /// The count of the shadows that said `kind` beside a decision of
     /// the binding at position `binding`, for the decider that counts
-    /// one: its counts are laid here at its first. `side` is a pair's
-    /// side, and none for a single's shadow.
-    pub(crate) fn shadowed(
-        &self,
-        binding: u32,
-        side: Option<PairSide>,
-        kind: ShadowKind,
-    ) -> &AtomicU64 {
+    /// one: its counts are laid here at its first. `at` says where the
+    /// shadow was asked.
+    pub(crate) fn shadowed(&self, binding: u32, at: Counted, kind: ShadowKind) -> &AtomicU64 {
         let counts = self.shadowed.get_or_init(Box::default);
-        counts.of(binding, side, kind)
+        counts.of(binding, at, kind)
     }
 
     /// That count as it stands, for a reader: none where the decider
     /// has counted no shadow.
-    pub(crate) fn shadowed_so_far(
-        &self,
-        binding: u32,
-        side: Option<PairSide>,
-        kind: ShadowKind,
-    ) -> u64 {
+    pub(crate) fn shadowed_so_far(&self, binding: u32, at: Counted, kind: ShadowKind) -> u64 {
         let counts = self.shadowed.get();
         counts.map_or(0, |counts| {
-            counts.of(binding, side, kind).load(Ordering::Relaxed)
+            counts.of(binding, at, kind).load(Ordering::Relaxed)
         })
     }
 }
@@ -1123,10 +1129,10 @@ pub(crate) fn pair_shadowed_in<A: Asked>(
                     return;
                 };
                 for side in PairSide::BOTH {
-                    let due = (binding, side);
                     let pools = pair.pools();
-                    let said =
-                        side_shadow(engine, due, facts, pool, pools, cx, live, left, scratch);
+                    let said = side_shadow(engine, (binding, side), live, left, || {
+                        engine.shadow_side(binding, side, facts, pool, pools, cx, cx, live, scratch)
+                    });
                     sides[side.index()] = said;
                     if said == Shadow::Faulted {
                         break;
@@ -1138,22 +1144,17 @@ pub(crate) fn pair_shadowed_in<A: Asked>(
     (answer, sides)
 }
 
-/// One side's shadow of a pair that picked `live`
-/// ([`pair_shadowed_in`]).
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the engine's side entry and its inputs, beside the budget left"
-)]
+/// One side's shadow beside a decision that picked `live`: a pair's
+/// ([`pair_shadowed_in`]), or the decode of a pair decided after its
+/// prefill ([`Door::decode_shadowed`]). `ask` decides the side once more
+/// by the engine's entry for that decision, and `left` is what the
+/// request's budget still holds.
 fn side_shadow(
     engine: &Engine,
     (binding, side): (u32, PairSide),
-    facts: &RequestFacts<'_>,
-    pool: &PoolFacts<'_>,
-    pools: PairPools<'_>,
-    cx: &Constraints<'_>,
     live: &Pick,
     left: Duration,
-    scratch: &mut Scratch,
+    ask: impl FnOnce() -> Option<Decision>,
 ) -> Shadow {
     if !engine.shadows_side(binding, side) {
         return Shadow::NotDue;
@@ -1170,9 +1171,7 @@ fn side_shadow(
     if engine.side_apart(binding, side) || left < SHADOW_FLOOR {
         return said(ShadowKind::Skipped, None);
     }
-    let asked = catch_unwind(AssertUnwindSafe(|| {
-        engine.shadow_side(binding, side, facts, pool, pools, cx, cx, live, scratch)
-    }));
+    let asked = catch_unwind(AssertUnwindSafe(ask));
     match asked {
         Ok(Some(shadow)) => {
             let first = shadow.pick().and_then(|pick| pick.targets.first());
@@ -1618,6 +1617,37 @@ pub(crate) fn decode_in<A: Asked>(
     buffers: &mut Buffers<A::Lists>,
     own: &Part,
 ) -> Result<(Decision, Option<DecodeBooking>), DecodeRefused> {
+    decode_with(world, store, taken, lease, buffers, own, |_| no_shadow)
+}
+
+/// [`decode_in`] with the step its order asks behind the side's booking
+/// ([`pair_with`]): `behind` makes it for the held prefill. The plain
+/// order's step is none ([`no_shadow`]), and a door's shadowed order
+/// asks the decode side's shadow there ([`Door::decode_shadowed`]).
+///
+/// # Errors
+///
+/// [`DecodeRefused`]: as [`decode_in`] refuses.
+fn decode_with<A: Asked, B>(
+    world: &World,
+    store: &MemoryStore,
+    taken: &Taken<'_, A>,
+    lease: LeaseId,
+    buffers: &mut Buffers<A::Lists>,
+    own: &Part,
+    behind: impl FnOnce(WorkerId) -> B,
+) -> Result<(Decision, Option<DecodeBooking>), DecodeRefused>
+where
+    B: FnOnce(
+        &Engine,
+        &PairBuffers,
+        &RequestFacts<'_>,
+        &PoolFacts<'_>,
+        &Constraints<'_>,
+        &Decision,
+        &mut Scratch,
+    ),
+{
     let prefill = store.held_prefill(taken.gateway, lease)?;
     let Buffers {
         pair,
@@ -1661,7 +1691,7 @@ pub(crate) fn decode_in<A: Asked>(
                 };
                 Some((side, world.booked(&decodes, side.target)))
             },
-            no_shadow,
+            behind(prefill),
         ),
     ))
 }
@@ -3220,7 +3250,7 @@ impl Door {
     #[must_use]
     pub fn shadowed(&self, binding: u32, kind: ShadowKind) -> u64 {
         let parts = self.parts.iter();
-        let counts = parts.map(|part| part.shadowed_so_far(binding, None, kind));
+        let counts = parts.map(|part| part.shadowed_so_far(binding, Counted::Single, kind));
         counts.sum()
     }
 
@@ -3231,7 +3261,20 @@ impl Door {
     #[must_use]
     pub fn shadowed_side(&self, binding: u32, side: PairSide, kind: ShadowKind) -> u64 {
         let parts = self.parts.iter();
-        let counts = parts.map(|part| part.shadowed_so_far(binding, Some(side), kind));
+        let counts = parts.map(|part| part.shadowed_so_far(binding, Counted::Side(side), kind));
+        counts.sum()
+    }
+
+    /// [`Self::shadowed_side`] for a decode decided after its prefill
+    /// ([`Self::decide_decode`]): how many such calls had a shadow of
+    /// the decode side that said `kind` beside the decode the call
+    /// picked. The count is its own. The pair's first decision counts
+    /// its decode side under [`Self::shadowed_side`], beside the decode
+    /// it named first.
+    #[must_use]
+    pub fn shadowed_later(&self, binding: u32, kind: ShadowKind) -> u64 {
+        let parts = self.parts.iter();
+        let counts = parts.map(|part| part.shadowed_so_far(binding, Counted::Later, kind));
         counts.sum()
     }
 
@@ -3591,20 +3634,25 @@ impl Door {
                 // samples: its order is the plain one, which stands last.
                 if flags & (SAMPLES_DECISIONS | SHADOWS) != 0 {
                     // The request's shadow is asked for first, by one
-                    // lookup of its binding. A request whose binding
-                    // names none is ordered as a generation that shadows
-                    // nowhere orders it.
+                    // lookup of the binding its order decides under. A
+                    // request whose binding names none is ordered as a
+                    // generation that shadows nowhere orders it.
                     let due = match flags & SHADOWS {
                         0 => None,
-                        _ => engine.shadow_for(request.facts.model, request.facts.phase),
+                        _ => {
+                            let under = order.binding(engine, &request.facts);
+                            under.and_then(|under| engine.shadow_at(under))
+                        }
                     };
                     // Each order's answer is built in its own place:
                     // two that met in one would cost a copy of it.
                     let Some((binding, rows)) = due else {
                         let decided = order.plain(&world, at, term, &taken, buffers);
                         if flags & SAMPLES_DECISIONS != 0 {
-                            let none = (None, [None; 2]);
-                            self.sampled(at, engine, &taken, &decided, none, sample_count);
+                            // A kept record names that binding: it is
+                            // looked up for a kept decision alone.
+                            let said = || (order.binding(engine, &request.facts), None, [None; 2]);
+                            self.sampled(at, engine, &taken, &decided, said, sample_count);
                         }
                         return decided;
                     };
@@ -3616,7 +3664,7 @@ impl Door {
                     };
                     let decided = order.shadowed(&world, at, term, &taken, buffers, &mut due);
                     if flags & SAMPLES_DECISIONS != 0 {
-                        let said = (due.said, due.sides);
+                        let said = || (Some(binding), due.said, due.sides);
                         self.sampled(at, engine, &taken, &decided, said, sample_count);
                     }
                     return decided;
@@ -3665,7 +3713,8 @@ impl Door {
     }
 
     /// Keeps a made decision in the seat's samples where its turn to be
-    /// sampled came, with what its shadow said.
+    /// sampled came, with the binding its order decided under and what
+    /// its shadow said (`said`, asked for a kept decision alone).
     // Forced into each order's tail: the sampling stands in line there,
     // as it did where one order ran.
     #[inline(always)]
@@ -3675,13 +3724,14 @@ impl Door {
         engine: &Engine,
         taken: &Taken<'_, Request<'_>>,
         decided: &Result<Decided, Refused>,
-        (said, sides): (Option<Shadowed>, [Option<Shadowed>; 2]),
+        said: impl FnOnce() -> (Option<u32>, Option<Shadowed>, [Option<Shadowed>; 2]),
         count: &mut SampleCount,
     ) {
         let Ok(answer) = decided else { return };
         if count.keeps(0, engine, &answer.decision) {
+            let (binding, said, sides) = said();
             let mut samples = self.seats[at].samples.lock();
-            samples.push(0, engine, taken, &answer.decision, said, sides);
+            samples.push(0, binding, taken, &answer.decision, said, sides);
         }
     }
 
@@ -3915,7 +3965,8 @@ impl Door {
     /// counted with the door's faults and the scratch it left is
     /// dropped, both behind the commit: the live pair is issued as
     /// decided. Any other request under the binding takes its plain
-    /// order: a decode decided after its prefill asks no shadow.
+    /// order here. A decode decided after its prefill asks its shadow at
+    /// its own call ([`Self::decode_shadowed`]).
     fn order_sides(
         &self,
         world: &World,
@@ -3941,7 +3992,7 @@ impl Door {
         let decided = decided?;
         for (side, shadow) in PairSide::BOTH.into_iter().zip(sides) {
             if let Shadow::Said(said) = shadow {
-                let count = own.shadowed(said.binding, Some(side), said.kind);
+                let count = own.shadowed(said.binding, Counted::Side(side), said.kind);
                 count.fetch_add(1, Ordering::Relaxed);
                 due.sides[side.index()] = Some(said);
             }
@@ -3995,7 +4046,7 @@ impl Door {
         }
         let lease = filed?;
         if let Shadow::Said(shadow) = shadow {
-            let count = own.shadowed(shadow.binding, None, shadow.kind);
+            let count = own.shadowed(shadow.binding, Counted::Single, shadow.kind);
             count.fetch_add(1, Ordering::Relaxed);
             due.said = Some(shadow);
         }
@@ -4044,7 +4095,7 @@ impl Door {
 
     /// A decode call's order at this door: the decision ([`decode_in`]) and,
     /// for a pick, the side's issue under the lease's id
-    /// ([`issue_decode`]).
+    /// ([`Self::file_decode`]).
     #[inline(never)]
     fn decode(
         &self,
@@ -4054,9 +4105,85 @@ impl Door {
         buffers: &mut Buffers<()>,
         lease: LeaseId,
     ) -> Result<Decided, Refused> {
+        let (store, own) = (&*self.store, &self.parts[at]);
+        let decided = decode_in(world, store, taken, lease, buffers, own);
+        self.file_decode(world, taken, lease, decided)
+    }
+
+    /// [`Self::decode`] for a call whose pair binding names a shadow for
+    /// a side. The decode side is decided once more by its shadow
+    /// profile, behind the side's booking and ahead of its issue, over
+    /// the rows the call decided over
+    /// ([`Engine::shadow_decode_later`]). It is compared with the decode
+    /// this call picked and counted on its own
+    /// ([`Door::shadowed_later`]), behind an issue that held. A shadow
+    /// that panicked is counted with the door's faults and the scratch
+    /// it left is dropped: the call answers as decided. Out of line: the
+    /// plain call runs no part of it.
+    #[inline(never)]
+    fn decode_shadowed(
+        &self,
+        world: &World,
+        at: usize,
+        taken: &Taken<'_, Request<'_>>,
+        buffers: &mut Buffers<()>,
+        lease: LeaseId,
+        due: &mut Due,
+    ) -> Result<Decided, Refused> {
+        let (binding, left) = (due.binding, taken.left);
+        let mut said = Shadow::NotDue;
+        let (store, own) = (&*self.store, &self.parts[at]);
+        let decided = decode_with(world, store, taken, lease, buffers, own, |prefill| {
+            let said = &mut said;
+            move |engine: &Engine,
+                  pair: &PairBuffers,
+                  facts: &RequestFacts<'_>,
+                  pool: &PoolFacts<'_>,
+                  cx: &Constraints<'_>,
+                  decision: &Decision,
+                  scratch: &mut Scratch| {
+                let Some(live) = decision.pick() else {
+                    return;
+                };
+                // The call's facts, as its live decode read them.
+                let facts = RequestFacts {
+                    phase: Phase::Decode,
+                    ..*facts
+                };
+                let pools = pair.pools();
+                *said = side_shadow(engine, (binding, PairSide::Decode), live, left, || {
+                    engine.shadow_decode_later(binding, &facts, pool, pools, prefill, cx, scratch)
+                });
+            }
+        });
+        let decided = self.file_decode(world, taken, lease, decided);
+        if said == Shadow::Faulted {
+            // The next decision reads nothing the shadow left.
+            buffers.scratch = Scratch::default();
+            self.faults.fetch_add(1, Ordering::Relaxed);
+        }
+        let decided = decided?;
+        if let Shadow::Said(said) = said {
+            let count = own.shadowed(said.binding, Counted::Later, said.kind);
+            count.fetch_add(1, Ordering::Relaxed);
+            due.sides[PairSide::Decode.index()] = Some(said);
+        }
+        Ok(decided)
+    }
+
+    /// Files what a decode call decided, for its two orders
+    /// ([`Self::decode`], [`Self::decode_shadowed`]): for a pick, the
+    /// side's issue under the lease's id ([`issue_decode`]).
+    #[inline(always)]
+    fn file_decode(
+        &self,
+        world: &World,
+        taken: &Taken<'_, Request<'_>>,
+        lease: LeaseId,
+        decided: Result<(Decision, Option<DecodeBooking>), DecodeRefused>,
+    ) -> Result<Decided, Refused> {
         let store = &*self.store;
-        let (decision, booking) = decode_in(world, store, taken, lease, buffers, &self.parts[at])
-            .map_err(Refused::Decode)?;
+        let (decision, booking) = decided.map_err(Refused::Decode)?;
         let lease = booking
             .map(|booking| issue_decode(store, world, taken, lease, &decision, booking))
             .transpose()
@@ -4080,7 +4207,7 @@ const SHADOWED: u8 = 1;
 const OWN_ROWS: u8 = 2;
 
 /// A decision's shadow at its seat: what the seat read of the request's
-/// binding ahead of the order ([`Engine::shadow_for`]), and what the
+/// binding ahead of the order ([`Engine::shadow_at`]), and what the
 /// order leaves of the shadow.
 struct Due {
     /// The binding's position in its generation.
@@ -4099,6 +4226,17 @@ struct Due {
 /// form and no part of the other. Under one that shadows, a request
 /// whose binding names no shadow runs the plain form too.
 trait Orders {
+    /// The position of the binding the order's live decision runs
+    /// under: the one the request's own phase resolves to
+    /// ([`Engine::binding_position`]). An order whose live decision runs
+    /// under another binding answers that one. The seat reads the
+    /// request's shadow word ([`Engine::shadow_at`]) and names its
+    /// sampled record by this one answer.
+    #[inline(always)]
+    fn binding(&self, engine: &Engine, facts: &RequestFacts<'_>) -> Option<u32> {
+        engine.binding_position(facts.model, facts.phase)
+    }
+
     /// Decides the request and, for a pick, issues its lease.
     fn plain(
         &mut self,
@@ -4128,6 +4266,11 @@ trait Orders {
 /// its order twice: the first run borrows it and the second takes it, so
 /// each run is an instance of its own, as each closure's was.
 impl<O: Orders> Orders for &mut O {
+    #[inline(always)]
+    fn binding(&self, engine: &Engine, facts: &RequestFacts<'_>) -> Option<u32> {
+        (**self).binding(engine, facts)
+    }
+
     #[inline(always)]
     fn plain(
         &mut self,
@@ -4224,12 +4367,19 @@ impl Orders for WholeStated<'_, '_> {
 }
 
 /// The order of [`Door::decide_decode`]: the decode side of the pair's
-/// lease on file ([`Door::decode`]). A decode decided after its prefill
-/// asks no shadow ([`Door::order_sides`]), so the seat runs the plain
-/// form.
+/// lease on file ([`Door::decode`]). Where the pair's binding names a
+/// shadow for a side, the decode side's is asked beside the call
+/// ([`Door::decode_shadowed`]). The call decides under the pair binding
+/// its model's prefill lookup resolves to, whatever phase it states
+/// ([`Engine::pair_position`]): its shadow word and its sampled record
+/// are that binding's.
 struct DecodeCall<'d>(&'d Door, LeaseId);
 
 impl Orders for DecodeCall<'_> {
+    fn binding(&self, engine: &Engine, facts: &RequestFacts<'_>) -> Option<u32> {
+        engine.pair_position(facts.model)
+    }
+
     #[inline(always)]
     fn plain(
         &mut self,
@@ -4246,12 +4396,15 @@ impl Orders for DecodeCall<'_> {
         &mut self,
         world: &World,
         at: usize,
-        term: u64,
+        _: u64,
         taken: &Taken<'_, Request<'_>>,
         buffers: &mut Buffers<()>,
-        _: &mut Due,
+        due: &mut Due,
     ) -> Result<Decided, Refused> {
-        self.plain(world, at, term, taken, buffers)
+        // The word is a pair binding's that names a shadow for a side
+        // ([`Self::binding`]).
+        self.0
+            .decode_shadowed(world, at, taken, buffers, self.1, due)
     }
 }
 

@@ -20,7 +20,9 @@ const SLOTS: usize = 1_024;
 pub struct DecisionRecord {
     /// The decision and its trace, which carries the generation.
     pub decision: Decision,
-    /// The binding's position in that generation, if one matched.
+    /// The position in that generation of the binding the decision ran
+    /// under, if one matched. A decode decided after its prefill ran
+    /// under its pair's binding, whatever phase the call stated.
     pub binding: Option<u32>,
     /// The instant the request was taken.
     pub at: Instant,
@@ -154,12 +156,13 @@ pub(crate) struct Samples {
 
 impl Samples {
     /// Pushes one record, allocating the ring on its first write. A new
-    /// lead starts with an empty ring.
+    /// lead starts with an empty ring. `binding` is the position of the
+    /// binding the decision ran under.
     #[cold]
     pub(crate) fn push<A: Asked>(
         &mut self,
         term: u64,
-        engine: &Engine,
+        binding: Option<u32>,
         taken: &Taken<'_, A>,
         decision: &Decision,
         shadow: Option<Shadowed>,
@@ -185,7 +188,7 @@ impl Samples {
         let [prefill, decode] = sides;
         self.records.push_back(DecisionRecord {
             decision: *decision,
-            binding: engine.binding_position(taken.request.model(), taken.request.phase()),
+            binding,
             at: taken.now,
             shadow: shadow.or(prefill).map(|said| said.kind),
             shadow_target: shadow.or(prefill).and_then(|said| said.first),
