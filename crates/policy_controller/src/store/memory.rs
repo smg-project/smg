@@ -406,8 +406,45 @@ impl MemoryStore {
         // the ids on file are read: a take's write waits for them, so a
         // take lands whole ahead of the restore or whole behind it.
         let mut turns = self.every_turn();
+        let term = cut.at.term;
+        if !self.lay_snapshot(cut, false) {
+            return false;
+        }
+        // The term rises and the leases on file are read under the turns.
+        // Their releases are handed to the files once the turns are let go.
+        self.rise(&mut turns, term);
+        self.empty(turns);
+        true
+    }
+
+    /// Lays the worker rows and epoch of a `WatchWorkers` snapshot and
+    /// builds the world at once. The store keeps its lease files and their
+    /// term and its session pins. A worker still present keeps its count
+    /// slot, admission instant, gateway vetoes, completed-dispatch times
+    /// and local loads. Its KV lane stays while its cache events still
+    /// belong to the same model and rank.
+    ///
+    /// Loads in the cut are ignored. Returns `false` with the store as it
+    /// was if the journal refuses the snapshot's place.
+    ///
+    /// A follower's store has no journal. On a journaled store the journal
+    /// takes the cut's place: it follows the cut's term and leads no
+    /// longer, as at a restore, and the lease files keep their own term.
+    /// The two terms are in step after a restore and not after this door.
+    pub fn watch_from(&self, cut: Cut) -> bool {
+        let _released = self.released();
+        self.lay_snapshot(cut, true)
+    }
+
+    /// Lays the rows and publishes their world. A watch carries local
+    /// state for the ids it sees again. A standby takes the cut's loads
+    /// and gives every row a fresh slot.
+    fn lay_snapshot(&self, cut: Cut, keep_local: bool) -> bool {
         let mut workers = self.workers.lock();
-        let held: Vec<WorkerId>;
+        // A watch matches incoming ids against the previous membership.
+        // A restore only needs the previous ids to retire their KV lanes.
+        let mut previous = FxHashMap::default();
+        let mut previous_ids = Vec::new();
         {
             let mut health = self.health.lock();
             let mut loads = self.loads.lock();
@@ -416,48 +453,70 @@ impl MemoryStore {
                     return false;
                 }
             }
-            health.vetoes.clear();
-            health.ok_at.clear();
-            held = workers.rows.keys().copied().collect();
-            workers.rows.clear();
+            if keep_local {
+                previous = mem::take(&mut workers.rows);
+            } else {
+                health.vetoes.clear();
+                health.ok_at.clear();
+                previous_ids.extend(workers.rows.keys().copied());
+                workers.rows.clear();
+                // An unpublished build over no row drops the restore's old
+                // vetoes and the state derived from its membership and loads.
+                drop(loads.writer.rebuild(
+                    cut.epoch,
+                    std::iter::empty(),
+                    |_, _| None,
+                    Classes::Derive,
+                ));
+                loads.ranks.clear();
+            }
             workers.by_key.clear();
             workers.log.clear();
             workers.epoch = cut.epoch;
             workers.history += 1;
-            // A world's vetoes leave with their rows at a membership write:
-            // one over no row takes them all, and its world is shown to
-            // no one. The fields each member was read at under the
-            // generation's lists leave with them: a cut can bring a row at
-            // an id and a revision the world read under other facts.
-            drop(
-                loads
-                    .writer
-                    .rebuild(cut.epoch, std::iter::empty(), |_, _| None, Classes::Derive),
-            );
-            loads.ranks.clear();
-            for row in cut.rows {
-                workers.by_key.insert(row.facts.key.clone(), row.id);
-                loads.ranks.insert(row.id, Ranks::default());
-                let slot = self.join(row.id);
-                workers.rows.insert(
-                    row.id,
+            workers.rows.reserve(cut.rows.len());
+            for mut row in cut.rows {
+                let id = row.id;
+                workers.by_key.insert(row.facts.key.clone(), id);
+                let kept = if keep_local {
+                    previous.remove(&id).or_else(|| workers.rows.remove(&id))
+                } else {
+                    None
+                };
+                let held = if let Some(kept) = kept {
+                    row.admitted_at = kept.row.admitted_at;
+                    Row { row, ..kept }
+                } else {
+                    loads.ranks.insert(id, Ranks::default());
                     Row {
                         row,
                         probes: Probes::default(),
-                        slot,
-                    },
-                );
+                        slot: self.join(id),
+                    }
+                };
+                workers.rows.insert(id, held);
             }
-            for (id, rank, sample) in cut.loads {
-                if let Some(ranks) = loads.ranks.get_mut(&id) {
-                    ranks.samples.insert(rank, sample);
+            if keep_local {
+                // Prune each table once for the whole membership.
+                let stays = |id: &WorkerId| workers.rows.contains_key(id);
+                health.vetoes.retain(|(_, id), _| stays(id));
+                health.ok_at.retain(|_, dispatches| {
+                    dispatches.retain(|id, _| stays(id));
+                    !dispatches.is_empty()
+                });
+                loads.ranks.retain(|id, _| stays(id));
+            } else {
+                for (id, rank, sample) in cut.loads {
+                    if let Some(ranks) = loads.ranks.get_mut(&id) {
+                        ranks.samples.insert(rank, sample);
+                    }
                 }
             }
         }
         // The index is this replica's own: a row that left gives up its
         // lane, a row that stays keeps what was heard for it, and a row the
         // cut brings takes the lane its facts ask for.
-        for id in held {
+        for id in previous_ids.into_iter().chain(previous.into_keys()) {
             if !workers.rows.contains_key(&id) {
                 self.kv.forget(id);
             }
@@ -465,18 +524,8 @@ impl MemoryStore {
         for row in workers.rows.values() {
             self.kv.member(&row.row);
         }
-        self.swap_world(&workers, Classes::Derive);
-        // Every row was replaced: the engine is told the members once, by
-        // id, as an apply tells a generation's.
+        self.swap_world(&workers);
         self.tell_members(&workers);
-        drop(workers);
-        // Under the turns taken at the start the term rises and the ids on
-        // file are read: each of those leases then leaves its file as a
-        // frame's release does, handed with the turns let go
-        // ([`Self::empty`]). A later generation's stages never saw the
-        // issue and hear nothing of it.
-        self.rise(&mut turns, cut.at.term);
-        self.empty(turns);
         true
     }
 
@@ -940,20 +989,18 @@ impl MemoryStore {
         micros(self.origin, at)
     }
 
-    /// Build the pools of the membership as it stands and show them in one
-    /// world, now, whatever the window: nothing is left owed. What a write
-    /// that replaces every row does, which tells the engine in other words
-    /// than one change's ([`MemoryStore::restore_from`]). Called under the
-    /// workers lock; it takes the load lock and lets it go at its return.
-    fn swap_world(&self, workers: &Workers, classes: Classes) {
+    /// Publish the pools of a snapshot at once, with every row read again
+    /// under the generation's lists. The caller holds the workers lock.
+    fn swap_world(&self, workers: &Workers) {
         let mut loads = self.loads.lock();
         let Loads { ranks, writer } = &mut *loads;
         let ranks = &*ranks;
+        writer.clear_listed();
         let world = writer.rebuild(
             workers.epoch,
             workers.rows.values().map(|row| (&row.row, row.slot)),
             |id, rank| ranks.get(&id)?.samples.get(&rank).copied(),
-            classes,
+            Classes::Derive,
         );
         world.tell_kept_loads();
         writer.replaced(self.world.swap(world));
@@ -963,7 +1010,7 @@ impl MemoryStore {
 
     /// Tell the standing generation's engine every member once, by id
     /// ([`Membership::Snapshot`]): what an apply tells the generation it
-    /// applied and a restore the one that stands. Called under the workers
+    /// applied and a snapshot the one that stands. Called under the workers
     /// lock, after the world of those members is shown and with the load
     /// lock let go.
     fn tell_members(&self, workers: &Workers) {
@@ -1301,14 +1348,14 @@ impl MemoryStore {
 
     /// A worker's row is gone (removed, or replaced by a new incarnation):
     /// the store's tables that live exactly as long as the row leave with
-    /// it, here and nowhere else: the health tables, the load rows and the
-    /// worker's KV lane with its blocks in the index. The vetoes a world
+    /// it: the health tables, the load rows and the worker's KV lane with
+    /// its blocks in the index. The vetoes a world
     /// carries are not among them: they leave with the row in the
     /// publication of the membership write that calls this. Nor are the
     /// sessions' pins of record that name the worker: the leader's own
     /// removal or replacement drops them once it let its lock go
     /// ([`Self::forget_pins`]), and a row that leaves by a followed change
-    /// or a restore keeps them. A standby is sent no pin, so those are of
+    /// or a snapshot keeps them. A standby is sent no pin, so those are of
     /// a term this store led itself: no decision takes one while its
     /// worker is gone, and a worker that returns under the same key and
     /// incarnation is pinned by them again. Called under the workers

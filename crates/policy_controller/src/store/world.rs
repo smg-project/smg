@@ -3129,6 +3129,12 @@ impl Writer {
         self.outside
     }
 
+    /// Forget the fields read under the generation's lists. A snapshot
+    /// can give the same id and revision different facts.
+    pub(super) fn clear_listed(&mut self) {
+        self.listed.clear();
+    }
+
     /// Derive the pools of the membership `members` at the store's `epoch`,
     /// each row with its load record on file, make them the working copy
     /// and publish them through the one door: every pool is new, so the

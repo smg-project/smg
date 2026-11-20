@@ -470,9 +470,10 @@ pub trait WorkersStore: Send + Sync {
     fn changes_since(&self, epoch: u64) -> MembershipTail;
 
     /// Which history of rows the store holds: it moves when the rows are
-    /// replaced whole by another store's
-    /// ([`MemoryStore::restore_from`](super::MemoryStore::restore_from))
-    /// and at no write. An epoch names a place in one history, and a row
+    /// replaced from a snapshot
+    /// ([`MemoryStore::restore_from`](super::MemoryStore::restore_from) or
+    /// [`MemoryStore::watch_from`](super::MemoryStore::watch_from)).
+    /// An epoch names a place in one history, and a row
     /// under one id and one revision may state other facts in the next, so
     /// a watcher that keeps its place keeps this beside it and starts again
     /// from a snapshot, trusting nothing it held, when it moves. A store
