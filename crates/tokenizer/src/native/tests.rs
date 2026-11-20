@@ -3548,6 +3548,27 @@ fn a_piece_the_model_declines_is_reported_after_the_work() {
         Err(Fallback::PieceDeclined)
     );
     assert!(tokenizer.encode("plain text\u{7F}", false).is_err());
+    // The same in a long text that its calling thread and the pool's
+    // threads encode by units, whichever unit holds the piece: the first
+    // (the calling thread's), one in the middle, the last.
+    let model = Some(tokenizer.get_model());
+    let long = "plain text, more words and 漢字 ".repeat(8 * PARALLEL_CHUNK_BYTES / 32);
+    assert!(native.units(&long, true, true).as_slice().len() >= 8);
+    let plain = native.encode_with(model, &long, false, false);
+    assert!(plain.is_ok());
+    assert_eq!(native.encode_with(model, &long, true, false), plain);
+    for at in [0, long.len() / 2, long.len()] {
+        let at = (at..long.len())
+            .find(|&at| long.is_char_boundary(at))
+            .unwrap_or(long.len());
+        let mut text = long.clone();
+        text.insert(at, '\u{7F}');
+        assert_eq!(
+            native.encode_with(model, &text, true, false),
+            Err(Fallback::PieceDeclined),
+            "at byte {at}"
+        );
+    }
 }
 
 #[test]
@@ -5754,6 +5775,295 @@ fn tiktoken_ranks_of(corpus: &str, merges: usize, bytes_last: bool) -> FxHashMap
         ranks.insert(token, token_base + i as u32);
     }
     ranks
+}
+
+/// One block of exactly `PARALLEL_CHUNK_BYTES` bytes of words, accents, CJK,
+/// an emoji and letter runs that opens with a space: a text of such blocks
+/// is cut for the pool where each block starts, and its last unit holds
+/// two of them.
+fn chunk_block() -> String {
+    let long_run = "x".repeat(1_024);
+    let fragment = format!("mixed words café 漢字 😀 {long_run} more words ");
+    let tail = "résumé 漢字 😀 x";
+    let mut block = String::from(" café 漢字 😀 words ");
+    while block.len() + fragment.len() + tail.len() <= PARALLEL_CHUNK_BYTES {
+        block.push_str(&fragment);
+    }
+    while block.len() + "word ".len() + tail.len() <= PARALLEL_CHUNK_BYTES {
+        block.push_str("word ");
+    }
+    block.extend(std::iter::repeat_n(
+        'x',
+        PARALLEL_CHUNK_BYTES - block.len() - tail.len(),
+    ));
+    block.push_str(tail);
+    assert_eq!(block.len(), PARALLEL_CHUNK_BYTES);
+    block
+}
+
+/// The ids of a long text that its calling thread and the pool's threads
+/// encode by units are those of the calling thread alone, at the counts of
+/// units around the bounds: no text, one unit, two (still the calling
+/// thread's alone), three (the first count a helper is asked for), eight
+/// and thirty-three.
+#[test]
+fn bounded_parallel_units_keep_the_plain_paths_ids() {
+    let mut state = 0x5041_5241_4C4C_454Cu64;
+    let ranks = tiktoken_ranks(&mut state, 600, false);
+    let native = NativeEncoder::from_ranks(&ranks, CL100K, &[]).expect("the direct path");
+    let block = chunk_block();
+    for requested_units in [0, 1, 2, 3, 8, 33] {
+        let text = match requested_units {
+            0 => String::new(),
+            1 => block.clone(),
+            units => block.repeat(units + 1),
+        };
+        assert_eq!(
+            native.units(&text, true, true).as_slice().len(),
+            requested_units.max(1),
+            "requested {requested_units} units"
+        );
+        assert_eq!(
+            native.encode_with(None, &text, true, false),
+            native.encode_with(None, &text, false, false),
+            "{requested_units} units"
+        );
+    }
+}
+
+/// The calling thread of a long text encodes units of it itself: it holds a
+/// piece cache after its first long text, and so counts among the
+/// encoder's threads.
+#[test]
+fn the_caller_of_a_long_text_takes_units_of_it() {
+    let mut state = 0x5041_5241_4C4C_454Du64;
+    let ranks = tiktoken_ranks(&mut state, 600, false);
+    let text = chunk_block().repeat(10);
+    let plain = NativeEncoder::from_ranks(&ranks, CL100K, &[])
+        .expect("the direct path")
+        .encode_with(None, &text, false, false);
+    let native = NativeEncoder::from_ranks(&ranks, CL100K, &[]).expect("the direct path");
+    assert!(native.piece_cache.get().is_none());
+    assert_eq!(native.encode_with(None, &text, true, false), plain);
+    assert!(
+        native.piece_cache.get().is_some(),
+        "the calling thread encoded no unit of its text"
+    );
+}
+
+/// The units of a long text are dealt in spans, one a thread, of about
+/// the same bytes of text each: a thread takes the units of its own span
+/// from the front, then, from the back, the units of the spans no thread
+/// has begun, the ones after its own first. A span whose thread has begun
+/// is left to that thread, so a text that comes again brings a thread the
+/// units it took before. Unit 0 is never handed out (the calling thread
+/// starts on it), every other unit once.
+#[test]
+fn a_thread_takes_the_units_of_its_own_span_first() {
+    let text = "x".repeat(64);
+    // Units by their bytes; one of no bytes is an added token.
+    let units_of = |bytes: &[usize]| -> Vec<Segment<'_>> {
+        bytes
+            .iter()
+            .map(|&len| match len {
+                0 => Segment::Added(7),
+                len => Segment::Text(&text[..len]),
+            })
+            .collect()
+    };
+    let spans_of = |claims: &UnitClaims| -> Vec<Range<usize>> {
+        claims
+            .spans
+            .iter()
+            .map(|span| span.lock().expect("no thread panicked").left.clone())
+            .collect()
+    };
+    // Ten units of one size in three spans: 0..4 (the calling thread's,
+    // without its unit 0), 4..7 and 7..10.
+    let units = units_of(&[8; 10]);
+    let claims = UnitClaims::new(&units, 3);
+    assert_eq!(spans_of(&claims), [1..4, 4..7, 7..10]);
+    let take = |home: usize, count: usize| -> Vec<usize> {
+        (0..count).map_while(|_| claims.take(home)).collect()
+    };
+    // Each thread starts at the front of its own span.
+    assert_eq!(take(1, 1), [4]);
+    assert_eq!(take(0, 2), [1, 2]);
+    // A thread whose span is done passes the span another thread has begun
+    // and takes the one no thread has, the last unit first.
+    assert_eq!(take(0, 3), [3, 9, 8]);
+    // The thread of that span comes late: it takes what is left of it and
+    // nothing of the spans the others have begun.
+    assert_eq!(take(2, 2), [7]);
+    assert_eq!(claims.take(0), None);
+    // The thread of a begun span takes it to its end.
+    assert_eq!(take(1, 3), [5, 6]);
+    assert_eq!(claims.take(2), None);
+    // The spans follow the bytes, not the count of units: a prompt of one
+    // long text, short texts between added tokens and three long texts is
+    // halved behind the first of the three; a first unit as long as half
+    // the text leaves its calling thread no other; added tokens alone go
+    // to the last span; three units in three spans.
+    for (bytes, spans, dealt) in [
+        (&[40, 0, 2, 0, 2, 0, 40, 40, 40][..], 2, &[1..7, 7..9][..]),
+        (&[60, 2, 2, 2], 2, &[1..1, 1..4]),
+        (&[0, 0, 0, 0], 2, &[1..1, 1..4]),
+        (&[1, 1, 1], 3, &[1..1, 1..2, 2..3]),
+    ] {
+        let claims = UnitClaims::new(&units_of(bytes), spans);
+        assert_eq!(spans_of(&claims), dealt, "{bytes:?} in {spans} spans");
+    }
+    // A thread alone takes every unit but the calling thread's first, once:
+    // its own span from the front, then each span after it from the back.
+    for bytes in [
+        &[8; 3][..],
+        &[8; 10],
+        &[8; 33],
+        &[40, 0, 2, 0, 2, 0, 40, 40, 40],
+    ] {
+        let units = units_of(bytes);
+        for spans in 1..=units.len().min(16) {
+            for home in 0..spans {
+                let claims = UnitClaims::new(&units, spans);
+                let dealt = spans_of(&claims);
+                assert_eq!(dealt.len(), spans);
+                let around: Vec<usize> = dealt[home]
+                    .clone()
+                    .chain((1..spans).flat_map(|step| dealt[(home + step) % spans].clone().rev()))
+                    .collect();
+                let mut taken: Vec<usize> = std::iter::from_fn(|| claims.take(home)).collect();
+                assert_eq!(taken, around, "{bytes:?}, {spans} spans, span {home}");
+                taken.sort_unstable();
+                assert_eq!(taken, (1..units.len()).collect::<Vec<_>>());
+            }
+        }
+    }
+    // A declined piece stops the taking.
+    let claims = UnitClaims::new(&units, 3);
+    assert_eq!(claims.take(1), Some(4));
+    claims.declined.store(true, Ordering::Relaxed);
+    assert_eq!(claims.take(1), None);
+    assert_eq!(claims.take(0), None);
+}
+
+/// A long text is spread over its helpers and its calling thread and no
+/// further thread of the pool; with no helper it is its calling thread's
+/// alone. Twelve helpers are more than its nine units have work for: one
+/// job a unit past the first is handed out.
+#[test]
+fn a_long_text_is_spread_over_its_helpers_and_its_caller() {
+    let mut state = 0x5041_5241_4C4C_454Eu64;
+    let ranks = tiktoken_ranks(&mut state, 600, false);
+    let text = chunk_block().repeat(10);
+    let plain = NativeEncoder::from_ranks(&ranks, CL100K, &[])
+        .expect("the direct path")
+        .encode_with(None, &text, false, false);
+    for helpers in [0, 1, 2, 12] {
+        let native = NativeEncoder::from_ranks(&ranks, CL100K, &[]).expect("the direct path");
+        assert_eq!(
+            native.encode_units(None, &text, helpers, true, false, true),
+            plain,
+            "{helpers} helpers"
+        );
+        let threads = native.threads.load(Ordering::Relaxed);
+        assert!(
+            (1..=helpers + 1).contains(&threads),
+            "{threads} threads encoded a text with {helpers} helpers"
+        );
+    }
+}
+
+/// The helpers of a long text follow the texts in flight as it came in:
+/// the pool's threads divided among them, less the calling thread.
+#[test]
+fn the_helpers_of_a_long_text_follow_the_texts_in_flight() {
+    // On a count of its own: the process's is shared with every test that
+    // encodes while this one runs.
+    let count = AtomicUsize::new(0);
+    // Alone in flight: every other thread of the pool, none of a pool of
+    // one thread.
+    let first = InFlight::enter(&count);
+    assert_eq!(first.texts, 1);
+    for (threads, helpers) in [(1, 0), (2, 1), (3, 2), (4, 3), (16, 15), (64, 63)] {
+        assert_eq!(first.helpers(threads), helpers, "{threads} threads");
+    }
+    // The second of two: half the pool less itself, and the first keeps the
+    // count it came in with.
+    let second = InFlight::enter(&count);
+    assert_eq!(second.texts, 2);
+    for (threads, helpers) in [(1, 0), (2, 0), (3, 0), (4, 1), (16, 7), (64, 31)] {
+        assert_eq!(second.helpers(threads), helpers, "{threads} threads");
+    }
+    assert_eq!(first.helpers(16), 15);
+    // One helper as long as the texts are at most half the threads, none
+    // for the text that comes in after that.
+    let mut held = vec![first, second];
+    while held.len() < 8 {
+        held.push(InFlight::enter(&count));
+    }
+    assert_eq!(held.last().map(|text| text.helpers(16)), Some(1));
+    let over = InFlight::enter(&count);
+    assert_eq!(over.texts, 9);
+    assert_eq!(over.helpers(16), 0);
+    assert_eq!(over.helpers(64), 6);
+    drop(over);
+    // A text that leaves makes room for the one that comes in after it.
+    held.pop();
+    let after = InFlight::enter(&count);
+    assert_eq!(after.texts, 8);
+    drop((held, after));
+    // Every text is out again: nothing is counted and the next is alone.
+    assert_eq!(count.load(Ordering::Relaxed), 0);
+    let alone = InFlight::enter(&count);
+    assert_eq!(alone.texts, 1);
+    // The entry counts a text from `COUNTED_MIN_BYTES` up and no shorter
+    // one, and asks helpers for a counted text of `PARALLEL_MIN_BYTES` or
+    // more alone.
+    let long = "a".repeat(PARALLEL_MIN_BYTES);
+    assert!(NativeEncoder::in_flight(&long[..COUNTED_MIN_BYTES - 1]).is_none());
+    assert!(NativeEncoder::in_flight(&long[..COUNTED_MIN_BYTES]).is_some());
+    assert_eq!(
+        NativeEncoder::pool_helpers(&long, Some(&alone)),
+        rayon::current_num_threads() - 1
+    );
+    assert_eq!(
+        NativeEncoder::pool_helpers(&long[1..], Some(&alone)),
+        0,
+        "a shorter text"
+    );
+    assert_eq!(NativeEncoder::pool_helpers(&long, None), 0);
+}
+
+#[test]
+fn callers_at_once_keep_the_ids_of_a_lone_one() {
+    // Long texts through the entry from several threads at once: each is
+    // helped by the threads the pool can spare it as it comes in, or
+    // encoded by its calling thread alone (see `pool_helpers`); the ids are
+    // those of the serial encode either way.
+    let mut state = 0x900D_C0DE_0000_0013u64;
+    let shape = &shapes()[0];
+    let tokenizer = tokenizer_of(shape, &mut state);
+    let native = seeded(&tokenizer);
+    let model = tokenizer.get_model();
+    let texts: Vec<String> = (0..4)
+        .map(|_| long_text(&mut state, &[], 4 * PARALLEL_MIN_BYTES))
+        .collect();
+    let serial: Vec<_> = texts
+        .iter()
+        .map(|text| native.encode_with(Some(model), text, false, false))
+        .collect();
+    let barrier = std::sync::Barrier::new(texts.len());
+    std::thread::scope(|scope| {
+        for (text, serial) in texts.iter().zip(&serial) {
+            let (native, barrier) = (&native, &barrier);
+            scope.spawn(move || {
+                barrier.wait();
+                for _ in 0..4 {
+                    assert_eq!(&native.encode(Some(model), text, false), serial);
+                }
+            });
+        }
+    });
 }
 
 /// A tiktoken vocabulary rides the direct path as the file's own encoder
