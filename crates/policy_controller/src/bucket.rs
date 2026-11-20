@@ -968,7 +968,7 @@ impl Scorer for Bucket {
             };
             pool.cut_if_due(facts.now_micros, self.interval_micros);
             let spills = loads.most - loads.least > self.abs_threshold
-                && loads.most as f32 > self.rel_threshold * loads.least as f32;
+                && loads.most as f64 > f64::from(self.rel_threshold) * loads.least as f64;
             let leads = if spills {
                 Some(loads.lightest)
             } else {
@@ -1355,6 +1355,29 @@ mod tests {
         assert_eq!(led_by(&scorer, &facts, &pool, &[0, 2]), Some(0), "20 apart");
         let (scorer, pool) = booked(32, 1.5, &[100, 10, 60]);
         assert_eq!(led_by(&scorer, &facts, &pool, &[0, 2]), Some(2));
+    }
+
+    #[test]
+    fn the_balance_rule_uses_the_stored_relative_threshold_at_an_integer_boundary() {
+        let (scorer, pool) = booked(64, 1.3, &[286, 220]);
+        assert_eq!(led(&scorer, &pool, 0, SECOND), Some(1));
+    }
+
+    #[test]
+    fn large_exact_loads_still_cross_the_balance_gate() {
+        let scorer = scorer(64, 1.0, 5);
+        let pool = pool(2);
+        led(&scorer, &pool, 0, SECOND);
+        for row in 0..2 {
+            for _ in 0..256 {
+                book(&scorer, &pool, row, u32::MAX, SECOND);
+            }
+        }
+        book(&scorer, &pool, 0, 321, SECOND);
+        book(&scorer, &pool, 1, 256, SECOND);
+
+        assert_eq!(loads(&scorer).0, vec![(1 << 40) + 65, 1 << 40]);
+        assert_eq!(led(&scorer, &pool, 0, SECOND), Some(1));
     }
 
     /// Three workers listed at ten seconds, then ten bookings of 100 tokens,
