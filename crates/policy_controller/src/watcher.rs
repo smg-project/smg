@@ -631,6 +631,24 @@ mod tests {
             "{lost:?}"
         );
 
+        // The answer of a registration that states several ranks rides no
+        // watch: a watcher that meets it lets the stream go by its name.
+        let mut watcher = watching(&told, 8);
+        let ranks = worker_wire::event(
+            Event::Ranks(proto::RankRows::default()),
+            told.seq + 1,
+            WorkersStore::epoch(&told.store),
+            TERM,
+        );
+        assert_eq!(
+            watcher.take(&ranks, now),
+            Err(Lost::Unread {
+                path: "membership.ranks",
+                why: "a registration's answer rides no watch",
+            })
+        );
+        assert_eq!(watcher.at(), None);
+
         let mut watcher = watching(&told, 8);
         let word = worker_wire::start_again(Position::default());
         assert_eq!(watcher.take(&word, now), Err(Lost::Required));

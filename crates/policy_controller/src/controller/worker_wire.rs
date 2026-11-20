@@ -260,6 +260,26 @@ pub(crate) fn status_changed(id: WorkerId, from: WorkerStatus, to: WorkerStatus)
     })
 }
 
+/// One entry of the answer of a registration that states several ranks: the
+/// event a watcher is told of that row, without a place of its own. `None`
+/// for a case no registration makes of a row.
+#[cfg(feature = "worker-host")]
+pub(crate) fn rank_row(event: Event) -> Option<proto::RankRow> {
+    use proto::rank_row::Made;
+    let made = match event {
+        Event::Registered(row) => Made::Registered(row),
+        Event::Replaced(replaced) => Made::Replaced(replaced),
+        Event::Removed(removed) => Made::Removed(removed),
+        Event::Relabelled(row) => Made::Relabelled(row),
+        Event::Snapshot(_)
+        | Event::Status(_)
+        | Event::Needs(_)
+        | Event::SnapshotRequired(_)
+        | Event::Ranks(_) => return None,
+    };
+    Some(proto::RankRow { made: Some(made) })
+}
+
 /// The event in its envelope: a position of the log, the membership epoch
 /// and the term the position was written under.
 pub(crate) fn event(
@@ -363,9 +383,9 @@ fn maker_weight(maker: &Maker) -> usize {
 /// the fact, and a promoted one would decide by other facts than its leader
 /// did. The row on the wire carries a pairing's port alone and no encode
 /// offer, vision bit, priority or drain window, and it reads an empty zone
-/// and a zero window, block size or port as none. The facts are written as the log
-/// writes them and read back as a standby reads them, so a fact the wire
-/// gains is taken here with no second list.
+/// and a zero admission window, block size or port as none. The facts are
+/// written as the log writes them and read back as a standby reads them, so
+/// a fact the wire gains is taken here with no second list.
 #[cfg(feature = "worker-host")]
 #[cfg_attr(
     not(test),
@@ -759,6 +779,14 @@ pub(crate) fn told_change(
             let to = told_status(status.new).ok_or_else(|| unknown("membership.status.new"))?;
             (MembershipChange::StatusChanged { id, from, to }, None)
         }
+        // The answer of a registration that states several ranks: no watch
+        // tells it, and a reader lets the stream go by its name.
+        Some(Event::Ranks(_)) => {
+            return Err(refused(
+                "membership.ranks",
+                "a registration's answer rides no watch",
+            ));
+        }
         // A watch's own cases, and one this build does not know.
         Some(Event::Snapshot(_) | Event::Needs(_) | Event::SnapshotRequired(_)) | None => {
             return Err(unknown("membership.event"));
@@ -889,7 +917,44 @@ pub(crate) fn registration(
     standing: impl FnOnce(&str) -> Option<WorkerRow>,
 ) -> Result<(WorkerFacts, Option<WorkerRow>), Refused> {
     let standing = standing(key(spec)?);
-    let facts = over(spec, standing.as_ref().map(|row| &row.facts))?;
+    let facts = over(spec, standing.as_ref().map(|row| &row.facts), None)?;
+    Ok((facts, standing))
+}
+
+/// The most ranks one registration states: a replacement answers two rows a
+/// rank, and the answer stays inside half of a 4 MiB frame.
+#[cfg(feature = "worker-host")]
+pub(crate) const RANKS: u32 = 64;
+
+/// The ranks a registration states: one where it states none, and at most
+/// [`RANKS`].
+#[cfg(feature = "worker-host")]
+pub(crate) fn width(spec: &proto::WorkerSpec) -> Result<u16, Refused> {
+    if spec.dp_size > RANKS {
+        return Err(refused(
+            "spec.dp_size",
+            "a registration states at most 64 ranks",
+        ));
+    }
+    narrow(spec.dp_size.max(1), "spec.dp_size")
+}
+
+/// The facts of one rank of a registration that states `width` ranks, with
+/// the row that stands under the rank's URL. The URL's own rules hold for
+/// the engine's address ([`key`]) and for the rank's.
+#[cfg(feature = "worker-host")]
+pub(crate) fn rank_registration(
+    spec: &proto::WorkerSpec,
+    (url, rank, width): (&str, u16, u16),
+    standing: impl FnOnce(&str) -> Option<WorkerRow>,
+) -> Result<(WorkerFacts, Option<WorkerRow>), Refused> {
+    key(spec)?;
+    if url.len() > URL_BYTES {
+        return Err(refused("spec.url", "a rank's URL is at most 2048 bytes"));
+    }
+    let standing = standing(url);
+    let stated = standing.as_ref().map(|row| &row.facts);
+    let facts = over(spec, stated, Some((url, rank, width)))?;
     Ok((facts, standing))
 }
 
@@ -905,11 +970,17 @@ pub(crate) fn registration(
 /// character is refused, never mended: the URL, the runtime and each model
 /// id key the store's rows, its pools and its classes.
 ///
-/// One rank a registration: the contract's call answers one row, so a stated
-/// width above one is refused until a call can answer a row a rank.
+/// A registration of one rank makes the row under its URL. One that states
+/// more is laid a rank at a time ([`rank_registration`]): `rank` is that
+/// rank's URL, its place and the width. A width above one with no rank
+/// named is refused: the build lays no ranks.
 ///
 /// The URL's own rules are [`key`]'s, held before this is called.
-fn over(spec: &proto::WorkerSpec, standing: Option<&WorkerFacts>) -> Result<WorkerFacts, Refused> {
+fn over(
+    spec: &proto::WorkerSpec,
+    standing: Option<&WorkerFacts>,
+    rank: Option<(&str, u16, u16)>,
+) -> Result<WorkerFacts, Refused> {
     if spec.runtime.len() > NAME_BYTES {
         return Err(refused("spec.runtime", "a runtime is at most 256 bytes"));
     }
@@ -956,7 +1027,7 @@ fn over(spec: &proto::WorkerSpec, standing: Option<&WorkerFacts>) -> Result<Work
         Ok(proto::Role::Unspecified) => standing.map(|row| row.role),
         Err(_) => return Err(refused("spec.role", "a role this build does not know")),
     };
-    if spec.dp_size > 1 {
+    if spec.dp_size > 1 && rank.is_none() {
         return Err(refused(
             "spec.dp_size",
             "a registration makes one rank; a width above one is not served by this build",
@@ -982,10 +1053,22 @@ fn over(spec: &proto::WorkerSpec, standing: Option<&WorkerFacts>) -> Result<Work
         None => None,
     };
     let mut facts = standing.cloned().unwrap_or_default();
-    facts.key.clone_from(&spec.url);
-    if standing.is_none() {
-        facts.engine.clone_from(&spec.url);
-        facts.dp_size = 1;
+    match rank {
+        None => {
+            facts.key.clone_from(&spec.url);
+            if standing.is_none() {
+                facts.engine.clone_from(&spec.url);
+                facts.dp_size = 1;
+            }
+        }
+        // A rank states its engine, its place and the width at every
+        // registration: a worker that comes back wider or narrower says so.
+        Some((url, rank, width)) => {
+            url.clone_into(&mut facts.key);
+            facts.engine.clone_from(&spec.url);
+            facts.dp_rank = rank;
+            facts.dp_size = width;
+        }
     }
     if !spec.runtime.is_empty() {
         facts.engine_kind.clone_from(&spec.runtime);

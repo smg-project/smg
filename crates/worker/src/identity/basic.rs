@@ -467,8 +467,10 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
 
     /// Whether the absolute overload guard currently vetoes this worker.
     ///
-    /// Written only by the load monitor, once per ingested load report, and
-    /// always `false` while overload protection is unconfigured.
+    /// Written through the registry, by whoever judges the worker's load:
+    /// the load monitor, once per ingested load report, or a host that
+    /// judges load in a store of its own and mirrors each verdict. Always
+    /// `false` while overload protection is unconfigured.
     fn is_overloaded(&self) -> bool {
         false
     }

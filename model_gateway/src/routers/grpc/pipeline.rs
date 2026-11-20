@@ -81,7 +81,7 @@ use crate::{
         metrics::{bool_to_static_str, metrics_labels, Metrics},
     },
     policies::PolicyRegistry,
-    policy_controller::host::Host,
+    policy_controller::host::{Host, Placed},
     rate_limit::{RateLimitManager, UsageSettlement},
     routers::{
         common::{
@@ -588,7 +588,7 @@ impl RequestPipeline {
             acquire_clients(
                 workers,
                 &ctx.input.model_id,
-                self.worker_registry.overload_shed_enabled(),
+                self.rechecks_overload(ctx.state.placed.as_ref()),
             )
             .await
         )?);
@@ -599,6 +599,17 @@ impl RequestPipeline {
             stages.request_building.name(),
             stages.request_building.build(ctx).await
         )
+    }
+
+    /// Whether client acquisition re-checks the chosen workers' overload
+    /// flag: under `--worker-overload-shed`, for a selection the classic
+    /// policies made. A placement the controller's host made is not
+    /// re-checked. There the overload veto is the controller's, read from
+    /// its rows, and the flag on the object mirrors it for the gateway's
+    /// other readers: a worker flagged under another pool's thresholds
+    /// still takes the send the controller decided.
+    fn rechecks_overload(&self, placed: Option<&Placed>) -> bool {
+        placed.is_none() && self.worker_registry.overload_shed_enabled()
     }
 
     /// One dispatch attempt: (re-)selection for retries, plan stamping,
@@ -631,7 +642,7 @@ impl RequestPipeline {
                 acquire_clients(
                     workers,
                     &dctx.model_id,
-                    self.worker_registry.overload_shed_enabled(),
+                    self.rechecks_overload(dctx.placed.as_ref()),
                 )
                 .await?,
             );

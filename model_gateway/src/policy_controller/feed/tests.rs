@@ -22,7 +22,9 @@ use smg_policy_controller::{
         PUBLISH_WINDOW,
     },
     view::{Role, WireModes, WorkerId},
-    worker_host::{Expect, Membership, Objects, Refused, Remover, Standing, StoreDoor, Wrote},
+    worker_host::{
+        Expect, Membership, Objects, Over, Refused, Remover, Standing, StoreDoor, Wrote,
+    },
 };
 use smg_worker::{
     connection::engine::EngineConnector,
@@ -43,7 +45,10 @@ use crate::{
         start,
     },
     routers::{
-        common::snapshot::WorkerRegistry,
+        common::{
+            snapshot::WorkerRegistry,
+            worker_selection::{SelectWorkerRequest, WorkerSelector},
+        },
         grpc::backend_client::{BackendConnector, BasicWorkerBuilder},
     },
 };
@@ -465,8 +470,12 @@ fn a_built_worker_is_the_rows_object_when_its_write_returns() {
     // a write over it is refused as moved though the row never moved.
     let third = built();
     let guarded = |over| {
-        feed.door
-            .found_built(&Maker::Control, Expect::Anything, &third, Some(over))
+        feed.door.found_built(
+            &Maker::Control,
+            Expect::Anything,
+            &third,
+            Some(Over::Updated(over)),
+        )
     };
     assert_eq!(guarded(&first), Err(Refused::Moved));
     assert!(held(&second));
@@ -518,6 +527,148 @@ fn a_refreshed_worker_is_the_rows_object_when_its_write_returns() {
     let wrote = feed.door.refreshed(seen(), &moved, &equal);
     assert!(matches!(wrote, Ok(Wrote::InPlace(_))), "{wrote:?}");
     assert!(held(&moved));
+}
+
+/// A worker's ranks, each built with its own key and, where one is
+/// named, a tier's label.
+fn ranks(width: usize, gold: Option<usize>) -> Vec<Arc<dyn Worker>> {
+    (0..width)
+        .map(|rank| -> Arc<dyn Worker> {
+            let worker = BasicWorkerBuilder::new(URL)
+                .model(ModelCard::new(MODEL))
+                .dp_config(rank, width)
+                .api_key(format!("key-{rank}"));
+            let worker = if gold == Some(rank) {
+                worker.label("tier", "gold")
+            } else {
+                worker
+            };
+            Arc::new(worker.build())
+        })
+        .collect()
+}
+
+/// Whether each of `built` is the object the registry holds under its URL.
+fn stand(registry: &WorkerRegistry, built: &[Arc<dyn Worker>]) -> Vec<bool> {
+    built
+        .iter()
+        .map(|built| {
+            let held = registry.get_by_url(built.url());
+            held.is_some_and(|held| Arc::ptr_eq(&held, built))
+        })
+        .collect()
+}
+
+/// A worker of three ranks registered in one turn of the feed's door
+/// leaves the three objects its registration built, each with its key.
+#[test]
+fn three_ranks_registered_in_one_turn_leave_three_handed_objects() {
+    let store = Arc::new(MemoryStore::default());
+    let (registry, feed) = bed(&store);
+    let built = ranks(3, None);
+    let wrote = feed
+        .door
+        .found_rows(&Maker::Control, Expect::Nothing, &built, None);
+    assert!(
+        matches!(
+            wrote.as_deref(),
+            Ok([
+                Wrote::Registered(_),
+                Wrote::Registered(_),
+                Wrote::Registered(_)
+            ])
+        ),
+        "{wrote:?}"
+    );
+    assert_eq!(stand(&registry, &built), [true; 3]);
+    assert_eq!(built[2].api_key().map(String::as_str), Some("key-2"));
+    assert_eq!(feed.objects.unhanded(), 0);
+
+    // One rank alone is not the engine's width: the write is refused
+    // whole, and the object on offer for it is taken back.
+    let alone = ranks(3, None);
+    let refused = feed
+        .door
+        .found_rows(&Maker::Control, Expect::Anything, &alone[1..2], None);
+    assert!(matches!(refused, Err(Refused::Past(_))), "{refused:?}");
+    assert_eq!(stand(&registry, &built), [true; 3]);
+    assert_eq!(stand(&registry, &alone), [false; 3]);
+    assert_eq!(feed.objects.unhanded(), 0);
+}
+
+/// The same three ranks registered again with one rank's label changed
+/// lay each row with its own object, the unmoved rows too.
+#[test]
+fn ranks_registered_again_lay_each_row_with_its_own_object() {
+    let store = Arc::new(MemoryStore::default());
+    let (registry, feed) = bed(&store);
+    let first = ranks(3, None);
+    feed.door
+        .found_rows(&Maker::Control, Expect::Nothing, &first, None)
+        .expect("three ranks registered");
+    let again = ranks(3, Some(1));
+    let wrote = feed
+        .door
+        .found_rows(&Maker::Control, Expect::Anything, &again, None);
+    assert!(
+        matches!(
+            wrote.as_deref(),
+            Ok([Wrote::Unmoved(_), Wrote::InPlace(_), Wrote::Unmoved(_)])
+        ),
+        "{wrote:?}"
+    );
+    assert_eq!(stand(&registry, &again), [true; 3]);
+    assert_eq!(stand(&registry, &first), [false; 3]);
+    assert_eq!(feed.objects.unhanded(), 0);
+}
+
+/// A width that shrinks to two ends the third rank's object, and the two
+/// ranks that stay are laid with the objects of the narrower registration.
+#[test]
+fn a_width_that_shrinks_ends_the_object_of_the_rank_that_left() {
+    let store = Arc::new(MemoryStore::default());
+    let (registry, feed) = bed(&store);
+    let wide = ranks(3, None);
+    feed.door
+        .found_rows(&Maker::Control, Expect::Nothing, &wide, None)
+        .expect("three ranks registered");
+    let narrow = ranks(2, None);
+    let wrote = feed
+        .door
+        .found_rows(&Maker::Control, Expect::Anything, &narrow, None);
+    assert!(
+        matches!(wrote.as_deref(), Ok([_, _, Wrote::Removed(_)])),
+        "{wrote:?}"
+    );
+    assert_eq!(stand(&registry, &narrow), [true; 2]);
+    assert!(registry.get_by_url(wide[2].url()).is_none());
+    assert_eq!(store.snapshot().1.len(), 2);
+    assert_eq!(feed.objects.unhanded(), 0);
+}
+
+/// A worker that serves several engines over one connection states their
+/// count and no rank. It is one row under its own URL, and the object its
+/// registration built stands for it.
+#[test]
+fn a_worker_that_states_a_width_and_no_rank_is_one_row_with_its_object() {
+    let store = Arc::new(MemoryStore::default());
+    let (registry, feed) = bed(&store);
+    let built: Vec<Arc<dyn Worker>> = vec![Arc::new(
+        BasicWorkerBuilder::new(URL)
+            .model(ModelCard::new(MODEL))
+            .zmq_engine_group(4)
+            .build(),
+    )];
+    assert_eq!((built[0].dp_rank(), built[0].dp_size()), (None, Some(4)));
+    let wrote = feed
+        .door
+        .found_rows(&Maker::Control, Expect::Nothing, &built, None);
+    assert!(
+        matches!(wrote.as_deref(), Ok([Wrote::Registered(_)])),
+        "{wrote:?}"
+    );
+    assert_eq!(stand(&registry, &built), [true]);
+    assert_eq!(store.snapshot().1.len(), 1);
     assert_eq!(feed.objects.unhanded(), 0);
 }
 
@@ -771,6 +922,81 @@ async fn the_loop_shows_a_waiting_write_at_its_due_instant() {
     // No later write comes: the loop shows it when the window ends.
     sleep_until((now + 2 * PUBLISH_WINDOW).into()).await;
     assert_eq!(loads.vetoed(), Some(false));
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_loop_writes_the_stores_overload_verdict_on_the_workers_object() {
+    let loads = Loads::new().expect("the bed stands");
+    let _publications = loads.feed.publications();
+    let over = || loads.registry.overloaded_worker_count(MODEL);
+    let now = Instant::now();
+    // The store shows the first record by itself. The object's flag does
+    // not move at the record: the loop writes it at its wake.
+    loads.pushed(6, now);
+    assert_eq!(loads.vetoed(), Some(true));
+    assert!(!loads.worker.is_overloaded());
+    yield_now().await;
+    assert!(loads.worker.is_overloaded());
+    assert_eq!(over(), 1);
+    // The queue drains inside the window. The verdict waits for the
+    // window's end, and the flag with it.
+    loads.pushed(0, now + PUBLISH_WINDOW / 4);
+    yield_now().await;
+    assert!(loads.worker.is_overloaded());
+    // The loop's publication shows the verdict cleared and clears the flag.
+    sleep_until((now + 2 * PUBLISH_WINDOW).into()).await;
+    assert_eq!(loads.vetoed(), Some(false));
+    assert!(!loads.worker.is_overloaded());
+    assert_eq!(over(), 0);
+}
+
+#[test]
+fn a_settle_writes_the_stores_overload_verdict_on_a_replaced_object() {
+    let loads = Loads::new().expect("the bed stands");
+    loads.pushed(6, Instant::now());
+    loads.feed.settle();
+    assert!(loads.worker.is_overloaded());
+    // The row's facts move at the door, and the holder replaces its
+    // object. The registry releases the verdict the first carried, and
+    // the write's own settle writes it on the second.
+    let moved = || WorkerFacts {
+        max_running: Some(32),
+        ..limited()
+    };
+    let door = &loads.feed.door;
+    door.found(&Maker::Control, Expect::Anything, URL, &|_| moved())
+        .expect("the row moves in place");
+    let second = loads.registry.get_by_url(URL).expect("the row's object");
+    assert!(!Arc::ptr_eq(&loads.worker, &second));
+    assert!(second.is_overloaded());
+    assert_eq!(loads.registry.overloaded_worker_count(MODEL), 1);
+}
+
+/// A route that picks by no routing policy reads the flag the feed mirrors,
+/// as it reads the monitor's under the classic policies. Where every
+/// candidate reads overloaded the selector still hands out the least loaded
+/// one, and under `--worker-overload-shed` it refuses instead.
+#[tokio::test]
+async fn a_classic_selection_reads_the_stores_overload_verdict() {
+    let loads = Loads::new().expect("the bed stands");
+    let selector = WorkerSelector::new(&loads.registry);
+    let request = SelectWorkerRequest {
+        model_id: MODEL,
+        ..Default::default()
+    };
+    loads.pushed(6, Instant::now());
+    loads.feed.settle();
+    assert!(loads.worker.is_overloaded());
+
+    let picked = selector.select_worker(&request).await;
+    assert!(picked.is_ok_and(|picked| Arc::ptr_eq(&picked, &loads.worker)));
+
+    loads.registry.set_overload_shed(true);
+    let refused = selector.select_worker(&request).await;
+    assert_eq!(
+        refused.err().map(|shed| shed.status()),
+        Some(http::StatusCode::SERVICE_UNAVAILABLE)
+    );
 }
 
 #[tokio::test(start_paused = true)]

@@ -3059,26 +3059,164 @@ async fn the_factory_builds_a_pair_router_that_serves_under_the_policy_controlle
     assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
 }
 
-async fn placed_harmony_responses_context() -> (ResponsesContext, Arc<MemoryStore>, WorkerId) {
-    let port = spawn_stub(GatedScheduler::default()).await;
-    let registry = Arc::new(WorkerRegistry::new());
-    let worker = register_worker(&registry, port, WorkerType::Regular);
-    let (_, store, _) = host_testing::bed(&[worker.url()]);
-    let mut facts = store.by_key(worker.url()).expect("the worker's row").facts;
-    facts.models = vec![MODEL.to_string()];
-    let row = store.upsert(facts).id();
-    store.publish_now();
+/// A harmony responses context whose requests the controller places: the
+/// store, the row of its one worker, the registry and the worker's object.
+struct PlacedRig {
+    ctx: ResponsesContext,
+    store: Arc<MemoryStore>,
+    row: WorkerId,
+    registry: Arc<WorkerRegistry>,
+    worker: Arc<dyn Worker>,
+}
 
+async fn placed_harmony_responses_context() -> (ResponsesContext, Arc<MemoryStore>, WorkerId) {
+    let rig = placed_harmony_responses_rig().await;
+    (rig.ctx, rig.store, rig.row)
+}
+
+/// A published store with one ready row for each of `workers`, each
+/// serving [`MODEL`], and the pipeline's deps under a host that places over
+/// those rows.
+fn placed_deps(
+    registry: &Arc<WorkerRegistry>,
+    workers: &[Arc<dyn Worker>],
+) -> (PipelineDeps, Arc<MemoryStore>) {
+    let urls: Vec<&str> = workers.iter().map(|worker| worker.url()).collect();
+    let (_, store, _) = host_testing::bed(&urls);
+    for url in urls {
+        let mut facts = store.by_key(url).expect("the worker's row").facts;
+        facts.models = vec![MODEL.to_string()];
+        store.upsert(facts);
+    }
+    store.publish_now();
     let deps = PipelineDeps::pair(
-        Arc::clone(&registry),
+        Arc::clone(registry),
         Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
         None,
         None,
         Duration::from_secs(60),
     )
-    .with_host(Some(Arc::new(Host::at_keys(Arc::clone(&store), registry))));
+    .with_host(Some(Arc::new(Host::at_keys(
+        Arc::clone(&store),
+        Arc::clone(registry),
+    ))));
+    (deps, store)
+}
+
+async fn placed_harmony_responses_rig() -> PlacedRig {
+    let port = spawn_stub(GatedScheduler::default()).await;
+    let registry = Arc::new(WorkerRegistry::new());
+    let worker = register_worker(&registry, port, WorkerType::Regular);
+    let (deps, store) = placed_deps(&registry, std::slice::from_ref(&worker));
+    let row = store.by_key(worker.url()).expect("the worker's row").id;
     let ctx = responses_context_with_deps(Endpoint::Harmony, Mode::Regular, &deps, 0).await;
-    (ctx, store, row)
+    PlacedRig {
+        ctx,
+        store,
+        row,
+        registry,
+        worker,
+    }
+}
+
+/// Under `--worker-overload-shed` client acquisition re-checks the overload
+/// flag of a worker the classic policies chose. A worker the controller
+/// placed is not re-checked: the veto is the controller's, read from its
+/// rows, and the flag on the object mirrors it for the gateway's other
+/// readers.
+#[tokio::test]
+async fn a_placed_iteration_is_not_shed_by_the_workers_overload_flag() {
+    let rig = placed_harmony_responses_rig().await;
+    rig.registry.set_overload_shed(true);
+    assert!(rig.registry.set_worker_overloaded(&rig.worker, true));
+    let mut request = responses_request(false);
+    Arc::make_mut(&mut request).stream = Some(false);
+    let started = Instant::now();
+    rig.ctx
+        .pipeline
+        .execute_harmony_responses(&request, &rig.ctx, None)
+        .await
+        .expect("the controller's placement is sent");
+    assert!(rig
+        .store
+        .completed_ok_since(GatewayId::LOCAL, rig.row, started));
+}
+
+/// A retry the controller places is not re-checked either. Two engines
+/// share one count of starts, and the first start either of them sees is
+/// refused: the first attempt fails on the worker the controller chose, and
+/// the retry lands on the other. Both objects read overloaded with shedding
+/// on, and each engine sees the request once.
+#[tokio::test]
+async fn a_placed_retry_is_not_shed_by_the_workers_overload_flag() {
+    let starts = Arc::new(AtomicUsize::new(0));
+    let registry = Arc::new(WorkerRegistry::new());
+    let mut workers = Vec::new();
+    let mut seen = Vec::new();
+    for _ in 0..2 {
+        let ids = Arc::new(Mutex::new(Vec::new()));
+        let port = spawn_stub(GatedScheduler {
+            fail_first: true,
+            calls: Arc::clone(&starts),
+            seen_request_ids: Arc::clone(&ids),
+            ..Default::default()
+        })
+        .await;
+        workers.push(register_worker(&registry, port, WorkerType::Regular));
+        seen.push(ids);
+    }
+    let (deps, _store) = placed_deps(&registry, &workers);
+    registry.set_overload_shed(true);
+    for worker in &workers {
+        assert!(registry.set_worker_overloaded(worker, true));
+    }
+
+    let pipeline = RequestPipeline::build(Endpoint::Completion, Mode::Regular, &deps)
+        .expect("completion pipeline");
+    let components = components(registry).await;
+    let response = run_completion(pipeline, components, &fast_retry_config(3)).await;
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+    for ids in &seen {
+        assert_eq!(calls_seen(ids), 1, "each engine sees one start");
+    }
+}
+
+/// A placed request's definitive failure still moves to the other worker
+/// where that worker's object reads overloaded. Under a host the retry
+/// window reads a worker's status and breaker, and the retry's placement
+/// answers for the veto. Each engine sees the request once, and the second
+/// answer stands.
+#[tokio::test]
+async fn a_placed_requests_definitive_failure_moves_on_past_the_overload_flag() {
+    let registry = Arc::new(WorkerRegistry::new());
+    let mut workers = Vec::new();
+    let mut seen = Vec::new();
+    for _ in 0..2 {
+        let ids = Arc::new(Mutex::new(Vec::new()));
+        let port = spawn_stub(GatedScheduler {
+            fail_internal: true,
+            seen_request_ids: Arc::clone(&ids),
+            ..Default::default()
+        })
+        .await;
+        workers.push(register_worker_with_breaker(&registry, port, 5));
+        seen.push(ids);
+    }
+    let (deps, _store) = placed_deps(&registry, &workers);
+    for worker in &workers {
+        assert!(registry.set_worker_overloaded(worker, true));
+    }
+
+    let pipeline = RequestPipeline::build(Endpoint::Completion, Mode::Regular, &deps)
+        .expect("completion pipeline");
+    let components = components(registry).await;
+    let response = run_completion(pipeline, components, &fast_retry_config(5)).await;
+
+    assert_eq!(response.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+    for ids in &seen {
+        assert_eq!(calls_seen(ids), 1, "each engine sees the request once");
+    }
 }
 
 #[tokio::test]

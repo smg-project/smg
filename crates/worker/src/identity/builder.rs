@@ -31,6 +31,11 @@ use crate::{
     },
 };
 
+/// The URL of the rank `rank` of the engine at `base`.
+pub fn rank_url(base: &str, rank: usize) -> String {
+    format!("{base}@{rank}")
+}
+
 /// Builder for creating BasicWorker instances with fluent API.
 ///
 /// Internally stores a [`WorkerSpec`] for identity/config fields.
@@ -382,7 +387,7 @@ impl<D: ConnectorDefault> BasicWorkerBuilder<D> {
     /// Captures the current URL as the base URL, then formats it as `{base}@{rank}`.
     pub fn dp_config(mut self, rank: usize, size: usize) -> Self {
         let base_url = self.spec.url.clone();
-        self.spec.url = format!("{base_url}@{rank}");
+        self.spec.url = rank_url(&base_url, rank);
         self.spec.dp_base_url = Some(base_url);
         self.spec.dp_rank = Some(rank);
         self.spec.dp_size = Some(size);
@@ -616,6 +621,23 @@ mod tests {
         spec.dp_base_url = Some("ipc:///tmp/g".to_string());
         let ranked = BasicWorkerBuilder::from_spec(spec).build();
         assert_eq!(ranked.redacted_url(), "ipc:///tmp/g@1");
+    }
+
+    #[test]
+    fn a_ranks_url_is_formed_in_one_place() {
+        let base = "http://worker:8000";
+        for (rank, url) in [
+            "http://worker:8000@0",
+            "http://worker:8000@1",
+            "http://worker:8000@2",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let worker = BasicWorkerBuilder::new(base).dp_config(rank, 3).build();
+            assert_eq!(rank_url(base, rank), url);
+            assert_eq!(worker.url(), url);
+        }
     }
 
     #[test]

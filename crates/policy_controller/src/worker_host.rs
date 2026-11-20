@@ -25,7 +25,7 @@
 //! | `wire_modes` | `connection_mode`: gRPC where the set holds it, else HTTP, else the host-local wire; an empty set is HTTP |
 //! | `engine_kind` | `runtime_type`, as the worker crate parses the name; unspecified where it knows none |
 //! | `models` | `models`, one card an id; no id is the wildcard |
-//! | `dp_rank`, `dp_size` | `dp_rank`, `dp_size`, where the width is above one; else neither |
+//! | `dp_rank`, `dp_size` | `dp_size` where the width is above one, and `dp_rank` with it unless the row is the engine whole: under its engine's own address at rank 0; else neither |
 //! | `labels` | `labels` |
 //! | `kv_block_size` | `kv_block_size` |
 //! | `bootstrap_port` | `bootstrap_port` |
@@ -33,7 +33,7 @@
 //! | `drain_settle_secs` | the checks' drain window, where the row states one; else the object's default |
 //! | `signals`, `reachable_from` | not carried: the object has no field for them, and a collector reads them of the row by the id the holder keeps. A host that is no gateway has the object of a row one gateway alone reaches built with its checks off ([`Objects::with_host_local_unchecked`]) |
 //! | `zone`, `pairing`, `encode`, `vision`, `max_running`, `priority`, `demand_facts` | not carried: a decision's facts, read of the store's rows and never of an object |
-//! | `overload` | not carried to the object: a decision's fact, read of the store's rows. [`facts()`] states the thresholds of the object's own registration over the standing row's |
+//! | `overload` | not carried to the object: a decision's fact, read of the store's rows. [`facts()`] states the thresholds of the object's own registration over the standing row's. A replacement by id states them whole: one it leaves out is cleared ([`Over::Replaced`]) |
 //!
 //! A new object starts at its row's status. A replacement takes the
 //! standing object's running state, including its status. A host that gets
@@ -55,10 +55,10 @@
 //! host's holder was built with.
 //!
 //! A host whose registrations run in its own process needs none of that.
-//! Its registration built a whole object, and the holder keeps it as the
-//! row's ([`Objects::with_built_kept`]): the door hands it in with the
-//! write ([`Membership::found_built`], [`Objects::handing`]). The object
-//! holds what the table does not carry, its credential first.
+//! Its registration built a whole object a row, and the holder keeps each
+//! as its row's ([`Objects::with_built_kept`]): the door hands them in
+//! with the write ([`Membership::found_rows`], [`Objects::handing`]). An
+//! object holds what the table does not carry, its credential first.
 //!
 //! # The adapters
 //!
@@ -121,11 +121,13 @@ pub use credentials::{Credentials, KeptCredential, RegistrationInFlight};
 #[cfg(all(test, feature = "controller"))]
 pub(crate) use door::tests::{
     check_event_signal, check_expectations, check_guard, check_health_scope, check_maker,
-    check_provider, check_refresh,
+    check_one_row, check_provider, check_rank_rows, check_refresh, FindOne, Rows,
 };
 #[cfg(feature = "controller")]
-pub(crate) use door::{drain, lay, refresh, take, Turn};
-pub use door::{Expect, Membership, Refused, Remover, StoreDoor, Wrote};
+pub(crate) use door::{
+    drain, lay, lay_one, lay_ready, refresh, stating, take, Ready, Stated, Turn,
+};
+pub use door::{Expect, Membership, Over, Refused, Remover, StoreDoor, Wrote};
 pub use found::facts;
 pub use health::HealthAdapter;
 pub use kv::{KvAdapter, KvHost, NoFeed, Unfed};

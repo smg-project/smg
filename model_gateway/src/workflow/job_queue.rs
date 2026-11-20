@@ -2088,6 +2088,65 @@ mod tests {
         );
     }
 
+    /// Under the policy controller a PUT that changes a worker's role or
+    /// its model makes its row another life, and the worker keeps its id.
+    /// The caller holds the id of the PUT's 202: the holder lays the new
+    /// life's object under it, and the worker API answers the new worker
+    /// there behind the job. The store holds the new row alone, no lay
+    /// missed its object, and the object reads its row's status.
+    #[tokio::test]
+    async fn under_the_policy_controller_a_put_that_starts_another_life_keeps_its_id() {
+        use openai_protocol::{
+            model_card::ModelCard,
+            worker::{WorkerModels, WorkerStatus},
+        };
+        use smg_policy_controller::store::{WorkerStatus as RowStatus, WorkersStore};
+
+        let (hosted, url, _, mut next_job) = a_hosted_gateway_with_a_row().await;
+        let store = hosted.policy_store.as_ref().expect("the store");
+        let registry = &hosted.worker_registry;
+        let service = &hosted.worker_service;
+        let rows = &hosted.door_feed().expect("the feed").objects;
+        let id = registry.get_id_by_url(&url).expect("the worker's id");
+
+        let mut prefill = WorkerSpec::new(&url);
+        prefill.worker_type = WorkerType::Prefill;
+        let mut renamed = prefill.clone();
+        renamed.models = WorkerModels::Single(Box::new(ModelCard::new("n")));
+        for (what, spec) in [("the role", prefill), ("the model", renamed)] {
+            let before = store.by_key(&url).expect("the worker's row");
+            let accepted = service
+                .replace_worker(id.as_str(), spec)
+                .await
+                .expect("the 202");
+            assert_eq!(accepted.worker_id, id, "{what}");
+            let done = execute_job(&next_job(), &hosted, &DashSet::new(), None).await;
+            assert!(done.is_ok(), "{what}: {done:?}");
+
+            let row = store.by_key(&url).expect("the worker's row");
+            assert_ne!(row.id, before.id, "{what} did not start another life");
+            assert!(store.get(before.id).is_none(), "{what}: the old row stands");
+            assert_eq!(row.status, RowStatus::Ready, "{what}");
+            assert_eq!(registry.get_id_by_url(&url), Some(id.clone()), "{what}");
+            let laid = registry.get(&id).expect("the worker under its id");
+            assert_eq!(laid.status(), WorkerStatus::Ready, "{what}");
+            let standing = rows.standing_of(&id, &laid).expect("the new life's row");
+            assert_eq!(
+                (standing.row, standing.revision),
+                (row.id, row.revision),
+                "{what}"
+            );
+            assert_eq!(rows.len(), 1, "{what}");
+        }
+        let answered = service
+            .get_worker(id.as_str())
+            .expect("the worker API's answer");
+        assert_eq!(answered.0.id, id.as_str());
+        assert_eq!(answered.0.spec.worker_type, WorkerType::Prefill);
+        assert_eq!(answered.0.model_id.as_deref(), Some("n"));
+        assert_eq!(rows.unhanded(), 0);
+    }
+
     /// Under the policy controller a PATCH moves a row's labels and its
     /// health checks. The update job lays them over the row at the store's
     /// door as the control maker, in place, and hands its rebuilt worker
@@ -2231,6 +2290,65 @@ mod tests {
         let laid = registry.get(&id).expect("the row's object");
         assert!(!Arc::ptr_eq(&laid, &out));
         assert_eq!(laid.status(), WorkerStatus::Ready);
+    }
+
+    /// Under the policy controller a PUT is the operator's whole statement
+    /// of a worker: an overload threshold it leaves out is cleared, on the
+    /// row and on the row's object. A PATCH of another field keeps it.
+    #[tokio::test]
+    async fn under_the_policy_controller_a_put_clears_a_threshold_it_leaves_out() {
+        use smg_policy_controller::store::{Overload, WorkersStore};
+
+        let (hosted, url, _, mut next_job) = a_hosted_gateway_with_a_row().await;
+        let store = hosted.policy_store.as_ref().expect("the store");
+        let registry = &hosted.worker_registry;
+        let service = &hosted.worker_service;
+        let id = registry.get_id_by_url(&url).expect("the worker's id");
+        let marks = DashSet::new();
+        let limited = |waiting| {
+            let mut spec = WorkerSpec::new(&url);
+            spec.overload.waiting_requests = waiting;
+            spec
+        };
+        let pair = || store.by_key(&url).expect("the worker's row").facts.overload;
+        let listed = || {
+            let object = registry.get(&id).expect("the row's object");
+            object.metadata().spec.overload.waiting_requests
+        };
+
+        // A PUT that states a threshold: the row and its object hold it.
+        service
+            .replace_worker(id.as_str(), limited(Some(8)))
+            .await
+            .expect("the 202");
+        let done = execute_job(&next_job(), &hosted, &marks, None).await;
+        assert!(done.is_ok(), "{done:?}");
+        assert_eq!(pair().waiting_requests, Some(8));
+        assert_eq!(listed(), Some(8));
+
+        // A PATCH of a label keeps it.
+        let patch = Job::UpdateWorker {
+            url: url.clone(),
+            update: Box::new(
+                serde_json::from_value(serde_json::json!({"labels": {"tier": "a"}}))
+                    .expect("an update"),
+            ),
+            asker: WorkerJobAsker::Api,
+        };
+        let done = execute_job(&patch, &hosted, &marks, None).await;
+        assert!(done.is_ok(), "{done:?}");
+        assert_eq!(pair().waiting_requests, Some(8));
+        assert_eq!(listed(), Some(8));
+
+        // A PUT that leaves it out clears it.
+        service
+            .replace_worker(id.as_str(), limited(None))
+            .await
+            .expect("the 202");
+        let done = execute_job(&next_job(), &hosted, &marks, None).await;
+        assert!(done.is_ok(), "{done:?}");
+        assert_eq!(pair(), Overload::default());
+        assert_eq!(listed(), None);
     }
 
     /// The door is the judge of an update. A job that reaches a row another

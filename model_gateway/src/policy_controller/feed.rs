@@ -2,10 +2,10 @@
 //! registry up to date and publishes membership for decisions in that order.
 //! Each membership write asks for publication before it returns.
 //!
-//! A registration of this process hands the door the worker it built, and
-//! the holder keeps that object as the row's ([`FeedDoor`]). It holds what
-//! no row states: the worker's credential, its connection settings and its
-//! model cards.
+//! A registration of this process hands the door the workers it built, and
+//! the holder keeps each as its row's object ([`FeedDoor`]). An object
+//! holds what no row states: the worker's credential, its connection
+//! settings and its model cards.
 //!
 //! Under a controller's address the follower writes the store in the door's
 //! place, and settles the feed after each event it takes ([`following`]).
@@ -35,7 +35,7 @@ use parking_lot::Mutex;
 use smg_policy_controller::{
     store::{LoadSink as StoreLoadSink, Maker, MemoryStore, WorkerFacts},
     worker_host::{
-        Expect, HealthAdapter, KvFeed, LoadAdapter, Membership, Objects, Refused, Remover,
+        Expect, HealthAdapter, KvFeed, LoadAdapter, Membership, Objects, Over, Refused, Remover,
         SoleLead, Standing, StoreDoor, Wrote,
     },
 };
@@ -90,11 +90,12 @@ impl Feed {
         })
     }
 
-    /// Bring the registry to the store's rows, then publish them: the two
-    /// calls the door's listener makes after each write. A follower that
-    /// applies a served controller's events calls this after each event.
-    /// It takes the feed's turn, so it never runs between a write at the
-    /// door and that write's listener.
+    /// Bring the registry to the store's rows, publish them, then write the
+    /// published overload verdicts on the objects: the three calls the
+    /// door's listener makes after each write. A follower that applies a
+    /// served controller's events calls this after each event. It takes the
+    /// feed's turn, so it never runs between a write at the door and that
+    /// write's listener.
     pub(crate) fn settle(&self) {
         let _turn = self.turn.lock();
         settle(&self.objects, &self.store, None);
@@ -149,9 +150,16 @@ impl Feed {
     /// With no instant in hand the loop waits for a wake. With one in hand
     /// it sleeps to it and settles at it. A wake that comes while it sleeps
     /// is kept, and costs one more read of the instant.
+    ///
+    /// A write the store showed by itself names no instant, and no settle
+    /// follows it. The loop writes the overload verdicts of the world that
+    /// stands before it waits, so a wake with nothing due still mirrors.
+    /// The holder mirrors one call at a time and reads the world of its
+    /// instant, so the call takes no turn of the feed.
     async fn publish_as_due(self) {
         loop {
             let Some(due) = self.store.publish_due() else {
+                self.objects.mirror_overload(&self.store);
                 self.woken.notified().await;
                 continue;
             };
@@ -313,13 +321,15 @@ impl HealthSink for FeedHealth {
 /// The order is the rule: the registry holds a row's object before a
 /// decision can read the row. With an instant the store shows what is due
 /// at it. With none it pays the build the membership writes left owed, at
-/// once.
+/// once. The objects then take the overload verdicts of the world that
+/// stands.
 fn settle(objects: &Objects<ModelWorkerSnapshot>, store: &MemoryStore, at: Option<Instant>) {
     objects.follow(store);
     match at {
         Some(now) => store.publish(now),
         None => store.publish_now(),
     }
+    objects.mirror_overload(store);
 }
 
 /// The feed over `store`, for the workers of `registry`. The holder keeps
@@ -382,9 +392,10 @@ fn over(store: &Arc<MemoryStore>, objects: Objects<ModelWorkerSnapshot>) -> Feed
 /// feed's turn through that call, so neither a later write nor a settle
 /// can publish a row the holder has yet to read.
 ///
-/// A built worker is on offer at the holder through its write, inside the
-/// same turn: the listener's read lays the row with it, and a write that
-/// moved no fact has the holder lay it too. The offer ends with the turn.
+/// A registration's built workers are on offer at the holder through its
+/// write, inside the same turn: the listener's read lays each row with its
+/// own, and a row the write left unmoved has the holder lay it too. The
+/// offer ends whole with the turn.
 /// A guarded write names the object it replaces, and the holder refuses it
 /// in that turn where another object stands.
 struct FeedDoor {
@@ -395,10 +406,7 @@ struct FeedDoor {
 }
 
 impl FeedDoor {
-    fn write(
-        &self,
-        write: impl FnOnce(&StoreDoor) -> Result<Wrote, Refused>,
-    ) -> Result<Wrote, Refused> {
+    fn write<T>(&self, write: impl FnOnce(&StoreDoor) -> Result<T, Refused>) -> Result<T, Refused> {
         let _turn = self.turn.lock();
         write(&self.door)
     }
@@ -415,16 +423,17 @@ impl Membership for FeedDoor {
         self.write(|door| door.found(maker, expect, url, state))
     }
 
-    fn found_built(
+    fn found_rows(
         &self,
         maker: &Maker,
         expect: Expect,
-        built: &Arc<dyn Worker>,
-        over: Option<&Arc<dyn Worker>>,
-    ) -> Result<Wrote, Refused> {
+        built: &[Arc<dyn Worker>],
+        over: Option<Over<'_>>,
+    ) -> Result<Vec<Wrote>, Refused> {
         self.write(|door| {
-            self.objects.handing(self.store.as_ref(), built, over, || {
-                door.found_built(maker, expect, built, None)
+            let seen = over.map(Over::object);
+            self.objects.handing(self.store.as_ref(), built, seen, || {
+                door.found_rows(maker, expect, built, over)
             })
         })
     }
@@ -445,7 +454,7 @@ impl Membership for FeedDoor {
     ) -> Result<Wrote, Refused> {
         self.write(|door| {
             self.objects
-                .handing(self.store.as_ref(), built, Some(over), || {
+                .handing_one(self.store.as_ref(), built, Some(over), || {
                     door.refreshed(seen, built, over)
                 })
         })

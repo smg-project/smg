@@ -1891,6 +1891,22 @@ impl MemoryStore {
     }
 }
 
+#[cfg(feature = "worker-host")]
+impl MemoryStore {
+    /// Every row whose facts name `engine`: its plain row, or each rank
+    /// that stands. One pass over the rows under the membership lock, once
+    /// a registration at a door. No decision reads it.
+    pub(crate) fn of_engine(&self, engine: &str) -> Vec<WorkerRow> {
+        let workers = self.workers.lock();
+        workers
+            .rows
+            .values()
+            .filter(|row| row.row.facts.engine == engine)
+            .map(|row| row.row.clone())
+            .collect()
+    }
+}
+
 impl WorkersStore for MemoryStore {
     fn upsert_by(&self, mut facts: WorkerFacts, maker: Maker) -> MembershipChange {
         // A blank value of a descriptor or of an encode offer is no report:

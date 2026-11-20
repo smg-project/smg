@@ -15,7 +15,7 @@ use openai_protocol::worker::WorkerStatus;
 use smg_policy_controller::{
     store::{Maker, WorkerFacts},
     view::WorkerId,
-    worker_host::{Expect, Membership, Objects, Refused, Remover, Standing, Wrote},
+    worker_host::{Expect, Membership, Objects, Over, Refused, Remover, Standing, Wrote},
 };
 use smg_worker::identity::basic::Worker;
 
@@ -64,16 +64,16 @@ impl Membership for DrainingDoor {
         self.door.found(maker, expect, url, state)
     }
 
-    // The feed's door hands a built worker to the holder: pass the call on,
-    // so the holder keeps the object the registration built.
-    fn found_built(
+    // The feed's door hands the built workers to the holder: pass the call
+    // on, so the holder keeps the objects the registration built.
+    fn found_rows(
         &self,
         maker: &Maker,
         expect: Expect,
-        built: &Arc<dyn Worker>,
-        over: Option<&Arc<dyn Worker>>,
-    ) -> Result<Wrote, Refused> {
-        self.door.found_built(maker, expect, built, over)
+        built: &[Arc<dyn Worker>],
+        over: Option<Over<'_>>,
+    ) -> Result<Vec<Wrote>, Refused> {
+        self.door.found_rows(maker, expect, built, over)
     }
 
     fn drained(&self, by: Remover<'_>, url: &str, seen: Standing) -> Result<Wrote, Refused> {

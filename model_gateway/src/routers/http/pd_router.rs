@@ -797,7 +797,7 @@ impl PDRouter {
 
         // What the request's attempts tell the worker pool: a retry selects
         // around a worker whose answer was definitive (`attempt_ledger`).
-        let ledger = AttemptLedger::default();
+        let ledger = AttemptLedger::of(self.host.is_some());
         // The rows of the pairs the request's failed attempts were sent to,
         // for the policy controller's host. The classic path leaves it empty.
         let tried_rows = parking_lot::Mutex::new(Vec::new());
@@ -1591,7 +1591,7 @@ impl PDRouter {
         let pairs_without = |gone: &Arc<dyn Worker>| {
             let free = |worker: &Arc<dyn Worker>| {
                 worker.base_url() != gone.base_url()
-                    && worker.is_available()
+                    && ledger.takes(worker.as_ref())
                     && ledger.admits(worker.as_ref())
             };
             pairs

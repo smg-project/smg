@@ -191,7 +191,10 @@ fn register_worker(
 /// worker's own group, and the group of the worker it replaces at the same
 /// URL, when there is one and it differs (a replacement that changes the
 /// model, worker type or connection mode empties the old group).
-fn pool_groups_touched(registry: &WorkerRegistry, workers: &[Arc<dyn Worker>]) -> PoolGroups {
+pub(crate) fn pool_groups_touched(
+    registry: &WorkerRegistry,
+    workers: &[Arc<dyn Worker>],
+) -> PoolGroups {
     let mut groups: PoolGroups = workers.iter().map(|w| pool_group(w.as_ref())).collect();
     for worker in workers {
         if let Some(replaced) = registry.get_by_url(worker.url()) {
@@ -434,10 +437,14 @@ impl StepExecutor<WorkerWorkflowData> for RegisterBesideRowsStep {
                 for worker in workers {
                     pd_admission::announce_decode_window(worker.as_ref());
                 }
-                let groups = workers
+                // The door replaced the registry's object ahead of this
+                // step, so the group a replaced worker left is the
+                // check's to name: it read the registry ahead of the write.
+                let mut groups: PoolGroups = workers
                     .iter()
                     .map(|worker| pool_group(worker.as_ref()))
                     .collect();
+                groups.extend(context.data.host_notes.pool_groups.iter().cloned());
                 after_write(&app_context, workers, &groups, symphony_table);
             }
             WorkerKind::External => {
@@ -563,6 +570,49 @@ mod tests {
             .get(&id)
             .is_some_and(|entry| Arc::ptr_eq(&entry, &provider)));
         assert!(feed.objects.standing(&id).is_none());
+    }
+
+    /// Beside the rows the step refreshes the pool size of each group its
+    /// registration touched, as the check noted them ahead of the door's
+    /// write. The door replaces the registry's object first, so the step
+    /// no longer finds the worker a replacement moved out of its group.
+    /// The only worker of a model, moved to another model, leaves the old
+    /// model's gauge at zero.
+    #[tokio::test]
+    async fn beside_rows_a_replacement_refreshes_the_group_its_worker_left() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let (registry, feed, host) = beside_rows();
+        let step = RegisterBesideRowsStep::new(Arc::clone(&feed.objects));
+        let size = |model: &str| {
+            let model = format!("model=\"{model}\"");
+            handle
+                .render()
+                .lines()
+                .find(|line| line.starts_with("smg_worker_pool_size{") && line.contains(&model))
+                .and_then(|line| line.rsplit(' ').next().map(str::to_owned))
+        };
+
+        // A registration, then its replacement by a worker of another
+        // model: the check's read, the door's write, the step.
+        for (model, left) in [("m1", None), ("m2", Some("m1"))] {
+            let new = worker(model);
+            let mut context = built(&host, WorkerKind::Local, &new);
+            context.data.host_notes.pool_groups =
+                pool_groups_touched(&registry, std::slice::from_ref(&new));
+            feed.door
+                .found_built(&Maker::Control, Expect::Anything, &new, None)
+                .unwrap();
+            assert_eq!(
+                step.execute(&mut context).await.unwrap(),
+                StepResult::Success
+            );
+            assert_eq!(size(model).as_deref(), Some("1"), "{model}");
+            if let Some(left) = left {
+                assert_eq!(size(left).as_deref(), Some("0"), "{left}");
+            }
+        }
     }
 
     #[tokio::test]

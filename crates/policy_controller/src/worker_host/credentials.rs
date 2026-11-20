@@ -26,7 +26,9 @@ use crate::{store::WorkerFacts, view::WorkerId};
 /// write, with the facts it writes and `None` where it has no credential.
 /// It writes the row. Then it answers the token `keep` returned:
 /// [`KeptCredential::accepted`] with the row the door answered where the
-/// write was taken, whether or not it moved the row, and
+/// write was taken, whether or not it moved the row
+/// ([`KeptCredential::accepted_rows`] with every row, where it states the
+/// ranks of one engine), and
 /// [`KeptCredential::put_back`] where it was refused. It answers at the
 /// door's answer, with no await between the two. A token dropped with no
 /// answer is put back. Where either answer returns `true`, the host has
@@ -185,7 +187,15 @@ impl KeptCredential {
     /// objects again then
     /// ([`Objects::lay_again`](super::Objects::lay_again)).
     pub fn accepted(mut self, row: WorkerId) -> bool {
-        self.end(Some(row))
+        self.end(Some(&[row]))
+    }
+
+    /// The write of several rows at the one address was taken:
+    /// [`Self::accepted`] for a registration that states the ranks of one
+    /// engine, with every row the door answered. It is one flight, so its
+    /// one answer binds them all.
+    pub fn accepted_rows(mut self, rows: &[WorkerId]) -> bool {
+        self.end(Some(rows))
     }
 
     /// The write was refused: restore what stood at the address when the
@@ -198,9 +208,9 @@ impl KeptCredential {
         self.end(None)
     }
 
-    /// End the flight, once: accepted with the row the door answered, or
+    /// End the flight, once: accepted with the rows the door answered, or
     /// put back. Return whether the address is to be laid again.
-    fn end(&mut self, accepted: Option<WorkerId>) -> bool {
+    fn end(&mut self, accepted: Option<&[WorkerId]>) -> bool {
         if !mem::take(&mut self.in_flight) {
             return false;
         }
@@ -214,21 +224,24 @@ impl KeptCredential {
             return false;
         };
         let built = flight.built.into_inner();
-        if let Some(row) = accepted {
+        if let Some(rows) = accepted {
             *taken += 1;
-            return match entry.rows.iter_mut().find(|bound| bound.row == row) {
-                Some(bound) => {
-                    bound.taken_at = *taken;
-                    built || self.differs
+            let mut again = built || self.differs;
+            for &row in rows {
+                match entry.rows.iter_mut().find(|bound| bound.row == row) {
+                    Some(bound) => bound.taken_at = *taken,
+                    None => {
+                        entry.rows.push(Bound {
+                            row,
+                            taken_at: *taken,
+                        });
+                        // A row not bound here before: its object took
+                        // no credential.
+                        again = true;
+                    }
                 }
-                None => {
-                    entry.rows.push(Bound {
-                        row,
-                        taken_at: *taken,
-                    });
-                    true
-                }
-            };
+            }
+            return again;
         }
         if let Some(stood) = flight.stood {
             entry.credential = stood.credential;
@@ -422,6 +435,23 @@ mod tests {
 
     fn has_entry(credentials: &Credentials, address: &str) -> bool {
         credentials.held.read().entries.contains_key(address)
+    }
+
+    /// A registration of several rows at one address is one flight. Its
+    /// acceptance binds every row its door answered, and the object of
+    /// each takes the credential.
+    #[test]
+    fn an_acceptance_of_several_rows_binds_each_of_them() {
+        let credentials = Credentials::new();
+        let rows = [ROW, OTHER_ROW];
+        assert!(keep(&credentials, ADDRESS, Some(KEY_A)).accepted_rows(&rows));
+        for row in rows {
+            assert!(builds_with(&credentials, ADDRESS, row, Some(KEY_A)));
+        }
+        // Stated again with no change, nothing is to be laid again.
+        assert!(!keep(&credentials, ADDRESS, Some(KEY_A)).accepted_rows(&rows));
+        // A row beside them that no registration bound takes nothing.
+        assert!(builds_with(&credentials, ADDRESS, WorkerId(3), None));
     }
 
     #[test]

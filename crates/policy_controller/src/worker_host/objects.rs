@@ -1,12 +1,16 @@
 //! The holder of a replica's worker objects: it follows the store's
 //! membership and writes the registry. A host can also ask it to follow
-//! the rows' status.
+//! the rows' status, and to write the store's overload verdicts on the
+//! objects.
 
 use std::{
     collections::{HashMap, HashSet},
     fmt,
     sync::{
-        atomic::{AtomicU64, Ordering::Relaxed},
+        atomic::{
+            AtomicBool, AtomicU64,
+            Ordering::{Acquire, Relaxed, Release},
+        },
         Arc,
     },
 };
@@ -14,6 +18,7 @@ use std::{
 use parking_lot::{Mutex, RwLock};
 use smg_worker::{
     connection::engine::EngineConnector,
+    health::overload::{log_overload_edge, OverloadReading, OverloadThresholds},
     identity::{basic::Worker, endpoint::Endpoint},
     registry::{Generation, WorkerId as ObjectId, WorkerRegistry},
 };
@@ -26,8 +31,11 @@ use super::{
     object::{builder, dial_address, status, unchecked},
 };
 use crate::{
-    store::{MembershipChange, MembershipTail, Reachability, WorkerFacts, WorkerRow, WorkersStore},
-    view::WorkerId,
+    store::{
+        MembershipChange, MembershipTail, MemoryStore, Overload, Reachability, WorkerFacts,
+        WorkerRow, WorkersStore,
+    },
+    view::{LoadRow, WorkerId},
 };
 
 /// What a host keeps of a registry's generation when it derives nothing
@@ -74,19 +82,21 @@ struct Laid {
     handed: bool,
 }
 
-/// An object on offer for the write of its row. Dropping it ends the offer.
-struct Offer<'a>(&'a Mutex<Option<Arc<dyn Worker>>>);
+/// The objects on offer for one write, each for its own row. Dropping it
+/// ends the offer whole: an object no row took is never left for a later
+/// lay.
+struct Offer<'a>(&'a Mutex<Vec<Arc<dyn Worker>>>);
 
 impl<'a> Offer<'a> {
-    fn put(slot: &'a Mutex<Option<Arc<dyn Worker>>>, built: &Arc<dyn Worker>) -> Self {
-        *slot.lock() = Some(Arc::clone(built));
+    fn put(slot: &'a Mutex<Vec<Arc<dyn Worker>>>, built: &[Arc<dyn Worker>]) -> Self {
+        *slot.lock() = built.to_vec();
         Self(slot)
     }
 }
 
 impl Drop for Offer<'_> {
     fn drop(&mut self) {
-        *self.0.lock() = None;
+        self.0.lock().clear();
     }
 }
 
@@ -137,6 +147,19 @@ impl Held {
             self.ranks.remove(address);
         }
     }
+
+    /// Take the row `id` out of every table of the entry: its place among
+    /// its engine's ranks, its facts, its object's id, and that object's
+    /// own entry. A row that leaves goes through here, at its object's end
+    /// and where its next life takes its object's place.
+    fn leave(&mut self, id: WorkerId) {
+        // The rank first: it is found by the row's facts.
+        self.unrank(id);
+        self.facts.remove(&id);
+        if let Some(object) = self.objects.remove(&id) {
+            self.rows.remove(&object);
+        }
+    }
 }
 
 /// A replica's worker objects: for every row of the membership store that
@@ -146,7 +169,8 @@ impl Held {
 /// what the store's membership did since its last read. It builds the
 /// object of a row that arrived, drops the object of a row that went, and
 /// replaces the object of a row whose facts changed under the same id in
-/// the registry. A new incarnation of a key gets a new object and id.
+/// the registry. A new incarnation of a key gets a new object and id,
+/// unless a registration hands its object in.
 ///
 /// By default a status change reads no row and leaves the object alone.
 /// With [`Self::with_status_followed`], the holder copies the row's status
@@ -185,6 +209,11 @@ impl Held {
 /// the row. Such an object holds its own credential, so that holder needs
 /// no keeper.
 ///
+/// A registration whose write makes the row another life keeps the
+/// worker's id in the registry: the object it hands in takes the place of
+/// the old life's object. The id is the worker's handle for its operator,
+/// and the row's id is the life.
+///
 /// With a keeper ([`Self::with_credentials`]), each read has the keeper
 /// forget the rows that left, whoever wrote the removal, and an entry goes
 /// with its last row. The keeper's clock is read ahead of the store: a row
@@ -219,13 +248,21 @@ pub struct Objects<G> {
     host_local_unchecked: bool,
     /// Whether the host's registrations hand in the objects they built.
     built_kept: bool,
-    /// The object on offer through one registration's write. Empty
-    /// outside one.
-    offered: Mutex<Option<Arc<dyn Worker>>>,
+    /// The objects on offer through one registration's write, one a row.
+    /// Empty outside one.
+    offered: Mutex<Vec<Arc<dyn Worker>>>,
     /// One hand-in at a time, from the offer to its end.
     handing: Mutex<()>,
     /// How many lays found no object handed in where the host hands them.
     unhanded: AtomicU64,
+    /// The epoch of the store's overload verdicts the objects were last
+    /// held against ([`Self::mirror_overload`]). Held through a walk: one
+    /// mirrors at a time.
+    mirrored: Mutex<Option<u64>>,
+    /// Whether the registry took an object since the last walk began. Its
+    /// replacement releases a verdict and a new object starts with none,
+    /// so the next mirror walks whatever the epoch says.
+    mirror_owed: AtomicBool,
     /// Where the last read ended. Held through a read: one follows at a
     /// time.
     read_to: Mutex<Place>,
@@ -294,9 +331,11 @@ impl<G: Generation> Objects<G> {
             forgotten_at: AtomicU64::new(0),
             host_local_unchecked: false,
             built_kept: false,
-            offered: Mutex::new(None),
+            offered: Mutex::new(Vec::new()),
             handing: Mutex::new(()),
             unhanded: AtomicU64::new(0),
+            mirrored: Mutex::new(None),
+            mirror_owed: AtomicBool::new(false),
             read_to: Mutex::new(Place::default()),
             held: RwLock::new(Held::default()),
         }
@@ -379,57 +418,70 @@ impl<G: Generation> Objects<G> {
         laid
     }
 
-    /// Put `built` on offer through `write`, the write of its row at the
-    /// host's door, and return the write's answer.
+    /// Put `built` on offer through `write`, the write of their rows at the
+    /// host's door, and return the write's answer. The offer is the
+    /// registration's set: one object a row, for that one turn.
     ///
-    /// The row the write leaves under the object's URL is laid with
-    /// `built`, where `built` states the row's facts ([`facts`]): it
-    /// takes the place of the object that stands there, under its id and
-    /// with its running state. A write that moved no fact leaves no
-    /// change for a follow to read, so its row is laid here. An object
-    /// that stands for the row already is left as it is.
+    /// The row the write leaves under an object's URL is laid with that
+    /// object, where it states the row's facts ([`facts`]): it takes the
+    /// place of the object that stands there, under its id and with its
+    /// running state. A write that moved no fact of a row leaves no change
+    /// for a follow to read, so that row is laid here. An object that
+    /// stands for its row already is left as it is.
     ///
     /// The call follows `store` behind an answered write and holds the
-    /// follow's turn to its end, so the registry holds `built` when it
-    /// returns. The offer ends with the call, taken or not. One call runs
-    /// at a time. A host keeps its follows in the write's turn, as a door's
-    /// listener does: a follow on another thread may lay a row with the
-    /// offer of a write that is still open.
+    /// follow's turn to its end, so the registry holds the objects when it
+    /// returns. The offer ends whole with the call: an object whose row the
+    /// write refused or did not state is taken back, never left for a later
+    /// lay. One call runs at a time. A host keeps its follows in the
+    /// write's turn, as a door's listener does: a follow on another thread
+    /// may lay a row with the offer of a write that is still open.
     ///
     /// `over` is the object a guarded write replaces, the one its asker
-    /// read and built from. An object can change while its row's revision
-    /// stands: a write that moved no fact still laid another. So the call
-    /// refuses the write as moved, ahead of it, where another object
-    /// stands under the URL by then.
+    /// read and built from. A guarded write states one row. An object can
+    /// change while its row's revision stands: a write that moved no fact
+    /// still laid another. So the call refuses the write as moved, ahead of
+    /// it, where another object stands under that row's URL by then.
+    ///
+    /// A write that makes the row another life keeps the worker's id:
+    /// the read lays `built` in the place of the old life's object, by the
+    /// store's tail or by its snapshot. With no object on offer, it drops
+    /// that object and lays the new life's under another id.
     ///
     /// A holder built without [`Self::with_built_kept`] runs `write` alone.
     pub fn handing<S: WorkersStore + ?Sized>(
         &self,
         store: &S,
-        built: &Arc<dyn Worker>,
+        built: &[Arc<dyn Worker>],
         over: Option<&Arc<dyn Worker>>,
-        write: impl FnOnce() -> Result<Wrote, Refused>,
-    ) -> Result<Wrote, Refused> {
+        write: impl FnOnce() -> Result<Vec<Wrote>, Refused>,
+    ) -> Result<Vec<Wrote>, Refused> {
         if !self.built_kept {
             return write();
         }
         let _turn = self.handing.lock();
         if let Some(seen) = over {
-            let stands = self.registry.get_by_url(built.url());
+            let stands = match built {
+                [one] => self.registry.get_by_url(one.url()),
+                _ => None,
+            };
             if !stands.is_some_and(|stands| Arc::ptr_eq(&stands, seen)) {
                 return Err(Refused::Moved);
             }
         }
         let offer = Offer::put(&self.offered, built);
         let answer = write();
-        if let Ok(wrote) = answer {
+        if let Ok(wrote) = &answer {
             let mut place = self.read_to.lock();
             self.follow_from(store, &mut place);
-            if let Wrote::Unmoved(id) = wrote {
+            for wrote in wrote {
                 // Equal facts left no change to read. The row is laid
                 // here unless the read above laid it. A row that left
                 // behind the write is the next follow's.
-                let waits = self.offered.lock().is_some();
+                let Wrote::Unmoved(id) = *wrote else {
+                    continue;
+                };
+                let waits = !self.offered.lock().is_empty();
                 if let Some(row) = store.get(id).filter(|_| waits) {
                     self.lay_unmoved(store, &row);
                 }
@@ -439,8 +491,8 @@ impl<G: Generation> Objects<G> {
         answer
     }
 
-    /// Run `write`, one worker's write of a registration that keeps its
-    /// credential, in the hand-in's turn, and return its answer. `write`
+    /// Run `write`, the write of a registration that keeps its credential,
+    /// in the hand-in's turn, and return its answer. `write`
     /// is the whole of it: the keep, the door's write, the keeper's answer
     /// and the lay-again that answer asks for. One runs at a time, so a
     /// credential is settled and its object laid again before the next
@@ -469,11 +521,91 @@ impl<G: Generation> Objects<G> {
         Ok(write())
     }
 
+    /// [`Self::handing`] for the write of one row: a refresh's rebuilt
+    /// worker, or a registration of one. The answer is that row's.
+    pub fn handing_one<S: WorkersStore + ?Sized>(
+        &self,
+        store: &S,
+        built: &Arc<dyn Worker>,
+        over: Option<&Arc<dyn Worker>>,
+        write: impl FnOnce() -> Result<Wrote, Refused>,
+    ) -> Result<Wrote, Refused> {
+        let wrote = self.handing(store, std::slice::from_ref(built), over, || {
+            write().map(|wrote| vec![wrote])
+        })?;
+        wrote.first().copied().ok_or(Refused::Moved)
+    }
+
     /// How many lays found no object handed in, under
     /// [`Self::with_built_kept`]: rows a writer moved or made with no
     /// hand-in, and offers that did not state the row. Each one warned.
     pub fn unhanded(&self) -> u64 {
         self.unhanded.load(Relaxed)
+    }
+
+    /// Write the overload verdicts `store` publishes on the objects. An
+    /// object reads overloaded where any row of its worker is published
+    /// under a verdict, and clear where none is. The holder judges
+    /// nothing. The registry makes each write
+    /// ([`WorkerRegistry::set_worker_overloaded`]), so its counters and its
+    /// gauge move once an edge. An edge is said in the worker crate's one
+    /// line ([`log_overload_edge`]), under the source `policy store`.
+    ///
+    /// A host calls it behind each publication it makes. It walks the
+    /// objects only where the world's verdicts moved since the last walk
+    /// ([`World::overload_epoch`](crate::store::World::overload_epoch)), or
+    /// the registry took an object since. Return how many flags moved.
+    ///
+    /// Calls run one at a time, and each reads the world of its instant
+    /// inside that turn. A late caller so cannot write an older world's
+    /// verdicts over a newer one's, and a host needs no turn of its own
+    /// around the call. What the walk needs of the world is taken inside
+    /// its load, which is let go ahead of the registry's writes and the
+    /// edges' lines.
+    ///
+    /// The flag follows the world that shows a verdict by one call: a
+    /// world that a decision's own build published is mirrored at the
+    /// host's next.
+    ///
+    /// The line states the worker's published figures and the thresholds
+    /// its row names for itself. They need not explain the verdict. The
+    /// store judges an engine's ranks together, and under the pool's
+    /// thresholds where the row names none.
+    pub fn mirror_overload(&self, store: &MemoryStore) -> usize {
+        let mut mirrored = self.mirrored.lock();
+        // The objects whose flag is not their rows' verdict, each with the
+        // verdict and what its edge's line states.
+        let stale = store.with_world(|world| {
+            let owed = self.mirror_owed.swap(false, Acquire);
+            let epoch = world.overload_epoch();
+            if !owed && *mirrored == Some(epoch) {
+                return Vec::new();
+            }
+            *mirrored = Some(epoch);
+            let mut over: Vec<WorkerId> = world.overloaded().map(|row| row.id).collect();
+            over.sort_unstable();
+            let held = self.held.read();
+            let stale = held.rows.values().filter_map(|laid| {
+                let row = laid.standing.row;
+                let verdict = over.binary_search(&row).is_ok();
+                if laid.object.is_overloaded() == verdict {
+                    return None;
+                }
+                let own = held.facts.get(&row).map(|facts| facts.overload);
+                let load = world.first_row_of(row).and_then(|row| row.load);
+                let figures = reading(load, own.unwrap_or_default());
+                Some((Arc::clone(&laid.object), verdict, figures))
+            });
+            stale.collect::<Vec<_>>()
+        });
+        let mut edges = 0;
+        for (object, verdict, figures) in stale {
+            if self.registry.set_worker_overloaded(&object, verdict) {
+                edges += 1;
+                log_overload_edge(object.as_ref(), verdict, &figures, MIRRORED_FROM);
+            }
+        }
+        edges
     }
 
     /// The registry the objects stand in.
@@ -636,9 +768,13 @@ impl<G: Generation> Objects<G> {
             MembershipChange::StatusChanged { id, .. } => self.follow_status(store, id),
             // The old incarnation first: its object leaves the URL the new
             // one's is built under. It leaves whatever stands under its id
-            // now: an incarnation a key takes again is another life.
+            // now: an incarnation a key takes again is another life. An
+            // object on offer for the row under its URL now takes the old
+            // one's place instead, and the worker keeps its id.
             MembershipChange::Replaced { old, new } => {
-                self.end(old);
+                if !self.succeed(store, old, |url| store.by_key(url)) {
+                    self.end(old);
+                }
                 self.settle(store, old);
                 self.settle(store, new);
             }
@@ -660,6 +796,10 @@ impl<G: Generation> Objects<G> {
     /// revision held is trusted alone here: behind a gap of the tail, as in
     /// another history, a row under a held id and revision may be another
     /// life with other facts. The facts are compared beside it.
+    ///
+    /// A row that went leaves its object's place to the life that took its
+    /// URL, where a registration has that life's object on offer: the
+    /// worker keeps its id, as on the tail's read.
     fn reconcile<S: WorkersStore + ?Sized>(&self, store: &S, rows: &[WorkerRow]) {
         let stand: HashSet<WorkerId> = rows.iter().map(|row| row.id).collect();
         let gone: Vec<WorkerId> = self
@@ -671,7 +811,10 @@ impl<G: Generation> Objects<G> {
             .copied()
             .collect();
         for id in gone {
-            self.end(id);
+            let under = |url: &str| rows.iter().find(|row| row.facts.key == url).cloned();
+            if !self.succeed(store, id, under) {
+                self.end(id);
+            }
         }
         for row in rows {
             if self.stands(row) {
@@ -680,6 +823,21 @@ impl<G: Generation> Objects<G> {
                 self.lay(store, row);
             }
         }
+    }
+
+    /// The URL the object of the row `old` was laid under, where an object
+    /// is on offer under it.
+    fn offered_at(&self, old: WorkerId) -> Option<String> {
+        let offered = self.offered.lock();
+        let urls: Vec<String> = offered.iter().map(|built| built.url().to_owned()).collect();
+        drop(offered);
+        urls.into_iter().find(|url| self.stood_at(old, url))
+    }
+
+    /// Whether the object of the row `id` was laid under `url`.
+    fn stood_at(&self, id: WorkerId, url: &str) -> bool {
+        let held = self.held.read();
+        held.facts.get(&id).is_some_and(|facts| facts.key == url)
     }
 
     /// Whether `row`'s object was built from the row as it stands now: the
@@ -755,11 +913,7 @@ impl<G: Generation> Objects<G> {
         };
         // The registry first: the entry stands while its event is sent.
         self.registry.remove(&held);
-        let mut entries = self.held.write();
-        entries.objects.remove(&id);
-        entries.rows.remove(&held);
-        entries.unrank(id);
-        entries.facts.remove(&id);
+        self.held.write().leave(id);
     }
 
     /// Lay `row`'s object: the one on offer for it, else one built from
@@ -769,7 +923,7 @@ impl<G: Generation> Objects<G> {
     /// the row's revision and facts alone.
     fn lay<S: WorkersStore + ?Sized>(&self, store: &S, row: &WorkerRow) {
         if let Some(built) = self.take_offered(row) {
-            return self.lay_handed(store, row, built);
+            return self.lay_handed(store, row, built, None);
         }
         if self.kept(row.id).is_some() {
             self.missed(row, "the object that stands is kept");
@@ -780,22 +934,18 @@ impl<G: Generation> Objects<G> {
         if self.built_kept {
             self.missed(row, "its object is built from the row");
         }
-        self.put(store, row, self.build(row), false);
+        self.put(store, row, self.build(row), false, None);
     }
 
-    /// Take the object on offer where it is `row`'s: under the row's URL,
-    /// and stating the row's facts over the row's own ([`facts`]). The
-    /// facts a door states itself are the row's by that reading.
+    /// Take the object on offer that is `row`'s: under the row's URL, and
+    /// stating the row's facts over the row's own ([`facts`]). The facts a
+    /// door states itself are the row's by that reading.
     fn take_offered(&self, row: &WorkerRow) -> Option<Arc<dyn Worker>> {
         let mut offered = self.offered.lock();
-        let states = offered.as_ref().is_some_and(|built| {
+        let at = offered.iter().position(|built| {
             built.url() == row.facts.key && facts(built.as_ref(), Some(&row.facts)) == row.facts
-        });
-        if states {
-            offered.take()
-        } else {
-            None
-        }
+        })?;
+        Some(offered.swap_remove(at))
     }
 
     /// The object that stands for `row`, where a registration handed it in.
@@ -833,11 +983,14 @@ impl<G: Generation> Objects<G> {
     /// row's status ahead of the registry's write and again behind it: a
     /// replacement takes the standing object's running state, its status
     /// with it. A row's worker neither leads its row nor trails it.
+    /// `succeeds` is the life `row` took the place of: the object takes the
+    /// place of that life's object.
     fn lay_handed<S: WorkersStore + ?Sized>(
         &self,
         store: &S,
         row: &WorkerRow,
         built: Arc<dyn Worker>,
+        succeeds: Option<WorkerId>,
     ) {
         // A write's second attempt hands in the object that stands: a
         // replacement by itself would end its own background tasks.
@@ -853,7 +1006,33 @@ impl<G: Generation> Objects<G> {
         if built.status() != at {
             built.set_status(at);
         }
-        self.put(store, row, built, true);
+        self.put(store, row, built, true, succeeds);
+    }
+
+    /// Lay the life that stands under the URL of the row `old`, with the
+    /// object on offer for it, in the place of the old row's object: under
+    /// its id in the registry and with its running state. `standing`
+    /// answers the row under a URL as the read holds it, by the store or
+    /// by its snapshot. The old row leaves every table of the entry.
+    ///
+    /// Return whether an object was laid. With none on offer under the old
+    /// row's URL that states the row there, the read drops the old row's
+    /// object, and a new life is laid under a new id.
+    fn succeed<S: WorkersStore + ?Sized>(
+        &self,
+        store: &S,
+        old: WorkerId,
+        standing: impl FnOnce(&str) -> Option<WorkerRow>,
+    ) -> bool {
+        let Some(url) = self.offered_at(old) else {
+            return false;
+        };
+        let offered = standing(&url).and_then(|row| Some((self.take_offered(&row)?, row)));
+        let Some((built, row)) = offered else {
+            return false;
+        };
+        self.lay_handed(store, &row, built, Some(old));
+        true
     }
 
     /// Lay the row a write left unmoved with the object still on offer.
@@ -861,7 +1040,7 @@ impl<G: Generation> Objects<G> {
     /// stands states it.
     fn lay_unmoved<S: WorkersStore + ?Sized>(&self, store: &S, row: &WorkerRow) {
         match self.take_offered(row) {
-            Some(built) => self.lay_handed(store, row, built),
+            Some(built) => self.lay_handed(store, row, built, None),
             None => self.missed(row, "the object that stands is kept"),
         }
     }
@@ -897,25 +1076,34 @@ impl<G: Generation> Objects<G> {
     /// where the row's URL holds no object, else in the place of the one
     /// that stands there, under its id and with its running state. An
     /// object another row holds under the URL is dropped first: a row takes
-    /// the place of its own object alone.
+    /// the place of its own object, or of the object of `succeeds`, the
+    /// life it took the place of. Where the registry holds nothing under
+    /// the URL by then, the object is registered under a new id.
     fn put<S: WorkersStore + ?Sized>(
         &self,
         store: &S,
         row: &WorkerRow,
         object: Arc<dyn Worker>,
         handed: bool,
+        succeeds: Option<WorkerId>,
     ) {
         // The id first, then the entry, then the registry's write: its
         // event finds the entry.
         let mut id = self.registry.reserve_id_for_url(&row.facts.key);
         // A store restored inside a read can show a key's new incarnation
         // before any change says the old one left.
-        if let Some(other) = self.standing(&id).filter(|other| other.row != row.id) {
+        let others = |other: &Standing| other.row != row.id && Some(other.row) != succeeds;
+        if let Some(other) = self.standing(&id).filter(others) {
             self.end(other.row);
             id = self.registry.reserve_id_for_url(&row.facts.key);
         }
         {
             let mut entries = self.held.write();
+            // The old life leaves the entry in the turn the new one enters
+            // it: a reader finds the object under one of the two rows.
+            if let Some(old) = succeeds {
+                entries.leave(old);
+            }
             entries.objects.insert(row.id, id.clone());
             entries.state(row);
             entries.rows.insert(
@@ -931,11 +1119,36 @@ impl<G: Generation> Objects<G> {
             );
         }
         self.registry.register_or_replace(object);
+        // Behind the registry's write, and released to the mirror that
+        // takes it: a mirror that reads the mark finds the object in its
+        // place.
+        self.mirror_owed.store(true, Release);
         if handed {
             self.copy_status(store, row.id);
         } else {
             self.follow_status(store, row.id);
         }
+    }
+}
+
+/// Who judged a verdict the holder mirrors, as the edge's line says it.
+const MIRRORED_FROM: &str = "policy store";
+
+/// What the line of a mirrored edge states: the figures the worker's
+/// published row carries, zero where it has none, and the thresholds its
+/// row names for itself.
+fn reading(load: Option<LoadRow>, own: Overload) -> OverloadReading {
+    OverloadReading {
+        waiting_requests: load.map_or(0, |load| i64::from(load.queued)),
+        kv_pressure: load.map_or(0.0, |load| f64::from(load.active_kv_permille) / 1_000.0),
+        thresholds: OverloadThresholds {
+            waiting_requests: own
+                .waiting_requests
+                .map(|count| usize::try_from(count).unwrap_or(usize::MAX)),
+            token_usage: own
+                .kv_usage_permille
+                .map(|permille| f64::from(permille) / 1_000.0),
+        },
     }
 }
 
@@ -946,7 +1159,7 @@ mod tests {
         collections::BTreeMap,
         sync::{mpsc, Barrier},
         thread,
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use smg_worker::{
@@ -958,20 +1171,22 @@ mod tests {
         model_card::ModelCard,
         registry::event::WorkerEvent,
         runtime::StallReason,
-        worker::{HealthCheckConfig, WorkerStatus as ObjectStatus},
+        worker::{HealthCheckConfig, WorkerStatus as ObjectStatus, WorkerType},
     };
     use tokio::sync::broadcast::Receiver;
 
     use super::*;
     use crate::{
+        spec::{BindingSpec, Match, OverloadSpec},
         store::{
-            GatewayId, HealthSink, Kinds, Maker, MemoryStore, WorkerFacts, WorkerPatch,
-            WorkerStatus,
+            GatewayId, HealthSink, Kinds, LoadSink as _, LoadSource, Maker, MemoryStore,
+            WorkerFacts, WorkerPatch, WorkerStatus,
         },
         worker_host::{
-            facts as stated, object, Expect, HealthAdapter, KeptCredential, Membership, SoleLead,
-            StoreDoor,
+            facts as stated, object, Expect, HealthAdapter, KeptCredential, Membership, Over,
+            SoleLead, StoreDoor,
         },
+        AppliedSpec, PolicySpec,
     };
 
     const A: &str = "http://a:8000";
@@ -1047,6 +1262,17 @@ mod tests {
     }
 
     impl Replica {
+        /// One object handed in through `write`, the write of its one row.
+        fn handing(
+            &self,
+            built: &Arc<dyn Worker>,
+            over: Option<&Arc<dyn Worker>>,
+            write: impl FnOnce() -> Result<Wrote, Refused>,
+        ) -> Result<Wrote, Refused> {
+            let store = self.store.as_ref();
+            self.objects.handing_one(store, built, over, write)
+        }
+
         fn new() -> Self {
             let registry = Arc::new(WorkerRegistry::new());
             let events = registry.subscribe_events();
@@ -1156,11 +1382,9 @@ mod tests {
         built: &Arc<dyn Worker>,
         expect: Expect,
     ) -> Result<Wrote, Refused> {
-        replica
-            .objects
-            .handing(replica.store.as_ref(), built, None, || {
-                door.found_built(&Maker::Control, expect, built, None)
-            })
+        replica.handing(built, None, || {
+            door.found_built(&Maker::Control, expect, built, None)
+        })
     }
 
     /// One refresh of `rebuilt`, a worker rebuilt from `over`, handed to
@@ -1172,11 +1396,7 @@ mod tests {
         rebuilt: &Arc<dyn Worker>,
         over: &Arc<dyn Worker>,
     ) -> Result<Wrote, Refused> {
-        replica
-            .objects
-            .handing(replica.store.as_ref(), rebuilt, Some(over), || {
-                door.refreshed(seen, rebuilt, over)
-            })
+        replica.handing(rebuilt, Some(over), || door.refreshed(seen, rebuilt, over))
     }
 
     /// A refresh lays the object it rebuilt whatever its write moved: equal
@@ -1321,13 +1541,11 @@ mod tests {
     fn an_object_that_does_not_state_the_row_is_left_out() {
         let (replica, door) = handing();
         let stray = built(A, KEY_A);
-        let wrote = replica
-            .objects
-            .handing(replica.store.as_ref(), &stray, None, || {
-                door.found(&Maker::Control, Expect::Anything, A, &|standing| {
-                    labelled_over(stated(stray.as_ref(), standing))
-                })
-            });
+        let wrote = replica.handing(&stray, None, || {
+            door.found(&Maker::Control, Expect::Anything, A, &|standing| {
+                labelled_over(stated(stray.as_ref(), standing))
+            })
+        });
         assert!(matches!(wrote, Ok(Wrote::Registered(_))), "{wrote:?}");
         assert!(!Arc::ptr_eq(&replica.at(A), &stray));
         assert!(replica.holds_credential(A, None));
@@ -1335,15 +1553,55 @@ mod tests {
         assert_eq!(replica.objects.unhanded(), 1);
 
         let elsewhere = built(B, KEY_B);
-        let wrote = replica
-            .objects
-            .handing(replica.store.as_ref(), &elsewhere, None, || {
-                door.found_built(&Maker::Control, Expect::Anything, &built(C, KEY_C), None)
-            });
+        let wrote = replica.handing(&elsewhere, None, || {
+            door.found_built(&Maker::Control, Expect::Anything, &built(C, KEY_C), None)
+        });
         assert!(matches!(wrote, Ok(Wrote::Registered(_))), "{wrote:?}");
         assert!(replica.holds_credential(C, None));
         assert!(replica.objects.registry().get_by_url(B).is_none());
         assert_eq!(replica.objects.unhanded(), 2);
+    }
+
+    /// A registration's set on offer lays each row of the write with that
+    /// row's own object. An object on offer that no row of the write took
+    /// is taken back with the turn, not left for a later lay.
+    #[test]
+    fn a_set_on_offer_lays_each_row_with_its_own_object_and_ends_whole() {
+        let (replica, door) = handing();
+        let rank = |at: usize| -> Arc<dyn Worker> {
+            let worker = <BasicWorkerBuilder>::new(A).model(ModelCard::new("m"));
+            Arc::new(worker.dp_config(at, 2).api_key(KEY_A).build())
+        };
+        let ranks = [rank(0), rank(1)];
+        let stray = built(B, KEY_B);
+        let offered = [
+            Arc::clone(&ranks[1]),
+            Arc::clone(&stray),
+            Arc::clone(&ranks[0]),
+        ];
+        let store = replica.store.as_ref();
+        let wrote = replica.objects.handing(store, &offered, None, || {
+            door.found_rows(&Maker::Control, Expect::Nothing, &ranks, None)
+        });
+        assert!(
+            matches!(
+                wrote.as_deref(),
+                Ok([Wrote::Registered(_), Wrote::Registered(_)])
+            ),
+            "{wrote:?}"
+        );
+        for rank in &ranks {
+            assert!(Arc::ptr_eq(&replica.at(rank.url()), rank));
+        }
+        assert_eq!(replica.objects.unhanded(), 0);
+
+        // The stray object's offer ended with that turn: its row, written
+        // later with no hand-in, gets an object built from the row.
+        door.found_built(&Maker::Control, Expect::Nothing, &stray, None)
+            .expect("the stray worker's row");
+        replica.follow();
+        assert!(!Arc::ptr_eq(&replica.at(B), &stray));
+        assert_eq!(replica.objects.unhanded(), 1);
     }
 
     fn labelled_over(facts: WorkerFacts) -> WorkerFacts {
@@ -1408,9 +1666,13 @@ mod tests {
         replica.told();
 
         let guarded = |built: &Arc<dyn Worker>, over: &Arc<dyn Worker>| {
-            let store = replica.store.as_ref();
-            replica.objects.handing(store, built, Some(over), || {
-                door.found_built(&Maker::Control, Expect::Anything, built, Some(over))
+            replica.handing(built, Some(over), || {
+                door.found_built(
+                    &Maker::Control,
+                    Expect::Anything,
+                    built,
+                    Some(Over::Updated(over)),
+                )
             })
         };
         let stale = built(A, KEY_C);
@@ -1421,6 +1683,227 @@ mod tests {
         assert!(matches!(wrote, Ok(Wrote::Unmoved(_))), "{wrote:?}");
         assert!(Arc::ptr_eq(&replica.at(A), &fresh));
         assert_eq!(replica.told(), [("replaced", replica.id(A))]);
+    }
+
+    /// A registration whose write makes the row another life keeps the
+    /// worker's id: the built object takes the old life's place in the
+    /// registry, which tells a replacement and no removal. Nothing of the
+    /// old row is left in the holder, the one lay took the object handed
+    /// in, and the object reads its new row's status: Pending where the
+    /// row is probed, Ready where its checks are off. A guarded write and
+    /// an upsert are laid alike.
+    #[test]
+    fn a_registration_that_starts_another_life_keeps_its_workers_id() {
+        let (mut replica, door) = handing();
+        let first = built(A, KEY_A);
+        registered(&replica, &door, &first, Expect::Anything).expect("the first write");
+        let id = replica.id(A);
+        replica.told();
+
+        // Another model is another life. A guarded write names its object.
+        let old = replica.row(A);
+        let renamed = <BasicWorkerBuilder>::new(A).model(ModelCard::new("n"));
+        let second: Arc<dyn Worker> = Arc::new(renamed.api_key(KEY_B).build());
+        let seen = replica.objects.standing_of(&id, &first).expect("its row");
+        let wrote =
+            replica
+                .objects
+                .handing_one(replica.store.as_ref(), &second, Some(&first), || {
+                    door.found_built(
+                        &Maker::Control,
+                        Expect::Seen(seen),
+                        &second,
+                        Some(Over::Replaced(&first)),
+                    )
+                });
+        let new = replica.row(A);
+        let another = Wrote::Another {
+            old: old.id,
+            new: new.id,
+        };
+        assert_eq!(wrote, Ok(another));
+        assert!(replica.store.get(old.id).is_none());
+        assert_eq!(replica.id(A), id);
+        assert!(Arc::ptr_eq(&replica.at(A), &second));
+        assert!(entry_stands(&replica, A));
+        assert_eq!(replica.objects.object(old.id), None);
+        assert_eq!(replica.objects.len(), 1);
+        assert_eq!(new.status, WorkerStatus::Pending);
+        assert_eq!(second.status(), ObjectStatus::Pending);
+        assert_eq!(replica.told(), [("replaced", id.clone())]);
+
+        // Another role is another life, here by an upsert with checks off.
+        let old = new;
+        let unchecked = HealthCheckConfig {
+            disable_health_check: true,
+            ..HealthCheckConfig::default()
+        };
+        let prefill = <BasicWorkerBuilder>::new(A)
+            .model(ModelCard::new("n"))
+            .worker_type(WorkerType::Prefill)
+            .health_config(unchecked);
+        let third: Arc<dyn Worker> = Arc::new(prefill.build());
+        let wrote = registered(&replica, &door, &third, Expect::Anything);
+        let new = replica.row(A);
+        let another = Wrote::Another {
+            old: old.id,
+            new: new.id,
+        };
+        assert_eq!(wrote, Ok(another));
+        assert_eq!(replica.id(A), id);
+        assert!(Arc::ptr_eq(&replica.at(A), &third));
+        assert!(entry_stands(&replica, A));
+        assert_eq!(replica.objects.object(old.id), None);
+        assert_eq!(replica.objects.len(), 1);
+        assert_eq!(new.status, WorkerStatus::Ready);
+        assert_eq!(third.status(), ObjectStatus::Ready);
+        let told = replica.told();
+        assert!(told.contains(&("replaced", id.clone())), "{told:?}");
+        assert!(
+            told.iter()
+                .all(|(what, _)| *what != "removed" && *what != "registered"),
+            "{told:?}"
+        );
+        assert_eq!(replica.objects.unhanded(), 0);
+    }
+
+    /// The way out of that replacement: where the registry holds nothing
+    /// under the URL by then, the new life's object is registered anew and
+    /// the entry holds the id it got. Nothing of the old row is left.
+    #[test]
+    fn a_new_life_whose_old_object_left_the_registry_is_registered_anew() {
+        let (mut replica, door) = handing();
+        let first = built(A, KEY_A);
+        registered(&replica, &door, &first, Expect::Anything).expect("the first write");
+        let id = replica.id(A);
+        let old = replica.row(A);
+        replica.objects.registry().remove(&id);
+        replica.told();
+
+        let renamed = <BasicWorkerBuilder>::new(A).model(ModelCard::new("n"));
+        let second: Arc<dyn Worker> = Arc::new(renamed.build());
+        let wrote = registered(&replica, &door, &second, Expect::Anything);
+        assert!(matches!(wrote, Ok(Wrote::Another { .. })), "{wrote:?}");
+        let anew = replica.id(A);
+        assert_ne!(anew, id);
+        assert!(Arc::ptr_eq(&replica.at(A), &second));
+        assert!(entry_stands(&replica, A));
+        assert_eq!(replica.objects.standing(&id), None);
+        assert_eq!(replica.objects.object(old.id), None);
+        assert_eq!(replica.objects.len(), 1);
+        assert_eq!(replica.objects.unhanded(), 0);
+        assert_eq!(replica.told(), [("registered", anew)]);
+    }
+
+    /// The same replacement where the URL took two lives inside one read:
+    /// the row under the URL at the read takes the old object's place, and
+    /// the life between the two is laid nowhere.
+    #[test]
+    fn a_new_life_keeps_its_workers_id_through_two_lives_in_one_read() {
+        let (mut replica, door) = handing();
+        let first = built(A, KEY_A);
+        registered(&replica, &door, &first, Expect::Anything).expect("the first write");
+        let id = replica.id(A);
+        let old = replica.row(A);
+        replica.told();
+
+        // A life between, written with no read behind it.
+        let between = WorkerFacts {
+            models: vec!["x".to_string()],
+            incarnation: old.facts.incarnation + 1_000,
+            ..old.facts.clone()
+        };
+        let between = replica.store.upsert(between).id();
+        assert_ne!(between, old.id);
+
+        let renamed = <BasicWorkerBuilder>::new(A).model(ModelCard::new("n"));
+        let second: Arc<dyn Worker> = Arc::new(renamed.api_key(KEY_B).build());
+        let wrote =
+            replica
+                .objects
+                .handing_one(replica.store.as_ref(), &second, Some(&first), || {
+                    door.found_built(
+                        &Maker::Control,
+                        Expect::Anything,
+                        &second,
+                        Some(Over::Replaced(&first)),
+                    )
+                });
+        let new = replica.row(A);
+        let another = Wrote::Another {
+            old: between,
+            new: new.id,
+        };
+        assert_eq!(wrote, Ok(another));
+        assert_eq!(replica.id(A), id);
+        assert!(Arc::ptr_eq(&replica.at(A), &second));
+        assert!(entry_stands(&replica, A));
+        assert_eq!(replica.objects.object(old.id), None);
+        assert_eq!(replica.objects.object(between), None);
+        assert_eq!(replica.objects.len(), 1);
+        assert_eq!(replica.objects.unhanded(), 0);
+        assert_eq!(replica.told(), [("replaced", id.clone())]);
+    }
+
+    /// The same replacement through a read that takes the store's
+    /// snapshot. The tail no longer reaches, the row that went leaves its
+    /// object's place to the life on offer under its URL, and the worker
+    /// keeps its id. A row beside it keeps its object.
+    #[test]
+    fn a_new_life_keeps_its_workers_id_through_a_snapshot_read() {
+        let (mut replica, door) = handing();
+        let first = built(A, KEY_A);
+        registered(&replica, &door, &first, Expect::Anything).expect("the first write");
+        let beside = built(B, KEY_B);
+        registered(&replica, &door, &beside, Expect::Anything).expect("the second write");
+        let (id, other) = (replica.id(A), replica.id(B));
+        let old = replica.row(A);
+        let read_to = replica.store.epoch();
+        replica.told();
+
+        // More status writes than the tail keeps, and no read between.
+        let flipped = replica.row(B);
+        for turn in 0..1_100 {
+            let status = [WorkerStatus::Ready, WorkerStatus::NotReady][turn % 2];
+            assert!(replica
+                .store
+                .set_status(flipped.id, status, flipped.revision)
+                .is_some());
+        }
+        assert_eq!(
+            replica.store.changes_since(read_to),
+            MembershipTail::SnapshotRequired
+        );
+
+        let renamed = <BasicWorkerBuilder>::new(A).model(ModelCard::new("n"));
+        let second: Arc<dyn Worker> = Arc::new(renamed.api_key(KEY_C).build());
+        let wrote =
+            replica
+                .objects
+                .handing_one(replica.store.as_ref(), &second, Some(&first), || {
+                    door.found_built(
+                        &Maker::Control,
+                        Expect::Anything,
+                        &second,
+                        Some(Over::Replaced(&first)),
+                    )
+                });
+        assert!(matches!(wrote, Ok(Wrote::Another { .. })), "{wrote:?}");
+        assert_eq!(replica.id(A), id);
+        assert!(Arc::ptr_eq(&replica.at(A), &second));
+        assert!(entry_stands(&replica, A));
+        assert_eq!(replica.objects.object(old.id), None);
+        assert_eq!(replica.id(B), other);
+        assert!(Arc::ptr_eq(&replica.at(B), &beside));
+        assert_eq!(replica.objects.len(), 2);
+        assert_eq!(replica.objects.unhanded(), 0);
+        let told = replica.told();
+        assert!(told.contains(&("replaced", id.clone())), "{told:?}");
+        assert!(
+            told.iter()
+                .all(|(what, _)| *what != "removed" && *what != "registered"),
+            "{told:?}"
+        );
     }
 
     /// A replacement takes the standing object's status, so a handed
@@ -1462,11 +1945,10 @@ mod tests {
         let (replica, door) = handing();
         let (first, second) = (built(A, KEY_A), built(B, KEY_B));
         let (entered, seen) = mpsc::channel();
-        let store = replica.store.as_ref();
         thread::scope(|scope| {
-            let wrote = replica.objects.handing(store, &first, None, || {
+            let wrote = replica.handing(&first, None, || {
                 scope.spawn(|| {
-                    replica.objects.handing(store, &second, None, || {
+                    replica.handing(&second, None, || {
                         entered.send(()).expect("the case listens");
                         door.found_built(&Maker::Control, Expect::Anything, &second, None)
                     })
@@ -1484,9 +1966,11 @@ mod tests {
 
     /// A handed object starts at its row's status, as one built from the
     /// row does: here a row that stood Ready before the holder's first read.
+    /// The registry is handed the object at that status, so it tells one
+    /// registration and no status change behind it.
     #[test]
     fn a_handed_object_starts_at_its_rows_status() {
-        let (replica, door) = handing();
+        let (mut replica, door) = handing();
         let first = built(A, KEY_A);
         door.found_built(&Maker::Control, Expect::Anything, &first, None)
             .expect("a write the holder has not read");
@@ -1502,6 +1986,9 @@ mod tests {
         assert!(matches!(wrote, Ok(Wrote::Unmoved(_))), "{wrote:?}");
         assert!(Arc::ptr_eq(&replica.at(A), &second));
         assert_eq!(second.status(), ObjectStatus::Ready);
+        let registry = replica.objects.registry();
+        let id = registry.get_id_by_url(A).expect("the object's id");
+        assert_eq!(replica.told(), [("registered", id)]);
         assert_eq!(replica.objects.unhanded(), 0);
     }
 
@@ -2809,6 +3296,51 @@ mod tests {
         WATCHED.set(None);
     }
 
+    /// A rank's row whose next life keeps its object leaves its engine's
+    /// ranks with the rest of its entry: the rank is answered by its new
+    /// row alone.
+    #[test]
+    fn a_new_life_that_keeps_its_object_takes_its_rows_rank() {
+        let (replica, door) = handing();
+        let ranked = |rank: usize, model: &str| -> Arc<dyn Worker> {
+            let worker = <BasicWorkerBuilder>::new(A).model(ModelCard::new(model));
+            Arc::new(worker.dp_config(rank, 2).build())
+        };
+        // A worker's ranks are one registration: each write states both.
+        let written = |built: &[Arc<dyn Worker>], expect: Expect| {
+            let store = replica.store.as_ref();
+            replica.objects.handing(store, built, None, || {
+                door.found_rows(&Maker::Control, expect, built, None)
+            })
+        };
+        let (lower, first) = (ranked(0, "m"), ranked(1, "m"));
+        let wrote = written(&[Arc::clone(&lower), Arc::clone(&first)], Expect::Nothing);
+        assert!(
+            matches!(
+                wrote.as_deref(),
+                Ok([Wrote::Registered(_), Wrote::Registered(_)])
+            ),
+            "{wrote:?}"
+        );
+        let engine = replica.row(lower.url()).id;
+        let old = replica.row(first.url()).id;
+        assert_eq!(replica.objects.rank_row(engine, 1), Some(old));
+
+        let second = ranked(1, "n");
+        let wrote = written(&[Arc::clone(&lower), Arc::clone(&second)], Expect::Anything);
+        assert!(
+            matches!(
+                wrote.as_deref(),
+                Ok([Wrote::Unmoved(_), Wrote::Another { .. }])
+            ),
+            "{wrote:?}"
+        );
+        let new = replica.row(second.url()).id;
+        assert_ne!(new, old);
+        assert!(Arc::ptr_eq(&replica.at(second.url()), &second));
+        assert_eq!(replica.objects.rank_row(engine, 1), Some(new));
+    }
+
     /// An engine's ranks are answered by their rows, asked of its rank 0
     /// row. A rank no row holds is answered by none, a row above rank 0 is
     /// answered none, and a row that is its own engine has its one rank.
@@ -2904,5 +3436,201 @@ mod tests {
         replica.follow();
         assert!(Arc::ptr_eq(&replica.at(B), &kept));
         assert_eq!(replica.objects.rank_row(lower, 1), Some(row.id));
+    }
+
+    // ---------------------------------------------- the overload mirror
+
+    /// A replica whose store shows each load write at once.
+    fn judging() -> Replica {
+        let mut replica = Replica::new();
+        replica.store = Arc::new(MemoryStore::with_publish_window(Duration::ZERO));
+        replica
+    }
+
+    /// [`facts`] of a worker that names a queue of two for itself.
+    fn bounded(key: &str) -> WorkerFacts {
+        WorkerFacts {
+            overload: Overload {
+                waiting_requests: Some(2),
+                kv_usage_permille: None,
+            },
+            ..facts(key, 1)
+        }
+    }
+
+    /// A generation that hands the pools of `model` a queue of two, and
+    /// every other pool no threshold.
+    fn bound(model: &str) -> AppliedSpec {
+        let mut document = PolicySpec::preset("round_robin").expect("a preset of this build");
+        document.generation = 1;
+        let profiles = &document.profiles;
+        let profile = profiles.keys().next().expect("the preset's profile");
+        let binding = |model: &str, overload| BindingSpec {
+            matcher: Match {
+                model: model.to_string(),
+                ..Match::default()
+            },
+            profile: Some(profile.clone()),
+            overload: Some(overload),
+            ..BindingSpec::default()
+        };
+        let two = OverloadSpec {
+            waiting_requests: Some(2),
+            ..OverloadSpec::default()
+        };
+        let off = OverloadSpec {
+            enabled: false,
+            ..OverloadSpec::default()
+        };
+        document.bindings = vec![binding(model, two), binding("*", off)];
+        AppliedSpec::validate(&document).expect("the document validates")
+    }
+
+    impl Replica {
+        /// A registered row with its object, and its build paid.
+        fn stand(&self, facts: WorkerFacts) -> WorkerId {
+            let row = self.register(facts, None);
+            self.follow();
+            self.store.publish_now();
+            row
+        }
+
+        /// A pushed record of `row`'s rank zero with `queued` requests
+        /// waiting.
+        fn push(&self, row: WorkerId, queued: u32) {
+            let load = LoadRow {
+                queued,
+                ..LoadRow::default()
+            };
+            self.store
+                .record(row, 0, load, Instant::now(), LoadSource::Stream);
+        }
+
+        fn mirror(&self) -> usize {
+            self.objects.mirror_overload(self.store.as_ref())
+        }
+
+        /// How many workers of the model the registry counts overloaded.
+        fn counted(&self) -> usize {
+            self.objects.registry().overloaded_worker_count("m")
+        }
+    }
+
+    #[test]
+    fn a_published_overload_verdict_is_written_on_the_object_once_an_edge() {
+        let replica = judging();
+        let row = replica.stand(bounded(A));
+        let worker = replica.at(A);
+        // Over the row's own count. The store judges and shows the verdict,
+        // and no flag moves until the host mirrors.
+        replica.push(row, 3);
+        assert!(!worker.is_overloaded());
+        assert_eq!(replica.mirror(), 1);
+        assert!(worker.is_overloaded());
+        assert_eq!(replica.counted(), 1);
+        // The verdict stands: nothing moves, and the count is moved once.
+        replica.push(row, 4);
+        assert_eq!(replica.mirror(), 0);
+        assert_eq!(replica.counted(), 1);
+        // The queue drains, and the next mirror clears the flag.
+        replica.push(row, 1);
+        assert_eq!(replica.mirror(), 1);
+        assert!(!worker.is_overloaded());
+        assert_eq!(replica.counted(), 0);
+    }
+
+    #[test]
+    fn a_world_of_the_same_verdicts_is_not_walked_again() {
+        let replica = judging();
+        let row = replica.stand(bounded(A));
+        let worker = replica.at(A);
+        replica.push(row, 3);
+        assert_eq!(replica.mirror(), 1);
+        // A flag moved behind the mirror shows whether a call walked.
+        let registry = replica.objects.registry();
+        assert!(registry.set_worker_overloaded(&worker, false));
+        // Another publication of the same verdicts is not walked.
+        replica.push(row, 4);
+        assert_eq!(replica.mirror(), 0);
+        assert!(!worker.is_overloaded());
+        // The verdict moves and moves back, and the walk writes the flag.
+        replica.push(row, 1);
+        assert_eq!(replica.mirror(), 0);
+        replica.push(row, 3);
+        assert_eq!(replica.mirror(), 1);
+        assert!(worker.is_overloaded());
+    }
+
+    #[test]
+    fn an_object_put_in_the_registry_owes_a_mirror_whatever_the_epoch() {
+        let replica = judging();
+        let row = replica.stand(bounded(A));
+        replica.push(row, 3);
+        assert_eq!(replica.mirror(), 1);
+        let first = replica.at(A);
+        // The row's labels move, and the holder replaces its object. The
+        // registry releases the verdict the first object carried. The
+        // build the write owes is not paid, so the world stands.
+        replica.patch(A, labels("gold"));
+        replica.follow();
+        let second = replica.at(A);
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert!(!second.is_overloaded());
+        assert_eq!(replica.counted(), 0);
+        // The mirror walks for the object, though no verdict moved.
+        assert_eq!(replica.mirror(), 1);
+        assert!(second.is_overloaded());
+        assert_eq!(replica.counted(), 1);
+    }
+
+    #[test]
+    fn a_worker_of_two_pools_reads_overloaded_where_one_of_its_rows_is() {
+        let replica = judging();
+        replica.store.apply(bound("m")).expect("applied");
+        let row = replica.stand(WorkerFacts {
+            models: vec!["m".to_string(), "n".to_string()],
+            ..facts(A, 1)
+        });
+        replica.push(row, 3);
+        let over = replica.store.with_world(|world| world.overloaded().count());
+        assert_eq!(over, 1, "one of the worker's two rows is under a verdict");
+        assert_eq!(replica.mirror(), 1);
+        assert!(replica.at(A).is_overloaded());
+    }
+
+    #[test]
+    fn a_mirrored_edge_is_said_in_the_worker_crates_line_under_the_stores_name() {
+        use tracing::{subscriber, Level};
+
+        let log = tempfile::NamedTempFile::new().expect("a file for this case");
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(Level::INFO)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(log.reopen().expect("the log writer"))
+            .finish();
+        let replica = judging();
+        let row = replica.stand(bounded(A));
+        let _kept = subscriber::set_default(subscriber);
+        replica.push(row, 3);
+        assert_eq!(replica.mirror(), 1);
+        replica.push(row, 1);
+        assert_eq!(replica.mirror(), 1);
+        let log = std::fs::read_to_string(log.path()).expect("the log text");
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 2, "{log}");
+        for (line, verdict, queued) in [(lines[0], "set", 3), (lines[1], "cleared", 1)] {
+            assert!(line.contains("smg_worker::load::monitor"), "{line}");
+            assert!(
+                line.contains(&format!("Worker overload veto {verdict}")),
+                "{line}"
+            );
+            assert!(
+                line.contains(&format!("waiting_requests={queued} ")),
+                "{line}"
+            );
+            assert!(line.contains("waiting_threshold=Some(2)"), "{line}");
+            assert!(line.contains(r#"source="policy store""#), "{line}");
+        }
     }
 }
