@@ -211,7 +211,10 @@ What the block shows:
   its check is due. A `Pending` worker becomes `Ready` after enough probes
   pass in a row, two by default. A `Ready` worker becomes `NotReady` after
   enough fail in a row, three by default. Keep the returned `WorkerManager`:
-  dropping it stops the checks.
+  dropping it stops the checks. A host that keeps a worker's status elsewhere
+  hands its sink to `WorkerManager::start_with_sink`, or to
+  `WorkerManager::maybe_start_with_sink`, which starts the loop only where
+  `WorkerManager::maybe_start` would.
 - **`None` leaves the `WorkerJobs` port empty.** The manager then asks nobody
   to remove a failed worker or to read a worker's labels again.
   `UnhealthyRemovalScope::Disabled` says the same of removal: a failed worker
@@ -297,9 +300,9 @@ A port is a trait this crate calls and a host implements.
 | `EngineConnection` | `connection::engine` | The calls the runtime makes on a connected engine: liveness, the health and load reads, the labels the engine reports of its model and of itself, the admin calls and the two pushed streams. | Its client of an engine. |
 | `ConnectorDefault` | `connection::engine` | The connector a builder uses when it is handed none. | The same connector. |
 | `WorkerJobs` | `jobs` | How to remove workers at an address, how to read a worker's labels again, how to register a worker, and whether a job of an address is in flight. | Its job queue. |
-| `LoadSink` | `load::port` | What a pushed record or a poll's answer means for routing: the receipts and the poll decision, the overload verdict, what its readers cache. | Nothing to write for the crate's own sink: `WorkerMonitor::new` builds it over the registry and the routing side. A host with a load store of its own writes this trait and hands it to `WorkerMonitor::with_sink`. |
+| `LoadSink` | `load::port` | What a pushed record or a poll's answer means for routing: the receipts and the poll decision, the overload verdict, what its readers cache. | Under the classic policies nothing to write: `WorkerMonitor::new` builds the crate's own sink over the registry and the routing side. Under the policy controller, the sink of the gateway's feed: the controller crate's load adapter, which writes the store's rows, and a loop of the feed that publishes what waits for the store's window. A host with a load store of its own writes this trait and hands it to `WorkerMonitor::with_sink`. |
 | `LoadConsumer` | `load::monitor` | Whether a reader wants loads, and how to trim what readers booked on a worker. | Its policy registry. |
-| `HealthSink` | `health::port` | What a probe's outcome or a connect signal does to a worker's status. | Nothing to write: the crate's registry is the sink, and `WorkerManager::start` hands it. |
+| `HealthSink` | `health::port` | What a probe's outcome or a connect signal does to a worker's status. | Under the classic policies nothing to write: the crate's registry is the sink, and `WorkerManager::start` hands it. Under the policy controller, the sink of the gateway's feed: the store keeps the health of a worker that has a row, and the registry keeps the rest. |
 | `RequestCompletionSink` | `identity::basic` | What to do when a request on a worker ends. | The sink its policy registry installs. |
 | `KvEventSink` | `kv_events::port` | What to do with the KV cache events a worker's stream brings: keep each rank's cursor, apply what it admits, and drop a worker's blocks when it leaves. | The sink over its KV indexes. |
 | `KvEventHost` | `kv_events` | What a worker's events subscription feeds: the sink its task opens, and what goes when a model's last events subscription is gone. | Its index side: the models' KV indexes. |

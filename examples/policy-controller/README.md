@@ -174,7 +174,7 @@ smg-policy-controller = { git = "https://github.com/smg-project/smg", features =
 ```
 
 - `controller`: the listeners, the command line and `controller::run`.
-- `worker-host`: the cache-event feed. With it a controller reads cache events from each gRPC worker whose row asks for them. The stock image is built with it. Without it a cache-aware document places by warm-up and load.
+- `worker-host`: the cache-event feed. With it a controller reads cache events from each gRPC worker whose row asks for them and names a model. The stock image is built with it. Without it a cache-aware document places by warm-up and load.
 - `kubernetes`: the Lease election the Helm chart's replicas use.
 - `client`: the reference client of the protocol. The example's tests ask
   the started controller its decisions through it.
