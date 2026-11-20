@@ -585,7 +585,7 @@ const fn role_slot(role: Role) -> usize {
 }
 
 /// The phase a role's pool decides: what a binding is matched on.
-const fn phase_of(role: Role) -> Phase {
+pub(crate) const fn phase_of(role: Role) -> Phase {
     match role {
         Role::Single => Phase::Single,
         Role::Prefill => Phase::Prefill,
