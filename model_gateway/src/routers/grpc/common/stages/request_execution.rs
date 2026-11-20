@@ -564,8 +564,11 @@ fn require_prefill_guard(guard: Option<PrefillLoadGuard>) -> Result<PrefillLoadG
 /// request's samples take too.
 /// `encode` is the watch on an EPD request's encode dispatch (see
 /// [`launch_encode_dispatch`]), `None` for every other request.
-/// `placement` is the placement of a pair the policy controller placed:
-/// each side says its dispatch on it at its own send ([`Placement::sent`]).
+/// `placement` is the placement of a pair the policy controller placed. A
+/// parallel dispatch says each side on it at its own send
+/// ([`Placement::sent`]). A sequential one commits both sides at the
+/// prefill's send and ends the prefill's side at its last drain
+/// ([`Placement::committed`], [`Placement::prefill_ended`]).
 #[expect(clippy::too_many_arguments)]
 async fn execute_pd_dispatch(
     proto_request: ProtoGenerateRequest,

@@ -1098,7 +1098,7 @@ pub(crate) struct DispatchMetadata {
 /// Dropping the last hold reports any end still owed.
 #[derive(Clone)]
 pub(crate) struct Placement {
-    cell: Arc<Mutex<Held>>,
+    cell: Arc<Mutex<Hold>>,
     sent: Instant,
     /// The ends said, kept for the cases: a closed lease leaves the store,
     /// so no case can read its end there.
@@ -1106,10 +1106,34 @@ pub(crate) struct Placement {
     ends: Arc<Mutex<Vec<End>>>,
 }
 
+/// What the holds of one placement share: the lease with the worker's load,
+/// and the prefill phases of a pair's dispatch that have yet to end.
+struct Hold {
+    held: Held,
+    /// The prefill phases still running, one a sub-request of the dispatch.
+    /// The prefill's side ends with the last of them.
+    prefills: usize,
+    /// The prompt tokens the ended phases read, said with the side's end.
+    prompt_tokens: u32,
+}
+
+impl Hold {
+    fn placed(&mut self) -> &mut Placed {
+        self.held.placed()
+    }
+}
+
 impl Placement {
-    fn new(held: Held, sent: Instant) -> Self {
+    /// A hold on `held` for a dispatch sent at `sent` as `prefills`
+    /// sub-requests.
+    fn new(held: Held, sent: Instant, prefills: usize) -> Self {
+        let hold = Hold {
+            held,
+            prefills,
+            prompt_tokens: 0,
+        };
         Self {
-            cell: Arc::new(Mutex::new(held)),
+            cell: Arc::new(Mutex::new(hold)),
             sent,
             #[cfg(test)]
             ends: Arc::default(),
@@ -1150,21 +1174,27 @@ impl Placement {
         placed.decode_dispatched(now);
     }
 
-    /// A placed pair's prefill phase ended whole at `now`, having read
-    /// `tokens_in` of the prompt: the prefill's side ends where its
-    /// admission guard is dropped, and the controller reads its worker free
-    /// while the decode runs. The decode's side stands to the response's
-    /// end. A single has no phase that ends here.
+    /// One prefill phase of a placed pair ended whole at `now`, having read
+    /// `tokens_in` of the prompt. A dispatch runs one phase a sub-request,
+    /// all on the one prefill worker, and the prefill's side ends with the
+    /// last of them: there its admission slot is freed, and the controller
+    /// reads its worker free while the decode runs. The decode's side stands
+    /// to the response's end. A single has no phase that ends here.
     pub(crate) fn prefill_ended(&self, tokens_in: u32, now: Instant) {
+        let mut held = self.cell.lock();
+        held.prompt_tokens = held.prompt_tokens.saturating_add(tokens_in);
+        held.prefills = held.prefills.saturating_sub(1);
+        if held.prefills > 0 {
+            return;
+        }
         let end = End {
             status: 200,
             class: TransportClass::Ok,
             ttft_micros: 0,
-            tokens_in,
+            tokens_in: held.prompt_tokens,
             tokens_out: 0,
             duration_micros: self.micros_to(now),
         };
-        let mut held = self.cell.lock();
         let placed = held.placed();
         if placed.decode().is_some() {
             placed.completed(end, now);
@@ -1352,6 +1382,7 @@ impl LoadGuards {
                     WorkerLoadGuard::with_key(Arc::clone(worker), routing_key)
                 }),
                 sent,
+                count.max(1),
             ),
         };
         if count <= 1 {
@@ -1367,9 +1398,10 @@ impl LoadGuards {
 
     /// The guards of a dispatch at its send, at `now`. A placement of the
     /// controller rides them. A single is told the send here. A pair's
-    /// sides go out apart, so each is told at its own send
-    /// ([`Placement::sent`]). With no placement they are the classic guards
-    /// of [`Self::scaled`].
+    /// sides go out apart, so its dispatch tells them: each at its own send
+    /// ([`Placement::sent`]), or both at the prefill's where the decode
+    /// follows the prefill ([`Placement::committed`]). With no placement
+    /// they are the classic guards of [`Self::scaled`].
     pub fn at_dispatch(
         selection: &WorkerSelection,
         routing_key: Option<&str>,
@@ -2573,6 +2605,25 @@ mod tests {
         let placement = guards.placement().expect("the dispatch's placement");
         placement.prefill_ended(17, sent);
         assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 1);
+    }
+
+    #[tokio::test]
+    async fn a_batched_pairs_prefill_ends_with_its_last_phase() {
+        // Three prompts of one completion run three prefill phases on the
+        // pair's one prefill worker, under one lease.
+        let (placed, _admission, store) = place_pair().await;
+        let lease = testing::lease_of(&placed);
+        let selection = pair_selection(&placed);
+        let sent = Instant::now();
+        let guards = LoadGuards::at_dispatch(&selection, None, 3, Some(placed), sent);
+        let placement = guards.placement().expect("the pair's placement");
+        placement.committed(sent);
+        // The first two to drain leave the worker busy with the third.
+        placement.prefill_ended(5, sent);
+        placement.prefill_ended(7, sent);
+        assert_eq!(live_sides(&store, lease), (true, true));
+        placement.prefill_ended(11, sent);
+        assert_eq!(live_sides(&store, lease), (false, true));
     }
 
     #[tokio::test]

@@ -2964,6 +2964,7 @@ async fn a_pair_gateway_serves_a_pair_under_the_policy_controller() {
     let pipeline = RequestPipeline::build(Endpoint::Completion, Mode::PrefillDecode, &deps)
         .expect("completion pipeline");
     let components = components(registry).await;
+    let started = Instant::now();
 
     let response = pipeline
         .execute_completion(
@@ -2983,6 +2984,14 @@ async fn a_pair_gateway_serves_a_pair_under_the_policy_controller() {
         format!("grpc://127.0.0.1:{decode_port}")
     );
     drop(response);
+    // Each side ended whole on its own worker, and no lease is left.
+    for url in [prefill.url(), decode.url()] {
+        let row = store.by_key(url).expect("the side's row").id;
+        assert!(
+            store.completed_ok_since(GatewayId::LOCAL, row, started),
+            "{url}"
+        );
+    }
     assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
 }
 
