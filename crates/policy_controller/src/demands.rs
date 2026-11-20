@@ -118,11 +118,22 @@ pub struct DemandFacts {
     pub host_pipeline: bool,
 }
 
+/// The stage a pool is shed under when none of its rows processes media by
+/// reference ([`Unmet::References`]).
+pub(crate) const REFERENCES: &str = "references";
+
+/// The stage a pool is shed under when its rows that process media by
+/// reference all run the other pipeline than the request names
+/// ([`Unmet::Pipeline`]).
+pub(crate) const PIPELINE: &str = "pipeline";
+
 /// The demand a worker fails first. The order is the order a host answers
 /// for them: a pool is cut to its request's runtime, then to the workers
 /// that take images, then to those that process media by reference, then
-/// to the pipeline the request names.
+/// to the pipeline the request names. Further demands add their cases: a
+/// host's match keeps an arm for the rest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
 pub enum Unmet {
     /// Another runtime than the request stays on, or none stated.
     Runtime,
@@ -145,8 +156,8 @@ impl Unmet {
         match self {
             Self::Runtime => crate::door::WIRES,
             Self::Vision => crate::framework::VISION,
-            Self::References => "references",
-            Self::Pipeline => "pipeline",
+            Self::References => REFERENCES,
+            Self::Pipeline => PIPELINE,
         }
     }
 }

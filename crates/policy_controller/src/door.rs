@@ -1752,18 +1752,8 @@ pub(crate) fn hand<A: Asked, R>(
         signal_cells: cells,
     };
     if candidates.is_empty() && pool.pool_size > 0 {
-        // The request's own narrowing left none of a pool that has rows:
-        // answered under the stage that took the last of them, its hint
-        // of 0, the last demand its rows failed first, or its gateway's
-        // wires.
-        let stage = if request.subset() == Some(0) {
-            SUBSET_HINT
-        } else {
-            unmet.map_or(WIRES, Unmet::stage)
-        };
-        let answer = request.read(lists, viewed, unnamed, |facts, constraints| {
-            decide.emptied(facts, &pool, constraints, scratch, stage)
-        });
+        // The request's own narrowing left none of a pool that has rows.
+        let answer = emptied(request, lists, viewed, decide, &pool, scratch, unmet);
         return (answer, built);
     }
     // The store's sessions, where the decision's rule has an in-flight
@@ -1840,6 +1830,33 @@ pub(crate) fn hand<A: Asked, R>(
         }
     });
     (answer, built)
+}
+
+/// The answer for a pool that has rows of which the request's own narrowing
+/// left none, in the decider's form for it ([`Decides::emptied`]), under
+/// the stage that took the last of them: the request's hint of 0, the last
+/// demand its rows failed first, or its gateway's wires. A routine of its
+/// own, out of line: a pool that keeps a row pays one test for this answer
+/// and none of its code.
+#[cold]
+#[inline(never)]
+fn emptied<A: Asked, R>(
+    request: &A,
+    lists: &mut A::Lists,
+    viewed: Viewed<'_>,
+    decide: impl Decides<R>,
+    pool: &PoolFacts<'_>,
+    scratch: &mut Scratch,
+    unmet: Option<Unmet>,
+) -> R {
+    let stage = if request.subset() == Some(0) {
+        SUBSET_HINT
+    } else {
+        unmet.map_or(WIRES, Unmet::stage)
+    };
+    request.read(lists, viewed, unnamed, |facts, constraints| {
+        decide.emptied(facts, pool, constraints, scratch, stage)
+    })
 }
 
 /// The role whose pool decides a request of `phase`: the pool [`hand`]
