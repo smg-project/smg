@@ -97,7 +97,7 @@ mod tests {
     #[test]
     fn the_host_lists_the_objects_of_the_rows_that_stand() {
         let (workers, id) = follow_a_row();
-        let host = Host::new(Arc::clone(workers.registry()), None);
+        let host = Host::new(Arc::clone(workers.objects().registry()), None);
         let actual: Vec<_> = host
             .workers()
             .into_iter()
@@ -109,7 +109,7 @@ mod tests {
     #[test]
     fn a_laid_object_has_its_origin_and_an_unknown_id_has_none() {
         let (workers, id) = follow_a_row();
-        let host = Host::new(Arc::clone(workers.registry()), None);
+        let host = Host::new(Arc::clone(workers.objects().registry()), None);
         assert_eq!(
             host.origin_of(&id.expect("followed row")),
             Some(WorkerOrigin::Local)
