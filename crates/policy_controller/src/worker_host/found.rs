@@ -33,6 +33,7 @@ pub fn facts(worker: &dyn Worker, standing: Option<&WorkerFacts>) -> WorkerFacts
     let metadata = worker.metadata();
     let spec = &metadata.spec;
     let checks = &metadata.health_config;
+    let models: Vec<String> = worker.models().into_iter().map(|card| card.id).collect();
     WorkerFacts {
         key: spec.url.clone(),
         engine: engine_of(worker).to_owned(),
@@ -48,7 +49,10 @@ pub fn facts(worker: &dyn Worker, standing: Option<&WorkerFacts>) -> WorkerFacts
         } else {
             String::new()
         },
-        models: worker.models().into_iter().map(|card| card.id).collect(),
+        // A window is a model's: each follows its model's name into the
+        // order the object lists its models in.
+        windows: carried_windows(standing, &models),
+        models,
         // Values wider than a row's fields take the largest value they hold.
         dp_rank: u16::try_from(spec.dp_rank.unwrap_or(0)).unwrap_or(u16::MAX),
         dp_size: u16::try_from(spec.dp_size.unwrap_or(1)).unwrap_or(u16::MAX),
@@ -92,6 +96,20 @@ pub fn facts(worker: &dyn Worker, standing: Option<&WorkerFacts>) -> WorkerFacts
             .then(|| u32::try_from(checks.drain_settle_secs).unwrap_or(u32::MAX)),
         demand_facts: standing.demand_facts,
     }
+}
+
+/// The windows the standing row states, for the models the object serves
+/// now: none where the row states none, and `0` for a model the row gives
+/// no window.
+fn carried_windows(standing: &WorkerFacts, models: &[String]) -> Vec<u32> {
+    if standing.windows.is_empty() {
+        return Vec::new();
+    }
+    let of = |model: &String| {
+        let listed = standing.models.iter().position(|served| served == model);
+        listed.and_then(|at| standing.windows.get(at)).copied()
+    };
+    models.iter().map(|model| of(model).unwrap_or(0)).collect()
 }
 
 /// The thresholds a worker's own registration states.
@@ -306,6 +324,33 @@ mod tests {
             waiting_requests: Some(7),
         };
         assert_eq!(found.overload, stated);
+    }
+
+    /// A window is a model's: the standing row's windows follow their
+    /// models' names into the order the object lists its models in now. A
+    /// model the row gave no window states none, and a row that lists no
+    /// window hands none on.
+    #[test]
+    fn the_standing_windows_follow_their_models_names() {
+        let spec = WorkerSpec {
+            models: vec![ModelCard::new("first")].into(),
+            ..WorkerSpec::new(URL.to_owned())
+        };
+        let worker = <BasicWorkerBuilder>::from_spec(spec).build();
+        worker.set_models(["third", "second", "first"].map(ModelCard::new).into());
+        let standing = WorkerFacts {
+            models: vec!["first".to_owned(), "second".to_owned()],
+            windows: vec![8, 32],
+            ..WorkerFacts::default()
+        };
+        let found = facts(&worker, Some(&standing));
+        assert_eq!(found.models, ["third", "second", "first"]);
+        assert_eq!(found.windows, [0, 32, 8]);
+        let unstated = WorkerFacts {
+            windows: Vec::new(),
+            ..standing
+        };
+        assert!(facts(&worker, Some(&unstated)).windows.is_empty());
     }
 
     /// A threshold of the object's own under half a permille is held as

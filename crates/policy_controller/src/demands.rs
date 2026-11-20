@@ -16,13 +16,19 @@
 //! candidate row carries none of them. The crate compares what the two
 //! sides state and derives nothing: it names no label and no runtime.
 //!
-//! A request that demands nothing reads no column and pays one test.
+//! A request that demands nothing reads no column and pays one test. So
+//! does one that demands a context window alone, where its pool's floor
+//! holds it ([`Demands::settled_by`]): every row meets it, and the rows
+//! are read as they stand.
 //!
 //! A request's context window is two bounds: what its input takes, and
 //! what its completion may ([`Demands::input_window`],
 //! [`Demands::output_window`]). Each is held against a worker's window
 //! alone ([`DemandFacts::window`]), and the two are not added. A worker
-//! that states no window holds a request of any size.
+//! that states no window holds a request of any size. A window is a
+//! model's: a registration states one a model where they differ
+//! ([`WorkerFacts::windows`](crate::store::WorkerFacts::windows)), and a
+//! pool's column holds its model's.
 //!
 //! A pool the demands leave nobody is shed with no endpoint, under the
 //! stage of one demand ([`Unmet::stage`]). A row is judged by the demand it
@@ -141,6 +147,29 @@ impl Demands {
         }
     }
 
+    /// Whether every worker of a pool meets these demands, told by the
+    /// pool's floor alone: the narrowest context window a row of it
+    /// states, `0` where none states one
+    /// ([`World::floor`](crate::store::World::floor)). A request
+    /// that demands a window and no more is settled where the floor holds
+    /// both bounds: each row's window is as wide, or is not stated. One
+    /// that demands nothing is settled by every floor. Any other demand is
+    /// settled by none: its door judges the rows one by one
+    /// ([`Self::unmet_by`]).
+    #[must_use]
+    pub const fn settled_by(self, floor: u32) -> bool {
+        // A demand beside the window is settled by no floor. It is read
+        // by the one test of none, so a demand that is added later is
+        // read here with it.
+        let beside = Self {
+            input_window: 0,
+            output_window: 0,
+            ..self
+        };
+        beside.is_none()
+            && (floor == 0 || (self.input_window <= floor && self.output_window <= floor))
+    }
+
     /// Whether a worker meets every demand ([`Self::unmet_by`]).
     #[must_use]
     pub const fn met_by(self, vision: bool, facts: DemandFacts) -> bool {
@@ -170,7 +199,10 @@ pub struct DemandFacts {
     pub host_pipeline: bool,
     /// The worker's context window in tokens, where its registering host
     /// holds a request to it. `0` states none, and the worker takes a
-    /// request of any size.
+    /// request of any size. In a registration it is the window of each
+    /// model that states none of its own
+    /// ([`WorkerFacts::windows`](crate::store::WorkerFacts::windows)). In
+    /// a pool's column it is the worker's window for the pool's model.
     pub window: u32,
 }
 
@@ -399,6 +431,62 @@ mod tests {
             ..Demands::default()
         };
         assert!(budget.held_by(Role::Prefill).is_none());
+    }
+
+    /// A pool's floor settles a request that demands a window alone: the
+    /// narrowest stated window holds both bounds, or no row states one.
+    /// What it settles, every row at or above the floor meets, and every
+    /// row that states none. What it does not, the narrowest row fails. It
+    /// settles no demand for a runtime or for media, whatever the floor.
+    #[test]
+    fn a_floor_settles_a_window_alone_and_no_demand_beside_it() {
+        let sized = |input_window, output_window| Demands {
+            input_window,
+            output_window,
+            ..Demands::default()
+        };
+        let stating = |window| DemandFacts {
+            window,
+            ..DemandFacts::default()
+        };
+        for floor in [0, 4, 8, u32::MAX] {
+            assert!(Demands::default().settled_by(floor), "{floor}");
+        }
+        // No row states a window: each holds a request of any size.
+        assert!(sized(u32::MAX, u32::MAX).settled_by(0));
+        for floor in [4_u32, 8] {
+            for (input, output) in [(1, 1), (floor, floor), (floor + 1, 1), (1, floor + 1)] {
+                let asked = sized(input, output);
+                let held = input <= floor && output <= floor;
+                assert_eq!(asked.settled_by(floor), held, "{asked:?} under {floor}");
+                let narrowest = asked.met_by(false, stating(floor));
+                assert_eq!(narrowest, held, "{asked:?} under {floor}");
+                for window in [0, floor + 1, u32::MAX] {
+                    let met = asked.met_by(false, stating(window));
+                    assert!(met || !held, "{asked:?} by {window}");
+                }
+            }
+        }
+        let window = sized(4, 4);
+        for beside in [
+            Demands {
+                runtime: 7,
+                ..window
+            },
+            Demands {
+                vision: true,
+                ..window
+            },
+            Demands {
+                references: References::Any,
+                ..window
+            },
+        ] {
+            assert!(!beside.settled_by(8) && !beside.settled_by(0), "{beside:?}");
+        }
+        // The floor is asked of what the role's rows are held to.
+        assert!(sized(4, 64).held_by(Role::Prefill).settled_by(8));
+        assert!(!sized(4, 64).held_by(Role::Single).settled_by(8));
     }
 
     /// The demands stand in the order a host answers for them, and each has

@@ -32,7 +32,7 @@
 //! | `health` | the health checks: the two thresholds, the interval and the timeout in whole seconds, the checks off where the policy's probes are |
 //! | `drain_settle_secs` | the checks' drain window, where the row states one; else the object's default |
 //! | `signals`, `reachable_from` | not carried: the object has no field for them, and a collector reads them of the row by the id the holder keeps. A host that is no gateway has the object of a row one gateway alone reaches built with its checks off ([`Objects::with_host_local_unchecked`]) |
-//! | `zone`, `pairing`, `encode`, `vision`, `max_running`, `priority`, `demand_facts` | not carried: a decision's facts, read of the store's rows and never of an object |
+//! | `zone`, `pairing`, `encode`, `vision`, `max_running`, `priority`, `demand_facts`, `windows` | not carried: a decision's facts, read of the store's rows and never of an object |
 //! | `overload` | not carried to the object: a decision's fact, read of the store's rows. [`facts()`] states the thresholds of the object's own registration over the standing row's. A replacement by id states them whole: one it leaves out is cleared ([`Over::Replaced`]) |
 //!
 //! A new object starts at its row's status. A replacement takes the

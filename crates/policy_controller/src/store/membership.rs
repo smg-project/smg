@@ -5,6 +5,7 @@
 use std::{collections::hash_map::RandomState, fmt, hash::BuildHasher};
 
 use super::workers::{Maker, WorkerFacts, WorkerRow, WorkerStatus};
+use crate::demands::DemandFacts;
 
 /// A write of a row by a caller that did not make it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,6 +83,12 @@ pub enum Laid {
     Another,
 }
 
+/// `facts` less its context window: what a registration states for a
+/// request's hard demands that starts another life where it changes.
+const fn windowless(facts: DemandFacts) -> DemandFacts {
+    DemandFacts { window: 0, ..facts }
+}
+
 impl WorkerFacts {
     /// How these facts change a standing registration under the same key.
     ///
@@ -92,11 +99,17 @@ impl WorkerFacts {
     ///
     /// Another life starts where the facts change which requests the worker
     /// can take at all: its role, its wires, its models, whether it takes
-    /// images, or what it states beside that for a request's hard demands.
-    /// The store pays a publication at the write of another life, so a
-    /// decision that starts once the write is answered reads none of the old
-    /// life's facts. A decision that loaded its publication before the write
-    /// still decides over the old life.
+    /// images, or what it states beside that for a request's hard demands,
+    /// its context windows apart. The store pays a publication at the write
+    /// of another life, so a decision that starts once the write is answered
+    /// reads none of the old life's facts. A decision that loaded its
+    /// publication before the write still decides over the old life.
+    ///
+    /// A context window is laid in place, the registration's one and a
+    /// model's own ([`Self::windows`]): a model's card may change under a
+    /// worker that keeps running. Its pools' columns and floors follow at
+    /// the store's next build, as a join's rows do, so a decision made in
+    /// between may read the window that stood.
     ///
     /// A life its vision or its demand facts alone start is handed the
     /// standing life's status: the store hands a status on where role,
@@ -107,7 +120,7 @@ impl WorkerFacts {
         } else if self.role != standing.role
             || self.wire_modes != standing.wire_modes
             || self.vision != standing.vision
-            || self.demand_facts != standing.demand_facts
+            || windowless(self.demand_facts) != windowless(standing.demand_facts)
             || !self.same_models(standing)
         {
             Laid::Another
@@ -412,6 +425,84 @@ mod tests {
             );
         }
         assert_eq!(stating(7).laid_over(&stating(7)), Laid::Unmoved);
+    }
+
+    /// A context window is laid in place, a model's own and the
+    /// registration's one: a model's card may change under a worker that
+    /// keeps running. The runtime beside it starts another life still.
+    #[test]
+    fn a_changed_window_is_laid_in_place() {
+        let standing = WorkerFacts {
+            models: vec!["one".to_owned(), "two".to_owned()],
+            windows: vec![8, 32],
+            demand_facts: DemandFacts {
+                runtime: 7,
+                window: 16,
+                ..DemandFacts::default()
+            },
+            ..WorkerFacts::default()
+        };
+        let stating = |window| WorkerFacts {
+            demand_facts: DemandFacts {
+                window,
+                ..standing.demand_facts
+            },
+            ..standing.clone()
+        };
+        for (which, fresh) in [
+            (
+                "a model's own",
+                WorkerFacts {
+                    windows: vec![8, 16],
+                    ..standing.clone()
+                },
+            ),
+            (
+                "none a model",
+                WorkerFacts {
+                    windows: Vec::new(),
+                    ..standing.clone()
+                },
+            ),
+            ("the registration's", stating(64)),
+            ("the registration's none", stating(0)),
+        ] {
+            assert_eq!(fresh.laid_over(&standing), Laid::InPlace, "{which}");
+        }
+        let other_runtime = WorkerFacts {
+            demand_facts: DemandFacts {
+                runtime: 9,
+                ..standing.demand_facts
+            },
+            ..standing.clone()
+        };
+        assert_eq!(other_runtime.laid_over(&standing), Laid::Another);
+    }
+
+    /// A window is a model's: a worker states its facts for a model with
+    /// that model's own window, and with the registration's one for a
+    /// model the list gives none, by a `0` or by ending ahead of it. A
+    /// registration that lists no window is read as it stands.
+    #[test]
+    fn a_models_own_window_stands_for_it_and_the_registrations_for_the_rest() {
+        let facts = WorkerFacts {
+            models: ["one", "two", "three", "four"].map(str::to_owned).into(),
+            windows: vec![8, 0, 32],
+            demand_facts: DemandFacts {
+                runtime: 7,
+                window: 16,
+                ..DemandFacts::default()
+            },
+            ..WorkerFacts::default()
+        };
+        let windows = ["one", "two", "three", "four"].map(|model| facts.stated_for(model).window);
+        assert_eq!(windows, [8, 16, 32, 16]);
+        assert_eq!(facts.stated_for("one").runtime, 7);
+        let plain = WorkerFacts {
+            windows: Vec::new(),
+            ..facts
+        };
+        assert_eq!(plain.stated_for("three"), plain.demand_facts);
     }
 
     /// Whether a worker takes images says which requests it can take at

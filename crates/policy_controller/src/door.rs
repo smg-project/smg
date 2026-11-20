@@ -1530,6 +1530,38 @@ where
     }
 }
 
+/// The read of a pool whose rows the store's one door handed
+/// ([`World::view`]): the pool's facts, the rows as the view holds them,
+/// the asking gateway's mask with the rows of it a hold stands on, and
+/// what the view read beside the rows.
+#[inline(always)]
+fn lent<'a>(
+    world: &'a World,
+    read: crate::store::PoolView<'a>,
+    ask: &Ask,
+    holds: &'a mut Vec<u32>,
+) -> Read<'a> {
+    (
+        read.pool_facts(),
+        read.built.now_micros,
+        read.candidates,
+        (read.stalled, world.held(&read, ask, holds)),
+        read.affinity,
+        read.signal_cells,
+        read.in_flight,
+        Some(read.built),
+    )
+}
+
+/// Whether the floor of the pool `built` was read of settles `demands`
+/// ([`Demands::settled_by`](crate::demands::Demands::settled_by)): every
+/// row of that pool meets them, and the door judges none.
+#[inline]
+fn settled(world: &World, built: &Built, demands: Demands) -> bool {
+    let floor = world.floor(built);
+    floor.is_some_and(|floor| demands.settled_by(floor))
+}
+
 /// What [`hand`] reads of a pool for one request: the pool's facts, the
 /// decision's instant in the rows' clock, the rows, the mask of the asking
 /// gateway's vetoes beside lent rows with the rows of it a hold stands on,
@@ -1554,8 +1586,11 @@ type Read<'a> = (
 /// of 0 and no hard demand reads its pool by the store's one door
 /// ([`World::view`]): the rows where their publication left them, with its
 /// gateway's standing vetoes and the leases' counts beside them, or rows
-/// the door writes where the request's profile shows them to a plugin. One
-/// that states wires, a hint of 0 or a demand is handed rows written for
+/// the door writes where the request's profile shows them to a plugin. So
+/// does one whose demand its pool's floor settles
+/// ([`Demands::settled_by`](crate::demands::Demands::settled_by)): a
+/// context window alone that the pool's narrowest row holds. One that
+/// states wires, a hint of 0 or any other demand is handed rows written for
 /// it ([`World::build`]), what the leases on file book on each row's
 /// worker written over them ([`World::count_in_flight`]), less what the
 /// gateway states of itself and what the request's demands take
@@ -1661,37 +1696,46 @@ pub(crate) fn hand<A: Asked, R>(
     // Nothing of the request's own is cut out of the rows the door hands:
     // the publication's own, the leases' counts beside them, or a copy the
     // door writes with the counts on it for a plugin, which is shown a
-    // row's bits and ages as the row's own fields. A request that states a
-    // hard demand is handed written rows, as one that states wires is.
-    let by_door = wires.is_none() && request.subset() != Some(0) && request.demands().is_none();
+    // row's bits and ages as the row's own fields. A request that states
+    // wires or a hint of 0 is handed written rows. So is one that states a
+    // hard demand, unless its pool's floor settles the demand: every row
+    // meets it then, and the pass that judges rows would take none.
+    let lendable = wires.is_none() && request.subset() != Some(0);
+    // A request that demands nothing asks no floor: its one test is made
+    // here, ahead of the read, and it reads its pool by the store's one
+    // door at once.
+    let by_door = lendable && request.demands().is_none();
     // The last demand the rows a demand took failed first, where one took
     // a row of the build: the rows left are named within themselves then.
     let mut unmet: Option<crate::demands::Unmet> = None;
-    let (pool, now_micros, candidates, masks, affinity, cells, counts, built): Read<'_> = if by_door
-    {
-        match world.view(model, role, &ask, shown, view) {
-            Some(read) => (
-                read.pool_facts(),
-                read.built.now_micros,
-                read.candidates,
-                (read.stalled, world.held(&read, &ask, holds)),
-                read.affinity,
-                read.signal_cells,
-                read.in_flight,
-                Some(read.built),
-            ),
-            None => (
-                none(),
-                world.micros(now),
-                &[],
-                (&[], &[]),
-                &[],
-                None,
-                None,
-                None,
-            ),
+    let (pool, now_micros, candidates, masks, affinity, cells, counts, built): Read<'_> = 'read: {
+        if by_door {
+            break 'read match world.view(model, role, &ask, shown, view) {
+                Some(read) => lent(world, read, &ask, holds),
+                None => (
+                    none(),
+                    world.micros(now),
+                    &[],
+                    (&[], &[]),
+                    &[],
+                    None,
+                    None,
+                    None,
+                ),
+            };
         }
-    } else {
+        // A demand alone keeps the request off that door. Where the pool's
+        // floor settles what the role's rows are held to, each row meets
+        // it, and the rows are lent all the same. Any other demand is
+        // judged row by row over the rows written below, and so is a pool
+        // no member serves answered there.
+        if lendable {
+            if let Some(read) = world.view(model, role, &ask, shown, view) {
+                if settled(world, &read.built, request.demands().held_by(role)) {
+                    break 'read lent(world, read, &ask, holds);
+                }
+            }
+        }
         let built = world.build(model, role, &ask, view);
         let (pool, now_micros) = match built {
             Some(built) => {
@@ -6355,6 +6399,182 @@ pub(crate) mod tests {
         assert_eq!(decide(b"long", Phase::Prefill, (16, 64)), too_small);
         assert_eq!(decide(b"budget", Phase::Single, (4, 64)), too_small);
         assert_eq!(decide(b"held", Phase::Single, (4, 8)), Ok(single));
+    }
+
+    /// The `random` picker, keeping how each decision's rows were handed
+    /// it: whether the leases' counts stood beside them, as they stand
+    /// beside rows the door lent, and the workers the rows name.
+    #[derive(Debug)]
+    struct Lent(Arc<Mutex<Vec<HandedRows>>>);
+
+    /// How one decision's rows were handed its picker: whether the
+    /// leases' counts stood beside them, and the workers the rows name.
+    type HandedRows = (bool, Vec<WorkerId>);
+
+    impl Lifecycle for Lent {}
+
+    impl Picker for Lent {
+        fn name(&self) -> &'static str {
+            "lent"
+        }
+
+        fn pick(
+            &self,
+            facts: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            scores: &[f32],
+            band: TieBand,
+            out: &mut Targets,
+        ) {
+            let rows = candidates.iter().map(|row| row.id).collect();
+            self.0.lock().push((facts.lent_in_flight.is_some(), rows));
+            Random.pick(facts, candidates, kept, scores, band, out);
+        }
+    }
+
+    /// Applies the `random` preset to `store` with [`Lent`] as its pick.
+    /// Returns the reader of what the last decision handed the picker.
+    fn lending(store: &MemoryStore) -> impl Fn() -> HandedRows {
+        let handed = Arc::new(Mutex::new(Vec::new()));
+        let kept = Arc::clone(&handed);
+        let mut catalog = Catalog::builtin();
+        let added = catalog.picker("lent", move || Box::new(Lent(Arc::clone(&kept))));
+        added.expect("a free name");
+        let mut document = PolicySpec::preset("random").expect("a preset of this build");
+        document.generation = 1;
+        for profile in document.profiles.values_mut() {
+            profile.pick = "lent".into();
+        }
+        let digest = document.digest().expect("the document digests");
+        let spec = AppliedSpec::validate_digested(&document, digest, &catalog, &[]);
+        let applied = store.apply(spec.expect("the catalog holds the stage"));
+        applied.expect("above the unbound start");
+        move || {
+            let handed = handed.lock();
+            handed
+                .last()
+                .cloned()
+                .expect("a decision reached the picker")
+        }
+    }
+
+    /// A request that states a context window reads its pool as one that
+    /// states nothing does, where the pool's floor holds it: the
+    /// publication's own rows, lent, every one a candidate. One past the
+    /// floor is handed written rows, less the row that does not hold it.
+    /// So is one that demands more than a window, whatever the floor. A
+    /// lone prefill's rows are held to the input alone: a budget past their
+    /// floor is no demand of theirs, and they are lent.
+    #[test]
+    fn a_window_the_pools_floor_holds_reads_lent_rows_and_one_past_it_written_rows() {
+        let store = MemoryStore::new();
+        let stating = |window| {
+            let stated = DemandFacts {
+                window,
+                ..DemandFacts::default()
+            };
+            (true, stated)
+        };
+        let narrow = states_facts(&store, "s0", Role::Single, stating(8));
+        let wide = states_facts(&store, "s1", Role::Single, stating(32));
+        let unstated = states_facts(&store, "s2", Role::Single, stating(0));
+        let prefill = states_facts(&store, "p0", Role::Prefill, stating(8));
+        store.publish_now();
+        let handed = lending(&store);
+        let store = Arc::new(store);
+        let door = Door::new(Arc::clone(&store));
+        let decide = |id: &[u8], phase: Phase, demands: Demands| {
+            let mut asked = request(id, 7);
+            asked.facts.phase = phase;
+            asked.constraints.demands = demands;
+            let decided = door.decide(GATEWAY, &asked, Instant::now());
+            let placed = decided.expect("a decision").decision.pick().is_some();
+            assert!(placed, "{demands:?}");
+            handed()
+        };
+        let single = |id: &[u8], demands: Demands| decide(id, Phase::Single, demands);
+        let sized = |input_window, output_window| Demands {
+            input_window,
+            output_window,
+            ..Demands::default()
+        };
+        let sorted = |mut rows: Vec<WorkerId>| {
+            rows.sort_unstable();
+            rows
+        };
+        let (all, held) = (
+            sorted(vec![narrow, wide, unstated]),
+            sorted(vec![wide, unstated]),
+        );
+        assert_eq!(single(b"plain", Demands::default()), (true, all.clone()));
+        assert_eq!(single(b"at the floor", sized(8, 8)), (true, all.clone()));
+        assert_eq!(single(b"input past it", sized(9, 1)), (false, held.clone()));
+        assert_eq!(single(b"budget past it", sized(1, 9)), (false, held));
+        let seeing = Demands {
+            vision: true,
+            ..sized(8, 8)
+        };
+        assert_eq!(single(b"vision beside it", seeing), (false, all));
+        let budget = decide(b"a prefill's budget", Phase::Prefill, sized(8, 64));
+        assert_eq!(budget, (true, vec![prefill]));
+    }
+
+    /// A window is a model's. A worker of three models holds a request of
+    /// each to the window it states for that model, and to the
+    /// registration's one for the model it lists none for.
+    #[test]
+    fn a_request_is_held_to_the_window_its_worker_states_for_its_model() {
+        const MODELS: [&str; 3] = [MODEL, "model-b", "model-c"];
+        let store = MemoryStore::new();
+        let key = "http://w0:8000".to_owned();
+        let facts = WorkerFacts {
+            key: key.clone(),
+            engine: key,
+            incarnation: 1,
+            role: Role::Single,
+            models: MODELS.map(str::to_owned).into(),
+            windows: vec![8, 32],
+            dp_size: 1,
+            max_running: Some(4_096),
+            demand_facts: DemandFacts {
+                window: 16,
+                ..DemandFacts::default()
+            },
+            ..WorkerFacts::default()
+        };
+        let worker = store.upsert(facts).id();
+        let row = WorkersStore::get(&store, worker).expect("the row");
+        let ready = store.set_status(worker, WorkerStatus::Ready, row.revision);
+        ready.expect("the row stands");
+        store.publish_now();
+        let applied = store.apply(preset("random", 1));
+        applied.expect("above the unbound start");
+        let store = Arc::new(store);
+        let door = Door::new(Arc::clone(&store));
+        let decide = |id: String, model: &'static str, input_window: u32| {
+            let mut asked = request(id.as_bytes(), 7);
+            asked.facts.model = model;
+            asked.constraints.demands = Demands {
+                input_window,
+                ..Demands::default()
+            };
+            let decided = door.decide(GATEWAY, &asked, Instant::now());
+            match decided.expect("a decision").decision {
+                Decision::Shed(shed) => Err((shed.reason, shed.emptied_by)),
+                decision => {
+                    let first = decision.pick().and_then(|pick| pick.targets.first());
+                    Ok(first.expect("a target").id)
+                }
+            }
+        };
+        let too_small = Err((ShedReason::NoEndpoints, "context-window"));
+        for (model, window) in MODELS.into_iter().zip([8, 32, 16]) {
+            let held = decide(format!("{model} held"), model, window);
+            assert_eq!(held, Ok(worker), "{model}");
+            let past = decide(format!("{model} past"), model, window + 1);
+            assert_eq!(past, too_small, "{model}");
+        }
     }
 
     /// The store narrows a pair's sides by its gateway's wires and keeps no

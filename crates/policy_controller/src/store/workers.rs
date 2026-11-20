@@ -127,6 +127,14 @@ pub struct WorkerFacts {
     pub engine_kind: String,
     /// The model ids the worker serves, aliases resolved.
     pub models: Vec<String>,
+    /// The context window of each model in tokens, in the order of
+    /// [`Self::models`], where the worker's models state windows of their
+    /// own. A model the list gives no number, by a `0` or by ending ahead
+    /// of it, takes the registration's one window
+    /// ([`DemandFacts::window`]). A pool is one model's, and its column
+    /// holds that model's window. A window that changes is laid in place
+    /// ([`Self::laid_over`]).
+    pub windows: Vec<u32>,
     pub dp_rank: u16,
     pub dp_size: u16,
     /// The labels of record: the registration's, over those discovered from
@@ -173,7 +181,8 @@ pub struct WorkerFacts {
     /// What the worker states for a request's hard demands beside its
     /// vision ([`DemandFacts`]), in its registering host's own numbers. A
     /// host that states none registers a worker that meets no demand that
-    /// reads them.
+    /// reads them. Its window is the one of each model that states none of
+    /// its own ([`Self::windows`]).
     pub demand_facts: DemandFacts,
 }
 
@@ -201,6 +210,26 @@ impl WorkerFacts {
             ids
         }
         self.models == other.models || named(&self.models) == named(&other.models)
+    }
+
+    /// What the worker states for the hard demands of a request for
+    /// `model`: its demand facts, with that model's window
+    /// ([`Self::windows`]). The column of a model's pool holds this for
+    /// each of its rows.
+    pub(crate) fn stated_for(&self, model: &str) -> DemandFacts {
+        // A registration that states no window a model is read as it
+        // stands: no model is looked up.
+        if self.windows.is_empty() {
+            return self.demand_facts;
+        }
+        let listed = self.models.iter().position(|served| served == model);
+        let own = listed.and_then(|at| self.windows.get(at)).copied();
+        DemandFacts {
+            window: own
+                .filter(|&window| window != 0)
+                .unwrap_or(self.demand_facts.window),
+            ..self.demand_facts
+        }
     }
 }
 

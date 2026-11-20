@@ -496,6 +496,81 @@ fn the_demand_facts_stand_beside_the_rows_written_for_the_asking_gateway() {
     assert_eq!(stated_to(3), sorted(vec![(open, 7), (last, 0)]));
 }
 
+/// A pool's column holds each row's window for the pool's model, and the
+/// pool's floor is the narrowest window a row of it states, `0` where none
+/// states one, on both forms of its view. A window laid in place moves
+/// them at the store's next build, under the same id, and a leave moves
+/// them with its rows.
+#[test]
+fn a_pools_floor_is_the_narrowest_window_its_rows_state_for_its_model() {
+    use crate::{demands::DemandFacts, store::MembershipChange};
+
+    const OTHER: &str = "other";
+    let store = MemoryStore::new();
+    let now = Instant::now();
+    let both = WorkerFacts {
+        windows: vec![8, 32],
+        ..facts("http://a:8000", Role::Single, &[MODEL, OTHER])
+    };
+    let a = admit(&store, both.clone());
+    let b = admit(
+        &store,
+        WorkerFacts {
+            demand_facts: DemandFacts {
+                window: 16,
+                ..DemandFacts::default()
+            },
+            ..facts("http://b:8000", Role::Single, &[MODEL])
+        },
+    );
+    let c = admit(&store, facts("http://c:8000", Role::Single, &[OTHER]));
+    // The pool's floor, lent and written, and each row's window.
+    let read = |model: &str| {
+        let ask = ask(now);
+        let (mut out, mut stated) = (ViewBuffers::default(), Vec::new());
+        let mut floors = [0; 2];
+        store.with_world(|world| {
+            for (floor, written) in floors.iter_mut().zip([false, true]) {
+                let view = world.view(model, Role::Single, &ask, written, &mut out);
+                let built = view.expect("the pool").built;
+                *floor = world.floor(&built).expect("the pool's floor");
+            }
+            let built = world.build(model, Role::Single, &ask, &mut out);
+            world.demand_facts(&built.expect("the pool"), &ask, &mut stated);
+        });
+        assert_eq!(floors[0], floors[1], "{model}");
+        let rows = out.candidates.iter().zip(&stated);
+        let mut windows: Vec<_> = rows.map(|(row, facts)| (row.id, facts.window)).collect();
+        windows.sort_unstable();
+        (floors[0], windows)
+    };
+    let sorted = |mut rows: Vec<(WorkerId, u32)>| {
+        rows.sort_unstable();
+        rows
+    };
+    assert_eq!(read(MODEL), (8, sorted(vec![(a, 8), (b, 16)])));
+    // A row that states no window bounds no floor.
+    assert_eq!(read(OTHER), (32, sorted(vec![(a, 32), (c, 0)])));
+
+    let narrower = WorkerFacts {
+        windows: vec![8, 4],
+        ..both
+    };
+    assert_eq!(
+        store.upsert(narrower),
+        MembershipChange::Relabelled { id: a }
+    );
+    store.publish_now();
+    assert_eq!(read(MODEL), (8, sorted(vec![(a, 8), (b, 16)])));
+    assert_eq!(read(OTHER), (4, sorted(vec![(a, 4), (c, 0)])));
+
+    let revision = WorkersStore::get(&store, a).expect("the row").revision;
+    store.remove(a, revision).expect("the row leaves");
+    store.publish_now();
+    assert_eq!(read(MODEL), (16, vec![(b, 16)]));
+    assert_eq!(read(OTHER), (0, vec![(c, 0)]));
+}
+
 #[test]
 fn a_build_names_the_asking_gateways_list_where_the_pool_holds_a_host_local_row() {
     let store = MemoryStore::new();

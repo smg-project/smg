@@ -320,11 +320,12 @@ impl Ring {
 ///
 /// The bound in bytes: a slot is at most 120 bytes whatever the event. A
 /// load row is its slot alone: 65,536 of them are 7.9 MB, held from the
-/// start. A membership event's rows stand apart from its slot, 352 bytes a
-/// row and its strings: about 0.55 KB an event at a row of a short URL, one
-/// model, no label, no pairing descriptor and no encode connector, a second
-/// row for a replacement, so 4,096 membership events are about 2.2 MB at
-/// that row. A pairing descriptor stands apart from its row, 168 bytes and
+/// start. A membership event's rows stand apart from its slot, 376 bytes a
+/// row with its strings and its models' windows: about 0.57 KB an event at
+/// a row of a short URL, one model, no window, no label, no pairing
+/// descriptor and no encode connector, a second row for a replacement, so
+/// 4,096 membership events are about 2.3 MB at that row. A pairing
+/// descriptor stands apart from its row, 168 bytes and
 /// its strings, held once for every copy of that row, and so does a
 /// provider's key, 64 bytes and its strings.
 ///
@@ -1180,7 +1181,7 @@ mod tests {
         // replacement), each with its strings. A provider's key stands
         // apart from its row, behind a pointer's two counts.
         assert!(size_of::<Entry>() <= 120);
-        assert!(size_of::<WorkerRow>() <= 352);
+        assert!(size_of::<WorkerRow>() <= 376);
         assert!(size_of::<crate::store::ProviderKey>() + 2 * size_of::<usize>() <= 64);
     }
 

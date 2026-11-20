@@ -54,6 +54,7 @@ pub(super) fn builder(row: &WorkerRow) -> BasicWorkerBuilder {
         overload: _,
         drain_settle_secs,
         demand_facts: _,
+        windows: _,
     } = &row.facts;
     let mut spec = WorkerSpec::new(key.clone());
     spec.models = models.iter().map(ModelCard::new).collect::<Vec<_>>().into();

@@ -636,8 +636,12 @@ struct PoolShape {
     engines: PoolEngines,
     /// What each row states for a request's hard demands, in the rows'
     /// order: the column a door reads for a request that states one
-    /// ([`World::demand_facts`]).
+    /// ([`World::demand_facts`]). A row's window there is its window for
+    /// the pool's model
+    /// ([`WorkerFacts::stated_for`](super::WorkerFacts::stated_for)).
     demanded: Box<[DemandFacts]>,
+    /// The column's floor ([`floor_of`]): what [`World::floor`] hands.
+    floor: u32,
 }
 
 /// One pool's engines: each engine's rows by position, the ranks of a
@@ -1817,6 +1821,23 @@ impl World {
         }
     }
 
+    /// The floor of the pool a view or a build was read of: the narrowest
+    /// context window a row of the pool states for the pool's model, `0`
+    /// where none states one. What
+    /// [`Demands::settled_by`](crate::demands::Demands::settled_by) takes:
+    /// a request that demands a window alone is met by every row where the
+    /// floor holds it. It is the pool's whole, whichever of its rows the
+    /// asking gateway reaches: a floor over more rows settles no demand a
+    /// row fails. Asked of the publication `built` was read of, by a door
+    /// whose request states a demand: a request that states none asks no
+    /// floor. `None` where the build's pool is no pool of this publication.
+    #[inline]
+    #[must_use]
+    pub fn floor(&self, built: &Built) -> Option<u32> {
+        let shape = self.derived.pools.get(built.pool as usize)?;
+        Some(shape.floor)
+    }
+
     /// Name the rows the affinity stages read in the column's place
     /// ([`NamedAffinity`](crate::NamedAffinity)) for `view`, the rows a
     /// decision of `model` in `role` is made over: the pool's as
@@ -2205,6 +2226,14 @@ struct Entry<'a> {
     own: Overload,
     /// Its member's slot in the store's counts.
     booked: Slot,
+}
+
+/// The floor of a pool's column: the narrowest context window a row of it
+/// states, `0` where none states one. A row that states none holds a
+/// request of any size and bounds nothing.
+fn floor_of(demanded: &[DemandFacts]) -> u32 {
+    let stated = demanded.iter().map(|facts| facts.window);
+    stated.filter(|&window| window != 0).min().unwrap_or(0)
 }
 
 /// The engines of the pool `entries` list, which stand by id: the ranks of
@@ -3978,6 +4007,11 @@ impl Writer {
                         pool: index,
                         row: row as u32,
                     }));
+                // What each row states for a request for the pool's model.
+                let demanded: Box<[DemandFacts]> = entries
+                    .iter()
+                    .map(|entry| entry.facts.stated_for(&model))
+                    .collect();
                 pools.push(PoolShape {
                     admitted_micros: entries.iter().map(|entry| entry.admitted_micros).collect(),
                     booked: entries.iter().map(|entry| entry.booked).collect(),
@@ -4002,10 +4036,8 @@ impl Writer {
                         None
                     },
                     engines: engines_of(&entries, &ranked, &mut placed),
-                    demanded: entries
-                        .iter()
-                        .map(|entry| entry.facts.demand_facts)
-                        .collect(),
+                    floor: floor_of(&demanded),
+                    demanded,
                 });
                 self.spares.push(None);
                 self.working.push(Working {
