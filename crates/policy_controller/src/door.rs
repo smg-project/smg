@@ -9039,7 +9039,10 @@ pub(crate) mod tests {
         store.publish_now();
         let door = Door::new(Arc::clone(&store));
         let mut asked = request(b"stays", 7);
-        asked.constraints.demands = Demands { runtime: 7 };
+        asked.constraints.demands = Demands {
+            runtime: 7,
+            ..Demands::default()
+        };
         let decided = door.decide(GATEWAY, &asked, now).expect("a decision");
         assert!(decided.decision.pick().is_some(), "{decided:?}");
         // The demand left the second and the fourth member: each read the
