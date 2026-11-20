@@ -9,12 +9,13 @@
 //! of its own registration alone: one that states no policy is checked,
 //! whatever stood under its URL.
 //!
-//! An answer carries the log's place after the call's write, with the term
-//! that place was written under: the write's own place, since the door is
-//! the only writer of the kinds a watcher follows but the start of a term.
-//! A caller that watches the rows holds the call's write once its stream
-//! has passed that place. A call that wrote nothing answers the place the
-//! log stands at.
+//! An answer carries the log's place read after the call's write, with the
+//! term that place was written under: the write's own place or a later one.
+//! The door is not the only writer of the kinds a watcher follows: a
+//! probe's verdict moves a row's status beside it, and so does the start
+//! of a term. A caller that watches the rows holds the call's write once
+//! its stream has passed that place. A call that wrote nothing answers the
+//! place the log stands at.
 //!
 //! **The door is the process's only membership writer.** A call's read, its
 //! write and its read back run under the door's one lock, so a mode's test
@@ -98,6 +99,8 @@ fn invalid(refused: Refused) -> Status {
 
 const ABSENT: &str = "no worker is registered under the URL";
 const MOVED: &str = "the row moved under the call";
+#[cfg(feature = "worker-host")]
+const DRAINING: &str = "the worker under the URL is draining";
 
 /// A `REPLACE` of a URL no row stands under.
 fn absent() -> Status {
@@ -143,7 +146,8 @@ impl Door {
         }
     }
 
-    /// The log's place: read after a call's write, that write's own.
+    /// The log's place: read after a call's write, that write's own or one
+    /// past it.
     fn place(&self) -> Position {
         self.log.head(Kinds::Watched)
     }
@@ -299,7 +303,7 @@ impl Door {
         // from the old incarnation. Read before the connect signal moves it.
         let carried = now.status != WorkerStatus::Pending;
         if !now.facts.health.probes {
-            self.store.connected(id, now.revision);
+            self.store.connected(id, now.revision, &|| true);
             if request.wait_ready {
                 (now, epoch, at) = (self.read(id)?, self.store.epoch(), self.place());
             }
@@ -512,6 +516,7 @@ impl Hosted {
                     HostRefused::Stands => {
                         (Code::AlreadyExists, "a worker is registered under the URL")
                     }
+                    HostRefused::Draining => (Code::FailedPrecondition, DRAINING),
                     HostRefused::OutOfScope => (Code::PermissionDenied, HostRefused::OUT_OF_SCOPE),
                 };
                 audit_refusal(call, &self.by, code, why, asker);
@@ -675,8 +680,8 @@ pub(crate) mod tests {
         store::{GatewayId, Reachability, WorkerFacts, WorkerRow},
         view::{Role, WireModes},
         worker_host::{
-            check_expectations, check_guard, check_health_scope, check_maker, check_provider,
-            Expect, Membership, Refused, Remover, Standing, StoreDoor, Wrote,
+            check_event_signal, check_expectations, check_guard, check_health_scope, check_maker,
+            check_provider, Expect, Membership, Refused, Remover, Standing, StoreDoor, Wrote,
         },
     };
 
@@ -1626,6 +1631,12 @@ pub(crate) mod tests {
     #[test]
     fn a_registration_is_laid_over_what_it_expects() {
         check_expectations(hosted_door);
+    }
+
+    #[cfg(feature = "worker-host")]
+    #[test]
+    fn a_found_row_states_its_event_signal() {
+        check_event_signal(hosted_door);
     }
 
     #[cfg(feature = "worker-host")]

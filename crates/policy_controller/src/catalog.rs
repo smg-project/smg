@@ -28,7 +28,8 @@ use crate::{
     framework::{Filter, Picker, Scorer},
     reports::Reports,
     sent::SentCredit,
-    spec::{SpecError, SCORERS},
+    signals::SignalColumn,
+    spec::{Needs, SpecError, SCORERS},
 };
 
 /// Builds one stage: once at its registration, then once for each place a
@@ -38,7 +39,7 @@ type Factory<T> = Box<dyn Fn() -> Box<T> + Send + Sync>;
 type ScorerFactory =
     dyn Fn(&mut StageBuild<'_>) -> Result<Box<dyn Scorer>, StageError> + Send + Sync;
 type ScorerBuild = Build<dyn Scorer, Box<ScorerFactory>>;
-type FilterFactory =
+pub(crate) type FilterFactory =
     dyn Fn(&mut StageBuild<'_>) -> Result<Box<dyn Filter>, StageError> + Send + Sync;
 type FilterBuild = Build<dyn Filter, Box<FilterFactory>>;
 
@@ -72,22 +73,52 @@ pub struct StageBuild<'a> {
     sent_ttl_ms: Option<u32>,
     sent: &'a mut Option<Arc<SentCredit>>,
     reports: Reports,
+    /// The document's signals, resolved, in name order.
+    signals: &'a [SignalColumn],
+    resolved_signal: bool,
 }
 
 impl<'a> StageBuild<'a> {
-    pub(crate) fn new(
+    /// The stage `build` makes under a context of its own, held to its own
+    /// word on the signal cells: its needs (`needs`) set them exactly where
+    /// its factory resolved a signal ([`Self::signal_column`]). A stage
+    /// that kept a column and does not say so would be handed no cells and
+    /// read no value, in silence. One that says so and kept none would
+    /// have a host hand cells nothing reads. The one maker of a context: a
+    /// stage of any kind a factory builds comes through here.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the context's parts, the factory and the stage's own word on its needs"
+    )]
+    pub(crate) fn built<S: ?Sized>(
         written: &'a Map<String, Value>,
         profile: &'a str,
         sent_ttl_ms: Option<u32>,
         sent: &'a mut Option<Arc<SentCredit>>,
         reports: Reports,
-    ) -> Self {
-        Self {
+        signals: &'a [SignalColumn],
+        build: impl FnOnce(&mut Self) -> Result<Box<S>, StageError>,
+        needs: impl FnOnce(&S) -> Needs,
+    ) -> Result<Box<S>, StageError> {
+        let mut context = Self {
             written,
             profile,
             sent_ttl_ms,
             sent,
             reports,
+            signals,
+            resolved_signal: false,
+        };
+        let stage = build(&mut context)?;
+        match (context.resolved_signal, needs(&stage).signal_cells) {
+            (true, false) => Err(StageError::other(
+                "the stage keeps a signal's column: its needs must set signal_cells",
+            )),
+            (false, true) => Err(StageError::other(
+                "the stage's needs set signal_cells and its build resolved no signal: \
+                 resolve one or leave the need unset",
+            )),
+            _ => Ok(stage),
         }
     }
 }
@@ -123,6 +154,24 @@ impl StageBuild<'_> {
     /// `Copy`, and asking for it makes nothing.
     pub fn reports(&self) -> Reports {
         self.reports
+    }
+
+    /// The column of a signal the document declares, by its name. A name
+    /// the document does not declare is refused at the stage's entry. A
+    /// stage that keeps a column says so in its needs
+    /// ([`Needs::signal_cells`](crate::Needs::signal_cells)), and a stage
+    /// that keeps none does not: the validator refuses either mismatch, so
+    /// a host hands the cells to the profiles that read them and to no
+    /// other.
+    pub fn signal_column(&mut self, name: &str) -> Result<SignalColumn, StageError> {
+        let found = self
+            .signals
+            .binary_search_by(|column| column.name().cmp(name));
+        let column = found.map_err(|_| {
+            StageError::other(format!("{name} is not a signal the document declares"))
+        })?;
+        self.resolved_signal = true;
+        Ok(self.signals[column].clone())
     }
 }
 
@@ -1794,14 +1843,14 @@ bindings: [{{ profile: before }}]
                 SpecError::BadField {
                     path: path.into(),
                     value: value.into(),
-                    reason: "left out under a filter that takes no parameter",
+                    reason: "left out: this filter takes no parameter, write its bare name",
                 }
             );
             assert_eq!(error.field_path(), path);
         }
         assert_eq!(
             refused("[{ odd-ids: { slots: 2 } }]").to_string(),
-            r#"profiles.default.filter[0].odd-ids = {"slots":2} is not left out under a filter that takes no parameter"#
+            r#"profiles.default.filter[0].odd-ids = {"slots":2} is not left out: this filter takes no parameter, write its bare name"#
         );
         // A name no catalog holds is unknown, whatever stands under it.
         assert_eq!(

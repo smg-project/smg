@@ -6,6 +6,14 @@
 //! one function, [`KeySources::derive`], for a host in process and for a
 //! gateway that asks a controller under an address.
 //!
+//! A source can also tell one client from another: a header a proxy or a
+//! browser sets. Its key is a second fact, read by
+//! [`KeySources::derive_client`]: a ring places by it where the request
+//! carries no session key, and nothing else reads it
+//! ([`RequestFacts::client_key`]).
+//!
+//! [`RequestFacts::client_key`]: crate::RequestFacts::client_key
+//!
 //! [`RequestFacts::session_key`]: crate::RequestFacts::session_key
 
 use crate::{
@@ -33,6 +41,9 @@ struct Source {
     /// Whether the key leaves in the clear: the document lets a stage read
     /// the header, or the source is the request's own id.
     plain: bool,
+    /// Whether the source tells one client from another: it hands the
+    /// client's key and never the session's.
+    client: bool,
 }
 
 /// Where a derived key came from.
@@ -79,6 +90,7 @@ impl KeySources {
                     .is_none_or(|name| view.headers.contains(name)),
                 header: source.header.as_deref().map(Box::from),
                 max_bytes: bytes(source.max_bytes.unwrap_or(KEY_BYTES)),
+                client: source.client,
             })
             .collect();
         Self {
@@ -101,6 +113,7 @@ impl KeySources {
                 header: Some(name.as_str().into()),
                 max_bytes: bytes(KEY_BYTES),
                 plain: true,
+                client: false,
             })
             .collect();
         Self {
@@ -130,26 +143,41 @@ impl KeySources {
     /// A source holds a value where it is present, not empty, UTF-8 and
     /// within the source's byte cap. Any other is passed over, never an
     /// error, and the next source is read. Under `strip_lineage` the turn
-    /// and retry suffixes leave the key ([`strip_lineage`]). `None` where no
+    /// and retry suffixes leave the key ([`strip_lineage`]): a header is
+    /// measured as sent, and the request's id without them. `None` where no
     /// source holds a value: the request carries no key.
     pub fn derive<'a>(
         &'a self,
         header: impl Fn(&str) -> Option<&'a [u8]>,
         rid: Option<&'a str>,
     ) -> Option<DerivedKey<'a>> {
-        self.sources.iter().find_map(|source| {
-            let (value, from) = match &source.header {
-                Some(name) => (header(name)?, KeySource::Header(name)),
-                None => (rid?.as_bytes(), KeySource::Rid),
-            };
-            if value.is_empty() || value.len() > source.max_bytes {
-                return None;
-            }
-            let value = std::str::from_utf8(value).ok()?;
-            let key = if self.strip_lineage {
-                strip_lineage(value)
+        let lineage = |key| {
+            if self.strip_lineage {
+                strip_lineage(key)
             } else {
-                value
+                key
+            }
+        };
+        let mut session = self.sources.iter().filter(|source| !source.client);
+        session.find_map(|source| {
+            let (key, from) = match &source.header {
+                Some(name) => {
+                    let value = header(name)?;
+                    if value.is_empty() || value.len() > source.max_bytes {
+                        return None;
+                    }
+                    let value = std::str::from_utf8(value).ok()?;
+                    (lineage(value), KeySource::Header(name))
+                }
+                // The suffixes are the gateway's own marks on an id: the id
+                // is measured as the key it hands.
+                None => {
+                    let key = lineage(rid?);
+                    if key.is_empty() || key.len() > source.max_bytes {
+                        return None;
+                    }
+                    (key, KeySource::Rid)
+                }
             };
             Some(DerivedKey {
                 key: if source.plain {
@@ -161,6 +189,26 @@ impl KeySources {
             })
         })
     }
+
+    /// The request's client key: the fingerprint of the value under the
+    /// first client source's header the request carries, `0` where it
+    /// carries none of them or that value cannot be handed. A value is
+    /// handed where it is not empty and is visible ASCII, as a header's
+    /// text is. It is read whole, with any suffix, and no source behind it
+    /// is read. Its text leaves in no form.
+    pub fn derive_client<'a>(&self, header: impl Fn(&str) -> Option<&'a [u8]>) -> u64 {
+        self.sources
+            .iter()
+            .filter(|source| source.client)
+            .find_map(|source| header(source.header.as_deref()?))
+            .filter(|value| {
+                !value.is_empty()
+                    && value
+                        .iter()
+                        .all(|&byte| matches!(byte, b'\t' | b' '..=b'~'))
+            })
+            .map_or(0, fingerprint)
+    }
 }
 
 /// A document's byte count as a length.
@@ -171,7 +219,8 @@ fn bytes(count: u32) -> usize {
 /// A key without its lineage: one trailing `_r<n>` retry suffix leaves, then
 /// one trailing `_t<n>` turn suffix, so every turn and retry of a
 /// conversation shares one key (`conv_t2_r1` keys as `conv`). A key that is
-/// nothing but suffix keys as itself.
+/// nothing but suffix keys as itself. A suffix's counter has any number of
+/// digits, as the gateway's own strip takes it.
 pub fn strip_lineage(key: &str) -> &str {
     let stripped = strip_suffix(strip_suffix(key, b'r'), b't');
     if stripped.is_empty() {
@@ -309,6 +358,11 @@ mod tests {
         ] {
             assert_eq!(strip_lineage(key), stripped, "{key}");
         }
+        // A suffix's counter has any number of digits, as the gateway's own
+        // strip takes it: padded turns of a conversation share its key.
+        let padded = "9".repeat(21);
+        assert_eq!(strip_lineage(&format!("conv_t{padded}")), "conv");
+        assert_eq!(strip_lineage(&format!("conv_t2_r{padded}")), "conv");
         let strips = sources(
             r#"{"sources":[{"header":"x-smg-routing-key"},{"rid":true}],"strip_lineage":true}"#,
         );
@@ -325,6 +379,56 @@ mod tests {
         assert_eq!(
             strips.derive(request(&[]), Some("rid_t4")).map(|d| d.key),
             Some(Identity::plain("rid"))
+        );
+        // A header is measured as sent and the request's id as the key it
+        // hands: at the cap with a suffix behind it, the header is passed
+        // over and the id keys.
+        let base = "k".repeat(128);
+        let suffixed = format!("{base}_t2");
+        let headers: [(&str, &[u8]); 1] = [("x-smg-routing-key", suffixed.as_bytes())];
+        assert_eq!(strips.derive(request(&headers), None), None);
+        assert_eq!(
+            strips.derive(request(&[]), Some(&suffixed)).map(|d| d.key),
+            Some(Identity::plain(&base))
+        );
+        assert_eq!(keeps.derive(request(&[]), Some(&suffixed)), None);
+        let over = format!("{base}k_t2");
+        assert_eq!(strips.derive(request(&[]), Some(&over)), None);
+    }
+
+    /// A client source hands the client's key and never the session's. The
+    /// first of them the request carries is the one read: a value it cannot
+    /// hand ends the read, and the value is read whole.
+    #[test]
+    fn a_client_source_hands_the_clients_key_alone() {
+        let sources = sources(
+            r#"{"sources":[{"header":"x-smg-routing-key"},{"header":"x-forwarded-for","client":true},{"header":"cookie","client":true}],"strip_lineage":true}"#,
+        );
+        let cookie = "c".repeat(10_000);
+        let both: [(&str, &[u8]); 2] = [
+            ("cookie", cookie.as_bytes()),
+            ("x-forwarded-for", b"10.0.0.1_t2"),
+        ];
+        assert_eq!(sources.derive(request(&both), None), None, "no session key");
+        assert_eq!(
+            sources.derive_client(request(&both)),
+            fingerprint(b"10.0.0.1_t2"),
+            "the first client header, whole"
+        );
+        assert_eq!(
+            sources.derive_client(request(&both[..1])),
+            fingerprint(cookie.as_bytes()),
+            "the next one where the first is absent, at any length"
+        );
+        for unusable in [&b""[..], &[0xc3, 0xa9][..]] {
+            let present: [(&str, &[u8]); 2] =
+                [("cookie", b"session=abc"), ("x-forwarded-for", unusable)];
+            assert_eq!(sources.derive_client(request(&present)), 0, "{unusable:?}");
+        }
+        assert_eq!(sources.derive_client(request(&[])), 0);
+        assert_eq!(
+            sources.headers().collect::<Vec<_>>(),
+            ["x-smg-routing-key", "x-forwarded-for", "cookie"]
         );
     }
 

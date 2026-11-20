@@ -479,5 +479,15 @@ harness = false
 name = "sent"
 harness = false
 
+[[bench]]
+name = "signals"
+harness = false
+
+# A `has-room` rule beside the same profile without it. Apart from
+# `decision`, whose binary takes no new id.
+[[bench]]
+name = "has_room"
+harness = false
+
 [lints]
 workspace = true

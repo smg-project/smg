@@ -8,7 +8,7 @@ use std::{
     collections::VecDeque,
     hash::Hasher,
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
 };
@@ -26,7 +26,7 @@ use crate::{
         TieBand, Unit, DRAW_BOUND,
     },
     lease::{Lease, Lifecycle, Membership, Outcome, ReleaseReason, Side, Signal},
-    sent::SentCredit,
+    sent::{Sent, SentCredit, SentReads},
     spec::{CostMargin, Needs, Unreported},
     terms::{Coefficients, Term},
     view::{
@@ -185,6 +185,272 @@ impl Filter for HasRoom {
 
     fn soft(&self) -> bool {
         true
+    }
+}
+
+/// Asks `$rule.$method` with the three flags of a report's sum
+/// ([`Coefficients::add_report`]) settled from the names the rule reads. A
+/// flag left on for a name it does not read would drop a row for a value
+/// nobody named.
+macro_rules! by_names {
+    ($rule:expr, $method:ident($($arg:expr),*)) => {
+        match ($rule.resident, $rule.waiting, $rule.kv_or_running) {
+            (false, false, false) => $rule.$method::<false, false, false>($($arg),*),
+            (false, false, true) => $rule.$method::<false, false, true>($($arg),*),
+            (false, true, false) => $rule.$method::<false, true, false>($($arg),*),
+            (false, true, true) => $rule.$method::<false, true, true>($($arg),*),
+            (true, false, false) => $rule.$method::<true, false, false>($($arg),*),
+            (true, false, true) => $rule.$method::<true, false, true>($($arg),*),
+            (true, true, false) => $rule.$method::<true, true, false>($($arg),*),
+            (true, true, true) => $rule.$method::<true, true, true>($($arg),*),
+        }
+    };
+}
+
+/// `has-room` by a rule the document writes: a row has room where what it
+/// holds is at most its capacity less the headroom. What a row holds is the
+/// sum of the rule's named fields times their coefficients, in name order.
+/// A row that lacks a named value has no room. Soft and row-wise, as the
+/// host's bit is: where no row has room the list stands.
+#[derive(Debug)]
+pub(crate) struct HasRoomRule {
+    terms: Coefficients,
+    /// The coefficient of the request's size: zero where the rule does not
+    /// name it.
+    request_tokens: f64,
+    /// The capacity less the headroom.
+    bound: f64,
+    /// Whether a term reads the row's count in flight.
+    in_flight: bool,
+    /// Whether a term reads the row's report.
+    loads: bool,
+    // The optional values of a report, each tested where the rule names it.
+    resident: bool,
+    waiting: bool,
+    kv_or_running: bool,
+    /// The profile's count of sends, where a term reads it.
+    sent: Option<Arc<SentCredit>>,
+}
+
+impl HasRoomRule {
+    pub(crate) const NAME: &str = "has-room";
+    /// The request's size among the rule's fields. Every request states it.
+    pub(crate) const REQUEST_TOKENS: &str = "request.prompt_tokens";
+
+    pub(crate) fn new(
+        terms: &[(Term, f64)],
+        request_tokens: f64,
+        capacity: f64,
+        headroom: f64,
+        sent: Option<Arc<SentCredit>>,
+    ) -> Self {
+        let coefficients = Coefficients::of(terms);
+        Self {
+            request_tokens,
+            bound: (1.0 - headroom) * capacity,
+            in_flight: coefficients.in_flight != 0.0,
+            loads: terms.iter().any(|&(term, _)| term.reads_load()),
+            resident: coefficients.resident_tokens != 0.0,
+            waiting: coefficients.waiting_uncached_tokens != 0.0,
+            kv_or_running: coefficients.names_kv_or_running(),
+            terms: coefficients,
+            sent,
+        }
+    }
+
+    /// The request's part of what a row holds: its size times the rule's
+    /// coefficient. Every row of a pass is handed the same, so a pass works
+    /// it once.
+    #[inline(always)]
+    fn asked(&self, facts: &RequestFacts<'_>) -> f64 {
+        f64::from(facts.prompt_tokens) * self.request_tokens
+    }
+
+    /// Whether a row has room, by its report as `load` hands it and its
+    /// sends as `sent` counts them: the stated tokens and the requests, the
+    /// count's two-number read. The sum runs in name order: the count
+    /// in flight, the report's fields, the request's part as `asked`
+    /// ([`Self::asked`]), the sends.
+    #[inline(always)]
+    fn fits<const RESIDENT: bool, const WAITING: bool, const KV_OR_RUNNING: bool>(
+        &self,
+        asked: f64,
+        facts: &RequestFacts<'_>,
+        row: &Candidate,
+        load: Option<&LoadRow>,
+        sent: impl FnOnce() -> (u64, u64),
+    ) -> bool {
+        let mut used = 0.0;
+        if self.in_flight {
+            used += f64::from(facts.in_flight(row)) * self.terms.in_flight;
+        }
+        if self.loads {
+            // A row with no report, or with one that lacks a named value,
+            // has no room.
+            let Some(sum) = load.and_then(|report| {
+                self.terms
+                    .add_report::<RESIDENT, WAITING, KV_OR_RUNNING>(used, report, true)
+            }) else {
+                return false;
+            };
+            used = sum;
+        }
+        used += asked;
+        if self.sent.is_some() {
+            let (tokens, requests) = sent();
+            used += requests as f64 * self.terms.sent_requests;
+            used += tokens as f64 * self.terms.sent_tokens;
+        }
+        used <= self.bound
+    }
+
+    /// [`Filter::keep`] of one row, by the report `load` hands.
+    fn keep_with(&self, facts: &RequestFacts<'_>, row: &Candidate, load: Option<&LoadRow>) -> bool {
+        let sent = || {
+            self.sent
+                .as_ref()
+                .map_or((0, 0), |sent| sent.reads(facts).counts(row))
+        };
+        by_names!(self, fits(self.asked(facts), facts, row, load, sent))
+    }
+
+    /// One pass over the kept rows, in one loop with the test in it: the
+    /// request's part is worked once, and the profile's sends are read
+    /// through one load of its tally. The rows that fit are written over
+    /// the list's front, in the list's order.
+    #[inline(always)]
+    fn rows<const RESIDENT: bool, const WAITING: bool, const KV_OR_RUNNING: bool>(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &mut Vec<u32>,
+        load: impl Fn(&Candidate) -> Option<&LoadRow>,
+    ) {
+        let asked = self.asked(facts);
+        let sends = self.sent.as_ref().map(|sent| sent.reads(facts));
+        let mut held = 0;
+        for at in 0..kept.len() {
+            let i = kept[at];
+            let row = &candidates[i as usize];
+            let sent = || sends.as_ref().map_or((0, 0), |sends| sends.counts(row));
+            let fits =
+                self.fits::<RESIDENT, WAITING, KV_OR_RUNNING>(asked, facts, row, load(row), sent);
+            kept[held] = i;
+            held += usize::from(fits);
+        }
+        kept.truncate(held);
+    }
+
+    /// [`Filter::retain`], by the report `load` hands of each row: the
+    /// flags are settled once a pass.
+    fn retain_with(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &mut Vec<u32>,
+        load: impl Fn(&Candidate) -> Option<&LoadRow>,
+    ) {
+        by_names!(self, rows(facts, candidates, kept, load));
+    }
+}
+
+impl Filter for HasRoomRule {
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
+    // Soft: it turns no request away, so a late report can only place a
+    // request elsewhere.
+    fn refuses_by_reports(&self) -> bool {
+        false
+    }
+
+    fn row_wise(&self) -> bool {
+        true
+    }
+
+    fn soft(&self) -> bool {
+        true
+    }
+
+    // A report ends the sends before it, so the sends need the reports
+    // though no term may read one.
+    fn needs(&self) -> Needs {
+        Needs {
+            loads: self.loads || self.sent.is_some(),
+            ..Needs::default()
+        }
+    }
+
+    fn keep(&self, facts: &RequestFacts<'_>, c: &Candidate, _: &Constraints<'_>) -> bool {
+        self.keep_with(facts, c, c.load.as_ref())
+    }
+
+    fn retain(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        _: &Constraints<'_>,
+        kept: &mut Vec<u32>,
+    ) {
+        self.retain_with(facts, candidates, kept, |row| row.load.as_ref());
+    }
+}
+
+/// [`HasRoomRule`] under the view's report age limit: a report past the
+/// limit reads as none, by the cutoff the scorers read under.
+#[derive(Debug)]
+struct HasRoomWithin {
+    rule: HasRoomRule,
+    max_age_ms: u64,
+}
+
+impl Filter for HasRoomWithin {
+    fn name(&self) -> &'static str {
+        self.rule.name()
+    }
+
+    fn refuses_by_reports(&self) -> bool {
+        self.rule.refuses_by_reports()
+    }
+
+    fn row_wise(&self) -> bool {
+        self.rule.row_wise()
+    }
+
+    fn soft(&self) -> bool {
+        self.rule.soft()
+    }
+
+    fn needs(&self) -> Needs {
+        self.rule.needs()
+    }
+
+    fn keep(&self, facts: &RequestFacts<'_>, c: &Candidate, _: &Constraints<'_>) -> bool {
+        let cutoff = ReportCutoff::new(facts.now_micros, self.max_age_ms);
+        self.rule.keep_with(facts, c, cutoff.load(c))
+    }
+
+    fn retain(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        _: &Constraints<'_>,
+        kept: &mut Vec<u32>,
+    ) {
+        let cutoff = ReportCutoff::new(facts.now_micros, self.max_age_ms);
+        self.rule
+            .retain_with(facts, candidates, kept, |row| cutoff.load(row));
+    }
+}
+
+/// The rule as a profile's filter: under the view's report age limit where
+/// the document sets one and a term reads a report, and as it stands
+/// otherwise. So a document with no limit runs no test of an age.
+pub(crate) fn has_room_rule(rule: HasRoomRule, max_age_ms: Option<u64>) -> Box<dyn Filter> {
+    match max_age_ms.filter(|_| rule.loads) {
+        Some(max_age_ms) => Box::new(HasRoomWithin { rule, max_age_ms }),
+        None => Box::new(rule),
     }
 }
 
@@ -668,6 +934,18 @@ pub(crate) struct SinceReport {
     /// The held token-work in the high bits and the held requests in the low
     /// [`REQUEST_BITS`]: one word, so a reader never sees a torn pair.
     held: AtomicU64,
+    /// How many of the held dispatches were recorded at no tokens: those
+    /// of a lease that states no size, in a count of sends. As wide as the
+    /// held word's count of requests, which bounds it. A word of its own,
+    /// written behind the held word at a record and lowered ahead of it
+    /// at a release and at a retirement, so it never counts a dispatch
+    /// the held word does not. The held word's subtraction there is a
+    /// `Release` and the read of both words loads the held word with
+    /// `Acquire`, so a reader finds that order on every target. A read
+    /// loads the two words apart: across a record or a release it may see
+    /// one without the other for the dispatch in flight, and across a
+    /// retirement for its batch.
+    unsized_held: AtomicU16,
     /// The lowest of the lanes' front instants; `u64::MAX` when none. A
     /// dispatch lowers it under its lane's lock; a release recomputes it
     /// under every lane's lock, so it never reads above any lane's front.
@@ -813,6 +1091,7 @@ impl Default for SinceReport {
     fn default() -> Self {
         Self {
             held: AtomicU64::new(0),
+            unsized_held: AtomicU16::new(0),
             oldest_micros: AtomicU64::new(u64::MAX),
             retiring: Mutex::new(()),
             lanes: Default::default(),
@@ -828,6 +1107,8 @@ impl SinceReport {
         u64::from(tokens) << REQUEST_BITS | 1
     }
 
+    /// Holds one dispatch of `tokens` made at `at_micros`. A dispatch of no
+    /// tokens is counted as a send of no stated size.
     pub(crate) fn record(&self, at_micros: u64, tokens: u32) {
         // Past the bound the row's oldest batch retires before this dispatch
         // lands, by instant across the lanes: the newest credits stay,
@@ -854,6 +1135,9 @@ impl SinceReport {
             newest.is_none()
         };
         self.held.fetch_add(Self::weight(tokens), Ordering::Relaxed);
+        if tokens == 0 {
+            self.unsized_held.fetch_add(1, Ordering::Relaxed);
+        }
         if front {
             lane.publish_oldest(&dispatches);
         }
@@ -865,9 +1149,13 @@ impl SinceReport {
         }
     }
 
+    /// Takes a lane's oldest dispatch out of the held word. The
+    /// subtraction is a `Release`: a read that loads the word with
+    /// `Acquire` finds every write made ahead of it, the count of the
+    /// dispatches of no tokens among them ([`Self::sent_through`]).
     fn pop_oldest(&self, dispatches: &mut Dispatches) {
         if let Some((_, tokens)) = dispatches.pop_front() {
-            self.held.fetch_sub(Self::weight(tokens), Ordering::Relaxed);
+            self.held.fetch_sub(Self::weight(tokens), Ordering::Release);
         }
     }
 
@@ -912,6 +1200,7 @@ impl SinceReport {
             return;
         }
         let mut retired = 0;
+        let mut unsized_retired = 0;
         for _ in 0..RETIRE_BATCH {
             // The lane whose front is the oldest; none when every lane is
             // empty.
@@ -925,9 +1214,13 @@ impl SinceReport {
             };
             if let Some((_, tokens)) = held_lanes[i].pop_front() {
                 retired += Self::weight(tokens);
+                unsized_retired += u16::from(tokens == 0);
             }
         }
-        self.held.fetch_sub(retired, Ordering::Relaxed);
+        self.unsized_held
+            .fetch_sub(unsized_retired, Ordering::Relaxed);
+        // A `Release`, as a release's subtraction is: see `pop_oldest`.
+        self.held.fetch_sub(retired, Ordering::Release);
         for (dispatches, lane) in held_lanes.iter().zip(&self.lanes) {
             lane.publish_oldest(dispatches);
         }
@@ -942,15 +1235,35 @@ impl SinceReport {
     }
 
     /// The held token-work and requests once the dispatches made at or
-    /// before the report's sample are released. A sample that reaches none
-    /// of them reads the word alone. Inlined into each load scorer's row
+    /// before `through_micros` are released: a report sampled then
+    /// reflects them, or a time limit ends them. An instant that reaches
+    /// none of them reads the word alone. Inlined into a reader's row
     /// loop: two loads and a compare a row, the release behind a call.
     #[inline(always)]
-    pub(crate) fn credit_through(&self, sampled_at_micros: u64) -> (u64, u64) {
-        if self.reaches(sampled_at_micros) {
-            self.release_through(sampled_at_micros);
+    pub(crate) fn credit_through(&self, through_micros: u64) -> (u64, u64) {
+        if self.reaches(through_micros) {
+            self.release_through(through_micros);
         }
         self.held_credit()
+    }
+
+    /// [`Self::credit_through`] with the count of the held dispatches of
+    /// no tokens: a third load. The held word is loaded with `Acquire`,
+    /// against the `Release` of a release's and a retirement's
+    /// subtraction: the count is read as it stood at that write or later,
+    /// so no read finds more dispatches of no tokens than dispatches
+    /// across a release, on any target.
+    #[inline(always)]
+    pub(crate) fn sent_through(&self, through_micros: u64) -> Sent {
+        if self.reaches(through_micros) {
+            self.release_through(through_micros);
+        }
+        let held = self.held.load(Ordering::Acquire);
+        Sent {
+            requests: (held & REQUEST_MASK) as u32,
+            tokens: held >> REQUEST_BITS,
+            unsized_requests: u32::from(self.unsized_held.load(Ordering::Relaxed)),
+        }
     }
 
     /// Whether the row holds a dispatch made at or before the sample: one
@@ -977,14 +1290,22 @@ impl SinceReport {
     #[inline(never)]
     fn release_through(&self, sampled_at_micros: u64) {
         let mut held_lanes = self.lock_lanes();
-        for (dispatches, lane) in held_lanes.iter_mut().zip(&self.lanes) {
-            while dispatches
-                .front()
-                .is_some_and(|&(at, _)| at <= sampled_at_micros)
-            {
-                self.pop_oldest(dispatches);
+        // No dispatch lands under every lane's lock, so the count of the
+        // held dispatches of no tokens stands still here: a row that
+        // holds none releases by the loop it ran before that count was
+        // kept.
+        if self.unsized_held.load(Ordering::Relaxed) != 0 {
+            self.release_marked(&mut held_lanes, sampled_at_micros);
+        } else {
+            for (dispatches, lane) in held_lanes.iter_mut().zip(&self.lanes) {
+                while dispatches
+                    .front()
+                    .is_some_and(|&(at, _)| at <= sampled_at_micros)
+                {
+                    self.pop_oldest(dispatches);
+                }
+                lane.publish_oldest(dispatches);
             }
-            lane.publish_oldest(dispatches);
         }
         let oldest = self
             .lanes
@@ -993,6 +1314,31 @@ impl SinceReport {
             .min()
             .unwrap_or(u64::MAX);
         self.oldest_micros.store(oldest, Ordering::Release);
+    }
+
+    /// The release of a row that holds a dispatch of no tokens: each one
+    /// that goes leaves that count first and the held word next, so a
+    /// read that crosses the release misses the price of one dispatch at
+    /// most.
+    #[cold]
+    #[inline(never)]
+    fn release_marked(
+        &self,
+        held_lanes: &mut [MutexGuard<'_, Dispatches>; DISPATCH_LANES],
+        sampled_at_micros: u64,
+    ) {
+        for (dispatches, lane) in held_lanes.iter_mut().zip(&self.lanes) {
+            while let Some(&(at, tokens)) = dispatches.front() {
+                if at > sampled_at_micros {
+                    break;
+                }
+                if tokens == 0 {
+                    self.unsized_held.fetch_sub(1, Ordering::Relaxed);
+                }
+                self.pop_oldest(dispatches);
+            }
+            lane.publish_oldest(dispatches);
+        }
     }
 
     /// Dispatches held over every lane, for tests and dumps.
@@ -1092,20 +1438,28 @@ impl Credits {
         }
     }
 
-    /// Credits the rank a dispatch landed on. A lease that states no size
-    /// is credited at `mean_prefill`, the calling stage's own mean: a
-    /// credit of no tokens would read its worker as free until that
-    /// worker's next report. `credit` is handed the rank's entry with the
-    /// dispatch's instant and its size, and records it
-    /// ([`SinceReport::record`]): a stage that keeps the rank's number
-    /// records it under the report it was told.
+    /// Credits the rank a dispatch landed on. `credit` is handed the
+    /// rank's entry with the dispatch's instant and the tokens its lease
+    /// states, zero where it states none, and records it
+    /// ([`SinceReport::record`]). A count of sends records the zero, a
+    /// profile's and the one a `least-load` built by hand keeps: the
+    /// entry counts the send as one of no stated size, and each reader
+    /// prices it. `resident-work` keeps a tally of its own and records its
+    /// mean there: a credit of no tokens would read its worker as free
+    /// until that worker's next report. It records the dispatch under the
+    /// report it was told, as it keeps the rank's number.
+    ///
+    /// A rank the tally does not know is entered only where `present`
+    /// says its row still stands, so a late dispatch enters no rank
+    /// behind a removal. A rank the tally knows takes the dispatch
+    /// unasked: a removal forgets the worker's entries.
     pub(crate) fn dispatched(
         &self,
         lease: &Lease,
         target: &Target,
         side: Side,
         since_decision_micros: u32,
-        mean_prefill: u32,
+        present: impl FnOnce() -> bool,
         credit: impl FnOnce(&SinceReport, u64, u32),
     ) {
         // The decode side of a pair target is the pair's decode rank; the
@@ -1119,19 +1473,18 @@ impl Credits {
             Side::Single | Side::Prefill | Side::Encode => (target.id, target.dp_rank),
         };
         let dispatched_micros = lease.issued_micros + u64::from(since_decision_micros);
-        let tokens = match lease.tokens {
-            0 => mean_prefill,
-            stated => stated,
-        };
         // A rank the tally knows is credited on its own entry; the first
         // dispatch to a rank enters it (another dispatch may have entered it
         // meanwhile: the entry the map holds is the one credited).
         if let Some(since) = self.tally.load().get(&rank) {
-            credit(since, dispatched_micros, tokens);
+            credit(since, dispatched_micros, lease.tokens);
+            return;
+        }
+        if !present() {
             return;
         }
         if let Some(since) = self.entry(rank) {
-            credit(&since, dispatched_micros, tokens);
+            credit(&since, dispatched_micros, lease.tokens);
         }
     }
 
@@ -1184,11 +1537,37 @@ pub struct LeastLoad {
     pub kv_pressure_weight: f32,
     pub mean_prefill_tokens: u32,
     pub default_throughput: f32,
-    credits: Credits,
+    /// The count of sends the stage reads: its profile's where a document
+    /// built the stage, one of its own elsewhere.
+    sent: Arc<SentCredit>,
+    /// Whether the count is the stage's own. The stage's hooks feed its
+    /// own count. The engine feeds a profile's.
+    feeds: bool,
 }
 
 impl LeastLoad {
+    /// The stage over a count of its own, which its hooks feed.
     pub fn new(kv_pressure_weight: f32, mean_prefill_tokens: u32, default_throughput: f32) -> Self {
+        Self {
+            feeds: true,
+            ..Self::of_profile(
+                kv_pressure_weight,
+                mean_prefill_tokens,
+                default_throughput,
+                Arc::new(SentCredit::new("", None)),
+            )
+        }
+    }
+
+    /// The stage over its profile's count of sends, as a document builds
+    /// it: the profile's other readers read the same sends, and the
+    /// profile's time limit ends them here too.
+    pub(crate) fn of_profile(
+        kv_pressure_weight: f32,
+        mean_prefill_tokens: u32,
+        default_throughput: f32,
+        sent: Arc<SentCredit>,
+    ) -> Self {
         Self {
             kv_pressure_weight,
             mean_prefill_tokens: mean_prefill_tokens.max(1),
@@ -1197,31 +1576,38 @@ impl LeastLoad {
             } else {
                 1.0
             },
-            credits: Credits::default(),
+            sent,
+            feeds: false,
         }
     }
 
     /// Dispatches no report reflects yet on `worker`, over every rank of it,
     /// for tests and dumps.
     pub fn held(&self, worker: WorkerId) -> usize {
-        self.credits.held(worker)
+        self.sent.credits.held(worker)
     }
 
     /// Dispatches no report reflects yet on one rank of `worker`.
     pub fn held_at(&self, worker: WorkerId, dp_rank: u16) -> usize {
-        self.credits.held_at(worker, dp_rank)
+        self.sent.credits.held_at(worker, dp_rank)
     }
 
-    /// One rank's held word as a decision reads it: token-work and requests.
+    /// One rank's held work as a decision reads it: token-work, a send of
+    /// no stated size at the mean prefill, and requests.
     #[cfg(test)]
     fn held_word_at(&self, worker: WorkerId, dp_rank: u16) -> (u64, u64) {
-        self.credits
+        self.sent
+            .credits
             .tally
             .load()
             .get(&(worker, dp_rank))
             .map_or((0, 0), |since| {
-                let held = since.held.load(Ordering::Relaxed);
-                (held >> REQUEST_BITS, held & REQUEST_MASK)
+                let (tokens, requests) = since.held_credit();
+                let unsized_held = u64::from(since.unsized_held.load(Ordering::Relaxed));
+                (
+                    tokens + unsized_held * u64::from(self.mean_prefill_tokens),
+                    requests,
+                )
             })
     }
 
@@ -1229,7 +1615,7 @@ impl LeastLoad {
     /// runs it.
     #[cfg(test)]
     fn retire_oldest_batch_of(&self, worker: WorkerId, dp_rank: u16) {
-        if let Some(since) = self.credits.tally.load().get(&(worker, dp_rank)) {
+        if let Some(since) = self.sent.credits.tally.load().get(&(worker, dp_rank)) {
             since.retire_oldest_batch();
         }
     }
@@ -1237,7 +1623,8 @@ impl LeastLoad {
     /// The rank row, for a test that holds its retire lock.
     #[cfg(test)]
     fn row(&self, worker: WorkerId, dp_rank: u16) -> Arc<SinceReport> {
-        self.credits
+        self.sent
+            .credits
             .tally
             .load()
             .get(&(worker, dp_rank))
@@ -1367,6 +1754,39 @@ impl LeastLoad {
         }
     }
 
+    /// Writes each reporting row's credit work and marks each row without
+    /// a report, and says how many report. `TIMED` is whether the count
+    /// sets a time limit ([`SentCredit::limited`]): the pass of a count
+    /// with none reads each row by its sample alone.
+    #[inline(always)]
+    fn credit_pass<const TIMED: bool>(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        rows: &[u32],
+        out: &mut [f32],
+        load: impl Fn(&Candidate) -> Option<&LoadRow> + Copy,
+        sends: &SentReads<'_>,
+    ) -> usize {
+        let mean = u64::from(self.mean_prefill_tokens);
+        let mut reporting = 0usize;
+        with_counts!(facts, |counts| {
+            for (slot, &i) in out.iter_mut().zip(rows) {
+                let c = &candidates[i as usize];
+                *slot = match load(c) {
+                    Some(report) => {
+                        let sent = sends.reported::<TIMED>(c);
+                        let tokens = sent.tokens + u64::from(sent.unsized_requests) * mean;
+                        reporting += 1;
+                        self.credit_work(report, counts(c), tokens, u64::from(sent.requests))
+                    }
+                    None => PENDING,
+                };
+            }
+        });
+        reporting
+    }
+
     /// The costs of `rows`, spread over their span, and their band: the one
     /// body behind the stage's two entries. A row that needs a fallback
     /// drains at the mean of the kept rows' rates ([`Self::mean_rate`]).
@@ -1381,30 +1801,20 @@ impl LeastLoad {
         load: impl Fn(&Candidate) -> Option<&LoadRow> + Copy,
     ) -> TieBand {
         // One load of the tally: each reporting row's held work is read
-        // (released first when its report's sample reaches a dispatch) and
-        // its credit work written; the divisions and the KV barrier run after
-        // the load is gone. A row without a report is marked and costed after
-        // the peer baseline is known. No allocation.
-        let mut reporting = 0usize;
-        {
-            let tally = self.credits.tally.load();
-            with_counts!(facts, |counts| {
-                for (slot, &i) in out.iter_mut().zip(rows) {
-                    let c = &candidates[i as usize];
-                    *slot = match load(c) {
-                        Some(report) => {
-                            let (tokens, requests) =
-                                tally.get(&(c.id, c.dp_rank)).map_or((0, 0), |since| {
-                                    since.credit_through(c.load_sampled_at_micros)
-                                });
-                            reporting += 1;
-                            self.credit_work(report, counts(c), tokens, requests)
-                        }
-                        None => PENDING,
-                    };
-                }
-            });
-        }
+        // (released first when its report's sample or the time limit
+        // reaches a dispatch) and its credit work written; the divisions
+        // and the KV barrier run after the load is gone. A send of no
+        // stated size is priced here, at the stage's mean. A row without a
+        // report is marked and costed after the peer baseline is known. No
+        // allocation.
+        let reporting = {
+            let sends = self.sent.reads(facts);
+            if self.sent.limited() {
+                self.credit_pass::<true>(facts, candidates, rows, out, load, &sends)
+            } else {
+                self.credit_pass::<false>(facts, candidates, rows, out, load, &sends)
+            }
+        };
         let mut mean = None;
         let mut nominal = || *mean.get_or_insert_with(|| self.mean_rate(candidates, kept, load));
         for (slot, &i) in out.iter_mut().zip(rows) {
@@ -1437,6 +1847,16 @@ impl LeastLoad {
     }
 }
 
+impl LeastLoad {
+    /// Counts one send in the stage's own count. Out of line: the hook of
+    /// a stage over its profile's count returns at once.
+    #[inline(never)]
+    fn feed(&self, lease: &Lease, target: &Target, side: Side, since_decision_micros: u32) {
+        self.sent
+            .dispatched(lease, target, side, since_decision_micros, || true);
+    }
+}
+
 /// A cost slot not written yet: a candidate without a report is costed
 /// after the reporting peers' baseline is known. Costs are never negative.
 const PENDING: f32 = f32::NEG_INFINITY;
@@ -1449,18 +1869,15 @@ impl Lifecycle for LeastLoad {
         side: Side,
         since_decision_micros: u32,
     ) {
-        self.credits.dispatched(
-            lease,
-            target,
-            side,
-            since_decision_micros,
-            self.mean_prefill_tokens,
-            |since, at_micros, tokens| since.record(at_micros, tokens),
-        );
+        if self.feeds {
+            self.feed(lease, target, side, since_decision_micros);
+        }
     }
 
     fn on_membership(&self, change: &Membership<'_>) {
-        self.credits.membership(change, |_| {});
+        if self.feeds {
+            self.sent.membership(change);
+        }
     }
 }
 
@@ -2102,8 +2519,14 @@ impl Lifecycle for ResidentWork {
             target,
             side,
             since_decision_micros,
-            self.mean_prefill_tokens,
-            |since, at_micros, tokens| {
+            || true,
+            |since, at_micros, stated| {
+                // The stage's own tally holds a send of no stated size at
+                // the stage's mean.
+                let tokens = match stated {
+                    0 => self.mean_prefill_tokens,
+                    stated => stated,
+                };
                 let told = since.told.lock();
                 since.record(at_micros, tokens);
                 // A number is kept from its report's first decision on:
@@ -2549,9 +2972,9 @@ impl ReadsLoad for LeastCostSent {
             let mut bounds = CostBounds::EMPTY;
             for (&row, cost) in kept.iter().zip(costs.iter_mut()) {
                 if let RowCost::Sum(sum) = cost {
-                    let sent = sends.of(&candidates[row as usize]);
-                    *sum += f64::from(sent.requests) * terms.sent_requests;
-                    *sum += sent.tokens as f64 * terms.sent_tokens;
+                    let (tokens, requests) = sends.counts(&candidates[row as usize]);
+                    *sum += requests as f64 * terms.sent_requests;
+                    *sum += tokens as f64 * terms.sent_tokens;
                     bounds.include(*sum);
                 }
             }
@@ -6774,6 +7197,42 @@ mod tests {
             bound + 1,
             "the waiting dispatch retired a batch and landed"
         );
+    }
+
+    #[test]
+    fn a_read_across_a_release_counts_no_more_unsized_dispatches_than_dispatches() {
+        // One thread releases a row that holds dispatches of no tokens
+        // alone, and this one reads the row's two words as they stand. The
+        // count of those dispatches goes down ahead of the held word at
+        // each one, so no read sees more of them than dispatches. A round
+        // whose reads all land beside the release shows nothing: the
+        // rounds go on until a read lands inside one, a few at most.
+        const HELD: u64 = 6_000;
+        for _ in 0..32 {
+            let row = SinceReport::default();
+            for at in 1..=HELD {
+                row.record(at, 0);
+            }
+            let crossed = std::thread::scope(|s| {
+                let release = s.spawn(|| row.sent_through(HELD));
+                let mut crossed = false;
+                while !release.is_finished() {
+                    // An instant ahead of every dispatch releases none.
+                    let read = row.sent_through(0);
+                    assert!(
+                        read.unsized_requests <= read.requests,
+                        "{} dispatches of no tokens beside {} dispatches",
+                        read.unsized_requests,
+                        read.requests
+                    );
+                    crossed |= read.requests != 0 && u64::from(read.requests) != HELD;
+                }
+                crossed
+            });
+            if crossed {
+                return;
+            }
+        }
     }
 
     #[test]

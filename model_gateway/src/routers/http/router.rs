@@ -67,18 +67,15 @@ use crate::{
     observability::{
         events::{self, Event},
         metrics::{bool_to_static_str, error_reason_from_status, metrics_labels, Metrics},
-        otel_trace::inject_trace_context_http,
+        otel_trace::{inject_trace_context_http, with_trace_context_http},
     },
     policies::{CacheNamespace, PolicyRegistry},
-    policy_controller::{
-        self,
-        host::{self, Ask, Host, Placed, Sent},
-    },
+    policy_controller::host::{self, Ask, BehindAnswer, Host, Placed, Sent},
     rate_limit::RateLimitManager,
     routers::{
         common::{
             attach_sized_body,
-            attempt_ledger::{mark_upstream_answer, AttemptLedger, UpstreamAnswer},
+            attempt_ledger::{mark_upstream_answer, AttemptLedger},
             body_policy::{
                 decide_body_path, BodyPath, BodyPathInputs, BODY_PATH_BUFFERED, BODY_PATH_STREAMED,
                 REASON_MODEL_AMBIGUOUS, REASON_MODEL_SELECTION, REASON_NO_AVAILABLE_WORKER,
@@ -127,6 +124,8 @@ use crate::{
 /// Max body size for a WebRTC `/v1/realtime/calls` SDP offer (10 MiB).
 const WEBRTC_REQUEST_BODY_LIMIT: usize = 10 * 1024 * 1024;
 
+const TRANSCRIPTION_REFUSAL_SITE: &str = "Router::route_multipart_transcription";
+
 /// Error code of a streamed body that broke off before it was forwarded.
 /// With the middleware's `REQUEST_BODY_STALLED` and `REQUEST_BODY_TOO_LARGE`
 /// it names an abort the client caused; the three carry no worker verdict:
@@ -141,15 +140,6 @@ struct StreamRelayMode {
     is_stream: bool,
     /// The numbers the stream is re-sliced by, when its wire asks for it.
     rechunk: Option<RechunkPolicy>,
-}
-
-/// The regular HTTP router's rule at the host's commit: the membership of
-/// the classic pool it draws from. The router sends plain HTTP to a regular
-/// worker's URL, so a target of another wire or of another role is passed
-/// over.
-fn regular_http(worker: &dyn Worker) -> bool {
-    *worker.worker_type() == WorkerType::Regular
-        && *worker.connection_mode() == ConnectionMode::Http
 }
 
 /// One dispatch attempt of a typed request: the inputs every stage of
@@ -183,8 +173,11 @@ struct TypedAttempt<'a, T> {
     rid: Option<&'a str>,
 }
 
-/// The regular HTTP router places typed requests through its host or its
-/// injected load balancing policies.
+/// The regular HTTP router places typed requests and multipart transcriptions
+/// through its host or its injected load balancing policies.
+///
+/// Proxied GETs and realtime sessions pick their worker by no routing
+/// policy: they read the worker registry directly, with a host or without.
 pub struct Router {
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
@@ -391,17 +384,12 @@ impl Router {
     ///
     /// Uses the shared [`WorkerSelector`] (least-loaded) filtered to regular
     /// HTTP workers advertising the `realtime` label, so realtime traffic
-    /// never lands on a worker that can't serve it. Under the policy
-    /// controller's host every realtime route is refused by name here: the
-    /// selector asks no controller and takes no lease.
+    /// never lands on a worker that can't serve it.
     async fn select_realtime_worker(
         &self,
         model_id: &str,
         headers: Option<&HeaderMap>,
     ) -> Result<Arc<dyn Worker>, Response> {
-        if self.host.is_some() {
-            return Err(policy_controller::refused("a realtime request"));
-        }
         WorkerSelector::new(&self.worker_registry)
             .select_worker(&SelectWorkerRequest {
                 model_id,
@@ -803,16 +791,16 @@ impl Router {
             None => response,
             Some(placed) if head_success_recorded => placed.held_to_the_end_of(response),
             Some(placed) => {
-                let answered = response.extensions().get::<UpstreamAnswer>().is_some();
-                placed.ended(response.status(), answered, Instant::now());
+                placed.ended_by(&response, Instant::now());
                 response
             }
         }
     }
 
-    /// Resolve an unnamed request to the one model this router's workers
-    /// serve. Use the no-model id when no worker has a model, and return
-    /// `None` when the workers serve several distinct models.
+    /// Resolve an unnamed request to the one primary model this router's
+    /// workers serve: the model a worker answers an unnamed request under.
+    /// Use the no-model id when no worker has a model, and return `None`
+    /// when the workers' primary models differ.
     fn model_of_an_unnamed_request(&self) -> Option<String> {
         let pool = self
             .worker_registry
@@ -827,7 +815,9 @@ impl Router {
 
     /// The attempt's placement by the policy controller, or the answer of a
     /// request it did not place. The commit keeps to this router's own pool
-    /// ([`regular_http`]) and to the workers the request's ledger admits: a
+    /// ([`RoutingPool::HttpRegular`]): the router sends plain HTTP to a
+    /// regular worker's URL, so a target of another wire or role is passed
+    /// over. It also keeps to the workers the request's ledger admits: a
     /// worker that answered the request definitively takes no later attempt,
     /// as on the classic arm. The controller reads the tried rows softly, so
     /// the rule is held here.
@@ -862,19 +852,17 @@ impl Router {
         let id = host::mark();
         let tried = attempt.tried_rows.lock().clone();
         let ask = Ask {
-            id: &id,
-            model: &model,
             streaming: attempt.is_stream,
             headers: attempt.headers,
             rid: attempt.rid,
             tried: &tried,
-            hashes: None,
+            ..Ask::of(&id, &model)
         };
         let ledger = attempt.ledger;
         let placed = host
             .place_where(
                 &ask,
-                |worker| regular_http(worker) && ledger.admits(worker),
+                |worker| RoutingPool::HttpRegular.matches(worker) && ledger.admits(worker),
                 Instant::now(),
             )
             .await;
@@ -1003,9 +991,8 @@ impl Router {
         }
         .emit();
         let raw_body_len = header_utils::content_length(headers);
-        let mut headers_with_trace = headers.cloned().unwrap_or_default();
-        inject_trace_context_http(&mut headers_with_trace);
-        let headers = Some(&headers_with_trace);
+        let headers_with_trace = with_trace_context_http(headers);
+        let headers = Some(&*headers_with_trace);
 
         let mode = Self::relay_mode_for_attempt(attempt);
         match Self::serialize_attempt_body(
@@ -1281,7 +1268,9 @@ impl Router {
     /// its dispatch-time overload re-check, the form's send and the relay of
     /// the worker's answer. Separate from `route_typed_request` because the
     /// endpoint is not JSON-bodied: the form is sent once (no retry could
-    /// replay it) and never passes through `prepare_request`.
+    /// replay it) and never passes through `prepare_request`. Under the
+    /// policy controller's host the worker is the host's placement, with no
+    /// re-check, and a streamed answer carries it to the end of its body.
     async fn route_multipart_transcription(
         &self,
         headers: Option<&HeaderMap>,
@@ -1303,26 +1292,41 @@ impl Router {
         // exit below.
         let outcome = self.begin_route(route, model_id, is_stream);
 
-        let worker = match self.select_transcription_worker(headers, model_id, &routing) {
-            Ok(worker) => worker,
-            Err(refusal) => {
-                outcome.pre_send_error(&refusal);
-                return refusal;
-            }
-        };
+        let (worker, mut placed) = match &self.host {
+            None => {
+                let worker = match self.select_transcription_worker(headers, model_id, &routing) {
+                    Ok(worker) => worker,
+                    Err(refusal) => {
+                        outcome.pre_send_error(&refusal);
+                        return refusal;
+                    }
+                };
 
-        // Same dispatch-time re-check the regular path takes. A transcription
-        // occupies its worker for far longer than a chat completion, so a
-        // report landing in the selection→dispatch window is the one case where
-        // dispatching anyway is measurably worse.
-        if let Some(resp) = overload::shed_if_worker_overloaded(
-            worker.as_ref(),
-            model_id,
-            self.worker_registry.overload_shed_enabled(),
-        ) {
-            outcome.pre_send_error(&resp);
-            return resp;
-        }
+                // Same dispatch-time re-check the regular path takes. A transcription
+                // occupies its worker for far longer than a chat completion, so a
+                // report landing in the selection→dispatch window is the one case where
+                // dispatching anyway is measurably worse.
+                if let Some(resp) = overload::shed_if_worker_overloaded(
+                    worker.as_ref(),
+                    model_id,
+                    self.worker_registry.overload_shed_enabled(),
+                ) {
+                    outcome.pre_send_error(&resp);
+                    return resp;
+                }
+                (worker, None)
+            }
+            Some(host) => match self
+                .place_transcription(host, headers, body.rid(), model_id, is_stream)
+                .await
+            {
+                Ok(placed) => (Arc::clone(placed.worker()), Some(Sent::from(placed))),
+                Err(refusal) => {
+                    outcome.pre_send_error(&refusal);
+                    return refusal;
+                }
+            },
+        };
 
         // Streamed requests have no rid; the header is the whole sticky key.
         let load_guard = WorkerLoadGuard::with_key(
@@ -1338,11 +1342,19 @@ impl Router {
             route,
             canonical_model.as_deref(),
             &outcome,
+            placed.as_mut(),
         )
         .await
         {
             Ok(res) => res,
-            Err(response) => return response,
+            Err(response) => {
+                // A send that failed says so; a form that was never sent
+                // leaves the placement to its drop.
+                if let Some(placed) = placed {
+                    placed.ended(response.status(), false, Instant::now());
+                }
+                return response;
+            }
         };
 
         let status = res.status();
@@ -1351,7 +1363,7 @@ impl Router {
 
         events::RequestReceivedEvent {}.emit();
 
-        if is_stream {
+        let response = if is_stream {
             relay_transcription_stream(res, status, &worker, load_guard, outcome, start)
         } else {
             buffer_transcription_response(
@@ -1363,7 +1375,70 @@ impl Router {
                 start,
             )
             .await
+        };
+
+        match placed {
+            None => response,
+            Some(placed) if is_stream => placed.held_to_the_end_of(response),
+            Some(placed) => {
+                placed.ended(response.status(), true, Instant::now());
+                response
+            }
         }
+    }
+
+    /// A transcription's placement by the policy controller, or its refusal.
+    /// The route cannot pin a rank, so the commit passes over a data-parallel
+    /// worker, and it keeps to this router's own pool ([`RoutingPool::HttpRegular`]).
+    async fn place_transcription(
+        &self,
+        host: &Host,
+        headers: Option<&HeaderMap>,
+        rid: Option<&str>,
+        model_id: &str,
+        streaming: bool,
+    ) -> Result<Placed, Response> {
+        let pool = self
+            .worker_registry
+            .get_routing_pool(model_id, RoutingPool::HttpRegular);
+        if pool.is_empty() {
+            return Err(self.report_refusal(
+                TRANSCRIPTION_REFUSAL_SITE,
+                model_id,
+                error::model_not_found(model_id),
+            ));
+        }
+        if pool.iter().all(|worker| worker.is_dp_aware()) {
+            return Err(Self::transcription_dp_not_supported());
+        }
+
+        let id = host::mark();
+        let ask = Ask {
+            streaming,
+            headers,
+            rid,
+            ..Ask::of(&id, model_id)
+        };
+        host.place_where(
+            &ask,
+            |worker| RoutingPool::HttpRegular.matches(worker) && !worker.is_dp_aware(),
+            Instant::now(),
+        )
+        .await
+        .map_err(|unplaced| {
+            self.report_refusal(
+                TRANSCRIPTION_REFUSAL_SITE,
+                model_id,
+                unplaced.answer(model_id),
+            )
+        })
+    }
+
+    fn transcription_dp_not_supported() -> Response {
+        error::bad_request(
+            "dp_aware_not_supported",
+            "/v1/audio/transcriptions does not yet support DP-aware workers",
+        )
     }
 
     /// The worker of a transcription, or the refusal this router answers.
@@ -1380,15 +1455,12 @@ impl Router {
         model_id: &str,
         routing: &RoutingDerivatives,
     ) -> Result<Arc<dyn Worker>, Response> {
-        if self.host.is_some() {
-            return Err(policy_controller::refused("a transcription request"));
-        }
         let all_workers = self
             .worker_registry
             .get_routing_pool(model_id, RoutingPool::HttpRegular);
         if all_workers.is_empty() {
             return Err(self.report_refusal(
-                "Router::route_multipart_transcription",
+                TRANSCRIPTION_REFUSAL_SITE,
                 model_id,
                 error::model_not_found(model_id),
             ));
@@ -1399,10 +1471,7 @@ impl Router {
             .cloned()
             .collect();
         if non_dp_workers.is_empty() {
-            return Err(error::bad_request(
-                "dp_aware_not_supported",
-                "/v1/audio/transcriptions does not yet support DP-aware workers",
-            ));
+            return Err(Self::transcription_dp_not_supported());
         }
         let Some(worker) = placement::select_from(
             &self.worker_registry,
@@ -1443,11 +1512,7 @@ impl Router {
                     placement::no_available_workers(message)
                 }
             };
-            return Err(self.report_refusal(
-                "Router::route_multipart_transcription",
-                model_id,
-                resp,
-            ));
+            return Err(self.report_refusal(TRANSCRIPTION_REFUSAL_SITE, model_id, resp));
         };
         Ok(worker)
     }
@@ -1457,6 +1522,10 @@ impl Router {
     /// one send (the form's streamed body cannot be cloned, so the
     /// stale-connection retry never fires). A form the request cannot
     /// build or a send that fails is the finalized error answer.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the form inputs and the dispatch accounting are passed separately"
+    )]
     async fn send_transcription(
         headers: Option<&HeaderMap>,
         body: &TranscriptionRequest,
@@ -1465,6 +1534,7 @@ impl Router {
         route: &'static str,
         canonical_model: Option<&str>,
         outcome: &RouteOutcome<'_>,
+        placed: Option<&mut Sent>,
     ) -> Result<reqwest::Response, Response> {
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
         inject_trace_context_http(&mut headers_with_trace);
@@ -1496,6 +1566,9 @@ impl Router {
         );
 
         WorkerMetrics::record_worker_request(worker.url(), worker.model_id());
+        if let Some(placed) = placed {
+            placed.dispatched(Instant::now());
+        }
         match send_with_stale_conn_retry(request_builder).await {
             Ok(res) => Ok(res),
             Err(e) => {
@@ -1678,7 +1751,11 @@ impl Router {
                     mark_upstream_answer(&mut response);
                     response
                 }
-                Err(error_response) => error_response,
+                // The gateway's own answer, made behind the worker's head.
+                Err(mut error_response) => {
+                    error_response.extensions_mut().insert(BehindAnswer);
+                    error_response
+                }
             };
             header_utils::insert_routed_worker_id(
                 response.headers_mut(),
@@ -2388,7 +2465,13 @@ impl Router {
             policy_needs_text: self
                 .policy_registry
                 .any_policy_needs_request_text(Some(headers)),
-            model_ambiguous: self.worker_registry.model_count() > 1,
+            // A worker knows a model's canonical id alone, and only a body
+            // read here has an alias in it rewritten to that id.
+            model_ambiguous: self.worker_registry.model_count() > 1
+                || candidates.iter().any(|w| {
+                    let models = &w.metadata().spec.models;
+                    models.iter().any(|card| !card.aliases.is_empty())
+                }),
             worker_mutates_body: candidates.iter().any(|w| w.mutates_request()),
             wasm_request_hooks,
             content_length: header_utils::content_length(Some(headers)).map(|len| len as u64),
@@ -2459,7 +2542,9 @@ impl Router {
         // Guard the registration races the decision left open: a mutating
         // worker that joined after the fleet check must not receive an
         // unmutated stream, and a second model appearing re-opens
-        // wrong-model selection.
+        // wrong-model selection. An alias registered after the decision is
+        // not re-checked: the request named a name that did not exist when
+        // its path was decided.
         if worker.mutates_request() {
             Metrics::record_request_body_path(BODY_PATH_BUFFERED, REASON_WORKER_MUTATES_BODY);
             return Err(req);
@@ -4416,6 +4501,15 @@ mod tests {
             .build()
     }
 
+    /// A worker of one model that declares a second name for it.
+    fn aliased_worker(url: &str) -> BasicWorker {
+        BasicWorkerBuilder::new(url)
+            .worker_type(WorkerType::Regular)
+            .health_config(no_health_check())
+            .models(vec![ModelCard::new("model-a").with_alias("model-a-latest")])
+            .build()
+    }
+
     type CapturedUpstreamRequest = Arc<tokio::sync::Mutex<Option<(HeaderMap, Bytes)>>>;
 
     /// Loopback engine stub: captures the forwarded `/generate` request and
@@ -4593,6 +4687,22 @@ mod tests {
         assert_eq!(
             router.request_body_path(&headers_with_content_length(Some("64")), false),
             BodyPath::Stream(REASON_RETRY_FORFEITED)
+        );
+    }
+
+    /// A lone model under an alias buffers: a body may name the alias, and
+    /// the worker knows the canonical id alone.
+    #[test]
+    fn an_aliased_lone_model_decides_buffer() {
+        let router = streaming_router(
+            least_load_policy(),
+            1024 * 1024,
+            vec![aliased_worker("http://worker1:8080")],
+        );
+        assert_eq!(
+            router.request_body_path(&headers_with_content_length(Some("64")), false),
+            BodyPath::Buffer(REASON_MODEL_AMBIGUOUS),
+            "a body that may name an alias is read first"
         );
     }
 
@@ -4984,6 +5094,30 @@ mod tests {
             vec![plain_worker("http://worker1:8080")],
         );
         assert_falls_back_with_body_intact(&router).await;
+    }
+
+    /// The streamed path forwards a body unread, the name it gives the model
+    /// included: a request to a lone model under an alias goes back to the
+    /// buffered path, which sends the worker the canonical id.
+    #[tokio::test]
+    async fn a_body_that_may_name_an_alias_is_not_streamed_to_the_worker() {
+        let (url, captured) = spawn_capture_stub("application/json", r#"{"text":"ok"}"#).await;
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![aliased_worker(&url)]);
+
+        let handed_back = router
+            .route_streaming_request(
+                streamed_request(&[b"{\"model\":\"model-a-latest\",\"text\":\"hello\"}"]),
+                "/generate",
+                false,
+            )
+            .await;
+
+        let sent = captured.lock().await.take().map(|(_, body)| body);
+        assert_eq!(
+            sent, None,
+            "the worker was sent the alias: a body that may name an alias is read first"
+        );
+        assert!(handed_back.is_err());
     }
 
     fn with_header(mut req: Request<Body>, name: &'static str, value: &str) -> Request<Body> {
@@ -7459,3 +7593,7 @@ mod upstream_span_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[expect(clippy::print_stdout, reason = "a recorder says where its sheet went")]
+mod classic_rank_rows;

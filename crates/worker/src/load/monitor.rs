@@ -950,15 +950,16 @@ impl<G: Generation> WorkerMonitor<G> {
     /// written there, so no record and no eviction runs between a poll's
     /// series and its row, which the sentinel's guard reads. The series
     /// are written behind the publish's own fence, read under the hold:
-    /// an answer for a worker that left during the fetch writes none, and
-    /// the sentinel of its eviction stands.
+    /// an answer for a worker that left during the fetch writes none. A
+    /// row the publish takes from a worker that left ends under the same
+    /// hold ([`Self::publish_rows`]).
     fn publish_polled(
         &self,
         model_id: &str,
         polled_urls: &[String],
         group_loads: Vec<(Arc<dyn Worker>, WorkerLoadResponse, bool)>,
     ) {
-        let _reports = self.pushed_reports.lock();
+        let reports = self.pushed_reports.lock();
         // Every successful load poll is also the canonical observability
         // sample. Load-aware policies already require this poll; the
         // explicit engine-metrics option only forces polling when routing
@@ -980,7 +981,27 @@ impl<G: Generation> WorkerMonitor<G> {
             .into_iter()
             .map(|(worker, load, _)| (worker, Arc::new(load)))
             .collect();
-        self.load_state.publish_group(polled_urls, fresh);
+        self.publish_rows(&reports, polled_urls, fresh);
+    }
+
+    /// Publish rows, and end each row the publish took away from a worker
+    /// that is not its URL's `Ready` worker: a row that went under its
+    /// successor's, or one a tick pruned behind its worker's leave. That
+    /// worker's eviction finds no row of its own, so its batch can name no
+    /// rank the row held past the worker's width, or finds no row at the
+    /// URL and writes nothing. The row's series end here instead, but for
+    /// the ones a live writer writes ([`Self::clear_series`]). A row taken
+    /// from the URL's `Ready` worker, whose fetch failed this tick, ends
+    /// nothing. `reports` is the locked map of the pushed reports.
+    fn publish_rows(
+        &self,
+        reports: &FxHashMap<String, PushedFile>,
+        group_urls: &[String],
+        fresh: Vec<(Arc<dyn Worker>, Arc<WorkerLoadResponse>)>,
+    ) {
+        for (worker, row) in self.load_state.publish_group(group_urls, fresh) {
+            self.clear_series(reports, &worker, Some(&row));
+        }
     }
 
     /// One engine's answer of a tick, reconciled with what its members'
@@ -1183,9 +1204,10 @@ impl<G: Generation> WorkerMonitor<G> {
         }
         if !fresh.is_empty() {
             // No URL is pruned. A report the fence admits overwrites its
-            // worker's row. A refused one leaves the row to the eviction,
-            // which writes the sentinel of the series with it.
-            self.load_state.publish_group(&[], fresh);
+            // worker's row, and a row of another worker it overwrites ends
+            // there. A refused one leaves the row to the eviction, which
+            // writes the sentinel of the series with it.
+            self.publish_rows(&reports, &[], fresh);
         }
         if !held.is_empty() {
             // Under the hold of the reports still: no record has queued
@@ -1543,9 +1565,9 @@ impl<G: Generation> WorkerMonitor<G> {
     /// every series is written under that lock, so a sentinel and a live
     /// write do not cross. `ended` is what ends with the worker's feed,
     /// where there is one: the report an eviction or a successor's first
-    /// record took off the file, or the load of the row the batch removed.
-    /// The sentinel covers the worker's own width and each rank it held
-    /// past that.
+    /// record took off the file, or the load of the row the batch removed
+    /// or a publish took away. The sentinel covers the worker's own width
+    /// and each rank it held past that.
     fn clear_series(
         &self,
         reports: &FxHashMap<String, PushedFile>,
@@ -2293,7 +2315,7 @@ async fn poll_group_once<G: Generation>(
 
     if group_loads.is_empty() {
         debug!("No loads fetched for group {group_key}, pruning stale entries");
-        monitor.load_state.publish_group(&polled_urls, Vec::new());
+        monitor.publish_polled(&group_key.model_id, &polled_urls, Vec::new());
         return;
     }
 

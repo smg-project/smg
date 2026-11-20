@@ -245,6 +245,7 @@ fn an_encode_pair_decision_allocates_nothing_after_its_first_32() {
                     facts: &of_encoders,
                     prefill_classes: &prefill_classes,
                     affinity: &[],
+                    ..EncodePool::default()
                 };
                 let pool_facts = PoolFacts {
                     pool_size: n,

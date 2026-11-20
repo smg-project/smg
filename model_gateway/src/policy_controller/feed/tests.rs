@@ -1,4 +1,5 @@
-//! Cases of the gateway's membership feed.
+//! Cases of the gateway's membership feed, its load sink and its
+//! publication loop.
 
 use std::{
     error::Error,
@@ -9,16 +10,29 @@ use std::{
         Arc, OnceLock, Weak,
     },
     task::{Context, Poll, Wake, Waker},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
+use openai_protocol::model_card::ModelCard;
 use parking_lot::Mutex;
 use smg_policy_controller::{
-    store::{HealthPolicy, Maker, MemoryStore, WorkerFacts, WorkersStore},
+    store::{
+        Ask as ViewAsk, GatewayId, HealthPolicy, LoadSink as StoreLoadSink, Maker, MemoryStore,
+        Overload, ViewBuffers, WorkerFacts, WorkerStatus as RowStatus, WorkersStore,
+        PUBLISH_WINDOW,
+    },
     view::{Role, WireModes, WorkerId},
     worker_host::{Expect, Membership, Refused, Remover, Standing, StoreDoor, Wrote},
 };
-use smg_worker::{connection::engine::EngineConnector, registry::event::WorkerEvent};
+use smg_worker::{
+    connection::engine::EngineConnector,
+    health::port::{HealthSink, ProbeAnswer},
+    identity::basic::Worker,
+    load::port::{LoadSink, PollMode, PolledMember},
+    registry::event::WorkerEvent,
+    worker::{SchedulerLoadSnapshot, WorkerLoadResponse, WorkerStatus},
+};
+use tokio::{task::yield_now, time::sleep_until};
 
 use super::{feed, Feed, FeedDoor};
 use crate::{
@@ -27,7 +41,10 @@ use crate::{
         host::{Ask, Host, Unplaced},
         start,
     },
-    routers::{common::snapshot::WorkerRegistry, grpc::backend_client::BackendConnector},
+    routers::{
+        common::snapshot::WorkerRegistry,
+        grpc::backend_client::{BackendConnector, BasicWorkerBuilder},
+    },
 };
 
 const URL: &str = "http://worker:8000";
@@ -57,9 +74,25 @@ fn stated() -> WorkerFacts {
 }
 
 fn register(door: &dyn Membership) -> Result<WorkerId, String> {
-    match door.found(&Maker::Control, Expect::Nothing, URL, &|_| stated()) {
+    register_with(door, stated)
+}
+
+fn register_with(door: &dyn Membership, facts: fn() -> WorkerFacts) -> Result<WorkerId, String> {
+    match door.found(&Maker::Control, Expect::Nothing, URL, &|_| facts()) {
         Ok(Wrote::Registered(id)) => Ok(id),
         other => Err(format!("expected a registration, got {other:?}")),
+    }
+}
+
+fn probed() -> WorkerFacts {
+    WorkerFacts {
+        health: HealthPolicy {
+            failure_threshold: 2,
+            success_threshold: 2,
+            probes: true,
+            ..HealthPolicy::default()
+        },
+        ..stated()
     }
 }
 
@@ -107,6 +140,157 @@ async fn a_written_row_is_in_force_for_the_next_decision() {
         .await
         .expect("the next decision picks the worker");
     assert_eq!(placed.id(), row);
+}
+
+#[tokio::test]
+async fn a_failed_probe_is_written_on_the_row_and_the_object_mirrors_it() {
+    let store = start_store().expect("the store starts");
+    let (registry, feed) = bed(&store);
+    let host = Host::new(Arc::clone(&store), Arc::clone(&feed.objects));
+    let row = register_with(&*feed.door, probed).expect("the worker registers");
+    let object = feed.objects.object(row).expect("the row has an object");
+    let worker = registry.get(&object).expect("the worker stands");
+    let revision = worker.revision();
+    let sink = feed.health_sink();
+
+    let assert_statuses = |row_status, object_status| {
+        assert_eq!(store.by_key(URL).map(|row| row.status), Some(row_status));
+        assert_eq!(worker.status(), object_status);
+    };
+    assert_statuses(RowStatus::Pending, WorkerStatus::Pending);
+    assert_eq!(
+        sink.connected(&object, revision),
+        Some((WorkerStatus::Pending, WorkerStatus::Ready))
+    );
+    assert_statuses(RowStatus::Ready, WorkerStatus::Ready);
+    let placed = host
+        .place(&ask(b"first"), Instant::now())
+        .await
+        .expect("the ready row takes a decision");
+    assert_eq!(placed.id(), row);
+    drop(placed);
+
+    let probe = |passed, launched| sink.probe_outcome(&object, passed, revision, launched);
+    assert_eq!(
+        probe(false, WorkerStatus::Ready),
+        ProbeAnswer::Stood(WorkerStatus::Ready)
+    );
+    assert_statuses(RowStatus::Ready, WorkerStatus::Ready);
+    assert_eq!(
+        probe(false, WorkerStatus::Ready),
+        ProbeAnswer::Moved {
+            old: WorkerStatus::Ready,
+            new: WorkerStatus::NotReady
+        }
+    );
+    assert_statuses(RowStatus::NotReady, WorkerStatus::NotReady);
+    assert!(matches!(
+        host.ask(&ask(b"down"), &[], Instant::now()).await,
+        Err(Unplaced::Shed { .. })
+    ));
+
+    assert_eq!(
+        probe(true, WorkerStatus::NotReady),
+        ProbeAnswer::Stood(WorkerStatus::NotReady)
+    );
+    assert_statuses(RowStatus::NotReady, WorkerStatus::NotReady);
+    assert_eq!(
+        probe(true, WorkerStatus::NotReady),
+        ProbeAnswer::Moved {
+            old: WorkerStatus::NotReady,
+            new: WorkerStatus::Ready
+        }
+    );
+    assert_statuses(RowStatus::Ready, WorkerStatus::Ready);
+    let placed = host
+        .place(&ask(b"back"), Instant::now())
+        .await
+        .expect("the recovered row takes a decision");
+    assert_eq!(placed.id(), row);
+}
+
+#[test]
+fn a_worker_with_no_row_keeps_the_registrys_health() {
+    let store = Arc::new(MemoryStore::default());
+    let (registry, feed) = bed(&store);
+    let classic = WorkerRegistry::new();
+    let pending = || -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(URL)
+                .status(WorkerStatus::Pending)
+                .build(),
+        )
+    };
+    let (worker, reference) = (pending(), pending());
+    let id = registry
+        .register(Arc::clone(&worker))
+        .expect("a worker without a row");
+    let reference_id = classic
+        .register(Arc::clone(&reference))
+        .expect("a classic worker");
+    let epoch = store.epoch();
+    let sink = feed.health_sink();
+
+    assert_eq!(
+        sink.connected(&id, worker.revision()),
+        classic.connected(&reference_id, reference.revision())
+    );
+    assert_eq!(worker.status(), WorkerStatus::Ready);
+    for _ in 0..2 {
+        assert_eq!(
+            sink.probe_outcome(&id, true, worker.revision(), WorkerStatus::Ready),
+            classic.probe_outcome(
+                &reference_id,
+                true,
+                reference.revision(),
+                WorkerStatus::Ready
+            )
+        );
+        assert_eq!(worker.status(), reference.status());
+    }
+    assert!(store.snapshot().1.is_empty());
+    assert_eq!(store.epoch(), epoch);
+}
+
+#[test]
+fn a_rows_object_takes_no_step_of_the_registrys_own() {
+    let store = Arc::new(MemoryStore::default());
+    let (registry, feed) = bed(&store);
+    let row = register_with(&*feed.door, probed).expect("the worker registers");
+    let object = feed.objects.object(row).expect("the row has an object");
+    let worker = registry.get(&object).expect("the worker stands");
+    let pass = |sink: &dyn HealthSink| {
+        sink.probe_outcome(&object, true, worker.revision(), WorkerStatus::Pending)
+    };
+
+    // Leave the object one pass short of ready while the row has counted none.
+    assert_eq!(
+        pass(registry.as_ref()),
+        ProbeAnswer::Stood(WorkerStatus::Pending)
+    );
+    assert_eq!(
+        pass(feed.health_sink().as_ref()),
+        ProbeAnswer::Stood(WorkerStatus::Pending)
+    );
+    assert_eq!(
+        store.by_key(URL).map(|row| row.status),
+        Some(RowStatus::Pending)
+    );
+    assert_eq!(worker.status(), WorkerStatus::Pending);
+    assert_eq!(
+        worker
+            .runtime_state()
+            .expect("the worker's state")
+            .total_pending_probes(),
+        1
+    );
+    assert_eq!(
+        pass(registry.as_ref()),
+        ProbeAnswer::Moved {
+            old: WorkerStatus::Pending,
+            new: WorkerStatus::Ready
+        }
+    );
 }
 
 #[test]
@@ -315,4 +499,243 @@ fn a_membership_write_holds_the_feed_turn_through_its_listener() {
     assert_eq!(door.drained(by, URL, seen), Ok(Wrote::Draining(row)));
     assert_eq!(door.gone(by, URL, seen), Ok(Wrote::Removed(row)));
     assert_eq!(calls.load(Ordering::Relaxed), 3);
+}
+
+/// The interval in which the cases' collector hears every ready rank.
+const PERIOD: Duration = Duration::from_secs(1);
+
+/// [`stated`] with a limit of five queued requests, at which the row is
+/// vetoed.
+fn limited() -> WorkerFacts {
+    WorkerFacts {
+        overload: Overload {
+            waiting_requests: Some(5),
+            ..Overload::default()
+        },
+        ..stated()
+    }
+}
+
+/// A report of rank zero with `queued` requests waiting.
+fn report(queued: i32) -> WorkerLoadResponse {
+    WorkerLoadResponse {
+        dp_rank_count: 1,
+        loads: vec![SchedulerLoadSnapshot {
+            num_waiting_reqs: queued,
+            ..SchedulerLoadSnapshot::default()
+        }],
+        ..WorkerLoadResponse::default()
+    }
+}
+
+/// A started store with one row under [`limited`], the row's worker
+/// object, and the feed's load sink.
+struct Loads {
+    store: Arc<MemoryStore>,
+    registry: Arc<WorkerRegistry>,
+    feed: Feed,
+    row: WorkerId,
+    worker: Arc<dyn Worker>,
+    sink: Arc<dyn LoadSink>,
+}
+
+impl Loads {
+    fn new() -> Result<Self, Box<dyn Error>> {
+        let store = start_store()?;
+        let (registry, feed) = bed(&store);
+        let row = register_with(&*feed.door, limited)?;
+        let worker = registry
+            .get_by_url(URL)
+            .ok_or("the registry holds no worker of the row")?;
+        Ok(Self {
+            sink: feed.load_sink(PERIOD),
+            store,
+            registry,
+            feed,
+            row,
+            worker,
+        })
+    }
+
+    /// Say a pushed record of `queued` waiting requests, received at `at`.
+    fn pushed(&self, queued: i32, at: Instant) {
+        self.sink.record(&self.worker, 0, &report(queued), at, at);
+    }
+
+    /// The row's overload bit in the view a decision is handed. `None`
+    /// where the view lists no such row.
+    fn vetoed(&self) -> Option<bool> {
+        let mut view = ViewBuffers::default();
+        let ask = ViewAsk {
+            gateway: GatewayId::LOCAL,
+            now: Instant::now(),
+            pinned: None,
+            affinity: false,
+        };
+        self.store
+            .build_view(MODEL, Role::Single, &ask, &mut view)?;
+        let row = view.candidates.iter().find(|row| row.id == self.row)?;
+        Some(row.health.overloaded)
+    }
+}
+
+#[test]
+fn a_pushed_record_is_written_on_the_row_and_a_decision_reads_it() {
+    let loads = Loads::new().expect("the bed stands");
+    assert_eq!(loads.vetoed(), Some(false));
+    loads.pushed(6, Instant::now());
+    let sample = StoreLoadSink::load(&*loads.store, loads.row, 0).expect("the row holds a sample");
+    assert_eq!(sample.row.queued, 6);
+    // No window stood open, so the store showed the record by itself.
+    assert_eq!(loads.vetoed(), Some(true));
+}
+
+#[test]
+fn a_worker_with_no_row_writes_no_load() {
+    let loads = Loads::new().expect("the bed stands");
+    let stranger: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("http://stranger:8000")
+            .model(ModelCard::new(MODEL))
+            .status(WorkerStatus::Ready)
+            .build(),
+    );
+    loads
+        .registry
+        .register(Arc::clone(&stranger))
+        .expect("the worker registers");
+    let shown = loads.store.world();
+    let now = Instant::now();
+    let answer = report(6);
+    loads.sink.record(&stranger, 0, &answer, now, now);
+    let polled = [PolledMember {
+        worker: &stranger,
+        answer: Some(&answer),
+        on_file: None,
+    }];
+    assert!(loads.sink.report(&polled, now).newer.is_empty());
+    // A worker with no row is not asked either.
+    assert_eq!(
+        loads.sink.poll_mode(&stranger, now, PERIOD),
+        PollMode::Suppressed
+    );
+    assert_eq!(StoreLoadSink::ranks(&*loads.store, loads.row), 0);
+    assert_eq!(loads.store.publish_due(), None);
+    assert!(Arc::ptr_eq(&shown, &loads.store.world()));
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_loop_shows_a_waiting_write_at_its_due_instant() {
+    let loads = Loads::new().expect("the bed stands");
+    let _publications = loads.feed.publications();
+    let now = Instant::now();
+    // The first record opens the store's window and is shown by itself.
+    loads.pushed(6, now);
+    assert_eq!(loads.vetoed(), Some(true));
+    // The loop reads no instant and waits for a wake.
+    yield_now().await;
+    // The second record lands inside the window, so it waits.
+    loads.pushed(0, now + PUBLISH_WINDOW / 4);
+    assert_eq!(loads.vetoed(), Some(true));
+    // No later write comes: the loop shows it when the window ends.
+    sleep_until((now + 2 * PUBLISH_WINDOW).into()).await;
+    assert_eq!(loads.vetoed(), Some(false));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_forgotten_workers_eviction_is_shown_by_the_loop() {
+    let loads = Loads::new().expect("the bed stands");
+    let _publications = loads.feed.publications();
+    let now = Instant::now();
+    loads.pushed(6, now);
+    assert_eq!(loads.vetoed(), Some(true));
+    yield_now().await;
+    // The collector forgets a worker that left `Ready`. The store judges
+    // its engine again and names no instant, so the verdict waits.
+    loads.sink.forget(&loads.worker);
+    assert_eq!(loads.vetoed(), Some(true));
+    sleep_until((now + 2 * PUBLISH_WINDOW).into()).await;
+    assert_eq!(loads.vetoed(), Some(false));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_resets_eviction_is_shown_by_the_loop() {
+    let loads = Loads::new().expect("the bed stands");
+    let _publications = loads.feed.publications();
+    let now = Instant::now();
+    loads.pushed(6, now);
+    yield_now().await;
+    // The row left `Ready`. The collector lost the event, and resets.
+    let row = WorkersStore::get(&*loads.store, loads.row).expect("the row");
+    loads
+        .store
+        .set_status(loads.row, RowStatus::NotReady, row.revision)
+        .expect("the row stands");
+    loads.sink.reset();
+    assert_eq!(StoreLoadSink::ranks(&*loads.store, loads.row), 0);
+    assert!(loads.store.publish_due().is_some());
+    sleep_until((now + 2 * PUBLISH_WINDOW).into()).await;
+    assert_eq!(loads.store.publish_due(), None);
+}
+
+/// What the registry's listener reads on the thread that lays a row's
+/// object: whether the feed's turn is held, and the members a decision
+/// sees.
+struct AtObject {
+    feed: Feed,
+    read: OnceLock<(bool, Option<usize>)>,
+}
+
+impl Wake for AtObject {
+    fn wake(self: Arc<Self>) {
+        self.read.get_or_init(|| {
+            (
+                self.feed.turn.try_lock().is_none(),
+                self.feed.store.world().members(MODEL, Role::Single),
+            )
+        });
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_loop_settles_a_row_written_past_the_door_under_the_feeds_turn() {
+    let store = start_store().expect("the store starts");
+    let (registry, feed) = bed(&store);
+    let _publications = feed.publications();
+    // The loop reads no instant and waits for a wake.
+    yield_now().await;
+    let at_object = Arc::new(AtObject {
+        feed: feed.clone(),
+        read: OnceLock::new(),
+    });
+    let waker = Waker::from(Arc::clone(&at_object));
+    let mut events = registry.subscribe_events();
+    let mut event = pin!(events.recv());
+    assert!(event
+        .as_mut()
+        .poll(&mut Context::from_waker(&waker))
+        .is_pending());
+
+    // A write past the door leaves a build owed, and the store wakes the
+    // loop. No load is written, and nobody settles.
+    store.upsert(stated());
+    assert!(registry.get_by_url(URL).is_none());
+    sleep_until((Instant::now() + PUBLISH_WINDOW).into()).await;
+    // The loop laid the object under the turn, then showed the row.
+    assert_eq!(at_object.read.get(), Some(&(true, None)));
+    assert!(registry.get_by_url(URL).is_some());
+    assert_eq!(store.world().members(MODEL, Role::Single), Some(1));
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_loop_ends_when_its_answer_is_dropped() {
+    let loads = Loads::new().expect("the bed stands");
+    let publications = loads.feed.publications();
+    yield_now().await;
+    drop(publications);
+    let now = Instant::now();
+    loads.pushed(6, now);
+    loads.pushed(0, now + PUBLISH_WINDOW / 4);
+    sleep_until((now + 2 * PUBLISH_WINDOW).into()).await;
+    // The second record still waits: nobody shows it.
+    assert_eq!(loads.vetoed(), Some(true));
 }

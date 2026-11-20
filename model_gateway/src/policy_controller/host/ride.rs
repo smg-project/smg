@@ -12,15 +12,26 @@ use std::{
     time::Instant,
 };
 
-use axum::{
-    body::{Body, BodyDataStream},
-    http::StatusCode,
-    response::Response,
-};
-use futures_util::Stream;
+use axum::{body::Body, http::StatusCode, response::Response};
+use bytes::Bytes;
+use http_body::{Body as _, Frame, SizeHint};
 use smg_policy_controller::lease::TransportClass;
 
 use super::{transport_class, End, Placed};
+use crate::{middleware::metrics::BodyProgress, routers::common::attempt_ledger::UpstreamAnswer};
+
+/// Response extension: the gateway made this answer behind the worker's own
+/// head: a body cut short, one over the limit, or a read past the request's
+/// time. The worker was reached, so the end is not a failed connection.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BehindAnswer;
+
+/// Whether the worker answered `response`'s request, whole or its head
+/// alone.
+fn answered(response: &Response) -> bool {
+    let marks = response.extensions();
+    marks.get::<UpstreamAnswer>().is_some() || marks.get::<BehindAnswer>().is_some()
+}
 
 /// A placement with what the regular HTTP router alone knows of its send:
 /// the instant, and the mark its streamed answer's relay writes at a cut.
@@ -75,6 +86,13 @@ impl Sent {
         self.end(status, transport_class(status, answered), None, now);
     }
 
+    /// The request ended with the whole answer `response` at `now`. Its
+    /// marks say whether the worker answered: its own answer, or one the
+    /// gateway made behind the worker's head ([`BehindAnswer`]).
+    pub(crate) fn ended_by(self, response: &Response, now: Instant) {
+        self.ended(response.status(), answered(response), now);
+    }
+
     /// Say the placement's end where it was sent.
     fn end(
         mut self,
@@ -89,18 +107,46 @@ impl Sent {
         }
     }
 
-    /// `response` with this placement held to the end of its body. The
-    /// stream reports at EOF, using the time of the first data frame, or at
-    /// the body's error frame. A body dropped before either is cancelled.
+    /// `response` with this placement held to the end of its body. The body
+    /// reports once: when it has gone out in full, or at its error frame. A
+    /// body dropped before either is cancelled. A response with nothing to
+    /// send has gone out in full at its head, where a server asks its body
+    /// for no frame: its lease ends here, as the answer it was.
     pub(crate) fn held_to_the_end_of(self, response: Response) -> Response {
+        let progress = BodyProgress::new(&response);
+        let status = response.status();
+        if declares_no_body(status) || progress.out_in_full(response.body().is_end_stream()) {
+            let class = class_at_the_end(false, self.cut(), status);
+            self.end(status, class, None, Instant::now());
+            return response;
+        }
         let (parts, body) = response.into_parts();
-        let body = Body::from_stream(Ride {
+        let body = Body::new(Ride {
             sent: Some(self),
-            inner: body.into_data_stream(),
-            status: parts.status,
+            inner: body,
+            status,
             first: None,
+            progress,
         });
         Response::from_parts(parts, body)
+    }
+}
+
+/// Whether a server writes no body under `status`, whatever the response
+/// holds: an informational status, 204 and 304.
+fn declares_no_body(status: StatusCode) -> bool {
+    status.is_informational() || matches!(status, StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED)
+}
+
+/// The class of a body's end. Where the relay marked a cut, the cut's
+/// status decides, whether the body then ended cleanly or with an error
+/// frame. Else a whole body ends by its head's status and a failed one as a
+/// server error.
+fn class_at_the_end(failed: bool, cut: Option<StatusCode>, status: StatusCode) -> TransportClass {
+    match (cut, failed) {
+        (Some(cut), _) => transport_class(cut, true),
+        (None, false) => transport_class(status, true),
+        (None, true) => TransportClass::ServerError,
     }
 }
 
@@ -109,39 +155,59 @@ impl Sent {
 /// placement and the load guard together as [`Held`](super::Held).
 ///
 /// The placement drops before the body and its guard. A dispatched
-/// placement reports once: at EOF, by the head's status or by the cut the
-/// relay marked, or at an error frame, where a server drops the body and
-/// polls no further. On an early drop the handle reports the cancellation.
-/// The stream reads the frame results without reading their bytes.
+/// placement reports once: when the body has gone out in full, or at an
+/// error frame, where a server drops the body and polls no further. A body
+/// has gone out in full by the edge body's rule ([`BodyProgress`]): at its
+/// last frame, or once its data adds up to the length the response
+/// declared, since an HTTP/1.1 server asks for no frame after that. On an
+/// early drop the handle reports the cancellation. The body reads each
+/// frame's length and none of its bytes. A response with nothing to send
+/// gets no such body: its lease ended at its head.
 struct Ride {
     sent: Option<Sent>,
-    inner: BodyDataStream,
+    inner: Body,
     status: StatusCode,
     first: Option<Instant>,
+    progress: BodyProgress,
 }
 
-impl Stream for Ride {
-    type Item = <BodyDataStream as Stream>::Item;
+impl http_body::Body for Ride {
+    type Data = Bytes;
+    type Error = axum::Error;
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
         let this = self.get_mut();
-        let next = Pin::new(&mut this.inner).poll_next(cx);
-        let class = match &next {
-            Poll::Ready(Some(Ok(_))) => {
-                this.first.get_or_insert_with(Instant::now);
-                return next;
-            }
-            Poll::Ready(Some(Err(_))) => TransportClass::ServerError,
-            Poll::Ready(None) => {
-                let cut = this.sent.as_ref().and_then(Sent::cut);
-                transport_class(cut.unwrap_or(this.status), true)
-            }
+        let next = Pin::new(&mut this.inner).poll_frame(cx);
+        let failed = match &next {
             Poll::Pending => return next,
+            Poll::Ready(Some(Ok(frame))) => {
+                if frame.is_data() {
+                    this.first.get_or_insert_with(Instant::now);
+                }
+                if !this.progress.frame_out(frame, this.inner.is_end_stream()) {
+                    return next;
+                }
+                false
+            }
+            Poll::Ready(Some(Err(_))) => true,
+            Poll::Ready(None) => false,
         };
         if let Some(sent) = this.sent.take() {
+            let class = class_at_the_end(failed, sent.cut(), this.status);
             sent.end(this.status, class, this.first, Instant::now());
         }
         next
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
     }
 }
 
@@ -149,31 +215,71 @@ impl Stream for Ride {
 mod tests {
     use std::{io, time::Duration};
 
-    use bytes::Bytes;
-    use futures_util::{stream, StreamExt};
+    use futures_util::stream;
+    use http_body_util::BodyExt;
 
     use super::*;
 
     #[tokio::test]
-    async fn the_stream_times_its_first_data_frame_once() {
+    async fn the_body_times_its_first_data_frame_once() {
         let frames = [
             Err(io::Error::other("body failed")),
             Ok(Bytes::from_static(b"a")),
             Ok(Bytes::from_static(b"b")),
         ];
+        let response = Response::new(Body::from_stream(stream::iter(frames)));
         let mut ride = Ride {
             sent: None,
-            inner: Body::from_stream(stream::iter(frames)).into_data_stream(),
+            progress: BodyProgress::new(&response),
+            inner: response.into_body(),
             status: StatusCode::OK,
             first: None,
         };
-        assert!(matches!(ride.next().await, Some(Err(_))));
+        assert!(matches!(ride.frame().await, Some(Err(_))));
         assert_eq!(ride.first, None);
-        assert!(matches!(ride.next().await, Some(Ok(_))));
+        assert!(matches!(ride.frame().await, Some(Ok(_))));
         let first = ride.first.expect("the first frame was timed");
         let earlier = first - Duration::from_millis(1);
         ride.first = Some(earlier);
-        assert!(matches!(ride.next().await, Some(Ok(_))));
+        assert!(matches!(ride.frame().await, Some(Ok(_))));
         assert_eq!(ride.first, Some(earlier));
+    }
+
+    #[test]
+    fn an_answer_behind_the_workers_head_counts_as_answered() {
+        let marked = |mark: Option<bool>| {
+            let mut response = Response::new(Body::empty());
+            match mark {
+                Some(true) => drop(response.extensions_mut().insert(UpstreamAnswer)),
+                Some(false) => drop(response.extensions_mut().insert(BehindAnswer)),
+                None => {}
+            }
+            answered(&response)
+        };
+        assert_eq!(
+            [marked(None), marked(Some(true)), marked(Some(false))],
+            [false, true, true]
+        );
+    }
+
+    #[test]
+    fn a_cut_the_relay_marked_decides_the_class_of_either_end() {
+        use TransportClass::{Ok as Whole, ServerError, Timeout};
+        const OK: StatusCode = StatusCode::OK;
+        let cut = |status| Some(StatusCode::from_u16(status).expect("a status"));
+        for (failed, mark, class) in [
+            (false, None, Whole),
+            (true, None, ServerError),
+            (false, cut(502), ServerError),
+            (true, cut(502), ServerError),
+            (false, cut(504), Timeout),
+            (true, cut(504), Timeout),
+        ] {
+            assert_eq!(
+                class_at_the_end(failed, mark, OK),
+                class,
+                "{failed} {mark:?}"
+            );
+        }
     }
 }

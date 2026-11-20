@@ -7,7 +7,7 @@ use std::{collections::BTreeSet, fs, path::Path};
 
 use serde_json::Value;
 use smg_policy_controller::{
-    spec::{MAX_BLOCK_HASHES, MAX_ENGINES, MAX_HEADERS, MAX_LABELS, MAX_ZONES},
+    spec::{MAX_BLOCK_HASHES, MAX_ENGINES, MAX_HEADERS, MAX_LABELS, MAX_SIGNALS, MAX_ZONES},
     Catalog, PolicySpec,
 };
 
@@ -99,20 +99,38 @@ fn the_committed_schema_admits_a_filter_by_its_name_and_by_its_name_with_paramet
         defs["ProfileSpec"]["properties"]["filter"]["items"]["$ref"],
         "#/$defs/FilterSpec"
     );
-    // A bare name is any string: a host adds names. A name with parameters
-    // is one key mapped to a map.
+    // A bare name is any string: a host adds names. A built-in with
+    // parameters has a schema of its own. A host's name with parameters
+    // is one key, no built-in's, mapped to a map.
     assert_eq!(
         defs["FilterSpec"]["anyOf"],
         serde_json::json!([
             { "type": "string" },
+            { "$ref": "#/$defs/FilterStage" },
             {
                 "type": "object",
                 "minProperties": 1,
                 "maxProperties": 1,
+                "propertyNames": { "not": { "const": "has-room" } },
                 "additionalProperties": { "type": "object" }
             }
         ])
     );
+    // The rule of `has-room`: its two required parts, no other key, and
+    // the names it may sum.
+    let rule = &defs["HasRoomParams"];
+    assert_eq!(rule["required"], serde_json::json!(["used", "capacity"]));
+    assert_eq!(rule["additionalProperties"], false);
+    let names = rule["properties"]["used"]["propertyNames"]["enum"]
+        .as_array()
+        .expect("the names the rule may sum");
+    for name in [
+        "load.resident_tokens",
+        "request.prompt_tokens",
+        "sent.tokens",
+    ] {
+        assert!(names.iter().any(|listed| listed == name), "{name}");
+    }
 }
 
 /// Every object schema under `root` either lists its properties and refuses
@@ -150,6 +168,7 @@ fn the_schema_names_every_section_and_refuses_unknown_properties() {
         "generation",
         "view",
         "index",
+        "signals",
         "profiles",
         "plans",
         "bindings",
@@ -271,5 +290,18 @@ fn the_schema_names_every_section_and_refuses_unknown_properties() {
     assert_eq!(
         field("ViewSpec", "max_block_hashes")["maximum"],
         MAX_BLOCK_HASHES
+    );
+    assert_eq!(field("SignalSpec", "max_age_ms")["minimum"], 1);
+    assert_eq!(field("SignalSpec", "max_age_ms")["maximum"], 3_599_999);
+    // A unit's length and its alphabet, as the validator takes them.
+    assert_eq!(field("SignalSpec", "unit")["minLength"], 1);
+    assert_eq!(field("SignalSpec", "unit")["maxLength"], 31);
+    assert_eq!(field("SignalSpec", "unit")["pattern"], "^[!-~]*$");
+    // A signal's name and the count of signals, as the validator takes them.
+    let signals = &root["properties"]["signals"];
+    assert_eq!(signals["maxProperties"], MAX_SIGNALS);
+    assert_eq!(
+        signals["propertyNames"]["pattern"],
+        "^[a-z][a-z0-9_]{0,62}$"
     );
 }

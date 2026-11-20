@@ -78,10 +78,16 @@ pub const ENTRIES: &[(&str, &str, Fate)] = &[
     ),
     ("LoadSink", "load", Fate::Read),
     ("LoadSink", "ranks", Fate::Read),
+    // The load adapter of a host with no standby is the one caller.
     (
         "LoadSink",
         "evict",
-        Fate::NotYet("no caller yet: its first caller brings its event"),
+        Fate::NotYet("the first host with a standby beside the load adapter brings its event"),
+    ),
+    (
+        "LoadSink",
+        "evict_unready",
+        Fate::Rebuilt("each replica's collector says its own reset, under its own lead"),
     ),
     ("LoadSink", "publish_due", Fate::Read),
     ("LoadSink", "publish", Fate::Rebuilt(PUBLISHED)),
@@ -116,6 +122,7 @@ pub const ENTRIES: &[(&str, &str, Fate)] = &[
     ("LeasesStore", "set_term", Fate::Journaled),
     ("LeasesStore", "issue", Fate::NotYet(PINS)),
     ("LeasesStore", "issue_pair", Fate::NotYet(PINS)),
+    ("LeasesStore", "issue_decode", Fate::NotYet(PINS)),
     ("LeasesStore", "dispatched", Fate::Rebuilt(DISPATCHED)),
     ("LeasesStore", "completed", Fate::NotYet(PINS)),
     ("LeasesStore", "released", Fate::NotYet(PINS)),

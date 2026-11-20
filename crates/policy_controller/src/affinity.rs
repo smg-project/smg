@@ -755,6 +755,7 @@ impl Scorer for PrefixAffinity {
             affinity: true,
             token_hashes: true,
             events: self.source != AffinitySource::Predictor,
+            sent_prefixes: placements,
             text: placements,
             text_hashes: placements,
             loads: self.gates.kv_configured(),

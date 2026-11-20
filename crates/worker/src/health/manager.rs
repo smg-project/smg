@@ -227,6 +227,26 @@ impl WorkerManager {
         health_checks_enabled: bool,
         zmq_transport_enabled: bool,
     ) -> Option<Self> {
+        let sink: Arc<dyn HealthSink> = registry.clone();
+        Self::maybe_start_with_sink(
+            registry,
+            sink,
+            config,
+            job_queue,
+            health_checks_enabled,
+            zmq_transport_enabled,
+        )
+    }
+
+    /// [`Self::maybe_start`] over the sink a host hands.
+    pub fn maybe_start_with_sink<G: Generation>(
+        registry: Arc<WorkerRegistry<G>>,
+        sink: Arc<dyn HealthSink>,
+        config: WorkerManagerConfig,
+        job_queue: Option<Arc<dyn WorkerJobs>>,
+        health_checks_enabled: bool,
+        zmq_transport_enabled: bool,
+    ) -> Option<Self> {
         if !health_checks_enabled
             && !zmq_transport_enabled
             && !registry.has_workers_awaiting_connect_signal()
@@ -238,7 +258,7 @@ impl WorkerManager {
             return None;
         }
         let default_check_interval_secs = config.default_check_interval_secs;
-        let manager = Self::start(registry, config, job_queue);
+        let manager = Self::start_with_sink(registry, sink, config, job_queue);
         debug!("Started WorkerManager loop with {default_check_interval_secs}s default interval");
         Some(manager)
     }
@@ -300,9 +320,10 @@ impl WorkerManager {
         reconcile_from_registry(&registry, &mut next_check, &config);
 
         // Drain the connect-readiness signal (workers wake us the instant
-        // their backend handshake lands). Taken once — a second manager on
-        // the same registry would simply run poll-only.
-        let connect_rx = registry.take_connect_signal_receiver();
+        // their backend handshake lands). One loop holds the receiver: a
+        // second manager on the same registry runs poll-only until the
+        // first ends and hands it back.
+        let signals = HeldSignals::take(&registry);
 
         #[expect(
             clippy::disallowed_methods,
@@ -313,7 +334,7 @@ impl WorkerManager {
                 registry,
                 sink,
                 events_rx,
-                connect_rx,
+                signals,
                 next_check,
                 config,
                 job_queue,
@@ -488,7 +509,7 @@ async fn run_health_loop<G: Generation>(
     registry: Arc<WorkerRegistry<G>>,
     sink: Arc<dyn HealthSink>,
     mut events_rx: broadcast::Receiver<WorkerEvent>,
-    mut connect_rx: Option<mpsc::UnboundedReceiver<WorkerConnected>>,
+    mut signals: HeldSignals<G>,
     mut next_check: HashMap<WorkerId, tokio::time::Instant>,
     config: WorkerManagerConfig,
     job_queue: Option<Arc<dyn WorkerJobs>>,
@@ -618,7 +639,7 @@ async fn run_health_loop<G: Generation>(
                 }
             }
             () = tokio::time::sleep_until(sleep_until) => {}
-            signal = recv_connect_signal(&mut connect_rx) => {
+            signal = signals.recv() => {
                 match signal {
                     Some(connected) => {
                         apply_connect_signal_and_refresh(
@@ -631,10 +652,11 @@ async fn run_health_loop<G: Generation>(
                         )
                         .await;
                     }
-                    // Every sender lives on the registry (Arc), so recv() only
-                    // returns None if the registry itself is gone. Drop the
-                    // branch so the loop stops polling a dead channel.
-                    None => connect_rx = None,
+                    // The registry holds a sender and this loop holds the
+                    // registry, so no loop meets a closed channel. One that
+                    // did would drop the receiver, not hand it back, and
+                    // the branch would lie dormant.
+                    None => signals.receiver = None,
                 }
             }
             event = events_rx.recv() => {
@@ -892,15 +914,48 @@ async fn apply_probe_completion<G: Generation>(
     answer
 }
 
-/// Await the next connect-readiness signal, or park forever when there is no
-/// receiver (health checks disabled, or a second manager already took it). The
-/// `pending()` arm keeps this `select!` branch dormant instead of busy-looping.
-async fn recv_connect_signal(
-    rx: &mut Option<mpsc::UnboundedReceiver<WorkerConnected>>,
-) -> Option<WorkerConnected> {
-    match rx {
-        Some(rx) => rx.recv().await,
-        None => std::future::pending().await,
+/// The registry's connect-signal receiver in one loop's hands. It goes back
+/// to the registry when the loop's task ends, by its return or by the abort
+/// at the manager's drop, with the signals no loop has read. So a host that
+/// runs one loop after another over a registry (one for each term of its
+/// lead) is signalled in each of them, not in the first alone.
+struct HeldSignals<G: Generation> {
+    registry: Arc<WorkerRegistry<G>>,
+    receiver: Option<mpsc::UnboundedReceiver<WorkerConnected>>,
+}
+
+impl<G: Generation> HeldSignals<G> {
+    /// The receiver where no other loop holds it. Else none yet:
+    /// [`Self::recv`] takes it when it comes back.
+    fn take(registry: &Arc<WorkerRegistry<G>>) -> Self {
+        Self {
+            registry: Arc::clone(registry),
+            receiver: registry.take_connect_signal_receiver(),
+        }
+    }
+
+    /// The next signal. A loop that holds no receiver waits here for the
+    /// loop that does to end, then takes it: the `select!` branch lies
+    /// dormant meanwhile and never spins. Cancel safe: a signal leaves the
+    /// channel only in the `recv` that returns it.
+    async fn recv(&mut self) -> Option<WorkerConnected> {
+        loop {
+            match &mut self.receiver {
+                Some(receiver) => return receiver.recv().await,
+                None => {
+                    self.registry.connect_signal_receiver_returned().await;
+                    self.receiver = self.registry.take_connect_signal_receiver();
+                }
+            }
+        }
+    }
+}
+
+impl<G: Generation> Drop for HeldSignals<G> {
+    fn drop(&mut self) {
+        if let Some(receiver) = self.receiver.take() {
+            self.registry.return_connect_signal_receiver(receiver);
+        }
     }
 }
 

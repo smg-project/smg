@@ -20,6 +20,633 @@ use crate::{
 
 const MODEL: &str = "m";
 
+mod sent_prefixes {
+    use std::{
+        sync::{atomic::Ordering, mpsc, Arc},
+        thread,
+        time::{Duration, Instant},
+    };
+
+    use super::*;
+    use crate::{
+        door::tests::sent_prefixes::{applied, merged, use_sent_prefixes},
+        predictor::Predictor,
+        spec::AffinitySource,
+        store::{
+            index::Predicted, Ask, GatewayId, Kinds, Named, Naming, Position, Reachability,
+            ViewBuffers,
+        },
+        view::{Role, WireModes},
+    };
+
+    type Case = Result<(), Box<dyn std::error::Error>>;
+    const HASHES: [u64; 4] = [1, 2, 3, 4];
+
+    fn plain(
+        store: &MemoryStore,
+        key: &str,
+        wires: WireModes,
+        reachable_from: Reachability,
+    ) -> WorkerId {
+        let id = store
+            .upsert(WorkerFacts {
+                signals: Signals::default(),
+                wire_modes: wires,
+                reachable_from,
+                ..publisher(key, &[MODEL])
+            })
+            .id();
+        store.publish_now();
+        id
+    }
+
+    fn publish(store: &MemoryStore, id: WorkerId) {
+        assert_eq!(
+            store.admit(id, 0, batch(1), &stored(None, &chain(&HASHES))),
+            BatchOutcome::Applied
+        );
+    }
+
+    fn record(store: &MemoryStore) -> Option<Arc<Predicted>> {
+        store.deciding(|world| world.standing(MODEL, Role::Single)?.predicted())
+    }
+
+    fn keys(hashes: &[u64]) -> Vec<u64> {
+        let mut keys = Vec::new();
+        Predictor::fold_into(&mut keys, 0, hashes);
+        keys
+    }
+
+    fn predicted(store: &MemoryStore, id: WorkerId) -> Option<()> {
+        record(store)?.record.write().sent(&keys(&HASHES), id, 0);
+        Some(())
+    }
+
+    fn named(
+        store: &MemoryStore,
+        wires: Option<WireModes>,
+        cap: u32,
+        seed: u64,
+    ) -> (Named, Vec<WorkerId>) {
+        named_from(store, GatewayId::LOCAL, wires, cap, seed)
+    }
+
+    fn named_from(
+        store: &MemoryStore,
+        gateway: GatewayId,
+        wires: Option<WireModes>,
+        cap: u32,
+        seed: u64,
+    ) -> (Named, Vec<WorkerId>) {
+        let mut named = Named::default();
+        let mut view = ViewBuffers::default();
+        store.deciding(|world| {
+            let now = Instant::now();
+            let ask = Ask {
+                gateway,
+                now,
+                pinned: None,
+                affinity: false,
+            };
+            world.build(MODEL, Role::Single, &ask, &mut view);
+            if let Some(wires) = wires {
+                view.candidates
+                    .retain(|row| row.wire_modes.intersects(wires));
+            }
+            let naming = Naming {
+                gateway: GatewayId::LOCAL,
+                block_hashes: &HASHES,
+                namespace_seed: 0,
+                seed,
+                cap,
+                wires,
+                now_micros: 0,
+            };
+            world.name(MODEL, Role::Single, &naming, &view.candidates, &mut named);
+        });
+        let ids = view.candidates.iter().map(|row| row.id).collect();
+        (named, ids)
+    }
+
+    #[test]
+    fn a_pool_where_every_row_has_events_reads_no_record() -> Case {
+        let store = MemoryStore::new();
+        admitted(&store, "a");
+        admitted(&store, "b");
+        store.apply(applied(&merged(1)?)?)?;
+        assert!(record(&store).is_none());
+        let (named, rows) = named(&store, None, 16, 7);
+        assert!(named.holders.is_empty());
+        assert!(named.keys.is_empty());
+        assert!(named.sent_pool().is_none());
+        store.deciding(|world| world.sent(&named, rows[0]));
+        assert!(store
+            .deciding(|world| world.sent_slices(MODEL, Role::Single))
+            .is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn a_stale_prediction_cannot_name_a_worker_with_a_lane() -> Case {
+        let store = MemoryStore::new();
+        let event = admitted(&store, "event");
+        admitted(&store, "other-event");
+        plain(&store, "plain", WireModes::GRPC, Reachability::Any);
+        store.apply(applied(&merged(1)?)?)?;
+        publish(&store, event);
+        // A shared record can still hold a placement from an older pool.
+        predicted(&store, event).ok_or("a record with a stale placement")?;
+        let (named, rows) = named(&store, None, 16, 7);
+        assert_eq!(named.holders.len(), 1);
+        let holder = named.holders[0];
+        assert_eq!(rows[holder.row as usize], event);
+        assert_eq!((holder.overlap_blocks, holder.predicted_blocks), (4, 0));
+        Ok(())
+    }
+
+    #[test]
+    fn the_two_lists_of_holders_keep_one_cap() -> Case {
+        let store = MemoryStore::new();
+        let event = admitted(&store, "event");
+        admitted(&store, "other-event");
+        let predictions =
+            ["a", "b", "c"].map(|key| plain(&store, key, WireModes::GRPC, Reachability::Any));
+        store.apply(applied(&merged(1)?)?)?;
+        publish(&store, event);
+        for id in predictions {
+            predicted(&store, id).ok_or("a record with a placement")?;
+        }
+        let mut kept = std::collections::BTreeSet::new();
+        for seed in 0..32 {
+            let (named, rows) = named(&store, None, 2, seed);
+            assert_eq!(named.holders.len(), 2);
+            assert!(named.holders[0].row < named.holders[1].row);
+            for holder in named.holders {
+                let id = rows[holder.row as usize];
+                if id == event {
+                    assert_eq!((holder.overlap_blocks, holder.predicted_blocks), (4, 0));
+                } else {
+                    assert_eq!((holder.overlap_blocks, holder.predicted_blocks), (0, 4));
+                    kept.insert(id);
+                }
+            }
+        }
+        assert_eq!(kept, predictions.into_iter().collect());
+        let (named, rows) = named(&store, None, 1, 0);
+        assert_eq!(named.holders.len(), 1);
+        assert_eq!(rows[named.holders[0].row as usize], event);
+        Ok(())
+    }
+
+    #[test]
+    fn a_predicted_holder_outside_the_view_is_not_named() -> Case {
+        let store = MemoryStore::new();
+        let http = plain(&store, "http", WireModes::HTTP, Reachability::Any);
+        let foreign = plain(
+            &store,
+            "foreign",
+            WireModes::GRPC,
+            Reachability::Gateway(GatewayId(9)),
+        );
+        let grpc = plain(&store, "grpc", WireModes::GRPC, Reachability::Any);
+        store.apply(applied(&merged(1)?)?)?;
+        for id in [http, foreign, grpc] {
+            predicted(&store, id).ok_or("a record with a placement")?;
+        }
+        let (named, rows) = named(&store, Some(WireModes::GRPC), 1, 0);
+        assert_eq!(rows, vec![grpc]);
+        assert_eq!(named.holders.len(), 1);
+        assert_eq!(
+            (named.holders[0].row, named.holders[0].predicted_blocks),
+            (0, 4)
+        );
+        // Even when given rows that still include a foreign worker, the
+        // naming must not spend any of the cap on it.
+        let (named, rows) = named_from(&store, GatewayId(9), Some(WireModes::GRPC), 16, 0);
+        assert!(rows.contains(&foreign));
+        assert_eq!(named.holders.len(), 1);
+        assert_eq!(rows[named.holders[0].row as usize], grpc);
+        Ok(())
+    }
+
+    #[test]
+    fn a_worker_outside_the_view_hides_no_shorter_prefix_inside_it() -> Case {
+        let store = MemoryStore::new();
+        let http = plain(&store, "http", WireModes::HTTP, Reachability::Any);
+        let grpc = plain(&store, "grpc", WireModes::GRPC, Reachability::Any);
+        store.apply(applied(&merged(1)?)?)?;
+        let record = record(&store).ok_or("the model's record")?;
+        record.record.write().sent(&keys(&HASHES), http, 0);
+        record.record.write().sent(&keys(&HASHES[..3]), grpc, 0);
+        let (named, rows) = named(&store, Some(WireModes::GRPC), 16, 7);
+        assert_eq!(rows, vec![grpc]);
+        assert_eq!(named.holders.len(), 1);
+        let holder = named.holders[0];
+        assert_eq!((holder.row, holder.predicted_blocks), (0, 3));
+        Ok(())
+    }
+
+    #[test]
+    fn a_source_that_reads_the_record_alone_names_its_holders_first() -> Case {
+        let store = MemoryStore::new();
+        let event = admitted(&store, "event");
+        admitted(&store, "other-event");
+        let sent = plain(&store, "plain", WireModes::GRPC, Reachability::Any);
+        let mut document = merged(1)?;
+        use_sent_prefixes(&mut document, AffinitySource::Predictor);
+        store.apply(applied(&document)?)?;
+        publish(&store, event);
+        predicted(&store, sent).ok_or("a record with a placement")?;
+        // The index holds the request too. Under a cap of one the stage's
+        // own holder is named, and the index's with room for two.
+        let (one, rows) = named(&store, None, 1, 0);
+        assert_eq!(one.holders.len(), 1);
+        let holder = one.holders[0];
+        assert_eq!(rows[holder.row as usize], sent);
+        assert_eq!((holder.overlap_blocks, holder.predicted_blocks), (0, 4));
+        let (two, _) = named(&store, None, 2, 0);
+        assert_eq!(two.holders.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn a_worker_whose_offer_moves_leaves_the_record() -> Case {
+        let store = MemoryStore::new();
+        let id = plain(&store, "a", WireModes::GRPC, Reachability::Any);
+        plain(&store, "b", WireModes::GRPC, Reachability::Any);
+        store.apply(applied(&merged(1)?)?)?;
+        predicted(&store, id).ok_or("the old placement")?;
+        let record = record(&store).ok_or("the model's record")?;
+        // The same worker, registered again for another model alone.
+        let moved = WorkerFacts {
+            signals: Signals::default(),
+            wire_modes: WireModes::GRPC,
+            ..publisher("a", &["other"])
+        };
+        assert_eq!(store.upsert(moved).id(), id);
+        assert_eq!(record.record.read().deepest(&keys(&HASHES)).blocks(), 0);
+        Ok(())
+    }
+
+    /// A worker kept under its id with another offer, or at another rank,
+    /// leaves the record at each write that keeps it: the store's own
+    /// registration, a standby's replay of its leader's, and a watch's
+    /// snapshot. A rank is a cache of its own.
+    #[test]
+    fn a_worker_kept_under_another_offer_or_rank_leaves_the_record() -> Case {
+        fn first(models: &[&str]) -> WorkerFacts {
+            WorkerFacts {
+                dp_size: 2,
+                signals: Signals::default(),
+                wire_modes: WireModes::GRPC,
+                ..publisher("a", models)
+            }
+        }
+        /// The record of a store that holds the worker, with a placement.
+        fn sent_to(
+            store: &MemoryStore,
+            id: WorkerId,
+        ) -> Result<Arc<Predicted>, Box<dyn std::error::Error>> {
+            store.apply(applied(&merged(1)?)?)?;
+            predicted(store, id).ok_or("a placement")?;
+            Ok(record(store).ok_or("the model's record")?)
+        }
+        let left = |record: &Predicted| record.record.read().deepest(&keys(&HASHES)).blocks() == 0;
+        let another_offer = first(&["other"]);
+        let another_rank = WorkerFacts {
+            dp_rank: 1,
+            ..first(&[MODEL])
+        };
+        for moved in [another_offer, another_rank] {
+            let leader = MemoryStore::new();
+            let id = leader.upsert(first(&[MODEL])).id();
+            plain(&leader, "b", WireModes::GRPC, Reachability::Any);
+            let own = sent_to(&leader, id)?;
+            let standby = MemoryStore::new();
+            assert!(standby.restore_from(leader.cut(Kinds::All)));
+            let replayed = sent_to(&standby, id)?;
+            let watcher = MemoryStore::new();
+            assert!(watcher.watch_from(leader.cut(Kinds::Watched)));
+            let watched = sent_to(&watcher, id)?;
+
+            let change = leader.upsert(moved);
+            assert_eq!(change.id(), id);
+            assert!(left(&own), "the store's own registration");
+            let row = WorkersStore::get(&leader, id);
+            standby.follow(
+                Position::default(),
+                WorkersStore::epoch(&leader),
+                change,
+                row,
+            );
+            assert!(left(&replayed), "a standby's replay");
+            assert!(watcher.watch_from(leader.cut(Kinds::Watched)));
+            assert!(left(&watched), "a watch's snapshot");
+        }
+        Ok(())
+    }
+
+    /// At its new rank the worker is sent prefixes again.
+    #[test]
+    fn a_worker_at_a_new_rank_is_recorded_again() -> Case {
+        let store = MemoryStore::new();
+        let at_rank = |dp_rank| WorkerFacts {
+            dp_rank,
+            dp_size: 2,
+            signals: Signals::default(),
+            wire_modes: WireModes::GRPC,
+            ..publisher("a", &[MODEL])
+        };
+        let id = store.upsert(at_rank(0)).id();
+        store.publish_now();
+        store.apply(applied(&merged(1)?)?)?;
+        let (cold, _) = named(&store, None, 16, 7);
+        store.deciding(|world| world.sent(&cold, id));
+        let (warm, _) = named(&store, None, 16, 7);
+        assert_eq!(warm.holders.len(), 1);
+        assert_eq!(store.upsert(at_rank(1)).id(), id);
+        store.publish_now();
+        let (cold, _) = named(&store, None, 16, 7);
+        assert!(cold.holders.is_empty(), "rank 1 was sent nothing");
+        store.deciding(|world| world.sent(&cold, id));
+        let (warm, _) = named(&store, None, 16, 7);
+        assert_eq!(warm.holders.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn a_pools_build_waits_for_no_decider_where_the_bound_stands() -> Case {
+        let store = MemoryStore::new();
+        plain(&store, "a", WireModes::GRPC, Reachability::Any);
+        store.apply(applied(&merged(1)?)?)?;
+        let record = record(&store).ok_or("the model's record")?;
+        // A decider holds the record. A member joins: every pool is built
+        // again, and the record's bound stands.
+        let reading = record.record.read();
+        thread::scope(|scope| {
+            let (finished, done) = mpsc::channel();
+            let store = &store;
+            scope.spawn(move || {
+                plain(store, "b", WireModes::GRPC, Reachability::Any);
+                let _ = finished.send(());
+            });
+            let finished = done.recv_timeout(Duration::from_secs(5));
+            drop(reading);
+            finished
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_removal_waits_for_no_decider_of_another_model() -> Case {
+        let store = MemoryStore::new();
+        plain(&store, "a", WireModes::GRPC, Reachability::Any);
+        let beside = store
+            .upsert(WorkerFacts {
+                signals: Signals::default(),
+                ..publisher("beside", &["beside"])
+            })
+            .id();
+        store.publish_now();
+        store.apply(applied(&merged(1)?)?)?;
+        let record = record(&store).ok_or("the model's record")?;
+        let revision = store.get(beside).ok_or("the other model's row")?.revision;
+        // A decider holds this model's record. A worker of another model
+        // leaves: the record holds no place for it, and its removal takes
+        // no guard this model's deciders wait behind.
+        let reading = record.record.read();
+        let removed = thread::scope(|scope| {
+            let (finished, done) = mpsc::channel();
+            let store = &store;
+            scope.spawn(move || {
+                let _ = finished.send(store.remove(beside, revision).is_some());
+            });
+            let removed = done.recv_timeout(Duration::from_secs(5));
+            drop(reading);
+            removed
+        })?;
+        assert!(removed, "the removal");
+        Ok(())
+    }
+
+    #[test]
+    fn a_worker_that_leaves_loses_its_placements() -> Case {
+        let store = MemoryStore::new();
+        let a = plain(&store, "a", WireModes::GRPC, Reachability::Any);
+        let b = plain(&store, "b", WireModes::GRPC, Reachability::Any);
+        store.apply(applied(&merged(1)?)?)?;
+        let record = record(&store).ok_or("the model's record")?;
+        let gone = keys(&(100..196).collect::<Vec<_>>());
+        record.record.write().sent(&gone, a, 0);
+        predicted(&store, b).ok_or("a live placement")?;
+
+        let row = store.get(a).ok_or("the registered row")?;
+        store.remove(a, row.revision).ok_or("the removal")?;
+        assert_eq!(record.record.read().deepest(&gone).blocks(), 0);
+        let (named, rows) = named(&store, None, 16, 7);
+        assert_eq!(rows, vec![b]);
+        assert_eq!(
+            named.holders.len(),
+            1,
+            "the live placement survived the removal"
+        );
+        assert!(record.sweeping.load(Ordering::Relaxed));
+        let tell = || store.deciding(|world| world.sent(&named, b));
+        let reading = record.record.read();
+        thread::scope(|scope| {
+            let (finished, done) = mpsc::channel();
+            let tell = &tell;
+            scope.spawn(move || {
+                tell();
+                let _ = finished.send(());
+            });
+            let finished = done.recv_timeout(Duration::from_secs(5));
+            drop(reading);
+            finished
+        })?;
+        assert_eq!(record.record.read().len(), gone.len() + HASHES.len());
+        tell();
+        assert!(
+            record.record.read().len() > HASHES.len(),
+            "one sweep is bounded"
+        );
+        for _ in 0..5 {
+            tell();
+        }
+        assert_eq!(record.record.read().len(), HASHES.len());
+        assert!(!record.sweeping.load(Ordering::Relaxed));
+        assert_eq!(
+            record.slices.load(Ordering::Relaxed),
+            0,
+            "fresh issues only swept"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_lease_over_an_old_pool_cannot_restore_a_departed_workers_prefix() -> Case {
+        let store = MemoryStore::new();
+        let a = plain(&store, "a", WireModes::GRPC, Reachability::Any);
+        plain(&store, "b", WireModes::GRPC, Reachability::Any);
+        store.apply(applied(&merged(1)?)?)?;
+        let record = record(&store).ok_or("the model's record")?;
+        let (named, _) = named(&store, None, 16, 7);
+        let row = store.get(a).ok_or("the registered row")?;
+        store.deciding(|before| {
+            store.remove(a, row.revision);
+            before.sent(&named, a);
+        });
+        assert_eq!(record.slices.load(Ordering::Relaxed), 0);
+        assert_eq!(record.record.read().deepest(&keys(&HASHES)).blocks(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn a_worker_that_takes_a_lane_forgets_its_placements() -> Case {
+        let store = MemoryStore::new();
+        let id = plain(&store, "a", WireModes::GRPC, Reachability::Any);
+        plain(&store, "b", WireModes::GRPC, Reachability::Any);
+        store.apply(applied(&merged(1)?)?)?;
+        predicted(&store, id).ok_or("the old placement")?;
+        let record = record(&store).ok_or("the model's record")?;
+        assert_eq!(admitted(&store, "a"), id);
+        assert_eq!(record.record.read().deepest(&keys(&HASHES)).blocks(), 0);
+        assert!(record.sweeping.load(Ordering::Relaxed));
+        Ok(())
+    }
+
+    #[test]
+    fn a_replica_cut_forgets_a_row_that_left() -> Case {
+        let store = MemoryStore::new();
+        let a = plain(&store, "a", WireModes::GRPC, Reachability::Any);
+        let b = plain(&store, "b", WireModes::GRPC, Reachability::Any);
+        store.apply(applied(&merged(1)?)?)?;
+        predicted(&store, a).ok_or("the old placement")?;
+        let predicted = record(&store).ok_or("the model's record")?;
+        let mut cut = store.cut(Kinds::All);
+        cut.rows.retain(|row| row.id == b);
+        assert!(store.restore_from(cut));
+        assert_eq!(predicted.record.read().deepest(&keys(&HASHES)).blocks(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn a_fresh_prefix_still_writes_for_a_new_target() -> Case {
+        let store = MemoryStore::new();
+        let a = plain(&store, "a", WireModes::GRPC, Reachability::Any);
+        let b = plain(&store, "b", WireModes::GRPC, Reachability::Any);
+        store.apply(applied(&merged(1)?)?)?;
+        predicted(&store, a).ok_or("the first placement")?;
+        let (named, _) = named(&store, None, 1, 7);
+        store.deciding(|world| world.sent(&named, b));
+        let record = record(&store).ok_or("the model's record")?;
+        assert_eq!(
+            record
+                .record
+                .read()
+                .deepest(&keys(&HASHES))
+                .holders()
+                .collect::<Vec<_>>(),
+            vec![a, b]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_fresh_target_outside_the_holder_cap_writes_nothing() -> Case {
+        let store = MemoryStore::new();
+        let a = plain(&store, "a", WireModes::GRPC, Reachability::Any);
+        let b = plain(&store, "b", WireModes::GRPC, Reachability::Any);
+        store.apply(applied(&merged(1)?)?)?;
+        predicted(&store, a).ok_or("the first placement")?;
+        predicted(&store, b).ok_or("the second placement")?;
+        let (named, rows) = named(&store, None, 1, 7);
+        let target = if rows[named.holders[0].row as usize] == a {
+            b
+        } else {
+            a
+        };
+        store.deciding(|world| world.sent(&named, target));
+        assert_eq!(
+            store.deciding(|world| world.sent_slices(MODEL, Role::Single)),
+            Some(0)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_last_slice_sweeps_placements_owed_by_a_lower_bound() -> Case {
+        let store = MemoryStore::new();
+        let a = plain(&store, "a", WireModes::GRPC, Reachability::Any);
+        store.apply(applied(&merged(1)?)?)?;
+        let predicted = record(&store).ok_or("the model's record")?;
+        predicted
+            .record
+            .write()
+            .sent(&keys(&(100..200).collect::<Vec<_>>()), a, 0);
+        let mut smaller = merged(2)?;
+        smaller.index.insert(
+            MODEL.into(),
+            crate::spec::IndexSpec {
+                max_size: 16,
+                ..Default::default()
+            },
+        );
+        store.apply(applied(&smaller)?)?;
+        let (named, _) = named(&store, None, 16, 7);
+        store.deciding(|world| world.sent(&named, a));
+        // A cold four-block write does at most 16 steps to make room.
+        // Most of the work here had to come from the sweep.
+        assert!(predicted.record.read().len() <= 100 - 64);
+        Ok(())
+    }
+
+    #[test]
+    fn a_lower_bound_keeps_its_sweep_past_a_decider_that_holds_the_record() -> Case {
+        let store = MemoryStore::new();
+        let a = plain(&store, "a", WireModes::GRPC, Reachability::Any);
+        store.apply(applied(&merged(1)?)?)?;
+        let predicted = record(&store).ok_or("the model's record")?;
+        predicted
+            .record
+            .write()
+            .sent(&keys(&(100..200).collect::<Vec<_>>()), a, 0);
+        let mut smaller = merged(2)?;
+        smaller.index.insert(
+            MODEL.into(),
+            crate::spec::IndexSpec {
+                max_size: 16,
+                ..Default::default()
+            },
+        );
+        let smaller = applied(&smaller)?;
+        let was = predicted.bound.load(Ordering::Relaxed);
+        // A decider holds the record while a build lowers the bound, and
+        // sweeps once the build waits for it: the record still reads the
+        // old bound, so that sweep finds nothing owed.
+        let mut held = predicted.record.write();
+        let lowered = thread::scope(|scope| {
+            let store = &store;
+            let lowering = scope.spawn(move || store.apply(smaller).is_ok());
+            while predicted.bound.load(Ordering::Relaxed) == was {
+                thread::yield_now();
+            }
+            // Time for a step the build must not take ahead of the guard.
+            for _ in 0..1_000 {
+                thread::yield_now();
+            }
+            predicted.sweep(&mut held);
+            drop(held);
+            lowering.join()
+        });
+        assert!(lowered.is_ok_and(|applied| applied), "the lower bound");
+        let (named, _) = named(&store, None, 16, 7);
+        store.deciding(|world| world.sent(&named, a));
+        assert!(predicted.record.read().len() <= 100 - 64);
+        Ok(())
+    }
+}
+
 /// The facts of a row whose signals ask for events.
 fn publisher(key: &str, models: &[&str]) -> WorkerFacts {
     WorkerFacts {
@@ -1131,8 +1758,23 @@ mod named {
         gateway: GatewayId,
         wires: Option<WireModes>,
         request: &[u64],
+        cut: (u32, u64),
+        at: Instant,
+    ) -> Handed {
+        handed_less(store, gateway, wires, request, cut, at, &[])
+    }
+
+    /// [`handed_at`] for a view its caller cut further: the rows of `taken`
+    /// leave the narrowed view before it is named, as the rows a request's
+    /// hard demands take, and the view is named as one cut so.
+    fn handed_less(
+        store: &MemoryStore,
+        gateway: GatewayId,
+        wires: Option<WireModes>,
+        request: &[u64],
         (cap, seed): (u32, u64),
         at: Instant,
+        taken: &[WorkerId],
     ) -> Handed {
         let mut view = ViewBuffers::default();
         let mut named = Named::default();
@@ -1150,15 +1792,21 @@ mod named {
                 view.candidates
                     .retain(|row| row.wire_modes.intersects(wires));
             }
+            view.candidates.retain(|row| !taken.contains(&row.id));
             let naming = Naming {
                 gateway,
                 block_hashes: request,
+                namespace_seed: 0,
                 seed,
                 cap,
                 wires,
                 now_micros: built.now_micros,
             };
-            world.name(MODEL, Role::Single, &naming, &view.candidates, &mut named);
+            if taken.is_empty() {
+                world.name(MODEL, Role::Single, &naming, &view.candidates, &mut named);
+            } else {
+                world.name_cut(MODEL, Role::Single, &naming, &view.candidates, &mut named);
+            }
         });
         let rows: Vec<WorkerId> = view.candidates.iter().map(|row| row.id).collect();
         let places = |list: &[u32]| list.windows(2).all(|pair| pair[0] < pair[1]);
@@ -1322,6 +1970,7 @@ mod named {
                 let naming = Naming {
                     gateway: GatewayId::LOCAL,
                     block_hashes: request,
+                    namespace_seed: 0,
                     seed,
                     cap,
                     wires: None,
@@ -1664,6 +2313,7 @@ mod named {
             let naming = Naming {
                 gateway: GatewayId::LOCAL,
                 block_hashes: &request,
+                namespace_seed: 0,
                 seed: 7,
                 cap: 16,
                 wires: None,
@@ -2018,6 +2668,7 @@ mod named {
                 let naming = Naming {
                     gateway,
                     block_hashes: &[],
+                    namespace_seed: 0,
                     seed: 1,
                     cap: 16,
                     wires,
@@ -2028,6 +2679,72 @@ mod named {
                 assert!(!view.is_empty(), "every set of wires has a member");
             }
         }
+    }
+
+    /// A view its caller cut by more than its gateway's wires is named
+    /// within its own rows: a holder the cut took is named by nobody and
+    /// takes no place of the cap, which the holders that stay fill, and the
+    /// warming rows named are the view's.
+    #[test]
+    fn a_view_cut_further_is_named_within_the_rows_that_stay() {
+        let store = MemoryStore::new();
+        store.apply(sampled(1)).expect("above the unbound start");
+        let ids: Vec<WorkerId> = (0..6).map(|n| admitted(&store, &format!("w{n}"))).collect();
+        // One holds the whole request, two its first two blocks, one none.
+        holds(&store, ids[0], &[1, 2, 3, 4]);
+        holds(&store, ids[1], &[1, 2]);
+        holds(&store, ids[2], &[1, 2]);
+        // Two fill past the level's floor with another chain's blocks, so
+        // the four above are the warming rows at the next window.
+        let filled: Vec<u64> = (101..=1_200).collect();
+        holds(&store, ids[4], &filled);
+        holds(&store, ids[5], &filled);
+        let window = Instant::now() + Duration::from_secs(1);
+        store.record(ids[4], 0, LoadRow::default(), window, LoadSource::Stream);
+        let request = [1, 2, 3, 4];
+        let less = |taken: &[WorkerId], cap: u32, seed: u64| {
+            let at = Instant::now();
+            handed_less(
+                &store,
+                GatewayId::LOCAL,
+                None,
+                &request,
+                (cap, seed),
+                at,
+                taken,
+            )
+        };
+        // The whole view under a cap of one: the deepest holder alone.
+        assert_eq!(less(&[], 1, 7).holders, [(ids[0], 4)]);
+        // The deepest holder cut: the cap's one place goes to a holder that
+        // stays, each of the two by some seed.
+        let mut drawn = std::collections::BTreeSet::new();
+        for seed in 0..40 {
+            let cut = less(&ids[..1], 1, seed);
+            assert_eq!((cut.rows.len(), cut.holders.len()), (5, 1), "seed {seed}");
+            assert_eq!(cut.holders[0].1, 2, "seed {seed}");
+            drawn.insert(cut.holders[0].0);
+        }
+        assert_eq!(drawn, [ids[1], ids[2]].into_iter().collect());
+        // Under no cap: every holder that stays, and the warming rows the
+        // whole view is named, less the row the cut took.
+        let (whole, cut) = (less(&[], 0, 7), less(&ids[..1], 0, 7));
+        let mut stay = vec![(ids[1], 2), (ids[2], 2)];
+        stay.sort_unstable();
+        assert_eq!(cut.holders, stay);
+        let mut short = ids[..4].to_vec();
+        short.sort_unstable();
+        assert_eq!(whole.warming, short);
+        short.retain(|&id| id != ids[0]);
+        assert_eq!(cut.warming, short);
+        // Under a cap of one the draw is among the three that stay.
+        let mut warm = std::collections::BTreeSet::new();
+        for seed in 0..60 {
+            let cut = less(&ids[..1], 1, seed).warming;
+            assert_eq!(cut.len(), 1, "seed {seed}");
+            warm.insert(cut[0]);
+        }
+        assert_eq!(warm, short.into_iter().collect());
     }
 
     /// A young row's naming ends at its own instant, with no window
@@ -2077,6 +2794,7 @@ mod named {
             let naming = Naming {
                 gateway: GatewayId::LOCAL,
                 block_hashes: &[],
+                namespace_seed: 0,
                 seed: 1,
                 cap: 16,
                 wires: None,
@@ -2189,6 +2907,7 @@ mod named {
             let naming = Naming {
                 gateway: GatewayId::LOCAL,
                 block_hashes: &[1, 2, 3],
+                namespace_seed: 0,
                 seed: 1,
                 cap: 16,
                 wires: None,
@@ -2234,6 +2953,7 @@ mod named {
             let naming = Naming {
                 gateway: GatewayId::LOCAL,
                 block_hashes: &[],
+                namespace_seed: 0,
                 seed: 1,
                 cap: 16,
                 wires,

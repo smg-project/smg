@@ -31,6 +31,7 @@
 use std::{
     fmt, io,
     net::{IpAddr, SocketAddr},
+    panic::{catch_unwind, resume_unwind, AssertUnwindSafe},
     path::{Path, PathBuf},
     sync::{mpsc, Arc, Weak},
     thread,
@@ -410,8 +411,8 @@ impl Running {
     /// once on every call after that.
     pub(crate) async fn ended(&mut self) {
         if let Some(end) = self.end.as_mut() {
-            // Sent at the thread's end and dropped at its panic: gone
-            // either way.
+            // Sent after cleanup on a normal end or a caught loop panic.
+            // Dropped if cleanup itself panics: gone either way.
             let _ = end.await;
             self.end = None;
         }
@@ -522,10 +523,27 @@ pub(crate) fn start(
     thread::Builder::new()
         .name("election".to_owned())
         .spawn(move || {
-            run(elector, &store, &standing, &heard);
+            let mut elector = elector;
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                run_loop(&mut elector, &store, &standing, &heard)
+            }));
+            // The elector is safe to clean up after an unwind: release closes
+            // the fence before a backend call, a stale held record only makes
+            // its compare-and-swap miss, and its locks do not poison.
+            give_up(&mut elector);
+            let failure = match result {
+                Ok(seen) => {
+                    publish_end(&elector, &standing, seen);
+                    None
+                }
+                Err(failure) => Some(failure),
+            };
             // The run loop is gone with its receiver when the controller
             // returned first.
             let _ = end.send(());
+            if let Some(failure) = failure {
+                resume_unwind(failure);
+            }
         })?;
     Ok(Running {
         words: Arc::new(words),
@@ -533,12 +551,12 @@ pub(crate) fn start(
     })
 }
 
-fn run(
-    mut elector: Elector,
+fn run_loop(
+    elector: &mut Elector,
     store: &MemoryStore,
     standing: &watch::Sender<Standing>,
     words: &mpsc::Receiver<Word>,
-) {
+) -> Standing {
     let period = elector.settings().renew_period;
     let deadline = elector.settings().renew_deadline;
     let mut seen = Standing::default();
@@ -640,7 +658,7 @@ fn run(
                     None => seen.holder.clear(),
                 }
                 report(
-                    &elector,
+                    elector,
                     &tick,
                     store,
                     &mut following,
@@ -674,7 +692,7 @@ fn run(
                 Ok(Word::StepDown(above)) => above,
                 // The planned hand-over leaves the lease of its own term, as
                 // a word with no term does.
-                Ok(Word::HandOver(under)) if holds_under(&elector, under) => None,
+                Ok(Word::HandOver(under)) if holds_under(elector, under) => None,
                 // Planned under a term this replica no longer holds the lease
                 // under, it asks nothing: that lease is left already, and
                 // the take since stands.
@@ -689,7 +707,7 @@ fn run(
             };
             // A word the elector refused counts nothing here
             // either.
-            let Some(left) = step_down(&mut elector, above) else {
+            let Some(left) = step_down(elector, above) else {
                 continue;
             };
             // The fence closed at the word: the take that opens it
@@ -716,12 +734,29 @@ fn run(
             break;
         }
     }
-    give_up(&mut elector);
+    seen
+}
+
+/// Publishes the standing after the release at the run loop's end.
+fn publish_end(elector: &Elector, standing: &watch::Sender<Standing>, mut seen: Standing) {
     seen.holder.clear();
     // The stop's release may read the lease again, and the elector counts
     // that record's term as at any step: the last standing reads it here.
     seen.term = seen.term.max(elector.highest_term());
     standing.send_replace(seen);
+}
+
+/// Runs the loop through its normal cleanup for cases that call it directly.
+#[cfg(test)]
+fn run(
+    mut elector: Elector,
+    store: &MemoryStore,
+    standing: &watch::Sender<Standing>,
+    words: &mpsc::Receiver<Word>,
+) {
+    let seen = run_loop(&mut elector, store, standing, words);
+    give_up(&mut elector);
+    publish_end(&elector, standing, seen);
 }
 
 /// The steps in a row that follow nobody for one reason: its line is written
@@ -1256,6 +1291,82 @@ mod tests {
         );
     }
 
+    /// A lease that can be armed to panic on a read after it stores a take.
+    struct PanicsAfterTake {
+        lease: MemoryLease,
+        armed: Arc<AtomicBool>,
+        took: bool,
+    }
+
+    impl LeaseBackend for PanicsAfterTake {
+        fn read(&mut self) -> Result<Option<LeaseRecord>, ElectError> {
+            assert!(
+                !self.took || !self.armed.load(Ordering::SeqCst),
+                "the read after the take panics"
+            );
+            self.lease.read()
+        }
+
+        fn write(
+            &mut self,
+            expected: Option<&LeaseRecord>,
+            record: &LeaseRecord,
+        ) -> Result<Written, ElectError> {
+            let written = self.lease.write(expected, record)?;
+            if written == Written::Done && !record.holder.is_empty() {
+                self.took = true;
+            }
+            Ok(written)
+        }
+
+        fn place(&self) -> String {
+            self.lease.place()
+        }
+    }
+
+    #[test]
+    fn a_panicking_step_closes_its_fence_and_releases_before_the_thread_ends() {
+        let mut lease = MemoryLease::new();
+        let armed = Arc::new(AtomicBool::new(false));
+        let released = LeaseRecord {
+            term: 1,
+            ..LeaseRecord::default()
+        };
+        assert_eq!(
+            lease.write(None, &released).expect("a write"),
+            Written::Done
+        );
+        let settings = ElectionSettings {
+            duration: Duration::from_millis(600),
+            renew_period: Duration::from_millis(50),
+            renew_deadline: Duration::from_millis(400),
+        };
+        let candidate = Elector::new(
+            Box::new(PanicsAfterTake {
+                lease: lease.clone(),
+                armed: armed.clone(),
+                took: false,
+            }),
+            "a@127.0.0.1:1",
+            settings,
+        )
+        .expect("the settings are in order");
+        let fence = candidate.fence();
+        let (standing, _stood) = watch::channel(Standing::default());
+        let running = start(candidate, Arc::new(MemoryStore::new()), standing).expect("a thread");
+        thread::sleep(Duration::from_millis(100));
+        until("the take", || fence.leader_term(Instant::now()) == Some(2));
+        armed.store(true, Ordering::SeqCst);
+
+        ended(running);
+        assert_eq!(fence.leader_term(Instant::now()), None);
+        let stored = lease.read().expect("a read");
+        assert!(
+            stored.is_some_and(|record| record.holder.is_empty()),
+            "the lease is free"
+        );
+    }
+
     /// A door given out keeps no election alive: the handle alone holds the
     /// words. Dropped while the service's shared state still holds the
     /// door, the election ends as it does with no door, and the door then
@@ -1335,14 +1446,14 @@ mod tests {
         }
     }
 
-    /// Waits, bounded, for a stopped election's thread to be gone.
+    /// Waits, bounded, for an election thread to signal that it is gone.
     fn ended(running: Running) {
         let mut end = running.end.expect("the end was not seen yet");
         let started = Instant::now();
         while end.try_recv().is_err() {
             assert!(
                 started.elapsed() < Duration::from_secs(20),
-                "the election thread did not end 20 s after its stop"
+                "the election thread did not signal its end in 20 s"
             );
             thread::sleep(Duration::from_millis(2));
         }

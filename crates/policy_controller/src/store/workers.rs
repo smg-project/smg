@@ -5,6 +5,7 @@
 use std::{collections::BTreeMap, sync::Arc, time::Instant};
 
 use crate::{
+    demands::DemandFacts,
     lease::Membership,
     store::{encoding::EncodeOffer, pairing::PairingDescriptor, GatewayId},
     view::{fingerprint, Role, WireModes, WorkerId},
@@ -166,6 +167,10 @@ pub struct WorkerFacts {
     /// registration states another window than the default. A host that
     /// builds the worker's object from the row gives the object this window.
     pub drain_settle_secs: Option<u32>,
+    /// What the worker states for a request's hard demands
+    /// ([`DemandFacts`]), in its registering host's own numbers. A host
+    /// that states none registers a worker that meets no demand.
+    pub demand_facts: DemandFacts,
 }
 
 impl WorkerFacts {

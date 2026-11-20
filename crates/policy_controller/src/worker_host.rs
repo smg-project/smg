@@ -31,8 +31,8 @@
 //! | `bootstrap_port` | `bootstrap_port` |
 //! | `health` | the health checks: the two thresholds, the interval and the timeout in whole seconds, the checks off where the policy's probes are |
 //! | `drain_settle_secs` | the checks' drain window, where the row states one; else the object's default |
-//! | `signals`, `reachable_from` | not carried: the object has no field for them, and a collector reads them of the row by the id the holder keeps |
-//! | `zone`, `pairing`, `encode`, `vision`, `max_running`, `priority` | not carried: a decision's facts, read of the store's rows and never of an object |
+//! | `signals`, `reachable_from` | not carried: the object has no field for them, and a collector reads them of the row by the id the holder keeps. A host that is no gateway has the object of a row one gateway alone reaches built with its checks off ([`Objects::with_host_local_unchecked`]) |
+//! | `zone`, `pairing`, `encode`, `vision`, `max_running`, `priority`, `demand_facts` | not carried: a decision's facts, read of the store's rows and never of an object |
 //! | `overload` | not carried to the object: a decision's fact, read of the store's rows. [`facts()`] states the thresholds of the object's own registration over the standing row's |
 //!
 //! A new object starts at its row's status. A replacement takes the
@@ -45,8 +45,12 @@
 //! promotion comes back as any promotion does. The host's vetoes stand.
 //! The id and the revision stand beside the object in the
 //! holder ([`Standing`]). No credential and no connector is a row's fact. A
-//! host hands the holder its connector ([`Objects::with_connector`]); a
-//! credential has no door yet.
+//! host hands the holder its connector ([`Objects::with_connector`]). It
+//! keeps its workers' credentials in [`Credentials`] and hands the keeper
+//! to the holder ([`Objects::with_credentials`]). A credential is bound to
+//! the rows its registrations wrote: a row no registration of this host
+//! stated takes none. Where a registration's answer says so, the host has
+//! the holder lay the address's objects again ([`Objects::lay_again`]).
 //!
 //! # The adapters
 //!
@@ -86,6 +90,7 @@
 //! drives. The collector under it starts a task for each worker it streams
 //! and ends them at the stop. It names nothing of the controller.
 
+mod credentials;
 mod door;
 mod found;
 mod health;
@@ -97,9 +102,11 @@ mod object;
 mod objects;
 pub mod steps;
 
+pub use credentials::{Credentials, KeptCredential, RegistrationInFlight};
 #[cfg(all(test, feature = "controller"))]
 pub(crate) use door::tests::{
-    check_expectations, check_guard, check_health_scope, check_maker, check_provider,
+    check_event_signal, check_expectations, check_guard, check_health_scope, check_maker,
+    check_provider,
 };
 #[cfg(feature = "controller")]
 pub(crate) use door::{drain, lay, take, Turn};

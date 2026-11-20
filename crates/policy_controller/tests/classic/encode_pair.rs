@@ -446,6 +446,7 @@ fn decided(row: &Row, classes: &EncodeClasses) -> Vec<String> {
         facts: &of_encoders,
         prefill_classes: &prefill_classes,
         affinity: &[],
+        ..EncodePool::default()
     };
     let pool_facts = PoolFacts {
         pool_size: prefills.len() as u32,

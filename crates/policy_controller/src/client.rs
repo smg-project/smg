@@ -4,7 +4,7 @@
 //! Both clients dial a gateway listener, ask who leads and send a `Hello`
 //! to open a session. The leader answers with a `Welcome`. The session
 //! carries `Dispatched`, `Completed` and `Released` reports. The clients
-//! raise their term floor from answers and refuse frames below it.
+//! raise their term floor from answers and refuse terms below it.
 //!
 //! [`Client`] is the reference client. It asks for a decision one request at
 //! a time ([`Client::decide`]). [`Link`] shares the session and one decide
@@ -143,16 +143,17 @@ pub enum Error {
     /// welcome.
     #[error("the session answered the hello with no welcome: {0}")]
     NoWelcome(String),
-    /// A frame of the session or an answer of the decide stream came
-    /// under a term below the client's floor. A gateway rejects a frame
-    /// below its floor whatever it carries. At the open the session is not
-    /// taken, and the address a `NotLeader` names is not read; after the
-    /// welcome the frame is read no further. A decide stream is dropped.
-    #[error("a frame's term {term} is below the floor {floor}")]
+    /// A `Leader` answer, a frame of the session or an answer of the decide
+    /// stream came under a term below the client's floor. A gateway rejects
+    /// an answer below its floor whatever it carries. A `Leader` answer below
+    /// the floor is not returned. At the open the session is not taken, and
+    /// the address a `NotLeader` names is not read; after the welcome the
+    /// frame is read no further. A decide stream is dropped.
+    #[error("an answer's term {term} is below the floor {floor}")]
     BelowFloor {
-        /// The term the frame came under.
+        /// The term the answer came under.
         term: u64,
-        /// The floor the frame was read under.
+        /// The floor the answer was read under.
         floor: u64,
     },
     /// An ask's request id is outside the call's range. The controller
@@ -170,6 +171,11 @@ pub enum Error {
     /// by its path in the contract. The controller ends a stream at such a
     /// frame, and a link's one stream is every caller's: the link refuses
     /// the frame at its own door and sends nothing ([`Link::ask`]).
+    ///
+    /// A hard demand of a host's request is refused under this kind too, as
+    /// `constraints.demands`: this protocol version states none, so a
+    /// handle sends no request that states one
+    /// ([`Handle::asked`](crate::handle::Handle::asked)).
     #[error("an ask's {0} is out of its range in this protocol version")]
     OutOfRange(&'static str),
     /// A link's report queue was full: its session took no report for as
@@ -763,11 +769,17 @@ impl Client {
         })
     }
 
-    /// Asks the replica who leads, within the client's bound. The answer's
-    /// term raises the floor.
+    /// Asks the replica who leads, within the client's bound. An answer below
+    /// the floor is [`Error::BelowFloor`]; otherwise its term raises the floor.
     pub async fn leader(&mut self) -> Result<LeaderInfo, Error> {
         let info = ask_leader(&mut self.stub, self.wait).await?;
-        self.floor = self.floor.max(info.term);
+        if info.term < self.floor {
+            return Err(Error::BelowFloor {
+                term: info.term,
+                floor: self.floor,
+            });
+        }
+        self.floor = info.term;
         Ok(info)
     }
 
@@ -1082,7 +1094,7 @@ mod tests {
     };
     use tonic::{
         codegen::tokio_stream::{iter, once, pending, Stream, StreamExt},
-        server::{Grpc, StreamingService},
+        server::{Grpc, StreamingService, UnaryService},
         service::{Interceptor, Routes},
         transport::{server::TcpIncoming, Endpoint, Server},
         Code, Request, Status, Streaming,
@@ -1094,7 +1106,10 @@ mod tests {
         GatewayFrame, PolicyControllerClient, Principal, Session, Stub, Welcome, ANSWER_WAIT,
         MAX_FRAME, MAX_REQUEST_ID, PRINCIPAL_ENTRY, PROTOCOL_VERSION,
     };
-    use crate::proto::{busy, Completed, Credit, Dispatched, NotLeader, Released, RequestFacts};
+    use crate::proto::{
+        busy, Completed, Credit, Dispatched, LeaderInfo, LeaderRequest, NotLeader, Released,
+        RequestFacts,
+    };
 
     /// The bound a case gives a wait it wants ended.
     const SHORT: Duration = Duration::from_millis(300);
@@ -1290,6 +1305,70 @@ mod tests {
             .await
             .expect(ends);
         assert!(ran_out(&asked, "the Leader ask", SHORT), "{asked:?}");
+    }
+
+    /// The `Leader` call of a peer that answers each ask with `answer`.
+    #[derive(Clone, Copy)]
+    struct Leads(fn() -> LeaderInfo);
+
+    impl UnaryService<LeaderRequest> for Leads {
+        type Response = LeaderInfo;
+        type Future = Ready<Result<tonic::Response<Self::Response>, Status>>;
+
+        fn call(&mut self, _request: Request<LeaderRequest>) -> Self::Future {
+            ready(Ok(tonic::Response::new((self.0)())))
+        }
+    }
+
+    /// A peer that answers each call with `answer`, for as long as the case
+    /// holds its task.
+    async fn leading(
+        answer: fn() -> LeaderInfo,
+    ) -> (SocketAddr, JoinSet<Result<(), tonic::transport::Error>>) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("a listener");
+        let address = listener.local_addr().expect("its address");
+        let answer = Router::new().fallback(move |request: axum::extract::Request| async move {
+            Grpc::new(tonic_prost::ProstCodec::<LeaderInfo, LeaderRequest>::default())
+                .unary(Leads(answer), request)
+                .await
+                .map(Body::new)
+        });
+        let mut serving = JoinSet::new();
+        serving.spawn(
+            Server::builder()
+                .add_routes(Routes::from(answer))
+                .serve_with_incoming(TcpIncoming::from(listener)),
+        );
+        (address, serving)
+    }
+
+    #[tokio::test]
+    async fn a_leader_answer_below_the_clients_floor_is_refused() {
+        let (deciding, _deciding) = deciding(|| (Vec::new(), None)).await;
+        let (stream, _stub) = stream(deciding, 0).await;
+        let (mut client, _welcoming) = holding(stream, ROOM).await;
+        let (leading, _leading) = leading(|| LeaderInfo {
+            term: 7,
+            address: "old".to_owned(),
+            ..LeaderInfo::default()
+        })
+        .await;
+        client.stub = stub(leading).await;
+        client.floor = 8;
+
+        let refused = client.leader().await;
+
+        assert!(
+            matches!(refused, Err(Error::BelowFloor { term: 7, floor: 8 })),
+            "a stale leader answer is refused: {refused:?}"
+        );
+        assert_eq!(
+            client.term_floor(),
+            8,
+            "the floor remains at its high-water mark"
+        );
     }
 
     #[tokio::test]

@@ -44,6 +44,89 @@ mod repeated_models;
 mod unnamed_rank;
 mod written;
 
+mod sent_prefixes {
+    use super::*;
+    use crate::{
+        door::tests::sent_prefixes::{applied, merged},
+        spec::{IndexKind, IndexSpec},
+        store::{index::Predicted, KvEventSink},
+    };
+
+    type Case = Result<(), Box<dyn std::error::Error>>;
+
+    fn record(store: &MemoryStore) -> Option<Arc<Predicted>> {
+        store.deciding(|world| world.standing(MODEL, Role::Single)?.predicted())
+    }
+
+    #[test]
+    fn a_generation_that_reads_no_sent_prefix_drops_the_record() -> Case {
+        let store = MemoryStore::new();
+        member(&store, "a");
+        store.apply(applied(&merged(1)?)?)?;
+        assert_eq!(record(&store).map(|record| record.bound()), Some(4_194_304));
+        let mut idle = PolicySpec::preset("least_load")?;
+        idle.generation = 2;
+        store.apply(applied(&idle)?)?;
+        assert!(record(&store).is_none());
+        store.apply(applied(&merged(3)?)?)?;
+        assert!(record(&store).is_some());
+        let mut hash = merged(4)?;
+        hash.view.boundaries = vec![16];
+        hash.index.insert(
+            MODEL.into(),
+            IndexSpec {
+                kind: IndexKind::Hash,
+                ..IndexSpec::default()
+            },
+        );
+        hash.plans.pd_pair.pairing = Pairing::Off;
+        store.apply(applied(&hash)?)?;
+        assert!(record(&store).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn a_changed_bound_applies_in_place() -> Case {
+        let store = MemoryStore::new();
+        member(&store, "a");
+        let mut document = merged(1)?;
+        document.view.block_size = Some(8);
+        document.index.insert(
+            "*".into(),
+            IndexSpec {
+                max_size: 1024,
+                ..IndexSpec::default()
+            },
+        );
+        store.apply(applied(&document)?)?;
+        let first = record(&store).ok_or("the model's record")?;
+        assert_eq!(first.bound(), 128, "the generation's block size");
+
+        store.set_block_size(MODEL, 32);
+        // A refresh carries the classes, but the model's block size moved.
+        member(&store, "a");
+        assert_eq!(first.bound(), 32, "the model's block size of record");
+
+        document.generation = 2;
+        document.index.insert(
+            MODEL.into(),
+            IndexSpec {
+                max_size: 16,
+                ..IndexSpec::default()
+            },
+        );
+        store.apply(applied(&document)?)?;
+        let next = record(&store).ok_or("the model's record")?;
+        assert!(Arc::ptr_eq(&first, &next));
+        assert_eq!(
+            next.bound(),
+            1,
+            "the exact key wins and the bound stays positive"
+        );
+        Ok(())
+    }
+}
+
 const MODEL: &str = "m";
 const ASKER: GatewayId = GatewayId(1);
 
@@ -357,6 +440,56 @@ fn another_gateways_host_local_row_is_not_written_and_the_slice_is_its_own_index
         },
     );
     assert!(rows.iter().all(|row| !row.session_hit));
+}
+
+/// What each row states for a request's hard demands is read beside the
+/// rows a build writes for the asking gateway, one entry a row in the rows'
+/// order: another gateway's host-local row has no entry there.
+#[test]
+fn the_demand_facts_stand_beside_the_rows_written_for_the_asking_gateway() {
+    use crate::demands::DemandFacts;
+
+    let store = MemoryStore::new();
+    let now = Instant::now();
+    let stating = |key: &str, runtime: u32, reachable_from: Reachability| {
+        admit(
+            &store,
+            WorkerFacts {
+                reachable_from,
+                demand_facts: DemandFacts { runtime },
+                ..facts(key, Role::Single, &[MODEL])
+            },
+        )
+    };
+    let open = stating("http://a:8000", 7, Reachability::Any);
+    let theirs = stating("unix:///b", 8, Reachability::Gateway(GatewayId(2)));
+    let ours = stating("unix:///c", 9, Reachability::Gateway(GatewayId(1)));
+    let last = stating("http://d:8000", 0, Reachability::Any);
+    let stated_to = |gateway: u64| {
+        let ask = Ask {
+            gateway: GatewayId(gateway),
+            ..ask(now)
+        };
+        let (mut out, mut stated) = (ViewBuffers::default(), Vec::new());
+        store.with_world(|world| {
+            let built = world.build(MODEL, Role::Single, &ask, &mut out);
+            world.demand_facts(&built.expect("the pool"), &ask, &mut stated);
+        });
+        assert_eq!(stated.len(), out.candidates.len());
+        let rows = out.candidates.iter().zip(&stated);
+        rows.map(|(row, facts)| (row.id, facts.runtime))
+            .collect::<Vec<_>>()
+    };
+    let sorted = |mut rows: Vec<(WorkerId, u32)>| {
+        rows.sort_unstable();
+        rows
+    };
+    assert_eq!(stated_to(1), sorted(vec![(open, 7), (ours, 9), (last, 0)]));
+    assert_eq!(
+        stated_to(2),
+        sorted(vec![(open, 7), (theirs, 8), (last, 0)])
+    );
+    assert_eq!(stated_to(3), sorted(vec![(open, 7), (last, 0)]));
 }
 
 #[test]
@@ -1754,7 +1887,7 @@ fn a_probes_verdict_and_a_connect_signal_are_read_at_once() {
     assert!(!healthy());
 
     // The connect signal of a handshake-promoted worker.
-    assert!(store.connected(id, revision()).moved().is_some());
+    assert!(store.connected(id, revision(), &|| true).moved().is_some());
     assert!(healthy());
 
     // The prober takes a ready worker out after its failure threshold.
@@ -1765,7 +1898,7 @@ fn a_probes_verdict_and_a_connect_signal_are_read_at_once() {
         .failure_threshold;
     for _ in 0..threshold {
         assert!(healthy());
-        store.probe_outcome(id, false, revision());
+        store.probe_outcome(id, false, revision(), &|| true);
     }
     assert!(!healthy());
 }

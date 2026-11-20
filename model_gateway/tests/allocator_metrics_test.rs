@@ -1,7 +1,8 @@
 //! Verifies the final-artifact contract for jemalloc metrics.
 //!
-//! This integration test is a separate executable, so it can declare the same
-//! global allocator and registration sequence used by the shipped SMG binary.
+//! This integration test is a separate executable. It takes the stock
+//! allocator by the library's macro, as a host's own binary does, and makes
+//! the registration the shipped SMG binary makes.
 
 #![cfg(all(
     feature = "jemalloc-stats",
@@ -13,8 +14,7 @@ use smg::observability::metrics::{
     register_jemalloc_as_global_allocator, start_prometheus, PrometheusConfig,
 };
 
-#[global_allocator]
-static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+smg::stock_allocator!();
 
 #[test]
 fn registered_global_jemalloc_exposes_allocator_gauges() {
@@ -28,6 +28,11 @@ fn registered_global_jemalloc_exposes_allocator_gauges() {
     let after = allocated.get();
     assert!(after > before, "Rust allocation bypassed jemalloc");
     std::hint::black_box(&allocation);
+
+    // The macro exports the stock options too. The allocator reads them at
+    // its start, and sixteen arenas is one of them.
+    let arenas = tikv_jemalloc_ctl::opt::narenas::read().expect("the arenas option");
+    assert_eq!(arenas, 16, "the stock options were not exported");
 
     register_jemalloc_as_global_allocator();
     let handle = start_prometheus(PrometheusConfig {

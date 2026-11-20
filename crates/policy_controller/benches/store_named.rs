@@ -186,6 +186,7 @@ fn decide(
             let naming = Naming {
                 gateway: GATEWAY,
                 block_hashes: &host.hashes,
+                namespace_seed: 0,
                 seed,
                 cap: engine.named_for(MODEL, Phase::Single),
                 wires: None,

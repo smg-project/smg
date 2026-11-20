@@ -1,17 +1,42 @@
 //! The membership door writes the store. Its listener brings the worker
 //! registry up to date and publishes membership for decisions in that order.
-//! The gateway has no publication loop, so each write asks for publication
-//! before it returns. A row holds no credential, so its worker object
-//! carries none.
+//! Each membership write asks for publication before it returns. A row
+//! holds no credential, so its worker object carries none.
+//!
+//! Under a controller's address the follower writes the store in the door's
+//! place, and settles the feed after each event it takes ([`following`]).
+//!
+//! The load collector writes the store through the feed's sink. Those
+//! writes come from the collector's tasks and name no instant to a host, so
+//! the feed runs the gateway's publication loop, which shows what waits
+//! when the store's instant comes. The loop is the gateway's one hand on
+//! the store's wake. It keeps the listener's order: the registry is brought
+//! up to date, then the store publishes.
 
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use parking_lot::Mutex;
 use smg_policy_controller::{
-    store::{Maker, MemoryStore, WorkerFacts},
-    worker_host::{Expect, Membership, Objects, Refused, Remover, Standing, StoreDoor, Wrote},
+    store::{LoadSink as StoreLoadSink, Maker, MemoryStore, WorkerFacts},
+    worker_host::{
+        Expect, HealthAdapter, LoadAdapter, Membership, Objects, Refused, Remover, SoleLead,
+        Standing, StoreDoor, Wrote,
+    },
 };
-use smg_worker::connection::engine::EngineConnector;
+use smg_worker::{
+    connection::engine::EngineConnector,
+    health::port::{HealthSink, ProbeAnswer},
+    identity::basic::Worker,
+    load::port::{GroupTick, LoadSink, PollMode, PolledMember, PolledRanks},
+    registry::WorkerId,
+    worker::{WorkerLoadResponse, WorkerStatus},
+};
+use tokio::{sync::Notify, time::sleep_until};
+use tokio_util::task::AbortOnDropHandle;
+use tracing::warn;
 
 use crate::routers::common::snapshot::{ModelWorkerSnapshot, WorkerRegistry};
 
@@ -26,28 +51,224 @@ pub(crate) struct Feed {
     pub objects: Arc<Objects<ModelWorkerSnapshot>>,
     /// The store the door writes and the holder follows.
     store: Arc<MemoryStore>,
-    /// The feed's turn: one write with its listener, or one settle, at a
-    /// time.
+    /// The feed's turn: one write with its listener, one settle, or one
+    /// publication of the loop, at a time.
     turn: Arc<Mutex<()>>,
+    /// The publication loop's wake: a load write through the feed's sink,
+    /// or the store's word that a membership write left a build owed.
+    woken: Arc<Notify>,
 }
 
 impl Feed {
+    /// The health sink of a gateway that keeps its workers in the store.
+    pub(crate) fn health_sink(&self) -> Arc<dyn HealthSink> {
+        Arc::new(FeedHealth {
+            objects: Arc::clone(&self.objects),
+            adapter: HealthAdapter::new(
+                Arc::clone(&self.objects),
+                Arc::clone(&self.store),
+                Arc::new(SoleLead),
+                SoleLead::TERM,
+            ),
+            registry: Arc::clone(self.objects.registry()),
+        })
+    }
+
     /// Bring the registry to the store's rows, then publish them: the two
-    /// calls the door's listener makes after each write. It is here for a
-    /// follower that applies a served controller's events; no product line
-    /// calls it yet. It takes the feed's turn, so it never runs between a
-    /// write at the door and that write's listener.
+    /// calls the door's listener makes after each write. A follower that
+    /// applies a served controller's events calls this after each event.
+    /// It takes the feed's turn, so it never runs between a write at the
+    /// door and that write's listener.
     pub(crate) fn settle(&self) {
         let _turn = self.turn.lock();
-        settle(&self.objects, &self.store);
+        settle(&self.objects, &self.store, None);
+    }
+
+    /// The store the door writes and the holder follows.
+    pub(crate) fn store(&self) -> &Arc<MemoryStore> {
+        &self.store
+    }
+
+    /// The load sink of a gateway that keeps its workers in the store: the
+    /// crate's adapter under the sole lead. `period` is the interval in
+    /// which the collector hears every ready rank. A worker no row stands
+    /// for is passed over: nothing of it reaches the store.
+    pub(crate) fn load_sink(&self, period: Duration) -> Arc<dyn LoadSink> {
+        let adapter = LoadAdapter::new(
+            Arc::clone(&self.objects),
+            Arc::clone(&self.store),
+            Arc::new(SoleLead),
+            SoleLead::TERM,
+            period,
+        );
+        if !adapter.period_taken() {
+            warn!(
+                period_secs = period.as_secs(),
+                "The policy store keeps an earlier load report period, so this one is not in force"
+            );
+        }
+        Arc::new(FeedLoads {
+            adapter,
+            woken: Arc::clone(&self.woken),
+        })
+    }
+
+    /// Show the store's waiting writes as they come due, for as long as
+    /// the answer is kept. The collector's sink writes from the collector's
+    /// tasks and reads no instant, so without the loop a load write waits
+    /// for the next one to be shown. The loop takes the store's one wake.
+    pub(crate) fn publications(&self) -> AbortOnDropHandle<()> {
+        self.store.wake_with(Box::new({
+            let woken = Arc::clone(&self.woken);
+            move || woken.notify_one()
+        }));
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the loop holds no request; its answer ends it, and a shutdown need not wait for it"
+        )]
+        let task = tokio::spawn(self.clone().publish_as_due());
+        AbortOnDropHandle::new(task)
+    }
+
+    /// With no instant in hand the loop waits for a wake. With one in hand
+    /// it sleeps to it and settles at it. A wake that comes while it sleeps
+    /// is kept, and costs one more read of the instant.
+    async fn publish_as_due(self) {
+        loop {
+            let Some(due) = self.store.publish_due() else {
+                self.woken.notified().await;
+                continue;
+            };
+            sleep_until(due.into()).await;
+            self.settle_at(due);
+        }
+    }
+
+    /// The loop's publication: a settle at the store's instant, under the
+    /// feed's turn. It can pay a membership build, and the store may hold a
+    /// row written past the door, so the registry is brought up to date
+    /// first, as at every publication the feed makes.
+    fn settle_at(&self, due: Instant) {
+        let _turn = self.turn.lock();
+        // The store shows nothing before its instant, so the loop never
+        // hands it an earlier one.
+        settle(&self.objects, &self.store, Some(Instant::now().max(due)));
+    }
+}
+
+/// The crate's load adapter with the loop's wake. Every fact goes to the
+/// adapter. A call that can leave a write waiting in the store wakes the
+/// publication loop behind it. A reset is one: it drops the loads of rows
+/// that are not `Ready`. A question leaves none.
+struct FeedLoads {
+    adapter: LoadAdapter<ModelWorkerSnapshot, MemoryStore>,
+    woken: Arc<Notify>,
+}
+
+impl LoadSink for FeedLoads {
+    fn record(
+        &self,
+        worker: &Arc<dyn Worker>,
+        rank: i32,
+        report: &WorkerLoadResponse,
+        received_at: Instant,
+        sampled_at: Instant,
+    ) {
+        self.adapter
+            .record(worker, rank, report, received_at, sampled_at);
+        self.woken.notify_one();
+    }
+
+    fn poll_mode(&self, worker: &Arc<dyn Worker>, now: Instant, interval: Duration) -> PollMode {
+        self.adapter.poll_mode(worker, now, interval)
+    }
+
+    fn report(&self, answer: &[PolledMember<'_>], polled_at: Instant) -> PolledRanks {
+        let ranks = self.adapter.report(answer, polled_at);
+        self.woken.notify_one();
+        ranks
+    }
+
+    fn report_empty(&self, answer: &[PolledMember<'_>], polled_at: Instant) -> Vec<i32> {
+        let leaving = self.adapter.report_empty(answer, polled_at);
+        self.woken.notify_one();
+        leaving
+    }
+
+    fn fetch_failed(&self, members: &[Arc<dyn Worker>], polled_at: Instant) {
+        self.adapter.fetch_failed(members, polled_at);
+        self.woken.notify_one();
+    }
+
+    fn forget(&self, worker: &Arc<dyn Worker>) {
+        self.adapter.forget(worker);
+        self.woken.notify_one();
+    }
+
+    fn reset(&self) {
+        self.adapter.reset();
+        self.woken.notify_one();
+    }
+
+    fn needs_loads(&self) -> bool {
+        self.adapter.needs_loads()
+    }
+
+    fn tick(&self, tick: &GroupTick<'_>) {
+        self.adapter.tick(tick);
+    }
+}
+
+/// The adapter writes a row's health and mirrors its status on the worker.
+/// The registry writes the health of workers without a row.
+/// The adapter answers stale for those workers, so it cannot promote them.
+struct FeedHealth {
+    objects: Arc<Objects<ModelWorkerSnapshot>>,
+    adapter: HealthAdapter<ModelWorkerSnapshot, MemoryStore>,
+    registry: Arc<WorkerRegistry>,
+}
+
+impl FeedHealth {
+    fn sink(&self, worker_id: &WorkerId) -> &dyn HealthSink {
+        if self.objects.standing(worker_id).is_some() {
+            &self.adapter
+        } else {
+            self.registry.as_ref()
+        }
+    }
+}
+
+impl HealthSink for FeedHealth {
+    fn probe_outcome(
+        &self,
+        worker_id: &WorkerId,
+        passed: bool,
+        revision: u64,
+        launched: WorkerStatus,
+    ) -> ProbeAnswer {
+        self.sink(worker_id)
+            .probe_outcome(worker_id, passed, revision, launched)
+    }
+
+    fn connected(
+        &self,
+        worker_id: &WorkerId,
+        revision: u64,
+    ) -> Option<(WorkerStatus, WorkerStatus)> {
+        self.sink(worker_id).connected(worker_id, revision)
     }
 }
 
 /// The order is the rule: the registry holds a row's object before a
-/// decision can read the row.
-fn settle(objects: &Objects<ModelWorkerSnapshot>, store: &MemoryStore) {
+/// decision can read the row. With an instant the store shows what is due
+/// at it. With none it pays the build the membership writes left owed, at
+/// once.
+fn settle(objects: &Objects<ModelWorkerSnapshot>, store: &MemoryStore, at: Option<Instant>) {
     objects.follow(store);
-    store.publish_now();
+    match at {
+        Some(now) => store.publish(now),
+        None => store.publish_now(),
+    }
 }
 
 /// The feed over `store`, for the workers of `registry`. The holder lays
@@ -57,11 +278,37 @@ pub(crate) fn feed(
     registry: &Arc<WorkerRegistry>,
     connector: Arc<dyn EngineConnector>,
 ) -> Feed {
-    let objects = Arc::new(Objects::new(Arc::clone(registry)).with_connector(connector));
+    over(store, holder(registry, connector))
+}
+
+/// The feed of a gateway that follows a controller at an address.
+///
+/// Such a gateway probes no worker of its own. The controller's verdict is
+/// each row's status, and the holder copies it onto the row's object. The
+/// follower writes the store and settles this feed after each event.
+/// Nothing writes at its door.
+pub(crate) fn following(
+    store: &Arc<MemoryStore>,
+    registry: &Arc<WorkerRegistry>,
+    connector: Arc<dyn EngineConnector>,
+) -> Feed {
+    over(store, holder(registry, connector).with_status_followed())
+}
+
+/// A holder that writes `registry` and lays each object with `connector`.
+fn holder(
+    registry: &Arc<WorkerRegistry>,
+    connector: Arc<dyn EngineConnector>,
+) -> Objects<ModelWorkerSnapshot> {
+    Objects::new(Arc::clone(registry)).with_connector(connector)
+}
+
+fn over(store: &Arc<MemoryStore>, objects: Objects<ModelWorkerSnapshot>) -> Feed {
+    let objects = Arc::new(objects);
     let door = StoreDoor::new(Arc::clone(store)).telling({
         let objects = Arc::clone(&objects);
         let store = Arc::clone(store);
-        move || settle(&objects, &store)
+        move || settle(&objects, &store, None)
     });
     let turn = Arc::new(Mutex::new(()));
     Feed {
@@ -72,6 +319,7 @@ pub(crate) fn feed(
         objects,
         store: Arc::clone(store),
         turn,
+        woken: Arc::new(Notify::new()),
     }
 }
 

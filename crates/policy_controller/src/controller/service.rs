@@ -179,9 +179,10 @@ pub(crate) struct Shared {
     /// The log that store journals to and the wake of its watched writes:
     /// what a watch of the rows reads.
     pub(crate) feed: Feed,
-    /// Whether this replica leads, told at a change alone by the run loop's
-    /// one task: how an idle watch learns its replica stopped leading.
-    pub(crate) role: watch::Sender<bool>,
+    /// The term this replica leads, if it leads one, told at a change alone
+    /// by the run loop's one task: how an idle watch learns its replica
+    /// stopped leading, and a task of the lead that another term began.
+    pub(crate) role: watch::Sender<Option<u64>>,
     /// Who watches this replica: the bounds of a watch's open.
     pub(crate) watchers: Arc<Watchers>,
     /// A gateway's term floor above this replica's term, on its way to the
@@ -271,7 +272,7 @@ impl Shared {
             streams: Arc::new(Streams::new(decide::MAX_STREAMS)),
             stop: watch::Sender::new(false),
             feed,
-            role: watch::channel(false).0,
+            role: watch::channel(None).0,
             watchers: Arc::new(Watchers::new(session::PRESENT_MAX)),
             floors: Floors::default(),
             snapshots: Turn::new(snapshot::SNAPSHOTS_WAITING),

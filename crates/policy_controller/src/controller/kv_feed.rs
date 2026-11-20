@@ -32,11 +32,11 @@ mod tests {
             Controller,
         },
         store::{
-            Ask, GatewayId, MemoryStore, Named, Naming, Signals, ViewBuffers, WorkerFacts,
+            Ask, GatewayId, Maker, MemoryStore, Named, Naming, Signals, ViewBuffers, WorkerFacts,
             WorkerStatus, WorkersStore,
         },
         view::{Role, WireModes, WorkerId as RowId},
-        worker_host::{KvFeed, Members, Objects},
+        worker_host::{Expect, KvFeed, Members, Membership as _, Objects, StoreDoor},
         AppliedSpec, PolicySpec,
     };
 
@@ -186,6 +186,28 @@ mod tests {
         })
         .await
         .expect("the feed starts and processes the next worker");
+    }
+
+    /// The door states the signal the follow reads: the facts state none.
+    #[tokio::test]
+    async fn a_worker_found_at_a_door_gets_its_stream_after_one_registration() {
+        let f = Fixture::new();
+        let mut spec = PolicySpec::preset("cache_aware").expect("the cache-aware preset");
+        spec.generation = 1;
+        f.store
+            .apply(AppliedSpec::validate(&spec).expect("the preset validates"))
+            .expect("the first generation");
+        let door = StoreDoor::new(Arc::clone(&f.store));
+        f.check(async {
+            door.found(&Maker::Control, Expect::Nothing, FIRST, &|_| {
+                facts(FIRST, WireModes::GRPC, false)
+            })
+            .expect("registered");
+            f.objects.follow(&*f.store);
+            f.new_slot(FIRST, None).await;
+        })
+        .await
+        .expect("the feed asks the stream of the found worker");
     }
 
     #[tokio::test]
@@ -367,6 +389,7 @@ mod tests {
                     let naming = Naming {
                         gateway,
                         block_hashes: &hashes,
+                        namespace_seed: 0,
                         seed: 0,
                         cap: 0,
                         wires: None,

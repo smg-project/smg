@@ -13,7 +13,9 @@
 //! - 4.1, the view ([`view`]): [`RequestFacts`], [`Candidate`] rows with their
 //!   [`LoadRow`], the [`AffinityFacts`] column beside the rows, [`Constraints`]
 //!   and [`PoolFacts`]. Built once per decision by the host into a reused
-//!   buffer; no handle, no callback into the host.
+//!   buffer; no handle, no callback into the host. The values a report
+//!   states under a name the document declares stand beside the rows too
+//!   ([`signals`]): a stage reads one by its [`SignalColumn`].
 //! - 4.2, the decision ([`decision`]): an ordered [`Pick`] of up to
 //!   [`MAX_TARGETS`] targets, a [`Shed`] with its reason and the stage that
 //!   emptied the pool, or a [`Queue`] ticket (specified in v1; no built-in
@@ -28,8 +30,9 @@
 //!   a request; the [`Engine`] resolves a request to its binding and decides.
 //!   A scorer or picker allocates nothing per decision. The consistent-hash
 //!   scorer owns its ring ([`ring`]), fed by the membership hooks. The
-//!   prefixes sent to a model's workers are kept by the sent-prefix
-//!   predictor ([`predictor`]), which no decision reads yet.
+//!   prefixes sent to a model's workers without cache events are kept by
+//!   the sent-prefix predictor ([`predictor`]). A profile that reads sent
+//!   prefixes reads that record at the naming through the in-process door.
 //! - 4.5, the stages in code ([`catalog`]): the [`Catalog`] of the stages a
 //!   build knows by name, the stock build's and the ones a host registers.
 //!   A document names either kind the same way, and the validator resolves
@@ -134,6 +137,7 @@ pub mod controller;
 pub mod counts;
 pub mod decider;
 pub mod decision;
+pub mod demands;
 pub mod door;
 pub mod elector;
 pub mod framework;
@@ -158,6 +162,7 @@ pub mod ring;
 pub mod routing_key;
 pub mod sent;
 pub mod sessions;
+pub mod signals;
 pub mod spec;
 pub mod store;
 mod terms;
@@ -176,6 +181,7 @@ pub use decision::{
     Decision, Lifted, Overlap, OverlapSource, Pair, Pick, Queue, Shed, ShedReason, Survivors,
     Target, Targets, Trace, MAX_TARGETS, TRACE_TOP,
 };
+pub use demands::{DemandFacts, Demands};
 pub use door::{DecisionRecord, Explained, Names};
 pub use framework::{
     Binding, DecisionScope, EncodeItems, EncodePlaced, EncodePool, EncoderFacts, Engine, Filter,
@@ -193,6 +199,7 @@ pub use sent::{Sent, SentCredit};
 pub use sessions::{
     Assignment, Forgets, Pins, Recovery, SessionRule, SessionTable, SessionVerdict,
 };
+pub use signals::{SignalCell, SignalCells, SignalColumn};
 pub use spec::{
     AppliedSpec, Needs, PolicySpec, PowerOfTwoMetric, SessionsSpec, SpecError, API_VERSION, PRESETS,
 };

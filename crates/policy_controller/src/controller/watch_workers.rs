@@ -152,7 +152,7 @@ impl Feed {
     /// The task takes nothing of a watch. `role` is the replica's word, one
     /// for every watch: the watch that starts the task hands it a handle of
     /// its own.
-    fn start(&self, mut role: watch::Receiver<bool>) {
+    fn start(&self, mut role: watch::Receiver<Option<u64>>) {
         let mut teller = self.teller.lock();
         // A live task alone counts. The set keeps one that ended until it
         // is joined: those are taken out first.
@@ -305,12 +305,12 @@ pub(crate) struct Source {
     pub(crate) store: Arc<MemoryStore>,
     pub(crate) feed: Feed,
     pub(crate) fence: Arc<Fence>,
-    /// Whether this replica leads. That it does is told at the change; that
-    /// it does not is told again at every move of the serve, since the word
-    /// a stream found at its start may be the one before the lead it was
-    /// admitted under. A stream ends at the word that this replica does not
-    /// lead, whatever the word before it was.
-    pub(crate) role: watch::Receiver<bool>,
+    /// The term this replica leads, if it leads one. A term is told at its
+    /// start; that the replica leads none is told again at every move of
+    /// the serve, since the word a stream found at its start may be the one
+    /// before the lead it was admitted under. A stream ends at the word
+    /// that this replica does not lead, whatever the word before it was.
+    pub(crate) role: watch::Receiver<Option<u64>>,
     /// The term the watch was admitted under.
     pub(crate) term: u64,
 }
@@ -416,7 +416,7 @@ impl Watching {
     fn left(&mut self) -> bool {
         match self.source.role.has_changed() {
             Ok(false) => false,
-            Ok(true) => !*self.source.role.borrow_and_update(),
+            Ok(true) => self.source.role.borrow_and_update().is_none(),
             Err(_) => true,
         }
     }
@@ -852,7 +852,7 @@ pub(crate) mod tests {
         store: Arc<MemoryStore>,
         feed: Feed,
         elector: Elector,
-        role: watch::Sender<bool>,
+        role: watch::Sender<Option<u64>>,
         /// Who watches it: a table of two principals.
         watchers: Arc<Watchers>,
     }
@@ -874,7 +874,7 @@ pub(crate) mod tests {
             Tick::Acquired { term: 1 }
         );
         store.set_term(1);
-        let (role, _) = watch::channel(true);
+        let (role, _) = watch::channel(Some(1));
         Leader {
             store,
             feed,
@@ -1473,7 +1473,7 @@ pub(crate) mod tests {
         let mut stream = leader.watch(Start::Snapshot, &[]);
         next(&mut stream).await;
         // The fence is open still: the word alone ends the stream.
-        leader.role.send_replace(false);
+        leader.role.send_replace(None);
         assert_eq!(last_word(&mut stream).await.code(), Code::Aborted);
         assert!(stream.next().await.is_none(), "the end");
     }
@@ -1801,7 +1801,7 @@ pub(crate) mod tests {
         parks(&mut stream, &waker);
         // The fence is open still, and nothing was written: the word alone
         // wakes the stream, by the feed's task.
-        leader.role.send_replace(false);
+        leader.role.send_replace(None);
         woken.reads(1).await;
         leader.register(0, 1, "model-a");
         assert_eq!(last_word(&mut stream).await.code(), Code::Aborted);
@@ -2120,7 +2120,7 @@ pub(crate) mod tests {
         // One of the eight is taken: seven are in hand.
         next(&mut stream).await;
         // The fence is open still: the word alone ends the stream.
-        leader.role.send_replace(false);
+        leader.role.send_replace(None);
         let (taken, word) = to_the_last_word(&mut stream, written).await;
         assert_eq!(word.code(), Code::Aborted);
         assert_eq!(taken, 0, "an entry in hand told after the word");
@@ -2140,7 +2140,7 @@ pub(crate) mod tests {
         leader.register(0, 1, "model-a");
         // The word is told while the watcher takes nothing, the fence open
         // still.
-        leader.role.send_replace(false);
+        leader.role.send_replace(None);
         time::sleep(STALL + Duration::from_secs(1)).await;
         assert!(
             stream.next().await.is_none(),
@@ -2162,7 +2162,7 @@ pub(crate) mod tests {
         }
         // The word is told while the watcher takes nothing, the fence open
         // still.
-        leader.role.send_replace(false);
+        leader.role.send_replace(None);
         time::sleep(STALL / 2).await;
         let (taken, word) = to_the_last_word(&mut stream, written).await;
         assert_eq!(word.code(), Code::Aborted);
@@ -2223,7 +2223,7 @@ pub(crate) mod tests {
         let leader = leader();
         let mut stream = leader.watch(Start::Snapshot, &[]);
         // The task has not run yet, and the fence is open still.
-        leader.role.send_replace(false);
+        leader.role.send_replace(None);
         assert_eq!(last_word(&mut stream).await.code(), Code::Aborted);
         assert!(stream.next().await.is_none(), "the end");
     }
@@ -2234,12 +2234,12 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn the_word_told_again_ends_a_stream_that_started_under_it() {
         let leader = leader();
-        leader.role.send_replace(false);
+        leader.role.send_replace(None);
         let mut stream = leader.watch(Start::Snapshot, &[]);
         // The fence is open: the stream is served under the word it found.
         let page = next(&mut stream).await;
         assert!(matches!(page.event, Some(Event::Snapshot(_))), "{page:?}");
-        leader.role.send_replace(false);
+        leader.role.send_replace(None);
         assert_eq!(last_word(&mut stream).await.code(), Code::Aborted);
         assert!(stream.next().await.is_none(), "the end");
     }

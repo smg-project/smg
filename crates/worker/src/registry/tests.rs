@@ -193,7 +193,7 @@ fn assert_sampling_defaults_group_values(
 }
 
 #[test]
-fn connect_signal_receiver_is_taken_exactly_once() {
+fn connect_signal_receiver_is_held_by_one_taker_at_a_time() {
     let registry = WorkerRegistry::new();
     assert!(
         registry.take_connect_signal_receiver().is_some(),
@@ -203,6 +203,32 @@ fn connect_signal_receiver_is_taken_exactly_once() {
         registry.take_connect_signal_receiver().is_none(),
         "a second take must return None so a second manager runs poll-only"
     );
+}
+
+/// The receiver handed back is taken again, with what was sent while
+/// nobody read: a signal waits in the channel for the next loop. The
+/// hand-back wakes a waiter that asks after it too.
+#[tokio::test]
+async fn a_returned_connect_signal_receiver_is_taken_again_with_what_was_sent_meanwhile() {
+    let registry = WorkerRegistry::new();
+    let held = registry
+        .take_connect_signal_receiver()
+        .expect("the first take");
+    registry
+        .connect_signal_sender()
+        .send(WorkerConnected {
+            url: "ipc:///tmp/w.ipc".to_string(),
+            revision: 3,
+        })
+        .expect("send on a live channel");
+    registry.return_connect_signal_receiver(held);
+    registry.connect_signal_receiver_returned().await;
+
+    let mut again = registry
+        .take_connect_signal_receiver()
+        .expect("the receiver is back");
+    let got = again.recv().await.expect("the signal sent meanwhile");
+    assert_eq!(got.revision, 3);
 }
 
 #[tokio::test]
@@ -1504,6 +1530,35 @@ fn test_model_index_fast_lookup() {
     let llama_workers_after = registry.get_by_model("llama-3");
     assert_eq!(llama_workers_after.len(), 1);
     assert_eq!(llama_workers_after[0].url(), "http://worker2:8080");
+}
+
+/// The model index is iterated on request paths and the map's iterator pays
+/// for every shard, so its shard count is fixed: not the library's default
+/// of four shards a CPU.
+#[test]
+fn the_model_index_keeps_a_fixed_shard_count() {
+    use dashmap::Map as _;
+
+    let registry = WorkerRegistry::new();
+    assert_eq!(
+        registry.model_index._shard_count(),
+        16,
+        "the model index's shard count follows the CPUs"
+    );
+}
+
+/// The per-model retry overrides are scanned on a request path, as the model
+/// index is counted on one, so their map keeps the same fixed shard count.
+#[test]
+fn the_retry_override_map_keeps_a_fixed_shard_count() {
+    use dashmap::Map as _;
+
+    let registry = WorkerRegistry::new();
+    assert_eq!(
+        registry.model_retry_configs._shard_count(),
+        16,
+        "the retry override map's shard count follows the CPUs"
+    );
 }
 
 // Health-checker integration tests moved to health/manager.rs along with

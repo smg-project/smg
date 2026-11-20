@@ -1,14 +1,13 @@
-//! The routing configuration as a policy document:
-//! [`RouterConfig::policy_document`], one function from the configuration to
-//! the policy controller's [`PolicySpec`].
+//! The policy document the gateway gives to its controller.
 //!
 //! # Why this exists
 //!
-//! The policy controller decides by a document, not by flags. This function
-//! writes the document that today's routing settings mean, so a gateway can
-//! hand its routing to the controller and keep the routing its flags asked
-//! for. The store applies the document at startup when the controller is
-//! selected. No request path calls this module.
+//! [`RouterConfig::policy_document`] converts the routing settings into the
+//! controller's [`PolicySpec`]. At start-up, [`RouterConfig::policy_document_in_force`]
+//! takes a supplied document when the settings are at their configuration
+//! defaults or describe that same document. The store applies the document
+//! in force at startup when the controller is selected. No request path
+//! calls this module.
 //!
 //! # Where a setting lands
 //!
@@ -21,8 +20,11 @@
 //! - The overload thresholds land on the binding, the pairing mode on the
 //!   pair plan, the index settings under every model, and the block size
 //!   and the cache boundaries in the view.
-//! - The manual policy's settings land in the binding's session rule, with
-//!   the headers its key is read from.
+//! - The manual policy's settings land in the binding's session rule.
+//! - A keyed policy's key sources land on the binding. The two rings name
+//!   them under `routing_key`. The manual policy names them in its session
+//!   rule while they are headers alone, and under `routing_key` once the
+//!   override adds the request's own id.
 //!
 //! # What is refused
 //!
@@ -35,13 +37,11 @@
 //! What the gateway keeps for itself under the controller is no part of the
 //! document: the pools and their addresses, discovery, the probes and the
 //! load poll, retries and the breaker, the prefill queue and the decode
-//! rooms. The headers a routing key is read from are the gateway's too: it
-//! reads the key and states it as a fact of the request. One place names
-//! them, the session rule the manual policy places by. The copy of the
-//! cache boundaries at the top of the configuration decides nothing either:
-//! each policy reads its own.
+//! rooms. The copy of the cache boundaries at the top of the configuration
+//! decides nothing either: each policy reads its own.
 
 use serde::Serialize;
+use serde_json::Value;
 use smg_policy_controller::{
     affinity::{
         Gates, DEFAULT_THRESHOLD, DEFAULT_WARMUP_BLOCKS, DEFAULT_WARMUP_DIVERT_EVERY,
@@ -51,8 +51,9 @@ use smg_policy_controller::{
     builtins::{DEFAULT_KV_PRESSURE_WEIGHT, DEFAULT_MEAN_PREFILL_TOKENS, DEFAULT_THROUGHPUT},
     spec::{
         BestWithTemperatureParams, BoundedLoadParams, BucketParams, ConsistentHashParams,
-        IndexKind, IndexSpec, KvPressureParams, LeastLoadParams, OverloadSpec, Pairing, PickStage,
-        PrefixAffinityParams, ProfileSpec, ScoreSpec, ScoreStage, SpillParams, WarmupSliceParams,
+        IndexKind, IndexSpec, KeySourceSpec, KvPressureParams, LeastLoadParams, OverloadSpec,
+        Pairing, PickStage, PrefixAffinityParams, ProfileSpec, RoutingKeySpec, ScoreSpec,
+        ScoreStage, SpillParams, WarmupSliceParams, MANUAL_SESSION_HEADER, MAX_KEY_SOURCES,
         OVERLOAD_TOKEN_USAGE, OVERLOAD_WAITING_REQUESTS,
     },
     AppliedSpec, Assignment, Catalog, PolicySpec, PowerOfTwoMetric, SessionsSpec, SpecError,
@@ -68,7 +69,10 @@ use crate::policies::cost::DEFAULT_POLICY as DEFAULT_SELECTION_POLICY;
 /// placement follows an item's content, not the request's main policy.
 static ENCODE_DEFAULT: PolicyConfig = PolicyConfig::ConsistentHashing;
 
-/// Why a routing configuration has no policy document.
+/// The encode side's profile, by its name in a document of three sides.
+const ENCODE_SIDE: &str = "encode";
+
+/// Why a routing configuration has no policy document to run.
 #[derive(Debug, PartialEq, thiserror::Error)]
 pub enum PolicyDocumentError {
     /// A setting decides a placement and the document has no place for it.
@@ -95,9 +99,19 @@ pub enum PolicyDocumentError {
         policy: &'static str,
         part: &'static str,
     },
-    /// The controller knows no preset of a policy's name.
+    /// A failure to produce or validate a policy document.
     #[error(transparent)]
     Preset(#[from] SpecError),
+    /// The flags change the default document and differ from the supplied one.
+    #[error("the routing flags and the policy document disagree at {at}: the flags mean {flags}, the document says {document}")]
+    Disagree {
+        /// Where the documents first differ, in their own field names.
+        at: String,
+        /// The value from the routing flags.
+        flags: String,
+        /// The value from the supplied document.
+        document: String,
+    },
 }
 
 fn unsaid(
@@ -123,16 +137,23 @@ impl RouterConfig {
         refuse_unsaid(self)?;
         let (mut document, sides) = presets(self)?;
         let mut shared = Shared::default();
-        for &(profile, policy) in &sides {
+        for &(side, policy) in &sides {
             let profile =
                 document
                     .profiles
-                    .get_mut(profile)
+                    .get_mut(side)
                     .ok_or_else(|| PolicyDocumentError::NoPart {
                         policy: policy.name(),
                         part: "profile",
                     })?;
             write_policy(policy, self, profile, &mut shared)?;
+            // The encode side places an item by the item's content: it reads
+            // no key, and the override never places it.
+            if side != ENCODE_SIDE {
+                if let Some(sources) = key_sources(policy, self)? {
+                    shared.keys.push((policy.name(), sources));
+                }
+            }
         }
         shared.write(self, sides.len(), &mut document)?;
         let binding = document
@@ -144,6 +165,60 @@ impl RouterConfig {
             })?;
         binding.overload = overload(self)?;
         Ok(document)
+    }
+
+    /// The document this gateway runs. Without a supplied document, it is
+    /// the one the routing settings mean. A supplied document takes effect
+    /// if the settings describe the same document or the default
+    /// configuration's document for this mode. A conflict names the first
+    /// difference and the two values.
+    ///
+    /// Both launchers refuse a routing setting beside a document before
+    /// this runs, so the comparison judges a configuration built by hand.
+    /// The generation is no part of it: it numbers the document, and no
+    /// routing setting says it. A document that names none is this
+    /// gateway's first and takes number 1, since a store applies only a
+    /// number above the one it holds.
+    pub fn policy_document_in_force(&self) -> Result<PolicySpec, PolicyDocumentError> {
+        let mut said = self.policy_document()?;
+        let Some(given) = &self.policy_spec else {
+            return Ok(said);
+        };
+        let mut given = given.clone();
+        if given.generation == 0 {
+            given.generation = 1;
+        }
+        let plain = RouterConfig {
+            mode: self.mode.with_defaults(),
+            ..RouterConfig::default()
+        }
+        .policy_document()?;
+        if said == plain {
+            return Ok(given);
+        }
+        said.generation = given.generation;
+        if said == given {
+            return Ok(given);
+        }
+
+        let written = |spec| {
+            serde_json::to_value(spec)
+                .map_err(|error| SpecError::NoCanonicalForm(error.to_string()))
+        };
+        let flags = written(&said)?;
+        let document = written(&given)?;
+        if let Some(difference) = first_difference(Some(&flags), Some(&document), String::new()) {
+            return Err(difference);
+        }
+
+        // A field the reader accepts to report a validation error can be
+        // absent from the written form. Let the document name that error.
+        given.validate()?;
+        Err(PolicyDocumentError::Disagree {
+            at: "document".to_owned(),
+            flags: flags.to_string(),
+            document: document.to_string(),
+        })
     }
 
     /// Validates the document over the stock stages, with the gateway's
@@ -165,15 +240,85 @@ impl RouterConfig {
     }
 }
 
+impl RoutingMode {
+    /// Start with empty pools and clear any side policies, so the default
+    /// document for this mode carries none of the configured side settings.
+    fn with_defaults(&self) -> Self {
+        match self {
+            Self::Regular { .. } => Self::Regular {
+                worker_urls: vec![],
+            },
+            Self::PrefillDecode { .. } => Self::PrefillDecode {
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                prefill_policy: None,
+                decode_policy: None,
+            },
+            Self::EncodePrefillDecode { .. } => Self::EncodePrefillDecode {
+                encode_urls: vec![],
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                encode_policy: None,
+                prefill_policy: None,
+                decode_policy: None,
+            },
+            Self::OpenAI { .. } => Self::OpenAI {
+                worker_urls: vec![],
+            },
+            Self::Anthropic { .. } => Self::Anthropic {
+                worker_urls: vec![],
+            },
+            Self::Gemini { .. } => Self::Gemini {
+                worker_urls: vec![],
+            },
+        }
+    }
+}
+
+/// Walk each object in the flags' written order, then through keys that
+/// appear only in the supplied document. Walk lists by index.
+fn first_difference(
+    flags: Option<&Value>,
+    document: Option<&Value>,
+    at: String,
+) -> Option<PolicyDocumentError> {
+    match (flags, document) {
+        (Some(Value::Object(flags)), Some(Value::Object(document))) => flags
+            .keys()
+            .chain(document.keys().filter(|key| !flags.contains_key(*key)))
+            .find_map(|key| {
+                let path = if at.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{at}.{key}")
+                };
+                first_difference(flags.get(key), document.get(key), path)
+            }),
+        (Some(Value::Array(flags)), Some(Value::Array(document))) => {
+            (0..flags.len().max(document.len())).find_map(|index| {
+                first_difference(
+                    flags.get(index),
+                    document.get(index),
+                    format!("{at}[{index}]"),
+                )
+            })
+        }
+        _ if flags == document => None,
+        _ => {
+            let written = |value: Option<&Value>| {
+                value.map_or_else(|| "nothing".to_owned(), Value::to_string)
+            };
+            Some(PolicyDocumentError::Disagree {
+                at,
+                flags: written(flags),
+                document: written(document),
+            })
+        }
+    }
+}
+
 /// The settings that decide a placement today and that no document says.
 fn refuse_unsaid(config: &RouterConfig) -> Result<(), PolicyDocumentError> {
-    if config.routing_key_override.enabled {
-        return Err(unsaid(
-            "routing_key_override.enabled",
-            true,
-            "the controller holds no recorded form of the sticky sessions' rule yet",
-        ));
-    }
     match config.grouped_dp_sticky {
         GroupedDpSticky::Off => {}
         GroupedDpSticky::Hash => {
@@ -228,7 +373,11 @@ fn presets(config: &RouterConfig) -> Result<(PolicySpec, Vec<Side<'_>>), PolicyD
             let encode = mode.get_encode_policy(&ENCODE_DEFAULT);
             (
                 PolicySpec::epd_presets(encode.name(), prefill.name(), decode.name())?,
-                vec![("encode", encode), ("prefill", prefill), ("decode", decode)],
+                vec![
+                    (ENCODE_SIDE, encode),
+                    ("prefill", prefill),
+                    ("decode", decode),
+                ],
             )
         }
         RoutingMode::OpenAI { worker_urls: _ } => return Err(provider_mode("openai")),
@@ -558,6 +707,9 @@ struct Shared<'a> {
     /// The manual policy's sweep interval, idle time and assignment.
     manual: Option<(u64, u64, ManualAssignmentMode)>,
     manual_sides: usize,
+    /// The sources each keyed side reads a request's key from, under the
+    /// side's policy.
+    keys: Vec<(&'static str, RoutingKeySpec)>,
 }
 
 /// A value as the configuration spells it.
@@ -618,6 +770,15 @@ impl Shared<'_> {
             document.index.insert("*".to_string(), index);
         }
         let Some((eviction_interval_secs, max_idle_secs, assignment_mode)) = self.manual else {
+            // A binding names its key's sources once: what its keyed sides
+            // read, or nothing, over whatever its presets wrote.
+            let key = one_list(self.keys)?.filter(|key| !key.sources.is_empty());
+            if let Some(key) = &key {
+                within_a_block(key, config)?;
+            }
+            if let Some(binding) = document.bindings.first_mut() {
+                binding.routing_key = key;
+            }
             return Ok(());
         };
         if self.manual_sides != sides {
@@ -627,7 +788,31 @@ impl Shared<'_> {
                 "the manual policy places by the binding's one session rule, so every side of a plan is manual or none is",
             ));
         }
-        let (sticky_header, headers) = key_headers(config)?;
+        let key = one_list(self.keys)?.ok_or(PolicyDocumentError::NoPart {
+            policy: "manual",
+            part: "key sources",
+        })?;
+        let headers: Vec<String> = key
+            .sources
+            .iter()
+            .filter_map(|source| source.header.clone())
+            .collect();
+        // The rule's own two fields say a list of headers, each at the
+        // default length. The request's id and the stripped suffixes take
+        // the binding's block, and the rule then names no header.
+        let by_rule = !key.strip_lineage
+            && key
+                .sources
+                .iter()
+                .all(|source| !source.rid && source.max_bytes.is_none());
+        if !by_rule {
+            within_a_block(&key, config)?;
+        }
+        let sticky_header = headers
+            .first()
+            .filter(|_| by_rule)
+            .cloned()
+            .unwrap_or_default();
         // The manual policy sweeps nothing where either of its two times is
         // zero: a key stays pinned for ever, which the rule says with its
         // largest number.
@@ -656,10 +841,11 @@ impl Shared<'_> {
                 .pop()
                 .and_then(|binding| binding.sessions),
         };
+        binding.routing_key = (!by_rule).then_some(key);
         binding.sessions = Some(SessionsSpec {
             sticky_header,
             // One header is the sticky header alone, and the rule lists none.
-            headers: if headers.len() > 1 {
+            headers: if by_rule && headers.len() > 1 {
                 headers
             } else {
                 Vec::new()
@@ -681,25 +867,143 @@ impl Shared<'_> {
     }
 }
 
-/// The headers a routing key is read from, as a session rule names them:
-/// the first one, then all of them in the order they are tried, lowercase
-/// and each once.
-fn key_headers(config: &RouterConfig) -> Result<(String, Vec<String>), PolicyDocumentError> {
-    let mut headers: Vec<String> = Vec::new();
-    for name in &config.routing_key_override.headers {
-        let name = name.to_ascii_lowercase();
-        if !headers.contains(&name) {
-            headers.push(name);
+/// The one list of sources the keyed sides read, or the two policies whose
+/// lists differ: a binding names one list for every side. The sides are held
+/// to the same session sources. Client sources are the hash ring's alone, and
+/// no other side's stage reads their key, so the binding takes them from the
+/// side that names them.
+fn one_list(
+    keys: Vec<(&'static str, RoutingKeySpec)>,
+) -> Result<Option<RoutingKeySpec>, PolicyDocumentError> {
+    let of_session = |source: &&KeySourceSpec| !source.client;
+    let mut keys = keys.into_iter();
+    let Some((first, mut key)) = keys.next() else {
+        return Ok(None);
+    };
+    for (second, other) in keys {
+        let same = other.strip_lineage == key.strip_lineage
+            && (other.sources.iter().filter(of_session)).eq(key.sources.iter().filter(of_session));
+        if !same {
+            return Err(unsaid(
+                "policy",
+                format!("{first} and {second}"),
+                "the two sides read two lists of key sources and a binding names one",
+            ));
+        }
+        if other.sources.len() > key.sources.len() {
+            key = other;
         }
     }
-    match headers.first().cloned() {
-        Some(first) => Ok((first, headers)),
-        None => Err(unsaid(
+    Ok(Some(key))
+}
+
+/// A `routing_key` block holds eight sources at most, its client sources
+/// not counted.
+fn within_a_block(key: &RoutingKeySpec, config: &RouterConfig) -> Result<(), PolicyDocumentError> {
+    if key.sources.iter().filter(|source| !source.client).count() > MAX_KEY_SOURCES {
+        return Err(unsaid(
             "routing_key_override.headers",
-            "[]",
-            "the manual policy's session rule names the header its key is read from",
-        )),
+            spelled(&config.routing_key_override.headers),
+            "a binding names eight sources of its key at most",
+        ));
     }
+    Ok(())
+}
+
+/// The two headers the hash ring reads as a client's key, in its order.
+const CLIENT_HEADERS: [&str; 2] = ["x-forwarded-for", "cookie"];
+
+/// The sources a keyed policy reads a request's routing key from, in the
+/// order it reads them, as a binding's `routing_key` block names them: an
+/// empty list where the policy reads a key and no source is configured.
+/// `None` for a policy that reads no key.
+///
+/// - Every keyed policy reads the configured headers first, lowercase and
+///   each once.
+/// - `manual` and `consistent_hashing` read the routing key header behind
+///   them. Under the override they read the request's own id behind that,
+///   and every source loses its turn and retry suffixes.
+/// - `prefix_hash` reads the configured headers alone.
+///
+/// Two reads have no document yet and are refused by the setting's name.
+/// The override places every other policy's keyed requests by the sticky
+/// sessions' rule. And under the override the gateway reads the routing
+/// key header as sent where no configured header names it, while a block
+/// strips every source or none.
+///
+/// `consistent_hashing` also names its two client headers as client
+/// sources: a key from them places a request that carries no session key,
+/// and lifts no overload veto. A configured `x-forwarded-for` is named both
+/// ways, as the gateway reads it: within the cap as a session's key, and
+/// whole as a client's.
+fn key_sources(
+    policy: &PolicyConfig,
+    config: &RouterConfig,
+) -> Result<Option<RoutingKeySpec>, PolicyDocumentError> {
+    let overridden = config.routing_key_override.enabled;
+    let hint = match policy {
+        PolicyConfig::Manual { .. } | PolicyConfig::ConsistentHashing => true,
+        PolicyConfig::PrefixHash { .. } if !overridden => false,
+        // Each kind is named: a new one builds once its answer is written.
+        PolicyConfig::PrefixHash { .. }
+        | PolicyConfig::Random
+        | PolicyConfig::RoundRobin
+        | PolicyConfig::Passthrough
+        | PolicyConfig::CacheAware { .. }
+        | PolicyConfig::PowerOfTwo { .. }
+        | PolicyConfig::LeastLoad { .. }
+        | PolicyConfig::Bucket { .. } => {
+            return if overridden {
+                Err(unsaid(
+                    "routing_key_override.enabled",
+                    true,
+                    "the controller holds no recorded form of the sticky sessions' rule yet",
+                ))
+            } else {
+                Ok(None)
+            };
+        }
+    };
+    let header = |name: &str, client| KeySourceSpec {
+        header: Some(name.to_string()),
+        client,
+        ..KeySourceSpec::default()
+    };
+    let reads = |sources: &[KeySourceSpec], name: &str| {
+        sources
+            .iter()
+            .any(|source| source.header.as_deref() == Some(name))
+    };
+    let mut sources: Vec<KeySourceSpec> = Vec::new();
+    for name in &config.routing_key_override.headers {
+        let name = name.to_ascii_lowercase();
+        if !reads(&sources, &name) {
+            sources.push(header(&name, false));
+        }
+    }
+    if hint && !reads(&sources, MANUAL_SESSION_HEADER) {
+        if overridden {
+            return Err(unsaid(
+                "routing_key_override.headers",
+                spelled(&config.routing_key_override.headers),
+                "under the override the routing key header is read as sent behind these headers, and a binding strips every source or none",
+            ));
+        }
+        sources.push(header(MANUAL_SESSION_HEADER, false));
+    }
+    if overridden {
+        sources.push(KeySourceSpec {
+            rid: true,
+            ..KeySourceSpec::default()
+        });
+    }
+    if matches!(policy, PolicyConfig::ConsistentHashing) {
+        sources.extend(CLIENT_HEADERS.map(|name| header(name, true)));
+    }
+    Ok(Some(RoutingKeySpec {
+        sources,
+        strip_lineage: overridden,
+    }))
 }
 
 /// The binding's overload block, or none where the configuration stands at
@@ -734,7 +1038,7 @@ fn overload(config: &RouterConfig) -> Result<Option<OverloadSpec>, PolicyDocumen
 
 #[cfg(test)]
 mod tests {
-    use serde_json::{json, Value};
+    use serde_json::json;
     use smg_policy_controller::PRESETS;
 
     use super::*;
@@ -787,6 +1091,158 @@ mod tests {
 
     fn preset(name: &str) -> PolicySpec {
         PolicySpec::preset(name).expect("a preset of this build")
+    }
+
+    #[test]
+    fn with_no_document_the_flags_document_is_in_force() {
+        let config = config(PolicyConfig::RoundRobin);
+        assert_eq!(config.policy_document_in_force(), Ok(preset("round_robin")));
+    }
+
+    #[test]
+    fn a_given_document_wins_where_no_routing_setting_is_set() {
+        for (mode, document) in [
+            (RouterConfig::default().mode, preset("round_robin")),
+            (
+                RoutingMode::PrefillDecode {
+                    prefill_urls: vec![],
+                    decode_urls: vec![],
+                    prefill_policy: None,
+                    decode_policy: None,
+                },
+                PolicySpec::pair_presets("round_robin", "random").expect("paired presets"),
+            ),
+        ] {
+            let config = RouterConfig {
+                mode,
+                policy_spec: Some(document.clone()),
+                ..RouterConfig::default()
+            };
+            assert_eq!(config.policy_document_in_force(), Ok(document));
+        }
+    }
+
+    #[test]
+    fn a_given_document_that_the_flags_mean_too_is_in_force() {
+        let document = preset("round_robin");
+        let config = RouterConfig {
+            policy_spec: Some(document.clone()),
+            ..config(PolicyConfig::RoundRobin)
+        };
+        assert_eq!(config.policy_document_in_force(), Ok(document));
+    }
+
+    #[test]
+    fn the_generation_numbers_the_document_and_is_no_part_of_the_comparison() {
+        for (written, runs) in [(0, 1), (1, 1), (7, 7)] {
+            let mut document = preset("round_robin");
+            document.generation = written;
+            let mut in_force = document.clone();
+            in_force.generation = runs;
+            for settings in [RouterConfig::default(), config(PolicyConfig::RoundRobin)] {
+                let config = RouterConfig {
+                    policy_spec: Some(document.clone()),
+                    ..settings
+                };
+                assert_eq!(
+                    config.policy_document_in_force().as_ref(),
+                    Ok(&in_force),
+                    "generation {written}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_routing_flag_that_says_something_else_is_refused_with_both_values() {
+        let mut document = preset("bucket");
+        let profile = document.profiles.remove("bucket").expect("the profile");
+        document.profiles.insert("power_of_two".to_owned(), profile);
+        document.bindings[0].profile = Some("power_of_two".to_owned());
+        let config = RouterConfig {
+            policy_spec: Some(document),
+            ..config(at_flag_defaults("power_of_two"))
+        };
+        let refusal = config
+            .policy_document_in_force()
+            .expect_err("different stages");
+        assert_eq!(
+            refusal.to_string(),
+            r#"the routing flags and the policy document disagree at profiles.power_of_two.score[0]: the flags mean "least-load", the document says "bucket""#
+        );
+    }
+
+    #[test]
+    fn a_side_policy_that_says_something_else_is_refused_with_both_values() {
+        let config = RouterConfig {
+            mode: RoutingMode::PrefillDecode {
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                prefill_policy: Some(PolicyConfig::RoundRobin),
+                decode_policy: None,
+            },
+            policy_spec: Some(
+                PolicySpec::pair_presets("random", "random").expect("paired presets"),
+            ),
+            ..RouterConfig::default()
+        };
+        assert_eq!(
+            config.policy_document_in_force(),
+            Err(PolicyDocumentError::Disagree {
+                at: "profiles.prefill.pick".to_owned(),
+                flags: r#""round-robin""#.to_owned(),
+                document: r#""random""#.to_owned(),
+            }),
+        );
+    }
+
+    #[test]
+    fn a_part_one_side_lacks_reads_nothing() {
+        let document = edited(preset("round_robin"), |form| {
+            form["bindings"][0]["shadow"] = json!("round_robin");
+        });
+        let mut config = RouterConfig {
+            policy_spec: Some(document),
+            ..config(PolicyConfig::RoundRobin)
+        };
+        assert_eq!(
+            config.policy_document_in_force(),
+            Err(PolicyDocumentError::Disagree {
+                at: "bindings[0].shadow".to_owned(),
+                flags: "nothing".to_owned(),
+                document: r#""round_robin""#.to_owned(),
+            }),
+        );
+
+        let mut document = preset("round_robin");
+        let binding = serde_json::to_string(&document.bindings[0]).expect("the binding serializes");
+        document.bindings.clear();
+        config.policy_spec = Some(document);
+        assert_eq!(
+            config.policy_document_in_force(),
+            Err(PolicyDocumentError::Disagree {
+                at: "bindings[0]".to_owned(),
+                flags: binding,
+                document: "nothing".to_owned(),
+            }),
+        );
+    }
+
+    #[test]
+    fn a_kind_in_an_otherwise_equal_document_is_refused_by_name() {
+        let document = edited(preset("round_robin"), |form| {
+            form["kind"] = json!("PolicySpec");
+        });
+        let config = RouterConfig {
+            policy_spec: Some(document),
+            ..config(PolicyConfig::RoundRobin)
+        };
+        assert_eq!(
+            config.policy_document_in_force(),
+            Err(PolicyDocumentError::Preset(SpecError::Kind(
+                "PolicySpec".to_owned()
+            )))
+        );
     }
 
     /// A document with places of its JSON form written over.
@@ -1139,7 +1595,7 @@ mod tests {
     }
 
     #[test]
-    fn the_headers_of_a_routing_key_land_in_the_manual_session_rule_alone() {
+    fn the_headers_of_a_routing_key_land_where_the_policy_reads_its_key() {
         let keyed = |policy: &str, headers: &[&str]| {
             let mut keyed = config(at_flag_defaults(policy));
             keyed.routing_key_override.headers =
@@ -1147,40 +1603,240 @@ mod tests {
             keyed
         };
 
-        // The first header is the sticky one. The rule lists them where
-        // there is more than one, each once and lowercase.
+        // The manual policy reads the configured headers, then the routing
+        // key header. Its rule names them: the first is the sticky one, and
+        // the rule lists them where there is more than one, each once and
+        // lowercase.
+        let both = |document: &mut Value| {
+            document["view"]["headers"] = json!(["x-session-id", "x-smg-routing-key"]);
+            let sessions = &mut document["bindings"][0]["sessions"];
+            sessions["sticky_header"] = json!("x-session-id");
+            sessions["headers"] = json!(["x-session-id", "x-smg-routing-key"]);
+        };
         let listed = ["X-Session-Id", "x-smg-routing-key", "x-session-id"];
         assert_eq!(
             keyed("manual", &listed).policy_document(),
-            Ok(edited(preset("manual"), |document| {
-                document["view"]["headers"] = json!(["x-session-id", "x-smg-routing-key"]);
-                let sessions = &mut document["bindings"][0]["sessions"];
-                sessions["sticky_header"] = json!("x-session-id");
-                sessions["headers"] = json!(["x-session-id", "x-smg-routing-key"]);
-            }))
+            Ok(edited(preset("manual"), both))
         );
         assert_eq!(
             keyed("manual", &["x-session-id"]).policy_document(),
-            Ok(edited(preset("manual"), |document| {
-                document["view"]["headers"] = json!(["x-session-id"]);
-                document["bindings"][0]["sessions"]["sticky_header"] = json!("x-session-id");
+            Ok(edited(preset("manual"), both)),
+            "the routing key header is read behind a configured one that is not it"
+        );
+        assert_eq!(
+            keyed("manual", &[]).policy_document(),
+            Ok(preset("manual")),
+            "with no header configured the manual policy still reads the routing key header"
+        );
+
+        // The prefix ring reads the configured headers alone, and none is no
+        // block. The hash ring reads the routing key header behind them.
+        let sources = |name: &str, sources: Value| {
+            edited(preset(name), |document| {
+                document["bindings"][0]["routing_key"] = json!({ "sources": sources });
+            })
+        };
+        assert_eq!(
+            keyed("prefix_hash", &["x-session-id", "X-Other-Key"]).policy_document(),
+            Ok(sources(
+                "prefix_hash",
+                json!([{ "header": "x-session-id" }, { "header": "x-other-key" }])
+            ))
+        );
+        assert_eq!(
+            keyed("prefix_hash", &[]).policy_document(),
+            Ok(edited(preset("prefix_hash"), |document| {
+                document["bindings"][0]["routing_key"] = Value::Null;
             }))
         );
         assert_eq!(
-            refusal(&keyed("manual", &[])),
-            ("routing_key_override.headers", "[]".to_string()),
-            "a session rule with no header to read its key from is no document"
+            keyed("consistent_hashing", &["x-session-id"]).policy_document(),
+            Ok(sources(
+                "consistent_hashing",
+                json!([
+                    { "header": "x-session-id" },
+                    { "header": "x-smg-routing-key" },
+                    { "header": "x-forwarded-for", "client": true },
+                    { "header": "cookie", "client": true }
+                ])
+            ))
         );
 
-        // No other policy's document names a header: the gateway reads the
-        // key and states it.
-        for name in PRESETS.iter().filter(|name| **name != "manual") {
+        // Eight sources bound a block. The manual policy's rule holds the
+        // configured headers, bounded by the view: 256 with the routing key
+        // header.
+        let eight: Vec<String> = (0..8).map(|n| format!("x-key-{n}")).collect();
+        let eight: Vec<&str> = eight.iter().map(String::as_str).collect();
+        assert_eq!(
+            refusal(&keyed("consistent_hashing", &eight)).0,
+            "routing_key_override.headers"
+        );
+        assert!(keyed("manual", &eight).policy_document().is_ok());
+        // The hash ring's two client sources are counted apart: seven
+        // configured headers and the routing key header are its eight.
+        let seven = keyed("consistent_hashing", &eight[..7]);
+        let written = seven.policy_document().expect("eight sources");
+        assert!(seven.hosted_policy(&written).is_ok());
+
+        // The hash ring reads a configured `x-forwarded-for` both ways,
+        // within the cap as a session's key and whole as a client's. The
+        // document names it twice, and the controller's check takes it.
+        let both_ways = keyed("consistent_hashing", &["x-forwarded-for"]);
+        let document = sources(
+            "consistent_hashing",
+            json!([
+                { "header": "x-forwarded-for" },
+                { "header": "x-smg-routing-key" },
+                { "header": "x-forwarded-for", "client": true },
+                { "header": "cookie", "client": true }
+            ]),
+        );
+        assert_eq!(both_ways.policy_document().as_ref(), Ok(&document));
+        assert!(both_ways.hosted_policy(&document).is_ok());
+
+        // No other policy reads a key, so its document names no source.
+        let keyed_policies = ["manual", "prefix_hash", "consistent_hashing"];
+        for name in PRESETS
+            .iter()
+            .filter(|name| !keyed_policies.contains(*name))
+        {
             assert_eq!(
                 keyed(name, &["x-session-id"]).policy_document(),
                 Ok(preset(name)),
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn the_override_adds_the_requests_id_where_a_policy_keeps_its_own_key() {
+        let overridden = |policy: &str| {
+            let mut overridden = config(at_flag_defaults(policy));
+            overridden.routing_key_override.enabled = true;
+            overridden
+        };
+
+        // The hash ring keeps its own placement under the override. Its
+        // sources gain the request's id behind the headers, and every source
+        // loses its turn and retry suffixes.
+        assert_eq!(
+            overridden("consistent_hashing").policy_document(),
+            Ok(edited(preset("consistent_hashing"), |document| {
+                document["bindings"][0]["routing_key"] = json!({
+                    "sources": [
+                        { "header": "x-smg-routing-key" },
+                        { "rid": true },
+                        { "header": "x-forwarded-for", "client": true },
+                        { "header": "cookie", "client": true }
+                    ],
+                    "strip_lineage": true
+                });
+            }))
+        );
+
+        // The manual policy's rule says headers alone. The id and the strip
+        // take the binding's block, and the rule then names no header.
+        assert_eq!(
+            overridden("manual").policy_document(),
+            Ok(edited(preset("manual"), |document| {
+                let binding = &mut document["bindings"][0];
+                binding["routing_key"] = json!({
+                    "sources": [{ "header": "x-smg-routing-key" }, { "rid": true }],
+                    "strip_lineage": true
+                });
+                binding["sessions"]["sticky_header"] = json!("");
+            }))
+        );
+
+        // The override places every other policy's keyed requests itself.
+        for name in ["prefix_hash", "cache_aware", "round_robin"] {
+            assert_eq!(
+                refusal(&overridden(name)),
+                ("routing_key_override.enabled", "true".to_string()),
+                "{name}"
+            );
+        }
+
+        // Behind other configured headers the gateway reads the routing key
+        // header as sent, and a block strips every source or none.
+        let mut behind = overridden("consistent_hashing");
+        behind.routing_key_override.headers = vec!["x-session-id".to_string()];
+        assert_eq!(
+            refusal(&behind),
+            (
+                "routing_key_override.headers",
+                r#"["x-session-id"]"#.to_string()
+            )
+        );
+
+        // The encode side reads no key and the override never places it.
+        let mut plan = RouterConfig {
+            mode: RoutingMode::EncodePrefillDecode {
+                encode_urls: Vec::new(),
+                prefill_urls: Vec::new(),
+                decode_urls: Vec::new(),
+                encode_policy: Some(PolicyConfig::RoundRobin),
+                prefill_policy: Some(PolicyConfig::ConsistentHashing),
+                decode_policy: Some(PolicyConfig::ConsistentHashing),
+            },
+            ..config(PolicyConfig::RoundRobin)
+        };
+        plan.routing_key_override.enabled = true;
+        let sources = plan.policy_document().map(|document| {
+            document
+                .bindings
+                .first()
+                .and_then(|binding| binding.routing_key.as_ref())
+                .map(|key| key.sources.len())
+        });
+        assert_eq!(sources, Ok(Some(4)));
+    }
+
+    #[test]
+    fn the_sides_of_a_plan_share_one_list_of_key_sources() {
+        let pair = |prefill: &str, decode: &str| RouterConfig {
+            mode: RoutingMode::PrefillDecode {
+                prefill_urls: Vec::new(),
+                decode_urls: Vec::new(),
+                prefill_policy: Some(at_flag_defaults(prefill)),
+                decode_policy: Some(at_flag_defaults(decode)),
+            },
+            pd_pairing_mode: PdPairingMode::Strict,
+            ..config(PolicyConfig::RoundRobin)
+        };
+
+        // One keyed side names the binding's sources, whichever side it is.
+        for (prefill, decode) in [
+            ("consistent_hashing", "least_load"),
+            ("least_load", "consistent_hashing"),
+            ("prefix_hash", "prefix_hash"),
+            ("prefix_hash", "consistent_hashing"),
+        ] {
+            let mut expected =
+                PolicySpec::pair_presets(prefill, decode).expect("a pair of presets");
+            expected.plans.pd_pair.pairing = Pairing::Strict;
+            assert_eq!(
+                pair(prefill, decode).policy_document(),
+                Ok(expected),
+                "{prefill} and {decode}"
+            );
+        }
+
+        // Two sides that read two lists are refused by their policies: with
+        // no header configured the prefix ring reads none, and the hash ring
+        // still reads the routing key header.
+        let mut bare = pair("prefix_hash", "consistent_hashing");
+        bare.routing_key_override.headers = Vec::new();
+        assert_eq!(
+            refusal(&bare),
+            ("policy", "prefix_hash and consistent_hashing".to_string())
+        );
+
+        // The manual policy's own refusal comes first.
+        assert_eq!(
+            refusal(&pair("manual", "consistent_hashing")),
+            ("policy", "manual".to_string())
+        );
     }
 
     #[test]

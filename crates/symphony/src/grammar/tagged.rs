@@ -13,13 +13,14 @@
 //! assembler takes them away by it, not the grammar.
 //!
 //! The value follows the property's type. A string is written as it is, any text up to the
-//! parameter's close or a terminal the table leaves the call on. A number is JSON. A boolean or
-//! null is JSON or Python's word (`True`, `False`, `None`), both of which the templates write and
-//! the assembler reads. An object or a list is JSON the property's schema accepts where the
-//! template writes JSON (Qwen's `tojson`), and any text where the template writes Python's repr
-//! (Seed-OSS's `str`), which the assembler reads as the JSON it stands for ([`Spelling`]). A
-//! property without a type, or a schema without properties, takes any text. When the calls sit in a
-//! block, the block's ways in frame one or more calls, as Kimi K3's do.
+//! parameter's close, the word that opens another parameter or a terminal the table leaves the
+//! call on: a value cannot go on over the next parameter's tag. A number is JSON. A boolean or null
+//! is JSON or Python's word (`True`, `False`, `None`), both of which the templates write and the
+//! assembler reads. An object or a list is JSON the property's schema accepts where the template
+//! writes JSON (Qwen's `tojson`), and any text where the template writes Python's repr (Seed-OSS's
+//! `str`), which the assembler reads as the JSON it stands for ([`Spelling`]). A property without a
+//! type, or a schema without properties, takes any text. When the calls sit in a block, the block's
+//! ways in frame one or more calls, as Kimi K3's do.
 
 use std::sync::Arc;
 
@@ -85,10 +86,15 @@ struct Slot {
 }
 
 impl Values<'_> {
-    /// A value written as it is: any text up to the parameter's close or a terminal that ends the
-    /// call.
+    /// A value written as it is: any text up to the parameter's close, the word that opens another
+    /// parameter or a terminal that ends the call. The opener ends the value at its word, before
+    /// its sign: a model that runs on writes the word first, and a stop at the sign would leave the
+    /// word in the value.
     fn text(&self) -> Slot {
-        let mut excludes = vec![PARAMETER_CLOSE.to_string()];
+        let mut excludes = vec![
+            PARAMETER_CLOSE.to_string(),
+            PARAMETER_OPEN.trim_end_matches('=').to_string(),
+        ];
         excludes.extend(self.call_exits.iter().map(|exit| exit.to_string()));
         Slot {
             value: Grammar::AnyText { excludes },
@@ -254,7 +260,7 @@ mod tests {
             .payload();
         let text = value!({
             "type": "any_text",
-            "excludes": ["</parameter>", "</tool_call>", "<tool_call>"],
+            "excludes": ["</parameter>", "<parameter", "</tool_call>", "<tool_call>"],
         });
         let city = value!({"type": "const_string", "value": "city"});
         let days =
@@ -336,7 +342,9 @@ mod tests {
         assert_eq!(weather["end"], "</function>\n</seed:tool_call>");
         let text = value!({
             "type": "any_text",
-            "excludes": ["</parameter>", "</seed:tool_call>", "<seed:tool_call>"],
+            "excludes": [
+                "</parameter>", "<parameter", "</seed:tool_call>", "<seed:tool_call>",
+            ],
         });
         let slots = weather["content"]["elements"]
             .as_array()

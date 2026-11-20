@@ -403,6 +403,17 @@ impl CliArgs {
         }))
     }
 
+    /// Select the main routing policy. A policy document replaces the
+    /// routing flags, so the line names no policy beside one: the
+    /// configuration's default stands in, and the document decides.
+    fn routing_policy(&self) -> PolicyConfig {
+        match self.routing.policy.as_deref() {
+            Some(policy) => self.parse_policy(policy),
+            None if self.routing.policy_spec.is_some() => RouterConfig::default().policy,
+            None => self.parse_policy("cache_aware"),
+        }
+    }
+
     /// Build a routing policy with the same per-policy defaults as the CLI flags.
     fn parse_policy(&self, policy_str: &str) -> PolicyConfig {
         match policy_str {
@@ -1112,7 +1123,7 @@ impl CliArgs {
     fn routing_part(&self, mode: RoutingMode) -> ConfigResult<RouterConfigBuilder> {
         Ok(RouterConfig::builder()
             .mode(mode)
-            .policy(self.parse_policy(&self.routing.policy))
+            .policy(self.routing_policy())
             .cache_boundaries(self.routing.cache_boundaries.clone())
             .maybe_discovery(self.discovery_config()?)
             .igw(self.routing.enable_igw)
@@ -1350,6 +1361,8 @@ impl CliArgs {
             .maybe_reasoning_parser(self.model.reasoning_parser.as_ref())
             .maybe_tool_call_parser(self.model.tool_call_parser.as_ref())
             .maybe_mcp_config_path(self.model.mcp_config_path.as_ref())
+            .policy_controller(self.routing.policy_controller == "on")
+            .maybe_policy_spec_path(self.routing.policy_spec.as_ref())
             .retries(!self.serving.disable_retries)
             .upstream_http2(self.routing.upstream_http2)
             .circuit_breaker(!self.serving.disable_circuit_breaker)
@@ -1371,7 +1384,6 @@ impl CliArgs {
             );
 
         let config = RouterConfig {
-            policy_controller: self.routing.policy_controller,
             policy_controller_address: self.routing.policy_controller_address.clone(),
             policy_controller_tls_ca_cert: self.routing.policy_controller_tls_ca_cert.clone(),
             policy_controller_tls_cert: self.routing.policy_controller_tls_cert.clone(),
@@ -1485,9 +1497,18 @@ impl CliArgs {
         if self.routing.enable_igw {
             return;
         }
-        println!("Policy: {}", self.routing.policy);
+        println!("{}", self.policy_line());
         for line in self.node_lines(prefill_urls, encode_urls) {
             println!("{line}");
+        }
+    }
+
+    /// The banner's policy line: the document where one decides, else the
+    /// policy the line means.
+    fn policy_line(&self) -> String {
+        match &self.routing.policy_spec {
+            Some(path) => format!("Policy: document {path}"),
+            None => format!("Policy: {}", self.routing_policy().name()),
         }
     }
 

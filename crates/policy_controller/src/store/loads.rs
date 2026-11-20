@@ -175,6 +175,12 @@ pub trait LoadSink: Send + Sync {
     /// The worker left, or its reports stopped: nothing on file for it.
     fn evict(&self, id: WorkerId);
 
+    /// Evict every member whose row is not `Ready`, as [`Self::evict`] does
+    /// one. A host's collector asks behind events it lost: a member that
+    /// left `Ready` among them was never forgotten. A sink that keeps no
+    /// membership has no status to read and does nothing.
+    fn evict_unready(&self);
+
     /// When the writes this sink took and has not yet shown its readers are
     /// due to be shown; `None` when nothing waits. A sink that shows each
     /// write at once never names an instant. The crate's load driver keeps

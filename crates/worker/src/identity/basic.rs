@@ -152,8 +152,9 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// The URL as a request's success path shows it (the routed-worker
     /// response header, the cache-trace header, the request-sent event): the
     /// registered URL byte for byte when it has no userinfo, query or
-    /// fragment, otherwise `Endpoint::redacted_str`'s form (see
-    /// `Endpoint::redacted_url`). Computed once at construction
+    /// fragment, otherwise its redacted form by the spec's own rule
+    /// (`WorkerSpec::redacted_url`), which reads a rank out of the address
+    /// its spec ranks alone. Computed once at construction
     /// (`WorkerMetadata::redacted_url`).
     fn redacted_url(&self) -> &str {
         &self.metadata().redacted_url

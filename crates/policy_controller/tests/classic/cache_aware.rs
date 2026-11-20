@@ -415,6 +415,7 @@ impl Served {
             let naming = Naming {
                 gateway: GATEWAY,
                 block_hashes: &hashes,
+                namespace_seed: 0,
                 seed,
                 cap: world.spec().engine().named_for(MODEL, Phase::Single),
                 wires: None,

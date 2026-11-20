@@ -1012,6 +1012,7 @@ mod tests {
             text_hashes: false,
             loads: true,
             events: true,
+            sent_prefixes: true,
             ring: true,
             headers: true,
             media: true,
@@ -1019,6 +1020,7 @@ mod tests {
             session_in_flight: true,
             affinity: true,
             sample: 8,
+            signal_cells: true,
         };
         assert_eq!(sent(&held[..3], tokens), [1, 2, 3]);
         assert_eq!(sent(&held[..3], text), [1, 2, 3]);

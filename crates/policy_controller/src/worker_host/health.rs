@@ -2,10 +2,12 @@
 //!
 //! The adapter reads the lead before it takes the object's mutation lock and
 //! again under it. With the lock held, it reads the holder's map, releases
-//! the read lock, and writes the store. The holder writes its map and the
-//! registry under separate locks. Its status mirror reads the row under
-//! the same mutation lock as the adapter and writes through the
-//! registry as the adapter does.
+//! the read lock, and writes the store. The store asks the lead once more
+//! behind its own locks, as an admitted apply asks its own: a term that
+//! ended while a write waited there writes nothing, a verdict's and a
+//! projection's alike. The holder writes its map and the registry under
+//! separate locks. Its status mirror reads the row under the same mutation
+//! lock as the adapter and writes through the registry as the adapter does.
 //!
 //! The store guards a write by the row's id and revision, and a row's id is
 //! its key and incarnation. A URL's next life under another incarnation is
@@ -17,11 +19,9 @@
 //! The projection ([`HealthAdapter::project`]) writes what the object knows
 //! of its worker onto the row, under the same lock and the same fences. It
 //! reads the object at its write and is handed no reading, so of two
-//! projections the later one's reading stands on the row. The store asks
-//! the lead once more behind its own locks, as an admitted apply asks its
-//! own: a term that ended while the write waited there writes nothing. A
-//! projection moves no status: the object's follows its row through the
-//! holder's mirror and through a verdict's write.
+//! projections the later one's reading stands on the row. A projection
+//! moves no status: the object's follows its row through the holder's
+//! mirror and through a verdict's write.
 
 use std::sync::Arc;
 
@@ -45,7 +45,8 @@ pub struct HealthAdapter<G, S: ?Sized> {
 
 impl<G: Generation, S: StoreHealthSink + ?Sized> HealthAdapter<G, S> {
     /// An adapter for `term`. Each call checks that `lead` still names it
-    /// before taking the object's lock, and again under the lock.
+    /// before taking the object's lock and again under the lock, and the
+    /// store asks it once more behind its own.
     pub fn new(objects: Arc<Objects<G>>, store: Arc<S>, lead: Arc<dyn Lead>, term: u64) -> Self {
         Self {
             objects,
@@ -153,7 +154,7 @@ impl<G: Generation, S: StoreHealthSink + ?Sized + 'static> HealthSink for Health
         _launched: ObjectStatus,
     ) -> ProbeAnswer {
         match self.write(worker_id, revision, |store, standing| {
-            store.probe_outcome(standing.row, passed, standing.revision)
+            store.probe_outcome(standing.row, passed, standing.revision, &|| self.leads())
         }) {
             HealthWrite::Moved { from, to } => ProbeAnswer::Moved {
                 old: status(from),
@@ -170,7 +171,7 @@ impl<G: Generation, S: StoreHealthSink + ?Sized + 'static> HealthSink for Health
         revision: u64,
     ) -> Option<(ObjectStatus, ObjectStatus)> {
         self.write(worker_id, revision, |store, standing| {
-            store.connected(standing.row, standing.revision)
+            store.connected(standing.row, standing.revision, &|| self.leads())
         })
         .moved()
         .map(|(from, to)| (status(from), status(to)))
@@ -352,7 +353,7 @@ mod tests {
         let replica = Replica::new(1, true).expect("a laid worker");
         let row = replica.store.by_key(URL).expect("a row");
         assert!(
-            StoreHealthSink::connected(replica.store.as_ref(), row.id, row.revision)
+            StoreHealthSink::connected(replica.store.as_ref(), row.id, row.revision, &|| true)
                 .moved()
                 .is_some()
         );
@@ -456,6 +457,51 @@ mod tests {
         assert!(replica.doubted());
     }
 
+    /// The store has the term's last word at a verdict too. A probe's
+    /// outcome and a connect signal that passed the adapter's two readings
+    /// and waited at the store's lock through their term's end write
+    /// nothing there: no status moves, no probe is counted and the journal
+    /// is told nothing.
+    #[test]
+    fn a_verdict_whose_term_ended_at_the_stores_lock_writes_nothing() {
+        let replica = Replica::new(2, true).expect("a laid worker");
+        let turning = || {
+            HealthAdapter::new(
+                Arc::clone(&replica.objects),
+                Arc::clone(&replica.store),
+                TurningLead::after(2),
+                1,
+            )
+        };
+        let epoch = replica.store.epoch();
+        assert_eq!(
+            turning().probe_outcome(&replica.id, true, replica.revision, ObjectStatus::Pending),
+            ProbeAnswer::Stale
+        );
+        assert_eq!(turning().connected(&replica.id, replica.revision), None);
+        replica.assert_statuses(Some(RowStatus::Pending), ObjectStatus::Pending);
+        assert_eq!(
+            replica.store.epoch(),
+            epoch,
+            "a refused verdict moved the store"
+        );
+        // The refused pass was not counted: under a term that stands the
+        // row still owes the two passes its policy asks.
+        let adapter = replica.adapter();
+        assert_eq!(
+            adapter.probe_outcome(&replica.id, true, replica.revision, ObjectStatus::Pending),
+            ProbeAnswer::Stood(ObjectStatus::Pending)
+        );
+        assert_eq!(
+            adapter.probe_outcome(&replica.id, true, replica.revision, ObjectStatus::Pending),
+            ProbeAnswer::Moved {
+                old: ObjectStatus::Pending,
+                new: ObjectStatus::Ready,
+            }
+        );
+        replica.assert_statuses(Some(RowStatus::Ready), ObjectStatus::Ready);
+    }
+
     /// A projection moves no status. Its answer says the row's, and an
     /// object that lags its row keeps its own: the holder's mirror and a
     /// verdict's write move it, never a projection.
@@ -464,7 +510,7 @@ mod tests {
         let replica = Replica::new(1, true).expect("a laid worker");
         let row = replica.store.by_key(URL).expect("a row");
         assert!(
-            StoreHealthSink::connected(replica.store.as_ref(), row.id, row.revision)
+            StoreHealthSink::connected(replica.store.as_ref(), row.id, row.revision, &|| true)
                 .moved()
                 .is_some()
         );
@@ -625,7 +671,7 @@ mod tests {
         let replica = Replica::new(2, false).expect("a laid worker");
         let row = replica.store.by_key(URL).expect("a row");
         assert_eq!(
-            StoreHealthSink::connected(replica.store.as_ref(), row.id, row.revision),
+            StoreHealthSink::connected(replica.store.as_ref(), row.id, row.revision, &|| true),
             HealthWrite::Moved {
                 from: RowStatus::Pending,
                 to: RowStatus::Ready,

@@ -163,6 +163,9 @@ never read as something they are not, never shown as the answer, and never vanis
 Inside a value only `</parameter>` is a tag; `<function=`, `<parameter=` and `</function>` there
 are the value's text (the engine's parser ends a value at the next `<parameter=` or `</function>`
 as well, a tolerance to judge with adversarial fixtures rather than port).
+The structural tag is narrower than the reader there: under a tag, a value written as text does
+not hold `<parameter` and cannot go on over the next parameter's tag. A bare `<` remains text, and
+the reader's rule is unchanged for a worker that takes no grammar.
 
 Two endings. `Assembler::close` is for a block the model ended before `</function>` (its own closing
 marker came, or the next call began): the call is over as far as the model is concerned, so after
