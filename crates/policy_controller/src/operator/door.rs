@@ -681,7 +681,8 @@ impl SpecDoor {
         let applied = dir.written(newest).map_err(unreadable)?;
         let rule = Line::Record(generation);
         let Checked { digest, next, .. } = self.pass(self.standing(), &document, format, rule)?;
-        // Where the store runs this document already, none is entered.
+        // Where the store runs this document already, at the file's number
+        // or above it, none is entered.
         if let Some(next) = next {
             let kept = Held {
                 generation,
