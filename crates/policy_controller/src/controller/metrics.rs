@@ -73,6 +73,10 @@ pub const SPEC_GENERATION: &str = "smg_policy_spec_generation";
 /// kept. A document that is the standing one counts as neither. Rendered
 /// with [`SPEC_GENERATION`].
 pub const SPEC_APPLY_TOTAL: &str = "smg_policy_spec_apply_total";
+/// Pushed policy spec documents a gateway refused. Such a gateway keeps the
+/// document it runs, and the spec read's rows say which one refused.
+/// Rendered with [`SPEC_GENERATION`].
+pub const SPEC_PUSH_REFUSED_TOTAL: &str = "smg_policy_spec_push_refused_total";
 /// Decide requests answered `Busy`, by the `reason` the answer carries
 /// (`unspecified`, `queue_depth`, `no_credit`, `budget_gone_on_arrival`,
 /// `not_leader`): each is one the gateway decided locally. A refused
@@ -163,6 +167,7 @@ struct SpecSeries {
     generation: Gauge,
     applied: Counter,
     rejected: Counter,
+    pushes_refused: Counter,
 }
 
 /// The load driver's counts as the recorder's counters, set absolute from
@@ -431,6 +436,11 @@ impl Metrics {
                 None,
                 "Policy spec documents a source handed over, by result (applied, rejected)".into(),
             );
+            self.recorder.describe_counter(
+                KeyName::from_const_str(SPEC_PUSH_REFUSED_TOTAL),
+                None,
+                "Pushed policy spec documents a gateway refused".into(),
+            );
             let result = |result: &'static str| {
                 self.recorder.register_counter(
                     &Key::from_parts(SPEC_APPLY_TOTAL, vec![Label::new("result", result)]),
@@ -443,6 +453,9 @@ impl Metrics {
                     .register_gauge(&Key::from_name(SPEC_GENERATION), &metadata),
                 applied: result("applied"),
                 rejected: result("rejected"),
+                pushes_refused: self
+                    .recorder
+                    .register_counter(&Key::from_name(SPEC_PUSH_REFUSED_TOTAL), &metadata),
                 generations,
             }
         });
@@ -473,6 +486,8 @@ impl Metrics {
             spec.generation.set(spec.generations.generation() as f64);
             spec.applied.absolute(counts.applied);
             spec.rejected.absolute(counts.rejected);
+            spec.pushes_refused
+                .absolute(spec.generations.pushes_refused());
         }
         self.observe_decides(decides);
         self.observe_store(store());
@@ -565,7 +580,7 @@ mod tests {
     use super::{
         Generations, Metrics, StoreCounts, MEMBERS_OUTSIDE_LIST, REPLICATION_LAG_SECONDS,
         REPLICATION_RESTORES_ASKED_TOTAL, REPLICATION_SYNCED, SIGNAL_WRITES_TOTAL,
-        SPEC_APPLY_TOTAL, SPEC_GENERATION, START_TIME_SECONDS, STATE,
+        SPEC_APPLY_TOTAL, SPEC_GENERATION, SPEC_PUSH_REFUSED_TOTAL, START_TIME_SECONDS, STATE,
     };
     use crate::{
         controller::{
@@ -1009,6 +1024,24 @@ mod tests {
             .apply(RANDOM.into(), Format::Yaml)
             .expect("a valid document");
         series(2, 2, 1);
+
+        // A gateway's refusal of a pushed document is its own series.
+        let refused = |count: u64| {
+            let rendered = metrics.render(
+                || State::Leader,
+                &Stats::default(),
+                &Counts::default(),
+                StoreCounts::default,
+            );
+            let line = format!("{SPEC_PUSH_REFUSED_TOTAL} {count}");
+            assert!(
+                rendered.lines().any(|rendered| rendered == line),
+                "no line {line:?} in {rendered}"
+            );
+        };
+        refused(0);
+        generations.push_refused();
+        refused(1);
     }
 
     #[test]

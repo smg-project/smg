@@ -2724,6 +2724,100 @@ async fn a_dispatched_lease_is_ended_by_a_report_on_the_links_next_session() {
         .expect("the case ends inside its outer bound");
 }
 
+/// A gateway's link follows the controller's document, both ends in one
+/// process. The controller applies its spec file as generation 1, and a
+/// link whose hello names no generation reads that document behind its
+/// welcome. Its holder takes it, and the spec read lists the gateway's
+/// answer. The file's next document enters as generation 2 and reaches the
+/// session that stands. The holder refuses it, and the read lists the
+/// refusal with its reason. The link's next hello states the generation
+/// the holder runs, so its next session is pushed the standing document
+/// again, and the holder's second answer replaces its first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_link_follows_the_controllers_document_and_the_spec_read_lists_its_answers() {
+    const GATEWAY: &str = "fleet-follows";
+    const FIRST: &str = "apiVersion: smg.policy/v1\nprofiles:\n  default:\n    filter: [healthy]\n    score: [least-load]\n    pick: best\n";
+    const SECOND: &str =
+        "apiVersion: smg.policy/v1\nprofiles:\n  default:\n    filter: [healthy]\n    pick: random\n";
+    const REFUSAL: &str = "this build holds no such stage";
+    let case = async {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let file = dir.path().join("policy.yaml");
+        std::fs::write(&file, FIRST).expect("the document's file");
+        let mut harness = Harness::start_hosting(smg_policy_controller::Catalog::builtin(), &file)
+            .await
+            .expect("a controller starts on its document");
+        let endpoint =
+            Endpoint::from_shared(format!("http://{}", harness.gateway())).expect("a URI");
+        let link = Box::pin(Link::connect(endpoint.clone(), GATEWAY))
+            .await
+            .expect("the link's first session");
+        assert_eq!(link.welcome().generation, 1);
+        let mut pushes = link.spec_pushes();
+        let first = tokio::time::timeout(ROOM, pushes.next())
+            .await
+            .expect("the standing document follows the welcome")
+            .expect("the link stands");
+        assert_eq!(
+            (
+                first.generation,
+                first.format.as_str(),
+                first.document.as_slice()
+            ),
+            (1, "yaml", FIRST.as_bytes())
+        );
+        harness
+            .spec_answers_read(&[])
+            .await
+            .expect("no answer before the holder's");
+        link.spec_ack(1, Ok(()));
+        harness
+            .spec_answers_read(&[(GATEWAY, 1, true, "")])
+            .await
+            .expect("the read lists the document the gateway runs");
+
+        // The file's next document, laid by one rename as a mount lays it.
+        let next = dir.path().join("policy.next");
+        std::fs::write(&next, SECOND).expect("the next document");
+        std::fs::rename(&next, &file).expect("the next document takes the file's place");
+        let second = tokio::time::timeout(ROOM, pushes.next())
+            .await
+            .expect("the next generation reaches the session that stands")
+            .expect("the link stands");
+        assert_eq!(
+            (second.generation, second.document.as_slice()),
+            (2, SECOND.as_bytes())
+        );
+        link.spec_ack(2, Err(REFUSAL.to_owned()));
+        harness
+            .spec_answers_read(&[(GATEWAY, 2, false, REFUSAL)])
+            .await
+            .expect("the read lists the refusal and its reason");
+
+        // The holder still runs generation 1, and the link's next hello
+        // says so: the next session is pushed the standing document again.
+        Box::pin(link.redial(endpoint, GATEWAY))
+            .await
+            .expect("the link's next session");
+        assert_eq!(link.welcome().generation, 2);
+        let again = tokio::time::timeout(ROOM, pushes.next())
+            .await
+            .expect("the standing document follows the next welcome")
+            .expect("the link stands");
+        assert_eq!(again.generation, 2);
+        link.spec_ack(2, Ok(()));
+        harness
+            .spec_answers_read(&[(GATEWAY, 2, true, "")])
+            .await
+            .expect("the holder's second answer replaces its first");
+        drop(link);
+        harness.stop().await.expect("a clean stop");
+    };
+    tokio::time::timeout(CASE, Box::pin(case))
+        .await
+        .expect("the case ends inside its outer bound");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_link_releases_the_lease_of_a_zero_budget_ask() {
     const GATEWAY: &str = "fleet-late-link";

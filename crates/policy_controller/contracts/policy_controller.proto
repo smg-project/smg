@@ -298,7 +298,11 @@ message GatewayVeto {
   bool clear = 4;
 }
 
-// The gateway's answer to a SpecPush.
+// The gateway's answer to a SpecPush it read, one a push: sent on the session
+// that stands when the push was read, which may be a later one than the push
+// left on, and never without a push. `generation` is the push's, never 0.
+// A gateway that refuses a document says why in `error` and keeps the one
+// it runs. The controller keeps the first 256 bytes of the reason.
 message SpecAck {
   uint64 generation = 1;
   bool accepted = 2;
@@ -338,6 +342,9 @@ message Welcome {
   uint32 dispatch_ttl_ms = 10;
   // How often the gateway polls Leader for its term floor.
   uint32 leader_poll_ms = 11;
+  // The gateway's leases the controller holds as the Welcome leaves: what a
+  // resume's pages left standing, and with no page what the controller kept.
+  // At zero no report of an earlier session can reach a lease.
   uint32 leases_restored = 12;
   uint32 pins_restored = 13;
   // How many of the Hello's vetoes the controller holds: fewer than listed
@@ -1253,6 +1260,8 @@ message PolicySpecDocument {
   repeated GatewayAckRow acks = 7;
 }
 
+// A present gateway's last answer to a pushed document. A gateway that
+// answered no push has no row.
 message GatewayAckRow {
   string gateway_id = 1;
   uint64 generation = 2;

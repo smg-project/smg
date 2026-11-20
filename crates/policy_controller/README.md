@@ -924,6 +924,7 @@ The admin `/metrics` endpoint exports the following series. A spec source adds t
 | `smg_policy_controller_load_values_dropped_total` | Named values that the list bounds removed from the load driver's polled answers. |
 | `smg_policy_spec_generation` | Standing spec generation. |
 | `smg_policy_spec_apply_total` | Applies by `result` (`applied` or `rejected`). |
+| `smg_policy_spec_push_refused_total` | Pushed spec documents that a gateway refused. |
 | `smg_policy_controller_decide_busy_total` | Busy answers by wire `reason`. |
 | `smg_policy_controller_decide_no_decision_total` | Unspecified Busy by `cause` (`fault`, `pair_side`, `prompt_text`, `decider_gone`, `lease_ids_spent`, or `document_awaited`). |
 | `smg_policy_controller_decide_hashes_cut_total` | Requests whose hash list exceeded what the generation reads. |

@@ -60,7 +60,7 @@ use std::{
 };
 
 use parking_lot::{Mutex, MutexGuard};
-use tokio::task::JoinError;
+use tokio::{sync::watch, task::JoinError};
 use tracing::{debug, warn};
 
 use super::{
@@ -180,6 +180,12 @@ pub(crate) struct Generations {
     /// again at a retry is refused from here: no second pass and no second
     /// warning.
     unfollowed: Mutex<Option<Unfollowable>>,
+    /// The number of the generation that entered the door last, as the
+    /// door tells it ([`SpecDoor::telling`]); `0` before the first.
+    entered: watch::Sender<u64>,
+    /// The pushed documents a gateway refused
+    /// ([`Generations::push_refused`]).
+    pushes_refused: AtomicU64,
 }
 
 impl Deref for Generations {
@@ -207,8 +213,17 @@ impl Generations {
     }
 
     fn over(door: SpecDoor) -> Self {
+        let (entered, _) = watch::channel(0);
+        door.telling({
+            let entered = entered.clone();
+            move |generation| {
+                entered.send_replace(generation);
+            }
+        });
         Self {
             door,
+            entered,
+            pushes_refused: AtomicU64::new(0),
             deferred: Mutex::new(None),
             file_sourced: AtomicBool::new(false),
             fence: OnceLock::new(),
@@ -470,6 +485,31 @@ impl Generations {
         held.as_ref()
             .filter(|held| held.generation == standing)
             .map(|held| wire::generation_event(held.document()))
+    }
+
+    /// The standing generation's document as a session pushes it to its
+    /// gateway; none where no document is held for it.
+    pub(crate) fn standing_push(&self) -> Option<proto::SpecPush> {
+        self.standing_sent().and_then(|event| event.document)
+    }
+
+    /// The number of the generation that entered this door last, for a
+    /// session to wait on: each generation that enters wakes it, and it
+    /// then pushes the standing document. A receiver starts with what
+    /// entered before it as seen.
+    pub(crate) fn entered(&self) -> watch::Receiver<u64> {
+        self.entered.subscribe()
+    }
+
+    /// Counts one pushed document a gateway refused: that gateway keeps
+    /// the document it runs.
+    pub(crate) fn push_refused(&self) {
+        self.pushes_refused.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The pushed documents gateways refused, as the count stands.
+    pub(crate) fn pushes_refused(&self) -> u64 {
+        self.pushes_refused.load(Ordering::Relaxed)
     }
 
     /// The start's document of a replica under a shared lease: passed here
@@ -1510,6 +1550,39 @@ pub(crate) mod tests {
 
     fn applied(applied: u64, rejected: u64) -> Counts {
         Counts { applied, rejected }
+    }
+
+    /// Each generation that enters wakes a receiver of the door's number,
+    /// whichever write brought it: a source's apply, or an operator's
+    /// enforce. A receiver starts with what entered before it as seen, and
+    /// a document applied again enters nothing. The document a session
+    /// pushes is the standing one's.
+    #[test]
+    fn each_generation_that_enters_is_told_once() {
+        let (_store, sourced) = generations();
+        assert_eq!(yaml(&sourced, LEAST_LOAD), Ok(Applied::Generation(1)));
+        let mut entered = sourced.entered();
+        assert!(!entered.has_changed().expect("the door stands"));
+        assert_eq!(*entered.borrow(), 1);
+
+        assert_eq!(yaml(&sourced, LEAST_LOAD), Ok(Applied::Unchanged(1)));
+        assert!(!entered.has_changed().expect("the door stands"));
+
+        assert_eq!(yaml(&sourced, RANDOM), Ok(Applied::Generation(2)));
+        assert!(entered.has_changed().expect("the door stands"));
+        assert_eq!(*entered.borrow_and_update(), 2);
+        let push = sourced.standing_push().expect("the standing document");
+        assert_eq!(
+            (push.generation, push.document.as_slice()),
+            (2, RANDOM.as_bytes())
+        );
+
+        let (_dir, _store, written) = stored();
+        let mut entered = written.entered();
+        let (number, _) = enforce(&written, LEAST_LOAD).expect("it runs");
+        assert_eq!(number, 1);
+        assert!(entered.has_changed().expect("the door stands"));
+        assert_eq!(*entered.borrow_and_update(), 1);
     }
 
     /// An enforce under a spec store: the document is on file under the

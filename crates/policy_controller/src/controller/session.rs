@@ -25,10 +25,19 @@
 //! the `Welcome` and after it: only the gateway's own close ends a stream
 //! with none.
 //!
-//! One arm a kind of frame. `Hello` and `GatewayVeto` are served here, and
-//! the lifecycle's three frames in [`lifecycle`]. The other kinds are
-//! refused by name until the step that serves each adds its arm, as the
+//! One arm a kind of frame. `Hello`, `GatewayVeto` and `SpecAck` are served
+//! here, and the lifecycle's three frames in [`lifecycle`]. `HelloPage` is
+//! refused by name until the step that serves it adds its arm, as the
 //! service refuses an unserved call.
+//!
+//! A gateway's own engine follows the controller's document. The `Welcome`
+//! says the standing generation. A `Hello` that names another one is pushed
+//! the standing document behind its `Welcome`, and each generation that
+//! enters while the session stands is pushed as it enters ([`push`]). The
+//! gateway answers a push it read with one `SpecAck`, on the session that
+//! stands then, and the answer is kept on the gateway's row for the spec
+//! read ([`acked`]). A gateway that refuses a document keeps the one it
+//! runs, and the controller still decides each of its asks.
 //!
 //! A gateway's vetoes ride its `Hello`, whole, and are held before the
 //! `Welcome` leaves: a new leader masks for the gateway from its first
@@ -53,7 +62,9 @@ use tracing::{debug, info, warn};
 use super::{
     decide,
     floor::{unbelieved, Told, FLOORS_SPENT_MAX, FLOOR_REACH},
-    gateways::{over_kinds, Refused, Seat, Vetoed, KINDS_MAX, VETOES_MAX},
+    gateways::{
+        over_kinds, Refused, Seat, SpecAnswer, Vetoed, KINDS_MAX, SPEC_ERROR_MAX, VETOES_MAX,
+    },
     lifecycle,
     principal::Principal,
     service::Shared,
@@ -62,7 +73,7 @@ use super::{
 };
 use crate::{
     proto::{self, controller_frame, gateway_frame::Frame},
-    store::{leases::DISPATCH_TTL, Hand},
+    store::{leases::DISPATCH_TTL, Hand, LeasesStore as _},
     view::WorkerId,
 };
 
@@ -174,11 +185,90 @@ impl Answers {
     }
 }
 
-/// What a `Welcome` tells of the applied spec. No generation is applied
-/// yet: generation `0`, no needs and no hashing rule. The holder of the
-/// applied generation fills this one function.
-fn applied() -> (u64, Option<proto::NeedsSummary>, Vec<proto::ModelHashing>) {
-    (0, None, Vec::new())
+/// Pushes the standing document where it is not the one the gateway runs:
+/// `pushed` is the generation its `Hello` named or it was pushed last. The
+/// frame leaves under the session's term, so the fence is read first, as
+/// for a frame in. A generation whose bytes this replica does not hold is
+/// not pushed: the `Welcome` said its number.
+async fn push(
+    shared: &Shared,
+    subject: &str,
+    term: u64,
+    pushed: &mut u64,
+    answers: &mut Answers,
+) -> Option<Status> {
+    if let Some(status) = fenced(shared, term, Instant::now(), answers).await {
+        return Some(status);
+    }
+    let document = shared.generations.standing_push()?;
+    if document.generation == *pushed {
+        return None;
+    }
+    *pushed = document.generation;
+    debug!(
+        gateway = %subject,
+        generation = document.generation,
+        bytes = document.document.len(),
+        "the standing document is pushed to a gateway"
+    );
+    answers
+        .frame(term, controller_frame::Frame::Spec(document))
+        .await;
+    None
+}
+
+/// A gateway's refusal as the table keeps it and the log reads it: its
+/// first [`SPEC_ERROR_MAX`] bytes, cut at a character's end, with every
+/// control character left out.
+fn refusal_kept(error: &str) -> String {
+    let mut kept = String::with_capacity(error.len().min(SPEC_ERROR_MAX));
+    for character in error.chars().filter(|character| !character.is_control()) {
+        if kept.len() + character.len_utf8() > SPEC_ERROR_MAX {
+            break;
+        }
+        kept.push(character);
+    }
+    kept
+}
+
+/// A gateway's answer to a pushed document, kept on its row for the spec
+/// read. A gateway answers on the session that stands when it has read a
+/// push, which may be a later one than the push left on, so the answer is
+/// taken by its generation alone. A refusal moves nothing here: the
+/// gateway keeps the document it runs, and the refusal is warned of and
+/// counted once it is kept.
+fn acked(shared: &Shared, seat: &Seat, subject: &str, ack: &proto::SpecAck) -> Option<Status> {
+    if ack.generation == 0 {
+        return Some(Status::invalid_argument(
+            "SpecAck.generation is 0: an answer names the generation of the push it read",
+        ));
+    }
+    let refused = (!ack.accepted).then(|| refusal_kept(&ack.error));
+    match &refused {
+        Some(error) => warn!(
+            gateway = %subject,
+            generation = ack.generation,
+            error = %error,
+            "a gateway refused a pushed document and keeps the one it runs"
+        ),
+        None => debug!(
+            gateway = %subject,
+            generation = ack.generation,
+            "a gateway runs a pushed document"
+        ),
+    }
+    let refusal = refused.is_some();
+    let answer = SpecAnswer {
+        generation: ack.generation,
+        refused,
+    };
+    if !seat.acked(answer) {
+        return Some(replaced());
+    }
+    if refusal {
+        shared.generations.push_refused();
+    }
+    None
 }
 
 /// The status of a `Hello` the presence table refused.
@@ -350,7 +440,15 @@ async fn session(
         })
         .collect();
     let vetoes_restored = seat.restore(&vetoes, now);
-    let (generation, needs, hashing) = applied();
+    // Asked before the standing number is read: a generation that enters
+    // behind that read wakes the loop, so none is missed.
+    let mut entered = shared.generations.entered();
+    // The standing generation's number, `0` where none stands.
+    let generation = shared.generations.generation();
+    // The gateway is present from its seat, so nothing lets its leases go
+    // while this session stands: what the store holds for it now is what a
+    // report the gateway kept can still reach.
+    let leases_restored = shared.store.live(gateway);
     let welcome = proto::Welcome {
         protocol: PROTOCOL_VERSION,
         generation,
@@ -361,8 +459,10 @@ async fn session(
             method: principal.method.into(),
             role: String::new(),
         }),
-        needs,
-        hashing,
+        // No needs and no hashing rule: a gateway that runs the pushed
+        // document feeds and hashes by it.
+        needs: None,
+        hashing: Vec::new(),
         // A decide stream's credit at its open, the streams a gateway holds
         // at most, and the time it has to name the dispatch of a lease.
         decide_window: decide::WINDOW,
@@ -370,8 +470,9 @@ async fn session(
         dispatch_ttl_ms: millis(DISPATCH_TTL),
         grace_period_ms: millis(shared.gateways.grace()),
         leader_poll_ms: millis(LEADER_POLL),
-        // The design sends no page: no lease and no pin is restored.
-        leases_restored: 0,
+        // The design sends no page: the leases are the ones the controller
+        // kept for the gateway, and no pin is restored.
+        leases_restored: u32::try_from(leases_restored).unwrap_or(u32::MAX),
         pins_restored: 0,
         vetoes_restored: u32::try_from(vetoes_restored).unwrap_or(u32::MAX),
     };
@@ -387,11 +488,30 @@ async fn session(
         "a gateway is welcomed"
     );
 
+    // A gateway that runs another generation than the standing one is
+    // pushed the standing document behind its Welcome.
+    let mut pushed = generation;
+    if hello.generation != generation {
+        pushed = 0;
+        if let Some(status) = push(shared, &principal.subject, term, &mut pushed, answers).await {
+            return Some(status);
+        }
+    }
+
     // The session's hand-over at the leases' file: what its frames say of
     // a lease is handed there, and applied before the session leaves.
     let hand = lifecycle::open(&shared.store, gateway);
+    let mut follows = true;
     let status = loop {
         tokio::select! {
+            woken = entered.changed(), if follows => {
+                if woken.is_err() {
+                    // The door went with its controller: no generation enters.
+                    follows = false;
+                } else if let Some(status) = push(shared, &principal.subject, term, &mut pushed, answers).await {
+                    break Some(status);
+                }
+            }
             frame = inbound.message() => {
                 let frame = match frame {
                     Ok(Some(frame)) => frame,
@@ -599,9 +719,11 @@ async fn judge(
         }
         Some(Frame::Released(released)) => lifecycle::released(&shared.store, hand, released).err(),
         Some(Frame::Veto(veto)) => vetoed(seat, veto, now),
-        Some(unserved @ (Frame::HelloPage(_) | Frame::SpecAck(_))) => Some(Status::unimplemented(
-            format!("{} is not served by this build", kind(unserved)),
-        )),
+        Some(Frame::SpecAck(ack)) => acked(shared, seat, subject, ack),
+        Some(unserved @ Frame::HelloPage(_)) => Some(Status::unimplemented(format!(
+            "{} is not served by this build",
+            kind(unserved)
+        ))),
     }
 }
 
@@ -640,7 +762,7 @@ mod tests {
             floor::{FLOORS_SPENT_MAX, FLOOR_BELIEVED, FLOOR_REACH},
             gateways::{
                 tests::{lease, PATIENT},
-                Gateways, Refused, KINDS_MAX, VETOES_MAX,
+                Gateways, Refused, SpecAnswer, KINDS_MAX, SPEC_ERROR_MAX, VETOES_MAX,
             },
             lifecycle::tests::{a_completed, a_dispatched, a_released, worker},
             principal::{tests::told, Layer, ENTRY},
@@ -650,6 +772,10 @@ mod tests {
         },
         elector::{ElectionSettings, Elector, Tick},
         lease::LeaseId,
+        operator::{
+            test_support::{LEAST_LOAD, RANDOM},
+            Applied, Format,
+        },
         proto::{
             self, controller_frame, gateway_frame::Frame,
             policy_controller_client::PolicyControllerClient,
@@ -1243,11 +1369,6 @@ mod tests {
                 "HelloPage is not served by this build",
             ),
             (
-                Frame::SpecAck(proto::SpecAck::default()),
-                Code::Unimplemented,
-                "SpecAck is not served by this build",
-            ),
-            (
                 Frame::Hello(proto::Hello::default()),
                 Code::FailedPrecondition,
                 "a session stands on this stream: a second Hello needs a new stream",
@@ -1259,6 +1380,170 @@ mod tests {
             session.send(frame(0, Some(kind))).await;
             assert_eq!(session.status().await, (code, message.to_owned()));
         }
+    }
+
+    /// The document of a `Spec` frame.
+    fn pushed(frame: proto::ControllerFrame) -> proto::SpecPush {
+        match frame.frame {
+            Some(controller_frame::Frame::Spec(push)) => push,
+            other => panic!("a pushed document: {other:?}"),
+        }
+    }
+
+    /// The `Welcome` says the standing generation. A gateway that runs
+    /// another is pushed the standing document behind its `Welcome`, under
+    /// the session's term, and each generation that enters while the
+    /// session stands as it enters. A document applied again enters
+    /// nothing, so nothing is pushed for it.
+    #[tokio::test]
+    async fn a_gateway_that_runs_another_generation_is_pushed_the_standing_document() {
+        let mut bed = bed(PATIENT).await;
+        bed.leads(1);
+        let generations = &bed.shared.generations;
+        let yaml = |document: &str| generations.apply(document.into(), Format::Yaml);
+        assert_eq!(yaml(LEAST_LOAD), Ok(Applied::Generation(1)));
+
+        let mut session = open(bed.addr).await;
+        assert_eq!(session.welcomed(1).await.generation, 1);
+        let first = session.frame().await;
+        assert_eq!((first.seq, first.term), (2, 1));
+        let first = pushed(first);
+        assert_eq!((first.generation, first.format.as_str()), (1, "yaml"));
+        assert_eq!(first.document, LEAST_LOAD.as_bytes());
+        let (_, digest) = generations.standing();
+        assert_eq!(Some(first.digest), digest.map(|digest| digest.to_string()));
+
+        assert_eq!(yaml(LEAST_LOAD), Ok(Applied::Unchanged(1)));
+        assert_eq!(yaml(RANDOM), Ok(Applied::Generation(2)));
+        let second = session.frame().await;
+        assert_eq!((second.seq, second.term), (3, 1));
+        let second = pushed(second);
+        assert_eq!(second.generation, 2);
+        assert_eq!(second.document, RANDOM.as_bytes());
+    }
+
+    /// A gateway whose `Hello` names the standing generation runs it: no
+    /// document follows its `Welcome`, and the next frame it reads is the
+    /// next generation's document, as that one enters.
+    #[tokio::test]
+    async fn a_gateway_that_runs_the_standing_generation_is_pushed_the_next_one_alone() {
+        let mut bed = bed(PATIENT).await;
+        bed.leads(1);
+        let generations = &bed.shared.generations;
+        let yaml = |document: &str| generations.apply(document.into(), Format::Yaml);
+        assert_eq!(yaml(LEAST_LOAD), Ok(Applied::Generation(1)));
+
+        let mut session = open(bed.addr).await;
+        let mut said = hello(GATEWAY);
+        if let Some(Frame::Hello(hello)) = said.frame.as_mut() {
+            hello.generation = 1;
+        }
+        session.send(said).await;
+        let welcome = session.frame().await;
+        assert_eq!(welcome.seq, 1, "{welcome:?}");
+
+        assert_eq!(yaml(RANDOM), Ok(Applied::Generation(2)));
+        // The frame behind the Welcome is the second generation's: none
+        // left between the two.
+        let next = session.frame().await;
+        assert_eq!((next.seq, next.term), (2, 1));
+        assert_eq!(pushed(next).generation, 2);
+    }
+
+    /// A gateway's answer to a pushed document is kept on its row, the
+    /// latest one, through a later session of the gateway: an acceptance,
+    /// then a refusal cut at a character's end to the bytes the table
+    /// keeps, its control characters left out. An answer that names
+    /// generation 0 names no push: it ends the session and nothing is kept
+    /// of it.
+    #[tokio::test]
+    async fn a_gateways_answer_to_a_push_is_kept_on_its_row_and_generation_0_is_refused() {
+        const SECOND_HELLO: &str =
+            "a session stands on this stream: a second Hello needs a new stream";
+        let mut bed = bed(PATIENT).await;
+        bed.leads(1);
+        let gateways = Arc::clone(&bed.shared.gateways);
+        let ack = |generation, accepted, error: &str| {
+            let ack = proto::SpecAck {
+                generation,
+                accepted,
+                error: error.to_owned(),
+            };
+            frame(1, Some(Frame::SpecAck(ack)))
+        };
+        let kept = |generation, refused: Option<&str>| {
+            let refused = refused.map(str::to_owned);
+            vec![(
+                GATEWAY.to_owned(),
+                SpecAnswer {
+                    generation,
+                    refused,
+                },
+            )]
+        };
+
+        let mut session = open(bed.addr).await;
+        session.welcomed(1).await;
+        assert_eq!(gateways.spec_answers(), Vec::new());
+        session.send(ack(4, true, "")).await;
+        // A second Hello ends the session by name: the frame before it was
+        // read.
+        session.send(hello(GATEWAY)).await;
+        assert_eq!(
+            session.status().await,
+            (Code::FailedPrecondition, SECOND_HELLO.to_owned())
+        );
+        assert_eq!(gateways.spec_answers(), kept(4, None));
+
+        let mut session = open(bed.addr).await;
+        session.welcomed(1).await;
+        assert_eq!(gateways.spec_answers(), kept(4, None));
+        let reason = format!("no stage\n\"cheapest\"\t!{}", "é".repeat(200));
+        session.send(ack(5, false, &reason)).await;
+        session.send(hello(GATEWAY)).await;
+        assert_eq!(
+            session.status().await,
+            (Code::FailedPrecondition, SECOND_HELLO.to_owned())
+        );
+        let cut = format!("no stage\"cheapest\"!{}", "é".repeat(118));
+        assert_eq!(cut.len(), SPEC_ERROR_MAX - 1);
+        assert_eq!(gateways.spec_answers(), kept(5, Some(cut.as_str())));
+        assert_eq!(bed.shared.generations.pushes_refused(), 1);
+
+        let mut session = open(bed.addr).await;
+        session.welcomed(1).await;
+        session.send(ack(0, true, "")).await;
+        assert_eq!(
+            session.status().await,
+            (
+                Code::InvalidArgument,
+                "SpecAck.generation is 0: an answer names the generation of the push it read"
+                    .to_owned()
+            )
+        );
+        assert_eq!(gateways.spec_answers(), kept(5, Some(cut.as_str())));
+    }
+
+    /// The `Welcome` counts the gateway's own leases the controller holds
+    /// as it leaves: the ones a report the gateway kept can still reach.
+    #[tokio::test]
+    async fn the_welcome_counts_the_leases_the_controller_kept_for_the_gateway() {
+        let mut bed = bed(PATIENT).await;
+        bed.leads(1);
+        let store = Arc::clone(&bed.shared.store);
+        store.set_term(1);
+        let now = Instant::now();
+        for id in 1..=3 {
+            store
+                .issue(lease(told(GATEWAY).gateway(), id, now))
+                .expect("a lease");
+        }
+        store
+            .issue(lease(told("gateway-b").gateway(), 4, now))
+            .expect("another gateway's lease");
+
+        let mut session = open(bed.addr).await;
+        assert_eq!(session.welcomed(1).await.leases_restored, 3);
     }
 
     const ENDED: &str = "this controller no longer leads: find the leader through Leader";

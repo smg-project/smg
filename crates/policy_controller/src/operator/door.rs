@@ -390,6 +390,10 @@ pub struct SpecDoor {
     /// and the document move together and waits on no validation. `None`
     /// until a source has applied its first document.
     pub(crate) held: Mutex<Option<Held>>,
+    /// What the host asked to hear of each generation that enters
+    /// ([`SpecDoor::telling`]): none until it asks.
+    #[cfg(feature = "controller")]
+    entered: OnceLock<Box<dyn Fn(u64) + Send + Sync>>,
     applied: AtomicU64,
     rejected: AtomicU64,
 }
@@ -431,9 +435,20 @@ impl SpecDoor {
             #[cfg(feature = "controller")]
             write_turn: Turn::new(WRITES_WAITING),
             held: Mutex::new(None),
+            #[cfg(feature = "controller")]
+            entered: OnceLock::new(),
             applied: AtomicU64::new(0),
             rejected: AtomicU64::new(0),
         }
+    }
+
+    /// Tells `tell` the number of each generation that enters from here on:
+    /// under the document lock and behind the store's entry, so in the
+    /// numbers' order and each once. One listener a door, the first to ask.
+    /// It runs under the door's locks and may call no method of this door.
+    #[cfg(feature = "controller")]
+    pub(crate) fn telling(&self, tell: impl Fn(u64) + Send + Sync + 'static) {
+        let _ = self.entered.set(Box::new(tell));
     }
 
     /// Applies a source's document through the store's own entry. A host
@@ -543,6 +558,10 @@ impl SpecDoor {
             }
             *held = Some(kept);
             on_standing(generation, digest);
+            #[cfg(feature = "controller")]
+            if let Some(tell) = self.entered.get() {
+                tell(generation);
+            }
         }
         self.applied.fetch_add(1, Ordering::Relaxed);
         info!(

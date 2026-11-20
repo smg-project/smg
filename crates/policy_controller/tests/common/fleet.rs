@@ -1226,7 +1226,6 @@ impl Harness {
     /// `catalog` holds and on the policy document at `spec`, which the
     /// controller reads and applies itself. The case applies no generation
     /// in its own process beside it.
-    #[cfg(feature = "wasm")]
     pub async fn start_hosting(catalog: Catalog, spec: &Path) -> Result<Self, String> {
         let replica = Replica::start_over("fleet-controller", None, catalog, Some(spec)).await?;
         Self::around(replica).await
@@ -1384,6 +1383,59 @@ impl Harness {
     /// The gateway listener's address.
     pub fn gateway(&self) -> SocketAddr {
         self.replica.gateway()
+    }
+
+    /// The spec read's rows as an operator reads them on the control
+    /// listener: each present gateway's last answer to a pushed document,
+    /// as its name, the generation, whether the gateway runs it, and its
+    /// refusal.
+    pub async fn spec_answers(&mut self) -> Result<Vec<(String, u64, bool, String)>, String> {
+        let mut request = Request::new(proto::GetPolicySpecRequest { generation: 0 });
+        request
+            .metadata_mut()
+            .insert(PRINCIPAL, AsciiMetadataValue::from_static(OPERATOR));
+        let document = bounded(
+            "the spec read answers",
+            ROOM,
+            self.operator.get_policy_spec(request),
+        )
+        .await?
+        .map_err(|status| {
+            format!(
+                "the spec read was refused: {:?}: {}",
+                status.code(),
+                status.message()
+            )
+        })?
+        .into_inner();
+        Ok(document
+            .acks
+            .into_iter()
+            .map(|row| (row.gateway_id, row.generation, row.accepted, row.error))
+            .collect())
+    }
+
+    /// Waits, inside the room, until the spec read lists `wanted` and
+    /// nothing else. The controller reads a session's answer behind the
+    /// call that sent it, so the read is asked until it shows.
+    pub async fn spec_answers_read(
+        &mut self,
+        wanted: &[(&str, u64, bool, &str)],
+    ) -> Result<(), String> {
+        let asked = Instant::now();
+        loop {
+            let rows = self.spec_answers().await?;
+            let listed = rows.iter().map(|(gateway, generation, accepted, error)| {
+                (gateway.as_str(), *generation, *accepted, error.as_str())
+            });
+            if listed.eq(wanted.iter().copied()) {
+                return Ok(());
+            }
+            if asked.elapsed() >= ROOM {
+                return Err(format!("the spec read lists {rows:?}, not {wanted:?}"));
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
 
     /// Applies the preset named `preset` as the store's next generation,

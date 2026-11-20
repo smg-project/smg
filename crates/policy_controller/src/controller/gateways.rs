@@ -158,6 +158,22 @@ pub(crate) enum Refused {
     Stepped { read: u64, shown: Option<u64> },
 }
 
+/// The longest refusal of a pushed document the table keeps for a gateway,
+/// in bytes. The spec read lists one row a present gateway, so with the
+/// table's ceiling this bounds what the rows add to that answer.
+pub(crate) const SPEC_ERROR_MAX: usize = 256;
+
+/// What a gateway answered last to a pushed document ([`Seat::acked`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SpecAnswer {
+    /// The generation the answer names: the controller's number of the
+    /// document the gateway read.
+    pub(crate) generation: u64,
+    /// The gateway's refusal where it refused the document, at most
+    /// [`SPEC_ERROR_MAX`] bytes; `None` where it runs the document.
+    pub(crate) refused: Option<String>,
+}
+
 /// The presence table.
 pub(crate) struct Gateways {
     /// How long a gateway stays present after its last session ended.
@@ -217,6 +233,10 @@ struct Row {
     /// ([`Row::left`]), `None` before the first: a row leaves by a
     /// membership write alone, so one walk an epoch finds every one.
     left_at: Option<u64>,
+    /// The gateway's last answer to a pushed document, kept for as long as
+    /// the gateway is present: an answer may come on a later session than
+    /// its push left on.
+    spec: Option<SpecAnswer>,
     /// Held for as long as this presence lasts: a [`Presence`] waits for
     /// its drop.
     ended: watch::Sender<()>,
@@ -316,6 +336,18 @@ impl Seat {
     pub(crate) fn restore(&self, vetoes: &[(WorkerId, i32, Instant)], now: Instant) -> usize {
         self.gateways
             .restore(self.gateway, self.session, vetoes, now)
+    }
+
+    /// The gateway's answer to a pushed document, kept on its row for the
+    /// spec read: the latest stands. `false` where a newer session took
+    /// this one's place or the stream ended, and nothing is kept.
+    pub(crate) fn acked(&self, answer: SpecAnswer) -> bool {
+        let mut table = self.gateways.table.lock();
+        let Some(row) = Gateways::standing(&mut table, self.gateway, self.session) else {
+            return false;
+        };
+        row.spec = Some(answer);
+        true
     }
 
     /// The session ended at `now`, where a case names the instant.
@@ -520,6 +552,7 @@ impl Gateways {
             next_end: None,
             deadline: None,
             left_at: None,
+            spec: None,
             ended: watch::channel(()).0,
         });
         if row.session > 0 && row.gone.is_none() {
@@ -544,6 +577,23 @@ impl Gateways {
             #[cfg(test)]
             drop_pause: None,
         })
+    }
+
+    /// Each present gateway's last answer to a pushed document, by its
+    /// subject and in the subjects' order: the spec read's rows. A gateway
+    /// that answered no push has none. The rows are copied under the
+    /// table's lock and ordered outside it.
+    pub(crate) fn spec_answers(&self) -> Vec<(String, SpecAnswer)> {
+        let mut answers: Vec<(String, SpecAnswer)> = {
+            let table = self.table.lock();
+            table
+                .rows
+                .values()
+                .filter_map(|row| Some((row.subject.clone(), row.spec.clone()?)))
+                .collect()
+        };
+        answers.sort_unstable_by(|one, other| one.0.cmp(&other.0));
+        answers
     }
 
     /// The gateway's presence at `now` for a decide stream's open: `None`
@@ -904,7 +954,9 @@ pub(crate) mod tests {
 
     use tokio::{sync::watch, task::JoinSet, time::timeout};
 
-    use super::{over_kinds, DropPause, Gateways, Refused, Seat, Vetoed, KINDS_MAX, VETOES_MAX};
+    use super::{
+        over_kinds, DropPause, Gateways, Refused, Seat, SpecAnswer, Vetoed, KINDS_MAX, VETOES_MAX,
+    };
     use crate::{
         controller::lifecycle::{
             self,
@@ -1013,6 +1065,50 @@ pub(crate) mod tests {
         seat.end(ended);
         assert!(gateways.presence(A, ended + GRACE - MS).is_some());
         assert!(gateways.presence(A, ended + GRACE).is_none());
+    }
+
+    /// A gateway's answer to a pushed document stays on its row while the
+    /// gateway is present: a newer session of it keeps the answer and
+    /// writes the next, and the session it replaced writes none. The row's
+    /// end takes the answer with it. The rows read in the subjects' order,
+    /// and an answer costs a row four words.
+    #[test]
+    fn a_gateways_answer_to_a_push_lives_as_long_as_its_presence() {
+        let (_elector, _store, gateways, t0) = leading(GRACE);
+        let runs = |generation| SpecAnswer {
+            generation,
+            refused: None,
+        };
+        let rows = |answers: &[(&str, u64)]| -> Vec<(String, SpecAnswer)> {
+            answers
+                .iter()
+                .map(|(subject, generation)| ((*subject).to_owned(), runs(*generation)))
+                .collect()
+        };
+        assert!(size_of::<Option<SpecAnswer>>() <= 4 * size_of::<usize>());
+
+        let other = welcomed(&gateways, B, "gateway-b", TERM, t0);
+        let first = welcomed(&gateways, A, "gateway-a", TERM, t0);
+        assert_eq!(gateways.spec_answers(), Vec::new());
+        assert!(other.acked(runs(3)));
+        assert!(first.acked(runs(3)));
+        let both = rows(&[("gateway-a", 3), ("gateway-b", 3)]);
+        assert_eq!(gateways.spec_answers(), both);
+
+        let second = welcomed(&gateways, A, "gateway-a", TERM, t0);
+        assert!(!first.acked(runs(4)), "a replaced session writes none");
+        assert_eq!(gateways.spec_answers(), both);
+        assert!(second.acked(runs(4)));
+        assert_eq!(
+            gateways.spec_answers(),
+            rows(&[("gateway-a", 4), ("gateway-b", 3)])
+        );
+
+        drop(first);
+        second.end(t0);
+        assert_eq!(gateways.sweep(t0 + GRACE), 1);
+        assert_eq!(gateways.spec_answers(), rows(&[("gateway-b", 3)]));
+        drop(other);
     }
 
     #[test]

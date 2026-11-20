@@ -53,6 +53,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use super::gateways::SpecAnswer;
 pub(crate) use crate::door::Viewed;
 use crate::{
     decision::{Decision, ShedReason, Target},
@@ -843,6 +844,20 @@ pub(super) fn spec_document(document: Document) -> proto::PolicySpecDocument {
         mode: proto::ApplyMode::Enforce.into(),
         acks: Vec::new(),
     }
+}
+
+/// Each present gateway's last answer to a pushed document, as the spec
+/// read lists them.
+pub(super) fn ack_rows(answers: Vec<(String, SpecAnswer)>) -> Vec<proto::GatewayAckRow> {
+    answers
+        .into_iter()
+        .map(|(gateway_id, answer)| proto::GatewayAckRow {
+            gateway_id,
+            generation: answer.generation,
+            accepted: answer.refused.is_none(),
+            error: answer.refused.unwrap_or_default(),
+        })
+        .collect()
 }
 
 /// The source's document and its status as a standby is sent them.

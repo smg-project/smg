@@ -1028,11 +1028,14 @@ impl PolicyController for Service {
             return self.sourceless(Call::GetPolicySpec, &request);
         }
         self.admit(Call::GetPolicySpec, &request)?;
-        generations
+        let mut document = generations
             .read(request.get_ref().generation)
             .await
-            .map(Response::new)
-            .map_err(unanswered)
+            .map_err(unanswered)?;
+        // One row a present gateway that answered a push: its last answer,
+        // whatever generation is read.
+        document.acks = wire::ack_rows(self.shared.gateways.spec_answers());
+        Ok(Response::new(document))
     }
 
     /// `RollbackPolicySpec` by a controller with a spec source: the scope,
@@ -1144,7 +1147,7 @@ mod tests {
             config::Scope,
             deciders::{tests as bed, Job},
             election::{self, LeasePlace, Standing},
-            gateways::tests::PATIENT,
+            gateways::{tests::PATIENT, SpecAnswer},
             generations::{tests::LEAST_LOAD, Format, Unanswered},
             principal::{
                 gateway_id,
@@ -2421,6 +2424,55 @@ mod tests {
         assert_eq!(unplaced.code(), Code::Unauthenticated);
         let denied = gateway.get_policy_spec(read(0)).await.expect_err("refused");
         assert_eq!(denied.code(), Code::PermissionDenied);
+    }
+
+    /// The read call lists each present gateway's last answer to a pushed
+    /// document, in the gateways' order: an acceptance, and a refusal with
+    /// its reason. A gateway that answered no push has no row.
+    #[tokio::test]
+    async fn the_read_call_lists_each_gateways_answer_to_a_pushed_document() {
+        let (mut elector, _standing, control) = service_alone(&[Scope::Control]);
+        elector.lead_at(Instant::now());
+        let shared = &control.shared;
+        shared
+            .generations
+            .apply(LEAST_LOAD.into(), Format::Yaml)
+            .expect("a valid document");
+        let read = || from("operator-a", proto::GetPolicySpecRequest { generation: 0 });
+        let unanswered = control.get_policy_spec(read()).await.expect("the document");
+        assert_eq!(unanswered.into_inner().acks, Vec::new());
+
+        let now = Instant::now();
+        let seat = |subject: &str| {
+            let gateway = told(subject).gateway();
+            shared
+                .gateways
+                .welcome(gateway, subject, 1, now)
+                .expect("the table takes the Hello")
+        };
+        let (refuses, runs, _silent) = (seat("gateway-b"), seat("gateway-a"), seat("gateway-c"));
+        assert!(refuses.acked(SpecAnswer {
+            generation: 1,
+            refused: Some("no stage named cheapest".to_owned()),
+        }));
+        assert!(runs.acked(SpecAnswer {
+            generation: 1,
+            refused: None,
+        }));
+        let answered = control.get_policy_spec(read()).await.expect("the document");
+        let row = |gateway: &str, error: &str| proto::GatewayAckRow {
+            gateway_id: gateway.to_owned(),
+            generation: 1,
+            accepted: error.is_empty(),
+            error: error.to_owned(),
+        };
+        assert_eq!(
+            answered.into_inner().acks,
+            vec![
+                row("gateway-a", ""),
+                row("gateway-b", "no stage named cheapest")
+            ]
+        );
     }
 
     /// A control listener's service over an election no case outlasts (an
