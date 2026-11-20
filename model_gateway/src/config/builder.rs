@@ -1,8 +1,9 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, io::Read};
 
 use llm_multimodal::jpeg_turbo::TurboJpegPolicy;
 use openai_protocol::worker::{MmProcessingMode, TransportMode};
 use smg_mcp::McpConfig;
+use smg_policy_controller::operator::{SpecRejected, MAX_DOCUMENT_BYTES};
 use smg_worker::identity::basic::{ConnectionMode, RuntimeType};
 
 use super::{
@@ -12,6 +13,35 @@ use super::{
     PolicyConfig, PostgresConfig, RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig,
     RoutingMode, TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
 };
+
+/// A policy document's text from its opened source, where `stated` is the
+/// size the file's metadata states. A file over the controller's bound on
+/// a document ([`MAX_DOCUMENT_BYTES`]) is refused by that size, unread, in
+/// the controller's words. A file may grow behind its metadata, and a
+/// source that is no regular file states no size: the read takes one byte
+/// past the bound and no more, and refuses a source that reaches past it.
+fn bounded_document(stated: u64, source: impl Read) -> std::io::Result<String> {
+    let too_large = |len: u64| {
+        std::io::Error::new(
+            std::io::ErrorKind::FileTooLarge,
+            SpecRejected::TooLarge(len).to_string(),
+        )
+    };
+    if stated > MAX_DOCUMENT_BYTES {
+        return Err(too_large(stated));
+    }
+    let mut bytes = Vec::new();
+    source
+        .take(MAX_DOCUMENT_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    let read = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if read > MAX_DOCUMENT_BYTES {
+        return Err(too_large(read));
+    }
+    let mut text = String::new();
+    bytes.as_slice().read_to_string(&mut text)?;
+    Ok(text)
+}
 
 /// Builder for RouterConfig that wraps the config itself
 /// This eliminates field duplication and stays in sync automatically
@@ -1048,8 +1078,10 @@ impl RouterConfigBuilder {
 
     fn read_policy_spec(mut self) -> ConfigResult<Self> {
         if let Some(path) = &self.config.policy_spec_path {
-            let text =
-                std::fs::read_to_string(path).map_err(|error| ConfigError::ValidationFailed {
+            let text = std::fs::File::open(path)
+                .and_then(|file| Ok((file.metadata()?.len(), file)))
+                .and_then(|(stated, file)| bounded_document(stated, file))
+                .map_err(|error| ConfigError::ValidationFailed {
                     reason: format!("{path}: could not read the policy document ({error})"),
                 })?;
             self.config.policy_spec = Some(serde_yaml::from_str(&text).map_err(|error| {
@@ -1196,6 +1228,65 @@ mod tests {
                 if field == "policy_spec" && value == "routing.yaml"
                     && reason.starts_with("the policy document of this path is not loaded")
         ));
+    }
+
+    /// A policy document of `len` bytes: a small one, then one YAML comment
+    /// that fills the file to the length.
+    fn document_of(len: usize) -> String {
+        let document = "apiVersion: smg.policy/v1\nprofiles: {default: {pick: random}}\n";
+        let filler = "x".repeat(len - document.len() - 2);
+        format!("{document}#{filler}\n")
+    }
+
+    #[test]
+    fn a_document_at_the_size_bound_is_read() {
+        let bound = usize::try_from(MAX_DOCUMENT_BYTES).expect("the bound fits");
+        let dir = tempdir().expect("a temporary directory");
+        let path = dir.path().join("bound.yaml");
+        let path = path.to_str().expect("a UTF-8 path");
+        std::fs::write(path, document_of(bound)).expect("the document is written");
+        let config = RouterConfig::builder()
+            .policy_controller(true)
+            .maybe_policy_spec_path(Some(path))
+            .build_with_validation(false)
+            .expect("a document at the bound is read");
+        assert!(config.policy_spec.is_some());
+    }
+
+    #[test]
+    fn a_document_over_the_size_bound_stops_the_build_by_its_size() {
+        let bound = usize::try_from(MAX_DOCUMENT_BYTES).expect("the bound fits");
+        let dir = tempdir().expect("a temporary directory");
+        let path = dir.path().join("over.yaml");
+        let path = path.to_str().expect("a UTF-8 path");
+        // A document the reader would take, five bytes past the bound: the
+        // refusal states the file's whole size, so the file was not read.
+        let over = bound + 5;
+        std::fs::write(path, document_of(over)).expect("the document is written");
+        let refusal = RouterConfig::builder()
+            .policy_controller(true)
+            .maybe_policy_spec_path(Some(path))
+            .build_with_validation(false)
+            .expect_err("a document over the bound is refused");
+        assert!(matches!(
+            refusal,
+            ConfigError::ValidationFailed { reason } if reason == format!(
+                "{path}: could not read the policy document (the document is {over} bytes; at most {bound})"
+            )
+        ));
+    }
+
+    #[test]
+    fn a_source_that_holds_more_than_it_states_is_read_one_byte_past_the_bound() {
+        let bound = usize::try_from(MAX_DOCUMENT_BYTES).expect("the bound fits");
+        // A source that states no size and holds ten bytes past the bound.
+        let source = std::io::repeat(b'#').take(MAX_DOCUMENT_BYTES + 10);
+        let refusal = bounded_document(0, source).expect_err("the source is past the bound");
+        assert_eq!(refusal.kind(), std::io::ErrorKind::FileTooLarge);
+        assert_eq!(
+            refusal.to_string(),
+            format!("the document is {} bytes; at most {bound}", bound + 1)
+        );
     }
 
     /// Test complex routing mode helper method
