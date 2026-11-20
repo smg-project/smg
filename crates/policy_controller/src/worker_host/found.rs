@@ -4,11 +4,13 @@ use std::sync::Arc;
 
 use smg_worker::{
     identity::basic::Worker,
-    worker::{ConnectionMode, HealthCheckConfig, WorkerSpec},
+    labels::media,
+    worker::{ConnectionMode, HealthCheckConfig, RuntimeType, WorkerSpec},
 };
 
 use super::{door::Over, object::role};
 use crate::{
+    demands::DemandFacts,
     store::{
         pairing::{PairingDescriptor, LAYOUT_FACTS},
         HealthPolicy, Overload, WorkerFacts,
@@ -24,6 +26,29 @@ pub(super) fn engine_of(worker: &dyn Worker) -> &str {
     spec.dp_base_url.as_deref().unwrap_or(&spec.url)
 }
 
+/// A worker's runtime as the number a host states for it: what a
+/// registration states of the worker ([`DemandFacts::runtime`]), and what a
+/// retry that stays on its first attempt's runtime demands. Equal numbers
+/// are one runtime. A runtime that is not specified states none, and meets
+/// no demand for one.
+///
+/// The numbers are written out: a row a standby reads and a request another
+/// build states must agree, whatever order a later build lists the runtimes
+/// in.
+#[must_use]
+pub const fn runtime_number(runtime: RuntimeType) -> u32 {
+    match runtime {
+        RuntimeType::Unspecified => 0,
+        RuntimeType::Sglang => 1,
+        RuntimeType::Vllm => 2,
+        RuntimeType::Trtllm => 3,
+        RuntimeType::Mlx => 4,
+        RuntimeType::TokenSpeed => 5,
+        RuntimeType::Generic => 6,
+        RuntimeType::External => 7,
+    }
+}
+
 /// The facts a provider states of a worker it found, from the object to the
 /// row as the module's table describes. Facts the object does not carry
 /// come from the standing row, or from the store's defaults. The models are
@@ -33,9 +58,10 @@ pub(super) fn engine_of(worker: &dyn Worker) -> &str {
 /// writes a replacement by id ([`Over::Replaced`]) clears it past this
 /// reading.
 ///
-/// The pairing descriptor is the standing row's here too. A door whose rows
-/// hold one states the worker's own in its place (`paired`, below). The
-/// controller's door states none: its log carries no descriptor.
+/// The pairing descriptor, the vision bit and the facts a request's hard
+/// demands read are the standing row's here too. A door whose rows hold
+/// them states the worker's own in their place (`whole`, below). The
+/// controller's door states none: its log carries none of them.
 pub fn facts(worker: &dyn Worker, standing: Option<&WorkerFacts>) -> WorkerFacts {
     let defaults = WorkerFacts::default();
     let standing = standing.unwrap_or(&defaults);
@@ -160,18 +186,32 @@ fn pairing(worker: &dyn Worker) -> Option<Arc<PairingDescriptor>> {
     (descriptor != PairingDescriptor::default()).then(|| Arc::new(descriptor))
 }
 
-/// [`stated`], with the pairing descriptor `built` derived at its build in
-/// place of the standing row's ([`pairing`]): the reading of a door whose
-/// rows hold a descriptor. A worker that reports nothing withdraws the
-/// standing one.
-pub(crate) fn paired(
+/// [`stated`], with what `built` alone states of itself in place of the
+/// standing row's: the reading of a door whose rows hold it. That is the
+/// pairing descriptor it derived at its build ([`pairing`]), and what a
+/// request's hard demands read: whether it takes images, whether it
+/// processes media by reference and by whose pipeline, as the worker crate
+/// reads its labels ([`media`]), and its runtime as a number
+/// ([`runtime_number`]). A worker that reports no pairing fact withdraws
+/// the standing descriptor. The context window stays the standing row's:
+/// no registration states one yet.
+pub(crate) fn whole(
     built: &dyn Worker,
     standing: Option<&WorkerFacts>,
     over: Option<Over<'_>>,
 ) -> WorkerFacts {
+    let facts = stated(built, standing, over);
     WorkerFacts {
         pairing: pairing(built),
-        ..stated(built, standing, over)
+        vision: !media::language_model_only(built),
+        demand_facts: DemandFacts {
+            runtime: runtime_number(built.metadata().spec.runtime_type),
+            references: media::accepts_media_refs(built),
+            host_pipeline: media::runs_host_pipeline(built),
+            // No registration states a window yet: the standing row's stays.
+            ..facts.demand_facts
+        },
+        ..facts
     }
 }
 
@@ -192,10 +232,10 @@ mod tests {
         identity::{basic::Worker, builder::BasicWorkerBuilder},
         model_card::ModelCard,
         pd::pairing::{layout_labels, PairingMismatch, PdPairingMode},
-        worker::{HealthCheckConfig, OverloadUpdate, RuntimeType, WorkerSpec},
+        worker::{ConnectionMode, HealthCheckConfig, OverloadUpdate, RuntimeType, WorkerSpec},
     };
 
-    use super::{facts, paired, pairing};
+    use super::{facts, pairing, runtime_number, stated, whole};
     use crate::{
         demands::DemandFacts,
         spec::Pairing,
@@ -410,8 +450,8 @@ mod tests {
             pairing: Some(stated),
             ..WorkerFacts::default()
         };
-        assert_eq!(paired(&silent, Some(&standing), None).pairing, None);
-        assert_eq!(paired(&worker, None, None).pairing, standing.pairing);
+        assert_eq!(whole(&silent, Some(&standing), None).pairing, None);
+        assert_eq!(whole(&worker, None, None).pairing, standing.pairing);
         // The table states the standing row's descriptor, and none of its own.
         assert_eq!(facts(&worker, None).pairing, None);
         assert_eq!(facts(&silent, Some(&standing)).pairing, standing.pairing);
@@ -470,7 +510,7 @@ mod tests {
         ];
         let rows: Vec<_> = fleet
             .iter()
-            .map(|worker| paired(worker, None, None))
+            .map(|worker| whole(worker, None, None))
             .collect();
         let modes = [
             (Pairing::Strict, PdPairingMode::Strict),
@@ -490,6 +530,90 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// What a request's hard demands read is stated of the worker at a door
+    /// whose rows hold it, whatever the standing row holds. A vision label
+    /// that reads false takes no images. A gRPC worker whose media
+    /// processor label names a processor its runtime serves references with
+    /// processes them, by its host's pipeline where the label names that
+    /// one. Each runtime states its own number, and one that is not
+    /// specified states none. The window stays the standing row's. A door
+    /// whose log carries none of it keeps the standing row's whole.
+    #[test]
+    fn a_door_whose_rows_hold_them_states_what_a_requests_demands_read() {
+        let standing = WorkerFacts {
+            demand_facts: DemandFacts {
+                runtime: 99,
+                references: true,
+                host_pipeline: true,
+                window: 4_096,
+            },
+            ..WorkerFacts::default()
+        };
+        let read = |runtime, connection_mode, labels: &[(&str, &str)]| {
+            let spec = WorkerSpec {
+                models: vec![ModelCard::new("model")].into(),
+                runtime_type: runtime,
+                connection_mode,
+                labels: labels
+                    .iter()
+                    .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                    .collect(),
+                ..WorkerSpec::new(URL.to_owned())
+            };
+            let built = <BasicWorkerBuilder>::from_spec(spec).build();
+            let kept = stated(&built, Some(&standing), None);
+            assert_eq!(
+                (kept.vision, kept.demand_facts),
+                (standing.vision, standing.demand_facts)
+            );
+            let found = whole(&built, Some(&standing), None);
+            let demands = found.demand_facts;
+            // No registration states a window yet: the standing row's stays.
+            assert_eq!(demands.window, 4_096);
+            (
+                found.vision,
+                demands.runtime,
+                demands.references,
+                demands.host_pipeline,
+            )
+        };
+        let (grpc, http) = (ConnectionMode::Grpc, ConnectionMode::Http);
+        let (first, second) = (RuntimeType::Sglang, RuntimeType::Vllm);
+        let own = [("mm_processor", " SMG ")];
+        let other = [("mm_processor", "engine")];
+        let blind = [("supports_vision", "false"), ("mm_processor", "smg")];
+
+        // The runtime, the wire, the labels: vision, the runtime's number,
+        // references, the host's pipeline.
+        assert_eq!(
+            read(RuntimeType::Unspecified, http, &[]),
+            (true, 0, false, false)
+        );
+        assert_eq!(read(first, grpc, &own), (true, 1, true, true));
+        assert_eq!(read(first, grpc, &other), (true, 1, false, false));
+        assert_eq!(read(second, grpc, &own), (true, 2, true, true));
+        assert_eq!(read(second, grpc, &other), (true, 2, true, false));
+        assert_eq!(read(second, http, &own), (true, 2, false, false));
+        assert_eq!(read(second, grpc, &blind), (false, 2, true, true));
+        assert_eq!(
+            read(RuntimeType::TokenSpeed, grpc, &own),
+            (true, 5, false, false)
+        );
+
+        let numbers = [
+            RuntimeType::Unspecified,
+            RuntimeType::Sglang,
+            RuntimeType::Vllm,
+            RuntimeType::Trtllm,
+            RuntimeType::Mlx,
+            RuntimeType::TokenSpeed,
+            RuntimeType::Generic,
+            RuntimeType::External,
+        ]
+        .map(runtime_number);
+        assert_eq!(numbers, [0, 1, 2, 3, 4, 5, 6, 7]);
     }
 
     /// A model list set after the object was built, and a threshold of its

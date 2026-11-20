@@ -759,8 +759,8 @@ mod tests {
     use crate::{
         store::{Maker, MemoryStore, Overload, Unmade, WorkerFacts, WorkerStatus, WorkersStore},
         worker_host::{
-            facts, Expect, Members, Membership, Objects, Over, Refused, Remover, Standing,
-            StoreDoor, Wrote,
+            facts, found::whole, Expect, Members, Membership, Objects, Over, Refused, Remover,
+            Standing, StoreDoor, Wrote,
         },
     };
 
@@ -907,11 +907,13 @@ mod tests {
             WorkflowContext::new(WorkflowInstanceId::new(), data)
         }
 
+        /// A row under `maker` that states `worker` as the store's door
+        /// reads a built worker: a job of the same worker finds equal facts.
         fn seed(&self, maker: &Maker, worker: &dyn Worker) -> Result<Wrote, Refused> {
             let answer = self
                 .door
                 .found(maker, Expect::Anything, worker.url(), &|old| {
-                    facts(worker, old)
+                    whole(worker, old, None)
                 })?;
             self.objects.follow(&*self.store);
             Ok(answer)
@@ -1145,7 +1147,7 @@ mod tests {
             let row = f.store.by_key(url).expect("the row for this worker");
             let expected = WorkerFacts {
                 incarnation: row.facts.incarnation,
-                ..facts(worker.as_ref(), None)
+                ..whole(worker.as_ref(), None, None)
             };
             assert_eq!(row.facts, expected);
             assert_eq!(row.maker, maker);
@@ -1809,7 +1811,7 @@ mod tests {
         // tried again, and it lays the first rank.
         let f = Fixture::new();
         let ranks = ranked_workers(2);
-        f.store.upsert(facts(ranks[1].as_ref(), None));
+        f.store.upsert(whole(ranks[1].as_ref(), None, None));
         let mut cx = f.registration(WorkerJobAsker::Api, ranks);
         cx.data.registration_mode = WorkerRegistrationMode::CreateOnly;
         f.write()

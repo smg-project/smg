@@ -3572,6 +3572,56 @@ pub(crate) mod tests {
         assert_eq!(version.map(String::as_str), Some("2"));
     }
 
+    /// The controller's door reads a built worker's facts alone. Its log
+    /// carries no vision bit and no demand fact, and its room test refuses
+    /// a row that states one. So a worker of a known runtime is registered
+    /// and refreshed here, and its row keeps the standing row's: the label
+    /// that says it takes no images moves the labels alone. A standby that
+    /// replays the log reads the leader's row.
+    #[cfg(feature = "worker-host")]
+    #[test]
+    fn a_worker_of_a_known_runtime_is_laid_with_the_standing_rows_demand_facts() {
+        use smg_worker::labels::{media, SUPPORTS_VISION_LABEL};
+
+        use super::super::worker_wire;
+
+        const HTTP: &str = "http://10.0.0.7:8000";
+        let (store, door) = hosted_door();
+        let built = |blind: bool| -> Arc<dyn Worker> {
+            let worker = <BasicWorkerBuilder>::new(HTTP)
+                .model(ModelCard::new("m"))
+                .runtime_type(smg_worker::worker::RuntimeType::Generic);
+            let worker = if blind {
+                worker.label(SUPPORTS_VISION_LABEL, "false")
+            } else {
+                worker
+            };
+            Arc::new(worker.build())
+        };
+        let kept = |facts: &WorkerFacts| (facts.vision, facts.demand_facts);
+        let unstated = kept(&WorkerFacts::default());
+
+        // No label says the worker takes no images, and its runtime has a
+        // number: a door whose rows hold them would state both.
+        let first = built(false);
+        assert!(!media::language_model_only(first.as_ref()));
+        let wrote = door.found_built(&Maker::Control, Expect::Nothing, &first, None);
+        assert!(wrote.is_ok(), "{wrote:?}");
+        let row = store.by_key(HTTP).expect("the registered row");
+        assert_eq!(kept(&row.facts), unstated);
+
+        let blind = built(true);
+        assert!(media::language_model_only(blind.as_ref()));
+        let wrote = door.refreshed(standing(&row), &blind, &first);
+        assert_eq!(wrote, Ok(Wrote::InPlace(row.id)));
+        let refreshed = store.by_key(HTTP).expect("the refreshed row");
+        assert_eq!(kept(&refreshed.facts), unstated);
+        assert!(refreshed.facts.labels.contains_key(SUPPORTS_VISION_LABEL));
+
+        let back = worker_wire::told_row(&worker_wire::row(&refreshed), std::time::Instant::now());
+        assert_eq!(back.map(|back| back.facts), Ok(refreshed.facts));
+    }
+
     #[cfg(feature = "worker-host")]
     #[test]
     fn every_write_of_a_provider_leaves_its_audit_line() {

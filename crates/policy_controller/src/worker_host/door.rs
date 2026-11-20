@@ -8,7 +8,7 @@ use smg_worker::{
     settings::UnhealthyRemovalScope,
 };
 
-use super::{found::paired, kv_feed::asks_events, Standing};
+use super::{found::whole, kv_feed::asks_events, Standing};
 use crate::{
     store::{
         membership::{self, NotMaker, Past},
@@ -321,9 +321,9 @@ const RANKS: Refused = Refused::Past(Past {
 
 /// How a door reads the facts a built worker states over the row that
 /// stands under its URL, by the write's verb. A door whose rows hold a
-/// pairing descriptor reads the worker's own with them ([`paired`]). A door
-/// whose log carries none reads the facts alone, and the row keeps the
-/// descriptor that stands.
+/// pairing descriptor, a vision bit and the facts a request's demands read
+/// reads the worker's own with them ([`whole`]). A door whose log carries
+/// none of them reads the facts alone, and the row keeps what stands.
 pub(crate) type Reading = fn(&dyn Worker, Option<&WorkerFacts>, Option<Over<'_>>) -> WorkerFacts;
 
 /// The rows `built` states, handed to `write`: each worker's URL, and its
@@ -879,7 +879,7 @@ impl Membership for StoreDoor {
     }
 
     // This door has no holder. The rows take the facts alone, by the
-    // write's verb, each with its worker's own pairing descriptor.
+    // write's verb, each with what its worker alone states of itself.
     fn found_rows(
         &self,
         maker: &Maker,
@@ -887,7 +887,7 @@ impl Membership for StoreDoor {
         built: &[Arc<dyn Worker>],
         over: Option<Over<'_>>,
     ) -> Result<Vec<Wrote>, Refused> {
-        stating(built, over, paired, |rows| self.rows(maker, expect, rows))
+        stating(built, over, whole, |rows| self.rows(maker, expect, rows))
     }
 
     fn drained(&self, by: Remover<'_>, url: &str, seen: Standing) -> Result<Wrote, Refused> {
@@ -906,7 +906,7 @@ impl Membership for StoreDoor {
         _: &Arc<dyn Worker>,
     ) -> Result<Wrote, Refused> {
         self.call(
-            || refresh(self, seen, built.as_ref(), paired),
+            || refresh(self, seen, built.as_ref(), whole),
             Wrote::changed,
         )
     }
