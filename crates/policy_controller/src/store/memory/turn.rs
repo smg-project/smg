@@ -181,7 +181,7 @@ use crate::{
     decider::Decider,
     lease::LeaseId,
     store::{
-        leases::{Said, Sides},
+        leases::{LeaseState, Said, Sides},
         world::World,
         GatewayId,
     },
@@ -1101,18 +1101,10 @@ impl MemoryStore {
     /// record held as the frame found it.
     fn apply_frame(&self, at: usize, leases: &mut Leases, key: Key, said: Said, one: &mut OneLoad) {
         let found = match said {
-            Said::Dispatched(dispatch, when) => {
-                let found = leases.found(&key);
-                leases.dispatched(self.slots(), &key, dispatch, when);
-                // The side the frame names is told where this dispatch
-                // moved it.
-                found.filter(|found| takes_dispatch(found, dispatch.side))
-            }
-            Said::Completed(outcome) => {
-                let found = leases.found(&key);
-                leases.completed(&key, &outcome);
-                found
-            }
+            Said::Dispatched(dispatch, when) => leases
+                .dispatched(self, &key, dispatch, when)
+                .filter(|found| takes_dispatch(found, dispatch.side)),
+            Said::Completed(outcome) => leases.end_side(&key, outcome.side, LeaseState::Completed),
             Said::Released(side, reason) => leases.released(&key, side, reason),
         };
         if let Some(found) = found {

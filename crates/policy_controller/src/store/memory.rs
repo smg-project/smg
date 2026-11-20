@@ -3554,7 +3554,10 @@ impl MemoryStore {
 /// order their dispatch deadlines fall due in.
 struct Leases {
     term: u64,
+    #[cfg(not(test))]
     records: FxHashMap<Key, Held>,
+    #[cfg(test)]
+    records: HashMap<Key, Held, super::tests::LeaseHashes>,
     /// The decode side of each pair's lease on file: a place for each
     /// record that carries the mark of a pair's lease
     /// ([`LeaseRecord::decode`]) and for no other, named by the record's
@@ -3822,7 +3825,7 @@ impl Leases {
     ) -> Self {
         Self {
             term,
-            records: FxHashMap::default(),
+            records: HashMap::default(),
             decodes: Decodes::default(),
             counts,
             sessions,
@@ -4052,13 +4055,6 @@ impl Leases {
         Sides { record, decode }
     }
 
-    /// What a tell of the lease under `key` takes: both its parts as the
-    /// file holds them.
-    fn found(&self, key: &Key) -> Option<Sides> {
-        let held = self.records.get(key)?;
-        Some(self.sides(key, held))
-    }
-
     /// Whether a side of the lease `held` under `key` waits for its
     /// dispatch.
     fn waits(&self, key: &Key, held: &Held) -> bool {
@@ -4078,21 +4074,30 @@ impl Leases {
                 && decode().is_some_and(|decode| decode.side.state.is_live()))
     }
 
-    /// A dispatch of the lease under `key` at `at`; `false` where it is
-    /// not on file. A first dispatch that names another target of the pick
-    /// moves the lease to it: the record's target and index, and the count
-    /// it books, read as every door of the leases reads it
-    /// ([`Slots::of`]). A pair's lease moves by the side its frame names
-    /// ([`Self::dispatched_side`]).
-    fn dispatched(&mut self, slots: Slots<'_>, key: &Key, dispatch: Dispatch, at: Instant) -> bool {
-        let Some(held) = self.records.get_mut(key) else {
-            return false;
+    /// Returns the sides before dispatch so the teller sees the original
+    /// target and state even when this report moves the booking.
+    #[inline(always)]
+    fn dispatched(
+        &mut self,
+        store: &MemoryStore,
+        key: &Key,
+        dispatch: Dispatch,
+        at: Instant,
+    ) -> Option<Sides> {
+        let held = self.records.get_mut(key)?;
+        let mut found = Sides {
+            record: held.record,
+            decode: None,
         };
         if held.record.decode.is_some() {
-            return self.dispatched_side(slots, key, dispatch, at);
+            if let Some(decode) = self.decodes.get_mut(held.decode, key) {
+                found.decode = Some(decode.side);
+                Self::dispatched_side(store, held, decode, dispatch, at);
+            }
+            return Some(found);
         }
         if !held.record.state.is_issued() {
-            return true;
+            return Some(found);
         }
         held.record.state = LeaseState::Dispatched { at };
         // A dispatch on another target of the pick: the record names that
@@ -4101,11 +4106,11 @@ impl Leases {
         // new count added before the first is taken; another rank of the
         // lease's own worker moves no count.
         let Some((target, _)) = held.record.target_at(dispatch.target_index) else {
-            return true;
+            return Some(found);
         };
         if target != held.record.target {
             let first = held.booked;
-            held.booked = slots.of(target);
+            held.booked = store.slots().of(target);
             self.counts.moved(first, held.booked);
             if held.keyed {
                 let session = held.record.lease.session;
@@ -4114,25 +4119,19 @@ impl Leases {
             held.record.target = target;
         }
         held.record.lease.target_index = dispatch.target_index;
-        true
+        Some(found)
     }
 
     /// Dispatches the named side if it is issued or chosen. Every target
     /// of a pair's pick names the same prefill, so only the decode's
     /// booking can move. A chosen decode books its target at dispatch.
     fn dispatched_side(
-        &mut self,
-        slots: Slots<'_>,
-        key: &Key,
+        store: &MemoryStore,
+        held: &mut Held,
+        decode: &mut HeldDecode,
         dispatch: Dispatch,
         at: Instant,
-    ) -> bool {
-        let Some(held) = self.records.get_mut(key) else {
-            return false;
-        };
-        let Some(decode) = self.decodes.get_mut(held.decode, key) else {
-            return false;
-        };
+    ) {
         match dispatch.side {
             Side::Prefill if held.record.state.is_issued() => {
                 held.record.state = LeaseState::Dispatched { at };
@@ -4143,10 +4142,10 @@ impl Leases {
                 side.state = LeaseState::Dispatched { at };
                 if let Some((target, _)) = named {
                     if target != side.target {
-                        let to = slots.of(target);
-                        rebook(&self.counts, &mut decode.booked, to);
+                        let to = store.slots().of(target);
+                        rebook(&store.counts, &mut decode.booked, to);
                         if held.keyed {
-                            self.sessions.moved(side.session, side.target, target);
+                            store.sessions.moved(side.session, side.target, target);
                         }
                         side.target = target;
                     }
@@ -4160,36 +4159,16 @@ impl Leases {
                     side.target_index = dispatch.target_index;
                 }
                 side.state = LeaseState::Dispatched { at };
-                decode.booked = slots.of(side.target);
+                decode.booked = store.slots().of(side.target);
                 if let Some(booked) = decode.booked {
-                    self.counts.book(booked);
+                    store.counts.book(booked);
                 }
                 if let Some((session, worker)) = keyed_decode(held.keyed, side) {
-                    self.sessions.book(session, worker);
+                    store.sessions.book(session, worker);
                 }
             }
             _ => {}
         }
-        true
-    }
-
-    /// A side of the lease under `key` completed; `false` where it is not
-    /// on file. A pair's side ends alone and gives its count back: the
-    /// record stands until its last side ends. One look finds the lease:
-    /// a single's leaves the file by it, as before the pair door.
-    fn completed(&mut self, key: &Key, outcome: &Outcome) -> bool {
-        use std::collections::hash_map::Entry;
-
-        let Entry::Occupied(found) = self.records.entry(*key) else {
-            return false;
-        };
-        if found.get().record.decode.is_some() {
-            self.end_side(key, outcome.side, LeaseState::Completed);
-        } else {
-            let held = found.remove();
-            self.gone(held, key, |_, _| ());
-        }
-        true
     }
 
     /// The lease under `key` given up on `side`, or with `None` whole;
@@ -4201,40 +4180,47 @@ impl Leases {
     #[inline(always)]
     fn released(&mut self, key: &Key, side: Option<Side>, reason: ReleaseReason) -> Option<Sides> {
         match side {
-            Some(side) if self.pairs(key) => {
-                let found = self.found(key);
-                self.end_side(key, side, LeaseState::Released(reason));
-                found
-            }
+            Some(side) if self.pairs(key) => self.end_side(key, side, LeaseState::Released(reason)),
             _ => self.taken(key),
         }
     }
 
-    /// Ends `side` of the pair's lease under `key` as `ended` and gives
-    /// that side's count and its key's booking back; the lease leaves the
-    /// file with its last side. A side the lease does not hold, or one
-    /// that ended, changes nothing. A chosen decode side books nothing:
-    /// its end is its state alone, and no later call issues it.
-    fn end_side(&mut self, key: &Key, side: Side, ended: LeaseState) {
-        let Some(held) = self.records.get_mut(key) else {
-            return;
+    /// A single ends whole. A pair leaves with its last live side.
+    /// Both return the sides as they stood before the report.
+    #[inline(always)]
+    fn end_side(&mut self, key: &Key, side: Side, ended: LeaseState) -> Option<Sides> {
+        use std::collections::hash_map::Entry;
+
+        let Entry::Occupied(mut entry) = self.records.entry(*key) else {
+            return None;
         };
+        let held = entry.get_mut();
+        let mut found = Sides {
+            record: held.record,
+            decode: None,
+        };
+        if held.record.decode.is_none() {
+            let held = entry.remove();
+            self.gone(held, key, |_, _| ());
+            return Some(found);
+        }
         let Some(decode) = self.decodes.get_mut(held.decode, key) else {
-            return;
+            return Some(found);
         };
+        found.decode = Some(decode.side);
         // What the side books of its key's requests, read while it lives.
         let side_key = match side {
             Side::Prefill => keyed(held.keyed, &held.record),
             Side::Decode => keyed_decode(held.keyed, &decode.side),
-            Side::Single | Side::Encode => return,
+            Side::Single | Side::Encode => return Some(found),
         };
         let (state, booked) = match side {
             Side::Prefill => (&mut held.record.state, &mut held.booked),
             Side::Decode => (&mut decode.side.state, &mut decode.booked),
-            Side::Single | Side::Encode => return,
+            Side::Single | Side::Encode => return Some(found),
         };
         if !(state.is_live() || state.is_chosen()) {
-            return;
+            return Some(found);
         }
         *state = ended;
         if let Some(booked) = booked.take() {
@@ -4244,8 +4230,10 @@ impl Leases {
             self.sessions.free(session, worker);
         }
         if !held.record.state.is_live() && !decode.side.state.is_live() {
-            self.end(key);
+            let held = entry.remove();
+            self.gone(held, key, |_, _| ());
         }
+        Some(found)
     }
 
     /// Queues `deadline` in its order. The deadlines come in rising order
@@ -4979,12 +4967,14 @@ impl LeasesStore for MemoryStore {
         at: Instant,
     ) -> bool {
         self.turn_of(self.file_of(lease))
-            .dispatched(self.slots(), &(gateway, lease), dispatch, at)
+            .dispatched(self, &(gateway, lease), dispatch, at)
+            .is_some_and(|found| found.record.decode.is_none() || found.decode.is_some())
     }
 
     fn completed(&self, gateway: GatewayId, lease: LeaseId, outcome: &Outcome) -> bool {
         self.turn_of(self.file_of(lease))
-            .completed(&(gateway, lease), outcome)
+            .end_side(&(gateway, lease), outcome.side, LeaseState::Completed)
+            .is_some()
     }
 
     fn released(
