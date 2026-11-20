@@ -274,10 +274,12 @@ async fn a_step_that_panics_ends_its_run_as_failed() {
         .unwrap();
     assert_eq!(step_state.status, StepStatus::Failed);
     assert_eq!(step_state.attempt, 1);
+    assert_eq!(step_state.last_error.as_deref(), Some("Step failed"));
     assert_eq!(
-        step_state.last_error.as_deref(),
-        Some("Step panicked: the step's own words")
+        wfaas::completion_outcome(&state, "panicking"),
+        Err("Workflow failed at step panicking_step: Step failed".to_string())
     );
+    assert!(!format!("{state:?}").contains("the step's own words"));
 }
 
 /// Where a step author's other code panics.
@@ -355,7 +357,7 @@ async fn a_panic_in_a_steps_condition_or_hooks_ends_its_run() {
             PanicsIn::RunIf,
             WorkflowStatus::Failed,
             StepStatus::Failed,
-            Some("run_if panicked: the condition's own words"),
+            Some("Step failed"),
         ),
         (
             PanicsIn::IsRetryable,
@@ -509,7 +511,7 @@ async fn a_method_that_panics_as_it_is_called_is_caught() {
             Call::Execute,
             WorkflowStatus::Failed,
             StepStatus::Failed,
-            Some("Step panicked: the call's own words"),
+            Some("Step failed"),
         ),
         (
             Call::OnSuccess,
@@ -550,18 +552,18 @@ async fn a_method_that_panics_as_it_is_called_is_caught() {
 }
 
 /// A condition that panics ends its run by its step's failure action, as a
-/// panic in `execute` does, and the run's outcome names the step and the
-/// panic. Under `ContinueNextStep` the step is skipped with the panic's
-/// words kept, and the workflow goes on to its end.
+/// panic in `execute` does, and the run's outcome names the step and failure.
+/// Under `ContinueNextStep` the step is skipped with the failure kept, and the
+/// workflow goes on to its end.
 #[tokio::test]
 async fn a_condition_that_panics_ends_its_run_by_the_steps_failure_action() {
-    const PANIC: &str = "run_if panicked: the condition's own words";
+    const FAILURE: &str = "Step failed";
     let rows = [
         (
             FailureAction::FailWorkflow,
             WorkflowStatus::Failed,
             StepStatus::Failed,
-            Err(format!("Workflow failed at step gated_step: {PANIC}")),
+            Err(format!("Workflow failed at step gated_step: {FAILURE}")),
         ),
         (
             FailureAction::ContinueNextStep,
@@ -596,7 +598,11 @@ async fn a_condition_that_panics_ends_its_run_by_the_steps_failure_action() {
         assert_eq!(state.status, run, "{action:?}");
         let step_state = state.step_states.get(&StepId::new("gated_step")).unwrap();
         assert_eq!(step_state.status, step, "{action:?}");
-        assert_eq!(step_state.last_error.as_deref(), Some(PANIC), "{action:?}");
+        assert_eq!(
+            step_state.last_error.as_deref(),
+            Some(FAILURE),
+            "{action:?}"
+        );
         assert_eq!(
             wfaas::completion_outcome(&state, "gated"),
             outcome,
