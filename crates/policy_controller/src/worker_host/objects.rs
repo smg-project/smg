@@ -33,7 +33,7 @@ use super::{
 use crate::{
     store::{
         MembershipChange, MembershipTail, MemoryStore, Overload, Reachability, WorkerFacts,
-        WorkerRow, WorkersStore,
+        WorkerRow, WorkerStatus, WorkersStore,
     },
     view::{LoadRow, WorkerId},
 };
@@ -385,9 +385,14 @@ impl<G: Generation> Objects<G> {
     /// the follow's turn to its end. It reads the keeper as a build does:
     /// where a registration is in flight at the address, an object that
     /// holds what it stated marks the flight, and its put-back says so.
+    ///
+    /// A draining row keeps its object. That object serves what is in
+    /// flight alone, with the credential those requests were dialed with,
+    /// and the removal that began the drain holds it to take it.
+    ///
     /// Return how many objects were laid again: none where no keeper was
     /// handed in, where no row dials the address, or where each object
-    /// there holds what its row takes.
+    /// there holds what its row takes or stands for a draining row.
     pub fn lay_again<S: WorkersStore + ?Sized>(&self, store: &S, facts: &WorkerFacts) -> usize {
         let mut place = self.read_to.lock();
         self.follow_from(store, &mut place);
@@ -411,7 +416,8 @@ impl<G: Generation> Objects<G> {
         };
         let mut laid = 0;
         // A row that left behind the read above is the next follow's.
-        for row in stale.into_iter().filter_map(|id| store.get(id)) {
+        let rows = stale.into_iter().filter_map(|id| store.get(id));
+        for row in rows.filter(|row| row.status != WorkerStatus::Draining) {
             self.lay(store, &row);
             laid += 1;
         }
@@ -2479,6 +2485,33 @@ mod tests {
 
         // An address no row dials lays nothing.
         assert_eq!(replica.lay_again(&facts(E, 1)), 0);
+    }
+
+    /// A draining row keeps its object. Two rank rows dial one address and
+    /// one of them drains. The other rank's registration then states
+    /// another credential: its own object is laid again, alone. The
+    /// draining row's object stands as it was, with the credential it was
+    /// built with, so the removal that holds it finds it under its URL.
+    #[test]
+    fn laying_again_leaves_the_object_of_a_draining_row() {
+        let replica = Replica::new();
+        let first = replica.register(rank_facts(A, C, 0), Some(KEY_C));
+        let draining = replica.register(rank_facts(B, C, 1), Some(KEY_C));
+        replica.follow();
+        let revision = replica.row(B).revision;
+        let marked = replica
+            .store
+            .set_status(draining, WorkerStatus::Draining, revision);
+        assert!(marked.is_some());
+        replica.follow();
+        let held = replica.at(B);
+
+        let rotated = replica.kept(&rank_facts(A, C, 0), Some(KEY_B));
+        assert!(rotated.accepted(first));
+        assert_eq!(replica.lay_again(&rank_facts(A, C, 0)), 1);
+        assert!(replica.holds_credential(A, Some(KEY_B)));
+        assert!(Arc::ptr_eq(&held, &replica.at(B)));
+        assert!(replica.holds_credential(B, Some(KEY_C)));
     }
 
     #[test]
