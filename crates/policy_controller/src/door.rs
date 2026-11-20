@@ -3999,7 +3999,7 @@ pub(crate) mod tests {
         catalog::Catalog,
         decider::Decider,
         decision::{Decision, Lifted, ShedReason, Target, Targets},
-        demands::{DemandFacts, Demands, References, Unmet},
+        demands::{DemandFacts, Demands},
         framework::{DecisionScope, EncodeItems, EncodePlaced, Filter, Picker, TieBand},
         lease::{Lease, LeaseId, Lifecycle, Outcome, ReleaseReason, Side, TransportClass},
         sessions::SessionVerdict,
@@ -4014,7 +4014,7 @@ pub(crate) mod tests {
             Candidate, Constraints, Identity, KeyedRow, LoadRow, Phase, PoolFacts, RequestFacts,
             Role, Session, WireModes, WorkerId,
         },
-        DecisionRecord,
+        DecisionRecord, References, Unmet,
     };
 
     mod shadow;
