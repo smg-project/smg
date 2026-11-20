@@ -1773,6 +1773,54 @@ async fn an_encode_ask_states_the_wires_its_pipeline_dials() -> anyhow::Result<(
     Ok(())
 }
 
+/// A fleet of two runtimes holds a pair and an encoder of each. A first
+/// attempt pinned to one runtime lands on that runtime's pair, with its
+/// encoder where the request has an item. The encode pair's commit takes
+/// the route's rule a side at a time, so a pair of the other runtime is
+/// passed over and the next ask is made. With the rule read after the
+/// commit, an attempt that drew the other pair was given up and refused.
+#[tokio::test]
+async fn a_pinned_encode_attempt_passes_over_a_pair_of_another_runtime() -> anyhow::Result<()> {
+    const OTHER: [&str; 3] = ["http://p1:8000", "http://d1:8000", "http://e1:8000"];
+    let mut fleet = fleet_around(MEET, &[Member::of(ENCODER, WorkerType::Encode, MEET)]);
+    fleet.extend([
+        Member::of(OTHER[0], WorkerType::Prefill, PUSH),
+        Member::of(OTHER[1], WorkerType::Decode, PUSH),
+        Member::of(OTHER[2], WorkerType::Encode, PUSH),
+    ]);
+    let (stage, store) = encode_stage(&fleet)?;
+    let fleets = [(MEET, [PREFILL, DECODE, ENCODER]), (PUSH, OTHER)];
+    for (runtime, [prefill, decode, encoder]) in fleets {
+        let pinned = EpdDemands {
+            wire: Some(grpc_wire(runtime)),
+            ..IMAGES
+        };
+        for key in 0..8_u8 {
+            // A request with no item is its pair alone. One with an item
+            // takes the pinned runtime's encoder too.
+            for items in [vec![], vec![vec![key]]] {
+                let ((assignments, placed_prefill, placed_decode, _), placed) =
+                    encode_attempt(&stage, &items, pinned)
+                        .await
+                        .ok()
+                        .context("the pinned runtime's pair")?;
+                assert_eq!(
+                    (placed_prefill.url(), placed_decode.url()),
+                    (prefill, decode),
+                    "{key}"
+                );
+                assert_eq!(assignments.len(), items.len(), "{key}");
+                for assignment in &assignments {
+                    assert_eq!(assignment.worker.url(), encoder, "{key}");
+                }
+                drop(placed);
+            }
+        }
+    }
+    assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
+    Ok(())
+}
+
 /// Equal items carry one key, so one encoder takes them, and the keys of a
 /// fleet spread over more encoders than one.
 #[tokio::test]

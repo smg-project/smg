@@ -2321,12 +2321,15 @@ impl WorkerSelectionStage {
     /// ask yet: the encoders are held to it after the commit.
     ///
     /// The ask states the wires the route dials, so the controller names no
-    /// pair and no encoder on another wire. The commit takes no other rule
-    /// of the route. So a pair or an encoder the route still cannot send to
-    /// is given up as a failed commit and refused, as the pair helper
-    /// refuses its pair. Where the document's plan places no encoder for a
-    /// request with items, the request is refused by name. An encoder holds
-    /// no lease, so nothing more is said for it.
+    /// pair and no encoder on another wire. The pair's commit takes the
+    /// route's rule a side at a time, as the pair helper's does, and passes
+    /// over a pair either of whose workers it refuses. No rule of a side
+    /// tells a pair of two runtimes, and the commit holds no encoder to the
+    /// route's rule. So such a pair, or an encoder the route still cannot
+    /// send to, is given up as a failed commit and refused. Where the
+    /// document's plan places no encoder for a request with items, the
+    /// request is refused by name. An encoder holds no lease, so nothing
+    /// more is said for it.
     #[expect(
         clippy::too_many_arguments,
         reason = "the encode pair's selection threads every input the classic placement consumes"
@@ -2374,8 +2377,17 @@ impl WorkerSelectionStage {
             },
             ..attempt.ask(model_id, &id, &hashes)
         };
+        // A worker passes the rule of its own pool: a pool matches its own
+        // type alone.
+        let on_prefill = on_route(prefill_pool, demand.wire, ledger);
+        let on_decode = on_route(decode_pool, demand.wire, ledger);
         let (mut placed, guard) = host
-            .place_pair(&ask, self.prefill_admission.as_deref(), sticky_key)
+            .place_pair_where(
+                &ask,
+                |worker| on_prefill(worker) || on_decode(worker),
+                self.prefill_admission.as_deref(),
+                sticky_key,
+            )
             .await
             .map_err(|unplaced| match epd_shed(&unplaced) {
                 Some(failure) => self.epd_selection_failure(model_id, failure, needs_encode),
@@ -2383,23 +2395,22 @@ impl WorkerSelectionStage {
             })?;
         let prefill = Arc::clone(placed.worker());
         let runtime = prefill.metadata().spec.runtime_type;
-        let holds = |pool, worker: &dyn Worker| on_route(pool, demand.wire, ledger)(worker);
-        let pair_holds = |decode: &Arc<dyn Worker>| {
-            holds(prefill_pool, prefill.as_ref())
-                && holds(decode_pool, decode.as_ref())
-                && decode.metadata().spec.runtime_type == runtime
-        };
-        // An encoder is held to the gateway's own read of it: its pool, the
-        // request's wire, the pair's runtime and the request's media.
+        // The commit held each side to the route's rule. An encoder is held
+        // here to the gateway's own read of it: its pool, the request's
+        // wire, the pair's runtime and the request's media.
+        let on_encode = on_route(RoutingPool::GrpcEncode, demand.wire, ledger);
         let encoder_holds = |encoder: &host::PlacedEncoder| {
             let worker = encoder.worker.as_ref();
-            holds(RoutingPool::GrpcEncode, worker)
+            on_encode(worker)
                 && worker.metadata().spec.runtime_type == runtime
                 && demand.encode.accepts(worker)
         };
         let decode = placed
             .decode()
-            .filter(|decode| pair_holds(decode) && placed.encoders().iter().all(encoder_holds))
+            .filter(|decode| {
+                decode.metadata().spec.runtime_type == runtime
+                    && placed.encoders().iter().all(encoder_holds)
+            })
             .cloned();
         let Some(decode) = decode else {
             placed.released(ReleaseReason::CommitFailed, Instant::now());
