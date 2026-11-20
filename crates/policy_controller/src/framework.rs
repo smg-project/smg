@@ -16142,7 +16142,7 @@ mod tests {
         let catalog = Catalog::builtin();
         let build = |name: &str| match catalog.find_picker(name) {
             Some(Found::Built(picker)) => Some(picker),
-            Some(Found::Typed) => None,
+            Some(Found::Typed | Found::With(_)) => None,
             None => Some(Box::new(Lowest) as Box<dyn Picker>),
         };
         let mut marked = Vec::new();

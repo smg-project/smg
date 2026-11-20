@@ -646,7 +646,7 @@ fn a_stage_built_with_no_context_that_declares_the_signal_cells_is_refused() {
             held(
                 declares,
                 "profiles.default.pick.declares",
-                "a picker resolves none: leave the need unset"
+                "register it by picker_with to resolve one, or leave the need unset"
             )
         );
     }
@@ -774,5 +774,50 @@ fn the_default_cells_read_no_value() {
     assert_eq!(
         reads(&rows, Some(&SignalCells::default())),
         [(31, None, None), (32, None, None)]
+    );
+}
+
+/// A picker built under a context is held to its word on the signal cells
+/// as a scorer is: the one maker of a context holds every kind of stage.
+#[test]
+fn a_picker_built_under_a_context_is_held_to_its_word_on_the_cells() {
+    let refusal = |declares: bool, resolves: bool| {
+        let mut catalog = Catalog::builtin();
+        catalog
+            .picker_with("declares", move |build: &mut StageBuild<'_>| {
+                if resolves {
+                    build.signal_column("free")?;
+                }
+                Ok(Box::new(Declares { declares }))
+            })
+            .expect("a free name");
+        let text = DOCUMENT
+            .replace(
+                "- reads-two: { first: pending, second: free }",
+                "- least-requests",
+            )
+            .replace("pick: best", "pick: declares");
+        document(&text)
+            .validate_in(&catalog, &[])
+            .map(|_| ())
+            .map_err(|refused| refused.to_string())
+    };
+    assert_eq!(refusal(true, true), Ok(()));
+    assert_eq!(refusal(false, false), Ok(()));
+    assert_eq!(
+        refusal(false, true),
+        Err(
+            "profiles.default.pick.declares: the stage keeps a signal's column: its needs must \
+             set signal_cells"
+                .to_owned()
+        )
+    );
+    assert_eq!(
+        refusal(true, false),
+        Err(
+            "profiles.default.pick.declares: the stage's needs set signal_cells and its build \
+             resolved no signal: resolve one or leave the need unset"
+                .to_owned()
+        )
     );
 }

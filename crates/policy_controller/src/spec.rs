@@ -43,7 +43,7 @@ use crate::{
         LeastLoad, LeastRequests, ResidentWork, SampledBest, SessionAffinity,
         DEFAULT_KV_PRESSURE_WEIGHT, DEFAULT_MEAN_PREFILL_TOKENS, DEFAULT_THROUGHPUT,
     },
-    catalog::{profile_sent, Catalog, FilterFactory, Found, StageBuild},
+    catalog::{profile_sent, Catalog, FilterFactory, Found, PickerFactory, StageBuild},
     framework::{
         Binding, Engine, Filter, OverloadThresholds, Picker, Plan, Profile, Scorer, Weighted,
     },
@@ -1519,18 +1519,32 @@ impl JsonSchema for ScoreSpec {
     }
 
     fn json_schema(generator: &mut SchemaGenerator) -> Schema {
-        // The bare form stands for the stage at its defaults, so a scorer
-        // whose parameters have none is written in the parameter form only.
+        // The schema cannot know a host's catalog, so a name is open in
+        // both forms: the validator refuses an unknown one by its path. The
+        // bare form stands for a stock scorer at its defaults, so one whose
+        // parameters have none is written in the parameter form only: the
+        // description lists the stock scorers that stand bare.
         let names: Vec<&str> = SCORERS
             .iter()
             .copied()
             .filter(|name| ScoreStage::by_name(name).is_some())
             .collect();
+        let description = format!(
+            "A scorer: its bare name (a stock scorer at its defaults, or a scorer the host adds at weight one), a stock scorer mapped to its weight and parameters, or the name of a scorer the host adds mapped to its weight and parameters. The stock scorers a document names bare: {}.",
+            names.join(", ")
+        );
         json_schema!({
-            "description": "A scorer: its bare name (the stage at its defaults), or the name mapped to its weight and parameters.",
+            "description": description,
             "anyOf": [
-                { "type": "string", "enum": names },
-                generator.subschema_for::<ScoreStage>()
+                { "type": "string" },
+                generator.subschema_for::<ScoreStage>(),
+                {
+                    "type": "object",
+                    "minProperties": 1,
+                    "maxProperties": 1,
+                    "propertyNames": { "not": { "enum": SCORERS } },
+                    "additionalProperties": { "type": "object" }
+                }
             ]
         })
     }
@@ -1554,19 +1568,29 @@ impl PickStage {
     }
 }
 
-/// A picker reference: a bare name, or the name mapped to its parameters
-/// ([`PickStage`]).
+/// A picker reference: a bare name, a built-in mapped to its parameters
+/// ([`PickStage`]), or a name the catalog adds mapped to the parameters
+/// its factory reads.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum PickSpec {
     Name(String),
     Params(PickStage),
+    /// A name that is no built-in's with parameters, mapped to what the
+    /// document wrote under it. The map is kept as read so the validator
+    /// can ask the catalog for the name first. Parsing refuses a repeated
+    /// key.
+    Added {
+        name: String,
+        written: serde_json::Value,
+    },
 }
 
 impl PickSpec {
     /// The picker's name as written.
     pub fn name(&self) -> &str {
         match self {
-            Self::Name(name) => name,
+            Self::Name(name) | Self::Added { name, .. } => name,
             Self::Params(stage) => stage.name(),
         }
     }
@@ -1604,27 +1628,43 @@ impl Serialize for PickSpec {
                 map.serialize_entry("best-with-temperature", p)?;
                 map.end()
             }
+            Self::Added { name, written } => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry(name, &Ordered(written))?;
+                map.end()
+            }
         }
     }
 }
 
-/// The one picker of a pick entry's map, read by its key.
-fn picker_entry<'de, A: MapAccess<'de>>(mut map: A) -> Result<PickStage, A::Error> {
-    const WITH_PARAMETERS: [&str; 2] = ["best", "best-with-temperature"];
+/// The built-in pickers a document writes with parameters: the keys the
+/// reader reads into [`PickStage`].
+const TYPED_PICKERS: [&str; 2] = ["best", "best-with-temperature"];
+
+/// The one picker of a pick entry's map, read by its key. A built-in's
+/// key chooses its parameter struct, so the struct's own message names an
+/// unknown or mistyped parameter. What stands under any other name is
+/// kept as read: only the validator knows the names a catalog adds.
+fn picker_entry<'de, A: MapAccess<'de>>(mut map: A) -> Result<PickSpec, A::Error> {
     let Some(key) = map.next_key::<String>()? else {
         return Err(de::Error::custom("a pick entry names one picker"));
     };
-    let stage = match key.as_str() {
-        "best" => PickStage::Best(map.next_value()?),
-        "best-with-temperature" => PickStage::BestWithTemperature(map.next_value()?),
-        other => return Err(de::Error::unknown_variant(other, &WITH_PARAMETERS)),
+    let entry = match key.as_str() {
+        "best" => PickSpec::Params(PickStage::Best(map.next_value()?)),
+        "best-with-temperature" => {
+            PickSpec::Params(PickStage::BestWithTemperature(map.next_value()?))
+        }
+        _ => {
+            let Written(written) = map.next_value()?;
+            PickSpec::Added { name: key, written }
+        }
     };
     if map.next_key::<de::IgnoredAny>()?.is_some() {
         return Err(de::Error::custom(
             "a pick entry maps a single key to its parameters",
         ));
     }
-    Ok(stage)
+    Ok(entry)
 }
 
 impl<'de> Deserialize<'de> for PickSpec {
@@ -1643,7 +1683,7 @@ impl<'de> Deserialize<'de> for PickSpec {
             }
 
             fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<PickSpec, A::Error> {
-                picker_entry(map).map(PickSpec::Params)
+                picker_entry(map)
             }
         }
 
@@ -1662,11 +1702,25 @@ impl JsonSchema for PickSpec {
             .copied()
             .filter(|name| *name != "best-with-temperature")
             .collect();
+        // A name is open in both forms, as a scorer's is: the description
+        // lists the stock pickers a document names bare.
+        let description = format!(
+            "{} The stock pickers a document names bare: {}.",
+            "A picker: its bare name, a built-in mapped to its parameters, or the name of a picker the host adds mapped to its parameters. `power-of-two` and `power-of-two-count-first` compare two workers drawn from those the filters left, `count-first` the fewest in flight among them: the built-in scorers score the workers compared and no other. Between two workers a normalized score is all or nothing, so several weighted scorers under a two-draw picker vote by weight where over the pool they would blend: name one scorer there, or the `best` picker over the pool.",
+            names.join(", ")
+        );
         json_schema!({
-            "description": "A picker: its bare name, or the name mapped to its parameters. `power-of-two` and `power-of-two-count-first` compare two workers drawn from those the filters left, `count-first` the fewest in flight among them: the built-in scorers score the workers compared and no other. Between two workers a normalized score is all or nothing, so several weighted scorers under a two-draw picker vote by weight where over the pool they would blend: name one scorer there, or the `best` picker over the pool.",
+            "description": description,
             "anyOf": [
-                { "type": "string", "enum": names },
-                generator.subschema_for::<PickStage>()
+                { "type": "string" },
+                generator.subschema_for::<PickStage>(),
+                {
+                    "type": "object",
+                    "minProperties": 1,
+                    "maxProperties": 1,
+                    "propertyNames": { "not": { "enum": TYPED_PICKERS } },
+                    "additionalProperties": { "type": "object" }
+                }
             ]
         })
     }
@@ -1686,7 +1740,8 @@ pub struct ProfileSpec {
     /// The scorers, each a name or a name with its weight and parameters.
     #[serde(default)]
     pub score: Vec<ScoreSpec>,
-    /// The picker.
+    /// The picker: a name, a built-in mapped to its parameters, or the name
+    /// of a picker the catalog adds mapped to its parameters.
     pub pick: PickSpec,
     /// The number of milliseconds a send counts for. An unset limit keeps
     /// sends from expiring by age. A profile whose stages do not read its
@@ -3092,37 +3147,71 @@ fn scorer_of(
     })
 }
 
+/// The profile's picker. The catalog is asked for a name first, as it is
+/// for a filter: a picker it builds from the document's map is handed what
+/// stands under the name, a picker registered with no parameter is written
+/// by its name alone, and a name it does not hold is refused as unknown
+/// whatever is written under it. `sent` hands a factory that asks for it
+/// the profile's count of sends.
 fn picker_of(
     pick: &PickSpec,
     profile: &str,
     at: &At,
-    catalog: &Catalog,
+    from: StageInputs<'_>,
+    sent_ttl_ms: Option<u32>,
+    sent: &mut Option<Arc<SentCredit>>,
 ) -> Result<Resolved<Box<dyn Picker>>, SpecError> {
-    Ok(match pick {
-        PickSpec::Name(name) => match catalog.find_picker(name) {
+    let named = pick.name();
+    let path = || format!("{}.pick.{named}", at.0);
+    // The catalog's factory builds its picker from the document's map. A
+    // picker has no weight: the map is the factory's whole.
+    let made = |build: &PickerFactory,
+                mut params: serde_json::Map<String, serde_json::Value>,
+                sent: &mut Option<Arc<SentCredit>>| {
+        in_key_order(&mut params);
+        let picker = StageBuild::built(
+            &params,
+            profile,
+            sent_ttl_ms,
+            sent,
+            from.reports,
+            from.signals,
+            build,
+            Picker::needs,
+        )
+        .map_err(|error| error.at(&path()))?;
+        let answers = picker.name();
+        if answers != named {
+            return Err(SpecError::BadStage {
+                path: path(),
+                reason: format!("picker registered as {named:?} answers the name {answers:?}"),
+            });
+        }
+        Ok(Resolved::Built(picker))
+    };
+    let unknown = || SpecError::UnknownPicker {
+        profile: profile.to_string(),
+        name: named.to_string(),
+    };
+    match pick {
+        PickSpec::Name(name) => match from.catalog.find_picker(name) {
             Some(Found::Built(picker)) => {
-                // A picker has no registration with a context.
+                // A picker the catalog built with no context.
                 no_cells_without_a_context(
                     picker.needs(),
-                    "a picker resolves none: leave the need unset",
-                    || at.sub("pick").field(name),
+                    "register it by picker_with to resolve one, or leave the need unset",
+                    path,
                 )?;
-                Resolved::Built(picker)
+                Ok(Resolved::Built(picker))
             }
+            Some(Found::With(build)) => made(build, serde_json::Map::new(), sent),
             // The one picker with parameters, named without them.
-            Some(Found::Typed) => {
-                return Err(at.bad(
-                    "pick",
-                    name,
-                    "a picker with its temperature: { best-with-temperature: { temperature } }",
-                ))
-            }
-            None => {
-                return Err(SpecError::UnknownPicker {
-                    profile: profile.to_string(),
-                    name: name.clone(),
-                })
-            }
+            Some(Found::Typed) => Err(at.bad(
+                "pick",
+                name,
+                "a picker with its temperature: { best-with-temperature: { temperature } }",
+            )),
+            None => Err(unknown()),
         },
         PickSpec::Params(PickStage::Best(p)) => {
             if !(1..=MAX_SAMPLE).contains(&p.sample) {
@@ -3132,7 +3221,7 @@ fn picker_of(
                     "a whole number from 1 to 64",
                 ));
             }
-            Resolved::Built(Box::new(SampledBest::new(p.sample)))
+            Ok(Resolved::Built(Box::new(SampledBest::new(p.sample))))
         }
         PickSpec::Params(PickStage::BestWithTemperature(p)) => {
             if !at_or_above_zero(p.temperature) {
@@ -3142,9 +3231,36 @@ fn picker_of(
                     "a finite number at or above zero",
                 ));
             }
-            Resolved::NotInBuild("the best-with-temperature picker")
+            Ok(Resolved::NotInBuild("the best-with-temperature picker"))
         }
-    })
+        PickSpec::Added { name, written } => match from.catalog.find_picker(name) {
+            // Only a document built in code: the reader reads a typed
+            // built-in's key into its parameter struct.
+            _ if TYPED_PICKERS.contains(&name.as_str()) => Err(SpecError::BadField {
+                path: path(),
+                value: name.clone(),
+                reason: "a picker added in code: a built-in's parameters are typed",
+            }),
+            Some(Found::With(build)) => {
+                let params = written.as_object().ok_or_else(|| SpecError::BadField {
+                    path: path(),
+                    value: written.to_string(),
+                    reason: "a map of the picker's parameters",
+                })?;
+                made(build, params.clone(), sent)
+            }
+            // A picker registered with no parameter is written by its name
+            // alone: whatever stands under it is refused.
+            Some(Found::Built(_)) => Err(SpecError::BadField {
+                path: path(),
+                value: written.to_string(),
+                reason: "left out: this picker takes no parameter, write its bare name",
+            }),
+            // The catalog holds no picker by its type alone under a name the
+            // reader kept as read.
+            None | Some(Found::Typed) => Err(unknown()),
+        },
+    }
 }
 
 /// Holds a stage the catalog built with no context to the signal cells,
@@ -3607,7 +3723,7 @@ fn check_profile(
             }
         }
     }
-    let picker = match picker_of(&p.pick, name, &at, catalog)? {
+    let picker = match picker_of(&p.pick, name, &at, from, p.sent_ttl_ms, &mut sent)? {
         Resolved::Built(picker) => Some(picker),
         Resolved::NotInBuild(what) => {
             deferred.note(at.field("pick"), what);

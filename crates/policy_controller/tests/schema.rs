@@ -84,10 +84,55 @@ fn the_committed_schema_admits_least_cost_with_terms_and_a_margin() {
     let over_least = &unreported[0]["properties"]["over-least"];
     assert_eq!(over_least["required"], serde_json::json!(["request_cost"]));
     assert_eq!(over_least["properties"]["request_cost"]["type"], "number");
-    let bare = defs["ScoreSpec"]["anyOf"][0]["enum"]
-        .as_array()
-        .expect("the bare names");
-    assert!(!bare.iter().any(|name| name == "least-cost"));
+    // Its parameters have no default: the stock scorers a document names
+    // bare, listed in the entry's description, leave it out.
+    let listed = defs["ScoreSpec"]["description"]
+        .as_str()
+        .expect("a description");
+    let (_, bare) = listed
+        .rsplit_once(" names bare: ")
+        .expect("the stock names");
+    assert!(!bare.contains("least-cost"), "{bare}");
+}
+
+/// A stage's name is open in both forms for a scorer and a picker, as for
+/// a filter: the schema cannot know a host's catalog, and the validator
+/// refuses an unknown name by its path. A map is a stock stage with its
+/// typed parameters, or one key that is no stock typed name's.
+#[test]
+fn the_committed_schema_admits_a_scorer_and_a_picker_by_any_name() {
+    let committed = fs::read_to_string(schema_path()).expect("the committed schema");
+    let schema: Value = serde_json::from_str(&committed).expect("a JSON schema");
+    let defs = &schema["$defs"];
+    let scorers: Vec<&str> = Catalog::builtin().scorers().collect();
+    assert_eq!(
+        defs["ScoreSpec"]["anyOf"],
+        serde_json::json!([
+            { "type": "string" },
+            { "$ref": "#/$defs/ScoreStage" },
+            {
+                "type": "object",
+                "minProperties": 1,
+                "maxProperties": 1,
+                "propertyNames": { "not": { "enum": scorers } },
+                "additionalProperties": { "type": "object" }
+            }
+        ])
+    );
+    assert_eq!(
+        defs["PickSpec"]["anyOf"],
+        serde_json::json!([
+            { "type": "string" },
+            { "$ref": "#/$defs/PickStage" },
+            {
+                "type": "object",
+                "minProperties": 1,
+                "maxProperties": 1,
+                "propertyNames": { "not": { "enum": ["best", "best-with-temperature"] } },
+                "additionalProperties": { "type": "object" }
+            }
+        ])
+    );
 }
 
 #[test]
@@ -216,14 +261,17 @@ fn the_schema_names_every_section_and_refuses_unknown_properties() {
         defs["SessionsSpec"]["properties"]["ttl_s"]["default"],
         14_400
     );
-    // The bare names are the catalog minus the stages whose parameters have
-    // no default, so a document written against the schema validates.
+    // The stock names a document writes bare stand in each entry's
+    // description: the catalog minus the stages whose parameters have no
+    // default.
     let bare = |def: &str| -> Vec<String> {
-        defs[def]["anyOf"][0]["enum"]
-            .as_array()
-            .expect("the bare names")
-            .iter()
-            .filter_map(Value::as_str)
+        let description = defs[def]["description"].as_str().expect("a description");
+        let (_, names) = description
+            .rsplit_once(" names bare: ")
+            .expect("the stock names");
+        names
+            .trim_end_matches('.')
+            .split(", ")
             .map(str::to_string)
             .collect()
     };
