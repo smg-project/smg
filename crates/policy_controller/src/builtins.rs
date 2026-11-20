@@ -1338,11 +1338,11 @@ impl LeastLoad {
     /// The mean rate of the kept rows that report one, which a report
     /// without a rate drains at: the default where none reports one.
     ///
-    /// A scan finds the first row that states a rate, and the sum starts
-    /// there: a fleet whose reports state none asks this at every
-    /// decision, and its walk keeps no sum. Out of line and not cold: the
-    /// pass that never asks it holds none of it, and the pass that asks
-    /// it at every decision gets it built for speed.
+    /// A scan first asks whether any row states a rate, and only then
+    /// does the sum run: a fleet whose reports state none asks this at
+    /// every decision, and its walk keeps no sum. Out of line and not
+    /// cold: the pass that never asks it holds none of it, and the pass
+    /// that asks it at every decision gets it built for speed.
     #[inline(never)]
     fn mean_rate(
         &self,
@@ -1351,10 +1351,10 @@ impl LeastLoad {
         load: impl Fn(&Candidate) -> Option<&LoadRow>,
     ) -> f32 {
         let rate_of = |i: u32| load(&candidates[i as usize]).map_or(0, |r| r.live_rate);
-        let Some(first) = kept.iter().position(|&i| rate_of(i) > 0) else {
+        if !kept.iter().any(|&i| rate_of(i) > 0) {
             return self.default_throughput;
-        };
-        let (sum, n) = kept[first..]
+        }
+        let (sum, n) = kept
             .iter()
             .map(|&i| rate_of(i))
             .filter(|&rate| rate > 0)
