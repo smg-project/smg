@@ -1198,6 +1198,19 @@ fn relaxed_pair(
 /// the least-loaded partner of the prefill its own policy picked. Only the
 /// placement by policy puts a pair on one known runtime before a pair with
 /// an unknown one: the default pairs by load over the index's lists, as before.
+///
+/// The placement is one pass, and one more when the pass found nobody open
+/// on a side while a worker of that side the request may use is available
+/// now. The pass and the default each read the vetoes on their own, so a
+/// veto that lifts between the two reads leaves the pass with nobody open
+/// and the default with a pool that is not all vetoed: a refusal on a pool
+/// that can take the request. A side with no admitted worker available keeps
+/// its miss. On decode, this check is coarser than the pass: it scans the
+/// admitted decode pool rather than only partners of eligible prefills, so an
+/// available non-partner can cause the one bounded extra pass. A miss of any
+/// other kind (a policy that declined, a prefill at its limit) is not asked
+/// again, and neither is an overload shed: building that verdict already
+/// counted the request in `smg_worker_overload_shed_total`.
 pub(crate) fn select_pair(
     registry: &WorkerRegistry,
     policies: &PolicyRegistry,
@@ -1207,6 +1220,71 @@ pub(crate) fn select_pair(
     prefill_capacity: Option<&PrefillSelectionContext<'_>>,
     inputs: PlacementInputs<'_>,
 ) -> Result<Pair, Box<PairFailure>> {
+    // At most two rounds. The pass has this one caller, so it compiles into
+    // the placement and a placement pays for no call between the two.
+    let mut asked_again = false;
+    loop {
+        let failure = match pair_pass(
+            registry,
+            policies,
+            model_id,
+            pairs,
+            wire,
+            prefill_capacity,
+            inputs,
+        ) {
+            Ok(pair) => return Ok(pair),
+            Err(PairMiss::NobodyOpen(failure))
+                if !asked_again
+                    && !matches!(&failure.verdict, PlacementFailure::AllOverloaded(_)) =>
+            {
+                failure
+            }
+            Err(PairMiss::NobodyOpen(failure) | PairMiss::Final(failure)) => return Err(failure),
+        };
+        let failed_pool: &[Arc<dyn Worker>] = if matches!(failure.role, WorkerRole::Prefill) {
+            &pairs.prefill
+        } else {
+            &pairs.decode_pool
+        };
+        let came_free = failed_pool.iter().any(|w| {
+            w.is_available()
+                && WireConstraint::admits(wire, w.as_ref())
+                && inputs
+                    .candidate_filter
+                    .is_none_or(|accepts| accepts(w.as_ref()))
+        });
+        if !came_free {
+            return Err(failure);
+        }
+        asked_again = true;
+    }
+}
+
+/// Why a pass of the pair placement placed no pair.
+#[derive(Debug)]
+enum PairMiss {
+    /// Nobody was open on the failure's side at the pass's read, and the
+    /// veto default did not take that side's pool: unless the verdict is an
+    /// overload shed, the placement may look once more when its retry check
+    /// sees a worker of the side available. Building an overload-shed verdict
+    /// already counted the request in `smg_worker_overload_shed_total`.
+    NobodyOpen(Box<PairFailure>),
+    /// Any other miss: the pass's answer stands.
+    Final(Box<PairFailure>),
+}
+
+/// One pass of the pair placement ([`select_pair`]). A miss says whether
+/// the pass found nobody open on a side ([`PairMiss`]).
+fn pair_pass(
+    registry: &WorkerRegistry,
+    policies: &PolicyRegistry,
+    model_id: &str,
+    pairs: &PdPairIndex,
+    wire: Option<WireConstraint>,
+    prefill_capacity: Option<&PrefillSelectionContext<'_>>,
+    inputs: PlacementInputs<'_>,
+) -> Result<Pair, PairMiss> {
     let admitted = |w: &Arc<dyn Worker>| {
         WireConstraint::admits(wire, w.as_ref())
             && inputs
@@ -1253,8 +1331,12 @@ pub(crate) fn select_pair(
             && (w.is_available() || (lift && overload::vetoed_by_overload_alone(w.as_ref())))
     };
     let prefill_eligible = |w: &Arc<dyn Worker>| eligible(w, lift_prefill);
-    let fail =
-        |role: WorkerRole, verdict: PlacementFailure| Box::new(PairFailure { role, verdict });
+    let fail = |role: WorkerRole, verdict: PlacementFailure| {
+        PairMiss::Final(Box::new(PairFailure { role, verdict }))
+    };
+    let nobody_open = |role: WorkerRole, verdict: PlacementFailure| {
+        PairMiss::NobodyOpen(Box::new(PairFailure { role, verdict }))
+    };
 
     // A role with no worker at all names itself before pairing is judged.
     if pairs.prefill_pool.is_empty() {
@@ -1308,10 +1390,10 @@ pub(crate) fn select_pair(
             &inputs,
             &admitted,
         ) {
-            return pair;
+            return pair.map_err(PairMiss::Final);
         }
         debug!(role = ?WorkerRole::Prefill, "No available PD pair");
-        return Err(fail(
+        return Err(nobody_open(
             WorkerRole::Prefill,
             failure_from(&admitted, model_id, registry.overload_shed_enabled()),
         ));
@@ -1360,10 +1442,10 @@ pub(crate) fn select_pair(
             &inputs,
             &admitted,
         ) {
-            return pair;
+            return pair.map_err(PairMiss::Final);
         }
         debug!(?role, "No available PD pair");
-        return Err(fail(
+        return Err(nobody_open(
             role,
             failure_from(&admitted, model_id, registry.overload_shed_enabled()),
         ));
@@ -1410,10 +1492,7 @@ pub(crate) fn select_pair(
     // veto cannot steer counting as available), so a miss here is the
     // policy's own decision.
     let declined = |role: WorkerRole, policy: &'static str| {
-        Box::new(PairFailure {
-            role,
-            verdict: PlacementFailure::PolicyDeclined(policy),
-        })
+        fail(role, PlacementFailure::PolicyDeclined(policy))
     };
     let Some(prefill_idx) =
         policies.select_worker_for_model(&prefill_policy, model_id, prefill.workers(), &info)
@@ -1431,7 +1510,7 @@ pub(crate) fn select_pair(
                 &inputs,
                 &admitted,
             ) {
-                return pair;
+                return pair.map_err(PairMiss::Final);
             }
         }
         return Err(declined(WorkerRole::Prefill, prefill_policy.name()));
@@ -1581,25 +1660,30 @@ mod tests {
 
     const MODEL: &str = "m";
 
-    /// A vLLM gRPC PD fleet whose workers carry the given KV connectors
+    /// A worker of a vLLM gRPC PD fleet, carrying the given KV connector
     /// (`None` leaves the transport unknown).
+    fn pd_worker(url: &str, worker_type: WorkerType, connector: Option<&str>) -> BasicWorker {
+        let mut builder = BasicWorkerBuilder::new(url)
+            .model(ModelCard::new(MODEL))
+            .worker_type(worker_type)
+            .connection_mode(ConnectionMode::Grpc)
+            .runtime_type(RuntimeType::Vllm)
+            .health_config(HealthCheckConfig {
+                disable_health_check: true,
+                ..Default::default()
+            });
+        if let Some(connector) = connector {
+            builder = builder.kv_connector(connector);
+        }
+        builder.build()
+    }
+
+    /// A vLLM gRPC PD fleet of such workers.
     fn pd_registry(workers: &[(&str, WorkerType, Option<&str>)]) -> WorkerRegistry {
         let registry = WorkerRegistry::new();
         for (url, worker_type, connector) in workers {
-            let mut builder = BasicWorkerBuilder::new(*url)
-                .model(ModelCard::new(MODEL))
-                .worker_type(*worker_type)
-                .connection_mode(ConnectionMode::Grpc)
-                .runtime_type(RuntimeType::Vllm)
-                .health_config(HealthCheckConfig {
-                    disable_health_check: true,
-                    ..Default::default()
-                });
-            if let Some(connector) = connector {
-                builder = builder.kv_connector(*connector);
-            }
             registry
-                .register(Arc::new(builder.build()))
+                .register(Arc::new(pd_worker(url, *worker_type, *connector)))
                 .expect("worker registers");
         }
         registry
@@ -3077,36 +3161,50 @@ mod tests {
     }
 
     /// A worker whose overload veto lifts right after selection has read its
-    /// routing state once, as a load record that lands between the pass's
-    /// read and the veto fallback's read does. Everything else is the real
-    /// worker's.
+    /// routing state a set number of times, as a load record that lands
+    /// between the pass's read and the veto fallback's read does. Everything
+    /// else is the real worker's.
     #[derive(Debug)]
     struct VetoLiftsAfterARead {
         worker: BasicWorker,
-        lifted: std::sync::OnceLock<()>,
+        /// The reads left before the veto lifts.
+        reads_left: Mutex<usize>,
     }
 
     impl VetoLiftsAfterARead {
-        /// A ready worker under the overload veto.
+        /// A ready worker under the overload veto, which lifts behind the
+        /// first read.
         fn vetoed(url: &str) -> Arc<dyn Worker> {
             let worker = BasicWorkerBuilder::new(url)
                 .model(ModelCard::new(MODEL))
                 .worker_type(WorkerType::Regular)
                 .build();
+            Self::under_veto(worker, 1)
+        }
+
+        /// `worker`, ready and under the overload veto, which lifts behind
+        /// its `reads`-th read.
+        fn under_veto(worker: BasicWorker, reads: usize) -> Arc<dyn Worker> {
             worker.set_status(WorkerStatus::Ready);
             worker.set_overloaded(true);
             Arc::new(Self {
                 worker,
-                lifted: std::sync::OnceLock::new(),
+                reads_left: Mutex::new(reads),
             })
         }
 
-        /// What `read` sees of the worker; the veto lifts behind the first read.
+        /// What `read` sees of the worker; the veto lifts behind the last
+        /// read it has left.
         fn read<T>(&self, read: impl FnOnce(&BasicWorker) -> T) -> T {
             let seen = read(&self.worker);
-            if self.lifted.set(()).is_ok() {
+            let mut left = self
+                .reads_left
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if *left == 1 {
                 self.worker.set_overloaded(false);
             }
+            *left = left.saturating_sub(1);
             seen
         }
     }
@@ -3195,7 +3293,7 @@ mod tests {
             self.read(|worker| worker.routing_state())
         }
         fn is_overloaded(&self) -> bool {
-            self.worker.is_overloaded()
+            self.read(|worker| worker.is_overloaded())
         }
         fn stall_reason(&self) -> Option<StallReason> {
             self.worker.stall_reason()
@@ -3247,6 +3345,147 @@ mod tests {
         assert!(
             refused.is_empty(),
             "refused while its only worker was available, under: {refused:?}"
+        );
+    }
+
+    /// The pair placement has the same two reads, the pass's and the veto
+    /// default's, and a veto that lifts between them is no refusal there
+    /// either. Two rows, the prefill side and the decode side: a pool of one
+    /// worker under the veto beside a free partner. The pairs are on the
+    /// HTTP wire, where the veto lifts behind the worker's third read: two
+    /// reads judge its pool's lift, the third is the pass's availability
+    /// read. The fourth sees the veto gone: the default's read of the pool
+    /// on the prefill side, the vetoed-alone read of the same eligibility
+    /// test on the decode side, whose pool the first two reads had lifted.
+    #[test]
+    fn a_pair_veto_that_lifts_between_the_two_reads_is_no_refusal() {
+        let registry = WorkerRegistry::new();
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let mut refused = Vec::new();
+        for vetoed in [WorkerType::Prefill, WorkerType::Decode] {
+            // A fresh pair for every selection: the veto lifts once.
+            let pair = || {
+                let side = |role: WorkerType, url: &str| -> Arc<[Arc<dyn Worker>]> {
+                    let worker = pd_worker(url, role, Some("NixlConnector"));
+                    if role == vetoed {
+                        Arc::from([VetoLiftsAfterARead::under_veto(worker, 3)])
+                    } else {
+                        worker.set_status(WorkerStatus::Ready);
+                        Arc::from([Arc::new(worker) as Arc<dyn Worker>])
+                    }
+                };
+                PdPairIndex::build(
+                    side(WorkerType::Prefill, "grpc://p:1"),
+                    side(WorkerType::Decode, "grpc://d:1"),
+                    PdWire::Http,
+                    policies.pd_pairing_mode(),
+                )
+            };
+            // One pass alone must find nobody open on that side: were the
+            // veto to lift before the pass's last read of the worker, the
+            // test would pass without the gap between that read and the
+            // default's.
+            assert!(
+                matches!(
+                    pair_pass(
+                        &registry,
+                        &policies,
+                        MODEL,
+                        &pair(),
+                        None,
+                        None,
+                        PlacementInputs::default(),
+                    ),
+                    Err(PairMiss::NobodyOpen(_))
+                ),
+                "one pass alone, the {vetoed:?} side"
+            );
+            let placed = select_pair(
+                &registry,
+                &policies,
+                MODEL,
+                &pair(),
+                None,
+                None,
+                PlacementInputs::default(),
+            );
+            if placed.is_err() {
+                refused.push(vetoed);
+            }
+        }
+        assert!(
+            refused.is_empty(),
+            "refused while the side's only worker was available: {refused:?}"
+        );
+    }
+
+    /// Building an overload-shed verdict records the shed, so that verdict
+    /// must stand even if the load flag clears immediately afterwards. Both
+    /// sides cover the gap between the verdict's read and the retry check.
+    #[test]
+    fn an_overload_shed_is_final_for_pair_placement() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let registry = WorkerRegistry::new();
+        registry.set_overload_shed(true);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let mut served = Vec::new();
+        metrics::with_local_recorder(&recorder, || {
+            for vetoed in [WorkerType::Prefill, WorkerType::Decode] {
+                let side = |role: WorkerType, url: &str| -> Arc<[Arc<dyn Worker>]> {
+                    let worker = pd_worker(url, role, Some("NixlConnector"));
+                    if role == vetoed {
+                        // The pass and fallback see the veto. It clears just
+                        // after failure classification records the shed.
+                        Arc::from([VetoLiftsAfterARead::under_veto(worker, 4)])
+                    } else {
+                        worker.set_status(WorkerStatus::Ready);
+                        Arc::from([Arc::new(worker) as Arc<dyn Worker>])
+                    }
+                };
+                let pairs = PdPairIndex::build(
+                    side(WorkerType::Prefill, "grpc://p:1"),
+                    side(WorkerType::Decode, "grpc://d:1"),
+                    PdWire::Http,
+                    policies.pd_pairing_mode(),
+                );
+                match select_pair(
+                    &registry,
+                    &policies,
+                    MODEL,
+                    &pairs,
+                    None,
+                    None,
+                    PlacementInputs::default(),
+                ) {
+                    Err(failure)
+                        if matches!(failure.verdict, PlacementFailure::AllOverloaded(_)) => {}
+                    Err(failure) => panic!("unexpected failure: {failure:?}"),
+                    Ok(_) => served.push(vetoed),
+                }
+                let vetoed_worker = if vetoed == WorkerType::Prefill {
+                    &pairs.prefill[0]
+                } else {
+                    &pairs.decode_pool[0]
+                };
+                assert!(
+                    !vetoed_worker.is_overloaded(),
+                    "the veto lifted inside the placement, the {vetoed:?} side"
+                );
+            }
+        });
+        assert!(
+            served.is_empty(),
+            "served after recording a shed: {served:?}"
+        );
+        assert!(
+            handle.render().lines().any(|line| {
+                line.starts_with("smg_worker_overload_shed_total{")
+                    && line.contains("stage=\"selection\"")
+                    && line.ends_with(" 2")
+            }),
+            "each refused request is counted once:\n{}",
+            handle.render()
         );
     }
 
