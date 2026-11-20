@@ -205,6 +205,13 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   content source renders as the document's text, as a text source does. Breaking:
   `DocumentSource::Content` holds the new `DocumentContent`, and `CreateMessageRequest.container`
   is the new `MessagesContainer`.
+- An Interactions input of steps reads its `user_input` and `model_output` steps, as the public API
+  takes them and as the SDK sends every content list it builds: each keeps its type and content
+  and is forwarded as written, its text is in the request's routing text and in the tenant's
+  reserve-time estimate, and a replayed conversation that also holds thought or tool steps
+  validates. A list with such a step read as role-less turns, which dropped each step's type, and
+  a replay was refused as having empty turns.
+  Breaking: `interactions::Content` gains `UserInput` and `ModelOutput`.
 - `PromptCacheRetention::InMemory` reads and writes `in_memory`, as the public API spells it
   (`PromptCacheRetentionEnum`), and still reads `in-memory`. The crate refused a Responses
   request carrying `in_memory` as an unknown variant, and wrote `in-memory`, which the public

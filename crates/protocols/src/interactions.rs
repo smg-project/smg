@@ -128,30 +128,56 @@ impl GenerationRequest for InteractionsRequest {
     }
 
     fn extract_text_for_routing(&self) -> String {
-        fn text_of(content: &Content) -> Option<&str> {
-            match content {
-                Content::Text { text, .. } => text.as_deref(),
-                _ => None,
-            }
-        }
-
-        /// `texts` into `buffer`, a space between each: the shape `join(" ")`
-        /// gives, empty pieces included.
-        fn push_joined<'a>(buffer: &mut String, texts: impl Iterator<Item = &'a str>) {
-            for (index, text) in texts.enumerate() {
-                if index > 0 {
+        /// `contents`' texts into `buffer`, a space between each: the shape
+        /// `join(" ")` gives, empty pieces included. A user-input or
+        /// model-output step is one piece, its own contents' texts joined
+        /// the same way where they land, and is left out when they join to
+        /// nothing. Each text is copied once.
+        fn push_texts(buffer: &mut String, contents: &[Content]) {
+            let mut first = true;
+            for content in contents {
+                let mark = buffer.len();
+                if !first {
                     buffer.push(' ');
                 }
-                buffer.push_str(text);
+                let is_piece = match content {
+                    Content::Text {
+                        text: Some(text), ..
+                    } => {
+                        buffer.push_str(text);
+                        true
+                    }
+                    Content::UserInput {
+                        content: Some(contents),
+                    }
+                    | Content::ModelOutput {
+                        content: Some(contents),
+                        ..
+                    } => {
+                        let start = buffer.len();
+                        push_texts(buffer, contents);
+                        buffer.len() > start
+                    }
+                    _ => false,
+                };
+                if is_piece {
+                    first = false;
+                } else {
+                    buffer.truncate(mark);
+                }
             }
         }
 
         match &self.input {
             InteractionsInput::Text(text) => text.clone(),
-            InteractionsInput::Content(content) => text_of(content).unwrap_or_default().to_owned(),
+            InteractionsInput::Content(content) => {
+                let mut buffer = String::new();
+                push_texts(&mut buffer, std::slice::from_ref(content));
+                buffer
+            }
             InteractionsInput::Contents(contents) => {
                 let mut buffer = String::new();
-                push_joined(&mut buffer, contents.iter().filter_map(text_of));
+                push_texts(&mut buffer, contents);
                 buffer
             }
             InteractionsInput::Turns(turns) => {
@@ -163,7 +189,7 @@ impl GenerationRequest for InteractionsRequest {
                     match &turn.content {
                         Some(TurnContent::Text(text)) => buffer.push_str(text),
                         Some(TurnContent::Contents(contents)) => {
-                            push_joined(&mut buffer, contents.iter().filter_map(text_of));
+                            push_texts(&mut buffer, contents);
                         }
                         None => {}
                     }
@@ -868,6 +894,17 @@ pub enum Content {
         result: Value,
         call_id: String,
     },
+
+    /// A user input step: the content the user gave for a turn. The SDK
+    /// sends every content list it builds as one.
+    UserInput { content: Option<Vec<Content>> },
+
+    /// A model output step of a replayed turn: the content the model gave,
+    /// or the error the turn ended with, kept as written.
+    ModelOutput {
+        content: Option<Vec<Content>>,
+        error: Option<Value>,
+    },
 }
 
 /// Content types allowed in thought summary (text or image only)
@@ -1238,10 +1275,17 @@ fn validate_input(input: &InteractionsInput) -> Result<(), ValidationError> {
 
     // Reject unsupported file search content
     fn has_file_search_content(content: &Content) -> bool {
-        matches!(
-            content,
-            Content::FileSearchCall { .. } | Content::FileSearchResult { .. }
-        )
+        match content {
+            Content::FileSearchCall { .. } | Content::FileSearchResult { .. } => true,
+            Content::UserInput {
+                content: Some(contents),
+            }
+            | Content::ModelOutput {
+                content: Some(contents),
+                ..
+            } => contents.iter().any(has_file_search_content),
+            _ => false,
+        }
     }
 
     fn check_turn(turn: &Turn) -> bool {
@@ -1283,6 +1327,17 @@ fn is_content_empty(content: &Content) -> bool {
         Content::CodeExecutionResult { call_id, .. }
         | Content::UrlContextResult { call_id, .. }
         | Content::GoogleSearchResult { call_id, .. } => is_option_blank(call_id.as_ref()),
+        // A user input step is empty as a turn is: without content, or with
+        // an empty item. A model output step is the model's own turn,
+        // replayed as written, so it is empty only with neither content nor
+        // an error: an empty item in it, which a model may well have written,
+        // is not refused.
+        Content::UserInput { content } => content
+            .as_ref()
+            .is_none_or(|contents| contents.is_empty() || contents.iter().any(is_content_empty)),
+        Content::ModelOutput { content, error } => {
+            error.is_none() && content.as_ref().is_none_or(Vec::is_empty)
+        }
         _ => false,
     }
 }
@@ -1316,6 +1371,99 @@ fn validate_stop_sequences(seqs: &[String]) -> Result<(), ValidationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An input of steps, as the SDK sends every content list it builds and
+    /// a replayed conversation: each step keeps its type and content and is
+    /// written back as sent, the routing text is the steps' text, and the
+    /// replay validates. A user input step without content is refused as
+    /// empty.
+    #[test]
+    fn an_input_of_user_input_and_model_output_steps_is_read_as_sent() {
+        let steps = serde_json::json!([
+            {"type": "user_input", "content": [{"type": "text", "text": "What is the weather in Paris?"}]},
+            {"type": "thought", "signature": "c2lnbmF0dXJl"},
+            {"type": "function_call", "id": "call_1", "name": "get_weather", "arguments": {"city": "Paris"}},
+            {"type": "function_result", "call_id": "call_1", "name": "get_weather", "result": {"temp": 18}},
+            {"type": "model_output", "content": [{"type": "text", "text": "It is 18 degrees."}]},
+            {"type": "model_output", "error": {"code": 8, "message": "Resource exhausted"}},
+            {"type": "user_input", "content": [{"type": "text", "text": "And tomorrow?"}]}
+        ]);
+        let request: InteractionsRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "input": steps, "store": false
+        }))
+        .unwrap();
+        assert!(matches!(request.input, InteractionsInput::Contents(_)));
+        assert!(request.validate().is_ok(), "{:?}", request.validate());
+        assert_eq!(
+            request.extract_text_for_routing(),
+            "What is the weather in Paris? It is 18 degrees. And tomorrow?"
+        );
+        let written = crate::common::to_value_exact(&request).unwrap();
+        assert_eq!(written["input"], steps);
+
+        let empty: InteractionsRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "input": [{"type": "user_input"}], "store": false
+        }))
+        .unwrap();
+        let errors = empty.validate().expect_err("an empty step").to_string();
+        assert!(
+            errors.contains("Input content array contains empty content items"),
+            "{errors}"
+        );
+
+        let bare: InteractionsRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "input": [{"type": "model_output"}], "store": false
+        }))
+        .unwrap();
+        let errors = bare
+            .validate()
+            .expect_err("a bare model output")
+            .to_string();
+        assert!(
+            errors.contains("Input content array contains empty content items"),
+            "{errors}"
+        );
+
+        // The same blank text item in both steps: it makes a user input
+        // step empty, and a model output step, the model's own, it does not.
+        let blank = serde_json::json!([{"type": "text", "text": ""}]);
+        let blank_user_input: InteractionsRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "input": [{"type": "user_input", "content": blank}], "store": false
+        }))
+        .unwrap();
+        let errors = blank_user_input
+            .validate()
+            .expect_err("a blank item in a user input step")
+            .to_string();
+        assert!(
+            errors.contains("Input content array contains empty content items"),
+            "{errors}"
+        );
+        let blank_model_output: InteractionsRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "input": [{"type": "model_output", "content": blank}], "store": false
+        }))
+        .unwrap();
+        assert!(
+            blank_model_output.validate().is_ok(),
+            "{:?}",
+            blank_model_output.validate()
+        );
+
+        let nested_file_search: InteractionsRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "input": [{"type": "user_input", "content": [{"type": "file_search_call", "id": "fs_1"}]}],
+            "store": false
+        }))
+        .unwrap();
+        let errors = nested_file_search
+            .validate()
+            .expect_err("a file search inside a step")
+            .to_string();
+        assert!(
+            errors.contains("file_search_content_not_supported"),
+            "{errors}"
+        );
+    }
 
     /// The tools the public API declares beside the ones the gateway knew
     /// read, validate and are written back as sent: computer use, Google
@@ -1652,6 +1800,37 @@ mod tests {
                     {"role": "user", "content": [{"type": "text", "text": "x"}, {"type": "text", "text": "y"}]}
                 ]),
                 "first   x y",
+            ),
+            (
+                serde_json::json!({"type": "user_input", "content": [
+                    {"type": "text", "text": "one"},
+                    {"type": "text", "text": "two"}
+                ]}),
+                "one two",
+            ),
+            (
+                serde_json::json!([
+                    {"type": "user_input", "content": [{"type": "text", "text": "a"}]},
+                    {"type": "model_output"},
+                    {"type": "user_input", "content": [{"type": "image", "uri": "u"}]},
+                    {"type": "model_output", "content": [{"type": "text", "text": ""}]},
+                    {"type": "text", "text": ""},
+                    {"type": "model_output", "content": [
+                        {"type": "text", "text": "b"},
+                        {"type": "text", "text": ""}
+                    ]}
+                ]),
+                "a  b ",
+            ),
+            (
+                serde_json::json!([
+                    {"role": "user", "content": "first"},
+                    {"role": "user", "content": [
+                        {"type": "user_input", "content": [{"type": "image", "uri": "u"}]},
+                        {"type": "user_input", "content": [{"type": "text", "text": "x"}]}
+                    ]}
+                ]),
+                "first x",
             ),
         ];
         for (input, expected) in cases {
