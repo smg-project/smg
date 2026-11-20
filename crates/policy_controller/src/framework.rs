@@ -2611,13 +2611,15 @@ pub(crate) enum ShadowRows {
     /// Less the rows named for the live profile: the shadow profile reads
     /// no column, and would be named none.
     Unnamed,
-    /// By rows the host names again for it, under this cap: the shadow
-    /// profile names by another cap than the live one, or the live one
-    /// is named no row. A pool keeps one ruling of its warming rows and
-    /// one record of sent prefixes, and both are the shadow profile's
-    /// own there ([`Engine::pool_rule_for`],
-    /// [`Engine::pool_record_for`]).
-    Own(u32),
+    /// By rows the host names again for it, under the shadow profile's
+    /// own cap ([`Engine::shadow_cap_at`]): that profile names by
+    /// another cap than the live one, or the live one is named no row.
+    /// A pool keeps one ruling of its warming rows and one record of
+    /// sent prefixes, and both are the shadow profile's own there
+    /// ([`Engine::pool_rule_for`], [`Engine::pool_record_for`]). The
+    /// word carries no cap: every decision of a shadowed generation
+    /// reads the word, and only one that names such rows reads the cap.
+    Own,
     /// Not at all: the shadow profile would be named rows of another
     /// warm-up ruling or another record than the pool keeps, or handed a
     /// column the live decision was not.
@@ -2652,12 +2654,12 @@ impl ShadowRows {
             // row reads no record, so the record is left to the shadow
             // there, and the ruling too where that profile rules by
             // none.
-            (live_cap, cap) => {
+            (live_cap, _) => {
                 let left = live_cap == 0;
                 let ruled = live.rule == by.rule || (left && live.rule.is_none());
                 let recorded = left || (live.sent, live.sent_alone) == (by.sent, by.sent_alone);
                 if ruled && recorded {
-                    Self::Own(cap)
+                    Self::Own
                 } else {
                     Self::Apart
                 }
@@ -4201,6 +4203,19 @@ impl Engine {
             .is_some_and(|needs| needs.affinity)
     }
 
+    /// The cap of each list of rows a host names again for the shadow of
+    /// the binding at `at` ([`ShadowRows::Own`]): the shadow profile's
+    /// own, as [`Self::named_for`] says a live profile's. `0` where the
+    /// binding names no shadow. A host asks it where it names such rows,
+    /// and for no other decision.
+    pub(crate) fn shadow_cap_at(&self, at: u32) -> u32 {
+        self.bindings
+            .get(at as usize)
+            .and_then(|entry| entry.binding.shadow)
+            .and_then(|shadow| self.named_by.get(usize::from(shadow)))
+            .map_or(0, |by| by.cap)
+    }
+
     /// The binding a request of `phase` for `model` resolves to, where
     /// its shadow is asked ([`Self::shadow`]): its position in this
     /// generation, and how that shadow reads the rows a host handed the
@@ -4248,9 +4263,9 @@ impl Engine {
     pub fn pool_rule_for(&self, model: &str, phase: Phase) -> Option<WarmRule> {
         self.warm_rule_for(model, phase).or_else(|| {
             let (at, rows) = self.shadow_for(model, phase)?;
-            let ShadowRows::Own(_) = rows else {
+            if rows != ShadowRows::Own {
                 return None;
-            };
+            }
             let shadow = self.bindings.get(at as usize)?.binding.shadow?;
             self.named_by.get(usize::from(shadow))?.rule
         })
@@ -4300,9 +4315,9 @@ impl Engine {
         // live profile's only where that profile is named no row
         // ([`ShadowRows::of`]).
         let (at, rows) = self.shadow_for(model, phase)?;
-        let ShadowRows::Own(_) = rows else {
+        if rows != ShadowRows::Own {
             return None;
-        };
+        }
         let shadow = self.bindings.get(at as usize)?.binding.shadow?;
         let by = self.named_by.get(usize::from(shadow))?;
         by.sent.then_some(by.sent_alone)
@@ -7663,7 +7678,8 @@ mod tests {
             document.profiles.insert("second".into(), profile);
             document.bindings[0].shadow = Some(crate::spec::ShadowSpec::Profile("second".into()));
             let engine = document.validate().expect("a binding with a shadow");
-            engine.shadow_for("m", Phase::Single).map(|(_, rows)| rows)
+            let due = engine.shadow_for("m", Phase::Single);
+            due.map(|(at, rows)| (rows, engine.shadow_cap_at(at)))
         };
         let as_it_is = |_: &mut ProfileSpec| {};
         let sample = |profile: &mut ProfileSpec| {
@@ -7695,22 +7711,24 @@ mod tests {
             };
             profile.score[1] = ScoreStage::PrefixAffinity(prefix).into();
         };
-        let cases: [(&str, &str, Turn<'_>, ShadowRows); 10] = [
-            ("cache_aware", "cache_aware", &as_it_is, ShadowRows::Same),
-            ("cache_aware", "cache_aware", &record, ShadowRows::Apart),
-            ("cache_aware", "cache_aware", &index, ShadowRows::Apart),
-            ("least_load", "random", &as_it_is, ShadowRows::Same),
-            ("cache_aware", "cache_aware", &sample, ShadowRows::Own(8)),
-            ("cache_aware", "cache_aware", &ruling, ShadowRows::Apart),
-            ("least_load", "cache_aware", &as_it_is, ShadowRows::Own(16)),
-            ("least_load", "cache_aware", &ruling, ShadowRows::Own(16)),
-            ("least_load", "cache_aware", &record, ShadowRows::Own(16)),
-            ("cache_aware", "least_load", &as_it_is, ShadowRows::Unnamed),
+        // Each pairing's word, and the shadow profile's own cap beside it.
+        let (aware, least) = ("cache_aware", "least_load");
+        let cases: [(&str, &str, Turn<'_>, ShadowRows, u32); 10] = [
+            (aware, aware, &as_it_is, ShadowRows::Same, 16),
+            (aware, aware, &record, ShadowRows::Apart, 16),
+            (aware, aware, &index, ShadowRows::Apart, 16),
+            (least, "random", &as_it_is, ShadowRows::Same, 0),
+            (aware, aware, &sample, ShadowRows::Own, 8),
+            (aware, aware, &ruling, ShadowRows::Apart, 16),
+            (least, aware, &as_it_is, ShadowRows::Own, 16),
+            (least, aware, &ruling, ShadowRows::Own, 16),
+            (least, aware, &record, ShadowRows::Own, 16),
+            (aware, least, &as_it_is, ShadowRows::Unnamed, 0),
         ];
-        for (live, shadow, turn, wanted) in cases {
+        for (live, shadow, turn, wanted, cap) in cases {
             assert_eq!(
                 rows(live, shadow, turn),
-                Some(wanted),
+                Some((wanted, cap)),
                 "{shadow} behind {live}"
             );
         }

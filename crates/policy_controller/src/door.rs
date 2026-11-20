@@ -641,6 +641,10 @@ trait ShadowAsk {
     fn reads_column(&self) -> bool;
 
     /// The shadow's decision over the live decision's view, by `rows`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the engine's shadow entry and its inputs, beside the rows' word"
+    )]
     fn shadow(
         self,
         engine: &Engine,
@@ -707,6 +711,9 @@ struct OwnRows<'a> {
     /// Whether the live profile reads the affinity column by its own
     /// stages: no column is filled for such a shadow's sake.
     column: bool,
+    /// The binding's position: its shadow's rows are named under that
+    /// shadow profile's own cap ([`Engine::shadow_cap_at`]).
+    binding: u32,
 }
 
 impl ShadowAsk for OwnRows<'_> {
@@ -726,11 +733,12 @@ impl ShadowAsk for OwnRows<'_> {
     ) -> Option<Decision> {
         // A shadow that is skipped is asked nothing: its decider stops
         // ahead of the asking.
-        let ShadowRows::Own(cap) = rows else {
+        if rows != ShadowRows::Own {
             return None;
-        };
+        }
         // A profile that is named rows of its own reads them in the
         // column's place, as it does live.
+        let cap = engine.shadow_cap_at(self.binding);
         let named = self.name(cap, facts, candidates);
         let own = RequestFacts {
             named: Some(named.affinity()),
@@ -910,6 +918,7 @@ pub(crate) fn decide_own_in<A: Asked>(
         cut: !taken.request.demands().is_none(),
         named: &mut named,
         column: engine.live_column_at(due.0, taken.request.phase()),
+        binding: due.0,
     };
     let decided = shadowed_by(world, taken, buffers, own, due, left, ask);
     buffers.shadow_named = named;
@@ -3402,7 +3411,7 @@ impl Door {
         buffers: &mut Buffers<()>,
         due: &mut Due,
     ) -> Result<Decided, Refused> {
-        if matches!(due.rows, ShadowRows::Own(_) | ShadowRows::Apart) {
+        if matches!(due.rows, ShadowRows::Own | ShadowRows::Apart) {
             return self.order_own(world, at, term, taken, buffers, due);
         }
         self.shadowed_order::<SHADOWED>(world, at, term, taken, buffers, due)
