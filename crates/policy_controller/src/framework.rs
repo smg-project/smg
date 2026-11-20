@@ -3139,10 +3139,13 @@ impl<'a> PairTable<'a> {
 
     /// The decode classes prefill class `class` pairs with, ascending: its
     /// list under a table, its own number under none. Every read of a pair
-    /// decision asks here. Class 0 pairs with nothing, as does a class the
-    /// table holds no list for, and a list is read up to the count of the
-    /// lists' entries: a number above it is no class of the table. The
-    /// class is lent, so that under no table the list is the number itself.
+    /// decision asks here, but for the width's walk: it reads each list's
+    /// last entry by the same cut ([`Self::cut`]), and asks here list by
+    /// list once a last entry stands above the count. Class 0 pairs with
+    /// nothing, as does a class the table holds no list for, and a list is
+    /// read up to the count of the lists' entries: a number above it is no
+    /// class of the table. The class is lent, so that under no table the
+    /// list is the number itself.
     pub(crate) fn of<'c>(&self, class: &'c u32) -> &'c [u32]
     where
         'a: 'c,
@@ -3169,9 +3172,15 @@ impl<'a> PairTable<'a> {
             return &[];
         };
         let start = at.checked_sub(1).map_or(0, |before| self.ends[before]);
-        self.classes
-            .get(start as usize..end as usize)
-            .unwrap_or(&[])
+        self.cut(start as usize, end as usize)
+    }
+
+    /// The entries from `start` up to `end`: the one cut of a list out of
+    /// the lists' entries, empty where the two ends do not hold.
+    /// [`Self::list`] cuts by a class's own two ends, and the width's walk
+    /// by the end it passed last.
+    fn cut(&self, start: usize, end: usize) -> &'a [u32] {
+        self.classes.get(start..end).unwrap_or(&[])
     }
 
     /// The table's prefill classes.
@@ -3185,7 +3194,36 @@ impl<'a> PairTable<'a> {
     /// of its own size, whatever numbers it names. Lists ascend, so a
     /// list's last entry is its largest; the width is capped at the count
     /// all the same, so the bound stands for a list out of order too.
+    ///
+    /// One walk of the lists' ends reads each list's last entry by the cut
+    /// a list's own read makes ([`Self::cut`]). The walk stays out of line
+    /// and calls nothing on its way, so the routine that asks is compiled
+    /// as it was without a table's walk in it. The first last entry above
+    /// the count ends the walk: [`Self::width_by_lists`] answers.
+    #[inline(never)]
     fn width(&self) -> usize {
+        let count = self.classes.len();
+        let (mut largest, mut start) = (0u32, 0usize);
+        for &end in self.ends {
+            let end = end as usize;
+            if let Some(&last) = self.cut(start, end).last() {
+                if last as usize > count {
+                    return self.width_by_lists();
+                }
+                largest = largest.max(last);
+            }
+            start = end;
+        }
+        Self::capped(largest, count)
+    }
+
+    /// The width of a table with a list's last entry above the count of
+    /// the entries: each list's own read says where it ends
+    /// ([`PairTable::of`]), list by list. Cold and out of line: a table a
+    /// host numbers from one up never comes here.
+    #[cold]
+    #[inline(never)]
+    fn width_by_lists(&self) -> usize {
         let largest = self
             .prefill_classes()
             .filter_map(|class| self.of(&class).last().copied())
@@ -10479,6 +10517,49 @@ mod tests {
         let backwards = PairTable::new(&[2, 1], &[1, 2, 3]);
         assert_eq!(backwards.of(&1), [1, 2]);
         assert!(backwards.of(&2).is_empty());
+    }
+
+    /// The width's walk reads each list's last entry, whichever list holds
+    /// the largest, and the first last entry above the count hands the
+    /// table to the list by list read. Both name one width: one past the
+    /// largest class a list's own read holds.
+    #[test]
+    fn a_tables_width_is_one_past_the_largest_class_its_lists_hold() {
+        let agree = |table: &PairTable<'_>, width: usize, what: &str| {
+            assert_eq!(table.width(), width, "{what}");
+            assert_eq!(table.width_by_lists(), width, "{what}, list by list");
+        };
+        let tables: [(&[&[u32]], usize); 10] = [
+            // The largest class in the first list, a middle one, the last.
+            (&[&[1, 4], &[], &[2, 3]], 5),
+            (&[&[1], &[2, 4], &[3]], 5),
+            (&[&[1, 2], &[3, 4]], 5),
+            // In a list of one entry behind an empty list.
+            (&[&[1], &[], &[2]], 3),
+            // An empty list names no class: two entries, the width of one.
+            (&[&[1], &[1], &[]], 2),
+            // A last entry above the count, in the first list and in the
+            // last: its list ends at the classes it holds.
+            (&[&[1, 9], &[2, 3]], 4),
+            (&[&[2, 3], &[1, 9]], 4),
+            // One above the count is above it.
+            (&[&[1, 3]], 2),
+            // No list holds a class, and no list holds an entry.
+            (&[&[8], &[9]], 1),
+            (&[&[], &[]], 1),
+        ];
+        for (lists, width) in tables {
+            let (ends, classes) = table_of(lists);
+            agree(
+                &PairTable::new(&ends, &classes),
+                width,
+                &format!("{lists:?}"),
+            );
+        }
+        // Ends the entries do not hold: an end past them costs its list,
+        // and each list is cut by its own two ends, whatever the last did.
+        agree(&PairTable::new(&[3], &[1, 2]), 1, "an end past the entries");
+        agree(&PairTable::new(&[3, 0, 1], &[2, 1]), 3, "ends out of order");
     }
 
     /// The question a host asks once where it builds a table: each clause
