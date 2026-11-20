@@ -250,7 +250,8 @@ struct Lane {
     /// A batch ran through the cursor since the lane was made or its worker
     /// was reported gone. The index keeps a bit beside it
     /// ([`Index::hear`]), set at the first such batch that carries an event
-    /// and cleared with this word, where a decision reads it with no lock.
+    /// and is applied, and cleared with this word, where a decision reads
+    /// it with no lock.
     heard: bool,
     /// `None` once the row left: a batch that found the lane before the
     /// removal writes nothing.
@@ -1427,10 +1428,12 @@ struct Index {
     took: [AtomicU64; INDEX_WORKERS],
     /// How many times a row took an id ([`Self::take`]).
     taken: AtomicU64,
-    /// A bit an index id: a batch that carried an event ran through the
-    /// lane of the row that holds the id ([`Lane::heard`]). A batch with no
-    /// event sets nothing: the index holds nothing of the row yet, so the
-    /// record keeps its cover. The lane writes its own bit under its lock,
+    /// A bit an index id: a batch that carried an event was applied
+    /// through the lane of the row that holds the id. A batch with no
+    /// event sets nothing, and neither does one the lane's cursor refuses:
+    /// the index holds nothing of the row yet, so the record keeps its
+    /// cover. The lane's own word says less, that any batch ran through it
+    /// ([`Lane::heard`]). The lane writes its own bit under its lock,
     /// and a decision reads it with no lock: until the bit is set the
     /// record of sent prefixes speaks for the row. A naming reads the
     /// pool's bits once for its whole run ([`Tables::unheard`]), and a
@@ -1454,7 +1457,7 @@ impl Index {
     }
 
     /// The lane that holds `id` says whether a batch that carried an event
-    /// ran through it.
+    /// was applied through it.
     fn hear(&self, id: u32, heard: bool) {
         let Some(word) = self.heard.get((id / 64) as usize) else {
             return;
@@ -1467,8 +1470,8 @@ impl Index {
         }
     }
 
-    /// Whether a batch that carried an event ran through the lane that
-    /// holds `id`.
+    /// Whether a batch that carried an event was applied through the lane
+    /// that holds `id`.
     fn heard(&self, id: u32) -> bool {
         let word = self.heard.get((id / 64) as usize);
         word.is_some_and(|word| word.load(Ordering::Relaxed) & (1 << (id % 64)) != 0)
@@ -1952,10 +1955,14 @@ impl KvTables {
             return BatchOutcome::Skipped;
         };
         *heard = true;
-        if !events.is_empty() && !held.index.heard(held.worker) {
+        let (outcome, emptied) = admit(cursor, held, facts, events, counts);
+        // The index speaks for the row from the first batch that carried
+        // an event and was applied. A batch the cursor refuses writes no
+        // block, and the record keeps its cover until one is applied.
+        let applied = outcome == BatchOutcome::Applied && !events.is_empty();
+        if applied && !held.index.heard(held.worker) {
             held.index.hear(held.worker, true);
         }
-        let (outcome, emptied) = admit(cursor, held, facts, events, counts);
         if let Some(reason) = emptied {
             self.note(reason);
         }

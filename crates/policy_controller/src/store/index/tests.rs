@@ -346,6 +346,40 @@ mod sent_prefixes {
         Ok(())
     }
 
+    /// A batch the lane's cursor refuses as a gap writes no block: the
+    /// record keeps the row until a batch with an event is applied.
+    #[test]
+    fn a_batch_refused_as_a_gap_leaves_the_record_its_row() -> Case {
+        let store = MemoryStore::new();
+        let event = admitted(&store, "event");
+        admitted(&store, "other-event");
+        store.apply(applied(&merged(1)?)?)?;
+        predicted(&store, event).ok_or("a record with a placement")?;
+        // An empty batch takes the cursor to its sequence. Events two
+        // past it are a gap, and nothing of them is applied.
+        assert_eq!(store.admit(event, 0, batch(1), &[]), BatchOutcome::Applied);
+        let refused = store.admit(event, 0, batch(3), &stored(None, &chain(&HASHES)));
+        assert!(
+            matches!(refused, BatchOutcome::Gap { .. }),
+            "a gap: {refused:?}"
+        );
+        let (kept, rows) = named(&store, None, 16, 7);
+        assert_eq!(kept.holders.len(), 1);
+        let holder = kept.holders[0];
+        assert_eq!(rows[holder.row as usize], event);
+        assert_eq!((holder.overlap_blocks, holder.predicted_blocks), (0, 4));
+        // The batch that fills the gap is applied: the index speaks.
+        assert_eq!(store.admit(event, 0, batch(2), &[]), BatchOutcome::Applied);
+        let filled = store.admit(event, 0, batch(3), &stored(None, &chain(&HASHES)));
+        assert_eq!(filled, BatchOutcome::Applied);
+        let (heard, rows) = named(&store, None, 16, 7);
+        assert_eq!(heard.holders.len(), 1);
+        let holder = heard.holders[0];
+        assert_eq!(rows[holder.row as usize], event);
+        assert_eq!((holder.overlap_blocks, holder.predicted_blocks), (4, 0));
+        Ok(())
+    }
+
     #[test]
     fn a_row_that_takes_a_heard_rows_id_is_not_heard() -> Case {
         let store = MemoryStore::new();
