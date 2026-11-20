@@ -170,13 +170,17 @@ pub trait Membership: Send + Sync + 'static {
     ///
     /// A registration is held whole: each row to the rule of
     /// [`found`](Self::found), the rows together to the engine's full
-    /// width, and the engine's rows it does not state leave with it. Every
-    /// check holds before the first write, so a refusal of a row or of the
-    /// group writes nothing. At a door whose lead can move, a lead lost
-    /// between two rows refuses at that row ([`Refused::NotLeading`]), and
-    /// the rows written before it stand. A guarded write ([`Expect::Seen`])
-    /// states the one row its asker saw and changes it where it stands, by
-    /// that row's own rule.
+    /// width, and the engine's rows it does not state leave with it. The
+    /// rows are one a rank, each under its rank's URL, or one row under the
+    /// engine's own URL that states no rank. That one row is the engine
+    /// whole at any width it states: a worker that serves several engines
+    /// over one connection states their count. Every check holds before
+    /// the first write, so a refusal of a row or of the group writes
+    /// nothing. At a door whose lead can move, the term is asked ahead of
+    /// each row's write and each removal: a lead lost between two of them
+    /// refuses there ([`Refused::NotLeading`]), and what was written before
+    /// it stands. A guarded write ([`Expect::Seen`]) states the one row its
+    /// asker saw and changes it where it stands, by that row's own rule.
     ///
     /// Each door says what it does with the objects. A door whose host
     /// keeps built objects hands them to the holder for the write's turn
@@ -253,7 +257,8 @@ pub trait Membership: Send + Sync + 'static {
 pub(crate) trait Turn {
     fn store(&self) -> &MemoryStore;
 
-    /// Check the term before the registration starts writing.
+    /// Check the term ahead of a write. A registration asks before each
+    /// row it writes and each row it removes.
     fn check_term(&self) -> Result<(), Refused> {
         Ok(())
     }
@@ -315,6 +320,15 @@ pub(crate) fn stating<T>(
 /// What a stated row leaves to write: its facts, and what laying them makes
 /// of the row that stands under its URL.
 type Ready = (WorkerFacts, Option<(WorkerId, Laid)>);
+
+/// Whether a registration states its engine as one row: the row stands
+/// under the engine's own URL and states no rank. Such a row is the engine
+/// whole at any width it states: a worker that serves several engines over
+/// one connection states their count and no rank. Every other registration
+/// states one row a rank, of an engine two or more wide.
+fn states_the_engine_whole(ready: &[Ready]) -> bool {
+    matches!(ready, [(only, _)] if only.key == only.engine && only.dp_rank == 0)
+}
 
 /// Check one stated row by its own rule, over what its write expects to
 /// stand under its URL. Nothing is written. The row's event signal is
@@ -414,28 +428,24 @@ pub(crate) fn lay(
     // The engine is the one the first row states. The others are held to
     // it below, and the store is asked by it.
     let engine = ready[0].0.engine.as_str();
-    let width = usize::from(ready[0].0.dp_size);
-    if width != rows.len() {
-        return Err(RANKS);
-    }
-    let ranked = width > 1;
-    let mut seen = vec![false; width];
-    for (facts, _) in &ready {
-        let rank = usize::from(facts.dp_rank);
-        let Some(seen) = seen.get_mut(rank) else {
+    if !states_the_engine_whole(&ready) {
+        let width = usize::from(ready[0].0.dp_size);
+        if width < 2 || width != ready.len() {
             return Err(RANKS);
-        };
-        let right_key = if ranked {
-            facts.key == rank_url(engine, rank)
-        } else {
-            facts.key == engine
-        };
-        if facts.engine != engine
-            || usize::from(facts.dp_size) != width
-            || !right_key
-            || mem::replace(seen, true)
-        {
-            return Err(RANKS);
+        }
+        let mut seen = vec![false; width];
+        for (facts, _) in &ready {
+            let rank = usize::from(facts.dp_rank);
+            let Some(seen) = seen.get_mut(rank) else {
+                return Err(RANKS);
+            };
+            if facts.engine != engine
+                || usize::from(facts.dp_size) != width
+                || facts.key != rank_url(engine, rank)
+                || mem::replace(seen, true)
+            {
+                return Err(RANKS);
+            }
         }
     }
 
@@ -458,12 +468,16 @@ pub(crate) fn lay(
         made_by(row, maker)?;
     }
 
-    turn.check_term()?;
-    let mut answer = Vec::with_capacity(width + left.len());
+    // The term is asked ahead of each row's write and of each removal,
+    // whatever the write makes of its row: a lead lost between two of them
+    // refuses at the next.
+    let mut answer = Vec::with_capacity(ready.len() + left.len());
     for (facts, laid) in ready {
+        turn.check_term()?;
         answer.push(write_row(turn, maker, facts, laid)?);
     }
     for row in left {
+        turn.check_term()?;
         let wrote = changed(store.remove(row.id, row.revision), Wrote::Removed)?;
         turn.told(wrote);
         answer.push(wrote);
@@ -607,6 +621,8 @@ pub(crate) fn refresh(
     stated.labels = labels;
     stated.bounded(&row.maker).map_err(Refused::Past)?;
     turn.room(&stated, &row.maker)?;
+    // The patch is a write of the turn: the term is asked ahead of it.
+    turn.check_term()?;
     let patch = WorkerPatch {
         labels: Some(stated.labels),
         ..WorkerPatch::default()
@@ -750,8 +766,8 @@ pub(super) mod tests {
     };
 
     use super::{
-        changed, lay, Expect, Membership, Refused, Remover, Standing, Stated, StoreDoor, Turn,
-        Wrote,
+        changed, lay, lay_one, Expect, Membership, Refused, Remover, Standing, Stated, StoreDoor,
+        Turn, Wrote,
     };
     use crate::{
         demands::{DemandFacts, Demands},
@@ -1087,6 +1103,49 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn one_row_under_the_engines_own_url_is_the_engine_at_any_width() {
+        check_whole_row(local_door).expect("the engine stands as one row");
+    }
+
+    /// A worker that serves several engines over one connection states
+    /// their count and no rank: one row under the engine's own URL, which
+    /// is no rank of that width.
+    fn check_whole_row(open: Open) -> Result<(), &'static str> {
+        let (store, door) = open();
+        let maker = Maker::Control;
+        let whole = WorkerFacts {
+            dp_size: 4,
+            ..stated()
+        };
+        let answer =
+            find_rows(&*door, &maker, std::slice::from_ref(&whole)).map_err(|_| "registered")?;
+        let row = store.by_key(URL).ok_or("the engine's one row")?;
+        assert_eq!(answer, [Wrote::Registered(row.id)]);
+        assert_eq!((row.facts.dp_rank, row.facts.dp_size), (0, 4));
+        // The same facts again write nothing, and another width is laid in
+        // place.
+        assert_eq!(
+            find_rows(&*door, &maker, std::slice::from_ref(&whole)),
+            Ok(vec![Wrote::Unmoved(row.id)])
+        );
+        let wider = WorkerFacts {
+            dp_size: 8,
+            ..whole
+        };
+        assert_eq!(
+            find_rows(&*door, &maker, &[wider]),
+            Ok(vec![Wrote::InPlace(row.id)])
+        );
+        assert_eq!(store.by_key(URL).map(|row| row.facts.dp_size), Some(8));
+        // Four ranks retire it, as they retire a row of one.
+        let answer = find_rows(&*door, &maker, &ranked(4)).map_err(|_| "four ranks")?;
+        assert_eq!(answer.len(), 5);
+        assert_eq!(answer[4], Wrote::Removed(row.id));
+        assert_eq!(store.by_key(URL), None);
+        Ok(())
+    }
+
+    #[test]
     fn another_makers_row_of_the_engine_refuses_the_registration_whole() {
         check_other_maker(local_door).expect("the control row stands alone");
     }
@@ -1269,6 +1328,7 @@ pub(super) mod tests {
         check_narrower(open)?;
         check_partial_removal(open)?;
         check_ranked_then_plain(open)?;
+        check_whole_row(open)?;
         check_other_maker(open)?;
         check_invalid_ranks(open);
         let (store, door) = open();
@@ -1958,6 +2018,92 @@ pub(super) mod tests {
         );
         assert!(store.by_key(&two[0].key).is_some());
         assert!(store.by_key(&two[1].key).is_none());
+    }
+
+    /// A turn whose term holds for a number of checks and is lost then.
+    struct TermFor<'a>(&'a MemoryStore, std::cell::Cell<usize>);
+
+    impl Turn for TermFor<'_> {
+        fn store(&self) -> &MemoryStore {
+            self.0
+        }
+
+        fn check_term(&self) -> Result<(), Refused> {
+            let Some(left) = self.1.get().checked_sub(1) else {
+                return Err(Refused::NotLeading("the term moved".to_owned()));
+            };
+            self.1.set(left);
+            Ok(())
+        }
+
+        fn life(&self) -> Result<u64, Refused> {
+            Ok(7)
+        }
+
+        fn room(&self, _: &WorkerFacts, _: &Maker) -> Result<(), Refused> {
+            Ok(())
+        }
+    }
+
+    fn lay_under(turn: &TermFor<'_>, facts: &[WorkerFacts]) -> Result<Vec<Wrote>, Refused> {
+        let states: Vec<_> = facts
+            .iter()
+            .map(|facts| move |_: Option<&WorkerFacts>| facts.clone())
+            .collect();
+        let rows: Vec<_> = facts
+            .iter()
+            .zip(&states)
+            .map(|(facts, state)| Stated {
+                url: &facts.key,
+                state,
+            })
+            .collect();
+        lay(turn, &Maker::Control, Expect::Anything, &rows)
+    }
+
+    /// The term is asked ahead of every write, whatever the write makes of
+    /// its row. A label laid in place and a rank that leaves are refused
+    /// behind a lost lead, and what was written before it stands.
+    #[test]
+    fn a_term_lost_between_two_rows_stops_a_write_in_place_and_a_removal() {
+        let (store, door) = door();
+        let three = ranked(3);
+        find_rows(&door, &Maker::Control, &three).expect("three ranks registered");
+        let lost = Err(Refused::NotLeading("the term moved".to_owned()));
+        let term = |checks| TermFor(&store, std::cell::Cell::new(checks));
+
+        // Every rank's label changes. The term holds for the first row.
+        let mut labelled = three.clone();
+        for facts in &mut labelled {
+            facts.labels.insert("tier".to_owned(), "gold".to_owned());
+        }
+        assert_eq!(lay_under(&term(1), &labelled), lost);
+        let labels: Vec<_> = three
+            .iter()
+            .map(|facts| store.by_key(&facts.key).map(|row| row.facts.labels.len()))
+            .collect();
+        assert_eq!(labels, [Some(1), Some(0), Some(0)]);
+
+        // The worker comes back two wide. The term holds for the two rows
+        // that stay and is lost ahead of the third rank's removal.
+        assert_eq!(lay_under(&term(2), &ranked(2)), lost);
+        let widths: Vec<_> = three
+            .iter()
+            .map(|facts| store.by_key(&facts.key).map(|row| row.facts.dp_size))
+            .collect();
+        assert_eq!(widths, [Some(2), Some(2), Some(3)]);
+    }
+
+    /// A row laid alone asks the term ahead of its write.
+    #[test]
+    fn a_row_laid_alone_under_a_lost_term_writes_nothing() {
+        let (store, _) = door();
+        let turn = TermFor(&store, std::cell::Cell::new(0));
+        assert_eq!(
+            lay_one(&turn, &Maker::Control, Expect::Anything, URL, &|_| stated()),
+            Err(Refused::NotLeading("the term moved".to_owned()))
+        );
+        assert_eq!(store.snapshot(), (0, Vec::new()));
     }
 
     #[test]

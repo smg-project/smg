@@ -1040,6 +1040,33 @@ mod tests {
         }
     }
 
+    /// A worker that serves several engines over one connection states
+    /// their count and no rank. It registers as one row under its own
+    /// address, and the object that stands for it holds no rank.
+    #[tokio::test]
+    async fn a_worker_that_states_a_width_and_no_rank_stands_as_one_row() {
+        let f = Fixture::new();
+        let spec = WorkerSpec {
+            models: vec![ModelCard::new("model")].into(),
+            dp_size: Some(4),
+            ..WorkerSpec::new(URL.to_owned())
+        };
+        let built: Arc<dyn Worker> = Arc::new(<BasicWorkerBuilder>::from_spec(spec).build());
+        assert_eq!((built.dp_rank(), built.dp_size()), (None, Some(4)));
+        let mut cx = f.registration(WorkerJobAsker::Discovery, vec![built]);
+        f.write().execute(&mut cx).await.expect("written");
+        let row = f.store.by_key(URL).expect("the worker's one row");
+        assert_eq!((row.facts.dp_rank, row.facts.dp_size), (0, 4));
+        assert_eq!(f.store.snapshot().1.len(), 1);
+        f.objects.follow(&*f.store);
+        let held = f
+            .host
+            .registry
+            .get_by_url(URL)
+            .expect("the worker's object");
+        assert_eq!((held.dp_rank(), held.dp_size()), (None, Some(4)));
+    }
+
     /// A join base drops an HTTP address's trailing slash and a row's facts
     /// keep the address as written. The door reads the engine from the
     /// facts, for a plain worker and for a ranked one.

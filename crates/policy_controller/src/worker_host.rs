@@ -25,7 +25,7 @@
 //! | `wire_modes` | `connection_mode`: gRPC where the set holds it, else HTTP, else the host-local wire; an empty set is HTTP |
 //! | `engine_kind` | `runtime_type`, as the worker crate parses the name; unspecified where it knows none |
 //! | `models` | `models`, one card an id; no id is the wildcard |
-//! | `dp_rank`, `dp_size` | `dp_rank`, `dp_size`, where the width is above one; else neither |
+//! | `dp_rank`, `dp_size` | `dp_size` where the width is above one, and `dp_rank` with it unless the row is the engine whole: under its engine's own address at rank 0; else neither |
 //! | `labels` | `labels` |
 //! | `kv_block_size` | `kv_block_size` |
 //! | `bootstrap_port` | `bootstrap_port` |

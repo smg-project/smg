@@ -646,6 +646,32 @@ fn a_width_that_shrinks_ends_the_object_of_the_rank_that_left() {
     assert_eq!(feed.objects.unhanded(), 0);
 }
 
+/// A worker that serves several engines over one connection states their
+/// count and no rank. It is one row under its own URL, and the object its
+/// registration built stands for it.
+#[test]
+fn a_worker_that_states_a_width_and_no_rank_is_one_row_with_its_object() {
+    let store = Arc::new(MemoryStore::default());
+    let (registry, feed) = bed(&store);
+    let built: Vec<Arc<dyn Worker>> = vec![Arc::new(
+        BasicWorkerBuilder::new(URL)
+            .model(ModelCard::new(MODEL))
+            .zmq_engine_group(4)
+            .build(),
+    )];
+    assert_eq!((built[0].dp_rank(), built[0].dp_size()), (None, Some(4)));
+    let wrote = feed
+        .door
+        .found_rows(&Maker::Control, Expect::Nothing, &built, None);
+    assert!(
+        matches!(wrote.as_deref(), Ok([Wrote::Registered(_)])),
+        "{wrote:?}"
+    );
+    assert_eq!(stand(&registry, &built), [true]);
+    assert_eq!(store.snapshot().1.len(), 1);
+    assert_eq!(feed.objects.unhanded(), 0);
+}
+
 #[tokio::test]
 async fn a_drained_row_takes_no_decision_and_a_gone_row_leaves_the_registry() {
     let store = start_store().expect("the store starts");
