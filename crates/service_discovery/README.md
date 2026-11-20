@@ -40,8 +40,9 @@ A host names the providers it runs as features, and implements
 for the given worker roles before it resolves runtime inputs such as the
 Consul environment. A host can call `DiscoveryConfig::validate` to check the
 supplied settings on their own. It does not read the Kubernetes model id
-source. The runtime conversion parses that source: it keeps a valid one and
-refuses a malformed one as `discovery.model_id_source`.
+source. The runtime conversion parses that source. It keeps `namespace`,
+`label:<key>` and `annotation:<key>`, and refuses any other form as
+`discovery.model_id_source`. It does not check a key's own syntax.
 
 The host hands the runtime settings and itself to
 `start_service_discovery`, which starts the selected provider's task. The
