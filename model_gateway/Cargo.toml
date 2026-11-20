@@ -109,9 +109,10 @@ smg-wasm = { workspace = true, features = ["storage-hooks"] }
 smg-mesh.workspace = true
 smg-rl.workspace = true
 # The policy document, its presets, and the controller's store, door and
-# handle in this process: every target builds them, with none of the crate's
-# features. The crate's client is two targets': see the end of this file.
-smg-policy-controller.workspace = true
+# handle in this process: every target builds them. The worker-host feature
+# supplies the membership door and the holder of worker objects. The crate's
+# client is two targets': see the end of this file.
+smg-policy-controller = { workspace = true, features = ["worker-host"] }
 smg-grpc-client.workspace = true
 engine-zmq-client.workspace = true
 engine-zmq-adapter.workspace = true

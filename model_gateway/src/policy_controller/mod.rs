@@ -7,12 +7,14 @@
 //! default.
 //!
 //! The setting starts the store with the policy document for the routing
-//! configuration. The context holds a host over that store. A regular HTTP
-//! router with that host asks it to place typed requests for a named model.
-//! Without a controller's address nothing feeds the store yet. The server
-//! answers with a refusing router in the gateway object's place
-//! ([`router`]), so its requests never reach the host. With the setting off,
-//! the context holds neither the store nor its host.
+//! configuration. The context holds the membership feed over that store and
+//! a host over the feed's holder. A regular HTTP router with that host asks
+//! it to place typed requests for a named model. The gateway's workflows
+//! leave the feed's door unused, so without a controller's address nothing
+//! feeds the store yet. The server answers with a refusing router in the
+//! gateway object's place ([`router`]), so its requests never reach the
+//! host. With the setting off, the context holds neither the store, its
+//! feed nor its host.
 //!
 //! One site reads the setting, [`start_with`]. Every other site asks what
 //! the start left in the context.
@@ -44,6 +46,11 @@ pub(crate) mod follower;
 #[path = "follower_absent.rs"]
 pub(crate) mod follower;
 
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the gateway holds the feed for membership writes")
+)]
+pub(crate) mod feed;
 #[cfg_attr(
     not(test),
     expect(

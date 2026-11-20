@@ -47,7 +47,7 @@ fn stage_with_workers(
             .build();
         assert!(registry.register(Arc::new(worker)).is_some());
     }
-    let host = Host::new(Arc::clone(&store), Arc::clone(&registry));
+    let host = Host::at_keys(Arc::clone(&store), Arc::clone(&registry));
     (
         regular_stage(registry).with_host(Some(Arc::new(host))),
         store,
