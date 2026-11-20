@@ -1724,3 +1724,30 @@ async fn a_failed_http_health_check_is_logged_without_the_clients_url() {
         refused.http_url()
     )));
 }
+
+#[test]
+fn a_worker_and_its_metadata_print_no_api_key() {
+    let marker = "marble";
+    let url = "http://worker:8000";
+    let debug = |worker: &BasicWorker| {
+        let metadata = worker.metadata();
+        [
+            format!("{metadata:?}"),
+            format!("{metadata:#?}"),
+            format!("{worker:?}"),
+            format!("{worker:#?}"),
+        ]
+    };
+
+    let worker = BasicWorkerBuilder::new(url).api_key(marker).build();
+    for text in debug(&worker) {
+        assert!(!text.contains(marker));
+        assert!(text.contains("api_key: Some("));
+        assert!(text.contains(r#""<redacted>""#));
+    }
+
+    let worker = BasicWorkerBuilder::new(url).build();
+    for text in debug(&worker) {
+        assert!(text.contains("api_key: None"));
+    }
+}
