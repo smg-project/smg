@@ -625,24 +625,41 @@ async fn an_attempt_the_controller_does_not_place_reads_the_hosts_answer() -> Ca
 /// Under the host a request that names its worker is refused by name where
 /// the model's classic policy holds it to that worker, on the typed line
 /// and on the transcription line, and no worker is asked. Under a policy
-/// that reads no target the header changes nothing.
+/// that reads no target the header changes nothing. An unnamed request
+/// reads the no-model id's policy, as the classic's selection does: the
+/// main one where no model-less worker's label set its own.
 #[tokio::test]
 async fn a_request_that_names_its_worker_is_refused_by_name_under_the_host() -> Case {
     let meta = TenantRequestMeta::new(TenantKey::from("test-tenant"));
     let mut headers = HeaderMap::new();
     headers.insert("x-smg-target-worker", HeaderValue::from_static("0"));
-    for (policy, refused) in [
-        (PolicyConfig::ConsistentHashing, true),
-        (PolicyConfig::RoundRobin, false),
+    // The main policy, the model's own by its workers' label, the typed
+    // request's model id, and whether each line is refused.
+    for (main, label, generate_as, refused) in [
+        (PolicyConfig::ConsistentHashing, None, MODEL, [true; 2]),
+        (PolicyConfig::RoundRobin, None, MODEL, [false; 2]),
+        (
+            PolicyConfig::RoundRobin,
+            Some("consistent_hashing"),
+            UNKNOWN_MODEL_ID,
+            [false, true],
+        ),
+        (
+            PolicyConfig::ConsistentHashing,
+            Some("round_robin"),
+            UNKNOWN_MODEL_ID,
+            [true, false],
+        ),
     ] {
         let (url, hits) = fixed_status_upstream(&[GENERATE, TRANSCRIBE], StatusCode::OK).await;
         let registry = Arc::new(WorkerRegistry::new());
         let (host, ..) = bed_over(Arc::clone(&registry), &[&url]);
         let mut router = router(registry, Some(host));
-        router.policy_registry = Arc::new(PolicyRegistry::new(policy));
+        router.policy_registry = Arc::new(PolicyRegistry::new(main));
+        router.policy_registry.on_worker_added(MODEL, label);
         let request = serde_json::from_value(json!({"text": "hi"}))?;
         let generated = router
-            .route_generate(Some(&headers), &meta, request, MODEL)
+            .route_generate(Some(&headers), &meta, request, generate_as)
             .await;
         let request = TranscriptionRequest {
             model: MODEL.into(),
@@ -656,7 +673,7 @@ async fn a_request_that_names_its_worker_is_refused_by_name_under_the_host() -> 
         let transcribed = router
             .route_audio_transcriptions(Some(&headers), &meta, &request, audio, MODEL)
             .await;
-        for response in [generated, transcribed] {
+        for (response, refused) in [generated, transcribed].into_iter().zip(refused) {
             if refused {
                 assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
                 assert_eq!(
@@ -667,7 +684,8 @@ async fn a_request_that_names_its_worker_is_refused_by_name_under_the_host() -> 
                 assert_eq!(response.status(), StatusCode::OK);
             }
         }
-        assert_eq!(hits.load(Ordering::SeqCst), if refused { 0 } else { 2 });
+        let served = refused.iter().filter(|refused| !**refused).count();
+        assert_eq!(hits.load(Ordering::SeqCst), served);
     }
     Ok(())
 }

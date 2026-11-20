@@ -865,7 +865,10 @@ impl Router {
                 error::model_not_found(&model),
             ));
         }
-        if let Some(refusal) = self.explicit_target_refusal(&model, attempt.headers) {
+        // The classic selects by the request's own model id, so an unnamed
+        // request reads the no-model id's policy: the main one unless a
+        // model-less worker's `policy` label set its own.
+        if let Some(refusal) = self.explicit_target_refusal(attempt.model_id, attempt.headers) {
             return Err(refusal);
         }
         let id = host::mark();
