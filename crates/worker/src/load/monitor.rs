@@ -89,7 +89,7 @@ use crate::{
     },
     metrics::{
         intern_model_label,
-        writers::{LoadTest, Metrics},
+        writers::{registered_engine_role, LoadTest, Metrics},
     },
     registry::{event::WorkerEvent, worker_model_ids, Generation, WorkerRegistry},
     worker::{
@@ -380,7 +380,12 @@ impl PushedFile {
     /// pusher's series is made under that lock, where the sentinel is
     /// written too ([`WorkerMonitor::clear_series`]).
     fn write_rank_series(&self, at: usize, url: &str, model_id: &str) {
-        Metrics::record_engine_rank_load(url, model_id, &self.report.loads[at]);
+        Metrics::record_engine_rank_load(
+            url,
+            model_id,
+            registered_engine_role(*self.pusher.worker_type()),
+            &self.report.loads[at],
+        );
     }
 }
 
@@ -429,8 +434,10 @@ fn write_sentinel(
     // A worker can serve multiple models (one load group per model),
     // so sentinel every model's series — not just the primary.
     let models = worker_model_ids(worker);
+    // The worker's load series carry the role it is registered in.
+    let role = registered_engine_role(*worker.worker_type());
     for rank in ranks {
-        Metrics::remove_engine_rank_metrics(url, &models, rank, |label, test| {
+        Metrics::remove_engine_rank_metrics(url, &models, rank, role, |label, test| {
             live(label, rank, test)
         });
     }
@@ -967,7 +974,12 @@ impl<G: Generation> WorkerMonitor<G> {
         // pushed record feeds the same gauges from `apply_pushed_load`.)
         for (worker, load, _) in &group_loads {
             if self.load_state.is_current_incarnation(worker) {
-                Metrics::record_engine_load(worker.url(), model_id, load);
+                Metrics::record_engine_load(
+                    worker.url(),
+                    model_id,
+                    registered_engine_role(*worker.worker_type()),
+                    load,
+                );
             }
         }
         // Merge into the shared snapshot in one rebuild: clear stale entries
@@ -1580,7 +1592,13 @@ impl<G: Generation> WorkerMonitor<G> {
         let row = self
             .load_state
             .another_live_workers_row(worker)
-            .map(|(source, load)| (worker_model_ids(&source), load));
+            .map(|(source, load)| {
+                (
+                    worker_model_ids(&source),
+                    registered_engine_role(*source.worker_type()),
+                    load,
+                )
+            });
         // Each live writer's labels are read once, and the guard compares
         // texts alone. The read is the intern the writers use, so it gives
         // the label a writer's series carry, and it admits at most the
@@ -1588,28 +1606,36 @@ impl<G: Generation> WorkerMonitor<G> {
         // read of the label map would stop the compiler inlining the
         // map's lookup into the intern, a cost to every record that
         // builds its own keys.
-        let row = row.as_ref().map(|(models, load)| {
+        let row = row.as_ref().map(|(models, registered, load)| {
             let labels: Vec<Arc<str>> = models
                 .iter()
                 .map(|model| intern_model_label(model))
                 .collect();
-            (labels, load)
+            (labels, *registered, load)
         });
         let other = reports
             .get(worker.url())
             .filter(|other| !Arc::ptr_eq(&other.pusher, worker) && !other.series_held)
-            .map(|other| (intern_model_label(other.pusher.model_id()), other));
+            .map(|other| {
+                (
+                    intern_model_label(other.pusher.model_id()),
+                    registered_engine_role(*other.pusher.worker_type()),
+                    other,
+                )
+            });
         write_sentinel(worker, ended, |label, rank, carries| {
-            let holds = |loads: &[SchedulerLoadSnapshot]| {
+            // An entry is tested with its own writer's registered role,
+            // the one that writer's load series carry.
+            let holds = |loads: &[SchedulerLoadSnapshot], registered: &'static str| {
                 loads
                     .iter()
-                    .any(|load| load.dp_rank == rank && carries(load))
+                    .any(|load| load.dp_rank == rank && carries(load, registered))
             };
-            row.as_ref().is_some_and(|(labels, load)| {
+            row.as_ref().is_some_and(|(labels, registered, load)| {
                 label.is_none_or(|label| labels.iter().any(|own| **own == *label))
-                    && holds(&load.loads)
-            }) || other.as_ref().is_some_and(|(own, other)| {
-                label.is_none_or(|label| **own == *label) && holds(&other.report.loads)
+                    && holds(&load.loads, registered)
+            }) || other.as_ref().is_some_and(|(own, registered, other)| {
+                label.is_none_or(|label| **own == *label) && holds(&other.report.loads, registered)
             })
         });
     }
