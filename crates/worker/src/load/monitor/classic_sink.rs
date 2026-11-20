@@ -12,10 +12,11 @@ use std::{
 
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
-use tracing::{info, warn};
+use tracing::warn;
 
 use super::{dp_rank_token_loads, LoadConsumer, WorkerLoadManager};
 use crate::{
+    health::overload::{log_overload_edge, OverloadReading},
     identity::basic::Worker,
     load::port::{GroupTick, LoadSink, PollMode, PolledMember, PolledRanks},
     registry::{Generation, WorkerRegistry},
@@ -71,22 +72,12 @@ impl<G: Generation> ClassicLoadSink<G> {
         if !self.worker_registry.set_worker_overloaded(worker, verdict) {
             return;
         }
-        let waiting = load.map_or(0, WorkerLoadResponse::total_waiting_reqs);
-        let kv_pressure = load.map_or(0.0, WorkerLoadResponse::effective_kv_pressure);
-        // The line keeps the monitor's log target: it was written there
-        // before the port.
-        info!(
-            target: "smg_worker::load::monitor",
-            worker_url = %worker.redacted_url(),
-            overloaded = verdict,
-            waiting_requests = waiting,
-            kv_pressure,
-            waiting_threshold = ?overload.waiting_requests,
-            kv_pressure_threshold = ?overload.token_usage,
-            source,
-            "Worker overload veto {}",
-            if verdict { "set" } else { "cleared" }
-        );
+        let reading = OverloadReading {
+            waiting_requests: load.map_or(0, WorkerLoadResponse::total_waiting_reqs),
+            kv_pressure: load.map_or(0.0, WorkerLoadResponse::effective_kv_pressure),
+            thresholds: overload,
+        };
+        log_overload_edge(worker.as_ref(), verdict, &reading, source);
     }
 
     /// The poll decision for `url` at `now` from the receipt times of its
