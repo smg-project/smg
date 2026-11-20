@@ -5276,7 +5276,8 @@ impl Engine {
     /// runs its decode profile over that prefill's partners in `pools`.
     /// Each picked target names the held prefill and one of those decodes.
     /// A missing prefill is shed under `prefill-gone`. A shed made once the
-    /// decode profile resolves names that profile.
+    /// decode profile resolves names that profile. `pool` holds the facts
+    /// of the decode pool, where the profile places.
     pub fn decide_decode(
         &self,
         facts: &RequestFacts<'_>,

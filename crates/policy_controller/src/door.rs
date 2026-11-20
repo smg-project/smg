@@ -535,7 +535,7 @@ pub(crate) fn pair_in<A: Asked>(
         ..
     } = buffers;
     let later = taken.request.decode_later();
-    pair_with(
+    pair_with::<false, _, _, _>(
         world,
         taken,
         own,
@@ -574,7 +574,7 @@ pub(crate) fn encode_pair_in<A: Asked>(
     } = buffers;
     let rows: &mut EncodePairBuffers = encode.get_or_insert_with(Box::default);
     let later = taken.request.decode_later();
-    let answer = pair_with(
+    let answer = pair_with::<false, _, _, _>(
         world,
         taken,
         own,
@@ -618,8 +618,10 @@ pub(crate) fn encode_pair_in<A: Asked>(
 }
 
 /// Reads a built pair, decides over it, and takes what `book` files of the
-/// decision.
-fn pair_with<A: Asked, R, B>(
+/// decision. The decision is shown the facts of the pool it places in
+/// first: the prefills', or under `DECODE` the decodes', where a decode
+/// call places in that pool alone.
+fn pair_with<const DECODE: bool, A: Asked, R, B>(
     world: &World,
     taken: &Taken<'_, A>,
     own: &Part,
@@ -693,7 +695,8 @@ fn pair_with<A: Asked, R, B>(
     let demanded = !request.demands().is_none();
     let mut emptied = false;
     let built = build(rows, engine, model, ask, wires, subset).map(|(built, (took, none))| {
-        pool = built.0.pool_facts();
+        let shown = if DECODE { built.1 } else { built.0 };
+        pool = shown.pool_facts();
         emptied = none || demanded;
         if took > 0 {
             own.undialed.fetch_add(took, Ordering::Relaxed);
@@ -2759,6 +2762,8 @@ impl Door {
     /// first, so a call it refuses runs no stage. Then the pair's rows of
     /// this instant, the engine's decode entry over the held prefill's
     /// partners and, for a pick, the side's issue under the lease's id.
+    /// The decode profile is shown the decode pool's facts: its size, its
+    /// list and whether every row of it holds a report.
     #[inline(never)]
     fn decode(
         &self,
@@ -2778,7 +2783,7 @@ impl Door {
             lists,
             ..
         } = buffers;
-        let (decision, side) = pair_with(
+        let (decision, side) = pair_with::<true, _, _, _>(
             world,
             taken,
             &self.parts[at],
@@ -2883,7 +2888,7 @@ pub(crate) mod tests {
         decider::Decider,
         decision::{Decision, ShedReason, Target, Targets},
         demands::{DemandFacts, Demands},
-        framework::{DecisionScope, EncodeItems, EncodePlaced, Picker, TieBand},
+        framework::{DecisionScope, EncodeItems, EncodePlaced, Filter, Picker, TieBand},
         lease::{Lease, LeaseId, Lifecycle, Outcome, ReleaseReason, Side, TransportClass},
         sessions::SessionVerdict,
         spec::{AppliedSpec, Needs, PolicySpec},
@@ -3910,6 +3915,70 @@ pub(crate) mod tests {
             },
             at,
         )
+    }
+
+    /// One prefill and two decodes. A decode call shows its profile the
+    /// decode pool's facts beside the decode rows: the pool the profile
+    /// places in, and never the prefills'.
+    #[test]
+    fn a_decode_call_shows_its_profile_the_decode_pools_facts() {
+        #[derive(Debug)]
+        struct Shown(Arc<Mutex<Vec<(u32, usize)>>>);
+
+        impl Lifecycle for Shown {}
+
+        impl Filter for Shown {
+            fn name(&self) -> &'static str {
+                "shown-pool"
+            }
+
+            fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+                true
+            }
+
+            fn scope(&self) -> Option<&dyn DecisionScope> {
+                Some(self)
+            }
+        }
+
+        impl DecisionScope for Shown {
+            fn open(&self, _: &RequestFacts<'_>, rows: &[Candidate], pool: &PoolFacts<'_>) {
+                self.0.lock().push((pool.pool_size, rows.len()));
+            }
+
+            fn close(&self) {}
+        }
+
+        let store = pair_fleet(1, 2).expect("one prefill and two decodes");
+        let shown = Arc::new(Mutex::new(Vec::new()));
+        let kept = Arc::clone(&shown);
+        let mut catalog = Catalog::builtin();
+        catalog
+            .filter("shown-pool", move || Box::new(Shown(Arc::clone(&kept))))
+            .expect("a free filter name");
+        let mut document = PolicySpec::pair_presets("least_load", "least_load").expect("a spec");
+        document.generation = 2;
+        for profile in document.profiles.values_mut() {
+            profile.filter.clear();
+        }
+        let decode = document.profiles.get_mut("decode");
+        let filters = &mut decode.expect("the decode profile").filter;
+        filters.push("shown-pool".into());
+        let digest = document.digest().expect("a digest");
+        let spec = AppliedSpec::validate_digested(&document, digest, &catalog, &[]);
+        let applied = store.apply(spec.expect("a valid spec"));
+        applied.expect("a later generation");
+        let door = Door::new(store);
+        let now = Instant::now();
+        let asked = later_request(b"pool");
+        let first = door.decide(GATEWAY, &asked, now).expect("a pair");
+        let lease = first.lease.expect("a lease").lease.id;
+        door.report(GATEWAY, lease, pair_dispatch(Side::Prefill, now));
+        shown.lock().clear();
+        let called = door.decide_decode(GATEWAY, &asked, lease, now);
+        assert!(called.expect("a decode").decision.pick().is_some());
+        // The pool's size as its facts say it, and the rows read.
+        assert_eq!(shown.lock().as_slice(), [(2, 2)]);
     }
 
     #[test]
