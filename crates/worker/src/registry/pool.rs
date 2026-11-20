@@ -6,6 +6,10 @@
 //! of the groups it touches and writes their gauge. So the gauge reads the
 //! same for a worker a workflow registered, for one a membership store's
 //! row laid and for one a mesh peer published.
+//!
+//! A worker counts once, in the group of its primary model, so the groups
+//! add up to the registry's workers. The model index lists a worker under
+//! every model it serves, and this count does not.
 
 use std::collections::HashMap;
 
@@ -18,7 +22,9 @@ use crate::{
 /// and primary model id.
 type PoolGroup = (WorkerType, ConnectionMode, String);
 
-/// The gauge's key for one worker.
+/// The gauge's key for one worker. It reads the worker's spec, which stands
+/// for the handle's life: a refresh of the worker's model cards moves no
+/// group, so a worker leaves the group it entered.
 fn pool_group(worker: &dyn Worker) -> PoolGroup {
     let meta = worker.metadata();
     (
@@ -64,9 +70,15 @@ impl PoolSizes {
         }
         let mut sizes = self.sizes.lock();
         if let Some(group) = left {
-            // Saturating: a count never wraps below zero. A group that
-            // empties leaves the map, and its gauge keeps a zero sample.
-            let size = sizes.get(&group).map_or(0, |size| size.saturating_sub(1));
+            // A group that empties leaves the map, and its gauge keeps a
+            // zero sample.
+            let size = match sizes.get(&group) {
+                Some(size) => size.saturating_sub(1),
+                None => {
+                    uncounted(&group);
+                    0
+                }
+            };
             write_gauge(&group, size);
             if size == 0 {
                 sizes.remove(&group);
@@ -80,6 +92,21 @@ impl PoolSizes {
             sizes.insert(group, size);
         }
     }
+}
+
+/// A worker left `group` and the group holds no count, so a write of the
+/// registry missed its call. Nothing counts a group again, and its gauge
+/// would read wrong until a restart: a release build says so in a log line
+/// and a debug build stops here, where the registry's cases catch it.
+fn uncounted(group: &PoolGroup) {
+    let (worker_type, connection_mode, model_id) = group;
+    tracing::warn!(
+        worker_type = worker_type.as_metric_label(),
+        connection_mode = connection_mode.as_metric_label(),
+        model = %model_id,
+        "a worker left a pool group that holds no count"
+    );
+    debug_assert!(false, "pool group {group:?} left with no count");
 }
 
 /// Write `size` to the pool-size gauge of `group`.
@@ -116,7 +143,7 @@ mod tests {
         )
     }
 
-    /// The gauge's sample for the group whose labels `scrape` names, or
+    /// The gauge's sample for the group whose labels `labels` names, or
     /// none where the group never had a worker.
     fn size(handle: &PrometheusHandle, labels: &[&str]) -> Option<String> {
         handle
@@ -204,5 +231,48 @@ mod tests {
             assert_eq!(of("connection_mode=\"http\"").as_deref(), Some("1"));
             assert_eq!(of("connection_mode=\"grpc\"").as_deref(), Some("1"));
         });
+    }
+
+    /// A worker counts once, under its primary model: its first card. The
+    /// model index lists it under its second card too, and that group's
+    /// gauge does not count it. A refresh of its cards moves no group, so
+    /// it leaves the group it entered.
+    #[test]
+    fn a_worker_of_two_cards_counts_once_under_its_primary_model() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let of = |model: &str| size(&handle, &[&format!("model=\"{model}\"")]);
+        metrics::with_local_recorder(&recorder, || {
+            let registry = WorkerRegistry::new();
+            let both: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new(A)
+                    .models(vec![ModelCard::new("m"), ModelCard::new("n")])
+                    .build(),
+            );
+            let id = registry.register(Arc::clone(&both)).expect("a registers");
+            registry.register(worker(B, "n")).expect("b registers");
+            assert_eq!(registry.get_by_model("n").len(), 2);
+            assert_eq!(of("m").as_deref(), Some("1"));
+            assert_eq!(of("n").as_deref(), Some("1"));
+
+            let turned = vec![ModelCard::new("n"), ModelCard::new("m")];
+            assert!(registry.refresh_models(&both, turned));
+            assert_eq!(of("m").as_deref(), Some("1"));
+            assert_eq!(of("n").as_deref(), Some("1"));
+
+            assert!(registry.remove(&id).is_some());
+            assert_eq!(of("m").as_deref(), Some("0"));
+            assert_eq!(of("n").as_deref(), Some("1"));
+        });
+    }
+
+    /// A leaving that finds no count is a write of the registry that missed
+    /// its call. Nothing counts a group again, so a debug build stops there
+    /// and the registry's cases catch it.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "left with no count")]
+    fn a_leaving_that_finds_no_count_stops_a_debug_build() {
+        super::PoolSizes::default().left(worker(A, "m").as_ref());
     }
 }
