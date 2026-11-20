@@ -166,7 +166,7 @@ pub trait Membership: Send + Sync + 'static {
     /// Lays the rows one registration states of one engine, each with the
     /// worker its registration built, over what it expects to stand. A
     /// row's URL is its worker's, and its facts are the ones the worker
-    /// states over the standing row ([`facts`](super::facts)), by the
+    /// states over the standing row ([`facts`]), by the
     /// write's verb. The engine is the one the rows' own facts state, so no
     /// caller names it another way.
     ///
