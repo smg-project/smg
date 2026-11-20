@@ -56,7 +56,7 @@ impl Hashes {
     /// Prompt tokens are hashed by the model's block size
     /// ([`block_size_of`]), so a model whose workers publish no cache
     /// events is hashed too. The generation bounds the number of full
-    /// blocks hashed.
+    /// blocks hashed. A prompt that holds no whole block is one block.
     pub(crate) fn of(store: &MemoryStore, model: &str, prompt: &Prompt<'_>) -> Self {
         let Some(tokens) = prompt.tokens else {
             // No engine hashes text: its seed is the whole partition's.
@@ -85,7 +85,9 @@ impl Hashes {
         });
         let size = block_size as usize;
         let end = tokens.len().min(depth.saturating_mul(size));
-        let blocks = request_content_hashes_with_seed(&tokens[..end], size, event_seed)
+        // A prompt under one block is one block of what it has: the
+        // classic's prefix policy keys a short prompt too.
+        let blocks = request_content_hashes_with_seed(&tokens[..end], size.min(end), event_seed)
             .into_iter()
             .map(|hash| hash.0)
             .collect();
@@ -119,7 +121,7 @@ impl Hashes {
         });
         let size = window as usize;
         let end = bytes.len().min(depth.saturating_mul(size));
-        let blocks = request_text_hashes_with_seed(&bytes[..end], size, namespace_seed)
+        let blocks = request_text_hashes_with_seed(&bytes[..end], size.min(end), namespace_seed)
             .into_iter()
             .map(|hash| hash.0)
             .collect();
@@ -452,6 +454,47 @@ mod tests {
         let hashes = Hashes::of(&store, MODEL, &plain_prompt(&tokens));
         assert_eq!(hashes.blocks.len(), 1);
         assert_eq!(hashes.prompt_tokens, BLOCK_SIZE + 1);
+    }
+
+    /// A prompt that holds no whole block states one block, the hash of
+    /// what it has, as the classic's prefix policy keys a short prompt. Two
+    /// short prompts are two blocks, and an empty prompt states none.
+    #[test]
+    fn a_prompt_under_one_block_states_one_block_of_what_it_has() {
+        let (_, store) = record_bed();
+        store.set_block_size(MODEL, BLOCK_SIZE);
+        let text = |text| Prompt {
+            text: Some(text),
+            ..Prompt::default()
+        };
+        let (sevens, eights) = ([7; BLOCK_SIZE as usize - 1], [8; 3]);
+        let of = |prompt: &Prompt<'_>| Hashes::of(&store, MODEL, prompt);
+        for (short, other, block_size, prompt_tokens) in [
+            (
+                plain_prompt(&sevens),
+                plain_prompt(&eights),
+                BLOCK_SIZE,
+                BLOCK_SIZE - 1,
+            ),
+            (
+                text("a prompt under one window"),
+                text("another"),
+                BLOCK_SIZE * TEXT_BYTES_PER_TOKEN,
+                6,
+            ),
+        ] {
+            let hashes = of(&short);
+            assert_eq!(hashes.blocks.len(), 1, "{short:?}");
+            assert_eq!(hashes.blocks, of(&short).blocks);
+            assert_ne!(hashes.blocks, of(&other).blocks);
+            assert_eq!(
+                (hashes.block_size, hashes.prompt_tokens),
+                (block_size, prompt_tokens)
+            );
+        }
+        for empty in [plain_prompt(&[]), text("")] {
+            assert!(of(&empty).blocks.is_empty(), "{empty:?}");
+        }
     }
 
     #[test]
