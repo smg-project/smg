@@ -51,8 +51,9 @@ use smg_policy_controller::{
     elector::ElectionSettings,
     proto::{
         controller_frame, decide_answer, decision, gateway_frame,
-        policy_controller_client::PolicyControllerClient, ApplyMode, ApplyResult, DecideRequest,
-        Decision, GatewayFrame, Hello, RequestFacts, RollbackRequest, ShedReason,
+        policy_controller_client::PolicyControllerClient, snapshot_request::Slice, ApplyMode,
+        ApplyResult, DecideRequest, Decision, GatewayFrame, Hello, RequestFacts, RollbackRequest,
+        ShedReason, SnapshotRequest, SpecStatus,
     },
 };
 use spec::{
@@ -153,6 +154,7 @@ async fn decide(replica: &Replica) -> Option<decide_answer::Answer> {
                 ..RequestFacts::default()
             }),
             constraints: None,
+            again: false,
         })
         .await
         .expect("the stream takes the request");
@@ -170,6 +172,19 @@ async fn rollback(replica: &Replica, generation: u64) -> Result<ApplyResult, Sta
     inside("the rollback call's answer", call)
         .await
         .map(Response::into_inner)
+}
+
+/// The spec slice of the operators' snapshot on the control listener, as
+/// `operator-a`.
+async fn status(replica: &Replica) -> Result<SpecStatus, Status> {
+    let mut client = control(replica).await?;
+    let request = SnapshotRequest {
+        slices: vec![Slice::Spec.into()],
+        ..SnapshotRequest::default()
+    };
+    let call = client.get_snapshot(as_operator(request));
+    let answer = inside("the snapshot call's answer", call).await?;
+    Ok(answer.into_inner().spec.expect("the spec slice"))
 }
 
 /// The names in the store's directory, the store's own lock file apart.
@@ -229,7 +244,8 @@ fn refused(flags: &[&OsStr]) -> (Option<i32>, String) {
 /// directory, the binary runs the newest generation on file before any
 /// call, and its next apply is the next number. A rollback there runs a
 /// generation the first process wrote as the next number, and the read call
-/// answers each generation on file by its number.
+/// answers each generation on file by its number. The snapshot's spec slice
+/// names the standing generation and the ones a rollback can name.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_enforce_on_a_spec_store_runs_and_a_start_runs_it_again() {
     let dir = tempfile::tempdir().expect("a directory");
@@ -262,6 +278,18 @@ async fn an_enforce_on_a_spec_store_runs_and_a_start_runs_it_again() {
     assert!(would.accepted && !would.read_only, "{would:?}");
     assert_eq!(would.generation, 1);
     assert_eq!(on_file(dir.path()), BTreeSet::new());
+    // The snapshot's spec slice says the same of an empty store: no
+    // generation, no digest, nothing a rollback can name.
+    let empty = status(&replica).await.expect("the leader's status");
+    assert_eq!(
+        (
+            empty.generation,
+            empty.digest.as_str(),
+            empty.source.as_str()
+        ),
+        (0, "", "api")
+    );
+    assert!(empty.retained.is_empty(), "{empty:?}");
 
     let first = apply(&replica, ApplyMode::Enforce, LEAST_LOAD)
         .await
@@ -369,6 +397,15 @@ async fn an_enforce_on_a_spec_store_runs_and_a_start_runs_it_again() {
     assert_eq!(gone.code(), Code::NotFound, "{gone:?}");
     let four = BTreeSet::from([name(1), name(2), name(3), name(4)]);
     assert_eq!(on_file(dir.path()), four);
+    // The snapshot's spec slice names what stands and what a rollback can
+    // name: the list this start read from the directory, then its two
+    // writes.
+    let told = status(&again).await.expect("the leader's status");
+    assert_eq!(
+        (told.generation, &told.digest, told.source.as_str()),
+        (4, &second.digest, "api")
+    );
+    assert_eq!(told.retained, [1, 2, 3]);
 }
 
 /// A start on a directory another controller holds waits for that one to

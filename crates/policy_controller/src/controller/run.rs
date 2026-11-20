@@ -121,8 +121,14 @@ struct Cli {
 
     // ==================== Election ====================
     /// The lease as a file on this host: the replicas of one host elect
-    /// their leader over it; its directory must exist. With no lease flag
-    /// the controller runs alone and leads itself
+    /// their leader over it; its directory must exist. Each renewal is a
+    /// durable write: on a volume whose sync can take over a second the
+    /// leader answers Busy for that time, ends its gateways' sessions
+    /// where a renewal takes two, and can lose its lease where one takes
+    /// three; keep the file on a quiet local volume or run a slower
+    /// timing (15000, 10000 and 2000 for --lease-duration-ms,
+    /// --lease-renew-deadline-ms and --lease-renew-period-ms). With no
+    /// lease flag the controller runs alone and leads itself
     #[arg(long, help_heading = "Election")]
     lease_file: Option<PathBuf>,
 
@@ -173,11 +179,17 @@ struct Cli {
 
     /// The policy spec as a file, in YAML (JSON under a `.json` name): read
     /// and applied at the start, as generation 1 or under the number its
-    /// `generation` line writes. A file that cannot be read, or a document
-    /// that is invalid, refuses the start. The file is then watched: a
-    /// changed one is applied as the next generation, or under the number
-    /// it writes, and one that does not run is rejected whole and the
-    /// running generation stays. A start names one source of the spec, this
+    /// `generation` line writes. Under `--lease-file` or `--lease-name` it
+    /// is read and checked at the start, and applied when this replica
+    /// leads: while it follows a leader it runs the leader's document, and
+    /// once it leads it applies its own file's, unless that document ran
+    /// on it since the file last changed. A file that cannot be read, or a
+    /// document that is invalid, refuses the start. The file is watched
+    /// from then on. While the replica leads, a changed one is applied as
+    /// the next generation, or under the number it writes, and one that
+    /// does not run is rejected whole and the running generation stays.
+    /// While the replica follows, nothing of the file is applied and
+    /// nothing is said of it. A start names one source of the spec, this
     /// file or `--spec-store`: with neither it is refused.
     ///
     /// YAML reads as JSON does: text that looks like a number or a boolean
@@ -195,8 +207,8 @@ struct Cli {
     /// until the first apply. The last 8 generations stay on file, and a
     /// rollback runs one of them again as the next generation. One replica
     /// serves it, its lease in the process: beside a lease another
-    /// replica can take the start is refused, since a standby does not
-    /// follow an applied generation in this build. One process holds the
+    /// replica can take the start is refused, since a standby follows a
+    /// file's generations alone in this build. One process holds the
     /// directory, under a lock on a file it makes there: a start that
     /// cannot make that file is refused, and one that finds it held waits
     /// for its holder to stop, refused where it is still held at the end
@@ -1602,7 +1614,7 @@ mod tests {
     }
 
     /// Beside a lease another replica can take, a spec store refuses the
-    /// start by name: a standby would not follow an applied generation.
+    /// start by name: a standby follows a file's generations alone.
     #[tokio::test]
     async fn a_spec_store_refuses_the_start_beside_a_lease_another_replica_can_take() {
         let dir = tempfile::tempdir().expect("a directory");
@@ -1623,12 +1635,66 @@ mod tests {
             }) => assert_eq!(
                 refused.to_string(),
                 format!(
-                    "the spec store {}: another replica can take this controller's lease, and a standby does not follow an applied generation in this build: keep the lease in the process, or hand the spec as a file",
+                    "the spec store {}: another replica can take this controller's lease, and a standby follows a file's generations alone in this build: keep the lease in the process, or hand the spec as a file",
                     store.display()
                 )
             ),
             Err(other) => panic!("refused as {other}"),
             Ok(_) => panic!("a shared lease takes no spec store"),
+        }
+    }
+
+    /// Beside a lease another replica can take, a spec file is passed at
+    /// the start and not applied: the replica runs no number of its own
+    /// until it leads, so it follows its leader's generation whatever the
+    /// number. The file is its source all the same, and writes while the
+    /// replica leads. One that does not run refuses the start. Under a
+    /// lease in the process the file is applied at the start, and writes
+    /// always.
+    #[tokio::test]
+    async fn a_spec_file_is_applied_at_the_start_under_a_lease_in_the_process_alone() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let document =
+            "apiVersion: smg.policy/v1\nprofiles:\n  default:\n    filter: [healthy]\n    pick: random\n";
+        let file = dir.path().join("policy.yaml");
+        std::fs::write(&file, document).expect("the file");
+        let lease = dir.path().join("lease");
+        let shared = ["--lease-file", lease.to_str().expect("a path in UTF-8")];
+        let start = |flags: &[&str]| {
+            let mut args = EPHEMERAL.to_vec();
+            args.extend_from_slice(flags);
+            let config = parse(&args).config().expect("the flags are in order");
+            bind(
+                config,
+                Catalog::builtin(),
+                &[],
+                SpecSource::File(file.clone()),
+            )
+        };
+
+        let alone = start(&[]).await.expect("the file starts");
+        assert_eq!(alone.store().world().spec().generation(), 1);
+        assert!(alone.shared.generations.source_writes());
+        drop(alone);
+
+        let paired = start(&shared).await.expect("the file starts");
+        assert_eq!(
+            paired.store().world().spec().generation(),
+            0,
+            "passed, not applied"
+        );
+        assert!(paired.shared.generations.bound(), "a source all the same");
+        assert!(
+            !paired.shared.generations.source_writes(),
+            "its source writes while it leads, and it has not led"
+        );
+        drop(paired);
+
+        std::fs::write(&file, document.replace("healthy", "no-such-stage")).expect("the file");
+        match start(&shared).await {
+            Err(Error::SpecFile { .. }) => {}
+            Err(other) => panic!("refused as {other}"),
+            Ok(_) => panic!("a document that does not run refuses the start"),
         }
     }
 }

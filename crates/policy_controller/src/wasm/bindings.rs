@@ -30,8 +30,8 @@ pub(crate) mod packed {
         ownership: Borrowing { duplicate_if_necessary: false },
         additional_derives: [PartialEq],
         with: {
-            "smg:policy/types@1.0.0": super::record::smg::policy::types,
-            "smg:policy/host@1.0.0": super::record::smg::policy::host,
+            "smg:policy/types@1.2.0": super::record::smg::policy::types,
+            "smg:policy/host@1.2.0": super::record::smg::policy::host,
         },
     });
 }

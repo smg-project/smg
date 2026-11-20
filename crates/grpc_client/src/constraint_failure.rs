@@ -52,6 +52,41 @@ pub fn is_constraint_failure(status: &Status) -> bool {
         .is_some_and(|value| value == REPORTED_BY_ENGINE)
 }
 
+/// The gRPC trailer on a worker's refusal of a constraint its engine cannot
+/// enforce, before the engine sees the request (an xgrammar backend that
+/// would drop a schema keyword, a backend that does not compile the kind, a
+/// disabled backend). The status is `INVALID_ARGUMENT`, which a router that
+/// predates the trailer answers as a 400 under the code of whatever failed
+/// (on a disaggregated pair, `prefill_worker_failed_to_start`). A router that
+/// reads the trailer answers the client for the constraint instead: a 400
+/// under the code `unsupported_constraint`, with the worker's words, which
+/// name the keyword and where it stands.
+pub const CONSTRAINT_REFUSED_METADATA_KEY: &str = "smg-constraint-refused";
+
+/// The trailer's value: the worker refused the constraint itself.
+const REFUSED_BY_WORKER: &str = "worker";
+
+/// The status a wire refuses a request with when its engine cannot enforce
+/// the request's constraint; `message` names the constraint and why.
+pub fn constraint_refused_status(message: impl Into<String>) -> Status {
+    let mut status = Status::invalid_argument(message);
+    status.metadata_mut().insert(
+        CONSTRAINT_REFUSED_METADATA_KEY,
+        MetadataValue::from_static(REFUSED_BY_WORKER),
+    );
+    status
+}
+
+/// Whether `status` is a worker's refusal of a constraint its engine cannot
+/// enforce (see [`constraint_refused_status`]).
+pub fn is_constraint_refusal(status: &Status) -> bool {
+    status
+        .metadata()
+        .get(CONSTRAINT_REFUSED_METADATA_KEY)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value == REFUSED_BY_WORKER)
+}
+
 #[cfg(test)]
 mod tests {
     use tonic::Code;
@@ -84,5 +119,21 @@ mod tests {
             MetadataValue::from_static("elsewhere"),
         );
         assert!(!is_constraint_failure(&odd));
+    }
+
+    #[test]
+    fn a_refusal_is_an_invalid_argument_under_its_own_trailer() {
+        let status = constraint_refused_status("The JSON schema constraint cannot be enforced");
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert_eq!(
+            status.message(),
+            "The JSON schema constraint cannot be enforced"
+        );
+        assert!(is_constraint_refusal(&status));
+        assert!(!is_constraint_failure(&status));
+        assert!(!is_constraint_refusal(&constraint_failed_status("aborted")));
+        assert!(!is_constraint_refusal(&Status::invalid_argument(
+            "The JSON schema constraint cannot be enforced"
+        )));
     }
 }

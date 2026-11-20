@@ -108,9 +108,8 @@ async fn removed_worker_series_leave_the_scrape() {
         "series missing after re-registration:\n{body}"
     );
     // The removed registration's count (closed -> open, 1) never returns.
-    // The fresh breaker publishes its transition counters at zero while it is
-    // built: once the removed instance is gone from every handle, the store
-    // has forgotten the address and those zeros stand, as for any new worker.
+    // The registration publishes the fresh breaker's transition counters at
+    // zero, as for any new worker.
     assert!(
         lines
             .iter()

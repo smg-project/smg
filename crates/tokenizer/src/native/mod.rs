@@ -246,10 +246,12 @@ const PIECE_CACHE_CAPACITY: usize = 262_144;
 /// however many threads share the total), toward 352 + 560 MiB with
 /// the rounding of more threads (the packed part toward twice its 352 MiB past
 /// some 680 threads, as above); the long pieces add `LONG_PIECE_BYTES_TOTAL` at
-/// most (a thread's long tier keeps its map's slots through an eviction's
-/// clear when they fit four times its share and gives them back when they
-/// do not; a share that fell below a quarter of what the tier holds, entries
-/// and empty slots together, makes it anew at the thread's next call). A
+/// most once every thread has added one under its present share, and can
+/// add more until then, see that constant (a thread's long tier keeps its map's
+/// slots through an eviction's clear when they fit four times its share and
+/// gives them back when they do not; a share that fell below a quarter of
+/// what the tier holds, entries and empty slots together, makes it anew at
+/// the thread's next call). A
 /// thread reads its share at the start of every encode call and keeps
 /// it for that call's misses (a call that was running when threads joined keeps
 /// its earlier share until it ends; the long tier reads the live share at every
@@ -259,22 +261,54 @@ const PIECE_CACHE_CAPACITY: usize = 262_144;
 /// `THREAD_BACKING_SLOTS` slots at most, 33 bytes each, about 528 KiB per
 /// thread: more than the share's slots only once those fall under the
 /// reservation, a share under 6,144 entries, some 680 threads on this total),
-/// and holds at most its earlier share until then, or until it exits if it
-/// never encodes again: right after a join the total is the earlier share times
+/// and holds at most its earlier share until then, or while the encoder
+/// lives if it never encodes again (its exit frees nothing, the encoder owns
+/// the caches): right after a join the total is the earlier share times
 /// the threads that had it plus the new share times the rest, and settles as
 /// they encode. Before this bound the same ceilings were a sixteenth of these.
 /// All of it is freed with the encoder.
 const PIECE_CACHE_TOTAL_CAPACITY: usize = 16 * PIECE_CACHE_CAPACITY;
 /// Bytes of long pieces (each piece, its ids and their slot) a thread holds
 /// for one encoder before its long entries are cleared, at most; see
-/// `LONG_PIECE_BYTES_TOTAL`.
-const LONG_PIECE_BYTES_CAPACITY: usize = 2 << 20;
-/// Bytes of long pieces all threads together hold for one encoder, shared
-/// the way `PIECE_CACHE_TOTAL_CAPACITY` is. The long pieces of a prompt (its
-/// clauses, in a script without word spaces) are few in number and large,
-/// and each one that misses goes through the model's merges, so they are
-/// bounded by what they take rather than counted.
-const LONG_PIECE_BYTES_TOTAL: usize = 32 << 20;
+/// `LONG_PIECE_BYTES_TOTAL`. This is the cliff of a repeated document for
+/// its long pieces, as `PIECE_CACHE_CAPACITY` is for the others: a text
+/// whose long pieces fit is encoded again at the cost of their lookups, one
+/// with more merges them again on every pass, since the clear takes the
+/// pieces that recur with the rest. By this count the 33 documents of
+/// 128,000 tokens of the README's benchmark hold 2.8 to 3.0 MiB of long
+/// pieces in all and its 33 documents of 500,000 tokens 5.6 to 6.0 MiB
+/// (three byte-level vocabularies, some 14,000 and 29,000 entries of about
+/// 220 bytes), so the bound holds either set whole; at 2 MiB the tier was
+/// cleared once or twice in a pass over the first set and five or six
+/// times in a pass over the second, and a second pass merged most of the
+/// long pieces again (measured).
+/// Memory: a thread holds what the long pieces it met take, so one that
+/// meets few holds little; the count leaves out what the allocator rounds
+/// each box up by and the empty slots of the map.
+const LONG_PIECE_BYTES_CAPACITY: usize = 8 << 20;
+/// Bytes of long pieces the threads of one encoder share, the way they
+/// share `PIECE_CACHE_TOTAL_CAPACITY`: a thread's share is this total
+/// divided by the threads that have encoded with the encoder,
+/// `LONG_PIECE_BYTES_CAPACITY` at most, so sixteen threads have the full
+/// bound each and more threads a smaller share. A thread is held to its
+/// share in two places: where it adds a long piece, its long entries are
+/// cleared first when the piece would take them past the share read at
+/// that miss, and the start of a call makes anew a long tier that holds
+/// more than four times the share. Nothing reaches into another thread's
+/// cache, so the threads together are within this total only once each
+/// has added a long piece under the present share. A thread that filled a
+/// larger share and has added none since keeps what it holds, up to four
+/// times its share while it encodes and all of it while it does not, for
+/// as long as the encoder lives (a thread's exit frees nothing), and the
+/// threads together can stand above this total for that time: sixteen
+/// threads that filled 8 MiB each and a seventeenth that fills its share
+/// hold 135.5 MiB. At the worst, every thread filling its share as it
+/// joins and adding nothing after, the n-th keeps the total divided by n
+/// and the sum is 215 MiB at 32 threads, 302 MiB at 64. The long pieces
+/// of a prompt (its clauses, in a script without word spaces) are few in
+/// number and large, and each one that misses goes through the model's
+/// merges, so they are bounded by what they take rather than counted.
+const LONG_PIECE_BYTES_TOTAL: usize = 128 << 20;
 /// What an entry of the long tier takes beyond its piece and ids.
 const LONG_PIECE_ENTRY_BYTES: usize = size_of::<(Box<[u8]>, Box<[u32]>)>();
 
@@ -297,6 +331,10 @@ const PARALLEL_CHUNK_BYTES: usize = 32 << 10;
 /// load that runs on a worker of a rayon pool already (the Python binding
 /// loads on its own, sized by its host) reads on that pool instead.
 const SEED_THREADS: usize = 4;
+/// Ids the vocabulary seed's pass reads at a time: one list of this many
+/// slots, a megabyte and a half, is all the pass holds of its reads beside
+/// what the tables are built from (see `vocabulary_seed`).
+const SEED_WINDOW: usize = 1 << 14;
 /// Text on each side of a candidate cut that every stage's pattern is run
 /// over to confirm a piece starts there (widened to the spaces around it:
 /// the window starts where the text's match loop begins a piece and ends
@@ -1945,16 +1983,63 @@ impl NativeEncoder {
             })();
             Some(seeded)
         };
-        let ids = 0..bpe.get_vocab_size() as u32;
-        // One slot per id, written in place (the read keeps its index, so the
-        // collect is one list and no concatenation); one scratch per rayon job
-        // (2048 entries or more).
-        let read_all = || {
-            ids.clone()
+        let vocab_size = bpe.get_vocab_size();
+        // The pass reads a window of ids at a time into one list of slots
+        // the calling thread owns and reuses, and keeps of each window what
+        // the tables are built from, packed: the key and the ids of a short
+        // piece, the bytes of a long one. One list of a slot per entry
+        // (ninety-six bytes each, 25 MB for a vocabulary of 262k entries),
+        // collected by a thread of the pool, stayed behind after the load
+        // as free memory in that thread's heap: the system allocator gives
+        // back no free top below the threshold that a freed block as large
+        // as the vocabulary file has raised.
+        let mut slots: Vec<Option<Option<Seeded>>> =
+            Vec::with_capacity(SEED_WINDOW.min(vocab_size));
+        let mut entries = 0usize;
+        let mut keys: Vec<ShortPieceKey> = Vec::with_capacity(vocab_size);
+        let mut counts: Vec<u8> = Vec::with_capacity(vocab_size);
+        let mut short_ids: Vec<u32> = Vec::with_capacity(vocab_size);
+        let mut long_entries: Vec<Box<[u8]>> = Vec::new();
+        // An id that was an entry has a slot that is `Some`; the seeded
+        // pieces are the inner `Some`s.
+        let mut keep = |slots: &mut Vec<Option<Option<Seeded>>>| {
+            for read in slots.drain(..) {
+                let Some(seeded) = read else { continue };
+                entries += 1;
+                match seeded {
+                    Some(Seeded::Short(key, ids)) => {
+                        keys.push(key);
+                        counts.push(ids.count);
+                        short_ids.extend_from_slice(ids.as_slice());
+                    }
+                    Some(Seeded::Long(bytes)) => long_entries.push(bytes),
+                    None => {}
+                }
+            }
+        };
+        let windows = || {
+            (0..vocab_size)
+                .step_by(SEED_WINDOW)
+                .map(|start| start as u32..(start + SEED_WINDOW).min(vocab_size) as u32)
+        };
+        // One slot per id of the window, written in place (the read keeps
+        // its index, so the collect is one list and no concatenation); one
+        // scratch per rayon job. Rayon halves a window into jobs, none of
+        // fewer than `job` entries: the window's share of a thread of the
+        // pool the read runs on, held between 256 and 2048. On the seed's
+        // own pool a full window is eight jobs of 2048 for its four
+        // threads. On a caller's pool of eight threads or more it is as
+        // many jobs as the largest power of two that is not above the
+        // pool's threads, sixty-four at the most, and a thread reads a
+        // job: no more threads than there are jobs read a window, however
+        // wide the pool (its width is the `threads` of the debug line).
+        let read_window = |window: Range<u32>, slots: &mut Vec<Option<Option<Seeded>>>| {
+            let job = (SEED_WINDOW / rayon::current_num_threads().max(1)).clamp(256, 2048);
+            window
                 .into_par_iter()
-                .with_min_len(2048)
+                .with_min_len(job)
                 .map_init(SeedScratch::default, |scratch, id| read(id, scratch))
-                .collect::<Vec<Option<Option<Seeded>>>>()
+                .collect_into_vec(slots);
         };
         // A caller that is a worker of a rayon pool already (the Python
         // binding loads on its own, sized by its host) reads on that pool,
@@ -1963,44 +2048,55 @@ impl NativeEncoder {
         // entries are returned, so the load leaves no pool behind; a process
         // that cannot spawn them reads on the calling thread and says so.
         // (The name fits the fifteen bytes a thread's name keeps.)
-        let (entries, threads) = if rayon::current_thread_index().is_some() {
-            (read_all(), rayon::current_num_threads())
+        let threads = if rayon::current_thread_index().is_some() {
+            for window in windows() {
+                read_window(window, &mut slots);
+                keep(&mut slots);
+            }
+            rayon::current_num_threads()
         } else {
             let pooled = rayon::ThreadPoolBuilder::new()
                 .num_threads(SEED_THREADS)
                 .thread_name(|index| format!("vocab-seed-{index}"))
-                .build_scoped(|thread| thread.run(), |pool| pool.install(read_all));
+                .build_scoped(
+                    |thread| thread.run(),
+                    |pool| {
+                        for window in windows() {
+                            pool.install(|| read_window(window, &mut slots));
+                            keep(&mut slots);
+                        }
+                    },
+                );
             match pooled {
-                Ok(entries) => (entries, SEED_THREADS),
+                Ok(()) => SEED_THREADS,
                 Err(error) => {
                     tracing::warn!(
                         %error,
                         "could not build the vocabulary seed's pool; reading on the calling thread"
                     );
                     let mut scratch = SeedScratch::default();
-                    (ids.map(|id| read(id, &mut scratch)).collect::<Vec<_>>(), 1)
+                    for window in windows() {
+                        slots.extend(window.map(|id| read(id, &mut scratch)));
+                        keep(&mut slots);
+                    }
+                    1
                 }
             }
         };
-        // An id that was an entry has a slot that is `Some`; the seeded pieces
-        // are the inner `Some`s.
-        let covers = entries.iter().filter(|read| read.is_some()).count() == bpe.get_vocab_size();
-        let short = entries
-            .iter()
-            .flatten()
-            .flatten()
-            .filter(|seeded| matches!(seeded, Seeded::Short(..)))
-            .count();
-        let long = entries.iter().flatten().flatten().count() - short;
+        let covers = entries == vocab_size;
+        let (short, long) = (keys.len(), long_entries.len());
         let mut table = ShortPieceTable::for_entries(short);
         let mut filter = LongEntryFilter::for_entries(long);
-        for seeded in entries.iter().flatten().flatten() {
-            match seeded {
-                Seeded::Short(key, ids) => {
-                    table.insert(*key, ids.as_slice(), short);
-                }
-                Seeded::Long(bytes) => filter.insert(bytes),
-            }
+        // The inserts the one list gave, in its order: the short pieces by
+        // id into the table, the long ones by id into the filter.
+        let mut at = 0;
+        for (key, &count) in keys.iter().zip(&counts) {
+            let end = at + usize::from(count);
+            table.insert(*key, &short_ids[at..end], short);
+            at = end;
+        }
+        for bytes in &long_entries {
+            filter.insert(bytes);
         }
         let filter = (covers && chars.is_none()).then_some(filter);
         tracing::debug!(
@@ -3124,10 +3220,16 @@ impl NativeEncoder {
                 // blocks where its pattern gives that reader. The all-ASCII
                 // unit does not: its lean scan reads long words in fewer
                 // instructions than the block pass (measured: the pass costs
-                // a sixth more on a text of 18-byte words).
+                // a sixth more on a text of 18-byte words). The cased-letter
+                // template has no lean scan: its unit goes by blocks either
+                // way, the all-ASCII one from `encode_single_stage`.
                 let encoded = if cache.unit_ascii {
                     self.encode_single_stage::<true>(model, stage, text, words, mapped, ids, cache)
                 } else if let Some(blocks) = stage.pattern.by_blocks(text) {
+                    self.encode_single_stage_by_blocks(
+                        model, blocks, text, words, mapped, ids, cache,
+                    )
+                } else if let Some(blocks) = stage.pattern.by_cased_blocks(text) {
                     self.encode_single_stage_by_blocks(
                         model, blocks, text, words, mapped, ids, cache,
                     )
@@ -3489,8 +3591,10 @@ impl NativeEncoder {
     /// compiled in here, the lean loop moved the code of the other loops,
     /// and the byte loops and the cased scanner cost 1 to 2 % more
     /// operations per token on text the lean scan never reads (counted). A
-    /// pattern with no lean scan goes on to the other copy, which is the
-    /// function as it was.
+    /// pattern with no lean scan leaves this copy at once: through
+    /// [`Self::encode_single_stage_by_blocks`] when it gives a reader of the
+    /// text by blocks (the cased-letter template, `Pattern::by_cased_blocks`),
+    /// else on to the other copy, which is the function as it was.
     #[inline(never)]
     #[expect(clippy::too_many_arguments)]
     fn encode_single_stage<const ASCII: bool>(
@@ -3504,6 +3608,12 @@ impl NativeEncoder {
         cache: &mut PieceCache,
     ) -> Result<(), Fallback> {
         if ASCII && !stage.pattern.has_lean_scan() {
+            // No lean scan: the block pass where the pattern gives that
+            // reader (the cased-letter template), else the walk as it was.
+            if let Some(blocks) = stage.pattern.by_cased_blocks(text) {
+                return self
+                    .encode_single_stage_by_blocks(model, blocks, text, words, mapped, ids, cache);
+            }
             return self
                 .encode_single_stage::<false>(model, stage, text, words, mapped, ids, cache);
         }
@@ -3552,13 +3662,15 @@ impl NativeEncoder {
     /// [`Self::encode_single_stage`] keeps its text and its loops as they
     /// are. A pattern that gives a reader by blocks leaves no gap in any
     /// text (`Pattern::by_blocks`), so there is none to tokenize here and
-    /// no cursor to keep.
+    /// no cursor to keep. Compiled once a template (`CASED`, the reader's
+    /// type): with the loops of both in one copy, the loop of the GPT-4
+    /// family's template cost one instruction a token more (counted).
     #[inline(never)]
     #[expect(clippy::too_many_arguments)]
-    fn encode_single_stage_by_blocks(
+    fn encode_single_stage_by_blocks<const CASED: bool>(
         &self,
         model: Option<&ModelWrapper>,
-        blocks: pattern::ByBlocks<'_>,
+        blocks: pattern::ByBlocks<'_, CASED>,
         text: &str,
         words: bool,
         mapped: &mut String,
@@ -4148,10 +4260,13 @@ impl NativeEncoder {
     /// tier anew when it holds more than four times the long share, entries
     /// and empty slots together (see `PieceCache::remake_long`), so
     /// every thread that still encodes is within the share
-    /// from its next call on (the share is read here once and kept in the
+    /// from its next call on, its long tier within four times the long
+    /// share until it next adds a long piece (the share is read here once
+    /// and kept in the
     /// cache for the call's misses, so a call that was running when threads
     /// joined keeps the share it started with until it ends; a thread that
-    /// never encodes again holds what it had until it exits). Two relaxed
+    /// never encodes again holds what it had while the encoder lives, see
+    /// `LONG_PIECE_BYTES_TOTAL`). Two relaxed
     /// loads, two stores and five compares per call. A call that ended on
     /// a declined piece or unwound left its waiting pieces behind
     /// (`Self::waits`): they are dropped here, their holes stood in ids

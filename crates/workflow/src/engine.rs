@@ -1400,7 +1400,8 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         label: &str,
         timeout_duration: Duration,
     ) -> Result<WorkflowState<D>, String> {
-        let start = std::time::Instant::now();
+        // The runtime's clock, which a step's own timeout reads too.
+        let start = tokio::time::Instant::now();
         let mut poll_interval = Duration::from_millis(100);
         let max_poll_interval = Duration::from_millis(2000);
         let poll_backoff = Duration::from_millis(200);

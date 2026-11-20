@@ -243,7 +243,7 @@ pub(crate) fn reads(
 /// template's name for a model read through its template. `None` when the legacy parsers read the
 /// model: its requests count under `none`, whose series exist from start-up. Asked at the model's
 /// first registration, so the table's series exist at zero before its first output
-/// (`workflow::steps::local::create_worker`).
+/// (`workflow::steps::local::check_local_worker`).
 pub(crate) fn table_label_read(names: &ModelNames<'_>, model: &str) -> Option<&'static str> {
     match decision(names, model) {
         Decision::Template => Some(telemetry::TEMPLATE),
@@ -257,7 +257,7 @@ pub(crate) fn table_label_read(names: &ModelNames<'_>, model: &str) -> Option<&'
 /// model, and the flags' choice spelled for a log line (`the table 'mistral_v13'`, `the model's
 /// response template`, `the legacy parsers`). `None` when the flags select nothing or the
 /// registry's own table, or when the registry does not know the model. Registration warns with it
-/// once per model (`workflow::steps::local::create_worker`).
+/// once per model (`workflow::steps::local::check_local_worker`).
 pub(crate) fn set_aside_by_the_registry(
     flags: &Names,
     model: &str,

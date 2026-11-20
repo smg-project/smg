@@ -22,7 +22,7 @@ impl StepExecutor<WorkerRemovalWorkflowData> for UpdateRemainingPoliciesStep {
         &self,
         context: &mut WorkflowContext<WorkerRemovalWorkflowData>,
     ) -> WorkflowResult<StepResult> {
-        let app_context = require_app_context(context.data.app_context.as_ref())?;
+        let app_context = require_app_context(context.data.host.as_ref())?;
         let affected_models = &context.data.affected_models;
         let worker_urls = &context.data.worker_urls;
 
@@ -81,7 +81,7 @@ impl StepExecutor<WorkerRemovalWorkflowData> for UpdateRemainingPoliciesStep {
 mod tests {
     use std::sync::Arc;
 
-    use smg_worker::test_support::ready_worker;
+    use smg_worker::{jobs::WorkerJobAsker, test_support::ready_worker};
     use wfaas::WorkflowInstanceId;
 
     use super::*;
@@ -143,6 +143,7 @@ mod tests {
             "http://w2:8000".to_string(),
             None,
             Arc::clone(&app_context),
+            WorkerJobAsker::Api,
         );
         data.worker_urls = vec!["http://w2:8000".to_string()];
         data.affected_models = [MODEL.to_string()].into_iter().collect();

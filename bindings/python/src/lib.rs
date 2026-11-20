@@ -2346,9 +2346,9 @@ impl Router {
             .discovery
             .as_ref()
             .map(|discovery| {
-                service_discovery::RuntimeDiscoveryConfig::from_config(
+                smg_service_discovery::RuntimeDiscoveryConfig::from_config(
                     discovery,
-                    &router_config.mode,
+                    router_config.mode.discovery_roles(),
                 )
             })
             .transpose()

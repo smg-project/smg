@@ -376,8 +376,7 @@ async fn a_gateway_gone_past_its_grace_period_is_let_go_by_the_run_loop() {
                 term: 1,
                 issued_at: now,
                 dispatch_deadline: now + Duration::from_secs(600),
-                state: LeaseState::Issued,
-                session_ttl_micros: None,
+                state: LeaseState::ISSUED,
             })
             .expect("a lease under the leader's term");
         assert_eq!(store.live(gateway), 1);
@@ -695,6 +694,7 @@ async fn a_present_gateway_is_answered_which_worker_on_its_decide_stream() {
                         ..RequestFacts::default()
                     }),
                     constraints: None,
+                    again: false,
                 })
                 .await
                 .expect("the stream takes the request");
@@ -739,6 +739,7 @@ async fn a_present_gateway_is_answered_which_worker_on_its_decide_stream() {
                     ..RequestFacts::default()
                 }),
                 constraints: None,
+                again: false,
             })
             .await
             .expect("the stream takes the request");
@@ -892,6 +893,7 @@ async fn a_worker_added_over_the_wire_is_decided_with_no_ask_for_a_build() {
                         ..RequestFacts::default()
                     }),
                     constraints: None,
+                    again: false,
                 })
                 .await
                 .expect("the stream takes the request");
@@ -1004,6 +1006,7 @@ async fn a_drain_ends_the_open_decide_streams_and_returns_inside_its_grace_perio
                     ..RequestFacts::default()
                 }),
                 constraints: None,
+                again: false,
             })
             .await
             .expect("the stream takes the request");
@@ -1482,5 +1485,220 @@ async fn rss_idle_and_with_a_thousand_workers_in_the_store() {
         stop.send(()).expect("the serve is listening for the stop");
     };
     let (served, ()) = tokio::join!(serve, feed);
+    served.expect("a clean stop");
+}
+
+#[tokio::test]
+async fn a_served_dispatch_feeds_a_registered_scorer_without_lifecycle_hooks() {
+    use std::sync::{Arc, Mutex};
+
+    use smg_policy_controller::{
+        proto::{Dispatched, Side},
+        Candidate, Catalog, Lifecycle, Scorer, Sent, SentCredit, TieBand, API_VERSION,
+    };
+
+    #[derive(Debug)]
+    struct SentScore {
+        sent: Arc<SentCredit>,
+        seen: Arc<Mutex<Vec<(WorkerId, Sent)>>>,
+    }
+
+    impl Lifecycle for SentScore {}
+
+    impl Scorer for SentScore {
+        fn name(&self) -> &'static str {
+            "sent-score"
+        }
+
+        fn score(
+            &self,
+            facts: &smg_policy_controller::RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            out: &mut [f32],
+        ) -> TieBand {
+            let reads = self.sent.reads(facts);
+            let mut seen = self.seen.lock().expect("the scores");
+            seen.clear();
+            for (&index, score) in kept.iter().zip(out) {
+                let row = &candidates[index as usize];
+                let sent = reads.of(row);
+                seen.push((row.id, sent));
+                *score = if sent.requests == 0 { 1.0 } else { 0.0 };
+            }
+            TieBand::NORMALIZED
+        }
+    }
+
+    const GATEWAY: &str = "sender";
+    const MODEL: &str = "work";
+    const TOKENS: u32 = 367;
+    const PATIENCE: Duration = Duration::from_secs(12);
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut catalog = Catalog::builtin();
+    let scores = Arc::clone(&seen);
+    catalog
+        .scorer_with("sent-score", move |build| {
+            Ok(Box::new(SentScore {
+                sent: build.sent(),
+                seen: Arc::clone(&scores),
+            }))
+        })
+        .expect("a free name");
+    let mut controller = Controller::bind_with(config(), catalog)
+        .await
+        .expect("bind");
+    controller
+        .identity_as_told("gateway")
+        .expect("the listener");
+
+    let mut file = tempfile::NamedTempFile::new().expect("a policy file");
+    write!(
+        file,
+        "apiVersion: {API_VERSION}\nprofiles:\n  work:\n    sent_ttl_ms: 24001\n    score: [sent-score]\n    pick: best\n"
+    )
+    .expect("the document is written");
+    controller
+        .spec_file(file.path())
+        .await
+        .expect("the document validates");
+
+    let store = controller.store();
+    for key in ["http://first:8000", "http://second:8000"] {
+        let id = store
+            .upsert(WorkerFacts {
+                key: key.to_owned(),
+                engine: key.to_owned(),
+                incarnation: 1,
+                models: vec![MODEL.to_owned()],
+                dp_size: 1,
+                ..WorkerFacts::default()
+            })
+            .id();
+        let revision = WorkersStore::get(&*store, id).expect("the row").revision;
+        store.set_status(id, WorkerStatus::Ready, revision);
+    }
+    store.publish_now();
+
+    let mut readiness = controller.readiness();
+    let addr = controller
+        .addresses()
+        .of(Scope::Gateway)
+        .expect("the gateway listener");
+    let (stop, stopped) = oneshot::channel::<()>();
+    let (served, ()) = tokio::join!(
+        controller.serve(async {
+            let _ = stopped.await;
+        }),
+        async {
+            timeout(PATIENCE, async {
+                assert_eq!(readiness.wait_for(State::Leader).await, Some(State::Leader));
+                let mut client = PolicyControllerClient::connect(format!("http://{addr}"))
+                    .await
+                    .expect("the listener accepts");
+                let (frames, sent) = mpsc::channel(4);
+                let mut session = client
+                    .session(stating(Some(GATEWAY), ReceiverStream::new(sent)))
+                    .await
+                    .expect("a session")
+                    .into_inner();
+                frames
+                    .send(GatewayFrame {
+                        frame: Some(gateway_frame::Frame::Hello(Hello {
+                            gateway_id: GATEWAY.to_owned(),
+                            protocol_min: 1,
+                            protocol_max: 1,
+                            ..Hello::default()
+                        })),
+                        ..GatewayFrame::default()
+                    })
+                    .await
+                    .expect("the Hello");
+                let welcome = session
+                    .message()
+                    .await
+                    .expect("a frame")
+                    .expect("a Welcome");
+                assert!(matches!(
+                    welcome.frame,
+                    Some(controller_frame::Frame::Welcome(_))
+                ));
+
+                let (requests, sent) = mpsc::channel(4);
+                let mut answers = client
+                    .decide(stating(Some(GATEWAY), ReceiverStream::new(sent)))
+                    .await
+                    .expect("a decide stream")
+                    .into_inner();
+                let mut first = None;
+                for id in [b"a", b"b"] {
+                    requests
+                        .send(DecideRequest {
+                            request_id: id.to_vec(),
+                            facts: Some(RequestFacts {
+                                model: MODEL.to_owned(),
+                                prompt_tokens: TOKENS,
+                                budget_micros: 1_470_000,
+                                ..RequestFacts::default()
+                            }),
+                            constraints: None,
+                            again: false,
+                        })
+                        .await
+                        .expect("a request");
+                    let answer = answers
+                        .message()
+                        .await
+                        .expect("an answer")
+                        .expect("a decision");
+                    let Some(decide_answer::Answer::Decision(answer)) = answer.answer else {
+                        panic!("a decision answers the request: {answer:?}");
+                    };
+                    let Some(decision::Outcome::Pick(pick)) = answer.outcome else {
+                        panic!("the decision picks a worker: {answer:?}");
+                    };
+                    let target = WorkerId(pick.targets[0].id);
+                    if let Some(dispatched) = first {
+                        assert_ne!(target, dispatched);
+                        let seen = seen.lock().expect("the scores");
+                        assert!(seen.contains(&(
+                            dispatched,
+                            Sent {
+                                requests: 1,
+                                tokens: u64::from(TOKENS),
+                            }
+                        )));
+                        assert!(seen.contains(&(target, Sent::default())));
+                    } else {
+                        first = Some(target);
+                        let lease_id = answer.leases[0].id;
+                        frames
+                            .send(GatewayFrame {
+                                seq: 1,
+                                frame: Some(gateway_frame::Frame::Dispatched(Dispatched {
+                                    lease_id,
+                                    side: Side::Single.into(),
+                                    since_decision_micros: 83,
+                                    ..Dispatched::default()
+                                })),
+                                ..GatewayFrame::default()
+                            })
+                            .await
+                            .expect("a dispatch");
+                        let gateway = GatewayId(fingerprint(GATEWAY.as_bytes()));
+                        while !LeasesStore::get(&*store, gateway, LeaseId(lease_id)).is_some_and(
+                            |record| matches!(record.state, LeaseState::Dispatched { .. }),
+                        ) {
+                            tokio::time::sleep(Duration::from_millis(3)).await;
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("the decisions and dispatch");
+            stop.send(()).expect("the serve is listening for the stop");
+        }
+    );
     served.expect("a clean stop");
 }

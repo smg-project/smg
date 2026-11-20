@@ -81,6 +81,10 @@
 //!   the record's duration, rounded up.
 //!   An elector alone over a store it made itself ([`Elector::alone`]) has
 //!   no other holder to wait for: its take leads at once.
+//!   The controller hands its candidate a step for each take. It runs
+//!   behind the take's write and behind the fence's stamp, so the step
+//!   reads the fence as any reader does: the take's term where its window
+//!   is open, and none where the window is past or the lead still waits.
 //!
 //! The elector keeps five private instants, each with one meaning. Before
 //! the first it writes no record that names it: it takes nothing, and a
@@ -467,6 +471,9 @@ pub struct Elector {
     /// run leaves on a word ([`Elector::step_down`]), one lease duration
     /// ahead, and cleared by its next take.
     hold: Option<Instant>,
+    /// What this candidate's holder does at each take, behind the take's
+    /// write and behind the fence's stamp ([`Elector::at_take`]).
+    at_take: Option<Box<dyn Fn() + Send>>,
 }
 
 impl fmt::Debug for Elector {
@@ -512,6 +519,7 @@ impl Elector {
             stepped: None,
             alone: false,
             hold: None,
+            at_take: None,
         })
     }
 
@@ -533,6 +541,20 @@ impl Elector {
     /// The fence the shard threads read; one per elector, shared by handle.
     pub fn fence(&self) -> Arc<Fence> {
         Arc::clone(&self.fence)
+    }
+
+    /// Hands this candidate a step it runs at each take, behind the take's
+    /// write and behind the fence's stamp. The step reads the fence as any
+    /// reader does. It finds the take's term where the take's window is
+    /// open, and no term where the write returned past that window or the
+    /// lead still waits to open: what a step does for its term it does
+    /// under the fence, so a take that never leads does nothing by it. The
+    /// step runs inside [`Elector::tick`], on its caller's thread; a
+    /// renewal is no take and runs no step.
+    /// Built with the controller, its one caller.
+    #[cfg(any(test, feature = "controller"))]
+    pub(crate) fn at_take(&mut self, step: impl Fn() + Send + 'static) {
+        self.at_take = Some(Box::new(step));
     }
 
     /// This run's take still waits to lead: it took a record with no holder
@@ -1163,6 +1185,12 @@ impl Elector {
                     since: now,
                 });
                 self.held = Some(record);
+                // The holder's step, behind the stamp: it reads the fence
+                // as any reader does, and a take whose window is past or
+                // still ahead shows it no term.
+                if let Some(step) = &self.at_take {
+                    step();
+                }
                 Ok(Tick::Acquired { term })
             }
             // Another write landed first and nothing is taken.
@@ -1347,6 +1375,58 @@ mod tests {
         let mut handed = candidate(&MemoryLease::new(), "b@host:2");
         assert_eq!(handed.tick(t0).expect("tick"), Tick::Acquired { term: 1 });
         assert_eq!(handed.fence().leader_term(t0), None);
+    }
+
+    /// A take's step runs behind the take's stamp and reads the fence as
+    /// any reader does: the take's term where its window is open, and no
+    /// term where the lead still waits to open. A renewal is no take and
+    /// runs no step.
+    #[test]
+    fn a_takes_step_runs_behind_its_stamp() {
+        let t0 = Instant::now() + AHEAD;
+        // The steps a candidate ran, and whether the last was shown the
+        // first term.
+        let stepping = |elector: &mut Elector| {
+            let fence = elector.fence();
+            let (steps, shown) = (
+                Arc::new(AtomicU32::new(0)),
+                Arc::new(AtomicBool::new(false)),
+            );
+            let step = {
+                let (steps, shown) = (Arc::clone(&steps), Arc::clone(&shown));
+                move || {
+                    steps.fetch_add(1, Ordering::Relaxed);
+                    shown.store(fence.leader_term(t0) == Some(1), Ordering::Relaxed);
+                }
+            };
+            elector.at_take(step);
+            (steps, shown)
+        };
+        let mut alone = Elector::alone("a@host:1", settings()).expect("valid settings");
+        let (steps, shown) = stepping(&mut alone);
+        assert_eq!(alone.tick(t0).expect("tick"), Tick::Acquired { term: 1 });
+        assert_eq!(steps.load(Ordering::Relaxed), 1);
+        assert!(
+            shown.load(Ordering::Relaxed),
+            "the fence showed the take's term at the step"
+        );
+        assert_eq!(
+            alone.tick(t0 + S).expect("renew"),
+            Tick::Renewed { term: 1 }
+        );
+        assert_eq!(steps.load(Ordering::Relaxed), 1, "a renewal is no take");
+
+        // A take with no holder to wait for leads one renew deadline
+        // later: its step is shown no term.
+        let lease = MemoryLease::new();
+        let mut waiting = candidate(&lease, "b@host:1");
+        let (steps, shown) = stepping(&mut waiting);
+        assert_eq!(waiting.tick(t0).expect("tick"), Tick::Acquired { term: 1 });
+        assert_eq!(steps.load(Ordering::Relaxed), 1);
+        assert!(
+            !shown.load(Ordering::Relaxed),
+            "the lead still waits to open"
+        );
     }
 
     #[test]

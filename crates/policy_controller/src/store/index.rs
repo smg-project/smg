@@ -934,7 +934,7 @@ fn name_of(id: WorkerId) -> String {
 
 /// The model a row is indexed under: its first, when its signals ask for
 /// events.
-pub(super) fn indexed_under(row: &WorkerRow) -> Option<&String> {
+pub(crate) fn indexed_under(row: &WorkerRow) -> Option<&String> {
     let facts = &row.facts;
     facts.models.first().filter(|_| facts.signals.events)
 }
@@ -1227,6 +1227,11 @@ impl KvTables {
         if size > *of_record {
             *of_record = size;
         }
+    }
+
+    /// Drop the size of record so a returning model can set it anew.
+    pub(super) fn forget_block_size(&self, model: &str) {
+        self.table.lock().block_sizes.remove(model);
     }
 
     fn note(&self, reason: ResyncReason) {

@@ -26,7 +26,7 @@
 //! The pre-tokenizer of the GPT-4 family (Qwen 2 and 3, Llama 3, GLM 4.6
 //! and their kin ship one template, the digit rule's bound apart) is matched
 //! by a [`Scanner`] instead of the program, and the cased-letter template
-//! (gpt-oss, Llama 4, MiniMax and their kin) by [`cased::Scanner`]: each
+//! (gpt-oss, Llama 4, MiniMax, Kimi and their kin) by [`cased::Scanner`]: each
 //! alternative is decided at a position by a few class tests and class runs,
 //! which is what the backtracking engine arrives at for that shape, so the
 //! pieces are the same and no character is interpreted op by op. A scanner
@@ -724,28 +724,44 @@ enum Matcher {
     Cased(cased::Scanner),
 }
 
-/// A pattern as the reader of a text by blocks. [`Pattern::by_blocks`] alone
-/// makes one, of a template whose text [`block`]'s pass cuts, so the
-/// encoder's block routine cannot be handed another matcher. It holds the
-/// pattern and nothing else: with the scanner and the classes as fields of
-/// their own the routine's walk kept three values where one address reaches
-/// all, 1 to 3 instructions per token on text beyond ASCII (measured).
+/// A pattern as the reader of a text by blocks. [`Pattern::by_blocks`] and
+/// [`Pattern::by_cased_blocks`] alone make one, of a template whose text
+/// [`block`]'s pass cuts, so the encoder's block routine cannot be handed
+/// another matcher. `CASED` is the template it was made of, the cased-letter
+/// one or the GPT-4 family's: the type says which loops the routine compiles,
+/// and a copy of the routine holds the loops of one template alone. It holds
+/// the pattern and nothing else: with the scanner and the classes as fields
+/// of their own the routine's walk kept three values where one address
+/// reaches all, 1 to 3 instructions per token on text beyond ASCII
+/// (measured).
 #[derive(Clone, Copy)]
-pub(crate) struct ByBlocks<'p>(&'p Pattern);
+pub(crate) struct ByBlocks<'p, const CASED: bool>(&'p Pattern);
 
-impl ByBlocks<'_> {
+impl<const CASED: bool> ByBlocks<'_, CASED> {
     /// [`Pattern::for_each_match`] with the ASCII stretches of `text` cut by
     /// [`block`]'s pass.
     #[inline(always)]
     pub(crate) fn for_each_match<F: FnMut(usize, usize)>(self, text: &str, words: bool, mut f: F) {
-        // No other matcher gets here: the type is made of a template alone.
-        let Matcher::Template(scanner) = &self.0.matcher else {
-            return;
-        };
-        if words {
-            scanner.for_each_match_by_blocks::<true, F>(&self.0.classes, text, &mut f);
+        // No other matcher gets here: the type is made of its template
+        // alone.
+        if CASED {
+            let Matcher::Cased(scanner) = &self.0.matcher else {
+                return;
+            };
+            if words {
+                scanner.for_each_match_by_blocks::<true, F>(&self.0.classes, text, &mut f);
+            } else {
+                scanner.for_each_match_by_blocks::<false, F>(&self.0.classes, text, &mut f);
+            }
         } else {
-            scanner.for_each_match_by_blocks::<false, F>(&self.0.classes, text, &mut f);
+            let Matcher::Template(scanner) = &self.0.matcher else {
+                return;
+            };
+            if words {
+                scanner.for_each_match_by_blocks::<true, F>(&self.0.classes, text, &mut f);
+            } else {
+                scanner.for_each_match_by_blocks::<false, F>(&self.0.classes, text, &mut f);
+            }
         }
     }
 }
@@ -1217,10 +1233,29 @@ impl Pattern {
     /// is no shorter than the pass's bound, and one of the places it is
     /// asked at begins an ASCII stretch (`block::has_stretch`).
     #[inline]
-    pub(crate) fn by_blocks(&self, text: &str) -> Option<ByBlocks<'_>> {
+    pub(crate) fn by_blocks(&self, text: &str) -> Option<ByBlocks<'_, false>> {
         match &self.matcher {
             Matcher::Template(scanner)
                 if scanner.blocks
+                    && text.len() >= block::MIN_BYTES
+                    && block::has_stretch(text.as_bytes()) =>
+            {
+                Some(ByBlocks(self))
+            }
+            _ => None,
+        }
+    }
+
+    /// [`Self::by_blocks`] of the cased-letter template
+    /// (`cased::Scanner::blocks`), by the same two tests of the text. A
+    /// reader of its own type: the encoder asks for it only where a unit
+    /// takes neither the lean scan nor the other template's reader, so a
+    /// unit of that template runs what it ran.
+    #[inline]
+    pub(crate) fn by_cased_blocks(&self, text: &str) -> Option<ByBlocks<'_, true>> {
+        match &self.matcher {
+            Matcher::Cased(scanner)
+                if scanner.blocks()
                     && text.len() >= block::MIN_BYTES
                     && block::has_stretch(text.as_bytes()) =>
             {
@@ -1859,13 +1894,8 @@ impl Scanner {
     }
 
     /// [`Self::for_each_match`] through [`block`]'s pass, for a text
-    /// [`Pattern::by_blocks`] gives a reader of. The pass cuts each ASCII stretch
-    /// of the text. What lies between two stretches and behind the last one
-    /// is matched here piece by piece, from the piece the pass left open:
-    /// text beyond ASCII, a blank run the pass declines, the text's last
-    /// block. Where the pass cut nothing the walk goes twice as far before
-    /// the pass is tried again, up to [`block::MAX_WALK`], so a text with
-    /// no ASCII stretch pays one test of two blocks per walk.
+    /// [`Pattern::by_blocks`] gives a reader of: [`each_match_by_blocks`]
+    /// with this template's pass ([`block::pieces`]) and its `match_at`.
     #[inline(always)]
     fn for_each_match_by_blocks<const WORDS: bool, F: FnMut(usize, usize)>(
         &self,
@@ -1873,38 +1903,22 @@ impl Scanner {
         text: &str,
         f: &mut F,
     ) {
-        let mut pos = 0;
-        let mut walk = 2 * block::BLOCK;
-        while pos < text.len() {
-            let open = block::pieces(
-                text.as_bytes(),
-                pos,
-                self.digit_cap,
-                |at| clitic_match(classes, text, at, &self.clitics),
-                f,
-            );
-            walk = if open > pos {
-                2 * block::BLOCK
-            } else {
-                (2 * walk).min(block::MAX_WALK)
-            };
-            let until = open + walk;
-            pos = open;
-            while pos < text.len() && pos < until {
-                match self.match_at::<WORDS, false>(classes, text, pos) {
-                    Some(end) if end > pos => {
-                        f(pos, end);
-                        pos = end;
-                    }
-                    _ => {
-                        let Some((_, len)) = next_char(text, pos) else {
-                            return;
-                        };
-                        pos += len;
-                    }
-                }
-            }
-        }
+        each_match_by_blocks(
+            text,
+            #[inline(always)]
+            |from, f| {
+                block::pieces(
+                    text.as_bytes(),
+                    from,
+                    self.digit_cap,
+                    |at| clitic_match(classes, text, at, &self.clitics),
+                    f,
+                )
+            },
+            #[inline(always)]
+            |pos| self.match_at::<WORDS, false>(classes, text, pos),
+            f,
+        );
     }
 
     /// The end of the piece that starts at `pos`, if one does: the first of
@@ -2931,6 +2945,51 @@ where
                     return;
                 };
                 pos += len;
+            }
+        }
+    }
+}
+
+/// [`each_match`] through [`block`]'s pass: the one walk behind the
+/// templates' `for_each_match_by_blocks`, compiled into each with its own
+/// `pass` and `match_at`. `pass(pos, f)` cuts the ASCII stretch that begins
+/// at `pos`, a piece's start, and gives the start of the piece it left
+/// open. What lies between two stretches and behind the last one is matched
+/// here piece by piece, from that piece: text beyond ASCII, a blank run the
+/// pass declines, the text's last block. Where the pass cut nothing the
+/// walk goes twice as far before the pass is tried again, up to
+/// [`block::MAX_WALK`], so a text with no ASCII stretch pays one test of
+/// two blocks per walk.
+#[inline(always)]
+pub(super) fn each_match_by_blocks<P, M, F>(text: &str, mut pass: P, mut match_at: M, f: &mut F)
+where
+    P: FnMut(usize, &mut F) -> usize,
+    M: FnMut(usize) -> Option<usize>,
+    F: FnMut(usize, usize),
+{
+    let mut pos = 0;
+    let mut walk = 2 * block::BLOCK;
+    while pos < text.len() {
+        let open = pass(pos, f);
+        walk = if open > pos {
+            2 * block::BLOCK
+        } else {
+            (2 * walk).min(block::MAX_WALK)
+        };
+        let until = open + walk;
+        pos = open;
+        while pos < text.len() && pos < until {
+            match match_at(pos) {
+                Some(end) if end > pos => {
+                    f(pos, end);
+                    pos = end;
+                }
+                _ => {
+                    let Some((_, len)) = next_char(text, pos) else {
+                        return;
+                    };
+                    pos += len;
+                }
             }
         }
     }
@@ -4983,15 +5042,7 @@ mod tests {
         const SWAPPED: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+|\s+(?!\S)";
         const TWO_OR_MORE: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{2,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
         const LEAD_IN_RUN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]*\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
-        for pattern in [
-            DIGITS,
-            CJK,
-            DEEPSEEK,
-            KIMI,
-            SWAPPED,
-            TWO_OR_MORE,
-            LEAD_IN_RUN,
-        ] {
+        for pattern in [DIGITS, CJK, DEEPSEEK, SWAPPED, TWO_OR_MORE, LEAD_IN_RUN] {
             assert!(
                 matches!(
                     Pattern::parse(pattern).expect("parses").matcher,
@@ -5045,9 +5096,10 @@ mod tests {
     /// templates: the template's letter run is the letters, the cased
     /// template's upper and lower runs are the upper-case and the lower-case
     /// letters, and the white-space runs of both are the white space; the
-    /// digit, punctuation and line-break roles run byte by byte. A class
-    /// change that dropped a scan would keep the ids and lose the gain; it
-    /// fails here instead.
+    /// digit, punctuation and line-break roles and the opening run of the
+    /// Kimi template run byte by byte, and that template keeps the scans of
+    /// its letter and white-space runs. A class change that dropped a scan
+    /// would keep the ids and lose the gain; it fails here instead.
     #[test]
     fn the_run_sites_name_the_scans_their_roles_carry() {
         for pattern in [CL100K, QWEN2, QWEN35, TWO_DIGITS, ANY_DIGITS] {
@@ -5076,7 +5128,7 @@ mod tests {
                 );
             }
         }
-        for pattern in [CASED, TEKKEN, CASED_ONE_DIGIT] {
+        for pattern in [CASED, TEKKEN, CASED_ONE_DIGIT, KIMI] {
             let parsed = Pattern::parse(pattern).expect("parses");
             let Matcher::Cased(scanner) = &parsed.matcher else {
                 panic!("the cased template takes its scanner: {pattern}");
@@ -5108,6 +5160,7 @@ mod tests {
                 cased::Role::Punct,
                 cased::Role::PunctBreak,
                 cased::Role::Break,
+                cased::Role::Run,
             ] {
                 assert_eq!(
                     roles.scan_of(role.bit()),
@@ -5118,15 +5171,19 @@ mod tests {
         }
     }
 
-    /// The cased-letter template with the clitic group, without it and with
-    /// one digit at a time, and no other shape: the group in one letter
-    /// alternative only, the letter alternatives the other way round, a
-    /// required lead-in, a non-optional group.
+    /// The cased-letter template with the clitic group, without it, with
+    /// one digit at a time and behind the Kimi template's run of
+    /// ideographs, and no other shape: the group in one letter alternative
+    /// only, the letter alternatives the other way round, a required
+    /// lead-in, a non-optional group.
     #[test]
     fn the_cased_template_takes_its_scanner_and_no_other_shape_does() {
-        for (pattern, digit_cap, clitics) in
-            [(CASED, 3, 7), (TEKKEN, 1, 0), (CASED_ONE_DIGIT, 1, 7)]
-        {
+        for (pattern, digit_cap, clitics) in [
+            (CASED, 3, 7),
+            (TEKKEN, 1, 0),
+            (CASED_ONE_DIGIT, 1, 7),
+            (KIMI, 3, 7),
+        ] {
             let parsed = Pattern::parse(pattern).expect("parses");
             let Matcher::Cased(scanner) = &parsed.matcher else {
                 panic!("the cased template takes its scanner: {pattern}");
@@ -5144,7 +5201,6 @@ mod tests {
             LEAD_IN_REQUIRED,
             GROUP_REQUIRED,
             CL100K,
-            KIMI,
             NUMBER_GROUPS,
         ] {
             assert!(
@@ -5155,6 +5211,298 @@ mod tests {
                 "{pattern}"
             );
         }
+    }
+
+    /// The run a cased template may open with. A template whose first
+    /// alternative is a run of a class no letter body begins with takes the
+    /// scanner: the Kimi template, and the template behind a run of symbols
+    /// (lead-ins and punctuation as well) or of numbers (digits as well).
+    /// Its role table holds the run's role and no lead-in for a character
+    /// of it; the tables of a template without the run hold no character of
+    /// the role. A run that shares a character with the letter classes a
+    /// body begins with (ideographs left in them, capitals, small letters),
+    /// a run that is not the first alternative, a second run, and a first
+    /// alternative that is possessive, bounded or one character keep the
+    /// program.
+    #[test]
+    fn the_cased_template_takes_an_opening_run_no_letter_body_begins_with() {
+        let run = cased::Role::Run.bit();
+        let leads = cased::Role::Lead1.bit() | cased::Role::Lead2.bit();
+        let roles_of = |pattern: &str| {
+            let parsed = Pattern::parse(pattern).expect("parses");
+            let Matcher::Cased(scanner) = &parsed.matcher else {
+                panic!("the cased template takes its scanner: {pattern}");
+            };
+            scanner.roles().clone()
+        };
+        let symbols = format!(r"\p{{S}}+|{CASED}");
+        let numbers = format!(r"\p{{N}}+|{TEKKEN}");
+        for pattern in [KIMI, symbols.as_str(), numbers.as_str()] {
+            let roles = roles_of(pattern);
+            assert!(roles.some_char_holds_both(run, run), "{pattern}");
+            assert!(!roles.some_char_holds_both(run, leads), "{pattern}");
+        }
+        // A radical is a lead-in and punctuation, a Han numeral a digit, a
+        // symbol a lead-in: the classes the three runs overlap.
+        let kimi = roles_of(KIMI);
+        assert!(kimi.some_char_holds_both(run, cased::Role::Punct.bit()));
+        assert!(kimi.some_char_holds_both(run, cased::Role::Digit.bit()));
+        assert!(kimi.some_char_holds_both(leads, cased::Role::Punct.bit()));
+        for pattern in [CASED, TEKKEN, CASED_ONE_DIGIT] {
+            assert!(
+                !roles_of(pattern).some_char_holds_both(run, run),
+                "{pattern}"
+            );
+        }
+        let (opening, seven) = KIMI.split_once('|').expect("the opening run");
+        assert_eq!(opening, r"[\p{Han}]+");
+        for pattern in [
+            format!(r"[\p{{Han}}]+|{CASED}"),
+            format!(r"\p{{Lu}}+|{CASED}"),
+            format!(r"\p{{Ll}}+|{CASED}"),
+            format!("{seven}|{opening}"),
+            format!(r"\p{{S}}+|{KIMI}"),
+            format!(r"[\p{{Han}}]++|{seven}"),
+            format!(r"[\p{{Han}}]{{1,8}}|{seven}"),
+            format!(r"[\p{{Han}}]|{seven}"),
+        ] {
+            assert!(
+                matches!(
+                    Pattern::parse(&pattern).expect("parses").matcher,
+                    Matcher::Program
+                ),
+                "{pattern}"
+            );
+        }
+    }
+
+    /// The block pass cuts the text of the cased-letter templates as their
+    /// scanner cuts it piece by piece: the shaped text and the runs of the
+    /// test below, with capitals behind small letters, clitics in every
+    /// case behind a letter and behind one another, and the slash behind
+    /// punctuation and line breaks (the Kimi template leaves it out of that
+    /// run). From any piece's start the pass cuts the scanner's pieces. A
+    /// template gives the reader of its own kind alone, for a text of the
+    /// bound with an ASCII stretch, and a cased template the pass does not
+    /// cut as the scanner does gives none.
+    #[test]
+    fn the_block_pass_cuts_cased_text_as_the_scanner_does() {
+        const PARTS: &[&str] = &[
+            " ",
+            "  ",
+            "   ",
+            "    ",
+            "\n",
+            "\n\n",
+            "\r\n",
+            "\t",
+            "\t\t",
+            "\x0B",
+            "\x0C",
+            "\"",
+            "'",
+            "'s",
+            "'S",
+            "'ll",
+            "'LL",
+            "'lL",
+            "'ve",
+            "'vE",
+            "'Re",
+            "'re",
+            "'d",
+            "'m",
+            "'t",
+            "'x",
+            "'r",
+            "'l",
+            "'v",
+            "'rex",
+            "'sox",
+            ":",
+            ",",
+            ".",
+            "{",
+            "}",
+            "[",
+            "]",
+            "(",
+            ")",
+            "-",
+            "_",
+            "!",
+            "?",
+            "a",
+            "Word",
+            "word",
+            "camelCase",
+            "HTTPServer",
+            "aB",
+            "Ab",
+            "ABc",
+            "abC",
+            "X",
+            "1",
+            "22",
+            "333",
+            "4444",
+            "55555",
+            "7777777",
+            "x",
+            "ABC",
+            "/",
+            "//",
+            ".../",
+            "\n/",
+            "/\n",
+            "/\n/",
+            "\n//\n",
+            "!\n/",
+            "!\n/?",
+            "?\r\n/\n",
+            "/a",
+            "a/",
+            "/A",
+            "I'M",
+            "WE'LL",
+            "don't",
+            "don't's",
+            "it'S",
+            "we'vE",
+            "'s'd",
+            "s's",
+            "s'",
+            " \n",
+            "  \n  ",
+            ".\n",
+            ".\n\n  ",
+            ",\n    \"k\": ",
+            "\n    ",
+            "\x01",
+            "\x7F",
+            " .",
+            " 's",
+            "\t.",
+            "\t's",
+            " a",
+            " A",
+            "\ta",
+            "\n a",
+            ". a",
+            ".a",
+            ".A",
+            "..a",
+            " 1",
+            "1a",
+            "a1",
+            "A1",
+            " /",
+            " /\n/",
+            "\n/\n",
+        ];
+        const RUNS: &[u8] = b"aZ7 \t\n\r.'\"\x0B\x0CstlrevmdSTLREVMD\x01\x7F,/";
+        const BEYOND: &[&str] = &[
+            "\u{e9}",
+            "\u{4e2d}",
+            "\u{A0}",
+            "\u{1F600}",
+            "\u{2028}",
+            "\u{17F}",
+            "\u{c9}",
+        ];
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut begun_inside = 0;
+        let mut cut_by_the_pass = 0;
+        for pattern in [CASED, TEKKEN, CASED_ONE_DIGIT, KIMI] {
+            let parsed = Pattern::parse(pattern).expect("parses");
+            let Matcher::Cased(scanner) = &parsed.matcher else {
+                panic!("the cased scanner: {pattern}");
+            };
+            assert!(scanner.blocks(), "{pattern}");
+            for round in 0..2000 {
+                let (shaped, ascii) = (round % 2 == 0, round % 3 != 0);
+                let mut text = String::new();
+                let len = block::MIN_BYTES + (pseudo_random(&mut state) % 1500) as usize;
+                while text.len() < len {
+                    let pick = pseudo_random(&mut state);
+                    if !ascii && pick.is_multiple_of(400) && text.len() >= 2 * block::BLOCK {
+                        text.push_str(BEYOND[(pick >> 8) as usize % BEYOND.len()]);
+                    } else if shaped {
+                        text.push_str(PARTS[(pick >> 8) as usize % PARTS.len()]);
+                    } else {
+                        let c = RUNS[(pick >> 8) as usize % RUNS.len()];
+                        let run = match pseudo_random(&mut state) % 32 {
+                            0..=19 => 1,
+                            20..=25 => 2,
+                            26..=29 => 3 + pseudo_random(&mut state) % 6,
+                            30 => 20 + pseudo_random(&mut state) % 50,
+                            _ => 60 + pseudo_random(&mut state) % 90,
+                        };
+                        text.extend(std::iter::repeat_n(char::from(c), run as usize));
+                    }
+                }
+                let by_scanner: Vec<(usize, usize)> = parsed.find_iter(&text).collect();
+                let mut by_blocks = Vec::new();
+                let reader = parsed.by_cased_blocks(&text).expect("a reader by blocks");
+                let words = round % 4 == 1;
+                reader.for_each_match(&text, words, |s, e| by_blocks.push((s, e)));
+                assert_eq!(by_blocks, by_scanner, "pattern {pattern:?} text {text:?}");
+                let inside = pseudo_random(&mut state) % by_scanner.len() as u64;
+                for first in [0, inside as usize] {
+                    let from = by_scanner[first].0;
+                    let mut cut = Vec::new();
+                    let open =
+                        scanner.block_pass(&parsed.classes, &text, from, &mut |start, end| {
+                            cut.push((start, end));
+                        });
+                    assert_eq!(
+                        (cut.as_slice(), open),
+                        (
+                            &by_scanner[first..first + cut.len()],
+                            by_scanner[first + cut.len()].0
+                        ),
+                        "from {from}: pattern {pattern:?} text {text:?}"
+                    );
+                    begun_inside += usize::from(first > 0 && !cut.is_empty());
+                    cut_by_the_pass += cut.len();
+                }
+            }
+        }
+        // Each template gives the reader of its own kind, for a text of
+        // the bound with an ASCII stretch at a place it is asked at.
+        let text = "Word ".repeat(block::MIN_BYTES);
+        let cased = Pattern::parse(CASED).expect("parses");
+        let template = Pattern::parse(CL100K).expect("parses");
+        assert!(cased.by_cased_blocks(&text).is_some());
+        assert!(cased.by_blocks(&text).is_none());
+        assert!(template.by_cased_blocks(&text).is_none());
+        assert!(cased
+            .by_cased_blocks(&text[..block::MIN_BYTES - 1])
+            .is_none());
+        let cyrillic = "слово ".repeat(block::MIN_BYTES);
+        assert!(cased.by_cased_blocks(&cyrillic).is_none());
+        // A cased template the pass does not cut as the scanner does keeps
+        // the scanner: a digit rule whose bound is no shift of a block, and
+        // two letter alternatives with two clitic groups.
+        for other in [
+            CASED.replace(r"\p{N}{1,3}", r"\p{N}{1,64}"),
+            CASED.replacen("(?i:'s|'t|'re|'ve|'m|'ll|'d)?", "(?i:'s|'t)?", 1),
+        ] {
+            let parsed = Pattern::parse(&other).expect("parses");
+            let Matcher::Cased(scanner) = &parsed.matcher else {
+                panic!("the cased scanner: {other}");
+            };
+            assert!(!scanner.blocks(), "{other}");
+            assert!(parsed.by_cased_blocks(&text).is_none(), "{other}");
+        }
+        assert!(
+            begun_inside > 1000,
+            "the pass begins inside a text: {begun_inside}"
+        );
+        assert!(
+            cut_by_the_pass > 1_000_000,
+            "the pass cuts the pieces: {cut_by_the_pass}"
+        );
     }
 
     /// The block pass cuts text as the scanner cuts it piece by piece (the
@@ -5457,6 +5805,92 @@ mod tests {
                     oracle_matches(pattern, &text),
                     "the engine; pattern {pattern:?} text {text:?}"
                 );
+            }
+        }
+    }
+
+    /// A template that opens with a run is cut by the scanner as by its
+    /// program and by the engine: the Kimi template, and the cased template
+    /// behind a run of symbols and behind a run of numbers. The text is
+    /// built of every class the Kimi template tells apart: ideographs of
+    /// the plane, of its extension and compatibility blocks and above it;
+    /// the Han characters that are no letters (iteration marks, numerals,
+    /// radicals), which are a run of their own where a piece starts and a
+    /// letter, a digit or punctuation inside one that began before them;
+    /// kana, Hangul and CJK punctuation, which are not Han; letter runs of
+    /// every case structure, in several scripts, with marks, some longer
+    /// than a word of the word scans; digits of several kinds; white space
+    /// and line ends; punctuation; the clitics in both cases and near
+    /// misses of them; and those classes side by side. Each text is read
+    /// through the iterator and through the loop with and without the word
+    /// scans, and one text in sixteen again cut at every character, from
+    /// the start and to the end.
+    #[test]
+    fn a_template_that_opens_with_a_run_cuts_as_the_program_and_the_engine_do() {
+        const PARTS: &[&str] = &[
+            "中", "中文", "汉字", "漢字", "㐀", "豈", "𠀀", "𮯰", "々", "〻", "〇", "〡", "〸",
+            "⺀", "⿕", "あ", "ア", "ー", "한", "。", "、", "〆", "a", "word", "Word", "WORD",
+            "wORD", "iPhone", "McDonald", "é", "É", "ß", "ſ", "ǅx", "xǅ", "ʰa", "Aʰ", "я", "Я",
+            "α", "Ω", "ก", "क", "ा", "\u{301}", "\u{93E}", "1", "22", "333", "4444", "٣", "²", "Ⅷ",
+            " ", "  ", "\t", "\n", "\n\n", "\r\n", "\u{A0}", "\u{2028}", "\u{3000}", ".", ",", "!",
+            "?", "-", "_", "(", ")", "[", "]", "{", "}", "\"", "/", "...", "，", "😀", "\u{200D}",
+            "\u{FE0F}", "\u{FFFD}", "'", "'s", "'S", "'t", "'re", "'RE", "'ve", "'m", "'ll", "'LL",
+            "'d", "'x", "'ſ", "’s", "中A", "A中", "a中b", "中1", "1〇", "〇1", "!⺀", "⺀!", "⺀a",
+            " 中", "中 ", "中's", "中\n", "\n中",
+        ];
+        // Runs longer than a word of the word scans.
+        const LONG: &[&str] = &[
+            "abcdefghijklmnopqrstuvwxyz",
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+            "HTTPServer",
+            "          ",
+        ];
+        let parts: Vec<&str> = PARTS.iter().chain(LONG).copied().collect();
+        let symbols = format!(r"\p{{S}}+|{CASED}");
+        let numbers = format!(r"\p{{N}}+|{TEKKEN}");
+        let mut state = 0xD1B5_4A32_D192_ED03u64;
+        for pattern in [KIMI, symbols.as_str(), numbers.as_str()] {
+            let parsed = Pattern::parse(pattern).expect("parses");
+            assert!(matches!(parsed.matcher, Matcher::Cased(_)), "{pattern}");
+            let program = parsed.program_only();
+            let engine = SysRegex::new(pattern).expect("the engine compiles the pattern");
+            for round in 0..3000 {
+                let text: String = (0..1 + round % 40)
+                    .map(|_| parts[(pseudo_random(&mut state) % parts.len() as u64) as usize])
+                    .collect();
+                let expected: Vec<(usize, usize)> = engine.find_iter(&text).collect();
+                assert_eq!(
+                    program.find_iter(&text).collect::<Vec<_>>(),
+                    expected,
+                    "the program; pattern {pattern:?} text {text:?}"
+                );
+                assert_eq!(
+                    parsed.find_iter(&text).collect::<Vec<_>>(),
+                    expected,
+                    "the scanner; pattern {pattern:?} text {text:?}"
+                );
+                for words in [false, true] {
+                    let mut ours = Vec::new();
+                    parsed.for_each_match::<false, _>(&text, words, |start, end| {
+                        ours.push((start, end));
+                    });
+                    assert_eq!(
+                        ours, expected,
+                        "the loop, word scans {words}; pattern {pattern:?} text {text:?}"
+                    );
+                }
+                if round % 16 != 0 {
+                    continue;
+                }
+                for (cut, _) in text.char_indices() {
+                    for part in [&text[..cut], &text[cut..]] {
+                        assert_eq!(
+                            parsed.find_iter(part).collect::<Vec<_>>(),
+                            engine.find_iter(part).collect::<Vec<_>>(),
+                            "a cut text; pattern {pattern:?} text {part:?}"
+                        );
+                    }
+                }
             }
         }
     }

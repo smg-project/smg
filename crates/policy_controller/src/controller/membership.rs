@@ -1,8 +1,7 @@
-//! The membership door (design 5.1 and 5.2): the control scope's three
-//! registration calls over the store's membership writes. A call writes the
-//! row its caller stated or refuses it whole by the field's name, and
-//! answers the event that write caused: it drops nothing, discovers nothing
-//! and gives no verdict it did not witness.
+//! The membership door (design 5.1 and 5.2) for control calls and provider
+//! writes. Control calls answer with a wire event at the log's place or
+//! with a refusal. A provider writes through the same turn and gets the
+//! outcome in the store's terms.
 //!
 //! A registered row is pending. One whose checks are off gets the store's
 //! connect signal at once, as a worker with its health checks off starts
@@ -28,6 +27,24 @@
 //! behind another writes under the term of its own minute, or is refused as
 //! a follower's is, and never under a term read before the wait.
 //!
+//! **A row has one maker** ([`Maker`]): the caller whose registration put
+//! it there, a control call or a provider that finds workers by itself. The
+//! door writes it at a registration and keeps it while the URL's
+//! registration stands. An upsert or a replacement over a standing row, a
+//! patch, a drain and a removal are refused where their caller is not the
+//! row's maker, whole: a control call changes nothing of a provider's row,
+//! a provider nothing of a control call's or of another's. The refusal
+//! names the maker and never the URL, and it comes ahead of the revision's
+//! test. An add changes no standing row: it is refused as already there,
+//! whoever made the row. The control scope's three calls are a control
+//! call's; a provider's step writes through the same turn.
+//!
+//! **A provider takes a worker away by its URL.** It holds the URL and no id
+//! or revision of an earlier answer. The door reads the standing row in its
+//! turn, tests the maker whole and removes the row. Only the row of exactly
+//! that maker goes: a late or a repeated removal never takes a later worker
+//! at the URL that another key made. A key names one life of a worker.
+//!
 //! **Every life of a URL has a number of its own:** the leader's term above the
 //! store's epoch when the door numbered it, counted from a base the door
 //! draws once a run. The store's id is a function of the URL and that
@@ -37,10 +54,10 @@
 //! that holds by the draw, not by construction: two runs' counts meet with
 //! odds near a run's writes over 2^38.
 
-use std::{collections::hash_map::RandomState, hash::BuildHasher, sync::Arc};
+use std::sync::Arc;
 
 use parking_lot::Mutex;
-use tonic::Status;
+use tonic::{Code, Status};
 use tracing::info;
 
 use super::{
@@ -50,8 +67,17 @@ use super::{
 use crate::{
     proto::{self, register_worker_request::Mode, worker_event::Event},
     replication::Log,
-    store::{HealthSink, Kinds, MemoryStore, Position, WorkerRow, WorkerStatus, WorkersStore},
+    store::{
+        membership::{self, life},
+        HealthSink, Kinds, Laid, Maker, MemoryStore, Position, WorkerRow, WorkerStatus,
+        WorkersStore,
+    },
     view::WorkerId,
+};
+#[cfg(feature = "worker-host")]
+use crate::{
+    store::{membership::Past, WorkerFacts},
+    worker_host::{drain, lay, take, Membership, Refused as HostRefused, Turn, Wrote},
 };
 
 /// A registration's refusal where the store's log does not lead the term the
@@ -74,15 +100,27 @@ fn invalid(refused: Refused) -> Status {
     Status::invalid_argument(format!("{}: {}", refused.path, refused.why))
 }
 
+const ABSENT: &str = "no worker is registered under the URL";
+const MOVED: &str = "the row moved under the call";
+
 /// A `REPLACE` of a URL no row stands under.
 fn absent() -> Status {
-    Status::not_found("no worker is registered under the URL")
+    Status::not_found(ABSENT)
 }
 
 /// A row that left or moved between a call's read and its write: no call of
 /// the door does that to another, so a second writer did.
 fn moved() -> Status {
-    Status::aborted("the row moved under the call")
+    Status::aborted(MOVED)
+}
+
+/// A write of a row by a caller that did not make it. The words name the
+/// row's maker by its provider, never by its key, and never the URL. A
+/// caller of that provider under another key is told so: where a new worker
+/// took an address, its provider takes the old one away by the old key.
+fn made_by(row: &WorkerRow, caller: &Maker) -> Result<(), Status> {
+    row.made_by(caller)
+        .map_err(|not| Status::permission_denied(not.to_string()))
 }
 
 /// The contract's names of the door's three calls, as an audit line says
@@ -91,43 +129,11 @@ const REGISTER: &str = "RegisterWorker";
 const PATCH: &str = "PatchWorker";
 const DEREGISTER: &str = "DeregisterWorker";
 
-/// The low bits of a life's number hold the store's epoch, counted from the
-/// door's base; the leader's term stands above them.
-const EPOCH_BITS: u32 = 40;
-
-/// The bound of a base and of an epoch, each: their sum and one stay inside
-/// the low bits.
-const HALF: u64 = 1 << (EPOCH_BITS - 1);
-
-/// The number of the life a registration makes under `term` in a store that
-/// stands at `epoch`, at a door whose count starts at `base`.
-///
-/// Every life the store held was numbered at an earlier epoch of this term
-/// or under an earlier term, and a registration moves the epoch, so no two
-/// lives share a number, the later of two lives of one run under one term
-/// has the higher one, and the id of a URL's next life is one no life of it
-/// had. Another run under the same term counts from another base. A term
-/// past 2^24, or a base or an epoch past 2^39, would carry into the other's
-/// bits, and a number that wraps repeats: a debug build asserts the three
-/// bounds (a term a second for half a year, a thousand writes a second for
-/// seventeen years).
-fn life(term: u64, base: u64, epoch: u64) -> u64 {
-    debug_assert!(
-        term >> (u64::BITS - EPOCH_BITS) == 0,
-        "a term past its 24 bits: {term}"
-    );
-    debug_assert!(base < HALF, "a base past its 39 bits: {base}");
-    debug_assert!(epoch < HALF, "an epoch past its 39 bits: {epoch}");
-    (term << EPOCH_BITS) | (base.wrapping_add(epoch).wrapping_add(1) & ((1 << EPOCH_BITS) - 1))
-}
-
 impl Door {
-    /// The door over `store` and the log it journals to, its count starting
-    /// at a draw of this run: 39 bits of a hash under the keys the standard
-    /// library draws for a process's maps, so the crate gains no generator
-    /// for one number.
+    /// The door over `store` and the log it journals to. The count of lives
+    /// starts at a draw for this run.
     pub(crate) fn new(store: Arc<MemoryStore>, log: Arc<Log>) -> Self {
-        Self::based(store, log, RandomState::new().hash_one(0u8) % HALF)
+        Self::based(store, log, membership::base())
     }
 
     /// The door over `store` and its log, its count starting at `base`,
@@ -180,13 +186,7 @@ impl Door {
         let answer = leading().and_then(write);
         drop(turn);
         if let Err(refusal) = &answer {
-            info!(
-                call,
-                by = %by.subject,
-                code = ?refusal.code(),
-                why = refusal.message(),
-                "membership call refused"
-            );
+            audit_refusal(call, by, refusal.code(), refusal.message());
         }
         answer
     }
@@ -208,13 +208,16 @@ impl Door {
         leading: impl FnOnce() -> Result<u64, Status>,
         request: &proto::RegisterWorkerRequest,
     ) -> Result<proto::WorkerEvent, Status> {
-        self.call(REGISTER, by, leading, |term| self.upsert(by, term, request))
+        self.call(REGISTER, by, leading, |term| {
+            self.upsert(by, &Maker::Control, term, request)
+        })
     }
 
-    /// The write of [`Self::register`], in the door's turn.
+    /// The write of [`Self::register`], in the door's turn, from `maker`.
     fn upsert(
         &self,
         by: &Principal,
+        maker: &Maker,
         admitted: u64,
         request: &proto::RegisterWorkerRequest,
     ) -> Result<proto::WorkerEvent, Status> {
@@ -254,6 +257,8 @@ impl Door {
             }));
         }
         let old = match (mode, standing) {
+            // An add changes no standing row, so it asks no maker: its
+            // refusal is the same whoever made the row.
             (Mode::Add, Some(row)) => {
                 return Err(Status::already_exists(format!(
                     "the URL is registered as worker {:016x} at revision {}",
@@ -266,26 +271,31 @@ impl Door {
                 None
             }
             (mode, Some(row)) => {
-                if mode == Mode::Upsert && facts == row.facts {
-                    let epoch = self.store.epoch();
-                    let at = self.place();
-                    let unmoved = worker_wire::relabelled(&row);
-                    return Ok(told(REGISTER, by, unmoved, false, epoch, at));
-                }
-                // The store carries a status across incarnations only where
-                // these three stand: a change of one is a new worker under
-                // the URL. The models stand as a set: a reorder alone is
-                // made in place.
-                let another = facts.role != row.facts.role
-                    || facts.wire_modes != row.facts.wire_modes
-                    || !facts.same_models(&row.facts);
-                if mode == Mode::Replace || another {
-                    facts.incarnation = self.next_life(admitted)?;
+                // Ahead of the test of equal facts: a caller that did not
+                // make the row is told so, and never that it stands unmoved.
+                made_by(&row, maker)?;
+                let laid = if mode == Mode::Replace {
+                    Laid::Another
+                } else {
+                    facts.laid_over(&row.facts)
+                };
+                match laid {
+                    Laid::Unmoved => {
+                        let epoch = self.store.epoch();
+                        let at = self.place();
+                        let unmoved = worker_wire::relabelled(&row);
+                        return Ok(told(REGISTER, by, unmoved, false, epoch, at));
+                    }
+                    Laid::InPlace => {}
+                    Laid::Another => facts.incarnation = self.next_life(admitted)?,
                 }
                 Some(row)
             }
         };
-        let id = self.store.upsert(facts).id();
+        // The row's bound holds with its maker: the facts' own was told
+        // where they were read.
+        worker_wire::room(&facts, &facts.labels, maker, "spec").map_err(invalid)?;
+        let id = self.store.upsert_by(facts, maker.clone()).id();
         // The row, the epoch and the place as the registration's write left
         // them: the answer of a call that does not wait.
         let (mut now, mut epoch, mut at) = (self.read(id)?, self.store.epoch(), self.place());
@@ -315,19 +325,26 @@ impl Door {
         leading: impl FnOnce() -> Result<u64, Status>,
         request: &proto::PatchWorkerRequest,
     ) -> Result<proto::WorkerEvent, Status> {
-        self.call(PATCH, by, leading, |_| self.relabel(by, request))
+        self.call(PATCH, by, leading, |_| {
+            self.relabel(by, &Maker::Control, request)
+        })
     }
 
-    /// The write of [`Self::patch`], in the door's turn.
+    /// The write of [`Self::patch`], in the door's turn, from `maker`.
     fn relabel(
         &self,
         by: &Principal,
+        maker: &Maker,
         request: &proto::PatchWorkerRequest,
     ) -> Result<proto::WorkerEvent, Status> {
-        let standing = self.guarded(request.worker_id, request.revision)?;
+        let standing = self.guarded(maker, request.worker_id, request.revision)?;
         let (now, wrote) = match worker_wire::patch(request, &standing.facts).map_err(invalid)? {
             None => (standing, false),
             Some(patch) => {
+                if let Some(labels) = &patch.labels {
+                    worker_wire::room(&standing.facts, labels, &standing.maker, "labels")
+                        .map_err(invalid)?;
+                }
                 self.store
                     .patch(standing.id, patch, standing.revision)
                     .ok_or_else(moved)?;
@@ -356,16 +373,20 @@ impl Door {
         leading: impl FnOnce() -> Result<u64, Status>,
         request: &proto::DeregisterWorkerRequest,
     ) -> Result<proto::WorkerEvent, Status> {
-        self.call(DEREGISTER, by, leading, |_| self.remove(by, request))
+        self.call(DEREGISTER, by, leading, |_| {
+            self.remove(by, &Maker::Control, request)
+        })
     }
 
-    /// The write of [`Self::deregister`], in the door's turn.
+    /// The write of [`Self::deregister`], in the door's turn, from `maker`.
+    /// A drain is no exception: it is a write of the row.
     fn remove(
         &self,
         by: &Principal,
+        maker: &Maker,
         request: &proto::DeregisterWorkerRequest,
     ) -> Result<proto::WorkerEvent, Status> {
-        let standing = self.guarded(request.worker_id, request.revision)?;
+        let standing = self.guarded(maker, request.worker_id, request.revision)?;
         let (event, wrote) = if !request.drain {
             self.store
                 .remove(standing.id, standing.revision)
@@ -385,12 +406,15 @@ impl Door {
         Ok(told(DEREGISTER, by, event, wrote, epoch, self.place()))
     }
 
-    /// The row under `id` when `revision` is the one it stands at.
-    fn guarded(&self, id: u64, revision: u64) -> Result<WorkerRow, Status> {
+    /// The row under `id` when `maker` made it and `revision` is the one it
+    /// stands at. The maker is tested first: a caller that did not make the
+    /// row is told so whatever revision it read.
+    fn guarded(&self, maker: &Maker, id: u64, revision: u64) -> Result<WorkerRow, Status> {
         let row = self
             .store
             .get(WorkerId(id))
             .ok_or_else(|| Status::not_found("no worker has the id"))?;
+        made_by(&row, maker)?;
         if row.revision == revision {
             Ok(row)
         } else {
@@ -403,6 +427,161 @@ impl Door {
 
     fn read(&self, id: WorkerId) -> Result<WorkerRow, Status> {
         self.store.get(id).ok_or_else(moved)
+    }
+}
+
+/// The provider's door on a replica, sharing the turn of its control calls.
+#[cfg(feature = "worker-host")]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the host owns the provider's door")
+)]
+pub(crate) struct Hosted {
+    door: Arc<Door>,
+    by: Principal,
+    leading: Box<dyn Fn() -> Result<u64, Status> + Send + Sync>,
+}
+
+#[cfg(feature = "worker-host")]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the host supplies the principal and fence")
+)]
+impl Hosted {
+    /// Open a provider's door with the principal its calls name and the
+    /// replica's read of the leading term.
+    pub(crate) fn new(
+        door: Arc<Door>,
+        by: Principal,
+        leading: impl Fn() -> Result<u64, Status> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            door,
+            by,
+            leading: Box::new(leading),
+        }
+    }
+
+    fn call(
+        &self,
+        call: &'static str,
+        write: impl FnOnce(u64) -> Result<Wrote, HostRefused>,
+    ) -> Result<Wrote, HostRefused> {
+        let turn = self.door.turn.lock();
+        let term = match (self.leading)() {
+            Ok(term) => term,
+            Err(status) => {
+                drop(turn);
+                audit_refusal(call, &self.by, status.code(), status.message());
+                return Err(HostRefused::NotLeading(status.message().to_owned()));
+            }
+        };
+        match write(term) {
+            Ok(wrote) => {
+                let (made, worker) = match wrote {
+                    Wrote::Registered(id) => ("registered", id),
+                    Wrote::InPlace(id) => ("relabelled", id),
+                    Wrote::Another { new, .. } => ("replaced", new),
+                    Wrote::Unmoved(id) => ("nothing", id),
+                    Wrote::Draining(id) => ("status", id),
+                    Wrote::Removed(id) => ("removed", id),
+                };
+                audit_write(
+                    call,
+                    &self.by,
+                    worker.0,
+                    made,
+                    self.door.store.epoch(),
+                    self.door.place(),
+                );
+                Ok(wrote)
+            }
+            Err(refusal) => {
+                drop(turn);
+                let detail;
+                let (code, why) = match &refusal {
+                    HostRefused::NotMaker(why) => (Code::PermissionDenied, why.as_str()),
+                    HostRefused::Past(past) => {
+                        detail = format!("{}: {}", past.fact, past.why);
+                        (Code::InvalidArgument, detail.as_str())
+                    }
+                    HostRefused::Absent => (Code::NotFound, ABSENT),
+                    HostRefused::NotLeading(why) => (Code::Unavailable, why.as_str()),
+                    HostRefused::Moved => (Code::Aborted, MOVED),
+                };
+                audit_refusal(call, &self.by, code, why);
+                Err(refusal)
+            }
+        }
+    }
+}
+
+#[cfg(feature = "worker-host")]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the host reads the term for each registration")
+)]
+struct HostedTurn<'a> {
+    door: &'a Door,
+    term: u64,
+}
+
+#[cfg(feature = "worker-host")]
+impl Turn for HostedTurn<'_> {
+    fn store(&self) -> &MemoryStore {
+        &self.door.store
+    }
+
+    fn life(&self) -> Result<u64, HostRefused> {
+        self.door
+            .next_life(self.term)
+            .map_err(|status| HostRefused::NotLeading(status.message().to_owned()))
+    }
+
+    fn room(&self, facts: &WorkerFacts, maker: &Maker) -> Result<(), HostRefused> {
+        worker_wire::wire_reach(facts.wire_modes, facts.reachable_from, "row.wire")
+            .and_then(|()| worker_wire::carried(facts))
+            .and_then(|()| worker_wire::room(facts, &facts.labels, maker, "row"))
+            .map_err(|refusal| {
+                HostRefused::Past(Past {
+                    fact: refusal.path,
+                    why: refusal.why,
+                })
+            })
+    }
+}
+
+#[cfg(feature = "worker-host")]
+impl Membership for Hosted {
+    fn found(
+        &self,
+        maker: &Maker,
+        url: &str,
+        state: &dyn Fn(Option<&WorkerFacts>) -> WorkerFacts,
+    ) -> Result<Wrote, HostRefused> {
+        self.call("a provider's registration", |term| {
+            lay(
+                &HostedTurn {
+                    door: &self.door,
+                    term,
+                },
+                maker,
+                url,
+                state,
+            )
+        })
+    }
+
+    fn drained(&self, maker: &Maker, url: &str) -> Result<Wrote, HostRefused> {
+        self.call("a provider's drain", |_| {
+            drain(&self.door.store, maker, url)
+        })
+    }
+
+    fn gone(&self, maker: &Maker, url: &str) -> Result<Wrote, HostRefused> {
+        self.call("a provider's removal", |_| {
+            take(&self.door.store, maker, url)
+        })
     }
 }
 
@@ -427,6 +606,18 @@ fn told(
         Event::Snapshot(_) | Event::Needs(_) | Event::SnapshotRequired(_) => ("", 0),
     };
     let made = if wrote { made } else { "nothing" };
+    audit_write(call, by, worker, made, membership_epoch, at);
+    worker_wire::event(event, at.seq, membership_epoch, at.term)
+}
+
+fn audit_write(
+    call: &'static str,
+    by: &Principal,
+    worker: u64,
+    made: &str,
+    membership_epoch: u64,
+    at: Position,
+) {
     info!(
         call,
         by = %by.subject,
@@ -437,13 +628,15 @@ fn told(
         term = at.term,
         "membership write"
     );
-    worker_wire::event(event, at.seq, membership_epoch, at.term)
+}
+
+fn audit_refusal(call: &'static str, by: &Principal, code: Code, why: &str) {
+    info!(call, by = %by.subject, ?code, why, "membership call refused");
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use std::{
-        io,
         sync::{
             atomic::{AtomicBool, Ordering},
             Arc, Barrier,
@@ -451,9 +644,10 @@ pub(crate) mod tests {
         thread,
     };
 
-    use parking_lot::Mutex;
     use tonic::{Code, Status};
 
+    #[cfg(feature = "worker-host")]
+    use super::Hosted;
     use super::{Door, Position};
     use crate::{
         controller::{
@@ -462,8 +656,14 @@ pub(crate) mod tests {
             replication::{journaled, journaled_from},
         },
         proto::{self, register_worker_request::Mode, worker_event::Event},
-        store::{self, identity, MemoryStore, WorkerStatus, WorkersStore},
+        store::{self, identity, Maker, MemoryStore, WorkerStatus, WorkersStore},
         view::WorkerId,
+    };
+    #[cfg(feature = "worker-host")]
+    use crate::{
+        store::{GatewayId, Reachability, WorkerFacts},
+        view::{Role, WireModes},
+        worker_host::{Membership, Refused, StoreDoor, Wrote},
     };
 
     const URL: &str = "grpc://10.0.0.5:8000";
@@ -640,7 +840,7 @@ pub(crate) mod tests {
         // (the models) and one read after it (the labels), each with the
         // wire and the role stated and with both left unsaid.
         let wide = |over: proto::WorkerSpec| proto::WorkerSpec {
-            models: (0..129).map(|n| format!("model-{n}")).collect(),
+            models: vec!["m".repeat(257)],
             ..over
         };
         let labelled = |over: proto::WorkerSpec| proto::WorkerSpec {
@@ -649,7 +849,7 @@ pub(crate) mod tests {
                 .collect(),
             ..over
         };
-        let models = "spec.models: a row names at most 128 model ids";
+        let models = "spec.models: a model id is at most 256 bytes";
         let labels = "spec.labels: a row holds at most 128 labels";
         for (past, field) in [
             (wide(spec(URL)), models),
@@ -694,6 +894,39 @@ pub(crate) mod tests {
             }))
         );
         assert_eq!((new.status, new.revision), (WorkerStatus::Ready, 1));
+    }
+
+    #[test]
+    fn many_short_model_ids_register_and_a_list_past_the_row_size_is_refused() {
+        let (store, door) = door();
+        let heavy = proto::WorkerSpec {
+            models: vec!["m".repeat(256); 64],
+            ..spec(URL)
+        };
+        let status = door
+            .register(&operator(), under(TERM), &ask(heavy, Mode::Add))
+            .expect_err("past the row's size");
+        assert_eq!(
+            (status.code(), status.message()),
+            (
+                Code::InvalidArgument,
+                "spec: a row is at most 16384 bytes on the wire"
+            )
+        );
+        assert_eq!(store.epoch(), 0);
+
+        let short = proto::WorkerSpec {
+            models: (0..129).map(|n| n.to_string()).collect(),
+            ..spec(URL)
+        };
+        let wrote = door
+            .register(&operator(), under(TERM), &ask(short.clone(), Mode::Add))
+            .expect("the ids fit");
+        assert_eq!(row_of(&wrote).models, short.models);
+        assert_eq!(
+            store.by_key(URL).expect("the row").facts.models,
+            short.models
+        );
     }
 
     #[test]
@@ -1019,6 +1252,573 @@ pub(crate) mod tests {
             (told.seq, told.term, told.membership_epoch),
             (7, TERM + 1, 5)
         );
+    }
+
+    /// A provider's maker for one worker.
+    fn found(key: &str) -> Maker {
+        Maker::provider("cluster", key).expect("a whole maker")
+    }
+
+    #[test]
+    fn a_row_keeps_the_maker_its_registration_gave_it() {
+        let (store, door) = door();
+        // A control call's row says no maker on the wire.
+        let by_hand = row_of(
+            &door
+                .register(&operator(), under(TERM), &ask(spec(URL), Mode::Add))
+                .expect("registered"),
+        );
+        assert_eq!(by_hand.maker, None);
+        let held = store.get(WorkerId(by_hand.id)).expect("the row");
+        assert_eq!(held.maker, Maker::Control);
+        // A provider's registration makes the row its own, and the answer
+        // shows whose it is.
+        let maker = found("pods/a");
+        let other = "grpc://10.0.0.6:8000";
+        let made = row_of(
+            &door
+                .upsert(&operator(), &maker, TERM, &ask(spec(other), Mode::Upsert))
+                .expect("found"),
+        );
+        let shown = Some(proto::Maker {
+            provider: "cluster".to_owned(),
+            key: "pods/a".to_owned(),
+        });
+        assert_eq!(made.maker, shown);
+        // Its refresh in place and its new incarnation keep the maker. The
+        // refresh comes from a maker made anew: two makers are one where
+        // they agree whole, whichever copy a caller holds.
+        let relabelled = proto::WorkerSpec {
+            labels: [("tier".to_owned(), "gold".to_owned())].into(),
+            ..spec(other)
+        };
+        let anew = found("pods/a");
+        let in_place = row_of(
+            &door
+                .upsert(&operator(), &anew, TERM, &ask(relabelled, Mode::Upsert))
+                .expect("refreshed"),
+        );
+        assert_eq!((in_place.id, &in_place.maker), (made.id, &shown));
+        let again = row_of(
+            &door
+                .upsert(&operator(), &maker, TERM, &ask(spec(other), Mode::Replace))
+                .expect("replaced"),
+        );
+        assert_ne!(again.id, made.id);
+        assert_eq!(again.maker, shown);
+        let held = store.get(WorkerId(again.id)).expect("the row");
+        assert_eq!(held.maker, maker);
+    }
+
+    #[test]
+    fn a_caller_that_did_not_make_a_row_changes_nothing_of_it() {
+        let (store, door) = door();
+        let maker = found("pods/a");
+        let made = row_of(
+            &door
+                .upsert(&operator(), &maker, TERM, &ask(spec(URL), Mode::Upsert))
+                .expect("found"),
+        );
+        let epoch = store.epoch();
+        let refused = |answer: Result<proto::WorkerEvent, Status>, whose: &str| {
+            let status = answer.expect_err("refused");
+            assert_eq!(status.code(), Code::PermissionDenied, "{status:?}");
+            assert!(status.message().contains(whose), "{status:?}");
+            assert!(!status.message().contains("10.0.0"), "no URL: {status:?}");
+        };
+        // A control call on the provider's row: a registration over it, with
+        // other facts and with equal ones, a patch, a drain and a removal.
+        let relabelled = proto::WorkerSpec {
+            labels: [("tier".to_owned(), "gold".to_owned())].into(),
+            ..spec(URL)
+        };
+        for request in [
+            ask(spec(URL), Mode::Replace),
+            ask(relabelled, Mode::Upsert),
+            ask(spec(URL), Mode::Upsert),
+        ] {
+            let answer = door.register(&operator(), under(TERM), &request);
+            refused(answer, "provider cluster");
+        }
+        let patch = proto::PatchWorkerRequest {
+            worker_id: made.id,
+            labels: [("lane".to_owned(), "b".to_owned())].into(),
+            remove_labels: Vec::new(),
+            overload: None,
+            revision: made.revision,
+        };
+        refused(
+            door.patch(&operator(), under(TERM), &patch),
+            "provider cluster",
+        );
+        for drain in [true, false] {
+            let leave = proto::DeregisterWorkerRequest {
+                worker_id: made.id,
+                revision: made.revision,
+                drain,
+            };
+            refused(
+                door.deregister(&operator(), under(TERM), &leave),
+                "provider cluster",
+            );
+        }
+        // The maker is tested ahead of the revision: a caller that did not
+        // make the row is told so whatever revision it read.
+        let stale = proto::PatchWorkerRequest {
+            revision: made.revision + 7,
+            ..patch.clone()
+        };
+        refused(
+            door.patch(&operator(), under(TERM), &stale),
+            "provider cluster",
+        );
+        // The same provider under another key is another worker's maker.
+        let another = found("pods/b");
+        refused(
+            door.upsert(&operator(), &another, TERM, &ask(spec(URL), Mode::Upsert)),
+            "provider cluster",
+        );
+        // Nothing was written, and the maker's own call goes through.
+        assert_eq!(store.epoch(), epoch);
+        let held = store.get(WorkerId(made.id)).expect("the row");
+        assert_eq!(held.revision, made.revision);
+        door.relabel(&operator(), &maker, &patch)
+            .expect("the maker patches its row");
+
+        // The other way round: a provider changes nothing of a control
+        // call's row.
+        let other = "grpc://10.0.0.6:8000";
+        let by_hand = row_of(
+            &door
+                .register(&operator(), under(TERM), &ask(spec(other), Mode::Add))
+                .expect("registered"),
+        );
+        refused(
+            door.upsert(&operator(), &maker, TERM, &ask(spec(other), Mode::Upsert)),
+            "a control call",
+        );
+        let leave = proto::DeregisterWorkerRequest {
+            worker_id: by_hand.id,
+            revision: by_hand.revision,
+            drain: false,
+        };
+        refused(door.remove(&operator(), &maker, &leave), "a control call");
+        door.deregister(&operator(), under(TERM), &leave)
+            .expect("the control call removes its row");
+    }
+
+    #[test]
+    fn a_row_holds_its_maker_inside_the_wires_bound() {
+        use super::worker_wire;
+
+        let (store, door) = door();
+        let maker = found("pods/a");
+        // Three labels at a value's bound and one that fills. The widest
+        // fill a row of this maker has room for is registered; one byte more
+        // is refused by the row's name, and so is a patch of the row at its
+        // brim.
+        let stated = |fill: usize| proto::WorkerSpec {
+            labels: ["a", "b", "c"]
+                .map(|key| (key.to_owned(), "v".repeat(4_096)))
+                .into_iter()
+                .chain([("fill".to_owned(), "v".repeat(fill))])
+                .collect(),
+            ..spec(URL)
+        };
+        let fits = |fill: usize| {
+            worker_wire::registration(&stated(fill), |_| None).is_ok_and(|(facts, _)| {
+                worker_wire::room(&facts, &facts.labels, &maker, "spec").is_ok()
+            })
+        };
+        let widest = (0..=4_096usize)
+            .rev()
+            .find(|&fill| fits(fill))
+            .expect("a fill the row has room for");
+        let epoch = store.epoch();
+        let past = door.upsert(
+            &operator(),
+            &maker,
+            TERM,
+            &ask(stated(widest + 1), Mode::Upsert),
+        );
+        let status = past.expect_err("past the bound");
+        assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+        assert!(status.message().starts_with("spec:"), "{status:?}");
+        assert_eq!(store.epoch(), epoch);
+        let brim = row_of(
+            &door
+                .upsert(
+                    &operator(),
+                    &maker,
+                    TERM,
+                    &ask(stated(widest), Mode::Upsert),
+                )
+                .expect("at the bound"),
+        );
+        let more = proto::PatchWorkerRequest {
+            worker_id: brim.id,
+            labels: [("lane".to_owned(), "b".to_owned())].into(),
+            remove_labels: Vec::new(),
+            overload: None,
+            revision: brim.revision,
+        };
+        let status = door
+            .relabel(&operator(), &maker, &more)
+            .expect_err("past the bound");
+        assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+        assert!(status.message().starts_with("labels:"), "{status:?}");
+    }
+
+    #[cfg(feature = "worker-host")]
+    fn found_facts() -> WorkerFacts {
+        WorkerFacts {
+            key: URL.to_owned(),
+            engine: URL.to_owned(),
+            wire_modes: WireModes::GRPC,
+            models: vec!["model-a".to_owned()],
+            dp_size: 1,
+            ..WorkerFacts::default()
+        }
+    }
+
+    /// A standby builds its rows from the log. A fact the log's row does not
+    /// carry would leave it another row than its leader holds.
+    #[cfg(feature = "worker-host")]
+    #[test]
+    fn a_fact_the_log_does_not_carry_is_refused_by_its_name_and_nothing_is_written() {
+        use super::super::worker_wire;
+        type State = fn(&mut WorkerFacts);
+
+        let (store, door) = door();
+        let hosted = Hosted::new(Arc::new(door), operator(), under(TERM));
+        let maker = found("pods/a");
+        let epoch = store.epoch();
+        let lost: [(&str, State); 6] = [
+            ("row.vision", |facts| facts.vision = true),
+            ("row.priority", |facts| facts.priority = 5),
+            ("row.zone", |facts| facts.zone = Some(String::new())),
+            ("row.max_running", |facts| facts.max_running = Some(0)),
+            ("row.kv_block_size", |facts| facts.kv_block_size = Some(0)),
+            ("row.bootstrap_port", |facts| facts.bootstrap_port = Some(0)),
+        ];
+        for (fact, state) in lost {
+            let answer = hosted.found(&maker, URL, &|_| {
+                let mut facts = found_facts();
+                state(&mut facts);
+                facts
+            });
+            let Err(Refused::Past(past)) = answer else {
+                panic!("{fact}: wrong answer: {answer:?}")
+            };
+            assert_eq!(past.fact, fact);
+        }
+        assert_eq!((store.by_key(URL), store.epoch()), (None, epoch));
+
+        // What the log carries is taken, and a standby reads it back whole.
+        hosted
+            .found(&maker, URL, &|_| found_facts())
+            .expect("found");
+        let row = store.by_key(URL).expect("the found row");
+        let back = worker_wire::told_row(&worker_wire::row(&row), std::time::Instant::now());
+        assert_eq!(back.map(|back| back.facts), Ok(row.facts));
+    }
+
+    /// The store reads a row as host-local by its reach alone: a row of the
+    /// host-local wire that names no gateway would stand in every gateway's
+    /// pool. A store held in process serves one gateway.
+    #[cfg(feature = "worker-host")]
+    #[test]
+    fn a_host_local_wire_names_its_gateway_at_the_controllers_door() {
+        let stated = |wire: WireModes, from: Reachability| {
+            move |_: Option<&WorkerFacts>| WorkerFacts {
+                wire_modes: wire,
+                reachable_from: from,
+                ..found_facts()
+            }
+        };
+        let (store, door) = door();
+        let hosted = Hosted::new(Arc::new(door), operator(), under(TERM));
+        let maker = found("pods/a");
+        let epoch = store.epoch();
+        for wire in [WireModes::ZMQ, WireModes::GRPC.union(WireModes::ZMQ)] {
+            let answer = hosted.found(&maker, URL, &stated(wire, Reachability::Any));
+            let Err(Refused::Past(past)) = answer else {
+                panic!("{wire:?}: wrong answer: {answer:?}")
+            };
+            assert_eq!(past.fact, "row.wire");
+        }
+        assert_eq!((store.by_key(URL), store.epoch()), (None, epoch));
+
+        // A row that names its gateway is in that gateway's pool alone.
+        let one = Reachability::Gateway(GatewayId(7));
+        hosted
+            .found(&maker, URL, &stated(WireModes::ZMQ, one))
+            .expect("found");
+        let row = store.by_key(URL).expect("the found row");
+        assert_eq!(row.facts.reachable_from, one);
+
+        // A store held in process serves one gateway, and takes the row.
+        let lone = Arc::new(MemoryStore::default());
+        let wrote = StoreDoor::new(Arc::clone(&lone)).found(
+            &maker,
+            URL,
+            &stated(WireModes::ZMQ, Reachability::Any),
+        );
+        let row = lone.by_key(URL).expect("the row in process");
+        assert_eq!(wrote, Ok(Wrote::Registered(row.id)));
+    }
+
+    #[cfg(feature = "worker-host")]
+    #[test]
+    fn a_provider_takes_away_by_url_only_the_row_it_made() {
+        let (store, door) = door();
+        let door = Arc::new(door);
+        let hosted = Hosted::new(Arc::clone(&door), operator(), under(TERM));
+        let maker = found("pods/a");
+        hosted
+            .found(&maker, URL, &|_| found_facts())
+            .expect("found");
+        let made = store.by_key(URL).expect("the found row");
+        let other = "grpc://10.0.0.6:8000";
+        door.register(&operator(), under(TERM), &ask(spec(other), Mode::Add))
+            .expect("registered");
+        let epoch = store.epoch();
+        let denied = |answer: Result<Wrote, Refused>, whose: &str| {
+            let Err(Refused::NotMaker(why)) = answer else {
+                panic!("wrong refusal: {answer:?}")
+            };
+            assert!(why.contains(whose), "{why}");
+            assert!(!why.contains("10.0.0"), "{why}");
+            assert!(!why.contains("pods/"), "{why}");
+        };
+        // Another maker's row stays: a control call's, and this provider's
+        // own under another key, which is told so.
+        denied(hosted.gone(&maker, other), "a control call");
+        denied(
+            hosted.gone(&found("pods/b"), URL),
+            "provider cluster's under another key",
+        );
+        // A caller of another provider is told whose the row is, and
+        // nothing of a key.
+        let stranger = Maker::provider("nodes", "pods/a").expect("a whole maker");
+        denied(
+            hosted.gone(&stranger, URL),
+            "provider cluster's: its worker",
+        );
+        // No row under the URL is not found, and a replica that does not
+        // lead refuses by name. None of the five wrote.
+        assert_eq!(
+            hosted.gone(&maker, "grpc://10.0.0.9:8000"),
+            Err(Refused::Absent)
+        );
+        let follower = || -> Result<u64, Status> {
+            Err(Status::failed_precondition("this replica does not lead"))
+        };
+        let follower = Hosted::new(Arc::clone(&door), operator(), follower);
+        assert_eq!(
+            follower.gone(&maker, URL),
+            Err(Refused::NotLeading("this replica does not lead".to_owned()))
+        );
+        assert_eq!(store.epoch(), epoch);
+        // The maker's own call takes the row away and answers it removed.
+        assert_eq!(hosted.gone(&maker, URL), Ok(Wrote::Removed(made.id)));
+        assert!(store.get(made.id).is_none());
+        assert_eq!(store.epoch(), epoch + 1);
+        // A new worker takes the address under another key: the old key's
+        // late or repeated removal leaves it.
+        hosted
+            .found(&found("pods/c"), URL, &|_| found_facts())
+            .expect("found again");
+        let again = store.by_key(URL).expect("the new row");
+        assert_ne!(again.id, made.id);
+        denied(
+            hosted.gone(&maker, URL),
+            "provider cluster's under another key",
+        );
+        assert_eq!(store.by_key(URL), Some(again));
+    }
+
+    #[cfg(feature = "worker-host")]
+    #[test]
+    fn a_providers_write_on_a_replica_that_does_not_lead_is_refused_and_writes_nothing() {
+        use std::sync::atomic::AtomicUsize;
+
+        let (store, door) = door();
+        let door = Arc::new(door);
+        let maker = found("pods/a");
+        Hosted::new(Arc::clone(&door), operator(), under(TERM))
+            .found(&maker, URL, &|_| found_facts())
+            .expect("registered");
+        let row = store.by_key(URL);
+        let epoch = store.epoch();
+        let at = door.place();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&reads);
+        let hosted = Hosted::new(Arc::clone(&door), operator(), move || {
+            assert!(door.turn.is_locked(), "the fence is read inside the turn");
+            seen.fetch_add(1, Ordering::Relaxed);
+            Err(Status::failed_precondition("this replica does not lead"))
+        });
+        let refused = Err(Refused::NotLeading("this replica does not lead".to_owned()));
+        assert_eq!(
+            hosted.found(&maker, URL, &|_| panic!(
+                "a follower does not ask for facts"
+            )),
+            refused
+        );
+        assert_eq!(hosted.drained(&maker, URL), refused);
+        assert_eq!(hosted.gone(&maker, URL), refused);
+        assert_eq!(reads.load(Ordering::Relaxed), 3);
+        assert_eq!(store.by_key(URL), row);
+        assert_eq!(store.epoch(), epoch);
+        assert_eq!(hosted.door.place(), at);
+    }
+
+    #[cfg(feature = "worker-host")]
+    #[test]
+    fn a_providers_registration_numbers_its_life_under_the_term_the_log_leads() {
+        use super::{HostedTurn, Turn};
+        use crate::store::membership::Past;
+
+        let (store, door) = door_in(TERM + 1);
+        let door = Arc::new(door);
+        let maker = found("pods/a");
+        let stale = Hosted::new(Arc::clone(&door), operator(), under(TERM));
+        let refusal = Err(Refused::NotLeading(super::LEADS_NO_TERM.to_owned()));
+        assert_eq!(stale.found(&maker, URL, &|_| found_facts()), refusal);
+        assert_eq!(store.epoch(), 0);
+
+        let leading = Hosted::new(door, operator(), under(TERM + 1));
+        let number = life(TERM + 1, 0);
+        assert_eq!(
+            leading.found(&maker, URL, &|_| found_facts()),
+            Ok(Wrote::Registered(identity(URL, number)))
+        );
+        let row = store.by_key(URL).expect("the registered row");
+        assert_eq!(row.facts.incarnation, number);
+        let replaced = || WorkerFacts {
+            role: Role::Decode,
+            ..found_facts()
+        };
+        assert_eq!(stale.found(&maker, URL, &|_| replaced()), refusal);
+        assert_eq!(store.by_key(URL), Some(row.clone()));
+        let new = life(TERM + 1, 1);
+        assert_eq!(
+            leading.found(&maker, URL, &|_| replaced()),
+            Ok(Wrote::Another {
+                old: row.id,
+                new: identity(URL, new)
+            })
+        );
+        assert_eq!(
+            store
+                .by_key(URL)
+                .expect("the replaced row")
+                .facts
+                .incarnation,
+            new
+        );
+
+        let turn = HostedTurn {
+            door: &leading.door,
+            term: TERM + 1,
+        };
+        let heavy = WorkerFacts {
+            models: vec!["m".repeat(256); 64],
+            ..found_facts()
+        };
+        assert_eq!(
+            turn.room(&heavy, &maker),
+            Err(Refused::Past(Past {
+                fact: "row",
+                why: "a row is at most 16384 bytes on the wire",
+            }))
+        );
+    }
+
+    #[cfg(feature = "worker-host")]
+    #[test]
+    fn the_two_doors_answer_one_row_alike() {
+        let (replica, door) = door();
+        let local = Arc::new(MemoryStore::default());
+        let maker = found("pods/a");
+        let hosted = Hosted::new(Arc::new(door), operator(), under(TERM));
+        let lone = StoreDoor::new(Arc::clone(&local));
+        let write = |door: &dyn Membership, store: &MemoryStore| {
+            assert_eq!(door.gone(&maker, URL), Err(Refused::Absent));
+            let registered = door
+                .found(&maker, URL, &|_| found_facts())
+                .expect("registered");
+            let first = store.by_key(URL).expect("the first row");
+            assert_eq!(registered, Wrote::Registered(first.id));
+            assert_eq!(
+                door.found(&maker, URL, &|_| found_facts()),
+                Ok(Wrote::Unmoved(first.id))
+            );
+            let refresh = || WorkerFacts {
+                max_running: Some(8),
+                ..found_facts()
+            };
+            assert_eq!(
+                door.found(&maker, URL, &|_| refresh()),
+                Ok(Wrote::InPlace(first.id))
+            );
+            let refreshed = store.by_key(URL).expect("the refreshed row");
+            let wrote = door.found(&maker, URL, &|_| WorkerFacts {
+                role: Role::Decode,
+                ..refresh()
+            });
+            let fresh = store.by_key(URL).expect("the new row");
+            assert_eq!(
+                wrote,
+                Ok(Wrote::Another {
+                    old: first.id,
+                    new: fresh.id
+                })
+            );
+            assert_eq!(door.drained(&maker, URL), Ok(Wrote::Draining(fresh.id)));
+            let draining = store.by_key(URL).expect("the draining row");
+            assert_eq!(door.drained(&maker, URL), Ok(Wrote::Unmoved(fresh.id)));
+            assert_eq!(door.gone(&maker, URL), Ok(Wrote::Removed(fresh.id)));
+            assert_eq!(store.by_key(URL), None);
+            [first, refreshed, fresh, draining].map(|row| {
+                assert_eq!(row.id, identity(URL, row.facts.incarnation));
+                (
+                    WorkerFacts {
+                        incarnation: 0,
+                        ..row.facts
+                    },
+                    row.revision,
+                    row.status,
+                    row.maker,
+                )
+            })
+        };
+        assert_eq!(write(&lone, &local), write(&hosted, &replica));
+        assert_eq!(local.epoch(), replica.epoch());
+    }
+
+    #[test]
+    fn an_add_over_a_standing_row_is_already_there_whoever_made_it() {
+        let (store, door) = door();
+        let maker = found("pods/a");
+        door.upsert(&operator(), &maker, TERM, &ask(spec(URL), Mode::Upsert))
+            .expect("found");
+        let other = "grpc://10.0.0.6:8000";
+        door.register(&operator(), under(TERM), &ask(spec(other), Mode::Add))
+            .expect("registered");
+        let epoch = store.epoch();
+        let there = |answer: Result<proto::WorkerEvent, Status>| {
+            let status = answer.expect_err("refused");
+            assert_eq!(status.code(), Code::AlreadyExists, "{status:?}");
+        };
+        // An add asks no maker: a control call's and a provider's read the
+        // same over a provider's row and over a control call's.
+        for url in [URL, other] {
+            there(door.register(&operator(), under(TERM), &ask(spec(url), Mode::Add)));
+            there(door.upsert(&operator(), &maker, TERM, &ask(spec(url), Mode::Add)));
+        }
+        assert_eq!(store.epoch(), epoch);
     }
 
     #[test]
@@ -1415,20 +2215,7 @@ pub(crate) mod tests {
             .expect("removed");
     }
 
-    /// The lines a case's own subscriber wrote.
-    #[derive(Clone, Default)]
-    pub(crate) struct Logged(pub(crate) Arc<Mutex<Vec<u8>>>);
-
-    impl io::Write for Logged {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            self.0.lock().extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
+    pub(crate) use crate::operator::test_support::Logged;
 
     #[test]
     fn every_call_leaves_its_audit_line_written_unmoved_or_refused() {
@@ -1472,7 +2259,6 @@ pub(crate) mod tests {
             door.deregister(&operator(), under(TERM), &drain)
                 .expect(answer);
         }
-
         // A line a call, in the calls' order: what a write made, `nothing`
         // where a call wrote none, a refusal by its code.
         let logged = String::from_utf8(lines.0.lock().clone()).expect("the lines are text");
@@ -1499,6 +2285,96 @@ pub(crate) mod tests {
         }
         // No line holds the URL: it may carry a credential.
         assert!(!logged.contains(URL), "{logged}");
+    }
+
+    #[cfg(feature = "worker-host")]
+    #[test]
+    fn every_write_of_a_provider_leaves_its_audit_line() {
+        let lines = Logged::default();
+        let writer = lines.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _beside = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let _kept = tracing::subscriber::set_default(subscriber);
+
+        let (store, door) = door();
+        let hosted = Hosted::new(Arc::new(door), operator(), under(TERM));
+        let key = "private/provider-key";
+        let maker = found(key);
+        hosted
+            .found(&maker, URL, &|_| found_facts())
+            .expect("registered");
+        let id = store.by_key(URL).expect("the registered row").id.0;
+        hosted
+            .found(&maker, URL, &|_| found_facts())
+            .expect("unmoved");
+        let resized = || WorkerFacts {
+            dp_size: 2,
+            ..found_facts()
+        };
+        hosted
+            .found(&maker, URL, &|_| resized())
+            .expect("relabelled");
+        hosted
+            .found(&maker, URL, &|_| WorkerFacts {
+                role: Role::Decode,
+                ..resized()
+            })
+            .expect("replaced");
+        let new = store.by_key(URL).expect("the replaced row").id.0;
+        hosted.drained(&maker, URL).expect("drained");
+        hosted.drained(&maker, URL).expect("unmoved");
+        hosted
+            .gone(&found("another/key"), URL)
+            .expect_err("another maker");
+        hosted.gone(&maker, URL).expect("gone");
+        hosted.gone(&maker, URL).expect_err("already gone");
+
+        let logged = String::from_utf8(lines.0.lock().clone()).expect("the lines are text");
+        let lines: Vec<&str> = logged.lines().collect();
+        let want = [
+            ("registration", "registered", Some((id, 1, 2))),
+            ("registration", "nothing", Some((id, 1, 2))),
+            ("registration", "relabelled", Some((id, 2, 3))),
+            ("registration", "replaced", Some((new, 3, 4))),
+            ("drain", "status", Some((new, 4, 5))),
+            ("drain", "nothing", Some((new, 4, 5))),
+            (
+                "removal",
+                "code=PermissionDenied why=\"the row is provider cluster's under another key",
+                None,
+            ),
+            ("removal", "removed", Some((new, 5, 6))),
+            (
+                "removal",
+                "code=NotFound why=\"no worker is registered under the URL\"",
+                None,
+            ),
+        ];
+        assert_eq!(lines.len(), want.len(), "{logged}");
+        for (line, (call, detail, place)) in lines.iter().zip(want) {
+            assert!(
+                line.contains(&format!("call=\"a provider's {call}\" by=operator-a")),
+                "{line}"
+            );
+            if let Some((worker, epoch, seq)) = place {
+                let fields = format!("worker={worker:016x} made=\"{detail}\" membership_epoch={epoch} seq={seq} term={TERM}");
+                assert!(
+                    line.contains("membership write") && line.contains(&fields),
+                    "{line}"
+                );
+            } else {
+                assert!(
+                    line.contains("membership call refused") && line.contains(detail),
+                    "{line}"
+                );
+            }
+        }
+        for private in [URL, key, "another/key"] {
+            assert!(!logged.contains(private), "{logged}");
+        }
     }
 
     #[test]

@@ -11,7 +11,8 @@
 //! again before, so one engine's silence never delays another engine's
 //! sample. A poll asks the engine once, at the engine's own address, and
 //! writes one row per rank whose own records are not serving it, each
-//! rank's figures scoped from the answer. A scrape asks the metrics of an
+//! rank's figures scoped from the answer. A poll carries the sample instant
+//! when the answer gives one. A scrape asks the metrics of an
 //! engine of one rank and writes that rank's row; the gauges are
 //! engine-wide, so a data-parallel engine without a servicer is not scraped
 //! and its ranks have no row until a per-rank source names them: a row
@@ -59,6 +60,7 @@ use tracing::{debug, warn};
 
 use super::{rows::load_row, scrape};
 use crate::{
+    address::{split, UNPARSABLE},
     store::{LoadSink, LoadSource, PollMode, Reachability, WorkerRow, WorkerStatus, WorkersStore},
     view::{Role, SignalSource, WireModes, WorkerId},
 };
@@ -415,23 +417,11 @@ async fn turned(polls: &mut watch::Receiver<bool>) -> bool {
 
 /// What a log line calls an engine: the host and port of its address, never
 /// the address whole (a worker URL may carry userinfo, which no log line
-/// gets; the gRPC client names its peers the same way). An address with an
-/// `@` past its first `/`, `?` or `#` is named by the marker the gateway
-/// writes for an address it cannot parse: a userinfo that holds one of the
-/// three raw reads like a path or a query that holds an `@`, and a guess
-/// could print part of the userinfo.
+/// gets; the gRPC client names its peers the same way). An address whose
+/// userinfo cannot be told from what follows it ([`split`]) is named by
+/// [`UNPARSABLE`].
 fn peer(engine: &str) -> &str {
-    let rest = engine
-        .split_once("://")
-        .map_or(engine, |(_scheme, rest)| rest);
-    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let (authority, tail) = rest.split_at(end);
-    if tail.contains('@') {
-        return "<unparsable address>";
-    }
-    authority
-        .rsplit_once('@')
-        .map_or(authority, |(_userinfo, host)| host)
+    split(engine).map_or(UNPARSABLE, |address| address.host)
 }
 
 impl<S, P> LoadDriver<S, P>
@@ -753,6 +743,7 @@ where
                     }
                 };
                 let received = now();
+                let sampled_at = report.sampled_at.map(|at| at.min(received));
                 // A data-parallel engine's answer is scoped to each rank,
                 // whatever rows are ready; a rank the answer omits is
                 // unavailable: nothing is written for it, never another
@@ -769,7 +760,7 @@ where
                                     &scoped,
                                     engine.role,
                                     received,
-                                    received,
+                                    sampled_at.unwrap_or(received),
                                     SignalSource::Poll,
                                 )
                             });
@@ -782,7 +773,12 @@ where
                 // none and is the word that no report came, which a poll
                 // that left out a served rank does not say.
                 if rows > 0 || !served {
-                    self.store.report(&answer, polled_at, LoadSource::Poll);
+                    if let Some(sampled_at) = sampled_at {
+                        self.store
+                            .report_sampled(&answer, polled_at, sampled_at, LoadSource::Poll);
+                    } else {
+                        self.store.report(&answer, polled_at, LoadSource::Poll);
+                    }
                 }
                 self.stats.rows.fetch_add(rows as u64, Ordering::Relaxed);
             }

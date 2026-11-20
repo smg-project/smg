@@ -64,8 +64,9 @@
 // the first request under each term the replica leads.
 // Errors (gRPC status): UNAUTHENTICATED no principal, or Hello's id is not
 // the subject (the stream closes); PERMISSION_DENIED the scope or
-// role does not cover the RPC; FAILED_PRECONDITION a write or a Session
-// off the leader (a NotLeader in the status details, which are a
+// role does not cover the RPC, or a membership write names a row its
+// caller did not make (WorkerRow.maker); FAILED_PRECONDITION a write or a
+// Session off the leader (a NotLeader in the status details, which are a
 // google.rpc.Status that holds it as an Any, its address the leader's
 // gateway listener as Leader tells it; on Session, the NotLeader frame
 // ahead of the status), a first frame that is not Hello or a second
@@ -425,11 +426,15 @@ message SpecPush {
 
 // --- Decide: one stream per gateway runtime thread --------------------------
 
-// Idempotent on (verified gateway id, request_id) for the lease's lifetime: a
-// repeated Decide after a stream reset returns the standing decision. A
-// frame is at most 64 KiB as encoded, and one over it is refused whole: a
-// sender cuts its block hashes at the tail until its frame fits, and
-// counts the cut on its own side.
+// One lease stands for one request. A gateway that sends a request again,
+// because the stream that carried it ended before its answer arrived, says
+// so (`again`): the lease its earlier decision was issued ends there, where
+// no Dispatched named it, and the request is decided anew. The word reaches
+// the asking gateway's own waiting leases alone, and of a pair's lease each
+// side that waits ends. A request sent twice without the word is two
+// requests. A frame is at most 64 KiB as encoded, and one over it is refused
+// whole: a sender cuts its block hashes at the tail until its frame fits,
+// and counts the cut on its own side.
 message DecideRequest {
   // 1 to 256 bytes: the gateway's own key of one request among those it has
   // standing, carried back on every answer. A longer id is sent as a digest
@@ -439,6 +444,17 @@ message DecideRequest {
   // name and is out of its range.
   RequestFacts facts = 2;
   Constraints constraints = 3;
+  // The gateway sent this request before under this id and holds no answer
+  // to it, and the stream that carried it has ended: the gateway reads
+  // nothing more from that stream. The word is not said while that stream
+  // is open: an answer on its way is not held back, and it would carry a
+  // lease the word has ended, which no Dispatched can name. The controller
+  // finds the earlier lease by the id's 64-bit fingerprint, among the
+  // gateway's leases that wait for a dispatch: two ids of one gateway that
+  // share a fingerprint read as one request. A repeat its stream answers
+  // Busy before a decider takes it (no credit, a full queue, a budget of 0)
+  // ends nothing: the earlier lease waits out its dispatch deadline.
+  bool again = 4;
 }
 
 message DecideAnswer {
@@ -621,6 +637,24 @@ message WorkerRow {
   // admitted where it is applied; a row an event changes keeps the
   // admission its standby holds.
   uint64 admitted_age_ms = 26;
+  // Who made the row. Absent: a control call. The caller that made a row
+  // alone changes it: an UPSERT or a REPLACE over it, a patch, a drain and
+  // a removal from any other are refused PERMISSION_DENIED, ahead of the
+  // revision's test, and the words name the maker. An ADD over it is
+  // ALREADY_EXISTS whoever made it. A reader that knows no such field
+  // reads every row as a control call's.
+  Maker maker = 27;
+}
+
+// A provider that finds workers by itself, as a row's maker. Neither
+// field is empty: a reader refuses a row whose maker lacks one, by that
+// field.
+message Maker {
+  // The provider's name: one token of visible ASCII (0x21 to 0x7E) with no
+  // comma, at most 128 bytes, the form of a principal's stated name.
+  string provider = 1;
+  // The provider's own key for the worker, at most 2048 bytes.
+  string key = 2;
 }
 
 // A host-local wire is reachable from one gateway only.
@@ -770,17 +804,20 @@ message RegisterWorkerRequest {
   enum Mode {
     // Reads as MODE_ADD.
     MODE_UNSPECIFIED = 0;
-    // The URL must be absent: ALREADY_EXISTS otherwise.
+    // The URL must be absent: ALREADY_EXISTS otherwise, whoever made the
+    // standing row.
     MODE_ADD = 1;
     // The URL must stand: its next incarnation, NOT_FOUND otherwise, whatever
     // the registration leaves unset. A field past its own rule or bound is
-    // INVALID_ARGUMENT first, whether the URL stands or not.
+    // INVALID_ARGUMENT first, whether the URL stands or not. A caller that
+    // did not make the standing row is PERMISSION_DENIED (WorkerRow.maker).
     MODE_REPLACE = 2;
     // Registers an absent URL. Over a standing row: equal facts write nothing
     // and answer the row unmoved, a change of role, wire or models is a new
     // incarnation, any other change is made in place. The models change
     // when their set does: the same ids in another order are written in
-    // place, and the row tells the stated order.
+    // place, and the row tells the stated order. A caller that did not make
+    // the standing row is PERMISSION_DENIED, whatever the facts.
     MODE_UPSERT = 3;
   }
   Mode mode = 2;
@@ -857,6 +894,8 @@ message PatchWorkerRequest {
   repeated string remove_labels = 3;
   OverloadThresholds overload = 4;
   // The row's revision the caller read; FAILED_PRECONDITION when it moved.
+  // A caller that did not make the row is PERMISSION_DENIED first, whatever
+  // revision it read (WorkerRow.maker).
   uint64 revision = 5;
 }
 
@@ -896,7 +935,9 @@ message SnapshotRequest {
   repeated string models = 2;
   // Admin only in the control scope: identifiers in clear.
   bool plain_identifiers = 3;
-  // Rows per slice at most; `truncated` says when it bit.
+  // Rows per slice at most; 0 sets no limit. A slice's rows are bounded by
+  // the bytes of a page as well, whatever is asked. `truncated` says when
+  // either bound left a row out.
   uint32 limit = 4;
 }
 
@@ -1300,6 +1341,12 @@ message ReplicationSnapshot {
   // Each row's `admitted_age_ms` is its age at the part's send.
   repeated WorkerRow workers = 4;
   repeated LoadSample loads = 5;
+  // The generation that stands at the leader when the part is sent, with its
+  // document, on the snapshot's first part: at the snapshot's place or
+  // after it, never before. Unset where the leader holds no document. A
+  // standby restored from the snapshot runs the document under this number;
+  // the event of the same generation, where it follows, changes nothing.
+  GenerationEvent generation = 6;
 }
 
 message ReplicationEvent {
@@ -1327,6 +1374,11 @@ message TermStart {}
 // A generation as the leader applied it (the status, the document the
 // gateways receive), so a standby serves GetPolicySpec and RollbackPolicySpec
 // and runs it after promotion; a rollback replicates the restored one alike.
+// A leader's log keeps the generation's number alone, and the document is
+// joined at the send: an event with no document states a generation that
+// stood no longer by then. A standby applies nothing for it and journals the
+// position; a later event carries what replaced it. A leader states the
+// generation that stands again behind the start of each term it takes.
 message GenerationEvent {
   SpecStatus status = 1;
   SpecPush document = 2;

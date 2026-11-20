@@ -15,10 +15,13 @@ use llm_multimodal::{
 };
 use openai_protocol::worker::MmProcessingMode;
 use smg_grpc_client::{common_proto as common, vllm_proto as vllm};
-use smg_worker::identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType};
+use smg_worker::{
+    identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType},
+    labels::SUPPORTS_VISION_LABEL,
+};
 
 use super::{
-    capability::{runtime_supports_modality, SUPPORTS_VISION_LABEL},
+    capability::runtime_supports_modality,
     config::MultimodalComponents,
     plan::{MediaPlan, PlaceholderTokens},
 };

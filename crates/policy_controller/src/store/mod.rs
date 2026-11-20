@@ -72,6 +72,7 @@ pub mod journal;
 pub mod kv_events;
 pub mod leases;
 pub mod loads;
+pub mod membership;
 pub mod memory;
 pub mod pairing;
 pub mod reservations;
@@ -92,15 +93,20 @@ pub use kv_events::{
     Admission, BatchFacts, BatchOutcome, KvCursor, KvEventSink, RankCursor, ResyncReason,
     SnapshotChunk,
 };
-pub use leases::{Dispatch, LeaseRecord, LeaseRefused, LeaseState, LeasesStore, Picked, Said};
+pub use leases::{
+    DecodeMark, DecodeSide, Dispatch, LeaseRecord, LeaseRefused, LeaseState, LeasesStore, Picked,
+    Said, Sides,
+};
 pub use loads::{LoadSample, LoadSink, LoadSource, PollMode};
-pub use memory::{AtWork, Cut, Hand, MemoryStore, StoreCounts};
+pub use membership::{Laid, NotMaker};
+pub use memory::{AtWork, Cut, Hand, MemoryStore, StoreCounts, Watch};
 pub use pairing::{PairClasses, PairingDescriptor};
 pub use reservations::{ReservationKind, ReservationStore};
 pub use sessions::{Pin, SessionsStore};
 pub use workers::{
-    identity, identity_of, HealthPolicy, MembershipChange, MembershipTail, Overload, Reachability,
-    Signals, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
+    identity, identity_of, token, HealthPolicy, Maker, MembershipChange, MembershipTail, Overload,
+    ProviderKey, Reachability, Signals, Unmade, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus,
+    WorkersStore,
 };
 pub use world::{
     Ask, Built, EncodePairBuffers, Naming, OutsideLists, PairBuffers, PoolView, StaleGeneration,

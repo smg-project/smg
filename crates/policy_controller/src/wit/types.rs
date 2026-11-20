@@ -459,6 +459,26 @@ pub(crate) const TYPES: &[Item] = &[
         blank_before: true,
     },
     Item::Record {
+        name: "score-answer",
+        doc: &[
+            " A scorer's answer: one score per candidate, and the tie band on the",
+            " scores' 0 to 1 scale. Rows within this band of the best score tie.",
+            " The host uses its default band where the guest sends none.",
+        ],
+        fields: &[
+            Field {
+                name: "scores",
+                ty: "list<f32>",
+            },
+            Field {
+                name: "tie-band",
+                ty: "option<f32>",
+            },
+        ],
+        inline: true,
+        blank_before: true,
+    },
+    Item::Record {
         name: "lease",
         doc: &[
             " The record of one issued decision, or of one side of a pair decision. The",
@@ -618,7 +638,19 @@ pub(crate) const TYPES: &[Item] = &[
         name: "membership",
         doc: &[
             " A membership change; `replaced` carries (old, new), `snapshot` every",
-            " worker of every pool the engine decides over.",
+            " worker of every pool the engine decides over. `left` carries a worker's",
+            " id and the models whose pools it left: its role moved, or it serves them",
+            " no longer. A registration that keeps its id says the word ahead of its",
+            " `relabelled` or `resized`; a new incarnation says its `replaced` first",
+            " and the word behind it, for the new id. A plugin that lists workers by",
+            " model unlists the worker under these names and keeps what it holds by",
+            " id. A model joined has no word, a role move names every model of the old",
+            " list, and a write that moves neither says none.",
+            " A snapshot names ids and no pool: an instance that hears one in place of",
+            " the changes it fell behind hears no `left` among them. A plugin that lists",
+            " workers by model then drops the ids the snapshot leaves out and holds the",
+            " rest as it knew them, and a decision's candidates say who stands in the",
+            " pool it decides over.",
         ],
         cases: &[
             "added(u64)",
@@ -627,6 +659,7 @@ pub(crate) const TYPES: &[Item] = &[
             "relabelled(u64)",
             "resized(u64)",
             "snapshot(list<u64>)",
+            "left(tuple<u64, list<string>>)",
         ],
         inline: false,
         blank_before: true,
@@ -639,8 +672,8 @@ pub(crate) const TYPES: &[Item] = &[
             " aggregated over every gateway (it stands while any gateway holds one, the",
             " microseconds are the longest remaining, 0 only when none remains). The",
             " deciding gateway's own veto is applied before any stage runs: in that",
-            " gateway's candidate rows alone the worker reads breaker-open (a breaker",
-            " veto) or stalled (a liveness veto).",
+            " gateway's candidate rows alone the worker reads stalled, and",
+            " breaker-open too under a breaker veto.",
         ],
         cases: &[
             "load(tuple<u64, u16, load>)",

@@ -12,35 +12,18 @@
 
 use std::{collections::HashMap, sync::Arc};
 
+use openai_protocol::worker::WorkerUpdateRequest as ProtocolWorkerUpdateRequest;
 /// Re-export the protocol types for convenience
 pub use openai_protocol::worker::{WorkerSpec, WorkerUpdateRequest as ProtocolUpdateRequest};
-use openai_protocol::{
-    model_card::ModelCard, worker::WorkerUpdateRequest as ProtocolWorkerUpdateRequest,
-};
 use serde::{Deserialize, Serialize};
-use wfaas::{StepId, WorkflowData, WorkflowError, WorkflowResult};
-
-// ============================================================================
-// Worker kind classification
-// ============================================================================
-
-/// Classification of worker type: local inference backend or external cloud API.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum WorkerKind {
-    /// Self-hosted inference backend (sglang, vllm, trtllm).
-    Local,
-    /// Cloud API endpoint (OpenAI, Anthropic, etc.).
-    External,
-}
-
+pub use smg_worker::jobs::WorkerRegistrationMode;
 use smg_worker::{
-    identity::basic::{ConnectionMode, Worker},
-    registry::WorkerId,
+    identity::basic::Worker, jobs::WorkerJobAsker, registry::WorkerId, workflow as worker_workflow,
 };
+use wfaas::{WorkflowData, WorkflowError, WorkflowResult};
 
 use super::{
-    mcp_registration::McpServerConfigRequest, steps::local::WorkerRemovalRequest,
-    tokenizer_registration::TokenizerConfigRequest,
+    mcp_registration::McpServerConfigRequest, tokenizer_registration::TokenizerConfigRequest,
     wasm_module_registration::WasmModuleConfigRequest,
     wasm_module_removal::WasmModuleRemovalRequest,
 };
@@ -87,127 +70,31 @@ pub trait WorkerRegistrationData: WorkflowData {
     }
 }
 
-/// Semantics of the final worker registry write.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum WorkerRegistrationMode {
-    /// `POST /workers`: fail when the URL is already registered.
-    CreateOnly,
-    /// Startup and service discovery: register the URL, replacing whatever
-    /// holds it. Both reconcile declared state against the registry.
-    #[default]
-    Upsert,
-    /// `PUT /workers/{id}`: replace the worker only while `worker_id` still
-    /// holds the URL at `expected_revision`.
-    ///
-    /// `PUT` answers 202 and registers later, so other writes for the same URL
-    /// can land in between. Binding the write to what the request validated
-    /// makes the late write fail instead of resurrecting a worker a `DELETE`
-    /// removed, overwriting one a `POST` created, or restoring the older
-    /// specification over a second `PUT` that finished first.
-    ReplaceById {
-        worker_id: String,
-        expected_revision: u64,
-    },
-}
-
-/// Wrapper for worker list that can be serialized
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct WorkerList {
-    /// Worker URLs (we can't serialize `Arc<dyn Worker>`, so we store URLs)
-    pub worker_urls: Vec<String>,
-}
-
-impl WorkerList {
-    pub fn new() -> Self {
-        Self {
-            worker_urls: Vec::new(),
-        }
-    }
-
-    pub fn from_workers(workers: &[Arc<dyn Worker>]) -> Self {
-        Self {
-            worker_urls: workers.iter().map(|w| w.url().to_string()).collect(),
-        }
-    }
-}
-
 // ============================================================================
-// Unified worker registration workflow data
+// Worker registration workflow data
 // ============================================================================
 
-/// Unified data for worker registration workflows (both local and external).
+/// What the gateway's own steps keep on a registration between them.
+#[derive(Debug, Clone, Default)]
+pub struct RegistrationNotes {
+    /// Under Symphony, the table whose failure classes the registration step
+    /// publishes at zero once the worker is in the registry (the create step
+    /// resolves it from the model card and the names; none for an HTTP
+    /// worker, the legacy parsers or a model no table reads).
+    pub symphony_table: Option<&'static str>,
+}
+
+/// Unified data for worker registration workflows (both local and external),
+/// with the gateway as their host.
 ///
 /// A `ClassifyWorkerTypeStep` runs first to populate `worker_kind`, then
 /// branch-specific steps check `worker_kind` and return `StepResult::Skip`
 /// when they don't apply.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkerWorkflowData {
-    pub config: WorkerSpec,
-    /// Defaults to upsert so persisted workflows from older versions preserve
-    /// their historical registration behavior when deserialized.
-    #[serde(default)]
-    pub registration_mode: WorkerRegistrationMode,
-    /// Determined by ClassifyWorkerTypeStep (Local or External).
-    pub worker_kind: Option<WorkerKind>,
-    // -- Local-only fields --
-    pub connection_mode: Option<ConnectionMode>,
-    /// HTTP workers: whether the router speaks HTTP/2 prior knowledge,
-    /// resolved by DetectConnectionModeStep.
-    #[serde(default)]
-    pub http2: Option<bool>,
-    /// The worker-directed client for `http2` (transient; see
-    /// [`Self::http_client`]).
-    #[serde(skip, default)]
-    pub http_client_handle: Option<Arc<reqwest::Client>>,
-    pub detected_runtime_type: Option<String>,
-    pub discovered_labels: HashMap<String, String>,
-    pub dp_info: Option<super::steps::local::DpInfo>,
-    /// Under Symphony, the table whose failure classes the registration step
-    /// publishes at zero once the worker is in the registry (transient; the
-    /// create step resolves it from the model card and the names; none for
-    /// an HTTP worker, the legacy parsers or a model no table reads).
-    #[serde(skip, default)]
-    pub symphony_table: Option<&'static str>,
-    // -- External-only fields --
-    pub model_cards: Vec<ModelCard>,
-    // -- Shared fields --
-    pub workers: Option<WorkerList>,
-    pub final_labels: HashMap<String, String>,
-    /// Application context (transient, must be re-initialized after deserialization)
-    #[serde(skip, default)]
-    pub app_context: Option<Arc<AppContext>>,
-    /// Actual worker objects (transient, not serialized)
-    #[serde(skip, default)]
-    pub actual_workers: Option<Vec<Arc<dyn Worker>>>,
-}
-
-impl WorkflowData for WorkerWorkflowData {
-    fn workflow_type() -> &'static str {
-        "worker_registration"
-    }
-}
-
-impl WorkerWorkflowData {
-    /// The worker-directed client for the resolved HTTP version, re-fetched
-    /// from the cache when a deserialize dropped the transient handle.
-    pub fn http_client(&self, step_id: &str) -> WorkflowResult<Arc<reqwest::Client>> {
-        if let Some(client) = &self.http_client_handle {
-            return Ok(Arc::clone(client));
-        }
-        let app_context = require_app_context(self.app_context.as_ref())?;
-        app_context
-            .worker_client_cache
-            .get(&self.config.http_pool, self.http2.unwrap_or(false))
-            .map_err(|message| WorkflowError::StepFailed {
-                step_id: StepId::new(step_id),
-                message,
-            })
-    }
-}
+pub type WorkerWorkflowData = worker_workflow::WorkerRegistrationWorkflowData<AppContext>;
 
 impl WorkerRegistrationData for WorkerWorkflowData {
     fn get_app_context(&self) -> Option<&Arc<AppContext>> {
-        self.app_context.as_ref()
+        self.host.as_ref()
     }
 
     fn get_actual_workers(&self) -> Option<&Vec<Arc<dyn Worker>>> {
@@ -219,7 +106,7 @@ impl WorkerRegistrationData for WorkerWorkflowData {
     }
 
     fn symphony_table(&self) -> Option<&'static str> {
-        self.symphony_table
+        self.host_notes.symphony_table
     }
 
     fn registration_mode(&self) -> WorkerRegistrationMode {
@@ -247,55 +134,16 @@ impl WorkflowData for TokenizerWorkflowData {
     }
 }
 
-/// Data for worker removal workflow
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkerRemovalWorkflowData {
-    pub config: WorkerRemovalRequest,
-    pub workers_to_remove: Option<WorkerList>,
-    /// URLs of workers being removed
-    pub worker_urls: Vec<String>,
-    /// Model IDs affected by the removal
-    pub affected_models: std::collections::HashSet<String>,
-    /// Application context (transient, must be re-initialized after deserialization)
-    #[serde(skip, default)]
-    pub app_context: Option<Arc<AppContext>>,
-    /// Actual worker objects to remove (transient, not serialized)
-    #[serde(skip, default)]
-    pub actual_workers_to_remove: Option<Vec<Arc<dyn Worker>>>,
-    /// The workers the registry step removed at those URLs, a same-URL
-    /// replacement that landed during the drain rather than the worker found
-    /// (transient, not serialized)
-    #[serde(skip, default)]
-    pub removed_workers: Vec<Arc<dyn Worker>>,
-}
-
-impl WorkerRemovalWorkflowData {
-    /// Narrows the job to `kept`, the workers it still holds: the selection's
-    /// result, or what a step left after it found some of them standing on
-    /// their own (a pin that moved, a registration under the URL since the
-    /// selection). The worker list, the URLs and the affected models move
-    /// together, so the steps after it touch nothing of the others.
-    pub fn keep_only(&mut self, kept: Vec<Arc<dyn Worker>>) {
-        self.worker_urls = kept.iter().map(|worker| worker.url().to_string()).collect();
-        self.affected_models = kept
-            .iter()
-            .map(|worker| worker.model_id().to_string())
-            .collect();
-        self.workers_to_remove = Some(WorkerList::from_workers(&kept));
-        self.actual_workers_to_remove = Some(kept);
-    }
-}
-
-impl WorkflowData for WorkerRemovalWorkflowData {
-    fn workflow_type() -> &'static str {
-        "worker_removal"
-    }
-}
+/// Data for worker removal workflow: the worker crate's, with this gateway's
+/// context as the host its steps read.
+pub type WorkerRemovalWorkflowData = worker_workflow::WorkerRemovalWorkflowData<AppContext>;
 
 /// Data for worker update workflow
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerUpdateWorkflowData {
     pub config: ProtocolWorkerUpdateRequest,
+    /// Who asked for the update or label refresh. A host's own step reads it.
+    pub asker: WorkerJobAsker,
     /// URL of worker(s) to update
     pub worker_url: String,
     /// Application context (transient, must be re-initialized after deserialization)

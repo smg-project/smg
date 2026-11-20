@@ -5,9 +5,22 @@
 //! deepest block of its request that a worker was sent, and the workers
 //! sent it.
 //!
-//! One model has one decider, and the model's predictor is that decider's
-//! own state: one thread reads it and writes it, under the decider's turn.
-//! Nothing here is shared, locked or ordered against another thread.
+//! This is the `tree` kind of the document's index settings
+//! ([`IndexKind`](crate::spec::IndexKind)). The `hash` kind is not built.
+//!
+//! Nothing here is locked or ordered against another thread. A read takes
+//! the predictor by a shared reference and writes nothing, so an owner may
+//! lend it to many readers at once. A write takes it alone. A caller folds
+//! a request's keys once, in a buffer of its own
+//! ([`Predictor::fold_into`]), and hands them to the read and to the write
+//! behind it.
+//!
+//! The in-process door ([`Door`](crate::door::Door)) seats a request by
+//! its calling thread unless the generation holds a stage that keeps
+//! state a decider (`Engine::keeps_deciders`). A stage that reads a
+//! predictor there joins that fact, or the predictor takes a shared
+//! owner: with neither, a door would split a model's predictor between
+//! its callers' seats, with no error.
 //!
 //! What is kept. A request carries its prefix as one hash a block of its
 //! content ([`RequestFacts::block_hashes`](crate::RequestFacts::block_hashes)).
@@ -19,6 +32,13 @@
 //! request sent before, and at most one more than the logarithm of its
 //! blocks for any other. The fold itself is one multiplication a block.
 //!
+//! A block keeps the tick of its last use: the tick it was made at, and
+//! the tick of each write that ended at it. The tick is the caller's clock
+//! in steps of the caller's choice, and the predictor reads no clock. A
+//! read says whether its deepest block is fresh at a tick
+//! ([`Deepest::fresh`]), so an owner can pass no write for a request sent
+//! a moment ago.
+//!
 //! What is forgotten. The bound is a count of placements, a block for a
 //! worker. Blocks leave by last use, a block that none follows first. The
 //! predictor lists every block a request ended at, oldest first. It takes
@@ -29,14 +49,21 @@
 //! leading part of it. A block leaves with every worker sent it.
 //!
 //! A worker that left is skipped by the next read. Its placements are
-//! taken out by the sweep, a bounded count a call, and its place is given
-//! to another worker once a whole pass has run since it left.
+//! taken out by the sweep, and a path no worker is left of leaves with
+//! them from its deep end, a block a step: a call takes out as many
+//! blocks as its budget and no more. A block that none follows and no
+//! worker is left of waits in a list of its own, and the next step
+//! takes it ahead of the oldest end. A worker's place is given to
+//! another worker once a whole pass has run since it left.
 //!
 //! Memory: 32 bytes a block and its entry in a map, about 60 bytes
 //! together. A block that more than one worker was sent keeps their
-//! places in a list of its own, two bytes a worker. The blocks stand in
-//! pieces of 4,096 that never move, and the keys in 256 maps by their top
-//! byte, so a growth moves one map's entries.
+//! places in a list of its own: two bytes a worker, room for eight
+//! places or for twice its workers at most, whichever is more, and the
+//! list's own 24 bytes. A block left with one worker holds it in itself
+//! again, and a list no block uses keeps room for eight places at most.
+//! The blocks stand in pieces of 4,096 that never move, and the keys in
+//! 256 maps by their top byte, so a growth moves one map's entries.
 
 use std::{mem, slice};
 
@@ -44,9 +71,10 @@ use rustc_hash::FxHashMap;
 
 use crate::view::WorkerId;
 
-/// No block: the end of the list, and the block before a request's first.
+/// No block: the end of a list, and the block before a request's first.
 const NONE: u32 = u32::MAX;
-/// In a block's links: the block is not on the list of ends.
+/// In a block's links: the block is on neither list, the ends or the
+/// blocks that wait.
 const UNLISTED: u32 = u32::MAX - 1;
 /// In a block's count of followers: the entry is free.
 const FREE: u32 = u32::MAX;
@@ -57,6 +85,8 @@ const NOBODY: u16 = u16::MAX;
 const CHUNK: usize = 1 << 12;
 /// The maps a key is found through, one for each value of its top byte.
 const MAPS: usize = 1 << 8;
+/// The places of room a list of workers keeps while no block uses it.
+const POOLED: usize = 8;
 
 /// The key of a prefix one block longer: the key before it folded with the
 /// block's hash. The key's top bits take every bit of both.
@@ -79,9 +109,12 @@ struct Block {
     before: u32,
     /// How many blocks have it before them; `FREE` in a free entry.
     after: u32,
-    /// The next older block of the list of ends; `UNLISTED` off the list.
+    /// The next older block of the list of ends. Among the blocks that
+    /// wait the links are places, not ages: this is the block linked
+    /// after it. `UNLISTED` off both lists.
     older: u32,
-    /// The next newer one; `UNLISTED` off the list.
+    /// The next newer block of the list of ends, or the block linked
+    /// before it among those that wait; `UNLISTED` off both lists.
     newer: u32,
     /// The group of the workers sent the block; `NONE` where one worker
     /// was, or none is left.
@@ -89,6 +122,9 @@ struct Block {
     /// The one worker sent the block; `NOBODY` under a group, and where
     /// none is left.
     lone: u16,
+    /// The caller's tick at the block's last use: when it was made, and at
+    /// each write that ended at it.
+    touched: u16,
 }
 
 impl Block {
@@ -101,7 +137,19 @@ impl Block {
         newer: UNLISTED,
         group: NONE,
         lone: NOBODY,
+        touched: 0,
     };
+
+    /// Whether no worker is left of the block.
+    const fn unheld(&self) -> bool {
+        self.lone == NOBODY && self.group == NONE
+    }
+
+    /// Whether the block waits to leave: none follows it and no worker is
+    /// left of it.
+    const fn waits(&self) -> bool {
+        self.after == 0 && self.unheld()
+    }
 }
 
 /// What a probe asks of a block it finds.
@@ -135,6 +183,10 @@ pub struct Predictor {
     oldest: u32,
     /// The newest.
     newest: u32,
+    /// The first of the blocks that wait: none follows such a block and
+    /// no worker is left of it. They stand in a list of their own, and
+    /// the next step takes one out.
+    waiting: u32,
     /// The worker of each place.
     workers: Vec<WorkerId>,
     /// The place of each worker of the pool.
@@ -160,12 +212,6 @@ pub struct Predictor {
     blocks: usize,
     /// The placements a write did not make, for the bound or for places.
     dropped: u64,
-    /// The seed of the request folded last.
-    seed: u64,
-    /// Its hashes.
-    request: Vec<u64>,
-    /// Its keys, one a block.
-    keys: Vec<u64>,
 }
 
 /// What a read found: the deepest block of the request that a worker of
@@ -184,6 +230,20 @@ impl<'a> Deepest<'a> {
     /// where none was sent its first block.
     pub fn blocks(&self) -> u32 {
         self.blocks
+    }
+
+    /// Whether the deepest block's last use was at `tick`: it was made at
+    /// that tick, or a write at that tick ended at it. `false` where no
+    /// worker was sent the request's first block.
+    ///
+    /// An owner passes no write where a read finds the whole request
+    /// ([`Self::blocks`] is the count of its keys), its end fresh at the
+    /// owner's tick and the picked worker among [`Self::holders`]: that
+    /// write would move nothing a reader can see. The list of ends is then
+    /// true to one tick. A tick is sixteen bits: a block last used 65,536
+    /// ticks ago reads fresh once, and one move of the list is passed.
+    pub fn fresh(&self, tick: u16) -> bool {
+        self.at != NONE && self.predictor.block(self.at).touched == tick
     }
 
     /// The workers of the pool that were sent that many, in no order.
@@ -216,6 +276,7 @@ impl Predictor {
             free_groups: Vec::new(),
             oldest: NONE,
             newest: NONE,
+            waiting: NONE,
             workers: Vec::new(),
             places: FxHashMap::default(),
             live: Vec::new(),
@@ -228,9 +289,6 @@ impl Predictor {
             placements: 0,
             blocks: 0,
             dropped: 0,
-            seed: 0,
-            request: Vec::new(),
-            keys: Vec::new(),
         }
     }
 
@@ -268,14 +326,25 @@ impl Predictor {
         self.dropped
     }
 
-    /// Reads a request: the deepest of its blocks that a worker of the
-    /// pool was sent, and the workers sent it. `seed` is the request's
-    /// cache namespace ([`RequestFacts::namespace_seed`](crate::RequestFacts::namespace_seed)):
-    /// the same blocks under another seed are another prefix. Nothing is
-    /// written but the request's keys, which the issue's write reads back.
-    pub fn deepest(&mut self, seed: u64, hashes: &[u64]) -> Deepest<'_> {
-        self.fold_request(seed, hashes);
-        let (blocks, at) = self.depth(hashes.len(), Ask::Live);
+    /// A request's keys into `keys`, one a block: each is the fold of the
+    /// hashes up to its block under `seed`, the request's cache namespace
+    /// ([`RequestFacts::namespace_seed`](crate::RequestFacts::namespace_seed)).
+    /// The same blocks under another seed are another prefix. `keys` is
+    /// cleared and filled, and allocates only while it grows.
+    pub fn fold_into(keys: &mut Vec<u64>, seed: u64, hashes: &[u64]) {
+        keys.clear();
+        let mut key = seed;
+        keys.extend(hashes.iter().map(|&hash| {
+            key = fold(key, hash);
+            key
+        }));
+    }
+
+    /// Reads a request by its keys ([`Self::fold_into`]): the deepest of
+    /// its blocks that a worker of the pool was sent, and the workers sent
+    /// it. Nothing is written.
+    pub fn deepest(&self, keys: &[u64]) -> Deepest<'_> {
+        let (blocks, at) = self.depth(keys, keys.len(), Ask::Live);
         Deepest {
             predictor: self,
             at,
@@ -283,18 +352,30 @@ impl Predictor {
         }
     }
 
-    /// Records a request as sent to `worker`: the blocks past what the
-    /// worker was already sent of it, and the request as the newest use
-    /// of its path. A request the worker was sent before adds nothing.
+    /// Records a request, by its keys ([`Self::fold_into`]), as sent to
+    /// `worker` at the caller's `tick`: the blocks past what the worker
+    /// was already sent of it, and the request as the newest use of its
+    /// path. A request the worker was sent before adds nothing. A block
+    /// the write makes takes the tick, and so does the block it ends at.
     ///
-    /// At the bound the oldest blocks that none follows leave first, never
-    /// a block of the request itself. The write takes at most two steps
-    /// for each block it needs and eight more: a step takes one block out
-    /// or passes over one that others follow. Where that makes no room
-    /// for all of it, the request's leading blocks are written as far as
-    /// the room goes and the rest is counted ([`Predictor::dropped`]).
-    pub fn sent(&mut self, seed: u64, hashes: &[u64], worker: WorkerId) {
-        let blocks = hashes.len();
+    /// A write of a longer leading part of a request behind a write of a
+    /// shorter one leaves what one write of the longer leaves, so an owner
+    /// may write a long request in parts.
+    ///
+    /// At the bound the blocks that wait leave first, then the oldest that
+    /// none follows, never a block of the request itself. The write takes
+    /// at most two steps for each block it needs and eight more: a step
+    /// takes one block out or passes over one that others follow. Where
+    /// that makes no room for all of it, the request's leading blocks are
+    /// written as far as the room goes and the rest is counted
+    /// ([`Predictor::dropped`]).
+    ///
+    /// Call it only for a worker of the pool. A write gives its worker a
+    /// place, and only [`Predictor::forget`] takes the place back: a write
+    /// for a worker told gone gives it a place again, and nothing takes
+    /// that one back until the worker is told gone once more.
+    pub fn sent(&mut self, keys: &[u64], worker: WorkerId, tick: u16) {
+        let blocks = keys.len();
         if blocks == 0 {
             return;
         }
@@ -302,25 +383,29 @@ impl Predictor {
             self.dropped += blocks as u64;
             return;
         };
-        self.fold_request(seed, hashes);
         // What anyone was sent of the request, and what the worker was.
-        let (have, end) = self.depth(blocks, Ask::Any);
-        let (held, mut before) = self.depth(have, Ask::Holds(place));
+        let (have, end) = self.depth(keys, blocks, Ask::Any);
+        let (held, mut before) = self.depth(keys, have, Ask::Holds(place));
         let need = blocks - held;
         if need == 0 {
-            self.touch(before);
+            self.end_at(before, tick);
             return;
         }
         // The request's own path is the newest before any block leaves for
-        // it, and its deepest block is kept: the write stands on it.
+        // it, and its deepest block is kept: the write stands on it. A
+        // block that waited is an end again while the write runs.
         if end != NONE {
-            self.touch(end);
+            if self.block(end).waits() {
+                self.unlink_waiting(end);
+                self.link_newest(end);
+            } else {
+                self.touch(end);
+            }
         }
         self.make_room(need, end);
-        let take = need.min(self.bound.saturating_sub(self.placements));
-        self.dropped += (need - take) as u64;
-        for at in held..held + take {
-            let key = self.keys[at];
+        let room = need.min(self.bound.saturating_sub(self.placements));
+        self.dropped += (need - room) as u64;
+        for (at, &key) in keys.iter().enumerate().take(held + room).skip(held) {
             before = match self.find(key) {
                 Some(block) => {
                     if self.add(block, place) {
@@ -329,8 +414,8 @@ impl Predictor {
                     block
                 }
                 None => {
-                    let Some(block) = self.take(key, before, place) else {
-                        self.dropped += (held + take - at) as u64;
+                    let Some(block) = self.take(key, before, place, tick) else {
+                        self.dropped += (held + room - at) as u64;
                         break;
                     };
                     self.placements += 1;
@@ -339,7 +424,13 @@ impl Predictor {
             };
         }
         if before != NONE {
-            self.touch(before);
+            self.end_at(before, tick);
+        }
+        // A block no worker is left of that the write stood on and gave
+        // nothing waits again: the next step takes it.
+        if end != NONE && self.block(end).waits() {
+            self.unlink(end);
+            self.link_waiting(end);
         }
     }
 
@@ -358,14 +449,18 @@ impl Predictor {
     }
 
     /// The work that waits, `budget` steps of it at most, on the decider's
-    /// thread as it leaves a turn: the oldest blocks leave while more
-    /// placements are held than the bound, then the placements of the
-    /// workers that left are taken out, an entry a step. Returns the steps
-    /// taken: fewer than `budget` where nothing waits.
+    /// thread as it leaves a turn. A block that none follows and no worker
+    /// is left of leaves first. The oldest blocks leave while more
+    /// placements are held than the bound. The placements of the workers
+    /// that left are taken out, and a path no worker is left of leaves
+    /// from its deep end. A step visits one entry, takes one block out or
+    /// passes over one that others follow, so a call takes out `budget`
+    /// blocks at most. Returns the steps taken: fewer than `budget` where
+    /// nothing waits.
     pub fn sweep(&mut self, budget: usize) -> usize {
         let mut steps = 0;
         while steps < budget {
-            if self.placements > self.bound && self.forget_oldest(NONE) {
+            if (self.waiting != NONE || self.placements > self.bound) && self.forget_one(NONE) {
                 steps += 1;
                 continue;
             }
@@ -418,26 +513,26 @@ impl Predictor {
         }
     }
 
-    /// The block of the folded request's place `at`, where it passes.
-    fn probe(&self, at: usize, ask: Ask) -> Option<u32> {
-        let block = self.find(self.keys[at])?;
+    /// The block of the request's key at place `at`, where it passes.
+    fn probe(&self, keys: &[u64], at: usize, ask: Ask) -> Option<u32> {
+        let block = self.find(keys[at])?;
         self.passes(self.block(block), ask).then_some(block)
     }
 
-    /// How many of the folded request's first `within` blocks pass, and
-    /// the last of them. The blocks that pass are a leading part of the
-    /// request, so the last one first, then by halves.
-    fn depth(&self, within: usize, ask: Ask) -> (usize, u32) {
+    /// How many of the request's first `within` blocks pass, and the last
+    /// of them. The blocks that pass are a leading part of the request, so
+    /// the last one first, then by halves.
+    fn depth(&self, keys: &[u64], within: usize, ask: Ask) -> (usize, u32) {
         let Some(last) = within.checked_sub(1) else {
             return (0, NONE);
         };
-        if let Some(block) = self.probe(last, ask) {
+        if let Some(block) = self.probe(keys, last, ask) {
             return (within, block);
         }
         let (mut low, mut high, mut found) = (0, last, NONE);
         while low < high {
             let middle = low + (high - low) / 2;
-            match self.probe(middle, ask) {
+            match self.probe(keys, middle, ask) {
                 Some(block) => {
                     low = middle + 1;
                     found = block;
@@ -446,23 +541,6 @@ impl Predictor {
             }
         }
         (low, found)
-    }
-
-    /// The keys of a request, kept: the write that follows a read of the
-    /// same request folds nothing again.
-    fn fold_request(&mut self, seed: u64, hashes: &[u64]) {
-        if self.seed == seed && self.request.as_slice() == hashes {
-            return;
-        }
-        self.seed = seed;
-        self.request.clear();
-        self.request.extend_from_slice(hashes);
-        self.keys.clear();
-        let mut key = seed;
-        self.keys.extend(hashes.iter().map(|&hash| {
-            key = fold(key, hash);
-            key
-        }));
     }
 
     /// The worker's place, a new one where it has none; `None` past the
@@ -525,9 +603,9 @@ impl Predictor {
         true
     }
 
-    /// A new block of one worker behind `before`; `None` past the entries
-    /// a link can name.
-    fn take(&mut self, key: u64, before: u32, place: u16) -> Option<u32> {
+    /// A new block of one worker behind `before`, made at `tick`; `None`
+    /// past the entries a link can name.
+    fn take(&mut self, key: u64, before: u32, place: u16, tick: u16) -> Option<u32> {
         let at = if self.free == NONE {
             if self.span == UNLISTED {
                 return None;
@@ -548,6 +626,7 @@ impl Predictor {
             before,
             after: 0,
             lone: place,
+            touched: tick,
             ..Block::BLANK
         };
         self.maps[map_of(key)].insert(key, at);
@@ -603,6 +682,32 @@ impl Predictor {
         }
     }
 
+    /// Puts a block that waits first on its list.
+    fn link_waiting(&mut self, at: u32) {
+        let first = mem::replace(&mut self.waiting, at);
+        let block = self.block_mut(at);
+        block.older = NONE;
+        block.newer = first;
+        if first != NONE {
+            self.block_mut(first).older = at;
+        }
+    }
+
+    /// Takes a block off the list of those that wait.
+    fn unlink_waiting(&mut self, at: u32) {
+        let block = self.block_mut(at);
+        let older = mem::replace(&mut block.older, UNLISTED);
+        let newer = mem::replace(&mut block.newer, UNLISTED);
+        if older == NONE {
+            self.waiting = newer;
+        } else {
+            self.block_mut(older).newer = newer;
+        }
+        if newer != NONE {
+            self.block_mut(newer).older = older;
+        }
+    }
+
     /// A request ended at the block: it is the newest of the list.
     fn touch(&mut self, at: u32) {
         if self.newest == at {
@@ -614,11 +719,24 @@ impl Predictor {
         self.link_newest(at);
     }
 
-    /// One step at the old end of the list, never past `keep`: a block
-    /// that others follow leaves the list, one that none follows leaves
-    /// the predictor. Whether a step was taken.
-    fn forget_oldest(&mut self, keep: u32) -> bool {
-        let at = self.oldest;
+    /// A write at `tick` ended at the block: it is the newest of the list,
+    /// and its last use is that tick.
+    fn end_at(&mut self, at: u32, tick: u16) {
+        self.touch(at);
+        self.block_mut(at).touched = tick;
+    }
+
+    /// One step of forgetting, never past `keep`. A block that waits
+    /// leaves first. With none, the step is at the old end of the list: a
+    /// block that others follow leaves the list, one that none follows
+    /// leaves the predictor. Whether a step was taken.
+    fn forget_one(&mut self, keep: u32) -> bool {
+        let at = if self.waiting == NONE {
+            self.oldest
+        } else {
+            debug_assert_ne!(self.waiting, keep, "a write's block is an end as it runs");
+            self.take_waiting()
+        };
         if at == NONE || at == keep {
             return false;
         }
@@ -630,58 +748,75 @@ impl Predictor {
         true
     }
 
+    /// Takes the first block that waits off its list, for the step to
+    /// take out. A block waits only behind a worker that left, so this
+    /// stands out of a write's own line.
+    #[cold]
+    #[inline(never)]
+    fn take_waiting(&mut self) -> u32 {
+        let at = self.waiting;
+        self.unlink_waiting(at);
+        at
+    }
+
     /// Room for `need` placements of a write that stands on `keep`: at
-    /// most two steps at the old end for each, and eight more.
+    /// most two steps of forgetting for each, and eight more.
     fn make_room(&mut self, need: usize, keep: u32) {
         let mut steps = 2 * need + 8;
-        while steps != 0 && self.placements + need > self.bound && self.forget_oldest(keep) {
+        while steps != 0 && self.placements + need > self.bound && self.forget_one(keep) {
             steps -= 1;
         }
     }
 
-    /// Takes out a block that none follows, with every worker sent it.
+    /// Takes out a block that none follows, with every worker sent it. A
+    /// block that waited is off its list already: the caller took it.
     /// The block before it, where this leaves it with no follower, takes
-    /// its place at the old end unless a later request ended there; where
-    /// no worker is left of that block, it goes too, and so on up the
-    /// path, never past `keep`.
-    fn drop_block(&mut self, mut at: u32, keep: u32) {
-        loop {
-            let block = *self.block(at);
-            debug_assert_eq!(block.after, 0, "a block that others follow stays");
-            if block.older != UNLISTED {
-                self.unlink(at);
-            }
-            self.maps[map_of(block.key)].remove(&block.key);
-            if block.group == NONE {
-                self.placements -= usize::from(block.lone != NOBODY);
+    /// its place at the old end unless a later request ended there. Where
+    /// no worker is left of that block it waits instead, whatever ended
+    /// there, and the next step takes it: a path no worker is left of
+    /// leaves a block a step. A block a write stands on (`keep`) stays
+    /// where it is.
+    fn drop_block(&mut self, at: u32, keep: u32) {
+        let block = *self.block(at);
+        debug_assert_eq!(block.after, 0, "a block that others follow stays");
+        if block.older != UNLISTED {
+            self.unlink(at);
+        }
+        self.maps[map_of(block.key)].remove(&block.key);
+        if block.group == NONE {
+            self.placements -= usize::from(block.lone != NOBODY);
+        } else {
+            let group = &mut self.groups[block.group as usize];
+            self.placements -= group.len();
+            if group.capacity() > POOLED {
+                *group = Vec::new();
             } else {
-                let group = &mut self.groups[block.group as usize];
-                self.placements -= group.len();
                 group.clear();
-                self.free_groups.push(block.group);
             }
-            *self.block_mut(at) = Block {
-                before: self.free,
-                ..Block::BLANK
-            };
-            self.free = at;
-            self.blocks -= 1;
-            if block.before == NONE {
-                return;
-            }
-            let before = self.block_mut(block.before);
-            before.after -= 1;
-            if before.after != 0 || block.before == keep {
-                return;
-            }
-            if before.lone == NOBODY && before.group == NONE {
-                at = block.before;
-                continue;
-            }
-            if before.older == UNLISTED {
-                self.link_oldest(block.before);
-            }
+            self.free_groups.push(block.group);
+        }
+        *self.block_mut(at) = Block {
+            before: self.free,
+            ..Block::BLANK
+        };
+        self.free = at;
+        self.blocks -= 1;
+        if block.before == NONE {
             return;
+        }
+        let before = self.block_mut(block.before);
+        before.after -= 1;
+        if before.after != 0 || block.before == keep {
+            return;
+        }
+        let (unheld, listed) = (before.unheld(), before.older != UNLISTED);
+        if unheld {
+            if listed {
+                self.unlink(block.before);
+            }
+            self.link_waiting(block.before);
+        } else if !listed {
+            self.link_oldest(block.before);
         }
     }
 
@@ -710,6 +845,7 @@ impl Predictor {
     /// The pass's next entry: the workers that left are taken out of its
     /// holders, and a block left with no worker and no follower goes.
     fn clear_next(&mut self) {
+        debug_assert_eq!(self.waiting, NONE, "the sweep takes what waits first");
         let at = self.cursor;
         self.cursor += 1;
         self.to_visit -= 1;
@@ -725,14 +861,24 @@ impl Predictor {
                 let held = group.len();
                 group.retain(|&place| self.is_live(place));
                 self.placements -= held - group.len();
-                if group.is_empty() {
+                if group.len() < 2 {
+                    // A block left with one worker holds it in itself
+                    // again, and the list's room goes back.
                     self.free_groups.push(block.group);
-                    self.block_mut(at).group = NONE;
+                    let lone = group.first().copied().unwrap_or(NOBODY);
+                    let block = self.block_mut(at);
+                    (block.lone, block.group) = (lone, NONE);
+                } else {
+                    if group.capacity() > 2 * group.len() {
+                        group.shrink_to_fit();
+                    }
+                    self.groups[block.group as usize] = group;
                 }
-                self.groups[block.group as usize] = group;
             }
-            let block = self.block(at);
-            if block.after == 0 && block.lone == NOBODY && block.group == NONE {
+            // No block waits while the pass visits, so one the visit
+            // leaves with no worker and no follower is an end of the
+            // list, and goes at once.
+            if self.block(at).waits() {
                 self.drop_block(at, NONE);
             }
         }

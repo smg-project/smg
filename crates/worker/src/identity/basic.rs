@@ -168,7 +168,9 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// Returns a reference to avoid cloning on every access
     fn connection_mode(&self) -> &ConnectionMode;
 
-    /// Get the worker's lifecycle status.
+    /// Get the worker's lifecycle status. A worker that returns a runtime
+    /// state ([`Self::runtime_state`]) reads its status from it: the
+    /// registry's health sink reads the status that stands there.
     fn status(&self) -> WorkerStatus;
 
     /// Get the current monotonic worker revision.
@@ -443,6 +445,18 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// `BasicWorker` overrides it to read both under a single runtime guard.
     fn is_healthy_and_eligible(&self) -> bool {
         self.is_healthy() && !self.is_overloaded() && self.stall_reason().is_none()
+    }
+
+    /// Publish the series this worker carries while it is registered: its
+    /// health, its HTTP/2 flag and its circuit breaker's state. The registry
+    /// calls this where the worker enters, at a registration and at a
+    /// replacement. Building a worker writes none of them, so a worker that
+    /// is built and never enters leaves the series of its address as they
+    /// stood.
+    fn publish_series(&self) {
+        Metrics::set_worker_health(self.url(), self.is_healthy());
+        Metrics::set_worker_http2(self.url(), self.http2());
+        Metrics::set_worker_cb_state(self.url(), self.circuit_breaker_state().as_int());
     }
 
     /// Publish the worker's routing state for an address whose series were
@@ -1215,19 +1229,18 @@ impl BasicWorker {
         }
     }
 
+    /// The adoption writes no health and no breaker series: the registry has
+    /// the replacement publish its own once it has entered
+    /// ([`Worker::publish_series`]). The routing state moves here, from the
+    /// pair the replaced instance published.
     fn install_shared_state_from_basic(&self, other: &BasicWorker) {
         let shared_runtime = other.shared_runtime();
         shared_runtime.bump_revision();
-        let shared_status = shared_runtime.status();
         self.runtime.store(shared_runtime);
-        Metrics::set_worker_health(self.url(), shared_status == WorkerStatus::Ready);
 
         let existing_cb = self.circuit_breaker.load();
         let other_cb = other.circuit_breaker.load_full();
         if other_cb.config() == existing_cb.config() {
-            // Building this worker reset the URL's breaker state gauge to
-            // closed; the adopted breaker is what monitoring must show.
-            other_cb.publish_metrics();
             self.circuit_breaker.store(other_cb);
         }
         self.publish_state();
@@ -1242,15 +1255,22 @@ impl BasicWorker {
     /// a replacement starting from an empty cell would unbind the live sockets,
     /// rebind, and wait for a HELLO that never arrives.
     ///
+    /// Only a replacement that dials the same base address adopts it. The
+    /// URL alone does not say so: a host may key a worker by a URL of its own
+    /// and state the engine's address beside it, and a replacement under that
+    /// key whose address moved reads another engine.
+    ///
     /// `zmq_connect_started` is deliberately left cleared rather than copied:
     /// the shared cell already dedupes a handshake in flight, and a cleared
     /// guard lets the replacement retry (and signal under its own revision) if
     /// that handshake fails.
     fn adopt_backend_client_from(&self, other: &BasicWorker) {
-        // A transport or runtime change means a different wire protocol, and a
-        // replacement that arrived with its own client keeps it.
+        // A transport or runtime change means a different wire protocol, a
+        // base address change another engine, and a replacement that arrived
+        // with its own client keeps it.
         if self.metadata.spec.connection_mode != other.metadata.spec.connection_mode
             || self.metadata.spec.runtime_type != other.metadata.spec.runtime_type
+            || self.metadata.base_url() != other.metadata.base_url()
             || self.engine_connection.load_full().get().is_some()
         {
             return;
@@ -1791,6 +1811,17 @@ impl Worker for BasicWorker {
         if after != before || after == CircuitState::Open {
             self.publish_state();
         }
+    }
+
+    /// The breaker publishes itself, under the lock that orders its gauge
+    /// writes: a transition that races the entry cannot leave the gauge
+    /// behind the state. Its counters are on the scrape from zero.
+    fn publish_series(&self) {
+        Metrics::set_worker_health(self.url(), self.is_healthy());
+        Metrics::set_worker_http2(self.url(), self.http2());
+        let breaker = self.circuit_breaker.load();
+        breaker.publish_zero_counters();
+        breaker.publish_metrics();
     }
 
     fn republish_state(&self) {

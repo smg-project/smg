@@ -4748,6 +4748,20 @@ fn long_entry_bytes(piece: &[u8], ids: &[u32]) -> usize {
     LONG_PIECE_ENTRY_BYTES + piece.len() + size_of_val(ids)
 }
 
+/// How many distinct long pieces of 80 bytes take more than `share` bytes
+/// of the long tier whatever their ids are: an entry takes at least its
+/// piece and its slot.
+fn long_pieces_past(share: usize) -> u32 {
+    u32::try_from(share / (LONG_PIECE_ENTRY_BYTES + 80) + 1).expect("a count of pieces")
+}
+
+/// That many distinct long pieces of 80 bytes, one a line.
+fn long_lines(pieces: u32) -> String {
+    (0..pieces)
+        .map(|i| format!("{}\n", letters(80, i)))
+        .collect()
+}
+
 /// A piece of 16 to 32 bytes is kept in the wide table when its ids fit an
 /// entry and in the map when they do not: every first sight stores the piece
 /// in one of the two, and a second encode reads the same ids.
@@ -4975,15 +4989,15 @@ fn long_pieces_stay_within_their_byte_share() {
     let tokenizer = tokenizer_of(shape, &mut state);
     let native = seeded(&tokenizer);
     let model = tokenizer.get_model();
-    // Distinct long pieces worth more than one thread's share: each
-    // entry takes its 80 bytes, its ids (at least 27, the model merges
-    // pairs) and its slot, so 16,000 of them are over 3 MB.
-    let words = 16_000u32;
-    let text: String = (0..words)
-        .map(|i| format!("{}\n", letters(80, i)))
-        .collect();
-    native.encode(Some(model), &text, false).expect("ids");
+    // Distinct long pieces worth more than the share of a thread that
+    // encodes alone, which is the whole bound of a thread.
+    let words = long_pieces_past(LONG_PIECE_BYTES_CAPACITY);
+    // On this thread, not the pool: the test reads this thread's cache.
+    native
+        .encode_with(Some(model), &long_lines(words), false, false)
+        .expect("ids");
     let share = native.long_piece_bytes_share();
+    assert_eq!(share, LONG_PIECE_BYTES_CAPACITY);
     let cache = native
         .piece_cache
         .get()
@@ -4996,6 +5010,123 @@ fn long_pieces_stay_within_their_byte_share() {
         .sum();
     assert_eq!(cache.long_bytes, accounted);
     assert!(cache.long_bytes <= share, "{} > {share}", cache.long_bytes);
+    assert!(cache.long.len() < words as usize, "{}", cache.long.len());
+    assert!(!cache.long.is_empty());
+}
+
+/// A thread's long tier holds a text whose long pieces take more than
+/// 2 MiB, the bound before `LONG_PIECE_BYTES_CAPACITY` grew, and less than
+/// the 8 MiB it is now: one pass keeps every piece, and a second pass
+/// finds each in the cache, so it adds nothing (a long piece that misses
+/// is added to `long_bytes` when it is kept). The sizes are written out
+/// here, where the other tests of the tier take theirs from the constants.
+#[test]
+fn a_text_of_two_to_eight_mebibytes_of_long_pieces_is_cached_whole() {
+    let mut state = 0x6B6B_8A8A_A9A9_C8C8u64;
+    let shape = &shapes()[0];
+    let tokenizer = tokenizer_of(shape, &mut state);
+    let native = seeded(&tokenizer);
+    let model = tokenizer.get_model();
+    // More than 2 MiB whatever the ids are, and under 8 MiB even were
+    // every byte of a piece an id (432 bytes an entry then).
+    let words = long_pieces_past(2 << 20);
+    let text = long_lines(words);
+    let long = |native: &NativeEncoder| -> (usize, usize) {
+        let cache = native
+            .piece_cache
+            .get()
+            .expect("this thread's cache")
+            .borrow();
+        (cache.long.len(), cache.long_bytes)
+    };
+    // On this thread, not the pool: the test reads this thread's cache.
+    let first = native
+        .encode_with(Some(model), &text, false, false)
+        .expect("ids");
+    let (entries, bytes) = long(&native);
+    assert_eq!(entries, words as usize, "the tier was cleared");
+    assert!(bytes > 2 << 20, "{bytes}");
+    assert!(bytes < 8 << 20, "{bytes}");
+    let again = native
+        .encode_with(Some(model), &text, false, false)
+        .expect("ids");
+    assert!(again == first, "the ids of the second pass differ");
+    assert_eq!(long(&native), (entries, bytes), "a long piece missed");
+}
+
+/// The two bounds of the long tier, by their constants: a thread's share is
+/// `LONG_PIECE_BYTES_CAPACITY` while the total holds that for every thread
+/// that encodes, and more threads share `LONG_PIECE_BYTES_TOTAL`, all of it
+/// and never more among them.
+#[test]
+fn the_long_share_is_a_threads_bound_until_the_threads_share_the_total() {
+    let mut state = 0x4F4F_6E6E_8D8D_ACACu64;
+    let shape = &shapes()[0];
+    let tokenizer = tokenizer_of(shape, &mut state);
+    let native = seeded(&tokenizer);
+    let full = LONG_PIECE_BYTES_TOTAL / LONG_PIECE_BYTES_CAPACITY;
+    for threads in [0, 1, full] {
+        native.threads.store(threads, Ordering::Relaxed);
+        let share = native.long_piece_bytes_share();
+        assert_eq!(share, LONG_PIECE_BYTES_CAPACITY, "{threads} threads");
+    }
+    for threads in [full + 1, 2 * full, 64 * full, 4_096 * full] {
+        native.threads.store(threads, Ordering::Relaxed);
+        let share = native.long_piece_bytes_share();
+        assert!(
+            share < LONG_PIECE_BYTES_CAPACITY,
+            "{share} at {threads} threads"
+        );
+        assert!(
+            threads * share <= LONG_PIECE_BYTES_TOTAL,
+            "{share} at {threads} threads"
+        );
+        assert!(
+            threads * (share + 1) > LONG_PIECE_BYTES_TOTAL,
+            "{share} at {threads} threads"
+        );
+    }
+}
+
+/// A thread among more threads than hold the full bound each stays within
+/// its share of the total, which is under the bound of a thread.
+#[test]
+fn long_pieces_stay_within_a_share_of_the_total() {
+    let mut state = 0x5A5A_7979_9898_B7B7u64;
+    let shape = &shapes()[0];
+    let tokenizer = tokenizer_of(shape, &mut state);
+    let native = seeded(&tokenizer);
+    let model = tokenizer.get_model();
+    let counted = 64 * (LONG_PIECE_BYTES_TOTAL / LONG_PIECE_BYTES_CAPACITY);
+    native.threads.store(counted, Ordering::Relaxed);
+    let words = long_pieces_past(native.long_piece_bytes_share());
+    // On this thread, not the pool: the test reads this thread's cache.
+    native
+        .encode_with(Some(model), &long_lines(words), false, false)
+        .expect("ids");
+    // This thread counts from its first encode on: the share it kept to
+    // is the total among one thread more.
+    let threads = native.threads.load(Ordering::Relaxed);
+    assert_eq!(threads, counted + 1);
+    let share = native.long_piece_bytes_share();
+    assert!(share < LONG_PIECE_BYTES_CAPACITY, "{share}");
+    let cache = native
+        .piece_cache
+        .get()
+        .expect("this thread's cache")
+        .borrow();
+    let accounted: usize = cache
+        .long
+        .iter()
+        .map(|(piece, ids)| long_entry_bytes(piece, ids))
+        .sum();
+    assert_eq!(cache.long_bytes, accounted);
+    assert!(cache.long_bytes <= share, "{} > {share}", cache.long_bytes);
+    assert!(
+        threads * cache.long_bytes <= LONG_PIECE_BYTES_TOTAL,
+        "{} at {threads} threads",
+        cache.long_bytes
+    );
     assert!(cache.long.len() < words as usize, "{}", cache.long.len());
     assert!(!cache.long.is_empty());
 }
@@ -5020,11 +5151,12 @@ fn a_thread_whose_long_tier_outgrew_its_share_makes_it_anew_at_its_next_encode()
             .long_held_bytes()
     };
     let head: String = (0..20).map(|i| format!("{}\n", letters(80, i))).collect();
-    let text: String = (0..16_000)
-        .map(|i| format!("{}\n", letters(80, i)))
-        .collect();
+    let text = long_lines(long_pieces_past(LONG_PIECE_BYTES_CAPACITY));
     let before = native.encode(Some(model), &head, false).expect("ids");
-    native.encode(Some(model), &text, false).expect("ids");
+    // On this thread, not the pool: the test reads this thread's cache.
+    native
+        .encode_with(Some(model), &text, false, false)
+        .expect("ids");
     let share = native.long_piece_bytes_share();
     let grown = held(&native);
     assert!(grown <= 4 * share, "{grown} for a share of {share}");
@@ -5071,10 +5203,11 @@ fn a_long_tier_made_anew_for_a_smaller_share_keeps_what_the_next_calls_add() {
     };
     let text: String = (0..64).map(|i| format!("{}\n", letters(80, i))).collect();
     let before = native.encode(Some(model), &text, false).expect("ids");
-    let fill: String = (0..16_000)
-        .map(|i| format!("{}\n", letters(80, i)))
-        .collect();
-    native.encode(Some(model), &fill, false).expect("ids");
+    let fill = long_lines(long_pieces_past(LONG_PIECE_BYTES_CAPACITY));
+    // On this thread, not the pool: the test reads this thread's cache.
+    native
+        .encode_with(Some(model), &fill, false, false)
+        .expect("ids");
     let (_, slots, grown) = long(&native);
     // Threads join until four times the share is just above the map's
     // slots: the tier holds more than that, and a clear in place would keep
@@ -5567,7 +5700,11 @@ fn an_ascii_free_line_splits_into_its_pieces_in_one_pass() {
 /// pair inside a word becomes the next token), the byte tokens ranked
 /// first or, as in a file whose byte tokens are not its first lines, last.
 fn tiktoken_ranks(state: &mut u64, merges: usize, bytes_last: bool) -> FxHashMap<Vec<u8>, u32> {
-    let corpus = random_text(state, 6000, &[]);
+    tiktoken_ranks_of(&random_text(state, 6000, &[]), merges, bytes_last)
+}
+
+/// [`tiktoken_ranks`] learnt from `corpus`.
+fn tiktoken_ranks_of(corpus: &str, merges: usize, bytes_last: bool) -> FxHashMap<Vec<u8>, u32> {
     let mut symbols: Vec<Vec<u8>> = corpus.bytes().map(|b| vec![b]).collect();
     let mut tokens: Vec<Vec<u8>> = Vec::new();
     let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
@@ -5670,6 +5807,102 @@ fn a_tiktoken_vocabulary_encodes_on_the_direct_path_as_its_own_encoder_does() {
             Ok(own.encode_ordinary(&long))
         );
     }
+}
+
+/// The Kimi template on the direct path cuts shaped text as the file's own
+/// encoder does. The direct path reads the template's matches by the scanner
+/// of the cased template behind its opening run; the file's encoder runs the
+/// pattern itself. The vocabulary is learnt from text of the same parts, so
+/// tokens span the edges the template cuts at (an ideograph and the letter,
+/// the digit or the mark beside it, a radical and the punctuation beside
+/// it): a piece cut elsewhere merges to other ids. The parts are every class
+/// the template tells apart: ideographs of the plane and above it, the Han
+/// characters that are no letters (iteration marks, numerals, radicals),
+/// kana and CJK punctuation, letter runs of every case structure with
+/// marks, digits, white space and line ends, punctuation, the clitics in
+/// both cases, and those side by side, with the special tokens among them,
+/// whole and cut. One text in sixteen is encoded again cut at every
+/// character, from the start and to the end, and one is long enough for
+/// the thread pool.
+#[test]
+fn the_kimi_template_encodes_shaped_text_as_the_files_own_encoder_does() {
+    const SPECIALS: [&str; 4] = ["[BOS]", "[EOS]", "<|im_end|>", "<|reserved_token_1|>"];
+    const PARTS: &[&str] = &[
+        "中", "中文", "汉字", "漢字", "㐀", "豈", "𠀀", "々", "〻", "〇", "〡", "⺀", "⿕", "あ",
+        "ア", "ー", "。", "、", "a", "word", "Word", "WORD", "wORD", "iPhone", "McDonald", "HTTPd",
+        "é", "É", "ß", "ſ", "ǅx", "ʰa", "я", "Я", "ก", "ा", "\u{301}", "1", "22", "333", "4444",
+        "٣", "²", " ", "  ", "\t", "\n", "\n\n", "\r\n", "\u{A0}", "\u{3000}", ".", ",", "!", "?",
+        "-", "(", ")", "\"", "/", "...", "，", "😀", "\u{200D}", "\u{FFFD}", "'", "'s", "'S", "'t",
+        "'re", "'RE", "'ve", "'m", "'ll", "'LL", "'d", "'x", "’s", "中A", "A中", "a中b", "中1",
+        "1〇", "〇1", "!⺀", "⺀!", "⺀a", " 中", "中 ", "中's", "中\n",
+    ];
+    let shaped = |state: &mut u64, parts: usize, specials: &[&str]| -> String {
+        let mut text = String::new();
+        for _ in 0..parts {
+            let roll = pseudo_random(state);
+            if !specials.is_empty() && roll.is_multiple_of(13) {
+                let special = specials[(roll / 13) as usize % specials.len()];
+                // Whole, or cut so that only a prefix of it stands.
+                let cut = if roll.is_multiple_of(3) {
+                    special.len() / 2
+                } else {
+                    special.len()
+                };
+                text.push_str(&special[..cut]);
+            } else {
+                text.push_str(PARTS[(roll % PARTS.len() as u64) as usize]);
+            }
+        }
+        text
+    };
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let ranks = tiktoken_ranks_of(&shaped(&mut state, 2500, &[]), 600, false);
+    let next = ranks.len() as u32 + 7;
+    let specials: Vec<(String, u32)> = SPECIALS
+        .iter()
+        .enumerate()
+        .map(|(i, special)| ((*special).to_owned(), next + i as u32))
+        .collect();
+    let native =
+        NativeEncoder::from_ranks(&ranks, KIMI_K2_PATTERN, &specials).expect("the direct path");
+    assert!(native.stages[0].pattern.has_scanner());
+    let own = CoreBPE::new(
+        ranks.clone(),
+        specials.iter().cloned().collect(),
+        KIMI_K2_PATTERN,
+    )
+    .expect("the file's encoder");
+    let same = |text: &str| {
+        if text.is_empty() {
+            return;
+        }
+        assert_eq!(
+            native.encode(None, text, false),
+            Ok(own.encode_with_special_tokens(text)),
+            "{text:?}"
+        );
+        assert_eq!(
+            native.encode_plain(None, text, true),
+            Ok(own.encode_ordinary(text)),
+            "plain: {text:?}"
+        );
+    };
+    for round in 0..2000 {
+        let text = shaped(&mut state, 1 + round % 40, &SPECIALS);
+        same(&text);
+        if round % 16 == 0 {
+            for (cut, _) in text.char_indices() {
+                same(&text[..cut]);
+                same(&text[cut..]);
+            }
+        }
+    }
+    let mut long = String::new();
+    while long.len() < 3 * PARALLEL_MIN_BYTES {
+        long.push_str(&shaped(&mut state, 24, &SPECIALS));
+        long.push(' ');
+    }
+    same(&long);
 }
 
 /// Characters of the pool the sentencepiece vocabulary below has no token

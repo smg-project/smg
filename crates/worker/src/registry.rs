@@ -638,7 +638,7 @@ impl<G: Generation> WorkerRegistry<G> {
     /// and the shared runtime but installs a new worker object with a possibly
     /// different model card, and the replaced handle must not be allowed to
     /// attribute a counter move to the model set it used to carry.
-    fn is_current_handle(&self, worker: &Arc<dyn Worker>) -> bool {
+    pub(crate) fn is_current_handle(&self, worker: &Arc<dyn Worker>) -> bool {
         let Some(worker_id) = self.url_to_id.get(worker.url()).map(|id| id.clone()) else {
             return false;
         };
@@ -1355,6 +1355,12 @@ impl<G: Generation> WorkerRegistry<G> {
         // the URL drops those writes until the old instance is gone too.
         Metrics::worker_replaced(old_worker.url(), Arc::downgrade(&old_worker));
 
+        // The replacement's series are its own from here: its HTTP/2 flag,
+        // and the breaker it ends with, the adopted one or one of its own.
+        // Its build wrote none, so a replacement that never got here left
+        // the old worker's series as they stood.
+        new_worker.publish_series();
+
         // The replacement owns its handshake driver. Release any binds the
         // retired instance still holds while waiting for the engine.
         old_worker.abort_background_tasks();
@@ -2037,14 +2043,10 @@ impl<G: Generation> WorkerRegistry<G> {
         }
 
         // The worker's series are kept for the time its address is
-        // registered (see `metrics::series`). The builder's
-        // writes for health, HTTP/2 and breaker state preceded this
-        // registration and were dropped if the address was retired by an
-        // earlier removal, so they are repeated here.
+        // registered (see `metrics::series`), and building a worker writes
+        // none of them: they start here, where the worker enters.
         Metrics::worker_registered(worker.url());
-        Metrics::set_worker_health(worker.url(), worker.is_healthy());
-        Metrics::set_worker_http2(worker.url(), worker.http2());
-        Metrics::set_worker_cb_state(worker.url(), worker.circuit_breaker_state().as_int());
+        worker.publish_series();
         worker.republish_state();
 
         // The worker's request counter starts at zero with its registration,

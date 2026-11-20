@@ -9,7 +9,10 @@ use std::time::Duration;
 
 use smg_worker::{
     connection::http_client::WorkerHttpClientSettings,
-    health::{liveness::Budgets, overload::OverloadThresholds},
+    health::{
+        circuit_breaker::CircuitBreakerConfig, liveness::Budgets, overload::OverloadThresholds,
+    },
+    settings::RegistrationSettings,
 };
 
 use super::types::RouterConfig;
@@ -62,6 +65,35 @@ impl RouterConfig {
             pool_idle_timeout_secs: self.upstream_pool_idle_timeout_secs,
         }
     }
+
+    /// The settings the worker's detection and creation steps read.
+    pub fn registration_settings(&self) -> RegistrationSettings {
+        let breaker = self.effective_circuit_breaker_config();
+        RegistrationSettings {
+            upstream_http2: self.upstream_http2,
+            health_check_timeout_secs: self.health_check.timeout_secs,
+            startup_timeout_secs: self.worker_startup_timeout_secs,
+            startup_delay_secs: self.worker_startup_delay_secs,
+            startup_check_interval_secs: self.worker_startup_check_interval_secs,
+            dp_aware: self.dp_aware,
+            model_path: self.model_path.clone(),
+            model_aliases: self.model_aliases.clone(),
+            retry: self.effective_retry_config(),
+            retries_enabled: !self.disable_retries,
+            circuit_breaker: CircuitBreakerConfig {
+                failure_threshold: breaker.failure_threshold,
+                success_threshold: breaker.success_threshold,
+                timeout_duration: Duration::from_secs(breaker.timeout_duration_secs),
+                window_duration: Duration::from_secs(breaker.window_duration_secs),
+            },
+            circuit_breaker_enabled: !self.disable_circuit_breaker,
+            overload_defaults: self.worker_overload_thresholds(),
+            health: self.health_check.to_protocol_config(),
+            health_endpoint: self.health_check.endpoint.clone(),
+            zmq_startup_timeout_secs: self.zmq_startup_timeout_secs,
+            request_timeout_secs: self.request_timeout_secs,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -76,6 +108,82 @@ mod tests {
 
     use super::*;
     use crate::routers::grpc::backend_client::BasicWorkerBuilder;
+
+    #[test]
+    fn the_registration_settings_carry_what_the_creation_reads() {
+        use crate::config::{
+            CircuitBreakerConfig as RouterCircuitBreakerConfig, HealthCheckConfig, RetryConfig,
+        };
+
+        let config = RouterConfig {
+            dp_aware: true,
+            model_path: Some("/models/a".to_string()),
+            model_aliases: [("alias".to_string(), "a".to_string())].into(),
+            retry: RetryConfig {
+                max_retries: 11,
+                initial_backoff_ms: 19,
+                max_backoff_ms: 29,
+                backoff_multiplier: 2.0,
+                jitter_factor: 0.1,
+            },
+            disable_retries: true,
+            circuit_breaker: RouterCircuitBreakerConfig {
+                failure_threshold: 13,
+                success_threshold: 7,
+                timeout_duration_secs: 21,
+                window_duration_secs: 39,
+            },
+            disable_circuit_breaker: true,
+            worker_overload_protection: true,
+            worker_overload_waiting_requests: Some(12),
+            worker_overload_token_usage: Some(0.4),
+            health_check: HealthCheckConfig {
+                endpoint: "/live".to_string(),
+                timeout_secs: 11,
+                check_interval_secs: 17,
+                failure_threshold: 5,
+                success_threshold: 4,
+                disable_health_check: true,
+                drain_settle_secs: 9,
+                ..HealthCheckConfig::default()
+            },
+            zmq_startup_timeout_secs: 43,
+            request_timeout_secs: 47,
+            ..RouterConfig::default()
+        };
+        let settings = config.registration_settings();
+        let breaker = config.effective_circuit_breaker_config();
+
+        assert!(settings.dp_aware);
+        assert_eq!(settings.model_path, config.model_path);
+        assert_eq!(settings.model_aliases, config.model_aliases);
+        assert_eq!(settings.retry, config.effective_retry_config());
+        assert_eq!(settings.retries_enabled, !config.disable_retries);
+        assert_eq!(
+            settings.circuit_breaker,
+            CircuitBreakerConfig {
+                failure_threshold: breaker.failure_threshold,
+                success_threshold: breaker.success_threshold,
+                timeout_duration: Duration::from_secs(breaker.timeout_duration_secs),
+                window_duration: Duration::from_secs(breaker.window_duration_secs),
+            }
+        );
+        assert_eq!(
+            settings.circuit_breaker_enabled,
+            !config.disable_circuit_breaker
+        );
+        assert_eq!(
+            settings.overload_defaults,
+            config.worker_overload_thresholds()
+        );
+        assert_eq!(settings.health, config.health_check.to_protocol_config());
+        assert_eq!(settings.health_endpoint, config.health_check.endpoint);
+        assert_eq!(
+            settings.zmq_startup_timeout_secs,
+            config.zmq_startup_timeout_secs
+        );
+        assert_eq!(settings.request_timeout_secs, config.request_timeout_secs);
+    }
 
     fn gateway_config(
         protection: bool,

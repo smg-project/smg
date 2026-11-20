@@ -502,8 +502,11 @@ policyController:
   #    runs, and a pod that starts takes it. A pod that starts on a document
   #    that does not run refuses to start: dry-run a document before an
   #    upgrade that moves the pods for another reason. With the election on
-  #    each pod watches its own mount: until the kubelets have turned both,
-  #    two pods hold two documents.
+  #    the leader's mount decides: a standby that follows its leader runs
+  #    the leader's document, and one that follows nobody runs none until
+  #    it leads. A pod that takes the lead applies its own mount's
+  #    document, unless that ran on it since its mount last turned (the
+  #    README says the rest).
   spec: {}
 
   # -- A spec store in place of the document: the name of a
@@ -896,6 +899,15 @@ workers: []
 #       periodSeconds: 10
 #       failureThreshold: 30
 #     progressDeadlineSeconds: 960      # rollout deadline; default: the startup probe's budget + 600 s
+#     # How long the kubelet waits between SIGTERM and SIGKILL (default 90).
+#     # A gRPC worker on the Rust servicer drains in-flight streams first:
+#     # SMG_*_SERVICER_DRAIN_SECS (default 30; the PD linger counts within it)
+#     # + the server stop (5 s) + on vLLM, its process manager's shutdown
+#     # (vLLM's --shutdown-timeout N, 5 s when it is 0) + the engine's
+#     # termination (up to 30 s) = 70 s, plus a margin; Kubernetes' own
+#     # default of 30 s would cut the drain. Raise it with the drain bound and
+#     # with a vLLM --shutdown-timeout above 5.
+#     terminationGracePeriodSeconds: 90
 
 # Engine default ports (used when worker.port is not set)
 engineDefaults:

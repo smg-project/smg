@@ -18,7 +18,7 @@
 //! stream took no part for [`STALLED`] ([`Hold`]).
 //!
 //! The load rows are journaled where the lease is shared, and nowhere else
-//! ([`journaled`]): a controller that leads itself over a lease in its own
+//! ([`journaled_waking`]): a controller that leads itself over a lease in its own
 //! process can have no standby, so its log carries the watched kinds alone
 //! and the call is refused by that state of its configuration.
 
@@ -35,17 +35,20 @@ use std::{
 use parking_lot::Mutex;
 use prost::{encoding::message, Message as _};
 use tokio::{
-    sync::watch,
+    sync::{watch, Notify},
     time::{interval, Interval, MissedTickBehavior},
 };
 use tonic::{codegen::tokio_stream::Stream, Code, Status, Streaming};
 use tracing::info;
 
-use super::{election::LeasePlace, service::not_leader, watch_workers, worker_wire};
+use super::{
+    election::LeasePlace, generations::Generations, service::not_leader, watch_workers,
+    worker_objects::ObjectsWake, worker_wire,
+};
 use crate::{
     elector::Fence,
-    proto::{self, replica_frame::Frame},
-    replication::{Entry, Log, Unled},
+    proto::{self, replica_frame::Frame, replication_event::Event as Sent},
+    replication::{Entry, Event as Written, Log, Unled},
     store::{Cut, Journal, Kinds, LoadSample, MemoryStore, Position},
     view::WorkerId,
 };
@@ -74,8 +77,10 @@ pub(crate) const BEAT: Duration = Duration::from_secs(1);
 /// of it ([`watch_workers::PAGE_BYTES`]).
 const MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 
-/// A store and the feed of the log it journals to, for a lease at `place`:
-/// the one place the two are built. Where the lease is shared the log
+/// A store and the feed of the log it journals to, for a lease at `place`,
+/// built in one place ([`journaled_at`]). A watched write wakes the feed's
+/// one task and tells `objects`, the wake of the replica's worker objects.
+/// Where the lease is shared the log
 /// carries the load rows from the start, so a replica added to a running
 /// leader follows it with no restart; where the lease lives in this process
 /// the log carries the watched kinds alone, and a load write tells nothing
@@ -91,12 +96,22 @@ const MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 /// reader is told to start again. A standby that applied nothing names no
 /// place of any run: the standby's feed joins it at the drawn start
 /// ([`Feed::join`]).
+pub(crate) fn journaled_waking(
+    place: &LeasePlace,
+    deciders: usize,
+    objects: ObjectsWake,
+) -> (Arc<MemoryStore>, watch_workers::Feed) {
+    let first = RandomState::new().hash_one(0u8) % FIRST_PLACES;
+    journaled_at(place, first, deciders, objects)
+}
+
+/// [`journaled_waking`] with no worker objects to wake, for the cases.
+#[cfg(test)]
 pub(crate) fn journaled(
     place: &LeasePlace,
     deciders: usize,
 ) -> (Arc<MemoryStore>, watch_workers::Feed) {
-    let first = RandomState::new().hash_one(0u8) % FIRST_PLACES;
-    journaled_for(place, first, deciders)
+    journaled_waking(place, deciders, ObjectsWake::default())
 }
 
 /// The same over one file of leases with the log's places starting after
@@ -109,17 +124,45 @@ pub(crate) fn journaled_from(
     journaled_for(place, first, 1)
 }
 
-/// The store and its feed with the log's places starting after `first`,
-/// the store with a file of leases a decider, `deciders` of them
-/// ([`MemoryStore::with_deciders`]).
+/// The store and its feed with the log's places starting after `first`
+/// and `deciders` files of leases, with no worker objects to wake.
+#[cfg(test)]
 pub(crate) fn journaled_for(
     place: &LeasePlace,
     first: u64,
     deciders: usize,
 ) -> (Arc<MemoryStore>, watch_workers::Feed) {
+    journaled_at(place, first, deciders, ObjectsWake::default())
+}
+
+/// The store and its feed with the log's places starting after `first`,
+/// the store with a file of leases a decider, `deciders` of them
+/// ([`MemoryStore::with_deciders`]): the one place the two are built.
+///
+/// The log tells one listener, and that listener is made here: one
+/// callback that wakes the feed's one task and tells `objects`, each on a
+/// wake of its own, so neither sleeps through a write the other took. The
+/// set is fixed for the log's life. The callback runs on the writer's
+/// thread once the store has let the write's locks go: it wakes and does
+/// no work.
+pub(super) fn journaled_at(
+    place: &LeasePlace,
+    first: u64,
+    deciders: usize,
+    objects: ObjectsWake,
+) -> (Arc<MemoryStore>, watch_workers::Feed) {
     let loads = if place.is_shared() { LOAD_EVENTS } else { 0 };
-    let log = Log::new(WATCHED_EVENTS, loads).starting_after(first);
-    let feed = watch_workers::Feed::of(log);
+    let landed = Arc::new(Notify::new());
+    let log = {
+        let landed = Arc::clone(&landed);
+        Log::new(WATCHED_EVENTS, loads)
+            .starting_after(first)
+            .on_watched(move || {
+                landed.notify_one();
+                objects.tell();
+            })
+    };
+    let feed = watch_workers::Feed::of(Arc::new(log), landed);
     let journal: Arc<dyn Journal> = Arc::<Log>::clone(&feed.log);
     let store = MemoryStore::journaled(journal).with_deciders(deciders);
     (Arc::new(store), feed)
@@ -136,6 +179,9 @@ pub(crate) struct Replication {
     log: Arc<Log>,
     fence: Arc<Fence>,
     cuts: Arc<Kept>,
+    /// The door whose documents a stream joins to the generations it sends
+    /// ([`Replication::telling`]).
+    documents: Option<Arc<Generations>>,
 }
 
 impl Replication {
@@ -145,7 +191,20 @@ impl Replication {
             log,
             fence,
             cuts: Arc::default(),
+            documents: None,
         }
+    }
+
+    /// The same, its streams telling `documents`: the log holds a
+    /// generation by its number, and a stream sends it with the document
+    /// that door still holds for it ([`Generations::sent`]), and a
+    /// snapshot's first part with the standing one. With no door a
+    /// generation crosses by its number alone, and a standby journals its
+    /// place.
+    #[must_use]
+    pub(crate) fn telling(mut self, documents: Arc<Generations>) -> Self {
+        self.documents = Some(documents);
+        self
     }
 
     /// Refuses a controller no standby can follow, and a leader whose store
@@ -550,7 +609,7 @@ pub(super) fn parts(cut: Arc<Cut>, now: Instant) -> Vec<proto::ReplicationBatch>
 }
 
 /// An instant's age at `now`, in milliseconds: what crosses in its place.
-fn age_ms(now: Instant, then: Instant) -> u64 {
+pub(super) fn age_ms(now: Instant, then: Instant) -> u64 {
     u64::try_from(now.saturating_duration_since(then).as_millis()).unwrap_or(u64::MAX)
 }
 
@@ -776,6 +835,14 @@ impl Feed {
             )));
         };
         batch.head_seq = self.head();
+        // The standing generation crosses on the first part, joined here as
+        // an event's document is: the door's at the send, which stands at
+        // or after the cut's place. A standby that is then sent that
+        // generation's event holds it already, and journals the place.
+        let first = batch.snapshot.as_mut().filter(|part| part.part == 0);
+        if let (Some(part), Some(documents)) = (first, &self.source.documents) {
+            part.generation = documents.standing_sent().map(Box::new);
+        }
         if let Some(at) = ends {
             self.place = at;
             self.acked = at.seq;
@@ -861,7 +928,8 @@ impl Feed {
         // never short of the batch's end, and a write between the two
         // only leaves this frame short of the head it states.
         let head = self.head();
-        let (events, last) = fitting(first, head, &self.entries, now, MESSAGE_BYTES);
+        let documents = self.source.documents.as_deref();
+        let (events, last) = fitting(first, head, &self.entries, now, MESSAGE_BYTES, documents);
         self.place = last;
         self.beat = now;
         Step::Batch(proto::ReplicationBatch {
@@ -896,6 +964,7 @@ fn fitting(
     entries: &[Entry],
     now: Instant,
     bound: usize,
+    documents: Option<&Generations>,
 ) -> (Vec<proto::ReplicationEvent>, Position) {
     // The batch's own fields: its position, its term and the head it
     // states.
@@ -909,7 +978,11 @@ fn fitting(
     let mut events = Vec::with_capacity(entries.len());
     let mut last = first;
     for entry in entries {
-        let event = worker_wire::replication(entry, now);
+        let mut event = worker_wire::replication(entry, now);
+        // A generation's entry is its number: the document is its door's.
+        if let (Written::Generation { generation }, Some(documents)) = (&entry.event, documents) {
+            event.event = Some(Sent::Generation(documents.sent(*generation)));
+        }
         let len = event.encoded_len();
         // An event in a batch: one byte of key, its length, its bytes.
         bytes += 1 + prost::length_delimiter_len(len) + len;
@@ -1147,6 +1220,7 @@ mod tests {
                 Some(Sent::Membership(_)) => "membership",
                 Some(Sent::Load(_)) => "load",
                 Some(Sent::TermStart(_)) => "term",
+                Some(Sent::Generation(_)) => "generation",
                 Some(_) => "another",
                 None => "unset",
             })
@@ -1451,7 +1525,7 @@ mod tests {
         assert!(read.is_ok());
         let first = entries.first().expect("the take's event").at;
         let head = leader.log.head(Kinds::All);
-        let (all, last) = fitting(first, head.seq, &entries, leader.at, usize::MAX);
+        let (all, last) = fitting(first, head.seq, &entries, leader.at, usize::MAX, None);
         assert_eq!((all.len(), last), (5, head));
         // What a batch of the first `count` events weighs on the wire.
         let weighs = |count: usize| {
@@ -1466,14 +1540,21 @@ mod tests {
             .encoded_len()
         };
         for count in 2..=5 {
-            let (fits, last) = fitting(first, head.seq, &entries, leader.at, weighs(count));
+            let (fits, last) = fitting(first, head.seq, &entries, leader.at, weighs(count), None);
             assert_eq!(fits.len(), count);
             assert_eq!(last.seq, first.seq + count as u64 - 1);
-            let (short, _) = fitting(first, head.seq, &entries, leader.at, weighs(count) - 1);
+            let (short, _) = fitting(
+                first,
+                head.seq,
+                &entries,
+                leader.at,
+                weighs(count) - 1,
+                None,
+            );
             assert_eq!(short.len(), count - 1, "one byte under {count} events");
         }
         // No bound is under the first event: a batch always moves the place.
-        let (alone, last) = fitting(first, head.seq, &entries, leader.at, 0);
+        let (alone, last) = fitting(first, head.seq, &entries, leader.at, 0, None);
         assert_eq!((alone.len(), last), (1, first));
     }
 
@@ -2237,6 +2318,10 @@ mod tests {
             self.log.term_rose(term);
         }
 
+        fn generation(&self, at: Option<Position>, generation: u64) {
+            self.log.generation(at, generation);
+        }
+
         fn term_followed(&self, at: Position) {
             self.log.term_followed(at);
         }
@@ -2450,5 +2535,83 @@ mod tests {
             .cut(leader.term)
             .expect_err("no standby follows it");
         assert_eq!(refused.code(), Code::FailedPrecondition);
+    }
+
+    /// The stock door over the leader's store.
+    fn door(leader: &Leader) -> Arc<Generations> {
+        let catalog = Arc::new(crate::catalog::Catalog::builtin());
+        Arc::new(Generations::new(Arc::clone(&leader.store), catalog))
+    }
+
+    /// The generation an event states.
+    fn generation(event: &proto::ReplicationEvent) -> proto::GenerationEvent {
+        match &event.event {
+            Some(Sent::Generation(told)) => told.clone(),
+            other => panic!("a generation, not {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_stream_sends_a_generation_with_the_document_its_door_holds() {
+        use crate::controller::generations::{
+            tests::{LEAST_LOAD, RANDOM},
+            Format,
+        };
+
+        let leader = Leader::leading();
+        let documents = door(&leader);
+        let apply = |document: &str| documents.apply(document.into(), Format::Yaml);
+        apply(RANDOM).expect("a valid document");
+        apply(LEAST_LOAD).expect("a changed document");
+        let mut feed = leader.feed(START, RING);
+        feed.source = feed.source.telling(Arc::clone(&documents));
+        let sent = batch(feed.look(leader.at));
+        assert_eq!(cases(&sent), ["term", "generation", "generation"]);
+        // The first stood no longer at the send: its number alone.
+        assert_eq!(generation(&sent.events[1]), worker_wire::generation_told(1));
+        assert_eq!(Some(generation(&sent.events[2])), documents.standing_sent());
+        // A source with no door sends each by its number alone.
+        let sent = batch(leader.feed(START, RING).look(leader.at));
+        assert_eq!(generation(&sent.events[2]), worker_wire::generation_told(2));
+    }
+
+    #[test]
+    fn a_snapshots_first_part_states_the_generation_that_stands_at_its_send() {
+        use crate::controller::generations::{tests::LEAST_LOAD, Format};
+
+        let leader = Leader::leading();
+        let documents = door(&leader);
+        leader.writes(3);
+        let lost = past_the_head(&leader);
+        let mut feed = leader.feed(lost, RING);
+        feed.source = feed.source.telling(Arc::clone(&documents));
+        assert_eq!(resync(&mut feed, leader.at), Why::Place(lost));
+        // No document is held: the part states none.
+        let rows = batch(feed.look(leader.at));
+        let part = rows.snapshot.as_ref().expect("the rows' part");
+        assert_eq!((part.part, part.generation.as_ref()), (0, None));
+        // Applied inside the restore: the parts behind the first state none.
+        documents
+            .apply(LEAST_LOAD.into(), Format::Yaml)
+            .expect("a valid document");
+        let loads = batch(feed.look(leader.at));
+        let part = loads.snapshot.as_ref().expect("the load rows' part");
+        assert_eq!((part.part, part.generation.as_ref()), (1, None));
+        // The log follows from the cut's place, the generation's event in it.
+        let next = batch(feed.look(leader.at));
+        assert_eq!(cases(&next), ["generation"]);
+        assert_eq!(Some(generation(&next.events[0])), documents.standing_sent());
+
+        // A restore that starts behind the apply states it on its first part.
+        let mut feed = leader.feed(past_the_head(&leader), RING);
+        feed.source = feed.source.telling(Arc::clone(&documents));
+        resync(&mut feed, leader.at);
+        let rows = batch(feed.look(leader.at));
+        let part = rows.snapshot.as_ref().expect("the rows' part");
+        assert_eq!(part.part, 0);
+        assert_eq!(
+            part.generation.as_deref(),
+            documents.standing_sent().as_ref()
+        );
     }
 }

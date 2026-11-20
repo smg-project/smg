@@ -5,24 +5,52 @@
 //! engine's `GetLoads` shape into the record, and the cases that hold the two
 //! together.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use crate::{
     common_proto as common,
     worker::{
         EngineMemoryMetricsSnapshot, EngineQueueMetricsSnapshot, LoadRecord, LoadTelemetry,
-        SchedulerLoadSnapshot,
+        NamedValue, SchedulerLoadSnapshot,
     },
 };
 
-/// The per-rank snapshot a poll would have produced from what the record
-/// carries, the way the engines' `GetLoads` responses convert: the two
-/// canonical disaggregation queue depths roll the per-stage counters up
-/// (prefill = prealloc + inflight, decode = prealloc + transfer +
-/// retracted), `utilization` is the KV usage, `num_total_reqs` the running
-/// and waiting sum. The rank is the caller's; telemetry the record leaves
-/// unset stays at the type's default, which the gateway merges with what it
-/// knew from the last record that carried it.
+const MAX_VALUES: usize = 64;
+const MAX_NAME_BYTES: usize = 63;
+const MAX_UNIT_BYTES: usize = 31;
+
+/// The record's named values under the snapshot's bounds: the first
+/// `MAX_VALUES` entries, less those with an empty name, a name or a unit
+/// over its bound, a value that is not finite, or a name an entry kept
+/// ahead of it states. The first of a name stands. What is left out here
+/// is counted where the record is taken: the record's list less this one
+/// ([`LoadRecord::values_sent`]).
+fn read_values(values: &[common::NamedValue]) -> Vec<NamedValue> {
+    let mut named: Vec<NamedValue> = Vec::new();
+    for sample in values.iter().take(MAX_VALUES) {
+        if sample.name.is_empty()
+            || sample.name.len() > MAX_NAME_BYTES
+            || sample.unit.len() > MAX_UNIT_BYTES
+            || !sample.value.is_finite()
+            || named.iter().any(|kept| *kept.name == *sample.name)
+        {
+            continue;
+        }
+        named.push(NamedValue {
+            name: Arc::from(sample.name.as_str()),
+            unit: Arc::from(sample.unit.as_str()),
+            value: sample.value,
+            age_ms: sample.age_ms,
+        });
+    }
+    named
+}
+
+/// A record's fixed fields take the shape of a poll's. The two
+/// disaggregation queue depths roll up the per-stage counters, utilization
+/// is KV usage, and the request total is the sum of running and waiting
+/// requests. The caller sets the rank and can merge fixed telemetry the
+/// record omitted with the last figures it received.
 impl From<&common::EngineLoad> for SchedulerLoadSnapshot {
     /// Read input capacity directly, including absence after the samples expire.
     fn from(record: &common::EngineLoad) -> Self {
@@ -79,6 +107,7 @@ impl From<&common::EngineLoad> for SchedulerLoadSnapshot {
                     .saturating_add(d.decode_retracted_queue_reqs)
             }),
             disagg_mode: disagg.map(|d| d.mode.clone()),
+            values: read_values(&record.values),
             ..Default::default()
         }
     }
@@ -116,6 +145,11 @@ impl LoadRecord for common::EngineLoad {
     }
 
     #[inline]
+    fn values_sent(&self) -> usize {
+        self.values.len()
+    }
+
+    #[inline]
     fn engine_silence(&self) -> Option<Duration> {
         self.engine_silence_ms
             .map(|ms| Duration::from_millis(u64::from(ms)))
@@ -129,5 +163,153 @@ impl LoadRecord for common::EngineLoad {
     #[inline]
     fn prefill_pending(&self) -> Option<u64> {
         self.prefill_pending_tokens.map(u64::from)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use prost::Message;
+
+    use super::*;
+
+    #[test]
+    fn a_pushed_record_carries_each_named_value_with_its_own_age() {
+        let wire = b"\xc2\x01\x1a\x0a\x09queue_age\x12\x02ms\x19\x00\x00\x00\x00\x00\x00\x1a\x40\x20\x25\
+                     \xc2\x01\x1d\x0a\x09read_rate\x12\x07items/s\x19\x00\x00\x00\x00\x00\x00\xc0\x3f";
+        let record = common::EngineLoad::decode(wire.as_slice()).unwrap();
+        assert_eq!(record.encode_to_vec().as_slice(), wire);
+        let snapshot = record.snapshot();
+        assert_eq!(
+            snapshot.values,
+            [
+                NamedValue {
+                    name: "queue_age".into(),
+                    unit: "ms".into(),
+                    value: 6.5,
+                    age_ms: Some(37),
+                },
+                NamedValue {
+                    name: "read_rate".into(),
+                    unit: "items/s".into(),
+                    value: 0.125,
+                    age_ms: None,
+                },
+            ]
+        );
+        let json = serde_json::to_value(snapshot).unwrap();
+        assert_eq!(json["values"][0]["age_ms"], 37);
+        assert!(json["values"][1].get("age_ms").is_none());
+    }
+
+    #[test]
+    fn an_unnamed_record_keeps_the_old_snapshot_json() {
+        let record = common::EngineLoad {
+            running_requests: 13,
+            num_used_tokens: Some(493),
+            max_total_num_tokens: Some(8_317),
+            ..Default::default()
+        };
+        let legacy = concat!(
+            r#"{"dp_rank":0,"num_running_reqs":13,"num_waiting_reqs":0,"num_waiting_uncached_tokens":0,"#,
+            r#""num_total_reqs":13,"num_used_tokens":493,"max_total_num_tokens":8317,"token_usage":0.0,"#,
+            r#""gen_throughput":0.0,"cache_hit_rate":0.0,"utilization":0.0,"max_running_requests":0}"#,
+        );
+        let snapshot = record.snapshot();
+        assert!(snapshot.values.is_empty());
+        assert_eq!(serde_json::to_string(&snapshot).unwrap(), legacy);
+        let decoded: SchedulerLoadSnapshot = serde_json::from_str(legacy).unwrap();
+        assert!(decoded.values.is_empty());
+    }
+
+    fn sample(name: &str, unit: &str, value: f64) -> common::NamedValue {
+        common::NamedValue {
+            name: name.into(),
+            unit: unit.into(),
+            value,
+            age_ms: None,
+        }
+    }
+
+    #[test]
+    fn a_pushed_record_drops_and_counts_each_nonfinite_value() {
+        for nonfinite in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let values = [
+                sample("invalid", "items", nonfinite),
+                sample("finite", "items", -3.25),
+            ];
+            let kept = read_values(&values);
+            assert_eq!(kept.len(), 1);
+            assert_eq!((kept[0].name.as_ref(), kept[0].value), ("finite", -3.25));
+            let record = common::EngineLoad {
+                values: values.into(),
+                ..Default::default()
+            };
+            assert_eq!(record.snapshot().values, kept);
+            assert_eq!(record.values_sent() - kept.len(), 1);
+        }
+    }
+
+    #[test]
+    fn a_pushed_record_drops_and_counts_values_past_each_bound() {
+        let dropped = |values: &[common::NamedValue]| values.len() - read_values(values).len();
+        let mut values: Vec<_> = (0..=64)
+            .map(|index| sample(&format!("ready_{index}"), "items", f64::from(index)))
+            .collect();
+        let kept = read_values(&values);
+        assert_eq!(kept.len(), 64);
+        assert_eq!(kept.last().unwrap().value, 63.0);
+        assert_eq!(dropped(&values), 1);
+        // An entry dropped among the first 64 gives no later one its place.
+        values[0].value = f64::NAN;
+        assert_eq!(read_values(&values).len(), 63);
+        assert_eq!(dropped(&values), 2);
+
+        let name = "é".repeat(31) + "e";
+        let unit = "ø".repeat(15) + "o";
+        let values = [
+            sample(&"é".repeat(32), "items", 19.0),
+            sample("ready", &"ø".repeat(16), 23.0),
+            sample(&name, &unit, 27.0),
+        ];
+        let kept = read_values(&values);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(
+            (kept[0].name.as_ref(), kept[0].unit.as_ref()),
+            (name.as_str(), unit.as_str())
+        );
+        assert_eq!(dropped(&values), 2);
+
+        let record = common::EngineLoad {
+            running_requests: 17,
+            values: values.to_vec(),
+            ..Default::default()
+        };
+        let snapshot = record.snapshot();
+        assert_eq!(snapshot.num_running_reqs, 17);
+        assert_eq!(snapshot.values, kept);
+        assert_eq!(record.values_sent() - snapshot.values.len(), 2);
+    }
+
+    #[test]
+    fn a_pushed_record_drops_an_empty_name_and_a_name_it_states_again() {
+        let values = [
+            sample("", "items", 1.0),
+            sample("depth", "items", 2.0),
+            sample("depth", "items", 3.0),
+            sample("rate", "items/s", 4.0),
+        ];
+        let kept = read_values(&values);
+        let read: Vec<_> = kept
+            .iter()
+            .map(|value| (value.name.as_ref(), value.value))
+            .collect();
+        assert_eq!(read, [("depth", 2.0), ("rate", 4.0)]);
+        // An entry dropped at a bound keeps no name: the next of its name stands.
+        let values = [
+            sample("depth", "items", f64::NAN),
+            sample("depth", "items", 5.0),
+        ];
+        let kept = read_values(&values);
+        assert_eq!((kept.len(), kept[0].value), (1, 5.0));
     }
 }

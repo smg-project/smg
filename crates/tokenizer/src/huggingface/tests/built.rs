@@ -301,14 +301,15 @@ fn a_typed_added_token_is_text_under_a_renderer_with_its_own_encoder() {
 }
 
 /// A pipeline that matches an added token after normalization reads as
-/// that token a text its normalizer turns into the spelling. Under it a
-/// prompt is encoded by segments: such a text is read by its characters,
-/// alone and beside a typed token that keeps its id. With no normalizer,
-/// or an empty sequence of them, the entry matches as it is spelled, and a
-/// prompt is encoded from its text; so is the prompt of a vocabulary whose
-/// entries all match as they are spelled, under any normalizer.
+/// that token a text its normalizer turns into the spelling. Under it the
+/// template is left as it was: a prompt is encoded from its text, and such
+/// a text is the entry's token there, alone and beside a typed token, as
+/// the flat encode reads it. With no normalizer, or an empty sequence of
+/// them, the entry matches as it is spelled, and the template is marked;
+/// so is the template of a vocabulary whose entries all match as they are
+/// spelled, under any normalizer.
 #[test]
-fn a_text_the_normalizer_turns_into_an_added_token_stays_text() {
+fn a_pipeline_that_matches_an_added_token_after_normalization_leaves_the_template_as_it_was() {
     let conversion = with_added_token("<a>")
         .replace(
             r#""special": false}],"#,
@@ -324,18 +325,19 @@ fn a_text_the_normalizer_turns_into_an_added_token_stays_text() {
         );
         let temp = TempDir::new().unwrap();
         let tok = checkpoint_of(temp.path(), &conversion, &builds());
-        assert!(tok.chat_template.marked(), "{normalizer}");
         (temp, tok)
     };
     let (_temp, tok) = under(r#"{"type": "Lowercase"}"#);
+    assert!(!tok.chat_template.marked());
     let (_, ids, from_text) = render(&tok, json!("<B>"));
-    assert!(!from_text);
-    assert_eq!(ids, [2, 16, 14, 18, 3, 13, 14, 1]);
+    assert!(from_text);
+    assert_eq!(ids, [2, 20, 3, 13, 14, 1]);
     let (_, ids, from_text) = render(&tok, json!("<a><B>"));
-    assert!(!from_text);
-    assert_eq!(ids, [2, 19, 16, 14, 18, 3, 13, 14, 1]);
+    assert!(from_text);
+    assert_eq!(ids, [2, 19, 20, 3, 13, 14, 1]);
     for normalizer in ["null", r#"{"type": "Sequence", "normalizers": []}"#] {
         let (_temp, tok) = under(normalizer);
+        assert!(tok.chat_template.marked(), "{normalizer}");
         let (_, ids, from_text) = render(&tok, json!("a<a>b"));
         assert!(from_text, "{normalizer}");
         assert_eq!(ids, [2, 13, 19, 14, 3, 13, 14, 1], "{normalizer}");
@@ -346,16 +348,16 @@ fn a_text_the_normalizer_turns_into_an_added_token_stays_text() {
     );
     let temp = TempDir::new().unwrap();
     let tok = checkpoint_of(temp.path(), &lowered, &builds());
+    assert!(tok.chat_template.marked());
     let (_, ids, from_text) = render(&tok, json!("a<a>b"));
     assert!(from_text);
     assert_eq!(ids, [2, 13, 19, 14, 3, 13, 14, 1]);
 }
 
-/// A text a template writes in two pieces side by side is asked both ways,
-/// the pieces joined and each by itself. Under a pipeline that lowercases,
-/// an added token that matches only as a whole word stands in the second
-/// piece (`TAG`) and not in the run (`xTAG`): the template is left as it
-/// is, as one that writes that piece alone is.
+/// Under a pipeline that lowercases, an added token matched after
+/// normalization and only as a whole word stands in the second of two
+/// pieces side by side (`TAG`) and not in the run (`xTAG`). The template is
+/// left as it is whatever it writes: that piece alone, the run, or neither.
 #[test]
 fn a_whole_word_token_in_one_of_two_joined_pieces_leaves_the_template_as_it_was() {
     let conversion = with_added_token("<a>")
@@ -377,15 +379,15 @@ fn a_whole_word_token_in_one_of_two_joined_pieces_leaves_the_template_as_it_was(
             .chat_template
             .marked()
     };
-    assert!(marked("{{ 'x' }}"));
+    assert!(!marked("{{ 'x' }}"));
     assert!(!marked("{{ 'TAG' }}"));
     assert!(!marked("{{ ('x' ~ 'TAG')[1:] }}"));
 }
 
-/// Every piece a template writes and every run of pieces side by side is
-/// asked by itself. An added token that matches only as a whole word ends
-/// a piece: the template is left as it is, whether that piece is the last,
-/// a run of two pieces stands before it, or a piece follows it.
+/// An added token matched after normalization and only as a whole word
+/// ends a piece: the template is left as it is, whether that piece is the
+/// last, a run of two pieces stands before it, or a piece follows it. So
+/// is, under that pipeline, a template that writes no such piece.
 #[test]
 fn a_whole_word_token_at_the_end_of_a_piece_leaves_the_template_as_it_was() {
     let conversion = with_a_whole_word_entry();
@@ -397,7 +399,7 @@ fn a_whole_word_token_at_the_end_of_a_piece_leaves_the_template_as_it_was() {
             .marked()
     };
     let last = "{% if tagged %}{{ ' TAG' }}{% endif %}";
-    assert!(marked("{{ 'x' ~ 'y' }}", ""));
+    assert!(!marked("{{ 'x' ~ 'y' }}", ""));
     assert!(!marked("", last));
     assert!(!marked("{{ 'x' ~ 'y' }}", last));
     assert!(!marked("", &[last, "{{ 'x' }}"].concat()));
@@ -450,26 +452,32 @@ fn marked_with_a_tagged_write(conversion: &str, written: &str, text: &str, id: u
 /// in the order of the source with nothing between. Two pieces, each in
 /// parentheses of its own, are no run, and they spell together a text an
 /// added token matches: the template is left as it is, and one whose
-/// pieces spell no token there is marked.
+/// pieces spell no token there is marked. Under a pipeline that matches
+/// the token after normalization the template is left as it is too, and
+/// the text its pieces spell is the entry's token.
 #[test]
 fn a_token_two_pieces_spell_across_parentheses_leaves_the_template_as_it_was() {
+    let as_spelled = with_added_token("<a>");
+    let marked =
+        |written: &str, text: &str| marked_with_a_tagged_write(&as_spelled, written, text, 19);
+    assert!(marked("{{ ('<') ~ ('b>') }}", "<b>"));
+    assert!(!marked("{{ ('<') ~ ('a>') }}", "<a>"));
     let conversion = with_a_whole_word_entry();
     let marked =
         |written: &str, text: &str| marked_with_a_tagged_write(&conversion, written, text, 20);
-    assert!(marked("{{ (' T') ~ ('OP ') }}", " TOP "));
     assert!(!marked("{{ (' T') ~ ('AG ') }}", " TAG "));
 }
 
 /// A block tag stands between two pieces, and a render that takes the
 /// block writes the second right after the first: glued, they hold the
-/// token they spell together, an added token matched as it is spelled as
-/// one matched after normalization, and the template is left as it is.
+/// token they spell together, and the template is left as it is. Under a
+/// pipeline that matches the token after normalization the template is
+/// left as it is too, and the text its pieces spell is the entry's token.
 #[test]
 fn a_token_two_pieces_spell_across_a_block_tag_leaves_the_template_as_it_was() {
     let conversion = with_a_whole_word_entry();
     let marked =
         |written: &str, text: &str| marked_with_a_tagged_write(&conversion, written, text, 20);
-    assert!(marked(" T{% if tagged %}OP {% endif %}", " TOP "));
     assert!(!marked(" T{% if tagged %}AG {% endif %}", " TAG "));
     let as_spelled = with_added_token("<a>");
     let marked =
@@ -480,7 +488,9 @@ fn a_token_two_pieces_spell_across_a_block_tag_leaves_the_template_as_it_was() {
 
 /// An expression that comes out empty stands between two pieces, and the
 /// render writes the second right after the first: glued, they hold the
-/// token they spell together, and the template is left as it is.
+/// token they spell together, and the template is left as it is. Under a
+/// pipeline that matches the token after normalization the template is
+/// left as it is too, and the text its pieces spell is the entry's token.
 #[test]
 fn a_token_two_pieces_spell_around_an_empty_expression_leaves_the_template_as_it_was() {
     let as_spelled = with_added_token("<a>");
@@ -491,15 +501,94 @@ fn a_token_two_pieces_spell_around_an_empty_expression_leaves_the_template_as_it
     let conversion = with_a_whole_word_entry();
     let marked =
         |written: &str, text: &str| marked_with_a_tagged_write(&conversion, written, text, 20);
-    assert!(marked(" T{{ note }}OP ", " TOP "));
     assert!(!marked(" T{{ note }}AG ", " TAG "));
+}
+
+/// A render writes the pieces of a template in an order of its own: it
+/// leaves a piece out, takes one arm of a branch and not the other, writes
+/// the body of a loop again, or writes a macro's text where the macro is
+/// called. Two pieces that stand apart in the source then spell together,
+/// with whole pieces between them or none, a text an added token matches,
+/// and the template is left as it is: the token it writes there is read as
+/// the flat encode reads it, whether its entry is special or not. A
+/// template whose pieces spell no token in any order is marked.
+#[test]
+fn a_token_pieces_spell_in_an_order_of_the_render_leaves_the_template_as_it_was() {
+    let plain = with_added_token("<a>");
+    let special = plain.replace(
+        r#""normalized": false, "special": false}"#,
+        r#""normalized": false, "special": true}"#,
+    );
+    assert!(special != plain);
+    for conversion in [&plain, &special] {
+        let marked =
+            |written: &str, text: &str| marked_with_a_tagged_write(conversion, written, text, 19);
+        // A piece between the two is left out.
+        assert!(marked("<{% if extra %}x{% endif %}b>", "<b>"));
+        assert!(!marked("<{% if extra %}x{% endif %}a>", "<a>"));
+        // One arm of a branch is taken, and the piece of the other is not
+        // written.
+        assert!(!marked(
+            "{% if not extra %}<{% else %}x{% endif %}a>",
+            "<a>"
+        ));
+        // A whole piece stands between the two.
+        assert!(!marked(
+            "<{% if extra %}x{% endif %}{{ 'a' }}{% if extra %}y{% endif %}>",
+            "<a>"
+        ));
+        // The body of a loop is written again: its end, then its start.
+        assert!(marked("{% for n in [1, 2] %}b>a<{% endfor %}", "b>a<b>a<"));
+        assert!(!marked("{% for n in [1, 2] %}a>b<{% endfor %}", "a>b<a>b<"));
+        // A macro's text is written where the macro is called.
+        assert!(!marked(
+            "{% macro tail() %}a>{% endmacro %}<{{ tail() }}",
+            "<a>"
+        ));
+    }
+}
+
+/// Under a normalizer that lowercases, an added token is matched after
+/// normalization. A template that writes two pieces around a branch a
+/// request leaves out is left as it is: with the argument its prompt is
+/// encoded from its text, and the text the pieces write there, which the
+/// normalizer turns into the entry's spelling, is the entry's token.
+#[test]
+fn pieces_around_a_branch_under_a_normalizer_that_lowercases_leave_the_template_as_it_was() {
+    let conversion = with_a_normalized_entry().replace(
+        r#""normalizer": null"#,
+        r#""normalizer": {"type": "Lowercase"}"#,
+    );
+    assert!(conversion.contains("Lowercase"));
+    assert!(!marked_with_a_tagged_write(
+        &conversion,
+        "<{% if extra %}x{% endif %}B>",
+        "<B>",
+        19
+    ));
+}
+
+/// The same under a pipeline that matches the added token after
+/// normalization and only as a whole word: the pieces stand around a
+/// branch a request leaves out, the template is left as it is, and the
+/// word they write there is the entry's token.
+#[test]
+fn pieces_of_a_whole_word_around_a_branch_leave_the_template_as_it_was() {
+    let conversion = with_a_whole_word_entry();
+    assert!(!marked_with_a_tagged_write(
+        &conversion,
+        " T{% if extra %}x{% endif %}AG ",
+        " TAG ",
+        20
+    ));
 }
 
 /// Under a normalizer that strips the edges of a text, an added token
 /// whose spelling begins with a blank is matched after normalization. A
-/// template that writes, behind a block tag, a text the normalizer turns
-/// into that spelling is left as it is: with the argument its prompt is
-/// encoded from its text, and the text is the entry's token.
+/// template is left as it is under it, whether it writes such a text or
+/// not. One that writes, behind a block tag, a text the normalizer turns
+/// into that spelling: with the argument its prompt is encoded from its
+/// text, and the text is the entry's token.
 #[test]
 fn a_token_with_a_blank_edge_under_a_normalizer_that_strips_leaves_the_template_as_it_was() {
     let conversion = with_added_token("<a>")
@@ -521,7 +610,7 @@ fn a_token_with_a_blank_edge_under_a_normalizer_that_strips_leaves_the_template_
         (temp, tok)
     };
     let (_temp, tok) = load("{{ 'x' ~ 'y' }}", "");
-    assert!(tok.chat_template.marked());
+    assert!(!tok.chat_template.marked());
     let (_temp, tok) = load("", "x{% if tagged %} TAG{% endif %}");
     assert!(!tok.chat_template.marked());
     let kwargs = HashMap::from([("tagged".to_owned(), json!(true))]);
@@ -553,15 +642,15 @@ fn a_replaced_template_that_writes_a_kept_token_reads_the_typed_one_as_text() {
     assert_eq!(ids, [2, 13, 16, 13, 10, 11, 18, 14, 3, 13, 14, 1, 19]);
 }
 
-/// The guard on a pipeline that matches an added token after normalization
+/// The rule on a pipeline that matches an added token after normalization
 /// stands above the choice of encoder. On a byte-level file that the direct
-/// encoder takes, under NFC, a text that only the normalizer makes an
-/// entry's spelling is read by its characters, and every prompt of that
-/// pipeline is encoded by segments. A template that writes such a text
-/// itself stays as it is.
+/// encoder takes, under NFC, the template is left as it was: a prompt is
+/// encoded from its text, and a text that only the normalizer makes an
+/// entry's spelling is the entry's token there, typed into a message or
+/// written by the template itself.
 #[cfg(not(feature = "tokenizers-v1"))]
 #[test]
-fn a_text_the_normalizer_turns_into_an_added_token_stays_text_on_the_direct_encoder() {
+fn a_normalizing_pipeline_leaves_the_template_as_it_was_on_the_direct_encoder() {
     use tokenizers::pre_tokenizers::byte_level::ByteLevel;
 
     let mut alphabet: Vec<char> = ByteLevel::alphabet().into_iter().collect();
@@ -603,21 +692,18 @@ fn a_text_the_normalizer_turns_into_an_added_token_stays_text_on_the_direct_enco
     .to_string();
     let temp = TempDir::new().unwrap();
     let tok = checkpoint_of(temp.path(), &conversion, &builds());
-    assert!(tok.chat_template.marked());
+    assert!(!tok.chat_template.marked());
     assert!(tok.core.native.is_some());
     let entry = alphabet.len() as u32 + 4;
     // `e` and a combining acute: NFC makes the two the entry's letter.
     let (_, ids, from_text) = render(&tok, json!("a<e\u{301}>b"));
-    assert!(!from_text);
-    assert!(!ids.contains(&entry));
-    // The opening control, six bytes of text, the closing control, `ab`
+    assert!(from_text);
+    // The opening control, `a`, the entry, `b`, the closing control, `ab`
     // and the end token.
-    assert_eq!(ids.len(), 11);
-    let (_, _, from_text) = render(&tok, json!("ab"));
-    assert!(!from_text);
+    assert_eq!(ids.len(), 8);
+    assert_eq!(ids[2], entry);
     // The same text written by the template itself: the flat encode reads
-    // the entry there, so the template stays as it is and the prompt is
-    // encoded from its text.
+    // the entry there too.
     let writes_it = template(
         CONSTANTS,
         "{{ open }}",
@@ -631,11 +717,11 @@ fn a_text_the_normalizer_turns_into_an_added_token_stays_text_on_the_direct_enco
     assert!(from_text);
     assert!(ids.contains(&entry));
     // A text the normalizer shortens into no entry, written before a
-    // control: the marks stand where the controls stand in the prompt.
+    // control: the template is left as it was all the same.
     let shortened = template(CONSTANTS, "e\u{301}{{ open }}", "{{ close }}", "{{ end }}");
     let temp = TempDir::new().unwrap();
     let tok = checkpoint_of(temp.path(), &conversion, &shortened);
-    assert!(tok.chat_template.marked());
+    assert!(!tok.chat_template.marked());
 }
 
 #[test]
@@ -2501,4 +2587,316 @@ fn a_special_token_written_by_its_name_is_marked() {
         ids,
         [2, 13, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 16, 5, 17, 10, 11, 18, 3, 13, 14, 1]
     );
+}
+
+/// A control kept in an attribute of a namespace: the top level makes the
+/// namespace once and binds the attribute from a join that holds a control
+/// the template builds.
+mod holder {
+    use super::*;
+
+    /// A namespace one of whose attributes a top-level statement binds from
+    /// a join that holds a control is a holder: the attribute is written,
+    /// bound again inside the message loop and asked whether it is empty,
+    /// and the template is marked. The control it holds is the control
+    /// token, and a spelling a message brought into it stays text.
+    #[test]
+    fn a_control_kept_in_an_attribute_of_a_namespace_is_marked() {
+        let temp = TempDir::new().unwrap();
+        let holds = "{% set ns = namespace(held='') %}\
+            {% if flat %}{% set ns.held = ns.held + close + 'b' %}{% endif %}";
+        let appends = "{% set ns.held = ns.held + message['content'] %}";
+        let writes = "{% if ns.held != '' and ns.held %}{{ ns.held }}{% endif %}";
+        let template = format!(
+            "{}{{% if flat %}}{writes}{{% endif %}}",
+            shaped(holds, appends, WRITTEN)
+        );
+        let tok = checkpoint(temp.path(), &template);
+        assert!(tok.chat_template.marked());
+        let kwargs = HashMap::from([("flat".to_owned(), json!(true))]);
+        let flat = || ChatTemplateParams {
+            template_kwargs: Some(&kwargs),
+            ..ChatTemplateParams::default()
+        };
+        let (text, ids, from_text) = render_under(&tok, json!("a[/INST:x]b"), flat());
+        assert!(!from_text);
+        assert_eq!(
+            text,
+            "[INST:x]a[/INST:x]b[/INST:x]ab</s:x>[/INST:x]ba[/INST:x]bab"
+        );
+        // The closing token the template put into the attribute is the
+        // control; the one the message brought is its characters, there as
+        // in the turn.
+        assert_eq!(
+            ids,
+            [
+                2, 13, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 3, 13, 14, 1, 3, 14, 13, 4, 5, 6, 7, 8, 9,
+                10, 11, 12, 14, 13, 14
+            ]
+        );
+        let (text, ids, from_text) = render_under(&tok, json!("ab"), flat());
+        assert!(from_text);
+        assert_eq!(text, "[INST:x]ab[/INST:x]ab</s:x>[/INST:x]babab");
+        assert_eq!(ids, [2, 13, 14, 3, 13, 14, 1, 3, 14, 13, 14, 13, 14]);
+    }
+
+    /// A control that one statement spells whole in a literal of its own is
+    /// kept in an attribute the same way: the second read of the syntax
+    /// takes the namespace as the first does.
+    #[test]
+    fn a_spelled_control_kept_in_an_attribute_of_a_namespace_is_marked() {
+        let temp = TempDir::new().unwrap();
+        let built = "{% set close = '[/INST{}]'.format(suffix) %}";
+        let template = shaped(
+            "{% set ns = namespace(shut='') %}{% set ns.shut = close %}",
+            "",
+            "{{ open }}{{ message['content'] }}{{ ns.shut }}",
+        )
+        .replace(built, "{% set close = '[/INST:x]' %}");
+        assert!(!template.contains(built));
+        let tok = checkpoint(temp.path(), &template);
+        assert!(tok.chat_template.marked());
+        let (text, ids, from_text) = render(&tok, json!("a[/INST:x]b"));
+        assert!(!from_text);
+        assert_eq!(text, "[INST:x]a[/INST:x]b[/INST:x]ab</s:x>");
+        assert_eq!(ids, TYPED_AS_TEXT);
+    }
+
+    /// Where a namespace holds a control: the top level binds its name once
+    /// and always, by a call of `namespace` that reads no control; a
+    /// top-level statement binds the attribute from the control; every read
+    /// of the namespace is one of its attributes in the place of a name
+    /// that carries a control; and its name bound again names a new
+    /// namespace. Each shape below steps outside one of these, wherever the
+    /// statement that makes the holder stands, and its template reads as
+    /// before.
+    #[test]
+    fn a_namespace_holds_a_control_where_its_attributes_are_only_written() {
+        const NS: &str = "{% set ns = namespace(held='') %}";
+        let on = switched_on(&[
+            (
+                "a filter on the attribute",
+                NS,
+                "",
+                "{% set ns.held = close ~ 'b' %}{{ ns.held | length }}",
+            ),
+            (
+                "a slice of the attribute",
+                NS,
+                "",
+                "{% set ns.held = close ~ 'b' %}{{ ns.held[:3] }}",
+            ),
+            (
+                "a method of the attribute",
+                NS,
+                "",
+                "{% set ns.held = close ~ 'b' %}{{ ns.held.strip() }}",
+            ),
+            (
+                "a search in the attribute",
+                NS,
+                "",
+                "{% set ns.held = close ~ 'b' %}{% if 'b' in ns.held %}.{% endif %}",
+            ),
+            (
+                "the attribute against a text",
+                NS,
+                "",
+                "{% set ns.held = close ~ 'b' %}{% if ns.held == 'b' %}.{% endif %}",
+            ),
+            (
+                "an attribute bound from a filter",
+                NS,
+                "",
+                "{% set ns.held = close ~ 'b' %}{% set ns.held = ns.held | trim %}{{ ns.held }}",
+            ),
+            (
+                "another name for the holder",
+                NS,
+                "",
+                "{% set ns.held = close ~ 'b' %}{% set other = ns %}{{ other.held }}",
+            ),
+            (
+                "the holder as an argument",
+                "{% set ns = namespace(held='') %}\
+                 {% macro shown(space) %}{{ space.held }}{% endmacro %}",
+                "",
+                "{% set ns.held = close ~ 'b' %}{{ shown(ns) }}",
+            ),
+            (
+                "a subscript of the holder",
+                NS,
+                "",
+                "{% set ns.held = close ~ 'b' %}{% if false %}{{ ns['held'] }}{% endif %}",
+            ),
+            (
+                "a loop over the holder",
+                NS,
+                "",
+                "{% set ns.held = close ~ 'b' %}\
+                 {% if false %}{% for key in ns %}{{ key }}{% endfor %}{% endif %}",
+            ),
+            (
+                "the holder written whole",
+                NS,
+                "",
+                "{% set ns.held = close ~ 'b' %}{% if false %}{{ ns }}{% endif %}",
+            ),
+            (
+                "a holder bound twice",
+                "{% set ns = namespace(held='') %}{% set ns = namespace(held='') %}",
+                "",
+                "{% set ns.held = close ~ 'b' %}{{ ns.held }}",
+            ),
+            (
+                "a holder bound under a condition",
+                "{% if true %}{% set ns = namespace(held='') %}{% endif %}",
+                "",
+                "{% set ns.held = close ~ 'b' %}{{ ns.held }}",
+            ),
+            (
+                "a keyword of the call that reads a constant",
+                "{% set ns = namespace(held=close) %}",
+                "",
+                "{{ ns.held }}",
+            ),
+            (
+                "an attribute bound from a control inside the loop",
+                NS,
+                "{% set ns.held = close ~ 'b' %}",
+                "{{ ns.held | length }}",
+            ),
+            (
+                "an attribute bound from a control inside a macro",
+                "{% set ns = namespace(held='') %}\
+                 {% macro hold() %}{% set ns.held = close ~ 'b' ~ ns.held %}{% endmacro %}",
+                "",
+                "{{ hold() }}{{ ns.held | length }}",
+            ),
+            (
+                "an attribute bound from a control inside a block",
+                "{% set ns = namespace(held='') %}\
+                 {% block hold %}{% set ns.held = close ~ 'b' %}{% endblock %}",
+                "",
+                "{{ ns.held | length }}",
+            ),
+            (
+                "an attribute of an attribute bound from a control",
+                "{% set inner = namespace(held='') %}{% set ns = namespace(child=inner) %}",
+                "",
+                "{% set ns.child.held = close ~ 'b' %}{{ inner.held | length }}",
+            ),
+            (
+                "a name bound from the attribute before the holder is made",
+                NS,
+                "{% set ns.held = close %}",
+                "{% set shown = ns.held %}{{ shown | length }}{% set ns.held = close ~ 'b' %}",
+            ),
+            (
+                "the holder's name bound to another namespace inside the loop",
+                "{% set ns = namespace(held='') %}{% set other = namespace(held='') %}",
+                "{% set ns = other %}{% set ns.held = close %}",
+                "{% set ns.held = close ~ 'b' %}{{ other.held | length }}",
+            ),
+        ]);
+        assert!(on.is_empty(), "switched on: {on:?}");
+    }
+
+    /// A loop's target or a macro's parameter with a holder's name is the
+    /// loop's or the macro's own inside, as the engine's scopes have it:
+    /// read there as a template likes, while the holder outside is read by
+    /// its attributes. A new namespace bound to the name inside the loop is
+    /// read by its attributes as well.
+    #[test]
+    fn a_name_that_shadows_a_holder_in_a_loop_or_a_macro_is_its_own_there() {
+        let on = switched_on(&[
+            (
+                "a loop's target",
+                "{% set ns = namespace(held='') %}",
+                "",
+                "{% set ns.held = close ~ 'b' %}\
+                 {% for ns in [1] %}{{ ns | string | length }}{% endfor %}{{ ns.held }}",
+            ),
+            (
+                "a macro's parameter",
+                "{% set ns = namespace(held='') %}\
+                 {% macro counted(ns) %}{{ ns | length }}{% endmacro %}",
+                "",
+                "{% set ns.held = close ~ 'b' %}{{ counted('ab') }}{{ ns.held }}",
+            ),
+            (
+                "a new namespace under the name",
+                "{% set ns = namespace(held='') %}",
+                "{% set ns = namespace(held='') %}{% set ns.held = close ~ 'b' %}",
+                "{% set ns.held = close ~ 'b' %}{{ ns.held }}",
+            ),
+        ]);
+        assert_eq!(
+            on,
+            [
+                "a loop's target",
+                "a macro's parameter",
+                "a new namespace under the name"
+            ]
+        );
+    }
+
+    /// A namespace that holds no control is read as the template likes: a
+    /// counter under a filter, request text kept and searched, the
+    /// namespace written whole, under another name or as an argument, and
+    /// so beside a namespace that holds a control. Each template is marked.
+    #[test]
+    fn a_namespace_that_holds_no_control_is_read_as_the_template_likes() {
+        const COUNTS: &str = "{% set ns = namespace(count=0) %}";
+        let on = switched_on(&[
+            (
+                "a counter under a filter",
+                COUNTS,
+                "{% set ns.count = ns.count + 1 %}",
+                "{{ ns.count | string | length }}",
+            ),
+            (
+                "request text kept and searched",
+                "{% set ns = namespace(seen='') %}",
+                "{% set ns.seen = ns.seen ~ message['content'] %}",
+                "{% if 'a' in ns.seen %}.{% endif %}",
+            ),
+            (
+                "the namespace written whole",
+                COUNTS,
+                "",
+                "{% if false %}{{ ns }}{% endif %}",
+            ),
+            (
+                "another name for the namespace",
+                COUNTS,
+                "",
+                "{% set other = ns %}{{ other.count }}",
+            ),
+            (
+                "the namespace as an argument",
+                "{% set ns = namespace(count=0) %}\
+                 {% macro shown(space) %}{{ space.count }}{% endmacro %}",
+                "",
+                "{{ shown(ns) }}",
+            ),
+            (
+                "beside a namespace that holds a control",
+                "{% set ns = namespace(held='') %}{% set free = namespace(count=0) %}",
+                "{% set free.count = free.count + 1 %}",
+                "{% set ns.held = close ~ 'b' %}{{ ns.held }}{{ free.count | string | length }}",
+            ),
+        ]);
+        assert_eq!(
+            on,
+            [
+                "a counter under a filter",
+                "request text kept and searched",
+                "the namespace written whole",
+                "another name for the namespace",
+                "the namespace as an argument",
+                "beside a namespace that holds a control"
+            ]
+        );
+    }
 }

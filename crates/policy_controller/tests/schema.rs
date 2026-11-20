@@ -1,7 +1,7 @@
 //! The committed `policyspec.schema.json` is generated from the spec types.
-//! The first test fails when the two drift; `SMG_POLICY_SCHEMA_WRITE=1`
-//! rewrites the file from the types instead. The second pins the schema's
-//! shape: every section named, no unknown property anywhere, no `kind`.
+//! The tests hold the artifact to the generated schema and check its
+//! document shapes. `SMG_POLICY_SCHEMA_WRITE=1` writes the generated
+//! schema to the file.
 
 use std::{collections::BTreeSet, fs, path::Path};
 
@@ -31,6 +31,47 @@ fn the_committed_schema_matches_the_spec_types() {
          and commit the file",
         path.display()
     );
+}
+
+#[test]
+fn the_committed_schema_admits_least_cost_with_terms_and_a_margin() {
+    let committed = fs::read_to_string(schema_path()).expect("the committed schema");
+    let schema: Value = serde_json::from_str(&committed).expect("a JSON schema");
+    let defs = &schema["$defs"];
+    let entries = defs["ScoreStage"]["oneOf"]
+        .as_array()
+        .expect("the scorer entries");
+    let entry = entries
+        .iter()
+        .find(|entry| entry["properties"].get("least-cost").is_some())
+        .expect("the least-cost entry");
+    assert_eq!(entry["required"], serde_json::json!(["least-cost"]));
+    assert_eq!(
+        entry["properties"]["least-cost"]["$ref"],
+        "#/$defs/LeastCostParams"
+    );
+    let params = &defs["LeastCostParams"];
+    assert_eq!(params["required"], serde_json::json!(["terms"]));
+    assert_eq!(
+        params["properties"]["terms"]["additionalProperties"]["type"],
+        "number"
+    );
+    assert_eq!(params["properties"]["margin"]["$ref"], "#/$defs/CostMargin");
+    assert_eq!(defs["CostMargin"]["properties"]["absolute"]["default"], 0.0);
+    assert_eq!(defs["CostMargin"]["properties"]["relative"]["default"], 0.0);
+    assert_eq!(
+        params["properties"]["unreported"]["anyOf"][0]["$ref"],
+        "#/$defs/Unreported"
+    );
+    let unreported = &defs["Unreported"]["oneOf"];
+    assert_eq!(unreported[1]["const"], "missing-as-zero");
+    let over_least = &unreported[0]["properties"]["over-least"];
+    assert_eq!(over_least["required"], serde_json::json!(["request_cost"]));
+    assert_eq!(over_least["properties"]["request_cost"]["type"], "number");
+    let bare = defs["ScoreSpec"]["anyOf"][0]["enum"]
+        .as_array()
+        .expect("the bare names");
+    assert!(!bare.iter().any(|name| name == "least-cost"));
 }
 
 /// Every object schema under `root` either lists its properties and refuses
@@ -71,6 +112,7 @@ fn the_schema_names_every_section_and_refuses_unknown_properties() {
         "profiles",
         "plans",
         "bindings",
+        "explain",
     ]
     .into_iter()
     .collect();
@@ -132,7 +174,7 @@ fn the_schema_names_every_section_and_refuses_unknown_properties() {
     let stock = Catalog::builtin();
     let scorers: Vec<&str> = stock
         .scorers()
-        .filter(|name| *name != "resident-work")
+        .filter(|name| !matches!(*name, "resident-work" | "least-cost"))
         .collect();
     assert_eq!(bare("ScoreSpec"), scorers);
     assert_eq!(

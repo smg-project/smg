@@ -5354,12 +5354,12 @@ mod tests {
         let refs_with_vision = [
             ("mm_processor", "inprocess"),
             ("mm_media_ref_schemes", "http,https,data"),
-            (multimodal::SUPPORTS_VISION_LABEL, "true"),
+            (smg_worker::labels::SUPPORTS_VISION_LABEL, "true"),
         ];
         let refs_without_vision = [
             ("mm_processor", "inprocess"),
             ("mm_media_ref_schemes", "http,https,data"),
-            (multimodal::SUPPORTS_VISION_LABEL, "false"),
+            (smg_worker::labels::SUPPORTS_VISION_LABEL, "false"),
         ];
         let worker_registry = Arc::new(WorkerRegistry::new());
         let stage = regular_stage(Arc::clone(&worker_registry));
@@ -5475,7 +5475,7 @@ mod tests {
             let labels = [
                 ("mm_processor", "inprocess"),
                 ("mm_media_ref_schemes", "http,https,data"),
-                (multimodal::SUPPORTS_VISION_LABEL, verdict),
+                (smg_worker::labels::SUPPORTS_VISION_LABEL, verdict),
             ];
             registry
                 .register(regular_worker(url, "test-model", &labels))
@@ -5759,12 +5759,12 @@ mod tests {
         let pipeline_without_vision = [
             ("mm_processor", multimodal::GATEWAY_PIPELINE_PROCESSOR),
             ("mm_media_ref_schemes", "http,https,data"),
-            (multimodal::SUPPORTS_VISION_LABEL, "false"),
+            (smg_worker::labels::SUPPORTS_VISION_LABEL, "false"),
         ];
         let engine_with_vision = [
             ("mm_processor", "inprocess"),
             ("mm_media_ref_schemes", "http,https,data"),
-            (multimodal::SUPPORTS_VISION_LABEL, "true"),
+            (smg_worker::labels::SUPPORTS_VISION_LABEL, "true"),
         ];
         let worker_registry = Arc::new(WorkerRegistry::new());
         for (url, worker_type, labels) in [
@@ -6156,7 +6156,7 @@ mod tests {
         ];
         let refs_with = |verdict: &'static str| -> Vec<(&'static str, &'static str)> {
             let mut labels = REFS.to_vec();
-            labels.push((multimodal::SUPPORTS_VISION_LABEL, verdict));
+            labels.push((smg_worker::labels::SUPPORTS_VISION_LABEL, verdict));
             labels
         };
         let model_id = "test-model-vision-prefill-refs";
@@ -6219,7 +6219,7 @@ mod tests {
         ];
         let refs_with = |verdict: &'static str| -> Vec<(&'static str, &'static str)> {
             let mut labels = REFS.to_vec();
-            labels.push((multimodal::SUPPORTS_VISION_LABEL, verdict));
+            labels.push((smg_worker::labels::SUPPORTS_VISION_LABEL, verdict));
             labels
         };
         let model_id = "test-model-vision-prefill-refs-refusal";
@@ -6614,7 +6614,7 @@ mod tests {
                         .worker_type(WorkerType::Regular)
                         .runtime_type(RuntimeType::Vllm)
                         .connection_mode(ConnectionMode::Grpc)
-                        .label(multimodal::SUPPORTS_VISION_LABEL, vision)
+                        .label(smg_worker::labels::SUPPORTS_VISION_LABEL, vision)
                         .health_config(no_health_check())
                         .build(),
                 );
@@ -6681,8 +6681,9 @@ mod tests {
 
     /// The vision verdict of a worker without the encoder, of one with it,
     /// and of one whose servicer gave none.
-    const NO_VISION_ENCODER: &[(&str, &str)] = &[(multimodal::SUPPORTS_VISION_LABEL, "false")];
-    const VISION_ENCODER: &[(&str, &str)] = &[(multimodal::SUPPORTS_VISION_LABEL, "true")];
+    const NO_VISION_ENCODER: &[(&str, &str)] =
+        &[(smg_worker::labels::SUPPORTS_VISION_LABEL, "false")];
+    const VISION_ENCODER: &[(&str, &str)] = &[(smg_worker::labels::SUPPORTS_VISION_LABEL, "true")];
     const UNLABELED: &[(&str, &str)] = &[];
 
     /// A gRPC worker of `worker_type`, with `labels`.
@@ -6958,7 +6959,7 @@ mod tests {
         ];
         let refs_with = |verdict: &'static str| -> Vec<(&'static str, &'static str)> {
             let mut labels = REFS.to_vec();
-            labels.push((multimodal::SUPPORTS_VISION_LABEL, verdict));
+            labels.push((smg_worker::labels::SUPPORTS_VISION_LABEL, verdict));
             labels
         };
         let model_id = "test-model-vision-decode-refs";

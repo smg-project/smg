@@ -148,6 +148,7 @@ def repo(tmp_path, mod):
     put(root, "moved/src/lib.rs", "// moved\n")
     put(root, "model_gateway/Cargo.toml", manifest("smg", "1.0.0"))
     put(root, "model_gateway/src/main.rs", "fn main() {}\n")
+    put(root, "model_gateway/src/cli/mod.rs", "fn read_args() {}\n")
     put(root, "pkg/pyproject.toml", '[project]\nname = "pkg"\nversion = "0.1.0"\n')
     put(root, "pkg/pkg.py", "x = 1\n")
     put(root, "quiet/pyproject.toml", '[project]\nname = "quiet"\nversion = "0.1.0"\n')
@@ -193,7 +194,7 @@ def repo(tmp_path, mod):
     git(root, "add", "-A")
     git(root, "commit", "-q", "-m", "feat(delta): new crate")
     # the gateway: a breaking change, not bumped
-    put(root, "model_gateway/src/main.rs", "fn main() { println!(); }\n")
+    put(root, "model_gateway/src/cli/mod.rs", "fn read_args() { println!(); }\n")
     git(root, "add", "-A")
     git(root, "commit", "-q", "-m", "feat(gateway)!: a new wire")
     # pkg: a feat and then a fix, not bumped (the older feat still decides); quiet: untouched
@@ -1369,3 +1370,58 @@ def test_a_crates_wire_files_are_read_against_every_published_copy_a_version_rea
     assert "minor wire v0.2.1 → v0.3.0 (crates/wire/Cargo.toml)" in out
     code, out = check()
     assert code == 0, out
+
+
+def test_a_renamed_wire_file_does_not_hide_an_older_lines_copy(mod, tmp_path):
+    """A version written by hand alone is read against the copies other lines published, and the
+    comparison tag's own copy is no candidate there. With its version the newest one a caret
+    accepts, a wire file renamed with nothing else changed would otherwise answer for an older
+    line's copy whose wire files really differ."""
+    root = tmp_path / "renamed"
+    root.mkdir()
+    git(root, "init", "-q", "-b", "main")
+    one, two = "message A { int32 a = 1; }\n", "message A { int32 a = 1; int32 b = 2; }\n"
+
+    def write(version, proto, subject):
+        put(root, "Cargo.toml", root_manifest({"wire": version}))
+        put(root, "crates/wire/Cargo.toml", manifest("wire", version))
+        put(root, "crates/wire/proto/common.proto", proto)
+        git(root, "add", "-A")
+        git(root, "commit", "-q", "-m", subject)
+
+    def check():
+        crates = (
+            mod.crate("smg", "model_gateway"),
+            mod.crate("wire", "crates/wire", "wire", wire=("crates/wire/proto/",)),
+        )
+        stream = io.StringIO()
+        code = mod.run(
+            root, "v1.0.0", "check", None, mod.Out(stream), crates=crates, packages=(), mirrors=()
+        )
+        return code, stream.getvalue()
+
+    put(root, "crates/wire/src/lib.rs", "// wire\n")
+    put(root, "model_gateway/Cargo.toml", manifest("smg", "1.0.0"))
+    put(root, "model_gateway/src/main.rs", "fn main() {}\n")
+    write("0.2.0", one, "chore: initial")
+    git(root, "tag", "v0.9.0")
+    # An older line publishes 0.2.1 with a field more.
+    git(root, "checkout", "-q", "-b", "line")
+    write("0.2.1", two, "feat(wire): a field more")
+    git(root, "tag", "v0.9.1")
+    # Main publishes 0.2.2 without it, then writes 0.2.3 by hand over those very files.
+    git(root, "checkout", "-q", "main")
+    write("0.2.2", one, "chore(wire): 0.2.2")
+    git(root, "tag", "v1.0.0")
+    write("0.2.3", one, "chore(wire): 0.2.3 alone")
+
+    code, out = check()
+    assert code == 1, out
+    assert "but v0.2.3 is inside ^0.2.1 [minor]" in out
+
+    # The wire file renamed and nothing else: ^0.2.1 still accepts 0.2.3 without the field.
+    git(root, "mv", "crates/wire/proto/common.proto", "crates/wire/proto/renamed.proto")
+    git(root, "commit", "-q", "-m", "chore(wire): a file renamed")
+    code, out = check()
+    assert code == 1, out
+    assert "but v0.2.3 is inside ^0.2.1 [minor]" in out

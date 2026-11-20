@@ -195,6 +195,7 @@ fn the_writer_keeps_a_derivation_a_paired_model_and_none_past_it() {
         status: WorkerStatus::Ready,
         revision: 1,
         admitted_at: origin,
+        maker: Default::default(),
     };
     let moved = |id: u64| Classes::Written {
         left: Some(WorkerId(id)),

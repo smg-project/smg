@@ -5,15 +5,22 @@
 //! Included by path beside `common/engines.rs` and `common/net.rs` (the
 //! including binary names them `engines` and `net`).
 //!
+//! A second holder, [`Embedded`], is the same fleet under a host that
+//! embeds the engine: no controller, the store in the case's own hands,
+//! the same engines and the same stand-in prober.
+//!
 //! Every fact the store holds of an engine came from that engine, through a
 //! sink. Loads are the controller's own load driver's: the harness writes no
 //! load row. Health has no driver in the crate yet, so the harness stands in
 //! for one ([`probe`]): once an interval it asks each engine its wire's
 //! health check and writes what it heard, never what the case knows. A dial
 //! is bounded, so an engine that stops answering costs a turn that bound and
-//! no more. KV events have no driver either: a second stand-in
-//! ([`subscribe`]) holds one event stream an engine, decodes each batch into
-//! the events an index applies and hands it to the sink. Each stand-in leaves
+//! no more. KV events are the controller's own feed's where its build has
+//! the `worker-host` feature: the store then has one writer, the product's,
+//! and a listener ([`subscribe`]) holds one event stream an engine and keeps
+//! what the stream said. A build without that feature has no driver, so
+//! there the listener stands in for one: it decodes each batch into the
+//! events an index applies and hands it to the sink. Each stand-in leaves
 //! the day a driver feeds its sink.
 //!
 //! An engine speaks the wire of its kind ([`Shape::runtime`]): the fleet's
@@ -66,11 +73,11 @@ use smg_policy_controller::{
     },
     store::{
         Ask, BatchFacts, BatchOutcome, GatewayId, HealthPolicy, HealthSink, Kinds, KvCursor,
-        KvEvent, KvEventSink, LaneCounts, LeaseState, MemoryStore, SequenceHash, Signals,
-        StoredBlock, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
+        KvEvent, KvEventSink, LaneCounts, LeaseState, MemoryStore, ResyncReason, SequenceHash,
+        Signals, StoredBlock, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
     },
     view::{fingerprint, LoadRow, Role, WireModes, WorkerId},
-    AppliedSpec, Catalog, LeaseId, PolicySpec,
+    AppliedSpec, Catalog, LeaseId, PolicySpec, TransportClass,
 };
 use tokio::{
     io::{copy, sink},
@@ -109,6 +116,24 @@ pub const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Room for a loaded host on top of a wait's own timing.
 pub const ROOM: Duration = Duration::from_secs(30);
+
+/// Whether the controller under test feeds its own cache index: a build
+/// with the `worker-host` feature streams each engine's events into its
+/// store, and the harness then only listens.
+const PRODUCT_FEEDS: bool = cfg!(feature = "worker-host");
+
+/// Every reason the store counts a resync under.
+const RESYNCS: [ResyncReason; 9] = [
+    ResyncReason::OutOfRange,
+    ResyncReason::DataLoss,
+    ResyncReason::StreamEnded,
+    ResyncReason::SnapshotAbandoned,
+    ResyncReason::RelayRestart,
+    ResyncReason::EngineReplaced,
+    ResyncReason::PublisherRestart,
+    ResyncReason::GapCleared,
+    ResyncReason::Snapshot,
+];
 
 /// The metadata entry a caller states its name in.
 const PRINCIPAL: &str = "x-smg-principal";
@@ -162,8 +187,9 @@ pub struct Verdict {
     pub at: Instant,
 }
 
-/// One rank's KV events: what its stream delivered beside what the store
-/// holds of it, read at one instant.
+/// One rank's KV events: what the listener's stream delivered beside what
+/// the store holds of it, read at one instant. Where the controller feeds
+/// itself the two come by streams of their own, so they agree only at rest.
 #[derive(Clone, Copy, Debug)]
 pub struct Heard {
     /// The engine's data-parallel rank the row stands for.
@@ -171,9 +197,7 @@ pub struct Heard {
     /// The last sequence the engine's stream delivered for the rank; `0`
     /// when none came.
     pub last: u64,
-    /// The batches the sink answered applied.
-    pub applied: u64,
-    /// The blocks the applied events left the engine holding.
+    /// The blocks the stream's events left the engine holding.
     pub held: usize,
     /// The blocks the store's index holds for the row.
     pub indexed: usize,
@@ -220,6 +244,34 @@ struct Engine {
     release: Option<mpsc::Sender<()>>,
 }
 
+impl Engine {
+    /// Kills the engine: its runtime is dropped, and the call returns once
+    /// its thread has ended and the connection the harness held to it read
+    /// its end, so every socket of the engine closed. A hung engine is let
+    /// go first. `false` for an engine that is dead already.
+    async fn die(&mut self) -> Result<bool, String> {
+        let (Some(kill), Some(ended), Some(mut witness)) =
+            (self.kill.take(), self.ended.take(), self.witness.take())
+        else {
+            return Ok(false);
+        };
+        self.hang = None;
+        self.release = None;
+        drop(kill);
+        // The sender's drop is the thread's end: the wait ends on the error.
+        let _ = bounded("a killed engine's thread ends", ROOM, ended).await?;
+        // The proof of death is a socket of the harness's own: it reads to
+        // its end once the engine's side closed. A reset is an end too.
+        let _ = bounded(
+            "a killed engine's sockets close",
+            ROOM,
+            copy(&mut witness, &mut sink()),
+        )
+        .await?;
+        Ok(true)
+    }
+}
+
 /// What the stand-in prober counts and writes.
 #[derive(Default)]
 struct Turns {
@@ -256,9 +308,11 @@ struct Dialed {
     end: DialEnd,
 }
 
-/// What the stand-in subscribers heard, a row at a time, and the gaps the
-/// sink named. The rows' one lock is held across a batch's hand-over, so a
-/// read under it sees the store and every row in step.
+/// What the listeners heard, a row at a time, and the gaps the sink named
+/// to a listener that stands in for a driver. There the rows' one lock is
+/// held across a batch's hand-over, so a read under it sees the store and
+/// every row in step. Where the controller feeds itself the store has its
+/// own writer, and a read sees the two in step only at rest.
 #[derive(Default)]
 struct Events {
     rows: Mutex<HashMap<WorkerId, Stream>>,
@@ -276,9 +330,9 @@ struct Events {
 struct Stream {
     /// The last sequence the stream delivered.
     last: u64,
-    /// The batches the sink answered applied.
-    applied: u64,
-    /// The blocks the applied events left the engine holding, by its hashes.
+    /// The blocks the stream's events left the engine holding, by its hashes:
+    /// every batch's where the controller feeds itself, the batches the sink
+    /// applied otherwise.
     /// An engine's own stream carries no snapshot chunk (a relay's does), so
     /// stores, removals and clears are the whole of it. A stream opened
     /// again past the engine's replay buffer would part it from the index:
@@ -337,6 +391,9 @@ pub struct Harness {
     buffers: ViewBuffers,
     stop_feeds: watch::Sender<bool>,
     feeds: JoinSet<()>,
+    /// Whether the controller the harness asks elects over a lease file: a
+    /// leader that elects can stop leading for a moment.
+    elects: bool,
 }
 
 /// Waits for `check` under the bound named `name`; the error names the
@@ -540,6 +597,71 @@ async fn start_engine(ranks: u16, runtime: RuntimeType) -> Result<Engine, String
     })
 }
 
+/// One rank written into the store by its membership write, pending: a
+/// rank of a wider engine under a controller, and every rank of a fleet
+/// that has no control listener.
+fn written(store: &MemoryStore, endpoint: &str, shape: &Shape, rank: u16) -> WorkerId {
+    store
+        .upsert(WorkerFacts {
+            key: format!("{endpoint}@{rank}"),
+            engine: endpoint.to_owned(),
+            incarnation: 1,
+            role: shape.role,
+            wire_modes: WireModes::GRPC,
+            engine_kind: shape.runtime.as_str().to_owned(),
+            models: vec![shape.model.to_owned()],
+            dp_rank: rank,
+            dp_size: shape.ranks,
+            signals: Signals {
+                events: !counts_resident(shape.runtime),
+                ..Signals::default()
+            },
+            health: health_policy(),
+            ..WorkerFacts::default()
+        })
+        .id()
+}
+
+/// Sends one short request named `id` to the engine at `endpoint` on the
+/// fleet's first wire and reads it to its end, the whole under
+/// [`DIAL_TIMEOUT`]: the class the transport read (a stream read to its
+/// end, a connection refused or the bound run out) and the frames read.
+async fn sent(endpoint: &str, id: String) -> (Class, u32) {
+    let request = vllm_proto::GenerateRequest {
+        request_id: id,
+        input: Some(vllm_proto::generate_request::Input::Tokenized(
+            vllm_proto::TokenizedInput {
+                original_text: String::new(),
+                input_ids: vec![1; 8],
+            },
+        )),
+        sampling_params: Some(vllm_proto::SamplingParams {
+            max_tokens: Some(SENT_TOKENS),
+            ..Default::default()
+        }),
+        stream: true,
+        ..Default::default()
+    };
+    let asked = tokio::time::timeout(DIAL_TIMEOUT, async {
+        let Ok(client) = VllmEngineClient::connect(endpoint).await else {
+            return (Class::ConnectFailed, 0);
+        };
+        let Ok(mut stream) = client.generate(request).await else {
+            return (Class::ServerError, 0);
+        };
+        let mut frames = 0;
+        loop {
+            match stream.next().await {
+                Some(Ok(_)) => frames += 1,
+                Some(Err(_)) => return (Class::ServerError, frames),
+                None => return (Class::Ok, frames),
+            }
+        }
+    })
+    .await;
+    asked.unwrap_or((Class::Timeout, 0))
+}
+
 /// An engine's client on the wire its kind speaks.
 #[derive(Clone)]
 enum EngineClient {
@@ -686,12 +808,16 @@ fn decode(batch: &KvEventBatch) -> Vec<KvEvent> {
         .collect()
 }
 
-/// One batch, decoded, through its rank's cursor into its row's index, with
-/// the header the batch carries. A batch that carries a load record alone is
-/// not handed over, and its record is not written here: loads are the
-/// driver's. A snapshot chunk is a relay's: its start is a collector's word
-/// to every row of the engine, which this stand-in does not say, so a chunk
-/// is counted and not handed over. Returns `false` at a gap.
+/// One batch as its rank's row keeps it: the last sequence, and the blocks
+/// its events leave the engine holding. Where the controller feeds itself
+/// the store is handed nothing here. Otherwise the batch goes, decoded,
+/// through its rank's cursor into its row's index, with the header the
+/// batch carries, and a batch the sink did not apply leaves the blocks as
+/// they were. A batch that carries a load record alone is passed by, and
+/// its record is not written here: loads are the driver's. A snapshot chunk
+/// is a relay's: its start is a collector's word to every row of the
+/// engine, which this listener does not say, so a chunk is counted and
+/// passed by. Returns `false` at a gap the sink named.
 fn admit(store: &MemoryStore, engine: &Probed, events: &Events, batch: &KvEventBatch) -> bool {
     if batch.load.as_ref().is_some_and(|load| load.load_only) {
         return true;
@@ -715,37 +841,39 @@ fn admit(store: &MemoryStore, engine: &Probed, events: &Events, batch: &KvEventB
     let mut rows = events.rows.lock();
     let row = rows.entry(id).or_default();
     row.last = batch.sequence_number;
-    match store.admit(id, rank, facts, &decoded) {
-        BatchOutcome::Applied => {
-            row.applied += 1;
-            for event in decoded {
-                match event {
-                    KvEvent::Stored { parent, blocks } => {
-                        if parent == row.head.last().map(|block| block.seq_hash) {
-                            row.head.extend(&blocks);
-                        }
-                        row.held.extend(blocks.iter().map(|block| block.seq_hash));
-                    }
-                    KvEvent::Removed(hashes) => {
-                        for hash in hashes {
-                            row.held.remove(&hash);
-                        }
-                    }
-                    KvEvent::Cleared => row.held.clear(),
-                }
+    if !PRODUCT_FEEDS {
+        match store.admit(id, rank, facts, &decoded) {
+            BatchOutcome::Applied => {}
+            BatchOutcome::Skipped => return true,
+            BatchOutcome::Gap { .. } => {
+                events.gaps.fetch_add(1, Ordering::SeqCst);
+                return false;
             }
-            true
-        }
-        BatchOutcome::Skipped => true,
-        BatchOutcome::Gap { .. } => {
-            events.gaps.fetch_add(1, Ordering::SeqCst);
-            false
         }
     }
+    for event in decoded {
+        match event {
+            KvEvent::Stored { parent, blocks } => {
+                if parent == row.head.last().map(|block| block.seq_hash) {
+                    row.head.extend(&blocks);
+                }
+                row.held.extend(blocks.iter().map(|block| block.seq_hash));
+            }
+            KvEvent::Removed(hashes) => {
+                for hash in hashes {
+                    row.held.remove(&hash);
+                }
+            }
+            KvEvent::Cleared => row.held.clear(),
+        }
+    }
+    true
 }
 
-/// The case's stand-in for the KV event subscription: one stream an engine,
-/// every rank's batches on it, each handed to the sink as it arrives. A
+/// The case's listener on the KV events: one stream an engine, every rank's
+/// batches on it, each kept as it arrives ([`admit`]). Where the controller
+/// feeds itself the stream is asked from zero each time it opens, and the
+/// engine's rows start over. Where the listener stands in for a driver, a
 /// stream that ends or names a gap is opened again after one probe interval:
 /// from the rank's cursor for an engine of one rank, from zero for an engine
 /// of several (one cursor names one rank's sequence). An engine asked from
@@ -761,7 +889,7 @@ async fn subscribe(
 ) {
     loop {
         let resume = match engine.ids.as_slice() {
-            [only] => store.cursor(*only, 0).map_or(0, |cursor| cursor.applied),
+            [only] if !PRODUCT_FEEDS => store.cursor(*only, 0).map_or(0, |cursor| cursor.applied),
             _ => 0,
         };
         let opened = tokio::time::timeout(DIAL_TIMEOUT, async {
@@ -778,8 +906,17 @@ async fn subscribe(
         let refusal = match opened {
             Ok(mut stream) => {
                 events.refused.lock().remove(&engine.engine);
-                for id in &engine.ids {
-                    store.reconnected(*id);
+                if PRODUCT_FEEDS {
+                    // The engine replays from zero: its rows start over,
+                    // and the store is told nothing.
+                    let mut rows = events.rows.lock();
+                    for id in &engine.ids {
+                        rows.remove(id);
+                    }
+                } else {
+                    for id in &engine.ids {
+                        store.reconnected(*id);
+                    }
                 }
                 loop {
                     let batch = tokio::select! {
@@ -1035,6 +1172,7 @@ impl Harness {
     /// `catalog` holds and on the policy document at `spec`, which the
     /// controller reads and applies itself. The case applies no generation
     /// in its own process beside it.
+    #[cfg(feature = "wasm")]
     pub async fn start_hosting(catalog: Catalog, spec: &Path) -> Result<Self, String> {
         let replica = Replica::start_over("fleet-controller", None, catalog, Some(spec)).await?;
         Self::around(replica).await
@@ -1064,6 +1202,7 @@ impl Harness {
             buffers: ViewBuffers::default(),
             stop_feeds,
             feeds: JoinSet::new(),
+            elects: false,
         })
     }
 
@@ -1077,7 +1216,9 @@ impl Harness {
         let port = leader.replication.port();
         let mut standby = Replica::start_at("fleet-standby", Some(lease), STANDBY, port).await?;
         standby.reaches(State::Follower).await?;
-        Ok((Self::around(leader).await?, standby))
+        let mut harness = Self::around(leader).await?;
+        harness.elects = true;
+        Ok((harness, standby))
     }
 
     /// The reference client at `replica`'s gateway listener and the
@@ -1140,6 +1281,31 @@ impl Harness {
         self.client = client;
         self.operator = operator;
         Ok(())
+    }
+
+    /// Whether the controller the harness asks elects over a lease file.
+    pub const fn elects(&self) -> bool {
+        self.elects
+    }
+
+    /// Opens the harness's session again at the controller it asks, as a
+    /// gateway does whose session that controller ended. The dial is tried
+    /// until the controller welcomes it, inside the room.
+    pub async fn redial(&mut self) -> Result<(), String> {
+        let gateway = format!("http://{}", self.replica.gateway());
+        let asked = Instant::now();
+        loop {
+            match Client::connect(&gateway, GATEWAY).await {
+                Ok(client) => {
+                    self.client = client;
+                    return Ok(());
+                }
+                Err(_) if asked.elapsed() < ROOM => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Err(refused) => return Err(format!("no session opens inside the room: {refused}")),
+            }
+        }
     }
 
     /// Ask: who leads, as the reference client hears it on the gateway
@@ -1237,27 +1403,7 @@ impl Harness {
         if shape.ranks == 1 {
             return self.add(endpoint, shape).await;
         }
-        let id = self
-            .store
-            .upsert(WorkerFacts {
-                key: format!("{endpoint}@{rank}"),
-                engine: endpoint.to_owned(),
-                incarnation: 1,
-                role: shape.role,
-                wire_modes: WireModes::GRPC,
-                engine_kind: shape.runtime.as_str().to_owned(),
-                models: vec![shape.model.to_owned()],
-                dp_rank: rank,
-                dp_size: shape.ranks,
-                signals: Signals {
-                    events: !counts_resident(shape.runtime),
-                    ..Signals::default()
-                },
-                health: health_policy(),
-                ..WorkerFacts::default()
-            })
-            .id();
-        Ok(id)
+        Ok(written(&self.store, endpoint, shape, rank))
     }
 
     /// An operator's add of a one-rank engine. The answer is the row the
@@ -1366,7 +1512,6 @@ impl Harness {
                 Heard {
                     rank: *rank,
                     last: stream.map_or(0, |stream| stream.last),
-                    applied: stream.map_or(0, |stream| stream.applied),
                     held: stream.map_or(0, |stream| stream.held.len()),
                     indexed: self.store.indexed_blocks(*id, *rank),
                     counts: self.store.lane_counts(*id, *rank),
@@ -1384,9 +1529,18 @@ impl Harness {
         self.events.refused.lock().get(&engine).cloned()
     }
 
-    /// The gaps the KV sink named on any engine's stream.
+    /// The gaps on any engine's stream: the store's own resyncs where the
+    /// controller feeds itself, the gaps the sink named to the stand-in
+    /// otherwise.
     pub fn gaps(&self) -> u64 {
-        self.events.gaps.load(Ordering::SeqCst)
+        if PRODUCT_FEEDS {
+            RESYNCS
+                .iter()
+                .map(|reason| self.store.resyncs(*reason))
+                .sum()
+        } else {
+            self.events.gaps.load(Ordering::SeqCst)
+        }
     }
 
     /// The snapshot chunks any engine's stream carried.
@@ -1576,39 +1730,7 @@ impl Harness {
         self.sent += 1;
         let lease_id = self.sent;
         let started = Instant::now();
-        let request = vllm_proto::GenerateRequest {
-            request_id: format!("sent-{engine}-{lease_id}"),
-            input: Some(vllm_proto::generate_request::Input::Tokenized(
-                vllm_proto::TokenizedInput {
-                    original_text: String::new(),
-                    input_ids: vec![1; 8],
-                },
-            )),
-            sampling_params: Some(vllm_proto::SamplingParams {
-                max_tokens: Some(SENT_TOKENS),
-                ..Default::default()
-            }),
-            stream: true,
-            ..Default::default()
-        };
-        let asked = tokio::time::timeout(DIAL_TIMEOUT, async {
-            let Ok(client) = VllmEngineClient::connect(&endpoint).await else {
-                return (Class::ConnectFailed, 0);
-            };
-            let Ok(mut stream) = client.generate(request).await else {
-                return (Class::ServerError, 0);
-            };
-            let mut frames = 0;
-            loop {
-                match stream.next().await {
-                    Some(Ok(_)) => frames += 1,
-                    Some(Err(_)) => return (Class::ServerError, frames),
-                    None => return (Class::Ok, frames),
-                }
-            }
-        })
-        .await;
-        let (class, frames) = asked.unwrap_or((Class::Timeout, 0));
+        let (class, frames) = sent(&endpoint, format!("sent-{engine}-{lease_id}")).await;
         let side = Side::Single.into();
         let dispatched = Dispatched {
             lease_id,
@@ -1739,28 +1861,13 @@ impl Harness {
             .engines
             .get_mut(engine)
             .ok_or_else(|| format!("no engine {engine}"))?;
-        let (Some(kill), Some(ended), Some(mut witness)) =
-            (slot.kill.take(), slot.ended.take(), slot.witness.take())
-        else {
-            return Err(format!("engine {engine} is dead already"));
-        };
         // Both are read before a hung engine is let go: its release runs
         // the thread to its end.
         let at = Instant::now();
         let asked = self.turns.begun.load(Ordering::SeqCst);
-        slot.hang = None;
-        slot.release = None;
-        drop(kill);
-        // The sender's drop is the thread's end: the wait ends on the error.
-        let _ = bounded("a killed engine's thread ends", ROOM, ended).await?;
-        // The proof of death is a socket of the harness's own: it reads to
-        // its end once the engine's side closed. A reset is an end too.
-        let _ = bounded(
-            "a killed engine's sockets close",
-            ROOM,
-            copy(&mut witness, &mut sink()),
-        )
-        .await?;
+        if !slot.die().await? {
+            return Err(format!("engine {engine} is dead already"));
+        }
         Ok(Death {
             at,
             asked,
@@ -1861,5 +1968,156 @@ impl Harness {
             }
         }
         self.replica.stop().await
+    }
+}
+
+/// A fleet under a host that embeds the engine: the same engines and the
+/// same stand-in prober, over a store of the case's own process with no
+/// controller beside it. A store has one host at its files, so every
+/// decision over this fleet is its door's.
+pub struct Embedded {
+    store: Arc<MemoryStore>,
+    engines: Vec<Engine>,
+    probed: Arc<Mutex<Vec<Probed>>>,
+    turns: Arc<Turns>,
+    stop_feeds: watch::Sender<bool>,
+    feeds: JoinSet<()>,
+}
+
+impl Embedded {
+    /// A store of `deciders` files of leases with `document` applied as
+    /// its first generation, and no engine yet.
+    pub fn start(deciders: usize, mut document: PolicySpec) -> Result<Self, String> {
+        let store = MemoryStore::new().with_deciders(deciders);
+        document.generation = 1;
+        let spec = AppliedSpec::validate(&document).map_err(|error| error.to_string())?;
+        store.apply(spec).map_err(|error| error.to_string())?;
+        let (stop_feeds, _) = watch::channel(false);
+        Ok(Self {
+            store: Arc::new(store),
+            engines: Vec::new(),
+            probed: Arc::default(),
+            turns: Arc::default(),
+            stop_feeds,
+            feeds: JoinSet::new(),
+        })
+    }
+
+    /// Register: starts one mock engine a shape and writes each of its
+    /// ranks into the store, pending: only a probe's verdict makes a rank
+    /// ready. Returns the engines' indexes, in the shapes' order.
+    pub async fn register(&mut self, shapes: &[Shape]) -> Result<Vec<usize>, String> {
+        let mut started = Vec::with_capacity(shapes.len());
+        for shape in shapes {
+            let running = start_engine(shape.ranks, shape.runtime).await?;
+            let endpoint = running.endpoint.clone();
+            let ranks = 0..shape.ranks;
+            let ids = ranks.map(|rank| written(&self.store, &endpoint, shape, rank));
+            let probed = Probed {
+                engine: self.engines.len(),
+                runtime: shape.runtime,
+                endpoint: endpoint.clone(),
+                ids: ids.collect(),
+            };
+            // The build these registrations owe, asked: the case reads
+            // the rows at once.
+            self.store.publish_now();
+            started.push(probed.engine);
+            self.probed.lock().push(probed);
+            self.engines.push(running);
+        }
+        Ok(started)
+    }
+
+    /// Feed: starts the stand-in prober over every engine registered now
+    /// and later.
+    pub fn feed(&mut self) {
+        self.feeds.spawn(probe(
+            Arc::clone(&self.store),
+            Arc::clone(&self.probed),
+            Arc::clone(&self.turns),
+            self.stop_feeds.subscribe(),
+        ));
+    }
+
+    /// The store: the host's door decides over it.
+    pub fn store(&self) -> &Arc<MemoryStore> {
+        &self.store
+    }
+
+    /// The engine a row of the fleet stands for.
+    pub fn engine_of(&self, id: WorkerId) -> Option<usize> {
+        let probed = self.probed.lock();
+        let owner = probed.iter().find(|engine| engine.ids.contains(&id));
+        owner.map(|engine| engine.engine)
+    }
+
+    /// Each engine as a decision of `gateway` reads it in the pool that
+    /// serves `model` at this instant, in the engines' order: whether
+    /// every rank of it reads healthy, and the requests the leases on
+    /// file book on it.
+    pub fn read(&self, model: &str, gateway: GatewayId) -> Vec<(bool, u32)> {
+        let ask = Ask {
+            gateway,
+            now: Instant::now(),
+            pinned: None,
+            affinity: false,
+        };
+        let mut out = ViewBuffers::default();
+        self.store.deciding(|world| {
+            if let Some(built) = world.build(model, Role::Single, &ask, &mut out) {
+                world.count_in_flight(&built, &ask, &mut out.candidates);
+            }
+        });
+        let probed = self.probed.lock();
+        let engines = probed.iter().map(|engine| {
+            let rows = out.candidates.iter();
+            let own: Vec<_> = rows.filter(|row| engine.ids.contains(&row.id)).collect();
+            let healthy = own.len() == engine.ids.len() && own.iter().all(|row| row.health.healthy);
+            (healthy, own.iter().map(|row| row.in_flight).sum())
+        });
+        engines.collect()
+    }
+
+    /// Sends one short request named `id` to the engine at `engine` on the
+    /// engine's own wire and reads it to its end, as a host that committed
+    /// its pick sends one: the class the transport read and the frames
+    /// read.
+    pub async fn send(&self, engine: usize, id: &str) -> Result<(TransportClass, u32), String> {
+        let slot = self.engines.get(engine);
+        let endpoint = slot.map(|engine| engine.endpoint.clone());
+        let endpoint = endpoint.ok_or_else(|| format!("no engine {engine}"))?;
+        let (class, frames) = sent(&endpoint, id.to_owned()).await;
+        let class = match class {
+            Class::Ok => TransportClass::Ok,
+            Class::ConnectFailed => TransportClass::ConnectFailed,
+            Class::Timeout => TransportClass::Timeout,
+            _ => TransportClass::ServerError,
+        };
+        Ok((class, frames))
+    }
+
+    /// Kills the engine at `engine`: every socket of it has closed at the
+    /// return.
+    pub async fn kill(&mut self, engine: usize) -> Result<(), String> {
+        let slot = self.engines.get_mut(engine);
+        let slot = slot.ok_or_else(|| format!("no engine {engine}"))?;
+        if slot.die().await? {
+            Ok(())
+        } else {
+            Err(format!("engine {engine} is dead already"))
+        }
+    }
+
+    /// Ends the prober and the engines, each under a bound.
+    pub async fn stop(mut self) -> Result<(), String> {
+        self.stop_feeds.send_replace(true);
+        while let Some(joined) = bounded("a feed ends", ROOM, self.feeds.join_next()).await? {
+            joined.map_err(|error| error.to_string())?;
+        }
+        for engine in &mut self.engines {
+            engine.die().await?;
+        }
+        Ok(())
     }
 }

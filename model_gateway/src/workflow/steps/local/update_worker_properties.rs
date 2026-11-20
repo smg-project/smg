@@ -4,20 +4,21 @@ use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
 use openai_protocol::worker::{WorkerModels, WorkerSpec, WorkerStatus};
-use smg_worker::identity::basic::{merge_labels, BasicWorker, RuntimeType, Worker};
+use smg_service_discovery::DISCOVERY_PROVIDER_LABEL;
+use smg_worker::{
+    identity::basic::{merge_labels, BasicWorker, RuntimeType, Worker},
+    workflow::{
+        kv_transfer_value, model_card_for_labels, report_for_rank,
+        validate_constrained_decoding_label, DP_WIDTH_LABELS,
+    },
+};
 use tracing::{debug, info};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
-#[cfg(test)]
-use super::create_worker::labels_for_rank;
-use super::create_worker::{
-    kv_transfer_value, model_card_for_labels, report_for_rank, validate_parser_overrides,
-    warn_on_conflicting_parser_overrides, DP_WIDTH_LABELS,
-};
+use super::check_local_worker::{validate_parser_overrides, warn_on_conflicting_parser_overrides};
 use crate::{
     admin::worker_service::MAX_WORKER_LABELS,
     routers::grpc::backend_client::BasicWorkerBuilder,
-    service_discovery::DISCOVERY_PROVIDER_LABEL,
     workflow::data::{require_app_context, WorkerUpdateWorkflowData},
 };
 
@@ -42,9 +43,8 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
         // merges the request's labels into the existing ones.
         let refresh = context.data.refresh_discovered_labels;
         // The engine's KV transfer metadata travels in its report under label
-        // names and is never a label (registration takes it out the same way,
-        // `create_worker::take_kv_transfer_metadata`): out of the report before
-        // any merge, applied to the worker's dedicated fields below.
+        // names. Take it out before merging labels and apply it to the same
+        // dedicated fields as registration.
         let (fresh_engine_labels, fresh_kv) = match context.data.fresh_engine_labels.clone() {
             Some(mut fresh) => {
                 let kv = EngineKvMetadata::take(&mut fresh);
@@ -98,7 +98,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                     // An engine that reports a `constrained_decoding` naming no
                     // policy is refused as at registration: the job fails with
                     // the reason and the worker keeps the labels it had.
-                    super::create_worker::validate_constrained_decoding_label(
+                    validate_constrained_decoding_label(
                         &labels,
                         worker.url(),
                         "update_worker_properties",
@@ -106,7 +106,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                     labels
                 } else {
                     // A window set here is the worker's only window, as at
-                    // registration (see `create_worker::merge_labels`).
+                    // registration (see `merge_labels`).
                     let updated_labels = match request.labels {
                         Some(ref new_labels) => {
                             // The admin check refused labels for a discovered
@@ -132,7 +132,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                     // A `constrained_decoding` label sent in the update must name a
                     // policy, as at registration (`create_worker`): a typo would
                     // otherwise read as `requested` from here on.
-                    super::create_worker::validate_constrained_decoding_label(
+                    validate_constrained_decoding_label(
                         &updated_labels,
                         worker.url(),
                         "update_worker_properties",
@@ -408,7 +408,7 @@ fn models_for_labels(
 
 /// The engine's KV transfer metadata, which its report carries under label
 /// names (`kv_connector`, `kv_role`, `kv_engine_id`) and the worker holds in
-/// dedicated fields, as at registration (`create_worker::take_kv_transfer_metadata`).
+/// dedicated fields, as at registration.
 #[derive(Debug, Default)]
 struct EngineKvMetadata {
     connector: Option<String>,

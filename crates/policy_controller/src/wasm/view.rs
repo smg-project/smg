@@ -15,8 +15,9 @@ use crate::{
     plugins::shown_hashes,
     spec::Needs,
     view::{
-        AffinityFacts, Candidate, Feed, HashKind, Health, Identity, LoadRow, OverloadRegime, Phase,
-        PoolFacts, RequestFacts, Role, SignalSource, WireModes, ZoneCapacity,
+        lay_session_in_flight, AffinityFacts, Candidate, Feed, HashKind, Health, Identity, LoadRow,
+        OverloadRegime, Phase, PoolFacts, RequestFacts, Role, SignalSource, WireModes,
+        ZoneCapacity,
     },
 };
 
@@ -312,6 +313,11 @@ impl Records {
                 .zip(candidates)
                 .map(|(index, c)| candidate(c, facts.affinity_at(index), counts(c)));
             self.candidates.extend(records);
+        });
+        // The key's counts a host lent beside its rows are each row's own
+        // in the record.
+        lay_session_in_flight(facts, &mut self.candidates, |row, in_flight| {
+            row.session_in_flight = in_flight;
         });
         self.zones.clear();
         self.zones.extend(pool.zones.iter().map(zone));
@@ -787,6 +793,12 @@ impl Packed {
                 }
             }
         });
+        // The key's counts a host lent beside its rows are each row's own
+        // in the table.
+        let rows = buf.as_chunks_mut::<ROW>().0;
+        lay_session_in_flight(facts, rows, |row, in_flight| {
+            put(row, layout::ROW_SESSION_IN_FLIGHT, &in_flight.to_le_bytes());
+        });
     }
 
     /// One candidate's row of the table, its affinity facts and the
@@ -969,15 +981,20 @@ pub(crate) fn release_reason(r: ReleaseReason) -> wit::ReleaseReason {
     }
 }
 
-/// A membership word as the guest's world carries it. `None` for
-/// [`Membership::Left`]: the world has no case for it, and a guest hears
-/// the write's own word, said beside it.
+/// A membership word as the guest's world carries it. A snapshot's ids are
+/// written into `snapshot` and a left word's names into `names`: the word
+/// borrows them for the call.
 pub(crate) fn membership<'a>(
-    m: &Membership<'_>,
+    m: &Membership<'a>,
     snapshot: &'a mut Vec<u64>,
-) -> Option<wit::Membership<'a>> {
-    Some(match m {
-        Membership::Left { .. } => return None,
+    names: &'a mut Vec<&'a str>,
+) -> wit::Membership<'a> {
+    match *m {
+        Membership::Left { id, models } => {
+            names.clear();
+            names.extend(models.iter().map(String::as_str));
+            wit::Membership::Left((id.0, names.as_slice()))
+        }
         Membership::Added(w) => wit::Membership::Added(w.0),
         Membership::Removed(w) => wit::Membership::Removed(w.0),
         Membership::Replaced { old, new } => wit::Membership::Replaced((old.0, new.0)),
@@ -988,7 +1005,7 @@ pub(crate) fn membership<'a>(
             snapshot.extend(workers.iter().map(|w| w.0));
             wit::Membership::Snapshot(snapshot)
         }
-    })
+    }
 }
 
 /// A signal; a veto's instant on the host's clock becomes the microseconds
@@ -999,6 +1016,7 @@ pub(crate) fn signal(s: &Signal, now_micros: u64) -> wit::Signal {
             worker,
             dp_rank,
             row,
+            ..
         } => wit::Signal::Load((worker.0, *dp_rank, load(row))),
         Signal::Health { worker, health: h } => wit::Signal::Health((worker.0, health(*h))),
         Signal::GatewayVeto {
@@ -1217,6 +1235,43 @@ mod tests {
             .map(|row| le_u32(row, ROW_IN_FLIGHT))
             .collect();
         assert_eq!(packed, vec![0, 7, 3]);
+    }
+
+    /// Both fills carry each candidate's count of the request's session
+    /// key as the request's facts read it: the lent rows' counts where the
+    /// host lends them, and zero for every other row, whatever the rows
+    /// themselves say.
+    #[test]
+    fn both_fills_give_a_row_the_keys_count_its_request_reads() {
+        use crate::view::KeyedRow;
+        let mut rows = [Candidate::default(), candidate_row(), Candidate::default()];
+        for (row, position) in rows.iter_mut().zip(0..) {
+            row.position = position;
+        }
+        let read = |facts: &RequestFacts<'_>| {
+            let mut records = Records::default();
+            records.fill(facts, &rows, &PoolFacts::default());
+            let record = records.candidates.iter().map(|r| r.session_in_flight);
+            let record: Vec<u16> = record.collect();
+            let mut packed = Packed::default();
+            packed.fill_candidates(facts, &rows);
+            let table = packed.candidates.as_chunks::<ROW>().0.iter();
+            let table: Vec<u16> = table
+                .map(|row| le_u16(row, ROW_SESSION_IN_FLIGHT))
+                .collect();
+            assert_eq!(record, table, "the two forms");
+            record
+        };
+        assert_eq!(read(&RequestFacts::default()), [0, 19, 0], "the rows' own");
+        let lent = [KeyedRow {
+            row: 2,
+            in_flight: 3,
+        }];
+        let facts = RequestFacts {
+            lent_session_in_flight: Some(&lent),
+            ..RequestFacts::default()
+        };
+        assert_eq!(read(&facts), [0, 0, 3], "the lent rows alone");
     }
 
     #[test]
@@ -1463,6 +1518,7 @@ mod tests {
             now_micros: 0,
             pinned_at: 0,
             lent_in_flight: None,
+            lent_session_in_flight: None,
             session_counted: false,
             // Host-only: the request block carries no affinity column and
             // no rows named in its place.
@@ -1702,18 +1758,21 @@ mod tests {
         assert_eq!(lease(&told, &Exposure::default()).target_index, 1);
     }
 
-    /// The guest's world has no case for the models a worker left: the
-    /// mapper hands a guest nothing for that word, and the write's own word
-    /// as before.
+    /// The guest's world carries the models a worker left as the case
+    /// `left`: the mapper hands a guest the worker's id with the names, and
+    /// the write's own word as before.
     #[test]
-    fn a_guest_is_told_nothing_of_the_models_a_worker_left() {
+    fn a_guest_is_told_the_models_a_worker_left_as_the_case_left() {
         let (id, models) = (WorkerId(7), ["m".to_string()]);
         let left = Membership::Left {
             id,
             models: &models,
         };
-        let mut snapshot = Vec::new();
-        assert!(membership(&left, &mut snapshot).is_none());
-        assert!(membership(&Membership::Relabelled(id), &mut snapshot).is_some());
+        let (mut snapshot, mut names) = (Vec::new(), Vec::new());
+        let word = membership(&left, &mut snapshot, &mut names);
+        assert!(matches!(word, wit::Membership::Left((7, ["m"]))));
+        let (mut snapshot, mut names) = (Vec::new(), Vec::new());
+        let word = membership(&Membership::Relabelled(id), &mut snapshot, &mut names);
+        assert!(matches!(word, wit::Membership::Relabelled(7)));
     }
 }

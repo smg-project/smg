@@ -116,6 +116,8 @@ fn engine_with(picker: Box<dyn Picker>) -> Engine {
         plan: Plan::Single,
         profile: 0,
         decode_profile: None,
+        shadow: None,
+        decode_shadow: None,
         sessions: None,
         overload: None,
     };
@@ -594,6 +596,8 @@ fn engine_under(
         plan: Plan::Single,
         profile: 0,
         decode_profile: None,
+        shadow: None,
+        decode_shadow: None,
         sessions: None,
         overload: None,
     };

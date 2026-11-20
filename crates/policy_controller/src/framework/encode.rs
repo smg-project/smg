@@ -130,7 +130,8 @@ impl EncodePlaced {
         self.one
     }
 
-    fn clear(&mut self) {
+    /// Empties the list and keeps its room.
+    pub(crate) fn clear(&mut self) {
         self.encoders.clear();
         self.one = false;
     }
@@ -148,6 +149,27 @@ struct Admitted {
     /// empty until a mask is numbered anew ([`Admitted::renumber`]). Its
     /// room is taken with the rows ([`Admitted::take_room`]).
     masked: Vec<u32>,
+    /// The rows here that the mask's held rows name, by their index here.
+    /// Emptied and filled where a mask is numbered anew
+    /// ([`Admitted::renumber`]) and read with that mask alone: a decision
+    /// under no mask leaves it as it was. Its room is taken where a hold is
+    /// numbered, not with the rows: a decision under no hold pays nothing
+    /// for it.
+    held: Vec<u32>,
+}
+
+/// One mask over a pool's rows numbered by the rows admitted from it, whose
+/// places in the pool are `from`: each masked row that was admitted is
+/// pushed by its index among the admitted. Both ascend by the pool's index.
+#[inline(always)]
+fn number(from: &[u32], mask: &[u32], numbered: &mut Vec<u32>) {
+    let mut mask = mask.iter().copied().peekable();
+    for (index, &from) in (0u32..).zip(from) {
+        while mask.next_if(|&at| at < from).is_some() {}
+        if mask.next_if_eq(&from).is_some() {
+            numbered.push(index);
+        }
+    }
 }
 
 impl Admitted {
@@ -160,20 +182,25 @@ impl Admitted {
 
     /// Numbers a mask over the pool's rows by the rows admitted, each by
     /// its index here: a masked row that was left out masks none. The mask
-    /// and the rows both ascend by the pool's index.
-    fn renumber(&mut self, stalled: &[u32]) {
-        let mut stalled = stalled.iter().copied().peekable();
-        for (index, &from) in (0u32..).zip(&self.from) {
-            while stalled.next_if(|&at| at < from).is_some() {}
-            if stalled.next_if_eq(&from).is_some() {
-                self.masked.push(index);
-            }
+    /// and the rows both ascend by the pool's index. The mask's held rows
+    /// are rows of it, numbered the same way into a list of their own: a
+    /// stage of a side reads the two as a stage of a whole pool does. The
+    /// held list takes its room here, one place a row admitted: the first
+    /// decision under a hold sizes it once, and no fuller hold over as many
+    /// rows grows it.
+    fn renumber(&mut self, stalled: &[u32], held: &[u32]) {
+        number(&self.from, stalled, &mut self.masked);
+        self.held.clear();
+        if !held.is_empty() {
+            self.held.reserve(self.rows.len());
+            number(&self.from, held, &mut self.held);
         }
     }
 
     /// Takes the room a mask numbered anew fills at most, one place a row
     /// admitted: a decision under a mask then allocates nothing that a
-    /// decision under none did not.
+    /// decision under none did not, but the held list's room, which the
+    /// first decision under a hold takes ([`Admitted::renumber`]).
     fn take_room(&mut self) {
         self.masked.reserve(self.rows.len());
     }
@@ -635,9 +662,10 @@ impl Engine {
             }
             side.prefills.take_room();
             if !cx.stalled.is_empty() {
-                side.prefills.renumber(cx.stalled);
+                side.prefills.renumber(cx.stalled, cx.held);
                 prefill_mask = Constraints {
                     stalled: &side.prefills.masked,
+                    held: &side.prefills.held,
                     ..*cx
                 };
                 cx = &prefill_mask;
@@ -655,9 +683,10 @@ impl Engine {
             }
             side.decodes.take_room();
             if !decode_cx.stalled.is_empty() {
-                side.decodes.renumber(decode_cx.stalled);
+                side.decodes.renumber(decode_cx.stalled, decode_cx.held);
                 decode_mask = Constraints {
                     stalled: &side.decodes.masked,
+                    held: &side.decodes.held,
                     ..*decode_cx
                 };
                 decode_cx = &decode_mask;
@@ -708,9 +737,10 @@ impl Engine {
         let offered_mask;
         let mut encode_cx = encode_cx;
         if !encode_cx.stalled.is_empty() && side.offered.rows.len() != encode.encoders.len() {
-            side.offered.renumber(encode_cx.stalled);
+            side.offered.renumber(encode_cx.stalled, encode_cx.held);
             offered_mask = Constraints {
                 stalled: &side.offered.masked,
+                held: &side.offered.held,
                 ..*encode_cx
             };
             encode_cx = &offered_mask;

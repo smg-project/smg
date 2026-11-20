@@ -14,19 +14,24 @@ name: E2E Discovery
 on:
   pull_request:
     paths:
-      - model_gateway/src/service_discovery/**
+      - crates/service_discovery/**
+      # The gateway as discovery's host: its registry, its stamp and its job queue.
+      - model_gateway/src/discovery_host.rs
+      - model_gateway/src/discovery_host/**
       - model_gateway/src/mesh/discovery/**
       # The start/skip gating for both discoveries now lives in `startup`,
       # and `cli/configure.rs` owns the CLI -> discovery-config conversion
       # feeding it.
       - model_gateway/src/server.rs
-      - model_gateway/src/main.rs
+      - model_gateway/src/cli/mod.rs
       - model_gateway/src/cli/configure.rs
       - model_gateway/src/config/**
       # What a discovered worker becomes: its endpoint, and the workflow that
       # registers it.
       - crates/worker/src/identity/endpoint.rs
       - model_gateway/src/workflow/**
+      - crates/workflow/**
+      - crates/worker/src/workflow/**
       - crates/worker/src/worker.rs
       - crates/mock_worker/**
       - model_gateway/tests/discovery/k8s_discovery_test.rs
