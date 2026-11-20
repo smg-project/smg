@@ -90,6 +90,11 @@ const GATEWAY: GatewayId = GatewayId::LOCAL;
 /// the gateway could not send to.
 const ASKS: usize = 3;
 
+/// The encode items one ask may state. A pair's commit walks the placed
+/// encoders under the prefill admission lock, so one request bounds that
+/// walk. The bound stands above the largest image limit a model states.
+const MAX_ENCODE_KEYS: usize = 256;
+
 /// The crate's word, in a shed's `emptied_by`, for a pool no stage emptied:
 /// it held no candidate before any stage ran.
 const NO_STAGE: &str = "none";
@@ -340,6 +345,9 @@ pub(crate) enum Unplaced {
     Queued,
     /// The door made no decision.
     Refused(Refused),
+    /// The ask states more encode items than one ask may
+    /// ([`MAX_ENCODE_KEYS`]): no decision was asked.
+    TooManyItems,
     /// The gateway could send to no target of its three asks.
     NoTargetHolds,
     /// A pair's ask found no endpoint, and by membership no prefill pairs
@@ -385,6 +393,7 @@ impl Unplaced {
     /// | The prefill admission queue is full or timed out | 429 `pd_prefill_queue_full` or `pd_prefill_queue_timeout` |
     /// | The policy declined the request | 503 `policy_declined` |
     /// | The door made no decision | 503 `policy_controller_unavailable`, with a retry hint |
+    /// | The ask states more encode items than one ask may | 501 `not_decided_by_policy_controller` |
     ///
     /// A declined request reads the same message for every cause. Its
     /// refusal line names where the policy declined.
@@ -472,6 +481,7 @@ impl Unplaced {
                 ),
                 0,
             ),
+            Self::TooManyItems => super::refused("a request of more than 256 encode items"),
         };
         mark_non_retryable(&mut response);
         response
@@ -502,21 +512,17 @@ pub(crate) struct Asked {
     targets: Targets,
     /// The prefill and decode resolved for each pair target.
     pairs: [[Option<Arc<dyn Worker>>; 2]; MAX_TARGETS],
-    /// The encoder of each placed key, in the keys' order, resolved or
-    /// not. Empty for a request without items.
-    encoders: Vec<AskedEncoder>,
+    /// The encoder of each placed key the holder has an object for, in the
+    /// keys' order: the very list the placement keeps. Empty for a request
+    /// without items.
+    encoders: Vec<PlacedEncoder>,
+    /// The placed encoders with no object: the holder has laid none for
+    /// the row, or the object has left the registry. The commit misses
+    /// them.
+    lost: Vec<WorkerId>,
     /// Whether the one key was placed in the items' stead.
     one_key: bool,
     handle: Handle<Arc<Door>>,
-}
-
-/// One placed key's encoder as the ask resolved it: `None` where the
-/// holder has laid no object for the row, or the object has left the
-/// registry.
-struct AskedEncoder {
-    worker: Option<Arc<dyn Worker>>,
-    id: WorkerId,
-    rank: u16,
 }
 
 /// The policy controller's host in this process: the door over the
@@ -738,6 +744,10 @@ impl Host {
         first: bool,
         now: Instant,
     ) -> Result<Asked, Unplaced> {
+        // Refused ahead of the decision: nothing is booked for it.
+        if ask.items.keys.len() > MAX_ENCODE_KEYS {
+            return Err(Unplaced::TooManyItems);
+        }
         let made = Made {
             ask,
             missed,
@@ -785,18 +795,26 @@ impl Host {
                         *workers = [self.worker(target.id), self.worker(pair.decode_id)];
                     }
                 }
-                // Each placed key's encoder is resolved here too: the
-                // commit looks nothing up.
-                let encoders = placed.encoders().iter();
-                let encoders = encoders.map(|target| AskedEncoder {
-                    worker: self.worker(target.id),
-                    id: target.id,
-                    rank: target.dp_rank,
-                });
+                // Each placed key's encoder is resolved here too, into the
+                // list the placement keeps: the commit looks nothing up and
+                // builds nothing.
+                let mut encoders = Vec::with_capacity(placed.encoders().len());
+                let mut lost = Vec::new();
+                for target in placed.encoders() {
+                    match self.worker(target.id) {
+                        Some(worker) => encoders.push(PlacedEncoder {
+                            worker,
+                            id: target.id,
+                            rank: target.dp_rank,
+                        }),
+                        None => lost.push(target.id),
+                    }
+                }
                 Ok(Asked {
                     targets: pick.targets,
                     pairs,
-                    encoders: encoders.collect(),
+                    encoders,
+                    lost,
                     one_key: placed.one(),
                     handle,
                 })
@@ -878,7 +896,9 @@ impl Host {
     ///
     /// With encoders placed, a target holds only where each of them takes
     /// a request too. They were placed for the first target's prefill, so
-    /// a target of another prefill is passed over.
+    /// a target of another prefill is passed over. The walk over them only
+    /// reads, and an ask's items are bounded ([`MAX_ENCODE_KEYS`]). The
+    /// list that holds moves into the placement as the ask built it.
     pub(crate) fn commit_pair(
         &self,
         asked: Asked,
@@ -906,12 +926,13 @@ impl Host {
             targets,
             pairs,
             encoders,
+            mut lost,
             one_key,
             mut handle,
         } = asked;
         let mut failed = [[None; 2]; MAX_TARGETS];
         let mut no_room = false;
-        let mut lost = Vec::new();
+        let with_encoders = !encoders.is_empty() || !lost.is_empty();
         // A pick's alternates name its first target's prefill with another
         // decode, so the encoders placed for that prefill hold for each.
         let placed_for = targets.first().map(|target| target.id);
@@ -919,7 +940,7 @@ impl Host {
             let Some(pair) = target.pair else {
                 continue;
             };
-            if !encoders.is_empty() && Some(target.id) != placed_for {
+            if with_encoders && Some(target.id) != placed_for {
                 continue;
             }
             let sendable = |worker: &Arc<dyn Worker>| {
@@ -942,18 +963,10 @@ impl Host {
             // a request. One that does not joins the misses and ends the
             // pass, since every alternate has the same encoders. The next
             // ask names it, and the engine places the items around it.
-            let mut held = Vec::with_capacity(encoders.len());
-            for encoder in &encoders {
-                let worker = encoder.worker.as_ref();
-                match worker.filter(|worker| routable_but_for_veto(worker.as_ref())) {
-                    Some(worker) => held.push(PlacedEncoder {
-                        worker: Arc::clone(worker),
-                        id: encoder.id,
-                        rank: encoder.rank,
-                    }),
-                    None => lost.push(encoder.id),
-                }
-            }
+            let unsendable = encoders
+                .iter()
+                .filter(|encoder| !routable_but_for_veto(encoder.worker.as_ref()));
+            lost.extend(unsendable.map(|encoder| encoder.id));
             if !lost.is_empty() {
                 break;
             }
@@ -967,7 +980,7 @@ impl Host {
                     side: pair,
                     targets,
                     index,
-                    encoders: held,
+                    encoders,
                     one_key,
                 })),
                 handle,

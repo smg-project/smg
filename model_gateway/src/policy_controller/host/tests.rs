@@ -60,7 +60,7 @@ use super::{
     elapsed_micros, left_no_worker, mark, profile_of,
     testing::{bed, bed_under, cache_bed, record_bed, store_blocks, MODEL},
     transport_class, Ask, End, Hashes, Held, Host, Placed, Prompt, Sent, Unplaced, GATEWAY,
-    NO_STAGE,
+    MAX_ENCODE_KEYS, NO_STAGE,
 };
 use crate::{
     config::{ManualAssignmentMode, PolicyConfig, RouterConfig},
@@ -1095,6 +1095,15 @@ async fn each_reason_an_attempt_has_no_worker_reads_its_own_answer() {
             "no_compatible_pd_pair",
             None,
             Some(no_pair.as_str()),
+        ),
+        (
+            Unplaced::TooManyItems,
+            StatusCode::NOT_IMPLEMENTED,
+            "not_decided_by_policy_controller",
+            None,
+            Some(
+                "The policy controller is picked for this gateway and does not decide a request of more than 256 encode items yet",
+            ),
         ),
     ];
     for (unplaced, status, code, retry_after, message) in rows {
@@ -2959,6 +2968,89 @@ async fn an_encoder_the_gateway_cannot_send_to_ends_the_pass_and_is_named_in_the
     let other: Vec<_> = other.filter(|id| *id != lost).collect();
     assert_eq!(held, other, "the other encoder takes the item");
     assert_eq!(missed, [lost], "a placement adds no miss");
+}
+
+/// The placed encoders are the list the ask built: the commit, which can
+/// run under the admission lock, builds no list of its own.
+#[tokio::test]
+async fn the_placed_encoders_are_the_list_the_ask_built() {
+    let bed = EncodeBed::new(1, 2).expect("an encode fleet");
+    let keys = [
+        Identity::hashed(11),
+        Identity::hashed(12),
+        Identity::hashed(13),
+    ];
+    let ask = Ask {
+        items: items(&keys),
+        ..pair_ask()
+    };
+    let now = Instant::now();
+    let asked = bed.host.ask(&ask, &[], now).await;
+    let asked = asked.expect("a pair with its items");
+    assert!(asked.lost.is_empty());
+    let list = asked.encoders.as_ptr();
+    let placed = bed
+        .host
+        .commit_pair(asked, None, &mut Vec::new(), now)
+        .expect("a placement");
+    assert_eq!(placed.encoders().len(), keys.len());
+    assert!(std::ptr::eq(placed.encoders().as_ptr(), list));
+}
+
+/// An encoder whose object has left the registry is known at the ask. The
+/// commit misses it and gives the lease up, and the next ask names it.
+#[tokio::test]
+async fn an_encoder_with_no_object_is_a_miss_the_next_ask_names() {
+    let bed = EncodeBed::new(1, 1).expect("an encode fleet");
+    let (encoder, worker) = &bed.encoders[0];
+    bed.host
+        .registry()
+        .remove_by_url(worker.url())
+        .expect("the encoder's object");
+    let keys = [Identity::hashed(11)];
+    let ask = Ask {
+        items: items(&keys),
+        ..pair_ask()
+    };
+    let now = Instant::now();
+    let asked = bed.host.ask(&ask, &[], now).await;
+    let asked = asked.expect("a pair with its item");
+    assert!(asked.encoders.is_empty());
+    assert_eq!(asked.lost, [*encoder]);
+    let mut missed = Vec::new();
+    let result = bed.host.commit_pair(asked, None, &mut missed, now);
+    assert_eq!(
+        result.expect_err("an encoder with no object"),
+        Unplaced::NoTargetHolds
+    );
+    assert_eq!(missed, [*encoder]);
+    assert_eq!(live(&bed.store, 0), 0, "the lease is given up");
+}
+
+/// An ask one item past the bound is refused ahead of the decision and
+/// books nothing. At the bound it is decided.
+#[tokio::test]
+async fn an_ask_past_the_bound_of_its_items_is_refused_and_books_nothing() {
+    let bed = EncodeBed::new(1, 1).expect("an encode fleet");
+    let keys: Vec<_> = (0_u64..)
+        .take(MAX_ENCODE_KEYS + 1)
+        .map(Identity::hashed)
+        .collect();
+    let now = Instant::now();
+    let past = Ask {
+        items: items(&keys),
+        ..pair_ask()
+    };
+    let refused = bed.host.ask(&past, &[], now).await.err();
+    assert_eq!(refused, Some(Unplaced::TooManyItems));
+    assert_eq!(live(&bed.store, 0), 0);
+    let at = Ask {
+        items: items(&keys[..MAX_ENCODE_KEYS]),
+        ..pair_ask()
+    };
+    let asked = bed.host.ask(&at, &[], now).await;
+    let asked = asked.expect("an ask at the bound");
+    assert_eq!(asked.encoders.len(), MAX_ENCODE_KEYS);
 }
 
 /// With items the commit walks a pick's alternates as a pair without
