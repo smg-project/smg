@@ -70,10 +70,7 @@ use crate::{
         otel_trace::inject_trace_context_http,
     },
     policies::{CacheNamespace, PolicyRegistry},
-    policy_controller::{
-        self,
-        host::{self, Ask, BehindAnswer, Host, Placed, Sent},
-    },
+    policy_controller::host::{self, Ask, BehindAnswer, Host, Placed, Sent},
     rate_limit::RateLimitManager,
     routers::{
         common::{
@@ -127,8 +124,6 @@ use crate::{
 /// Max body size for a WebRTC `/v1/realtime/calls` SDP offer (10 MiB).
 const WEBRTC_REQUEST_BODY_LIMIT: usize = 10 * 1024 * 1024;
 
-const PROXIED_GET: &str = "a proxied GET";
-const REALTIME_SESSION: &str = "a realtime session";
 const TRANSCRIPTION_REFUSAL_SITE: &str = "Router::route_multipart_transcription";
 
 /// Error code of a streamed body that broke off before it was forwarded.
@@ -181,8 +176,8 @@ struct TypedAttempt<'a, T> {
 /// The regular HTTP router places typed requests and multipart transcriptions
 /// through its host or its injected load balancing policies.
 ///
-/// Proxied GETs and realtime sessions read the worker registry directly.
-/// A router with a host refuses them until the store supplies the registry.
+/// Proxied GETs and realtime sessions pick their worker by no routing
+/// policy: they read the worker registry directly, with a host or without.
 pub struct Router {
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
@@ -2819,23 +2814,14 @@ impl RouterTrait for Router {
     }
 
     async fn health_generate(&self, req: Request<Body>) -> Response {
-        if self.host.is_some() {
-            return policy_controller::refused(PROXIED_GET);
-        }
         self.proxy_get_request(req, "health_generate").await
     }
 
     async fn get_server_info(&self, req: Request<Body>) -> Response {
-        if self.host.is_some() {
-            return policy_controller::refused(PROXIED_GET);
-        }
         self.proxy_get_request(req, "get_server_info").await
     }
 
     async fn get_model_info(&self, req: Request<Body>) -> Response {
-        if self.host.is_some() {
-            return policy_controller::refused(PROXIED_GET);
-        }
         self.proxy_get_request(req, "get_model_info").await
     }
 
@@ -3040,9 +3026,6 @@ impl RouterTrait for Router {
         headers: Option<&HeaderMap>,
         body: &RealtimeSessionCreateRequest,
     ) -> Response {
-        if self.host.is_some() {
-            return policy_controller::refused(REALTIME_SESSION);
-        }
         self.route_realtime_rest(
             headers,
             body,
@@ -3057,9 +3040,6 @@ impl RouterTrait for Router {
         headers: Option<&HeaderMap>,
         body: &RealtimeClientSecretCreateRequest,
     ) -> Response {
-        if self.host.is_some() {
-            return policy_controller::refused(REALTIME_SESSION);
-        }
         self.route_realtime_rest(
             headers,
             body,
@@ -3074,9 +3054,6 @@ impl RouterTrait for Router {
         headers: Option<&HeaderMap>,
         body: &RealtimeTranscriptionSessionCreateRequest,
     ) -> Response {
-        if self.host.is_some() {
-            return policy_controller::refused(REALTIME_SESSION);
-        }
         self.route_realtime_rest(
             headers,
             body,
@@ -3087,9 +3064,6 @@ impl RouterTrait for Router {
     }
 
     async fn route_realtime_ws(&self, req: Request<Body>, model: &str) -> Response {
-        if self.host.is_some() {
-            return policy_controller::refused(REALTIME_SESSION);
-        }
         let (parts, _body) = req.into_parts();
 
         Metrics::record_router_request(
@@ -3118,9 +3092,6 @@ impl RouterTrait for Router {
     }
 
     async fn route_realtime_webrtc(&self, req: Request<Body>, model: &str) -> Response {
-        if self.host.is_some() {
-            return policy_controller::refused(REALTIME_SESSION);
-        }
         let (parts, body) = req.into_parts();
         let body = match to_bytes(body, WEBRTC_REQUEST_BODY_LIMIT).await {
             Ok(b) => b,

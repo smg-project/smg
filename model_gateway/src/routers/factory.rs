@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use smg_external_router::{builtin_routers, spec_for_backend, ExternalRouterSpec};
+use smg_external_router::{builtin_routers, spec_for_backend};
 use smg_worker::identity::basic::ConnectionMode;
 
 use super::{
@@ -247,22 +247,12 @@ impl RouterFactory {
         ctx: &Arc<AppContext>,
     ) -> Result<Box<dyn RouterTrait>, String> {
         match spec_for_backend(backend) {
-            Some(spec) if spec.compiled => Self::mount_external(spec, ctx).await,
+            Some(spec) if spec.compiled => ExternalRouterAdapter::mount(spec, ctx).await,
             Some(spec) => Err(spec.not_compiled()),
             None => Err(format!(
                 "{backend} is not an external router this gateway knows"
             )),
         }
-    }
-
-    async fn mount_external(
-        spec: ExternalRouterSpec,
-        ctx: &Arc<AppContext>,
-    ) -> Result<Box<dyn RouterTrait>, String> {
-        if let Some(router) = policy_controller::undecided(ctx) {
-            return Ok(router);
-        }
-        ExternalRouterAdapter::mount(spec, ctx).await
     }
 
     /// Create all routers for IGW (multi-router) mode.
@@ -325,7 +315,7 @@ impl RouterFactory {
             routers.push((
                 RouterId::new(spec.router_id),
                 spec.label,
-                Self::mount_external(spec, ctx).await,
+                ExternalRouterAdapter::mount(spec, ctx).await,
             ));
         }
 

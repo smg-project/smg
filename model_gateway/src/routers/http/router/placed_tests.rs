@@ -587,48 +587,29 @@ async fn transcription(
         .await
 }
 
-/// The refusal by name of `shape`. The refusal's own case holds the whole
-/// text of the message.
-async fn assert_refused(response: Response, shape: &str) -> Case {
-    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
-    let body = to_bytes(response.into_body(), 1024).await?;
-    let value: Value = serde_json::from_slice(&body)?;
-    assert_eq!(value["error"]["code"], "not_decided_by_policy_controller");
-    let message = value["error"]["message"]
-        .as_str()
-        .ok_or("the refusal has no message")?;
-    assert!(message.contains(shape), "{message}");
-    Ok(())
-}
-
+/// A proxied GET and a realtime session pick their worker by no routing
+/// policy. Under the host each reads as it reads without one.
 #[tokio::test]
-async fn a_proxied_get_and_a_realtime_session_are_refused_by_name_under_the_host() -> Case {
+async fn a_proxied_get_and_a_realtime_session_read_as_on_the_classic_line_under_the_host() -> Case {
     let registry = Arc::new(WorkerRegistry::new());
     let (host, _, _) = bed_over(Arc::clone(&registry), &[]);
-    let hosted = router(Arc::clone(&registry), Some(host));
-    let classic = router(registry, None);
     let session = serde_json::from_value(json!({"type": "realtime", "model": MODEL}))?;
 
-    assert_refused(
-        hosted.health_generate(Request::new(Body::empty())).await,
-        "a proxied GET",
-    )
-    .await?;
-    assert_refused(
-        hosted.route_realtime_session(None, &session).await,
-        "a realtime session",
-    )
-    .await?;
-
-    let get = classic.health_generate(Request::new(Body::empty())).await;
-    assert_eq!(get.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(extract_error_code_from_response(&get), "no_workers");
-    let realtime = classic.route_realtime_session(None, &session).await;
-    assert_eq!(realtime.status(), StatusCode::NOT_FOUND);
-    assert_eq!(
-        extract_error_code_from_response(&realtime),
-        "model_not_found"
-    );
+    for router in [
+        router(Arc::clone(&registry), Some(host)),
+        router(registry, None),
+    ] {
+        let hosted = router.host.is_some();
+        let get = router.health_generate(Request::new(Body::empty())).await;
+        assert_eq!(get.status(), StatusCode::SERVICE_UNAVAILABLE, "{hosted}");
+        assert_eq!(extract_error_code_from_response(&get), "no_workers");
+        let realtime = router.route_realtime_session(None, &session).await;
+        assert_eq!(realtime.status(), StatusCode::NOT_FOUND, "{hosted}");
+        assert_eq!(
+            extract_error_code_from_response(&realtime),
+            "model_not_found"
+        );
+    }
     Ok(())
 }
 

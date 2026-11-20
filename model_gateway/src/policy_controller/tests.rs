@@ -191,30 +191,26 @@ fn body<T: DeserializeOwned>(json: Value) -> T {
     serde_json::from_value(json).expect("a request body")
 }
 
-/// The status of an answer and the code of its error object.
+/// The status of an answer and the code of its error object, empty where
+/// the answer holds none.
 async fn refusal(answer: Response) -> (StatusCode, String) {
     let status = answer.status();
     let bytes = to_bytes(answer.into_body(), usize::MAX)
         .await
         .expect("the answer's body");
-    let error: Value = serde_json::from_slice(&bytes).expect("a JSON error object");
+    let error: Value = serde_json::from_slice(&bytes).unwrap_or_default();
     let code = error["error"]["code"].as_str().unwrap_or_default();
     (status, code.to_owned())
 }
 
-/// The asks of `answers` not refused by the controller's name, with what
-/// each read.
-async fn not_by_name(
-    answers: Vec<(&'static str, Response)>,
-) -> Vec<(&'static str, StatusCode, String)> {
-    let mut other = Vec::new();
+/// What each of `answers` read: its ask, its status and its error's code.
+async fn read(answers: Vec<(&'static str, Response)>) -> Vec<(&'static str, StatusCode, String)> {
+    let mut read = Vec::new();
     for (ask, answer) in answers {
         let (status, code) = refusal(answer).await;
-        if (status, code.as_str()) != (StatusCode::NOT_IMPLEMENTED, BY_NAME) {
-            other.push((ask, status, code));
-        }
+        read.push((ask, status, code));
     }
-    other
+    read
 }
 
 /// A chat request for `model`.
@@ -438,66 +434,59 @@ async fn build(config: RouterConfig) -> Result<(Arc<AppContext>, Arc<Gateway>), 
     Ok((context, gateway))
 }
 
-/// With an empty registry, typed requests reach a model miss and routes
-/// outside placement keep their own answers.
-async fn decided_or_refused(config: RouterConfig) -> Case {
+/// The asks the controller decides.
+const TYPED: [&str; 16] = [
+    "route_generate",
+    "route_chat",
+    "route_completion",
+    "route_responses",
+    "route_embeddings",
+    "route_classify",
+    "route_decisions",
+    "route_systemone",
+    "route_audio_transcriptions",
+    "route_rerank",
+    "route_messages",
+    "route_messages_count_tokens",
+    "chat, the model names the adapter",
+    "chat, the request's field names the adapter",
+    "completion, the model names the adapter",
+    "generate, the request's field names the adapter",
+];
+
+/// What `gateway` reads to every route and every adapter ask.
+async fn every_answer(gateway: &Gateway) -> Vec<(&'static str, StatusCode, String)> {
+    let mut answers = every_route(gateway, "m").await;
+    answers.extend(adapter_asks(gateway).await);
+    read(answers).await
+}
+
+/// With an empty registry, the asks the controller decides reach a model
+/// miss. Every other route picks its worker by no routing policy and reads
+/// as the classic line reads it: none is refused by the controller's name.
+async fn decided_or_classic(config: RouterConfig) -> Case {
     let enable_igw = config.enable_igw;
+    let mut classic = config.clone();
+    classic.policy_controller = false;
     let gateway = build_gateway(config).await?;
     assert_eq!(gateway.router_count() > 1, enable_igw);
+    let classic = build_gateway(classic).await?;
 
-    let mut answers = every_route(gateway.as_ref(), "m").await;
-    answers.extend(adapter_asks(gateway.as_ref()).await);
-    let other = not_by_name(answers).await;
-    let (model_misses, other): (Vec<_>, Vec<_>) = other.iter().partition(|(_, status, code)| {
-        *status == StatusCode::NOT_FOUND && code == "model_not_found"
-    });
+    let answers = Box::pin(every_answer(gateway.as_ref())).await;
+    let classic = Box::pin(every_answer(classic.as_ref())).await;
+    let (decided, other): (Vec<_>, Vec<_>) = answers
+        .into_iter()
+        .partition(|(ask, _, _)| TYPED.contains(ask));
     assert_eq!(
-        model_misses
-            .into_iter()
-            .map(|(ask, _, _)| *ask)
-            .collect::<Vec<_>>(),
-        [
-            "route_generate",
-            "route_chat",
-            "route_completion",
-            "route_responses",
-            "route_embeddings",
-            "route_classify",
-            "route_decisions",
-            "route_systemone",
-            "route_audio_transcriptions",
-            "route_rerank",
-            "route_messages",
-            "route_messages_count_tokens",
-            "chat, the model names the adapter",
-            "chat, the request's field names the adapter",
-            "completion, the model names the adapter",
-            "generate, the request's field names the adapter",
-        ],
+        decided,
+        TYPED.map(|ask| (ask, StatusCode::NOT_FOUND, "model_not_found".to_owned())),
     );
-    assert_eq!(
-        other
-            .into_iter()
-            .map(|(ask, status, code)| (*ask, *status, code.as_str()))
-            .collect::<Vec<_>>(),
-        [
-            (
-                "cancel_response",
-                StatusCode::SERVICE_UNAVAILABLE,
-                "no_workers"
-            ),
-            (
-                "route_messages, no token asked",
-                StatusCode::BAD_REQUEST,
-                "max_tokens_zero_not_relayed"
-            ),
-            (
-                "route_interactions",
-                StatusCode::NOT_IMPLEMENTED,
-                "interactions_not_implemented"
-            ),
-        ],
-    );
+    let classic: Vec<_> = classic
+        .into_iter()
+        .filter(|(ask, _, _)| !TYPED.contains(ask))
+        .collect();
+    assert_eq!(other.len(), 11);
+    assert_eq!(other, classic);
     Ok(())
 }
 
@@ -640,28 +629,26 @@ async fn a_hosts_catalog_and_document_reach_the_store_through_the_context() -> C
 }
 
 #[tokio::test]
-async fn under_the_setting_one_router_serves_typed_requests_and_refuses_the_rest() -> Case {
-    Box::pin(decided_or_refused(picked(quiet()))).await
+async fn under_the_setting_one_router_decides_typed_requests_and_leaves_the_rest_classic() -> Case {
+    Box::pin(decided_or_classic(picked(quiet()))).await
 }
 
 #[tokio::test]
-async fn under_the_setting_many_routers_serve_typed_requests_and_refuse_the_rest() -> Case {
+async fn under_the_setting_many_routers_decide_typed_requests_and_leave_the_rest_classic() -> Case {
     let mut config = picked(quiet());
     config.enable_igw = true;
-    Box::pin(decided_or_refused(config)).await
+    Box::pin(decided_or_classic(config)).await
 }
 
+/// The router asks the host for its typed requests; the router's own cases
+/// hold that.
 #[tokio::test]
-async fn the_regular_router_under_the_setting_holds_the_host() -> Case {
+async fn the_regular_router_is_built_under_the_setting() -> Case {
     let gateway = build_gateway(picked(quiet())).await?;
     let router = gateway
         .select_router_for_request(None)
         .ok_or("the regular router is missing")?;
     assert_eq!(router.router_type(), "regular");
-    assert_eq!(
-        refusal(router.health_generate(Request::new(Body::empty())).await).await,
-        (StatusCode::NOT_IMPLEMENTED, BY_NAME.to_owned())
-    );
     Ok(())
 }
 
@@ -694,7 +681,7 @@ async fn assert_refusing_router(router: &dyn RouterTrait, family: &str) -> Case 
 }
 
 #[tokio::test]
-async fn the_pair_and_the_provider_routers_refuse_by_name() -> Case {
+async fn the_pair_routers_refuse_by_name() -> Case {
     let mut pair = picked(quiet());
     pair.mode = RoutingMode::PrefillDecode {
         prefill_urls: vec![],
@@ -742,19 +729,25 @@ async fn the_pair_and_the_provider_routers_refuse_by_name() -> Case {
         );
     }
 
-    #[cfg(feature = "provider-openai")]
-    {
-        use smg_external_router::known::OPENAI;
-        use smg_worker::identity::basic::RuntimeType;
+    Ok(())
+}
 
-        use crate::routers::RouterFactory;
+/// A provider's router picks its worker by no routing policy, so the
+/// setting leaves its mount alone. A gateway of many routers and the
+/// factory's own mount both give the router of the classic line.
+#[cfg(feature = "provider-openai")]
+#[tokio::test]
+async fn a_providers_router_mounts_as_on_the_classic_line() -> Case {
+    use smg_external_router::known::OPENAI;
+    use smg_worker::identity::basic::RuntimeType;
 
-        // A provider-only mode has no policy document. In a multi-router
-        // gateway, an external worker selects the mounted provider router.
-        let mut config = picked(quiet());
+    use crate::routers::RouterFactory;
+
+    let model = "external-model";
+    let mut mounts = Vec::new();
+    for mut config in [quiet(), picked(quiet())] {
         config.enable_igw = true;
         let context = Arc::new(AppContext::from_config(config.clone(), 30, None, None).await?);
-        let model = "external-model";
         let worker = BasicWorkerBuilder::new("http://127.0.0.1:1")
             .model(ModelCard::new(model))
             .runtime_type(RuntimeType::External)
@@ -765,13 +758,14 @@ async fn the_pair_and_the_provider_routers_refuse_by_name() -> Case {
             .register(Arc::new(worker))
             .ok_or("the provider worker did not register")?;
         let gateway = Gateway::from_config(&ServerConfig::minimal(config), &context).await?;
-        let router = gateway
+        let routed = gateway
             .select_router_for_request(Some(model))
             .ok_or("the provider router is missing")?;
-        assert_refusing_router(router.as_ref(), "multi-router provider").await?;
-        let router = RouterFactory::create_external_router(OPENAI.backend, &context).await?;
-        assert_refusing_router(router.as_ref(), "single-router provider").await?;
+        let mounted = RouterFactory::create_external_router(OPENAI.backend, &context).await?;
+        mounts.push((routed.router_type(), mounted.router_type()));
     }
+    assert_eq!(mounts[0], mounts[1]);
+    assert_ne!(mounts[1].0, ROUTER_TYPE);
     Ok(())
 }
 
