@@ -6150,7 +6150,7 @@ impl Engine {
     /// ([`Self::decide_decode`]), made once more with the side's shadow
     /// profile over the rows that call decided over: the decodes that
     /// pair with the held `prefill`, on the call's own draw sequence.
-    /// `at` is the pair binding's position ([`Self::shadow_for`]). The
+    /// `at` is the pair binding's position ([`Self::pair_position`]). The
     /// run writes the scratch and the shadow profile's stages, and
     /// nothing a commit reads.
     ///

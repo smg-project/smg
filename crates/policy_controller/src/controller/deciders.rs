@@ -365,8 +365,14 @@ impl Shared {
                 .samples
                 .get_or_init(|| (0..deciders).map(|_| Mutex::default()).collect());
             let mut samples = seats[index].lock();
+            // The record names the binding its decision ran under, as the
+            // in-process door's does: a decode call's is its pair's,
+            // whatever phase its frame states.
             let request = &taken.request;
-            let binding = engine.binding_position(request.model(), request.phase());
+            let binding = match request.decode_of() {
+                Some(_) => engine.pair_position(request.model()),
+                None => engine.binding_position(request.model(), request.phase()),
+            };
             samples.push(answer.0, binding, taken, &answer.1, None, [None; 2]);
         }
         Ok(answer)
@@ -7059,6 +7065,15 @@ pub(crate) mod tests {
     /// The document of [`later_bed`] as `generation`, whose decode side
     /// keeps what its engine tells it in `told`.
     pub(crate) fn later_spec(generation: u64, told: &Arc<Mutex<SideCalls>>) -> AppliedSpec {
+        later_spec_with(generation, told, |_| {})
+    }
+
+    /// [`later_spec`] with `edit` made to its document ahead of its check.
+    fn later_spec_with(
+        generation: u64,
+        told: &Arc<Mutex<SideCalls>>,
+        edit: impl FnOnce(&mut PolicySpec),
+    ) -> AppliedSpec {
         let kept = Arc::clone(told);
         let mut catalog = Catalog::builtin();
         catalog
@@ -7081,6 +7096,7 @@ pub(crate) mod tests {
         )
         .expect("a document of this build");
         document.generation = generation;
+        edit(&mut document);
         let digest = document.digest().expect("the document digests");
         AppliedSpec::validate_digested(&document, digest, &catalog, &[])
             .expect("the catalog holds the stage")
@@ -7182,6 +7198,39 @@ pub(crate) mod tests {
         assert_eq!(pair_counts(&bed.store, [prefill, chosen, other]), [2, 1, 1]);
         assert_eq!(told.lock().last(), Some(&(Side::Decode, other, None)));
         assert_eq!(asked_again(&bed), [0, 0]);
+    }
+
+    /// A served decode call's kept record names the pair binding the call
+    /// decided under, whatever phase its frame states. A binding of the
+    /// decode phase stands ahead of the pair's here: it decides a decode
+    /// asked alone, and no pair's.
+    #[tokio::test]
+    async fn a_served_decode_calls_record_names_its_pairs_binding() {
+        use crate::{
+            spec::{BindingSpec, Match},
+            view::Phase,
+        };
+
+        let (mut bed, told, _) = later_bed();
+        let sampled = later_spec_with(2, &told, |document| {
+            let ahead = BindingSpec {
+                matcher: Match {
+                    phase: vec![Phase::Decode],
+                    ..Match::default()
+                },
+                profile: Some("side".into()),
+                ..BindingSpec::default()
+            };
+            document.bindings.insert(0, ahead);
+            document.explain.sample = 1;
+        });
+        bed.store.apply(sampled).expect("a later generation");
+        let (id, _, _) = held(&mut bed).await;
+        let answer = bed.ask(phased(call(1, id), proto::Phase::Decode)).await;
+        assert_eq!(sides_of(&answer), [(id, proto::Side::Decode, 0)]);
+        let record = bed.deciders.explain(answer.term, GATEWAY, &[1]);
+        // The pair's binding is the document's second.
+        assert_eq!(record.expect("the sampled call").binding, Some(1));
     }
 
     /// Each refusal of the call leaves as a `Busy` of its own reason,
