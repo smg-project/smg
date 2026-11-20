@@ -16,7 +16,11 @@ use parking_lot::RwLock;
 ///
 /// The keeper lives in the host's process and is lost when the process
 /// exits. The membership store, its log, snapshots, watches and operator
-/// views carry no credential.
+/// views carry no credential. It holds one entry for each address a
+/// registration was accepted at and no forgetting dropped, with or
+/// without a credential: as many as the host's rows dial, where each
+/// removal is followed by
+/// [`Objects::forget_credential`](super::Objects::forget_credential).
 ///
 /// A registration makes three calls. It calls [`Self::keep`] before its
 /// write, with `None` where it has no credential. It writes the row. Then
@@ -136,10 +140,12 @@ impl fmt::Display for RegistrationInFlight {
 
 impl Error for RegistrationInFlight {}
 
+// No address: as a registration writes it, its userinfo can carry a
+// credential.
 impl fmt::Debug for KeptCredential {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("KeptCredential")
-            .field("address", &self.address)
+            .field("in_flight", &self.in_flight)
             .finish_non_exhaustive()
     }
 }
@@ -357,6 +363,24 @@ mod tests {
     }
 
     #[test]
+    fn neither_the_keeper_nor_a_token_prints_an_address_or_a_credential() {
+        let credentials = Credentials::new();
+        // An address as a registration writes it can carry a userinfo.
+        let token = keep(&credentials, "http://pebble:cedar@a:8000", Some(KEY_A));
+        for text in [
+            format!("{token:?}"),
+            format!("{token:#?}"),
+            format!("{credentials:?}"),
+            format!("{credentials:#?}"),
+        ] {
+            for secret in ["pebble", "cedar", KEY_A] {
+                assert!(!text.contains(secret), "{text}");
+            }
+        }
+        assert!(!token.put_back());
+    }
+
+    #[test]
     fn a_registration_taken_leaves_its_credential_standing() {
         let credentials = Credentials::new();
         assert!(credentials.is_empty());
@@ -569,10 +593,7 @@ mod tests {
         let shown = format!("{kept:?}");
         assert!(!shown.contains(KEY_A));
         assert!(!shown.contains(KEY_B));
-        assert_eq!(
-            shown,
-            format!("KeptCredential {{ address: {ADDRESS:?}, .. }}")
-        );
+        assert_eq!(shown, "KeptCredential { in_flight: true, .. }");
         kept.accepted();
     }
 }

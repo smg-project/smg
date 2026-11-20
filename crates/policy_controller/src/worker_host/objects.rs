@@ -106,8 +106,10 @@ struct Held {
 /// The holder trusts no revision it held alone in either. It holds each
 /// row against the facts its object was built from, beside the revision.
 /// A row whose facts and revision both stand keeps its object: one built
-/// again from them would state nothing new, and its replacement would
-/// start every read of its worker again. Any other row is laid again and
+/// again from them would state the same row, and its replacement would
+/// start every read of its worker again. A credential the host kept since
+/// is no fact of a row: the object takes it at its next build. Any other
+/// row is laid again and
 /// keeps its place: its object is replaced under its id in the registry,
 /// which carries the standing object's running state over. An entry's
 /// revision never moves under an object that is kept.
