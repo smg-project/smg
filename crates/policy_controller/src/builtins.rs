@@ -220,6 +220,8 @@ pub(crate) struct HasRoomRule {
     request_tokens: f64,
     /// The capacity less the headroom.
     bound: f64,
+    /// Whether a term reads the row's count in flight.
+    in_flight: bool,
     /// Whether a term reads the row's report.
     loads: bool,
     // The optional values of a report, each tested where the rule names it.
@@ -246,6 +248,7 @@ impl HasRoomRule {
         Self {
             request_tokens,
             bound: (1.0 - headroom) * capacity,
+            in_flight: coefficients.in_flight != 0.0,
             loads: terms.iter().any(|&(term, _)| term.reads_load()),
             resident: coefficients.resident_tokens != 0.0,
             waiting: coefficients.waiting_uncached_tokens != 0.0,
@@ -255,19 +258,30 @@ impl HasRoomRule {
         }
     }
 
+    /// The request's part of what a row holds: its size times the rule's
+    /// coefficient. Every row of a pass is handed the same, so a pass works
+    /// it once.
+    #[inline(always)]
+    fn asked(&self, facts: &RequestFacts<'_>) -> f64 {
+        f64::from(facts.prompt_tokens) * self.request_tokens
+    }
+
     /// Whether a row has room, by its report as `load` hands it and its
-    /// sends as `sent` counts them. The sum runs in name order: the count
-    /// in flight, the report's fields, the request's size, the sends.
+    /// sends as `sent` counts them: the stated tokens and the requests, the
+    /// count's two-number read. The sum runs in name order: the count
+    /// in flight, the report's fields, the request's part as `asked`
+    /// ([`Self::asked`]), the sends.
     #[inline(always)]
     fn fits<const RESIDENT: bool, const WAITING: bool, const KV_OR_RUNNING: bool>(
         &self,
+        asked: f64,
         facts: &RequestFacts<'_>,
         row: &Candidate,
         load: Option<&LoadRow>,
-        sent: impl FnOnce() -> Sent,
+        sent: impl FnOnce() -> (u64, u64),
     ) -> bool {
         let mut used = 0.0;
-        if self.terms.in_flight != 0.0 {
+        if self.in_flight {
             used += f64::from(facts.in_flight(row)) * self.terms.in_flight;
         }
         if self.loads {
@@ -281,11 +295,11 @@ impl HasRoomRule {
             };
             used = sum;
         }
-        used += f64::from(facts.prompt_tokens) * self.request_tokens;
+        used += asked;
         if self.sent.is_some() {
-            let sent = sent();
-            used += f64::from(sent.requests) * self.terms.sent_requests;
-            used += sent.tokens as f64 * self.terms.sent_tokens;
+            let (tokens, requests) = sent();
+            used += requests as f64 * self.terms.sent_requests;
+            used += tokens as f64 * self.terms.sent_tokens;
         }
         used <= self.bound
     }
@@ -295,13 +309,15 @@ impl HasRoomRule {
         let sent = || {
             self.sent
                 .as_ref()
-                .map_or_else(Sent::default, |sent| sent.read(facts, row))
+                .map_or((0, 0), |sent| sent.reads(facts).counts(row))
         };
-        by_names!(self, fits(facts, row, load, sent))
+        by_names!(self, fits(self.asked(facts), facts, row, load, sent))
     }
 
-    /// One pass over the kept rows: the profile's sends are read through
-    /// one load of its tally.
+    /// One pass over the kept rows, in one loop with the test in it: the
+    /// request's part is worked once, and the profile's sends are read
+    /// through one load of its tally. The rows that fit are written over
+    /// the list's front, in the list's order.
     #[inline(always)]
     fn rows<const RESIDENT: bool, const WAITING: bool, const KV_OR_RUNNING: bool>(
         &self,
@@ -310,16 +326,19 @@ impl HasRoomRule {
         kept: &mut Vec<u32>,
         load: impl Fn(&Candidate) -> Option<&LoadRow>,
     ) {
+        let asked = self.asked(facts);
         let sends = self.sent.as_ref().map(|sent| sent.reads(facts));
-        kept.retain(|&i| {
+        let mut held = 0;
+        for at in 0..kept.len() {
+            let i = kept[at];
             let row = &candidates[i as usize];
-            let sent = || {
-                sends
-                    .as_ref()
-                    .map_or_else(Sent::default, |sends| sends.of(row))
-            };
-            self.fits::<RESIDENT, WAITING, KV_OR_RUNNING>(facts, row, load(row), sent)
-        });
+            let sent = || sends.as_ref().map_or((0, 0), |sends| sends.counts(row));
+            let fits =
+                self.fits::<RESIDENT, WAITING, KV_OR_RUNNING>(asked, facts, row, load(row), sent);
+            kept[held] = i;
+            held += usize::from(fits);
+        }
+        kept.truncate(held);
     }
 
     /// [`Filter::retain`], by the report `load` hands of each row: the

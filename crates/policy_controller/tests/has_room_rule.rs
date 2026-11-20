@@ -100,6 +100,23 @@ fn a_row_at_or_under_the_bound_is_kept_and_a_row_over_it_is_dropped() {
     assert_eq!(policy.profiles()[0].filters[0].name(), "has-room");
 }
 
+/// The pass writes the rows that fit over the list's front: rows that fit
+/// behind a dropped row keep the list's order, and the list ends at the
+/// last row that fits.
+#[test]
+fn a_pass_keeps_the_rows_that_fit_in_the_lists_order() {
+    let policy = policy(RESIDENT);
+    let rows = [
+        row(0, 1_001),
+        row(1, 999),
+        row(2, 2_000),
+        row(3, 1_000),
+        row(4, 1),
+        row(5, 1_001),
+    ];
+    assert_eq!(kept(&policy, 0, &request(0), &rows), [1, 3, 4]);
+}
+
 #[test]
 fn a_headroom_keeps_its_share_of_the_capacity_free() {
     let policy = policy(
