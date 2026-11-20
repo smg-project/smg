@@ -1115,15 +1115,31 @@ enum RegularAttempt<'a> {
 
 impl<'a> RegularAttempt<'a> {
     /// The facts still available for the controller's ask, under the
-    /// gateway's own `id` for it. Nothing a client sent names an ask.
-    fn ask(self, model: &'a str, id: &'a [u8]) -> Ask<'a> {
-        let (streaming, tried) = match self {
-            Self::First(ctx) => (ctx.is_streaming(), &[][..]),
-            Self::Retry(ctx) => (ctx.streaming, &ctx.tried_rows[..]),
+    /// gateway's own `id` for it and with the prompt's `hashes`. Nothing a
+    /// client sent names an ask. The request's headers and its own `rid`
+    /// are the sources of its routing key: a first attempt states both, and
+    /// a retry states the headers it retained and no `rid`.
+    fn ask(self, model: &'a str, id: &'a [u8], hashes: &'a host::Hashes) -> Ask<'a> {
+        let (streaming, headers, rid, tried) = match self {
+            Self::First(ctx) => (
+                ctx.is_streaming(),
+                ctx.input.headers.as_ref(),
+                ctx.input.request_type.rid(),
+                &[][..],
+            ),
+            Self::Retry(ctx) => (
+                ctx.streaming,
+                ctx.headers.as_ref(),
+                None,
+                &ctx.tried_rows[..],
+            ),
         };
         Ask {
             streaming,
+            headers,
+            rid,
             tried,
+            hashes: Some(hashes),
             ..Ask::of(id, model)
         }
     }
@@ -1843,9 +1859,14 @@ impl WorkerSelectionStage {
             return Err(policy_controller::refused(shape));
         }
 
+        let prompt = host::Prompt {
+            tokens: inputs.tokens,
+            namespace: inputs.cache_namespace,
+        };
+        let hashes = host.hashes(model_id, &prompt);
         let id = host::mark();
         let rule = on_route(wire, attempt.ledger());
-        let ask = attempt.ask(model_id, &id);
+        let ask = attempt.ask(model_id, &id, &hashes);
         let placed = host
             .place_where(&ask, rule, Instant::now())
             .await

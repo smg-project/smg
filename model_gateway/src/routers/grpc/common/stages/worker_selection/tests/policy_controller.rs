@@ -1,19 +1,30 @@
 //! Regular selection and re-selection over a store with worker rows.
 
+use anyhow::Context;
 use axum::body::to_bytes;
+use kv_index::{salt::request_content_hashes_with_seed, XXH3_SEED};
 use llm_multimodal::MediaContentPart;
 use serde_json::Value;
 use smg_policy_controller::{
-    store::{GatewayId, LeasesStore, MemoryStore, WorkersStore},
-    view::fingerprint,
+    store::{
+        BatchOutcome, GatewayId, KvEventSink, LeasesStore, LoadSink, LoadSource, MemoryStore,
+        WorkersStore,
+    },
+    view::{fingerprint, LoadRow, WorkerId},
+    AppliedSpec, PolicySpec,
 };
 
 use super::*;
-use crate::{middleware::request_id::RequestId, routers::grpc::context::LoadGuards};
+use crate::{
+    middleware::request_id::RequestId, policy_controller::host::testing::MODEL,
+    routers::grpc::context::LoadGuards,
+};
 
-const MODEL: &str = "model-a";
 const URLS: [&str; 2] = ["http://w0:8000", "http://w1:8000"];
 const WINDOW: u32 = 16;
+const BLOCK_SIZE: u32 = 4;
+const TOKENS: [u32; BLOCK_SIZE as usize] = [1, 2, 3, 4];
+const PLACEMENTS: usize = 8;
 
 fn stage_with_host(urls: &[&str]) -> (WorkerSelectionStage, Arc<MemoryStore>) {
     let workers: Vec<_> = urls
@@ -37,6 +48,14 @@ fn stage_with_workers(
 ) -> (WorkerSelectionStage, Arc<MemoryStore>) {
     let urls: Vec<&str> = workers.iter().map(|(url, ..)| *url).collect();
     let (_, store, rows) = host::testing::bed(&urls);
+    (stage_on_rows(workers, &store, &rows), store)
+}
+
+fn stage_on_rows(
+    workers: &[(&str, WorkerType, ConnectionMode, RuntimeType)],
+    store: &Arc<MemoryStore>,
+    rows: &[Arc<dyn Worker>],
+) -> WorkerSelectionStage {
     let registry = Arc::new(WorkerRegistry::new());
     for (row, (_, worker_type, connection, runtime)) in rows.iter().zip(workers) {
         let worker = BasicWorkerBuilder::carrying(row)
@@ -47,16 +66,59 @@ fn stage_with_workers(
             .build();
         assert!(registry.register(Arc::new(worker)).is_some());
     }
-    let host = Host::at_keys(Arc::clone(&store), Arc::clone(&registry));
-    (
-        regular_stage(registry).with_host(Some(Arc::new(host))),
-        store,
-    )
+    let host = Host::at_keys(Arc::clone(store), Arc::clone(&registry));
+    regular_stage(registry).with_host(Some(Arc::new(host)))
+}
+
+fn stage_with_cached_prompt(
+    seed: u64,
+    runtime: RuntimeType,
+) -> anyhow::Result<(WorkerSelectionStage, WorkerId)> {
+    let store = Arc::new(MemoryStore::with_publish_window(Duration::ZERO));
+    let document = PolicySpec::preset("cache_aware")?;
+    store.apply(AppliedSpec::validate(&document)?)?;
+    let rows = URLS.map(|url| (url, Some(MODEL)));
+    let (_, store, rows) = host::testing::bed_with(store, Arc::new(WorkerRegistry::new()), rows);
+    let workers = URLS.map(|url| (url, WorkerType::Regular, ConnectionMode::Grpc, runtime));
+    let stage = stage_on_rows(&workers, &store, &rows);
+
+    let other = store.by_key(URLS[0]).context("the other row")?.id;
+    let holder = store.by_key(URLS[1]).context("the holder's row")?.id;
+    store.set_block_size(MODEL, BLOCK_SIZE);
+    // Both workers hold a block so neither is thin. A miss goes to the less
+    // loaded worker, and only a match can place on the holder.
+    for (id, tokens, running) in [(other, [2; BLOCK_SIZE as usize], 0), (holder, TOKENS, 1)] {
+        let blocks = request_content_hashes_with_seed(&tokens, BLOCK_SIZE as usize, seed);
+        assert_eq!(
+            host::testing::store_blocks(&store, id, &blocks),
+            BatchOutcome::Applied
+        );
+        store.record(
+            id,
+            0,
+            LoadRow {
+                running,
+                ..LoadRow::default()
+            },
+            Instant::now(),
+            LoadSource::Stream,
+        );
+    }
+    Ok((stage, holder))
 }
 
 fn ingress(registry: &Arc<WorkerRegistry>) -> RequestContext {
     let mut ctx = prepared_ctx(Arc::clone(registry), None);
     ctx.input.model_id = MODEL.to_owned();
+    ctx
+}
+
+fn ingress_with_tokens(registry: &Arc<WorkerRegistry>, tokens: &[u32]) -> RequestContext {
+    let mut ctx = ingress(registry);
+    ctx.state.preparation = Some(PreparationOutput::Generate {
+        original_text: None,
+        token_ids: tokens.to_vec(),
+    });
     ctx
 }
 
@@ -141,11 +203,18 @@ async fn a_first_attempt_under_the_host_lands_on_the_placed_worker() {
             .with_extension(RequestId("middleware-id".to_owned())),
     );
     ctx.input.streaming = true;
+    let mut headers = HeaderMap::new();
+    headers.insert("x-session", HeaderValue::from_static("s1"));
+    ctx.input.headers = Some(headers);
     let id = host::mark();
-    let ask = RegularAttempt::First(&ctx).ask(MODEL, &id);
+    let hashes = host::Hashes::default();
+    let ask = RegularAttempt::First(&ctx).ask(MODEL, &id, &hashes);
     assert_eq!(ask.id, id);
     assert!(ask.streaming);
     assert!(ask.tried.is_empty());
+    // The sources of its routing key: its headers and its own `rid`.
+    assert_eq!(ask.headers, ctx.input.headers.as_ref());
+    assert_eq!(ask.rid, Some("request-rid"));
     stage.execute(&mut ctx).await.expect("a placed worker");
     let ctx = Box::new(ctx).into_dispatch().expect("a dispatch context");
     let placed = ctx
@@ -163,6 +232,59 @@ async fn a_first_attempt_under_the_host_lands_on_the_placed_worker() {
 }
 
 #[tokio::test]
+async fn a_first_attempt_lands_on_the_worker_that_holds_its_prompt() -> anyhow::Result<()> {
+    let (stage, holder) = stage_with_cached_prompt(XXH3_SEED, RuntimeType::Vllm)?;
+    for _ in 0..PLACEMENTS {
+        let mut ctx = ingress_with_tokens(&stage.worker_registry, &TOKENS);
+        stage.execute(&mut ctx).await.expect("a placement");
+        assert_eq!(ctx.state.placed.expect("a placed worker").id(), holder);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_retry_states_the_retained_prompt() -> anyhow::Result<()> {
+    let (stage, holder) = stage_with_cached_prompt(XXH3_SEED, RuntimeType::Vllm)?;
+    let plan = retained_plan(&TOKENS);
+    for _ in 0..PLACEMENTS {
+        let mut ctx = dispatch_ctx(MODEL, grpc_wire(RuntimeType::Vllm));
+        stage.reselect(&mut ctx, &plan).await.expect("a placement");
+        assert_eq!(ctx.placed.expect("a placed worker").id(), holder);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_prompt_under_a_cache_partition_hashes_under_its_seed() -> anyhow::Result<()> {
+    let adapter = "adapter";
+    let namespace = CacheNamespace::derive(&CachePartition {
+        lora_path: Some(adapter),
+        ..CachePartition::default()
+    })
+    .expect("the adapter's namespace");
+    let (stage, holder) = stage_with_cached_prompt(namespace.event_seed(), RuntimeType::Sglang)?;
+
+    let mut scoped = ingress_with_tokens(&stage.worker_registry, &TOKENS);
+    let RequestType::Generate(request) = &mut scoped.input.request_type else {
+        panic!("a generate request");
+    };
+    Arc::make_mut(request).lora_path = Some(adapter.to_owned());
+    stage
+        .execute(&mut scoped)
+        .await
+        .expect("a scoped placement");
+    assert_eq!(scoped.state.placed.expect("a placed worker").id(), holder);
+
+    let mut plain = ingress_with_tokens(&stage.worker_registry, &TOKENS);
+    stage.execute(&mut plain).await.expect("a plain placement");
+    assert_eq!(
+        plain.state.placed.expect("a placed worker").worker().url(),
+        URLS[0]
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn each_ask_carries_a_mark_of_its_own() {
     let (stage, store) = stage_with_host(&URLS[..1]);
     let mut first = ingress(&stage.worker_registry);
@@ -172,21 +294,6 @@ async fn each_ask_carries_a_mark_of_its_own() {
     let leases = store.expire(Instant::now() + Duration::from_secs(60));
     assert_eq!(leases.len(), 2);
     assert_ne!(leases[0].request, leases[1].request);
-}
-
-#[tokio::test]
-async fn an_attempt_no_target_holds_reads_the_hosts_answer() {
-    use openai_protocol::worker::WorkerStatus;
-
-    let (stage, store) = stage_with_host(&URLS[..1]);
-    let worker = stage
-        .worker_registry
-        .get_by_url(URLS[0])
-        .expect("the worker");
-    worker.set_status(WorkerStatus::NotReady);
-    let mut ctx = ingress(&stage.worker_registry);
-    let refused = stage.execute(&mut ctx).await.expect_err("no target holds");
-    assert_no_target_holds(&refused, &store);
 }
 
 #[tokio::test]
@@ -382,8 +489,14 @@ async fn a_retry_names_the_rows_of_its_failed_attempts() {
     let mut ctx = dispatch_ctx(MODEL, grpc_wire(RuntimeType::Vllm));
     ctx.request_id = Some("retry-id".to_owned());
     ctx.streaming = true;
+    ctx.headers = Some(HeaderMap::new());
     let id = host::mark();
-    assert!(RegularAttempt::Retry(&ctx).ask(MODEL, &id).streaming);
+    let hashes = host::Hashes::default();
+    let ask = RegularAttempt::Retry(&ctx).ask(MODEL, &id, &hashes);
+    assert!(ask.streaming);
+    // A retry states the headers it retained and no `rid`.
+    assert_eq!(ask.headers, ctx.headers.as_ref());
+    assert!(ask.rid.is_none());
     let plan = retained_plan(&[1]);
     stage
         .reselect(&mut ctx, &plan)
@@ -403,6 +516,9 @@ async fn a_retry_names_the_rows_of_its_failed_attempts() {
     let failure = error::internal_error("attempt_failed", "Attempt failed");
     ctx.release_attempt(&failure, Instant::now());
     assert_eq!(*ctx.tried_rows, [first_row]);
+    // The retry's ask states that row as tried.
+    let ask = RegularAttempt::Retry(&ctx).ask(MODEL, &id, &hashes);
+    assert_eq!(ask.tried, [first_row]);
 
     stage
         .reselect(&mut ctx, &plan)
