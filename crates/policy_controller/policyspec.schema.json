@@ -1377,7 +1377,7 @@
           "minimum": 1
         },
         "token_usage": {
-          "description": "Mean KV usage over an engine's ranks at or above which a worker is\nvetoed; above 0 and at most 1 (default 0.8).",
+          "description": "Mean active KV usage over an engine's ranks at or above which a\nworker is vetoed; above 0 and at most 1 (default 0.8). A rank that\nreports no active share counts its whole usage.",
           "type": [
             "number",
             "null"
@@ -1399,13 +1399,13 @@
       "type": "object",
       "properties": {
         "sources": {
-          "description": "The sources, read in order: one to eight, each named once.",
+          "description": "The sources, read in order: one to eight, each named once, and up\nto four client sources beside them.",
           "type": "array",
           "items": {
             "$ref": "#/$defs/KeySourceSpec"
           },
           "minItems": 1,
-          "maxItems": 8
+          "maxItems": 12
         },
         "strip_lineage": {
           "description": "Take the turn and retry suffixes off a key, so every turn of a\nconversation shares one (`conv_t2_r1` keys as `conv`); default\nfalse.",
@@ -1433,7 +1433,7 @@
           "type": "boolean"
         },
         "max_bytes": {
-          "description": "The most bytes of a value this source hands, 8192 at most (default\n128). A longer value is passed over and the next source is read.",
+          "description": "The most bytes of a value this source hands, 8192 at most (default\n128). A longer value is passed over and the next source is read. A\nheader is measured as sent, and the request's own id after the\nblock's `strip_lineage` took its suffixes off.",
           "type": [
             "integer",
             "null"
@@ -1441,6 +1441,10 @@
           "format": "uint32",
           "minimum": 1,
           "maximum": 8192
+        },
+        "client": {
+          "description": "A source that tells one client from another, not one session: a\nheader a proxy or a browser sets. Its key places a request that\ncarries no session key on a ring. It lifts no overload veto, pins\nno session and is counted under no key. Of a binding's client\nsources, the first whose header a request carries is the one read,\nand a value it cannot hand ends the read. The value is read whole\nand leaves as its fingerprint alone, so `rid` and `max_bytes` are\nrefused beside it. A header may be named both ways: capped as a\nsession's source, and whole as a client's where that read handed no\nkey. Default false.",
+          "type": "boolean"
         }
       },
       "additionalProperties": false

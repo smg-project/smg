@@ -967,7 +967,7 @@ impl Scorer for ConsistentHash {
     /// takes on trust: the rows are a pool's own under a membership epoch,
     /// in the order of their ids, and the pool is numbered. `false`, with
     /// what `kept` holds to be dropped, where the host does not say so,
-    /// where the request has no routing key, where the pool was shown
+    /// where the request has no key the ring places by, where the pool was shown
     /// with a row the ring does not hold, once [`DRAW_BOUND`] rows were
     /// refused, which says nothing of the rows behind them, where the walk
     /// came round the ring short of the rows handed, one of which the ring
@@ -985,7 +985,12 @@ impl Scorer for ConsistentHash {
         keep: &mut dyn FnMut(&Candidate) -> bool,
         kept: &mut Vec<u32>,
     ) -> bool {
-        let key = facts.session_key.hash;
+        // A client's key is the plain ring's: the prefix form places a
+        // request with no routing key by its prefix.
+        let key = match &self.prefix {
+            Some(_) => facts.session_key.hash,
+            None => facts.ring_key(),
+        };
         let unsaid = pool.membership_epoch == 0 || pool.engines.is_empty();
         if key == 0 || unsaid || !self.owns() {
             return false;
@@ -1021,12 +1026,13 @@ impl Scorer for ConsistentHash {
         out: &mut [f32],
     ) -> TieBand {
         out.fill(0.0);
-        // A ring that names no prefix form has one key, the routing key: it
-        // is read here, and the walk is built for the prefix form alone.
+        // A ring that names no prefix form has one key, the session's or
+        // else the client's: it is read here, and the walk is built for the
+        // prefix form alone.
         let mut keys = self.prefix.is_some().then(|| self.keys(facts));
         let first = match &mut keys {
             Some(keys) => keys.next(),
-            None => Some(facts.session_key.hash).filter(|&key| key != 0),
+            None => Some(facts.ring_key()).filter(|&key| key != 0),
         };
         let first = match first {
             Some(key) if !kept.is_empty() => key,

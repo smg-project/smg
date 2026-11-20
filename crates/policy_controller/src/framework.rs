@@ -4179,7 +4179,7 @@ impl Engine {
                 if marks.engines() {
                     return run_engines(self, index, facts, pool, set, cx, buf);
                 }
-                if marks.owns() && !facts.session_key.is_none() {
+                if marks.owns() && facts.ring_key() != 0 {
                     let owned = run_owned(self, index, facts, pool, candidates, cx, buf);
                     if let Some(decision) = owned {
                         return decision;
