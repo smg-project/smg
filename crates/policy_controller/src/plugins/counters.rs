@@ -39,10 +39,16 @@ impl Counters {
             .and_then(|i| self.inner.values.get(i))
         {
             Some(counter) => {
-                counter.fetch_add(by, Ordering::Relaxed);
+                counter.update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                    value.saturating_add(by)
+                });
             }
             None => {
-                self.inner.undeclared.fetch_add(1, Ordering::Relaxed);
+                self.inner
+                    .undeclared
+                    .update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                        value.saturating_add(1)
+                    });
             }
         }
     }
@@ -77,5 +83,17 @@ mod tests {
         let read: Vec<(&str, u64)> = counters.read().collect();
         assert_eq!(read, vec![("hits", 3), ("misses", 2)]);
         assert_eq!(counters.undeclared(), 2);
+    }
+
+    #[test]
+    fn a_declared_counter_saturates_at_the_maximum() {
+        let counters = Counters::new(vec!["hits".into()]);
+        counters.add(0, u64::MAX);
+        counters.add(0, 1);
+
+        assert_eq!(
+            counters.read().collect::<Vec<_>>(),
+            vec![("hits", u64::MAX)]
+        );
     }
 }
