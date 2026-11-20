@@ -46,7 +46,8 @@ fn pair_bed_over(
     prefill_urls: &[&str],
     decode_urls: &[&str],
 ) -> PairBed {
-    pair_bed_of(|_, worker| worker, registry, prefill_urls, decode_urls)
+    let plain = |_: &str, worker: BasicWorkerBuilder| (worker, WireModes::HTTP);
+    pair_bed_of(plain, registry, prefill_urls, decode_urls)
 }
 
 /// [`pair_bed_over`] with every worker of `runtime`: a pair router picks its
@@ -57,14 +58,15 @@ fn pair_bed_running(
     prefill_urls: &[&str],
     decode_urls: &[&str],
 ) -> PairBed {
-    let running = |_: &str, worker: BasicWorkerBuilder| worker.runtime_type(runtime);
+    let running =
+        |_: &str, worker: BasicWorkerBuilder| (worker.runtime_type(runtime), WireModes::HTTP);
     pair_bed_of(running, registry, prefill_urls, decode_urls)
 }
 
-/// [`pair_bed_over`] with each registry worker as `shaped` leaves it, by
-/// its URL. The rows are written the same for every shape.
+/// [`pair_bed_over`] with each registry worker as `shaped` leaves it and
+/// its row's wires as `shaped` states them, by its URL.
 fn pair_bed_of(
-    shaped: impl Fn(&str, BasicWorkerBuilder) -> BasicWorkerBuilder,
+    shaped: impl Fn(&str, BasicWorkerBuilder) -> (BasicWorkerBuilder, WireModes),
     registry: Arc<WorkerRegistry>,
     prefill_urls: &[&str],
     decode_urls: &[&str],
@@ -96,13 +98,14 @@ fn pair_bed_of(
                 .model(ModelCard::new(MODEL))
                 .worker_type(worker_type)
                 .status(WorkerStatus::Ready);
-            let worker: Arc<dyn Worker> = Arc::new(shaped(url, builder).build());
+            let (builder, wire_modes) = shaped(url, builder);
+            let worker: Arc<dyn Worker> = Arc::new(builder.build());
             let facts = WorkerFacts {
                 key: worker.url().to_string(),
                 engine: url.to_string(),
                 incarnation: 1,
                 role,
-                wire_modes: WireModes::HTTP,
+                wire_modes,
                 models: vec![MODEL.to_string()],
                 dp_size: 1,
                 max_running: Some(64),
@@ -128,6 +131,17 @@ fn pair_bed_of(
 }
 
 const GATEWAY: GatewayId = GatewayId::LOCAL;
+
+/// A unary generate request of the bed's model, as an attempt reads it.
+const UNARY: PDRequestContext<'static> = PDRequestContext {
+    route: "/generate",
+    batch_size: None,
+    is_stream: false,
+    return_logprob: false,
+    model_id: MODEL,
+    headers: None,
+    rid: None,
+};
 
 fn router(worker_registry: Arc<WorkerRegistry>, host: Host) -> PDRouter {
     PDRouter {
@@ -433,10 +447,11 @@ async fn decode_arrivals_over(
     let registry = Arc::new(WorkerRegistry::new());
     let shaped = |url: &str, worker: BasicWorkerBuilder| {
         let worker = worker.runtime_type(RuntimeType::Vllm);
-        match second_connector.filter(|_| url == second) {
+        let worker = match second_connector.filter(|_| url == second) {
             Some(connector) => worker.kv_connector(connector),
             None => worker,
-        }
+        };
+        (worker, WireModes::HTTP)
     };
     let bed = pair_bed_of(
         shaped,
@@ -507,9 +522,10 @@ async fn a_decode_its_prefill_was_told_is_booked_at_the_prefills_send() -> Case 
     let registry = Arc::new(WorkerRegistry::new());
     let read = |_: &str, worker: BasicWorkerBuilder| {
         let worker = worker.runtime_type(RuntimeType::Vllm);
-        worker
+        let worker = worker
             .kv_connector(MORIIO_CONNECTOR)
-            .label("moriio_mode", "read")
+            .label("moriio_mode", "read");
+        (worker, WireModes::HTTP)
     };
     let bed = pair_bed_of(read, Arc::clone(&registry), &[&prefill], &[&decode]);
     let (host, store, _) = bed;
@@ -577,19 +593,10 @@ async fn a_retry_is_not_placed_on_a_worker_the_ledger_closed() -> Case {
         );
         let router = router(registry, host);
         let host = router.host.as_deref().ok_or("the router holds the host")?;
-        let context = PDRequestContext {
-            route: "/generate",
-            batch_size: None,
-            is_stream: false,
-            return_logprob: false,
-            model_id: MODEL,
-            headers: None,
-            rid: None,
-        };
         let tried = parking_lot::Mutex::new(Vec::new());
         for _ in 0..4 {
             let placed = router
-                .place_pair_attempt(host, &context, 0, None, &tried, &ledger)
+                .place_pair_attempt(host, &UNARY, 0, 0, None, &tried, &ledger)
                 .await;
             let (sent, (_, decode), _guards, _asked) =
                 placed.map_err(|refusal| format!("refused: {}", refusal.status()))?;
@@ -688,7 +695,7 @@ async fn spawn_held_body_stub(hold: Duration, whole: bool) -> String {
     spawn_stub(app).await
 }
 
-/// The held body of the three cases below ends this long after its head.
+/// The held body of the two cases below ends this long after its head.
 const DRAIN_HOLD: Duration = Duration::from_millis(800);
 
 /// Whether the prefill still holds its lease, read well inside its body's
@@ -765,12 +772,73 @@ async fn a_client_that_leaves_mid_stream_leaves_the_prefill_to_its_drain() -> Ca
     Ok(())
 }
 
+/// What a held server waits on: its case lets the answer go.
+type Release = Arc<tokio::sync::Notify>;
+
+/// Whether `seen` came true inside a long patience of short looks. The
+/// server a look waits ahead of is held until the look ends, so a late look
+/// reads the same as an early one.
+async fn shown(seen: impl Fn() -> bool) -> bool {
+    for _ in 0..1_000 {
+        if seen() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    false
+}
+
+/// A server whose answer's head and first bytes leave at once, with a frame
+/// of white space every few milliseconds behind them, and whose body ends
+/// whole once its case lets it go.
+async fn spawn_released_body_stub(release: Release) -> String {
+    let app = axum::Router::new().fallback(axum::routing::any(move || {
+        let release = Arc::clone(&release);
+        async move {
+            let first = futures_util::stream::iter([Ok(Bytes::from_static(b"{\"partial\":"))]);
+            let rest = futures_util::stream::unfold(Some(release), |release| async move {
+                let release = release?;
+                let frame = Duration::from_millis(5);
+                tokio::select! {
+                    () = release.notified() => Some((Ok(Bytes::from_static(b"1}")), None)),
+                    () = tokio::time::sleep(frame) => {
+                        Some((Ok::<_, std::io::Error>(Bytes::from_static(b" ")), Some(release)))
+                    }
+                }
+            });
+            (
+                [(CONTENT_TYPE, "application/json")],
+                Body::from_stream(first.chain(rest)),
+            )
+        }
+    }));
+    spawn_stub(app).await
+}
+
+/// A server that holds its answer until its case lets it go, and the count
+/// of the requests that reached it.
+async fn spawn_released_stub(reply: Value, release: Release) -> (String, Arc<AtomicUsize>) {
+    let reached = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&reached);
+    let app = axum::Router::new().fallback(axum::routing::any(move || {
+        let (count, reply, release) = (Arc::clone(&count), reply.clone(), Arc::clone(&release));
+        async move {
+            count.fetch_add(1, Ordering::Release);
+            release.notified().await;
+            axum::Json(reply)
+        }
+    }));
+    (spawn_stub(app).await, reached)
+}
+
 /// While the answer's body runs, a drained prefill ends at the answer's
-/// next frame: its row hears the success well ahead of the answer's end.
+/// next frame: its row hears the success ahead of the answer's end. The
+/// answer's body runs until the case saw that, or gave up.
 #[tokio::test]
 async fn a_drained_prefill_ends_at_the_answers_next_frame() -> Case {
     let (prefill, _) = spawn_recording_stub("{}").await;
-    let decode = spawn_held_body_stub(DRAIN_HOLD, true).await;
+    let release = Release::default();
+    let decode = spawn_released_body_stub(Arc::clone(&release)).await;
     let registry = Arc::new(WorkerRegistry::new());
     let (host, store, _) = pair_bed_over(Arc::clone(&registry), &[&prefill], &[&decode]);
     let row = store
@@ -785,16 +853,11 @@ async fn a_drained_prefill_ends_at_the_answers_next_frame() -> Case {
 
     assert_eq!(response.status(), StatusCode::OK);
     let early = async {
-        // The patience ends inside the answer's hold: a prefill that ends
-        // with the answer is read as not ended here.
-        let deadline = start + DRAIN_HOLD / 2;
-        while Instant::now() < deadline {
-            if HealthSink::completed_ok_since(&*store, GATEWAY, row.id, start) {
-                return true;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        false
+        // The answer's body ends behind this look: a prefill that ends with
+        // the answer is not seen ended here.
+        let ended = shown(|| HealthSink::completed_ok_since(&*store, GATEWAY, row.id, start)).await;
+        release.notify_one();
+        ended
     };
     let whole = axum::body::to_bytes(response.into_body(), usize::MAX);
     let (_, ended) = tokio::join!(whole, early);
@@ -804,16 +867,16 @@ async fn a_drained_prefill_ends_at_the_answers_next_frame() -> Case {
 }
 
 /// A prefill that is read whole ends where its guard drops, ahead of the
-/// answer its decode writes. The decode here holds its answer, and the
-/// prefill's row hears its success well inside that hold. Both shapes: the
+/// answer its decode writes. The decode here holds its answer until the
+/// case saw the prefill's row hear its success, or gave up. Both shapes: the
 /// two sides sent together, and the decode sent behind its prefill.
 #[tokio::test]
 async fn a_prefill_read_whole_ends_ahead_of_its_decodes_answer() -> Case {
-    let hold = Duration::from_millis(600);
     for runtime in [RuntimeType::default(), RuntimeType::Vllm] {
         let (prefill, _) = spawn_recording_stub("{}").await;
         let reply = json!({"object": "chat.completion"});
-        let (decode, decode_seen) = spawn_delayed_stub(StatusCode::OK, reply, hold).await;
+        let release = Release::default();
+        let (decode, reached) = spawn_released_stub(reply, Arc::clone(&release)).await;
         let registry = Arc::new(WorkerRegistry::new());
         let bed = pair_bed_running(runtime, Arc::clone(&registry), &[&prefill], &[&decode]);
         let (host, store, _) = bed;
@@ -824,17 +887,15 @@ async fn a_prefill_read_whole_ends_ahead_of_its_decodes_answer() -> Case {
         let start = Instant::now();
 
         let early = async {
-            // The patience ends inside the decode's hold: a prefill that
-            // ends with the answer is read as not ended here.
-            let deadline = start + hold / 2;
-            while Instant::now() < deadline {
-                let held = decode_seen.lock().is_ok_and(|seen| !seen.is_empty());
-                if held && HealthSink::completed_ok_since(&*store, GATEWAY, row.id, start) {
-                    return true;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-            false
+            // The decode answers behind this look: a prefill that ends with
+            // the answer is not seen ended here.
+            let ended = shown(|| {
+                let held = reached.load(Ordering::Acquire) > 0;
+                held && HealthSink::completed_ok_since(&*store, GATEWAY, row.id, start)
+            })
+            .await;
+            release.notify_one();
+            ended
         };
         let (response, ended) = tokio::join!(chat(&router), early);
 
@@ -848,42 +909,36 @@ async fn a_prefill_read_whole_ends_ahead_of_its_decodes_answer() -> Case {
     Ok(())
 }
 
-/// A pair of another wire is not placed: the commit asks each side's HTTP
-/// pool of its worker, so a pick that names the gRPC decode is passed over
-/// for the HTTP one, whichever the pick lists first.
+/// A row can state the route's wire while its worker dials another: the
+/// stated wire keeps the row, and the controller names it. The commit asks
+/// each side's HTTP pool of its worker, so a pick that names the decode
+/// which dials gRPC is passed over for the HTTP one, whichever the pick
+/// lists first.
 #[tokio::test]
-async fn a_pair_of_another_wire_is_passed_over_at_its_commit() -> Case {
+async fn a_row_whose_worker_dials_another_wire_is_passed_over_at_its_commit() -> Case {
     for other in [0, 1] {
         let (prefill, _) = spawn_recording_stub("{}").await;
         let (first, _) = spawn_recording_stub("{}").await;
         let (second, _) = spawn_recording_stub("{}").await;
         let urls = [first.as_str(), second.as_str()];
         let grpc = |url: &str, worker: BasicWorkerBuilder| {
-            if url == urls[other] {
+            let worker = if url == urls[other] {
                 worker.connection_mode(ConnectionMode::Grpc)
             } else {
                 worker
-            }
+            };
+            (worker, WireModes::HTTP)
         };
         let registry = Arc::new(WorkerRegistry::new());
         let bed = pair_bed_of(grpc, Arc::clone(&registry), &[&prefill], &urls);
         let (host, store, [_, decodes]) = bed;
         let router = router(registry, host);
         let host = router.host.as_deref().ok_or("the router holds the host")?;
-        let context = PDRequestContext {
-            route: "/generate",
-            batch_size: None,
-            is_stream: false,
-            return_logprob: false,
-            model_id: MODEL,
-            headers: None,
-            rid: None,
-        };
         let tried = parking_lot::Mutex::new(Vec::new());
         let ledger = AttemptLedger::default();
         for _ in 0..4 {
             let placed = router
-                .place_pair_attempt(host, &context, 0, None, &tried, &ledger)
+                .place_pair_attempt(host, &UNARY, 0, 0, None, &tried, &ledger)
                 .await;
             let (sent, (_, decode), _guards, _asked) =
                 placed.map_err(|refusal| format!("refused: {}", refusal.status()))?;
@@ -892,6 +947,66 @@ async fn a_pair_of_another_wire_is_passed_over_at_its_commit() -> Case {
                 decodes[1 - other].url(),
                 "the gRPC decode {other}"
             );
+            drop(sent);
+        }
+        assert_eq!(live(&store, 0).await, 0);
+    }
+    Ok(())
+}
+
+/// The prefills of another wire in the case below: four times the targets
+/// the asks of one attempt can name.
+const OTHER_WIRE_PREFILLS: usize = 48;
+
+/// The ask states the route's wire, so the controller places among the rows
+/// that serve it. A prefill of another wire pairs with a decode of that
+/// wire. Were the wire left to the commit, an attempt's asks would name
+/// twelve such pairs at most, the commit would pass each over, and the
+/// attempt would end with no worker while the route's own pair stands,
+/// first or last among the rows.
+#[tokio::test]
+async fn a_pair_is_placed_past_more_pairs_of_another_wire_than_an_attempt_asks() -> Case {
+    const OWN_DECODE: &str = "http://decode-own";
+    const OTHER_DECODE: &str = "http://decode-other";
+    let names: Vec<String> = (0..=OTHER_WIRE_PREFILLS)
+        .map(|at| format!("http://prefill-{at}"))
+        .collect();
+    let prefills: Vec<&str> = names.iter().map(String::as_str).collect();
+    for own in [0, OTHER_WIRE_PREFILLS] {
+        let other_wire = |url: &str, worker: BasicWorkerBuilder| {
+            if url == prefills[own] || url == OWN_DECODE {
+                (worker, WireModes::HTTP)
+            } else {
+                (
+                    worker.connection_mode(ConnectionMode::Grpc),
+                    WireModes::GRPC,
+                )
+            }
+        };
+        let decodes = if own == 0 {
+            [OWN_DECODE, OTHER_DECODE]
+        } else {
+            [OTHER_DECODE, OWN_DECODE]
+        };
+        let registry = Arc::new(WorkerRegistry::new());
+        let bed = pair_bed_of(other_wire, Arc::clone(&registry), &prefills, &decodes);
+        let (host, store, _) = bed;
+        let router = router(registry, host);
+        let host = router.host.as_deref().ok_or("the router holds the host")?;
+        let tried = parking_lot::Mutex::new(Vec::new());
+        let ledger = AttemptLedger::default();
+        for _ in 0..4 {
+            let placed = router
+                .place_pair_attempt(host, &UNARY, 0, 0, None, &tried, &ledger)
+                .await;
+            let (sent, (prefill, decode), _guards, _asked) =
+                placed.map_err(|refusal| format!("refused: {}", refusal.status()))?;
+            assert_eq!(
+                prefill.url(),
+                prefills[own],
+                "the route's prefill stands at {own}"
+            );
+            assert_eq!(decode.url(), OWN_DECODE);
             drop(sent);
         }
         assert_eq!(live(&store, 0).await, 0);
