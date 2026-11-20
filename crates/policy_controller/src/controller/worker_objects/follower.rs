@@ -17,7 +17,8 @@ use crate::{
 /// wake of its one task. The registry is built here, and the holder alone
 /// writes it. Each object connects to its engine through the engine clients'
 /// gRPC connector, so a worker of the host-local wire has no connection
-/// here.
+/// here. The replica cannot dial a row that one gateway alone reaches: such
+/// a row's object is built with its checks off, and no probe is sent to it.
 pub(crate) struct WorkerObjects {
     store: Arc<MemoryStore>,
     objects: Arc<Objects<Members>>,
@@ -41,7 +42,9 @@ impl WorkerObjects {
         Self {
             store,
             objects: Arc::new(
-                Objects::new(Arc::new(WorkerRegistry::new())).with_connector(connector),
+                Objects::new(Arc::new(WorkerRegistry::new()))
+                    .with_connector(connector)
+                    .with_host_local_unchecked(),
             ),
             wake,
         }

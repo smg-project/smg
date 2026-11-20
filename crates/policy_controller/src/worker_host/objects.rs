@@ -20,10 +20,10 @@ use smg_worker::{
 
 use super::{
     credentials::Credentials,
-    object::{builder, dial_address, status},
+    object::{builder, dial_address, status, unchecked},
 };
 use crate::{
-    store::{MembershipChange, MembershipTail, WorkerFacts, WorkerRow, WorkersStore},
+    store::{MembershipChange, MembershipTail, Reachability, WorkerFacts, WorkerRow, WorkersStore},
     view::WorkerId,
 };
 
@@ -147,6 +147,8 @@ pub struct Objects<G> {
     /// forgetting did not ask about, and the next read forgets again.
     /// Written and read under the follow's turn.
     forgotten_at: AtomicU64,
+    /// Whether the object of a host-local row is built with its checks off.
+    host_local_unchecked: bool,
     /// Where the last read ended. Held through a read: one follows at a
     /// time.
     read_to: Mutex<Place>,
@@ -169,6 +171,16 @@ impl<G> Objects<G> {
         self.status_followed = true;
         self
     }
+
+    /// For a host that is no gateway: it holds the socket of no host-local
+    /// wire, so the object of a row that one gateway alone reaches is built
+    /// with its checks off, whatever the row's policy says. A health loop
+    /// over the registry then dials no worker its host cannot reach.
+    #[must_use]
+    pub fn with_host_local_unchecked(mut self) -> Self {
+        self.host_local_unchecked = true;
+        self
+    }
 }
 
 impl<G: Generation> Objects<G> {
@@ -181,6 +193,7 @@ impl<G: Generation> Objects<G> {
             status_followed: false,
             credentials: None,
             forgotten_at: AtomicU64::new(0),
+            host_local_unchecked: false,
             read_to: Mutex::new(Place::default()),
             held: RwLock::new(Held::default()),
         }
@@ -518,7 +531,14 @@ impl<G: Generation> Objects<G> {
     /// object another row holds under the URL is dropped first: a row takes
     /// the place of its own object alone.
     fn lay<S: WorkersStore + ?Sized>(&self, store: &S, row: &WorkerRow) {
-        let mut worker = builder(row);
+        // A row one gateway alone reaches is built unchecked where the
+        // host asked for it: nothing here can dial its worker.
+        let reached = !self.host_local_unchecked || row.facts.reachable_from == Reachability::Any;
+        let mut worker = if reached {
+            builder(row)
+        } else {
+            unchecked(row)
+        };
         if let Some(connector) = &self.connector {
             worker = worker.engine_connector(Arc::clone(connector));
         }
@@ -577,7 +597,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        store::{HealthSink, Kinds, Maker, MemoryStore, WorkerFacts, WorkerPatch, WorkerStatus},
+        store::{
+            GatewayId, HealthSink, Kinds, Maker, MemoryStore, WorkerFacts, WorkerPatch,
+            WorkerStatus,
+        },
         worker_host::{object, HealthAdapter, KeptCredential, SoleLead},
     };
 
@@ -728,6 +751,40 @@ mod tests {
 
         fn tier(&self, url: &str) -> Option<String> {
             self.at(url).metadata().spec.labels.get("tier").cloned()
+        }
+    }
+
+    /// A host that is no gateway asks for a host-local row's object with
+    /// its checks off, whatever the row's policy says. The object of a row
+    /// any gateway dials keeps its checks, and so does the row's own once
+    /// its reach turns. A holder that was not asked builds each as its
+    /// policy says.
+    #[test]
+    fn a_host_local_rows_object_is_unchecked_where_the_host_asked() {
+        let checked = |replica: &Replica, url| {
+            !replica
+                .at(url)
+                .metadata()
+                .health_config
+                .disable_health_check
+        };
+        let local = WorkerFacts {
+            reachable_from: Reachability::Gateway(GatewayId(1)),
+            ..facts(A, 1)
+        };
+        let mut outside = Replica::new();
+        let registry = Arc::clone(outside.objects.registry());
+        outside.objects = Objects::new(registry).with_host_local_unchecked();
+        for (replica, asked) in [(Replica::new(), false), (outside, true)] {
+            replica.store.upsert(local.clone());
+            replica.store.upsert(facts(B, 1));
+            replica.follow();
+            assert_eq!(checked(&replica, A), !asked, "the host-local row");
+            assert!(checked(&replica, B), "a row any gateway dials");
+
+            replica.store.upsert(facts(A, 1));
+            replica.follow();
+            assert!(checked(&replica, A), "the row once any gateway dials it");
         }
     }
 

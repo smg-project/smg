@@ -144,7 +144,7 @@ mod tests {
     };
     use crate::{
         elector::{ElectError, Elector},
-        store::{HealthPolicy, WorkerFacts, WorkerStatus, WorkersStore},
+        store::{GatewayId, HealthPolicy, Reachability, WorkerFacts, WorkerStatus, WorkersStore},
         view::{WireModes, WorkerId},
     };
 
@@ -487,6 +487,30 @@ mod tests {
         );
         assert_eq!(replica.connector.connects(), 1, "one row was dialed");
         assert_eq!(replica.status(off), Some(WorkerStatus::Pending));
+        assert!(replica.stopped().await, "the task ends at the stop");
+    }
+
+    /// A row one gateway alone reaches is not the replica's to dial: its
+    /// object stands unchecked, so the loop sends it no probe and no
+    /// verdict moves its row, whatever its policy says.
+    #[tokio::test(start_paused = true)]
+    async fn a_row_one_gateway_alone_reaches_is_not_probed() {
+        let mut replica = Replica::new().expect("a replica");
+        replica.lead().expect("a term");
+        let local = replica.register(WorkerFacts {
+            reachable_from: Reachability::Gateway(GatewayId(1)),
+            ..facts(A, 1)
+        });
+        let dialed = replica.register(facts(B, 1));
+
+        time::sleep(INTERVAL * 3).await;
+        assert_eq!(
+            replica.status(dialed),
+            Some(WorkerStatus::Ready),
+            "the row beside it is probed"
+        );
+        assert_eq!(replica.connector.connects(), 1, "one row was dialed");
+        assert_eq!(replica.status(local), Some(WorkerStatus::Pending));
         assert!(replica.stopped().await, "the task ends at the stop");
     }
 

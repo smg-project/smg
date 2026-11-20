@@ -84,6 +84,16 @@ pub(super) fn builder(row: &WorkerRow) -> BasicWorkerBuilder {
         .status(status(row.status))
 }
 
+/// [`builder`] with the checks off, whatever the row's policy says: what
+/// the holder builds from for a row its host cannot dial.
+pub(super) fn unchecked(row: &WorkerRow) -> BasicWorkerBuilder {
+    let facts = &row.facts;
+    builder(row).health_config(HealthCheckConfig {
+        disable_health_check: true,
+        ..checks(&facts.health, facts.drain_settle_secs)
+    })
+}
+
 /// The store's role for a worker object.
 pub(super) fn role(worker_type: WorkerType) -> Role {
     match worker_type {
