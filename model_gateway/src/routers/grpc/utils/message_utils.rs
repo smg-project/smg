@@ -1247,6 +1247,7 @@ mod tests {
                     name: "calculator".to_string(),
                     input: json!({"expr": "2+2"}),
                     cache_control: None,
+                    caller: None,
                 }),
             ]),
         }];
@@ -1281,6 +1282,7 @@ mod tests {
                     name: "calc".to_string(),
                     input: json!({"x": 1}),
                     cache_control: None,
+                    caller: None,
                 },
             )]),
         }];

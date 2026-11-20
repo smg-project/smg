@@ -356,6 +356,15 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   `text_tokens` in the completion details. A usage the gateway builds is written as before.
   Breaking: `PromptTokenUsageInfo` gains `text_tokens`, `image_tokens` and `cache_write_tokens`,
   and `CompletionTokensDetails` gains `text_tokens`, all `Option<u32>`.
+- A Messages tool block keeps its `caller`, as the public API writes it and takes it back: a
+  `server_tool_use` or `web_search_tool_result` block in an answer, and a replayed `tool_use`,
+  `server_tool_use` or `web_search_tool_result` block in a request. The usage's `server_tool_use`
+  keeps its `web_fetch_requests`. Each was dropped, so a call a code execution made was replayed as
+  one the model made, and the web fetch count was lost. The Anthropic MCP loop's next round keeps
+  a caller other than the model's too. Breaking: `ToolUseBlock`, `ServerToolUseBlock`,
+  `WebSearchToolResultBlock` and the `ContentBlock::ServerToolUse` and
+  `ContentBlock::WebSearchToolResult` variants gain `caller`, and `ServerToolUsage` gains
+  `web_fetch_requests`.
 - A Responses function tool declared with `async`, `defer_loading`, `output_schema` or
   `allowed_callers`, and a custom tool declared with `async` or `allowed_callers`, as the public
   API's tools take them, parse and are forwarded as given. The crate refused each as an unknown

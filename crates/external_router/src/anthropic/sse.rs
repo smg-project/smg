@@ -13,7 +13,7 @@ use axum::{
 use bytes::Bytes;
 use futures::StreamExt;
 use openai_protocol::messages::{
-    ContentBlock, MessageDeltaUsage, StopReason, ToolUseBlock, ToolUseCaller,
+    ContentBlock, MessageDeltaUsage, ServerToolUsage, StopReason, ToolUseBlock, ToolUseCaller,
 };
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -200,19 +200,22 @@ pub(crate) async fn emit_mcp_tool_result(
     true
 }
 
-/// Emit the final `message_delta` and `message_stop` events.
+/// Emit the final `message_delta` and `message_stop` events. The usage is
+/// the loop's: the tokens of every round, and the server tool counts the
+/// rounds reported, left out when none did.
 pub(crate) async fn emit_final(
     tx: &mpsc::Sender<Result<Bytes, io::Error>>,
     enc: &mut SseEncoder,
     stop_reason: Option<&StopReason>,
     total_input_tokens: u32,
     total_output_tokens: u32,
+    server_tool_use: Option<&ServerToolUsage>,
 ) {
     let stop_reason_val = stop_reason
         .map(|r| serde_json::to_value(r).unwrap_or(Value::Null))
         .unwrap_or(Value::Null);
 
-    let message_delta = serde_json::json!({
+    let mut message_delta = serde_json::json!({
         "type": "message_delta",
         "delta": {
             "stop_reason": stop_reason_val,
@@ -223,6 +226,10 @@ pub(crate) async fn emit_final(
             "output_tokens": total_output_tokens
         }
     });
+    if let Some(server_tool_use) = server_tool_use {
+        message_delta["usage"]["server_tool_use"] =
+            serde_json::to_value(server_tool_use).unwrap_or(Value::Null);
+    }
 
     if !send_event(tx, enc, "message_delta", &message_delta).await {
         debug!("Failed to send final message_delta — channel closed");
@@ -324,6 +331,9 @@ enum BlockAccumulator {
         id: String,
         name: String,
         input_json: String,
+        /// The caller the block's start named, so the next round's history
+        /// keeps it as the non-streamed loop's does
+        caller: ToolUseCaller,
     },
     Thinking {
         thinking: String,
@@ -410,6 +420,7 @@ impl BlockAccumulator {
                 id,
                 name,
                 input_json,
+                caller,
             } => {
                 let input: Value = serde_json::from_str(input_json).unwrap_or_else(|e| {
                     warn!(
@@ -424,13 +435,15 @@ impl BlockAccumulator {
                     name: name.clone(),
                     input: input.clone(),
                     cache_control: None,
+                    // a call the model made keeps its caller implicit
+                    caller: (*caller != ToolUseCaller::Direct).then(|| caller.clone()),
                 };
                 (
                     ContentBlock::ToolUse {
                         id: id.clone(),
                         name: name.clone(),
                         input,
-                        caller: ToolUseCaller::Direct,
+                        caller: caller.clone(),
                     },
                     Some(tool_use),
                 )
@@ -647,6 +660,7 @@ where
             id,
             name,
             input_json: String::new(),
+            caller: tool_use_caller(content_block),
         };
         Ok(())
     }
@@ -728,6 +742,16 @@ fn resolve_event(frame: SseFrame<'_>) -> Option<(Cow<'_, str>, Cow<'_, str>)> {
     Some((event_type, frame.data))
 }
 
+/// The caller a streamed `tool_use` block's start names, as the public API
+/// reports it; a block without one is a call the model made.
+fn tool_use_caller(content_block: &Value) -> ToolUseCaller {
+    content_block
+        .get("caller")
+        .filter(|caller| !caller.is_null())
+        .and_then(|caller| serde_json::from_value(caller.clone()).ok())
+        .unwrap_or_default()
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -736,6 +760,44 @@ fn resolve_event(frame: SseFrame<'_>) -> Option<(Cow<'_, str>, Cow<'_, str>)> {
 mod tests {
     use super::*;
     use crate::error::HEADER_X_SMG_ERROR_CODE;
+
+    /// A streamed MCP `tool_use` keeps the caller its start names, so the
+    /// next round's history writes it as the non-streamed loop's does; a call
+    /// the model made writes none.
+    #[test]
+    fn a_streamed_tool_use_keeps_its_caller() {
+        let code_execution = ToolUseCaller::CodeExecution20250825 {
+            tool_id: "srvtoolu_1".to_string(),
+        };
+        let start = serde_json::json!({
+            "type": "tool_use",
+            "id": "toolu_1",
+            "name": "search",
+            "input": {},
+            "caller": {"type": "code_execution_20250825", "tool_id": "srvtoolu_1"}
+        });
+        assert_eq!(tool_use_caller(&start), code_execution);
+
+        let block = BlockAccumulator::ToolUse {
+            id: "toolu_1".to_string(),
+            name: "search".to_string(),
+            input_json: "{}".to_string(),
+            caller: tool_use_caller(&start),
+        };
+        let (content, tool_use) = block.finalize();
+        assert!(
+            matches!(&content, ContentBlock::ToolUse { caller, .. } if *caller == code_execution),
+            "{content:?}"
+        );
+        assert_eq!(tool_use.and_then(|t| t.caller), Some(code_execution));
+
+        for direct in [
+            serde_json::json!({"type": "tool_use", "id": "toolu_2", "name": "search"}),
+            serde_json::json!({"type": "tool_use", "id": "toolu_3", "name": "search", "caller": null}),
+        ] {
+            assert_eq!(tool_use_caller(&direct), ToolUseCaller::Direct, "{direct}");
+        }
+    }
 
     #[test]
     fn build_sse_response_drops_smg_owned_error_code() {
@@ -785,6 +847,55 @@ mod tests {
             }
         }
         out
+    }
+
+    /// The loop's final `message_delta` carries the server tool counts its
+    /// rounds reported beside the token totals, and no `server_tool_use`
+    /// when no round reported one.
+    #[tokio::test]
+    async fn the_final_message_delta_carries_the_loops_server_tool_counts() {
+        async fn final_usage(server_tool_use: Option<&ServerToolUsage>) -> Value {
+            let (tx, mut rx) = mpsc::channel(8);
+            let mut enc = SseEncoder::new();
+            emit_final(
+                &tx,
+                &mut enc,
+                Some(&StopReason::EndTurn),
+                7,
+                3,
+                server_tool_use,
+            )
+            .await;
+            drop(tx);
+            let mut bytes = Vec::new();
+            while let Some(frame) = rx.recv().await {
+                bytes.extend_from_slice(&frame.expect("a frame"));
+            }
+            let events = decode_events(&bytes);
+            let (_, data) = events
+                .iter()
+                .find(|(event, _)| event == "message_delta")
+                .expect("a message_delta");
+            let delta: Value = serde_json::from_str(data).expect("the event's JSON");
+            delta["usage"].clone()
+        }
+
+        let counted = ServerToolUsage {
+            web_search_requests: 1,
+            web_fetch_requests: 2,
+        };
+        assert_eq!(
+            final_usage(Some(&counted)).await,
+            serde_json::json!({
+                "input_tokens": 7,
+                "output_tokens": 3,
+                "server_tool_use": {"web_search_requests": 1, "web_fetch_requests": 2}
+            })
+        );
+        assert_eq!(
+            final_usage(None).await,
+            serde_json::json!({"input_tokens": 7, "output_tokens": 3})
+        );
     }
 
     #[test]
