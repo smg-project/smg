@@ -26,8 +26,8 @@ use crate::{
     lease::{LeaseId, Lifecycle, Side},
     sessions::SessionVerdict,
     spec::{
-        AppliedSpec, BestParams, PickStage, PolicySpec, ProfileSpec, ScoreStage, ShadowSpec,
-        WarmupSliceParams,
+        AffinitySource, AppliedSpec, BestParams, PickStage, PolicySpec, PrefixAffinityParams,
+        ProfileSpec, ScoreStage, ShadowSpec, WarmupSliceParams,
     },
     store::{Dispatch, LeasesStore, MemoryStore, Said},
     view::{Candidate, RequestFacts, WorkerId},
@@ -408,12 +408,13 @@ fn a_decision_made_again_is_shadowed_from_its_own_reading() {
     assert_eq!(kinds(&door), [2, 0, 0, 0]);
 }
 
-/// Rows are named for the live profile alone, by its sample and its
-/// warm-up ruling. A shadow profile that would be named other rows is not
-/// asked, and is counted as skipped: one of another sample, one of
-/// another ruling, and one that reads cached blocks behind a live profile
-/// that is named no row. A shadow of the live profile's own sample and
-/// ruling is asked over the same rows.
+/// Rows are named for the live profile alone, by its sample, its
+/// warm-up ruling and the record of sent prefixes. A shadow profile that
+/// would be named other rows is not asked, and is counted as skipped: one
+/// of another sample, one of another ruling, one that reads the record
+/// where the live profile reads the index, and one that reads cached
+/// blocks behind a live profile that is named no row. A shadow of the
+/// live profile's own sample and ruling is asked over the same rows.
 #[test]
 fn a_shadow_that_would_be_named_other_rows_is_skipped() {
     let shadowed = |live: &str, turn: &dyn Fn(&mut ProfileSpec)| {
@@ -443,8 +444,17 @@ fn a_shadow_that_would_be_named_other_rows_is_skipped() {
         };
         twin.score[0] = ScoreStage::WarmupSlice(slice).into();
     };
+    let record = |twin: &mut ProfileSpec| {
+        let prefix = PrefixAffinityParams {
+            weight: 4.0,
+            source: Some(AffinitySource::Predictor),
+            ..PrefixAffinityParams::default()
+        };
+        twin.score[1] = ScoreStage::PrefixAffinity(prefix).into();
+    };
     assert_eq!(shadowed("cache_aware", &sample(8)), [0, 0, 0, 1]);
     assert_eq!(shadowed("cache_aware", &ruling), [0, 0, 0, 1]);
+    assert_eq!(shadowed("cache_aware", &record), [0, 0, 0, 1]);
     assert_eq!(shadowed("random", &|_| {}), [0, 0, 0, 1]);
     let same = shadowed("cache_aware", &sample(16));
     assert_eq!((same.iter().sum::<u64>(), same[3]), (1, 0), "{same:?}");
