@@ -1,12 +1,16 @@
 //! The holder of a replica's worker objects: it follows the store's
 //! membership and writes the registry. A host can also ask it to follow
-//! the rows' status.
+//! the rows' status, and to write the store's overload verdicts on the
+//! objects.
 
 use std::{
     collections::{HashMap, HashSet},
     fmt,
     sync::{
-        atomic::{AtomicU64, Ordering::Relaxed},
+        atomic::{
+            AtomicBool, AtomicU64,
+            Ordering::{Acquire, Relaxed, Release},
+        },
         Arc,
     },
 };
@@ -14,6 +18,7 @@ use std::{
 use parking_lot::{Mutex, RwLock};
 use smg_worker::{
     connection::engine::EngineConnector,
+    health::overload::{log_overload_edge, OverloadReading, OverloadThresholds},
     identity::{basic::Worker, endpoint::Endpoint},
     registry::{Generation, WorkerId as ObjectId, WorkerRegistry},
 };
@@ -26,8 +31,11 @@ use super::{
     object::{builder, dial_address, status, unchecked},
 };
 use crate::{
-    store::{MembershipChange, MembershipTail, Reachability, WorkerFacts, WorkerRow, WorkersStore},
-    view::WorkerId,
+    store::{
+        MembershipChange, MembershipTail, MemoryStore, Overload, Reachability, WorkerFacts,
+        WorkerRow, WorkersStore,
+    },
+    view::{LoadRow, WorkerId},
 };
 
 /// What a host keeps of a registry's generation when it derives nothing
@@ -245,6 +253,14 @@ pub struct Objects<G> {
     handing: Mutex<()>,
     /// How many lays found no object handed in where the host hands them.
     unhanded: AtomicU64,
+    /// The epoch of the store's overload verdicts the objects were last
+    /// held against ([`Self::mirror_overload`]). Held through a walk: one
+    /// mirrors at a time.
+    mirrored: Mutex<Option<u64>>,
+    /// Whether the registry took an object since the last walk began. Its
+    /// replacement releases a verdict and a new object starts with none,
+    /// so the next mirror walks whatever the epoch says.
+    mirror_owed: AtomicBool,
     /// Where the last read ended. Held through a read: one follows at a
     /// time.
     read_to: Mutex<Place>,
@@ -316,6 +332,8 @@ impl<G: Generation> Objects<G> {
             offered: Mutex::new(None),
             handing: Mutex::new(()),
             unhanded: AtomicU64::new(0),
+            mirrored: Mutex::new(None),
+            mirror_owed: AtomicBool::new(false),
             read_to: Mutex::new(Place::default()),
             held: RwLock::new(Held::default()),
         }
@@ -498,6 +516,71 @@ impl<G: Generation> Objects<G> {
     /// hand-in, and offers that did not state the row. Each one warned.
     pub fn unhanded(&self) -> u64 {
         self.unhanded.load(Relaxed)
+    }
+
+    /// Write the overload verdicts `store` publishes on the objects. An
+    /// object reads overloaded where any row of its worker is published
+    /// under a verdict, and clear where none is. The holder judges
+    /// nothing. The registry makes each write
+    /// ([`WorkerRegistry::set_worker_overloaded`]), so its counters and its
+    /// gauge move once an edge. An edge is said in the worker crate's one
+    /// line ([`log_overload_edge`]), under the source `policy store`.
+    ///
+    /// A host calls it behind each publication it makes. It walks the
+    /// objects only where the world's verdicts moved since the last walk
+    /// ([`World::overload_epoch`](crate::store::World::overload_epoch)), or
+    /// the registry took an object since. Return how many flags moved.
+    ///
+    /// Calls run one at a time, and each reads the world of its instant
+    /// inside that turn. A late caller so cannot write an older world's
+    /// verdicts over a newer one's, and a host needs no turn of its own
+    /// around the call. What the walk needs of the world is taken inside
+    /// its load, which is let go ahead of the registry's writes and the
+    /// edges' lines.
+    ///
+    /// The flag follows the world that shows a verdict by one call: a
+    /// world that a decision's own build published is mirrored at the
+    /// host's next.
+    ///
+    /// The line states the worker's published figures and the thresholds
+    /// its row names for itself. They need not explain the verdict. The
+    /// store judges an engine's ranks together, and under the pool's
+    /// thresholds where the row names none.
+    pub fn mirror_overload(&self, store: &MemoryStore) -> usize {
+        let mut mirrored = self.mirrored.lock();
+        // The objects whose flag is not their rows' verdict, each with the
+        // verdict and what its edge's line states.
+        let stale = store.with_world(|world| {
+            let owed = self.mirror_owed.swap(false, Acquire);
+            let epoch = world.overload_epoch();
+            if !owed && *mirrored == Some(epoch) {
+                return Vec::new();
+            }
+            *mirrored = Some(epoch);
+            let mut over: Vec<WorkerId> = world.overloaded().map(|row| row.id).collect();
+            over.sort_unstable();
+            let held = self.held.read();
+            let stale = held.rows.values().filter_map(|laid| {
+                let row = laid.standing.row;
+                let verdict = over.binary_search(&row).is_ok();
+                if laid.object.is_overloaded() == verdict {
+                    return None;
+                }
+                let own = held.facts.get(&row).map(|facts| facts.overload);
+                let load = world.first_row_of(row).and_then(|row| row.load);
+                let figures = reading(load, own.unwrap_or_default());
+                Some((Arc::clone(&laid.object), verdict, figures))
+            });
+            stale.collect::<Vec<_>>()
+        });
+        let mut edges = 0;
+        for (object, verdict, figures) in stale {
+            if self.registry.set_worker_overloaded(&object, verdict) {
+                edges += 1;
+                log_overload_edge(object.as_ref(), verdict, &figures, MIRRORED_FROM);
+            }
+        }
+        edges
     }
 
     /// The registry the objects stand in.
@@ -1012,11 +1095,36 @@ impl<G: Generation> Objects<G> {
             );
         }
         self.registry.register_or_replace(object);
+        // Behind the registry's write, and released to the mirror that
+        // takes it: a mirror that reads the mark finds the object in its
+        // place.
+        self.mirror_owed.store(true, Release);
         if handed {
             self.copy_status(store, row.id);
         } else {
             self.follow_status(store, row.id);
         }
+    }
+}
+
+/// Who judged a verdict the holder mirrors, as the edge's line says it.
+const MIRRORED_FROM: &str = "policy store";
+
+/// What the line of a mirrored edge states: the figures the worker's
+/// published row carries, zero where it has none, and the thresholds its
+/// row names for itself.
+fn reading(load: Option<LoadRow>, own: Overload) -> OverloadReading {
+    OverloadReading {
+        waiting_requests: load.map_or(0, |load| i64::from(load.queued)),
+        kv_pressure: load.map_or(0.0, |load| f64::from(load.active_kv_permille) / 1_000.0),
+        thresholds: OverloadThresholds {
+            waiting_requests: own
+                .waiting_requests
+                .map(|count| usize::try_from(count).unwrap_or(usize::MAX)),
+            token_usage: own
+                .kv_usage_permille
+                .map(|permille| f64::from(permille) / 1_000.0),
+        },
     }
 }
 
@@ -1027,7 +1135,7 @@ mod tests {
         collections::BTreeMap,
         sync::{mpsc, Barrier},
         thread,
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use smg_worker::{
@@ -1045,14 +1153,16 @@ mod tests {
 
     use super::*;
     use crate::{
+        spec::{BindingSpec, Match, OverloadSpec},
         store::{
-            GatewayId, HealthSink, Kinds, Maker, MemoryStore, WorkerFacts, WorkerPatch,
-            WorkerStatus,
+            GatewayId, HealthSink, Kinds, LoadSink as _, LoadSource, Maker, MemoryStore,
+            WorkerFacts, WorkerPatch, WorkerStatus,
         },
         worker_host::{
             facts as stated, object, Expect, HealthAdapter, KeptCredential, Membership, Over,
             SoleLead, StoreDoor,
         },
+        AppliedSpec, PolicySpec,
     };
 
     const A: &str = "http://a:8000";
@@ -3241,5 +3351,201 @@ mod tests {
         replica.follow();
         assert!(Arc::ptr_eq(&replica.at(B), &kept));
         assert_eq!(replica.objects.rank_row(lower, 1), Some(row.id));
+    }
+
+    // ---------------------------------------------- the overload mirror
+
+    /// A replica whose store shows each load write at once.
+    fn judging() -> Replica {
+        let mut replica = Replica::new();
+        replica.store = Arc::new(MemoryStore::with_publish_window(Duration::ZERO));
+        replica
+    }
+
+    /// [`facts`] of a worker that names a queue of two for itself.
+    fn bounded(key: &str) -> WorkerFacts {
+        WorkerFacts {
+            overload: Overload {
+                waiting_requests: Some(2),
+                kv_usage_permille: None,
+            },
+            ..facts(key, 1)
+        }
+    }
+
+    /// A generation that hands the pools of `model` a queue of two, and
+    /// every other pool no threshold.
+    fn bound(model: &str) -> AppliedSpec {
+        let mut document = PolicySpec::preset("round_robin").expect("a preset of this build");
+        document.generation = 1;
+        let profiles = &document.profiles;
+        let profile = profiles.keys().next().expect("the preset's profile");
+        let binding = |model: &str, overload| BindingSpec {
+            matcher: Match {
+                model: model.to_string(),
+                ..Match::default()
+            },
+            profile: Some(profile.clone()),
+            overload: Some(overload),
+            ..BindingSpec::default()
+        };
+        let two = OverloadSpec {
+            waiting_requests: Some(2),
+            ..OverloadSpec::default()
+        };
+        let off = OverloadSpec {
+            enabled: false,
+            ..OverloadSpec::default()
+        };
+        document.bindings = vec![binding(model, two), binding("*", off)];
+        AppliedSpec::validate(&document).expect("the document validates")
+    }
+
+    impl Replica {
+        /// A registered row with its object, and its build paid.
+        fn stand(&self, facts: WorkerFacts) -> WorkerId {
+            let row = self.register(facts, None);
+            self.follow();
+            self.store.publish_now();
+            row
+        }
+
+        /// A pushed record of `row`'s rank zero with `queued` requests
+        /// waiting.
+        fn push(&self, row: WorkerId, queued: u32) {
+            let load = LoadRow {
+                queued,
+                ..LoadRow::default()
+            };
+            self.store
+                .record(row, 0, load, Instant::now(), LoadSource::Stream);
+        }
+
+        fn mirror(&self) -> usize {
+            self.objects.mirror_overload(self.store.as_ref())
+        }
+
+        /// How many workers of the model the registry counts overloaded.
+        fn counted(&self) -> usize {
+            self.objects.registry().overloaded_worker_count("m")
+        }
+    }
+
+    #[test]
+    fn a_published_overload_verdict_is_written_on_the_object_once_an_edge() {
+        let replica = judging();
+        let row = replica.stand(bounded(A));
+        let worker = replica.at(A);
+        // Over the row's own count. The store judges and shows the verdict,
+        // and no flag moves until the host mirrors.
+        replica.push(row, 3);
+        assert!(!worker.is_overloaded());
+        assert_eq!(replica.mirror(), 1);
+        assert!(worker.is_overloaded());
+        assert_eq!(replica.counted(), 1);
+        // The verdict stands: nothing moves, and the count is moved once.
+        replica.push(row, 4);
+        assert_eq!(replica.mirror(), 0);
+        assert_eq!(replica.counted(), 1);
+        // The queue drains, and the next mirror clears the flag.
+        replica.push(row, 1);
+        assert_eq!(replica.mirror(), 1);
+        assert!(!worker.is_overloaded());
+        assert_eq!(replica.counted(), 0);
+    }
+
+    #[test]
+    fn a_world_of_the_same_verdicts_is_not_walked_again() {
+        let replica = judging();
+        let row = replica.stand(bounded(A));
+        let worker = replica.at(A);
+        replica.push(row, 3);
+        assert_eq!(replica.mirror(), 1);
+        // A flag moved behind the mirror shows whether a call walked.
+        let registry = replica.objects.registry();
+        assert!(registry.set_worker_overloaded(&worker, false));
+        // Another publication of the same verdicts is not walked.
+        replica.push(row, 4);
+        assert_eq!(replica.mirror(), 0);
+        assert!(!worker.is_overloaded());
+        // The verdict moves and moves back, and the walk writes the flag.
+        replica.push(row, 1);
+        assert_eq!(replica.mirror(), 0);
+        replica.push(row, 3);
+        assert_eq!(replica.mirror(), 1);
+        assert!(worker.is_overloaded());
+    }
+
+    #[test]
+    fn an_object_put_in_the_registry_owes_a_mirror_whatever_the_epoch() {
+        let replica = judging();
+        let row = replica.stand(bounded(A));
+        replica.push(row, 3);
+        assert_eq!(replica.mirror(), 1);
+        let first = replica.at(A);
+        // The row's labels move, and the holder replaces its object. The
+        // registry releases the verdict the first object carried. The
+        // build the write owes is not paid, so the world stands.
+        replica.patch(A, labels("gold"));
+        replica.follow();
+        let second = replica.at(A);
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert!(!second.is_overloaded());
+        assert_eq!(replica.counted(), 0);
+        // The mirror walks for the object, though no verdict moved.
+        assert_eq!(replica.mirror(), 1);
+        assert!(second.is_overloaded());
+        assert_eq!(replica.counted(), 1);
+    }
+
+    #[test]
+    fn a_worker_of_two_pools_reads_overloaded_where_one_of_its_rows_is() {
+        let replica = judging();
+        replica.store.apply(bound("m")).expect("applied");
+        let row = replica.stand(WorkerFacts {
+            models: vec!["m".to_string(), "n".to_string()],
+            ..facts(A, 1)
+        });
+        replica.push(row, 3);
+        let over = replica.store.with_world(|world| world.overloaded().count());
+        assert_eq!(over, 1, "one of the worker's two rows is under a verdict");
+        assert_eq!(replica.mirror(), 1);
+        assert!(replica.at(A).is_overloaded());
+    }
+
+    #[test]
+    fn a_mirrored_edge_is_said_in_the_worker_crates_line_under_the_stores_name() {
+        use tracing::{subscriber, Level};
+
+        let log = tempfile::NamedTempFile::new().expect("a file for this case");
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(Level::INFO)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(log.reopen().expect("the log writer"))
+            .finish();
+        let replica = judging();
+        let row = replica.stand(bounded(A));
+        let _kept = subscriber::set_default(subscriber);
+        replica.push(row, 3);
+        assert_eq!(replica.mirror(), 1);
+        replica.push(row, 1);
+        assert_eq!(replica.mirror(), 1);
+        let log = std::fs::read_to_string(log.path()).expect("the log text");
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 2, "{log}");
+        for (line, verdict, queued) in [(lines[0], "set", 3), (lines[1], "cleared", 1)] {
+            assert!(line.contains("smg_worker::load::monitor"), "{line}");
+            assert!(
+                line.contains(&format!("Worker overload veto {verdict}")),
+                "{line}"
+            );
+            assert!(
+                line.contains(&format!("waiting_requests={queued} ")),
+                "{line}"
+            );
+            assert!(line.contains("waiting_threshold=Some(2)"), "{line}");
+            assert!(line.contains(r#"source="policy store""#), "{line}");
+        }
     }
 }
