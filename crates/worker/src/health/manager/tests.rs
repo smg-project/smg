@@ -1373,6 +1373,258 @@ async fn a_brought_forward_read_never_lands_after_the_scheduled_one() {
     manager.shutdown().await;
 }
 
+/// The registry's sink with a note of every probe's outcome: the second it
+/// landed in, counted from the sink's making, and whether it passed. The
+/// registry judges each fact, so a status moves as under the plain start.
+struct TimedSink {
+    registry: Arc<WorkerRegistry>,
+    since: tokio::time::Instant,
+    reads: parking_lot::Mutex<Vec<(WorkerId, u64, bool)>>,
+}
+
+impl TimedSink {
+    fn over(registry: &Arc<WorkerRegistry>) -> Arc<Self> {
+        Arc::new(Self {
+            registry: Arc::clone(registry),
+            since: tokio::time::Instant::now(),
+            reads: parking_lot::Mutex::default(),
+        })
+    }
+
+    /// The reads of the worker under `worker_id`, in their order: the
+    /// second each landed in and whether it passed.
+    fn reads_of(&self, worker_id: &WorkerId) -> Vec<(u64, bool)> {
+        self.reads
+            .lock()
+            .iter()
+            .filter(|(id, ..)| id == worker_id)
+            .map(|(_, second, passed)| (*second, *passed))
+            .collect()
+    }
+}
+
+impl HealthSink for TimedSink {
+    fn probe_outcome(
+        &self,
+        worker_id: &WorkerId,
+        passed: bool,
+        revision: u64,
+        launched: WorkerStatus,
+    ) -> ProbeAnswer {
+        let second = self.since.elapsed().as_secs();
+        self.reads.lock().push((worker_id.clone(), second, passed));
+        self.registry
+            .probe_outcome(worker_id, passed, revision, launched)
+    }
+
+    fn connected(
+        &self,
+        worker_id: &WorkerId,
+        revision: u64,
+    ) -> Option<(WorkerStatus, WorkerStatus)> {
+        self.registry.connected(worker_id, revision)
+    }
+}
+
+/// The loop over `registry`, with its facts said to `sink`.
+fn manager_saying_to(registry: &Arc<WorkerRegistry>, sink: &Arc<TimedSink>) -> WorkerManager {
+    WorkerManager::maybe_start_with_sink(
+        registry.clone(),
+        sink.clone(),
+        test_config(),
+        None,
+        true,
+        false,
+    )
+    .expect("health checks on: the manager runs")
+}
+
+/// A gRPC worker whose engine answers its health call in process, healthy
+/// or not: readied on `success_threshold` reads, probed every
+/// `check_interval_secs`, with a probe timeout of `timeout_secs`. It
+/// opens no socket, so a case reads its schedule on a paused clock.
+fn in_process_worker(
+    url: &str,
+    healthy: bool,
+    success_threshold: u32,
+    check_interval_secs: u64,
+    timeout_secs: u64,
+) -> Arc<dyn Worker> {
+    Arc::new(
+        BasicWorkerBuilder::new(url)
+            .worker_type(WorkerType::Regular)
+            .connection_mode(ConnectionMode::Grpc)
+            .engine_connection(ScriptedAnswers::answering_health(Ok(HealthAnswer {
+                healthy,
+                message: String::new(),
+            })))
+            .health_config(HealthCheckConfig {
+                success_threshold,
+                failure_threshold: 3,
+                timeout_secs,
+                check_interval_secs,
+                disable_health_check: false,
+                drain_settle_secs: 0,
+            })
+            .build(),
+    )
+}
+
+/// A pending worker is readied on consecutive reads, not consecutive
+/// intervals. Through the running loop on a paused clock, with a
+/// threshold of two reads, a minute between probes and a five-second
+/// probe timeout: the registration's read passes one short of the
+/// threshold, and the read that readies the worker lands a probe's
+/// timeout later, not a minute later. Once ready, the worker is read an
+/// interval after that launch.
+#[tokio::test(start_paused = true)]
+async fn a_pending_worker_is_readied_on_consecutive_reads_not_consecutive_intervals() {
+    let registry = Arc::new(WorkerRegistry::new());
+    let sink = TimedSink::over(&registry);
+    let mut manager = manager_saying_to(&registry, &sink);
+
+    let worker = in_process_worker("grpc://new:1", true, 2, 60, 5);
+    assert_eq!(worker.status(), WorkerStatus::Pending);
+    let worker_id = registry.register(worker.clone()).unwrap();
+
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    assert_eq!(
+        sink.reads_of(&worker_id),
+        [(0, true), (5, true)],
+        "the registration's read, then the next a probe's timeout later"
+    );
+    assert_eq!(worker.status(), WorkerStatus::Ready);
+
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    assert_eq!(
+        sink.reads_of(&worker_id),
+        [(0, true), (5, true), (65, true)],
+        "a ready worker is read an interval after its last launch"
+    );
+
+    manager.shutdown().await;
+}
+
+/// The read a pending worker's pass brings forward never lands after the
+/// one the schedule already holds. With two seconds between probes and a
+/// five-second probe timeout, the read that readies the worker follows
+/// the interval, not the timeout.
+#[tokio::test(start_paused = true)]
+async fn a_pending_workers_read_is_brought_forward_and_never_pushed_back() {
+    let registry = Arc::new(WorkerRegistry::new());
+    let sink = TimedSink::over(&registry);
+    let mut manager = manager_saying_to(&registry, &sink);
+
+    let worker = in_process_worker("grpc://new:1", true, 2, 2, 5);
+    let worker_id = registry.register(worker.clone()).unwrap();
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        sink.reads_of(&worker_id),
+        [(0, true), (2, true)],
+        "the scheduled read an interval after the first, ahead of the timeout"
+    );
+    assert_eq!(worker.status(), WorkerStatus::Ready);
+
+    manager.shutdown().await;
+}
+
+/// A pending worker's failed read brings nothing forward. Its engine
+/// answers not healthy: the reads stay an interval apart, and the worker
+/// stays pending.
+#[tokio::test(start_paused = true)]
+async fn a_pending_workers_failed_read_keeps_its_interval() {
+    let registry = Arc::new(WorkerRegistry::new());
+    let sink = TimedSink::over(&registry);
+    let mut manager = manager_saying_to(&registry, &sink);
+
+    let worker = in_process_worker("grpc://down:1", false, 2, 60, 5);
+    let worker_id = registry.register(worker.clone()).unwrap();
+
+    tokio::time::sleep(Duration::from_secs(124)).await;
+    assert_eq!(
+        sink.reads_of(&worker_id),
+        [(0, false), (60, false), (120, false)],
+        "a failed read is followed an interval later"
+    );
+    assert_eq!(worker.status(), WorkerStatus::Pending);
+
+    manager.shutdown().await;
+}
+
+/// A worker that its handshake readies stays pending until that signal.
+/// Its probe reads the handshake, which has not landed, so each read
+/// fails: none is brought forward, and the reads stay an interval apart.
+/// The connect signal then readies the worker with no further read.
+#[tokio::test(start_paused = true)]
+async fn a_worker_its_handshake_readies_stays_pending_until_the_signal() {
+    let registry = Arc::new(WorkerRegistry::new());
+    let sink = TimedSink::over(&registry);
+    let mut manager = manager_saying_to(&registry, &sink);
+
+    let worker =
+        probed_worker_with_timeout("ipc:///tmp/pending.ipc", ConnectionMode::Zmq, 2, 60, 5);
+    let worker_id = registry.register(worker.clone()).unwrap();
+
+    tokio::time::sleep(Duration::from_secs(124)).await;
+    assert_eq!(
+        sink.reads_of(&worker_id),
+        [(0, false), (60, false), (120, false)],
+        "ahead of the handshake every read fails, an interval apart"
+    );
+    assert_eq!(worker.status(), WorkerStatus::Pending);
+
+    registry
+        .connect_signal_sender()
+        .send(WorkerSignal::Connected(WorkerConnected {
+            url: worker.url().to_string(),
+            revision: worker.revision(),
+        }))
+        .expect("the loop holds the receiver");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(worker.status(), WorkerStatus::Ready);
+    assert_eq!(
+        sink.reads_of(&worker_id).len(),
+        3,
+        "the signal readied the worker, not a read"
+    );
+
+    manager.shutdown().await;
+}
+
+/// A ready worker and a failed worker keep their read times. A ready
+/// worker's passes bring nothing forward: it is read at its registration,
+/// then once an interval. A failed worker whose engine answers again
+/// returns on two reads a probe's timeout apart, as before.
+#[tokio::test(start_paused = true)]
+async fn a_ready_worker_and_a_failed_worker_keep_their_read_times() {
+    let registry = Arc::new(WorkerRegistry::new());
+    let sink = TimedSink::over(&registry);
+    let mut manager = manager_saying_to(&registry, &sink);
+
+    let ready = in_process_worker("grpc://ready:1", true, 2, 60, 5);
+    ready.set_status(WorkerStatus::Ready);
+    let ready_id = registry.register(ready.clone()).unwrap();
+    let failed = in_process_worker("grpc://failed:1", true, 2, 60, 5);
+    failed.set_status(WorkerStatus::Failed);
+    let failed_id = registry.register(failed.clone()).unwrap();
+
+    tokio::time::sleep(Duration::from_secs(124)).await;
+    assert_eq!(
+        sink.reads_of(&ready_id),
+        [(0, true), (60, true), (120, true)],
+        "a ready worker is read once an interval"
+    );
+    assert_eq!(
+        sink.reads_of(&failed_id),
+        [(0, true), (5, true), (65, true)],
+        "a failed worker returns on its second read, a probe's timeout after the first"
+    );
+    assert_eq!(failed.status(), WorkerStatus::Ready);
+
+    manager.shutdown().await;
+}
+
 /// A worker whose probe interval is past what the clock can hold does not
 /// stop the loop: its registration probe reads, and a worker registered
 /// after it is probed on its own interval.

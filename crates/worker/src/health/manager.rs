@@ -7,10 +7,10 @@
 //! with a worker of a given status under the manager's configuration (a
 //! removed worker's slot and the lag recovery's rebuild are the only writes
 //! beside it). A worker's deadline is re-armed when its probe launches, and
-//! on its completion only to bring the next read of a demoted worker whose
-//! probe just passed to a probe's timeout from now (its return is
-//! consecutive reads, not consecutive intervals); `in_flight` keeps a slow
-//! probe from being joined by a second one.
+//! on its completion only to bring the next read of a pending or demoted
+//! worker whose probe just passed to a probe's timeout from now (a run of
+//! passes is consecutive reads, not consecutive intervals); `in_flight`
+//! keeps a slow probe from being joined by a second one.
 //!
 //! What a probe's outcome or a connect signal does to a worker's status
 //! crosses the port of [`super::port`]: this loop is the port's collector.
@@ -461,8 +461,8 @@ impl ProbeSlot {
 /// registration or replacement is probed without waiting an interval, so is
 /// a demoted worker a contact brings forward, and so is a worker the
 /// bootstrap finds without a verdict) or after its interval; any other slot
-/// leaves the schedule. (A demoted worker's passing probe short of
-/// its success threshold brings the next read to a probe timeout away, or
+/// leaves the schedule. (A pending or demoted worker's passing probe short
+/// of its success threshold brings the next read to a probe timeout away, or
 /// leaves an earlier deadline standing; that write is the health loop's own.)
 fn schedule_at(
     next_check: &mut HashMap<WorkerId, tokio::time::Instant>,
@@ -610,11 +610,19 @@ async fn run_health_loop<G: Generation>(
                     // launch. The status is the sink's answer, read where
                     // the outcome was judged: the loop does not read the
                     // worker object a second time for it.
+                    //
+                    // A pending worker is the same case under a sink that
+                    // readies a worker at its probes: its registration's
+                    // read passed, and it waited a whole interval for the
+                    // next. One that flaps is read toward its pending cap
+                    // sooner by the clock.
                     ProbeAnswer::Stood(status)
                         if probe_ok
                             && matches!(
                                 status,
-                                WorkerStatus::NotReady | WorkerStatus::Failed
+                                WorkerStatus::Pending
+                                    | WorkerStatus::NotReady
+                                    | WorkerStatus::Failed
                             ) =>
                     {
                         let slot = ProbeSlot::of_worker(
