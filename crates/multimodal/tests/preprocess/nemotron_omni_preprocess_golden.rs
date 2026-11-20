@@ -8,7 +8,9 @@
 //! seeded or fixture images and frames, and synthetic tones.
 //! Grids, clip frames and token counts must match exactly; values are checked
 //! at sampled positions and through their sums, within tolerances that cover
-//! the float resize order and the pure-Rust FFT.
+//! the float resize order and the pure-Rust FFT. The fixture holds pixels
+//! packed (`(patches, 3 * 16 * 16)` rows); the reference-layout processor's
+//! `(n, 3, H, W)` pixels are packed the same way to compare.
 #![allow(clippy::expect_used, clippy::panic)]
 #![expect(clippy::print_stdout, reason = "integration tests: diagnostic output")]
 
@@ -18,10 +20,11 @@ use llm_multimodal::{
     audio::{DecodedAudio, ParakeetAudioProcessor},
     encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs},
     vision::{
-        processors::NemotronOmniProcessor, transforms::rgb_bytes, VideoClipOptions,
-        VisionPreProcessor,
+        processors::{nemotron_omni::NemotronGeometry, NemotronOmniProcessor},
+        transforms::rgb_bytes,
+        VideoClipOptions, VisionPreProcessor,
     },
-    RgbFrameRef,
+    RgbFrameRef, VideoSamplingInfo,
 };
 use serde::Deserialize;
 
@@ -31,6 +34,8 @@ use super::make_seeded_image;
 const IMAGE_TOL: f64 = 1e-5;
 /// Log-mel features: pure-Rust `rustfft` against the torch STFT.
 const AUDIO_TOL: f64 = 2e-3;
+/// The checkpoint's patch side, in pixels.
+const PATCH: usize = 16;
 
 const GOLDEN: &str = include_str!("../fixtures/golden/nemotron_omni_preprocess.json");
 
@@ -146,6 +151,7 @@ fn assert_per_item(name: &str, out: &PreprocessedEncoderInputs, key: &str, expec
 fn images_match_the_reference_tiler() {
     let golden: Golden = serde_json::from_str(GOLDEN).expect("golden fixture parses");
     let processor = NemotronOmniProcessor::new();
+    let reference = reference_processor();
     for case in &golden.images {
         let (name, image) = match &case.source {
             Source::Seed {
@@ -186,6 +192,31 @@ fn images_match_the_reference_tiler() {
             &case.summary,
             IMAGE_TOL,
         );
+
+        // The reference layout holds the same pixels as `(1, 3, H, W)`.
+        let out = reference.preprocess(&[&image]).expect("image preprocesses");
+        assert_eq!(
+            out.feature_token_counts,
+            vec![case.tokens],
+            "{name}: reference tokens"
+        );
+        let [height, width] = [case.rows, case.cols].map(|v| v as u32 * PATCH as u32);
+        assert_eq!(
+            out.encoder_input.shape(),
+            [1, 3, height as usize, width as usize],
+            "{name}: reference shape"
+        );
+        assert!(
+            matches!(out.model_specific.get("imgs_sizes"), Some(ModelSpecificValue::TupleVec(sizes)) if sizes == &[(height, width)]),
+            "{name}: reference size"
+        );
+        let values = out.encoder_input.as_f32();
+        compare(
+            &name,
+            &packed(values.as_slice().expect("standard layout"), values.shape()),
+            &case.summary,
+            IMAGE_TOL,
+        );
     }
 }
 
@@ -193,6 +224,7 @@ fn images_match_the_reference_tiler() {
 fn video_frames_match_the_reference_sizing() {
     let golden: Golden = serde_json::from_str(GOLDEN).expect("golden fixture parses");
     let processor = NemotronOmniProcessor::new();
+    let reference = reference_processor();
     for case in &golden.videos {
         let VideoSource {
             width,
@@ -236,6 +268,37 @@ fn video_frames_match_the_reference_sizing() {
             &case.summary,
             IMAGE_TOL,
         );
+
+        // The reference layout holds the same frames as `(frames, 3, H, W)`.
+        let sampling = VideoSamplingInfo {
+            source_fps: 2.0,
+            frame_indices: (0..refs.len()).collect(),
+        };
+        let out = reference
+            .preprocess_video_rgb_sampled(
+                &refs,
+                &VideoClipOptions::sampled_at(2.0),
+                Some(&sampling),
+            )
+            .expect("video preprocesses");
+        assert_eq!(
+            out.feature_token_counts,
+            vec![case.tokens],
+            "{name}: reference tokens"
+        );
+        let [frames, height, width] = [0, 1, 2].map(|i| case.grid[i] as usize);
+        assert_eq!(
+            out.encoder_input.shape(),
+            [frames, 3, height * PATCH, width * PATCH],
+            "{name}: reference shape"
+        );
+        let values = out.encoder_input.as_f32();
+        compare(
+            &name,
+            &packed(values.as_slice().expect("standard layout"), values.shape()),
+            &case.summary,
+            IMAGE_TOL,
+        );
     }
 }
 
@@ -274,4 +337,44 @@ fn audio_matches_the_reference_extractor() {
             AUDIO_TOL,
         );
     }
+}
+
+/// The reference-layout processor for the checkpoint geometry the fixture was generated for.
+fn reference_processor() -> NemotronOmniProcessor {
+    NemotronOmniProcessor::reference(
+        NemotronGeometry::from_model_config(&serde_json::json!({
+            "patch_size": 16, "downsample_ratio": 0.5, "force_image_size": 512,
+            "norm_mean": [0.48145466, 0.4578275, 0.40821073],
+            "norm_std": [0.26862954, 0.26130258, 0.27577711],
+            "vision_config": {
+                "args": {"min_num_patches": 1024, "max_num_patches": 13312},
+                "video_target_num_patches": 1024,
+                "video_temporal_patch_size": 2,
+                "video_maintain_aspect_ratio": true
+            }
+        }))
+        .expect("checkpoint geometry"),
+    )
+}
+
+/// `(n, 3, H, W)` pixels as the engine's `DynamicResolutionImageTiler.stack`
+/// packs them: `c (py yy) (px xx) -> (py px) (c yy xx)` per image.
+fn packed(values: &[f32], shape: &[usize]) -> Vec<f32> {
+    let &[n, c, h, w] = shape else {
+        panic!("NCHW pixels, got {shape:?}")
+    };
+    let mut out = Vec::with_capacity(values.len());
+    for item in 0..n {
+        for py in 0..h / PATCH {
+            for px in 0..w / PATCH {
+                for channel in 0..c {
+                    for yy in 0..PATCH {
+                        let row = ((item * c + channel) * h + py * PATCH + yy) * w + px * PATCH;
+                        out.extend_from_slice(&values[row..row + PATCH]);
+                    }
+                }
+            }
+        }
+    }
+    out
 }
