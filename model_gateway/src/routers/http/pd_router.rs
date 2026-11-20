@@ -114,10 +114,22 @@ use crate::{
 /// [`PDRouter::handle_server_selection_error`].
 type PdPair = (Arc<dyn Worker>, Arc<dyn Worker>);
 
-/// Response extension: the side whose worker answered the attempt's 500
-/// itself (see [`PDRouter::settle_attempt`]).
+/// Response extension: the side that failed the attempt by itself. Its
+/// worker answered an error status before the side's first byte, or the
+/// call to it failed below HTTP, or its body was cut after a successful
+/// response head. The attempt is recorded on that side's worker alone
+/// ([`PDRouter::record_attempt_outcomes`]), and a worker's own 500 is settled
+/// on the request's ledger ([`PDRouter::settle_attempt`]).
 #[derive(Clone, Copy, Debug)]
 struct OwnFailure(PdSide);
+
+/// The side that failed the attempt by itself, when the answer names one.
+fn own_failure(response: &Response) -> Option<PdSide> {
+    response
+        .extensions()
+        .get::<OwnFailure>()
+        .map(|&OwnFailure(side)| side)
+}
 
 /// The load one admitted PD request holds. The Prefill guard is released
 /// when the Prefill phase ends; the Decode guard rides on the response body.
@@ -1082,6 +1094,7 @@ impl PDRouter {
                         Arc::clone(&prefill),
                         Arc::clone(&decode),
                         guards,
+                        ledger,
                     )
                     .await;
                 return self.settle_attempt(ledger, model_id, [&prefill, &decode], response);
@@ -1101,6 +1114,7 @@ impl PDRouter {
                     Arc::clone(&prefill),
                     Arc::clone(&decode),
                     guards,
+                    ledger,
                 )
                 .await;
             return self.settle_attempt(ledger, model_id, [&prefill, &decode], response);
@@ -1213,11 +1227,16 @@ impl PDRouter {
             response.status(),
             prefill_outcome,
             head_success_recorded(&response),
+            own_failure(&response),
         );
         self.settle_attempt(ledger, model_id, [&prefill, &decode], response)
     }
 
-    /// Record an attempt's outcome on both sides. On the early-commit path the
+    /// Record an attempt's outcome on both sides, or on one. A status one
+    /// side failed with by itself (`failed_side`, see [`OwnFailure`]) is
+    /// that worker's alone, as the sequential path records it: charged to
+    /// its partner too, one failing decode worker would open the breaker of
+    /// the healthy prefill worker beside it. On the early-commit path the
     /// drain records the prefill's once its body is known: the attempt's
     /// status is the decode's there, and recording it on the prefill would
     /// reset the failures the drain counts. A streamed decode head's success
@@ -1229,12 +1248,15 @@ impl PDRouter {
         status: StatusCode,
         prefill_outcome: PrefillOutcome,
         decode_head_recorded: bool,
+        failed_side: Option<PdSide>,
     ) {
-        let attempt_records_prefill = prefill_outcome == PrefillOutcome::FromStatus;
+        let attempt_records_prefill =
+            prefill_outcome == PrefillOutcome::FromStatus && failed_side != Some(PdSide::Decode);
+        let attempt_records_decode = failed_side != Some(PdSide::Prefill);
         if attempt_records_prefill {
             prefill.record_outcome(status.as_u16());
         }
-        if !(decode_head_recorded && status.is_success()) {
+        if attempt_records_decode && !(decode_head_recorded && status.is_success()) {
             decode.record_outcome(status.as_u16());
         }
 
@@ -1248,11 +1270,13 @@ impl PDRouter {
                     error_type,
                 );
             }
-            Metrics::record_worker_error(
-                metrics_labels::WORKER_DECODE,
-                metrics_labels::CONNECTION_HTTP,
-                error_type,
-            );
+            if attempt_records_decode {
+                Metrics::record_worker_error(
+                    metrics_labels::WORKER_DECODE,
+                    metrics_labels::CONNECTION_HTTP,
+                    error_type,
+                );
+            }
         }
     }
 
@@ -1266,10 +1290,10 @@ impl PDRouter {
     /// status's body as the envelope, not as events. An error body that
     /// cannot be read says so in the detail.
     ///
-    /// The answer is marked as the worker's own. Its 500 is definitive for
-    /// the payload and names the side for the request's ledger
-    /// ([`Self::settle_attempt`]). Its other statuses name no side and are
-    /// replayed as before.
+    /// The answer is marked as the worker's own and as the side's own
+    /// failure ([`OwnFailure`]). Its 500 is definitive for the payload and
+    /// is settled on the request's ledger ([`Self::settle_attempt`]). Its
+    /// other statuses are replayed as before.
     async fn side_refused(side: PdSide, response: reqwest::Response) -> Response {
         let status = response.status();
         // Taken before the body read consumes the response.
@@ -1286,9 +1310,7 @@ impl PDRouter {
             answer.headers_mut().insert(RETRY_AFTER, value);
         }
         mark_upstream_answer(&mut answer);
-        if is_definitive_failure(&answer) {
-            answer.extensions_mut().insert(OwnFailure(side));
-        }
+        answer.extensions_mut().insert(OwnFailure(side));
         answer
     }
 
@@ -1321,7 +1343,8 @@ impl PDRouter {
         pair: [&Arc<dyn Worker>; 2],
         mut response: Response,
     ) -> Response {
-        let Some(&OwnFailure(side)) = response.extensions().get::<OwnFailure>() else {
+        // Of a side's own failures only its worker's own 500 is definitive.
+        let Some(side) = own_failure(&response).filter(|_| is_definitive_failure(&response)) else {
             return response;
         };
         let [prefill, decode] = pair;
@@ -1356,10 +1379,14 @@ impl PDRouter {
     /// The decode side's response head, once the prefill side is done with:
     /// the side's outcome recorded (a streamed head's success is the relay's
     /// to record, before it spawns its task, see `create_streaming_response`;
-    /// the other outcomes here, before the body is forwarded), an error
-    /// status answered, the PD TTFT taken from the dispatch to this head
-    /// (the prefill wait is part of what the client experiences), and the
-    /// body forwarded.
+    /// a non-streamed success is recorded after its body is read), an error
+    /// status answered, the PD TTFT taken from the dispatch to this head (the
+    /// prefill wait is part of what the client experiences), and the body
+    /// forwarded.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the sequential decode handoff carries its request ledger"
+    )]
     async fn forward_decode_head(
         &self,
         decode_response: reqwest::Response,
@@ -1368,13 +1395,17 @@ impl PDRouter {
         decode_guard: WorkerLoadGuard,
         runtime: &'static str,
         dispatch_start: Instant,
+        ledger: &AttemptLedger,
     ) -> Response {
         events::RequestReceivedEvent {}.emit();
         let status = decode_response.status();
-        if !(context.is_stream && status.is_success()) {
-            Self::record_sequential_side(decode.as_ref(), metrics_labels::WORKER_DECODE, status);
-        }
         if !status.is_success() {
+            Self::record_sequential_side(
+                ledger,
+                decode.as_ref(),
+                metrics_labels::WORKER_DECODE,
+                status,
+            );
             return Self::decode_refused(decode.as_ref(), decode_response).await;
         }
         Metrics::record_pd_ttft(
@@ -1383,8 +1414,15 @@ impl PDRouter {
             runtime,
             dispatch_start.elapsed(),
         );
-        self.forward_decode_body(decode_response, status, context, decode, decode_guard, None)
-            .await
+        self.forward_decode_body(
+            decode_response,
+            context,
+            decode,
+            decode_guard,
+            None,
+            Some(ledger),
+        )
+        .await
     }
 
     /// A side the request's own timeout cut (see `retry::is_request_timeout`):
@@ -1392,6 +1430,7 @@ impl PDRouter {
     /// side's worker as the timeout, answered as the gateway's 504, which the
     /// retry layer does not replay on another pair.
     fn side_timed_out(
+        ledger: &AttemptLedger,
         worker: &dyn Worker,
         role: &'static str,
         what: &str,
@@ -1402,7 +1441,7 @@ impl PDRouter {
             "PD {what} timed out: {}",
             cause(e)
         );
-        Self::record_sequential_side(worker, role, StatusCode::GATEWAY_TIMEOUT);
+        Self::record_sequential_side(ledger, worker, role, StatusCode::GATEWAY_TIMEOUT);
         request_timeout_response(format!("{what} timed out: {}", cause(e)))
     }
 
@@ -1414,6 +1453,7 @@ impl PDRouter {
     /// the shared vocabulary (see `pd_failure`) with the transport's reason
     /// and its causes. `what` names the call in the log and the timeout.
     fn side_failed_below_http(
+        ledger: &AttemptLedger,
         side: PdSide,
         phase: SidePhase,
         what: &str,
@@ -1421,7 +1461,7 @@ impl PDRouter {
         e: &reqwest::Error,
     ) -> Response {
         if is_request_timeout(e) {
-            return Self::side_timed_out(worker, side.name(), what, e);
+            return Self::side_timed_out(ledger, worker, side.name(), what, e);
         }
         error!(
             worker = Endpoint::redacted_str(worker.url()),
@@ -1429,13 +1469,18 @@ impl PDRouter {
             "PD {what} failed below HTTP: {}",
             cause(e)
         );
-        Self::record_sequential_side(worker, side.name(), StatusCode::BAD_GATEWAY);
+        Self::record_sequential_side(ledger, worker, side.name(), StatusCode::BAD_GATEWAY);
         side.answer(phase, StatusCode::BAD_GATEWAY, cause(e))
     }
 
     /// A prefill side whose call failed below HTTP before its first byte.
-    fn prefill_transport_failed(prefill: &dyn Worker, e: &reqwest::Error) -> Response {
+    fn prefill_transport_failed(
+        ledger: &AttemptLedger,
+        prefill: &dyn Worker,
+        e: &reqwest::Error,
+    ) -> Response {
         Self::side_failed_below_http(
+            ledger,
             PdSide::Prefill,
             SidePhase::Start,
             "Prefill request",
@@ -1446,8 +1491,13 @@ impl PDRouter {
 
     /// A prefill side whose answer could not be read to its end: its stream
     /// failed after it began.
-    fn prefill_read_failed(prefill: &dyn Worker, e: &reqwest::Error) -> Response {
+    fn prefill_read_failed(
+        ledger: &AttemptLedger,
+        prefill: &dyn Worker,
+        e: &reqwest::Error,
+    ) -> Response {
         Self::side_failed_below_http(
+            ledger,
             PdSide::Prefill,
             SidePhase::Stream,
             "Prefill response",
@@ -1457,8 +1507,13 @@ impl PDRouter {
     }
 
     /// A decode side whose call failed below HTTP before its first byte.
-    fn decode_transport_failed(decode: &dyn Worker, e: &reqwest::Error) -> Response {
+    fn decode_transport_failed(
+        ledger: &AttemptLedger,
+        decode: &dyn Worker,
+        e: &reqwest::Error,
+    ) -> Response {
         Self::side_failed_below_http(
+            ledger,
             PdSide::Decode,
             SidePhase::Start,
             "Decode request",
@@ -1616,8 +1671,8 @@ impl PDRouter {
                     PdSide::Decode => &decode,
                 };
                 // The request's own timeout on either side is the request's
-                // end (see `retry::request_timeout_response`); the caller
-                // records the 504 on both workers as it records every status.
+                // end (see `retry::request_timeout_response`). It names no
+                // side, so the caller records the 504 on both workers.
                 if is_request_timeout(&e) {
                     error!(
                         worker = Endpoint::redacted_str(worker.url()),
@@ -1634,9 +1689,11 @@ impl PDRouter {
                     side.name(),
                     cause(&e)
                 );
-                // Don't record_outcome here — the caller (execute_dual_dispatch)
-                // records outcomes from the response status after we return.
-                return side.answer(SidePhase::Start, StatusCode::BAD_GATEWAY, cause(&e));
+                // Not recorded here: the caller records the response status
+                // after we return, on this side's worker alone.
+                let mut answer = side.answer(SidePhase::Start, StatusCode::BAD_GATEWAY, cause(&e));
+                answer.extensions_mut().insert(OwnFailure(side));
+                return answer;
             }
             Err(DispatchError::Prefill(response)) => return response,
             Err(DispatchError::Decode(response)) => {
@@ -1670,11 +1727,11 @@ impl PDRouter {
         };
         self.forward_decode_body(
             decode_response,
-            status,
             &context,
             decode,
             decode_guard,
             prefill_body,
+            None,
         )
         .await
     }
@@ -1837,6 +1894,7 @@ impl PDRouter {
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
         guards: PdLoadGuards,
+        ledger: &AttemptLedger,
     ) -> Response {
         let PdSetup {
             prefill_body,
@@ -1874,7 +1932,7 @@ impl PDRouter {
                 dp_rank,
             );
             let prefill_bytes =
-                match Self::prefill_side_bytes(prefill.as_ref(), prefill_request).await {
+                match Self::prefill_side_bytes(ledger, prefill.as_ref(), prefill_request).await {
                     Ok(bytes) => bytes,
                     Err(refusal) => return refusal,
                 };
@@ -1983,7 +2041,7 @@ impl PDRouter {
         );
         let decode_response = match send_with_stale_conn_retry(decode_request).await {
             Ok(response) => response,
-            Err(e) => return Self::decode_transport_failed(decode.as_ref(), &e),
+            Err(e) => return Self::decode_transport_failed(ledger, decode.as_ref(), &e),
         };
 
         self.forward_decode_head(
@@ -1993,6 +2051,7 @@ impl PDRouter {
             decode_guard,
             runtime,
             dispatch_start,
+            ledger,
         )
         .await
     }
@@ -2020,6 +2079,7 @@ impl PDRouter {
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
         guards: PdLoadGuards,
+        ledger: &AttemptLedger,
     ) -> Response {
         let PdSetup {
             prefill_body,
@@ -2052,7 +2112,7 @@ impl PDRouter {
             headers,
             dp_rank,
         );
-        let prefill_side = Self::prefill_side_bytes(prefill.as_ref(), prefill_request);
+        let prefill_side = Self::prefill_side_bytes(ledger, prefill.as_ref(), prefill_request);
         let decode_side = send_with_stale_conn_retry(decode_request);
         tokio::pin!(decode_side);
 
@@ -2068,7 +2128,9 @@ impl PDRouter {
                             decode_head = Some(response);
                         }
                         Ok(response) => break Err(response),
-                        Err(e) => return Self::decode_transport_failed(decode.as_ref(), &e),
+                        Err(e) => {
+                            return Self::decode_transport_failed(ledger, decode.as_ref(), &e);
+                        }
                     },
                 }
             }
@@ -2115,7 +2177,9 @@ impl PDRouter {
                     Some(response) => response,
                     None => match decode_side.await {
                         Ok(response) => response,
-                        Err(e) => return Self::decode_transport_failed(decode.as_ref(), &e),
+                        Err(e) => {
+                            return Self::decode_transport_failed(ledger, decode.as_ref(), &e);
+                        }
                     },
                 }
             }
@@ -2127,6 +2191,7 @@ impl PDRouter {
             decode_guard,
             runtime,
             dispatch_start,
+            ledger,
         )
         .await
     }
@@ -2135,12 +2200,13 @@ impl PDRouter {
     /// refused on an error status, read whole and recorded on its worker. The
     /// error is the response the client is answered with.
     async fn prefill_side_bytes(
+        ledger: &AttemptLedger,
         prefill: &dyn Worker,
         request: reqwest::RequestBuilder,
     ) -> Result<Bytes, Response> {
         let response = match send_with_stale_conn_retry(request).await {
             Ok(response) => response,
-            Err(e) => return Err(Self::prefill_transport_failed(prefill, &e)),
+            Err(e) => return Err(Self::prefill_transport_failed(ledger, prefill, &e)),
         };
         let status = response.status();
         if !status.is_success() {
@@ -2149,22 +2215,32 @@ impl PDRouter {
                 prefill.redacted_url(),
                 status
             );
-            Self::record_sequential_side(prefill, metrics_labels::WORKER_PREFILL, status);
+            Self::record_sequential_side(ledger, prefill, metrics_labels::WORKER_PREFILL, status);
             return Err(Self::side_refused(PdSide::Prefill, response).await);
         }
         match response.bytes().await {
             Ok(bytes) => {
-                Self::record_sequential_side(prefill, metrics_labels::WORKER_PREFILL, status);
+                Self::record_sequential_side(
+                    ledger,
+                    prefill,
+                    metrics_labels::WORKER_PREFILL,
+                    status,
+                );
                 Ok(bytes)
             }
-            Err(e) => Err(Self::prefill_read_failed(prefill, &e)),
+            Err(e) => Err(Self::prefill_read_failed(ledger, prefill, &e)),
         }
     }
 
     /// Per-side outcome accounting for the sequential path: a side that was
     /// never contacted must not feed the other worker's circuit breaker.
-    fn record_sequential_side(worker: &dyn Worker, role: &'static str, status: StatusCode) {
-        worker.record_outcome(status.as_u16());
+    fn record_sequential_side(
+        ledger: &AttemptLedger,
+        worker: &dyn Worker,
+        role: &'static str,
+        status: StatusCode,
+    ) {
+        ledger.record_outcome(worker, status.as_u16());
         if status.is_server_error() {
             Metrics::record_worker_error(
                 role,
@@ -2177,15 +2253,18 @@ impl PDRouter {
     /// Forward a successful decode response to the client, streaming or not,
     /// merging prefill logprobs when requested. Shared by the parallel and
     /// sequential PD dispatch paths.
+    /// `outcome_ledger` records an unstreamed answer's status on the decode
+    /// worker here when the caller does not record the attempt itself.
     async fn forward_decode_body(
         &self,
         decode_response: reqwest::Response,
-        status: StatusCode,
         context: &PDRequestContext<'_>,
         decode: Arc<dyn Worker>,
         decode_guard: WorkerLoadGuard,
         prefill_body: Option<Bytes>,
+        outcome_ledger: Option<&AttemptLedger>,
     ) -> Response {
+        let status = decode_response.status();
         if context.is_stream {
             // Streaming response
             let prefill_logprobs = if context.return_logprob {
@@ -2247,7 +2326,13 @@ impl PDRouter {
                             "Failed to read decode response: {}",
                             cause(&e)
                         );
-                        PdSide::Decode.answer(SidePhase::Stream, StatusCode::BAD_GATEWAY, cause(&e))
+                        let mut answer = PdSide::Decode.answer(
+                            SidePhase::Stream,
+                            StatusCode::BAD_GATEWAY,
+                            cause(&e),
+                        );
+                        answer.extensions_mut().insert(OwnFailure(PdSide::Decode));
+                        answer
                     }
                 }
             };
@@ -2255,6 +2340,14 @@ impl PDRouter {
             // The decode worker is the one that produced the body the client
             // sees, on both the merged-logprob and passthrough paths.
             header_utils::insert_routed_worker_id(response.headers_mut(), decode.redacted_url());
+            if let Some(ledger) = outcome_ledger {
+                Self::record_sequential_side(
+                    ledger,
+                    decode.as_ref(),
+                    metrics_labels::WORKER_DECODE,
+                    response.status(),
+                );
+            }
             response
         }
     }
@@ -2483,11 +2576,10 @@ impl PDRouter {
                     "Failed to read decode response: {}",
                     cause(&e)
                 );
-                return PdSide::Decode.answer(
-                    SidePhase::Stream,
-                    StatusCode::BAD_GATEWAY,
-                    cause(&e),
-                );
+                let mut answer =
+                    PdSide::Decode.answer(SidePhase::Stream, StatusCode::BAD_GATEWAY, cause(&e));
+                answer.extensions_mut().insert(OwnFailure(PdSide::Decode));
+                return answer;
             }
         };
 
@@ -3273,8 +3365,10 @@ mod tests {
             error.url().is_some(),
             "reqwest attaches the URL to the error"
         );
+        let ledger = AttemptLedger::default();
 
         let response = PDRouter::side_failed_below_http(
+            &ledger,
             PdSide::Prefill,
             SidePhase::Start,
             "prefill request",
@@ -3312,8 +3406,10 @@ mod tests {
             .unwrap_err();
         drop(listener);
         assert!(is_request_timeout(&error));
+        let ledger = AttemptLedger::default();
 
         let response = PDRouter::side_failed_below_http(
+            &ledger,
             PdSide::Decode,
             SidePhase::Start,
             "decode request",
@@ -5246,6 +5342,7 @@ mod tests {
                     StatusCode::OK,
                     outcome,
                     false,
+                    None,
                 );
             }
             assert_eq!(!prefill.circuit_breaker_can_execute(), trips, "{outcome:?}");
@@ -7656,6 +7753,7 @@ mod tests {
             StatusCode::OK,
             PrefillOutcome::FromStatus,
             true,
+            None,
         );
         assert_eq!(recorded.circuit_breaker_state(), CircuitState::HalfOpen);
 
@@ -7666,6 +7764,7 @@ mod tests {
             StatusCode::OK,
             PrefillOutcome::FromStatus,
             false,
+            None,
         );
         assert_eq!(unrecorded.circuit_breaker_state(), CircuitState::Closed);
     }
@@ -8942,6 +9041,175 @@ mod tests {
             (response.status(), refused.lock().unwrap().len()),
             (StatusCode::INTERNAL_SERVER_ERROR, 1),
             "the answer, the attempts on the refusing decode worker"
+        );
+    }
+
+    /// On the parallel dispatch a status one side fails with by itself is
+    /// recorded on that side's worker alone, as the sequential path and the
+    /// gRPC prefill-decode route record it: its own error status, or a call
+    /// to it that failed below HTTP, including a successful response whose
+    /// body was cut. Every worker's breaker opens on its first failure here,
+    /// so a charge to either side shows: the failing side's is open after one
+    /// request and its partner's is closed.
+    /// Charged with its partner's failure, a healthy worker leaves the
+    /// rotation with the failing one.
+    #[tokio::test]
+    async fn a_sides_own_failure_is_charged_to_its_worker_alone() {
+        use Fault::{CutAfterHead, Refuses, Unreachable};
+        use PdSide::{Decode, Prefill};
+
+        let rows = [
+            (Decode, Refuses(StatusCode::INTERNAL_SERVER_ERROR)),
+            (Decode, Unreachable),
+            (Decode, CutAfterHead),
+            (Prefill, Refuses(StatusCode::INTERNAL_SERVER_ERROR)),
+            (Prefill, Unreachable),
+        ];
+        let mut mismatches = Vec::new();
+        for (side, fault) in rows {
+            let (failing_url, _refusing) = faulty_stub(fault).await;
+            let healthy_url = healthy_stub(Shape::Parallel, side.partner()).await;
+            let failing = fragile_worker(
+                failing_url,
+                match side {
+                    Prefill => WorkerType::Prefill,
+                    Decode => WorkerType::Decode,
+                },
+            );
+            let partner = fragile_worker(
+                healthy_url,
+                match side {
+                    Prefill => WorkerType::Decode,
+                    Decode => WorkerType::Prefill,
+                },
+            );
+            let router = single_attempt_router();
+            for worker in [&failing, &partner] {
+                router
+                    .worker_registry
+                    .register_or_replace(Arc::clone(worker));
+            }
+
+            let response = chat_through(&router, false).await;
+
+            let charged = (
+                !failing.circuit_breaker_can_execute(),
+                !partner.circuit_breaker_can_execute(),
+            );
+            if response.status().is_success() || charged != (true, false) {
+                mismatches.push(format!(
+                    "{side:?} {fault:?}: {}, the failing side's breaker open: {}, its partner's breaker open: {}",
+                    response.status(),
+                    charged.0,
+                    charged.1
+                ));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "a side's own failure is not its worker's alone:\n{}",
+            mismatches.join("\n")
+        );
+    }
+
+    /// A non-streamed decode body cut on the sequential path is the decode
+    /// worker's failure, not the successful response head recorded earlier.
+    #[tokio::test]
+    async fn a_sequential_decode_cut_is_charged_to_the_decode_worker() {
+        let (decode_url, _refusing) = faulty_stub(Fault::CutAfterHead).await;
+        let prefill_url = healthy_stub(Shape::Sequential, PdSide::Prefill).await;
+        let prefill: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(prefill_url)
+                .worker_type(WorkerType::Prefill)
+                .runtime_type(RuntimeType::Vllm)
+                .kv_connector("NixlConnector")
+                .circuit_breaker_config(CircuitBreakerConfig {
+                    failure_threshold: 1,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        let decode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(decode_url)
+                .worker_type(WorkerType::Decode)
+                .runtime_type(RuntimeType::Vllm)
+                .circuit_breaker_config(CircuitBreakerConfig {
+                    failure_threshold: 1,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        let router = single_attempt_router();
+        for worker in [&prefill, &decode] {
+            worker.set_status(openai_protocol::worker::WorkerStatus::Ready);
+            router
+                .worker_registry
+                .register_or_replace(Arc::clone(worker));
+        }
+
+        let response = chat_through(&router, false).await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(
+            prefill.circuit_breaker_can_execute(),
+            "the decode's cut is charged to the prefill worker"
+        );
+        assert!(!decode.circuit_breaker_can_execute());
+    }
+
+    /// Retrying one request after its sequential decode body is cut charges
+    /// that request to the decode worker once, not once per attempt.
+    #[tokio::test]
+    async fn retried_sequential_decode_cuts_charge_one_breaker_failure() {
+        let (decode_url, _refusing) = faulty_stub(Fault::CutAfterHead).await;
+        let (prefill_url, attempts) =
+            spawn_recording_stub(healthy_answer(Shape::Sequential, PdSide::Prefill)).await;
+        let prefill: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(prefill_url)
+                .worker_type(WorkerType::Prefill)
+                .runtime_type(RuntimeType::Vllm)
+                .kv_connector("NixlConnector")
+                .build(),
+        );
+        let decode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(decode_url)
+                .worker_type(WorkerType::Decode)
+                .runtime_type(RuntimeType::Vllm)
+                .circuit_breaker_config(CircuitBreakerConfig {
+                    failure_threshold: 2,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        let router = PDRouter {
+            retry_config: RetryConfig {
+                max_retries: 2,
+                initial_backoff_ms: 1,
+                max_backoff_ms: 1,
+                ..Default::default()
+            },
+            ..create_test_pd_router()
+        };
+        for worker in [&prefill, &decode] {
+            worker.set_status(openai_protocol::worker::WorkerStatus::Ready);
+            router
+                .worker_registry
+                .register_or_replace(Arc::clone(worker));
+        }
+
+        let response = chat_through(&router, false).await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            attempts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            2
+        );
+        assert!(
+            decode.circuit_breaker_can_execute(),
+            "one request's retried decode cuts opened the breaker"
         );
     }
 
