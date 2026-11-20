@@ -1958,10 +1958,13 @@ pub struct SignalSpec {
     /// The unit a source states for its value to be taken: 1 to 31 bytes.
     #[schemars(length(min = 1, max = 31))]
     pub unit: String,
-    /// A value older than this reads as no value. Absent: a value does
+    /// A value older than this reads as no value: 1 to 3,599,999, the
+    /// bound of the view's `max_report_age_ms`. A store's clock keeps one
+    /// hour, and a sample older than that stands at the clock's origin:
+    /// under a longer limit it would read as fresh. Absent: a value does
     /// not end by its age.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1, max = MAX_REPORT_AGE_MS))]
     pub max_age_ms: Option<u32>,
 }
 
@@ -1970,6 +1973,9 @@ pub const MAX_SIGNALS: usize = 64;
 
 /// The most bytes a signal's name takes.
 const MAX_SIGNAL_NAME: usize = 63;
+
+/// A signal's name as the schema states it: what [`check_signals`] takes.
+const SIGNAL_NAME_PATTERN: &str = "^[a-z][a-z0-9_]{0,62}$";
 
 /// The most bytes a signal's unit takes.
 const MAX_SIGNAL_UNIT: usize = 31;
@@ -2017,7 +2023,10 @@ pub struct PolicySpec {
         deserialize_with = "keyed_once",
         skip_serializing_if = "BTreeMap::is_empty"
     )]
-    #[schemars(extend("maxProperties" = 64))]
+    #[schemars(extend(
+        "maxProperties" = MAX_SIGNALS,
+        "propertyNames" = { "pattern": SIGNAL_NAME_PATTERN }
+    ))]
     pub signals: BTreeMap<String, SignalSpec>,
     /// The profiles by name.
     #[serde(deserialize_with = "keyed_once")]
@@ -2444,9 +2453,9 @@ fn check_index(index: &BTreeMap<String, IndexSpec>, view: &ViewSpec) -> Result<(
 
 /// The `signals` section's checks, each refused by its path: at most
 /// [`MAX_SIGNALS`] names, each a lower-case identifier of at most 63
-/// bytes, a unit of 1 to 31 bytes, and a maximum age above zero where one
-/// is written. A signal no stage reads is allowed: a host's own stage may
-/// read it.
+/// bytes, a unit of 1 to 31 bytes, and a maximum age of 1 to 3,599,999
+/// where one is written. A signal no stage reads is allowed: a host's own
+/// stage may read it.
 fn check_signals(signals: &BTreeMap<String, SignalSpec>) -> Result<(), SpecError> {
     if signals.len() > MAX_SIGNALS {
         return Err(SpecError::TooManyListed {
@@ -2476,8 +2485,12 @@ fn check_signals(signals: &BTreeMap<String, SignalSpec>) -> Result<(), SpecError
                 "a unit of 1 to 31 bytes",
             ));
         }
-        if spec.max_age_ms == Some(0) {
-            return Err(at().bad("max_age_ms", 0, "above zero"));
+        match spec.max_age_ms {
+            Some(0) => return Err(at().bad("max_age_ms", 0, "above zero")),
+            Some(ms) if ms > MAX_REPORT_AGE_MS => {
+                return Err(at().bad("max_age_ms", ms, "a whole number from 1 to 3599999"));
+            }
+            _ => {}
         }
     }
     Ok(())

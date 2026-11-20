@@ -923,6 +923,20 @@ fn an_admitted_row_outside_the_hosts_cells_takes_cells_of_no_value() {
     assert!(admitted.cells.fits(1));
 }
 
+#[test]
+fn a_hosts_count_past_the_cap_asks_the_admitted_copy_for_no_cell() {
+    let mut admitted = Admitted {
+        from: vec![0, 1, 2],
+        ..Admitted::default()
+    };
+    // No cells, and a count no document holds: a copy under that count
+    // would write as many empty cells for each admitted row.
+    let past = crate::spec::MAX_SIGNALS + 1;
+    admitted.copy_cells(&SignalCells::new(Vec::new(), past));
+    assert_eq!(admitted.cells.signals(), 0);
+    assert!(admitted.cells.fits(3), "no cell for any admitted row");
+}
+
 /// The decision of `bed` over a fresh scratch under `table`, and the words
 /// each of the encode side's four sets of bits holds after it: the open and
 /// the member encode classes, the decodes' classes and those that take

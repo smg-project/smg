@@ -32,7 +32,10 @@
       "additionalProperties": {
         "$ref": "#/$defs/SignalSpec"
       },
-      "maxProperties": 64
+      "maxProperties": 64,
+      "propertyNames": {
+        "pattern": "^[a-z][a-z0-9_]{0,62}$"
+      }
     },
     "profiles": {
       "description": "The profiles by name.",
@@ -199,13 +202,14 @@
           "maxLength": 31
         },
         "max_age_ms": {
-          "description": "A value older than this reads as no value. Absent: a value does\nnot end by its age.",
+          "description": "A value older than this reads as no value: 1 to 3,599,999, the\nbound of the view's `max_report_age_ms`. A store's clock keeps one\nhour, and a sample older than that stands at the clock's origin:\nunder a longer limit it would read as fresh. Absent: a value does\nnot end by its age.",
           "type": [
             "integer",
             "null"
           ],
           "format": "uint32",
-          "minimum": 1
+          "minimum": 1,
+          "maximum": 3599999
         }
       },
       "additionalProperties": false,

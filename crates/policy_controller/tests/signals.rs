@@ -218,8 +218,18 @@ fn the_signals_section_refuses_each_bad_entry_by_its_path() {
         refusal("  held: { unit: tokens, max_age_ms: 0 }\n"),
         "signals.held.max_age_ms = 0 is not above zero"
     );
-    // The longest name, the longest unit and the most signals are taken.
-    let longest = format!("  {}: {{ unit: {} }}\n", "a".repeat(63), "u".repeat(31));
+    // An hour is the store's clock: a limit of an hour or more is refused.
+    assert_eq!(
+        refusal("  held: { unit: tokens, max_age_ms: 3600000 }\n"),
+        "signals.held.max_age_ms = 3600000 is not a whole number from 1 to 3599999"
+    );
+    // The longest name, the longest unit, the longest age and the most
+    // signals are taken.
+    let longest = format!(
+        "  {}: {{ unit: {}, max_age_ms: 3599999 }}\n",
+        "a".repeat(63),
+        "u".repeat(31)
+    );
     let most: String = (1..MAX_SIGNALS)
         .map(|n| format!("  s{n}: {{ unit: tokens }}\n"))
         .collect();
@@ -284,6 +294,28 @@ fn a_stage_reads_each_rows_value_by_its_position_and_none_past_its_age() {
             (34, Some(4.0), Some(40.0)),
         ]
     );
+}
+
+#[test]
+fn a_cell_of_no_number_reads_as_no_value_whatever_its_instant() {
+    let rows = rows(&[31]);
+    // Sampled this instant, and no number: the cell of no value under
+    // another stamp. The largest finite value is a value.
+    let cells = [cell(f64::NAN, 0), cell(f64::MAX, 0)];
+    assert_eq!(
+        reads(&rows, Some(&SignalCells::new(cells.to_vec(), 2))),
+        [(31, Some(f64::MAX), None)]
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "a signal's value is finite: no source states another")]
+fn a_debug_build_refuses_a_value_that_is_not_finite() {
+    let rows = rows(&[31]);
+    // A host writes what it computed: an overflow, a division by zero.
+    let cells = [cell(f64::INFINITY, 0), cell(1.0, 0)];
+    let _ = reads(&rows, Some(&SignalCells::new(cells.to_vec(), 2)));
 }
 
 #[test]

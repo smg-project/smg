@@ -18,7 +18,10 @@
 //! ([`RequestFacts::signal_cells`](crate::RequestFacts::signal_cells)) for
 //! a profile whose stages read a signal, and for no other.
 
-use crate::view::{Candidate, RequestFacts};
+use crate::{
+    spec::MAX_SIGNALS,
+    view::{Candidate, RequestFacts},
+};
 
 /// One value and when it was sampled, in microseconds on the host's clock.
 #[derive(Clone, Copy, Debug)]
@@ -28,7 +31,11 @@ pub struct SignalCell {
 }
 
 impl SignalCell {
-    /// No value. A value is finite by rule, so none collides with it.
+    /// No value. A value is finite by rule, so none collides with it. The
+    /// rule is the source's: a store's sink takes no other value, and a
+    /// host that hands cells it built hands finite values or this cell. A
+    /// read tests for this cell alone, since a test of every value would
+    /// stand on each read's path, and a debug build asserts the rule there.
     pub const NONE: Self = Self {
         value: f64::NAN,
         sampled_at_micros: 0,
@@ -53,18 +60,23 @@ pub struct SignalCells {
     signals: u32,
 }
 
-/// A row's count of cells as the reads take it. A count a `u32` does not
-/// hold is no document's, and a place computed under it could wrap onto
-/// another row's cell: it is taken as no signal, so every read answers no
-/// value.
+/// A row's count of cells as the reads take it. A count past the
+/// document's cap ([`MAX_SIGNALS`]) is no document's. A copy of a row's
+/// cells would make room for it, and past a `u32` a place computed under
+/// it could wrap onto another row's cell. It is taken as no signal, so
+/// every read answers no value.
 fn counted(signals: usize) -> u32 {
-    u32::try_from(signals).unwrap_or(0)
+    match u32::try_from(signals) {
+        Ok(count) if signals <= MAX_SIGNALS => count,
+        _ => 0,
+    }
 }
 
 impl SignalCells {
     /// For a host that keeps no store: `cells` holds `signals` cells a
     /// row, in the rows' order, and a row's cells stand in the order of
-    /// the document's names.
+    /// the document's names. A count past the document's cap
+    /// ([`MAX_SIGNALS`]) is taken as no signal.
     pub fn new(cells: Vec<SignalCell>, signals: usize) -> Self {
         Self {
             cells,
@@ -161,6 +173,10 @@ impl SignalColumn {
     #[inline]
     pub fn read(&self, facts: &RequestFacts<'_>, row: &Candidate) -> Option<f64> {
         let cell = facts.signal_cells?.cell(row.position, self.column)?;
+        debug_assert!(
+            cell.is_none() || cell.value.is_finite(),
+            "a signal's value is finite: no source states another"
+        );
         // The oldest sample instant still read: one value for every row
         // of a decision, where an age is a subtraction a row.
         let oldest = facts.now_micros.saturating_sub(self.max_age_micros);
@@ -192,15 +208,30 @@ mod tests {
     }
 
     #[test]
-    fn the_last_count_a_u32_holds_stands_and_reads_inside_the_cells_alone() {
-        let cells = SignalCells::new(vec![HELD; 4], u32::MAX as usize);
+    fn a_count_of_signals_past_the_cap_holds_no_signal() {
+        for past in [MAX_SIGNALS + 1, u32::MAX as usize] {
+            let mut cells = SignalCells::new(vec![HELD; 4], past);
+            assert_eq!(cells.signals(), 0, "a count of {past}");
+            assert!(cells.cell(0, 0).is_none(), "a count of {past}");
+            assert_eq!(cells.row(0).map(<[_]>::len), Some(0));
+            cells.refill(past);
+            assert_eq!(cells.signals(), 0, "a refill under {past}");
+        }
+    }
+
+    #[test]
+    fn the_caps_count_stands_and_reads_inside_the_cells_alone() {
+        let cells = SignalCells::new(vec![HELD; 4], MAX_SIGNALS);
+        assert_eq!(cells.signals(), MAX_SIGNALS);
         assert!(cells.cell(0, 3).is_some());
         assert!(cells.cell(0, 4).is_none(), "past the cells' end");
         assert!(cells.cell(1, 0).is_none(), "a second row is outside them");
         assert!(
             cells.cell(u32::MAX, u16::MAX).is_none(),
-            "the last place of all"
+            "a column past the count"
         );
+        // The last column under the cap, at the last position.
+        assert!(cells.cell(u32::MAX, 63).is_none(), "the last place of all");
         assert!(cells.row(0).is_none(), "a row no cells hold whole");
         assert!(
             !cells.fits(usize::MAX),
