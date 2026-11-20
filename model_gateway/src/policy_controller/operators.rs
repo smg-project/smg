@@ -1,18 +1,20 @@
-//! The policy document on the control plane: `GET /policy/spec` tells the
-//! document in force, and `POST /policy/spec:validate` says what an apply
-//! of another would do, with nothing applied.
+//! The policy controller on the control plane: `GET /policy/spec` tells the
+//! document in force, `POST /policy/spec:validate` says what an apply of
+//! another would do, with nothing applied, and `GET /policy/snapshot` tells
+//! the worker rows the controller's store holds.
 //!
-//! Both stand on the policy crate's operators' door ([`SpecDoor`]), which
-//! the start leaves in the context beside the controller's store. Under
-//! the classic policies no door stands, and each route refuses by one code
-//! that names the setting. Nothing is applied in this process after the
-//! start: the document in force is the start's, and a restart reads the
-//! routing configuration again.
+//! The three stand on the policy crate's operators' door ([`SpecDoor`])
+//! and its snapshot of the rows, which the start leaves in the context
+//! beside the controller's store. Under the classic policies none stands,
+//! and each route refuses by one code that names the setting. Nothing is
+//! applied in this process after the start: the document in force is the
+//! start's, and a restart reads the routing configuration again.
 //!
-//! A dry run validates a whole document. Its pass runs on the blocking
-//! pool, one at a time, and a bounded number of calls wait for it.
+//! A dry run validates a whole document and a snapshot copies rows. Each
+//! runs on the blocking pool, one at a time of its kind, and a bounded
+//! number of calls wait for it.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use axum::{
     body::Bytes,
@@ -25,34 +27,52 @@ use axum::{
     Json,
 };
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use smg_policy_controller::{
     operator::{
+        snapshot::{self, Asked, Rows},
         Document, DryRun, Format, NeedsRow, SpecDoor, Turn, Unanswered, MAX_DOCUMENT_BYTES,
     },
     spec::{Digest, Needs},
+    store::MemoryStore,
     view::Phase,
 };
 use tracing::error;
 
-use crate::{admin::json::refusal, middleware::SHED_RETRY_AFTER_SECS, server::AppState};
+use crate::{
+    admin::{json::refusal, params::AdminQuery},
+    middleware::SHED_RETRY_AFTER_SECS,
+    server::AppState,
+};
 
 /// How many dry runs may wait for the one that runs. A call past them is
 /// answered 429.
 const DRY_RUNS_WAITING: usize = 32;
 
-/// The operators' door over the controller's store, with the turn of its
-/// dry runs.
+/// How many snapshots may wait for the one that is taken. A call past
+/// them is answered 429.
+const SNAPSHOTS_WAITING: usize = 32;
+
+/// The most rows a snapshot tells, and the number it tells where its
+/// caller names none. A fleet past it is read by model.
+const SNAPSHOT_ROWS: usize = 1_024;
+
+/// The operators' door over the controller's store, and the store for its
+/// rows, each call behind the turn of its kind.
 pub(crate) struct Operators {
     door: Arc<SpecDoor>,
+    store: Arc<MemoryStore>,
     dry_runs: Turn,
+    snapshots: Turn,
 }
 
 impl Operators {
-    pub(crate) fn new(door: Arc<SpecDoor>) -> Self {
+    pub(crate) fn new(store: Arc<MemoryStore>, door: Arc<SpecDoor>) -> Self {
         Self {
             door,
+            store,
             dry_runs: Turn::new(DRY_RUNS_WAITING),
+            snapshots: Turn::new(SNAPSHOTS_WAITING),
         }
     }
 }
@@ -102,11 +122,12 @@ struct SpecInForce<'a> {
     /// `yaml` or `json`: the form `document` is in.
     format: &'static str,
     applied_at: DateTime<Utc>,
-    /// The document as its source wrote it.
+    /// The document as the gateway holds it: the YAML its start applied,
+    /// its own writing of a given document.
     document: &'a str,
 }
 
-/// `GET /policy/spec`: the document in force as its source wrote it, with
+/// `GET /policy/spec`: the document in force as the gateway holds it, with
 /// its generation, its digest and when it was applied. `ETag` is the
 /// digest: the guard a dry run takes in `If-Match`. 409 under the classic
 /// policies.
@@ -239,15 +260,10 @@ pub(crate) async fn validate(
         Err(refused) => return refused,
     };
     let Some(turn) = operators.dry_runs.take().await else {
-        let mut refused = refusal(
-            StatusCode::TOO_MANY_REQUESTS,
+        return full(
             "TOO_MANY_DRY_RUNS",
-            "As many dry runs wait as may; try again".to_string(),
+            "As many dry runs wait as may; try again",
         );
-        // When to come again, as the gateway's sheds say it.
-        let again = HeaderValue::from(SHED_RETRY_AFTER_SECS);
-        refused.headers_mut().insert(RETRY_AFTER, again);
-        return refused;
     };
     let door = Arc::clone(&operators.door);
     // The pass keeps its turn to its own end, off the runtime's workers: a
@@ -305,6 +321,92 @@ pub(crate) async fn validate(
         }
         Err(join) => {
             error!(%join, "the policy dry run's task failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// The answer to a call past the ones of its kind that may wait: 429 under
+/// `code`, with the `Retry-After` the gateway's sheds send.
+fn full(code: &str, error: &str) -> Response {
+    let mut refused = refusal(StatusCode::TOO_MANY_REQUESTS, code, error.to_string());
+    let again = HeaderValue::from(SHED_RETRY_AFTER_SECS);
+    refused.headers_mut().insert(RETRY_AFTER, again);
+    refused
+}
+
+/// What a snapshot's caller asks. Any other key is refused by name, so a
+/// misspelt filter never tells every row in the filtered one's place.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SnapshotQuery {
+    /// Model ids, comma separated: the rows that serve one of them. Every
+    /// row where none is named.
+    models: Option<String>,
+    /// The most rows to tell, at most [`SNAPSHOT_ROWS`].
+    limit: Option<usize>,
+}
+
+/// The answer of `GET /policy/snapshot`: the page as the policy crate
+/// writes one, under the generation the store runs.
+#[derive(Serialize)]
+struct Snapshot {
+    generation: u64,
+    #[serde(flatten)]
+    page: snapshot::Told,
+}
+
+/// `GET /policy/snapshot`: the worker rows the controller's store holds,
+/// in registration key order, each address without its userinfo. `models`
+/// keeps the rows that serve one of the models it names, comma separated.
+/// `limit` caps the rows, at most 1,024, which is the default too.
+/// `truncated` says that a matching row was left out, by the cap or by
+/// the policy crate's bound on a page: 2 MiB by its measure of the rows,
+/// taken ahead of the JSON, whose keys and escapes may pass it. The page
+/// has no cursor: a fleet past the cap is read by model.
+///
+/// 429 says that as many snapshots wait as may, with `Retry-After`. 409
+/// under the classic policies.
+pub(crate) async fn snapshot(
+    State(state): State<Arc<AppState>>,
+    AdminQuery(query): AdminQuery<SnapshotQuery>,
+) -> Response {
+    let operators = match operators(&state) {
+        Ok(operators) => operators,
+        Err(refused) => return refused,
+    };
+    let Some(turn) = operators.snapshots.take().await else {
+        return full(
+            "TOO_MANY_SNAPSHOTS",
+            "As many snapshots wait as may; try again",
+        );
+    };
+    let store = Arc::clone(&operators.store);
+    // The rows are copied off the runtime's workers, the turn kept to the
+    // copy's own end.
+    let taken = tokio::task::spawn_blocking(move || {
+        let _turn = turn;
+        let models = query.models.as_deref().unwrap_or_default().split(',');
+        let asked = Asked {
+            models: models
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+                .map(str::to_owned)
+                .collect(),
+            limit: query.limit.unwrap_or(SNAPSHOT_ROWS).min(SNAPSHOT_ROWS),
+        };
+        let now = Instant::now();
+        let (rows, serving) = store.rows_serving(&asked.models, asked.limit);
+        Snapshot {
+            page: snapshot::told(&asked, Rows::Told(rows, serving), now),
+            generation: store.world().spec().generation(),
+        }
+    })
+    .await;
+    match taken {
+        Ok(snapshot) => Json(snapshot).into_response(),
+        Err(join) => {
+            error!(%join, "the policy snapshot's task failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }

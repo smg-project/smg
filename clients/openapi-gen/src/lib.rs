@@ -414,6 +414,7 @@ pub const CONTROL_PLANE_ROUTES: &[(&str, &str)] = &[
     ("PUT", "/rate-limits/tenants"),
     ("GET", "/policy/spec"),
     ("POST", "/policy/spec:validate"),
+    ("GET", "/policy/snapshot"),
     ("POST", "/flush_cache"),
     ("POST", "/start_profile"),
     ("POST", "/stop_profile"),
@@ -1575,7 +1576,7 @@ pub fn document() -> anyhow::Result<OpenApiDoc> {
         PathItem {
             get: Some(operation(
                 "getPolicySpec",
-                "The policy document in force as its source wrote it: the admin role alone, mounted only with control-plane authentication",
+                "The policy document in force as the gateway holds it: the admin role alone, mounted only with control-plane authentication",
                 None,
                 None,
                 {
@@ -1588,7 +1589,7 @@ pub fn document() -> anyhow::Result<OpenApiDoc> {
                                 "digest": {"type": "string", "description": "`sha256:` and 64 hex digits"},
                                 "format": {"type": "string", "enum": ["yaml", "json"], "description": "The form `document` is in"},
                                 "applied_at": {"type": "string", "format": "date-time"},
-                                "document": {"type": "string", "description": "The document as its source wrote it"}
+                                "document": {"type": "string", "description": "The document as the gateway holds it: the YAML its start applied, the gateway's own writing of a given document"}
                             },
                             "required": ["generation", "digest", "format", "applied_at", "document"]
                         }),
@@ -1711,6 +1712,138 @@ pub fn document() -> anyhow::Result<OpenApiDoc> {
                     responses.insert(
                         "429".to_string(),
                         refused("As many dry runs wait as may (TOO_MANY_DRY_RUNS); Retry-After says when to come again"),
+                    );
+                    responses
+                },
+            )),
+            ..PathItem::default()
+        },
+    );
+
+    let nullable = |kind: &str| serde_json::json!({"type": [kind, "null"]});
+    let worker_row = serde_json::json!({
+        "type": "object",
+        "description": "A worker row by the field names of the controller's contract; a fact the row does not state is null",
+        "properties": {
+            "id": {"type": "string", "description": "Sixteen hex digits, as the controller's messages print a worker"},
+            "registration_key": {"type": "string", "description": "The address a gateway dials, without its userinfo"},
+            "incarnation": {"type": "integer"},
+            "engine": {"type": "string", "description": "The engine the row belongs to: one for the ranks of a data-parallel engine"},
+            "wire": {"type": "array", "items": {"type": "string", "enum": ["http", "grpc", "zmq"]}},
+            "role": {"type": "string", "enum": ["single", "prefill", "decode", "encode"]},
+            "runtime": {"type": "string"},
+            "models": {"type": "array", "items": {"type": "string"}},
+            "dp_rank": {"type": "integer"},
+            "dp_size": {"type": "integer"},
+            "labels": {"type": "object", "additionalProperties": {"type": "string"}},
+            "zone": nullable("string"),
+            "status": {"type": "string", "enum": ["pending", "ready", "not_ready", "failed", "draining"]},
+            "revision": {"type": "integer", "description": "Counts the row's stated facts"},
+            "reachable": {
+                "type": "object",
+                "description": "Either `any`, true, or `gateway_id`, the one gateway that holds a host-local wire",
+                "properties": {"any": {"type": "boolean"}, "gateway_id": {"type": "string"}}
+            },
+            "pairing": {
+                "type": ["object", "null"],
+                "description": "What the row states of a pair and of an encode handoff; null where it states nothing of either",
+                "properties": {
+                    "protocol": nullable("string"),
+                    "transport": nullable("string"),
+                    "version": nullable("string"),
+                    "bootstrap_port": nullable("integer"),
+                    "kv_layout": {"type": "object", "additionalProperties": {"type": "string"}},
+                    "ec_producer": {"type": "boolean"},
+                    "ec_consumer": {"type": "boolean"},
+                    "vision": {"type": "boolean"},
+                    "encode_handoff": {"type": "string", "enum": ["none", "push", "rendezvous"]},
+                    "ec_connector": nullable("string"),
+                    "encode_references": {"type": "boolean"}
+                },
+                "required": [
+                    "protocol", "transport", "version", "bootstrap_port", "kv_layout", "ec_producer",
+                    "ec_consumer", "vision", "encode_handoff", "ec_connector", "encode_references"
+                ]
+            },
+            "max_running": nullable("integer"),
+            "kv_block_size": nullable("integer"),
+            "priority": {"type": "integer"},
+            "overload": {
+                "type": "object",
+                "properties": {"queue_limit": nullable("integer"), "kv_usage_permille": nullable("integer")},
+                "required": ["queue_limit", "kv_usage_permille"]
+            },
+            "signals": {
+                "type": "object",
+                "properties": {
+                    "events": {"type": "boolean"},
+                    "loads": {"type": "boolean"},
+                    "scrape_interval_ms": {"type": "integer"}
+                },
+                "required": ["events", "loads", "scrape_interval_ms"]
+            },
+            "health_policy": {
+                "type": "object",
+                "properties": {
+                    "failure_threshold": {"type": "integer"},
+                    "success_threshold": {"type": "integer"},
+                    "check_interval_ms": {"type": "integer"},
+                    "timeout_ms": {"type": "integer"},
+                    "disabled": {"type": "boolean"}
+                },
+                "required": [
+                    "failure_threshold", "success_threshold", "check_interval_ms", "timeout_ms", "disabled"
+                ]
+            },
+            "admitted_age_ms": {"type": "integer", "description": "The row's age at the read, in milliseconds"},
+            "maker": {
+                "type": ["object", "null"],
+                "description": "The provider that made the row, its key without a userinfo; null for a control call's row",
+                "properties": {"provider": {"type": "string"}, "key": {"type": "string"}},
+                "required": ["provider", "key"]
+            }
+        },
+        "required": [
+            "id", "registration_key", "incarnation", "engine", "wire", "role", "runtime", "models",
+            "dp_rank", "dp_size", "labels", "zone", "status", "revision", "reachable", "pairing",
+            "max_running", "kv_block_size", "priority", "overload", "signals", "health_policy",
+            "admitted_age_ms", "maker"
+        ]
+    });
+    paths.insert(
+        "/policy/snapshot".to_string(),
+        PathItem {
+            get: Some(operation(
+                "getPolicySnapshot",
+                "The worker rows the policy controller's store holds, in registration key order: the admin role alone, mounted only with control-plane authentication",
+                Some(vec![
+                    // Model ids, comma separated: the rows that serve one.
+                    optional_query_param("models"),
+                    // At most 1,024 rows, which is the default.
+                    typed_query_param("limit", ParameterSchema::of("integer")),
+                ]),
+                None,
+                {
+                    let mut responses = inline_response(
+                        "The rows under the generation that runs; truncated says a matching row was left out, by the row cap or by the policy crate's bound on a page, 2 MiB by its measure of the rows",
+                        serde_json::json!({
+                            "type": "object",
+                            "properties": {
+                                "generation": {"type": "integer"},
+                                "rows": {"type": "array", "items": worker_row},
+                                "truncated": {"type": "boolean"}
+                            },
+                            "required": ["generation", "rows", "truncated"]
+                        }),
+                    );
+                    responses.insert(
+                        "400".to_string(),
+                        refused("The query names a key other than models and limit, or limit is no number"),
+                    );
+                    responses.insert("409".to_string(), policy_off());
+                    responses.insert(
+                        "429".to_string(),
+                        refused("As many snapshots wait as may (TOO_MANY_SNAPSHOTS); Retry-After says when to come again"),
                     );
                     responses
                 },

@@ -842,7 +842,12 @@ async fn inflight_requests(State(state): State<Arc<AppState>>) -> Response {
 /// The control-plane reads the `admin` role alone may make: the gate
 /// refuses the `user` role there before any handler and writes the denial
 /// line, as for a mutation ([`smg_auth::ControlPlaneAuthState::with_admin_only_reads`]).
-pub const ADMIN_ONLY_READS: &[&str] = &["/config", "/rate-limits/tenants", "/policy/spec"];
+pub const ADMIN_ONLY_READS: &[&str] = &[
+    "/config",
+    "/rate-limits/tenants",
+    "/policy/spec",
+    "/policy/snapshot",
+];
 
 /// `GET /config`: the effective configuration with every secret
 /// redacted and the keys in force named by fingerprint. The `admin` role
@@ -915,6 +920,7 @@ fn gated_control_plane_routes() -> Router<Arc<AppState>> {
                 operators::document_bytes(),
             )),
         )
+        .route("/policy/snapshot", get(operators::snapshot))
 }
 
 /// The gated routes by name, in the order of `gated_control_plane_routes`.
@@ -925,6 +931,7 @@ pub const GATED_ROUTES: &[(&str, &str)] = &[
     ("PUT", "/rate-limits/tenants"),
     ("GET", "/policy/spec"),
     ("POST", "/policy/spec:validate"),
+    ("GET", "/policy/snapshot"),
 ];
 
 async fn list_workers_rest(

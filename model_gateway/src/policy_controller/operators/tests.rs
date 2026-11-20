@@ -9,11 +9,18 @@ use axum::{
 };
 use serde_json::{json, Value};
 use smg_auth::{ApiKeyEntry, ControlPlaneAuthConfig, ControlPlaneAuthState, Role};
-use smg_policy_controller::PolicySpec;
-use tokio::task::JoinSet;
+use smg_policy_controller::{
+    operator::Turn,
+    store::{
+        EncodeOffer, GatewayId, Maker, Overload, PairingDescriptor, Reachability, WorkerFacts,
+        WorkersStore,
+    },
+    view::WireModes,
+    PolicySpec,
+};
 use tower::ServiceExt;
 
-use super::{document_bytes, DRY_RUNS_WAITING};
+use super::{document_bytes, DRY_RUNS_WAITING, SNAPSHOTS_WAITING, SNAPSHOT_ROWS};
 use crate::{
     app_context::AppContext,
     config::RouterConfig,
@@ -24,8 +31,12 @@ use crate::{
 
 type Case = Result<(), Box<dyn Error>>;
 
+/// The turn of one kind of call, read from the operators.
+type TurnOf = fn(&super::Operators) -> &Turn;
+
 const SPEC: &str = "/policy/spec";
 const VALIDATE: &str = "/policy/spec:validate";
+const SNAPSHOT: &str = "/policy/snapshot";
 
 /// A document apart from the one a routing configuration means.
 const OTHER: &str =
@@ -60,7 +71,10 @@ async fn state(config: RouterConfig) -> Result<Arc<AppState>, String> {
 fn app(state: Arc<AppState>) -> Result<Router, header::InvalidHeaderName> {
     let keys = ControlPlaneAuthConfig {
         jwt: None,
-        api_keys: vec![ApiKeyEntry::new("admin", "Admin", "admin-key", Role::Admin)],
+        api_keys: vec![
+            ApiKeyEntry::new("admin", "Admin", "admin-key", Role::Admin),
+            ApiKeyEntry::new("user", "User", "user-key", Role::User),
+        ],
         audit_enabled: false,
     };
     build_app(
@@ -94,6 +108,23 @@ fn dry_run() -> Builder {
     by_admin(Request::post(VALIDATE))
 }
 
+/// A snapshot of the rows under `query`, a query string or none.
+fn snapshot(query: &str) -> Result<Request<Body>, http::Error> {
+    by_admin(Request::get(format!("{SNAPSHOT}{query}"))).body(Body::empty())
+}
+
+/// A worker's facts under `key`, serving `models`.
+fn serving(key: &str, models: &[&str]) -> WorkerFacts {
+    WorkerFacts {
+        key: key.to_owned(),
+        engine: key.to_owned(),
+        incarnation: 1,
+        dp_size: 1,
+        models: models.iter().map(|model| (*model).to_owned()).collect(),
+        ..WorkerFacts::default()
+    }
+}
+
 /// What `request` is answered: the status, the headers, and the body as
 /// JSON where it is JSON.
 async fn answered(
@@ -106,6 +137,49 @@ async fn answered(
     Ok((parts.status, parts.headers, body))
 }
 
+/// The first place where `answer` is not what `schema`, a schema of the
+/// OpenAPI document, gives it: a value of another type or outside its
+/// names, a key the schema does not list, or a required key left out.
+fn off_schema(schema: &Value, answer: &Value, path: &str) -> Option<String> {
+    let kind = match answer {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "integer",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    };
+    let (kinds, names) = (&schema["type"], &schema["enum"]);
+    let typed = kinds
+        .as_array()
+        .map_or(kinds == kind, |kinds| kinds.iter().any(|of| of == kind));
+    let named = names.as_array().is_none_or(|names| names.contains(answer));
+    if !(typed && named) {
+        return Some(format!("{path}: {answer} is not of {schema}"));
+    }
+    match answer {
+        Value::Array(items) => items
+            .iter()
+            .find_map(|item| off_schema(&schema["items"], item, &format!("{path}[]"))),
+        Value::Object(fields) => {
+            let required = schema["required"].as_array().into_iter().flatten();
+            let left_out = required
+                .filter_map(Value::as_str)
+                .find(|name| !fields.contains_key(*name));
+            if let Some(name) = left_out {
+                return Some(format!("{path}: no {name}"));
+            }
+            fields.iter().find_map(|(name, field)| {
+                let of = schema["properties"]
+                    .get(name)
+                    .unwrap_or_else(|| &schema["additionalProperties"]);
+                off_schema(of, field, &format!("{path}.{name}"))
+            })
+        }
+        _ => None,
+    }
+}
+
 /// The digest of the document `config` means: the standing one after a
 /// start.
 fn standing(config: &RouterConfig) -> Result<String, Box<dyn Error>> {
@@ -113,11 +187,11 @@ fn standing(config: &RouterConfig) -> Result<String, Box<dyn Error>> {
 }
 
 #[tokio::test]
-async fn under_the_classic_policies_both_routes_refuse_by_one_code() -> Case {
+async fn under_the_classic_policies_each_route_refuses_by_one_code() -> Case {
     let state = state(RouterConfig::default()).await?;
     assert!(state.context.policy_operators.is_none());
     let app = app(state)?;
-    for request in [read()?, dry_run().body(Body::from(OTHER))?] {
+    for request in [read()?, dry_run().body(Body::from(OTHER))?, snapshot("")?] {
         let (status, _, refused) = answered(&app, request).await?;
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(refused["code"], "POLICY_CONTROLLER_OFF");
@@ -193,26 +267,14 @@ async fn a_dry_run_tells_the_next_number_and_applies_nothing() -> Case {
 async fn a_dry_runs_needs_are_of_the_types_the_openapi_document_gives() -> Case {
     let app = app_under(picked()).await?;
     let (_, _, would_run) = answered(&app, dry_run().body(Body::from(OTHER))?).await?;
-    let fed = would_run["needs"]["after"][0]["needs"]
-        .as_object()
-        .ok_or("no needs")?;
-    assert!(fed.contains_key("sample") && fed.contains_key("loads"));
+    let fed = &would_run["needs"]["after"][0]["needs"];
+    assert!(fed.get("sample").is_some() && fed.get("loads").is_some());
     let document = serde_json::to_value(openapi_gen::document()?)?;
     let answer = &document["paths"][VALIDATE]["post"]["responses"]["200"]["content"]
         ["application/json"]["schema"];
     let schema =
         &answer["properties"]["needs"]["properties"]["after"]["items"]["properties"]["needs"];
-    for (name, value) in fed {
-        let declared = schema["properties"]
-            .get(name)
-            .unwrap_or_else(|| &schema["additionalProperties"]);
-        let written = match value {
-            Value::Bool(_) => "boolean",
-            Value::Number(_) => "integer",
-            _ => "another type",
-        };
-        assert_eq!(declared["type"], written, "{name}");
-    }
+    assert_eq!(off_schema(schema, fed, "needs"), None);
     Ok(())
 }
 
@@ -329,29 +391,152 @@ async fn a_body_past_a_documents_bound_is_refused_at_the_edge() -> Case {
     Ok(())
 }
 
-/// One dry run runs and a bounded number wait: a call past them is refused
-/// at once, by name.
+/// One call of a kind runs and a bounded number wait: a dry run and a
+/// snapshot past them are each refused at once, by name.
 #[tokio::test]
-async fn a_dry_run_past_the_ones_that_may_wait_is_refused() -> Case {
+async fn a_call_past_the_ones_that_may_wait_is_refused() -> Case {
     let state = state(picked()).await?;
     let operators = state.context.policy_operators.clone().ok_or("no door")?;
-    let _running = operators.dry_runs.take().await.ok_or("a free turn")?;
-    // The set ends its waiters when the case does.
-    let mut waiting = JoinSet::new();
-    for _ in 0..DRY_RUNS_WAITING {
-        let operators = Arc::clone(&operators);
-        waiting.spawn(async move { operators.dry_runs.take().await.is_some() });
-    }
-    // Each waiter takes its place at its first poll, ahead of this task.
-    tokio::task::yield_now().await;
-
     let app = app(state)?;
-    let (status, headers, refused) = answered(&app, dry_run().body(Body::from(OTHER))?).await?;
-    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
-    assert_eq!(refused["code"], "TOO_MANY_DRY_RUNS");
-    let again = headers
-        .get(header::RETRY_AFTER)
-        .and_then(|again| again.to_str().ok());
-    assert_eq!(again, Some(SHED_RETRY_AFTER_SECS.to_string().as_str()));
+    let kinds: [(TurnOf, usize, _, &str); 2] = [
+        (
+            |operators| &operators.dry_runs,
+            DRY_RUNS_WAITING,
+            dry_run().body(Body::from(OTHER))?,
+            "TOO_MANY_DRY_RUNS",
+        ),
+        (
+            |operators| &operators.snapshots,
+            SNAPSHOTS_WAITING,
+            snapshot("")?,
+            "TOO_MANY_SNAPSHOTS",
+        ),
+    ];
+    for (turn, may_wait, request, code) in kinds {
+        let _running = turn(&operators).take().await.ok_or("a free turn")?;
+        // Each wait takes its place at its first poll and stays behind the
+        // running call. Polled here by hand: a runtime gives a yielding
+        // case no word on how many spawned waiters ran before it.
+        let mut waits: Vec<_> = (0..may_wait)
+            .map(|_| Box::pin(turn(&operators).take()))
+            .collect();
+        for wait in &mut waits {
+            assert!(futures::poll!(wait.as_mut()).is_pending());
+        }
+
+        let (status, headers, refused) = answered(&app, request).await?;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(refused["code"], code);
+        let again = headers
+            .get(header::RETRY_AFTER)
+            .and_then(|again| again.to_str().ok());
+        assert_eq!(again, Some(SHED_RETRY_AFTER_SECS.to_string().as_str()));
+    }
+    Ok(())
+}
+
+/// A snapshot tells the store's rows in the order of their keys as
+/// registered, each address without its userinfo, under the generation
+/// that runs. `limit` and `models` cut the page, and a misspelt key is
+/// refused, never read as no filter.
+#[tokio::test]
+async fn a_snapshot_tells_the_stores_rows_by_key_without_their_userinfo() -> Case {
+    let state = state(picked()).await?;
+    let store = state.context.policy_store.clone().ok_or("no store")?;
+    // The key with a userinfo sorts last as registered, and second as told.
+    store.upsert(serving("http://z.example", &["c"]));
+    store.upsert(serving("http://zz:secret@b.example", &["b"]));
+    store.upsert(serving("http://a.example", &["a", "c"]));
+    let app = app(state)?;
+    let (a, b, z) = ("http://a.example", "http://b.example", "http://z.example");
+    for (query, keys, truncated) in [
+        ("", &[a, z, b][..], false),
+        ("?limit=1", &[a][..], true),
+        ("?models=b,absent", &[b][..], false),
+        ("?models=c", &[a, z][..], false),
+    ] {
+        let (status, _, page) = answered(&app, snapshot(query)?).await?;
+        assert_eq!(status, StatusCode::OK, "{query}");
+        assert_eq!(page["generation"], 1);
+        assert_eq!(page["truncated"], truncated, "{query}");
+        let rows = page["rows"].as_array().ok_or("no rows")?;
+        let told = rows
+            .iter()
+            .filter_map(|row| row["registration_key"].as_str());
+        assert_eq!(told.collect::<Vec<_>>(), keys, "{query}");
+    }
+    let (status, _, _) = answered(&app, snapshot("?model=b")?).await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "a misspelt key");
+    Ok(())
+}
+
+/// A snapshot tells at most its cap of rows, whatever `limit` asks.
+#[tokio::test]
+async fn a_snapshot_stops_at_its_cap_of_rows() -> Case {
+    let state = state(picked()).await?;
+    let store = state.context.policy_store.clone().ok_or("no store")?;
+    for n in 0..SNAPSHOT_ROWS + 2 {
+        store.upsert(serving(&format!("http://w{n:05}.example"), &["m"]));
+    }
+    let (status, _, page) = answered(&app(state)?, snapshot("?limit=5000")?).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(page["rows"].as_array().map(Vec::len), Some(SNAPSHOT_ROWS));
+    assert_eq!(page["truncated"], true);
+    Ok(())
+}
+
+/// The OpenAPI document gives a snapshot's page as the route writes it,
+/// for a row that states the least and for one that states every nullable
+/// fact: each value of its listed type and names, each key listed, and no
+/// required key left out.
+#[tokio::test]
+async fn a_snapshots_page_is_as_the_openapi_document_gives_it() -> Case {
+    let state = state(picked()).await?;
+    let store = state.context.policy_store.clone().ok_or("no store")?;
+    store.upsert(serving("http://least.example", &[]));
+    let stated = WorkerFacts {
+        wire_modes: WireModes::from_bits(3),
+        labels: [("tier".to_owned(), "a".to_owned())].into(),
+        zone: Some("zone-a".to_owned()),
+        pairing: Some(Arc::new(PairingDescriptor {
+            protocol: Some("p1".to_owned()),
+            transport: Some("t1".to_owned()),
+            version: Some("v1".to_owned()),
+            kv_layout: [Some("float16".to_owned()), None, None, None],
+        })),
+        encode: EncodeOffer {
+            connector: Some("c1".to_owned()),
+            ..EncodeOffer::default()
+        },
+        max_running: Some(8),
+        kv_block_size: Some(16),
+        bootstrap_port: Some(9000),
+        reachable_from: Reachability::Gateway(GatewayId(0x1f)),
+        overload: Overload {
+            kv_usage_permille: Some(900),
+            waiting_requests: Some(64),
+        },
+        ..serving("http://stated.example", &["m"])
+    };
+    store.upsert_by(stated, Maker::provider("finder", "http://host/x")?);
+    let (status, _, page) = answered(&app(state)?, snapshot("")?).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(page["rows"].as_array().map(Vec::len), Some(2));
+    let document = serde_json::to_value(openapi_gen::document()?)?;
+    let schema = &document["paths"][SNAPSHOT]["get"]["responses"]["200"]["content"]
+        ["application/json"]["schema"];
+    assert_eq!(off_schema(schema, &page, "page"), None);
+    Ok(())
+}
+
+/// The document and the rows name a fleet: the `user` role reads neither.
+#[tokio::test]
+async fn the_user_role_reads_neither_the_document_nor_the_rows() -> Case {
+    let app = app_under(picked()).await?;
+    for path in [SPEC, SNAPSHOT] {
+        let by_user = Request::get(path).header(header::AUTHORIZATION, "Bearer user-key");
+        let (status, _, _) = answered(&app, by_user.body(Body::empty())?).await?;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
+    }
     Ok(())
 }
