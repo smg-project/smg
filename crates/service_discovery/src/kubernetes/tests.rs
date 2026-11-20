@@ -1,11 +1,19 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use futures::{channel::mpsc, FutureExt, SinkExt};
 use k8s_openapi::{
     api::core::v1::{Pod, PodCondition, PodSpec, PodStatus},
     apimachinery::pkg::apis::meta::v1::{ObjectMeta, Time},
 };
-use kube::runtime::watcher::Event;
+use kube::runtime::watcher::{self, Event};
+use openai_protocol::worker::WorkerSpec;
 use smg_worker::{
-    identity::endpoint::{endpoint_key, Endpoint, EndpointKey},
-    registry::WorkerId,
+    identity::{
+        basic::Worker,
+        endpoint::{endpoint_key, Endpoint, EndpointKey},
+    },
+    jobs::WorkerJobs,
+    registry::{WorkerId, WorkerOrigin},
 };
 use tracing_test::traced_test;
 
@@ -547,6 +555,119 @@ fn test_from_pod_bootstrap_count_mismatch_ignored() {
 
 fn store_snapshot(pods: Vec<Pod>) -> Vec<Arc<Pod>> {
     pods.into_iter().map(Arc::new).collect()
+}
+
+#[derive(Default)]
+struct ReconcileCountingHost {
+    passes: AtomicUsize,
+}
+
+impl DiscoveryHost for ReconcileCountingHost {
+    fn workers(&self) -> Vec<(WorkerId, Arc<dyn Worker>)> {
+        self.passes.fetch_add(1, Ordering::Relaxed);
+        Vec::new()
+    }
+
+    fn origin_of(&self, _worker_id: &WorkerId) -> Option<WorkerOrigin> {
+        None
+    }
+
+    fn stamp(&self, _spec: &mut WorkerSpec) {}
+
+    fn jobs(&self) -> Option<Arc<dyn WorkerJobs>> {
+        None
+    }
+}
+
+async fn assert_watch_event_wake(
+    events: &mut mpsc::Sender<watcher::Result<Event<Pod>>>,
+    notify: &Notify,
+    event: watcher::Result<Event<Pod>>,
+    expected: bool,
+) {
+    assert!(events.send(event).await.is_ok());
+    task::yield_now().await;
+    assert_eq!(notify.notified().now_or_never().is_some(), expected);
+}
+
+#[tokio::test]
+async fn drive_watch_notifies_only_after_visible_store_changes() {
+    let (mut events, stream) = mpsc::channel(1);
+    let notify = Arc::new(Notify::new());
+    let loop_notify = Arc::clone(&notify);
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the finite stream task is joined at the end of the test"
+    )]
+    let handle = task::spawn(async move {
+        drive_watch(stream, loop_notify.as_ref()).await;
+    });
+
+    let pod = Pod::default;
+    assert_watch_event_wake(&mut events, &notify, Ok(Event::Init), false).await;
+    assert_watch_event_wake(&mut events, &notify, Ok(Event::InitApply(pod())), false).await;
+    assert_watch_event_wake(&mut events, &notify, Ok(Event::InitDone), false).await;
+    assert_watch_event_wake(&mut events, &notify, Ok(Event::Apply(pod())), true).await;
+    assert_watch_event_wake(&mut events, &notify, Ok(Event::Delete(pod())), true).await;
+    assert_watch_event_wake(&mut events, &notify, Ok(Event::Init), false).await;
+    assert_watch_event_wake(&mut events, &notify, Ok(Event::InitApply(pod())), false).await;
+    assert_watch_event_wake(&mut events, &notify, Ok(Event::InitDone), true).await;
+    assert_watch_event_wake(
+        &mut events,
+        &notify,
+        Err(watcher::Error::NoResourceVersion),
+        false,
+    )
+    .await;
+
+    drop(events);
+    assert!(handle.await.is_ok());
+}
+
+#[tokio::test(start_paused = true)]
+async fn unchanged_ticks_reuse_the_projected_pod_snapshot() {
+    PROJECTION_PASSES.set(0);
+    let (store, mut writer) = reflector::store::<Pod>();
+    writer.apply_watcher_event(&Event::Init);
+    writer.apply_watcher_event(&Event::InitApply(make_labeled_pod(
+        "worker-0",
+        "10.0.0.1",
+        &[("app", "sglang")],
+    )));
+    writer.apply_watcher_event(&Event::InitDone);
+
+    let notify = Arc::new(Notify::new());
+    let host = Arc::new(ReconcileCountingHost::default());
+    let mut config = make_regular_config();
+    config.check_interval = Duration::from_secs(60);
+    let loop_notify = Arc::clone(&notify);
+    let loop_host = Arc::clone(&host);
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the loop under test is aborted at the end of the test"
+    )]
+    let handle = task::spawn(async move {
+        reconcile_on_change(&store, loop_notify.as_ref(), &config, loop_host.as_ref()).await;
+    });
+
+    task::yield_now().await;
+    for _ in 0..2 {
+        time::advance(Duration::from_secs(60)).await;
+        task::yield_now().await;
+    }
+    assert_eq!(host.passes.load(Ordering::Relaxed), 3);
+    assert_eq!(PROJECTION_PASSES.get(), 1);
+
+    let changed = make_labeled_pod("worker-0", "10.0.0.2", &[("app", "sglang")]);
+    writer.apply_watcher_event(&Event::Apply(changed));
+    notify.notify_one();
+    task::yield_now().await;
+    time::advance(Duration::from_secs(1)).await;
+    task::yield_now().await;
+
+    assert_eq!(host.passes.load(Ordering::Relaxed), 4);
+    assert_eq!(PROJECTION_PASSES.get(), 2);
+    handle.abort();
 }
 
 fn key(url: &str) -> EndpointKey {
