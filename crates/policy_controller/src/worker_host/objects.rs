@@ -3424,6 +3424,7 @@ mod tests {
         registered(&replica, &door, &kept, Expect::Anything).expect("the write");
         let row = replica.row(B);
         assert_eq!(replica.objects.rank_row(lower, 1), None);
+        assert_eq!(replica.objects.rank_row(row.id, 0), Some(row.id));
 
         // The row becomes rank 1 of the first row's engine.
         let moved = WorkerFacts {
@@ -3436,6 +3437,9 @@ mod tests {
         replica.follow();
         assert!(Arc::ptr_eq(&replica.at(B), &kept));
         assert_eq!(replica.objects.rank_row(lower, 1), Some(row.id));
+        // The kept object stands for the row still, which stands at rank 0
+        // no longer: a feed's open reads the second.
+        assert_eq!(replica.objects.rank_row(row.id, 0), None);
     }
 
     // ---------------------------------------------- the overload mirror
