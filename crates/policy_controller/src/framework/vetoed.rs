@@ -1098,7 +1098,7 @@ mod tests {
             let naming = RequestFacts {
                 block_hashes: &HASHES,
                 prompt_tokens: 256,
-                named: Some(NamedAffinity {
+                named: Some(&NamedAffinity {
                     holders: &holders,
                     ..NamedAffinity::default()
                 }),

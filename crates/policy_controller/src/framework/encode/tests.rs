@@ -1367,7 +1367,7 @@ fn a_request_with_a_column_or_named_rows_declines_before_a_stage_is_asked() {
         predicted_blocks: 0,
     }];
     let named = RequestFacts {
-        named: Some(crate::NamedAffinity {
+        named: Some(&crate::NamedAffinity {
             holders: &holders,
             ..crate::NamedAffinity::default()
         }),

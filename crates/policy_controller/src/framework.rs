@@ -2207,23 +2207,31 @@ fn join_named(
 /// The picker's order of a draw the rows a host named join
 /// ([`Picker::joined_by_named`]): the named rows join the rows drawn
 /// ([`join_named`]) and the stages are handed the drawn rows' mean in
-/// flight. Out of line: a draw nothing joins keeps the code it had.
+/// flight. Out of line: a draw nothing joins keeps the code it had. The
+/// rows are read from the facts here, so the draw's own path tests that
+/// they are named and loads nothing of them. None named orders nothing,
+/// and the whole pass answers.
 #[inline(never)]
 fn order_joined(
     profile: &Profile,
     after: &RequestFacts<'_>,
-    named: NamedAffinity<'_>,
     candidates: &[Candidate],
     keep: &mut dyn FnMut(&Candidate) -> bool,
     buf: &mut Buffers,
     out: &mut Targets,
 ) {
-    let mean = join_named(after, &named, candidates, keep, &mut buf.kept);
+    let Some(named) = after.named else {
+        return;
+    };
+    let mean = join_named(after, named, candidates, keep, &mut buf.kept);
+    // The rows with the draw's mean stand here for the passes below: the
+    // facts take their reference.
+    let joined_rows = NamedAffinity {
+        mean_in_flight: Some(mean),
+        ..*named
+    };
     let joined = RequestFacts {
-        named: Some(NamedAffinity {
-            mean_in_flight: Some(mean),
-            ..named
-        }),
+        named: Some(&joined_rows),
         ..*after
     };
     let band = combine(
@@ -2317,42 +2325,31 @@ fn run_drawn(
     };
     if drew {
         let mut targets = Targets::new();
-        match after.named {
-            // The rows the host named join the rows drawn where the picker
-            // takes them: out of line, so a draw nothing joins keeps the
-            // code it had.
-            Some(named) if profile.picker.joined_by_named() => {
-                // The rows named are few: each is asked a call a filter,
-                // which answers as the folded test does.
-                let mut keep = |c: &Candidate| profile.filters.iter().all(|f| f.keep(facts, c, cx));
-                order_joined(
-                    profile,
-                    after,
-                    named,
-                    candidates,
-                    &mut keep,
-                    buf,
-                    &mut targets,
-                );
-            }
-            _ => {
-                let band = combine(
-                    profile,
-                    after,
-                    candidates,
-                    &buf.kept,
-                    &mut buf.scores,
-                    &mut buf.stage,
-                );
-                profile.picker.order_drawn(
-                    after,
-                    candidates,
-                    &buf.kept,
-                    &buf.scores,
-                    band,
-                    &mut targets,
-                );
-            }
+        // The rows the host named join the rows drawn where the picker
+        // takes them: out of line, so a draw nothing joins keeps the code
+        // it had.
+        if after.named.is_some() && profile.picker.joined_by_named() {
+            // The rows named are few: each is asked a call a filter, which
+            // answers as the folded test does.
+            let mut keep = |c: &Candidate| profile.filters.iter().all(|f| f.keep(facts, c, cx));
+            order_joined(profile, after, candidates, &mut keep, buf, &mut targets);
+        } else {
+            let band = combine(
+                profile,
+                after,
+                candidates,
+                &buf.kept,
+                &mut buf.scores,
+                &mut buf.stage,
+            );
+            profile.picker.order_drawn(
+                after,
+                candidates,
+                &buf.kept,
+                &buf.scores,
+                band,
+                &mut targets,
+            );
         }
         if !targets.is_empty() {
             let trace = trace_drawn(index, facts, pool, candidates, &buf.kept, &buf.scores);
@@ -7080,7 +7077,7 @@ mod tests {
             ..single_binding()
         });
         let pool = [candidate(0, 0), candidate(1, 0), candidate(2, 0)];
-        let decide = |column: &[AffinityFacts], named: Option<NamedAffinity<'_>>| {
+        let decide = |column: &[AffinityFacts], named: Option<&NamedAffinity<'_>>| {
             let facts = RequestFacts {
                 model: "m",
                 affinity: column,
@@ -7111,9 +7108,11 @@ mod tests {
             holders: &holders,
             ..NamedAffinity::default()
         };
-        assert_eq!(lead(&decide(&[], Some(named))), Some(1));
+        assert_eq!(lead(&decide(&[], Some(&named))), Some(1));
         // Nobody named decides too.
-        assert!(decide(&[], Some(NamedAffinity::default())).pick().is_some());
+        assert!(decide(&[], Some(&NamedAffinity::default()))
+            .pick()
+            .is_some());
         // A request that names nothing reads its column.
         assert_eq!(lead(&decide(&held(&[10, 90, 20]), None)), Some(1));
     }
@@ -7157,7 +7156,7 @@ mod tests {
                 let facts = RequestFacts {
                     model: "m",
                     affinity: column,
-                    named: Some(NamedAffinity {
+                    named: Some(&NamedAffinity {
                         holders: &holders,
                         warming,
                         thin: false,
@@ -7298,7 +7297,7 @@ mod tests {
         let (prefills, decodes) = (paired(2), paired(2));
         let facts = RequestFacts {
             model: "m",
-            named: Some(NamedAffinity::default()),
+            named: Some(&NamedAffinity::default()),
             ..RequestFacts::default()
         };
         let decision = engine.decide_pair(
@@ -7328,7 +7327,7 @@ mod tests {
         }];
         let facts = RequestFacts {
             model: "m",
-            named: Some(NamedAffinity {
+            named: Some(&NamedAffinity {
                 holders: &holders,
                 ..NamedAffinity::default()
             }),
@@ -13158,16 +13157,21 @@ mod tests {
         }
     }
 
-    /// A request of sixteen blocks whose host names `holders`.
-    fn naming(seed: u64, holders: &[crate::NamedHolder]) -> RequestFacts<'_> {
+    /// The rows a host names: `holders`, and no warming row.
+    fn named_by(holders: &[crate::NamedHolder]) -> NamedAffinity<'_> {
+        NamedAffinity {
+            holders,
+            ..NamedAffinity::default()
+        }
+    }
+
+    /// A request of sixteen blocks whose host names the rows of `named`.
+    fn naming<'a>(seed: u64, named: &'a NamedAffinity<'a>) -> RequestFacts<'a> {
         static HASHES: [u64; 16] = [0; 16];
         RequestFacts {
             block_hashes: &HASHES,
             prompt_tokens: 256,
-            named: Some(NamedAffinity {
-                holders,
-                ..NamedAffinity::default()
-            }),
+            named: Some(named),
             ..request(seed)
         }
     }
@@ -13185,7 +13189,7 @@ mod tests {
         for (down, lead) in [(64u32, 40u32), (40, 20)] {
             let pool = pool_of(64, |i| i == down);
             for seed in 0..200u64 {
-                let got = drawn(&engine, &naming(seed, &holders), &pool);
+                let got = drawn(&engine, &naming(seed, &named_by(&holders)), &pool);
                 assert!(got.trace().drew_first(), "seed {seed}: the decision drew");
                 let rows = positions(&got);
                 assert_eq!(rows.first(), Some(&lead), "seed {seed}, row {down} down");
@@ -13247,7 +13251,7 @@ mod tests {
         let holders = [holding(20, 8)];
         let mut led = 0;
         for seed in 0..64u64 {
-            let got = drawn(&engine, &naming(seed, &holders), &pool);
+            let got = drawn(&engine, &naming(seed, &named_by(&holders)), &pool);
             assert!(got.trace().drew_first(), "seed {seed}: the decision drew");
             let handed = positions(&got);
             assert_eq!(
@@ -13275,7 +13279,11 @@ mod tests {
     fn rows_named_past_the_sample_stop_a_debug_build_where_the_picker_draws() {
         let engine = preset("cache_aware");
         let holders: Vec<crate::NamedHolder> = (0..17).map(|row| holding(row, 12)).collect();
-        let decision = drawn(&engine, &naming(1, &holders), &pool_of(64, |_| false));
+        let decision = drawn(
+            &engine,
+            &naming(1, &named_by(&holders)),
+            &pool_of(64, |_| false),
+        );
         panic!("seventeen rows named answered {decision:?}");
     }
 
@@ -13289,7 +13297,8 @@ mod tests {
         for seed in 0..40u64 {
             // Twice the sample, rows named: the whole pass, row for row.
             let pool = pool_of(32, |i| i % 17 == 5);
-            let facts = naming(seed, &holders);
+            let named = named_by(&holders);
+            let facts = naming(seed, &named);
             let got = drawn(&engine, &facts, &pool);
             assert!(!got.trace().drew_first(), "seed {seed}");
             assert_eq!(got, whole_pass(&twin, &facts, &pool), "seed {seed}");
@@ -13339,7 +13348,7 @@ mod tests {
         let holders = [holding(3, 12)];
         let pool = pool_of(64, |_| false);
         for seed in 0..20u64 {
-            let got = drawn(&engine, &naming(seed, &holders), &pool);
+            let got = drawn(&engine, &naming(seed, &named_by(&holders)), &pool);
             assert!(!got.trace().drew_first(), "seed {seed}");
             assert_eq!(got.trace().survivors.get(), Some(64), "seed {seed}");
         }
@@ -13363,7 +13372,7 @@ mod tests {
             .collect();
         let mut led = 0u32;
         for seed in 0..200u64 {
-            let got = drawn(&engine, &naming(seed, &holders), &pool);
+            let got = drawn(&engine, &naming(seed, &named_by(&holders)), &pool);
             assert!(got.trace().drew_first(), "seed {seed}");
             led += u32::from(positions(&got).first().is_some_and(|row| row % 16 == 8));
         }
@@ -13470,9 +13479,10 @@ mod tests {
         for (model, sample) in [("narrow", 4usize), ("wide", 16)] {
             let cap = engine.sample_for(model, Phase::Single) as usize;
             assert_eq!(cap, sample, "{model}");
+            let named = named_by(&holders[..cap]);
             let facts = RequestFacts {
                 model,
-                ..naming(1, &holders[..cap])
+                ..naming(1, &named)
             };
             let got = drawn(&engine, &facts, &pool);
             assert!(got.trace().drew_first(), "{model}: capped so, it draws");
@@ -13492,9 +13502,10 @@ mod tests {
         let holders: Vec<crate::NamedHolder> = (0..engine.needs().sample)
             .map(|row| holding(row, 12))
             .collect();
+        let named = named_by(&holders);
         let facts = RequestFacts {
             model: "narrow",
-            ..naming(1, &holders)
+            ..naming(1, &named)
         };
         let decision = drawn(&engine, &facts, &pool_of(64, |_| false));
         panic!("sixteen rows named under a sample of four answered {decision:?}");
@@ -13510,7 +13521,7 @@ mod tests {
         let engine = preset("cache_aware");
         let holders = [holding(3, 12)];
         let facts = RequestFacts {
-            named: Some(NamedAffinity {
+            named: Some(&NamedAffinity {
                 holders: &holders,
                 mean_in_flight: Some(2.0),
                 ..NamedAffinity::default()
@@ -13530,12 +13541,16 @@ mod tests {
         let holders = [holding(5, 12)];
         let pool = pool_of(64, |i| i % 2 == 0);
         for seed in 0..500u64 {
-            let got = drawn(&engine, &naming(seed, &holders), &pool);
+            let got = drawn(&engine, &naming(seed, &named_by(&holders)), &pool);
             assert!(got.trace().drew_first(), "seed {seed}");
             let rows = positions(&got);
             assert!(rows.iter().all(|row| row % 2 == 1), "seed {seed}: {rows:?}");
         }
-        let got = drawn(&engine, &naming(1, &holders), &pool_of(64, |_| true));
+        let got = drawn(
+            &engine,
+            &naming(1, &named_by(&holders)),
+            &pool_of(64, |_| true),
+        );
         assert!(!got.trace().drew_first());
         assert!(got.pick().is_none());
     }
@@ -13682,10 +13697,11 @@ mod tests {
         assert_eq!(engine.sample_for("mixed", Phase::Decode), 4);
         assert_eq!(engine.sample_for("nobody", Phase::Decode), 0);
         let holders: Vec<crate::NamedHolder> = (0..4).map(|row| holding(row, 12)).collect();
+        let named = named_by(&holders);
         let facts = RequestFacts {
             model: "mixed",
             phase: Phase::Decode,
-            ..naming(1, &holders)
+            ..naming(1, &named)
         };
         let got = drawn(&engine, &facts, &pool_of(64, |_| false));
         assert!(
@@ -13701,9 +13717,10 @@ mod tests {
     fn a_sample_under_eight_draws_from_sixteen_rows_on() {
         let engine = two_samples();
         let holders = [holding(0, 12)];
+        let named = named_by(&holders);
         let facts = RequestFacts {
             model: "narrow",
-            ..naming(1, &holders)
+            ..naming(1, &named)
         };
         for (rows, drew) in [(9, false), (12, false), (15, false), (16, true)] {
             let got = drawn(&engine, &facts, &pool_of(rows, |_| false));
@@ -14148,7 +14165,7 @@ mod tests {
         assert_eq!(engine.marks[0].ahead(), Marks::RANKED);
         let pool = ranked_pool(9);
         let facts = RequestFacts {
-            named: Some(NamedAffinity::default()),
+            named: Some(&NamedAffinity::default()),
             ..request(7)
         };
         let decision = reported(&engine, &facts, &pool);
@@ -14277,7 +14294,7 @@ mod tests {
         };
         let pool = ranked_pool(16);
         let names = RequestFacts {
-            named: Some(NamedAffinity::default()),
+            named: Some(&NamedAffinity::default()),
             ..request(7)
         };
         // Under the built-in picker of that kind the profile holds the

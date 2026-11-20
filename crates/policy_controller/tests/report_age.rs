@@ -242,7 +242,7 @@ fn prefix_affinity_ignores_stale_reports_in_the_kv_gate() {
     );
     assert_eq!(front, stale.as_slice());
     let named = RequestFacts {
-        named: Some(NamedAffinity {
+        named: Some(&NamedAffinity {
             holders: &[NamedHolder {
                 row: 0,
                 overlap_blocks: 8,

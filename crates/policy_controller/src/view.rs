@@ -387,7 +387,8 @@ pub struct AffinityFacts {
 /// lists are the host's to keep ascending by row and under the candidates'
 /// count: a debug build asserts it where a decision takes its inputs, and a
 /// release build reads them as they stand, a row past the count naming
-/// nobody. In-process only.
+/// nobody. The facts take it by reference ([`RequestFacts::named`]): the
+/// host keeps the value where it keeps the lists. In-process only.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct NamedAffinity<'a> {
     /// The rows that hold a leading part of the request, ascending by row,
@@ -959,9 +960,12 @@ pub struct RequestFacts<'a> {
     pub affinity: &'a [AffinityFacts],
     /// The rows the host names in that column's place ([`NamedAffinity`]):
     /// beside an empty column, the affinity stages read them. A pair
-    /// decision takes none: its sides read their pools' columns. In-process
+    /// decision takes none: its sides read their pools' columns. Behind a
+    /// reference: a decision copies its facts where it narrows or resumes
+    /// them, and a copy carries one word for the rows, named or not. The
+    /// host keeps the value readable as it keeps the candidates. In-process
     /// only.
-    pub named: Option<NamedAffinity<'a>>,
+    pub named: Option<&'a NamedAffinity<'a>>,
     /// The fingerprint of `model` when the host holds it, as a host that
     /// keeps its models makes it once a model; [`ModelFingerprint::NONE`]
     /// when it does not, and each read of [`RequestFacts::session`] then
@@ -1030,7 +1034,7 @@ impl<'a> RequestFacts<'a> {
     /// The column is asked first, so a host that fills one pays nothing for
     /// the rows it does not name.
     #[inline(always)]
-    pub(crate) fn named_alone(&self) -> Option<NamedAffinity<'a>> {
+    pub(crate) fn named_alone(&self) -> Option<&'a NamedAffinity<'a>> {
         if self.affinity.is_empty() {
             self.named
         } else {
@@ -1039,10 +1043,12 @@ impl<'a> RequestFacts<'a> {
     }
 
     /// What the candidates hold as the host fed this decision: the rows it
-    /// named where they answer, else its column. A pass takes it once.
+    /// named where they answer, else its column. A pass takes it once: the
+    /// rows named are copied from behind the facts' reference here, so a
+    /// row's read loads nothing more.
     pub(crate) fn feed(&self) -> Feed<'a> {
         match self.named_alone() {
-            Some(named) => Feed::Named(named),
+            Some(named) => Feed::Named(*named),
             None => Feed::Column(self.affinity),
         }
     }
@@ -1405,12 +1411,13 @@ mod tests {
 
     /// A request's facts are copied where a decision narrows or resumes
     /// them, so their size is a cost of those decisions: the pin is exact.
-    /// The signal cells are the last word, one for every signal: a field
+    /// The signal cells are the last word, one for every signal, and the
+    /// rows a host names stand behind a reference, one word: a field
     /// the facts gain moves this number and carries the decision bench's
     /// cells that copy the facts (`benches/decision.rs`).
     #[test]
     fn a_requests_facts_take_the_pinned_bytes() {
-        assert_eq!(size_of::<RequestFacts<'_>>(), 288);
+        assert_eq!(size_of::<RequestFacts<'_>>(), 248);
     }
 
     #[test]
@@ -1598,7 +1605,7 @@ mod tests {
             },
         ];
         let facts = RequestFacts {
-            named: Some(NamedAffinity {
+            named: Some(&NamedAffinity {
                 holders: &holders,
                 ..NamedAffinity::default()
             }),
@@ -1610,7 +1617,7 @@ mod tests {
         });
         assert_eq!(read, [(0, 0), (9, 0), (0, 0), (3, 7), (0, 0)]);
         let nobody = RequestFacts {
-            named: Some(NamedAffinity::default()),
+            named: Some(&NamedAffinity::default()),
             ..RequestFacts::default()
         };
         assert_eq!(nobody.affinity_at(3), AffinityFacts::default());

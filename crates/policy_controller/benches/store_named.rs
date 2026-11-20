@@ -199,6 +199,7 @@ fn decide(
                 &mut host.named,
             );
         }
+        let rows = named.then(|| host.named.affinity());
         let facts = RequestFacts {
             model: MODEL,
             prompt_tokens: tokens.len() as u32,
@@ -207,7 +208,7 @@ fn decide(
             seed,
             now_micros: built.now_micros,
             affinity: read.affinity,
-            named: named.then(|| host.named.affinity()),
+            named: rows.as_ref(),
             ..RequestFacts::default()
         };
         let constraints = Constraints {

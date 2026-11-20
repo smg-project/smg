@@ -589,7 +589,7 @@ impl PrefixAffinity {
         candidates: &[Candidate],
         kept: &[u32],
         out: &mut [f32],
-        named: NamedAffinity<'_>,
+        named: &NamedAffinity<'_>,
     ) -> TieBand {
         let request_blocks = self.gates.request_blocks(facts);
         // Nobody holding anything, the deepest match is zero without a
@@ -626,7 +626,11 @@ impl PrefixAffinity {
     /// depth. Each pass walks the holders beside its kept rows where the
     /// pool is read whole; behind a draw each row is searched once
     /// ([`Self::rank_drawn`]). Out of line: see [`Scorer::score`] of this
-    /// stage.
+    /// stage. Marked cold for the pass over a column, which then keeps its
+    /// row loop's values in registers: by count that pass read one
+    /// instruction a row more without the mark. A pass over rows named
+    /// pays the jump, two instructions.
+    #[cold]
     #[inline(never)]
     fn rank_named(
         &self,
@@ -634,14 +638,14 @@ impl PrefixAffinity {
         candidates: &[Candidate],
         kept: &[u32],
         out: &mut [f32],
-        named: NamedAffinity<'_>,
+        named: &NamedAffinity<'_>,
     ) -> TieBand {
         if named.drawn() {
             // Behind a draw the rows stand in the draw's order: each is
             // read by a search, once, and no cursor is kept.
             return self.rank_drawn(facts, candidates, kept, out, named);
         }
-        self.rank(facts, candidates, kept, out, Feed::Named(named), || {
+        self.rank(facts, candidates, kept, out, Feed::Named(*named), || {
             let mut walk = named.walk();
             move |i: u32| walk.entry(i)
         })
@@ -1098,8 +1102,10 @@ impl WarmupSlice {
     }
 
     /// The stage over the rows a host named: it ruled the warming rows
-    /// where it wrote, and none named slices nothing. Out of line, so a
-    /// pass over a column keeps the code it had.
+    /// where it wrote, and none named slices nothing. Out of line and
+    /// marked cold, so a pass over a column keeps the code it had
+    /// ([`PrefixAffinity::rank_named`]).
+    #[cold]
     #[inline(never)]
     fn score_named(
         &self,
@@ -1107,7 +1113,7 @@ impl WarmupSlice {
         candidates: &[Candidate],
         kept: &[u32],
         out: &mut [f32],
-        named: NamedAffinity<'_>,
+        named: &NamedAffinity<'_>,
     ) -> TieBand {
         if named.warming.is_empty() {
             return neutral(out);
@@ -1119,9 +1125,9 @@ impl WarmupSlice {
         // Behind a draw the pass reads the rows named by a search: one
         // body a read, the read chosen where the body is entered.
         if named.drawn() {
-            return self.turn::<true>(facts, candidates, kept, out, Feed::Named(named), warm);
+            return self.turn::<true>(facts, candidates, kept, out, Feed::Named(*named), warm);
         }
-        self.turn::<false>(facts, candidates, kept, out, Feed::Named(named), warm)
+        self.turn::<false>(facts, candidates, kept, out, Feed::Named(*named), warm)
     }
 
     /// One pass where somebody warms: the request is a miss the slice may
@@ -1956,7 +1962,7 @@ mod tests {
             ..facts(16)
         };
         let by_named = RequestFacts {
-            named: Some(named(&holders, &[2], true)),
+            named: Some(&named(&holders, &[2], true)),
             now_micros: 5_000_000,
             ..facts(16)
         };
@@ -2225,7 +2231,7 @@ mod tests {
         let mut rows = rows.to_vec();
         let lent = Lent::take(&mut rows);
         let facts = lent.beside(&RequestFacts {
-            named: Some(named),
+            named: Some(&named),
             ..*facts
         });
         let kept = kept(rows.len() as u32);
@@ -2319,7 +2325,7 @@ mod tests {
         assert_eq!(by_column, vec![1.0, 0.5]);
         assert_eq!(
             over(RequestFacts {
-                named: Some(named(&each, &[], false)),
+                named: Some(&named(&each, &[], false)),
                 ..facts(16)
             }),
             by_column
@@ -2464,7 +2470,7 @@ mod tests {
             ..facts(16)
         };
         let by_named = RequestFacts {
-            named: Some(named(&holders, &[], false)),
+            named: Some(&named(&holders, &[], false)),
             ..facts(16)
         };
         for (facts, feed) in [(&by_column, "the column"), (&by_named, "the rows named")] {
@@ -2485,7 +2491,7 @@ mod tests {
             ..facts(16)
         };
         let by_named = RequestFacts {
-            named: Some(named(&[], &[1, 3], true)),
+            named: Some(&named(&[], &[1, 3], true)),
             ..facts(16)
         };
         for (facts, feed) in [(&by_column, "the column"), (&by_named, "the rows named")] {
@@ -2620,7 +2626,7 @@ mod tests {
             let [by_walk, by_search] = [whole, drawn].map(|named| {
                 LOOKS_BEHIND.with(|looks| looks.set(0));
                 let facts = RequestFacts {
-                    named: Some(named),
+                    named: Some(&named),
                     ..facts(16)
                 };
                 let mut out = vec![0.0; order.len()];
@@ -2678,7 +2684,7 @@ mod tests {
         let pool = rows(&[candidate(0, 0, 0), candidate(1, 0, 0)]);
         let holders = [holder(1, 5)];
         let named = RequestFacts {
-            named: Some(named(&holders, &[], false)),
+            named: Some(&named(&holders, &[], false)),
             ..facts(16)
         };
         let nothing = Overlap {
@@ -2955,7 +2961,7 @@ mod tests {
             let feed = round as usize % 3;
             let facts = RequestFacts {
                 affinity: if feed == 2 { &column } else { &[] },
-                named: [Some(whole), Some(drawn), None][feed],
+                named: [Some(&whole), Some(&drawn), None][feed],
                 phase: if round % 5 == 0 {
                     Phase::Decode
                 } else {
@@ -3038,7 +3044,7 @@ mod tests {
             let stage = &stages[round as usize % stages.len()];
             let [by_pass, by_draw] = [whole, drawn].map(|named| {
                 let facts = RequestFacts {
-                    named: Some(named),
+                    named: Some(&named),
                     phase: if round % 5 == 0 {
                         Phase::Decode
                     } else {
@@ -3089,7 +3095,7 @@ mod tests {
         let [by_walk, by_search] = [whole, drawn].map(|named| {
             LOOKS_BEHIND.with(|looks| looks.set(0));
             let facts = RequestFacts {
-                named: Some(named),
+                named: Some(&named),
                 ..facts(16)
             };
             let mut out = vec![0.0; order.len()];
@@ -3315,7 +3321,7 @@ mod tests {
         // entry: the second row holds the request and the third warms.
         let holders = [holder(1, 8)];
         let naming = RequestFacts {
-            named: Some(named(&holders, &[2], true)),
+            named: Some(&named(&holders, &[2], true)),
             ..facts(16)
         };
         let pairs: [[Box<dyn Scorer>; 2]; 2] = [

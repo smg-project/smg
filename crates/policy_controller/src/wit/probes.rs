@@ -79,7 +79,7 @@ wit! {
     &[AffinityFacts] => "host-only",
     // Host-only: the rows a host names in that column's place stay in
     // process, as the column does.
-    Option<NamedAffinity<'_>> => "host-only",
+    Option<&NamedAffinity<'_>> => "host-only",
     // Host-only: a guest reads a candidate's requests in flight as the
     // candidate's own field, whichever feed its host read them from.
     Option<&crate::LentCounts<'_>> => "host-only",

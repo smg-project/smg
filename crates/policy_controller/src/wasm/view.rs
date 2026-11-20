@@ -1177,7 +1177,7 @@ mod tests {
     #[test]
     fn both_fills_give_a_named_holder_its_depth_and_every_other_row_nothing() {
         let facts = RequestFacts {
-            named: Some(NamedAffinity {
+            named: Some(&NamedAffinity {
                 holders: &[NamedHolder {
                     row: 1,
                     overlap_blocks: 17,

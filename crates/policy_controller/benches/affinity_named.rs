@@ -28,18 +28,23 @@ use smg_policy_controller::{
 
 const SIZES: [usize; 5] = [8, 64, 128, 512, 1024];
 
-fn facts(seed: u64, holders: &[NamedHolder]) -> RequestFacts<'_> {
+/// The rows a host names, as it writes them for one decision.
+fn named(holders: &[NamedHolder]) -> NamedAffinity<'_> {
+    NamedAffinity {
+        holders,
+        warming: &[],
+        thin: false,
+        mean_in_flight: None,
+    }
+}
+
+fn facts<'a>(seed: u64, named: &'a NamedAffinity<'a>) -> RequestFacts<'a> {
     RequestFacts {
         model: "m",
         prompt_tokens: 512,
         seed,
         now_micros: 1_000_000,
-        named: Some(NamedAffinity {
-            holders,
-            warming: &[],
-            thin: false,
-            mean_in_flight: None,
-        }),
+        named: Some(named),
         ..RequestFacts::default()
     }
 }
@@ -92,14 +97,18 @@ fn decide(c: &mut Criterion) {
             ..PoolFacts::default()
         };
         let cx = Constraints::default();
-        let first = engine.decide(&facts(0, &holders), &pool, &rows, &cx, &mut scratch);
+        let rows_named = named(&holders);
+        let first = engine.decide(&facts(0, &rows_named), &pool, &rows, &cx, &mut scratch);
         assert!(first.pick().is_some(), "{n}: the decision picks a worker");
         group.bench_with_input(BenchmarkId::new("cache_aware", n), &n, |b, _| {
             let mut seed = 0u64;
             b.iter(|| {
                 seed += 1;
+                // The host writes the rows it names and hands their
+                // reference, a decision.
+                let rows_named = named(black_box(&holders));
                 engine.decide(
-                    &facts(seed, black_box(&holders)),
+                    &facts(seed, &rows_named),
                     &pool,
                     black_box(&rows),
                     &cx,

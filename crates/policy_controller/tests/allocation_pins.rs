@@ -233,7 +233,7 @@ fn a_decision_by_rank_after_the_first_allocates_nothing() {
             ),
             (
                 RequestFacts {
-                    named: Some(NamedAffinity {
+                    named: Some(&NamedAffinity {
                         holders: &names,
                         ..NamedAffinity::default()
                     }),

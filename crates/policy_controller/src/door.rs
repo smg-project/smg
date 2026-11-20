@@ -1223,8 +1223,9 @@ pub(crate) fn hand<A: Asked, R>(
         // Over the rows it named the decider is asked in its form for
         // them, at this arm's own call: a decision that names no row
         // meets no test for it.
+        let rows = named.affinity();
         let viewed = Viewed {
-            named: Some(named.affinity()),
+            named: Some(&rows),
             ..viewed
         };
         let answer = request.read(lists, viewed, |facts, constraints| match sessions {
@@ -1396,7 +1397,7 @@ pub(crate) struct Viewed<'a> {
     pub(crate) max_block_hashes: usize,
     /// The rows the deciding host named in the column's place, where the
     /// request's profile takes them.
-    pub(crate) named: Option<NamedAffinity<'a>>,
+    pub(crate) named: Option<&'a NamedAffinity<'a>>,
     /// The pins of record the host lends the decision ([`PinSource`]);
     /// `None` where it keeps none.
     pub(crate) pins: Option<&'a dyn PinSource>,

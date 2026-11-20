@@ -4921,7 +4921,7 @@ pub(crate) mod tests {
                     &taken,
                     &mut buffers,
                     &none,
-                    |facts, _, rows, _, _| facts.named.map(|named| lists(&named, rows)),
+                    |facts, _, rows, _, _| facts.named.map(|named| lists(named, rows)),
                 )
                 .0
             })
