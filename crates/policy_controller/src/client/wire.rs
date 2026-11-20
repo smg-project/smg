@@ -87,6 +87,9 @@ pub(crate) fn request(request: &door::Request<'_>) -> (proto::DecideRequest, usi
             subset_hint: constraints.subset_hint,
         }),
         again: false,
+        // No link asks its decode later: the controller issues both sides.
+        decode_later: false,
+        decode_of: None,
     };
     (asked, facts.block_hashes.len() - held)
 }

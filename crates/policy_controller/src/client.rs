@@ -2269,6 +2269,7 @@ mod tests {
             }),
             constraints: None,
             again: false,
+            ..Default::default()
         };
         // A longer name is written with a longer length: fill, then mend.
         let mut name = size - request.encoded_len();

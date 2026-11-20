@@ -249,6 +249,7 @@ fn ask(id: &[u8]) -> DecideRequest {
         }),
         constraints: None,
         again: false,
+        ..Default::default()
     }
 }
 

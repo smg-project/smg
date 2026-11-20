@@ -454,7 +454,29 @@ message DecideRequest {
   // share a fingerprint read as one request. A repeat its stream answers
   // Busy before a decider takes it (no credit, a full queue, a budget of 0)
   // ends nothing: the earlier lease waits out its dispatch deadline.
+  //
+  // Beside decode_of the word reaches one side. It ends the decode side of
+  // the lease that field names, where a call issued it and no dispatch named
+  // it, and nothing else: no search by the id's fingerprint is run for a
+  // frame that carries decode_of, with the word or without. The ending is
+  // ahead of the decision, whatever its answer, and a pick of the same frame
+  // issues the side anew.
   bool again = 4;
+  // This pair's decode is sent after its prefill has run. The decision names
+  // the decode targets and issues the prefill side alone: the decode side is
+  // chosen, books nothing and waits under no dispatch deadline. Read on a
+  // request that enters a pair plan at its prefill, and on no other.
+  bool decode_later = 5;
+  // This request asks the decode side of the pair's lease this id names,
+  // issued to this gateway, while its prefill is dispatched and not ended and
+  // its decode side is chosen. The facts and the constraints are the
+  // request's own, as on its first decision. It is read at the decode phase,
+  // whatever its facts' phase says, and its decode_later is not read. The
+  // answer's pick names decode targets, each with the lease's prefill, under
+  // the same lease id. A refusal is a Busy with a reason of its own: the
+  // gateway then sends the decode the first pick named. An id of 0 is out of
+  // range.
+  optional fixed64 decode_of = 6;
 }
 
 message DecideAnswer {

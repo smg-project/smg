@@ -100,6 +100,7 @@ pub use leases::{
 };
 pub use loads::{LoadSample, LoadSink, LoadSource, PollMode};
 pub use membership::{Laid, NotMaker};
+pub(crate) use memory::DecodeIssue;
 pub use memory::{AtWork, Cut, Hand, MemoryStore, StoreCounts, Watch};
 pub use pairing::{PairClasses, PairingDescriptor};
 pub use reservations::{ReservationKind, ReservationStore};

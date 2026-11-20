@@ -58,7 +58,7 @@ use crate::{
     decision::{Decision, ShedReason, Target},
     demands::Demands,
     door::Asked,
-    lease::{Lease, Side},
+    lease::{Lease, LeaseId, Side},
     operator::{Document, NeedsRow, Status},
     proto::{self, busy::Reason, decide_answer::Answer, decision::Outcome, identity::Form},
     spec::{AppliedSpec, MAX_HEADERS},
@@ -102,6 +102,14 @@ const TEXT: u8 = 1;
 /// The bit for a frame whose gateway asks its request again
 /// (`DecideRequest.again`).
 const AGAIN: u8 = 1 << 1;
+
+/// The bit for a pair's frame whose decode is sent after its prefill has
+/// run (`DecideRequest.decode_later`).
+const DECODE_LATER: u8 = 1 << 2;
+
+/// The bit for a frame that asks the decode side of a lease
+/// (`DecideRequest.decode_of`).
+const DECODE_OF: u8 = 1 << 3;
 
 /// What the ranges of a frame's facts read as: its phase, the kind of its
 /// block hashes and its session key's fingerprint (`0` for a key carried
@@ -175,9 +183,12 @@ pub(crate) struct Checked {
     /// none.
     session_key: u64,
     /// What the frame says that few frames say, a bit a word ([`TEXT`],
-    /// [`AGAIN`]): `0` for a frame that says neither, so a decider reads
-    /// both by one test.
+    /// [`AGAIN`], [`DECODE_LATER`], [`DECODE_OF`]): `0` for a frame that
+    /// says none, so a decider reads them by one test.
     rare: u8,
+    /// The lease whose decode side the frame asks; `0` for a frame that
+    /// asks none.
+    decode_of: u64,
 }
 
 impl Checked {
@@ -194,7 +205,19 @@ impl Checked {
         // The prompt as text is said and not kept: no step reads it yet.
         let text = !mem::take(&mut facts.prompt_text).is_empty();
         let (phase, hash_kind, session_key) = ranges(&facts)?;
-        let rare = (u8::from(text) * TEXT) | (u8::from(request.again) * AGAIN);
+        let decode_of = match request.decode_of {
+            Some(0) => return Err(Refusal::OutOfRange("decode_of")),
+            asked => asked.unwrap_or(0),
+        };
+        // A frame that asks a lease's decode side is read at the decode
+        // phase, whatever its facts say, and is no pair's first request:
+        // its `decode_later` is not read.
+        let phase = if decode_of == 0 { phase } else { Phase::Decode };
+        let later = request.decode_later && decode_of == 0;
+        let rare = (u8::from(text) * TEXT)
+            | (u8::from(request.again) * AGAIN)
+            | (u8::from(later) * DECODE_LATER)
+            | (u8::from(decode_of != 0) * DECODE_OF);
         Ok(Self {
             id: request.request_id,
             facts,
@@ -203,6 +226,7 @@ impl Checked {
             hash_kind,
             session_key,
             rare,
+            decode_of,
         })
     }
 
@@ -227,8 +251,9 @@ impl Checked {
     }
 
     /// Whether the frame says a word few frames say: it carried its prompt
-    /// as text, or its gateway asks its request again. A decider asks this
-    /// of every request, once, and which word it is of those that say one.
+    /// as text, its gateway asks its request again, its pair's decode comes
+    /// later, or it asks a lease's decode side. A decider asks this of
+    /// every request, once, and which word it is of those that say one.
     pub(crate) const fn says_more(&self) -> bool {
         self.rare != 0
     }
@@ -243,6 +268,19 @@ impl Checked {
     /// holds no answer to it (`DecideRequest.again`).
     pub(crate) const fn again(&self) -> bool {
         self.rare & AGAIN != 0
+    }
+
+    /// Whether the pair's decode is sent after its prefill has run
+    /// (`DecideRequest.decode_later`): its first decision files the decode
+    /// side chosen.
+    pub(crate) const fn decode_later(&self) -> bool {
+        self.rare & DECODE_LATER != 0
+    }
+
+    /// The lease whose decode side the frame asks
+    /// (`DecideRequest.decode_of`); `None` for a frame that asks none.
+    pub(crate) fn decode_of(&self) -> Option<LeaseId> {
+        (self.rare & DECODE_OF != 0).then_some(LeaseId(self.decode_of))
     }
 
     /// How many block hashes the frame carries: a read hands the engine
@@ -430,7 +468,11 @@ impl Asked for Checked {
     }
 
     fn decode_later(&self) -> bool {
-        false
+        Self::decode_later(self)
+    }
+
+    fn asks_decode(&self) -> bool {
+        self.rare & DECODE_OF != 0
     }
 
     fn hashes(&self) -> usize {
@@ -1198,6 +1240,7 @@ mod tests {
                 subset_hint: Some(0),
             }),
             again: false,
+            ..Default::default()
         }
     }
 
@@ -1597,6 +1640,42 @@ mod tests {
         assert_eq!(said(texted(b"hello", true)), (true, true, true));
     }
 
+    /// A pair's two words of its decode ride the same byte. A frame keeps
+    /// its `decode_later` bit, and its `decode_of` id as it came. A frame
+    /// that asks a lease's decode side is read at the decode phase, whatever
+    /// its facts say, and is no pair's first request: its bit is not read.
+    #[test]
+    fn a_frame_keeps_its_decode_later_bit_and_its_decode_of_id() {
+        use crate::{door::Asked, view::Phase};
+        let said = |later: bool, of: Option<u64>| {
+            let mut frame = with(|facts| facts.phase = proto::Phase::Prefill.into());
+            (frame.decode_later, frame.decode_of) = (later, of);
+            let frame = Checked::new(frame).expect("no word is a field out of its range");
+            assert_eq!(Asked::decode_later(&frame), frame.decode_later());
+            let of = frame.decode_of().map(|lease| lease.0);
+            assert_eq!(frame.asks_decode(), of.is_some());
+            (frame.says_more(), frame.decode_later(), of, frame.phase())
+        };
+        let lease = 1 << 32 | 7;
+        assert_eq!(said(false, None), (false, false, None, Phase::Prefill));
+        assert_eq!(said(true, None), (true, true, None, Phase::Prefill));
+        let call = (true, false, Some(lease), Phase::Decode);
+        assert_eq!(said(false, Some(lease)), call);
+        assert_eq!(said(true, Some(lease)), call);
+        let last = Some(u64::MAX);
+        assert_eq!(said(false, last), (true, false, last, Phase::Decode));
+    }
+
+    /// No lease has the id 0: a frame that names it is refused by its
+    /// field, as any field out of its range is.
+    #[test]
+    fn a_decode_of_zero_is_refused_by_its_field() {
+        let mut frame = full();
+        frame.decode_of = Some(0);
+        let refused = Checked::new(frame).err();
+        assert_eq!(refused, Some(Refusal::OutOfRange("decode_of")));
+    }
+
     #[test]
     fn the_hashes_past_what_the_generation_reads_are_cut_at_the_read_and_the_first_ones_kept() {
         let frame = with(|facts| facts.block_hashes = (1..=6).collect());
@@ -1636,6 +1715,7 @@ mod tests {
             }),
             constraints: None,
             again: false,
+            ..Default::default()
         };
         let at = frame(MAX_BLOCK_HASHES);
         assert_eq!(prost::Message::encoded_len(&at), MAX_FRAME - 5);

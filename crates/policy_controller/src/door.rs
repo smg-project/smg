@@ -50,7 +50,7 @@ use crate::{
     sessions::{Forgets, SessionVerdict},
     spec::AppliedSpec,
     store::{
-        leases::DISPATCH_TTL, Ask, AtWork, Built, DecodeRefused, DecodeSide, Dispatch,
+        leases::DISPATCH_TTL, Ask, AtWork, Built, DecodeIssue, DecodeRefused, DecodeSide, Dispatch,
         EncodePairBuffers, GatewayId, Hand, HealthSink, LeaseRecord, LeaseRefused, LeaseState,
         LeasesStore, MemoryStore, Named, Naming, PairBuffers, Picked, Pin, Said, SessionsStore,
         Sides, ViewBuffers, World,
@@ -88,6 +88,12 @@ pub(crate) trait Asked {
     /// Whether the asker sends a pair's decode after its prefill has run:
     /// the pair's first decision then files the decode side chosen.
     fn decode_later(&self) -> bool;
+    /// Whether the request asks the decode side of a pair's lease: a
+    /// request of the served wire alone, read at the decode phase. It
+    /// takes a side's path whatever its model is bound to ([`entry`]).
+    fn asks_decode(&self) -> bool {
+        false
+    }
     /// How many block hashes the request carries.
     fn hashes(&self) -> usize;
     /// How many of them the generation of `spec` reads.
@@ -411,7 +417,9 @@ pub(crate) enum Entry {
     Pair,
     /// Another side of a pair plan. A pair's alternates ride its answer
     /// and a retry is a new pair request, so that side has no decision,
-    /// and one side's entry of the engine never makes one.
+    /// and one side's entry of the engine never makes one. The one
+    /// decision a side has is the decode of a lease its request names
+    /// ([`Asked::asks_decode`]).
     Side,
 }
 
@@ -434,6 +442,9 @@ fn entry_and_plan<A: Asked>(world: &World, taken: &Taken<'_, A>) -> (Entry, Plan
             Phase::Prefill => (Entry::Pair, binding.plan),
             _ => (Entry::Side, binding.plan),
         },
+        // A decode call whose model a reload bound to no pair plan is a
+        // side's request still: its lease's own test answers it.
+        _ if taken.request.asks_decode() => (Entry::Side, Plan::Single),
         _ => (Entry::Single, Plan::Single),
     }
 }
@@ -1153,6 +1164,114 @@ pub(crate) fn issue_pair<A: Asked>(
     Ok((lease, decode.lease(&lease)))
 }
 
+/// What a decode call's pick files: the decode side, beside the slot of
+/// the count it books.
+pub(crate) type DecodeBooking = (DecodeSide, Option<Slot>);
+
+/// The decode side of the pair's lease `lease` decided over one world, for
+/// both doors. The store's own test of the lease comes first, so a call
+/// it refuses runs no stage. Then the pair's rows are built and narrowed
+/// as [`pair_in`] builds them, and the engine's decode entry runs over the
+/// partners of the held prefill. The decode profile is shown the decode
+/// pool's facts: its size, its list and whether every row of it holds a
+/// report. A pick comes with what its issue files.
+///
+/// # Errors
+///
+/// [`DecodeRefused`]: why the lease takes no decode side. Nothing is built.
+pub(crate) fn decode_in<A: Asked>(
+    world: &World,
+    store: &MemoryStore,
+    taken: &Taken<'_, A>,
+    (lease, repeat): (LeaseId, bool),
+    buffers: &mut Buffers<A::Lists>,
+    own: &Part,
+) -> Result<(Decision, Option<DecodeBooking>), DecodeRefused> {
+    let prefill = store.held_prefill(taken.gateway, lease, repeat)?;
+    let Buffers {
+        pair,
+        scratch,
+        lists,
+        ..
+    } = buffers;
+    Ok(pair_with::<true, _, _, _>(
+        world,
+        taken,
+        own,
+        pair,
+        (lists, scratch),
+        |pair, _, model, ask, wires, subset| {
+            let built = world.build_pair(model, &ask, pair)?;
+            world.count_pair_in_flight(&built, &ask, pair);
+            Some((built, pair.narrow(wires, subset, &built)))
+        },
+        (
+            |engine, pair, facts, pool, cx, scratch| {
+                let facts = RequestFacts {
+                    phase: Phase::Decode,
+                    ..*facts
+                };
+                engine.decide_decode(&facts, pool, pair.pools(), prefill, cx, scratch)
+            },
+            |facts, decision, built, _| {
+                let (pick, (_, decodes)) = decision.pick().zip(built)?;
+                let first = pick.targets.first()?.pair?;
+                let side = DecodeSide {
+                    target: first.decode_id,
+                    picked: Picked::of_decodes(&pick.targets),
+                    session: RequestFacts {
+                        phase: Phase::Decode,
+                        ..*facts
+                    }
+                    .session(),
+                    state: LeaseState::ISSUED,
+                    tokens: facts.prompt_tokens,
+                    target_index: 0,
+                };
+                Some((side, world.booked(&decodes, side.target)))
+            },
+        ),
+    ))
+}
+
+/// Files a decode call's pick under the lease's id and tells the engine,
+/// under one hold of the file. The side is on file when the engine hears:
+/// a stage that panics there is held and counted, as under a report, and
+/// the caller still gets the pick the file holds. The side's lease comes
+/// with what the issue replaced, for a door that may undo it.
+///
+/// # Errors
+///
+/// [`DecodeRefused`]: the lease moved since the call's first test.
+pub(crate) fn issue_decode<A: Asked>(
+    store: &MemoryStore,
+    world: &World,
+    taken: &Taken<'_, A>,
+    (lease, repeat): (LeaseId, bool),
+    decision: &Decision,
+    booking: DecodeBooking,
+) -> Result<(Lease, DecodeIssue), DecodeRefused> {
+    let spec = world.spec();
+    store.issue_decided_decode(taken.gateway, lease, booking, taken.now, repeat, |lease| {
+        // The lease keeps the generation of its first decision, and the
+        // engine of that generation alone hears its words ([`issuing`]).
+        // Behind a reload the engine of this instant decided the side and
+        // hears nothing of the lease.
+        let Some(engine) = issuing(spec, lease) else {
+            return;
+        };
+        // The issue is dated at this call ([`issued_later`]).
+        let heard = || issued_later(world, engine, lease, decision, taken.now);
+        match catch_unwind(AssertUnwindSafe(heard)) {
+            Ok(()) => store.call_returned(),
+            Err(payload) => {
+                release(payload);
+                store.call_faulted();
+            }
+        }
+    })
+}
+
 /// The record of the lease `booking` asks on `side`, as its door hands it
 /// to the store: the store mints its id, and writes the mark of a pair's
 /// lease where it files one.
@@ -1792,7 +1911,7 @@ pub(crate) fn told(
 /// hears nothing of it: no dispatch, no end, and no issue of a side a call
 /// decides later.
 #[inline]
-fn issuing<'a>(spec: &'a AppliedSpec, lease: &Lease) -> Option<&'a Engine> {
+pub(crate) fn issuing<'a>(spec: &'a AppliedSpec, lease: &Lease) -> Option<&'a Engine> {
     (spec.generation() == lease.generation).then(|| spec.engine())
 }
 
@@ -3227,13 +3346,9 @@ impl Door {
         })
     }
 
-    /// A decode call's order. The store's own test of the lease comes
-    /// first, so a call it refuses runs no stage. Then the pair's rows of
-    /// this instant, the engine's decode entry over the held prefill's
-    /// partners and, for a pick, the side's issue under the lease's id,
-    /// dated at this call ([`issued_later`]).
-    /// The decode profile is shown the decode pool's facts: its size, its
-    /// list and whether every row of it holds a report.
+    /// A decode call's order at this door: the decision ([`decode_in`]) and,
+    /// for a pick, the side's issue under the lease's id
+    /// ([`issue_decode`]).
     #[inline(never)]
     fn decode(
         &self,
@@ -3244,86 +3359,18 @@ impl Door {
         lease: LeaseId,
     ) -> Result<Decided, Refused> {
         let store = &*self.store;
-        let prefill = store
-            .held_prefill(taken.gateway, lease)
+        // In process no answer is lost: a call is never a repeat.
+        let asked = (lease, false);
+        let (decision, booking) = decode_in(world, store, taken, asked, buffers, &self.parts[at])
             .map_err(Refused::Decode)?;
-        let Buffers {
-            pair,
-            scratch,
-            lists,
-            ..
-        } = buffers;
-        let (decision, side) = pair_with::<true, _, _, _>(
-            world,
-            taken,
-            &self.parts[at],
-            pair,
-            (lists, scratch),
-            |pair, _, model, ask, wires, subset| {
-                let built = world.build_pair(model, &ask, pair)?;
-                world.count_pair_in_flight(&built, &ask, pair);
-                Some((built, pair.narrow(wires, subset, &built)))
-            },
-            (
-                |engine, pair, facts, pool, cx, scratch| {
-                    let facts = RequestFacts {
-                        phase: Phase::Decode,
-                        ..*facts
-                    };
-                    engine.decide_decode(&facts, pool, pair.pools(), prefill, cx, scratch)
-                },
-                |facts, decision, built, _| {
-                    let (pick, (_, decodes)) = decision.pick().zip(built)?;
-                    let first = pick.targets.first()?.pair?;
-                    let side = DecodeSide {
-                        target: first.decode_id,
-                        picked: Picked::of_decodes(&pick.targets),
-                        session: RequestFacts {
-                            phase: Phase::Decode,
-                            ..*facts
-                        }
-                        .session(),
-                        state: LeaseState::ISSUED,
-                        tokens: facts.prompt_tokens,
-                        target_index: 0,
-                    };
-                    Some((side, world.booked(&decodes, side.target)))
-                },
-            ),
-        );
-        let Some((side, slot)) = side else {
-            return Ok(Decided {
-                decision,
-                lease: None,
-            });
-        };
-        let spec = world.spec();
-        let lease = store
-            .issue_decided_decode(taken.gateway, lease, side, slot, taken.now, |lease| {
-                // The lease keeps the generation of its first decision, and
-                // the engine of that generation alone hears its words
-                // ([`issuing`]). Behind a reload the engine of this instant
-                // decided the side and hears nothing of the lease.
-                let Some(engine) = issuing(spec, lease) else {
-                    return;
-                };
-                // The side is on file by now, and its issue is dated at
-                // this call. A stage that panics while it hears of the
-                // issue is held and counted, as under a report: the host
-                // still gets the pick the file holds.
-                let heard = || issued_later(world, engine, lease, &decision, taken.now);
-                match catch_unwind(AssertUnwindSafe(heard)) {
-                    Ok(()) => store.call_returned(),
-                    Err(payload) => {
-                        release(payload);
-                        store.call_faulted();
-                    }
-                }
-            })
-            .map_err(Refused::Decode)?;
+        let lease = booking
+            .map(|booking| issue_decode(store, world, taken, asked, &decision, booking))
+            .transpose()
+            .map_err(Refused::Decode)?
+            .map(|(lease, _)| lease);
         Ok(Decided {
             decision,
-            lease: Some(Leased {
+            lease: lease.map(|lease| Leased {
                 lease,
                 due: taken.due(),
             }),
