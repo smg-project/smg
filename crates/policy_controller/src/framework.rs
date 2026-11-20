@@ -863,6 +863,11 @@ pub struct Scratch {
     /// What the last decision made through the keeping entry read of its
     /// session key, kept for the request's shadow ([`SessionsFound`]).
     sessions_found: SessionsFound,
+    /// Whether the keeping entry made the last decision with this scratch.
+    /// Only a debug build keeps it, for the shadow's stop on a mix of the
+    /// two entries ([`Engine::shadow`]).
+    #[cfg(debug_assertions)]
+    kept_last: bool,
 }
 
 /// What a live decision under a sessions rule read of its key: the key's
@@ -870,8 +875,8 @@ pub struct Scratch {
 /// decision asked for one. The decision's commit moves the pins, so its
 /// shadow starts from this reading and reads neither again
 /// ([`Engine::shadow`]). The keeping entry writes it
-/// ([`Engine::decide_keeping`]). Every decision first forgets the one
-/// before it, so the scratch holds a reading of its last decision alone.
+/// ([`Engine::decide_keeping`]), and forgets the one before it first: the
+/// scratch holds a reading of its last keeping decision alone.
 #[derive(Clone, Copy, Debug, Default)]
 struct SessionsFound {
     /// The request the reading is of: its key, its clock and its seed. A
@@ -3948,6 +3953,8 @@ impl Engine {
     /// for one. The shadow starts from that reading, since the commit
     /// between the two moves the pins. A decision that answers before it
     /// reads its key keeps none, and leaves none of an earlier decision.
+    /// A host that shadows a request decides it through this entry, each
+    /// time it decides it.
     pub fn decide_keeping(
         &self,
         facts: &RequestFacts<'_>,
@@ -3956,6 +3963,9 @@ impl Engine {
         cx: &Constraints<'_>,
         scratch: &mut Scratch,
     ) -> Decision {
+        // No reading yet: one an earlier decision left is no word of this
+        // request, which may answer before it reads its key.
+        scratch.sessions_found.forget();
         self.decide_as::<true>(facts, pool, candidates, cx, scratch)
     }
 
@@ -3971,10 +3981,12 @@ impl Engine {
         cx: &Constraints<'_>,
         scratch: &mut Scratch,
     ) -> Decision {
-        // The scratch holds a reading of its last decision alone. One an
-        // earlier decision left is no word of this request, which may
-        // answer before it reads its key, or keep none.
-        scratch.sessions_found.forget();
+        // Which entry decides: a debug build keeps it for the shadow's
+        // stop on a mix of the two.
+        #[cfg(debug_assertions)]
+        {
+            scratch.kept_last = KEEPS;
+        }
         let bare = Trace {
             seed: facts.seed,
             generation: pool.generation,
@@ -4184,6 +4196,12 @@ impl Engine {
     /// Behind [`Self::decide`] or [`Self::decide_stated`], or with another
     /// scratch, the shadow reads the pins as they stand.
     ///
+    /// A host that shadows a request decides it through the keeping
+    /// entry, each time it decides it. Behind a plain decision the
+    /// scratch can still hold an earlier keeping decision's reading of
+    /// the request. The shadow would start from it, and a debug build
+    /// stops there.
+    ///
     /// Returns `None` where the phase resolves to no shadow. When the live
     /// and shadow profiles need different sets of named affinity rows,
     /// supply the affinity column.
@@ -4370,6 +4388,14 @@ impl Engine {
         // read of the key, where the scratch is that decision's.
         let found = scratch.sessions_found;
         let handed = !WRITE_SESSIONS && found.is_of(key.get(), facts);
+        // A host that shadows a request decides it through the keeping
+        // entry. Behind a plain decision the scratch can still hold an
+        // earlier keeping decision's reading of the same request.
+        #[cfg(debug_assertions)]
+        debug_assert!(
+            !handed || scratch.kept_last,
+            "the shadow takes a reading behind a plain decision"
+        );
         let mut pins = if WRITE_SESSIONS {
             self.sessions.lookup(key, facts.now_micros, rule)
         } else if handed {
@@ -6022,34 +6048,64 @@ mod tests {
         assert_eq!(first_of(&shadow), Some(rows[0].id));
     }
 
-    /// The scratch holds a reading of its last decision alone. A keeping
-    /// decision is committed, and the same request is decided again
-    /// through an entry that keeps none, the plain one and the stated
-    /// one. The shadow behind it reads the pins as they stand: it follows
-    /// the committed pin, where the earlier reading held no pin and its
-    /// own stages would place another worker.
+    /// A host that shadows a request decides it through the keeping entry.
+    /// Here one mixes the two: a keeping decision is committed, and the
+    /// same request is decided again through an entry that keeps none.
+    /// The scratch still holds the first decision's reading, and a debug
+    /// build stops where the shadow would take it.
+    #[cfg(debug_assertions)]
+    fn shadow_behind_a_mix_of_the_entries(stated: bool) {
+        let engine = with_shadow(least_requests_profile(), Some(SESSIONS));
+        let mut rows = [candidate(0, 1), candidate(1, 3)];
+        let facts = keyed_at(61, 71);
+        let (pool, cx) = (PoolFacts::default(), Constraints::default());
+        let mut scratch = Scratch::new();
+        let live = engine.decide_keeping(&facts, &pool, &rows, &cx, &mut scratch);
+        assert_eq!(commit(&engine, &facts, &live, 0), rows[0].id);
+        rows[0].in_flight = 9;
+        let again = if stated {
+            engine.decide_stated(&facts, &pool, &rows, &cx, &mut scratch)
+        } else {
+            engine.decide(&facts, &pool, &rows, &cx, &mut scratch)
+        };
+        assert_eq!(first_of(&again), Some(rows[0].id));
+        let _ = engine.shadow(&facts, &pool, &rows, &cx, &mut scratch);
+    }
+
+    #[cfg(debug_assertions)]
     #[test]
-    fn shadow_behind_a_plain_decision_takes_no_reading_of_an_earlier_keeping_one() {
-        for stated in [false, true] {
-            let engine = with_shadow(least_requests_profile(), Some(SESSIONS));
-            let mut rows = [candidate(0, 1), candidate(1, 3)];
-            let facts = keyed_at(61, 71);
-            let (pool, cx) = (PoolFacts::default(), Constraints::default());
-            let mut scratch = Scratch::new();
-            let live = engine.decide_keeping(&facts, &pool, &rows, &cx, &mut scratch);
-            assert_eq!(commit(&engine, &facts, &live, 0), rows[0].id);
-            rows[0].in_flight = 9;
-            let again = if stated {
-                engine.decide_stated(&facts, &pool, &rows, &cx, &mut scratch)
-            } else {
-                engine.decide(&facts, &pool, &rows, &cx, &mut scratch)
-            };
-            assert_eq!(first_of(&again), Some(rows[0].id), "stated {stated}");
-            let shadow = engine
-                .shadow(&facts, &pool, &rows, &cx, &mut scratch)
-                .expect("a shadow decision");
-            assert_eq!(first_of(&shadow), Some(rows[0].id), "stated {stated}");
-        }
+    #[should_panic(expected = "the shadow takes a reading behind a plain decision")]
+    fn shadow_behind_a_plain_decision_of_a_kept_request_stops_a_debug_build() {
+        shadow_behind_a_mix_of_the_entries(false);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "the shadow takes a reading behind a plain decision")]
+    fn shadow_behind_a_stated_decision_of_a_kept_request_stops_a_debug_build() {
+        shadow_behind_a_mix_of_the_entries(true);
+    }
+
+    /// The order a host that shadows keeps: each decision of the request
+    /// through the keeping entry. Behind the second one the shadow starts
+    /// from what that decision read, the pin the first one's commit left,
+    /// where its own stages would place another worker.
+    #[test]
+    fn shadow_behind_a_second_keeping_decision_starts_from_its_reading() {
+        let engine = with_shadow(least_requests_profile(), Some(SESSIONS));
+        let mut rows = [candidate(0, 1), candidate(1, 3)];
+        let facts = keyed_at(61, 71);
+        let (pool, cx) = (PoolFacts::default(), Constraints::default());
+        let mut scratch = Scratch::new();
+        let live = engine.decide_keeping(&facts, &pool, &rows, &cx, &mut scratch);
+        assert_eq!(commit(&engine, &facts, &live, 0), rows[0].id);
+        rows[0].in_flight = 9;
+        let again = engine.decide_keeping(&facts, &pool, &rows, &cx, &mut scratch);
+        assert_eq!(first_of(&again), Some(rows[0].id));
+        let shadow = engine
+            .shadow(&facts, &pool, &rows, &cx, &mut scratch)
+            .expect("a shadow decision");
+        assert_eq!(first_of(&shadow), Some(rows[0].id));
     }
 
     /// The shadow's entry takes its inputs as the live one does: a debug
