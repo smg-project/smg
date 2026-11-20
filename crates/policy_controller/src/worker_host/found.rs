@@ -1,6 +1,9 @@
 //! The facts a worker object states of its row.
 
-use smg_worker::{identity::basic::Worker, worker::ConnectionMode};
+use smg_worker::{
+    identity::basic::Worker,
+    worker::{ConnectionMode, HealthCheckConfig},
+};
 
 use super::object::role;
 use crate::{
@@ -74,6 +77,11 @@ pub fn facts(worker: &dyn Worker, standing: Option<&WorkerFacts>) -> WorkerFacts
                 .map(|waiting| u32::try_from(waiting).unwrap_or(u32::MAX))
                 .or(standing.overload.waiting_requests),
         },
+        // A window the object's registration left at the default is not a
+        // fact of the row: the object built from the row takes the default.
+        drain_settle_secs: (checks.drain_settle_secs
+            != HealthCheckConfig::default().drain_settle_secs)
+            .then(|| u32::try_from(checks.drain_settle_secs).unwrap_or(u32::MAX)),
     }
 }
 
@@ -142,6 +150,7 @@ mod tests {
                 labels: [("tier".to_owned(), "gold".to_owned())].into(),
                 bootstrap_port: Some(8_998),
                 kv_block_size: Some(32),
+                drain_settle_secs: Some(30),
                 health: HealthPolicy {
                     failure_threshold: 4,
                     success_threshold: 5,
@@ -306,6 +315,7 @@ mod tests {
             (0, 1, None, None)
         );
         assert_eq!(found.engine, URL);
+        assert_eq!(found.drain_settle_secs, None);
 
         let spec = WorkerSpec {
             dp_rank: Some(usize::from(u16::MAX) + 1),

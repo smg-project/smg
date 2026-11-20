@@ -1502,7 +1502,7 @@ pub(crate) mod tests {
         let hosted = Hosted::new(Arc::new(door), operator(), under(TERM));
         let maker = found("pods/a");
         let epoch = store.epoch();
-        let lost: [(&str, State); 8] = [
+        let lost: [(&str, State); 9] = [
             ("row.pairing", |facts| {
                 facts.pairing = Some(Arc::new(PairingDescriptor {
                     protocol: Some("pd".to_owned()),
@@ -1522,6 +1522,9 @@ pub(crate) mod tests {
             ("row.max_running", |facts| facts.max_running = Some(0)),
             ("row.kv_block_size", |facts| facts.kv_block_size = Some(0)),
             ("row.bootstrap_port", |facts| facts.bootstrap_port = Some(0)),
+            ("row.drain_settle_secs", |facts| {
+                facts.drain_settle_secs = Some(30);
+            }),
         ];
         for (fact, state) in lost {
             let answer = hosted.found(&maker, URL, &|_| {

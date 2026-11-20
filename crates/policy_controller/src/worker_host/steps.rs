@@ -389,7 +389,7 @@ mod tests {
         model_card::ModelCard,
         registry::WorkerRegistry,
         settings::{RegistrationSettings, UnhealthyRemovalScope},
-        worker::{RuntimeType, WorkerSpec},
+        worker::{HealthCheckConfig, RuntimeType, WorkerSpec},
         workflow::{
             RegistrationGates, WorkerRegistrationWorkflowData, WorkerRemovalRequest,
             WorkerRemovalWorkflowData, WorkflowHost,
@@ -916,10 +916,20 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_removal_marks_its_rows_draining_and_takes_them_behind_the_settle() {
+    async fn a_removal_marks_its_rows_draining_and_takes_them_behind_the_workers_own_window() {
         let f = Fixture::new();
-        f.seed(&Maker::Control, worker(URL, "model").as_ref())
-            .expect("registered");
+        // The registration states a drain window of thirty seconds: the row
+        // carries it, and the object the holder builds settles by it.
+        let checks = HealthCheckConfig {
+            drain_settle_secs: 30,
+            ..HealthCheckConfig::default()
+        };
+        let built = <BasicWorkerBuilder>::from_spec(WorkerSpec::new(URL.to_owned()))
+            .health_config(checks)
+            .build();
+        let mut cx = f.registration(WorkerJobAsker::Api, vec![Arc::new(built)]);
+        f.write().execute(&mut cx).await.expect("registered");
+        f.objects.follow(&*f.store);
         let live = f.host.registry.get_by_url(URL).expect("the held worker");
         let workflow = removal_at_door::<Host>(Arc::clone(&f.door), Arc::clone(&f.objects), SCOPE);
         let engine = WorkflowEngine::new();
@@ -933,7 +943,7 @@ mod tests {
             .start_workflow(WorkflowId::new("worker_removal"), data)
             .await
             .expect("started");
-        time::sleep(Duration::from_secs(4)).await;
+        time::sleep(Duration::from_secs(29)).await;
         assert_eq!(
             f.store.by_key(URL).expect("drain is settling").status,
             WorkerStatus::Draining
@@ -947,7 +957,7 @@ mod tests {
         .expect("the settle window ended")
         .expect("the final removal state");
         assert_eq!(state.status, WorkflowStatus::Completed);
-        assert!(at.elapsed() >= Duration::from_secs(5));
+        assert!(at.elapsed() >= Duration::from_secs(30));
         let data = state.context.data;
         for workers in [&data.drained_workers, &data.removed_workers] {
             assert_eq!(workers.len(), 1);
