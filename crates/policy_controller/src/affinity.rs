@@ -34,7 +34,7 @@ use crate::{
     spec::{AffinitySource, KvPressureParams, Needs, PrefixAffinityParams, WarmupSliceParams},
     view::{
         mean_in_flight, AffinityFacts, Candidate, Feed, HashKind, LoadRow, NamedAffinity, Phase,
-        RequestFacts, Walk, WorkerId,
+        RequestFacts, Walk, WorkerId, TEXT_BYTES_PER_TOKEN,
     },
     Draw,
 };
@@ -56,10 +56,6 @@ const DIVERT_SHALLOW_SHARE: f32 = 0.5;
 /// A thin worker with requests in flight takes no second diverted hit
 /// sooner than this after its last one.
 const DIVERT_WINDOW_MICROS: u64 = 2_000_000;
-
-/// Characters a text-window block prices at per token, for the held prefix's
-/// price under `hash_kind: text`.
-const CHARS_PER_TOKEN: u32 = 4;
 
 /// Tokens per block when the document names none: the block size of record
 /// of the common engines.
@@ -131,12 +127,12 @@ impl Default for Gates {
 
 /// How many whole blocks of `block_size` lie within the first `tokens`
 /// tokens of a request hashed in `kind`: the tokens over the block size,
-/// under the text kind their characters over the character block size. A
+/// under the text kind their bytes over the window's size in bytes. A
 /// block size is one at least.
 pub(crate) fn blocks_within(tokens: u32, kind: HashKind, block_size: u32) -> u32 {
     let units = match kind {
         HashKind::Token => tokens,
-        HashKind::Text => tokens.saturating_mul(CHARS_PER_TOKEN),
+        HashKind::Text => tokens.saturating_mul(TEXT_BYTES_PER_TOKEN),
     };
     units / block_size
 }
@@ -244,7 +240,7 @@ impl Gates {
     }
 
     /// The request's size in blocks: its token count over the block size
-    /// (the text kind's characters over the character block size, as
+    /// (the text kind's bytes over the window's size in bytes, as
     /// `tokens_of` reads them back), never under one and never under the
     /// block hashes the host sent. The host caps that list, so a long
     /// request's hashes alone would understate it and overstate every
@@ -261,7 +257,7 @@ impl Gates {
         let units = blocks as f32 * self.block_size_of(facts) as f32;
         match facts.hash_kind {
             HashKind::Token => units,
-            HashKind::Text => units / CHARS_PER_TOKEN as f32,
+            HashKind::Text => units / TEXT_BYTES_PER_TOKEN as f32,
         }
     }
 }
@@ -755,8 +751,10 @@ impl Scorer for PrefixAffinity {
             affinity: true,
             token_hashes: true,
             events: self.source != AffinitySource::Predictor,
+            // The record of sent prefixes holds text windows beside token
+            // blocks, and the events' index holds token blocks alone: a
+            // host hashes its text for a source that reads the record.
             sent_prefixes: placements,
-            text: placements,
             text_hashes: placements,
             loads: self.gates.kv_configured(),
             ..Needs::default()
@@ -2188,6 +2186,12 @@ mod tests {
                 needs.events,
                 source != AffinitySource::Predictor,
                 "{source:?}: events feed the index, they do not name the column"
+            );
+            let placements = source != AffinitySource::Index;
+            assert_eq!(
+                (needs.sent_prefixes, needs.text_hashes, needs.text),
+                (placements, placements, false),
+                "{source:?}: text windows are read by the record, and none asks for the text"
             );
         }
         assert!(warmup(1.0, 0).needs().affinity);

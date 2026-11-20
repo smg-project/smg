@@ -38,9 +38,12 @@
 //! known whole.
 //!
 //! A pool whose profile reads sent prefixes can also hold its model's
-//! record of sends. Naming adds holders without lanes to the room left
-//! under the index's cap. Issuing a lease writes the token blocks sent to
-//! its first target when that target has no lane.
+//! record of sends. Naming lists its holders without lanes beside the
+//! index's under one cap: after them, in the room they leave, or ahead of
+//! them where the profile's prefix stage reads the record alone. Issuing a
+//! lease writes the blocks sent to its first target when that target has
+//! no lane: token blocks, or windows of a request's text, which the index
+//! of cache events is never asked for.
 //!
 //! Locks: the table's, taken under the workers lock by a membership write
 //! and alone by a batch, each for as long as it takes to find or to change
@@ -829,6 +832,13 @@ impl PoolIndex {
     /// publication's that the view holds, less the rows whose naming ended
     /// by the decision's instant: whole within the cap, a draw of the cap
     /// past it, on another stream.
+    ///
+    /// Where the pool holds a record of sent prefixes, its rows with no
+    /// lane are named beside the index's holders under the same cap: after
+    /// them, in the room they leave, or ahead of them where the profile's
+    /// prefix stage reads the record alone. That lookup finds the deepest
+    /// block a worker of the view was sent. The index is asked for a token
+    /// request alone, the record for a request of either kind.
     #[inline]
     pub(super) fn name(
         &self,
@@ -891,8 +901,7 @@ impl PoolIndex {
         };
         let mut draw = Draw::new(naming.seed ^ HOLDERS_STREAM);
         let hashed = !naming.block_hashes.is_empty();
-        let record = tables.predicted.as_ref();
-        let record = record.filter(|_| hashed && hash_kind == HashKind::Token);
+        let record = tables.predicted.as_ref().filter(|_| hashed);
         // The record's holders, in the room the cap leaves where this runs.
         let name_record = |named: &mut Named, draw: &mut Draw| {
             let Some(predicted) = record else {
@@ -925,8 +934,11 @@ impl PoolIndex {
             name_record(named, &mut draw);
         }
         let room = cap.saturating_sub(named.holders.len());
+        // An engine's events are token blocks. A request hashed by windows
+        // of its text asks the record alone.
+        let tokens = hashed && hash_kind == HashKind::Token;
         let index = tables.index.as_ref();
-        if let Some(index) = index.filter(|_| hashed && room > 0) {
+        if let Some(index) = index.filter(|_| tokens && room > 0) {
             let mut mask = [0u64; MASK_WORDS];
             let within = if CUT {
                 tables.within_view(pool, view, &mut mask)

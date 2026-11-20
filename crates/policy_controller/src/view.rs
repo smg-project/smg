@@ -50,9 +50,14 @@ pub enum HashKind {
     /// Token blocks of the model's block size of record.
     #[default]
     Token,
-    /// Fixed character windows over the text, for a host without a tokenizer.
+    /// Fixed windows of bytes over the text, for a host without a tokenizer.
     Text,
 }
+
+/// Bytes of a request's text a token, for a host with no tokenizer. A text
+/// window is this many times the model's block size in bytes, and a text's
+/// size in tokens is its bytes over this.
+pub const TEXT_BYTES_PER_TOKEN: u32 = 4;
 
 /// Where a candidate's load row came from.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -892,10 +897,12 @@ pub struct RequestFacts<'a> {
     /// The per-decision seed, recorded in the trace: the only randomness a
     /// stage gets.
     pub seed: u64,
-    /// The size in tokens of one of the request's blocks as the host
-    /// counted them: an index's learned block size on an event-fed request,
-    /// the configured one on a tree-fed request; `0` reads the view's. Last
-    /// on the wire (the numbering follows the record's order).
+    /// The size of one of the request's blocks as the host counted them.
+    /// Under the token kind it is in tokens: an index's learned block size
+    /// on an event-fed request, the configured one on a tree-fed request;
+    /// `0` reads the view's. Under the text kind it is the window's size in
+    /// bytes, and a text request always states it. Last on the wire (the
+    /// numbering follows the record's order).
     pub block_size: u32,
     /// The host's clock at the decision, in microseconds since its origin.
     /// In-process only; no absolute instant crosses the wire.

@@ -55,7 +55,7 @@ use smg_worker::{
 
 use super::{
     elapsed_micros, left_no_worker, mark, profile_of,
-    testing::{bed, bed_under, cache_bed, store_blocks, MODEL},
+    testing::{bed, bed_under, cache_bed, record_bed, store_blocks, MODEL},
     transport_class, Ask, End, Hashes, Held, Host, Placed, Prompt, Sent, Unplaced, GATEWAY,
     NO_STAGE,
 };
@@ -772,7 +772,7 @@ async fn a_returning_prefix_lands_on_the_worker_that_holds_it() {
             MODEL,
             &Prompt {
                 tokens: Some(&tokens),
-                namespace: None,
+                ..Prompt::default()
             },
         );
         let now = Instant::now();
@@ -816,6 +816,58 @@ async fn a_returning_prefix_lands_on_the_worker_that_holds_it() {
             returning.request(Identity::NONE, 0, &[]).facts.block_size,
             block_size
         );
+    }
+}
+
+#[tokio::test]
+async fn a_returning_prompt_lands_on_the_worker_it_was_sent_to() {
+    // No size of record: a block is the document's 16 tokens, and a window
+    // those tokens at four bytes.
+    let text: String = ('a'..='z').cycle().take(256).collect();
+    let tokens: Vec<u32> = (1..=64).collect();
+    let as_text = Prompt {
+        text: Some(&text),
+        ..Prompt::default()
+    };
+    let as_tokens = Prompt {
+        tokens: Some(&tokens),
+        ..Prompt::default()
+    };
+    for prompt in [as_text, as_tokens] {
+        let (host, store) = record_bed();
+        let hashes = Hashes::of(&store, MODEL, &prompt);
+        assert!(!hashes.blocks.is_empty());
+        let now = Instant::now();
+        let cold = Ask {
+            hashes: Some(&hashes),
+            ..first(b"cold")
+        };
+        let sent = host.place(&cold, now).await.expect("a worker").id();
+        // Every other row reports less load: the record alone brings it back.
+        for row in store.snapshot().1 {
+            let running = u32::from(row.id == sent);
+            let load = LoadRow {
+                running,
+                ..LoadRow::default()
+            };
+            store.record(row.id, 0, load, now, LoadSource::Stream);
+        }
+        let now = now + PUBLISH_WINDOW;
+        store.publish(now);
+        let mut plain_matches = 0;
+        for turn in 0..32u8 {
+            let id = [turn];
+            let plain = first(&id);
+            let returning = Ask {
+                hashes: Some(&hashes),
+                ..plain
+            };
+            let placed = host.place(&returning, now).await.expect("a worker");
+            assert_eq!(placed.id(), sent, "request {turn}");
+            let placed = host.place(&plain, now).await.expect("a worker");
+            plain_matches += usize::from(placed.id() == sent);
+        }
+        assert!(plain_matches < 32);
     }
 }
 

@@ -1,9 +1,13 @@
 //! The prompt facts an attempt keeps for its asks to the controller.
 
-use kv_index::{salt::request_content_hashes_with_seed, XXH3_SEED};
+use kv_index::{
+    salt::{request_content_hashes_with_seed, request_text_hashes_with_seed},
+    XXH3_SEED,
+};
 use smg_policy_controller::{
     store::{KvEventSink, MemoryStore},
-    view::HashKind,
+    view::{HashKind, TEXT_BYTES_PER_TOKEN},
+    AppliedSpec,
 };
 
 use crate::policies::CacheNamespace;
@@ -13,6 +17,9 @@ use crate::policies::CacheNamespace;
 pub(crate) struct Prompt<'a> {
     /// The prompt's token ids, where the router tokenized it.
     pub tokens: Option<&'a [u32]>,
+    /// The request's text as its route reads it for routing, where the
+    /// router holds no token ids. Token ids win where both are stated.
+    pub text: Option<&'a str>,
     /// The request's cache partition, where it has one.
     pub namespace: Option<CacheNamespace>,
 }
@@ -22,6 +29,9 @@ pub(crate) struct Prompt<'a> {
 #[derive(Debug, Default)]
 pub(crate) struct Hashes {
     pub(super) blocks: Vec<u64>,
+    /// What the blocks hash: token blocks, or windows of the text.
+    pub(super) kind: HashKind,
+    /// The size of one block: in tokens, or in bytes for a window.
     pub(super) block_size: u32,
     pub(super) namespace_seed: u64,
     pub(super) prompt_tokens: u32,
@@ -30,28 +40,35 @@ pub(crate) struct Hashes {
 impl Hashes {
     /// The hashes of `prompt` for `model`, under the generation in force.
     ///
-    /// Hashing prompt tokens needs a positive block size of record. The
-    /// index can hold prehashed blocks before a size is recorded.
-    /// The generation bounds the number of full blocks hashed.
+    /// Prompt tokens are hashed by the model's block size
+    /// ([`block_size_of`]), so a model whose workers publish no cache
+    /// events is hashed too. The generation bounds the number of full
+    /// blocks hashed.
     pub(crate) fn of(store: &MemoryStore, model: &str, prompt: &Prompt<'_>) -> Self {
         let Some(tokens) = prompt.tokens else {
-            return Self::default();
+            // No engine hashes text: its seed is the whole partition's.
+            let seed = prompt
+                .namespace
+                .map_or(XXH3_SEED, CacheNamespace::text_seed);
+            return prompt.text.map_or_else(Self::default, |text| {
+                Self::of_text(store, model, text, seed)
+            });
         };
+        let namespace_seed = prompt
+            .namespace
+            .map_or(XXH3_SEED, CacheNamespace::event_seed);
         let tokens = if prompt.namespace.is_some() {
             tokens
         } else {
             CacheNamespace::unpartitioned_tokens(tokens)
         };
-        let block_size = store.block_size(model).unwrap_or(0);
+        let (block_size, depth) = store.deciding(|world| {
+            let spec = world.spec();
+            let block_size = block_size_of(store, spec, model);
+            let depth = spec.block_hashes_read(HashKind::Token, block_size);
+            (block_size, depth)
+        });
         let size = block_size as usize;
-        let depth = if block_size == 0 {
-            0
-        } else {
-            store.deciding(|world| world.spec().block_hashes_read(HashKind::Token, block_size))
-        };
-        let namespace_seed = prompt
-            .namespace
-            .map_or(XXH3_SEED, CacheNamespace::event_seed);
         let end = tokens.len().min(depth.saturating_mul(size));
         let blocks = request_content_hashes_with_seed(&tokens[..end], size, namespace_seed)
             .into_iter()
@@ -59,11 +76,46 @@ impl Hashes {
             .collect();
         Self {
             blocks,
+            kind: HashKind::Token,
             block_size,
             namespace_seed,
             prompt_tokens: prompt_token_count(tokens.len()),
         }
     }
+
+    /// The hashes of a prompt its router holds as text: one a window of the
+    /// text's bytes, as deep as the generation reads. A window is the
+    /// model's block size times [`TEXT_BYTES_PER_TOKEN`], so one number a
+    /// model sizes both kinds. The text is hashed as it stands: its whole
+    /// partition is in the seed ([`CacheNamespace::text_seed`]), and no
+    /// marker stands before it.
+    fn of_text(store: &MemoryStore, model: &str, text: &str, namespace_seed: u64) -> Self {
+        let bytes = text.as_bytes();
+        let (window, depth) = store.deciding(|world| {
+            let spec = world.spec();
+            let window = block_size_of(store, spec, model).saturating_mul(TEXT_BYTES_PER_TOKEN);
+            (window, spec.block_hashes_read(HashKind::Text, window))
+        });
+        let size = window as usize;
+        let end = bytes.len().min(depth.saturating_mul(size));
+        let blocks = request_text_hashes_with_seed(&bytes[..end], size, namespace_seed)
+            .into_iter()
+            .map(|hash| hash.0)
+            .collect();
+        Self {
+            blocks,
+            kind: HashKind::Text,
+            block_size: window,
+            namespace_seed,
+            prompt_tokens: prompt_token_count(bytes.len() / TEXT_BYTES_PER_TOKEN as usize),
+        }
+    }
+}
+
+/// The model's block size: its size of record, and the document's where it
+/// has none.
+fn block_size_of(store: &MemoryStore, spec: &AppliedSpec, model: &str) -> u32 {
+    store.block_size(model).unwrap_or_else(|| spec.block_size())
 }
 
 fn prompt_token_count(count: usize) -> u32 {
@@ -75,12 +127,14 @@ mod tests {
     use std::time::Instant;
 
     use kv_index::{
-        compute_request_content_hashes, salt::request_content_hashes_with_seed, XXH3_SEED,
+        compute_request_content_hashes,
+        salt::{request_content_hashes_with_seed, request_text_hashes_with_seed},
+        XXH3_SEED,
     };
     use openai_protocol::common::CachePartition;
     use smg_policy_controller::{
         store::{Ask as ViewAsk, BatchOutcome, KvEventSink, Named, Naming, ViewBuffers},
-        view::{HashKind, Identity, RequestFacts, Role},
+        view::{HashKind, Identity, RequestFacts, Role, TEXT_BYTES_PER_TOKEN},
         AppliedSpec, PolicySpec,
     };
 
@@ -88,7 +142,7 @@ mod tests {
     use crate::{
         policies::CacheNamespace,
         policy_controller::host::{
-            testing::{cache_bed, store_blocks, MODEL},
+            testing::{cache_bed, record_bed, store_blocks, MODEL},
             tests::first,
             Ask, Prompt, GATEWAY,
         },
@@ -99,7 +153,7 @@ mod tests {
     fn plain_prompt(tokens: &[u32]) -> Prompt<'_> {
         Prompt {
             tokens: Some(tokens),
-            namespace: None,
+            ..Prompt::default()
         }
     }
 
@@ -201,6 +255,73 @@ mod tests {
     }
 
     #[test]
+    fn a_text_prompt_is_hashed_by_windows_of_bytes() {
+        // A generation whose prefix stage reads the record of sent
+        // prefixes: it declares text hashes, so the host hashes them.
+        let (_, store) = record_bed();
+        store.set_block_size(MODEL, 32);
+        let window = 32 * TEXT_BYTES_PER_TOKEN;
+        let depth = store.deciding(|world| world.spec().block_hashes_read(HashKind::Text, window));
+        assert!(depth > 0, "the generation reads text windows");
+        // Two windows past the depth, and a tail of three bytes.
+        let text: String = ('a'..='z')
+            .cycle()
+            .take((depth + 2) * window as usize + 3)
+            .collect();
+        let prompt = Prompt {
+            text: Some(&text),
+            ..Prompt::default()
+        };
+        let hashes = Hashes::of(&store, MODEL, &prompt);
+        let read = &text.as_bytes()[..depth * window as usize];
+        let windows = request_text_hashes_with_seed(read, window as usize, XXH3_SEED);
+        assert_eq!(
+            hashes.blocks,
+            windows.iter().map(|hash| hash.0).collect::<Vec<_>>()
+        );
+        let facts = Ask {
+            hashes: Some(&hashes),
+            ..first(b"text")
+        }
+        .request(Identity::NONE, 0, &[])
+        .facts;
+        assert_eq!(
+            (facts.hash_kind, facts.block_size, facts.prompt_tokens),
+            (HashKind::Text, window, text.len() as u32 / 4)
+        );
+        // Token ids win where a prompt states both.
+        let tokens: Vec<u32> = (1..=64).collect();
+        let both = Prompt {
+            tokens: Some(&tokens),
+            ..prompt
+        };
+        assert_eq!(Hashes::of(&store, MODEL, &both).kind, HashKind::Token);
+        // A partition is in the text's seed whole. An extra key alone moves
+        // every window, where it leaves the seed of the engines' events.
+        let keyed = CacheNamespace::derive(&CachePartition {
+            extra_key: Some("k"),
+            ..CachePartition::default()
+        })
+        .expect("the namespace");
+        assert_eq!(keyed.event_seed(), XXH3_SEED);
+        let scoped = Hashes::of(
+            &store,
+            MODEL,
+            &Prompt {
+                namespace: Some(keyed),
+                ..prompt
+            },
+        );
+        assert_eq!(scoped.blocks.len(), hashes.blocks.len());
+        assert!(scoped
+            .blocks
+            .iter()
+            .zip(&hashes.blocks)
+            .all(|(a, b)| a != b));
+        assert_eq!(scoped.namespace_seed, keyed.text_seed());
+    }
+
+    #[test]
     fn a_request_with_no_tokens_states_no_hash() {
         let (_, store, _) = cache_bed();
         store.set_block_size(MODEL, BLOCK_SIZE);
@@ -216,20 +337,31 @@ mod tests {
         );
     }
 
+    /// A model whose workers state no block size is hashed by the
+    /// document's. A size of record wins once there is one, and one of
+    /// zero states no hash.
     #[test]
-    fn a_model_with_no_block_size_of_record_states_no_hash() {
+    fn a_model_with_no_block_size_of_record_is_hashed_by_the_documents() {
         let (_, store, _) = cache_bed();
-        let tokens = [1; BLOCK_SIZE as usize];
+        let size = store.deciding(|world| world.spec().block_size());
+        let tokens: Vec<u32> = (1..=2 * size).collect();
         let prompt = plain_prompt(&tokens);
-        for recorded in [None, Some(0)] {
+        for (recorded, blocks, stated) in [
+            (None, 2, size),
+            (Some(0), 0, 0),
+            (Some(2 * size), 1, 2 * size),
+        ] {
             if let Some(size) = recorded {
                 store.set_block_size(MODEL, size);
             }
             assert_eq!(store.block_size(MODEL), recorded);
             let hashes = Hashes::of(&store, MODEL, &prompt);
-            assert!(hashes.blocks.is_empty());
-            assert_eq!(hashes.block_size, 0);
-            assert_eq!(hashes.prompt_tokens, BLOCK_SIZE);
+            assert_eq!(
+                (hashes.blocks.len(), hashes.block_size),
+                (blocks, stated),
+                "{recorded:?}"
+            );
+            assert_eq!(hashes.prompt_tokens, tokens.len() as u32);
             assert_eq!(hashes.namespace_seed, XXH3_SEED);
         }
     }

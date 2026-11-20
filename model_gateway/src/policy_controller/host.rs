@@ -46,7 +46,7 @@ use smg_policy_controller::{
     handle::Handle,
     lease::{Outcome, ReleaseReason, Side, TransportClass},
     store::{GatewayId, MemoryStore, World},
-    view::{Constraints, HashKind, Identity, Phase, RequestFacts, WorkerId},
+    view::{Constraints, Identity, Phase, RequestFacts, WorkerId},
     worker_host::Objects,
     AppliedSpec, DerivedKey, KeySource,
 };
@@ -221,7 +221,7 @@ impl<'a> Ask<'a> {
         };
         if let Some(hashes) = self.hashes {
             facts.block_hashes = &hashes.blocks;
-            facts.hash_kind = HashKind::Token;
+            facts.hash_kind = hashes.kind;
             facts.block_size = hashes.block_size;
             facts.namespace_seed = hashes.namespace_seed;
             if facts.prompt_tokens == 0 {

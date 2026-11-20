@@ -51,7 +51,7 @@ enum HashKind {
   HASH_KIND_UNSPECIFIED = 0;
   // Token blocks of the model's block size of record.
   HASH_KIND_TOKEN = 1;
-  // Fixed character windows over the text, for a host without a tokenizer.
+  // Fixed windows of bytes over the text, for a host without a tokenizer.
   HASH_KIND_TEXT = 2;
 }
 
@@ -312,9 +312,11 @@ message RequestFacts {
   // request `Busy` with no reason and never decides it as a request with no
   // prefix.
   bytes prompt_text = 18;
-  // The size in tokens of one of the request's blocks as the host counted
-  // them: an index's learned block size on an event-fed request, the
-  // configured one on a tree-fed request; 0 reads the view's.
+  // The size of one of the request's blocks as the host counted them. Under
+  // the token kind it is in tokens: an index's learned block size on an
+  // event-fed request, the configured one on a tree-fed request; 0 reads the
+  // view's. Under the text kind it is the window's size in bytes, and a text
+  // request always states it.
   uint32 block_size = 19;
 }
 

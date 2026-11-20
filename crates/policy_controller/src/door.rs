@@ -8,7 +8,7 @@
 //! fence and the budget that a wire and an election bring. A host that
 //! embeds the engine runs it on the caller's thread ([`Door`]): no frame
 //! is built and no thread is hopped. A single's issued lease records the
-//! token prefix for its first target when the naming read a record of
+//! prefix for its first target when the naming read a record of
 //! sent prefixes and the target has no cache-event lane.
 //!
 //! A request reaches the order in the form it was asked in (the trait

@@ -318,6 +318,11 @@ fn a_worker_with_events_is_neither_written_nor_listed() -> Case {
     assert_eq!(buffers.named.holders.len(), 1);
     let holder = buffers.named.holders[0];
     assert_eq!((holder.overlap_blocks, holder.predicted_blocks), (1, 0));
+    // The same numbers as windows of a text ask no cache events.
+    let mut text = asked;
+    text.facts.hash_kind = HashKind::Text;
+    decide_only(&door, &text, later, &mut buffers);
+    assert!(buffers.named.holders.is_empty());
     Ok(())
 }
 
@@ -340,18 +345,21 @@ fn a_namespace_keeps_its_prefixes_apart() -> Case {
 }
 
 #[test]
-fn text_windows_and_absent_hashes_write_no_prefix() -> Case {
+fn a_text_request_is_recorded_and_absent_hashes_are_not() -> Case {
     let store = fleet();
     worker(&store, "a", Role::Single, &[MODEL], false)?;
     store.apply(applied(&merged(1)?)?)?;
     let door = Door::new(store.clone());
     let now = Instant::now();
     let mut buffers = Buffers::default();
+    issued(&door, &token_request(&[]), now, &mut buffers)?;
+    assert_eq!(slices(&store, Role::Single), Some(0));
     let mut asked = token_request(&HASHES);
     asked.facts.hash_kind = HashKind::Text;
     issued(&door, &asked, now, &mut buffers)?;
-    issued(&door, &token_request(&[]), now, &mut buffers)?;
-    assert_eq!(slices(&store, Role::Single), Some(0));
+    assert_eq!(slices(&store, Role::Single), Some(1));
+    decide_only(&door, &asked, now, &mut buffers);
+    assert_eq!(depths(&buffers), vec![(0, 12)]);
     Ok(())
 }
 

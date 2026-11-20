@@ -182,8 +182,10 @@ const SIDES: [&str; 4] = ["single", "prefill", "decode", "encode"];
 /// deployment. Read at apply, never per request.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Needs {
-    /// The request text in the view (a text-window hash form, for a host
-    /// without a tokenizer).
+    /// The request's text itself, for a controller that hashes it into
+    /// windows for a foreign host. No stage of this build declares it: a
+    /// host that holds the text hashes its windows itself
+    /// ([`Self::text_hashes`]).
     pub text: bool,
     /// The request's prefix block hashes over its token ids. A decision is
     /// handed the hashes as deep as the stages that declare them read
@@ -192,9 +194,10 @@ pub struct Needs {
     /// does, it is handed none. A plugin is shown the list where its own
     /// row declares one of the two, and none of it otherwise.
     pub token_hashes: bool,
-    /// The request's prefix block hashes over windows of its text, which a
-    /// host without a tokenizer feeds in their place. A stage that reads a
-    /// prefix by either kind sets this beside `text`.
+    /// The request's prefix block hashes over fixed windows of its text's
+    /// bytes, which a host with no token ids feeds in the token hashes'
+    /// place. A stage that reads a prefix by either kind sets this beside
+    /// `token_hashes`.
     pub text_hashes: bool,
     /// Load reports per worker.
     pub loads: bool,
@@ -5081,7 +5084,8 @@ impl AppliedSpec {
 
     /// The document's block size, in tokens: the size a request's blocks
     /// are counted by where neither the request nor a record says one.
-    pub(crate) fn block_size(&self) -> u32 {
+    #[must_use]
+    pub fn block_size(&self) -> u32 {
         self.block_size
     }
 
@@ -5108,11 +5112,21 @@ impl AppliedSpec {
     /// and the blocks are the request's own, counted as the key counts
     /// them. A stage that declares the request's hashes and names no depth
     /// reads to the cap ([`Self::max_block_hashes`]), which no depth is
-    /// past, and a generation with no such stage reads none. A host hashes
-    /// that many blocks of a request and no more, and hands the engine the
-    /// first that many of a longer list.
+    /// past, and a generation with no such stage reads none. A kind no
+    /// stage of the generation declares is read by none
+    /// ([`Needs::token_hashes`], [`Needs::text_hashes`]): `0`, whatever the
+    /// other kind's depth. A host hashes that many blocks of a request and
+    /// no more, and hands the engine the first that many of a longer list.
     #[must_use]
     pub fn block_hashes_read(&self, kind: HashKind, block_size: u32) -> usize {
+        let needs = self.needs();
+        let declared = match kind {
+            HashKind::Token => needs.token_hashes,
+            HashKind::Text => needs.text_hashes,
+        };
+        if !declared {
+            return 0;
+        }
         let blocks = match self.depth {
             HashDepth::Unread => 0,
             HashDepth::Tokens(tokens) => {
@@ -5367,6 +5381,8 @@ mod tests {
     #[test]
     fn an_applied_generation_reads_block_hashes_as_deep_as_its_stages_do() {
         use HashKind::{Text, Token};
+
+        use crate::door::tests::sent_prefixes::use_sent_prefixes;
         let preset = |name: &str| {
             let mut document = PolicySpec::preset(name).expect("a preset of this build");
             document.generation = 1;
@@ -5415,6 +5431,13 @@ mod tests {
         let mut held = preset("cache_aware");
         assert_eq!(applied(&held).block_hashes_read(Token, 0), 256);
         held.view.max_block_hashes = 128;
+        // A kind no stage declares is read by none. The prefix stage
+        // declares text hashes where its source reads the record of sent
+        // prefixes, and none where it reads cache events alone.
+        use_sent_prefixes(&mut held, AffinitySource::Index);
+        assert_eq!(applied(&held).block_hashes_read(Token, 0), 128);
+        assert_eq!(applied(&held).block_hashes_read(Text, 4), 0);
+        use_sent_prefixes(&mut held, AffinitySource::Merged);
         assert_eq!(applied(&held).block_hashes_read(Text, 4), 128);
         // A generation reads as deep as the deepest of its profiles.
         let two = doc(

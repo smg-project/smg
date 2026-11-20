@@ -1639,9 +1639,11 @@ impl World {
     /// none), and the pool's warming rows as this publication read them,
     /// less those whose naming ended by the decision's instant. Under a cap
     /// the holders' lookup lists nothing of the pool's length. Where the
-    /// pool holds a record of sent prefixes, its rows with no lane join
-    /// the holders in the room the cap leaves: that lookup walks the
-    /// workers at the request's deepest recorded block and no other. The
+    /// pool holds a record of sent prefixes, its rows with no lane are
+    /// named beside the index's holders under the same cap: after them, in
+    /// the room they leave, or ahead of them where the profile's prefix
+    /// stage reads the record alone. That lookup finds the deepest block a
+    /// worker of the view was sent. The
     /// warming rows are read where the publication holds them: they are
     /// copied only for a view that is not the pool whole, and past the
     /// first row's end. No row is named, and no index is read, where the
@@ -1680,7 +1682,8 @@ impl World {
 
     /// The one naming behind [`World::name`] and [`World::name_cut`], built
     /// once for each. Those two name a token request. The door names a
-    /// request by the kind it was hashed by.
+    /// request by the kind it was hashed by: a text request is named by
+    /// the record of sent prefixes alone.
     pub(crate) fn name_in<const CUT: bool>(
         &self,
         model: &str,
