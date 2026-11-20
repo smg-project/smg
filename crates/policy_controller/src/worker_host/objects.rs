@@ -240,9 +240,15 @@ impl<G> Objects<G> {
     /// finds none keeps a handed object that stands for the row, and
     /// builds from the row where none does. It warns and counts either
     /// way ([`Self::unhanded`]).
+    ///
+    /// A holder takes kept objects or a keeper
+    /// ([`Self::with_credentials`]), never both: a built object holds its
+    /// own credential. The later of the two calls stands, so this one
+    /// drops a keeper handed before it.
     #[must_use]
     pub fn with_built_kept(mut self) -> Self {
         self.built_kept = true;
+        self.credentials = None;
         self
     }
 }
@@ -281,10 +287,23 @@ impl<G: Generation> Objects<G> {
     /// the address it dials, when it is built. The host supplies the
     /// keeper. An object is built without a credential if there is no
     /// keeper, or no registration of this host bound its row.
+    ///
+    /// A holder takes a keeper or kept objects
+    /// ([`Self::with_built_kept`]), never both. The later of the two calls
+    /// stands, so this one ends the keeping of built objects.
     #[must_use]
     pub fn with_credentials(mut self, credentials: Arc<Credentials>) -> Self {
         self.credentials = Some(credentials);
+        self.built_kept = false;
         self
+    }
+
+    /// The keeper the holder reads at an object's build, where the host
+    /// handed one ([`Self::with_credentials`]). A registration line that
+    /// keeps reads it here, so the line's write and the build read one
+    /// keeper.
+    pub fn credentials(&self) -> Option<&Arc<Credentials>> {
+        self.credentials.as_ref()
     }
 
     /// Lay again the object of each row that dials the address of `facts`
@@ -389,6 +408,36 @@ impl<G: Generation> Objects<G> {
         }
         drop(offer);
         answer
+    }
+
+    /// Run `write`, one worker's write of a registration that keeps its
+    /// credential, in the hand-in's turn, and return its answer. `write`
+    /// is the whole of it: the keep, the door's write, the keeper's answer
+    /// and the lay-again that answer asks for. One runs at a time, so a
+    /// credential is settled and its object laid again before the next
+    /// registration reads either. A holder takes a keeper or kept objects,
+    /// never both, so the one turn serves the writes of either.
+    ///
+    /// `over` is the object a guarded write replaces, as in
+    /// [`Self::handing`]. A registration that states another credential
+    /// alone moves no row and lays another object, so here too an object
+    /// changes while its row's revision stands. The call refuses the write
+    /// as moved, ahead of it, where another object stands under `url` by
+    /// then.
+    pub(super) fn keeping<T>(
+        &self,
+        url: &str,
+        over: Option<&Arc<dyn Worker>>,
+        write: impl FnOnce() -> T,
+    ) -> Result<T, Refused> {
+        let _turn = self.handing.lock();
+        if let Some(seen) = over {
+            let stands = self.registry.get_by_url(url);
+            if !stands.is_some_and(|stands| Arc::ptr_eq(&stands, seen)) {
+                return Err(Refused::Moved);
+            }
+        }
+        Ok(write())
     }
 
     /// How many lays found no object handed in, under

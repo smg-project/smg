@@ -21,8 +21,14 @@ use wfaas::{
     WorkflowDefinition, WorkflowError, WorkflowResult,
 };
 
-use super::{Expect, Membership, Objects, Refused, Remover, Standing, Wrote};
-use crate::store::{Maker, Unmade};
+use super::{
+    facts, Credentials, Expect, KeptCredential, Membership, Objects, Refused, Remover, Standing,
+    Wrote,
+};
+use crate::{
+    store::{Maker, Unmade, WorkersStore},
+    view::WorkerId,
+};
 
 /// The provider name used by the host's own discovery source.
 pub const DISCOVERY: &str = "discovery";
@@ -67,7 +73,28 @@ pub const REMOVE_WORKERS_AT_DOOR_STEP: &str = "remove_workers_at_door";
 pub struct WriteWorkersAtDoor<G> {
     door: Arc<dyn Membership>,
     objects: Arc<Objects<G>>,
+    keeping: Option<Keeping>,
 }
+
+/// What a write that keeps holds. A row holds no credential: the write
+/// keeps what each worker states ahead of its row, and answers the keeper
+/// with the door's answer.
+struct Keeping {
+    /// The keeper the write's holder reads at an object's build, read from
+    /// that holder where the line is built ([`Objects::credentials`]). So
+    /// the write and the build read one keeper.
+    credentials: Arc<Credentials>,
+    /// The store that holder follows. Where the keeper's answer says so,
+    /// the write has the holder lay the address's objects again from it.
+    store: Arc<dyn WorkersStore>,
+}
+
+/// A registration line that keeps was asked over a holder built with no
+/// keeper ([`Objects::with_credentials`]). The objects such a holder
+/// builds would hold nothing of what the line kept.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("the holder was built with no keeper, so its registration line can keep no credential")]
+pub struct NoKeeper;
 
 /// Mark the rows that still stand for the workers this removal names.
 pub struct DrainWorkersAtDoor<G> {
@@ -97,11 +124,66 @@ pub struct RemoveWorkersAtDoor<G> {
 /// expects anything and a create-only job expects nothing. A replacement
 /// by id expects the row behind the registry's worker of that id, read
 /// through `objects` at the revision the job names.
+///
+/// The write keeps no credential: the object the holder builds from a row
+/// carries none. [`registration_at_door_keeping`] is the line of a host
+/// that keeps its workers' credentials.
 pub fn registration_at_door<H: WorkflowHost>(
     settings: &RegistrationSettings,
     gates: RegistrationGates,
     door: Arc<dyn Membership>,
     objects: Arc<Objects<H::Generation>>,
+    behind: &[&'static str],
+) -> WorkflowDefinition<WorkerRegistrationWorkflowData<H>> {
+    registration_line(settings, gates, door, objects, None, behind)
+}
+
+/// [`registration_at_door`] for a host that keeps its workers'
+/// credentials. The write keeps the credential each worker states ahead of
+/// the row, in the keeper `objects` was built with
+/// ([`Objects::with_credentials`]), and the holder builds the row's object
+/// with it.
+///
+/// `store` is the store the holder follows: where the keeper's answer says
+/// so, the write has the holder lay the address's objects again from it. A
+/// holder is built with no store, since each of its reads is handed one.
+///
+/// The write runs in the holder's turn, from its keep to that lay-again. A
+/// registration that states another credential alone moves no row, and the
+/// holder lays another object while the row's revision stands. So a
+/// replacement by id is refused as moved, ahead of its keep, where another
+/// object stands under its URL by then.
+///
+/// A holder built with no keeper is refused ([`NoKeeper`]). A holder that
+/// keeps built objects ([`Objects::with_built_kept`]) is one: a built
+/// object holds its own credential.
+pub fn registration_at_door_keeping<H: WorkflowHost>(
+    settings: &RegistrationSettings,
+    gates: RegistrationGates,
+    door: Arc<dyn Membership>,
+    objects: Arc<Objects<H::Generation>>,
+    store: Arc<dyn WorkersStore>,
+    behind: &[&'static str],
+) -> Result<WorkflowDefinition<WorkerRegistrationWorkflowData<H>>, NoKeeper> {
+    let credentials = Arc::clone(objects.credentials().ok_or(NoKeeper)?);
+    let keeping = Keeping { credentials, store };
+    Ok(registration_line(
+        settings,
+        gates,
+        door,
+        objects,
+        Some(keeping),
+        behind,
+    ))
+}
+
+/// The registration line of both doors above.
+fn registration_line<H: WorkflowHost>(
+    settings: &RegistrationSettings,
+    gates: RegistrationGates,
+    door: Arc<dyn Membership>,
+    objects: Arc<Objects<H::Generation>>,
+    keeping: Option<Keeping>,
     behind: &[&'static str],
 ) -> WorkflowDefinition<WorkerRegistrationWorkflowData<H>> {
     let dependencies = if behind.is_empty() {
@@ -113,7 +195,11 @@ pub fn registration_at_door<H: WorkflowHost>(
         StepDefinition::new(
             WRITE_WORKERS_AT_DOOR_STEP,
             "Write workers at the membership door",
-            Arc::new(WriteWorkersAtDoor { door, objects }),
+            Arc::new(WriteWorkersAtDoor {
+                door,
+                objects,
+                keeping,
+            }),
         )
         .with_timeout(Duration::from_secs(5))
         .with_failure_action(FailureAction::FailWorkflow)
@@ -172,6 +258,7 @@ pub fn removal_at_door<H: WorkflowHost>(
 
 const NOT_LEADING: &str = "the membership door does not lead";
 const MOVED: &str = "the membership row moved";
+const IN_FLIGHT: &str = "another registration is writing at the worker's address";
 const ABSENT: &str = "no row is registered under the URL";
 
 fn failed(step: &str, message: impl Into<String>) -> WorkflowError {
@@ -287,19 +374,100 @@ impl<H: WorkflowHost> StepExecutor<WorkerRegistrationWorkflowData<H>>
             }
         };
         for worker in workers {
-            let url = worker.url();
-            self.door
-                .found_built(&maker, expect, worker, over.as_ref())
-                .map_err(|refusal| registration_refusal(url, refusal))?;
+            self.write_at_door(&maker, expect, worker, over.as_ref())?;
         }
         data.workers = Some(WorkerList::from_workers(workers));
         Ok(StepResult::Success)
     }
 
-    /// A step's error carries text: the two fixed messages name the refusals
-    /// worth a second attempt.
+    /// A step's error carries text: the three fixed messages name the
+    /// refusals worth a second attempt.
     fn is_retryable(&self, error: &WorkflowError) -> bool {
-        matches!(error, WorkflowError::StepFailed { message, .. } if message == NOT_LEADING || message == MOVED)
+        matches!(
+            error,
+            WorkflowError::StepFailed { message, .. }
+                if message == NOT_LEADING || message == MOVED || message == IN_FLIGHT
+        )
+    }
+}
+
+impl<G: Generation> WriteWorkersAtDoor<G> {
+    /// Write one worker at the door. A line that keeps runs the whole of
+    /// it in its holder's turn ([`Objects::keeping`]): the keep, the door's
+    /// write, the keeper's answer and the lay-again that answer asks for.
+    /// A guarded write is refused there as moved, ahead of its keep, where
+    /// another object stands under the URL by then. The plain line takes
+    /// no turn here: where its holder keeps built objects, its door hands
+    /// in under that turn.
+    fn write_at_door(
+        &self,
+        maker: &Maker,
+        expect: Expect,
+        worker: &Arc<dyn Worker>,
+        over: Option<&Arc<dyn Worker>>,
+    ) -> WorkflowResult<Wrote> {
+        let url = worker.url();
+        let write = || -> WorkflowResult<Wrote> {
+            // Kept ahead of the write: the holder may build the row's
+            // object inside the door's turn.
+            let kept = self.keep(worker.as_ref())?;
+            let answer = self.door.found_built(maker, expect, worker, over);
+            self.answer_kept(worker.as_ref(), kept, answer.as_ref().ok());
+            answer.map_err(|refusal| registration_refusal(url, refusal))
+        };
+        if self.keeping.is_none() {
+            return write();
+        }
+        self.objects
+            .keeping(url, over, write)
+            .map_err(|refusal| registration_refusal(url, refusal))?
+    }
+
+    /// Keep what `worker` states for its engine, ahead of its row's write.
+    /// One registration is in flight at an address: a second fails here,
+    /// before the door, and is tried again.
+    fn keep(&self, worker: &dyn Worker) -> WorkflowResult<Option<KeptCredential>> {
+        let Some(keeping) = &self.keeping else {
+            return Ok(None);
+        };
+        keeping
+            .credentials
+            .keep(&facts(worker, None), worker.api_key().cloned())
+            .map(Some)
+            .map_err(|_| failed(WRITE_WORKERS_AT_DOOR_STEP, IN_FLIGHT))
+    }
+
+    /// Answer the keeper at the door's answer, with no await between the
+    /// two: the row the door wrote is accepted, and a refusal puts back
+    /// what stood. Where the keeper says an object may hold another
+    /// credential than its row takes, the holder lays the address again.
+    fn answer_kept(
+        &self,
+        worker: &dyn Worker,
+        kept: Option<KeptCredential>,
+        wrote: Option<&Wrote>,
+    ) {
+        let (Some(keeping), Some(kept)) = (&self.keeping, kept) else {
+            return;
+        };
+        let again = match wrote.and_then(written_row) {
+            Some(row) => kept.accepted(row),
+            None => kept.put_back(),
+        };
+        if again {
+            self.objects
+                .lay_again(keeping.store.as_ref(), &facts(worker, None));
+        }
+    }
+}
+
+/// The row a registration's write stands on: the new one of a replacement.
+/// A removal's answers name no such row.
+fn written_row(wrote: &Wrote) -> Option<WorkerId> {
+    match *wrote {
+        Wrote::Registered(row) | Wrote::InPlace(row) | Wrote::Unmoved(row) => Some(row),
+        Wrote::Another { new, .. } => Some(new),
+        Wrote::Draining(_) | Wrote::Removed(_) => None,
     }
 }
 
@@ -739,6 +907,29 @@ mod tests {
             WriteWorkersAtDoor {
                 door: Arc::clone(&self.door),
                 objects: Arc::clone(&self.objects),
+                keeping: None,
+            }
+        }
+
+        /// The fixture with a keeper that its holder reads.
+        fn keeping() -> (Self, Arc<Credentials>) {
+            let mut fixture = Self::new();
+            let credentials = Arc::new(Credentials::new());
+            let registry = Arc::clone(&fixture.host.registry);
+            fixture.objects =
+                Arc::new(Objects::new(registry).with_credentials(Arc::clone(&credentials)));
+            (fixture, credentials)
+        }
+
+        /// The write that keeps in `credentials`.
+        fn write_keeping(&self, credentials: &Arc<Credentials>) -> WriteWorkersAtDoor<Members> {
+            let store: Arc<dyn WorkersStore> = self.store.clone();
+            WriteWorkersAtDoor {
+                keeping: Some(Keeping {
+                    credentials: Arc::clone(credentials),
+                    store,
+                }),
+                ..self.write()
             }
         }
 
@@ -766,6 +957,24 @@ mod tests {
             ..WorkerSpec::new(url.to_owned())
         };
         Arc::new(<BasicWorkerBuilder>::from_spec(spec).build())
+    }
+
+    /// A worker that states `key` for its engine.
+    fn keyed(url: &str, key: &str) -> Arc<dyn Worker> {
+        let spec = WorkerSpec {
+            models: vec![ModelCard::new("model")].into(),
+            api_key: Some(key.to_owned()),
+            ..WorkerSpec::new(url.to_owned())
+        };
+        Arc::new(<BasicWorkerBuilder>::from_spec(spec).build())
+    }
+
+    /// The credential the row's object at `url` holds, once the holder has
+    /// followed the store.
+    fn held_key(f: &Fixture, url: &str) -> Option<String> {
+        f.objects.follow(&*f.store);
+        let object = f.host.registry.get_by_url(url).expect("the row's object");
+        object.api_key().cloned()
     }
 
     #[test]
@@ -1082,6 +1291,312 @@ mod tests {
                 retryable
             );
         }
+    }
+
+    /// A row holds no credential. A write that keeps hands what each worker
+    /// states to the host's keeper, and the holder builds the row's object
+    /// with it. A worker that states none is built with none.
+    #[tokio::test]
+    async fn a_keeping_write_builds_each_rows_object_with_what_its_worker_states() {
+        let (f, credentials) = Fixture::keeping();
+        let plain = "http://plain:8000";
+        let workers = vec![keyed(URL, "key-a"), worker(plain, "model")];
+        let mut cx = f.registration(WorkerJobAsker::Startup, workers);
+        let write = f.write_keeping(&credentials);
+        assert_eq!(
+            write.execute(&mut cx).await.expect("written"),
+            StepResult::Success
+        );
+        assert_eq!(held_key(&f, URL).as_deref(), Some("key-a"));
+        assert_eq!(held_key(&f, plain), None);
+    }
+
+    /// A worker registered again with another credential moves no row, so
+    /// no change tells the holder. The write has the holder lay the
+    /// address's object again, and that object holds the new credential.
+    #[tokio::test]
+    async fn a_keeping_write_of_another_credential_lays_the_object_again() {
+        let (f, credentials) = Fixture::keeping();
+        let write = f.write_keeping(&credentials);
+        let mut cx = f.registration(WorkerJobAsker::Startup, vec![keyed(URL, "key-a")]);
+        write.execute(&mut cx).await.expect("written");
+        assert_eq!(held_key(&f, URL).as_deref(), Some("key-a"));
+        let epoch = f.store.epoch();
+
+        let mut cx = f.registration(WorkerJobAsker::Startup, vec![keyed(URL, "key-b")]);
+        write.execute(&mut cx).await.expect("unchanged");
+        assert_eq!(f.store.epoch(), epoch, "the row did not move");
+        let object = f.host.registry.get_by_url(URL).expect("the row's object");
+        assert_eq!(object.api_key().map(String::as_str), Some("key-b"));
+    }
+
+    /// A write the door refuses puts its credential back: nothing is kept
+    /// for a row that was not written.
+    #[tokio::test]
+    async fn a_keeping_write_the_door_refuses_keeps_nothing() {
+        let (f, credentials) = Fixture::keeping();
+        let discovered = Maker::provider(DISCOVERY, URL).expect("a provider");
+        f.seed(&discovered, worker(URL, "model").as_ref())
+            .expect("registered");
+
+        let mut cx = f.registration(WorkerJobAsker::Startup, vec![keyed(URL, "key-a")]);
+        let write = f.write_keeping(&credentials);
+        write
+            .execute(&mut cx)
+            .await
+            .expect_err("another maker's row");
+        assert!(credentials.is_empty());
+        assert_eq!(held_key(&f, URL), None);
+    }
+
+    /// One registration is in flight at an address. A second write there
+    /// fails before the door, and is tried again.
+    #[tokio::test]
+    async fn a_keeping_write_at_an_address_in_flight_fails_and_is_tried_again() {
+        let (f, credentials) = Fixture::keeping();
+        let first = keyed(URL, "key-a");
+        let token = credentials
+            .keep(&facts(first.as_ref(), None), first.api_key().cloned())
+            .expect("no registration in flight");
+
+        let mut cx = f.registration(WorkerJobAsker::Startup, vec![keyed(URL, "key-b")]);
+        let write = f.write_keeping(&credentials);
+        let error = write.execute(&mut cx).await.expect_err("in flight");
+        assert!(StepExecutor::<Registration>::is_retryable(&write, &error));
+        assert!(f.store.by_key(URL).is_none(), "the door was not asked");
+        assert!(!token.put_back());
+    }
+
+    /// The line that keeps reads the keeper from its holder, where the line
+    /// is built. A holder built with none is refused. A holder takes a
+    /// keeper or kept objects, never both, and the later call stands: so a
+    /// holder that keeps built objects has no keeper, and is refused too.
+    #[test]
+    fn the_line_that_keeps_is_not_built_over_a_holder_with_no_keeper() {
+        let f = Fixture::new();
+        let store: Arc<dyn WorkersStore> = f.store.clone();
+        let line = |objects: Objects<Members>| {
+            registration_at_door_keeping::<Host>(
+                f.host.registration_settings(),
+                RegistrationGates::default(),
+                Arc::clone(&f.door),
+                Arc::new(objects),
+                Arc::clone(&store),
+                &[],
+            )
+        };
+        let registry = || Arc::clone(&f.host.registry);
+        let keeper = Arc::new(Credentials::new());
+        assert!(matches!(line(Objects::new(registry())), Err(NoKeeper)));
+
+        let built_kept = Objects::new(registry())
+            .with_credentials(Arc::clone(&keeper))
+            .with_built_kept();
+        assert!(built_kept.credentials().is_none());
+        assert!(matches!(line(built_kept), Err(NoKeeper)));
+
+        let keeping = Objects::new(registry())
+            .with_built_kept()
+            .with_credentials(keeper);
+        assert!(keeping.credentials().is_some());
+        assert!(line(keeping).is_ok());
+    }
+
+    /// A door another writer moved the row under: it writes the row another
+    /// way, has the holder follow, and then refuses. So the holder builds
+    /// the row's object while the registration is in flight.
+    struct MovedUnder {
+        door: Arc<dyn Membership>,
+        objects: Arc<Objects<Members>>,
+        store: Arc<MemoryStore>,
+    }
+
+    impl Membership for MovedUnder {
+        fn found(
+            &self,
+            _: &Maker,
+            _: Expect,
+            _: &str,
+            _: &dyn Fn(Option<&WorkerFacts>) -> WorkerFacts,
+        ) -> Result<Wrote, Refused> {
+            Err(Refused::Moved)
+        }
+
+        fn found_built(
+            &self,
+            maker: &Maker,
+            _: Expect,
+            built: &Arc<dyn Worker>,
+            _: Option<&Arc<dyn Worker>>,
+        ) -> Result<Wrote, Refused> {
+            self.door
+                .found(maker, Expect::Anything, built.url(), &|standing| {
+                    let mut moved = standing.cloned().expect("the row stands");
+                    moved.labels.insert("moved".to_owned(), "under".to_owned());
+                    moved
+                })?;
+            self.objects.follow(&*self.store);
+            Err(Refused::Moved)
+        }
+
+        fn drained(&self, _: Remover<'_>, _: &str, _: Standing) -> Result<Wrote, Refused> {
+            Err(Refused::Moved)
+        }
+
+        fn gone(&self, _: Remover<'_>, _: &str, _: Standing) -> Result<Wrote, Refused> {
+            Err(Refused::Moved)
+        }
+    }
+
+    /// A refused write puts back what stood. Where the holder built the
+    /// row's object while the registration was in flight, that object holds
+    /// what the registration stated. The write has the holder lay it again,
+    /// with the credential that stands.
+    #[tokio::test]
+    async fn a_refused_keeping_write_lays_again_an_object_built_in_its_flight() {
+        let (f, credentials) = Fixture::keeping();
+        let mut cx = f.registration(WorkerJobAsker::Startup, vec![keyed(URL, "key-a")]);
+        f.write_keeping(&credentials)
+            .execute(&mut cx)
+            .await
+            .expect("written");
+        assert_eq!(held_key(&f, URL).as_deref(), Some("key-a"));
+
+        let write = WriteWorkersAtDoor {
+            door: Arc::new(MovedUnder {
+                door: Arc::clone(&f.door),
+                objects: Arc::clone(&f.objects),
+                store: Arc::clone(&f.store),
+            }),
+            ..f.write_keeping(&credentials)
+        };
+        let mut cx = f.registration(WorkerJobAsker::Startup, vec![keyed(URL, "key-b")]);
+        let error = write.execute(&mut cx).await.expect_err("moved");
+        assert!(StepExecutor::<Registration>::is_retryable(&write, &error));
+        let object = f.host.registry.get_by_url(URL).expect("the row's object");
+        assert_eq!(object.api_key().map(String::as_str), Some("key-a"));
+    }
+
+    /// A registration that states other models takes the row's place with a
+    /// new row, and the keeper is answered with that new row. So an object
+    /// built from it later, at its next revision, still holds what the
+    /// registration stated.
+    #[tokio::test]
+    async fn a_keeping_write_that_replaces_a_row_binds_the_new_row() {
+        let (f, credentials) = Fixture::keeping();
+        let write = f.write_keeping(&credentials);
+        let mut cx = f.registration(WorkerJobAsker::Startup, vec![keyed(URL, "key-a")]);
+        write.execute(&mut cx).await.expect("written");
+        let old = f.store.by_key(URL).expect("the row").id;
+
+        let replacing = |tier: &str, key: Option<&str>| -> Arc<dyn Worker> {
+            let spec = WorkerSpec {
+                models: vec![ModelCard::new("model"), ModelCard::new("model-b")].into(),
+                labels: [("tier".to_owned(), tier.to_owned())].into(),
+                api_key: key.map(str::to_owned),
+                ..WorkerSpec::new(URL.to_owned())
+            };
+            Arc::new(<BasicWorkerBuilder>::from_spec(spec).build())
+        };
+        let mut cx = f.registration(
+            WorkerJobAsker::Startup,
+            vec![replacing("gold", Some("key-b"))],
+        );
+        write.execute(&mut cx).await.expect("replaced");
+        let new = f.store.by_key(URL).expect("the new row").id;
+        assert_ne!(new, old, "another row stands under the URL");
+        assert_eq!(held_key(&f, URL).as_deref(), Some("key-b"));
+
+        // The row moves in place through the line that keeps nothing: its
+        // object is built anew, with what the keeper binds to the new row.
+        let mut cx = f.registration(WorkerJobAsker::Startup, vec![replacing("silver", None)]);
+        f.write().execute(&mut cx).await.expect("relabelled");
+        assert_eq!(f.store.by_key(URL).expect("the row").id, new);
+        assert_eq!(held_key(&f, URL).as_deref(), Some("key-b"));
+    }
+
+    /// A credential is no fact of a row. A registration that states another
+    /// credential alone moves no row, and the holder lays another object
+    /// while the row's revision stands. A replacement by id that read its
+    /// worker ahead of that registration is refused as moved in the
+    /// holder's turn, ahead of its keep: the door is not asked, and the
+    /// object holds what the later registration stated. Tried again, the
+    /// replacement is dropped: the object laid again is at another
+    /// revision.
+    #[tokio::test]
+    async fn a_guarded_keeping_write_is_refused_once_another_object_stands() {
+        let (f, credentials) = Fixture::keeping();
+        let write = f.write_keeping(&credentials);
+        let mut cx = f.registration(WorkerJobAsker::Startup, vec![keyed(URL, "key-a")]);
+        write.execute(&mut cx).await.expect("written");
+        let id = f.host.registry.get_id_by_url(URL).expect("the worker's id");
+        let revision = f.host.registry.get(&id).expect("the worker").revision();
+
+        // The replacement reads the worker it replaces: the step's first
+        // read.
+        let stale = vec![keyed(URL, "key-old")];
+        let (seen, over) = replaced(&f.host.registry, &f.objects, &stale, id.as_str(), revision)
+            .expect("the worker stands at the job's revision");
+
+        // A registration of another credential alone runs whole meanwhile.
+        let mut cx = f.registration(WorkerJobAsker::Startup, vec![keyed(URL, "key-b")]);
+        write.execute(&mut cx).await.expect("unchanged");
+        let epoch = f.store.epoch();
+        let row = f.store.by_key(URL).expect("the row");
+        assert_eq!((row.id, row.revision), (seen.row, seen.revision));
+
+        let error = write
+            .write_at_door(&Maker::Control, Expect::Seen(seen), &stale[0], Some(&over))
+            .expect_err("another object stands under the URL");
+        assert!(StepExecutor::<Registration>::is_retryable(&write, &error));
+        assert_eq!(f.store.epoch(), epoch, "the door was not asked");
+        assert_eq!(held_key(&f, URL).as_deref(), Some("key-b"));
+        let kept = facts(stale[0].as_ref(), None);
+        assert_eq!(f.objects.lay_again(&*f.store, &kept), 0);
+
+        let mut cx = f.registration(WorkerJobAsker::Api, stale);
+        cx.data.registration_mode = WorkerRegistrationMode::ReplaceById {
+            worker_id: id.as_str().to_owned(),
+            expected_revision: revision,
+        };
+        let error = write.execute(&mut cx).await.expect_err("dropped");
+        assert!(
+            error.to_string().contains("is no longer at revision"),
+            "{error}"
+        );
+        assert!(!StepExecutor::<Registration>::is_retryable(&write, &error));
+        assert_eq!(held_key(&f, URL).as_deref(), Some("key-b"));
+    }
+
+    /// The line that keeps is the plain line, step for step. The write is
+    /// the one step that differs, in what it holds.
+    #[test]
+    fn the_line_that_keeps_orders_its_steps_as_the_plain_line() {
+        let (f, _) = Fixture::keeping();
+        let store: Arc<dyn WorkersStore> = f.store.clone();
+        let plain = registration_at_door::<Host>(
+            f.host.registration_settings(),
+            RegistrationGates::default(),
+            Arc::clone(&f.door),
+            Arc::clone(&f.objects),
+            &[],
+        );
+        let keeping = registration_at_door_keeping::<Host>(
+            f.host.registration_settings(),
+            RegistrationGates::default(),
+            Arc::clone(&f.door),
+            Arc::clone(&f.objects),
+            store,
+            &[],
+        )
+        .expect("a holder with a keeper");
+        let order = |line: &WorkflowDefinition<Registration>| {
+            line.steps
+                .iter()
+                .map(|step| (step.id.clone(), step.depends_on.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(order(&plain), order(&keeping));
     }
 
     #[tokio::test]
