@@ -31,7 +31,19 @@ router:
   #    least_load, manual, consistent_hashing or prefix_hash (the launcher's --policy
   #    choices; values.schema.json lists them). bucket is a prefill-side policy:
   #    router.disaggregation.prefillPolicy.
-  policy: cache_aware
+  #    Without a document, empty uses the launcher's cache_aware default. With a document, set a value only to check it against the file.
+  policy: ""
+
+  # -- Worker selection inside the gateway. "off" uses the classic policies.
+  #    "on" selects the policy controller. This switch configures only the
+  #    gateway process. Use the top-level policyController.enabled for the
+  #    separate controller service.
+  policyController: "off"
+  # -- Inline policy document. An empty map supplies no document.
+  policySpec: {}
+  # -- Name of your ConfigMap in the release's namespace, with the policy
+  #    document under spec.yaml. An empty name supplies no document.
+  policySpecConfigMap: ""
 
   # -- Disaggregated serving: the roles the gateway's --pd-disaggregation and
   #    --epd-disaggregation take. mode "" (the default) is a regular fleet, "pd"

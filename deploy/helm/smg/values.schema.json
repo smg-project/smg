@@ -20,6 +20,7 @@
         "policy": {
           "type": "string",
           "enum": [
+            "",
             "random",
             "round_robin",
             "passthrough",
@@ -31,6 +32,9 @@
             "prefix_hash"
           ]
         },
+        "policyController": { "type": "string", "enum": ["on", "off"] },
+        "policySpec": { "type": "object" },
+        "policySpecConfigMap": { "type": "string" },
         "parser": { "type": "string", "enum": ["", "legacy", "symphony"] },
         "mmTurbojpeg": {
           "type": "string",
