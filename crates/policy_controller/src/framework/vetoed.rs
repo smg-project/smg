@@ -1748,10 +1748,11 @@ mod tests {
             rule.inflight_cap = cap;
         }
         spec.view.headers = manual.view.headers.clone();
-        spec.bindings
-            .first_mut()
-            .expect("the preset's binding")
-            .sessions = Some(rule);
+        let binding = spec.bindings.first_mut().expect("the preset's binding");
+        // The rule names the key's header, so the ring's own sources go: a
+        // binding names them once.
+        binding.routing_key = None;
+        binding.sessions = Some(rule);
         spec.validate().expect("the document builds")
     }
 

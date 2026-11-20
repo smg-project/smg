@@ -130,26 +130,40 @@ impl KeySources {
     /// A source holds a value where it is present, not empty, UTF-8 and
     /// within the source's byte cap. Any other is passed over, never an
     /// error, and the next source is read. Under `strip_lineage` the turn
-    /// and retry suffixes leave the key ([`strip_lineage`]). `None` where no
+    /// and retry suffixes leave the key ([`strip_lineage`]): a header is
+    /// measured as sent, and the request's id without them. `None` where no
     /// source holds a value: the request carries no key.
     pub fn derive<'a>(
         &'a self,
         header: impl Fn(&str) -> Option<&'a [u8]>,
         rid: Option<&'a str>,
     ) -> Option<DerivedKey<'a>> {
-        self.sources.iter().find_map(|source| {
-            let (value, from) = match &source.header {
-                Some(name) => (header(name)?, KeySource::Header(name)),
-                None => (rid?.as_bytes(), KeySource::Rid),
-            };
-            if value.is_empty() || value.len() > source.max_bytes {
-                return None;
-            }
-            let value = std::str::from_utf8(value).ok()?;
-            let key = if self.strip_lineage {
-                strip_lineage(value)
+        let lineage = |key| {
+            if self.strip_lineage {
+                strip_lineage(key)
             } else {
-                value
+                key
+            }
+        };
+        self.sources.iter().find_map(|source| {
+            let (key, from) = match &source.header {
+                Some(name) => {
+                    let value = header(name)?;
+                    if value.is_empty() || value.len() > source.max_bytes {
+                        return None;
+                    }
+                    let value = std::str::from_utf8(value).ok()?;
+                    (lineage(value), KeySource::Header(name))
+                }
+                // The suffixes are the gateway's own marks on an id: the id
+                // is measured as the key it hands.
+                None => {
+                    let key = lineage(rid?);
+                    if key.is_empty() || key.len() > source.max_bytes {
+                        return None;
+                    }
+                    (key, KeySource::Rid)
+                }
             };
             Some(DerivedKey {
                 key: if source.plain {
@@ -326,6 +340,20 @@ mod tests {
             strips.derive(request(&[]), Some("rid_t4")).map(|d| d.key),
             Some(Identity::plain("rid"))
         );
+        // A header is measured as sent and the request's id as the key it
+        // hands: at the cap with a suffix behind it, the header is passed
+        // over and the id keys.
+        let base = "k".repeat(128);
+        let suffixed = format!("{base}_t2");
+        let headers: [(&str, &[u8]); 1] = [("x-smg-routing-key", suffixed.as_bytes())];
+        assert_eq!(strips.derive(request(&headers), None), None);
+        assert_eq!(
+            strips.derive(request(&[]), Some(&suffixed)).map(|d| d.key),
+            Some(Identity::plain(&base))
+        );
+        assert_eq!(keeps.derive(request(&[]), Some(&suffixed)), None);
+        let over = format!("{base}k_t2");
+        assert_eq!(strips.derive(request(&[]), Some(&over)), None);
     }
 
     /// A key from a header the view does not list leaves as its fingerprint
