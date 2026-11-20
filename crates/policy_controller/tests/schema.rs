@@ -90,6 +90,31 @@ fn the_committed_schema_admits_least_cost_with_terms_and_a_margin() {
     assert!(!bare.iter().any(|name| name == "least-cost"));
 }
 
+#[test]
+fn the_committed_schema_admits_a_filter_by_its_name_and_by_its_name_with_parameters() {
+    let committed = fs::read_to_string(schema_path()).expect("the committed schema");
+    let schema: Value = serde_json::from_str(&committed).expect("a JSON schema");
+    let defs = &schema["$defs"];
+    assert_eq!(
+        defs["ProfileSpec"]["properties"]["filter"]["items"]["$ref"],
+        "#/$defs/FilterSpec"
+    );
+    // A bare name is any string: a host adds names. A name with parameters
+    // is one key mapped to a map.
+    assert_eq!(
+        defs["FilterSpec"]["anyOf"],
+        serde_json::json!([
+            { "type": "string" },
+            {
+                "type": "object",
+                "minProperties": 1,
+                "maxProperties": 1,
+                "additionalProperties": { "type": "object" }
+            }
+        ])
+    );
+}
+
 /// Every object schema under `root` either lists its properties and refuses
 /// the rest, or is a map (`additionalProperties` a schema), never open.
 fn objects_are_closed(value: &Value, at: &str, open: &mut Vec<String>) {

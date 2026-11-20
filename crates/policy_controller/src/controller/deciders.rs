@@ -4185,7 +4185,7 @@ pub(crate) mod tests {
         let mut document = PolicySpec::preset("random").expect("a preset of this build");
         document.generation = 1;
         for profile in document.profiles.values_mut() {
-            profile.filter.push("shown".to_string());
+            profile.filter.push("shown".into());
         }
         let digest = document.digest().expect("the document digests");
         let spec = AppliedSpec::validate_digested(&document, digest, &catalog, &[])

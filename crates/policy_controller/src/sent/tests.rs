@@ -10,9 +10,9 @@ use crate::{
         Dispatch, GatewayId, LeaseState, LeasesStore, MemoryStore, Said, StaleGeneration,
         WorkerFacts, WorkerStatus, WorkersStore,
     },
-    AppliedSpec, Candidate, Catalog, Constraints, Engine, Lease, Lifecycle, LoadRow, Membership,
-    Pair, PolicySpec, RequestFacts, Scorer, Sent, SentCredit, Side, SpecError, Target, TieBand,
-    WorkerId, API_VERSION,
+    AppliedSpec, Candidate, Catalog, Constraints, Engine, Filter, Lease, Lifecycle, LoadRow,
+    Membership, Pair, PolicySpec, RequestFacts, Scorer, Sent, SentCredit, Side, SpecError, Target,
+    TieBand, WorkerId, API_VERSION,
 };
 
 const POOL: &str = "work";
@@ -671,5 +671,84 @@ fn an_unset_limit_leaves_a_documents_canonical_form_and_digest_intact() {
     assert_eq!(
         document.digest().expect("a digest").to_string(),
         "sha256:5d615ed114ca79046283cd72596dd3428baa2ec110170a5bb72ea4bc525b1ade"
+    );
+}
+
+/// Keeps the rows its profile sent fewer than `most` requests.
+#[derive(Debug)]
+struct SentUnder {
+    sent: Arc<SentCredit>,
+    most: u32,
+}
+
+impl Filter for SentUnder {
+    fn name(&self) -> &'static str {
+        "sent-under"
+    }
+
+    fn keep(&self, facts: &RequestFacts<'_>, candidate: &Candidate, _: &Constraints<'_>) -> bool {
+        self.sent.read(facts, candidate).requests < self.most
+    }
+}
+
+/// A registered filter holds its profile's count of sends, as a registered
+/// scorer does. The count is made where the filter's factory asks for it,
+/// ahead of any scorer, so the profile's limit has its reader.
+#[test]
+fn a_registered_filter_reads_the_sends_of_its_profile() {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Most {
+        requests: u32,
+    }
+
+    let readers = Readers::default();
+    let kept = Arc::clone(&readers);
+    let mut catalog = Catalog::builtin();
+    catalog
+        .filter_with("sent-under", move |build| {
+            let Most { requests } = build.params()?;
+            let sent = build.sent();
+            kept.lock().push(Arc::clone(&sent));
+            Ok(Box::new(SentUnder {
+                sent,
+                most: requests,
+            }))
+        })
+        .expect("a free name");
+    let document: PolicySpec = serde_json::from_value(json!({
+        "apiVersion": API_VERSION,
+        "generation": 4,
+        "profiles": {
+            "work": {
+                "sent_ttl_ms": 24_001,
+                "filter": [{ "sent-under": { "requests": 2 } }],
+                "pick": "random"
+            }
+        }
+    }))
+    .expect("a document");
+    let engine = document
+        .validate_in(&catalog, &[])
+        .expect("the filter reads the sends the limit ages");
+    assert_eq!(engine.sent_credits.len(), 1);
+
+    let a = row(127, 3);
+    let b = row(131, a.dp_rank);
+    let facts = clock(START + 700);
+    let filter = &engine.profiles()[0].filters[0];
+    let keeps = |row: &Candidate| filter.keep(&facts, row, &Constraints::default());
+    send(&engine, &a, START, TOKENS);
+    assert!(keeps(&a) && keeps(&b), "one send is under two");
+    send(&engine, &a, START, TOKENS);
+    assert!(!keeps(&a), "two sends are not under two");
+    assert!(keeps(&b), "another row's sends are its own");
+    // The count the factory was handed is the one the engine feeds.
+    assert_eq!(
+        readers.lock()[0].read(&facts, &a),
+        Sent {
+            requests: 2,
+            tokens: 2 * u64::from(TOKENS),
+        }
     );
 }

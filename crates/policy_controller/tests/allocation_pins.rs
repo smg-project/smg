@@ -184,7 +184,7 @@ fn a_decision_by_rank_after_the_first_allocates_nothing() {
     for profile in bare.profiles.values_mut() {
         profile
             .filter
-            .retain(|name| name != "not-tried" && name != "has-room");
+            .retain(|entry| !matches!(entry.name(), "not-tried" | "has-room"));
     }
     let engines = [
         (true, engine_of("cache_aware")),

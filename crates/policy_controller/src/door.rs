@@ -2581,7 +2581,7 @@ pub(crate) mod tests {
                 .ok_or("missing pair profile")?;
             profile
                 .filter
-                .retain(|stage| !matches!(stage.as_str(), "has-capacity" | "has-room"));
+                .retain(|stage| !matches!(stage.name(), "has-capacity" | "has-room"));
             profile.pick = "count-first".into();
         }
         let encode = document

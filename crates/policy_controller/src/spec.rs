@@ -7,8 +7,8 @@
 //!
 //! The document has an `apiVersion` and no `kind`: its forms are a file and
 //! the API. An unknown field is refused by name, never ignored. The one
-//! exception is the parameters of a scorer a host registers, which its
-//! factory's own type reads ([`crate::StageBuild::params`]). A field this
+//! exception is the parameters of a scorer or filter a host registers, which
+//! its factory's own type reads ([`crate::StageBuild::params`]). A field this
 //! build cannot honour yet (a stage, a plan, a matcher or a binding rule of a
 //! later step) is checked in shape like every other field and then refused
 //! by name as not in this build, so a document written against the published
@@ -44,7 +44,9 @@ use crate::{
         DEFAULT_MEAN_PREFILL_TOKENS, DEFAULT_THROUGHPUT,
     },
     catalog::{profile_sent, Catalog, Found, StageBuild},
-    framework::{Binding, Engine, OverloadThresholds, Picker, Plan, Profile, Scorer, Weighted},
+    framework::{
+        Binding, Engine, Filter, OverloadThresholds, Picker, Plan, Profile, Scorer, Weighted,
+    },
     ring::ConsistentHash,
     routing_key::KeySources,
     sent::SentCredit,
@@ -949,6 +951,42 @@ impl ScoreStage {
     }
 }
 
+/// A filter reference: a bare name, or a name the catalog adds mapped to
+/// the parameters its factory reads.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub enum FilterSpec {
+    Name(String),
+    /// A name mapped to what the document wrote under it. The map is kept
+    /// as read so the validator can ask the catalog for the name first.
+    /// Parsing refuses a repeated key.
+    Added {
+        name: String,
+        written: serde_json::Value,
+    },
+}
+
+impl FilterSpec {
+    /// The filter's name as written.
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Name(name) | Self::Added { name, .. } => name,
+        }
+    }
+}
+
+impl From<&str> for FilterSpec {
+    fn from(name: &str) -> Self {
+        Self::Name(name.to_string())
+    }
+}
+
+impl From<String> for FilterSpec {
+    fn from(name: String) -> Self {
+        Self::Name(name)
+    }
+}
+
 /// A scorer reference: a bare name (a built-in at its defaults, or a scorer
 /// the catalog adds at weight one), or the name mapped to its weight and
 /// parameters ([`ScoreStage`]).
@@ -987,7 +1025,7 @@ impl From<ScoreStage> for ScoreSpec {
     }
 }
 
-/// What a document wrote under a registered scorer's name, written with
+/// What a document wrote under a registered stage's name, written with
 /// the keys of every map in order: the canonical bytes, and so the digest,
 /// are the same whatever order a file wrote the keys in. The validator
 /// hands a factory its parameters in that order too.
@@ -1007,6 +1045,19 @@ impl Serialize for Ordered<'_> {
             }
             serde_json::Value::Array(values) => serializer.collect_seq(values.iter().map(Ordered)),
             value => value.serialize(serializer),
+        }
+    }
+}
+
+impl Serialize for FilterSpec {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Name(name) => serializer.serialize_str(name),
+            Self::Added { name, written } => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry(name, &Ordered(written))?;
+                map.end()
+            }
         }
     }
 }
@@ -1123,7 +1174,7 @@ where
     deserializer.deserialize_map(Once(PhantomData))
 }
 
-/// What a document wrote under a scorer's name that is no built-in's, kept
+/// What a document wrote under the name of a stage the catalog adds, kept
 /// as read for the validator. Read maps and lists recursively so a key
 /// written twice is refused even inside a parameter.
 struct Written(serde_json::Value);
@@ -1136,7 +1187,7 @@ impl<'de> Deserialize<'de> for Written {
             type Value = Written;
 
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("a scorer's parameters")
+                f.write_str("a stage's parameters")
             }
 
             fn visit_bool<E: de::Error>(self, value: bool) -> Result<Written, E> {
@@ -1185,6 +1236,62 @@ impl<'de> Deserialize<'de> for Written {
         }
 
         deserializer.deserialize_any(WrittenVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for FilterSpec {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct FilterVisitor;
+
+        impl<'de> Visitor<'de> for FilterVisitor {
+            type Value = FilterSpec;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a filter name, or one filter name mapped to its parameters")
+            }
+
+            fn visit_str<E: de::Error>(self, name: &str) -> Result<FilterSpec, E> {
+                Ok(FilterSpec::Name(name.to_string()))
+            }
+
+            // What stands under the name is kept as read: only the
+            // validator knows the names a catalog adds.
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<FilterSpec, A::Error> {
+                let Some(name) = map.next_key::<String>()? else {
+                    return Err(de::Error::custom("a filter entry names one filter"));
+                };
+                let Written(written) = map.next_value()?;
+                if map.next_key::<de::IgnoredAny>()?.is_some() {
+                    return Err(de::Error::custom(
+                        "a filter entry maps a single key to its parameters; write one entry per filter",
+                    ));
+                }
+                Ok(FilterSpec::Added { name, written })
+            }
+        }
+
+        deserializer.deserialize_any(FilterVisitor)
+    }
+}
+
+impl JsonSchema for FilterSpec {
+    fn schema_name() -> Cow<'static, str> {
+        "FilterSpec".into()
+    }
+
+    fn json_schema(_: &mut SchemaGenerator) -> Schema {
+        json_schema!({
+            "description": "A filter: its bare name, or the name of a filter the host adds mapped to its parameters.",
+            "anyOf": [
+                { "type": "string" },
+                {
+                    "type": "object",
+                    "minProperties": 1,
+                    "maxProperties": 1,
+                    "additionalProperties": { "type": "object" }
+                }
+            ]
+        })
     }
 }
 
@@ -1378,11 +1485,12 @@ impl JsonSchema for PickSpec {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ProfileSpec {
-    /// The hard filters, in order. Which workers the hard filters keep does
-    /// not turn on their order; a shed's reason does: a shed names the
-    /// first filter, in this order, that left nobody.
+    /// The hard filters, in order: each a name, or the name of a filter the
+    /// catalog adds mapped to its parameters. Which workers the hard
+    /// filters keep does not turn on their order; a shed's reason does: a
+    /// shed names the first filter, in this order, that left nobody.
     #[serde(default)]
-    pub filter: Vec<String>,
+    pub filter: Vec<FilterSpec>,
     /// The scorers, each a name or a name with its weight and parameters.
     #[serde(default)]
     pub score: Vec<ScoreSpec>,
@@ -2713,6 +2821,68 @@ fn picker_of(
     })
 }
 
+/// The filter the entry at `index` of a profile's list stands for. The
+/// catalog is asked for the name first: a name it does not hold is refused
+/// as unknown whatever is written under it. `at` is the profile's path:
+/// the entry's own is written where a refusal names it, so an entry that
+/// validates builds none.
+fn filtered(
+    entry: &FilterSpec,
+    profile: &str,
+    at: &At,
+    index: usize,
+    catalog: &Catalog,
+    sent_ttl_ms: Option<u32>,
+    sent: &mut Option<Arc<SentCredit>>,
+) -> Result<Box<dyn Filter>, SpecError> {
+    let name = entry.name();
+    let path = || format!("{}.filter[{index}].{name}", at.0);
+    match (catalog.find_filter(name), entry) {
+        (Some(Found::Built(filter)), FilterSpec::Name(_)) => Ok(filter),
+        // A filter registered with no parameter is written by its name
+        // alone: whatever stands under it is refused.
+        (Some(Found::Built(_)), FilterSpec::Added { written, .. }) => Err(SpecError::BadField {
+            path: path(),
+            value: written.to_string(),
+            reason: "left out under a filter that takes no parameter",
+        }),
+        (Some(Found::With(build)), entry) => {
+            let mut params = match entry {
+                FilterSpec::Name(_) => serde_json::Map::new(),
+                FilterSpec::Added { written, .. } => written
+                    .as_object()
+                    .ok_or_else(|| SpecError::BadField {
+                        path: path(),
+                        value: written.to_string(),
+                        reason: "a map of the filter's parameters",
+                    })?
+                    .clone(),
+            };
+            // A filter has no weight: the map is the factory's whole, in
+            // the one order a scorer's parameters take.
+            params.sort_keys();
+            params
+                .values_mut()
+                .for_each(serde_json::Value::sort_all_objects);
+            let mut context = StageBuild::new(&params, profile, sent_ttl_ms, sent);
+            let filter = build(&mut context).map_err(|error| error.at(&path()))?;
+            let answers = filter.name();
+            if answers != name {
+                return Err(SpecError::BadStage {
+                    path: path(),
+                    reason: format!("filter registered as {name:?} answers the name {answers:?}"),
+                });
+            }
+            Ok(filter)
+        }
+        // No filter is the validator's to build from typed parameters.
+        (None | Some(Found::Typed), _) => Err(SpecError::UnknownFilter {
+            profile: profile.to_string(),
+            name: name.to_string(),
+        }),
+    }
+}
+
 /// What a score entry stands for.
 enum Scored {
     /// A built-in, by its parameters: the written ones, or a bare name's
@@ -2904,21 +3074,17 @@ fn check_profile(
     let gates = gates_of(p, view);
     let at = At::new(format!("profiles.{name}"));
     at.nonzero("sent_ttl_ms", p.sent_ttl_ms)?;
+    // The profile's count of sends, made where a stage's factory first
+    // asks for it: a filter's may, ahead of any scorer's.
+    let mut sent = None;
     let mut filters = Vec::with_capacity(p.filter.len());
-    for f in &p.filter {
-        filters.push(
-            catalog
-                .find_filter(f)
-                .ok_or_else(|| SpecError::UnknownFilter {
-                    profile: name.to_string(),
-                    name: f.clone(),
-                })?,
-        );
+    for (index, entry) in p.filter.iter().enumerate() {
+        let filter = filtered(entry, name, &at, index, catalog, p.sent_ttl_ms, &mut sent)?;
+        filters.push(filter);
     }
     let mut scorers = Vec::with_capacity(p.score.len());
     let mut complete = true;
     let mut plain_ring = false;
-    let mut sent = None;
     for (i, entry) in p.score.iter().enumerate() {
         let entry_at = At::new(format!("{}.score[{i}]", at.0));
         let stage = match scored(entry, name, &entry_at, catalog, p.sent_ttl_ms, &mut sent)? {
@@ -3617,7 +3783,7 @@ pub const PRESETS: [&str; 10] = [
 /// routing-key header; the host feeds the key it resolved under it.
 pub const MANUAL_SESSION_HEADER: &str = "x-smg-routing-key";
 
-fn standard_filters() -> Vec<String> {
+fn standard_filters() -> Vec<FilterSpec> {
     vec![
         "healthy".into(),
         "not-overloaded".into(),
@@ -5590,10 +5756,8 @@ mod tests {
         let spec = PolicySpec::pair_presets("least_load", "power_of_two").expect("pair");
         assert!(spec.profiles["prefill"]
             .filter
-            .contains(&"has-capacity".to_string()));
-        assert!(spec.profiles["decode"]
-            .filter
-            .contains(&"has-room".to_string()));
+            .contains(&"has-capacity".into()));
+        assert!(spec.profiles["decode"].filter.contains(&"has-room".into()));
         let engine = spec.validate().expect("validates");
         let binding = engine.binding("m", Phase::Prefill).expect("bound");
         assert_eq!(binding.plan, Plan::PdPair);
@@ -5785,7 +5949,7 @@ mod tests {
         assert_eq!(presets.profiles["encode"].score.len(), 1);
         assert!(presets.profiles["prefill"]
             .filter
-            .contains(&"has-capacity".to_string()));
+            .contains(&"has-capacity".into()));
         let engine = presets.validate().expect("validates");
         assert!(engine.needs().ring && engine.needs().loads);
         assert!(matches!(
@@ -7298,6 +7462,66 @@ mod tests {
         assert_eq!(from_yaml, spec);
     }
 
+    /// A filter entry is written as it was read: a bare name as the string
+    /// it always was, a name with parameters as its one-key map, the keys
+    /// of every map in order. The order a file wrote the keys in is in no
+    /// digest.
+    #[test]
+    fn a_filter_entry_round_trips_a_bare_name_as_a_string_and_a_map_as_a_map() {
+        let document = |entry: &str| {
+            doc(&format!(
+                r#"{{"apiVersion":"smg.policy/v1","profiles":{{"p":{{"filter":["healthy",{entry},"not-tried"],"pick":"random"}}}}}}"#
+            ))
+        };
+        let spec = document(r#"{"min-free":{"slots":2,"by":{"zone":3,"class":"a"}}}"#);
+        assert_eq!(
+            spec.profiles["p"].filter,
+            [
+                FilterSpec::Name("healthy".into()),
+                FilterSpec::Added {
+                    name: "min-free".into(),
+                    written: serde_json::json!({ "slots": 2, "by": { "zone": 3, "class": "a" } }),
+                },
+                "not-tried".into(),
+            ]
+        );
+        let written = serde_json::to_string(&spec).expect("serializes");
+        assert!(
+            written.contains(
+                r#""filter":["healthy",{"min-free":{"by":{"class":"a","zone":3},"slots":2}},"not-tried"]"#
+            ),
+            "{written}"
+        );
+        assert_eq!(doc(&written), spec);
+        let yaml = serde_yaml::to_string(&spec).expect("yaml");
+        let from_yaml: PolicySpec = serde_yaml::from_str(&yaml).expect("yaml round trip");
+        assert_eq!(from_yaml, spec);
+        // Another order of the same keys is the same document, and another
+        // value is another.
+        let reordered = document(r#"{"min-free":{"by":{"class":"a","zone":3},"slots":2}}"#);
+        assert_eq!(reordered.digest(), spec.digest());
+        assert_eq!(
+            serde_json::to_string(&reordered).expect("serializes"),
+            written
+        );
+        let moved = document(r#"{"min-free":{"slots":3,"by":{"zone":3,"class":"a"}}}"#);
+        assert_ne!(moved.digest(), spec.digest());
+        // An entry names one filter.
+        for (entry, message) in [
+            (r#"{"min-free":{"slots":2},"healthy":{}}"#, "single key"),
+            ("{}", "names one filter"),
+            (
+                "7",
+                "a filter name, or one filter name mapped to its parameters",
+            ),
+        ] {
+            let err = parse_error(&format!(
+                r#"{{"apiVersion":"smg.policy/v1","profiles":{{"p":{{"filter":[{entry}],"pick":"random"}}}}}}"#
+            ));
+            assert!(err.contains(message), "{entry}: {err}");
+        }
+    }
+
     #[test]
     fn the_schema_is_generated_from_the_types() {
         let text = PolicySpec::schema_json().expect("the schema serializes");
@@ -7801,7 +8025,7 @@ mod tests {
             .get_mut("p")
             .expect("the profile")
             .filter
-            .push("not-tried".to_owned());
+            .push("not-tried".into());
         assert_ne!(moved.digest(), Ok(digest), "a filter more is in it");
 
         // The one line a document can write that no canonical form carries:
