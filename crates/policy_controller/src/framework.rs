@@ -12563,6 +12563,25 @@ mod tests {
         );
     }
 
+    /// `has-room` written bare is the host's bit and folds into the row
+    /// test. With a rule it is a stage of its own: its profile folds into
+    /// nothing, and a picker that draws first still draws first.
+    #[test]
+    fn has_room_with_a_rule_folds_into_nothing_and_still_draws_first() {
+        let engine = |filter: &str| {
+            let document: PolicySpec = serde_json::from_str(&format!(
+                r#"{{"apiVersion":"smg.policy/v1","profiles":{{"p":{{"filter":["healthy",{filter}],"pick":"random"}}}}}}"#
+            ))
+            .expect("a document");
+            document.validate().expect("validates")
+        };
+        let bare = engine(r#""has-room""#);
+        assert!(bare.row_tests[0].is_some(), "the host's bit folds");
+        let rule = engine(r#"{"has-room":{"used":{"candidate.in_flight":1},"capacity":8}}"#);
+        assert!(rule.row_tests[0].is_none(), "the rule is asked as a stage");
+        assert!(draws_first(&bare.profiles[0]) && draws_first(&rule.profiles[0]));
+    }
+
     /// A set that is not the plan's whole pool is asked a stage at a time:
     /// an encode item's own rules stand ahead of the profile's filters, and
     /// the fold holds none of them.

@@ -39,7 +39,7 @@ type Factory<T> = Box<dyn Fn() -> Box<T> + Send + Sync>;
 type ScorerFactory =
     dyn Fn(&mut StageBuild<'_>) -> Result<Box<dyn Scorer>, StageError> + Send + Sync;
 type ScorerBuild = Build<dyn Scorer, Box<ScorerFactory>>;
-type FilterFactory =
+pub(crate) type FilterFactory =
     dyn Fn(&mut StageBuild<'_>) -> Result<Box<dyn Filter>, StageError> + Send + Sync;
 type FilterBuild = Build<dyn Filter, Box<FilterFactory>>;
 
