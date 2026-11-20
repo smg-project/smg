@@ -72,8 +72,9 @@ pub enum Forgets {
     /// At no instant: the key's rule has no TTL.
     Never,
     /// No decision has read the key since its entry was made: a dispatch
-    /// made the entry anew, behind a worker's leave or the end of the
-    /// key's TTL, and the next decision's read starts the key over.
+    /// made the entry anew, behind the end of an absence, a forget or the
+    /// end of the key's TTL, and the next decision's read starts the key
+    /// over.
     Unread,
 }
 
@@ -344,8 +345,9 @@ impl SessionTable {
         let entry = shard.entry(key).or_default();
         if entry.pins[0] == WorkerId(0) {
             entry.pins[0] = worker;
-            // The entry may be new here: a worker's leave drops a key with
-            // no pin left, between the decision's read and this write.
+            // The entry may be new here: between this decision's read and
+            // this write another decision pinned the key, and the end of
+            // that worker's absence, or a forget, took its last pin.
             entry.touch(now_micros, rule);
         }
         entry.pins
@@ -1097,7 +1099,7 @@ mod tests {
     #[test]
     fn a_restored_pin_on_a_key_the_table_dropped_lives_by_the_rules_ttl() {
         // The key's entry left the table between the decision's read and
-        // the write (a worker's leave drops a key with no pin): the pin
+        // the write (the end of an absence took its last pin): the pin
         // restored is the key's from that instant, for one TTL.
         let table = SessionTable::new(RULE.sweep_micros);
         assert_eq!(
