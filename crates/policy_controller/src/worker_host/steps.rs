@@ -1261,13 +1261,13 @@ mod tests {
                 .expect("the row moved in place");
             live
         };
-        let anothers: Setup = |f| {
+        let of_another: Setup = |f| {
             let maker = Maker::provider("discovery", URL).expect("a provider's maker");
             f.seed(&maker, worker(URL, "model").as_ref())
                 .expect("registered");
             f.host.registry.get_by_url(URL).expect("the held worker")
         };
-        for setup in [moved, anothers] {
+        for setup in [moved, of_another] {
             let f = Fixture::new();
             let live = setup(&f);
             let row = f.store.by_key(URL);
