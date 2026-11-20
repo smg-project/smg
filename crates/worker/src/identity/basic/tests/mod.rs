@@ -1705,3 +1705,22 @@ async fn a_failed_http_admin_call_names_the_worker_once_without_the_clients_url(
         "{text}"
     );
 }
+
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn a_failed_http_health_check_is_logged_without_the_clients_url() {
+    let refused = RefusedAddress::reserve();
+    let url = format!("{}/?token=s3cret", refused.http_url());
+    let worker = BasicWorkerBuilder::new(&url).build();
+
+    worker
+        .check_health_async()
+        .await
+        .expect_err("nothing listens at the address");
+
+    assert!(!logs_contain("s3cret"));
+    assert!(logs_contain(&format!(
+        "HTTP health check failed for {}:",
+        refused.http_url()
+    )));
+}
