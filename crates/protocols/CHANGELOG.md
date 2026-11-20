@@ -305,6 +305,15 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   empty `query` and an empty `documents` list, the rules of the native route's `RerankRequest`;
   its `top_n` keeps reading `0` as all documents. `TokenizeRequest` and `DetokenizeRequest`
   declare no rule; the rules `EmbeddingRequest` and `ClassifyRequest` declare follow.
+- The `/v1/audio/transcriptions` relay forwards the form's text fields the gateway's types do not
+  model: the public API's `include[]`, `chunking_strategy` (and the SDK's bracketed
+  `chunking_strategy[...]` keys), `known_speaker_names[]`, `known_speaker_references[]` and the
+  next field the API adds. The extractor drained them and the HTTP router rebuilt the worker's
+  form from the typed fields alone, so a transcription answered without the logprobs, speaker
+  names or chunking the client asked for. `TranscriptionRequest.other` keeps them in order under
+  the names they came with, and the router appends them to the worker's form; a file part under
+  another name is still drained. The gRPC pipeline builds its request from the typed fields and
+  does not read them. Breaking: `TranscriptionRequest` gains `other`.
 - The preview web search tool takes the public API's dated type, `web_search_preview_2025_03_11`,
   written back under the canonical `web_search_preview`, and its `search_content_types`. The crate
   refused a request declaring either, as an unknown tool type or field. Breaking:
