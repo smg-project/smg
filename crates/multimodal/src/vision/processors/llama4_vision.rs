@@ -28,15 +28,20 @@
 //! For LLaMA 4, tokens = num_tiles * (tile_size / patch_size)²
 //! where patch_size is typically 14, giving 576 tokens per tile.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use image::{imageops::FilterType, DynamicImage, GenericImageView};
-use ndarray::{s, Array3, Array4};
+use ndarray::Array4;
 
-use crate::vision::{
-    preprocessor_config::PreProcessorConfig,
-    processor::{ModelSpecificValue, PreprocessedEncoderInputs, VisionPreProcessor},
-    transforms::{self, TransformError},
+use crate::{
+    buffer_pool,
+    encoder_inputs::{EncoderDtype, EncoderInput, PixelNorm},
+    pixel_convert::WireWriter,
+    vision::{
+        preprocessor_config::PreProcessorConfig,
+        processor::{ModelSpecificValue, PreprocessedEncoderInputs, VisionPreProcessor},
+        transforms::{self, TransformError},
+    },
 };
 
 /// Default normalization mean for LLaMA 4 Vision.
@@ -258,128 +263,105 @@ impl Llama4VisionProcessor {
         }
     }
 
-    /// Build a padded [C, H, W] f32 tensor from a smaller image.
-    ///
-    /// The image is placed at top-left, and the remaining canvas is filled with
-    /// the normalized value of black (0). This fuses pad + tensor conversion
-    /// into one step, avoiding an intermediate padded `RgbImage` allocation.
-    fn pad_and_normalize_to_tensor(
+    /// Where an image of `(width, height)` lands: the size it is resized to
+    /// and its canvas in tiles.
+    fn plan(&self, (orig_w, orig_h): (u32, u32)) -> Plan {
+        let image_size = (orig_h, orig_w);
+        let tile = self.tile_size;
+        let (target_h, target_w) = self.get_best_fit(image_size);
+
+        // Upscaling stops at one tile unless the canvas is to be filled.
+        let resize_target = if self.resize_to_max_canvas {
+            (target_h, target_w)
+        } else {
+            (
+                target_h.min(orig_h.max(tile)),
+                target_w.min(orig_w.max(tile)),
+            )
+        };
+        let (new_h, new_w) = Self::get_max_res_without_distortion(image_size, resize_target);
+
+        Plan {
+            resized: (new_w.max(1), new_h.max(1)),
+            grid: ((target_h / tile) as usize, (target_w / tile) as usize),
+        }
+    }
+
+    /// The plan of every image of the batch, in order.
+    fn plans(&self, images: &[&DynamicImage]) -> Vec<Plan> {
+        images
+            .iter()
+            .map(|image| self.plan(image.dimensions()))
+            .collect()
+    }
+
+    /// `(byte - 255 * mean) / (255 * std)` in `f32`, the fused order of
+    /// [`transforms::to_tensor_and_normalize`], in the form a wire carries.
+    fn norm(&self) -> PixelNorm {
+        let tile = self.tile_size as usize;
+        PixelNorm {
+            scale: 1.0,
+            offset: self.mean.map(|mean| mean as f32 * 255.0),
+            divisor: self.std.map(|std| std as f32 * 255.0),
+            channel_block: tile * tile,
+        }
+    }
+
+    /// One image's elements in output order, each handed to `run` once: the
+    /// canvas tiles, then the global view behind more than one tile.
+    fn write_image(
         &self,
         image: &DynamicImage,
-        canvas_w: usize,
-        canvas_h: usize,
-    ) -> Array3<f32> {
-        let (img_w, img_h, raw) = transforms::rgb_bytes(image);
-        let canvas_pixels = canvas_h * canvas_w;
+        plan: &Plan,
+        mut run: impl FnMut(usize, &[[u8; 3]], usize),
+    ) {
+        let tile = self.tile_size as usize;
+        let (width, height) = plan.resized;
+        let resized = transforms::resize(image, width, height, FilterType::Triangle);
+        let (width, height, rgb) = transforms::rgb_bytes(&resized);
+        tile_rows(&rgb, (width, height), plan.grid, tile, &mut run);
+        if plan.grid.0 * plan.grid.1 > 1 {
+            let global =
+                transforms::resize(image, self.tile_size, self.tile_size, FilterType::Triangle);
+            let (width, height, rgb) = transforms::rgb_bytes(&global);
+            tile_rows(&rgb, (width, height), (1, 1), tile, &mut run);
+        }
+    }
 
-        let mut data = vec![0.0f32; 3 * canvas_pixels];
-        transforms::paint_rgb_onto_planes_by_table(
-            &raw,
-            (img_w, img_h),
-            (canvas_w, canvas_h),
-            &transforms::to_tensor_and_normalize_table(&self.mean, &self.std),
-            &mut data,
+    /// The batch's outputs around its tiles, the same for both forms of the
+    /// encoder input.
+    fn outputs(
+        &self,
+        images: &[&DynamicImage],
+        plans: &[Plan],
+        encoder_input: EncoderInput,
+    ) -> PreprocessedEncoderInputs {
+        let aspect_ratios = plans
+            .iter()
+            .flat_map(|plan| [plan.grid.0 as i64, plan.grid.1 as i64])
+            .collect();
+        let mut model_specific = HashMap::new();
+        model_specific.insert(
+            "aspect_ratios".to_string(),
+            ModelSpecificValue::IntTensor {
+                data: aspect_ratios,
+                shape: vec![images.len(), 2],
+            },
+        );
+        model_specific.insert(
+            "patches_per_image".to_string(),
+            ModelSpecificValue::int_1d(plans.iter().map(|plan| plan.tiles() as i64).collect()),
         );
 
-        #[expect(
-            clippy::expect_used,
-            reason = "data has exactly 3*canvas_h*canvas_w elements by construction"
-        )]
-        Array3::from_shape_vec((3, canvas_h, canvas_w), data)
-            .expect("shape matches pre-allocated buffer")
-    }
-
-    /// Split image tensor into tiles.
-    fn split_to_tiles(
-        &self,
-        tensor: &Array3<f32>,
-        num_tiles_h: usize,
-        num_tiles_w: usize,
-    ) -> Array4<f32> {
-        let tile = self.tile_size as usize;
-        let num_tiles = num_tiles_h * num_tiles_w;
-
-        let mut tiles = Array4::<f32>::zeros((num_tiles, 3, tile, tile));
-
-        for h_idx in 0..num_tiles_h {
-            for w_idx in 0..num_tiles_w {
-                let tile_idx = h_idx * num_tiles_w + w_idx;
-                let y_start = h_idx * tile;
-                let x_start = w_idx * tile;
-
-                let tile_view =
-                    tensor.slice(s![.., y_start..y_start + tile, x_start..x_start + tile]);
-                tiles.slice_mut(s![tile_idx, .., .., ..]).assign(&tile_view);
-            }
+        PreprocessedEncoderInputs {
+            encoder_input,
+            feature_token_counts: plans
+                .iter()
+                .map(|plan| self.calculate_num_tokens_for_aspect_ratio(plan.grid))
+                .collect(),
+            item_sizes: images.iter().map(|image| image.dimensions()).collect(),
+            model_specific,
         }
-
-        tiles
-    }
-
-    /// Create global image by bilinear interpolation to tile size.
-    fn create_global_image(&self, image: &DynamicImage) -> Array3<f32> {
-        let tile = self.tile_size;
-        let resized = transforms::resize(image, tile, tile, FilterType::Triangle);
-        transforms::to_tensor_and_normalize(&resized, &self.mean, &self.std)
-    }
-
-    /// Process a single image.
-    fn process_single_image(&self, image: &DynamicImage) -> (Array4<f32>, (usize, usize)) {
-        let (orig_w, orig_h) = image.dimensions();
-        let image_size = (orig_h, orig_w);
-
-        // Step 1: Find best fit resolution (canvas size for padding/tiling)
-        let target_size = self.get_best_fit(image_size);
-        let (target_h, target_w) = target_size;
-
-        // Step 2: Compute resize target - limit upscaling if not resize_to_max_canvas
-        let resize_target = if self.resize_to_max_canvas {
-            target_size
-        } else {
-            let tile = self.tile_size;
-            let new_target_h = target_h.min(orig_h.max(tile));
-            let new_target_w = target_w.min(orig_w.max(tile));
-            (new_target_h, new_target_w)
-        };
-
-        // Step 3: Resize preserving aspect ratio to fit within resize_target
-        let new_size = Self::get_max_res_without_distortion(image_size, resize_target);
-        let (new_h, new_w) = (new_size.0.max(1), new_size.1.max(1));
-
-        let resized = transforms::resize(image, new_w, new_h, FilterType::Triangle);
-
-        // Fused pad + tensor: build the padded f32 tensor directly from the
-        // resized RGB bytes, avoiding an intermediate padded RgbImage allocation.
-        let tensor = if new_w != target_w || new_h != target_h {
-            self.pad_and_normalize_to_tensor(&resized, target_w as usize, target_h as usize)
-        } else {
-            transforms::to_tensor_and_normalize(&resized, &self.mean, &self.std)
-        };
-
-        // Step 6: Calculate tile counts based on target_size (canvas size)
-        let tile = self.tile_size as usize;
-        let num_tiles_h = target_h as usize / tile;
-        let num_tiles_w = target_w as usize / tile;
-
-        // Step 7: Split into tiles + global tile
-        let tiles = self.split_to_tiles(&tensor, num_tiles_h, num_tiles_w);
-        let num_tiles = num_tiles_h * num_tiles_w;
-
-        let output = if num_tiles > 1 {
-            let global_tile = self.create_global_image(image);
-            let mut combined = Array4::<f32>::zeros((num_tiles + 1, 3, tile, tile));
-            combined
-                .slice_mut(s![..num_tiles, .., .., ..])
-                .assign(&tiles);
-            combined
-                .slice_mut(s![num_tiles, .., .., ..])
-                .assign(&global_tile);
-            combined
-        } else {
-            tiles
-        };
-
-        (output, (num_tiles_h, num_tiles_w))
     }
 
     /// Calculate number of image tokens for a given aspect ratio.
@@ -394,6 +376,53 @@ impl Llama4VisionProcessor {
         };
         let tokens_per_tile = (self.tile_size as usize / PATCH_SIZE).pow(2);
         total_tiles * tokens_per_tile
+    }
+}
+
+/// Where one image lands in the output.
+#[derive(Debug, Clone, Copy)]
+struct Plan {
+    /// Width and height the image is resized to, inside its canvas.
+    resized: (u32, u32),
+    /// Rows and columns of tiles of the canvas.
+    grid: (usize, usize),
+}
+
+impl Plan {
+    /// Tiles the image writes: its canvas, and the global view behind a
+    /// canvas of more than one.
+    fn tiles(&self) -> usize {
+        let canvas = self.grid.0 * self.grid.1;
+        canvas + usize::from(canvas > 1)
+    }
+}
+
+/// The rows of a `rows` x `columns` canvas in output order (tile, channel,
+/// row), `rgb` at its top left: `run` takes a row's channel, its pixels
+/// inside the image and the count of margin elements behind them.
+fn tile_rows(
+    rgb: &[u8],
+    (width, height): (usize, usize),
+    (rows, columns): (usize, usize),
+    tile: usize,
+    mut run: impl FnMut(usize, &[[u8; 3]], usize),
+) {
+    let (pixels, _) = rgb.as_chunks::<3>();
+    for tile_y in 0..rows {
+        for tile_x in 0..columns {
+            let left = (tile_x * tile).min(width);
+            let inside = (width - left).min(tile);
+            for channel in 0..3 {
+                for y in tile_y * tile..(tile_y + 1) * tile {
+                    let row = if y < height {
+                        &pixels[y * width + left..][..inside]
+                    } else {
+                        &[]
+                    };
+                    run(channel, row, tile - row.len());
+                }
+            }
+        }
     }
 }
 
@@ -412,63 +441,66 @@ impl VisionPreProcessor for Llama4VisionProcessor {
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         TransformError::if_empty(images)?;
 
-        let mut all_outputs = Vec::new();
-        let mut all_aspect_ratios = Vec::new();
-        let mut item_sizes = Vec::new();
-        let mut feature_token_counts = Vec::new();
-
-        for image in images {
-            let (output, aspect_ratio) = self.process_single_image(image);
-            let tokens = self.calculate_num_tokens_for_aspect_ratio(aspect_ratio);
-
-            all_outputs.push(output);
-            all_aspect_ratios.push(aspect_ratio);
-            item_sizes.push(image.dimensions());
-            feature_token_counts.push(tokens);
+        let plans = self.plans(images);
+        let tile = self.tile_size as usize;
+        let tiles: usize = plans.iter().map(Plan::tiles).sum();
+        let table = self.norm().table_f32();
+        // Every image's tiles land in the one buffer the engine reads:
+        // [total_tiles, C, H, W], no batch dimension, no zero-padding.
+        let mut data = Vec::with_capacity(tiles * 3 * tile * tile);
+        for (image, plan) in images.iter().zip(&plans) {
+            self.write_image(image, plan, |channel, row, margin| {
+                let table = &table[channel];
+                data.extend(row.iter().map(|pixel| table[usize::from(pixel[channel])]));
+                // The canvas outside the image is black (0), normalized.
+                data.extend(std::iter::repeat_n(table[0], margin));
+            });
         }
 
-        // Per-image tile counts (must be computed before remove/concatenate)
-        let patches_per_image: Vec<i64> = all_outputs.iter().map(|o| o.shape()[0] as i64).collect();
+        let encoder_input = Array4::from_shape_vec((tiles, 3, tile, tile), data)
+            .map_err(|e| TransformError::ShapeError(format!("Failed to shape tiles: {e}")))?;
+        Ok(self.outputs(images, &plans, encoder_input.into()))
+    }
 
-        // Concatenate all tiles from all images into a single 4D tensor
-        // [total_tiles, C, H, W] — no batch dimension, no zero-padding.
-        // This matches what the serving engines' vision models expect.
-        let encoder_input = if all_outputs.len() == 1 {
-            all_outputs.remove(0)
-        } else {
-            let tile_views: Vec<ndarray::ArrayView4<f32>> =
-                all_outputs.iter().map(|o| o.view()).collect();
-            ndarray::concatenate(ndarray::Axis(0), &tile_views).map_err(|e| {
-                TransformError::ShapeError(format!("Failed to concatenate tiles: {e}"))
-            })?
-        };
+    /// The batch written once in `dtype`: the wire's tables are
+    /// [`preprocess`](Self::preprocess)'s own table narrowed, so every float
+    /// dtype is served.
+    fn preprocess_wire(
+        &self,
+        images: &[&DynamicImage],
+        dtype: EncoderDtype,
+    ) -> Option<Result<PreprocessedEncoderInputs, TransformError>> {
+        let norm = self.norm();
+        let writer = WireWriter::new(&norm, dtype)?;
+        if images.is_empty() {
+            return Some(Err(TransformError::EmptyBatch));
+        }
 
-        // Store aspect ratios and patches_per_image as model-specific data
-        let mut model_specific = std::collections::HashMap::new();
-        let batch_size = images.len();
+        let plans = self.plans(images);
+        let tile = self.tile_size as usize;
+        let tiles: usize = plans.iter().map(Plan::tiles).sum();
+        let element = writer.element_size();
+        let row_bytes = tile * element;
+        // A pooled buffer: its bytes are a previous request's until the rows
+        // are written, and the rows cover it.
+        let mut wire = buffer_pool::take(tiles * 3 * tile * row_bytes);
+        let black = vec![0u8; tile];
+        let mut written = 0;
+        for (image, plan) in images.iter().zip(&plans) {
+            self.write_image(image, plan, |channel, row, margin| {
+                let (inside, outside) =
+                    wire[written..written + row_bytes].split_at_mut(row.len() * element);
+                writer.write_channel(inside, row, channel);
+                writer.write_run(outside, &black[..margin], channel);
+                written += row_bytes;
+            });
+        }
 
-        let aspect_ratios_flat: Vec<i64> = all_aspect_ratios
-            .iter()
-            .flat_map(|&(h, w)| vec![h as i64, w as i64])
-            .collect();
-        model_specific.insert(
-            "aspect_ratios".to_string(),
-            ModelSpecificValue::IntTensor {
-                data: aspect_ratios_flat,
-                shape: vec![batch_size, 2],
-            },
-        );
-        model_specific.insert(
-            "patches_per_image".to_string(),
-            ModelSpecificValue::int_1d(patches_per_image),
-        );
-
-        Ok(PreprocessedEncoderInputs {
-            encoder_input: encoder_input.into(),
-            feature_token_counts,
-            item_sizes,
-            model_specific,
-        })
+        Some(
+            EncoderInput::wire(wire, dtype, vec![tiles, 3, tile, tile], norm)
+                .map(|encoder_input| self.outputs(images, &plans, encoder_input))
+                .map_err(TransformError::ShapeError),
+        )
     }
 
     fn calculate_num_tokens(&self, width: u32, height: u32) -> Result<usize, TransformError> {
@@ -685,5 +717,40 @@ mod tests {
         let processor = Llama4VisionProcessor::new();
         let result = processor.preprocess(&[]);
         assert!(matches!(result, Err(TransformError::EmptyBatch)));
+    }
+
+    /// The one-pass wire against the two-pass bytes (`preprocess`, then the
+    /// write in the wire's dtype) in every float dtype: a batch of a canvas
+    /// with margins, an exact fit and a single tile.
+    #[test]
+    fn the_wire_equals_the_two_pass_bytes() {
+        let processor = Llama4VisionProcessor::new();
+        let image = |width, height| {
+            DynamicImage::ImageRgb8(image::RgbImage::from_fn(width, height, |x, y| {
+                Rgb([(x % 251) as u8, (y % 241) as u8, ((x + y) % 239) as u8])
+            }))
+        };
+        let images = [image(1024, 768), image(672, 336), image(200, 300)];
+        let refs: Vec<&DynamicImage> = images.iter().collect();
+        let two_pass = processor.preprocess(&refs).unwrap();
+        for dtype in [
+            EncoderDtype::BFloat16,
+            EncoderDtype::Float16,
+            EncoderDtype::Float32,
+        ] {
+            let wire = processor.preprocess_wire(&refs, dtype).unwrap().unwrap();
+            assert_eq!(wire.encoder_input.shape(), two_pass.encoder_input.shape());
+            assert!(
+                wire.encoder_input.write_as(dtype) == two_pass.encoder_input.write_as(dtype),
+                "{dtype}: the one-pass wire differs from the two-pass bytes"
+            );
+            assert_eq!(wire.feature_token_counts, two_pass.feature_token_counts);
+            for (key, value) in &two_pass.model_specific {
+                assert_eq!(
+                    format!("{:?}", wire.model_specific[key]),
+                    format!("{value:?}")
+                );
+            }
+        }
     }
 }
