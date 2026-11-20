@@ -184,17 +184,18 @@ impl RouterFactory {
         ctx: &Arc<AppContext>,
         mode: Mode,
     ) -> Result<Box<dyn RouterTrait>, String> {
-        // The regular router and the pair router ask the controller's host
-        // in their selection stage. The pair router serves where the
-        // document in force plans pairs, and its family refuses by name
-        // elsewhere. The encode mode places no request through the host
-        // yet.
+        // Every router asks the controller's host in its selection stage.
+        // A pair router and an encode pair router serve where the document
+        // in force plans their family, and the family refuses by name
+        // elsewhere.
         let refusing = match mode {
             Mode::Regular => None,
             Mode::PrefillDecode => {
                 policy_controller::undecided_without(ctx, policy_controller::PlanName::PdPair)
             }
-            Mode::EncodePrefillDecode => policy_controller::undecided(ctx),
+            Mode::EncodePrefillDecode => {
+                policy_controller::undecided_without(ctx, policy_controller::PlanName::Epd)
+            }
         };
         if let Some(router) = refusing {
             return Ok(router);

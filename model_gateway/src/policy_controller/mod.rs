@@ -13,18 +13,17 @@
 //! ([`upkeep`]). A regular HTTP router with that host asks
 //! it to place typed requests: for the model a request names, or for the one
 //! primary model the router's workers serve where it names none. A regular
-//! gRPC router and a gRPC pair router ask it in their selection stage. An
-//! HTTP pair router asks it for each attempt's pair, through prefill
-//! admission. A pair router does where this gateway decides pairs in its
-//! own process: the document in force plans pairs and the gateway follows
-//! no controller. It mounts a refusing router elsewhere
-//! ([`undecided_without()`]). A gRPC encode pair router mounts a refusing
-//! router under its usual id ([`undecided()`]) whenever the store started,
-//! with or without a controller's address. The routes that pick a
-//! worker by no routing policy serve as under the classic policies: a
-//! provider's router, a realtime session and a proxied GET. A local worker's
-//! registration writes its row at the feed's door. With the setting off, the
-//! context holds neither the store, its feed nor its host.
+//! gRPC router, a gRPC pair router and a gRPC encode pair router ask it in
+//! their selection stage. An HTTP pair router asks it for each attempt's
+//! pair, through prefill admission. A pair router and an encode pair router
+//! do where this gateway decides their family in its own process: the
+//! document in force plans the family and the gateway follows no
+//! controller. They mount a refusing router under their usual id elsewhere
+//! ([`undecided_without()`]). The routes that pick a worker by no routing
+//! policy serve as under the classic policies: a provider's router, a
+//! realtime session and a proxied GET. A local worker's registration writes
+//! its row at the feed's door. With the setting off, the context holds
+//! neither the store, its feed nor its host.
 //!
 //! The document in force reaches the store through the policy crate's
 //! operators' door as YAML: the bytes `--print-policy-spec` prints where
@@ -233,11 +232,11 @@ pub(crate) fn feeds(
     }
 }
 
-/// The refusing router for a family the controller does not decide yet:
-/// the gRPC encode pair router. It mounts under
-/// the family's usual id so the gateway can select it. Returns `None` under
-/// the classic policies.
-pub(crate) fn undecided(context: &AppContext) -> Option<Box<dyn RouterTrait>> {
+/// The refusing router for a family this gateway does not decide:
+/// [`undecided_without()`] says where that is. It mounts under the family's
+/// usual id so the gateway can select it. Returns `None` under the classic
+/// policies.
+fn undecided(context: &AppContext) -> Option<Box<dyn RouterTrait>> {
     context
         .policy_host
         .is_some()

@@ -1031,6 +1031,39 @@ async fn the_grpc_pair_router_is_built_under_the_setting() -> Case {
     Ok(())
 }
 
+/// The encode pair router's selection stage asks the host too; the stage's
+/// cases hold that. No classic policy of the pair or of the encode side is
+/// built beside it.
+#[tokio::test]
+async fn the_grpc_encode_pair_router_is_built_under_the_setting() -> Case {
+    let mut config = picked(quiet());
+    config.connection_mode = ConnectionMode::Grpc;
+    config.mode = RoutingMode::EncodePrefillDecode {
+        encode_urls: vec![],
+        prefill_urls: vec![],
+        decode_urls: vec![],
+        encode_policy: None,
+        prefill_policy: None,
+        decode_policy: None,
+    };
+    let (context, gateway) = build(config).await?;
+    let router = gateway
+        .select_router_for_request(None)
+        .ok_or("the gRPC encode pair router is missing")?;
+    assert_eq!(router.router_type(), "grpc_epd");
+    let policies = &context.policy_registry;
+    let unset = policies.get_default_policy();
+    assert!(Arc::ptr_eq(&policies.get_prefill_policy(), &unset));
+    assert!(Arc::ptr_eq(&policies.get_decode_policy(), &unset));
+    // An encode policy nobody registered is made anew at each read. A
+    // registered one is one object.
+    assert!(!Arc::ptr_eq(
+        &policies.get_encode_policy(),
+        &policies.get_encode_policy()
+    ));
+    Ok(())
+}
+
 /// A gateway of many routers mounts every family over its one document.
 /// That document plans pairs under a regular configuration and under a
 /// pair configuration alike, so the gRPC pair family serves under both.
@@ -1097,6 +1130,74 @@ async fn a_grpc_pair_gateway_that_follows_a_controller_refuses_by_name() -> Case
     assert_refusing_router(router.as_ref(), "gRPC pair under an address").await
 }
 
+/// The gRPC encode pair family mounts by the same rule: it serves under a
+/// document of the encode plan, and refuses by name under a document that
+/// plans a single or a pair alone.
+#[tokio::test]
+async fn many_routers_mount_the_grpc_encode_router_where_the_document_plans_it() -> Case {
+    use crate::routers::{factory::router_ids, RouterFactory};
+
+    let mut regular = picked(quiet());
+    regular.enable_igw = true;
+    let mut pair = regular.clone();
+    pair.mode = RoutingMode::PrefillDecode {
+        prefill_urls: vec![],
+        decode_urls: vec![],
+        prefill_policy: None,
+        decode_policy: None,
+    };
+    let mut encode = regular.clone();
+    encode.mode = RoutingMode::EncodePrefillDecode {
+        encode_urls: vec![],
+        prefill_urls: vec![],
+        decode_urls: vec![],
+        encode_policy: None,
+        prefill_policy: None,
+        decode_policy: None,
+    };
+    for (config, serves) in [(regular, false), (pair, false), (encode, true)] {
+        let context = Arc::new(AppContext::from_config(config.clone(), 30, None, None).await?);
+        let routers = RouterFactory::create_igw_routers(&config.policy, &context).await;
+        let (_, _, built) = routers
+            .into_iter()
+            .find(|(id, ..)| *id == router_ids::GRPC_EPD)
+            .ok_or("the gRPC encode pair family has no entry")?;
+        let router = built?;
+        if serves {
+            assert_eq!(router.router_type(), "grpc_epd");
+        } else {
+            assert_refusing_router(router.as_ref(), "gRPC encode pair, many routers").await?;
+        }
+    }
+    Ok(())
+}
+
+/// Under a controller's address an encode pair is the controller's to
+/// decide too. The gRPC encode pair family refuses by name there, as it
+/// did, though the gateway's document plans the family.
+#[tokio::test]
+async fn a_grpc_encode_pair_gateway_that_follows_a_controller_refuses_by_name() -> Case {
+    let socket = tokio::net::TcpSocket::new_v4()?;
+    socket.bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
+    let mut config = picked(quiet());
+    config.connection_mode = ConnectionMode::Grpc;
+    config.mode = RoutingMode::EncodePrefillDecode {
+        encode_urls: vec![],
+        prefill_urls: vec![],
+        decode_urls: vec![],
+        encode_policy: None,
+        prefill_policy: None,
+        decode_policy: None,
+    };
+    config.policy_controller_address = Some(socket.local_addr()?.to_string());
+    let (context, gateway) = build(config).await?;
+    assert!(context.follows_controller());
+    let router = gateway
+        .select_router_for_request(None)
+        .ok_or("the router is missing")?;
+    assert_refusing_router(router.as_ref(), "gRPC encode pair under an address").await
+}
+
 async fn assert_refusing_router(router: &dyn RouterTrait, family: &str) -> Case {
     assert_eq!(router.router_type(), ROUTER_TYPE, "{family}");
     let answer = router.health_generate(Request::new(Body::empty())).await;
@@ -1109,60 +1210,6 @@ async fn assert_refusing_router(router: &dyn RouterTrait, family: &str) -> Case 
         "The policy controller is picked for this gateway and does not decide requests for this router yet",
         "{family}"
     );
-    Ok(())
-}
-
-#[tokio::test]
-async fn the_pair_routers_refuse_by_name() -> Case {
-    let mut pair = picked(quiet());
-    pair.mode = RoutingMode::PrefillDecode {
-        prefill_urls: vec![],
-        decode_urls: vec![],
-        prefill_policy: None,
-        decode_policy: None,
-    };
-    let mut grpc_pair = pair.clone();
-    grpc_pair.connection_mode = ConnectionMode::Grpc;
-    let mut encode_pair = grpc_pair.clone();
-    encode_pair.mode = RoutingMode::EncodePrefillDecode {
-        encode_urls: vec![],
-        prefill_urls: vec![],
-        decode_urls: vec![],
-        encode_policy: None,
-        prefill_policy: None,
-        decode_policy: None,
-    };
-    for (family, config) in [("HTTP pair", pair), ("gRPC encode pair", encode_pair)] {
-        let (context, gateway) = build(config).await?;
-        let router = gateway
-            .select_router_for_request(None)
-            .ok_or("the router is missing")?;
-        // The HTTP pair router asks the host and refuses nothing. Its own
-        // case holds what it is built as.
-        if family == "HTTP pair" {
-            assert_eq!(router.router_type(), "pd");
-            continue;
-        }
-        assert_refusing_router(router.as_ref(), family).await?;
-        // No classic pair policy was built for the refused family.
-        let policies = &context.policy_registry;
-        let unset = policies.get_default_policy();
-        assert!(
-            Arc::ptr_eq(&policies.get_prefill_policy(), &unset),
-            "{family}"
-        );
-        assert!(
-            Arc::ptr_eq(&policies.get_decode_policy(), &unset),
-            "{family}"
-        );
-        // An encode policy nobody registered is made anew at each read. A
-        // registered one is one object.
-        assert!(
-            !Arc::ptr_eq(&policies.get_encode_policy(), &policies.get_encode_policy()),
-            "{family}"
-        );
-    }
-
     Ok(())
 }
 
