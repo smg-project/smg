@@ -74,7 +74,7 @@ pub enum Refused {
 impl Refused {
     pub(crate) const OUT_OF_SCOPE: &str = "the row's maker is outside the health removal scope";
     pub(crate) const NOT_LABELS_ALONE: &str =
-        "a refresh writes a row's labels and states no other fact";
+        "a refresh writes a row's labels and the pairing they derive, and states no other fact";
 }
 
 /// Who asks to drain or remove a row.
@@ -233,8 +233,10 @@ pub trait Membership: Send + Sync + 'static {
     /// other difference is refused ([`Refused::NotLabelsAlone`]), so a
     /// refresh starts no life. No row, another row or revision, and a
     /// draining row refuse it too. The stated facts' room is tested as a
-    /// registration's is. Equal labels and an equal descriptor write
-    /// nothing and answer [`Wrote::Unmoved`].
+    /// registration's is: the controller's door, whose log carries no
+    /// descriptor, refuses a refresh that states one as it refuses such a
+    /// registration. Equal labels and an equal descriptor write nothing
+    /// and answer [`Wrote::Unmoved`].
     ///
     /// Each door says what it does with the object, as for
     /// [`Self::found_built`]. A door whose host keeps built objects hands
@@ -242,12 +244,13 @@ pub trait Membership: Send + Sync + 'static {
     /// moved: a refresh can rebuild what no row states. A door over a door
     /// passes the call on. Any other door writes the row alone.
     ///
-    /// `over` is the object the refresh rebuilt from. Equal labels move no
-    /// revision, so the row's guard cannot tell an older rebuild from a
-    /// newer one: a door that hands `built` in refuses the refresh as moved
-    /// where another object stands for the row by then, or none. It asks
-    /// ahead of the row's guard, so a worker that left reads as moved
-    /// there. A door that keeps no object has nothing to hold it against.
+    /// `over` is the object the refresh rebuilt from. Equal labels and an
+    /// equal descriptor move no revision, so the row's guard cannot tell an
+    /// older rebuild from a newer one: a door that hands `built` in refuses
+    /// the refresh as moved where another object stands for the row by
+    /// then, or none. It asks ahead of the row's guard, so a worker that
+    /// left reads as moved there. A door that keeps no object has nothing
+    /// to hold it against.
     fn refreshed(
         &self,
         seen: Standing,

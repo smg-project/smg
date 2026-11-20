@@ -875,7 +875,9 @@ impl Membership for Hosted {
         })
     }
 
-    // The controller builds each object from its row: the labels alone.
+    // The controller builds each object from its row: the refresh writes
+    // the row alone. Its log carries no descriptor, so the room test
+    // refuses a refresh that states one.
     fn refreshed(
         &self,
         seen: Standing,
