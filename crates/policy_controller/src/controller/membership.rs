@@ -31,7 +31,10 @@
 //! **A registration that states several ranks is one write.** Each rank's
 //! facts are read by the call's own rules, a rank at a time. The host
 //! door's routine then checks the group, takes the engine's rows the
-//! registration does not state, and writes: whole or not at all. The answer
+//! registration does not state, and writes. Every rule holds before the
+//! first write, so a refusal of a rank or of the group writes nothing. A
+//! lead lost between two ranks refuses there and leaves the ranks written
+//! before it: an upsert lays the rest, and an add meets them. The answer
 //! tells what the call made of each rank, then each row that left, at the
 //! place of the call's last write. A registration of one rank for an
 //! engine that stands as ranks is refused: a plain row beside its ranks

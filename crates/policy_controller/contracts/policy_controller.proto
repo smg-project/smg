@@ -905,9 +905,13 @@ message WorkerSpec {
   PairingDescriptor pairing = 10;
   // 0: the data-parallel width is discovered where a handshake runs (always
   // on) and is one rank where none does. Above 1: one row a rank, rank r
-  // under the URL `url@r`, laid whole or not at all, and the call answers a
-  // row a rank (WorkerEvent.ranks). At most 64: INVALID_ARGUMENT above, and
-  // above 1 where the controller's build lays no ranks.
+  // under the URL `url@r`, and the call answers a row a rank
+  // (WorkerEvent.ranks). Every rule holds before the first write: a
+  // refusal of a rank or of the group writes nothing. A lead lost between
+  // two ranks is UNAVAILABLE and leaves the ranks written before it: a
+  // MODE_UPSERT lays the rest, and a MODE_ADD meets them as ALREADY_EXISTS.
+  // At most 64: INVALID_ARGUMENT above, and above 1 where the controller's
+  // build lays no ranks.
   //
   // The modes hold for the engine. MODE_ADD: ALREADY_EXISTS where a row
   // stands under a rank's URL or the engine stands in another form (its
