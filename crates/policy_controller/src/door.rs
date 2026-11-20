@@ -4163,6 +4163,59 @@ pub(crate) mod tests {
         );
     }
 
+    /// The two ranks of one engine are two rows, each under its own key
+    /// and id. The second rank is the lighter: the pair's first pick sends
+    /// the prefill there, and the decode call names the held prefill at
+    /// that same rank.
+    #[test]
+    fn a_decode_call_names_the_held_prefill_at_its_own_rank() {
+        let store = pair_fleet(0, 1).expect("a decode worker under the pair plan");
+        let rank = |dp_rank: u16| {
+            let facts = WorkerFacts {
+                key: format!("http://p-ranks:8000/{dp_rank}"),
+                engine: "http://p-ranks:8000".into(),
+                incarnation: 1,
+                role: Role::Prefill,
+                models: vec![MODEL.to_owned()],
+                dp_rank,
+                dp_size: 2,
+                max_running: Some(4_096),
+                ..WorkerFacts::default()
+            };
+            ready(&store, facts)
+        };
+        let ranks = [rank(0), rank(1)];
+        let at = Instant::now();
+        for (worker, dp_rank, queued) in [(ranks[0], 0, 80), (ranks[1], 1, 0)] {
+            let row = LoadRow {
+                queued,
+                live_rate: 2_000,
+                ..LoadRow::default()
+            };
+            store.record(worker, dp_rank, row, at, LoadSource::Stream);
+        }
+        let now = store.publish_due().map_or(at, |due| due.max(at));
+        store.publish(now);
+        let door = Door::new(store);
+        let asked = later_request(b"ranks");
+        // Every target of a pick names its prefill, by worker and rank.
+        let prefills = |decision: &Decision| -> Vec<(WorkerId, u16)> {
+            let pick = decision.pick();
+            pick.into_iter()
+                .flat_map(|pick| pick.targets.iter())
+                .map(|target| (target.id, target.dp_rank))
+                .collect()
+        };
+        let first = door.decide(GATEWAY, &asked, now).expect("a pair");
+        assert_eq!(prefills(&first.decision), [(ranks[1], 1)]);
+        let lease = first.lease.expect("a lease").lease.id;
+        door.report(GATEWAY, lease, pair_dispatch(Side::Prefill, now));
+        let called = door
+            .decide_decode(GATEWAY, &asked, lease, now)
+            .expect("a decode");
+        assert_eq!(prefills(&called.decision), [(ranks[1], 1)]);
+    }
+
     #[test]
     fn the_call_is_refused_by_name_and_moves_nothing() {
         let store = pair_fleet(1, 1).expect("a pair fleet");
