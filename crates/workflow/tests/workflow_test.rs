@@ -278,6 +278,132 @@ async fn a_step_that_panics_ends_its_run_as_failed() {
     );
 }
 
+/// Where a step author's other code panics.
+#[derive(Debug, Clone, Copy)]
+enum PanicsIn {
+    RunIf,
+    IsRetryable,
+    OnSuccess,
+    OnFailure,
+}
+
+/// A step whose named code panics. It fails where that code needs a failure.
+struct HookPanics(PanicsIn);
+
+#[async_trait::async_trait]
+impl StepExecutor<TestWorkflowData> for HookPanics {
+    async fn execute(
+        &self,
+        _context: &mut WorkflowContext<TestWorkflowData>,
+    ) -> WorkflowResult<StepResult> {
+        match self.0 {
+            PanicsIn::RunIf | PanicsIn::OnSuccess => Ok(StepResult::Success),
+            PanicsIn::IsRetryable | PanicsIn::OnFailure => Err(WorkflowError::StepFailed {
+                step_id: StepId::new("hooked_step"),
+                message: "its own failure".to_string(),
+            }),
+        }
+    }
+
+    #[expect(clippy::panic, reason = "the case needs a retry answer that panics")]
+    fn is_retryable(&self, _error: &WorkflowError) -> bool {
+        if matches!(self.0, PanicsIn::IsRetryable) {
+            panic!("the retry answer's own words");
+        }
+        false
+    }
+
+    #[expect(clippy::panic, reason = "the case needs a hook that panics")]
+    async fn on_success(&self, _context: &WorkflowContext<TestWorkflowData>) -> WorkflowResult<()> {
+        if matches!(self.0, PanicsIn::OnSuccess) {
+            panic!("the success hook's own words");
+        }
+        Ok(())
+    }
+
+    #[expect(clippy::panic, reason = "the case needs a hook that panics")]
+    async fn on_failure(
+        &self,
+        _context: &WorkflowContext<TestWorkflowData>,
+        _error: &WorkflowError,
+    ) -> WorkflowResult<()> {
+        if matches!(self.0, PanicsIn::OnFailure) {
+            panic!("the failure hook's own words");
+        }
+        Ok(())
+    }
+}
+
+/// A panic in a step author's other code ends the run too: the condition,
+/// the retry answer and the two end hooks. A hook's panic is logged like its
+/// error and leaves what the step came to. Each row hung its run before.
+#[tokio::test]
+async fn a_panic_in_a_steps_condition_or_hooks_ends_its_run() {
+    const FAILURE: &str = "Step failed: hooked_step - its own failure";
+    let rows = [
+        (
+            PanicsIn::RunIf,
+            WorkflowStatus::Failed,
+            StepStatus::Failed,
+            Some("run_if panicked: the condition's own words"),
+        ),
+        (
+            PanicsIn::IsRetryable,
+            WorkflowStatus::Failed,
+            StepStatus::Failed,
+            Some(FAILURE),
+        ),
+        (
+            PanicsIn::OnSuccess,
+            WorkflowStatus::Completed,
+            StepStatus::Succeeded,
+            None,
+        ),
+        (
+            PanicsIn::OnFailure,
+            WorkflowStatus::Failed,
+            StepStatus::Failed,
+            Some(FAILURE),
+        ),
+    ];
+    for (panics_in, run, step, error) in rows {
+        let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+        let mut hooked = StepDefinition::new(
+            "hooked_step",
+            "Step whose other code panics",
+            Arc::new(HookPanics(panics_in)),
+        )
+        .with_retry(RetryPolicy {
+            max_attempts: 3,
+            backoff: BackoffStrategy::Fixed(Duration::from_millis(10)),
+        })
+        .with_failure_action(FailureAction::FailWorkflow);
+        if matches!(panics_in, PanicsIn::RunIf) {
+            let condition = |_: &WorkflowContext<TestWorkflowData>| -> bool {
+                panic!("the condition's own words")
+            };
+            hooked = hooked.run_if(condition);
+        }
+        let workflow = WorkflowDefinition::new("hooked_workflow", "A step's other code panics")
+            .add_step(hooked);
+        let instance_id = started(&engine, workflow).await.unwrap();
+
+        let state = engine
+            .wait_for_terminal_state(instance_id, "hooked", Duration::from_secs(5))
+            .await
+            .map_err(|error| format!("{panics_in:?}: {error}"))
+            .unwrap();
+
+        assert_eq!(state.status, run, "{panics_in:?}");
+        let step_state = state.step_states.get(&StepId::new("hooked_step")).unwrap();
+        assert_eq!(step_state.status, step, "{panics_in:?}");
+        assert_eq!(step_state.last_error.as_deref(), error, "{panics_in:?}");
+        if matches!(panics_in, PanicsIn::IsRetryable) {
+            assert_eq!(step_state.attempt, 1, "a panicked answer allows no retry");
+        }
+    }
+}
+
 #[tokio::test]
 async fn test_workflow_continue_on_failure() {
     let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
