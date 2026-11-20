@@ -43,7 +43,7 @@ use crate::{
 
 /// The name of the refusal of a local worker's POST, PUT or PATCH, where a
 /// local worker is a row of the policy controller's store.
-const WORKER_API_UNSUPPORTED: &str = "policy_controller_worker_api_unsupported";
+const WORKER_API_UNSUPPORTED: &str = "POLICY_CONTROLLER_WORKER_API_UNSUPPORTED";
 
 /// Validate the URL of an incoming worker-management request, translating a
 /// config-layer rejection into `400 Bad Request`. Must run before
@@ -297,7 +297,8 @@ fn validate_labels(labels: &HashMap<String, String>) -> Result<(), WorkerService
 /// worker and overwrites the edit. What no provider publishes (priority,
 /// cost, API key, health checks) is still a PATCH's to change, and a DELETE
 /// stays allowed; the provider adds the worker back while it still
-/// publishes it.
+/// publishes it. Where a local worker is a row, a DELETE is refused as
+/// well ([`WorkerServiceError::DiscoveryRemoves`]).
 fn refuse_discovery_owned(worker: &dyn Worker) -> Result<(), WorkerServiceError> {
     match discovery_provider(worker) {
         Some(provider) => Err(WorkerServiceError::DiscoveryOwned {
@@ -312,6 +313,12 @@ fn refuse_discovery_owned(worker: &dyn Worker) -> Result<(), WorkerServiceError>
 /// reconciler writes; `None` for a worker registered locally.
 fn discovery_provider(worker: &dyn Worker) -> Option<&String> {
     worker.metadata().spec.labels.get(DISCOVERY_PROVIDER_LABEL)
+}
+
+/// Whether `worker` is a row where a local worker is one: every worker but
+/// a provider's, which stays outside the store.
+fn stands_as_row(worker: &dyn Worker) -> bool {
+    worker.metadata().spec.runtime_type != RuntimeType::External
 }
 
 /// Error types for worker service operations
@@ -343,6 +350,10 @@ pub enum WorkerServiceError {
     /// A discovery provider owns the worker (a PUT, or a PATCH of labels, of a
     /// discovered worker)
     DiscoveryOwned { url: String, provider: String },
+    /// A DELETE of a discovered worker, on a gateway whose local workers are
+    /// rows of the policy controller's store: its provider alone removes
+    /// its row
+    DiscoveryRemoves { url: String, provider: String },
     /// The spec targets a provider whose router this build does not carry
     ProviderNotCompiled {
         url: String,
@@ -373,7 +384,7 @@ impl WorkerServiceError {
             // code the window answered before; the message says what holds.
             Self::RemovalInProgress { .. } => "WORKER_ALREADY_EXISTS",
             Self::CreateInProgress { .. } => "WORKER_CREATE_IN_PROGRESS",
-            Self::DiscoveryOwned { .. } => "WORKER_DISCOVERY_OWNED",
+            Self::DiscoveryOwned { .. } | Self::DiscoveryRemoves { .. } => "WORKER_DISCOVERY_OWNED",
             Self::ProviderNotCompiled { .. } => "PROVIDER_NOT_COMPILED",
             Self::KeyUnsupported { .. } => WORKER_KEY_UNSUPPORTED,
             Self::ApiUnsupported { .. } => WORKER_API_UNSUPPORTED,
@@ -391,6 +402,7 @@ impl WorkerServiceError {
             Self::RemovalInProgress { .. } => StatusCode::CONFLICT,
             Self::CreateInProgress { .. } => StatusCode::CONFLICT,
             Self::DiscoveryOwned { .. } => StatusCode::CONFLICT,
+            Self::DiscoveryRemoves { .. } => StatusCode::CONFLICT,
             Self::ProviderNotCompiled { .. } => StatusCode::BAD_REQUEST,
             Self::KeyUnsupported { .. } => StatusCode::BAD_REQUEST,
             Self::ApiUnsupported { .. } => StatusCode::NOT_IMPLEMENTED,
@@ -456,6 +468,12 @@ impl std::fmt::Display for WorkerServiceError {
                 "Worker '{url}' is owned by the '{provider}' discovery provider. \
                 Its spec and labels come from its discovery source: change them there, \
                 not with a PUT or a PATCH of labels."
+            ),
+            Self::DiscoveryRemoves { url, provider } => write!(
+                f,
+                "Worker '{url}' is owned by the '{provider}' discovery provider, and under \
+                the policy controller its provider alone removes it. Take it out of its \
+                discovery source."
             ),
             Self::ProviderNotCompiled {
                 url,
@@ -665,12 +683,13 @@ impl WorkerService {
     }
 
     /// Where a local worker is a row, the worker API registers none yet.
-    /// The store's door takes an upsert alone, which a start-up and a
-    /// discovery registration are: a POST's new worker and a PUT's
-    /// replacement would be accepted and then fail at the door. A row also
-    /// keeps no credential, so a worker that states an API key is refused
-    /// by that name first. Refuse here rather than after the 202. A
-    /// provider's worker stays outside the store and registers as before.
+    /// A start-up and a discovery registration are upserts. A POST's add
+    /// and a PUT's replacement take the door's other two modes, and the
+    /// API hands them no job until the change that proves both lines
+    /// there. A row also keeps no credential, so a worker that states an
+    /// API key is refused by that name first. Refuse here rather than after
+    /// the 202. A provider's worker stays outside the store and registers
+    /// as before.
     fn refuse_local_worker(&self, config: &WorkerSpec) -> Result<(), WorkerServiceError> {
         let local = stated_kind(config) != Some(WorkerKind::External);
         if !(self.local_workers_are_rows && local) {
@@ -837,6 +856,12 @@ impl WorkerService {
         validate_spec(&config)?;
         Self::require_provider_router(&config)?;
         self.refuse_local_worker(&config)?;
+        // A row's worker is the door's, whatever runtime the new spec
+        // states: a spec that restates it as a provider's would be accepted
+        // and then fail at the row that holds its URL.
+        if self.local_workers_are_rows && stands_as_row(existing.as_ref()) {
+            return Err(Self::row_refusal(url, config.api_key.is_some()));
+        }
 
         // A data-parallel router expands one spec into one worker per rank,
         // each registered under a rank-suffixed URL. Re-running registration
@@ -982,6 +1007,19 @@ impl WorkerService {
             .ok_or_else(|| WorkerServiceError::NotFound {
                 worker_id: worker_id_raw.to_string(),
             })?;
+        // Where a local worker is a row, its maker alone removes it at the
+        // store's door, and the API removes as the control maker. A
+        // discovered worker is its provider's row: the removal would be
+        // accepted and then leave it. Refuse here rather than after the 202.
+        if self.local_workers_are_rows {
+            let discovered = find_workers_by_url(&self.worker_registry, &url)
+                .iter()
+                .filter(|worker| stands_as_row(worker.as_ref()))
+                .find_map(|worker| discovery_provider(worker.as_ref()).cloned());
+            if let Some(provider) = discovered {
+                return Err(WorkerServiceError::DiscoveryRemoves { url, provider });
+            }
+        }
         let job_queue = self.get_job_queue()?;
 
         // An id with no worker behind it is a POST's registration still in
@@ -1077,13 +1115,8 @@ impl WorkerService {
         // the row's until the row's next change. The id of a data-parallel
         // group reaches its ranks, each a row under its own URL.
         if self.local_workers_are_rows {
-            let row = |worker: &Arc<dyn Worker>| {
-                worker.metadata().spec.runtime_type != RuntimeType::External
-            };
-            if find_workers_by_url(&self.worker_registry, &url)
-                .iter()
-                .any(row)
-            {
+            let selected = find_workers_by_url(&self.worker_registry, &url);
+            if selected.iter().any(|worker| stands_as_row(worker.as_ref())) {
                 return Err(Self::row_refusal(url, update.api_key.is_some()));
             }
         }
@@ -1279,7 +1312,9 @@ mod tests {
     /// A gateway whose local workers are rows registers none through the
     /// worker API yet. A POST and a PUT are refused by name before the 202:
     /// with 400 for a worker that states an API key, with 501 for any other.
-    /// Nothing is reserved. A provider's worker registers as before.
+    /// A PUT that restates a row's worker as a provider's is refused by the
+    /// worker that stands. Nothing is reserved. A provider's worker
+    /// registers as before.
     #[tokio::test]
     async fn a_local_worker_is_refused_by_name_at_the_api_where_a_local_worker_is_a_row() {
         let spec = |url: &str, runtime: &str, key: Option<&str>| -> WorkerSpec {
@@ -1295,8 +1330,8 @@ mod tests {
         let id = registry.get_id_by_url(replaced).unwrap();
         let service = make_service(Arc::clone(&registry)).with_local_workers_as_rows();
         let names = [
-            "policy_controller_worker_key_unsupported",
-            "policy_controller_worker_api_unsupported",
+            "POLICY_CONTROLLER_WORKER_KEY_UNSUPPORTED",
+            "POLICY_CONTROLLER_WORKER_API_UNSUPPORTED",
         ];
 
         let created = "http://create:8000";
@@ -1311,6 +1346,10 @@ mod tests {
                     .map(drop),
                 service
                     .replace_worker(id.as_str(), spec(replaced, "sglang", key))
+                    .await
+                    .map(drop),
+                service
+                    .replace_worker(id.as_str(), spec(replaced, "external", key))
                     .await
                     .map(drop),
             ] {
@@ -1341,6 +1380,59 @@ mod tests {
         }
     }
 
+    /// Where a local worker is a row, its maker alone removes it at the
+    /// store's door, and the API is not a discovered worker's maker. Its
+    /// DELETE is refused by name before the 202 and queues nothing. A
+    /// worker the gateway registered itself, a discovered provider's worker
+    /// and a service with no rows take the DELETE.
+    #[tokio::test]
+    async fn a_delete_of_a_discovered_rows_worker_is_refused_by_name() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let ours = "http://ours:8000";
+        register_worker(&registry, ours, Some("served"));
+        let discovered = "http://discovered:8000";
+        let provider = "https://provider.example/v1";
+        for (url, runtime) in [
+            (discovered, RuntimeType::default()),
+            (provider, RuntimeType::External),
+        ] {
+            let found = BasicWorkerBuilder::new(url)
+                .runtime_type(runtime)
+                .model(ModelCard::new("served"))
+                .label(DISCOVERY_PROVIDER_LABEL, "kubernetes")
+                .build();
+            registry.register(Arc::new(found)).unwrap();
+        }
+        let id = |url: &str| registry.get_id_by_url(url).unwrap();
+        let service = make_service(Arc::clone(&registry)).with_local_workers_as_rows();
+
+        let refused = service.delete_worker(id(discovered).as_str()).await;
+        let (answered, body, _) = answer(refused.map(drop).unwrap_err()).await;
+        assert_eq!(answered, StatusCode::CONFLICT);
+        assert_eq!(body["code"], "WORKER_DISCOVERY_OWNED");
+        let sentence = body["error"].as_str().unwrap();
+        assert!(
+            sentence.contains("'kubernetes' discovery provider")
+                && sentence.contains("its provider alone removes it"),
+            "{sentence}"
+        );
+
+        // Each of these passes the check and ends at the queue this service
+        // lacks.
+        for passed in [
+            service.delete_worker(id(ours).as_str()).await,
+            service.delete_worker(id(provider).as_str()).await,
+            make_service(Arc::clone(&registry))
+                .delete_worker(id(discovered).as_str())
+                .await,
+        ] {
+            assert!(matches!(
+                passed,
+                Err(WorkerServiceError::QueueNotInitialized)
+            ));
+        }
+    }
+
     /// A PATCH of a row's worker is refused as its POST is: with 400 where
     /// it states an API key, with 501 for any other. A provider's worker
     /// takes the PATCH, and so does a worker of a service with no rows.
@@ -1367,12 +1459,12 @@ mod tests {
             (
                 key(),
                 StatusCode::BAD_REQUEST,
-                "policy_controller_worker_key_unsupported",
+                "POLICY_CONTROLLER_WORKER_KEY_UNSUPPORTED",
             ),
             (
                 labels(),
                 StatusCode::NOT_IMPLEMENTED,
-                "policy_controller_worker_api_unsupported",
+                "POLICY_CONTROLLER_WORKER_API_UNSUPPORTED",
             ),
         ] {
             let refused = service.update_worker(id(row).as_str(), patch).await;

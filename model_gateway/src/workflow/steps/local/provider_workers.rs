@@ -1,13 +1,16 @@
-//! The registry's removal steps for a worker no row stands for, in the
+//! The registry's removal steps for the workers no row stands for, in the
 //! removal line that writes at the store's door.
 //!
 //! The door's steps leave a worker with no row alone, and a provider's
 //! worker has none: the registry is its one home. The registry's own drain
-//! and removal take it, as in the classic line. A removal that names a
-//! row's worker is the door's: both steps skip it, whatever the door
-//! answered.
+//! and removal take it, as in the classic line. One removal can name both
+//! kinds: an address selects every rank and every scheme registered under
+//! it. Each step here runs for the workers no row stands for and leaves
+//! the rest of the selection to the door. A row the door refused reaches
+//! neither step: the door's drain fails the job where nothing drained, and
+//! takes the row's worker off the job's lists otherwise.
 
-use std::sync::Arc;
+use std::{mem, sync::Arc};
 
 use async_trait::async_trait;
 use smg_policy_controller::worker_host::Objects;
@@ -46,18 +49,41 @@ where
         &self,
         context: &mut WorkflowContext<WorkerRemovalWorkflowData>,
     ) -> WorkflowResult<StepResult> {
-        let registry = require_host(context.data.host.as_ref())?.worker_registry();
-        let names_row = context.data.worker_urls.iter().any(|url| {
+        let host = Arc::clone(require_host(context.data.host.as_ref())?);
+        let registry = host.worker_registry();
+        // The selection's workers that stand in the registry with no row.
+        // A row the door drained still stands with its row, and a row the
+        // door removed left the registry with it: neither is this step's.
+        let selected = context
+            .data
+            .actual_workers_to_remove
+            .clone()
+            .unwrap_or_default();
+        let (rowless, rest): (Vec<_>, Vec<_>) = selected.into_iter().partition(|worker| {
             registry
-                .get_id_by_url(url)
-                .is_some_and(|id| self.rows.standing(&id).is_some())
+                .get_id_by_url(worker.url())
+                .is_some_and(|id| registry.get(&id).is_some() && self.rows.standing(&id).is_none())
         });
-        // A row the door removed left the registry with it: the door's
-        // answer names it.
-        if names_row || !context.data.removed_workers.is_empty() {
+        if rowless.is_empty() {
             return Ok(StepResult::Skip);
         }
-        self.step.execute(context).await
+
+        // The step reads the job's lists and writes its answer over the
+        // door's. Hand it the rowless workers alone, then lay the door's
+        // lists back in front of what it left. The engine writes a failed
+        // step's data back as well, so the lists are whole on every way
+        // out.
+        let data = &mut context.data;
+        let drained = mem::take(&mut data.drained_workers);
+        let removed = mem::take(&mut data.removed_workers);
+        data.keep_only(rowless);
+        let ended = self.step.execute(context).await;
+        let data = &mut context.data;
+        let left = data.actual_workers_to_remove.take().unwrap_or_default();
+        data.keep_only(rest.into_iter().chain(left).collect());
+        data.drained_workers.splice(0..0, drained);
+        data.removed_workers.splice(0..0, removed);
+        ended
     }
 
     fn is_retryable(&self, error: &WorkflowError) -> bool {

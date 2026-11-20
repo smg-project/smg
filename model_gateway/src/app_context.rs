@@ -279,6 +279,15 @@ impl WorkflowHost for AppContext {
     }
 }
 
+/// The feed a gateway's worker workflows write at: `feed` where the gateway
+/// decides in its own process, and none where it `follows` a controller.
+/// There the store mirrors that controller's rows, and a write of the
+/// gateway's own would set the mirror apart from the controller: its
+/// workflows stay the classic ones.
+fn workflows_feed(feed: Option<&Feed>, follows: bool) -> Option<&Feed> {
+    feed.filter(|_| !follows)
+}
+
 impl AppContext {
     pub fn builder() -> AppContextBuilder {
         AppContextBuilder::new()
@@ -293,19 +302,27 @@ impl AppContext {
         self.policy_follower.is_some()
     }
 
+    /// The feed this gateway's worker workflows write at: its own where it
+    /// decides in its own process, and none where a controller supplies its
+    /// workers ([`workflows_feed`]).
+    pub(crate) fn door_feed(&self) -> Option<&Feed> {
+        workflows_feed(self.policy_feed.as_ref(), self.follows_controller())
+    }
+
     /// Whether a registration of `spec` writes a row of the policy
-    /// controller's store: under the feed, every worker but a stated
-    /// provider's. A row holds no credential yet, so the gateway states its
-    /// own API key on no such worker, at start-up or from discovery.
+    /// controller's store: where the workflows write at the door, every
+    /// worker but a stated provider's. A row holds no credential yet, so
+    /// the gateway states its own API key on no such worker, at start-up or
+    /// from discovery.
     pub(crate) fn registers_at_door(&self, spec: &WorkerSpec) -> bool {
-        self.policy_feed.is_some() && stated_kind(spec) != Some(WorkerKind::External)
+        self.door_feed().is_some() && stated_kind(spec) != Some(WorkerKind::External)
     }
 
     /// Whether a row of the policy controller's store stands for a worker
     /// `url` selects. The holder is then the one writer of that worker's
     /// object in the registry.
     pub(crate) fn holds_row_at(&self, url: &str) -> bool {
-        self.policy_feed.as_ref().is_some_and(|feed| {
+        self.door_feed().is_some_and(|feed| {
             find_workers_by_url(&self.worker_registry, url)
                 .iter()
                 .filter_map(|worker| self.worker_registry.get_id_by_url(worker.url()))
@@ -669,14 +686,16 @@ impl AppContextBuilder {
             policy_registry.keep_rings_warm(&worker_registry, &runtime);
         }
 
-        // Create WorkerService from the already-built components. Under a
-        // feed a local worker is a row of the store.
+        // Create WorkerService from the already-built components. Where
+        // the workflows write at the door a local worker is a row of the
+        // store.
         let worker_service = WorkerService::new(
             worker_registry.clone(),
             worker_job_queue.clone(),
             router_config.clone(),
         );
-        let worker_service = Arc::new(if self.policy_feed.is_some() {
+        let rows = workflows_feed(self.policy_feed.as_ref(), self.policy_follower.is_some());
+        let worker_service = Arc::new(if rows.is_some() {
             worker_service.with_local_workers_as_rows()
         } else {
             worker_service

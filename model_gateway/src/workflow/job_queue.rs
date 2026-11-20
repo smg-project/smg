@@ -1767,7 +1767,7 @@ mod tests {
         assert_eq!(stated(&registration), Some((url.clone(), None)));
         assert_eq!(stated(&next_job()), Some((provider, key)));
 
-        let engines = WorkflowEngines::with_feed(&config, hosted.policy_feed.as_ref());
+        let engines = WorkflowEngines::with_feed(&config, hosted.door_feed());
         assert!(hosted.workflow_engines.set(engines).is_ok());
         let done = execute_job(&registration, &hosted, &marks, None).await;
         assert!(done.is_ok(), "{done:?}");
@@ -1798,7 +1798,7 @@ mod tests {
         let hosted = Arc::new(hosted);
         let (queue, next_job) = recording_for_tests(&hosted);
         hosted.worker_job_queue.set(queue).unwrap();
-        let engines = WorkflowEngines::with_feed(&config, hosted.policy_feed.as_ref());
+        let engines = WorkflowEngines::with_feed(&config, hosted.door_feed());
         assert!(hosted.workflow_engines.set(engines).is_ok());
         let registration = Job::AddWorker {
             config: Box::new(WorkerSpec::new(&url)),

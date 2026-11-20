@@ -1951,7 +1951,7 @@ impl ConfigValidator {
             if probes && checks.endpoint != probed {
                 return refuse(&format!(
                     "--health-check-endpoint {} conflicts with the policy_controller setting \
-                     (--policy-controller): a worker of the controller's store is probed at \
+                     (--policy-controller on): a worker of the controller's store is probed at \
                      {probed} alone yet",
                     checks.endpoint
                 ));

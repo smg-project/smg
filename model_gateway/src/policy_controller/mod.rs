@@ -24,9 +24,10 @@
 //!
 //! Under a controller's address a follower keeps the store's worker rows
 //! as that controller's watch tells them ([`follower`]). The gateway then
-//! discovers, registers and probes no worker of its own. Each row has its
-//! worker object in the registry before the gateway reports a fleet, and
-//! the object's status is the row's ([`feeds`]).
+//! discovers, registers and probes no worker of its own, and its worker
+//! workflows write no row: a write of its own would set the mirror apart.
+//! Each row has its worker object in the registry before the gateway
+//! reports a fleet, and the object's status is the row's ([`feeds`]).
 
 use std::sync::Arc;
 

@@ -56,7 +56,7 @@ pub(crate) struct RegisterBesideRowsStep {
 }
 
 /// The name of the refusal of a provider's worker at a URL a row holds.
-const WORKER_URL_TAKEN: &str = "policy_controller_worker_url_taken";
+const WORKER_URL_TAKEN: &str = "POLICY_CONTROLLER_WORKER_URL_TAKEN";
 
 impl RegisterBesideRowsStep {
     /// The step beside the rows whose objects `rows` holds.

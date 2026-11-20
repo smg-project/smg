@@ -17,7 +17,7 @@ pub(crate) const REFUSE_WORKER_KEY_STEP: &str = "refuse_worker_key";
 
 /// The name of the refusal, in the step's error and in the worker API's
 /// answer.
-pub(crate) const WORKER_KEY_UNSUPPORTED: &str = "policy_controller_worker_key_unsupported";
+pub(crate) const WORKER_KEY_UNSUPPORTED: &str = "POLICY_CONTROLLER_WORKER_KEY_UNSUPPORTED";
 
 /// Step to refuse a local registration that states an API key.
 pub struct RefuseWorkerKeyStep;
