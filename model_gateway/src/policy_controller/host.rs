@@ -42,7 +42,7 @@ use parking_lot::Mutex;
 use rand::RngExt;
 use smg_policy_controller::{
     decision::{Decision, Lifted, Pair, ShedReason, Targets, Trace, MAX_TARGETS},
-    door::{Door, Maker, Refused, Request},
+    door::{Door, Maker, Refused, Request, Swept},
     handle::Handle,
     lease::{Outcome, ReleaseReason, Side, TransportClass},
     store::{GatewayId, MemoryStore, World},
@@ -477,6 +477,12 @@ impl Host {
             door: Arc::new(Door::new(store)),
             workers: Workers::Held(objects),
         }
+    }
+
+    /// One pass of the door's clock at `now`: the call of the host's timer
+    /// ([`upkeep`](super::upkeep)), about once a second.
+    pub(crate) fn sweep(&self, now: Instant) -> Swept {
+        self.door.sweep(now)
     }
 
     /// An attempt's prompt hashes for `model`, under the generation in force.

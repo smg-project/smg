@@ -24,7 +24,7 @@ use smg_policy_controller::{
     lease::Lifecycle,
     operator::SpecRejected,
     store::{WorkerFacts, WorkerStatus as RowStatus, WorkersStore},
-    view::{Candidate, RequestFacts, Role, WireModes},
+    view::{Candidate, RequestFacts, Role, WireModes, WorkerId},
     AppliedSpec, Catalog, CatalogError, PolicySpec, SpecError,
 };
 use smg_worker::{connection::engine::EngineConnector, identity::basic::ConnectionMode};
@@ -1351,35 +1351,24 @@ async fn a_rows_status_is_its_workers_under_a_controllers_address_alone() -> Cas
     Ok(())
 }
 
-/// The host the context builds stands over the feed's own holder. A worker
-/// written at the context's feed door is placed by the context's host, on
-/// the object the holder laid in the context's registry.
-#[tokio::test]
-async fn a_worker_written_at_the_contexts_door_is_placed_by_its_host() -> Case {
-    use std::time::Instant;
-
+/// A context that decides in its own process, with one worker written at
+/// its feed's door under `url`: the context and the worker's row.
+async fn context_with_a_worker(url: &str) -> Result<(AppContext, WorkerId), Box<dyn Error>> {
     use smg_policy_controller::{
         store::{HealthPolicy, Maker},
         worker_host::{Expect, Wrote},
     };
 
-    use super::host::Ask;
-
-    const URL: &str = "http://127.0.0.1:1";
     let context = AppContext::from_config(picked(quiet()), 30, None, None).await?;
     let feed = context
         .policy_feed
         .as_ref()
         .ok_or("the store has no feed")?;
-    let host = context
-        .policy_host
-        .as_ref()
-        .ok_or("the store has no host")?;
     let wrote = feed
         .door
-        .found(&Maker::Control, Expect::Nothing, URL, &|_| WorkerFacts {
-            key: URL.to_owned(),
-            engine: URL.to_owned(),
+        .found(&Maker::Control, Expect::Nothing, url, &|_| WorkerFacts {
+            key: url.to_owned(),
+            engine: url.to_owned(),
             role: Role::Single,
             wire_modes: WireModes::HTTP,
             models: vec!["model-a".to_owned()],
@@ -1394,6 +1383,24 @@ async fn a_worker_written_at_the_contexts_door_is_placed_by_its_host() -> Case {
     let Ok(Wrote::Registered(row)) = wrote else {
         return Err(format!("expected a registration, got {wrote:?}").into());
     };
+    Ok((context, row))
+}
+
+/// The host the context builds stands over the feed's own holder. A worker
+/// written at the context's feed door is placed by the context's host, on
+/// the object the holder laid in the context's registry.
+#[tokio::test]
+async fn a_worker_written_at_the_contexts_door_is_placed_by_its_host() -> Case {
+    use std::time::Instant;
+
+    use super::host::Ask;
+
+    const URL: &str = "http://127.0.0.1:1";
+    let (context, row) = context_with_a_worker(URL).await?;
+    let host = context
+        .policy_host
+        .as_ref()
+        .ok_or("the store has no host")?;
     let placed = host
         .place(&Ask::of(b"r1", "model-a"), Instant::now())
         .await
@@ -1404,6 +1411,48 @@ async fn a_worker_written_at_the_contexts_door_is_placed_by_its_host() -> Case {
         .get_by_url(URL)
         .ok_or("the registry holds no worker at the URL")?;
     assert!(Arc::ptr_eq(placed.worker(), &laid));
+    Ok(())
+}
+
+/// The context starts its host's timer. A lease placed through the
+/// context's host a minute ago, whose dispatch is never named, is ended at
+/// the timer's next pass: no later request has to end it.
+#[tokio::test]
+async fn a_built_contexts_timer_ends_a_lease_whose_dispatch_was_never_named() -> Case {
+    use std::time::{Duration, Instant};
+
+    use smg_policy_controller::store::{GatewayId, LeasesStore};
+
+    use super::{host::Ask, upkeep};
+
+    let (context, _) = context_with_a_worker("http://127.0.0.1:1").await?;
+    let host = context
+        .policy_host
+        .as_ref()
+        .ok_or("the store has no host")?;
+    let store = context
+        .policy_store
+        .as_ref()
+        .ok_or("the context holds no store")?;
+    let issued = Instant::now()
+        .checked_sub(Duration::from_secs(60))
+        .ok_or("the clock is under a minute old")?;
+    let placed = host
+        .place(&Ask::of(b"r1", "model-a"), issued)
+        .await
+        .map_err(|_| "the context's host placed no worker")?;
+    assert_eq!(LeasesStore::live(&**store, GatewayId::LOCAL), 1);
+
+    // The clock is held and moved a tick at a step. The timer's task may
+    // take its first turn inside the first step, and its tick then falls
+    // a millisecond past that step.
+    tokio::time::pause();
+    for _ in 0..3 {
+        tokio::time::advance(upkeep::EVERY).await;
+    }
+    tokio::task::yield_now().await;
+    assert_eq!(LeasesStore::live(&**store, GatewayId::LOCAL), 0);
+    drop(placed);
     Ok(())
 }
 
