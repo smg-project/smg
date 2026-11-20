@@ -43,6 +43,7 @@ use rand::RngExt;
 use smg_policy_controller::{
     decision::{Decision, Lifted, Pair, ShadowKind, ShedReason, Targets, Trace, MAX_TARGETS},
     door::{Door, Maker, Refused, Request, Swept},
+    framework::{EncodeItems, EncodePlaced},
     handle::Handle,
     lease::{Outcome, ReleaseReason, Side, TransportClass},
     spec::DecodePick,
@@ -162,6 +163,9 @@ pub(crate) struct Ask<'a> {
     /// The attempt's prompt hashes, where it has them. The stage that holds
     /// the tokens fills this once per attempt, before its first ask.
     pub hashes: Option<&'a Hashes>,
+    /// The request's encode items and what it asks for them. Empty for a
+    /// request without items: its ask is decided as its pair alone.
+    pub items: EncodeItems<'a>,
 }
 
 impl<'a> Ask<'a> {
@@ -184,7 +188,19 @@ impl<'a> Ask<'a> {
             tried: &[],
             attempt: None,
             hashes: None,
+            items: EncodeItems {
+                keys: &[],
+                one: None,
+                references: false,
+                decode_images: false,
+            },
         }
+    }
+
+    /// Whether the ask states an item's key, or that its decode must take
+    /// images: such an ask is decided with its items, in one decision.
+    fn states_items(&self) -> bool {
+        !self.items.keys.is_empty() || self.items.one.is_some() || self.items.decode_images
     }
 
     /// The request's two keys by the sources its binding names in `spec`.
@@ -486,7 +502,21 @@ pub(crate) struct Asked {
     targets: Targets,
     /// The prefill and decode resolved for each pair target.
     pairs: [[Option<Arc<dyn Worker>>; 2]; MAX_TARGETS],
+    /// The encoder of each placed key, in the keys' order, resolved or
+    /// not. Empty for a request without items.
+    encoders: Vec<AskedEncoder>,
+    /// Whether the one key was placed in the items' stead.
+    one_key: bool,
     handle: Handle<Arc<Door>>,
+}
+
+/// One placed key's encoder as the ask resolved it: `None` where the
+/// holder has laid no object for the row, or the object has left the
+/// registry.
+struct AskedEncoder {
+    worker: Option<Arc<dyn Worker>>,
+    id: WorkerId,
+    rank: u16,
 }
 
 /// The policy controller's host in this process: the door over the
@@ -714,7 +744,18 @@ impl Host {
             source: Cell::new(None),
         };
         let started = Instant::now();
-        let decided = Handle::decide_under(Arc::clone(&self.door), GATEWAY, &made, now);
+        let mut placed = EncodePlaced::new();
+        let decided = if ask.states_items() {
+            // The encode entry takes a request and no maker. The request is
+            // made from the world the host loads here, ahead of the
+            // decision's own load.
+            let world = self.door.store().world();
+            let request = made.make(&world);
+            let door = Arc::clone(&self.door);
+            Handle::decide_encode_pair(door, GATEWAY, &request, ask.items, &mut placed, now)
+        } else {
+            Handle::decide_under(Arc::clone(&self.door), GATEWAY, &made, now)
+        };
         let seconds = started.elapsed().as_secs_f64();
         // A key's source counts once an attempt, at its first ask, as a
         // keyed selection of the gateway's own policies counts it: an ask
@@ -748,9 +789,19 @@ impl Host {
                         *workers = [self.worker(target.id), self.worker(pair.decode_id)];
                     }
                 }
+                // Each placed key's encoder is resolved here too: the
+                // commit looks nothing up.
+                let encoders = placed.encoders().iter();
+                let encoders = encoders.map(|target| AskedEncoder {
+                    worker: self.worker(target.id),
+                    id: target.id,
+                    rank: target.dp_rank,
+                });
                 Ok(Asked {
                     targets: pick.targets,
                     pairs,
+                    encoders: encoders.collect(),
+                    one_key: placed.one(),
                     handle,
                 })
             }
@@ -854,11 +905,20 @@ impl Host {
         let Asked {
             targets,
             pairs,
+            encoders,
+            one_key,
             mut handle,
         } = asked;
         let mut failed = [[None; 2]; MAX_TARGETS];
         let mut no_room = false;
+        let mut lost = Vec::new();
         for (index, (target, [prefill, decode])) in targets.iter().zip(pairs).enumerate() {
+            // The encoders were placed for the first target's prefill, and
+            // a later target can name a prefill they do not hand to. With
+            // items the commit takes the first target or none.
+            if index > 0 && !encoders.is_empty() {
+                break;
+            }
             let Some(pair) = target.pair else {
                 continue;
             };
@@ -878,6 +938,24 @@ impl Host {
                 no_room = true;
                 continue;
             }
+            // The target holds where every placed encoder stands and takes
+            // a request. One that does not joins the misses: the next ask
+            // names it, and the engine places the items around it.
+            let mut held = Vec::with_capacity(encoders.len());
+            for encoder in &encoders {
+                let worker = encoder.worker.as_ref();
+                match worker.filter(|worker| routable_but_for_veto(worker.as_ref())) {
+                    Some(worker) => held.push(PlacedEncoder {
+                        worker: Arc::clone(worker),
+                        id: encoder.id,
+                        rank: encoder.rank,
+                    }),
+                    None => lost.push(encoder.id),
+                }
+            }
+            if !lost.is_empty() {
+                break;
+            }
             handle.take(index);
             return Ok(Placed {
                 worker: Arc::clone(worker),
@@ -888,6 +966,8 @@ impl Host {
                     side: pair,
                     targets,
                     index,
+                    encoders: held,
+                    one_key,
                 })),
                 handle,
             });
@@ -897,6 +977,7 @@ impl Host {
             return Err(Unplaced::NoRoom);
         }
         missed.extend(failed.into_iter().flatten().flatten());
+        missed.extend(lost);
         Err(Unplaced::NoTargetHolds)
     }
 
@@ -1142,6 +1223,21 @@ struct PlacedPair {
     side: Pair,
     targets: Targets,
     index: usize,
+    /// The encoder of each placed key, in the keys' order. They ride
+    /// behind the pair's pointer: a placement's own size does not move.
+    encoders: Vec<PlacedEncoder>,
+    /// Whether the one key was placed in the items' stead.
+    one_key: bool,
+}
+
+/// One placed key's encoder: its worker, the store's row and the rank its
+/// target names. A part of a placement, never a second one: an encoder
+/// holds no lease, so its dispatch, its end and its release stay the
+/// pair's two sides'.
+pub(crate) struct PlacedEncoder {
+    pub worker: Arc<dyn Worker>,
+    pub id: WorkerId,
+    pub rank: u16,
 }
 
 impl Placed {
@@ -1187,6 +1283,18 @@ impl Placed {
     /// lease is released, and after one it completes as cancelled.
     pub(crate) fn released(&mut self, reason: ReleaseReason, now: Instant) {
         self.handle.released(reason, now);
+    }
+
+    /// The encoder of each placed key, in the keys' order. Empty for a
+    /// request without items.
+    pub(crate) fn encoders(&self) -> &[PlacedEncoder] {
+        self.pair.as_ref().map_or(&[], |pair| &pair.encoders)
+    }
+
+    /// Whether the one key was placed in the items' stead: one encoder
+    /// then stands for every item.
+    pub(crate) fn one_key(&self) -> bool {
+        self.pair.as_ref().is_some_and(|pair| pair.one_key)
     }
 
     /// The decode worker of a pair. A regular attempt has none.

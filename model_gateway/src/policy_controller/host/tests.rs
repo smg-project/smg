@@ -36,11 +36,13 @@ use serde_json::{json, Value};
 use smg_policy_controller::{
     decision::{Decision, Shed, ShedReason, Trace},
     door::Refused,
+    framework::EncodeItems,
     spec::{KeySourceSpec, Pairing, RoutingKeySpec},
     store::{
-        Ask as StoreAsk, BatchOutcome, HealthSink, KvEventSink, LeaseState, LeasesStore, LoadSink,
-        LoadSource, MemoryStore, PairBuffers, PairingDescriptor, SessionsStore, WorkerFacts,
-        WorkerStatus as RowStatus, WorkersStore, PUBLISH_WINDOW,
+        Ask as StoreAsk, BatchOutcome, EncodeHandoff, EncodeOffer, HealthSink, KvEventSink,
+        LeaseState, LeasesStore, LoadSink, LoadSource, MemoryStore, PairBuffers, PairingDescriptor,
+        SessionsStore, ViewBuffers, WorkerFacts, WorkerStatus as RowStatus, WorkersStore,
+        PUBLISH_WINDOW,
     },
     view::{
         fingerprint, Candidate, Identity, LoadRow, MediaCounts, Phase, RequestFacts, Role,
@@ -2696,4 +2698,143 @@ async fn a_decision_that_reads_every_target_full_waits_and_is_admitted_at_a_rele
     assert_eq!(bed.issued(Side::Prefill).len(), 4);
     assert_eq!(admission.queued_requests(), 0);
     assert_eq!(live(&bed.store, 1), 1);
+}
+
+/// A model under the encode plan: prefills, one decode and encoders that
+/// push, each a row of the store with its worker in the registry.
+struct EncodeBed {
+    host: Host,
+    store: Arc<MemoryStore>,
+    prefills: Vec<(WorkerId, Arc<dyn Worker>)>,
+    decode: (WorkerId, Arc<dyn Worker>),
+    encoders: Vec<(WorkerId, Arc<dyn Worker>)>,
+}
+
+impl EncodeBed {
+    fn new(prefills: usize, encoders: usize) -> Result<Self, Box<dyn Error>> {
+        let store = Arc::new(MemoryStore::new());
+        let registry = Arc::new(WorkerRegistry::new());
+        let add = |name: String, role, worker_type| -> Result<_, Box<dyn Error>> {
+            let url = format!("grpc://{name}:8000");
+            let facts = WorkerFacts {
+                key: url.clone(),
+                engine: url.clone(),
+                engine_kind: "runtime".to_owned(),
+                incarnation: 1,
+                role,
+                wire_modes: WireModes::GRPC,
+                models: vec![MODEL.to_owned()],
+                dp_size: 1,
+                max_running: Some(4_096),
+                encode: EncodeOffer {
+                    handoff: EncodeHandoff::Push,
+                    producer: role == Role::Encode,
+                    consumer: role == Role::Prefill,
+                    connector: Some("c0".to_owned()),
+                    ..EncodeOffer::default()
+                },
+                ..WorkerFacts::default()
+            };
+            let id = store.upsert(facts).id();
+            let row = WorkersStore::get(&*store, id).ok_or("the row is missing")?;
+            store
+                .set_status(id, RowStatus::Ready, row.revision)
+                .ok_or("the row did not become ready")?;
+            let worker: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new(&url)
+                    .model(ModelCard::new(MODEL))
+                    .worker_type(worker_type)
+                    .status(WorkerStatus::Ready)
+                    .build(),
+            );
+            registry
+                .register(Arc::clone(&worker))
+                .ok_or("the worker did not register")?;
+            Ok((id, worker))
+        };
+        let decode = add("d0".to_owned(), Role::Decode, WorkerType::Decode)?;
+        let prefills = (0..prefills)
+            .map(|n| add(format!("p{n}"), Role::Prefill, WorkerType::Prefill))
+            .collect::<Result<Vec<_>, _>>()?;
+        let encoders = (0..encoders)
+            .map(|n| add(format!("e{n}"), Role::Encode, WorkerType::Encode))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut document =
+            PolicySpec::epd_presets("consistent_hashing", "least_load", "least_load")?;
+        for side in ["prefill", "decode"] {
+            let profile = document
+                .profiles
+                .get_mut(side)
+                .ok_or("the side's profile is missing")?;
+            profile.filter = vec!["healthy".into(), "not-tried".into()];
+        }
+        store.apply(AppliedSpec::validate(&document)?)?;
+        store.publish_now();
+        Ok(Self {
+            host: Host::at_keys(Arc::clone(&store), registry),
+            store,
+            prefills,
+            decode,
+            encoders,
+        })
+    }
+
+    /// What the leases on file count on each encoder, as a decision reads
+    /// it.
+    fn encoder_counts(&self) -> Vec<u32> {
+        self.store.with_world(|world| {
+            let ask = StoreAsk {
+                gateway: GATEWAY,
+                now: Instant::now(),
+                pinned: None,
+                affinity: false,
+            };
+            let mut view = ViewBuffers::default();
+            let Some(built) = world.build(MODEL, Role::Encode, &ask, &mut view) else {
+                return Vec::new();
+            };
+            world.count_in_flight(&built, &ask, &mut view.candidates);
+            let rows = view.candidates.iter();
+            rows.map(|row| row.in_flight).collect()
+        })
+    }
+}
+
+/// An ask with items is one decision: each item's encoder is placed with
+/// the pair, the pair's one lease holds its two sides, and an encoder is
+/// counted nothing.
+#[tokio::test]
+async fn an_ask_with_items_places_each_item_and_holds_the_pairs_lease() {
+    let bed = EncodeBed::new(1, 1).expect("an encode fleet");
+    let keys = [Identity::hashed(11), Identity::hashed(12)];
+    let ask = Ask {
+        items: EncodeItems {
+            keys: &keys,
+            ..EncodeItems::default()
+        },
+        ..pair_ask()
+    };
+    let now = Instant::now();
+    let asked = bed.host.ask(&ask, &[], now).await;
+    let asked = asked.expect("a pair with its items");
+    let placed = bed
+        .host
+        .commit_pair(asked, None, &mut Vec::new(), now)
+        .expect("a placement");
+    let (prefill, prefill_worker) = &bed.prefills[0];
+    assert_eq!(placed.id(), *prefill);
+    assert!(Arc::ptr_eq(placed.worker(), prefill_worker));
+    assert_eq!(placed.decode_id(), Some(bed.decode.0));
+    assert!(placed
+        .decode()
+        .is_some_and(|decode| Arc::ptr_eq(decode, &bed.decode.1)));
+    let (encoder, worker) = &bed.encoders[0];
+    assert_eq!(placed.encoders().len(), keys.len(), "an encoder a key");
+    for held in placed.encoders() {
+        assert_eq!(held.id, *encoder);
+        assert!(Arc::ptr_eq(&held.worker, worker));
+    }
+    assert!(!placed.one_key());
+    assert_eq!(live(&bed.store, 1), 1, "one lease holds both sides");
+    assert_eq!(bed.encoder_counts(), [0], "an encoder holds no lease");
 }
