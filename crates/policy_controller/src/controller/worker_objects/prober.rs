@@ -47,50 +47,47 @@ impl Prober {
         }
     }
 
-    /// Runs one loop a term this replica leads and none while it does not,
-    /// until `stop` reads true. `leads` is the role's word.
+    /// Runs one loop a term this replica leads and none while it leads
+    /// none, until `stop` reads true. `led` is the role's word: the term
+    /// this replica leads, if it leads one.
     ///
-    /// The term is read after the word: a take sets the fence before its
-    /// word is told. A word that reads true again under another term is
-    /// another lead. The loop of a term that ended is told to end, and its
-    /// end is awaited before the next starts: two loops never run at once.
+    /// A term is one value of the word, so a take under another term is
+    /// another word however soon it follows a release. The loop of a term
+    /// that ended is told to end, and its end is awaited before the next
+    /// starts: two loops never run at once.
     ///
-    /// An outcome that comes back behind its term's end is not written:
-    /// the term's adapter asks the lead before each write
-    /// ([`ElectedLead`]).
+    /// An outcome that comes back behind its term's end is not written.
+    /// The term's adapter asks the lead ([`ElectedLead`]) before it takes
+    /// the object's lock and again under it, and the store asks it once
+    /// more behind its own lock.
     ///
     /// The task ends at the stop alone. Once the word's teller is gone
     /// nothing leads here: the loop ends and the task waits for the stop.
     pub(crate) async fn run(
         &self,
         mut stop: watch::Receiver<bool>,
-        mut leads: watch::Receiver<bool>,
+        mut led: watch::Receiver<Option<u64>>,
     ) {
-        let lead: Arc<dyn Lead> =
-            Arc::new(ElectedLead::new(Arc::clone(&self.fence), leads.clone()));
+        let lead: Arc<dyn Lead> = Arc::new(ElectedLead::new(Arc::clone(&self.fence), led.clone()));
         let stopped = async {
             let _ = stop.wait_for(|stop| *stop).await;
         };
         tokio::pin!(stopped);
         loop {
-            let told = tokio::select! {
+            let term = tokio::select! {
                 biased;
                 () = &mut stopped => return,
-                told = leads.wait_for(|leads| *leads) => told.is_ok(),
+                told = led.wait_for(Option::is_some) => told.ok().and_then(|term| *term),
             };
-            if !told {
-                break;
-            }
-            let term = self.fence.term();
+            // No term: the word's teller is gone.
+            let Some(term) = term else { break };
             let mut probes = self.start(Arc::clone(&lead), term);
             // `None` at the stop, else whether the word still has its
             // teller.
             let told = tokio::select! {
                 biased;
                 () = &mut stopped => None,
-                told = leads.wait_for(|leads| !*leads || self.fence.term() != term) => {
-                    Some(told.is_ok())
-                }
+                told = led.wait_for(|led| *led != Some(term)) => Some(told.is_ok()),
             };
             probes.shutdown().await;
             match told {
@@ -197,7 +194,7 @@ mod tests {
         connector: Arc<ScriptedConnector>,
         elector: Elector,
         prober: Arc<Prober>,
-        role: watch::Sender<bool>,
+        role: watch::Sender<Option<u64>>,
         stop: watch::Sender<bool>,
         task: JoinSet<()>,
     }
@@ -220,12 +217,12 @@ mod tests {
             ));
             let elector = Elector::alone("replica", lasting())?;
             let prober = Arc::new(Prober::new(Arc::clone(&workers), elector.fence()));
-            let (role, leads) = watch::channel(false);
+            let (role, led) = watch::channel(None);
             let (stop, stopped) = watch::channel(false);
             let mut task = JoinSet::new();
             task.spawn({
                 let prober = Arc::clone(&prober);
-                async move { prober.run(stopped, leads).await }
+                async move { prober.run(stopped, led).await }
             });
             Ok(Self {
                 store,
@@ -252,6 +249,14 @@ mod tests {
         fn take(&mut self) -> Result<u64, ElectError> {
             self.elector.tick(Instant::now())?;
             Ok(self.elector.fence().term())
+        }
+
+        /// Takes the lease and tells its term, as the serve's teller does
+        /// at the step behind a take.
+        fn lead(&mut self) -> Result<u64, ElectError> {
+            let term = self.take()?;
+            self.role.send_replace(Some(term));
+            Ok(term)
         }
 
         fn status(&self, row: WorkerId) -> Option<WorkerStatus> {
@@ -304,8 +309,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_leaders_probe_readies_a_pending_row() {
         let mut replica = Replica::new().expect("a replica");
-        replica.take().expect("a term");
-        replica.role.send_replace(true);
+        replica.lead().expect("a term");
         let row = replica.register(facts(A, 1));
         assert_eq!(replica.status(row), Some(WorkerStatus::Pending));
 
@@ -323,8 +327,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_failed_probe_moves_the_row_by_its_policys_threshold() {
         let mut replica = Replica::new().expect("a replica");
-        replica.take().expect("a term");
-        replica.role.send_replace(true);
+        replica.lead().expect("a term");
         let row = replica.register(facts(A, 3));
         assert!(comes(|| replica.status(row) == Some(WorkerStatus::Ready)).await);
 
@@ -346,8 +349,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_failed_row_is_probed_in_place_and_returns_when_its_engine_answers() {
         let mut replica = Replica::new().expect("a replica");
-        replica.take().expect("a term");
-        replica.role.send_replace(true);
+        replica.lead().expect("a term");
         let row = replica.register(facts(A, 1));
         assert!(comes(|| replica.status(row) == Some(WorkerStatus::Ready)).await);
 
@@ -381,17 +383,16 @@ mod tests {
 
     /// A row that arrives while nobody leads here waits for the next term,
     /// whose loop probes it at once and writes under that term. A word that
-    /// reads true again under another term is another lead.
+    /// goes from one term to the next is another lead.
     #[tokio::test(start_paused = true)]
     async fn a_terms_end_stops_the_probes_and_the_next_term_starts_them() {
         let mut replica = Replica::new().expect("a replica");
-        let first = replica.take().expect("the first term");
-        replica.role.send_replace(true);
+        let first = replica.lead().expect("the first term");
         let a = replica.register(facts(A, 1));
         assert!(comes(|| replica.status(a) == Some(WorkerStatus::Ready)).await);
 
         assert!(replica.elector.release().expect("a release"));
-        replica.role.send_replace(false);
+        replica.role.send_replace(None);
         time::sleep(INTERVAL).await;
         let b = replica.register(facts(B, 1));
         time::sleep(INTERVAL * 3).await;
@@ -402,24 +403,22 @@ mod tests {
         );
         assert_eq!(replica.status(b), Some(WorkerStatus::Pending));
 
-        let second = replica.take().expect("the second term");
+        let second = replica.lead().expect("the second term");
         assert!(second > first);
-        replica.role.send_replace(true);
         assert!(
             comes(|| replica.status(b) == Some(WorkerStatus::Ready)).await,
             "the next term's loop probes the row and writes under its term"
         );
 
-        // Both words land before the prober reads either: all it sees is
-        // the word standing under another term.
+        // A release and the take behind it, told as one: the word goes
+        // from the last term to the next, and none between them says that
+        // nobody leads here.
         assert!(replica.elector.release().expect("a release"));
-        replica.role.send_replace(false);
-        assert!(replica.take().expect("the third term") > second);
-        replica.role.send_replace(true);
+        assert!(replica.lead().expect("the third term") > second);
         let c = replica.register(facts(C, 1));
         assert!(
             comes(|| replica.status(c) == Some(WorkerStatus::Ready)).await,
-            "a word that stands under another term starts that term's loop"
+            "a word that names another term starts that term's loop"
         );
         assert!(replica.stopped().await, "the task ends at the stop");
     }
@@ -433,9 +432,9 @@ mod tests {
         let row = replica.register(facts(A, 1));
         let term = replica.take().expect("a term");
         // The term's adapter with a word of the case's own: the replica's
-        // word stays false, so no loop probes beside the outcomes below.
-        let (word, leads) = watch::channel(true);
-        let lead: Arc<dyn Lead> = Arc::new(ElectedLead::new(replica.elector.fence(), leads));
+        // word names no term, so no loop probes beside the outcomes below.
+        let (word, led) = watch::channel(Some(term));
+        let lead: Arc<dyn Lead> = Arc::new(ElectedLead::new(replica.elector.fence(), led));
         let adapter = replica.prober.adapter(lead, term);
 
         assert_eq!(
@@ -454,14 +453,14 @@ mod tests {
                 .is_some_and(|row| (row.status, row.revision) == (stood.status, stood.revision))
         };
 
-        word.send_replace(false);
+        word.send_replace(None);
         assert_eq!(
             replica.judged(&adapter, row, false),
             Some(ProbeAnswer::Stale)
         );
         assert!(stands(&replica), "an outcome behind the word's turn");
 
-        word.send_replace(true);
+        word.send_replace(Some(term));
         assert!(replica.elector.release().expect("a release"));
         assert_eq!(
             replica.judged(&adapter, row, false),
@@ -474,8 +473,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_row_whose_policy_turns_probes_off_is_not_probed() {
         let mut replica = Replica::new().expect("a replica");
-        replica.take().expect("a term");
-        replica.role.send_replace(true);
+        replica.lead().expect("a term");
         let mut unprobed = facts(A, 1);
         unprobed.health.probes = false;
         let off = replica.register(unprobed);
@@ -498,8 +496,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_replaced_object_is_probed_in_the_place_of_the_old_one() {
         let mut replica = Replica::new().expect("a replica");
-        replica.take().expect("a term");
-        replica.role.send_replace(true);
+        replica.lead().expect("a term");
         let row = replica.register(facts(A, 1));
         assert!(comes(|| replica.status(row) == Some(WorkerStatus::Ready)).await);
         let (place, old) = replica.object(row).expect("the row's object");
@@ -526,13 +523,12 @@ mod tests {
         for leads in [true, false] {
             let mut replica = Replica::new().expect("a replica");
             if leads {
-                replica.take().expect("a term");
-                replica.role.send_replace(true);
+                replica.lead().expect("a term");
                 let a = replica.register(facts(A, 1));
                 assert!(comes(|| replica.status(a) == Some(WorkerStatus::Ready)).await);
             }
 
-            let (gone, _) = watch::channel(false);
+            let (gone, _) = watch::channel(None);
             drop(std::mem::replace(&mut replica.role, gone));
             time::sleep(INTERVAL).await;
             let b = replica.register(facts(B, 1));

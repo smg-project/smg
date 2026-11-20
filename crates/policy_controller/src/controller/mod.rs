@@ -926,15 +926,11 @@ impl Controller {
         // needs. The loop itself runs on every replica: it pays the store's
         // publications, so a followed row reaches the published world.
         let polls = follows.map(|_| shared.role.subscribe());
-        let fence = Arc::clone(&shared.fence);
         tasks.spawn(async move {
             match polls {
-                // The fence's term moves at a take alone: a word that
-                // reads `true` again under another term is another lead.
-                Some(polls) => {
-                    let led = move || fence.term();
-                    driver.run_while(driver_stop, polls, led).await;
-                }
+                // The word names the term led: a take under another term
+                // is another lead, and another run of polls.
+                Some(polls) => driver.run_while(driver_stop, polls).await,
                 None => driver.run(driver_stop).await,
             }
             Ok(())
@@ -972,9 +968,9 @@ impl Controller {
             // The probes run under the role's word on every replica: one
             // that leads alone hears it from its own election, and one
             // that does not lead dials no engine for its health.
-            let (probes_stop, leads) = (stop.subscribe(), shared.role.subscribe());
+            let (probes_stop, led) = (stop.subscribe(), shared.role.subscribe());
             tasks.spawn(async move {
-                prober.run(probes_stop, leads).await;
+                prober.run(probes_stop, led).await;
                 Ok(())
             });
         }
@@ -1193,22 +1189,28 @@ impl Controller {
 /// word that nobody leads here. The word told again ends it, the drain's
 /// included; told at the change alone, the drain would leave that watch
 /// open to the end of the grace period.
+///
+/// The word names the term led, and a term is told once. A release and the
+/// take behind it can both fall between two reads of this loop: the replica
+/// leads at each read, under another term at the second. That term is
+/// another word, so a task that runs for one term hears where it ended.
 async fn tell_role(
     mut role: Readiness,
     mut stop: watch::Receiver<bool>,
     doors: Vec<HealthReporter>,
-    told: watch::Sender<bool>,
+    told: watch::Sender<Option<u64>>,
 ) {
     let (mut last, mut left) = (None, false);
     loop {
-        let (state, turn) = role.read();
-        let leads = !left && state == State::Leader;
+        let (led, turn) = role.led();
+        let led = led.filter(|_| !left);
+        let leads = led.is_some();
         // The watches first: nothing is awaited between the read of the
         // fence and their word.
         if leads {
-            told.send_if_modified(|was| !std::mem::replace(was, true));
+            told.send_if_modified(|was| std::mem::replace(was, led) != led);
         } else {
-            told.send_replace(false);
+            told.send_replace(None);
         }
         if last != Some(leads) {
             let word = if leads {
@@ -1924,12 +1926,15 @@ mod tests {
         let (phase, readiness) =
             readiness::channel(elector.fence(), stepped, Arc::new(Lag::new(Duration::ZERO)));
         let (stop, stopped) = watch::channel(false);
-        let (told, mut role) = watch::channel(false);
+        let (told, mut role) = watch::channel(None);
         let mut teller = JoinSet::new();
         teller.spawn(tell_role(readiness, stopped, Vec::new(), told));
         let mut told_as = async |leads: bool| {
-            let reached =
-                timeout(Duration::from_secs(5), role.wait_for(|told| *told == leads)).await;
+            let reached = timeout(
+                Duration::from_secs(5),
+                role.wait_for(|told| told.is_some() == leads),
+            )
+            .await;
             assert!(
                 matches!(reached, Ok(Ok(_))),
                 "the role was not told as {leads}"
@@ -1980,12 +1985,15 @@ mod tests {
         let (phase, readiness) =
             readiness::channel(elector.fence(), stepped, Arc::new(Lag::new(Duration::ZERO)));
         let (_stop, stopped) = watch::channel(false);
-        let (told, mut role) = watch::channel(false);
+        let (told, mut role) = watch::channel(None);
         let mut teller = JoinSet::new();
         teller.spawn(tell_role(readiness, stopped, Vec::new(), told));
         let mut told_as = async |leads: bool| {
-            let reached =
-                timeout(Duration::from_secs(5), role.wait_for(|told| *told == leads)).await;
+            let reached = timeout(
+                Duration::from_secs(5),
+                role.wait_for(|told| told.is_some() == leads),
+            )
+            .await;
             assert!(
                 matches!(reached, Ok(Ok(_))),
                 "the role was not told as {leads}"
@@ -2017,9 +2025,12 @@ mod tests {
     /// once a renew period.
     #[tokio::test]
     async fn a_step_under_a_standing_leader_tells_the_watches_nothing() {
-        async fn told_as(role: &mut watch::Receiver<bool>, leads: bool) {
-            let reached =
-                timeout(Duration::from_secs(5), role.wait_for(|told| *told == leads)).await;
+        async fn told_as(role: &mut watch::Receiver<Option<u64>>, leads: bool) {
+            let reached = timeout(
+                Duration::from_secs(5),
+                role.wait_for(|told| told.is_some() == leads),
+            )
+            .await;
             assert!(
                 matches!(reached, Ok(Ok(_))),
                 "the role was not told as {leads}"
@@ -2031,7 +2042,7 @@ mod tests {
         let (phase, readiness) =
             readiness::channel(elector.fence(), stepped, Arc::new(Lag::new(Duration::ZERO)));
         let (_stop, stopped) = watch::channel(false);
-        let (told, mut role) = watch::channel(false);
+        let (told, mut role) = watch::channel(None);
         let mut teller = JoinSet::new();
         teller.spawn(tell_role(readiness, stopped, Vec::new(), told));
 
@@ -2060,6 +2071,48 @@ mod tests {
         told_as(&mut role, false).await;
     }
 
+    /// A release and the take behind it, both between two reads of the
+    /// teller: the replica leads at each read, under another term at the
+    /// second. The word names that term, so a task that runs for one term
+    /// is told where it ended.
+    #[tokio::test]
+    async fn a_take_under_another_term_between_two_reads_is_another_word() {
+        async fn names(role: &mut watch::Receiver<Option<u64>>, term: u64) {
+            let told = |told: &Option<u64>| *told == Some(term);
+            let reached = timeout(Duration::from_secs(5), role.wait_for(told)).await;
+            assert!(matches!(reached, Ok(Ok(_))), "term {term} was not told");
+        }
+        let mut elector = Elector::alone("controller-0@127.0.0.1:1", ElectionSettings::default())
+            .expect("the default settings are in order");
+        let (steps, stepped) = watch::channel(Standing::default());
+        let (phase, readiness) =
+            readiness::channel(elector.fence(), stepped, Arc::new(Lag::new(Duration::ZERO)));
+        let (_stop, stopped) = watch::channel(false);
+        let (told, mut role) = watch::channel(None);
+        let mut teller = JoinSet::new();
+        teller.spawn(tell_role(readiness, stopped, Vec::new(), told));
+
+        phase.send_replace(Phase::Serving);
+        assert!(matches!(
+            elector.tick(Instant::now()),
+            Ok(Tick::Acquired { .. })
+        ));
+        steps.send_replace(Standing::default());
+        let first = elector.fence().term();
+        names(&mut role, first).await;
+        // The release and the take with nothing awaited between them: the
+        // teller runs on this thread, so it reads the fence at neither.
+        assert!(elector.release().expect("a release"));
+        assert!(matches!(
+            elector.tick(Instant::now()),
+            Ok(Tick::Acquired { .. })
+        ));
+        let second = elector.fence().term();
+        assert_ne!(second, first, "a take is another term");
+        steps.send_replace(Standing::default());
+        names(&mut role, second).await;
+    }
+
     /// A serve whose lead opened with no step of the election since: the
     /// take of a lease with no holder to wait for leads one renew deadline
     /// after its write, between two steps. The fence admits a watch from
@@ -2070,7 +2123,7 @@ mod tests {
         steps: watch::Sender<Standing>,
         phase: watch::Sender<Phase>,
         /// The role's word, as a watch admitted now holds it.
-        watch: watch::Receiver<bool>,
+        watch: watch::Receiver<Option<u64>>,
         /// The serve's stop, never said, and the teller's task.
         _serve: (watch::Sender<bool>, JoinSet<()>),
     }
@@ -2092,7 +2145,7 @@ mod tests {
             let (phase, readiness) =
                 readiness::channel(elector.fence(), stepped, Arc::new(Lag::new(Duration::ZERO)));
             let (stop, stopped) = watch::channel(false);
-            let (told, role) = watch::channel(false);
+            let (told, role) = watch::channel(None);
             let mut teller = JoinSet::new();
             teller.spawn(tell_role(readiness, stopped, Vec::new(), told));
 
@@ -2119,7 +2172,7 @@ mod tests {
             steps.send_replace(Standing::default());
             let mut first = role.clone();
             first.changed().await.expect("the teller tells the step");
-            assert!(!*first.borrow());
+            assert!(first.borrow().is_none());
             // The lead opens by itself and the fence admits a watch. The
             // teller sleeps to that instant: this thread, the runtime's
             // one, is held across it with nothing awaited, so the opening
@@ -2128,7 +2181,7 @@ mod tests {
             thread::sleep(settings.renew_deadline);
             assert_eq!(elector.fence().leader_term(Instant::now()), Some(1));
             let mut watch = role.clone();
-            assert!(!*watch.borrow_and_update());
+            assert!(watch.borrow_and_update().is_none());
             Self {
                 elector,
                 steps,
@@ -2145,7 +2198,7 @@ mod tests {
                 matches!(heard, Ok(Ok(()))),
                 "{what} was not told to a watch that stood under the word: {heard:?}"
             );
-            assert!(!*self.watch.borrow());
+            assert!(self.watch.borrow().is_none());
         }
     }
 
