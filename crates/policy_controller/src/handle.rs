@@ -74,9 +74,11 @@ use crate::{
 enum Arm<D> {
     /// The door of this process, and the gateway the decision was made for.
     Door { door: D, gateway: GatewayId },
-    /// A controller, over the host's link.
+    /// A controller, over the host's link. The link rides behind a
+    /// pointer: a host embeds the handle in each request's context, and a
+    /// handle of its door is the size it has in a build with no link.
     #[cfg(feature = "client")]
-    Link(Link),
+    Link(Box<Link>),
 }
 
 /// What a handle still owes its lease.
@@ -486,7 +488,7 @@ impl<D: Deref<Target = Door>> Handle<D> {
         let (asked, left_out) = wire::request(request);
         let told = link.ask_cut(asked, left_out, budget).await?;
         match wire::decided(&told, now) {
-            Ok(decided) => Ok(Self::hold(Arm::Link(link.clone()), decided, now)),
+            Ok(decided) => Ok(Self::hold(Arm::Link(Box::new(link.clone())), decided, now)),
             Err(unread) => {
                 link.release_late(told);
                 Err(Unanswered::Unsent(Error::NoDecision(unread.to_string())))
@@ -652,6 +654,19 @@ mod tests {
             said => said,
         });
         calls.collect()
+    }
+
+    /// A host embeds the handle in the context it allocates once a request,
+    /// and fits that context to its allocator's class. A handle is the size
+    /// it has in a build with no link: the link's arm rides behind a
+    /// pointer, and the door's own pointer tells the arms apart. A field
+    /// that grows the handle grows each such context, so its hosts are
+    /// read before this number moves.
+    #[test]
+    fn a_handle_is_the_size_it_has_in_a_build_with_no_link() {
+        const HELD: usize = 480;
+        assert_eq!(size_of::<Handle<Arc<Door>>>(), HELD);
+        assert_eq!(size_of::<Handle<&Door>>(), HELD);
     }
 
     /// A request that is served: its lease is booked at the issue, moves
