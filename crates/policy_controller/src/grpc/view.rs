@@ -8,7 +8,7 @@
 use crate::{
     counts::with_counts,
     decision::{Decision, Target},
-    lease::{Lease, LeaseKind, Membership, Outcome, ReleaseReason, Side, Signal, TransportClass},
+    lease::{wire, Lease, LeaseKind, Membership, Outcome, ReleaseReason, Side, Signal},
     plugins::{
         config::{Exposure, Reveal},
         shown_hashes,
@@ -77,12 +77,7 @@ fn phase(p: Phase) -> i32 {
 }
 
 fn side(s: Side) -> i32 {
-    (match s {
-        Side::Single => proto::Side::Single,
-        Side::Prefill => proto::Side::Prefill,
-        Side::Decode => proto::Side::Decode,
-        Side::Encode => proto::Side::Encode,
-    }) as i32
+    proto::Side::from(s).into()
 }
 
 fn hash_kind(k: HashKind) -> i32 {
@@ -426,37 +421,13 @@ pub(crate) fn dispatched(
 }
 
 pub(crate) fn completed(l: &Lease, o: &Outcome) -> proto::lifecycle_event::Event {
-    proto::lifecycle_event::Event::Completed(proto::Completed {
-        lease_id: l.id.0,
-        side: side(o.side),
-        served: o.served.0,
-        status: u32::from(o.status),
-        class: (match o.class {
-            TransportClass::Ok => proto::completed::Class::Ok,
-            TransportClass::ClientError => proto::completed::Class::ClientError,
-            TransportClass::ServerError => proto::completed::Class::ServerError,
-            TransportClass::ConnectFailed => proto::completed::Class::ConnectFailed,
-            TransportClass::Timeout => proto::completed::Class::Timeout,
-            TransportClass::Cancelled => proto::completed::Class::Cancelled,
-        }) as i32,
-        ttft_micros: o.ttft_micros,
-        tokens_in: o.tokens_in,
-        tokens_out: o.tokens_out,
-        duration_micros: o.duration_micros,
-    })
+    proto::lifecycle_event::Event::Completed(wire::completed(l.id, o))
 }
 
 pub(crate) fn released(l: &Lease, r: ReleaseReason) -> proto::lifecycle_event::Event {
     proto::lifecycle_event::Event::Released(proto::Released {
         what: Some(proto::released::What::LeaseId(l.id.0)),
-        reason: (match r {
-            ReleaseReason::Abandoned => proto::released::Reason::Abandoned,
-            ReleaseReason::LateDecision => proto::released::Reason::LateDecision,
-            ReleaseReason::ClientGone => proto::released::Reason::ClientGone,
-            ReleaseReason::CommitFailed => proto::released::Reason::CommitFailed,
-            ReleaseReason::Expired => proto::released::Reason::Expired,
-            ReleaseReason::WorkerRemoved => proto::released::Reason::WorkerRemoved,
-        }) as i32,
+        reason: proto::released::Reason::from(r).into(),
         side: side(l.side),
     })
 }

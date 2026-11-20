@@ -2496,16 +2496,16 @@ async fn the_blocking_client_asks_a_started_controller_from_a_thread_of_its_own(
         .expect("the case ends inside its outer bound");
 }
 
-/// One ready worker under a controller that leads itself.
-async fn linked_fleet(gateway: &str) -> Result<(Harness, Link), String> {
+/// Ready workers under a controller that leads itself.
+async fn linked_fleet(gateway: &str, workers: usize) -> Result<(Harness, Link), String> {
     let mut harness = Harness::start().await?;
     harness.apply("round_robin")?;
-    harness.register(&FLEET[..1]).await?;
+    harness.register(&FLEET[..workers]).await?;
     harness.feed();
-    within("the worker is ready", ROOM, || {
+    within("the workers are ready", ROOM, || {
         harness
             .view(MODEL, Role::Single)
-            .is_ok_and(|pool| pool.len() == 1 && pool[0].healthy)
+            .is_ok_and(|pool| pool.len() == workers && pool.iter().all(|row| row.healthy))
     })
     .await?;
     let endpoint = Endpoint::from_shared(format!("http://{}", harness.gateway()))
@@ -2553,7 +2553,7 @@ async fn leases_before_expiry(
 async fn a_link_answers_sixty_four_asks_and_reports_the_end_of_each_lease() {
     const GATEWAY: &str = "fleet-link";
     let case = async {
-        let (harness, link) = Box::pin(linked_fleet(GATEWAY))
+        let (harness, link) = Box::pin(linked_fleet(GATEWAY, 1))
             .await
             .expect("a ready fleet");
         let mut asks = JoinSet::new();
@@ -2607,7 +2607,7 @@ async fn a_link_answers_sixty_four_asks_and_reports_the_end_of_each_lease() {
 async fn a_link_releases_the_lease_of_a_zero_budget_ask() {
     const GATEWAY: &str = "fleet-late-link";
     let case = async {
-        let (harness, link) = Box::pin(linked_fleet(GATEWAY))
+        let (harness, link) = Box::pin(linked_fleet(GATEWAY, 1))
             .await
             .expect("a ready fleet");
         let before = Instant::now();
@@ -2642,7 +2642,7 @@ async fn a_link_releases_the_lease_of_a_zero_budget_ask() {
 async fn a_link_refuses_a_frame_out_of_the_calls_ranges_and_stands() {
     const GATEWAY: &str = "fleet-ranged-link";
     let case = async {
-        let (harness, link) = Box::pin(linked_fleet(GATEWAY))
+        let (harness, link) = Box::pin(linked_fleet(GATEWAY, 1))
             .await
             .expect("a ready fleet");
         let first = linked_pick(&link, ask(b"first"))
@@ -2667,6 +2667,86 @@ async fn a_link_refuses_a_frame_out_of_the_calls_ranges_and_stands() {
         harness.stop().await.expect("a clean stop");
     };
     tokio::time::timeout(CASE, case)
+        .await
+        .expect("the case ends inside its outer bound");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_handle_over_a_link_ends_each_lease_on_the_worker_that_served() {
+    use smg_policy_controller::{
+        door::{Door, Request},
+        handle::Handle,
+        Outcome, RequestFacts, Side, TransportClass,
+    };
+
+    const GATEWAY: &str = "fleet-handle";
+    let case = async {
+        let (harness, link) = Box::pin(linked_fleet(GATEWAY, 2))
+            .await
+            .expect("a ready fleet");
+        for id in ["held-0", "held-1", "held-2"] {
+            let asked = Request {
+                id: id.as_bytes(),
+                facts: RequestFacts {
+                    model: MODEL,
+                    budget_micros: 5_000_000,
+                    ..RequestFacts::default()
+                },
+                constraints: Default::default(),
+            };
+            let started = Instant::now();
+            let held = Box::pin(Handle::<&Door>::asked(&link, &asked, started, ROOM)).await;
+            let mut handle = held.expect("the controller's decision");
+            let taken = handle.take(0).expect("a picked worker");
+            let alternate = handle.decision().pick().expect("a pick").targets.as_slice()[1];
+            let (picked, _) = harness
+                .named(taken.id.0)
+                .expect("the picked worker is in the fleet");
+            let (served, _) = harness
+                .named(alternate.id.0)
+                .expect("the alternate is in the fleet");
+            assert_ne!(served, picked);
+            assert_eq!(harness.leases(GATEWAY), 1, "the controller filed the lease");
+            let sent = Instant::now();
+            handle.dispatched(sent);
+            let (class, frames) = harness
+                .serve_request(served, id.to_owned())
+                .await
+                .expect("the worker answers");
+            assert_eq!(class, Class::Ok);
+            assert!(frames > 0);
+            let ended = Instant::now();
+            handle.completed(
+                &Outcome {
+                    side: Side::Single,
+                    served: alternate.id,
+                    status: 0,
+                    class: TransportClass::Ok,
+                    ttft_micros: 0,
+                    tokens_in: 8,
+                    tokens_out: frames,
+                    duration_micros: u32::try_from(ended.duration_since(sent).as_micros())
+                        .unwrap_or(u32::MAX),
+                },
+                ended,
+            );
+            leases_before_expiry(&harness, &link, GATEWAY, 0, started)
+                .await
+                .expect("the completion ends the lease");
+            within(
+                "the completion is written on the served worker",
+                ROOM,
+                || harness.completed_ok(GATEWAY, served, started),
+            )
+            .await
+            .expect("the controller records the named worker's completion");
+            assert!(!harness.completed_ok(GATEWAY, picked, started));
+        }
+        assert!(link.stands());
+        drop(link);
+        harness.stop().await.expect("a clean stop");
+    };
+    tokio::time::timeout(CASE, Box::pin(case))
         .await
         .expect("the case ends inside its outer bound");
 }
@@ -2892,7 +2972,7 @@ async fn a_watcher_holds_the_fleets_rows_as_the_controller_tells_them() {
 async fn a_link_answers_beside_its_watch_and_the_watch_outlives_it() {
     const GATEWAY: &str = "fleet-link-watch";
     let case = async {
-        let (mut harness, link) = Box::pin(linked_fleet(GATEWAY))
+        let (mut harness, link) = Box::pin(linked_fleet(GATEWAY, 1))
             .await
             .expect("a ready fleet");
         let first = harness.worker(0).expect("the first worker's row");

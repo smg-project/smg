@@ -316,9 +316,9 @@ impl ModelFingerprint {
 }
 
 /// A session: a key within its model and phase, as the one value a lease
-/// carries and the session table is keyed by. Only
-/// [`RequestFacts::session`] makes one, so a lease or a pin cannot carry a
-/// key's own fingerprint in its place.
+/// carries and the session table is keyed by. [`RequestFacts::session`]
+/// derives the value from a request. A lease read from the wire already
+/// carries that value.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Session(u64);
 
@@ -336,8 +336,8 @@ impl Session {
         self.0
     }
 
-    /// A session from its value, for the session table's own cases.
-    #[cfg(test)]
+    /// A session from the scoped value a lease carries on the wire.
+    #[cfg(any(test, feature = "client"))]
     pub(crate) const fn from_raw(value: u64) -> Self {
         Self(value)
     }

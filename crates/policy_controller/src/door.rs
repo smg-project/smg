@@ -1460,7 +1460,7 @@ fn pinned_by_rule(
 /// session's hand at the file or the door's report, and the gateway's
 /// completion is written on the served worker for the health precedence,
 /// whether or not the lease is on file. A served controller's handler of a
-/// `Completed` frame and a host's handle both say a completion here, so
+/// `Completed` frame and a handle over an in-process door both call here, so
 /// what one means stands once.
 pub(crate) fn completed(
     store: &MemoryStore,
@@ -1496,20 +1496,17 @@ pub(crate) fn decider_of(model: &str, deciders: usize) -> usize {
     usize::try_from(fingerprint(model.as_bytes()) % deciders).unwrap_or(0)
 }
 
-/// A request as a host in process asks it: the engine's request and the
-/// host's constraints as the host holds them. No frame is built.
+/// A request and its constraints as the host holds them. A door reads
+/// these facts in process. A link carries them to the controller.
 #[derive(Clone, Copy, Debug)]
 pub struct Request<'a> {
     /// The request's id as the host states it: its lease keeps the id's
     /// fingerprint.
     pub id: &'a [u8],
-    /// The request as the engine reads it. The door writes over the
-    /// host's what the deciding view adds: the instant in the rows'
-    /// clock, the affinity column, the rows the store names, the leases'
-    /// counts and, for a keyed request under a rule with an in-flight
-    /// cap, the count of its key. A budget of 0 states none, and the
-    /// engine is told no bound. A frame's 0 says none is left: a host
-    /// itself refuses a request whose time is spent.
+    /// The request as the engine reads it. The deciding view supplies the
+    /// clock value, affinity, named rows, lease counts and the key's count
+    /// under a rule with an in-flight cap. A budget of 0 leaves a decision
+    /// in process unbounded. Over a link it says the request's time is spent.
     pub facts: RequestFacts<'a>,
     /// What the host alone knows. The door writes its standing vetoes and
     /// the pins of record over the host's.
@@ -1649,8 +1646,8 @@ impl<M: Maker> Stated for Made<'_, M> {
 pub struct Decided {
     /// The engine's decision.
     pub decision: Decision,
-    /// The lease filed for a pick, a credit on the pick's first target.
-    /// For a pair this is the prefill side. `None` for a decision that
+    /// The lease issued for a pick, with the target index it books. For
+    /// a pair this is the prefill side. `None` for a decision that
     /// picks no worker.
     pub lease: Option<Leased>,
 }
@@ -1665,15 +1662,14 @@ impl Decided {
     }
 }
 
-/// A pick's lease as its door hands it over: the lease the store filed,
-/// and when its dispatch span ends.
+/// A pick's lease as its host receives it, with its dispatch deadline.
 #[derive(Clone, Copy, Debug)]
 pub struct Leased {
-    /// The lease as the store filed it.
+    /// The lease issued for the pick.
     pub lease: Lease,
-    /// When its dispatch span ends: the host names a dispatch before
-    /// then, or the lease is ended as abandoned, by the next issue at its
-    /// file or by the door's clock ([`Door::sweep`]).
+    /// When its dispatch span ends on the host's clock. The store ends
+    /// leases whose dispatch span has passed and whose dispatch is still
+    /// owed.
     pub due: Instant,
 }
 
@@ -2045,7 +2041,7 @@ impl Door {
     /// A completion said here ends the lease and is no health write: the
     /// gateway's completed dispatch on the worker that served is the
     /// host's to write ([`HealthSink::completed`]). A host that holds a
-    /// handle says one completion and the handle writes both
+    /// handle over this door says one completion and the handle writes both
     /// ([`crate::handle::Handle::completed`]).
     pub fn report(&self, gateway: GatewayId, lease: LeaseId, said: Said) {
         let at = self.store.file_of(lease);
