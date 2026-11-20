@@ -1092,6 +1092,42 @@ async fn a_pair_on_another_wire_than_the_pinned_one_is_released_and_refused() {
     assert_no_target_holds(&refused, &store);
 }
 
+/// A retry keeps its plan's runtime. In a fleet of two runtimes the
+/// controller names pairs of either, and the pair's commit passes over a
+/// pair the route's rule refuses, so every retry lands on its own runtime's
+/// pair. With no rule at the commit such a pair was released and refused.
+#[tokio::test]
+async fn a_pinned_retry_passes_over_a_pair_of_another_runtime() {
+    const OTHER_PREFILL: &str = "http://p1:8000";
+    const OTHER_DECODE: &str = "http://d1:8000";
+    let (stage, store) = pair_stage(
+        WorkerSelectionMode::PrefillDecode,
+        &[
+            (PREFILL, RuntimeType::Vllm),
+            (OTHER_PREFILL, RuntimeType::Sglang),
+        ],
+        &[
+            (DECODE, RuntimeType::Vllm),
+            (OTHER_DECODE, RuntimeType::Sglang),
+        ],
+    );
+    let plan = retained_plan(&[1]);
+    for _ in 0..16 {
+        let mut ctx = dispatch_ctx(MODEL, grpc_wire(RuntimeType::Sglang));
+        stage
+            .reselect(&mut ctx, &plan)
+            .await
+            .expect("the pair of the plan's runtime");
+        let placed = ctx.placed.as_ref().expect("a placement");
+        assert_eq!(placed.worker().url(), OTHER_PREFILL);
+        assert_eq!(
+            placed.decode().map(|decode| decode.url()),
+            Some(OTHER_DECODE)
+        );
+    }
+    assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
+}
+
 #[tokio::test]
 async fn a_request_with_encode_items_is_refused_by_name_under_a_host() -> anyhow::Result<()> {
     let (stage, store) = one_pair_stage(WorkerSelectionMode::EncodePrefillDecode);

@@ -1220,9 +1220,9 @@ fn route_wires(wire: Option<WireConstraint>) -> WireModes {
 /// The route's rule for a worker of `pool`, built from the classic
 /// selection's own rules: the pool's match, the request's wire, and on a
 /// retry the ledger's admit. The controller reads none of them. At a
-/// regular commit a target one of them refuses is passed over like one the
-/// gateway cannot send to. A pair's commit takes no rule, so the stage asks
-/// it of the pair it was handed. A demand the controller keeps ahead of its
+/// commit a target one of them refuses is passed over like one the gateway
+/// cannot send to: a regular target, or a pair either of whose workers its
+/// own pool's rule refuses. A demand the controller keeps ahead of its
 /// stages takes this function's place once a request can state it.
 fn on_route<'a>(
     pool: RoutingPool,
@@ -1984,11 +1984,12 @@ impl WorkerSelectionStage {
     /// runtime is its prefill worker's.
     ///
     /// The ask states the wires the route dials, so the controller names no
-    /// pair on another wire. The host's pair commit takes no other rule of
-    /// the route. So a pair the route still cannot send to, one of two
-    /// runtimes or one a retry's pin refuses, is given up as a failed commit
-    /// and refused, as the regular helper refuses an attempt no target
-    /// holds.
+    /// pair on another wire. The pair's commit takes the route's rule a side
+    /// at a time, and passes over a pair either of whose workers it refuses:
+    /// one off its pool, or one a retry's pin or ledger refuses. No rule of
+    /// a side tells a pair of two runtimes. Such a pair is still given up as
+    /// a failed commit and refused, as the regular helper refuses an attempt
+    /// no target holds.
     #[expect(
         clippy::too_many_arguments,
         reason = "the pair's selection threads every input the classic placement consumes"
@@ -2035,20 +2036,24 @@ impl WorkerSelectionStage {
             wires: route_wires(wire),
             ..attempt.ask(model_id, &id, &hashes)
         };
+        // A worker passes the rule of its own pool: a pool matches its own
+        // type alone.
+        let on_prefill = on_route(prefill_pool, wire, ledger);
+        let on_decode = on_route(decode_pool, wire, ledger);
         let (mut placed, guard) = host
-            .place_pair(&ask, self.prefill_admission.as_deref(), sticky_key)
+            .place_pair_where(
+                &ask,
+                |worker| on_prefill(worker) || on_decode(worker),
+                self.prefill_admission.as_deref(),
+                sticky_key,
+            )
             .await
             .map_err(|unplaced| unplaced.answer(model_id))?;
         let prefill = Arc::clone(placed.worker());
         let runtime = prefill.metadata().spec.runtime_type;
-        let holds = |pool, worker: &dyn Worker| on_route(pool, wire, ledger)(worker);
         let decode = placed
             .decode()
-            .filter(|decode| {
-                holds(prefill_pool, prefill.as_ref())
-                    && holds(decode_pool, decode.as_ref())
-                    && decode.metadata().spec.runtime_type == runtime
-            })
+            .filter(|decode| decode.metadata().spec.runtime_type == runtime)
             .cloned();
         let Some(decode) = decode else {
             placed.released(ReleaseReason::CommitFailed, Instant::now());
