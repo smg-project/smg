@@ -52,8 +52,9 @@ pub trait SessionsStore: Send + Sync {
 
     fn unpin(&self, key: u64);
 
-    /// A worker left for good: its pins go with it. Returns how many.
-    fn drop_worker(&self, worker: WorkerId) -> usize;
+    /// Workers left for good: their pins go with them, in one walk.
+    /// Returns how many.
+    fn drop_workers(&self, workers: &[WorkerId]) -> usize;
 
     /// Drop the pins whose own end is at or before `now`, an instant of
     /// the decision clock. Returns how many.
@@ -144,9 +145,13 @@ pub(super) struct Shard {
 /// ([`SessionTables::read`]).
 ///
 /// A lease's file writes under its own turn: the turn first, then the
-/// key's shard. Every other caller takes a shard with no lock of the
-/// store's held, and nothing is taken under one, so no path takes the two
-/// the other way.
+/// key's shard. A registration that takes its key's pins along renames
+/// them under the workers lock: that lock first, then each shard. Every
+/// other caller takes a shard with no lock of the store's held, and
+/// nothing is taken under one, so no path takes two of them the other
+/// way. The engine's own table is told each leave and join under the
+/// workers lock too, and takes its absent list's lock, then a shard of
+/// its own ([`crate::sessions::SessionTable`]).
 #[derive(Default)]
 pub(super) struct SessionTables {
     shards: [Mutex<Shard>; SHARDS],

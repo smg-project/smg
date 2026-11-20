@@ -112,7 +112,7 @@ pub const ENTRIES: &[(&str, &str, Fate)] = &[
     ("SessionsStore", "pin_no_earlier", Fate::NotYet(PINS)),
     ("SessionsStore", "lookup", Fate::Read),
     ("SessionsStore", "unpin", Fate::NotYet(PINS)),
-    ("SessionsStore", "drop_worker", Fate::NotYet(PINS)),
+    ("SessionsStore", "drop_workers", Fate::NotYet(PINS)),
     ("SessionsStore", "expire", Fate::NotYet(PINS)),
     ("SessionsStore", "merge", Fate::Rebuilt(HELLO)),
     ("SessionsStore", "len", Fate::Read),

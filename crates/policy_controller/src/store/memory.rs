@@ -1397,18 +1397,39 @@ impl MemoryStore {
     /// worker's id is its key and incarnation: where the same incarnation
     /// registers again before the walk ends, a pin a dispatch writes for
     /// it in a shard the walk has not reached leaves though its row
-    /// stands, until the key's next dispatch writes it again.
-    fn forget_pins(&self, id: WorkerId) {
-        SessionsStore::drop_worker(self, id);
+    /// stands, until the key's next dispatch writes it again. One walk for
+    /// every id of `ids`. The rename of a key registered again is the
+    /// exception to the lock's rule ([`Self::follow_pins`]): it runs under
+    /// the workers lock, since renames must run in the registrations'
+    /// order.
+    fn forget_pins(&self, ids: &[WorkerId]) {
+        SessionsStore::drop_workers(self, ids);
     }
 
-    /// A key that left does not return as the worker it was, or stayed
-    /// away past the absence's time: its session pins leave the standing
-    /// engine's table and the pins of record. With the workers lock let
-    /// go, as [`Self::forget_pins`].
-    fn forget_gone(&self, id: WorkerId) {
-        self.world.load().spec().engine().pins_forget(id);
-        self.forget_pins(id);
+    /// The keys that stayed away past the absence's time leave the list
+    /// at the store's tick ([`Self::sweep_pins`]), with their pins: a
+    /// membership that stands still ends them too, under any rules.
+    fn end_gone(&self, now: Instant) {
+        let ended = {
+            let mut workers = self.workers.lock();
+            if workers.gone.is_empty() {
+                return;
+            }
+            workers.ended_gone(now, self.pins_absence())
+        };
+        self.forget_gone(&ended);
+    }
+
+    /// Keys that left do not return as the workers they were, or stayed
+    /// away past the absence's time: their session pins leave the standing
+    /// engine's table and the pins of record, in one walk of each for them
+    /// all. With the workers lock let go, as [`Self::forget_pins`].
+    fn forget_gone(&self, ids: &[WorkerId]) {
+        if ids.is_empty() {
+            return;
+        }
+        self.world.load().spec().engine().pins_forget(ids);
+        self.forget_pins(ids);
     }
 
     /// The sessions' pins of record that name `old` name `new`: the key
@@ -1903,7 +1924,7 @@ impl WorkersStore for MemoryStore {
             #[cfg(test)]
             seam::released();
             if !same {
-                self.forget_gone(old_id);
+                self.forget_gone(&[old_id]);
             }
             return change;
         }
@@ -1915,7 +1936,7 @@ impl WorkersStore for MemoryStore {
             let inside = now.saturating_duration_since(gone.left) <= bound;
             (gone.id, inside && same_worker(&gone.facts, &facts))
         });
-        let ended = workers.ended_gone(now, bound);
+        let mut ended = workers.ended_gone(now, bound);
         let id = identity(&facts.key, facts.incarnation);
         workers.by_key.insert(facts.key.clone(), id);
         workers.rows.insert(
@@ -1959,12 +1980,12 @@ impl WorkersStore for MemoryStore {
         drop(workers);
         #[cfg(test)]
         seam::released();
+        // Another worker under the key takes none: its pins leave with
+        // those of the keys that stayed away, in one walk a side.
         if let Some((old, false)) = returned {
-            self.forget_gone(old);
+            ended.push(old);
         }
-        for old in ended {
-            self.forget_gone(old);
-        }
+        self.forget_gone(&ended);
         change
     }
 
@@ -2021,9 +2042,7 @@ impl WorkersStore for MemoryStore {
         // time.
         let ended = workers.file_gone(row.row.facts, id, now, self.pins_absence());
         drop(workers);
-        for old in ended {
-            self.forget_gone(old);
-        }
+        self.forget_gone(&ended);
         Some(change)
     }
 
@@ -3031,14 +3050,14 @@ impl SessionsStore for MemoryStore {
         self.sessions.shard(key).lock().pins.remove(&key);
     }
 
-    fn drop_worker(&self, worker: WorkerId) -> usize {
+    fn drop_workers(&self, workers: &[WorkerId]) -> usize {
         let shards = self.sessions.shards().iter();
         shards
             .map(|shard| {
                 let mut shard = shard.lock();
                 let pins = &mut shard.pins;
                 let before = pins.len();
-                pins.retain(|_, pin| pin.worker != worker);
+                pins.retain(|_, pin| !workers.contains(&pin.worker));
                 before - pins.len()
             })
             .sum()
@@ -3095,8 +3114,11 @@ impl MemoryStore {
     /// standing rule sweeps, the interval of the last generation one of
     /// whose rules swept stands, as its apply left it, so the pins it
     /// ended still leave; before any such generation no pass runs. Returns
-    /// how many pins left.
+    /// how many pins left by their own end. At every call, under any
+    /// rules, the keys that stayed away past the absence's time are
+    /// forgotten first ([`Self::end_gone`]).
     pub(crate) fn sweep_pins(&self, now: Instant) -> usize {
+        self.end_gone(now);
         let standing = self.with_world(|world| world.spec().engine().pins_shortest_sweep());
         {
             let mut swept = self.pins_swept.lock();

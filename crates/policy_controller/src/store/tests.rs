@@ -1700,6 +1700,29 @@ fn a_key_registered_again_past_the_absences_time_takes_no_pin() {
     assert_eq!(sessions.lookup(11), None);
 }
 
+/// A key that stays away is forgotten at the store's tick, in the engine's
+/// table and of record: no membership write and no decision has to follow.
+#[test]
+fn the_tick_ends_the_absence_of_a_key_that_stays_away() {
+    let store = MemoryStore::new();
+    let ruled = manual_ruled(1, 1, 1);
+    store.apply(ruled).expect("above the unbound start");
+    let a = ready(&store, "http://a:8000");
+    let sessions: &dyn SessionsStore = &store;
+    sessions.pin(11, a, Instant::now(), None);
+    let key = Session::from_raw(21);
+    let world = store.world();
+    let table = world.spec().engine().sessions();
+    table.dispatched(key, SessionVerdict::Pinned, a);
+    let revision = WorkersStore::get(&store, a).expect("the row").revision;
+    store.remove(a, revision).expect("removed");
+    store.sweep_pins(Instant::now());
+    assert!(sessions.lookup(11).is_some(), "inside its time");
+    assert_eq!(table.pins(key).map(|pins| pins[0]), Some(a));
+    store.sweep_pins(Instant::now() + Duration::from_millis(1_100));
+    assert_eq!((sessions.lookup(11), table.pins(key)), (None, None));
+}
+
 /// The door of a writer that knows a key's rule by its lease alone: the
 /// worker and the last use move as at the plain door, and the end that
 /// stood stays where it is the later one. No end is later than any
@@ -1777,7 +1800,7 @@ fn a_pin_is_written_at_the_commit_and_leaves_with_its_worker_or_at_its_end() {
         },
     );
     assert_eq!(sessions.len(), 3);
-    assert_eq!(sessions.drop_worker(WorkerId(9)), 1);
+    assert_eq!(sessions.drop_workers(&[WorkerId(9)]), 1);
     let two = store.micros(now + Duration::from_secs(2));
     assert_eq!(sessions.expire(two), 1);
     assert_eq!(sessions.lookup(11), None);
@@ -4896,7 +4919,7 @@ fn a_removal_and_a_sweep_reach_the_pins_of_every_shard() {
         }
     }
     assert_eq!(sessions.len(), keys);
-    assert_eq!(sessions.drop_worker(WorkerId(1)), keys / 2);
+    assert_eq!(sessions.drop_workers(&[WorkerId(1)]), keys / 2);
     assert_eq!(sessions.len(), keys / 2);
     for (i, key) in (1_u64..).take(keys).enumerate() {
         assert_eq!(sessions.lookup(key).is_some(), !first(i), "key {key}");
