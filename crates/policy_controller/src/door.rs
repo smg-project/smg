@@ -39,6 +39,7 @@ use crate::{
     counts::Slot,
     decider::Decider,
     decision::{Decision, Shed, ShedReason, Target, Trace},
+    demands::{DemandFacts, Demands},
     framework::{
         release, EncodeItems, EncodePlaced, Engine, Plan, Scratch, KEEPS_DECIDERS,
         SAMPLES_DECISIONS,
@@ -79,6 +80,8 @@ pub(crate) trait Asked {
     fn wires(&self) -> Option<WireModes>;
     /// The subset the asker narrows its rows to, where it states one.
     fn subset(&self) -> Option<u32>;
+    /// What the request demands of the worker that takes it.
+    fn demands(&self) -> Demands;
     /// How many block hashes the request carries.
     fn hashes(&self) -> usize;
     /// How many of them the generation of `spec` reads.
@@ -136,6 +139,9 @@ pub(crate) struct Buffers<L> {
     /// The rows of a lent view's mask a hold of the asking gateway stands
     /// on ([`World::held`]): asked where a veto masks the view.
     pub(crate) held: Vec<u32>,
+    /// What each row of a built view states for a request's hard demands
+    /// ([`World::demand_facts`]): read for a request that states one.
+    pub(crate) demanded: Vec<DemandFacts>,
     /// Both sides' rows of a pair decision and the table of their classes.
     pub(crate) pair: PairBuffers,
     /// The rows of an encode-pair decision, made at the thread's first
@@ -499,8 +505,11 @@ pub(crate) fn decide_in<A: Asked>(
 /// itself takes from each side ([`narrow`]); the engine's pair entry
 /// decides over them once, and the request's constraints are read by both
 /// sides. A side with rows that the gateway's own word leaves none is shed
-/// under that constraint's name, as a single's pool is. A pick's booking
-/// holds both sides, each worker's count beside its own pool's row.
+/// under that constraint's name, as a single's pool is. The store's
+/// narrowing of a pair keeps no hard demand yet: a pair's request that
+/// states one is shed under the wires' name, never placed past it. A
+/// pick's booking holds both sides, each worker's count beside its own
+/// pool's row.
 ///
 /// A pair whose profile on either side holds a stage that may refuse on a
 /// count it is shown is decided behind an apply of what waits at the files
@@ -650,16 +659,26 @@ fn pair_with<A: Asked, R>(
         ..PoolFacts::default()
     };
     let (wires, subset) = (request.wires(), request.subset());
+    // The store narrows a pair's sides by its gateway's wires and keeps no
+    // hard demand there yet: a request that states one is shed as an
+    // emptied side is, never placed past its demand. It reads under the
+    // wires' name until the store keeps the demand: a stage of its own
+    // would leave the hosts' tables again with that change.
+    let demanded = !request.demands().is_none();
     let mut emptied = false;
     let built = build(rows, engine, model, ask, wires, subset).map(|(built, (took, none))| {
         pool = built.0.pool_facts();
-        emptied = none;
+        emptied = none || demanded;
         if took > 0 {
             own.undialed.fetch_add(took, Ordering::Relaxed);
-            if let Some(wires) = wires {
-                pool.reach = cut_reach(pool.reach, wires);
-            }
         }
+        // The pair's list takes its name from the one routine that names a
+        // cut. No demand takes a row of a pair yet.
+        let cut = Took {
+            undialed: took,
+            ..Took::default()
+        };
+        pool.reach = cut_name(pool.reach, wires, cut);
         built
     });
     let viewed = Viewed {
@@ -985,19 +1004,21 @@ type Read<'a> = (
 /// what is left of its budget, the pool's facts under the generation its
 /// rows were published under, and those rows as the asking gateway reaches
 /// them at the decision's instant, with the affinity column where the
-/// request's profile declares it. A request that states no wires and no
-/// hint of 0 reads its pool by the store's one door ([`World::view`]): the
-/// rows where their publication left them, with its gateway's standing
-/// vetoes and the leases' counts beside them, or rows the door writes
-/// where the request's profile shows them to a plugin. One that states
-/// wires or a hint of 0 is handed rows written for it ([`World::build`]),
-/// what the leases on file book on each row's worker written over them
-/// ([`World::count_in_flight`]), less what the gateway states of itself
-/// takes ([`narrow`]). The rows its wires take are counted in `undialed`,
-/// the decider's own part, and the list they leave takes a name of its
-/// own ([`cut_reach`]). The request's block hashes are cut at what that
-/// generation reads of them. `decide`'s answer comes back with the build
-/// its rows were read by, `None` where no member serves the model.
+/// request's profile declares it. A request that states no wires, no hint
+/// of 0 and no hard demand reads its pool by the store's one door
+/// ([`World::view`]): the rows where their publication left them, with its
+/// gateway's standing vetoes and the leases' counts beside them, or rows
+/// the door writes where the request's profile shows them to a plugin. One
+/// that states wires, a hint of 0 or a demand is handed rows written for
+/// it ([`World::build`]), what the leases on file book on each row's
+/// worker written over them ([`World::count_in_flight`]), less what the
+/// gateway states of itself and what the request's demands take
+/// ([`narrow`], [`narrow_demanded`]). The rows its wires take are counted
+/// in `undialed`, the decider's own part, and the list the narrowing
+/// leaves takes a name of its own ([`cut_name`]). The request's block
+/// hashes are cut at what that generation reads of them. `decide`'s answer
+/// comes back with the build its rows were read by, `None` where no member
+/// serves the model.
 ///
 /// A request whose profile reads the affinity column by its own stages is
 /// handed no column: the rows the store names for it stand in the column's
@@ -1070,13 +1091,14 @@ pub(crate) fn hand<A: Asked, R>(
     let Buffers {
         view,
         held: holds,
+        demanded,
         scratch,
         lists,
         named,
         keyed,
         ..
     } = buffers;
-    let wires = request.wires();
+    let (wires, demands) = (request.wires(), request.demands());
     // No member serves the model in the role: the engine answers over no
     // candidate, as it answers any host that hands it none.
     let none = || PoolFacts {
@@ -1086,8 +1108,12 @@ pub(crate) fn hand<A: Asked, R>(
     // Nothing of the request's own is cut out of the rows the door hands:
     // the publication's own, the leases' counts beside them, or a copy the
     // door writes with the counts on it for a plugin, which is shown a
-    // row's bits and ages as the row's own fields.
-    let by_door = wires.is_none() && request.subset() != Some(0);
+    // row's bits and ages as the row's own fields. A request that states a
+    // hard demand is handed written rows, as one that states wires is.
+    let by_door = wires.is_none() && request.subset() != Some(0) && demands.is_none();
+    // Whether a demand took a row of the build: the rows left are named by
+    // no index then.
+    let mut cut = false;
     let (pool, now_micros, candidates, masks, affinity, counts, built): Read<'_> = if by_door {
         match world.view(model, role, &ask, shown, view) {
             Some(read) => (
@@ -1116,13 +1142,23 @@ pub(crate) fn hand<A: Asked, R>(
                 // narrowing, all but the list's name: the rows the wires
                 // left are another list of the pool.
                 let mut pool: PoolFacts<'_> = built.pool_facts();
-                let took = narrow(view, wires, request.subset());
-                if took > 0 {
-                    undialed.fetch_add(took, Ordering::Relaxed);
-                    if let Some(wires) = wires {
-                        pool.reach = cut_reach(pool.reach, wires);
+                let took = if demands.is_none() {
+                    Took {
+                        undialed: narrow(view, wires, request.subset()),
+                        demanded: 0,
                     }
                 } else {
+                    world.demand_facts(&built, &ask, demanded);
+                    narrow_demanded(view, demanded, wires, request.subset(), demands)
+                };
+                cut = took.demanded != 0;
+                if took.undialed > 0 {
+                    undialed.fetch_add(took.undialed, Ordering::Relaxed);
+                }
+                // The rows the wires and a demand left are another list of
+                // the pool, named by the one routine that names a cut.
+                pool.reach = cut_name(pool.reach, wires, took);
+                if took == Took::default() {
                     // Every row stands where the build left it, so the
                     // pool's engines name these rows as they name the
                     // publication's: a key is placed alike over both.
@@ -1172,7 +1208,10 @@ pub(crate) fn hand<A: Asked, R>(
             wires,
             now_micros,
         };
-        world.name(model, role, &naming, candidates, named);
+        // The index reads a view by its gateway's wires alone: rows a
+        // demand cut are handed it as no rows, and it names nobody.
+        let over: &[Candidate] = if cut { &[] } else { candidates };
+        world.name(model, role, &naming, over, named);
         // Over the rows it named the decider is asked in its form for
         // them, at this arm's own call: a decision that names no row
         // meets no test for it.
@@ -1213,6 +1252,82 @@ pub(crate) fn keeps_a_row(wires: Option<WireModes>, subset: Option<u32>) -> bool
     subset != Some(0) && wires != Some(WireModes::NONE)
 }
 
+/// What a narrowing took from a built view.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Took {
+    /// The rows the gateway's wires took: members that share no wire with
+    /// it.
+    pub(crate) undialed: u64,
+    /// The name of the rows a demand took, by their places in the build's
+    /// list: `0` where no demand took a row.
+    pub(crate) demanded: u64,
+}
+
+/// [`narrow`] for a request that states hard demands ([`Demands`]): one
+/// pass keeps the rows that share a wire with the gateway and meet every
+/// demand, each by its entry of `facts`, the build's column
+/// ([`World::demand_facts`]). A row with no entry meets none. The kept rows
+/// keep their order and take their positions, and every column beside them
+/// follows in the same step: the affinity column and the facts. A hint of
+/// 0 keeps none.
+///
+/// The rows a demand took are named by their places in the build's list
+/// ([`Took::demanded`]), never by what the demand states: two requests
+/// that leave one list share its name, so a rotation over that list is one
+/// rotation whatever its requests stated.
+pub(crate) fn narrow_demanded(
+    view: &mut ViewBuffers,
+    facts: &mut Vec<DemandFacts>,
+    wires: Option<WireModes>,
+    subset: Option<u32>,
+    demands: Demands,
+) -> Took {
+    if subset == Some(0) {
+        view.candidates.clear();
+        view.affinity.clear();
+        facts.clear();
+        return Took::default();
+    }
+    // The column is by row, where the profile declared one.
+    let column = !view.affinity.is_empty();
+    let mut took = Took::default();
+    let (mut kept, mut position) = (0, 0_u32);
+    for at in 0..view.candidates.len() {
+        let row = view.candidates[at];
+        if wires.is_some_and(|wires| !row.wire_modes.intersects(wires)) {
+            took.undialed += 1;
+            continue;
+        }
+        let Some(stated) = facts
+            .get(at)
+            .copied()
+            .filter(|stated| demands.met_by(*stated))
+        else {
+            // One more than the place: the first row's taking is no zero.
+            // Each place turns the fold by a product of the places' own
+            // word: the name is of these places in their order, and of
+            // no set of wires ([`cut_name`]).
+            took.demanded = (took.demanded ^ (at as u64 + 1))
+                .wrapping_mul(PLACES)
+                .max(1);
+            continue;
+        };
+        view.candidates[kept] = Candidate { position, ..row };
+        position += 1;
+        if column {
+            view.affinity[kept] = view.affinity[at];
+        }
+        facts[kept] = stated;
+        kept += 1;
+    }
+    view.candidates.truncate(kept);
+    if column {
+        view.affinity.truncate(kept);
+    }
+    facts.truncate(kept);
+    took
+}
+
 /// The name of the list a gateway's wires cut out of a build's
 /// ([`PoolFacts::reach`]): the build's word turned by the wires. Each of the
 /// eight sets of wires turns it by its own multiple of one odd word, eight
@@ -1220,6 +1335,32 @@ pub(crate) fn keeps_a_row(wires: Option<WireModes>, subset: Option<u32>) -> bool
 /// whole list, and no two cuts of one build read alike.
 pub(crate) fn cut_reach(built: u64, wires: WireModes) -> u64 {
     built ^ (u64::from(wires.bits()) + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+}
+
+/// The word the places a demand took are folded by ([`narrow_demanded`]):
+/// another odd word than the wires' ([`cut_reach`]).
+const PLACES: u64 = 0xD6E8_FEB8_6659_FD93;
+
+/// The name of the list a request's own narrowing left of a build's
+/// ([`PoolFacts::reach`]), the one routine that names a cut list: the
+/// build's word turned by the gateway's wires where they took a row
+/// ([`cut_reach`]), then by the places a demand took ([`Took::demanded`]).
+/// The parts are kept apart. The places are folded by a word of their
+/// own, and their turn is a product over the wires' turn, never a second
+/// XOR beside it: a demand's cut reads as no wires' cut, and a cut by
+/// both never reads as the build's whole list. A narrowing in which no
+/// demand took a row names its list as its wires alone do.
+pub(crate) fn cut_name(built: u64, wires: Option<WireModes>, took: Took) -> u64 {
+    let dialed = match wires {
+        Some(wires) if took.undialed > 0 => cut_reach(built, wires),
+        _ => built,
+    };
+    if took.demanded == 0 {
+        return dialed;
+    }
+    (dialed ^ took.demanded)
+        .wrapping_mul(0xBF58_476D_1CE4_E5B9)
+        .rotate_left(32)
 }
 
 /// What a decision's view adds to its request: the facts that are the
@@ -1535,6 +1676,10 @@ impl Asked for Request<'_> {
 
     fn subset(&self) -> Option<u32> {
         self.constraints.subset_hint
+    }
+
+    fn demands(&self) -> Demands {
+        self.constraints.demands
     }
 
     fn hashes(&self) -> usize {
@@ -2445,6 +2590,7 @@ pub(crate) mod tests {
         catalog::Catalog,
         decider::Decider,
         decision::{Decision, ShedReason, Target, Targets},
+        demands::{DemandFacts, Demands},
         framework::{DecisionScope, EncodeItems, EncodePlaced, Picker, TieBand},
         lease::{Lease, LeaseId, Lifecycle, Outcome, ReleaseReason, Side, TransportClass},
         sessions::SessionVerdict,
@@ -3729,6 +3875,360 @@ pub(crate) mod tests {
         let pick = decide(b"r-3");
         let first = pick.pick().and_then(|pick| pick.targets.first());
         assert_eq!(first.map(|target| target.id), Some(members[1]));
+    }
+
+    /// A ready member of [`MODEL`] under `role` that states `runtime` for a
+    /// request's hard demands, `0` for none, in `store`.
+    fn states(store: &MemoryStore, name: &str, role: Role, runtime: u32) -> WorkerId {
+        let key = format!("http://{name}:8000");
+        let facts = WorkerFacts {
+            key: key.clone(),
+            engine: key,
+            incarnation: 1,
+            role,
+            models: vec![MODEL.to_owned()],
+            dp_size: 1,
+            max_running: Some(4_096),
+            demand_facts: DemandFacts { runtime },
+            ..WorkerFacts::default()
+        };
+        let id = store.upsert(facts).id();
+        let row = WorkersStore::get(store, id).expect("the row");
+        if row.status != WorkerStatus::Ready {
+            let ready = store.set_status(id, WorkerStatus::Ready, row.revision);
+            ready.expect("the row stands");
+        }
+        id
+    }
+
+    /// A store under the `random` preset whose ready members of [`MODEL`]
+    /// state the runtimes of `stated`, one a member, in that order.
+    fn stating(stated: &[u32]) -> (Arc<MemoryStore>, Vec<WorkerId>) {
+        let store = MemoryStore::new();
+        let ids = stated
+            .iter()
+            .enumerate()
+            .map(|(place, &runtime)| states(&store, &format!("r{place}"), Role::Single, runtime));
+        let ids: Vec<WorkerId> = ids.collect();
+        store.publish_now();
+        let applied = store.apply(preset("random", 1));
+        applied.expect("above the unbound start");
+        (Arc::new(store), ids)
+    }
+
+    /// A request that demands a runtime is decided over the members that
+    /// state it, whatever the draw, and its lease books one of them. A
+    /// request that demands none is decided over the pool.
+    #[test]
+    fn a_demanded_runtime_keeps_the_members_that_state_it() {
+        let (store, ids) = stating(&[7, 9, 7, 0]);
+        let door = Door::new(Arc::clone(&store));
+        let placed = |runtime: u32| {
+            let mut placed = BTreeSet::new();
+            for seed in 0..64_u64 {
+                let id = [seed.to_le_bytes(), u64::from(runtime).to_le_bytes()].concat();
+                let mut asked = request(&id, seed);
+                asked.constraints.demands = Demands { runtime };
+                let decided = door.decide(GATEWAY, &asked, Instant::now());
+                let decided = decided.expect("a decision");
+                let pick = decided.decision.pick().expect("a member states it");
+                placed.insert(pick.targets.first().expect("a target").id);
+                assert!(decided.lease.is_some(), "a pick's lease");
+            }
+            placed
+        };
+        let (first, second, third, fourth) = (ids[0], ids[1], ids[2], ids[3]);
+        assert_eq!(placed(7), BTreeSet::from([first, third]));
+        let books = booked(&store, Role::Single);
+        let on = |id: WorkerId| {
+            let book = books.iter().find(|(member, _)| *member == id);
+            book.map_or(0, |(_, count)| *count)
+        };
+        assert_eq!((on(first) + on(third), on(second) + on(fourth)), (64, 0));
+        assert_eq!(placed(9), BTreeSet::from([second]));
+        assert_eq!(placed(0), ids.iter().copied().collect());
+        assert_eq!(door.undialed(), 0, "a demand takes no row as a wire does");
+    }
+
+    /// A demand no member of a pool meets leaves the request nobody: it is
+    /// shed under the stage a gateway's wires are, and no lease is filed. A
+    /// member that states no runtime meets no demand for one.
+    #[test]
+    fn a_demand_no_member_meets_is_shed_and_files_no_lease() {
+        let (store, _) = stating(&[7, 0]);
+        let door = Door::new(Arc::clone(&store));
+        let mut asked = request(b"r-1", 7);
+        asked.constraints.demands = Demands { runtime: 9 };
+        let decided = door.decide(GATEWAY, &asked, Instant::now());
+        let decided = decided.expect("a decision");
+        match decided.decision {
+            Decision::Shed(shed) => assert_eq!(
+                (shed.reason, shed.emptied_by),
+                (ShedReason::NoEndpoints, super::WIRES)
+            ),
+            other => panic!("a member took it: {other:?}"),
+        }
+        assert!(decided.lease.is_none());
+        assert_eq!(LeasesStore::live(&*store, GATEWAY), 0);
+        assert_eq!(door.undialed(), 0);
+    }
+
+    /// The store narrows a pair's sides by its gateway's wires and keeps no
+    /// hard demand there yet. So a pair's request that states one is shed
+    /// under the wires' name, whatever its sides state, and files
+    /// nothing: it is never placed past its demand. One that states none
+    /// is decided.
+    #[test]
+    fn a_pair_whose_request_states_a_demand_is_shed_and_files_nothing() {
+        let store = MemoryStore::new();
+        states(&store, "p0", Role::Prefill, 7);
+        states(&store, "d0", Role::Decode, 7);
+        store.publish_now();
+        let document = PolicySpec::pair_presets("least_load", "least_load");
+        apply_pair_document(&store, document.expect("the pair presets")).expect("a pair plan");
+        let store = Arc::new(store);
+        let door = Door::new(Arc::clone(&store));
+        let decide = |id: &[u8], runtime: u32| {
+            let mut asked = request(id, 7);
+            asked.facts.phase = Phase::Prefill;
+            asked.constraints.demands = Demands { runtime };
+            let decided = door.decide(GATEWAY, &asked, Instant::now());
+            decided.expect("a decision")
+        };
+        let stated = decide(b"stated", 7);
+        match &stated.decision {
+            Decision::Shed(shed) => assert_eq!(
+                (shed.reason, shed.emptied_by),
+                (ShedReason::NoEndpoints, super::WIRES)
+            ),
+            other => panic!("a pair was placed past a demand: {other:?}"),
+        }
+        assert!(stated.lease.is_none());
+        assert_eq!(LeasesStore::live(&*store, GATEWAY), 0);
+        let plain = decide(b"plain", 0);
+        assert!(plain.decision.pick().is_some() && plain.pair(), "{plain:?}");
+        assert_eq!(door.undialed(), 0);
+    }
+
+    /// A list a demand cut and a list the wires cut of one build take two
+    /// names, and a cut by both never reads as the build's whole list. Each
+    /// place below is the one whose taking read as a set of wires' cut
+    /// while the two were folded by one word.
+    #[test]
+    fn a_cut_by_a_demand_is_named_apart_from_a_cut_by_the_wires() {
+        use super::{cut_name, cut_reach, narrow_demanded, Took};
+
+        for build in [0_u64, 0x5EED_0001] {
+            for wires in [WireModes::HTTP, WireModes::GRPC, WireModes::ZMQ] {
+                // Rows that all state one runtime but the one at the place
+                // that equals the set's bits.
+                let place = wires.bits();
+                let mut view = ViewBuffers::default();
+                let mut facts = Vec::new();
+                for position in 0..place + 2 {
+                    view.candidates.push(Candidate {
+                        id: WorkerId(u64::from(position) + 10),
+                        position: u32::from(position),
+                        wire_modes: wires,
+                        ..Candidate::default()
+                    });
+                    facts.push(DemandFacts {
+                        runtime: if position == place { 9 } else { 7 },
+                    });
+                }
+                let demands = Demands { runtime: 7 };
+                let took = narrow_demanded(&mut view, &mut facts, None, None, demands);
+                assert_eq!(
+                    (took.undialed, view.candidates.len()),
+                    (0, usize::from(place) + 1)
+                );
+                let by_demand = cut_name(build, None, took);
+                let by_wires = cut_reach(build, wires);
+                assert_ne!(by_demand, by_wires, "place {place}");
+                assert_ne!(by_demand, build, "place {place}");
+                // The same place taken beside those wires' own cut.
+                let beside = Took {
+                    undialed: 1,
+                    ..took
+                };
+                let both = cut_name(build, Some(wires), beside);
+                assert!(
+                    both != build && both != by_wires && both != by_demand,
+                    "place {place}"
+                );
+                // No demand took a row: the wires' name alone, or the build's.
+                let dialed = Took {
+                    undialed: 1,
+                    demanded: 0,
+                };
+                assert_eq!(cut_name(build, Some(wires), dialed), by_wires);
+                assert_eq!(cut_name(build, Some(wires), Took::default()), build);
+            }
+        }
+    }
+
+    /// Two lists a demand cuts out of one build turn two rotations. A pool
+    /// of sixteen members a wire that state the runtime, with one more a
+    /// wire that states another at the place equal to its wire's bits:
+    /// requests of the two wires that alternate each draw every member of
+    /// their own list. Under one name for both lists each drew every
+    /// other one.
+    #[test]
+    fn two_lists_a_demand_cut_out_of_one_build_turn_two_rotations() {
+        let store = MemoryStore::new();
+        let grpc = (WireModes::GRPC, 7);
+        let zmq = (WireModes::ZMQ, 7);
+        let member = |name: usize, (wire_modes, runtime): (WireModes, u32)| {
+            let key = format!("http://w{name}:8000");
+            WorkerFacts {
+                key: key.clone(),
+                engine: key,
+                incarnation: 1,
+                role: Role::Single,
+                models: vec![MODEL.to_owned()],
+                dp_size: 1,
+                wire_modes,
+                demand_facts: DemandFacts { runtime },
+                ..WorkerFacts::default()
+            }
+        };
+        // A build lists its members in the order of their ids, and an id
+        // is of its member's key: every member is written once for its
+        // id, then again as its place in that order states.
+        let mut written: Vec<(WorkerId, usize)> = (0..34)
+            .map(|name| (store.upsert(member(name, grpc)).id(), name))
+            .collect();
+        written.sort_unstable();
+        // The build's places 2 and 4 are the gRPC and the ZMQ member of
+        // another runtime.
+        let mut places = vec![grpc, zmq, (WireModes::GRPC, 9), grpc, (WireModes::ZMQ, 9)];
+        places.extend([grpc; 14]);
+        places.extend([zmq; 15]);
+        for ((id, name), stated) in written.into_iter().zip(places) {
+            let again = store.upsert(member(name, stated)).id();
+            assert_eq!(again, id, "a member written again keeps its id");
+            let row = WorkersStore::get(&store, id).expect("the row");
+            if row.status != WorkerStatus::Ready {
+                let ready = store.set_status(id, WorkerStatus::Ready, row.revision);
+                ready.expect("the row stands");
+            }
+        }
+        store.publish_now();
+        let applied = store.apply(preset("round_robin", 1));
+        applied.expect("above the unbound start");
+        let store = Arc::new(store);
+        let door = Door::new(Arc::clone(&store));
+        let mut drawn = [BTreeSet::new(), BTreeSet::new()];
+        for turn in 0..32_u64 {
+            let list = usize::from(turn % 2 == 1);
+            let id = turn.to_le_bytes();
+            let mut asked = request(&id, turn);
+            asked.constraints.wire_modes = [WireModes::GRPC, WireModes::ZMQ][list];
+            asked.constraints.demands = Demands { runtime: 7 };
+            let decided = door.decide(GATEWAY, &asked, Instant::now());
+            let decided = decided.expect("a decision");
+            let pick = decided.decision.pick().expect("sixteen members state it");
+            drawn[list].insert(pick.targets.first().expect("a target").id);
+        }
+        let [by_grpc, by_zmq] = drawn;
+        assert_eq!((by_grpc.len(), by_zmq.len()), (16, 16));
+        assert!(by_grpc.is_disjoint(&by_zmq));
+    }
+
+    /// One pass narrows a built view by its gateway's wires and its
+    /// request's demands: the rows kept take their places in order, and the
+    /// affinity column and the facts follow them. The rows a demand took
+    /// are named by their places: two requests that leave one list give it
+    /// one name whatever they state, and two lists take two names.
+    #[test]
+    fn a_narrowing_by_demands_keeps_every_column_in_step_and_names_the_rows_taken() {
+        use super::{narrow_demanded, Took};
+        use crate::view::AffinityFacts;
+
+        let wires = [
+            WireModes::GRPC,
+            WireModes::GRPC,
+            WireModes::ZMQ,
+            WireModes::GRPC,
+            WireModes::GRPC,
+        ];
+        let built = |column: bool, stated: [u32; 5]| {
+            let mut view = ViewBuffers::default();
+            let mut facts = Vec::new();
+            for ((position, wire_modes), runtime) in (0_u32..).zip(wires).zip(stated) {
+                view.candidates.push(Candidate {
+                    id: WorkerId(u64::from(position) + 10),
+                    position,
+                    wire_modes,
+                    ..Candidate::default()
+                });
+                if column {
+                    view.affinity.push(AffinityFacts {
+                        admitted_age_ms: position + 100,
+                        ..AffinityFacts::default()
+                    });
+                }
+                facts.push(DemandFacts { runtime });
+            }
+            (view, facts)
+        };
+        let read = |view: &ViewBuffers, facts: &[DemandFacts]| {
+            let rows = view.candidates.iter().map(|row| (row.id.0, row.position));
+            let ages = view.affinity.iter().map(|facts| facts.admitted_age_ms);
+            let stated = facts.iter().map(|facts| facts.runtime);
+            (
+                rows.collect::<Vec<_>>(),
+                ages.collect::<Vec<_>>(),
+                stated.collect::<Vec<_>>(),
+            )
+        };
+        let grpc = Some(WireModes::GRPC);
+        let sevens = [7, 9, 7, 0, 7];
+        let kept = vec![(10, 0), (14, 1)];
+        // The wire takes the third row, the demand the second and the
+        // fourth, which states no runtime.
+        let (mut view, mut facts) = built(true, sevens);
+        let took = narrow_demanded(&mut view, &mut facts, grpc, None, Demands { runtime: 7 });
+        assert_eq!(took.undialed, 1);
+        assert_ne!(took.demanded, 0);
+        assert_eq!(
+            read(&view, &facts),
+            (kept.clone(), vec![100, 104], vec![7, 7])
+        );
+        // The same rows taken of a view with no column, under other
+        // numbers and a positive hint: one list, one name.
+        let (mut view, mut facts) = built(false, [3, 5, 3, 0, 3]);
+        let again = narrow_demanded(&mut view, &mut facts, grpc, Some(2), Demands { runtime: 3 });
+        assert_eq!(again, took);
+        assert_eq!(read(&view, &facts), (kept, vec![], vec![3, 3]));
+        // Another demand leaves another list, under another name.
+        let (mut view, mut facts) = built(true, sevens);
+        let other = narrow_demanded(&mut view, &mut facts, None, None, Demands { runtime: 9 });
+        assert_eq!(other.undialed, 0);
+        assert!(other.demanded != 0 && other.demanded != took.demanded);
+        assert_eq!(read(&view, &facts), (vec![(11, 0)], vec![101], vec![9]));
+        // No demand: the wires alone take a row, and the list has no name
+        // of a demand's.
+        let (mut view, mut facts) = built(true, sevens);
+        let none = narrow_demanded(&mut view, &mut facts, grpc, None, Demands::default());
+        assert_eq!(
+            none,
+            Took {
+                undialed: 1,
+                demanded: 0
+            }
+        );
+        assert_eq!(read(&view, &facts).0, [(10, 0), (11, 1), (13, 2), (14, 3)]);
+        // A hint of 0 keeps none.
+        let (mut view, mut facts) = built(true, sevens);
+        let hinted = narrow_demanded(&mut view, &mut facts, None, Some(0), Demands { runtime: 7 });
+        assert_eq!(hinted, Took::default());
+        assert_eq!(read(&view, &facts), (vec![], vec![], vec![]));
+        // A row with no entry of the column meets no demand.
+        let (mut view, mut facts) = built(true, sevens);
+        facts.truncate(1);
+        narrow_demanded(&mut view, &mut facts, None, None, Demands { runtime: 7 });
+        assert_eq!(read(&view, &facts), (vec![(10, 0)], vec![100], vec![7]));
     }
 
     /// In process no election hands a term over: the door starts a store

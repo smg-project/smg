@@ -109,6 +109,7 @@ use rustc_hash::FxHashMap;
 use crate::{
     affinity::WarmRule,
     counts::{Counts, KeptCounts, LentCounts, Slot},
+    demands::DemandFacts,
     framework::{Engine, OverloadThresholds, PairPools, PairTable},
     lease::{Lifecycle, Signal},
     spec::{AppliedSpec, Listed, Pairing},
@@ -527,6 +528,10 @@ struct PoolShape {
     encoders: Option<Arc<[EncoderFacts]>>,
     /// The pool's engines, where one of them holds several rows.
     engines: PoolEngines,
+    /// What each row states for a request's hard demands, in the rows'
+    /// order: the column a door reads for a request that states one
+    /// ([`World::demand_facts`]).
+    demanded: Box<[DemandFacts]>,
 }
 
 /// One pool's engines: each engine's rows by position, the ranks of a
@@ -1598,6 +1603,23 @@ impl World {
             }
         }
         Some(built)
+    }
+
+    /// What each row of a build states for a request's hard demands
+    /// ([`DemandFacts`]), into `out`, cleared first: one entry a row of the
+    /// list `built` was written as for `ask`'s gateway, in the rows' order,
+    /// as [`World::build`] copied them. Asked of the publication the build
+    /// read, by a door whose request states a demand: a request that states
+    /// none reads no column. Empty where the build's pool is no pool of
+    /// this publication.
+    pub fn demand_facts(&self, built: &Built, ask: &Ask, out: &mut Vec<DemandFacts>) {
+        out.clear();
+        let Some(shape) = self.derived.pools.get(built.pool as usize) else {
+            return;
+        };
+        for (from, to) in Segments::of(&shape.locals, ask.gateway, shape.demanded.len()) {
+            out.extend_from_slice(&shape.demanded[from..to]);
+        }
     }
 
     /// Name the rows the affinity stages read in the column's place
@@ -3443,6 +3465,10 @@ impl Writer {
                         None
                     },
                     engines: engines_of(&entries, &ranked, &mut placed),
+                    demanded: entries
+                        .iter()
+                        .map(|entry| entry.facts.demand_facts)
+                        .collect(),
                 });
                 self.spares.push(None);
                 self.working.push(Working {
