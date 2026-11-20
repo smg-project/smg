@@ -2320,11 +2320,13 @@ impl WorkerSelectionStage {
     /// take images. That the request carries pixel media has no word in the
     /// ask yet: the encoders are held to it after the commit.
     ///
-    /// The commit takes no rule of the route. So a pair or an encoder the
-    /// route cannot send to is given up as a failed commit and refused, as
-    /// the pair helper refuses its pair. Where the document's plan places
-    /// no encoder for a request with items, the request is refused by name.
-    /// An encoder holds no lease, so nothing more is said for it.
+    /// The ask states the wires the route dials, so the controller names no
+    /// pair and no encoder on another wire. The commit takes no other rule
+    /// of the route. So a pair or an encoder the route still cannot send to
+    /// is given up as a failed commit and refused, as the pair helper
+    /// refuses its pair. Where the document's plan places no encoder for a
+    /// request with items, the request is refused by name. An encoder holds
+    /// no lease, so nothing more is said for it.
     #[expect(
         clippy::too_many_arguments,
         reason = "the encode pair's selection threads every input the classic placement consumes"
@@ -2363,6 +2365,7 @@ impl WorkerSelectionStage {
         let ask = Ask {
             phase: Phase::Prefill,
             attempt: Some(attempt.number()),
+            wires: route_wires(demand.wire),
             items: EncodeItems {
                 keys: &keys,
                 one,

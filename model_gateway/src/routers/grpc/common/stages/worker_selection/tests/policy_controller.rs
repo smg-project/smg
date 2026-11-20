@@ -12,7 +12,7 @@ use smg_policy_controller::{
         LeasesStore, LoadSink, LoadSource, MemoryStore, WorkerFacts, WorkerStatus as RowStatus,
         WorkersStore,
     },
-    view::{fingerprint, LoadRow, Role, WireModes, WorkerId},
+    view::{fingerprint, LoadRow, Role, WorkerId},
     worker_host, AppliedSpec, PolicySpec,
 };
 
@@ -1518,26 +1518,29 @@ const IMAGES: EpdDemands = EpdDemands {
     image_fanout: false,
 };
 
-/// One worker of an encode fleet: its URL, its role and the runtime its
-/// registry object runs, and what its row states: its end of the encode
-/// handoff, that it takes images, that it processes references itself.
+/// One worker of an encode fleet: its URL, its role, the runtime its
+/// registry object runs and the connection it is dialed on, and what its
+/// row states: its end of the encode handoff, that it takes images, that
+/// it processes references itself.
 #[derive(Clone, Copy)]
 struct Member {
     url: &'static str,
     role: WorkerType,
     runtime: RuntimeType,
+    connection: ConnectionMode,
     states_end: bool,
     vision: bool,
     references: bool,
 }
 
 impl Member {
-    /// A worker of `runtime` that states its end and takes images.
+    /// A gRPC worker of `runtime` that states its end and takes images.
     const fn of(url: &'static str, role: WorkerType, runtime: RuntimeType) -> Self {
         Self {
             url,
             role,
             runtime,
+            connection: ConnectionMode::Grpc,
             states_end: true,
             vision: true,
             references: false,
@@ -1568,7 +1571,8 @@ fn fleet_of(runtime: RuntimeType) -> Vec<Member> {
 }
 
 /// The stage in the encode mode over a host whose rows are `fleet` under a
-/// document of the encode plan: one gRPC worker a row. The rows report no
+/// document of the encode plan: one worker a row, on its member's
+/// connection, and the row states that worker's wire. The rows report no
 /// capacity and no room, so each side of the pair keeps the two filters
 /// that read neither.
 fn encode_stage(fleet: &[Member]) -> anyhow::Result<(WorkerSelectionStage, Arc<MemoryStore>)> {
@@ -1591,13 +1595,27 @@ fn encode_stage(fleet: &[Member]) -> anyhow::Result<(WorkerSelectionStage, Arc<M
             WorkerType::Prefill => Role::Prefill,
             _ => Role::Decode,
         };
+        let mut builder = BasicWorkerBuilder::new(member.url)
+            .model(ModelCard::new(MODEL).with_context_length(WINDOW))
+            .worker_type(member.role)
+            .connection_mode(member.connection)
+            .runtime_type(member.runtime)
+            .health_config(no_health_check());
+        if !member.vision {
+            builder = builder.label("supports_vision", "false");
+        }
+        if member.references {
+            builder = builder.label("mm_processor", "inprocess");
+        }
+        let worker = builder.build();
         let facts = WorkerFacts {
             key: member.url.to_owned(),
             engine: member.url.to_owned(),
             engine_kind: format!("{:?}", member.runtime),
             incarnation: 1,
             role,
-            wire_modes: WireModes::GRPC,
+            // By the rule a store's writer states a row's wire.
+            wire_modes: worker_host::facts(&worker, None).wire_modes,
             models: vec![MODEL.to_owned()],
             dp_size: 1,
             max_running: Some(64),
@@ -1622,19 +1640,7 @@ fn encode_stage(fleet: &[Member]) -> anyhow::Result<(WorkerSelectionStage, Arc<M
                 .set_status(id, RowStatus::Ready, row.revision)
                 .context("the row stands")?;
         }
-        let mut builder = BasicWorkerBuilder::new(member.url)
-            .model(ModelCard::new(MODEL).with_context_length(WINDOW))
-            .worker_type(member.role)
-            .connection_mode(ConnectionMode::Grpc)
-            .runtime_type(member.runtime)
-            .health_config(no_health_check());
-        if !member.vision {
-            builder = builder.label("supports_vision", "false");
-        }
-        if member.references {
-            builder = builder.label("mm_processor", "inprocess");
-        }
-        assert!(registry.register(Arc::new(builder.build())).is_some());
+        assert!(registry.register(Arc::new(worker)).is_some());
     }
     store.publish_now();
     let host = Host::at_keys(Arc::clone(&store), Arc::clone(&registry));
@@ -1730,6 +1736,40 @@ async fn a_hosted_encode_request_gets_its_pair_and_one_assignment_an_item() -> a
         &placed.encoders()[0].worker
     ));
     assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 1);
+    Ok(())
+}
+
+/// A fleet of mixed wires holds two pairs and two encoders, and one pair
+/// and one encoder are on the pipeline's wire. The encode ask states the
+/// wires its pipeline dials, so every attempt is placed on those three.
+/// With no wire stated the controller named the others as well, and an
+/// attempt that drew one was given up at its commit and refused.
+#[tokio::test]
+async fn an_encode_ask_states_the_wires_its_pipeline_dials() -> anyhow::Result<()> {
+    let on = |url, role, connection| Member {
+        connection,
+        ..Member::of(url, role, MEET)
+    };
+    let (stage, store) = encode_stage(&[
+        on("http://p1:8000", WorkerType::Prefill, ConnectionMode::Http),
+        on("http://d1:8000", WorkerType::Decode, ConnectionMode::Http),
+        on("http://e1:8000", WorkerType::Encode, ConnectionMode::Http),
+        on(PREFILL, WorkerType::Prefill, ConnectionMode::Grpc),
+        on(DECODE, WorkerType::Decode, ConnectionMode::Grpc),
+        on(ENCODER, WorkerType::Encode, ConnectionMode::Grpc),
+    ])?;
+    for key in 0..16_u8 {
+        let ((assignments, prefill, decode, _), placed) =
+            encode_attempt(&stage, &[vec![key]], IMAGES)
+                .await
+                .ok()
+                .context("an encode pair on the pipeline's wire")?;
+        assert_eq!((prefill.url(), decode.url()), (PREFILL, DECODE), "{key}");
+        assert_eq!(assignments.len(), 1, "{key}");
+        assert_eq!(assignments[0].worker.url(), ENCODER, "{key}");
+        drop(placed);
+    }
+    assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
     Ok(())
 }
 
