@@ -17,7 +17,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use smg_worker::identity::basic::{ConnectionMode, RuntimeType};
 
-use super::{start, undecided::ROUTER_TYPE, StartError};
+use super::{refused, start, undecided::ROUTER_TYPE, StartError};
 use crate::{
     app_context::AppContext,
     config::{ManualAssignmentMode, PolicyConfig, RouterConfig},
@@ -33,6 +33,20 @@ type Case = Result<(), Box<dyn Error>>;
 /// The refusal's code as a client reads it. A literal: the product's
 /// constant may not move it in silence.
 const BY_NAME: &str = "not_decided_by_policy_controller";
+
+#[tokio::test]
+async fn refused_names_its_shape_under_the_one_code() -> Case {
+    let answer = refused("a test request");
+    assert_eq!(answer.status(), StatusCode::NOT_IMPLEMENTED);
+    let bytes = to_bytes(answer.into_body(), 1024).await?;
+    let error: Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(error["error"]["code"], BY_NAME);
+    assert_eq!(
+        error["error"]["message"],
+        "The policy controller is picked for this gateway and does not decide a test request yet"
+    );
+    Ok(())
+}
 
 /// `config` with the policy controller picked.
 fn picked(mut config: RouterConfig) -> RouterConfig {

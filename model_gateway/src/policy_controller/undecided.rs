@@ -50,6 +50,14 @@ fn refusal() -> Response {
     )
 }
 
+/// The refusal for a named request shape.
+pub(crate) fn refused(shape: &'static str) -> Response {
+    error::not_implemented(
+        CODE,
+        format!("The policy controller is picked for this gateway and does not decide {shape} yet"),
+    )
+}
+
 #[async_trait]
 impl RouterTrait for Undecided {
     fn as_any(&self) -> &dyn Any {

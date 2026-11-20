@@ -187,7 +187,8 @@ impl GrpcRouter {
             queue_timeout,
         )
         .with_request_timeout(request_timeout)
-        .with_grouped_dp_sticky(grouped_dp_sticky);
+        .with_grouped_dp_sticky(grouped_dp_sticky)
+        .with_host(ctx.policy_host.clone());
         // Deps for the parser-free endpoints (completion/embeddings/classify/
         // decisions/transcription).
         let pair_deps = PipelineDeps::pair(
@@ -198,7 +199,8 @@ impl GrpcRouter {
             queue_timeout,
         )
         .with_request_timeout(request_timeout)
-        .with_grouped_dp_sticky(grouped_dp_sticky);
+        .with_grouped_dp_sticky(grouped_dp_sticky)
+        .with_host(ctx.policy_host.clone());
 
         // Present in every mode: chat/generate, messages, completion.
         let pipeline = RequestPipeline::build(Endpoint::Chat, mode, &configured_deps)
