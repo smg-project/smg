@@ -556,10 +556,22 @@ impl Deciders {
         &self.reads.counts
     }
 
-    /// Hands `job` to its model's decider, without waiting. `Some` is the
-    /// request back with why it took no place: its submitter answers it.
+    /// Hands `job` to its decider, without waiting: its model's, or for a
+    /// decode call the one whose file holds the call's lease
+    /// ([`MemoryStore::file_of`]). A file is its decider's own, so a
+    /// decode call is decided, and its issue taken back, by the thread at
+    /// work at its lease's file, whatever model the call names and
+    /// whichever term minted the lease. A file past the queues, which a
+    /// store built with a file a decider never names, falls to the
+    /// model's decider. `Some` is the request back with why it took no
+    /// place: its submitter answers it.
     pub(crate) fn submit(&self, job: Job) -> Option<(Refused, Job)> {
-        match self.queues[self.of(job.request.model())].try_send(job) {
+        let home = job.request.decode_of().and_then(|lease| {
+            let file = self.reads.store.file_of(lease);
+            self.queues.get(file)
+        });
+        let queue = home.unwrap_or_else(|| &self.queues[self.of(job.request.model())]);
+        match queue.try_send(job) {
             Ok(()) => None,
             Err(TrySendError::Full(job)) => Some((Refused::Full, job)),
             Err(TrySendError::Disconnected(job)) => Some((Refused::Gone, job)),
@@ -7029,8 +7041,13 @@ pub(crate) mod tests {
     /// fleet's prefill and its decode beside one more decode. With the bed:
     /// what the engine told that stage, and the prefill.
     fn later_bed() -> (Bed, Arc<Mutex<SideCalls>>, WorkerId) {
+        later_bed_of(1)
+    }
+
+    /// [`later_bed`] behind `deciders` deciders.
+    fn later_bed_of(deciders: usize) -> (Bed, Arc<Mutex<SideCalls>>, WorkerId) {
         let told = Arc::new(Mutex::new(Vec::new()));
-        let bed = bed(Some(later_spec(1, &told)), true, (1, 8), []);
+        let bed = bed(Some(later_spec(1, &told)), true, (deciders, 8), []);
         ready(&bed.store, "d1", MODEL, Role::Decode, WireModes::NONE);
         let prefill = WorkersStore::by_key(&*bed.store, "http://p0:8000");
         let prefill = prefill.expect("the fleet's prefill").id;
@@ -7417,6 +7434,14 @@ pub(crate) mod tests {
         assert_eq!(asked_again(&bed), [1, 0]);
     }
 
+    /// The issue that stands of `lease`'s decode side, taken back by the
+    /// case's own hand once the bed's decider left its work: a thread acts
+    /// at a file where nobody is at work, and beside nobody.
+    async fn taken_back_by_hand(store: &MemoryStore, lease: LeaseId) {
+        let abandoned = ReleaseReason::Abandoned;
+        settled(|| store.take_back_decode(GATEWAY, lease, abandoned)).await;
+    }
+
     /// One decode call's order by the case's own hand, at the bed's first
     /// instant: the issue its decider would undo.
     fn issued_by_hand(bed: &Bed, frame: proto::DecideRequest) -> DecodeIssue {
@@ -7456,7 +7481,7 @@ pub(crate) mod tests {
             (store.sides(GATEWAY, lease), counts)
         };
         let first = issued_by_hand(&bed, call(1, id));
-        assert!(store.take_back_decode(GATEWAY, lease, ReleaseReason::Abandoned));
+        taken_back_by_hand(&store, lease).await;
         let ended = file();
         assert!(!store.unissue_decode(GATEWAY, lease, first));
         assert_eq!(file(), ended);
@@ -7556,7 +7581,7 @@ pub(crate) mod tests {
         let filed = file();
         for _ in 0..u8::MAX {
             issued_by_hand(&bed, call(1, id));
-            assert!(store.take_back_decode(GATEWAY, lease, ReleaseReason::Abandoned));
+            taken_back_by_hand(&store, lease).await;
         }
         assert_eq!(file(), filed);
         for full in [call(1, id), again(call(1, id))] {
@@ -7597,6 +7622,8 @@ pub(crate) mod tests {
             .expect("the decider reads the clock");
         let hand = lifecycle::open(&store, GATEWAY);
         let late = ReleaseReason::LateDecision;
+        // A take-back in place is refused beside the decider at work.
+        assert!(!store.take_back_decode(GATEWAY, lease, late));
         answer.given_up(&store, &hand, late);
         assert_eq!(told.lock().len(), heard, "left to the decider at work");
         go.send(()).expect("the decider holds the other end");
@@ -7606,6 +7633,38 @@ pub(crate) mod tests {
         let released = (Side::Decode, other, Some(late));
         assert_eq!(told.lock().get(heard), Some(&released));
         store.hand_back(hand);
+    }
+
+    /// A decode call is decided at its lease's file, whatever model it
+    /// names: its job goes to the decider that issued the lease, not to
+    /// the decider of the model the call names. A repeat under such a
+    /// name takes the call's issue back there, and the first pick's decode
+    /// stands chosen where the named model has no pair.
+    #[tokio::test]
+    async fn a_decode_call_is_decided_by_its_leases_decider_whatever_model_it_names() {
+        let (mut bed, _, prefill) = later_bed_of(4);
+        let (id, [chosen, other], _) = held(&mut bed).await;
+        let home = format!("decide-{}", bed.deciders.of(MODEL));
+        let elsewhere = (0..64)
+            .map(|index| format!("model-{index}"))
+            .find(|model| bed.deciders.of(model) != bed.deciders.of(MODEL))
+            .expect("some model of sixty-four has another key");
+        let answer = bed.ask(call(1, id)).await;
+        assert_eq!(sides_of(&answer), [(id, proto::Side::Decode, 0)]);
+        assert_eq!(decode_on_file(&bed, id), (LeaseState::ISSUED, other));
+        bed.script.readers.lock().clear();
+        let mut repeat = again(call(1, id));
+        let facts = repeat.facts.as_mut().expect("the case's frame has facts");
+        facts.model = elsewhere;
+        bed.ask(repeat).await;
+        let readers = mem::take(&mut *bed.script.readers.lock());
+        assert!(
+            !readers.is_empty() && readers.iter().all(|reader| *reader == home),
+            "{readers:?}"
+        );
+        assert_eq!(asked_again(&bed), [0, 1]);
+        assert_eq!(decode_on_file(&bed, id), (LeaseState::Chosen, chosen));
+        assert_eq!(pair_counts(&bed.store, [prefill, chosen, other]), [2, 1, 0]);
     }
 
     /// What an answer that does not leave gives up, by what its lease is
@@ -7629,7 +7688,7 @@ pub(crate) mod tests {
         let late = ReleaseReason::LateDecision;
         // The first call's answer, given up behind a repeat's issue.
         let first = answer(wire::Beside::Issue(issued_by_hand(&bed, call(1, id))));
-        assert!(store.take_back_decode(GATEWAY, lease, ReleaseReason::Abandoned));
+        taken_back_by_hand(&store, lease).await;
         let repeat = answer(wire::Beside::Issue(issued_by_hand(&bed, call(1, id))));
         let issued = file();
         assert_eq!(issued.1, [2, 1, 1]);

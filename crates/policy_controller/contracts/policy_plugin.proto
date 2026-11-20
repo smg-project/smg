@@ -531,8 +531,8 @@ message Busy {
     REASON_DECODE_NOT_CHOSEN = 6;
     // The lease's prefill is not held: not dispatched yet, or ended.
     REASON_DECODE_PREFILL_NOT_HELD = 7;
-    // The decode side stands: a call issued it, a dispatch named it, or its
-    // gateway ended it.
+    // The decode side stands: a call issued it, a dispatch named it, its
+    // gateway ended it, or it took as many calls as one lease takes (255).
     REASON_DECODE_STANDS = 8;
   }
   Reason reason = 1;

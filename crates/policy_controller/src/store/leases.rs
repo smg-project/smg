@@ -345,13 +345,6 @@ pub enum Said {
     Completed(Outcome),
     /// The side given up, where the frame names one, and the reason.
     Released(Option<Side>, ReleaseReason),
-    /// One issue of a decode call taken back, by the issue's count, and the
-    /// reason: a `Decide` stream's word for an answer of that call that
-    /// does not leave. The side stands chosen again where that issue still
-    /// stands, and nothing moves where it does not. No frame carries the
-    /// word and no host says it: a door reads it from a host as it reads
-    /// any report, and a link frames it as the decode side's release.
-    TakenBack(u8, ReleaseReason),
 }
 
 /// Why a lease was not recorded.
@@ -387,7 +380,8 @@ pub enum DecodeRefused {
     /// The prefill side is waiting for dispatch or has ended.
     PrefillNotHeld,
     /// The chosen side was already issued or dispatched, even if it has
-    /// ended, or its host gave it up.
+    /// ended, or its host gave it up, or it took as many calls as one
+    /// lease takes.
     DecodeStands,
 }
 

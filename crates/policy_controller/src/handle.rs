@@ -396,7 +396,7 @@ impl<D: Deref<Target = Door>> Handle<D> {
                         door.report(*gateway, lease, said);
                     });
                 }
-                Said::Dispatched(..) | Said::Released(..) | Said::TakenBack(..) => {
+                Said::Dispatched(..) | Said::Released(..) => {
                     door.report(*gateway, lease, said);
                 }
             },

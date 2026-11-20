@@ -3527,15 +3527,6 @@ struct HeldDecode {
 )]
 pub(crate) struct DecodeIssue(u8);
 
-#[cfg(feature = "controller")]
-impl DecodeIssue {
-    /// The issue's count, as a word of the leases' file names the issue
-    /// ([`Said::TakenBack`]).
-    pub(crate) fn count(self) -> u8 {
-        self.0
-    }
-}
-
 /// What an issue of a chosen decode side replaced: the side and the
 /// lease's dispatch deadline as they stood.
 #[cfg(feature = "controller")]
@@ -4497,14 +4488,17 @@ impl MemoryStore {
     /// lease `lease`, where a call issued the side and no dispatch named
     /// it: for a gateway that asks the call again and holds no answer to
     /// it, so no dispatch will name what that answer carried. The caller
-    /// is the lease's decider, the thread at work at its file. An answer
+    /// is the lease's decider, the thread at work at its file: a decode
+    /// call is handed to the decider whose file holds its lease. An answer
     /// that does not leave its stream is given up on the stream's task,
-    /// and hands the file a word instead ([`Said::TakenBack`]). The issue
-    /// is released under `reason` with its engine told, and the side holds
-    /// the first pick's targets again: that pick's dispatch books it, and
-    /// a later call issues it anew. The lease's prefill keeps its booking.
-    /// `false` where no issue stands: a side still chosen, one a dispatch
-    /// named, one that ended.
+    /// and hands the file a word instead ([`Self::hand_taken_back`]). The
+    /// issue is released under `reason` with its engine told, and the side
+    /// holds the first pick's targets again: that pick's dispatch books
+    /// it, and a later call issues it anew. The lease's prefill keeps its
+    /// booking. Everything handed to the file is applied first, as at an
+    /// issue. `false` where no issue stands, a side still chosen, one a
+    /// dispatch named or one that ended, and for a caller that may not act
+    /// at the file.
     #[cfg(feature = "controller")]
     #[cold]
     pub(crate) fn take_back_decode(
@@ -4514,7 +4508,10 @@ impl MemoryStore {
         reason: ReleaseReason,
     ) -> bool {
         let at = self.file_of(lease);
-        let mut leases = self.turn_of(at);
+        let mut leases = self.files[at].take();
+        if !self.applied(at, &mut leases) {
+            return false;
+        }
         let Some(found) = leases.taken_back(&(gateway, lease), None) else {
             return false;
         };
@@ -4522,6 +4519,28 @@ impl MemoryStore {
         let released = Said::Released(Some(Side::Decode), reason);
         self.tell(at, one.world(self), &found, released);
         true
+    }
+
+    /// Applies the take-back of `issue` that was handed to the file at
+    /// `at` ([`Self::hand_taken_back`]). Where that issue of the decode
+    /// side under `key` still stands, the side returns to chosen and the
+    /// engine hears the decode side's release under `reason`. Where the
+    /// side moved since, nothing moves and nothing is told.
+    #[cfg(feature = "controller")]
+    #[cold]
+    fn apply_taken_back(
+        &self,
+        at: usize,
+        leases: &mut Leases,
+        key: Key,
+        issue: DecodeIssue,
+        reason: ReleaseReason,
+        one: &mut turn::OneLoad,
+    ) {
+        if let Some(found) = leases.taken_back(&key, Some(issue)) {
+            let released = Said::Released(Some(Side::Decode), reason);
+            self.tell(at, one.world(self), &found, released);
+        }
     }
 
     /// Undoes `issue`, an issue of the decode side of `gateway`'s lease

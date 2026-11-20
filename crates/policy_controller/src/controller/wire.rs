@@ -607,12 +607,13 @@ impl Leased {
     /// `Released` frame's word is: whoever may act at the file next applies
     /// it and tells its engine, so no stage hears it beside its decider at
     /// work. A decode call's answer takes its one issue back, and the side
-    /// stands chosen for the first pick's dispatch ([`Said::TakenBack`]).
+    /// stands chosen for the first pick's dispatch
+    /// ([`MemoryStore::hand_taken_back`]).
     /// Any other lease is released whole.
     pub(crate) fn given_up(&self, store: &MemoryStore, hand: &Hand, reason: ReleaseReason) {
         match self.beside {
             Beside::Issue(issue) => {
-                store.hand(hand, self.lease.id, Said::TakenBack(issue.count(), reason));
+                store.hand_taken_back(hand, self.lease.id, issue, reason);
             }
             Beside::Alone | Beside::Decode(_) => {
                 store.hand(hand, self.lease.id, Said::Released(None, reason));
