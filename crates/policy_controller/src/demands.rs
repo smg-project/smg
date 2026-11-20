@@ -30,6 +30,8 @@
 //! pool is shed under the last of those: where a host cuts a pool one
 //! demand after another, that is the demand that took its last worker.
 
+use crate::view::Role;
+
 /// Where a request's media by reference may be processed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum References {
@@ -72,7 +74,8 @@ pub struct Demands {
     pub input_window: u32,
     /// The context window the request's completion needs, in tokens: its
     /// budget. It is held against a worker's window alone, as the input
-    /// is. `0` demands none.
+    /// is. A prefill worker is not held to it ([`Self::held_by`]): a host
+    /// states it whatever the request's phase. `0` demands none.
     pub output_window: u32,
 }
 
@@ -119,6 +122,22 @@ impl Demands {
             None
         } else {
             Some(Unmet::Window)
+        }
+    }
+
+    /// What a worker of `role`'s pool is held to: the request's demands,
+    /// less its completion's bound for a prefill worker. A prefill runs
+    /// the input, and the decode beside it holds the budget. The door
+    /// reads a request's demands through this where it judges rows: the
+    /// role is the door's to know.
+    #[must_use]
+    pub const fn held_by(self, role: Role) -> Self {
+        match role {
+            Role::Prefill => Self {
+                output_window: 0,
+                ..self
+            },
+            Role::Single | Role::Decode | Role::Encode => self,
         }
     }
 
@@ -210,7 +229,7 @@ impl Unmet {
 
 #[cfg(test)]
 mod tests {
-    use super::{DemandFacts, Demands, References, Unmet};
+    use super::{DemandFacts, Demands, References, Role, Unmet};
 
     /// A request that demands nothing is met by every worker, and one that
     /// demands a runtime by the workers that registered its number alone: a
@@ -353,6 +372,33 @@ mod tests {
             ..own
         };
         assert_eq!(both.unmet_by(false, host), Some(Unmet::Window));
+    }
+
+    /// A prefill worker is held to the input alone: the completion's
+    /// bound is its decode's to hold. Every other role is held to both,
+    /// and no other demand moves with the role.
+    #[test]
+    fn a_prefill_is_held_to_the_input_alone() {
+        let asked = Demands {
+            runtime: 7,
+            vision: true,
+            references: References::Host,
+            input_window: 40,
+            output_window: 400,
+        };
+        let input_alone = Demands {
+            output_window: 0,
+            ..asked
+        };
+        assert_eq!(asked.held_by(Role::Prefill), input_alone);
+        for role in [Role::Single, Role::Decode, Role::Encode] {
+            assert_eq!(asked.held_by(role), asked, "{role:?}");
+        }
+        let budget = Demands {
+            output_window: 400,
+            ..Demands::default()
+        };
+        assert!(budget.held_by(Role::Prefill).is_none());
     }
 
     /// The demands stand in the order a host answers for them, and each has
