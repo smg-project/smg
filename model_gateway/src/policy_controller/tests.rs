@@ -842,6 +842,63 @@ async fn the_regular_router_is_built_under_the_setting() -> Case {
     Ok(())
 }
 
+/// The HTTP pair router asks the host for each attempt's pair; the router's
+/// own cases hold that. No classic pair policy is built beside it.
+#[tokio::test]
+async fn the_http_pair_router_is_built_under_the_setting() -> Case {
+    let mut config = picked(quiet());
+    config.mode = RoutingMode::PrefillDecode {
+        prefill_urls: vec![],
+        decode_urls: vec![],
+        prefill_policy: None,
+        decode_policy: None,
+    };
+    let (context, gateway) = build(config).await?;
+    let router = gateway
+        .select_router_for_request(None)
+        .ok_or("the HTTP pair router is missing")?;
+    assert_eq!(router.router_type(), "pd");
+    let policies = &context.policy_registry;
+    let unset = policies.get_default_policy();
+    assert!(Arc::ptr_eq(&policies.get_prefill_policy(), &unset));
+    assert!(Arc::ptr_eq(&policies.get_decode_policy(), &unset));
+    Ok(())
+}
+
+/// A gateway of many routers mounts every family over its one document.
+/// Under a document that plans no pair its HTTP pair keeps the refusal by
+/// name: a pair asked there would be decided as a single. Under a pair
+/// gateway's document it serves.
+#[tokio::test]
+async fn many_routers_mount_the_http_pair_router_where_the_document_plans_pairs() -> Case {
+    use crate::routers::{factory::router_ids, RouterFactory};
+
+    let mut regular = picked(quiet());
+    regular.enable_igw = true;
+    let mut pair = regular.clone();
+    pair.mode = RoutingMode::PrefillDecode {
+        prefill_urls: vec![],
+        decode_urls: vec![],
+        prefill_policy: None,
+        decode_policy: None,
+    };
+    for (config, serves) in [(regular, false), (pair, true)] {
+        let context = Arc::new(AppContext::from_config(config.clone(), 30, None, None).await?);
+        let routers = RouterFactory::create_igw_routers(&config.policy, &context).await;
+        let (_, _, built) = routers
+            .into_iter()
+            .find(|(id, ..)| *id == router_ids::HTTP_PD)
+            .ok_or("the HTTP pair family has no entry")?;
+        let router = built?;
+        if serves {
+            assert_eq!(router.router_type(), "pd");
+        } else {
+            assert_refusing_router(router.as_ref(), "HTTP pair, many routers").await?;
+        }
+    }
+    Ok(())
+}
+
 /// The router's selection stage asks the host; the stage's cases hold that.
 #[tokio::test]
 async fn the_regular_grpc_router_is_built_under_the_setting() -> Case {
@@ -978,6 +1035,12 @@ async fn the_pair_routers_refuse_by_name() -> Case {
         let router = gateway
             .select_router_for_request(None)
             .ok_or("the router is missing")?;
+        // The HTTP pair router asks the host and refuses nothing. Its own
+        // case holds what it is built as.
+        if family == "HTTP pair" {
+            assert_eq!(router.router_type(), "pd");
+            continue;
+        }
         assert_refusing_router(router.as_ref(), family).await?;
         // No classic pair policy was built for the refused family.
         let policies = &context.policy_registry;

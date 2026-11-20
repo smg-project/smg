@@ -146,7 +146,12 @@ impl RouterFactory {
         main_policy_config: &PolicyConfig,
         ctx: &Arc<AppContext>,
     ) -> Result<Box<dyn RouterTrait>, String> {
-        if let Some(router) = policy_controller::undecided(ctx) {
+        // The pair router asks the controller's host where this gateway
+        // decides pairs in its own process. Its family refuses by name
+        // elsewhere.
+        if let Some(router) =
+            policy_controller::undecided_without(ctx, policy_controller::PlanName::PdPair)
+        {
             return Ok(router);
         }
         Self::set_pd_policies(
@@ -157,7 +162,9 @@ impl RouterFactory {
         );
 
         let config = ctx.router_config.clone();
-        if config.dp_minimum_tokens_scheduler {
+        // Under the policy controller a side's rank is its target's: no rank
+        // policy is built.
+        if config.dp_minimum_tokens_scheduler && ctx.policy_host.is_none() {
             let mini_tokens_policy = MinimumTokensPolicy::new(
                 ctx.worker_monitor
                     .as_ref()

@@ -61,6 +61,13 @@ pub(crate) fn mark_failed_side(response: &mut Response, worker: &dyn Worker) {
     });
 }
 
+/// The kind of the worker whose side alone failed, where `response` names
+/// one ([`FailedSide`]).
+pub(crate) fn failed_side_type(response: &Response) -> Option<WorkerType> {
+    let side = response.extensions().get::<FailedSide>();
+    side.map(|side| side.worker_type)
+}
+
 /// Whether `response` is a failure the answering worker must not see again
 /// for this request: the worker's own 500, the one retryable status a worker
 /// gives a request it processed and failed on. Its "not served now" statuses

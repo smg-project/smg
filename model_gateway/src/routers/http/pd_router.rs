@@ -1,7 +1,7 @@
 use std::{
     borrow::Cow,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU16, AtomicUsize, Ordering},
         Arc,
     },
     time::Instant,
@@ -35,9 +35,10 @@ use serde_json::{
     value::{to_raw_value, RawValue},
     Value,
 };
+use smg_policy_controller::view::{Phase, WorkerId};
 use smg_worker::{
     identity::{
-        basic::{RuntimeType, Worker, WorkerLoadGuard},
+        basic::{RuntimeType, Worker, WorkerLoadGuard, WorkerType},
         endpoint::Endpoint,
     },
     metrics::writers::Metrics as WorkerMetrics,
@@ -60,12 +61,14 @@ use crate::{
         otel_trace::with_trace_context_http,
     },
     policies::{CacheNamespace, PolicyRegistry, WorkerRole},
+    policy_controller::host::{self, Ask, Host, Sent, Unplaced},
     rate_limit::RateLimitManager,
     routers::{
         common::{
             attach_sized_body,
             attempt_ledger::{
-                is_definitive_failure, mark_failed_side, mark_upstream_answer, AttemptLedger,
+                failed_side_type, is_definitive_failure, mark_failed_side, mark_upstream_answer,
+                AttemptLedger,
             },
             header_utils,
             kv_transfer::{
@@ -219,6 +222,8 @@ pub struct PDRouter {
     /// tenant reserves through it before its first dispatch
     /// (`tenant_rate_limit::reserve`).
     rate_limit_manager: Option<Arc<RateLimitManager>>,
+    /// The policy controller's host, when it places this router's pairs.
+    host: Option<Arc<Host>>,
 }
 
 impl std::fmt::Debug for PDRouter {
@@ -249,6 +254,9 @@ struct PDRequestContext<'a> {
     return_logprob: bool,
     model_id: &'a str,
     headers: Option<HeaderMap>,
+    /// The request's own id, the `rid` of its body, where the policy
+    /// controller's host places the request: a source of its routing key.
+    rid: Option<&'a str>,
 }
 
 /// What the PD dispatch needs to know about a request beyond what every
@@ -521,6 +529,7 @@ impl PDRouter {
             prefill_admission: ctx.prefill_admission.clone(),
             moriio_dp_turn: AtomicUsize::new(0),
             rate_limit_manager: ctx.rate_limit_manager.clone(),
+            host: ctx.policy_host.clone(),
         })
     }
 
@@ -694,6 +703,12 @@ impl PDRouter {
                 .map(str::to_string),
             cache_namespace: CacheNamespace::derive(&body.cache_partition()),
         };
+        // The host's ask reads the body's own id after the dispatch took the
+        // body. The classic path copies nothing.
+        let rid = self
+            .host
+            .as_ref()
+            .and_then(|_| body.rid().map(str::to_owned));
         let context = PDRequestContext {
             route: R::ROUTE,
             batch_size: body.batch_size(),
@@ -701,6 +716,7 @@ impl PDRouter {
             return_logprob: body.returns_logprob(),
             model_id,
             headers: headers.cloned(),
+            rid: rid.as_deref(),
         };
         self.execute_dual_dispatch(headers, tenant_meta, body, routing, context)
             .await
@@ -773,6 +789,9 @@ impl PDRouter {
         // What the request's attempts tell the worker pool: a retry selects
         // around a worker whose answer was definitive (`attempt_ledger`).
         let ledger = AttemptLedger::default();
+        // The rows of the pairs the request's failed attempts were sent to,
+        // for the policy controller's host. The classic path leaves it empty.
+        let tried_rows = parking_lot::Mutex::new(Vec::new());
 
         let response = if let Some(denied) = denial {
             denied
@@ -780,7 +799,7 @@ impl PDRouter {
             // Retries disabled: one dispatch; the lease frees the parsed
             // request as soon as its serialized sides exist.
             let res = self
-                .execute_dual_dispatch_attempt(0, headers, &lease, context, &ledger)
+                .execute_dual_dispatch_attempt(0, headers, &lease, context, &ledger, &tried_rows)
                 .await;
             // Mirror the retry executor's exhaustion accounting for a
             // retryable response that gets no retry.
@@ -792,7 +811,7 @@ impl PDRouter {
         } else {
             // The lease keeps the request alive for replay until the retry
             // window closes (first non-retryable response).
-            let (lease, ledger) = (&lease, &ledger);
+            let (lease, ledger, tried_rows) = (&lease, &ledger, &tried_rows);
             RetryExecutor::execute_response_with_retry(
                 retry_config,
                 {
@@ -800,7 +819,7 @@ impl PDRouter {
                         let context = context.clone();
                         async move {
                             self.execute_dual_dispatch_attempt(
-                                attempt, headers, lease, context, ledger,
+                                attempt, headers, lease, context, ledger, tried_rows,
                             )
                             .await
                         }
@@ -881,6 +900,7 @@ impl PDRouter {
         lease: &RequestLease<T>,
         context: PDRequestContext<'_>,
         ledger: &AttemptLedger,
+        tried_rows: &parking_lot::Mutex<Vec<WorkerId>>,
     ) -> Response {
         // Admission may queue the request, so the selection inputs are copied
         // out of the lease's synchronous view first.
@@ -903,47 +923,86 @@ impl PDRouter {
             if attempt == 0 { None } else { Some(&admits) };
         // The dispatch takes the context; the settle reads the model after it.
         let model_id = context.model_id;
-        let selected = self
-            .select_pd_pair_with_admission(
-                model_id,
-                PlacementInputs {
-                    text: text.as_deref(),
-                    tokens: tokens.as_deref(),
-                    headers: context.headers.as_ref(),
-                    rid_key: rid_key.as_deref(),
-                    cache_namespace,
-                    candidate_filter,
-                    tried: &[],
-                },
-                sticky_key,
-            )
-            .await;
-        let ((prefill, decode), guards) = match selected {
-            Ok(admitted) => admitted,
-            Err(e) => {
-                return self
-                    .report_refusal(context.model_id, Self::handle_server_selection_error(*e));
-            }
-        };
+        let (prefill, decode, guards, mut placed) = match &self.host {
+            None => {
+                let selected = self
+                    .select_pd_pair_with_admission(
+                        model_id,
+                        PlacementInputs {
+                            text: text.as_deref(),
+                            tokens: tokens.as_deref(),
+                            headers: context.headers.as_ref(),
+                            rid_key: rid_key.as_deref(),
+                            cache_namespace,
+                            candidate_filter,
+                            tried: &[],
+                        },
+                        sticky_key,
+                    )
+                    .await;
+                let ((prefill, decode), guards) = match selected {
+                    Ok(admitted) => admitted,
+                    Err(e) => {
+                        return self.report_refusal(
+                            context.model_id,
+                            Self::handle_server_selection_error(*e),
+                        );
+                    }
+                };
 
-        debug!(
-            "PD retry attempt {} using prefill={} decode={}",
-            attempt,
-            prefill.redacted_url(),
-            decode.redacted_url()
-        );
+                debug!(
+                    "PD retry attempt {} using prefill={} decode={}",
+                    attempt,
+                    prefill.redacted_url(),
+                    decode.redacted_url()
+                );
 
-        // Dispatch-time re-check of both sides, the same one the regular HTTP
-        // and gRPC paths take just before their load guards.
-        let shedding = self.worker_registry.overload_shed_enabled();
-        if let Some(shed) =
-            overload::shed_if_worker_overloaded(prefill.as_ref(), context.model_id, shedding)
+                // Dispatch-time re-check of both sides, the same one the regular HTTP
+                // and gRPC paths take just before their load guards.
+                let shedding = self.worker_registry.overload_shed_enabled();
+                if let Some(shed) = overload::shed_if_worker_overloaded(
+                    prefill.as_ref(),
+                    context.model_id,
+                    shedding,
+                )
                 .or_else(|| {
                     overload::shed_if_worker_overloaded(decode.as_ref(), context.model_id, shedding)
-                })
-        {
-            return shed;
-        }
+                }) {
+                    return shed;
+                }
+                (prefill, decode, guards, None)
+            }
+            // The host places the pair. The controller's own overload verdict,
+            // from its document's thresholds, stands in for the gateway's
+            // dispatch-time re-check, as on the regular router's hosted path.
+            Some(host) => {
+                let prompt_tokens = tokens
+                    .as_deref()
+                    .map_or(0, |tokens| u32::try_from(tokens.len()).unwrap_or(u32::MAX));
+                let placed = self
+                    .place_pair_attempt(
+                        host,
+                        &context,
+                        prompt_tokens,
+                        sticky_key,
+                        tried_rows,
+                        ledger,
+                    )
+                    .await;
+                match placed {
+                    Ok((placed, (prefill, decode), guards)) => {
+                        debug!(
+                            "PD attempt {} placed by the policy controller: prefill={} decode={}",
+                            attempt,
+                            prefill.redacted_url(),
+                            decode.redacted_url()
+                        );
+                        (prefill, decode, guards, Some(placed))
+                    }
+                    Err(refusal) => return refusal,
+                }
+            }
+        };
 
         let raw_body_len = header_utils::content_length(headers);
 
@@ -1095,9 +1154,11 @@ impl PDRouter {
                         Arc::clone(&decode),
                         guards,
                         ledger,
+                        placed.as_mut(),
                     )
                     .await;
-                return self.settle_attempt(ledger, model_id, [&prefill, &decode], response);
+                let response = self.settle_attempt(ledger, model_id, [&prefill, &decode], response);
+                return Self::end_placed(placed, tried_rows, response);
             }
 
             // Outcome accounting happens per-side inside the sequential path:
@@ -1115,11 +1176,17 @@ impl PDRouter {
                     Arc::clone(&decode),
                     guards,
                     ledger,
+                    placed.as_mut(),
                 )
                 .await;
-            return self.settle_attempt(ledger, model_id, [&prefill, &decode], response);
+            let response = self.settle_attempt(ledger, model_id, [&prefill, &decode], response);
+            return Self::end_placed(placed, tried_rows, response);
         }
 
+        let placed_ranks = placed.as_ref().map(|placed| {
+            let decode = placed.decode_rank().map(|rank| rank as isize);
+            (placed.rank() as isize, decode)
+        });
         let sides =
             lease.serialize_sides_with(|view| -> Result<(Vec<u8>, Vec<u8>), Box<Response>> {
                 let serialization_error =
@@ -1138,8 +1205,17 @@ impl PDRouter {
 
                 let mut prefill_rank = prefill.dp_rank().map(|rank| rank as isize);
                 let mut decode_rank = decode.dp_rank().map(|rank| rank as isize);
+                // Under the policy controller a side that carries a rank
+                // sends its target's, and no rank policy is asked.
+                if let Some((placed_prefill, placed_decode)) = placed_ranks {
+                    prefill_rank = prefill_rank.map(|_| placed_prefill);
+                    decode_rank = decode_rank.and(placed_decode);
+                }
 
-                let dp_rank_policy_opt = self.policy_registry.get_dp_rank_policy();
+                let dp_rank_policy_opt = match placed_ranks {
+                    Some(_) => None,
+                    None => self.policy_registry.get_dp_rank_policy(),
+                };
                 if let Some(dp_rank_policy) = dp_rank_policy_opt.as_ref() {
                     let estimated_cost: isize = match (view.tokens, view.text) {
                         (Some(tokens), _) => (tokens.len() as isize).max(1),
@@ -1218,6 +1294,7 @@ impl PDRouter {
                 Arc::clone(&prefill),
                 Arc::clone(&decode),
                 guards,
+                placed.as_mut(),
                 &mut prefill_outcome,
             )
             .await;
@@ -1229,7 +1306,142 @@ impl PDRouter {
             head_success_recorded(&response),
             own_failure(&response),
         );
-        self.settle_attempt(ledger, model_id, [&prefill, &decode], response)
+        let response = self.settle_attempt(ledger, model_id, [&prefill, &decode], response);
+        Self::end_placed(placed, tried_rows, response)
+    }
+
+    /// The one primary model this router's prefill workers serve: the model
+    /// an unnamed request is placed under. The no-model id where no worker
+    /// has a model, and `None` where their primary models differ.
+    fn model_of_an_unnamed_request(&self) -> Option<String> {
+        let pool = self
+            .worker_registry
+            .get_routing_pool(UNKNOWN_MODEL_ID, RoutingPool::HttpPrefill);
+        let mut models = pool
+            .iter()
+            .map(|worker| worker.model_id())
+            .filter(|&model| model != UNKNOWN_MODEL_ID);
+        let model = models.next().unwrap_or(UNKNOWN_MODEL_ID);
+        models.all(|other| other == model).then(|| model.to_owned())
+    }
+
+    /// The attempt's pair as the policy controller placed it, with the load
+    /// both sides hold, or the answer of a request it did not place. The
+    /// prefill's guard is the admission's and the decode's is taken here, as
+    /// on the classic path. The controller reads the tried rows softly. The
+    /// commit asks the route's rule of both workers, made of the classic
+    /// selection's own: a worker of the HTTP pair pools, and one `ledger`
+    /// admits. A worker that answered the request definitively takes no
+    /// further attempt of it, at any of its ranks.
+    async fn place_pair_attempt(
+        &self,
+        host: &Host,
+        context: &PDRequestContext<'_>,
+        prompt_tokens: u32,
+        sticky_key: Option<&str>,
+        tried_rows: &parking_lot::Mutex<Vec<WorkerId>>,
+        ledger: &AttemptLedger,
+    ) -> Result<(Sent, PdPair, PdLoadGuards), Response> {
+        let model = if context.model_id == UNKNOWN_MODEL_ID {
+            let Some(model) = self.model_of_an_unnamed_request() else {
+                let refusal = error::model_not_found(UNKNOWN_MODEL_ID);
+                return Err(self.report_refusal(context.model_id, refusal));
+            };
+            Cow::Owned(model)
+        } else {
+            Cow::Borrowed(context.model_id)
+        };
+        let id = host::mark();
+        let tried = tried_rows.lock().clone();
+        let ask = Ask {
+            streaming: context.is_stream,
+            headers: context.headers.as_ref(),
+            rid: context.rid,
+            phase: Phase::Prefill,
+            prompt_tokens,
+            tried: &tried,
+            ..Ask::of(&id, &model)
+        };
+        // The controller reads neither rule, so a target one of them
+        // refuses is passed over like one the gateway cannot send to.
+        let on_route = |worker: &dyn Worker| {
+            let pooled =
+                RoutingPool::HttpPrefill.matches(worker) || RoutingPool::HttpDecode.matches(worker);
+            pooled && ledger.admits(worker)
+        };
+        let placed = host
+            .place_pair_where(
+                &ask,
+                on_route,
+                self.prefill_admission.as_deref(),
+                sticky_key,
+            )
+            .await;
+        let (placed, prefill_guard) = match placed {
+            Ok(placed) => placed,
+            Err(unplaced) => {
+                return Err(self.report_refusal(context.model_id, unplaced.answer(&model)));
+            }
+        };
+        let prefill = Arc::clone(placed.worker());
+        let Some(decode) = placed.decode().map(Arc::clone) else {
+            // A placement with no decode side is no pair. Its drop gives the
+            // lease up.
+            let refusal = Unplaced::NoTargetHolds.answer(&model);
+            return Err(self.report_refusal(context.model_id, refusal));
+        };
+        let guards = PdLoadGuards {
+            prefill: prefill_guard,
+            decode: WorkerLoadGuard::with_key(Arc::clone(&decode), sticky_key),
+        };
+        Ok((Sent::from(placed), (prefill, decode), guards))
+    }
+
+    /// The mark the relay of a streamed answer writes a cut's status on,
+    /// where the policy controller placed the attempt.
+    fn cut_mark_of(placed: Option<&mut Sent>, is_stream: bool) -> Option<Arc<AtomicU16>> {
+        placed.filter(|_| is_stream).map(Sent::cut_mark)
+    }
+
+    /// The end of an attempt the policy controller placed. The rows of a
+    /// pair whose answer a retry may replace join the request's tried rows:
+    /// the row of the side the request's ledger closed, else both.
+    /// A success ends the decode at the end of the body it writes. Its
+    /// prefill ends ahead of that: where it was read whole, or where its
+    /// drain marks its end. A failed attempt names no side here: the
+    /// placement's drop completes a side that was sent and not ended as
+    /// cancelled, and releases one that was not sent.
+    fn end_placed(
+        placed: Option<Sent>,
+        tried_rows: &parking_lot::Mutex<Vec<WorkerId>>,
+        response: Response,
+    ) -> Response {
+        let Some(placed) = placed else {
+            return response;
+        };
+        if is_retryable_response(&response) {
+            // The ledger gave the failure to one side, which is not always
+            // the side that answered. That row alone is tried: its partner
+            // stays as selectable as it was.
+            let named = failed_side_type(&response);
+            let mut tried = tried_rows.lock();
+            if named != Some(WorkerType::Decode) {
+                tried.push(placed.id());
+            }
+            if named != Some(WorkerType::Prefill) {
+                tried.extend(placed.decode_id());
+            }
+        }
+        let status = response.status();
+        if !status.is_success() {
+            return response;
+        }
+        if head_success_recorded(&response) {
+            placed.held_to_the_end_of(response)
+        } else {
+            placed.ended_by(&response, Instant::now());
+            response
+        }
     }
 
     /// Record an attempt's outcome on both sides, or on one. A status one
@@ -1385,7 +1597,7 @@ impl PDRouter {
     /// forwarded.
     #[expect(
         clippy::too_many_arguments,
-        reason = "the sequential decode handoff carries its request ledger"
+        reason = "the sequential decode handoff carries its request ledger and the placement's mark"
     )]
     async fn forward_decode_head(
         &self,
@@ -1396,6 +1608,7 @@ impl PDRouter {
         runtime: &'static str,
         dispatch_start: Instant,
         ledger: &AttemptLedger,
+        cut: Option<Arc<AtomicU16>>,
     ) -> Response {
         events::RequestReceivedEvent {}.emit();
         let status = decode_response.status();
@@ -1421,6 +1634,7 @@ impl PDRouter {
             decode_guard,
             None,
             Some(ledger),
+            cut,
         )
         .await
     }
@@ -1535,6 +1749,7 @@ impl PDRouter {
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
         guards: PdLoadGuards,
+        mut placed: Option<&mut Sent>,
         prefill_outcome: &mut PrefillOutcome,
     ) -> Response {
         let PdSetup {
@@ -1587,6 +1802,19 @@ impl PDRouter {
             Draining(tokio_util::task::AbortOnDropHandle<()>),
         }
         let dispatch_start = Instant::now();
+        // Both sides go out together.
+        if let Some(placed) = placed.as_deref_mut() {
+            placed.dispatched(dispatch_start);
+            placed.decode_dispatched(dispatch_start);
+        }
+        let cut = Self::cut_mark_of(placed.as_deref_mut(), context.is_stream);
+        // The drain of a streamed pair's prefill outlives this attempt. It
+        // writes its end on the placement's mark, and the answer's body
+        // tells the prefill's end from it.
+        let drain_mark = placed
+            .as_deref_mut()
+            .filter(|_| context.is_stream && !context.return_logprob)
+            .map(Sent::drain_mark);
         let prefill_fut = async {
             let resp = send_with_stale_conn_retry(prefill_request)
                 .await
@@ -1617,6 +1845,9 @@ impl PDRouter {
                         }
                     }
                     prefill.record_outcome(drained.as_u16());
+                    if let Some(mark) = drain_mark {
+                        mark.store(drained.as_u16(), Ordering::Relaxed);
+                    }
                     if drained.is_server_error() {
                         Metrics::record_worker_error(
                             metrics_labels::WORKER_PREFILL,
@@ -1641,7 +1872,11 @@ impl PDRouter {
                 .process_prefill_response(resp, prefill.url(), context.return_logprob)
                 .await;
             drop(prefill_guard);
-            let (_, body) = result.map_err(DispatchError::Prefill)?;
+            let (status, body) = result.map_err(DispatchError::Prefill)?;
+            // The prefill is done with ahead of the answer its decode writes.
+            if let Some(placed) = placed.as_deref_mut() {
+                placed.prefill_ended(status, Instant::now());
+            }
             Metrics::record_pd_prefill_duration(
                 metrics_labels::BACKEND_PD,
                 context.model_id,
@@ -1732,6 +1967,7 @@ impl PDRouter {
             decode_guard,
             prefill_body,
             None,
+            cut,
         )
         .await
     }
@@ -1895,6 +2131,7 @@ impl PDRouter {
         decode: Arc<dyn Worker>,
         guards: PdLoadGuards,
         ledger: &AttemptLedger,
+        mut placed: Option<&mut Sent>,
     ) -> Response {
         let PdSetup {
             prefill_body,
@@ -1931,6 +2168,13 @@ impl PDRouter {
                 headers,
                 dp_rank,
             );
+            // The decode waits on its prefill for longer than an unsent
+            // side's lease may live, so both dispatches are said here.
+            if let Some(placed) = placed.as_deref_mut() {
+                let now = Instant::now();
+                placed.dispatched(now);
+                placed.decode_dispatched(now);
+            }
             let prefill_bytes =
                 match Self::prefill_side_bytes(ledger, prefill.as_ref(), prefill_request).await {
                     Ok(bytes) => bytes,
@@ -1954,6 +2198,11 @@ impl PDRouter {
             None
         };
         drop(prefill_guard);
+        // A prefill that was sent is done with here. One that was not is
+        // said no end.
+        if let Some(placed) = placed.as_deref_mut() {
+            placed.prefill_ended(StatusCode::OK, Instant::now());
+        }
         if mode == KvConnectorMode::MoriIo {
             let checked = match (&harvested, transfer_id.as_deref()) {
                 (Some(handoff), Some(id)) => validate_moriio_handoff(handoff, id, dp_rank),
@@ -2039,6 +2288,12 @@ impl PDRouter {
             headers,
             dp_rank,
         );
+        let cut = Self::cut_mark_of(placed.as_deref_mut(), context.is_stream);
+        // A decode sent behind its prefill said its dispatch at that send,
+        // and a second say tells nothing. A decode sent alone says it here.
+        if let Some(placed) = placed {
+            placed.decode_dispatched(Instant::now());
+        }
         let decode_response = match send_with_stale_conn_retry(decode_request).await {
             Ok(response) => response,
             Err(e) => return Self::decode_transport_failed(ledger, decode.as_ref(), &e),
@@ -2052,6 +2307,7 @@ impl PDRouter {
             runtime,
             dispatch_start,
             ledger,
+            cut,
         )
         .await
     }
@@ -2080,6 +2336,7 @@ impl PDRouter {
         decode: Arc<dyn Worker>,
         guards: PdLoadGuards,
         ledger: &AttemptLedger,
+        mut placed: Option<&mut Sent>,
     ) -> Response {
         let PdSetup {
             prefill_body,
@@ -2098,6 +2355,12 @@ impl PDRouter {
         .emit();
 
         let dispatch_start = Instant::now();
+        // Both sides go out together.
+        if let Some(placed) = placed.as_deref_mut() {
+            placed.dispatched(dispatch_start);
+            placed.decode_dispatched(dispatch_start);
+        }
+        let cut = Self::cut_mark_of(placed.as_deref_mut(), context.is_stream);
         let prefill_request = self.build_post_with_headers(
             prefill.as_ref(),
             context.route,
@@ -2145,6 +2408,9 @@ impl PDRouter {
                     Err(response) => return response,
                 };
                 drop(prefill_guard);
+                if let Some(placed) = placed {
+                    placed.prefill_ended(StatusCode::OK, Instant::now());
+                }
                 Metrics::record_pd_prefill_duration(
                     metrics_labels::BACKEND_PD,
                     context.model_id,
@@ -2192,6 +2458,7 @@ impl PDRouter {
             runtime,
             dispatch_start,
             ledger,
+            cut,
         )
         .await
     }
@@ -2255,6 +2522,10 @@ impl PDRouter {
     /// sequential PD dispatch paths.
     /// `outcome_ledger` records an unstreamed answer's status on the decode
     /// worker here when the caller does not record the attempt itself.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the decode side as its dispatch body holds it, and the placement's mark"
+    )]
     async fn forward_decode_body(
         &self,
         decode_response: reqwest::Response,
@@ -2263,6 +2534,7 @@ impl PDRouter {
         decode_guard: WorkerLoadGuard,
         prefill_body: Option<Bytes>,
         outcome_ledger: Option<&AttemptLedger>,
+        cut: Option<Arc<AtomicU16>>,
     ) -> Response {
         let status = decode_response.status();
         if context.is_stream {
@@ -2280,12 +2552,19 @@ impl PDRouter {
                 header_utils::preserve_response_headers(decode_response.headers());
             header_utils::insert_routed_worker_id(&mut response_headers, decode.redacted_url());
 
+            // The relay answers a cut body with an error frame and a clean
+            // end. It writes the cut on the placement's mark, so the body's
+            // end is told as the cut it was.
+            let mut source = RelaySource::decode_side(context.model_id, context.route, decode);
+            if let Some(cut) = cut {
+                source = source.marking(cut);
+            }
             self.create_streaming_response(
                 decode_response.bytes_stream(),
                 status,
                 prefill_logprobs,
                 context.return_logprob,
-                RelaySource::decode_side(context.model_id, context.route, decode),
+                source,
                 Some(response_headers),
                 decode_guard,
             )
@@ -3308,13 +3587,15 @@ fn upstream_error_message(body: &[u8]) -> String {
 }
 
 #[cfg(test)]
+mod placed_tests;
+
+#[cfg(test)]
 mod tests {
     use axum::http::header::{AUTHORIZATION, CONTENT_LENGTH};
     use openai_protocol::model_card::ModelCard;
     use serde_json::json;
     use smg_worker::{
         health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
-        identity::basic::WorkerType,
         test_support::RefusedAddress,
     };
     use tokio::sync::{mpsc, oneshot};
@@ -3517,7 +3798,7 @@ mod tests {
     /// hang, not a budget, since a loaded machine can take seconds.
     const ROUND_TRIP_GUARD: std::time::Duration = std::time::Duration::from_secs(60);
 
-    fn create_test_pd_router() -> PDRouter {
+    pub(super) fn create_test_pd_router() -> PDRouter {
         let worker_registry = Arc::new(WorkerRegistry::new());
         let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
 
@@ -3529,6 +3810,7 @@ mod tests {
             prefill_admission: None,
             moriio_dp_turn: AtomicUsize::new(0),
             rate_limit_manager: None,
+            host: None,
         }
     }
 
@@ -4261,7 +4543,7 @@ mod tests {
         clippy::disallowed_methods,
         reason = "test stub server lives for the duration of the test process"
     )]
-    async fn spawn_recording_stub(
+    pub(super) async fn spawn_recording_stub(
         reply: &'static str,
     ) -> (String, Arc<std::sync::Mutex<Vec<(String, Value)>>>) {
         let seen: Arc<std::sync::Mutex<Vec<(String, Value)>>> =
@@ -4466,7 +4748,7 @@ mod tests {
     /// A server whose answer's head and first bytes leave at once and whose
     /// body then breaks off, on every path and method: a worker that dies
     /// mid-answer.
-    async fn spawn_cut_body_stub() -> String {
+    pub(super) async fn spawn_cut_body_stub() -> String {
         let app = axum::Router::new().fallback(axum::routing::any(|| async {
             let head = futures_util::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(
                 b"{\"partial\":",
@@ -6672,11 +6954,11 @@ mod tests {
         );
     }
 
-    type Arrivals = Arc<std::sync::Mutex<Vec<Value>>>;
+    pub(super) type Arrivals = Arc<std::sync::Mutex<Vec<Value>>>;
 
     /// A stub that records each request body, then answers `reply` with
     /// `status` after `delay`.
-    async fn spawn_delayed_stub(
+    pub(super) async fn spawn_delayed_stub(
         status: StatusCode,
         reply: Value,
         delay: std::time::Duration,
@@ -7292,6 +7574,7 @@ mod tests {
             return_logprob: false,
             model_id: UNKNOWN_MODEL_ID,
             headers: None,
+            rid: None,
         };
         let request = DropProbeRequest {
             text: "hello".to_string(),
@@ -7384,6 +7667,7 @@ mod tests {
                     return_logprob,
                     model_id: UNKNOWN_MODEL_ID,
                     headers: None,
+                    rid: None,
                 };
                 let mut outcome = PrefillOutcome::FromStatus;
                 let dispatch = router.execute_dual_dispatch_internal(
@@ -7393,6 +7677,7 @@ mod tests {
                     Arc::clone(&prefill),
                     Arc::clone(&decode),
                     guards,
+                    None,
                     &mut outcome,
                 );
                 tokio::pin!(dispatch);
@@ -7480,10 +7765,12 @@ mod tests {
                             return_logprob,
                             model_id: UNKNOWN_MODEL_ID,
                             headers: None,
+                            rid: None,
                         },
                         prefill,
                         decode,
                         guards,
+                        None,
                         &mut outcome,
                     )
                     .await;
@@ -7561,6 +7848,7 @@ mod tests {
                     return_logprob: false,
                     model_id: UNKNOWN_MODEL_ID,
                     headers: None,
+                    rid: None,
                 };
                 {
                     let mut outcome = PrefillOutcome::FromStatus;
@@ -7571,6 +7859,7 @@ mod tests {
                         Arc::clone(&prefill),
                         Arc::clone(&decode),
                         guards,
+                        None,
                         &mut outcome,
                     );
                     tokio::pin!(dispatch);

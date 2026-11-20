@@ -1,5 +1,5 @@
-//! A placement as the regular HTTP router holds it, to the end of its
-//! response's body.
+//! A placement as an HTTP router holds it, to the end of its response's
+//! body.
 
 use std::{
     ops::Deref,
@@ -33,13 +33,19 @@ fn answered(response: &Response) -> bool {
     marks.get::<UpstreamAnswer>().is_some() || marks.get::<BehindAnswer>().is_some()
 }
 
-/// A placement with what the regular HTTP router alone knows of its send:
+/// A placement with what an HTTP router alone knows of its send:
 /// the instant, and the mark its streamed answer's relay writes at a cut.
 /// The host's [`Placed`] keeps neither, so a route that needs none carries
 /// none.
 pub(crate) struct Sent {
     placed: Placed,
     at: Option<Instant>,
+    /// Whether [`Self::dispatched`] was said: the request's own dispatch, or
+    /// a pair's prefill's. A pair's prefill that was not sent is said no
+    /// end, and the placement's drop releases its side.
+    own_sent: bool,
+    /// The mark the drain of a pair's prefill writes its end's status on.
+    drained: Option<Arc<AtomicU16>>,
     cut: Option<Arc<AtomicU16>>,
 }
 
@@ -48,6 +54,8 @@ impl From<Placed> for Sent {
         Self {
             placed,
             at: None,
+            own_sent: false,
+            drained: None,
             cut: None,
         }
     }
@@ -65,7 +73,47 @@ impl Sent {
     /// The request was sent to the worker at `now`. Said once.
     pub(crate) fn dispatched(&mut self, now: Instant) {
         self.at = Some(now);
+        self.own_sent = true;
         self.placed.dispatched(now);
+    }
+
+    /// A pair's decode request was sent at `now`. Said once. Where the
+    /// prefill was not sent, the placement's time counts from here.
+    pub(crate) fn decode_dispatched(&mut self, now: Instant) {
+        if self.at.is_none() {
+            self.at = Some(now);
+        }
+        self.placed.decode_dispatched(now);
+    }
+
+    /// A pair's prefill answered `status` at `now`, ahead of the end of the
+    /// answer its decode writes. Said once, and of a prefill that was sent.
+    pub(crate) fn prefill_ended(&mut self, status: StatusCode, now: Instant) {
+        if let (true, Some(at)) = (self.own_sent, self.at) {
+            let class = transport_class(status, true);
+            self.placed
+                .completed(End::http(status, class, at, None, now), now);
+        }
+    }
+
+    /// The mark for the drain of this pair's prefill, which outlives the
+    /// attempt that sent it: the drain writes its end's status on it, and
+    /// the answer's body tells the prefill's end from it at its next frame.
+    pub(crate) fn drain_mark(&mut self) -> Arc<AtomicU16> {
+        Arc::clone(self.drained.get_or_insert_with(Arc::default))
+    }
+
+    /// Say the prefill's end where its drain marked one. Said once: the
+    /// mark is given up with it. The clock is read only for a marked end.
+    fn tell_drained(&mut self) {
+        let marked = self
+            .drained
+            .as_ref()
+            .map(|mark| mark.load(Ordering::Relaxed));
+        if let Some(Ok(status)) = marked.map(StatusCode::from_u16) {
+            self.drained = None;
+            self.prefill_ended(status, Instant::now());
+        }
     }
 
     /// The mark for the relay of this placement's streamed answer: the relay
@@ -93,7 +141,11 @@ impl Sent {
         self.ended(response.status(), answered(response), now);
     }
 
-    /// Say the placement's end where it was sent.
+    /// Say the placement's end where it was sent. A pair's answer is its
+    /// decode's: the decode ends with it, and so does a prefill whose router
+    /// said no end ahead of it ([`Self::prefill_ended`]). A drain that
+    /// marked its end ahead of the answer's tells its own. A prefill that
+    /// was not sent hears no end: the drop releases its side.
     fn end(
         mut self,
         status: StatusCode,
@@ -101,9 +153,13 @@ impl Sent {
         first: Option<Instant>,
         now: Instant,
     ) {
+        self.tell_drained();
         if let Some(at) = self.at {
-            self.placed
-                .completed(End::http(status, class, at, first, now), now);
+            let end = End::http(status, class, at, first, now);
+            if self.own_sent {
+                self.placed.completed(end, now);
+            }
+            self.placed.decode_completed(end, now);
         }
     }
 
@@ -188,6 +244,9 @@ impl http_body::Body for Ride {
                     this.first.get_or_insert_with(Instant::now);
                 }
                 if !this.progress.frame_out(frame, this.inner.is_end_stream()) {
+                    if let Some(sent) = &mut this.sent {
+                        sent.tell_drained();
+                    }
                     return next;
                 }
                 false

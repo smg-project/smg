@@ -29,6 +29,12 @@
 //! control plane reads the document in force through it and checks another
 //! against it ([`operators`]). Nothing is applied after the start.
 //!
+//! The HTTP pair router asks the host for each attempt's pair, through
+//! prefill admission. It is built where this gateway decides pairs in its
+//! own process, and the refusing router is mounted elsewhere
+//! ([`undecided_without()`]). The refusing router is also for the pair
+//! routers that do not ask the host yet.
+//!
 //! One site reads the setting, [`start_with`]. Every other site asks what
 //! the start left in the context.
 //!

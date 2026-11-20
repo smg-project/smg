@@ -722,10 +722,25 @@ impl Host {
 
     /// Takes the first sendable pair whose prefill has room. The admission
     /// lock can be held here, so every lookup happens in the ask.
-    #[expect(clippy::unused_self, reason = "the commit uses workers from the ask")]
     pub(crate) fn commit_pair(
         &self,
         asked: Asked,
+        room: Option<&PrefillSelectionContext<'_>>,
+        missed: &mut Vec<WorkerId>,
+        now: Instant,
+    ) -> Result<Placed, Unplaced> {
+        self.commit_pair_where(asked, |_| true, room, missed, now)
+    }
+
+    /// The pair's commit on a route with a rule of its own: as
+    /// [`Host::commit_pair`], and a target either of whose workers `holds`
+    /// refuses is passed over like one the gateway cannot send to. The
+    /// rule is the route's, as [`Host::commit_where`] says of a regular one.
+    #[expect(clippy::unused_self, reason = "the commit uses workers from the ask")]
+    pub(crate) fn commit_pair_where(
+        &self,
+        asked: Asked,
+        holds: impl Fn(&dyn Worker) -> bool,
         room: Option<&PrefillSelectionContext<'_>>,
         missed: &mut Vec<WorkerId>,
         now: Instant,
@@ -741,8 +756,11 @@ impl Host {
             let Some(pair) = target.pair else {
                 continue;
             };
-            let prefill = prefill.filter(|worker| routable_but_for_veto(worker.as_ref()));
-            let decode = decode.filter(|worker| routable_but_for_veto(worker.as_ref()));
+            let sendable = |worker: &Arc<dyn Worker>| {
+                routable_but_for_veto(worker.as_ref()) && holds(worker.as_ref())
+            };
+            let prefill = prefill.filter(sendable);
+            let decode = decode.filter(sendable);
             let (Some(worker), Some(decode)) = (&prefill, decode.as_ref()) else {
                 failed[index] = [
                     prefill.is_none().then_some(target.id),
@@ -788,6 +806,23 @@ impl Host {
         admission: Option<&PrefillAdmission>,
         routing_key: Option<&str>,
     ) -> Result<(Placed, PrefillLoadGuard), Unplaced> {
+        self.place_pair_where(ask, |_| true, admission, routing_key)
+            .await
+    }
+
+    /// Places a pair on a route with a rule of its own: as
+    /// [`Host::place_pair`], over [`Host::commit_pair_where`]. The pass
+    /// that reads which prefills are full and the probe of a request
+    /// behind a waiter count a worker the rule refuses as one the gateway
+    /// cannot send to.
+    pub(crate) async fn place_pair_where(
+        &self,
+        ask: &Ask<'_>,
+        holds: impl Fn(&dyn Worker) -> bool + Send + Sync,
+        admission: Option<&PrefillAdmission>,
+        routing_key: Option<&str>,
+    ) -> Result<(Placed, PrefillLoadGuard), Unplaced> {
+        let holds = &holds;
         let missed = Mutex::new(Vec::new());
         // The attempt's first ask, whichever half makes it: each wake's
         // decision starts from the attempt's list, which stays empty
@@ -797,9 +832,11 @@ impl Host {
             admission,
             routing_key,
             Placed::worker,
-            || self.probe_pair(ask, &missed, &first),
-            || self.decide_pair(ask, admission, missed.lock().clone(), &first),
-            |asked, room| self.commit_pair(asked, room, &mut missed.lock(), Instant::now()),
+            || self.probe_pair(ask, holds, &missed, &first),
+            || self.decide_pair(ask, holds, admission, missed.lock().clone(), &first),
+            |asked, room| {
+                self.commit_pair_where(asked, holds, room, &mut missed.lock(), Instant::now())
+            },
         )
         .await
         .map_err(|error| match error {
@@ -814,6 +851,7 @@ impl Host {
     async fn decide_pair(
         &self,
         ask: &Ask<'_>,
+        holds: &(impl Fn(&dyn Worker) -> bool + Sync),
         admission: Option<&PrefillAdmission>,
         mut missed: Vec<WorkerId>,
         first: &AtomicBool,
@@ -829,8 +867,10 @@ impl Host {
                 let (Some(prefill), Some(decode)) = (prefill, decode) else {
                     continue;
                 };
-                if routable_but_for_veto(prefill.as_ref()) && routable_but_for_veto(decode.as_ref())
-                {
+                let sendable = |worker: &Arc<dyn Worker>| {
+                    routable_but_for_veto(worker.as_ref()) && holds(worker.as_ref())
+                };
+                if sendable(prefill) && sendable(decode) {
                     if !admission.reads_full(prefill) {
                         return Ok(asked);
                     }
@@ -852,6 +892,7 @@ impl Host {
     async fn probe_pair(
         &self,
         ask: &Ask<'_>,
+        holds: &(impl Fn(&dyn Worker) -> bool + Sync),
         missed: &Mutex<Vec<WorkerId>>,
         first: &AtomicBool,
     ) -> Option<Unplaced> {
@@ -863,7 +904,7 @@ impl Host {
                 WorkerType::Decode => &mut decode,
                 WorkerType::Regular | WorkerType::Encode => continue,
             };
-            *found = *found || routable_but_for_veto(worker.as_ref());
+            *found = *found || (routable_but_for_veto(worker.as_ref()) && holds(worker.as_ref()));
             if prefill && decode {
                 return None;
             }
