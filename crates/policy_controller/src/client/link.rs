@@ -56,9 +56,10 @@ pub enum Unanswered {
     /// wait it names.
     Busy(Busy),
     /// No answer inside the budget. The link releases a decision that arrives
-    /// later.
+    /// later, and the ask's id stays taken until then.
     Late,
-    /// An ask under this id is in flight already. Nothing was sent.
+    /// An ask under this id is in flight already, or one that left has its
+    /// answer still due. Nothing was sent.
     InFlight,
     /// The link ended or the request queue closed. [`Link::ended`] tells
     /// the cause once the link has ended.
@@ -163,8 +164,11 @@ impl Link {
 
     /// Sends one ask if the stream holds credit and waits up to `budget`
     /// for its answer. A budget past the clock's range waits with no bound.
-    /// Use a distinct id for each request that may still have an answer on
-    /// the wire.
+    ///
+    /// An id stays taken until its ask's answer arrives, also where the
+    /// asker left or its budget ended. An ask under it in that time is
+    /// [`Unanswered::InFlight`], so no ask takes an answer made for an
+    /// earlier one.
     ///
     /// A request the controller's check refuses is refused here, by the
     /// same check, and nothing is sent: a frame out of its ranges ends the
@@ -277,16 +281,28 @@ struct Open {
 #[derive(Debug)]
 struct Waiting {
     deadline: Option<Instant>,
-    // The id stays in the table until its caller takes the answer or leaves.
+    // `None` once the asker took the answer, or left ahead of it.
     answer: Option<oneshot::Sender<Answer>>,
+    // Whether the answer arrived. The id stays in the table until it has
+    // and the asker left: an asker that leaves first keeps the id taken,
+    // so no later ask under it takes the answer still due.
+    answered: bool,
 }
 
 impl Waiting {
+    /// The asker's end for the answer that arrived, where the asker
+    /// still waits inside its budget.
     fn take(&mut self) -> Option<oneshot::Sender<Answer>> {
+        self.answered = true;
         if self.deadline.is_some_and(|at| Instant::now() >= at) {
             return None;
         }
         self.answer.take()
+    }
+
+    /// Whether the asker left ahead of its answer.
+    fn left(&self) -> bool {
+        !self.answered && self.answer.is_none()
     }
 }
 
@@ -421,6 +437,7 @@ impl Shared {
             Waiting {
                 deadline,
                 answer: Some(sender),
+                answered: false,
             },
         );
         // The cut of an ask is counted once the ask is queued.
@@ -510,11 +527,17 @@ impl Shared {
                 return;
             }
         };
-        let waiting = open.pending.get_mut(frame.request_id.as_slice());
+        let id = frame.request_id.as_slice();
+        let waiting = open.pending.get_mut(id);
+        // An asker that left ahead of this answer kept its id for it.
+        let left = waiting.as_ref().is_some_and(|waiting| waiting.left());
         let undelivered = match waiting.and_then(Waiting::take) {
             Some(sender) => sender.send(answer).err(),
             None => Some(answer),
         };
+        if left {
+            open.pending.remove(id);
+        }
         drop(state);
         if let Some(Answer::Decision(decision)) = undelivered {
             self.release(decision);
@@ -557,7 +580,15 @@ impl Drop for Pending<'_> {
     fn drop(&mut self) {
         self.answer.close();
         if let Some(open) = self.shared.state.lock().open.as_mut() {
-            open.pending.remove(self.id.as_ref());
+            match open.pending.get_mut(self.id.as_ref()) {
+                // The asker leaves ahead of its answer. The id stays taken
+                // until that answer arrives: an ask under it in between
+                // would take an answer made for this one.
+                Some(waiting) if !waiting.answered => waiting.answer = None,
+                _ => {
+                    open.pending.remove(self.id.as_ref());
+                }
+            }
         }
         // A send that won the race with close may still be in the channel.
         if let Ok(Answer::Decision(decision)) = self.answer.try_recv() {
@@ -946,7 +977,7 @@ pub(super) mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn the_budget_ends_the_wait_and_frees_the_id() {
+    async fn the_budget_ends_the_wait_and_the_id_stays_taken_until_its_answer() {
         let mut peer = Peer::new(3);
         peer.read_hello().await;
         let budget = Duration::from_secs(1);
@@ -959,16 +990,26 @@ pub(super) mod tests {
         advance(2 * step).await;
         assert!(matches!(within(first).await, Err(Unanswered::Late)));
 
-        let mut again = Box::pin(peer.link.ask(request(1), budget));
-        assert!(poll(again.as_mut()).is_pending());
-        assert_eq!(within(peer.requests.next()).await, Some(request(1)));
-        advance(budget).await;
+        // The first ask's answer is still due. A second ask under its id
+        // would take that answer for its own: it is refused, unsent.
+        assert!(matches!(
+            poll(Box::pin(peer.link.ask(request(1), budget)).as_mut()),
+            Poll::Ready(Err(Unanswered::InFlight))
+        ));
+        assert!(poll(Box::pin(peer.requests.next()).as_mut()).is_pending());
         peer.answer(1, 5, decision(7, &[Side::Single]));
         assert_eq!(
             within(peer.reports.next()).await.expect("a release").frame,
             Some(release(7, Side::Single, released::Reason::LateDecision))
         );
-        assert!(matches!(within(again).await, Err(Unanswered::Late)));
+        // The answer freed the id: the next ask under it goes out, and
+        // the answer it gets is its own.
+        let mut again = Box::pin(peer.link.ask(request(1), budget));
+        assert!(poll(again.as_mut()).is_pending());
+        assert_eq!(within(peer.requests.next()).await, Some(request(1)));
+        peer.answer(1, 5, decision(8, &[Side::Single]));
+        let again = within(again).await.expect("the second ask's own answer");
+        assert_eq!(again.leases[0].id, 8);
 
         assert!(matches!(
             poll(Box::pin(peer.link.ask(request(2), Duration::ZERO)).as_mut()),
@@ -1002,6 +1043,11 @@ pub(super) mod tests {
         assert!(poll(dropped.as_mut()).is_pending());
         drop(dropped);
         assert_eq!(within(peer.requests.next()).await, Some(request(2)));
+        // The dropped ask's answer is still due: its id stays taken.
+        assert!(matches!(
+            poll(Box::pin(peer.link.ask(request(2), WAIT)).as_mut()),
+            Poll::Ready(Err(Unanswered::InFlight))
+        ));
         peer.answer(2, 4, decision(8, &[Side::Single]));
 
         let mut closed = peer
