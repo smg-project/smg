@@ -96,6 +96,22 @@ impl ContextRequirements {
         }
     }
 
+    /// The demand of a request of `input_tokens`, with or without a scoring
+    /// position and a completion budget, for a recorder that prepares no
+    /// request.
+    #[cfg(test)]
+    pub(crate) fn of_demand(
+        input_tokens: usize,
+        scoring_position: bool,
+        output_tokens: Option<u32>,
+    ) -> Self {
+        Self {
+            input_tokens,
+            scoring_position,
+            output_tokens,
+        }
+    }
+
     /// Unknown windows remain eligible; no character estimate or token sum is used.
     /// Direct-ZMQ workers in the shared pipeline retain post-selection validation.
     /// A prefill worker is held to the input alone: in a disaggregated request
