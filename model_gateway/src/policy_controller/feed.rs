@@ -436,6 +436,20 @@ impl Membership for FeedDoor {
     fn gone(&self, by: Remover<'_>, url: &str, seen: Standing) -> Result<Wrote, Refused> {
         self.write(|door| door.gone(by, url, seen))
     }
+
+    fn refreshed(
+        &self,
+        seen: Standing,
+        built: &Arc<dyn Worker>,
+        over: &Arc<dyn Worker>,
+    ) -> Result<Wrote, Refused> {
+        self.write(|door| {
+            self.objects
+                .handing(self.store.as_ref(), built, Some(over), || {
+                    door.refreshed(seen, built, over)
+                })
+        })
+    }
 }
 
 #[cfg(test)]

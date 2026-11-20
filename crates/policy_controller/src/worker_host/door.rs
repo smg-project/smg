@@ -9,8 +9,8 @@ use super::{found::facts, kv_feed::asks_events, Standing};
 use crate::{
     store::{
         membership::{self, NotMaker, Past},
-        HealthSink, Laid, Maker, MembershipChange, MemoryStore, WorkerFacts, WorkerRow,
-        WorkerStatus, WorkersStore,
+        HealthSink, Laid, Maker, MembershipChange, MemoryStore, WorkerFacts, WorkerPatch,
+        WorkerRow, WorkerStatus, WorkersStore,
     },
     view::WorkerId,
 };
@@ -44,15 +44,20 @@ pub enum Refused {
     Moved,
     /// A row stands under the URL of a registration that expects none.
     Stands,
-    /// The row a replacement names is draining: its removal takes the
-    /// worker.
+    /// The row a replacement or a refresh names is draining: its removal
+    /// takes the worker.
     Draining,
-    /// The row's maker is outside the health removal scope.
+    /// Outside what the health loop writes: a removal of a row whose maker
+    /// is outside the health removal scope, or a refresh whose worker
+    /// states another fact than the labels.
     OutOfScope,
 }
 
 impl Refused {
     pub(crate) const OUT_OF_SCOPE: &str = "the row's maker is outside the health removal scope";
+    /// What [`Self::OutOfScope`] says of a refresh.
+    pub(crate) const NOT_LABELS_ALONE: &str =
+        "a refresh writes a row's labels and states no other fact";
 }
 
 /// Who asks to drain or remove a row.
@@ -129,6 +134,38 @@ pub trait Membership: Send + Sync + 'static {
 
     /// Remove the row the asker saw under the registered URL.
     fn gone(&self, by: Remover<'_>, url: &str, seen: Standing) -> Result<Wrote, Refused>;
+
+    /// Write the labels of the worker the health loop's refresh rebuilt,
+    /// over the row the asker saw under the worker's URL. The labels are
+    /// the engine's word and nobody's registration: no maker is asked, a
+    /// control call's row and a provider's are served alike, and the row
+    /// keeps the maker it has.
+    ///
+    /// The facts `built` states over the standing row ([`facts`]) may
+    /// differ from the row's in the labels alone. Any other difference is
+    /// refused ([`Refused::OutOfScope`]), so a refresh starts no life. No
+    /// row, another row or revision, and a draining row refuse it too. The
+    /// labels' room is tested as a registration's is. Equal labels write
+    /// nothing and answer [`Wrote::Unmoved`].
+    ///
+    /// Each door says what it does with the object, as for
+    /// [`Self::found_built`]. A door whose host keeps built objects hands
+    /// `built` to the holder in the write's turn, whether or not a label
+    /// moved: a refresh can rebuild what no row states. A door over a door
+    /// passes the call on. Any other door writes the labels alone.
+    ///
+    /// `over` is the object the refresh rebuilt from. Equal labels move no
+    /// revision, so the row's guard cannot tell an older rebuild from a
+    /// newer one: a door that hands `built` in refuses the refresh as moved
+    /// where another object stands for the row by then, or none. It asks
+    /// ahead of the row's guard, so a worker that left reads as moved
+    /// there. A door that keeps no object has nothing to hold it against.
+    fn refreshed(
+        &self,
+        seen: Standing,
+        built: &Arc<dyn Worker>,
+        over: &Arc<dyn Worker>,
+    ) -> Result<Wrote, Refused>;
 }
 
 /// What a door owns of a write, beside the rules every door shares.
@@ -305,6 +342,40 @@ pub(crate) fn take(
     changed(store.remove(row.id, row.revision), Wrote::Removed)
 }
 
+/// Write the labels a refresh's rebuilt worker states over the guarded row
+/// while the door holds its turn. The row's other facts are the test of
+/// the refresh's scope and are not written: the door states a row's event
+/// signal at its registration, and a refresh leaves it as it stands.
+pub(crate) fn refresh(
+    turn: &impl Turn,
+    seen: Standing,
+    built: &dyn Worker,
+) -> Result<Wrote, Refused> {
+    let store = turn.store();
+    let row = seen_row(store, built.url(), seen)?;
+    // A draining row is leaving: its removal wins over a refresh, as over
+    // a replacement.
+    if row.status == WorkerStatus::Draining {
+        return Err(Refused::Draining);
+    }
+    let mut stated = facts(built, Some(&row.facts));
+    let labels = std::mem::replace(&mut stated.labels, row.facts.labels.clone());
+    if stated != row.facts {
+        return Err(Refused::OutOfScope);
+    }
+    if labels == row.facts.labels {
+        return Ok(Wrote::Unmoved(row.id));
+    }
+    stated.labels = labels;
+    stated.bounded(&row.maker).map_err(Refused::Past)?;
+    turn.room(&stated, &row.maker)?;
+    let patch = WorkerPatch {
+        labels: Some(stated.labels),
+        ..WorkerPatch::default()
+    };
+    changed(store.patch(row.id, patch, row.revision), Wrote::InPlace)
+}
+
 /// The membership door over a store alone, for a host with no election or
 /// log. A host shares one door for its store so its writes share a turn.
 pub struct StoreDoor {
@@ -394,6 +465,16 @@ impl Membership for StoreDoor {
     fn gone(&self, by: Remover<'_>, url: &str, seen: Standing) -> Result<Wrote, Refused> {
         self.call(|| take(&self.store, by, url, seen))
     }
+
+    // This door has no holder. The row takes the labels alone.
+    fn refreshed(
+        &self,
+        seen: Standing,
+        built: &Arc<dyn Worker>,
+        _: &Arc<dyn Worker>,
+    ) -> Result<Wrote, Refused> {
+        self.call(|| refresh(self, seen, built.as_ref()))
+    }
 }
 
 #[cfg(test)]
@@ -407,7 +488,12 @@ pub(super) mod tests {
         time::{Duration, Instant},
     };
 
-    use smg_worker::settings::UnhealthyRemovalScope;
+    use smg_worker::{
+        identity::{basic::Worker, builder::BasicWorkerBuilder},
+        model_card::ModelCard,
+        settings::UnhealthyRemovalScope,
+        worker::{HealthCheckConfig, WorkerType},
+    };
 
     use super::{
         changed, lay, Expect, Membership, Refused, Remover, Standing, StoreDoor, Turn, Wrote,
@@ -793,6 +879,92 @@ pub(super) mod tests {
                 ..row
             })
         );
+        Ok(())
+    }
+
+    /// A worker a registration or a refresh built at [`URL`], under one
+    /// label.
+    fn built(tier: &str) -> BasicWorkerBuilder {
+        <BasicWorkerBuilder>::new(URL)
+            .model(ModelCard::new("m"))
+            .label("tier", tier)
+    }
+
+    #[test]
+    fn a_refresh_writes_its_workers_labels_and_no_other_fact() {
+        check_refresh(local_door).expect("the makers and their rows");
+    }
+
+    /// A refresh writes the labels its rebuilt worker states over the row
+    /// its asker saw, whoever made the row. The row keeps its maker and
+    /// every other fact, and equal labels write no revision. A worker that
+    /// states another fact is out of scope, a label past its bound is
+    /// refused, and a row that moved, drains or left takes no refresh. A
+    /// refused refresh writes nothing.
+    pub(crate) fn check_refresh(
+        open: impl Fn() -> (Arc<MemoryStore>, Box<dyn Membership>),
+    ) -> Result<(), &'static str> {
+        let provider = Maker::provider("pool", "private/key").map_err(|_| "the source's maker")?;
+        let worker = |built: BasicWorkerBuilder| -> Arc<dyn Worker> { Arc::new(built.build()) };
+        for maker in [&Maker::Control, &provider] {
+            let (store, door) = open();
+            let first = worker(built("gold"));
+            assert!(door
+                .found_built(maker, Expect::Nothing, &first, None)
+                .is_ok());
+            let row = store.by_key(URL).ok_or("the registered row")?;
+            let seen = standing(&row);
+
+            let equal = door.refreshed(seen, &worker(built("gold")), &first);
+            assert_eq!(equal, Ok(Wrote::Unmoved(row.id)));
+
+            // Each states one fact more than a label: a model, a role, a
+            // health threshold.
+            let checks = HealthCheckConfig {
+                failure_threshold: 9,
+                ..HealthCheckConfig::default()
+            };
+            let strays = [
+                built("silver").model(ModelCard::new("other")),
+                built("silver").worker_type(WorkerType::Prefill),
+                built("silver").health_config(checks),
+            ];
+            for stray in strays {
+                let refused = door.refreshed(seen, &worker(stray), &first);
+                assert_eq!(refused, Err(Refused::OutOfScope));
+            }
+            let wide = "x".repeat(WorkerFacts::LABEL_VALUE_BYTES + 1);
+            let refused = door.refreshed(seen, &worker(built(&wide)), &first);
+            assert!(
+                matches!(refused, Err(Refused::Past(Past { fact: "labels", .. }))),
+                "{refused:?}"
+            );
+            assert_eq!(store.by_key(URL).as_ref(), Some(&row));
+
+            let wrote = door.refreshed(seen, &worker(built("silver")), &first);
+            assert_eq!(wrote, Ok(Wrote::InPlace(row.id)));
+            let moved = store.by_key(URL).ok_or("the refreshed row")?;
+            let mut facts = row.facts.clone();
+            facts.labels.insert("tier".to_owned(), "silver".to_owned());
+            assert_eq!(
+                moved,
+                WorkerRow {
+                    facts,
+                    revision: row.revision + 1,
+                    ..row
+                }
+            );
+
+            // The asker's row moved under it, then drains, then is gone.
+            let late = worker(built("bronze"));
+            assert_eq!(door.refreshed(seen, &late, &first), Err(Refused::Moved));
+            let seen = standing(&moved);
+            let by = Remover::Maker(maker);
+            assert_eq!(door.drained(by, URL, seen), Ok(Wrote::Draining(moved.id)));
+            assert_eq!(door.refreshed(seen, &late, &first), Err(Refused::Draining));
+            assert_eq!(door.gone(by, URL, seen), Ok(Wrote::Removed(moved.id)));
+            assert_eq!(door.refreshed(seen, &late, &first), Err(Refused::Absent));
+        }
         Ok(())
     }
 

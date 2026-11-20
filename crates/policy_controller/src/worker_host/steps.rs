@@ -1243,6 +1243,15 @@ mod tests {
         fn gone(&self, _: Remover<'_>, _: &str, _: Standing) -> Result<Wrote, Refused> {
             Err(self.0.clone())
         }
+
+        fn refreshed(
+            &self,
+            _: Standing,
+            _: &Arc<dyn Worker>,
+            _: &Arc<dyn Worker>,
+        ) -> Result<Wrote, Refused> {
+            Err(self.0.clone())
+        }
     }
 
     #[tokio::test]
@@ -1444,6 +1453,15 @@ mod tests {
         }
 
         fn gone(&self, _: Remover<'_>, _: &str, _: Standing) -> Result<Wrote, Refused> {
+            Err(Refused::Moved)
+        }
+
+        fn refreshed(
+            &self,
+            _: Standing,
+            _: &Arc<dyn Worker>,
+            _: &Arc<dyn Worker>,
+        ) -> Result<Wrote, Refused> {
             Err(Refused::Moved)
         }
     }
