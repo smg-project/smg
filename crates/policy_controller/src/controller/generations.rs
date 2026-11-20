@@ -306,7 +306,9 @@ impl Generations {
     /// stands after it. A document over the bound takes no turn: it is
     /// refused by its size, unread, and waits on no pass. A guard longer
     /// than a digest's text takes none either: it names no digest, the
-    /// guard refuses it at once, and no wait holds it.
+    /// guard refuses it at once, and no turn's wait holds it. Each of the
+    /// two still reads on one side of a store's bind, as every dry run
+    /// does: a bind in flight at a start holds it until the store is bound.
     pub(crate) async fn dry_run_in_turn(
         self: &Arc<Self>,
         expected: String,
