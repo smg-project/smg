@@ -7278,3 +7278,7 @@ mod upstream_span_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[expect(clippy::print_stdout, reason = "a recorder says where its sheet went")]
+mod classic_rank_rows;

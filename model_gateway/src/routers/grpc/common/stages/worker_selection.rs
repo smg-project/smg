@@ -7702,3 +7702,7 @@ mod tests {
 #[cfg(test)]
 #[expect(clippy::print_stdout, reason = "a recorder says where its sheet went")]
 mod classic_encode_pair_rows;
+
+#[cfg(test)]
+#[expect(clippy::print_stdout, reason = "a recorder says where its sheets went")]
+mod classic_hard_demand_rows;

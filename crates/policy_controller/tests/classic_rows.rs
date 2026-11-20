@@ -122,10 +122,32 @@ struct OwedSheet {
 
 /// The owed sheets: each was recorded before the change that replays it
 /// landed here.
-const OWED_SHEETS: &[OwedSheet] = &[OwedSheet {
-    policy: "pair-select",
-    by: "the placement of a prefill and decode pair",
-}];
+const OWED_SHEETS: &[OwedSheet] = &[
+    OwedSheet {
+        policy: "pair-select",
+        by: "the placement of a prefill and decode pair",
+    },
+    OwedSheet {
+        policy: "retry-wire",
+        by: "a request's hard demands: the wire a retry stays on",
+    },
+    OwedSheet {
+        policy: "media-refs",
+        by: "a request's hard demands: media by reference under its pipeline pin",
+    },
+    OwedSheet {
+        policy: "context-window",
+        by: "a request's hard demands: the context window's two bounds",
+    },
+    OwedSheet {
+        policy: "constraint-decider",
+        by: "a request's hard demands: the constraint's decider on a retry",
+    },
+    OwedSheet {
+        policy: "rank-pin",
+        by: "a request's hard demands: no worker that registered a rank where none is pinned",
+    },
+];
 
 /// The owed sheet of a policy, when one is owed.
 fn owed_sheet(policy: &str) -> Option<&'static OwedSheet> {
