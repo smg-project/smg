@@ -2341,7 +2341,9 @@ impl PDRouter {
                 // a MoRI-IO decode takes the checked MoRI-IO path alone:
                 // the second commit passes one over.
                 let on_route = on_pair_route(ledger);
-                let rule = |worker: &dyn Worker| on_route(worker) && !is_moriio_worker(worker);
+                let rule = |worker: &Arc<dyn Worker>| {
+                    on_route(worker.as_ref()) && !is_moriio_worker(worker.as_ref())
+                };
                 if let Some(moved) = placed.decode_again(again.host, &ask, rule, Instant::now()) {
                     decode = Arc::clone(moved);
                     decode_guard = WorkerLoadGuard::with_key(Arc::clone(moved), again.sticky_key);

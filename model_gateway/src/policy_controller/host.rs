@@ -884,6 +884,7 @@ impl Host {
                 id: target.id,
                 rank: target.dp_rank,
                 pair: Some(Box::new(PlacedPair {
+                    kept: None,
                     decode: Arc::clone(decode),
                     side: pair,
                     targets,
@@ -1134,10 +1135,90 @@ pub(crate) struct Placed {
     handle: Handle<Arc<Door>>,
 }
 
+/// A route's rule for a decode its second commit may take, as a kept ask
+/// holds it.
+type DecodeRule = dyn Fn(&dyn Worker) -> bool + Send + Sync;
+
+/// What a route keeps of a pair's first ask for the second ask of its
+/// decode ([`Placed::keep_ask`]), where the two are stages apart and the
+/// first ask's borrows end between them: the host that decides, the ask's
+/// facts, owned, and the route's own rule at the second commit.
+pub(crate) struct KeptAsk {
+    host: Arc<Host>,
+    id: Box<[u8]>,
+    model: Box<str>,
+    streaming: bool,
+    headers: Option<HeaderMap>,
+    rid: Option<Box<str>>,
+    prompt_tokens: u32,
+    media: MediaCounts,
+    wires: WireModes,
+    tried: Box<[WorkerId]>,
+    attempt: Option<u8>,
+    hashes: Option<Hashes>,
+    holds: Box<DecodeRule>,
+}
+
+impl KeptAsk {
+    /// The facts of `ask`, owned, for a second ask by `host`, with no
+    /// hashes: the ask borrows the attempt's, and they move in behind its
+    /// last use ([`Self::with_hashes`]). `holds` is the route's rule for a
+    /// decode the second commit may take.
+    pub(crate) fn of(
+        host: &Arc<Host>,
+        ask: &Ask<'_>,
+        holds: impl Fn(&dyn Worker) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            host: Arc::clone(host),
+            id: ask.id.into(),
+            model: ask.model.into(),
+            streaming: ask.streaming,
+            headers: ask.headers.cloned(),
+            rid: ask.rid.map(Into::into),
+            prompt_tokens: ask.prompt_tokens,
+            media: ask.media,
+            wires: ask.wires,
+            tried: ask.tried.into(),
+            attempt: ask.attempt,
+            hashes: None,
+            holds: Box::new(holds),
+        }
+    }
+
+    /// The attempt's `hashes`, moved in: no ask reads them between the two
+    /// decisions.
+    pub(crate) fn with_hashes(mut self, hashes: Hashes) -> Self {
+        self.hashes = Some(hashes);
+        self
+    }
+
+    /// The pair's ask again, as its first ask stated it.
+    fn ask(&self) -> Ask<'_> {
+        Ask {
+            id: &self.id,
+            model: &self.model,
+            streaming: self.streaming,
+            headers: self.headers.as_ref(),
+            rid: self.rid.as_deref(),
+            phase: Phase::Prefill,
+            decode_again: true,
+            prompt_tokens: self.prompt_tokens,
+            media: self.media,
+            wires: self.wires,
+            tried: &self.tried,
+            attempt: self.attempt,
+            hashes: self.hashes.as_ref(),
+        }
+    }
+}
+
 /// What a placed pair holds beside its prefill: the decode worker with the
 /// decode side of the target taken, and the pick's targets with that
 /// target's index, for the next decode of the same prefill.
 struct PlacedPair {
+    /// The first ask as its route kept it for the second ask of the decode.
+    kept: Option<Box<KeptAsk>>,
     decode: Arc<dyn Worker>,
     side: Pair,
     targets: Targets,
@@ -1260,6 +1341,45 @@ impl Placed {
         self.handle.decode_chosen()
     }
 
+    /// Keeps `kept` for the second ask of the pair's decode
+    /// ([`Self::decode_again_kept`]): for a route whose second ask is stages
+    /// behind its first. A placement whose decode does not wait keeps
+    /// nothing.
+    pub(crate) fn keep_ask(&mut self, kept: KeptAsk) {
+        let waits = self.decode_waits();
+        if let Some(pair) = self.pair.as_deref_mut().filter(|_| waits) {
+            pair.kept = Some(Box::new(kept));
+        }
+    }
+
+    /// The pair keeps the decode its first decision named, and says that
+    /// decode's dispatch at `now`: a decode that stood chosen is booked
+    /// there. The ask kept for a second one is let go, and
+    /// [`Self::decode_again_kept`] asks nothing. For a route that knows the
+    /// decode cannot move, at its commit or behind it: a decode nobody asks
+    /// again gains nothing by standing unbooked while its prefill runs.
+    pub(crate) fn keep_first_decode(&mut self, now: Instant) {
+        if let Some(pair) = self.pair.as_deref_mut() {
+            pair.kept = None;
+        }
+        self.decode_dispatched(now);
+    }
+
+    /// [`Self::decode_again`] with the ask and the rule the route kept
+    /// ([`Self::keep_ask`]), and with `holds` beside that rule: what the
+    /// route knows at the call alone. The kept ask is spent. A placement
+    /// that kept none asks nothing.
+    pub(crate) fn decode_again_kept(
+        &mut self,
+        holds: impl Fn(&Arc<dyn Worker>) -> bool,
+        now: Instant,
+    ) -> Option<&Arc<dyn Worker>> {
+        let kept = self.pair.as_deref_mut()?.kept.take()?;
+        let ask = kept.ask();
+        let rule = |worker: &Arc<dyn Worker>| (kept.holds)(worker.as_ref()) && holds(worker);
+        self.decode_again(&kept.host, &ask, rule, now)
+    }
+
     /// Asks the pair's decode again at `now`, on the rows of that instant:
     /// behind the prefill's answer, and ahead of the prefill's end. `ask`
     /// states the request as its first ask did. A pick moves the placement
@@ -1267,6 +1387,11 @@ impl Placed {
     /// admits: the route's rule, as at the first commit. Returns the decode
     /// the call moved the placement to, and `None` where the placement
     /// keeps the decode it named.
+    ///
+    /// `holds` is asked of one decode at a time, best first, and of none
+    /// behind the one the placement takes. So a rule may take hold of what
+    /// the route needs on the worker it admits, as a claim at its gate, and
+    /// give it up when it is asked of the next.
     ///
     /// The call never fails its request. A decode that does not stand
     /// chosen takes no call. A call the door sheds or refuses leaves the
@@ -1277,7 +1402,7 @@ impl Placed {
         &mut self,
         host: &Host,
         ask: &Ask<'_>,
-        holds: impl Fn(&dyn Worker) -> bool,
+        holds: impl Fn(&Arc<dyn Worker>) -> bool,
         now: Instant,
     ) -> Option<&Arc<dyn Worker>> {
         let placed = self.pair.as_deref_mut()?;
@@ -1311,9 +1436,8 @@ impl Placed {
             let Some(pair) = target.pair.filter(|_| target.id == self.id) else {
                 continue;
             };
-            let sendable = |worker: &Arc<dyn Worker>| {
-                routable_but_for_veto(worker.as_ref()) && holds(worker.as_ref())
-            };
+            let sendable =
+                |worker: &Arc<dyn Worker>| routable_but_for_veto(worker.as_ref()) && holds(worker);
             let Some(worker) = host.worker(pair.decode_id).filter(sendable) else {
                 continue;
             };
@@ -1351,7 +1475,6 @@ pub(crate) struct Held {
     placed: Placed,
     /// The load of the worker the response is read from, given back at the
     /// drop.
-    #[expect(dead_code, reason = "held for its drop alone")]
     guard: WorkerLoadGuard,
 }
 
@@ -1375,6 +1498,20 @@ impl Held {
     /// The placement, for the reports its router says.
     pub(crate) fn placed(&mut self) -> &mut Placed {
         &mut self.placed
+    }
+
+    /// [`Placed::decode_again_kept`] for the held placement. A decode the
+    /// pair moves to takes the load guard with it, under the first guard's
+    /// key: the response is read from that worker now, and the first one's
+    /// load is given back.
+    pub(crate) fn decode_again(
+        &mut self,
+        holds: impl Fn(&Arc<dyn Worker>) -> bool,
+        now: Instant,
+    ) -> Option<Arc<dyn Worker>> {
+        let moved = self.placed.decode_again_kept(holds, now).cloned()?;
+        self.guard = self.guard.onto(Arc::clone(&moved));
+        Some(moved)
     }
 }
 

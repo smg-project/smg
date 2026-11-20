@@ -9,10 +9,10 @@ use openai_protocol::{model_card::ModelCard, worker::WorkerStatus, UNKNOWN_MODEL
 use smg_policy_controller::{
     spec::DecodePick,
     store::{
-        Ask as StoreAsk, BatchFacts, BatchOutcome, KvEvent, KvEventSink, MemoryStore, PairBuffers,
-        Signals, WorkerFacts, WorkerStatus as RowStatus, WorkersStore,
+        Ask as StoreAsk, BatchFacts, BatchOutcome, KvEvent, KvEventSink, LoadSink, LoadSource,
+        MemoryStore, PairBuffers, Signals, WorkerFacts, WorkerStatus as RowStatus, WorkersStore,
     },
-    view::{Role, WorkerId},
+    view::{LoadRow, Role, WorkerId},
     AppliedSpec, LeaseId, PolicySpec, WireModes,
 };
 use smg_worker::identity::basic::{Worker, WorkerType};
@@ -205,13 +205,44 @@ pub(crate) fn pair_bed(prefills: &[&str], decodes: &[&str]) -> Bed {
 /// [`pair_bed`] under a document that says when a pair's decode is picked
 /// (`plans.pd-pair.decode`).
 pub(crate) fn pair_bed_picking(decode: DecodePick, prefills: &[&str], decodes: &[&str]) -> Bed {
+    pair_bed_shaped(decode, |_, worker| worker, prefills, decodes)
+}
+
+/// [`pair_bed_picking`] with each registry worker as `shaped` leaves it, by
+/// its URL. The rows are written the same for every shape.
+pub(crate) fn pair_bed_shaped(
+    decode: DecodePick,
+    shaped: impl Fn(&str, BasicWorkerBuilder) -> BasicWorkerBuilder,
+    prefills: &[&str],
+    decodes: &[&str],
+) -> Bed {
     let store = Arc::new(MemoryStore::new());
     let mut document =
         PolicySpec::pair_presets("least_load", "least_load").expect("the pair presets");
     document.plans.pd_pair.decode = decode;
     let applied = AppliedSpec::validate(&document).expect("the presets validate");
     store.apply(applied).expect("the store takes the presets");
-    pair_rows(store, MODEL, prefills, decodes)
+    pair_rows_shaped(store, MODEL, shaped, prefills, decodes)
+}
+
+/// The engines report the worker at `busy` deep in its queue and the one at
+/// `idle` empty, and the store publishes the two loads. The publication's
+/// instant comes back: a decision at it reads them.
+pub(crate) fn report_loads(store: &MemoryStore, busy: &str, idle: &str) -> Instant {
+    let at = Instant::now();
+    for (url, queued) in [(busy, 80), (idle, 0)] {
+        let row = store.by_key(url).expect("the worker's row");
+        let load = LoadRow {
+            queued,
+            live_rate: 2_000,
+            ..LoadRow::default()
+        };
+        store.record(row.id, 0, load, at, LoadSource::Stream);
+    }
+    // A publication shows what waits once it is due.
+    let published = store.publish_due().map_or(at, |due| due.max(at));
+    store.publish(published);
+    published
 }
 
 /// The requests the store counts in flight on `row`, a row of [`MODEL`]'s
@@ -277,6 +308,18 @@ fn wire_of(url: &str) -> WireModes {
 /// serving `model`, a registry with one worker a row, and the host over the
 /// two.
 fn pair_rows(store: Arc<MemoryStore>, model: &str, prefills: &[&str], decodes: &[&str]) -> Bed {
+    pair_rows_shaped(store, model, |_, worker| worker, prefills, decodes)
+}
+
+/// [`pair_rows`] with each registry worker as `shaped` leaves it, by its
+/// URL.
+fn pair_rows_shaped(
+    store: Arc<MemoryStore>,
+    model: &str,
+    shaped: impl Fn(&str, BasicWorkerBuilder) -> BasicWorkerBuilder,
+    prefills: &[&str],
+    decodes: &[&str],
+) -> Bed {
     let registry = Arc::new(WorkerRegistry::new());
     let mut workers = Vec::new();
     let sides = [
@@ -304,13 +347,11 @@ fn pair_rows(store: Arc<MemoryStore>, model: &str, prefills: &[&str], decodes: &
                     .set_status(id, RowStatus::Ready, row.revision)
                     .expect("the row stands");
             }
-            let worker: Arc<dyn Worker> = Arc::new(
-                BasicWorkerBuilder::new(url)
-                    .model(ModelCard::new(model))
-                    .worker_type(worker_type)
-                    .status(WorkerStatus::Ready)
-                    .build(),
-            );
+            let builder = BasicWorkerBuilder::new(url)
+                .model(ModelCard::new(model))
+                .worker_type(worker_type)
+                .status(WorkerStatus::Ready);
+            let worker: Arc<dyn Worker> = Arc::new(shaped(url, builder).build());
             registry
                 .register(Arc::clone(&worker))
                 .expect("the worker registers");

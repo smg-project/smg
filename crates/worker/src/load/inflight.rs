@@ -152,6 +152,13 @@ impl WorkerLoadGuard {
         }
     }
 
+    /// A load guard on `worker` under this guard's routing key: for a
+    /// request that moves to another worker behind its guard. It raises
+    /// `worker`'s load. This guard stands until it is dropped.
+    pub fn onto(&self, worker: Arc<dyn Worker>) -> Self {
+        Self::with_owned_key(worker, self.routing_key.clone())
+    }
+
     fn from_acquired_load(worker: Arc<dyn Worker>, routing_key: Option<String>) -> Self {
         if let Some(ref key) = routing_key {
             worker.increment_routing_key_load(key);
