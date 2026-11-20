@@ -401,6 +401,10 @@ name = "encode_pair"
 harness = false
 
 [[bench]]
+name = "decode_later"
+harness = false
+
+[[bench]]
 name = "contention"
 harness = false
 

@@ -103,8 +103,7 @@ impl Targets {
     /// names `prefill` with the decode it held, in the order they had.
     /// Nothing is stated of a pair's first target ([`Pick::overlap`]). The
     /// entries past the count are not rewritten, as [`Self::clear`] leaves
-    /// them. No accessor goes past the count; the derived equality and
-    /// `Debug` read the whole array.
+    /// them. No accessor goes past the count.
     pub(crate) fn pair_under(&mut self, prefill: &Target) {
         for target in &mut self.items[..usize::from(self.len)] {
             *target = Target {
