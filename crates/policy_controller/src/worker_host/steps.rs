@@ -124,8 +124,14 @@ pub fn registration_at_door<H: WorkflowHost>(
 /// Build a removal that selects workers, marks their rows draining, waits
 /// for them to settle and removes their rows. The holder drops the objects
 /// when it follows the store. The drain marks the row: routing reads the
-/// row's status, and the holder mirrors it onto the held object where it
-/// follows the store.
+/// row's status, and a holder built with [`Objects::with_status_followed`]
+/// mirrors it onto the held object.
+///
+/// A step drops from the job's lists a worker it leaves standing, as the
+/// registry's steps do: a host step behind reads the workers the removal
+/// took or found gone, and an object no row stands for. Where the door
+/// refuses the asker and the job drained nothing, the drain step fails with
+/// the door's sentence.
 pub fn removal_at_door<H: WorkflowHost>(
     door: Arc<dyn Membership>,
     objects: Arc<Objects<H::Generation>>,
@@ -183,6 +189,10 @@ fn registration_refusal(url: &str, refusal: Refused) -> WorkflowError {
         Refused::NotLeading(_) => NOT_LEADING.to_owned(),
         Refused::Moved => MOVED.to_owned(),
         Refused::Stands => format!("Worker {} already exists", Endpoint::redacted_str(url)),
+        Refused::Draining => format!(
+            "Worker {} is draining, so the replacement was dropped",
+            Endpoint::redacted_str(url)
+        ),
         Refused::OutOfScope => Refused::OUT_OF_SCOPE.to_owned(),
     };
     failed(WRITE_WORKERS_AT_DOOR_STEP, message)
@@ -293,32 +303,70 @@ impl<H: WorkflowHost> StepExecutor<WorkerRegistrationWorkflowData<H>>
     }
 }
 
+/// What the registry holds for a removal's worker at a step's second read.
+enum Held {
+    /// The object under the id.
+    Is(Arc<dyn Worker>),
+    /// No live object under the id or the URL: the worker left, or a
+    /// replacement is still being laid.
+    Gone,
+    /// No object under the id and another under the URL: the worker was
+    /// registered anew between the two reads.
+    Anew,
+}
+
+fn held<G: Generation>(registry: &WorkerRegistry<G>, id: &ObjectId, url: &str) -> Held {
+    match registry.get(id) {
+        Some(worker) => Held::Is(worker),
+        None if registry.get_id_by_url(url).is_some() => Held::Anew,
+        None => Held::Gone,
+    }
+}
+
 fn skipped(url: &str, why: &str) {
     debug!(worker_url = %Endpoint::redacted_str(url), why, "Worker left alone");
 }
 
-fn removal_answer(
-    step: &str,
-    url: &str,
-    answer: Result<Wrote, Refused>,
-) -> WorkflowResult<Option<Wrote>> {
-    match answer {
-        Ok(wrote) => return Ok(Some(wrote)),
+/// What a removal write left of a worker.
+#[derive(Debug, PartialEq, Eq)]
+enum Left {
+    /// The door wrote.
+    Wrote(Wrote),
+    /// No row stands under the URL: the worker is gone and stays the job's.
+    Gone,
+    /// The row moved under the asker: another registration stands there,
+    /// and the job leaves it.
+    Standing,
+    /// The door refused the asker, with its sentence: the worker stays.
+    Refused(String),
+}
+
+fn removal_answer(step: &str, url: &str, answer: Result<Wrote, Refused>) -> WorkflowResult<Left> {
+    let refused = |why: String| {
+        warn!(worker_url = %Endpoint::redacted_str(url), why, "Worker left alone");
+        Left::Refused(why)
+    };
+    Ok(match answer {
+        Ok(wrote) => Left::Wrote(wrote),
+        Err(Refused::Moved) => {
+            skipped(url, MOVED);
+            Left::Standing
+        }
+        Err(Refused::Absent) => {
+            skipped(url, ABSENT);
+            Left::Gone
+        }
+        Err(Refused::NotMaker(why)) => refused(why),
+        Err(Refused::OutOfScope) => refused(Refused::OUT_OF_SCOPE.to_owned()),
         Err(Refused::NotLeading(_)) => return Err(failed(step, NOT_LEADING)),
-        Err(Refused::Moved) => skipped(url, MOVED),
-        Err(Refused::Absent) => skipped(url, ABSENT),
-        Err(Refused::NotMaker(why)) => {
-            warn!(worker_url = %Endpoint::redacted_str(url), why, "Worker left alone");
-        }
-        Err(Refused::OutOfScope) => {
-            warn!(worker_url = %Endpoint::redacted_str(url), why = Refused::OUT_OF_SCOPE, "Worker left alone");
-        }
         Err(Refused::Stands) => return Err(failed(step, "the door answered a removal as an add")),
+        Err(Refused::Draining) => {
+            return Err(failed(step, "the door answered a removal as a replacement"))
+        }
         Err(Refused::Past(past)) => {
             return Err(failed(step, format!("{}: {}", past.fact, past.why)))
         }
-    }
-    Ok(None)
+    })
 }
 
 #[async_trait]
@@ -338,13 +386,23 @@ impl<H: WorkflowHost> StepExecutor<WorkerRemovalWorkflowData<H>>
         let pins = data.config.expected_revisions.as_ref();
         let by = remover_of(&data.asker, self.scope);
         data.drained_workers.clear();
+        let mut kept = Vec::with_capacity(workers.len());
+        let mut refusal = None;
         for worker in workers {
             let url = worker.url();
-            let pinned = pin(registry, pins, url);
-            let (id, revision) = match pinned {
+            let (id, revision) = match pin(registry, pins, url) {
                 Pin::Held { id, revision } => (id, revision),
+                // A worker gone altogether stays the job's, as the
+                // registry's drain keeps it. One registered anew between
+                // the pin's own two reads stands under the URL again, and
+                // leaves the job.
                 Pin::Absent => {
+                    if registry.get_id_by_url(url).is_some() {
+                        skipped(url, "the worker moved after selection");
+                        continue;
+                    }
                     skipped(url, "no worker stands in the registry");
+                    kept.push(Arc::clone(worker));
                     continue;
                 }
                 Pin::LeftAlone => {
@@ -352,15 +410,25 @@ impl<H: WorkflowHost> StepExecutor<WorkerRemovalWorkflowData<H>>
                     continue;
                 }
             };
-            let Some(current) = registry
-                .get(&id)
-                .filter(|current| current.revision() == revision)
-            else {
-                skipped(url, "the worker moved after selection");
-                continue;
+            let current = match held(registry, &id, url) {
+                Held::Is(current) if current.revision() == revision => current,
+                // Gone between the two reads: the job's, as a worker gone
+                // ahead of them.
+                Held::Gone => {
+                    skipped(url, "no worker stands in the registry");
+                    kept.push(Arc::clone(worker));
+                    continue;
+                }
+                Held::Is(_) | Held::Anew => {
+                    skipped(url, "the worker moved after selection");
+                    continue;
+                }
             };
+            // An object no row stands for is not the store's: the job keeps
+            // it for the host's own steps.
             let Some(seen) = self.objects.standing_of(&id, &current) else {
                 skipped(url, "no row stands for this object");
+                kept.push(Arc::clone(worker));
                 continue;
             };
             let answer = removal_answer(
@@ -369,15 +437,30 @@ impl<H: WorkflowHost> StepExecutor<WorkerRemovalWorkflowData<H>>
                 self.door.drained(by, url, seen),
             )?;
             match answer {
-                Some(Wrote::Draining(_) | Wrote::Unmoved(_)) => data.drained_workers.push(current),
-                None => {}
-                Some(_) => {
+                Left::Wrote(Wrote::Draining(_) | Wrote::Unmoved(_)) => {
+                    data.drained_workers.push(current);
+                    kept.push(Arc::clone(worker));
+                }
+                Left::Wrote(_) => {
                     return Err(failed(
                         DRAIN_WORKERS_AT_DOOR_STEP,
                         "the door did not answer a drain",
                     ))
                 }
+                Left::Gone => kept.push(Arc::clone(worker)),
+                Left::Standing => {}
+                Left::Refused(why) => {
+                    refusal.get_or_insert(why);
+                }
             }
+        }
+        // A refusal of the request itself reaches its asker, as a
+        // registration's does, where the job drained nothing.
+        if let (true, Some(why)) = (data.drained_workers.is_empty(), refusal) {
+            return Err(failed(DRAIN_WORKERS_AT_DOOR_STEP, why));
+        }
+        if kept.len() != workers.len() {
+            data.keep_only(kept);
         }
         Ok(StepResult::Success)
     }
@@ -401,18 +484,24 @@ impl<H: WorkflowHost> StepExecutor<WorkerRemovalWorkflowData<H>>
         let registry = require_host(data.host.as_ref())?.worker_registry();
         let by = remover_of(&data.asker, self.scope);
         data.removed_workers.clear();
+        let mut standing = Vec::new();
         for worker in &data.drained_workers {
             let url = worker.url();
             let Some(id) = registry.get_id_by_url(url) else {
                 skipped(url, "no worker stands in the registry");
                 continue;
             };
-            let Some(current) = registry
-                .get(&id)
-                .filter(|current| Arc::ptr_eq(current, worker))
-            else {
-                skipped(url, "the worker moved while draining");
-                continue;
+            let current = match held(registry, &id, url) {
+                Held::Is(current) if Arc::ptr_eq(&current, worker) => current,
+                Held::Gone => {
+                    skipped(url, "no worker stands in the registry");
+                    continue;
+                }
+                Held::Is(_) | Held::Anew => {
+                    skipped(url, "the worker moved while draining");
+                    standing.push(url.to_owned());
+                    continue;
+                }
             };
             let Some(seen) = self.objects.standing_of(&id, &current) else {
                 skipped(url, "no row stands for this object");
@@ -424,15 +513,28 @@ impl<H: WorkflowHost> StepExecutor<WorkerRemovalWorkflowData<H>>
                 self.door.gone(by, url, seen),
             )?;
             match answer {
-                Some(Wrote::Removed(_)) => data.removed_workers.push(current),
-                None => {}
-                Some(_) => {
+                Left::Wrote(Wrote::Removed(_)) => data.removed_workers.push(current),
+                Left::Wrote(_) => {
                     return Err(failed(
                         REMOVE_WORKERS_AT_DOOR_STEP,
                         "the door did not answer a removal",
                     ))
                 }
+                Left::Gone => {}
+                Left::Standing | Left::Refused(_) => standing.push(url.to_owned()),
             }
+        }
+        // A worker left standing under its URL leaves the job, as at the
+        // registry's step: the steps behind touch nothing of it.
+        if !standing.is_empty() {
+            let kept = data
+                .actual_workers_to_remove
+                .iter()
+                .flatten()
+                .filter(|worker| !standing.iter().any(|url| url == worker.url()))
+                .map(Arc::clone)
+                .collect();
+            data.keep_only(kept);
         }
         Ok(StepResult::Success)
     }
@@ -826,7 +928,39 @@ mod tests {
         // The removal's guard names the row that left: the new one stays.
         f.remove().execute(&mut removal).await.expect("skipped");
         assert!(removal.data.removed_workers.is_empty());
+        assert!(removal.data.worker_urls.is_empty());
         assert_eq!(f.store.by_key(URL), Some(anew));
+    }
+
+    /// The door answers that the row left, under an object the holder has
+    /// not dropped yet: the worker stays the job's at either step.
+    #[tokio::test]
+    async fn a_removal_keeps_a_worker_whose_row_left_before_the_holder_followed() {
+        let f = Fixture::new();
+        let built = worker(URL, "model");
+        let maker = Maker::Control;
+        let by = Remover::Maker(&maker);
+        for at_the_drain in [true, false] {
+            f.seed(&maker, built.as_ref()).expect("registered");
+            let live = f.host.registry.get_by_url(URL).expect("the held worker");
+            let id = f.host.registry.get_id_by_url(URL).expect("its id");
+            let seen = f.objects.standing_of(&id, &live).expect("its row");
+            let mut removal = f.removal(WorkerJobAsker::Api, vec![Arc::clone(&live)]);
+            if !at_the_drain {
+                f.drain().execute(&mut removal).await.expect("drained");
+                assert_eq!(removal.data.drained_workers.len(), 1);
+            }
+            f.door.gone(by, URL, seen).expect("the row left");
+            if at_the_drain {
+                f.drain().execute(&mut removal).await.expect("skipped");
+                assert!(removal.data.drained_workers.is_empty());
+            } else {
+                f.remove().execute(&mut removal).await.expect("skipped");
+                assert!(removal.data.removed_workers.is_empty());
+            }
+            assert_eq!(removal.data.worker_urls, [URL]);
+            f.objects.follow(&*f.store);
+        }
     }
 
     #[tokio::test]
@@ -1045,7 +1179,48 @@ mod tests {
             Some("silver")
         );
         f.objects.follow(&*f.store);
-        assert_eq!(f.host.registry.get_id_by_url(URL), Some(id));
+        assert_eq!(f.host.registry.get_id_by_url(URL), Some(id.clone()));
+
+        // The worker drains: its removal wins, and the replacement is told.
+        let live = f.host.registry.get(&id).expect("the worker");
+        let seen = f.objects.standing_of(&id, &live).expect("its row");
+        f.door
+            .drained(Remover::Maker(&Maker::Control), URL, seen)
+            .expect("draining");
+        let mut cx = f.registration(WorkerJobAsker::Api, vec![relabelled()]);
+        cx.data.registration_mode = by_id(id.as_str(), live.revision());
+        let error = write.execute(&mut cx).await.expect_err("draining");
+        assert_eq!(
+            error.to_string(),
+            "Step failed: write_workers_at_door - Worker http://worker:8000 is draining, \
+             so the replacement was dropped"
+        );
+    }
+
+    /// At a step's second read a worker registered anew under the URL is
+    /// told from one that left.
+    #[tokio::test]
+    async fn a_worker_registered_anew_between_a_steps_reads_is_told_from_one_gone() {
+        let f = Fixture::new();
+        f.seed(&Maker::Control, worker(URL, "model").as_ref())
+            .expect("registered");
+        let first = f.host.registry.get_id_by_url(URL).expect("its id");
+        assert!(matches!(held(&f.host.registry, &first, URL), Held::Is(_)));
+
+        // Other models: the URL's next life, under a new id.
+        f.seed(&Maker::Control, worker(URL, "other").as_ref())
+            .expect("registered anew");
+        let second = f.host.registry.get_id_by_url(URL).expect("the new id");
+        assert_ne!(first, second);
+        assert!(matches!(held(&f.host.registry, &first, URL), Held::Anew));
+
+        let live = f.host.registry.get(&second).expect("the worker");
+        let seen = f.objects.standing_of(&second, &live).expect("its row");
+        f.door
+            .gone(Remover::Maker(&Maker::Control), URL, seen)
+            .expect("removed");
+        f.objects.follow(&*f.store);
+        assert!(matches!(held(&f.host.registry, &second, URL), Held::Gone));
     }
 
     #[tokio::test]
@@ -1138,6 +1313,7 @@ mod tests {
             StepResult::Success
         );
         assert!(cx.data.drained_workers.is_empty());
+        assert!(cx.data.worker_urls.is_empty());
         assert_eq!(f.store.by_key(URL), row);
     }
 
@@ -1157,6 +1333,7 @@ mod tests {
             StepResult::Success
         );
         assert!(cx.data.drained_workers.is_empty());
+        assert!(cx.data.worker_urls.is_empty());
         assert_eq!(f.store.by_key(URL), row);
     }
 
@@ -1187,6 +1364,19 @@ mod tests {
         );
         assert!(removal.data.removed_workers.is_empty());
         assert_eq!(f.store.epoch(), 0);
+        // Not the store's worker: the job keeps it for the host's own steps.
+        assert_eq!(removal.data.worker_urls, [URL]);
+
+        // A worker gone from the registry stays the job's as well.
+        let mut gone = f.removal(
+            WorkerJobAsker::Api,
+            vec![worker("http://gone:8000", "model")],
+        );
+        f.drain()
+            .execute(&mut gone)
+            .await
+            .expect("nothing to drain");
+        assert_eq!(gone.data.worker_urls, ["http://gone:8000"]);
     }
 
     #[cfg(feature = "controller")]
@@ -1209,33 +1399,38 @@ mod tests {
 
         let url = "http://user:secret@worker:8000/p?token=hidden";
         let answers = [
-            (Refused::Moved, "DEBUG", "the membership row moved"),
+            (
+                Refused::Moved,
+                "DEBUG",
+                "the membership row moved",
+                Left::Standing,
+            ),
             (
                 Refused::Absent,
                 "DEBUG",
                 "no row is registered under the URL",
+                Left::Gone,
             ),
             (
                 Refused::NotMaker("another maker's row".to_owned()),
                 "WARN",
                 "another maker's row",
+                Left::Refused("another maker's row".to_owned()),
             ),
             (
                 Refused::OutOfScope,
                 "WARN",
                 "the row's maker is outside the health removal scope",
+                Left::Refused("the row's maker is outside the health removal scope".to_owned()),
             ),
         ];
-        for (refusal, _, _) in &answers {
-            assert_eq!(
-                removal_answer("drain_workers_at_door", url, Err(refusal.clone()))
-                    .expect("skipped"),
-                None
-            );
+        for (refusal, _, _, left) in &answers {
+            let answer = removal_answer("drain_workers_at_door", url, Err(refusal.clone()));
+            assert_eq!(&answer.expect("left alone"), left);
         }
         let log = std::fs::read_to_string(log.path()).expect("the log text");
         assert_eq!(log.lines().count(), answers.len(), "{log}");
-        for (line, (_, level, reason)) in log.lines().zip(answers) {
+        for (line, (_, level, reason, _)) in log.lines().zip(answers) {
             assert!(line.contains(level) && line.contains(reason), "{line}");
             assert!(line.contains("http://***@worker:8000/p"), "{line}");
         }
@@ -1244,47 +1439,81 @@ mod tests {
         }
     }
 
-    /// A removal leaves a row its guard does not name: one that moved under
-    /// the held object, and another maker's.
+    /// A row that moved under the held object is left, and its worker leaves
+    /// the job at either step.
     #[tokio::test]
-    async fn a_removal_leaves_a_row_its_guard_does_not_name() {
-        type Setup = fn(&Fixture) -> Arc<dyn Worker>;
-        let moved: Setup = |f| {
-            let built = worker(URL, "model");
-            f.seed(&Maker::Control, built.as_ref()).expect("registered");
-            let live = f.host.registry.get_by_url(URL).expect("the held worker");
-            f.door
-                .found(&Maker::Control, Expect::Anything, URL, &|old| WorkerFacts {
-                    priority: 5,
-                    ..facts(built.as_ref(), old)
-                })
-                .expect("the row moved in place");
-            live
-        };
-        let of_another: Setup = |f| {
-            let maker = Maker::provider("discovery", URL).expect("a provider's maker");
-            f.seed(&maker, worker(URL, "model").as_ref())
-                .expect("registered");
-            f.host.registry.get_by_url(URL).expect("the held worker")
-        };
-        for setup in [moved, of_another] {
-            let f = Fixture::new();
-            let live = setup(&f);
-            let row = f.store.by_key(URL);
+    async fn a_removal_leaves_a_row_that_moved_and_drops_its_worker_from_the_job() {
+        let f = Fixture::new();
+        let built = worker(URL, "model");
+        f.seed(&Maker::Control, built.as_ref()).expect("registered");
+        let live = f.host.registry.get_by_url(URL).expect("the held worker");
+        f.door
+            .found(&Maker::Control, Expect::Anything, URL, &|old| WorkerFacts {
+                priority: 5,
+                ..facts(built.as_ref(), old)
+            })
+            .expect("the row moved in place");
+        let row = f.store.by_key(URL);
+        for at_the_drain in [true, false] {
             let mut removal = f.removal(WorkerJobAsker::Api, vec![Arc::clone(&live)]);
-            assert_eq!(
-                f.drain().execute(&mut removal).await.expect("skipped"),
-                StepResult::Success
-            );
-            assert!(removal.data.drained_workers.is_empty());
-            removal.data.drained_workers.push(live);
-            assert_eq!(
-                f.remove().execute(&mut removal).await.expect("skipped"),
-                StepResult::Success
-            );
-            assert!(removal.data.removed_workers.is_empty());
+            if at_the_drain {
+                f.drain().execute(&mut removal).await.expect("skipped");
+                assert!(removal.data.drained_workers.is_empty());
+            } else {
+                removal.data.drained_workers.push(Arc::clone(&live));
+                f.remove().execute(&mut removal).await.expect("skipped");
+                assert!(removal.data.removed_workers.is_empty());
+            }
+            assert!(removal.data.worker_urls.is_empty());
             assert_eq!(f.store.by_key(URL), row);
         }
+    }
+
+    /// A removal the door refuses its asker fails the drain with the door's
+    /// sentence where the job drained nothing. Beside a worker the job
+    /// drained, the refused one leaves the job.
+    #[tokio::test]
+    async fn a_removal_the_door_refuses_its_asker_fails_with_the_doors_sentence() {
+        let provider = Maker::provider("discovery", URL).expect("a provider's maker");
+        for (maker, asker, said) in [
+            (
+                provider.clone(),
+                WorkerJobAsker::Api,
+                "the row is provider discovery's: its worker is changed at the provider's source",
+            ),
+            (
+                Maker::Control,
+                WorkerJobAsker::Health,
+                "the row's maker is outside the health removal scope",
+            ),
+        ] {
+            let f = Fixture::new();
+            f.seed(&maker, worker(URL, "model").as_ref())
+                .expect("registered");
+            let live = f.host.registry.get_by_url(URL).expect("the held worker");
+            let row = f.store.by_key(URL);
+            let mut removal = f.removal(asker, vec![live]);
+            let drain = f.drain();
+            let error = drain.execute(&mut removal).await.expect_err("refused");
+            assert_eq!(
+                error.to_string(),
+                format!("Step failed: drain_workers_at_door - {said}")
+            );
+            assert!(!StepExecutor::<Removal>::is_retryable(&drain, &error));
+            assert_eq!(f.store.by_key(URL), row);
+        }
+
+        let f = Fixture::new();
+        let other = "http://other:8000";
+        f.seed(&Maker::Control, worker(URL, "model").as_ref())
+            .expect("registered");
+        f.seed(&provider, worker(other, "model").as_ref())
+            .expect("registered");
+        let both = [URL, other].map(|url| f.host.registry.get_by_url(url).expect("held"));
+        let mut removal = f.removal(WorkerJobAsker::Api, both.to_vec());
+        f.drain().execute(&mut removal).await.expect("one drained");
+        assert_eq!(removal.data.drained_workers.len(), 1);
+        assert_eq!(removal.data.worker_urls, [URL]);
     }
 
     #[tokio::test]
@@ -1316,6 +1545,7 @@ mod tests {
             StepResult::Success
         );
         assert!(removal.data.removed_workers.is_empty());
+        assert!(removal.data.worker_urls.is_empty());
         assert_eq!(f.store.by_key(URL), row);
         // Other facts, found again: the row is out of the drain as well.
         let status = row.map(|row| row.status);

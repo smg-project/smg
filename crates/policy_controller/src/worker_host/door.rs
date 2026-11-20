@@ -44,6 +44,9 @@ pub enum Refused {
     Moved,
     /// A row stands under the URL of a registration that expects none.
     Stands,
+    /// The row a replacement names is draining: its removal takes the
+    /// worker.
+    Draining,
     /// The row's maker is outside the health removal scope.
     OutOfScope,
 }
@@ -75,7 +78,8 @@ pub enum Expect {
     Nothing,
     /// The row its asker saw, at the revision it saw: a replacement by id.
     /// No row refuses it ([`Refused::Absent`]), and so does another row or
-    /// revision ([`Refused::Moved`]).
+    /// revision ([`Refused::Moved`]). A draining row refuses it too
+    /// ([`Refused::Draining`]): its removal wins.
     Seen(Standing),
     /// Anything: an upsert.
     Anything,
@@ -151,6 +155,12 @@ pub(crate) fn lay(
     }
     if let Some(row) = &standing {
         made_by(row, maker)?;
+        // A draining row is leaving. Laid over, it would take the URL's
+        // next life and its removal would leave the worker: the removal
+        // wins over a replacement.
+        if matches!(expect, Expect::Seen(_)) && row.status == WorkerStatus::Draining {
+            return Err(Refused::Draining);
+        }
     }
 
     let mut facts = state(standing.as_ref().map(|row| &row.facts));
@@ -481,8 +491,27 @@ pub(super) mod tests {
             })
         );
 
-        // The row its asker saw left.
+        // A draining row is leaving: its removal wins over a replacement,
+        // which is told so. Another maker is told the row is not its own.
         let seen = standing(&next);
+        assert_eq!(
+            door.drained(Remover::Maker(&control), URL, seen),
+            Ok(Wrote::Draining(next.id))
+        );
+        assert_eq!(
+            door.found(&control, Expect::Seen(seen), URL, &unstated),
+            Err(Refused::Draining)
+        );
+        assert!(matches!(
+            door.found(&pool, Expect::Seen(seen), URL, &unstated),
+            Err(Refused::NotMaker(_))
+        ));
+        assert_eq!(
+            store.by_key(URL).map(|row| (row.id, row.status)),
+            Some((next.id, WorkerStatus::Draining))
+        );
+
+        // The row its asker saw left.
         assert_eq!(
             door.gone(Remover::Maker(&control), URL, seen),
             Ok(Wrote::Removed(next.id))
