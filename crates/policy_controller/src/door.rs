@@ -7991,7 +7991,10 @@ pub(crate) mod tests {
                     events: true,
                     ..Signals::default()
                 },
-                demand_facts: DemandFacts { runtime },
+                demand_facts: DemandFacts {
+                    runtime,
+                    ..DemandFacts::default()
+                },
                 ..WorkerFacts::default()
             };
             let id = store.upsert(facts).id();
@@ -8292,7 +8295,10 @@ pub(crate) mod tests {
             let mut asked = request(b"cut", 7);
             asked.facts.block_hashes = &BLOCKS;
             asked.facts.tried = &tried;
-            asked.constraints.demands = Demands { runtime: 7 };
+            asked.constraints.demands = Demands {
+                runtime: 7,
+                ..Demands::default()
+            };
             let decided = decided(&store, &asked);
             assert_eq!(decided.holders, [(warm, 1)]);
             assert_eq!(decided.pick, Some((warm, 1)));
@@ -8466,7 +8472,10 @@ pub(crate) mod tests {
             let mut asked = request(b"cut", 7);
             asked.facts.block_hashes = &BLOCKS;
             asked.facts.tried = &tried;
-            asked.constraints.demands = Demands { runtime: 7 };
+            asked.constraints.demands = Demands {
+                runtime: 7,
+                ..Demands::default()
+            };
             let decided = decided(&store, &asked);
             assert_eq!(decided.holders, [(shallow, 1)]);
             assert_eq!(decided.pick, Some((shallow, 1)));
