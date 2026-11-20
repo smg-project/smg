@@ -1,0 +1,348 @@
+{
+  "recorded_from": "d6be6744234a29f6e8f759b9a5e3667620b8c1ad",
+  "policy": "explicit-target",
+  "rows": [
+    {
+      "name": "a-named-worker-takes-the-request",
+      "shed": false,
+      "workers": [
+        {
+          "state": "free",
+          "available": true
+        },
+        {
+          "state": "free",
+          "available": true
+        },
+        {
+          "state": "free",
+          "available": true
+        }
+      ],
+      "requests": [
+        {
+          "target": "0"
+        },
+        {
+          "target": "1"
+        },
+        {
+          "target": "2"
+        }
+      ],
+      "answers": [
+        {
+          "placed": [
+            0
+          ]
+        },
+        {
+          "placed": [
+            1
+          ]
+        },
+        {
+          "placed": [
+            2
+          ]
+        }
+      ]
+    },
+    {
+      "name": "an-index-past-the-list-names-nobody",
+      "shed": false,
+      "workers": [
+        {
+          "state": "free",
+          "available": true
+        },
+        {
+          "state": "free",
+          "available": true
+        }
+      ],
+      "requests": [
+        {
+          "target": "2"
+        },
+        {
+          "target": "7"
+        }
+      ],
+      "answers": [
+        {
+          "refused": {
+            "status": 503,
+            "code": "no_available_workers",
+            "retry_after": true,
+            "message": "All workers are unavailable (circuit breaker open or unhealthy)"
+          }
+        },
+        {
+          "refused": {
+            "status": 503,
+            "code": "no_available_workers",
+            "retry_after": true,
+            "message": "All workers are unavailable (circuit breaker open or unhealthy)"
+          }
+        }
+      ]
+    },
+    {
+      "name": "a-value-that-is-no-index-names-nobody",
+      "shed": false,
+      "workers": [
+        {
+          "state": "free",
+          "available": true
+        },
+        {
+          "state": "free",
+          "available": true
+        }
+      ],
+      "requests": [
+        {
+          "target": "x"
+        },
+        {
+          "target": "-1"
+        }
+      ],
+      "answers": [
+        {
+          "refused": {
+            "status": 503,
+            "code": "no_available_workers",
+            "retry_after": true,
+            "message": "All workers are unavailable (circuit breaker open or unhealthy)"
+          }
+        },
+        {
+          "refused": {
+            "status": 503,
+            "code": "no_available_workers",
+            "retry_after": true,
+            "message": "All workers are unavailable (circuit breaker open or unhealthy)"
+          }
+        }
+      ]
+    },
+    {
+      "name": "a-worker-that-is-out-moves-the-indexes-behind-it",
+      "shed": false,
+      "workers": [
+        {
+          "state": "free",
+          "available": true
+        },
+        {
+          "state": "down",
+          "available": false
+        },
+        {
+          "state": "free",
+          "available": true
+        }
+      ],
+      "requests": [
+        {
+          "target": "0"
+        },
+        {
+          "target": "1"
+        },
+        {
+          "target": "2"
+        }
+      ],
+      "answers": [
+        {
+          "placed": [
+            0
+          ]
+        },
+        {
+          "placed": [
+            2
+          ]
+        },
+        {
+          "refused": {
+            "status": 503,
+            "code": "no_available_workers",
+            "retry_after": true,
+            "message": "All workers are unavailable (circuit breaker open or unhealthy)"
+          }
+        }
+      ]
+    },
+    {
+      "name": "the-one-worker-is-down",
+      "shed": false,
+      "workers": [
+        {
+          "state": "down",
+          "available": false
+        }
+      ],
+      "requests": [
+        {
+          "target": "0"
+        }
+      ],
+      "answers": [
+        {
+          "refused": {
+            "status": 503,
+            "code": "no_available_workers",
+            "retry_after": true,
+            "message": "All workers are unavailable (circuit breaker open or unhealthy)"
+          }
+        }
+      ]
+    },
+    {
+      "name": "a-model-no-worker-serves",
+      "shed": false,
+      "workers": [],
+      "requests": [
+        {
+          "target": "0"
+        }
+      ],
+      "answers": [
+        {
+          "refused": {
+            "status": 404,
+            "code": "model_not_found",
+            "retry_after": false,
+            "message": "No worker available for model 'm'"
+          }
+        }
+      ]
+    },
+    {
+      "name": "a-named-worker-over-its-thresholds-beside-one-under-them",
+      "shed": false,
+      "workers": [
+        {
+          "state": "over",
+          "available": false
+        },
+        {
+          "state": "free",
+          "available": true
+        }
+      ],
+      "requests": [
+        {
+          "target": "0"
+        },
+        {
+          "target": "1"
+        }
+      ],
+      "answers": [
+        {
+          "placed": [
+            1
+          ]
+        },
+        {
+          "refused": {
+            "status": 503,
+            "code": "no_available_workers",
+            "retry_after": true,
+            "message": "All workers are unavailable (circuit breaker open or unhealthy)"
+          }
+        }
+      ]
+    },
+    {
+      "name": "every-worker-is-over-its-thresholds",
+      "shed": false,
+      "workers": [
+        {
+          "state": "over",
+          "available": false
+        },
+        {
+          "state": "over",
+          "available": false
+        }
+      ],
+      "requests": [
+        {
+          "target": "0"
+        },
+        {
+          "target": "1"
+        },
+        {
+          "target": "2"
+        }
+      ],
+      "answers": [
+        {
+          "placed": [
+            0,
+            1
+          ]
+        },
+        {
+          "placed": [
+            0,
+            1
+          ]
+        },
+        {
+          "placed": [
+            0,
+            1
+          ]
+        }
+      ]
+    },
+    {
+      "name": "every-worker-is-over-and-shedding-is-on",
+      "shed": true,
+      "workers": [
+        {
+          "state": "over",
+          "available": false
+        },
+        {
+          "state": "over",
+          "available": false
+        }
+      ],
+      "requests": [
+        {
+          "target": "0"
+        },
+        {
+          "target": "1"
+        }
+      ],
+      "answers": [
+        {
+          "refused": {
+            "status": 503,
+            "code": "worker_overload_protection_shed",
+            "retry_after": true,
+            "message": "All workers for model 'm' are overloaded"
+          }
+        },
+        {
+          "refused": {
+            "status": 503,
+            "code": "worker_overload_protection_shed",
+            "retry_after": true,
+            "message": "All workers for model 'm' are overloaded"
+          }
+        }
+      ]
+    }
+  ]
+}

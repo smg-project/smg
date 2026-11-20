@@ -73,6 +73,7 @@ model_gateway/src/         the gateway's recorders, each a test module beside th
   routers/grpc/common/stages/worker_selection/classic_hard_demand_rows.rs   context_window.json
   routers/grpc/common/stages/worker_selection/classic_hard_demand_rows.rs   constraint_decider.json
   routers/http/router/classic_rank_rows.rs                                  rank_pin.json
+  routers/http/router/classic_target_rows.rs                                explicit_target.json
   policies/classic_cache_aware_rows.rs                                      cache_aware.json
   policies/classic_sticky_override_rows.rs                                  sticky_override.json
 crates/worker/src/         the worker crate's recorders, test modules beside the load monitor
@@ -310,6 +311,7 @@ directory. The sha256 is of the file as committed.
 | `context_window.json` | the context window: the input and the completion budget each against the window, a scoring position, an unknown window, the widest window a refusal names | `a4935a5acd15151641b1988e234016a95fd172da` | 8 demand rows | `bf49bf479afab2621fa118ea07c35ff21cbbd0b06dcb499fa1d1318bd60e0f62` | `classic_hard_demand_rows.rs` |
 | `constraint_decider.json` | the constraint's decider on a retry: the workers that decide a constraint as the first attempt's worker did, and the pool's answer where none is left | `a4935a5acd15151641b1988e234016a95fd172da` | 5 demand rows | `5008922d28db1276f4a202de44b24935b8f10fe8d3581a0e9483d597358493c0` | `classic_hard_demand_rows.rs` |
 | `rank_pin.json` | the rank rule of a route that pins no rank: the workers that registered a data-parallel rank are left out, and the refusal where every worker registered one | `a4935a5acd15151641b1988e234016a95fd172da` | 11 demand rows | `774c494485af59153ef9579acde444459bc37f001741b7da95903679151c59f7` | `classic_rank_rows.rs` |
+| `explicit_target.json` | the worker a request names by its target header under consistent hashing: an index into the available workers, an index or a value that names nobody, a worker that is out or over its thresholds, and a pool with no available worker | `d6be6744234a29f6e8f759b9a5e3667620b8c1ad` | 9 demand rows | `b4d1a7cd24919758dc1b32d1afcb72ed81767765a2dc37f89c92bf3bd2304578` | `classic_target_rows.rs` |
 | `cache_aware.json` | cache aware in single placement, under each of its three matchers: a holder kept, the count gate and its spill, its factor under the command line's defaults, a margin under its floor, a miss, a match at the threshold, a holder tried or not usable, the two KV gates, a request that ends, the blocks a worker stores and removes | `bfe189b332349c44cf7e3b6e1102a9b5a2699d9d` | 28: 26 sequence, 2 drawn | `f13a642dc9252e0328f8092b3ff322a03f270d918311c3b5c5dd29979ab8f085` | `classic_cache_aware_rows.rs` |
 | `sticky_override.json` | the routing-key override over a policy that reads no key: a pin under the cap and under its model, a key seen first under the map's modes and under `delegate`, each pin order after a failover, and at the cap a pin that follows, a pick on the pinned worker again, a pick on a worker at the cap, every worker at the cap, no other worker routable | `26f90083091e4dd791420febd88beda3bef3faac` | 18: 14 sequence, 4 drawn | `d74b5e3c8a31b4f1c8cd55cef5629acad0659658c830d937f94b056e9580562b` | `classic_sticky_override_rows.rs` |
 
@@ -345,6 +347,7 @@ The overload and minimum-tokens sheets' recorders are tests of the worker crate:
 | `context_window.json` | `worker_selection::classic_hard_demand_rows` |
 | `constraint_decider.json` | `worker_selection::classic_hard_demand_rows` |
 | `rank_pin.json` | `router::classic_rank_rows` |
+| `explicit_target.json` | `router::classic_target_rows` |
 | `cache_aware.json` | `policies::classic_cache_aware_rows` |
 | `sticky_override.json` | `policies::classic_sticky_override_rows` |
 

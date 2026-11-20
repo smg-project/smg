@@ -2255,7 +2255,7 @@ pub(crate) struct Took {
 
 /// [`narrow`] for a request that states hard demands ([`Demands`]): one
 /// pass keeps the rows that share a wire with the gateway and meet every
-/// demand, each by its own vision bit and its entry of `facts`, the
+/// demand, each by its own id, its vision bit and its entry of `facts`, the
 /// build's column ([`World::demand_facts`]). A row with no entry states
 /// nothing there. The kept rows keep their order and take their positions,
 /// and every column beside them follows in the same step: the affinity
@@ -2294,7 +2294,7 @@ pub(crate) fn narrow_demanded(
         }
         // A row with no entry states nothing.
         let stated = facts.get(at).copied().unwrap_or_default();
-        if let Some(unmet) = demands.unmet_by(row.vision, stated) {
+        if let Some(unmet) = demands.unmet_by(row.id, row.vision, stated) {
             // One more than the place: the first row's taking is no zero.
             // Each place turns the fold by a product of the places' own
             // word: the name is of these places in their order, and of
@@ -7500,6 +7500,28 @@ pub(crate) mod tests {
         assert_eq!(other.undialed, 0);
         assert!(other.demanded != 0 && other.demanded != took.demanded);
         assert_eq!(read(&view, &facts), (vec![(11, 0)], vec![101], vec![9]));
+        // A named worker alone is kept, and the rows taken are named as
+        // any demand's. A named worker another demand takes leaves none,
+        // and so does a worker no row has.
+        let named = |runtime: u32, id: u64| Demands {
+            runtime,
+            target: Some(WorkerId(id)),
+            ..Demands::default()
+        };
+        let (mut view, mut facts) = built(true, sevens);
+        let alone = narrow_demanded(&mut view, &mut facts, None, None, named(0, 12));
+        assert_eq!(alone.unmet, Some(Unmet::Target));
+        assert_eq!(read(&view, &facts), (vec![(12, 0)], vec![102], vec![7]));
+        // Another worker named leaves another list, under another name.
+        let (mut view, mut facts) = built(true, sevens);
+        let beside = narrow_demanded(&mut view, &mut facts, None, None, named(0, 11));
+        assert!(alone.demanded != 0 && alone.demanded != beside.demanded);
+        for gone in [named(9, 12), named(0, 99)] {
+            let (mut view, mut facts) = built(true, sevens);
+            let took = narrow_demanded(&mut view, &mut facts, None, None, gone);
+            assert_eq!(took.unmet, Some(Unmet::Target), "{gone:?}");
+            assert_eq!(read(&view, &facts), (vec![], vec![], vec![]));
+        }
         // No demand: the wires alone take a row, and the list has no name
         // of a demand's.
         let (mut view, mut facts) = built(true, sevens);
