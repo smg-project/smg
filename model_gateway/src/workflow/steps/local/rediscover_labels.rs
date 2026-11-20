@@ -69,12 +69,12 @@ impl StepExecutor<WorkerUpdateWorkflowData> for RediscoverLabelsStep {
             };
             // The seed is the worker's record, kept in rank space
             // (`report_for_rank`); the update step passes the report
-            // through that rule again, which is the identity here only
-            // because the record holds neither a running-window label
-            // (`WINDOW_LABELS`) nor a width (`DP_WIDTH_LABELS`): sampling
-            // defaults, the grammar start and the context window, which no
-            // rank shares. A record that gains a running window needs a
-            // report read in engine space instead.
+            // through that rule again. That is the identity for what the
+            // record holds besides the link's own labels: sampling defaults
+            // and the grammar start, which no rank shares. The link's labels
+            // replace the record's in engine space: the context window, and
+            // a TokenSpeed group's running window with the width its ranks
+            // share it by.
             let mut fresh = HashMap::clone(&worker.metadata().discovered_labels);
             fresh.extend(zmq_client::link_labels(client));
             debug!(
